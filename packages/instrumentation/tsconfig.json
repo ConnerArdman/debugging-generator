@@ -1,0 +1,188 @@
+{
+  // ---------------------------------------------------------------------------
+  // @debuggen/instrumentation - the reversible-instrumentation project
+  // (AAP 0.7.1 Group 1).
+  //
+  // This package owns the instrumentation plan schemas (the authoring
+  // `InstrumentationPlanInput` and the normalized `InstrumentationPlan`), the
+  // `InstrumentationAdapter` contract and its registry, the six built-in
+  // adapters, and the ts-morph function-timing patcher with its hash-recorded
+  // backups, conflict detection and cleanup - the only code in the product that
+  // writes into a developer's working tree (AAP 0.5.1).
+  //
+  // Position in the acyclic package graph (AAP 0.2.2):
+  //   shared -> telemetry -> code-analysis -> instrumentation -> ... -> protocol
+  // so `references` below names exactly the three workspaces package.json
+  // depends on (@debuggen/shared, @debuggen/telemetry, @debuggen/code-analysis)
+  // and nothing else. ../protocol, ../panel-schema, ../panel-renderer and
+  // ../model-provider sit ABOVE this package: a reference to any of them is the
+  // cycle the layering exists to prevent - rejected by `tsc -b` (TS6202) and
+  // independently forbidden by the `no-restricted-imports` layering block of
+  // eslint.config.js.
+  //
+  // `pnpm typecheck` (= `pnpm demo:generate && tsc -b`) builds the root
+  // tsconfig.json solution file, which references every workspace project - this
+  // one after packages/shared, packages/telemetry and packages/code-analysis -
+  // so the options below are what that blocking gate (AAP 0.8.5) runs on. A
+  // misconfiguration here fails the whole monorepo typecheck, not just this
+  // package. `pnpm --filter @debuggen/instrumentation typecheck` runs the same
+  // `tsc -b` for this project and its three dependencies alone.
+  //
+  // Everything not stated below is inherited from tsconfig.base.json and must
+  // stay that way - in particular `strict`, `noUncheckedIndexedAccess`,
+  // `verbatimModuleSyntax`, `isolatedModules`, the no-unused/no-implicit
+  // diagnostics, `target`/`lib` ES2023, `skipLibCheck` (which keeps declaration
+  // drift in ts-morph's bundled TypeScript and in the `diff` typings out of this
+  // gate) and the declaration-emit settings (`declaration`, `declarationMap`,
+  // `sourceMap`, `emitDeclarationOnly`, `incremental`). `noEmit` must never be
+  // added: TypeScript 6.0.3 rejects a referenced project that disables emit with
+  // TS6310 and the whole gate fails. No strictness flag is relaxed here;
+  // `noUncheckedIndexedAccess` in particular is load-bearing for a package whose
+  // plan normalisation, adapter results, modification chains and ts-morph node
+  // lookups are all indexed accesses that must stay `T | undefined`.
+  //
+  // This file is JSONC, like every other tsconfig in the repository. tsc,
+  // ESLint, Vitest, tsup and Prettier all parse comments in tsconfig files;
+  // anything reading it programmatically must use a JSONC-aware reader
+  // (`ts.readConfigFile`), never bare `JSON.parse`.
+  // ---------------------------------------------------------------------------
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    // Already true in the base; restated because the root solution file
+    // references this project and a non-composite reference fails `tsc -b`
+    // outright (TS6306). Keeping it local means a future edit to the base cannot
+    // silently break the gate at this project.
+    //
+    // It also stays true while tsup builds dist/: the declaration half of that
+    // build turns `composite`/`incremental` off in this package's tsup.config.ts
+    // (`dts: { compilerOptions: { composite: false, incremental: false } }`)
+    // rather than here, so the bundler's needs never cost the solution build its
+    // project reference.
+    "composite": true,
+
+    // The base defaults to "ESNext" + "bundler" for the bundled/web workspaces
+    // and instructs Node-targeted projects to override with NodeNext. This
+    // package is Node-only: ts-morph 28.0.0 loads a target project from a real
+    // filesystem, the patcher records backups and performs atomic replacements
+    // through `node:fs` and the `./node` entry of @debuggen/shared, and the sole
+    // consumer is apps/local-service (also NodeNext). package.json declares
+    // `"type": "module"`, so this project is type-checked under real Node ESM
+    // resolution rather than a bundler approximation.
+    //
+    // Consequence for every source file in src/**: relative specifiers must
+    // carry an explicit ".js" extension (`import { patchFunctionTiming } from
+    // "./patch/function-timing.js"`, `import type { InstrumentationAction } from
+    // "./schema/plan.js"`), and directory specifiers must name the file.
+    // Extensionless relative imports are a compile error here by design
+    // (TS2835/TS2834). tsup/esbuild resolve a "./x.js" specifier from a
+    // TypeScript importer back to "./x.ts", so the bundle in dist/ is
+    // unaffected.
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+
+    // Per-workspace (the base deliberately leaves it unset), so the declaration
+    // tree under .tsbuild/ mirrors src/ exactly: src/index.ts ->
+    // .tsbuild/index.d.ts and src/patch/patcher.ts ->
+    // .tsbuild/patch/patcher.d.ts, matching the single "." entry the
+    // package.json `exports` map advertises under dist/. It also pins the
+    // program's boundary: nothing outside src/ may be an input, which is what
+    // keeps the mutated fixture corpus under test/ out (see "exclude").
+    "rootDir": "src",
+
+    // The base sets no `types` so that one workspace's ambient globals cannot
+    // bleed into another. This package needs exactly one: @types/node 24.13.6 (a
+    // root devDependency, resolved through the workspace-root
+    // node_modules/@types). It types the `node:fs` / `node:path` /
+    // `node:crypto` builtins that src/patch/backup-store.ts,
+    // src/patch/patcher.ts and src/cleanup.ts use directly and through
+    // `@debuggen/shared/node` - whose `createFileExclusive`,
+    // `atomicReplaceFile`, `ensureSecureDir` and `readFileNoFollow` surface
+    // `Buffer` and errno-bearing error types - `process.env` for
+    // $DEBUGGEN_HOME, and `node:child_process`, which src/patch/patcher.test.ts
+    // needs to run each failure-injection scenario in a fresh process
+    // (AAP 0.5.1).
+    //
+    // Deliberately no "lib": ["DOM"] override and no "jsx": nothing here runs in
+    // a page and this package emits no React. The browser-side signals its
+    // adapters plan for are installed by packages/telemetry's page agent; the
+    // adapters only describe them, so admitting `window`/`document` would merely
+    // legitimise browser globals in a Node-only patcher.
+    "types": ["node"]
+
+    // NOT overridden: "outDir" / "declarationDir" / "tsBuildInfoFile". The base
+    // already anchors them per project with `${configDir}`, which resolves to
+    // the directory of THIS file, so declarations and the incremental stamp land
+    // in packages/instrumentation/.tsbuild - ignored by .gitignore,
+    // .prettierignore and the ignore list in eslint.config.js. A repository-level
+    // path would be an output location outside those ignore lists and would leak
+    // build artefacts into `git status`; tsc must likewise never write into
+    // packages/instrumentation/dist, which belongs to tsup and holds the
+    // artefacts the `exports` map points at.
+    // NOT set: "baseUrl" / "paths". `@debuggen/shared`, `@debuggen/telemetry`
+    // and `@debuggen/code-analysis` resolve through the pnpm workspace symlink
+    // and each package's `exports` map plus the project references below,
+    // exactly as the runtime and the bundlers resolve them (AAP 0.2.2).
+  },
+
+  // src/** only, and deliberately including the colocated `*.test.ts` files -
+  // schema/*.test.ts, feasibility.test.ts, cleanup.test.ts,
+  // patch/function-timing.test.ts, patch/patcher.test.ts, patch/conflict.test.ts
+  // and adapters/*.test.ts (AAP 0.8.3) - so the typecheck gate covers the tests
+  // too: `strict`, `noUncheckedIndexedAccess`, `noUnusedLocals` and
+  // `noUnusedParameters` apply to them exactly as they do to sources. It is also
+  // precisely what the `instrumentation` Vitest project collects
+  // (`packages/instrumentation/src/**/*.test.ts`). The suites import
+  // `{ describe, it, expect }` from "vitest" explicitly rather than relying on
+  // globals, and vitest resolves from the workspace-root node_modules, so no
+  // "vitest/globals" entry is needed in `types`. No "*.tsx" glob: this package
+  // emits no JSX.
+  "include": ["src/**/*.ts"],
+
+  // Replaces the base's inherited list, so it is spelled relative to this
+  // directory: packages/instrumentation/dist (tsup output), node_modules, and
+  // .tsbuild - the last one repeated from the base because TypeScript excludes
+  // `outDir` automatically only when `exclude` is absent, so without it the
+  // declarations emitted by `tsc -b` would become inputs of the next run.
+  //
+  // test/fixtures/** is the load-bearing entry. test/fixtures/project-a is a
+  // deliberately ordinary, standalone project used as *patching input*: it
+  // carries its own package.json and tsconfig.json because the patcher builds a
+  // ts-morph `Project` from a target project's tsconfig at runtime and the
+  // suites exercise exactly that path, running the real patcher and the real
+  // cleanup against it. Its files are therefore MUTATED IN PLACE during a test
+  // run - transiently holding `__DEBUGGEN__`, `__orig` and the inserted
+  // `type __DebuggenSpanHelper` alias - and it also carries constructs the
+  // patcher must *reject* (generator and async-generator functions) plus
+  // `.js`/`.jsx` variants this project does not compile (`allowJs` is false in
+  // the base). If any of that entered this program, `tsc -b` output would depend
+  // on test execution order and `strict`/`noUnusedLocals` would fail on fixture
+  // code that is intentionally plain. `include` above already restricts the
+  // input set to src/**; this entry states the boundary so that widening
+  // `include` cannot silently swallow the corpus, and it is the typecheck half
+  // of the same exclusion the root vitest.config.ts (`**/test/fixtures/**`) and
+  // the ESLint ignore list apply to test collection and lint. The fixture's own
+  // tsconfig.json is correspondingly absent from `references` below, so `tsc -b`
+  // never builds it.
+  "exclude": ["dist", "node_modules", ".tsbuild", "test/fixtures/**"],
+
+  // Exactly the three `@debuggen/*` dependencies package.json declares, listed
+  // bottom-up so the order matches the layering `tsc -b` walks:
+  //   ../shared        ids, `Result`, POSIX path normalisation and containment,
+  //                    the `SourceLocation` schema recorded on every
+  //                    ModificationRecord, and the `./node` hashing and safe-fs
+  //                    entries the backup store writes through;
+  //   ../telemetry     the TelemetryEvent kinds and signal vocabulary the
+  //                    adapters map their runtime actions onto;
+  //   ../code-analysis the code graph src/feasibility.ts queries to confirm a
+  //                    planned file and symbol exist before anything is patched.
+  // `tsc -b` builds those projects (packages/shared first of all, since the
+  // other two reference it) before this one, which is what proves each published
+  // `exports` map - not a source path alias - resolves. Nothing else belongs
+  // here.
+  "references": [
+    { "path": "../shared" },
+    { "path": "../telemetry" },
+    { "path": "../code-analysis" }
+  ]
+}

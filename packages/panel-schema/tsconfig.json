@@ -1,0 +1,180 @@
+{
+  // ---------------------------------------------------------------------------
+  // @debuggen/panel-schema - the compiler project for the monorepo typecheck gate.
+  //
+  // `pnpm typecheck` (= `pnpm demo:generate && tsc -b`) builds the root solution
+  // file, whose `references` list this project after packages/shared and
+  // packages/telemetry: panel-schema sits on the schema layer of the acyclic
+  // package graph (AAP 0.2.2) and depends on exactly those two workspaces, so
+  // `references` below has exactly those two entries in that order and `tsc -b`
+  // builds shared -> telemetry -> panel-schema. The sibling `tsup.config.ts`
+  // points at this same file with `tsconfig: "./tsconfig.json"`, so the bundle
+  // and the gate type-check the package under one identical configuration.
+  //
+  // What this package is: the panel specification DSL - the authoring schema a
+  // model may produce (input.ts), the deterministic normaliser (normalize.ts),
+  // the internal PanelSpec with its evidence and data-query types (spec.ts,
+  // summary.ts, nodes/{query,layout,viz}.ts), the node catalog (catalog.ts) and
+  // the syntactic and semantic validators (validate.ts, semantic.ts,
+  // json-schema.ts). It is pure Zod schema and pure data: no React, no DOM, no
+  // Node builtins, no I/O.
+  //
+  // Everything not stated below is inherited from tsconfig.base.json and must
+  // stay that way - in particular `strict`, `noUncheckedIndexedAccess`,
+  // `verbatimModuleSyntax`, `isolatedModules`, `noImplicitOverride`,
+  // `noImplicitReturns`, `noFallthroughCasesInSwitch`, `noUnusedLocals`,
+  // `noUnusedParameters`, `forceConsistentCasingInFileNames`, `target`/`lib`
+  // ES2023 and the declaration-emit settings (`declaration`, `declarationMap`,
+  // `sourceMap`, `emitDeclarationOnly`, `incremental`). No strictness flag is
+  // relaxed here, and no compiler version or compiler package is declared:
+  // TypeScript 6.0.3 is pinned once, in the root manifest (AAP 0.3.1).
+  // `noEmit` must never be added: TypeScript 6.0.3 rejects a referenced project
+  // that disables emit with TS6310 and the whole gate fails.
+  //
+  // This file is JSONC. tsc, ESLint, Vitest, tsup and Prettier all parse comments
+  // in tsconfig files; anything reading it programmatically must use a JSONC-aware
+  // reader (`ts.readConfigFile`), never bare `JSON.parse`.
+  // ---------------------------------------------------------------------------
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    // Already true in the base; restated because the root solution file
+    // references this project and a non-composite reference fails `tsc -b`
+    // outright (TS6306). Keeping it local means a future edit to the base cannot
+    // silently break the gate at this project.
+    "composite": true,
+
+    // The base defaults to "ESNext" + "bundler" for the bundled/web workspaces and
+    // instructs Node-targeted projects to override with NodeNext (AAP 0.3.4).
+    // This package is one of them: package.json declares `"type": "module"` and
+    // dist/index.js is imported directly by the Node process apps/local-service
+    // (src/panels/{generate,validate,fallback}.ts, src/pipeline/stages/
+    // generate-panel.ts) as well as by the bundled surfaces (the DevTools panel
+    // through @debuggen/panel-renderer, and @debuggen/protocol's panel message).
+    // NodeNext output is consumable by Node *and* by every bundler in the repo;
+    // the reverse is not true, so the stricter flavour is the correct default -
+    // and it matches the choice both sibling schema packages made
+    // (packages/shared, packages/telemetry).
+    //
+    // CONSEQUENCE FOR EVERY SOURCE FILE IN src/** - the single most common build
+    // break in this workspace: relative specifiers must carry an explicit ".js"
+    // extension even though the files on disk are ".ts", and directory
+    // specifiers must name the file:
+    //     import { factSchema } from "./summary.js";
+    //     import { dataQuerySchema } from "./nodes/query.js";
+    //     export * from "./spec.js";
+    // Extensionless relative imports are a compile error here by design
+    // (TS2835), because they would break the real Node consumer of
+    // dist/index.js. Package specifiers are written WITHOUT an extension -
+    // `zod`, `@debuggen/shared`, `@debuggen/telemetry` - and resolve through the
+    // pnpm workspace symlink and each package's `exports` map.
+    // tsup/esbuild resolve a "./x.js" specifier from a TypeScript importer back
+    // to "./x.ts", so the emitted bundle is unaffected.
+    //
+    // `verbatimModuleSyntax` is inherited, so a specifier imported only for its
+    // types must say `import type` / `export type`. Both forms occur in this
+    // package and both must compile: semantic.ts consumes `CaptureSummary` purely
+    // as a type (`import type { CaptureSummary } from "@debuggen/telemetry"`),
+    // while catalog.ts and nodes/query.ts need the RUNTIME values that package
+    // owns - the telemetry kind list and kind groups, the kind-specific attribute
+    // key catalogs and `METRIC_IDS` - and sourceLocationSchema is imported as a
+    // runtime value from `@debuggen/shared`.
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+
+    // Per-workspace (the base deliberately leaves it unset), so the declaration
+    // tree under .tsbuild/ mirrors src/ exactly: src/index.ts -> .tsbuild/index.d.ts
+    // and src/nodes/query.ts -> .tsbuild/nodes/query.d.ts, matching the path the
+    // package.json `exports` map advertises under dist/. It also pins the
+    // program's boundary: nothing outside src/ may be an input.
+    "rootDir": "src"
+
+    // NOT overridden: "outDir" / "declarationDir" / "tsBuildInfoFile". The base
+    // anchors all three per project with `${configDir}`, which resolves to the
+    // directory of THIS file and not to the base's own directory, so the
+    // declarations and the incremental stamp already land in
+    // packages/panel-schema/.tsbuild (ignored by .gitignore and .prettierignore).
+    // Restating a bare relative "outDir": ".tsbuild" here would resolve to the
+    // same place and is therefore redundant. tsc must never write into
+    // packages/panel-schema/dist: that directory belongs to tsup and holds the
+    // artefacts the `exports` map points at.
+    // NOT overridden: "lib". The base's ES2023-only set is exactly right - this
+    // package must never touch a browser API. It is consumed by the DevTools
+    // panel, but only as pure schema and data, so adding "DOM" would legitimise
+    // `window`/`document` in a module that also runs inside the local service.
+    // NOT set: "types". The base leaves it unset so one workspace's ambient
+    // globals cannot bleed into another, and this package needs none: the library
+    // subtree is environment-neutral (the sibling tsup.config.ts sets
+    // `platform: "neutral"` so an accidental Node builtin fails the build rather
+    // than shipping a barrel that breaks browser consumers), and the colocated
+    // tests use no Node builtin - they build their fixtures as literals and
+    // validate them with the schemas under test. Adding "node" here would make
+    // `process`, `Buffer` and `require` ambient across the whole library and let
+    // exactly that mistake compile. If a future test genuinely needs a builtin,
+    // add "types": ["node"] and keep the `node:*` import inside the test file.
+    // NOT set: "jsx". The base's inherited "react-jsx" is inert because `include`
+    // below admits no .tsx file, and none exists: this package contains no React
+    // (packages/telemetry needs it only for its src/browser/react.test.tsx).
+    // NOT set: "paths" / "baseUrl". The two workspace dependencies resolve through
+    // their `exports` maps plus the project references below, exactly as the
+    // runtime and the bundlers resolve them (AAP 0.2.2). Aliasing to source would
+    // hide a broken `exports` map and let the acyclic layering be violated
+    // without anything failing.
+    // NOT set: "noEmit", and no strictness flag is relaxed on top of the base.
+  },
+
+  // src/** only, and .ts only. This covers the library modules (index.ts,
+  // input.ts, normalize.ts, spec.ts, summary.ts, catalog.ts, validate.ts,
+  // semantic.ts, json-schema.ts, nodes/{query,layout,viz}.ts) and the colocated
+  // `*.test.ts` suites (input, normalize, validate, semantic, catalog), which are
+  // deliberately part of the program so the typecheck gate covers them: `strict`,
+  // `noUncheckedIndexedAccess`, `noUnusedLocals` and `noUnusedParameters` apply to
+  // tests exactly as they do to sources. Tests import `{ describe, it, expect }`
+  // from "vitest" explicitly rather than relying on globals, so no
+  // "vitest/globals" entry is needed in `types`.
+  //
+  // Until the first src file lands, `tsc -b` on this project answers TS18003
+  // ("No inputs were found in config file") - expected on an empty subtree, not a
+  // configuration fault.
+  "include": ["src/**/*.ts"],
+
+  // Replaces the base's inherited list rather than merging with it, so the build
+  // output directories are named again here; resolved relative to this directory,
+  // meaning packages/panel-schema/{dist,node_modules,.tsbuild}. `include` already
+  // restricts the input set to src/**, which leaves dist/ (tsup output) and
+  // .tsbuild/ (declaration output) outside the program; these entries document
+  // that intent and keep it true if `include` is ever widened. Note what
+  // `exclude` does NOT do: it filters the `include` globs only, so a file reached
+  // by an import still joins the program - `rootDir` above is what rejects one
+  // from outside src/ (TS6059).
+  "exclude": ["dist", "node_modules", ".tsbuild"],
+
+  // The ONLY project references, foundational-first to match the root solution's
+  // ordering. @debuggen/panel-schema depends on @debuggen/shared (the single
+  // `SourceLocation` definition, reused rather than restated) and on
+  // @debuggen/telemetry (the telemetry event kinds, the attribute-key catalogs
+  // and the fixed metric-id set owned by its aggregate/summary.ts, likewise
+  // referenced rather than restated), and on no other workspace - exactly the
+  // edges AAP 0.2.2 gives this package and exactly its package.json
+  // `dependencies`.
+  //
+  // What the references do, precisely: they order the build, so `tsc -b` on this
+  // project (or on the root solution) builds packages/shared and then
+  // packages/telemetry before this project and reports errors in dependency
+  // order. They are NOT what resolves the two specifiers: each package's
+  // `exports` map points at its tsup output (dist/index.d.ts), which lies outside
+  // the `${configDir}/.tsbuild` declaration directory `tsc -b` writes, so no
+  // output-to-source redirect applies. That is deliberate - it type-checks this
+  // package against the very declarations its consumers import (AAP 0.2.2) - and
+  // it is why `pnpm verify` runs `pnpm build` before `pnpm typecheck`: on a tree
+  // where a dependency's dist/ is missing, the import fails with TS2307 rather
+  // than silently resolving to source.
+  //
+  // Never add ../protocol or ../panel-renderer, nor any app: both sit ABOVE this
+  // package in the layering (protocol embeds the panel spec in its panel.generated
+  // message; panel-renderer keys its component registry by this package's node
+  // catalog). A reference in either direction is the project-reference cycle that
+  // `tsc -b` rejects, and importing them from here is independently forbidden by
+  // the `no-restricted-imports` rules in the root eslint.config.js.
+  "references": [{ "path": "../shared" }, { "path": "../telemetry" }]
+}
