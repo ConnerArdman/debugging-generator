@@ -1,0 +1,36 @@
+{
+  "name": "@debuggen/demo-app",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Lumen Supply: a Next.js App Router B2B supply storefront used as the instrumentation target for this repository's debugging tool. It is a plain application workspace and depends on none of the product packages.",
+  "type": "module",
+  "scripts": {
+    "dev": "next dev",
+    "prebuild": "prisma generate",
+    "build": "next build",
+    "start": "next start",
+    "generate": "prisma generate",
+    "pretypecheck": "prisma generate",
+    "typecheck": "tsc -b",
+    "migrate": "prisma migrate deploy",
+    "migrate:dev": "prisma migrate dev",
+    "seed": "prisma db seed"
+  },
+  "dependencies": {
+    "@prisma/adapter-pg": "7.10.0",
+    "@prisma/client": "7.10.0",
+    "clsx": "2.1.1",
+    "next": "16.3.5",
+    "pg": "8.23.0",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@types/pg": "8.23.1",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "prisma": "7.10.0",
+    "tsx": "4.23.13"
+  }
+}

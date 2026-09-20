@@ -1,0 +1,29 @@
+{
+  "name": "@debuggen/code-analysis",
+  "version": "0.1.0",
+  "description": "Indexes a target TypeScript project with ts-morph into a queryable code graph of imports, symbols, components, event handlers, routes and database calls, and maps generated bundle positions back to project-relative source locations.",
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc -b",
+    "test": "vitest run --root ../.. --project code-analysis"
+  },
+  "dependencies": {
+    "@debuggen/shared": "workspace:*",
+    "@jridgewell/trace-mapping": "0.3.31",
+    "ts-morph": "28.0.0"
+  }
+}

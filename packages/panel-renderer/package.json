@@ -1,0 +1,45 @@
+{
+  "name": "@debuggen/panel-renderer",
+  "version": "0.1.0",
+  "description": "In-repo design system and panel renderer: design tokens, UI primitives, layout primitives, visualization components and the panel host.",
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": [
+    "**/*.css"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./styles.css": "./dist/styles.css"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "prebuild": "node scripts/build-tokens.mjs",
+    "build": "tsup",
+    "typecheck": "tsc -b",
+    "test": "vitest run --root ../.. --project panel-renderer",
+    "tokens:check": "node scripts/build-tokens.mjs --check"
+  },
+  "dependencies": {
+    "@debuggen/panel-schema": "workspace:*",
+    "@debuggen/shared": "workspace:*",
+    "@debuggen/telemetry": "workspace:*",
+    "@tanstack/react-virtual": "3.14.13",
+    "clsx": "2.1.1",
+    "lucide-react": "1.47.0"
+  },
+  "peerDependencies": {
+    "react": "19.3.0",
+    "react-dom": "19.3.0"
+  },
+  "devDependencies": {
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0"
+  }
+}

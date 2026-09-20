@@ -1,0 +1,230 @@
+{
+  "name": "debug-generator",
+  "displayName": "Debug Generator",
+  "description": "Turn a plain-English debugging question into a purpose-built, interactive debugging panel in Chrome DevTools, backed by temporary, fully reversible instrumentation of your own project.",
+  "version": "0.1.0",
+  "publisher": "debuggen",
+  "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ConnerArdman/debugging-generator.git"
+  },
+  "categories": [
+    "Debuggers",
+    "Other"
+  ],
+  "keywords": [
+    "debugging",
+    "devtools",
+    "instrumentation",
+    "tracing",
+    "telemetry"
+  ],
+  "engines": {
+    "vscode": "^1.125.0"
+  },
+  "icon": "media/icon.png",
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onUri",
+    "onView:debuggen.session"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "debuggen",
+          "title": "Debug Generator",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "debuggen": [
+        {
+          "type": "webview",
+          "id": "debuggen.session",
+          "name": "Session",
+          "contextualTitle": "Debug Generator"
+        },
+        {
+          "id": "debuggen.sessions",
+          "name": "Sessions",
+          "contextualTitle": "Debug Generator"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "debuggen.startSession",
+        "title": "Start Debugging Session",
+        "category": "Debug Generator",
+        "icon": "$(add)"
+      },
+      {
+        "command": "debuggen.startCapture",
+        "title": "Start Capture",
+        "category": "Debug Generator",
+        "icon": "$(debug-start)"
+      },
+      {
+        "command": "debuggen.stopCapture",
+        "title": "Stop Capture",
+        "category": "Debug Generator",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "debuggen.endSession",
+        "title": "End Session",
+        "category": "Debug Generator"
+      },
+      {
+        "command": "debuggen.openSource",
+        "title": "Open Source Location",
+        "category": "Debug Generator"
+      },
+      {
+        "command": "debuggen.launchDevServer",
+        "title": "Launch Dev Server",
+        "category": "Debug Generator"
+      },
+      {
+        "command": "debuggen.showModifications",
+        "title": "Show File Modifications",
+        "category": "Debug Generator"
+      },
+      {
+        "command": "debuggen.reopenSession",
+        "title": "Reopen Session",
+        "category": "Debug Generator",
+        "icon": "$(history)"
+      },
+      {
+        "command": "debuggen.startService",
+        "title": "Start Local Service",
+        "category": "Debug Generator"
+      },
+      {
+        "command": "debuggen.pairChrome",
+        "title": "Pair Chrome DevTools Panel",
+        "category": "Debug Generator"
+      },
+      {
+        "command": "debuggen.rotateServiceToken",
+        "title": "Rotate Service Token",
+        "category": "Debug Generator"
+      },
+      {
+        "command": "debuggen.purgeSessions",
+        "title": "Purge Stored Sessions",
+        "category": "Debug Generator"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "debuggen.openSource",
+          "when": "false"
+        },
+        {
+          "command": "debuggen.reopenSession",
+          "when": "false"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "debuggen.startCapture",
+          "when": "view == debuggen.session",
+          "group": "navigation@1"
+        },
+        {
+          "command": "debuggen.stopCapture",
+          "when": "view == debuggen.session",
+          "group": "navigation@2"
+        },
+        {
+          "command": "debuggen.startSession",
+          "when": "view == debuggen.sessions",
+          "group": "navigation@1"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "debuggen.reopenSession",
+          "when": "view == debuggen.sessions",
+          "group": "inline"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Debug Generator",
+      "properties": {
+        "debuggen.serviceUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:43117",
+          "scope": "machine-overridable",
+          "markdownDescription": "Base URL of the local coordination service. It must match the `DEBUGGEN_HOST` and `DEBUGGEN_PORT` values the service listens on."
+        },
+        "debuggen.autoStartService": {
+          "type": "boolean",
+          "default": true,
+          "scope": "machine-overridable",
+          "markdownDescription": "Start the coordination service bundled with this extension when a health check against `#debuggen.serviceUrl#` fails. Disable this to manage the service process yourself."
+        },
+        "debuggen.devServerUrl": {
+          "type": "string",
+          "default": "",
+          "scope": "resource",
+          "markdownDescription": "URL of the development server of the project you are debugging, for example `http://127.0.0.1:3000`. Leave this empty to let the service detect a running development server for the workspace folder, or launch one for it."
+        },
+        "debuggen.provider": {
+          "type": "string",
+          "enum": [
+            "anthropic",
+            "deterministic"
+          ],
+          "enumDescriptions": [
+            "Use the hosted Anthropic model provider. Requires ANTHROPIC_API_KEY in the environment of the coordination service.",
+            "Use the rules-based provider, which runs entirely offline, sends nothing off the machine, and is what the automated tests use."
+          ],
+          "default": "anthropic",
+          "scope": "machine-overridable",
+          "markdownDescription": "Model provider the coordination service reasons with. This value is forwarded as `DEBUGGEN_PROVIDER` when this extension starts the bundled service."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "node esbuild.mjs --production && vite build",
+    "build:host": "node esbuild.mjs --production",
+    "build:webview": "vite build",
+    "watch": "node esbuild.mjs --watch",
+    "watch:webview": "vite build --watch",
+    "typecheck": "tsc -b tsconfig.json tsconfig.webview.json",
+    "test": "vitest run --root ../.. --project vscode-extension-webview",
+    "pretest:vscode": "node esbuild.mjs --production --tests && vite build",
+    "test:vscode": "vscode-test",
+    "package": "vsce package --no-dependencies",
+    "vscode:prepublish": "node esbuild.mjs --production --package && vite build"
+  },
+  "dependencies": {
+    "@debuggen/panel-renderer": "workspace:*",
+    "@debuggen/protocol": "workspace:*",
+    "@debuggen/shared": "workspace:*",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "ws": "8.21.3"
+  },
+  "devDependencies": {
+    "@debuggen/local-service": "workspace:*",
+    "@types/mocha": "10.0.10",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@types/vscode": "1.125.0",
+    "@types/ws": "8.18.1",
+    "@vscode/test-cli": "0.0.15",
+    "@vscode/test-electron": "3.1.0",
+    "@vscode/vsce": "4.0.0"
+  }
+}
