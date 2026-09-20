@@ -1,0 +1,115 @@
+{
+  // ---------------------------------------------------------------------------
+  // @debuggen/model-provider - the compiler project for the monorepo typecheck
+  // gate.
+  //
+  // `pnpm typecheck` (= `pnpm demo:generate && tsc -b`) builds the root solution
+  // file, which lists this project after packages/shared because that is the only
+  // workspace this one sits on top of (AAP 0.2.2): the model boundary depends on
+  // @debuggen/shared and on nothing else in the repository, so the `references`
+  // array at the bottom of this file has exactly one entry.
+  //
+  // Everything that is not stated below is inherited from tsconfig.base.json and
+  // must stay that way - in particular `strict`, `noUncheckedIndexedAccess`,
+  // `verbatimModuleSyntax`, `isolatedModules`, the no-unused/no-implicit
+  // diagnostics, `target`/`lib` ES2023, and the declaration-emit settings
+  // (`declaration`, `declarationMap`, `sourceMap`, `emitDeclarationOnly`,
+  // `incremental`). `noEmit` must never be added: TypeScript 6.0.3 rejects a
+  // referenced project that disables emit with TS6310 and the whole gate fails.
+  //
+  // This file is JSONC. tsc, ESLint, Vitest, tsup and Prettier all parse comments
+  // in tsconfig files; anything reading it programmatically must use a JSONC-aware
+  // reader (`ts.readConfigFile`), never bare `JSON.parse`.
+  // ---------------------------------------------------------------------------
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    // Already true in the base; restated because the root solution file
+    // references this project and a non-composite reference fails `tsc -b`
+    // outright (TS6306). Keeping it local means a future edit to the base cannot
+    // silently break the gate at this project.
+    //
+    // tsup is the other consumer of this file (`tsconfig: './tsconfig.json'` in
+    // tsup.config.ts). If its `.d.ts` step ever objects to `composite` /
+    // `incremental`, the override belongs in that file's `dts.compilerOptions` -
+    // never here, because dropping `composite` breaks the solution build.
+    "composite": true,
+
+    // The base defaults to "ESNext" + "bundler" for the bundled/web workspaces and
+    // instructs Node-targeted projects to override with NodeNext. This package is
+    // Node-only: apps/local-service loads it in the service process,
+    // apps/vscode-extension bundles it into the VSIX for the same process, and
+    // src/prompt-loader.ts reads the versioned prompt files under
+    // apps/local-service/prompts/** with `node:fs` / `node:path`. Nothing here
+    // runs in a page, so the project is type-checked under real Node ESM
+    // resolution instead of a bundler approximation (AAP 0.3.4).
+    //
+    // Consequence for every source file in src/**: relative specifiers must carry
+    // an explicit ".js" extension (`export * from "./provider.js"`,
+    // `import { … } from "./providers/anthropic.js"`,
+    // `import { … } from "./deterministic/rules.js"`), and directory specifiers
+    // must name the file (`"./providers/index.js"`). Extensionless relative
+    // imports are a compile error here by design - they would break real Node
+    // consumers of dist/index.js. tsup/esbuild resolve a "./x.js" specifier from a
+    // TypeScript importer back to "./x.ts", so the bundle is unaffected.
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+
+    // Per-workspace (the base deliberately leaves it unset), so the declaration
+    // tree under .tsbuild/ mirrors src/ exactly: src/index.ts -> .tsbuild/index.d.ts
+    // and src/providers/anthropic.ts -> .tsbuild/providers/anthropic.d.ts, matching
+    // the single "." path the package.json `exports` map advertises under dist/.
+    "rootDir": "src",
+
+    // The base sets no `types` so that one workspace's ambient globals cannot bleed
+    // into another. This package needs exactly one: @types/node 24.13.6 (a root
+    // devDependency, resolved through the workspace-root node_modules/@types by the
+    // ancestor walk-up, which is why it is absent from this package's manifest).
+    // It types the `node:fs` / `node:path` / `node:url` builtins behind
+    // src/prompt-loader.ts and the `process.env` reads behind src/factory.ts
+    // (DEBUGGEN_PROVIDER, DEBUGGEN_MODEL, ANTHROPIC_API_KEY).
+    //
+    // Deliberately no "lib": ["DOM"] override and no "chrome"/"vscode" entry: a
+    // model call never happens in a page, and @anthropic-ai/sdk 0.127.0 ships its
+    // own fetch typings, so the Node lib set is sufficient.
+    "types": ["node"]
+
+    // NOT overridden: "outDir" / "declarationDir" / "tsBuildInfoFile". The base
+    // already anchors them per project with `${configDir}`, which resolves to the
+    // directory of THIS file, so declarations and the incremental stamp land in
+    // packages/model-provider/.tsbuild (ignored by .gitignore and .prettierignore).
+    // tsc must never write into packages/model-provider/dist: that directory
+    // belongs to tsup and holds the artefacts the `exports` map points at.
+    // NOT overridden: "skipLibCheck" (the base already enables it) and no strictness
+    // flag is relaxed or added on top of the base.
+  },
+
+  // src/** only, and deliberately including the colocated `*.test.ts` files -
+  // src/structured.test.ts, src/prompt-loader.test.ts, src/redact-guard.test.ts,
+  // src/providers/deterministic.test.ts and src/providers/anthropic.test.ts - so the
+  // typecheck gate and ESLint's type-aware project service cover the tests too. They
+  // import `{ describe, it, expect, vi }` from "vitest" explicitly rather than relying
+  // on globals, and vitest resolves from the workspace-root node_modules, so no
+  // "vitest/globals" entry is needed in `types`. Tests never reach dist/: tsup bundles
+  // only what src/index.ts imports.
+  "include": ["src/**/*.ts"],
+
+  // Replaces the base's inherited list; resolved relative to this directory, so it
+  // means packages/model-provider/dist, /.tsbuild and /node_modules. Belt and braces:
+  // `include` already restricts the input set to src/**, and the tsup output in dist/
+  // plus the declaration output in .tsbuild/ sit outside it.
+  "exclude": ["dist", ".tsbuild", "node_modules"],
+
+  // The one substantive difference from packages/shared/tsconfig.json, which has no
+  // references: this project consumes @debuggen/shared (ids, Result, SourceLocation,
+  // the logger and DebuggenError), so `tsc -b` must build that project first.
+  //
+  // No other reference may be added. @debuggen/panel-schema, @debuggen/instrumentation,
+  // @debuggen/telemetry and @debuggen/protocol are deliberately not dependencies of the
+  // model boundary (AAP 0.2.2): callers pass their own Zod authoring schema and their
+  // deterministic normaliser in, so this package stays ignorant of plans, panels, events
+  // and messages. eslint.config.js fails the build on an import of any of them, and a
+  // reference to @debuggen/protocol would close a cycle, since protocol sits above this
+  // layer.
+  "references": [{ "path": "../shared" }]
+}

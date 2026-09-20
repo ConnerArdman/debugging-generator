@@ -28,7 +28,10 @@ export default tseslint.config(
   ...tseslint.configs.recommended,
   {
     files: ['**/*.{jsx,tsx}'],
-    ...reactHooks.configs['recommended-latest'],
+    // eslint-plugin-react-hooks 7 publishes both formats: `configs['recommended-latest']`
+    // is the legacy eslintrc object (`plugins: ['react-hooks']`), which flat config
+    // rejects, so the flat variant under `configs.flat` is the one to spread here.
+    ...reactHooks.configs.flat['recommended-latest'],
   },
   {
     files: ['**/*.{js,mjs,cjs}'],

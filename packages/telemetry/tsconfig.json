@@ -1,0 +1,220 @@
+{
+  // ---------------------------------------------------------------------------
+  // @debuggen/telemetry - the compiler project for the monorepo typecheck gate.
+  //
+  // `pnpm typecheck` (= `pnpm demo:generate && tsc -b`) builds the root solution
+  // file, whose `references` list this project directly after packages/shared:
+  // telemetry sits one level above the bottom of the acyclic package graph
+  // (AAP 0.2.2) and depends on that one workspace and nothing else. So
+  // `references` below has exactly one entry, and `tsc -b` on either the root
+  // solution or this project alone builds packages/shared's declarations first.
+  //
+  // This is the only project in the monorepo that legitimately spans two
+  // runtimes in one program (see the `lib` note): the runtime-neutral library
+  // (schema, redaction, correlation, aggregates), the page-injected browser
+  // agent under src/browser/** and the dev-server Node preload under src/node/**.
+  // Splitting it is deliberately NOT done - the AAP names a single tsconfig.json
+  // for this workspace and the root solution references only this file - so the
+  // discipline that keeps the two runtimes apart lives elsewhere:
+  //   - eslint.config.js (`no-restricted-imports`) forbids `@debuggen/protocol`
+  //     and `@debuggen/shared/node` inside src/browser/**;
+  //   - esbuild.agent.mjs hard-fails if the agent bundle pulls in a Node builtin.
+  // The compiler's job here is to type-check all three subtrees in one pass; the
+  // conventions recorded at the bottom of this file are what keep that honest.
+  //
+  // Everything not stated below is inherited from tsconfig.base.json and must
+  // stay that way - in particular `strict`, `noUncheckedIndexedAccess`,
+  // `verbatimModuleSyntax`, `isolatedModules`, the no-unused/no-implicit
+  // diagnostics, `target` ES2023 and the declaration-emit settings
+  // (`declaration`, `declarationMap`, `sourceMap`, `emitDeclarationOnly`,
+  // `incremental`). `noEmit` must never be added: TypeScript 6.0.3 rejects a
+  // referenced project that disables emit with TS6310 and the whole gate fails.
+  //
+  // This file is JSONC. tsc, ESLint, Vitest, tsup and Prettier all parse comments
+  // in tsconfig files; anything reading it programmatically must use a JSONC-aware
+  // reader (`ts.readConfigFile`), never bare `JSON.parse`.
+  // ---------------------------------------------------------------------------
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    // Already true in the base; restated because the root solution file
+    // references this project and a non-composite reference fails `tsc -b`
+    // outright (TS6306). Keeping it local means a future edit to the base cannot
+    // silently break the gate at this project.
+    "composite": true,
+
+    // The base defaults to "ESNext" + "bundler" for the bundled/web workspaces and
+    // instructs Node-targeted projects - naming the `./node/register` preload entry
+    // of this package - to override with NodeNext. package.json declares
+    // `"type": "module"`, and dist/node/register.mjs is loaded directly by Node
+    // (`NODE_OPTIONS=--import`) inside the developer's `next dev` process, so this
+    // project is type-checked under real Node ESM resolution rather than a bundler
+    // approximation. Mirrors packages/shared and AAP 0.3.4 ("NodeNext for node
+    // packages").
+    //
+    // Consequence for every source file in src/**: relative specifiers must carry
+    // an explicit ".js" extension - `./schema/event.js`, `./browser/fiber-diff.js`,
+    // and `./react.js` for a module authored as react.tsx - and directory
+    // specifiers must name the file (`"./node/index.js"`). Extensionless relative
+    // imports are a compile error here by design (TS2835); they would break the
+    // real Node consumer of the preload. tsup/esbuild resolve a "./x.js" specifier
+    // from a TypeScript importer back to "./x.ts" (or ".tsx"), so the library
+    // bundle, the agent IIFE and the preload are unaffected.
+    //
+    // `verbatimModuleSyntax` is inherited, so a specifier imported only for its
+    // types must be written `import type` / `export type`: the agent IIFE and the
+    // preload must not retain a runtime import that existed only for a type.
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+
+    // Per-workspace (the base deliberately leaves it unset), so the declaration
+    // tree under .tsbuild/ mirrors src/ exactly: src/index.ts -> .tsbuild/index.d.ts
+    // and src/node/register.ts -> .tsbuild/node/register.d.ts, matching the paths
+    // the package.json `exports` map advertises under dist/. It also pins the
+    // program's boundary: nothing outside src/ may be an input (see the fixture
+    // note under "include"/"exclude").
+    "rootDir": "src",
+
+    // Widened from the base's ES2023-only set, which exists so that a Node-only
+    // package cannot reference `window` and still compile. This project must type
+    // the browser agent, which legitimately uses `window`, `document`,
+    // `PerformanceObserver`, `PerformanceEventTiming`, `PerformanceResourceTiming`,
+    // `fetch`/`XMLHttpRequest`, `MutationObserver` and `window.postMessage`, while
+    // the same program also types the Node preload. DOM.Iterable is what makes
+    // `for (const e of performanceObserverEntryList)`-style iteration and
+    // `Headers`/`FormData` iteration type-check.
+    //
+    // ES2023 is restated alongside the browser libs because `lib` REPLACES the
+    // inherited array rather than merging with it - omitting ES2023 here would
+    // silently drop `Array.prototype.findLast`, `toSorted` and the rest.
+    //
+    // The cost of one program over two runtimes is paid in the source: see the
+    // cross-runtime conventions at the bottom of this file. In particular the
+    // runtime-neutral modules (src/schema/**, src/redaction/**,
+    // src/correlation/**, src/aggregate/**) must not assume a DOM just because
+    // the compiler now knows one exists.
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+
+    // The base sets no `types` so that one workspace's ambient globals cannot bleed
+    // into another. This package needs exactly one: @types/node 24.13.6 (a root
+    // devDependency, resolved through the workspace-root node_modules/@types). It
+    // types the `node:*` builtins and the OpenTelemetry/Prisma surfaces used by
+    // src/node/**, and it is authored to stand down from the DOM globals it shares
+    // with lib.dom.d.ts, so the two coexist in this program.
+    //
+    // @types/react is a devDependency of this package but is deliberately absent
+    // here: it is not an ambient global package. The JSX types of the one .tsx
+    // source (src/browser/react.test.tsx, AAP 0.8.3) arrive through the automatic
+    // runtime's `react/jsx-runtime` module import, and `import type { ... } from
+    // "react"` resolves the same way. Listing it in `types` would instead make
+    // React's globals ambient across the browser agent and the preload.
+    "types": ["node"],
+
+    // Inherited from the base (React 19.3.0 automatic runtime) and restated so the
+    // guarantee is local: the colocated `*.test.tsx` under src/browser/** is inside
+    // `include`, so this project must be able to compile JSX without an
+    // `import React` in every file. A base that later scoped jsx to the React
+    // surfaces would otherwise break this project's tests.
+    "jsx": "react-jsx"
+
+    // NOT overridden: "outDir" / "declarationDir" / "tsBuildInfoFile". The base
+    // anchors them per project with `${configDir}`, which resolves to the directory
+    // of THIS file, so declarations and the incremental stamp land in
+    // packages/telemetry/.tsbuild - ignored by .gitignore, .prettierignore and the
+    // ignore list in eslint.config.js. A repository-level path such as
+    // ../../.tsbuild/packages/telemetry would be a new output location outside
+    // those ignore lists and would leak build artefacts into `git status`; tsc must
+    // likewise never write into packages/telemetry/dist, which belongs to tsup,
+    // esbuild.agent.mjs and esbuild.node.mjs and holds the artefacts the `exports`
+    // map points at.
+    // NOT set: "paths" / "baseUrl". `@debuggen/shared` resolves through the pnpm
+    // workspace symlink and that package's `exports` map plus the project reference
+    // below, exactly as the runtime and the bundlers resolve it (AAP 0.2.2).
+    // Aliasing to source would hide a broken `exports` map and let the acyclic
+    // package layering be violated without anything failing.
+    // NOT set: "resolveJsonModule" (the base already enables it) - but see the
+    // fixture note below: JSON under test/ is loaded at runtime, never imported.
+    // NOT set: "noEmit", and no strictness flag is relaxed on top of the base.
+  },
+
+  // src/** only - both extensions, because Vitest collects this package's suites
+  // from `packages/telemetry/src/**/*.test.{ts,tsx}` and the React fiber-hook test
+  // is authored as .tsx. The colocated `*.test.ts(x)` files are deliberately part
+  // of the program so the typecheck gate covers them: `strict`,
+  // `noUncheckedIndexedAccess`, `noUnusedLocals` and `noUnusedParameters` apply to
+  // tests exactly as they do to sources. Tests import `{ describe, it, expect }`
+  // from "vitest" explicitly rather than relying on globals, so no
+  // "vitest/globals" entry is needed in `types`.
+  "include": ["src/**/*.ts", "src/**/*.tsx"],
+
+  // Replaces the base's inherited list; resolved relative to this directory, so it
+  // means packages/telemetry/dist, packages/telemetry/node_modules and
+  // packages/telemetry/test/fixtures. `include` already restricts the input set to
+  // src/**, which leaves dist/ (bundler output), .tsbuild/ (declaration output) and
+  // test/ outside the program; the entries here document that intent and keep it
+  // true if `include` is ever widened. Note what `exclude` does NOT do: it filters
+  // the `include` globs only, so a file reached by an import still joins the
+  // program. The rules below, not this list, are what keep test/ out.
+  //
+  // The fixture pitfall, with the exact compiler behaviour of this project:
+  //   - Importing TypeScript from outside src/ - `import { x } from
+  //     "../test/helpers/x.js"` - fails hard, with TS6059 ("is not under 'rootDir'")
+  //     plus TS6307 ("is not listed within the file list of project"). Keeping
+  //     test/ free of TypeScript is what lets `rootDir` stay "src".
+  //   - Importing JSON - `import fixture from "../test/fixtures/event.json" with
+  //     { type: "json" }` - is not rejected, because `emitDeclarationOnly` means
+  //     that file emits nothing and so never trips the rootDir check. That is the
+  //     trap: it compiles, silently adds an input that sits outside `include`, the
+  //     declaration mirror and the Vitest/lint boundary, and gives the test an
+  //     unvalidated `any`-shaped literal typed by the fixture rather than by the
+  //     schema.
+  // Fixture-driven tests therefore read the file at runtime -
+  //   JSON.parse(readFileSync(new URL("../../test/fixtures/<name>.json",
+  //     import.meta.url), "utf8"))
+  // - and validate the parsed value with the Zod schema from src/schema/event.ts,
+  // which is the assertion that matters anyway.
+  "exclude": ["dist", "node_modules", "test/fixtures/**"],
+
+  // The ONLY project reference. @debuggen/telemetry depends on @debuggen/shared and
+  // on no other workspace (AAP 0.2.2 edge list), and `tsc -b` therefore builds
+  // packages/shared's declarations before this project. Never add ../protocol,
+  // ../code-analysis, ../panel-schema, ../instrumentation or any app: protocol and
+  // the rest sit ABOVE telemetry, importing them is an eslint
+  // `no-restricted-imports` failure, and a reference here would create precisely
+  // the cycle the layering exists to prevent.
+  //
+  // `SourceLocation` - the one symbol this package consumes from shared - comes
+  // from that package's root entry ("."), which is browser-safe. src/browser/**
+  // may import that entry but must never touch `@debuggen/shared/node` (hashing,
+  // safe-fs) or a Node builtin: it is bundled into an IIFE injected into the
+  // developer's page at `document_start`.
+  "references": [{ "path": "../shared" }]
+
+  // ---------------------------------------------------------------------------
+  // Cross-runtime source conventions this configuration forces on src/**
+  //
+  // Because lib.dom.d.ts and @types/node are both in scope, the compiler will
+  // accept code that cannot run in one of the two runtimes. These are the failure
+  // modes that surface first, and the rules that avoid them:
+  //
+  // 1. Timer handles are `ReturnType<typeof setTimeout>`, never `number` and never
+  //    `NodeJS.Timeout`. The DOM and Node overloads disagree on the return type,
+  //    and either concrete spelling breaks in the other runtime.
+  // 2. `startTime` is Unix epoch MILLISECONDS as a double, in both subtrees: the
+  //    browser computes `performance.timeOrigin + entry.startTime`, the preload
+  //    converts an OpenTelemetry `hrTime` tuple. `duration` is milliseconds. That
+  //    single time base is what lets the correlator order browser, server and db
+  //    events in one trace.
+  // 3. Environment-specific globals are reached behind capability checks -
+  //    `typeof PerformanceObserver !== "undefined"`, `typeof window !== "undefined"`
+  //    - not behind casts, so the runtime-neutral modules never assume a DOM and
+  //    stay importable by the service and the preload.
+  // 4. Shared helpers prefer `globalThis` over `window`/`global`. The span helper
+  //    is installed at `globalThis.__DEBUGGEN__` in BOTH runtimes and must keep the
+  //    identical shape
+  //      { span<T>(name: string, meta: Record<string, unknown>, fn: () => T): T }
+  //    that packages/instrumentation/src/patch/wrap-template.ts emits and that
+  //    scripts/check-no-residual-instrumentation.mjs greps for. Changing that shape
+  //    breaks every patched function in a developer's project.
+  // ---------------------------------------------------------------------------
+}
