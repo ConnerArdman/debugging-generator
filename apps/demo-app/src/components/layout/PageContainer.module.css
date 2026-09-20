@@ -1,0 +1,234 @@
+/*
+ * PageContainer - the page shell of the Lumen Supply storefront.
+ *
+ * Imported by exactly one file, its sibling `PageContainer.tsx`
+ * (`import styles from './PageContainer.module.css';`), which `app/layout.tsx` mounts once around
+ * `{children}`. Every route therefore renders through these rules, which is why the file owns only
+ * structure: the page measure, the page gutters, the top offset that keeps the sticky header off
+ * the first line of content, and the vertical rhythm of the optional heading block. Page-specific
+ * geometry belongs to the page's own component modules, and the header, nav and footer landmarks
+ * are owned by `SiteHeader`, `SiteNav` and `SiteFooter`.
+ *
+ * The class set is a closed contract with `PageContainer.tsx`, which consumes all eight and
+ * nothing else:
+ *
+ *   .root  -> <main id="main" tabIndex={-1} data-width="narrow|default|wide">
+ *     .inner
+ *       .head        (rendered only when breadcrumb, title, description or actions is supplied)
+ *         .breadcrumb .title .description .actions
+ *       .body        (the route's own content)
+ *
+ * Token discipline. Every value resolves to a `--ls-*` token from `app/globals.css`, and every
+ * reference carries the literal fallback that stylesheet declares, so the shell is presentable
+ * even when read on its own. Geometry that has no token of its own - the gutter step, the two
+ * measure variants, the reading measure, the two leading ratios - is declared as a file-local
+ * custom property on `.root` and derived from a token, either directly or through a unitless
+ * scale in `calc()`; nothing new is declared globally. Hex fallbacks are lowercase because
+ * Prettier normalises CSS colours and `pnpm format:check` is a blocking gate.
+ *
+ * Stacking and position are deliberately absent. The header's sticky behaviour and the drawer and
+ * toast tiers live in their own modules; this file offsets content beneath the header with
+ * padding and never competes for the same layer.
+ */
+
+.root {
+  /* The gutter is one property so that `.inner` reads it once and the breakpoint below is the
+   * only place it changes. */
+  --page-gutter: var(--ls-space-4, 16px);
+
+  /* The header's height plus one space step. Used twice, and it has to be the same value both
+   * times: as `padding-block-start` it keeps the first line of content clear of the sticky
+   * header, and as `scroll-margin-block-start` it stops an in-page jump to `#main` - the target
+   * of the header's "Skip to content" link - from parking that line underneath it. */
+  --page-offset: calc(var(--ls-header-height, 64px) + var(--ls-space-4, 16px));
+  --page-space-end: var(--ls-space-6, 32px);
+
+  /* The three page measures. `default` is the shared page width the header, nav and footer also
+   * cap themselves at; the variants scale it rather than introducing widths of their own, so all
+   * three move together when the token changes. */
+  --measure: var(--ls-page-max, 1200px);
+  --measure-narrow-scale: 0.7;
+  --measure-wide-scale: 1.3;
+  --measure-narrow: calc(var(--ls-page-max, 1200px) * var(--measure-narrow-scale));
+  --measure-wide: calc(var(--ls-page-max, 1200px) * var(--measure-wide-scale));
+
+  /* Heading-block rhythm: the gap between its rows, the gap between the heading column and the
+   * actions beside it, the space between its last row and the hairline, and the space between
+   * the hairline and the route's content. */
+  --head-gap: var(--ls-space-2, 8px);
+  --head-column-gap: var(--ls-space-4, 16px);
+  --head-rule-space: var(--ls-space-4, 16px);
+  --head-space-after: var(--ls-space-5, 24px);
+
+  /* The hairline's thickness is the one plain literal in the file: the shared token set names a
+   * border colour but no border width, and a hairline is one device pixel by definition. */
+  --head-rule-width: 1px;
+
+  /* Leading ratios are unitless on purpose, so they scale with whatever font size the token
+   * resolves to. 1.25 matches the global heading leading; 1.55 is the looser value supporting
+   * copy reads better at. */
+  --title-leading: 1.25;
+  --description-leading: 1.55;
+
+  /* A comfortable reading measure for the page description, derived from the body type token
+   * rather than fixed in pixels: 34 times the body size lands at roughly 68 characters, the same
+   * measure the global page-lede utility holds prose to, and it follows the reader's font size
+   * because the token is declared in `rem`. */
+  --description-measure-scale: 34;
+  --description-measure: calc(var(--ls-text-md, 15px) * var(--description-measure-scale));
+
+  display: block;
+  /* `body` is a flex column, so the main region is what grows to push the footer to the bottom of
+   * a short page; `min-width: 0` lets a wide table or grid inside scroll instead of stretching
+   * the column. */
+  flex: 1 1 auto;
+  min-width: 0;
+  padding-block-start: var(--page-offset);
+  padding-block-end: var(--page-space-end);
+  scroll-margin-block-start: var(--page-offset);
+}
+
+/* `PageContainer.tsx` sets `tabIndex={-1}` on this element so the skip link can move focus into
+ * it. That focus is programmatic, and a ring around the whole page would be noise, so it is
+ * suppressed for exactly that case - `:focus-visible` is untouched, which leaves a genuine
+ * keyboard focus ring intact. */
+.root:focus:not(:focus-visible) {
+  outline: none;
+}
+
+/* The centred measure. Width first, then the cap, so the region still fills a viewport narrower
+ * than the measure. */
+.inner {
+  width: 100%;
+  max-width: var(--measure);
+  margin-inline: auto;
+  padding-inline: var(--page-gutter);
+}
+
+/* Measure variants, selected by the `data-width` attribute the component sets rather than by an
+ * extra class - the convention the rest of this application follows. `default` needs no rule: it
+ * is `.inner` as declared above. */
+.root[data-width='narrow'] .inner {
+  max-width: var(--measure-narrow);
+}
+
+.root[data-width='wide'] .inner {
+  max-width: var(--measure-wide);
+}
+
+/* The heading block. The component omits the element entirely when it has no breadcrumb, title,
+ * description or actions to put in it, so the hairline below only ever appears under a heading
+ * that exists and no `:empty` guard is needed.
+ *
+ * A grid, not a wrapping flex row, and the reason is worth keeping: the description carries a
+ * reading measure, and in a flex row a `max-width` shrinks the item's hypothetical main size, so
+ * an item asking for a full line stops asking for one as soon as it is clamped - the row model
+ * then silently depends on how long the copy is. Grid places an item independently of how wide it
+ * is, so the description keeps both its own row and its measure, and the actions can sit beside
+ * the title without reordering anything. One column here stacks the rows in source order; the
+ * breakpoint below adds the second column. */
+.head {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--head-gap);
+  margin-block-end: var(--head-space-after);
+  padding-block-end: var(--head-rule-space);
+  border-block-end: var(--head-rule-width) solid var(--ls-border, #cbd5e1);
+}
+
+/* Placement for the breadcrumb node the page passes in. Spacing only - the trail's own
+ * typography and separators belong to `BreadcrumbTrail.module.css`. */
+.breadcrumb {
+  min-width: 0;
+}
+
+/* The page's single `<h1>`. */
+.title {
+  min-width: 0;
+  margin: 0;
+  color: var(--ls-text, #0f172a);
+  font-family: var(
+    --ls-font-sans,
+    system-ui,
+    -apple-system,
+    'Segoe UI',
+    Roboto,
+    'Helvetica Neue',
+    Arial,
+    sans-serif
+  );
+  font-size: var(--ls-text-xl, 24px);
+  font-weight: 600;
+  line-height: var(--title-leading);
+}
+
+/* The sentence under the title. It keeps its own reading measure however wide the page gets, and
+ * it always takes a row of its own so a long lede never squeezes the actions beside it. */
+.description {
+  min-width: 0;
+  max-width: var(--description-measure);
+  margin: 0;
+  color: var(--ls-text-muted, #475569);
+  font-size: var(--ls-text-md, 15px);
+  line-height: var(--description-leading);
+}
+
+/* The heading's trailing controls. Their own appearance is the button component's business; this
+ * rule places them and lets them wrap among themselves when the row runs out of room. */
+.actions {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--ls-space-2, 8px);
+}
+
+/* The route's content. `min-width: 0` is the important half: without it a wide table or grid
+ * child would widen this block past the measure instead of scrolling inside it. */
+.body {
+  display: block;
+  min-width: 0;
+}
+
+/* The file's only breakpoint. A custom property cannot be read inside a media query, so the
+ * length here is a literal; it is 48rem - 768px at the default root size - which is where there
+ * is room for the title and its actions on one line, and where the wider gutter starts to look
+ * intentional rather than wasteful. */
+@media (min-width: 48rem) {
+  .root {
+    --page-gutter: var(--ls-space-6, 32px);
+  }
+
+  /* A second, content-sized column for the actions. Dense packing is what lets them rise to the
+   * title's row without the source order changing: every child names its column and leaves its
+   * row to the grid, so the actions take the first row where the trailing column is free - the
+   * title's row when a breadcrumb has claimed the full width above it, the first row when it has
+   * not. No child is reordered, so the reading order the component renders is the order a screen
+   * reader announces. */
+  .head {
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-auto-flow: row dense;
+    align-items: center;
+    column-gap: var(--head-column-gap);
+  }
+
+  /* The breadcrumb reads across the whole block; the title and its description share the first
+   * column so the actions have the second to themselves. */
+  .breadcrumb {
+    grid-column: 1 / -1;
+  }
+
+  .title {
+    grid-column: 1;
+  }
+
+  .description {
+    grid-column: 1;
+  }
+
+  .actions {
+    grid-column: 2;
+    justify-self: end;
+  }
+}

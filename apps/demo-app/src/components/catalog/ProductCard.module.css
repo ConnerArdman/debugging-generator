@@ -1,0 +1,221 @@
+/*
+ * Lumen Supply - catalog product tile geometry.
+ *
+ * Consumed only by `ProductCard.tsx`, which puts `.root` (plus `.selected` while the tile's quick
+ * specs are open) on a `@/components/ui/Card` and the remaining classes on its own elements. The
+ * primitives the tile composes - `Card`, `Pill`, `Badge`, `Price`, `Button` - own their surface,
+ * typography and interaction states. This file owns the tile's geometry and the two accents that
+ * belong to the tile itself: the outline that marks an expanded tile and the focus ring on the
+ * product link, which is the tile's accessible name.
+ *
+ * Token contract: every colour, space, radius, type size and family is read as
+ * `var(--ls-NAME, <literal fallback>)`. `app/globals.css` declares the tokens once for the
+ * application and each fallback mirrors the declaration there, so this module also renders
+ * sensibly on its own. Geometry the token set does not model - the media ratio, the title clamp,
+ * the accent width, the hairline, the stock layer, the grid tracks - is declared once on `.root`
+ * as a file-local `--catalog-*` property whose own value is a `var(--ls-catalog-*, <literal>)`
+ * lookup: a future global override has a name to target, descendants inherit the resolved value,
+ * and no bare value is repeated at a use site.
+ *
+ * Nothing here restyles a primitive's chrome, and nothing here animates: `Card` owns the tile's
+ * hover elevation together with the reduced-motion treatment of that transition, so this file
+ * introduces no transition of its own and needs no reduced-motion block.
+ */
+
+.root {
+  /* File-local geometry, resolved once here and inherited by every element below. */
+  --catalog-card-fill: var(--ls-catalog-card-fill, 100%);
+  --catalog-media-ratio: var(--ls-catalog-media-ratio, 4 / 3);
+  --catalog-body-columns: var(--ls-catalog-body-columns, minmax(0, 1fr));
+  --catalog-stock-layer: var(--ls-catalog-stock-layer, 1);
+  --catalog-accent-width: var(--ls-catalog-accent-width, 2px);
+  --catalog-hairline: var(--ls-catalog-hairline, 1px);
+  --catalog-title-lines: var(--ls-catalog-title-lines, 2);
+  --catalog-title-leading: var(--ls-catalog-title-leading, 1.3);
+  --catalog-specs-columns: var(--ls-catalog-specs-columns, max-content minmax(0, 1fr));
+
+  display: grid;
+  block-size: var(--catalog-card-fill, 100%);
+  min-inline-size: 0;
+  gap: var(--ls-space-2, 8px);
+}
+
+/*
+ * `Card` wraps the tile's content in one slot element of its own and declares no layout for it -
+ * its stylesheet owns the surface and leaves arrangement to the caller - so the tile's single
+ * content column is composed here, on that slot, rather than by reaching into the primitive's own
+ * class names. The column is as tall as the card, which is what lets `.actions` settle at the foot
+ * of a tile whose product name is shorter than its neighbour's.
+ */
+.root > * {
+  display: flex;
+  flex-direction: column;
+  min-inline-size: 0;
+  gap: var(--ls-space-2, 8px);
+}
+
+/*
+ * An expanded tile. The outline is an accent on top of the specs list itself, the toggle's label
+ * and its `aria-expanded` state, so the colour is never the only thing that reports the state.
+ *
+ * BLITZY [A11Y]: --ls-accent (#f59e0b) measures 2.15:1 against --ls-surface, below the 3:1
+ * recommendation for a non-text indicator. Implemented with the shared token the design contract
+ * assigns to a selected surface rather than silently darkened, exactly as `app/globals.css`
+ * records for the same token. Flagged for design review.
+ */
+.selected {
+  outline: var(--catalog-accent-width, 2px) solid var(--ls-accent, #f59e0b);
+  outline-offset: var(--ls-space-1, 4px);
+}
+
+.media {
+  position: relative;
+  aspect-ratio: var(--catalog-media-ratio, 4 / 3);
+  overflow: hidden;
+  border-radius: var(--ls-radius-md, 8px);
+  background: var(--ls-surface-sunken, #f8fafc);
+}
+
+/* The catalog artwork is 4:3, and so is its placeholder; `contain` keeps either undistorted in a
+ * track that is narrower or wider than the box's own ratio. */
+.image {
+  inline-size: var(--catalog-card-fill, 100%);
+  block-size: var(--catalog-card-fill, 100%);
+  object-fit: contain;
+}
+
+/* The stock indicator sits over the artwork, inset by one space step on both axes; the maximum
+ * inline size is the media box less those two insets, so a long label wraps inside the box instead
+ * of reaching past its rounded corner. */
+.stock {
+  position: absolute;
+  z-index: var(--catalog-stock-layer, 1);
+  inset-block-start: var(--ls-space-2, 8px);
+  inset-inline-end: var(--ls-space-2, 8px);
+  max-inline-size: calc(var(--catalog-card-fill, 100%) - var(--ls-space-4, 16px));
+}
+
+/*
+ * The name, code and price stack. The single explicit track is what keeps a long unbroken product
+ * code from setting the tile's width: an implicit `auto` track is floored at its widest child's
+ * minimum content size, so a 40-character code would widen the tile past its grid cell, while
+ * `minmax(0, 1fr)` holds the track to the cell and leaves wrapping to the children below.
+ */
+.body {
+  display: grid;
+  grid-template-columns: var(--catalog-body-columns, minmax(0, 1fr));
+  min-inline-size: 0;
+  gap: var(--ls-space-1, 4px);
+}
+
+/* The heading is the type treatment; the anchor inside it carries the box. */
+.title {
+  margin: 0;
+  min-inline-size: 0;
+  color: var(--ls-text, #0f172a);
+  font-family: var(--ls-font-sans, system-ui, sans-serif);
+  font-size: var(--ls-text-md, 15px);
+  line-height: var(--catalog-title-leading, 1.3);
+}
+
+/*
+ * The product name, held to two lines so an industrial description cannot stretch one tile past
+ * the others in its row, and clipped by the same element that carries the focus ring below: an
+ * element's own overflow never clips its own outline, whereas a clamp on the heading would cut
+ * the ring off along every edge. Surplus lines stay inside this box, so nothing paints over the
+ * product code underneath it.
+ */
+.link {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: var(--catalog-title-lines, 2);
+  overflow: hidden;
+  color: inherit;
+  text-decoration: none;
+}
+
+/* Hover is gated so a touch activation does not leave the underline stuck on the tile. */
+@media (hover: hover) {
+  .link:hover {
+    text-decoration: underline;
+  }
+}
+
+.link:focus-visible {
+  outline: var(--catalog-accent-width, 2px) solid var(--ls-focus, #0f766e);
+  outline-offset: var(--ls-space-1, 4px);
+  border-radius: var(--ls-radius-sm, 4px);
+}
+
+/* Product codes carry no break opportunity of their own, so one is granted here rather than
+ * letting an unbroken run reach past the tile. */
+.sku {
+  margin: 0;
+  min-inline-size: 0;
+  overflow-wrap: anywhere;
+  color: var(--ls-text-muted, #475569);
+  font-family: var(--ls-font-mono, ui-monospace, monospace);
+  font-size: var(--ls-text-xs, 12px);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Current price, any comparison price and its saving share a baseline, and wrap together in a
+ * narrow track. */
+.priceRow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  min-inline-size: 0;
+  gap: var(--ls-space-2, 8px);
+}
+
+.category {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  min-inline-size: 0;
+  gap: var(--ls-space-1, 4px);
+}
+
+/* The action row is the last thing in the column's flow before the specs list, and the automatic
+ * leading margin absorbs whatever height the tile has to spare, so every tile in a row presents
+ * its controls on the same line. */
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  margin-block-start: auto;
+  gap: var(--ls-space-2, 8px);
+}
+
+/* Quick specs: a term column sized to its longest label and a value column that takes the rest,
+ * separated from the controls above by the shared hairline. */
+.specs {
+  display: grid;
+  grid-template-columns: var(--catalog-specs-columns, max-content minmax(0, 1fr));
+  align-items: baseline;
+  margin: 0;
+  border-block-start: var(--catalog-hairline, 1px) solid var(--ls-border, #cbd5e1);
+  padding-block-start: var(--ls-space-2, 8px);
+  column-gap: var(--ls-space-2, 8px);
+  row-gap: var(--ls-space-1, 4px);
+}
+
+.specsTerm {
+  color: var(--ls-text-muted, #475569);
+  font-family: var(--ls-font-sans, system-ui, sans-serif);
+  font-size: var(--ls-text-xs, 12px);
+}
+
+/* Spec values are identifiers and counts - a stock keeping unit, a category key, an on-hand
+ * quantity - so they read in the monospaced face with figures aligned, and an unbroken code wraps
+ * rather than widening the column. */
+.specsValue {
+  margin: 0;
+  min-inline-size: 0;
+  overflow-wrap: anywhere;
+  color: var(--ls-text, #0f172a);
+  font-family: var(--ls-font-mono, ui-monospace, monospace);
+  font-size: var(--ls-text-sm, 13px);
+  font-variant-numeric: tabular-nums;
+}

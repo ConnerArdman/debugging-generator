@@ -1,0 +1,102 @@
+/*
+ * CheckoutSummaryPanel - the order-review column of the /checkout page.
+ *
+ * Scope, deliberately narrow. This module owns the column's vertical rhythm, its heading, the
+ * separator above the line list, the caption beneath the totals and the sticky treatment that
+ * keeps the review beside a long form. Everything the column actually *looks* like arrives with
+ * the components it composes, each of which owns its own appearance:
+ *
+ *   - `../cart/CartLineList` (page variant) owns the list reset, the row grid, the thumbnail box,
+ *     the row separators and the inline-size container that collapses a row in a narrow column.
+ *     No rule here re-declares any of that, and no rule here competes with that container.
+ *   - `../cart/CartTotalsPanel` (page variant) already renders inside `../ui/Card`, so `.totals`
+ *     below is placement only: a surface, border, radius, shadow or padding at that level would
+ *     show as a card drawn inside a card.
+ *   - `../ui/BlankSlate` owns the illustration, copy and actions of the nothing-to-review block,
+ *     so `.empty` only gives that block room.
+ *
+ * The point of the restraint is that the checkout review reads as the same presentation as the
+ * /cart page, because it is the same components fed by the same hooks - only the rhythm around
+ * them is local to checkout.
+ *
+ * Token contract: every colour, length and font size resolves through an `--ls-*` custom property
+ * declared in `app/globals.css`, written with the literal fallback that file documents (its type
+ * scale is authored in rem and its comments give the rendered pixel size at the default 16px
+ * root, which is the form a component fallback states). A length with no token of its own - the
+ * hairline - is derived with `calc()` over the spacing scale rather than written as a bare value.
+ * Hex values are lowercase because Prettier normalises CSS colours and `pnpm format:check` is a
+ * blocking gate.
+ */
+
+/* The column itself: one evenly spaced stack, free to shrink inside its track. */
+.root {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: var(--ls-space-4, 16px);
+}
+
+/*
+ * Wide enough for two columns, so the review can follow the form down the page. The threshold is
+ * the width at which `.ls-split` in `app/globals.css` adopts its second track - 960px, written as
+ * a product of the 16px root size because a media condition cannot read a custom property. Below
+ * it the page is a single column, where a sticky review would pin itself over the content it is
+ * meant to sit beside, so the treatment is added here rather than declared above and undone.
+ *
+ * The offset clears the sticky site header and leaves one spacing step of air under it.
+ * `align-self` holds the panel at its natural height wherever it is itself the grid or flex item.
+ * No `z-index`: the site header carries `--ls-z-header` and already paints above this column, and
+ * the column has no sibling of its own to out-rank.
+ */
+@media (min-width: calc(60 * 16px)) {
+  .root {
+    position: sticky;
+    inset-block-start: calc(var(--ls-header-height, 64px) + var(--ls-space-4, 16px));
+    align-self: start;
+  }
+}
+
+/* The column's heading element. Its weight and line height come from the element baseline; the
+ * size, the colour and the step of air beneath it are stated here so the block reads as a column
+ * head rather than a page section title. */
+.heading {
+  margin-block-end: var(--ls-space-2, 8px);
+  color: var(--ls-text, #0f172a);
+  font-size: var(--ls-text-lg, 18px);
+  font-weight: 600;
+}
+
+/* Spacing wrapper for the line list. The rule separates the reviewed lines from the heading above
+ * them and the padding gives the first row the air the rule takes; `min-width` is shrink
+ * behaviour rather than decoration, and keeps a long product code from widening the column. The
+ * hairline is a quarter of the first spacing step, which is how the module states it without a
+ * bare length. */
+.lines {
+  min-width: 0;
+  border-block-start: calc(var(--ls-space-1, 4px) / 4) solid var(--ls-border, #cbd5e1);
+  padding-block-start: var(--ls-space-4, 16px);
+}
+
+/* Placement for the totals block, and nothing besides - see the note at the head of this file.
+ * The stack supplies its spacing; `min-width` lets a long money row shrink instead of widening
+ * the column around it. */
+.totals {
+  min-width: 0;
+}
+
+/* The quiet caption under the totals: a note about the review itself, never a figure the buyer
+ * has to read off the page. */
+.meta {
+  color: var(--ls-text-muted, #475569);
+  font-size: var(--ls-text-sm, 13px);
+}
+
+/* Room for the block the column shows when there is nothing to review. That block brings its own
+ * illustration, copy and actions, so this contributes spacing only. */
+.empty {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: var(--ls-space-2, 8px);
+  padding-block: var(--ls-space-2, 8px);
+}

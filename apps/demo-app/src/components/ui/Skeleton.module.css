@@ -1,0 +1,186 @@
+/*
+ * Lumen Supply - loading placeholder surface.
+ *
+ * The module behind `Skeleton.tsx`, the storefront's one loading placeholder. The catalog grid,
+ * product detail, cart and dashboard all reserve their boxes with it while server data resolves,
+ * so this file is the single place the shimmer is defined and the single place it stops.
+ *
+ * Class contract - three names, nothing else is exported:
+ *
+ *   .root   one placeholder box. Block-level and full-width by default; its shape comes from the
+ *           element's `data-shape` attribute ("text" | "block" | "circle") rather than from a
+ *           second class, so the component passes its prop straight through to the DOM and the
+ *           caller's own class stays free to size the box.
+ *   .lines  the wrapper of a multi-line text placeholder: one column, evenly spaced.
+ *   .line   one line inside that wrapper. It carries the same surface as `.root`, takes its
+ *           height from the body type scale, and the last of several lines is short so the group
+ *           reads as a paragraph instead of a bar.
+ *
+ * `.root` is accepted as that wrapper too: the rule in the stack section turns a `.root` holding
+ * `.line` children into the column and drops the surface it would otherwise paint behind them, so
+ * both spellings render the same thing rather than one of them shimmering through the gaps.
+ *
+ * Sizing: a "text" line is the body type size tall and as wide as its container, a "block" fills
+ * the box it is placed in, and a "circle" is one type-scale square. Where a caller knows a
+ * dimension the box cannot supply, it declares the file's own `--skeleton-size` on the element
+ * through the `className` it passes; see the two shape rules for which one wins what.
+ *
+ * The box is decorative. `Skeleton.tsx` renders it `aria-hidden`, it has no text, and this file
+ * adds none: there is no generated content anywhere below, because a placeholder that announced
+ * itself would read out as noise between the real content and the status message the page already
+ * gives. What a reader is told about loading belongs to the page, not to the grey box.
+ *
+ * Tokens: every colour, radius and length is `var(--ls-NAME, <literal fallback>)` over the
+ * `--ls-*` set declared in `app/globals.css`, each fallback mirroring the value there, so the
+ * module also renders correctly read on its own. Hex spellings are lowercase because Prettier
+ * normalises them and `pnpm format:check` is a blocking gate - do not restore uppercase.
+ *
+ * Motion: the shimmer animates `background-position` across a gradient twice the width of the
+ * box, and nothing else - no opacity fade, no transform, no shadow pulse. A full catalog paints
+ * 48 of these at once, and one background sweep is the calmest of the options that still reads as
+ * "loading"; it also keeps this page's own render behaviour attributable to the page rather than
+ * to its placeholders. The reduced-motion rule at the end stops the sweep and leaves a flat,
+ * outlined box, because a placeholder still has to look like a placeholder when it holds still.
+ */
+
+.root,
+.line {
+  display: block;
+  width: 100%;
+  border-radius: var(--ls-radius-sm, 4px);
+  /* The recessed surface is the resting colour and the gradient rides over it, so the box is
+   * already the right grey before the first animation frame and stays that grey if a browser
+   * declines the gradient. */
+  background-color: var(--ls-surface-sunken, #f8fafc);
+  background-image: linear-gradient(
+    90deg,
+    var(--ls-surface-sunken, #f8fafc),
+    var(--ls-mist, #cbd5e1),
+    var(--ls-surface-sunken, #f8fafc)
+  );
+  /* Twice the box wide and tiled rather than clipped: one cycle travels exactly one tile, so a
+   * single highlight crosses the box and the loop has no seam. `no-repeat` would park the
+   * gradient outside the box for the back half of every pass and flatten the sweep. */
+  background-repeat: repeat;
+  background-size: 200% 100%;
+  background-position: 100% 0;
+  animation: shimmer 1400ms ease-in-out infinite;
+}
+
+/* Local to this module: css-loader scopes the name and rewrites the reference above, so no other
+ * stylesheet can see or collide with it. Only `background-position` moves. */
+@keyframes shimmer {
+  from {
+    background-position: 100% 0;
+  }
+
+  to {
+    background-position: -100% 0;
+  }
+}
+
+/* Shapes
+ * ---------------------------------------------------------------------------------------------
+ * Chosen by the attribute the component writes and never by a class lookup, which keeps the
+ * component's `shape` prop and the DOM in step and leaves one class name to compose with. */
+
+.root[data-shape='text'] {
+  /* One line of body copy, exactly the body type size tall - that is what makes a placeholder
+   * line up with the sentence it stands in for. */
+  height: var(--ls-text-md, 15px);
+}
+
+.root[data-shape='block'] {
+  /* Fills the box the caller's class gives it - an image frame, a chart area, a card body - and
+   * never collapses to nothing when that box has no height of its own. A caller that knows the
+   * height rather than the box declares `--skeleton-size` instead of `height`: this file makes no
+   * declaration of that property for a block, so the caller's always wins, whichever order the
+   * two modules end up in and whatever their selectors weigh. */
+  height: var(--skeleton-size, 100%);
+  min-height: var(--ls-space-6, 32px);
+}
+
+.root[data-shape='circle'] {
+  /* An avatar or thumbnail slot: equal sides, so 50% is a circle and not an ellipse. Width is
+   * restated here because the surface above is full-width. The default diameter is the file's
+   * own; a caller changes it with `.myClass[data-shape='circle'] { --skeleton-size: ... }`, which
+   * outweighs this rule. */
+  --skeleton-size: var(--ls-text-xl, 24px);
+
+  width: var(--skeleton-size);
+  height: var(--skeleton-size);
+  /* Hold the diameter inside a flex row, where the default would let it shrink. */
+  flex: 0 0 auto;
+  border-radius: 50%;
+}
+
+/* Multi-line text placeholders
+ * ---------------------------------------------------------------------------------------------
+ * A paragraph's worth of lines, stacked in one column. */
+
+.lines,
+.root:has(> .line) {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: var(--ls-space-1, 4px);
+}
+
+/* A `.root` used as the wrapper is a container, not a box: it gives up the surface it would
+ * otherwise paint behind its lines and the height a shape variant gave it. Declared after the
+ * shape rules on purpose - it matches at the same weight and has to win the tie. */
+.root:has(> .line) {
+  height: auto;
+  min-height: 0;
+  border-radius: 0;
+  background: none;
+  outline: none;
+  animation: none;
+}
+
+.line {
+  height: var(--ls-text-md, 15px);
+  /* Every line keeps its exact height however tight the column gets. */
+  flex: 0 0 auto;
+}
+
+/* The ragged last line is the whole trick: equal full-width bars read as a block of shading,
+ * while a short final line reads as prose. A lone line keeps its full width, because there is no
+ * paragraph for it to suggest. */
+.line:last-child:not(:only-child) {
+  width: 60%;
+}
+
+/* Reduced motion
+ * ---------------------------------------------------------------------------------------------
+ * `app/globals.css` collapses animation durations for the whole document at zero specificity as a
+ * catch-all; a module that introduces motion owns what its still frame looks like, and for a
+ * placeholder that means staying visible. Stopping the sweep on its own would freeze the box
+ * mid-gradient, so the surface flattens to the resting grey and picks up a hairline outline:
+ * unmistakably an empty box waiting for content, only no longer a moving one.
+ *
+ * BLITZY [A11Y]: in this still frame the fill measures 1.05:1 against the page and the hairline
+ * 1.48:1, below the 3:1 WCAG 1.4.11 guidance for non-text contrast - measured in the browser, and
+ * the reason the outline is here at all, since the fill alone would not read as a box. Both values
+ * are the shared token contract's (`--ls-surface-sunken` over `--ls-surface`, `--ls-border` as the
+ * hairline, which `app/globals.css` flags at the same ratio for every module that draws one), so
+ * they are implemented as specified rather than quietly darkened here, where a one-off would also
+ * put this box out of step with the cards and fields around it. Flagged for design review. */
+@media (prefers-reduced-motion: reduce) {
+  .root,
+  .line {
+    background: var(--ls-surface-sunken, #f8fafc);
+    outline: 1px solid var(--ls-border, #cbd5e1);
+    animation: none;
+  }
+}
+
+/* Forced-colours mode substitutes the reader's own background for ours, which would erase a box
+ * whose only content is a background. The outline is drawn in the inherited text colour, so it
+ * survives the substitution and the reserved space stays legible as reserved space. */
+@media (forced-colors: active) {
+  .root,
+  .line {
+    outline: 1px solid currentColor;
+  }
+}

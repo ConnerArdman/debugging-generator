@@ -1,0 +1,158 @@
+/*
+ * Lumen Supply - checkout form layout.
+ *
+ * Imported by one file, its sibling `CheckoutForm.tsx`
+ * (`import styles from './CheckoutForm.module.css';`). Next.js supplies the CSS Modules typing,
+ * so there is no declaration file beside this one.
+ *
+ * What this stylesheet owns: the form's arrangement. The vertical rhythm of its titled groups,
+ * the two-column field grid and the single point at which it becomes one column, and the
+ * placement of the shipping, failure, confirmation and submit regions.
+ *
+ * What it deliberately does not own - each of these belongs to the module of the component that
+ * renders the element, and none of their properties is restated here:
+ *
+ *   ../ui/FormField.module.css   label typography, the required marker, the hint and error lines
+ *   ../ui/Input.module.css       field chrome, focus ring, the invalid appearance
+ *   ../ui/Select.module.css      the same, for a dropdown
+ *   ../ui/Alert.module.css       the tone treatment of the failure notice
+ *   ../ui/Button.module.css      button chrome, sizes and states
+ *   ../ui/Card.module.css        the surface `./OrderConfirmation` renders on
+ *   ./CheckoutButton.module.css  the width, accent and caption of the place-order control
+ *   ./ShippingOptionPicker.module.css  the fieldset reset and the option rows
+ *
+ * `app/globals.css` declares every `--ls-*` custom property and is authored alongside this file,
+ * so each `var()` below carries the literal fallback the token contract publishes and the module
+ * renders sensibly on its own. Lengths the scale does not model are a `calc()` over it, held in a
+ * file-local custom property rather than written inline as a bare number.
+ */
+
+.root {
+  /* The one border width in this file: a quarter of the smallest spacing step, so the hairline
+   * stays on the scale instead of introducing a length of its own. */
+  --checkout-rule-width: calc(var(--ls-space-1, 4px) / 4);
+  /* The field grid and the submit row measure themselves against this element rather than the
+   * window: the checkout page may place an order-summary column beside the form, which makes the
+   * form's own inline size the width that decides how its rows should sit. */
+  container-type: inline-size;
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: var(--ls-space-6, 32px);
+}
+
+/* A titled group - the shipping address, the contact details - as one quiet column. */
+.section {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: var(--ls-space-3, 12px);
+}
+
+/* Consecutive groups get a hairline as well as the stack gap above, which is what makes a long
+ * form scannable without giving any group a surface, a heavier border or a heading rule of its
+ * own. The first group needs none: the page's own heading already sits above it. */
+.section + .section {
+  border-block-start: var(--checkout-rule-width, 1px) solid var(--ls-border, #cbd5e1);
+  padding-block-start: var(--ls-space-5, 24px);
+}
+
+/* A group's heading. The component renders a real heading element here; this class sets its size
+ * and the space beneath it, and the reading order of the form conveys the structure on its own. */
+.sectionTitle {
+  margin-block-end: var(--ls-space-2, 8px);
+  color: var(--ls-text, #0f172a);
+  font-size: var(--ls-text-lg, 18px);
+  font-weight: 600;
+  line-height: 1.3;
+}
+
+/* The field rows. `minmax(0, 1fr)` rather than `1fr` is what keeps a long value - a street
+ * address, an order reference - inside its column instead of widening the track; `align-items:
+ * start` keeps a field whose error message has appeared from stretching the field beside it. */
+.grid {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
+  row-gap: var(--ls-space-4, 16px);
+  column-gap: var(--ls-space-3, 12px);
+}
+
+/* A field that takes the whole row: the street address, the email. */
+.fieldWide {
+  grid-column: 1 / -1;
+}
+
+/* The shipping group's body. Spacing only - the picker draws its own rows. */
+.shipping {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: var(--ls-space-3, 12px);
+}
+
+/* Where a submission failure is announced, directly above the submit row so a message that
+ * appears moves that row and nothing else. Colour, border and tone are the alert's own. */
+.failure {
+  min-width: 0;
+  margin-block-end: var(--ls-space-4, 16px);
+  /* Room above the notice when it is scrolled or focused into view, so it does not land flush
+   * against the top edge of the scroll port. */
+  scroll-margin-block-start: var(--ls-space-5, 24px);
+}
+
+/* What replaces the fields once the order is placed. The confirmation renders its own surface, so
+ * this is the rhythm between its blocks and nothing more. */
+.confirmation {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: var(--ls-space-4, 16px);
+}
+
+/* The footer. The place-order control leads it and is the only thing on the line until there is
+ * room for a second item - a reassurance line, a returns note - beside it, at which point the
+ * control still takes the larger share. Both widths are basis values rather than breakpoints, so
+ * the row rearranges itself at exactly the width its own contents run out of room. */
+.submitRow {
+  --checkout-submit-basis: calc(var(--ls-space-6, 32px) * 8);
+  --checkout-submit-aside-basis: calc(var(--ls-space-6, 32px) * 5);
+  display: flex;
+  width: 100%;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--ls-space-3, 12px);
+  margin-block-start: var(--ls-space-4, 16px);
+}
+
+.submitRow > :first-child {
+  min-width: 0;
+  flex-grow: 2;
+  flex-shrink: 1;
+  flex-basis: var(--checkout-submit-basis, 256px);
+}
+
+.submitRow > :first-child ~ * {
+  min-width: 0;
+  flex-grow: 1;
+  flex-shrink: 1;
+  flex-basis: var(--checkout-submit-aside-basis, 160px);
+}
+
+/* The form's single breakpoint: below it a row has no room for two labelled controls, so the grid
+ * becomes one column.
+ *
+ * A container-query condition is resolved before the cascade, which is why the length is a
+ * `calc()` over the 32px spacing step (32px x 16) instead of `var(--ls-space-6, 32px)` - a custom
+ * property cannot be substituted into the condition, and a bare 512px would put a length in this
+ * file that answers to nothing. The query is unnamed on purpose: `.root` is the only containment
+ * context between `.grid` and the page, so nearest-container resolution is unambiguous, and a
+ * container name is a custom identifier that a CSS Modules pipeline may or may not scope. The
+ * submit row needs no rule here: its items reach their basis width and wrap to full-width lines
+ * by themselves. */
+@container (max-width: calc(32px * 16)) {
+  .grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

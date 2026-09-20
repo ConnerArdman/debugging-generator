@@ -1,0 +1,248 @@
+/*
+ * OrderHistoryList - the order-history collection on the "Lumen Supply" orders page.
+ *
+ * This module owns the chrome around the rows and nothing inside them: the heading block, the
+ * visible column-header strip, the `<ul>` reset with the hairline that separates one order from
+ * the next, the link-based pager and the wrapper the blank slate sits in.
+ *
+ * OWNERSHIP, so that no rule here has a second owner
+ *   - OrderHistoryRow.module.css owns the row grid, the whole-row hover and focus affordance, the
+ *     monospace order number and the money alignment. This file declares the list reset and the
+ *     separators; it never reaches into a row.
+ *   - BlankSlate.module.css owns the empty block's illustration slot, heading and body. `.empty`
+ *     below is placement only - no size, no colour, no typography.
+ *   - app/globals.css owns the `--ls-*` tokens, the element baseline and the one focus indicator.
+ *     Every value here reads a token with the literal fallback that mirrors its declared value,
+ *     so this stylesheet also renders sensibly on its own.
+ *
+ * THE TWO-FILE GRID CONTRACT - read this before touching a track, a gap or a padding value.
+ * The header strip below and each row's `<li>` are two *separate* grids in two different files,
+ * so they line up only while three things agree exactly:
+ *
+ *   1. the four tracks       `--order-history-columns` (declared on `.root`, and therefore
+ *                            inherited by the rows, which may read the same custom property)
+ *   2. the column gap        `--ls-space-3`
+ *   3. the inline padding    `--ls-space-3` on the strip and on the row
+ *
+ * The tracks are deliberately four identical `minmax(0, 1fr)` fractions rather than `auto` or
+ * `max-content`: a content-sized track is measured per grid, so the strip would settle on the
+ * width of its labels and a row on the width of its values, and the two would drift apart by a
+ * few pixels on every page of results. Fractions are measured from the container alone, which
+ * makes the alignment exact and independent of what any single order happens to contain, and
+ * `minmax(0, ...)` is what lets a long order reference truncate instead of widening its track.
+ */
+
+.root {
+  /*
+   * The shared four-track template: identity, status, items, total. It lives here, on the
+   * element that wraps both the strip and the list, so a row can consume the very same value
+   * (`grid-template-columns: var(--order-history-columns, ...)`) instead of restating it.
+   */
+  --order-history-columns: repeat(4, minmax(0, 1fr));
+
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: var(--ls-space-4, 16px);
+
+  /*
+   * The query container for this whole block, and the reason a narrow page column behaves
+   * correctly without a viewport breakpoint: the strip below and every row ask *this* box how
+   * wide it is. It is declared here and deliberately not on `.list` as well - a second container
+   * between the two would let the strip and the rows resolve against different boxes and switch
+   * arrangement at different moments, which is precisely the drift the contract above prevents.
+   */
+  container-type: inline-size;
+}
+
+/* Heading and result count on one line, the count pushed to the end, wrapping when the two no
+ * longer fit side by side. Baseline alignment keeps the two type sizes sitting on one line. */
+.head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--ls-space-3, 12px);
+}
+
+/* Styles the real heading element the component renders, whatever its level. */
+.heading {
+  color: var(--ls-text, #0f172a);
+  font-size: var(--ls-text-lg, 18px);
+  font-weight: 600;
+  line-height: 1.3;
+}
+
+/* "312 orders" and the like: quiet, and tabular so the number does not jitter between pages. */
+.count {
+  color: var(--ls-text-muted, #475569);
+  font-size: var(--ls-text-sm, 13px);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/*
+ * The visible column-header strip. Same tracks, same gap and same inline padding as a row, so
+ * its labels sit exactly over the values beneath them. Small and muted, and deliberately not
+ * uppercased or letter-spaced: four quiet labels read as a table header without shouting.
+ */
+.columns {
+  display: grid;
+  grid-template-columns: var(--order-history-columns, repeat(4, minmax(0, 1fr)));
+  align-items: baseline;
+  gap: var(--ls-space-3, 12px);
+  border-block-end: 1px solid var(--ls-border, #cbd5e1);
+  padding: var(--ls-space-2, 8px) var(--ls-space-3, 12px);
+  color: var(--ls-text-muted, #475569);
+  font-size: var(--ls-text-xs, 12px);
+}
+
+/* A label that outgrows its track wraps inside it rather than widening it. */
+.columns > * {
+  min-width: 0;
+}
+
+/* The two numeric columns are end-aligned here, which is the arrangement a row's item-count and
+ * total cells match: a quantity and a sum are read from their last digit. */
+.columns > :nth-child(3),
+.columns > :nth-child(4) {
+  text-align: end;
+}
+
+/*
+ * The `<ul>`. A full-page list, so there is no height cap and no scroll container of its own -
+ * the page scrolls. The separator is drawn between rows only, never above the first or below the
+ * last, so the strip's own bottom border is not doubled.
+ */
+.list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.list > li + li {
+  border-block-start: 1px solid var(--ls-border, #cbd5e1);
+}
+
+/* The paging strip: status wording first, the previous/next pair at the end, both dropping onto
+ * their own lines when the container is too narrow to hold them side by side. */
+.pager {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--ls-space-3, 12px);
+  border-block-start: 1px solid var(--ls-border, #cbd5e1);
+  padding-block-start: var(--ls-space-3, 12px);
+}
+
+/* "Page 2 of 7" wording, supplied by the component. Tabular figures keep the digits from
+ * shifting as the reader moves between pages. */
+.pagerStatus {
+  color: var(--ls-text-muted, #475569);
+  font-size: var(--ls-text-sm, 13px);
+  font-variant-numeric: tabular-nums;
+}
+
+.pagerLinks {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--ls-space-2, 8px);
+}
+
+/*
+ * An available direction, rendered by the component as a `next/link` anchor.
+ *
+ * BLITZY [A11Y]: the accent colour measures 2.15:1 against the page surface, below the WCAG AA
+ * 4.5:1 minimum for text, and the chip is about 30px tall, below the 44x44px touch-target
+ * recommendation. Both are implemented exactly as the design specifies - accent text, and
+ * `--ls-space-1`/`--ls-space-2` padding on 13px text - rather than silently darkened or
+ * enlarged. Direction is never carried by colour alone: the component supplies the label, the
+ * border and background carry the affordance, and the unavailable direction is not an anchor at
+ * all. Flagged for design review.
+ */
+.pagerLink {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--ls-space-1, 4px);
+  border: 1px solid var(--ls-border, #cbd5e1);
+  border-radius: var(--ls-radius-md, 8px);
+  padding: var(--ls-space-1, 4px) var(--ls-space-2, 8px);
+  color: var(--ls-accent, #f59e0b);
+  font-size: var(--ls-text-sm, 13px);
+  text-decoration: none;
+  white-space: nowrap;
+  transition:
+    background-color 180ms ease-out,
+    border-color 180ms ease-out;
+}
+
+/* Hover only where hovering is a real thing, so a touch does not leave the chip stuck in its
+ * hover state. The `:not()` guard keeps the affordance honest if the two pager classes are ever
+ * composed on one element; the component keeps them mutually exclusive today. */
+@media (hover: hover) {
+  .pagerLink:not(.pagerLinkDisabled):hover {
+    border-color: var(--ls-text-muted, #475569);
+    background-color: var(--ls-surface-sunken, #f8fafc);
+  }
+}
+
+/* The application's one focus ring, restated at this module's specificity: 2px derived from the
+ * spacing step rather than written as a bare literal, and the same offset the baseline uses. */
+.pagerLink:focus-visible {
+  outline: calc(var(--ls-space-1, 4px) / 2) solid var(--ls-focus, #0f766e);
+  outline-offset: calc(var(--ls-space-1, 4px) / 2);
+}
+
+/*
+ * The unavailable direction, rendered as a `<span>`. It keeps the metrics of an anchor - same
+ * type size, same padding, same radius, and a transparent border of the same width - so the two
+ * directions sit on one baseline and the strip does not shift when a reader reaches the first or
+ * last page. Everything that says "clickable" is absent: no border, no accent, no hover, no
+ * pointer, and no motion to remove.
+ */
+.pagerLinkDisabled {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--ls-space-1, 4px);
+  border: 1px solid transparent;
+  border-radius: var(--ls-radius-md, 8px);
+  padding: var(--ls-space-1, 4px) var(--ls-space-2, 8px);
+  color: var(--ls-text-muted, #475569);
+  font-size: var(--ls-text-sm, 13px);
+  white-space: nowrap;
+  cursor: default;
+}
+
+/* Placement for the blank slate the component renders when there are no orders. Centring and
+ * margins only: the block's own module owns everything it looks like. */
+.empty {
+  display: flex;
+  justify-content: center;
+  margin-block: var(--ls-space-2, 8px);
+}
+
+/*
+ * The narrow arrangement. Below this width a row stacks its cells, so the four-column strip no
+ * longer describes anything and is removed; the row supplies its own labels from there on.
+ *
+ * The threshold is 640px - twenty times the 32px `--ls-space-6` step - written as a calculation
+ * over that step rather than as a bare pixel literal. It is spelled out in full because a
+ * container condition is evaluated without an element to read custom properties from, so
+ * `var(--ls-space-6)` is not available here; the row's query states the same width the same way.
+ */
+@container (max-width: calc(32px * 20)) {
+  .columns {
+    display: none;
+  }
+}
+
+/* The motion introduced above, withdrawn for a reader who has asked for less of it. Declared at
+ * this module's own specificity, as every module in this application does, rather than left to
+ * the baseline's universal rule. */
+@media (prefers-reduced-motion: reduce) {
+  .pagerLink {
+    transition: none;
+  }
+}

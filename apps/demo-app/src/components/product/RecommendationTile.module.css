@@ -1,0 +1,141 @@
+/*
+ * RecommendationTile - one recommended product inside the recommendations rail.
+ *
+ * The rail is mounted twice on a product page: full size in the detail body and compact inside
+ * the site header. Both mounts render the same component with the same props, so this stylesheet
+ * is the only place the two differ, and the whole difference is width, inner spacing and the
+ * name's type size. Nothing here changes what the tile does.
+ *
+ * The tile is intentionally independent of the catalog card's module: it borrows no rule from it
+ * and imports nothing, so the strip in the site header carries none of the catalog's chrome.
+ *
+ * Values read the `--ls-*` tokens declared in `app/globals.css` and each states the literal its
+ * token contract gives, so the tile still reads correctly if it is ever mounted without that
+ * stylesheet; inside the application the declaration in `app/globals.css` is what the browser
+ * paints. Hex spellings are lowercase because Prettier normalises them and `pnpm format:check`
+ * is a blocking gate - do not "restore" the uppercase form.
+ */
+
+/* The whole tile is one link, so the surface, its hairline and its states belong to the anchor.
+ * `height: 100%` lets a tile fill the row it sits in, which is what keeps a strip of tiles even
+ * when one name wraps to two lines and its neighbour's does not. */
+.root {
+  display: flex;
+  height: 100%;
+  flex-direction: column;
+  gap: var(--ls-space-2, 8px);
+  padding: var(--ls-space-2, 8px);
+  border: 1px solid var(--ls-border, #cbd5e1);
+  border-radius: var(--ls-radius-md, 8px);
+  background: var(--ls-surface, #ffffff);
+  color: inherit;
+  text-decoration: none;
+  /* BLITZY [MOTION]: the shared token set carries no duration or easing token, so these two are
+   * literals rather than `var()` reads. They are deliberately short, affect the hover treatment
+   * alone, and the reduced-motion rule below removes them. Flagged for design review. */
+  transition:
+    border-color 160ms ease-out,
+    box-shadow 160ms ease-out;
+}
+
+/* A restrained lift: the hairline takes the interactive tint and the surface gains one step of
+ * elevation. Nothing moves and nothing resizes, so a hovered tile never nudges its neighbours.
+ *
+ * BLITZY [A11Y]: the tinted hairline measures 2.15:1 against the tile surface, below the 3:1
+ * non-text recommendation - the value the shared token contract fixes, kept rather than darkened.
+ * It is never the only signal: the elevation changes with it and the pointer already indicates a
+ * link. Flagged for design review. */
+.root:hover {
+  border-color: var(--ls-accent, #0f766e);
+  box-shadow: var(--ls-shadow-1, 0 1px 2px rgba(15, 23, 42, 0.08));
+}
+
+/* The strip of tiles is navigated from the keyboard, so the ring is restated here at the module's
+ * own specificity rather than left to the shared indicator alone - and it is never removed.
+ *
+ * The offset is inward because a tile lives in a horizontally scrolling strip, whose box clips
+ * whatever is drawn outside it: an outward ring loses its top edge on every tile and its leading
+ * edge on the first one, and a tile at the top of the page would draw that edge off-screen
+ * altogether. Drawn just inside the border the whole ring survives, in both mounts and wherever
+ * else the tile is placed. */
+.root:focus-visible {
+  outline: 2px solid var(--ls-focus, #1d4ed8);
+  outline-offset: -2px;
+}
+
+/* The motion above is this module's, so its reduced-motion treatment is too: the hover change
+ * lands at once instead of easing in, and the tile is otherwise identical. */
+@media (prefers-reduced-motion: reduce) {
+  .root {
+    transition: none;
+  }
+}
+
+/* The thumbnail frame. The ratio matches the intrinsic 400 x 300 of the committed product
+ * artwork, so the box is already the right shape before the file arrives, and the sunken fill
+ * keeps the tile legible when images are turned off. */
+.media {
+  width: 100%;
+  overflow: hidden;
+  border-radius: var(--ls-radius-sm, 4px);
+  background: var(--ls-surface-sunken, #f8fafc);
+  aspect-ratio: 4 / 3;
+}
+
+/* `contain` because the artwork is drawn to its own margins: filling the frame would crop the
+ * part that identifies the item. The element baseline gives every image `height: auto`, which
+ * this overrides so the artwork uses the frame it was given. */
+.image {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+/* The text column. `min-width: 0` is what lets the clamped name shrink instead of widening the
+ * tile, and growing the column lets the price settle on the bottom edge, so the prices of
+ * neighbouring tiles line up however long their names are. */
+.body {
+  display: flex;
+  min-width: 0;
+  flex: auto;
+  flex-direction: column;
+  gap: var(--ls-space-1, 4px);
+}
+
+/* Two lines, then an ellipsis: long product names are the norm here, and clamping them is what
+ * holds a row of tiles to one height. The prefixed spelling is the interoperable one and is what
+ * current engines implement. */
+.name {
+  display: -webkit-box;
+  overflow: hidden;
+  margin: 0;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  color: var(--ls-text, #0f172a);
+  font-size: var(--ls-text-sm, 13px);
+}
+
+/* Placement only. The money string comes from the shared price component, which owns its own
+ * type and colour; the automatic leading margin pushes it to the foot of the text column. */
+.price {
+  margin-block-start: auto;
+}
+
+/* The two mounts, told apart by the attribute the component sets. Each rule below states sizes
+ * and nothing else, so a tile in the header behaves exactly like a tile in the page. The compact
+ * tile is a scaled-down version of the same card rather than a different arrangement, which is
+ * what keeps a loading placeholder and a loaded tile the same shape in both mounts. */
+.root[data-variant='detail'] {
+  width: 12rem;
+}
+
+.root[data-variant='compact'] {
+  width: 9rem;
+  gap: var(--ls-space-1, 4px);
+  padding: var(--ls-space-1, 4px);
+}
+
+.root[data-variant='compact'] .name {
+  font-size: var(--ls-text-xs, 12px);
+}

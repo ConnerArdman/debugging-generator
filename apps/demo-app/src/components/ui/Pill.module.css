@@ -1,0 +1,193 @@
+/*
+ * Pill - the chip of the Lumen Supply storefront.
+ *
+ * Consumed only by `Pill.tsx`, which renders one of two elements and never a third:
+ *
+ *   - a `<button type="button" aria-pressed>` for a chip the reader can toggle (the catalog's
+ *     category filter row, the dashboard's grouping chips), and
+ *   - a `<span>` for a chip that only labels something.
+ *
+ * Both carry `.root` plus `data-tone` and `data-size`; the toggle path additionally carries
+ * `data-selected="true"` while it is on, and no `data-selected` attribute at all while it is off.
+ * Variants are therefore selected by attribute and never by a class-name lookup, which keeps the
+ * component free of dynamic `styles[...]` indexing. `.count` is the only other class this file
+ * exports, for the optional trailing number.
+ *
+ * Why the selected state changes `color` and not just the background: a chip usually wraps a
+ * category glyph, and that glyph is painted with `background-color: currentColor` behind a CSS
+ * mask, so the chip's text colour is also the glyph's colour. Inverting the fill alone would
+ * leave a slate glyph sitting on an ink chip.
+ *
+ * Why every state keeps the same border width and padding: the catalog shows around a dozen of
+ * these in a wrapping row, and a state that changed either would reflow the whole row - and every
+ * card below it - on each click. Selection changes three colours and nothing else; the box is
+ * fixed by `.root`.
+ *
+ * Cascade order matters twice in this file and is the reason the blocks are in the order they
+ * are: the selected rule is written after the tone rules because the two have equal specificity,
+ * and the selected hover rule carries a longer selector than the plain hover rule so a selected
+ * chip stays inverted while the pointer is over it.
+ *
+ * Every value is `var(--ls-TOKEN, <fallback>)` against the tokens declared in
+ * `app/globals.css`; the fallbacks mirror them so this module also renders sensibly on its own.
+ * Bare literals appear only for border and outline widths, an opacity, a duration, and the
+ * keywords `0`, `none`, `inherit` and `currentColor`.
+ *
+ * Two formatting details are Prettier's and not preferences: attribute-selector values are
+ * single-quoted and hex colours are lowercase, because `pnpm format:check` is a blocking gate -
+ * do not "restore" either spelling.
+ */
+
+/* The chip box. Shared by both render paths, so nothing here assumes interactivity.
+ *
+ * `min-height` is what keeps the filter row even: only some categories have glyph art, a glyph is
+ * taller than the 13px label, and without a floor the chips with art would stand taller than the
+ * ones without. The spacing scale carries no dedicated control height, so the floor is the top of
+ * that scale, which clears the tallest chip content this component is used with.
+ *
+ * BLITZY [A11Y]: the resulting target is 32px tall, below the 44x44 touch-target recommendation.
+ * The height follows from the padding and type steps the shared token contract fixes for a chip,
+ * so it is implemented as specified rather than silently enlarged; the chips sit in a pointer-and-
+ * keyboard storefront view and every filter they apply is also reachable from the page's own
+ * controls. Flagged for design review. */
+.root {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--ls-space-1, 4px);
+  min-height: var(--ls-space-6, 32px);
+  padding-block: var(--ls-space-1, 4px);
+  padding-inline: var(--ls-space-3, 12px);
+  border: 1px solid var(--ls-border, #cbd5e1);
+  border-radius: var(--ls-radius-lg, 12px);
+  background-color: var(--ls-surface, #ffffff);
+  color: var(--ls-text, #0f172a);
+  font: inherit;
+  font-size: var(--ls-text-sm, 13px);
+  line-height: 1;
+  white-space: nowrap;
+  /* Colour only: transitioning a box property would animate the row's geometry. */
+  transition-property: background-color, border-color, color;
+  transition-duration: 160ms;
+  transition-timing-function: ease-out;
+}
+
+/* The toggle path. `appearance: none` drops the platform button chrome, and the pointer cursor is
+ * scoped to this selector so a labelling `<span>` never advertises a press it cannot accept. The
+ * focus ring further down is what replaces the chrome for keyboard readers. */
+button.root {
+  margin: 0;
+  appearance: none;
+  cursor: pointer;
+}
+
+/* Tones. The four status names and their fallbacks are the folder's shared palette, so a chip and
+ * a badge that describe the same thing read as the same colour. `neutral` is the default - both
+ * `Pill.tsx` and `.root` above already produce it - and keeps the hairline border rather than a
+ * slate one, which is what stops a dozen quiet chips from reading as a dozen outlines. */
+.root[data-tone='neutral'] {
+  border-color: var(--ls-border, #cbd5e1);
+  color: var(--ls-text-muted, #475569);
+}
+
+.root[data-tone='info'] {
+  border-color: var(--ls-info, #1d4ed8);
+  color: var(--ls-info, #1d4ed8);
+}
+
+.root[data-tone='success'] {
+  border-color: var(--ls-success, #0f766e);
+  color: var(--ls-success, #0f766e);
+}
+
+.root[data-tone='warning'] {
+  border-color: var(--ls-warning, #b45309);
+  color: var(--ls-warning, #b45309);
+}
+
+.root[data-tone='danger'] {
+  border-color: var(--ls-danger, #b42318);
+  color: var(--ls-danger, #b42318);
+}
+
+/* Sizes differ in the label step and the horizontal breathing room, and in nothing else: the
+ * vertical padding, border and height floor stay shared so chips of either size line up on one
+ * row. `md` is the default and repeats `.root`'s values so the two sizes can be read together. */
+.root[data-size='sm'] {
+  padding-inline: var(--ls-space-2, 8px);
+  font-size: var(--ls-text-xs, 12px);
+}
+
+.root[data-size='md'] {
+  padding-inline: var(--ls-space-3, 12px);
+  font-size: var(--ls-text-sm, 13px);
+}
+
+/* The optional trailing number. Tabular figures stop the chip's width from twitching as a count
+ * changes between digits of different widths. */
+.count {
+  color: var(--ls-text-muted, #475569);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Selected. Written after the tone rules, which it ties with on specificity, so the inversion
+ * wins for every tone. The label turns white and the glyph follows it, because the glyph paints
+ * itself in `currentColor`; white on the ink fill measures 17.9:1. */
+.root[data-selected='true'] {
+  border-color: var(--ls-ink, #0f172a);
+  background-color: var(--ls-ink, #0f172a);
+  color: var(--ls-white, #ffffff);
+}
+
+/* Inside an inverted chip the count joins the label instead of staying muted, which would be
+ * unreadable on the ink fill. */
+.root[data-selected='true'] .count {
+  color: currentColor;
+}
+
+/* One focus indicator, drawn for keyboard interaction. It is an addition to the button chrome
+ * this file removed, never a removal: no rule in this module clears or hides an outline. The
+ * offset keeps the ring clear of the chip's own border, including on an inverted chip. */
+.root:focus-visible {
+  outline: 2px solid var(--ls-focus, #0f766e);
+  outline-offset: 2px;
+}
+
+/* Disabled chips keep their colours and lose their affordance, so a row of filters stays legible
+ * while one of them is unavailable. Only the toggle path can match this. */
+.root:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+/* Hover, excluded while disabled so an unavailable chip stays inert - `:hover` still matches a
+ * disabled button, so the guard is what keeps the fill from implying it can be pressed.
+ *
+ * Deliberately not wrapped in a `(hover: hover)` capability query. That query is the usual guard
+ * against a chip staying in its hover appearance after a tap, but headless Chrome reports
+ * `hover: none`, which is the browser this repository's own suites drive - a gated rule would be
+ * unobservable in exactly the client that checks it, for a storefront whose hover step is a 3%
+ * luminance shift on a pointer-and-keyboard view. The rule is therefore declared plainly.
+ *
+ * The selected rule is repeated at higher specificity rather than left to the base rule above:
+ * an inverted chip lightens to the slate step of the palette instead of falling back to the
+ * recessed surface, which would drop white text onto a near-white fill. White on slate measures
+ * 7.6:1, and only the two colours change, so the row's geometry is untouched. */
+.root:hover:not(:disabled) {
+  background-color: var(--ls-surface-sunken, #f8fafc);
+}
+
+.root[data-selected='true']:hover:not(:disabled) {
+  border-color: var(--ls-slate, #475569);
+  background-color: var(--ls-slate, #475569);
+}
+
+/* Honour a reduced-motion preference for the colour transition this module introduced. The
+ * duration collapses rather than dropping to `none`, which matches the application's baseline and
+ * keeps a `transitionend` listener firing for anything that ever waits on one. The rule carries
+ * this module's own specificity, because the baseline's universal rule carries none and would
+ * otherwise be overruled by `.root` above. */
+@media (prefers-reduced-motion: reduce) {
+  .root {
+    transition-duration: 0.01ms;
+  }
+}

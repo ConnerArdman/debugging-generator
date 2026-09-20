@@ -1,0 +1,152 @@
+/*
+ * RecommendationsRail - the storefront's recommended-products strip.
+ *
+ * Consumed only by ./RecommendationsRail.tsx, which renders exactly this tree:
+ *
+ *   section.root[data-variant]      the labelled region
+ *     div.head > h2.heading         the strip's title row
+ *     div.viewport[tabindex="0"]    the horizontal scroll container
+ *       ul.list > li.item           one tile per recommendation
+ *     div.state                     the loading and empty slots - and the class
+ *                                   the inline message is given on the error slot
+ *       .skeleton                   one block placeholder per pending tile
+ *
+ * Every colour, spacing step, radius and type size is `var(--ls-TOKEN, <literal
+ * fallback>)`, and each fallback mirrors the declaration in app/globals.css,
+ * which is what the browser paints. Tile geometry belongs to
+ * ./RecommendationTile.module.css; the strip only says how tiles are arranged.
+ *
+ * The strip appears in two places - a product page's detail body and, more
+ * quietly, the site header - and the difference between them is presentational
+ * and lives entirely in the two `[data-variant]` blocks at the end of this file,
+ * as a set of file-local `--rail-*` metrics that the rules above read. Each of
+ * those again resolves to an `--ls-*` token with a literal fallback, and none of
+ * them changes what the component does.
+ *
+ * Hex values are lowercase because Prettier normalises CSS colours to lowercase
+ * and `pnpm format:check` is a blocking gate.
+ */
+
+.root {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: var(--rail-block-gap, var(--ls-space-2, 8px));
+}
+
+/* The title row. `space-between` keeps the trailing edge free, so a control
+ * added beside the heading later moves nothing. `baseline` rather than `center`
+ * so the heading and anything next to it sit on one line of text. */
+.head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--ls-space-2, 8px);
+}
+
+.heading {
+  margin: 0;
+  color: var(--ls-text, #0f172a);
+  font-size: var(--rail-heading-size, var(--ls-text-lg, 18px));
+}
+
+/* The scroll container, and the only box here that scrolls: the strip overflows
+ * inside it, so a narrow viewport never gains page-level horizontal scroll. The
+ * block-end padding is clearance for the scrollbar, not a gap under the rail. */
+.viewport {
+  min-width: 0;
+  padding-block-end: var(--ls-space-1, 4px);
+  overflow-x: auto;
+  overflow-y: hidden;
+  /* A flick past either end scrolls the strip only, never the page behind it. */
+  overscroll-behavior-x: contain;
+  scrollbar-width: thin;
+  scroll-behavior: smooth;
+}
+
+/* The component makes this box focusable so the strip is operable with the arrow
+ * keys; the ring is what tells a keyboard reader where they have landed. It is
+ * stated here rather than left to the application-wide indicator because this
+ * element is a plain scroll container and is easy to lose sight of. */
+.viewport:focus-visible {
+  outline: 2px solid var(--ls-focus, #0f766e);
+  outline-offset: 2px;
+}
+
+/* The smooth scrolling above is this module's own motion, so this module is what
+ * withdraws it for a reader who has asked for less - at its own specificity,
+ * which the zero-specificity baseline in app/globals.css cannot do for it. */
+@media (prefers-reduced-motion: reduce) {
+  .viewport {
+    scroll-behavior: auto;
+  }
+}
+
+.list {
+  display: flex;
+  margin: 0;
+  padding: 0;
+  gap: var(--rail-item-gap, var(--ls-space-3, 12px));
+  list-style: none;
+}
+
+/* One slot in the strip. A tile brings its own width, so the slot neither grows
+ * nor shrinks - that refusal to shrink is what gives the strip something to
+ * scroll - and `display: flex` lets the tile fill the row's height so tiles with
+ * shorter names still line up with their neighbours. */
+.item {
+  display: flex;
+  flex: 0 0 auto;
+}
+
+/* The loading, empty and error slot. Only the block axis is padded: the error
+ * path puts this class on the inline message itself, which brings its own inline
+ * padding, and nothing here should take that away. `min-height: 0` keeps the
+ * slot from imposing a floor of its own on the column. */
+.state {
+  min-height: 0;
+  padding-block: var(--rail-state-pad, var(--ls-space-3, 12px));
+}
+
+/* Placeholders lie along the strip instead of stacking, so a pending rail
+ * reserves a row where the tiles will be rather than a tall column, and the page
+ * settles by about a caption's worth of height when they arrive. Matching on the
+ * placeholders themselves leaves the empty and error slots - a blank-slate block
+ * and an inline message - in the block layout they expect. */
+.state:has(> .skeleton) {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--rail-item-gap, var(--ls-space-3, 12px));
+  overflow: hidden;
+}
+
+/* One pending tile. The width travels as a flex basis as well as a width, so the
+ * placeholder primitive's own full-width default cannot stretch it however the
+ * two stylesheets happen to be ordered, and the ratio is the tile's thumbnail
+ * frame, so a pending row stands as tall as the thumbnails it will become. */
+.skeleton {
+  flex: 0 0 var(--rail-tile-width, 12rem);
+  width: var(--rail-tile-width, 12rem);
+  aspect-ratio: 4 / 3;
+  border-radius: var(--ls-radius-md, 8px);
+}
+
+/* In the product detail body: the full-size strip. */
+.root[data-variant='detail'] {
+  --rail-block-gap: var(--ls-space-2, 8px);
+  --rail-heading-size: var(--ls-text-lg, 18px);
+  --rail-item-gap: var(--ls-space-3, 12px);
+  --rail-state-pad: var(--ls-space-3, 12px);
+  --rail-tile-width: 12rem;
+}
+
+/* In the site header: a smaller label, tighter spacing and narrower tiles, so the
+ * strip asks the row around it for no more height than the tiles themselves
+ * need - a label, a 4px gap and the scrollbar clearance above them. */
+.root[data-variant='compact'] {
+  --rail-block-gap: var(--ls-space-1, 4px);
+  --rail-heading-size: var(--ls-text-sm, 13px);
+  --rail-item-gap: var(--ls-space-2, 8px);
+  --rail-state-pad: var(--ls-space-2, 8px);
+  --rail-tile-width: 9rem;
+}

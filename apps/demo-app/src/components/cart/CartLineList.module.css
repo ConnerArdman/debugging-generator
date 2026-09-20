@@ -1,0 +1,211 @@
+/*
+ * Lumen Supply - cart line collection.
+ *
+ * The stylesheet for `CartLineList.tsx` and nothing else. It owns eight class names, and the
+ * component references exactly those eight: `root`, `notice`, `status`, `scroll`, `list`,
+ * `skeletonRow`, `skeletonMedia` and `skeletonText`. A CSS Module gives no compile-time check -
+ * `styles.scrol` typechecks and silently yields `undefined` - so the two files are kept in step by
+ * hand; renaming a class here means renaming it there in the same change.
+ *
+ * What this file is responsible for:
+ *
+ *   1. The collection's own box: one column, the rhythm between the error notice, the placeholder
+ *      rows and the scroll region, and the two arrangements the component asks for through
+ *      `data-variant` on its root element.
+ *   2. The `<ul>` reset and the hairline *between* rows. A row's own padding, thumbnail, columns
+ *      and controls belong to `CartLineRow.module.css`; that file deliberately declares no
+ *      `border-bottom`, because a separator after the last row is a visual defect and `li + li`
+ *      here cannot produce one.
+ *   3. The geometry of the loading placeholders, which mirrors a real row's so the list does not
+ *      resize under the reader when data arrives.
+ *
+ * What it must not do: restyle `../ui/Alert` (it owns its tone, border and padding),
+ * `../ui/Skeleton` (it owns its surface and shimmer), or `../ui/BlankSlate` (it owns the empty
+ * state and its illustration - which is why no image reference appears here at all). It declares no
+ * `position: sticky`: in the drawer, `CartDrawer.module.css` pins the header and the totals footer
+ * as fixed grid rows, so a sticky element here would fight a layout that already works.
+ *
+ * Token contract: every colour, space, radius and type size is `var(--ls-NAME, <literal>)`, where
+ * the literal mirrors the value `app/globals.css` declares. The fallbacks are mandatory rather than
+ * decorative - they are what makes this module render sensibly when it is read on its own - and the
+ * hexes are lowercase because Prettier normalises them and `pnpm format:check` is a blocking gate.
+ * Bare literals appear only where a token would be wrong: `0`, keywords, the `minmax(0, 1fr)` and
+ * `100%` structural sizes, the unitless ratios inside `calc()`, and the `1px` hairline width in the
+ * one `border` shorthand below, whose colour is tokenised.
+ *
+ * Motion: none. The list re-renders roughly four times a second while mounted (the cart context
+ * republishes its value on the shipping-estimate cadence), so a transition on this container would
+ * animate against its own re-render; the only movement in the loading state is the shimmer inside
+ * `../ui/Skeleton`, which carries its own reduced-motion override.
+ */
+
+/* The collection root. One column, because every child - notice, placeholders, scroll region - is
+ * full width; `minmax(0, 1fr)` rather than `1fr` so a long product name or SKU inside a row
+ * ellipsizes instead of widening the track and, in the drawer, the panel with it. */
+.root {
+  display: grid;
+  min-inline-size: 0;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--ls-space-2, 8px);
+}
+
+/* Drawer: the compact rhythm, in a panel roughly 400px wide whose vertical room is shared with a
+ * header and a totals footer. */
+.root[data-variant='drawer'] {
+  gap: var(--ls-space-2, 8px);
+}
+
+/* Page (`app/cart/page.tsx`): the same component with room to breathe, one step looser. */
+.root[data-variant='page'] {
+  gap: var(--ls-space-3, 12px);
+}
+
+/* Spacing around the error block only. The `Alert` inside keeps its own tone, border and padding,
+ * and the list stays rendered below it when a stale-but-usable cart is still in hand, so the
+ * margin is what separates the two. `min-inline-size: 0` lets a long message wrap inside the grid
+ * track instead of stretching it. */
+.notice {
+  min-inline-size: 0;
+  margin-block-end: var(--ls-space-2, 8px);
+}
+
+/* The polite live region that announces "loading" and "saving". It must cost no layout: an
+ * in-flow child of a `gap` grid would add a row *and* a gap, moving the list by 8px every time a
+ * save starts. Taking it out of flow removes both, and unlike `display: contents` it keeps a real
+ * box, so the element - with its `role` and `aria-live` - stays in the accessibility tree exactly
+ * as the component wrote it. The size is zero and the overflow hidden because the text itself is
+ * rendered inside `../ui/VisuallyHidden`; nothing here is ever painted. */
+.status {
+  position: absolute;
+  inline-size: 0;
+  block-size: 0;
+  overflow: hidden;
+}
+
+/* The region that wraps the `<ul>`.
+ *
+ * `container-type: inline-size` is the one declaration a row depends on: `CartLineRow.module.css`
+ * collapses its five-area grid to two lines through a single `@container` query, and an *unnamed*
+ * container is what that plain query resolves against - so this container is deliberately left
+ * unnamed, and naming it would silently disable the row's narrow arrangement. Inline-size
+ * containment constrains the inline axis only, which is why the block axis below is still free to
+ * cap and scroll. */
+.scroll {
+  min-inline-size: 0;
+  container-type: inline-size;
+}
+
+/* Drawer: the list is the only part of the panel that should grow unboundedly, so it caps itself
+ * and scrolls. The cap is a file-local property built from the spacing scale - fourteen 32px steps,
+ * 448px - deep enough to show several lines at once and shallow enough that the twelve-line cart
+ * the demo seeds scrolls here rather than pushing the totals footer out of reach.
+ *
+ * The `min()` is the part that earns its keep. The panel is a full-viewport-height sheet whose
+ * middle row is what holds this list, so the room actually available is the viewport less the
+ * panel's header, its totals footer and their padding - roughly 185px of chrome. A fixed 448px cap
+ * is taller than that on a short window, and the cost is not a little clipping: the panel's own
+ * body then becomes a second scroll container nested inside this one, the last row is cut through
+ * the middle, and on a platform with classic (space-taking) scrollbars that nested scrollbar
+ * appears and disappears with the item count, shifting every row sideways by its width - exactly
+ * the shift `scrollbar-gutter: stable` is here to prevent. Half the viewport keeps the cap clear of
+ * the chrome for any window taller than about 370px, and yields to the token value - which is the
+ * design intent - on anything from a normal laptop upwards. `vh` rather than `dvh` deliberately:
+ * the overlay this sits in is sized by the same reference frame.
+ *
+ * `overscroll-behavior: contain` stops a flick at the end of the list from chaining into the panel
+ * behind it, and `scrollbar-gutter: stable` reserves the scrollbar's width whether or not it is
+ * showing, so rows never shift sideways as items come and go. */
+.root[data-variant='drawer'] .scroll {
+  --list-max-height: calc(var(--ls-space-6, 32px) * 14);
+
+  max-block-size: min(var(--list-max-height), 50vh);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+/* Page: the document scrolls, so the region does neither. A second scroll container on a full-page
+ * cart traps the wheel and hides rows below the fold. */
+.root[data-variant='page'] .scroll {
+  max-block-size: none;
+  overflow: visible;
+}
+
+/* The `<ul>`. No gap: rows abut and the hairline below is what divides them, which keeps a row's
+ * own padding the only vertical rhythm in the list. */
+.list {
+  display: grid;
+  margin: 0;
+  padding: 0;
+  grid-template-columns: minmax(0, 1fr);
+  list-style: none;
+}
+
+/* The separator, owned here rather than by the row so that the first row has no rule above it and
+ * the last row has none below it, at any list length - including one. */
+.list > li + li {
+  border-block-start: 1px solid var(--ls-border, #cbd5e1);
+}
+
+/* One loading placeholder row.
+ *
+ * The arithmetic mirrors `CartLineRow.module.css` so the switch from placeholders to data is not a
+ * jump: the same 12px block padding, the same 12px column gap, the same 64px thumbnail track (two
+ * 32px steps, as the row's own media width) and a content row deep enough for the details column a
+ * real line renders - its name, SKU and stock/price meta line stacked at 4px. Declaring that depth
+ * as a definite track is also what sizes the thumbnail placeholder: `../ui/Skeleton` fills its box
+ * in `block` shape, so the box has to be the thing with the dimensions.
+ *
+ * These rows are children of `.root`, so the rhythm between them is its `gap`; they carry no
+ * hairline, because the 1px rules belong to the real list and a floating rule between spaced
+ * placeholders reads as a defect rather than a separator. They also sit outside `.scroll`, so they
+ * do not carry its reserved scrollbar gutter: on a platform with space-taking scrollbars the rows
+ * that replace them are that gutter narrower. Only the inline axis is affected, and only in the
+ * drawer, where the gutter is what keeps the loaded rows from shifting as items come and go. */
+.skeletonRow {
+  --skeleton-media-inline-size: calc(var(--ls-space-6, 32px) * 2);
+  --skeleton-media-block-size: calc(var(--skeleton-media-inline-size) * 3 / 4);
+  --skeleton-line-block-size: calc(var(--ls-space-6, 32px) * 2 + var(--ls-space-2, 8px));
+
+  display: grid;
+  align-items: start;
+  grid-template-columns: var(--skeleton-media-inline-size) minmax(0, 1fr);
+  grid-template-rows: var(--skeleton-line-block-size);
+  gap: var(--ls-space-3, 12px);
+  padding-block: var(--ls-space-3, 12px);
+}
+
+/* Drawer: a real row is two lines here, not one. Its five areas collapse to `media details` above
+ * `controls total remove` as soon as the region is narrow, so the placeholder reserves a second
+ * track for that controls line - empty, because the component draws only two placeholder bars, but
+ * the same height a quantity stepper occupies. Measured against a populated list, this closes the
+ * jump from placeholders to data from tens of pixels per row to a couple: the remainder is the
+ * stepper's own border and text metrics, which belong to its component and are not knowable here.
+ * The page variant needs no second track - its rows keep the single-line arrangement. */
+.root[data-variant='drawer'] .skeletonRow {
+  --skeleton-controls-block-size: calc(var(--ls-space-6, 32px) - var(--ls-space-1, 4px));
+
+  grid-template-rows: var(--skeleton-line-block-size) var(--skeleton-controls-block-size);
+}
+
+/* The thumbnail placeholder: the row's 64px media box at the 4 / 3 ratio the catalog artwork is
+ * drawn to, so it occupies 64x48 exactly as the loaded image will. `max-block-size` is what holds
+ * that height - a `block` skeleton stretches to its box, and clamping is additive rather than a
+ * fight over the same property. */
+.skeletonMedia {
+  inline-size: var(--skeleton-media-inline-size);
+  max-block-size: var(--skeleton-media-block-size);
+  aspect-ratio: 4 / 3;
+  border-radius: var(--ls-radius-sm, 4px);
+}
+
+/* The text placeholder: the details column, top-aligned and free to shrink, stacked at the same 4px
+ * the real details column uses. `../ui/Skeleton` draws two bars into it with the second one short,
+ * which is why no height is declared here - the bars carry their own. */
+.skeletonText {
+  display: grid;
+  align-self: start;
+  min-inline-size: 0;
+  inline-size: 100%;
+  gap: var(--ls-space-1, 4px);
+}

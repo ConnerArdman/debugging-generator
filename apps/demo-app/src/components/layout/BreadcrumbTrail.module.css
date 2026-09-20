@@ -1,0 +1,128 @@
+/*
+ * Lumen Supply - BreadcrumbTrail
+ *
+ * The CSS Module for `BreadcrumbTrail.tsx` and imported by nothing else. That component renders
+ * `nav.root > ol.list > li.item`, where an item holds either `a.link` (an ancestor page) or
+ * `span.current` (this page, carrying `aria-current="page"`), and every item after the first is
+ * preceded by the component's own `span.separator` with `aria-hidden="true"`.
+ *
+ * Two things this file deliberately does not do:
+ *
+ *   1. It declares no outer margin. Space above and below the trail belongs to
+ *      `PageContainer.module.css`'s `.breadcrumb` wrapper, the single owner of that slot's
+ *      placement; restating the gap here would give it two owners that have to agree.
+ *   2. It injects no separator glyph. The divider is a real element in the markup, so generated
+ *      content from a pseudo-element here would paint a second one next to it. This file styles
+ *      the element it is handed.
+ *
+ * Every value reads a shared `--ls-*` token from `app/globals.css` in
+ * `var(--ls-NAME, <literal fallback>)` form, so the strip renders sensibly on its own - in a
+ * component test or a static harness with no stylesheet - and renders the storefront's palette in
+ * the application, where the `:root` declaration is what the browser paints. The three measures
+ * the shared set does not name (the crumb truncation width, the focus ring and the hover
+ * duration) are file-local custom properties declared on `.root` in exactly the same form, so a
+ * page can override one from its own wrapper without this file changing.
+ */
+
+.root {
+  /* How wide a single crumb may grow before it truncates. 18ch keeps a four-crumb trail with a
+   * long product name on one line across the page measure; the trail wraps rather than overflows
+   * when even the truncated crumbs no longer fit. */
+  --crumb-max: var(--ls-crumb-max, 18ch);
+  /* The keyboard focus indicator, held as a complete outline value: `--ls-focus` in globals.css
+   * is the ring *colour*, not an outline shorthand, so the width and style are stated here and
+   * the fallback alone is a valid `outline` on its own. */
+  --crumb-focus-ring: var(--ls-focus-ring, 2px solid var(--ls-focus, #0f766e));
+  --crumb-focus-offset: var(--ls-focus-offset, 2px);
+  /* Duration of the crumb's hover/focus colour change, paired with the reduced-motion rule at the
+   * end of this file. */
+  --crumb-transition: var(--ls-duration-fast, 150ms);
+
+  display: block;
+  /* The trail is frequently a flex or grid item; without this it would refuse to shrink below the
+   * width of its longest crumb and widen the column instead of truncating. */
+  min-width: 0;
+  font-family: var(--ls-font-sans, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif);
+}
+
+.list {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--ls-space-1, 4px);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* One crumb and the separator that precedes it, kept on the same baseline. */
+.item {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: var(--ls-space-1, 4px);
+}
+
+/* Both kinds of crumb hold to a single line and end in an ellipsis, so a long product title
+ * shortens instead of pushing the trail - and the heading below it - off the measure. */
+.link,
+.current {
+  display: inline-block;
+  max-width: var(--crumb-max);
+  min-width: 0;
+  overflow: hidden;
+  font-size: var(--ls-text-sm, 13px);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* An ancestor crumb: quieter than the page's own, and padded just enough that the focus ring
+ * clears the text rather than sitting on the glyphs. */
+.link {
+  padding-inline: var(--ls-space-1, 4px);
+  border-radius: var(--ls-radius-sm, 4px);
+  color: var(--ls-text-muted, #475569);
+  text-decoration: none;
+  transition: color var(--crumb-transition) ease-out;
+}
+
+/* Hover is deliberately ungated - no `(hover: hover)` query - because the whole treatment is a
+ * colour change plus an underline on a text link: there is no state for a touch device to get
+ * stuck in, and the application's baseline stylesheet gates none of its own interactive styles.
+ * The underline joins the colour change so the affordance is not carried by colour alone. */
+.link:hover {
+  color: var(--ls-text, #0f172a);
+  text-decoration: underline;
+}
+
+.link:focus-visible {
+  outline: var(--crumb-focus-ring);
+  outline-offset: var(--crumb-focus-offset);
+  color: var(--ls-text, #0f172a);
+}
+
+/* The trailing crumb is the page itself: full-strength text, slightly heavier, and with no hover
+ * or focus treatment, because it is a `<span>` and nothing here makes it interactive. */
+.current {
+  color: var(--ls-text, #0f172a);
+  font-weight: 500;
+}
+
+/* The divider: decorative, hidden from assistive technology by the component, excluded from text
+ * selection so copying the trail yields the labels, and never the element that gives up room when
+ * the row runs short. */
+.separator {
+  flex: none;
+  color: var(--ls-mist, #cbd5e1);
+  font-size: var(--ls-text-sm, 13px);
+  user-select: none;
+}
+
+/* The colour change is the only motion this module introduces, so this is the whole of its
+ * reduced-motion treatment: a reader who asked for less gets the end state at once. */
+@media (prefers-reduced-motion: reduce) {
+  .link {
+    transition: none;
+  }
+}

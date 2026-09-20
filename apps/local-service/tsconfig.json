@@ -1,0 +1,274 @@
+{
+  // ---------------------------------------------------------------------------
+  // @debuggen/local-service - the compiler project for the monorepo typecheck
+  // gate.
+  //
+  // What this workspace is: the single local coordination process (AAP 0.1.3,
+  // 0.7.1 Group 2). It owns the HTTP (hono) and WebSocket (ws) surfaces on
+  // 127.0.0.1, the `node:sqlite` session store, the session state machine, the
+  // six-stage pipeline with its versioned prompt files, adapter-driven
+  // instrumentation, telemetry ingestion with redaction and trace correlation,
+  // panel generation with validation and fallback, source-open forwarding, the
+  // dev-server launcher and end-of-session cleanup. It is a Node 24 process and
+  // nothing else: it renders no user interface, so no DOM or React type ever
+  // belongs in this program.
+  //
+  // Position in the acyclic package graph (AAP 0.2.2):
+  //   shared -> telemetry -> code-analysis -> instrumentation
+  //                       -> panel-schema                     -> protocol -> apps
+  // This project sits at the top of that graph, on the `apps` tier: it consumes
+  // the seven packages `references` names below and is consumed by nobody, so a
+  // reference FROM a package TO this project would be the cycle `tsc -b` rejects
+  // (TS6202) and the layering violation the per-package `no-restricted-imports`
+  // rules of eslint.config.js forbid independently once they land (AAP 0.2.2).
+  //
+  // `pnpm typecheck` (= `pnpm demo:generate && tsc -b`) builds the root
+  // tsconfig.json solution file, which references every workspace project - this
+  // one after the eight under packages/ - so the options here are what that
+  // blocking gate (AAP 0.8.5) runs on: a misconfiguration fails the whole
+  // monorepo typecheck, not just this workspace. `pnpm --filter
+  // @debuggen/local-service typecheck` runs the same `tsc -b` for this project
+  // and its seven dependencies alone, and until a referenced package has its
+  // first source file `tsc -b` answers that empty subtree with TS18003 ("No
+  // inputs were found in config file") - a property of an empty tree, not a
+  // configuration fault.
+  //
+  // Everything not stated below is inherited from tsconfig.base.json and must
+  // stay that way - in particular `strict`, `noUncheckedIndexedAccess`,
+  // `noImplicitOverride`, `noImplicitReturns`, `noFallthroughCasesInSwitch`,
+  // `noUnusedLocals`, `noUnusedParameters`, `forceConsistentCasingInFileNames`,
+  // `verbatimModuleSyntax`, `isolatedModules`, `moduleDetection`, `target`
+  // ES2023, `skipLibCheck` and the declaration-emit settings (`declaration`,
+  // `declarationMap`, `sourceMap`, `emitDeclarationOnly`, `incremental`,
+  // `outDir`, `tsBuildInfoFile`). No strictness flag is relaxed here, and no
+  // compiler or compiler package is declared: TypeScript 6.0.3 is pinned once,
+  // in the root manifest (AAP 0.3.1). `noEmit` must never be added: TypeScript
+  // 6.0.3 rejects a referenced project that disables emit with TS6310 and the
+  // whole gate fails.
+  //
+  // This file is JSONC, like every other tsconfig in the repository. tsc,
+  // ESLint, Vitest, tsup and Prettier all parse comments in tsconfig files;
+  // anything reading it programmatically must use a JSONC-aware reader
+  // (`ts.readConfigFile`), never bare `JSON.parse`.
+  // ---------------------------------------------------------------------------
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    // Already true in the base; restated because the root solution file
+    // references this project and a non-composite reference fails `tsc -b`
+    // outright (TS6306). Keeping it local means a future edit to the base cannot
+    // silently break the gate at this project.
+    "composite": true,
+
+    // The base defaults to "ESNext" + "bundler" for the bundled/web workspaces
+    // and names this workspace as one of the Node-targeted projects that
+    // override with NodeNext (AAP 0.3.4). It is the honest flavour here: the
+    // package.json declares `"type": "module"`, tsup emits dist/main.js as real
+    // Node ESM and `node dist/main.js` / `tsx watch src/main.ts` run it in
+    // Node 24, so the program must be type-checked against the resolver that
+    // actually loads it. A bundler-resolution program would accept an import
+    // graph Node then rejects at startup, and the seven `@debuggen/*`
+    // dependencies all compile and publish their dist under NodeNext too.
+    //
+    // CONSEQUENCE FOR EVERY SOURCE FILE IN src/** AND test/** - the single most
+    // common build break in this workspace: relative specifiers must carry an
+    // explicit ".js" extension even though the files on disk are ".ts", and a
+    // directory specifier must name its file:
+    //     import { loadConfig } from "./config.js";
+    //     import { openStore } from "../store/db.js";
+    //     import { registerRoutes } from "./server/routes/index.js";
+    // Extensionless relative imports are a compile error here by design
+    // (TS2835/TS2834). Package specifiers are written WITHOUT an extension -
+    // `hono`, `@hono/node-server`, `ws`, `pino`, `dotenv`, `zod`, the seven
+    // `@debuggen/*` packages - and resolve through the pnpm workspace symlink
+    // and each package's `exports` map; Node builtins are written with their
+    // `node:` prefix (`node:sqlite`, `node:http`, `node:fs`, `node:path`).
+    // tsup/esbuild resolve a "./x.js" specifier from a TypeScript importer back
+    // to "./x.ts", so neither `pnpm build` nor the esbuild bundle that
+    // apps/vscode-extension produces at dist/service/main.js is affected.
+    //
+    // `verbatimModuleSyntax` is inherited, so a specifier imported only for its
+    // types must say `import type` / `export type`. Both forms occur here: the
+    // Zod schemas of the schema packages are runtime imports, their inferred
+    // record and message types are type-only.
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+
+    // The workspace root, NOT "src" as in every packages/* sibling, because the
+    // integration suite lives outside src/ at test/integration/**/*.test.ts (the
+    // Vitest project `local-service-integration` behind `pnpm test:integration`,
+    // AAP 0.8.3) and must be part of the program: `rootDir: "src"` would reject
+    // those files with TS6059. Setting it to "." keeps both input roots legal and
+    // makes the inherited `${configDir}/.tsbuild` output mirror the workspace, so
+    // src/main.ts -> .tsbuild/src/main.d.ts and test/integration/auth.test.ts ->
+    // .tsbuild/test/integration/auth.test.d.ts. It also pins the program's
+    // boundary: nothing outside this workspace may be an input, so a stray
+    // `../../packages/**/src` import is a compile error rather than a second
+    // copy of a package compiled into this project.
+    "rootDir": ".",
+
+    // Node globals only, and they are load-bearing rather than incidental:
+    // `node:sqlite`'s `DatabaseSync` (the session store), `process.env` (config),
+    // `Buffer`/`crypto` (token hashing), `fs`/`path` (the $DEBUGGEN_HOME tree and
+    // file backups), `child_process` (the dev-server launcher) and the WHATWG
+    // `fetch`/`AbortSignal`/`URL` globals all come from @types/node 24.13.6,
+    // which is a ROOT devDependency and resolves by directory walk - AAP 0.3.2
+    // deliberately keeps it out of this workspace's manifest, so it must not be
+    // added there.
+    //
+    // Deliberately NOT listed: "ws". `types` governs only the ambient global
+    // type packages TypeScript includes automatically, never a package's own
+    // declarations, so @types/ws 8.18.1 (this workspace's devDependency) is
+    // found through the normal @types lookup for the explicit `import ... from
+    // "ws"` specifier - its exports map publishes the types condition NodeNext
+    // reads. Nothing else is listed either: no "react"/"react-dom" (this process
+    // renders nothing - the DevTools panel and the webview own the React
+    // surfaces), no "chrome", no "vscode". The suites import `{ describe, it,
+    // expect }` from "vitest" explicitly, so they need no ambient entry.
+    "types": ["node"]
+
+    // NOT overridden: "lib". The base's ES2023-only set is exactly right for a
+    // Node process, and adding "DOM" here would be actively harmful: `window`,
+    // `document` and DOM's `WebSocket`/`MessageEvent` would start type-checking
+    // inside a program that has no page, and DOM's `WebSocket` type does not
+    // describe a `ws` 8.21.3 instance. `fetch`, `Response`, `Headers`,
+    // `AbortController`, `URL` and the timer functions all come from @types/node
+    // via `types` above, so nothing real is lost. Timer handles are written as
+    // `ReturnType<typeof setTimeout>` rather than `number`.
+    // NOT overridden: "outDir" / "declarationDir" / "tsBuildInfoFile". The base
+    // anchors all three with `${configDir}`, which resolves to the directory of
+    // THIS file and not to the base's own directory, so the declarations and the
+    // incremental stamp land in apps/local-service/.tsbuild - ignored by
+    // .gitignore, .prettierignore and the ignore list in eslint.config.js. tsc
+    // must never write into apps/local-service/dist, which belongs to tsup and
+    // holds the dist/main.js that package.json `main`/`exports` point at; the
+    // inherited `emitDeclarationOnly` is what keeps `tsc -b` out of it.
+    // NOT set: "baseUrl" / "paths", and no alias of any kind. The seven
+    // workspace dependencies resolve through the pnpm workspace symlink and each
+    // package's `exports` map plus the project references below, exactly as the
+    // runtime and the bundlers resolve them (AAP 0.2.2). An alias would hide a
+    // broken `exports` map, let the acyclic layering be violated silently, and -
+    // decisively - break the esbuild bundle in apps/vscode-extension that
+    // compiles these sources into dist/service/main.js without reading this
+    // file. Because those `exports` maps point at each package's
+    // dist/index.d.ts, which lies outside the `${configDir}/.tsbuild`
+    // declaration directory, no output-to-source redirect applies: on a tree
+    // where a dependency's dist/ is missing the import fails with TS2307, which
+    // is why `pnpm verify` runs `pnpm build` before `pnpm typecheck`.
+    // NOT set: "noEmit" (TS6310 on a referenced project, see the header) and no
+    // strictness flag is relaxed on top of the base.
+    // NOT added: "resolveJsonModule". The base already enables it repository-wide
+    // and it stays inherited, but nothing here relies on it: prompts/manifest.json
+    // and src/store/schema.sql are runtime inputs read from disk with `fs` (the
+    // esbuild bundle of apps/vscode-extension copies the prompts and inlines the
+    // DDL), never `import`ed, so the program does not depend on JSON module
+    // resolution and must not start doing so - an imported .json file would be a
+    // build artefact this project cannot place next to dist/main.js.
+    // NOT set: "jsx". The base's inherited "react-jsx" is inert because `include`
+    // below admits no .tsx file and this workspace has none.
+  },
+
+  // The program is the service sources plus its suites, .ts only. `src/**/*.ts`
+  // covers the entry point and every module (server/**, store/**, sessions/**,
+  // pipeline/**, instrumentation/**, telemetry/**, analysis/**, panels/**,
+  // source/**, dev-server/**, cleanup/**) together with the colocated unit tests
+  // the Vitest project `local-service` collects at src/**/*.test.ts;
+  // `test/**/*.ts` covers the integration suite and its helpers under
+  // test/integration/** (AAP 0.8.3). Both are deliberately part of the program:
+  // `pnpm typecheck` is a blocking gate and the tests are first-class code, so
+  // `strict`, `noUncheckedIndexedAccess`, `noUnusedLocals` and
+  // `noUnusedParameters` apply to them exactly as they do to the sources. No
+  // "*.tsx" glob and no "prompts/**": the prompt files are Markdown read at
+  // runtime by the prompt loader.
+  //
+  // Until the first src file lands, `tsc -b` on this project answers TS18003
+  // ("No inputs were found in config file") - expected on an empty subtree, not
+  // a configuration fault.
+  "include": ["src/**/*.ts", "test/**/*.ts"],
+
+  // Replaces the base's inherited list rather than merging with it, so the build
+  // output directories are named again here; resolved relative to this
+  // directory, meaning apps/local-service/{node_modules,dist,.tsbuild}. The
+  // ".tsbuild" entry is load-bearing: TypeScript excludes `outDir` automatically
+  // only when `exclude` is absent, and with `rootDir: "."` that directory sits
+  // inside the input root, so without it the declarations emitted by `tsc -b`
+  // would become inputs of the next run. "dist" keeps the tsup bundle out for
+  // the same reason.
+  //
+  // "test/fixtures/**" is the deliberate one, and it is not an optimisation:
+  // that tree holds sample-project corpora and JSON payloads that are RUNTIME
+  // INPUTS - fed to the ts-morph indexer, patched by the real installer and
+  // posted to the ingest routes - not program files. test/fixtures/sample-project
+  // is a self-contained Next.js app with its own package.json, its own
+  // tsconfig.json (`noEmit`, `jsx: "preserve"`, its own `paths`) and .tsx
+  // components; compiling it here would type-check a foreign project under this
+  // project's options, fail on its unresolved `next`/`react` imports, and make
+  // every fixture edit a typecheck-gate event. It is the same treatment
+  // packages/code-analysis and packages/instrumentation give their fixture
+  // corpora, and the same tree the `sharedExclude` list of vitest.config.ts
+  // keeps out of test collection.
+  //
+  // Note what `exclude` does NOT do: it filters the `include` globs only, so a
+  // file reached by an import still joins the program - `rootDir` above is what
+  // rejects one from outside this workspace.
+  "exclude": ["node_modules", "dist", ".tsbuild", "test/fixtures/**"],
+
+  // Exactly the seven `@debuggen/*` dependencies package.json declares, listed
+  // bottom-up so the order matches the layering `tsc -b` walks (AAP 0.2.2):
+  //   ../../packages/shared          ids, `Result`, POSIX path containment and
+  //                                  the single `SourceLocation` schema, plus
+  //                                  the `./node` entry's hashing and safe-fs
+  //                                  helpers used by the store and cleanup;
+  //   ../../packages/telemetry       the TelemetryEventIngress/TelemetryEvent
+  //                                  schemas, the redaction rules, the
+  //                                  correlator and the capture aggregates the
+  //                                  ingest, analysis and panel-data paths run on;
+  //   ../../packages/code-analysis   the ts-morph indexer, code graph queries,
+  //                                  route map and source-map resolver behind
+  //                                  the investigation stage and source
+  //                                  resolution;
+  //   ../../packages/instrumentation the plan schemas, adapter registry,
+  //                                  installer, patcher and cleanup the
+  //                                  instrumentation service drives;
+  //   ../../packages/panel-schema    the PanelSpec/PanelSpecInput DSL, the node
+  //                                  catalog, DataQuery and the validators the
+  //                                  panel stage runs;
+  //   ../../packages/model-provider  the ModelProvider interface, the Anthropic
+  //                                  and deterministic providers, structured
+  //                                  output with its repair loop, the prompt
+  //                                  loader and the outbound redaction guard;
+  //   ../../packages/protocol        the message envelope, every WS message and
+  //                                  HTTP route schema, the SessionRecord and
+  //                                  the AnalysisResult - the topmost package,
+  //                                  which embeds the types of the four schema
+  //                                  packages above it rather than restating
+  //                                  them.
+  // Every cross-process type is referenced, never redefined: a second definition
+  // of an event, plan, panel or message shape in this workspace is the defect
+  // AAP 0.4.2 calls out by name.
+  //
+  // Deliberately ABSENT: ../../packages/panel-renderer, the React component
+  // library - this process renders nothing, it only ships validated PanelSpec
+  // objects to the DevTools panel and the webview, which own the renderer - and
+  // every apps/* sibling: the two extensions talk to this service over
+  // localhost HTTP and WebSocket using @debuggen/protocol, and apps/demo-app is
+  // an instrumentation target that no product workspace may import. The
+  // per-package `no-restricted-imports` rules of eslint.config.js enforce the
+  // same boundary for imports (AAP 0.2.2); this list is the compiler half of it,
+  // and it holds from the moment `tsc -b` runs rather than when the lint rules
+  // are switched on.
+  //
+  // What the references do, precisely: they order the build, so `tsc -b` on this
+  // project (or on the root solution) builds the seven packages first and reports
+  // errors in dependency order. They are not what resolves the specifiers - the
+  // `exports` maps are, per the "baseUrl"/"paths" note above.
+  "references": [
+    { "path": "../../packages/shared" },
+    { "path": "../../packages/telemetry" },
+    { "path": "../../packages/code-analysis" },
+    { "path": "../../packages/instrumentation" },
+    { "path": "../../packages/panel-schema" },
+    { "path": "../../packages/model-provider" },
+    { "path": "../../packages/protocol" }
+  ]
+}

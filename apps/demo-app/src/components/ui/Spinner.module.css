@@ -1,0 +1,91 @@
+/*
+ * Spinner - the storefront's busy indicator, shown by the cart, checkout and catalog surfaces
+ * while a request is in flight.
+ *
+ * Spinner.tsx renders one empty, `aria-hidden` element carrying `data-size`, so everything the
+ * reader sees is painted here: there is no text, no pseudo-element content and no second box. The
+ * element deliberately announces nothing to assistive technology - the surface that owns the
+ * request announces the wait, through its own label or `aria-busy` - which is why the ring needs
+ * no accessible name and no `role` of its own.
+ *
+ * Geometry comes from one file-local custom property, `--spinner-size`. Both dimensions read it
+ * and a size variant sets it, so each variant below is a single declaration rather than a fresh
+ * geometry block and no size literal is ever repeated. Its value is taken from the `--ls-text-*`
+ * scale instead of a spacing step because the spinner nearly always sits beside type - inside a
+ * button's label, at the end of a line of body copy - and matching the text size is what keeps it
+ * optically the same weight as its neighbour at all three sizes.
+ *
+ * Every colour is `var(--ls-TOKEN, <literal fallback>)`, the contract shared by every module in
+ * this folder: app/globals.css declares the tokens and the fallback mirrors the value declared
+ * there, so this component still renders correctly wherever it is mounted without that
+ * stylesheet. The fallback hex is lowercase because Prettier normalises CSS colours and
+ * `pnpm format:check` is a blocking gate.
+ *
+ * The border widths, `50%`, the rotation and the animation duration are bare literals on purpose:
+ * they are structural values the `--ls-*` set does not model, and promoting this one component's
+ * ring geometry into the application-wide stylesheet would give it the wrong owner.
+ */
+
+.root {
+  /* The single source of the ring's diameter: width, height and every size variant read it. */
+  --spinner-size: var(--ls-text-md, 15px);
+
+  display: inline-block;
+  /* Restated rather than left to the global reset, because the value is load-bearing here: the
+   * border has to sit inside `--spinner-size`, so a 15px spinner occupies exactly 15px and the
+   * line it sits in does not reflow when a variant changes the border width. */
+  box-sizing: border-box;
+  width: var(--spinner-size);
+  height: var(--spinner-size);
+  /* A button lays its label and this indicator out with flex; `none` (0 0 auto) stops the circle
+   * being squashed into an ellipse when the label runs out of room. */
+  flex: none;
+  /* The track, then the single arc that makes the rotation legible. `border-top-color` is
+   * physical on purpose: the arc is carried around by a physical rotation below, and the writing
+   * mode never moves it - in horizontal-tb, block-start is top. */
+  border: 2px solid var(--ls-mist, #cbd5e1);
+  border-top-color: var(--ls-accent, #f59e0b);
+  border-radius: 50%;
+  /* Two kinds of parent, two alignment models: `vertical-align` centres the ring on the text it
+   * follows in an inline run, `align-self` centres it in a flex or grid parent. Each is inert in
+   * the other's context, so no caller has to align the spinner itself. */
+  vertical-align: middle;
+  align-self: center;
+  animation: spin 700ms linear infinite;
+}
+
+/* Size is read from the `data-size` attribute the component writes on this same element rather
+ * than from a second class: a variant then cannot be applied without the base rule, and
+ * Spinner.tsx forwards its prop straight through instead of mapping it to a class name. `md` is
+ * the default declared above and needs no rule of its own. */
+.root[data-size='sm'] {
+  --spinner-size: var(--ls-text-sm, 13px);
+
+  /* A 2px ring on a 13px circle closes up into a disc; 1px keeps the hole - and therefore the
+   * rotation - visible at this size. */
+  border-width: 1px;
+}
+
+.root[data-size='lg'] {
+  --spinner-size: var(--ls-text-xl, 24px);
+}
+
+/* CSS Modules scope animation names alongside class names, so `spin` cannot collide with another
+ * module's animation of the same name. One keyframe is all it takes: the implicit `from` is the
+ * element's own unrotated state. */
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* A reader who has asked for less motion still has to be able to see that something is in flight,
+ * so the rotation stops and nothing else changes: the ring keeps its accent arc, its size and its
+ * place in the line. The rule carries this module's own specificity, which is what lets it replace
+ * the zero-specificity duration collapse in app/globals.css - that baseline would instead run the
+ * full rotation once in 0.01ms, which is motion the reader asked not to be shown. */
+@media (prefers-reduced-motion: reduce) {
+  .root {
+    animation: none;
+  }
+}

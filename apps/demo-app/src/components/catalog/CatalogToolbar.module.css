@@ -1,0 +1,117 @@
+/*
+ * CatalogToolbar - the catalog's search field, sort dropdown and result count.
+ *
+ * This module owns the row and nothing else: how the search field, the sort dropdown and the
+ * count share the available width, where the count sits, and how the three stack once the
+ * viewport is too narrow for one line.
+ *
+ * What it deliberately does not own: the fields' own appearance. `CatalogToolbar.tsx` renders
+ * `@/components/ui/Input` and `@/components/ui/Select` inside `@/components/ui/FormField`, and
+ * their border, background, radius, padding, focus ring and invalid state belong to
+ * `Input.module.css`, `Select.module.css` and `FormField.module.css` - the same primitives the
+ * checkout form uses, so a field that looked different here would look wrong there. The select's
+ * caret matters in particular: `Select.module.css` draws it from background gradients rather than
+ * an asset, so any `background` declaration reaching that element from this file would erase it.
+ * No rule below targets a field, and the only thing this file paints is the toolbar's own
+ * hairline.
+ *
+ * Why the wrappers exist at all: `Input` and `Select` are width-filling native elements
+ * (`width: 100%` in their own modules) and their props are the native attributes, so the width
+ * decision has to be made by the element around them. `.search` and `.sortField` are those
+ * elements, and they carry the flex behaviour.
+ *
+ * Token contract, as in every module of this workspace: each value is read as
+ * `var(--ls-NAME, <literal fallback>)`, so the module renders sensibly on its own and renders the
+ * `app/globals.css` palette in the application. The two geometry values that the shared scale
+ * does not model - the hairline's width and the search field's minimum - are declared once as
+ * file-local custom properties on `.root`, in the same `var()` form, and inherited by the child
+ * that reads them.
+ *
+ * Hex fallbacks are lowercase on purpose: Prettier normalises CSS colours to lowercase and
+ * `pnpm format:check` is a blocking gate.
+ */
+
+.root {
+  /* File-local geometry. Each reads a shared token, should one ever be added to globals.css, and
+   * otherwise resolves to the literal this storefront ships with today. */
+  --catalog-toolbar-hairline: var(--ls-hairline-width, 1px);
+  --catalog-toolbar-search-min: var(--ls-field-min-width, 16rem);
+
+  display: flex;
+  /* Wrapping instead of overflowing: between the single-column breakpoint at the end of this file
+   * and a wide desktop row there is a band where both fields still fit but the count no longer
+   * does, and there the count takes a line of its own rather than squeezing the search field. */
+  flex-wrap: wrap;
+  /* The fields are taller than the count, because each carries a `FormField` label above it, so
+   * the bottom edge is what settles where the count sits: level with the last line of the tallest
+   * field rather than floating above it. The fields themselves opt out of this and align by their
+   * top edges - see `.search` - since one of them carries a hint under its control and the other
+   * does not. */
+  align-items: flex-end;
+  gap: var(--ls-space-3, 12px);
+  /* Vertical breathing room only: the horizontal measure belongs to the page shell that holds the
+   * toolbar and the product grid, and both must share one left edge. */
+  padding: var(--ls-space-3, 12px) 0;
+  border-bottom: var(--catalog-toolbar-hairline) solid var(--ls-border, #cbd5e1);
+}
+
+/* The search wrapper: take whatever width is left over, and never fall below the measure at which
+ * a product name or an order code stops being readable while it is being typed. The minimum is
+ * inherited from `.root`, which is always this element's parent.
+ *
+ * `align-self` is what makes the two fields line up. Their wrappers are not the same height - the
+ * search field's `FormField` adds a hint line under its control and the sort field's does not - so
+ * bottom-aligning the wrappers would push the shorter field's control down by exactly the height
+ * of the taller field's trailing text. Claiming the line's full height instead leaves each label
+ * and control at the top of its own wrapper, which is where they belong relative to each other.
+ * The stacked layout at the end of the file asks every child for the same thing, so this rule
+ * needs no counterpart there. */
+.search {
+  flex: 1 1 auto;
+  align-self: stretch;
+  min-width: var(--catalog-toolbar-search-min);
+}
+
+/* The sort wrapper sizes to its own content - the widest option label plus the padding the select
+ * reserves for its caret - and neither grows nor shrinks, so the dropdown keeps one width while
+ * the result count beside it changes. It shares `.search`'s top alignment for the reason given
+ * there. */
+.sortField {
+  flex: 0 0 auto;
+  align-self: stretch;
+}
+
+/* Trailing-edge hook, for the optional empty element `CatalogToolbar.tsx` may render between the
+ * fields and the count: the auto inline-start margin claims whatever space its own line has left
+ * over, so the count keeps the end of that line even if the search field is ever given a width of
+ * its own in place of the growth it takes today. The stacked layout hides it, because an element
+ * with no content in it would otherwise still claim a row and the gap in front of it. */
+.spacer {
+  margin-inline-start: auto;
+}
+
+/* The result count. Tabular figures give every digit the same advance width, so the line keeps its
+ * measure as the number inside it changes and the text beside it never shifts. */
+.count {
+  margin: 0;
+  color: var(--ls-text-muted, #475569);
+  font-family: var(--ls-font-sans, system-ui);
+  font-size: var(--ls-text-sm, 13px);
+  font-variant-numeric: tabular-nums;
+}
+
+/* One column below the width at which the search field's minimum, the dropdown and a gap stop
+ * fitting side by side. The condition is written as a literal because a media query cannot read a
+ * custom property; this is the only place the breakpoint appears. */
+@media (max-width: 40rem) {
+  .root {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  /* A column already gives every child the full width, so the trailing-edge hook has no role here
+   * and would otherwise contribute an empty row's worth of gap. */
+  .spacer {
+    display: none;
+  }
+}

@@ -1,0 +1,126 @@
+/*
+ * WarehouseFilter - the inventory dashboard's filter row.
+ *
+ * Imported only by its sibling `WarehouseFilter.tsx` (`import styles from
+ * './WarehouseFilter.module.css';`). It is a leaf stylesheet: it imports nothing, and nothing but
+ * that component may use these classes.
+ *
+ * Division of labour, and the reason this file is nothing but layout:
+ *
+ *   - `ui/Select` and `ui/Input` own the control itself - height, padding, radius, border, the
+ *     gradient chevron, the hover/disabled treatment and the focus ring drawn from `--ls-focus`.
+ *     Their props are the native element's minus a layout escape hatch, so this row may not reach
+ *     into a control, and nothing here targets a `select`, `input` or `button` element.
+ *   - `ui/FormField` owns the `<label>`, the hint and the error paragraph, and the vertical rhythm
+ *     between a label and its control. Label typography is therefore not restated below.
+ *   - This file owns the row: how the labelled columns share the available width, where the Apply
+ *     group sits, how the row behaves when it no longer fits on one line, and how the row reads
+ *     while a filter change is in flight.
+ *
+ * Cascade note worth keeping in mind when editing `.field`: that class is passed to `FormField`'s
+ * `className`, so it lands on the same element as `FormField.module.css`'s own `.root`, which
+ * declares `display`, `flex-direction`, `gap` and `min-width: 0`. Two single-class rules in two
+ * stylesheets tie on specificity, and which one wins then depends on the order the bundler emits
+ * the modules in - not something this file should rely on. So `.field` declares none of those four
+ * properties: it sizes its column with the `flex` shorthand, which `FormField` never sets, and its
+ * floor is `flex-shrink: 0` rather than a `min-width` that `min-width: 0` could out-order.
+ *
+ * Token contract: every colour, space and type size is `var(--ls-TOKEN, <literal fallback>)`, as
+ * declared in `apps/demo-app/app/globals.css`. The fallback keeps this module sensible on its own
+ * and states the pixel value the token resolves to at the default root font size. Bare literals
+ * are limited to `0`, `none`, `auto` and the relative units (`ch`, `%`) that express a column
+ * measure the token scale deliberately does not model.
+ *
+ * There is no motion here - no transition, no animation, nothing that needs a reduced-motion
+ * counterpart - because a filter row that animates reads as slow, and this row must read as
+ * instant. The dashboard is the honest control surface of this demo and carries no seeded defect.
+ */
+
+/* The `<form method="get">` itself: a wrapping row of labelled controls.
+ *
+ * `align-items: flex-end` is what lines the Apply button up with the bottom edge of the controls,
+ * since `FormField` stacks a label above each one and so makes the columns taller than a bare
+ * button. Wrapping - rather than a horizontal scroller - is the right narrow-viewport behaviour
+ * for a handful of short controls: each column keeps its usable width and moves to the next line.
+ *
+ * `min-width: 0` lets the row shrink with the dashboard's grid track instead of widening it, and
+ * there is deliberately no `overflow` here: a native select draws its focus ring outside its own
+ * box, and a clipping ancestor would cut it off. */
+.root {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--ls-space-3, 12px);
+}
+
+/* One labelled column, passed to `FormField`'s `className`.
+ *
+ * `flex: 1 0 20ch` reads as: take an equal share of the leftover width, never shrink below the
+ * basis, and let the row wrap when the basis no longer fits. The `ch` basis is measured in the
+ * row's own font, so a column is sized by the text it has to show - roughly a warehouse name -
+ * rather than by a pixel figure guessed at authoring time. Refusing to shrink is what stops a long
+ * warehouse name from squeezing its neighbour down to an unusable sliver. */
+.field {
+  flex: 1 0 20ch;
+}
+
+/* The compact variant, for the low-stock threshold: a fixed, visibly narrower column that neither
+ * grows nor shrinks, so the numeric control stays the size of the number it holds and the text
+ * selects absorb the leftover width instead. Declared after `.field`, in the same file, so the
+ * override order is deterministic; a control with long option labels should take plain `.field`. */
+.fieldNarrow {
+  flex: 0 0 15ch;
+}
+
+/* The trailing control group: the Apply submit button, and a reset control beside it if the
+ * component renders one. `flex: none` keeps the group at its natural width, so a button never
+ * stretches to fill a column's worth of space.
+ *
+ * `margin-inline-start: auto` earns its place on the wrapped row rather than the wide one. While
+ * every control fits on one line the growing columns have already taken the free space, so the
+ * group sits at the trailing edge with nothing for the auto margin to absorb; once the row wraps
+ * and the group starts a line of its own, that margin is what holds it at the trailing edge
+ * instead of letting it fall back to the leading one. It is also the guard for a row built from
+ * fixed-width columns only, where free space does exist on a single line.
+ *
+ * A reset control belongs in here and needs no class of its own: rendering it with the shared
+ * `Button` primitive keeps its metrics and its focus ring identical to Apply's, which is exactly
+ * why this file draws no focus ring and defines no link treatment. */
+.actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: var(--ls-space-2, 8px);
+  margin-inline-start: auto;
+}
+
+/* Applied alongside `.root` while a filter change is in flight.
+ *
+ * Deliberately the quietest affordance that still says "working": a slight dim plus the progress
+ * cursor, with no spinner and no pulse. Filtering this dashboard is a URL change the server
+ * answers immediately, and a busy indicator with any theatre to it would misrepresent that - and
+ * would sit oddly in an application whose whole purpose is to make real slowness legible.
+ *
+ * 0.8 is not an arbitrary dim: at that value the muted 12px status line below still measures
+ * 4.5:1 against the page surface, so the row stays readable while it is pending rather than
+ * dropping below the contrast floor the rest of the storefront holds to.
+ *
+ * The cursor reaches the row's own area, the gaps between columns and the status line; a native
+ * control and a button keep the cursor their own stylesheet gives them, which is the correct
+ * trade - overriding that would take an element selector reaching into a control this file does
+ * not own. */
+.pending {
+  cursor: progress;
+  opacity: 0.8;
+}
+
+/* The polite status line that names the filter now in force, on its own full-width line under the
+ * controls (`flex: 1 0 100%`) so it never competes with a column for space. Muted and small: it
+ * confirms what just happened and is not a control. */
+.status {
+  flex: 1 0 100%;
+  color: var(--ls-text-muted, #475569);
+  font-size: var(--ls-text-xs, 12px);
+  line-height: 1.4;
+}

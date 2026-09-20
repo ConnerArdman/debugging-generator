@@ -1,0 +1,131 @@
+/*
+ * Lumen Supply - the inventory dashboard's KPI row.
+ *
+ * The CSS Module for `InventoryKpiCards.tsx`, which is the only file that may import it. It is a
+ * leaf: it imports nothing, declares no keyframes and reaches into no other component.
+ *
+ * Class contract - which element each class belongs on, because a CSS Module fails silently on a
+ * name that does not match:
+ *
+ *   .root           the `<section>` that holds the row. This is the grid.
+ *   .card           passed to `Card`'s `className`, so it lands on the card's outer element.
+ *   .metric         the `<dl>` inside a card: `<dt>` label, `<dd>` figure, optional `<dd>` note.
+ *   .label          the `<dt>`.
+ *   .value          the `<dd>` carrying the figure. Also carries `data-emphasis`.
+ *   .secondary      the optional `<dd>` under the figure.
+ *   .skeletonValue  passed to `Skeleton`'s `className` for a `shape="block"` figure placeholder.
+ *
+ * Ownership split with `ui/Card.module.css`: that file owns the surface - background, border,
+ * radius, elevation and the `data-pad` padding rhythm - and this file owns the geometry the card
+ * sits in. Nothing here restates a surface property, so a KPI card and a catalog card are the
+ * same surface with different geometry.
+ *
+ * Every colour, spacing step, radius and type size is `var(--ls-token, <literal fallback>)`. The
+ * fallbacks mirror `app/globals.css`, so the row renders correctly even where that stylesheet has
+ * not loaded, and they are lowercase because Prettier normalises CSS colours to lowercase and
+ * `pnpm format:check` is a blocking gate.
+ *
+ * The row is deliberately static: it declares no transition and no animation, so it needs no
+ * `prefers-reduced-motion` rule of its own. The only motion in the loading state belongs to
+ * `Skeleton`, which carries its own reduced-motion treatment.
+ */
+
+.root {
+  /* The narrowest a card may become before `auto-fit` drops a track, derived from what a card has
+   * to hold rather than chosen: a tabular monospace character occupies about 0.6em, so six times
+   * the figure's size leaves room for a ten-character grouped total, and the card spends two
+   * paddings on either side of it. A figure such as 1,284,930 therefore stays on one line at
+   * every width, and the scale travels with the reader's font size instead of a fixed floor.
+   *
+   * Five cards share one row on a dashboard-width page and reflow to three, two and one as the
+   * viewport narrows, with no breakpoint of this file's own. `min(100%, ...)` keeps a single card
+   * inside a viewport narrower than the floor instead of overflowing it. */
+  --kpi-track-min: calc(var(--ls-text-xl, 24px) * 6 + var(--ls-space-4, 16px) * 2);
+
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, var(--kpi-track-min, 176px)), 1fr));
+  gap: var(--ls-space-4, 16px);
+  /* The page owns the centred measure (`--ls-page-max`); the row simply fills the column it is
+   * given. `min-width: 0` lets a long figure wrap rather than widen the grid. */
+  width: 100%;
+  min-width: 0;
+}
+
+.card {
+  /* `Card` already declares this column; it is repeated so the class is meaningful on its own and
+   * so the gap below has a container to apply to. */
+  display: flex;
+  flex-direction: column;
+  /* Content sits at the top of the box, which keeps every figure on the same line whether or not
+   * its card has a secondary note. */
+  justify-content: flex-start;
+  gap: var(--ls-space-2, 8px);
+  /* A floor rather than a fixed height: it keeps a short card (no secondary note) in the row's
+   * rhythm, and the grid's default stretch still equalises the cards that share a row. */
+  min-height: calc(var(--ls-space-6, 32px) * 3);
+}
+
+.metric {
+  /* `Card` wraps children in its own body slot, so the label-to-figure rhythm lives on the
+   * definition list itself. */
+  display: flex;
+  flex-direction: column;
+  gap: var(--ls-space-1, 4px);
+  min-width: 0;
+}
+
+.label {
+  color: var(--ls-text-muted, #475569);
+  font-size: var(--ls-text-xs, 12px);
+  font-weight: 600;
+  /* Relative, so the tracking scales with the label rather than fighting a reader's font size. */
+  letter-spacing: 0.04em;
+  line-height: 1.35;
+  text-transform: uppercase;
+}
+
+.value {
+  color: var(--ls-text, #0f172a);
+  font-family: var(--ls-font-mono, ui-monospace, monospace);
+  font-size: var(--ls-text-xl, 24px);
+  /* Tabular figures keep the five cards' numbers optically aligned as the dashboard's aggregates
+   * change width - 6 warehouses beside 200,000 movements. */
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  /* A length, not a ratio: the figure's line box then measures exactly what `.skeletonValue`
+   * reserves, so the row keeps its height when a real number replaces its placeholder. */
+  line-height: var(--ls-space-6, 32px);
+}
+
+/* `data-emphasis` tints the figure and never carries the meaning alone: the `<dt>` label states
+ * what the figure is, and the component pairs an emphasised figure with a short badge word. */
+.value[data-emphasis='neutral'] {
+  color: var(--ls-text, #0f172a);
+}
+
+.value[data-emphasis='attention'] {
+  color: var(--ls-warning, #b45309);
+}
+
+.value[data-emphasis='positive'] {
+  color: var(--ls-success, #0f766e);
+}
+
+.secondary {
+  color: var(--ls-text-muted, #475569);
+  font-size: var(--ls-text-xs, 12px);
+  line-height: 1.4;
+}
+
+.skeletonValue {
+  /* `Skeleton` is `aria-hidden` and takes its box from the caller. Short of the full column so
+   * the row reads as figures being loaded rather than as solid bars. */
+  width: 70%;
+  /* The same token the figure's line box uses, so loading and loaded rows are the same height. */
+  height: var(--ls-space-6, 32px);
+  /* The bounds, not the height, are what hold that box: `Skeleton` declares `height: 100%` on its
+   * block shape through a class-and-attribute selector, which outranks this class whichever
+   * stylesheet the bundler emits first. Nothing competes for the bounds, so they always win. */
+  min-height: var(--ls-space-6, 32px);
+  max-height: var(--ls-space-6, 32px);
+}

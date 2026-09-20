@@ -1,0 +1,216 @@
+/*
+ * Lumen Supply - the inventory dashboard's low-stock list.
+ *
+ * Imported only by its sibling `LowStockList.tsx`
+ * (`import styles from './LowStockList.module.css';`). It dresses a semantic `<section>` holding a
+ * `<ul>` of short records, ordered most-urgent first, each naming the product, the warehouse the
+ * line sits in, the quantity on hand and the threshold that classified it.
+ *
+ * Division of ownership, so nothing here fights a shared component:
+ *
+ *   - `ui/Card` owns surface: background, border, radius, elevation and interior padding. When the
+ *     dashboard wraps this list in a card, `.root` travels through the card's `className` and
+ *     restates none of those properties.
+ *   - `ui/Badge` owns per-row status colour. The urgency accent below is a 2px rule and nothing
+ *     else, and the row always carries a badge whose text states the state in words - so the list
+ *     reads correctly without colour perception, and colour is purely additive.
+ *   - `ui/BlankSlate` owns the entire empty state: its illustration, its `positive` tone and its
+ *     typography, with the reassuring copy supplied by `LowStockList.tsx`. `.blankSlate` here
+ *     contributes placement and nothing else - no colour, no tint, no border accent, no icon, no
+ *     illustration path. An empty low-stock list means every line is above its threshold, which is
+ *     good news; a wrapper that framed it like an alarm would make the screen lie.
+ *   - `ui/Skeleton` owns the loading placeholder's own fill and is `aria-hidden`, so `.skeletonRow`
+ *     only gives it a size.
+ *
+ * Every colour, spacing step, radius, font family and type size is read as
+ * `var(--ls-TOKEN, <literal fallback>)` from the single `:root` block in `app/globals.css`, so the
+ * module renders sensibly in isolation and renders the storefront's palette in the application.
+ * Hex fallbacks are lowercase because Prettier normalises CSS colours and `pnpm format:check` is a
+ * blocking gate - do not "restore" the uppercase spelling.
+ *
+ * Interaction and motion are deliberately absent. `LowStockList.tsx` is a server component with no
+ * event handler, so there is no hover or pressed state to describe; the focus indicator for any
+ * link it nests comes from the one `:focus-visible` rule in `globals.css`. Nothing here transitions
+ * or animates, so this file needs no `prefers-reduced-motion` override of its own.
+ */
+
+/* The `<section>` wrapper: its heading, the list, and whatever the caller puts between them, on one
+ * vertical rhythm. An `<h2>` rendered here needs no class - the element baseline in `globals.css`
+ * already gives it the section-title colour, weight and size. */
+.root {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: var(--ls-space-3, 12px);
+}
+
+/* The `<ul>`. Rows are separated by the hairline on `.item`, not by a gap, so the list reads as one
+ * continuous ledger rather than a stack of cards. */
+.list {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* One `<li>`. Identity on the inline-start side, figures on the inline-end side, sharing a baseline
+ * so the product name and the monospace quantity sit on one optical line.
+ *
+ * The transparent inline-start border is the urgency accent's reserved seat: every row pays for the
+ * same 2px, so the text column starts at one x-position whatever a row's urgency is, and the
+ * `[data-urgency]` rules below only recolour it.
+ *
+ * `flex-wrap` is the narrow-column safety net: `.identity` can shrink to nothing, so once the
+ * figure group and the badge together outgrow the row they drop to a second line instead of
+ * overflowing the card. What pushes the figures to the inline-end edge is `.identity` absorbing the
+ * free space, deliberately, and not a `justify-content` value - a distributed `justify-content`
+ * would also spread that wrapped second line to both edges, stranding the badge opposite the
+ * figures it belongs to, and it would do so only at narrow widths and only when the badge is
+ * parented to the row rather than to the figure group. Leaving the default packs every wrapped line
+ * to the inline-start edge, under the text, which is where a continuation of the row reads. */
+.item {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--ls-space-3, 12px);
+  border-inline-start: 2px solid transparent;
+  padding-block: var(--ls-space-2, 8px);
+  padding-inline-start: var(--ls-space-2, 8px);
+}
+
+/* The rule between rows, and only between them: the first row needs no rule above it and the last
+ * none below, so neither the section heading nor the card edge gains a stray hairline. */
+.item + .item {
+  border-block-start: 1px solid var(--ls-border, #cbd5e1);
+}
+
+/* Urgency, derived by `LowStockList.tsx` from the row's own data. Restrained on purpose: a 2px
+ * inline-start rule, no fill, no border on the other three sides, and never the only carrier of the
+ * meaning. `watch` takes the neutral hairline colour rather than a third alarm colour, because a
+ * line merely worth watching is not a warning. */
+.item[data-urgency='critical'] {
+  border-inline-start-color: var(--ls-danger, #b42318);
+}
+
+.item[data-urgency='low'] {
+  border-inline-start-color: var(--ls-warning, #b45309);
+}
+
+.item[data-urgency='watch'] {
+  border-inline-start-color: var(--ls-border, #cbd5e1);
+}
+
+/* The identity column: product name above, warehouse beneath. `min-width: 0` is what lets a long
+ * product name wrap instead of widening the row past its container, and `flex: 1 1 auto` gives the
+ * name the slack while the figures keep their intrinsic width - it is also what carries the row's
+ * free space, and so what holds the figures against the inline-end edge (see `.item`). */
+.identity {
+  display: flex;
+  min-width: 0;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: var(--ls-space-1, 4px);
+}
+
+/* The product name, and the row's primary line. Medium rather than bold: the quantity beside it is
+ * what should catch the eye when the list is scanned. */
+.product {
+  min-width: 0;
+  color: var(--ls-text, #0f172a);
+  font-size: var(--ls-text-md, 15px);
+  font-weight: 500;
+  line-height: 1.4;
+  overflow-wrap: break-word;
+}
+
+/* The SKU, when the row carries one: rendered inside `.product` as its own element, so it reads as
+ * a code beside the name rather than part of it. Monospace, muted, and back to normal weight. */
+.sku {
+  color: var(--ls-text-muted, #475569);
+  font-family: var(--ls-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: var(--ls-text-xs, 12px);
+  font-weight: 400;
+}
+
+/* The warehouse, on its own line under the product name: which of the six sites is short. */
+.warehouse {
+  color: var(--ls-text-muted, #475569);
+  font-size: var(--ls-text-xs, 12px);
+  line-height: 1.4;
+}
+
+/* The figure group. `flex: none` keeps it at its intrinsic width so a long product name can never
+ * squeeze a quantity into wrapping mid-number. */
+.quantities {
+  display: flex;
+  flex: none;
+  align-items: baseline;
+  gap: var(--ls-space-1, 4px);
+}
+
+/* The quantity on hand: the number the reader came for. Tabular figures so a column of them lines
+ * up digit for digit down the list. */
+.available {
+  color: var(--ls-text, #0f172a);
+  font-family: var(--ls-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: var(--ls-text-md, 15px);
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+
+/* The threshold that classified the line. `LowStockList.tsx` renders it with an explicit textual
+ * relation ("of 40"), never as a bare second number, so the comparison survives being read aloud;
+ * `white-space: nowrap` keeps that phrase on one line. */
+.threshold {
+  color: var(--ls-text-muted, #475569);
+  font-family: var(--ls-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: var(--ls-text-xs, 12px);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* Placement for the row's `ui/Badge`, which owns its own colour, border and padding. Works whether
+ * the badge sits beside the figure group or inside it - the enclosing flex gap supplies the space,
+ * and `flex: none` stops the badge label wrapping. */
+.badge {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+}
+
+/* The empty state's placement, and deliberately nothing more.
+ *
+ * `BlankSlate` arrives here with its `positive` tone and brings its own centred column, heading and
+ * body, plus its illustration - which it selects and locates itself from the `art` name the call
+ * site passes, so no asset path is named or fetched here. All this class does is centre that block
+ * in the space the rows would have occupied and hold the card open, so the dashboard does not
+ * reflow when the last low-stock line clears. The `min-height` is a structural floor in `rem` -
+ * roughly the height of five rows - not a spacing step, which is why it is a bare relative length
+ * rather than a token.
+ *
+ * Nothing below may become a colour, a tint, a border or an icon. Read as a reviewer would: this
+ * must be impossible to mistake for an alert. */
+.blankSlate {
+  display: flex;
+  min-width: 0;
+  min-height: 17.5rem;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding-block: var(--ls-space-2, 8px);
+}
+
+/* One loading placeholder row, sized by the caller because `ui/Skeleton` is `aria-hidden` and
+ * paints only a `shape="block"` fill. 3rem of body plus 4px of margin on each edge reproduces a
+ * loaded row's pitch - a 15px name line, a 4px gap, a 12px warehouse line and 8px of padding above
+ * and below - to within two pixels, so the list does not jump when the rows arrive. Margins rather
+ * than a parent gap, so the placeholder reads correctly inside `.list` or inside a plain wrapper. */
+.skeletonRow {
+  display: block;
+  inline-size: 100%;
+  block-size: 3rem;
+  margin-block: var(--ls-space-1, 4px);
+}

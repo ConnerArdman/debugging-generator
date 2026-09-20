@@ -1,0 +1,225 @@
+/*
+ * Lumen Supply - one row of the order history.
+ *
+ * Scope is exactly the `<li>` that `OrderHistoryRow.tsx` renders. The `<ul>` reset, the hairline
+ * between rows, the visible column-header strip and the pager belong to
+ * `OrderHistoryList.module.css`; the status chip belongs to `../ui/Badge`; money typography
+ * belongs to `../ui/Price`. This file places those parts on one grid and owns the row's own
+ * hover and focus affordance - nothing more.
+ *
+ * The orders page lists hundreds of rows, so the grid is deliberately rigid: four tracks, only
+ * the first of them flexible, tabular numerals in every numeric cell and a monospace order
+ * reference. The three trailing tracks are sized from the spacing scale rather than from their
+ * contents, because every row is its own grid container: an `auto` track would resolve to that
+ * row's own badge word, item count and money string, and the column edges would then wander by
+ * tens of pixels from row to row and match no header strip. Fixed tracks are what make a column
+ * edge drawn at the top of the page the same edge at the bottom.
+ *
+ * Alignment contract with `OrderHistoryList.module.css`, whose `.columns` header strip (order,
+ * status, items, total) states the same template:
+ *
+ *     grid-template-columns:
+ *       minmax(0, 1fr)
+ *       var(--order-row-status-track, calc(var(--ls-space-6, 32px) * 3))
+ *       var(--order-row-items-track, calc(var(--ls-space-6, 32px) * 2.5))
+ *       var(--order-row-total-track, calc(var(--ls-space-6, 32px) * 4));
+ *     column-gap: var(--ls-space-3, 12px);
+ *
+ * The three custom properties are the seam: a container may declare them once - custom properties
+ * inherit, and CSS Modules leaves their names untouched - and the strip and every row then read
+ * the same widths without either file hardcoding them twice. The defaults above are 96px, 80px
+ * and 128px, each comfortably wider than the content it holds (the longest status chip, a
+ * two-digit item count, a seven-figure currency amount), so nothing spills into the gap.
+ *
+ * The two numeric cells are end-aligned, so their header labels are end-aligned too, and the
+ * strip hides itself in the same container query that collapses this row.
+ *
+ * Every colour, length, radius and font size resolves to an `--ls-*` custom property declared by
+ * `app/globals.css`, each with the literal fallback that mirrors it, so the module renders
+ * correctly on its own as well as inside the application. Hex fallbacks are lowercase because
+ * Prettier normalises CSS colours and `pnpm format:check` is a blocking gate.
+ */
+
+.root {
+  display: grid;
+  grid-template-columns:
+    minmax(0, 1fr)
+    var(--order-row-status-track, calc(var(--ls-space-6, 32px) * 3))
+    var(--order-row-items-track, calc(var(--ls-space-6, 32px) * 2.5))
+    var(--order-row-total-track, calc(var(--ls-space-6, 32px) * 4));
+  align-items: center;
+  /* The column gap is the half of the contract the header strip has to repeat. The row gap only
+   * ever applies when the anchor occupies a line of its own, so it is the tighter step. */
+  column-gap: var(--ls-space-3, 12px);
+  row-gap: var(--ls-space-2, 8px);
+  padding: var(--ls-space-2, 8px) var(--ls-space-3, 12px);
+  border-radius: var(--ls-radius-sm, 4px);
+  /* Declared so the hover tint has a start value to interpolate from. Durations are not part of
+   * the token contract, so this timing is stated literally; every length in the file is a token or
+   * a calc() over one, the sole exception being the container-query breakpoint at the end, which
+   * the syntax forbids from reading a token at all. */
+  background-color: transparent;
+  transition: background-color 150ms ease-out;
+}
+
+.identity {
+  display: flex;
+  min-width: 0;
+  grid-row: 1;
+  grid-column: 1;
+  flex-direction: column;
+  gap: var(--ls-space-1, 4px);
+}
+
+/* The column readers scan. Monospace with tabular figures is what keeps three hundred references
+ * in a straight edge; the ellipsis keeps a long one inside the flexible track instead of forcing
+ * the grid wider, and leaves the text selectable. */
+.orderNumber {
+  overflow: hidden;
+  color: var(--ls-text, #0f172a);
+  font-family: var(--ls-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: var(--ls-text-md, 15px);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.placed {
+  color: var(--ls-text-muted, #475569);
+  font-size: var(--ls-text-xs, 12px);
+}
+
+/* Placement only: the chip's own padding, radius, colour and border are `../ui/Badge`'s. */
+.statusCell {
+  display: flex;
+  grid-row: 1;
+  grid-column: 2;
+  align-items: center;
+}
+
+.itemsCell {
+  grid-row: 1;
+  grid-column: 3;
+  color: var(--ls-text-muted, #475569);
+  font-size: var(--ls-text-sm, 13px);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  text-align: end;
+}
+
+/* Alignment only: `../ui/Price` owns the money typography variants. The family and the figure
+ * mode are restated here so the totals form a straight right edge even when a row renders the
+ * amount as plain text. */
+.totalCell {
+  grid-row: 1;
+  grid-column: 4;
+  font-family: var(--ls-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  text-align: end;
+}
+
+/* The row's anchor. It sits in the flexible first track on a line of its own when the component
+ * renders it as a direct child of the row, and is inert grid placement when the component nests
+ * it inside `.identity` instead - either way it stays out of the three trailing tracks, so the
+ * anchor's label can never widen a column and break the alignment with the header strip.
+ *
+ * Colour: the link accent for this row is #0f766e, which `app/globals.css` declares as
+ * `--ls-teal` and exposes semantically as `--ls-focus` (5.5:1 on the page surface). It is read
+ * through that token rather than through `--ls-accent`, because `--ls-accent` is bound to the
+ * brand amber there and that stylesheet reserves it for fills and decorative accents - never for
+ * text on a light surface, where it measures 2.15:1. */
+.link {
+  grid-row: 2;
+  grid-column: 1;
+  justify-self: start;
+  max-width: 100%;
+  padding-block: var(--ls-space-1, 4px);
+  color: var(--ls-focus, #0f766e);
+  font-size: var(--ls-text-sm, 13px);
+  text-decoration: none;
+}
+
+/* BLITZY [A11Y]: the anchor is a compact inline target roughly 21px tall, below the 44x44px
+ * touch-target recommendation, because the design for this view is a dense data row repeated
+ * hundreds of times. It is implemented at the designed size rather than silently enlarged; the
+ * padded row around it carries the visible hover affordance, and the row's focus ring below marks
+ * the anchor when it is reached from the keyboard. Flagged for design review. */
+
+/* Hover lives behind a hover-capable-pointer query so a tap on a touch device does not leave a
+ * row looking permanently active. */
+@media (hover: hover) {
+  .root:hover {
+    background-color: var(--ls-surface-sunken, #f8fafc);
+  }
+
+  .link:hover {
+    text-decoration: underline;
+    text-underline-offset: calc(var(--ls-space-1, 4px) / 2);
+  }
+}
+
+/* One indicator for the whole row, drawn when its anchor takes focus. The outline is inset by
+ * half its own width so it stays inside the row box instead of overlapping the hairline the list
+ * draws between rows. */
+.root:focus-within {
+  outline: calc(var(--ls-space-1, 4px) / 2) solid var(--ls-focus, #0f766e);
+  outline-offset: calc(var(--ls-space-1, 4px) * -0.5);
+  background-color: var(--ls-surface-sunken, #f8fafc);
+}
+
+/* The anchor deliberately shows no ring of its own: `app/globals.css` gives every focusable
+ * element one, and keeping it here would draw a second ring inside the row's. */
+.link:focus-visible {
+  outline: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .root {
+    transition: none;
+  }
+}
+
+/* One collapse point, expressed as a container query because this list is as likely to sit in a
+ * narrow page column as to span the page: `OrderHistoryList.module.css` declares
+ * `container-type: inline-size` on the list region, and the rule below reads that container's
+ * inline size rather than the viewport's.
+ *
+ * The value is 32rem - 512px at the default 16px root, sixteen times the 32px `--ls-space-6`
+ * step - written as arithmetic over that step in rem so it also tracks the reader's root font
+ * size. A container condition is evaluated before custom properties are substituted, so `var()`
+ * cannot appear inside the parentheses; the calc() is as close as the syntax allows to naming the
+ * token. The header strip hides itself at this same width, because a stacked row has no columns
+ * left to label.
+ *
+ * Two columns: the order identity beside its status, then the item count beside the total, with
+ * the anchor on its own line. The second track keeps the widest of the two fixed widths above, so
+ * the chip and the amount stay on one straight right edge, and everything else lives in the
+ * flexible first track - nothing overflows however narrow the container becomes. */
+@container (max-width: calc(2rem * 16)) {
+  .root {
+    grid-template-columns:
+      minmax(0, 1fr)
+      var(--order-row-total-track, calc(var(--ls-space-6, 32px) * 4));
+  }
+
+  .statusCell {
+    grid-column: 2;
+    justify-content: flex-end;
+  }
+
+  .itemsCell {
+    grid-row: 2;
+    grid-column: 1;
+    text-align: start;
+  }
+
+  .totalCell {
+    grid-row: 2;
+    grid-column: 2;
+  }
+
+  .link {
+    grid-row: 3;
+  }
+}

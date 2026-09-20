@@ -1,0 +1,126 @@
+/*
+ * Lumen Supply - Alert: the inline message box.
+ *
+ * Rendered by src/components/ui/Alert.tsx and by nothing else. That component sets `data-tone` on
+ * the root element - "info" (the default), "success", "warning" or "danger" - and derives the
+ * element's ARIA role and live-region politeness from the same value, so this stylesheet owns how
+ * a notice looks and never what it announces.
+ *
+ * Where these appear in the storefront: a failed order above the checkout form, a cart that could
+ * not be synchronised, a low-stock notice on the inventory dashboard. They are inline boxes that
+ * sit in the document flow and stay where they were rendered. Notices that fly in, stack and time
+ * out are a different component in this folder, and that component is also the only one here that
+ * takes an element out of the flow and spends a stacking tier: nothing below pins an element to the
+ * viewport or claims a layer, so an alert can never end up floating over a drawer.
+ *
+ * Tone is carried twice - by a 3px accent along the inline-start edge and by the title colour -
+ * and never carried by colour alone: the caller's title and body text state the problem in words.
+ * No icon, glyph, pseudo-element content or image is involved, which keeps the box readable with
+ * colour perception simulated off and keeps the component free of any asset dependency.
+ *
+ * The four tones are the folder's shared status set - the same token names and fallbacks the badge,
+ * pill and toast stylesheets use. As text on this box's background they measure 6.7:1 (info),
+ * 5.5:1 (success), 5.0:1 (warning) and 6.6:1 (danger), and the body copy measures 17.9:1; all clear
+ * WCAG AA for text at 4.5:1.
+ *
+ * Only the title takes the tone colour. Body copy stays `--ls-text`, because a whole paragraph
+ * tinted in a status colour is what makes a failure message hard to read, and the checkout failure
+ * path is precisely where that would show. The box keeps the plain `--ls-surface` background for
+ * the same reason: the token set has no tint ramp, so a tint would have to be mixed from one status
+ * colour and - to stay token-only and uniform - applied to all four tones, washing an info notice
+ * in the danger hue. The plain surface is also what lets an alert nested inside a card read as one
+ * family with it, sharing its radius and its padding rhythm.
+ *
+ * Every colour, spacing, radius and type size is `var(--ls-NAME, <literal fallback>)`, so the box
+ * renders sensibly on its own and renders the palette declared in app/globals.css inside the
+ * application. Hex fallbacks are lowercase because Prettier normalises CSS colours to lowercase and
+ * `pnpm format:check` is a blocking gate. The font family is inherited rather than restated: the
+ * document sets it once.
+ */
+
+.root {
+  /* The tone, resolved once per box. This is the stylesheet's own custom property, declared here
+   * and read by the accent border and by the title, so each variant below is one declaration
+   * instead of two rules that could drift apart. Its value is always a status token carrying that
+   * token's literal fallback, so the accent and the title still paint when this module is rendered
+   * without the global token sheet. `info` is the default, which is what an Alert with no
+   * `data-tone` attribute - or an unrecognised one - gets. */
+  --alert-tone: var(--ls-info, #1d4ed8);
+
+  display: flex;
+  flex-direction: column;
+  /* Title, body and the optional actions row stack in this order; the row adds to this gap. */
+  gap: var(--ls-space-1, 4px);
+  /* An alert is often a child of a flex or grid column (the checkout summary, a dashboard card),
+   * where a long order reference would otherwise push the track wider than its share. */
+  min-width: 0;
+  padding-block: var(--ls-space-3, 12px);
+  padding-inline: var(--ls-space-4, 16px);
+  /* The hairline first, then the inline-start edge widened and recoloured into the tone accent.
+   * Physical and logical border declarations cascade in source order, so these two must follow the
+   * shorthand.
+   *
+   * BLITZY [A11Y]: the hairline measures 1.48:1 against this box's background, below the 3:1
+   * non-text recommendation. It is written as the shared token contract specifies rather than
+   * silently darkened, because it is a decorative separator: the tone accent on the inline-start
+   * edge clears 3:1 in all four tones (5.0:1 to 6.7:1) and the title and body text state the
+   * message in words, so no meaning rests on the hairline. Flagged for design review. */
+  border: 1px solid var(--ls-border, #cbd5e1);
+  border-inline-start-width: 3px;
+  border-inline-start-color: var(--alert-tone);
+  border-radius: var(--ls-radius-md, 8px);
+  background: var(--ls-surface, #ffffff);
+  color: var(--ls-text, #0f172a);
+  font-size: var(--ls-text-sm, 13px);
+  line-height: 1.45;
+  /* Product codes, SKUs and order references arrive inside these messages unbroken. */
+  overflow-wrap: break-word;
+}
+
+/* Tones. Selected by the attribute the component already sets, so Alert.tsx needs no class lookup
+ * and no dynamic indexing into the styles object. */
+
+.root[data-tone='info'] {
+  --alert-tone: var(--ls-info, #1d4ed8);
+}
+
+.root[data-tone='success'] {
+  --alert-tone: var(--ls-success, #0f766e);
+}
+
+.root[data-tone='warning'] {
+  --alert-tone: var(--ls-warning, #b45309);
+}
+
+.root[data-tone='danger'] {
+  --alert-tone: var(--ls-danger, #b42318);
+}
+
+/* The one-line heading, rendered as a paragraph rather than a heading element so an alert dropped
+ * into a page never disturbs its outline. It is the element that carries the tone in colour, and
+ * its text is what carries the tone in words. */
+.title {
+  margin: 0;
+  color: var(--alert-tone);
+  font-size: var(--ls-text-sm, 13px);
+  font-weight: 600;
+}
+
+/* The message itself: primary text colour at the box's own size, whatever the tone. Block rhythm
+ * inside the slot belongs to the caller - this rule deliberately does not lay out its children, so
+ * a sentence containing a link or a strong run stays one sentence on one line. */
+.body {
+  margin: 0;
+  color: var(--ls-text, #0f172a);
+}
+
+/* The optional trailing row of controls the caller supplies (retry, dismiss, "view order"). It
+ * wraps rather than overflowing in a narrow column, and sits a step further from the message than
+ * the title does, since the root gap already separates the stack. */
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--ls-space-2, 8px);
+  margin-block-start: var(--ls-space-2, 8px);
+}

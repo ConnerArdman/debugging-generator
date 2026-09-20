@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 180" width="240" height="180" role="img">
+  <title>No orders yet</title>
+  <!-- Empty-state artwork for the order history page: a clipboard board holding one blank ruled
+      slip, two more slips fanned behind it. Nothing has been filed yet, so the reading stays
+      administrative - no warning shape, no red in the palette. The 240 x 180 box is shared with
+      the other two empty-state illustrations here so all three sit at identical proportions, and
+      the intrinsic size is declared beside the view box because consumers reference this file by
+      its string path and have no static import to infer a size from. The subject spans x 61-179
+      and y 19-149, centred on x 120, clear of every edge, leaving the lower 31 units free for a
+      heading and a call to action. The shapes carry no lettering: all copy belongs to the page. -->
+  <!-- Palette: the storefront's own values, written as explicit hex because an image loaded
+      through an img element inherits no colour from the page. Slate #475569 outlines the front
+      board and carries the silhouette on a white surface; mist #CBD5E1 draws the deliberately
+      faint rear outlines, ruled lines and ground line; paper #F8FAFC fills the rear slips; white
+      #FFFFFF the front face; ink #0F172A one small rivet; teal #0F766E the clip, this file's
+      single accent, held to a small area so it reads as a marker, not a block of colour. -->
+  <defs>
+    <!-- The only gradient in the file: a two-stop vertical wash that lifts the front face off the
+        flat paper fill of the slips behind it. Both stops are palette values, so the composited
+        result stays inside the palette at every point. -->
+    <linearGradient id="slip-face" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF" />
+      <stop offset="1" stop-color="#F8FAFC" />
+    </linearGradient>
+  </defs>
+  <!-- One stroked group: every line is round-capped and round-joined, and stroke widths stay
+      between 3 and 3.5 so none thins to a hairline at two thirds of the intrinsic size. -->
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <!-- Ground line, narrower than the stack so it seats the slips without framing them. -->
+    <line x1="78" y1="147" x2="162" y2="147" stroke="#CBD5E1" stroke-width="3.5" />
+    <!-- The two slips already in the pile, fanned nine degrees either side of the board's centre
+        at 120 87 so a corner of each stays visible past the front face. -->
+    <rect x="69" y="40" width="82" height="94" rx="7" fill="#F8FAFC" stroke="#CBD5E1" stroke-width="3" transform="rotate(-9 120 87)" />
+    <rect x="89" y="40" width="82" height="94" rx="7" fill="#F8FAFC" stroke="#CBD5E1" stroke-width="3" transform="rotate(9 120 87)" />
+    <!-- The board in front, upright and unrotated: the shape the eye settles on. -->
+    <rect x="73" y="34" width="94" height="104" rx="9" fill="url(#slip-face)" stroke="#475569" stroke-width="3.5" />
+    <!-- Four ruled lines of unequal length. Plain strokes at a spacing far wider than any type
+        would set, so the slip reads as blank stationery and never as writing. -->
+    <line x1="91" y1="64" x2="149" y2="64" stroke="#CBD5E1" stroke-width="3.5" />
+    <line x1="91" y1="84" x2="133" y2="84" stroke="#CBD5E1" stroke-width="3.5" />
+    <line x1="91" y1="104" x2="149" y2="104" stroke="#CBD5E1" stroke-width="3.5" />
+    <line x1="91" y1="122" x2="121" y2="122" stroke="#CBD5E1" stroke-width="3.5" />
+  </g>
+  <!-- The clip: a clamp plate straddling the board's top edge and the narrow bridge above it,
+      both filled teal, with one ink rivet at the pivot as the drawing's darkest detail. -->
+  <g fill="#0F766E">
+    <rect x="112" y="19" width="16" height="8" rx="3.5" />
+    <rect x="103" y="25" width="34" height="15" rx="4.5" />
+  </g>
+  <circle cx="120" cy="32.5" r="2.5" fill="#0F172A" />
+</svg>

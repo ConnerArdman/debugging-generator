@@ -1,0 +1,66 @@
+/*
+ * CatalogEmptyNotice - the field around the catalog's empty and no-match block.
+ *
+ * Division of labour: `@/components/ui/BlankSlate` owns everything inside the block - the
+ * illustration slot, the heading and the action row, together with their own spacing - so this
+ * module declares only the field around it and the treatment of the sentence BlankSlate renders as
+ * its children. Nothing here restyles BlankSlate or reaches into it.
+ *
+ * Token contract, as `apps/demo-app/app/globals.css` states it: every value is read as
+ * `var(--ls-NAME, <literal fallback>)` from the single `:root` block in that file, so this block
+ * renders sensibly on its own and renders the storefront's palette in the application. The
+ * fallbacks mirror the values that file declares, which is why the recessed surface falls back to
+ * #f8fafc (`--ls-surface-sunken` resolves to `--ls-paper`) and the type-scale fallback is the pixel
+ * size its rem value renders at the default 16px root. Where the shared set carries no token for a
+ * value - the hairline width, the field's own width, the reading measure of the sentence - a
+ * file-local property holds it in the same `var()` form, so every literal in this file sits inside
+ * a fallback. Hex is lowercase because Prettier normalises it and `pnpm format:check` is blocking.
+ *
+ * The exported class names are `root`, `body` and `term`: exactly the three CatalogEmptyNotice.tsx
+ * imports, and each of the three is declared below.
+ */
+
+/* The field: a centred column holding the BlankSlate block, outlined and recessed so the message
+ * reads as a deliberate state of the catalog rather than empty space. */
+.root {
+  --notice-hairline: var(--ls-border-width, 1px);
+  --notice-inline-size: var(--ls-notice-inline-size, 100%);
+
+  display: grid;
+  justify-items: center;
+  /* The field takes the full width of whichever column, grid track or notice slot the catalog
+   * places it in, and `min-inline-size: 0` lets a long search term wrap inside the field instead
+   * of widening that track. */
+  inline-size: var(--notice-inline-size);
+  min-inline-size: 0;
+  gap: var(--ls-space-3, 12px);
+  /* The generous block padding is what gives the message room. The inline padding is already the
+   * small step of the spacing scale, so no narrow-viewport rule is needed for the field to stay
+   * comfortable down to the narrowest phone width. */
+  padding-block: var(--ls-space-6, 32px);
+  padding-inline: var(--ls-space-4, 16px);
+  border: var(--notice-hairline) solid var(--ls-border, #cbd5e1);
+  border-radius: var(--ls-radius-lg, 12px);
+  background: var(--ls-surface-sunken, #f8fafc);
+  text-align: center;
+}
+
+/* The sentence under BlankSlate's heading: secondary in colour and size, and held to a reading
+ * measure so centred copy breaks into short, even lines rather than one wide one. The muted text
+ * colour measures 7.2:1 on the recessed surface, so it clears WCAG AA comfortably. */
+.body {
+  --notice-measure: var(--ls-measure-copy, 48ch);
+
+  max-inline-size: var(--notice-measure);
+  margin-inline: auto;
+  color: var(--ls-text-muted, #475569);
+  font-family: var(--ls-font-sans, system-ui);
+  font-size: var(--ls-text-sm, 13px);
+}
+
+/* The search term echoed back inside that sentence: monospaced and in the primary text colour, so
+ * a reader can see exactly what was searched for, spacing and punctuation included. */
+.term {
+  color: var(--ls-text, #0f172a);
+  font-family: var(--ls-font-mono, ui-monospace);
+}

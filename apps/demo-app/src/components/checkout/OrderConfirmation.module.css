@@ -1,0 +1,302 @@
+/*
+ * Lumen Supply - order confirmation.
+ *
+ * The stylesheet for `OrderConfirmation.tsx`: the receipt the storefront shows once an order has
+ * been placed - a headline, the order reference, the order status, the ordered lines, the totals,
+ * the shipping destination with its estimated arrival, and a link to the order history. The same
+ * block is rendered by a server page and, after a successful submit, by `CheckoutForm`, so it has
+ * to look identical in both places from a single stylesheet with no variant switch.
+ *
+ * WHAT THIS FILE OWNS
+ *   The block's internal rhythm and alignment: the line grid, the totals grid, the monospace
+ *   order-reference chip, the destination block and the trailing action row.
+ *
+ * WHAT IT DELIBERATELY DOES NOT OWN - none of it is restated here
+ *   - The surface. The component renders inside `../ui/Card`, so `Card.module.css` owns the
+ *     background, border, radius, elevation and outer padding, and separates its `head` and
+ *     `foot` slots from the body with its own hairline. `.root` below adds no surface of its
+ *     own: a second one inside the card would read as a box drawn inside a box.
+ *   - The status chip. `../ui/Badge` owns its tone palette and geometry. `.statusRow` only
+ *     places it beside the order date, and the badge's own label always states the status in
+ *     words, so colour is never the sole carrier of that meaning.
+ *   - Money typography. `../ui/Price` owns the figure itself - the mono family, tabular
+ *     numerals, weight and the size variants - so `.lineTotal` and `.totalsValue` position and
+ *     align it and nothing more.
+ *
+ * TOKEN CONTRACT
+ *   Every colour, space, radius and type size is read as `var(--ls-NAME, <literal fallback>)`.
+ *   `app/globals.css` declares the tokens and is what the browser paints; the fallbacks mirror
+ *   its values so this module still renders sensibly when read on its own. Bare literals appear
+ *   only where the token set models nothing: `0`, `none`, grid keywords, line heights, font
+ *   weights, the transition duration, and the 1px and 2px line widths the folder writes literally
+ *   for a border, an outline and the link underline - exactly as `Card.module.css` writes its
+ *   hairline and `globals.css` its focus ring, so the three agree on sight. Hex spellings are
+ *   lowercase because Prettier normalises them and `pnpm format:check` is a blocking gate.
+ *
+ * CLASS CONTRACT - what `OrderConfirmation.tsx` composes with `clsx`
+ *   .root           the block wrapper, rendered inside `Card`
+ *   .headline       the receipt's heading element
+ *   .orderNumber    the selectable order reference
+ *   .statusRow      the `Badge` beside the order date
+ *   .lines .line    the ordered-lines list, and one line of it
+ *   .lineBody       a line's description column, holding .lineName and .lineMeta
+ *   .lineTotal      a line's money column
+ *   .totals         the derived-totals block: .totalsRow, .totalsLabel, .totalsValue
+ *   .grandTotal     added to the final .totalsRow to emphasise it - and because `Price` owns the
+ *                   figure's size, the emphasis only reaches the money if that row's `Price`
+ *                   is given the larger size; a `font-size` here cannot cross that boundary
+ *   .shipping       the destination block, with .addressBlock for the postal address itself
+ *   .actions        the trailing row, with .actionLink for the "View all orders" anchor
+ */
+
+/* The wrapper inside `Card`: one column with an even rhythm between blocks, and a size container
+ * so the line grid can answer the width it actually has rather than the width of the viewport.
+ * That matters because this block appears both in a page's main column and in the narrower
+ * checkout column, and neither knows what the other is doing. */
+.root {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: var(--ls-space-4, 16px);
+  container-type: inline-size;
+}
+
+/* Styles a real heading element; `globals.css` has already reset its margin. */
+.headline {
+  color: var(--ls-text, #0f172a);
+  font-size: var(--ls-text-xl, 24px);
+  font-weight: 600;
+  line-height: 1.25;
+}
+
+/* The reference a customer quotes back, so it is unambiguous and plain selectable text: a
+ * monospace chip on the recessed surface, digits in tabular numerals so a zero cannot be read as
+ * a letter, and `overflow-wrap: anywhere` so a long reference wraps inside a narrow card instead
+ * of widening it. The inline-start edge carries the one restrained success accent in this file;
+ * it is decoration only - the badge and its label state the order's status. Selection behaviour
+ * is left at the browser default on purpose: nothing here may make the reference unselectable. */
+.orderNumber {
+  display: inline-flex;
+  align-items: center;
+  align-self: flex-start;
+  max-width: 100%;
+  border: 1px solid var(--ls-border, #cbd5e1);
+  border-inline-start: 2px solid var(--ls-success, #0f766e);
+  border-radius: var(--ls-radius-sm, 4px);
+  background-color: var(--ls-surface-sunken, #f8fafc);
+  padding-block: var(--ls-space-1, 4px);
+  padding-inline: var(--ls-space-2, 8px);
+  color: var(--ls-text, #0f172a);
+  font-family: var(--ls-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: var(--ls-text-md, 15px);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
+  overflow-wrap: anywhere;
+}
+
+/* The status badge with the order date beside it. The row sets the date's own treatment - muted
+ * and small - so the date needs no class of its own; the badge overrides both from its module. */
+.statusRow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--ls-space-2, 8px);
+  color: var(--ls-text-muted, #475569);
+  font-size: var(--ls-text-sm, 13px);
+}
+
+/* The ordered lines. A real list, reset to no marker, with one hairline between neighbours and
+ * none after the last - which is what `li + li` buys over a bottom border on every row. The
+ * selector names `.lines` because CSS Modules require a local class in every selector. */
+.lines {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.lines > li + li {
+  border-block-start: 1px solid var(--ls-border, #cbd5e1);
+}
+
+/* One line: description on the inline-start side, money on the inline-end side. `minmax(0, 1fr)`
+ * is load-bearing - it lets the description track shrink below its content's intrinsic width, so
+ * a long industrial product name is clamped by `.lineName` instead of pushing the money column
+ * out of the card. Baseline alignment puts the figure on the name's first baseline. */
+.line {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: var(--ls-space-3, 12px);
+  padding-block: var(--ls-space-2, 8px);
+}
+
+.lineBody {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: var(--ls-space-1, 4px);
+}
+
+/* Held to two lines. A receipt line names a product, not a paragraph, and a wrapping title three
+ * lines deep would break the scan down the money column that makes this block readable. */
+.lineName {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  color: var(--ls-text, #0f172a);
+  font-size: var(--ls-text-md, 15px);
+  overflow-wrap: anywhere;
+}
+
+/* The line's supporting wording - the quantity and the stock code. Tabular numerals keep the
+ * quantities in a column under one another. */
+.lineMeta {
+  color: var(--ls-text-muted, #475569);
+  font-size: var(--ls-text-xs, 12px);
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+/* Placement for the line's figure. `Price` supplies the family and the weight; this only pins
+ * the column to the inline-end edge and keeps the numerals tabular if the caller renders plain
+ * text here instead. */
+.lineTotal {
+  justify-self: end;
+  font-family: var(--ls-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-variant-numeric: tabular-nums;
+  text-align: end;
+}
+
+/* Below roughly 22rem of container width - the point at which a two-line product name and a
+ * figure stop fitting side by side inside the card's padding - the grid collapses to one track,
+ * which puts the figure under the description. The threshold is written as a `calc()` over one
+ * rem, which is 22 times the 16px step `--ls-space-4` names: a container query condition is
+ * resolved before custom properties are, so a `var()` here would invalidate the whole block
+ * rather than read the token.
+ *
+ * Nothing here re-aligns the figure. `.lineTotal` keeps `justify-self: end`, so the money stays
+ * on the inline-end edge once stacked and the column it forms with the totals below survives the
+ * collapse - which is the one thing that makes a receipt readable at any width. */
+@container (max-width: calc(22 * 1rem)) {
+  .line {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* The derived totals. Same two-column rhythm as the cart's own totals block, so the two read as
+ * one product without either file reaching into the other. */
+.totals {
+  display: grid;
+  gap: var(--ls-space-2, 8px);
+  font-size: var(--ls-text-sm, 13px);
+}
+
+.totalsRow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: var(--ls-space-3, 12px);
+}
+
+.totalsLabel {
+  color: var(--ls-text-muted, #475569);
+  overflow-wrap: anywhere;
+}
+
+.totalsValue {
+  justify-self: end;
+  font-variant-numeric: tabular-nums;
+  text-align: end;
+}
+
+/* The final row, carried alongside `.totalsRow`. Declared after it so the emphasis wins for the
+ * properties both set, and separated by a rule above rather than by extra space alone. */
+.grandTotal {
+  border-block-start: 1px solid var(--ls-border, #cbd5e1);
+  padding-block-start: var(--ls-space-2, 8px);
+  color: var(--ls-text, #0f172a);
+  font-size: var(--ls-text-lg, 18px);
+  font-weight: 600;
+}
+
+/* The label of that row needs the colour named on the row itself, because `.totalsLabel` sets
+ * `color` on the label element directly and inheritance never reaches past a declaration: a
+ * colour on the row alone leaves the block's largest text as its palest, which reads as
+ * unfinished rather than as emphasis. */
+.grandTotal .totalsLabel {
+  color: var(--ls-text, #0f172a);
+}
+
+/* Where the order is going and when it is expected. The block is muted, which makes its labels
+ * muted whatever element the component reaches for, and `.addressBlock` lifts the address itself
+ * back to full contrast. */
+.shipping {
+  display: grid;
+  gap: var(--ls-space-1, 4px);
+  color: var(--ls-text-muted, #475569);
+  font-size: var(--ls-text-sm, 13px);
+}
+
+/* A postal address arrives as one string with newlines in it, so it is rendered as text and the
+ * newlines are honoured here - no chain of `<br>` elements, and nothing for a screen reader to
+ * read out as empty lines. */
+.addressBlock {
+  margin: 0;
+  color: var(--ls-text, #0f172a);
+  font-size: var(--ls-text-sm, 13px);
+  font-style: normal;
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+}
+
+/* The trailing row. Spacing only; the anchor's own treatment is below. */
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--ls-space-2, 8px);
+}
+
+/* The "View all orders" anchor: an underlined link, never a button inside a link. The text stays
+ * on the primary ink colour and the brand accent carries the underline, because the accent is a
+ * fill colour and does not clear text contrast on this surface at this size.
+ *
+ * BLITZY [A11Y]: the amber underline measures about 2.15:1 against --ls-surface, below the 3:1
+ * recommendation for a non-text indicator. Implemented as the shared token contract specifies -
+ * `globals.css` carries the same note against --ls-accent - rather than silently darkened, and it
+ * is never the only thing marking the link: the text is underlined, sits at 17.9:1 on this
+ * surface and takes a --ls-focus ring when focused. Flagged for design review. */
+.actionLink {
+  border-radius: var(--ls-radius-sm, 4px);
+  color: var(--ls-text, #0f172a);
+  font-size: var(--ls-text-sm, 13px);
+  font-weight: 600;
+  text-decoration-line: underline;
+  text-decoration-color: var(--ls-accent, #f59e0b);
+  text-decoration-thickness: 2px;
+  text-underline-offset: 3px;
+  transition: text-decoration-color 180ms ease-out;
+}
+
+/* Hover is gated so a touch device does not keep the hovered appearance after a tap. */
+@media (hover: hover) {
+  .actionLink:hover {
+    text-decoration-color: var(--ls-text, #0f172a);
+  }
+}
+
+.actionLink:focus-visible {
+  outline: 2px solid var(--ls-focus, #0f766e);
+  outline-offset: 2px;
+}
+
+/* The module pairs the one transition it introduces with its own reduced-motion rule, at its own
+ * specificity, rather than leaving it to the baseline collapse in `globals.css`: the hover change
+ * here is a colour change and is perfectly readable as an instant one. */
+@media (prefers-reduced-motion: reduce) {
+  .actionLink {
+    transition: none;
+  }
+}

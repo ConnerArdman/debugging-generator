@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 180" width="240" height="180" role="img">
+  <title>No results found</title>
+  <!-- One drawing for two callers: a catalog search or filter that matched nothing, and the
+       dashboard low stock list when nothing is running low. The second reading is good news, so the
+       scene stays neutral and inquisitive rather than alarmed: bare cubbies looked over by a
+       magnifier, with no sign, no face, no item on the shelf and no alarming colour. The caption,
+       the heading and the alternative text belong to the page that shows this file. -->
+  <!-- Geometry, in the 240 x 180 box the three empty state illustrations share: a 100 x 58 bay at
+       52 80, quartered by two boards and standing on two uprights above a ground line, and a lens
+       of radius 25 centred at 160 64 that sits in front of the bay's top right corner so the two
+       read as one scene. Intrinsic width and height sit beside the view box, so a consumer that
+       references the string path - <img src="/illustrations/no-results.svg" width="240"
+       height="180" alt="..."> - gets the aspect ratio without a static image import. -->
+  <defs>
+    <!-- The only gradient in the file: paper falling to mist across the lens, light enough that the
+         glass still reads as empty. Nothing is drawn inside it, because nothing was found. -->
+    <linearGradient id="lens-face" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#F8FAFC" />
+      <stop offset="1" stop-color="#CBD5E1" />
+    </linearGradient>
+  </defs>
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <!-- Ground line, overhanging the bay by 8 on each side, then the two uprights it stands on. -->
+    <path d="M44 147 H160" stroke="#CBD5E1" stroke-width="3.5" />
+    <path d="M64 138 V147 M140 138 V147" stroke="#CBD5E1" stroke-width="3.5" />
+    <!-- The bay: paper behind a slate outline, deliberately bare. -->
+    <rect x="52" y="80" width="100" height="58" rx="6" fill="#F8FAFC" stroke="#475569" stroke-width="3.5" />
+    <!-- One shelf across the middle and one upright through the centre, so the bay reads as four
+         empty cubbies rather than a closed box. Both boards stop a cap radius short of the frame's
+         inner edge (a half stroke in from 52, 152, 80 and 138), so their round ends seat against
+         the frame instead of painting over it and the slate outline stays unbroken. -->
+    <path d="M55.5 109 H148.5 M102 83.5 V134.5" stroke="#CBD5E1" stroke-width="3.5" />
+    <!-- The magnifier, and the single accent in the file. The handle is drawn before the ring so
+         the lens fill covers the end that runs under it, leaving one clean amber stroke. -->
+    <path d="M176.3 80.3 L199 103" stroke="#F59E0B" stroke-width="4" />
+    <circle cx="160" cy="64" r="25" fill="url(#lens-face)" stroke="#475569" stroke-width="3.5" />
+  </g>
+</svg>

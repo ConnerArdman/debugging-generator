@@ -1,0 +1,230 @@
+/*
+ * Button - the shared interactive control of this storefront, and the busiest one: a form's
+ * primary action, the small steppers beside a quantity, a destructive confirmation and the
+ * dismiss control of a transient notice are all this one component.
+ *
+ * Consumed by `Button.tsx` alone, which renders a native `<button>` - or, for a navigation
+ * action, an `<a>` - carrying `className={styles.root}` and three data attributes:
+ *
+ *   data-variant   primary | secondary | ghost | danger
+ *   data-size      sm | md | lg        (md is the default and is what `.root` itself declares)
+ *   data-busy      "true" while the action the control started is still in flight
+ *
+ * Appearance is selected by those attributes and by nothing else: there is no class-name lookup
+ * map here, so a variant is one attribute value on the element and one rule in this file.
+ *
+ * Two classes are exported. `.root` is the control; `.label` is the optional span around its
+ * text, which lets a long label truncate instead of widening the control while an inline status
+ * indicator beside it stays whole.
+ *
+ * Geometry is deliberately state-independent. Padding, border width and font size are declared
+ * once per size and are never restated by a hover, focus, active, disabled or busy rule, so a
+ * control cannot resize while a reader is watching it - which is exactly what a control whose
+ * request takes a noticeable moment would otherwise do, shifting everything after it in the
+ * layout mid-press. State is carried by colour, the focus outline, the cursor and a single
+ * pixel of optical travel, all of which leave the box untouched.
+ *
+ * An anchor needs no separate rule: everything a user agent would add to a link that a control
+ * must not have - the underline, the link colour, inline display - is already reset in `.root`
+ * below, and the one state a link cannot express natively is covered by the
+ * `[aria-disabled='true']` rule, because there is no `:disabled` for an `<a>`.
+ *
+ * Every colour, space, radius and type size reads an `--ls-*` token from `app/globals.css` in
+ * `var(--token, <literal fallback>)` form, so this module renders sensibly on its own and
+ * renders the application's palette inside it. Hex fallbacks are lowercase because Prettier
+ * normalises CSS colours and `pnpm format:check` is a blocking gate.
+ */
+
+.root {
+  display: inline-flex;
+  /* The control may sit in a narrow grid track; it is allowed to become narrower than its text
+   * because `.label` is the child that gives way. */
+  min-width: 0;
+  align-items: center;
+  justify-content: center;
+  gap: var(--ls-space-2, 8px);
+  /* The default size. An element that carries no `data-size` renders as `md`. */
+  padding: var(--ls-space-2, 8px) var(--ls-space-4, 16px);
+  /* Declared on every variant, transparent by default: the border is part of the box on all
+   * four of them, so a variant that paints no outline still occupies the same width as one
+   * that does. */
+  border: 1px solid transparent;
+  border-radius: var(--ls-radius-md, 8px);
+  background-color: transparent;
+  color: inherit;
+  /* `font: inherit` is a shorthand and resets weight and size, so the two declarations that
+   * refine it follow it rather than precede it. */
+  font: inherit;
+  font-size: var(--ls-text-md, 15px);
+  font-weight: 600;
+  /* The line box is the text itself; height comes from padding alone, which is what keeps the
+   * three sizes proportional. */
+  line-height: 1;
+  text-decoration: none;
+  white-space: nowrap;
+  appearance: none;
+  cursor: pointer;
+  /* Only these four properties animate, and each of them is a state change the reader benefits
+   * from seeing settle. Nothing that affects the box is listed. */
+  transition-property: background-color, border-color, color, transform;
+  transition-duration: 150ms;
+  transition-timing-function: ease-out;
+}
+
+/* The text. `min-width: 0` is what actually permits the truncation: without it a flex item
+ * refuses to shrink below its content, and the control would widen instead of the label
+ * clipping. */
+.label {
+  min-width: 0;
+  flex: 0 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Everything that is not the label - a status indicator, an icon - keeps its intrinsic size, so
+ * it is never squeezed by a long label and never changes the control's height. */
+.root > *:not(.label) {
+  flex: none;
+}
+
+/* Sizes
+ * ---------------------------------------------------------------------------------------------
+ * One padding pair and one type size each; `md` restates the default explicitly so the whole
+ * scale can be read in one place.
+ *
+ * BLITZY [A11Y]: the two smaller steps fall below the 44x44px touch-target guideline. At the
+ * default 16px root the rendered heights are about 23px, 33px and 44px including the border, so
+ * only `lg` reaches it. Implemented exactly as the shared size contract specifies rather than
+ * silently enlarged: these are pointer- and keyboard-first surfaces of a desktop storefront,
+ * every control carries a visible text label, and the focus outline with its 2px offset extends
+ * the visible target. Flagged for design review. */
+
+.root[data-size='sm'] {
+  padding: var(--ls-space-1, 4px) var(--ls-space-2, 8px);
+  font-size: var(--ls-text-sm, 13px);
+}
+
+.root[data-size='md'] {
+  padding: var(--ls-space-2, 8px) var(--ls-space-4, 16px);
+  font-size: var(--ls-text-md, 15px);
+}
+
+.root[data-size='lg'] {
+  padding: var(--ls-space-3, 12px) var(--ls-space-5, 24px);
+  font-size: var(--ls-text-lg, 18px);
+}
+
+/* Variants
+ * ---------------------------------------------------------------------------------------------
+ * Each sets only colour: background, border and text. The brand accent is deliberately absent
+ * as a fill - it is a light amber, and white text on it does not carry, so the ink colour is
+ * what a primary action is painted with and the accent stays an emphasis colour elsewhere. */
+
+/* The single most important action on a view. */
+.root[data-variant='primary'] {
+  border-color: var(--ls-ink, #0f172a);
+  background-color: var(--ls-ink, #0f172a);
+  color: var(--ls-white, #ffffff);
+}
+
+/* An action of equal weight to its neighbours: a hairline box on the page surface. */
+.root[data-variant='secondary'] {
+  border-color: var(--ls-border, #cbd5e1);
+  background-color: var(--ls-surface, #ffffff);
+  color: var(--ls-text, #0f172a);
+}
+
+/* A quiet action - a dismiss control, a stepper - which takes no box until it is pointed at. */
+.root[data-variant='ghost'] {
+  border-color: transparent;
+  background-color: transparent;
+  color: var(--ls-text-muted, #475569);
+}
+
+/* A destructive action. White on this red measures about 6.5:1. */
+.root[data-variant='danger'] {
+  border-color: var(--ls-danger, #b42318);
+  background-color: var(--ls-danger, #b42318);
+  color: var(--ls-white, #ffffff);
+}
+
+/* Hover
+ * ---------------------------------------------------------------------------------------------
+ * Pointer-only: on a touch screen `:hover` persists after a tap and would leave a control
+ * looking permanently pointed at. Every rule excludes both disabled forms, so neither of them
+ * reacts to the pointer at all. Each shift is computed from the variant's own tokens with
+ * `color-mix()`, so the palette stays the single source of the colour. */
+
+@media (hover: hover) {
+  .root[data-variant='primary']:hover:not(:disabled):not([aria-disabled='true']) {
+    border-color: color-mix(in srgb, var(--ls-ink, #0f172a) 86%, var(--ls-white, #ffffff));
+    background-color: color-mix(in srgb, var(--ls-ink, #0f172a) 86%, var(--ls-white, #ffffff));
+  }
+
+  .root[data-variant='secondary']:hover:not(:disabled):not([aria-disabled='true']) {
+    background-color: var(--ls-surface-sunken, #f8fafc);
+  }
+
+  .root[data-variant='ghost']:hover:not(:disabled):not([aria-disabled='true']) {
+    background-color: var(--ls-surface-sunken, #f8fafc);
+    color: var(--ls-text, #0f172a);
+  }
+
+  .root[data-variant='danger']:hover:not(:disabled):not([aria-disabled='true']) {
+    border-color: color-mix(in srgb, var(--ls-danger, #b42318) 88%, var(--ls-ink, #0f172a));
+    background-color: color-mix(in srgb, var(--ls-danger, #b42318) 88%, var(--ls-ink, #0f172a));
+  }
+}
+
+/* States
+ * ------------------------------------------------------------------------------------------- */
+
+/* The keyboard indicator, restated at module specificity so it survives on every variant. The
+ * offset is what makes it read on the dark primary fill: the ring sits on the page surface
+ * rather than on the control. */
+.root:focus-visible {
+  outline: 2px solid var(--ls-focus, #0f766e);
+  outline-offset: 2px;
+}
+
+/* A single pixel of travel on press. It moves the control, not its box: no neighbour shifts. */
+.root:active:not(:disabled):not([aria-disabled='true']) {
+  transform: translateY(1px);
+}
+
+/* Unavailable: dimmed, with the cursor saying so. No hover rule above applies here. */
+.root:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+/* The same state for a link, which has no `:disabled`. Removing pointer events is what stops an
+ * anchor following its `href`; this is the only rule in the file that does so. */
+.root[aria-disabled='true'] {
+  opacity: 0.55;
+  cursor: not-allowed;
+  pointer-events: none;
+}
+
+/* Working. Declared after `:disabled` and at the same specificity so the progress cursor wins
+ * while the component holds the native `disabled` attribute for the duration. Pointer events
+ * stay enabled: whether a second press is possible is the component's decision, taken with that
+ * attribute, and not this file's. */
+.root[data-busy='true'] {
+  cursor: progress;
+}
+
+/* Reduced motion
+ * ---------------------------------------------------------------------------------------------
+ * The element baseline in `app/globals.css` collapses transition durations through a universal
+ * selector, which carries no specificity and so cannot reach the declarations above; that
+ * baseline asks each module to state its own treatment, which this is. The colour transition is
+ * dropped outright. The press offset stays: it is a static position, held only while the
+ * control is held down, not motion played at the reader. */
+
+@media (prefers-reduced-motion: reduce) {
+  .root {
+    transition: none;
+  }
+}

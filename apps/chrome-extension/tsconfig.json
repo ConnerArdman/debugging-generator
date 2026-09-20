@@ -1,0 +1,343 @@
+{
+  // ---------------------------------------------------------------------------
+  // @debuggen/chrome-extension - the compiler project for the monorepo typecheck
+  // gate.
+  //
+  // What this workspace is: the Manifest V3 extension that contributes the
+  // "Debug Generator" DevTools panel (AAP 0.7.1 Group 4). Four runtime surfaces
+  // live in src/**, and this one program covers all of them:
+  //   * src/devtools/**   - the devtools page: chrome.devtools.panels.create,
+  //                         inspectedWindow.eval("$0"), panels.themeName and
+  //                         panels.elements.onSelectionChanged;
+  //   * src/panel/**      - the React panel that hosts @debuggen/panel-renderer's
+  //                         PanelHost plus its DataProvider/PanelActions wiring;
+  //   * src/background/** - the module service worker: the authenticated
+  //                         WebSocket to the local service, the tab<->session
+  //                         registry, agent arming and the port routing;
+  //   * src/content/**    - the isolated-world bridge that relays the MAIN-world
+  //                         telemetry agent's batches over a runtime port.
+  // Plus the workspace's two build-time configs (manifest.config.ts,
+  // vite.config.ts) and the unit suites under test/**.
+  //
+  // Two jobs, and nothing else:
+  //   1. `tsc -b` type-checks every one of those surfaces - `pnpm --filter
+  //      @debuggen/chrome-extension typecheck` runs exactly that, and the root
+  //      `pnpm typecheck` (= `pnpm demo:generate && tsc -b`) is a blocking AAP
+  //      0.8.5 gate;
+  //   2. this project is the `composite` node the root solution file references
+  //      for this workspace, among the apps and after the eight packages. The
+  //      root tsconfig.json carries a non-empty `references` list to which each
+  //      workspace is appended as it lands; this project belongs there once its
+  //      first source file exists, because an input-less project answers `tsc -b`
+  //      with TS18003 and would fail the gate for the whole repository.
+  //
+  // It does NOT build the extension. The shipped bundle is produced by Vite +
+  // @crxjs/vite-plugin into dist/, which this project must never write into (see
+  // `outDir` below), and typescript-eslint's project service reads this same file
+  // for the type information behind the type-aware rules and
+  // eslint-plugin-react-hooks - which is why test/** and the two root-level
+  // configs are inside `include` rather than only src/**.
+  //
+  // Everything not stated below is inherited from tsconfig.base.json and must
+  // stay that way - in particular `strict`, `noUncheckedIndexedAccess`,
+  // `verbatimModuleSyntax`, `isolatedModules`, `moduleDetection: "force"`,
+  // `noImplicitOverride`, `noImplicitReturns`, `noFallthroughCasesInSwitch`,
+  // `noUnusedLocals`, `noUnusedParameters`, `forceConsistentCasingInFileNames`,
+  // `target` ES2023 and the declaration-emit settings. No strictness flag is
+  // relaxed here, no `any`-friendly flag is added, and no compiler version or
+  // compiler package is declared: TypeScript 6.0.3 is pinned once, in the root
+  // manifest (AAP 0.3.1). `noEmit` must never be added either: TypeScript 6.0.3
+  // rejects a referenced project that disables emit with TS6310 and the whole
+  // gate fails.
+  //
+  // This file is JSONC. tsc, ESLint, Vitest and Prettier all parse comments in
+  // tsconfig files; anything reading it programmatically must use a JSONC-aware
+  // reader (`ts.readConfigFile`), never bare `JSON.parse`.
+  // ---------------------------------------------------------------------------
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    // Already true in the base; restated because the root solution file
+    // references this project and a non-composite reference fails `tsc -b`
+    // outright (TS6306). Keeping it local means a future edit to the base cannot
+    // silently break the gate at this project. Vite and @crxjs/vite-plugin do not
+    // read this option - esbuild transpiles per file - so the value is free to
+    // serve the gate alone.
+    "composite": true,
+
+    // "." and not "src", because this program deliberately spans four input
+    // roots: src/**, test/**, manifest.config.ts and vite.config.ts (see
+    // `include`). `rootDir: "src"` would reject the three non-src inputs with
+    // TS6059 ("is not under 'rootDir'"), and leaving it unset would let the
+    // compiler infer a root from the longest common prefix - which changes
+    // whenever a file is added or removed, moving the whole declaration tree with
+    // it. Pinned to the workspace directory, the mirror under .tsbuild/ is
+    // stable: src/panel/App.tsx -> .tsbuild/src/panel/App.d.ts and
+    // manifest.config.ts -> .tsbuild/manifest.config.d.ts.
+    "rootDir": ".",
+
+    // Declaration-only emit, restated with the `${configDir}` anchoring the base
+    // uses (apps/demo-app restates it the same way). `${configDir}` resolves to
+    // the directory of THIS file, so every artefact of the gate lands in
+    // apps/chrome-extension/.tsbuild - ignored by .gitignore, by .prettierignore
+    // and by the `**/.tsbuild/**` entry in eslint.config.js, so the typecheck
+    // gate never shows up in `git status`. A repository-level path such as
+    // ../../.tsbuild/chrome-extension would put the output outside the
+    // per-workspace convention every sibling follows.
+    //
+    // What must never happen: tsc writing into apps/chrome-extension/dist. That
+    // directory belongs exclusively to Vite + @crxjs/vite-plugin, it is what
+    // `manifest.config.ts` is built into, what a developer loads unpacked, and
+    // what the root playwright.config.ts passes to
+    // `--disable-extensions-except`/`--load-extension`; a stray .d.ts or .js from
+    // the gate in there would be packed into the extension.
+    //
+    // `declaration`, `declarationMap` and `emitDeclarationOnly` are inherited
+    // true from the base and restated so the "declarations, never JavaScript"
+    // guarantee is local to this project: `composite` forbids `noEmit` (TS6310),
+    // so emitting nothing but .d.ts/.d.ts.map is the only shape that satisfies
+    // both the gate and the bundler's ownership of dist/.
+    "declaration": true,
+    "declarationMap": true,
+    "emitDeclarationOnly": true,
+    "outDir": "${configDir}/.tsbuild",
+    "tsBuildInfoFile": "${configDir}/.tsbuild/tsconfig.tsbuildinfo",
+
+    // Widened from the base's ES2023-only set, which exists so a Node-only
+    // package cannot reference `window` and still compile. Every surface in this
+    // workspace is a browser/extension context: the panel and the devtools page
+    // are documents, the content bridge runs in a page's isolated world, and even
+    // the service worker reaches `addEventListener`, `fetch`, `WebSocket`,
+    // `URL`/`URLSearchParams`, `structuredClone` and `postMessage` through
+    // lib.dom.d.ts. DOM.Iterable is what makes iteration over `NodeList`,
+    // `DOMTokenList`, `Headers` and `FormData` type-check.
+    //
+    // ES2023 is restated alongside the browser libs because `lib` REPLACES the
+    // inherited array rather than merging with it - omitting it would silently
+    // drop `Array.prototype.findLast`, `toSorted` and the rest.
+    //
+    // Deliberately NOT added: "WebWorker". The service worker is a worker scope,
+    // but lib.webworker.d.ts redeclares the globals lib.dom.d.ts already
+    // declares, and loading both produces dozens of duplicate-identifier errors
+    // (TS2300/TS2451). The MV3 background module needs no worker-only global: its
+    // API surface is `chrome.*` plus the DOM-typed event and networking globals
+    // above, and a genuinely worker-only member is reached through a locally
+    // declared interface in the module that needs it, never by widening `lib`
+    // here. "DOM.AsyncIterable" is likewise absent - nothing here consumes a
+    // `ReadableStream` as an async iterable.
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+
+    // The base sets no `types`, so one workspace's ambient globals cannot bleed
+    // into another. This project needs exactly two, and nothing else:
+    //
+    //   "chrome"  - @types/chrome 0.3.0, a devDependency of this workspace. It is
+    //               the ambient `chrome` namespace every surface depends on:
+    //               chrome.devtools.panels.create,
+    //               chrome.devtools.inspectedWindow.eval/.tabId,
+    //               chrome.devtools.panels.elements.onSelectionChanged,
+    //               chrome.devtools.panels.themeName,
+    //               chrome.runtime.connect/.onConnect/.onMessage,
+    //               chrome.storage.local and chrome.storage.session,
+    //               chrome.alarms, chrome.tabs.onUpdated/.reload.
+    //   "node"    - @types/node 24.13.6, a ROOT devDependency resolved by walking
+    //               up to the workspace-root node_modules/@types. Do NOT add it
+    //               to this workspace's manifest. It is required by three members
+    //               of this program and by nothing else: manifest.config.ts and
+    //               vite.config.ts use `node:path`/`node:url` (and `process.env`
+    //               for the build mode), and test/manifest.test.ts reads the built
+    //               dist/manifest.json from disk to assert the two declared
+    //               content scripts, their worlds, `run_at` and order.
+    //
+    // THE BOUNDARY THIS DOES NOT MOVE, and the reason it is written down: naming
+    // "node" makes `process`, `Buffer`, `__dirname` and the `node:*` builtins
+    // ambient across the whole program, including src/**, where they are
+    // FORBIDDEN. No file under src/** may import a `node:*` builtin or touch
+    // `process`, `Buffer` or `__dirname`: that code is bundled into a service
+    // worker, a devtools page, a panel document and a page-injected content
+    // script, none of which has a Node runtime. They are permitted only in
+    // manifest.config.ts, vite.config.ts and test/**. Three controls keep it
+    // true: the Vite/@crxjs build targets the browser platform and fails on a
+    // builtin in the bundle graph; the per-workspace `no-restricted-imports`
+    // rules in the root eslint.config.js; and review of this stated rule. For the
+    // same reason `@debuggen/shared/node` (SHA-256 hashing, safe-fs) must never
+    // be imported here - only `@debuggen/shared`'s browser-safe root entry.
+    //
+    // Not listed: "react" / "react-dom". They are not ambient global type
+    // packages - JSX types arrive through the automatic runtime's
+    // `react/jsx-runtime` module import and component code writes
+    // `import type { ReactNode } from "react"`; naming them would make React's
+    // globals ambient workspace-wide. Not listed: "vitest/globals" - the suites
+    // import `{ describe, it, expect }` from "vitest" explicitly, as every
+    // sibling workspace does. Not listed: "@crxjs/vite-plugin" or any plugin -
+    // those are module imports in vite.config.ts, not ambient types.
+    "types": ["chrome", "node"],
+
+    // Inherited from the base (React 19.3.0 automatic runtime) and restated so
+    // the guarantee is local: the panel is a React application whose components
+    // are .tsx and are inside `include`, so this project must compile JSX without
+    // an `import React` in every file. A base that later scoped `jsx` to the
+    // library surfaces would otherwise break this workspace. `jsxImportSource` is
+    // deliberately absent - the default "react" runtime is the only one in use.
+    "jsx": "react-jsx"
+
+    // NOT overridden: "module" / "moduleResolution". The base's "ESNext" +
+    // "bundler" is exactly the flavour AAP 0.3.4 assigns to extension code, and
+    // this workspace is bundled by Vite + @crxjs/vite-plugin: Node never loads
+    // these modules, so the stricter NodeNext flavour would buy nothing and cost
+    // the whole source tree an extension convention.
+    //
+    // CONSEQUENCE FOR EVERY FILE IN src/** AND test/**, and the single most
+    // likely avoidable break in this workspace: relative specifiers are
+    // EXTENSIONLESS -
+    //     import { connect } from "./ws-bridge";
+    //     import { PanelView } from "../components/PanelView";
+    //     export * from "./messages";
+    // - which is the exact OPPOSITE of the ".js"-suffixed convention that
+    // packages/shared, packages/telemetry, packages/panel-schema and
+    // packages/protocol must use because they override this setting to NodeNext.
+    // This workspace follows packages/panel-renderer instead. Copying an import
+    // line from one of the NodeNext packages into this one is a compile error
+    // (TS2307: "./ws-bridge.js" does not exist) and the mistake reads as correct;
+    // conversely, an extensionless relative import that reports TS2835 ("did you
+    // mean './x.js'?") means this setting was overridden by accident - fix the
+    // config, never the imports. Package specifiers carry no extension in either
+    // flavour ("react", "@debuggen/protocol", "@crxjs/vite-plugin") and resolve
+    // through the pnpm workspace symlink and each package's `exports` map.
+    //
+    // NOT overridden: "resolveJsonModule" (the base enables it) - but no file in
+    // this program may import JSON. test/manifest.test.ts asserts against the
+    // BUILT dist/manifest.json, a Vite artefact that lies outside `include` and
+    // outside `rootDir`'s declaration mirror; importing it would silently add a
+    // program input the lint and Vitest boundaries do not cover and would type
+    // the assertion by the artefact instead of by the expectation. The suite
+    // therefore reads it at runtime -
+    //   JSON.parse(readFileSync(new URL("../dist/manifest.json", import.meta.url), "utf8"))
+    // - exactly as packages/telemetry reads its fixtures. manifest.config.ts
+    // likewise declares its `version` as a literal cross-checked by a test rather
+    // than importing package.json.
+    // NOT overridden: "allowJs" (the base sets false) and no ambient `*.js`
+    // declaration exists. public/agent.iife.js is the pre-built MAIN-world
+    // telemetry agent copied verbatim from packages/telemetry/dist by the
+    // `prebuild` step (scripts/copy-agent.mjs); it is git-ignored, ESLint-ignored
+    // and Prettier-ignored, and it must never become a program input - the
+    // manifest declares that file itself as the MAIN-world content script.
+    // NOT set: "paths" / "baseUrl". The five workspace dependencies resolve
+    // through their `exports` maps plus the project references below, exactly as
+    // the runtime and the bundlers resolve them (AAP 0.2.2). An alias to a
+    // sibling's src/** would hide a broken `exports` map, let this app import
+    // internals past a declared entry point, and let the acyclic package layering
+    // be violated without anything failing.
+    // NOT set: "noEmit" (TS6310 on a referenced project), and no strictness flag
+    // is relaxed on top of the base - in particular `skipLibCheck` is the base's
+    // decision about third-party .d.ts drift and is neither widened nor restated
+    // here.
+  },
+
+  // The whole workspace program, in four parts:
+  //   * "src/**/*.ts" / "src/**/*.tsx" - the four runtime surfaces named in the
+  //     header. Most of src/background/**, src/content/**, src/devtools/** and
+  //     src/panel/state/** is .ts; the panel's App and components are .tsx.
+  //   * "test/**/*.ts" / "test/**/*.tsx" - the unit suites (manifest, bridge,
+  //     tab-registry, ws-bridge, agent-control per AAP 0.7.1 Group 4). They are
+  //     deliberately program members so the gate type-checks them: `strict`,
+  //     `noUncheckedIndexedAccess`, `noUnusedLocals` and `noUnusedParameters`
+  //     apply to tests exactly as to sources, and an untypechecked test is how
+  //     contract drift escapes. The .tsx glob is admitted because the Vitest
+  //     project for this workspace collects
+  //     `apps/chrome-extension/test/**/*.test.{ts,tsx}`, so a component-level
+  //     suite authored as .tsx cannot fall outside the program.
+  //   * "manifest.config.ts" - `defineManifest` for the MV3 manifest. It is
+  //     type-checked here because the manifest is the product's permission and
+  //     content-script contract (two static `document_start` entries, one
+  //     `world: "MAIN"`), not incidental build glue.
+  //   * "vite.config.ts" - the @crxjs build. Included for the same reason and so
+  //     typescript-eslint has a program covering every linted file in this
+  //     workspace.
+  // Nothing else: public/** holds the copied agent IIFE and the four PNG icons,
+  // and the .html entry documents (src/devtools/devtools.html,
+  // src/panel/panel.html) are Vite inputs, not program inputs.
+  //
+  // Until the first source file lands, `tsc -b` on this project answers TS18003
+  // ("No inputs were found in config file") - expected on an empty subtree, not a
+  // configuration fault.
+  "include": [
+    "src/**/*.ts",
+    "src/**/*.tsx",
+    "test/**/*.ts",
+    "test/**/*.tsx",
+    "manifest.config.ts",
+    "vite.config.ts"
+  ],
+
+  // Replaces the base's inherited list rather than merging with it, so the output
+  // and vendored directories are named again here; resolved relative to this
+  // directory, meaning apps/chrome-extension/{dist,.tsbuild,node_modules,public}.
+  // `include` already restricts the input set, which leaves dist/ (the Vite +
+  // @crxjs bundle a developer loads unpacked) and .tsbuild/ (this project's
+  // declaration output) outside the program; these entries document that intent
+  // and keep it true if `include` is ever widened. public/ is listed for the same
+  // reason - with `allowJs: false` its agent.iife.js cannot be compiled anyway,
+  // and naming it here makes the exclusion explicit rather than incidental.
+  // Note what `exclude` does NOT do: it filters the `include` globs only, so a
+  // file reached by an import still joins the program.
+  "exclude": ["dist", ".tsbuild", "node_modules", "public"],
+
+  // The ONLY project references, foundational-first to match the root solution's
+  // ordering, and exactly the `@debuggen/*` edges AAP 0.2.2 gives this app:
+  //   ../../packages/shared        - SourceLocation (the click-to-source contract
+  //                                  carried on every runtime item), ids, result
+  //                                  and error types; the browser-safe root entry
+  //                                  only, never the `./node` entry.
+  //   ../../packages/telemetry     - reached TRANSITIVELY, and referenced anyway
+  //                                  on purpose: TelemetryEvent flows through
+  //                                  @debuggen/protocol's `telemetry.event` and
+  //                                  `telemetry.tail` payloads and through the
+  //                                  aggregate result shapes behind
+  //                                  @debuggen/panel-renderer's DataProvider /
+  //                                  DataResult types, so its declarations must
+  //                                  be built for this project to type-check; and
+  //                                  its dist/browser-agent.iife.js is what the
+  //                                  `prebuild` step copies into public/. Do not
+  //                                  remove it.
+  //   ../../packages/panel-schema  - PanelSpec, DataQuery and the node catalog the
+  //                                  panel renders and validates against.
+  //   ../../packages/panel-renderer - PanelHost, the tokens and the primitives the
+  //                                  panel composes; also the source of the
+  //                                  DataProvider / PanelActions interfaces
+  //                                  src/panel/{data-provider,actions}.ts
+  //                                  implement.
+  //   ../../packages/protocol      - the message envelope, every WS/HTTP schema,
+  //                                  SessionRecord and the reconnecting client the
+  //                                  service worker drives. Both extensions import
+  //                                  this and never service internals (AAP 0.4.2).
+  //
+  // What the references do, precisely: they order the build, so `tsc -b` on this
+  // project (or on the root solution) builds those five projects - and, through
+  // protocol's own references, packages/instrumentation - before this one, and
+  // reports errors in dependency order. They are NOT what resolves the
+  // specifiers: each package's `exports` map points at its tsup output
+  // (dist/index.d.ts), which lies outside the `${configDir}/.tsbuild` declaration
+  // directory `tsc -b` writes, so no output-to-source redirect applies. That is
+  // deliberate - this app is type-checked against the very declarations it
+  // imports at runtime - and it is why `pnpm verify` runs `pnpm build` before
+  // `pnpm typecheck`: on a tree where a dependency's dist/ is missing, the import
+  // fails with TS2307 rather than silently resolving to source.
+  //
+  // FORBIDDEN EDGES - never add a reference to, or an import from, any of these:
+  // packages/code-analysis and packages/model-provider (service-side only, and
+  // model-provider would put an API-key-bearing client inside a browser bundle),
+  // packages/instrumentation (the service owns every write into a developer's
+  // project; it arrives here only as the ModificationRecord/InstrumentationPlan
+  // types embedded in protocol messages), apps/local-service and
+  // apps/vscode-extension (sibling processes reached over the wire, never by
+  // import), and apps/demo-app - which is an instrumentation target only, so a
+  // reference or import would additionally fail `pnpm check:no-hardcoding`
+  // (AAP 0.5.4).
+  "references": [
+    { "path": "../../packages/shared" },
+    { "path": "../../packages/telemetry" },
+    { "path": "../../packages/panel-schema" },
+    { "path": "../../packages/panel-renderer" },
+    { "path": "../../packages/protocol" }
+  ]
+}

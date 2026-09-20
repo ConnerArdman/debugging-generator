@@ -1,0 +1,135 @@
+/*
+ * BlankSlate - the storefront's "there is nothing here" block (CSS Module).
+ *
+ * One block, four screens: a cart with no lines in it, an order history with no orders yet, a
+ * catalog search or filter combination that matched no products, and the inventory dashboard's
+ * low-stock list when no product is running low. `BlankSlate.tsx` renders the same three elements
+ * every time - one of the three 240x180 illustrations under /illustrations/, a heading and a
+ * sentence - plus an optional caller-supplied control underneath them.
+ *
+ * WHY THERE IS NO WARNING TONE, AND WHY THAT IS THE POINT
+ * /illustrations/no-results.svg appears on two screens whose emptiness means opposite things: in
+ * the catalog it means a search came back with nothing, and on the dashboard it means no product
+ * is running low, which is the healthiest reading that list can have. A stylesheet that supplied
+ * an alarming colour of its own would make one of those two screens lie, so this file offers
+ * exactly two framings - `neutral` and `positive` - contributes no icon and no wording of its own
+ * (there is not a single generated-string declaration below), and never touches the warning or
+ * danger status tokens. Which framing a screen uses, and what it says, stays with the caller.
+ *
+ * Tokens: every colour, spacing step, radius and type size below is read as
+ * `var(--ls-NAME, <literal fallback>)` from app/globals.css, the single place those properties are
+ * declared, so the module also renders sensibly on its own. The fallbacks mirror the declarations
+ * there and are lowercase because Prettier normalises CSS colours and `pnpm format:check` is a
+ * blocking gate - do not "restore" an uppercase spelling. Bare lengths appear only where the token
+ * set models nothing: the artwork's own 240px width and 4/3 ratio, the hairline border width,
+ * percentages, the `ch` measure, the unitless line-heights and the heading's font weight.
+ *
+ * Variants are data attributes on the root element (`data-tone`, `data-framed`), never extra class
+ * names, so the component needs no class lookup map and an absent or unrecognised attribute value
+ * falls through to the default appearance rather than to no appearance at all.
+ *
+ * Deliberately absent: motion of any kind, a stacking tier, fixed positioning, an escape out of
+ * the module's local scope and any pulled-in stylesheet. This is ordinary in-flow markup that a
+ * page positions with the `.ls-notice` utility from app/globals.css, or drops inside a Card.
+ *
+ * No declaration in this file generates text - the block says only what the caller passes it - and
+ * the sole `content` substring below is the flex `justify-content` centring the column.
+ */
+
+/* The block itself: a centred column of artwork, heading, sentence and optional control.
+ *
+ * `--blank-measure` is a structural, file-local property rather than a shared token - it is a
+ * reading measure in `ch`, tied to the copy's own font size, and the token set models page maxima
+ * in pixels only. Capping the column here and centring it with `margin-inline: auto` is what keeps
+ * the sentence readable when the block sits in a full-width catalog area, while `min-width: 0`
+ * lets the very same block shrink inside a narrow dashboard column instead of pushing its parent
+ * into a horizontal scroll. */
+.root {
+  --blank-measure: 42ch;
+
+  display: flex;
+  min-width: 0;
+  max-width: var(--blank-measure);
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  margin-inline: auto;
+  padding: var(--ls-space-6, 32px) var(--ls-space-4, 16px);
+  gap: var(--ls-space-3, 12px);
+  color: var(--ls-text, #0f172a);
+  text-align: center;
+}
+
+/* The illustration slot. The three assets are 240x180 with a matching `viewBox`, and the `<img>`
+ * carries those two numbers as width and height attributes, so the box is reserved before the file
+ * arrives.
+ *
+ * The height is expressed as `auto` plus the assets' own 4/3 ratio rather than as a fixed 180px:
+ * the pair renders the box at exactly 240x180 wherever there is room for it, and scales it down
+ * proportionally - `max-width: 100%` doing the capping - inside any container narrower than the
+ * artwork, which is what a 320px viewport and a narrow dashboard column both are. A fixed height
+ * would letterbox the drawing there instead.
+ *
+ * No background, border or shadow: the artwork carries itself, and framing it here would fight the
+ * quiet `data-framed` treatment at the end of this file. Selection is off so that dragging across
+ * the block picks up the copy rather than highlighting a decorative image. */
+.art {
+  display: block;
+  width: 240px;
+  max-width: 100%;
+  height: auto;
+  aspect-ratio: 4 / 3;
+  user-select: none;
+}
+
+/* The one-line answer to "what is missing here". The component picks the element - a region with
+ * no heading of its own gets a real heading level, a block inside a section that already has one
+ * gets a paragraph - so the margin reset and the type role are stated here rather than left to
+ * whichever element turns up. */
+.heading {
+  margin: 0;
+  color: var(--ls-text, #0f172a);
+  font-size: var(--ls-text-lg, 18px);
+  font-weight: 600;
+  line-height: 1.3;
+}
+
+/* The sentence under the heading: what to do next, or why the list is empty. Muted, one step
+ * smaller than the heading, and looser in leading because it wraps within the measure above. */
+.body {
+  margin: 0;
+  color: var(--ls-text-muted, #475569);
+  font-size: var(--ls-text-sm, 13px);
+  line-height: 1.5;
+}
+
+/* The optional control below the copy - a button that clears the active filters, a link back to
+ * the catalog. The wrapper contributes separation and nothing else: the control's own module owns
+ * its size, colour and focus ring, and the column's `text-align: center` is what centres it. */
+.action {
+  margin-block-start: var(--ls-space-2, 8px);
+}
+
+/* Tone, set with `data-tone` on the root element. There are two, and only two.
+ *
+ * `neutral` is the default and deliberately carries no rule of its own: it is the appearance every
+ * declaration above already produces, which is also what an absent or unrecognised `data-tone`
+ * value gets.
+ *
+ * `positive` says "this list is empty and that is the good outcome" - the dashboard's low-stock
+ * list with nothing in it. It tints the heading with the success token and stops there: artwork,
+ * copy, spacing and box are identical in both tones, because two screens that share an
+ * illustration must not be told apart by a colour the component chose for them. */
+.root[data-tone='positive'] .heading {
+  color: var(--ls-success, #0f766e);
+}
+
+/* Optional framing, for a block that stands alone in a page region rather than inside a card that
+ * already draws a box. A recessed surface, the shared hairline and the medium radius - no shadow,
+ * no accent edge, no tone-dependent border - so a framed block still reads as a quiet placeholder.
+ * The plain form stays borderless, which is what stops a box from being drawn twice. */
+.root[data-framed='true'] {
+  border: 1px solid var(--ls-border, #cbd5e1);
+  border-radius: var(--ls-radius-md, 8px);
+  background: var(--ls-surface-sunken, #f8fafc);
+}

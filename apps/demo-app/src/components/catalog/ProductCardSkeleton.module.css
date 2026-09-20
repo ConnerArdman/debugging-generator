@@ -1,0 +1,108 @@
+/*
+ * Lumen Supply - catalog placeholder geometry.
+ *
+ * The CSS Module behind `ProductCardSkeleton`. Its single job is to reserve the box the loaded
+ * catalog occupies: the same track sizing and gutters as the product grid, and the same stacking
+ * rhythm inside one card, so the placeholder state and the loaded state take up the same space.
+ *
+ * Division of labour, which is why the file is short:
+ *
+ *   - Geometry belongs here: the grid's tracks, the card's rows, the media box's ratio and the
+ *     action row's height.
+ *   - Appearance belongs to `@/components/ui/Skeleton`'s own module: the placeholder fill, its
+ *     motion and that motion's reduced-motion treatment. Nothing below animates, paints a
+ *     surface, draws a border or sets a colour.
+ *
+ * Token discipline, exactly as `app/globals.css` documents it for every module under
+ * `src/components/**`: each value is read as `var(--ls-NAME, <literal fallback>)`, so the module
+ * lays out sensibly on its own and adopts the storefront's scale inside the application. Three
+ * geometry values have no shared token - the column minimum, the media ratio and the action row's
+ * height - so each is a file-local custom property whose own value is a `var()` with the literal
+ * as its fallback. Every literal therefore sits inside a `var()`, and `globals.css` gains an
+ * optional `--ls-catalog-*` override hook it does not have to declare.
+ */
+
+/* The loading state's outer wrapper: the placeholder grid, plus any heading or toolbar
+ * placeholder the page stacks above it, on the catalog's own vertical rhythm. */
+.root {
+  display: grid;
+  min-inline-size: 0;
+  gap: var(--ls-space-4, 16px);
+}
+
+/* The placeholder grid. `auto-fill` over a `minmax` track is what mirrors the loaded grid without
+ * either side naming a column count, and `min()` in the track floor is what makes a viewport
+ * narrower than one column collapse to a single full-width column rather than overflow - so this
+ * needs no breakpoint of its own, which is just as well, because a media query cannot read a
+ * custom property. The margin, padding and marker reset applies when the component renders the
+ * grid as a list; on a plain element it changes nothing. */
+.grid {
+  --catalog-card-min: var(--ls-catalog-card-min, 14rem);
+
+  display: grid;
+  margin: 0;
+  padding: 0;
+  grid-template-columns: repeat(auto-fill, minmax(min(var(--catalog-card-min), 100%), 1fr));
+  gap: var(--ls-space-4, 16px);
+  list-style: none;
+}
+
+/* One placeholder card: media, body, meta and actions in the loaded card's order, each row at its
+ * own height rather than stretched to fill the track. */
+.card {
+  display: grid;
+  min-inline-size: 0;
+  align-content: start;
+  gap: var(--ls-space-2, 8px);
+}
+
+/* The image placeholder. Catalog product art is 4:3, so the reserved box carries that ratio
+ * instead of a height, and rounds its own corners independently of the card. */
+.media {
+  --catalog-media-ratio: var(--ls-catalog-media-ratio, 4 / 3);
+
+  display: block;
+  inline-size: 100%;
+  overflow: hidden;
+  border-radius: var(--ls-radius-md, 8px);
+  aspect-ratio: var(--catalog-media-ratio);
+}
+
+/* A placeholder nested inside the media box fills it, so the ratio holds whichever element the
+ * component puts the class on. */
+.media > * {
+  inline-size: 100%;
+  block-size: 100%;
+}
+
+/* The title and supporting lines. */
+.body {
+  display: grid;
+  min-inline-size: 0;
+  gap: var(--ls-space-2, 8px);
+}
+
+/* The tighter row beneath the body - price and availability placeholders side by side, wrapping
+ * onto a second line instead of widening the grid track when the column is narrow. */
+.meta {
+  display: flex;
+  min-inline-size: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--ls-space-1, 4px) var(--ls-space-2, 8px);
+}
+
+/* The card's action row, laid out as a row of control-height placeholders so the row measures the
+ * same as the loaded one. */
+.actions {
+  --catalog-action-block: var(--ls-catalog-action-block, 2.25rem);
+
+  display: flex;
+  min-inline-size: 0;
+  align-items: center;
+  gap: var(--ls-space-2, 8px);
+}
+
+.actions > * {
+  block-size: var(--catalog-action-block);
+}
