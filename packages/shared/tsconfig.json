@@ -1,0 +1,90 @@
+{
+  // ---------------------------------------------------------------------------
+  // @debuggen/shared - the compiler project for the monorepo typecheck gate.
+  //
+  // `pnpm typecheck` (= `pnpm demo:generate && tsc -b`) builds the root solution
+  // file, which lists this project first because packages/shared is the bottom of
+  // the acyclic package graph (AAP 0.2.2): it depends on no other workspace, so
+  // nothing here may declare project `references`.
+  //
+  // Everything that is not stated below is inherited from tsconfig.base.json and
+  // must stay that way - in particular `strict`, `noUncheckedIndexedAccess`,
+  // `verbatimModuleSyntax`, `isolatedModules`, the no-unused/no-implicit
+  // diagnostics, `target`/`lib` ES2023, and the declaration-emit settings
+  // (`declaration`, `declarationMap`, `sourceMap`, `emitDeclarationOnly`,
+  // `incremental`). `noEmit` must never be added: TypeScript 6.0.3 rejects a
+  // referenced project that disables emit with TS6310 and the whole gate fails.
+  //
+  // This file is JSONC. tsc, ESLint, Vitest, tsup and Prettier all parse comments
+  // in tsconfig files; anything reading it programmatically must use a JSONC-aware
+  // reader (`ts.readConfigFile`), never bare `JSON.parse`.
+  // ---------------------------------------------------------------------------
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    // Already true in the base; restated because the root solution file
+    // references this project and a non-composite reference fails `tsc -b`
+    // outright (TS6306). Keeping it local means a future edit to the base cannot
+    // silently break the gate at this project.
+    "composite": true,
+
+    // The base defaults to "ESNext" + "bundler" for the bundled/web workspaces and
+    // instructs Node-targeted projects - naming the `./node` entry of this package
+    // - to override with NodeNext. package.json declares `"type": "module"`, and
+    // the `./node` export (dist/node/index.js) is loaded directly by Node in the
+    // local service and the telemetry preload, so this project is type-checked
+    // under real Node ESM resolution instead of a bundler approximation.
+    //
+    // Consequence for every source file in src/**: relative specifiers must carry
+    // an explicit ".js" extension (`export * from "./ids.js"`), and directory
+    // specifiers must name the file (`"./node/index.js"`). Extensionless relative
+    // imports are a compile error here by design - they would break real Node
+    // consumers of dist/node/index.js. tsup/esbuild resolve a "./x.js" specifier
+    // from a TypeScript importer back to "./x.ts", so the bundles are unaffected.
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+
+    // Per-workspace (the base deliberately leaves it unset), so the declaration
+    // tree under .tsbuild/ mirrors src/ exactly: src/index.ts -> .tsbuild/index.d.ts
+    // and src/node/index.ts -> .tsbuild/node/index.d.ts, matching the paths the
+    // package.json `exports` map advertises under dist/.
+    "rootDir": "src",
+
+    // The base sets no `types` so that one workspace's ambient globals cannot bleed
+    // into another. This package needs exactly one: @types/node 24.13.6 (a root
+    // devDependency, resolved through the workspace-root node_modules/@types).
+    // It types the `node:crypto` / `node:fs` / `node:path` builtins used by
+    // src/node/** and also declares the cross-platform globals the root entry
+    // relies on (`crypto.getRandomValues`, `performance`).
+    //
+    // Deliberately no "lib": ["DOM"] override: the root entry is imported by
+    // browser bundles *and* by Node, so it must stay on globals that exist in both.
+    // Adding DOM would legitimise `window`/`document` in a package that also runs
+    // in the service and the preload.
+    "types": ["node"]
+
+    // NOT overridden: "outDir" / "declarationDir" / "tsBuildInfoFile". The base
+    // already anchors them per project with `${configDir}`, which resolves to the
+    // directory of THIS file, so declarations and the incremental stamp land in
+    // packages/shared/.tsbuild (ignored by .gitignore and .prettierignore). tsc must never
+    // write into packages/shared/dist: that directory belongs to tsup and holds the
+    // artefacts the `exports` map points at.
+    // NOT overridden: "skipLibCheck" (the base already enables it) and no strictness
+    // flag is relaxed or added on top of the base.
+  },
+
+  // src/** only, and deliberately including the colocated `*.test.ts` files so the
+  // typecheck gate covers the tests too. They import `{ describe, it, expect }` from
+  // "vitest" explicitly rather than relying on globals, and vitest resolves from the
+  // workspace-root node_modules, so no "vitest/globals" entry is needed in `types`.
+  "include": ["src/**/*.ts"],
+
+  // Replaces the base's inherited list; resolved relative to this directory, so it
+  // means packages/shared/dist and packages/shared/node_modules. Belt and braces:
+  // `include` already restricts the input set to src/**, and the tsup output in dist/
+  // plus the declaration output in .tsbuild/ sit outside it.
+  "exclude": ["dist", "node_modules"]
+
+  // No "files" array and no "references": this project owns src/** wholesale and
+  // imports no other workspace.
+}

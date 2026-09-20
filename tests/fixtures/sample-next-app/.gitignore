@@ -1,0 +1,39 @@
+# Ignore list for the generic Next.js fixture application.
+#
+# This directory is a test fixture, not a pnpm workspace member. The browser and
+# end-to-end suites run it as the generalization target: the product indexes it,
+# instruments it, captures a session against it and then restores it. The gate
+# `node scripts/check-no-residual-instrumentation.mjs --path <this directory>`
+# asserts that `git status --porcelain` for this path is empty afterwards, so
+# every file a dev or build run leaves behind here has to be listed below. An
+# unignored generated file would fail that gate for a reason that has nothing to
+# do with the cleanup guarantee it exists to prove.
+#
+# The repository root already ignores three of the four patterns below, yet this
+# file is kept self-contained on purpose:
+#   - the root entry for the ambient declaration file is scoped to another
+#     workspace, so only the entry below keeps this directory clean; and
+#   - the integration suites copy this fixture into a temporary directory
+#     outside the checkout, where repository-root rules do not apply at all.
+#
+# Scope is deliberately narrow: no negations, nothing tracked is ignored
+# (package.json, tsconfig.json, next.config.ts and the app and src trees all
+# stay in version control), and there is no environment-file entry because no
+# such file may exist in this directory.
+
+# build and dev-server output
+.next/
+
+# ambient type declarations, rewritten on every dev and build run. The root
+# ignore entry for this filename is scoped to another workspace, so this line
+# is the one that keeps the working tree clean here.
+next-env.d.ts
+
+# dependencies. Nothing should ever install into this directory: the fixture is
+# not a workspace member and runs on a `next` binary resolved from a workspace
+# that has one. Ignored as insurance against a stray local install.
+node_modules/
+
+# incremental TypeScript build state, possible because this folder's
+# tsconfig.json sets `incremental: true`
+*.tsbuildinfo

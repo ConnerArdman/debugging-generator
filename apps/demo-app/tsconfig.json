@@ -1,0 +1,205 @@
+{
+  // ---------------------------------------------------------------------------
+  // demo-app - "Lumen Supply" (AAP 0.7.1 Group 5).
+  //
+  // The Next.js 16.3.5 App Router application this repository instruments. It is
+  // an ordinary application workspace and depends on none of the product
+  // packages, so this project declares no project `references` at all: nothing
+  // here imports a workspace package or a tracing library, and instrumentation
+  // reaches it at runtime (browser agent, Node preload) or through a recorded,
+  // reversible patch - never through a compile-time dependency.
+  //
+  // Three sets of requirements meet in this file, and the comments below say
+  // which option serves which, because a few of them look redundant otherwise:
+  //
+  //   A. The root solution build. The root tsconfig.json references this
+  //      project and `pnpm typecheck` is `pnpm demo:generate && tsc -b`, so the
+  //      project must be `composite` and must emit its declarations outside
+  //      every tracked directory of the worktree.
+  //   B. tsconfig.base.json, which carries the repository's strictness,
+  //      language level and declaration-emit conventions. Only what Next.js
+  //      needs is overridden here.
+  //   C. Next.js itself. `next dev` and `next build` call
+  //      writeConfigurationDefaults(), which rewrites tsconfig.json in place -
+  //      except that it returns before writing anything when the raw file
+  //      contains `extends` or `references`
+  //      ("Bail automatic setup when the user has extended or referenced
+  //      another config", next/dist/lib/typescript/writeConfigurationDefaults.js
+  //      in next@16.3.5). The `extends` below is therefore what keeps this file
+  //      byte-stable across dev and build runs, which matters because a
+  //      rewritten tsconfig.json would leave `git status --porcelain --
+  //      apps/demo-app` dirty and fail the `residual-worktree` rule of
+  //      `pnpm check:no-residual-instrumentation`.
+  //
+  //      Every option Next.js manages is nevertheless restated verbatim, so the
+  //      rewrite would still be a no-op if that bail ever disappeared: Next
+  //      compares its required values against the *raw* file and does not
+  //      resolve `extends`, and it writes its suggested values whenever the key
+  //      is merely absent. Each such option is marked "(C)" below.
+  //
+  // JSONC, like the rest of the repository's tsconfig files: tsc, ESLint,
+  // Prettier, Next.js (comment-json) and Vitest all parse comments here, so any
+  // tool reading this file must use a JSONC-aware reader, never `JSON.parse`.
+  // ---------------------------------------------------------------------------
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    // --- Solution build and declaration emit (A) -----------------------------
+    // Inherited from the base and restated because this project is referenced
+    // by the root solution file: `tsc -b` refuses to build a referenced project
+    // that is not composite.
+    "composite": true,
+    // (C) Suggested by Next.js when absent; the value it would write is the one
+    // the base already sets.
+    "incremental": true,
+    // (C) `noEmit` is stated explicitly, and false, for two reasons. Next.js
+    // suggests `noEmit: true` whenever the key is missing, and a composite
+    // project with emit disabled contributes no declarations to the solution
+    // build (TypeScript 6.0.3 accepts the combination and silently writes only
+    // the .tsbuildinfo stamp, which would make this project's participation in
+    // `tsc -b` meaningless). Shipping output comes from `next build`; `tsc -b`
+    // exists here only as the typecheck gate, so it emits types and nothing
+    // else.
+    "noEmit": false,
+    "emitDeclarationOnly": true,
+    "declaration": true,
+    "declarationMap": true,
+    // The base's `${configDir}` convention, which resolves against *this*
+    // directory: everything the gate emits lands in apps/demo-app/.tsbuild,
+    // which .gitignore, .prettierignore and eslint.config.js all ignore. It
+    // must never be an output inside app/, src/ or prisma/, because emitted
+    // declarations there would show up in `git status` for the demo app.
+    "outDir": "${configDir}/.tsbuild",
+    "tsBuildInfoFile": "${configDir}/.tsbuild/tsconfig.tsbuildinfo",
+
+    // --- Language level and module system (B, restated for C) ----------------
+    // (C) Next.js suggests ES2017 when `target` is absent; ES2023 is the
+    // repository-wide level and Next's SWC pipeline downlevels for browsers on
+    // its own.
+    "target": "ES2023",
+    // (C) The base ships ["ES2023"] alone so that a Node-only package cannot
+    // reach for `window`. This workspace renders in a browser - client
+    // components, providers and hooks use the DOM, `fetch` and
+    // `performance` - so the DOM libraries are added here. Next.js suggests
+    // ["dom", "dom.iterable", "esnext"]; ES2023 is that same ES level pinned to
+    // the repository's target.
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    // (C) Required by Next.js "for dynamic import() support"; already the
+    // base's value.
+    "module": "ESNext",
+    // (C) Required by Next.js "to match modern bundler resolution"; already the
+    // base's value.
+    "moduleResolution": "bundler",
+    // (C) Required by Next.js as a "requirement for SWC / babel".
+    "esModuleInterop": true,
+    // (C) Required by Next.js "to match webpack resolution".
+    "resolveJsonModule": true,
+    // (C) Next.js drops its `isolatedModules` requirement when
+    // `verbatimModuleSyntax` is true in the raw file, and requires
+    // `isolatedModules` otherwise. Both are stated, so either branch matches.
+    // Practically it means `import type` / `export type` are mandatory in this
+    // workspace, exactly as everywhere else in the repository.
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    // (C) Next 16.3.5 *requires* "react-jsx": getDesiredCompilerOptions() sets
+    // `jsx: { parsedValue: 'react-jsx', value: 'react-jsx', reason: 'next.js
+    // uses the React automatic runtime' }`, and would overwrite anything else -
+    // "preserve" was the required value of earlier majors only. It is also the
+    // base's value, so .tsx files here need no `import React`.
+    "jsx": "react-jsx",
+    // (C) Next.js suggests `allowJs: true` when the key is absent. The demo is
+    // TypeScript only, like the rest of the repository, and stating the base's
+    // value keeps that decision in this file rather than relying on a suggested
+    // default.
+    "allowJs": false,
+    // (C) Next.js suggests `strict: false` when the key is absent; the demo app
+    // is held to the same strictness as the product. `strictNullChecks` is
+    // implied by `strict` and restated because Next.js writes it separately for
+    // projects that are not strict.
+    "strict": true,
+    "strictNullChecks": true,
+    // (C) Suggested by Next.js when absent; already the base's value. Third
+    // party declarations - Next, React, Prisma, pg - are not this repository's
+    // to fix. Note that it does not cover the generated Prisma client, which
+    // the `prisma-client` generator emits as TypeScript *sources*: those are
+    // checked as first-party code, and they pass the base's strict set as
+    // generated (verified against Prisma 7.10.0 output), so no strictness flag
+    // is relaxed for them here.
+    "skipLibCheck": true,
+
+    // --- Editor integration --------------------------------------------------
+    // (C) Next.js adds this entry when it is missing. `tsc` ignores `plugins`;
+    // it enables the Next.js language-service plugin in the editor, which flags
+    // invalid Server/Client Component boundaries while the demo is authored.
+    "plugins": [{ "name": "next" }],
+
+    // --- Ambient types -------------------------------------------------------
+    // The base deliberately leaves `types` unset so each workspace declares its
+    // own ambient packages. This one needs Node (next.config.ts,
+    // prisma.config.ts, prisma/seed.ts, the pg pool and the generated Prisma
+    // client all use `node:` built-ins and `process.env`) plus the React
+    // typings. Listing them keeps unrelated globals hoisted elsewhere in the
+    // monorepo - Chrome, VS Code, Vitest - out of this program. Module imports
+    // that resolve through @types (for example `pg` via @types/pg) are
+    // unaffected by this list, and the triple-slash references inside the
+    // generated next-env.d.ts still pull in Next's own ambient types.
+    "types": ["node", "react", "react-dom"],
+
+    // --- The single path alias ----------------------------------------------
+    // `@/...` maps to this workspace's src/ tree, so app/** and src/** import
+    // `@/components/...`, `@/providers/...`, `@/hooks/...`, `@/lib/...`,
+    // `@/server/...` and `@/generated/prisma/client`. It is deliberately the
+    // only alias in the workspace.
+    //
+    // `baseUrl` is NOT set, and must not be: TypeScript 6.0.3 answers it with
+    // "error TS5101: Option 'baseUrl' is deprecated and will stop functioning
+    // in TypeScript 7.0", which fails `tsc -b` outright. `paths` alone is
+    // enough - TypeScript resolves the values below against the directory of
+    // the config that declares them, and Next.js resolves them the same way
+    // (build/load-jsconfig.js falls back to `pathsBasePath`, so "baseUrl is not
+    // required for path aliases to work in webpack"), which keeps the compiler
+    // and the bundler in agreement.
+    "paths": {
+      "@/*": ["./src/*"]
+    }
+  },
+
+  // `include` is the set Next.js expects to find, so it has nothing to add:
+  //   - next-env.d.ts: generated by Next.js and git-ignored, therefore absent
+  //     on a clean clone. It belongs in `include`, never in `files`: a `files`
+  //     entry that does not exist is a hard error, while an `include` glob that
+  //     matches nothing is ignored. Nothing in the demo may depend on what it
+  //     declares (in particular, no static image imports - use `next/image`
+  //     with a string `src` into public/), so `pnpm typecheck` succeeds on a
+  //     fresh clone that has never run a build.
+  //   - **/*.ts and **/*.tsx: app/**, src/**, next.config.ts, prisma.config.ts
+  //     and prisma/seed.ts, so the configuration and seed scripts are checked
+  //     too.
+  //   - the two .next globs: getTypeDefinitionGlobPatterns() asks for
+  //     `<distDir>/types/**/*.ts` plus its dev counterpart, and distDir is
+  //     .next for `next build` and .next/dev for `next dev`. Listing both means
+  //     Next.js never appends a glob (which would rewrite this file) and the
+  //     generated route types - the typed-routes unions and the validator that
+  //     checks every page, layout and route-handler signature - are visible to
+  //     whichever mode produced them. They are git-ignored, so they cannot
+  //     dirty the worktree either. The two generated routes.d.ts copies declare
+  //     the same ambient names; `skipLibCheck` above is what keeps that from
+  //     being a duplicate-identifier error, and a `.next` left over from a
+  //     route that no longer exists is cleared by deleting the directory.
+  "include": [
+    "next-env.d.ts",
+    "**/*.ts",
+    "**/*.tsx",
+    ".next/types/**/*.ts",
+    ".next/dev/types/**/*.ts"
+  ],
+
+  // Declaring `exclude` replaces the base's list, which is why .tsbuild is
+  // repeated here: TypeScript excludes `outDir` automatically only when
+  // `exclude` is absent, so without this entry the declarations emitted by
+  // `tsc -b` would become inputs of the next run. `node_modules` is the value
+  // Next.js writes when `exclude` is missing. `.next` as a whole is NOT
+  // excluded, because that would also drop the generated route types the
+  // `include` globs above deliberately pick up.
+  "exclude": ["node_modules", ".tsbuild"]
+}
