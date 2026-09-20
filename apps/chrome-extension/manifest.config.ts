@@ -1,0 +1,175 @@
+/**
+ * Manifest V3 manifest for the "Debug Generator" Chrome extension.
+ *
+ * This module is the single source of the manifest. `vite.config.ts` hands the
+ * default export to `crx({ manifest })` and @crxjs/vite-plugin writes
+ * `dist/manifest.json` - the directory a developer loads unpacked and the one
+ * the Playwright `browser` project passes to `--load-extension`. Every value
+ * below is asserted field by field against that built file by
+ * `test/manifest.test.ts`, so a change here is a change to a tested contract.
+ *
+ * The surfaces declared, and deliberately no others:
+ *   - a DevTools page, which contributes the "Debug Generator" panel;
+ *   - a module service worker, which owns the authenticated WebSocket to the
+ *     local service, the tab-to-session registry and the arming of the page
+ *     agent;
+ *   - two statically declared `document_start` content scripts on the local app
+ *     origins: the pre-built MAIN-world telemetry agent, then the
+ *     ISOLATED-world bridge.
+ *
+ * Not declared: `action`/`default_popup`, `options_page`, `omnibox`,
+ * `commands`, `externally_connectable`, `content_security_policy` and
+ * `web_accessible_resources`. The extension has no such surface, and each one
+ * would widen the permission boundary documented in `docs/SECURITY.md`. A
+ * manifest-declared content script is injected by Chrome from the extension
+ * package, so the MAIN-world agent needs no web-accessible-resource entry;
+ * crxjs adds one of its own for the bundled bridge chunk, which is its business
+ * and not authored here.
+ */
+import { defineManifest } from '@crxjs/vite-plugin';
+
+/**
+ * Kept in lockstep with this workspace's `package.json` `version`, and written
+ * as a literal on purpose: importing `package.json` would add a JSON input to a
+ * program whose tsconfig admits exactly four roots. `test/manifest.test.ts`
+ * compares the built manifest's `version` against `package.json`, so drift
+ * fails the suite instead of shipping.
+ */
+const VERSION = '0.1.0';
+
+/**
+ * The local origins a developer's dev server is reachable on, addressed both
+ * ways Chrome resolves it. Generic by requirement - never a project-specific
+ * port, path, route or identifier (AAP 0.5.4, `scripts/check-no-hardcoding.mjs`
+ * scans this workspace as product source).
+ *
+ * The same two patterns appear as `host_permissions` and as each content
+ * script's `matches`, because they answer different questions: `matches` selects
+ * the pages the scripts are injected into, while the host permission is what
+ * makes a manifest-declared `world: "MAIN"` script legal on those origins at
+ * all. Spread at every use site so no two manifest fields share one mutable
+ * array.
+ */
+const LOCAL_APP_ORIGINS = ['http://localhost/*', 'http://127.0.0.1/*'] as const;
+
+export default defineManifest({
+  manifest_version: 3,
+
+  // Exactly the string `src/devtools/devtools.ts` passes to
+  // `chrome.devtools.panels.create`, so the DevTools tab and the extension read
+  // as one product.
+  name: 'Debug Generator',
+  version: VERSION,
+  description:
+    'Ask a debugging question and get a purpose-built debugging panel for the page you are inspecting.',
+
+  // The version the browser and end-to-end suites actually run: Playwright
+  // 1.63.0 bundles Chromium 153.0.8010.12, so 153 is the floor this extension is
+  // proven on. The true API floor is lower - manifest `world: "MAIN"` needs 111
+  // and `chrome.storage.session` needs 102 - but those versions are untested
+  // here, and an untested claim of support is worse than a conservative one.
+  minimum_chrome_version: '153',
+
+  // Authored as the paths the icons occupy in the BUILT extension, not as
+  // `public/`-prefixed source paths. crxjs resolves a manifest asset against the
+  // Vite project root and then against `publicDir`, and emits it under the name
+  // declared here, which is also where Vite's own `public/` copy lands:
+  // `public/icons/16.png` -> `dist/icons/16.png`. `test/manifest.test.ts`
+  // asserts each of these paths exists under `dist/`.
+  icons: {
+    16: 'icons/16.png',
+    32: 'icons/32.png',
+    48: 'icons/48.png',
+    128: 'icons/128.png',
+  },
+
+  // crxjs emits this document and rewrites the path if it has to; the value here
+  // is the source location of the page that calls
+  // `chrome.devtools.panels.create`.
+  devtools_page: 'src/devtools/devtools.html',
+
+  // `type: "module"` is required, not cosmetic: the worker imports
+  // `@debuggen/protocol` as ESM. crxjs replaces the source path below with its
+  // generated loader in the built manifest but preserves the module type.
+  background: {
+    service_worker: 'src/background/service-worker.ts',
+    type: 'module',
+  },
+
+  // Least privilege - three permissions, each with one caller:
+  //   storage  `chrome.storage.local` for the paired devtools credential and
+  //            `chrome.storage.session` for the tab-to-session registry;
+  //   alarms   the keepalive that outlives the ~30 s idle suspension Manifest V3
+  //            applies to the service worker, so the WebSocket to the local
+  //            service is re-established rather than silently dropped;
+  //   tabs     `chrome.tabs.onUpdated` (the `tab.navigated` message that keeps or
+  //            drops a binding) and the consented `chrome.tabs.reload` that
+  //            re-runs the agent ahead of React on an already-loaded page.
+  // `scripting` is deliberately absent: both page-side scripts are declared
+  // statically below and stay dormant until the service worker configures them,
+  // so nothing in this extension registers or injects a script dynamically.
+  // `test/manifest.test.ts` asserts that absence on its own.
+  permissions: ['storage', 'alarms', 'tabs'],
+  host_permissions: [...LOCAL_APP_ORIGINS],
+
+  // Two static entries, and the ORDER IS THE CONTRACT: Chrome injects the
+  // scripts of one entry in declaration order, so the MAIN-world agent must come
+  // first and run at `document_start`. That is what installs the React DevTools
+  // hook before the page's React loads - the whole reason the product observes
+  // renders without the developer touching their own application. Swap these two
+  // entries, drop `world: "MAIN"`, or relax `run_at`, and browser telemetry
+  // degrades silently; `test/manifest.test.ts` is the gate that catches it.
+  //
+  // BUILD CONSTRAINT for `vite.config.ts` (verified against @crxjs/vite-plugin
+  // 2.7.1 + Vite 8.3.0, not assumed): `agent.iife.js` is a pre-built asset that
+  // `prebuild` (`scripts/copy-agent.mjs`) copies byte for byte from
+  // `packages/telemetry/dist/browser-agent.iife.js` into `public/`, and Vite
+  // emits it untouched at `dist/agent.iife.js`. It is NOT a source input.
+  // crxjs's built-in `crx:content-scripts-iife` plugin, however, claims every
+  // content script whose name matches /\.iife\.(ts|tsx|js|jsx|mjs|cjs)$/ and
+  // re-bundles it with a nested Vite library build resolved from the project
+  // root, which fails outright here ("[UNRESOLVED_ENTRY] Cannot resolve entry
+  // module agent.iife.js") because the file lives in `public/`; it reads the
+  // object passed to `crx()` directly, so no manifest transform hook can hide
+  // the entry from it. `vite.config.ts` therefore passes crxjs this manifest
+  // with the MAIN-world entry filtered out, and a post-build hook rewrites
+  // `dist/manifest.json` by walking THIS array in order - keeping a MAIN-world
+  // entry verbatim and consuming crxjs's rewritten entries for the rest - then
+  // asserts `dist/agent.iife.js` is SHA-256 identical to `public/agent.iife.js`.
+  // Re-inserting at the authored index rather than prepending is what keeps the
+  // built order equal to the order written here, so swapping these two entries
+  // shows up in `dist/manifest.json` and `test/manifest.test.ts` can still fail
+  // on it. This array stays the declarative source of the required shape either
+  // way, and re-bundling the agent is never an acceptable outcome: it would
+  // break both the before-React hook installation and the byte-for-byte copy
+  // contract.
+  content_scripts: [
+    {
+      matches: [...LOCAL_APP_ORIGINS],
+      js: ['agent.iife.js'],
+      world: 'MAIN',
+      run_at: 'document_start',
+      all_frames: false,
+    },
+    {
+      // The isolated-world relay between the page agent and the service worker.
+      // crxjs bundles this TypeScript entry and rewrites the path in the built
+      // manifest. `world: "ISOLATED"` is Chrome's default and is stated
+      // explicitly so the boundary between the two scripts is a declaration
+      // rather than an omission.
+      //
+      // One more build constraint this entry depends on, also measured rather
+      // than assumed: crxjs wraps a bundled content-script chunk in an IIFE by
+      // appending `})()` to the emitted code, which lands INSIDE the trailing
+      // `//# sourceMappingURL=` comment when `build.sourcemap` is `true`. The
+      // chunk is then a syntax error and this script silently never runs.
+      // `vite.config.ts` therefore uses `build.sourcemap: 'hidden'`, which keeps
+      // the .map files without emitting the comment.
+      matches: [...LOCAL_APP_ORIGINS],
+      js: ['src/content/bridge.ts'],
+      world: 'ISOLATED',
+      run_at: 'document_start',
+      all_frames: false,
+    },
+  ],
+});

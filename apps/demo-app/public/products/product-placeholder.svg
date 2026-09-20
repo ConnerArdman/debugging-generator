@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 300" width="400" height="300" role="img">
+  <title>Product placeholder</title>
+  <!-- The generic catalog tile: a plain closed carton, shown wherever a product has no artwork of
+       its own. It is also the exemplar for the six object tiles beside it. The four frame elements
+       below - the rounded paper panel and the three mist shelf strokes - are identical in all seven
+       files, as is the 400 x 300 view box, so a catalog card or the product gallery can swap one
+       tile for another without reflowing. That 4:3 box is the ratio both of those frames declare,
+       and the intrinsic width and height sit on the root beside the view box because consumers
+       reference these files by their string path alone - an img element, or a next/image with a
+       literal src - and so have no import from which a size could be inferred. -->
+  <!-- Palette, written as explicit hex because an image loaded through an img element inherits no
+       colour from the page. Ink #0F172A carries the silhouette at the heaviest weight in the file;
+       slate #475569 the secondary line work; mist #CBD5E1 the shelf behind the subject and nothing
+       in front of it, since at 1.42:1 against the panel it would leave the tile looking blank at
+       card size; paper #F8FAFC the panel itself; and one amber #F59E0B accent, filled and bounded
+       by slate rather than stroked on its own, for that same contrast reason. Round caps and joins
+       sit on the wrapping group, so every stroke of the subject inherits them. -->
+  <rect x="0" y="0" width="400" height="300" rx="12" fill="#F8FAFC" />
+  <path d="M40 232 H360" stroke="#CBD5E1" stroke-width="6" stroke-linecap="round" />
+  <path d="M96 232 V212" stroke="#CBD5E1" stroke-width="6" stroke-linecap="round" />
+  <path d="M304 232 V212" stroke="#CBD5E1" stroke-width="6" stroke-linecap="round" />
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <!-- The lid, drawn before the face so the ink stroke covers both slant ends where they land on
+         it: a parallelogram projected 20 units up and 20 across off the flat part of the face's top
+         edge, with the flap joint carrying the front seam back over it. Shallow on purpose - depth
+         enough that the subject reads as a closed box rather than a square, not so much that it
+         climbs into the panel's upper margin. -->
+    <path d="M124 132 L144 112 H296 L276 132" stroke="#475569" stroke-width="6" />
+    <path d="M200 132 L220 112" stroke="#475569" stroke-width="6" />
+    <!-- The front face: 168 x 92, centred on x 200 between the two shelf uprights, its base a unit
+         clear of the shelf stroke so the carton is seated rather than floating. -->
+    <rect x="116" y="132" width="168" height="92" rx="8" stroke="#0F172A" stroke-width="8" />
+    <!-- The seam down the centre of the face, stopping a cap radius inside the outline at either
+         end, and the one accent: a small shipping label, filled amber inside a slate outline and
+         set left of the seam so the two never meet. Nothing else is drawn - no cross, no torn
+         corner, no mark of any kind - because artwork that is merely absent is an ordinary state
+         and not a fault, and this tile has to read as a product. -->
+    <path d="M200 140 V216" stroke="#475569" stroke-width="6" />
+    <rect x="140" y="176" width="48" height="30" rx="6" fill="#F59E0B" stroke="#475569" stroke-width="6" />
+  </g>
+</svg>
