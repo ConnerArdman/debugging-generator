@@ -1,31 +1,165 @@
 {
+  // ---------------------------------------------------------------------------
+  // Debug Generator - shared TypeScript compiler options (AAP 0.3.4).
+  //
+  // Every workspace tsconfig.json under apps/* and packages/* extends this file.
+  // The root tsconfig.json is a solution file that references those projects, and
+  // `pnpm typecheck` (= `pnpm demo:generate && tsc -b`) is the gate that builds
+  // them, so every referenced project must be `composite`.
+  //
+  // This file is extend-only: it declares no `files`/`include`, so running
+  // `tsc -p tsconfig.base.json` directly answers TS18003 ("No inputs were
+  // found") by design. Validate it through a workspace project that extends it.
+  //
+  // Compiler: TypeScript 6.0.3, the last JavaScript-based line (AAP 0.3.1). 7.0.x
+  // is deliberately not used because ts-morph 28 and typescript-eslint 8.70 need
+  // the classic compiler API, so every option below is one 6.0.x accepts.
+  //
+  // The file is JSONC: tsc, ESLint, Vitest, tsup and Prettier all parse comments
+  // in tsconfig files, and the rationale for each decision is recorded inline.
+  // Any tooling that reads this file programmatically must use a JSONC-aware
+  // reader (for example `ts.readConfigFile`), never bare `JSON.parse`.
+  // ---------------------------------------------------------------------------
   "$schema": "https://json.schemastore.org/tsconfig",
   "compilerOptions": {
+    // --- Language level ------------------------------------------------------
+    // Node 24.21.0, Chrome 153 and every bundler in the repo support ES2023, so
+    // nothing is downlevelled anywhere in the monorepo.
     "target": "ES2023",
+    // Deliberately no "DOM"/"DOM.Iterable" here. Browser libraries are added by
+    // the workspaces that actually run in a page or a webview - packages/
+    // panel-renderer, the browser agent of packages/telemetry, apps/
+    // chrome-extension, the webview project of apps/vscode-extension and
+    // apps/demo-app - so a Node-only package cannot reference `window` and still
+    // compile.
     "lib": ["ES2023"],
+    // ES2022 class-field semantics (already the default at this target); stated
+    // explicitly so a workspace that lowers `target` keeps the same behaviour.
+    "useDefineForClassFields": true,
+
+    // --- Module system -------------------------------------------------------
+    // The default flavour is bundled/web: packages are emitted by tsup and the
+    // extension surfaces by Vite/esbuild. Node-targeted projects override with
+    //   "module": "NodeNext", "moduleResolution": "NodeNext"
+    // - that is apps/local-service, the `./node` entry of packages/shared, the
+    // `./node/register` preload entry of packages/telemetry and the guard
+    // scripts under scripts/.
     "module": "ESNext",
     "moduleResolution": "bundler",
+    // Every source file is a module: no accidental global scripts, and
+    // `declare global` works without a dummy import. Ambient asset declarations
+    // (`declare module "*.module.css"`) are unaffected.
     "moduleDetection": "force",
+    // Imports are emitted exactly as written, so type-only imports must say
+    // `import type` / `export type`. This keeps the browser-agent IIFE and the
+    // MV3 bundles free of runtime imports that existed only for types.
     "verbatimModuleSyntax": true,
+    // Each file must be emittable in isolation - required by esbuild, Vite and
+    // tsup, which transpile file by file.
     "isolatedModules": true,
-    "resolveJsonModule": true,
     "esModuleInterop": true,
-    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    // The product is TypeScript only; the few .mjs tooling scripts are linted,
+    // never compiled.
+    "allowJs": false,
+    "checkJs": false,
 
+    // --- JSX -----------------------------------------------------------------
+    // React 19.3.0 automatic runtime, so .tsx files need no `import React`.
+    // Carried in the base for packages/panel-renderer and both extension UIs;
+    // apps/demo-app overrides it to "preserve" because Next.js compiles JSX.
+    "jsx": "react-jsx",
+
+    // --- Strictness and diagnostics -----------------------------------------
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "noImplicitOverride": true,
+    "noImplicitReturns": true,
     "noFallthroughCasesInSwitch": true,
-    "exactOptionalPropertyTypes": true,
+    // Paired with `eslint . --max-warnings 0`: dead code fails the typecheck
+    // gate as well, so it cannot reach a commit.
     "noUnusedLocals": true,
     "noUnusedParameters": true,
+    "forceConsistentCasingInFileNames": true,
+    // Third-party .d.ts drift (OpenTelemetry, Prisma, @types/chrome, bippy) must
+    // not block the gate; first-party sources are still fully checked.
+    "skipLibCheck": true,
+    // NOT set: "exactOptionalPropertyTypes". It fights Zod 4 `.optional()`
+    // inference - the inferred output type of an optional key is `T | undefined`
+    // while object literals and parsed values flow into the same shapes - and
+    // every schema package (packages/protocol, packages/telemetry,
+    // packages/panel-schema, packages/instrumentation) is built on those
+    // inferred types, so enabling it would force `| undefined` noise through
+    // every message, event, plan and panel type. Decision recorded per AAP 0.3.4,
+    // whose strictness list is exactly `strict`, `noUncheckedIndexedAccess` and
+    // `verbatimModuleSyntax`.
+    // NOT set: "types". Each workspace declares its own ambient type packages
+    // ("node", "chrome", "vscode", "react", "react-dom") so that, for example,
+    // the Chrome extension's globals never bleed into the local service.
 
+    // --- Solution build and declaration emit --------------------------------
+    // `tsc -b` needs composite projects, and every workspace is referenced by the
+    // root solution file, so `noEmit` must never appear here or in any project
+    // that extends this file: TypeScript 6.0.3 answers a referenced project with
+    // `noEmit` with "error TS6310: Referenced project '...' may not disable
+    // emit." and the whole gate fails. A workspace whose framework wants to add
+    // `noEmit` (Next.js writes it into the project tsconfig) keeps it out of the
+    // file and relies on its own build for that check.
+    "composite": true,
+    "incremental": true,
     "declaration": true,
     "declarationMap": true,
     "sourceMap": true,
-    "composite": true,
-    "incremental": true,
-    "skipLibCheck": true
+    // Shipping bundles come from tsup / esbuild / Vite / Next; `tsc -b` exists
+    // only as the typecheck gate, so it emits declarations and nothing else.
+    "emitDeclarationOnly": true,
+    // `${configDir}` (TypeScript 5.5+) resolves to the directory of the
+    // *extending* config, not of this file. The substitution is load-bearing: a
+    // plain relative "outDir": ".tsbuild" resolves against this file's own
+    // directory, so every workspace would emit into <repo>/.tsbuild and silently
+    // overwrite its siblings' declarations. With `${configDir}` each project
+    // emits to <workspace>/.tsbuild, which never collides with the tsup output
+    // in <workspace>/dist.
+    //
+    // `.tsbuild/` is ignored by .gitignore, .prettierignore and the ignore list
+    // in eslint.config.js; renaming it means updating all three.
+    "outDir": "${configDir}/.tsbuild",
+    // The stamp is pinned inside the same directory instead of being left to its
+    // default. TypeScript derives the default from `outDir` plus the path from
+    // `rootDir` back to the config file, so a project whose `rootDir` is nested
+    // (for example "src/webview") writes its stamp *outside* its own workspace:
+    // two such projects under apps/ end up sharing `apps/tsconfig.tsbuildinfo`
+    // and then rebuild on every `tsc -b` run - with exit code 0 and no warning.
+    // Pinning it keeps every artefact of the typecheck gate inside
+    // <workspace>/.tsbuild, so the ignore lists above cover all of it.
+    //
+    // A workspace that declares a SECOND project in the same directory (only
+    // apps/vscode-extension does: tsconfig.json plus tsconfig.webview.json) must
+    // override BOTH of these in that project, for example
+    //   "outDir": "${configDir}/.tsbuild/webview",
+    //   "tsBuildInfoFile": "${configDir}/.tsbuild/webview/tsconfig.webview.tsbuildinfo"
+    // because two projects sharing one output directory overwrite each other's
+    // declarations and two projects sharing one stamp never settle.
+    "tsBuildInfoFile": "${configDir}/.tsbuild/tsconfig.tsbuildinfo"
+
+    // NOT set: "baseUrl", "paths", "rootDir".
+    // - No `@debuggen/*` -> `src/**` aliases. Cross-package imports resolve
+    //   through each package's `exports` map into `dist/`, exactly as the runtime
+    //   and the bundlers resolve them (AAP 0.2.2); aliasing to source would hide
+    //   a broken `exports` map and let the acyclic package layering be violated
+    //   without anything failing.
+    // - `baseUrl` interacts badly with "bundler" resolution.
+    // - `rootDir` is per-workspace: each project sets "src".
   },
-  "exclude": ["node_modules", "dist", ".next", "coverage"]
+
+  // Inherited by every workspace that does not declare its own `exclude`, so each
+  // entry is anchored with `${configDir}` and refers to that workspace's own
+  // directories rather than to the repository root.
+  "exclude": [
+    "${configDir}/node_modules",
+    "${configDir}/dist",
+    "${configDir}/.tsbuild",
+    "${configDir}/.next",
+    "${configDir}/coverage"
+  ]
 }

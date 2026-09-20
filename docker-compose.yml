@@ -1,10 +1,33 @@
 # PostgreSQL for the "Lumen Supply" demo application.
-# Only the database runs in Docker; the product itself runs on the host.
+#
+# Only the database runs in Docker; the product itself (the VS Code extension,
+# the local coordination service, the Chrome extension and the demo app) runs on
+# the host, so this file defines exactly one service and nothing else.
+#
+# Usage:
+#   pnpm demo:db           start it in the background (docker compose up -d postgres)
+#   pnpm demo:migrate      apply the demo's Prisma migrations to it
+#   pnpm demo:seed         load the demo data set
+#   docker compose stop    stop it, keeping the data volume
+#   docker compose down -v stop it and discard the data volume
+#
+# The user, password, database and port below are the ones DATABASE_URL in
+# .env.example already points at, so `pnpm demo:db` needs no configuration.
 services:
   postgres:
     image: postgres:18.6-alpine
     container_name: ${POSTGRES_CONTAINER_NAME:-debuggen-postgres}
     restart: unless-stopped
+    # Deliberately no `command:` override and no server tuning. The demo app is
+    # the instrumentation target, and one of its seeded performance problems is
+    # an unindexed aggregate over a large inventory-movement table: flags such as
+    # shared_buffers, work_mem, fsync=off or any planner setting would mask the
+    # very latency Debug Generator is meant to observe. Run the image's defaults.
+    #
+    # The credentials below are local development placeholders, kept literal on
+    # purpose: interpolating them (${POSTGRES_PASSWORD}) would break `pnpm
+    # demo:db` on a fresh clone that has no .env, and docs/SECURITY.md documents
+    # them as non-secret. Never put a real credential in this file.
     environment:
       POSTGRES_USER: debuggen
       POSTGRES_PASSWORD: debuggen
@@ -16,12 +39,17 @@ services:
       # volume must be mounted at /var/lib/postgresql (NOT .../data, which the
       # entrypoint rejects with "in 18+, these Docker images are configured to
       # store database data in a format which is compatible with pg_ctlcluster").
+      # A named volume is used rather than a bind mount so that seeded data
+      # never appears in the working tree and `git status` stays clean.
       - postgres-data:/var/lib/postgresql
+    # Mirrors the CI service's health options so `pnpm demo:migrate` can rely on
+    # the same readiness signal locally and in the pipeline.
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U debuggen -d lumen_supply"]
       interval: 5s
       timeout: 5s
       retries: 10
+      start_period: 5s
 
 volumes:
   postgres-data:
