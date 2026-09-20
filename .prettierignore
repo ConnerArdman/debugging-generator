@@ -1,0 +1,15 @@
+# generated / vendored
+pnpm-lock.yaml
+node_modules/
+dist/
+out/
+build/
+coverage/
+.next/
+playwright-report/
+test-results/
+apps/demo-app/src/generated/
+apps/chrome-extension/public/agent.iife.js
+
+# Blitzy run artifacts
+blitzy/

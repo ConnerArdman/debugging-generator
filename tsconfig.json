@@ -1,0 +1,6 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "// note": "Solution file for `tsc -b`. Each workspace appends itself to `references` as it lands; use \"files\": [] alongside a non-empty `references` list once the first project reference exists.",
+  "include": [],
+  "references": []
+}

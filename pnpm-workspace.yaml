@@ -1,0 +1,32 @@
+packages:
+  - "apps/*"
+  - "packages/*"
+
+# pnpm >=10 reads its settings from this file, NOT from .npmrc, so the
+# engine-strict / auto-install-peers pair required by the project lives here.
+# (.npmrc keeps the same keys for npm and for older pnpm versions.)
+engineStrict: true
+autoInstallPeers: true
+
+# pnpm blocks dependency lifecycle scripts unless they are allowlisted.
+# pnpm >=12 reads `allowBuilds`; `onlyBuiltDependencies` is kept for older pnpm.
+# These are the packages in the pinned dependency set that legitimately need one.
+allowBuilds:
+  "@playwright/test": true
+  "@prisma/client": true
+  "@prisma/engines": true
+  "@vscode/vsce-sign": true
+  esbuild: true
+  playwright: true
+  prisma: true
+  unrs-resolver: true
+
+onlyBuiltDependencies:
+  - "@playwright/test"
+  - "@prisma/client"
+  - "@prisma/engines"
+  - "@vscode/vsce-sign"
+  - esbuild
+  - playwright
+  - prisma
+  - unrs-resolver

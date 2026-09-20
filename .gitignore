@@ -1,0 +1,43 @@
+# dependencies
+node_modules/
+.pnpm-store/
+
+# build output
+dist/
+out/
+build/
+.next/
+*.tsbuildinfo
+*.vsix
+
+# generated code / assets
+apps/demo-app/src/generated/
+apps/demo-app/next-env.d.ts
+apps/chrome-extension/public/agent.iife.js
+
+# test and coverage output
+coverage/
+playwright-report/
+test-results/
+blob-report/
+.playwright/
+
+# environment files (the two committed examples are re-included)
+.env*
+!.env.example
+!apps/demo-app/.env.example
+
+# local databases and session state
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3
+
+# editor / OS noise
+.DS_Store
+*.log
+.idea/
+
+# Blitzy run artifacts (screenshots, recordings)
+blitzy/
