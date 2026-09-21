@@ -1,0 +1,99 @@
+/**
+ * `POST /api/checkout` - turns the cart this browser is shopping with into an
+ * order.
+ *
+ * The handler is four steps and nothing else: read the body with the one schema
+ * that describes it, read the origin off the request, hand both to the checkout
+ * service, and answer with the `CheckoutResult` the service built. The body's
+ * shape lives in `@/server/validation/checkout`, everything an order involves -
+ * the cart, the stock, the prices, the freight, the authorization and the write -
+ * lives in `@/server/services/checkout.service`, and every failure becomes a
+ * response through the single mapper in `@/server/errors`. So this file holds no
+ * schema, no query, no arithmetic and no error classification of its own: it is
+ * the endpoint's HTTP surface and nothing more.
+ *
+ * `origin` is read from `request.url` rather than from a constant or an
+ * environment variable, because the server layer names no host: the services
+ * behind this endpoint build the absolute URLs they need from whatever scheme
+ * and authority this request arrived on, so the same code answers on a
+ * developer's laptop, on a colleague's different port and behind a proxy without
+ * a value configured anywhere.
+ *
+ * The result is serialized exactly as the service built it. Money is already an
+ * integer count of US cents in its `*Cents` fields and every instant is already
+ * an ISO-8601 UTC string, which is why the object is passed to `Response.json`
+ * untouched rather than re-mapped here: a field renamed, rounded or reordered in
+ * this file would be a second, divergent description of a shape `@/lib/types`
+ * already publishes.
+ *
+ * Placing an order is a write, and each submission is its own attempt against
+ * the state of the moment - the cart, the stock and the prices as they stand -
+ * so every response says `no-store`, the segment is declared dynamic, and there
+ * is no caching, reuse or de-duplication anywhere in this file: one request from
+ * the browser is one checkout.
+ */
+
+import type { CheckoutDraft, CheckoutResult } from '@/lib/types';
+import { StorefrontValidationError, storefrontErrorResponse } from '@/server/errors';
+import { placeOrder } from '@/server/services/checkout.service';
+import { checkoutBodySchema } from '@/server/validation/checkout';
+
+/**
+ * An order is placed, never described, so the route is handled per request and
+ * never prerendered: `next build` neither reads this route nor needs a database
+ * to produce the build output, and no reply is served again for a later
+ * submission.
+ */
+export const dynamic = 'force-dynamic';
+
+/** What a caller is told when the request body was not readable JSON. */
+const UNREADABLE = 'The checkout request body could not be read as JSON.';
+
+/**
+ * Places the order this request submitted and answers with it.
+ *
+ * @param request The POST whose JSON body `checkoutBodySchema` describes: who is
+ * buying, where the goods are going, which shipping service was chosen and any
+ * delivery note. Its URL is read for the origin the services answer on; the cart
+ * is not named by the request, because it belongs to this browser's session and
+ * the server resolves it.
+ * @returns `200` with the `CheckoutResult` - the order as it was written and the
+ * authorization that paid for it - or the mapper's failure envelope: `400` when
+ * the body is not readable JSON or does not match the schema, `404` when the
+ * session is shopping with no open cart, `409` when the stock or the chosen
+ * shipping service no longer supports the submission, `402` when the payment was
+ * declined, `502` when a dependency did not answer, and a single generic `500`
+ * for anything unaccounted for.
+ */
+export async function POST(request: Request): Promise<Response> {
+  try {
+    let payload: unknown;
+
+    try {
+      payload = await request.json();
+    } catch (cause) {
+      // An empty or malformed body is the caller's mistake, so it is reported as
+      // the validation failure it is rather than as a failure of this endpoint.
+      throw new StorefrontValidationError(UNREADABLE, { cause });
+    }
+
+    // Parsing throws, and the rejection names every field at fault: the single
+    // mapper behind `storefrontErrorResponse` turns it into the same 400 every
+    // other endpoint answers an unacceptable body with.
+    const draft: CheckoutDraft = checkoutBodySchema.parse(payload);
+
+    const origin = new URL(request.url).origin;
+
+    const result: CheckoutResult = await placeOrder(draft, origin);
+
+    return Response.json(result, {
+      status: 200,
+      headers: {
+        'content-type': 'application/json; charset=utf-8',
+        'cache-control': 'no-store',
+      },
+    });
+  } catch (error) {
+    return storefrontErrorResponse(error);
+  }
+}
