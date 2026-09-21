@@ -1,12 +1,14 @@
 /**
  * Stock availability, and the figures behind the inventory dashboard.
  *
- * Two operations live here, and they are the two questions the warehouse side of
- * Lumen Supply is asked. `reserveStock` decides whether a cart can be promised
- * and which distribution center each of its lines ships from; it runs while an
- * order is being placed. `readInventorySummary` answers the inventory
- * dashboard: the figures on its cards, the stocking locations its filter row
- * lists, and the lines that have fallen to their reorder point.
+ * Three operations live here, and they are the questions the warehouse side of
+ * Lumen Supply is asked. `reserveStock` decides whether a cart can be promised,
+ * names the distribution center each of its lines ships from and holds the
+ * units it promised; it runs while an order is being placed, and `release`
+ * gives those units back when the order it was promising did not happen.
+ * `readInventorySummary` answers the inventory dashboard: the figures on its
+ * cards, the stocking locations its filter row lists, and the lines that have
+ * fallen to their reorder point.
  *
  * Both read the same two tables, and the difference between them is the whole
  * reason a reservation is not a single lookup. `inventory_levels` holds one row
@@ -16,8 +18,11 @@
  * one signed row for every recorded change, whether goods received, goods
  * shipped, stock transferred between locations, a correction after a count, or a
  * hold raised against an order. It is how the location came to believe it, and
- * it is where the holds that have not yet reached the level row are recorded.
- * A reservation reconciles the two before it promises anything.
+ * it is where every hold this store raises is written down. A reservation
+ * reconciles the two before it promises anything, and then writes itself into
+ * both: the units it promised are added to what the location has promised, and
+ * the hold that promised them is recorded in the ledger under a reference of
+ * its own, so it can be given back by naming it.
  *
  * Statements against the ledger are written as SQL and run on the shared pool,
  * because they aggregate a signed column into several figures per location, and
@@ -90,6 +95,13 @@ const MAX_PAGE_SIZE = 200;
 /** The highest page number the low-stock list answers; beyond it the page is empty. */
 const MAX_PAGE = 10_000;
 
+/**
+ * How a hold names itself in the ledger, ahead of the identifier that makes it
+ * one hold rather than another. Short and legible, because a reference is read
+ * by whoever is looking at the ledger rather than parsed by anything.
+ */
+const HOLD = 'RSV';
+
 /* ---------------------------------------------------------------------------
  * Shapes
  * ------------------------------------------------------------------------- */
@@ -100,9 +112,10 @@ const MAX_PAGE = 10_000;
  *
  * `availableQuantity` is what the chosen location could promise at the moment it
  * was chosen - its units on the shelf, less the units already promised to
- * somebody else, less the units held by orders that have not shipped yet - so it
- * is at least `requestedQuantity` on every line of a reservation that was
- * returned rather than refused. The remaining figures are that location's
+ * somebody else - so it is at least `requestedQuantity` on every line of a
+ * reservation that was returned rather than refused. It is the same figure the
+ * inventory dashboard calls available, because a line is promised out of the
+ * same headroom the dashboard reports. The remaining figures are that location's
  * ledger for this product: `net` over the reconciled history, `shipped` and
  * `held` over the recent window, `received` and `restockedAt` from its goods-in,
  * `adjusted` from its transfers and counts, and `movements` counting the
@@ -145,13 +158,17 @@ export type ReservedLine = {
  * start of the ledger history it was reconciled against, so a reader can tell
  * both how current the promise is and how much history stands behind it.
  *
- * A reservation reads stock and records nothing: it is a statement about what
- * the network can promise at `checkedAt`, not a claim on it, so establishing one
- * twice for the same cart answers the same thing twice.
+ * `reference` names the hold the reservation raised. The units it covers are
+ * promised to this reservation and to nothing else until they are shipped or
+ * given back, and handing the reference to {@link release} is how they are
+ * given back - which is what a caller whose order did not go through does with
+ * it. A reservation is therefore a claim on stock rather than a statement about
+ * it, and a second one for the same cart holds a second set of units.
  */
 export type StockReservation = {
   lines: ReservedLine[];
   units: number;
+  reference: string;
   checkedAt: string;
   since: string;
 };
@@ -249,11 +266,20 @@ function bounded(value: number | undefined, fallback: number, min: number, max: 
  * three; locations are read in code order, so the same cart resolves to the same
  * locations every time.
  *
+ * The units it promises are then held, all of them or none: availability was
+ * read a line at a time and another order may have taken the same units since,
+ * so each location is counted up under its own row and the hold is recorded in
+ * the ledger against a reference of its own. A caller whose order does not go
+ * through hands that reference to {@link release}, and the units return to the
+ * locations they were promised out of.
+ *
  * @param lines The cart's lines, quantified as the cart holds them.
- * @returns One {@link ReservedLine} per line, in the order they were given.
+ * @returns One {@link ReservedLine} per line, in the order they were given,
+ * together with the reference the hold was raised under.
  * @throws StorefrontError `OUT_OF_STOCK` when a line cannot be promised, either
- * because the network holds fewer units than were asked for or because no single
- * location holds enough of them to ship the line complete.
+ * because the network holds fewer units than were asked for, because no single
+ * location holds enough of them to ship the line complete, or because the units
+ * it was promised went elsewhere before the hold could be raised.
  */
 export async function reserveStock(lines: readonly CartLine[]): Promise<StockReservation> {
   type Row = {
@@ -369,7 +395,7 @@ export async function reserveStock(lines: readonly CartLine[]): Promise<StockRes
     let stocked = 0;
 
     for (const row of result.rows) {
-      const available = Math.max(0, row.on_hand - row.reserved - amount(row.held));
+      const available = Math.max(0, row.on_hand - row.reserved);
 
       stocked += available;
       deepest = Math.max(deepest, available);
@@ -416,12 +442,190 @@ export async function reserveStock(lines: readonly CartLine[]): Promise<StockRes
     units += line.quantity;
   }
 
+  const reference = `${HOLD}-${crypto.randomUUID()}`;
+
+  await hold(promised, reference);
+
   return {
     lines: promised,
     units,
+    reference,
     checkedAt: checked.toISOString(),
     since: ledger.toISOString(),
   };
+}
+
+/**
+ * Gives back the units a hold was promising.
+ *
+ * The ledger is the record of what a hold took, so releasing one is a matter of
+ * reading its rows back and writing their opposite: each location the hold
+ * touched has the units it still holds returned to its headroom, and a row
+ * recording the return goes into the ledger under the same reference, so the
+ * hold and its release stand next to each other rather than one of them
+ * quietly disappearing.
+ *
+ * Releasing twice is releasing once, and that has to hold when the two happen
+ * at the same time as much as when one follows the other - a caller recovering
+ * from a failure may well be one of several. So a release takes the reference
+ * itself in hand for the length of its transaction, and reads the balance
+ * while holding it: a second release of the same reference waits, then reads a
+ * ledger that already contains the first one's rows, finds nothing owed and
+ * writes nothing. A hold whose rows already cancel out is left alone, which is
+ * what lets a caller call this without first working out whether an earlier
+ * attempt already did.
+ *
+ * @param reference The hold to release, as {@link StockReservation} named it.
+ */
+export async function release(reference: string): Promise<void> {
+  await prisma.$transaction(async (tx) => {
+    // One release of a reference at a time. The lock is the reference rather
+    // than any row, because what is being made single is the decision about
+    // what this hold still owes, and it is scoped to this transaction, so it is
+    // given up when the transaction ends however it ends.
+    await tx.$queryRaw`SELECT true AS locked FROM pg_advisory_xact_lock(hashtext(${reference}::text))`;
+
+    const rows = await tx.inventoryMovement.findMany({
+      where: { reference, movementType: 'RESERVATION' },
+      select: { productId: true, warehouseId: true, quantityDelta: true },
+    });
+
+    // A hold is one row per line when it is raised and one per line when it is
+    // released, so what matters is the balance per location rather than the
+    // rows: a location still owing units has a negative balance, and a released
+    // one has none left.
+    const balance = new Map<string, { productId: string; warehouseId: string; units: number }>();
+
+    for (const row of rows) {
+      const key = `${row.productId}:${row.warehouseId}`;
+      const held = balance.get(key);
+
+      if (held === undefined) {
+        balance.set(key, {
+          productId: row.productId,
+          warehouseId: row.warehouseId,
+          units: row.quantityDelta,
+        });
+      } else {
+        held.units += row.quantityDelta;
+      }
+    }
+
+    // Locations are written in the same order a hold writes them, so a release
+    // and a hold that overlap queue behind one another rather than each waiting
+    // on a row the other holds.
+    const owed = [...balance.values()]
+      .filter((held) => held.units < 0)
+      .sort((one, other) =>
+        one.productId === other.productId
+          ? one.warehouseId.localeCompare(other.warehouseId)
+          : one.productId.localeCompare(other.productId),
+      );
+
+    for (const held of owed) {
+      const units = -held.units;
+
+      await tx.inventoryLevel.updateMany({
+        where: { productId: held.productId, warehouseId: held.warehouseId },
+        data: { reserved: { decrement: units } },
+      });
+
+      await tx.inventoryMovement.create({
+        data: {
+          productId: held.productId,
+          warehouseId: held.warehouseId,
+          quantityDelta: units,
+          movementType: 'RESERVATION',
+          reference,
+        },
+      });
+    }
+  });
+}
+
+/**
+ * Holds the units a reservation promised, or promises none of them.
+ *
+ * Availability was read a moment ago, and a moment is long enough for another
+ * order to have taken the same units, so the hold is not a matter of writing
+ * down what was read. Each location's row is taken in hand as the units are
+ * added to what it has promised, and the figure that results is read back
+ * inside the same transaction, where the row is still held: a location can only
+ * be counted up by one caller at a time, and the next caller reads what this
+ * one left rather than the figure that stood before it. The row is only sound
+ * if that result is still within what the location has on the shelf. A location
+ * counted past its shelf is one whose units went elsewhere in between, which
+ * fails the whole reservation: every line of a cart is held together or none of
+ * it is, so a caller is never left holding half a cart's worth of stock.
+ *
+ * Locations are taken in a fixed order, by product and then by location, so two
+ * carts holding overlapping lines queue behind one another rather than each
+ * waiting on a row the other already holds.
+ *
+ * @param lines The lines to hold, as availability named them.
+ * @param reference The hold's own reference, written on every row.
+ * @throws StorefrontError `OUT_OF_STOCK` when a line's units went elsewhere
+ * between availability being read and the hold being raised, or when the
+ * location it was going to ship from no longer stocks it at all.
+ */
+async function hold(lines: readonly ReservedLine[], reference: string): Promise<void> {
+  const ordered = [...lines].sort((one, other) =>
+    one.productId === other.productId
+      ? one.warehouseId.localeCompare(other.warehouseId)
+      : one.productId.localeCompare(other.productId),
+  );
+
+  await prisma.$transaction(async (tx) => {
+    for (const line of ordered) {
+      const where = { productId: line.productId, warehouseId: line.warehouseId };
+
+      const counted = await tx.inventoryLevel.updateMany({
+        where,
+        data: { reserved: { increment: line.requestedQuantity } },
+      });
+
+      const level =
+        counted.count === 0
+          ? null
+          : await tx.inventoryLevel.findFirst({ where, select: { onHand: true, reserved: true } });
+
+      if (level === null) {
+        throw new StorefrontError(
+          'OUT_OF_STOCK',
+          409,
+          'One of your items is no longer stocked where it was going to ship from. Review your cart and place the order again.',
+          {
+            details: { productId: line.productId, requested: line.requestedQuantity, available: 0 },
+          },
+        );
+      }
+
+      if (level.reserved > level.onHand) {
+        throw new StorefrontError(
+          'OUT_OF_STOCK',
+          409,
+          'Another order took the last units of one of your items. Review your cart and place the order again.',
+          {
+            details: {
+              productId: line.productId,
+              requested: line.requestedQuantity,
+              available: Math.max(0, level.onHand - (level.reserved - line.requestedQuantity)),
+            },
+          },
+        );
+      }
+
+      await tx.inventoryMovement.create({
+        data: {
+          productId: line.productId,
+          warehouseId: line.warehouseId,
+          quantityDelta: -line.requestedQuantity,
+          movementType: 'RESERVATION',
+          reference,
+        },
+      });
+    }
+  });
 }
 
 /* ---------------------------------------------------------------------------
@@ -446,6 +650,13 @@ export async function reserveStock(lines: readonly CartLine[]): Promise<StockRes
  * the lines worth acting on first, and is broken deterministically by SKU and
  * then by location code so that paging never shows a line twice.
  *
+ * `movementVolume` is the throughput behind those figures rather than another
+ * balance: the units the ledger has recorded against the lines the filters
+ * matched, with goods in and goods out both counting as the units they moved.
+ * It is read over the whole recorded history, so it answers how much stock has
+ * passed through what the caller asked about, and a movement filter narrows it
+ * to one kind of change.
+ *
  * @param input Which locations, states and lines to report on; `{}` answers the
  * figures the dashboard opens on.
  * @returns The dashboard's payload, computed at `generatedAt`.
@@ -469,6 +680,10 @@ export async function readInventorySummary(
     warehouse_name: string;
     available: number;
     reorder_point: number;
+  };
+
+  type Volume = {
+    units: string | null;
   };
 
   const threshold = bounded(input.threshold, DEFAULT_THRESHOLD, 0, MAX_THRESHOLD);
@@ -517,52 +732,82 @@ export async function readInventorySummary(
     only = groups.map((group) => group.productId);
   }
 
-  const totals = await pool.query<Totals>(
-    `
-      SELECT
-        COUNT(DISTINCT l.product_id) AS skus,
-        SUM(l.on_hand) AS on_hand,
-        SUM(l.reserved) AS reserved,
-        COUNT(*) FILTER (WHERE l.on_hand - l.reserved <= l.reorder_point + $2::int) AS low
-      FROM inventory_levels l
-      WHERE ($1::text IS NULL OR l.warehouse_id = $1::text)
-        AND ($3::text IS NULL
-             OR ($3::text = 'OUT_OF_STOCK' AND l.on_hand - l.reserved <= 0)
-             OR ($3::text = 'LOW_STOCK'
-                 AND l.on_hand - l.reserved > 0
-                 AND l.on_hand - l.reserved <= l.reorder_point + $2::int)
-             OR ($3::text = 'IN_STOCK' AND l.on_hand - l.reserved > l.reorder_point + $2::int))
-        AND ($4::text[] IS NULL OR l.product_id = ANY($4::text[]))
-    `,
-    [location, threshold, state, only],
-  );
-
-  const shortages = await pool.query<Shortage>(
-    `
-      SELECT
-        l.product_id,
-        p.sku,
-        p.name AS product_name,
-        w.name AS warehouse_name,
-        l.on_hand - l.reserved AS available,
-        l.reorder_point
-      FROM inventory_levels l
-      JOIN products p ON p.id = l.product_id
-      JOIN warehouses w ON w.id = l.warehouse_id
-      WHERE l.on_hand - l.reserved <= l.reorder_point + $2::int
-        AND ($1::text IS NULL OR l.warehouse_id = $1::text)
-        AND ($3::text IS NULL
-             OR ($3::text = 'OUT_OF_STOCK' AND l.on_hand - l.reserved <= 0)
-             OR ($3::text = 'LOW_STOCK' AND l.on_hand - l.reserved > 0)
-             OR ($3::text = 'IN_STOCK' AND l.on_hand - l.reserved > l.reorder_point + $2::int))
-        AND ($4::text[] IS NULL OR l.product_id = ANY($4::text[]))
-      ORDER BY (l.on_hand - l.reserved) - l.reorder_point, p.sku, w.code
-      LIMIT $5::int OFFSET $6::int
-    `,
-    [location, threshold, state, only, size, (page - 1) * size],
-  );
+  // Three questions about the same stock, and none of them reads another's
+  // answer: the figures on the cards, the page of lines that have fallen to
+  // their point, and the units the ledger accounts for. They are issued
+  // together and awaited once, so the dashboard costs one round trip to the
+  // database rather than three in turn.
+  const [totals, shortages, volume] = await Promise.all([
+    pool.query<Totals>(
+      `
+        SELECT
+          COUNT(DISTINCT l.product_id) AS skus,
+          SUM(l.on_hand) AS on_hand,
+          SUM(l.reserved) AS reserved,
+          COUNT(*) FILTER (WHERE l.on_hand - l.reserved <= l.reorder_point + $2::int) AS low
+        FROM inventory_levels l
+        WHERE ($1::text IS NULL OR l.warehouse_id = $1::text)
+          AND ($3::text IS NULL
+               OR ($3::text = 'OUT_OF_STOCK' AND l.on_hand - l.reserved <= 0)
+               OR ($3::text = 'LOW_STOCK'
+                   AND l.on_hand - l.reserved > 0
+                   AND l.on_hand - l.reserved <= l.reorder_point + $2::int)
+               OR ($3::text = 'IN_STOCK' AND l.on_hand - l.reserved > l.reorder_point + $2::int))
+          AND ($4::text[] IS NULL OR l.product_id = ANY($4::text[]))
+      `,
+      [location, threshold, state, only],
+    ),
+    pool.query<Shortage>(
+      `
+        SELECT
+          l.product_id,
+          p.sku,
+          p.name AS product_name,
+          w.name AS warehouse_name,
+          l.on_hand - l.reserved AS available,
+          l.reorder_point
+        FROM inventory_levels l
+        JOIN products p ON p.id = l.product_id
+        JOIN warehouses w ON w.id = l.warehouse_id
+        WHERE l.on_hand - l.reserved <= l.reorder_point + $2::int
+          AND ($1::text IS NULL OR l.warehouse_id = $1::text)
+          AND ($3::text IS NULL
+               OR ($3::text = 'OUT_OF_STOCK' AND l.on_hand - l.reserved <= 0)
+               OR ($3::text = 'LOW_STOCK' AND l.on_hand - l.reserved > 0)
+               OR ($3::text = 'IN_STOCK' AND l.on_hand - l.reserved > l.reorder_point + $2::int))
+          AND ($4::text[] IS NULL OR l.product_id = ANY($4::text[]))
+        ORDER BY (l.on_hand - l.reserved) - l.reorder_point, p.sku, w.code
+        LIMIT $5::int OFFSET $6::int
+      `,
+      [location, threshold, state, only, size, (page - 1) * size],
+    ),
+    // Both directions count as the units they moved, so goods in and goods out
+    // add up instead of cancelling: the figure is what the ledger has handled,
+    // not what is left. The join is what holds it to the same lines the totals
+    // above report on - a recorded change counts only where the line it moved
+    // is one the caller asked about - and a movement filter narrows it to the
+    // one kind of change directly, which is the question it was asked.
+    pool.query<Volume>(
+      `
+        SELECT COALESCE(SUM(ABS(m.quantity_delta)), 0) AS units
+        FROM inventory_movements m
+        JOIN inventory_levels l
+          ON l.product_id = m.product_id AND l.warehouse_id = m.warehouse_id
+        WHERE ($1::text IS NULL OR m.warehouse_id = $1::text)
+          AND ($3::text IS NULL
+               OR ($3::text = 'OUT_OF_STOCK' AND l.on_hand - l.reserved <= 0)
+               OR ($3::text = 'LOW_STOCK'
+                   AND l.on_hand - l.reserved > 0
+                   AND l.on_hand - l.reserved <= l.reorder_point + $2::int)
+               OR ($3::text = 'IN_STOCK' AND l.on_hand - l.reserved > l.reorder_point + $2::int))
+          AND ($4::text IS NULL OR m.movement_type::text = $4::text)
+      `,
+      [location, threshold, state, movement],
+    ),
+  ]);
 
   const figures = totals.rows[0];
+  const moved = volume.rows[0];
 
   const lowStock: LowStockRow[] = shortages.rows.map((row) => ({
     productId: row.product_id,
@@ -578,6 +823,7 @@ export async function readInventorySummary(
     totalOnHand: amount(figures?.on_hand ?? null),
     totalReserved: amount(figures?.reserved ?? null),
     lowStockCount: amount(figures?.low ?? null),
+    movementVolume: amount(moved?.units ?? null),
     warehouses,
     lowStock,
     generatedAt: new Date().toISOString(),

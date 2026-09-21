@@ -3,7 +3,7 @@
 import clsx from 'clsx';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { useId, useState, type ReactElement } from 'react';
+import { useId, useRef, useState, type ReactElement } from 'react';
 
 import { Button } from '@/components/ui/Button';
 import { VisuallyHidden } from '@/components/ui/VisuallyHidden';
@@ -28,11 +28,13 @@ import styles from './SiteNav.module.css';
  *
  * A CLIENT COMPONENT, FOR TWO REASONS AND NO MORE
  * `usePathname` is a client hook, and the disclosure holds one boolean of local state; either
- * alone would require the directive at the top of the file. Beyond those two there is nothing
- * client-only in here - no effect, no timer, no browser global, no `window` read, no randomness
- * and no clock read - so the markup the server renders for a URL and the markup the browser first
- * produces for it agree, and hydration is silent. `useId` supplies the one generated value in the
- * file, which React keeps stable across that boundary; a random id would not be.
+ * alone would require the directive at the top of the file. Beyond those two the only browser-side
+ * thing in here is the ref the key handler focuses, and that ref is touched inside the handler and
+ * never while the markup is being produced - there is no effect, no timer, no browser global, no
+ * `window` read, no randomness and no clock read - so the markup the server produces for a URL and
+ * the markup the browser first produces for it agree, and hydration is silent. `useId` supplies
+ * the one generated value in the file, which React keeps stable across that boundary; a random id
+ * would not be.
  *
  * ACTIVE ROUTE
  * `isActiveRoute` below is a pure module-level function, so the rule it encodes is testable
@@ -61,15 +63,30 @@ import styles from './SiteNav.module.css';
  * global listener would need an effect and a teardown, would fire for every key pressed anywhere
  * on the page, and would answer a key press aimed at something else entirely.
  *
+ * Escape also returns focus to the control, and it does so before the state update that closes the
+ * list. A reader who presses it is usually standing on one of the links inside the list, and
+ * `SiteNav.module.css` stops a closed list from being drawn at all, so the element focus was on
+ * would be taken out from under that reader and the document would be left with no keyboard
+ * position to carry on tabbing from. Moving focus first hands them the control they opened the
+ * list with - the element that reports the list's state - while the link is still there to move
+ * away from, which is possible because React applies the state change only once this handler has
+ * returned. Above the stylesheet's 720px breakpoint the control is not drawn and the list is a
+ * permanent row: a control that is not drawn cannot take focus, so the call does nothing and focus
+ * stays on the link, which is the right outcome there because nothing was hidden.
+ *
  * Following a link closes it too, because a tap on a phone-width viewport otherwise leaves the
- * menu standing open over the page it just navigated to.
+ * menu standing open over the page it just navigated to. That path moves no focus at all: the
+ * reader is on their way to another page, and where focus belongs is that page's business.
  *
  * WHAT IT IS NOT
  * A disclosure, not a dialog: focus is not trapped, it is not moved into the list when the list
- * opens, and no overlay is drawn. The cart drawer is this application's one dialog and owns that
- * behaviour. This component is also not a search surface and not a breadcrumb - the trail is its
- * own labelled landmark, which is precisely why the `aria-label` on the `<nav>` below is required
- * rather than decorative: two navigation landmarks in a document have to be distinguishable.
+ * opens, and no overlay is drawn. Returning focus to the control on Escape is neither of those
+ * things - it gives the reader back the position they came from rather than taking a position
+ * over, and it happens only on the key that dismisses the list. The cart drawer is this
+ * application's one dialog and owns the trapping behaviour. This component is also not a search
+ * surface and not a breadcrumb - the trail is its own labelled landmark, which is precisely why
+ * the `aria-label` on the `<nav>` below is required rather than decorative: two navigation
+ * landmarks in a document have to be distinguishable.
  *
  * CLASS CONTRACT
  * `SiteNav.module.css` defines seven classes and this component uses all seven - `root`, `inner`,
@@ -171,6 +188,12 @@ export function SiteNav(props: Props): ReactElement {
   const [open, setOpen] = useState(false);
   const listId = useId();
 
+  // The disclosure control, so Escape can put focus back on it. A single-token name: the guard
+  // described above `Props` harvests every multi-token name this workspace declares, and "the
+  // control" is what this file calls the toggle throughout. The node it holds is read inside the
+  // key handler and nowhere else.
+  const control = useRef<HTMLButtonElement | null>(null);
+
   return (
     <nav
       aria-label={LANDMARK_LABEL}
@@ -178,9 +201,18 @@ export function SiteNav(props: Props): ReactElement {
       // Escape, handled where the focus already is. The guard on `open` keeps a key press with
       // nothing to close from queueing a state update that would change nothing.
       onKeyDown={(event) => {
-        if (open && event.key === CLOSE_KEY) {
-          setOpen(false);
+        if (!open || event.key !== CLOSE_KEY) {
+          return;
         }
+
+        // Focus first, close second. The key press usually comes from a link the stylesheet stops
+        // drawing the moment `data-open` turns to `'false'`, and React holds the state update
+        // until this handler returns, so the move lands while that link is still in the document;
+        // pressed on the control itself it simply keeps focus there. Optional chaining rather than
+        // an assertion: the ref holds a node only once the control has mounted, and a control the
+        // stylesheet is not drawing cannot take focus anyway.
+        control.current?.focus();
+        setOpen(false);
       }}
     >
       <div className={styles.inner}>
@@ -188,6 +220,10 @@ export function SiteNav(props: Props): ReactElement {
             this wrapper entirely above the breakpoint, where the list needs no control. */}
         <div className={styles.toggle}>
           <Button
+            // `Button` extends `ComponentPropsWithRef<'button'>` and spreads the rest of its props
+            // onto its `<button>`, so React 19 delivers this straight to the element and no
+            // `forwardRef` is involved.
+            ref={control}
             variant="ghost"
             size="sm"
             aria-expanded={open}

@@ -31,15 +31,15 @@
  *
  * Stability over motion
  * ---------------------------------------------------------------------------------------------
- * This component re-renders roughly four times a second while it is mounted, because the cart
- * context republishes its value on the shipping-eta ticker's cadence. That cadence is a property
- * of the application under observation and is intentionally left alone, which makes two rules
- * absolute here:
+ * Every figure in this panel is a number a shopper is checking rather than watching, and each one
+ * can change as the cart does - a subtotal, a shipping estimate, a dispatch countdown. That makes
+ * two rules absolute here:
  *
- *   1. No `transition` and no `animation`, on any property. A 250 ms republish against a
- *      transition on colour or width would read as a flicker rather than as an update, so this
- *      file introduces no motion at all - and consequently needs no reduced-motion override of
- *      its own (the baseline in `app/globals.css` covers anything that is not declared here).
+ *   1. No `transition` and no `animation`, on any property. A figure that changes while a
+ *      transition on colour or width is still running blends two amounts on screen and reads as
+ *      a flicker rather than as an update, so this file introduces no motion at all - and
+ *      consequently needs no reduced-motion override of its own (the baseline in
+ *      `app/globals.css` covers anything that is not declared here).
  *      Anything added later that *does* animate must be paired with
  *      `@media (prefers-reduced-motion: reduce)` in this file.
  *   2. `font-variant-numeric: tabular-nums` on every cell that can hold a number, so a subtotal

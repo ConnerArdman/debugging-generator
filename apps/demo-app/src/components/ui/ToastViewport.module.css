@@ -17,8 +17,8 @@
  * The region is 360px wide and parks itself exactly where the checkout summary's action column
  * sits. Without the `none`, an all-but-invisible rectangle would swallow clicks meant for the
  * storefront's own controls - the checkout submit among them - and the application would appear
- * to have an intermittent "the button does nothing" fault that has nothing to do with the
- * defects this demo exists to exhibit, while every automated interaction in that corner failed.
+ * to have an intermittent "the button does nothing" fault with no cause anywhere in the control
+ * that appeared to be broken, while every automated interaction in that corner failed.
  * The `auto` on each notice hands interaction back to the notice itself, so its dismiss control
  * still responds.
  *

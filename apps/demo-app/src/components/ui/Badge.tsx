@@ -19,8 +19,8 @@
  * sets two attributes and never indexes the styles object: a variant class would have to be read
  * through a computed key, which this repository's `noUncheckedIndexedAccess` types as
  * `string | undefined` and which hides a typo until the label renders unstyled in a browser. An
- * attribute is constrained by the prop union below, and it is legible in the elements tree -
- * which is what this application exists to be inspected with.
+ * attribute is constrained by the prop union below, and it is legible in the elements tree beside
+ * the class it qualifies.
  *
  * ACCESSIBILITY
  * No `role` and no `aria-label`: the label's text *is* the information, so it stays in the
@@ -31,13 +31,10 @@
  * follows the tone without a rule of its own.
  *
  * RENDER BEHAVIOUR
- * A plain function component: no `memo`, no memoised props, no state, no effects, and nothing
- * read from `window`, `Date.now()` or `Math.random()` while rendering, so the markup the server
- * sends and the markup the browser first produces always agree. It re-renders whenever its
- * parent does, deliberately: badges sit inside catalog cards, and this application's render
- * behaviour is the subject under investigation rather than something for a primitive to smooth
- * over. Holding no hooks, and no client directive either, also lets a server component and a
- * client component render it equally.
+ * A plain function component: no state, no effects, and nothing read from `window`, `Date.now()`
+ * or `Math.random()` while rendering, so the markup the server sends and the markup the browser
+ * first produces always agree. Holding no hooks, and no client directive either, also lets a
+ * server component and a client component render it equally.
  */
 
 import clsx from 'clsx';

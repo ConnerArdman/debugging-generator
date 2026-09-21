@@ -16,7 +16,10 @@
  * resolved against the `origin` the route handler read from its own request,
  * because a server-side `fetch` needs an absolute URL and this process is the
  * wrong place to guess a host - a port chosen at startup, a proxy or a
- * tunnelled address would each make a base URL written here wrong.
+ * tunnelled address would each make a base URL written here wrong. That origin
+ * is checked against `@/server/origin` before anything is addressed to it: it
+ * reaches this module from a request, and an amount to charge is not a thing to
+ * send wherever a request asked for it to be sent.
  *
  * The conventions of `@/lib/types` hold at both ends of the call. Money is an
  * integer number of US cents in a `*Cents` field, in the body sent as much as
@@ -49,6 +52,7 @@
 
 import type { PaymentAuthorization } from '@/lib/types';
 import { StorefrontUpstreamError, StorefrontValidationError } from '@/server/errors';
+import { trusted } from '@/server/origin';
 
 /**
  * How long the processor is given to answer, in milliseconds.
@@ -76,6 +80,13 @@ const UNREADABLE =
 
 /** The wording to show for a decline the processor gave no reason for. */
 const DECLINED = 'The payment was declined by the processor.';
+
+/**
+ * What a caller is told when the address it handed over is not one this store
+ * may reach itself at. No amount is authorized against it, and the wording
+ * repeats no part of the address: it came from the request in the first place.
+ */
+const MISADDRESSED = 'This request was not addressed to this store, so no payment was attempted.';
 
 /**
  * What to authorize: an amount, the currency it is counted in, and what the
@@ -170,12 +181,14 @@ function stamp(value: unknown): string | null {
  * @param input What to authorize; see {@link PaymentAuthorizationInput}.
  * @param origin The scheme and host this application is answering on - what a
  * route handler reads from its own request, such as `new URL(request.url).origin`.
- * The endpoint's path is resolved against it, so a value that is not an
- * absolute origin is a programming error and surfaces as one.
+ * The endpoint's path is resolved against it, so it is checked against
+ * `@/server/origin` first: an address this store may not reach itself at is
+ * refused before an amount is sent anywhere.
  *
  * @throws StorefrontValidationError when the amount is not a whole,
- * non-negative number of cents, the currency is not a three-letter code, or no
- * reference was given.
+ * non-negative number of cents, the currency is not a three-letter code, no
+ * reference was given, or the address handed over is not one this store may
+ * reach itself at.
  * @throws StorefrontUpstreamError when the processor could not be reached,
  * answered with a status outside the 2xx range, or answered with a body this
  * module could not read an outcome from.
@@ -210,6 +223,10 @@ export async function authorize(
 
   if (reference.length === 0) {
     throw new StorefrontValidationError('A payment attempt must name what it is being made for.');
+  }
+
+  if (!trusted(origin)) {
+    throw new StorefrontValidationError(MISADDRESSED);
   }
 
   const url = new URL('/api/mock/payment', origin);

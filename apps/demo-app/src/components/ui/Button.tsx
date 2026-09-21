@@ -13,9 +13,9 @@
  * several controls that are not its submit button - a stepper, a "remove", a "use this address" -
  * and any one of them left at the implicit default would post the form when pressed. That is not a
  * styling nicety: it is a phantom request in the middle of an interaction, arriving from a control
- * nobody pressed to submit anything, and it would be indistinguishable from the application's own
- * behaviour to whoever is trying to explain that interaction afterwards. So the attribute is always
- * emitted, always explicitly, and a submit button is the caller stating `type="submit"`.
+ * nobody pressed to submit anything, and at the route handling it, it is indistinguishable from a
+ * submission the shopper meant to make. So the attribute is always emitted, always explicitly, and
+ * a submit button is the caller stating `type="submit"`.
  *
  * THE BUSY STATE IS TRUTHFUL, AND IT IS NOT A LAYOUT EVENT
  * `busy` says that the request this control started has not finished. It holds the native
@@ -44,11 +44,11 @@
  * `[data-busy]`. So the two variant props are forwarded straight into attributes: a class map would
  * have to be read through a computed key, which this repository's `noUncheckedIndexedAccess` types
  * as `string | undefined` and which hides a typo until the control renders unstyled in a browser.
- * An attribute is constrained by the unions below, is legible in the elements tree - which is what
- * this application exists to be inspected with - and keeps every colour, space and type size in the
- * stylesheet's `--ls-*` tokens rather than in this file. Note that the stylesheet carries a
- * BLITZY [A11Y] flag of its own: the `sm` and `md` steps render below the 44x44px touch-target
- * guideline, implemented as the shared size contract specifies rather than silently enlarged here.
+ * An attribute is constrained by the unions below, is legible in the elements tree beside the class
+ * it qualifies, and keeps every colour, space and type size in the stylesheet's `--ls-*` tokens
+ * rather than in this file. Note that the stylesheet carries a BLITZY [A11Y] flag of its own: the
+ * `sm` and `md` steps render below the 44x44px touch-target guideline, implemented as the shared
+ * size contract specifies rather than silently enlarged here.
  *
  * DELIBERATELY NOT HERE
  * No `loading` alias for `busy`, no `as`/polymorphic prop, no icon prop and no link mode: an action
@@ -61,10 +61,6 @@
  * component renders it as happily as a client one, and a caller that passes `onClick` already
  * carries its own client boundary. Nothing is read from `window`, `Date.now()` or `Math.random()`
  * while rendering, so the markup the server sends and the markup the browser first produces agree.
- *
- * A plain function component: no `memo` and no memoised props. It re-renders whenever its parent
- * does, deliberately - this application's render behaviour is the subject under investigation, and
- * a primitive that smoothed it over would hide the very thing an observer came to see.
  */
 import clsx from 'clsx';
 import type { ComponentPropsWithRef } from 'react';

@@ -15,8 +15,8 @@
  * when the value it would send actually differs from the `quantity` prop, so tabbing through the
  * row, or blurring a field nobody edited, mutates nothing. That matters more here than it looks:
  * a cart mutation is a request, a re-render and a total to recompute, and a control that fired one
- * per character would put five of them on the wire for "12" and make the interaction under
- * investigation impossible to read.
+ * per character would put five of them on the wire for "12" - four of them for quantities the
+ * shopper never asked the cart to hold.
  *
  * WHO OWNS THE VALUE
  * The `quantity` prop is authoritative; the string in the field is a draft of the shopper's next
@@ -36,18 +36,14 @@
  *     quantity that is really in the cart rather than the number the shopper typed. A control that
  *     kept the typed text would be quietly lying about the cart's contents.
  *
- * NO MEMOIZATION, DELIBERATELY
- * No `memo`, no `useMemo`, no `useCallback`, no derived-state cache, and handlers that are new
- * functions on every render. `CartProvider` republishes its context value at
- * `ShippingEtaProvider`'s 250 ms cadence, so this control re-renders about four times a second
- * while the cart is open. That is AAP 0.8.2's second seeded defect propagating through exactly
- * this path, and it is the behaviour the tool under development is meant to find and explain:
- * memoizing here would damp the symptom in one component and hide it, which is a worse outcome
- * than the renders themselves. Local `useState` is the only hook in the file.
+ * WHAT IT HOLDS
+ * Local `useState` is the only hook in the file, twice over: the draft the field displays, and the
+ * `quantity` the reconciliation above compares against. No effect, no ref, no context read and no
+ * DOM read, so everything this control renders is a function of its props and those two values.
  *
  * Nothing here reads a clock, a random source, `window` or `document`, and nothing schedules a
- * timer, so the markup the server renders and the markup the browser first produces agree, and a
- * capture of this interaction records no hydration warning to explain away.
+ * timer, so the markup the server renders and the markup the browser first produces agree, and
+ * editing a quantity raises no hydration warning to explain away.
  *
  * APPEARANCE AND ACCESSIBILITY ARE BOTH SOMEONE ELSE'S
  * `./QuantityStepper.module.css` owns the layout and exports exactly four classes - `.root`,

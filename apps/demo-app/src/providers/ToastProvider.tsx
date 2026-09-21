@@ -21,6 +21,12 @@ import {
  * publishes the three operations that change them, and retires each notice
  * once its own deadline passes.
  *
+ * The queue is short on purpose: it never holds more than `TOAST_QUEUE_LIMIT`
+ * notices at once. A busy moment - a cart whose lines are each turned down by
+ * the stock check in turn - leaves the buyer with the newest few to read,
+ * rather than a stack that covers the page they are on and a screen reader
+ * working through a backlog of messages they can no longer act on.
+ *
  * It contributes no markup of its own. The visible corner region belongs to
  * `@/components/ui/ToastViewport`, which reads this context and is mounted
  * once by the root layout, so a notice raised anywhere in the application
@@ -65,11 +71,18 @@ export interface ToastInput {
 
 /** The queue and its operations, as published on the context. */
 export interface ToastCenter {
-  /** Oldest notice first, which is the order the viewport lists them in. */
+  /**
+   * Oldest notice first, which is the order the viewport lists them in, and
+   * never more than `TOAST_QUEUE_LIMIT` of them: past that, the newest
+   * notices are the ones the buyer is left with.
+   */
   readonly toasts: readonly StoreToast[];
   /** Queues a notice and returns the id it was given. */
   readonly showToast: (input: ToastInput) => string;
-  /** Retires one notice early. An id that is no longer queued is ignored. */
+  /**
+   * Retires one notice early. An id that is no longer queued is ignored,
+   * whether it retired on its own deadline or newer notices took its place.
+   */
   readonly dismissToast: (id: string) => void;
   /** Empties the queue, for a route change that makes every notice stale. */
   readonly clearToasts: () => void;
@@ -83,6 +96,15 @@ export interface ToastProviderProps {
 
 /** The lifetime a notice gets when neither the caller nor the mount says. */
 export const TOAST_AUTO_DISMISS_MS: number = 5000;
+
+/**
+ * The most notices the queue holds at once. Four stack in the corner without
+ * reaching across the page the buyer is reading, and once a fifth arrives the
+ * newest four are the ones kept: the notice that has been on screen longest
+ * makes room for the one describing what just happened. The value has to be
+ * at least 1, or a notice would have nowhere to be shown at all.
+ */
+export const TOAST_QUEUE_LIMIT: number = 4;
 
 /**
  * The published queue, or `null` outside a `<ToastProvider>` - which is the
@@ -141,7 +163,18 @@ export function ToastProvider({
         expiresAt: Date.now() + noticeLifetimeMs,
       };
 
-      setToasts((current) => [...current, queued]);
+      setToasts((current) => {
+        const queue = [...current, queued];
+
+        // The queue is read oldest first, so the notices that make room are
+        // taken off the front: what stays is the newest `TOAST_QUEUE_LIMIT`,
+        // in the order they were raised. A notice dropped this way is gone
+        // exactly as if its deadline had passed - its deadline no longer
+        // matters, and `dismissToast` on its id finds nothing to retire.
+        return queue.length <= TOAST_QUEUE_LIMIT
+          ? queue
+          : queue.slice(queue.length - TOAST_QUEUE_LIMIT);
+      });
 
       return id;
     },
@@ -152,7 +185,8 @@ export function ToastProvider({
     setToasts((current) => {
       const remaining = current.filter((toast) => toast.id !== id);
 
-      // An id that already retired itself leaves the queue exactly as it was.
+      // An id that already retired itself, or whose notice newer ones pushed
+      // out of the queue, leaves the queue exactly as it was.
       return remaining.length === current.length ? current : remaining;
     });
   }, []);

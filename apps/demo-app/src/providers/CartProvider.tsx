@@ -9,7 +9,14 @@ import {
   type ReactNode,
 } from 'react';
 
-import { addCartItem, loadCartContents, StorefrontApiError } from '@/lib/api-client';
+import {
+  addCartItem,
+  clearCartContents,
+  loadCartContents,
+  removeCartItem,
+  setCartItemQuantity,
+  StorefrontApiError,
+} from '@/lib/api-client';
 import { formatPriceLabel } from '@/lib/format';
 import type { CartItemDraft, CartLine, CartView } from '@/lib/types';
 
@@ -73,33 +80,31 @@ export interface CartContextValue {
   readonly cartError: string | null;
   /** Puts a quantity of one product into the cart, then publishes the cart the server answers. */
   readonly addLine: (draft: CartItemDraft) => Promise<void>;
-  /** Sets one line's quantity; a quantity of zero or less takes the line out of the cart. */
-  readonly setLineQuantity: (lineId: string, quantity: number) => void;
-  /** Takes one line out of the cart. A line that is no longer held is ignored. */
-  readonly removeLine: (lineId: string) => void;
-  /** Takes every line out of the cart, for a buyer starting their order again. */
-  readonly emptyCart: () => void;
+  /**
+   * Sets one line's quantity on the server, then publishes the cart it answers. A quantity of zero
+   * or less takes the line out of the cart, which is the write `removeLine` performs. The promise
+   * rejects when the server refused the change, once the failure has been published on `cartError`.
+   */
+  readonly setLineQuantity: (lineId: string, quantity: number) => Promise<void>;
+  /**
+   * Takes one line out of the cart on the server, then publishes the cart it answers. A line this
+   * cart no longer holds is a change the server refuses, so the promise rejects - once the failure
+   * has been published on `cartError` - rather than reporting a removal that removed nothing.
+   */
+  readonly removeLine: (lineId: string) => Promise<void>;
+  /**
+   * Takes every line out of the cart on the server, then publishes the cart it answers, for a
+   * buyer starting their order again. A cart that is already empty is emptied successfully; the
+   * promise rejects when the server refused the change, once the failure has been published on
+   * `cartError`.
+   */
+  readonly emptyCart: () => Promise<void>;
   /** Reads the cart from the server again, replacing what is published. */
   readonly refreshCart: () => Promise<void>;
 }
 
 export interface CartProviderProps {
   readonly children: ReactNode;
-}
-
-/** The line at `quantity`, priced at the unit price the server captured it with. */
-function repricedLine(line: CartLine, quantity: number): CartLine {
-  return { ...line, quantity, lineTotalCents: line.unitPriceCents * quantity };
-}
-
-/** `cart` holding `lines` in place of its own, with the two totals that follow from them. */
-function cartWithLines(cart: CartView, lines: CartLine[]): CartView {
-  return {
-    ...cart,
-    lines,
-    itemCount: lines.reduce((total, line) => total + line.quantity, 0),
-    subtotalCents: lines.reduce((total, line) => total + line.lineTotalCents, 0),
-  };
 }
 
 /** The whole number of units `quantity` asks for: a fraction rounds down, anything unusable 0. */
@@ -187,9 +192,28 @@ export function CartProvider({ children }: CartProviderProps): ReactElement {
     setCartError(cartFailureText(cause));
   }
 
+  /**
+   * Publishes `cause` as the cart's failure and then hands it back to the caller that asked for the
+   * change.
+   *
+   * A refused change is reported in both directions on purpose. The cart publishes it, so every
+   * surface reading `cartError` shows wording a buyer can act on; and the promise the caller is
+   * holding rejects, so the control that asked - a quantity stepper, a remove button - learns that
+   * the line in front of it was not changed and can say so where the buyer is looking instead of
+   * confirming a change the server refused.
+   *
+   * `addLine` deliberately does not go through here: its callers watch `cartError` and announce a
+   * refusal from there, and they expect its promise to settle whatever the server answered.
+   */
+  function raiseCartFailure(cause: unknown): never {
+    reportCartFailure(cause);
+
+    throw cause;
+  }
+
   // The cart lives on the server, so the browser reads it once, when the application starts. It is
-  // never read again on its own: each operation below either writes through to the server and
-  // publishes the cart it answered with, or edits the published lines here in the browser.
+  // never read again on its own: every operation below writes through to the server and publishes
+  // the cart it answered with, which is the cart checkout will price the order from.
   useEffect(() => {
     let cancelled = false;
 
@@ -238,42 +262,50 @@ export function CartProvider({ children }: CartProviderProps): ReactElement {
     }
   }
 
-  function setLineQuantity(lineId: string, quantity: number): void {
+  async function setLineQuantity(lineId: string, quantity: number): Promise<void> {
     const wanted = requestedQuantity(quantity);
 
-    setCart((current) => {
-      if (current === null) {
-        return current;
-      }
+    setSyncStatus('saving');
+    setCartError(null);
 
-      // Asking for none of a product is the same as taking its line out of the cart.
-      if (wanted === 0) {
-        return cartWithLines(
-          current,
-          current.lines.filter((line) => line.id !== lineId),
-        );
-      }
+    try {
+      // Asking for none of a product is the same as taking its line out of the cart, and the
+      // endpoint's set operation holds a line at one unit or more, so a normalised 0 is a removal.
+      const saved =
+        wanted === 0
+          ? await removeCartItem(lineId)
+          : await setCartItemQuantity({ lineId, quantity: wanted });
 
-      return cartWithLines(
-        current,
-        current.lines.map((line) => (line.id === lineId ? repricedLine(line, wanted) : line)),
-      );
-    });
+      publishServerCart(saved);
+    } catch (cause) {
+      raiseCartFailure(cause);
+    }
   }
 
-  function removeLine(lineId: string): void {
-    setCart((current) =>
-      current === null
-        ? current
-        : cartWithLines(
-            current,
-            current.lines.filter((line) => line.id !== lineId),
-          ),
-    );
+  async function removeLine(lineId: string): Promise<void> {
+    setSyncStatus('saving');
+    setCartError(null);
+
+    try {
+      const saved = await removeCartItem(lineId);
+
+      publishServerCart(saved);
+    } catch (cause) {
+      raiseCartFailure(cause);
+    }
   }
 
-  function emptyCart(): void {
-    setCart((current) => (current === null ? current : cartWithLines(current, [])));
+  async function emptyCart(): Promise<void> {
+    setSyncStatus('saving');
+    setCartError(null);
+
+    try {
+      const saved = await clearCartContents();
+
+      publishServerCart(saved);
+    } catch (cause) {
+      raiseCartFailure(cause);
+    }
   }
 
   const lines = cart?.lines ?? [];

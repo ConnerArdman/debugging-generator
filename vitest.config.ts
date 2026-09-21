@@ -422,7 +422,22 @@ export default defineConfig({
       // `check-no-hardcoding`) ship their own tests, and AAP 0.7.1 Group 0
       // requires `pnpm test` to run them, so they get a project of their own.
       // They are `.mjs` because the scripts they test are plain Node ESM.
-      nodeProject('tooling', ['scripts/*.test.mjs']),
+      //
+      // `scripts/*.test.mjs` is named first because AAP 0.7.1 Group 0 names it;
+      // the two workspace-root globs extend the same project to the build
+      // scripts that live beside a workspace manifest rather than under
+      // `scripts/` - today `packages/telemetry/esbuild.agent.test.mjs` and
+      // `esbuild.node.test.mjs`, which cover the exit-code contract of the two
+      // esbuild drivers. A `*.test.mjs` at a workspace ROOT is by construction
+      // a plain-Node build-script suite: every product suite is TypeScript
+      // under `src/**` or `test/**`, so nothing else can match, and these
+      // belong with the guard-script tests rather than in a project of their
+      // own. Only the root level is matched (`packages/*/` and `apps/*/`, not
+      // `**`), so a `.mjs` fixture deeper in a workspace stays uncollected.
+      // Leaving these suites out of every include glob is what let the build
+      // scripts' precondition branches - the exit codes a successful CI build
+      // never reaches - go untested.
+      nodeProject('tooling', ['scripts/*.test.mjs', 'packages/*/*.test.mjs', 'apps/*/*.test.mjs']),
     ],
   },
 });

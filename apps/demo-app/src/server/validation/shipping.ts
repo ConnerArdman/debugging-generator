@@ -103,6 +103,16 @@ export const shippingQuoteQuerySchema = z.object({
    * refuse: it matches no serviceable destination and is answered as one,
    * whereas punctuation, quoting and path junk are refused here, before the
    * value travels on as a lookup key.
+   *
+   * Three to twelve characters in alphanumeric groups joined by single spaces
+   * or hyphens is the one shape this storefront holds a destination to, and
+   * every surface a destination arrives on states it identically: the checkout
+   * body's address field is written to this very rule. Each surface keeps its
+   * own copy rather than importing another's, because the modules of this
+   * folder deliberately do not depend on each other, and writing the rule twice
+   * is the price of that independence. Letting the two copies drift apart is
+   * not: a destination one surface accepted and the other refused would be a
+   * request the storefront took and then could not act on.
    */
   postalCode: z
     .string()
@@ -132,11 +142,20 @@ export const shippingQuoteQuerySchema = z.object({
    * packages the shipment is made up of.
    *
    * At least one, because a shipment of nothing is not a shipment, and at most
-   * a thousand, which is far more units than a cart holds and keeps the figure
-   * a count. One unit is the default, so a caller naming only a destination is
-   * quoted on the smallest shipment this store sends.
+   * five hundred, which is the largest consignment the services offered at
+   * checkout rate as one shipment. The ceiling is a refusal rather than a cap:
+   * a larger order travels as more than one shipment and is quoted once per
+   * shipment, so quoting it here as five hundred pieces would answer with the
+   * cost of a shipment nobody is sending. One unit is the default, so a caller
+   * naming only a destination is quoted on the smallest shipment this store
+   * sends.
    */
-  itemCount: z.coerce.number().int().min(1).max(1_000).default(1),
+  itemCount: z.coerce
+    .number()
+    .int()
+    .min(1)
+    .max(500, 'A shipment carries at most 500 units; a larger order ships as more than one.')
+    .default(1),
 
   /**
    * Which tier of service to quote around, named as the persisted quote records

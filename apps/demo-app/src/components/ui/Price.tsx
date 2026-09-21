@@ -40,7 +40,7 @@
  * object: a computed key is typed `string | undefined` under this repository's
  * `noUncheckedIndexedAccess` and hides a typo until the figure renders unstyled in a browser,
  * whereas an attribute is constrained by the prop unions below and is legible in the elements
- * tree - which is what this application exists to be inspected with.
+ * tree beside the class it qualifies.
  *
  * `data-size` and `data-tone` are always written, because the stylesheet describes `md` and
  * `default` in its base rule and a second declaration of either would be one more place to drift.
@@ -59,13 +59,10 @@
  * markup, beside the struck figure.
  *
  * RENDER BEHAVIOUR
- * A plain function component: no `memo`, no `useMemo`, no `useCallback`, no state, no effects,
- * and nothing read from `window`, `Date.now()` or `Math.random()` while rendering, so the markup
- * the server sends and the markup the browser first produces always agree. It re-renders whenever
- * its parent does, deliberately: prices sit inside cart lines and catalog cards whose re-render
- * behaviour is the subject under investigation in this application, and a memoized figure would
- * hide exactly the cadence an investigation is trying to observe. Holding no hooks, and no client
- * directive either, also lets a server component and a client component render it equally.
+ * A plain function component: no state, no effects, and nothing read from `window`, `Date.now()`
+ * or `Math.random()` while rendering, so the markup the server sends and the markup the browser
+ * first produces always agree. Holding no hooks, and no client directive either, also lets a
+ * server component and a client component render it equally.
  */
 
 import clsx from 'clsx';

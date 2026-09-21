@@ -49,7 +49,7 @@
  *   blocking `pnpm test` gate.
  */
 
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, expectTypeOf, it, vi } from 'vitest';
 
 import { DebuggenError } from './errors.js';
 import {
@@ -73,6 +73,24 @@ import {
   type SpanId,
   type TraceId,
 } from './ids.js';
+// The nine opaque id aliases come from the package's public entry rather than
+// from `./ids.js`, because that is the specifier every consumer writes: the
+// local service, both extensions, the page agent and the Node preload all
+// reach these types through `@debuggen/shared`, whose `.` export resolves to
+// this barrel. Importing them here is what makes both hops — the declaration
+// and its re-export — a tested contract rather than an assumption; see the
+// type-surface suite at the end of this file.
+import type {
+  ActionId,
+  AnalysisId,
+  CaptureId,
+  EventId,
+  MessageId,
+  ModificationId,
+  PanelId,
+  ProducerId,
+  SessionId,
+} from './index.js';
 
 /*
  * ---------------------------------------------------------------------------
@@ -1030,5 +1048,108 @@ describe('rendering random bytes as an identifier', () => {
     expect(id).toBe('0001020304050607');
     expect(isSpanId(id)).toBe(true);
     expect(id).not.toBe('0'.repeat(SPAN_ID_LENGTH));
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The exported type surface
+ *
+ * `ids.ts` exports eleven type aliases alongside its generators, and they are
+ * how a signature elsewhere says which identifier it means — the consumers
+ * this module's own overview names: the message envelope's `MessageId` in
+ * `@debuggen/protocol`, action and modification ids in
+ * `@debuggen/instrumentation`, and the session, capture, panel and analysis
+ * ids that `apps/local-service` also uses as store primary keys. Every runtime
+ * suite above would pass unchanged if one of those `export` modifiers were
+ * dropped or an alias renamed, because types are erased before Vitest ever
+ * runs the file.
+ *
+ * The assertions below are therefore compile-time, checked by `tsc -b`
+ * (`pnpm typecheck`) because `packages/shared/tsconfig.json` includes the
+ * colocated tests in the program. Two things have teeth:
+ *
+ * - **The imports.** Removing an `export`, renaming an alias or dropping it
+ *   from the barrel is a compile error in this file.
+ * - **The exact return types.** Each alias resolves to `string` today, so a
+ *   pin against the alias and a pin against `string` agree — but they stop
+ *   agreeing the moment an alias becomes a branded or narrowed type, and this
+ *   is where a generator that still returns a bare string fails. `newId` is
+ *   pinned to plain `string` for the same reason from the other direction: it
+ *   takes an arbitrary prefix, so it has no entity type to promise.
+ * ---------------------------------------------------------------------------
+ */
+
+describe('the exported identifier type surface', () => {
+  it('types each opaque generator as the alias its consumers import', () => {
+    expectTypeOf(newSessionId).returns.toEqualTypeOf<SessionId>();
+    expectTypeOf(newCaptureId).returns.toEqualTypeOf<CaptureId>();
+    expectTypeOf(newPanelId).returns.toEqualTypeOf<PanelId>();
+    expectTypeOf(newAnalysisId).returns.toEqualTypeOf<AnalysisId>();
+    expectTypeOf(newModificationId).returns.toEqualTypeOf<ModificationId>();
+    expectTypeOf(newActionId).returns.toEqualTypeOf<ActionId>();
+    expectTypeOf(newEventId).returns.toEqualTypeOf<EventId>();
+    expectTypeOf(newMessageId).returns.toEqualTypeOf<MessageId>();
+    expectTypeOf(newProducerId).returns.toEqualTypeOf<ProducerId>();
+
+    // The runtime witnesses: each annotation is the assertion — a generator
+    // whose result no longer satisfies its alias fails to compile here — and
+    // the shared pattern check proves the annotated values are the real ids
+    // rather than a type-level fiction.
+    const sessionId: SessionId = newSessionId();
+    const captureId: CaptureId = newCaptureId();
+    const panelId: PanelId = newPanelId();
+    const analysisId: AnalysisId = newAnalysisId();
+    const modificationId: ModificationId = newModificationId();
+    const actionId: ActionId = newActionId();
+    const eventId: EventId = newEventId();
+    const messageId: MessageId = newMessageId();
+    const producerId: ProducerId = newProducerId();
+    const minted = [
+      sessionId,
+      captureId,
+      panelId,
+      analysisId,
+      modificationId,
+      actionId,
+      eventId,
+      messageId,
+      producerId,
+    ];
+
+    expect(minted).toHaveLength(idKinds().length);
+    expect(minted.filter((id) => !OPAQUE_ID_PATTERN.test(id))).toEqual([]);
+  });
+
+  it('types the W3C generators as TraceId and SpanId, and newId as a plain string', () => {
+    expectTypeOf(newTraceId).returns.toEqualTypeOf<TraceId>();
+    expectTypeOf(newSpanId).returns.toEqualTypeOf<SpanId>();
+    // `newId` is the escape hatch for a prefix `ID_PREFIXES` does not name, so
+    // it promises the shape and no entity identity.
+    expectTypeOf(newId).returns.toEqualTypeOf<string>();
+    expectTypeOf(newId).parameters.toEqualTypeOf<[string]>();
+
+    const traceId: TraceId = newTraceId();
+    const spanId: SpanId = newSpanId();
+
+    expect(traceId).toMatch(TRACE_ID_PATTERN);
+    expect(spanId).toMatch(SPAN_ID_PATTERN);
+  });
+
+  it('types the guards as predicates over those aliases', () => {
+    const candidate: unknown = newTraceId();
+
+    expectTypeOf(isTraceId).parameters.toEqualTypeOf<[unknown]>();
+    expectTypeOf(isSpanId).parameters.toEqualTypeOf<[unknown]>();
+
+    if (isTraceId(candidate)) {
+      // Narrowing to the alias, not to `string`: a guard that regressed to
+      // `boolean` would leave `candidate` as `unknown` and fail to compile.
+      const narrowed: TraceId = candidate;
+
+      expect(narrowed).toMatch(TRACE_ID_PATTERN);
+    } else {
+      expect.unreachable('a freshly generated trace id must satisfy isTraceId');
+    }
   });
 });

@@ -5,9 +5,22 @@
  * checkout - the order together with every one of its lines, in one
  * transaction, so a customer is never left with a charge recorded against half
  * an order - and a customer's orders are read back for the history view and
- * for the confirmation screen. No stock is moved and no cart is touched: an
- * order is a record of what was bought, and the modules that own inventory and
- * carts own the rest of what placing one means.
+ * for the confirmation screen. No stock is moved: an order is a record of what
+ * was bought, and the module that owns inventory owns that part of what placing
+ * one means.
+ *
+ * A cart, on the other hand, is finished by the order it became, so the cart is
+ * this module's business at two moments and no others. {@link claim} takes a
+ * cart out of the session's hands before a checkout starts spending money
+ * against it, and it is the reason two checkouts of one cart cannot both reach
+ * a carrier or a processor: exactly one of them takes it, because taking it is
+ * a single conditional write that one caller wins. {@link unclaim} puts it back
+ * when the checkout it was taken for did not finish, so a customer whose
+ * payment was declined still has their cart. The cart's last transition, to
+ * `CONVERTED`, happens inside the transaction that writes the order, which is
+ * what makes a cart and the order it became one fact rather than two: there is
+ * no moment at which an order exists and its cart is still orderable, and no
+ * second order can be written from a cart that has already become one.
  *
  * Everything returned is stated in the shapes of `@/lib/types` rather than in
  * database rows, so a page, a route handler and a client component all read an
@@ -84,6 +97,18 @@ export interface OrderDraft {
   address: ShippingAddress;
   /** The lines to write, priced. */
   lines: readonly PricedLine[];
+  /**
+   * The cart this order was assembled from, which becomes `CONVERTED` in the
+   * same transaction the order is written in.
+   */
+  cart: string;
+  /**
+   * The quote the freight was charged at, as `./shipping.service` recorded it.
+   * That quote is put on the order rather than whichever quote for the cart was
+   * taken most recently, so a re-read order shows the service its customer
+   * actually chose.
+   */
+  quote: string;
   /** The shipping service the customer chose. */
   option: ShippingOption;
   /** How the payment resolved, which decides the status the order opens in. */
@@ -144,7 +169,6 @@ type Item = {
 
 /** The quote columns the detail query selects, one per shipping service recorded. */
 type Quote = {
-  id: string;
   carrierCode: string;
   serviceLevel: string;
   amountCents: number;
@@ -212,6 +236,12 @@ function mint(at: Date): string {
  * @throws StorefrontConflictError When its figures disagree with one another.
  */
 function check(input: OrderDraft): void {
+  if (input.cart.length === 0 || input.quote.length === 0) {
+    throw new StorefrontValidationError(
+      'An order has to name the cart it was assembled from and the quote its freight was charged at.',
+    );
+  }
+
   if (input.lines.length === 0) {
     throw new StorefrontValidationError('An order needs at least one item. Your cart is empty.');
   }
@@ -340,6 +370,10 @@ function lines(items: readonly Item[]): OrderLine[] {
  * reads them in. The label is the carrier and the service together, because
  * that is what the store printed on the order and neither alone identifies the
  * service the customer bought.
+ *
+ * The identifier is the service's own rather than the quote row's, so an order
+ * read back names the service the same way the checkout that placed it named
+ * the service it chose.
  */
 function service(quotes: readonly Quote[]): ShippingOption | null {
   const quote = quotes.at(0);
@@ -349,7 +383,7 @@ function service(quotes: readonly Quote[]): ShippingOption | null {
   }
 
   return {
-    id: quote.id,
+    id: quote.serviceLevel,
     carrier: quote.carrierCode,
     service: quote.serviceLevel,
     label: `${quote.carrierCode} ${quote.serviceLevel}`,
@@ -388,6 +422,58 @@ function blank(): ShippingAddress {
 }
 
 /**
+ * Takes a cart for a checkout, and answers only to the caller that got it.
+ *
+ * A checkout spends real money on the strength of a cart: it holds stock, asks
+ * a carrier to rate a shipment and asks a processor to approve an amount. Two
+ * checkouts of one cart doing that at the same time is two charges for one
+ * order, and the cart is the thing they have in common, so the cart is what
+ * they compete for. The competition is a single conditional write, which the
+ * database settles: whichever caller finds the cart still open takes it out of
+ * the session's hands, and the other finds it taken and is told so before it
+ * has spent anything.
+ *
+ * A cart in that state is neither being shopped nor ordered, and a checkout
+ * that ends without either finishing or putting it back has abandoned it -
+ * which is what it reads as afterwards. {@link unclaim} is how a checkout that
+ * failed puts it back.
+ *
+ * @param id The cart to take.
+ * @throws StorefrontConflictError When the cart is not open to be taken -
+ * another checkout holds it, or it has already become an order.
+ */
+export async function claim(id: string): Promise<void> {
+  const taken = await prisma.cart.updateMany({
+    where: { id, status: 'ACTIVE' },
+    data: { status: 'ABANDONED' },
+  });
+
+  if (taken.count === 0) {
+    throw new StorefrontConflictError(
+      'This cart is already being checked out. Wait for that order to finish, or open your cart again.',
+    );
+  }
+}
+
+/**
+ * Puts a cart back in the session's hands after a checkout did not finish.
+ *
+ * The condition matters as much as the write: only a cart a checkout is holding
+ * is put back, so this cannot reopen one that has already become an order, and
+ * a caller recovering from a failure does not have to work out which of the two
+ * happened. A cart that was never taken, or has since been converted, is left
+ * exactly as it is.
+ *
+ * @param id The cart to put back.
+ */
+export async function unclaim(id: string): Promise<void> {
+  await prisma.cart.updateMany({
+    where: { id, status: 'ABANDONED' },
+    data: { status: 'ACTIVE' },
+  });
+}
+
+/**
  * Writes a placed order and answers with it.
  *
  * The order and its lines are one unit of work: both are written inside a
@@ -408,14 +494,26 @@ function blank(): ShippingAddress {
  * settle. Nothing else about the order is decided here - the figures are the
  * draft's, checked rather than adjusted.
  *
+ * Three writes share that transaction, and each of the other two is conditional
+ * on something the order depends on still being true. The cart the order was
+ * assembled from becomes `CONVERTED`, and a cart that has already become an
+ * order is not converted again - so a second attempt at the same cart writes no
+ * second order, whatever it was told earlier in the checkout. The quote the
+ * freight was charged at becomes this order's, by identifier, and a quote
+ * already belonging to another order is not taken from it. Either condition
+ * failing rolls the order back with it: the cart, the quote and the order are
+ * one fact.
+ *
  * @param input Everything the checkout assembled: the customer, the
- * destination, the priced lines, the chosen service, the payment and the
- * figures they add up to.
+ * destination, the priced lines, the cart they came from, the quote the freight
+ * was charged at, the chosen service, the payment and the figures they add up
+ * to.
  * @returns The order as it was written, with its lines, the service it ships by
  * and the destination the draft carried.
  * @throws StorefrontValidationError When the draft is not a recordable order.
  * @throws StorefrontConflictError When the draft's figures disagree with one
- * another or with the amount approved for payment.
+ * another or with the amount approved for payment, when the cart has already
+ * become an order, or when the quote is not one this order can be placed on.
  */
 export async function recordOrder(input: OrderDraft): Promise<OrderDetail> {
   check(input);
@@ -434,6 +532,23 @@ export async function recordOrder(input: OrderDraft): Promise<OrderDetail> {
       update: {},
       select: { id: true },
     });
+
+    // The cart is finished here, and the condition is what makes writing this
+    // order safe: a cart that has already become an order is not converted a
+    // second time, the count says so, and the order this call was about to
+    // write is rolled back with it. The account it was checked out under goes
+    // on the cart at the same time, which is how a cart a visitor filled
+    // anonymously ends up attached to the customer who bought it.
+    const converted = await tx.cart.updateMany({
+      where: { id: input.cart, status: { not: 'CONVERTED' } },
+      data: { status: 'CONVERTED', customerId: account.id },
+    });
+
+    if (converted.count === 0) {
+      throw new StorefrontConflictError(
+        'That cart has already been ordered. Open the order it became rather than placing it again.',
+      );
+    }
 
     const order = await tx.order.create({
       data: {
@@ -479,6 +594,21 @@ export async function recordOrder(input: OrderDraft): Promise<OrderDetail> {
         },
       },
     });
+
+    // The quote the freight was charged at becomes this order's, and only that
+    // one: naming it by identifier is what keeps a re-read order showing the
+    // service its customer chose rather than a later quote for the same cart.
+    // A quote already on another order is not taken from it.
+    const quoted = await tx.shippingQuote.updateMany({
+      where: { id: input.quote, orderId: null },
+      data: { orderId: order.id },
+    });
+
+    if (quoted.count === 0) {
+      throw new StorefrontConflictError(
+        'The shipping quote this order was priced from is no longer available to place it on. Choose a service and place the order again.',
+      );
+    }
 
     return order;
   });
@@ -598,7 +728,6 @@ export async function readOrderDetail(id: string): Promise<OrderDetail> {
       },
       shippingQuotes: {
         select: {
-          id: true,
           carrierCode: true,
           serviceLevel: true,
           amountCents: true,

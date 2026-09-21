@@ -91,7 +91,9 @@
 
 /* The route list. `SiteNav.tsx` keeps it mounted at every width and reports the disclosure state
  * in `data-open`, so visibility is decided here instead of by unmounting - which is what keeps
- * the toggle's `aria-controls` pointing at an element that exists. */
+ * the toggle's `aria-controls` pointing at an element that exists. Escape is safe against the
+ * `data-open='false'` rule below because `SiteNav.tsx` moves focus to the control before it writes
+ * that attribute, so that path never leaves focus on an element this rule stops drawing. */
 .list {
   display: flex;
   min-width: 0;

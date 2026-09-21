@@ -103,7 +103,7 @@ const MAX_ADDRESS_LINE_LENGTH = 120;
 const MAX_CITY_LENGTH = 80;
 const MAX_REGION_LENGTH = 80;
 const MIN_POSTAL_CODE_LENGTH = 3;
-const MAX_POSTAL_CODE_LENGTH = 16;
+const MAX_POSTAL_CODE_LENGTH = 12;
 const MAX_NOTES_LENGTH = 500;
 
 /**
@@ -117,8 +117,12 @@ const MAX_NOTES_LENGTH = 500;
  */
 const EMAIL_SHAPE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-/** Letters, digits, spaces and hyphens, as a postal code is written in the regions this store serves. */
-const POSTAL_CODE_SHAPE = /^[A-Za-z0-9][A-Za-z0-9 -]*$/;
+/**
+ * Alphanumeric groups joined by single spaces or hyphens, as a postal code is written in the
+ * regions this store serves - and the shape `shippingAddressSchema` holds the same field to, so a
+ * destination this form accepts is one the endpoint accepts and one the freight quote can rate.
+ */
+const POSTAL_CODE_SHAPE = /^[A-Za-z0-9]+(?:[ -][A-Za-z0-9]+)*$/;
 
 /** Two upper-case letters, the one canonical form the address DTO carries a country in. */
 const COUNTRY_CODE_SHAPE = /^[A-Z]{2}$/;
@@ -356,7 +360,8 @@ function collectFieldErrors(draft: CheckoutDraft): CheckoutFieldErrors {
   } else if (address.postalCode.length > MAX_POSTAL_CODE_LENGTH) {
     problems.postalCode = `Keep the postal code to ${MAX_POSTAL_CODE_LENGTH} characters.`;
   } else if (!POSTAL_CODE_SHAPE.test(address.postalCode)) {
-    problems.postalCode = 'A postal code holds letters, digits, spaces and hyphens.';
+    problems.postalCode =
+      'A postal code holds letters and digits in groups separated by single spaces or hyphens.';
   }
 
   if (!COUNTRY_CODE_SHAPE.test(address.country)) {

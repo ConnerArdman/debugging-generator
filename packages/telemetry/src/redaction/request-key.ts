@@ -100,8 +100,16 @@ import { decodeQueryComponent, parseQueryPairs, parseUrlParts } from './url.js';
  * cannot be compared by accident, and a capture keyed under one layout stays
  * internally consistent. Bump this only together with a layout change, and
  * treat the two as one edit.
+ *
+ * `v2` tags the layout {@link buildRequestKeyMessage} documents: four
+ * newline-separated parts whose every variable member is JSON-encoded, so no
+ * member can contain the delimiter that frames it. `v1` joined those members
+ * with bare `\n`, `&` and `=`, which its own components could contain, and so
+ * gave two structurally different requests one digest — the condition this
+ * module exists to prevent. Nothing keyed under `v1` can be compared with a
+ * `v2` key, which is the point of the tag.
  */
-export const REQUEST_KEY_MESSAGE_VERSION = 'v1';
+export const REQUEST_KEY_MESSAGE_VERSION = 'v2';
 
 /**
  * Length in bytes of a per-session key: 32, rendered as 64 hex characters.
@@ -198,6 +206,50 @@ function compareCanonicalPairs(left: CanonicalPair, right: CanonicalPair): numbe
 }
 
 /**
+ * The single delimiter between the canonical message's four parts.
+ *
+ * Newline rather than a printable character so that a message read in a test
+ * failure or a local trace is legible line by line. It is safe as a delimiter
+ * only because every variable part is written by
+ * {@link encodeCanonicalPart}, whose output cannot contain it.
+ */
+const MESSAGE_PART_DELIMITER = '\n';
+
+/**
+ * Writes one variable part of the canonical message so that it cannot be
+ * confused with another part, or with a different value in the same part.
+ *
+ * `JSON.stringify` is the encoder, and the choice carries three properties the
+ * message depends on:
+ *
+ * - **Injective.** `JSON.parse` inverts it, so two distinct inputs can never
+ *   share an encoding. That is the whole requirement: a digest identifies a
+ *   request only if the string behind it does. Canonical percent-encoding
+ *   would also be injective but cannot be used here — `encodeURIComponent`
+ *   throws `URIError` on a lone surrogate, and this function runs on every
+ *   captured request while the module's contract is that no input throws.
+ *   Well-formed `JSON.stringify` escapes such a code unit instead (ES2019),
+ *   so it is total where the alternative is not.
+ * - **Deterministic.** ECMA-262 fixes the escaping completely: `"` and `\`,
+ *   the C0 controls as `\n`, `\t` and the rest, anything else below `0x20` as
+ *   a four-digit lowercase `\uXXXX`. Two machines, or one machine before and
+ *   after a runtime upgrade, therefore encode a value identically — the same
+ *   reason {@link compareCanonicalPairs} compares code units rather than
+ *   consulting a locale. A stored key stays comparable with a freshly computed
+ *   one.
+ * - **Newline-free.** An encoded part cannot contain the delimiter that frames
+ *   it, which is what makes the message's four-part arity an invariant rather
+ *   than a hope.
+ *
+ * @param part - A method, a path, or the sorted pair list. Never logged: this
+ * is pre-redaction material.
+ * @returns The part as a JSON value, ready to be joined into the message.
+ */
+function encodeCanonicalPart(part: string | readonly CanonicalPair[]): string {
+  return JSON.stringify(part);
+}
+
+/**
  * Builds the exact string {@link computeRequestKey} authenticates.
  *
  * Pure, synchronous and free of crypto, so a test can assert the canonical
@@ -206,29 +258,34 @@ function compareCanonicalPairs(left: CanonicalPair, right: CanonicalPair): numbe
  *
  * ## The layout
  *
- * Four parts, joined by newlines:
+ * Four parts joined by newlines. Every part after the version tag is written
+ * by {@link encodeCanonicalPart}, so no part can contain the delimiter that
+ * frames it and no part can be mistaken for another:
  *
  * ```text
- * <version>\n<METHOD>\n<path>\n<key>=<value>&<key>=<value>…
+ * <version>\n<"METHOD">\n<"path">\n[["key","value"],…]
  * ```
  *
  * For `GET https://shop.test:3000/api/items?limit=20&q=hex%20bolt#top`:
  *
  * ```text
- * v1
- * GET
- * /api/items
- * limit=20&q=hex bolt
+ * v2
+ * "GET"
+ * "/api/items"
+ * [["limit","20"],["q","hex bolt"]]
  * ```
  *
  * Part by part:
  *
  * - **Version** — {@link REQUEST_KEY_MESSAGE_VERSION}, so a layout change
- *   cannot silently re-key existing data.
+ *   cannot silently re-key existing data. It is the one part left bare,
+ *   because its value comes from a closed set of short literals that contain
+ *   no newline and so cannot absorb the delimiter after it.
  * - **Method** — trimmed and upper-cased with `toUpperCase`, never
  *   `toLocaleUpperCase`, whose Turkish mapping would turn a dotless `i` into
  *   something no HTTP method contains. `get` and `GET` therefore collide, which
- *   is what the wire means by them.
+ *   is what the wire means by them. Encoded, because nothing upstream
+ *   guarantees a producer's method contains no delimiter.
  * - **Path** — `parseUrlParts(url).path`, byte-faithful: trailing slashes are
  *   not folded, case is not folded, and `%2F` is not decoded, because two paths
  *   spelled differently are two different requests to the server that answers
@@ -238,35 +295,60 @@ function compareCanonicalPairs(left: CanonicalPair, right: CanonicalPair): numbe
  *   tab and one application, and the alternative (keying on the origin) would
  *   stop a `fetch` written as `/api/items` from grouping with the same request
  *   written absolutely. Do not "fix" this without changing the formula, the
- *   version tag and the aggregates together.
+ *   version tag and the aggregates together. Encoded, because a path is
+ *   reproduced verbatim and a producer can report one containing anything.
  * - **Query pairs** — every pair from `parseQueryPairs`, each half run through
  *   `decodeQueryComponent` so that `a%20b`, `a+b` and `a b` canonicalise
- *   identically, then sorted by {@link compareCanonicalPairs} and joined as
- *   `key=value` with `&`. An absent or empty query yields an empty fourth
- *   part, which is still preceded by its newline: the layout has fixed arity,
- *   so `?` and no query at all canonicalise the same way and a message can
- *   never be mistaken for one with fewer parts.
+ *   identically, then sorted by {@link compareCanonicalPairs} and encoded as
+ *   one array of two-element tuples. Decoding before sorting is what keeps
+ *   those encoding variants equivalent; encoding after sorting is what keeps
+ *   the result unambiguous. An absent or empty query yields `[]`, still
+ *   preceded by its newline: the layout has fixed arity, so `?` and no query
+ *   at all canonicalise the same way and a message can never be mistaken for
+ *   one with fewer parts.
  * - **Excluded** — the fragment, which no browser sends to a server, and any
  *   userinfo, which is a credential rather than part of a request's identity.
  *
- * ## Two bounded ambiguities, stated rather than discovered
+ * ## Why the parts are encoded rather than merely delimited
  *
- * Both need a query that no ordinary application produces, and both err toward
- * reporting two requests as one group rather than splitting one:
+ * A canonical message is worth only as much as its framing. Duplicate
+ * detection groups by the digest of this string, so if two structurally
+ * different requests can produce one message, the product reports them as one
+ * repeated request — a confident, wrong answer of exactly the kind the privacy
+ * model's `productId=A` versus `productId=B` sentence forbids. A framing built
+ * from delimiters its own components may contain admits precisely that, and
+ * four concrete cases followed from the earlier `\n`/`&`/`=` join:
  *
- * 1. `&` and `=` are the pair delimiters *and* legal characters inside a
- *    decoded component, so `?a=b%26c=d` canonicalises to `a=b&c=d`, as does
- *    `?a=b&c=d`. Distinguishing them would require re-encoding the components,
- *    which is a different message layout and hence a different version tag.
- * 2. `parseQueryPairs` caps a query at 512 pairs, and this function
- *    canonicalises that capped prefix. The cap is deterministic — the same URL
- *    always yields the same prefix and so the same key — but beyond it order
- *    insensitivity no longer holds, because reordering changes which pairs
- *    survive the cut.
+ * - `?a=b%26c=d` (one parameter whose value is `b&c=d`) and `?a=b&c=d` (two
+ *   parameters) both rendered `a=b&c=d`.
+ * - `?a%3Db=c` (the key `a=b`) and `?a=b=c` (the value `b=c`) both rendered
+ *   `a=b=c`.
+ * - A method of `GET\n/b` with the path `/a` rendered the same three lines as
+ *   the method `GET` with a path of `/B\n/a` — the part delimiter itself was
+ *   forgeable, and `parseUrlParts` reproduces a path verbatim.
+ * - `?q=a%0Ab` decoded to a value containing a newline and produced a
+ *   *five*-part message, breaking the fixed arity the layout claims.
+ *
+ * Encoding each part removes the class, not the four instances:
+ * {@link encodeCanonicalPart} is injective, so distinct inputs cannot share an
+ * encoding, and its output contains no literal newline, so the arity holds for
+ * every input. The two equivalences that must survive — parameter order and
+ * percent/plus/space spelling — are unaffected, because both are settled by
+ * decoding and sorting before anything is encoded.
+ *
+ * ## One bounded ambiguity, stated rather than discovered
+ *
+ * `parseQueryPairs` caps a query at 512 pairs, and this function canonicalises
+ * that capped prefix. The cap is deterministic — the same URL always yields the
+ * same prefix and so the same key — but beyond it order insensitivity no longer
+ * holds, because reordering changes which pairs survive the cut. It needs a
+ * query no ordinary application produces, and it errs toward reporting two
+ * requests as one group rather than splitting one.
  *
  * Total: every string decomposes, `decodeQueryComponent` returns its input
- * rather than throwing on malformed escapes, and nothing here allocates more
- * than the capped pair list. No input throws.
+ * rather than throwing on malformed escapes, {@link encodeCanonicalPart}
+ * accepts every string, and nothing here allocates more than the capped pair
+ * list. No input throws.
  *
  * @param input - The request's method and its **unredacted** URL, absolute or
  * origin-relative. Ingress validation upstream guarantees both are strings.
@@ -285,9 +367,13 @@ export function buildRequestKeyMessage(input: { method: string; url: string }): 
         ]);
 
   pairs.sort(compareCanonicalPairs);
-  const canonicalQuery = pairs.map(([key, value]) => `${key}=${value}`).join('&');
 
-  return `${REQUEST_KEY_MESSAGE_VERSION}\n${method}\n${path}\n${canonicalQuery}`;
+  return [
+    REQUEST_KEY_MESSAGE_VERSION,
+    encodeCanonicalPart(method),
+    encodeCanonicalPart(path),
+    encodeCanonicalPart(pairs),
+  ].join(MESSAGE_PART_DELIMITER);
 }
 
 /*

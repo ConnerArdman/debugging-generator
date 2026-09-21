@@ -1,20 +1,20 @@
 /**
  * InventoryKpiCards - the figure row at the top of the Lumen Supply inventory dashboard.
  *
- * Five cards, one per figure the warehouse side of the storefront is judged by: the SKUs it
- * tracks, the units on the shelf, the units already promised to somebody, the lines that have
- * fallen to their reorder point, and the locations it stocks from. The dashboard page reads the
- * payload and hands it over; this file prints it, and the two files below it on the page - the
- * levels table and the low-stock list - print the detail behind the fourth card.
+ * Five cards, one per figure the warehouse side of the storefront is judged by: the units on the
+ * shelf, the units already promised to somebody, the lines that have fallen to their reorder
+ * point, the locations it stocks from, and the units its ledger has moved. The dashboard page
+ * reads the payload and hands it over; this file prints it, and the two files below it on the
+ * page - the levels table and the low-stock list - print the detail behind the reorder card.
  *
  * EVERY FIGURE IS A FIELD, NEVER A CALCULATION
  * Each value printed here is one field of `InventorySummary` passed through
  * `formatQuantityLabel`, and nothing is added, subtracted or divided on the way to the screen.
- * The server computes its totals in one statement over `inventory_levels`, under whichever
- * location and state filter the reader chose, so a figure assembled here from two of them would
- * be a second, quieter answer to a question the database has already answered - and it would go
- * wrong precisely when a filter is applied. The one length taken in this file is
- * `warehouses.length`, which counts the very array it reports on.
+ * The server computes every total under whichever location, selling state and movement filter
+ * the reader chose, so a figure assembled here from two of them would be a second, quieter
+ * answer to a question the database has already answered - and it would go wrong precisely when
+ * a filter is applied. The one length taken in this file is `warehouses.length`, which counts
+ * the very array it reports on.
  *
  * WHAT THE COPY MAY CLAIM
  * The notes under the figures state what a figure *is*, never what it covers: the totals honour
@@ -77,9 +77,9 @@ const ROW_LABEL = 'Inventory figures';
 const PLACEHOLDER_LABEL = 'Loading inventory figures';
 
 /**
- * Cards in the row, and therefore cards the placeholder reserves. It is five because
- * `InventorySummary` carries five reportable figures; the loaded row builds its list from those
- * fields rather than from this number, which exists so the wait reserves the same geometry.
+ * Cards in the row, and therefore cards the placeholder reserves. It is five because the loaded
+ * row reports five figures; that row builds its list from the payload's own fields rather than
+ * from this number, which exists so the wait reserves the same geometry.
  */
 const FIGURE_COUNT = 5;
 
@@ -209,19 +209,13 @@ export function InventoryKpiCards({ summary, referenceIso, className }: Props): 
 
   const figures: readonly InventoryKpiFigure[] = [
     {
-      id: 'skus',
-      label: 'Tracked SKUs',
-      value: formatQuantityLabel(summary.totalSkus),
-      emphasis: 'neutral',
-      // The payload's own timestamp, which is what tells a reader whether they are looking at
-      // this minute's figures or at a page left open over lunch.
-      note: `Updated ${formatTimeAgoLabel(summary.generatedAt, referenceIso)}`,
-    },
-    {
       id: 'on-hand',
       label: 'Units on hand',
       value: formatQuantityLabel(summary.totalOnHand),
       emphasis: 'neutral',
+      // The payload's own timestamp, which is what tells a reader whether they are looking at
+      // this minute's figures or at a page left open over lunch.
+      note: `Updated ${formatTimeAgoLabel(summary.generatedAt, referenceIso)}`,
     },
     {
       id: 'reserved',
@@ -245,6 +239,17 @@ export function InventoryKpiCards({ summary, referenceIso, className }: Props): 
       label: 'Stocking locations',
       value: formatQuantityLabel(summary.warehouses.length),
       emphasis: 'neutral',
+    },
+    {
+      id: 'movement-volume',
+      label: 'Units moved',
+      value: formatQuantityLabel(summary.movementVolume),
+      emphasis: 'neutral',
+      // What the figure is, and nothing about what it covers: the payload is filtered by a
+      // location, a selling state and a kind of change this component is not told about, so a
+      // note naming the kinds counted - or calling them all - would be false on a filtered
+      // dashboard. That both directions add up rather than cancel is true of every filtering.
+      note: 'Stock in and out, counted in units',
     },
   ];
 

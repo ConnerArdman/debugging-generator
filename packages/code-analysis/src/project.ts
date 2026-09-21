@@ -23,25 +23,71 @@
  * Three independent mechanisms hold that line, and each one is sufficient on
  * its own:
  *
- * 1. **The file set is this module's, not the target's.** The `Project` is
- *    always constructed with `skipAddingFilesFromTsConfig`, so however
- *    permissive the target's `include`/`files` are — `["**\/*"]` is legal and
- *    not rare — the compiler adds nothing by itself. Every file the project
- *    holds was added by {@link openProject} through a glob list built here.
- * 2. **The globs exclude by construction.** Positive globs name the
- *    {@link INDEXABLE_EXTENSIONS} and nothing else; negative globs remove every
- *    {@link EXCLUDED_DIRECTORY_NAMES} tree, declaration files, minified bundles
- *    and every `.env*` path at any depth.
- * 3. **A filter runs afterwards anyway.** Every file the glob layer returned is
- *    re-judged with {@link shouldExcludePath} and {@link isIndexableFile}, and
- *    an environment file that reached the project despite both mechanisms above
- *    is *unloaded from it* — `project.removeSourceFile`, so its content leaves
- *    memory too — and reported at `warn`. A mis-specified glob is then a
- *    logged anomaly rather than a leak.
+ * 1. **The file set is this module's, not the target's.** The target's
+ *    configuration is parsed here for its `compilerOptions` alone, with a
+ *    parser that is given no filesystem to expand against, and the `Project` is
+ *    constructed from those options rather than from the configuration's path.
+ *    So however permissive the target's `include`/`files` are — `["**\/*"]` is
+ *    legal and not rare — neither the compiler nor its configuration parser
+ *    contributes a single file. Every file the project holds was added by
+ *    {@link openProject} from the traversal below.
+ * 2. **The traversal excludes by construction, and never follows a directory
+ *    link.** {@link discoverCandidatePaths} walks the project itself with
+ *    `readdir`, descending only into an entry whose own directory entry says it
+ *    *is* a directory — which a symbolic link's entry never does. An
+ *    {@link EXCLUDED_DIRECTORY_NAMES} tree, an `extraExcludes` tree and every
+ *    hidden (dot-prefixed) entry are recognised at their own entry and are
+ *    never enumerated, so a large `node_modules` costs one rejected entry
+ *    rather than a hundred thousand paths.
+ * 3. **Nothing is read until it has been screened.** Discovery and loading are
+ *    two steps rather than one: the traversal produces candidate *paths* and
+ *    reads no content, every candidate is then judged by a single screen
+ *    ({@link screenCandidatePath}), and only a candidate the screen calls
+ *    indexable is handed to the compiler. A mistake upstream is therefore a
+ *    logged refusal rather than a leak, because the refusal happens before the
+ *    bytes are touched.
  *
- * The sibling `project.test.ts` exercises all three, including a target whose
- * `tsconfig.json` has been widened to `include: ["**\/*"]`. Treat a failure
- * there as a security regression, not a broken unit test.
+ * ## Why the traversal is this module's, and why the screen still resolves
+ *
+ * A path that is lexically inside the project can read from anywhere the
+ * developer's account can. A symlinked *directory* (`<root>/vendor -> /etc`)
+ * presents an entire external tree under the root, every one of whose files has
+ * an ordinary final component; a symlinked *file*
+ * (`<root>/src/config.ts -> <root>/.env`) carries an indexable basename while
+ * its content is an environment file. Neither is visible to a string
+ * containment test, and neither is visible to a check that only asks whether
+ * the final component is itself a link.
+ *
+ * Handing the traversal to a glob layer does not avoid the first case, it
+ * merely hides where it happens — measured on the supported runtime, not
+ * assumed: ts-morph's file-system host globs through `tinyglobby` with symlink
+ * following at its default and descends into a linked directory outright,
+ * while Node's built-in `fs.globSync` descends into one whose own name matches
+ * a pattern component. By the time either has answered, the external tree has
+ * been enumerated. So this module walks the project, and the no-follow
+ * guarantee is structural rather than a matcher's option.
+ *
+ * The screen then resolves **every component** of each candidate with
+ * `realpath` and judges the resolved path as well as the candidate: the real
+ * path must sit under the *canonical* project root, must be a regular file, and
+ * must pass {@link isEnvFilePath}, {@link shouldExcludePath} and
+ * {@link isIndexableFile} in its own right. Resolution failure — a dangling
+ * link, a link cycle, a directory this account may not traverse — is a
+ * refusal, not an acceptance: a file whose provenance cannot be established is
+ * not indexed. A link whose target is an ordinary source file *inside* the
+ * project stays indexed, which is what keeps the screen from refusing the
+ * legitimate case.
+ *
+ * The same screen runs a second time over what the compiler actually holds
+ * (see {@link retainIndexableSourceFiles}), so the guarantee does not depend on
+ * every future call site remembering to ask.
+ *
+ * The sibling `project.test.ts` exercises all three mechanisms, including a
+ * target whose `tsconfig.json` has been widened to `include: ["**\/*"]`, a
+ * directory link whose contents are proven never to be enumerated, a regular
+ * file reached through a symlinked directory outside the root, and a link to
+ * the project's own `.env`. Treat a failure there as a security regression, not
+ * a broken unit test.
  *
  * ## Why the target's own tsconfig cannot own the file set
  *
@@ -55,12 +101,21 @@
  * disclosure. Taking the options and rejecting the file list is the only
  * combination that gives correct resolution and a bounded file set.
  *
+ * "Rejecting the file list" is meant literally: the list is never computed.
+ * Handing a configuration path to the `Project` constructor would have
+ * TypeScript expand the configuration's globs across the tree — following
+ * directory links while it does — and only then discard the result, so
+ * {@link readCompilerOptions} parses the configuration with a host whose
+ * `readDirectory` answers nothing at all. See that function for what the
+ * expansion costs when a directory link is in the way.
+ *
  * ## Behaviour worth knowing before you call this
  *
  * - **Failures are values.** `openProject` returns `Result<LoadedProject>` and
  *   throws for nothing a caller can provoke: a relative root, a missing root, a
  *   root that is a file, a malformed or absent `tsconfig.json`, an unreadable
- *   file — each comes back as an `Err` carrying a `DebuggenError` with one of
+ *   file, a root whose own real location cannot be established — each comes
+ *   back as an `Err` carrying a `DebuggenError` with one of
  *   `PATH_OUTSIDE_PROJECT`, `PROJECT_NOT_FOUND` or `CODE_INDEX_FAILED`, a hint
  *   naming the developer's next step, and a `details.reason` a caller can
  *   branch on.
@@ -78,12 +133,13 @@
  *   call to `sourceFiles()`. Files added to `loaded.project` afterwards do not
  *   appear in it; re-open the project instead, which is what makes an index,
  *   its cache key and a test expectation reproducible.
- * - **Hidden directories are not indexed.** ts-morph's glob layer does not
- *   match a path segment beginning with a dot unless the pattern says so, which
- *   is why `.next`, `.turbo`, `.cache` and `.git` are excluded twice over — and
- *   why a source file parked under any other hidden directory is invisible to
- *   the indexer. The negative globs for those trees are kept regardless, so the
- *   exclusion does not depend on a third-party default.
+ * - **Hidden entries are not indexed.** The traversal skips any entry whose
+ *   name begins with a dot, at any depth, which is why `.next`, `.turbo`,
+ *   `.cache`, `.git` and every `.env*` are excluded twice over — and why a
+ *   source file parked under any other hidden directory is invisible to the
+ *   indexer. This used to be a glob matcher's `dot: false` default; it is now
+ *   a rule of this module ({@link HIDDEN_PREFIX}), so the behaviour no longer
+ *   depends on a third-party default.
  * - **Type resolution is not required.** A target whose dependencies are not
  *   installed indexes exactly as one whose dependencies are: unresolvable
  *   module specifiers, missing `lib` files and missing ambient types produce no
@@ -103,11 +159,12 @@
  * ```
  */
 
-import { lstatSync, realpathSync, statSync } from 'node:fs';
+import { readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
 
 import {
   DebuggenError,
   basenamePosix,
+  dirnamePosix,
   err,
   extnamePosix,
   isAbsolutePosix,
@@ -218,26 +275,23 @@ const ENV_BASENAME = '.env';
 /** The prefix every qualified environment file basename carries. */
 const ENV_PREFIX = '.env.';
 
+/**
+ * The prefix of a hidden filesystem entry, which is never indexed at any depth.
+ *
+ * This is a rule rather than a side effect. It used to arrive from a glob
+ * matcher's `dot: false` default — a pattern that does not ask for a
+ * dot-prefixed segment does not match one — and the module's documentation has
+ * always stated the resulting behaviour: `.git`, `.next`, `.turbo` and `.cache`
+ * are excluded twice over, and a source file parked under any other hidden
+ * directory is invisible to the indexer. Now that {@link discoverCandidatePaths}
+ * owns the traversal, the rule is stated here so the behaviour does not depend
+ * on a third-party default, and so every `.env*` file is skipped before its
+ * name is even judged.
+ */
+const HIDDEN_PREFIX = '.';
+
 /** The configuration file {@link openProject} probes for when none is named. */
 const TSCONFIG_BASENAME = 'tsconfig.json';
-
-/**
- * The glob metacharacters that must be neutralised in a *literal* path before
- * it can be used as the prefix of a pattern.
- *
- * ts-morph's glob layer normalises backslashes to forward slashes before
- * matching, so backslash escaping is unavailable: an escaped `\(` arrives as
- * `/(`. A single-character class — `(` written `[(]` — is the form that
- * survives, and it is what {@link escapeGlobLiteral} produces.
- *
- * `!` and `^` are deliberately **not** in this set. `[!]` and `[^]` open a
- * *negated* class rather than matching the character, so escaping them breaks
- * the pattern outright, while leaving them literal matches correctly: the
- * leading `!` that marks a negative pattern is added by this module after the
- * prefix has been escaped, so a `!` inside a directory name is never mistaken
- * for one.
- */
-const GLOB_METACHARACTERS = /[()[\]{}*?+@$|]/g;
 
 /**
  * Whether a path names an environment file.
@@ -553,12 +607,16 @@ export interface LoadedProject {
  * 4. A ts-morph `Project` is constructed — with the configuration's
  *    `compilerOptions` and *without* its file list, or with this module's
  *    defaults when there is no configuration.
- * 5. Files are added from the glob list built here, positive globs for the
- *    indexable extensions and negative globs for every excluded tree,
- *    declaration file, minified bundle and environment file.
- * 6. The resulting set is filtered again, environment files and symbolic links
- *    leaving the project are unloaded from the compiler, and what remains is
- *    sorted and frozen.
+ * 5. The root's canonical form is resolved once, and becomes the base every
+ *    containment decision is made against.
+ * 6. Candidate paths are discovered by walking the project without following a
+ *    directory link and without descending into an excluded or hidden entry.
+ *    The traversal reads no file content.
+ * 7. Every candidate is screened (lexically, then through `realpath`), and only
+ *    a candidate that survives is loaded into the compiler.
+ * 8. What the compiler holds is screened again, environment files and files
+ *    whose real path leaves the project are unloaded from it, and what remains
+ *    is sorted and frozen.
  *
  * Nothing a caller can pass makes this function throw. The failures it reports
  * and the codes they carry are listed on the module documentation above; each
@@ -603,24 +661,47 @@ export function openProject(options: OpenProjectOptions): Result<LoadedProject> 
     logger.debug('no TypeScript configuration found; using indexer defaults', { projectRoot });
   }
 
-  const globs = buildSourceFileGlobs(projectRoot, extraExcludes);
-  const matched = tryCatch(() => project.addSourceFilesAtPaths(globs), 'CODE_INDEX_FAILED');
-  if (isErr(matched)) {
-    return err(
-      failure(
-        'CODE_INDEX_FAILED',
-        `The source files of the project at '${projectRoot}' could not be read: ${matched.error.message}`,
-        'source-files-unreadable',
-        'Check that the project directory and its files are readable, then try again.',
-        matched.error,
-      ),
-    );
+  // Resolved once, before anything is discovered, and the base every
+  // containment decision below is made against. A root reached through a
+  // symbolic link (a checkout under a linked home directory, a temporary
+  // directory on a platform that links its temporary path) is ordinary, so the
+  // *canonical* root is what files are required to sit under while the handle
+  // keeps speaking of the path the caller passed.
+  const canonicalRoot = resolveCanonicalRoot(projectRoot);
+  if (isErr(canonicalRoot)) {
+    return canonicalRoot;
+  }
+  const canonicalProjectRoot = canonicalRoot.value;
+
+  // Discovery yields candidate *paths* only and never follows a directory
+  // link, so a tree outside the project is not even enumerated, let alone
+  // read.
+  const discovered = discoverCandidatePaths({
+    projectRoot,
+    canonicalProjectRoot,
+    extraExcludes,
+    logger,
+  });
+  if (isErr(discovered)) {
+    return discovered;
+  }
+
+  const admitted = admitScreenedSourceFiles({
+    project,
+    candidatePaths: discovered.value,
+    projectRoot,
+    canonicalProjectRoot,
+    extraExcludes,
+    logger,
+  });
+  if (isErr(admitted)) {
+    return admitted;
   }
 
   const sourceFiles = retainIndexableSourceFiles({
     project,
     projectRoot,
-    realProjectRoot: realPathOrSelf(projectRoot),
+    canonicalProjectRoot,
     extraExcludes,
     logger,
   });
@@ -628,7 +709,8 @@ export function openProject(options: OpenProjectOptions): Result<LoadedProject> 
   logger.debug('project opened', {
     projectRoot,
     tsConfigFilePath,
-    matchedFileCount: matched.value.length,
+    candidateFileCount: discovered.value.length,
+    loadedFileCount: admitted.value,
     sourceFileCount: sourceFiles.length,
   });
 
@@ -794,10 +876,9 @@ function isReadableFile(path: string): boolean {
  * Both branches pass the same two options, and each one is load-bearing:
  *
  * - `skipAddingFilesFromTsConfig` keeps the **file set under this module's
- *   control**. Without it the compiler would add whatever the target's
- *   `include`/`files` name — which is written for a build and may be as wide as
- *   the whole directory — and an environment file would be in the program
- *   before any filter of ours ran.
+ *   control**. It is stated even though no configuration is handed to the
+ *   constructor any more (see below), so that a change which reintroduces one
+ *   cannot silently hand the file set back to the target.
  * - `skipFileDependencyResolution` stops the project from pulling in the files
  *   its sources import. Those live under `node_modules`, are declaration files,
  *   or both; admitting them would enlarge the program by orders of magnitude
@@ -808,52 +889,135 @@ function isReadableFile(path: string): boolean {
  * `@/<segment>` resolve to the module it names, which is how the import and
  * symbol extractors follow an aliased edge at all.
  *
- * A configuration whose JSON is malformed makes ts-morph throw, and that
- * surfaces as an `Err` rather than a fallback, for the reason given on
- * {@link resolveTsConfigFilePath}.
+ * ## Why the options are read here instead of by the constructor
+ *
+ * `new Project({ tsConfigFilePath })` hands the path to TypeScript's
+ * configuration parser, which **expands the configuration's `include` globs
+ * across the project tree** — following directory links as it goes — before
+ * `skipAddingFilesFromTsConfig` throws the resulting file list away. That
+ * expansion is both the traversal this module exists to own and a real hazard:
+ * measured on this runtime, a single directory link to a large pseudo-filesystem
+ * turned a 15-millisecond open into a 7-second one, and a link to a big tree
+ * scales with the tree rather than with the project.
+ *
+ * So the options are parsed here with a host whose `readDirectory` returns
+ * nothing. The parser still resolves `extends` chains, still makes `paths` and
+ * `baseUrl` absolute against the configuration's own directory, and still
+ * reports a malformed file — it simply never asks the filesystem what the
+ * configuration matches, because this module already knows what it is willing
+ * to read.
+ *
+ * A configuration whose JSON is malformed is an `Err` rather than a fallback,
+ * for the reason given on {@link resolveTsConfigFilePath}. Diagnostics about
+ * the *options themselves* are deliberately not fatal: a target written for a
+ * newer compiler may name an option this one does not know, and refusing to
+ * index a project over an unknown option would be a fault of ours rather than
+ * theirs.
  */
 function createProject(tsConfigFilePath: string | undefined): Result<Project> {
+  const compilerOptions =
+    tsConfigFilePath === undefined
+      ? ok(defaultCompilerOptions())
+      : readCompilerOptions(tsConfigFilePath);
+  if (isErr(compilerOptions)) {
+    return compilerOptions;
+  }
+
   const created = tryCatch(
     () =>
-      tsConfigFilePath === undefined
-        ? new Project({
-            compilerOptions: defaultCompilerOptions(),
-            skipAddingFilesFromTsConfig: true,
-            skipFileDependencyResolution: true,
-          })
-        : new Project({
-            tsConfigFilePath,
-            skipAddingFilesFromTsConfig: true,
-            skipFileDependencyResolution: true,
-          }),
+      new Project({
+        compilerOptions: compilerOptions.value,
+        skipAddingFilesFromTsConfig: true,
+        skipFileDependencyResolution: true,
+      }),
     'CODE_INDEX_FAILED',
   );
 
   if (isErr(created)) {
-    if (tsConfigFilePath === undefined) {
-      return err(
-        failure(
-          'CODE_INDEX_FAILED',
-          `A TypeScript project could not be created for this directory: ${created.error.message}`,
-          'project-creation-failed',
-          'Check that the project directory is readable, then try again.',
-          created.error,
-        ),
-      );
-    }
-
     return err(
       failure(
         'CODE_INDEX_FAILED',
-        `The TypeScript configuration at '${tsConfigFilePath}' could not be read: ${created.error.message}`,
-        'tsconfig-unreadable',
-        'Fix the JSON in that configuration file, then start the session again.',
+        `A TypeScript project could not be created for this directory: ${created.error.message}`,
+        'project-creation-failed',
+        'Check that the project directory is readable, then try again.',
         created.error,
       ),
     );
   }
 
   return created;
+}
+
+/**
+ * Reads a target configuration's `compilerOptions` without letting it enumerate
+ * anything.
+ *
+ * The host below is the whole point: `readDirectory` answers with an empty list,
+ * so the parser resolves options, `extends` chains and relative paths while the
+ * filesystem is never walked on the configuration's behalf. `fileExists` and
+ * `readFile` are real, because an `extends` chain has to be followed to know
+ * what the options are, and a configuration that extends a file it cannot read
+ * is a configuration this module must report rather than guess at.
+ *
+ * Failure is reported exactly as the previous constructor-driven path reported
+ * it — `CODE_INDEX_FAILED` with `details.reason` `tsconfig-unreadable` — so a
+ * caller branching on the reason is unaffected.
+ *
+ * @param tsConfigFilePath The absolute path of the configuration to read.
+ * @returns `Ok` with the resolved options, or `Err` when the file cannot be
+ * read or parsed.
+ */
+function readCompilerOptions(tsConfigFilePath: string): Result<CompilerOptions> {
+  const unreadable = (detail: string, cause?: unknown): Result<CompilerOptions> =>
+    err(
+      failure(
+        'CODE_INDEX_FAILED',
+        `The TypeScript configuration at '${tsConfigFilePath}' could not be read: ${detail}`,
+        'tsconfig-unreadable',
+        'Fix the JSON in that configuration file, then start the session again.',
+        cause,
+      ),
+    );
+
+  const readFile = (path: string): string | undefined => {
+    const contents = tryCatch(() => readFileSync(path, 'utf8'));
+    return isErr(contents) ? undefined : contents.value;
+  };
+
+  const read = tryCatch(() => ts.readConfigFile(tsConfigFilePath, readFile), 'CODE_INDEX_FAILED');
+  if (isErr(read)) {
+    return unreadable(read.error.message, read.error);
+  }
+  if (read.value.error !== undefined) {
+    return unreadable(ts.flattenDiagnosticMessageText(read.value.error.messageText, ' '));
+  }
+
+  const host: ts.ParseConfigHost = {
+    useCaseSensitiveFileNames: true,
+    // The mechanism this function exists for: the configuration's `include`,
+    // `files` and `exclude` are resolved against nothing, so no directory is
+    // read and no directory link is followed on its behalf.
+    readDirectory: () => [],
+    fileExists: (path: string) => isReadableFile(path),
+    readFile,
+  };
+
+  const parsed = tryCatch(
+    () =>
+      ts.parseJsonConfigFileContent(
+        read.value.config,
+        host,
+        dirnamePosix(tsConfigFilePath),
+        undefined,
+        tsConfigFilePath,
+      ),
+    'CODE_INDEX_FAILED',
+  );
+  if (isErr(parsed)) {
+    return unreadable(parsed.error.message, parsed.error);
+  }
+
+  return ok(parsed.value.options);
 }
 
 /**
@@ -896,84 +1060,620 @@ function defaultCompilerOptions(): CompilerOptions {
   };
 }
 
-/**
- * Builds the glob list the project's files are added from.
- *
- * One positive pattern per {@link INDEXABLE_EXTENSIONS} entry, then a negative
- * pattern for every excluded tree, every declaration-file flavour, minified
- * bundles and environment files. Negative patterns matter beyond tidiness: the
- * glob layer never *descends* into an excluded directory, so `node_modules` of
- * a large project is not enumerated rather than enumerated and discarded —
- * which is the difference between an index that takes a second and one that
- * takes a minute.
- *
- * There is no hand-rolled directory walk here on purpose. The glob layer is
- * the part that knows how to traverse a large tree efficiently, and a
- * recursive walk written here would have to reimplement it — including the
- * exclusions, whose whole value is that they prevent traversal.
- *
- * Every pattern is anchored at the project root, and the root is passed through
- * {@link escapeGlobLiteral} first: a directory whose name contains a glob
- * metacharacter — `project (v2)` is the everyday example — otherwise matches
- * *nothing at all*, producing a silently empty index. Each excluded name is
- * escaped for the same reason.
- *
- * @param projectRoot The normalised absolute project root.
- * @param extraExcludes Caller-supplied directory names or project-relative
- * directory paths.
- * @returns The pattern list, positive patterns first.
- */
-function buildSourceFileGlobs(
-  projectRoot: string,
-  extraExcludes: readonly string[],
-): readonly string[] {
-  const prefix = escapeGlobLiteral(projectRoot);
-  const include = (pattern: string): string => joinPosix(prefix, pattern);
-  const exclude = (pattern: string): string => `!${joinPosix(prefix, pattern)}`;
+/** What {@link discoverCandidatePaths} needs to enumerate a project. */
+interface DiscoverOptions {
+  /** The normalised absolute project root, as the caller spelled it. */
+  readonly projectRoot: string;
 
-  const globs: string[] = [];
+  /** The project root with every symbolic link resolved — the containment base. */
+  readonly canonicalProjectRoot: string;
 
-  for (const extension of INDEXABLE_EXTENSIONS) {
-    globs.push(include(`**/*${extension}`));
-  }
+  /** Caller-supplied exclusions, already defaulted. */
+  readonly extraExcludes: readonly string[];
 
-  for (const name of [...EXCLUDED_DIRECTORY_NAMES, ...extraExcludes]) {
-    const normalized = normalizePosix(toPosix(name)).trim();
-    if (normalized.length === 0 || normalized === '.') {
-      continue;
-    }
-    globs.push(exclude(`**/${escapeGlobLiteral(normalized)}/**`));
-  }
-
-  for (const suffix of DECLARATION_FILE_SUFFIXES) {
-    globs.push(exclude(`**/*${suffix}`));
-  }
-
-  globs.push(exclude(`**/*${MINIFIED_SUFFIX}`));
-
-  // The positive patterns above cannot match an environment file — none of them
-  // carries an indexable extension, and the glob layer does not match a
-  // dot-prefixed segment against a pattern that does not ask for one. Both
-  // patterns are stated anyway, because the guarantee this module exists to
-  // hold must not rest on a third-party matcher's default.
-  globs.push(exclude(`**/${ENV_BASENAME}`), exclude(`**/${ENV_PREFIX}*`));
-
-  return globs;
+  /** Where pruned links and unreadable directories are reported. */
+  readonly logger: Logger;
 }
 
 /**
- * Neutralises the glob metacharacters of a literal path segment or path.
+ * Enumerates the project's candidate files without ever following a directory
+ * link, and without reading a single byte of any of them.
  *
- * Each metacharacter becomes a single-character class — `(` becomes `[(]` —
- * which is the only escaping form that survives the normalisation ts-morph's
- * glob layer applies to a pattern (see {@link GLOB_METACHARACTERS}, which also
- * records why `!` and `^` are left alone).
+ * ## Why this module owns the traversal
  *
- * @param literal A path or path fragment to be used literally inside a pattern.
- * @returns The same text, safe to concatenate into a glob.
+ * Every glob layer available here follows a symbolic link somewhere, and a
+ * followed directory link is not a cosmetic difference: the entries of an
+ * arbitrary external tree — another checkout, a home directory, a mount — are
+ * enumerated into a candidate list, and whatever screens that list afterwards
+ * is already too late to have prevented the traversal. Both mechanisms were
+ * measured on the supported runtime rather than assumed:
+ *
+ * - ts-morph's file-system host globs through `tinyglobby` with
+ *   `followSymbolicLinks` at its default, which descends into a linked
+ *   directory outright.
+ * - Node's built-in `fs.globSync` does not descend into a link reached by
+ *   `**`, but *does* descend into one whose own name matches a pattern
+ *   component — a directory link named `<name>.ts` is crawled — and it returns
+ *   matching directories as results alongside files.
+ *
+ * Neither can be configured out of that behaviour from here, and adding a
+ * third-party matcher to this package is not available to it. So the walk is
+ * this module's, and the no-follow guarantee is structural: a directory is
+ * descended into only when its own directory entry says it *is* a directory,
+ * which a symbolic link's entry never does, whatever it points at and whatever
+ * it is named.
+ *
+ * ## What it costs, and what it keeps
+ *
+ * One `readdir` per real directory, which is what any traversal costs, and the
+ * property the previous negative globs existed for is kept: an excluded tree is
+ * recognised at its own directory entry and is never enumerated, so
+ * `node_modules` of a large project costs one rejected entry rather than a
+ * hundred thousand paths. Exclusion is decided by the same predicates the
+ * screen uses ({@link shouldExcludePath}, {@link isIndexableFile},
+ * {@link isEnvFilePath}) rather than by a parallel list of patterns, so there
+ * is no second spelling of the rule to drift.
+ *
+ * A dot-prefixed entry is skipped at any depth. That is not incidental
+ * tidiness: it is the behaviour the glob layer's `dot: false` default used to
+ * supply, which this module's documentation states and which keeps `.git`,
+ * `.next`, `.turbo` and every `.env*` out of the candidate list a second time
+ * over.
+ *
+ * ## Failures
+ *
+ * The root must be readable — a project whose top level cannot be listed is an
+ * `Err`, as it was when the glob layer failed. A directory *below* the root
+ * that cannot be listed is counted and reported rather than fatal: one
+ * unreadable subdirectory in a large tree is a reason to index the rest, and
+ * the report names it.
+ *
+ * @param options The project's two roots, the exclusions and where to report.
+ * @returns `Ok` with absolute candidate paths spelled under
+ * {@link DiscoverOptions.projectRoot}, or `Err` when the root is unreadable.
  */
-function escapeGlobLiteral(literal: string): string {
-  return literal.replace(GLOB_METACHARACTERS, (character) => `[${character}]`);
+function discoverCandidatePaths(options: DiscoverOptions): Result<readonly string[]> {
+  const { projectRoot, canonicalProjectRoot, extraExcludes, logger } = options;
+
+  const candidates: string[] = [];
+  const directoryLinks: string[] = [];
+  const prunedLinks: string[] = [];
+  const unreadable: string[] = [];
+  let prunedDirectoryCount = 0;
+  let visitedDirectoryCount = 0;
+
+  // Canonical paths of the directories already walked. A real directory tree
+  // cannot contain a cycle, but a bind mount can present the same directory at
+  // two places, and the set makes the walk terminate regardless while doubling
+  // as the per-directory containment proof.
+  const visited = new Set<string>([canonicalProjectRoot]);
+  const pending: string[] = [projectRoot];
+
+  while (pending.length > 0) {
+    const directory = pending.pop();
+    if (directory === undefined) {
+      break;
+    }
+
+    const entries = tryCatch(
+      () => readdirSync(directory, { withFileTypes: true }),
+      'CODE_INDEX_FAILED',
+    );
+    if (isErr(entries)) {
+      if (directory === projectRoot) {
+        return err(
+          failure(
+            'CODE_INDEX_FAILED',
+            `The source files of the project at '${projectRoot}' could not be read: ${entries.error.message}`,
+            'source-files-unreadable',
+            'Check that the project directory and its files are readable, then try again.',
+            entries.error,
+          ),
+        );
+      }
+      unreadable.push(projectRelativeOrUndefined(projectRoot, directory) ?? directory);
+      continue;
+    }
+
+    visitedDirectoryCount += 1;
+
+    for (const entry of entries.value) {
+      // Hidden entries are not indexed, at any depth — see the note above.
+      if (entry.name.startsWith(HIDDEN_PREFIX)) {
+        continue;
+      }
+
+      const entryPath = joinPosix(directory, entry.name);
+
+      if (entry.isDirectory()) {
+        if (shouldExcludePath(projectRoot, entryPath, extraExcludes)) {
+          prunedDirectoryCount += 1;
+          continue;
+        }
+
+        // The entry says "directory", so this cannot be a link; resolving it
+        // anyway is what keeps the walk inside the project even if a component
+        // above it was replaced while the walk was in progress, and what makes
+        // the visited set canonical.
+        const canonicalDirectory = tryCatch(() => realpathSync(entryPath));
+        if (isErr(canonicalDirectory)) {
+          unreadable.push(projectRelativeOrUndefined(projectRoot, entryPath) ?? entryPath);
+          continue;
+        }
+
+        const canonical = normalizePosix(toPosix(canonicalDirectory.value));
+        if (!isWithin(canonicalProjectRoot, canonical) || visited.has(canonical)) {
+          prunedDirectoryCount += 1;
+          continue;
+        }
+
+        visited.add(canonical);
+        pending.push(entryPath);
+        continue;
+      }
+
+      if (entry.isSymbolicLink()) {
+        // A link is never descended into, whatever it points at and whatever
+        // it is named: its directory entry is not a directory entry, so the
+        // branch above cannot have queued it. What remains is to say which
+        // kind of link it was, which needs the one `stat` in this loop — links
+        // are rare, and the answer decides whether the developer is told.
+        const target = tryCatch(() => statSync(entryPath, { throwIfNoEntry: false }));
+        const targetStats = isErr(target) ? undefined : target.value;
+
+        if (targetStats?.isDirectory() === true) {
+          // The case a following glob layer turns into an external tree in the
+          // candidate list. Reported at `warn` rather than counted quietly:
+          // source reachable only through this link is deliberately not
+          // indexed, and a developer who expected it indexed has to be able to
+          // find out why.
+          directoryLinks.push(projectRelativeOrUndefined(projectRoot, entryPath) ?? entryPath);
+          continue;
+        }
+
+        // A link to a file is a candidate when its name is indexable, because
+        // a link to a source file inside the project is legitimate;
+        // {@link screenCandidatePath} resolves it and decides. A dangling or
+        // cyclic link resolves to nothing and is refused here, which is the
+        // fail-closed direction.
+        if (
+          targetStats?.isFile() === true &&
+          isIndexableFile(entryPath) &&
+          !shouldExcludePath(projectRoot, entryPath, extraExcludes)
+        ) {
+          candidates.push(entryPath);
+          continue;
+        }
+
+        prunedLinks.push(projectRelativeOrUndefined(projectRoot, entryPath) ?? entryPath);
+        continue;
+      }
+
+      // A regular file is a candidate; a socket, a pipe or a device node is
+      // not a source file and is skipped without a stat.
+      if (
+        entry.isFile() &&
+        isIndexableFile(entryPath) &&
+        !shouldExcludePath(projectRoot, entryPath, extraExcludes)
+      ) {
+        candidates.push(entryPath);
+      }
+    }
+  }
+
+  if (directoryLinks.length > 0) {
+    logger.warn('directory links were not followed, so nothing below them was enumerated', {
+      projectRoot,
+      count: directoryLinks.length,
+      files: directoryLinks.slice(0, MAX_REPORTED_REFUSAL_PATHS),
+    });
+  }
+
+  if (prunedLinks.length > 0) {
+    logger.debug('links that name nothing indexable were skipped during discovery', {
+      projectRoot,
+      count: prunedLinks.length,
+      files: prunedLinks.slice(0, MAX_REPORTED_REFUSAL_PATHS),
+    });
+  }
+
+  if (unreadable.length > 0) {
+    logger.warn('directories inside the project could not be read and were skipped', {
+      projectRoot,
+      count: unreadable.length,
+      files: unreadable.slice(0, MAX_REPORTED_REFUSAL_PATHS),
+    });
+  }
+
+  logger.debug('project discovered', {
+    projectRoot,
+    visitedDirectoryCount,
+    prunedDirectoryCount,
+    candidateFileCount: candidates.length,
+  });
+
+  return ok(candidates);
+}
+
+/**
+ * What the screen decided about one candidate file.
+ *
+ * A discriminated verdict rather than a boolean, because the four ways a file
+ * can be refused are not interchangeable: two of them are privacy or
+ * containment failures that must be reported and, where the file is already
+ * loaded, unloaded; one is an ordinary exclusion that is expected and quiet;
+ * and one is the fail-closed answer for a path whose provenance could not be
+ * established. Keeping them distinct is what lets the two call sites count and
+ * log them differently, and what lets a reader see every refusal reason in one
+ * place.
+ *
+ * - `indexable` — judged safe to read and to keep in the file set.
+ * - `excluded` — a declaration file, a minified bundle, a non-indexable
+ *   extension, or a path under an excluded tree. Not a privacy matter: absent
+ *   from the file set, counted at `debug`.
+ * - `env` — the candidate *or its resolved path* names an environment file.
+ *   The privacy guarantee of this package; reported at `warn`.
+ * - `escaping` — the resolved path lies outside the project, which is what a
+ *   symlinked directory or a symlinked file achieves; reported at `warn`.
+ * - `unresolvable` — `realpath` failed (a dangling link, a link cycle, a
+ *   directory this account may not traverse). Refused rather than accepted: a
+ *   path whose real location cannot be established is not indexed.
+ */
+type ScreenVerdict = 'indexable' | 'excluded' | 'env' | 'escaping' | 'unresolvable';
+
+/** The verdicts that refuse a candidate — every {@link ScreenVerdict} but one. */
+type RefusalVerdict = Exclude<ScreenVerdict, 'indexable'>;
+
+/** Everything {@link screenCandidatePath} needs to judge one path. */
+interface ScreenOptions {
+  /**
+   * The path being judged: absolute, POSIX separators, already normalised.
+   *
+   * For the discovery pass this is a path the traversal produced; for the
+   * defence-in-depth pass it is a path the compiler holds. The screen makes no
+   * distinction, which is the point of there being one screen.
+   */
+  readonly candidatePath: string;
+
+  /** The normalised absolute project root, as the caller spelled it. */
+  readonly projectRoot: string;
+
+  /**
+   * The project root with every symbolic link resolved — see
+   * {@link resolveCanonicalRoot}. The one base containment is decided against.
+   */
+  readonly canonicalProjectRoot: string;
+
+  /** Caller-supplied exclusions, already defaulted. */
+  readonly extraExcludes: readonly string[];
+}
+
+/**
+ * The single path screen: the one place that decides whether a file may be
+ * read and indexed.
+ *
+ * Both call sites use it — {@link admitScreenedSourceFiles} before a file is
+ * loaded and {@link retainIndexableSourceFiles} over what the compiler holds —
+ * so there is exactly one rule about containment in this module rather than a
+ * strong one and a weak one that can drift apart.
+ *
+ * ## The order of the questions is deliberate
+ *
+ * The lexical judgements come first, so the common case — an ordinary source
+ * file — costs no syscall beyond the one `realpath` below, and a path that is
+ * excluded by its own name never causes a filesystem operation at all.
+ *
+ * Then the whole path is resolved. `realpath` resolves **every component**,
+ * not just the last, which is what reveals a regular file reached through a
+ * symlinked directory — the case a final-component `lstat` cannot see. The
+ * resolved path is required to be inside the project and is re-judged by the
+ * same predicates, because a link's own basename says nothing about what it
+ * reads: `src/config.ts -> ../.env` is indexable by name and an environment
+ * file in fact.
+ *
+ * ## Containment is decided against the canonical root, and nothing else
+ *
+ * Two spellings of the root exist and they do different jobs. The path the
+ * caller passed is what the handle reports and what every loaded file is
+ * spelled under, because a consumer's cache key and its `SourceLocation`s have
+ * to match what it asked for. The *canonical* root — the same directory with
+ * every symbolic link resolved — is the only base a resolved path is required
+ * to sit under, and a resolved path is by construction free of links, so the
+ * comparison is between two canonical paths and has one answer. Accepting the
+ * lexical root as a second base, as an earlier version of this screen did,
+ * widens that answer for no gain: a resolved path can only match the lexical
+ * root when the two are the same string.
+ *
+ * ## And the resolved path must be a regular file
+ *
+ * A *directory* can carry a name this module calls indexable — a link named
+ * `<name>.ts` pointing at a directory is the shape a following glob layer
+ * yields, and a real directory so named is legal — and handing one to the
+ * compiler turns an ordinary project into a failed open. It is refused as an
+ * exclusion, quietly, because it is a naming accident rather than a breach.
+ *
+ * @param options The path to judge, the project's two roots and the exclusions.
+ * @returns The verdict; only `indexable` permits the file to be read.
+ */
+function screenCandidatePath(options: ScreenOptions): ScreenVerdict {
+  const { candidatePath, projectRoot, canonicalProjectRoot, extraExcludes } = options;
+
+  if (isEnvFilePath(candidatePath)) {
+    return 'env';
+  }
+
+  if (
+    !isIndexableFile(candidatePath) ||
+    shouldExcludePath(projectRoot, candidatePath, extraExcludes)
+  ) {
+    return 'excluded';
+  }
+
+  const real = tryCatch(() => realpathSync(candidatePath));
+  if (isErr(real)) {
+    return 'unresolvable';
+  }
+  const resolvedPath = normalizePosix(toPosix(real.value));
+
+  if (!isWithin(canonicalProjectRoot, resolvedPath)) {
+    return 'escaping';
+  }
+
+  const resolvedStats = tryCatch(() => statSync(resolvedPath, { throwIfNoEntry: false }));
+  if (isErr(resolvedStats) || resolvedStats.value === undefined) {
+    return 'unresolvable';
+  }
+  if (!resolvedStats.value.isFile()) {
+    return 'excluded';
+  }
+
+  if (isEnvFilePath(resolvedPath)) {
+    return 'env';
+  }
+
+  if (
+    !isIndexableFile(resolvedPath) ||
+    shouldExcludePath(canonicalProjectRoot, resolvedPath, extraExcludes)
+  ) {
+    return 'excluded';
+  }
+
+  return 'indexable';
+}
+
+/**
+ * How many refused paths a single log record names.
+ *
+ * Counts are always exact; the *paths* are a bounded sample, because a
+ * pathological tree — a directory of dangling links, a vendored copy of a
+ * project — can refuse thousands of files and a log record that grows with the
+ * filesystem is a denial of service against whoever reads the log. Twenty is
+ * enough for a developer to recognise the pattern and small enough to print.
+ */
+const MAX_REPORTED_REFUSAL_PATHS = 20;
+
+/** The tally of one refusal class: every occurrence counted, a sample named. */
+interface RefusalRecord {
+  /** How many candidates this class refused. Exact. */
+  count: number;
+
+  /**
+   * Up to {@link MAX_REPORTED_REFUSAL_PATHS} of the refused paths, in
+   * project-relative form.
+   *
+   * Project-relative on purpose. For an escaping file this is the *link's*
+   * path, never its resolved target: the target names a location on the
+   * developer's filesystem, and reporting it would disclose the layout a
+   * refusal exists to keep out of the product.
+   */
+  readonly reported: string[];
+}
+
+/** The tally of every refusal class from one screening pass. */
+type RefusalTally = Readonly<Record<RefusalVerdict, RefusalRecord>>;
+
+/**
+ * How the refused files of a pass were disposed of, as the phrase the log
+ * record uses.
+ *
+ * Both call sites report the same four classes and differ only here, so the
+ * difference is a word rather than a second set of messages: discovery refuses
+ * a candidate *before* it is read, and the defence-in-depth pass unloads a file
+ * that had already been read.
+ */
+type RefusalDisposition = 'refused before being read' | 'refused and unloaded';
+
+/** A fresh, zeroed tally. */
+function createRefusalTally(): RefusalTally {
+  return {
+    excluded: { count: 0, reported: [] },
+    env: { count: 0, reported: [] },
+    escaping: { count: 0, reported: [] },
+    unresolvable: { count: 0, reported: [] },
+  };
+}
+
+/**
+ * Counts one refusal and, while there is room in the sample, names it.
+ *
+ * @param tally The pass's tally, mutated in place.
+ * @param verdict The class the candidate was refused under.
+ * @param reportablePath The refused path in project-relative form.
+ */
+function recordRefusal(tally: RefusalTally, verdict: RefusalVerdict, reportablePath: string): void {
+  const record = tally[verdict];
+  record.count += 1;
+  if (record.reported.length < MAX_REPORTED_REFUSAL_PATHS) {
+    record.reported.push(reportablePath);
+  }
+}
+
+/**
+ * Reports a pass's refusals: one record per non-empty class, counts and paths
+ * only.
+ *
+ * Nothing about a file's *content* is logged here or anywhere else in this
+ * module — that is the whole point of refusing the file — and an escaping
+ * link's resolved target is deliberately absent for the reason given on
+ * {@link RefusalRecord.reported}.
+ *
+ * The three privacy and containment classes are `warn`: reaching one of them
+ * means either that {@link discoverCandidatePaths} let something through or
+ * that the project holds a link which reads from outside itself, and both
+ * deserve a developer's attention. Ordinary exclusions are `debug`, because
+ * they are the expected outcome for most of a real project's tree.
+ *
+ * @param tally The pass's tally.
+ * @param projectRoot The root the pass ran over, for the log fields.
+ * @param disposition What happened to the refused files.
+ * @param logger Where the records go.
+ */
+function reportRefusals(
+  tally: RefusalTally,
+  projectRoot: string,
+  disposition: RefusalDisposition,
+  logger: Logger,
+): void {
+  if (tally.env.count > 0) {
+    logger.warn(
+      `environment files were ${disposition}: the indexer never reads them (privacy model)`,
+      { projectRoot, count: tally.env.count, files: tally.env.reported },
+    );
+  }
+
+  if (tally.escaping.count > 0) {
+    logger.warn(`files whose real path leaves the project were ${disposition}`, {
+      projectRoot,
+      count: tally.escaping.count,
+      files: tally.escaping.reported,
+    });
+  }
+
+  if (tally.unresolvable.count > 0) {
+    logger.warn(`files whose real path could not be established were ${disposition}`, {
+      projectRoot,
+      count: tally.unresolvable.count,
+      files: tally.unresolvable.reported,
+    });
+  }
+
+  if (tally.excluded.count > 0) {
+    logger.debug('files were excluded from the code index', {
+      projectRoot,
+      count: tally.excluded.count,
+    });
+  }
+}
+
+/** Everything {@link admitScreenedSourceFiles} needs to load a project's files. */
+interface AdmitOptions {
+  /** The project the surviving candidates are loaded into. */
+  readonly project: Project;
+
+  /**
+   * The paths {@link discoverCandidatePaths} produced.
+   *
+   * Each one is converted to POSIX separators and normalised here, so the path
+   * the screen judges is the path the compiler is given and the path a later
+   * pass re-judges.
+   */
+  readonly candidatePaths: readonly string[];
+
+  /** The normalised absolute project root. */
+  readonly projectRoot: string;
+
+  /** The project root with every symbolic link resolved — the containment base. */
+  readonly canonicalProjectRoot: string;
+
+  /** Caller-supplied exclusions, already defaulted. */
+  readonly extraExcludes: readonly string[];
+
+  /** Where refusals are reported. */
+  readonly logger: Logger;
+}
+
+/**
+ * Screens every discovered candidate and loads only the ones that survive.
+ *
+ * This is the step that makes the privacy guarantee mechanical rather than
+ * hopeful: a refused candidate is never opened, so its bytes never enter the
+ * compiler's memory, a graph node, a summary or a prompt — there is nothing to
+ * unload afterwards, and no window in which another stage could have read it.
+ *
+ * A candidate that vanished between discovery and loading is skipped:
+ * `addSourceFileAtPathIfExists` answers `undefined` for it rather than
+ * throwing, which is exactly the case a concurrent build or a dev-server cache
+ * sweep produces. A candidate that exists but cannot be *read* is a different
+ * matter and fails the whole open with `CODE_INDEX_FAILED` — the behaviour
+ * documented on {@link openProject}, where an unreadable file is an `Err`
+ * rather than a silently smaller index.
+ *
+ * @param options The project, the candidates, the project's two roots and where
+ * to report.
+ * @returns `Ok` with the number of files loaded, or `Err` when a candidate
+ * could not be read.
+ */
+function admitScreenedSourceFiles(options: AdmitOptions): Result<number> {
+  const { project, candidatePaths, projectRoot, canonicalProjectRoot, extraExcludes, logger } =
+    options;
+
+  const tally = createRefusalTally();
+  let loadedCount = 0;
+  let vanishedCount = 0;
+
+  for (const discoveredPath of candidatePaths) {
+    const candidatePath = normalizePosix(toPosix(discoveredPath));
+
+    const verdict = screenCandidatePath({
+      candidatePath,
+      projectRoot,
+      canonicalProjectRoot,
+      extraExcludes,
+    });
+
+    if (verdict !== 'indexable') {
+      recordRefusal(
+        tally,
+        verdict,
+        projectRelativeOrUndefined(projectRoot, candidatePath) ?? candidatePath,
+      );
+      continue;
+    }
+
+    const added = tryCatch(
+      () => project.addSourceFileAtPathIfExists(candidatePath),
+      'CODE_INDEX_FAILED',
+    );
+    if (isErr(added)) {
+      return err(
+        failure(
+          'CODE_INDEX_FAILED',
+          `The source files of the project at '${projectRoot}' could not be read: ${added.error.message}`,
+          'source-files-unreadable',
+          'Check that the project directory and its files are readable, then try again.',
+          added.error,
+        ),
+      );
+    }
+
+    if (added.value === undefined) {
+      vanishedCount += 1;
+      continue;
+    }
+
+    loadedCount += 1;
+  }
+
+  reportRefusals(tally, projectRoot, 'refused before being read', logger);
+
+  if (vanishedCount > 0) {
+    logger.debug('files disappeared between discovery and loading and were skipped', {
+      projectRoot,
+      count: vanishedCount,
+    });
+  }
+
+  return ok(loadedCount);
 }
 
 /** Everything {@link retainIndexableSourceFiles} needs to judge a file. */
@@ -985,17 +1685,17 @@ interface RetainOptions {
   readonly projectRoot: string;
 
   /**
-   * The project root with every symbolic link resolved, or the root itself when
-   * it could not be resolved.
+   * The project root with every symbolic link resolved — the one base a
+   * resolved path is required to sit under.
    *
-   * Needed because a root may legitimately be reached through a link — a
-   * checkout under a linked home directory, or a temporary directory on a
-   * platform that links its temporary path — and a file's resolved path would
-   * then sit under the *real* root while the project speaks of the link. A
-   * containment test against the link alone would refuse every file in such a
-   * project.
+   * A root may legitimately be reached through a link (a checkout under a
+   * linked home directory, or a temporary directory on a platform that links
+   * its temporary path), and a file's resolved path then sits under the *real*
+   * root while the project speaks of the link. Resolving the root once, in
+   * {@link resolveCanonicalRoot}, is what lets containment be a single
+   * canonical comparison instead of a choice between two bases.
    */
-  readonly realProjectRoot: string;
+  readonly canonicalProjectRoot: string;
 
   /** Caller-supplied exclusions, already defaulted. */
   readonly extraExcludes: readonly string[];
@@ -1005,27 +1705,31 @@ interface RetainOptions {
 }
 
 /**
- * The defence-in-depth filter: re-judges every file the glob layer loaded and
- * returns the deterministic, frozen file set the handle exposes.
+ * The defence-in-depth filter: re-judges every file the compiler actually
+ * holds and returns the deterministic, frozen file set the handle exposes.
  *
- * Why it exists even though the globs already exclude: a glob list is a piece
- * of string-building, and string-building can be wrong. This pass asks the
- * predicates directly — {@link shouldExcludePath} and
- * {@link isIndexableFile} — of every path the compiler actually holds, so a
- * mistake in a pattern costs an entry in the log instead of a leak.
+ * Why it exists even though {@link admitScreenedSourceFiles} already screened
+ * every candidate: the compiler's program is not only what this module put
+ * there. A traversal is code and code can be wrong; a future call site may add
+ * a file; module resolution may pull one in. This
+ * pass therefore asks {@link screenCandidatePath} — the *same* screen, not a
+ * weaker second rule — of every path `project.getSourceFiles()` reports, so a
+ * mistake anywhere upstream costs an entry in the log instead of a leak.
  *
- * Two classes of refusal go further than dropping the file from the set, and
+ * Three classes of refusal go further than dropping the file from the set, and
  * are *unloaded from the compiler* with `removeSourceFile`, which also releases
  * the content ts-morph read:
  *
- * - **Environment files.** The privacy guarantee of this package. Reported at
- *   `warn`, because reaching this branch means a pattern failed and somebody
- *   should look.
- * - **Symbolic links whose target leaves the project.** A link inside the root
- *   is indistinguishable from an ordinary file to a string-level containment
- *   check, so a link named like a module can point anywhere on the filesystem.
- *   The link is resolved and required to stay inside the project; one that does
- *   not is unloaded and reported at `warn`.
+ * - **Environment files** (`env`), by name or by resolved path. The privacy
+ *   guarantee of this package.
+ * - **Files whose real path leaves the project** (`escaping`) — what a
+ *   symlinked directory or a symlinked file achieves, and what a string-level
+ *   containment check cannot see.
+ * - **Files whose real path could not be established** (`unresolvable`), which
+ *   is the fail-closed direction: an unverifiable provenance is not indexed.
+ *
+ * All three are reported at `warn`, because reaching any of them here means a
+ * file was read before it was judged and somebody should look.
  *
  * Everything else that is refused — a path under an excluded tree, a
  * declaration file, a minified bundle — is simply absent from the returned set
@@ -1037,36 +1741,39 @@ interface RetainOptions {
  * @returns The frozen, sorted set of indexable source files.
  */
 function retainIndexableSourceFiles(options: RetainOptions): readonly SourceFile[] {
-  const { project, projectRoot, realProjectRoot, extraExcludes, logger } = options;
+  const { project, projectRoot, canonicalProjectRoot, extraExcludes, logger } = options;
 
   const kept: { readonly relativePath: string; readonly sourceFile: SourceFile }[] = [];
   const unload: SourceFile[] = [];
-  const envFiles: string[] = [];
-  let escapingLinkCount = 0;
-  let excludedCount = 0;
+  const tally = createRefusalTally();
 
   for (const sourceFile of project.getSourceFiles()) {
-    const filePath: string = sourceFile.getFilePath();
+    const filePath: string = normalizePosix(toPosix(sourceFile.getFilePath()));
 
-    if (isEnvFilePath(filePath)) {
-      envFiles.push(projectRelativeOrUndefined(projectRoot, filePath) ?? filePath);
-      unload.push(sourceFile);
+    const verdict = screenCandidatePath({
+      candidatePath: filePath,
+      projectRoot,
+      canonicalProjectRoot,
+      extraExcludes,
+    });
+
+    if (verdict !== 'indexable') {
+      recordRefusal(tally, verdict, projectRelativeOrUndefined(projectRoot, filePath) ?? filePath);
+      // An ordinary exclusion is merely absent from the set; a privacy or
+      // containment refusal has its content taken out of memory as well.
+      if (verdict !== 'excluded') {
+        unload.push(sourceFile);
+      }
       continue;
     }
 
     const relative = toProjectRelative(projectRoot, filePath);
-    if (
-      isErr(relative) ||
-      shouldExcludePath(projectRoot, filePath, extraExcludes) ||
-      !isIndexableFile(filePath)
-    ) {
-      excludedCount += 1;
-      continue;
-    }
-
-    if (escapesProjectThroughSymlink(filePath, projectRoot, realProjectRoot)) {
-      escapingLinkCount += 1;
-      unload.push(sourceFile);
+    if (isErr(relative)) {
+      // Unreachable through the screen above — a file it calls indexable is
+      // inside the project — and handled rather than asserted, because the
+      // alternative is a non-null assertion on a value the compiler cannot
+      // narrow. Counted as the ordinary exclusion it would be.
+      recordRefusal(tally, 'excluded', filePath);
       continue;
     }
 
@@ -1091,26 +1798,7 @@ function retainIndexableSourceFiles(options: RetainOptions): readonly SourceFile
     }
   }
 
-  if (envFiles.length > 0) {
-    logger.warn(
-      'environment files were refused and unloaded: the indexer never reads them (privacy model)',
-      { projectRoot, count: envFiles.length, files: envFiles },
-    );
-  }
-
-  if (escapingLinkCount > 0) {
-    logger.warn('symbolic links leaving the project were refused and unloaded', {
-      projectRoot,
-      count: escapingLinkCount,
-    });
-  }
-
-  if (excludedCount > 0) {
-    logger.debug('files were excluded from the code index', {
-      projectRoot,
-      count: excludedCount,
-    });
-  }
+  reportRefusals(tally, projectRoot, 'refused and unloaded', logger);
 
   kept.sort((left, right) => comparePaths(left.relativePath, right.relativePath));
 
@@ -1196,57 +1884,39 @@ function projectRelativeOrUndefined(projectRoot: string, absolutePath: string): 
 }
 
 /**
- * The path with every symbolic link resolved, or the path itself when it cannot
- * be resolved.
+ * The project root with every symbolic link resolved: the base every
+ * containment decision in this module is made against.
  *
- * Used once per opened project, for the root. A failure here is not
- * interesting: the root has already been confirmed to be a directory, and the
- * unresolved value is a usable containment base on its own.
+ * Resolved once per opened project, and a failure is an `Err` rather than a
+ * fallback to the unresolved path. That is the fail-closed direction and it is
+ * the only honest one: if the root's own real location cannot be established,
+ * no file's real location can be judged against it, and quietly using the
+ * unresolved spelling would either refuse every file in the project — a
+ * silently empty index, the outcome this module documents as never acceptable
+ * without a reason — or accept a path whose containment was never actually
+ * proven. The root has already been confirmed to exist and to be a directory
+ * by {@link requireDirectory}, so reaching here means a link cycle above the
+ * root or a directory this account may not traverse, and the developer is told
+ * which.
+ *
+ * @param projectRoot The normalised absolute project root.
+ * @returns `Ok` with the canonical root, or `Err` carrying `PROJECT_NOT_FOUND`.
  */
-function realPathOrSelf(path: string): string {
-  const real = tryCatch(() => realpathSync(path));
-  return isErr(real) ? path : normalizePosix(toPosix(real.value));
-}
-
-/**
- * Whether a file inside the project is a symbolic link whose target lies
- * outside it.
- *
- * The string-level containment gate cannot see this: a link at
- * `src/<name>.ts` is, as a path, inside the project, and only resolving it
- * reveals where it actually reads from. Indexing such a file would put content
- * from outside the project — potentially from anywhere the developer's user can
- * read — into the graph, the summary and, through a later stage, a prompt.
- *
- * The check is arranged so the common case costs a single `lstat` and nothing
- * else: a file that is not a link is accepted immediately, and only a link is
- * resolved. A link that cannot be resolved at all is refused, which is the
- * fail-closed direction — a broken or cyclic link has no content worth
- * indexing. A file that has vanished between the glob and this pass is
- * accepted: ts-morph already holds its content, and its path is inside the
- * project.
- *
- * Containment is tested against both the project root and its resolved form,
- * because a project reached through a link would otherwise have every one of
- * its files refused.
- */
-function escapesProjectThroughSymlink(
-  filePath: string,
-  projectRoot: string,
-  realProjectRoot: string,
-): boolean {
-  const link = tryCatch(() => lstatSync(filePath, { throwIfNoEntry: false }));
-  if (isErr(link) || link.value === undefined || !link.value.isSymbolicLink()) {
-    return false;
-  }
-
-  const real = tryCatch(() => realpathSync(filePath));
+function resolveCanonicalRoot(projectRoot: string): Result<string> {
+  const real = tryCatch(() => realpathSync(projectRoot), 'PROJECT_NOT_FOUND');
   if (isErr(real)) {
-    return true;
+    return err(
+      failure(
+        'PROJECT_NOT_FOUND',
+        `The real location of the project root '${projectRoot}' could not be established: ${real.error.message}`,
+        'project-root-unresolvable',
+        'Check that every directory on the way to the project can be read by this user, then try again.',
+        real.error,
+      ),
+    );
   }
 
-  const resolved = normalizePosix(toPosix(real.value));
-  return !isWithin(projectRoot, resolved) && !isWithin(realProjectRoot, resolved);
+  return ok(normalizePosix(toPosix(real.value)));
 }
 
 /**

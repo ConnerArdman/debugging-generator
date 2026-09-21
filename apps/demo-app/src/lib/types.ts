@@ -235,6 +235,11 @@ export interface LowStockRow {
  * The inventory dashboard's payload: totals across every warehouse, the
  * warehouses themselves and the rows the low-stock list renders.
  *
+ * `movementVolume` is the units the recorded stock changes account for, counting
+ * a receipt and a shipment alike as the units they moved. It reads as
+ * throughput rather than as a balance, which is why it is far larger than
+ * `totalOnHand` and why nothing is subtracted from it.
+ *
  * `generatedAt` is the instant the server computed the totals, which the page
  * prints so a reader can tell how current the figures are.
  */
@@ -243,6 +248,7 @@ export interface InventorySummary {
   totalOnHand: number;
   totalReserved: number;
   lowStockCount: number;
+  movementVolume: number;
   warehouses: WarehouseSummary[];
   lowStock: LowStockRow[];
   generatedAt: string;
@@ -292,6 +298,50 @@ export interface CartItemDraft {
   productId: string;
   quantity: number;
 }
+
+/**
+ * The request body that sets one line of the cart to an exact quantity.
+ *
+ * `lineId` is the {@link CartLine.id} the server published rather than a
+ * product identifier: a cart holds one line per product, and a line is the
+ * thing a shopper changes the quantity of.
+ *
+ * `quantity` is the number of units the line holds afterwards, not a delta, so
+ * the same request applied twice leaves the cart where one application left it.
+ * It is at least one unit, because a line of nothing is a line that is gone and
+ * removing one is {@link CartLineRemoval}'s job.
+ */
+export interface CartLineQuantityDraft {
+  lineId: string;
+  quantity: number;
+}
+
+/** The request body that takes one line, named by its {@link CartLine.id}, out of the cart. */
+export interface CartLineRemoval {
+  lineId: string;
+}
+
+/**
+ * Every change `POST /api/cart/items` accepts, tagged by the change being asked
+ * for.
+ *
+ * The four members are the cart's whole write surface: add units of a product,
+ * set a line to a quantity, take one line out, and take every line out. They
+ * share one endpoint because a cart's contents are one resource, and each of
+ * them is answered with the same authoritative {@link CartView} — so a browser
+ * that changed the cart never has to work out what the cart now holds, and the
+ * prices and totals it displays remain the server's.
+ *
+ * `operation` is a literal on every member, which makes the union
+ * discriminated: a body that omits the tag or invents a value is refused by the
+ * endpoint's schema instead of being treated as some other change, and the
+ * server switches on a value the compiler has already narrowed to one shape.
+ */
+export type CartMutation =
+  | ({ operation: 'add' } & CartItemDraft)
+  | ({ operation: 'set' } & CartLineQuantityDraft)
+  | ({ operation: 'remove' } & CartLineRemoval)
+  | { operation: 'empty' };
 
 /* ---------------------------------------------------------------------------
  * Checkout and orders
@@ -406,8 +456,14 @@ export interface ShippingOption {
  *
  * The name ends in `Result` so a server module can hold it beside the persisted
  * quote model without having to alias either name.
+ *
+ * `id` names the quote the store recorded for the service it offered, so a
+ * checkout can put the order it places on the very quote its customer chose
+ * rather than on whichever quote was taken most recently. It is `null` only
+ * when nothing was on offer and there was therefore no rate to record.
  */
 export interface ShippingQuoteResult {
+  id: string | null;
   options: ShippingOption[];
   destinationPostalCode: string;
   quotedAt: string;

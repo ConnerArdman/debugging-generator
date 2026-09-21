@@ -21,8 +21,7 @@
  * and never indexes the styles object with a computed key: such a lookup is typed
  * `string | undefined` under this repository's `noUncheckedIndexedAccess`, and it hides a typo
  * until a box renders unstyled in a browser. An attribute is constrained by the prop union below
- * and is legible in the elements tree, which is what this application exists to be inspected
- * with.
+ * and is legible in the elements tree beside the class it qualifies.
  *
  * ACCESSIBILITY: DECORATIVE, DELIBERATELY
  * The outermost element carries `aria-hidden="true"` and holds no text, in either branch. A
@@ -33,12 +32,10 @@
  * entirely.
  *
  * RENDER BEHAVIOUR
- * A plain function component - no `memo`, no memoised values, no state, no effects - and no client
- * directive, so a server component and a client component render it equally. Nothing is read from
- * the clock, `Math.random()` or `window` while rendering, so the markup the server sends and the
- * markup the browser first produces always agree. It re-renders whenever its parent does, on
- * purpose: this application's render behaviour is the subject under investigation rather than
- * something for a primitive to smooth over.
+ * A plain function component - no state, no effects - and no client directive, so a server
+ * component and a client component render it equally. Nothing is read from the clock,
+ * `Math.random()` or `window` while rendering, so the markup the server sends and the markup the
+ * browser first produces always agree.
  */
 
 import clsx from 'clsx';

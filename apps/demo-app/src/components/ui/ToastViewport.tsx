@@ -62,9 +62,7 @@
  * unstyled; an unknown value would fall back to the neutral accent rather than break the layout.
  *
  * No props, and no exported props type: the component is mounted once, at a known place, with
- * nothing to configure. A plain function component, with no `memo` and no memoised callbacks -
- * this application's render behaviour is the subject under investigation, and a primitive that
- * smoothed it over would hide what an observer came to see.
+ * nothing to configure. Its only hook is the context read that hands it the queue.
  */
 
 import { useToastCenter } from '@/providers/ToastProvider';

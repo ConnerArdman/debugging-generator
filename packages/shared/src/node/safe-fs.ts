@@ -220,6 +220,21 @@ function noFollowFlag(): number {
 }
 
 /**
+ * The `O_DIRECTORY` flag, or `0` where the platform has no such flag.
+ *
+ * Detected exactly the way {@link noFollowFlag} detects its own constant, and
+ * for the same reason: the declarations promise the POSIX set, the runtime does
+ * not, and a missing constant must contribute nothing to a bit mask rather than
+ * a `NaN`. It pairs with `O_NOFOLLOW` when {@link ensureSecureDir} opens a
+ * directory it is about to tighten — together they say "this exact object, and
+ * only if it really is a directory".
+ */
+function directoryFlag(): number {
+  const flag: unknown = constants.O_DIRECTORY;
+  return typeof flag === 'number' ? flag : 0;
+}
+
+/**
  * The current user id, or `undefined` on a platform that has no such concept.
  *
  * Called as a method so it keeps its receiver, and checked for existence
@@ -253,6 +268,60 @@ function unsafePath(
     hint,
     details: { path: pathAbs, reason, ...extra },
   });
+}
+
+/**
+ * Refuses a path because a component of it is a symbolic link.
+ *
+ * Every refusal of this kind carries the same code, the same reason and the
+ * same hint — the developer's next action is always "replace the link" — so
+ * only the consequence differs between call sites, and it is a clause rather
+ * than a whole sentence to keep that single shape visible. Declared as
+ * returning `never` so a caller reads as a terminator and the compiler narrows
+ * the code after it.
+ *
+ * @param componentAbs The offending component, named in both the message and
+ * `details.path` because the developer has to act on that exact path.
+ * @param consequence What was therefore not done, as a clause completing
+ * "…is a symbolic link, so …".
+ */
+function refuseSymlinkComponent(componentAbs: string, consequence: string): never {
+  throw unsafePath(
+    `'${componentAbs}' is a symbolic link, so ${consequence}.`,
+    'symlink-component',
+    componentAbs,
+    'Replace the link with a real directory, or point the tool at a location that is not reached through a link.',
+  );
+}
+
+/**
+ * Refuses a component owned by another account.
+ *
+ * Shared by the verification pass and the creation walk, so the refusal a
+ * developer sees for "this directory is not yours" has one wording and one set
+ * of details wherever it is raised — and so a change to either cannot apply to
+ * one path through the module and not the other. A foreign-owned directory is
+ * refused rather than repaired because the account that owns it can replace it,
+ * and its contents, at any moment after the check.
+ *
+ * @param componentAbs The component being judged.
+ * @param ownerUid The uid `lstat` reported for it.
+ * @param expectedUid This process's own uid.
+ */
+function assertOwnedByThisAccount(
+  componentAbs: string,
+  ownerUid: number,
+  expectedUid: number,
+): void {
+  if (ownerUid !== expectedUid) {
+    throw unsafePath(
+      `'${componentAbs}' is owned by another account, so its contents cannot be kept private.`,
+      'foreign-owner',
+      componentAbs,
+      'Use a directory owned by the account running this tool.',
+      { owner: ownerUid, expectedOwner: expectedUid },
+    );
+  }
 }
 
 /**
@@ -390,14 +459,8 @@ function assertComponentSecure(componentAbs: string, requireOwner: boolean): voi
     return;
   }
 
-  if (requireOwner && stats.uid !== uid) {
-    throw unsafePath(
-      `'${componentAbs}' is owned by another account, so its contents cannot be kept private.`,
-      'foreign-owner',
-      componentAbs,
-      'Use a directory owned by the account running this tool.',
-      { owner: stats.uid, expectedOwner: uid },
-    );
+  if (requireOwner) {
+    assertOwnedByThisAccount(componentAbs, stats.uid, uid);
   }
 
   if ((stats.mode & GROUP_AND_OTHER_BITS) !== 0) {
@@ -508,37 +571,353 @@ export function assertSecureDir(dir: string, opts?: AssertSecureDirOptions): voi
 }
 
 /**
- * Creates a directory and every missing parent, then tightens the chain to
- * {@link SECURE_DIR_MODE} and verifies it.
+ * Whether the filesystem has *something* at `pathAbs` — a directory, a file, a
+ * symbolic link, anything at all.
+ *
+ * `lstat`, not `stat`: a dangling link exists as far as a creation walk is
+ * concerned, and resolving it would report the opposite. Every failure is read
+ * as "not known to exist", including the ones that are not `ENOENT`: a
+ * component under a regular file answers `ENOTDIR`, and a component this
+ * process may not look at answers `EACCES`. Neither is a licence to skip it —
+ * the `mkdir` that follows will meet the same condition and report the
+ * platform's own errno, which is precisely what a caller needs to see.
+ */
+function isKnownToExist(pathAbs: string): boolean {
+  try {
+    lstatSync(pathAbs);
+    return true;
+  } catch {
+    // The distinction between "absent" and "unreadable" belongs to `mkdir`,
+    // which is about to make it with the real errno attached.
+    return false;
+  }
+}
+
+/**
+ * The components a creation pass has to bring into existence, outermost first,
+ * always ending at `dirAbs`.
+ *
+ * This is the no-boundary counterpart of {@link secureChain}: the caller named
+ * no ancestor, so the walk finds where its own work starts — it climbs from
+ * `dirAbs` while a component is not known to exist and stops at the first one
+ * that is. That component is **not** part of the chain: it already existed,
+ * this call is not creating it, and it may legitimately be a directory the
+ * product does not own (a home directory, a temp directory) whose mode this
+ * function has no business tightening.
+ *
+ * Stopping there is a statement about *work*, not about trust. The climb uses
+ * `lstat`, which resolves every interior component, so the path it stops at can
+ * itself sit inside a symbolic link — which is exactly why
+ * {@link ensureSecureDir} tests the whole prefix above this chain with
+ * {@link assertPrefixIsSymlinkFree} before it creates or tightens anything.
+ * Reading this function as "the boundary is trusted" is the error that leaves
+ * CWE-59 open.
+ *
+ * `dirAbs` itself is always the last element, existing or not. When it already
+ * exists the chain is the single element, and the non-recursive `mkdir` in
+ * {@link ensureSecureDir} then turns "it exists" into the `EEXIST` that decides
+ * whether it is a directory, a file or a link.
+ */
+function creationChain(dirAbs: string): string[] {
+  const chain = [dirAbs];
+
+  let current = dirAbs;
+  for (;;) {
+    const parent = dirname(current);
+    // The filesystem root is its own parent, which is where a walk that found
+    // nothing existing on the way up stops.
+    if (parent === current || isKnownToExist(parent)) {
+      break;
+    }
+    chain.push(parent);
+    current = parent;
+  }
+
+  chain.reverse();
+  return chain;
+}
+
+/**
+ * Refuses one existing component that is a symbolic link, and says nothing
+ * about anything else.
+ *
+ * A link above the chain redirects the whole tree — and everything later
+ * written into it — to a location the product did not choose, which is the half
+ * of CWE-59 that a per-component walk of the chain alone would still miss.
+ *
+ * Nothing else about the component is policed here, on purpose. It sits outside
+ * the subtree this module can make a statement about, and an existing *file*
+ * there has to keep surfacing the platform's own `ENOTDIR` rather than becoming
+ * a policy error — so a component that cannot be inspected, or that is not a
+ * directory, falls through to `mkdir` and its authentic errno.
+ */
+function assertExistingComponentIsNotALink(componentAbs: string): void {
+  let isLink: boolean;
+  try {
+    isLink = lstatSync(componentAbs).isSymbolicLink();
+  } catch {
+    // Unreadable or absent: `mkdir` is the right reporter for that, not this.
+    return;
+  }
+
+  if (isLink) {
+    refuseSymlinkComponent(componentAbs, 'nothing was created or tightened through it');
+  }
+}
+
+/**
+ * Refuses a path reached through a symbolic link at *any* component of its
+ * existing prefix, naming the outermost one.
+ *
+ * This is what a walk of the chain cannot do for itself, and the reason is a
+ * property of `lstat`: it declines to resolve a link only at the **final**
+ * component of the path it is given, and resolves every interior one. So
+ * "climb until a component exists" stops at the deepest path whose `lstat`
+ * succeeds — and when a directory already sits inside a planted link's target,
+ * that path is *below* the link and the link is never looked at. The tail is
+ * then created inside the target, verified as private and owned (it is: the
+ * attacker's directory is a perfectly ordinary directory), and reported as a
+ * success outside the product's tree. Checking the chain's immediate parent
+ * alone has the same blind spot one component further up.
+ *
+ * Every component is therefore tested, outermost first — the outermost link is
+ * the one that redirects everything below it, and naming it sends the developer
+ * to the directory whose repair makes the rest reachable, which is the order
+ * {@link assertSecureDir} already reports a chain in.
+ *
+ * Only *identity* is tested here, never ownership or permissions: these
+ * components were not created by this call and may legitimately be directories
+ * the product neither owns nor should tighten — a home directory, a temp
+ * directory, the filesystem root. The one thing they may not be is a link,
+ * because then the path names something other than what the caller wrote.
+ *
+ * A caller whose legitimate layout really is reached through a link resolves it
+ * once with `fs.realpathSync` and passes the resolved path, or passes `upTo` to
+ * declare the subtree it owns; both are stated on {@link ensureSecureDir}.
+ *
+ * @param deepestAbs The deepest component of the prefix to test: the parent of
+ * the outermost component the caller is about to create.
+ */
+function assertPrefixIsSymlinkFree(deepestAbs: string): void {
+  const components: string[] = [];
+  let current = deepestAbs;
+  for (;;) {
+    components.push(current);
+
+    const parent = dirname(current);
+    // The filesystem root is its own parent, so this is where the climb stops.
+    if (parent === current) {
+      break;
+    }
+    current = parent;
+  }
+
+  components.reverse();
+  for (const componentAbs of components) {
+    assertExistingComponentIsNotALink(componentAbs);
+  }
+}
+
+/**
+ * Creates one component of a chain, and reports whether *this call* created it.
+ *
+ * Non-recursive by necessity. `mkdir` never follows a symbolic link at the
+ * final component, so a single-component create is the only form whose
+ * behaviour is defined against a planted link: the link arrives as `EEXIST`,
+ * where it can be diagnosed, instead of being silently resolved as an
+ * intermediate component would be.
+ *
+ * The `EEXIST` triage is three-way, and each branch is load-bearing:
+ *
+ * - a symbolic link is refused with `FS_UNSAFE_PATH`, naming that exact path;
+ * - anything else that is not a directory rethrows the **original** `EEXIST`
+ *   untouched, because "a file occupies this path" is the platform's statement
+ *   to make and a caller branches on the errno;
+ * - a real directory continues, after its ownership is checked — a directory
+ *   another account owns cannot be tightened anyway, and creating the
+ *   product's own tree inside it would put that tree at that account's mercy.
+ *
+ * Every other errno propagates unwrapped: `EACCES`, `ENOSPC` and `ENOTDIR` are
+ * answers, not policy failures.
+ *
+ * @returns `true` when this call created the directory, `false` when it was
+ * already there and passed the triage.
+ */
+function createChainComponent(componentAbs: string): boolean {
+  try {
+    mkdirSync(componentAbs, { mode: SECURE_DIR_MODE });
+    return true;
+  } catch (error) {
+    if (errnoCodeOf(error) !== 'EEXIST') {
+      throw error;
+    }
+
+    const stats = lstatSync(componentAbs);
+    if (stats.isSymbolicLink()) {
+      refuseSymlinkComponent(componentAbs, 'nothing was created or tightened through it');
+    }
+    if (!stats.isDirectory()) {
+      throw error;
+    }
+
+    const uid = currentUid();
+    if (uid !== undefined) {
+      assertOwnedByThisAccount(componentAbs, stats.uid, uid);
+    }
+
+    return false;
+  }
+}
+
+/**
+ * Tightens one directory of a chain to {@link SECURE_DIR_MODE}, without ever
+ * following a link.
+ *
+ * `chmod` takes a path, so it is looked up a second time — and between the
+ * `lstat` that proved the path was a directory and that lookup, another process
+ * can replace it with a link to something else. That window is the CWE-367 half
+ * of this module's exposure, and the descriptor route closes it: `open` with
+ * `O_NOFOLLOW | O_DIRECTORY` refuses a link outright and yields a handle to the
+ * object it just resolved, and `fchmod` applies the mode to *that* object, so
+ * there is no second lookup left to redirect.
+ *
+ * The route is chosen by capability, never by platform name. Where
+ * `O_NOFOLLOW` is absent the open buys nothing and the function falls back to
+ * the `lstat`-then-`chmod` sequence, which keeps the reduced guarantee this
+ * module documents for such platforms rather than failing. The same fallback
+ * covers a directory that cannot be *opened* but can be `chmod`-ed — one with
+ * no read permission for its own owner, for instance — so the function stays at
+ * least as capable as the path-based route alone.
+ *
+ * An `ELOOP` from the open is the one failure that is not a fallback case: it
+ * means the platform's no-follow flag met a link at this exact path, which is a
+ * refusal, not an inability.
+ */
+function tightenToSecureDirMode(componentAbs: string): void {
+  const noFollow = noFollowFlag();
+
+  if (noFollow !== 0) {
+    let fd: number | undefined;
+    try {
+      fd = openSync(componentAbs, constants.O_RDONLY | directoryFlag() | noFollow);
+    } catch (error) {
+      if (errnoCodeOf(error) === 'ELOOP') {
+        refuseSymlinkComponent(componentAbs, 'its permissions were left untouched');
+      }
+      // Anything else — no read permission, a platform that rejects this flag
+      // combination — is handled by the path-based route below.
+    }
+
+    if (fd !== undefined) {
+      try {
+        fchmodSync(fd, SECURE_DIR_MODE);
+      } finally {
+        closeSync(fd);
+      }
+      return;
+    }
+  }
+
+  // The path-based route: `chmod` follows a link, so the link test has to
+  // happen first and on this exact path.
+  if (lstatSync(componentAbs).isSymbolicLink()) {
+    refuseSymlinkComponent(componentAbs, 'its permissions were left untouched');
+  }
+  chmodSync(componentAbs, SECURE_DIR_MODE);
+}
+
+/**
+ * Creates a directory and every missing parent, one component at a time,
+ * tightening each to {@link SECURE_DIR_MODE} and verifying the result.
  *
  * This is how the product's state tree comes into existence at the documented
  * `0700`: the service creates its state root and the per-session backup
  * directories beneath it through this function, and the store creates the
  * directory its database file lives in.
  *
- * ## Why `chmod` follows `mkdir`
+ * ## Why the descent is component-by-component
+ *
+ * A single recursive `mkdir` over the whole path cannot be made safe. The
+ * kernel resolves every *non-final* component of a path through its symbolic
+ * links, so an intermediate component of the state tree that has been replaced
+ * by a link — `backups` swapped for a link into a directory another local
+ * account controls — makes the recursive create place the missing tail inside
+ * that directory. Whatever is written there afterwards is written outside the
+ * tree, and a verification pass that runs after the creation is a report, not a
+ * refusal.
+ *
+ * So the walk starts at a trusted boundary and takes one component at a time:
+ *
+ * 1. The chain is computed first — from `opts.upTo` down to `dir` when a
+ *    boundary was given, otherwise by climbing from `dir` to the first
+ *    component that already exists, which becomes the boundary and is left
+ *    alone. Either way the chain ends at `dir`.
+ * 2. The prefix above the chain is tested for links, because that is where an
+ *    intermediate link hides from the climb: `lstat` resolves every *interior*
+ *    component of a path, so a directory already sitting inside a planted
+ *    link's target makes the climb stop *below* the link. Without a boundary,
+ *    **every** component of that prefix must be a real directory, outermost
+ *    reported first. With a boundary, the components from it downward are each
+ *    verified in step 3, so the only remaining question is whether the boundary
+ *    itself is about to be created inside a link.
+ * 3. Each component is created with a **non-recursive** `mkdir`, which never
+ *    follows a link at the final component: a planted link arrives as `EEXIST`
+ *    and is refused by name, an existing file rethrows its own `EEXIST`, and an
+ *    existing directory continues only after its ownership is checked.
+ * 4. Each component is tightened immediately, through a descriptor opened
+ *    `O_NOFOLLOW | O_DIRECTORY` where the platform has those flags, so the mode
+ *    lands on the object the descriptor already names and there is no second
+ *    path lookup for another process to redirect.
+ *
+ * ## Why the mode is applied after `mkdir`
  *
  * The mode passed to `mkdir` is masked by the process umask, so a request for
  * `0700` lands as `0700` under the common `umask 022` and as something narrower
  * or wider under another — and a directory that already existed keeps whatever
  * mode it had, which for a directory created by other means is typically
- * `0755`. Neither case is acceptable for a tree holding a credential, so each
- * directory in the chain is explicitly `chmod`-ed after creation. An existing
- * over-permissive directory **in the product's own tree is deliberately
- * tightened**; that is the intended repair, and it is why this function is safe
- * to call on every start-up rather than only on first run.
+ * `0755`. Neither case is acceptable for a tree holding a credential, so every
+ * component is tightened explicitly. An existing over-permissive directory **in
+ * the product's own tree is deliberately tightened**; that is the intended
+ * repair, and it is why this function is safe to call on every start-up rather
+ * than only on first run. A component's mode is never *asserted* before that
+ * repair — only its type, its identity and its owner are, because those are the
+ * things a repair cannot fix.
  *
- * Each directory is `lstat`-ed immediately before it is tightened, and a
- * symbolic link is refused: `chmod` follows links, so tightening one would
- * change the permissions of whatever it points at — a file the product does not
- * own and was never asked to touch.
+ * ## The chain that is tightened, and what stays unverified
  *
- * ## The chain that is tightened
- *
- * `opts.upTo` when given, otherwise the outermost directory `mkdir` actually
+ * `opts.upTo` when given, otherwise the outermost component this call actually
  * created, otherwise the named directory alone. So a first run that creates the
- * whole tree tightens all of it, and a later run that creates nothing still
- * tightens what the caller declared its own.
+ * whole tree tightens and verifies all of it, and a later run that creates
+ * nothing still tightens what the caller declared its own.
+ *
+ * Stated plainly, the way this module states its POSIX reduction: the
+ * components *above* the chain are checked for one thing only — that none of
+ * them is a symbolic link — and never for ownership or permissions. They
+ * already existed, this call did not create them, and they may legitimately be
+ * directories the product neither owns nor should tighten: a home directory, a
+ * temp directory, the filesystem root. Which components those are depends on
+ * the boundary, and the two cases differ deliberately:
+ *
+ * - **Without `opts.upTo`** there is no declaration to rely on, so the *whole*
+ *   existing prefix must be link-free. A layout that genuinely is reached
+ *   through a link is served by resolving it once with `fs.realpathSync` and
+ *   passing the resolved path.
+ * - **With `opts.upTo`** the caller has declared the subtree it owns and
+ *   vouches for the path to it, so only that boundary's own parent is tested
+ *   for a link, and the components above it are out of scope by construction.
+ *   Everything from the boundary down is verified component by component.
+ *
+ * That is why every product caller passes `upTo: stateRoot`: it is what turns
+ * the guarantee from "the tail this call created is private" into "every
+ * directory from the state root down is private, and none of them is a link".
+ *
+ * One window remains, and naming it is part of the guarantee: the components
+ * above the chain are inspected and then traversed, so a link planted in that
+ * prefix between the inspection and the `mkdir` would still be followed. It is
+ * the residue of a filesystem API with no `openat`/`mkdirat`; the components
+ * this function creates carry no such window, because a non-recursive `mkdir`
+ * and an `O_NOFOLLOW` descriptor decide the question and act on the result in
+ * one step.
  *
  * The function returns only after {@link assertSecureDir} has confirmed the
  * result, which makes a successful return a statement about the filesystem and
@@ -547,9 +926,10 @@ export function assertSecureDir(dir: string, opts?: AssertSecureDirOptions): voi
  * @param dir The directory to create. Resolved against the process's working
  * directory when relative.
  * @param opts `upTo` to tighten and verify a whole chain the caller owns.
- * @throws {DebuggenError} With code `FS_UNSAFE_PATH` when a directory in the
- * chain is a symlink, is not a directory, is owned by another account, or still
- * grants group or other access after the tightening pass. With code `INTERNAL`
+ * @throws {DebuggenError} With code `FS_UNSAFE_PATH` when a component of the
+ * chain — or the directory the chain would be created inside — is a symbolic
+ * link, when a component is owned by another account, or when the chain still
+ * fails {@link assertSecureDir} after the tightening pass. With code `INTERNAL`
  * when `upTo` does not contain `dir`.
  * @throws The runtime's own filesystem error, with its `code` intact:
  * `ENOTDIR`/`EEXIST` when a path component is an existing regular file,
@@ -566,27 +946,40 @@ export function ensureSecureDir(dir: string, opts?: SecureBoundaryOptions): void
 
   // Validated before anything is created, so a caller that passed an unrelated
   // boundary is told about it instead of leaving a directory behind.
-  secureChain(dirAbs, upToAbs);
+  const declaredChain = secureChain(dirAbs, upToAbs);
+  const chain = upToAbs === undefined ? creationChain(dirAbs) : declaredChain;
 
-  const firstCreated = mkdirSync(dirAbs, { recursive: true, mode: SECURE_DIR_MODE });
-
-  const chainTop = upToAbs ?? (firstCreated === undefined ? dirAbs : resolve(firstCreated));
-  for (const componentAbs of secureChain(dirAbs, chainTop)) {
-    // `chmod` resolves a symlink, so the link test has to happen first and on
-    // this exact path. The structural failures are reported by the assertion
-    // below, which sees the same chain.
-    if (lstatSync(componentAbs).isSymbolicLink()) {
-      throw unsafePath(
-        `'${componentAbs}' is a symbolic link, so its permissions were left untouched.`,
-        'symlink-component',
-        componentAbs,
-        'Replace the link with a real directory, or point the tool at a location that is not reached through a link.',
-      );
-    }
-    chmodSync(componentAbs, SECURE_DIR_MODE);
+  // A chain always has at least `dirAbs` in it; the fallback is what satisfies
+  // the compiler's indexed-access strictness rather than a reachable case.
+  const outermostAbs = chain[0] ?? dirAbs;
+  if (upToAbs === undefined) {
+    // Nothing above the chain has been declared, so nothing above it can be
+    // taken on trust: every component the walk will reach through has to be a
+    // real directory. The test runs whether or not the chain's outermost
+    // component exists, because the tightening pass reaches through the same
+    // prefix that a creation would.
+    assertPrefixIsSymlinkFree(dirname(outermostAbs));
+  } else if (!isKnownToExist(outermostAbs)) {
+    // With a boundary, the components from it downward are each verified in the
+    // loop below; the one remaining question is whether the boundary itself is
+    // about to be created inside a link.
+    assertExistingComponentIsNotALink(dirname(outermostAbs));
   }
 
-  assertSecureDir(dirAbs, { upTo: upToAbs });
+  // The outermost component this call created, which is the meaning the
+  // recursive `mkdir` return value used to carry: what this call is
+  // responsible for, and therefore what it can vouch for without a boundary.
+  let firstCreated: string | undefined;
+  for (const componentAbs of chain) {
+    const created = createChainComponent(componentAbs);
+    if (created && firstCreated === undefined) {
+      firstCreated = componentAbs;
+    }
+    tightenToSecureDirMode(componentAbs);
+  }
+
+  const chainTop = upToAbs ?? firstCreated ?? dirAbs;
+  assertSecureDir(dirAbs, { upTo: chainTop });
 }
 
 /** The bytes of a payload: text encoded as UTF-8, bytes taken verbatim. */

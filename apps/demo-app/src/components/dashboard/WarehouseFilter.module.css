@@ -33,7 +33,7 @@
  *
  * There is no motion here - no transition, no animation, nothing that needs a reduced-motion
  * counterpart - because a filter row that animates reads as slow, and this row must read as
- * instant. The dashboard is the honest control surface of this demo and carries no seeded defect.
+ * instant.
  */
 
 /* The `<form method="get">` itself: a wrapping row of labelled controls.

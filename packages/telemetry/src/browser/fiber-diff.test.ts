@@ -25,7 +25,21 @@
  *    changed. A render for which any one of the three could not be evaluated
  *    is `unknown` and is counted separately as
  *    `render_trigger_unknown_count`. The "nothing changed but a dimension was
- *    unevaluable → unknown" case below is what keeps that distinction honest.
+ *    unevaluable → unknown" case below is what keeps that distinction honest,
+ *    and so does its harder sibling: a change hidden past `MAX_TRACKED_KEYS`
+ *    leaves an empty change list, so a scan that stopped at the bound reports
+ *    the dimension unevaluable rather than claiming equality it never
+ *    established.
+ *
+ * **The exported types are part of that contract.** `PropChange`,
+ * `HookChange`, `ContextChange` and `DimensionEvaluability` are what
+ * `../browser/react.ts`, `../aggregate/renders.ts` and the render-event
+ * attributes are written against, so the final `describe` pins each of them to
+ * the function result and the `FiberDiff` member it describes. Those
+ * assertions are compile-time: this file is inside
+ * `packages/telemetry/tsconfig.json`'s `include`, so `pnpm typecheck` fails if
+ * an `export` disappears, a member is renamed, or a shape drifts from what a
+ * consumer imports.
  *
  * **Why every credential fixture is assembled at runtime.** This file is
  * tracked, and `scripts/check-secrets.mjs` scans tracked content for provider
@@ -58,11 +72,19 @@
  * without any I/O, so every input below is built inline.
  */
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, expectTypeOf, it } from 'vitest';
 
 import { REDACTION_MARKER } from '../redaction/rules.js';
 import { MAX_PREVIEW_LENGTH, MAX_TRACKED_KEYS, RENDER_TRIGGERS } from '../schema/attributes.js';
-import type { FiberDiff, RenderTrigger, ValueSummary } from './fiber-diff.js';
+import type {
+  ContextChange,
+  DimensionEvaluability,
+  FiberDiff,
+  HookChange,
+  PropChange,
+  RenderTrigger,
+  ValueSummary,
+} from './fiber-diff.js';
 import {
   analyzeFiber,
   classifyRenderTrigger,
@@ -355,6 +377,125 @@ function makeFiber(spec: FiberSpec = {}): Bag {
     };
   }
   return fiber;
+}
+
+/**
+ * The prop name at `index`, zero-padded to two digits.
+ *
+ * `diffProps` sorts the capped key selection, so padding is what makes
+ * lexicographic order agree with numeric order up to ninety-nine keys — which
+ * is what lets a bounds case name the key that must, or must not, appear in
+ * the reported list.
+ */
+function propKeyAt(index: number): string {
+  return 'p' + String(index).padStart(2, '0');
+}
+
+/** Both sides of a context comparison, as {@link makeChangingContexts} builds them. */
+interface ContextsPair {
+  /** `dependencies` for this render. */
+  readonly contexts: unknown;
+  /** `dependencies` for the previous render. */
+  readonly prevContexts: unknown;
+}
+
+/**
+ * Two dependency chains over the **same** `count` context objects, with either
+ * every consumed value changed or exactly one.
+ *
+ * Sharing the context identities is what makes the differ's identity-first
+ * pairing apply, so a bounds case measures the bound rather than a pairing
+ * failure.
+ *
+ * @param count Dependencies in each chain.
+ * @param changed `'all'` to change every consumed value, or the single index
+ * whose value differs between the two renders.
+ */
+function makeChangingContexts(count: number, changed: 'all' | number): ContextsPair {
+  const objects: Bag[] = Array.from({ length: count }, (_unused, index) => ({
+    displayName: 'ctx' + String(index),
+    _currentValue: index,
+  }));
+  const entries = (next: boolean): ContextEntry[] =>
+    objects.map((context, index) => ({
+      context,
+      value: next && (changed === 'all' || changed === index) ? index + 1 : index,
+    }));
+  return {
+    contexts: makeContextChain(entries(true)),
+    prevContexts: makeContextChain(entries(false)),
+  };
+}
+
+/** Both sides of a hook comparison, as {@link makeChangingHooks} builds them. */
+interface HooksPair {
+  /** `memoizedState` head for this render. */
+  readonly hooks: unknown;
+  /** `memoizedState` head for the previous render. */
+  readonly prevHooks: unknown;
+}
+
+/**
+ * Two `useState`-shaped chains of `length` hooks whose every value differs.
+ *
+ * The counterpart of {@link makeChangingProps} for the hook dimension: every
+ * position changed, so the reported change count equals the number of hooks
+ * the walk actually paired.
+ */
+function makeChangingHooks(length: number): HooksPair {
+  return {
+    hooks: makeHookChain(Array.from({ length }, (_unused, index) => 'next-' + String(index))),
+    prevHooks: makeHookChain(Array.from({ length }, (_unused, index) => 'prev-' + String(index))),
+  };
+}
+
+/** Both sides of a props comparison, as {@link makeChangingProps} builds them. */
+interface PropsPair {
+  /** `memoizedProps` for this render. */
+  readonly props: Bag;
+  /** `memoizedProps` for the previous render. */
+  readonly prevProps: Bag;
+}
+
+/**
+ * `count` props on both sides, every one of them changed between the two
+ * renders.
+ *
+ * Used by the key-bound cases: with every key changed, the number of reported
+ * changes is exactly the number of keys the scan examined, so "at most
+ * `MAX_TRACKED_KEYS` entries are reported" becomes an equality rather than an
+ * inequality.
+ */
+function makeChangingProps(count: number): PropsPair {
+  const props: Bag = {};
+  const prevProps: Bag = {};
+  for (let index = 0; index < count; index += 1) {
+    const key = propKeyAt(index);
+    prevProps[key] = index;
+    props[key] = index + 1;
+  }
+  return { props, prevProps };
+}
+
+/**
+ * `MAX_TRACKED_KEYS + 1` props of which **only the one past the bound**
+ * changed.
+ *
+ * The hard case for the evaluability contract: the scan stops before that key,
+ * so the change list comes back empty and the render is indistinguishable from
+ * one whose props were genuinely all equal. Reported as unevaluable it becomes
+ * `unknown`; reported as evaluated it would become `unchanged` and enter
+ * `unchanged_render_count` (AAP 0.2.3) on the strength of a prop nothing read.
+ */
+function makeLateChangedProps(): PropsPair {
+  const props: Bag = {};
+  const prevProps: Bag = {};
+  for (let index = 0; index <= MAX_TRACKED_KEYS; index += 1) {
+    const key = propKeyAt(index);
+    prevProps[key] = index;
+    props[key] = index === MAX_TRACKED_KEYS ? index + 1 : index;
+  }
+  return { props, prevProps };
 }
 
 // ---------------------------------------------------------------------------
@@ -998,6 +1139,25 @@ describe('summarizeValue', () => {
       expect(summary.truncated).toBeUndefined();
     });
 
+    it('truncates a value one code point past the bound', () => {
+      // The immediate boundary pair for the preview bound: the case above is
+      // the largest value that must pass through whole, and this is the
+      // smallest that must be cut. A length check written with the wrong
+      // comparison — `>` where `>=` was meant, or the reverse — passes both
+      // the exact-bound case and the 500-character case above while failing
+      // exactly here, which is why one code point either side is asserted
+      // rather than a comfortable margin.
+      const justOver = cycle(PROSE_ALPHABET, MAX_PREVIEW_LENGTH + 1);
+
+      const summary = summarizeValue(justOver);
+
+      expect(codePointLength(justOver)).toBe(MAX_PREVIEW_LENGTH + 1);
+      expect(summary.truncated).toBe(true);
+      expect(codePointLength(summary.preview)).toBeLessThanOrEqual(MAX_PREVIEW_LENGTH);
+      expect(summary.preview).not.toBe(justOver);
+      expectWellFormedSummary(summary);
+    });
+
     it('counts the bound in code points, not UTF-16 units', () => {
       // Half the bound in astral characters is twice the bound in code units:
       // a length check written in `String.length` would cut this value.
@@ -1166,24 +1326,69 @@ describe('diffProps', () => {
   it('examines at most the tracked-key bound and reports the overflow', () => {
     const props: Bag = {};
     const prevProps: Bag = {};
-    const keyAt = (index: number): string => 'p' + String(index).padStart(2, '0');
     for (let index = 0; index < MAX_TRACKED_KEYS + 8; index += 1) {
-      prevProps[keyAt(index)] = index;
-      props[keyAt(index)] = index + 1;
+      prevProps[propKeyAt(index)] = index;
+      props[propKeyAt(index)] = index + 1;
     }
 
     const result = diffProps(makeFiber({ props, prevProps }));
 
-    expect(result.evaluable).toBe(true);
+    // Truncated, so equality across the dimension was never established: the
+    // keys past the bound were not read at all. The changes found are still
+    // reported — they are real, and a positive finding outranks an unknown in
+    // `classifyRenderTrigger` — but the dimension may not be read as "these
+    // are all of them", which is what `evaluable` claims.
+    expect(result.evaluable).toBe(false);
     expect(result.truncated).toBe(true);
     expect(result.changed).toHaveLength(MAX_TRACKED_KEYS);
     const reported = result.changed.map((change) => change.key);
     // The bound caps exposure as well as size: a key past it is dropped
     // rather than summarised more coarsely.
-    expect(reported).toContain(keyAt(0));
-    expect(reported).not.toContain(keyAt(MAX_TRACKED_KEYS + 7));
+    expect(reported).toContain(propKeyAt(0));
+    expect(reported).not.toContain(propKeyAt(MAX_TRACKED_KEYS + 7));
     // Deterministic order, so two captures of the same render agree.
     expect(reported).toStrictEqual([...reported].sort());
+  });
+
+  it('compares a props object of exactly the tracked-key bound in full', () => {
+    const { props, prevProps } = makeChangingProps(MAX_TRACKED_KEYS);
+
+    const result = diffProps(makeFiber({ props, prevProps }));
+
+    // The largest props object that fits: every key is read, so the dimension
+    // is complete and nothing is dropped.
+    expect(Object.keys(props)).toHaveLength(MAX_TRACKED_KEYS);
+    expect(result.truncated).toBe(false);
+    expect(result.evaluable).toBe(true);
+    expect(result.changed).toHaveLength(MAX_TRACKED_KEYS);
+  });
+
+  it('drops exactly one key from a props object one past the bound', () => {
+    const { props, prevProps } = makeChangingProps(MAX_TRACKED_KEYS + 1);
+
+    const result = diffProps(makeFiber({ props, prevProps }));
+
+    // One key more than the case above, and the only thing that may differ is
+    // the overflow: still exactly `MAX_TRACKED_KEYS` reported, now flagged
+    // truncated and therefore incomplete. Asserting the pair one key apart is
+    // what pins the bound itself rather than "somewhere around thirty-two".
+    expect(Object.keys(props)).toHaveLength(MAX_TRACKED_KEYS + 1);
+    expect(result.truncated).toBe(true);
+    expect(result.evaluable).toBe(false);
+    expect(result.changed).toHaveLength(MAX_TRACKED_KEYS);
+    expect(result.changed.map((change) => change.key)).not.toContain(propKeyAt(MAX_TRACKED_KEYS));
+  });
+
+  it('is unevaluable when the only changed prop sits past the tracked-key bound', () => {
+    const result = diffProps(makeFiber(makeLateChangedProps()));
+
+    // The visible evidence is identical to a props object that genuinely did
+    // not change — empty change list — so reporting the dimension as evaluated
+    // would let this render be counted in `unchanged_render_count` while the
+    // prop that caused it sat unread past the bound (AAP 0.2.3).
+    expect(result.changed).toStrictEqual([]);
+    expect(result.truncated).toBe(true);
+    expect(result.evaluable).toBe(false);
   });
 
   it('skips a prop whose getter throws and keeps comparing the rest', () => {
@@ -1326,18 +1531,52 @@ describe('diffHookState', () => {
   });
 
   it('bounds a long hook chain and reports the overflow', () => {
-    const length = MAX_TRACKED_KEYS + 6;
-    const result = diffHookState(
-      makeFiber({
-        hooks: makeHookChain(Array.from({ length }, (_, index) => 'next-' + String(index))),
-        prevHooks: makeHookChain(Array.from({ length }, (_, index) => 'prev-' + String(index))),
-      }),
-    );
+    const result = diffHookState(makeFiber(makeChangingHooks(MAX_TRACKED_KEYS + 6)));
 
-    expect(result.evaluable).toBe(true);
+    // Truncated, so the tail of the chain was never walked and the dimension
+    // cannot claim that the hooks it did not reach are unchanged.
+    expect(result.evaluable).toBe(false);
     expect(result.truncated).toBe(true);
     expect(result.changed).toHaveLength(MAX_TRACKED_KEYS);
     expect(result.changed.at(-1)?.index).toBe(MAX_TRACKED_KEYS - 1);
+  });
+
+  it('walks a hook chain of exactly the tracked-key bound in full', () => {
+    const result = diffHookState(makeFiber(makeChangingHooks(MAX_TRACKED_KEYS)));
+
+    // The longest chain that fits: every hook is paired and compared.
+    expect(result.truncated).toBe(false);
+    expect(result.evaluable).toBe(true);
+    expect(result.changed).toHaveLength(MAX_TRACKED_KEYS);
+    expect(result.changed.at(-1)?.index).toBe(MAX_TRACKED_KEYS - 1);
+  });
+
+  it('drops exactly one hook from a chain one past the bound', () => {
+    const result = diffHookState(makeFiber(makeChangingHooks(MAX_TRACKED_KEYS + 1)));
+
+    // One hook longer than the case above: the same thirty-two reported, now
+    // flagged truncated and therefore incomplete.
+    expect(result.truncated).toBe(true);
+    expect(result.evaluable).toBe(false);
+    expect(result.changed).toHaveLength(MAX_TRACKED_KEYS);
+    expect(result.changed.map((change) => change.index)).not.toContain(MAX_TRACKED_KEYS);
+  });
+
+  it('is unevaluable when the only changed hook sits past the tracked-key bound', () => {
+    const length = MAX_TRACKED_KEYS + 1;
+    const shared = Array.from({ length }, (_unused, index) => 'hook-' + String(index));
+    const changedTail = [...shared.slice(0, MAX_TRACKED_KEYS), 'hook-changed'];
+
+    const result = diffHookState(
+      makeFiber({ hooks: makeHookChain(changedTail), prevHooks: makeHookChain(shared) }),
+    );
+
+    // Same shape as the props case: nothing visible changed, but the hook that
+    // did change was never walked, so `unchanged` would be a claim about a
+    // value this capture never read.
+    expect(result.changed).toStrictEqual([]);
+    expect(result.truncated).toBe(true);
+    expect(result.evaluable).toBe(false);
   });
 
   it('terminates on a cyclic hook chain and reports the dimension unevaluable', () => {
@@ -1474,6 +1713,40 @@ describe('diffContexts', () => {
     // comparing two different contexts' values would manufacture a change.
     expect(result.changed).toStrictEqual([]);
     expect(result.evaluable).toBe(true);
+  });
+
+  it('compares a dependency chain of exactly the tracked-key bound in full', () => {
+    const result = diffContexts(makeFiber(makeChangingContexts(MAX_TRACKED_KEYS, 'all')));
+
+    // The longest chain that fits: every dependency is paired by identity and
+    // compared, so the dimension is complete.
+    expect(result.truncated).toBe(false);
+    expect(result.evaluable).toBe(true);
+    expect(result.changed).toHaveLength(MAX_TRACKED_KEYS);
+  });
+
+  it('drops exactly one dependency from a chain one past the bound', () => {
+    const result = diffContexts(makeFiber(makeChangingContexts(MAX_TRACKED_KEYS + 1, 'all')));
+
+    // One dependency more than the case above, and the difference is the
+    // overflow alone: still thirty-two reported, now incomplete.
+    expect(result.truncated).toBe(true);
+    expect(result.evaluable).toBe(false);
+    expect(result.changed).toHaveLength(MAX_TRACKED_KEYS);
+    expect(result.changed.map((change) => change.index)).not.toContain(MAX_TRACKED_KEYS);
+  });
+
+  it('is unevaluable when the only changed context sits past the tracked-key bound', () => {
+    const result = diffContexts(
+      makeFiber(makeChangingContexts(MAX_TRACKED_KEYS + 1, MAX_TRACKED_KEYS)),
+    );
+
+    // The third instance of the same rule: a consumed context value that
+    // changed beyond the bound leaves no visible trace, so the dimension must
+    // report that it could not be evaluated rather than that nothing changed.
+    expect(result.changed).toStrictEqual([]);
+    expect(result.truncated).toBe(true);
+    expect(result.evaluable).toBe(false);
   });
 
   it('is unevaluable when the previous value of a consumed context is unavailable', () => {
@@ -1689,6 +1962,46 @@ describe('classifyRenderTrigger', () => {
       expect(produced).toContain(trigger);
     }
   });
+
+  it('classifies an empty truncated scan as unknown, on what the dimension reports', () => {
+    // The matrix above states evaluability directly, which proves the
+    // classifier but not the hand-off. This case takes the flags from a real
+    // overflowed comparison instead: `diffProps` reports a dimension it could
+    // not finish as unevaluable, so an empty truncated scan arrives here as
+    // `unknown` rather than as `unchanged`.
+    const props = diffProps(makeFiber(makeLateChangedProps()));
+
+    const trigger = classifyRenderTrigger({
+      propChanges: props.changed,
+      hookChanges: [],
+      contextChanges: [],
+      evaluable: { props: props.evaluable, state: true, context: true },
+    });
+
+    expect(props.truncated).toBe(true);
+    expect(props.changed).toStrictEqual([]);
+    expect(trigger).not.toBe('unchanged');
+    expect(trigger).toBe('unknown');
+  });
+
+  it('still names the dimension that overflowed but found a change', () => {
+    // The other half of the rule: truncation makes a dimension incomplete, not
+    // silent. A change the capped scan did see explains the render, so it
+    // outranks the unknown its own incompleteness would otherwise produce.
+    const props = diffProps(makeFiber(makeChangingProps(MAX_TRACKED_KEYS + 1)));
+
+    const trigger = classifyRenderTrigger({
+      propChanges: props.changed,
+      hookChanges: [],
+      contextChanges: [],
+      evaluable: { props: props.evaluable, state: true, context: true },
+    });
+
+    expect(props.truncated).toBe(true);
+    expect(props.evaluable).toBe(false);
+    expect(props.changed.length).toBeGreaterThan(0);
+    expect(trigger).toBe('props');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1772,6 +2085,16 @@ const FIBER_TRIGGER_CASES: readonly FiberTriggerCase[] = [
       }),
     expected: 'props',
   },
+  {
+    label: 'a render whose only changed prop sits past the tracked-key bound',
+    make: (): unknown => makeFiber(makeLateChangedProps()),
+    expected: 'unknown',
+  },
+  {
+    label: 'a render with a visible prop change and more props than the bound allows',
+    make: (): unknown => makeFiber(makeChangingProps(MAX_TRACKED_KEYS + 1)),
+    expected: 'props',
+  },
 ];
 
 /**
@@ -1834,6 +2157,35 @@ describe('analyzeFiber', () => {
         evaluable: diff.evaluable,
       }),
     );
+  });
+
+  it('never reports unchanged for a render whose evidence was cut off by a bound', () => {
+    const diff = analyzeFiber(makeFiber(makeLateChangedProps()));
+
+    // End to end, through the three real comparisons: a prop changed past
+    // `MAX_TRACKED_KEYS`, nothing else did, and the capped scan saw none of
+    // it. `unchanged` here would put the render into `unchanged_render_count`
+    // — "props shallow-equal, own hook state unchanged and no consumed
+    // context value changed" — on the strength of a prop that was never read,
+    // so it belongs in `render_trigger_unknown_count` instead (AAP 0.2.3).
+    expect(diff.trigger).not.toBe('unchanged');
+    expect(diff.trigger).toBe('unknown');
+    expect(diff.changedProps).toStrictEqual([]);
+    expect(diff.truncated).toBe(true);
+    // Only the dimension that overflowed loses its claim; the other two were
+    // compared in full and say so, which is what keeps `truncated` readable as
+    // "this one was cut off" rather than "something somewhere was".
+    expect(diff.evaluable).toStrictEqual({ props: false, state: true, context: true });
+  });
+
+  it('keeps a change the capped scan did see, even though the dimension is incomplete', () => {
+    const diff = analyzeFiber(makeFiber(makeChangingProps(MAX_TRACKED_KEYS + 1)));
+
+    expect(diff.trigger).toBe('props');
+    expect(diff.changedProps).toHaveLength(MAX_TRACKED_KEYS);
+    expect(diff.truncated).toBe(true);
+    expect(diff.evaluable.props).toBe(false);
+    expectTransportable(diff);
   });
 
   it('leaves the fiber and its alternate exactly as it found them', () => {
@@ -1953,5 +2305,126 @@ describe('analyzeFiber', () => {
     expect(diff.trigger).toBe('props');
     expect(encoded).not.toContain(SECRET_TAIL);
     expect(encoded).toContain(REDACTION_MARKER);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Public type surface
+//
+// `./fiber-diff.ts` exports seven types, and a consumer imports them: the
+// render event's `changedProps` attribute is built from `PropChange`, a
+// `state` event's previous/next pair from `HookChange` and `ContextChange`,
+// and the two render-trigger metrics are bucketed from
+// `DimensionEvaluability`. The behavioural suites above would all keep passing
+// if any of those `export` modifiers were dropped, a member renamed or a
+// summary slot widened, because Vitest erases types and never sees them.
+//
+// The assertions below close that gap, and they are checked by `tsc -b` rather
+// than at run time: this file is inside `packages/telemetry/tsconfig.json`'s
+// `include`, so a drift here fails `pnpm typecheck`. Each one binds an
+// exported type to a real value — a function result or a `FiberDiff` member —
+// so a type that still exists but no longer describes what the module produces
+// fails too. `keyof` is asserted as an exact union for the same reason: it is
+// what catches an added, removed or renamed member, which an assignability
+// check on its own would let through.
+// ---------------------------------------------------------------------------
+
+describe('the exported type surface', () => {
+  /** A fiber exercising all three dimensions with one change in each. */
+  function makeTypedFiber(): Bag {
+    return makeFiber({
+      props: { count: 2 },
+      prevProps: { count: 1 },
+      hooks: makeHookChain([2]),
+      prevHooks: makeHookChain([1]),
+      contexts: makeContextChain([{ context: ETA_CONTEXT, value: { etaMinutes: 2 } }]),
+      prevContexts: makeContextChain([{ context: ETA_CONTEXT, value: { etaMinutes: 5 } }]),
+    });
+  }
+
+  it('types diffProps results and FiberDiff.propChanges as PropChange', () => {
+    const result = diffProps(makeTypedFiber());
+
+    expectTypeOf(result.changed).toEqualTypeOf<PropChange[]>();
+    expectTypeOf<FiberDiff['propChanges']>().toEqualTypeOf<PropChange[]>();
+    expectTypeOf<keyof PropChange>().toEqualTypeOf<'key' | 'from' | 'to'>();
+    expectTypeOf<PropChange['key']>().toEqualTypeOf<string>();
+    expectTypeOf<PropChange['from']>().toEqualTypeOf<ValueSummary>();
+    expectTypeOf<PropChange['to']>().toEqualTypeOf<ValueSummary>();
+
+    // A runtime witness for the compile-time claim: the annotation is what
+    // makes this assignment an assertion, and the checks below prove the value
+    // really carries the members the type promises.
+    const change: PropChange | undefined = result.changed[0];
+    expect(change?.key).toBe('count');
+    expect(change?.from.preview).toBe('1');
+    expect(change?.to.preview).toBe('2');
+  });
+
+  it('types diffHookState results and FiberDiff.hookChanges as HookChange', () => {
+    const result = diffHookState(makeTypedFiber());
+
+    expectTypeOf(result.changed).toEqualTypeOf<HookChange[]>();
+    expectTypeOf<FiberDiff['hookChanges']>().toEqualTypeOf<HookChange[]>();
+    expectTypeOf<keyof HookChange>().toEqualTypeOf<'index' | 'label' | 'from' | 'to'>();
+    expectTypeOf<HookChange['index']>().toEqualTypeOf<number>();
+    // `label` is optional because a hook whose kind could not be inferred
+    // carries none; `exactOptionalPropertyTypes` makes that "absent", never
+    // "present and undefined".
+    expectTypeOf<HookChange['label']>().toEqualTypeOf<string | undefined>();
+    expectTypeOf<HookChange['from']>().toEqualTypeOf<ValueSummary>();
+
+    const change: HookChange | undefined = result.changed[0];
+    expect(change?.index).toBe(0);
+    expect(change?.label).toBe('state');
+  });
+
+  it('types diffContexts results and FiberDiff.contextChanges as ContextChange', () => {
+    const result = diffContexts(makeTypedFiber());
+
+    expectTypeOf(result.changed).toEqualTypeOf<ContextChange[]>();
+    expectTypeOf<FiberDiff['contextChanges']>().toEqualTypeOf<ContextChange[]>();
+    expectTypeOf<keyof ContextChange>().toEqualTypeOf<'index' | 'label' | 'from' | 'to'>();
+    expectTypeOf<ContextChange['index']>().toEqualTypeOf<number>();
+    expectTypeOf<ContextChange['label']>().toEqualTypeOf<string | undefined>();
+    expectTypeOf<ContextChange['to']>().toEqualTypeOf<ValueSummary>();
+
+    const change: ContextChange | undefined = result.changed[0];
+    expect(change?.index).toBe(0);
+    expect(change?.label).toBe('ShippingEta');
+  });
+
+  it('types FiberDiff.evaluable as DimensionEvaluability with exactly three flags', () => {
+    const diff = analyzeFiber(makeTypedFiber());
+
+    expectTypeOf(diff.evaluable).toEqualTypeOf<DimensionEvaluability>();
+    expectTypeOf<FiberDiff['evaluable']>().toEqualTypeOf<DimensionEvaluability>();
+    // Exactly the three dimensions AAP 0.2.3 requires for `unchanged`: props
+    // shallow-equal, own hook state unchanged and no consumed context value
+    // changed. A fourth flag, or a missing one, changes what that metric
+    // means.
+    expectTypeOf<keyof DimensionEvaluability>().toEqualTypeOf<'props' | 'state' | 'context'>();
+    expectTypeOf<DimensionEvaluability['props']>().toEqualTypeOf<boolean>();
+    expectTypeOf<DimensionEvaluability['state']>().toEqualTypeOf<boolean>();
+    expectTypeOf<DimensionEvaluability['context']>().toEqualTypeOf<boolean>();
+
+    const evaluable: DimensionEvaluability = diff.evaluable;
+    expect(evaluable).toStrictEqual({ props: true, state: true, context: true });
+  });
+
+  it('types the classifier over exactly the four parts of a FiberDiff it reads', () => {
+    const diff = analyzeFiber(makeTypedFiber());
+
+    // The classifier's input is a `Pick` of the four members asserted above,
+    // so a rename on either side is a compile error here rather than a silent
+    // mis-read at the one call site that matters.
+    expectTypeOf(classifyRenderTrigger).parameters.toEqualTypeOf<
+      [Pick<FiberDiff, 'propChanges' | 'hookChanges' | 'contextChanges' | 'evaluable'>]
+    >();
+    expectTypeOf(classifyRenderTrigger).returns.toEqualTypeOf<RenderTrigger>();
+    expectTypeOf(diff.trigger).toEqualTypeOf<RenderTrigger>();
+
+    const trigger: RenderTrigger = classifyRenderTrigger(diff);
+    expect(trigger).toBe(diff.trigger);
   });
 });

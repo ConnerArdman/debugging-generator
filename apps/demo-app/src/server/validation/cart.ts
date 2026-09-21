@@ -1,15 +1,17 @@
 /**
  * Request validation for the cart's two surfaces — `GET /api/cart`, which answers the cart this
- * browser is shopping with, and `POST /api/cart/items`, which puts a quantity of one product into
- * it. This module is the only place either request is parsed, and it holds exactly one schema for
- * each.
+ * browser is shopping with, and `POST /api/cart/items`, which changes what is in it. This module is
+ * the only place either request is parsed. It holds one schema for the query both surfaces read the
+ * cart's session token from, one schema for each of the four changes the write surface accepts, and
+ * the single discriminated union that endpoint parses its body with.
  *
- * Five conventions shape the two schemas below, and they are why neither is simply a pair of
+ * Five conventions shape the schemas below, and they are why none of them is simply a pair of
  * strings:
  *
  * 1. **A caller never names the cart.** `loadCartContents()` in `@/lib/api-client` sends
- *    `GET /api/cart` with no parameters at all, and `addCartItem()` sends only the product and the
- *    quantity: which cart a request concerns is carried by the storefront's own cookie. The token
+ *    `GET /api/cart` with no parameters at all, and `addCartItem()`, `setCartItemQuantity()`,
+ *    `removeCartItem()` and `clearCartContents()` send their change as a body and no parameters
+ *    either: which cart a request concerns is carried by the storefront's own cookie. The token
  *    field therefore holds a default, and parsing an empty object succeeds — a request that says
  *    nothing about which cart it means is a complete request for the cart a visitor who has not
  *    shopped yet shops with.
@@ -17,34 +19,40 @@
  *    Prisma model calls `sessionToken`, and that is the name this schema publishes. The cookie, the
  *    route handler, the cart service and the row therefore use one word for one value instead of
  *    each translating between two.
- * 3. **The request body is `CartItemDraft` and nothing else.** {@link Fields} checks that at
- *    compile time: a field the type does not declare, a field it declares and the schema omits, and
- *    a field whose parsed type differs from the declared one are each a compile error here rather
- *    than a body the browser builds and the server rejects.
+ * 3. **The request body is a `CartMutation` and nothing else.** {@link Fields} and
+ *    {@link MutationFields} check that at compile time, member by member: a field the type does not
+ *    declare, a field it declares and the schema omits, and a field whose parsed type differs from
+ *    the declared one are each a compile error here rather than a body the browser builds and the
+ *    server rejects. {@link cartMutationBodySchema} restates the same guarantee over the union as a
+ *    whole, so the endpoint's four branches and the four members `@/lib/types` publishes cannot
+ *    drift apart.
  * 4. **A token arrives as text, or not at all — a body arrives as JSON.** A cookie that was never
  *    set, a query parameter read with an accessor that reports an absent value as `null`, and a
  *    value holding nothing but whitespace all mean the same thing, and are normalised onto the
- *    default rather than turned into a failed request. A JSON body carries real types, so the body
- *    schema coerces nothing: `"2"` is not a quantity, and a caller that sends one is asking the
- *    server to guess.
+ *    default rather than turned into a failed request. A JSON body carries real types, so no body
+ *    schema here coerces anything: `"2"` is not a quantity, and a caller that sends one is asking
+ *    the server to guess.
  * 5. **The caller's values stay with the caller.** A rejection is handed on as the `ZodError` it
  *    is, and the single mapper in `@/server/errors` turns it into a body of field paths and
  *    messages. The messages below say what was expected and never repeat what was received,
  *    because a session token identifies somebody's cart even when it is malformed.
  *
  * Nothing here reads the environment, opens a connection, imports a service or builds a response:
- * declaring two schemas is all that happens at import time, so a route handler, `next build` on a
+ * declaring these schemas is all that happens at import time, so a route handler, `next build` on a
  * machine with no database and `tsc -b` on a fresh clone all load the module equally happily. There
  * is deliberately no import edge between this folder and the service layer in either direction; the
  * route handler is where the two meet.
  *
- * Unknown properties are stripped rather than rejected, so a cart URL that also carries a campaign
- * parameter, and a body sent by a page newer than the server it reached, both still resolve.
+ * Unknown properties are stripped rather than rejected — by the query schema and by every member of
+ * the body union alike — so a cart URL that also carries a campaign parameter, and a body sent by a
+ * page newer than the server it reached, both still resolve. The one value that is never guessed at
+ * is the change being asked for: a body whose `operation` is missing or is a word this module does
+ * not know is refused rather than read as some other change.
  */
 
 import { z } from 'zod';
 
-import type { CartItemDraft } from '@/lib/types';
+import type { CartItemDraft, CartMutation } from '@/lib/types';
 
 /**
  * The cart a browser is answered with when it has not said which cart it means.
@@ -178,3 +186,127 @@ export const cartItemBodySchema = z.object({
  * shape and without an assertion standing in for the check.
  */
 export type CartItemBodyInput = z.infer<typeof cartItemBodySchema>;
+
+/**
+ * The fields one member of `CartMutation` has to declare, read off that member.
+ *
+ * It is {@link Fields} generalised over the tag: `MutationFields<'set'>` is the field roster of the
+ * `set` member, `MutationFields<'empty'>` the roster of a change that carries nothing but its tag.
+ * The three requirements are the same ones — every field of the member is present, a field the
+ * member does not declare cannot be added, and each field parses to the declared member type — and
+ * they hold for the `operation` tag too, so a member whose literal does not match the type it claims
+ * to describe is a compile error here.
+ *
+ * `Required<…>` reads each member's declared types without their optionality, for the reason
+ * {@link Fields} gives: under this workspace's `exactOptionalPropertyTypes` an optional member would
+ * otherwise be satisfied by a field that parses to nothing, and a consumer would have to check a
+ * hole the schema could have filled with a default.
+ *
+ * @typeParam K The `operation` tag of the member being described.
+ */
+type MutationFields<K extends CartMutation['operation']> = {
+  [F in keyof Required<Extract<CartMutation, { operation: K }>>]: z.ZodType<
+    Required<Extract<CartMutation, { operation: K }>>[F]
+  >;
+};
+
+/**
+ * The cart line a `set` or `remove` change names.
+ *
+ * A line is named by the `id` the server published for it in a `CartView`, never by a product: a
+ * cart holds one line per product, and a line is the thing a shopper changes the quantity of or
+ * takes out. The bounds match the product identifier's above for the same reason — a line
+ * identifier is an opaque twenty-five-character key, so sixty-four characters accepts anything this
+ * store issues and refuses a value large enough to be a document — and the lower bound restates
+ * that a line identifier is a non-empty string where a reader of the field expects to find it.
+ *
+ * One declaration serves both members, so the two changes that name a line cannot come to bound or
+ * describe it differently.
+ */
+const cartLineIdField = z
+  .string()
+  .trim()
+  .min(1, 'A cart line is required.')
+  .max(64, 'That cart line identifier is longer than this store issues.');
+
+/**
+ * Adding units of one product: {@link cartItemBodySchema} under the `add` tag.
+ *
+ * The payload is the existing add-to-cart body rather than a second description of it, so the fields
+ * the storefront has always sent are parsed by the same schema and the same messages whichever way
+ * the request is tagged.
+ */
+const cartAdditionSchema = cartItemBodySchema.extend({
+  operation: z.literal('add'),
+}) satisfies z.ZodType<Extract<CartMutation, { operation: 'add' }>>;
+
+/**
+ * Setting one line to an exact quantity.
+ *
+ * `quantity` is the number of units the line holds afterwards rather than a delta, so the same
+ * request applied twice leaves the cart where one application left it. Its rule is
+ * {@link cartItemBodySchema}'s own `quantity` field, reused rather than restated: ninety-nine units
+ * is the ceiling on a cart line, and one declaration of that bound is what keeps the two ways of
+ * reaching it — adding units and setting them — from drifting to different limits or different
+ * wording. A quantity of zero is refused here by that lower bound, because a line of nothing is a
+ * line that is gone and {@link cartRemovalSchema} is how it goes.
+ */
+const cartLineQuantitySchema = z.object({
+  operation: z.literal('set'),
+  lineId: cartLineIdField,
+  quantity: cartItemBodySchema.shape.quantity,
+} satisfies MutationFields<'set'>) satisfies z.ZodType<Extract<CartMutation, { operation: 'set' }>>;
+
+/** Taking one line, named by its identifier, out of the cart. */
+const cartRemovalSchema = z.object({
+  operation: z.literal('remove'),
+  lineId: cartLineIdField,
+} satisfies MutationFields<'remove'>) satisfies z.ZodType<
+  Extract<CartMutation, { operation: 'remove' }>
+>;
+
+/**
+ * Taking every line out of the cart.
+ *
+ * The tag is the whole body: emptying a cart names nothing, and a caller that sends a product or a
+ * line alongside it has that field stripped rather than its request refused.
+ */
+const cartEmptySchema = z.object({
+  operation: z.literal('empty'),
+} satisfies MutationFields<'empty'>) satisfies z.ZodType<
+  Extract<CartMutation, { operation: 'empty' }>
+>;
+
+/**
+ * The body `POST /api/cart/items` accepts: one change to the cart, tagged by the change being asked
+ * for.
+ *
+ * The four members are the cart's whole write surface, and they are the four `CartMutation`
+ * publishes — add units of a product, set a line to a quantity, take one line out, take every line
+ * out. `operation` discriminates them, so a body is matched against exactly one member and its
+ * messages name that member's fields: a `set` missing its quantity is reported as a missing
+ * quantity rather than as four simultaneous failures, and an unknown tag is refused outright
+ * instead of being read as some other change.
+ *
+ * `satisfies z.ZodType<CartMutation>` is a compile-time check and nothing more — it narrows no type,
+ * emits no code and is not an assertion — so {@link CartMutationBodyInput} below is still inferred
+ * from the union itself. What it proves is that this endpoint parses to the wire type
+ * `@/lib/api-client` writes: a member that parses to a shape the published union does not describe
+ * fails here, and a member the union publishes and this schema omits fails in the route handler,
+ * whose switch over the parsed `operation` has a branch for each of them.
+ */
+export const cartMutationBodySchema = z.discriminatedUnion('operation', [
+  cartAdditionSchema,
+  cartLineQuantitySchema,
+  cartRemovalSchema,
+  cartEmptySchema,
+]) satisfies z.ZodType<CartMutation>;
+
+/**
+ * A parsed cart change: one of the four members, narrowed by its `operation`.
+ *
+ * It is structurally the `CartMutation` the browser sent, so a route handler switches on the tag and
+ * hands each branch's payload to the cart service without restating either shape and without an
+ * assertion standing in for the check.
+ */
+export type CartMutationBodyInput = z.infer<typeof cartMutationBodySchema>;

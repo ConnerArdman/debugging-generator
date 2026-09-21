@@ -78,6 +78,16 @@
  *   privileged user does not change what a mode check reports, so there are no
  *   root-specific branches anywhere below.
  *
+ *   Two of the four guards probe an *effective* capability rather than the
+ *   presence of a platform feature, because that is what their cases need and
+ *   no constant can answer it. Planting a symbolic link is a privilege on
+ *   Windows and can be withheld by a hardened runner anywhere, and handing a
+ *   directory to another account is a privilege everywhere — so each is tried
+ *   once, in a directory of its own, and the result gates the cases that build
+ *   that fixture. This is the same habit, not an exception to it: the question
+ *   asked is still "can this host do the thing", never "which host is this" or
+ *   "which uid is this", and a host that can do it runs the case.
+ *
  * Payloads are short, obviously synthetic text or explicit byte arrays. The
  * case that stands in for the credential file writes a two-field JSON object
  * with no credential in it, because a realistic-looking secret in a committed
@@ -86,6 +96,7 @@
 
 import {
   chmodSync,
+  chownSync,
   constants,
   existsSync,
   lstatSync,
@@ -105,6 +116,8 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { DebuggenError } from '../errors.js';
+import { isWithin, resolveWithinProject, toProjectRelative } from '../paths.js';
+import { isErr, isOk, type Result } from '../result.js';
 import {
   SECURE_DIR_MODE,
   SECURE_FILE_MODE,
@@ -148,6 +161,112 @@ const NO_NOFOLLOW = ((): boolean => {
   const flag: unknown = constants.O_NOFOLLOW;
   return typeof flag !== 'number' || flag === 0;
 })();
+
+/**
+ * Whether this process can create a symbolic link at all.
+ *
+ * Every refusal this module makes about a link needs a link to exist first, and
+ * creating one is not a given: Windows requires either developer mode or the
+ * privilege, and a hardened or containerised runner can withhold it anywhere.
+ * An unguarded `symlinkSync` in a fixture turns that into a *setup* failure,
+ * which reads as "safe-fs is broken" rather than "this host cannot host the
+ * case" — so the capability is probed once, in a directory of its own, and the
+ * answer gates every symlink-dependent case below.
+ *
+ * A dangling link is enough to answer the question, and cheaper: it needs no
+ * target, and `lstat` reporting it as a link is the confirmation that the call
+ * did what it claimed rather than, say, copying the target on a filesystem that
+ * emulates links.
+ */
+const CAN_CREATE_SYMLINKS = ((): boolean => {
+  const probeRoot = mkdtempSync(join(tmpdir(), 'debuggen-safefs-probe-'));
+  try {
+    symlinkSync(join(probeRoot, 'absent'), join(probeRoot, 'link'));
+    return lstatSync(join(probeRoot, 'link')).isSymbolicLink();
+  } catch {
+    // Any failure is the answer: no link could be planted, so the cases that
+    // need one are skipped rather than failed.
+    return false;
+  } finally {
+    rmSync(probeRoot, { recursive: true, force: true });
+  }
+})();
+
+/**
+ * A uid that is conventionally not the one running a build: the traditional
+ * `nobody`/`nfsnobody` account.
+ *
+ * Only ever used as a *number*. Nothing below looks the account up, requires it
+ * to exist as a name, or cares which account it is — the ownership tests need
+ * one thing from it, that it is not this process's uid, and the probe below
+ * confirms the kernel agreed to assign it before any case relies on it.
+ */
+const CONVENTIONAL_FOREIGN_UID = 65534;
+
+/**
+ * A second candidate, for the unlikely host where this process *is* the uid
+ * above.
+ *
+ * `1` is `daemon` on essentially every POSIX system and, like the first
+ * candidate, is used only as a number.
+ */
+const ALTERNATE_FOREIGN_UID = 1;
+
+/**
+ * A uid this process can actually assign to a directory, or `undefined` when it
+ * cannot assign any.
+ *
+ * Handing a directory to another account normally requires privilege, so this
+ * is the one guard in the file that probes an *effective* capability rather
+ * than the presence of a platform feature — and that is deliberate, not a
+ * departure from the habit stated in this file's header. The habit is that a
+ * case is skipped for what the host cannot do, never for what it is called or
+ * for the value of its uid; "can this process assign a foreign owner" is
+ * exactly that capability, and it is the only way to build the fixture the
+ * ownership cases need. The AAP's test table requires parent **ownership**
+ * rejection to be proven, not only the permission bits, and an owner test can
+ * only be proven by a directory that really belongs to someone else.
+ *
+ * The probe runs in a directory of its own, confirms with `lstat` that the
+ * owner changed rather than trusting the call, and removes its fixture. The
+ * chowned directory is nested inside a root this process keeps, so the removal
+ * works even though the entry itself now belongs to another account.
+ */
+const FOREIGN_UID = ((): number | undefined => {
+  if (typeof process.getuid !== 'function') {
+    return undefined;
+  }
+
+  const processUid = process.getuid();
+  const probeRoot = mkdtempSync(join(tmpdir(), 'debuggen-safefs-probe-'));
+  try {
+    for (const candidate of [CONVENTIONAL_FOREIGN_UID, ALTERNATE_FOREIGN_UID]) {
+      if (candidate === processUid) {
+        continue;
+      }
+
+      const probeDir = join(probeRoot, `owned-${String(candidate)}`);
+      mkdirSync(probeDir);
+      try {
+        chownSync(probeDir, candidate, lstatSync(probeDir).gid);
+      } catch {
+        // No privilege for this candidate; try the next, then give up.
+        continue;
+      }
+
+      if (lstatSync(probeDir).uid === candidate) {
+        return candidate;
+      }
+    }
+
+    return undefined;
+  } finally {
+    rmSync(probeRoot, { recursive: true, force: true });
+  }
+})();
+
+/** Whether this process can hand a directory to another account at all. */
+const CAN_ASSIGN_FOREIGN_OWNER = FOREIGN_UID !== undefined;
 
 /*
  * ---------------------------------------------------------------------------
@@ -257,6 +376,41 @@ function makeFile(pathAbs: string, data: string | Uint8Array, mode?: number): st
   return pathAbs;
 }
 
+/**
+ * Hands `pathAbs` to another account, and proves the kernel did it.
+ *
+ * The `lstat` is the assertion that makes the fixture worth building: a `chown`
+ * that silently did nothing would leave a directory this account still owns,
+ * and every ownership case below would then pass for the wrong reason — the
+ * owner test it is meant to exercise would simply never fire. The group is
+ * carried over unchanged, so the only thing the case changes is the owner.
+ *
+ * Callable only from a case guarded by {@link CAN_ASSIGN_FOREIGN_OWNER}; the
+ * unreachable branch is what turns a missing guard into an explicit failure
+ * rather than a confusing `chown` errno.
+ */
+function assignForeignOwner(pathAbs: string): number {
+  if (FOREIGN_UID === undefined) {
+    return expect.unreachable(
+      'this case must be guarded on CAN_ASSIGN_FOREIGN_OWNER, which is false on this host',
+    );
+  }
+
+  chownSync(pathAbs, FOREIGN_UID, lstatSync(pathAbs).gid);
+  expect(lstatSync(pathAbs).uid).toBe(FOREIGN_UID);
+  return FOREIGN_UID;
+}
+
+/** This process's own uid, for the `expectedOwner` half of an ownership refusal. */
+function ownUid(): number {
+  if (typeof process.getuid !== 'function') {
+    return expect.unreachable(
+      'this case must be guarded on NO_POSIX_IDS, which is true on this host',
+    );
+  }
+  return process.getuid();
+}
+
 /** Deterministic bytes, so a large payload can be compared rather than sampled. */
 function syntheticBytes(length: number): Uint8Array {
   const bytes = new Uint8Array(length);
@@ -288,6 +442,53 @@ function entriesIn(dirAbs: string): string[] {
  */
 function temporaryLeftoversIn(dirAbs: string): string[] {
   return entriesIn(dirAbs).filter((entry) => entry.endsWith('.tmp'));
+}
+
+/**
+ * A state tree whose intermediate component has been replaced by a link out of
+ * the tree, and the directory that link points at.
+ *
+ * This is the shape of the attack the creation walk exists to stop: the root is
+ * private and owned by this account, but one component below it is a symbolic
+ * link to a directory another local account controls. A creation pass that
+ * hands the whole path to the kernel creates the missing tail *inside* that
+ * directory, because every non-final component of a path is resolved through
+ * its links.
+ *
+ * The outside directory is deliberately left at an ordinary `0755` and given
+ * one entry, so two properties can be asserted after a refusal: that its mode
+ * was not tightened through the link, and that its contents are exactly what
+ * this fixture put there.
+ */
+interface LinkedComponentFixture {
+  /** The private root a caller would name as its boundary. */
+  readonly root: string;
+
+  /** The intermediate component, a symbolic link rather than a directory. */
+  readonly link: string;
+
+  /** The directory the link points at, outside the root entirely. */
+  readonly outside: string;
+
+  /** The single entry the fixture placed in {@link outside}. */
+  readonly outsideEntry: string;
+}
+
+/**
+ * Builds the {@link LinkedComponentFixture} tree inside the current sandbox.
+ *
+ * Plants a link, so every case that calls it is guarded by
+ * {@link CAN_CREATE_SYMLINKS}.
+ */
+function plantLinkedComponent(): LinkedComponentFixture {
+  const root = makeDir(join(sandbox, 'state'), SECURE_DIR_MODE);
+  const outside = makeDir(join(sandbox, 'elsewhere'), PROJECT_DIR_MODE);
+  const outsideEntry = 'present.txt';
+  makeFile(join(outside, outsideEntry), 'placed by the fixture\n');
+  const link = join(root, 'backups');
+  symlinkSync(outside, link);
+
+  return { root, link, outside, outsideEntry };
 }
 
 /**
@@ -346,6 +547,31 @@ function unsafePathErrorFrom(run: () => void): DebuggenError {
   const error = debuggenErrorFrom(run);
   expect(error.code).toBe('FS_UNSAFE_PATH');
   return error;
+}
+
+/**
+ * The value of a `Result` the lexical gate in `../paths.js` was expected to
+ * accept.
+ *
+ * `isOk` rather than a cast, so a guard that stopped narrowing fails
+ * `pnpm typecheck` in this file — the same habit `../paths.test.ts` keeps, and
+ * the reason the escape block below can read the resolved path at all.
+ */
+function acceptedPath(result: Result<string>): string {
+  if (isOk(result)) {
+    return result.value;
+  }
+  return expect.unreachable(
+    `the lexical gate was expected to accept this path: ${result.error.message}`,
+  );
+}
+
+/** The `DebuggenError` of a `Result` the lexical gate was expected to refuse. */
+function refusedBy(result: Result<string>): DebuggenError {
+  if (isErr(result)) {
+    return result.error;
+  }
+  return expect.unreachable('the lexical gate was expected to refuse this path, and accepted it');
 }
 
 /*
@@ -458,41 +684,47 @@ describe('assertSecureDir', () => {
     },
   );
 
-  it('refuses a directory that is itself a symbolic link instead of resolving it', () => {
-    const target = makeDir(join(sandbox, 'real'), SECURE_DIR_MODE);
-    const link = join(sandbox, 'link');
-    symlinkSync(target, link);
+  it.skipIf(!CAN_CREATE_SYMLINKS)(
+    'refuses a directory that is itself a symbolic link instead of resolving it (requires symlink creation)',
+    () => {
+      const target = makeDir(join(sandbox, 'real'), SECURE_DIR_MODE);
+      const link = join(sandbox, 'link');
+      symlinkSync(target, link);
 
-    const error = unsafePathErrorFrom(() => {
-      assertSecureDir(link);
-    });
+      const error = unsafePathErrorFrom(() => {
+        assertSecureDir(link);
+      });
 
-    expect(error.details?.path).toBe(link);
-    expect(error.details?.reason).toBe('symlink-component');
-  });
+      expect(error.details?.path).toBe(link);
+      expect(error.details?.reason).toBe('symlink-component');
+    },
+  );
 
-  it('refuses a chain whose parent contains a symbolic link, however private its target', () => {
-    const root = makeDir(join(sandbox, 'state'), SECURE_DIR_MODE);
-    const target = makeDir(join(root, 'real'), SECURE_DIR_MODE);
-    const inner = makeDir(join(target, 'one'), SECURE_DIR_MODE);
-    const link = join(root, 'link');
-    symlinkSync(target, link);
+  it.skipIf(!CAN_CREATE_SYMLINKS)(
+    'refuses a chain whose parent contains a symbolic link, however private its target (requires symlink creation)',
+    () => {
+      const root = makeDir(join(sandbox, 'state'), SECURE_DIR_MODE);
+      const target = makeDir(join(root, 'real'), SECURE_DIR_MODE);
+      const inner = makeDir(join(target, 'one'), SECURE_DIR_MODE);
+      const link = join(root, 'link');
+      symlinkSync(target, link);
 
-    const error = unsafePathErrorFrom(() => {
-      assertSecureDir(join(link, 'one'), { upTo: root });
-    });
+      const error = unsafePathErrorFrom(() => {
+        assertSecureDir(join(link, 'one'), { upTo: root });
+      });
 
-    expect(error.details?.path).toBe(link);
-    expect(error.details?.reason).toBe('symlink-component');
+      expect(error.details?.path).toBe(link);
+      expect(error.details?.reason).toBe('symlink-component');
 
-    // What the link points at is a perfectly private directory, reached
-    // directly: the refusal is about the link, not about its target. A check
-    // that used `stat` instead of `lstat` would accept the path above, which is
-    // exactly the substitution this case exists to catch.
-    expect(() => {
-      assertSecureDir(inner, { upTo: root });
-    }).not.toThrow();
-  });
+      // What the link points at is a perfectly private directory, reached
+      // directly: the refusal is about the link, not about its target. A check
+      // that used `stat` instead of `lstat` would accept the path above, which
+      // is exactly the substitution this case exists to catch.
+      expect(() => {
+        assertSecureDir(inner, { upTo: root });
+      }).not.toThrow();
+    },
+  );
 
   it('refuses a path that exists but is not a directory', () => {
     const file = makeFile(join(sandbox, 'occupied'), 'one line\n');
@@ -555,6 +787,78 @@ describe('assertSecureDir', () => {
       expect(() => {
         assertSecureDir(privateDir, { requireOwner: false });
       }).not.toThrow();
+    },
+  );
+
+  /*
+   * The ownership cases. A directory at a perfect 0700 that belongs to another
+   * account is the failure mode the permission-bit cases above cannot express:
+   * its owner can move it, replace it, or replace anything inside it, so a
+   * credential or a backup written beneath it is that account's to take. The
+   * AAP requires wrong *ownership* to be rejected, not only a wrong mode, and
+   * that can only be shown by a directory that really belongs to someone else.
+   */
+
+  it.skipIf(NO_POSIX_IDS || !CAN_ASSIGN_FOREIGN_OWNER)(
+    'rejects an otherwise-private directory owned by another account (requires assigning a foreign owner)',
+    () => {
+      const dir = makeDir(join(sandbox, 'state'), SECURE_DIR_MODE);
+      const foreignUid = assignForeignOwner(dir);
+
+      const error = unsafePathErrorFrom(() => {
+        assertSecureDir(dir);
+      });
+
+      // The mode is impeccable, so `group-or-other-permissions` here would mean
+      // the owner test never ran.
+      expect(permissionsOf(dir)).toBe(SECURE_DIR_MODE);
+      expect(error.details?.reason).toBe('foreign-owner');
+      expect(error.details?.path).toBe(dir);
+      expect(error.message).toContain(dir);
+      // Both uids, because the developer's next question is "whose is it, and
+      // who did the tool expect?" and an error that answers neither sends them
+      // to `ls -l`.
+      expect(error.details?.owner).toBe(foreignUid);
+      expect(error.details?.expectedOwner).toBe(ownUid());
+    },
+  );
+
+  it.skipIf(NO_POSIX_IDS || !CAN_ASSIGN_FOREIGN_OWNER)(
+    'accepts that same foreign-owned directory when requireOwner is false (requires assigning a foreign owner)',
+    () => {
+      // The other half of the relaxation, which the permission-bit case above
+      // cannot reach: `requireOwner: false` must switch off the owner test and
+      // nothing else. A container whose mount belongs to another uid is the
+      // real caller of this option.
+      const dir = makeDir(join(sandbox, 'state'), SECURE_DIR_MODE);
+      assignForeignOwner(dir);
+
+      expect(() => {
+        assertSecureDir(dir, { requireOwner: false });
+      }).not.toThrow();
+    },
+  );
+
+  it.skipIf(NO_POSIX_IDS || !CAN_ASSIGN_FOREIGN_OWNER)(
+    'names the foreign-owned intermediate directory of a chain (requires assigning a foreign owner)',
+    () => {
+      const root = makeDir(join(sandbox, 'state'), SECURE_DIR_MODE);
+      const middle = makeDir(join(root, 'backups'), SECURE_DIR_MODE);
+      const leaf = makeDir(join(middle, 'one'), SECURE_DIR_MODE);
+      assignForeignOwner(middle);
+
+      // Named alone the leaf is ours and private, so a check that stopped there
+      // would approve a tree whose middle another account can replace.
+      expect(() => {
+        assertSecureDir(leaf);
+      }).not.toThrow();
+
+      const error = unsafePathErrorFrom(() => {
+        assertSecureDir(leaf, { upTo: root });
+      });
+
+      expect(error.details?.path).toBe(middle);
+      expect(error.details?.reason).toBe('foreign-owner');
     },
   );
 });
@@ -660,22 +964,25 @@ describe('ensureSecureDir', () => {
     }).not.toThrow();
   });
 
-  it('refuses to tighten a symbolic link in the chain', () => {
-    const root = makeDir(join(sandbox, 'state'), SECURE_DIR_MODE);
-    const outside = makeDir(join(sandbox, 'outside'), PROJECT_DIR_MODE);
-    const link = join(root, 'link');
-    symlinkSync(outside, link);
+  it.skipIf(!CAN_CREATE_SYMLINKS)(
+    'refuses to tighten a symbolic link in the chain (requires symlink creation)',
+    () => {
+      const root = makeDir(join(sandbox, 'state'), SECURE_DIR_MODE);
+      const outside = makeDir(join(sandbox, 'outside'), PROJECT_DIR_MODE);
+      const link = join(root, 'link');
+      symlinkSync(outside, link);
 
-    const error = unsafePathErrorFrom(() => {
-      ensureSecureDir(link, { upTo: root });
-    });
+      const error = unsafePathErrorFrom(() => {
+        ensureSecureDir(link, { upTo: root });
+      });
 
-    expect(error.details?.path).toBe(link);
-    expect(error.details?.reason).toBe('symlink-component');
-  });
+      expect(error.details?.path).toBe(link);
+      expect(error.details?.reason).toBe('symlink-component');
+    },
+  );
 
-  it.skipIf(NO_POSIX_IDS)(
-    'leaves the mode of a link target untouched when it refuses the link (POSIX permission bits)',
+  it.skipIf(!CAN_CREATE_SYMLINKS || NO_POSIX_IDS)(
+    'leaves the mode of a link target untouched when it refuses the link (requires symlink creation and POSIX permission bits)',
     () => {
       // `chmod` follows a link, so tightening one would change the permissions
       // of a directory the product neither owns nor was asked to touch.
@@ -702,6 +1009,278 @@ describe('ensureSecureDir', () => {
     expect(error.code).toBe('INTERNAL');
     expect(existsSync(leaf)).toBe(false);
   });
+
+  /*
+   * The intermediate-symlink cases. A single recursive `mkdir` over the whole
+   * path cannot express these: the kernel resolves every non-final component
+   * through its links, so the missing tail is created inside whatever the link
+   * points at and only then is the chain inspected. A refusal that arrives
+   * after the directory exists outside the tree is not a refusal — the next
+   * write into it succeeds — which is why each case below asserts the *absence*
+   * of the created directory as well as the error.
+   */
+
+  it.skipIf(!CAN_CREATE_SYMLINKS)(
+    'refuses an intermediate symbolic link under upTo and creates nothing through it (requires symlink creation)',
+    () => {
+      const { root, link, outside, outsideEntry } = plantLinkedComponent();
+
+      const error = unsafePathErrorFrom(() => {
+        ensureSecureDir(join(root, 'backups', 'one'), { upTo: root });
+      });
+
+      expect(error.details?.path).toBe(link);
+      expect(error.details?.reason).toBe('symlink-component');
+
+      // The security property, which the error alone does not carry: the walk
+      // stopped at the link instead of creating the tail behind it.
+      expect(entriesIn(outside)).toEqual([outsideEntry]);
+      expect(existsSync(join(outside, 'one'))).toBe(false);
+    },
+  );
+
+  it.skipIf(!CAN_CREATE_SYMLINKS)(
+    'refuses an intermediate symbolic link with no upTo and creates nothing through it (requires symlink creation)',
+    () => {
+      // The harder half. With no boundary the chain a creation pass verifies is
+      // derived from what it created, so a pass that created the tail inside the
+      // link's target verifies only that tail — every component it checks is
+      // private and owned, and the call returns successfully with a directory
+      // sitting outside the tree.
+      const { root, link, outside, outsideEntry } = plantLinkedComponent();
+
+      const error = unsafePathErrorFrom(() => {
+        ensureSecureDir(join(root, 'backups', 'one'));
+      });
+
+      expect(error.details?.path).toBe(link);
+      expect(error.details?.reason).toBe('symlink-component');
+      expect(entriesIn(outside)).toEqual([outsideEntry]);
+      expect(existsSync(join(outside, 'one'))).toBe(false);
+    },
+  );
+
+  it.skipIf(!CAN_CREATE_SYMLINKS)(
+    'stops at the link rather than at the first missing component of a deeper tail under upTo (requires symlink creation)',
+    () => {
+      const { root, link, outside, outsideEntry } = plantLinkedComponent();
+
+      const error = unsafePathErrorFrom(() => {
+        ensureSecureDir(join(root, 'backups', 'one', 'two'), { upTo: root });
+      });
+
+      // Two components are missing, so a walk that began at the outermost
+      // *missing* one would start below the link and never see it.
+      expect(error.details?.path).toBe(link);
+      expect(error.details?.reason).toBe('symlink-component');
+      expect(entriesIn(outside)).toEqual([outsideEntry]);
+      expect(existsSync(join(outside, 'one'))).toBe(false);
+    },
+  );
+
+  it.skipIf(!CAN_CREATE_SYMLINKS)(
+    'stops at the link rather than at the first missing component of a deeper tail with no upTo (requires symlink creation)',
+    () => {
+      const { root, link, outside, outsideEntry } = plantLinkedComponent();
+
+      const error = unsafePathErrorFrom(() => {
+        ensureSecureDir(join(root, 'backups', 'one', 'two'));
+      });
+
+      expect(error.details?.path).toBe(link);
+      expect(error.details?.reason).toBe('symlink-component');
+      expect(entriesIn(outside)).toEqual([outsideEntry]);
+      expect(existsSync(join(outside, 'one'))).toBe(false);
+    },
+  );
+
+  it.skipIf(!CAN_CREATE_SYMLINKS)(
+    'refuses a link whose target already holds the next component, with no upTo, and creates nothing through it (requires symlink creation)',
+    () => {
+      // The shape that survives a walk which trusts "the deepest path whose
+      // `lstat` succeeds". `lstat` resolves *interior* components, so with a
+      // directory already sitting inside the link's target the deepest
+      // succeeding path is that directory — below the link — and a walk that
+      // starts there never sees the link at all. Only the tail is then created,
+      // verified, and reported as private, outside the tree.
+      const { root, link, outside, outsideEntry } = plantLinkedComponent();
+      const beyond = makeDir(join(outside, 'existing'), SECURE_DIR_MODE);
+
+      const error = unsafePathErrorFrom(() => {
+        ensureSecureDir(join(root, 'backups', 'existing', 'created'));
+      });
+
+      expect(error.details?.path).toBe(link);
+      expect(error.details?.reason).toBe('symlink-component');
+      expect(existsSync(join(beyond, 'created'))).toBe(false);
+      expect(entriesIn(beyond)).toEqual([]);
+      expect(entriesIn(outside).sort()).toEqual(['existing', outsideEntry].sort());
+    },
+  );
+
+  it.skipIf(!CAN_CREATE_SYMLINKS)(
+    'refuses a link whose target already holds the named directory itself, with no upTo (requires symlink creation)',
+    () => {
+      // The same shape with nothing left to create: the named directory already
+      // exists behind the link, so the only act left is the tightening pass —
+      // and tightening a directory outside the tree is a permission change the
+      // product was never asked for, which makes the refusal as necessary here
+      // as it is for a creation.
+      const { root, link, outside } = plantLinkedComponent();
+      makeDir(join(outside, 'existing'), PROJECT_DIR_MODE);
+
+      const error = unsafePathErrorFrom(() => {
+        ensureSecureDir(join(root, 'backups', 'existing'));
+      });
+
+      expect(error.details?.path).toBe(link);
+      expect(error.details?.reason).toBe('symlink-component');
+    },
+  );
+
+  it.skipIf(!CAN_CREATE_SYMLINKS || NO_POSIX_IDS)(
+    'changes no mode outside the tree when an intermediate link already holds the named directory (requires symlink creation and POSIX permission bits)',
+    () => {
+      const { root, outside } = plantLinkedComponent();
+      const beyond = makeDir(join(outside, 'existing'), PROJECT_DIR_MODE);
+
+      unsafePathErrorFrom(() => {
+        ensureSecureDir(join(root, 'backups', 'existing'));
+      });
+
+      // `0755` is the mode a directory outside the product's tree legitimately
+      // carries. A pass that reached it through the link would have made it
+      // owner-only — invisible to the developer, and not something this module
+      // can undo.
+      expect(permissionsOf(beyond)).toBe(PROJECT_DIR_MODE);
+      expect(permissionsOf(outside)).toBe(PROJECT_DIR_MODE);
+    },
+  );
+
+  it.skipIf(!CAN_CREATE_SYMLINKS)(
+    'refuses a link whose target already holds the next component under upTo (requires symlink creation)',
+    () => {
+      // The declared-boundary form of the two cases above, so the symmetry is
+      // pinned: a boundary must not make the walk any more willing to descend
+      // through a link than it is without one.
+      const { root, link, outside } = plantLinkedComponent();
+      const beyond = makeDir(join(outside, 'existing'), SECURE_DIR_MODE);
+
+      const error = unsafePathErrorFrom(() => {
+        ensureSecureDir(join(root, 'backups', 'existing', 'created'), { upTo: root });
+      });
+
+      expect(error.details?.path).toBe(link);
+      expect(error.details?.reason).toBe('symlink-component');
+      expect(entriesIn(beyond)).toEqual([]);
+    },
+  );
+
+  it.skipIf(!CAN_CREATE_SYMLINKS || NO_POSIX_IDS)(
+    'leaves the mode of the directory an intermediate link points at untouched (requires symlink creation and POSIX permission bits)',
+    () => {
+      // `chmod` follows a link. A tightening pass that walked *through* the
+      // intermediate link would make a directory another account owns
+      // owner-only, which is a permission change the product was never asked
+      // for and cannot undo.
+      const { root, outside } = plantLinkedComponent();
+
+      unsafePathErrorFrom(() => {
+        ensureSecureDir(join(root, 'backups', 'one'), { upTo: root });
+      });
+
+      expect(permissionsOf(outside)).toBe(PROJECT_DIR_MODE);
+    },
+  );
+
+  /*
+   * The two sides of the boundary rule, pinned because the function's
+   * documentation promises them. Without a boundary the whole existing prefix
+   * must be literal — the function has no declaration to rely on and cannot
+   * tell a long-standing link from one planted a second ago. With a boundary
+   * the caller has declared the subtree it owns, so a link above that
+   * declaration is the caller's business, and the escape hatch for the strict
+   * case is to resolve the path once and pass the result.
+   */
+
+  it.skipIf(!CAN_CREATE_SYMLINKS)(
+    'refuses a path reached through a symbolic link anywhere above it when no boundary is declared (requires symlink creation)',
+    () => {
+      const real = makeDir(join(sandbox, 'real-home'), SECURE_DIR_MODE);
+      const linked = join(sandbox, 'home');
+      symlinkSync(real, linked);
+
+      const error = unsafePathErrorFrom(() => {
+        ensureSecureDir(join(linked, 'state', 'backups'));
+      });
+
+      expect(error.details?.path).toBe(linked);
+      expect(error.details?.reason).toBe('symlink-component');
+      expect(existsSync(join(real, 'state'))).toBe(false);
+    },
+  );
+
+  it.skipIf(!CAN_CREATE_SYMLINKS || NO_POSIX_IDS)(
+    'accepts the same path once the caller has resolved it, the documented way past a linked ancestor (requires symlink creation and POSIX permission bits)',
+    () => {
+      const real = makeDir(join(sandbox, 'real-home'), SECURE_DIR_MODE);
+      const linked = join(sandbox, 'home');
+      symlinkSync(real, linked);
+
+      // `fs.realpathSync` is what the refusal above tells a caller to do, so
+      // the result of doing it has to work — otherwise the strictness has no
+      // way out and a legitimate layout becomes unusable.
+      const leaf = join(realpathSync(linked), 'state', 'backups');
+      ensureSecureDir(leaf);
+
+      expect(permissionsOf(leaf)).toBe(SECURE_DIR_MODE);
+      expect(permissionsOf(join(real, 'state'))).toBe(SECURE_DIR_MODE);
+    },
+  );
+
+  it.skipIf(!CAN_CREATE_SYMLINKS || NO_POSIX_IDS)(
+    'verifies only the declared subtree when upTo is given, so a link above the boundary stays the caller declaration (requires symlink creation and POSIX permission bits)',
+    () => {
+      const real = makeDir(join(sandbox, 'real-home'), SECURE_DIR_MODE);
+      const linked = join(sandbox, 'home');
+      symlinkSync(real, linked);
+      // The boundary already exists, so nothing is created inside the link and
+      // the walk starts at a directory it can inspect directly.
+      const declaredRoot = makeDir(join(real, 'state'), SECURE_DIR_MODE);
+
+      ensureSecureDir(join(linked, 'state', 'backups'), { upTo: join(linked, 'state') });
+
+      // The asymmetry, asserted rather than assumed: this succeeded, and what
+      // it created is the directory the resolved path names.
+      expect(permissionsOf(join(declaredRoot, 'backups'))).toBe(SECURE_DIR_MODE);
+      expect(entriesIn(declaredRoot)).toEqual(['backups']);
+    },
+  );
+
+  it.skipIf(NO_POSIX_IDS || !CAN_ASSIGN_FOREIGN_OWNER)(
+    'refuses an existing component owned by another account and creates nothing beneath it (requires assigning a foreign owner)',
+    () => {
+      // The descent checks ownership *before* it tightens or enters a component
+      // that already existed. Both halves of that order matter: a directory
+      // another account owns cannot be `chmod`-ed by us at all, and creating the
+      // product's own subtree inside it would leave that subtree — backups, the
+      // session store — inside a directory its owner can swap out at will.
+      const root = makeDir(join(sandbox, 'state'), SECURE_DIR_MODE);
+      const handedOver = makeDir(join(root, 'backups'), SECURE_DIR_MODE);
+      const leaf = join(handedOver, 'one');
+      const foreignUid = assignForeignOwner(handedOver);
+
+      const error = unsafePathErrorFrom(() => {
+        ensureSecureDir(leaf, { upTo: root });
+      });
+
+      expect(error.details?.path).toBe(handedOver);
+      expect(error.details?.reason).toBe('foreign-owner');
+      expect(error.details?.owner).toBe(foreignUid);
+      expect(existsSync(leaf)).toBe(false);
+      expect(entriesIn(handedOver)).toEqual([]);
+    },
+  );
 });
 
 /*
@@ -795,40 +1374,46 @@ describe('createFileExclusive', () => {
     expect(lstatSync(target).isDirectory()).toBe(true);
   });
 
-  it('refuses a planted symbolic link and leaves its target byte-for-byte unchanged', () => {
-    const victim = makeFile(join(sandbox, 'victim.txt'), 'untouched\n');
-    const target = join(sandbox, 'note.txt');
-    symlinkSync(victim, target);
+  it.skipIf(!CAN_CREATE_SYMLINKS)(
+    'refuses a planted symbolic link and leaves its target byte-for-byte unchanged (requires symlink creation)',
+    () => {
+      const victim = makeFile(join(sandbox, 'victim.txt'), 'untouched\n');
+      const target = join(sandbox, 'note.txt');
+      symlinkSync(victim, target);
 
-    const code = runtimeErrnoFrom(() => {
-      createFileExclusive(target, 'written through the link\n');
-    });
+      const code = runtimeErrnoFrom(() => {
+        createFileExclusive(target, 'written through the link\n');
+      });
 
-    // `O_EXCL` takes precedence over `O_NOFOLLOW`: POSIX requires `EEXIST`
-    // when the path names an existing link, so either errno is a correct
-    // refusal here and the module's flags are not weakened to pick one. The
-    // security property is the assertion below, which no errno can express:
-    // nothing was written through the link.
-    expect(['EEXIST', 'ELOOP']).toContain(code);
-    expectFileBytes(victim, 'untouched\n');
-    expect(lstatSync(target).isSymbolicLink()).toBe(true);
-  });
+      // `O_EXCL` takes precedence over `O_NOFOLLOW`: POSIX requires `EEXIST`
+      // when the path names an existing link, so either errno is a correct
+      // refusal here and the module's flags are not weakened to pick one. The
+      // security property is the assertion below, which no errno can express:
+      // nothing was written through the link.
+      expect(['EEXIST', 'ELOOP']).toContain(code);
+      expectFileBytes(victim, 'untouched\n');
+      expect(lstatSync(target).isSymbolicLink()).toBe(true);
+    },
+  );
 
-  it('refuses a dangling symbolic link rather than creating what it points at', () => {
-    const missing = join(sandbox, 'missing.txt');
-    const target = join(sandbox, 'note.txt');
-    symlinkSync(missing, target);
+  it.skipIf(!CAN_CREATE_SYMLINKS)(
+    'refuses a dangling symbolic link rather than creating what it points at (requires symlink creation)',
+    () => {
+      const missing = join(sandbox, 'missing.txt');
+      const target = join(sandbox, 'note.txt');
+      symlinkSync(missing, target);
 
-    const code = runtimeErrnoFrom(() => {
-      createFileExclusive(target, 'one line\n');
-    });
+      const code = runtimeErrnoFrom(() => {
+        createFileExclusive(target, 'one line\n');
+      });
 
-    // The dangling case is the dangerous one: without `O_EXCL`'s refusal, a
-    // create through the link would place the file wherever the link points —
-    // a path the attacker, not the product, chose.
-    expect(['EEXIST', 'ELOOP']).toContain(code);
-    expect(existsSync(missing)).toBe(false);
-  });
+      // The dangling case is the dangerous one: without `O_EXCL`'s refusal, a
+      // create through the link would place the file wherever the link points —
+      // a path the attacker, not the product, chose.
+      expect(['EEXIST', 'ELOOP']).toContain(code);
+      expect(existsSync(missing)).toBe(false);
+    },
+  );
 
   it.skipIf(NO_POSIX_IDS)(
     'refuses an over-permissive parent and creates nothing (POSIX permission bits)',
@@ -881,6 +1466,31 @@ describe('createFileExclusive', () => {
 
       expect(error.details?.path).toBe(root);
       expect(existsSync(join(parent, 'two.bin'))).toBe(false);
+    },
+  );
+
+  it.skipIf(NO_POSIX_IDS || !CAN_ASSIGN_FOREIGN_OWNER)(
+    'refuses a parent owned by another account and creates nothing (requires assigning a foreign owner)',
+    () => {
+      // The parent is 0700, so nothing about its mode is wrong; what is wrong
+      // is that its owner can replace it — and therefore replace the file about
+      // to be written into it — between this check and any later read. A
+      // privileged process would be *allowed* to write here, which is why the
+      // refusal has to come from the module's policy rather than from the
+      // kernel.
+      const parent = makeDir(join(sandbox, 'state'), SECURE_DIR_MODE);
+      const target = join(parent, 'auth.json');
+      const foreignUid = assignForeignOwner(parent);
+
+      const error = unsafePathErrorFrom(() => {
+        createFileExclusive(target, '{"role":"editor","issuedAt":1}');
+      });
+
+      expect(error.details?.path).toBe(parent);
+      expect(error.details?.reason).toBe('foreign-owner');
+      expect(error.details?.owner).toBe(foreignUid);
+      expect(existsSync(target)).toBe(false);
+      expect(entriesIn(parent)).toEqual([]);
     },
   );
 });
@@ -1138,23 +1748,31 @@ describe('readFileNoFollow', () => {
     expect(Buffer.compare(read, payload)).toBe(0);
   });
 
-  it.skipIf(NO_NOFOLLOW)('refuses a planted symbolic link with ELOOP (requires O_NOFOLLOW)', () => {
-    // The assertion the plan names: `O_RDONLY | O_NOFOLLOW` meeting a link at
-    // the final component is reported as ELOOP — "too many symbolic links" —
-    // and the errno is left as the platform's own so a caller can tell it
-    // apart from ENOENT and EACCES. Without `O_NOFOLLOW` this read would
-    // silently return the content of whatever the link points at, which for a
-    // backup or a credential is another file's content presented as ours.
-    const victim = makeFile(join(sandbox, 'victim.txt'), 'another file\n');
-    const target = join(sandbox, 'backup.bin');
-    symlinkSync(victim, target);
+  it.skipIf(!CAN_CREATE_SYMLINKS || NO_NOFOLLOW)(
+    'refuses a planted symbolic link with ELOOP (requires symlink creation and O_NOFOLLOW)',
+    () => {
+      // The assertion the plan names: `O_RDONLY | O_NOFOLLOW` meeting a link at
+      // the final component is reported as ELOOP — "too many symbolic links" —
+      // and the errno is left as the platform's own so a caller can tell it
+      // apart from ENOENT and EACCES. Without `O_NOFOLLOW` this read would
+      // silently return the content of whatever the link points at, which for a
+      // backup or a credential is another file's content presented as ours.
+      //
+      // Both guards are needed and neither implies the other: the `O_NOFOLLOW`
+      // one is here because the exact errno is this case's subject, and the
+      // symlink one because the fixture cannot be built without planting a
+      // link — a platform can have the flag and still refuse the plant.
+      const victim = makeFile(join(sandbox, 'victim.txt'), 'another file\n');
+      const target = join(sandbox, 'backup.bin');
+      symlinkSync(victim, target);
 
-    const code = runtimeErrnoFrom(() => {
-      readFileNoFollow(target);
-    });
+      const code = runtimeErrnoFrom(() => {
+        readFileNoFollow(target);
+      });
 
-    expect(code).toBe('ELOOP');
-  });
+      expect(code).toBe('ELOOP');
+    },
+  );
 
   it('lets ENOENT through for a file that does not exist', () => {
     const code = runtimeErrnoFrom(() => {
@@ -1173,4 +1791,245 @@ describe('readFileNoFollow', () => {
 
     expect(['EISDIR', 'EACCES']).toContain(code);
   });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * a project-internal symbolic link whose target is outside the root
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * A project root holding two links that leave it, and the directory and file
+ * they leave it for.
+ *
+ * The root and the directory inside it are `0700` so that the refusals asserted
+ * below are about the *link* and not about a permission bit: `assertSecureDir`
+ * reports the outermost failing component, and an ordinary `0755` root would
+ * make every case report that instead of what it is testing.
+ */
+interface EscapingLinkFixture {
+  /** The project root every containment question below is asked against. */
+  readonly root: string;
+
+  /** An ordinary directory inside the root, the parent of both links. */
+  readonly inside: string;
+
+  /** A link inside the root pointing at {@link externalDir}. */
+  readonly linkedDir: string;
+
+  /** A link inside the root pointing at {@link externalFile}. */
+  readonly linkedFile: string;
+
+  /** The directory outside the root entirely. */
+  readonly externalDir: string;
+
+  /** The file in {@link externalDir}, whose bytes nothing inside the root may reach. */
+  readonly externalFile: string;
+
+  /** The exact content of {@link externalFile}, for byte-for-byte comparison. */
+  readonly externalContent: string;
+
+  /** The single entry {@link externalDir} holds, as `readdir` reports it. */
+  readonly externalEntry: string;
+}
+
+/**
+ * Builds the {@link EscapingLinkFixture} inside the current sandbox.
+ *
+ * Plants links, so every case that calls it is guarded by
+ * {@link CAN_CREATE_SYMLINKS}.
+ */
+function plantEscapingLinks(): EscapingLinkFixture {
+  const root = makeDir(join(sandbox, 'project'), SECURE_DIR_MODE);
+  const inside = makeDir(join(root, 'inside'), SECURE_DIR_MODE);
+  const externalDir = makeDir(join(sandbox, 'beyond'), SECURE_DIR_MODE);
+  const externalEntry = 'note.txt';
+  const externalContent = 'outside the project root\n';
+  const externalFile = makeFile(join(externalDir, externalEntry), externalContent);
+
+  const linkedDir = join(inside, 'escape');
+  symlinkSync(externalDir, linkedDir);
+  const linkedFile = join(inside, 'reachable.txt');
+  symlinkSync(externalFile, linkedFile);
+
+  return {
+    root,
+    inside,
+    linkedDir,
+    linkedFile,
+    externalDir,
+    externalFile,
+    externalContent,
+    externalEntry,
+  };
+}
+
+/**
+ * The escape the lexical gate cannot see, proven on a real filesystem.
+ *
+ * This block is the Node-side half of a requirement `../paths.test.ts` states
+ * but deliberately cannot test: a path that is inside the project root *as
+ * text* can still resolve outside it, because a component of it is a symbolic
+ * link. `../paths.ts` imports nothing and answers about strings, so it accepts
+ * such a path by construction and says so in each function's "Limit of the
+ * guarantee" — and that limit is only honest if the rejection is proven
+ * somewhere. It is proven here, in the order a resolver has to apply it:
+ *
+ * 1. the lexical gate **accepts** the unresolved path — the documented limit,
+ *    recorded as a fact rather than as prose;
+ * 2. the same gate composed with `fs.realpath` **rejects** it — the rule every
+ *    resolver in this product follows (the VS Code URI handler validating a
+ *    path any web page can supply, the service's source-open, the patcher):
+ *    resolve first, then ask this gate about the resolved path;
+ * 3. this module refuses the path on its own where its own guarantees reach:
+ *    `O_NOFOLLOW` refuses a link at the **final** component, and the directory
+ *    policy refuses a link anywhere in a chain it is given to verify.
+ *
+ * Step 3 is narrower than it is tempting to read it as, and the fourth case
+ * below exists to keep it narrow: `O_NOFOLLOW` constrains the final component
+ * only, so a read whose *interior* component is a link returns what the link
+ * points at. This module is therefore **not** a substitute for step 2. Every
+ * caller that accepts a multi-component path from anywhere but itself resolves
+ * it with `fs.realpath` and re-checks containment before opening it; the
+ * refusals here are the backstop for the final component and for a declared
+ * directory chain, not a replacement for that obligation.
+ *
+ * Every case needs a planted link, so all of them are guarded on the
+ * capability to plant one.
+ */
+describe('a project-internal symbolic link whose target is outside the root', () => {
+  it.skipIf(!CAN_CREATE_SYMLINKS)(
+    'is accepted by the lexical gate, which is the documented limit of a string check (requires symlink creation)',
+    () => {
+      const { root, externalEntry } = plantEscapingLinks();
+
+      // Text only: 'inside/escape/note.txt' has no traversal in it and lands
+      // under the root when joined, so the gate cannot answer otherwise — and
+      // a caller that stopped here would open a file outside the project.
+      const resolved = acceptedPath(resolveWithinProject(root, `inside/escape/${externalEntry}`));
+
+      expect(resolved).toBe(`${root}/inside/escape/${externalEntry}`);
+      expect(isWithin(root, resolved)).toBe(true);
+    },
+  );
+
+  it.skipIf(!CAN_CREATE_SYMLINKS)(
+    'is rejected by the gate once the path is resolved with realpath (requires symlink creation)',
+    () => {
+      const { root, externalDir, externalEntry } = plantEscapingLinks();
+      const resolved = acceptedPath(resolveWithinProject(root, `inside/escape/${externalEntry}`));
+
+      // The composition rule, asserted rather than described: realpath first,
+      // then the gate. Both halves are needed — the gate alone accepts (the
+      // case above), and realpath alone answers no question about containment.
+      const real = realpathSync(resolved);
+      expect(real).toBe(join(externalDir, externalEntry));
+      expect(isWithin(root, real)).toBe(false);
+
+      const error = refusedBy(toProjectRelative(root, real));
+      expect(error.code).toBe('PATH_OUTSIDE_PROJECT');
+    },
+  );
+
+  it.skipIf(!CAN_CREATE_SYMLINKS || NO_NOFOLLOW)(
+    'is refused by readFileNoFollow at the final component, so the external bytes are never read (requires symlink creation and O_NOFOLLOW)',
+    () => {
+      const { linkedFile, externalFile, externalContent } = plantEscapingLinks();
+
+      const code = runtimeErrnoFrom(() => {
+        readFileNoFollow(linkedFile);
+      });
+
+      expect(code).toBe('ELOOP');
+      expectFileBytes(externalFile, externalContent);
+    },
+  );
+
+  it.skipIf(!CAN_CREATE_SYMLINKS)(
+    'is read through when the link is an interior component, which is why a resolver must realpath first (requires symlink creation)',
+    () => {
+      // Stated as a fact, the way this file states the EEXIST/ELOOP split:
+      // `O_NOFOLLOW` constrains the **final** component only, so a read whose
+      // interior component is a link is an ordinary read of whatever that link
+      // points at. No flag can change that — the kernel resolves interior
+      // components before the flag applies — which is exactly why step 2 above
+      // is a requirement on every caller that accepts a path from elsewhere,
+      // and not a nicety.
+      const { linkedDir, externalContent, externalEntry } = plantEscapingLinks();
+
+      const read = readFileNoFollow(join(linkedDir, externalEntry));
+
+      expect(read.toString('utf8')).toBe(externalContent);
+    },
+  );
+
+  it.skipIf(!CAN_CREATE_SYMLINKS)(
+    'is refused by createFileExclusive, and the external directory gains nothing (requires symlink creation)',
+    () => {
+      const {
+        root,
+        linkedDir,
+        linkedFile,
+        externalDir,
+        externalFile,
+        externalContent,
+        externalEntry,
+      } = plantEscapingLinks();
+
+      // A link at the path being created: refused by the exclusive, no-follow
+      // open, and the file it points at keeps its bytes.
+      const code = runtimeErrnoFrom(() => {
+        createFileExclusive(linkedFile, 'written through the link\n', {
+          requireSecureParents: false,
+        });
+      });
+      expect(['EEXIST', 'ELOOP']).toContain(code);
+      expectFileBytes(externalFile, externalContent);
+
+      // A link as the *parent* of the path being created: refused by the
+      // directory policy, which is why that policy exists in addition to the
+      // flags — the flags cannot see an interior component.
+      const error = unsafePathErrorFrom(() => {
+        createFileExclusive(join(linkedDir, 'planted.txt'), 'one line\n', { upTo: root });
+      });
+      expect(error.details?.path).toBe(linkedDir);
+      expect(error.details?.reason).toBe('symlink-component');
+
+      expect(entriesIn(externalDir)).toEqual([externalEntry]);
+    },
+  );
+
+  it.skipIf(!CAN_CREATE_SYMLINKS)(
+    'is refused by assertSecureDir under the project root (requires symlink creation)',
+    () => {
+      const { root, linkedDir } = plantEscapingLinks();
+
+      const error = unsafePathErrorFrom(() => {
+        assertSecureDir(linkedDir, { upTo: root });
+      });
+
+      expect(error.details?.path).toBe(linkedDir);
+      expect(error.details?.reason).toBe('symlink-component');
+    },
+  );
+
+  it.skipIf(!CAN_CREATE_SYMLINKS)(
+    'is refused by ensureSecureDir, which creates nothing in the external directory (requires symlink creation)',
+    () => {
+      const { root, linkedDir, externalDir, externalEntry } = plantEscapingLinks();
+
+      const error = unsafePathErrorFrom(() => {
+        ensureSecureDir(join(linkedDir, 'sub'), { upTo: root });
+      });
+
+      expect(error.details?.path).toBe(linkedDir);
+      expect(error.details?.reason).toBe('symlink-component');
+      // The creation walk stopped at the link: the directory that would have
+      // been created behind it does not exist, and the external directory holds
+      // exactly what the fixture put there.
+      expect(existsSync(join(externalDir, 'sub'))).toBe(false);
+      expect(entriesIn(externalDir)).toEqual([externalEntry]);
+    },
+  );
 });

@@ -1189,7 +1189,25 @@ export interface PlanAdapterResolver {
 }
 
 /**
- * The identity of an action, as the text `file|symbol|type`.
+ * Encodes one component of an identity key so that it delimits itself: its
+ * length in UTF-16 code units, a `':'`, then the value verbatim.
+ *
+ * Self-delimiting is the whole point. A length is a digit run and contains no
+ * `':'`, so the first `':'` in an encoded component always ends the length, and
+ * the component is then exactly that many code units regardless of what those
+ * code units are — digits, colons, separators or anything else. A concatenation
+ * of such components is therefore uniquely decodable, which is the property
+ * {@link actionIdentityKey} needs and which no escaping scheme gets for free.
+ *
+ * @param value The component to encode. Any string, including an empty one.
+ * @returns The length-prefixed component.
+ */
+function lengthPrefixed(value: string): string {
+  return `${String(value.length)}:${value}`;
+}
+
+/**
+ * The identity of an action: an unambiguous encoding of `(file, symbol, type)`.
  *
  * Three things use this key, and all three need the *same* definition of "the
  * same action", which is why it is a function here rather than an expression
@@ -1208,11 +1226,30 @@ export interface PlanAdapterResolver {
  * including any of them would make an action that was merely re-explained look
  * like a new one, and re-instrument a file that is already instrumented.
  *
- * The result is an **opaque** key: compare it, group by it, but never parse it
- * back apart. Both components are single-line and control-character-free by
- * schema, which is what makes a plain separator sufficient for comparison, but
- * a `'|'` is a legal character in a POSIX file name, so the mapping back is not
- * unambiguous and is not offered.
+ * **The encoding is injective, and that is load-bearing rather than tidy.**
+ * Joining the three components with a separator does not work, because every
+ * plausible separator is a legal character in two of them: the schemas above
+ * refuse control characters and nothing else inside a path or a symbol, so
+ * `'|'` — valid in a POSIX file name and in the text of a symbol — would give
+ * `('src/a|b.ts', 'x')` and `('src/a', 'b.ts|x')` one key for two different
+ * actions, and each consumer would then mis-associate. Normalisation would hand
+ * one action's id to the other; the installer would read a new action as
+ * already applied and skip it, or consume the surviving action's id and patch a
+ * file the journal already records as instrumented; the feasibility gate would
+ * report two unrelated targets as a duplicate. AAP §0.4.2's modification chain
+ * — the one cleanup restores in strictly reverse order — hangs off those ids,
+ * so a collision is a file that does not come back.
+ *
+ * Each component is therefore written length-prefixed by {@link lengthPrefixed}
+ * and the three are concatenated, which makes distinct triples produce distinct
+ * keys whatever the components contain, with no character excluded and no
+ * escaping to get wrong.
+ *
+ * The result is still an **opaque** key: compare it, group by it, use it as a
+ * `Map` key, but do not parse it back apart. Unique decodability is what makes
+ * comparing it sound, not an interface this module offers. It carries no
+ * control character whenever its inputs carry none — which both schemas above
+ * already guarantee — so it is safe to name in a log line.
  *
  * @param target Anything carrying a normalised `file`, a `symbol` and a `type`
  * — an {@link InstrumentationAction} or a bare triple.
@@ -1223,7 +1260,7 @@ export function actionIdentityKey(target: {
   readonly symbol: string;
   readonly type: InstrumentationActionType;
 }): string {
-  return `${target.file}|${target.symbol}|${target.type}`;
+  return lengthPrefixed(target.file) + lengthPrefixed(target.symbol) + lengthPrefixed(target.type);
 }
 
 // ---------------------------------------------------------------------------

@@ -3,13 +3,30 @@
  *
  * One operation lives here, and it is the server half of the storefront's
  * "Place order" button. What placing an order consists of is the whole of this
- * module: the cart is read, the units on it are promised, the lines are priced,
- * the freight is quoted, the payment is authorized and the order is written.
- * Each of those is somebody else's expertise - `./cart.service`,
+ * module: the cart is read and taken, the units on it are promised, the lines
+ * are priced, the freight is quoted, the payment is authorized and the order is
+ * written. Each of those is somebody else's expertise - `./cart.service`,
  * `./inventory.service`, `./pricing.service`, `./shipping.service`,
  * `./payment.service` and `./order.service` own one each - so what is left here
  * is the order they happen in and the figures they hand one another. This
  * module issues no query, opens no connection and writes no row of its own.
+ *
+ * **A cart is taken before anything is spent against it.** The steps after the
+ * first hold stock, ask a carrier to rate a shipment and ask a processor to
+ * approve an amount, and none of that may happen twice for one cart, so the
+ * cart is claimed before any of it. Only the checkout holding the cart reaches
+ * a carrier or a processor; a second one is turned away with a collision before
+ * it spends anything, and the order and the cart's conversion are written
+ * together in one transaction so an order and an orderable cart cannot both
+ * exist.
+ *
+ * **What a failed checkout gives back depends on whether it charged.** The
+ * stock always goes back, because no order was written. The cart goes back only
+ * while nothing has been sent to the processor, or while the processor has
+ * answered that it took nothing: a cart that may carry an authorization is left
+ * held instead, so a second attempt cannot authorize the same order again, and
+ * the store is told in the log that it has an authorization to settle and no
+ * order against it. {@link undo} is where that line is drawn.
  *
  * **The cart belongs to the session, not to the request.** `CheckoutDraft`
  * carries no cart identifier, because a checkout that could name a cart would
@@ -44,7 +61,13 @@
  * parsed body together with the origin it is answering on.
  */
 
-import type { CheckoutDraft, CheckoutResult, ShippingOption } from '@/lib/types';
+import type {
+  CheckoutDraft,
+  CheckoutResult,
+  PaymentAuthorization,
+  ShippingOption,
+  ShippingQuoteResult,
+} from '@/lib/types';
 import {
   StorefrontConflictError,
   StorefrontError,
@@ -52,8 +75,8 @@ import {
 } from '@/server/errors';
 
 import { readActiveCart } from './cart.service';
-import { reserveStock } from './inventory.service';
-import { recordOrder } from './order.service';
+import { release, reserveStock } from './inventory.service';
+import { claim, recordOrder, unclaim } from './order.service';
 import { authorize } from './payment.service';
 import { applyPromotions } from './pricing.service';
 import { quote } from './shipping.service';
@@ -91,21 +114,85 @@ const DECLINED = 'The payment was declined, so this order was not placed.';
  * collision rather than a rejected request - the very same submission was
  * acceptable against the quote it was made from.
  *
- * @param options The services the carrier offered for the destination.
+ * The quote the store recorded comes back with it, because an order is placed
+ * on a quote and not merely at a price: the record of what the customer was
+ * quoted is what the order's freight is charged against. A quote with no
+ * record is no more usable than a service that is no longer offered, so the two
+ * are one outcome here.
+ *
+ * @param shipping The quote the carrier answered, as the store recorded it.
  * @param id The service the submitted checkout named.
- * @returns The offered service, with the price the freight is charged at.
- * @throws StorefrontConflictError When no offered service carries `id`.
+ * @returns The offered service, with the price the freight is charged at, and
+ * the quote it was recorded under.
+ * @throws StorefrontConflictError When no offered service carries `id`, or when
+ * the quote it was offered in was not recorded.
  */
-function offered(options: readonly ShippingOption[], id: string): ShippingOption {
-  const offer = options.find((entry) => entry.id === id);
+function offered(
+  shipping: ShippingQuoteResult,
+  id: string,
+): { option: ShippingOption; quote: string } {
+  const offer = shipping.options.find((entry) => entry.id === id);
 
-  if (offer === undefined) {
+  if (offer === undefined || shipping.id === null) {
     throw new StorefrontConflictError(
       'That shipping service is no longer offered to this destination. Choose a service and place the order again.',
     );
   }
 
-  return offer;
+  return { option: offer, quote: shipping.id };
+}
+
+/**
+ * Puts back what a checkout that did not finish had taken, as far as it is safe
+ * to, and lets the failure that ended it be the one the caller sees.
+ *
+ * Two things are taken before a checkout knows whether it will finish: the
+ * units the cart was promised, and the cart itself. The units always go back -
+ * no order was written, so nothing was sold - and they go back first.
+ *
+ * The cart is the part that depends on how far the checkout got, and the line
+ * is the authorization. Up to the moment an amount is sent to the processor,
+ * nothing has been charged and the cart goes back to its session, so a customer
+ * whose card was declined or whose cart ran short finds it where they left it
+ * and can try again. Once an amount has been sent and the answer is either an
+ * approval or no answer at all, an authorization may stand against that cart,
+ * and putting it back would let the next attempt authorize the same order a
+ * second time. So it is left held: one order that has to be settled by hand is
+ * a smaller wrong than two charges, and the state it is left in says exactly
+ * that - a held cart, no order, and a line in the log naming both.
+ *
+ * Neither step is allowed to become the error reported. A cart that could not
+ * be put back is a matter for whoever runs the store, and the reason the
+ * checkout failed is what the customer needs to be told, so a failure here is
+ * logged and swallowed.
+ *
+ * @param cart The cart the checkout was holding.
+ * @param reference The hold it had raised, or `null` if it had not got that far.
+ * @param charged Whether an amount reached the processor without a definite
+ * answer that nothing was taken.
+ */
+async function undo(cart: string, reference: string | null, charged: boolean): Promise<void> {
+  if (reference !== null) {
+    try {
+      await release(reference);
+    } catch (cause) {
+      console.error(`checkout: the stock held for cart ${cart} was not given back`, cause);
+    }
+  }
+
+  if (charged) {
+    console.error(
+      `checkout: cart ${cart} is still held because an authorization may stand against it, and no order was written for it - settle it before reopening the cart`,
+    );
+
+    return;
+  }
+
+  try {
+    await unclaim(cart);
+  } catch (cause) {
+    console.error(`checkout: cart ${cart} was not returned to its session`, cause);
+  }
 }
 
 /**
@@ -122,8 +209,9 @@ function offered(options: readonly ShippingOption[], id: string): ShippingOption
  * the destination the draft carried - together with the authorization that paid
  * for it.
  * @throws StorefrontValidationError When the cart holds nothing to order.
- * @throws StorefrontConflictError When the chosen shipping service is not among
- * those now offered to the destination.
+ * @throws StorefrontConflictError When another checkout is already holding the
+ * cart, when the cart has already become an order, or when the chosen shipping
+ * service is not among those now offered to the destination.
  * @throws StorefrontError `PAYMENT_DECLINED` when the processor declined the
  * authorization. No order is written for a payment nobody approved.
  * @throws StorefrontNotFoundError When the session is shopping with no open
@@ -140,43 +228,83 @@ export async function placeOrder(draft: CheckoutDraft, origin: string): Promise<
     );
   }
 
-  const reservation = await reserveStock(cart.lines);
+  // The cart is taken before anything is spent against it, so a second checkout
+  // of the same cart is turned away here rather than at the end - after it too
+  // has held stock, rated a shipment and had an amount approved.
+  await claim(cart.id);
 
-  const pricing = await applyPromotions(cart.lines);
+  let reference: string | null = null;
+  let charged = false;
 
-  const shipping = await quote(
-    {
-      postalCode: draft.shippingAddress.postalCode,
-      itemCount: reservation.units,
-      serviceLevel: draft.shippingOptionId,
-    },
-    origin,
-  );
+  try {
+    const reservation = await reserveStock(cart.lines);
 
-  const option = offered(shipping.options, draft.shippingOptionId);
-  const freight = option.priceCents;
-  const total = pricing.totalCents + freight;
+    reference = reservation.reference;
 
-  const payment = await authorize(
-    { amountCents: total, currency: CURRENCY, reference: cart.id },
-    origin,
-  );
+    const pricing = await applyPromotions(cart.lines);
 
-  if (!payment.authorized) {
-    throw new StorefrontError('PAYMENT_DECLINED', 402, payment.declineReason ?? DECLINED);
+    const shipping = await quote(
+      {
+        postalCode: draft.shippingAddress.postalCode,
+        itemCount: reservation.units,
+        serviceLevel: draft.shippingOptionId,
+        cart: cart.id,
+      },
+      origin,
+    );
+
+    const { option, quote: recorded } = offered(shipping, draft.shippingOptionId);
+    const freight = option.priceCents;
+    const total = pricing.totalCents + freight;
+
+    charged = true;
+
+    let payment: PaymentAuthorization;
+
+    try {
+      payment = await authorize(
+        { amountCents: total, currency: CURRENCY, reference: cart.id },
+        origin,
+      );
+    } catch (cause) {
+      // A request the processor never saw took nothing, and this module can
+      // tell: everything the payment service checks before sending - the
+      // amount, the currency, the reference and the address it is sending to -
+      // it reports as a rejected request, while anything that happened once the
+      // request was on its way is an upstream failure. The first is a definite
+      // no, so the cart goes back; the second is no answer at all, and a cart
+      // that may have been charged is not reopened.
+      charged = !(cause instanceof StorefrontValidationError);
+
+      throw cause;
+    }
+
+    if (!payment.authorized) {
+      // A decline is an answer: the processor took nothing, so the customer
+      // keeps their cart and can pay another way.
+      charged = false;
+
+      throw new StorefrontError('PAYMENT_DECLINED', 402, payment.declineReason ?? DECLINED);
+    }
+
+    const order = await recordOrder({
+      cart: cart.id,
+      quote: recorded,
+      customer: draft.contact,
+      address: draft.shippingAddress,
+      lines: pricing.lines,
+      option,
+      payment,
+      subtotalCents: pricing.subtotalCents,
+      discountCents: pricing.discountCents,
+      freightCents: freight,
+      totalCents: total,
+    });
+
+    return { order, payment };
+  } catch (cause) {
+    await undo(cart.id, reference, charged);
+
+    throw cause;
   }
-
-  const order = await recordOrder({
-    customer: draft.contact,
-    address: draft.shippingAddress,
-    lines: pricing.lines,
-    option,
-    payment,
-    subtotalCents: pricing.subtotalCents,
-    discountCents: pricing.discountCents,
-    freightCents: freight,
-    totalCents: total,
-  });
-
-  return { order, payment };
 }

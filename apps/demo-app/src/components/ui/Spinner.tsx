@@ -14,8 +14,7 @@
  * `aria-busy`. This primitive renders in dozens of places, and a `role="status"` in here would
  * turn each of them into an independent live region - a reader would hear the same generic
  * "loading" announced repeatedly, from places it could neither locate nor silence, and the
- * duplicates would be loudest during exactly the repeated interactions this application exists to
- * be observed through.
+ * duplicates would be loudest exactly when several requests are in flight at once.
  *
  *     <button type="button" aria-busy={submitting} disabled={submitting}>
  *       {submitting ? (
@@ -39,7 +38,7 @@
  * read through a computed key, which this repository's `noUncheckedIndexedAccess` types as
  * `string | undefined`, hiding a typo until the ring renders unstyled in a browser. An attribute
  * is constrained by the prop union below, cannot be applied without the base rule, and is legible
- * in the elements tree - which is what this application is here to be inspected with.
+ * in the elements tree beside the class it qualifies.
  *
  * MOTION
  * The rotation and its reduced-motion behaviour are the stylesheet's: under
@@ -50,13 +49,11 @@
  * server's markup and the browser's first markup disagree.
  *
  * RENDER BEHAVIOUR
- * A plain function component: no `memo`, no memoised props, no state, no effects, no `ref`
- * forwarding, and nothing read from `window`, `Date.now()` or `Math.random()` while rendering, so
- * the markup the server sends and the markup the browser first produces always agree. It
- * re-renders whenever its parent does, deliberately: this application's render behaviour is the
- * subject under investigation rather than something for a primitive to smooth over. Holding no
- * hooks, and carrying no client directive either, lets a server component and a client component
- * render it equally - which matters, because the surfaces that wait on data are of both kinds.
+ * A plain function component: no state, no effects, no `ref` forwarding, and nothing read from
+ * `window`, `Date.now()` or `Math.random()` while rendering, so the markup the server sends and
+ * the markup the browser first produces always agree. Holding no hooks, and carrying no client
+ * directive either, lets a server component and a client component render it equally - which
+ * matters, because the surfaces that wait on data are of both kinds.
  */
 
 import clsx from 'clsx';

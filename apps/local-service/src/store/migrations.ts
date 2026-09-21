@@ -31,7 +31,7 @@
  * | -------------------------------- | --------------------------------------------------- |
  * | equal to `STORE_SCHEMA_VERSION`  | no-op success, performing no write at all            |
  * | greater                          | refuse, with an actionable hint: a newer build wrote it |
- * | `0` with the schema already there | adopt it — stamp, do not re-create                 |
+ * | `0` with the schema already there | adopt it — complete it with the idempotent version-1 DDL, then stamp |
  * | lower                            | apply every ladder step above it, one transaction each |
  *
  * ## The additive-only ladder policy
@@ -286,8 +286,11 @@ export const STORE_MIGRATIONS: readonly StoreMigration[] = [
     description: 'initial schema',
     /**
      * Executes `./schema.sql` verbatim. Every statement in that file is
-     * `IF NOT EXISTS`, so the step is idempotent even though the ladder
-     * guarantees it runs at most once.
+     * `IF NOT EXISTS`, so the step is idempotent — which is not a spare
+     * property but one {@link applyMigrations} relies on: the adoption path
+     * runs this step against a database that already carries part of the
+     * schema, where it must leave every existing object alone and create only
+     * what is missing.
      */
     apply: (db, { ddl }) => {
       db.exec(ddl);
@@ -296,22 +299,33 @@ export const STORE_MIGRATIONS: readonly StoreMigration[] = [
 ];
 
 /**
- * The version the initial schema step establishes — the bottom rung, and the
- * version an adopted database is stamped with before any later step runs.
+ * The ladder's bottom rung — the step that establishes the version-1 schema,
+ * and the step the adoption path runs to complete a database that carries only
+ * part of it.
  *
- * Read from the ladder rather than written as `1`, so a future ladder cannot
- * develop a second opinion about where it starts.
+ * Resolved from the ladder rather than reached for as `STORE_MIGRATIONS[0]`, and
+ * never re-expressed as a second call to `db.exec(ddl)`, so adoption and a fresh
+ * install run the identical step and no future ladder can develop a second
+ * opinion about where it starts or what its first rung does. Resolving it here
+ * is also what validates the whole ladder when this module loads.
  */
-const INITIAL_SCHEMA_VERSION = readInitialSchemaVersion(STORE_MIGRATIONS);
+const INITIAL_SCHEMA_MIGRATION = readInitialSchemaMigration(STORE_MIGRATIONS);
+
+/**
+ * The version the initial schema step establishes — the version an adopted
+ * database is stamped with, before any later step runs.
+ */
+const INITIAL_SCHEMA_VERSION = INITIAL_SCHEMA_MIGRATION.version;
 
 /**
  * What {@link applyMigrations} did.
  *
- * `applied` is empty on both zero-work paths, which is why `adopted` exists to
- * tell them apart: an already-current database returns
- * `{ applied: [], adopted: false }` and wrote nothing, while a database that
- * carried the schema without the stamp returns `{ applied: [], adopted: true }`
- * and was stamped.
+ * `applied` is empty on both paths that migrate nothing forward, which is why
+ * `adopted` exists to tell them apart: an already-current database returns
+ * `{ applied: [], adopted: false }` and wrote nothing at all, while a database
+ * that carried the schema without the stamp returns
+ * `{ applied: [], adopted: true }` — it was completed and stamped at the
+ * ladder's bottom rung rather than migrated up from a stamped version.
  */
 export interface MigrationOutcome {
   /** The version the database was at before this call. `0` for a new file. */
@@ -323,12 +337,19 @@ export interface MigrationOutcome {
    */
   toVersion: number;
 
-  /** The versions of the ladder steps this call executed, in the order run. */
+  /**
+   * The versions of the ladder steps this call ran to migrate the database
+   * forward, in the order run. The bottom rung the adoption path re-runs to
+   * complete an unstamped schema is reported by {@link MigrationOutcome.adopted}
+   * instead, because it moved the database to no version it was not already at.
+   */
   applied: readonly number[];
 
   /**
-   * Whether an existing, unstamped schema was adopted — the schema objects were
-   * already present at version `0` and were stamped instead of created.
+   * Whether an existing, unstamped schema was adopted — schema objects were
+   * already present at version `0`, so the ladder's bottom rung ran only to
+   * create whatever that database was missing, and is reported here rather than
+   * in {@link MigrationOutcome.applied}.
    */
   adopted: boolean;
 }
@@ -571,7 +592,7 @@ function wrapStoreFailure(
 }
 
 /**
- * Validates the ladder and returns its lowest version.
+ * Validates the ladder and returns its lowest step.
  *
  * Runs once, when this module is loaded, because a malformed ladder is a
  * programmer error in this repository rather than a runtime condition a
@@ -580,13 +601,17 @@ function wrapStoreFailure(
  * every decision below unsound. Failing at load makes it the first thing the
  * service's own start and every store suite report.
  *
+ * The step itself is returned, not just its version, because the adoption path
+ * executes it: the bottom rung is what establishes the version-1 schema, and
+ * adoption has to run the same one the ladder would.
+ *
  * @param migrations The ladder, as authored.
- * @returns The version of the first step.
+ * @returns The first step.
  * @throws A {@link DebuggenError} when the ladder is empty, out of order, holds
  * a duplicate or non-integer version, or does not end at
  * {@link STORE_SCHEMA_VERSION}.
  */
-function readInitialSchemaVersion(migrations: readonly StoreMigration[]): number {
+function readInitialSchemaMigration(migrations: readonly StoreMigration[]): StoreMigration {
   const first = migrations[0];
   assert(first !== undefined, 'The store schema ladder must declare at least one step.');
 
@@ -612,7 +637,7 @@ function readInitialSchemaVersion(migrations: readonly StoreMigration[]): number
     `The highest store migration version (${previous}) must equal STORE_SCHEMA_VERSION (${STORE_SCHEMA_VERSION}); bump the constant in the same commit as the step.`,
   );
 
-  return first.version;
+  return first;
 }
 
 /**
@@ -678,6 +703,13 @@ function warnOnDigestDrift(db: DatabaseSync, ddlSha256: string, logger: Logger):
  *   intact rather than a partially created schema. A ladder of several steps
  *   commits each rung separately, which means an interrupted run resumes from
  *   the last completed rung on the next start instead of starting over.
+ * - **An unstamped database is completed before it is stamped.** Finding the
+ *   schema already there is treated as a reason to skip *creating* it, never as
+ *   proof that all of it is there: the version-1 DDL runs inside the adoption
+ *   transaction, so a database carrying only part of the schema — an
+ *   interrupted or hand-edited legacy migration — leaves this call with the
+ *   missing tables and indexes created rather than with a stamp claiming they
+ *   exist. It is idempotent, so on a complete database it creates nothing.
  * - **A newer database is refused, never downgraded.** Running an older build
  *   against a store a newer one wrote returns an error rather than reinterpreting
  *   its rows — the modification journal in there is what restores a developer's
@@ -771,24 +803,37 @@ export function applyMigrations(
   // as the work proceeds, so an error message can say where the store stands.
   let version = fromVersion;
   let adopted = false;
+  const context: MigrationContext = { ddl, logger, now };
 
-  // State 3 — the schema objects are present but were never stamped, which is
-  // what a database created by a build that predated version stamping looks
-  // like. Adopt it at the initial step's version: the objects that step would
-  // create are already there, so re-running its DDL would be pointless work,
-  // while any later rung still has to run, which is why this stamps the bottom
-  // of the ladder rather than the top.
+  // State 3 — schema objects are present but were never stamped, which is what
+  // a database created by a build that predated version stamping looks like.
+  // Adoption stamps the bottom of the ladder rather than the top, because every
+  // later rung still has to run afterwards.
+  //
+  // Adoption completes the schema before it stamps it, and that ordering is the
+  // point. The probe below establishes that *some* of the version-1 schema is
+  // there, which is not the same as all of it: a database left behind by an
+  // interrupted or hand-edited legacy migration can carry `sessions` and `meta`
+  // while later tables and indexes are missing. Stamping that would tell every
+  // later start the schema is current — the ladder skips a rung at or below the
+  // stamped version — and leave the repositories to fail against the gaps,
+  // including the modification journal, which is the only record able to restore
+  // a developer's patched files. So the initial rung runs first, inside the same
+  // transaction as the stamp: every statement in the version-1 DDL is
+  // `IF NOT EXISTS`, so it leaves every object that already exists untouched and
+  // creates exactly what is missing, and the stamp then describes a schema that
+  // is genuinely complete. On an already-complete database it creates nothing.
   if (version === 0) {
     let schemaPresent: boolean;
     try {
-      // Both tables, because adoption asserts two different things: that the
-      // schema this ladder would create is already there (the root of the
-      // foreign-key graph), and that the row this module has to write exists.
-      // An unstamped database carrying one without the other is an incomplete
-      // schema rather than an adoptable one, and falling through to the ladder
-      // completes it — every statement in the version-1 DDL is
-      // `IF NOT EXISTS`, so it creates exactly what is missing — instead of
-      // stamping a database the repositories would then fail against.
+      // Both tables, because what the probe asks is whether an earlier build of
+      // this tool wrote this database at all: the root of the store's
+      // foreign-key graph, and the bookkeeping table this module owns. A
+      // database carrying neither is a new file, and creating the schema through
+      // the ladder — reported as `adopted: false`, with version 1 in `applied` —
+      // describes what happened to it more accurately than adoption would. What
+      // the probe deliberately does not claim is that the schema is complete;
+      // the DDL executed inside the transaction below is what makes it so.
       schemaPresent = tableExists(db, ADOPTION_PROBE_TABLE) && tableExists(db, META_TABLE);
     } catch (cause) {
       return err(
@@ -804,6 +849,10 @@ export function applyMigrations(
     if (schemaPresent) {
       try {
         runInTransaction(db, logger, () => {
+          // The ladder's own bottom rung, not a second copy of it: whatever
+          // version 1 means to the ladder is what an adopted database gets.
+          // Idempotent, so this is a no-op on the objects already there.
+          INITIAL_SCHEMA_MIGRATION.apply(db, context);
           stampSchemaVersion(db, INITIAL_SCHEMA_VERSION);
           writeMetaRows(db, { version: INITIAL_SCHEMA_VERSION, ddlSha256, nowMs: now() });
         });
@@ -811,7 +860,7 @@ export function applyMigrations(
         return err(
           wrapStoreFailure(
             cause,
-            `Could not record schema version ${INITIAL_SCHEMA_VERSION} on the existing session store.`,
+            `Could not complete and record schema version ${INITIAL_SCHEMA_VERSION} on the existing session store.`,
             REPAIR_HINT,
             { fromVersion, targetVersion: INITIAL_SCHEMA_VERSION },
           ),
@@ -831,7 +880,6 @@ export function applyMigrations(
   // State 4 — apply every rung above the stamped version, lowest first, each in
   // its own transaction so an interruption resumes from the last completed one.
   const applied: number[] = [];
-  const context: MigrationContext = { ddl, logger, now };
 
   for (const step of STORE_MIGRATIONS) {
     if (step.version <= version) {

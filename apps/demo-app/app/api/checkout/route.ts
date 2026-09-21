@@ -16,8 +16,12 @@
  * environment variable, because the server layer names no host: the services
  * behind this endpoint build the absolute URLs they need from whatever scheme
  * and authority this request arrived on, so the same code answers on a
- * developer's laptop, on a colleague's different port and behind a proxy without
- * a value configured anywhere.
+ * developer's laptop and on a colleague's different port without a value
+ * configured anywhere. A request's authority is chosen by whoever sent it,
+ * though, so it is checked against `@/server/origin` before it is handed on:
+ * the services reached through it are asked to rate a shipment to a customer's
+ * address and to approve an amount, and a submission claiming to have arrived
+ * somewhere else is refused rather than answered.
  *
  * The result is serialized exactly as the service built it. Money is already an
  * integer count of US cents in its `*Cents` fields and every instant is already
@@ -35,6 +39,7 @@
 
 import type { CheckoutDraft, CheckoutResult } from '@/lib/types';
 import { StorefrontValidationError, storefrontErrorResponse } from '@/server/errors';
+import { trusted } from '@/server/origin';
 import { placeOrder } from '@/server/services/checkout.service';
 import { checkoutBodySchema } from '@/server/validation/checkout';
 
@@ -50,6 +55,13 @@ export const dynamic = 'force-dynamic';
 const UNREADABLE = 'The checkout request body could not be read as JSON.';
 
 /**
+ * What a caller is told when the request claims to have arrived somewhere this
+ * store is not served. It names no address: the one at fault came from the
+ * request itself.
+ */
+const MISADDRESSED = 'This request was not addressed to this store.';
+
+/**
  * Places the order this request submitted and answers with it.
  *
  * @param request The POST whose JSON body `checkoutBodySchema` describes: who is
@@ -59,8 +71,9 @@ const UNREADABLE = 'The checkout request body could not be read as JSON.';
  * the server resolves it.
  * @returns `200` with the `CheckoutResult` - the order as it was written and the
  * authorization that paid for it - or the mapper's failure envelope: `400` when
- * the body is not readable JSON or does not match the schema, `404` when the
- * session is shopping with no open cart, `409` when the stock or the chosen
+ * the body is not readable JSON, does not match the schema, or the request was
+ * not addressed to this store, `404` when the session is shopping with no open
+ * cart, `409` when the stock, another checkout of the same cart or the chosen
  * shipping service no longer supports the submission, `402` when the payment was
  * declined, `502` when a dependency did not answer, and a single generic `500`
  * for anything unaccounted for.
@@ -83,6 +96,10 @@ export async function POST(request: Request): Promise<Response> {
     const draft: CheckoutDraft = checkoutBodySchema.parse(payload);
 
     const origin = new URL(request.url).origin;
+
+    if (!trusted(origin)) {
+      throw new StorefrontValidationError(MISADDRESSED);
+    }
 
     const result: CheckoutResult = await placeOrder(draft, origin);
 

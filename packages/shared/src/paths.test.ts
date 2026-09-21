@@ -33,10 +33,24 @@
  *    and this suite mirrors that: pure string inputs, no temporary directory, no
  *    `node:fs`, nothing imported but the three source modules and `vitest`. That
  *    is what lets a hundred adversarial strings run in milliseconds, and it
- *    keeps the suite honest about what the gate actually proves. The
- *    filesystem-level guarantees — `O_NOFOLLOW` on create, `fs.realpath` before
- *    open — belong to `src/node/safe-fs.ts` and to the VS Code URI handler, and
- *    are tested there.
+ *    keeps the suite honest about what the gate actually proves.
+ *
+ *    The requirement that habit hands on, stated here so it cannot be lost in
+ *    the handover: **a path that is inside the project root as text, but whose
+ *    interior component is a symbolic link resolving outside the root, must be
+ *    rejected.** No string can reveal that, so the gate below accepts such a
+ *    path by construction — which makes the rejection a composition rule on
+ *    every caller that opens a file: resolve the path with `fs.realpath`
+ *    first, then ask this gate about the *resolved* path. The rule stays the
+ *    caller's obligation, because the filesystem-level refusals in
+ *    `src/node/safe-fs.ts` reach a path's **final** component (`O_NOFOLLOW`)
+ *    and a directory chain it is given to verify (the parent policy) — an
+ *    interior link is read through, which that suite records as a case of its
+ *    own. Rule and refusals alike are proven on a real filesystem in
+ *    `src/node/safe-fs.test.ts`, in the
+ *    `describe('a project-internal symbolic link whose target is outside the
+ *    root')` block — the resolver that owns the guarantee is the one that
+ *    carries its test.
  * 2. **Tables with labels, one case per test.** `it.each` over a labelled table
  *    names the offending input in the failure line, so a regression reads as
  *    "rejects a NUL byte" rather than "rejects malformed input" with an index.
@@ -1291,9 +1305,20 @@ describe('isWithin', () => {
     // path the product cannot vouch for character-for-character is the safe
     // direction, while folding case would make two distinct paths on a
     // case-sensitive host compare equal — the failure that actually lets
-    // something through. The filesystem-level check belongs elsewhere:
-    // `fs.realpath` in the VS Code extension's URI handler and `O_NOFOLLOW` in
-    // this package's `src/node/safe-fs.ts`.
+    // something through.
+    //
+    // The filesystem-level requirement this leaves open, named rather than
+    // gestured at: a path inside the root as text whose interior component is
+    // a symbolic link resolving outside the root must be rejected, and the way
+    // a caller does that is `fs.realpath` first, then this gate on the
+    // resolved path. It is proven in `src/node/safe-fs.test.ts`, in
+    // `describe('a project-internal symbolic link whose target is outside the
+    // root')`, which asserts in that order: this gate accepting the unresolved
+    // path, the realpath-aware composition rejecting it, and safe-fs's own
+    // narrower refusals — `O_NOFOLLOW` at a path's *final* component and the
+    // directory policy on a chain it is given to verify. That block also
+    // records the limit those refusals have: an interior link is read through,
+    // so they are a backstop and never a substitute for the realpath step.
     expect(isWithin(SHORT_ROOT, '/Proj/src')).toBe(false);
     expect(isWithin('/Proj', `${SHORT_ROOT}/src`)).toBe(false);
     expect(isWithin(PROJECT_ROOT, `/home/dev/Project/${SAFE_RELATIVE}`)).toBe(false);

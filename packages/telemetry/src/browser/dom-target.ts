@@ -45,10 +45,11 @@
  * **3. Only `id` and `class` are read off the element.** Never `innerHTML`,
  * never `outerHTML`, never `value`, never `data-*`, never any other attribute:
  * an input's value and a page's markup are application data this product does
- * not capture (AAP 0.5.2). `textContent` *is* read, because the label of the
- * thing the developer clicked is what makes a panel legible, and it is bounded,
- * whitespace-collapsed and passed through the redaction primitives before it
- * leaves this module.
+ * not capture (AAP 0.5.2). The element's *text* is read, because the label of
+ * the thing the developer clicked is what makes a panel legible — but through
+ * the budgeted walk of {@link harvestText}, never through `textContent`, whose
+ * single read costs the whole subtree — and it is whitespace-collapsed and
+ * passed through the redaction primitives before it leaves this module.
  *
  * **4. No side effects at import time and no module-scope DOM access.** Every
  * page global — `document`, `location`, `CSS` — is reached behind a
@@ -259,20 +260,84 @@ export interface DescribeOptions {
 /** `Node.ELEMENT_NODE`, spelled out so no DOM global is needed to read it. */
 const ELEMENT_NODE = 1;
 
+/** `Node.TEXT_NODE`, the node type an element's text lives in. */
+const TEXT_NODE = 3;
+
+/**
+ * `Node.CDATA_SECTION_NODE`, collected alongside {@link TEXT_NODE} because
+ * `textContent` concatenates both and an inline SVG or MathML subtree can
+ * legitimately carry one.
+ */
+const CDATA_SECTION_NODE = 4;
+
 /** `Node.DOCUMENT_NODE`, used to recognise an element's owner document. */
 const DOCUMENT_NODE = 9;
 
 /**
- * How much raw `textContent` is examined before collapsing and scrubbing.
+ * How much of an element's harvested text is kept before collapsing and
+ * scrubbing, and the cut that reduces it.
  *
- * Reading `textContent` costs what the subtree costs and cannot be bounded
- * from here; everything after the read is bounded by this window, which is
- * roughly twenty-five times the text a descriptor keeps. The cut goes through
- * `cutAtCredentialBoundary` rather than `slice` so a credential straddling the
- * window is removed from where it begins instead of leaving its head in the
- * text that is kept.
+ * Roughly twenty-five times the text a descriptor keeps, so an ordinary label
+ * is never anywhere near it. The cut goes through `cutAtCredentialBoundary`
+ * rather than `slice` so a credential straddling the window is removed from
+ * where it begins instead of leaving its head in the text that is kept.
  */
 const TEXT_SCAN_WINDOW = 2048;
+
+/**
+ * Most code units {@link harvestText} gathers before it stops walking.
+ *
+ * Wider than {@link TEXT_SCAN_WINDOW} on purpose, and the margin is exactly
+ * what keeps the redaction guarantee intact rather than spare room.
+ * `cutAtCredentialBoundary` reads a fixed overlap — one thousand and
+ * twenty-four code units, in `../redaction/rules.ts` — *past* the limit it is
+ * given, so that a credential the cut would split is seen whole; and it arms
+ * its strictest rules, the ones that answer "is a credential-shaped run still
+ * going where the window ends?", only when the text it was handed continues
+ * past that overlap. A harvest of twice the scan window satisfies both
+ * conditions with the overlap to spare, so the value the cut returns is
+ * identical to the one it returned when the whole of `textContent` was handed
+ * to it.
+ */
+const TEXT_HARVEST_WINDOW = TEXT_SCAN_WINDOW * 2;
+
+/**
+ * Most nodes {@link harvestText}'s walk visits.
+ *
+ * The bound that matters for a subtree of many nodes holding little text: a
+ * virtualised table, a sprite sheet of inline `<svg>` icons, a grid of empty
+ * skeleton cells. Text-bearing subtrees stop at
+ * {@link TEXT_HARVEST_WINDOW} long before this, so in practice it caps the
+ * pathological case rather than the ordinary one — five hundred and twelve
+ * guarded property reads, not a walk of the document. A subtree whose text
+ * begins past the five-hundred-and-twelfth node yields no text, which is the
+ * honest answer for a bounded look rather than a wrong one.
+ */
+const MAX_TEXT_NODES_SCANNED = 512;
+
+/**
+ * Deepest descent {@link harvestText}'s walk makes below the element.
+ *
+ * Text more than this many levels inside the thing that was clicked is not
+ * its label. The bound also caps the walk's own state — one resume slot per
+ * level — and keeps a cyclic or hostile object graph from growing it.
+ */
+const MAX_TEXT_DEPTH = 32;
+
+/**
+ * Elements whose text is not the page's visible text.
+ *
+ * Their content is code, markup or a data payload: a Next.js page carries its
+ * server-rendered flight data in inline `<script>` blobs that are routinely
+ * megabytes, and a `<style>` element carries a stylesheet. Collecting either
+ * would spend the whole harvest budget on text no developer would recognise
+ * in a panel row, and — since a page's inline bootstrap data can hold session
+ * material — would capture application data this product does not capture
+ * (AAP 0.5.2). The element the walk started from is tested too, so selecting
+ * a `<script>` in the Elements panel reports no text rather than a fragment
+ * of the page's own source.
+ */
+const NON_RENDERED_TAG = /^(?:script|style|template|noscript)$/;
 
 /** Most class names one selector segment carries. */
 const MAX_SELECTOR_CLASSES = 2;
@@ -316,6 +381,13 @@ const MAX_STACK_LINES_SCANNED = 64;
 
 /** Any run of whitespace, for collapsing text and stack frames. */
 const WHITESPACE_RUN = /\s+/g;
+
+/**
+ * The last whitespace-delimited word of a value, with the whitespace that
+ * precedes it — what {@link dropUnterminatedWord} removes when the text ends
+ * at a budget rather than at the end of the element's own text.
+ */
+const TRAILING_WORD = /\s\S*$/;
 
 /** Characters a CSS identifier may carry unescaped. */
 const SAFE_IDENTIFIER_CHAR = /[A-Za-z0-9_-]/;
@@ -821,14 +893,21 @@ function positiveInteger(value: unknown): number | undefined {
  *
  * Four steps, and their order is the contract rather than an accident:
  *
- * 1. **Bound the raw read.** `textContent` costs what the subtree costs — a
- *    click on `<body>` yields the whole page — so anything past
- *    {@link TEXT_SCAN_WINDOW} is cut with `cutAtCredentialBoundary`, which
- *    reads past the cut so a credential straddling it is removed from where it
- *    begins rather than left with its head in the kept text.
- * 2. **Collapse whitespace**, because a DOM subtree's text carries the source
+ * 1. **Harvest at most {@link TEXT_HARVEST_WINDOW} code units** with
+ *    {@link harvestText}. `textContent` is deliberately never read: it is one
+ *    property access that walks every descendant and concatenates every text
+ *    node into a new string, so its cost and its allocation are whatever the
+ *    subtree costs — a click on `<body>` materialises the whole page, inline
+ *    bootstrap payloads included — and no budget applied afterwards can undo
+ *    work that has already happened. This function runs on the developer's own
+ *    click path (`./interaction.ts`, capture phase, before their handler) and
+ *    on every Elements-panel selection change, so the bound has to come first.
+ * 2. **Reduce the harvest to a value the redaction rules can be trusted with**
+ *    ({@link boundedForRedaction}): the cut past {@link TEXT_SCAN_WINDOW}, and
+ *    the unterminated-word guard for text that ended at a budget.
+ * 3. **Collapse whitespace**, because a DOM subtree's text carries the source
  *    document's indentation and a panel row needs a label.
- * 3. **Scrub, then truncate — never the other way round.** This is the stated
+ * 4. **Scrub, then truncate — never the other way round.** This is the stated
  *    contract of `../redaction/rules.ts`: cutting first can leave a credential
  *    half-matched and therefore unreplaced, so the value is scrubbed while it
  *    is still whole and the scrubbed result is what gets shortened. UI text is
@@ -839,18 +918,279 @@ function positiveInteger(value: unknown): number | undefined {
  * omits the key entirely instead of emitting an empty string.
  */
 function textOf(el: Element): string | undefined {
-  const raw = readProperty(el, 'textContent');
-  if (typeof raw !== 'string' || raw.length === 0) {
+  const harvested = harvestText(el);
+  if (harvested.text.length === 0) {
     return undefined;
   }
-  const bounded =
-    raw.length > TEXT_SCAN_WINDOW ? cutAtCredentialBoundary(raw, TEXT_SCAN_WINDOW) : raw;
+  const bounded = boundedForRedaction(harvested);
   const collapsed = collapse(bounded);
   if (collapsed.length === 0) {
     return undefined;
   }
   const text = truncate(scrub(collapsed), MAX_TEXT_LENGTH);
   return text.length > 0 ? text : undefined;
+}
+
+/**
+ * Reduces harvested text to a value `scrub` can recognise credentials in.
+ *
+ * Every rule in `../redaction/rules.ts` identifies a credential by a run of
+ * credential characters — a provider prefix and its body, a bearer scheme word
+ * and its token, a JWT's dot-separated segments, a URL's `user:password@`,
+ * a PEM block — and a run is whitespace-free. A rule therefore needs to see
+ * either the run's terminator or enough of its body to meet its minimum
+ * length, and text that stops in the middle of a run gives it neither:
+ * `postgresql://user:secret` without its `@` and `Bearer abcdefg` one
+ * character short of the bearer rule's minimum both survive `scrub` verbatim.
+ *
+ * Text stops in the middle of a run in exactly two ways here, and each has its
+ * own answer:
+ *
+ * - **Past {@link TEXT_SCAN_WINDOW}**, where the harvest holds more text than
+ *   is kept. `cutAtCredentialBoundary` owns this: it reads past the cut, sees
+ *   the run whole, and moves the cut back to where the run begins.
+ * - **At a harvest budget**, where the text simply ends and there is nothing
+ *   past it to read — {@link MAX_TEXT_NODES_SCANNED}, {@link MAX_TEXT_DEPTH},
+ *   or a text node whose data could not be read within the budget. Nothing can
+ *   establish what the run was, so the last unterminated word goes
+ *   ({@link dropUnterminatedWord}), and a prefix that is one unterminated word
+ *   in its entirety becomes empty and the descriptor omits `text` — no text at
+ *   all is the only safe answer, since this value both is stored and can reach
+ *   a model provider (AAP 0.5.2).
+ *
+ * @param harvested - What {@link harvestText} gathered, with its truncation
+ * flag.
+ * @returns Text safe to scrub: never longer than {@link TEXT_SCAN_WINDOW}, and
+ * never ending inside a word the walk did not finish reading.
+ */
+function boundedForRedaction(harvested: HarvestedText): string {
+  if (harvested.text.length > TEXT_SCAN_WINDOW) {
+    return cutAtCredentialBoundary(harvested.text, TEXT_SCAN_WINDOW);
+  }
+  return harvested.truncated ? dropUnterminatedWord(harvested.text) : harvested.text;
+}
+
+/**
+ * Drops the final whitespace-delimited word of a value.
+ *
+ * The word is dropped rather than trusted because the text it belonged to
+ * ended at a budget: what follows was never read, so the word may be the head
+ * of a credential (see {@link boundedForRedaction}). A value with no
+ * whitespace in it is one such word, and yields the empty string.
+ */
+function dropUnterminatedWord(value: string): string {
+  const match = TRAILING_WORD.exec(value);
+  return match === null ? '' : value.slice(0, match.index);
+}
+
+/** What {@link harvestText} gathered, and whether it saw everything. */
+interface HarvestedText {
+  /**
+   * The gathered text, uncollapsed and unscrubbed — {@link textOf} owns those
+   * steps — and never longer than {@link TEXT_HARVEST_WINDOW} code units.
+   */
+  text: string;
+
+  /**
+   * Whether text the walk never read remains: a budget stopped it, a subtree
+   * sat below {@link MAX_TEXT_DEPTH}, or a text node's data could not be read
+   * within the budget.
+   *
+   * `true` means {@link text} may end in the middle of a word, which is what
+   * {@link boundedForRedaction} has to answer for before the value is scrubbed.
+   */
+  truncated: boolean;
+}
+
+/** The head of one text node's data, and whether data past it was left unread. */
+interface TextPrefix {
+  /** Text taken from the node, never longer than the budget it was given. */
+  text: string;
+
+  /** Whether the node holds data this read did not return. */
+  unread: boolean;
+}
+
+/**
+ * A text node, as much of one as this module needs.
+ *
+ * `CharacterData.length` is the node's code-unit count, and `substringData`
+ * returns a prefix of its data *without* handing over the rest — which is the
+ * whole point: a plain `node.data` read materialises the node's entire string
+ * into JavaScript before any slice can apply, at a cost proportional to the
+ * node. Measured in Chromium 153 on a parser-created text node of twenty
+ * million code units: the first `node.data.slice(0, 4096)` took 3.1 ms, while
+ * `node.substringData(0, 4096)` took under a hundredth of a millisecond. On a
+ * click path that difference is the whole budget.
+ *
+ * Declared structurally, like every other shape this module reads off a page,
+ * and reached only after the guarded checks in {@link substringOf}.
+ */
+interface CharacterDataLike {
+  substringData(offset: number, count: number): string;
+}
+
+/**
+ * Gathers an element's own text in document order, under three budgets.
+ *
+ * The walk is the bounded stand-in for `textContent`, and every budget it
+ * carries answers a way a page can be large (AAP 0.7.1: the agent does no
+ * work that scales with the size of the document):
+ *
+ * - **{@link TEXT_HARVEST_WINDOW} code units.** The walk stops at the budget,
+ *   and the text node that reaches it hands over only the prefix that fits
+ *   ({@link textPrefixOf}) rather than its whole data.
+ * - **{@link MAX_TEXT_NODES_SCANNED} nodes.** Bounds a subtree of many nodes
+ *   carrying little text, where the code-unit budget would never be reached.
+ * - **{@link MAX_TEXT_DEPTH} levels.** Bounds the descent, and with it the
+ *   `resume` list that is the walk's only state.
+ *
+ * Iterative rather than recursive, and pre-order: when the walk descends into
+ * an element it remembers that element's `nextSibling` in `resume`, so it
+ * comes back up without reading `parentNode` and without trusting a page's
+ * parent links to be consistent with its child links. Comments and processing
+ * instructions are skipped, exactly as `textContent` skips them, and the
+ * containers of {@link NON_RENDERED_TAG} are skipped whole.
+ *
+ * Every read goes through {@link readProperty}, so a replaced accessor or a
+ * revoked `Proxy` ends the walk with whatever was gathered instead of throwing
+ * into the page's click path.
+ *
+ * @param el - The element whose subtree is walked. Its own text nodes are
+ * collected; the element's attributes are never read.
+ * @returns The gathered text and whether anything was left unread. Empty text
+ * when the element has none within the budgets.
+ */
+function harvestText(el: Element): HarvestedText {
+  if (isNonRendered(el)) {
+    return { text: '', truncated: false };
+  }
+  const chunks: string[] = [];
+  const resume: unknown[] = [];
+  let remaining = TEXT_HARVEST_WINDOW;
+  let visits = 0;
+  let truncated = false;
+  let node: unknown = readProperty(el, 'firstChild');
+  while (isNode(node) && remaining > 0 && visits < MAX_TEXT_NODES_SCANNED) {
+    visits += 1;
+    const nodeType = readProperty(node, 'nodeType');
+    if (nodeType === TEXT_NODE || nodeType === CDATA_SECTION_NODE) {
+      const prefix = textPrefixOf(node, remaining);
+      chunks.push(prefix.text);
+      remaining -= prefix.text.length;
+      truncated = truncated || prefix.unread;
+    } else if (nodeType === ELEMENT_NODE && !isNonRendered(node)) {
+      const child = readProperty(node, 'firstChild');
+      if (isNode(child)) {
+        if (resume.length < MAX_TEXT_DEPTH) {
+          resume.push(readProperty(node, 'nextSibling'));
+          node = child;
+          continue;
+        }
+        // A subtree the depth budget refused: its text was never read.
+        truncated = true;
+      }
+    }
+    let next = readProperty(node, 'nextSibling');
+    while (!isNode(next) && resume.length > 0) {
+      next = resume.pop();
+    }
+    node = next;
+  }
+  // A node still in hand means a budget stopped the walk rather than the end
+  // of the element's own text.
+  return { text: chunks.join(''), truncated: truncated || isNode(node) };
+}
+
+/**
+ * Whether a value can be walked as a DOM node.
+ *
+ * Deliberately structural and deliberately shallow: the walk narrows each node
+ * by its `nodeType` before doing anything with it, so all this has to reject
+ * is the `null` that ends a sibling chain and the `undefined` a failed read or
+ * an exhausted `resume` slot yields.
+ */
+function isNode(value: unknown): boolean {
+  return typeof value === 'object' && value !== null;
+}
+
+/** Whether a node is one of the {@link NON_RENDERED_TAG} containers. */
+function isNonRendered(node: unknown): boolean {
+  return NON_RENDERED_TAG.test(tagNameOf(node));
+}
+
+/**
+ * The head of a text node's data, never longer than `limit` code units.
+ *
+ * The node's data is *never* read whole. `CharacterData.length` is a constant-
+ * time count, and `substringData` is the bounded read; a node that offers
+ * neither contributes nothing and is reported as unread, because the
+ * alternative — `node.data` or `node.nodeValue` — is precisely the read whose
+ * cost scales with the node, and a single text node can hold megabytes. Every
+ * `Text` and `CDATASection` in a browser implements both, so the refusal is a
+ * guard rather than a path a page takes.
+ *
+ * @param node - A node already narrowed to a text or CDATA `nodeType`.
+ * @param limit - Code units this read may return, always at least one.
+ * @returns The prefix and whether data past it remains unread.
+ */
+function textPrefixOf(node: unknown, limit: number): TextPrefix {
+  const declared = codeUnitLength(node);
+  if (declared === 0) {
+    return { text: '', unread: false };
+  }
+  const wanted = declared === undefined ? limit : Math.min(declared, limit);
+  const read = substringOf(node, wanted);
+  if (read === undefined) {
+    return { text: '', unread: true };
+  }
+  const text = withoutTrailingHighSurrogate(read.length > limit ? read.slice(0, limit) : read);
+  // With a declared length the comparison is exact; without one, a read that
+  // filled the budget is assumed to have more behind it.
+  const unread = declared === undefined ? text.length >= limit : declared > text.length;
+  return { text, unread };
+}
+
+/** A node's `length` in code units, when it reports a usable one. */
+function codeUnitLength(node: unknown): number | undefined {
+  const length = readProperty(node, 'length');
+  if (typeof length !== 'number' || !Number.isInteger(length) || length < 0) {
+    return undefined;
+  }
+  return length;
+}
+
+/**
+ * `CharacterData.substringData(0, count)`, guarded.
+ *
+ * The method is looked up before it is called, the call is wrapped — the DOM
+ * throws `IndexSizeError` for an out-of-range offset and a page may have
+ * replaced the method with anything — and the result is re-checked as a string
+ * rather than trusted for its declared type.
+ */
+function substringOf(node: unknown, count: number): string | undefined {
+  if (count < 1 || typeof readProperty(node, 'substringData') !== 'function') {
+    return undefined;
+  }
+  try {
+    const read: unknown = (node as CharacterDataLike).substringData(0, count);
+    return typeof read === 'string' && read.length > 0 ? read : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Drops a trailing lone high surrogate.
+ *
+ * A read cut at a code-unit budget can split a surrogate pair, and half a pair
+ * is not a character: it would travel through the descriptor as an unpaired
+ * code unit. Dropping it keeps the harvest well-formed UTF-16 at no cost to
+ * the label.
+ */
+function withoutTrailingHighSurrogate(value: string): string {
+  const last = value.charCodeAt(value.length - 1);
+  return last >= 0xd800 && last <= 0xdbff ? value.slice(0, -1) : value;
 }
 
 /*

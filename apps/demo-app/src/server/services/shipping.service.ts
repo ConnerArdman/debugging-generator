@@ -14,9 +14,11 @@
  * and the four members of {@link ShippingQuoteInput}. Only the destination is
  * required: the other three describe one ordinary parcel when a caller leaves
  * them out, which is what lets the browser ask for a quote with a postal code
- * and nothing else. A figure a caller does name is held to the range a carrier
- * will rate rather than passed on as it stands, so an implausible weight is
- * quoted at the boundary instead of coming back as a rejected request.
+ * and nothing else. A weight a caller does name is held to the range a carrier
+ * will rate rather than passed on as it stands, so an implausible one is quoted
+ * at the boundary instead of coming back as a rejected request; a destination or
+ * a piece count beyond what a carrier rates is refused instead, because a rate
+ * taken on a shorter code or on fewer pieces would price a different shipment.
  *
  * The request goes out over HTTP, to `/api/mock/carrier` on the origin the
  * caller hands over. That endpoint stands in for a carrier account this store
@@ -24,7 +26,10 @@
  * the point: it is addressed at the origin of the request being served rather
  * than at a host written into this file, so the same code runs wherever the
  * application is served from and no configuration decides where a quote comes
- * from.
+ * from. An origin arrives from the outside, though, so it is checked against
+ * `@/server/origin` before a request is addressed to it: a rating request
+ * carries a customer's destination, and one addressed somewhere other than this
+ * store would carry it there.
  *
  * Nothing in a reply is trusted. A carrier's wire format is not this
  * application's to guarantee, so every field is narrowed before it is read, a
@@ -47,6 +52,7 @@
 import type { ShippingOption, ShippingQuoteResult } from '@/lib/types';
 import { prisma } from '@/server/db/prisma';
 import { StorefrontUpstreamError, StorefrontValidationError } from '@/server/errors';
+import { trusted } from '@/server/origin';
 
 /* ---------------------------------------------------------------------------
  * The shipment a caller does not describe, and the figures a reply is held to
@@ -67,13 +73,25 @@ const ITEMS = 1;
 /** The tier quoted when a caller names none, and when it names one no carrier could read. */
 const LEVEL = 'standard';
 
-/** The longest destination postal code a carrier will rate. */
+/**
+ * The longest destination postal code a carrier will rate, and the same ceiling
+ * every request surface holds a destination to, so a postal code one of them
+ * accepted is never refused here.
+ */
 const MAX_POSTAL = 12;
 
 /** The heaviest single shipment a carrier will rate, in grams. */
 const MAX_WEIGHT = 150_000;
 
-/** The most pieces a carrier will rate as one shipment. */
+/**
+ * The most pieces a carrier will rate as one shipment, and the same ceiling
+ * every request surface holds a count to.
+ *
+ * A shipment of more pieces than this is refused rather than rated as fewer: a
+ * rate taken on part of a consignment is the cost of a shipment nobody is
+ * sending, and the consignment travels as more than one shipment, each quoted
+ * on its own.
+ */
 const MAX_ITEMS = 500;
 
 /** The longest service code a carrier will read. */
@@ -101,6 +119,14 @@ const MAX_DAYS = 365;
  * developer's problem, and the server log is where a developer reads about it.
  */
 const UNREADABLE = 'The carrier answered a shipping quote this storefront could not read.';
+
+/**
+ * What a caller is told when the address it handed over is not one this store
+ * may reach itself at. The wording names no address: the value came from the
+ * request, and repeating it back would only echo it.
+ */
+const MISADDRESSED =
+  'This request was not addressed to this store, so no shipping quote was taken.';
 
 /**
  * How long the carrier is given to answer, in milliseconds.
@@ -149,6 +175,17 @@ export interface ShippingQuoteInput {
 
   /** Which tier of service to quote around. Defaults to the store's baseline tier. */
   serviceLevel?: string | undefined;
+
+  /**
+   * The cart the shipment is for, when the caller is quoting one.
+   *
+   * A quote taken for a cart is recorded against it, so the order that cart
+   * becomes can be placed on the very quote its customer chose rather than on
+   * whichever quote happened to be taken last. The checkout form quotes a
+   * destination rather than a cart and leaves this out, and such a quote is
+   * recorded with no cart against it.
+   */
+  cart?: string | undefined;
 }
 
 /* ---------------------------------------------------------------------------
@@ -339,12 +376,16 @@ function chosen(options: readonly ShippingOption[], level: string): ShippingOpti
  *   not describe is rated as one ordinary parcel at the store's baseline tier.
  * @param origin Where the carrier is reached, as the scheme and authority of
  *   the request being served - read from the incoming request by the route
- *   handler rather than configured or assumed anywhere.
- * @returns The services on offer, the destination they were quoted for and the
- *   instant they were quoted at. A destination with no service offered to it is
- *   answered with no options, which is a result rather than a failure.
+ *   handler rather than configured or assumed anywhere, and checked here before
+ *   anything is addressed to it.
+ * @returns The quote the store recorded, the services on offer, the destination
+ *   they were quoted for and the instant they were quoted at. A destination
+ *   with no service offered to it is answered with no options and no recorded
+ *   quote, which is a result rather than a failure.
  * @throws StorefrontValidationError When the shipment names no destination a
- *   carrier could rate.
+ *   carrier could rate, names more pieces than a carrier rates as one
+ *   shipment, or when the address handed over is not one this store may reach
+ *   itself at.
  * @throws StorefrontUpstreamError When the carrier cannot be reached, refuses
  *   the request, or answers with nothing this storefront can read. A failure of
  *   the insert that records the quote propagates as it was raised, for the
@@ -363,8 +404,26 @@ export async function quote(
     );
   }
 
+  const counted = input.itemCount;
+
+  // A count a caller named above what a carrier rates as one shipment is
+  // refused rather than brought down to the ceiling: a rate taken on fewer
+  // pieces than travel is the price of a different shipment, and a caller told
+  // the limit can ask again per shipment. A figure that is no count at all
+  // takes the default below, as an unnamed one does.
+  if (counted !== undefined && Number.isFinite(counted) && Math.round(counted) > MAX_ITEMS) {
+    throw new StorefrontValidationError(
+      `A carrier rates at most ${String(MAX_ITEMS)} pieces as one shipment. ` +
+        'Quote a larger consignment as more than one shipment.',
+    );
+  }
+
+  if (!trusted(origin)) {
+    throw new StorefrontValidationError(MISADDRESSED);
+  }
+
   const weight = bounded(input.weightGrams, WEIGHT, 0, MAX_WEIGHT);
-  const items = bounded(input.itemCount, ITEMS, 1, MAX_ITEMS);
+  const items = bounded(counted, ITEMS, 1, MAX_ITEMS);
   const level = tier(input.serviceLevel);
 
   let response: Response;
@@ -438,21 +497,34 @@ export async function quote(
   const when = instant(record(payload) ? payload.quotedAt : undefined, new Date());
   const rate = chosen(options, level);
 
-  // One row per quote, recorded at the rate the customer is shown. A quote that
+  // One row per quote, recorded at the rate the customer is shown, and against
+  // the cart the shipment is for when there is one - which is what lets the
+  // order that cart becomes be placed on this quote and no other. A quote that
   // came back with nothing on offer has no rate to record.
+  let recorded: string | null = null;
+
   if (rate !== undefined) {
     const code = record(payload) ? text(payload.carrierCode, MAX_TEXT) : undefined;
 
-    await prisma.shippingQuote.create({
+    const row = await prisma.shippingQuote.create({
       data: {
+        cartId: input.cart ?? null,
         carrierCode: code ?? rate.carrier,
         serviceLevel: rate.service,
         amountCents: rate.priceCents,
         etaDays: rate.estimatedDays,
         quotedAt: when,
       },
+      select: { id: true },
     });
+
+    recorded = row.id;
   }
 
-  return { options, destinationPostalCode: postal, quotedAt: when.toISOString() };
+  return {
+    id: recorded,
+    options,
+    destinationPostalCode: postal,
+    quotedAt: when.toISOString(),
+  };
 }

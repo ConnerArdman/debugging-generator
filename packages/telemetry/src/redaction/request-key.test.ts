@@ -10,6 +10,14 @@
  * that either finds nothing or reports two unrelated requests as one. Nothing
  * downstream can detect that, so it is caught here or not at all.
  *
+ * This file is where those assertions live because the plan puts them here
+ * twice: AAP §0.5.2 states the guarantee and adds that "`request-key.test.ts`
+ * asserts both cases", and AAP §0.8.3's redaction row names the "`request-key`
+ * true-duplicate vs different-parameter cases" among the unit tests. The two
+ * cases are `computeRequestKey`'s "gives byte-identical requests the same key"
+ * and "gives requests differing only in a parameter value different keys"
+ * below; the rest of the suite exists to keep those two honest.
+ *
  * What is therefore asserted, and why each assertion exists:
  *
  * - **The canonical message, exactly.** {@link buildRequestKeyMessage} is pure
@@ -17,6 +25,17 @@
  *   rather than inferred from a digest. Persisted `request_key` values depend
  *   on that format, so a change to it that does not also change
  *   {@link REQUEST_KEY_MESSAGE_VERSION} must fail here.
+ * - **An unambiguous message.** A digest identifies a request only if the
+ *   string behind it does, so two structurally different requests must never
+ *   share a canonical message. The delimiter cases below — a value containing
+ *   `&`, a key containing `=`, a newline in a value, a newline in the method
+ *   or the path — are each a pair of requests that a framing built from bare
+ *   `\n`, `&` and `=` merged into one message and therefore one key, and each
+ *   is asserted at both levels: the message must differ, and so must the
+ *   digest. They sit beside the equivalences that must *survive* the encoding
+ *   (parameter order, repeated parameters, `%20` versus `+` versus a literal
+ *   space), because the two properties are easy to trade for one another and
+ *   the fix is only right if it keeps both.
  * - **A known-answer vector.** A keyed digest cannot be validated against
  *   itself: an implementation that hex-encodes backwards, or that encodes the
  *   message as UTF-16, is perfectly self-consistent. The RFC 4231 vectors below
@@ -206,8 +225,11 @@ describe('buildRequestKeyMessage', () => {
       url: 'https://shop.test:3000/api/items?limit=20&q=hex%20bolt#top',
     });
 
-    expect(message).toBe('v1\nGET\n/api/items\nlimit=20&q=hex bolt');
+    expect(message).toBe('v2\n"GET"\n"/api/items"\n[["limit","20"],["q","hex bolt"]]');
     expect(messageParts(message).version).toBe(REQUEST_KEY_MESSAGE_VERSION);
+    // Every part after the tag is a JSON value, which is what makes the four
+    // parts unambiguous rather than merely separated.
+    expect(message.split('\n')).toHaveLength(4);
   });
 
   it('trims and upper-cases the method, so get and GET collide', () => {
@@ -215,7 +237,7 @@ describe('buildRequestKeyMessage', () => {
 
     expect(upper).toBe(buildRequestKeyMessage({ method: 'post', url: '/api/lookup' }));
     expect(upper).toBe(buildRequestKeyMessage({ method: '  PoSt \n', url: '/api/lookup' }));
-    expect(messageParts(upper).method).toBe('POST');
+    expect(messageParts(upper).method).toBe('"POST"');
   });
 
   it('excludes the origin, so an absolute and an origin-relative URL agree', () => {
@@ -243,20 +265,20 @@ describe('buildRequestKeyMessage', () => {
 
   it('keeps the path byte-faithfully: no case, slash or escape folding', () => {
     expect(messageParts(buildRequestKeyMessage({ method: 'GET', url: '/API/Items/' })).path).toBe(
-      '/API/Items/',
+      '"/API/Items/"',
     );
     expect(buildRequestKeyMessage({ method: 'GET', url: '/api/items/' })).not.toBe(
       buildRequestKeyMessage({ method: 'GET', url: '/api/items' }),
     );
     expect(messageParts(buildRequestKeyMessage({ method: 'GET', url: '/a%2Fb' })).path).toBe(
-      '/a%2Fb',
+      '"/a%2Fb"',
     );
   });
 
   it('sorts pairs by key then value in code-unit order, never a locale collation', () => {
     const message = buildRequestKeyMessage({ method: 'GET', url: '/p?a=2&Z=1&a=1' });
 
-    expect(queryPart(message)).toBe('Z=1&a=1&a=2');
+    expect(queryPart(message)).toBe('[["Z","1"],["a","1"],["a","2"]]');
     // The comparison the implementation must not use disagrees on exactly this
     // pair, which is what makes the assertion above a real constraint rather
     // than a coincidence of the fixture.
@@ -273,7 +295,7 @@ describe('buildRequestKeyMessage', () => {
     expect(buildRequestKeyMessage({ method: 'GET', url: '/api/items?tag=b&limit=20&tag=a' })).toBe(
       canonical,
     );
-    expect(queryPart(canonical)).toBe('limit=20&tag=a&tag=b');
+    expect(queryPart(canonical)).toBe('[["limit","20"],["tag","a"],["tag","b"]]');
   });
 
   it('canonicalises %20, + and a literal space to one value', () => {
@@ -281,26 +303,26 @@ describe('buildRequestKeyMessage', () => {
 
     expect(buildRequestKeyMessage({ method: 'GET', url: '/api/items?q=hex+bolt' })).toBe(escaped);
     expect(buildRequestKeyMessage({ method: 'GET', url: '/api/items?q=hex bolt' })).toBe(escaped);
-    expect(queryPart(escaped)).toBe('q=hex bolt');
+    expect(queryPart(escaped)).toBe('[["q","hex bolt"]]');
   });
 
   it('decodes the parameter name as well as its value', () => {
     expect(queryPart(buildRequestKeyMessage({ method: 'GET', url: '/p?product%20id=7' }))).toBe(
-      'product id=7',
+      '[["product id","7"]]',
     );
   });
 
   it('gives a bare flag the empty value', () => {
     const bare = buildRequestKeyMessage({ method: 'GET', url: '/api/items?reload' });
 
-    expect(queryPart(bare)).toBe('reload=');
+    expect(queryPart(bare)).toBe('[["reload",""]]');
     expect(buildRequestKeyMessage({ method: 'GET', url: '/api/items?reload=' })).toBe(bare);
   });
 
   it('keeps a fixed arity when the query is absent or empty', () => {
     const absent = buildRequestKeyMessage({ method: 'GET', url: '/api/items' });
 
-    expect(absent).toBe('v1\nGET\n/api/items\n');
+    expect(absent).toBe('v2\n"GET"\n"/api/items"\n[]');
     expect(absent.split('\n')).toHaveLength(4);
     expect(buildRequestKeyMessage({ method: 'GET', url: '/api/items?' })).toBe(absent);
     expect(buildRequestKeyMessage({ method: 'GET', url: '/api/items?&&' })).toBe(absent);
@@ -313,7 +335,7 @@ describe('buildRequestKeyMessage', () => {
     });
     const capped = buildRequestKeyMessage({ method: 'GET', url: longQueryUrl(MAX_QUERY_PAIRS) });
 
-    expect(queryPart(overflowing).split('&')).toHaveLength(MAX_QUERY_PAIRS);
+    expect(JSON.parse(queryPart(overflowing)) as unknown[]).toHaveLength(MAX_QUERY_PAIRS);
     expect(overflowing).toBe(capped);
     // Same input, same message: the cap is a deterministic prefix, so a URL
     // beyond it still keys stably.
@@ -324,8 +346,90 @@ describe('buildRequestKeyMessage', () => {
 
   it('is total: a malformed escape or a lone delimiter does not throw', () => {
     expect(() => buildRequestKeyMessage({ method: 'GET', url: '%' })).not.toThrow();
-    expect(queryPart(buildRequestKeyMessage({ method: 'GET', url: '/p?q=%zz' }))).toBe('q=%zz');
-    expect(buildRequestKeyMessage({ method: '', url: '' })).toBe('v1\n\n\n');
+    expect(queryPart(buildRequestKeyMessage({ method: 'GET', url: '/p?q=%zz' }))).toBe(
+      '[["q","%zz"]]',
+    );
+    expect(buildRequestKeyMessage({ method: '', url: '' })).toBe('v2\n""\n""\n[]');
+  });
+
+  it('is total for a lone surrogate, which percent-encoding could not be', () => {
+    // `encodeURIComponent('\uD800')` throws `URIError`; the encoder this module
+    // uses escapes the code unit instead, which is why it is the one chosen.
+    // An unpaired surrogate reaches here from any producer that slices a URL
+    // mid-character, and losing the event is not an option.
+    const message = buildRequestKeyMessage({ method: 'GET', url: '/p?q=\uD800' });
+
+    expect(() => encodeURIComponent('\uD800')).toThrow(URIError);
+    expect(queryPart(message)).toBe('[["q","\\ud800"]]');
+    expect(message.split('\n')).toHaveLength(4);
+  });
+
+  /*
+   * The delimiter cases. Each pair below is two structurally different
+   * requests that a framing of bare `\n`, `&` and `=` rendered as one message,
+   * and therefore grouped as one repeated request. Asserted on the message
+   * here and on the digest in the `computeRequestKey` block, because the
+   * message is what the digest is taken over and only the digest is what
+   * duplicate detection actually compares.
+   */
+
+  it('does not merge a value containing & with two parameters', () => {
+    const oneParameter = buildRequestKeyMessage({ method: 'GET', url: '/x?a=b%26c=d' });
+    const twoParameters = buildRequestKeyMessage({ method: 'GET', url: '/x?a=b&c=d' });
+
+    expect(oneParameter).not.toBe(twoParameters);
+    expect(queryPart(oneParameter)).toBe('[["a","b&c=d"]]');
+    expect(queryPart(twoParameters)).toBe('[["a","b"],["c","d"]]');
+  });
+
+  it('does not merge a key containing = with a value containing =', () => {
+    const keyHasEquals = buildRequestKeyMessage({ method: 'GET', url: '/x?a%3Db=c' });
+    const valueHasEquals = buildRequestKeyMessage({ method: 'GET', url: '/x?a=b=c' });
+
+    expect(keyHasEquals).not.toBe(valueHasEquals);
+    expect(queryPart(keyHasEquals)).toBe('[["a=b","c"]]');
+    expect(queryPart(valueHasEquals)).toBe('[["a","b=c"]]');
+  });
+
+  it('keeps a decoded newline inside its part instead of forging a new one', () => {
+    const message = buildRequestKeyMessage({ method: 'GET', url: '/x?q=a%0Ab' });
+
+    expect(message.split('\n')).toHaveLength(4);
+    expect(queryPart(message)).toBe('[["q","a\\nb"]]');
+    expect(buildRequestKeyMessage({ method: 'GET', url: '/x?q=a b' })).not.toBe(message);
+  });
+
+  it('does not let a method or a path forge the part delimiter', () => {
+    // `parseUrlParts` reproduces a path verbatim and the method is only
+    // trimmed and upper-cased, so either can arrive carrying a newline.
+    const methodCarriesIt = buildRequestKeyMessage({ method: 'GET\n/b', url: '/a' });
+    const pathCarriesIt = buildRequestKeyMessage({ method: 'GET', url: '/B\n/a' });
+
+    expect(methodCarriesIt).not.toBe(pathCarriesIt);
+    expect(methodCarriesIt.split('\n')).toHaveLength(4);
+    expect(pathCarriesIt.split('\n')).toHaveLength(4);
+    expect(messageParts(methodCarriesIt).method).toBe('"GET\\n/B"');
+    expect(messageParts(pathCarriesIt).path).toBe('"/B\\n/a"');
+  });
+
+  it('is injective across the delimiter cases taken together', () => {
+    // One message per distinct request: the property the digest inherits, and
+    // the one a delimiter-only framing broke four different ways.
+    const requests = [
+      { method: 'GET', url: '/x?a=b%26c=d' },
+      { method: 'GET', url: '/x?a=b&c=d' },
+      { method: 'GET', url: '/x?a%3Db=c' },
+      { method: 'GET', url: '/x?a=b=c' },
+      { method: 'GET', url: '/x?q=a%0Ab' },
+      { method: 'GET', url: '/x?q=a b' },
+      { method: 'GET\n/b', url: '/a' },
+      { method: 'GET', url: '/B\n/a' },
+      { method: 'GET', url: '/x?a=b' },
+    ];
+
+    const messages = new Set(requests.map((request) => buildRequestKeyMessage(request)));
+
+    expect(messages.size).toBe(requests.length);
   });
 });
 
@@ -482,16 +586,59 @@ describe('computeRequestKey', () => {
       expectOk(await hmacSha256Hex(SESSION_A, message)),
     );
     // A different version tag over the same request is a different key, which
-    // is what makes a future layout change safe.
+    // is what makes a future layout change safe. Written against whatever the
+    // current tag is, so the assertion survives the next bump.
+    const otherVersion = message.replace(
+      `${REQUEST_KEY_MESSAGE_VERSION}\n`,
+      `${REQUEST_KEY_MESSAGE_VERSION}x\n`,
+    );
+    expect(otherVersion).not.toBe(message);
     expect(await keyFor('GET', '/api/items?limit=20')).not.toBe(
-      expectOk(await hmacSha256Hex(SESSION_A, message.replace('v1\n', 'v2\n'))),
+      expectOk(await hmacSha256Hex(SESSION_A, otherVersion)),
     );
   });
 
   it('keys a pathological URL rather than losing the event', async () => {
-    for (const url of ['', '%', '???', '/p?q=%zz', 'mailto:someone@example.test']) {
+    for (const url of [
+      '',
+      '%',
+      '???',
+      '/p?q=%zz',
+      'mailto:someone@example.test',
+      '/p?q=\uD800',
+      '/p?q=a%0Ab',
+    ]) {
       expect(await keyFor('GET', url)).toMatch(DIGEST_PATTERN);
     }
+  });
+
+  it('gives structurally different queries different keys, not one group', async () => {
+    // The digest-level half of the delimiter cases: these pairs shared a
+    // canonical message under a bare `key=value&…` join, so duplicate
+    // detection saw one repeated request where there were two distinct ones.
+    const pairs = [
+      ['/x?a=b%26c=d', '/x?a=b&c=d'],
+      ['/x?a%3Db=c', '/x?a=b=c'],
+      ['/x?q=a%0Ab', '/x?q=a b'],
+    ] as const;
+
+    for (const [left, right] of pairs) {
+      expect(await keyFor('GET', left)).not.toBe(await keyFor('GET', right));
+    }
+
+    expect(await keyFor('GET\n/b', '/a')).not.toBe(await keyFor('GET', '/B\n/a'));
+  });
+
+  it('still groups the requests that are the same request', async () => {
+    // The equivalences the encoding must not cost: an interaction firing the
+    // same fetch twice has to land in one group, however each call spelled it.
+    const canonical = await keyFor('GET', '/api/prices?limit=6&tag=a&tag=b');
+
+    expect(await keyFor('GET', '/api/prices?tag=b&tag=a&limit=6')).toBe(canonical);
+    expect(await keyFor('get', '/api/prices?limit=6&tag=a&tag=b')).toBe(canonical);
+    expect(await keyFor('GET', 'http://localhost:3000/api/prices?limit=6&tag=a&tag=b#x')).toBe(
+      canonical,
+    );
   });
 
   it('rejects a malformed session key without echoing it', async () => {

@@ -324,7 +324,9 @@ export const MODIFICATION_ID_PATTERN = /^mod_[0-9a-z]{16}$/;
  * Truncation, if it is ever needed, is the **patcher's** decision, not this
  * schema's: a schema that silently shortened a diff would hand both user
  * interfaces a patch that does not describe the bytes that were hashed. The
- * patcher caps and flags; this field rejects anything past the cap.
+ * record carries no truncation flag, so a patcher that shortens what it emits
+ * says so inside the diff text it writes; this field rejects anything past the
+ * cap.
  */
 export const MAX_MODIFICATION_DIFF_LENGTH = 2 * 1024 * 1024;
 
@@ -334,8 +336,12 @@ export const MAX_MODIFICATION_DIFF_LENGTH = 2 * 1024 * 1024;
  * Lower than {@link MAX_MODIFICATION_DIFF_LENGTH} because a conflict carries up
  * to three patches at once and is delivered inside a `cleanup.completed`
  * message that both user interfaces render immediately. `../patch/conflict.ts`
- * caps its emitted text against this constant and sets
- * {@link ModificationConflict.diffsTruncated} when it had to.
+ * measures each text against this constant before it composes a report. The
+ * conflict shape carries no truncation flag either, so a patch that does not
+ * fit is left out — an absent member already reads as "no patch to show here" —
+ * or accounted for in the developer-facing `message` the producer authors. What
+ * it must never do is deliver a clipped patch that presents itself as the whole
+ * change.
  */
 export const MAX_CONFLICT_DIFF_LENGTH = 512 * 1024;
 
@@ -1091,9 +1097,11 @@ export const modificationConflictSchema = z.strictObject({
    * The object and every member are optional, because a conflict may leave
    * nothing to diff: `'file-missing'` has no current text and
    * `'backup-missing'` has no original text. Each member is bounded by
-   * {@link MAX_CONFLICT_DIFF_LENGTH}; a report that had to be shortened sets
-   * {@link ModificationConflict.diffsTruncated} rather than pretending the
-   * patch is complete.
+   * {@link MAX_CONFLICT_DIFF_LENGTH}, and because this shape carries no
+   * truncation flag, a patch that exceeds the bound is omitted rather than
+   * shortened: an absent member reads as "nothing to show here", while a
+   * clipped one would claim to be the whole change. Where the omission is worth
+   * explaining, it belongs in `message`, which the producer authors.
    */
   diffs: z
     .strictObject({
@@ -1107,17 +1115,6 @@ export const modificationConflictSchema = z.strictObject({
       originalToCurrent: z.string().max(MAX_CONFLICT_DIFF_LENGTH).optional(),
     })
     .optional(),
-
-  /**
-   * Whether any diff above was shortened to fit
-   * {@link MAX_CONFLICT_DIFF_LENGTH}.
-   *
-   * Optional, and absent when nothing was truncated. It exists so a user
-   * interface can say "diff truncated" instead of implying that a clipped patch
-   * is the whole story — the conflict path's one job is to tell the developer
-   * the truth about a file it refused to touch.
-   */
-  diffsTruncated: z.boolean().optional(),
 });
 
 /**

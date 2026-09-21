@@ -14,16 +14,32 @@
  *    how to render — after eleven workspaces have already imported it. The
  *    first suite below is the cheap place to catch that.
  *
- * 2. **The brand is what makes an error survive the trip.** Four processes
- *    cooperate — the local service, the VS Code extension host, the DevTools
- *    panel and the page agent — and each bundles its own copy of this module.
- *    Two copies of a class are two constructor identities, so `instanceof` says
- *    `false` for an error that is structurally exactly a `DebuggenError`; a
- *    value that arrived through `postMessage`, `structuredClone` or JSON has no
- *    prototype left at all. `DebuggenError.is` answers with an own string-keyed
- *    data property instead, and `DebuggenError.from` is built on that answer.
- *    The `is`/`from` suites assert both the positive cross-bundle cases and the
- *    shapes that must stay out.
+ * 2. **The brand is what makes an error survive the trip — and the brand alone
+ *    is not enough.** Four processes cooperate — the local service, the VS Code
+ *    extension host, the DevTools panel and the page agent — and each bundles
+ *    its own copy of this module. Two copies of a class are two constructor
+ *    identities, so `instanceof` says `false` for an error that is structurally
+ *    exactly a `DebuggenError`; a value that arrived through `postMessage`,
+ *    `structuredClone` or JSON has no prototype left at all. `DebuggenError.is`
+ *    therefore tests structure rather than constructor identity — but it
+ *    narrows to the full class, so it has to test the *whole* structure the
+ *    class declares: an **own** brand, the `name` the class names itself, a
+ *    `code` from the closed vocabulary, a string `message`, and `stack`, `hint`
+ *    and `details` of their declared types when they are present, plus a
+ *    callable `toPayload`. A value that carries the brand and nothing else is
+ *    not an error a caller can use; narrowing one would make
+ *    `DebuggenError.from(caught).toPayload()` throw from inside the error
+ *    reporter, would let an invented code reach the protocol's closed-set
+ *    schema, and — for a numeric `hint`, which `toPayload` copies through
+ *    verbatim — would put a payload on the wire that fails that schema at the
+ *    far end. The `is` suite asserts the cross-bundle positives — including a
+ *    locally declared class that is what another bundle's copy really looks
+ *    like, and values carrying the optional members legitimately — and every
+ *    incomplete shape that must stay out, one per member, each row otherwise
+ *    complete so a failure names the condition that stopped being checked; the
+ *    `from` suite asserts that those incomplete shapes are rebuilt into real
+ *    instances, with the wrongly typed members dropped rather than copied,
+ *    rather than discarded.
  *
  * Two assertion habits in here are deliberate and worth keeping.
  *
@@ -33,18 +49,25 @@
  *   tests assert `'hint' in payload` and the exact `Object.keys` list, not
  *   `payload.hint === undefined`, which a broken implementation would satisfy.
  * - **Identity, not equality.** `cause`, `details` and the value `from` returns
- *   for something already branded are asserted with `toBe`. A wrapper that
- *   copied or re-serialised any of them would pass a `toEqual` and still lose
- *   the original stack, the caller's reference, or the specific code a deeper
- *   layer chose.
+ *   for something that already satisfies the contract are asserted with `toBe`.
+ *   A wrapper that copied or re-serialised any of them would pass a `toEqual`
+ *   and still lose the original stack, the caller's reference, or the specific
+ *   code a deeper layer chose.
+ * - **Every narrowed value is then used.** For each shape `is` accepts, the
+ *   suite calls `toPayload()` on the narrowed value and asserts the object it
+ *   returns. A guard that promises the class without checking for the method is
+ *   only caught by calling it, which is what the table at the end of the `is`
+ *   suite does.
  *
  * Runtime facts these tests encode, measured against Node 24 rather than
  * assumed: an instance's own enumerable properties are `name`, the brand,
  * `code` and whichever of `hint`/`details` was supplied (`message` and `stack`
  * are non-enumerable, which is exactly why the wire form is `toPayload()` and
- * not the instance); `structuredClone` of an `Error` *instance* keeps none of
- * them, while `structuredClone` of a plain object carrying the brand keeps it,
- * and symbol-keyed properties survive neither.
+ * not the instance, and why a JSON revival of an instance arrives without a
+ * message); `structuredClone` of an `Error` *instance* keeps none of them, while
+ * `structuredClone` of a plain object carrying the brand keeps the brand but
+ * refuses a function-valued property outright, and symbol-keyed properties
+ * survive neither.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -73,6 +96,14 @@ import {
  * up here as a failing test instead of as a guard that quietly stops matching.
  */
 const BRAND_KEY = '__isDebuggenError__';
+
+/**
+ * The `name` every `DebuggenError` carries, restated here for the same reason
+ * as the brand: the class declares it as that exact literal, so it is part of
+ * the structure `DebuggenError.is` narrows to, and a copy of the class from
+ * another bundle agrees with this one only while the literal matches.
+ */
+const ERROR_NAME = 'DebuggenError';
 
 /**
  * `SCREAMING_SNAKE_CASE`: an uppercase letter, then uppercase letters and
@@ -114,26 +145,196 @@ const REQUIRED_CODES: readonly string[] = [
 const SPECIFIC_CODE: DebuggenErrorCode = 'STORE_ERROR';
 
 /**
- * The structural shape a `DebuggenError` has after it crosses a bundle
- * boundary or a serialisation boundary: the brand, a code and a message, and
- * none of the class — no prototype, so no `toPayload`, and `instanceof` false.
+ * A code that is deliberately *not* in `DEBUGGEN_ERROR_CODES`, standing for
+ * what a hand-rolled imitation, a newer revision of a foreign bundle or a
+ * corrupted frame carries.
  *
- * Written as a plain interface rather than by casting an instance, because a
- * cast would still produce the real class and prove nothing.
+ * Typed `string`, because as a `DebuggenErrorCode` it would not compile — which
+ * is the point: the vocabulary is closed at the type level inside this
+ * repository, and `is`/`from` are what close it at run time for values that
+ * arrive from outside it.
  */
-interface ForeignDebuggenError {
-  readonly __isDebuggenError__: true;
+const INVALID_CODE = 'NOT_A_REAL_CODE';
+
+/** The message the foreign-bundle and branded-plain-object fixtures carry. */
+const FOREIGN_MESSAGE = 'Raised by another copy of this module.';
+
+/** The message the store-failure fixtures carry. */
+const STORE_MESSAGE = 'The session store failed.';
+
+/** The hint the store-failure fixtures carry. */
+const STORE_HINT = 'Check the session store.';
+
+/**
+ * The closed vocabulary as a lookup set, restated here so a test can ask
+ * whether a normalised code is a member without depending on the module-private
+ * set `errors.ts` builds for the same purpose.
+ */
+const KNOWN_CODES: ReadonlySet<string> = new Set<string>(DEBUGGEN_ERROR_CODES);
+
+/**
+ * What another bundle's copy of `DebuggenError` actually looks like: a class of
+ * its own, declared here rather than described, so the cross-bundle case is
+ * tested against the thing it claims to be.
+ *
+ * Every property the contract asks for is present the way the real class
+ * provides it — the brand and `code` as own enumerable fields, `message`
+ * inherited from the `Error` base, `toPayload` on the prototype — while the
+ * constructor identity is a different one, so `instanceof DebuggenError` is
+ * `false` for every instance. That combination is exactly the capability the
+ * brand exists for, and the reason `is` must not reach for `instanceof`.
+ *
+ * `code` is typed `string` rather than `DebuggenErrorCode` because a foreign
+ * copy may be a revision ahead or behind this one; the same class therefore
+ * builds both the in-vocabulary and the invented-code fixtures.
+ */
+class ForeignBundleError extends Error {
+  /** The real class sets the same name, being the same source. */
+  override readonly name = 'DebuggenError';
+
+  /** The brand, own and enumerable exactly as the real class sets it. */
+  readonly __isDebuggenError__ = true;
+
+  /** Whatever code the other bundle's vocabulary held. */
   readonly code: string;
-  readonly message: string;
+
+  constructor(code: string, message: string) {
+    super(message);
+    this.code = code;
+  }
+
+  /** The wire form, reached through the prototype just as the real one is. */
+  toPayload(): { code: string; message: string } {
+    return { code: this.code, message: this.message };
+  }
 }
 
-/** A fresh foreign-bundle value; fresh per call so identity tests are honest. */
-function foreignBundleError(): ForeignDebuggenError {
+/**
+ * A fresh foreign-bundle instance; fresh per call so identity tests are honest.
+ *
+ * @param code The code the other bundle chose. Defaults to a code this
+ * revision knows.
+ */
+function foreignBundleError(code: string = SPECIFIC_CODE): ForeignBundleError {
+  return new ForeignBundleError(code, FOREIGN_MESSAGE);
+}
+
+/**
+ * The structural shape of a `DebuggenError` that satisfies the contract without
+ * being an instance of anything: the brand, a code, a message and a callable
+ * `toPayload`, on a plain object with `Object.prototype` behind it.
+ *
+ * This is what a hand-built error from a non-bundled producer looks like, and
+ * the case that proves the guard is structural rather than prototype-based.
+ * Written as an interface and a literal rather than by casting an instance,
+ * because a cast would still produce the real class and prove nothing.
+ */
+interface BrandedErrorShape {
+  readonly __isDebuggenError__: true;
+  readonly name: string;
+  readonly code: string;
+  readonly message: string;
+  readonly toPayload: () => { code: string; message: string };
+}
+
+/**
+ * A fresh structurally complete branded plain object.
+ *
+ * `name` is part of that completeness: the class declares it as the literal
+ * `"DebuggenError"`, so an object without it would be narrowed to a type whose
+ * `name` is a string while its runtime value is `undefined`.
+ *
+ * @param code The code to carry. Defaults to a code this revision knows.
+ * @param message The message to carry.
+ */
+function brandedPlainError(
+  code: string = SPECIFIC_CODE,
+  message: string = FOREIGN_MESSAGE,
+): BrandedErrorShape {
   return {
     __isDebuggenError__: true,
-    code: SPECIFIC_CODE,
-    message: 'Raised by another copy of this module.',
+    name: ERROR_NAME,
+    code,
+    message,
+    // An arrow rather than a method, so the callable is an own property and
+    // nothing in the fixture depends on `this`.
+    toPayload: () => ({ code, message }),
   };
+}
+
+/**
+ * The complete branded shape as a mutable bag of own properties, which the
+ * negative rows below derive from by spoiling or removing exactly one member.
+ *
+ * Typed `Record<string, unknown>` rather than {@link BrandedErrorShape} on
+ * purpose: these fixtures stand for values that arrive from outside this
+ * repository, where a member may be missing or hold the wrong type, and neither
+ * is expressible in the interface the real shape satisfies.
+ */
+function completeBrandedShape(): Record<string, unknown> {
+  return {
+    [BRAND_KEY]: true,
+    name: ERROR_NAME,
+    code: SPECIFIC_CODE,
+    message: STORE_MESSAGE,
+    toPayload: () => ({ code: SPECIFIC_CODE, message: STORE_MESSAGE }),
+  };
+}
+
+/**
+ * The complete shape with one member replaced by a value of the wrong type.
+ *
+ * @param member The member to spoil.
+ * @param value What to put there instead.
+ */
+function brandedShapeWith(member: string, value: unknown): Record<string, unknown> {
+  const shape = completeBrandedShape();
+  shape[member] = value;
+  return shape;
+}
+
+/**
+ * The complete shape with one member absent entirely.
+ *
+ * Built by filtering the entries rather than by deleting a key, so the result
+ * is a fresh object with no trace of the removed member — an own property set
+ * to `undefined` would be a different test.
+ *
+ * @param member The member to leave out.
+ */
+function brandedShapeWithout(member: string): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(completeBrandedShape()).filter(([key]) => key !== member),
+  );
+}
+
+/**
+ * A value that inherits the brand and everything else from a branded prototype
+ * and owns nothing itself.
+ *
+ * Not a shape this product ever produces — every copy of the class installs the
+ * brand as a per-instance field, and every revival, clone and literal carries
+ * it as an own key — which is exactly why `is` may insist on own-ness. `from`
+ * still reads through the chain and rebuilds it, so refusing the narrowing
+ * costs the value nothing.
+ */
+function inheritedBrandShape(): unknown {
+  return Object.create(completeBrandedShape()) as unknown;
+}
+
+/**
+ * A real instance put through `JSON.stringify`/`JSON.parse`, which is what a
+ * naive "send the error" implementation produces at a process boundary.
+ *
+ * The revival keeps the own enumerable properties — the brand, `name`, `code`
+ * and `hint` — and loses `message` and `stack`, both non-enumerable, along with
+ * the prototype and therefore `toPayload`. It is the concrete value behind the
+ * rule that an error crosses a boundary as a `toPayload()` object.
+ */
+function revivedInstance(): unknown {
+  const error = new DebuggenError(SPECIFIC_CODE, STORE_MESSAGE, { hint: STORE_HINT });
+  const revived: unknown = JSON.parse(JSON.stringify(error));
+  return revived;
 }
 
 /** A node in a self-referencing object graph. */
@@ -201,6 +402,194 @@ const UNBRANDED_VALUES: readonly LabelledValue[] = [
   { label: 'an object whose brand is the string "true"', value: { [BRAND_KEY]: 'true' } },
   { label: 'an object whose brand is the number 1', value: { [BRAND_KEY]: 1 } },
 ];
+
+/**
+ * A labelled case whose value is built fresh for each use, so a suite may
+ * assert identity against it and a suite that hands it to `from` cannot be
+ * affected by what an earlier test did with it.
+ */
+interface LabelledFactory {
+  readonly label: string;
+  readonly build: () => unknown;
+}
+
+/**
+ * Values that carry the brand and fail the rest of the contract — the shapes
+ * `is` must reject and `from` must rebuild.
+ *
+ * There is one row per member the contract checks, and each is built from the
+ * complete shape by removing or spoiling exactly that member, so a failing row
+ * names the condition that stopped being checked rather than failing for an
+ * unrelated reason. The two deliberate exceptions are stated by their labels:
+ * the first row carries the brand alone, and the last is a real revival — both
+ * fail several conditions at once because that is what they look like in life.
+ *
+ * None of these is hypothetical: the brand-only row is what a value looks like
+ * when only the brand was copied across, the revival is what `JSON.stringify`
+ * of an instance produces, the invented code is what a foreign bundle a
+ * revision ahead sends, the missing or non-callable `toPayload` is what every
+ * clone and every JSON round-trip produces because a function cannot travel,
+ * the numeric hint is what an untyped producer writes, and the inherited brand
+ * is what an object assembled behind a branded prototype looks like.
+ */
+const INCOMPLETE_BRANDED_VALUES: readonly LabelledFactory[] = [
+  {
+    label: 'the brand and nothing else',
+    build: () => ({ [BRAND_KEY]: true }),
+  },
+  {
+    label: 'no message',
+    build: () => brandedShapeWithout('message'),
+  },
+  {
+    label: 'a message that is not a string',
+    build: () => brandedShapeWith('message', 42),
+  },
+  {
+    label: 'no code',
+    build: () => brandedShapeWithout('code'),
+  },
+  {
+    label: 'a code that is not in the closed vocabulary',
+    build: () => brandedPlainError(INVALID_CODE),
+  },
+  {
+    label: 'a complete instance from a foreign bundle one vocabulary revision ahead',
+    build: () => foreignBundleError(INVALID_CODE),
+  },
+  {
+    label: 'no toPayload',
+    build: () => brandedShapeWithout('toPayload'),
+  },
+  {
+    label: 'a toPayload that is not callable',
+    build: () => brandedShapeWith('toPayload', 'not a function'),
+  },
+  {
+    label: 'no name',
+    build: () => brandedShapeWithout('name'),
+  },
+  {
+    label: 'a name belonging to some other error class',
+    build: () => brandedShapeWith('name', 'Error'),
+  },
+  {
+    label: 'a name that is not a string',
+    build: () => brandedShapeWith('name', 42),
+  },
+  {
+    label: 'a stack that is not a string',
+    build: () => brandedShapeWith('stack', 42),
+  },
+  {
+    label: 'a hint that is not a string',
+    build: () => brandedShapeWith('hint', 42),
+  },
+  {
+    label: 'details that are an array',
+    build: () => brandedShapeWith('details', [1]),
+  },
+  {
+    label: 'details that are not an object at all',
+    build: () => brandedShapeWith('details', 'sessions'),
+  },
+  {
+    label: 'a brand it only inherits, owning nothing itself',
+    build: inheritedBrandShape,
+  },
+  {
+    label: 'an instance revived from its own JSON, which lost its message',
+    build: revivedInstance,
+  },
+];
+
+/** A labelled case that `is` must accept, with the payload it must then yield. */
+interface NarrowableCase extends LabelledFactory {
+  readonly payload: Readonly<Record<string, string>>;
+}
+
+/**
+ * Every shape `is` accepts, each paired with the exact object `toPayload()` has
+ * to return once the value has been narrowed.
+ *
+ * The table exists to be *called*, not merely recognised: a guard that promises
+ * this class without checking for its method table is caught only by invoking
+ * the method, and invoking it on a value the guard accepted is the assertion
+ * that fails when the contract loosens again.
+ */
+const CONTRACT_SATISFYING_VALUES: readonly NarrowableCase[] = [
+  {
+    label: 'a real instance',
+    build: () => new DebuggenError(SPECIFIC_CODE, STORE_MESSAGE),
+    payload: { code: SPECIFIC_CODE, message: STORE_MESSAGE },
+  },
+  {
+    label: 'a real instance carrying a hint',
+    build: () => new DebuggenError(SPECIFIC_CODE, STORE_MESSAGE, { hint: STORE_HINT }),
+    payload: { code: SPECIFIC_CODE, message: STORE_MESSAGE, hint: STORE_HINT },
+  },
+  {
+    label: "a foreign bundle's instance",
+    build: () => foreignBundleError(),
+    payload: { code: SPECIFIC_CODE, message: FOREIGN_MESSAGE },
+  },
+  {
+    label: 'a structurally complete branded plain object',
+    build: () => brandedPlainError(),
+    payload: { code: SPECIFIC_CODE, message: FOREIGN_MESSAGE },
+  },
+  {
+    label: 'an error rebuilt by from() out of an incomplete branded value',
+    build: () => DebuggenError.from(revivedInstance(), SPECIFIC_CODE),
+    payload: { code: SPECIFIC_CODE, message: 'Unknown error', hint: STORE_HINT },
+  },
+  {
+    // The optional members are checked only when present, so a value that
+    // carries them of the right type must still be accepted — the guard has to
+    // be sound in both directions for `hint` and `details` as well as for
+    // `message`.
+    label: 'a real instance carrying a hint and details',
+    build: () =>
+      new DebuggenError(SPECIFIC_CODE, STORE_MESSAGE, {
+        hint: STORE_HINT,
+        details: { table: 'sessions' },
+      }),
+    payload: { code: SPECIFIC_CODE, message: STORE_MESSAGE, hint: STORE_HINT },
+  },
+  {
+    label: 'a branded plain object carrying a string hint and object details',
+    build: () => ({
+      ...completeBrandedShape(),
+      hint: STORE_HINT,
+      details: { table: 'sessions' },
+      toPayload: () => ({ code: SPECIFIC_CODE, message: STORE_MESSAGE, hint: STORE_HINT }),
+    }),
+    payload: { code: SPECIFIC_CODE, message: STORE_MESSAGE, hint: STORE_HINT },
+  },
+];
+
+/**
+ * Assert that `value` satisfies `DebuggenError.is`, and hand it back narrowed.
+ *
+ * The narrowing is the point: the returned value is typed `DebuggenError`, so a
+ * caller reads `code` and calls `toPayload()` exactly as production code does
+ * after its own `is` check — which is what makes a guard that accepted an
+ * incomplete value fail here rather than in a `catch` block somewhere else.
+ *
+ * @param value The value under test.
+ * @returns `value`, typed as a `DebuggenError`.
+ */
+function narrowedError(value: unknown): DebuggenError {
+  expect(DebuggenError.is(value), 'the value must satisfy DebuggenError.is').toBe(true);
+
+  if (!DebuggenError.is(value)) {
+    // Unreachable: the expectation above has already failed the test. Present
+    // so this function's return type is `DebuggenError` rather than `unknown`.
+    throw new Error('Expected the value to satisfy DebuggenError.is.');
+  }
+
+  return value;
+}
 
 /*
  * ---------------------------------------------------------------------------
@@ -418,13 +807,187 @@ describe('DebuggenError.from', () => {
     expect(DebuggenError.from(first)).toBe(first);
   });
 
-  it('returns a foreign-bundle value unchanged rather than rebuilding it', () => {
+  it("returns a foreign bundle's instance unchanged rather than rebuilding it", () => {
     const foreign = foreignBundleError();
 
     // Rebuilding would mint a new instance with a new stack and would drop
-    // whatever else the other copy attached; the brand exists so this value can
-    // be recognised and passed through instead.
+    // whatever else the other copy attached; the brand exists so a value that
+    // satisfies the whole contract can be recognised and passed through
+    // instead, even though `instanceof` answers false for it.
+    expect(foreign instanceof DebuggenError).toBe(false);
     expect(DebuggenError.from(foreign)).toBe(foreign);
+  });
+
+  it('returns a structurally complete branded plain object unchanged', () => {
+    const branded = brandedPlainError();
+
+    // No prototype from this class, yet every element of the contract is
+    // present: passing it through is safe precisely because `toPayload` is
+    // callable on it.
+    expect(DebuggenError.from(branded)).toBe(branded);
+  });
+
+  it.each(INCOMPLETE_BRANDED_VALUES)(
+    'rebuilds a real error from a branded value with $label',
+    ({ build }: LabelledFactory) => {
+      const incomplete = build();
+      const normalized = DebuggenError.from(incomplete, SPECIFIC_CODE);
+
+      // Passing an incomplete value through is what made a later
+      // `.toPayload()` throw from inside the error reporter, so `from`
+      // rebuilds: the result is a real instance of this class, and of this
+      // bundle's copy of it.
+      expect(normalized).toBeInstanceOf(DebuggenError);
+      expect(DebuggenError.is(normalized)).toBe(true);
+      expect(normalized).not.toBe(incomplete);
+
+      // Nothing is lost by rebuilding: the shape that arrived is still
+      // reachable, by identity, for whoever logs the failure.
+      expect(normalized.cause).toBe(incomplete);
+
+      // The two fields the wire form carries are always usable: a code inside
+      // the closed vocabulary, and a message that is not a blank line.
+      expect(KNOWN_CODES.has(normalized.code)).toBe(true);
+      expect(normalized.message.length).toBeGreaterThan(0);
+
+      const payload = normalized.toPayload();
+
+      expect(payload.code).toBe(normalized.code);
+      expect(payload.message).toBe(normalized.message);
+    },
+  );
+
+  it('keeps an incomplete branded value out of the protocol by clamping its code', () => {
+    const invented = brandedPlainError(INVALID_CODE);
+
+    // The fixture has to be genuinely outside the vocabulary for the rest of
+    // this assertion to mean anything.
+    expect(KNOWN_CODES.has(INVALID_CODE)).toBe(false);
+
+    const normalized = DebuggenError.from(invented, SPECIFIC_CODE);
+
+    // An invented code narrowed to `DebuggenErrorCode` would reach the
+    // protocol's closed-set schema as an unparseable frame; the fallback is
+    // what it becomes instead. The message it did carry is still salvaged.
+    expect(normalized.code).toBe(SPECIFIC_CODE);
+    expect(normalized.message).toBe(FOREIGN_MESSAGE);
+    expect(normalized.cause).toBe(invented);
+  });
+
+  it('rebuilds a JSON-revived instance, salvaging its code and hint', () => {
+    const revived = revivedInstance();
+    const normalized = DebuggenError.from(revived);
+
+    // The revival kept the code and the hint and lost the non-enumerable
+    // message, so the code a deeper layer chose and the developer's recovery
+    // instruction both survive the trip, and only the message falls back to the
+    // sentinel. `from`'s own default code is never reached, because the revived
+    // code is in the vocabulary.
+    expect(normalized).toBeInstanceOf(DebuggenError);
+    expect(normalized.code).toBe(SPECIFIC_CODE);
+    expect(normalized.hint).toBe(STORE_HINT);
+    expect(normalized.message).toBe('Unknown error');
+    expect(normalized.cause).toBe(revived);
+    expect(normalized.toPayload()).toEqual({
+      code: SPECIFIC_CODE,
+      message: 'Unknown error',
+      hint: STORE_HINT,
+    });
+  });
+
+  it('salvages a message and details from a branded value, and ignores the rest', () => {
+    const details = { table: 'sessions', attempts: 2 } as const;
+    const branded = {
+      [BRAND_KEY]: true,
+      message: STORE_MESSAGE,
+      hint: 7,
+      details,
+      stack: 'not this process\u2019s stack',
+    };
+    const normalized = DebuggenError.from(branded, SPECIFIC_CODE);
+
+    expect(normalized.message).toBe(STORE_MESSAGE);
+    // Identity, not equality: details are handed through by reference, as the
+    // constructor does for a caller.
+    expect(normalized.details).toBe(details);
+    // A non-string hint is not a hint. `in`, not `=== undefined`: the key must
+    // be absent so `toPayload()` carries no null hint onto the wire.
+    expect('hint' in normalized).toBe(false);
+    expect(normalized.toPayload()).toEqual({ code: SPECIFIC_CODE, message: STORE_MESSAGE });
+  });
+
+  it('refuses to carry array details, which would render as a keyless bag', () => {
+    const branded = {
+      [BRAND_KEY]: true,
+      code: SPECIFIC_CODE,
+      message: STORE_MESSAGE,
+      details: [1],
+    };
+    const normalized = DebuggenError.from(branded);
+
+    expect('details' in normalized).toBe(false);
+    expect(normalized.code).toBe(SPECIFIC_CODE);
+  });
+
+  it('cannot let a non-string hint reach the wire, however callable the value is', () => {
+    // The shape that motivates checking `hint` rather than only `code`,
+    // `message` and callability: everything a caller reaches for is present and
+    // its `toPayload` answers — with a payload that fails the protocol's
+    // `{ code, message, hint? }` schema at the far end, produced by a value the
+    // guard would already have called an error.
+    const hinted = brandedShapeWith('hint', 42);
+    const ownPayload = (hinted['toPayload'] as () => Record<string, unknown>)();
+
+    expect(ownPayload).toEqual({ code: SPECIFIC_CODE, message: STORE_MESSAGE });
+    expect(DebuggenError.is(hinted)).toBe(false);
+
+    const normalized = DebuggenError.from(hinted);
+
+    // Rebuilt without the bad hint rather than with it coerced: a hint is the
+    // one field a developer is expected to act on, and 42 is not an
+    // instruction. `in`, not `=== undefined`, so no null hint is serialised.
+    expect('hint' in normalized).toBe(false);
+    expect(normalized.toPayload()).toEqual({
+      code: SPECIFIC_CODE,
+      message: STORE_MESSAGE,
+    });
+    expect(normalized.cause).toBe(hinted);
+  });
+
+  it('rebuilds a value that only inherits the brand, salvaging what it inherited', () => {
+    const inherited = inheritedBrandShape();
+
+    // `is` insists on an own brand, so this value is refused the narrowing —
+    // but refusing is not discarding: `from` reads through the prototype chain
+    // and rebuilds, so the code and message it carried still reach the surface.
+    expect(DebuggenError.is(inherited)).toBe(false);
+
+    const normalized = DebuggenError.from(inherited);
+
+    expect(normalized).toBeInstanceOf(DebuggenError);
+    expect(normalized.code).toBe(SPECIFIC_CODE);
+    expect(normalized.message).toBe(STORE_MESSAGE);
+    expect(normalized.cause).toBe(inherited);
+  });
+
+  it('gives a rebuilt error this class\u2019s own name, whatever the value claimed', () => {
+    const misnamed = brandedShapeWith('name', 'Error');
+    const normalized = DebuggenError.from(misnamed);
+
+    // The rebuilt value is a real instance, so it names itself correctly and a
+    // formatted stack or a log line no longer attributes it elsewhere.
+    expect(normalized.name).toBe(ERROR_NAME);
+    expect(String(normalized)).toBe(`${ERROR_NAME}: ${STORE_MESSAGE}`);
+  });
+
+  it('is idempotent for a branded value it had to rebuild', () => {
+    const normalized = DebuggenError.from(revivedInstance(), SPECIFIC_CODE);
+
+    // The rebuilt value is a real instance, so a second boundary that
+    // normalises it again gets the same object back rather than a chain of
+    // wrappers with the original buried under two causes.
+    expect(DebuggenError.from(normalized)).toBe(normalized);
+    expect(DebuggenError.from(normalized, 'INTERNAL').code).toBe(SPECIFIC_CODE);
   });
 
   it('wraps a native Error with the INTERNAL default, its message and itself as cause', () => {
@@ -511,42 +1074,91 @@ describe('DebuggenError.is', () => {
     expect(DebuggenError.is(new DebuggenError('INTERNAL', 'Something gave way.'))).toBe(true);
   });
 
-  it('accepts a plain object carrying the brand: the foreign-bundle case', () => {
+  it("accepts a foreign bundle's instance, which is not an instance of this class", () => {
     // This is the case the brand exists for. The local service, the VS Code
     // extension host, the DevTools panel and the page agent each bundle their
     // own copy of this module, so two copies of the class are two constructor
     // identities and `instanceof` answers false for a value that is exactly
-    // this shape. A structural test is the only one that can answer true —
-    // which is also why `is` accepts a hand-built object, and why `from`
-    // returns such a value unchanged instead of pretending to rebuild it.
+    // this shape. A structural test is the only one that can answer true — and
+    // this value earns the `true` on its own merits: brand and code as own
+    // properties, `message` from the `Error` base, `toPayload` on its
+    // prototype.
     const foreign = foreignBundleError();
 
     expect(foreign instanceof DebuggenError).toBe(false);
     expect(DebuggenError.is(foreign)).toBe(true);
+    expect(narrowedError(foreign).toPayload()).toEqual({
+      code: SPECIFIC_CODE,
+      message: FOREIGN_MESSAGE,
+    });
   });
 
-  it('accepts an instance revived from its own JSON', () => {
-    const error = new DebuggenError(SPECIFIC_CODE, 'The session store failed.', {
-      hint: 'Check the session store.',
+  it('accepts a structurally complete branded plain object', () => {
+    // The guard is structural rather than prototype-based, so a hand-built
+    // object from a producer that does not bundle this class at all is a
+    // `DebuggenError` as long as it carries everything the class declares —
+    // including a callable `toPayload`, which is the part a caller reaches for.
+    const branded = brandedPlainError();
+
+    expect(branded instanceof DebuggenError).toBe(false);
+    expect(DebuggenError.is(branded)).toBe(true);
+    expect(narrowedError(branded).toPayload()).toEqual({
+      code: SPECIFIC_CODE,
+      message: FOREIGN_MESSAGE,
     });
-    const revived: unknown = JSON.parse(JSON.stringify(error));
+  });
+
+  it('accepts an error with an empty message, which is a legal instance', () => {
+    // The one thing the guard must not demand is message *content*: this
+    // constructor call is legal, so requiring a non-empty message would make
+    // the guard unsound in the other direction and reject a real error.
+    const empty = new DebuggenError('INTERNAL', '');
+
+    expect(DebuggenError.is(empty)).toBe(true);
+    expect(narrowedError(empty).toPayload()).toEqual({ code: 'INTERNAL', message: '' });
+  });
+
+  it('rejects an instance revived from its own JSON, which lost its message', () => {
+    const revived = revivedInstance();
 
     // `message` and `stack` are non-enumerable, so a JSON round-trip of an
-    // instance keeps the brand, the name, the code and the hint but loses the
-    // message — which is precisely why an error crosses a process boundary as a
-    // `toPayload()` object, and why `is` must still recognise what arrives.
-    expect(DebuggenError.is(revived)).toBe(true);
-    expect(DebuggenError.is(revived) && revived.code).toBe(SPECIFIC_CODE);
+    // instance keeps the brand, the name, the code and the hint and loses the
+    // message — and the prototype with it, so there is no `toPayload` left to
+    // call. Narrowing this would hand a caller a value typed as a full error
+    // with no message and no wire form; it is `from` that rebuilds it.
+    expect(revived).toEqual({
+      [BRAND_KEY]: true,
+      name: 'DebuggenError',
+      code: SPECIFIC_CODE,
+      hint: STORE_HINT,
+    });
+    expect(DebuggenError.is(revived)).toBe(false);
   });
 
-  it('accepts a plain-object copy that has been through structuredClone', () => {
-    const clone: unknown = structuredClone(foreignBundleError());
+  it('rejects a structured clone of a branded plain object, whose method cannot travel', () => {
+    const branded = brandedPlainError();
 
-    // A string-keyed boolean is the form that travels. A symbol key would not:
-    // structuredClone drops symbol-keyed properties entirely, so a private
-    // symbol brand would vanish on exactly the hop it was meant to survive.
-    expect(DebuggenError.is(clone)).toBe(true);
+    // structuredClone refuses a function-valued property outright, which is
+    // the whole point: the method table is exactly what cannot cross a
+    // postMessage boundary, so a cloned error is always incomplete.
+    expect(() => structuredClone(branded)).toThrow();
+
+    const clone: unknown = structuredClone({
+      [BRAND_KEY]: branded.__isDebuggenError__,
+      code: branded.code,
+      message: branded.message,
+    });
+
+    // The brand itself does travel — a string-keyed boolean is the form that
+    // does. A symbol key would not: structuredClone drops symbol-keyed
+    // properties entirely, so a private symbol brand would vanish on exactly
+    // the hop it was meant to survive.
+    expect(clone).toEqual({ [BRAND_KEY]: true, code: SPECIFIC_CODE, message: FOREIGN_MESSAGE });
     expect(Object.getOwnPropertySymbols(structuredClone({ [Symbol('brand')]: true }))).toEqual([]);
+
+    // Recognisable, but not usable: `is` says no, and `from` rebuilds it.
+    expect(DebuggenError.is(clone)).toBe(false);
+    expect(DebuggenError.from(clone).message).toBe(FOREIGN_MESSAGE);
   });
 
   it('rejects a cloned Error instance, because cloning an Error is lossy', () => {
@@ -563,4 +1175,30 @@ describe('DebuggenError.is', () => {
   it.each(UNBRANDED_VALUES)('rejects $label', ({ value }: LabelledValue) => {
     expect(DebuggenError.is(value)).toBe(false);
   });
+
+  it.each(INCOMPLETE_BRANDED_VALUES)(
+    'rejects a branded value with $label',
+    ({ build }: LabelledFactory) => {
+      // The brand says where the value came from; it does not say the value is
+      // usable. Narrowing any of these would type it as a full error and let a
+      // caller read a code that is not in the vocabulary, format a message that
+      // is not a string, or call a method that is not there.
+      expect(DebuggenError.is(build())).toBe(false);
+    },
+  );
+
+  it.each(CONTRACT_SATISFYING_VALUES)(
+    'narrows $label to a value whose toPayload() answers',
+    ({ build, payload }: NarrowableCase) => {
+      // The soundness property, stated as an assertion: everything this guard
+      // accepts can be used as what it was narrowed to. Calling `toPayload()`
+      // on the narrowed value is what fails if the guard ever again promises
+      // the class without checking for its method table.
+      const narrowed = narrowedError(build());
+
+      expect(narrowed.toPayload()).toEqual(payload);
+      expect(KNOWN_CODES.has(narrowed.code)).toBe(true);
+      expect(typeof narrowed.message).toBe('string');
+    },
+  );
 });

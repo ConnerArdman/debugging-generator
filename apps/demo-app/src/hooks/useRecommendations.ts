@@ -127,6 +127,12 @@ function recommendationNotice(code: StorefrontErrorCode, status: number): string
  * products in the same order leaves the feed exactly as it stands, ids
  * included.
  *
+ * A read whose answer the rail can no longer use - it has unmounted, or the
+ * product it accompanies has changed - is abandoned rather than merely
+ * ignored: the request is aborted, so nothing is left occupying a connection
+ * on the rail's behalf, and neither the answer nor the abort reaches the state
+ * a later read owns.
+ *
  * @param options The product to suggest against and the number of tiles.
  * @returns The suggestions, the first-read flag and the failure wording.
  */
@@ -136,15 +142,22 @@ export function useRecommendations(options: RecommendationsOptions): Recommendat
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    // Set by the cleanup below, and read only to decide whether this read's
-    // answer still belongs on screen: a rail that has gone away, or has moved
-    // on to another product, must not have its state written by an answer the
-    // page is no longer waiting for.
-    let cancelled = false;
+    // This read's own controller, aborted by the cleanup below. It settles two
+    // questions at once: the read is let go of on the network rather than left
+    // to run for a rail that has gone away or has moved on to another product,
+    // and `signal.aborted` is then what both handlers consult before writing
+    // state the page is no longer waiting for - including the rejection the
+    // abort itself produces, which is this hook's own doing and nothing to show
+    // a buyer.
+    const controller = new AbortController();
 
-    loadRecommendations({ productId: options.productId, limit: options.limit })
+    loadRecommendations({
+      productId: options.productId,
+      limit: options.limit,
+      signal: controller.signal,
+    })
       .then((rows) => {
-        if (cancelled) {
+        if (controller.signal.aborted) {
           return;
         }
         setItems((current) => (sameRecommendations(current, rows) ? current : rows));
@@ -152,7 +165,7 @@ export function useRecommendations(options: RecommendationsOptions): Recommendat
         setIsLoading(false);
       })
       .catch((cause: unknown) => {
-        if (cancelled) {
+        if (controller.signal.aborted) {
           return;
         }
         const notice =
@@ -165,7 +178,7 @@ export function useRecommendations(options: RecommendationsOptions): Recommendat
       });
 
     return () => {
-      cancelled = true;
+      controller.abort();
     };
   }, [options]);
 

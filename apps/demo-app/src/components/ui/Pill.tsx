@@ -25,15 +25,10 @@
  * React omits an attribute whose value is `undefined`, which is what lets the stylesheet describe
  * the unselected chip once, in its base rule, instead of twice.
  *
- * Two deliberate omissions:
- *
- *   - No `"use client"`. The component holds no state and runs no effect, so it renders in either
- *     environment; the parent that owns the selection state is the one that needs the directive.
- *   - No `memo`, `useMemo` or `useCallback`. The catalog's render behaviour is the subject of this
- *     application's excessive-render scenario, and a memoized chip would hide it. The component is
- *     cheap enough for the ~12 chips of the filter row to be re-rendered freely: no hooks, no DOM
- *     reads, no allocation beyond the class string, and nothing that varies between a server and a
- *     client render.
+ * One deliberate omission: no `"use client"`. The component holds no state, runs no effect and
+ * reads no DOM, and nothing in its output varies between a server and a client render, so it
+ * renders in either environment; the parent that owns the selection state is the one that needs
+ * the directive.
  *
  * One naming constraint worth knowing before editing: `scripts/check-no-hardcoding.mjs` harvests
  * this application's declared names - functions, types and variables among them - into

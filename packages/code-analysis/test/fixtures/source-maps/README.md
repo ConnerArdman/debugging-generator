@@ -1,10 +1,38 @@
 # Source-map fixtures
 
-Eight hand-authored artifacts that _look_ like the JavaScript chunks and source maps a Next.js dev server serves, paired with the corpus in [`../sample-next-app`](../sample-next-app). Nothing here came out of a bundler: every byte was written by hand and every mapping was computed against the committed bytes. They exist so the three modules under `packages/code-analysis/src/source-map/` — `fetch-map.ts`, `resolver.ts` and `normalize.ts` — can be unit-tested with no dev server, no `next` install and no real network: a test serves this folder over a throwaway `node:http` server bound to `127.0.0.1` and points the module under test at that origin.
+Eight hand-authored artifacts — five JavaScript chunks and three `.map` files — that _look_ like the JavaScript chunks and source maps a Next.js dev server serves, paired with the corpus in [`../sample-next-app`](../sample-next-app). Nothing here came out of a bundler: every byte was written by hand and every mapping was computed against the committed bytes. They exist so the three modules under `packages/code-analysis/src/source-map/` — `fetch-map.ts`, `resolver.ts` and `normalize.ts` — can be unit-tested with no dev server, no `next` install and no real network: a test serves this folder over a throwaway `node:http` server bound to `127.0.0.1` and points the module under test at that origin.
+
+Counting this document, the folder holds **nine tracked files, and that is the whole of it**. [The inventory](#the-inventory-nine-files-eight-artifacts-and-this-document) states the set as a count, because three `.map` paths a reader may expect to find here are absent on purpose and their absence is coverage — see [absent by design](#absent-by-design-three-map-paths-that-must-never-exist) before concluding that anything is missing.
 
 This file is documentation of test input. It is not a fixture, no test parses it and nothing imports it. Its job is to spare the next author from decoding VLQ `mappings` by hand — the expectation tables below are the assertions, already decoded.
 
 > The consuming modules did not exist when this folder was committed; `packages/code-analysis/src` was empty. That is deliberate. The fixtures and this contract were authored first so the modules can be written against a fixed, documented input set, and this document is the handoff.
+
+## The inventory: nine files, eight artifacts and this document
+
+| #   | File                                       | Kind          | What it is here for                                                         |
+| --- | ------------------------------------------ | ------------- | --------------------------------------------------------------------------- |
+| 1   | `webpack-basin-page.js`                    | chunk         | webpack URL form; directive names the same stem                             |
+| 2   | `webpack-basin-page.js.map`                | map file      | the map named by file 1's directive; the only map carrying `sourcesContent` |
+| 3   | `turbopack-gauge-route.js`                 | chunk         | Turbopack form; directive names the same stem                               |
+| 4   | `turbopack-gauge-route.js.map`             | map file      | the map named by file 3's directive; the folder's only **sectioned** map    |
+| 5   | `turbopack-station-widget.js`              | chunk         | directive names a **differently hashed** stem                               |
+| 6   | `turbopack-station-widget-6f3ad91c.js.map` | map file      | the map named by file 5's directive, reachable through nothing else         |
+| 7   | `inline-map-basin-detail.js`               | chunk + map   | the map travels inside the chunk, in a `data:` URI                          |
+| 8   | `unmapped-observatory-runtime.js`          | chunk         | no directive at all — the negative case                                     |
+| 9   | `README.md`                                | this contract | documentation of test input; no test parses it and nothing imports it       |
+
+**The arithmetic, because it is easy to get wrong.** Five chunks; four of them resolve to a map; but only **three `.map` files**, because the fourth map is embedded in chunk 7 rather than served from a file. Each map file belongs to exactly one chunk, and the gauge pair (3 and 4) is one of those three pairs rather than an addition to a smaller base set. So `5 + 3 + 1 = 9` files is the complete folder, and a count of ten has either counted one pair twice or expected one of the three paths below.
+
+### Absent by design: three `.map` paths that must never exist
+
+| Path that must stay absent            | What its absence covers                                                                                                                     | Why it may not be created                                                                                                                                                        |
+| ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `turbopack-station-widget.js.map`     | the comment-driven pairing of chunk 5: a resolver deriving `<chunk>.js.map` from the chunk's filename must find nothing and fail the lookup | the mismatch is the fixture. A same-stem sibling would let a name-deriving resolver succeed by accident, and `fetch-map.ts` exists precisely not to derive a map name            |
+| `inline-map-basin-detail.js.map`      | the inline branch of chunk 7: the payload is decoded in place, with no HTTP request, and a fallback request for this path must find nothing | the map travels inside that chunk. A sibling file would resolve for a module that ignored the `data:` URI and fell back to a fetch, which is the failure this fixture must catch |
+| `unmapped-observatory-runtime.js.map` | the negative branch of chunk 8: a chunk with no map at all, so a frame pointing into it comes back unresolved instead of mis-resolved       | absence is that fixture's whole payload. A map here — even a correct one — would delete the only proof that a missing map degrades cleanly rather than being guessed at          |
+
+Adding any of the three raises the file count to ten and deletes the branch it stands for in the same edit. A completeness check that wants a number should assert all four facts together — nine files, five chunks, three map files, these three paths absent — which is what item 1 of the [validation checklist](#validation-checklist) does.
 
 ## Why this folder sits beside `sample-next-app` rather than inside it
 
@@ -14,7 +42,7 @@ This file is documentation of test input. It is not a fixture, no test parses it
 
 ## Chunk and map pairing
 
-Each row is one branch of `fetch-map.ts`. Do not collapse the set: dropping a row deletes its branch's only coverage, and nothing else in the suite would fail.
+Each row is one branch of `fetch-map.ts`. Do not collapse the set: dropping a row deletes its branch's only coverage, and nothing else in the suite would fail. Five rows, four of which reach a map, but three map files: the fourth map is embedded in its chunk and the fifth row has none, which is why the [inventory](#the-inventory-nine-files-eight-artifacts-and-this-document) is nine files rather than ten.
 
 | Chunk                             | How its map is located                                  | Map file                                   | Branch it covers                                                                        |
 | --------------------------------- | ------------------------------------------------------- | ------------------------------------------ | --------------------------------------------------------------------------------------- |
@@ -79,7 +107,7 @@ The `45:8` row is the one that proves flattening: it resolves into section 1's _
 
 ## `turbopack-station-widget.js` → `turbopack-station-widget-6f3ad91c.js.map`
 
-40 lines, directive on line 40. The map's `file` field is `turbopack-station-widget.js` while its own filename carries a hash suffix, so the directive is the only thing that pairs them — a resolver that derives `<chunk>.js.map` from the chunk name finds nothing here.
+40 lines, directive on line 40. The map's `file` field is `turbopack-station-widget.js` while its own filename carries a hash suffix, so the directive is the only thing that pairs them — a resolver that derives `<chunk>.js.map` from the chunk name finds nothing here, and `turbopack-station-widget.js.map` must stay absent for exactly that reason (see [absent by design](#absent-by-design-three-map-paths-that-must-never-exist)).
 
 `sources` is `["turbopack:///[project]/src/widgets/GaugeReadout.tsx", "turbopack:///[project]/src/lib/http.ts"]` and `names` is `["handleReadoutClick", "fetchGaugeIndex"]`. The chunk declares the `http.ts` module first (line 6) and `GaugeReadout.tsx` second (line 14), so the first mapped generated line resolves through `sources[1]`; index and declaration sequence deliberately disagree.
 
@@ -165,11 +193,11 @@ Decoded, verbatim — one line, no trailing newline:
 {"version":3,"file":"inline-map-basin-detail.js","sources":["webpack://_N_E/./app/(observatory)/basins/[id]/page.tsx"],"names":["BasinDetailPage"],"mappings":";;;;;;;;;;;qBAyD8BA;QAC5B;;QAGA"}
 ```
 
-This fixture must resolve with **no HTTP request at all**: `fetch-map.ts` reads the payload out of the directive and must not fall back to requesting `inline-map-basin-detail.js.map`, which does not exist.
+This fixture must resolve with **no HTTP request at all**: `fetch-map.ts` reads the payload out of the directive and must not fall back to requesting `inline-map-basin-detail.js.map`, which does not exist and must never be added — a sibling map file would answer that fallback and hide the very mistake this fixture catches.
 
 ## The negative case
 
-`unmapped-observatory-runtime.js` is 41 lines and contains **zero** occurrences of the `sourceMappingURL` substring, and no `.map` file accompanies it. `fetch-map.ts` must report absence cleanly:
+`unmapped-observatory-runtime.js` is 41 lines and contains **zero** occurrences of the `sourceMappingURL` substring, and no `.map` file accompanies it — not now and not later, because absence is this fixture's entire payload (see [absent by design](#absent-by-design-three-map-paths-that-must-never-exist)). `fetch-map.ts` must report absence cleanly:
 
 - no throw and no rejected promise;
 - no request for a guessed `unmapped-observatory-runtime.js.map`, and no request for anything else — a test asserting this counts the requests its loopback server received;
@@ -230,6 +258,7 @@ console.log(
 
 ## Maintenance rules
 
+- **Nine files, and no tenth map.** The [inventory](#the-inventory-nine-files-eight-artifacts-and-this-document) is the roster: five chunks, three map files, this document. Do not add a fourth `.map` to "complete" the set — the only three paths one could be added at are [absent by design](#absent-by-design-three-map-paths-that-must-never-exist), and each addition deletes a branch. If a completeness pass reports nine of ten, it has counted a chunk/map pair twice; reconcile it against the inventory table rather than by creating a file.
 - **No new dependencies.** `@jridgewell/trace-mapping` 0.3.31 is the only tool these fixtures need and it is already a runtime dependency of the package. Do not reach for a second source-map library, a map-generation helper, or a real bundler to maintain them: an added dependency fails the gate, and artifacts produced by a real build are ones nobody can hand-verify against the tables above.
 - **Stay out of ignored paths.** Never move these files under `.next/`, `dist/`, `out/`, `coverage/` or `node_modules/`, and never add a `.env` or `.env.*` file here. Those directories are git-ignored and those filenames are rejected outright, so a test reading an untracked fixture would pass on the author's machine for the wrong reason and fail on a fresh clone.
 - **Keep the invented vocabulary.** Every name, path and payload in this folder comes from `../sample-next-app`: observatory, basin, gauge, station, reading, drift. Nothing here may name or paraphrase the demo application under `apps/demo-app`. `scripts/check-no-hardcoding.mjs` reads `.md`, `.json` and `.txt` under the product trees as text, and knowledge of that application leaking into a product package is exactly what it fails on. Its defects are documented in `docs/DEMO.md` and nowhere else, this file included.
@@ -243,9 +272,10 @@ console.log(
 
 Runnable from the repository root after any change here.
 
-1. Nothing in this folder is ignored: `git check-ignore -v packages/code-analysis/test/fixtures/source-maps/*` prints nothing and exits non-zero, which is the pass.
-2. Gates are green: `pnpm format:check`, `pnpm lint`, `pnpm typecheck`, `pnpm --filter @debuggen/code-analysis test` (the package-scoped run of the `code-analysis` Vitest project; `pnpm test` runs the whole suite), `pnpm check:secrets` and `pnpm check:no-hardcoding`. Until the first colocated test lands under `packages/code-analysis/src`, that project run exits 1 with `No test files found` — an empty selector, not a failure of anything in this folder.
-3. `git status --porcelain packages/code-analysis` is empty after the test run, proving no test wrote into this tree.
-4. Parse smoke check: every `.map` here loads — the sectioned one through `AnyMap`, the other two through `TraceMap`, and the inline one after base64-decoding the directive; each `sourceMappingURL` resolves to the map named in the pairing table; `unmapped-observatory-runtime.js` has none.
-5. Cross-folder contract: every `sources` entry normalises to a path that exists under `../sample-next-app/`, with `node_modules/react/cjs/react.development.js` the only deliberate exception.
-6. Round-trip: re-encoding each map's decoded mappings reproduces the committed `mappings` string byte-for-byte, and every row of every expectation table above still matches what `originalPositionFor` returns.
+1. The inventory is intact — nine files, five chunks, three map files, three absences: `ls packages/code-analysis/test/fixtures/source-maps | wc -l` prints `9`, the folder's `*.js` glob matches five names and its `*.js.map` glob three, and `ls` finds none of `turbopack-station-widget.js.map`, `inline-map-basin-detail.js.map` or `unmapped-observatory-runtime.js.map`. A pass reporting nine of ten has counted a chunk/map pair twice — the [inventory](#the-inventory-nine-files-eight-artifacts-and-this-document) table is the roster, not an estimate.
+2. Nothing in this folder is ignored: `git check-ignore -v packages/code-analysis/test/fixtures/source-maps/*` prints nothing and exits non-zero, which is the pass.
+3. Gates are green: `pnpm format:check`, `pnpm lint`, `pnpm typecheck`, `pnpm --filter @debuggen/code-analysis test` (the package-scoped run of the `code-analysis` Vitest project; `pnpm test` runs the whole suite), `pnpm check:secrets` and `pnpm check:no-hardcoding`. Until the first colocated test lands under `packages/code-analysis/src`, that project run exits 1 with `No test files found` — an empty selector, not a failure of anything in this folder.
+4. `git status --porcelain packages/code-analysis` is empty after the test run, proving no test wrote into this tree.
+5. Parse smoke check: every `.map` here loads — the sectioned one through `AnyMap`, the other two through `TraceMap`, and the inline one after base64-decoding the directive; each `sourceMappingURL` resolves to the map named in the pairing table; `unmapped-observatory-runtime.js` has none.
+6. Cross-folder contract: every `sources` entry normalises to a path that exists under `../sample-next-app/`, with `node_modules/react/cjs/react.development.js` the only deliberate exception.
+7. Round-trip: re-encoding each map's decoded mappings reproduces the committed `mappings` string byte-for-byte, and every row of every expectation table above still matches what `originalPositionFor` returns.

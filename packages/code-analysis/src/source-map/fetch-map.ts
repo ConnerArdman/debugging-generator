@@ -48,13 +48,28 @@
  * server-side request forgery (SSRF) primitive. Five bounds are therefore not
  * optional, and each is enforced below:
  *
- * 1. **Loopback-only, scheme-restricted, credential-free URLs.** Only `http:`
- *    and `https:` URLs whose host is a loopback address are ever requested (see
- *    {@link isLoopbackDevServerUrl}); a URL carrying a `user:password@`
+ * 1. **A mandatory origin pin, matched exactly.** Every lookup names the
+ *    session's authoritative dev-server origin
+ *    ({@link FetchSourceMapOptions.devServerOrigin}, taken from the session
+ *    record's `devServerUrl`), and **both** the chunk URL and the map URL a
+ *    directive names must equal that origin exactly — same scheme, same host,
+ *    same port. The option is required rather than optional because "loopback"
+ *    is not a trust boundary on a developer's machine: a dozen services listen
+ *    there, this product's own service among them, and a default that accepted
+ *    any loopback host and port would let a page steer either request at any of
+ *    them. The pin itself is screened before it is used — it must be a
+ *    credential-free `http:`/`https:` loopback origin — so a caller cannot
+ *    widen the policy by passing a public origin, and a caller that has lost
+ *    the value fails closed instead of falling back to "anything local".
+ *    Loopback remains an independent check on top of the pin (see
+ *    {@link isLoopbackDevServerUrl}), and a URL carrying a `user:password@`
  *    userinfo component is refused outright rather than stripped, because a
  *    credential in a captured URL is a credential this product must not replay.
- *    `options.allowedOrigins`, when supplied, **narrows** that set further; it
- *    can never widen it.
+ *
+ *    The pin cannot refuse a legitimate lookup: the service binds a tab to the
+ *    session whose dev-server origin matches that tab's origin (AAP 0.4.2), so
+ *    a stack frame captured in that tab names chunks on that one origin, and a
+ *    chunk served from anywhere else is not this session's to read.
  * 2. **No ambient authority on the wire.** Every request is made with
  *    `credentials: 'omit'` and with no headers at all — no `Authorization`, no
  *    cookie, no custom header — so a request this module makes cannot carry the
@@ -83,7 +98,8 @@
  *
  * | Outcome | Code | `details.reason` |
  * | --- | --- | --- |
- * | URL refused by policy | `FORBIDDEN_ORIGIN` | `unparseable`, `scheme`, `credentials`, `non-loopback`, `origin-not-allowed` |
+ * | The supplied origin pin is unusable | `FORBIDDEN_ORIGIN` | `origin-pin-invalid` (with `problem`: `missing`, `unparseable`, `scheme`, `credentials`, `non-loopback`) |
+ * | URL refused by policy | `FORBIDDEN_ORIGIN` | `unparseable`, `scheme`, `credentials`, `non-loopback`, `origin-mismatch` |
  * | Request failed, was refused, timed out, or the body was too large or unreadable | `DEV_SERVER_UNAVAILABLE` | `request-failed`, `http-status`, `too-large`, `unreadable` |
  * | A document was fetched but is not a source map | `CODE_INDEX_FAILED` | `invalid-json`, `invalid-shape` |
  *
@@ -194,6 +210,16 @@ const SUPPORTED_SOURCE_MAP_VERSION = 3;
 
 /** The URL schemes a chunk or a map may be fetched over. See the SSRF note. */
 const ALLOWED_URL_PROTOCOLS: readonly string[] = ['http:', 'https:'];
+
+/**
+ * What `URL.origin` serialises an opaque origin to.
+ *
+ * Every opaque origin serialises to this same string, so comparing origins by
+ * equality would make two unrelated ones equal. No `http:`/`https:` URL has an
+ * opaque origin, which is why this only ever guards the pin — defence against a
+ * future scheme being admitted, not a case reachable today.
+ */
+const OPAQUE_ORIGIN = 'null';
 
 /** The scheme that marks a directive as an inline, embedded map. */
 const DATA_URL_SCHEME = 'data:';
@@ -512,10 +538,37 @@ export function createSourceMapCache(options: { maxEntries?: number } = {}): Sou
 }
 
 /**
- * Options for {@link fetchSourceMap}. Every field is optional and the defaults
- * are the safe ones; an empty object is a valid, fully bounded configuration.
+ * Options for {@link fetchSourceMap}.
+ *
+ * {@link devServerOrigin} is **required**; every other field is optional and
+ * its default is the safe one. The one mandatory field is the security-relevant
+ * one on purpose: a lookup that does not say which dev server it is reading
+ * from has no origin policy at all, and making that omission a type error is
+ * the only way to keep "any loopback service will do" from being the default
+ * behaviour (see the SSRF note in the module overview).
  */
 export interface FetchSourceMapOptions {
+  /**
+   * The authoritative origin of the session's dev server — the one origin a
+   * chunk and its map may be read from. **Required.**
+   *
+   * Supply the session record's `devServerUrl` (AAP 0.2.3). A full URL is
+   * accepted and only its origin is used, so `http://127.0.0.1:3000`,
+   * `http://127.0.0.1:3000/` and `http://127.0.0.1:3000/products/1` are the
+   * same pin; the comparison is against the WHATWG canonical origin, which
+   * normalises case and drops a default port, so `http://localhost:80` and
+   * `http://localhost` also agree.
+   *
+   * Matching is **exact**: a different port or a different loopback spelling is
+   * a different origin and is refused, for the chunk URL and again for the URL
+   * a `sourceMappingURL` directive names. The pin can only narrow what may be
+   * requested — it is itself screened as a credential-free `http:`/`https:`
+   * loopback origin — so passing a public origin refuses every lookup rather
+   * than authorising one, and an empty or unparseable value refuses too rather
+   * than degrading to "any loopback host".
+   */
+  readonly devServerOrigin: string;
+
   /**
    * A caller's cancellation signal — a session ending, a panel interaction
    * superseded. Composed with the per-request timeout through
@@ -545,15 +598,6 @@ export interface FetchSourceMapOptions {
   readonly timeoutMs?: number | undefined;
 
   /**
-   * When supplied, the set of origins (`http://127.0.0.1:3000` form) a chunk or
-   * map may be fetched from. This **narrows** the loopback rule — an origin
-   * listed here that is not loopback is still refused — and an empty array
-   * therefore permits nothing. Supply the session's dev-server origin to pin a
-   * lookup to the project under investigation.
-   */
-  readonly allowedOrigins?: readonly string[] | undefined;
-
-  /**
    * A document cache from {@link createSourceMapCache}, or any implementation
    * of {@link SourceMapCache}. Omit it and every lookup fetches and parses
    * afresh.
@@ -570,9 +614,13 @@ export interface FetchSourceMapOptions {
  *
  * The sequence is fixed, and each step is a bound rather than a best effort:
  *
- * 1. Screen `chunkUrl` against the URL policy. A refused URL returns an `Err`
- *    **before `fetchImpl` is consulted at all** — no request is made, not even
- *    a rejected one.
+ * 0. Screen `options.devServerOrigin` — the mandatory pin. A missing,
+ *    unparseable, credentialed, non-`http(s)` or non-loopback pin refuses the
+ *    whole lookup **before `fetchImpl` is consulted at all**, because a lookup
+ *    with no usable origin policy must not run rather than run unpinned.
+ * 1. Screen `chunkUrl` against the URL policy, which includes exact equality
+ *    with that pin. A refused URL returns an `Err` **before `fetchImpl` is
+ *    consulted at all** — no request is made, not even a rejected one.
  * 2. Fetch the chunk, credential-free, redirect-refusing, size-capped and
  *    timeout-bounded. The chunk is always fetched: only the chunk can say where
  *    its map is, or that it has none, so no cache entry can spare this request.
@@ -582,13 +630,16 @@ export interface FetchSourceMapOptions {
  *    `inline: true` with `mapUrl` set to the chunk's URL.
  * 5. Any other directive is resolved **as a relative reference against the
  *    chunk's own URL**, never derived from the chunk's filename, and the
- *    resolved URL is screened again by the same policy. The cache is consulted
- *    before the request and populated after the parse.
+ *    resolved URL is screened again by the same policy — pin included, so a
+ *    directive naming a different port or host on this machine is refused with
+ *    no second request. The cache is consulted before the request and populated
+ *    after the parse.
  *
  * @param chunkUrl The absolute URL of the generated chunk. Untrusted input: it
  * arrives from a stack string captured in the inspected page.
- * @param options See {@link FetchSourceMapOptions}; every field has a safe
- * default.
+ * @param options See {@link FetchSourceMapOptions}. Required, because
+ * {@link FetchSourceMapOptions.devServerOrigin} is: every other field has a
+ * safe default, and an origin policy does not.
  * @returns A promise that **always fulfils**. `Ok` carries a
  * {@link SourceMapLookup} — a found document or a clean "no map" outcome; `Err`
  * carries a `DebuggenError` whose `code` is one of `FORBIDDEN_ORIGIN`,
@@ -602,7 +653,7 @@ export interface FetchSourceMapOptions {
  * ```ts
  * const cache = createSourceMapCache();
  * const lookup = await fetchSourceMap(frame.url, {
- *   allowedOrigins: [session.devServerOrigin],
+ *   devServerOrigin: session.devServerUrl,
  *   cache,
  *   logger,
  * });
@@ -613,12 +664,36 @@ export interface FetchSourceMapOptions {
  */
 export async function fetchSourceMap(
   chunkUrl: string,
-  options: FetchSourceMapOptions = {},
+  options: FetchSourceMapOptions,
 ): Promise<Result<SourceMapLookup>> {
-  const logger = options.logger ?? noopLogger;
-  const maxBytes = Math.floor(positiveNumberOr(options.maxBytes, DEFAULT_MAX_MAP_BYTES));
-  const timeoutMs = Math.floor(positiveNumberOr(options.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS));
-  const fetchImpl = options.fetchImpl ?? globalThis.fetch;
+  // The options bag is validated before a single property of it is read. It is
+  // typed and required, but this module sits behind a service boundary and the
+  // published package is reachable from untyped JavaScript, so a caller that
+  // forgot the argument must get the same fail-closed refusal a missing pin
+  // gets — not a `TypeError` thrown past a caller that was promised a `Result`.
+  // Read through `unknown`, as every other foreign value in this module is.
+  const bag: unknown = options;
+  if (typeof bag !== 'object' || bag === null) {
+    return err(invalidOriginPin('missing'));
+  }
+  const settings = bag as FetchSourceMapOptions;
+
+  const logger = settings.logger ?? noopLogger;
+  const maxBytes = Math.floor(positiveNumberOr(settings.maxBytes, DEFAULT_MAX_MAP_BYTES));
+  const timeoutMs = Math.floor(positiveNumberOr(settings.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS));
+  const fetchImpl = settings.fetchImpl ?? globalThis.fetch;
+
+  // The origin policy is established before anything else, including before the
+  // `fetch` availability check below: a lookup whose pin is missing or unusable
+  // has no policy to enforce, and the only safe reading of that is to refuse it
+  // rather than to fall back to "any loopback service".
+  const pinnedOrigin = screenOriginPin(settings.devServerOrigin);
+  if (isErr(pinnedOrigin)) {
+    logger.debug('source map lookup refused an unusable dev-server origin pin', {
+      problem: pinnedOrigin.error.details?.['problem'],
+    });
+    return pinnedOrigin;
+  }
 
   // Guarded rather than assumed: `fetch` is global from Node 18, but this
   // module's contract is "returns a Result", and a bare call on a missing
@@ -632,7 +707,7 @@ export async function fetchSourceMap(
     );
   }
 
-  const chunkTarget = screenUrl(chunkUrl, 'chunk', options.allowedOrigins);
+  const chunkTarget = screenUrl(chunkUrl, 'chunk', pinnedOrigin.value);
   if (isErr(chunkTarget)) {
     logger.debug('source map lookup refused a chunk URL', {
       reason: chunkTarget.error.details?.['reason'],
@@ -647,7 +722,7 @@ export async function fetchSourceMap(
     fetchImpl,
     maxBytes,
     timeoutMs,
-    signal: options.signal,
+    signal: settings.signal,
     logger,
   });
   if (isErr(chunkBody)) {
@@ -663,16 +738,18 @@ export async function fetchSourceMap(
   }
 
   if (isDataUrlDirective(directive)) {
-    return resolveInlineDirective(directive, chunkTarget.value, options.cache, logger);
+    return resolveInlineDirective(directive, chunkTarget.value, settings.cache, logger);
   }
 
   // The pairing comes from the directive, resolved against the chunk's URL — a
   // relative value ("./x.js.map", "../maps/x.map"), an absolute path ("/_next/…")
   // and an absolute URL all behave as the format specifies, and none of them is
-  // derived from the chunk's filename. Screening runs again because a directive
-  // is page-authored content: it can name a foreign origin, a private network
-  // address or a `javascript:` URL, and each of those is refused here.
-  const mapTarget = screenUrl(directive, 'map', options.allowedOrigins, chunkTarget.value);
+  // derived from the chunk's filename. Screening runs again, against the same
+  // pin, because a directive is page-authored content: it can name a foreign
+  // origin, a private network address, a `javascript:` URL — or another service
+  // on this very machine, which is the case only the pin catches — and each of
+  // those is refused here, before a second request exists.
+  const mapTarget = screenUrl(directive, 'map', pinnedOrigin.value, chunkTarget.value);
   if (isErr(mapTarget)) {
     logger.debug('source map lookup refused a map URL named by a directive', {
       chunkUrl: describeUrl(chunkTarget.value),
@@ -683,7 +760,7 @@ export async function fetchSourceMap(
   }
 
   const mapUrl = mapTarget.value.href;
-  const cached = cacheGet(options.cache, mapUrl, describeUrl(mapTarget.value), logger);
+  const cached = cacheGet(settings.cache, mapUrl, describeUrl(mapTarget.value), logger);
   if (cached !== undefined) {
     logger.debug('source map served from cache', { url: describeUrl(mapTarget.value) });
     return ok({ kind: 'found', map: cached, mapUrl, inline: false });
@@ -695,7 +772,7 @@ export async function fetchSourceMap(
     fetchImpl,
     maxBytes,
     timeoutMs,
-    signal: options.signal,
+    signal: settings.signal,
     logger,
   });
   if (isErr(mapBody)) {
@@ -711,7 +788,7 @@ export async function fetchSourceMap(
     return document;
   }
 
-  cacheSet(options.cache, mapUrl, document.value, describeUrl(mapTarget.value), logger);
+  cacheSet(settings.cache, mapUrl, document.value, describeUrl(mapTarget.value), logger);
   return ok({ kind: 'found', map: document.value, mapUrl, inline: false });
 }
 
@@ -743,10 +820,13 @@ export async function fetchSourceMap(
  *
  * The host is one of four checks in {@link fetchSourceMap}'s URL policy; the
  * other three — an `http:`/`https:` scheme, no `user:password@` credentials,
- * and membership of `options.allowedOrigins` when that is supplied — are
- * applied there, because they are properties of the *request* rather than of
- * the host. A caller reusing this predicate as a standalone guard before
- * fetching something itself must apply those three as well.
+ * and exact equality with the session's pinned dev-server origin
+ * ({@link FetchSourceMapOptions.devServerOrigin}) — are applied there, because
+ * they are properties of the *request* rather than of the host. A caller
+ * reusing this predicate as a standalone guard before fetching something itself
+ * must apply those three as well; loopback alone is **not** an authorisation on
+ * a developer's machine, where this product's own service is one of the things
+ * listening there.
  *
  * @param url An absolute URL, as a string or a parsed `URL`.
  * @returns `true` only for a loopback host. A string that does not parse as an
@@ -922,7 +1002,7 @@ function describeUrl(url: URL): string {
  *
  * This is the SSRF gate described in the module overview, and it runs **before
  * any request** — for the chunk URL a caller supplied, and again for the map
- * URL a directive named. The four rules, in the order a reader should think
+ * URL a directive named. The five rules, in the order a reader should think
  * about them:
  *
  * 1. It must parse as an absolute URL (with `base`, as a relative reference
@@ -934,17 +1014,27 @@ function describeUrl(url: URL): string {
  *    refused rather than stripped: this product does not replay a credential
  *    it found in a captured string, and silently dropping it would turn an
  *    attempted credential leak into a successful anonymous fetch.
- * 4. Its host must be loopback ({@link isLoopbackDevServerUrl}) and, when
- *    `allowedOrigins` is supplied, its origin must be a member — a narrowing
- *    of rule 4, never a widening of it.
+ * 4. Its host must be loopback ({@link isLoopbackDevServerUrl}).
+ * 5. Its origin must **equal** `pinnedOrigin` — the session's authoritative
+ *    dev-server origin, already screened by {@link screenOriginPin}. This is
+ *    the rule that distinguishes the dev server under investigation from every
+ *    other listener on this machine, and it is why rule 4 is a floor rather
+ *    than the policy: `127.0.0.1:5432` and `127.0.0.1:43117` are as loopback as
+ *    the dev server is, and neither is it.
  *
+ * @param candidate The URL to screen: a caller-supplied chunk URL, or a
+ * page-authored directive value resolved against `base`.
+ * @param role Whether this is the chunk or its map; diagnostics only.
+ * @param pinnedOrigin The canonical origin every request of this lookup is
+ * confined to.
+ * @param base The chunk's URL, when `candidate` may be a relative reference.
  * @returns `Ok(URL)` for a permitted target, or `Err` with code
  * `FORBIDDEN_ORIGIN` and `details.reason` naming the failed rule.
  */
 function screenUrl(
   candidate: string,
   role: RequestRole,
-  allowedOrigins: readonly string[] | undefined,
+  pinnedOrigin: string,
   base?: URL,
 ): Result<URL> {
   const parsed = tryCatch(() =>
@@ -992,11 +1082,12 @@ function screenUrl(
     );
   }
 
-  if (allowedOrigins !== undefined && !isAllowedOrigin(url, allowedOrigins)) {
+  if (url.origin !== pinnedOrigin) {
     return err(
-      refusal('is not one of the allowed origins', role, {
-        reason: 'origin-not-allowed',
+      refusal("does not belong to the session's dev server", role, {
+        reason: 'origin-mismatch',
         origin: url.origin,
+        expectedOrigin: pinnedOrigin,
       }),
     );
   }
@@ -1005,24 +1096,77 @@ function screenUrl(
 }
 
 /**
- * Whether `url`'s origin is a member of `allowedOrigins`.
+ * Screens the mandatory origin pin and reduces it to a canonical origin string.
  *
- * Entries are compared against `url.origin` both literally and after being
- * parsed, so a caller may pass `http://127.0.0.1:3000` or the fuller
- * `http://127.0.0.1:3000/` — which a dev-server URL read from configuration
- * frequently is — and get the same answer. An entry that does not parse and
- * does not match literally simply never matches: an unusable entry can only
- * ever narrow the permitted set, which is the direction this option is allowed
- * to move it.
+ * The pin is the one thing a caller *must* supply, so it is also the one thing
+ * that must not be trusted to be well formed: it travels from a session record
+ * through the service, and a caller that lost it — an empty string from a
+ * half-initialised session, a value that was never a URL — would otherwise
+ * install a policy that matches nothing (harmless) or, if the comparison were
+ * written laxly, one that matches everything (not). Screening it here makes
+ * both cases the same visible refusal.
+ *
+ * The same four properties the candidates are held to apply to the pin, for one
+ * reason each: it must **parse**, or there is no origin to compare against; it
+ * must be `http:`/`https:`, because those are the only schemes this module
+ * fetches over and a `file:` or `data:` pin would authorise a set of URLs it
+ * could never legitimately name; it must carry **no credentials**, because a
+ * pin is compared by origin and a userinfo component in it can only be a
+ * mistake worth surfacing; and it must be **loopback**, which is what keeps the
+ * option a narrowing of the loopback rule rather than an escape from it — a
+ * caller cannot authorise `https://evil.example` by pinning to it.
+ *
+ * A full URL is accepted and reduced to its origin, because the value a session
+ * carries is a dev-server *URL* (`http://127.0.0.1:3000/`), not a bare origin.
+ * `URL.origin` performs the canonicalisation both sides of the later comparison
+ * need — lower-cased scheme and host, IDNA- and IPv4-normalised host, default
+ * port dropped — so the comparison itself is a string equality with no further
+ * parsing per candidate.
+ *
+ * @param rawOrigin The value of {@link FetchSourceMapOptions.devServerOrigin},
+ * taken as `unknown` rather than as `string`: the declared type is a promise
+ * TypeScript keeps for its own callers, and this function is the one place that
+ * must hold for the others too.
+ * @returns `Ok` with the canonical origin (`http://127.0.0.1:3000`), or `Err`
+ * with code `FORBIDDEN_ORIGIN`, `details.reason = 'origin-pin-invalid'` and
+ * `details.problem` naming which property failed.
  */
-function isAllowedOrigin(url: URL, allowedOrigins: readonly string[]): boolean {
-  return allowedOrigins.some((entry) => {
-    if (entry === url.origin) {
-      return true;
-    }
-    const parsed = tryCatch(() => new URL(entry));
-    return isOk(parsed) && parsed.value.origin === url.origin;
-  });
+function screenOriginPin(rawOrigin: unknown): Result<string> {
+  // A type narrowing rather than a truthiness test: this is a public option on
+  // a security boundary, and a JavaScript caller — or options deserialised from
+  // JSON — can supply `undefined`, `null` or a number for it without TypeScript
+  // ever seeing the call.
+  if (typeof rawOrigin !== 'string' || rawOrigin.trim().length === 0) {
+    return err(invalidOriginPin('missing'));
+  }
+
+  const parsed = tryCatch(() => new URL(rawOrigin.trim()));
+  if (isErr(parsed)) {
+    return err(invalidOriginPin('unparseable'));
+  }
+
+  const url = parsed.value;
+  if (!ALLOWED_URL_PROTOCOLS.includes(url.protocol)) {
+    return err(invalidOriginPin('scheme'));
+  }
+
+  if (url.username.length > 0 || url.password.length > 0) {
+    return err(invalidOriginPin('credentials'));
+  }
+
+  if (!isLoopbackDevServerUrl(url)) {
+    return err(invalidOriginPin('non-loopback'));
+  }
+
+  // `URL.origin` is `"null"` for an opaque origin. No `http:`/`https:` URL has
+  // one, so this is unreachable for the schemes admitted above — and it is
+  // checked anyway, because an origin of `"null"` compared by equality would
+  // match every other opaque origin rather than none of them.
+  if (url.origin === OPAQUE_ORIGIN) {
+    return err(invalidOriginPin('unparseable'));
+  }
+
+  return ok(url.origin);
 }
 
 /** Whether a directive value is an inline `data:` URI. Schemes are case-insensitive. */
@@ -1469,11 +1613,19 @@ function decodeUtf8(produce: () => Buffer, described: string, role: RequestRole)
  * alone would not help: a function that throws instead of rejecting does so
  * while the argument to `fromPromise` is being evaluated, which is outside its
  * `try`.
+ *
+ * Deliberately **not** `async`. Both branches already yield the value this
+ * function promises — `fromPromise` returns the promise, and the synchronous
+ * failure is lifted with `Promise.resolve` — so `async` would add a keyword
+ * with no `await` under it: an extra microtask hop on every stream read, and a
+ * `@typescript-eslint/require-await` violation of the `--max-warnings 0` lint
+ * gate (AAP 0.8.5) the moment a return path stops being thenable. Callers
+ * `await` the result either way, so the observable behaviour is identical.
  */
-async function awaitGuarded<T>(produce: () => PromiseLike<T>): Promise<Result<T>> {
+function awaitGuarded<T>(produce: () => PromiseLike<T>): Promise<Result<T>> {
   const started = tryCatch(produce);
   if (isErr(started)) {
-    return started;
+    return Promise.resolve(started);
   }
   return fromPromise(started.value);
 }
@@ -1639,6 +1791,29 @@ function refusal(
     {
       hint: 'Debug Generator reads chunks and source maps only from a loopback dev server, over http or https, without credentials.',
       details: { role, ...details },
+    },
+  );
+}
+
+/**
+ * The origin pin itself is unusable: `FORBIDDEN_ORIGIN` with
+ * `details.reason = 'origin-pin-invalid'` and the failed property in
+ * `details.problem`.
+ *
+ * The offending value is deliberately **not** included. A pin that failed to
+ * parse is a caller-supplied string of unknown provenance, and the diagnostic a
+ * developer needs is which property was wrong plus the hint below — not the
+ * string echoed into a log file (AAP 0.5.2).
+ */
+function invalidOriginPin(
+  problem: 'missing' | 'unparseable' | 'scheme' | 'credentials' | 'non-loopback',
+): DebuggenError {
+  return new DebuggenError(
+    'FORBIDDEN_ORIGIN',
+    `Refused to fetch a source map: the session's dev-server origin is unusable (${problem}).`,
+    {
+      hint: "Pass the session's devServerUrl as options.devServerOrigin — a credential-free http or https URL on a loopback host.",
+      details: { reason: 'origin-pin-invalid', problem },
     },
   );
 }

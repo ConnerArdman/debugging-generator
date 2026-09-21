@@ -39,8 +39,12 @@
  *                                one, or an equality comparison between one and a string literal.
  *
  *   plus, independent of any file:
- *      `policy-stale`            the committed policy is not what `--update` would produce from the
- *                                demo corpus, so the gate no longer matches what it guards.
+ *      `policy-stale`            the committed policy is not, byte for byte, what `--update` would
+ *                                produce from the demo corpus: a different vocabulary, different
+ *                                metadata, entries out of canonical order or repeated, or a
+ *                                hand-reformatted file. Any of those means the committed artifact
+ *                                cannot be reproduced from its corpus, so the gate no longer
+ *                                matches what it guards.
  *
  * WHAT THIS SCRIPT WRITES
  * Nothing, except `scripts/no-hardcoding.policy.json` under `--update`. Source files are read into
@@ -79,6 +83,16 @@
  *     no partial-corpus exemption: a policy a present corpus cannot reproduce is stale, whether it
  *     lists too much or too little, because a gate nobody can regenerate is a gate nobody can
  *     trust. Enforcement of the policy against product source is unconditional either way.
+ *
+ * "Every difference" is literal, and the comparison is therefore byte-exact: the committed file is
+ * compared with `serializePolicy()` of the fresh harvest, not only with the set of names it lists.
+ * A file that lists exactly the right names in the wrong order, repeats one, carries different
+ * metadata or was reformatted by hand is stale too, because AAP 0.5.4's contract is that the
+ * committed bytes are what `--update` writes -- the file is prettier-ignored and hand-editing it is
+ * forbidden precisely so those bytes mean something. Order-only drift is the case this exists for:
+ * it survives a hand-resolved merge conflict or a sort that used `localeCompare` instead of
+ * case-sensitive ASCII, it changes nothing about which names the gate matches, and a comparison of
+ * membership alone would pass it while leaving a committed artifact nobody can regenerate.
  *
  * THE SCAN FAILS CLOSED
  * A gate that returns success while part of the product tree went unexamined proves nothing, so
@@ -378,6 +392,21 @@ const RULE_HINTS = Object.freeze({
  */
 
 /**
+ * How the committed policy's *form* differs from the canonical form `--update` writes, once the
+ * names it lists are accounted for. Order, repetition and formatting are contract, not cosmetics:
+ * the committed artifact has to be reproducible from its corpus byte for byte (AAP 0.5.4).
+ *
+ * @typedef {object} SerializationReport
+ * @property {boolean} canonical Whether the committed form is the canonical one -- no reason below,
+ *   and the bytes equal {@link serializePolicy} of the fresh harvest wherever they were available.
+ * @property {boolean|null} byteEqual Whether the committed bytes equal the canonical serialization;
+ *   `null` when no bytes were available, which is the case for an injected policy object.
+ * @property {string[]} reasons Every difference the listed names do not already explain: entries
+ *   out of canonical case-sensitive ASCII order, repeated entries, and -- only when nothing else
+ *   accounts for it -- bytes that are not what the generator writes.
+ */
+
+/**
  * Outcome of comparing the committed policy with a fresh computation.
  *
  * @typedef {object} StaleReport
@@ -387,7 +416,10 @@ const RULE_HINTS = Object.freeze({
  * @property {CorpusState} corpus
  * @property {{ identifiers: string[], routePaths: string[] }} added Corpus has them, policy lacks.
  * @property {{ identifiers: string[], routePaths: string[] }} removed Policy has them, corpus lacks.
- * @property {string[]} fields Metadata fields that differ (`version`, `corpus`, `exclusions`).
+ * @property {string[]} fields Metadata fields that differ (`version`, `generatedBy`, `corpus`,
+ *   `exclusions`).
+ * @property {SerializationReport} serialization How the committed form differs from the canonical
+ *   one beyond the names it lists.
  */
 
 /**
@@ -1045,11 +1077,15 @@ function isStringArray(value) {
 /**
  * Read and validate a JSON artifact this script depends on.
  *
+ * The raw text is returned alongside the parsed object because the committed policy's *bytes* are
+ * part of its contract: `comparePolicies()` compares them with `serializePolicy()` of a fresh
+ * harvest, which is the only way order-only and formatting-only drift is visible at all.
+ *
  * @param {string} root Absolute repository root.
  * @param {string} relPath Repository-relative POSIX path.
  * @param {string} missingCode Error code when the file is absent.
  * @param {string} malformedCode Error code when it cannot be parsed.
- * @returns {Record<string, unknown>}
+ * @returns {{ text: string, value: Record<string, unknown> }}
  */
 function readJsonArtifact(root, relPath, missingCode, malformedCode) {
   const absolute = path.join(root, relPath);
@@ -1081,7 +1117,7 @@ function readJsonArtifact(root, relPath, missingCode, malformedCode) {
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
     throw new HardcodingCheckError(malformedCode, `${relPath} must contain a JSON object`);
   }
-  return /** @type {Record<string, unknown>} */ (parsed);
+  return { text: read.text, value: /** @type {Record<string, unknown>} */ (parsed) };
 }
 
 /**
@@ -1162,7 +1198,12 @@ export async function loadPolicy(root = DEFAULT_ROOT) {
  * @throws {HardcodingCheckError} With code `allowlist-missing` or `allowlist-malformed`.
  */
 export function loadAllowlist(root = DEFAULT_ROOT) {
-  const raw = readJsonArtifact(root, ALLOWLIST_FILE, 'allowlist-missing', 'allowlist-malformed');
+  const { value: raw } = readJsonArtifact(
+    root,
+    ALLOWLIST_FILE,
+    'allowlist-missing',
+    'allowlist-malformed',
+  );
   const { version, identifiers, routePaths, notes } = raw;
   if (version !== 1) {
     throw new HardcodingCheckError(
@@ -2069,6 +2110,22 @@ export function scanStructuredText(root = DEFAULT_ROOT, policy, options = {}) {
 }
 
 /**
+ * Read the committed policy as both the validated object and the exact bytes it is stored as.
+ *
+ * Callers that judge staleness need both: the object says which names the gate enforces, and the
+ * text says whether the committed artifact is the one `--update` writes. Nothing normalises the
+ * text on the way through -- a re-serialization of the parsed object would hide the very drift the
+ * comparison exists to find.
+ *
+ * @param {string} root
+ * @returns {{ policy: Policy, text: string }}
+ */
+function readPolicyDocument(root) {
+  const { text, value } = readJsonArtifact(root, POLICY_FILE, 'policy-missing', 'policy-malformed');
+  return { policy: validatePolicyShape(value), text };
+}
+
+/**
  * Synchronous policy load, used by {@link scanStructuredText}, which needs no AST and is therefore
  * synchronous itself. {@link loadPolicy} is the asynchronous public form; both read the same file
  * through the same validation.
@@ -2077,8 +2134,7 @@ export function scanStructuredText(root = DEFAULT_ROOT, policy, options = {}) {
  * @returns {Policy}
  */
 function loadPolicySync(root) {
-  const raw = readJsonArtifact(root, POLICY_FILE, 'policy-missing', 'policy-malformed');
-  return validatePolicyShape(raw);
+  return readPolicyDocument(root).policy;
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -2544,6 +2600,84 @@ function difference(left, right) {
 }
 
 /**
+ * @param {readonly string[]} entries
+ * @returns {string[]} The entries that occur more than once, in first-occurrence order.
+ */
+function duplicateEntries(entries) {
+  /** @type {Set<string>} */
+  const seen = new Set();
+  /** @type {Set<string>} */
+  const repeated = new Set();
+  for (const entry of entries) {
+    if (seen.has(entry)) {
+      repeated.add(entry);
+    } else {
+      seen.add(entry);
+    }
+  }
+  return [...repeated];
+}
+
+/**
+ * Compare the committed policy's form with the canonical form, which is what makes order-only and
+ * formatting-only drift visible. Membership comparison cannot see any of it: two files listing the
+ * same names in a different order are the same set and different artifacts, and only one of them is
+ * the one `--update` writes.
+ *
+ * Each reason is specific enough to act on without a diff:
+ *   * a repeated entry, named -- the generator de-duplicates, so a repeat is a hand edit;
+ *   * the first pair that is out of canonical case-sensitive ASCII order, named in the order they
+ *     appear. `localeCompare` and a case-insensitive sort both produce exactly this, which is how
+ *     a plausible-looking hand edit or merge resolution ends up unreproducible;
+ *   * bytes that are not what the generator writes, raised only when the names, their order and
+ *     the metadata all match -- so this reason genuinely means the key order, the indentation, an
+ *     extra key, an escape or the trailing newline, and never repeats what another reason said.
+ *
+ * @param {Policy} committed
+ * @param {Policy} computed
+ * @param {string|null} committedText The bytes on disk, or `null` when the policy was injected
+ *   rather than read, in which case only the order and repetition of its arrays can be judged.
+ * @param {boolean} explained Whether the listed names or the metadata already account for a byte
+ *   difference, which keeps the residual reason from restating drift reported elsewhere.
+ * @returns {SerializationReport}
+ */
+function compareSerialization(committed, computed, committedText, explained) {
+  /** @type {string[]} */
+  const reasons = [];
+  /** @type {[string, readonly string[]][]} */
+  const arrays = [
+    ['identifiers', committed.identifiers],
+    ['routePaths', committed.routePaths],
+  ];
+  for (const [field, entries] of arrays) {
+    const repeated = duplicateEntries(entries);
+    if (repeated.length > 0) {
+      reasons.push(
+        `\`${field}\` repeats ${pluralize(repeated.length, 'entry', 'entries')} (${preview(repeated)}); the generator de-duplicates`,
+      );
+    }
+    // Compare the de-duplicated sequence against the canonical one, so a repeat is reported once as
+    // a repeat rather than a second time as an ordering fault.
+    const asWritten = [...new Set(entries)];
+    const canonicalOrder = sortedUnique(entries);
+    const outOfOrder = asWritten.findIndex((entry, position) => entry !== canonicalOrder[position]);
+    if (outOfOrder !== -1) {
+      reasons.push(
+        `\`${field}\` is not in canonical case-sensitive ASCII order: ${JSON.stringify(asWritten[outOfOrder])} precedes ${JSON.stringify(canonicalOrder[outOfOrder])}`,
+      );
+    }
+  }
+
+  const byteEqual = committedText === null ? null : committedText === serializePolicy(computed);
+  if (byteEqual === false && reasons.length === 0 && !explained) {
+    reasons.push(
+      `the committed bytes are not what \`${PNPM_UPDATE_COMMAND}\` writes, although the names, their order and the metadata all match: the difference is the key order, the indentation, an extra key or the trailing newline`,
+    );
+  }
+  return { canonical: reasons.length === 0 && byteEqual !== false, byteEqual, reasons };
+}
+
+/**
  * Compare the committed policy with a fresh computation.
  *
  * `added` is what regeneration would add: names the corpus has and the policy lacks, which means
@@ -2553,16 +2687,30 @@ function difference(left, right) {
  * present is the only condition, and a caller that got here with an `absent` corpus should not have
  * compared at all.
  *
+ * The names are not the whole comparison. `serialization` reports how the committed *form* differs
+ * from the canonical one -- entries out of order or repeated, and, when `committedText` is given,
+ * bytes that are not what the generator writes -- and any of those drifts the policy on its own. A
+ * committed artifact that no regeneration reproduces is stale whatever its vocabulary says, and
+ * order-only drift is invisible to every membership comparison.
+ *
  * @param {Policy} committed
  * @param {Policy} computed
  * @param {CorpusState} corpus
+ * @param {{ committedText?: string|null }} [options] `committedText` is the committed file's exact
+ *   bytes. Omit it only when the policy did not come from disk: the byte comparison is then skipped
+ *   and the order and repetition of the object's arrays are still judged.
  * @returns {StaleReport}
  */
-export function comparePolicies(committed, computed, corpus) {
+export function comparePolicies(committed, computed, corpus, options = {}) {
   /** @type {string[]} */
   const fields = [];
   if (committed.version !== computed.version) {
     fields.push('version');
+  }
+  // `generatedBy` is compared too, so that a residual byte difference really is about the file's
+  // form: a hand-written provenance string would otherwise drift the bytes with nothing naming it.
+  if (committed.generatedBy !== computed.generatedBy) {
+    fields.push('generatedBy');
   }
   if (committed.corpus !== computed.corpus) {
     fields.push('corpus');
@@ -2578,13 +2726,27 @@ export function comparePolicies(committed, computed, corpus) {
     identifiers: difference(committed.identifiers, computed.identifiers),
     routePaths: difference(committed.routePaths, computed.routePaths),
   };
-  const drifted =
-    fields.length > 0 ||
+  const namesDrifted =
     added.identifiers.length > 0 ||
     added.routePaths.length > 0 ||
     removed.identifiers.length > 0 ||
     removed.routePaths.length > 0;
-  return { enforced: corpus.state === 'ready', drifted, corpus, added, removed, fields };
+  const serialization = compareSerialization(
+    committed,
+    computed,
+    options.committedText ?? null,
+    fields.length > 0 || namesDrifted,
+  );
+  const drifted = fields.length > 0 || namesDrifted || !serialization.canonical;
+  return {
+    enforced: corpus.state === 'ready',
+    drifted,
+    corpus,
+    added,
+    removed,
+    fields,
+    serialization,
+  };
 }
 
 /**
@@ -2592,6 +2754,11 @@ export function comparePolicies(committed, computed, corpus) {
  * de-duplicated arrays, two-space indentation and a trailing newline. No timestamp, git revision or
  * machine name appears anywhere, because a volatile field would make the committed policy
  * permanently stale.
+ *
+ * This is both the writer and the comparison basis: a normal run compares the committed bytes with
+ * this function's output over a fresh harvest, so every rule encoded here -- the key order, the
+ * case-sensitive ASCII sort, the de-duplication, the indentation, the single trailing newline -- is
+ * enforced on the committed artifact rather than merely applied when it happens to be rewritten.
  *
  * @param {Policy} policy
  * @returns {string}
@@ -2628,13 +2795,19 @@ export async function updatePolicy(root = DEFAULT_ROOT, options = {}) {
   const allowlist = options.allowlist === undefined ? loadAllowlist(root) : options.allowlist;
 
   // The previous policy is needed for the diff summary only. A missing or malformed one is not an
-  // error here: regenerating is exactly how a developer recovers from it.
+  // error here: regenerating is exactly how a developer recovers from it. Its bytes come along so
+  // the summary can say the file was rewritten for its form rather than its vocabulary.
   /** @type {Policy|null} */
   let committed;
+  /** @type {string|null} */
+  let committedText;
   try {
-    committed = loadPolicySync(root);
+    const document = readPolicyDocument(root);
+    committed = document.policy;
+    committedText = document.text;
   } catch {
     committed = null;
+    committedText = null;
   }
 
   const computed = await buildPolicy(root, { allowlist });
@@ -2668,11 +2841,16 @@ export async function updatePolicy(root = DEFAULT_ROOT, options = {}) {
     identifiers: [],
     routePaths: [],
   };
-  const comparison = comparePolicies(previous, policy, corpusState);
+  const comparison = comparePolicies(previous, policy, corpusState, { committedText });
   if (comparison.removed.identifiers.length + comparison.removed.routePaths.length > 0) {
     notes.push(
       'entries are being removed, which widens the gate; confirm each one really left the demo application',
     );
+  }
+  for (const reason of comparison.serialization.reasons) {
+    // Worth saying out loud: the reviewer of this diff would otherwise see entries move with no
+    // vocabulary change and have to work out why the file was rewritten at all.
+    notes.push(`the committed file was not the generator's canonical form -- ${reason}`);
   }
 
   const serialized = serializePolicy(policy);
@@ -2766,11 +2944,17 @@ function describeFailures(failures, limit = 6) {
  * @param {string} [root] Absolute repository root.
  * @param {{ policy?: Policy, allowlist?: Allowlist|null, stale?: boolean }} [options] `stale: false`
  *   skips the staleness comparison, which the unit tests use when they only exercise the scanners.
+ *   `policy` injects a policy object instead of reading the committed file, in which case there are
+ *   no committed bytes to compare and the staleness comparison judges the object's form alone.
  * @returns {Promise<CheckResult>}
  */
 export async function check(root = DEFAULT_ROOT, options = {}) {
   const absoluteRoot = path.resolve(root);
-  const policy = options.policy ?? (await loadPolicy(absoluteRoot));
+  // The committed bytes are read once, here, and carried to the staleness comparison: an injected
+  // policy has none, and its form is then judged from the object alone.
+  const document = options.policy === undefined ? readPolicyDocument(absoluteRoot) : null;
+  const policy = document === null ? /** @type {Policy} */ (options.policy) : document.policy;
+  const committedText = document === null ? null : document.text;
   const allowlist =
     options.allowlist === undefined ? loadAllowlist(absoluteRoot) : options.allowlist;
   const matchers = compileMatchers(policy, allowlist);
@@ -2819,14 +3003,18 @@ export async function check(root = DEFAULT_ROOT, options = {}) {
         `policy staleness not compared: the harvest could not read ${pluralize(corpusFailures.length, 'corpus path')} (${describeFailures(corpusFailures)}); the policy is still enforced against product source`,
       );
     } else {
-      stale = comparePolicies(policy, computedPolicy, corpusState);
+      stale = comparePolicies(policy, computedPolicy, corpusState, { committedText });
       if (stale.drifted) {
+        const form = stale.serialization.reasons;
         findings.push({
           rule: 'policy-stale',
           file: POLICY_FILE,
           line: 1,
           column: 1,
-          message: `the committed policy is not what \`${PNPM_UPDATE_COMMAND}\` would produce from ${DEMO_TREE}`,
+          message:
+            form.length > 0
+              ? `the committed policy is not what \`${PNPM_UPDATE_COMMAND}\` would produce from ${DEMO_TREE}: ${form.join('; ')}`
+              : `the committed policy is not what \`${PNPM_UPDATE_COMMAND}\` would produce from ${DEMO_TREE}`,
           hint: RULE_HINTS['policy-stale'],
         });
       }
@@ -2916,6 +3104,9 @@ export function renderReport(result) {
     lines.push(`${LOG_PREFIX}: policy drift against ${DEMO_TREE} (enforced):`);
     if (stale.fields.length > 0) {
       lines.push(`    metadata fields differ: ${stale.fields.join(', ')}`);
+    }
+    for (const reason of stale.serialization.reasons) {
+      lines.push(`    form: ${reason}`);
     }
     lines.push(`    identifiers to add:    ${preview(stale.added.identifiers)}`);
     lines.push(`    identifiers to remove: ${preview(stale.removed.identifiers)}`);
@@ -3012,7 +3203,9 @@ function helpText() {
     '                             expression tested against it, an equality comparison with a',
     '                             string literal, or a switch over it with string cases',
     '  and, independent of any file',
-    '     policy-stale            the committed policy is not what --update would produce, which is',
+    '     policy-stale            the committed policy is not, byte for byte, what --update would',
+    '                             produce: a different vocabulary, different metadata, entries out',
+    '                             of canonical ASCII order or repeated, or a reformatted file. It is',
     `                             enforced whenever ${DEMO_TREE} is in the checkout and compared not`,
     '                             at all when it is absent',
     '',

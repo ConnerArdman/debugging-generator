@@ -698,11 +698,16 @@ export function computeExternalPolicy(manifest) {
  * checkout.
  *
  * @param {string} name package name, e.g. `@debuggen/shared`
+ * @param {{ packageDir?: string }} [options] `packageDir` is the package whose
+ *   `node_modules` the dependency is resolved from; it defaults to
+ *   {@link PACKAGE_DIR}, so the CLI is unaffected, and is passed explicitly by
+ *   the suite in `esbuild.node.test.mjs`, which exercises every failure below
+ *   against a throwaway package root instead of this checkout
  * @returns {{ name: string, dir: string, entryFile: string }}
  * @throws {PreloadBuildError} when the package or its built entry is missing
  */
-export function verifyInlinedDependencyBuilt(name) {
-  const dependencyDir = path.join(PACKAGE_DIR, 'node_modules', ...name.split('/'));
+export function verifyInlinedDependencyBuilt(name, { packageDir = PACKAGE_DIR } = {}) {
+  const dependencyDir = path.join(packageDir, 'node_modules', ...name.split('/'));
   const buildHint = [
     `${name} is bundled into the preload, so it has to be built first:`,
     '',
@@ -912,6 +917,9 @@ export function auditBundleText(text) {
 
 /**
  * @typedef {object} BuildContext
+ * @property {string} packageDir absolute root every relative path of the build
+ *   is resolved against — {@link PACKAGE_DIR} for every real invocation, and a
+ *   temporary fixture root when the contract is being tested
  * @property {Record<string, unknown>} manifest this package's parsed manifest
  * @property {ExternalPolicy} policy the resolved externalisation policy
  * @property {string} entry absolute path of the entry point
@@ -932,6 +940,12 @@ export function auditBundleText(text) {
  * reported before a partial `dist/node/` can exist, and the ordering of a
  * handful of `stat` calls is not worth the indirection of promises.
  *
+ * @param {{ packageDir?: string }} [options] `packageDir` is the package root
+ *   every path below is resolved against. It defaults to {@link PACKAGE_DIR},
+ *   which is what every real invocation uses, and is passed explicitly only by
+ *   `esbuild.node.test.mjs`: each precondition here fails at exit 2 and the
+ *   trailing `mkdir` at exit 1, and a temporary package root is the only way to
+ *   reach those branches — a successful build never does.
  * @returns {BuildContext}
  * @throws {PreloadBuildError} exit 2 with a recovery hint. Everything checked
  *   here is a precondition of the build — nothing has been built when one of
@@ -939,15 +953,15 @@ export function auditBundleText(text) {
  *   added to this function later follows that rule. The one exception is the
  *   `mkdir` at the end, which acts rather than checks; see the comment there.
  */
-export function preflight() {
+export function preflight({ packageDir = PACKAGE_DIR } = {}) {
   const manifest = readManifest(
-    path.join(PACKAGE_DIR, 'package.json'),
+    path.join(packageDir, 'package.json'),
     "this package's package.json",
   );
   verifyPackageContract(manifest);
   const policy = computeExternalPolicy(manifest);
 
-  const entry = path.join(PACKAGE_DIR, ...ENTRY_REL.split('/'));
+  const entry = path.join(packageDir, ...ENTRY_REL.split('/'));
   if (!fs.existsSync(entry)) {
     throw new PreloadBuildError(`the preload entry point is missing: ${ENTRY_REL}`, {
       exitCode: EXIT_USAGE,
@@ -960,9 +974,9 @@ export function preflight() {
     });
   }
 
-  const tsconfig = path.join(PACKAGE_DIR, TSCONFIG_REL);
+  const tsconfig = path.join(packageDir, TSCONFIG_REL);
   if (!fs.existsSync(tsconfig)) {
-    throw new PreloadBuildError(`${TSCONFIG_REL} is missing from ${displayPath(PACKAGE_DIR)}`, {
+    throw new PreloadBuildError(`${TSCONFIG_REL} is missing from ${displayPath(packageDir)}`, {
       exitCode: EXIT_USAGE,
       hint: 'esbuild reads the workspace tsconfig for the TypeScript transform; restore it before building.',
     });
@@ -971,11 +985,11 @@ export function preflight() {
   /** @type {{ name: string, dir: string }[]} */
   const inlinedRoots = [];
   for (const name of policy.inlined) {
-    const resolved = verifyInlinedDependencyBuilt(name);
+    const resolved = verifyInlinedDependencyBuilt(name, { packageDir });
     inlinedRoots.push({ name: resolved.name, dir: resolved.dir });
   }
 
-  const outfile = path.join(PACKAGE_DIR, ...OUTFILE_REL.split('/'));
+  const outfile = path.join(packageDir, ...OUTFILE_REL.split('/'));
   try {
     fs.mkdirSync(path.dirname(outfile), { recursive: true });
   } catch (error) {
@@ -990,7 +1004,16 @@ export function preflight() {
     );
   }
 
-  return { manifest, policy, entry, outfile, outfileKey: OUTFILE_REL, tsconfig, inlinedRoots };
+  return {
+    packageDir,
+    manifest,
+    policy,
+    entry,
+    outfile,
+    outfileKey: OUTFILE_REL,
+    tsconfig,
+    inlinedRoots,
+  };
 }
 
 /**
@@ -1011,8 +1034,11 @@ export function preflight() {
 export function createBuildOptions(context, plugins = []) {
   return {
     // Anchors every relative path esbuild reports (metafile keys, messages) to
-    // this package, independent of where the command was run from.
-    absWorkingDir: PACKAGE_DIR,
+    // the package being built, independent of where the command was run from.
+    // `context.packageDir` is {@link PACKAGE_DIR} for every real invocation and
+    // a fixture root under test, which is what keeps the metafile keys the
+    // audit matches against relative to the same root either way.
+    absWorkingDir: context.packageDir ?? PACKAGE_DIR,
     entryPoints: [context.entry],
     // `outfile`, not `outdir`: the ".mjs" extension is what makes Node treat the
     // artefact as ESM when it is loaded from inside a project whose own
@@ -1123,7 +1149,9 @@ export function describeBuild(context, metafile) {
   // directory recorded at preflight, and only reported when it truly
   // contributed an input. Everything from a node_modules tree is named by its
   // package instead.
-  const absoluteInputs = inputs.map((input) => path.resolve(PACKAGE_DIR, input));
+  const absoluteInputs = inputs.map((input) =>
+    path.resolve(context.packageDir ?? PACKAGE_DIR, input),
+  );
   const workspaceInlined = context.inlinedRoots
     .filter(({ dir }) =>
       absoluteInputs.some((input) => input === dir || input.startsWith(`${dir}${path.sep}`)),
@@ -1186,7 +1214,7 @@ async function reviewBuild(context, result) {
   /** @type {string[]} */
   const findings = [
     ...auditMetafile(metafile, {
-      packageDir: PACKAGE_DIR,
+      packageDir: context.packageDir ?? PACKAGE_DIR,
       repoRoot: REPO_ROOT,
       outfileKey: context.outfileKey,
     }),
@@ -1370,6 +1398,12 @@ function reportFailure(error) {
  * CLI entry point.
  *
  * @param {readonly string[]} [argv] arguments after the script path
+ * @param {{ packageDir?: string }} [options] `packageDir` is forwarded to
+ *   {@link preflight} and defaults to {@link PACKAGE_DIR}, so the CLI below
+ *   passes nothing and behaves exactly as before. `esbuild.node.test.mjs` uses
+ *   it to drive this function end to end — a precondition fixture for exit 2, a
+ *   fixture whose bundle fails the audit for exit 1, a sound one for exit 0 —
+ *   against a throwaway package root rather than this checkout.
  * @returns {Promise<number>} process exit code, on the convention this script
  *   shares with `esbuild.agent.mjs`: 0 success (the artefact was written and the
  *   audit passed) or `--help`; 1 the build ran and its result was rejected
@@ -1377,7 +1411,7 @@ function reportFailure(error) {
  *   built (the argument list was not understood, or a precondition {@link
  *   preflight} checks does not hold)
  */
-export async function main(argv = process.argv.slice(2)) {
+export async function main(argv = process.argv.slice(2), { packageDir = PACKAGE_DIR } = {}) {
   /** @type {PreloadBuildArgs} */
   let args;
   try {
@@ -1392,7 +1426,7 @@ export async function main(argv = process.argv.slice(2)) {
   }
 
   try {
-    const context = preflight();
+    const context = preflight({ packageDir });
     return args.watch ? await runWatch(context) : await runOnce(context);
   } catch (error) {
     return reportFailure(error);

@@ -12,6 +12,18 @@
  * set of kinds the product filters by is therefore declared here as a named
  * group, so no other module ever has to hard-code one.
  *
+ * ## The metric ids these groups feed
+ *
+ * Several group declarations below name the computed metrics they are consumed
+ * by — `render_count`, `blocking_time`, `query_count` and the rest. Those ids
+ * are a closed vocabulary of their own, and they are declared in
+ * `./attributes.ts` beside the attribute keys the aggregates read from these
+ * kinds: not here, because this module is about what a producer may *emit*,
+ * and not in `../aggregate/summary.ts`, which computes their *values* rather
+ * than owning their names (AAP 0.2.3). A kind added here that warrants a new
+ * metric is therefore a change in both files — the group it joins in this one,
+ * and the metric vocabulary in that one.
+ *
  * ## Deliberately dependency-free
  *
  * This file imports **nothing** — no schema library, no sibling module, not

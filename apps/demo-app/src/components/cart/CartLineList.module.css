@@ -33,10 +33,10 @@
  * `100%` structural sizes, the unitless ratios inside `calc()`, and the `1px` hairline width in the
  * one `border` shorthand below, whose colour is tokenised.
  *
- * Motion: none. The list re-renders roughly four times a second while mounted (the cart context
- * republishes its value on the shipping-estimate cadence), so a transition on this container would
- * animate against its own re-render; the only movement in the loading state is the shimmer inside
- * `../ui/Skeleton`, which carries its own reduced-motion override.
+ * Motion: none. What this container paints changes as the cart does - a line added, a line
+ * removed, the switch between its loading and loaded states - so a transition here would animate
+ * against the next change instead of settling; the only movement in the loading state is the
+ * shimmer inside `../ui/Skeleton`, which carries its own reduced-motion override.
  */
 
 /* The collection root. One column, because every child - notice, placeholders, scroll region - is

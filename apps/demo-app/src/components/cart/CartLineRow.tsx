@@ -10,26 +10,30 @@
  * reports a requested quantity, and the remove button has no meaning anywhere else - which is why
  * the two handlers, and the busy flag they set, live here and nowhere above or below.
  *
- * THE MUTATIONS ARE SYNCHRONOUS, SO THE HANDLERS ARE TOO
+ * THE MUTATIONS REACH THE SERVER, SO THE HANDLERS AWAIT THEM
  * `@/hooks/useCart` publishes `setLineQuantity(lineId, quantity)` and `removeLine(lineId)` as
- * `() => void`: `CartProvider` applies both to the cart it already holds, with no request in
- * between (the storefront's browser client reads the cart and adds to it, and publishes no route
- * for either of these). Both are therefore called in a plain `try`/`catch`, and neither is
- * awaited - `await` on a value that is not a promise is what `await-thenable` exists to catch,
- * and an `async` function handed straight to `onClick` is what `no-misused-promises` exists to
- * catch. A throw is still handled rather than assumed away: it would mean a defect in the
- * provider, and this row reports that as a notice a shopper can read instead of an interaction
- * that silently did nothing. The cart's own persistent error wording stays where it belongs, on
- * `cartError` and `syncStatus`, which `./CartLineList.tsx` surfaces for the whole list.
+ * `() => Promise<void>`: `CartProvider` carries each of them to the server as one request against
+ * `/api/cart/items` and publishes the cart the server answers with, its line totals and its
+ * subtotal included, so the quantity this row shows is the quantity checkout prices the order
+ * from. Both handlers are therefore `async` and both `await` the call inside a
+ * `try`/`catch`/`finally`, and each success notice is raised after its `await` has returned - a
+ * refused change rejects instead, so the `catch` reports it and this row never tells a shopper a
+ * quantity was saved that the server did not save. Neither `async` function is
+ * handed to a prop directly - the stepper's `onCommit` and the button's `onClick` are both
+ * `() => void`, and an `async` function passed straight to one is what `no-misused-promises`
+ * exists to catch - so the JSX below calls the handler inside an arrow and discards the promise
+ * with `void`, which is sound because the handler settles its own failure rather than letting one
+ * escape. The cart's own persistent error wording stays where it belongs, on `cartError` and
+ * `syncStatus`, which `./CartLineList.tsx` surfaces for the whole list.
  *
  * `pending` is this row's own report that this row's mutation is in flight, deliberately not the
  * context's `syncStatus`, which is global to the cart and cannot say which line is changing. It
  * dims the row through `data-busy`, announces itself through `aria-busy`, holds the stepper with
  * its `busy` prop and holds the remove button with `disabled`, so those four states cannot drift
- * apart. Because the provider settles inside the same React batch today, the flag opens and closes
- * without a paint - which is the honest reading of a synchronous mutation, and it is cleared in
- * `finally` so a provider that drops a call (a cart it has not loaded yet) can never strand the
- * row in a busy state it has no way out of.
+ * apart. It covers the request for the whole life of that request: it is set before the call goes
+ * out and cleared in `finally` once the provider has settled, whether the cart came back changed
+ * or the write was refused, so the same line cannot be committed twice while the server is still
+ * deciding and no failure can strand the row in a busy state it has no way out of.
  *
  * WHY THERE IS NO STOCK BADGE
  * `.meta` was drawn wide enough for an availability chip beside the unit price, and the cart's own
@@ -45,23 +49,18 @@
  * MONEY IS NEVER FORMATTED OR MULTIPLIED HERE
  * `../ui/Price` takes integer cents and is the application's only monetary formatter, so both
  * figures are passed through as the cents they arrive as. `lineTotalCents` is the server's own
- * product of the unit price and the quantity - `CartProvider` recomputes it the same way when a
- * quantity changes - so this row multiplies nothing and divides nothing: a total assembled here
- * would be a second opinion about the amount a shopper is about to be charged.
+ * product of the unit price and the quantity - the server recomputes it, and publishes it again,
+ * every time a quantity changes - so this row multiplies nothing and divides nothing: a total
+ * assembled here would be a second opinion about the amount a shopper is about to be charged.
  *
- * NO MEMOIZATION, DELIBERATELY
- * No memoization of any kind - no component wrapper, no cached derivation, no stabilised handler,
- * no selector and no equality guard - so the handlers below are new functions on every render and
- * this row repaints whenever its list does. `CartProvider` republishes its context value, with
- * fresh callbacks, at `ShippingEtaProvider`'s 250 ms cadence, so it re-renders about four times a
- * second while the cart is open. That is AAP 0.8.2's second seeded defect propagating through
- * exactly this path, and it is the behaviour the tool under development exists to find and
- * explain; damping it in one row would hide the symptom rather than fix its cause. Local
- * `useState` for `pending` is the only hook in the file.
+ * WHAT IT HOLDS
+ * Beyond the two context reads at the top of the component - the cart and the toast centre -
+ * local `useState` for `pending` is the only hook in the file. No effect, no ref and no DOM read,
+ * so everything else the row renders is a function of the `line` it is given.
  *
  * Nothing here reads a clock, a random source, `window` or `document`, and nothing schedules a
- * timer, so the markup the server renders and the markup the browser first produces agree and a
- * capture of a cart interaction records no hydration warning to explain away.
+ * timer, so the markup the server renders and the markup the browser first produces agree and the
+ * cart raises no hydration warning to explain away.
  *
  * APPEARANCE AND NAMES
  * `./CartLineRow.module.css` owns every value: the five grid areas of the wide row, the two-line
@@ -211,11 +210,11 @@ export function CartLineRow({ line, className }: Props): ReactElement {
    * never asks for 0 - emptying a line is the remove button's job - so there is nothing left to
    * validate here and the request goes straight to the cart.
    */
-  function handleQuantityCommit(quantity: number): void {
+  async function handleQuantityCommit(quantity: number): Promise<void> {
     setPending(true);
 
     try {
-      setLineQuantity(line.id, quantity);
+      await setLineQuantity(line.id, quantity);
       showToast({
         tone: 'success',
         title: QUANTITY_SAVED_TITLE,
@@ -229,11 +228,11 @@ export function CartLineRow({ line, className }: Props): ReactElement {
   }
 
   /** Take this line out of the cart. */
-  function handleLineRemove(): void {
+  async function handleLineRemove(): Promise<void> {
     setPending(true);
 
     try {
-      removeLine(line.id);
+      await removeLine(line.id);
       showToast({ tone: 'success', title: LINE_REMOVED_TITLE, body: line.name });
     } catch (cause) {
       showToast(cartFailureNotice(LINE_REMOVE_FAILED_TITLE, cause));
@@ -282,7 +281,9 @@ export function CartLineRow({ line, className }: Props): ReactElement {
           quantity={line.quantity}
           busy={pending}
           itemLabel={line.name}
-          onCommit={handleQuantityCommit}
+          onCommit={(next) => {
+            void handleQuantityCommit(next);
+          }}
         />
       </div>
 
@@ -292,7 +293,14 @@ export function CartLineRow({ line, className }: Props): ReactElement {
       </div>
 
       <div className={styles.remove}>
-        <Button variant="ghost" size="sm" onClick={handleLineRemove} disabled={pending}>
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={() => {
+            void handleLineRemove();
+          }}
+          disabled={pending}
+        >
           <span aria-hidden="true">{REMOVE_GLYPH}</span>
           <VisuallyHidden>{`Remove ${line.name} from cart`}</VisuallyHidden>
         </Button>

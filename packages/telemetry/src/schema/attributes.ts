@@ -1,16 +1,19 @@
 /**
  * The attribute-key catalog: the single declaration of *which keys appear in a
  * telemetry event's `attributes` bag for each kind*, of the small value
- * vocabularies those keys draw on, and of the two bounds that cap what a
- * summarised value may carry.
+ * vocabularies those keys draw on, of the two bounds that cap what a
+ * summarised value may carry, and of the closed set of computed metric ids a
+ * capture can report.
  *
  * Treat this as a published contract rather than an internal note. Two
  * consumers read it directly — `packages/panel-schema/src/catalog.ts`, which
- * declares each panel node's `reads` list from {@link KIND_ATTRIBUTE_KEYS},
- * and `../aggregate/*`, which reads event fields by these exact key strings
- * (AAP 0.2.3, 0.6.2) — and `../browser/*` plus `../node/*` write them. A key
- * spelled one way here and another way at a producer or a consumer does not
- * fail loudly: it yields an empty column in a generated panel, which is
+ * declares each panel node's `reads` list from {@link KIND_ATTRIBUTE_KEYS} and
+ * validates a `metricCards` node's `metrics` against {@link METRIC_IDS}, and
+ * `../aggregate/*`, which reads event fields by these exact key strings and
+ * publishes its summary under those exact metric ids (AAP 0.2.3, 0.6.2) — and
+ * `../browser/*` plus `../node/*` write them. A key or a metric id spelled one
+ * way here and another way at a producer or a consumer does not fail loudly:
+ * it yields an empty column or an `n/a` card in a generated panel, which is
  * precisely the failure this file exists to prevent by fixing every spelling
  * in one place.
  *
@@ -59,8 +62,11 @@
  * redaction, no classification happens here: the value summariser lives in
  * `../browser/fiber-diff.ts`, the scrub-and-truncate primitives in
  * `../redaction/rules.ts`, and the per-event redaction pass in
- * `../redaction/redactor.ts`. What lives here is `const` tuples, derived
- * types, two frozen lookups and one total accessor.
+ * `../redaction/redactor.ts`. The metric ids at the end of the module are the
+ * same kind of declaration: the vocabulary lives here, while every value
+ * behind it is computed by `../aggregate/summary.ts`. What lives here is
+ * `const` tuples, derived types, frozen lookup tables and small total
+ * accessors.
  *
  * Its only import is `./kinds.js`, and that is a constraint rather than an
  * accident. The page-injected agent needs these keys, vocabularies and bounds
@@ -950,3 +956,337 @@ export const MAX_TRACKED_KEYS = 32;
  * this number as its bound.
  */
 export const MAX_PREVIEW_LENGTH = 120;
+
+/*
+ * ---------------------------------------------------------------------------
+ * Computed metric ids
+ *
+ * The closed vocabulary of the *numbers* a capture can report, declared beside
+ * the keys they are computed from so that the module computing them
+ * (`../aggregate/summary.ts`), the schema that lets a generated panel ask for
+ * one (`packages/panel-schema/src/catalog.ts`, whose `metricCards` node
+ * validates its `metrics` list against this set), the component that renders
+ * them and the prose layer that names one in a sentence all spell every id
+ * identically. A metric named one way here and another way at any of them does
+ * not fail loudly — it yields a card reading `n/a` next to a number the
+ * capture did record — which is the same failure the key catalog above exists
+ * to prevent, and it is prevented the same way: one declaration, imported.
+ *
+ * Vocabulary only: the ids live here, their values do not. `MetricValue`, the
+ * `CaptureSummary` that carries them and every line of arithmetic behind them
+ * belong to `../aggregate/summary.ts` (AAP 0.2.3), and nothing in this module
+ * reads an event or computes anything. The per-id documentation below states
+ * what each metric *means*, which is the part every consumer has to agree on;
+ * how it is derived from the event stream is that module's business.
+ *
+ * Adding a metric is four changes: a member of {@link METRIC_IDS}, an entry in
+ * {@link METRIC_ID_UNITS}, a place in exactly one of the semantic groups
+ * below, and the computation in `../aggregate/summary.ts`. The compiler
+ * demands the second, the colocated suite pins the first and the third, and
+ * only the computation is left to a reader to remember.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * Every computed metric a capture can report, in the order AAP 0.2.3 fixes:
+ * the total duration and its three per-tier parts, the render counts, the
+ * request and query counts, the two resource measures, then the remaining
+ * counts.
+ *
+ * The list is **closed**, and closedness is load-bearing rather than tidy: a
+ * generated panel's `metricCards` node names ids from this set and is rejected
+ * by panel validation when it names anything else, which is what stops a model
+ * from inventing a metric nobody computes and presenting an empty card as
+ * evidence (AAP 0.2.3, 0.5.3).
+ *
+ * The **order** is part of the contract too. It is the order the plan lists,
+ * it is the order the semantic groups below preserve, and it is the order a
+ * consumer that iterates the vocabulary rather than a model-authored list
+ * presents them in — the deterministic fallback panel, whose cards come from
+ * whatever the capture reported (AAP 0.5.3), being the case that matters.
+ *
+ * Frozen: a read-only vocabulary shared by the aggregates, the panel schema,
+ * the renderer and the deterministic prose layer.
+ */
+export const METRIC_IDS = Object.freeze([
+  /**
+   * Wall-clock duration of the whole interaction: from the start of the
+   * `interaction` root span to the end of the last event attributed to its
+   * trace, including anything attributed through a continuation window. The
+   * denominator the other durations are read against.
+   */
+  'total_duration',
+  /** Time accounted for by `browser`-tier events of the interaction's trace. */
+  'frontend_duration',
+  /** Time accounted for by `server`-tier events of the interaction's trace. */
+  'backend_duration',
+  /**
+   * Time accounted for by `db`-tier events of the interaction's trace. Split
+   * out from the server total because a slow query and slow application code
+   * on the same request support different conclusions.
+   */
+  'database_duration',
+  /**
+   * How many fibers the capture saw render — the `render` events of
+   * `RENDER_KINDS`, counted across the capture or for one component when the
+   * asking node filters by one.
+   */
+  'render_count',
+  /**
+   * How many of those renders had **stable inputs**: `attributes.trigger` was
+   * `unchanged`, meaning props were shallow-equal, own hook state was
+   * unchanged *and* no consumed context value changed (AAP 0.2.3). The
+   * interesting subset of {@link METRIC_IDS} for a re-render question, and the
+   * reason {@link RENDER_TRIGGERS} distinguishes `unchanged` from `unknown`.
+   */
+  'unchanged_render_count',
+  /**
+   * How many renders could **not** be classified: `attributes.trigger` was
+   * `unknown` because at least one of the three dimensions was unevaluable.
+   * Counted separately and never folded into `unchanged_render_count`, so a
+   * capture can never report a stable-input re-render it did not observe.
+   */
+  'render_trigger_unknown_count',
+  /**
+   * How many requests the page issued: the `fetch` and `xhr` events of
+   * `REQUEST_KINDS`.
+   */
+  'request_count',
+  /** How many database statements ran: the `db.query` events of `QUERY_KINDS`. */
+  'query_count',
+  /**
+   * Bytes transferred over the network, summed from the `transferSize` key
+   * where the browser reports one.
+   *
+   * The one metric that is legitimately **unobservable**: `transferSize` is
+   * available from resource timing for same-origin responses only, and server
+   * spans cannot report it at all, so a capture may have no value to give
+   * (AAP 0.6.6). A card with no value reads `n/a`; it is never rendered as
+   * zero, which would be a measurement the capture never made.
+   */
+  'transferred_bytes',
+  /**
+   * Total time the main thread was blocked, summed from the `blockingTime`
+   * key of the `perf.longtask` events of `PERF_KINDS`. A duration, not a
+   * count — see {@link METRIC_ID_UNITS}.
+   */
+  'blocking_time',
+  /**
+   * How many requests repeated a request the capture had already seen: the
+   * occurrences past the first in each group keyed by `request_key`, which is
+   * computed at ingest from the *unredacted* URL so that two requests
+   * differing only in a parameter value are not counted as duplicates of each
+   * other (AAP 0.5.2).
+   */
+  'duplicate_request_count',
+  /** How many long tasks occurred: the `perf.longtask` events of `PERF_KINDS`. */
+  'long_task_count',
+  /**
+   * How many failures the capture recorded: the `error` and `server.error`
+   * events of `ERROR_KINDS`. An operation of another kind that failed carries
+   * `status: 'error'` and is not counted here.
+   */
+  'error_count',
+] as const);
+
+/** One member of the closed computed-metric vocabulary. */
+export type MetricId = (typeof METRIC_IDS)[number];
+
+/** Widened view of {@link METRIC_IDS} used by {@link isMetricId}. */
+const METRIC_ID_VALUES: readonly string[] = METRIC_IDS;
+
+/**
+ * Whether `value` is one of the metric ids this module declares.
+ *
+ * The membership test for the places that classify a metric id before a schema
+ * is available: a stored panel specification read back from the session store,
+ * a metrics list arriving from another process, a node option being narrowed
+ * before a card is rendered. `packages/panel-schema` validates the same set
+ * structurally, through a schema built from {@link METRIC_IDS}; this predicate
+ * is for everywhere a schema is not at hand.
+ *
+ * Accepts `unknown` and narrows, so a caller need not prove it holds a string
+ * first.
+ */
+export function isMetricId(value: unknown): value is MetricId {
+  return typeof value === 'string' && METRIC_ID_VALUES.includes(value);
+}
+
+/**
+ * What a metric's number *is*, and therefore how it may be rendered and
+ * summed.
+ *
+ * - `milliseconds` — a duration, on the millisecond time base every event
+ *   uses (AAP 0.2.3). Comparable with a span's `duration` and eligible for the
+ *   duration-severity treatment the design tokens define (AAP 0.6.3).
+ * - `count` — a whole number of observed things. Never formatted as a
+ *   duration, never given a unit suffix.
+ * - `bytes` — a transferred size.
+ *
+ * Declared as a vocabulary rather than left implicit in each consumer because
+ * the mistake it prevents is silent: a count rendered through a duration
+ * formatter reads as a plausible `4 ms`, and nothing about the number itself
+ * says otherwise.
+ *
+ * Frozen: a read-only vocabulary.
+ */
+export const METRIC_UNITS = Object.freeze(['milliseconds', 'count', 'bytes'] as const);
+
+/** One member of the closed metric-unit vocabulary. */
+export type MetricUnit = (typeof METRIC_UNITS)[number];
+
+/**
+ * The unit each metric's value carries.
+ *
+ * The single place the monorepo says what kind of number a metric id names, so
+ * that the aggregate producing it, the card rendering it and the sentence
+ * quoting it cannot disagree. The annotation makes the table total by
+ * construction: adding a member to {@link METRIC_IDS} without an entry here is
+ * a compile error, and an entry here for an id the vocabulary does not declare
+ * is one too.
+ *
+ * Frozen: a read-only lookup table.
+ */
+export const METRIC_ID_UNITS: Readonly<Record<MetricId, MetricUnit>> = Object.freeze({
+  total_duration: 'milliseconds',
+  frontend_duration: 'milliseconds',
+  backend_duration: 'milliseconds',
+  database_duration: 'milliseconds',
+  render_count: 'count',
+  unchanged_render_count: 'count',
+  render_trigger_unknown_count: 'count',
+  request_count: 'count',
+  query_count: 'count',
+  transferred_bytes: 'bytes',
+  blocking_time: 'milliseconds',
+  duplicate_request_count: 'count',
+  long_task_count: 'count',
+  error_count: 'count',
+});
+
+/**
+ * The unit `metricId`'s value carries.
+ *
+ * The accessor consumers use instead of reaching into
+ * {@link METRIC_ID_UNITS}, so the table's shape stays an implementation detail
+ * of this module.
+ *
+ * Total: the table is exhaustive over the closed metric-id union, so the
+ * lookup always succeeds and no fallback or non-null assertion is needed under
+ * `noUncheckedIndexedAccess`. A caller holding an unvalidated string narrows it
+ * with {@link isMetricId} first.
+ *
+ * @param metricId - The metric whose unit is wanted.
+ */
+export function metricUnitFor(metricId: MetricId): MetricUnit {
+  return METRIC_ID_UNITS[metricId];
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * Semantic groups
+ *
+ * The three groups partition {@link METRIC_IDS} by unit: every id belongs to
+ * exactly one, and each group keeps the canonical order of the whole
+ * vocabulary.
+ *
+ * Each group is declared twice on purpose — once as a type derived with
+ * `Extract` from {@link MetricId}, once as the frozen list of its members
+ * annotated with that type — and neither half is a restatement of the
+ * vocabulary. The type cannot admit an id the vocabulary does not declare
+ * (`Extract` keeps only what is already a `MetricId`), and the annotated list
+ * cannot hold a misspelling, because a string outside the derived union is not
+ * assignable to it. A consumer that wants only durations therefore gets a type
+ * it can narrow with *and* a list it can iterate, both provably drawn from the
+ * one vocabulary above. The colocated suite asserts the third property the
+ * compiler cannot see: that the three groups together cover the vocabulary
+ * exactly once.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The metric ids whose value is a duration in milliseconds. */
+export type DurationMetricId = Extract<
+  MetricId,
+  | 'total_duration'
+  | 'frontend_duration'
+  | 'backend_duration'
+  | 'database_duration'
+  | 'blocking_time'
+>;
+
+/**
+ * The duration metrics, in canonical order.
+ *
+ * The per-tier split (`frontend`, `backend`, `database`) sums to less than
+ * `total_duration` whenever an interaction spent time in none of the three —
+ * waiting, or in work no signal covered — so a consumer presenting them as a
+ * breakdown accounts for the remainder rather than assuming it is zero.
+ *
+ * Frozen.
+ */
+export const DURATION_METRIC_IDS: readonly DurationMetricId[] = Object.freeze([
+  'total_duration',
+  'frontend_duration',
+  'backend_duration',
+  'database_duration',
+  'blocking_time',
+] as const);
+
+/**
+ * The metric ids whose value is a count of observed things.
+ *
+ * `packages/model-provider/src/deterministic/templates.ts` carries the noun
+ * each of these reads with in a sentence, and restates this member list
+ * locally: that package may import `@debuggen/shared` and nothing else of the
+ * monorepo (AAP 0.2.2 edge list, AAP 0.5.3 — the provider boundary stays free
+ * of telemetry, plan and panel types, and `eslint.config.js` enforces it), so
+ * it cannot derive the list from here. This group is the authority the
+ * restatement is checked against.
+ */
+export type CountMetricId = Extract<
+  MetricId,
+  | 'render_count'
+  | 'unchanged_render_count'
+  | 'render_trigger_unknown_count'
+  | 'request_count'
+  | 'query_count'
+  | 'duplicate_request_count'
+  | 'long_task_count'
+  | 'error_count'
+>;
+
+/**
+ * The counting metrics, in canonical order.
+ *
+ * Frozen.
+ */
+export const COUNT_METRIC_IDS: readonly CountMetricId[] = Object.freeze([
+  'render_count',
+  'unchanged_render_count',
+  'render_trigger_unknown_count',
+  'request_count',
+  'query_count',
+  'duplicate_request_count',
+  'long_task_count',
+  'error_count',
+] as const);
+
+/**
+ * The metric ids whose value is a transferred size in bytes.
+ *
+ * One member today. It is declared as a group rather than as a lone constant
+ * for the reason the one-member kind groups in `./kinds.ts` are: it is the
+ * member list that must not be duplicated, not its length — and a consumer
+ * formatting sizes asks for the group, so a second size metric needs no change
+ * anywhere but here.
+ */
+export type ByteMetricId = Extract<MetricId, 'transferred_bytes'>;
+
+/**
+ * The size metrics, in canonical order.
+ *
+ * Frozen.
+ */
+export const BYTE_METRIC_IDS: readonly ByteMetricId[] = Object.freeze([
+  'transferred_bytes',
+] as const);

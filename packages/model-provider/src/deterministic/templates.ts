@@ -705,14 +705,49 @@ export const EVIDENCE_PATTERN_FALLBACK_LABEL = 'a repeated pattern in the captur
  * countable nouns
  * ---------------------------------------------------------------------------------------------- */
 
-/** The computed metric ids of AAP §0.2.3 that count things rather than measure them. */
+/**
+ * The computed metric ids of AAP §0.2.3 that count things rather than measure
+ * them, in the order that plan fixes.
+ *
+ * **A deliberate restatement of a vocabulary another package owns**, like the
+ * action-type and tier keys above it. The single definition is `METRIC_IDS` in
+ * `packages/telemetry/src/schema/attributes.ts`, whose `COUNT_METRIC_IDS`
+ * group is exactly these eight ids in exactly this order, and that module's
+ * documentation names this file as the consumer restating them. Deriving the
+ * union from there is not available: AAP §0.2.2's edge list gives this package
+ * one `@debuggen` dependency, `@debuggen/shared`, and AAP §0.5.3 is the reason
+ * — the provider boundary stays free of telemetry, plan and panel types so
+ * that nothing can be sent to a model implicitly. `eslint.config.js` enforces
+ * it per workspace, so an import of `@debuggen/telemetry` here, even a
+ * type-only one in a test, fails `pnpm lint`.
+ *
+ * What the restatement is allowed to cost is bounded in three ways, and a
+ * maintainer changing the canonical group should know all three:
+ *
+ * 1. **Mirror a change here, in canonical order.** The telemetry group is the
+ *    authority; this list follows it, and
+ *    `packages/telemetry/src/schema/attributes.test.ts` enforces that by
+ *    reading *this declaration and the table below out of this file* and
+ *    comparing them with `COUNT_METRIC_IDS`. A divergence fails that suite; so
+ *    does renaming this type or moving this file, which is deliberate — the
+ *    check must break loudly rather than quietly stop checking.
+ * 2. **An unmirrored addition degrades, it does not break.**
+ *    {@link metricCountNoun} takes a plain `string` and falls back to
+ *    {@link FALLBACK_COUNT_NOUN}, so a metric added there and not here reads
+ *    as `‹n› recorded items` — plain, grammatical, and never `undefined`.
+ * 3. **A half-mirrored change is a compile error.**
+ *    {@link METRIC_COUNT_NOUNS} is keyed by this union and must be total, so a
+ *    member removed here leaves its noun behind as an excess property and a
+ *    member added here without one is a missing key. The union and its table
+ *    can drift from the authority; they cannot drift from each other.
+ */
 export type CountMetricId =
   | 'render_count'
   | 'unchanged_render_count'
   | 'render_trigger_unknown_count'
   | 'request_count'
-  | 'duplicate_request_count'
   | 'query_count'
+  | 'duplicate_request_count'
   | 'long_task_count'
   | 'error_count';
 
@@ -723,6 +758,10 @@ export type CountMetricId =
  * the capture reported — and takes the wording from here through
  * {@link metricCountNoun}, so the prose stays in this module and the selection
  * stays in that one.
+ *
+ * Keyed by {@link CountMetricId} and therefore total — every member has a noun
+ * — and written in that union's canonical order, so the two read as one list
+ * and a mirrored change to either is a one-line diff in both.
  *
  * `unchanged_render_count` is worded to AAP §0.2.3's precise meaning: props
  * shallow-equal, own hook state unchanged **and** no consumed context value
@@ -741,11 +780,11 @@ export const METRIC_COUNT_NOUNS: Readonly<Record<CountMetricId, NounForms>> = Ob
     plural: 'renders with an undetermined trigger',
   }),
   request_count: Object.freeze({ singular: 'request', plural: 'requests' }),
+  query_count: Object.freeze({ singular: 'database query', plural: 'database queries' }),
   duplicate_request_count: Object.freeze({
     singular: 'duplicate request',
     plural: 'duplicate requests',
   }),
-  query_count: Object.freeze({ singular: 'database query', plural: 'database queries' }),
   long_task_count: Object.freeze({ singular: 'long task', plural: 'long tasks' }),
   error_count: Object.freeze({ singular: 'error', plural: 'errors' }),
 });

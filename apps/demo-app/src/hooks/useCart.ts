@@ -3,11 +3,13 @@
 /**
  * Lumen Supply - the cart, as the storefront's client components read it.
  *
- * One cart belongs to one browser, and `<CartProvider>` is what holds it: the root layout mounts
- * that provider around the whole application, it reads the cart when the storefront starts, and it
- * owns every change made to the cart afterwards. This module is the one way the rest of the
- * storefront reaches it, so the header badge, the cart drawer, the cart page and the checkout
- * summary all read the same lines, the same counts and the same subtotal at the same moment.
+ * One cart belongs to one browser, and the server is what holds it: the root layout mounts
+ * `<CartProvider>` around the whole application, that provider reads the cart when the storefront
+ * starts, and it carries every later change to the server and publishes the cart the server
+ * answered with. This module is the one way the rest of the storefront reaches that published cart,
+ * so the header badge, the cart drawer, the cart page and the checkout summary all read the same
+ * lines, the same counts and the same subtotal at the same moment - and checkout, which prices the
+ * order from the cart the server holds, reads the cart a buyer was last shown.
  *
  * Nothing about the cart is computed or asked for here. The totals are derived by the provider from
  * the lines the server returned, and the requests that read and change the cart belong to
@@ -35,8 +37,16 @@ export type { CartContextValue } from '@/providers/CartProvider';
  * The operations that change the cart come back with it - `addLine`, `setLineQuantity`,
  * `removeLine`, `emptyCart` and `refreshCart` - so a quantity stepper, an add-to-cart button and
  * the drawer's remove control all write through the provider rather than keeping a cart of their
- * own. The value is published again after each of them, and every surface reading it prints the
- * cart the provider now holds.
+ * own. Each of the four mutations is a request to the server: every one of them returns a promise,
+ * the provider republishes the cart the server answered with - totals and prices included - and
+ * `syncStatus` says `'saving'` while the request is in flight, `'idle'` once the returned cart is
+ * published and `'error'` with wording on `cartError` when it was refused, the previously published
+ * cart staying in place so a buyer keeps seeing what they had. A refused change also rejects the
+ * promise of `setLineQuantity`, `removeLine` and `emptyCart`, so the control that asked for it -
+ * a quantity stepper, a remove button - can report the refusal beside the line it concerns instead
+ * of confirming a change that did not happen; `addLine` reports a refusal on `cartError` alone,
+ * which is where its own callers announce it from. Nothing about the cart is changed in the browser
+ * alone, so what a surface prints is what checkout will charge for.
  *
  * Throws when called from a component that is not inside `<CartProvider>`, which `app/layout.tsx`
  * mounts around the whole application. That is a loud failure on purpose: an empty stand-in cart

@@ -92,12 +92,19 @@ function blank(max: number, message: string): z.ZodType<string | null> {
  * The bounds are what a shipping label holds rather than what a database column
  * allows: a line, a city or a region longer than the label can print is a
  * mistake worth catching at the form instead of at the carrier. The postal code
- * is deliberately permissive — letters, digits, spaces and hyphens cover the
- * five-digit and nine-digit domestic forms as well as the alphanumeric ones a
- * neighbouring country uses — because this storefront quotes freight on the
- * value rather than verifying an address with it. The country is the only field
- * with a default: every warehouse behind this catalog ships domestically, so a
- * form with no country control still submits a complete address.
+ * is held to the one shape this storefront rates a destination in — three to
+ * twelve characters in alphanumeric groups joined by single spaces or hyphens,
+ * which covers the five-digit and nine-digit domestic forms as well as the
+ * alphanumeric ones a neighbouring country writes — because the destination an
+ * order carries is the destination its freight is quoted for: a value this
+ * schema accepted and the shipping-quote surface refused would be a body the
+ * storefront took and then could not act on. The rule is written out here
+ * rather than imported from the shipping-quote parameter that states it too,
+ * because the modules of this folder deliberately do not depend on each other;
+ * each surface carries its own copy of a rule both are held to.
+ * The country is the only field with a default: every warehouse behind this
+ * catalog ships domestically, so a form with no country control still submits a
+ * complete address.
  *
  * The annotation is the second half of the conformance check {@link Mirror}
  * begins: `z.ZodType<ShippingAddress>` demands that what this schema parses to
@@ -127,10 +134,10 @@ export const shippingAddressSchema: z.ZodType<ShippingAddress> = z.object({
     .string()
     .trim()
     .min(3, 'A postal code is required.')
-    .max(16, 'Keep the postal code to 16 characters.')
+    .max(12, 'Keep the postal code to 12 characters.')
     .regex(
-      /^[A-Za-z0-9][A-Za-z0-9 -]*$/,
-      'A postal code holds letters, digits, spaces and hyphens.',
+      /^[A-Za-z0-9]+(?:[ -][A-Za-z0-9]+)*$/,
+      'A postal code holds letters and digits in groups separated by single spaces or hyphens.',
     ),
 
   /**

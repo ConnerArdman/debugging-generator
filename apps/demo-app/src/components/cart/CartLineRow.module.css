@@ -16,14 +16,13 @@
  *     focus ring; the badge and the price own their colour and size. `.controls`, `.total` and
  *     `.remove` therefore carry placement only - a rule here that repainted a control would
  *     silently fork its appearance from every other place it is used.
- *   - No motion. `CartProvider` republishes its value at `ShippingEtaProvider`'s 250 ms cadence,
- *     so this row re-renders about four times a second while the cart is open (AAP 0.8.2's second
- *     seeded defect propagates through exactly this path, and is meant to). A transition on any
- *     property that changes with state would restart on every one of those renders and animate
- *     continuously, so this file declares no `transition` and no `animation` at all - which is
- *     also why it needs no `@media (prefers-reduced-motion: reduce)` block of its own. Motion in
- *     this workspace lives in the modules that introduce it, each with its own reduced-motion
- *     rule (`../ui/Skeleton.module.css` and the `ui` group's hover transitions).
+ *   - No motion. The states this row paints - the dimming while one of its mutations is in
+ *     flight, and the held controls that go with it - are meant to read as instantaneous, and a
+ *     transition on a property that changes with state restarts on the next change rather than
+ *     settling. So this file declares no `transition` and no `animation` at all - which is also
+ *     why it needs no `@media (prefers-reduced-motion: reduce)` block of its own. Motion in this
+ *     workspace lives in the modules that introduce it, each with its own reduced-motion rule
+ *     (`../ui/Skeleton.module.css` and the `ui` group's hover transitions).
  *
  * TOKENS
  *

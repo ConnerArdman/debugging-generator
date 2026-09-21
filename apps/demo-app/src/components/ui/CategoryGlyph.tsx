@@ -55,7 +55,7 @@
  * never indexed: a computed key is typed `string | undefined` under this repository's
  * `noUncheckedIndexedAccess` and would hide a typo until the glyph rendered blank in a browser,
  * whereas an attribute is constrained by the types below, cannot apply without the base rule, and
- * is legible in the elements tree - which is what this application is here to be inspected with.
+ * is legible in the elements tree beside the class it qualifies.
  *
  * DECORATIVE BY CONTRACT
  * `aria-hidden="true"`, and no `role`, `aria-label`, `title` or children. The category name is
@@ -65,13 +65,10 @@
  * the mark entirely, and safe for two thirds of the categories to have no mark at all.
  *
  * RENDER BEHAVIOUR
- * A plain function component: no `memo`, no `useMemo`, no `useCallback`, no state, no effects, no
- * `"use client"` directive - so a server component and a client component render it equally. It
- * re-renders whenever its parent does, on purpose: the catalog's render behaviour is the subject
- * this application exists to exhibit, and a memoized chip would smooth over exactly what is meant
- * to be observed. The output depends only on the props, with nothing read from `window`,
- * `Date.now()` or `Math.random()` during render, so the server's markup and the browser's first
- * markup always agree.
+ * A plain function component: no state, no effects, no `"use client"` directive - so a server
+ * component and a client component render it equally. The output depends only on the props, with
+ * nothing read from `window`, `Date.now()` or `Math.random()` during render, so the server's
+ * markup and the browser's first markup always agree.
  *
  * NAMING: `scripts/check-no-hardcoding.mjs` harvests this application's declared names into
  * `scripts/no-hardcoding.policy.json`, and no file of the debugging product may then contain one

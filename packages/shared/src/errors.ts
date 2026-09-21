@@ -20,10 +20,15 @@
  *   plus an optional developer-facing hint and diagnostic details — across a
  *   process boundary.
  *
- * What deliberately does *not* live here is a validator. The wire schema for
- * the payload shape is owned by `@debuggen/protocol`, so nothing below
- * `protocol` acquires a dependency on a validation library merely by throwing
- * an error, and the browser-safe entry stays as small as it is.
+ * What deliberately does *not* live here is a schema validator. The wire
+ * schema for the payload shape is owned by `@debuggen/protocol`, so nothing
+ * below `protocol` acquires a dependency on a validation library merely by
+ * throwing an error, and the browser-safe entry stays as small as it is. The
+ * structural checks {@link DebuggenError.is} and {@link DebuggenError.from}
+ * perform are hand-written here for that reason — an own-brand test, a `Set`
+ * membership test against the code vocabulary, and one comparison per member
+ * the class declares — and they are what stops a value that merely *claims* to
+ * be an error from being typed as one on the way to that schema.
  */
 
 /**
@@ -212,12 +217,146 @@ export type DebuggenErrorCode = (typeof DEBUGGEN_ERROR_CODES)[number];
 /**
  * The own-property name that marks a value as a {@link DebuggenError}.
  *
- * Declared once, here, and read by {@link DebuggenError.is}. The
- * `satisfies keyof DebuggenError` clause ties the string to the class member of
- * the same name: renaming one without the other is a compile error rather than
- * a type guard that quietly stops matching anything.
+ * Declared once, here, and read only by {@link hasOwnDebuggenErrorBrand} — the
+ * own-property test {@link DebuggenError.is} asks — and
+ * {@link claimsDebuggenErrorBrand}, the looser test {@link DebuggenError.from}
+ * asks before it rebuilds. The `satisfies keyof DebuggenError` clause ties the
+ * string to the class member of the same name: renaming one without the other
+ * is a compile error rather than a type guard that quietly stops matching
+ * anything.
  */
 const DEBUGGEN_ERROR_BRAND = '__isDebuggenError__' satisfies keyof DebuggenError;
+
+/**
+ * The value of {@link DebuggenError.name}, which the class declares as that
+ * exact literal rather than as a `string`.
+ *
+ * Declared here and *used* by the class field below, so the guard's condition
+ * and the value every instance carries are one constant and cannot drift: the
+ * name is part of the structure {@link DebuggenError.is} narrows to, so a value
+ * naming itself something else is not this error, and one naming itself nothing
+ * would be narrowed to a type whose `name` is a string while its runtime `name`
+ * is `undefined`.
+ */
+const DEBUGGEN_ERROR_NAME = 'DebuggenError';
+
+/**
+ * The message {@link DebuggenError.from} applies when the value it was handed
+ * carries none it can use.
+ *
+ * One sentinel, read from both places that need one — the unclassifiable-value
+ * branch and the normalisation branch — so a user interface only ever has one
+ * "we could not say what failed" string to recognise, and a grep for it finds
+ * every producer.
+ */
+const UNKNOWN_ERROR_MESSAGE = 'Unknown error';
+
+/**
+ * The code vocabulary as a membership set, built once when this module loads.
+ *
+ * {@link DebuggenError.is} runs in every `catch` block in the product, so the
+ * code condition has to be a constant-time lookup rather than a linear scan of
+ * the tuple on every caught value. Declared `ReadonlySet<string>` rather than
+ * `ReadonlySet<DebuggenErrorCode>` so an `unknown` can be tested against it
+ * without a cast, and kept module-private so
+ * {@link DEBUGGEN_ERROR_CODES} remains the single published source of truth.
+ */
+const DEBUGGEN_ERROR_CODE_SET: ReadonlySet<string> = new Set<string>(DEBUGGEN_ERROR_CODES);
+
+/**
+ * Whether `candidate` is one of the codes in {@link DEBUGGEN_ERROR_CODES}.
+ *
+ * This is what keeps an invented code out of a value typed
+ * {@link DebuggenErrorCode}. `@debuggen/protocol` enumerates the same tuple in
+ * its `error` and `instrumentation.failed` payload schemas, so a code outside
+ * the set does not merely read oddly — it arrives at the receiving end as a
+ * frame that fails to parse, on the failure path, where the original error is
+ * then lost.
+ *
+ * @param candidate Any value, typically read off an object of unknown shape.
+ * @returns `true` when `candidate` is a string in the closed vocabulary.
+ */
+function isDebuggenErrorCode(candidate: unknown): candidate is DebuggenErrorCode {
+  return typeof candidate === 'string' && DEBUGGEN_ERROR_CODE_SET.has(candidate);
+}
+
+/**
+ * Whether `value` is a non-null object that *claims* the brand, wherever on its
+ * prototype chain the claim sits.
+ *
+ * This is the question {@link DebuggenError.from} asks, and only that one: a
+ * value claiming to be a `DebuggenError` and failing the rest of the contract
+ * is normalised into a real instance rather than wrapped as an opaque cause,
+ * because its code, message and hint are worth salvaging. Reaching an
+ * inherited claim is deliberate here — a value assembled behind a prototype is
+ * still evidence of where it came from, and rebuilding it loses nothing.
+ *
+ * Exactly `true`, never merely truthy — a brand of `"true"` or `1` is what a
+ * mangled revival or a hand-rolled imitation looks like, and treating one as a
+ * claim would let `from` copy an arbitrary object's `code` onto a real error.
+ *
+ * Narrowed to an index-signature record rather than to the class, on purpose:
+ * the caller then reads every further property as `unknown` and has to narrow
+ * it, which is what makes the remaining conditions honest.
+ *
+ * @param value Any value, typically one caught or received.
+ * @returns `true` when `value` is an object whose brand is `true`, own or
+ * inherited.
+ */
+function claimsDebuggenErrorBrand(value: unknown): value is Readonly<Record<string, unknown>> {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    DEBUGGEN_ERROR_BRAND in value &&
+    value[DEBUGGEN_ERROR_BRAND] === true
+  );
+}
+
+/**
+ * Whether `value` carries the brand as its **own** property, set to exactly
+ * `true`.
+ *
+ * The first condition of {@link DebuggenError.is}, and stricter than
+ * {@link claimsDebuggenErrorBrand} on purpose: the brand is declared as a class
+ * field, so every instance of every copy of this class installs it per
+ * instance, and a JSON revival, a structured clone and a hand-written literal
+ * all carry it as an own key too. Nothing this product produces puts it on a
+ * prototype, so requiring own-ness rejects no legitimate value while excluding
+ * a chain assembled around a branded prototype — and it makes the guard do what
+ * its documentation says, which is the difference between a contract and a
+ * description.
+ *
+ * A value that only inherits the claim is still normalised by
+ * {@link DebuggenError.from}; being refused the narrowing is not being
+ * discarded.
+ *
+ * @param value Any value, typically one caught or received.
+ * @returns `true` when `value` is an object with an own brand of `true`.
+ */
+function hasOwnDebuggenErrorBrand(value: unknown): value is Readonly<Record<string, unknown>> {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    Object.hasOwn(value, DEBUGGEN_ERROR_BRAND) &&
+    (value as Readonly<Record<string, unknown>>)[DEBUGGEN_ERROR_BRAND] === true
+  );
+}
+
+/**
+ * Whether `value` is usable as {@link DebuggenErrorOptions.details}: a non-null
+ * object that is not an array.
+ *
+ * Used only while normalising a branded value, whose `details` arrived as
+ * `unknown`. An array is excluded because `details` is a keyed bag of
+ * diagnostic context: an array reaching a log or a user interface through it
+ * would render as `{ "0": … }`, which names nothing.
+ *
+ * @param value Any value, typically read off an object of unknown shape.
+ * @returns `true` when `value` can be attached as diagnostic details.
+ */
+function isDiagnosticDetails(value: unknown): value is Readonly<Record<string, unknown>> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
 
 /**
  * Optional context for a {@link DebuggenError}.
@@ -299,23 +438,68 @@ export interface DebuggenErrorOptions {
  *
  * Instances therefore carry an own, enumerable data property,
  * `__isDebuggenError__: true`, and {@link DebuggenError.is} tests for that
- * property instead of for a prototype. A string-keyed boolean is the form that
+ * property rather than for a prototype — along with the rest of the contract,
+ * which the next section sets out. A string-keyed boolean is the form that
  * travels: it survives a JSON round-trip of the error's own properties, and it
  * survives `postMessage` or `structuredClone` of any plain object carrying it —
  * a payload with an error field, for instance. A symbol key would survive
  * neither, and a prototype member would survive no clone at all, which is why
  * the brand is a plain `true` on the instance.
  *
- * Two limits of that are worth stating rather than discovering. `is` is a
- * structural test, so a plain object carrying the brand passes it — deliberate,
- * because the foreign-bundle and revived-from-JSON cases are exactly values
- * whose prototype is not this class, and the reason {@link DebuggenError.from}
- * returns such a value unchanged instead of pretending to rebuild it. And
- * cloning an `Error` *instance* is lossy in every runtime: the structured-clone
- * algorithm keeps only `name`, `message`, `stack` and `cause`, so the code and
- * the brand do not survive it. An error consequently crosses a process boundary
- * as a {@link DebuggenError.toPayload} object — which the protocol validates —
- * never as a cloned instance.
+ * ## What the brand alone does *not* establish
+ *
+ * A structural test is the right kind of test here, but "carries the brand" is
+ * not the whole of the structure. {@link DebuggenError.is} narrows to this
+ * class, so whatever it accepts is thereafter entitled to every member the
+ * class declares, and it consequently verifies each of them: an **own**
+ * `__isDebuggenError__` of exactly `true`, a `name` of exactly
+ * `"DebuggenError"`, a `code` drawn from {@link DEBUGGEN_ERROR_CODES}, a string
+ * `message`, a `stack`, `hint` and `details` that are either absent or of their
+ * declared type, and a callable `toPayload`. Each condition pays for itself on
+ * the failure path, which is the only path this class is ever on:
+ *
+ * - No callable `toPayload` and `DebuggenError.from(caught).toPayload()` throws
+ *   a `TypeError` from inside the error reporter — the original failure is
+ *   replaced by a crash in the code that was meant to report it.
+ * - A `code` outside the closed vocabulary is still typed
+ *   {@link DebuggenErrorCode} once narrowed, and reaches the protocol's
+ *   closed-set schema as a frame the receiving end cannot parse.
+ * - A missing or non-string `message` reads as a blank line in both user
+ *   interfaces, or throws where the message is measured or matched.
+ * - A non-string `hint` is worse than a missing one: `toPayload` copies a
+ *   defined hint through verbatim, so `hint: 42` leaves here as a payload that
+ *   fails the protocol's `{ code, message, hint? }` schema — a refused frame
+ *   produced by a value the guard had already called an error.
+ * - A `name` that is absent or something else, a non-string `stack`, or
+ *   `details` that are not a keyed object are each a member typed one way and
+ *   valued another, read by a log line or a user interface that has no reason
+ *   to defend itself against its own types.
+ *
+ * What is deliberately *not* required is a non-empty message:
+ * `new DebuggenError('INTERNAL', '')` is legal, so demanding content would
+ * reject a genuine instance — and the guard has to be sound in both directions.
+ * For the same reason an absent `hint`, `stack` or `details` passes: those
+ * members are optional, so they are checked only when they are present.
+ *
+ * A real error built by another bundle's copy of this class satisfies every
+ * condition on its own merits: the brand, `code` and `name` are own properties,
+ * `message` and `stack` come from the `Error` base and `toPayload` from its
+ * prototype. No `instanceof` appears anywhere, so the cross-bundle capability
+ * the brand exists for is exactly as capable as before. What the conditions do
+ * exclude is the *carcass* of an error — a JSON revival, which keeps the brand,
+ * the name, the code and the hint but loses the non-enumerable `message`; a
+ * structured clone of a branded plain object, which cannot carry a function; a
+ * hand-built object with an invented code, a numeric hint or no name at all.
+ * Those are not narrowed by `is`; {@link DebuggenError.from} rebuilds them into
+ * a real instance instead, salvaging what is usable, dropping what is not, and
+ * keeping the original reachable as `cause`.
+ *
+ * One further limit is worth stating rather than discovering: cloning an
+ * `Error` *instance* is lossy in every runtime — the structured-clone algorithm
+ * keeps only `name`, `message`, `stack` and `cause`, so the code and the brand
+ * do not survive it. An error consequently crosses a process boundary as a
+ * {@link DebuggenError.toPayload} object — which the protocol validates — never
+ * as a cloned instance.
  *
  * @example
  * ```ts
@@ -342,15 +526,18 @@ export class DebuggenError extends Error {
    * The `override` modifier is required: `name` is declared on the base, and
    * the repository compiles with `noImplicitOverride`.
    */
-  override readonly name = 'DebuggenError';
+  override readonly name = DEBUGGEN_ERROR_NAME;
 
   /**
    * The cross-bundle brand described in the class documentation above.
    *
    * An own, enumerable, JSON-safe data property, read only by
-   * {@link DebuggenError.is}. Never test it by hand — the guard is the
-   * supported way to ask, and it is the one place the property name appears
-   * besides this declaration.
+   * {@link hasOwnDebuggenErrorBrand} and {@link claimsDebuggenErrorBrand},
+   * which is how {@link DebuggenError.is} and {@link DebuggenError.from}
+   * respectively consult it. Never test it by hand: the
+   * brand on its own establishes only where a value came from, not that it is
+   * usable, so `is` is the supported way to ask whether something is an error
+   * and `from` is the supported way to turn it into one.
    *
    * `readonly` with a literal initializer, so its declared type is the literal
    * `true` rather than `boolean`: a consumer checking the brand structurally
@@ -405,25 +592,72 @@ export class DebuggenError extends Error {
   }
 
   /**
-   * Whether `value` is a `DebuggenError`, including one that crossed a bundle
-   * boundary or was serialised on the way.
+   * Whether `value` is a `DebuggenError`, including one built by another
+   * bundle's copy of this class.
    *
-   * Tests the own {@link DebuggenError.__isDebuggenError__} brand and
-   * deliberately does **not** use `instanceof`, for the reasons set out in the
-   * class documentation. Use this in every `catch` block and on every value
-   * received from another process; `instanceof` there produces false negatives
-   * that turn a precise failure into an `INTERNAL` one.
+   * Verifies **every member this class declares**, because the predicate
+   * narrows to the whole class and whatever it accepts is thereafter entitled
+   * to all of it:
+   *
+   * - an own {@link DebuggenError.__isDebuggenError__} of exactly `true`;
+   * - `name` exactly `"DebuggenError"`, which is the literal type the class
+   *   declares rather than a plain `string`;
+   * - a {@link DebuggenError.code} drawn from {@link DEBUGGEN_ERROR_CODES};
+   * - a string {@link DebuggenError.message} — empty is allowed, since an
+   *   instance may legally have one;
+   * - `stack`, `hint` and `details` either absent or of their declared type: a
+   *   string, a string, and a non-array object. An optional member is checked
+   *   only when it is there, so nothing legitimate is rejected for travelling
+   *   light;
+   * - a callable {@link DebuggenError.toPayload}.
+   *
+   * The class documentation above records what each condition costs when it is
+   * missing. The one it does *not* do is call `toPayload` to inspect what it
+   * returns: this guard runs on every caught value, and invoking a foreign
+   * function from inside a type check — on the failure path, where the original
+   * error is still unreported — could throw, mutate or block. Constraining the
+   * data the class's own `toPayload` reads is what keeps its output honest, and
+   * it is why a non-string `hint` is refused here rather than discovered by the
+   * protocol's schema at the far end of the wire.
+   *
+   * Deliberately **no** `instanceof`, for the reasons set out in the class
+   * documentation: use this in every `catch` block and on every value received
+   * from another process, where `instanceof` produces false negatives that turn
+   * a precise failure into an `INTERNAL` one. A foreign-bundle instance passes
+   * on its own merits — the brand, `code` and `name` are own properties,
+   * `message` and `stack` come from the `Error` base, and `toPayload` is
+   * reachable through its prototype, which a property read follows.
+   *
+   * A branded value that fails any condition is not narrowed — it is not safe
+   * for a caller to read `.code` off it, print its `name` or call
+   * `.toPayload()` — but it is not discarded either:
+   * {@link DebuggenError.from} turns it into a real instance.
+   *
+   * Cheap on purpose, because this runs on every caught value: one own-property
+   * test, one `Set` membership test, one string comparison and five `typeof`
+   * or `undefined` comparisons, allocating nothing.
    *
    * @param value Any value, typically one caught or received.
-   * @returns `true` when `value` is a non-null object whose
-   * `__isDebuggenError__` property is exactly `true`.
+   * @returns `true` when `value` satisfies every condition above.
    */
   static is(value: unknown): value is DebuggenError {
+    if (!hasOwnDebuggenErrorBrand(value)) {
+      return false;
+    }
+
+    // Read as `unknown` and narrowed one property at a time: a branded value
+    // reaching this point may have come from a JSON revival, a clone or another
+    // bundle, so nothing about its shape is known yet.
+    const { stack, hint, details } = value;
+
     return (
-      typeof value === 'object' &&
-      value !== null &&
-      DEBUGGEN_ERROR_BRAND in value &&
-      value[DEBUGGEN_ERROR_BRAND] === true
+      value.name === DEBUGGEN_ERROR_NAME &&
+      isDebuggenErrorCode(value.code) &&
+      typeof value.message === 'string' &&
+      (stack === undefined || typeof stack === 'string') &&
+      (hint === undefined || typeof hint === 'string') &&
+      (details === undefined || isDiagnosticDetails(details)) &&
+      typeof value.toPayload === 'function'
     );
   }
 
@@ -435,10 +669,28 @@ export class DebuggenError extends Error {
    * rejected promise's arbitrary reason, and a boundary still has to report
    * something typed.
    *
-   * - Already a `DebuggenError` (by the brand, so including a foreign-bundle
-   *   one): returned unchanged, which makes the function idempotent and
-   *   preserves the specific code a deeper layer chose. `fallbackCode` never
-   *   overrides an existing code.
+   * - Already a `DebuggenError` by {@link DebuggenError.is} — so including a
+   *   foreign-bundle instance, which is not `instanceof` this class: returned
+   *   unchanged, by identity, which preserves the specific code a deeper layer
+   *   chose along with its stack and its cause. `fallbackCode` never overrides
+   *   an existing code.
+   * - Claiming the brand — own or inherited — and failing that contract: a JSON
+   *   revival that lost its non-enumerable `message`, a clone that could not
+   *   carry `toPayload`, an object with an invented code, a numeric `hint` or no
+   *   `name`: **normalised** into a real instance rather than passed through,
+   *   because passing it through is what makes a later `.toPayload()` throw from
+   *   inside the error reporter, lets a code outside
+   *   {@link DEBUGGEN_ERROR_CODES} reach the protocol's closed-set schema, and
+   *   lets a non-string hint reach it as a payload that fails to parse.
+   *   Everything usable is salvaged — the `code` when it is in the vocabulary
+   *   and `fallbackCode` when it is not, the `message` when it is a non-empty
+   *   string and `"Unknown error"` when it is absent or unusable, a `hint` when
+   *   it is a string, and `details` when they are a non-array object — while
+   *   anything of the wrong type is dropped rather than copied, so the rebuilt
+   *   error's own payload is valid by construction. The original value becomes
+   *   the `cause`, so nothing is lost and the shape that arrived is still there
+   *   to be logged. Applying `from` to the result
+   *   returns it unchanged, since the result is a real instance.
    * - A native `Error` (or a subclass): wrapped with `fallbackCode`, keeping its
    *   `message` — or its `name`, when the message is empty, since an error with
    *   no message at all reads as a blank line in a user interface — and setting
@@ -454,11 +706,50 @@ export class DebuggenError extends Error {
    * @param fallbackCode The code to apply when `value` does not already carry
    * one. Defaults to `INTERNAL`; pass the code of the operation that failed
    * whenever it is known, because `INTERNAL` tells a user interface nothing.
-   * @returns A `DebuggenError` — `value` itself when it already was one.
+   * @returns A `DebuggenError`: `value` itself when it already satisfied
+   * {@link DebuggenError.is}, and otherwise a new instance — rebuilt from what
+   * a branded value carried, or wrapped around anything else.
    */
   static from(value: unknown, fallbackCode: DebuggenErrorCode = 'INTERNAL'): DebuggenError {
     if (DebuggenError.is(value)) {
       return value;
+    }
+
+    if (claimsDebuggenErrorBrand(value)) {
+      // Branded, but not a `DebuggenError` by the contract above. Salvaging is
+      // strictly better than wrapping it as an opaque cause: whatever produced
+      // it chose a code and wrote a hint, and those are the two fields a user
+      // interface acts on. Every read is narrowed, because this shape came from
+      // a revival, a clone or a foreign bundle and only claims the brand.
+      const salvagedCode: unknown = value.code;
+      const salvagedMessage: unknown = value.message;
+      const salvagedHint: unknown = value.hint;
+      const salvagedDetails: unknown = value.details;
+
+      // Built as a mutable local and only then handed over as
+      // `DebuggenErrorOptions`: under `exactOptionalPropertyTypes` an absent
+      // hint has to be an absent *key*, never a key holding `undefined`, or the
+      // rebuilt error would answer `'hint' in error` with `true` and serialise
+      // a null hint onto the wire.
+      const options: {
+        hint?: string;
+        details?: Readonly<Record<string, unknown>>;
+        cause: unknown;
+      } = { cause: value };
+      if (typeof salvagedHint === 'string') {
+        options.hint = salvagedHint;
+      }
+      if (isDiagnosticDetails(salvagedDetails)) {
+        options.details = salvagedDetails;
+      }
+
+      return new DebuggenError(
+        isDebuggenErrorCode(salvagedCode) ? salvagedCode : fallbackCode,
+        typeof salvagedMessage === 'string' && salvagedMessage.length > 0
+          ? salvagedMessage
+          : UNKNOWN_ERROR_MESSAGE,
+        options,
+      );
     }
 
     if (value instanceof Error) {
@@ -466,7 +757,7 @@ export class DebuggenError extends Error {
       return new DebuggenError(fallbackCode, message, { cause: value });
     }
 
-    const message = typeof value === 'string' && value.length > 0 ? value : 'Unknown error';
+    const message = typeof value === 'string' && value.length > 0 ? value : UNKNOWN_ERROR_MESSAGE;
     const options: DebuggenErrorOptions = value === undefined ? {} : { cause: value };
     return new DebuggenError(fallbackCode, message, options);
   }

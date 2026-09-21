@@ -61,7 +61,7 @@
  * into `"name": null` and a schema would then reject.
  */
 
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, expectTypeOf, it, vi } from 'vitest';
 
 import {
   LOG_LEVELS,
@@ -76,6 +76,14 @@ import {
   type LogSink,
   type Logger,
 } from './logger.js';
+// `ConsoleLoggerOptions` comes from the package's public entry, which is the
+// specifier every caller writes: `createConsoleLogger`'s parameter type is what
+// the local service, both extensions and the page agent annotate their own
+// logger factories with, and they reach it through `@debuggen/shared`, whose
+// `.` export resolves to this barrel. Importing it here makes the declaration
+// and its re-export a tested contract; the suite at the end of this file is
+// where it is pinned.
+import type { ConsoleLoggerOptions } from './index.js';
 
 /*
  * ---------------------------------------------------------------------------
@@ -1458,5 +1466,93 @@ describe('noopLogger', () => {
     expect(ingest([1, 2], createConsoleLogger({ level: 'trace', sink: source.sink }))).toBe(2);
     expect(onlyRecord(source).message).toBe('ingesting batch');
     expect(onlyRecord(source).fields).toEqual({ count: 2 });
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The exported options type surface
+ *
+ * `ConsoleLoggerOptions` is the one type a caller of this module writes down:
+ * `apps/local-service/src/logging.ts` builds a pino-backed sink and passes it
+ * in, the VS Code extension host routes records into an `OutputChannel` the
+ * same way, and both annotate the object they assemble. Every runtime suite
+ * above exercises option *values* while never naming the type, so dropping its
+ * `export`, renaming a member or widening one would leave this file green —
+ * types are erased before Vitest runs it.
+ *
+ * These assertions are compile-time instead, checked by `tsc -b`
+ * (`pnpm typecheck`), because `packages/shared/tsconfig.json` includes the
+ * colocated tests in the program. The `keyof` pin is the load-bearing one: an
+ * assignability check alone accepts a type that grew a fifth member, while the
+ * exact key union does not — and a fifth option nobody reads is an option a
+ * caller can set and watch do nothing.
+ * ---------------------------------------------------------------------------
+ */
+
+describe('the exported options type surface', () => {
+  it('declares exactly the four documented members, each optional', () => {
+    expectTypeOf<keyof ConsoleLoggerOptions>().toEqualTypeOf<
+      'level' | 'name' | 'bindings' | 'sink'
+    >();
+    // Each member is read with `??` in the factory, so each must be omittable
+    // and each must admit `undefined` under `exactOptionalPropertyTypes`.
+    expectTypeOf<ConsoleLoggerOptions['level']>().toEqualTypeOf<LogLevelSetting | undefined>();
+    expectTypeOf<ConsoleLoggerOptions['name']>().toEqualTypeOf<string | undefined>();
+    expectTypeOf<ConsoleLoggerOptions['bindings']>().toEqualTypeOf<LogFields | undefined>();
+    expectTypeOf<ConsoleLoggerOptions['sink']>().toEqualTypeOf<LogSink | undefined>();
+    expectTypeOf<Required<ConsoleLoggerOptions>>().toEqualTypeOf<{
+      readonly level: LogLevelSetting;
+      readonly name: string;
+      readonly bindings: LogFields;
+      readonly sink: LogSink;
+    }>();
+  });
+
+  it('types createConsoleLogger as taking those options and returning a Logger', () => {
+    // The parameter is optional *and* admits an explicit `undefined`, which is
+    // what `options: ConsoleLoggerOptions = {}` compiles to: a caller may omit
+    // it, and a caller forwarding an optional value of its own may pass
+    // `undefined` and still get the documented defaults.
+    expectTypeOf(createConsoleLogger).parameters.toEqualTypeOf<
+      [(ConsoleLoggerOptions | undefined)?]
+    >();
+    expectTypeOf(createConsoleLogger).returns.toEqualTypeOf<Logger>();
+    expectTypeOf(noopLogger).toEqualTypeOf<Logger>();
+  });
+
+  it('accepts a fully populated options object annotated with the exported type', () => {
+    const source = recorder();
+    // The annotation is the assertion: an object assembled the way a caller
+    // assembles one has to satisfy the exported type, with every member in the
+    // shape the factory reads.
+    const options: ConsoleLoggerOptions = {
+      level: 'trace',
+      name: 'agent',
+      bindings: { tier: 'browser' },
+      sink: source.sink,
+    };
+
+    const log: Logger = createConsoleLogger(options);
+    log.trace('through an annotated options object', { captureId: 'cap_7' });
+
+    const record = onlyRecord(source);
+    expect(record.level).toBe('trace');
+    expect(record.name).toBe('agent');
+    expect(record.fields).toEqual({ tier: 'browser', captureId: 'cap_7' });
+  });
+
+  it('accepts a partial options object and the default of no argument at all', () => {
+    const source = recorder();
+    // Both ends of the optionality the type declares: one member set, and the
+    // parameter omitted entirely. The second is why the parameter carries a
+    // default — `createConsoleLogger()` is how library code takes the console
+    // logger without stating anything about it.
+    const partial: ConsoleLoggerOptions = { sink: source.sink };
+    const empty: ConsoleLoggerOptions = {};
+
+    expect(createConsoleLogger(partial).level).toBe('info');
+    expect(createConsoleLogger(empty).level).toBe('info');
+    expect(createConsoleLogger().level).toBe('info');
   });
 });

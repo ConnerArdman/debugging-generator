@@ -141,9 +141,11 @@ function freightQuoteNotice(code: StorefrontErrorCode, status: number): string {
  *
  * A quote belongs to the one destination it was asked for, so a change of
  * destination clears the services on screen before the next lookup rather than
- * leaving prices for the previous address beside the new one. An answer that
- * arrives after the field has moved on, or after the panel has gone, is
- * discarded instead of being written to state.
+ * leaving prices for the previous address beside the new one. The lookup for
+ * the address that was left behind is aborted at that moment rather than run to
+ * the end and then ignored, so a field corrected two or three times does not
+ * leave as many carrier lookups in flight, and no answer for a superseded
+ * destination can reach state - not even to report having been cut off.
  *
  * @param postalCode Where the order is going, or `null` when nobody has said.
  * @returns The quoted services, the in-flight flag and the failure wording.
@@ -158,12 +160,15 @@ export function useFreightQuote(postalCode: string | null): FreightQuoteState {
   const [quoteError, setQuoteError] = useState<string | null>(null);
 
   useEffect(() => {
-    // Set by the cleanup below, and read only to decide whether this lookup's
-    // answer still belongs on screen: a panel that has gone away, or has moved
-    // on to another destination, must not have its state written by an answer
-    // checkout is no longer waiting for. The request layer takes no
-    // cancellation signal, so the reply is let go rather than cut off.
-    let cancelled = false;
+    // This lookup's own controller, aborted by the cleanup below. A carrier
+    // lookup is one of the slower things checkout asks for, so a panel that has
+    // gone away, or has moved on to another destination, cuts its lookup off
+    // rather than leaving it to run to the end for an address nobody is
+    // quoting any more. `signal.aborted` is then what each handler consults
+    // before writing state - including on the rejection the abort itself
+    // produces, which is this hook's own doing and never wording for a
+    // customer.
+    const controller = new AbortController();
     const shouldQuote = destination.length >= MIN_DESTINATION_CODE_LENGTH;
 
     setQuote(null);
@@ -171,16 +176,16 @@ export function useFreightQuote(postalCode: string | null): FreightQuoteState {
     setIsQuoting(shouldQuote);
 
     if (shouldQuote) {
-      requestShippingQuote({ postalCode: destination })
+      requestShippingQuote({ postalCode: destination, signal: controller.signal })
         .then((result) => {
-          if (cancelled) {
+          if (controller.signal.aborted) {
             return;
           }
           setQuote(result);
           setIsQuoting(false);
         })
         .catch((cause: unknown) => {
-          if (cancelled) {
+          if (controller.signal.aborted) {
             return;
           }
           setQuoteError(
@@ -193,7 +198,7 @@ export function useFreightQuote(postalCode: string | null): FreightQuoteState {
     }
 
     return () => {
-      cancelled = true;
+      controller.abort();
     };
   }, [destination]);
 

@@ -224,20 +224,31 @@ export interface ContextChange {
 }
 
 /**
- * Which of the three dimensions could be compared at all.
+ * Which of the three dimensions was compared **completely**.
  *
- * A dimension is unevaluable when the information needed to compare it is not
- * on the fiber: there is no alternate (a mount), the props of one side are not
- * an object, the hook chains cannot be paired positionally, or React dropped
- * the alternate's context-dependency chain. The flags are what keep an
- * unobservable render out of `unchanged_render_count`.
+ * A flag is `true` only when equality across the whole dimension was
+ * established, because that is the claim {@link classifyRenderTrigger} turns
+ * into `unchanged`. Two things make a dimension unevaluable:
+ *
+ * - **The information is not on the fiber.** There is no alternate (a mount),
+ *   the props of one side are not an object, the hook chains cannot be paired
+ *   positionally, or React dropped the alternate's context-dependency chain.
+ * - **The scan overflowed `MAX_TRACKED_KEYS`.** The entries past the bound
+ *   were never read, so their equality is unknown and the dimension cannot
+ *   claim that nothing changed. Whatever the scanned part *did* observe is
+ *   still reported — a positive finding outranks an unknown — but an empty
+ *   truncated scan means "we could not check", never "nothing changed".
+ *
+ * Both cases are what keep an unobservable render out of
+ * `unchanged_render_count` and in `render_trigger_unknown_count` instead (AAP
+ * 0.2.3). {@link FiberDiff.truncated} is what tells the two apart.
  */
 export interface DimensionEvaluability {
-  /** Whether props could be compared against the alternate's props. */
+  /** Whether props were compared against the alternate's props in full. */
   props: boolean;
-  /** Whether the fiber's own hook state could be compared. */
+  /** Whether the fiber's own hook state was compared in full. */
   state: boolean;
-  /** Whether consumed context values could be compared. */
+  /** Whether consumed context values were compared in full. */
   context: boolean;
 }
 
@@ -260,9 +271,16 @@ export interface FiberDiff {
   hookChanges: HookChange[];
   /** Transitions of the context values the fiber consumes. */
   contextChanges: ContextChange[];
-  /** Which dimensions could be compared. */
+  /** Which dimensions were compared in full. */
   evaluable: DimensionEvaluability;
-  /** Whether any dimension had more entries than `MAX_TRACKED_KEYS` allows. */
+  /**
+   * Whether any dimension had more entries than `MAX_TRACKED_KEYS` allows.
+   *
+   * A truncated dimension also reports `evaluable: false` for itself, so this
+   * flag is what distinguishes "capped at the bound" from "the fiber did not
+   * carry the information" rather than being the thing that protects the
+   * classification.
+   */
   truncated: boolean;
 }
 
@@ -270,7 +288,11 @@ export interface FiberDiff {
 interface DimensionResult<TChange> {
   /** The changes found, bounded by `MAX_TRACKED_KEYS`. */
   changed: TChange[];
-  /** Whether the comparison could be made at all. */
+  /**
+   * Whether the dimension was compared in full, which is the only basis on
+   * which it may be read as "nothing changed". False for a scan that
+   * overflowed the bound, whatever the scanned part showed.
+   */
   evaluable: boolean;
   /** Whether entries past the bound were dropped. */
   truncated: boolean;
@@ -1056,11 +1078,18 @@ export function summarizeValue(value: unknown, key?: string): ValueSummary {
  * The three dimensions
  *
  * Each of the three exported comparisons answers two things: what changed, and
- * whether the comparison could be made at all. The second is as important as
- * the first — a dimension that could not be evaluated must never be reported
- * as "nothing changed", because that is what would put an unobservable render
- * into `unchanged_render_count` and let a panel claim a stable-input re-render
- * that was never observed.
+ * whether the comparison could be made **in full**. The second is as important
+ * as the first — a dimension that could not be evaluated must never be
+ * reported as "nothing changed", because that is what would put an
+ * unobservable render into `unchanged_render_count` and let a panel claim a
+ * stable-input re-render that was never observed.
+ *
+ * "In full" is the part that is easy to lose. A scan stops at
+ * `MAX_TRACKED_KEYS`, and the entries beyond the bound are never read: a
+ * 33-prop component whose only changed prop is the 33rd looks exactly like a
+ * component whose props are all equal, so a truncated scan that found nothing
+ * has established nothing. {@link scannedDimension} is where that rule lives,
+ * and it is applied by every dimension whose answer came from a bounded scan.
  * ---------------------------------------------------------------------------
  */
 
@@ -1069,9 +1098,39 @@ function unevaluableDimension<TChange>(): DimensionResult<TChange> {
   return { changed: [], evaluable: false, truncated: false };
 }
 
-/** A dimension that was compared and found nothing. A fresh object per call. */
+/**
+ * A dimension whose equality is proven without a scan — the two sides are the
+ * same object, or neither side has anything to compare. A fresh object per
+ * call.
+ */
 function stableDimension<TChange>(): DimensionResult<TChange> {
   return { changed: [], evaluable: true, truncated: false };
+}
+
+/**
+ * The result of a bounded scan, with the one rule that makes the bound honest:
+ * **equality may only be claimed over a complete scan.**
+ *
+ * A scan that overflowed `MAX_TRACKED_KEYS` left entries unread, so it cannot
+ * report the dimension as evaluated however equal the entries it did read
+ * were. What it *positively observed* is preserved and returned — those
+ * changes are real, and {@link classifyRenderTrigger} ranks a positive finding
+ * above an unknown — but an empty truncated scan resolves to `unknown` rather
+ * than to `unchanged`, which is what AAP 0.2.3 requires of
+ * `unchanged_render_count`.
+ *
+ * @param changed - The changes the scan positively observed, already bounded.
+ * @param evaluable - Whether the comparison was possible at all, before the
+ * bound is taken into account (a context dependency with no counterpart, for
+ * instance, has already made the dimension unevaluable).
+ * @param truncated - Whether either side's scan overflowed the bound.
+ */
+function scannedDimension<TChange>(
+  changed: TChange[],
+  evaluable: boolean,
+  truncated: boolean,
+): DimensionResult<TChange> {
+  return { changed, evaluable: evaluable && !truncated, truncated };
 }
 
 /**
@@ -1088,8 +1147,11 @@ function stableDimension<TChange>(): DimensionResult<TChange> {
  * - No `alternate` means a mount, and a mount has nothing to compare against:
  *   the dimension is unevaluable, never "unchanged".
  * - The key union is bounded by `MAX_TRACKED_KEYS`. Keys past the bound are
- *   dropped and `truncated` is set, so a consumer reads the list as the
- *   changed props that are *known* rather than as all of them.
+ *   dropped, `truncated` is set and the dimension reports itself unevaluable
+ *   (see {@link scannedDimension}): the changes listed are the ones that are
+ *   *known*, and the props that were never read cannot be claimed as equal.
+ *   The identical-object fast path above is unaffected — it proves equality
+ *   without reading a key, so it stays evaluable.
  * - A key whose getter throws is skipped and the dimension stays evaluable:
  *   one hostile prop must not blind the comparison of the other thirty-one.
  * - A props object that cannot be enumerated at all (a revoked `Proxy`) makes
@@ -1164,7 +1226,7 @@ export function diffProps(fiber: unknown): DimensionResult<PropChange> {
       to: summarizeValue(after.value, key),
     });
   }
-  return { changed, evaluable: true, truncated };
+  return scannedDimension(changed, true, truncated);
 }
 
 /** The hook kinds this module can tell apart. */
@@ -1308,6 +1370,12 @@ function hookLabel(kind: HookKind): string | undefined {
  * Only state-bearing hooks are compared; see {@link STATE_BEARING_HOOK_KINDS}
  * for why a memo cache and a ref box are not state.
  *
+ * Both chains are bounded by `MAX_TRACKED_KEYS`. A chain longer than the bound
+ * leaves its tail unread, so the dimension reports itself unevaluable
+ * ({@link scannedDimension}) while still listing the hooks whose values were
+ * observed to change: a component with thirty-three hooks whose only changed
+ * one is the thirty-third must classify as `unknown`, never as `unchanged`.
+ *
  * A class component reaches this function too, and its `memoizedState` is the
  * component's state object rather than a hook list. That is reported
  * unevaluable — "we could not check the fiber's *hook* state" is the honest
@@ -1376,7 +1444,7 @@ export function diffHookState(fiber: unknown): DimensionResult<HookChange> {
     const to = summarizeValue(after.value);
     changed.push(label === undefined ? { index, from, to } : { index, label, from, to });
   }
-  return { changed, evaluable: true, truncated: nextScan.overflow || previousScan.overflow };
+  return scannedDimension(changed, true, nextScan.overflow || previousScan.overflow);
 }
 
 /**
@@ -1445,7 +1513,11 @@ function contextLabel(dependency: Record<string, unknown>): string | undefined {
  *
  * A dependency with no counterpart leaves the dimension unevaluable while any
  * change found on the other dependencies is still reported: a positive finding
- * outranks an unknown in {@link classifyRenderTrigger}.
+ * outranks an unknown in {@link classifyRenderTrigger}. A chain longer than
+ * `MAX_TRACKED_KEYS` has the same effect for the same reason — the
+ * dependencies past the bound were never compared, so the dimension cannot
+ * report that no consumed context value changed
+ * ({@link scannedDimension}).
  *
  * @param fiber - A React fiber; every read is guarded.
  */
@@ -1498,7 +1570,7 @@ export function diffContexts(fiber: unknown): DimensionResult<ContextChange> {
     const to = summarizeValue(after.value);
     changed.push(label === undefined ? { index, from, to } : { index, label, from, to });
   }
-  return { changed, evaluable, truncated: nextScan.overflow || previousScan.overflow };
+  return scannedDimension(changed, evaluable, nextScan.overflow || previousScan.overflow);
 }
 
 /*
@@ -1536,6 +1608,15 @@ function asTrigger(candidate: RenderTrigger): RenderTrigger {
  *   says it means: props shallow-equal, own hook state unchanged and no
  *   consumed context value changed. Anything less is `unknown`, counted
  *   separately as `render_trigger_unknown_count`.
+ *
+ * `input.evaluable` is therefore a claim of **complete** comparison, not of
+ * "the comparison was attempted". The three dimensions of this module make
+ * that claim only for a scan that ran to the end (see
+ * {@link scannedDimension}), so a change hidden past `MAX_TRACKED_KEYS`
+ * arrives here as an unevaluable dimension with empty change lists and
+ * classifies as `unknown`. A caller assembling this input by hand owes the
+ * same rule: passing `evaluable: true` for a dimension it only partly compared
+ * is what would let an unobservable render be counted as a stable-input one.
  *
  * A mount has no alternate, so all three dimensions are unevaluable and the
  * result is `unknown`. **`../browser/react.ts` must omit the `trigger`

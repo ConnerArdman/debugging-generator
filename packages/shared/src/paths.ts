@@ -762,6 +762,20 @@ export function isSafeRelativePath(path: string): boolean {
  * a symlink at the final component. Never treat this function as a complete
  * check on its own.
  *
+ * That rejection is *proven* in `src/node/safe-fs.test.ts`, in the
+ * `describe('a project-internal symbolic link whose target is outside the
+ * root')` block: it asserts that this function accepts the unresolved path and
+ * that `isWithin(root, fs.realpathSync(path))` refuses it. The pointer is named
+ * here so a later edit to either file can see what the other one is holding up.
+ *
+ * What the filesystem-level checks add is narrower than it sounds, and the same
+ * block proves the limit: `O_NOFOLLOW` refuses a link only at the **final**
+ * component of a path, and the directory policy refuses one only in a chain it
+ * is given to verify. A read whose *interior* component is a link returns what
+ * that link points at. So the realpath-then-containment sequence above is an
+ * obligation on every caller that opens a path it did not construct itself —
+ * not something `src/node/safe-fs.ts` performs on its behalf.
+ *
  * @param rootAbs The absolute path of the directory that must contain the
  * candidate.
  * @param candidateAbs The absolute path being tested.
@@ -856,8 +870,14 @@ function projectRootRejection(projectRoot: string, path: string): DebuggenError 
  *
  * **Limit of the guarantee.** String level only: a symlink inside the project
  * whose target is outside it satisfies this function. `fs.realpath` in
- * `apps/vscode-extension/src/uri-handler.ts` and `O_NOFOLLOW` in this package's
- * `src/node/safe-fs.ts` are the checks that catch that escape.
+ * `apps/vscode-extension/src/uri-handler.ts` is the check that catches that
+ * escape — `O_NOFOLLOW` in this package's `src/node/safe-fs.ts` refuses a link
+ * only at a path's final component, so it is a backstop rather than an answer
+ * for a multi-component path. The escape is proven rejected in
+ * `src/node/safe-fs.test.ts`, in the `describe('a project-internal symbolic
+ * link whose target is outside the root')` block — which asserts, among the
+ * rest, that this function returns `Err('PATH_OUTSIDE_PROJECT')` for the
+ * *realpath* of a link that leaves the project. Resolve first, then reduce.
  *
  * @param projectRoot The absolute path of the project root.
  * @param path The path to reduce: absolute and inside the root, or already
@@ -972,8 +992,17 @@ export function toProjectRelative(projectRoot: string, path: string): Result<str
  * question for `fs.realpath` in `apps/vscode-extension/src/uri-handler.ts`,
  * which requires the resolved path to stay inside an open workspace folder's
  * realpath, and for `O_NOFOLLOW` in this package's `src/node/safe-fs.ts`, which
- * refuses to follow a symlink at the final component. A caller that opens a
- * file uses one of those as well as this.
+ * refuses to follow a symlink at the final component. Those two are not
+ * interchangeable: a caller that opens the path this function returns resolves
+ * it with `fs.realpath` and re-checks containment on the *resolved* path, and
+ * treats the no-follow open as the backstop it is — it cannot see an interior
+ * component.
+ *
+ * Both halves of that composition — this function accepting a path through a
+ * link, and the realpath-aware form rejecting it — are proven in
+ * `src/node/safe-fs.test.ts`, in the `describe('a project-internal symbolic
+ * link whose target is outside the root')` block. Read it before changing what
+ * this paragraph promises.
  *
  * @param projectRoot The absolute path of the project root.
  * @param relPath The project-relative POSIX path to resolve.

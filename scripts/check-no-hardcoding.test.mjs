@@ -15,12 +15,13 @@
 // They are the first four `describe` blocks below, in that order. The remaining
 // blocks cover the rules and guarantees the four cases do not reach
 // (`demo-import`, `demo-path`, the question-branch exemption, `policy-stale`,
-// the exclusion list, the command-line surface, the enforcement of policy drift
-// whenever the demo corpus is present, and the fail-closed scan), because a gate
-// whose supporting rules are untested is a gate that can rot silently.
+// the policy's canonical form, the exclusion list, the command-line surface, the
+// enforcement of policy drift whenever the demo corpus is present, and the
+// fail-closed scan), because a gate whose supporting rules are untested is a
+// gate that can rot silently.
 //
-// TWO PROPERTIES THAT ARE THE GATE ITSELF, NOT A DETAIL
-// A guard is only evidence if it fails when it cannot do its job, so two
+// THREE PROPERTIES THAT ARE THE GATE ITSELF, NOT A DETAIL
+// A guard is only evidence if it fails when it cannot do its job, so three
 // properties are asserted as directly as the four cases above:
 //   * "policy-stale is enforced whenever the corpus is present" - drift fails
 //     the run however little of the committed policy a fresh harvest reproduces.
@@ -28,6 +29,13 @@
 //     exemption; the only state that skips the comparison is an absent
 //     `apps/demo-app`, and the policy is still enforced against product source
 //     then.
+//   * "the committed policy is the generator's output, byte for byte" - the
+//     policy is a generated artifact (AAP 0.5.4), so the same names in a
+//     different order, a name listed twice, a reformatted file and a
+//     hand-written provenance field are each drift, even though none of them
+//     changes which names the gate matches. A comparison of membership alone
+//     passes every one of them and leaves a committed artifact no regeneration
+//     reproduces.
 //   * "the scan fails closed" - an unlistable directory, an unreadable,
 //     undecodable or oversized file, a symbolic link where a scanned file was
 //     expected, and a corpus the harvest could only partly read each stop the
@@ -1125,6 +1133,300 @@ describe('policy-stale', () => {
     const again = await runCli(['--update'], root);
     expect(again.code).toBe(EXIT_OK);
     expect(again.stdout).toContain('already up to date');
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * the policy's canonical form
+ * ---------------------------------------------------------------------------------------------- */
+
+// AAP 0.5.4 makes the policy a generated artifact: `--update` from the demo's
+// code index is the only way it is produced, it is committed and reviewed, "and
+// the check fails if the committed policy is stale". The committed BYTES are
+// therefore the contract - the file is prettier-ignored precisely so its
+// generator owns them - and the cases below are the ones a comparison of
+// membership alone lets through: the same names in a different order, a name
+// listed twice, a reformatted file, a hand-written provenance field. Each leaves
+// a committed artifact no regeneration reproduces while changing nothing about
+// which names the gate matches, which is exactly why the gate has to see them.
+
+/**
+ * Two demo component names that order differently under a case-sensitive ASCII
+ * sort than under a case-insensitive or locale-aware one: `T` (0x54) sorts
+ * before `r` (0x72), so `AddToCartControl` comes first and `AddressFields`
+ * second. Every case below is built on this one pair, because it is the
+ * smallest difference a set comparison cannot see - both orders list the same
+ * two names - and it is what a hand-resolved merge or a `localeCompare` sort
+ * actually produces.
+ */
+const CANONICAL_PAIR = Object.freeze(['AddToCartControl', 'AddressFields']);
+
+/** The same two names in the order a case-insensitive sort puts them. */
+const CASE_INSENSITIVE_PAIR = Object.freeze(['AddressFields', 'AddToCartControl']);
+
+/** The demo corpus for these cases: two components, and nothing else to harvest. */
+const CANONICAL_PAIR_CORPUS = Object.freeze({
+  [`${DEMO_TREE}/src/components/cart/AddToCartControl.tsx`]: source(
+    'export function AddToCartControl() {',
+    '  return null;',
+    '}',
+  ),
+  [`${DEMO_TREE}/src/components/checkout/AddressFields.tsx`]: source(
+    'export function AddressFields() {',
+    '  return null;',
+    '}',
+  ),
+});
+
+/**
+ * Write a policy document **verbatim**: the arrays keep the order they are
+ * given, the indentation and the trailing newline are the caller's, and the
+ * metadata can be overridden. This is the only way a fixture can express a
+ * non-canonical file at all - `policyDocument()` goes through
+ * `serializePolicy()`, which would sort and reformat the drift away before the
+ * scanner ever saw it.
+ *
+ * @param {{ identifiers?: string[], routePaths?: string[], metadata?: Record<string, unknown>, indent?: number, trailingNewline?: boolean }} [options]
+ * @returns {string}
+ */
+function verbatimPolicyDocument(options = {}) {
+  const body = JSON.stringify(
+    {
+      ...POLICY_METADATA,
+      ...(options.metadata ?? {}),
+      identifiers: options.identifiers ?? [...CANONICAL_PAIR],
+      routePaths: options.routePaths ?? [],
+    },
+    null,
+    options.indent ?? 2,
+  );
+  return options.trailingNewline === false ? body : `${body}\n`;
+}
+
+/**
+ * A tree whose demo corpus declares exactly {@link CANONICAL_PAIR} and whose
+ * committed policy is the given text, byte for byte.
+ *
+ * @param {string} policyText
+ * @returns {string} Absolute root of the new tree.
+ */
+function canonicalFormTree(policyText) {
+  return makeTree({
+    [POLICY_FILE]: policyText,
+    [ALLOWLIST_FILE]: allowlistDocument({ identifiers: ['Button'] }),
+    ...CANONICAL_PAIR_CORPUS,
+    'apps/local-service/src/sessions/manager.ts': source(
+      'export function createSessionManager() {',
+      '  return { sessions: new Map<string, unknown>() };',
+      '}',
+    ),
+  });
+}
+
+describe('policy canonical form', () => {
+  it(
+    'fails an order-only difference, which a membership comparison cannot see',
+    astCase(),
+    async () => {
+      const root = canonicalFormTree(
+        verbatimPolicyDocument({ identifiers: [...CASE_INSENSITIVE_PAIR] }),
+      );
+      const result = await check(root);
+
+      expect(result.stale).not.toBeNull();
+      expect(result.stale.corpus.state).toBe('ready');
+      expect(result.stale.enforced).toBe(true);
+      expect(result.stale.drifted).toBe(true);
+
+      // Nothing to add, nothing to remove, no metadata difference: the file
+      // lists exactly the harvest's names. Order is the whole of the drift, so
+      // these four assertions are what makes this case a regression test rather
+      // than a restatement of the membership comparison.
+      expect(result.stale.added).toEqual({ identifiers: [], routePaths: [] });
+      expect(result.stale.removed).toEqual({ identifiers: [], routePaths: [] });
+      expect(result.stale.fields).toEqual([]);
+      expect(result.stale.serialization.canonical).toBe(false);
+      expect(result.stale.serialization.byteEqual).toBe(false);
+      expect(result.stale.serialization.reasons).toHaveLength(1);
+      expect(result.stale.serialization.reasons[0]).toContain(
+        'not in canonical case-sensitive ASCII order',
+      );
+      expect(result.stale.serialization.reasons[0]).toContain(
+        '"AddressFields" precedes "AddToCartControl"',
+      );
+
+      const [stale] = byRule(result.findings, 'policy-stale');
+      expect(stale).toBeDefined();
+      expect(stale.file).toBe(POLICY_FILE);
+      expect(stale.line).toBe(1);
+      expect(stale.column).toBe(1);
+      expect(stale.message).toContain('pnpm check:no-hardcoding --update');
+      // The message carries the reason, so a compact log says what to look at.
+      expect(stale.message).toContain('not in canonical case-sensitive ASCII order');
+      expect(result.ok).toBe(false);
+      expect(result.exitCode).toBe(EXIT_FINDINGS);
+
+      const report = renderReport(result);
+      expect(report).toContain(
+        'form: `identifiers` is not in canonical case-sensitive ASCII order',
+      );
+      expect(report).toContain('identifiers to add:    none');
+      expect(report).toContain('pnpm check:no-hardcoding --update');
+
+      const cli = await runCli([], root);
+      expect(cli.code).toBe(EXIT_FINDINGS);
+    },
+  );
+
+  it(
+    'is cured byte-for-byte by `--update`, which says why it rewrote the file',
+    astCase(),
+    async () => {
+      const root = canonicalFormTree(
+        verbatimPolicyDocument({ identifiers: [...CASE_INSENSITIVE_PAIR] }),
+      );
+
+      const update = await runCli(['--update'], root);
+      expect(update.code).toBe(EXIT_OK);
+      // No entry was added or removed, so the summary has to account for the
+      // rewrite some other way or the reviewer cannot tell why it happened.
+      expect(update.stdout).toContain('added 0 identifiers and 0 route paths');
+      expect(update.stdout).toContain("was not the generator's canonical form");
+      expect(update.stdout).toContain('not in canonical case-sensitive ASCII order');
+
+      expect(readFileSync(at(root, POLICY_FILE), 'utf8')).toBe(
+        policyDocument({ identifiers: [...CANONICAL_PAIR] }),
+      );
+
+      const after = await check(root);
+      expect(after.findings).toEqual([]);
+      expect(after.stale.drifted).toBe(false);
+      expect(after.stale.serialization).toEqual({
+        canonical: true,
+        byteEqual: true,
+        reasons: [],
+      });
+      expect(after.exitCode).toBe(EXIT_OK);
+
+      const again = await runCli(['--update'], root);
+      expect(again.code).toBe(EXIT_OK);
+      expect(again.stdout).toContain('already up to date');
+    },
+  );
+
+  it('fails a repeated entry, which the generator never writes', astCase(), async () => {
+    const root = canonicalFormTree(
+      verbatimPolicyDocument({
+        identifiers: ['AddToCartControl', 'AddToCartControl', 'AddressFields'],
+      }),
+    );
+    const result = await check(root);
+
+    // Set arithmetic sees nothing: a repeat is the same membership twice.
+    expect(result.stale.added).toEqual({ identifiers: [], routePaths: [] });
+    expect(result.stale.removed).toEqual({ identifiers: [], routePaths: [] });
+    expect(result.stale.drifted).toBe(true);
+    expect(result.stale.serialization.reasons).toHaveLength(1);
+    expect(result.stale.serialization.reasons[0]).toContain('`identifiers` repeats 1 entry');
+    expect(result.stale.serialization.reasons[0]).toContain('AddToCartControl');
+    expect(rulesOf(result.findings)).toEqual(['policy-stale']);
+    expect(result.exitCode).toBe(EXIT_FINDINGS);
+
+    const cured = await runCli(['--update'], root);
+    expect(cured.code).toBe(EXIT_OK);
+    expect(readFileSync(at(root, POLICY_FILE), 'utf8')).toBe(
+      policyDocument({ identifiers: [...CANONICAL_PAIR] }),
+    );
+  });
+
+  it('fails a file that differs only in its formatting', astCase(), async () => {
+    const reindented = canonicalFormTree(verbatimPolicyDocument({ indent: 4 }));
+    const result = await check(reindented);
+
+    expect(result.stale.drifted).toBe(true);
+    expect(result.stale.added).toEqual({ identifiers: [], routePaths: [] });
+    expect(result.stale.removed).toEqual({ identifiers: [], routePaths: [] });
+    expect(result.stale.fields).toEqual([]);
+    expect(result.stale.serialization.byteEqual).toBe(false);
+    expect(result.stale.serialization.reasons).toHaveLength(1);
+    expect(result.stale.serialization.reasons[0]).toContain('the committed bytes are not what');
+    expect(result.stale.serialization.reasons[0]).toContain('indentation');
+    expect(rulesOf(result.findings)).toEqual(['policy-stale']);
+    expect(result.exitCode).toBe(EXIT_FINDINGS);
+
+    // A missing trailing newline is the same class of difference: correct
+    // names, correct order, not the generator's output.
+    const unterminated = canonicalFormTree(verbatimPolicyDocument({ trailingNewline: false }));
+    const second = await check(unterminated);
+    expect(second.stale.serialization.byteEqual).toBe(false);
+    expect(second.stale.drifted).toBe(true);
+    expect(byRule(second.findings, 'policy-stale')).toHaveLength(1);
+
+    const cured = await runCli(['--update'], unterminated);
+    expect(cured.code).toBe(EXIT_OK);
+    expect(readFileSync(at(unterminated, POLICY_FILE), 'utf8')).toBe(
+      policyDocument({ identifiers: [...CANONICAL_PAIR] }),
+    );
+  });
+
+  it('fails a hand-written provenance field, and says so once', astCase(), async () => {
+    const root = canonicalFormTree(
+      verbatimPolicyDocument({ metadata: { generatedBy: 'hand-written by a developer' } }),
+    );
+    const result = await check(root);
+
+    expect(result.stale.drifted).toBe(true);
+    expect(result.stale.fields).toEqual(['generatedBy']);
+    // The metadata difference already explains the bytes, so the form report
+    // stays silent rather than reporting the same drift a second time.
+    expect(result.stale.serialization.reasons).toEqual([]);
+    expect(result.stale.serialization.byteEqual).toBe(false);
+
+    const [stale] = byRule(result.findings, 'policy-stale');
+    expect(stale.message).toContain('pnpm check:no-hardcoding --update');
+    expect(stale.message).not.toContain('the committed bytes are not what');
+    expect(renderReport(result)).toContain('metadata fields differ: generatedBy');
+    expect(result.exitCode).toBe(EXIT_FINDINGS);
+  });
+
+  it("judges an injected policy's form when there are no bytes to compare", astCase(), async () => {
+    // The committed file here is canonical; the policy handed to `check()` is
+    // not. An injected policy is what the scanner cases use, so its form is
+    // judged from the object alone and the byte comparison reports "no answer"
+    // rather than a false match.
+    const root = canonicalFormTree(policyDocument({ identifiers: [...CANONICAL_PAIR] }));
+    const result = await check(root, {
+      policy: {
+        ...POLICY_METADATA,
+        exclusions: [...POLICY_METADATA.exclusions],
+        identifiers: [...CASE_INSENSITIVE_PAIR],
+        routePaths: [],
+      },
+    });
+
+    expect(result.stale.serialization.byteEqual).toBeNull();
+    expect(result.stale.serialization.canonical).toBe(false);
+    expect(result.stale.serialization.reasons[0]).toContain(
+      'not in canonical case-sensitive ASCII order',
+    );
+    expect(result.stale.drifted).toBe(true);
+    expect(rulesOf(result.findings)).toEqual(['policy-stale']);
+  });
+
+  it('accepts the file the generator writes, byte for byte', astCase(), async () => {
+    // The fixture helper and the generator have to agree, or every case above
+    // would be asserting against a difference of its own making.
+    expect(verbatimPolicyDocument()).toBe(policyDocument({ identifiers: [...CANONICAL_PAIR] }));
+
+    const root = canonicalFormTree(policyDocument({ identifiers: [...CANONICAL_PAIR] }));
+    const result = await check(root);
+
+    expect(result.findings).toEqual([]);
+    expect(result.failures).toEqual([]);
+    expect(result.stale.drifted).toBe(false);
+    expect(result.stale.serialization).toEqual({ canonical: true, byteEqual: true, reasons: [] });
+    expect(result.ok).toBe(true);
+    expect(result.exitCode).toBe(EXIT_OK);
   });
 });
 
