@@ -1,0 +1,158 @@
+/*
+ * Lumen Supply - category glyph.
+ *
+ * The module behind `ui/CategoryGlyph.tsx`, which renders one empty, decorative `<span>` carrying
+ * `.root`, `data-slug`, `data-size` and `aria-hidden` - no children, no `<img>`, no inline style.
+ * Two places show it: the catalog's category filter chips (`catalog/CategoryFilterChips` inside
+ * `ui/Pill`) and the dashboard's category grouping headers (`dashboard/InventoryLevelsTable`).
+ *
+ * Class contract - one name, nothing else is exported:
+ *
+ *   .root  the glyph box. Its measure comes from `data-size` ("sm" | "md" | "lg", `md` being
+ *          `.root`'s own value) and its artwork from `data-slug`, so the component writes its
+ *          props straight to the DOM and never indexes a class-name map; a `className` from the
+ *          caller composes alongside it.
+ *
+ * WHY A MASK AND NOT AN `<img>`
+ * The six assets are stroke-only drawings whose `stroke` is the `currentColor` keyword. Fetched
+ * through `<img src>` each one is an independent document, so that keyword resolves against the
+ * file's own root `color` - the slate the assets declare deliberately, so a file opened on its own
+ * is still visible - and no rule on the host page can reach it. The chips need the opposite:
+ * `Pill.module.css` turns a selected chip's `color` white, and the glyph has to follow the label
+ * into that inversion rather than stay slate on an ink fill. So the asset is used as a CSS
+ * `mask-image` instead. Stroke-only art means the image's alpha channel *is* the glyph shape, and
+ * `background-color: currentColor` behind that mask reproduces the drawing in whatever colour the
+ * element inherits - which is why every module around this one documents that it sets no `color`
+ * of its own. This stylesheet is consequently the only place an asset path appears; the component
+ * names no file, and nothing here declares a colour.
+ *
+ * WHY `.root` PAINTS NOTHING BY ITSELF
+ * `apps/demo-app/public/categories/` holds exactly six files while the seed creates roughly twice
+ * as many categories, so most categories have no art at all. `CategoryGlyph.tsx` renders nothing
+ * for a slug outside the six, and this file reaches the same answer independently: `.root` sets
+ * `background-color: transparent` and declares no mask image, and only the six slug rules at the
+ * end turn the paint on. That split is load-bearing. A masked element whose mask image is absent
+ * is not masked at all, so it paints its background over the whole box; had the fill been declared
+ * on `.root`, a slug that ever reached the DOM unmatched would render as a solid square - exactly
+ * the broken icon the degradation rule forbids. Hence also: no seventh rule, no attribute *prefix*
+ * or substring selector that could match an unseen slug, and no generic "other" glyph.
+ *
+ * ASSET URLS are root-relative literals (`/categories/<slug>.svg`), served from
+ * `apps/demo-app/public/` at request time. Next's CSS pipeline leaves a root-relative `url()`
+ * untouched - verified in the browser on `next dev`, where the compiled rule still carries the
+ * literal path and the request answers 200. A path relative to this file would instead be handed
+ * to the bundler, which would try to resolve an asset this folder does not own.
+ *
+ * TOKENS: the three measures read the shared type scale from `app/globals.css` as
+ * `var(--ls-NAME, <literal fallback>)`, each fallback the pixel size that file's rem step renders
+ * at the default 16px root, so the glyph is still sized correctly if this module is ever read
+ * without the global stylesheet. The type scale is the right source: the glyph always sits beside
+ * a word and is sized to that word's step, one line-height's worth of art rather than an
+ * independent icon size the token set does not model. `currentColor` and `transparent` are this
+ * file's entire colour strategy.
+ *
+ * WHY THERE IS NO `forced-colors` RULE, unlike `ui/Skeleton` and `product/ProductGallery`: in
+ * forced-colours mode the UA replaces this background with the reader's own, so the glyph stops
+ * showing. Nothing is lost by that. The glyph is decorative and `aria-hidden`, and the category
+ * name always sits next to it as real text, so the chip then reads exactly like a chip for a
+ * category with no art - a rendering this design already supports everywhere. Opting out with
+ * `forced-color-adjust: none` would paint over the reader's palette for pure decoration, which is
+ * a trade the other two modules make only because state meaning would otherwise be lost.
+ *
+ * This module introduces no motion, so it owes no reduced-motion rule; the baseline in
+ * `app/globals.css` covers the page.
+ *
+ * Attribute-selector values and `url()` arguments are single-quoted because Prettier writes them
+ * that way and `pnpm format:check` is a blocking gate - do not "restore" double quotes.
+ */
+
+/* The box, painted nothing until a slug rule matches.
+ *
+ * `inline-block` puts it on the text baseline of a dashboard grouping label, `vertical-align:
+ * middle` centres it against the label's x-height rather than dropping it to the baseline, and
+ * `flex: none` holds its measure inside the chip's flex row, where a flex item would otherwise be
+ * allowed to shrink below its size and crop the art.
+ *
+ * The measure lives in one file-local property that the two size variants re-declare, so a variant
+ * changes a single value instead of restating width and height. */
+.root {
+  --glyph-size: var(--ls-text-lg, 18px);
+
+  display: inline-block;
+  flex: none;
+  width: var(--glyph-size);
+  height: var(--glyph-size);
+  vertical-align: middle;
+  background-color: transparent;
+  /* One copy, centred, scaled to fit: `contain` over square art in a square box fills it exactly
+   * and keeps the assets' 24-unit grid - and so their stroke weight - proportional at every size.
+   * The `-webkit-` spellings are carried for the WebKit versions that shipped masks under the
+   * prefix only; current Chrome applies the unprefixed properties. `mask-image` itself is
+   * deliberately absent here and declared only per slug below. */
+  mask-repeat: no-repeat;
+  mask-position: center;
+  mask-size: contain;
+  -webkit-mask-repeat: no-repeat;
+  -webkit-mask-position: center;
+  -webkit-mask-size: contain;
+}
+
+/* Sizes
+ * ---------------------------------------------------------------------------------------------
+ * Three steps of the shared type scale, chosen by the attribute the component writes. `md` is
+ * `.root`'s own 18px step and needs no rule: the small step matches body copy, for a glyph set
+ * inside a sentence or a dense table row, and the large one is a heading-sized mark for a section
+ * header. Only the measure changes - every other declaration above is shared, so all three sizes
+ * crop and centre the art identically. */
+
+.root[data-size='sm'] {
+  --glyph-size: var(--ls-text-md, 15px);
+}
+
+.root[data-size='lg'] {
+  --glyph-size: var(--ls-text-xl, 24px);
+}
+
+/* Artwork
+ * ---------------------------------------------------------------------------------------------
+ * One rule per asset in `apps/demo-app/public/categories/`, alphabetised, and exactly six: these
+ * slugs are the whole set of categories with art. Each rule names its file twice - once
+ * unprefixed, once for prefixed WebKit - and turns the fill on, which is the step that makes the
+ * glyph appear at all. A category outside this list matches none of them and keeps `.root`'s
+ * transparent fill, so it shows nothing rather than a square. */
+
+.root[data-slug='cable-reel'] {
+  mask-image: url('/categories/cable-reel.svg');
+  -webkit-mask-image: url('/categories/cable-reel.svg');
+  background-color: currentColor;
+}
+
+.root[data-slug='fastener'] {
+  mask-image: url('/categories/fastener.svg');
+  -webkit-mask-image: url('/categories/fastener.svg');
+  background-color: currentColor;
+}
+
+.root[data-slug='hand-tool'] {
+  mask-image: url('/categories/hand-tool.svg');
+  -webkit-mask-image: url('/categories/hand-tool.svg');
+  background-color: currentColor;
+}
+
+.root[data-slug='power-tool'] {
+  mask-image: url('/categories/power-tool.svg');
+  -webkit-mask-image: url('/categories/power-tool.svg');
+  background-color: currentColor;
+}
+
+.root[data-slug='safety-gear'] {
+  mask-image: url('/categories/safety-gear.svg');
+  -webkit-mask-image: url('/categories/safety-gear.svg');
+  background-color: currentColor;
+}
+
+.root[data-slug='valve'] {
+  mask-image: url('/categories/valve.svg');
+  -webkit-mask-image: url('/categories/valve.svg');
+  background-color: currentColor;
+}
