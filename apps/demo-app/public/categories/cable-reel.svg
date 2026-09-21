@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" color="#475569">
+  <!-- A cable spool face-on: a flange of radius 8.25 about 12 12 and a hub of radius 2.9 on the
+       same centre, 3.6 units of air between the strokes so the hub holds a ring of its own at 16
+       px. The tail starts 0.33 inside the rim so the strokes overlap and the cable is attached,
+       clears the rim 18 degrees off the radius and hooks through 68 to a vertical tip where a
+       radial spoke would read as a magnifier handle. Ink matches the hex nut of fastener.svg,
+       whose root element this repeats - currentColor over a slate root colour resolves by path
+       yet still inherits inlined. -->
+  <circle cx="12" cy="12" r="8.25" />
+  <circle cx="12" cy="12" r="2.9" />
+  <path d="M17.6 17.6 C19.6 17.7 20.8 18.9 20.8 20.8" />
+</svg>

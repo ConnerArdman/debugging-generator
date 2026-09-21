@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" color="#475569">
+  <!-- A hard hat head-on: a semicircular crown of radius 7.25 about 12 16.25, apex on y 9, over
+       a brim 18.2 wide that clears it by 1.85 either side - the overhang is the whole reason the
+       pair reads as a hat and not a half circle or an umbrella, so it runs out to the edge of the
+       2..22 safe area once the 0.875 half stroke is counted, a pixel a side at a 16 px chip. One
+       crest rib, apex to brim; a second fills the crown in at that size. The products tile's
+       amber and glasses are dropped; the root colour is what a fetched file strokes against. -->
+  <path d="M4.75 16.25 A7.25 7.25 0 0 1 19.25 16.25" />
+  <path d="M2.9 16.25 H21.1" />
+  <path d="M12 9.5 V16" />
+</svg>
