@@ -94,6 +94,21 @@
  * case-sensitive ASCII, it changes nothing about which names the gate matches, and a comparison of
  * membership alone would pass it while leaving a committed artifact nobody can regenerate.
  *
+ * THE SCRIPT, ITS SUITE AND THE POLICY ARE ONE UNIT, OWNED HERE
+ * This script, `scripts/check-no-hardcoding.test.mjs` and `scripts/no-hardcoding.policy.json` are
+ * one unit owned by the repository-tooling surface -- the rules here, the evidence that they hold
+ * in the suite, the vocabulary they match in the generated artifact -- and they change together.
+ * The policy's committed bytes are exactly what `--update` writes from `apps/demo-app` as that tree
+ * stands in the same commit, so a change to the demo corpus is complete only once `--update` has
+ * been re-run and the regenerated policy committed with it -- short of that the gate enforces a
+ * vocabulary the demo no longer has, and `policy-stale` says so on the next run.
+ * The policy is never hand-edited, and never regenerated as a side effect of unrelated work: a
+ * commit that changes the demo and re-sorts or rewrites the policy in passing produces an artifact
+ * nobody reviewed, in the one file whose review is why its bytes are pinned at all. The canonical
+ * form of the committed artifact is pinned a second time by the suite's "the committed policy
+ * artifact" cases, because the byte comparison below runs only with the corpus in hand -- it is
+ * skipped when `apps/demo-app` is absent, and when the harvest could read only part of it.
+ *
  * THE SCAN FAILS CLOSED
  * A gate that returns success while part of the product tree went unexamined proves nothing, so
  * nothing is ever "skipped". A directory that cannot be read, a file that cannot be read, parsed or

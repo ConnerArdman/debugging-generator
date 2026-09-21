@@ -50,13 +50,61 @@ const NO_DISPATCH_ETA_LABEL = '—';
 const CART_FAILURE_LABEL = 'The cart could not be updated. Try again in a moment.';
 
 /**
+ * Added to a failed addition the cart read back and found had put nothing in: the buyer is told
+ * what went wrong and, on the strength of that read, that their cart is as it was.
+ */
+const CART_ADDITION_NOT_APPLIED_LABEL = 'No units were added.';
+
+/**
+ * Wording for a failed addition whose outcome the cart could not establish.
+ *
+ * Units are added to whatever a line already holds, so a request that was answered with a failure
+ * may still have been carried out. Where the read that would have settled it did not answer either,
+ * the buyer is pointed at their cart rather than told what it holds or invited to press again -
+ * pressing again on top of an addition that did apply is what leaves a line of two.
+ */
+const CART_ADDITION_UNKNOWN_LABEL =
+  'The cart could not confirm those units went in. Check your cart before adding them again.';
+
+/**
  * How far along the cart is with the server.
  *
  * `'loading'` covers both the first read and a later refresh, `'saving'` a change being written,
  * and `'error'` a read or write that came back unhappy - which leaves the previously published
- * cart in place so the buyer keeps seeing what they had.
+ * cart in place so the buyer keeps seeing what they had, except where the failure was read back
+ * from the server, in which case what that read found is published and the wording stays with it.
  */
 export type CartSyncStatus = 'loading' | 'idle' | 'saving' | 'error';
+
+/**
+ * What became of the units a failed addition asked for, as far as the cart could establish.
+ *
+ * `'not-applied'` is a read of the cart that found the units absent, so the cart is as it was and
+ * asking again is safe. `'unknown'` is everything the cart could not settle - the read failed
+ * itself, there was no cart published to compare against, or the cart moved by some other amount
+ * because another tab was shopping too - and a buyer given that outcome is asked to look at their
+ * cart rather than told what it holds.
+ */
+export type CartAdditionOutcome = 'not-applied' | 'unknown';
+
+/**
+ * The failure {@link CartContextValue.addLine} rejects with, once the cart has been read back.
+ *
+ * `message` is the same sentence the cart published on {@link CartContextValue.cartError}, so a
+ * control that catches this may show it to a buyer as it stands, and `outcome` says how much the
+ * cart established about the units - which is what decides whether a control may state that
+ * nothing was added. `cause` carries the original failure for a caller that wants it.
+ */
+export class CartAdditionError extends Error {
+  /** How much the cart established about the units; see {@link CartAdditionOutcome}. */
+  readonly outcome: CartAdditionOutcome;
+
+  constructor(message: string, options: { outcome: CartAdditionOutcome; cause: unknown }) {
+    super(message, { cause: options.cause });
+    this.name = 'CartAdditionError';
+    this.outcome = options.outcome;
+  }
+}
 
 /** The cart and its operations, as published on the context. */
 export interface CartContextValue {
@@ -78,7 +126,17 @@ export interface CartContextValue {
   readonly syncStatus: CartSyncStatus;
   /** Wording for the last failure, or `null` when the cart is in step with the server. */
   readonly cartError: string | null;
-  /** Puts a quantity of one product into the cart, then publishes the cart the server answers. */
+  /**
+   * Puts a quantity of one product into the cart, then publishes the cart the server answers.
+   *
+   * The units are added to whatever the line already holds, so a request that came back a failure
+   * may still have been carried out - which is why a failed addition is not reported until the cart
+   * has been read from the server again. That read decides the outcome: units that did go in are
+   * published and the addition resolves as the success it turned out to be, and otherwise the
+   * contents it found are published with wording on `cartError` and the promise rejects with a
+   * {@link CartAdditionError} whose `outcome` says whether the units were found absent or whether
+   * nothing could be established about them.
+   */
   readonly addLine: (draft: CartItemDraft) => Promise<void>;
   /**
    * Sets one line's quantity on the server, then publishes the cart it answers. A quantity of zero
@@ -110,6 +168,20 @@ export interface CartProviderProps {
 /** The whole number of units `quantity` asks for: a fraction rounds down, anything unusable 0. */
 function requestedQuantity(quantity: number): number {
   return Number.isFinite(quantity) ? Math.max(0, Math.trunc(quantity)) : 0;
+}
+
+/**
+ * How many units of `productId` the given lines hold, `0` for a product that is not among them.
+ *
+ * Summed rather than read from the first match: a cart holds one line per product today, and a
+ * total is the answer whether that stays true or not. It is what tells a failed addition, compared
+ * against the same figure taken before the request, whether the units went in.
+ */
+function unitsOfProductHeld(lines: readonly CartLine[], productId: string): number {
+  return lines.reduce(
+    (units, line) => (line.productId === productId ? units + line.quantity : units),
+    0,
+  );
 }
 
 /**
@@ -193,6 +265,24 @@ export function CartProvider({ children }: CartProviderProps): ReactElement {
   }
 
   /**
+   * Publishes `contents` while leaving the cart reporting `message` as its failure.
+   *
+   * For the one case that is both at once: a change the server refused, and a read of the cart
+   * taken afterwards to find out what it actually holds. `publishServerCart` would clear the
+   * failure the buyer still needs to see, so the contents are published and the wording kept.
+   * `null` is a read that did not answer either, which leaves the previously published contents
+   * on screen - the same thing every other failure here does.
+   */
+  function publishCartUnderFailure(contents: CartView | null, message: string): void {
+    if (contents !== null) {
+      setCart(contents);
+    }
+
+    setSyncStatus('error');
+    setCartError(message);
+  }
+
+  /**
    * Publishes `cause` as the cart's failure and then hands it back to the caller that asked for the
    * change.
    *
@@ -202,8 +292,10 @@ export function CartProvider({ children }: CartProviderProps): ReactElement {
    * the line in front of it was not changed and can say so where the buyer is looking instead of
    * confirming a change the server refused.
    *
-   * `addLine` deliberately does not go through here: its callers watch `cartError` and announce a
-   * refusal from there, and they expect its promise to settle whatever the server answered.
+   * `addLine` does not go through here, because a refused addition is not the same statement as a
+   * refused change: its units are added to whatever the line already held, so the request may have
+   * been carried out before it failed. It takes `settleAdditionFailure` instead, which reads the
+   * cart back first and publishes and rejects with what that read established.
    */
   function raiseCartFailure(cause: unknown): never {
     reportCartFailure(cause);
@@ -211,32 +303,100 @@ export function CartProvider({ children }: CartProviderProps): ReactElement {
     throw cause;
   }
 
-  // The cart lives on the server, so the browser reads it once, when the application starts. It is
-  // never read again on its own: every operation below writes through to the server and publishes
-  // the cart it answered with, which is the cart checkout will price the order from.
+  /**
+   * Works out what became of a failed addition and reports it, having established it first.
+   *
+   * The cart is read from the server and the units it now holds of `draft.productId` compared with
+   * `unitsBefore`, the figure taken when the press was made. Units that went in despite the failure
+   * make this a success: the contents that carry them are published and nothing is said about a
+   * failure the buyer has no reason to hear about. A cart found holding what it held is a refusal,
+   * reported as one. Anything else - the read failing, no cart to compare against, or a difference
+   * that is neither, which another tab shopping at the same time would produce - is an outcome
+   * nobody established, and is reported as exactly that rather than guessed at.
+   *
+   * @param cause The failure the addition came back with.
+   * @param draft The addition that was asked for.
+   * @param unitsBefore Units of the product the published cart held when the press was made, or
+   *   `null` when no cart had been published yet and there is therefore nothing to compare against.
+   * @throws CartAdditionError when the units were found absent, or their fate could not be
+   *   established, once the cart has published the same wording on `cartError`.
+   */
+  async function settleAdditionFailure(
+    cause: unknown,
+    draft: CartItemDraft,
+    unitsBefore: number | null,
+  ): Promise<void> {
+    let reconciled: CartView | null;
+
+    try {
+      reconciled = await loadCartContents();
+    } catch {
+      // The read is how the outcome would have been established, so its own failure is not a
+      // second thing to tell the buyer about: it is what makes the outcome unknown below.
+      reconciled = null;
+    }
+
+    if (reconciled !== null && unitsBefore !== null) {
+      const wanted = requestedQuantity(draft.quantity);
+      const delta = unitsOfProductHeld(reconciled.lines, draft.productId) - unitsBefore;
+
+      if (wanted > 0 && delta === wanted) {
+        publishServerCart(reconciled);
+
+        return;
+      }
+
+      if (delta === 0) {
+        const message = `${cartFailureText(cause)} ${CART_ADDITION_NOT_APPLIED_LABEL}`;
+
+        publishCartUnderFailure(reconciled, message);
+
+        throw new CartAdditionError(message, { outcome: 'not-applied', cause });
+      }
+    }
+
+    publishCartUnderFailure(reconciled, CART_ADDITION_UNKNOWN_LABEL);
+
+    throw new CartAdditionError(CART_ADDITION_UNKNOWN_LABEL, { outcome: 'unknown', cause });
+  }
+
+  // The cart lives on the server, so the browser reads it once, when the application starts. There
+  // is no polling and no reading of it on a schedule: every operation below writes through to the
+  // server and publishes the cart it answered with, which is the cart checkout will price the order
+  // from, and the only other read is the one a failed addition takes to find out what it did.
+  //
+  // The read belongs to this mount, so it is carried out under a signal this effect owns. A cart
+  // that unmounts while its first read is in flight aborts it rather than holding a connection open
+  // for an answer nobody is left to show - and the abort is the provider letting go, so neither the
+  // answer nor the rejection it produces is published.
   useEffect(() => {
-    let cancelled = false;
+    const controller = new AbortController();
 
     void (async () => {
       try {
-        const stored = await loadCartContents();
+        const stored = await loadCartContents({ signal: controller.signal });
 
-        if (!cancelled) {
+        if (!controller.signal.aborted) {
           publishServerCart(stored);
         }
       } catch (cause) {
-        if (!cancelled) {
+        if (!controller.signal.aborted) {
           reportCartFailure(cause);
         }
       }
     })();
 
     return () => {
-      cancelled = true;
+      controller.abort();
     };
   }, []);
 
   async function addLine(draft: CartItemDraft): Promise<void> {
+    // The units this cart holds of the product as the press is made, which is the figure a failed
+    // addition is settled against. `null` while no cart has been published: there is no baseline
+    // then, and an outcome measured against a figure that was never read would be invented.
+    const unitsBefore = cart === null ? null : unitsOfProductHeld(cart.lines, draft.productId);
+
     setSyncStatus('saving');
     setCartError(null);
 
@@ -245,7 +405,7 @@ export function CartProvider({ children }: CartProviderProps): ReactElement {
 
       publishServerCart(saved);
     } catch (cause) {
-      reportCartFailure(cause);
+      await settleAdditionFailure(cause, draft, unitsBefore);
     }
   }
 

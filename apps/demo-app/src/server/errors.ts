@@ -8,7 +8,10 @@
  *    was asked throws a {@link StorefrontError} - almost always one of the four
  *    subclasses below - which carries the machine-readable
  *    `StorefrontErrorCode` the browser reads, the HTTP status the failure
- *    deserves and, when it helps, structured `details`.
+ *    deserves and, when it helps, structured `details`. One failure is neither
+ *    a subclass nor a service's own choice of code and status, because what it
+ *    tells a customer about their money is a contract:
+ *    {@link paymentStatusUnknown} builds it.
  * 2. **One mapper from any thrown value to one response.** Route handlers do not
  *    classify failures themselves: they `catch` and hand the value to
  *    {@link storefrontErrorResponse}, so every endpoint answers with the same
@@ -126,7 +129,9 @@ export interface StorefrontErrorOutcome {
  * Prefer one of the four subclasses; construct this class directly only for a
  * code they do not cover - `OUT_OF_STOCK` and `PAYMENT_DECLINED` are the two
  * that come up, both with a status of 409 and 402 respectively chosen by the
- * service that raises them.
+ * service that raises them. The third, `PAYMENT_STATUS_UNKNOWN`, has a
+ * constructor of its own in {@link paymentStatusUnknown}, because the body it
+ * answers with is a contract rather than a service's choice.
  *
  * @example
  * ```ts
@@ -245,6 +250,13 @@ export class StorefrontConflictError extends StorefrontError {
  * A dependency this application calls out to did not answer usefully: a non-2xx
  * reply from the carrier or payment endpoint, or a `fetch` that rejected.
  *
+ * It carries `INTERNAL_ERROR`, which on a checkout means what every code other
+ * than `PAYMENT_STATUS_UNKNOWN` means there: nothing was captured. So a service
+ * raises this one only for an upstream answer it can read that way - a
+ * dependency refusing the request it was sent - and raises
+ * {@link paymentStatusUnknown} when a payment attempt's outcome cannot be ruled
+ * out.
+ *
  * The status is 502, because the storefront itself is healthy and the failure
  * is upstream of it. The short `upstream` label is the only thing recorded
  * about which dependency failed: a URL could carry a query string or a
@@ -266,6 +278,69 @@ export class StorefrontUpstreamError extends StorefrontError {
     this.name = 'StorefrontUpstreamError';
     this.upstream = upstream;
   }
+}
+
+/**
+ * What {@link paymentStatusUnknown} needs beyond its message.
+ */
+export interface PaymentStatusUnknownOptions extends ErrorOptions {
+  /**
+   * Which dependency the unresolved attempt involved, as the same short label
+   * {@link StorefrontUpstreamError} uses - `payment`. It is reported to the
+   * browser inside `details`, so keep it to a word.
+   */
+  upstream: string;
+
+  /**
+   * The HTTP status to answer with. It defaults to 502, for the case this
+   * situation usually is: an amount was sent to the processor and no readable
+   * answer came back, which is a failure upstream of a healthy storefront. Pass
+   * 500 for the other case - the processor did answer and approved, and this
+   * application then failed to complete the order the amount was approved for -
+   * because that one is the store's own.
+   */
+  status?: number;
+}
+
+/**
+ * A payment attempt whose outcome this application cannot rule out, as the one
+ * error whose code says so.
+ *
+ * It exists because the alternative is worse than an error: every other failure
+ * a checkout answers with means no amount was captured, and a customer reads
+ * that as "place the order again". Two situations do not support it - an amount
+ * sent to the processor with no readable answer back, and an approval this
+ * application could not write an order against - and reporting either of them
+ * as one of the definite failures would tell a customer they were not charged
+ * when they may have been, and invite them to be charged twice.
+ *
+ * The body carries the code, the message and `{ upstream, outcome: 'unknown' }`,
+ * so a client that switches on the code and a developer reading a log line are
+ * told the same thing. Nothing about the attempt itself is included: an amount,
+ * a reference or a processor's own wording is for the store's records.
+ *
+ * @param message A complete sentence a customer can act on. It reaches the
+ * browser verbatim, so it must say that the outcome is unresolved and what to do
+ * instead of placing the order again.
+ * @param options The `upstream` label, the `status` to answer with, and `cause`
+ * for the log.
+ *
+ * @example
+ * ```ts
+ * throw paymentStatusUnknown('The payment service did not answer …', {
+ *   upstream: 'payment',
+ *   cause,
+ * });
+ * ```
+ */
+export function paymentStatusUnknown(
+  message: string,
+  options: PaymentStatusUnknownOptions,
+): StorefrontError {
+  return new StorefrontError('PAYMENT_STATUS_UNKNOWN', options.status ?? 502, message, {
+    details: { upstream: options.upstream, outcome: 'unknown' },
+    cause: options.cause,
+  });
 }
 
 /**

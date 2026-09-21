@@ -37,11 +37,11 @@
  * driver row ever leaves this module.
  */
 
+import { MovementType } from '@/generated/prisma/client';
 import type {
   CartLine,
   InventorySummary,
   LowStockRow,
-  MovementType,
   StockState,
   WarehouseSummary,
 } from '@/lib/types';
@@ -185,10 +185,10 @@ export type StockReservation = {
  */
 export interface InventorySummaryInput {
   /**
-   * A stocking location, named either by its identifier or by the short code
-   * the filter row lists it under. `null` reports on every location.
+   * A stocking location, named by its identifier - the `id` of one of the
+   * locations this module reports. `null` reports on every location.
    */
-  warehouse?: string | null | undefined;
+  warehouseId?: string | null | undefined;
   /** Units of headroom above a line's reorder point that still count as low. */
   threshold?: number | undefined;
   /** Which page of the low-stock list to answer with, counted from `1`. */
@@ -486,7 +486,7 @@ export async function release(reference: string): Promise<void> {
     await tx.$queryRaw`SELECT true AS locked FROM pg_advisory_xact_lock(hashtext(${reference}::text))`;
 
     const rows = await tx.inventoryMovement.findMany({
-      where: { reference, movementType: 'RESERVATION' },
+      where: { reference, movementType: MovementType.RESERVATION },
       select: { productId: true, warehouseId: true, quantityDelta: true },
     });
 
@@ -535,7 +535,7 @@ export async function release(reference: string): Promise<void> {
           productId: held.productId,
           warehouseId: held.warehouseId,
           quantityDelta: units,
-          movementType: 'RESERVATION',
+          movementType: MovementType.RESERVATION,
           reference,
         },
       });
@@ -620,7 +620,7 @@ async function hold(lines: readonly ReservedLine[], reference: string): Promise<
           productId: line.productId,
           warehouseId: line.warehouseId,
           quantityDelta: -line.requestedQuantity,
-          movementType: 'RESERVATION',
+          movementType: MovementType.RESERVATION,
           reference,
         },
       });
@@ -698,14 +698,15 @@ export async function readInventorySummary(
     .map((row) => ({ id: row.id, code: row.code, name: row.name, region: row.region }))
     .sort((a, b) => a.code.localeCompare(b.code));
 
-  const named = input.warehouse ?? null;
+  // The filter names a location by identifier and by nothing else: the short
+  // code above is how a location is displayed, not a second key it answers to,
+  // so a value that is not one of these identifiers matches no location at all.
+  const named = input.warehouseId ?? null;
   let location: string | null = null;
 
   if (named !== null && named.trim().length > 0) {
     const wanted = named.trim();
-    const match = warehouses.find(
-      (row) => row.id === wanted || row.code.toUpperCase() === wanted.toUpperCase(),
-    );
+    const match = warehouses.find((row) => row.id === wanted);
 
     if (match === undefined) {
       throw new StorefrontNotFoundError('No stocking location matches that filter.');

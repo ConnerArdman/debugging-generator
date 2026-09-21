@@ -18,10 +18,15 @@
  *
  * The strip appears in two places - a product page's detail body and, more
  * quietly, the site header - and the difference between them is presentational
- * and lives entirely in the two `[data-variant]` blocks at the end of this file,
- * as a set of file-local `--rail-*` metrics that the rules above read. Each of
- * those again resolves to an `--ls-*` token with a literal fallback, and none of
- * them changes what the component does.
+ * and lives entirely in the `[data-variant]` blocks at the end of this file, as
+ * a set of file-local `--rail-*` metrics that the rules above read. Each of
+ * those again resolves to an `--ls-*` token with a literal fallback, apart from
+ * the strip's own measures, which are stated in rem, and none of them changes
+ * what the component does. The compact block is followed by the one rule that
+ * tunes a slot instead of a metric - `.root[data-variant='compact'] .state`,
+ * which puts the header's failed-read notice on the smallest type step and holds
+ * it to the width of the tile row, so a sentence cannot make the navigation row
+ * taller than the suggestions it stands in for would have.
  *
  * Hex values are lowercase because Prettier normalises CSS colours to lowercase
  * and `pnpm format:check` is a blocking gate.
@@ -149,4 +154,24 @@
   --rail-item-gap: var(--ls-space-2, 8px);
   --rail-state-pad: var(--ls-space-2, 8px);
   --rail-tile-width: 9rem;
+  /* The measure the header's slot is held to: the width the strip already spends
+   * on its row of tiles, so a sentence wraps inside the space the suggestions
+   * would have occupied instead of stretching the navigation row wider. Stated
+   * in rem like the tile width above, and for the same reason - it is strip
+   * geometry rather than a spacing step, so no `--ls-space-*` token expresses
+   * it. */
+  --rail-state-measure: 20rem;
+}
+
+/* The failed-read notice in the site header. Two classes and an attribute, which
+ * outranks Alert.module.css's own single-class `.root` however the two modules
+ * happen to be ordered: the notice arrives at the alert's 13px body size, and a
+ * row that shares its height with the navigation has less than that to spend.
+ * The smaller type step and the bounded measure together keep the sentence from
+ * growing the row it sits in - it wraps inside the strip's own width. The
+ * waiting slot carries this class too and is unaffected: its placeholders are
+ * narrower than the measure and its only text is visually hidden. */
+.root[data-variant='compact'] .state {
+  max-inline-size: var(--rail-state-measure, 20rem);
+  font-size: var(--ls-text-xs, 12px);
 }

@@ -13,16 +13,17 @@
  * button and the header badge disagree about what a buyer has bought.
  *
  * HOW THE OUTCOME IS ANNOUNCED
- * The cart does not reject a failed change: it publishes wording for it. `addLine` resolves either
- * way, sets `syncStatus` to `'error'` and puts a customer-facing sentence on `cartError`, so the
- * outcome of a press is a fact about the cart's published state rather than a value the call
- * returns. That is why the notice is raised from the settled state and not from the call's own
- * resolution: announcing success where the promise resolved would tell a buyer their product was
- * added whenever the cart had just said the opposite. The `catch` remains for the other kind of
- * failure, the unexpected throw, which the cart never describes and therefore never publishes
- * wording for. Each press is numbered and the number of the press last spoken about is kept, so
- * whichever path speaks for a press is the only one that speaks for it - and a cart written to by
- * another part of the page is never mistaken for an answer to a press made here.
+ * A press is answered from how its call to the cart settled, because that is the only thing that
+ * knows what became of the units. Units are added to whatever the line already holds, so an
+ * addition whose request came back a failure may still have been carried out; the cart therefore
+ * reads itself back from the server before it answers, resolves where those units did go in, and
+ * otherwise rejects with a `CartAdditionError` saying whether the read found them absent or
+ * established nothing about them. The notice is written from that outcome and never from anything
+ * this file infers: an addition is stated as having failed only where the cart found the units
+ * absent, and every other ending - an outcome the cart could not settle, or a throw it never
+ * described at all - is announced as the open question it is, with the buyer asked to look at their
+ * cart. Nothing here tells a buyer their cart was left as it was unless that was read back and
+ * confirmed, and nothing invites a second press that could double a line.
  *
  * ONE EVENT, ONE ANNOUNCEMENT
  * A failure is stated twice, deliberately in two places: the notice answers what the buyer just
@@ -30,8 +31,10 @@
  * screen for as long as the cart holds it. Only one of them announces, though. The notification
  * queue speaks through a single polite region of its own, and `Alert` at tone `'warning'` takes
  * that primitive's polite branch, so the line does not add a second, assertive announcement of a
- * failure that has just been announced. The two also use different words - the notice carries the
- * store's own short sentence and the line carries the cart's - so nothing is read out twice.
+ * failure that has just been announced. One press settles once and raises one notice, so a cart
+ * written to by another part of the page never puts words in this control's mouth; the sentence the
+ * two show may be the same one, because the cart authors that wording and both places state what it
+ * said rather than inventing a second account of it.
  *
  * THE CLOCK IS NOT READ HERE
  * The dispatch line is built from what `useShippingEta` published - the arrival wording and the
@@ -56,7 +59,7 @@
  */
 
 import clsx from 'clsx';
-import { useEffect, useId, useRef, useState, type ChangeEvent, type ReactElement } from 'react';
+import { useId, useState, type ChangeEvent, type ReactElement } from 'react';
 
 import { Alert } from '@/components/ui/Alert';
 import { Button } from '@/components/ui/Button';
@@ -66,6 +69,7 @@ import { useCart } from '@/hooks/useCart';
 import { useShippingEta } from '@/hooks/useShippingEta';
 import { formatQuantityLabel } from '@/lib/format';
 import type { CartItemDraft, StockState } from '@/lib/types';
+import { CartAdditionError } from '@/providers/CartProvider';
 import { useToastCenter } from '@/providers/ToastProvider';
 
 import styles from './AddToCartControl.module.css';
@@ -98,8 +102,15 @@ const ORDERABLE_STOCK_STATES: Record<StockState, boolean> = {
   OUT_OF_STOCK: false,
 };
 
-/** Wording for an addition that failed before the cart could describe the failure itself. */
-const ADDITION_FAILED_BODY = 'Your cart was left as it was. Try again in a moment.';
+/**
+ * Wording for an addition that failed without the cart describing the failure itself.
+ *
+ * A failure the cart did not author is also a failure nobody established the outcome of, and units
+ * are added to whatever the line already holds: the request may have been carried out before it
+ * failed. So this says neither that the cart is unchanged nor that pressing again is safe - it
+ * sends the buyer to look at what their cart holds, which is the one thing that is true here.
+ */
+const UNSETTLED_ADDITION_BODY = 'Check your cart before adding this product again.';
 
 /**
  * A message that could be a sentence somebody wrote for a buyer: one line, of a length a person
@@ -110,22 +121,23 @@ const CUSTOMER_SENTENCE = /^[^\n\r{}[\]<>]{1,140}[.!?]$/;
 /**
  * Wording a buyer may read for `cause`.
  *
- * The cart publishes customer wording for every failure it understands, and that wording is what
- * the notice under the control shows. A value that reaches this function threw instead, so its
- * message is as likely to carry a request URL, a query or a stack frame as it is to carry a
- * sentence: only a plain sentence is passed through, and everything else - including a thrown
- * value that is not an `Error` at all - becomes the store's own wording.
+ * A failure the cart rejected with carries the sentence it published for a customer, and that
+ * sentence is what the notice should show, so it is passed straight through. Anything else that
+ * reaches here threw on its own terms, and its message is as likely to carry a request URL, a query
+ * or a stack frame as it is to carry a sentence: the guard is what tells the two apart, and
+ * everything that does not read as a sentence - including a thrown value that is not an `Error` at
+ * all - becomes the store's own wording instead.
  */
 function customerFailureBody(cause: unknown): string {
   if (!(cause instanceof Error)) {
-    return ADDITION_FAILED_BODY;
+    return UNSETTLED_ADDITION_BODY;
   }
 
   const message = cause.message.trim();
 
   return CUSTOMER_SENTENCE.test(message) && !message.includes('://')
     ? message
-    : ADDITION_FAILED_BODY;
+    : UNSETTLED_ADDITION_BODY;
 }
 
 /**
@@ -235,17 +247,6 @@ export function AddToCartControl({
 
   const [quantity, setQuantity] = useState<number>(MIN_ORDER_QUANTITY);
 
-  // Presses this control has sent to the cart. It moves forward once per press, in the handler
-  // below, so the announcement effect has something that changes for every press even when two
-  // presses end the same way.
-  const [pressCount, setPressCount] = useState<number>(0);
-
-  // The press the buyer has already been told about. Held in a ref rather than in state because
-  // the announcement effect writes it, and because it is a record of what has been said rather
-  // than anything the markup depends on. It is what makes the two announcement paths exclusive:
-  // whichever of them speaks first for a press marks it here, and neither speaks for it again.
-  const announcedPress = useRef<number>(0);
-
   const quantityLimit = quantityCeiling(maxQuantity);
   const orderedQuantity = clampQuantity(quantity, quantityLimit);
   const quantityChoices = Array.from(
@@ -257,39 +258,8 @@ export function AddToCartControl({
   const cartIsSaving = syncStatus === 'saving';
   const canAddToCart = isOrderable && !cartIsSaving && syncStatus !== 'loading';
 
-  // The cart's answer to a press, announced once the cart has finished working on it.
-  //
-  // Three things keep this to one notice for one press. Nothing is said before the first press, so
-  // the queue stays quiet on a page nobody has acted on. Nothing is said while the cart is still
-  // working, so a press cannot be answered before the cart has answered it. And nothing is said
-  // for a press already answered, which is what the ledger above records - so the cart being
-  // written to by another part of the page, or the countdown republishing, never puts words in
-  // this control's mouth.
-  useEffect(() => {
-    if (pressCount === 0 || pressCount === announcedPress.current) {
-      return;
-    }
-
-    if (syncStatus === 'saving' || syncStatus === 'loading') {
-      return;
-    }
-
-    announcedPress.current = pressCount;
-
-    if (cartError === null) {
-      showToast({ tone: 'success', title: `${productName} added to your cart` });
-      return;
-    }
-
-    showToast({
-      tone: 'danger',
-      title: `${productName} could not be added to your cart`,
-      body: ADDITION_FAILED_BODY,
-    });
-  }, [pressCount, syncStatus, cartError, showToast, productName]);
-
   /**
-   * Ask the cart for the quantity on screen.
+   * Ask the cart for the quantity on screen, and tell the buyer how it went.
    *
    * The guard is the same condition the action is disabled by, so a press that arrives anyway -
    * from a keyboard repeat, or from a click already in flight when the cart began saving - cannot
@@ -300,26 +270,27 @@ export function AddToCartControl({
       return;
     }
 
-    // The press being made. Presses are serialized by the guard above, so the next number is the
-    // one this press gets, and it is the name both announcement paths refer to it by.
-    const press = pressCount + 1;
     const draft: CartItemDraft = { productId, quantity: orderedQuantity };
-
-    setPressCount(press);
 
     try {
       await addLine(draft);
+
+      // The cart resolves only for units it has established are in it, including units a failed
+      // request turned out to have added anyway, so this states a fact rather than an expectation.
+      showToast({ tone: 'success', title: `${productName} added to your cart` });
     } catch (cause: unknown) {
-      // Only an unexpected throw arrives here: a failure the cart understands is published on
-      // `cartError` and announced by the effect above. Marking the press answered before speaking
-      // is what stops that effect saying anything further about it, whatever the cart publishes
-      // afterwards, and the buyer gets wording that has been checked for readability rather than
-      // whatever the failure carried.
-      announcedPress.current = press;
+      // What the notice may assert is exactly what the cart established. An addition it read back
+      // and found had added nothing is stated as a failure; an outcome it could not settle, and a
+      // throw it never described at all, are equally unknown here and are announced without
+      // claiming the units stayed out of the cart.
+      const unitsFoundAbsent =
+        cause instanceof CartAdditionError && cause.outcome === 'not-applied';
 
       showToast({
         tone: 'danger',
-        title: `${productName} could not be added to your cart`,
+        title: unitsFoundAbsent
+          ? `${productName} could not be added to your cart`
+          : `${productName} may not have been added to your cart`,
         body: customerFailureBody(cause),
       });
     }

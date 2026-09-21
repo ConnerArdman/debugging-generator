@@ -9,7 +9,7 @@
  * no import edge between this folder and the service layer in either direction;
  * the route handler is where the two meet.
  *
- * Four conventions come from elsewhere and are mirrored here rather than
+ * Five conventions come from elsewhere and are mirrored here rather than
  * restated:
  *
  * 1. **The paging names are the response's.** `PagedList<T>` in `@/lib/types`
@@ -29,6 +29,12 @@
  *    turn into a response body of field paths and messages. The messages below
  *    say what was expected and never repeat what was received, because a
  *    customer identifier is somebody's data even when it is malformed.
+ * 5. **The consumer classification is the endpoint's.** The only caller of this
+ *    schema is the route handler for `GET /api/orders`: the query it parses
+ *    arrives over HTTP, no browser code in this application builds that query -
+ *    the order history is server-rendered and its page calls the order service
+ *    directly - and `@/lib/types` therefore mirrors this shape with no
+ *    client-side DTO.
  *
  * Unknown parameters are stripped rather than rejected, so a link that arrived
  * carrying a tracking parameter still resolves to a page of orders.

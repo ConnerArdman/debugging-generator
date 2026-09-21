@@ -33,6 +33,17 @@
  *      shorten. A failure keeps every value the buyer typed, so placing the order again is one
  *      click rather than a re-typed form.
  *
+ *   4. THE FORM SAYS WHAT IT KNOWS AND NOT WHAT IT WOULD PREFER. Two of the things a buyer
+ *      reads here are statements about their money, and neither may be guessed. A failure is
+ *      described as "nothing was charged" only where the store said which reason applied and
+ *      that reason means nothing was captured; a reason the store did not author - a reply that
+ *      never arrived, one this page could not read, a status this page read a meaning into -
+ *      leaves the order unconfirmed, and what the buyer is offered then is to check the order
+ *      rather than to place it again. That check is the same submission with the same attempt
+ *      name, which the endpoint answers with the order it already holds instead of a second one,
+ *      so the safe action and the retry are one control. And the cart: a cart that could not be
+ *      read is not an empty cart, so its totals are withheld rather than printed as zero.
+ *
  * Validation is a mirror of the server's bounds, not a second opinion about them: the lengths and
  * shapes below are the ones `checkoutBodySchema` enforces, so a value this form accepts is a value
  * that endpoint accepts, and the endpoint remains the authority on everything that depends on data
@@ -128,6 +139,15 @@ const POSTAL_CODE_SHAPE = /^[A-Za-z0-9]+(?:[ -][A-Za-z0-9]+)*$/;
 const COUNTRY_CODE_SHAPE = /^[A-Z]{2}$/;
 
 /**
+ * How many random bytes name one attempt to place an order.
+ *
+ * Sixteen, written as hexadecimal, is thirty-two characters - comfortably
+ * inside the bound `checkoutBodySchema` holds the field to, and far beyond the
+ * point at which two buyers could mint the same name.
+ */
+const ATTEMPT_BYTES = 16;
+
+/**
  * The destinations this catalog's warehouses quote freight for.
  *
  * A closed list rather than a text field, because the country is the one address field the
@@ -198,14 +218,22 @@ type CheckoutFieldErrors = Partial<Record<CheckoutFieldKey, string>>;
 /**
  * Wording for a submission that failed, as the notice above the submit row prints it.
  *
- * Two fields, both written for a buyer: a headline they can scan and a sentence they can act on.
- * Nothing from the failure itself reaches either - not its message, not its status line, not a
- * stack - because a customer cannot do anything with an internal string, and a checkout is the
- * last place to start showing them one.
+ * Three fields, all written for a buyer: a headline they can scan, a sentence they can act on,
+ * and the label of the control the notice offers. Nothing from the failure itself reaches any of
+ * them - not its message, not its status line, not a stack - because a customer cannot do
+ * anything with an internal string, and a checkout is the last place to start showing them one.
+ *
+ * The label is part of the copy rather than fixed in the markup because the control means
+ * different things in the two cases the notice covers. Where the store said the order was not
+ * placed, pressing it places the order. Where the outcome is unconfirmed, pressing it resolves
+ * the attempt - the same submission under the same name, which the endpoint answers with the
+ * order it already holds if there is one - and calling that "try again" would invite a buyer to
+ * order twice.
  */
 interface OrderFailureCopy {
   readonly title: string;
   readonly body: string;
+  readonly action: string;
 }
 
 interface Props {
@@ -231,7 +259,13 @@ interface Props {
    *
    * A hook for the surrounding page - recording the conversion, moving the buyer on - and nothing
    * this form depends on: it swaps the receipt in whether a handler was supplied or not, and it
-   * never routes, retries or re-requests anything of its own.
+   * never routes, retries or re-requests anything of its own. It runs outside the form's own
+   * classification of the request, so a handler that throws is logged rather than turned into a
+   * failed checkout; the order was placed either way.
+   *
+   * `result.outcome` is worth reading before a page records a conversion: an `already_placed`
+   * result is the order an earlier submission placed, handed back because this one named the same
+   * attempt, and counting it twice would count one sale twice.
    */
   onOrderPlaced?: (result: CheckoutResult) => void;
 
@@ -242,9 +276,11 @@ interface Props {
 /* ---------------------------------------------------------------------------
  * Pure helpers
  *
- * All four are module-level and take everything they need as arguments, so the component body
+ * All of them are module-level and take everything they need as arguments, so the component body
  * holds no logic worth reading twice and each of them can be reasoned about - or exercised - on its
- * own. None of them touches the network, the clock or the DOM.
+ * own. None of them touches the network, the clock or the DOM. One reads the platform's random
+ * source, and {@link attemptKey} says where that is called from and why it is not called while
+ * anything is rendering.
  * ------------------------------------------------------------------------- */
 
 /**
@@ -261,6 +297,27 @@ function trimmedOrNull(value: string): string | null {
 }
 
 /**
+ * A name for one attempt to place an order: {@link ATTEMPT_BYTES} random bytes in hexadecimal.
+ *
+ * It exists so that a submission and every retry of that submission arrive under one name, which
+ * is what lets the endpoint answer a retry with the order it already placed rather than placing a
+ * second one. The name says nothing about the order, the cart or the buyer - it is an identifier
+ * for the attempt and nothing else - so random bytes are the whole of it.
+ *
+ * Two deliberate choices about how they are drawn. `crypto.getRandomValues` rather than
+ * `Math.random`, because two buyers must not mint one name; and called from the submit handler
+ * rather than from the component body, because a value drawn while rendering would differ between
+ * the markup the server sent and the markup this page hydrates.
+ */
+function attemptKey(): string {
+  const bytes = new Uint8Array(ATTEMPT_BYTES);
+
+  crypto.getRandomValues(bytes);
+
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+/**
  * The request body for what the controls currently hold.
  *
  * Trimming happens here rather than in the controls, so what a buyer sees in a field is exactly
@@ -271,12 +328,17 @@ function trimmedOrNull(value: string): string | null {
  * `shippingOptionId` falls back to `''` for a form with nothing chosen. That is not a value worth
  * sending, and it is not sent: an empty identifier is what {@link collectFieldErrors} reports as a
  * missing service, which is checked before the draft goes anywhere.
+ *
+ * `key` names the attempt this draft belongs to - see {@link attemptKey} - and is passed in rather
+ * than drawn here, because two drafts assembled from the same unresolved attempt must carry the
+ * same name.
  */
 function checkoutDraftFrom(
   contact: ContactFields,
   address: AddressFields,
   shippingOptionId: string | null,
   notes: string,
+  key: string,
 ): CheckoutDraft {
   return {
     contact: {
@@ -294,6 +356,7 @@ function checkoutDraftFrom(
     },
     shippingOptionId: shippingOptionId ?? '',
     notes: trimmedOrNull(notes),
+    idempotencyKey: key,
   };
 }
 
@@ -379,6 +442,27 @@ function collectFieldErrors(draft: CheckoutDraft): CheckoutFieldErrors {
   return problems;
 }
 
+/** The label of the notice's control where placing the order again is the thing to do. */
+const RETRY_ORDER = 'Try again';
+
+/** The label of the notice's control where resolving the attempt is the thing to do. */
+const RESOLVE_ORDER = 'Check this order';
+
+/**
+ * Wording for an attempt whose outcome this page cannot establish.
+ *
+ * It is the one notice that does not say whether the buyer has been charged, because that is the
+ * situation: the request left this page and what became of it is not known here. So it says so,
+ * it does not invite a second order, and it explains why the control in front of the buyer is
+ * safe to press - the endpoint recognises the attempt and answers with the order it already
+ * holds, and places the order only if it never received it.
+ */
+const UNCONFIRMED: OrderFailureCopy = {
+  title: 'This order is not confirmed',
+  body: 'Lumen Supply may already have this order, and a payment may already have been taken for it. Check the order rather than placing it again: checking cannot create a second order, and it completes this one if the store never received it.',
+  action: RESOLVE_ORDER,
+};
+
 /**
  * Wording for a submission that did not place an order.
  *
@@ -388,16 +472,28 @@ function collectFieldErrors(draft: CheckoutDraft): CheckoutFieldErrors {
  * that answered badly from one that could not answer at all, so the copy follows the failure rather
  * than the HTTP vocabulary it arrived in.
  *
+ * Two of those branches are reached only through a reason the store itself named, and that is
+ * checked before any of them: a failure carrying a reason this page derived - because the request
+ * never came back, because the reply could not be read, because only a status arrived - is a
+ * failure about a submission that may well have been carried out, and describing it as one that
+ * was not would be this page inventing the part it does not know. `PAYMENT_STATUS_UNKNOWN` is the
+ * same situation named by the store, for the case where the store knows it too.
+ *
  * Anything that is not a {@link StorefrontApiError} - a mistake in this page, a value the browser
- * threw - lands on the same generic sentence: it is equally true, and it says nothing a customer
- * cannot act on.
+ * threw - lands on the generic sentence: nothing left for the store at all, so nothing was
+ * charged.
  */
 function checkoutFailureCopy(cause: unknown): OrderFailureCopy {
   if (!(cause instanceof StorefrontApiError)) {
     return {
       title: 'The order was not placed',
       body: 'Something went wrong before this order reached Lumen Supply. Nothing was charged. Place the order again.',
+      action: RETRY_ORDER,
     };
+  }
+
+  if (!cause.reported) {
+    return UNCONFIRMED;
   }
 
   switch (cause.code) {
@@ -405,46 +501,51 @@ function checkoutFailureCopy(cause: unknown): OrderFailureCopy {
       return {
         title: 'Check these order details',
         body: 'Lumen Supply could not accept these details. Review the contact and address fields, then place the order again.',
+        action: RETRY_ORDER,
       };
     case 'NOT_FOUND':
       return {
         title: 'Something in this order is no longer available',
         body: 'A product or a shipping service in this order is no longer offered. Review the cart and the shipping method, then place the order again.',
+        action: RETRY_ORDER,
       };
     case 'OUT_OF_STOCK':
       return {
         title: 'Stock changed while you were ordering',
         body: 'One or more items are no longer available in the quantity requested. Adjust the cart, then place the order again.',
+        action: RETRY_ORDER,
       };
     case 'CART_CONFLICT':
       return {
         title: 'This cart changed',
         body: 'The cart changed while this order was being placed. Review it, then place the order again.',
+        action: RETRY_ORDER,
       };
     case 'PAYMENT_DECLINED':
       return {
         title: 'Payment was declined',
         body: 'The payment was not authorized and nothing was charged. Use another payment method, then place the order again.',
+        action: RETRY_ORDER,
       };
+    case 'PAYMENT_STATUS_UNKNOWN':
+      return UNCONFIRMED;
+    // Neither of the next two is ever reported by the store - both describe the reply rather than
+    // the order - so both are answered above. They are named here so that the reason for that is
+    // stated where a reader looks for it, and so that every member of the union has an answer.
     case 'NETWORK_FAILURE':
-      return {
-        title: 'Lumen Supply could not be reached',
-        body: 'The order was not placed and nothing was charged. Check your connection, then place the order again.',
-      };
     case 'MALFORMED_RESPONSE':
-      return {
-        title: 'The order status is unclear',
-        body: 'Lumen Supply replied in a form this page could not read. Check your orders before placing this one again.',
-      };
+      return UNCONFIRMED;
     case 'INTERNAL_ERROR':
       return cause.status >= 500
         ? {
             title: 'Lumen Supply could not complete the order',
             body: 'The store reported a problem on its side. Nothing was charged. Place the order again in a moment.',
+            action: RETRY_ORDER,
           }
         : {
             title: 'The order was not placed',
             body: 'Lumen Supply could not complete this order. Nothing was charged. Place the order again.',
+            action: RETRY_ORDER,
           };
   }
 }
@@ -520,6 +621,13 @@ export function CheckoutForm({
 
   const failureRegion = useRef<HTMLDivElement | null>(null);
 
+  // The name every submission of the order in front of the buyer travels under, drawn on the
+  // first one and kept until an order exists. A ref rather than state because nothing renders it
+  // and changing it must not re-render anything - and because it has to survive the render that a
+  // failure causes, which is the render after which it matters most: the next submission is the
+  // one the endpoint has to recognise as the same attempt.
+  const attempt = useRef<string | null>(null);
+
   // The notice announces itself - `Alert`'s `danger` tone renders `role="alert"` - and focus
   // follows it, so a reader using the keyboard lands on the sentence explaining why the order did
   // not go through instead of on the button that appeared to do nothing. It runs from an effect
@@ -535,14 +643,21 @@ export function CheckoutForm({
    * Place the order.
    *
    * The whole path, in order: stop the browser navigating; refuse a second submission while one is
-   * running; assemble the draft; validate it once; publish the messages that pass produced and drop
-   * any notice from an earlier attempt; stop there if anything is wrong; then one request, whose
-   * two outcomes are a stored order and a receipt, or a notice above the submit row with every
-   * typed value still in place.
+   * running; name the attempt, once, and keep that name for every submission of this order;
+   * assemble the draft; validate it once; publish the messages that pass produced and drop any
+   * notice from an earlier attempt; stop there if anything is wrong; then one request, whose two
+   * outcomes are a stored order and a receipt, or a notice above the submit row with every typed
+   * value still in place.
    *
-   * Nothing else belongs here. It starts no timer, measures nothing, retries nothing, batches
-   * nothing and empties no cart: the cart is converted by the endpoint, and a second request from
-   * this handler would only add work to the interaction a buyer is waiting on.
+   * The request is classified on its own, and what follows a success is not. A consumer's
+   * `onOrderPlaced` runs after the order has been stored and announced, outside anything that
+   * treats a thrown value as a failed checkout - a handler that throws is a bug in the surrounding
+   * page, and reporting an order that exists as an order that does not would be a worse one. It is
+   * logged where a developer will see it and nowhere a buyer will.
+   *
+   * Nothing else belongs here. It starts no timer, measures nothing, retries nothing on its own,
+   * batches nothing and empties no cart: the cart is converted by the endpoint, and a second
+   * request from this handler would only add work to the interaction a buyer is waiting on.
    */
   async function submitOrder(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault();
@@ -551,7 +666,13 @@ export function CheckoutForm({
       return;
     }
 
-    const draft = checkoutDraftFrom(contact, address, shippingOptionId, notes);
+    // Drawn on the first submission and reused by every later one, so a buyer pressing the
+    // control again after an unconfirmed outcome resolves that attempt instead of starting
+    // another. An order that was placed ends the form, so a name is never reused for a second
+    // order.
+    attempt.current ??= attemptKey();
+
+    const draft = checkoutDraftFrom(contact, address, shippingOptionId, notes, attempt.current);
     const problems = collectFieldErrors(draft);
 
     setFieldErrors(problems);
@@ -563,23 +684,34 @@ export function CheckoutForm({
 
     setPending(true);
 
-    try {
-      const result = await submitCheckout(draft);
+    let result: CheckoutResult;
 
-      setPlaced(result);
-      showToast({
-        tone: 'success',
-        title: 'Order placed',
-        body: `Order ${result.order.orderNumber} is confirmed.`,
-      });
-      onOrderPlaced?.(result);
+    try {
+      result = await submitCheckout(draft);
     } catch (cause) {
       const copy = checkoutFailureCopy(cause);
 
       setFailure(copy);
       showToast({ tone: 'danger', title: copy.title });
+
+      return;
     } finally {
       setPending(false);
+    }
+
+    const replayed = result.outcome === 'already_placed';
+
+    setPlaced(result);
+    showToast({
+      tone: 'success',
+      title: replayed ? 'This order was already placed' : 'Order placed',
+      body: `Order ${result.order.orderNumber} is confirmed.`,
+    });
+
+    try {
+      onOrderPlaced?.(result);
+    } catch (cause) {
+      console.error('Lumen Supply: a checkout consumer failed after the order was placed:', cause);
     }
   }
 
@@ -587,17 +719,32 @@ export function CheckoutForm({
     return (
       <div className={clsx(styles.root, className)}>
         <div className={styles.confirmation}>
-          <OrderConfirmation order={placed} headline="Thank you for your order" />
+          <OrderConfirmation
+            order={placed}
+            headline={
+              placed.outcome === 'already_placed'
+                ? 'This order was already placed'
+                : 'Thank you for your order'
+            }
+          />
         </div>
       </div>
     );
   }
 
+  // What the cart is, as this form has to treat it. A cart the provider could not read publishes
+  // no lines and a failure, which reads exactly like a cart somebody emptied - so the two are told
+  // apart here: a failure with nothing published is a cart whose contents are unknown, and an
+  // order cannot be priced against a cart nobody has read. A failure that arrived after the cart
+  // had been read leaves the lines it read in place, and those are still the figures to show.
+  const cartUnknown = cart.syncStatus === 'error' && cart.lineCount === 0;
+
   // An order needs something to ship and a service to ship it by. Both are the buyer's to fix -
   // the cart page for the first, the group below for the second - so the control is unavailable
   // rather than hidden, and the validation pass says the same thing in words if the form is
-  // submitted with the keyboard.
-  const readyToPlaceOrder = cart.itemCount > 0 && shippingOptionId !== null;
+  // submitted with the keyboard. A cart that could not be read disables it too, on the strength of
+  // not knowing rather than of knowing the cart is empty.
+  const readyToPlaceOrder = !cartUnknown && cart.itemCount > 0 && shippingOptionId !== null;
 
   return (
     <form
@@ -870,7 +1017,7 @@ export function CheckoutForm({
             title={failure.title}
             actions={
               <Button type="submit" variant="secondary" size="sm">
-                Try again
+                {failure.action}
               </Button>
             }
           >
@@ -879,10 +1026,37 @@ export function CheckoutForm({
         </div>
       )}
 
+      {cartUnknown ? (
+        <div className={styles.cartNotice}>
+          <Alert
+            tone="danger"
+            title="Your cart could not be read"
+            actions={
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={() => {
+                  void cart.refreshCart();
+                }}
+              >
+                Read the cart again
+              </Button>
+            }
+          >
+            {cart.cartError ??
+              'Lumen Supply could not read what is in your cart, so this order cannot be priced yet.'}
+          </Alert>
+        </div>
+      ) : null}
+
       <div className={styles.submitRow}>
         <CheckoutButton pending={pending} disabled={!readyToPlaceOrder} />
 
-        {cart.syncStatus === 'loading' ? null : (
+        {/* The line beside the control quotes what is about to be ordered, so it appears only
+            where there is a cart to quote: neither a cart still being read nor one that could not
+            be read has figures, and printing a zero for either would be this form asserting an
+            empty cart it has no grounds to assert. */}
+        {cart.syncStatus === 'loading' || cartUnknown ? null : (
           <p>{orderSizeLabel(cart.itemCount, cart.subtotalLabel)}</p>
         )}
       </div>

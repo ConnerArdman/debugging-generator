@@ -102,6 +102,16 @@
   scroll-margin-block-start: var(--ls-space-5, 24px);
 }
 
+/* Where the state of the cart is announced when it is not a state the submit row can quote - a
+ * cart the storefront could not read. It sits between the submission notice and the submit row,
+ * beside the control it disables, and takes the same spacing as that notice so a form showing both
+ * reads as one column rather than two. Colour, border and tone are the alert's own. */
+.cartNotice {
+  min-width: 0;
+  margin-block-end: var(--ls-space-4, 16px);
+  scroll-margin-block-start: var(--ls-space-5, 24px);
+}
+
 /* What replaces the fields once the order is placed. The confirmation renders its own surface, so
  * this is the rhythm between its blocks and nothing more. */
 .confirmation {

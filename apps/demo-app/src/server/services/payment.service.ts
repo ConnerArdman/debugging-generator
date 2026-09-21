@@ -28,21 +28,31 @@
  * reply carried it in. No `Date` reaches the returned value: it goes on into an
  * order and through JSON to the browser.
  *
- * Two rules govern how a reply is read, and they are why the code below is as
+ * Three rules govern how a reply is read, and they are why the code below is as
  * careful as it is:
  *
  * 1. **An outcome is never invented.** `authorized` is taken from the reply and
  *    from nowhere else. A non-2xx status, a body that is not JSON and a body
- *    that does not state the outcome are all upstream failures, reported
- *    through {@link StorefrontUpstreamError} rather than resolved into an
- *    approval. Every other field has a sound local fallback - the amount asked
+ *    that does not state the outcome are all failures rather than approvals.
+ *    Every other field has a sound local fallback - the amount asked
  *    for, the reference sent, the moment the reply was read - so a processor
  *    that answers tersely still yields a complete authorization.
- * 2. **A caller's mistake stays a caller's mistake.** The amount, the currency
+ * 2. **A failure says whether an amount may have been taken.** That is the one
+ *    thing a customer needs from it, and the two kinds are not interchangeable.
+ *    A processor that refuses the request it was sent - the client-error
+ *    statuses, which say the request was rejected rather than acted on - took
+ *    nothing, and that is a {@link StorefrontUpstreamError}. A request that was
+ *    sent and not answered readably - a connection that did not come back, a
+ *    timeout, a server-side status, a reply whose outcome cannot be read -
+ *    leaves an authorization possibly standing, and that is
+ *    {@link paymentStatusUnknown}. Collapsing the second into the first would
+ *    have the storefront promise a customer they were not charged on the
+ *    strength of a reply it never read.
+ * 3. **A caller's mistake stays a caller's mistake.** The amount, the currency
  *    and the reference are checked here against the same rules the endpoint
  *    enforces, so a fractional amount or a blank reference is reported as the
  *    validation failure it is instead of returning as a bare rejection from a
- *    dependency.
+ *    dependency. Nothing has been sent at that point, so nothing was taken.
  *
  * A declined authorization is not a failure of this module: it returns with
  * `authorized: false` and the wording to show for it, and the checkout decides
@@ -51,7 +61,11 @@
  */
 
 import type { PaymentAuthorization } from '@/lib/types';
-import { StorefrontUpstreamError, StorefrontValidationError } from '@/server/errors';
+import {
+  StorefrontUpstreamError,
+  StorefrontValidationError,
+  paymentStatusUnknown,
+} from '@/server/errors';
 import { trusted } from '@/server/origin';
 
 /**
@@ -68,15 +82,40 @@ const TIMEOUT = 10_000;
 const CURRENCY = /^[A-Z]{3}$/;
 
 /**
+ * The one status a client-error reply carries that does not mean the request
+ * was rejected unacted-upon: a request the processor timed out on is a request
+ * it may have begun.
+ */
+const TIMED_OUT = 408;
+
+/**
  * What a visitor is told when the processor's reply could not be read.
  *
- * It says the order was not completed, which is the one thing this module knows
- * for certain in that situation, and names neither the endpoint nor what was
- * wrong with the reply - a reply this application could not parse is not
- * something to quote back to a browser.
+ * It says what this module actually knows in that situation - the order was not
+ * completed, and whether an amount was taken is unresolved - and names neither
+ * the endpoint nor what was wrong with the reply: a reply this application could
+ * not parse is not something to quote back to a browser. The customer is sent to
+ * their orders rather than back to the button, because pressing it again is the
+ * one action that could turn an unresolved authorization into two.
  */
 const UNREADABLE =
-  'The payment service returned a reply this storefront could not read, so this order was not completed.';
+  'The payment service replied in a form this storefront could not read, so this order was not completed and whether the payment was taken is unresolved. Check your orders before placing it again.';
+
+/**
+ * What a visitor is told when no reply came back at all: the same unresolved
+ * situation, reached by a connection that did not return rather than by one
+ * that returned something unreadable.
+ */
+const UNANSWERED =
+  'The payment service did not answer, so this order was not completed and whether the payment was taken is unresolved. Check your orders before placing it again.';
+
+/**
+ * What a visitor is told when the processor answered that it could not complete
+ * the authorization without saying what became of it - a failing reply that is
+ * not the processor turning the request away.
+ */
+const UNSETTLED =
+  'The payment service could not complete this authorization, so this order was not completed and whether the payment was taken is unresolved. Check your orders before placing it again.';
 
 /** The wording to show for a decline the processor gave no reason for. */
 const DECLINED = 'The payment was declined by the processor.';
@@ -148,6 +187,24 @@ function cents(value: unknown): number | null {
 }
 
 /**
+ * Whether a failing `status` means the processor turned the request away rather
+ * than acting on it.
+ *
+ * A client-error status is the processor saying the request was not one it would
+ * process - malformed, unauthorized, addressed to nothing, refused - and a
+ * request that was not processed authorized nothing. A request it timed out on
+ * is the exception, because a timeout is reported about work that may have
+ * started. Everything else a failing reply can carry - a server-side status, a
+ * redirect nothing followed, an informational status - says nothing either way
+ * and is therefore unresolved.
+ *
+ * @param status The status of the failing reply.
+ */
+function refused(status: number): boolean {
+  return status >= 400 && status < 500 && status !== TIMED_OUT;
+}
+
+/**
  * `value` as an ISO-8601 UTC string when it is a readable instant, `null`
  * otherwise.
  *
@@ -188,10 +245,16 @@ function stamp(value: unknown): string | null {
  * @throws StorefrontValidationError when the amount is not a whole,
  * non-negative number of cents, the currency is not a three-letter code, no
  * reference was given, or the address handed over is not one this store may
- * reach itself at.
- * @throws StorefrontUpstreamError when the processor could not be reached,
- * answered with a status outside the 2xx range, or answered with a body this
- * module could not read an outcome from.
+ * reach itself at. Nothing has been sent at that point, so nothing was taken.
+ * @throws StorefrontUpstreamError when the processor turned the request away:
+ * a client-error status other than a timeout, which is the processor declining
+ * to process the request rather than an answer about an amount. Nothing was
+ * taken.
+ * @throws StorefrontError `PAYMENT_STATUS_UNKNOWN` when the request was sent
+ * and its outcome cannot be established - the processor did not answer, timed
+ * out, answered with a server-side status, or answered with a body this module
+ * could not read an outcome from. An authorization may stand, and the caller
+ * must not treat this as a definite refusal.
  *
  * @example
  * ```ts
@@ -246,24 +309,27 @@ export async function authorize(
       signal: AbortSignal.timeout(TIMEOUT),
     });
   } catch (cause) {
-    // The request did not come back - refused, dropped or out of time. The
-    // caught value is kept for the server log only: it may name a host or a
-    // port, and neither belongs in a response body.
-    throw new StorefrontUpstreamError(
-      'The payment service did not respond, so this order was not completed. Please try again in a moment.',
-      'payment',
-      { cause },
-    );
+    // The request left this process and nothing came back - dropped, refused by
+    // the transport or out of time - so whether the processor received it and
+    // acted on it is not something this module can establish. The caught value
+    // is kept for the server log only: it may name a host or a port, and
+    // neither belongs in a response body.
+    throw paymentStatusUnknown(UNANSWERED, { upstream: 'payment', cause });
   }
 
   if (!response.ok) {
-    // Whatever the body of a failing reply holds, it is not an outcome: a
-    // status outside 2xx is the processor declining to answer the question, not
-    // an answer to it.
-    throw new StorefrontUpstreamError(
-      'The payment service could not process this authorization, so this order was not completed. Please try again in a moment.',
-      'payment',
-    );
+    // Whatever the body of a failing reply holds, it is not an outcome. Which
+    // failure it is, though, decides what a customer is told: a processor that
+    // turned the request away authorized nothing, while any other failing reply
+    // leaves that unresolved.
+    if (refused(response.status)) {
+      throw new StorefrontUpstreamError(
+        'The payment service would not process this authorization, so nothing was charged and this order was not completed. Please try again in a moment.',
+        'payment',
+      );
+    }
+
+    throw paymentStatusUnknown(UNSETTLED, { upstream: 'payment' });
   }
 
   let payload: unknown;
@@ -271,20 +337,23 @@ export async function authorize(
   try {
     payload = await response.json();
   } catch (cause) {
-    throw new StorefrontUpstreamError(UNREADABLE, 'payment', { cause });
+    throw paymentStatusUnknown(UNREADABLE, { upstream: 'payment', cause });
   }
 
   if (!fields(payload)) {
-    throw new StorefrontUpstreamError(UNREADABLE, 'payment');
+    throw paymentStatusUnknown(UNREADABLE, { upstream: 'payment' });
   }
 
   const authorized = payload.authorized;
 
-  // The outcome is the one field with no fallback. A reply that does not state
-  // it plainly is an upstream failure, because the alternative - assuming an
-  // answer - is an order shipped against a payment nobody approved.
+  // The outcome is the one field with no fallback. A reply that reached this
+  // point was the processor answering the request it was sent, so a reply that
+  // does not state the outcome plainly leaves it unresolved rather than refused:
+  // the alternative - assuming an answer - is either an order shipped against a
+  // payment nobody approved or a customer told they were not charged when they
+  // were.
   if (typeof authorized !== 'boolean') {
-    throw new StorefrontUpstreamError(UNREADABLE, 'payment');
+    throw paymentStatusUnknown(UNREADABLE, { upstream: 'payment' });
   }
 
   return {

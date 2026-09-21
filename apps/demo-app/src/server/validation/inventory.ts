@@ -94,14 +94,16 @@ const movements: readonly [MovementType, ...MovementType[]] = [
  */
 export const inventorySummaryQuerySchema = z.object({
   /**
-   * Which stocking location to report on, named either by the short code the filter row lists it
-   * under or by its identifier — both are brief strings, so one bounded string accepts either and
-   * the service resolves which it was given. Sixty-four characters is comfortably more than either
-   * form needs and short enough that no caller can smuggle a document into a filter.
+   * Which stocking location to report on, named by its identifier — the `id` of one of the
+   * `WarehouseSummary` entries the same response lists, which is what the filter row submits and
+   * what the service resolves against. The short code a location is displayed under is wording for
+   * a reader rather than a value this parameter accepts, so a parameter named for an identifier
+   * matches on nothing else. Sixty-four characters is comfortably more than an identifier needs and
+   * short enough that no caller can smuggle a document into a filter.
    *
    * `null` is what the dashboard opens on and means every location.
    */
-  warehouse: z.preprocess(unset, z.string().trim().min(1).max(64).nullable().default(null)),
+  warehouseId: z.preprocess(unset, z.string().trim().min(1).max(64).nullable().default(null)),
 
   /**
    * How much headroom above a stock line's reorder point still counts as low, in units.

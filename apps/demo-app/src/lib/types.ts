@@ -55,8 +55,21 @@ export type CatalogSort = 'featured' | 'price_asc' | 'price_desc' | 'name_asc';
  * The machine-readable failure reason carried by {@link StorefrontErrorBody}.
  *
  * `NETWORK_FAILURE` and `MALFORMED_RESPONSE` are produced only by the browser
- * client — the request never reached the server, or the response was not the
- * JSON the caller expected — and a route handler never returns either.
+ * client — the exchange did not complete, or the response was not the JSON the
+ * caller expected — and a route handler never returns either. Neither says the
+ * request went unserved: a reply can be lost or unreadable after the server has
+ * acted on it, so for a request that changes something they mean "unknown",
+ * which is why the browser client also records whether the reason it carries was
+ * the server's own.
+ *
+ * One member is a statement about money rather than about a request, and the
+ * checkout surfaces depend on it: `PAYMENT_STATUS_UNKNOWN` is the single code
+ * with which the storefront cannot rule out that an amount was authorized —
+ * the processor was sent one and did not answer readably, or it approved one
+ * and the order behind it could not be completed. **Every other code a checkout
+ * returns means no amount was captured**, which is what lets a customer be told
+ * plainly whether to place the order again. A caller that treats an unknown
+ * outcome as a definite one is stating something the server did not.
  */
 export type StorefrontErrorCode =
   | 'VALIDATION_FAILED'
@@ -64,6 +77,7 @@ export type StorefrontErrorCode =
   | 'OUT_OF_STOCK'
   | 'CART_CONFLICT'
   | 'PAYMENT_DECLINED'
+  | 'PAYMENT_STATUS_UNKNOWN'
   | 'INTERNAL_ERROR'
   | 'NETWORK_FAILURE'
   | 'MALFORMED_RESPONSE';
@@ -361,7 +375,36 @@ export interface CheckoutDraft {
   shippingAddress: ShippingAddress;
   shippingOptionId: string;
   notes: string | null;
+
+  /**
+   * What the caller calls this attempt to place the order — its own value, kept
+   * for as long as the attempt is unresolved and sent again with every retry of
+   * it.
+   *
+   * Placing an order is not a repeatable request: a reply that is lost on the
+   * way back leaves the caller unable to tell a request that never arrived from
+   * one that placed an order and charged for it. Sending the same value again is
+   * how a caller says "this is that attempt, not another one", and the endpoint
+   * answers a repeat with the order the attempt already placed - see
+   * {@link CheckoutResult.outcome} - rather than placing a second one. A new
+   * order is a new value.
+   *
+   * It identifies nothing but the attempt: it is the caller's to mint, carries
+   * no cart, customer or session identity, and the server reads no meaning from
+   * its content.
+   */
+  idempotencyKey: string;
 }
+
+/**
+ * Which of the two things a successful checkout response describes.
+ *
+ * `placed` is an order this request wrote. `already_placed` is the order the
+ * attempt named by {@link CheckoutDraft.idempotencyKey} had already written -
+ * the answer to a retry whose first reply was lost - so a caller can say so
+ * instead of reporting a second sale that did not happen.
+ */
+export type CheckoutOutcome = 'placed' | 'already_placed';
 
 /** One line of a placed order, priced as it stood when the order was placed. */
 export interface OrderLine {
@@ -406,10 +449,19 @@ export interface OrderDetail extends OrderSummary {
   shippingAddress: ShippingAddress;
 }
 
-/** The response body of a completed checkout: the order created and how its payment resolved. */
+/**
+ * The response body of a completed checkout: the order created and how its
+ * payment resolved.
+ *
+ * `payment` is `null` in one situation only, and it is not an incomplete order:
+ * an `already_placed` result read back from the store's own record carries the
+ * order as it stands, and the authorization that paid for it is not retained
+ * with it, so the order's `status` is what says whether it is paid.
+ */
 export interface CheckoutResult {
   order: OrderDetail;
-  payment: PaymentAuthorization;
+  payment: PaymentAuthorization | null;
+  outcome: CheckoutOutcome;
 }
 
 /* ---------------------------------------------------------------------------

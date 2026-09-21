@@ -15,10 +15,11 @@
 // They are the first four `describe` blocks below, in that order. The remaining
 // blocks cover the rules and guarantees the four cases do not reach
 // (`demo-import`, `demo-path`, the question-branch exemption, `policy-stale`,
-// the policy's canonical form, the exclusion list, the command-line surface, the
-// enforcement of policy drift whenever the demo corpus is present, and the
-// fail-closed scan), because a gate whose supporting rules are untested is a
-// gate that can rot silently.
+// the policy's canonical form, the canonical form of the committed policy
+// artifact itself, the exclusion list, the command-line surface, the enforcement
+// of policy drift whenever the demo corpus is present, and the fail-closed
+// scan), because a gate whose supporting rules are untested is a gate that can
+// rot silently.
 //
 // THREE PROPERTIES THAT ARE THE GATE ITSELF, NOT A DETAIL
 // A guard is only evidence if it fails when it cannot do its job, so three
@@ -42,13 +43,21 @@
 //     run with the environment exit code instead of being counted as clean.
 //
 // HOW EVERY CASE IS BUILT
-// Each case writes a synthetic repository into a fresh `os.tmpdir()` directory
-// and runs the scanner against it with the root-parameterized exports
-// (`check(root)`, `scanProductSource(root)`, `buildPolicy(root)`,
-// `main(argv, root)`). Nothing is written inside this checkout, and the real
-// `scripts/no-hardcoding.policy.json` is never read as an input to an assertion
-// and never mutated - a test that depended on the committed policy would start
-// failing the day the demo application grows a component.
+// Every case about the scanner's behaviour writes a synthetic repository into a
+// fresh `os.tmpdir()` directory and runs the scanner against it with the
+// root-parameterized exports (`check(root)`, `scanProductSource(root)`,
+// `buildPolicy(root)`, `main(argv, root)`). Nothing is ever written inside this
+// checkout.
+//
+// The single exception is "the committed policy artifact", which reads the real
+// `scripts/no-hardcoding.policy.json` through `DEFAULT_ROOT`, because the byte
+// comparison inside `check()` runs only when `apps/demo-app` is present and
+// wholly readable and the committed artifact is this unit's own output. Those
+// cases assert only invariants that hold whatever the demo declares - its
+// canonical form, its metadata, the harvest rule, disjointness from the
+// allowlist - so they do not start failing the day the demo application grows a
+// component, and they name none of its entries: the policy's vocabulary lives in
+// the generated file alone.
 //
 // WHY THIS FILE MAY NAME DEMO SYMBOLS
 // The fixtures below deliberately use real demo vocabulary
@@ -92,6 +101,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 
 import {
   ALLOWLIST_FILE,
+  DEFAULT_ROOT,
   DEMO_PACKAGE,
   DEMO_TREE,
   EXIT_ERROR,
@@ -107,6 +117,7 @@ import {
   SCRIPT_FILE,
   buildPolicy,
   check,
+  isDemoSpecificIdentifier,
   loadAllowlist,
   loadPolicy,
   main,
@@ -1427,6 +1438,117 @@ describe('policy canonical form', () => {
     expect(result.stale.serialization).toEqual({ canonical: true, byteEqual: true, reasons: [] });
     expect(result.ok).toBe(true);
     expect(result.exitCode).toBe(EXIT_OK);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * the committed policy artifact
+ * ---------------------------------------------------------------------------------------------- */
+
+// The cases above prove the gate sees drift in a synthetic tree. None of them
+// says anything about the artifact this repository actually ships, and
+// `check()`'s byte comparison is not a substitute: it is skipped when
+// `apps/demo-app` is absent and skipped when the harvest could read only part of
+// it, which is precisely the state of a partial clone, a sparse checkout or an
+// unreadable corpus file. The committed policy is this unit's own output, so the
+// cases below read it through `DEFAULT_ROOT` and assert what holds whatever the
+// demo declares. None of them names a policy entry: the vocabulary belongs to
+// the generated file, and duplicating it here would make every demo change a
+// test change and every test edit a second, unreviewed policy.
+
+/**
+ * The committed policy artifact's exact bytes. `DEFAULT_ROOT` is the scanner's
+ * own notion of the repository root, so these cases read the very file the gate
+ * reads, and the read happens per case rather than at import time - a missing
+ * artifact then fails the cases that assert on it instead of the whole suite.
+ *
+ * @returns {string}
+ */
+function committedPolicyText() {
+  return readFileSync(at(DEFAULT_ROOT, POLICY_FILE), 'utf8');
+}
+
+describe('the committed policy artifact', () => {
+  it('is byte-identical to its own canonical serialization', () => {
+    // The order-only and formatting drift class, asserted on the committed file
+    // and without the corpus: entries out of case-sensitive ASCII order, an
+    // entry listed twice, a changed key order, a reindentation. This is the
+    // class that reached `main` before, because the comparison that would have
+    // caught it needs a corpus and a membership comparison cannot see it at all.
+    const text = committedPolicyText();
+
+    expect(text).toBe(serializePolicy(JSON.parse(text)));
+  });
+
+  it('carries the metadata a faithful regeneration writes', () => {
+    // A hand-written `generatedBy`, a repointed `corpus` or a dropped exclusion
+    // makes the file claim a provenance or a subtraction `--update` never
+    // performed. `comparePolicies()` reports those as metadata `fields` - again
+    // only when the corpus is present - so without this case an artifact
+    // produced by hand can look generated on any checkout without the demo.
+    const policy = JSON.parse(committedPolicyText());
+
+    expect({
+      version: policy.version,
+      generatedBy: policy.generatedBy,
+      corpus: policy.corpus,
+      exclusions: policy.exclusions,
+    }).toEqual(POLICY_METADATA);
+  });
+
+  it('lists only identifiers the harvest rule keeps', async () => {
+    // An entry `--update` could not have produced - a generic name added by
+    // hand, an all-caps constant, a single-token name - would fail honest
+    // product code under a rule AAP 0.5.4 does not grant. `loadPolicy()` is used
+    // rather than `JSON.parse` so the committed document also has to satisfy the
+    // shape the gate refuses to run without.
+    const policy = await loadPolicy(DEFAULT_ROOT);
+    const rejected = policy.identifiers.filter((name) => !isDemoSpecificIdentifier(name));
+
+    expect(
+      rejected,
+      'committed identifiers the harvest rule would not keep (fewer than two camel-case tokens, ' +
+        'shorter than four characters, or an all-caps constant)',
+    ).toEqual([]);
+  });
+
+  it('shares no entry with the committed allowlist', async () => {
+    // `--update` subtracts the allowlist (AAP 0.5.4), so an overlap means the
+    // committed policy is not a faithful regeneration of its corpus. `check()`
+    // only warns about that and enforces the rest, which is the right runtime
+    // behaviour and the reason nothing else in the suite fails on it.
+    const policy = await loadPolicy(DEFAULT_ROOT);
+    const allowlist = loadAllowlist(DEFAULT_ROOT);
+
+    expect({
+      identifiers: policy.identifiers.filter((name) => allowlist.identifiers.includes(name)),
+      routePaths: policy.routePaths.filter((route) => allowlist.routePaths.includes(route)),
+    }).toEqual({ identifiers: [], routePaths: [] });
+  });
+
+  it('is written with no CR, no BOM and exactly one trailing newline', () => {
+    // A CRLF checkout filter or an editor-added BOM changes every byte the
+    // generator wrote while leaving the parsed document identical, so only a
+    // byte-level assertion can see it. Named separately from the serialization
+    // case above because the failure message is what tells a developer to look
+    // at their line endings rather than at the demo's vocabulary.
+    const text = committedPolicyText();
+
+    expect(text).not.toContain('\r');
+    expect(text.startsWith('\uFEFF')).toBe(false);
+    expect(text.endsWith('}\n')).toBe(true);
+    expect(text.endsWith('\n\n')).toBe(false);
+  });
+
+  it('is not empty, so no case above can pass by listing nothing', async () => {
+    // An emptied policy satisfies every invariant above vacuously while
+    // disarming the gate completely. `updatePolicy()` refuses to write one; this
+    // asserts the same thing about the file as committed, which is what a
+    // hand-edit or a bad merge resolution could still produce.
+    const policy = await loadPolicy(DEFAULT_ROOT);
+
+    expect(policy.identifiers.length).toBeGreaterThan(0);
+    expect(policy.routePaths.length).toBeGreaterThan(0);
   });
 });
 

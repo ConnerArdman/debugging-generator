@@ -44,9 +44,15 @@ export type { CartContextValue } from '@/providers/CartProvider';
  * cart staying in place so a buyer keeps seeing what they had. A refused change also rejects the
  * promise of `setLineQuantity`, `removeLine` and `emptyCart`, so the control that asked for it -
  * a quantity stepper, a remove button - can report the refusal beside the line it concerns instead
- * of confirming a change that did not happen; `addLine` reports a refusal on `cartError` alone,
- * which is where its own callers announce it from. Nothing about the cart is changed in the browser
- * alone, so what a surface prints is what checkout will charge for.
+ * of confirming a change that did not happen. `addLine` rejects too, but only once the provider has
+ * read the cart back from the server to find out what the addition did: units are added to whatever
+ * a line already holds, so a request that came back a failure may still have been carried out. That
+ * read decides what the buyer is told - units it finds in the cart make the addition a success and
+ * the promise resolves, and otherwise it rejects with a `CartAdditionError` from
+ * `@/providers/CartProvider` whose `outcome` says whether the units were found absent or whether
+ * nothing could be established about them, which is what stops a control stating that a cart it
+ * never checked was left as it was. Nothing about the cart is changed in the browser alone, so what
+ * a surface prints is what checkout will charge for.
  *
  * Throws when called from a component that is not inside `<CartProvider>`, which `app/layout.tsx`
  * mounts around the whole application. That is a loud failure on purpose: an empty stand-in cart

@@ -18,6 +18,16 @@
  * request is carried out under it, so the connection is released rather than
  * held to the end for nobody. The signal belongs to the caller: nothing here
  * creates one, and a call made without one behaves exactly as it always has.
+ *
+ * The route handlers behind the order history and the inventory dashboard
+ * deliberately have no wrapper here, because the surfaces that read their data
+ * are server-rendered and call the services behind them directly rather than
+ * fetching their own endpoints: `GET /api/orders`, whose page of orders the
+ * order-history page resolves through the order service, and
+ * `GET /api/inventory/summary`, whose figures the inventory dashboard resolves
+ * through the inventory service. That is a classification of those two
+ * server-rendered surfaces and nothing more: an endpoint a browser calls
+ * belongs here as one more thin wrapper, exactly as above.
  */
 
 import type {
@@ -55,11 +65,28 @@ export class StorefrontApiError extends Error {
   /** Machine-readable reason, as {@link StorefrontErrorCode} enumerates them. */
   readonly code: StorefrontErrorCode;
 
-  constructor(message: string, options: { status: number; code: StorefrontErrorCode }) {
+  /**
+   * Whether `code` is the reason the server named, rather than one derived here
+   * from the status or from the request having failed outright.
+   *
+   * A derived reason is a guess about a request whose answer never arrived
+   * intelligibly, and for a request that changes something - an order, a cart -
+   * the difference matters: the server's own reason states what happened, while
+   * a guess cannot rule out that the request was carried out and only its reply
+   * was lost. A caller whose recovery advice depends on that reads this before
+   * it treats `code` as a fact.
+   */
+  readonly reported: boolean;
+
+  constructor(
+    message: string,
+    options: { status: number; code: StorefrontErrorCode; reported?: boolean },
+  ) {
     super(message);
     this.name = 'StorefrontApiError';
     this.status = options.status;
     this.code = options.code;
+    this.reported = options.reported ?? false;
   }
 }
 
@@ -206,8 +233,13 @@ export async function storefrontRequest<T>(
       throw new StorefrontApiError(body.error.message, {
         status: response.status,
         code: body.error.code,
+        reported: true,
       });
     }
+    // The store failed without saying why in the one shape that says why, so
+    // the reason below is this module's reading of the status rather than the
+    // store's own: it is left unreported, which is what stops a caller treating
+    // it as a statement about what the request did.
     throw new StorefrontApiError(
       `Lumen Supply could not complete that request (HTTP ${String(response.status)}).`,
       { status: response.status, code: storefrontCodeForStatus(response.status) },
@@ -247,9 +279,17 @@ export function loadRecommendations(input: {
   });
 }
 
-/** The cart this browser is shopping with; `GET /api/cart`. */
-export function loadCartContents(): Promise<CartView> {
-  return storefrontRequest<CartView>('/api/cart');
+/**
+ * The cart this browser is shopping with; `GET /api/cart`.
+ *
+ * `input.signal` is the caller's, and rejecting with its abort reason is how
+ * this call reports having been cut short - the read a provider starts as it
+ * mounts is the case that needs it, because a cart nobody is left to show is a
+ * connection worth releasing. A call made without a signal reads the cart
+ * exactly as it always has.
+ */
+export function loadCartContents(input?: { signal?: AbortSignal | undefined }): Promise<CartView> {
+  return storefrontRequest<CartView>('/api/cart', { signal: input?.signal });
 }
 
 /* ---------------------------------------------------------------------------
@@ -314,7 +354,16 @@ export function clearCartContents(): Promise<CartView> {
   return changeCart({ operation: 'empty' });
 }
 
-/** Turns the cart into an order and pays for it; `POST /api/checkout`. */
+/**
+ * Turns the cart into an order and pays for it; `POST /api/checkout`.
+ *
+ * `draft.idempotencyKey` is what makes sending this twice safe: the endpoint
+ * answers a submission whose name it has already seen with the order that
+ * attempt placed - `result.outcome` says which of the two it is - so a caller
+ * whose reply was lost resolves the attempt by sending the same draft again
+ * rather than by deciding for itself whether an order exists. A caller that
+ * mints a new name is asking for a new order.
+ */
 export function submitCheckout(draft: CheckoutDraft): Promise<CheckoutResult> {
   return storefrontRequest<CheckoutResult>('/api/checkout', { method: 'POST', body: draft });
 }

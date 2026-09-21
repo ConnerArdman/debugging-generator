@@ -14,12 +14,14 @@
  *
  * THE QUERY PARAMETERS ARE THE CONTRACT. Every `name` below and every key written into the URL is
  * copied verbatim from `src/server/validation/inventory.ts`, the single schema that
- * `GET /api/inventory/summary` and the dashboard page both parse their query with: `warehouse`,
- * `threshold`, `state` and `movement`. The numeric bounds are that schema's too - a default of ten
- * units, a floor of zero and a ceiling of ten thousand - and they are restated here rather than
- * imported, because a client component may not import server code. `page` is deliberately never
- * written: changing a filter should answer with the first page of the new listing, and omitting
- * the parameter is how the schema's default of `1` applies.
+ * `GET /api/inventory/summary` and the dashboard page both parse their query with: `warehouseId`,
+ * `threshold`, `state` and `movement`. The location is named by its identifier, exactly as the
+ * parameter's name says, while the dropdown shows that location's short code beside its name -
+ * the code is wording for a reader and never a value this row submits. The numeric bounds are that
+ * schema's too - a default of ten units, a floor of zero and a ceiling of ten thousand - and they
+ * are restated here rather than imported, because a client component may not import server code.
+ * `page` is deliberately never written: changing a filter should answer with the first page of the
+ * new listing, and omitting the parameter is how the schema's default of `1` applies.
  *
  * PROGRESSIVE ENHANCEMENT IS THE BACKBONE, not a fallback bolted on afterwards. The controls live
  * in a `<form method="get">` with no `action`, so the browser's own submission builds exactly the
@@ -81,8 +83,10 @@ import styles from './WarehouseFilter.module.css';
  * The query the dashboard reads
  * ---------------------------------------------------------------------------------------------- */
 
-/** Which stocking location to report on. Absent means every location. */
-const WAREHOUSE_PARAM = 'warehouse';
+/**
+ * Which stocking location to report on, by identifier. Absent means every location.
+ */
+const WAREHOUSE_PARAM = 'warehouseId';
 
 /** How much headroom above a reorder point still counts as low, in units. */
 const THRESHOLD_PARAM = 'threshold';
@@ -180,11 +184,11 @@ function isMovementType(value: string): value is MovementType {
  * ---------------------------------------------------------------------------------------------- */
 
 /**
- * Find the listed location a `warehouse` parameter names, or `undefined` when it names none.
+ * Find the listed location a `warehouseId` parameter names, or `undefined` when it names none.
  *
- * The parameter may carry either form the inventory service accepts - a location's identifier, or
- * the short code this row lists it under, matched without regard to case - so a URL written by
- * hand, a bookmark from an earlier session and this row's own dropdown all resolve the same way.
+ * The parameter carries an identifier - the `id` of one of the locations passed in - and is matched
+ * against nothing else, which is the one reading the schema behind the feed accepts too: the short
+ * code beside a location in the dropdown is how it is displayed, not a second name it answers to.
  * A value that matches nothing resolves to "every location" rather than being passed on, which is
  * what keeps a stale bookmark from asking for a location that no longer exists.
  */
@@ -202,9 +206,7 @@ function findWarehouse(
     return undefined;
   }
 
-  return warehouses.find(
-    (warehouse) => warehouse.id === wanted || warehouse.code.toUpperCase() === wanted.toUpperCase(),
-  );
+  return warehouses.find((warehouse) => warehouse.id === wanted);
 }
 
 /**
@@ -239,7 +241,7 @@ function readThreshold(text: string): number | null {
  * field a reader is still editing is never second-guessed under them.
  */
 interface Draft {
-  warehouse: string;
+  warehouseId: string;
   thresholdText: string;
   state: string;
   movement: string;
@@ -261,7 +263,7 @@ function draftFromApplied(
   movementType: MovementType | null,
 ): Draft {
   return {
-    warehouse: location === undefined ? UNCONSTRAINED : location.code,
+    warehouseId: location === undefined ? UNCONSTRAINED : location.id,
     thresholdText: String(threshold),
     state: stockState ?? UNCONSTRAINED,
     movement: movementType ?? UNCONSTRAINED,
@@ -280,10 +282,10 @@ function draftFromApplied(
  */
 function buildInventoryQuery(draft: Draft, warehouses: readonly WarehouseSummary[]): string {
   const params = new URLSearchParams();
-  const location = findWarehouse(warehouses, draft.warehouse);
+  const location = findWarehouse(warehouses, draft.warehouseId);
 
   if (location !== undefined) {
-    params.set(WAREHOUSE_PARAM, location.code);
+    params.set(WAREHOUSE_PARAM, location.id);
   }
 
   const threshold = readThreshold(draft.thresholdText);
@@ -315,14 +317,16 @@ function buildInventoryQuery(draft: Draft, warehouses: readonly WarehouseSummary
  * has already parsed them to produce everything beside this row: passing them down keeps one
  * reading of the query string on the page and spares this component the suspense boundary that
  * reading it again would require. Each is optional and nullable in the shape the schema produces,
- * so `query.warehouse`, `query.state` and `query.movement` can be handed over as they are.
+ * so `query.warehouseId`, `query.state` and `query.movement` can be handed over as they are.
  */
 interface Props {
   /** Every stocking location the dashboard can report on, in the order it should list them. */
   warehouses: readonly WarehouseSummary[];
 
-  /** The applied `warehouse` parameter - an identifier or a short code. Absent means every one. */
-  selectedWarehouse?: string | null;
+  /**
+   * The applied `warehouseId` parameter - a stocking location's identifier. Absent means every one.
+   */
+  selectedWarehouseId?: string | null;
 
   /** The applied headroom figure, in units above a reorder point. */
   threshold: number;
@@ -343,7 +347,7 @@ interface Props {
  */
 export function WarehouseFilter({
   warehouses,
-  selectedWarehouse = null,
+  selectedWarehouseId = null,
   threshold,
   stockState = null,
   movementType = null,
@@ -353,7 +357,7 @@ export function WarehouseFilter({
   const pathname = usePathname();
   const [isPending, startTransition] = useTransition();
 
-  const applied = findWarehouse(warehouses, selectedWarehouse);
+  const applied = findWarehouse(warehouses, selectedWarehouseId);
   const [draft, setDraft] = useState<Draft>(() =>
     draftFromApplied(applied, threshold, stockState, movementType),
   );
@@ -400,7 +404,7 @@ export function WarehouseFilter({
   }
 
   function handleWarehouseChange(event: ChangeEvent<HTMLSelectElement>): void {
-    commit({ ...draft, warehouse: event.target.value });
+    commit({ ...draft, warehouseId: event.target.value });
   }
 
   function handleStockStateChange(event: ChangeEvent<HTMLSelectElement>): void {
@@ -448,7 +452,7 @@ export function WarehouseFilter({
    */
   function handleClearFilters(): void {
     commit({
-      warehouse: UNCONSTRAINED,
+      warehouseId: UNCONSTRAINED,
       thresholdText: String(DEFAULT_THRESHOLD),
       state: UNCONSTRAINED,
       movement: UNCONSTRAINED,
@@ -475,13 +479,13 @@ export function WarehouseFilter({
             id={id}
             name={WAREHOUSE_PARAM}
             aria-describedby={describedBy}
-            value={draft.warehouse}
+            value={draft.warehouseId}
             onChange={handleWarehouseChange}
             scale="sm"
           >
             <option value={UNCONSTRAINED}>All locations</option>
             {warehouses.map((warehouse) => (
-              <option key={warehouse.id} value={warehouse.code}>
+              <option key={warehouse.id} value={warehouse.id}>
                 {`${warehouse.code} - ${warehouse.name}`}
               </option>
             ))}

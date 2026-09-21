@@ -10,7 +10,7 @@
  * That is what keeps the same listing available to a server component, which
  * calls the service directly, and to anything speaking HTTP.
  *
- * Three decisions are worth stating because a reader would otherwise reasonably
+ * Four decisions are worth stating because a reader would otherwise reasonably
  * expect the opposite:
  *
  * 1. **The query is parsed with the throwing `parse`, never with its
@@ -32,6 +32,17 @@
  *    fields, an ISO-8601 UTC string for the instant an order was placed - so
  *    re-labelling or re-rounding anything here could only introduce a
  *    disagreement between this endpoint and the components that read it.
+ * 4. **CONSUMER CLASSIFICATION: this endpoint is reached over HTTP and has no
+ *    browser caller, by design.** `@/lib/api-client` exposes no wrapper for
+ *    `GET /api/orders`, and that absence is a designation rather than an
+ *    omission: the order-history surface is server-rendered, so
+ *    `app/orders/page.tsx` resolves its page of orders by calling the order
+ *    service directly instead of issuing an HTTP request back into its own
+ *    application, and nothing in the browser issues `GET /api/orders`. The
+ *    handler is nevertheless fully validated and bounded by `ordersQuerySchema`
+ *    exactly as one with a browser caller would be, because an endpoint
+ *    reachable over HTTP is reachable by anyone: having no caller in this
+ *    application relaxes nothing about how a request is parsed.
  */
 
 import type { OrderSummary, PagedList } from '@/lib/types';

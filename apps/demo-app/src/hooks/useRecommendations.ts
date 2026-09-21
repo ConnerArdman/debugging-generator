@@ -62,11 +62,44 @@ const NO_RECOMMENDATIONS: readonly RecommendationItem[] = Object.freeze([]);
 const RECOMMENDATIONS_UNAVAILABLE = 'Suggestions are unavailable right now.';
 
 /**
- * Whether two answers name the same products in the same order.
+ * Every field of a suggestion, each paired with the check that says whether two
+ * answers agree on it.
  *
- * Ranking is what changes between answers, and the ids in order are what the
- * rail renders from, so comparing the length and then the ids is enough to know
- * that a fresh answer would put exactly the same tiles on screen.
+ * The type is what keeps this honest. It is a mapped type over
+ * `keyof RecommendationItem`, so a field added to that shape later leaves this
+ * constant a key short and the demo stops compiling until the new field is
+ * compared too - the alternative, a hand-written list of the fields that
+ * happened to matter when this was written, is exactly how a rail ends up
+ * showing a value the endpoint has already moved on from. Nothing here may be
+ * left out for looking incidental either: a tile prints the name, the price,
+ * the image and the wording as much as it keys on the id.
+ */
+const COMPARED_ITEM_FIELDS: {
+  readonly [K in keyof RecommendationItem]: (
+    current: RecommendationItem,
+    incoming: RecommendationItem,
+  ) => boolean;
+} = {
+  productId: (current, incoming) => current.productId === incoming.productId,
+  sku: (current, incoming) => current.sku === incoming.sku,
+  slug: (current, incoming) => current.slug === incoming.slug,
+  name: (current, incoming) => current.name === incoming.name,
+  priceCents: (current, incoming) => current.priceCents === incoming.priceCents,
+  imageUrl: (current, incoming) => current.imageUrl === incoming.imageUrl,
+  reason: (current, incoming) => current.reason === incoming.reason,
+};
+
+/**
+ * Whether two answers would put exactly the same tiles on screen.
+ *
+ * The ranking and the ids in order are only part of what a tile is made of. A
+ * price rule comes into force, a product is renamed, its photograph is
+ * replaced, the wording that says why it is being suggested is rephrased: each
+ * of those changes what a buyer reads while leaving the same products in the
+ * same order. So this walks the two lists in step and puts every pair through
+ * {@link COMPARED_ITEM_FIELDS}, and calls them the same answer only when they
+ * agree on all of it - the one case in which keeping the list the rail already
+ * has still shows the buyer what the endpoint just said.
  *
  * @param current The list the rail is showing.
  * @param incoming The list the endpoint just answered with.
@@ -78,9 +111,21 @@ function sameRecommendations(
   if (current.length !== incoming.length) {
     return false;
   }
+  const checks = Object.values(COMPARED_ITEM_FIELDS);
   for (let index = 0; index < current.length; index += 1) {
-    if (current[index]?.productId !== incoming[index]?.productId) {
+    // Both lists are walked within their own length, so neither read is
+    // actually absent; the check is how that is stated to the compiler, and it
+    // answers honestly if it ever is - a pair this function cannot read is not
+    // a pair it can call equal, which errs towards rendering the fresh answer.
+    const shown = current[index];
+    const fresh = incoming[index];
+    if (shown === undefined || fresh === undefined) {
       return false;
+    }
+    for (const agrees of checks) {
+      if (!agrees(shown, fresh)) {
+        return false;
+      }
     }
   }
   return true;
@@ -123,9 +168,13 @@ function recommendationNotice(code: StorefrontErrorCode, status: number): string
  * `isLoading` describes the first read only. It is true from the first render
  * until that read settles and false from then on, so a rail already showing
  * tiles keeps showing them while a further read is in flight instead of
- * flashing its skeleton back over them. A read that answers with the same
- * products in the same order leaves the feed exactly as it stands, ids
- * included.
+ * flashing its skeleton back over them. A read that answers with what the feed
+ * already holds - the same products in the same order, and identical in every
+ * field a tile renders - leaves the feed exactly as it stands, which is what
+ * spares a page nobody is touching a re-render for each read its rails make.
+ * Any difference at all replaces the list with the answer that carried it, so a
+ * renamed product, a repriced one, a new photograph or reworded advice reaches
+ * the screen on the read that reported it.
  *
  * A read whose answer the rail can no longer use - it has unmounted, or the
  * product it accompanies has changed - is abandoned rather than merely

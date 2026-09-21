@@ -139,12 +139,15 @@ interface Props {
  * Render the suggestions for `productId`.
  *
  * The region is rendered whenever there is something to put in it: tiles once the suggestions have
- * arrived, placeholder boxes while the first read is in flight, and - in the detail body, where a
- * page region is expected to account for itself - a blank slate when there is nothing to suggest
- * or an inline notice when the read failed. The header's row stays silent in those last two cases
- * and renders nothing at all: a buyer who came for the page above it is not helped by an
- * illustration or a warning wedged into the site header, and an empty row would only take height
- * from the navigation beside it.
+ * arrived, placeholder boxes while the first read is in flight, an inline notice when the read
+ * failed, and - in the detail body, where a page region is expected to account for itself - a
+ * blank slate when there is nothing to suggest. The header's row reports a failed read too, in the
+ * smaller measure the stylesheet gives it there, because a buyer has to be able to tell "the
+ * suggestions could not be loaded" from "there is no strip on this page" - a row that disappeared
+ * would say the second while the first is what happened. It stays silent in one case only, when
+ * there is nothing to suggest: a buyer who came for the page above it is not helped by an
+ * illustration wedged into the site header, and an empty row would only take height from the
+ * navigation beside it.
  *
  * @example
  * ```tsx
@@ -180,16 +183,21 @@ export function RecommendationsRail({
 
   // The region's contents, decided once so that the section, its heading and its name are written
   // once below. `null` means this variant has nothing worth occupying the page with, and it is
-  // reachable only in the header: the detail body always has something to render.
+  // reachable in one case only - the header's row with nothing to suggest: a failed read is
+  // reported in both variants, and the detail body always has something to render.
   let body: ReactElement | null;
 
   if (error !== null) {
-    // The hook's wording, printed as it stands. It is written for a buyer - a sentence about what
-    // is missing, at most carrying the status the endpoint answered with, and never a URL, a stack
-    // or anything out of the reply - so there is nothing here to interpret, shorten or hide.
-    // `warning` rather than `danger`: suggestions are an aside, and `ui/Alert` announces a warning
-    // politely instead of interrupting a reader who is reading the product itself.
-    body = compact ? null : (
+    // The hook's wording, printed as it stands and in both variants. It is written for a buyer - a
+    // sentence about what is missing, at most carrying the status the endpoint answered with, and
+    // never a URL, a stack or anything out of the reply - so there is nothing here to interpret,
+    // shorten, hide or restate per variant. The header's row says the same sentence at the smaller
+    // measure the stylesheet gives it, because a row that vanished on a failed read would tell a
+    // buyer there is no strip here rather than that its suggestions could not be fetched.
+    // `warning` rather than `danger`: suggestions are an aside, and `ui/Alert` derives
+    // `role="status"` with `aria-live="polite"` from that tone, so the notice is queued behind
+    // whatever a reader is doing instead of interrupting the product they came for.
+    body = (
       <Alert tone="warning" className={clsx(styles.state)}>
         {error}
       </Alert>

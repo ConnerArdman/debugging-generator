@@ -8,8 +8,8 @@
  * declares it, hands the parsed values to the service that answers it, and
  * serializes that answer as it stands.
  *
- * Three decisions are worth stating, because a reader would otherwise
- * reasonably expect the opposite:
+ * Four decisions are worth stating, because a reader would otherwise reasonably
+ * expect the opposite:
  *
  * 1. **No parameter is defaulted here.** Every figure and filter this endpoint
  *    accepts is declared, bounded and defaulted once, in
@@ -30,6 +30,17 @@
  *    quantities and an ISO-8601 UTC instant - so re-labelling or re-rounding
  *    anything on the way out could only put this endpoint at odds with the page
  *    that reads the same shape from the service directly.
+ * 4. **CONSUMER CLASSIFICATION: this endpoint is reached over HTTP and has no
+ *    browser caller, by design.** `@/lib/api-client` exposes no inventory
+ *    function, and that absence is deliberate rather than an omission: the
+ *    inventory dashboard is server-rendered, so `app/dashboard/page.tsx` calls
+ *    `readInventorySummary` directly instead of fetching its own endpoint, and
+ *    the one client component on that surface - the filter row - changes the
+ *    page's own query string rather than fetching anything. The query is
+ *    nevertheless parsed and bounded by `inventorySummaryQuerySchema` exactly
+ *    as one with a browser caller would be, because an endpoint reachable over
+ *    HTTP is reachable by anyone: having no caller in this application relaxes
+ *    nothing about how a request is parsed.
  *
  * There is no SQL here, no paging arithmetic and no business rule: the work
  * lives in `@/server/services/inventory.service`, and this module is where the
@@ -55,12 +66,16 @@ export const dynamic = 'force-dynamic';
  * Reads the inventory dashboard's figures for the locations, states and lines a
  * request names.
  *
- * @param request The incoming request. Its query string carries the stocking
- * location to report on, the headroom above a reorder point that still counts
- * as low, the page window of the low-stock list and the optional stock-state
- * and movement filters; `inventorySummaryQuerySchema` owns which of those are
+ * @param request The incoming request. Its query string carries an optional
+ * `warehouseId`, the headroom above a reorder point that still counts as low,
+ * the page window of the low-stock list and the optional stock-state and
+ * movement filters; `inventorySummaryQuerySchema` owns which of those are
  * accepted, what they are bounded to and what they default to, so a request
- * carrying no query string at all is a perfectly good one.
+ * carrying no query string at all is a perfectly good one. `warehouseId` names
+ * one stocking location by its identifier - `WarehouseSummary.id` as
+ * `@/lib/types` declares it - while the short code a location is listed under
+ * is display wording only; a request that carries no `warehouseId` reports on
+ * every location.
  * @returns 200 with an `InventorySummary` - the totals across the locations the
  * filters matched, those locations, and the page of lines at or below their
  * reorder point - and `no-store`, so neither the dev server nor the browser

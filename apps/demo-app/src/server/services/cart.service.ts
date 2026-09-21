@@ -62,13 +62,8 @@
  * imports it still builds and type-checks against a machine with no database.
  */
 
-import type {
-  CartItemDraft,
-  CartLine,
-  CartLineQuantityDraft,
-  CartStatus,
-  CartView,
-} from '@/lib/types';
+import { CartStatus } from '@/generated/prisma/client';
+import type { CartItemDraft, CartLine, CartLineQuantityDraft, CartView } from '@/lib/types';
 import { prisma } from '@/server/db/prisma';
 import {
   StorefrontConflictError,
@@ -228,7 +223,7 @@ function collides(error: unknown): boolean {
  */
 async function activeCartId(token: string): Promise<string> {
   const cart = await prisma.cart.findFirst({
-    where: { sessionToken: token, status: 'ACTIVE' },
+    where: { sessionToken: token, status: CartStatus.ACTIVE },
     select: { id: true },
   });
 
@@ -319,7 +314,7 @@ async function addUnits(cartId: string, draft: CartItemDraft): Promise<boolean> 
  */
 export async function readActiveCart(token: string): Promise<CartView> {
   const row = await prisma.cart.findFirst({
-    where: { sessionToken: token, status: 'ACTIVE' },
+    where: { sessionToken: token, status: CartStatus.ACTIVE },
     select: {
       id: true,
       status: true,

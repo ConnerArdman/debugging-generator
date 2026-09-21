@@ -23,7 +23,9 @@
  *    the server resolves it from the storefront's cookie, which is what
  *    `credentials: 'same-origin'` carries. A cart field here would be a way for
  *    a caller to check out somebody else's cart, so there is none — not even an
- *    optional one.
+ *    optional one. The one identifier the body does carry names the caller's own
+ *    attempt and nothing in this store, which is why it is bounded and shaped
+ *    here and given no meaning at all.
  * 3. **A JSON body carries typed values, so nothing is coerced.** Coercion
  *    belongs to the query-string surfaces, where every value arrives as text; a
  *    number or a boolean that arrives here as a string is a caller that did not
@@ -231,6 +233,30 @@ export const checkoutBodySchema = z.object({
 
   /** Delivery instructions for the warehouse; `null` when there are none. */
   notes: blank(500, 'Keep delivery notes to 500 characters.'),
+
+  /**
+   * What the caller calls this attempt to place the order, so that repeating a
+   * submission whose reply was lost is answered with the order that attempt
+   * already placed rather than placing a second one.
+   *
+   * It is accepted as the bounded opaque token it is, on the same terms as the
+   * shipping service above: the value is the caller's, it names nothing in this
+   * store, and the checkout service reads no meaning from its content - so the
+   * only requirements are that it is long enough to be a caller's own value
+   * rather than a guess, short enough to be worth remembering, and made of
+   * characters that are safe to log and to compare. A body that omits it is
+   * refused here rather than treated as an unrepeatable request, because a
+   * submission nobody can name is one nobody can retry safely.
+   */
+  idempotencyKey: z
+    .string()
+    .trim()
+    .min(8, 'Name the attempt this order is being placed under.')
+    .max(64, 'That attempt identifier is longer than this store accepts.')
+    .regex(
+      /^[A-Za-z0-9][A-Za-z0-9._-]*$/,
+      'An attempt identifier holds letters, digits, dots, hyphens and underscores.',
+    ),
 } satisfies Mirror<CheckoutDraft>);
 
 /**

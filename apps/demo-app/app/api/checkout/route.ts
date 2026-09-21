@@ -35,6 +35,15 @@
  * so every response says `no-store`, the segment is declared dynamic, and there
  * is no caching, reuse or de-duplication anywhere in this file: one request from
  * the browser is one checkout.
+ *
+ * That is deliberately not the same as "one request from the browser is one
+ * order". A submission names the attempt it belongs to, and repeating that name
+ * is how a caller whose reply was lost asks what became of its attempt: the
+ * service answers such a repeat with the order the attempt already placed,
+ * marked as such in the result's `outcome`, and writes no second one. The
+ * decision is the service's because it is a decision about the cart and the
+ * order, not about HTTP; this handler neither remembers a submission nor
+ * compares two.
  */
 
 import type { CheckoutDraft, CheckoutResult } from '@/lib/types';
@@ -65,18 +74,23 @@ const MISADDRESSED = 'This request was not addressed to this store.';
  * Places the order this request submitted and answers with it.
  *
  * @param request The POST whose JSON body `checkoutBodySchema` describes: who is
- * buying, where the goods are going, which shipping service was chosen and any
- * delivery note. Its URL is read for the origin the services answer on; the cart
- * is not named by the request, because it belongs to this browser's session and
- * the server resolves it.
- * @returns `200` with the `CheckoutResult` - the order as it was written and the
- * authorization that paid for it - or the mapper's failure envelope: `400` when
- * the body is not readable JSON, does not match the schema, or the request was
- * not addressed to this store, `404` when the session is shopping with no open
- * cart, `409` when the stock, another checkout of the same cart or the chosen
- * shipping service no longer supports the submission, `402` when the payment was
+ * buying, where the goods are going, which shipping service was chosen, any
+ * delivery note, and the name of the attempt the submission belongs to. Its URL
+ * is read for the origin the services answer on; the cart is not named by the
+ * request, because it belongs to this browser's session and the server resolves
+ * it.
+ * @returns `200` with the `CheckoutResult` - the order and the authorization
+ * that paid for it, as `outcome: 'placed'`, or the order the named attempt had
+ * already placed, as `outcome: 'already_placed'` - or the mapper's failure
+ * envelope: `400` when the body is not readable JSON, does not match the schema,
+ * or the request was not addressed to this store, `404` when the session has no
+ * cart at all, `409` when the stock, another checkout of the same cart or the
+ * chosen shipping service no longer supports the submission - or when an earlier
+ * attempt is still holding this session's cart, `402` when the payment was
  * declined, `502` when a dependency did not answer, and a single generic `500`
- * for anything unaccounted for.
+ * for anything unaccounted for. Exactly one code says an amount may have been
+ * taken - `PAYMENT_STATUS_UNKNOWN`, answered with `409`, `500` or `502` - and
+ * every other failure from this endpoint means nothing was captured.
  */
 export async function POST(request: Request): Promise<Response> {
   try {

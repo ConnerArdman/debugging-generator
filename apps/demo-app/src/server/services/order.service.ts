@@ -10,7 +10,7 @@
  * one means.
  *
  * A cart, on the other hand, is finished by the order it became, so the cart is
- * this module's business at two moments and no others. {@link claim} takes a
+ * this module's business at three moments and no others. {@link claim} takes a
  * cart out of the session's hands before a checkout starts spending money
  * against it, and it is the reason two checkouts of one cart cannot both reach
  * a carrier or a processor: exactly one of them takes it, because taking it is
@@ -20,7 +20,12 @@
  * `CONVERTED`, happens inside the transaction that writes the order, which is
  * what makes a cart and the order it became one fact rather than two: there is
  * no moment at which an order exists and its cart is still orderable, and no
- * second order can be written from a cart that has already become one.
+ * second order can be written from a cart that has already become one. That
+ * last property is what makes the third moment worth having:
+ * {@link readCartOutcome} reads back what a session's cart became, so a
+ * checkout that finds the session holding no open cart can tell an order that
+ * was already placed from a cart an attempt is holding and from a session that
+ * never had a cart at all.
  *
  * Everything returned is stated in the shapes of `@/lib/types` rather than in
  * database rows, so a page, a route handler and a client component all read an
@@ -48,11 +53,11 @@
  * imports it still builds and type-checks against a machine with no database.
  */
 
+import { CartStatus, OrderStatus } from '@/generated/prisma/client';
 import type {
   CustomerContact,
   OrderDetail,
   OrderLine,
-  OrderStatus,
   OrderSummary,
   PagedList,
   PaymentAuthorization,
@@ -444,8 +449,8 @@ function blank(): ShippingAddress {
  */
 export async function claim(id: string): Promise<void> {
   const taken = await prisma.cart.updateMany({
-    where: { id, status: 'ACTIVE' },
-    data: { status: 'ABANDONED' },
+    where: { id, status: CartStatus.ACTIVE },
+    data: { status: CartStatus.ABANDONED },
   });
 
   if (taken.count === 0) {
@@ -468,8 +473,8 @@ export async function claim(id: string): Promise<void> {
  */
 export async function unclaim(id: string): Promise<void> {
   await prisma.cart.updateMany({
-    where: { id, status: 'ABANDONED' },
-    data: { status: 'ACTIVE' },
+    where: { id, status: CartStatus.ABANDONED },
+    data: { status: CartStatus.ACTIVE },
   });
 }
 
@@ -519,7 +524,7 @@ export async function recordOrder(input: OrderDraft): Promise<OrderDetail> {
   check(input);
 
   const at = new Date();
-  const status: OrderStatus = input.payment.authorized ? 'PAID' : 'PENDING';
+  const status: OrderStatus = input.payment.authorized ? OrderStatus.PAID : OrderStatus.PENDING;
 
   const row = await prisma.$transaction(async (tx) => {
     const account = await tx.customer.upsert({
@@ -540,8 +545,8 @@ export async function recordOrder(input: OrderDraft): Promise<OrderDetail> {
     // on the cart at the same time, which is how a cart a visitor filled
     // anonymously ends up attached to the customer who bought it.
     const converted = await tx.cart.updateMany({
-      where: { id: input.cart, status: { not: 'CONVERTED' } },
-      data: { status: 'CONVERTED', customerId: account.id },
+      where: { id: input.cart, status: { not: CartStatus.CONVERTED } },
+      data: { status: CartStatus.CONVERTED, customerId: account.id },
     });
 
     if (converted.count === 0) {
@@ -750,4 +755,71 @@ export async function readOrderDetail(id: string): Promise<OrderDetail> {
     contact: contact(row.customer),
     shippingAddress: blank(),
   };
+}
+
+/**
+ * What the store's records say about the cart a session is shopping with, for a
+ * caller that has already established the session is holding no open one.
+ */
+export interface CartOutcome {
+  /** The cart the session's token names. */
+  cart: string;
+
+  /**
+   * The order it became, or `null` when it has not become one - which, for a
+   * cart that is no longer open, means an attempt is holding it rather than
+   * that nothing happened to it.
+   */
+  order: OrderDetail | null;
+}
+
+/**
+ * What became of the cart a session is shopping with: the order it became, or
+ * the fact that it exists and became none.
+ *
+ * It answers the question a checkout asks when it finds the session holding no
+ * open cart: did the cart this session had become an order, is it being held by
+ * an attempt, or was there never a cart at all? Without an answer all three are
+ * indistinguishable, and a customer whose order was placed by a submission whose
+ * reply was lost would be told their cart is gone and invited to order again.
+ * With one, each of the three has its own answer, and none of them is a
+ * statement that nothing was charged.
+ *
+ * The cart is addressed by the session's own token, so what this returns is only
+ * ever the order of the cart the caller was already entitled to read; nothing
+ * about which order to look for comes from a request. The link between the two
+ * is the quote the freight was charged at - it is written against the cart when
+ * the freight is rated and against the order when the order is placed, in the
+ * transaction that writes it - so an order with a quote for this cart is an
+ * order that was placed from it. The most recently quoted one wins, which is
+ * the order a repeated checkout of one cart would have placed.
+ *
+ * @param token The session token the cart is addressed by, as `./cart.service`
+ * addresses it.
+ * @returns The cart and the order it became, the cart and `null` when it became
+ * none, or `null` when this session has no cart at all. A quote that names an
+ * order names one that exists: deleting an order deletes the quotes written
+ * against it.
+ */
+export async function readCartOutcome(token: string): Promise<CartOutcome | null> {
+  const cart = await prisma.cart.findUnique({
+    where: { sessionToken: token },
+    select: { id: true },
+  });
+
+  if (cart === null) {
+    return null;
+  }
+
+  const quoted = await prisma.shippingQuote.findFirst({
+    where: { cartId: cart.id, orderId: { not: null } },
+    // The identifier breaks a tie the timestamp cannot: two quotes taken in one
+    // instant would otherwise be free to change places between reads.
+    orderBy: [{ quotedAt: 'desc' }, { id: 'desc' }],
+    select: { orderId: true },
+  });
+
+  const id = quoted?.orderId ?? null;
+
+  return { cart: cart.id, order: id === null ? null : await readOrderDetail(id) };
 }
