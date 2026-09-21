@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 300" width="400" height="300" role="img">
+  <title>Fasteners</title>
+  <!-- One of the object tiles of the catalog: a hex bolt standing between a nut and a washer. The
+       four frame elements below - the rounded paper panel and the three mist shelf strokes - are
+       identical in every tile of this folder, as is the 400 x 300 view box, so a catalog card or the
+       product gallery can swap one tile for another without reflowing. The intrinsic width and
+       height sit on the root beside the view box because consumers reference this file by its string
+       path alone - an img element, or a next/image with a literal src - and so have no import from
+       which a size could be inferred. -->
+  <!-- Palette, written as explicit hex because an image loaded through an img element inherits no
+       colour from the page. Ink #0F172A carries every silhouette at the heaviest weight; slate
+       #475569 the secondary line work, which here is the thread, the bore and the washer's inner
+       edge; mist #CBD5E1 the shelf behind the subject and nothing in front of it, since at 1.42:1
+       against the panel it would leave the tile looking blank at card size; paper #F8FAFC the panel
+       itself; and one amber #F59E0B accent, filled and bounded by slate rather than stroked on its
+       own, for that same contrast reason. Round caps and joins sit on the wrapping group, so every
+       stroke of the subject inherits them. -->
+  <rect x="0" y="0" width="400" height="300" rx="12" fill="#F8FAFC" />
+  <path d="M40 232 H360" stroke="#CBD5E1" stroke-width="6" stroke-linecap="round" />
+  <path d="M96 232 V212" stroke="#CBD5E1" stroke-width="6" stroke-linecap="round" />
+  <path d="M304 232 V212" stroke="#CBD5E1" stroke-width="6" stroke-linecap="round" />
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <!-- Three pieces, each seated with the outer edge of its stroke a unit clear of the shelf line -
+         the seating the carton of the placeholder tile has - and ten clear of its neighbour, so the
+         group reads as a set laid out for inspection rather than as a heap. The bolt is the largest
+         and stands on the centre line of the panel, x 200, with the two smaller pieces flanking it
+         inside the shelf uprights. -->
+    <!-- The nut, seen face-on: a regular hexagon of circumradius 24 centred on 128 203.22, turned
+         flat to flat so one side rests on the shelf, with a round bore through the middle. An
+         outline and a bore in two weights, with no fill and no accent, keep it a nut rather than a
+         second reading of the mark this storefront signs itself with. -->
+    <polygon points="152,203.22 140,224 116,224 104,203.22 116,182.44 140,182.44" stroke="#0F172A" stroke-width="8" />
+    <circle cx="128" cy="203.22" r="9" stroke="#475569" stroke-width="6" />
+    <!-- The bolt, in profile and drawn from the inside out: the four thread ticks first, then the
+         head and the shank over them, so the ink outline covers the ends of the slate ticks where
+         they land on it. The head is a hexagon of circumradius 30 centred on 200 96. The shank drops
+         from the middle of the head's lower flat to the shelf, 20 wide - a third of the head
+         measured across its corners, so five units of that flat stay visible as a shoulder on
+         either side of it - and its two round top ends finish inside the flat's own stroke, so the
+         joint between head and shank stays closed. The first tick sits well below the head, leaving
+         the plain length under it that a real bolt has. -->
+    <path d="M191 150 H209 M191 170 H209 M191 190 H209 M191 210 H209" stroke="#475569" stroke-width="6" />
+    <polygon points="230,96 215,121.98 185,121.98 170,96 185,70.02 215,70.02" stroke="#0F172A" stroke-width="8" />
+    <path d="M190 121.98 V224 H210 V121.98" stroke="#0F172A" stroke-width="8" />
+    <!-- The washer: two circles on 272 201, of radius 23 in ink and 10 in slate, and the single
+         accent of the file fills the inner one. That fill is bounded by the slate stroke and then by
+         the ink ring beyond it, which is the only arrangement in which amber may appear here. -->
+    <circle cx="272" cy="201" r="23" stroke="#0F172A" stroke-width="8" />
+    <circle cx="272" cy="201" r="10" fill="#F59E0B" stroke="#475569" stroke-width="6" />
+  </g>
+</svg>

@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 300" width="400" height="300" role="img">
+  <title>Valves and fittings</title>
+  <!-- A ball valve in elevation: an inline body interrupting a horizontal pipe run, a flange at
+       either end, and the lever raised to the right. One of the six object tiles cycled across the
+       catalog, so the four frame elements below - the rounded paper panel and the three mist shelf
+       strokes - are the ones from product-placeholder.svg unchanged, as is the 400 x 300 view box,
+       and a catalog card or the product gallery can swap any tile of the set for another without
+       reflowing. The intrinsic width and height sit on the root beside the view box because
+       consumers reference this file by its string path alone - an img element, or a next/image
+       with a literal src - and so have no import from which a size could be inferred. -->
+  <!-- Palette, written as explicit hex because an image loaded through an img element inherits no
+       colour from the page. Ink #0F172A carries the pipe run, the body and the lever at the
+       heaviest weight in the file; slate #475569 the secondary line work, which here is the union
+       nuts and the stem collar; mist #CBD5E1 the shelf behind the subject and nothing in front of
+       it, since at 1.42:1 against the panel it would leave the tile looking blank at card size;
+       paper #F8FAFC the panel itself; and one amber #F59E0B accent, the lever grip, filled and
+       bounded by ink rather than stroked on its own for that same contrast reason. Round caps and
+       joins sit on the wrapping group, so every stroke of the subject inherits them. -->
+  <rect x="0" y="0" width="400" height="300" rx="12" fill="#F8FAFC" />
+  <path d="M40 232 H360" stroke="#CBD5E1" stroke-width="6" stroke-linecap="round" />
+  <path d="M96 232 V212" stroke="#CBD5E1" stroke-width="6" stroke-linecap="round" />
+  <path d="M304 232 V212" stroke="#CBD5E1" stroke-width="6" stroke-linecap="round" />
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <!-- The pipe run, on a 196 centre line between the two shelf uprights: two wall strokes 32
+         apart on each side, closed at the outer end by a flange bar 48 tall, so a stub reads as
+         open pipe seen from the side rather than a solid bar. The walls stop on the body outline,
+         where their round caps fall inside that outline's own stroke width. -->
+    <path d="M118 180 H170" stroke="#0F172A" stroke-width="8" />
+    <path d="M118 212 H170" stroke="#0F172A" stroke-width="8" />
+    <path d="M230 180 H282" stroke="#0F172A" stroke-width="8" />
+    <path d="M230 212 H282" stroke="#0F172A" stroke-width="8" />
+    <path d="M118 172 V220" stroke="#0F172A" stroke-width="8" />
+    <path d="M282 172 V220" stroke="#0F172A" stroke-width="8" />
+    <!-- The body: 60 x 56 centred on x 200, so it is visibly chunkier than the run it interrupts,
+         and rounded rather than hexagonal so that a valve body is never read as a nut. Its base
+         lands a unit clear of the shelf stroke, seated exactly as the subject of the exemplar
+         tile is. -->
+    <rect x="170" y="168" width="60" height="56" rx="10" stroke="#0F172A" stroke-width="8" />
+    <!-- One union per side, drawn as a pair of nut ticks across the pipe just outside the body -
+         the joint a fitting of this kind is actually taken apart at. Each tick runs to the outer
+         edge of the wall rather than stopping on its centre line, so the pair stands a little
+         proud of the pipe, the way a nut of larger diameter than the pipe does, and reads as a
+         collar at card size instead of a stripe drawn on the run. -->
+    <path d="M150 176 V216" stroke="#475569" stroke-width="6" />
+    <path d="M160 176 V216" stroke="#475569" stroke-width="6" />
+    <path d="M240 176 V216" stroke="#475569" stroke-width="6" />
+    <path d="M250 176 V216" stroke="#475569" stroke-width="6" />
+    <!-- The stem collar, tangent to the top edge of the body, and the lever: a straight arm out of
+         the collar at 32 degrees into a grip whose four corners are a 30 x 22 rectangle squared to
+         that arm. The grip is painted after the arm, so its amber fill closes the arm's end, and
+         the handle reads as open - the position a valve of this kind is left in. -->
+    <circle cx="200" cy="158" r="10" stroke="#475569" stroke-width="6" />
+    <path d="M205 154 L258 120" stroke="#0F172A" stroke-width="8" />
+    <path d="M243 117 L255 135 L281 119 L269 101 Z" fill="#F59E0B" stroke="#0F172A" stroke-width="8" />
+  </g>
+</svg>

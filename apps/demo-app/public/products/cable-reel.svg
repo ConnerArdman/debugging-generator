@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 300" width="400" height="300" role="img">
+  <title>Cable reel</title>
+  <!-- A spool of cable seated on the shelf, drawn three-quarter on so that the near flange's face
+       and the wound drum behind it both read: a pure side elevation would read as a barrel and a
+       pure face-on view as a washer. The four frame elements below - the rounded paper panel and
+       the three mist shelf strokes - and the 400 x 300 view box are identical in every tile in
+       this folder, so a catalog card or the product gallery can swap one tile for another without
+       reflowing. That 4:3 box is the ratio both of those frames declare, and the intrinsic width
+       and height sit on the root beside the view box because consumers reference this file by its
+       string path alone and so have no import from which a size could be inferred. -->
+  <!-- Palette, written as explicit hex because an image loaded through an img element inherits no
+       colour from the page. Ink #0F172A carries the silhouette at the heaviest weight in the file
+       (both flanges, the drum's edges); slate #475569 the secondary line work (hub, the four
+       winding turns, the label's outline); mist #CBD5E1 the shelf behind the subject and nothing
+       in front of it, since at 1.42:1 against the panel it would leave the tile looking blank at
+       card size; paper #F8FAFC the panel itself. Then one accent of each kind: amber #F59E0B
+       filled inside a slate outline rather than stroked on its own, for that same contrast
+       reason, and teal #0F766E for the cable tail - the only teal in this folder, spent here
+       because at 5.23:1 against the panel it is the one accent colour a bare stroke can carry.
+       Round caps and joins sit on the wrapping group, so every subject stroke inherits them. -->
+  <rect x="0" y="0" width="400" height="300" rx="12" fill="#F8FAFC" />
+  <path d="M40 232 H360" stroke="#CBD5E1" stroke-width="6" stroke-linecap="round" />
+  <path d="M96 232 V212" stroke="#CBD5E1" stroke-width="6" stroke-linecap="round" />
+  <path d="M304 232 V212" stroke="#CBD5E1" stroke-width="6" stroke-linecap="round" />
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <!-- The far flange, drawn first and 0.91 of the near one so the reel recedes: the drum's fill
+         covers everything but the rim standing proud of the wound cable, leaving the partial
+         ellipse behind the drum that is all this flange is meant to be. -->
+    <ellipse cx="238" cy="124" rx="36.4" ry="50.96" stroke="#0F172A" stroke-width="8" />
+    <!-- The cable tail, drawn before the drum so the drum's ink edge cuts it cleanly where it
+         leaves the wound body: one curve down to the shelf and a run along it, ending in a round
+         cap that stops short of the right hand upright. -->
+    <path d="M188.87 195.92 C206.87 209.92 228.87 226 246.87 226 L294 226" stroke="#0F766E" stroke-width="8" />
+    <!-- The drum, 0.82 of the flange radius so the cable is wound nearly to the rim: two edges
+         tangent to its circular section at either end, and a far end closed by the shallow curve
+         that section's near half projects to. Filled white - the one fill this palette allows
+         inside an ink outline - so it hides the middle of the far flange; its near end is closed
+         straight and is hidden in turn by the near flange. -->
+    <path d="M161.03 211.24 L248.04 163.35 Q205.96 140.02 227.96 84.65 L138.97 124.76 Z" fill="#FFFFFF" stroke="#0F172A" stroke-width="8" />
+    <!-- Four turns of cable across the drum, each bowing toward the reader like its far end does
+         and stopping a cap radius inside the ink edges, so the round ends seat against those
+         edges instead of painting over them. Four is the whole count on purpose: more lines do
+         not read as more cable at card size, they read as noise. -->
+    <path d="M187.16 189.2 Q152.52 166.74 169.16 118.64 M206.34 178.8 Q172.4 156.8 188.7 109.68 M225.51 168.4 Q192.28 146.86 208.25 100.72 M237.72 161.78 Q204.94 140.53 220.68 95.02" stroke="#475569" stroke-width="6" />
+    <!-- The one amber accent: a label turned to the drum's axis, sitting on the turns the way a
+         label stuck to a reel does, and bounded by a slate outline so the fill never meets the
+         panel directly. -->
+    <rect x="192.32" y="131.34" width="28" height="17" rx="5" transform="rotate(-26.57 206.32 139.84)" fill="#F59E0B" stroke="#475569" stroke-width="6" />
+    <!-- The near flange and its hub, drawn last so the flange's face closes the near end of the
+         drum. Its base sits a unit clear of the shelf stroke, so the reel is seated rather than
+         floating. -->
+    <ellipse cx="150" cy="168" rx="40" ry="56" fill="#FFFFFF" stroke="#0F172A" stroke-width="8" />
+    <circle cx="150" cy="168" r="12" stroke="#475569" stroke-width="6" />
+  </g>
+</svg>
