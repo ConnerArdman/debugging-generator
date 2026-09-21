@@ -47,7 +47,8 @@
  * from source on every CI run and never committed.
  *
  * `package.json` runs `node scripts/build-tokens.mjs` as `prebuild`
- * (`.npmrc` keeps `enable-pre-post-scripts=true`), which is what puts
+ * (pnpm-workspace.yaml declares `enablePrePostScripts: true`, the setting pnpm
+ * honours; `.npmrc` mirrors it for npm), which is what puts
  * `src/tokens/tokens.css` on disk from `src/tokens/tokens.ts`. This file does
  * not run that generator and does not stand in for it: if the generated
  * stylesheet is absent the build stops with a message naming it, because an
@@ -120,11 +121,12 @@ const STYLESHEET_INPUTS: readonly StylesheetInput[] = [
       'That file is GENERATED from src/tokens/tokens.ts by scripts/build-tokens.mjs,',
       'which package.json runs as the `prebuild` script. Its absence means the',
       'generator did not run (for example `tsup` was invoked directly, or',
-      '`enable-pre-post-scripts` was not honoured) or it failed. Run `pnpm --filter',
-      '@debuggen/panel-renderer build`, or `node scripts/build-tokens.mjs` on its own,',
-      'and build again. It is never substituted with an empty file: without the',
-      '--dg-* declarations every colour, spacing, font and radius value in the',
-      'DevTools panel and the VS Code webview would silently resolve to nothing.',
+      "pnpm-workspace.yaml's `enablePrePostScripts` was set to false) or it failed.",
+      'Run `pnpm --filter @debuggen/panel-renderer build`, or `node',
+      'scripts/build-tokens.mjs` on its own, and build again. It is never',
+      'substituted with an empty file: without the --dg-* declarations every',
+      'colour, spacing, font and radius value in the DevTools panel and the VS',
+      'Code webview would silently resolve to nothing.',
     ].join('\n'),
   },
   {

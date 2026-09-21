@@ -51,8 +51,14 @@
  * Invoked by this package's `build` script after `tsup` (which cleans `dist/`),
  * so the output directory is created here rather than assumed.
  *
- * Exit codes: 0 success, 1 build or audit failure, 2 usage error (unknown flag,
- * missing entry file).
+ * Exit codes, one convention shared with `esbuild.node.mjs` — the other bundler
+ * this package's one `build` script runs, so a wrapper or a CI step reads both
+ * the same way: 0 success (the artifact was written and the audit passed) or
+ * `--help`; 1 the build ran and its result was rejected (esbuild reported
+ * errors, or the audit rejected the bundle), which is also the code an
+ * unexpected failure ends on; 2 nothing was built, because the argument list was
+ * not understood or a precondition of the build does not hold — here, the entry
+ * file being absent or not a regular file.
  *
  * @module packages/telemetry/esbuild.agent
  */
@@ -106,13 +112,21 @@ export const OUTPUT_DIR_REL = 'dist';
  */
 export const BANNER = '/* @debuggen/telemetry browser agent */';
 
-/** Build succeeded and the boundary audit passed. */
+/** Build succeeded and the boundary audit passed, or `--help` printed. */
 export const EXIT_OK = 0;
 
-/** esbuild reported errors, or the boundary audit rejected the bundle. */
+/**
+ * The build ran and its result was rejected: esbuild reported errors, or the
+ * boundary audit rejected the bundle. An unexpected failure ends here too.
+ */
 export const EXIT_FAILURE = 1;
 
-/** Bad usage: an unrecognised flag, or a missing entry file. */
+/**
+ * Nothing was built: the argument list was not understood (an unrecognised
+ * flag), or a precondition of the build does not hold — here, the entry file
+ * being absent or not a regular file. The same code `esbuild.node.mjs` reports
+ * for its own preconditions.
+ */
 export const EXIT_USAGE = 2;
 
 /** Width used when rendering esbuild diagnostics, matching Prettier's printWidth. */
@@ -127,8 +141,11 @@ export class AgentBuildError extends Error {
   /**
    * @param {string} message single-line description of what went wrong
    * @param {{ exitCode?: number, hint?: string, showUsage?: boolean }} [options]
-   *   `exitCode` defaults to {@link EXIT_FAILURE}; pass {@link EXIT_USAGE} for
-   *   argument and entry-point problems
+   *   `exitCode` defaults to {@link EXIT_FAILURE}, the code for a rejected build
+   *   result and for an unexpected failure; pass {@link EXIT_USAGE} for every
+   *   precondition failure — an unrecognised argument, or an entry point that is
+   *   missing or not a regular file — which is how `esbuild.node.mjs` classifies
+   *   the same class of condition
    */
   constructor(message, options = {}) {
     super(message);
@@ -257,10 +274,13 @@ Options
   --quiet   suppress the success line; failures are still reported
   --help    print this text
 
-Exit codes
-  0  build succeeded and the audit passed
-  1  esbuild reported errors, or the audit rejected the bundle
-  2  unrecognised argument, or ${ENTRY_REL} is missing
+Exit codes (the same three esbuild.node.mjs uses, so the pair this package's
+build script runs reads consistently)
+  0  success: ${OUTFILE_REL} was written and passed the audit, or --help
+  1  the build ran and its result was rejected: esbuild reported errors, or the
+     audit rejected the bundle — also the code an unexpected failure ends on
+  2  nothing was built: the argument list was not understood, or a precondition
+     of the build does not hold — ${ENTRY_REL} missing or not a regular file
 
 Paths resolve from this script's own location, never from the working
 directory, so the result is identical whether it is invoked from the package
@@ -842,13 +862,17 @@ export function createBuildOptions({ dev = false, packageRoot = PACKAGE_ROOT } =
 }
 
 /**
- * Fail with a usage error when the entry point is missing. Checked before the
- * build so the message names the file and the likely cause, rather than leaving
- * esbuild to report an unresolvable entry path.
+ * Fail when the entry point is missing: nothing can be built, so this is a
+ * precondition failure and reports {@link EXIT_USAGE} rather than a build
+ * failure. Checked before the build so the message names the file and the likely
+ * cause, rather than leaving esbuild to report an unresolvable entry path.
+ * `esbuild.node.mjs` classifies its own missing entry point the same way, in
+ * `preflight`.
  *
  * @param {{ packageRoot?: string }} [options]
  * @returns {Promise<void>}
- * @throws {AgentBuildError} exit code 2 when the entry is absent or not a file
+ * @throws {AgentBuildError} exit code 2 — nothing was built — when the entry is
+ *   absent or not a regular file
  */
 export async function assertEntryExists({ packageRoot = PACKAGE_ROOT } = {}) {
   const entry = path.join(packageRoot, ENTRY_REL);
@@ -1029,8 +1053,10 @@ export async function reportResult(
  * Build the agent once.
  *
  * @param {{ dev?: boolean, quiet?: boolean, packageRoot?: string }} [options]
- * @returns {Promise<number>} exit code
- * @throws {AgentBuildError} exit code 2 when the entry point is missing
+ * @returns {Promise<number>} exit code: 0 when the artifact was written and
+ *   passed the audit, 1 when esbuild reported errors or the audit rejected it
+ * @throws {AgentBuildError} exit code 2 — nothing was built — when the entry
+ *   point is missing or not a regular file
  */
 export async function buildAgent({ dev = false, quiet = false, packageRoot = PACKAGE_ROOT } = {}) {
   await assertEntryExists({ packageRoot });
@@ -1059,7 +1085,9 @@ export async function buildAgent({ dev = false, quiet = false, packageRoot = PAC
  *   state before Ctrl-C — 0 when the final rebuild built and passed the audit, 1
  *   when it did not. That is what keeps `--watch` honest for anyone who scripts
  *   it, and it matches `esbuild.node.mjs`.
- * @throws {AgentBuildError} exit code 2 when the entry point is missing
+ * @throws {AgentBuildError} exit code 2 — nothing was built — when the entry
+ *   point is missing or not a regular file, which is checked before the watcher
+ *   starts
  */
 export async function watchAgent({ dev = false, quiet = false, packageRoot = PACKAGE_ROOT } = {}) {
   await assertEntryExists({ packageRoot });
@@ -1167,8 +1195,12 @@ function reportFailure(error) {
  * CLI entry point.
  *
  * @param {readonly string[]} [argv] arguments after the script path
- * @returns {Promise<number>} exit code: 0 success, 1 build or audit failure,
- *   2 usage error
+ * @returns {Promise<number>} exit code, on the convention this script shares
+ *   with `esbuild.node.mjs`: 0 success (the artifact was written and the audit
+ *   passed) or `--help`; 1 the build ran and its result was rejected (esbuild
+ *   errors, a rejected audit, or an unexpected failure); 2 nothing was built
+ *   (the argument list was not understood, or the entry point is missing or not
+ *   a regular file)
  */
 export async function main(argv = process.argv.slice(2)) {
   /** @type {AgentBuildOptions} */

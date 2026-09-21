@@ -2,20 +2,43 @@ packages:
   - "apps/*"
   - "packages/*"
 
-# pnpm >=10 reads its settings from this file, NOT from .npmrc, so the
-# engine-strict / auto-install-peers pair required by the project lives here.
+# pnpm >=10 reads its settings from this file, NOT from .npmrc, so the three
+# settings the project requires - strict engine checking, automatic peer
+# installation and pre/post lifecycle scripts - live here.
 # (.npmrc keeps the same keys for npm and for older pnpm versions.)
 engineStrict: true
 autoInstallPeers: true
+# Run pre*/post* lifecycle scripts, which three hooks depend on: the
+# apps/chrome-extension `prebuild`/`predev` copy the browser-agent bundle
+# (scripts/copy-agent.mjs), the packages/panel-renderer `prebuild` regenerates
+# tokens.css, and apps/demo-app runs `prisma generate` from both `prebuild` and
+# `pretypecheck`. `true` is also pnpm's default, so this line changes no
+# behaviour today; it is what makes the requirement observable (`pnpm config get
+# enablePrePostScripts` prints it) and holds it against a future default flip,
+# which .npmrc cannot do - pnpm 12.4.2 does not read that file's npm-style
+# `enable-pre-post-scripts`, and setting this key to `false` here is what
+# actually skips the three hooks.
+enablePrePostScripts: true
 
 # Dependency lifecycle scripts stay blocked unless they are allowlisted here, so
 # every entry below is a deliberate permission for third-party code to run at
 # install time and the list is kept to the packages that need one. `allowBuilds`
 # is the only live allowlist under the pinned pnpm 12.4.2: it replaced
 # `onlyBuiltDependencies` in pnpm 11, and that key has been silently ignored
-# since, so it is deliberately not carried here as a fallback. This list mirrors
-# what `pnpm ignored-builds` reports for the pinned dependency set; re-run that
-# command after adding or upgrading dependencies.
+# since, so it is deliberately not carried here as a fallback. `pnpm install` is
+# what keeps this list complete, and it needs no separate audit step: a
+# dependency that declares an install script and is not named here fails the
+# install outright - `Error: ERR_PNPM_IGNORED_BUILDS`, `Ignored build scripts:
+# <name>@<version>`, exit 1 - so adding or upgrading a dependency either
+# installs clean or tells you exactly which entry to add below, with a rationale
+# like the ones above. What pnpm applied is readable back from
+# node_modules/.modules.yaml, which carries `allowBuilds` and `pendingBuilds`
+# after every install and an `ignoredBuilds` array only when a script was
+# skipped. `pnpm ignored-builds` is NOT that check - it reports the ignored set
+# alone, and for the empty set (this repository's state) it prints "Cannot
+# identify as no node_modules found" even with node_modules installed, so it can
+# neither enumerate nor reconcile the list below - and `pnpm approve-builds`
+# only edits it interactively, failing `IO error: not a terminal` off a TTY.
 allowBuilds:
   # postinstall places the Prisma engine binaries the CLI needs for
   # `pnpm demo:generate` (`prisma generate`), which `build` and `typecheck` run first.

@@ -225,9 +225,10 @@ function missingSourceError(root, source) {
       'workspace devDependency purely so that `pnpm -r build` builds',
       'telemetry before the extension, and this script runs from the',
       'extension\'s "prebuild"/"predev" hook, which fires only while',
-      "pnpm's pre/post scripts are enabled (enable-pre-post-scripts,",
-      "pnpm's default); with them disabled, run this script by hand",
-      'before `vite build`.',
+      "pnpm's pre/post scripts are enabled - pnpm-workspace.yaml",
+      'declares `enablePrePostScripts: true`, which is also the',
+      'default; with them disabled, run this script by hand before',
+      '`vite build`.',
       '',
       'Nothing was written. An empty placeholder would produce a Chrome',
       'extension that loads and captures nothing, which is far harder to',
@@ -340,8 +341,9 @@ Build ordering
   packages/telemetry/esbuild.agent.mjs; apps/chrome-extension declares
   @debuggen/telemetry as a workspace devDependency purely so that
   \`pnpm -r build\` builds telemetry first. The hook fires only while pnpm's
-  pre/post scripts are enabled (enable-pre-post-scripts, pnpm's default);
-  with them disabled, run this script by hand before \`vite build\`.
+  pre/post scripts are enabled: pnpm-workspace.yaml declares
+  \`enablePrePostScripts: true\`, which is also the default. With them
+  disabled, run this script by hand before \`vite build\`.
 
 Source maps
   When ${SOURCE_REL}${MAP_SUFFIX}

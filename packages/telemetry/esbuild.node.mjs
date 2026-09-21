@@ -79,6 +79,17 @@
  * Usage: `node esbuild.node.mjs [--watch]`, `pnpm --filter @debuggen/telemetry
  * build`, or `--help`.
  *
+ * EXIT CODES, one convention shared with `esbuild.agent.mjs` — the other bundler
+ * this package's one `build` script runs, so a wrapper or a CI step reads both
+ * the same way:
+ *   - 0 success (the artefact was written and the audit passed), or `--help`;
+ *   - 1 the build ran and its result was rejected: esbuild reported errors, or
+ *     the audit rejected the bundle — also the code an unexpected failure ends
+ *     on;
+ *   - 2 nothing was built: the argument list was not understood, or a
+ *     precondition of the build does not hold (a required input missing,
+ *     unusable or inconsistent).
+ *
  * @module packages/telemetry/esbuild.node
  */
 
@@ -236,16 +247,31 @@ export const FORBIDDEN_INPUT_REPO_DIRECTORIES = Object.freeze(['apps']);
 /** The build (and its audit) succeeded, or `--help` printed. */
 const EXIT_OK = 0;
 
-/** A build error, a failed audit, or a missing prerequisite. Nothing shipped. */
+/**
+ * The build ran and its result was rejected: esbuild reported errors, or the
+ * audit rejected the bundle. An unexpected failure ends here too. Nothing
+ * shipped.
+ */
 const EXIT_FAILURE = 1;
 
-/** A usage error: an unknown flag or a flag given a value it does not take. */
+/**
+ * Nothing was built: the argument list was not understood (an unknown flag, or a
+ * flag given a value it does not take), or a precondition of the build does not
+ * hold — a required input missing, unusable or inconsistent.
+ */
 const EXIT_USAGE = 2;
 
 /**
  * Failure carrying the exit code the CLI should use and, where one exists, a
  * multi-line hint stating exactly how to recover. Mirrors the shape used by
  * `scripts/dev-instrumented.mjs` so both scripts fail the same way.
+ *
+ * `exitCode` defaults to {@link EXIT_FAILURE}, which is the code for a rejected
+ * build result and for an unexpected failure. Every precondition failure passes
+ * {@link EXIT_USAGE} explicitly — an unrecognised argument, and everything
+ * {@link preflight} establishes before esbuild is asked to do anything — which
+ * is the same classification `esbuild.agent.mjs` applies to the same class of
+ * condition.
  */
 export class PreloadBuildError extends Error {
   /**
@@ -404,11 +430,15 @@ Configuration
   DEBUGGEN_TOKEN, DEBUGGEN_PROJECT_ROOT and the optional NEXT_OTEL_VERBOSE at
   runtime, in the dev-server process, never at build time.
 
-Exit codes
-  ${EXIT_OK}   the bundle was written and passed the audit
-  ${EXIT_FAILURE}   build error, failed audit, missing entry point, or a
-      dependency that has to be built first
-  ${EXIT_USAGE}   usage error — nothing was built`;
+Exit codes (the same three esbuild.agent.mjs uses, so the pair this package's
+build script runs reads consistently)
+  ${EXIT_OK}   success: ${OUTFILE_REL} was written and passed the audit, or --help
+  ${EXIT_FAILURE}   the build ran and its result was rejected: esbuild reported errors, or the
+      audit rejected the bundle — also the code an unexpected failure ends on
+  ${EXIT_USAGE}   nothing was built: the argument list was not understood, or a precondition
+      of the build does not hold — ${ENTRY_REL} or ${TSCONFIG_REL} missing,
+      package.json disagreeing with the artefact this script writes, or an
+      inlined workspace dependency that has to be built first`;
 }
 
 /**
@@ -466,11 +496,13 @@ function readManifest(file, label) {
   } catch (error) {
     if (isErrnoCode(error, 'ENOENT') || isErrnoCode(error, 'ENOTDIR')) {
       throw new PreloadBuildError(`${label} is missing: ${displayPath(file)}`, {
+        exitCode: EXIT_USAGE,
         hint: 'Run `pnpm install` from the repository root and try again.',
       });
     }
     throw new PreloadBuildError(
       `could not read ${label} (${displayPath(file)}): ${describeCause(error)}`,
+      { exitCode: EXIT_USAGE },
     );
   }
 
@@ -479,6 +511,7 @@ function readManifest(file, label) {
   } catch (error) {
     throw new PreloadBuildError(
       `${label} is not valid JSON (${displayPath(file)}): ${describeCause(error)}`,
+      { exitCode: EXIT_USAGE },
     );
   }
 }
@@ -537,13 +570,17 @@ export function verifyPackageContract(manifest) {
   if (declared === undefined) {
     throw new PreloadBuildError(
       `package.json does not export "${EXPORT_CONDITION}", which the local service uses to attach the preload`,
-      { hint: `Add:\n\n  "exports": { "${EXPORT_CONDITION}": "${expected}" }` },
+      {
+        exitCode: EXIT_USAGE,
+        hint: `Add:\n\n  "exports": { "${EXPORT_CONDITION}": "${expected}" }`,
+      },
     );
   }
   if (declared !== expected) {
     throw new PreloadBuildError(
       `package.json exports "${EXPORT_CONDITION}" as ${declared}, but this script writes ${expected}`,
       {
+        exitCode: EXIT_USAGE,
         hint: [
           'The preload path is a contract shared with scripts/dev-instrumented.mjs',
           '(PRELOAD_REL) and apps/local-service/src/dev-server/launcher.ts. Change all',
@@ -557,7 +594,7 @@ export function verifyPackageContract(manifest) {
   if (Array.isArray(sideEffects) && !sideEffects.includes(expected)) {
     throw new PreloadBuildError(
       `package.json "sideEffects" does not list ${expected}, so a bundler may tree-shake the preload away`,
-      { hint: `Add ${expected} to the "sideEffects" array.` },
+      { exitCode: EXIT_USAGE, hint: `Add ${expected} to the "sideEffects" array.` },
     );
   }
 }
@@ -610,6 +647,7 @@ export function computeExternalPolicy(manifest) {
       throw new PreloadBuildError(
         `workspace dependency ${name} is neither inlined nor explicitly external`,
         {
+          exitCode: EXIT_USAGE,
           hint: [
             'The preload is attached to a process outside this workspace, where',
             `a bare "${name}" import may not resolve. Decide explicitly in`,
@@ -627,6 +665,7 @@ export function computeExternalPolicy(manifest) {
       throw new PreloadBuildError(
         `${name} is configured to be bundled into the preload but is not a dependency of this package`,
         {
+          exitCode: EXIT_USAGE,
           hint: [
             `Either add ${name} to package.json "dependencies", or remove it from`,
             'INLINED_WORKSPACE_DEPENDENCIES in esbuild.node.mjs.',
@@ -675,6 +714,7 @@ export function verifyInlinedDependencyBuilt(name) {
 
   if (!fs.existsSync(dependencyDir)) {
     throw new PreloadBuildError(`${name} is not installed under ${displayPath(dependencyDir)}`, {
+      exitCode: EXIT_USAGE,
       hint: 'Run `pnpm install` from the repository root and try again.',
     });
   }
@@ -688,7 +728,10 @@ export function verifyInlinedDependencyBuilt(name) {
     ) ?? (typeof manifest.main === 'string' ? manifest.main : undefined);
 
   if (entry === undefined) {
-    throw new PreloadBuildError(`${name} declares no importable entry point`, { hint: buildHint });
+    throw new PreloadBuildError(`${name} declares no importable entry point`, {
+      exitCode: EXIT_USAGE,
+      hint: buildHint,
+    });
   }
 
   const entryFile = path.resolve(dependencyDir, entry);
@@ -696,6 +739,7 @@ export function verifyInlinedDependencyBuilt(name) {
     throw new PreloadBuildError(
       `${name} has not been built: ${displayPath(entryFile)} is missing`,
       {
+        exitCode: EXIT_USAGE,
         hint: buildHint,
       },
     );
@@ -889,7 +933,11 @@ export function auditBundleText(text) {
  * handful of `stat` calls is not worth the indirection of promises.
  *
  * @returns {BuildContext}
- * @throws {PreloadBuildError} exit 1 with a recovery hint for every failure
+ * @throws {PreloadBuildError} exit 2 with a recovery hint. Everything checked
+ *   here is a precondition of the build — nothing has been built when one of
+ *   them fails — so every throw below passes `exitCode: EXIT_USAGE`, and a check
+ *   added to this function later follows that rule. The one exception is the
+ *   `mkdir` at the end, which acts rather than checks; see the comment there.
  */
 export function preflight() {
   const manifest = readManifest(
@@ -902,6 +950,7 @@ export function preflight() {
   const entry = path.join(PACKAGE_DIR, ...ENTRY_REL.split('/'));
   if (!fs.existsSync(entry)) {
     throw new PreloadBuildError(`the preload entry point is missing: ${ENTRY_REL}`, {
+      exitCode: EXIT_USAGE,
       hint: [
         'This script bundles that module; it does not create it. src/node/register.ts',
         'is the preload itself (tracer provider, pg and Prisma instrumentations, the',
@@ -914,6 +963,7 @@ export function preflight() {
   const tsconfig = path.join(PACKAGE_DIR, TSCONFIG_REL);
   if (!fs.existsSync(tsconfig)) {
     throw new PreloadBuildError(`${TSCONFIG_REL} is missing from ${displayPath(PACKAGE_DIR)}`, {
+      exitCode: EXIT_USAGE,
       hint: 'esbuild reads the workspace tsconfig for the TypeScript transform; restore it before building.',
     });
   }
@@ -929,6 +979,12 @@ export function preflight() {
   try {
     fs.mkdirSync(path.dirname(outfile), { recursive: true });
   } catch (error) {
+    // Deliberately left at EXIT_FAILURE while every check above reports
+    // EXIT_USAGE: this is the only step of preflight that acts rather than
+    // checks, and the identical I/O failure in esbuild.agent.mjs's
+    // ensureOutputDirectory escapes as a raw fs error that its generic handler
+    // reports as exit 1. Reclassifying it here would make the pair disagree on a
+    // failing mkdir immediately after being aligned on every missing input.
     throw new PreloadBuildError(
       `could not create ${path.posix.dirname(OUTFILE_REL)}/: ${describeCause(error)}`,
     );
@@ -1151,8 +1207,14 @@ async function reviewBuild(context, result) {
 /**
  * Build once.
  *
+ * Reached only after {@link preflight} has passed, so every failure from here on
+ * is a rejected build result rather than a precondition: this function never
+ * reports {@link EXIT_USAGE}.
+ *
  * @param {BuildContext} context
- * @returns {Promise<number>} process exit code
+ * @returns {Promise<number>} process exit code: 0 when the artefact was written
+ *   and passed the audit, 1 when esbuild reported errors or the audit rejected
+ *   the bundle
  */
 async function runOnce(context) {
   /** @type {import('esbuild').BuildResult} */
@@ -1227,7 +1289,9 @@ function listenForStop() {
  * `--watch` honest for anyone who scripts it.
  *
  * @param {BuildContext} context
- * @returns {Promise<number>} process exit code
+ * @returns {Promise<number>} process exit code of the last completed rebuild — 0
+ *   when the final rebuild built and passed the audit, 1 when it did not — which
+ *   is what `esbuild.agent.mjs`'s `watchAgent` reports for the same situation
  */
 async function runWatch(context) {
   let lastExitCode = EXIT_OK;
@@ -1306,7 +1370,12 @@ function reportFailure(error) {
  * CLI entry point.
  *
  * @param {readonly string[]} [argv] arguments after the script path
- * @returns {Promise<number>} process exit code
+ * @returns {Promise<number>} process exit code, on the convention this script
+ *   shares with `esbuild.agent.mjs`: 0 success (the artefact was written and the
+ *   audit passed) or `--help`; 1 the build ran and its result was rejected
+ *   (esbuild errors, a rejected audit, or an unexpected failure); 2 nothing was
+ *   built (the argument list was not understood, or a precondition {@link
+ *   preflight} checks does not hold)
  */
 export async function main(argv = process.argv.slice(2)) {
   /** @type {PreloadBuildArgs} */
