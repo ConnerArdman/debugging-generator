@@ -24,8 +24,14 @@
 // Four properties are load-bearing and must survive any edit:
 //
 //   1. It imports nothing, statically or dynamically. The framework is a version string in the
-//      sibling manifest and is installed nowhere in this repository, so a specifier naming it
-//      would be unresolvable at run time. There is no `require` either: this file is ESM.
+//      sibling manifest and nothing more. This fixture tree is never installed: it is not a
+//      workspace member (the workspace file globs only the application and package directories)
+//      and it has no `node_modules` of its own, so no directory on this module's resolution path
+//      provides the framework - the single copy installed elsewhere in the repository, for the one
+//      application that actually runs it, is not on that path - and a specifier naming it is
+//      unresolvable at run time (verified: resolving it from this directory answers
+//      ERR_MODULE_NOT_FOUND, here and equally from the temporary copy a suite works on). There is
+//      no `require` either: this file is ESM.
 //   2. It is inert. No top-level `await`, no environment reads, no logging, no named exports and no
 //      asynchronous option, so evaluating the module defines one object and does nothing else.
 //   3. It declares no build output. `distDir`, `output`, `outputFileTracingRoot`, `experimental`,

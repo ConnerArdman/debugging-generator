@@ -14,10 +14,13 @@
  *   provider-key       a provider credential prefix with a plausible credential body after it.
  *   jwt                a JSON Web Token shaped string.
  *   private-key        a PEM private-key header.
- *   entropy            a long, dense value bound to a key-like name. This rule is deliberately
- *                      *bound*: a high-entropy string on its own (a hash, a build id, a base64
- *                      asset) is not a finding, because a bare entropy scan produces so much noise
- *                      that the gate stops being trusted.
+ *   entropy            a long, dense value bound to a key-like name. The value is measured over
+ *                      its complete contents - a quoted string in full, an unquoted assignment up
+ *                      to its delimiter - so punctuation in a password does not hide it, and a
+ *                      dense run with no assignment operator is measured too. This rule is
+ *                      deliberately *bound*: a high-entropy string on its own (a hash, a build id,
+ *                      a base64 asset) is not a finding, because a bare entropy scan produces so
+ *                      much noise that the gate stops being trusted.
  *   connection-string  a URI carrying an embedded user and password.
  *
  * FALSE POSITIVES COST AS MUCH AS MISSES. This check sits inside `pnpm verify`, so one noisy rule
@@ -37,9 +40,16 @@
  * lives in `.git/config`. Enumeration goes through `git ls-files`, which never lists anything under
  * `.git/`, and there is no filesystem-walk fallback that could reach it. Do not add one.
  *
+ * IT FAILS CLOSED. Every condition that leaves the check unable to inspect the repository is an
+ * error (exit 2), never a quiet pass: git missing, the directory not being a checkout, a missing
+ * or malformed allowlist, and - the one that looks like success - git tracking no files at all. A
+ * gate that returns 0 having read nothing proves nothing, so an empty tracked subject is a
+ * precondition failure raised where enumeration happens, which makes it fail for in-process
+ * callers and for the command line alike.
+ *
  * Usage:  node scripts/check-secrets.mjs [--json] [--help]
  * Exits:  0 clean | 1 findings | 2 usage or environment error (unknown option, git unavailable,
- *         not a git repository, missing or malformed allowlist).
+ *         not a git repository, no tracked files, missing or malformed allowlist).
  *
  * The check only reads: it writes nothing to disk, and it prints at most the first four characters
  * of a matched value plus its length, because CI logs are public.
@@ -64,7 +74,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 export const EXIT_OK = 0;
 /** Exit code: at least one finding. */
 export const EXIT_FINDINGS = 1;
-/** Exit code: the check could not be performed (usage, git, allowlist). */
+/** Exit code: the check could not be performed (usage, git, an empty subject, the allowlist). */
 export const EXIT_ERROR = 2;
 
 /**
@@ -636,7 +646,16 @@ const CONNECTION_STRING_PATTERN = new RegExp(
 );
 
 /**
- * A contiguous run long enough for the `entropy` rule to measure.
+ * A contiguous dense run long enough for the `entropy` rule to measure. This is the second of the
+ * rule's two candidate sources: the first is the complete assigned value (see
+ * {@link assignedValues}), and this one is what still covers the syntaxes that have no assignment
+ * operator at all - `--auth-token <run>`, `Authorization: Bearer <run>` - and dense runs embedded
+ * in a larger value.
+ *
+ * The alphabet is deliberately narrow, which is exactly why it cannot be the only source: a
+ * punctuated value is split into sub-runs shorter than {@link ENTROPY_MIN_LENGTH} and would never
+ * be measured. The complete-value pass exists for that case and measures the value whatever
+ * characters it contains.
  *
  * `=` is accepted only as trailing base64 padding, never inside the run: an `=` in the middle of a
  * candidate is an assignment operator, and admitting it would swallow the name into the value -
@@ -647,6 +666,109 @@ const ENTROPY_CANDIDATE_PATTERN = new RegExp(
   '[A-Za-z0-9+/_.~-]{' + String(ENTROPY_MIN_LENGTH) + ',}={0,2}',
   'g',
 );
+
+/** Quote characters that make an assigned value a complete string literal. */
+const VALUE_QUOTES = new Set(['"', "'", '`']);
+
+/**
+ * What ends an unquoted assigned value: whitespace, a quote, a list separator, or an angle bracket.
+ *
+ * Notably *not* `=` or `:`. The name is read leftwards from the value's first character, so by the
+ * time a value begins its operator has already been consumed, and a further `=` or `:` inside the
+ * run belongs to the value: `API_KEY=YWJjZGVm==` keeps its base64 padding, `TOKEN=v1:abc:def`
+ * keeps its segments, and `SECRET=a=b` keeps both halves. Terminating on them, as the dense-run
+ * alphabet must, is what truncates such a value to something shorter than the rule can measure.
+ *
+ * `<` and `>` do terminate it, because no value spans one: in TypeScript they delimit a type
+ * argument, so `const token: ReadonlyArray<CredentialDescriptor> = …` would otherwise offer the
+ * type `ReadonlyArray<CredentialDescriptor>` as a 35-character dense value bound to `token`, and in
+ * shell syntax they are redirections. A *quoted* value keeps them, so a password containing an
+ * angle bracket is still measured in full.
+ */
+const UNQUOTED_VALUE_TERMINATOR = /[\s"'`,;<>]/;
+
+/**
+ * Characters that, immediately before a `=` or `:`, mark it as something other than an assignment:
+ * a compound assignment (`+=`), a comparison (`!=`, `<=`), a ternary (`?:`) or a namespace
+ * separator (`::`). The `=>` / `==` / `===` / `::` forms are rejected by looking at the *next*
+ * character as well, so both halves of a two-character operator are covered.
+ */
+const NON_ASSIGNMENT_PREFIXES = new Set([...'=!<>+-*/%&|^?~:']);
+
+/**
+ * An interpolated (`${...}`) or command-substituted (`$(...)`) string. What such a value holds is
+ * computed when the file runs, so the committed text is a template and not key material.
+ */
+const INTERPOLATED_VALUE_PATTERN = /\$[{(]/;
+
+/**
+ * A value that is a URI: a location rather than key material. A URI that does carry a credential
+ * is `connection-string`'s business, which reports it with the scheme a reviewer needs.
+ */
+const URI_VALUE_PATTERN = /^[A-Za-z][A-Za-z0-9+.-]*:\/\//;
+
+/**
+ * An *unquoted* value that begins with `/`: a regular-expression literal or a filesystem path,
+ * neither of which is key material. The pattern case is why this is needed at all, because such a
+ * literal need not be closed by the time the extraction stops:
+ * `/-{5}BEGIN\s?(DSA|RSA)?\s?PRIVATE KEY/gm` bound to a key-like name is cut at the space before
+ * `KEY`, leaving a 48-character fragment at 4.47 bits per character whose brackets balance and
+ * which no anchored literal test recognises.
+ *
+ * Quoting is the line this exclusion stops at, and deliberately so: quotes delimit a literal, so
+ * `password = "/Ab!9cD@…"` is a credential that happens to start with a slash and is measured in
+ * full, while a quoted pattern is still recognised by {@link REGEX_LITERAL_VALUE_PATTERN}.
+ */
+const PATH_OR_PATTERN_VALUE_PATTERN = /^\//;
+
+/** A regular-expression literal with optional flags, which is a pattern and not a credential. */
+const REGEX_LITERAL_VALUE_PATTERN = /^\/.+\/[a-z]*$/;
+
+/**
+ * A value containing whitespace, which a quoted value can and an unquoted value cannot: prose. A
+ * credential is issued as one unbroken token, whereas a quoted string with spaces is a sentence -
+ * a documented example such as ``API_TOKEN=`This has 'single' and "double" quotes inside` ``, a
+ * message, or a description. Such sentences sit right at the threshold (English prose measures
+ * about 4 bits per character), so admitting them would put the gate's noise floor in documentation
+ * while adding no credential class the dense-run pass, which never admitted whitespace either,
+ * could see.
+ */
+const PROSE_VALUE_PATTERN = /\s/;
+
+/**
+ * An identifier followed by one or more member, call or index groups, anchored to the whole value:
+ * `process.env.DEBUGGEN_SERVER_AGENT_TOKEN`, `normalizeSqlStatement(fixture.sql)`,
+ * `credentials[activeProfile]`, `credential.tokenType?.toLowerCase()`. These are expressions that
+ * *read* a value, not the value itself. Nested groups are collapsed before the test (see
+ * {@link collapseGroups}), so a call whose argument is itself a call -
+ * `this.generateAccountKey(AccountEntityUtils.getAccountInfo(account))` - is recognised too.
+ *
+ * The separators admit optional chaining (`?.`) and the non-null assertion (`!`), because
+ * TypeScript writes a nullable credential lookup that way and the whole point of the pattern is to
+ * recognise a lookup: `const tokenType = credential.tokenType?.toLowerCase();` is 35 characters at
+ * over 4 bits per character bound to a key-like name, so without them it reads as key material.
+ *
+ * At least one group is required, so a bare identifier is *not* excluded: an unquoted
+ * `API_KEY=AbCdEfGh…` value has exactly the shape of an identifier, and that is the commonest
+ * credential form there is.
+ */
+const MEMBER_EXPRESSION_PATTERN =
+  /^[A-Za-z_$][A-Za-z0-9_$]*(?:(?:\?\.|!\.|\.)[A-Za-z_$][A-Za-z0-9_$]*|(?:\?\.)?\([^()]*\)|(?:\?\.)?\[[^[\]]*\]|!)+$/;
+
+/** How many levels of nesting {@link collapseGroups} flattens before it gives up. */
+const MAX_GROUP_COLLAPSE_PASSES = 8;
+
+/**
+ * Bracket pairs whose balance decides whether an unquoted run is a complete value or a fragment
+ * cut out of a larger expression.
+ *
+ * @type {readonly (readonly [string, string])[]}
+ */
+const BRACKET_PAIRS = Object.freeze([
+  Object.freeze(/** @type {[string, string]} */ (['(', ')'])),
+  Object.freeze(/** @type {[string, string]} */ (['[', ']'])),
+  Object.freeze(/** @type {[string, string]} */ (['{', '}'])),
+]);
 
 /**
  * Names whose value is a credential. Matching is case-insensitive and separator-aware, and
@@ -661,6 +783,20 @@ const NAME_PADDING = new Set([' ', '\t', '"', "'", '`']);
 
 /** Identifier characters, used to read the name that precedes a value. */
 const NAME_PATTERN = /[A-Za-z0-9_.-]+$/;
+
+/**
+ * How much of the text before a value the name lookup reads.
+ *
+ * {@link nearestAssignedName} only ever inspects the tail of what it is given - quoting and
+ * whitespace, then one identifier - so handing it the whole prefix of the line is wasted work, and
+ * on a long line it is quadratic work: one copy of the prefix per assignment site. Measured on a
+ * 50 000-character line of `NAME=value` pairs, the unbounded lookup cost 693 ms against 11 ms
+ * through this window, and that gap widens with the square of the length, which is how a gate
+ * inside `pnpm verify` would come to stall on a committed minified bundle. 256 characters is far
+ * more than any name plus its padding, and a name longer than that is reported truncated rather
+ * than missed.
+ */
+const NAME_LOOKBEHIND = 256;
 
 /** A git object name: `uses: owner/repo@<sha>` in a workflow pins actions this way. */
 const GIT_SHA_PATTERN = /^[0-9a-f]{7,40}$/;
@@ -740,6 +876,235 @@ function nearestAssignedName(before) {
   }
   const match = NAME_PATTERN.exec(before.slice(0, index));
   return match === null ? '' : match[0];
+}
+
+/**
+ * The text immediately before `index` on `line`, bounded to {@link NAME_LOOKBEHIND} characters:
+ * what the name lookup and the URI-authority guard read. Both look only at the tail, so the bound
+ * changes nothing they decide and keeps the entropy rule linear on a long line.
+ *
+ * @param {string} line
+ * @param {number} index Exclusive end of the window.
+ * @returns {string}
+ */
+function lookbehind(line, index) {
+  return line.slice(index > NAME_LOOKBEHIND ? index - NAME_LOOKBEHIND : 0, index);
+}
+
+/**
+ * Index of the quote that closes a literal opened at `from`, or `-1` when the line does not close
+ * it.
+ *
+ * A backslash escapes the character after it, so `\"` inside a double-quoted literal is part of
+ * the value rather than its end. Scanning for the delimiter without that rule cuts
+ * `password = "Ab!\"cD@…"` at the escaped quote and measures a fragment - which is the whole
+ * failure this rule exists to avoid, in a different disguise.
+ *
+ * @param {string} line
+ * @param {string} quote The opening delimiter: `"`, `'` or a backtick.
+ * @param {number} from Index of the literal's first content character.
+ * @returns {number} Index of the closing delimiter, or `-1`.
+ */
+function closingQuote(line, quote, from) {
+  for (let index = from; index < line.length; index += 1) {
+    const character = line.charAt(index);
+    if (character === '\\') {
+      index += 1;
+      continue;
+    }
+    if (character === quote) {
+      return index;
+    }
+  }
+  return -1;
+}
+
+/**
+ * One complete value an assignment on the line binds to a name.
+ *
+ * @typedef {object} AssignedValue
+ * @property {string} name The name the value is bound to, or `''` when there is none.
+ * @property {string} value The value in full, quotes stripped, punctuation and all.
+ * @property {number} start Inclusive index of the value's first character in the line.
+ * @property {number} end Exclusive index just past the value's last character in the line.
+ * @property {boolean} quoted Whether the value was delimited by quotes, and therefore complete by
+ *   construction rather than cut at the first delimiter.
+ */
+
+/**
+ * Whether every bracket in `value` is closed, and none closes before it opens.
+ *
+ * An unquoted value stops at the first delimiter, so `readCredential(configuration` is all that is
+ * left of `readCredential(configuration, fallbackProfile)` once the run is cut at the comma:
+ * unbalanced brackets are the signal that the run is a fragment of a larger expression rather than
+ * a value in its own right.
+ *
+ * @param {string} value
+ * @returns {boolean}
+ */
+function hasBalancedBrackets(value) {
+  for (const [open, close] of BRACKET_PAIRS) {
+    let depth = 0;
+    for (let index = 0; index < value.length; index += 1) {
+      const character = value.charAt(index);
+      if (character === open) {
+        depth += 1;
+      } else if (character === close) {
+        depth -= 1;
+        if (depth < 0) {
+          return false;
+        }
+      }
+    }
+    if (depth !== 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Every complete assigned or quoted value on `line`, with the name each is bound to.
+ *
+ * This is the `entropy` rule's first candidate source, and the reason a punctuated credential is
+ * measurable at all: the dense-run pattern ({@link ENTROPY_CANDIDATE_PATTERN}) splits
+ * `password=Xq!7@vB#...` into sub-runs of a handful of characters each, none of which reaches
+ * {@link ENTROPY_MIN_LENGTH}, whereas the value read here is the whole 35 characters.
+ *
+ * An assignment site is a `=` or `:` that assigns rather than operates: `==`, `===`, `=>`, `::`,
+ * `+=`, `!=` and the rest are skipped by inspecting the character on either side of it. After the
+ * operator, a quoted value runs to its matching *unescaped* quote (see {@link closingQuote}), or to
+ * the end of the line when the literal is unterminated, which is what an unbalanced editor state or
+ * a wrapped line looks like; an unquoted value runs to the first
+ * {@link UNQUOTED_VALUE_TERMINATOR}, which is neither `=` nor `:`.
+ *
+ * Scanning continues *after* each value, never inside it: an `=` within a quoted string is part of
+ * the string, not a second assignment.
+ *
+ * @param {string} line
+ * @returns {AssignedValue[]} In left-to-right order; empty values are omitted.
+ */
+function assignedValues(line) {
+  /** @type {AssignedValue[]} */
+  const values = [];
+  let index = 0;
+  while (index < line.length) {
+    const operator = line.charAt(index);
+    if (operator !== '=' && operator !== ':') {
+      index += 1;
+      continue;
+    }
+    const next = line.charAt(index + 1);
+    if (next === '=' || next === '>' || (operator === ':' && next === ':')) {
+      // `==`, `===`, `=>` and `::`: two-character operators, and neither half assigns.
+      index += 2;
+      continue;
+    }
+    if (index > 0 && NON_ASSIGNMENT_PREFIXES.has(line.charAt(index - 1))) {
+      // The trailing half of a compound assignment, a comparison or a namespace separator.
+      index += 1;
+      continue;
+    }
+
+    let cursor = index + 1;
+    while (cursor < line.length && (line.charAt(cursor) === ' ' || line.charAt(cursor) === '\t')) {
+      cursor += 1;
+    }
+
+    const quote = line.charAt(cursor);
+    const quoted = VALUE_QUOTES.has(quote);
+    let valueStart;
+    let valueEnd;
+    let resumeAt;
+    if (quoted) {
+      valueStart = cursor + 1;
+      const closing = closingQuote(line, quote, valueStart);
+      valueEnd = closing === -1 ? line.length : closing;
+      resumeAt = closing === -1 ? line.length : closing + 1;
+    } else {
+      valueStart = cursor;
+      let end = valueStart;
+      while (end < line.length && !UNQUOTED_VALUE_TERMINATOR.test(line.charAt(end))) {
+        end += 1;
+      }
+      valueEnd = end;
+      resumeAt = valueEnd;
+    }
+
+    const value = line.slice(valueStart, valueEnd);
+    if (value !== '') {
+      values.push({
+        // The name is read with the same helper, through the same bounded window, as the
+        // dense-run pass uses, so its rejection of arrows and comparisons applies identically to
+        // both candidate sources.
+        name: nearestAssignedName(lookbehind(line, valueStart)),
+        value,
+        start: valueStart,
+        end: valueEnd,
+        quoted,
+      });
+    }
+    index = Math.max(resumeAt, index + 1);
+  }
+  return values;
+}
+
+/**
+ * `value` with every balanced bracket group emptied, innermost first, so that an arbitrarily nested
+ * call or index reads as a flat one: `Arr.fromIterable(map.keys()).map(unmake)` collapses to
+ * `Arr.fromIterable().map()`, which {@link MEMBER_EXPRESSION_PATTERN} recognises as the expression
+ * it is. Without this, a regular expression would have to match nested parentheses, which it
+ * cannot, and every nested call in a codebase would read as a dense value.
+ *
+ * Each pass rewrites the innermost groups to a sentinel rather than to `()`, because `()` matches
+ * the same sub-pattern again and the collapse would stall one level in. The sentinels become empty
+ * groups once the text stops changing. Collapsing runs at most
+ * {@link MAX_GROUP_COLLAPSE_PASSES} times; stopping early only means a value nested deeper than
+ * that is measured rather than skipped.
+ *
+ * @param {string} value
+ * @returns {string}
+ */
+function collapseGroups(value) {
+  const CALL = '\u0001';
+  const INDEX = '\u0002';
+  let text = value;
+  for (let pass = 0; pass < MAX_GROUP_COLLAPSE_PASSES; pass += 1) {
+    const collapsed = text.replace(/\([^()]*\)/g, CALL).replace(/\[[^[\]]*\]/g, INDEX);
+    if (collapsed === text) {
+      break;
+    }
+    text = collapsed;
+  }
+  return text.split(CALL).join('()').split(INDEX).join('[]');
+}
+
+/**
+ * Whether an assigned value is code that reads or matches a credential rather than a credential.
+ *
+ * Two shapes. An expression - `normalizeSqlStatement(fixture.sql)`, which is a tracked line of
+ * `packages/telemetry/src/redaction/sql.test.ts` and the exact false positive a complete-value
+ * pass produces there, or a member chain such as `credentials[activeProfile].secretValue`. And -
+ * for unquoted values only - a run with unbalanced brackets, which means the run was cut out of a
+ * larger expression at the delimiter the extraction stopped on. A quoted value is complete by
+ * construction, so the balance rule does not apply to it: a real credential may legitimately
+ * contain a lone bracket.
+ *
+ * A closed regular-expression literal is code too, quoted or not, so it is tested here rather than
+ * left to {@link PATH_OR_PATTERN_VALUE_PATTERN}, which refuses unquoted `/`-leading values only.
+ *
+ * @param {string} value
+ * @param {boolean} quoted
+ * @returns {boolean}
+ */
+function isExpressionValue(value, quoted) {
+  if (MEMBER_EXPRESSION_PATTERN.test(collapseGroups(value))) {
+    return true;
+  }
+  if (REGEX_LITERAL_VALUE_PATTERN.test(value)) {
+    return true;
+  }
+  return !quoted && !hasBalancedBrackets(value);
 }
 
 /**
@@ -870,16 +1235,99 @@ function matchConnectionStrings(line) {
 }
 
 /**
- * `entropy`: a long, dense value bound to a key-like name.
+ * The `entropy` match for one candidate, or `null` when a threshold or the name binding rejects
+ * it. Shared by both candidate passes of {@link matchEntropy} so the two cannot drift apart in
+ * what they consider dense, and so a finding reads the same however the candidate was found.
  *
- * Three exclusions keep the rule quiet on content this repository legitimately commits:
+ * Exclusion (a): a value shorter than {@link ENTROPY_MIN_LENGTH}, or one whose density does not
+ * strictly exceed {@link ENTROPY_MIN_BITS_PER_CHAR}, is not measurable key material - an entropy
+ * estimate over a handful of characters means nothing, and hexadecimal (16 symbols, at most 4
+ * bits/char) is a hash rather than a credential.
  *
- *   * `pnpm-lock.yaml` is exempt from this rule alone (see {@link ENTROPY_EXEMPT_FILES}).
- *   * A value that continues a URI (`scheme://<here>`) is a host and path, not a credential; a
- *     credentialed URI is `connection-string`'s business.
- *   * A git object name in a workflow is how actions are pinned (AAP 0.3.2). Hexadecimal cannot
- *     exceed 4 bits per character anyway, so this is belt and braces rather than the load-bearing
- *     guard.
+ * Exclusion (b): the rule is *bound*. A dense value under a neutral name is a hash, a build id or
+ * a base64 asset, and reporting those would make the gate too noisy to be trusted.
+ *
+ * Exclusion (g), second half: a git object name on a `.github/workflows/` line is how actions are
+ * pinned (AAP 0.3.2). Hexadecimal cannot exceed the threshold anyway, so this is belt and braces
+ * rather than the load-bearing guard.
+ *
+ * @param {string} name Name the value is bound to.
+ * @param {string} value Complete candidate value.
+ * @param {number} start Inclusive index of `value` in the line.
+ * @param {boolean} inWorkflow Whether the file is a GitHub Actions workflow.
+ * @returns {RuleMatch | null}
+ */
+function entropyMatch(name, value, start, inWorkflow) {
+  if (value.length < ENTROPY_MIN_LENGTH) {
+    return null;
+  }
+  if (inWorkflow && GIT_SHA_PATTERN.test(value)) {
+    return null;
+  }
+  if (!isKeyLikeName(name)) {
+    return null;
+  }
+  const bits = shannonEntropy(value);
+  if (bits <= ENTROPY_MIN_BITS_PER_CHAR) {
+    return null;
+  }
+  return {
+    rule: 'entropy',
+    pattern: name,
+    start,
+    end: start + value.length,
+    text: value,
+    detail:
+      `value of ${value.length} characters at ${bits.toFixed(2)} bits/char assigned to ` +
+      `the key-like name \`${name}\``,
+  };
+}
+
+/**
+ * `entropy`: a long, dense value bound to a key-like name (AAP 0.3.4).
+ *
+ * TWO CANDIDATE SOURCES, IN THIS ORDER.
+ *
+ *   1. The complete assigned or quoted value ({@link assignedValues}), measured over its full
+ *      contents whatever characters it contains. Punctuation is what makes this pass necessary: a
+ *      password of `!@#$%^&*()` and alphanumerics is dense key material, and the dense-run
+ *      alphabet below splits it into sub-runs too short to measure.
+ *   2. The contiguous dense run ({@link ENTROPY_CANDIDATE_PATTERN}), which is the only pass that
+ *      covers a value with no assignment operator at all - the `--auth-token <run>` form this
+ *      file's specification requires - and dense runs embedded in a larger value.
+ *
+ * Complete values are reported first so that when both passes see the same credential,
+ * {@link dedupeOverlaps} keeps the fullest extent and the finding's column, preview and
+ * `N characters` describe the whole value. The structural rules still win over this one, because
+ * {@link scanContentWithSuppressions} lists them before it.
+ *
+ * EXCLUSIONS. Each has a name, because each is a false positive this repository's own tracked
+ * content produces, and each is pinned by a test:
+ *
+ *   (a) too short, or not dense enough - see {@link entropyMatch}. There is no upper bound: AAP
+ *       0.3.4 states a minimum of 32 characters and no maximum, so a long value is measured, and
+ *       what keeps a long *line* affordable is {@link NAME_LOOKBEHIND} rather than a size cap.
+ *   (b) the name is not key-like - see {@link entropyMatch}.
+ *   (c) the value interpolates (`${...}`) or substitutes a command (`$(...)`): what it holds is
+ *       computed at runtime, so the committed text is a template, not a literal.
+ *   (d) the value is a URI, or is unquoted and begins with `/` (see
+ *       {@link PATH_OR_PATTERN_VALUE_PATTERN}): a location or a pattern, not key material. A
+ *       credentialed URI is `connection-string`'s business, and `API_KEY=https://host/<dense path>`
+ *       is an asset URL. A *quoted* value beginning with `/` is a literal and is measured.
+ *   (e) the value contains whitespace - see {@link PROSE_VALUE_PATTERN}. Only a quoted value can:
+ *       prose in documentation, not a credential, which is always one unbroken token.
+ *   (f) the value is code rather than a literal - see {@link isExpressionValue}.
+ *   (g) `pnpm-lock.yaml` is exempt from this rule alone (see {@link ENTROPY_EXEMPT_FILES}), and a
+ *       git object name in a workflow is a pin rather than a credential.
+ *
+ * Exclusions (c) to (f) apply to the complete-value pass only, and the dense-run pass keeps
+ * exactly the guard it always had: a run that continues a URI authority (`scheme://<here>`). That
+ * is deliberate rather than an oversight. Those four exclusions are properties of a *complete*
+ * value, and a dense run is by definition a fragment bounded by the narrow alphabet, so what keeps
+ * such a fragment quiet is the name binding (b) - the character before it is a `(`, a `.` or a `/`
+ * rather than an assignment operator. Leaving the run pass untouched also means this rule detects
+ * everything it detected before, since a dotted dense run that happens to look like a member chain
+ * is still measured there.
  *
  * @param {string} relPath Repository-relative POSIX path.
  * @param {string} line
@@ -892,33 +1340,39 @@ function matchEntropy(relPath, line) {
     return matches;
   }
   const inWorkflow = relPath.startsWith(WORKFLOW_PATH_PREFIX);
-  for (const match of line.matchAll(ENTROPY_CANDIDATE_PATTERN)) {
-    const text = match[0];
-    const before = line.slice(0, match.index);
+
+  for (const assigned of assignedValues(line)) {
+    if (INTERPOLATED_VALUE_PATTERN.test(assigned.value)) {
+      continue;
+    }
+    if (URI_VALUE_PATTERN.test(assigned.value)) {
+      continue;
+    }
+    if (!assigned.quoted && PATH_OR_PATTERN_VALUE_PATTERN.test(assigned.value)) {
+      continue;
+    }
+    if (PROSE_VALUE_PATTERN.test(assigned.value)) {
+      continue;
+    }
+    if (isExpressionValue(assigned.value, assigned.quoted)) {
+      continue;
+    }
+    const match = entropyMatch(assigned.name, assigned.value, assigned.start, inWorkflow);
+    if (match !== null) {
+      matches.push(match);
+    }
+  }
+
+  for (const run of line.matchAll(ENTROPY_CANDIDATE_PATTERN)) {
+    const text = run[0];
+    const before = lookbehind(line, run.index);
     if (before.endsWith('://')) {
       continue;
     }
-    if (inWorkflow && GIT_SHA_PATTERN.test(text)) {
-      continue;
+    const match = entropyMatch(nearestAssignedName(before), text, run.index, inWorkflow);
+    if (match !== null) {
+      matches.push(match);
     }
-    const name = nearestAssignedName(before);
-    if (!isKeyLikeName(name)) {
-      continue;
-    }
-    const bits = shannonEntropy(text);
-    if (bits <= ENTROPY_MIN_BITS_PER_CHAR) {
-      continue;
-    }
-    matches.push({
-      rule: 'entropy',
-      pattern: name,
-      start: match.index,
-      end: match.index + text.length,
-      text,
-      detail:
-        `value of ${text.length} characters at ${bits.toFixed(2)} bits/char assigned to ` +
-        `the key-like name \`${name}\``,
-    });
   }
   return matches;
 }
@@ -1234,7 +1688,8 @@ function isBinary(buffer) {
  * @property {string} repoRoot Absolute work-tree root that was scanned.
  * @property {string} allowlistPath Absolute path of the allowlist that was applied.
  * @property {readonly string[]} rules Rule ids that were enforced.
- * @property {number} filesTracked Files git tracks.
+ * @property {number} filesTracked Files git tracks; never zero, because an empty tracked subject
+ *   is a precondition failure rather than a report (see {@link scanRepository}).
  * @property {number} filesScanned Files whose content was read and scanned.
  * @property {Finding[]} findings Violations, in file then line then column order.
  * @property {AllowlistedFinding[]} allowlisted Matches an allowlist entry exempted.
@@ -1250,7 +1705,9 @@ function isBinary(buffer) {
  *   In-process callers pass a throwaway repository here. `allowlist` supplies a validated or parsed
  *   allowlist instead of reading one; `allowlistPath` reads a different file.
  * @returns {CheckReport}
- * @throws {CheckSecretsError} When the scan cannot be performed.
+ * @throws {CheckSecretsError} When the scan cannot be performed: `root-missing`,
+ *   `not-a-repository`, `git-missing`, `git-failed`, an `allowlist-*` code, or
+ *   `no-tracked-files` when git tracks nothing in the checkout.
  */
 export function scanRepository(options = {}) {
   const repoRoot = resolveRepoRoot(options.cwd ?? options.root ?? SCRIPT_DIRECTORY);
@@ -1261,6 +1718,20 @@ export function scanRepository(options = {}) {
       : resolveAllowlist(options.allowlist);
 
   const files = listTrackedFiles(repoRoot);
+  if (files.length === 0) {
+    // A gate that passes because it had nothing to look at is worse than no gate at all: the
+    // build goes green having proved nothing about the repository. This is raised here rather
+    // than in the command line so that an in-process caller cannot get a clean report over an
+    // unscanned tree either.
+    throw new CheckSecretsError(
+      'no-tracked-files',
+      `git tracks no files in ${repoRoot}, so there is nothing to scan and this check cannot be ` +
+        'performed. Nothing has been staged or committed yet, the checkout is sparse or partial, ' +
+        'or the scan was pointed at the wrong directory: stage the files with `git add`, restore ' +
+        'the full checkout with `git sparse-checkout disable`, or run the check from a complete ' +
+        'checkout of the repository.',
+    );
+  }
   /** @type {Finding[]} */
   const findings = [];
   /** @type {AllowlistedFinding[]} */
@@ -1389,12 +1860,6 @@ function renderReport(report) {
     lines.push('', ...findingsExplanation(), '');
   }
 
-  if (report.filesTracked === 0) {
-    lines.push(
-      'check-secrets: warning: git tracks no files here, so the scan had nothing to check.',
-    );
-  }
-
   const parts = [
     `${report.filesScanned} ${plural(report.filesScanned, 'file')} scanned`,
     `${report.findings.length} ${plural(report.findings.length, 'finding')}`,
@@ -1433,8 +1898,8 @@ function helpText() {
     'Exit codes:',
     '  0  no findings',
     '  1  at least one finding',
-    '  2  the check could not run: unknown option, git unavailable, not a git repository, or a',
-    '     missing or malformed allowlist',
+    '  2  the check could not run: unknown option, git unavailable, not a git repository, no',
+    '     tracked files to scan, or a missing or malformed allowlist',
     '',
     'The check only reads: it writes nothing to disk and never opens anything inside .git/, whose',
     'config holds this repository\u2019s remote access token. Findings name the file and line, and',

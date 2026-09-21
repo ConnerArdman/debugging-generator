@@ -248,7 +248,9 @@ Import boundary (enforced, not advisory)
 
 Options
   --watch   rebuild on change (esbuild context + watch), re-running the import
-            boundary audit after every rebuild; Ctrl-C stops it
+            boundary audit after every rebuild; Ctrl-C stops it. A failing
+            rebuild prints and watching continues, so the exit code on stop is
+            the outcome of the last completed rebuild, not of the session
   --dev     opt-in development build: unminified with an inline source map,
             written to the same path. Never what \`pnpm build\` runs; re-run
             without --dev before copying, committing or measuring size
@@ -1052,12 +1054,21 @@ export async function buildAgent({ dev = false, quiet = false, packageRoot = PAC
  * A failure prints and the watcher stays up: the next save is the fix.
  *
  * @param {{ dev?: boolean, quiet?: boolean, packageRoot?: string }} [options]
- * @returns {Promise<number>} exit code, 0 once the watcher has been stopped
+ * @returns {Promise<number>} exit code of the last completed rebuild: because a
+ *   failure does not end the session, the code reported on stop is the last
+ *   state before Ctrl-C — 0 when the final rebuild built and passed the audit, 1
+ *   when it did not. That is what keeps `--watch` honest for anyone who scripts
+ *   it, and it matches `esbuild.node.mjs`.
  * @throws {AgentBuildError} exit code 2 when the entry point is missing
  */
 export async function watchAgent({ dev = false, quiet = false, packageRoot = PACKAGE_ROOT } = {}) {
   await assertEntryExists({ packageRoot });
   await ensureOutputDirectory({ packageRoot });
+
+  // Overwritten by every rebuild, so it carries the outcome of the most recent
+  // one rather than the worst or the first. Declared out here because the plugin
+  // below writes it and the value is read after the context is disposed.
+  let lastExitCode = EXIT_OK;
 
   const options = createBuildOptions({ dev, packageRoot });
   /** @type {import("esbuild").Plugin} */
@@ -1065,7 +1076,8 @@ export async function watchAgent({ dev = false, quiet = false, packageRoot = PAC
     name: 'debuggen-agent-audit',
     setup(build) {
       build.onEnd(async (result) => {
-        await reportResult(result, { dev, quiet, packageRoot });
+        const report = await reportResult(result, { dev, quiet, packageRoot });
+        lastExitCode = report.code;
       });
     },
   };
@@ -1093,7 +1105,9 @@ export async function watchAgent({ dev = false, quiet = false, packageRoot = PAC
     await context.dispose();
   }
 
-  return EXIT_OK;
+  // Read after dispose(), which drains an in-flight rebuild's onEnd: a Ctrl-C
+  // landing mid-rebuild must still report that rebuild's outcome.
+  return lastExitCode;
 }
 
 /**

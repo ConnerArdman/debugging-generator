@@ -13,10 +13,25 @@
 //    identifier still lists that identifier in the policy."
 //
 // They are the first four `describe` blocks below, in that order. The remaining
-// blocks cover the rules the four cases do not reach (`demo-import`,
-// `demo-path`, the question-branch exemption, `policy-stale`, the exclusion
-// list and the command-line surface), because a gate whose supporting rules are
-// untested is a gate that can rot silently.
+// blocks cover the rules and guarantees the four cases do not reach
+// (`demo-import`, `demo-path`, the question-branch exemption, `policy-stale`,
+// the exclusion list, the command-line surface, the enforcement of policy drift
+// whenever the demo corpus is present, and the fail-closed scan), because a gate
+// whose supporting rules are untested is a gate that can rot silently.
+//
+// TWO PROPERTIES THAT ARE THE GATE ITSELF, NOT A DETAIL
+// A guard is only evidence if it fails when it cannot do its job, so two
+// properties are asserted as directly as the four cases above:
+//   * "policy-stale is enforced whenever the corpus is present" - drift fails
+//     the run however little of the committed policy a fresh harvest reproduces.
+//     There is no coverage threshold and no partially-materialized-corpus
+//     exemption; the only state that skips the comparison is an absent
+//     `apps/demo-app`, and the policy is still enforced against product source
+//     then.
+//   * "the scan fails closed" - an unlistable directory, an unreadable,
+//     undecodable or oversized file, a symbolic link where a scanned file was
+//     expected, and a corpus the harvest could only partly read each stop the
+//     run with the environment exit code instead of being counted as clean.
 //
 // HOW EVERY CASE IS BUILT
 // Each case writes a synthetic repository into a fresh `os.tmpdir()` directory
@@ -53,7 +68,15 @@
 // source file: `buildPolicy()` parses the demo corpus with ts-morph to harvest
 // it. Those cases are gated with the rest.
 // ---------------------------------------------------------------------------
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
@@ -68,6 +91,7 @@ import {
   EXIT_OK,
   FIXTURE_TREE,
   HardcodingCheckError,
+  MAX_FILE_BYTES,
   POLICY_FILE,
   PRODUCT_TREES,
   QUESTION_EXEMPT_FILE,
@@ -82,6 +106,7 @@ import {
   scanProductSource,
   scanStructuredText,
   serializePolicy,
+  updatePolicy,
 } from './check-no-hardcoding.mjs';
 
 /**
@@ -125,6 +150,19 @@ function makeTree(files) {
     writeFileSync(absolute, contents, 'utf8');
   }
   return root;
+}
+
+/**
+ * Absolute path of a repository-relative POSIX path inside a synthetic tree, for
+ * the cases that have to manipulate the tree after `makeTree` wrote it
+ * (symbolic links, permissions, oversized bodies).
+ *
+ * @param {string} root
+ * @param {string} relPath
+ * @returns {string}
+ */
+function at(root, relPath) {
+  return path.join(root, ...relPath.split('/'));
 }
 
 /**
@@ -269,6 +307,65 @@ function byRule(findings, rule) {
 function rulesOf(findings) {
   return [...new Set(findings.map((finding) => finding.rule))].sort();
 }
+
+/**
+ * The scan failures recorded for one path, which is how a fail-closed case says
+ * "this is the hole the run refused to pass over".
+ *
+ * @param {{ path: string, reason: string, detail: string }[]} failures
+ * @param {string} relPath
+ * @returns {any[]}
+ */
+function failuresFor(failures, relPath) {
+  return failures.filter((failure) => failure.path === relPath);
+}
+
+/**
+ * Write a file whose body is `size` bytes, creating its parent directories. Used
+ * to put a file one byte over the scanner's read limit into a synthetic tree.
+ *
+ * @param {string} root
+ * @param {string} relPath
+ * @param {number} size
+ * @returns {void}
+ */
+function writeFileOfSize(root, relPath, size) {
+  const absolute = at(root, relPath);
+  mkdirSync(path.dirname(absolute), { recursive: true });
+  writeFileSync(absolute, 'x'.repeat(size), 'utf8');
+}
+
+/**
+ * Whether this process can be denied read access by a mode bit. Root cannot: it
+ * bypasses the permission check, so the one case built on `chmod` is declared
+ * skipped there rather than silently asserting nothing. Every other fail-closed
+ * case below is uid-independent by construction, and CI runs as a normal user,
+ * where this case does run.
+ */
+const canBeDeniedByMode = typeof process.getuid === 'function' && process.getuid() !== 0;
+if (!canBeDeniedByMode) {
+  process.stderr.write(
+    'check-no-hardcoding.test: skipping the permission-denied traversal case - this process is root, ' +
+      'which bypasses mode bits; the other fail-closed cases assert the same propagation without permissions.\n',
+  );
+}
+
+/**
+ * Whether this filesystem lets the test create a symbolic link. Linux and macOS
+ * do; a Windows checkout without the privilege does not, and the two link cases
+ * are declared skipped there instead of failing for an unrelated reason.
+ */
+const canCreateSymlinks = (() => {
+  const probe = mkdtempSync(path.join(os.tmpdir(), 'debuggen-nohc-link-'));
+  temporaryRoots.push(probe);
+  try {
+    writeFileSync(path.join(probe, 'target.txt'), 'probe\n', 'utf8');
+    symlinkSync('./target.txt', path.join(probe, 'link.txt'));
+    return true;
+  } catch {
+    return false;
+  }
+})();
 
 /**
  * Run the command-line entry point against a synthetic root, capturing both
@@ -1152,5 +1249,459 @@ describe('policy and allowlist loading', () => {
       name: 'HardcodingCheckError',
       code: 'policy-malformed',
     });
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * drift is enforced whenever the demo corpus is present
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * A committed policy the corpus mostly cannot account for: nine of its ten
+ * identifiers and its one route path belong to demo code that is not in this
+ * tree, and only `RecommendationsRail` is. A fresh harvest therefore reproduces
+ * far less than half of it - the shape a half-written demo application produces
+ * on the way to being finished - and the run must still fail, because a
+ * committed policy nobody can regenerate is a gate nobody can trust.
+ */
+const UNREPRODUCIBLE_IDENTIFIERS = Object.freeze([
+  'CartProvider',
+  'CatalogGrid',
+  'CheckoutButton',
+  'ProductCard',
+  'RecommendationsRail',
+  'ShippingEtaProvider',
+  'SiteHeader',
+  'placeOrder',
+  'reserveStock',
+  'useCartSummary',
+]);
+
+describe('policy drift enforcement', () => {
+  /**
+   * @returns {string} A tree whose demo corpus declares one of the ten
+   *   committed identifiers, and a route the policy does not list.
+   */
+  function partialCorpusTree() {
+    return makeTree({
+      ...artifacts(
+        { identifiers: [...UNREPRODUCIBLE_IDENTIFIERS], routePaths: ['/api/checkout'] },
+        { identifiers: ['Button'] },
+      ),
+      [`${DEMO_TREE}/src/components/product/RecommendationsRail.tsx`]: DRIFTED_DEMO,
+      [`${DEMO_TREE}/app/api/recommendations/route.ts`]: DEMO_ROUTE_HANDLER,
+      'apps/local-service/src/sessions/manager.ts': source(
+        'export function createSessionManager() {',
+        '  return { sessions: new Map<string, unknown>() };',
+        '}',
+      ),
+    });
+  }
+
+  it(
+    'fails the run however little of the committed policy the corpus reproduces',
+    astCase(),
+    async () => {
+      const root = partialCorpusTree();
+      const result = await check(root);
+
+      // The corpus is present, so it is the definition of the policy and the
+      // comparison is authoritative - whatever fraction of the policy it
+      // happens to reproduce today.
+      expect(result.stale).not.toBeNull();
+      expect(result.stale.corpus.state).toBe('ready');
+      expect(result.stale.enforced).toBe(true);
+      expect(result.stale.drifted).toBe(true);
+
+      const committedEntries = [...UNREPRODUCIBLE_IDENTIFIERS, '/api/checkout'];
+      const removed = [...result.stale.removed.identifiers, ...result.stale.removed.routePaths];
+      const reproduced = committedEntries.filter((entry) => !removed.includes(entry));
+      // One entry of eleven: an exemption keyed on how much of the policy the
+      // corpus accounts for would have suppressed exactly this run.
+      expect(reproduced).toEqual(['RecommendationsRail']);
+      expect(reproduced.length / committedEntries.length).toBeLessThan(0.5);
+
+      const [stale] = byRule(result.findings, 'policy-stale');
+      expect(stale).toBeDefined();
+      expect(stale.file).toBe(POLICY_FILE);
+      expect(result.exitCode).toBe(EXIT_FINDINGS);
+      expect(result.ok).toBe(false);
+
+      const report = renderReport(result);
+      expect(report).toContain('policy drift against apps/demo-app (enforced)');
+      expect(report).toContain('pnpm check:no-hardcoding --update');
+      expect(report).not.toContain('not enforced');
+
+      const cli = await runCli([], root);
+      expect(cli.code).toBe(EXIT_FINDINGS);
+    },
+  );
+
+  it(
+    '`--update` writes exactly what the corpus yields, dropping what it does not declare',
+    astCase(),
+    async () => {
+      const root = partialCorpusTree();
+
+      const update = await runCli(['--update'], root);
+      expect(update.code).toBe(EXIT_OK);
+
+      // No entry survives because the previous file listed it: the regenerated
+      // policy is the harvest, so the nine names the demo does not declare go.
+      const written = readFileSync(at(root, POLICY_FILE), 'utf8');
+      expect(written).toBe(
+        policyDocument({
+          identifiers: ['RecommendationsRail', 'useRecommendations'],
+          routePaths: ['/api/recommendations'],
+        }),
+      );
+      for (const dropped of UNREPRODUCIBLE_IDENTIFIERS.filter(
+        (entry) => entry !== 'RecommendationsRail',
+      )) {
+        expect(written).not.toContain(dropped);
+      }
+      expect(update.stdout).toContain('entries are being removed, which widens the gate');
+
+      const after = await check(root);
+      expect(after.findings).toEqual([]);
+      expect(after.stale.drifted).toBe(false);
+      expect(after.exitCode).toBe(EXIT_OK);
+    },
+  );
+
+  it(
+    'compares nothing when the demo corpus is absent, and still enforces the policy',
+    astCase(),
+    async () => {
+      const leaking = makeTree({
+        ...artifacts({ identifiers: ['RecommendationsRail'] }, { identifiers: ['Button'] }),
+        'apps/local-service/src/panels/generate.ts': source(
+          "import { RecommendationsRail } from './authored/panels';",
+          '',
+          'export function panel() {',
+          '  return RecommendationsRail;',
+          '}',
+        ),
+      });
+      const result = await check(leaking);
+
+      // Absent is the one state that skips the comparison, and skipping it does
+      // not soften the policy: the leak is still reported.
+      expect(result.stale).toBeNull();
+      expect(result.notes.join('\n')).toContain('policy staleness not compared');
+      expect(rulesOf(result.findings)).toEqual(['policy-identifier']);
+      expect(result.exitCode).toBe(EXIT_FINDINGS);
+      expect(result.failures).toEqual([]);
+
+      const clean = makeTree({
+        ...artifacts({ identifiers: ['RecommendationsRail'] }, { identifiers: ['Button'] }),
+        'packages/panel-renderer/src/primitives/Button.tsx': source(
+          'export function Button() {',
+          '  return null;',
+          '}',
+        ),
+      });
+      const cleanResult = await check(clean);
+      expect(cleanResult.findings).toEqual([]);
+      expect(cleanResult.stale).toBeNull();
+      expect(cleanResult.exitCode).toBe(EXIT_OK);
+    },
+  );
+
+  it('refuses to regenerate a policy from a corpus that is not there', astCase(), async () => {
+    const root = makeTree(artifacts({ identifiers: ['RecommendationsRail'] }));
+
+    await expect(updatePolicy(root, { allowlist: null })).rejects.toMatchObject({
+      name: 'HardcodingCheckError',
+      code: 'corpus-empty',
+    });
+    // The committed policy is left exactly as it was: an empty one would pass
+    // every product file.
+    expect(readFileSync(at(root, POLICY_FILE), 'utf8')).toBe(
+      policyDocument({ identifiers: ['RecommendationsRail'] }),
+    );
+
+    const cli = await runCli(['--update'], root);
+    expect(cli.code).toBe(EXIT_ERROR);
+    expect(cli.stderr).toContain('corpus-empty');
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * the scan fails closed
+ * ---------------------------------------------------------------------------------------------- */
+
+/** A product file the scan can read, so a case can prove the rest still ran. */
+const READABLE_PRODUCT_FILE = source(
+  'export function createSessionManager() {',
+  '  return { sessions: new Map<string, unknown>() };',
+  '}',
+);
+
+describe('fail-closed scanning', () => {
+  it('stops the run when a scanned tree exists but is not a directory', astCase(), async () => {
+    const root = makeTree({
+      ...artifacts({ identifiers: ['RecommendationsRail'] }),
+      'apps/local-service/src/sessions/manager.ts': READABLE_PRODUCT_FILE,
+      // A file where a product tree belongs: everything it should have
+      // contained went unscanned.
+      'apps/chrome-extension': 'not a directory\n',
+    });
+
+    const result = await check(root, { stale: false });
+    const [failure] = failuresFor(result.failures, 'apps/chrome-extension');
+    expect(failure).toBeDefined();
+    expect(failure.reason).toBe('not-a-directory');
+    expect(failure.detail).toContain('unscanned');
+    // Recorded once, although both passes walk the product trees.
+    expect(failuresFor(result.failures, 'apps/chrome-extension')).toHaveLength(1);
+
+    // The readable part of the tree was still scanned, and the run still fails.
+    expect(result.sourceFilesScanned).toBe(1);
+    expect(result.findings).toEqual([]);
+    expect(result.ok).toBe(false);
+    expect(result.exitCode).toBe(EXIT_ERROR);
+
+    const cli = await runCli([], root);
+    expect(cli.code).toBe(EXIT_ERROR);
+    expect(cli.stdout).toContain('could not examine');
+    expect(cli.stdout).toContain('apps/chrome-extension');
+  });
+
+  it('records a file it cannot decode as text rather than passing over it', () => {
+    const root = makeTree({
+      ...artifacts({ identifiers: ['RecommendationsRail'] }),
+      // A structured-text surface whose bytes are not text: its contents were
+      // never matched against the policy.
+      'packages/protocol/NOTES.md': 'intro\n\u0000\u0000binary tail\n',
+      'packages/protocol/README.md': '# Protocol\n\nNo demo vocabulary here.\n',
+    });
+
+    const scan = scanStructuredText(root, undefined, { allowlist: null });
+    const [failure] = failuresFor(scan.failures, 'packages/protocol/NOTES.md');
+    expect(failure).toBeDefined();
+    expect(failure.reason).toBe('binary');
+    expect(failure.detail).toContain('NUL bytes');
+    expect(scan.findings).toEqual([]);
+    // The readable Markdown file next to it was still read.
+    expect(scan.filesScanned).toBe(1);
+  });
+
+  it('records a file above the size it reads whole', async () => {
+    const root = makeTree({
+      ...artifacts({ identifiers: ['RecommendationsRail'] }),
+      'packages/protocol/README.md': '# Protocol\n',
+    });
+    // One byte over the limit, taken from the scanner's own constant so this
+    // case cannot drift from it.
+    writeFileOfSize(root, 'packages/protocol/HUGE.md', MAX_FILE_BYTES + 1);
+
+    const scan = scanStructuredText(root, undefined, { allowlist: null });
+    const [failure] = failuresFor(scan.failures, 'packages/protocol/HUGE.md');
+    expect(failure).toBeDefined();
+    expect(failure.reason).toBe('too-large');
+    expect(failure.detail).toContain(String(MAX_FILE_BYTES));
+
+    const result = await check(root, { stale: false });
+    expect(result.exitCode).toBe(EXIT_ERROR);
+    expect(failuresFor(result.failures, 'packages/protocol/HUGE.md')).toHaveLength(1);
+  });
+
+  it(
+    'refuses a symbolic link standing where a scanned file or directory was expected',
+    { skip: !canCreateSymlinks || !astScan.available, timeout: AST_TIMEOUT_MS },
+    async () => {
+      const root = makeTree({
+        ...artifacts({ identifiers: ['RecommendationsRail'] }),
+        'apps/local-service/src/sessions/manager.ts': READABLE_PRODUCT_FILE,
+        'apps/local-service/elsewhere/authored.ts': source('export const authored = 1;'),
+      });
+      // A link in place of a source file, and a link in place of a directory:
+      // neither is followed, so neither may be passed over in silence.
+      symlinkSync('../elsewhere/authored.ts', at(root, 'apps/local-service/src/linked.ts'));
+      symlinkSync('../elsewhere', at(root, 'apps/local-service/src/linked-tree'));
+
+      const result = await check(root, { stale: false });
+
+      const [linkedFile] = failuresFor(result.failures, 'apps/local-service/src/linked.ts');
+      expect(linkedFile).toBeDefined();
+      expect(linkedFile.reason).toBe('symlink-not-followed');
+      const [linkedTree] = failuresFor(result.failures, 'apps/local-service/src/linked-tree');
+      expect(linkedTree).toBeDefined();
+      expect(linkedTree.reason).toBe('symlink-not-followed');
+
+      expect(result.exitCode).toBe(EXIT_ERROR);
+      expect(result.ok).toBe(false);
+    },
+  );
+
+  it(
+    'stops the run when a directory cannot be listed',
+    { skip: !canBeDeniedByMode || !astScan.available, timeout: AST_TIMEOUT_MS },
+    async () => {
+      const root = makeTree({
+        ...artifacts({ identifiers: ['RecommendationsRail'] }),
+        'apps/local-service/src/sessions/manager.ts': READABLE_PRODUCT_FILE,
+        'apps/local-service/src/panels/generate.ts': source('export const panel = 1;'),
+      });
+      const locked = at(root, 'apps/local-service/src/panels');
+      chmodSync(locked, 0o000);
+      try {
+        const result = await check(root, { stale: false });
+        const [failure] = failuresFor(result.failures, 'apps/local-service/src/panels');
+        expect(failure).toBeDefined();
+        expect(failure.reason).toBe('unreadable-directory');
+        expect(result.exitCode).toBe(EXIT_ERROR);
+      } finally {
+        // Restored so `afterAll` can remove the tree.
+        chmodSync(locked, 0o755);
+      }
+    },
+  );
+
+  it(
+    'refuses to judge or rewrite the policy from a corpus it could only partly read',
+    astCase(),
+    async () => {
+      const root = makeTree({
+        ...artifacts({ identifiers: ['RecommendationsRail'] }, { identifiers: ['Button'] }),
+        [`${DEMO_TREE}/src/components/product/RecommendationsRail.tsx`]: DRIFTED_DEMO,
+        'apps/local-service/src/sessions/manager.ts': READABLE_PRODUCT_FILE,
+      });
+      // A corpus file the harvest cannot read is vocabulary missing from the
+      // regenerated policy, and nothing downstream can tell that from a name
+      // the demo no longer declares.
+      writeFileOfSize(
+        root,
+        `${DEMO_TREE}/src/server/services/checkout.service.ts`,
+        MAX_FILE_BYTES + 1,
+      );
+
+      const harvest = await buildPolicy(root, { allowlist: null });
+      const [corpusFailure] = failuresFor(
+        harvest.corpusFailures,
+        `${DEMO_TREE}/src/server/services/checkout.service.ts`,
+      );
+      expect(corpusFailure).toBeDefined();
+      expect(corpusFailure.reason).toBe('too-large');
+
+      // A normal run reports the hole and makes no staleness claim either way.
+      const result = await check(root);
+      expect(result.stale).toBeNull();
+      expect(result.notes.join('\n')).toContain('policy staleness not compared');
+      expect(byRule(result.findings, 'policy-stale')).toEqual([]);
+      expect(result.exitCode).toBe(EXIT_ERROR);
+
+      // And `--update` writes nothing.
+      const before = readFileSync(at(root, POLICY_FILE), 'utf8');
+      const cli = await runCli(['--update'], root);
+      expect(cli.code).toBe(EXIT_ERROR);
+      expect(cli.stderr).toContain('corpus-unreadable');
+      expect(readFileSync(at(root, POLICY_FILE), 'utf8')).toBe(before);
+    },
+  );
+
+  it('stops the run when applicable source does not parse', astCase(), async () => {
+    const root = makeTree({
+      ...artifacts({ identifiers: ['RecommendationsRail'] }),
+      'apps/local-service/src/sessions/manager.ts': READABLE_PRODUCT_FILE,
+      // Malformed TypeScript. The parser recovers and returns a partial tree
+      // instead of throwing, so this file used to count as scanned: a demo
+      // identifier inside the region it gave up on would never be reported.
+      'apps/local-service/src/panels/broken.ts': source('export const broken = ;'),
+    });
+
+    const result = await check(root, { stale: false });
+    const [failure] = failuresFor(result.failures, 'apps/local-service/src/panels/broken.ts');
+    expect(failure).toBeDefined();
+    expect(failure.reason).toBe('unparseable');
+    // The message names the parser's own complaint and where it is.
+    expect(failure.detail).toContain('TS1109');
+    expect(failure.detail).toContain('line 1');
+
+    // Not counted as scanned, and the run fails rather than reporting a clean tree.
+    expect(result.sourceFilesScanned).toBe(1);
+    expect(result.findings).toEqual([]);
+    expect(result.ok).toBe(false);
+    expect(result.exitCode).toBe(EXIT_ERROR);
+
+    const cli = await runCli([], root);
+    expect(cli.code).toBe(EXIT_ERROR);
+    expect(cli.stdout).toContain('unparseable');
+  });
+
+  it(
+    'refuses to judge or rewrite the policy from a corpus that does not parse',
+    astCase(),
+    async () => {
+      const root = makeTree({
+        ...artifacts({ identifiers: ['RecommendationsRail'] }, { identifiers: ['Button'] }),
+        [`${DEMO_TREE}/src/components/product/RecommendationsRail.tsx`]: DRIFTED_DEMO,
+        // A corpus file whose unparsed region may declare vocabulary, which
+        // would silently drop out of a regenerated policy.
+        [`${DEMO_TREE}/src/server/services/broken.service.ts`]: source(
+          'export function placeOrder( {',
+        ),
+        'apps/local-service/src/sessions/manager.ts': READABLE_PRODUCT_FILE,
+      });
+
+      const harvest = await buildPolicy(root, { allowlist: null });
+      const [corpusFailure] = failuresFor(
+        harvest.corpusFailures,
+        `${DEMO_TREE}/src/server/services/broken.service.ts`,
+      );
+      expect(corpusFailure).toBeDefined();
+      expect(corpusFailure.reason).toBe('unparseable');
+
+      const result = await check(root);
+      expect(result.stale).toBeNull();
+      expect(byRule(result.findings, 'policy-stale')).toEqual([]);
+      expect(result.notes.join('\n')).toContain('policy staleness not compared');
+      expect(result.exitCode).toBe(EXIT_ERROR);
+
+      const before = readFileSync(at(root, POLICY_FILE), 'utf8');
+      const cli = await runCli(['--update'], root);
+      expect(cli.code).toBe(EXIT_ERROR);
+      expect(cli.stderr).toContain('corpus-unreadable');
+      expect(readFileSync(at(root, POLICY_FILE), 'utf8')).toBe(before);
+    },
+  );
+
+  it('stops a run that found nothing to scan at all', astCase(), async () => {
+    // Artifacts and nothing else: no product tree, so the gate has no subject
+    // and "0 violations" would be a statement about an empty set.
+    const root = makeTree(artifacts({ identifiers: ['RecommendationsRail'] }));
+
+    const result = await check(root, { stale: false });
+    const [failure] = failuresFor(result.failures, '.');
+    expect(failure).toBeDefined();
+    expect(failure.reason).toBe('no-subject');
+    expect(failure.detail).toContain('not evidence');
+    expect(result.filesScanned).toBe(0);
+    expect(result.ok).toBe(false);
+    expect(result.exitCode).toBe(EXIT_ERROR);
+
+    const cli = await runCli([], root);
+    expect(cli.code).toBe(EXIT_ERROR);
+  });
+
+  it('keeps an absent tree an informational note rather than a failure', astCase(), async () => {
+    // Only one of the product trees exists: this is the clone shape the gate
+    // runs on before every surface has landed, and it is not a scan failure.
+    const root = makeTree({
+      ...artifacts({ identifiers: ['RecommendationsRail'] }),
+      'packages/panel-schema/src/spec.ts': source('export const version = 1;'),
+    });
+
+    const result = await check(root, { stale: false });
+    expect(result.failures).toEqual([]);
+    expect(result.findings).toEqual([]);
+    expect(result.ok).toBe(true);
+    expect(result.exitCode).toBe(EXIT_OK);
+    const absent = result.notes.filter((note) => note.includes('not present in this checkout'));
+    expect(absent.length).toBeGreaterThan(0);
+    for (const tree of PRODUCT_TREES.filter((tree) => tree !== 'packages')) {
+      expect(result.notes).toContain(`skipped ${tree}: not present in this checkout`);
+    }
   });
 });

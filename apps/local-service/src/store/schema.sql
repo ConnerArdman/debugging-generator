@@ -101,11 +101,19 @@
 --                 Colocated repository tests assert each CHECK list equals its
 --                 TypeScript tuple, element for element and in the same order,
 --                 so a drift fails the suite.
---   Privacy       no secret is ever stored here as a value. Credentials and
---                 pairing codes are persisted only as hashes minted at runtime,
---                 the per-session keyed-hash key is isolated in its own table
---                 (see session_keys), and telemetry rows are redacted before
---                 they are handed to the store.
+--   Privacy       authentication material is never stored as a value:
+--                 credentials and pairing codes are persisted only as hashes
+--                 minted at runtime, so a stolen database file yields nothing
+--                 a client could present. Exactly one runtime secret is
+--                 stored as a value - the random per-session keyed-hash key -
+--                 and it is isolated in its own table for precisely that
+--                 reason (see session_keys): it must never be serialized into
+--                 the record column of sessions, logged, returned by any
+--                 route or message, or included in a payload sent to a model
+--                 provider. Telemetry rows are redacted before they are
+--                 handed to the store, and the DDL text itself holds no
+--                 secret literal, which is what the repository secret scan
+--                 verifies.
 -- =============================================================================
 
 -- -----------------------------------------------------------------------------
@@ -564,4 +572,3 @@ CREATE TABLE IF NOT EXISTS session_keys (
   request_key TEXT    NOT NULL,
   created_at  INTEGER NOT NULL
 ) STRICT;
-

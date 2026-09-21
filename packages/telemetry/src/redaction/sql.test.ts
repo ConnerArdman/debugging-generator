@@ -61,6 +61,54 @@ import { REDACTION_MARKER, REDACTION_MASK, containsDenied } from './rules.js';
  */
 const PROVIDER_CREDENTIAL = 's' + 'k-ant-' + 'A1'.repeat(14);
 
+/**
+ * Credential half of a bearer authentication header value, of the kind a
+ * connection option or a `SET` statement can carry into statement text. A
+ * repeated pair for the same reason as the provider body above: it matches the
+ * deny list's shape while carrying nothing and measuring almost no entropy.
+ */
+const BEARER_TOKEN = 'B2'.repeat(24);
+
+/**
+ * A bearer header value: the scheme word, which the rule that redacts it keeps
+ * because its presence is diagnostic, followed by the credential.
+ */
+const BEARER_HEADER_VALUE = 'bearer ' + BEARER_TOKEN;
+
+/**
+ * A JOSE compact-serialisation token. `eyJ` — base64url of `{"` — is what the
+ * deny list identifies, so the prefix is split across fragments; each segment
+ * is a repeated pair, decodes to nothing and signs nothing.
+ */
+const JOSE_TOKEN = 'ey' + 'J' + 'C3'.repeat(12) + '.' + 'D4'.repeat(12) + '.' + 'E5'.repeat(12);
+
+/**
+ * The opening delimiter of a PEM private-key block, assembled from fragments so
+ * the committed bytes hold no key-file header for `scripts/check-secrets.mjs`
+ * to find. No key material follows it in any fixture here: the delimiter is
+ * what the deny list identifies, and it is the part a cut at the bound splits.
+ */
+const KEY_FILE_DELIMITER = '-'.repeat(5) + 'BEGIN' + ' RSA ' + 'PRIVATE' + ' KEY' + '-'.repeat(5);
+
+/** The closing delimiter of the same block. */
+const KEY_FILE_FOOTER = '-'.repeat(5) + 'END' + ' RSA ' + 'PRIVATE' + ' KEY' + '-'.repeat(5);
+
+/**
+ * Body of a key-file block: base64-shaped text, cycled from a short alphabet
+ * so the committed bytes are neither a real key nor dense enough for the
+ * secret gate's entropy rule. It stands for the material that must never be
+ * emitted, and the cases below assert its absence directly rather than
+ * trusting a detector that the leaking output also satisfies.
+ */
+const KEY_BODY = 'MIIEowIBAAKCAQEA' + 'q7Zt'.repeat(16);
+
+/**
+ * Scheme of the credentialed connection string below. It is named separately
+ * because the rule that redacts such a URL keeps the scheme — a redacted
+ * connection string stays diagnosable — so a cut at the bound keeps it too.
+ */
+const CONNECTION_SCHEME = 'postgres' + 'ql://';
+
 /** User half of the credentialed connection string below. */
 const CONNECTION_USER = 'svc_user';
 
@@ -74,12 +122,17 @@ const CONNECTION_USER = 'svc_user';
 const CONNECTION_PASSWORD = 'p4ssphrase';
 
 /**
+ * Userinfo of the connection string below: the half the rules replace, and
+ * therefore the half that must survive nowhere, in whole or in part.
+ */
+const CONNECTION_USERINFO = CONNECTION_USER + ':' + CONNECTION_PASSWORD;
+
+/**
  * A credentialed connection string of the kind a `dblink` call or a `COPY …
  * FROM PROGRAM` argument can carry. Assembled from fragments for the reason
  * given in the module documentation; the host is the loopback address.
  */
-const CONNECTION_STRING =
-  'postgres' + 'ql://' + CONNECTION_USER + ':' + CONNECTION_PASSWORD + '@' + '127.0.0.1:5432/db_a';
+const CONNECTION_STRING = CONNECTION_SCHEME + CONNECTION_USERINFO + '@' + '127.0.0.1:5432/db_a';
 
 /*
  * ---------------------------------------------------------------------------
@@ -618,6 +671,64 @@ describe('redactSqlStatement', () => {
       expect(redacted).not.toContain(CONNECTION_PASSWORD);
     });
 
+    it('removes a private-key block whose delimiter SQL reads as a comment', () => {
+      // The interaction this pins: a PEM block opens with five dashes, of
+      // which the scanner reads the first two as a line comment. Scanning
+      // before scrubbing therefore DROPS the delimiter, emits the base64 body
+      // as ordinary structure, and leaves the scrubber nothing to identify it
+      // by - a private key in a statement attribute, stored and forwarded.
+      // `containsDenied` on the result is not the assertion, because it is
+      // false of the leaking output too: the body itself has to be absent.
+      const sql = [
+        'SELECT ',
+        KEY_FILE_DELIMITER,
+        '\n',
+        KEY_BODY,
+        '\n',
+        KEY_FILE_FOOTER,
+        ' FROM t1',
+      ].join('');
+      const redacted = redactSqlStatement(sql);
+
+      expect(redacted).toBe('SELECT ' + REDACTION_MARKER + ' FROM t1');
+      expect(redacted).not.toContain(KEY_BODY);
+      expect(redacted).not.toContain(KEY_BODY.slice(0, 16));
+      expect(normalizeSqlStatement(sql)).not.toContain(KEY_BODY.slice(0, 16));
+      expect(containsDenied(redacted)).toBe(false);
+      expect(redactSqlStatement(redacted)).toBe(redacted);
+    });
+
+    it('removes an unterminated private-key block in structure position', () => {
+      // A statement carrying a key that was cut off, or streamed: everything
+      // after the opening delimiter is key material by construction.
+      const sql = ['SELECT ', KEY_FILE_DELIMITER, '\n', KEY_BODY].join('');
+      const redacted = redactSqlStatement(sql);
+
+      expect(redacted).toBe('SELECT ' + REDACTION_MARKER);
+      expect(redacted).not.toContain(KEY_BODY.slice(0, 16));
+      expect(redactSqlStatement(redacted)).toBe(redacted);
+    });
+
+    it('removes a private-key block sitting inside a comment', () => {
+      // Dropping the comment removes the body as well, but only because the
+      // scrubber has already replaced it: the assertion is the body's absence,
+      // whichever pass removed it.
+      const sql = ['SELECT col_a FROM t1 -- ', KEY_FILE_DELIMITER, ' ', KEY_BODY].join('');
+      const redacted = redactSqlStatement(sql);
+
+      expect(redacted).not.toContain(KEY_BODY.slice(0, 16));
+      expect(redacted.startsWith('SELECT col_a FROM t1')).toBe(true);
+      expect(redactSqlStatement(redacted)).toBe(redacted);
+    });
+
+    it('masks a private-key block held in a string literal', () => {
+      const sql = ["SELECT col_a FROM t1 WHERE k = '", KEY_FILE_DELIMITER, KEY_BODY, "'"].join('');
+      const redacted = redactSqlStatement(sql);
+
+      expect(redacted).toBe('SELECT col_a FROM t1 WHERE k = ' + REDACTION_MASK);
+      expect(redacted).not.toContain(KEY_BODY.slice(0, 16));
+    });
+
     it('scrubs the userinfo of a connection string in structure position', () => {
       // The scheme and the authority stay so the statement remains
       // diagnosable; only the credential goes.
@@ -840,6 +951,151 @@ describe('normalizeSqlStatement', () => {
   });
 });
 
+describe('input of a type the attribute was not supposed to carry', () => {
+  /*
+   * `db.statement` is a span attribute: it reaches the handler out of a parsed
+   * JSON payload that an instrumented process produced, so it is `unknown` at
+   * runtime however the call site types it. Two failure modes follow from
+   * trusting it, and both were real before the boundary coerced its input:
+   *
+   * - `null` and `undefined` threw on the emptiness check, which fails the
+   *   whole batch of events the statement arrived with rather than the one
+   *   attribute that was malformed.
+   * - A number has no `length`, so it fell straight through that check and
+   *   came back as `{ statement: '', literalCount: 0 }` - a query that really
+   *   was executed, silently replaced by nothing.
+   *
+   * Every expected value below was established by running the handler, not by
+   * assuming what it would do: to the scanner a bare number is a numeric
+   * literal in value position, so it masks rather than passing through, and
+   * that mask is exactly the evidence the empty string used to destroy.
+   */
+
+  /** One value a producer can put where a statement belongs, and its result. */
+  interface UntrustedInput {
+    /** Name shown in the test titles. */
+    readonly name: string;
+    /** The value, as it would arrive on the attribute. */
+    readonly value: unknown;
+    /** Exact statement the handler must return for it. */
+    readonly statement: string;
+    /** Literals the scan must report for it. */
+    readonly literalCount: number;
+  }
+
+  /**
+   * Every shape the boundary has to survive: the two empty values, the scalar
+   * types that carry real evidence, and the reference types that cannot be
+   * examined for credential material at all.
+   *
+   * A scalar keeps its text because a status code, a duration or a flag is
+   * evidence a panel is built from; anything else becomes
+   * {@link REDACTION_MARKER}, which records that something was there without
+   * reading a single property of it - a `toString` getter on a value the
+   * instrumented page supplied is page-supplied code, and the privacy boundary
+   * does not run it.
+   */
+  const UNTRUSTED_INPUTS: readonly UntrustedInput[] = [
+    { name: 'null', value: null, statement: REDACTION_MARKER, literalCount: 0 },
+    { name: 'undefined', value: undefined, statement: REDACTION_MARKER, literalCount: 0 },
+    { name: 'an integer', value: 42, statement: REDACTION_MASK, literalCount: 1 },
+    { name: 'zero', value: 0, statement: REDACTION_MASK, literalCount: 1 },
+    { name: 'a negative fraction', value: -3.5, statement: '-' + REDACTION_MASK, literalCount: 1 },
+    { name: 'NaN', value: Number.NaN, statement: 'NaN', literalCount: 0 },
+    { name: 'Infinity', value: Number.POSITIVE_INFINITY, statement: 'Infinity', literalCount: 0 },
+    { name: 'true', value: true, statement: 'true', literalCount: 0 },
+    { name: 'false', value: false, statement: 'false', literalCount: 0 },
+    { name: 'a bigint', value: 9_007_199_254_740_993n, statement: REDACTION_MASK, literalCount: 1 },
+    {
+      name: 'an object',
+      value: { statement: 'SELECT col_a FROM t1' },
+      statement: REDACTION_MARKER,
+      literalCount: 0,
+    },
+    {
+      name: 'an array',
+      value: ['SELECT col_a FROM t1'],
+      statement: REDACTION_MARKER,
+      literalCount: 0,
+    },
+    {
+      name: 'a function',
+      value: () => 'SELECT col_a FROM t1',
+      statement: REDACTION_MARKER,
+      literalCount: 0,
+    },
+    { name: 'a symbol', value: Symbol('col_a'), statement: REDACTION_MARKER, literalCount: 0 },
+    { name: 'a Date', value: new Date(0), statement: REDACTION_MARKER, literalCount: 0 },
+  ];
+
+  for (const input of UNTRUSTED_INPUTS) {
+    it('redacts ' + input.name + ' without throwing', () => {
+      expect(() => redactSqlStatement(input.value)).not.toThrow();
+      expect(() => redactSqlStatementWithFindings(input.value)).not.toThrow();
+      expect(() => normalizeSqlStatement(input.value)).not.toThrow();
+
+      expect(redactSqlStatementWithFindings(input.value)).toEqual({
+        statement: input.statement,
+        literalCount: input.literalCount,
+        truncated: false,
+      });
+      expect(redactSqlStatement(input.value)).toBe(input.statement);
+    });
+  }
+
+  it('masks a number instead of erasing the statement it arrived as', () => {
+    // The regression this suite exists for. The wrapper path used to reach the
+    // emptiness check with a value that has no `length`, take the early return
+    // and report `{ statement: '', literalCount: 0 }`: a captured query
+    // replaced by nothing, with no record that anything had been there.
+    expect(redactSqlStatementWithFindings(42)).toEqual({
+      statement: REDACTION_MASK,
+      literalCount: 1,
+      truncated: false,
+    });
+    expect(redactSqlStatement(42)).not.toBe('');
+  });
+
+  it('erases no evidence: every one of them yields a statement', () => {
+    // The empty string is reserved for the empty statement. Anything else that
+    // arrives has to leave a trace, masked or marked, or a reader of the panel
+    // cannot tell a query that carried nothing from one that was dropped.
+    for (const input of UNTRUSTED_INPUTS) {
+      expect(redactSqlStatement(input.value), input.name).not.toBe('');
+      expect(normalizeSqlStatement(input.value), 'key for ' + input.name).not.toBe('');
+    }
+  });
+
+  it('produces a grouping key rather than failing the aggregate', () => {
+    // `../aggregate/queries.ts` groups by the exact key, so a malformed
+    // statement has to yield one. None of these results holds whitespace, a
+    // placeholder or a value list, so each key is its own redacted statement -
+    // which also means two such events group together instead of fragmenting.
+    for (const input of UNTRUSTED_INPUTS) {
+      expect(normalizeSqlStatement(input.value), 'key for ' + input.name).toBe(input.statement);
+    }
+  });
+
+  it('is a fixed point after one application', () => {
+    // Idempotence has to hold on this path too: an event is redacted at ingest
+    // and again on the outbound path, and neither pass may change the value.
+    for (const input of UNTRUSTED_INPUTS) {
+      const redacted = redactSqlStatement(input.value);
+      const key = normalizeSqlStatement(input.value);
+
+      expect(redactSqlStatement(redacted), input.name).toBe(redacted);
+      expect(normalizeSqlStatement(key), 'key for ' + input.name).toBe(key);
+    }
+  });
+
+  it('emits nothing the deny list recognises', () => {
+    for (const input of UNTRUSTED_INPUTS) {
+      expect(containsDenied(redactSqlStatement(input.value)), input.name).toBe(false);
+      expect(containsDenied(normalizeSqlStatement(input.value)), input.name).toBe(false);
+    }
+  });
+});
+
 describe('bounds', () => {
   /** Structural prefix used to build statements of an exact length. */
   const BOUNDED_HEAD = 'SELECT col_a FROM t1 WHERE col_a = $1 AND ';
@@ -925,6 +1181,177 @@ describe('bounds', () => {
     expect(key.endsWith(REDACTION_MARKER)).toBe(true);
     expect(key).not.toContain(PLANTED_TAIL);
   });
+
+  /*
+   * -------------------------------------------------------------------------
+   * Credentials that straddle the bound
+   *
+   * The cut that applies the bound runs *before* the scan and before the value
+   * scrubber, so a plain slice discards the run that identifies a credential
+   * and keeps the head that reveals it: a statement cut mid-token came back
+   * carrying the provider prefix and the first five characters of its body in
+   * front of the marker, with nothing left in the text for either the scanner
+   * or the scrubber to match — and that text is what the store, the panel and
+   * the model see. One case per secret class below, each placed where the
+   * scanner reads *structure* — inside a string literal the construct is
+   * masked whole, which would prove nothing about the cut.
+   * -------------------------------------------------------------------------
+   */
+
+  /** Where the cut falls: the bound, less the room the marker needs. */
+  const CUT_POSITION = SQL_MAX_LENGTH - REDACTION_MARKER.length;
+
+  /** Structural prefix of every crossing fixture, ahead of its filler. */
+  const CROSSING_HEAD = BOUNDED_HEAD + 'hdr = ';
+
+  /**
+   * The letter each crossing fixture is padded with: an identifier character,
+   * so the filler is structure the scanner emits verbatim.
+   */
+  const CROSSING_FILLER = 'p';
+
+  /**
+   * Length of the windows of a secret that the result is searched for.
+   *
+   * A window rather than the whole secret because the failure being excluded
+   * is a *partial* leak: the whole credential never survives, while its first
+   * dozen characters did. Eight code units is short enough to catch a cut
+   * anywhere inside one of these fixtures and long enough that no window can
+   * collide with the statement's own structure.
+   */
+  const SECRET_WINDOW = 8;
+
+  /** A credential at the bound, with what may and may not survive the cut. */
+  interface CrossingFixture {
+    /** Name shown in the test titles; never any part of the credential. */
+    readonly name: string;
+    /** Credential text, placed where the scanner reads structure. */
+    readonly credential: string;
+    /** Code units of the credential that lie before the cut. */
+    readonly overlap: number;
+    /**
+     * The diagnostic prefix the owning rule keeps, so the truncated statement
+     * reads exactly as a replaced one would: a bearer scheme word, a URL
+     * scheme. Empty for the rules that keep nothing.
+     */
+    readonly kept: string;
+    /** The part that must survive in no window of the output. */
+    readonly secret: string;
+  }
+
+  /**
+   * One fixture per secret class the deny list recognises.
+   *
+   * The overlaps are deliberately uneven, and each was chosen because the
+   * plain slice leaked at exactly that offset — the prefix and five body
+   * characters for the provider credential, the header prefix and six body
+   * characters for the JOSE token, the scheme and seven characters of the user
+   * name for the connection string, and four characters of the token for the
+   * bearer value, which is fewer than the eight the bearer rule needs to
+   * recognise one and therefore left it unredacted. The key-file delimiter
+   * leaked no text of its own, because `-----` opens a line comment in SQL and
+   * the scanner dropped the remainder of the line; its case asserts that the
+   * *cut* removes the delimiter, so the guarantee does not rest on a comment
+   * rule that a dialect option could take away.
+   */
+  const CROSSING_FIXTURES: readonly CrossingFixture[] = [
+    {
+      name: 'a provider credential',
+      credential: PROVIDER_CREDENTIAL,
+      overlap: 12,
+      kept: '',
+      secret: PROVIDER_CREDENTIAL,
+    },
+    {
+      name: 'a bearer header value',
+      credential: BEARER_HEADER_VALUE,
+      overlap: 11,
+      kept: 'bearer ',
+      secret: BEARER_TOKEN,
+    },
+    {
+      name: 'a JOSE token',
+      credential: JOSE_TOKEN,
+      overlap: 16,
+      kept: '',
+      secret: JOSE_TOKEN,
+    },
+    {
+      name: 'a key-file delimiter',
+      credential: KEY_FILE_DELIMITER,
+      overlap: 14,
+      kept: '',
+      secret: KEY_FILE_DELIMITER,
+    },
+    {
+      name: 'a credentialed connection string',
+      credential: CONNECTION_STRING,
+      overlap: 24,
+      kept: CONNECTION_SCHEME,
+      secret: CONNECTION_USERINFO,
+    },
+  ];
+
+  /**
+   * Builds a statement in which `fixture.credential` begins `fixture.overlap`
+   * code units before the cut and runs past it, in identifier position.
+   *
+   * The filler is a run of one letter followed by a space, so everything ahead
+   * of the credential is structure the scanner emits verbatim: whatever the
+   * result holds in front of the marker therefore came from the cut and from
+   * nothing else.
+   */
+  function statementCrossingTheBound(fixture: CrossingFixture): string {
+    const start = CUT_POSITION - fixture.overlap;
+    const filler = CROSSING_FILLER.repeat(start - CROSSING_HEAD.length - 1) + ' ';
+    return CROSSING_HEAD + filler + fixture.credential + ' AND col_b = $2';
+  }
+
+  /** Every window of `size` consecutive code units in `secret`. */
+  function windowsOf(secret: string, size: number): readonly string[] {
+    const windows: string[] = [];
+    for (let index = 0; index + size <= secret.length; index += 1) {
+      windows.push(secret.slice(index, index + size));
+    }
+    return windows;
+  }
+
+  for (const fixture of CROSSING_FIXTURES) {
+    it('leaves no part of ' + fixture.name + ' in front of the marker', () => {
+      const sql = statementCrossingTheBound(fixture);
+      const findings = redactSqlStatementWithFindings(sql);
+      const key = normalizeSqlStatement(sql);
+
+      // The case is only a boundary case if the credential really straddles
+      // the cut: it begins before it and ends after it.
+      expect(sql.indexOf(fixture.credential)).toBe(CUT_POSITION - fixture.overlap);
+      expect(fixture.credential.length).toBeGreaterThan(fixture.overlap);
+
+      expect(findings.truncated).toBe(true);
+      expect(findings.statement.length).toBeLessThanOrEqual(SQL_MAX_LENGTH);
+      expect(findings.statement.startsWith(CROSSING_HEAD)).toBe(true);
+      // The cut moved back to exactly where the credential begins, keeping
+      // only what the owning rule keeps - so the tail is the filler, its
+      // separating space, that kept prefix and the marker, and nothing else
+      // of the credential stands between the structure and the marker.
+      const expectedTail = CROSSING_FILLER + ' ' + fixture.kept + REDACTION_MARKER;
+
+      expect(findings.statement.endsWith(expectedTail)).toBe(true);
+      expect(key.endsWith(expectedTail)).toBe(true);
+
+      for (const window of windowsOf(fixture.secret, SECRET_WINDOW)) {
+        expect(findings.statement, fixture.name).not.toContain(window);
+        expect(key, 'key for ' + fixture.name).not.toContain(window);
+      }
+      expect(containsDenied(findings.statement)).toBe(false);
+      expect(containsDenied(key)).toBe(false);
+
+      // Idempotent like every other result: the marker is inert to the
+      // scanner, and the bounded statement no longer truncates.
+      expect(redactSqlStatement(findings.statement)).toBe(findings.statement);
+      expect(normalizeSqlStatement(key)).toBe(key);
+    });
+  }
 });
 
 describe('properties over every fixture', () => {

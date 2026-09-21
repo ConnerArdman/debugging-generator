@@ -30,8 +30,15 @@
  * exported helpers exist so that spec and its helpers can run the very same rules in-process and
  * can therefore never disagree with the command line.
  *
+ * IT FAILS CLOSED. Anything that leaves the check without a subject is an error (exit 2), never a
+ * quiet pass: git missing, the directory not being a checkout, a `--path` that does not exist or
+ * is not a directory, and a target under which git tracks no file at all. The last one is the
+ * dangerous case, because it looks like success; it is raised where enumeration happens, so the
+ * in-process callers fail closed with the command line.
+ *
  * Usage:  node scripts/check-no-residual-instrumentation.mjs [--path <dir>] [--json] [--help]
- * Exits:  0 clean | 1 marker found or working tree dirty | 2 usage or environment error.
+ * Exits:  0 clean | 1 marker found or working tree dirty | 2 usage or environment error, which
+ *         includes a target with no tracked file under it.
  *
  * The script only reads. It writes nothing to disk, never opens anything inside `.git/` (the
  * repository's `origin` URL embeds a credential) and prints no file content beyond a sanitized
@@ -59,7 +66,7 @@ export const MARKERS = Object.freeze(['__DEBUGGEN__', '__DebuggenSpanHelper']);
 const EXIT_OK = 0;
 /** Exit code: a marker was found, or the working tree is dirty. */
 const EXIT_FINDINGS = 1;
-/** Exit code: the check could not be performed (usage, git, missing target). */
+/** Exit code: the check could not be performed (usage, git, a missing or empty target). */
 const EXIT_ERROR = 2;
 
 /** Bytes inspected when deciding whether a tracked file is binary. */
@@ -340,8 +347,9 @@ function scanBuffer(file, buffer) {
  * @param {string} root Any path inside the repository; the git work-tree root is derived from it.
  * @param {string} [relDir] Repository-relative directory to scan. Defaults to `apps/demo-app`.
  * @returns {MarkerScanResult}
- * @throws {ResidualCheckError} When git is unavailable, `root` is not a checkout, or `relDir` is
- *   missing, outside the repository or not a directory.
+ * @throws {ResidualCheckError} When git is unavailable, `root` is not a checkout, `relDir` is
+ *   missing, outside the repository or not a directory, or - code `target-empty` - git tracks no
+ *   file under it, which leaves the marker assertion with no subject.
  */
 export function scanResidualMarkers(root, relDir) {
   const repoRoot = resolveRepoRoot(root);
@@ -349,6 +357,22 @@ export function scanResidualMarkers(root, relDir) {
   assertTargetExists(repoRoot, target);
 
   const files = listTrackedFiles(repoRoot, target);
+  if (files.length === 0) {
+    // The same principle as assertTargetExists above, one step further in: a directory that exists
+    // but whose contents git does not track leaves the `residual-marker` assertion with nothing to
+    // assert, and a gate that passes because it had nothing to look at is worse than no gate at
+    // all. Raised here rather than in the command line so that the in-process callers
+    // (`tests/e2e/cleanup.spec.ts` and its helpers) fail closed too.
+    throw new ResidualCheckError(
+      'target-empty',
+      `git tracks no file under ${target} in ${repoRoot}, so the marker scan has no subject and ` +
+        'this check cannot be performed. The demo application has not been committed or staged ' +
+        'yet, the checkout is sparse or partial, or --path names a directory that holds only ' +
+        'untracked or ignored files: stage it with `git add`, restore the full checkout with ' +
+        '`git sparse-checkout disable`, or pass a --path that git tracks, such as ' +
+        `${DEFAULT_TARGET_PATH} or tests/fixtures/sample-next-app.`,
+    );
+  }
   /** @type {MarkerFinding[]} */
   const findings = [];
   /** @type {SkippedFile[]} */
@@ -398,11 +422,15 @@ export function scanResidualMarkers(root, relDir) {
 
 /**
  * Every instrumentation marker occurrence in tracked source under `relDir`. An empty array means
- * the `residual-marker` assertion holds.
+ * the `residual-marker` assertion holds - and it can only mean that, because a target with no
+ * tracked file under it raises instead of returning an empty array (see
+ * {@link scanResidualMarkers}).
  *
  * @param {string} root Any path inside the repository; the git work-tree root is derived from it.
  * @param {string} [relDir] Repository-relative directory to scan. Defaults to `apps/demo-app`.
  * @returns {MarkerFinding[]}
+ * @throws {ResidualCheckError} Everything {@link scanResidualMarkers} throws, including
+ *   `target-empty`.
  */
 export function findMarkers(root, relDir) {
   return scanResidualMarkers(root, relDir).findings;
@@ -459,7 +487,8 @@ export function worktreeDirty(root, relDir) {
  * @property {number} exitCode 0 when `ok`, otherwise 1.
  * @property {string} target Repository-relative POSIX path that was checked.
  * @property {string[]} markers The literals searched for.
- * @property {number} filesTracked Tracked files under `target`.
+ * @property {number} filesTracked Tracked files under `target`; never zero, because an empty
+ *   target is a precondition failure rather than a report (see {@link scanResidualMarkers}).
  * @property {number} filesScanned Tracked files actually read and searched.
  * @property {SkippedFile[]} skipped Tracked files deliberately not searched.
  * @property {MarkerFinding[]} findings `residual-marker` violations.
@@ -534,13 +563,6 @@ function renderReport(report) {
     lines.push('', ...worktreeExplanation(report), '');
   }
 
-  if (report.filesTracked === 0) {
-    lines.push(
-      `residual-instrumentation: warning: git tracks no files under ${report.target}, ` +
-        'so the marker scan had nothing to check.',
-    );
-  }
-
   const markerCount = report.findings.length;
   const worktreeCount = report.worktree.entries.length;
   const parts = [
@@ -583,8 +605,9 @@ function helpText() {
     'Exit codes:',
     '  0  clean',
     '  1  a marker was found, or the target has uncommitted changes',
-    '  2  usage or environment error: unknown option, git unavailable, not a git repository, or',
-    `     a missing target path (a complete checkout contains ${DEFAULT_TARGET_PATH})`,
+    '  2  usage or environment error: unknown option, git unavailable, not a git repository, a',
+    '     missing target path, or a target with no tracked file under it (a complete checkout',
+    `     contains ${DEFAULT_TARGET_PATH}, and the check refuses to pass over an empty subject)`,
     '',
     'The check only reads: it writes nothing to disk and never opens anything inside .git/.',
   ].join('\n');

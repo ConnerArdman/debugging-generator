@@ -21,11 +21,15 @@
  *
  * Four properties are load-bearing and must survive any edit:
  *
- *   1. It imports nothing, statically or dynamically. The `@debuggen/code-analysis` workspace
- *      pins only ts-morph, `@jridgewell/trace-mapping` and `@debuggen/shared`, so the `next`
- *      package is never installed anywhere in this repository and a module specifier naming it
- *      would be unresolvable at run time. The `@type` annotation below is a comment: it documents
- *      the expected shape exactly as a real target project does, and resolves to nothing.
+ *   1. It imports nothing, statically or dynamically. This fixture tree is never installed: it is
+ *      not a pnpm workspace member (pnpm-workspace.yaml globs only `apps/*` and `packages/*`) and
+ *      it has no `node_modules` of its own, while the `@debuggen/code-analysis` workspace pins
+ *      only ts-morph, `@jridgewell/trace-mapping` and `@debuggen/shared`. So no directory on this
+ *      module's resolution path provides the `next` package - the repository's single installed
+ *      copy belongs to `apps/demo-app`, which is not on that path - and a module specifier naming
+ *      it would be unresolvable at run time (verified: `import.meta.resolve('next')` from this
+ *      directory answers ERR_MODULE_NOT_FOUND). The `@type` annotation below is a comment: it
+ *      documents the expected shape exactly as a real target project does, and resolves to nothing.
  *   2. It is inert. No top-level `await`, no environment reads, no logging, no named exports and
  *      no asynchronous option, so evaluating the module defines one object and does nothing else.
  *   3. It declares no build output. `distDir`, `output`, `outputFileTracing*`, `experimental`,

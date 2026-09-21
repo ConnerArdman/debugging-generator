@@ -9,16 +9,23 @@
  * fallback, source-open forwarding, the dev-server launcher and end-of-session
  * cleanup.
  *
- * Unlike every `packages/*` sibling, this is an **application**, not a library:
- * nothing imports it, so there are no declarations to emit and no `exports` map
- * to satisfy beyond a single runnable file. What this configuration must put on
- * disk is therefore exactly three paths, and they are contracts written down in
- * four other files:
+ * Unlike every `packages/*` sibling, this workspace is an **application** first:
+ * what runs in production is one file started by `node dist/main.js`, not a
+ * module surface other code imports at will. It still emits the same three
+ * artefact kinds every tsup build in this repository emits — ESM, declarations
+ * and sourcemaps (AAP 0.7.1 Group 1) — because `apps/vscode-extension` declares
+ * `@debuggen/local-service` as a workspace dependency to bundle the service into
+ * its VSIX, and a workspace without declarations forces that consumer to type it
+ * by hand. With the store DDL the asset step below copies, what this
+ * configuration must put on disk is therefore exactly four paths, and they are
+ * contracts written down in four other files:
  *
- *   dist/main.js           dist/main.js.map           dist/store/schema.sql
+ *   dist/main.js      dist/main.js.map      dist/main.d.ts      dist/store/schema.sql
  *
- * - `package.json` names `dist/main.js` as `main`, as its only `exports`
- *   condition and as the target of `"start": "node dist/main.js"`.
+ * - `package.json` names `dist/main.js` as `main`, as the `import`/`default`
+ *   conditions of its only `exports` entry and as the target of
+ *   `"start": "node dist/main.js"`, and names `dist/main.d.ts` as `types` and as
+ *   that entry's `types` condition.
  * - the root `playwright.config.ts` `webServer` entry runs
  *   `node apps/local-service/dist/main.js` from the repository root and waits
  *   for `GET ${serviceUrl}/health` to answer, so both the artefact path and the
@@ -36,16 +43,16 @@
  *
  * ## Why the `@debuggen/*` dependencies stay external
  *
- * The seven workspace packages and the six third-party runtime dependencies are
+ * The seven workspace packages and the five third-party runtime dependencies are
  * left external (tsup's default for `dependencies`, restated in `external`
  * below), so `dist/main.js` resolves them at run time through the pnpm
  * workspace symlinks in `node_modules`. That is deliberate and it is what makes
  * `pnpm -r build` order load-bearing: the eight packages build first — their
  * `dist/` is what each `exports` map points at — and this workspace builds
- * after them. Inlining them here would produce a second copy of `zod`, of the
- * telemetry event schemas and of the ts-morph-backed patch layer, and would
- * defeat the single-definition rule AAP 0.4.2 states for every cross-process
- * type.
+ * after them. Inlining them here would compile a second copy of the telemetry
+ * event schemas, of the ts-morph-backed patch layer and of the Zod schema
+ * objects they are built from into this bundle, and would defeat the
+ * single-definition rule AAP 0.4.2 states for every cross-process type.
  *
  * The VSIX is the one artefact that *does* want everything in one file, and it
  * gets that from its own esbuild step rather than from a second mode here.
@@ -294,20 +301,55 @@ export default defineConfig({
   platform: 'node',
 
   /**
-   * No declarations: nothing imports this workspace. `package.json` exposes
-   * `dist/main.js` as an executable, not as a module surface, and declares no
-   * `types` field, so a `.d.ts` here would be an artefact with no consumer —
-   * while costing a full extra TypeScript program per build. The declarations
-   * `pnpm typecheck` needs are emitted by `tsc -b` into `.tsbuild/`, from the
-   * `composite` + `emitDeclarationOnly` settings in `tsconfig.json`, which is a
-   * separate gate with its own output directory.
+   * Declarations beside the bundle, at `dist/main.d.ts`, which is the path
+   * `package.json` names as `types` and as its `exports` `types` condition.
+   * Every tsup build in this repository emits ESM, declarations and sourcemaps
+   * (AAP 0.7.1 Group 1), and this workspace is no exception to it: it is
+   * imported as `@debuggen/local-service` by `apps/vscode-extension`, which
+   * declares it to bundle the service into the VSIX, so the artefact does have a
+   * consumer and a workspace without declarations would leave that consumer
+   * typing the service's surface by hand. The declarations `pnpm typecheck`
+   * consumes are a separate emit — `tsc -b` writes them into `.tsbuild/` from
+   * the `composite` + `emitDeclarationOnly` settings in `tsconfig.json` — so the
+   * two never write to the same directory.
    *
-   * Switching this on would also drag in the `ignoreDeprecations: '6.0'`
-   * acknowledgement the sibling libraries carry, because tsup 8.5.1 injects
-   * `baseUrl` into its declaration program and TypeScript 6.0.3 rejects that
-   * option outright (TS5101). With `dts: false` no such program exists.
+   * The three overrides below apply to the declaration program alone, which tsup
+   * seeds from this file's `tsconfig`, and each is required rather than
+   * preferred. They are the same three every `packages/*` sibling carries, for
+   * the same reasons:
+   *
+   * - `composite` / `incremental` arrive from `tsconfig.base.json` because the
+   *   root solution file references this project for `tsc -b`. A composite
+   *   program must list every input file, while tsup's program is seeded with
+   *   the one entry and follows its imports, so the files reached that way are
+   *   reported as "not listed within the file list of project" (TS6307). The
+   *   options also bind a program to the build stamp and declaration directory
+   *   of the typecheck gate, which is not where this build writes; disabling
+   *   them here leaves `tsconfig.json` untouched and keeps `dist/` free of a
+   *   stray `.tsbuildinfo`.
+   * - `ignoreDeprecations` answers tsup 8.5.1 setting `baseUrl` on that program
+   *   unconditionally (`baseUrl: compilerOptions.baseUrl || '.'`) — a value this
+   *   repository deliberately never declares, so that the seven workspace
+   *   dependencies resolve through their `exports` maps rather than a path
+   *   alias. TypeScript 6.0.3, the pinned compiler, raises `baseUrl` from a
+   *   deprecation warning to the hard error TS5101 and names
+   *   `"ignoreDeprecations": "6.0"` as the acknowledgement. Nothing in the
+   *   repository can stop tsup from injecting the option, so the
+   *   acknowledgement is the fix; it is scoped to this one program and to
+   *   `baseUrl`, and it falls away when tsup stops injecting it.
+   *
+   * Everything else is inherited — `strict`, `noUncheckedIndexedAccess`,
+   * `verbatimModuleSyntax` and the NodeNext resolution that maps the
+   * `.js`-suffixed relative specifiers in `src/**` back to their sources — so
+   * the declaration emitted here is the one the typecheck gate would emit.
    */
-  dts: false,
+  dts: {
+    compilerOptions: {
+      composite: false,
+      incremental: false,
+      ignoreDeprecations: '6.0',
+    },
+  },
 
   /**
    * Load-bearing, and the single most consequential line in this file for the
@@ -433,12 +475,25 @@ export default defineConfig({
    *   Node applies per subpath; the adapter additionally builds its
    *   Request/Response bridge directly on the `node:http` objects of the server
    *   it creates, so it must be the copy Node loaded, not a rebundled one.
-   * - `dotenv` and `zod` are ordinary libraries, and `zod` in particular must be
-   *   a single instance in this process: the service parses a model's output
-   *   against `@debuggen/panel-schema`'s schemas and then sends the parsed value
-   *   through `@debuggen/protocol`'s message schemas, so a second copy compiled
-   *   in here would give those layers separate registries of Zod internals and a
-   *   valid message could be rejected at the boundary.
+   * - `dotenv` is an ordinary library and stays external for uniformity with the
+   *   four above: the list is every runtime `dependency`, so a reader can check
+   *   it against the manifest without deciding which entries were judged to
+   *   matter.
+   *
+   * `zod` is deliberately NOT an entry, and not a dependency of this workspace
+   * either (AAP 0.3.2 assigns it to the schema packages). Validation the service
+   * performs is reached through the package that owns the schema —
+   * `@debuggen/shared` for source locations, `@debuggen/telemetry` for events,
+   * `@debuggen/instrumentation` for plans, `@debuggen/panel-schema` for panels,
+   * `@debuggen/protocol` for messages and the session record — and each of those
+   * packages declares `zod` 4.6.5 itself. Because every one of them resolves the
+   * same pinned version, pnpm links one physical copy and this process loads a
+   * single Zod instance: the service can parse a model's output against
+   * `@debuggen/panel-schema` and send the result through `@debuggen/protocol`'s
+   * message schemas without the two layers holding separate registries of Zod
+   * internals. Declaring `zod` here would add a direct edge outside the frozen
+   * inventory and invite a second resolved copy; naming it in `external` without
+   * that edge would be a specifier this bundle cannot resolve.
    */
   external: [
     '@debuggen/code-analysis',
@@ -453,7 +508,6 @@ export default defineConfig({
     'hono',
     'pino',
     'ws',
-    'zod',
   ],
 
   /**

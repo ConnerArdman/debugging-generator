@@ -339,6 +339,14 @@ async function insertSeedRows<T>(
  * index rather than drawn at random so that names stay distinct within a
  * category: five modifiers, six nouns and six sizes give 180 combinations for
  * the roughly 34 products each category receives.
+ *
+ * `tile` names the catalog artwork this category's products are shown with. The
+ * committed artwork is a small set of shared category tiles under
+ * `public/products/` rather than one drawing per stock-keeping unit, so each
+ * category points at the tile whose subject matches it — fasteners at the bolt,
+ * hydraulics and piping at the valve, electrical at the cable reel — and a
+ * category whose subject none of them depicts takes `product-placeholder`, the
+ * generic catalog tile the storefront falls back to.
  */
 const CATEGORY_BLUEPRINTS = [
   {
@@ -347,6 +355,7 @@ const CATEGORY_BLUEPRINTS = [
     description:
       'Structural bolts, screws, anchors and hardware for assembly, repair and plant maintenance.',
     duty: 'general structural assembly',
+    tile: 'fastener',
     modifiers: [
       'Zinc-Plated',
       'Stainless Steel',
@@ -376,6 +385,7 @@ const CATEGORY_BLUEPRINTS = [
     name: 'Bearings & Bushings',
     description: 'Rolling and sleeve bearings, mounted units and bushings for rotating equipment.',
     duty: 'continuous-duty rotating equipment',
+    tile: 'product-placeholder',
     modifiers: ['Sealed', 'Open', 'Double-Row', 'Flanged', 'Self-Aligning'],
     nouns: [
       'Deep Groove Ball Bearing',
@@ -392,6 +402,7 @@ const CATEGORY_BLUEPRINTS = [
     name: 'Power Transmission',
     description: 'Belts, chains, sprockets, couplings and gearing for mechanical drive trains.',
     duty: 'high-torque drive trains',
+    tile: 'product-placeholder',
     modifiers: ['Heavy-Duty', 'Corrosion-Resistant', 'Precision-Ground', 'Hardened', 'Balanced'],
     nouns: [
       'V-Belt',
@@ -408,6 +419,7 @@ const CATEGORY_BLUEPRINTS = [
     name: 'Hydraulics & Pneumatics',
     description: 'Cylinders, hose, fittings and air preparation for fluid-power circuits.',
     duty: 'fluid-power circuits',
+    tile: 'valve',
     modifiers: ['Double-Acting', 'Single-Acting', 'Stainless', 'High-Pressure', 'Compact'],
     nouns: [
       'Hydraulic Cylinder',
@@ -424,6 +436,7 @@ const CATEGORY_BLUEPRINTS = [
     name: 'Electrical & Controls',
     description: 'Contactors, drives, sensors and enclosures for machine control panels.',
     duty: 'machine control panels',
+    tile: 'cable-reel',
     modifiers: ['DIN-Rail', 'Panel-Mount', 'IP67-Rated', 'Three-Phase', 'Shielded'],
     nouns: [
       'Motor Contactor',
@@ -440,6 +453,7 @@ const CATEGORY_BLUEPRINTS = [
     name: 'Hand Tools',
     description: 'Wrenches, drivers, pliers and striking tools for maintenance crews.',
     duty: 'field maintenance work',
+    tile: 'hand-tool',
     modifiers: ['Chrome-Vanadium', 'Insulated', 'Non-Sparking', 'Ratcheting', 'Cushion-Grip'],
     nouns: [
       'Combination Wrench',
@@ -456,6 +470,7 @@ const CATEGORY_BLUEPRINTS = [
     name: 'Cutting Tools',
     description: 'Drills, end mills, inserts and saw blades for machining and fabrication.',
     duty: 'machining and fabrication',
+    tile: 'power-tool',
     modifiers: ['Cobalt', 'Carbide', 'TiAlN-Coated', 'High-Speed Steel', 'Diamond-Ground'],
     nouns: [
       'Jobber Drill Bit',
@@ -472,6 +487,7 @@ const CATEGORY_BLUEPRINTS = [
     name: 'Material Handling',
     description: 'Casters, hoists, slings and storage for moving and staging inventory.',
     duty: 'plant material handling',
+    tile: 'product-placeholder',
     modifiers: ['Swivel', 'Rigid', 'Powder-Coated', 'Load-Rated', 'Heavy-Gauge'],
     nouns: [
       'Polyurethane Caster',
@@ -488,6 +504,7 @@ const CATEGORY_BLUEPRINTS = [
     name: 'Safety & PPE',
     description: 'Protective equipment, lockout hardware and spill control for regulated sites.',
     duty: 'regulated work sites',
+    tile: 'safety-gear',
     modifiers: ['ANSI-Rated', 'Cut-Resistant', 'Flame-Resistant', 'High-Visibility', 'Dielectric'],
     nouns: [
       'Safety Glasses',
@@ -504,6 +521,7 @@ const CATEGORY_BLUEPRINTS = [
     name: 'Pipe, Valves & Fittings',
     description: 'Pipe, tubing, valves and fittings for process and utility piping.',
     duty: 'process and utility piping',
+    tile: 'valve',
     modifiers: ['Schedule 40', 'Schedule 80', 'Brass', '316 Stainless', 'Threaded'],
     nouns: [
       'Ball Valve',
@@ -520,6 +538,7 @@ const CATEGORY_BLUEPRINTS = [
     name: 'Abrasives & Finishing',
     description: 'Wheels, discs, belts and compounds for grinding, blending and finishing.',
     duty: 'grinding and surface finishing',
+    tile: 'product-placeholder',
     modifiers: ['Aluminium Oxide', 'Zirconia', 'Ceramic', 'Silicon Carbide', 'Non-Woven'],
     nouns: [
       'Grinding Wheel',
@@ -536,6 +555,7 @@ const CATEGORY_BLUEPRINTS = [
     name: 'Lubricants & Chemicals',
     description: 'Greases, oils, cleaners and sealants for equipment upkeep.',
     duty: 'scheduled equipment upkeep',
+    tile: 'product-placeholder',
     modifiers: ['Food-Grade', 'Synthetic', 'Lithium-Complex', 'Extreme-Pressure', 'Low-VOC'],
     nouns: [
       'Bearing Grease',
@@ -827,7 +847,11 @@ function buildProductRows(
       categoryId: category.id,
       unitPriceCents,
       leadTimeDays,
-      imageUrl: chance(0.92) ? `/images/products/${sku.toLowerCase()}.svg` : null,
+      // The category's shared tile from `public/products/`, addressed by the
+      // public path the storefront renders it from. Most products carry it; the
+      // rest are left without artwork, which is the case the catalog's
+      // no-image path exists for.
+      imageUrl: chance(0.92) ? `/products/${blueprint.tile}.svg` : null,
       active: chance(0.97),
       createdAt: before(listedDaysAgo * DAY_MS + between(0, DAY_MS - 1)),
       updatedAt: before(revisedDaysAgo * DAY_MS + between(0, DAY_MS - 1)),
@@ -1499,8 +1523,42 @@ async function loadLumenSupply(connectionString: string): Promise<void> {
     // what Prisma opened through the adapter, and the pool itself was created
     // here, so nothing else will end it. Skipping either one leaves the process
     // alive and `prisma db seed` waiting for a command that already finished.
-    await prisma.$disconnect();
-    await pool.end();
+    //
+    // That is why each release gets its own `try` instead of running in
+    // sequence: a rejection from the first would otherwise leave the second
+    // unreached, which is precisely the case it guards against. The failures are
+    // collected and reported together afterwards, so neither hides the other and
+    // neither hides the load error the `catch` above has already reported.
+    const releaseFailures: unknown[] = [];
+
+    try {
+      await prisma.$disconnect();
+    } catch (error: unknown) {
+      releaseFailures.push(error);
+    }
+
+    try {
+      await pool.end();
+    } catch (error: unknown) {
+      releaseFailures.push(error);
+    }
+
+    if (releaseFailures.length > 0) {
+      console.error(
+        `${LOG_PREFIX}: releasing the database connection failed. The data written by this run ` +
+          'is unaffected, but a connection may still be held open, so a process that does not ' +
+          'exit on its own is the symptom to expect. Address the cause below and run ' +
+          '`pnpm demo:seed` again.',
+      );
+      for (const failure of releaseFailures) {
+        console.error(failure);
+      }
+      // Raised, never cleared: the `catch` above may already have set it for a
+      // failed load, and a run that could not let go of its connection is not a
+      // successful run either. `process.exit` is deliberately not called — it
+      // would discard whatever output is still buffered.
+      process.exitCode = 1;
+    }
   }
 }
 

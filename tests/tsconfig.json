@@ -1,221 +1,59 @@
 {
-  // ---------------------------------------------------------------------------
-  // Playwright suites - the compiler project for tests/browser and tests/e2e.
-  //
-  // What this project covers: the two repository-root Playwright suites
-  // (AAP 0.8.3) - tests/browser/** (extension connect, telemetry capture, panel
-  // render, source navigation, plus fixtures.ts and panel-spec.fixture.ts) and
-  // tests/e2e/** (the three demo defect flows, cleanup, generalization,
-  // clean-clone, and helpers/**). It deliberately does NOT cover
-  // tests/fixtures/sample-next-app, which is a standalone Next.js application
-  // with its own tsconfig.json (see `exclude` below).
-  //
-  // Three gates read this file, so a mistake here is never local:
-  //   1. `pnpm typecheck` (= `pnpm demo:generate && tsc -b`) builds the root
-  //      solution file, which must list { "path": "./tests" } in its
-  //      `references` for this project to be part of that gate at all.
-  //   2. `pnpm lint` (`eslint . --max-warnings 0`). The committed
-  //      eslint.config.js is still the conservative, non-type-aware baseline;
-  //      when it switches to `recommendedTypeChecked` with
-  //      `parserOptions.projectService`, this is the project the service finds
-  //      for tests/browser/** and tests/e2e/** - see the TS6305 note under
-  //      `references`.
-  //   3. `pnpm test:browser` / `pnpm test:e2e`. Playwright has no `tsconfig`
-  //      entry in playwright.config.ts, so its loader discovers THIS file by
-  //      walking up from each spec, and resolves the `paths` below at runtime.
-  //      Verified with Playwright 1.63.0: both `--list` and a real run resolve a
-  //      value import of a mapped package.
-  //
-  // tests/ is intentionally NOT a pnpm workspace member (pnpm-workspace.yaml
-  // globs only apps/* and packages/*), there is no tests/package.json and there
-  // must not be one, and the root manifest declares no `@debuggen/*`
-  // dependency - which is exactly why `paths` exists here. Third-party packages
-  // (@playwright/test, @types/node) resolve upwards into the root node_modules.
-  //
-  // Everything not stated below is inherited from tsconfig.base.json and must
-  // stay that way: `strict`, `noUncheckedIndexedAccess`, `verbatimModuleSyntax`,
-  // `isolatedModules`, the no-unused/no-implicit diagnostics, `target` ES2023,
-  // `skipLibCheck` and the declaration-emit settings. No strictness flag is
-  // relaxed (a spec that trips `noUncheckedIndexedAccess` narrows first - the
-  // spec is what gets fixed, never this file), no `noEmit` is added (TypeScript
-  // 6.0.3 answers a referenced project that disables emit with TS6310), and no
-  // compiler is declared: TypeScript 6.0.3 is pinned once, in the root manifest.
-  //
-  // JSONC, like every other tsconfig in this repository: tsc, ESLint, Vitest
-  // and Prettier all parse comments in tsconfig files. Anything reading it
-  // programmatically must use a JSONC-aware reader (`ts.readConfigFile`), never
-  // bare `JSON.parse`.
-  // ---------------------------------------------------------------------------
   "$schema": "https://json.schemastore.org/tsconfig",
+
+  "// purpose": "Playwright suites - the compiler project for tests/browser and tests/e2e. What this project covers: the two repository-root Playwright suites (AAP 0.8.3) - tests/browser/** (extension connect, telemetry capture, panel render, source navigation, plus fixtures.ts and panel-spec.fixture.ts) and tests/e2e/** (the three demo defect flows, cleanup, generalization, clean-clone, and helpers/**). It deliberately does NOT cover tests/fixtures/sample-next-app, which is a standalone Next.js application with its own tsconfig.json (see `exclude` below).",
+
+  "// gates": "Three gates read this file, so a mistake here is never local. 1. `pnpm typecheck` (= `pnpm demo:generate && tsc -b`) builds the root solution file, which must list { \"path\": \"./tests\" } in its `references` for this project to be part of that gate at all. 2. `pnpm lint` (`eslint . --max-warnings 0`). The committed eslint.config.js applies `tseslint.configs.recommendedTypeChecked` with `parserOptions.projectService` and `tsconfigRootDir: import.meta.dirname`, so type-aware linting IS in force and THIS is the project its service finds for tests/browser/** and tests/e2e/** - see the TS6305 note under `references`. (playwright.config.ts, matched by the `**/*.config.ts` entry of that config's tooling list, is linted without a program; this project is what type-checks it.) 3. `pnpm test:browser` / `pnpm test:e2e`. Playwright has no `tsconfig` entry in playwright.config.ts, so its loader discovers THIS file by walking up from each spec, and resolves the `paths` below at runtime. Verified with Playwright 1.63.0: both `--list` and a real run resolve a value import of a mapped package.",
+
+  "// workspace-membership": "tests/ is intentionally NOT a pnpm workspace member (pnpm-workspace.yaml globs only apps/* and packages/*), there is no tests/package.json and there must not be one, and the root manifest declares no `@debuggen/*` dependency - which is exactly why `paths` exists here. Third-party packages (@playwright/test, @types/node) resolve upwards into the root node_modules.",
+
+  "// inheritance": "Everything not stated below is inherited from tsconfig.base.json and must stay that way: `strict`, `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`, `verbatimModuleSyntax`, `isolatedModules`, the no-unused/no-implicit diagnostics, `target` ES2023, `skipLibCheck` and the declaration-emit settings. No strictness flag is relaxed (a spec that trips `noUncheckedIndexedAccess` narrows first - the spec is what gets fixed, never this file), no `noEmit` is added (TypeScript 6.0.3 answers a referenced project that disables emit with TS6310), and no compiler is declared: TypeScript 6.0.3 is pinned once, in the root manifest.",
+
+  "// format": "Strict JSON, like the root tsconfig.json, tsconfig.base.json and every other tsconfig in this repository: tsc, ESLint, Vitest and Prettier would all accept JSONC comments in a tsconfig file, but keeping this one comment-free means both a JSONC-aware reader (`ts.readConfigFile`) and a bare `JSON.parse` can read it, so no consumer has to know which one to reach for. The rationale for each decision is therefore recorded in the `\"// …\"` string keys of this object rather than in comments. TypeScript ignores unknown TOP-LEVEL keys, which is what makes the convention safe; a `\"// …\"` key inside `compilerOptions` is a hard error instead (TS5023, \"Unknown compiler option\"), so every note about a single option lives up here under a `\"// compilerOptions.<option>\"` key and never beside the option itself - including the per-alias notes that belong to `paths`.",
+
+  "// compilerOptions.composite": "Already true in the base; restated because the root solution file references this project and a non-composite reference fails `tsc -b` outright (TS6306). Keeping it local means a future edit to the base cannot silently break the gate here.",
+
+  "// compilerOptions.rootDir": "The repository root, NOT this directory. Under `composite` the default is the directory holding the config, and that default rejects the one cross-directory import the suites legitimately need: a helper that types its fixtures from playwright.config.ts's exported `DebuggenTestOptions` fails with BOTH \"TS6059: File '<repo>/playwright.config.ts' is not under 'rootDir' '<repo>/tests'\" and TS6307 (measured under TypeScript 6.0.3). Re-declaring that interface inside tests/** instead would duplicate a type definition, which the AAP forbids. Widening `rootDir` only moves the emit anchor - declarations land at .tsbuild/tests/** and .tsbuild/playwright.config.d.ts - while `include` below stays the closed input set and TS6307 still rejects any repo file it does not list.",
+
+  "// compilerOptions.paths": "The only way tests/** can reach the product types, and the reason this file is more than three lines: there is no node_modules/@debuggen/* reachable from here. Each alias points at the package's SOURCE barrel, so the project reference below redirects it to that project's built declaration (packages/<name>/.tsbuild/index.d.ts) and `tsc -b` needs no prior tsup `dist`. Listed bottom-up, matching the acyclic package graph and the `references` order. The secondary \"@debuggen/shared/node\" entry is there for the SHA-256 hashing and safe-fs helpers the e2e cleanup assertions snapshot instrumented files with (AAP 0.8.3). This is the deliberate opposite of every workspace under packages/** and apps/local-service, which declare NO aliases because their imports must prove each published `exports` map resolves and because esbuild bundles those sources through node_modules for the VSIX. Nothing in tests/** is ever bundled or published, so aliasing to source hides nothing here. `baseUrl` is NOT set, and must not be: TypeScript 6.0.3 answers it with \"error TS5101: Option 'baseUrl' is deprecated and will stop functioning in TypeScript 7.0\", which fails `tsc -b` outright. `paths` alone is enough - TypeScript resolves the values against the directory of the config that declares them, and Playwright 1.63.0 resolves them the same way (verified at runtime, including its remap of a NodeNext \"./x.js\" specifier inside a mapped package back to x.ts). Exactly the six entries the suites need. @debuggen/panel-renderer, @debuggen/code-analysis and @debuggen/model-provider are absent on purpose: panel-render.spec.ts asserts against the DOM the extension panel renders, not against imported React components. @debuggen/telemetry's \"./node/register\" export is absent too - it is an esbuild-built preload artefact (dist/node/register.mjs) with no types condition, attached to the dev server by the launcher rather than imported by a spec.",
+
+  "// compilerOptions.lib": "Widened from the base's ES2023-only set (the base omits DOM so a Node-only package cannot reference `window` and still compile). It is load-bearing here rather than cosmetic: the callbacks handed to `page.evaluate()` / `page.$eval()` are type-checked in the ambient lib context of the SPEC file, so without DOM every `document`, `window`, `performance` and `HTMLElement` inside one is a compile error; DOM.Iterable covers iterating the NodeList a selector returns; and the specs' service observer uses the global `WebSocket` and `fetch` rather than a `ws` dependency, which is not resolvable from this directory. `lib` REPLACES the inherited array rather than merging with it, so ES2023 is restated - omitting it would silently drop `Array.prototype.findLast`, `toSorted` and the rest of that surface. Same pair as packages/telemetry/tsconfig.json; the base's `skipLibCheck` is what keeps the DOM/@types/node global overlap from being a redeclaration error.",
+
+  "// compilerOptions.types": "The base leaves `types` unset so each workspace declares its own ambient packages. These suites run in Node: node:fs, node:path, node:os, node:crypto and node:child_process in the e2e helpers (file snapshots, temp directories, borrowing the fixture app's dev server), plus `process.env` and `import.meta.dirname`. @playwright/test needs no entry - every spec imports `test`/`expect` explicitly - and Chrome, VS Code and Vitest globals stay out of this program on purpose.",
+
+  "// compilerOptions.module": "NOT overridden: \"module\" / \"moduleResolution\". The base's \"ESNext\" + \"bundler\" is what these suites want, and it is Playwright's own resolution flavour: relative imports inside tests/** are written WITHOUT an extension (`import { test } from './fixtures'`), like apps/chrome-extension. Do NOT copy the NodeNext convention of apps/local-service and packages/{shared,telemetry,panel-schema,protocol}, where every relative specifier must carry an explicit \".js\": mixing the two flavours is the most confusing failure available in this repository.",
+
+  "// compilerOptions.outDir": "NOT overridden: \"outDir\" / \"declarationDir\" / \"tsBuildInfoFile\". The base anchors all three with `${configDir}`, which resolves to THIS directory, so the declaration output and the incremental stamp land in tests/.tsbuild - ignored by .gitignore, .prettierignore and the ignore list in eslint.config.js. Nothing is ever emitted into a dist/ or into the tracked tests/ tree itself.",
+
+  "// compilerOptions.not-set": "NOT set: \"jsx\". The base's inherited \"react-jsx\" is inert because the `include` globs below admit only .ts files and no suite file is .tsx. NOT set: \"noEmit\", and nothing the base declares is relaxed.",
+
+  "// include": "The two suite directories, .ts only, plus the one repository-root module the suites are architecturally paired with. browser/**/*.ts and e2e/**/*.ts cover the specs, tests/browser/fixtures.ts, tests/browser/panel-spec.fixture.ts and tests/e2e/helpers/**. Both directories must be in the program or type-aware ESLint reports \"file is not included in any project\" for every file in them. ../playwright.config.ts is what makes `rootDir` above usable: a helper may import its exported `DebuggenTestOptions` (the config declares and exports that interface for exactly this purpose) instead of restating it, and a composite project must list every source file its program reaches (TS6307). It is an `include` glob rather than a `files` entry on purpose: a `files` entry that does not resolve is a hard error, while an `include` glob that matches nothing is ignored. It also gives that config the only typecheck coverage it has - no other project compiles it. vitest.config.ts is deliberately NOT listed: nothing under tests/** imports it, and Vitest excludes tests/** from collection (Playwright owns this directory). Until the first spec lands, ../playwright.config.ts is the only file these globs match (measured with TypeScript 6.0.3: `parseJsonConfigFileContent` resolves exactly that one input and reports no diagnostic), so the program is small but never empty; a project whose globs matched nothing at all would answer TS18003 (\"No inputs were found in config file\") instead, which is expected on an empty subtree rather than a configuration fault.",
+
+  "// exclude": "Replaces the base's inherited list, so each entry is spelled relative to this directory. \"fixtures/**\" is the load-bearing entry. tests/fixtures/sample-next-app is a second, standalone Next.js App Router application - the generalization target the suites index, instrument and restore - carrying its own package.json and tsconfig.json, its own React types and a generated, git-ignored next-env.d.ts. Admitting it here would drag that program into the root solution build under these options and break it, so it is excluded from this project exactly as it is excluded from Vitest collection (`tests/fixtures/**` in vitest.config.ts) and from the lint surface; its own tsconfig.json is correspondingly absent from `references` below, so `tsc -b` never builds it. The `include` globs above already leave it outside the program; this entry states the boundary so widening one cannot silently swallow the fixture app, and it covers its .next/ and node_modules/ too. \".tsbuild\" is equally deliberate: TypeScript excludes `outDir` automatically only when `exclude` is absent, so without it the declarations emitted by `tsc -b` would become inputs of the next run.",
+
+  "// references": "Exactly the five packages `paths` maps, listed bottom-up so the order matches the layering `tsc -b` walks: shared -> telemetry -> panel-schema -> instrumentation -> protocol. Every mapped package has a reference and every reference exists because something is mapped; keeping the two lists in agreement is what lets an alias resolve to a built declaration instead of dragging package sources into this program. packages/code-analysis is not listed: it is instrumentation's own reference, so `tsc -b` builds it transitively, and no suite imports it directly. What the references do: they order the BUILD, so `tsc -b tests` (or the root solution) compiles those projects first and this project then resolves each alias through the referenced project's .tsbuild declaration. Consequence worth knowing: non-build mode (`tsc -p tests`, and the ESLint project service, which is type-aware today) requires those declarations to exist already and otherwise reports TS6305 (\"Output file has not been built from source file\"). That is why `pnpm verify` runs `pnpm build` ahead of `pnpm typecheck`; `disableSourceOfProjectReferenceRedirect` is NOT the answer - it would put package sources in this program and trip TS6307.",
+
   "extends": "../tsconfig.base.json",
+
   "compilerOptions": {
-    // Already true in the base; restated because the root solution file
-    // references this project and a non-composite reference fails `tsc -b`
-    // outright (TS6306). Keeping it local means a future edit to the base cannot
-    // silently break the gate here.
     "composite": true,
-
-    // The repository root, NOT this directory. Under `composite` the default is
-    // the directory holding the config, and that default rejects the one
-    // cross-directory import the suites legitimately need: a helper that types
-    // its fixtures from playwright.config.ts's exported `DebuggenTestOptions`
-    // fails with BOTH "TS6059: File '<repo>/playwright.config.ts' is not under
-    // 'rootDir' '<repo>/tests'" and TS6307 (measured under TypeScript 6.0.3).
-    // Re-declaring that interface inside tests/** instead would duplicate a type
-    // definition, which the AAP forbids. Widening `rootDir` only moves the emit
-    // anchor - declarations land at .tsbuild/tests/** and
-    // .tsbuild/playwright.config.d.ts - while `include` below stays the closed
-    // input set and TS6307 still rejects any repo file it does not list.
     "rootDir": "..",
-
-    // The only way tests/** can reach the product types, and the reason this
-    // file is more than three lines: there is no node_modules/@debuggen/*
-    // reachable from here. Each alias points at the package's SOURCE barrel, so
-    // the project reference below redirects it to that project's built
-    // declaration (packages/<name>/.tsbuild/index.d.ts) and `tsc -b` needs no
-    // prior tsup `dist`. Listed bottom-up, matching the acyclic package graph
-    // and the `references` order.
-    //
-    // This is the deliberate opposite of every workspace under packages/** and
-    // apps/local-service, which declare NO aliases because their imports must
-    // prove each published `exports` map resolves and because esbuild bundles
-    // those sources through node_modules for the VSIX. Nothing in tests/** is
-    // ever bundled or published, so aliasing to source hides nothing here.
-    //
-    // `baseUrl` is NOT set, and must not be: TypeScript 6.0.3 answers it with
-    // "error TS5101: Option 'baseUrl' is deprecated and will stop functioning in
-    // TypeScript 7.0", which fails `tsc -b` outright. `paths` alone is enough -
-    // TypeScript resolves the values below against the directory of the config
-    // that declares them, and Playwright 1.63.0 resolves them the same way
-    // (verified at runtime, including its remap of a NodeNext "./x.js" specifier
-    // inside a mapped package back to x.ts).
-    //
-    // Exactly the six entries the suites need. @debuggen/panel-renderer,
-    // @debuggen/code-analysis and @debuggen/model-provider are absent on
-    // purpose: panel-render.spec.ts asserts against the DOM the extension panel
-    // renders, not against imported React components. @debuggen/telemetry's
-    // "./node/register" export is absent too - it is an esbuild-built preload
-    // artifact (dist/node/register.mjs) with no types condition, attached to the
-    // dev server by the launcher rather than imported by a spec.
     "paths": {
       "@debuggen/shared": ["../packages/shared/src/index.ts"],
-      // Secondary "./node" entry: the SHA-256 hashing and safe-fs helpers the
-      // e2e cleanup assertions snapshot instrumented files with (AAP 0.8.3).
       "@debuggen/shared/node": ["../packages/shared/src/node/index.ts"],
       "@debuggen/telemetry": ["../packages/telemetry/src/index.ts"],
       "@debuggen/panel-schema": ["../packages/panel-schema/src/index.ts"],
       "@debuggen/instrumentation": ["../packages/instrumentation/src/index.ts"],
       "@debuggen/protocol": ["../packages/protocol/src/index.ts"]
     },
-
-    // Widened from the base's ES2023-only set (the base omits DOM so a
-    // Node-only package cannot reference `window` and still compile). It is
-    // load-bearing here rather than cosmetic: the callbacks handed to
-    // `page.evaluate()` / `page.$eval()` are type-checked in the ambient lib
-    // context of the SPEC file, so without DOM every `document`, `window`,
-    // `performance` and `HTMLElement` inside one is a compile error;
-    // DOM.Iterable covers iterating the NodeList a selector returns; and the
-    // specs' service observer uses the global `WebSocket` and `fetch` rather
-    // than a `ws` dependency, which is not resolvable from this directory.
-    //
-    // `lib` REPLACES the inherited array rather than merging with it, so ES2023
-    // is restated - omitting it would silently drop `Array.prototype.findLast`,
-    // `toSorted` and the rest of that surface. Same pair as
-    // packages/telemetry/tsconfig.json; the base's `skipLibCheck` is what keeps
-    // the DOM/@types/node global overlap from being a redeclaration error.
     "lib": ["ES2023", "DOM", "DOM.Iterable"],
-
-    // The base leaves `types` unset so each workspace declares its own ambient
-    // packages. These suites run in Node: node:fs, node:path, node:os,
-    // node:crypto and node:child_process in the e2e helpers (file snapshots,
-    // temp directories, borrowing the fixture app's dev server), plus
-    // `process.env` and `import.meta.dirname`. @playwright/test needs no entry -
-    // every spec imports `test`/`expect` explicitly - and Chrome, VS Code and
-    // Vitest globals stay out of this program on purpose.
     "types": ["node"]
-
-    // NOT overridden: "module" / "moduleResolution". The base's "ESNext" +
-    // "bundler" is what these suites want, and it is Playwright's own
-    // resolution flavour: relative imports inside tests/** are written WITHOUT
-    // an extension (`import { test } from './fixtures'`), like
-    // apps/chrome-extension. Do NOT copy the NodeNext convention of
-    // apps/local-service and packages/{shared,telemetry,panel-schema,protocol},
-    // where every relative specifier must carry an explicit ".js": mixing the
-    // two flavours is the most confusing failure available in this repository.
-    // NOT overridden: "outDir" / "declarationDir" / "tsBuildInfoFile". The base
-    // anchors all three with `${configDir}`, which resolves to THIS directory,
-    // so the declaration output and the incremental stamp land in
-    // tests/.tsbuild - ignored by .gitignore, .prettierignore and the ignore
-    // list in eslint.config.js. Nothing is ever emitted into a dist/ or into the
-    // tracked tests/ tree itself.
-    // NOT set: "jsx". The base's inherited "react-jsx" is inert because the
-    // globs below admit only .ts files and no suite file is .tsx.
-    // NOT set: "noEmit", and nothing the base declares is relaxed.
   },
 
-  // The two suite directories, .ts only, plus the one repository-root module the
-  // suites are architecturally paired with.
-  //
-  // - browser/**/*.ts and e2e/**/*.ts cover the specs, tests/browser/fixtures.ts,
-  //   tests/browser/panel-spec.fixture.ts and tests/e2e/helpers/**. Both
-  //   directories must be in the program or type-aware ESLint reports "file is
-  //   not included in any project" for every file in them.
-  // - ../playwright.config.ts is what makes `rootDir` above usable: a helper may
-  //   import its exported `DebuggenTestOptions` (the config declares and exports
-  //   that interface for exactly this purpose) instead of restating it, and a
-  //   composite project must list every source file its program reaches
-  //   (TS6307). It is an `include` glob rather than a `files` entry on purpose:
-  //   a `files` entry that does not resolve is a hard error, while an `include`
-  //   glob that matches nothing is ignored. It also gives that config the only
-  //   typecheck coverage it has - no other project compiles it. vitest.config.ts
-  //   is deliberately NOT listed: nothing under tests/** imports it, and Vitest
-  //   excludes tests/** from collection (Playwright owns this directory).
-  //
-  // Until the first spec lands, `tsc -b` on this project answers TS18003 ("No
-  // inputs were found in config file") - expected on an empty subtree, not a
-  // configuration fault.
   "include": ["browser/**/*.ts", "e2e/**/*.ts", "../playwright.config.ts"],
 
-  // Replaces the base's inherited list, so each entry is spelled relative to
-  // this directory.
-  //
-  // "fixtures/**" is the load-bearing entry. tests/fixtures/sample-next-app is a
-  // second, standalone Next.js App Router application - the generalization
-  // target the suites index, instrument and restore - carrying its own
-  // package.json and tsconfig.json, its own React types and a generated,
-  // git-ignored next-env.d.ts. Admitting it here would drag that program into
-  // the root solution build under these options and break it, so it is excluded
-  // from this project exactly as it is excluded from Vitest collection
-  // (`tests/fixtures/**` in vitest.config.ts) and from the lint surface; its own
-  // tsconfig.json is correspondingly absent from `references` below, so `tsc -b`
-  // never builds it. The `include` globs above already leave it outside the
-  // program; this entry states the boundary so widening one cannot silently
-  // swallow the fixture app, and it covers its .next/ and node_modules/ too.
-  //
-  // ".tsbuild" is equally deliberate: TypeScript excludes `outDir` automatically
-  // only when `exclude` is absent, so without it the declarations emitted by
-  // `tsc -b` would become inputs of the next run.
   "exclude": ["fixtures/**", "node_modules", ".tsbuild"],
 
-  // Exactly the five packages `paths` maps, listed bottom-up so the order
-  // matches the layering `tsc -b` walks: shared -> telemetry -> panel-schema ->
-  // instrumentation -> protocol. Every mapped package has a reference and every
-  // reference exists because something is mapped; keeping the two lists in
-  // agreement is what lets an alias resolve to a built declaration instead of
-  // dragging package sources into this program.
-  //
-  // packages/code-analysis is not listed: it is instrumentation's own reference,
-  // so `tsc -b` builds it transitively, and no suite imports it directly.
-  //
-  // What the references do: they order the BUILD, so `tsc -b tests` (or the root
-  // solution) compiles those projects first and this project then resolves each
-  // alias through the referenced project's .tsbuild declaration. Consequence
-  // worth knowing: non-build mode (`tsc -p tests`, and the ESLint project
-  // service once type-aware linting is switched on) requires those declarations
-  // to exist already and otherwise reports TS6305 ("Output file has not been
-  // built from source file"). That is why `pnpm verify` runs `pnpm build` ahead
-  // of `pnpm typecheck`; `disableSourceOfProjectReferenceRedirect` is NOT the
-  // answer - it would put package sources in this program and trip TS6307.
   "references": [
     { "path": "../packages/shared" },
     { "path": "../packages/telemetry" },

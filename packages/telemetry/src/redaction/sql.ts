@@ -70,7 +70,14 @@
  * no logging and no mutable module state.
  */
 
-import { MAX_SCAN_LENGTH, REDACTION_MARKER, REDACTION_MASK, scrub } from './rules.js';
+import {
+  MAX_SCAN_LENGTH,
+  REDACTION_MARKER,
+  REDACTION_MASK,
+  asScannableText,
+  cutAtCredentialBoundary,
+  scrub,
+} from './rules.js';
 
 /**
  * Upper bound, in UTF-16 code units, on how much of a statement is scanned —
@@ -218,20 +225,6 @@ function isIdentifierPart(char: string): boolean {
 /** Whether `char` can appear in a dollar-quote tag. */
 function isDollarTagPart(char: string): boolean {
   return isIdentifierPart(char);
-}
-
-/**
- * Cuts `value` down to at most `limit` code units without splitting a
- * surrogate pair, so a lone surrogate is never emitted.
- *
- * The only caller applies the statement bound, which holds
- * `0 < limit < value.length`, so this always cuts and never has to consider a
- * shorter input.
- */
-function cutWithoutSplittingPair(value: string, limit: number): string {
-  const lastUnit = value.charCodeAt(limit - 1);
-  const splitsPair = lastUnit >= 0xd800 && lastUnit <= 0xdbff;
-  return value.slice(0, splitsPair ? limit - 1 : limit);
 }
 
 /**
@@ -689,20 +682,36 @@ function scanStatement(text: string, mode: ScanMode): ScanOutcome {
  * - **Bounded.** The result is never longer than {@link SQL_MAX_LENGTH}. A
  *   longer statement is scanned up to the bound and its remainder replaced by
  *   {@link REDACTION_MARKER}, so unscanned text is never returned.
- * - **Belt and braces.** The scanned text is passed through the value
- *   scrubber, so a credential sitting in a position the scanner treats as
- *   structure — an identifier, an operator argument — is still removed.
+ * - **No credential head in front of the marker.** The cut that applies the
+ *   bound goes through `cutAtCredentialBoundary`, which moves it back to the
+ *   start of any credential crossing it, so a token straddling the bound is
+ *   removed whole rather than leaving its prefix in the emitted text. What
+ *   the rule keeps of a credential it replaces — a `bearer` scheme word, a
+ *   URL scheme — is kept here too, so a truncated statement reads like a
+ *   redacted one.
+ * - **Belt and braces, on both sides of the scan.** The statement is passed
+ *   through the value scrubber before the scanner and again after it. After,
+ *   because a credential can sit in a position the scanner treats as
+ *   structure — an identifier, an operator argument. Before, because the
+ *   scanner removes structure of its own: a PEM private-key block opens with
+ *   five dashes, the first two of which are a line comment to SQL, so
+ *   scanning first would drop the delimiter that identifies the key and leave
+ *   its body behind as ordinary text with nothing left to match it.
  * - **Idempotent.** `redactSqlStatement(redactSqlStatement(s))` equals
  *   `redactSqlStatement(s)`: a mask is a placeholder on the second pass, a
  *   dropped comment leaves nothing to drop, and the bounded result is short
  *   enough that the second call never truncates.
- * - **Total.** Any string is accepted, including an empty one, and nothing
- *   throws.
+ * - **Total.** Any value of any type is accepted — an empty string, a scalar
+ *   that is not a string, `null`, `undefined`, an object — and nothing throws.
+ *   Non-string input is normalised by `asScannableText` and then redacted like
+ *   any other statement, so evidence is masked rather than erased.
  *
- * @param sql - Statement text as captured from the database tier.
+ * @param sql - Statement text as captured from the database tier. Declared
+ * `unknown` because a span attribute is untyped at runtime; see
+ * {@link redactSqlStatementWithFindings} for how a non-string value is handled.
  * @returns The statement with every inline literal replaced.
  */
-export function redactSqlStatement(sql: string): string {
+export function redactSqlStatement(sql: unknown): string {
   return redactSqlStatementWithFindings(sql).statement;
 }
 
@@ -713,19 +722,63 @@ export function redactSqlStatement(sql: string): string {
  * with the two counts a findings report needs alongside it. No part of any
  * replaced value is included — see {@link SqlRedactionFindings}.
  *
- * @param sql - Statement text as captured from the database tier.
+ * This is the module's single point of entry, so it is where the defensive
+ * boundary sits. `db.statement` is a span attribute: it reaches this function
+ * from a parsed JSON payload produced by an instrumented process, so it is
+ * `unknown` at runtime however it is typed at the call site. Two failure modes
+ * follow from trusting it, and `asScannableText` is what removes both:
+ *
+ * - **Throwing.** Reading `.length` off `null` or `undefined` raises inside
+ *   the ingest path, which would fail the whole batch of events the statement
+ *   arrived with rather than the one attribute that was malformed.
+ * - **Erasing evidence.** A value that is not a string but has no `length` —
+ *   a number, a boolean — used to fall through the emptiness check and return
+ *   an empty statement, so a captured query was silently replaced by nothing.
+ *   Normalising first means such a value is scanned like any other text: a
+ *   bare number is a numeric literal and comes back as one
+ *   {@link REDACTION_MASK}, and a value that cannot be examined at all comes
+ *   back as {@link REDACTION_MARKER}, which records that something was there.
+ *
+ * The guarantees of {@link redactSqlStatement} hold for every such input,
+ * including the bound and its credential-aware cut, because the normalised
+ * text takes exactly the same path as text that arrived as a string.
+ *
+ * @param sql - Statement text as captured from the database tier, or any other
+ * value an untrusted producer supplied in its place.
  */
-export function redactSqlStatementWithFindings(sql: string): SqlRedactionFindings {
-  if (sql.length === 0) {
+export function redactSqlStatementWithFindings(sql: unknown): SqlRedactionFindings {
+  // Coerced before anything reads a property of it: a non-string value is
+  // rendered if it is a safe scalar and reported as removed if it is not, and
+  // no getter on a caller-supplied object is ever invoked.
+  const text = asScannableText(sql);
+  if (text.length === 0) {
     return { statement: '', literalCount: 0, truncated: false };
   }
-  const truncated = sql.length > SQL_MAX_LENGTH;
+  const truncated = text.length > SQL_MAX_LENGTH;
   // The cut leaves room for the marker, so the emitted text plus the marker
-  // fits the bound and a second pass takes the unbounded path unchanged.
+  // fits the bound and a second pass takes the unbounded path unchanged. It
+  // goes through the shared credential-aware primitive rather than a plain
+  // slice because the scan runs *after* the cut: a credential straddling the
+  // bound would otherwise have its run discarded and its head — a provider
+  // credential's prefix, the first characters of the token that follows a
+  // `bearer` scheme word — emitted as structure in front of the marker, with
+  // nothing left in the text for the scrubber to match.
   const head = truncated
-    ? cutWithoutSplittingPair(sql, SQL_MAX_LENGTH - REDACTION_MARKER.length)
-    : sql;
-  const scanned = scanStatement(head, 'redact');
+    ? cutAtCredentialBoundary(text, SQL_MAX_LENGTH - REDACTION_MARKER.length)
+    : text;
+  // The content rules run BEFORE the scanner as well as after it, because the
+  // scanner does not only mask data — it also *removes structure*, and one of
+  // the things it removes is the delimiter that identifies a credential. A PEM
+  // private-key block opens with five dashes, of which the scanner reads the
+  // first two as a line comment: the header line is dropped, the base64 body
+  // that follows is emitted as ordinary structure, and by the time `scrub`
+  // sees the text there is no `-----BEGIN … PRIVATE KEY-----` left for the
+  // private-key rule to recognise it by. Scrubbing the raw statement first
+  // means no credential can lose its own delimiter that way; scrubbing the
+  // scanned text afterwards still catches one the scanner turned into
+  // structure. Neither pass is redundant, and the order of the two is the
+  // guarantee.
+  const scanned = scanStatement(scrub(head), 'redact');
   // The marker is appended before scrubbing because the scrubber matches
   // nothing in it, and because appending afterwards could push the result
   // past the bound.
@@ -774,11 +827,17 @@ export function redactSqlStatementWithFindings(sql: string): SqlRedactionFinding
  * collapsed and a folded list is already folded — and bounded by
  * {@link SQL_MAX_LENGTH}.
  *
- * @param sql - Statement text as captured from the database tier.
+ * It is total for the same reason and by the same means: the first thing it
+ * does is delegate to {@link redactSqlStatement}, so a value of any type is
+ * normalised into text there and a malformed `db.statement` yields a key
+ * rather than an exception in the aggregate that is grouping by it.
+ *
+ * @param sql - Statement text as captured from the database tier, or any other
+ * value an untrusted producer supplied in its place.
  * @returns The grouping key: redacted, placeholder-unified, whitespace-
  * collapsed statement text.
  */
-export function normalizeSqlStatement(sql: string): string {
+export function normalizeSqlStatement(sql: unknown): string {
   const redacted = redactSqlStatement(sql);
   if (redacted.length === 0) {
     return redacted;

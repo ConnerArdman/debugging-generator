@@ -36,9 +36,10 @@
  * `scripts/check-secrets.mjs` scans every tracked file and fails the build on a
  * credentialed connection string or a provider-key prefix appearing in source.
  * The fixtures that must *look* like credentials to `scrub` are therefore joined
- * from fragments at run time ({@link USERINFO_URL}, {@link PROVIDER_SHAPED}),
- * which keeps this file free of a contiguous secret-shaped literal while the
- * values the functions see are exactly the ones the patterns match. The
+ * from fragments at run time ({@link USERINFO_URL}, {@link PROVIDER_SHAPED},
+ * {@link JOSE_SHAPED}, {@link CREDENTIALED_DSN}), which keeps this file free of
+ * a contiguous secret-shaped literal while the values the functions see are
+ * exactly the ones the patterns match. The
  * credential bodies are runs of one character on purpose: they satisfy the
  * pattern's length requirement with zero entropy, so the scanner's entropy rule
  * has nothing to report either.
@@ -77,6 +78,44 @@ const PROVIDER_PREFIX = 's' + 'k-ant-';
  * characters longer than the rule's identifying minimum.
  */
 const PROVIDER_SHAPED = PROVIDER_PREFIX + 'A'.repeat(24);
+
+/**
+ * JOSE header prefix, split so this tracked file never contains it contiguously
+ * (see the module documentation).
+ */
+const JOSE_PREFIX = 'ey' + 'J';
+
+/**
+ * A value `scrub`'s `jwt` rule matches: the header prefix and two further
+ * base64url segments, each a zero-entropy run of one character.
+ */
+const JOSE_SHAPED = [JOSE_PREFIX + 'B'.repeat(20), 'C'.repeat(20), 'D'.repeat(20)].join('.');
+
+/**
+ * The scheme of {@link CREDENTIALED_DSN}. Redaction keeps it — it names the
+ * tier that was called and is not secret — and so does a cut that lands inside
+ * the credential, which is why it is named rather than inlined.
+ */
+const DSN_SCHEME = ['postgresql', '://'].join('');
+
+/** The user part of {@link DSN_SECRET}, asserted absent on its own. */
+const DSN_USER = 'demo';
+
+/**
+ * The userinfo of {@link CREDENTIALED_DSN}: the part no output may carry, in
+ * whole or in part.
+ */
+const DSN_SECRET = [DSN_USER, ':', 'P'.repeat(24)].join('');
+
+/**
+ * A credentialed connection string whose userinfo is long enough to straddle a
+ * bound, assembled from fragments.
+ *
+ * The `connection-string` rule needs the terminating `@` to match at all, so
+ * this is the fixture that shows what a cut before the `@` costs: the rule sees
+ * nothing, and the user and the head of the password are left in plain text.
+ */
+const CREDENTIALED_DSN = [DSN_SCHEME, DSN_SECRET, '@', 'db.example.test/app'].join('');
 
 /** A credentialed absolute URL, assembled from fragments. */
 const USERINFO_URL = ['postgresql', '://', 'demo', ':', 'pw', '@', 'db.example.test:5432/app'].join(
@@ -221,6 +260,62 @@ function expectOnlyMaskedValues(redacted: string): void {
       expect(value).toBe(REDACTION_MASK);
     }
   }
+}
+
+/**
+ * Width of the sliding window the crossing-bound cases compare against.
+ *
+ * A `toContain` on the whole credential proves nothing about a cut, because
+ * what a plain slice leaves behind is the credential's *head* and the whole
+ * value never matches that. Eight code units is short enough to catch a cut
+ * anywhere inside a credential and long enough that it cannot collide with the
+ * single-character padding those fixtures are built from.
+ */
+const CREDENTIAL_WINDOW = 8;
+
+/**
+ * Asserts that no {@link CREDENTIAL_WINDOW}-wide window of `credential` appears
+ * in `redacted` — the assertion a cut through the middle of a credential fails
+ * and a cut moved back to its start passes.
+ */
+function expectNoCredentialWindow(redacted: string, credential: string): void {
+  for (let start = 0; start + CREDENTIAL_WINDOW <= credential.length; start += 1) {
+    expect(redacted).not.toContain(credential.slice(start, start + CREDENTIAL_WINDOW));
+  }
+}
+
+/**
+ * Asserts that `value` really does place `credential` across `bound`.
+ *
+ * Without it, a change to a fixture, to `MAX_SCAN_LENGTH` or to the path budget
+ * could move the credential wholly to one side of the cut, and the case would
+ * keep passing while asserting nothing at all.
+ */
+function expectStraddles(value: string, credential: string, bound: number): void {
+  const start = value.indexOf(credential);
+  expect(start).toBeGreaterThanOrEqual(0);
+  expect(start).toBeLessThan(bound);
+  expect(start + credential.length).toBeGreaterThan(bound);
+}
+
+/**
+ * Asserts everything a truncating cut owes its caller: the result is within the
+ * module's output bound, it says that it was cut, it carries no part of the
+ * credential that straddled the cut nor the prefix that would reveal it, every
+ * query value is still masked, and it is a fixed point.
+ *
+ * @param redacted - Output of {@link redactUrl} for a crossing-bound fixture.
+ * @param credential - The secret text the cut ran through.
+ * @param prefix - The shorter fragment that identifies the credential's class
+ * and is therefore the leak a window comparison alone can miss.
+ */
+function expectCutClear(redacted: string, credential: string, prefix: string): void {
+  expect(redacted.length).toBeLessThanOrEqual(MAX_SCAN_LENGTH);
+  expect(redacted.endsWith(REDACTION_MARKER)).toBe(true);
+  expect(redacted).not.toContain(prefix);
+  expectNoCredentialWindow(redacted, credential);
+  expectOnlyMaskedValues(redacted);
+  expect(redactUrl(redacted)).toBe(redacted);
 }
 
 /*
@@ -729,6 +824,263 @@ describe('redactUrl bounds the work it does and the text it returns', () => {
     // A lone delimiter is structure with nothing in it, and comes back as sent.
     expect(redactUrl('?')).toBe('?');
     expect(redactUrl('#')).toBe('#');
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Credentials that straddle a bound
+ *
+ * `./url.ts` cuts in two places: once before parsing, at MAX_SCAN_LENGTH, and
+ * once per component, at the path budget. Both cuts land in text no pattern has
+ * run over yet, and every rule identifies a credential by a prefix followed by
+ * a run — so a plain slice through the run keeps the prefix and the first
+ * characters of the secret while discarding exactly the part that would have
+ * matched. `scrub` then has nothing left to recognise, and a query key or a path
+ * segment is stored precisely as it is scrubbed.
+ *
+ * The head that escapes is deliberately short in every case below: while it is
+ * still long enough to satisfy the rule's identifying minimum, `scrub` matches
+ * it and redacts it anyway, so the leak only exists in the last few characters
+ * before the bound. That is why each fixture positions the credential to begin
+ * a handful of code units before the cut rather than halfway across it, and why
+ * {@link expectStraddles} pins that placement.
+ * ---------------------------------------------------------------------------
+ */
+
+describe('redactUrl cuts clear of a credential that straddles a bound', () => {
+  /** Padding no rule matches and whose windows no credential fixture shares. */
+  const padding = 'x';
+
+  /** Where the pre-parse cut falls. */
+  const scanCut = MAX_SCAN_LENGTH;
+
+  /**
+   * Where the path budget's cut falls: the budget less the marker the cut
+   * appends, which is the position a credential has to straddle to be split.
+   */
+  const pathCut = PATH_BUDGET - REDACTION_MARKER.length;
+
+  /**
+   * A URL whose final query segment is `credential`, positioned so that segment
+   * begins `headroom` code units before {@link scanCut}.
+   *
+   * A query *key* is the sharpest case in the module: values are masked whatever
+   * they contain, so only a key — or a bare flag, which is what this builds —
+   * carries text through `scrub` into the stored URL.
+   */
+  function queryKeyStraddling(credential: string, headroom: number): string {
+    const prefix = '/p?a=';
+    const pad = scanCut - headroom - prefix.length - 1;
+    return `${prefix}${padding.repeat(pad)}&${credential}`;
+  }
+
+  /**
+   * A URL whose final path segment is `credential`, positioned so that segment
+   * begins `headroom` code units before `cut`, with `suffix` appended after it.
+   */
+  function pathSegmentStraddling(
+    credential: string,
+    headroom: number,
+    cut: number,
+    suffix: string,
+  ): string {
+    const prefix = '/reset/';
+    const pad = cut - headroom - prefix.length - 1;
+    return `${prefix}${padding.repeat(pad)}/${credential}${suffix}`;
+  }
+
+  it('moves the cut to the start of a provider key crossing the scan bound in a query key', () => {
+    // Eleven token characters is fewer than the rule's identifying minimum of
+    // sixteen, so a plain slice leaves a head `scrub` cannot match and the
+    // prefix is stored as a query key.
+    const value = queryKeyStraddling(PROVIDER_SHAPED, PROVIDER_PREFIX.length + 11);
+    expectStraddles(value, PROVIDER_SHAPED, scanCut);
+
+    const redacted = redactUrl(value);
+    expect(redacted).toBe(`/p?a=${REDACTION_MASK}&${REDACTION_MARKER}`);
+    expectCutClear(redacted, PROVIDER_SHAPED, PROVIDER_PREFIX);
+  });
+
+  it('moves the cut to the start of a JOSE token crossing the scan bound in a query key', () => {
+    // The `jwt` rule needs a payload segment, so a cut a few characters into
+    // the header leaves `eyJ` plus a short run: shaped like a token, matched by
+    // nothing.
+    const value = queryKeyStraddling(JOSE_SHAPED, JOSE_PREFIX.length + 5);
+    expectStraddles(value, JOSE_SHAPED, scanCut);
+
+    const redacted = redactUrl(value);
+    expect(redacted).toBe(`/p?a=${REDACTION_MASK}&${REDACTION_MARKER}`);
+    expectCutClear(redacted, JOSE_SHAPED, JOSE_PREFIX);
+  });
+
+  it('keeps only the scheme of a connection string crossing the scan bound in a query key', () => {
+    // The `connection-string` rule is anchored on the terminating `@`, which
+    // here sits past the bound, so a plain slice stores the user and the head
+    // of the password verbatim. The cut keeps `scheme://` — the same
+    // diagnostic prefix the replacement keeps — and nothing after it.
+    const value = queryKeyStraddling(CREDENTIALED_DSN, DSN_SCHEME.length + 10);
+    expectStraddles(value, CREDENTIALED_DSN, scanCut);
+
+    const redacted = redactUrl(value);
+    expect(redacted).toBe(`/p?a=${REDACTION_MASK}&${DSN_SCHEME}&${REDACTION_MARKER}`);
+    expect(redacted).toContain(DSN_SCHEME);
+    expectCutClear(redacted, DSN_SECRET, DSN_USER);
+  });
+
+  it('carries no provider key head when one crosses the scan bound in a path segment', () => {
+    // In a path the two bounds compound: a path long enough to reach the scan
+    // bound necessarily exceeds the path budget, so the budget's cut removes
+    // the region the scan bound cut. The case is here because the guarantee
+    // rests on that composition, and neither bound may be changed without it
+    // still holding.
+    const value = pathSegmentStraddling(PROVIDER_SHAPED, PROVIDER_PREFIX.length + 11, scanCut, '');
+    expectStraddles(value, PROVIDER_SHAPED, scanCut);
+
+    const redacted = redactUrl(value);
+    expect(redacted.startsWith(`/reset/${padding.repeat(3)}`)).toBe(true);
+    expect(redacted).toContain(`?${REDACTION_MARKER}`);
+    expectCutClear(redacted, PROVIDER_SHAPED, PROVIDER_PREFIX);
+  });
+
+  it('carries no JOSE token head when one crosses the scan bound in a path segment', () => {
+    // The same composition as the case above, for the other class of
+    // credential a reset or download link realistically carries in its path.
+    const value = pathSegmentStraddling(JOSE_SHAPED, JOSE_PREFIX.length + 5, scanCut, '');
+    expectStraddles(value, JOSE_SHAPED, scanCut);
+
+    const redacted = redactUrl(value);
+    expect(redacted.startsWith(`/reset/${padding.repeat(3)}`)).toBe(true);
+    expect(redacted).toContain(`?${REDACTION_MARKER}`);
+    expectCutClear(redacted, JOSE_SHAPED, JOSE_PREFIX);
+  });
+
+  it('cuts clear of a provider key crossing the path budget', () => {
+    // The second cut site. `boundedScrub` scrubs before it cuts, so here the
+    // credential is already replaced by the time the budget applies — the
+    // budget's own cut lands inside a `[redacted]`, not inside a secret. This
+    // case pins that outcome so the *composite* stays honest: reverse those two
+    // statements and it is the boundary-aware cut, not the scrub, that keeps it
+    // green, which is the whole reason both cut sites use the same primitive.
+    const value = pathSegmentStraddling(
+      PROVIDER_SHAPED,
+      PROVIDER_PREFIX.length + 11,
+      pathCut,
+      `/done/${padding.repeat(200)}`,
+    );
+    expectStraddles(value, PROVIDER_SHAPED, pathCut);
+
+    const redacted = redactUrl(value);
+    expect(redacted.length).toBeLessThanOrEqual(PATH_BUDGET);
+    expect(redacted.startsWith(`/reset/${padding.repeat(3)}`)).toBe(true);
+    expectCutClear(redacted, PROVIDER_SHAPED, PROVIDER_PREFIX);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Untrusted input
+ * ---------------------------------------------------------------------------
+ */
+
+/** One untrusted-input case: what arrives, and what both entry points return. */
+interface UntrustedFixture {
+  readonly label: string;
+  readonly value: unknown;
+  /**
+   * The text both entry points produce. Established by running them, not
+   * restated from the coercion policy — a fixture that merely repeats the
+   * policy cannot notice the policy changing.
+   */
+  readonly expected: string;
+}
+
+/**
+ * Every type a captured URL or query string actually arrives as.
+ *
+ * The call sites in `redactor.ts` are typed, but the values reaching them come
+ * out of `JSON.parse` on a posted event body and out of OpenTelemetry span
+ * attributes declared `unknown`, neither of which checks anything. A privacy
+ * boundary that threw there would lose the whole batch it was redacting, and one
+ * that stringified anything at all could run page-supplied code through a
+ * `toString` getter — which is why the last fixture's `toString` throws.
+ *
+ * A scalar keeps its text: it is evidence a panel is built from, it is no
+ * credential shape this layer knows, and erasing it would hide the producer bug
+ * that sent a number where a URL belongs. Anything else becomes the marker, so
+ * the event still records that something was there.
+ */
+const UNTRUSTED_FIXTURES: readonly UntrustedFixture[] = [
+  { label: 'null', value: null, expected: REDACTION_MARKER },
+  { label: 'undefined', value: undefined, expected: REDACTION_MARKER },
+  { label: 'a number', value: 42, expected: '42' },
+  { label: 'zero, falsy but still evidence', value: 0, expected: '0' },
+  { label: 'a negative non-integer number', value: -1.5, expected: '-1.5' },
+  {
+    label: 'NaN, which is information rather than a credential',
+    value: Number.NaN,
+    expected: 'NaN',
+  },
+  { label: 'a boolean', value: true, expected: 'true' },
+  { label: 'a bigint', value: 42n, expected: '42' },
+  { label: 'an object', value: { url: '/api/p?a=1' }, expected: REDACTION_MARKER },
+  { label: 'an array', value: ['/api/p?a=1'], expected: REDACTION_MARKER },
+  { label: 'a function', value: () => '/api/p?a=1', expected: REDACTION_MARKER },
+  { label: 'a symbol', value: Symbol('a symbol description'), expected: REDACTION_MARKER },
+  { label: 'a Date', value: new Date(0), expected: REDACTION_MARKER },
+  {
+    label: 'an object whose toString throws, which must never be called',
+    value: {
+      toString(): string {
+        throw new Error('page-supplied code must never run inside redaction');
+      },
+    },
+    expected: REDACTION_MARKER,
+  },
+];
+
+describe('the redaction entry points accept untrusted input of any type', () => {
+  for (const { label, value, expected } of UNTRUSTED_FIXTURES) {
+    it(`redactUrl: ${label}`, () => {
+      expect(() => redactUrl(value)).not.toThrow();
+      const redacted = redactUrl(value);
+      expect(redacted).toBe(expected);
+      // Redaction runs at ingest and again on the outbound path, so the second
+      // pass sees the first pass's output — a string by then, whatever arrived.
+      expect(redactUrl(redacted)).toBe(redacted);
+      expectOnlyMaskedValues(redacted);
+    });
+
+    it(`redactQueryString: ${label}`, () => {
+      expect(() => redactQueryString(value)).not.toThrow();
+      const masked = redactQueryString(value);
+      expect(masked).toBe(expected);
+      expect(redactQueryString(masked)).toBe(masked);
+    });
+  }
+
+  it('reports a value it could not examine rather than erasing it', () => {
+    // An attribute that silently became `""` would read as "no URL was
+    // captured", which is a different fact from "a URL was captured and could
+    // not be examined" — and the second is the one a developer needs.
+    expect(redactUrl(null)).toBe(REDACTION_MARKER);
+    expect(redactUrl(null)).not.toBe('');
+    expect(redactQueryString(undefined)).toBe(REDACTION_MARKER);
+    expect(redactQueryString(undefined)).not.toBe('');
+  });
+
+  it('still returns the empty string for the empty string, which is not an error', () => {
+    // The empty-string early return sits after coercion, so it keeps its
+    // meaning: nothing was sent, and nothing is reported.
+    expect(redactUrl('')).toBe('');
+    expect(redactQueryString('')).toBe('');
+  });
+
+  it('masks a query value even when the query arrived as a non-string', () => {
+    // Coercion happens before masking, not instead of it: a coerced scalar is
+    // still parsed and masked like any other query.
+    expect(redactQueryString('a=1')).toBe(`a=${REDACTION_MASK}`);
+    expect(redactQueryString(123)).toBe('123');
   });
 });
 

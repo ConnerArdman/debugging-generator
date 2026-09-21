@@ -71,7 +71,16 @@ export interface DebuggenTestOptions {
   fixtureAppUrl: string;
 }
 
-/** Product defaults (AAP 0.3.4). Every one of them is overridable by environment. */
+/**
+ * Product defaults (AAP 0.3.4). Every one of them is overridable by environment.
+ *
+ * This file reads its overrides from the PROCESS environment only - it loads no `.env`,
+ * because a Playwright config runs before any product code that would - so `DEMO_URL` and
+ * `FIXTURE_APP_URL` take effect when exported in the shell or set by CI, not when written
+ * into `.env`. `/.env.example` documents both keys, with these defaults, under that exact
+ * caveat; `scripts/dev-instrumented.test.mjs` asserts the two files agree, so changing a
+ * default here without updating that documentation fails the test suite.
+ */
 const DEFAULT_SERVICE_HOST = '127.0.0.1';
 const DEFAULT_SERVICE_PORT = '43117';
 const DEFAULT_DEMO_URL = 'http://localhost:3000';

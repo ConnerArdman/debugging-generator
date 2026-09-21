@@ -22,9 +22,10 @@ allowBuilds:
   "@prisma/engines": true
   # postinstall installs the signing binary `@vscode/vsce` needs to package the VSIX.
   "@vscode/vsce-sign": true
-  # postinstall (`node install.js`) puts the platform esbuild binary in place: 0.28.2 is
-  # the root devDependency used by the extension and agent bundlers, 0.27.7 arrives
-  # transitively through tsup.
+  # postinstall (`node install.js`) puts the platform esbuild binary in place. 0.28.2 is
+  # the root devDependency used by the extension and agent bundlers, and the `overrides`
+  # block below holds tsup's transitive copy at that same version, so exactly one
+  # esbuild version is resolved and one binary is installed.
   esbuild: true
   # preinstall runs the Prisma CLI's platform check before any `prisma` command.
   prisma: true
@@ -33,3 +34,76 @@ allowBuilds:
 # @playwright/test and @vscode/vsce declare no install script at their pinned
 # versions, and Playwright's browsers are fetched by an explicit
 # `playwright install` step rather than at install time.
+
+# Transitive resolutions this workspace forces, and the advisory ledger for the
+# installed dependency graph: one entry per advisory that `pnpm audit` reported
+# against a version some upstream range resolved to, each naming the advisory it
+# closes and the path the vulnerable copy arrived by. None of them can be fixed in
+# a manifest, because none of the five is a dependency any workspace declares at
+# the vulnerable version - they are pulled in by prisma, by @vscode/test-cli's
+# mocha and by tsup - so the frozen dependency inventory (AAP 0.3.2) is unchanged
+# by this block: `diff` and `esbuild` are forced to exactly the versions
+# packages/instrumentation and the root manifest already pin, which collapses each
+# of those to a single resolved version, and the other three are transitive-only.
+#
+# Exact versions, as every manifest pin is exact: a range would let the installed
+# graph drift between two installs of one commit. The policy these entries
+# implement is that the graph carries no known-vulnerable version - an advisory is
+# closed by an entry here, by an upgrade of the package that owns the range, or by
+# an explicit review recorded alongside it, never by being left to a warning. So
+# adding or upgrading a dependency means re-running `pnpm audit` and reconciling
+# this block with what it reports; an entry whose upstream range has moved past the
+# patched version stops being load-bearing and should be deleted, and the same
+# command proves that either way.
+#
+# THE GATE THAT ENFORCES THIS, and the one thing still to wire up: the policy above
+# holds for the committed lockfile, which audits clean, but nothing in the
+# repository re-checks it on the next lockfile change yet. The check is
+#
+#   pnpm audit --audit-level=low
+#
+# and it belongs as a failing step of the `verify` job in .github/workflows/ci.yml,
+# after `pnpm install --frozen-lockfile`, when that workflow is authored (AAP 0.7.1
+# Group 0). It is deliberately NOT a root script and not part of the `verify`
+# script: AAP 0.7.1 Group 0 fixes the root script list and AAP 0.8.5 defines
+# `verify` exactly once, and `verify` must stay runnable offline, which an audit
+# call is not. A reviewed advisory - one accepted rather than eliminated - is
+# recorded here beside the overrides as a comment carrying its GHSA id, the reason
+# it is accepted and the date, so the exception is reviewable in the pull request
+# that adds it; there is none today.
+overrides:
+  # GHSA-ggr8-5vv4-36mx (high): stack exhaustion when merging recursive object
+  # graphs, patched in 8.0.0. Arrives as prisma -> @prisma/config -> deepmerge-ts,
+  # which every `prisma generate` loads, so it is in the path of `pnpm build` and
+  # `pnpm typecheck` through `demo:generate`. 8.0.2 keeps the `deepmerge` named
+  # export @prisma/config destructures and the same dual CJS/ESM entry points.
+  deepmerge-ts: "8.0.2"
+  # GHSA-73rr-hh4g-fpgx (low): denial of service in `parsePatch`/`applyPatch`,
+  # patched in 8.0.3. Arrives as @vscode/test-cli -> mocha -> diff@7, the diff the
+  # Mocha reporter renders for a failed assertion. 9.0.0 is the version
+  # packages/instrumentation pins for its unified modification diffs (AAP 0.3.2),
+  # so this leaves one copy in the graph, and it still exports the `createPatch`
+  # and `diffWordsWithSpace` entry points that reporter calls.
+  diff: "9.0.0"
+  # GHSA-g7r4-m6w7-qqqr (low): arbitrary file read from the development server on
+  # Windows, affecting 0.27.3 - 0.28.0 and patched in 0.28.1. Arrives twice through
+  # tsup (directly and through bundle-require). 0.28.2 is the root devDependency
+  # (AAP 0.3.2) that apps/vscode-extension/esbuild.mjs and the two telemetry
+  # bundlers already run, so tsup builds against the same esbuild the rest of the
+  # repository does.
+  esbuild: "0.28.2"
+  # GHSA-3f6p-5ww8-9rcr (high): authentication-plugin downgrade to
+  # mysql_clear_password leaking plaintext credentials, patched in 3.22.0; and
+  # GHSA-rgwj-5xj2-c3m3 (moderate): unbounded zlib inflate in the compressed
+  # protocol handler, patched in 3.23.1. Arrives as prisma -> mysql2, the CLI's
+  # MySQL connector, which this project never uses - the demo speaks to PostgreSQL
+  # through @prisma/adapter-pg - but the copy is installed all the same.
+  mysql2: "3.24.4"
+  # GHSA-5c6j-r48x-rmvq (high): remote code execution via `RegExp.flags` and
+  # `Date.prototype.toISOString`, patched in 7.0.3; and GHSA-qj8w-gfj5-8c6v
+  # (moderate): CPU-exhaustion denial of service from crafted array-like objects,
+  # patched in 7.0.5. Arrives as @vscode/test-cli -> mocha -> serialize-javascript,
+  # which Mocha uses to hand run options to its worker pool under `--parallel`.
+  # 7.1.1 keeps the single-function `serialize(value, options)` API that call site
+  # uses and requires Node >= 20, satisfied by the pinned Node 24.21.0.
+  serialize-javascript: "7.1.1"

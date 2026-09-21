@@ -4,31 +4,40 @@
 // AAP 0.9.1 lists `vitest.config.ts` among this workspace's in-scope paths. It
 // exists for runs whose root is THIS directory - editor/IDE test integration and
 // a bare `vitest` invoked from inside the workspace - while the repository-root
-// vitest.config.ts stays the authoritative project registry for CI.
+// vitest.config.ts stays the authoritative project registry for every gate.
 //
-// OWNERSHIP - settled by reading the root config, not assumed
-// ----------------------------------------------------------
-// The root config declares its projects INLINE: its `test.projects` array is
-// built entirely from its own `nodeProject`/`domProject` helpers, two of whose
-// entries are
+// ONE DEFINITION, TWO CONTAINERS - settled by reading the root config
+// -------------------------------------------------------------------
+// The root config declares its projects inline and EXPORTS the two belonging to
+// this workspace as a factory, `localServiceProjects({ baseDir, exclude })`,
+// which returns
 //
-//   local-service              apps/local-service/src/**/*.test.ts
-//   local-service-integration  apps/local-service/test/integration/**/*.test.ts
+//   local-service              <baseDir>/src/**/*.test.ts
+//   local-service-integration  <baseDir>/test/integration/**/*.test.ts
 //
-// both `environment: 'node'` with `globals: false`. That array contains no path,
-// glob or directory entry, and Vitest only discovers config files for entries
-// that are paths or globs - so a root-rooted run never loads this file, each
-// project name is registered exactly once, and `pnpm test` can neither fail with
-// a duplicate project name nor double a test count.
+// both `environment: 'node'` with `globals: false`, both carrying the root's
+// hermetic environment (`DEBUGGEN_PROVIDER=deterministic` and an emptied
+// `ANTHROPIC_API_KEY`, AAP 0.5.3/0.8.3), and the integration project carrying
+// its execution policy: `pool: 'forks'`, `fileParallelism: false`,
+// `isolate: true`, 30 s `testTimeout`/`hookTimeout` and `retry: 0`.
 //
-// This is therefore the mirror case: the file below re-declares the SAME two
-// projects - same names, same `node` environment, same `globals: false`, the same
-// include globs written relative to this workspace - so that a workspace-rooted
-// run behaves like the corresponding slice of a root run. Two rules follow and
-// are not negotiable: this path must never be added to the root `projects` array
-// (that is what would double-register the names), and neither name may be
-// renamed or joined by a third, because the names are the contract behind the
-// blocking gates - `pnpm test:integration` is literally
+// This file imports that factory with `baseDir: ''`, because a run rooted here
+// resolves the globs against THIS directory. So the two containers register the
+// same two projects from the same source: a workspace-rooted run behaves like
+// the corresponding slice of a root run by construction, rather than by two
+// declarations being kept in agreement by hand - which is what previously left
+// the integration suites running under the 5 s/10 s defaults and in parallel on
+// the root path, where every gate actually runs them.
+//
+// The import direction is forced and must not be flipped: eslint.config.js
+// forbids a cross-workspace relative import (anything matching `../…/apps/` or
+// `../…/packages/`) everywhere in the repository, so the root may not import
+// this file, while `../../vitest.config` from here is allowed. Two further
+// rules follow and are not negotiable: this path must never be added to the
+// root `projects` array (that double-registers the names and Vitest fails the
+// run with "Project name … is not unique"), and neither name may be renamed or
+// joined by a third, because the names are the contract behind the blocking
+// gates - `pnpm test:integration` is literally
 // `vitest run --project local-service-integration` (AAP 0.8.5) and this
 // workspace's own scripts pass `--project <name>` to the root config.
 //
@@ -49,17 +58,18 @@
 //     Repeating it would emit a second, partial report; a threshold would invent
 //     a gate the plan does not list.
 //   * `setupFiles`. No suite here needs one. The integration suites take their
-//     `DEBUGGEN_PROVIDER=deterministic`, their temporary `$DEBUGGEN_HOME` and
-//     their ephemeral port through injected config, which is what makes them
-//     re-runnable; a workspace-wide setup file would turn that into a hidden
-//     global. If one ever becomes genuinely necessary it belongs under `test/`,
-//     declared on the project that needs it.
+//     temporary `$DEBUGGEN_HOME` and their ephemeral port through injected
+//     config, which is what makes them re-runnable; a workspace-wide setup file
+//     would turn that into a hidden global. If one ever becomes genuinely
+//     necessary it belongs under `test/`, declared on the project that needs it.
 //   * `process.env` writes. This module is evaluated once, in the Vitest main
 //     process, so a mutation here would leak into every project of the run and
-//     into an editor's long-lived Vitest server - and could point a suite at the
-//     developer's real `~/.debuggen` or their real `ANTHROPIC_API_KEY`. Neither
-//     project may reach either, and that is enforced where it belongs: in the
-//     suites, through injected configuration.
+//     into an editor's long-lived Vitest server. The provider and credential
+//     guarantee is not made that way: it travels with the shared projects as
+//     Vitest's own per-project `test.env`, which the worker applies to its own
+//     `process.env` before a test module loads and which therefore cannot
+//     outlive the run. A suite needing a different value stubs it per test with
+//     `vi.stubEnv`.
 //   * `resolve.alias` for `@debuggen/*`. Cross-package imports must resolve
 //     through each package's `exports` map into `dist/` (AAP 0.2.2), exactly as
 //     Node, tsup and the esbuild bundle of apps/vscode-extension resolve them;
@@ -69,16 +79,33 @@
 //     pinned once, in the root manifest; this workspace adds nothing to it. With
 //     no Vite-level option set, the projects below also stay eligible for the
 //     shared Vite server and its transform cache.
-//   * `clearMocks` / `restoreMocks`. Left exactly as the root registry leaves
-//     them, which means Vitest 5.0.1's defaults (`clearMocks: true`,
+//   * `clearMocks` / `restoreMocks`. Left exactly as the shared definition
+//     leaves them, which means Vitest 5.0.1's defaults (`clearMocks: true`,
 //     `restoreMocks: false`). Diverging would make a suite behave differently
-//     under an IDE than under CI - the one thing a mirror config must never do.
+//     under an IDE than under CI - the one thing this file must never do.
 // ---------------------------------------------------------------------------
-import { defineConfig, defineProject } from 'vitest/config';
-import type { UserWorkspaceConfig } from 'vitest/config';
+import { defineConfig } from 'vitest/config';
+// The `.ts` extension is spelled out deliberately. Vite 8's `configLoader:
+// 'native'` - announced as a future default - cannot load an extensionless
+// relative import from a config file and warns "Add the file extension" on
+// every run that resolves this file; Node's own TypeScript loader, which that
+// mode uses, requires the real filename too. It needs no
+// `allowImportingTsExtensions`: neither this file nor the root config belongs to
+// any `tsc -b` program (the root solution declares `files: []`, this workspace's
+// tsconfig.json includes only `src/**` and `test/**`, and tests/tsconfig.json
+// omits both on purpose), so the compiler never resolves this specifier. Should
+// a future project ever include a config file, that flag - or moving the shared
+// factory into a non-config module - is the change to make, never dropping the
+// extension and reinstating the warning.
+import { hermeticEnv, localServiceProjects } from '../../vitest.config.ts';
 
 /**
- * Paths neither project may ever collect. Applied to both projects below.
+ * Paths neither project may ever collect, spelled relative to THIS directory
+ * because that is the root of a run served by this file. The root container
+ * passes its own, repository-root-relative list to the same factory, and it has
+ * to: that list also keeps `tests/**` (Playwright's territory) and the demo's
+ * generated Prisma client out of collection, and neither path exists below this
+ * workspace.
  *
  * Declaring `exclude` REPLACES Vitest's default list rather than extending it
  * (`defaultExclude` in 5.0.1 is exactly `['**\/node_modules/**', '**\/.git/**']`),
@@ -111,115 +138,33 @@ const sharedExclude: string[] = [
 ];
 
 /**
- * Project `local-service`: the colocated unit suites of the service.
- *
- * These are the fast suites that sit next to the code they cover - config
- * parsing and defaults, the session state-machine transition table, telemetry
- * attribution, redaction wiring, the auth token and Origin rules, source-path
- * containment, panel fallback assembly and retention. They must stay fast and
- * hermetic: no socket is opened, no dev server is launched and nothing under
- * `$DEBUGGEN_HOME` is touched, which is why this project needs none of the
- * execution policy the integration project below carries and runs with Vitest's
- * defaults (the `forks` pool, `isolate: true`, a 5 s test and 10 s hook budget).
- *
- * `globals: false` is the repository convention for Node projects and is
- * deliberate rather than stylistic: every suite imports `describe`, `it`,
- * `expect` and `vi` from `vitest` explicitly, which keeps the service honest
- * about what it depends on and matches how the root registry declares this same
- * project. `retry: 0` restates the default so the intent is on the record: a
- * flaky unit test must fail, never be masked by a second attempt.
- */
-const unitProject: UserWorkspaceConfig = defineProject({
-  test: {
-    name: 'local-service',
-    environment: 'node',
-    globals: false,
-    include: ['src/**/*.test.ts'],
-    exclude: sharedExclude,
-    retry: 0,
-  },
-});
-
-/**
- * Project `local-service-integration`: the in-process integration suites of
- * AAP 0.8.3 (`session-lifecycle`, `ws-protocol`, `telemetry-ingest`,
- * `pipeline-deterministic`, `cleanup-conflict`, `source-open`, `panel-fallback`,
- * `panel-data`, `binding`, `followup`, `auth`, `concurrency`).
- *
- * Every one of them boots a real service - HTTP plus a WebSocket upgrade on an
- * ephemeral port - creates a temporary `$DEBUGGEN_HOME` holding a `node:sqlite`
- * store, and copies `test/fixtures/sample-project` somewhere writable before the
- * real installer patches it. That makes the execution policy below part of the
- * contract rather than tuning:
- *
- *   * `fileParallelism: false` runs one suite file at a time (Vitest also forces
- *     `maxWorkers` to 1 when it is false). Concurrent files would race for
- *     ports, for the store and for the fixture copy, and a port or lock
- *     collision reads as a product bug when it is only a scheduling artefact.
- *   * `pool: 'forks'` states the pool this workspace requires instead of relying
- *     on it being the 5.0.1 default: the suites drive `node:sqlite`, child
- *     processes (the dev-server launcher) and `process.env`, all of which behave
- *     as they do in production only in a real child process.
- *   * `isolate: true` (also the default, restated because it is load-bearing
- *     here) gives each suite file a fresh process and module registry, so a
- *     store handle, a listening server or a cached config from one suite cannot
- *     survive into the next. This is deliberately NOT the `singleFork` shape:
- *     `test.poolOptions` was removed in Vitest 4 - its options are top-level now
- *     - and a single shared fork would trade exactly the isolation these suites
- *     depend on for a saving this suite count does not need.
- *   * `testTimeout` / `hookTimeout` of 30 s replace the 5 s / 10 s defaults,
- *     which a real pipeline run, a ts-morph instrumentation install or a cleanup
- *     reconciliation pass legitimately exceeds on a loaded machine. The budget is
- *     generous, not unbounded: a genuinely hung server still fails the run.
- *   * `retry: 0`. A flaky integration test must fail rather than be retried into
- *     a green run - it is usually reporting a real leak (an unclosed socket, a
- *     `$DEBUGGEN_HOME` left behind) that a retry would hide.
- *
- * `environment: 'node'` and `globals: false` mirror the root registry exactly;
- * the suites reach the service over `fetch` and a `ws` client, never a DOM.
- *
- * One divergence is deliberate and load-bearing when writing these suites: the
- * root registry declares this project through its generic node-project helper,
- * so a root-rooted run (`pnpm test`, `pnpm test:integration`) resolves it with
- * Vitest's defaults - files in parallel, a 5 s test and 10 s hook budget. The
- * policy above is a hardening of the workspace-scoped run, never a licence to
- * depend on it. Every suite must therefore stand on its own: an ephemeral port
- * (`listen(0)`), a unique temporary `$DEBUGGEN_HOME`, its own copy of the
- * fixture project, and either a step that fits the default budget or an explicit
- * per-test timeout. Written that way a suite is green from both entry points; a
- * suite that silently assumes serialization would pass here and be flaky in CI.
- */
-const integrationProject: UserWorkspaceConfig = defineProject({
-  test: {
-    name: 'local-service-integration',
-    environment: 'node',
-    globals: false,
-    include: ['test/integration/**/*.test.ts'],
-    exclude: sharedExclude,
-    pool: 'forks',
-    fileParallelism: false,
-    isolate: true,
-    testTimeout: 30_000,
-    hookTimeout: 30_000,
-    retry: 0,
-  },
-});
-
-/**
  * Declaring `projects` makes this file a container: it never collects tests
- * itself, it only provides the two projects above. That is what lets a
- * workspace-rooted `vitest run --project local-service` (or
+ * itself, it only provides the two projects the shared factory returns. That is
+ * what lets a workspace-rooted `vitest run --project local-service` (or
  * `--project local-service-integration`) resolve the same names the root
  * registry uses, and what makes an editor list both suites of this workspace.
  *
- * No other `test` option is set at this level. Inline projects inherit the
- * container's options (`extends` defaults to `true`), so keeping the container
- * empty means each project's own options are exactly what Vitest runs - there is
- * no merge to reason about, and in particular no second copy of `exclude` to
- * keep in sync.
+ * `baseDir: ''` is what makes the factory's globs workspace-relative here
+ * (`src/**\/*.test.ts`, `test/integration/**\/*.test.ts`) while the root passes
+ * `apps/local-service` for the same two projects.
+ *
+ * `env` is the one option set at this level, and it is the same record both
+ * shared projects already carry: no suite of this workspace may inherit the
+ * developer's ambient `DEBUGGEN_PROVIDER` or real `ANTHROPIC_API_KEY`, whichever
+ * container registered it (AAP 0.5.3, 0.8.3). Declaring it here is the backstop
+ * - inheritance merges an object by key, so the value is identical rather than
+ * doubled - and it means the guarantee is visible in this file instead of only
+ * in the factory it imports.
+ *
+ * Nothing else is set at this level. Inline projects inherit the container's
+ * options (`extends` defaults to `true`), so keeping it otherwise empty means
+ * each project's own options are exactly what Vitest runs - and in particular
+ * there is no second copy of `exclude`, which inheritance would concatenate
+ * rather than merge.
  */
 export default defineConfig({
   test: {
-    projects: [unitProject, integrationProject],
+    env: { ...hermeticEnv },
+    projects: localServiceProjects({ baseDir: '', exclude: sharedExclude }),
   },
 });

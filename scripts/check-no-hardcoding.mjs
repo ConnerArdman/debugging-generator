@@ -67,24 +67,37 @@
  *   * Policy matching is literal and case-sensitive. There is no pattern facility, by design: an
  *     approximate rule would either fail honest product code or quietly stop matching.
  *
- * STALENESS AND A PARTIALLY MATERIALIZED CORPUS
- * The policy is defined as (demo harvest) minus (fixture harvest) minus (allowlist). While the demo
- * application is still being written -- a partial clone, an early build, a repository where it has
- * not landed in full -- a fresh harvest cannot reproduce the committed policy, and the difference is
- * absence rather than drift. `classifyCorpus()` measures that directly: below
- * CORPUS_COVERAGE_THRESHOLD of the committed entries the corpus is `materializing`, the comparison
- * is printed in full but not enforced, and `--update` becomes monotone -- it adds entries and never
- * drops one the incomplete corpus merely cannot see, so running it early can only strengthen the
- * gate. Nothing is ever skipped silently: every run prints the corpus state and any drift found.
- * Once the corpus accounts for the policy, drift is enforced as `policy-stale` and `--update`
- * writes exactly what it harvested. Enforcement of the policy against product source is
- * unconditional and does not depend on the corpus at all.
+ * STALENESS IS ENFORCED WHENEVER THE CORPUS IS PRESENT
+ * The policy is defined as (demo harvest) minus (fixture harvest) minus (allowlist), so the demo
+ * application is the definition of the policy rather than evidence about it. `classifyCorpus()`
+ * therefore asks one question only: is `apps/demo-app` in this checkout?
+ *   * absent -- a partial clone or an early build. No comparison is possible, the run says so on
+ *     its own line, and the committed policy is still enforced against product source.
+ *   * present -- every difference between the committed policy and a fresh harvest is drift. It is
+ *     reported as `policy-stale`, it fails the gate, and `--update` writes exactly what it
+ *     harvested, dropping entries the demo no longer declares. There is no coverage threshold and
+ *     no partial-corpus exemption: a policy a present corpus cannot reproduce is stale, whether it
+ *     lists too much or too little, because a gate nobody can regenerate is a gate nobody can
+ *     trust. Enforcement of the policy against product source is unconditional either way.
+ *
+ * THE SCAN FAILS CLOSED
+ * A gate that returns success while part of the product tree went unexamined proves nothing, so
+ * nothing is ever "skipped". A directory that cannot be read, a file that cannot be read, parsed or
+ * decoded as text, a file above MAX_FILE_BYTES, and a symbolic link that would otherwise have been
+ * scanned are all recorded as {@link ScanFailure} and stop the gate with exit code 2 -- distinct
+ * from the exit code 1 that reports violations, because an incomplete scan is an environment
+ * problem rather than a verdict. The corpus harvest fails the same way: a partial harvest would
+ * silently rewrite the policy, so `--update` refuses to write and a normal run refuses to judge
+ * staleness. A run that scanned nothing at all fails too, because a clean result over an empty set
+ * is not evidence. An absent tree is the one benign case and stays an informational note: this
+ * script runs on clones where a surface has not landed yet.
  *
  * Usage:  node scripts/check-no-hardcoding.mjs [--update] [--json] [--help]
- * Exits:  0 clean | 1 violations found or policy stale | 2 usage or environment error.
+ * Exits:  0 clean | 1 violations found or policy stale | 2 usage error, environment error, or a
+ *         scan that could not read part of the tree.
  */
 
-import { readdirSync, readFileSync, lstatSync, writeFileSync } from 'node:fs';
+import { readdirSync, readFileSync, lstatSync, statSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import process from 'node:process';
@@ -150,7 +163,13 @@ const STRUCTURED_TREES = Object.freeze([
   'packages/model-provider/src/deterministic',
 ]);
 
-/** Directory names skipped during every walk, at any depth. */
+/**
+ * Directory names pruned during every walk, at any depth, before anything is read and whatever the
+ * entry's type is. Dependencies, build output and test-runner caches hold no product source, and
+ * pruning them by name first is what keeps a symlinked `node_modules` or a symlinked
+ * `.vscode-test` (which the repository's own VS Code test setup creates) out of the fail-closed
+ * traversal rules below.
+ */
 const SKIPPED_DIRECTORIES = Object.freeze(
   new Set([
     'node_modules',
@@ -162,6 +181,7 @@ const SKIPPED_DIRECTORIES = Object.freeze(
     '.tsbuild',
     '.turbo',
     '.git',
+    '.vscode-test',
     'playwright-report',
     'test-results',
     '__tests__',
@@ -175,20 +195,22 @@ const SKIPPED_CORPUS_DIRECTORIES = Object.freeze(
   new Set(['node_modules', 'dist', 'out', 'build', '.next', '.tsbuild', '.git', 'generated']),
 );
 
-/** Files above this size are reported as skipped instead of being read. */
-const MAX_FILE_BYTES = 2 * 1024 * 1024;
+/**
+ * Largest file this scan reads whole. Every scanned file is read into memory -- the AST pass needs
+ * the complete text and the structured pass matches across line boundaries -- so a bound is needed;
+ * a file that exceeds it is a scan failure rather than a skip, because a file nobody examined is
+ * indistinguishable from a file that hides a cheat. No text file this gate covers comes close: the
+ * remedy for one that does is to prune its directory from the scanned trees (generated output does
+ * not belong in them) or to split it, never to let the gate pass without reading it.
+ *
+ * Exported so `scripts/check-no-hardcoding.test.mjs` can write a file exactly one byte over the
+ * limit instead of hard-coding a size that would drift from this constant.
+ */
+export const MAX_FILE_BYTES = 2 * 1024 * 1024;
 /** Longest excerpt printed for an offending line. */
 const MAX_SNIPPET_LENGTH = 100;
 /** Bound on the alias fixpoint of the question taint analysis. */
 const MAX_TAINT_PASSES = 6;
-
-/**
- * Share of the committed policy's entries a fresh harvest must reproduce before the corpus counts
- * as the one that produced that policy. Below it the corpus is treated as still materializing: a
- * harvest that cannot find half the committed vocabulary is missing the code that declares it, so
- * the difference is absence rather than drift. See {@link classifyCorpus}.
- */
-const CORPUS_COVERAGE_THRESHOLD = 0.5;
 
 /**
  * The only file allowed to branch on the question text, and only in its generic tokenizer
@@ -296,11 +318,31 @@ const RULE_HINTS = Object.freeze({
  */
 
 /**
- * A file the scan deliberately did not read.
+ * Something the scan could not examine. Every one of these fails the gate with exit code 2: the
+ * check was not performed over the whole tree, so its silence is not evidence.
  *
- * @typedef {object} SkippedFile
- * @property {string} file Repository-relative POSIX path.
- * @property {'too-large'|'binary'|'unreadable'|'not-a-regular-file'} reason
+ * Reasons:
+ *   `unreadable-directory`   a directory that exists but could not be listed.
+ *   `not-a-directory`        a scanned tree that exists and is not a directory.
+ *   `symlink-not-followed`   an entry that would have been scanned but is a symbolic link. Links
+ *                            are never followed -- one pointing out of the repository would take
+ *                            the scan with it -- so the entry stops the gate instead.
+ *   `unreadable-file`        a file that exists but could not be stat'ed or read.
+ *   `not-a-regular-file`     a path that is not a regular file where one was required.
+ *   `binary`                 a file with a scanned extension that contains NUL bytes, so it cannot
+ *                            be examined as text.
+ *   `too-large`              a file above {@link MAX_FILE_BYTES}.
+ *   `unparseable`            source the parser could not fully understand. The parser recovers
+ *                            from malformed syntax rather than throwing, so this covers an
+ *                            ordinary syntax error: the tree standing in for the file is partial,
+ *                            and the unparsed region went unexamined.
+ *   `no-subject`             the run found nothing at all to scan, so its success would say
+ *                            nothing about anything. Recorded against `.` rather than a path.
+ *
+ * @typedef {object} ScanFailure
+ * @property {string} path Repository-relative POSIX path, or `.` for a whole-run precondition.
+ * @property {'unreadable-directory'|'not-a-directory'|'symlink-not-followed'|'unreadable-file'|'not-a-regular-file'|'binary'|'too-large'|'unparseable'|'no-subject'} reason
+ * @property {string} detail What happened and what to do about it.
  */
 
 /**
@@ -326,10 +368,12 @@ const RULE_HINTS = Object.freeze({
  */
 
 /**
- * Readiness of the corpora `buildPolicy()` reads.
+ * Whether the demo corpus `buildPolicy()` harvests is in this checkout at all. Presence is the
+ * whole test: a present corpus defines the policy, so any difference from it is drift.
  *
  * @typedef {object} CorpusState
- * @property {'absent'|'materializing'|'ready'} state
+ * @property {'absent'|'ready'} state `absent` when `apps/demo-app` is not in this checkout and no
+ *   comparison is possible; `ready` whenever it is, which is when drift is enforced.
  * @property {string} reason Human-readable explanation, always printed.
  */
 
@@ -337,7 +381,8 @@ const RULE_HINTS = Object.freeze({
  * Outcome of comparing the committed policy with a fresh computation.
  *
  * @typedef {object} StaleReport
- * @property {boolean} enforced Whether drift was reported as a `policy-stale` finding.
+ * @property {boolean} enforced Whether drift was reported as a `policy-stale` finding, which is
+ *   true whenever the corpus is present.
  * @property {boolean} drifted Whether any difference was found.
  * @property {CorpusState} corpus
  * @property {{ identifiers: string[], routePaths: string[] }} added Corpus has them, policy lacks.
@@ -349,15 +394,17 @@ const RULE_HINTS = Object.freeze({
  * Everything one run produced.
  *
  * @typedef {object} CheckResult
- * @property {boolean} ok
- * @property {number} exitCode
+ * @property {boolean} ok No violations and no scan failures.
+ * @property {number} exitCode {@link EXIT_ERROR} when anything went unexamined, else
+ *   {@link EXIT_FINDINGS} when a violation was found, else {@link EXIT_OK}.
  * @property {string} root Absolute repository root the check ran against.
  * @property {Finding[]} findings Ordered by file, then line, then column, then rule.
  * @property {StaleReport|null} stale `null` when no comparison was possible.
  * @property {number} filesScanned Source and structured files actually read.
  * @property {number} sourceFilesScanned Source files parsed with ts-morph.
  * @property {number} structuredFilesScanned Structured-text files read.
- * @property {SkippedFile[]} skipped
+ * @property {ScanFailure[]} failures Everything the scan could not examine; a non-empty list means
+ *   the gate could not be performed and the exit code is {@link EXIT_ERROR}.
  * @property {string[]} notes Informational lines: absent trees, corpus state, defensive warnings.
  */
 
@@ -418,15 +465,85 @@ function isUnder(candidate, base) {
 }
 
 /**
+ * @param {unknown} error
+ * @returns {string} The message of a thrown value, whatever it is.
+ */
+function describeError(error) {
+  if (error instanceof Error) {
+    const code = /** @type {{ code?: unknown }} */ (error).code;
+    // Node's own messages already start with the code; only add it when it is missing, so the
+    // detail never reads `EACCES: EACCES: ...`.
+    return typeof code === 'string' && !error.message.startsWith(code)
+      ? `${code}: ${error.message}`
+      : error.message;
+  }
+  return String(error);
+}
+
+/**
+ * `lstat` with the one distinction this script has to make: a path that is not there (benign -- a
+ * surface that has not landed in this clone) versus a path that is there but could not be
+ * inspected (a hole in the scan). Symbolic links are not followed.
+ *
+ * @param {string} absolute
+ * @returns {{ stat: import('node:fs').Stats }|{ missing: true }|{ error: unknown }}
+ */
+function statEntry(absolute) {
+  try {
+    return { stat: lstatSync(absolute) };
+  } catch (error) {
+    const code = /** @type {{ code?: unknown }} */ (error).code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') {
+      return { missing: true };
+    }
+    return { error };
+  }
+}
+
+/**
+ * Classify a tree the scan is about to walk. `absent` is informational -- this script runs on
+ * clones where a surface has not landed yet -- while anything else that is not a readable directory
+ * is a scan failure.
+ *
+ * @param {string} root Absolute repository root.
+ * @param {string} absolute Absolute path of the tree.
+ * @returns {{ state: 'directory' }|{ state: 'absent' }|{ state: 'failed', failure: ScanFailure }}
+ */
+function classifyDirectory(root, absolute) {
+  const entry = statEntry(absolute);
+  if ('missing' in entry) {
+    return { state: 'absent' };
+  }
+  if ('error' in entry) {
+    return {
+      state: 'failed',
+      failure: {
+        path: relative(root, absolute),
+        reason: 'unreadable-directory',
+        detail: `could not be inspected (${describeError(entry.error)}); the scan cannot cover a tree it cannot stat`,
+      },
+    };
+  }
+  if (!entry.stat.isDirectory()) {
+    return {
+      state: 'failed',
+      failure: {
+        path: relative(root, absolute),
+        reason: 'not-a-directory',
+        detail: 'exists but is not a directory, so the tree it should contain went unscanned',
+      },
+    };
+  }
+  return { state: 'directory' };
+}
+
+/**
  * @param {string} absolute
  * @returns {boolean} Whether the path exists and is a directory (symlinks are not followed).
  */
 function isDirectory(absolute) {
-  try {
-    return lstatSync(absolute).isDirectory();
-  } catch {
-    return false;
-  }
+  const entry = statEntry(absolute);
+  return 'stat' in entry && entry.stat.isDirectory();
 }
 
 /**
@@ -434,8 +551,21 @@ function isDirectory(absolute) {
  * @returns {boolean} Whether the path exists and is a regular file.
  */
 function isFile(absolute) {
+  const entry = statEntry(absolute);
+  return 'stat' in entry && entry.stat.isFile();
+}
+
+/**
+ * Whether a symbolic link leads to a directory. The link is resolved for this classification only
+ * -- the walk still never descends through it and nothing is ever read through it -- so that a
+ * directory link can be reported as the hole in the scan that it is.
+ *
+ * @param {string} absolute Path of the link itself.
+ * @returns {boolean} `false` for a dangling or unreadable link.
+ */
+function linkLeadsToDirectory(absolute) {
   try {
-    return lstatSync(absolute).isFile();
+    return statSync(absolute).isDirectory();
   } catch {
     return false;
   }
@@ -458,34 +588,74 @@ function snippet(line) {
 }
 
 /**
- * Read a text file, classifying the reasons it might not be readable rather than throwing.
+ * Read a text file, classifying every reason it might not be readable rather than throwing. A
+ * classification is never a pass: each one becomes a {@link ScanFailure} at the call site and stops
+ * the gate, because an unread file is a file that could hide anything this gate exists to find.
  *
  * @param {string} absolute
- * @param {string} relPath Repository-relative POSIX path, for the skip record.
- * @returns {{ text: string }|{ skipped: SkippedFile }}
+ * @param {string} relPath Repository-relative POSIX path, for the failure record.
+ * @returns {{ text: string }|{ failure: ScanFailure }}
  */
 function readTextFile(absolute, relPath) {
-  let stat;
-  try {
-    stat = lstatSync(absolute);
-  } catch {
-    return { skipped: { file: relPath, reason: 'unreadable' } };
+  const entry = statEntry(absolute);
+  if ('missing' in entry) {
+    return {
+      failure: {
+        path: relPath,
+        reason: 'unreadable-file',
+        detail: 'disappeared between listing and reading; re-run the check on a settled tree',
+      },
+    };
   }
-  if (!stat.isFile()) {
-    return { skipped: { file: relPath, reason: 'not-a-regular-file' } };
+  if ('error' in entry) {
+    return {
+      failure: {
+        path: relPath,
+        reason: 'unreadable-file',
+        detail: `could not be inspected (${describeError(entry.error)}); make it readable and re-run`,
+      },
+    };
   }
-  if (stat.size > MAX_FILE_BYTES) {
-    return { skipped: { file: relPath, reason: 'too-large' } };
+  if (!entry.stat.isFile()) {
+    return {
+      failure: {
+        path: relPath,
+        reason: 'not-a-regular-file',
+        detail: 'is not a regular file, so its contents could not be examined',
+      },
+    };
+  }
+  if (entry.stat.size > MAX_FILE_BYTES) {
+    return {
+      failure: {
+        path: relPath,
+        reason: 'too-large',
+        detail: `is ${entry.stat.size} bytes, above the ${MAX_FILE_BYTES}-byte limit this scan reads whole; prune its directory from the scanned trees if it is generated output, or split it -- the gate will not pass on a file it did not read`,
+      },
+    };
   }
   /** @type {Buffer} */
   let buffer;
   try {
     buffer = readFileSync(absolute);
-  } catch {
-    return { skipped: { file: relPath, reason: 'unreadable' } };
+  } catch (error) {
+    return {
+      failure: {
+        path: relPath,
+        reason: 'unreadable-file',
+        detail: `could not be read (${describeError(error)}); make it readable and re-run`,
+      },
+    };
   }
   if (buffer.includes(0)) {
-    return { skipped: { file: relPath, reason: 'binary' } };
+    return {
+      failure: {
+        path: relPath,
+        reason: 'binary',
+        detail:
+          'contains NUL bytes, so it cannot be examined as text; move it out of the scanned trees if it is not source',
+      },
+    };
   }
   return { text: buffer.toString('utf8') };
 }
@@ -535,17 +705,27 @@ function positionAt(starts, offset) {
  * the demo application contains dynamic-route directories such as `[slug]` whose brackets are glob
  * character-class syntax.
  *
- * Symbolic links are never followed -- a link out of the repository would take the scan with it.
+ * The walk fails closed. A directory that cannot be listed is recorded rather than passed over, so
+ * an unreadable subtree can never leave the gate reporting success over a tree it did not see.
  *
- * @param {string} absoluteDir Directory to walk; a missing directory yields nothing.
+ * Symbolic links are never followed -- a link out of the repository would take the scan with it --
+ * but a link that would otherwise have been scanned is recorded too, so the no-follow rule cannot
+ * be used to hide a file. Pruned directory names are honoured first and whatever the entry's type,
+ * which is what keeps a symlinked `node_modules` or `.vscode-test` out of that rule.
+ *
+ * @param {string} absoluteDir Directory to walk; it must already be a readable directory (see
+ *   {@link classifyDirectory}).
  * @param {(relativePosixPath: string, name: string) => boolean} accept File predicate.
  * @param {ReadonlySet<string>} skippedDirectories Directory names pruned at any depth.
  * @param {string} root Absolute repository root, for the relative paths handed to `accept`.
- * @returns {string[]} Absolute paths, sorted so output is stable across platforms.
+ * @returns {{ files: string[], failures: ScanFailure[] }} Absolute paths, sorted so output is
+ *   stable across platforms, and everything the walk could not cover.
  */
 function walkFiles(absoluteDir, accept, skippedDirectories, root) {
   /** @type {string[]} */
   const found = [];
+  /** @type {ScanFailure[]} */
+  const failures = [];
   /** @type {string[]} */
   const queue = [absoluteDir];
   while (queue.length > 0) {
@@ -554,26 +734,64 @@ function walkFiles(absoluteDir, accept, skippedDirectories, root) {
     let entries;
     try {
       entries = readdirSync(current, { withFileTypes: true });
-    } catch {
+    } catch (error) {
+      failures.push({
+        path: relative(root, current),
+        reason: 'unreadable-directory',
+        detail: `could not be listed (${describeError(error)}); everything below it went unscanned`,
+      });
       continue;
     }
     for (const entry of entries) {
       const absolute = path.join(current, entry.name);
-      if (entry.isSymbolicLink()) {
+      const relPath = relative(root, absolute);
+      if (skippedDirectories.has(entry.name)) {
         continue;
       }
-      if (entry.isDirectory()) {
-        if (!skippedDirectories.has(entry.name)) {
-          queue.push(absolute);
+      if (entry.isSymbolicLink()) {
+        // Refused when a real entry in its place would have been read: a link whose name the
+        // predicate accepts, or one leading to a directory the walk would have descended into. A
+        // link named like a file this scan ignores anyway hides nothing, so it is passed over as
+        // its regular-file namesake would be.
+        if (accept(relPath, entry.name)) {
+          failures.push({
+            path: relPath,
+            reason: 'symlink-not-followed',
+            detail:
+              'is a symbolic link where a scanned file was expected, and links are never followed; replace it with a regular file or move it out of the scanned trees',
+          });
+        } else if (linkLeadsToDirectory(absolute)) {
+          failures.push({
+            path: relPath,
+            reason: 'symlink-not-followed',
+            detail:
+              'is a symbolic link to a directory, which this scan never follows, so everything below it went unscanned; replace it with a real directory or add its name to the pruned directories',
+          });
         }
         continue;
       }
-      if (entry.isFile() && accept(relative(root, absolute), entry.name)) {
-        found.push(absolute);
+      if (entry.isDirectory()) {
+        queue.push(absolute);
+        continue;
+      }
+      if (entry.isFile()) {
+        if (accept(relPath, entry.name)) {
+          found.push(absolute);
+        }
+        continue;
+      }
+      // A socket, FIFO or device node where source was expected: not readable as text, and not
+      // something to pass over silently.
+      if (accept(relPath, entry.name)) {
+        failures.push({
+          path: relPath,
+          reason: 'not-a-regular-file',
+          detail: 'is not a regular file, so its contents could not be examined',
+        });
       }
     }
   }
-  return found.sort();
+  return { files: found.sort(), failures };
 }
 
 /**
@@ -716,11 +934,15 @@ function createSyntaxProject(tsMorph) {
  * Parse one file's text. The text is supplied by the caller rather than read by ts-morph, so
  * oversized and binary files are filtered first and nothing is ever written back to disk.
  *
+ * A returned source file is NOT yet evidence that the text parsed: the TypeScript parser recovers
+ * from malformed syntax and hands back a partial tree carrying diagnostics instead of throwing, so
+ * every caller must ask {@link syntaxErrorsOf} before scanning or harvesting what it got.
+ *
  * @param {any} project
  * @param {string} relPath Repository-relative POSIX path, kept as the in-project path so findings
  *   report the path a developer recognises.
  * @param {string} text
- * @returns {any|null} The source file, or `null` when the text could not be parsed.
+ * @returns {any|null} The source file, or `null` when ts-morph refused the text outright.
  */
 function addSourceText(project, relPath, text) {
   try {
@@ -728,6 +950,76 @@ function addSourceText(project, relPath, text) {
   } catch {
     return null;
   }
+}
+
+/**
+ * The parser's own complaints about one file: a non-empty result means part of the text was not
+ * understood, so the tree standing in for it is partial and anything hiding in the unparsed region
+ * would go unreported. That is the fail-open case this gate must refuse (scanning a file the
+ * parser gave up on is indistinguishable from not scanning it), so callers turn a non-empty result
+ * into a `ScanFailure` rather than proceeding.
+ *
+ * Only *syntactic* diagnostics are consulted. Semantic ones are unavailable and meaningless here
+ * by design: the project is syntax-only (`noLib`, no dependency resolution, no type checker), so
+ * every unresolved import would otherwise read as an error.
+ *
+ * The parser attaches its diagnostics to the source file, which is the cheap way to read them --
+ * measured at about 5 ms per file against roughly 70 ms for building a program per file. That
+ * field is internal to the compiler, so when a future TypeScript stops providing it the public
+ * `Program#getSyntacticDiagnostics` path is used instead: slower, never silent, which is the
+ * property that matters for a guard.
+ *
+ * @param {{ ts: any }} tsMorph
+ * @param {any} project
+ * @param {any} sourceFile
+ * @returns {{ code: number|undefined, message: string, start: number|undefined }[]}
+ */
+function syntaxErrorsOf(tsMorph, project, sourceFile) {
+  const attached = /** @type {{ parseDiagnostics?: unknown }} */ (sourceFile.compilerNode)
+    .parseDiagnostics;
+  const raw = Array.isArray(attached)
+    ? attached
+    : project
+        .getProgram()
+        .getSyntacticDiagnostics(sourceFile)
+        .map((/** @type {any} */ diagnostic) => diagnostic.compilerObject ?? diagnostic);
+  return raw.map((/** @type {any} */ diagnostic) => ({
+    code: typeof diagnostic.code === 'number' ? diagnostic.code : undefined,
+    message:
+      typeof diagnostic.messageText === 'string'
+        ? diagnostic.messageText
+        : tsMorph.ts.flattenDiagnosticMessageText(diagnostic.messageText, ' '),
+    start: typeof diagnostic.start === 'number' ? diagnostic.start : undefined,
+  }));
+}
+
+/**
+ * The `ScanFailure` for a file the parser could not fully understand, naming the first error and
+ * where it is, so the developer can fix the file rather than hunt for what the gate disliked.
+ *
+ * @param {string} relPath
+ * @param {string} text
+ * @param {{ code: number|undefined, message: string, start: number|undefined }[]} errors
+ * @param {string} consequence What the unparsed region cost this pass.
+ * @returns {ScanFailure}
+ */
+function unparseableFailure(relPath, text, errors, consequence) {
+  const first = errors[0];
+  if (first === undefined) {
+    return {
+      path: relPath,
+      reason: 'unparseable',
+      detail: `could not be parsed at all -- the parser rejected the text outright -- so ${consequence}; fix the file or, if it is not source, move it out of the scanned trees`,
+    };
+  }
+  const at = first.start === undefined ? undefined : positionAt(lineStarts(text), first.start);
+  const where = at === undefined ? '' : ` at line ${at.line}, column ${at.column}`;
+  const code = first.code === undefined ? '' : `TS${first.code}: `;
+  return {
+    path: relPath,
+    reason: 'unparseable',
+    detail: `has ${pluralize(errors.length, 'syntax error')} -- ${code}${first.message}${where} -- so ${consequence}; fix the file or, if it is not source, move it out of the scanned trees`,
+  };
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -761,17 +1053,18 @@ function isStringArray(value) {
  */
 function readJsonArtifact(root, relPath, missingCode, malformedCode) {
   const absolute = path.join(root, relPath);
-  if (!isFile(absolute)) {
+  const entry = statEntry(absolute);
+  if ('missing' in entry) {
     throw new HardcodingCheckError(
       missingCode,
       `${relPath} is missing; regenerate it with \`${UPDATE_COMMAND}\` (or \`${PNPM_UPDATE_COMMAND}\`)`,
     );
   }
   const read = readTextFile(absolute, relPath);
-  if ('skipped' in read) {
+  if ('failure' in read) {
     throw new HardcodingCheckError(
       malformedCode,
-      `${relPath} could not be read (${read.skipped.reason})`,
+      `${relPath} could not be read (${read.failure.reason}): ${read.failure.detail}`,
     );
   }
   /** @type {unknown} */
@@ -1524,32 +1817,40 @@ function checkQuestionBranch(tsMorph, node, context, taintedNames, collector) {
 
 /**
  * @param {string} root
- * @returns {{ files: string[], notes: string[] }} Product source files, and a note per absent tree.
+ * @returns {{ files: string[], notes: string[], failures: ScanFailure[] }} Product source files, a
+ *   note per absent tree, and everything the walk could not cover.
  */
 function listProductSourceFiles(root) {
   /** @type {string[]} */
   const files = [];
   /** @type {string[]} */
   const notes = [];
+  /** @type {ScanFailure[]} */
+  const failures = [];
   for (const tree of PRODUCT_TREES) {
     const absolute = path.join(root, tree);
-    if (!isDirectory(absolute)) {
+    const classified = classifyDirectory(root, absolute);
+    if (classified.state === 'absent') {
       notes.push(`skipped ${tree}: not present in this checkout`);
       continue;
     }
-    files.push(
-      ...walkFiles(
-        absolute,
-        (relPath, name) =>
-          SOURCE_EXTENSIONS.includes(path.extname(name)) &&
-          !isTestFileName(name) &&
-          !isExcludedPath(relPath),
-        SKIPPED_DIRECTORIES,
-        root,
-      ),
+    if (classified.state === 'failed') {
+      failures.push(classified.failure);
+      continue;
+    }
+    const walked = walkFiles(
+      absolute,
+      (relPath, name) =>
+        SOURCE_EXTENSIONS.includes(path.extname(name)) &&
+        !isTestFileName(name) &&
+        !isExcludedPath(relPath),
+      SKIPPED_DIRECTORIES,
+      root,
     );
+    files.push(...walked.files);
+    failures.push(...walked.failures);
   }
-  return { files: files.sort(), notes };
+  return { files: files.sort(), notes, failures };
 }
 
 /**
@@ -1558,7 +1859,7 @@ function listProductSourceFiles(root) {
  * @param {string} [root] Absolute repository root.
  * @param {Policy} [policy] Policy to enforce; loaded from `root` when omitted.
  * @param {{ allowlist?: Allowlist|null, matchers?: PolicyMatchers }} [options]
- * @returns {Promise<{ findings: Finding[], filesScanned: number, skipped: SkippedFile[], notes: string[] }>}
+ * @returns {Promise<{ findings: Finding[], filesScanned: number, failures: ScanFailure[], notes: string[] }>}
  */
 export async function scanProductSource(root = DEFAULT_ROOT, policy, options = {}) {
   const effectivePolicy = policy ?? (await loadPolicy(root));
@@ -1571,22 +1872,30 @@ export async function scanProductSource(root = DEFAULT_ROOT, policy, options = {
   const tsMorph = await loadTsMorph(root);
   const project = createSyntaxProject(tsMorph);
 
-  const { files, notes } = listProductSourceFiles(root);
-  /** @type {SkippedFile[]} */
-  const skipped = [];
+  const { files, notes, failures } = listProductSourceFiles(root);
   const collector = new FindingCollector();
   let filesScanned = 0;
 
   for (const absolute of files) {
     const file = relative(root, absolute);
     const read = readTextFile(absolute, file);
-    if ('skipped' in read) {
-      skipped.push(read.skipped);
+    if ('failure' in read) {
+      failures.push(read.failure);
       continue;
     }
     const sourceFile = addSourceText(project, file, read.text);
     if (sourceFile === null) {
-      skipped.push({ file, reason: 'unreadable' });
+      failures.push(unparseableFailure(file, read.text, [], 'none of its syntax was examined'));
+      continue;
+    }
+    // The parser recovers from malformed syntax, so a source file in hand is not a parsed file:
+    // an unexamined region could hold exactly what this gate looks for.
+    const syntaxErrors = syntaxErrorsOf(tsMorph, project, sourceFile);
+    if (syntaxErrors.length > 0) {
+      project.removeSourceFile(sourceFile);
+      failures.push(
+        unparseableFailure(file, read.text, syntaxErrors, 'part of it went unexamined'),
+      );
       continue;
     }
     filesScanned += 1;
@@ -1619,7 +1928,7 @@ export async function scanProductSource(root = DEFAULT_ROOT, policy, options = {
     project.removeSourceFile(sourceFile);
   }
 
-  return { findings: collector.findings, filesScanned, skipped, notes };
+  return { findings: collector.findings, filesScanned, failures, notes };
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -1628,40 +1937,55 @@ export async function scanProductSource(root = DEFAULT_ROOT, policy, options = {
 
 /**
  * @param {string} root
- * @returns {{ files: string[], notes: string[] }}
+ * @returns {{ files: string[], notes: string[], failures: ScanFailure[] }}
  */
 function listStructuredTextFiles(root) {
   /** @type {Set<string>} */
   const files = new Set();
   /** @type {string[]} */
   const notes = [];
+  /** @type {ScanFailure[]} */
+  const failures = [];
 
   // Every file of the versioned prompts and of the deterministic provider, whatever its extension:
   // both are generation inputs, so demo vocabulary in prose is as forbidden as in code.
   for (const tree of STRUCTURED_TREES) {
     const absolute = path.join(root, tree);
-    if (!isDirectory(absolute)) {
+    const classified = classifyDirectory(root, absolute);
+    if (classified.state === 'absent') {
       notes.push(`skipped ${tree}: not present in this checkout`);
       continue;
     }
-    for (const file of walkFiles(
+    if (classified.state === 'failed') {
+      failures.push(classified.failure);
+      continue;
+    }
+    const walked = walkFiles(
       absolute,
       (relPath, name) => !isTestFileName(name) && !isExcludedPath(relPath),
       SKIPPED_DIRECTORIES,
       root,
-    )) {
+    );
+    for (const file of walked.files) {
       files.add(file);
     }
+    failures.push(...walked.failures);
   }
 
   // JSON, Markdown and plain text anywhere under a product tree. Workspace manifests are in this
   // set on purpose: no demo identifier belongs in a product `package.json`.
   for (const tree of PRODUCT_TREES) {
     const absolute = path.join(root, tree);
-    if (!isDirectory(absolute)) {
+    const classified = classifyDirectory(root, absolute);
+    if (classified.state === 'absent') {
+      // Already reported as an absent tree by the source pass, which walks the same list.
       continue;
     }
-    for (const file of walkFiles(
+    if (classified.state === 'failed') {
+      failures.push(classified.failure);
+      continue;
+    }
+    const walked = walkFiles(
       absolute,
       (relPath, name) =>
         STRUCTURED_EXTENSIONS.includes(path.extname(name)) &&
@@ -1669,12 +1993,14 @@ function listStructuredTextFiles(root) {
         !isExcludedPath(relPath),
       SKIPPED_DIRECTORIES,
       root,
-    )) {
+    );
+    for (const file of walked.files) {
       files.add(file);
     }
+    failures.push(...walked.failures);
   }
 
-  return { files: [...files].sort(), notes };
+  return { files: [...files].sort(), notes, failures };
 }
 
 /**
@@ -1684,7 +2010,7 @@ function listStructuredTextFiles(root) {
  * @param {string} [root] Absolute repository root.
  * @param {Policy} [policy] Policy to enforce; loaded from `root` when omitted.
  * @param {{ allowlist?: Allowlist|null, matchers?: PolicyMatchers }} [options]
- * @returns {{ findings: Finding[], filesScanned: number, skipped: SkippedFile[], notes: string[] }}
+ * @returns {{ findings: Finding[], filesScanned: number, failures: ScanFailure[], notes: string[] }}
  */
 export function scanStructuredText(root = DEFAULT_ROOT, policy, options = {}) {
   const effectivePolicy = policy ?? loadPolicySync(root);
@@ -1695,17 +2021,15 @@ export function scanStructuredText(root = DEFAULT_ROOT, policy, options = {}) {
       options.allowlist === undefined ? loadAllowlist(root) : options.allowlist,
     );
 
-  const { files, notes } = listStructuredTextFiles(root);
-  /** @type {SkippedFile[]} */
-  const skipped = [];
+  const { files, notes, failures } = listStructuredTextFiles(root);
   const collector = new FindingCollector();
   let filesScanned = 0;
 
   for (const absolute of files) {
     const file = relative(root, absolute);
     const read = readTextFile(absolute, file);
-    if ('skipped' in read) {
-      skipped.push(read.skipped);
+    if ('failure' in read) {
+      failures.push(read.failure);
       continue;
     }
     filesScanned += 1;
@@ -1741,7 +2065,7 @@ export function scanStructuredText(root = DEFAULT_ROOT, policy, options = {}) {
     }
   }
 
-  return { findings: collector.findings, filesScanned, skipped, notes };
+  return { findings: collector.findings, filesScanned, failures, notes };
 }
 
 /**
@@ -1836,10 +2160,13 @@ function isServiceModule(relPath) {
  * members in service modules. Parameters and type members are not read: their names are mostly
  * generic and would fill the policy with words the product legitimately uses.
  *
+ * A corpus file the harvest cannot read is a scan failure, not a gap to work around: the policy is
+ * defined as what this harvest yields, so a partial harvest would rewrite the gate.
+ *
  * @param {{ Project: any, Node: any, SyntaxKind: any }} tsMorph
  * @param {string} root
  * @param {string} tree Repository-relative tree to harvest.
- * @returns {{ identifiers: Set<string>, routePaths: Set<string>, files: number }}
+ * @returns {{ identifiers: Set<string>, routePaths: Set<string>, files: number, failures: ScanFailure[] }}
  */
 function harvestTree(tsMorph, root, tree) {
   const { Node } = tsMorph;
@@ -1847,23 +2174,52 @@ function harvestTree(tsMorph, root, tree) {
   const identifiers = new Set();
   /** @type {Set<string>} */
   const routePaths = new Set();
+  /** @type {ScanFailure[]} */
+  const failures = [];
   const absoluteTree = path.join(root, tree);
-  if (!isDirectory(absoluteTree)) {
-    return { identifiers, routePaths, files: 0 };
+  const classified = classifyDirectory(root, absoluteTree);
+  if (classified.state === 'absent') {
+    return { identifiers, routePaths, files: 0, failures };
+  }
+  if (classified.state === 'failed') {
+    return { identifiers, routePaths, files: 0, failures: [classified.failure] };
   }
 
   const project = createSyntaxProject(tsMorph);
-  const files = walkFiles(absoluteTree, isCorpusSourceFile, SKIPPED_CORPUS_DIRECTORIES, root);
+  const walked = walkFiles(absoluteTree, isCorpusSourceFile, SKIPPED_CORPUS_DIRECTORIES, root);
+  failures.push(...walked.failures);
   let parsed = 0;
 
-  for (const absolute of files) {
+  for (const absolute of walked.files) {
     const file = relative(root, absolute);
     const read = readTextFile(absolute, file);
-    if ('skipped' in read) {
+    if ('failure' in read) {
+      failures.push(read.failure);
       continue;
     }
     const sourceFile = addSourceText(project, file, read.text);
     if (sourceFile === null) {
+      failures.push(
+        unparseableFailure(
+          file,
+          read.text,
+          [],
+          'none of the vocabulary it declares reached the regenerated policy',
+        ),
+      );
+      continue;
+    }
+    const syntaxErrors = syntaxErrorsOf(tsMorph, project, sourceFile);
+    if (syntaxErrors.length > 0) {
+      project.removeSourceFile(sourceFile);
+      failures.push(
+        unparseableFailure(
+          file,
+          read.text,
+          syntaxErrors,
+          'the vocabulary declared in the unparsed region is missing from the regenerated policy',
+        ),
+      );
       continue;
     }
     parsed += 1;
@@ -1928,7 +2284,7 @@ function harvestTree(tsMorph, root, tree) {
     project.removeSourceFile(sourceFile);
   }
 
-  return { identifiers, routePaths, files: parsed };
+  return { identifiers, routePaths, files: parsed, failures };
 }
 
 /**
@@ -1962,14 +2318,18 @@ function normalizeRoutePath(value) {
  *
  * @param {string} root
  * @param {string} tree Repository-relative corpus tree.
- * @returns {Set<string>}
+ * @returns {{ routePaths: Set<string>, failures: ScanFailure[] }}
  */
 function harvestRouteHandlerPaths(root, tree) {
   /** @type {Set<string>} */
   const routePaths = new Set();
   const apiDirectory = path.join(root, tree, 'app', 'api');
-  if (!isDirectory(apiDirectory)) {
-    return routePaths;
+  const classified = classifyDirectory(root, apiDirectory);
+  if (classified.state === 'absent') {
+    return { routePaths, failures: [] };
+  }
+  if (classified.state === 'failed') {
+    return { routePaths, failures: [classified.failure] };
   }
   const handlers = walkFiles(
     apiDirectory,
@@ -1978,7 +2338,7 @@ function harvestRouteHandlerPaths(root, tree) {
     root,
   );
   const prefix = `${toPosix(path.join(tree, 'app'))}/`;
-  for (const absolute of handlers) {
+  for (const absolute of handlers.files) {
     const relPath = relative(root, absolute);
     const withoutPrefix = relPath.slice(prefix.length);
     const segments = withoutPrefix
@@ -1991,7 +2351,7 @@ function harvestRouteHandlerPaths(root, tree) {
     }
     routePaths.add(`/${segments.join('/')}`);
   }
-  return routePaths;
+  return { routePaths, failures: handlers.failures };
 }
 
 /**
@@ -2000,19 +2360,21 @@ function harvestRouteHandlerPaths(root, tree) {
  *
  * @param {string} root
  * @param {string} tree Repository-relative corpus tree.
- * @returns {{ identifiers: Set<string>, present: boolean }}
+ * @returns {{ identifiers: Set<string>, present: boolean, failures: ScanFailure[] }}
  */
 function harvestPrismaSchema(root, tree) {
   /** @type {Set<string>} */
   const identifiers = new Set();
   const relPath = `${tree}/prisma/schema.prisma`;
   const absolute = path.join(root, relPath);
-  if (!isFile(absolute)) {
-    return { identifiers, present: false };
+  const entry = statEntry(absolute);
+  if ('missing' in entry) {
+    return { identifiers, present: false, failures: [] };
   }
   const read = readTextFile(absolute, relPath);
-  if ('skipped' in read) {
-    return { identifiers, present: false };
+  if ('failure' in read) {
+    // A schema that is there but unreadable is not "no database vocabulary": it is a hole.
+    return { identifiers, present: true, failures: [read.failure] };
   }
   let inBlock = false;
   for (const rawLine of read.text.split('\n')) {
@@ -2045,7 +2407,7 @@ function harvestPrismaSchema(root, tree) {
       identifiers.add(/** @type {string} */ (enumValue[1]));
     }
   }
-  return { identifiers, present: true };
+  return { identifiers, present: true, failures: [] };
 }
 
 /**
@@ -2068,14 +2430,13 @@ function sortedUnique(values) {
  *   3. minus every entry of the hand-reviewed allowlist.
  *
  * The product trees are never enumerated here, so an identifier that has leaked into the product
- * cannot bless itself by being there. The corpus state is returned alongside the policy so callers
- * can tell a faithful regeneration from one computed over a half-written corpus.
+ * cannot bless itself by being there. The corpus state and every corpus file the harvest could not
+ * read are returned alongside the policy: a caller must not compare against, or write, a policy
+ * computed over a tree it only partly managed to read.
  *
  * @param {string} [root] Absolute repository root.
- * @param {{ allowlist?: Allowlist|null, committed?: Policy|null }} [options] `committed` is the
- *   policy the corpus is judged against by {@link classifyCorpus}; it is read from `root` when
- *   omitted, and its absence simply means there is nothing to judge coverage against.
- * @returns {Promise<Policy & { corpusState: CorpusState }>}
+ * @param {{ allowlist?: Allowlist|null }} [options]
+ * @returns {Promise<Policy & { corpusState: CorpusState, corpusFailures: ScanFailure[] }>}
  */
 export async function buildPolicy(root = DEFAULT_ROOT, options = {}) {
   const tsMorph = await loadTsMorph(root);
@@ -2085,10 +2446,8 @@ export async function buildPolicy(root = DEFAULT_ROOT, options = {}) {
   const prisma = harvestPrismaSchema(root, DEMO_TREE);
   const handlerRoutes = harvestRouteHandlerPaths(root, DEMO_TREE);
   const fixture = harvestTree(tsMorph, root, FIXTURE_TREE);
-  const fixtureRoutes = new Set([
-    ...fixture.routePaths,
-    ...harvestRouteHandlerPaths(root, FIXTURE_TREE),
-  ]);
+  const fixtureHandlerRoutes = harvestRouteHandlerPaths(root, FIXTURE_TREE);
+  const fixtureRoutes = new Set([...fixture.routePaths, ...fixtureHandlerRoutes.routePaths]);
 
   const allowedIdentifiers = new Set(allowlist?.identifiers ?? []);
   const allowedRoutes = new Set(allowlist?.routePaths ?? []);
@@ -2102,24 +2461,10 @@ export async function buildPolicy(root = DEFAULT_ROOT, options = {}) {
     ),
   );
   const routePaths = sortedUnique(
-    [...demo.routePaths, ...handlerRoutes].filter(
+    [...demo.routePaths, ...handlerRoutes.routePaths].filter(
       (route) => !fixtureRoutes.has(route) && !allowedRoutes.has(route),
     ),
   );
-
-  /** @type {Policy|null} */
-  let committed;
-  if (options.committed !== undefined) {
-    committed = options.committed;
-  } else {
-    // A missing or malformed committed policy is not an error while harvesting: there is simply
-    // nothing to measure the corpus against.
-    try {
-      committed = loadPolicySync(root);
-    } catch {
-      committed = null;
-    }
-  }
 
   return {
     version: 1,
@@ -2128,48 +2473,55 @@ export async function buildPolicy(root = DEFAULT_ROOT, options = {}) {
     exclusions: [FIXTURE_TREE, ALLOWLIST_FILE],
     identifiers,
     routePaths,
-    corpusState: classifyCorpus(
-      root,
-      { demoFiles: demo.files, fixtureFiles: fixture.files, prismaPresent: prisma.present },
-      { identifiers, routePaths },
-      committed,
-    ),
+    corpusState: classifyCorpus(root, {
+      demoFiles: demo.files,
+      fixtureFiles: fixture.files,
+      prismaPresent: prisma.present,
+    }),
+    corpusFailures: [
+      ...demo.failures,
+      ...prisma.failures,
+      ...handlerRoutes.failures,
+      ...fixture.failures,
+      ...fixtureHandlerRoutes.failures,
+    ],
   };
 }
 
 /**
- * Classify how complete the corpus behind the policy is, which decides whether a difference
- * between the committed policy and a fresh harvest is drift worth failing the gate for.
+ * Decide whether the committed policy can be compared against a fresh harvest at all, which is one
+ * question: is the demo corpus in this checkout?
  *
- * Three states:
- *   `absent`        `apps/demo-app` is not in this checkout. No comparison is possible; the policy
- *                   is still enforced against product source.
- *   `materializing` the demo is present but does not yet account for the committed policy: either
- *                   it holds no source files at all, or a fresh harvest reproduces less than
- *                   {@link CORPUS_COVERAGE_THRESHOLD} of the committed entries, which means the
- *                   code that declares them has not landed. The comparison is computed and printed
- *                   in full, but a difference is absence rather than drift, so it is not enforced
- *                   and `--update` becomes monotone (it adds, never removes).
- *   `ready`         the harvest accounts for the committed policy, so any difference is real drift:
- *                   it is reported as `policy-stale` and fails the gate.
+ * Two states:
+ *   `absent` `apps/demo-app` is not here -- a partial clone or an early build. No comparison is
+ *            possible, the run says so, and the committed policy is still enforced against product
+ *            source.
+ *   `ready`  it is here. The corpus *defines* the policy (policy = demo harvest minus fixture
+ *            harvest minus allowlist), so every difference from a fresh harvest is drift: it is
+ *            reported as `policy-stale` and fails the gate, whether the policy lists names the
+ *            corpus no longer declares or misses names it does.
  *
- * Coverage rather than a list of required files is the test, because it is the property that
- * actually matters -- whether this corpus could have produced this policy -- and because a
- * legitimate corpus need not contain every optional input (a demo with no database has no Prisma
- * schema to harvest). Structural observations are still reported, as they explain a low coverage.
+ * There is deliberately no third state and no coverage threshold. A partly written demo yields a
+ * smaller policy, not an exemption from having one that matches: a committed policy nobody can
+ * regenerate is a gate nobody can trust, and AAP 0.5.4 makes regeneration the only way the file is
+ * produced. The structural observations below are reported either way, because they explain what
+ * the harvest saw.
  *
  * @param {string} root
  * @param {{ demoFiles: number, fixtureFiles: number, prismaPresent: boolean }} harvest
- * @param {{ identifiers: string[], routePaths: string[] }} computed Fresh harvest.
- * @param {Policy|null} committed Committed policy, when one could be read.
  * @returns {CorpusState}
  */
-function classifyCorpus(root, harvest, computed, committed) {
+function classifyCorpus(root, harvest) {
   if (!isDirectory(path.join(root, DEMO_TREE))) {
     return { state: 'absent', reason: `${DEMO_TREE} is not present in this checkout` };
   }
   /** @type {string[]} */
   const observations = [`${harvest.demoFiles} demo source files harvested`];
+  if (harvest.demoFiles === 0) {
+    observations.push(
+      `${DEMO_TREE} is present but holds no source files, so a fresh harvest reproduces nothing the committed policy lists`,
+    );
+  }
   if (!harvest.prismaPresent) {
     observations.push(`no ${DEMO_TREE}/prisma/schema.prisma, so no database vocabulary`);
   }
@@ -2178,32 +2530,7 @@ function classifyCorpus(root, harvest, computed, committed) {
   } else {
     observations.push(`${harvest.fixtureFiles} fixture source files subtracted`);
   }
-
-  if (harvest.demoFiles === 0) {
-    return {
-      state: 'materializing',
-      reason: `${DEMO_TREE} contains no source files (${observations.join('; ')})`,
-    };
-  }
-
-  const committedEntries = [...(committed?.identifiers ?? []), ...(committed?.routePaths ?? [])];
-  if (committedEntries.length === 0) {
-    return { state: 'ready', reason: observations.join('; ') };
-  }
-  const computedEntries = new Set([...computed.identifiers, ...computed.routePaths]);
-  const reproduced = committedEntries.filter((entry) => computedEntries.has(entry)).length;
-  const coverage = reproduced / committedEntries.length;
-  const percentage = Math.round(coverage * 100);
-  if (coverage < CORPUS_COVERAGE_THRESHOLD) {
-    return {
-      state: 'materializing',
-      reason: `the harvest reproduces ${reproduced} of ${committedEntries.length} committed entries (${percentage}%), below the ${Math.round(CORPUS_COVERAGE_THRESHOLD * 100)}% the corpus needs to account for the policy; ${observations.join('; ')}`,
-    };
-  }
-  return {
-    state: 'ready',
-    reason: `the harvest reproduces ${reproduced} of ${committedEntries.length} committed entries (${percentage}%); ${observations.join('; ')}`,
-  };
+  return { state: 'ready', reason: observations.join('; ') };
 }
 
 /**
@@ -2221,7 +2548,10 @@ function difference(left, right) {
  *
  * `added` is what regeneration would add: names the corpus has and the policy lacks, which means
  * the gate is currently weaker than the demo it guards. `removed` is what regeneration would drop:
- * the gate is stricter than necessary, which is safe but out of date.
+ * the gate is stricter than necessary, which is safe but out of date. Either way the policy is not
+ * what `--update` produces, so either way it is stale and `enforced` is true -- the corpus being
+ * present is the only condition, and a caller that got here with an `absent` corpus should not have
+ * compared at all.
  *
  * @param {Policy} committed
  * @param {Policy} computed
@@ -2282,9 +2612,12 @@ export function serializePolicy(policy) {
  * Regenerate the policy and write it. This is the only code path in the script that writes, and
  * `scripts/no-hardcoding.policy.json` is the only file it touches.
  *
- * Regeneration is refused when the demo corpus yields no source file at all: writing an empty
- * policy would disarm the gate without anyone noticing, which is the one failure mode this file
- * exists to prevent.
+ * What it writes is exactly what the corpus yields -- nothing is carried over from the file being
+ * replaced. Regeneration is refused in two cases, both of which would leave a policy nobody can
+ * reproduce: when the demo corpus yields no vocabulary at all (writing an empty policy would disarm
+ * the gate without anyone noticing, the one failure mode this file exists to prevent), and when any
+ * corpus file could not be read (the harvest is then missing vocabulary it cannot know about, so
+ * writing it would silently widen the gate).
  *
  * @param {string} [root] Absolute repository root.
  * @param {{ allowlist?: Allowlist|null, write?: boolean }} [options] `write: false` computes the
@@ -2294,9 +2627,8 @@ export function serializePolicy(policy) {
 export async function updatePolicy(root = DEFAULT_ROOT, options = {}) {
   const allowlist = options.allowlist === undefined ? loadAllowlist(root) : options.allowlist;
 
-  // The previous policy is needed for the diff summary, for coverage classification and for the
-  // monotone merge below. A missing or malformed one is not an error here: regenerating is exactly
-  // how a developer recovers from it.
+  // The previous policy is needed for the diff summary only. A missing or malformed one is not an
+  // error here: regenerating is exactly how a developer recovers from it.
   /** @type {Policy|null} */
   let committed;
   try {
@@ -2305,12 +2637,19 @@ export async function updatePolicy(root = DEFAULT_ROOT, options = {}) {
     committed = null;
   }
 
-  const computed = await buildPolicy(root, { allowlist, committed });
-  const { corpusState, ...harvested } = computed;
+  const computed = await buildPolicy(root, { allowlist });
+  const { corpusState, corpusFailures, ...policy } = computed;
+
+  if (corpusFailures.length > 0) {
+    throw new HardcodingCheckError(
+      'corpus-unreadable',
+      `refusing to regenerate ${POLICY_FILE}: the harvest could not read ${pluralize(corpusFailures.length, 'corpus path')} (${describeFailures(corpusFailures)}). A policy computed over part of the corpus would silently widen the gate.`,
+    );
+  }
 
   if (
     corpusState.state === 'absent' ||
-    harvested.identifiers.length + harvested.routePaths.length === 0
+    policy.identifiers.length + policy.routePaths.length === 0
   ) {
     throw new HardcodingCheckError(
       'corpus-empty',
@@ -2320,32 +2659,6 @@ export async function updatePolicy(root = DEFAULT_ROOT, options = {}) {
 
   /** @type {string[]} */
   const notes = [`corpus ${corpusState.state}: ${corpusState.reason}`];
-
-  // While the corpus is still materializing, regeneration is monotone: an entry the incomplete
-  // corpus cannot see is not evidence that it left the demo application, and dropping it would
-  // widen the gate for a file that simply has not landed. Allowlisted entries are still subtracted,
-  // because that subtraction is a review decision rather than an observation about the corpus.
-  // Once the corpus accounts for the policy, regeneration writes exactly what it harvested.
-  /** @type {Policy} */
-  let policy = harvested;
-  if (corpusState.state === 'materializing' && committed !== null) {
-    const allowedIdentifiers = new Set(allowlist?.identifiers ?? []);
-    const allowedRoutes = new Set(allowlist?.routePaths ?? []);
-    policy = {
-      ...harvested,
-      identifiers: sortedUnique([
-        ...committed.identifiers.filter((entry) => !allowedIdentifiers.has(entry)),
-        ...harvested.identifiers,
-      ]),
-      routePaths: sortedUnique([
-        ...committed.routePaths.filter((entry) => !allowedRoutes.has(entry)),
-        ...harvested.routePaths,
-      ]),
-    };
-    notes.push(
-      'the corpus does not yet account for the committed policy, so this regeneration only adds entries; re-run it once the demo application is complete to drop any that have really gone',
-    );
-  }
 
   const previous = committed ?? {
     version: 1,
@@ -2403,7 +2716,52 @@ function byLocation(left, right) {
 }
 
 /**
+ * Order scan failures the way findings are ordered, and drop the duplicates the two passes produce
+ * when they classify or walk the same product tree.
+ *
+ * @param {readonly ScanFailure[]} failures
+ * @returns {ScanFailure[]}
+ */
+function normalizeFailures(failures) {
+  /** @type {Map<string, ScanFailure>} */
+  const unique = new Map();
+  for (const failure of failures) {
+    const key = `${failure.path}\u0000${failure.reason}`;
+    if (!unique.has(key)) {
+      unique.set(key, failure);
+    }
+  }
+  return [...unique.values()].sort((left, right) =>
+    left.path === right.path
+      ? left.reason < right.reason
+        ? -1
+        : left.reason > right.reason
+          ? 1
+          : 0
+      : left.path < right.path
+        ? -1
+        : 1,
+  );
+}
+
+/**
+ * @param {readonly ScanFailure[]} failures
+ * @param {number} [limit]
+ * @returns {string} `path (reason)` for each failure, for a one-line message.
+ */
+function describeFailures(failures, limit = 6) {
+  const shown = failures
+    .slice(0, limit)
+    .map((failure) => `${failure.path} (${failure.reason})`)
+    .join(', ');
+  return failures.length > limit ? `${shown}, … (${failures.length} total)` : shown;
+}
+
+/**
  * Run the whole gate: both scans, then the policy staleness comparison.
+ *
+ * The result's exit code is {@link EXIT_ERROR} whenever anything went unexamined, even if no
+ * violation was found and even if the policy is in step: an incomplete scan is not a verdict.
  *
  * @param {string} [root] Absolute repository root.
  * @param {{ policy?: Policy, allowlist?: Allowlist|null, stale?: boolean }} [options] `stale: false`
@@ -2431,18 +2789,38 @@ export async function check(root = DEFAULT_ROOT, options = {}) {
   const findings = [...source.findings, ...structured.findings];
   notes.push(...source.notes, ...structured.notes);
 
+  /** @type {ScanFailure[]} */
+  const failures = [...source.failures, ...structured.failures];
+
+  // An absent tree is benign, but a run in which *nothing* was scanned has no subject at all: it
+  // would report "0 violations" over an empty set and satisfy the gate by inspecting nothing.
+  if (source.filesScanned + structured.filesScanned === 0) {
+    failures.push({
+      path: '.',
+      reason: 'no-subject',
+      detail: `no product source or structured text was found to scan under ${PRODUCT_TREES.join(', ')}; a clean result over nothing is not evidence, so check the repository root passed to this gate`,
+    });
+  }
+
   /** @type {StaleReport|null} */
   let stale = null;
   if (options.stale !== false) {
-    const computed = await buildPolicy(absoluteRoot, { allowlist, committed: policy });
-    const { corpusState, ...computedPolicy } = computed;
+    const computed = await buildPolicy(absoluteRoot, { allowlist });
+    const { corpusState, corpusFailures, ...computedPolicy } = computed;
+    failures.push(...corpusFailures);
     if (corpusState.state === 'absent') {
       notes.push(
         `policy staleness not compared: ${corpusState.reason}; the policy is still enforced against product source`,
       );
+    } else if (corpusFailures.length > 0) {
+      // A harvest that read only part of the corpus cannot say whether the policy matches it, and
+      // guessing either way is worse than reporting the hole.
+      notes.push(
+        `policy staleness not compared: the harvest could not read ${pluralize(corpusFailures.length, 'corpus path')} (${describeFailures(corpusFailures)}); the policy is still enforced against product source`,
+      );
     } else {
       stale = comparePolicies(policy, computedPolicy, corpusState);
-      if (stale.enforced && stale.drifted) {
+      if (stale.drifted) {
         findings.push({
           rule: 'policy-stale',
           file: POLICY_FILE,
@@ -2451,26 +2829,24 @@ export async function check(root = DEFAULT_ROOT, options = {}) {
           message: `the committed policy is not what \`${PNPM_UPDATE_COMMAND}\` would produce from ${DEMO_TREE}`,
           hint: RULE_HINTS['policy-stale'],
         });
-      } else if (stale.drifted) {
-        notes.push(
-          `policy staleness reported but not enforced: corpus ${corpusState.state} (${corpusState.reason})`,
-        );
       }
     }
   }
 
   findings.sort(byLocation);
-  const ok = findings.length === 0;
+  const normalizedFailures = normalizeFailures(failures);
+  const ok = findings.length === 0 && normalizedFailures.length === 0;
   return {
     ok,
-    exitCode: ok ? EXIT_OK : EXIT_FINDINGS,
+    exitCode:
+      normalizedFailures.length > 0 ? EXIT_ERROR : findings.length > 0 ? EXIT_FINDINGS : EXIT_OK,
     root: absoluteRoot,
     findings,
     stale,
     filesScanned: source.filesScanned + structured.filesScanned,
     sourceFilesScanned: source.filesScanned,
     structuredFilesScanned: structured.filesScanned,
-    skipped: [...source.skipped, ...structured.skipped],
+    failures: normalizedFailures,
     notes,
   };
 }
@@ -2503,8 +2879,9 @@ function preview(entries, limit = 12) {
 }
 
 /**
- * Human-readable report. Findings come first, one `path:line:col: rule: message` line each with an
- * indented remediation hint, then the drift summary, then the informational notes and the tally.
+ * Human-readable report. Scan failures come first, because they say the verdict below them is
+ * incomplete; then the findings, one `path:line:col: rule: message` line each with an indented
+ * remediation hint; then the drift summary, the informational notes and the tally.
  *
  * @param {CheckResult} result
  * @returns {string}
@@ -2512,6 +2889,15 @@ function preview(entries, limit = 12) {
 export function renderReport(result) {
   /** @type {string[]} */
   const lines = [];
+  if (result.failures.length > 0) {
+    lines.push(
+      `${LOG_PREFIX}: the scan could not examine ${pluralize(result.failures.length, 'path')}, so this run proves nothing:`,
+    );
+    for (const failure of result.failures) {
+      lines.push(`    ${failure.path}: ${failure.reason}: ${failure.detail}`);
+    }
+    lines.push('');
+  }
   for (const finding of result.findings) {
     lines.push(
       `${finding.file}:${finding.line}:${finding.column}: ${finding.rule}: ${finding.message}`,
@@ -2527,9 +2913,7 @@ export function renderReport(result) {
   const stale = result.stale;
   if (stale !== null && stale.drifted) {
     lines.push('');
-    lines.push(
-      `${LOG_PREFIX}: policy drift against ${DEMO_TREE} (${stale.enforced ? 'enforced' : 'reported only'}):`,
-    );
+    lines.push(`${LOG_PREFIX}: policy drift against ${DEMO_TREE} (enforced):`);
     if (stale.fields.length > 0) {
       lines.push(`    metadata fields differ: ${stale.fields.join(', ')}`);
     }
@@ -2549,11 +2933,8 @@ export function renderReport(result) {
   if (result.stale !== null) {
     lines.push(`${LOG_PREFIX}: corpus ${result.stale.corpus.state}: ${result.stale.corpus.reason}`);
   }
-  for (const skip of result.skipped) {
-    lines.push(`${LOG_PREFIX}: skipped ${skip.file} (${skip.reason})`);
-  }
   lines.push(
-    `${LOG_PREFIX}: ${pluralize(result.filesScanned, 'file')} scanned (${result.sourceFilesScanned} source, ${result.structuredFilesScanned} structured), ${pluralize(result.findings.length, 'violation')}`,
+    `${LOG_PREFIX}: ${pluralize(result.filesScanned, 'file')} scanned (${result.sourceFilesScanned} source, ${result.structuredFilesScanned} structured), ${pluralize(result.findings.length, 'violation')}, ${pluralize(result.failures.length, 'unexaminable path')}`,
   );
   return `${lines.join('\n')}\n`;
 }
@@ -2609,9 +2990,10 @@ function helpText() {
     '  --help     Print this text and exit 0.',
     '',
     'Exit codes',
-    '  0  no violations, and the committed policy matches the corpus',
+    '  0  no violations, the committed policy matches the corpus, and the whole tree was examined',
     '  1  at least one violation, or the committed policy is stale',
-    '  2  the check could not run (ts-morph missing, malformed policy or allowlist, bad usage)',
+    '  2  the check could not run or could not finish: ts-morph missing, malformed policy or',
+    '     allowlist, bad usage, or a path the scan could not read, parse or decode as text',
     '',
     'Violation classes and rule ids',
     '  A. references into the demo application',
@@ -2630,7 +3012,16 @@ function helpText() {
     '                             expression tested against it, an equality comparison with a',
     '                             string literal, or a switch over it with string cases',
     '  and, independent of any file',
-    '     policy-stale            the committed policy is not what --update would produce',
+    '     policy-stale            the committed policy is not what --update would produce, which is',
+    `                             enforced whenever ${DEMO_TREE} is in the checkout and compared not`,
+    '                             at all when it is absent',
+    '',
+    'The scan fails closed',
+    '  A directory that cannot be listed, a file that cannot be read, parsed or decoded as text, a',
+    '  file above the size this scan reads whole, a symbolic link that would otherwise have been',
+    '  scanned, and a run that found nothing to scan at all stop the gate with exit code 2. Nothing',
+    '  is skipped: a tree that went unexamined is reported as such rather than counted as clean. An',
+    '  absent tree is the one benign case and is reported as an informational line.',
     '',
     'Scanned as source (AST)',
     ...PRODUCT_TREES.map((tree) => `  ${tree}`),

@@ -80,6 +80,7 @@ import {
   scanContent,
   scanContentWithSuppressions,
   scanPath,
+  scanRepository,
   shannonEntropy,
 } from './check-secrets.mjs';
 
@@ -451,6 +452,219 @@ const ENTROPY_FIXTURES = [
   },
 ];
 
+/**
+ * The punctuation a generated password draws on beyond letters and digits. Written out because
+ * these ten characters are the point: none of them belongs to the dense-run alphabet the rule's
+ * second candidate source uses, so a value containing them is only measurable when the rule reads
+ * the complete assigned value.
+ */
+const PUNCTUATION_CHARS = '!@#$%^&*()';
+
+/**
+ * The punctuated alphabet: 34 symbols, a third of them punctuation. The ordering keeps `(` and `)`
+ * adjacent and inside the first pass of {@link cycle}, so the generated value's brackets balance -
+ * the rule treats an unquoted run with unbalanced brackets as a fragment of a larger expression,
+ * and this fixture is testing punctuation rather than that exclusion.
+ */
+const PUNCTUATED_CHARS = assemble(
+  UPPER_LETTERS.slice(0, 8),
+  DIGITS.slice(0, 8),
+  PUNCTUATION_CHARS,
+  LOWER_LETTERS.slice(0, 8),
+);
+
+/**
+ * The punctuation-heavy value the complete-value cases measure: 36 characters at log2(34) = 5.06
+ * bits per character, so it clears both halves of the threshold, while its longest run of
+ * dense-alphabet characters is only 16 - shorter than {@link ENTROPY_MIN_LENGTH}, which is exactly
+ * why a candidate pattern restricted to that alphabet could not see it at all.
+ */
+const PUNCTUATED_VALUE = cycle(PUNCTUATED_CHARS, 36);
+
+/**
+ * The runs of {@link PUNCTUATED_VALUE} that the dense-run alphabet (`[A-Za-z0-9+/_.~-]`) can see,
+ * which the suite asserts are each too short to be measured on their own.
+ *
+ * @type {readonly string[]}
+ */
+const PUNCTUATED_DENSE_RUNS = PUNCTUATED_VALUE.split(/[^A-Za-z0-9+/_.~-]+/).filter(
+  (run) => run !== '',
+);
+
+/**
+ * The same four name forms as {@link ENTROPY_FIXTURES} - an environment file, YAML, JSON and a
+ * code assignment - carrying the punctuated value instead of the dense one. The JSON and code
+ * forms quote it, which is the case the rule can only get right by reading the quoted string in
+ * full.
+ *
+ * @type {readonly { label: string, line: string, pattern: string }[]}
+ */
+const PUNCTUATED_ENTROPY_FIXTURES = [
+  {
+    label: 'an environment-file assignment',
+    line: `password=${PUNCTUATED_VALUE}`,
+    pattern: 'password',
+  },
+  {
+    label: 'a YAML mapping entry',
+    line: `  password: ${PUNCTUATED_VALUE}`,
+    pattern: 'password',
+  },
+  {
+    label: 'a quoted JSON property',
+    line: `  "clientSecret": "${PUNCTUATED_VALUE}",`,
+    pattern: 'clientSecret',
+  },
+  {
+    label: 'a spaced code assignment',
+    line: `password = "${PUNCTUATED_VALUE}"`,
+    pattern: 'password',
+  },
+];
+
+/**
+ * Lines whose value is code rather than committed key material. Each `value` is what the rule
+ * extracts from `line`, and each is long enough and dense enough to clear both halves of the
+ * threshold - which is what makes these cases a test of the exclusion rather than of the
+ * thresholds. Every one is modelled on a shape this repository's own tracked source contains, and
+ * none of them is visible to the dense-run alphabet, so what keeps them quiet is the exclusion
+ * under test.
+ *
+ * @type {readonly { label: string, line: string, value: string }[]}
+ */
+const EXPRESSION_VALUE_FIXTURES = (() => {
+  const callExpression = assemble('normalizeSqlStatement', '(', 'fixture.sql', ')');
+  const memberExpression = assemble(
+    'credentials',
+    '[',
+    cycle(UPPER_LETTERS, 12),
+    ']',
+    '.',
+    'secretValue',
+  );
+  const truncatedRun = assemble('readCredential', '(', cycle(URLSAFE_CHARS, 24));
+  const optionalChain = assemble('credential', '.tokenType', '?.', 'toLowerCase', '()');
+  const assertedChain = assemble('descriptors', '[', 'activeProfileName', ']', '!', '.secret');
+  const nestedCall = assemble(
+    'this',
+    '.generateAccountKey',
+    '(',
+    'CredentialUtilities.getAccountInfo',
+    '(',
+    'account',
+    ')',
+    ')',
+  );
+  return [
+    {
+      label: 'a call expression that computes the value',
+      line: `const key = ${callExpression};`,
+      value: callExpression,
+    },
+    {
+      label: 'a member expression that reads the value from a lookup',
+      line: `const key = ${memberExpression};`,
+      value: memberExpression,
+    },
+    {
+      // The run stops at the comma, so what the rule sees is a fragment of the call rather than a
+      // value: its opening bracket never closes.
+      label: 'a run cut out of a larger expression, so its brackets do not balance',
+      line: `const key = ${truncatedRun}, fallbackProfile);`,
+      value: truncatedRun,
+    },
+    {
+      // Optional chaining is how TypeScript reads a nullable credential, so this is the shape a
+      // real codebase produces most often: 17 lines of the @azure/msal-common package installed
+      // in this workspace are exactly this, each binding such a lookup to a key-like name.
+      label: 'an optionally chained lookup, the shape a nullable credential read takes',
+      line: `const key = ${optionalChain};`,
+      value: optionalChain,
+    },
+    {
+      label: 'an index lookup with a non-null assertion',
+      line: `const key = ${assertedChain};`,
+      value: assertedChain,
+    },
+    {
+      // A call whose argument is itself a call. No regular expression matches nested parentheses,
+      // so the groups are collapsed innermost-first before the expression test - and a codebase is
+      // full of these, which is why the collapse matters more than it looks.
+      label: 'a call nested inside another call',
+      line: `const key = ${nestedCall};`,
+      value: nestedCall,
+    },
+  ];
+})();
+
+/**
+ * Values a credential really takes that a boundary-guessing extraction truncates instead of
+ * measuring: one that begins with `/`, one carrying an escaped quote inside a quoted literal, one
+ * with colon-separated segments, one with an internal `=`, and base64 padding. Each is built from
+ * {@link PUNCTUATED_VALUE}'s alphabet, so each clears both halves of the threshold on its own, and
+ * each `value` is exactly what the rule must report - the whole of it, not the longest fragment
+ * between two delimiters.
+ *
+ * @type {readonly { label: string, file: string, line: string, value: string }[]}
+ */
+const COMPLETE_VALUE_FIXTURES = (() => {
+  const body = cycle(PUNCTUATED_CHARS, 34);
+  const slashLed = `/${body}`;
+  const escaped = `${body.slice(0, 20)}\\"${body.slice(21)}`;
+  const segmented = `v1:${body}:x9`;
+  const internalEquals = `${body}=zT7`;
+  const padded = `${cycle(BASE64_CHARS, 38)}==`;
+  return [
+    {
+      label: 'a quoted value that begins with a slash',
+      file: 'src/config.ts',
+      line: `const password = "${slashLed}";`,
+      value: slashLed,
+    },
+    {
+      label: 'a quoted value carrying an escaped quote',
+      file: 'src/config.ts',
+      line: `const password = "${escaped}";`,
+      value: escaped,
+    },
+    {
+      label: 'an unquoted value with colon-separated segments',
+      file: 'config/runtime.conf',
+      line: `password=${segmented}`,
+      value: segmented,
+    },
+    {
+      label: 'an unquoted value with an internal equals sign',
+      file: 'config/runtime.conf',
+      line: `password=${internalEquals}`,
+      value: internalEquals,
+    },
+    {
+      label: 'an unquoted base64 value with its padding',
+      file: 'config/runtime.conf',
+      line: `password=${padded}`,
+      value: padded,
+    },
+  ];
+})();
+
+/**
+ * The private-key regular expression a published secret scanner assigns to `PRIVATE_KEY_PATTERN`,
+ * cut where the rule's extraction cuts it: at the space before `KEY`. The fragment is 48
+ * characters at 4.47 bits per character, its brackets balance, and it is not a closed literal, so
+ * nothing but the leading `/` distinguishes it from a value - which is why the rule refuses a
+ * value that begins with one. Assembled from fragments, as everything in this file is, so the
+ * tracked line carries no contiguous key-file header.
+ */
+const PATTERN_VALUE_FRAGMENT = assemble(
+  '/',
+  '-{5}',
+  'BEGIN',
+  '\\s?(DSA|RSA|EC|PGP|OPENSSH)?',
+  '\\s?',
+  'PRIVATE',
+);
+
 /** A credentialed URI no allowlist entry covers: a different scheme, host and database entirely. */
 const FOREIGN_CONNECTION_STRING = assemble(
   'mysql',
@@ -780,6 +994,207 @@ describe('entropy', () => {
     // in the module under test: a false positive inside `pnpm verify` costs as much as a miss.
     expect(scanLine('src/build-info.ts', `const key = () => '${DENSE_VALUE}';`)).toEqual([]);
     expect(scanLine('src/build-info.ts', `if (token === '${DENSE_VALUE}') {`)).toEqual([]);
+  });
+
+  it('measures a punctuated fixture that clears both halves of the threshold', () => {
+    // Asserted rather than assumed, exactly as the dense fixture above is.
+    expect(PUNCTUATED_VALUE.length).toBeGreaterThanOrEqual(ENTROPY_MIN_LENGTH);
+    expect(shannonEntropy(PUNCTUATED_VALUE)).toBeGreaterThan(ENTROPY_MIN_BITS_PER_CHAR);
+    // A third of the value is punctuation, which is what the case is about.
+    expect([...PUNCTUATED_VALUE].some((character) => PUNCTUATION_CHARS.includes(character))).toBe(
+      true,
+    );
+  });
+
+  it.each(PUNCTUATED_ENTROPY_FIXTURES)(
+    'reports a punctuated value bound by $label',
+    ({ line, pattern }) => {
+      expect(isKeyLikeName(pattern)).toBe(true);
+      const finding = expectSingleFinding(scanLine('apps/local-service/src/config.ts', line), {
+        rule: 'entropy',
+        pattern,
+        file: 'apps/local-service/src/config.ts',
+        // The column is the first character of the value, not of the longest dense run inside it.
+        column: columnOf(line, PUNCTUATED_VALUE),
+      });
+      expect(finding.message).toContain(pattern);
+      expect(finding.message).toContain(String(PUNCTUATED_VALUE.length));
+      expectValueNeverPrinted(finding, PUNCTUATED_VALUE);
+    },
+  );
+
+  it('measures the complete value, not the longest dense run inside it', () => {
+    // Every run of dense-alphabet characters in the punctuated value is shorter than the minimum
+    // length, so a candidate pattern restricted to that alphabet cannot see this value at all.
+    expect(PUNCTUATED_DENSE_RUNS.length).toBeGreaterThan(1);
+    for (const run of PUNCTUATED_DENSE_RUNS) {
+      expect(run.length).toBeLessThan(ENTROPY_MIN_LENGTH);
+    }
+    const line = `password=${PUNCTUATED_VALUE}`;
+    const finding = expectSingleFinding(scanLine('apps/local-service/src/config.ts', line), {
+      rule: 'entropy',
+      pattern: 'password',
+      file: 'apps/local-service/src/config.ts',
+      column: columnOf(line, PUNCTUATED_VALUE),
+    });
+    // The reported extent is the whole value: its full length, and no dense sub-run's length.
+    expect(finding.preview).toContain(`${PUNCTUATED_VALUE.length} characters`);
+    for (const run of PUNCTUATED_DENSE_RUNS) {
+      expect(finding.preview).not.toContain(`${run.length} characters`);
+    }
+  });
+
+  it('does not flag an interpolated or command-substituted value', () => {
+    // What such a value holds is computed when the file runs, so the committed text is a template
+    // and not a literal. `scripts/check-no-hardcoding.mjs` builds a key this way.
+    const interpolation = assemble('$', '{');
+    const substitution = assemble('$', '(');
+    for (const value of [
+      `${interpolation}profile}${DENSE_VALUE}`,
+      `${substitution}read-credential)${DENSE_VALUE}`,
+    ]) {
+      expect(scanLine('src/config.ts', `const apiKey = "${value}";`)).toEqual([]);
+      expect(scanLine('.env.example', `API_KEY=${value}`)).toEqual([]);
+    }
+  });
+
+  it('does not flag a quoted URI, whose credentials are connection-string\u2019s business', () => {
+    // The unquoted form is pinned among the legitimate-content cases below; this is the quoted one,
+    // which only the complete-value pass can see in full.
+    const url = `https://assets.example.com/${DENSE_VALUE}`;
+    expect(url.length).toBeGreaterThanOrEqual(ENTROPY_MIN_LENGTH);
+    expect(scanLine('src/config.ts', `const apiKey = "${url}";`)).toEqual([]);
+  });
+
+  it.each(EXPRESSION_VALUE_FIXTURES)(
+    'does not flag $label, which is code rather than a committed value',
+    ({ line, value }) => {
+      // Both thresholds are cleared, so the exclusion under test is what keeps the line quiet -
+      // and the name is key-like, so the name binding is not doing the work either.
+      expect(value.length).toBeGreaterThanOrEqual(ENTROPY_MIN_LENGTH);
+      expect(shannonEntropy(value)).toBeGreaterThan(ENTROPY_MIN_BITS_PER_CHAR);
+      expect(isKeyLikeName('key')).toBe(true);
+      expect(scanLine('packages/telemetry/src/redaction/sql.test.ts', line)).toEqual([]);
+    },
+  );
+
+  it('does not flag a pattern, closed or cut short, which is not key material', () => {
+    // A closed literal and a fragment are both patterns, and both are refused for the one property
+    // they share: a value that begins with `/`. The fragment is the case that needs it - the
+    // extraction stops at the space before `KEY`, so its brackets balance and no anchored literal
+    // test recognises what is left.
+    expect(PATTERN_VALUE_FRAGMENT.length).toBeGreaterThanOrEqual(ENTROPY_MIN_LENGTH);
+    expect(shannonEntropy(PATTERN_VALUE_FRAGMENT)).toBeGreaterThan(ENTROPY_MIN_BITS_PER_CHAR);
+    expect(isKeyLikeName('PRIVATE_KEY_PATTERN')).toBe(true);
+    expect(
+      scanLine('src/rules.ts', `const PRIVATE_KEY_PATTERN = ${PATTERN_VALUE_FRAGMENT} KEY/gm;`),
+    ).toEqual([]);
+
+    const closedLiteral = assemble('/', '^[A-Za-z0-9_-]{24}', '\\.', '[A-Z]{4}$', '/gu');
+    expect(closedLiteral.length).toBeGreaterThanOrEqual(ENTROPY_MIN_LENGTH);
+    expect(shannonEntropy(closedLiteral)).toBeGreaterThan(ENTROPY_MIN_BITS_PER_CHAR);
+    expect(scanLine('src/rules.ts', `const keyPattern = ${closedLiteral};`)).toEqual([]);
+    // Quoted, it is still a pattern rather than a credential - and the quoted form is the one the
+    // slash rule does not cover, so this is the case that keeps the literal test load-bearing.
+    expect(scanLine('src/rules.ts', `const keyPattern = "${closedLiteral}";`)).toEqual([]);
+  });
+
+  it('does not flag a type annotation, whose value is a type and not a value', () => {
+    // A `:` assigns in YAML and JSON and annotates in TypeScript, and the annotation of a
+    // credential-carrying variable is exactly where a key-like name meets a long, mixed-case
+    // identifier: `<` and `>` therefore end an unquoted value, which leaves `ReadonlyArray` and
+    // not the whole 35-character annotation as the candidate.
+    const annotation = assemble('ReadonlyArray', '<', 'CredentialDescriptor', '>');
+    expect(annotation.length).toBeGreaterThanOrEqual(ENTROPY_MIN_LENGTH);
+    expect(shannonEntropy(annotation)).toBeGreaterThan(ENTROPY_MIN_BITS_PER_CHAR);
+    expect(isKeyLikeName('token')).toBe(true);
+    expect(scanLine('src/config.ts', `const token: ${annotation} = descriptors;`)).toEqual([]);
+    // Quoted, the angle brackets are part of the value again, so a password containing one is
+    // still measured in full.
+    const bracketed = assemble(PUNCTUATED_VALUE.slice(0, 20), '<', PUNCTUATED_VALUE.slice(21));
+    expect(bracketed.length).toBeGreaterThanOrEqual(ENTROPY_MIN_LENGTH);
+    const finding = expectSingleFinding(
+      scanLine('src/config.ts', `const password = "${bracketed}";`),
+      {
+        rule: 'entropy',
+        pattern: 'password',
+        file: 'src/config.ts',
+        column: columnOf(`const password = "${bracketed}";`, bracketed),
+      },
+    );
+    expect(finding.preview).toContain(`${bracketed.length} characters`);
+  });
+
+  it.each(COMPLETE_VALUE_FIXTURES)(
+    'measures $label, because the rule reads the whole value',
+    ({ file, line, value }) => {
+      expect(value.length).toBeGreaterThanOrEqual(ENTROPY_MIN_LENGTH);
+      expect(shannonEntropy(value)).toBeGreaterThan(ENTROPY_MIN_BITS_PER_CHAR);
+      const finding = expectSingleFinding(scanLine(file, line), {
+        rule: 'entropy',
+        pattern: 'password',
+        file,
+        column: columnOf(line, value),
+      });
+      // The reported extent is the value's own length, so nothing was cut at a quote, a colon, an
+      // equals sign or a size limit.
+      expect(finding.preview).toContain(`${value.length} characters`);
+      expectValueNeverPrinted(finding, value);
+    },
+  );
+
+  it('measures a value of any length, because the rule states a minimum and no maximum', () => {
+    // AAP 0.3.4 bounds the rule from below at 32 characters and not from above, so a value of
+    // kilobytes is measured rather than exempted. What keeps a long line affordable is the bounded
+    // name lookup, which the case below pins.
+    const long = cycle(PUNCTUATED_CHARS + URLSAFE_CHARS, 8193);
+    expect(long.length).toBeGreaterThan(8192);
+    const line = `const password = "${long}";`;
+    const finding = expectSingleFinding(scanLine('src/config.ts', line), {
+      rule: 'entropy',
+      pattern: 'password',
+      file: 'src/config.ts',
+      column: columnOf(line, long),
+    });
+    expect(finding.preview).toContain(`${long.length} characters`);
+  });
+
+  it('reads the name through a bounded window, which is what keeps a long line linear', () => {
+    // The name lookup only ever needs the tail of the line before the value, and reading the whole
+    // prefix at every assignment site is what made a long line quadratic. The window is why a name
+    // longer than it is reported truncated - deliberately, and pinned here so that restoring the
+    // unbounded lookup fails a test rather than a build's patience.
+    const longName = `${cycle(LOWER_LETTERS, 300)}_token`;
+    const line = `const ${longName} = "${DENSE_VALUE}";`;
+    const findings = scanLine('src/config.ts', line);
+    expect(findings).toHaveLength(1);
+    const [finding] = findings;
+    expect(finding.rule).toBe('entropy');
+    expect(finding.column).toBe(columnOf(line, DENSE_VALUE));
+    // The name is the tail of the identifier, not the whole of it, and it is still key-like -
+    // truncation cannot turn a credential-like name into a neutral one when the suffix is what
+    // makes it credential-like.
+    expect(finding.pattern.length).toBeLessThan(longName.length);
+    expect(longName.endsWith(finding.pattern)).toBe(true);
+    expect(isKeyLikeName(finding.pattern)).toBe(true);
+  });
+
+  it('does not flag prose, which is what a value with whitespace in it is', () => {
+    // Only a quoted value can contain whitespace, and an English sentence measures about 4 bits
+    // per character - right at the threshold. A documented example in a README would otherwise be
+    // a finding, while no issued credential contains a space.
+    const sentence = assemble(
+      'This has ',
+      "'single'",
+      ' and ',
+      '"double"',
+      ' quotes inside of it.',
+    );
+    expect(sentence.length).toBeGreaterThanOrEqual(ENTROPY_MIN_LENGTH);
+    expect(shannonEntropy(sentence)).toBeGreaterThan(ENTROPY_MIN_BITS_PER_CHAR);
+    expect(isKeyLikeName('BACKTICK_KEY')).toBe(true);
+    expect(scanLine('docs/environment.md', `BACKTICK_KEY=\`${sentence}\``)).toEqual([]);
+    expect(scanLine('src/config.ts', `const apiKey = "${sentence}";`)).toEqual([]);
   });
 });
 
@@ -1177,6 +1592,82 @@ describe('the command line', () => {
   );
 
   it.skipIf(!GIT_AVAILABLE)(
+    'exits 0 over a checkout carrying both required placeholders, on the committed allowlist',
+    async () => {
+      // The end-to-end half of AAP 0.3.4's negative requirement. The rule-level cases above prove
+      // `scanContent` exempts the two placeholders; this one drives the whole gate over a
+      // repository that really tracks the three files they live in, so a regression in default
+      // allowlist loading, in tracked-file enumeration or in repository-level suppression fails
+      // here instead of surviving until `pnpm check:secrets` runs in CI.
+      const directory = createThrowawayRepository();
+      trackFile(directory, '.env.example', ROOT_ENV_EXAMPLE_FIXTURE);
+      trackFile(directory, 'apps/demo-app/.env.example', DEMO_ENV_EXAMPLE_FIXTURE);
+      trackFile(
+        directory,
+        'docker-compose.yml',
+        [
+          '# PostgreSQL for the demo application.',
+          'services:',
+          '  postgres:',
+          '    image: postgres:18.6-alpine',
+          '    environment:',
+          `      ${DEV_COMPOSE_PASSWORD}`,
+          '',
+        ].join('\n'),
+      );
+
+      const { exitCode, stdout, stderr } = await runCli(['--json'], { cwd: directory });
+
+      expect(exitCode).toBe(EXIT_OK);
+      expect(stderr).toBe('');
+      const report = JSON.parse(stdout);
+      expect(report.ok).toBe(true);
+      expect(report.exitCode).toBe(EXIT_OK);
+      expect(report.findings).toEqual([]);
+      // All three files were enumerated and all three were read: the pass is not a scan that
+      // quietly skipped the files the placeholders are in.
+      expect(report.filesTracked).toBe(3);
+      expect(report.filesScanned).toBe(3);
+      // And the committed, reviewed allowlist is what granted it - not an empty default, and not
+      // an allowlist found inside the throwaway repository.
+      expect(report.allowlistPath).toBe(DEFAULT_ALLOWLIST_PATH);
+
+      // The exemptions are accounted for, one entry per suppressed match, each naming the file it
+      // was used in, the rule it suppressed and the reviewed literal that granted it.
+      expect(
+        report.allowlisted.map(
+          (/** @type {{ file: string, rule: string, allowlistValue: string }} */ entry) => ({
+            file: entry.file,
+            rule: entry.rule,
+            allowlistValue: entry.allowlistValue,
+          }),
+        ),
+      ).toEqual([
+        { file: '.env.example', rule: 'connection-string', allowlistValue: DEV_DATABASE_URL },
+        {
+          file: 'apps/demo-app/.env.example',
+          rule: 'connection-string',
+          allowlistValue: DEV_DATABASE_URL,
+        },
+      ]);
+      // The Compose placeholder needs no exemption at all: `debuggen` is eight characters, so no
+      // rule matches it and there is nothing to suppress. Its allowlist entry exists for the
+      // literal's sake, and the file is tracked and scanned either way - which is what the
+      // `filesScanned` count above states.
+      expect(
+        report.allowlisted.some(
+          (/** @type {{ file: string }} */ entry) => entry.file === 'docker-compose.yml',
+        ),
+      ).toBe(false);
+      // Neither example file is an `env-file` violation, which is the other half of why they pass.
+      for (const allowed of ALLOWED_ENV_FILES) {
+        expect(isEnvFileViolation(allowed)).toBe(false);
+      }
+    },
+    20_000,
+  );
+
+  it.skipIf(!GIT_AVAILABLE)(
     'exits 1 and names the file, line and rule when a tracked file carries a credential',
     async () => {
       const directory = createThrowawayRepository();
@@ -1274,15 +1765,46 @@ describe('the command line', () => {
   );
 
   it.skipIf(!GIT_AVAILABLE)(
-    'warns rather than passes quietly when git tracks nothing',
+    'exits 2, not 0, when git tracks nothing, because it would be passing over nothing',
     async () => {
+      // The failure mode a gate must not have: a green exit code that proves nothing about the
+      // repository. An empty tracked subject is a precondition failure, not a clean report.
       const directory = createThrowawayRepository();
 
-      const { exitCode, stdout } = await runCli([], { cwd: directory });
+      const { exitCode, stdout, stderr } = await runCli(['--json'], { cwd: directory });
 
-      expect(exitCode).toBe(EXIT_OK);
-      expect(stdout).toContain('git tracks no files here');
-      expect(stdout).toContain('0 findings');
+      expect(exitCode).toBe(EXIT_ERROR);
+      expect(exitCode).not.toBe(EXIT_OK);
+      // Distinguishable from a finding, so CI can tell "nothing to scan" from "found something".
+      expect(exitCode).not.toBe(EXIT_FINDINGS);
+      const failure = JSON.parse(stdout);
+      expect(failure.ok).toBe(false);
+      expect(failure.exitCode).toBe(EXIT_ERROR);
+      expect(failure.error.code).toBe('no-tracked-files');
+      expect(stderr).toContain('no-tracked-files');
+      // Actionable: it names the subject and the ways out of the state.
+      expect(stderr).toContain(realpathSync(directory));
+      expect(stderr).toContain('git add');
+      expect(stderr).toContain('sparse-checkout');
+
+      const text = await runCli([], { cwd: directory });
+      expect(text.exitCode).toBe(EXIT_ERROR);
+      // No report is printed, so nothing can be mistaken for a scan that happened.
+      expect(text.stdout).toBe('');
+      expect(text.stderr).toContain('git tracks no files in');
+    },
+    20_000,
+  );
+
+  it.skipIf(!GIT_AVAILABLE)(
+    'refuses to return a report over nothing to an in-process caller either',
+    () => {
+      // The precondition is enforced where enumeration happens, so a caller that skips the
+      // command line - `scanRepository` is exported - cannot get `ok: true` over an unscanned
+      // tree. Were this only a CLI check, the exported seam would still fail open.
+      const directory = createThrowawayRepository();
+
+      expectCheckSecretsError(() => scanRepository({ cwd: directory }), 'no-tracked-files');
     },
     20_000,
   );

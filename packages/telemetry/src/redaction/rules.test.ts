@@ -56,7 +56,9 @@ import {
   REDACTION_MASK,
   REDACTION_RULE_IDS,
   TRUNCATION_SUFFIX,
+  asScannableText,
   containsDenied,
+  cutAtCredentialBoundary,
   findDeniedRules,
   isHighEntropySecret,
   isSensitiveKeyName,
@@ -122,6 +124,21 @@ function cycle(alphabet: string, length: number): string {
     result += alphabet.charAt(index % alphabet.length);
   }
   return result;
+}
+
+/**
+ * A value of `length` characters drawn evenly from the first `symbolCount`
+ * symbols of the base64url alphabet.
+ *
+ * When `length` is a multiple of `symbolCount` every symbol appears the same
+ * number of times, so the value's Shannon entropy is exactly
+ * `log2(symbolCount)` bits per character. That is what lets the entropy cases
+ * below sit at a stated distance from the module's threshold — 17 symbols for
+ * 4.0875 bits, 16 for exactly 4, 15 for 3.9069 — instead of merely somewhere
+ * above or below it.
+ */
+function evenDistribution(symbolCount: number, length: number): string {
+  return cycle(URLSAFE_CHARS.slice(0, symbolCount), length);
 }
 
 /**
@@ -236,15 +253,52 @@ const PEM_BLOCK = [PEM_HEADER, cycle(URLSAFE_CHARS, 64), cycle(URLSAFE_CHARS, 48
 /** A truncated or streamed block: a header and key material, never closed. */
 const PEM_OPEN_BLOCK = [PEM_HEADER, cycle(URLSAFE_CHARS, 64), cycle(URLSAFE_CHARS, 40)].join('\n');
 
+/**
+ * Every PEM label the repository secret gate recognises, in its order.
+ *
+ * `scripts/check-secrets.mjs` enumerates exactly these six
+ * (`RSA`/`EC`/`DSA`/`OPENSSH` prefixed, the PGP key *block*, and the bare
+ * form), and the module under test is required to recognise the same
+ * vocabulary — by convention rather than by an import, since the dependency
+ * edge list (AAP §0.2.2) forbids the two enforcement points from depending on
+ * one another. The PGP spelling is the one that needs saying out loud: it ends
+ * in ` BLOCK`, so a pattern that demanded `PRIVATE KEY` immediately before the
+ * closing dashes would pass every other label and miss that one.
+ */
+const PEM_LABELS: readonly string[] = [
+  'RSA ' + PEM_TAIL,
+  'EC ' + PEM_TAIL,
+  'DSA ' + PEM_TAIL,
+  'OPENSSH ' + PEM_TAIL,
+  'PGP ' + PEM_TAIL + ' BLOCK',
+  PEM_TAIL,
+];
+
+/** The opening delimiter of a block carrying `label`. */
+function pemHeaderFor(label: string): string {
+  return assemble(PEM_DASHES, 'BEGIN ', label, PEM_DASHES);
+}
+
+/** The closing delimiter of a block carrying `label`. */
+function pemFooterFor(label: string): string {
+  return assemble(PEM_DASHES, 'END ', label, PEM_DASHES);
+}
+
 /** Scheme of the connection string fixture, kept separate from its userinfo. */
 const CONNECTION_SCHEME = assemble('postgres', 'ql', '://');
 
 /** Authority and database name, which must survive redaction. */
 const CONNECTION_AUTHORITY = '127.0.0.1:5432/demo_db';
 
+/**
+ * Userinfo of the connection string fixture: the only part of it that must
+ * not survive. Named separately so the bound cases below can probe for it
+ * without probing for the scheme, which is kept on purpose.
+ */
+const CONNECTION_USERINFO = 'demo_user' + ':' + cycle(LOWER_LETTERS, 12);
+
 /** A credentialed connection string: scheme, userinfo, authority, database. */
-const CONNECTION_STRING =
-  CONNECTION_SCHEME + 'demo_user' + ':' + cycle(LOWER_LETTERS, 12) + '@' + CONNECTION_AUTHORITY;
+const CONNECTION_STRING = CONNECTION_SCHEME + CONNECTION_USERINFO + '@' + CONNECTION_AUTHORITY;
 
 /**
  * Every credential-shaped fixture, driven as a set by the property suites
@@ -349,6 +403,20 @@ describe('redaction constants', () => {
     // Shannon entropy over UTF-16 code units cannot exceed 16 bits per
     // character, so a higher bar would make the heuristic unreachable.
     expect(ENTROPY_MIN_BITS_PER_CHAR).toBeLessThanOrEqual(16);
+  });
+
+  it('pins the entropy thresholds to the values the secret gate uses', () => {
+    // These two numbers are a cross-component contract, not an implementation
+    // detail: AAP §0.3.4 fixes the repository secret gate at "strings of >= 32
+    // characters with Shannon entropy above 4.0 bits/char", and this module
+    // implements the same bar so that what the gate refuses to commit is also
+    // what the runtime refuses to forward. Asserting the literals is the whole
+    // point of this case - every other entropy assertion in this suite is
+    // written against these constants, so a drift to 64 characters or 5.0 bits
+    // would leave all of them green while the two enforcement points silently
+    // disagreed.
+    expect(ENTROPY_MIN_LENGTH).toBe(32);
+    expect(ENTROPY_MIN_BITS_PER_CHAR).toBe(4);
   });
 });
 
@@ -477,6 +545,31 @@ describe('scrub', () => {
       expect(scrubbed).toBe('before\n' + REDACTION_MARKER);
       expect(scrubbed).not.toContain(PEM_TAIL);
     });
+
+    for (const label of PEM_LABELS) {
+      it('replaces a complete ' + label + ' block', () => {
+        // Every label the repository secret gate recognises has to be
+        // recognised here too: the gate refusing to commit a key file while
+        // the runtime happily forwards the same bytes to a model provider
+        // would be the worst of both readings.
+        const body = cycle(URLSAFE_CHARS, 64);
+        const block = [pemHeaderFor(label), body, pemFooterFor(label)].join('\n');
+        const scrubbed = scrub('before\n' + block + '\nafter');
+
+        expect(scrubbed).toBe('before\n' + REDACTION_MARKER + '\nafter');
+        expect(scrubbed).not.toContain(body);
+        expect(scrubbed).not.toContain(PEM_TAIL);
+      });
+
+      it('replaces an unterminated ' + label + ' block', () => {
+        const body = cycle(URLSAFE_CHARS, 48);
+        const opened = [pemHeaderFor(label), body].join('\n');
+        const scrubbed = scrub('before\n' + opened);
+
+        expect(scrubbed).toBe('before\n' + REDACTION_MARKER);
+        expect(scrubbed).not.toContain(body);
+      });
+    }
   });
 
   describe('credentialed connection strings', () => {
@@ -640,6 +733,130 @@ describe('scrubNamedValue', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Untrusted input
+//
+// These primitives sit on a process boundary. A captured event arrives as
+// parsed JSON, a span attribute is declared `unknown`, and a React prop or
+// hook state slot is whatever the page put there - so `null`, a number, a
+// `Date` or a hostile object with a `toString` really do reach this module,
+// and a primitive that threw would take the whole batch it belongs to with
+// it. Every case below is about the boundary being defensive rather than
+// merely typed.
+// ---------------------------------------------------------------------------
+
+/** A value of a type these primitives must tolerate, labelled for failures. */
+interface UntrustedFixture {
+  readonly label: string;
+  readonly value: unknown;
+}
+
+/** Values the ingest path can hand a primitive that expects text. */
+const UNSCANNABLE_VALUES: readonly UntrustedFixture[] = [
+  { label: 'null', value: null },
+  { label: 'undefined', value: undefined },
+  { label: 'an object', value: { secret: 'value' } },
+  { label: 'an array', value: ['a', 'b'] },
+  { label: 'a function', value: (): string => 'x' },
+  { label: 'a symbol', value: Symbol('token') },
+  { label: 'a Date', value: new Date(0) },
+];
+
+describe('asScannableText', () => {
+  it('returns a string as it arrived', () => {
+    for (const { label, value } of [...SECRET_FIXTURES, ...CLEAN_FIXTURES]) {
+      expect(asScannableText(value), label).toBe(value);
+    }
+  });
+
+  it('renders the scalars a captured attribute legitimately carries', () => {
+    // A status code, a duration, a flag: keeping their text keeps the evidence
+    // a panel is built from, where returning the marker would erase it.
+    expect(asScannableText(42)).toBe('42');
+    expect(asScannableText(0)).toBe('0');
+    expect(asScannableText(-1.5)).toBe('-1.5');
+    expect(asScannableText(true)).toBe('true');
+    expect(asScannableText(false)).toBe('false');
+    expect(asScannableText(9_007_199_254_740_993n)).toBe('9007199254740993');
+    expect(asScannableText(Number.NaN)).toBe('NaN');
+    expect(asScannableText(Number.POSITIVE_INFINITY)).toBe('Infinity');
+  });
+
+  it('reports a value it cannot examine as removed rather than erasing it', () => {
+    for (const { label, value } of UNSCANNABLE_VALUES) {
+      expect(asScannableText(value), label).toBe(REDACTION_MARKER);
+    }
+  });
+
+  it('never reads a property of a value it cannot examine', () => {
+    // A page-supplied object can define `toString`, `valueOf` or a `length`
+    // getter, and stringifying it would run that code inside the agent. The
+    // marker is returned without touching the value at all.
+    let touched = false;
+    const hostile = {
+      get length(): number {
+        touched = true;
+        return 64;
+      },
+      toString(): string {
+        touched = true;
+        return 'stringified';
+      },
+      valueOf(): string {
+        touched = true;
+        return 'valued';
+      },
+    };
+
+    expect(asScannableText(hostile)).toBe(REDACTION_MARKER);
+    expect(scrub(hostile)).toBe(REDACTION_MARKER);
+    expect(scrubNamedValue('component', hostile)).toBe(REDACTION_MARKER);
+    expect(touched).toBe(false);
+  });
+});
+
+describe('scrub and scrubNamedValue accept input of any type', () => {
+  it('never throws for a value the ingest path can hand them', () => {
+    for (const { label, value } of UNSCANNABLE_VALUES) {
+      expect(() => scrub(value), label).not.toThrow();
+      expect(() => scrubNamedValue('component', value), label).not.toThrow();
+      expect(() => scrubNamedValue('authorization', value), label).not.toThrow();
+    }
+  });
+
+  it('reports an unscannable value as removed, under any name', () => {
+    for (const { label, value } of UNSCANNABLE_VALUES) {
+      expect(scrub(value), label).toBe(REDACTION_MARKER);
+      expect(scrubNamedValue('component', value), label).toBe(REDACTION_MARKER);
+      expect(scrubNamedValue('authorization', value), label).toBe(REDACTION_MARKER);
+    }
+  });
+
+  it('keeps a scalar as evidence instead of erasing it', () => {
+    // Erasing is the failure mode that matters here: a number that came back
+    // as an empty string would look in the panel like an attribute that was
+    // never captured.
+    expect(scrub(200)).toBe('200');
+    expect(scrub(12.5)).toBe('12.5');
+    expect(scrub(false)).toBe('false');
+    expect(scrubNamedValue('http.status_code', 200)).toBe('200');
+  });
+
+  it('still applies the name rule to a scalar under a sensitive name', () => {
+    expect(scrubNamedValue('authorization', 12_345)).toBe(REDACTION_MARKER);
+    expect(scrubNamedValue('api_key', true)).toBe(REDACTION_MARKER);
+  });
+
+  it('is idempotent over its own output for every untrusted input', () => {
+    for (const { label, value } of UNSCANNABLE_VALUES) {
+      const once = scrub(value);
+
+      expect(scrub(once), label).toBe(once);
+    }
+    expect(scrub(scrub(42))).toBe('42');
+  });
+});
+
 describe('shannonEntropy', () => {
   it('is zero for an empty string', () => {
     expect(shannonEntropy('')).toBe(0);
@@ -710,6 +927,63 @@ describe('isHighEntropySecret', () => {
   it('rejects an empty value', () => {
     expect(isHighEntropySecret('')).toBe(false);
   });
+
+  it('accepts a dense value at exactly 32 characters and rejects it at 31', () => {
+    // The literals are the assertion. Writing `ENTROPY_MIN_LENGTH` and
+    // `ENTROPY_MIN_LENGTH - 1` here would prove only that the module is
+    // self-consistent: raising the bar to 64 would move both fixtures with it
+    // and the case would still pass. Both values are drawn from the same
+    // alphabet and both clear the entropy bar, so the length is the only thing
+    // that differs in effect.
+    const atBound = cycle(URLSAFE_CHARS, 32);
+    const belowBound = cycle(URLSAFE_CHARS, 31);
+
+    expect(atBound).toHaveLength(32);
+    expect(belowBound).toHaveLength(31);
+    expect(shannonEntropy(atBound)).toBeGreaterThan(4);
+    expect(shannonEntropy(belowBound)).toBeGreaterThan(4);
+    expect(isHighEntropySecret(atBound)).toBe(true);
+    expect(isHighEntropySecret(belowBound)).toBe(false);
+  });
+
+  it('accepts a distribution immediately above 4.0 bits per character', () => {
+    // Seventeen symbols, evenly distributed: log2(17) = 4.0875 bits, the
+    // narrowest margin over the bar that an integer alphabet can produce. A
+    // module bar of 5.0 - or of anything above 4.09 - rejects this value, which
+    // is exactly the drift the previous fixtures (4.0 exactly and a distant
+    // 6.0) could not see. The length is comfortably past 32 so that only the
+    // entropy decides.
+    const justAbove = evenDistribution(17, 34);
+
+    expect(justAbove).toHaveLength(34);
+    expect(shannonEntropy(justAbove)).toBeCloseTo(Math.log2(17), 10);
+    expect(shannonEntropy(justAbove)).toBeGreaterThan(4);
+    expect(shannonEntropy(justAbove)).toBeLessThan(4.1);
+    expect(isHighEntropySecret(justAbove)).toBe(true);
+  });
+
+  it('rejects a distribution immediately below 4.0 bits per character', () => {
+    // Fifteen symbols, evenly distributed: log2(15) = 3.9069 bits. A module
+    // bar of 3.5 would accept this, so the case pins the threshold from below
+    // as the one above pins it from above.
+    const justBelow = evenDistribution(15, 45);
+
+    expect(justBelow).toHaveLength(45);
+    expect(shannonEntropy(justBelow)).toBeCloseTo(Math.log2(15), 10);
+    expect(shannonEntropy(justBelow)).toBeLessThan(4);
+    expect(shannonEntropy(justBelow)).toBeGreaterThan(3.9);
+    expect(isHighEntropySecret(justBelow)).toBe(false);
+  });
+
+  it('rejects a distribution sitting exactly on 4.0 bits per character', () => {
+    // Sixteen symbols, evenly distributed: exactly 4 bits. The bar is
+    // exclusive, and a balanced hexadecimal digest of any length has to stay
+    // evidence rather than become a redacted value.
+    const onBound = evenDistribution(16, 48);
+
+    expect(shannonEntropy(onBound)).toBeCloseTo(4, 10);
+    expect(isHighEntropySecret(onBound)).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -743,6 +1017,21 @@ describe('findDeniedRules', () => {
     expect(findDeniedRules(JWT_SIGNED)).toEqual(['jwt']);
     expect(findDeniedRules(PEM_BLOCK)).toEqual(['private-key']);
     expect(findDeniedRules(CONNECTION_STRING)).toEqual(['connection-string']);
+  });
+
+  it('reports private-key for every label the repository secret gate knows', () => {
+    // The outbound guard refuses a payload on the strength of this report, so
+    // a label it cannot name is a key that leaves the machine. The PGP block
+    // is the label that a `PRIVATE KEY`-terminated pattern silently misses.
+    for (const label of PEM_LABELS) {
+      const block = [pemHeaderFor(label), cycle(URLSAFE_CHARS, 40), pemFooterFor(label)].join('\n');
+
+      expect(findDeniedRules(block), label).toEqual(['private-key']);
+      expect(containsDenied(block), label).toBe(true);
+      expect(findDeniedRules(pemHeaderFor(label)), label + ' header alone').toEqual([
+        'private-key',
+      ]);
+    }
   });
 
   it('reports nothing for a value with nothing to hide', () => {
@@ -1001,6 +1290,142 @@ function pseudoRandomText(length: number, seedValue: number): string {
   return chunks.join('');
 }
 
+// --- Credentials placed across the scan bound ------------------------------
+
+/** Where `scrub` cuts a value that exceeds the scan bound. */
+const SCAN_CUT = MAX_SCAN_LENGTH - REDACTION_MARKER.length;
+
+/** One credential positioned so that the scan bound falls inside it. */
+interface CrossingCase {
+  /** Names the class, so a failure says which rule lost its boundary. */
+  readonly label: string;
+  /** The credential, assembled from fragments as everything here is. */
+  readonly credential: string;
+  /** Code units of the credential that land on the near side of the cut. */
+  readonly inHead: number;
+  /** What survives on the near side because it is diagnostic, not secret. */
+  readonly keeps: string;
+  /** The part that must not survive in any form, in any position. */
+  readonly secret: string;
+}
+
+/**
+ * Padding placed before the credential: `x` characters ending in one space.
+ *
+ * The space is load-bearing. The bearer rule requires a word boundary in front
+ * of its scheme word, so a credential welded to a run of letters would be a
+ * different value rather than a truncated credential - and the padding is also
+ * what the assertions expect to survive, so it is built once here.
+ */
+function crossingPadding(testCase: CrossingCase): string {
+  return 'x'.repeat(SCAN_CUT - testCase.inHead - 1) + ' ';
+}
+
+/** The padded value, long enough that `scrub` takes its bounded path. */
+function crossingValue(testCase: CrossingCase): string {
+  return crossingPadding(testCase) + testCase.credential + ' end of value';
+}
+
+/** A PEM block whose label is `label`, used for the delimiter-crossing cases. */
+function pemOpenBlockFor(label: string): string {
+  return pemHeaderFor(label) + '\n' + cycle(URLSAFE_CHARS, 64);
+}
+
+/**
+ * One case per content-driven rule - and one per shape within a rule where the
+ * shapes fail differently: a JOSE token cut in its header segment and one cut
+ * in its payload, a key delimiter with the common label and one with the PGP
+ * label that spells its tail differently.
+ *
+ * `inHead` is chosen so the cut lands *inside the part that identifies the
+ * credential*, which is the only position where the old behaviour leaked: a
+ * cut further left removes the prefix too, and one further right leaves a
+ * complete match that the replacement rules already handle.
+ */
+const CROSSING_CASES: readonly CrossingCase[] = [
+  {
+    label: 'a vendor-scoped model provider key',
+    credential: VENDOR_KEY,
+    inHead: VENDOR_KEY_PREFIX.length + 11,
+    keeps: '',
+    secret: VENDOR_KEY,
+  },
+  {
+    label: 'a short-form model provider key',
+    credential: GENERIC_KEY,
+    inHead: GENERIC_KEY_PREFIX.length + 11,
+    keeps: '',
+    secret: GENERIC_KEY,
+  },
+  {
+    label: 'a classic forge personal access token',
+    credential: FORGE_CLASSIC_KEY,
+    inHead: FORGE_CLASSIC_PREFIX.length + 11,
+    keeps: '',
+    secret: FORGE_CLASSIC_KEY,
+  },
+  {
+    label: 'a fine-grained forge personal access token',
+    credential: FORGE_FINE_KEY,
+    inHead: FORGE_FINE_PREFIX.length + 11,
+    keeps: '',
+    secret: FORGE_FINE_KEY,
+  },
+  {
+    label: 'a cloud access key identifier',
+    credential: ACCESS_KEY_ID,
+    inHead: ACCESS_KEY_PREFIX.length + 7,
+    keeps: '',
+    secret: ACCESS_KEY_ID,
+  },
+  {
+    label: 'a bearer header value',
+    credential: BEARER_HEADER_VALUE,
+    inHead: BEARER_SCHEME.length + 1 + 3,
+    // The scheme word survives a cut exactly as it survives a replacement:
+    // that a request was authenticated explains a 401 or a cache miss.
+    keeps: BEARER_SCHEME + ' ',
+    secret: BEARER_CREDENTIAL,
+  },
+  {
+    label: 'a JOSE token cut inside its header segment',
+    credential: JWT_SIGNED,
+    inHead: JOSE_PREFIX.length + 9,
+    keeps: '',
+    secret: JWT_SIGNED,
+  },
+  {
+    label: 'a JOSE token cut inside its payload segment',
+    credential: JWT_SIGNED,
+    inHead: JOSE_PREFIX.length + 24 + 1 + 2,
+    keeps: '',
+    secret: JWT_SIGNED,
+  },
+  {
+    label: 'a key-file delimiter',
+    credential: pemOpenBlockFor('TEST ' + PEM_TAIL),
+    inHead: 20,
+    keeps: '',
+    secret: pemOpenBlockFor('TEST ' + PEM_TAIL),
+  },
+  {
+    label: 'a PGP key-block delimiter',
+    credential: pemOpenBlockFor('PGP ' + PEM_TAIL + ' BLOCK'),
+    inHead: 20,
+    keeps: '',
+    secret: pemOpenBlockFor('PGP ' + PEM_TAIL + ' BLOCK'),
+  },
+  {
+    label: 'a credentialed connection string',
+    credential: CONNECTION_STRING,
+    inHead: CONNECTION_SCHEME.length + 'demo_user'.length + 1 + 6,
+    // The scheme survives so a redacted connection string stays diagnosable,
+    // which is the same shape the replacement produces.
+    keeps: CONNECTION_SCHEME,
+    secret: CONNECTION_USERINFO,
+  },
+];
+
 describe('properties', () => {
   it('scrubs idempotently', () => {
     // Two rules grow the text they replace, so a second pass over a scrubbed
@@ -1069,6 +1494,123 @@ describe('properties', () => {
     const exact = 'z'.repeat(MAX_SCAN_LENGTH);
 
     expect(scrub(exact)).toBe(exact);
+  });
+
+  it('leaves no credential head in front of the marker when a value is cut', () => {
+    // The shape this guards: the pattern that owns a credential identifies it
+    // by a prefix plus a run, so a cut through the run would leave the prefix
+    // and the first characters of the credential in plain text with nothing
+    // left to match them - `<prefix>ABCDEFGHIJK[redacted]`. Each case below
+    // places its credential so the cut falls inside the run.
+    for (const testCase of CROSSING_CASES) {
+      const value = crossingValue(testCase);
+      const scrubbed = scrub(value);
+      const expected = crossingPadding(testCase) + testCase.keeps + REDACTION_MARKER;
+
+      expect(value.length, testCase.label).toBeGreaterThan(MAX_SCAN_LENGTH);
+      expect(scrubbed, testCase.label).toBe(expected);
+      expect(scrubbed.length, testCase.label).toBeLessThanOrEqual(MAX_SCAN_LENGTH);
+      for (const window of leakWindows(testCase.secret)) {
+        expect(scrubbed, testCase.label).not.toContain(window);
+      }
+      expect(scrub(scrubbed), testCase.label).toBe(scrubbed);
+    }
+  });
+
+  it('cuts a credential whose continuation was never examined', () => {
+    // Here the cut window sees only credential-shaped characters and the input
+    // continues past it, so whether the run ends in a credential cannot be
+    // decided from what was examined. The cut is made anyway: over-redacting a
+    // truncated tail costs a few characters of a value that was being thrown
+    // away, and the other reading costs a credential.
+    const prefix = assemble('s', 'k-');
+    const cut = MAX_SCAN_LENGTH - REDACTION_MARKER.length;
+    const head = 'x'.repeat(cut - prefix.length - 9) + ' ' + prefix + cycle(URLSAFE_CHARS, 8);
+    const value = head + cycle(URLSAFE_CHARS, 40_000);
+    const scrubbed = scrub(value);
+
+    expect(head).toHaveLength(cut);
+    expect(scrubbed).toBe('x'.repeat(cut - prefix.length - 9) + ' ' + REDACTION_MARKER);
+    expect(scrubbed).not.toContain(prefix);
+    expect(scrub(scrubbed)).toBe(scrubbed);
+  });
+
+  it('cuts a run that is still going where the examined window ends', () => {
+    // The case a synthetic continuation cannot settle. A JOSE token's first
+    // segment may be longer than the bound the `jwt` rule itself uses, and
+    // then the separator the rule needs is out of that rule's reach: no text
+    // appended past the cut completes a match, so the crossing probe finds
+    // nothing and a token head 16 000 characters long would be emitted in
+    // front of the marker - and, because the same bound defeats the detector,
+    // `findDeniedRules` would call the result clean. A run still going at the
+    // end of everything examined, with input left beyond it, is therefore cut
+    // on the shape of its prefix alone.
+    const segment = cycle(URLSAFE_CHARS, MAX_SCAN_LENGTH + 4_000);
+    const token = JOSE_PREFIX + segment + '.' + cycle(URLSAFE_CHARS, 40);
+    const scrubbed = scrub('trace ' + token);
+
+    expect(token.length).toBeGreaterThan(MAX_SCAN_LENGTH);
+    expect(scrubbed).toBe('trace ' + REDACTION_MARKER);
+    expect(scrubbed).not.toContain(JOSE_PREFIX);
+    expect(scrub(scrubbed)).toBe(scrubbed);
+  });
+
+  it('cuts a userinfo password longer than the rule that would match it', () => {
+    // The same failure in the `connection-string` rule, whose password run is
+    // bounded at 256 characters: past that the terminating `@` is unreachable,
+    // so the user and the head of the password would survive the cut. The
+    // scheme is kept, as it is wherever this rule acts.
+    const password = cycle(LOWER_LETTERS, MAX_SCAN_LENGTH + 2_000);
+    const dsn = CONNECTION_SCHEME + 'demo_user' + ':' + password + '@' + CONNECTION_AUTHORITY;
+    const scrubbed = scrub(dsn);
+
+    expect(dsn.length).toBeGreaterThan(MAX_SCAN_LENGTH);
+    expect(scrubbed).toBe(CONNECTION_SCHEME + REDACTION_MARKER);
+    expect(scrubbed).not.toContain('demo_user');
+    expect(scrubbed).not.toContain(password.slice(0, LEAK_WINDOW));
+    expect(scrub(scrubbed)).toBe(scrubbed);
+  });
+
+  it('does not cut a long run whose end it actually reached', () => {
+    // The conservative cut is for text that was never examined, not for text
+    // that was: a value whose credential-shaped tail ends within the examined
+    // window has answered the question, and cutting it anyway would shorten
+    // every long opaque value - a digest list, a base64 blob - for nothing.
+    const opaque = cycle(URLSAFE_CHARS, MAX_SCAN_LENGTH + 200);
+    const scrubbed = scrub(opaque);
+    const cut = MAX_SCAN_LENGTH - REDACTION_MARKER.length;
+
+    expect(scrubbed).toBe(opaque.slice(0, cut) + REDACTION_MARKER);
+    expect(scrubbed).toHaveLength(MAX_SCAN_LENGTH);
+  });
+
+  it('does not shorten an ordinary value whose tail is merely long', () => {
+    // The guard is only allowed to act on text that could be a credential.
+    // Truncating every long value a few characters early would quietly cost
+    // the panel the end of every long path, statement and prose attribute.
+    const cut = MAX_SCAN_LENGTH - REDACTION_MARKER.length;
+    const prose = 'the panel rendered rows and columns '.repeat(1_000);
+    const scrubbed = scrub(prose);
+
+    expect(prose.length).toBeGreaterThan(MAX_SCAN_LENGTH);
+    expect(scrubbed).toBe(prose.slice(0, cut) + REDACTION_MARKER);
+    expect(scrubbed).toHaveLength(MAX_SCAN_LENGTH);
+  });
+
+  it('cuts clear of a credential at a bound a caller chose', () => {
+    // `cutAtCredentialBoundary` is exported because `./url.ts` and `./sql.ts`
+    // apply their own budgets - a path, a statement - and each of those cuts
+    // needs the same guarantee as the scan bound.
+    const planted = 'GET /v1/items?key=' + GENERIC_KEY + ' trailing text';
+    const boundary = planted.indexOf(GENERIC_KEY) + GENERIC_KEY_PREFIX.length + 9;
+    const cut = cutAtCredentialBoundary(planted, boundary);
+
+    expect(cut).toBe('GET /v1/items?key=');
+    expect(cut).not.toContain(GENERIC_KEY_PREFIX);
+    expect(cutAtCredentialBoundary(planted, planted.length)).toBe(planted);
+    expect(cutAtCredentialBoundary(planted, planted.length + 100)).toBe(planted);
+    expect(cutAtCredentialBoundary(planted, 0)).toBe('');
+    expect(cutAtCredentialBoundary('', 10)).toBe('');
   });
 
   it('never cuts a surrogate pair when it truncates at the scan bound', () => {

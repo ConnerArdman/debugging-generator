@@ -3,7 +3,7 @@
 
   "// purpose": "Solution file for `tsc -b` (AAP 0.7.1 Group 0). It is the single entry point of the `pnpm typecheck` gate, which is `pnpm demo:generate && tsc -b` (AAP 0.8.5): every project listed under `references` below is type-checked by that one command, and a workspace missing from the list is never type-checked at all.",
 
-  "// format": "Written as strict JSON - unlike tsconfig.base.json and the per-workspace configs, which are JSONC - so that both a JSONC-aware reader (`ts.readConfigFile`) and a bare `JSON.parse` can read it. Rationale lives in the `\"// …\"` string keys instead of in comments; TypeScript ignores unknown top-level keys.",
+  "// format": "Written as strict JSON - like tsconfig.base.json and every per-workspace config in this repository - so that both a JSONC-aware reader (`ts.readConfigFile`) and a bare `JSON.parse` can read it, and no consumer has to know which one to reach for. Rationale lives in the `\"// …\"` string keys instead of in comments; TypeScript ignores unknown top-level keys, while such a key inside `compilerOptions` would be error TS5023.",
 
   "// files": "Empty on purpose. A solution file owns no inputs of its own: `\"files\": []` is what keeps TypeScript from reporting TS18003 here and makes `references` the only thing this project contributes.",
 

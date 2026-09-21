@@ -11,19 +11,44 @@
  * process-scoped credential and ties the child's lifetime to the session.
  *
  * This script is the *CLI equivalent* of that launcher for a developer who
- * wants the instrumented dev server in their own terminal — and nothing more.
- * It resolves paths, pre-flights the service, asks the service for a credential,
- * spawns the project's `dev` script with the right environment, and forwards
- * signals and the exit code.
+ * wants the instrumented dev server from a terminal — and nothing more. It has
+ * two modes:
+ *
+ *   default          ask the service to launch the project through its own
+ *                    launcher (`POST /dev-server/launch`), report the dev
+ *                    server URL and pid it answers with, and stay in the
+ *                    foreground so Ctrl-C stops that server again
+ *                    (`POST /dev-server/stop`). This is the mode that yields
+ *                    AUTHENTICATED server and database telemetry, because the
+ *                    service is the only component that mints a server-agent
+ *                    credential (see WHY THE CREDENTIAL MATTERS below).
+ *   --spawn-local    spawn the project's own `dev` script from this terminal
+ *                    with the preload attached and no credential, which is the
+ *                    unauthenticated shape: the service rejects ingest, so no
+ *                    server or database spans are recorded. Useful offline and
+ *                    to demonstrate exactly that failure mode.
+ *
+ * `--detach` returns as soon as the service has reported the launch instead of
+ * waiting for Ctrl-C, and `--stop` stops a dev server the service launched for
+ * the project — the two halves of the default mode, available separately for
+ * scripts and for a terminal that has since been closed.
+ *
+ * ROUTES — THE CONTRACT IS NOT NEGOTIABLE HERE: this file is a *caller*. The
+ * routes it may use are the ones the protocol defines (AAP 0.4.2), and
+ * {@link SERVICE_ROUTES} is the whole list: `GET /health`,
+ * `POST /dev-server/launch`, `POST /dev-server/stop`. There is deliberately no
+ * route-name guessing, no probe list and no environment override that points at
+ * a different path: a caller that invents an endpoint the service does not
+ * define cannot work against the specified service, and an override would only
+ * hide that. If a future protocol version adds a dedicated server-agent
+ * credential route, add it to `packages/protocol/src/http.ts` first and then
+ * name it here — in that order.
  *
  * BOUNDARY — deliberately NOT implemented here, because the launcher owns it:
  *   - detecting an already-running dev server, probing ports or URLs;
  *   - retry/backoff, health polling or waiting for the server to be listening;
  *   - session creation, tab binding or any session bookkeeping;
- *   - child-process lifecycle bookkeeping beyond "forward signals, exit with
- *     the child's status";
- *   - minting, hashing, storing or refreshing credentials (it *asks* the
- *     service for one and passes it through);
+ *   - minting, hashing, storing or refreshing credentials of any kind;
  *   - reading, parsing or forwarding `.env` files — the child does its own.
  * If you are about to add any of the above, add it to the launcher instead and
  * let this script keep being a thin wrapper.
@@ -37,16 +62,19 @@
  * environment in a way that looks like a bug in this tool.
  *
  * WHY THE CREDENTIAL MATTERS: the service accepts telemetry ingest only from a
- * credential scoped to one project root, and expires it when the launched
- * process exits. This script requests that credential with the editor
- * credential the service wrote to `$DEBUGGEN_HOME/auth.json`, hands it to the
- * child as `DEBUGGEN_TOKEN`, and passes the same project root as
- * `DEBUGGEN_PROJECT_ROOT` so the preload's ingest calls match the credential's
- * scope.
+ * server-agent credential scoped to one project root, and expires it when the
+ * launched process exits (AAP 0.5.6). That credential is minted per dev-server
+ * launch by the service itself, so the only way a caller obtains an
+ * instrumented dev server with a valid credential is to let the launcher start
+ * it — which is what the default mode does, authorised by the editor
+ * credential the service wrote to `$DEBUGGEN_HOME/auth.json`. The launcher
+ * passes `DEBUGGEN_TOKEN` and a matching `DEBUGGEN_PROJECT_ROOT` to the child
+ * it starts; this script never handles a server-agent credential at all.
  *
- * SAFETY: the credential is never printed, never logged and never written to
- * disk — the banner reports only that it is set and how long it is. This
- * script writes nothing anywhere: it only reads, requests and spawns.
+ * SAFETY: the editor credential is sent only as a bearer token to the service
+ * on loopback, is never printed, never logged and never written to disk, and is
+ * redacted out of any service error this command echoes. This script writes
+ * nothing anywhere: it only reads, requests and spawns.
  *
  * Usage: `node scripts/dev-instrumented.mjs [options]`, `pnpm demo:instrumented`,
  * or `--help`.
@@ -100,45 +128,72 @@ export const AUTH_FILE_NAME = 'auth.json';
 /** Unauthenticated liveness route on the service. */
 export const HEALTH_PATH = '/health';
 
-/** Telemetry ingest route the preload posts batches to. */
+/**
+ * Telemetry ingest route the preload posts batches to. Named here only because
+ * it is the value of `DEBUGGEN_INGEST_URL` handed to a locally spawned child;
+ * this script never posts to it.
+ */
 export const INGEST_PATH = '/telemetry/ingest';
 
-/** The service's own launcher route, used only by `--via-service`. */
+/**
+ * The service's launcher route (AAP 0.4.2: `POST /dev-server/launch`,
+ * `{ projectRoot, command? }` → `{ devServerUrl, pid }`). The default mode
+ * calls exactly this route: it is the one place in the protocol where an
+ * instrumented dev server is started and its project-scoped server-agent
+ * credential is minted (AAP 0.5.6).
+ */
 export const LAUNCH_PATH = '/dev-server/launch';
 
 /**
- * Candidate routes for "mint a server-agent credential for this project root",
- * tried in order with the editor credential as the bearer token.
- *
- * The service owns these route names (`apps/local-service/src/server/routes/`
- * and `src/server/auth.ts`); this list is the ask, not a second definition of
- * the credential itself. A `404` or `405` means "not this route" and the next
- * candidate is tried; any other status is treated as the service's real answer.
- * Set `DEBUGGEN_CREDENTIAL_PATH` to a single route to bypass the list.
+ * The service's counterpart stop route (AAP 0.4.2: `POST /dev-server/stop`),
+ * called with the same `{ projectRoot }` when the foreground run is
+ * interrupted or `--stop` is passed.
  */
-export const CREDENTIAL_PATHS = Object.freeze([
-  '/dev-server/credential',
-  '/credentials/server-agent',
-  '/dev-server/token',
-]);
+export const STOP_PATH = '/dev-server/stop';
+
+/**
+ * Every service route this command is permitted to call, and therefore the
+ * complete list a service build must answer for it to work. All three are
+ * defined by the protocol (AAP 0.4.2); a request to anything else is a bug in
+ * this file, which is why the list is exported and asserted by
+ * `scripts/dev-instrumented.test.mjs` against a stub service that implements
+ * only these paths.
+ */
+export const SERVICE_ROUTES = Object.freeze([HEALTH_PATH, LAUNCH_PATH, STOP_PATH]);
 
 /** Timeout for the liveness pre-flight, per the plan's 2 s budget. */
 export const HEALTH_TIMEOUT_MS = 2_000;
 
-/** Timeout for the credential and launch requests. */
+/** Timeout for the launch and stop requests. */
 export const REQUEST_TIMEOUT_MS = 5_000;
 
-/** Everything went as asked (or `--help` / `--via-service` completed). */
+/**
+ * Interval of the timer that keeps the event loop alive while the foreground
+ * mode waits for a shutdown signal (see {@link awaitShutdownSignal}). One
+ * minute: long enough to be free, short enough that the handle is unremarkable
+ * in a process inspection.
+ */
+const KEEP_ALIVE_INTERVAL_MS = 60_000;
+
+/** Everything went as asked (`--help`, a reported launch, a clean stop, or a child that exited 0). */
 const EXIT_OK = 0;
 
 /**
- * Usage error or pre-flight failure: bad flag, missing preload, service down,
- * missing or invalid `auth.json`, credential request rejected, unusable target
- * project, or no package manager on `PATH`. Nothing was spawned.
+ * A failure this command reports rather than a status it inherited: a bad flag,
+ * a missing preload, a service that is not answering, a missing or invalid
+ * `auth.json`, a launch or stop the service refused, an unusable target
+ * project, or no package manager on `PATH`. Every message that uses this code
+ * states whether anything was launched, so "2" is never ambiguous about the
+ * state it leaves behind.
  */
 const EXIT_PREFLIGHT = 2;
 
-/** Status codes that mean "this route does not exist here, try the next". */
+/**
+ * Status codes that mean "this service build does not implement that route".
+ * They are a hard failure, never a signal to try a different path: the routes
+ * in {@link SERVICE_ROUTES} are the protocol's, so a 404 or 405 is a version
+ * mismatch between this checkout and the running service.
+ */
 const ROUTE_ABSENT_STATUSES = Object.freeze([404, 405]);
 
 /**
@@ -277,30 +332,39 @@ export function usage() {
   return `dev-instrumented — run a development server with the telemetry preload attached
 
 Usage
-  node scripts/dev-instrumented.mjs [--project <dir>] [--service <url>] [--no-token]
-  node scripts/dev-instrumented.mjs --via-service [--project <dir>] [--service <url>]
+  node scripts/dev-instrumented.mjs [--project <dir>] [--service <url>] [--detach]
+  node scripts/dev-instrumented.mjs --spawn-local [--project <dir>] [--service <url>]
+  node scripts/dev-instrumented.mjs --stop [--project <dir>] [--service <url>]
   node scripts/dev-instrumented.mjs --help
 
   pnpm demo:instrumented            the same thing for ${DEFAULT_PROJECT_REL}
 
-What it does
+What it does (default mode)
   1. resolves the Node preload at ${PRELOAD_REL}
-  2. resolves the local service from --service, or DEBUGGEN_HOST/DEBUGGEN_PORT
-  3. reads the editor credential from $DEBUGGEN_HOME/${AUTH_FILE_NAME}
-  4. checks GET {service}${HEALTH_PATH} answers
-  5. asks the service for a server-agent credential scoped to the project root
-  6. spawns the project's "dev" script with the preload and that credential
+  2. resolves the target project and checks it declares a "dev" script
+  3. resolves the local service from --service, or DEBUGGEN_HOST/DEBUGGEN_PORT
+  4. reads the editor credential from $DEBUGGEN_HOME/${AUTH_FILE_NAME}
+  5. checks GET {service}${HEALTH_PATH} answers
+  6. asks the service to launch the project: POST {service}${LAUNCH_PATH}
+     with { projectRoot }, authorised by that editor credential
+  7. reports the devServerUrl and pid the service answers with, then waits;
+     Ctrl-C (or SIGTERM) stops that server again through
+     POST {service}${STOP_PATH}
+
+  The service's launcher attaches the preload and mints the server-agent
+  credential for the process it starts (it is the only component that can:
+  a credential is scoped to one project root and expires with the process).
+  That is why the default mode goes through it — it is the only way this
+  command produces authenticated server and database telemetry, and it keeps
+  one implementation of launching instead of two.
 
   Server-tier spans (incoming requests, route handlers, outgoing fetch, Prisma
   and pg queries) exist only because the preload registers a tracer provider
-  inside this child process before the framework starts. Nothing in the target
-  project's source is modified, and this script writes nothing to disk.
+  inside the dev-server process before the framework starts. Nothing in the
+  target project's source is modified, and this script writes nothing to disk.
 
-  Starting a dev server is also a product feature: the local service's launcher
-  (apps/local-service/src/dev-server/launcher.ts) does it for a session, with
-  detection, and ties the child to that session. This script is the CLI
-  equivalent for a terminal, not a second implementation — use --via-service to
-  delegate to the product path instead.
+  Every route it calls is defined by the protocol (AAP 0.4.2), and these three
+  are all of them: ${SERVICE_ROUTES.join(', ')}.
 
 Options
   --project <dir>   project to launch; relative paths resolve against the
@@ -309,15 +373,17 @@ Options
                     "dev" script.
   --service <url>   base URL of the local service, overriding
                     DEBUGGEN_HOST/DEBUGGEN_PORT (example: http://127.0.0.1:43117)
-  --via-service     do not spawn anything here: ask the service to launch the
-                    project through its own launcher (POST ${LAUNCH_PATH}),
-                    print the dev server URL and pid it reports, and exit. The
-                    preload is still checked first, because the service
-                    attaches that same file.
-  --no-token        skip the credential request and start the child without
-                    DEBUGGEN_TOKEN. The service rejects unauthenticated ingest,
-                    so NO server or database spans are recorded; useful only to
-                    demonstrate that failure mode.
+  --detach          report the launch and exit immediately instead of waiting
+                    for Ctrl-C. The dev server keeps running under the service;
+                    stop it with --stop, or from VS Code by ending the session.
+  --spawn-local     spawn the project's own "dev" script from this terminal
+                    with the preload and DEBUGGEN_INGEST_URL, and WITHOUT a
+                    credential: the service rejects unauthenticated ingest, so
+                    NO server or database spans are recorded. Useful offline
+                    and to demonstrate that failure mode. Signals and the exit
+                    code are forwarded.
+  --stop            stop a dev server the service launched for this project
+                    (POST ${STOP_PATH}) and exit.
   --help, -h        print this text
 
 Environment it reads
@@ -325,37 +391,38 @@ Environment it reads
   DEBUGGEN_PORT     service port (default ${DEFAULT_SERVICE_PORT})
   DEBUGGEN_HOME     session home holding ${AUTH_FILE_NAME} (default ${DEFAULT_DEBUGGEN_HOME});
                     a leading ~ is expanded
-  DEBUGGEN_CREDENTIAL_PATH
-                    single credential route to use instead of trying
-                    ${CREDENTIAL_PATHS.join(', ')}
-  NODE_OPTIONS      inherited and appended to, never replaced
+  NODE_OPTIONS      inherited and appended to, never replaced (--spawn-local)
 
-Environment it sets on the child
+Environment it sets on the child (--spawn-local only)
   NODE_OPTIONS          inherited value + " --import <file:// URL of the preload>"
   DEBUGGEN_INGEST_URL   {service}${INGEST_PATH}
-  DEBUGGEN_TOKEN        the server-agent credential (omitted with --no-token).
-                        Never printed, never logged, never written to disk.
-  DEBUGGEN_PROJECT_ROOT absolute path of the launched project; ingest is
-                        accepted only for the credential's project root, so
-                        these two always match
+  DEBUGGEN_PROJECT_ROOT absolute path of the launched project; the preload
+                        reports ingest under this root
+  DEBUGGEN_TOKEN        removed from the child's environment: only the
+                        service's launcher mints a server-agent credential, so
+                        a local spawn has none and an inherited value would be
+                        a stale credential for some other process
 
   Everything else is inherited as-is. DATABASE_URL and the rest of the
   project's configuration stay with the project's own .env handling; this
   script neither reads nor forwards .env files.
 
 Exit codes
-  0   --help or --via-service completed, or the child exited 0
-  2   usage error, missing preload, service not answering, missing or invalid
-      ${AUTH_FILE_NAME}, credential request rejected, unusable project, or no
-      package manager on PATH — nothing was spawned
-  n   whatever the child exited with; 128 + signal number when it was signalled`;
+  0   --help, a reported launch, a stopped dev server, or a child that exited 0
+  2   a failure this command reports: usage error, missing preload, service not
+      answering, missing or invalid ${AUTH_FILE_NAME}, a launch or stop the
+      service refused, unusable project, or no package manager on PATH. The
+      message says whether anything was launched.
+  n   whatever the --spawn-local child exited with; 128 + signal number when it
+      was signalled`;
 }
 
 /**
  * @typedef {object} DevInstrumentedOptions
  * @property {boolean} help print usage and exit
- * @property {boolean} viaService delegate to the service's launcher route
- * @property {boolean} noToken skip the credential request
+ * @property {boolean} spawnLocal spawn the dev server here, without a credential
+ * @property {boolean} detach report the service's launch and exit immediately
+ * @property {boolean} stop stop a dev server the service launched, then exit
  * @property {string | undefined} project raw `--project` value, if given
  * @property {string | undefined} service raw `--service` value, if given
  */
@@ -366,18 +433,22 @@ Exit codes
  * Unknown flags are a usage error rather than something passed through to the
  * child: passing arguments to the project's dev script is the project's own
  * business, and silently forwarding them would make typos look like framework
- * failures.
+ * failures. Combinations that contradict each other are rejected here too, so
+ * a mode is never silently ignored — the three mode flags select genuinely
+ * different behaviour and precedence between them would be a guess.
  *
  * @param {readonly string[]} argv
  * @returns {DevInstrumentedOptions}
- * @throws {DevInstrumentedError} on an unknown flag or a missing flag value
+ * @throws {DevInstrumentedError} on an unknown flag, a missing flag value or a
+ *   contradictory combination
  */
 export function parseArgs(argv) {
   /** @type {DevInstrumentedOptions} */
   const options = {
     help: false,
-    viaService: false,
-    noToken: false,
+    spawnLocal: false,
+    detach: false,
+    stop: false,
     project: undefined,
     service: undefined,
   };
@@ -407,12 +478,16 @@ export function parseArgs(argv) {
       options.help = true;
       continue;
     }
-    if (arg === '--via-service') {
-      options.viaService = true;
+    if (arg === '--spawn-local') {
+      options.spawnLocal = true;
       continue;
     }
-    if (arg === '--no-token') {
-      options.noToken = true;
+    if (arg === '--detach') {
+      options.detach = true;
+      continue;
+    }
+    if (arg === '--stop') {
+      options.stop = true;
       continue;
     }
     if (arg === '--project' || arg.startsWith('--project=')) {
@@ -425,6 +500,31 @@ export function parseArgs(argv) {
     }
 
     throw new DevInstrumentedError(`unrecognised argument: ${arg}`, { showUsage: true });
+  }
+
+  if (options.help) return options;
+
+  if (options.stop && options.spawnLocal) {
+    throw new DevInstrumentedError('--stop and --spawn-local cannot be combined', {
+      hint: '--stop asks the service to stop a server it launched; --spawn-local never launches through the service. Pick one.',
+      showUsage: true,
+    });
+  }
+  if (options.stop && options.detach) {
+    throw new DevInstrumentedError('--stop and --detach cannot be combined', {
+      hint: '--stop always returns as soon as the service has answered, so there is nothing to detach from.',
+      showUsage: true,
+    });
+  }
+  if (options.spawnLocal && options.detach) {
+    throw new DevInstrumentedError('--spawn-local and --detach cannot be combined', {
+      hint: [
+        '--detach applies to a launch through the service, which owns the process',
+        'it starts. A local spawn IS this process: to background it, use your',
+        "shell's job control instead.",
+      ].join('\n'),
+      showUsage: true,
+    });
   }
 
   return options;
@@ -589,14 +689,15 @@ export async function readEditorCredential(home = resolveDebuggenHome()) {
       throw new DevInstrumentedError(`no editor credential at ${toPosix(file)}`, {
         hint: [
           'The service writes that file with mode 0600 the first time it starts,',
-          'and this command needs it to ask for a server-agent credential for',
-          'the project it launches.',
+          'and this command needs it to authorise the launch it asks the service',
+          'to perform.',
           '',
           serviceStartHint(),
           '',
           'Set DEBUGGEN_HOME if your session home is elsewhere, or pass',
-          '--no-token to start the dev server without ingest credentials (no',
-          'server or database spans will be recorded).',
+          '--spawn-local to start the dev server from this terminal without a',
+          'credential (ingest is rejected, so no server or database spans will be',
+          'recorded).',
         ].join('\n'),
       });
     }
@@ -796,143 +897,103 @@ function withReason(message, response, secrets = []) {
 }
 
 /**
- * The credential routes this run will try, in order.
+ * The recovery hint for "the service refused the editor credential". Shared by
+ * both authorised calls so the two paths give identical advice.
  *
- * @param {NodeJS.ProcessEnv} [env]
- * @returns {readonly string[]}
+ * @param {string} projectRoot project the call named
+ * @returns {string}
  */
-function credentialPaths(env = process.env) {
-  const override = cleanEnv(env.DEBUGGEN_CREDENTIAL_PATH);
-  if (override === undefined) return CREDENTIAL_PATHS;
-  return [override.startsWith('/') ? override : `/${override}`];
+function credentialRejectedHint(projectRoot) {
+  return [
+    `The credential in ${AUTH_FILE_NAME} is stale, was rotated, or does not cover`,
+    `${toPosix(projectRoot)}. An editor credential may act only on projects under`,
+    'the workspace folders the editor announced, so open that project in VS Code,',
+    'or restart the service (debuggen.rotateServiceToken rewrites the file), then',
+    're-run this command.',
+  ].join('\n');
 }
 
 /**
- * Ask the service for a server-agent credential scoped to one project root.
+ * The recovery hint for "this service build does not implement the route".
+ * A 404 or 405 on one of {@link SERVICE_ROUTES} is a version mismatch, not an
+ * invitation to look for the endpoint somewhere else.
  *
- * The credential itself is minted, hashed and stored by the service
- * (`apps/local-service/src/server/auth.ts`); this function only asks for one
- * and returns it. It never derives, caches or persists a credential, and the
- * caller passes it straight to the child's environment — the same thing the
- * product launcher does for a session-owned dev server.
- *
- * `POST /dev-server/launch` is deliberately not used here: that route is the
- * launcher, which would spawn the process itself, and this CLI exists to be
- * the alternative to that. `--via-service` is the way to use the launcher.
- *
- * @param {object} request
- * @param {string} request.base service base URL, without a trailing slash
- * @param {string} request.editorToken editor credential from auth.json
- * @param {string} request.projectRoot absolute path the credential is scoped to
- * @param {NodeJS.ProcessEnv} [request.env] environment to read the override from
- * @returns {Promise<string>} the server-agent credential
- * @throws {DevInstrumentedError} exit 2 when no route answers with a credential
+ * @param {string} route protocol route that answered 404/405
+ * @returns {string}
  */
-export async function mintServerAgentToken({ base, editorToken, projectRoot, env }) {
-  const paths = credentialPaths(env ?? process.env);
-  /** @type {string[]} */
-  const attempts = [];
-
-  for (const route of paths) {
-    const url = `${base}${route}`;
-    const response = await postJson({ url, editorToken, body: { projectRoot } });
-
-    if (ROUTE_ABSENT_STATUSES.includes(response.status)) {
-      attempts.push(`${route} → ${response.status}`);
-      continue;
-    }
-
-    if (response.status === 401 || response.status === 403) {
-      throw new DevInstrumentedError(
-        withReason(`the service rejected the editor credential at ${route}`, response, [
-          editorToken,
-        ]),
-        {
-          hint: [
-            `The credential in ${AUTH_FILE_NAME} is stale or was rotated. Restart the`,
-            'service (or run debuggen.rotateServiceToken and let it rewrite the',
-            'file), then re-run this command.',
-          ].join('\n'),
-        },
-      );
-    }
-
-    if (response.status < 200 || response.status >= 300) {
-      throw new DevInstrumentedError(
-        withReason(
-          `${url} answered ${response.status} ${response.statusText}`.trimEnd(),
-          response,
-          [editorToken],
-        ),
-      );
-    }
-
-    const token = extractToken(response.json, ['token', 'credential', 'serverAgentToken']);
-    if (token === undefined) {
-      throw new DevInstrumentedError(`${url} answered without a credential`, {
-        hint: 'Expected a JSON object with a "token" (or a "credential" holding one).',
-      });
-    }
-    return token;
-  }
-
-  throw new DevInstrumentedError(
-    `the service exposes no server-agent credential route (tried ${attempts.join(', ')})`,
-    {
-      hint: [
-        'This build of the service does not answer any of the routes this',
-        'command knows about. Either:',
-        '',
-        '  - set DEBUGGEN_CREDENTIAL_PATH to the route it does expose, or',
-        '  - run with --via-service to let the service launch the dev server',
-        `    itself through ${LAUNCH_PATH}, or`,
-        '  - run with --no-token to start without ingest credentials (no server',
-        '    or database spans will be recorded).',
-      ].join('\n'),
-    },
-  );
+function routeAbsentHint(route) {
+  return [
+    `${route} is part of the protocol (AAP 0.4.2), so a service that does not`,
+    'answer it is older or newer than this checkout. Rebuild and restart it:',
+    '',
+    '  pnpm --filter @debuggen/local-service build',
+    '',
+    'then re-run this command. Do not point this command at a different path:',
+    "the routes it calls are the protocol's, and guessing one produces a launch",
+    'that no service actually performed.',
+  ].join('\n');
 }
 
 /**
- * @typedef {object} LaunchViaServiceResult
+ * @typedef {object} LaunchResult
  * @property {string | undefined} devServerUrl URL the service reports
  * @property {number | undefined} pid process id the service reports
  */
 
 /**
- * Delegate to the product launcher: ask the service to start the project
- * itself. Used only by `--via-service`, as the documented way to exercise the
- * path a real session uses instead of this CLI's own spawn.
+ * Ask the service to launch the project through its own launcher:
+ * `POST /dev-server/launch` with `{ projectRoot }`, authorised by the editor
+ * credential (AAP 0.4.2).
+ *
+ * This is the whole of the credential story on this side. The service mints
+ * the server-agent credential for the process it starts, scopes it to that
+ * project root and expires it with the process (AAP 0.5.6), so a caller that
+ * wants authenticated server telemetry asks the launcher to start the server —
+ * there is no credential-minting route in the protocol for a caller to call,
+ * and this file must never invent one.
  *
  * @param {object} request
- * @param {string} request.base service base URL
- * @param {string} request.editorToken editor credential
+ * @param {string} request.base service base URL, without a trailing slash
+ * @param {string} request.editorToken editor credential from auth.json
  * @param {string} request.projectRoot absolute path of the target project
- * @returns {Promise<LaunchViaServiceResult>}
- * @throws {DevInstrumentedError} exit 2 when the launch is refused
+ * @returns {Promise<LaunchResult>} what the service reports about the process
+ * @throws {DevInstrumentedError} exit 2 when the launch is refused, or when the
+ *   answer does not carry the `devServerUrl` the contract promises
  */
-export async function launchViaService({ base, editorToken, projectRoot }) {
+export async function launchDevServer({ base, editorToken, projectRoot }) {
   const url = `${base}${LAUNCH_PATH}`;
   const response = await postJson({ url, editorToken, body: { projectRoot } });
 
   if (response.status === 401 || response.status === 403) {
     throw new DevInstrumentedError(
-      withReason('the service rejected the editor credential', response, [editorToken]),
-      {
-        hint: `The credential in ${AUTH_FILE_NAME} is stale or was rotated; restart the service and re-run.`,
-      },
+      withReason(`the service rejected the editor credential at ${LAUNCH_PATH}`, response, [
+        editorToken,
+      ]),
+      { hint: credentialRejectedHint(projectRoot) },
     );
   }
   if (ROUTE_ABSENT_STATUSES.includes(response.status)) {
-    throw new DevInstrumentedError(`the service has no ${LAUNCH_PATH} route`, {
-      hint: 'Run without --via-service to spawn the dev server from this terminal instead.',
-    });
+    throw new DevInstrumentedError(
+      `the service answered ${response.status} for ${LAUNCH_PATH}; nothing was launched`,
+      { hint: routeAbsentHint(LAUNCH_PATH) },
+    );
   }
   if (response.status < 200 || response.status >= 300) {
     throw new DevInstrumentedError(
       withReason(`${url} answered ${response.status} ${response.statusText}`.trimEnd(), response, [
         editorToken,
       ]),
+      {
+        hint:
+          response.status === 409
+            ? [
+                'Another session already owns a dev server for this project. End that',
+                'session in VS Code, or stop the server with:',
+                '',
+                `  node scripts/dev-instrumented.mjs --stop --project ${toPosix(projectRoot)}`,
+              ].join('\n')
+            : 'Nothing was launched. The service log has the detail behind that status.',
+      },
     );
   }
 
@@ -943,7 +1004,77 @@ export async function launchViaService({ base, editorToken, projectRoot }) {
   const devServerUrl = typeof record.devServerUrl === 'string' ? record.devServerUrl : undefined;
   const pid =
     typeof record.pid === 'number' && Number.isInteger(record.pid) ? record.pid : undefined;
+
+  // The protocol's response is `{ devServerUrl, pid }`. A 2xx without a URL is
+  // reported rather than accepted: the developer needs the address to open the
+  // app, and silently printing "(not reported)" for the whole answer would hide
+  // a definer that has drifted from the contract this caller was written
+  // against. `pid` is informational and stays optional, because the launcher may
+  // adopt a dev server it detected rather than one it spawned.
+  if (devServerUrl === undefined) {
+    throw new DevInstrumentedError(`${url} answered ${response.status} without a devServerUrl`, {
+      hint: [
+        `${LAUNCH_PATH} answers { devServerUrl, pid } (AAP 0.4.2). This service`,
+        'returned neither a devServerUrl nor an error, so it does not match the',
+        'contract this command was built against, and a dev server may have',
+        'started without this command being able to name it. Check the service',
+        'log, and stop any process it started with:',
+        '',
+        `  node scripts/dev-instrumented.mjs --stop --project ${toPosix(projectRoot)}`,
+      ].join('\n'),
+    });
+  }
+
   return { devServerUrl, pid };
+}
+
+/**
+ * Ask the service to stop the dev server it launched for this project:
+ * `POST /dev-server/stop` with the same `{ projectRoot }` (AAP 0.4.2).
+ *
+ * Called when the foreground run is interrupted and by `--stop`. A failure is
+ * reported rather than swallowed: the dev server is the service's child, so a
+ * stop that did not happen leaves a process running that this command cannot
+ * reach.
+ *
+ * @param {object} request
+ * @param {string} request.base service base URL, without a trailing slash
+ * @param {string} request.editorToken editor credential from auth.json
+ * @param {string} request.projectRoot absolute path of the target project
+ * @returns {Promise<void>}
+ * @throws {DevInstrumentedError} exit 2 when the stop is refused
+ */
+export async function stopDevServer({ base, editorToken, projectRoot }) {
+  const url = `${base}${STOP_PATH}`;
+  const response = await postJson({ url, editorToken, body: { projectRoot } });
+
+  if (response.status === 401 || response.status === 403) {
+    throw new DevInstrumentedError(
+      withReason(`the service rejected the editor credential at ${STOP_PATH}`, response, [
+        editorToken,
+      ]),
+      { hint: credentialRejectedHint(projectRoot) },
+    );
+  }
+  if (ROUTE_ABSENT_STATUSES.includes(response.status)) {
+    throw new DevInstrumentedError(
+      `the service answered ${response.status} for ${STOP_PATH}; the dev server is still running`,
+      { hint: routeAbsentHint(STOP_PATH) },
+    );
+  }
+  if (response.status < 200 || response.status >= 300) {
+    throw new DevInstrumentedError(
+      withReason(`${url} answered ${response.status} ${response.statusText}`.trimEnd(), response, [
+        editorToken,
+      ]),
+      {
+        hint: [
+          'The dev server may still be running under the service. Retry with',
+          '--stop, or end the session in VS Code, which stops the process it owns.',
+        ].join('\n'),
+      },
+    );
+  }
 }
 
 /**
@@ -1173,8 +1304,16 @@ export function appendImportOption(inherited, preloadUrl) {
 }
 
 /**
- * Build the child's environment: the inherited environment plus the four
- * variables that turn a plain dev server into an instrumented one.
+ * Build the child's environment: the inherited environment plus the three
+ * variables that turn a plain dev server into an instrumented one, and minus
+ * any inherited `DEBUGGEN_TOKEN` when this run has no credential of its own.
+ *
+ * Deleting rather than ignoring matters. Only the service's launcher mints a
+ * server-agent credential, and one is scoped to a single project root and
+ * expires with the process it was minted for (AAP 0.5.6), so a `DEBUGGEN_TOKEN`
+ * lying around in the environment belongs to some other process: forwarding it
+ * would make the child post ingest with a credential the service will reject,
+ * and the run would look authenticated while recording nothing.
  *
  * @param {object} request
  * @param {string} request.preloadUrl `file://` URL of the preload
@@ -1194,7 +1333,7 @@ export function buildChildEnv({ preloadUrl, base, projectRoot, token, env = proc
   };
 
   if (token === undefined) {
-    // Never inherit a stale credential into an explicitly unauthenticated run.
+    // Never inherit another process's credential into an unauthenticated run.
     delete childEnv.DEBUGGEN_TOKEN;
   } else {
     childEnv.DEBUGGEN_TOKEN = token;
@@ -1204,25 +1343,30 @@ export function buildChildEnv({ preloadUrl, base, projectRoot, token, env = proc
 }
 
 /**
- * Describe the credential without disclosing it. The byte count is reported so
- * a developer can tell "set" from "set to something implausible" without the
+ * Describe a credential without disclosing it. The byte count is reported so a
+ * developer can tell "set" from "set to something implausible" without the
  * value ever reaching a terminal, a log file or a scrollback buffer.
+ *
+ * In `--spawn-local` the credential is always absent — only the service's
+ * launcher mints one — so the description says what that costs rather than
+ * leaving an empty field.
  *
  * @param {string | undefined} token
  * @returns {string}
  */
 export function describeToken(token) {
   if (token === undefined) {
-    return '<not set (--no-token): the service rejects unauthenticated ingest, so no server or database spans will be recorded>';
+    return '<not set (--spawn-local): the service rejects unauthenticated ingest, so no server or database spans will be recorded>';
   }
   return `<set, ${Buffer.byteLength(token, 'utf8')} bytes>`;
 }
 
 /**
- * The banner printed once, immediately before the child is spawned. It names
- * everything that makes this run different from a plain `dev` — including the
- * effective `NODE_OPTIONS`, so an inherited value is visibly preserved rather
- * than assumed — and the credential only as a description.
+ * The banner printed once, immediately before a `--spawn-local` child is
+ * spawned. It names everything that makes this run different from a plain
+ * `dev` — including the effective `NODE_OPTIONS`, so an inherited value is
+ * visibly preserved rather than assumed — and the missing credential as a
+ * description of what it costs.
  *
  * @param {object} request
  * @param {string} request.root repository root
@@ -1247,12 +1391,93 @@ export function buildBanner({ root, project, command, preload, base, childEnv })
   const width = rows.reduce((longest, [label]) => Math.max(longest, (label ?? '').length), 0);
 
   return [
-    'dev-instrumented: starting the instrumented development server',
+    'dev-instrumented: starting the development server in this terminal (--spawn-local)',
     ...rows.map(([label, value]) => `  ${(label ?? '').padEnd(width)}  ${value ?? ''}`),
     '',
     '  Stop it with Ctrl-C. Nothing in the project was modified, and no file',
     '  was written: the server-tier tracer lives in this child process only.',
+    '',
+    '  This run is UNAUTHENTICATED: the service accepts telemetry ingest only',
+    '  from a server-agent credential it minted for the process it launched, so',
+    '  no server or database spans will be recorded. Run this command without',
+    '  --spawn-local to have the service launch the project instead, which is',
+    '  the path that produces authenticated server telemetry.',
   ].join('\n');
+}
+
+/**
+ * The report printed after the service has launched the project. It states
+ * what the service answered with and who owns the process, because the process
+ * is deliberately not this one.
+ *
+ * @param {object} request
+ * @param {ResolvedProject} request.project
+ * @param {string} request.base service base URL
+ * @param {LaunchResult} request.result what the service reported
+ * @param {boolean} request.foreground whether this command waits for Ctrl-C
+ * @returns {string}
+ */
+export function buildLaunchReport({ project, base, result, foreground }) {
+  const rows = [
+    ['project', project.label],
+    ['service', base],
+    ['route', `POST ${LAUNCH_PATH}`],
+    ['dev server', result.devServerUrl ?? '(not reported)'],
+    ['pid', result.pid === undefined ? '(not reported)' : String(result.pid)],
+  ];
+  const width = rows.reduce((longest, [label]) => Math.max(longest, (label ?? '').length), 0);
+
+  return [
+    `dev-instrumented: the service launched ${project.label}`,
+    ...rows.map(([label, value]) => `  ${(label ?? '').padEnd(width)}  ${value ?? ''}`),
+    '',
+    '  The service owns that process: per the protocol it attaches the telemetry',
+    '  preload and mints the project-scoped server-agent credential for it, so',
+    '  server and database spans are recorded under this project root. Nothing',
+    '  in the project was modified.',
+    '',
+    foreground
+      ? `  Press Ctrl-C to stop it again (POST ${STOP_PATH}).`
+      : `  Nothing is running in this terminal. Stop the dev server with --stop, or\n  by ending the session in VS Code.`,
+  ].join('\n');
+}
+
+/**
+ * Wait until this process is asked to shut down, and report which signal did
+ * it.
+ *
+ * Registering a `SIGINT` listener suppresses the default termination, which is
+ * what lets the foreground mode stop the service's dev server before exiting.
+ * The listeners are removed as soon as the first signal arrives, so a second
+ * Ctrl-C from an impatient developer terminates this process immediately
+ * instead of queuing another stop request.
+ *
+ * A timer holds the event loop open for the wait. Node's signal watchers are
+ * unreferenced, so a process whose only remaining work is "wait for SIGINT"
+ * drains its loop and exits — which, for a top-level `await`, means exiting
+ * with status 13 the moment the launch is reported instead of waiting for the
+ * developer. The timer is cleared with the listeners, so it never delays exit.
+ *
+ * @param {readonly NodeJS.Signals[]} [signals] signals to wait for
+ * @returns {Promise<NodeJS.Signals>} the signal that arrived
+ */
+export async function awaitShutdownSignal(signals = ['SIGINT', 'SIGTERM']) {
+  return await new Promise((resolve) => {
+    /** @type {Array<[NodeJS.Signals, () => void]>} */
+    const handlers = [];
+    const keepAlive = setInterval(() => undefined, KEEP_ALIVE_INTERVAL_MS);
+
+    for (const signal of signals) {
+      /** @returns {void} */
+      const handler = () => {
+        clearInterval(keepAlive);
+        for (const [name, registered] of handlers) process.off(name, registered);
+        resolve(signal);
+      };
+      handlers.push([signal, handler]);
+      process.on(signal, handler);
+    }
+  });
 }
 
 /**
@@ -1346,111 +1571,127 @@ export async function runDevServer(command, childEnv) {
  * Print a failure and return the exit code it maps to.
  *
  * @param {unknown} error
+ * @param {import('node:stream').Writable} [stderr] stream to report on
  * @returns {number}
  */
-function reportFailure(error) {
+function reportFailure(error, stderr = process.stderr) {
   if (error instanceof DevInstrumentedError) {
-    writeLine(process.stderr, `dev-instrumented: ${error.message}`);
-    if (error.hint !== undefined) writeLine(process.stderr, `\n${error.hint}`);
-    if (error.showUsage) writeLine(process.stderr, `\n${usage()}`);
+    writeLine(stderr, `dev-instrumented: ${error.message}`);
+    if (error.hint !== undefined) writeLine(stderr, `\n${error.hint}`);
+    if (error.showUsage) writeLine(stderr, `\n${usage()}`);
     return error.exitCode;
   }
 
   const detail = error instanceof Error ? (error.stack ?? error.message) : String(error);
-  writeLine(process.stderr, `dev-instrumented: unexpected failure\n${detail}`);
+  writeLine(stderr, `dev-instrumented: unexpected failure\n${detail}`);
   return EXIT_PREFLIGHT;
 }
 
 /**
+ * @typedef {object} MainContext
+ * @property {string} [root] repository root, for resolving the preload and the
+ *   default project
+ * @property {string} [cwd] directory a relative `--project` resolves against
+ * @property {NodeJS.ProcessEnv} [env] environment to read and to inherit into a
+ *   `--spawn-local` child
+ * @property {import('node:stream').Writable} [stdout] stream the banner, the
+ *   launch report and the usage text are written to
+ * @property {import('node:stream').Writable} [stderr] stream failures and hints
+ *   are written to
+ */
+
+/**
  * CLI entry point.
  *
- * The order is fixed so that every failure happens before anything is
- * spawned: resolve the preload, resolve the service, read the editor
- * credential, confirm the service answers, obtain the process-scoped
- * credential, and only then start the dev server.
+ * The order is fixed so that every failure happens before anything runs:
+ * resolve the preload, resolve the target project, resolve the service, read
+ * the editor credential, confirm the service answers, and only then launch,
+ * stop or spawn.
+ *
+ * The context parameter exists so the whole command can be driven against a
+ * temporary tree and a stub service in `scripts/dev-instrumented.test.mjs`;
+ * the defaults are the production values and the CLI entry below passes none of
+ * them.
  *
  * @param {readonly string[]} [argv] arguments after the script path
+ * @param {MainContext} [context] injected roots and environment
  * @returns {Promise<number>} process exit code
  */
-export async function main(argv = process.argv.slice(2)) {
+export async function main(argv = process.argv.slice(2), context = {}) {
+  const root = context.root ?? REPO_ROOT;
+  const cwd = context.cwd ?? process.cwd();
+  const env = context.env ?? process.env;
+  const stdout = context.stdout ?? process.stdout;
+  const stderr = context.stderr ?? process.stderr;
+
   /** @type {DevInstrumentedOptions} */
   let options;
   try {
     options = parseArgs(argv);
   } catch (error) {
-    return reportFailure(error);
+    return reportFailure(error, stderr);
   }
 
   if (options.help) {
-    writeLine(process.stdout, usage());
+    writeLine(stdout, usage());
     return EXIT_OK;
   }
 
   try {
-    const preload = await resolvePreload(REPO_ROOT);
-    const project = await resolveProject({ root: REPO_ROOT, project: options.project });
-    const base = resolveServiceBase({ service: options.service });
+    const project = await resolveProject({ root, project: options.project, cwd });
+    const base = resolveServiceBase({ service: options.service, env });
 
-    if (options.viaService && options.noToken) {
+    if (options.stop) {
+      const editorToken = await readEditorCredential(resolveDebuggenHome(env));
+      await checkServiceHealth(base);
+      await stopDevServer({ base, editorToken, projectRoot: project.dir });
       writeLine(
-        process.stderr,
-        'dev-instrumented: --no-token has no effect with --via-service; the service mints the credential for the process it launches.',
-      );
-    }
-
-    // The editor credential is needed for both the delegated launch and the
-    // credential request, and only skippable on the explicitly
-    // unauthenticated local path.
-    const needsEditorCredential = options.viaService || !options.noToken;
-    const editorToken = needsEditorCredential ? await readEditorCredential() : undefined;
-
-    await checkServiceHealth(base);
-
-    if (options.viaService) {
-      const result = await launchViaService({
-        base,
-        editorToken: /** @type {string} */ (editorToken),
-        projectRoot: project.dir,
-      });
-      writeLine(
-        process.stdout,
-        [
-          `dev-instrumented: the service launched ${project.label} through ${LAUNCH_PATH}`,
-          `  dev server  ${result.devServerUrl ?? '(not reported)'}`,
-          `  pid         ${result.pid ?? '(not reported)'}`,
-          '',
-          '  The service owns that process: it attached the preload, minted the',
-          '  credential and will stop the process with the session. Nothing is',
-          '  running in this terminal.',
-        ].join('\n'),
+        stdout,
+        `dev-instrumented: the service stopped the dev server for ${project.label}`,
       );
       return EXIT_OK;
     }
 
-    const token = options.noToken
-      ? undefined
-      : await mintServerAgentToken({
-          base,
-          editorToken: /** @type {string} */ (editorToken),
-          projectRoot: project.dir,
-        });
+    // Both remaining modes depend on the preload: the local spawn attaches it
+    // itself, and the service's launcher attaches this same file, so reporting
+    // a missing bundle here names the build command instead of leaving the
+    // launcher to fail with a path.
+    const preload = await resolvePreload(root);
 
-    const command = buildLaunchCommand({ project, root: REPO_ROOT });
-    const childEnv = buildChildEnv({
-      preloadUrl: preload.url,
-      base,
-      projectRoot: project.dir,
-      token,
-    });
+    if (options.spawnLocal) {
+      // No editor credential is read: this mode makes no authorised call, and
+      // reading a credential it cannot use would be misleading.
+      await checkServiceHealth(base);
 
-    writeLine(
-      process.stdout,
-      buildBanner({ root: REPO_ROOT, project, command, preload, base, childEnv }),
-    );
+      const command = buildLaunchCommand({ project, root, env });
+      const childEnv = buildChildEnv({
+        preloadUrl: preload.url,
+        base,
+        projectRoot: project.dir,
+        token: undefined,
+        env,
+      });
 
-    return await runDevServer(command, childEnv);
+      writeLine(stdout, buildBanner({ root, project, command, preload, base, childEnv }));
+
+      return await runDevServer(command, childEnv);
+    }
+
+    const editorToken = await readEditorCredential(resolveDebuggenHome(env));
+    await checkServiceHealth(base);
+
+    const result = await launchDevServer({ base, editorToken, projectRoot: project.dir });
+    writeLine(stdout, buildLaunchReport({ project, base, result, foreground: !options.detach }));
+
+    if (options.detach) return EXIT_OK;
+
+    const signal = await awaitShutdownSignal();
+    writeLine(stdout, `\ndev-instrumented: ${signal} received; stopping the dev server`);
+    await stopDevServer({ base, editorToken, projectRoot: project.dir });
+    writeLine(stdout, 'dev-instrumented: the service stopped the dev server');
+    return EXIT_OK;
   } catch (error) {
-    return reportFailure(error);
+    return reportFailure(error, stderr);
   }
 }
 

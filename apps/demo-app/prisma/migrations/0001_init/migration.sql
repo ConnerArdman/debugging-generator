@@ -274,4 +274,3 @@ ALTER TABLE "shipping_quotes" ADD CONSTRAINT "shipping_quotes_order_id_fkey" FOR
 
 -- AddForeignKey
 ALTER TABLE "shipping_quotes" ADD CONSTRAINT "shipping_quotes_cart_id_fkey" FOREIGN KEY ("cart_id") REFERENCES "carts"("id") ON DELETE CASCADE ON UPDATE CASCADE;
-

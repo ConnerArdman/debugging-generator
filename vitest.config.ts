@@ -16,6 +16,18 @@
 // turns the corresponding gate into a no-op that exits 1, so the list below must
 // stay in sync with those scripts.
 //
+// Two things here are load-bearing beyond the project list, and both are
+// EXPORTED so that apps/local-service/vitest.config.ts - the one other Vitest
+// container in the repository, which serves workspace-rooted and IDE runs -
+// states the same policy from the same source instead of a second copy of it:
+//   * `hermeticEnv` is applied to every project and to the container, so no
+//     automated test can inherit an ambient model provider or credential
+//     (AAP 0.5.3, 0.8.3). See its own comment for how and why.
+//   * `localServiceProjects` defines that workspace's two projects once, so
+//     they behave identically from both entry points; a second declaration is
+//     what let the execution policy of the integration suites go missing from
+//     this path.
+//
 // Deliberately NOT configured here, each for a stated reason:
 //   * `resolve.alias` for `@debuggen/*`. Cross-package imports must resolve
 //     through each package's `exports` map into `dist/`, which is why `pnpm build`
@@ -105,11 +117,59 @@ const coverageExclude: string[] = [
 ];
 
 /**
+ * The environment EVERY project runs with, whichever entry point started it.
+ *
+ * Without it a suite inherits the launching shell's configuration verbatim, so
+ * a developer's or CI runner's ambient `DEBUGGEN_PROVIDER=anthropic` plus a
+ * live `ANTHROPIC_API_KEY` would put the real, networked model provider inside
+ * an automated test. AAP 0.5.3 makes the deterministic provider "what every
+ * automated test uses", AAP 0.8.3 runs the integration suites with
+ * `DEBUGGEN_PROVIDER=deterministic`, and AAP 0.5.2 promises that "nothing
+ * leaves" the machine in that mode - promises this file is the only place that
+ * can keep for every project at once.
+ *
+ * How it takes effect, measured in Vitest 5.0.1 rather than assumed: `test.env`
+ * is a per-project option, and the worker assigns each entry onto `process.env`
+ * (through the `import.meta.env` proxy, whose setter writes `process.env[key]`)
+ * before the first test module is imported. Assignment means these values
+ * OVERRIDE whatever was exported ambiently, which is the whole point, and any
+ * child process a suite spawns inherits them too.
+ *
+ * `ANTHROPIC_API_KEY` is emptied rather than removed because `test.env` can
+ * only assign - an `undefined` value would stringify to the literal
+ * `"undefined"`, which is worse than an empty string. Empty is falsy, so every
+ * "is a key configured?" check still reads it as absent while the real
+ * credential cannot reach a test process.
+ *
+ * Deliberately NOT a `process.env` mutation at module scope: this file is
+ * evaluated once, in the Vitest main process, which an editor keeps alive for a
+ * whole session, so a mutation here would leak into everything that process
+ * later does. `test.env` is scoped to the worker that runs the tests.
+ *
+ * A suite that genuinely needs another value opts in explicitly and reversibly
+ * with `vi.stubEnv('DEBUGGEN_PROVIDER', …)` in the test that needs it - which is
+ * how the Anthropic provider's own suite (AAP 0.8.3, mocked transport) covers
+ * the real provider without a live key. Nothing else may reintroduce the
+ * ambient value.
+ *
+ * Exported so the workspace container in apps/local-service can declare the
+ * same guarantee on itself rather than only inheriting it through the projects
+ * it registers - a reader of that file must be able to see it there.
+ */
+export const hermeticEnv: Readonly<Record<string, string>> = {
+  DEBUGGEN_PROVIDER: 'deterministic',
+  ANTHROPIC_API_KEY: '',
+};
+
+/**
  * A Node-environment project.
  *
  * `globals: false` is the convention for these projects: every Node suite
  * imports `describe`/`it`/`expect` from `vitest` explicitly, which keeps the
  * service, schema and analysis packages honest about what they depend on.
+ *
+ * `env` is spread into a fresh object per project so no two projects share one
+ * mutable environment record.
  */
 function nodeProject(name: string, include: string[]): UserWorkspaceConfig {
   return defineProject({
@@ -119,6 +179,7 @@ function nodeProject(name: string, include: string[]): UserWorkspaceConfig {
       globals: false,
       include,
       exclude: sharedExclude,
+      env: { ...hermeticEnv },
     },
   });
 }
@@ -140,8 +201,132 @@ function domProject(name: string, include: string[]): UserWorkspaceConfig {
       globals: true,
       include,
       exclude: sharedExclude,
+      env: { ...hermeticEnv },
     },
   });
+}
+
+/**
+ * The two projects of `apps/local-service`, defined here ONCE for both
+ * containers that register them.
+ *
+ * Why the definition lives in this file and not in the workspace's own
+ * vitest.config.ts, which imports this factory: every command-line run resolves
+ * through THIS config. Each workspace's `test` script is
+ * `vitest run --root ../.. --project <name>`, and `pnpm test:integration` is
+ * `vitest run --project local-service-integration` (AAP 0.8.5) - so the root is
+ * the authoritative execution path, and an execution policy that existed only
+ * in the workspace file would never be in force for any gate. The dependency
+ * runs workspace -> root rather than the other way around because
+ * eslint.config.js forbids a cross-workspace relative import (`./apps/…`) from
+ * anywhere in the repository, while `../../vitest.config.ts` from inside the
+ * workspace is allowed.
+ *
+ * `baseDir` is the directory the include globs are written against, relative to
+ * the run root: `apps/local-service` for a repository-root run, `''` when the
+ * run root already IS the workspace. `exclude` belongs to the registering
+ * container, because the two trees genuinely differ - the root list also has to
+ * keep `tests/**` (Playwright's) and the demo's generated Prisma client out,
+ * neither of which exists below `apps/local-service`.
+ *
+ * Both names are contracts, not labels: `pnpm test:integration` names
+ * `local-service-integration` and the workspace scripts pass both names to this
+ * config. Renaming one turns a blocking gate into a no-op that exits 1.
+ *
+ * @param options.baseDir Directory prefix for the include globs, `''` for none.
+ * @param options.exclude Exclude patterns of the registering container.
+ * @returns The `local-service` and `local-service-integration` projects.
+ */
+export function localServiceProjects(options: {
+  readonly baseDir: string;
+  readonly exclude: string[];
+}): UserWorkspaceConfig[] {
+  const { baseDir, exclude } = options;
+  const at = (glob: string): string[] => [baseDir === '' ? glob : `${baseDir}/${glob}`];
+
+  return [
+    /**
+     * The colocated unit suites of the service: config parsing and defaults,
+     * the session state-machine transition table, telemetry attribution,
+     * redaction wiring, the auth token and Origin rules, source-path
+     * containment, panel fallback assembly and retention. They must stay fast
+     * and hermetic - no socket opened, no dev server launched, nothing under
+     * `$DEBUGGEN_HOME` touched - so they need none of the execution policy the
+     * integration project below carries and run with Vitest's defaults.
+     * `retry: 0` restates the default on the record: a flaky unit test must
+     * fail, never be masked by a second attempt.
+     */
+    defineProject({
+      test: {
+        name: 'local-service',
+        environment: 'node',
+        globals: false,
+        include: at('src/**/*.test.ts'),
+        exclude,
+        env: { ...hermeticEnv },
+        retry: 0,
+      },
+    }),
+
+    /**
+     * The in-process integration suites of AAP 0.8.3 (`session-lifecycle`,
+     * `ws-protocol`, `telemetry-ingest`, `pipeline-deterministic`,
+     * `cleanup-conflict`, `source-open`, `panel-fallback`, `panel-data`,
+     * `binding`, `followup`, `auth`, `concurrency`). Every one of them boots a
+     * real service - HTTP plus a WebSocket upgrade on an ephemeral port -
+     * creates a temporary `$DEBUGGEN_HOME` holding a `node:sqlite` store, and
+     * copies a fixture project somewhere writable before the real installer
+     * patches it. That makes the policy below part of the contract rather than
+     * tuning, and it is why the definition is shared instead of duplicated:
+     *
+     *   * `fileParallelism: false` runs one suite file at a time (Vitest also
+     *     forces this project's `maxWorkers` to 1 when it is false). Concurrent
+     *     files would race for ports, for the store and for the fixture copy,
+     *     and a collision reads as a product bug when it is only a scheduling
+     *     artefact. It does not serialize the rest of the run: Vitest 5.0.1
+     *     puts the specs of a project with `isolate: true`, the default
+     *     `sequence.groupOrder` and `maxWorkers: 1` into their own sequential
+     *     group, leaving every sibling project at its own worker count.
+     *   * `pool: 'forks'` states the pool these suites require instead of
+     *     relying on it being the 5.0.1 default: they drive `node:sqlite`,
+     *     child processes (the dev-server launcher) and `process.env`, all of
+     *     which behave as they do in production only in a real child process.
+     *   * `isolate: true` (also the default, restated because it is
+     *     load-bearing here) gives each suite file a fresh process and module
+     *     registry, so a store handle, a listening server or a cached config
+     *     cannot survive into the next file. Deliberately not the `singleFork`
+     *     shape: `test.poolOptions` was removed in Vitest 4, and one shared
+     *     fork would trade exactly the isolation these suites depend on.
+     *   * `testTimeout` / `hookTimeout` of 30 s replace the 5 s / 10 s
+     *     defaults, which a real pipeline run, a ts-morph instrumentation
+     *     install or a cleanup reconciliation pass legitimately exceeds on a
+     *     loaded machine. Generous, not unbounded: a genuinely hung server
+     *     still fails the run.
+     *   * `retry: 0`. A flaky integration test is usually reporting a real leak
+     *     (an unclosed socket, a `$DEBUGGEN_HOME` left behind) that a retry
+     *     would hide.
+     *
+     * `environment: 'node'` with `globals: false`: the suites reach the service
+     * over `fetch` and a `ws` client, never a DOM, and import their test API
+     * from `vitest` explicitly.
+     */
+    defineProject({
+      test: {
+        name: 'local-service-integration',
+        environment: 'node',
+        globals: false,
+        include: at('test/integration/**/*.test.ts'),
+        exclude,
+        env: { ...hermeticEnv },
+        pool: 'forks',
+        fileParallelism: false,
+        isolate: true,
+        testTimeout: 30_000,
+        hookTimeout: 30_000,
+        retry: 0,
+      },
+    }),
+  ];
 }
 
 export default defineConfig({
@@ -153,6 +338,15 @@ export default defineConfig({
     // prints when a project matches nothing. This config declares `projects`,
     // which makes it a container that never collects tests itself, so the one
     // place the list has to be correct is the projects below.
+
+    // `env`, by contrast, belongs in both places, and for the reason `exclude`
+    // does not: inheritance merges an object by key instead of concatenating it,
+    // so the identical record below and on each project produces exactly one
+    // value per variable. Every project already declares it explicitly; this
+    // entry is the backstop that holds the guarantee of `hermeticEnv` - no
+    // automated test may inherit a real model provider or credential - even for
+    // a project added later without the helpers above.
+    env: { ...hermeticEnv },
 
     // Coverage is a root-only option - Vitest ignores it inside a project - so
     // one report covers every project of a `pnpm test` run. `text` prints the
@@ -198,17 +392,21 @@ export default defineConfig({
       nodeProject('model-provider', ['packages/model-provider/src/**/*.test.ts']),
 
       // --- apps -------------------------------------------------------------
-      // Co-located unit suites of the local service. Its `test/` directory holds
-      // fixtures and the integration suite, which is the separate project below.
-      nodeProject('local-service', ['apps/local-service/src/**/*.test.ts']),
+      // `local-service` (the service's colocated unit suites) and
+      // `local-service-integration` (its in-process integration suites, with
+      // the serialized execution policy and 30 s budgets those need) come from
+      // the single factory above, which apps/local-service/vitest.config.ts
+      // imports for workspace-rooted runs. They are NOT re-declared through
+      // `nodeProject` here: that is what previously left the two containers
+      // describing the same project name differently, with the execution policy
+      // missing from this - the authoritative - path.
+      //
       // The name `local-service-integration` is the contract behind
       // `pnpm test:integration` (AAP 0.8.5). It also runs as part of `pnpm test`,
       // so `pnpm verify` executes it twice; that repetition is accepted by the
       // gate definitions and must not be "optimised" away by renaming the project
       // or excluding it from the default run.
-      nodeProject('local-service-integration', [
-        'apps/local-service/test/integration/**/*.test.ts',
-      ]),
+      ...localServiceProjects({ baseDir: 'apps/local-service', exclude: sharedExclude }),
       // happy-dom: the MV3 background, bridge and panel suites stub `chrome.*` on
       // a window and exercise `window.postMessage` relaying.
       domProject('chrome-extension', ['apps/chrome-extension/test/**/*.test.{ts,tsx}']),

@@ -1,0 +1,905 @@
+/**
+ * Tests for `scripts/dev-instrumented.mjs`, the CLI that starts a development
+ * server with the telemetry preload attached.
+ *
+ * The suite has two jobs, and both exist because the CLI is a *caller* of
+ * contracts it does not own:
+ *
+ *  1. CALLER/DEFINER CONTRACT. {@link PROTOCOL_ROUTES} below is the definer
+ *     side, transcribed from the protocol (AAP 0.4.2 `POST /dev-server/launch`
+ *     `{ projectRoot, command? }` → `{ devServerUrl, pid }`,
+ *     `POST /dev-server/stop`, `GET /health`; AAP 0.5.6 for who must present a
+ *     credential). It is written from the specification and NEVER from the
+ *     module under test — deriving the accepted routes from the caller's own
+ *     exports would make the pair self-consistent and blind to exactly the
+ *     drift this suite exists to catch. `SERVICE_ROUTES` is then asserted
+ *     against it, so a rename on either side fails.
+ *
+ *     The definer is enforced the way a service enforces it: unknown path 404,
+ *     wrong method 405, missing or wrong bearer credential 401, wrong
+ *     content-type 415, and a body that is not exactly `{ projectRoot }` (plus
+ *     the optional `command`) 400. Every rejection is recorded, and the
+ *     end-to-end cases assert the caller provokes none of them.
+ *
+ *     `agrees with the protocol definition once it lands` closes the loop when
+ *     the real definer exists: as soon as `packages/protocol/src/http.ts` or a
+ *     route module under `apps/local-service/src/server/routes/` is present,
+ *     that test reads it and requires the same three paths. At this boundary
+ *     neither file is in the tree (the service is a later boundary's
+ *     deliverable), which the test asserts explicitly rather than passing
+ *     vacuously, and an in-process run against the real hono app with its auth
+ *     middleware belongs to that boundary's own integration suite
+ *     (`apps/local-service/test/integration/**`, AAP 0.8.3).
+ *
+ *  2. ENVIRONMENT CONTRACT. `.env.example` claims to document every variable
+ *     the product and its suites read. That claim is re-derived from the tree:
+ *     the variable names this script and `playwright.config.ts` actually read
+ *     must all appear in that file.
+ *
+ * Nothing here touches the network beyond a loopback server on an ephemeral
+ * port, and every filesystem fixture lives in a directory created by
+ * `fs.mkdtemp` and removed afterwards, so the suite is hermetic and safe to run
+ * concurrently with any other.
+ */
+import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+import fs from 'node:fs';
+import http from 'node:http';
+import os from 'node:os';
+import path from 'node:path';
+import process from 'node:process';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+import {
+  INGEST_PATH,
+  SERVICE_ROUTES,
+  awaitShutdownSignal,
+  buildChildEnv,
+  describeToken,
+  launchDevServer,
+  main,
+  parseArgs,
+  stopDevServer,
+} from './dev-instrumented.mjs';
+
+/**
+ * The definer's contract, transcribed from the protocol rather than imported
+ * from the module under test.
+ *
+ * `authenticated` follows AAP 0.5.6: `GET /health` is one of the two
+ * unauthenticated routes, and everything else requires a bearer credential —
+ * for these two routes the editor credential the service wrote to
+ * `$DEBUGGEN_HOME/auth.json`.
+ */
+const PROTOCOL_ROUTES = Object.freeze({
+  health: Object.freeze({
+    method: 'GET',
+    path: '/health',
+    authenticated: false,
+    required: Object.freeze([]),
+    optional: Object.freeze([]),
+  }),
+  launch: Object.freeze({
+    method: 'POST',
+    path: '/dev-server/launch',
+    authenticated: true,
+    required: Object.freeze(['projectRoot']),
+    optional: Object.freeze(['command']),
+  }),
+  stop: Object.freeze({
+    method: 'POST',
+    path: '/dev-server/stop',
+    authenticated: true,
+    required: Object.freeze(['projectRoot']),
+    optional: Object.freeze([]),
+  }),
+});
+
+/** Every route of the contract, in the order the protocol table lists them. */
+const ALL_PROTOCOL_ROUTES = Object.freeze([
+  PROTOCOL_ROUTES.health,
+  PROTOCOL_ROUTES.launch,
+  PROTOCOL_ROUTES.stop,
+]);
+
+/** Shorthands for expectations, spelled from the contract above. */
+const HEALTH = PROTOCOL_ROUTES.health.path;
+const LAUNCH = PROTOCOL_ROUTES.launch.path;
+const STOP = PROTOCOL_ROUTES.stop.path;
+
+/** Repository root, derived from this file's location. */
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+
+/** The script under test, read once for the static contract assertions. */
+const SCRIPT_SOURCE = fs.readFileSync(path.join(REPO_ROOT, 'scripts/dev-instrumented.mjs'), 'utf8');
+
+/**
+ * The editor credential the stub service accepts, generated per run rather
+ * than written into this file: a committed high-entropy literal assigned to a
+ * credential-shaped name is exactly what `pnpm check:secrets` rejects, and a
+ * test has no reason to carry a fixed one.
+ */
+const EDITOR_TOKEN = `editor-credential-${randomUUID()}`;
+
+/** What the stub service reports for a successful launch. */
+const LAUNCHED = Object.freeze({ devServerUrl: 'http://localhost:3000', pid: 4242 });
+
+/**
+ * A writable stream that keeps what was written, so the command's own output
+ * can be asserted without patching `process.stdout`.
+ *
+ * @returns {{ write: (chunk: string) => boolean, text: () => string }}
+ */
+function captureStream() {
+  /** @type {string[]} */
+  const chunks = [];
+  return {
+    write(chunk) {
+      chunks.push(String(chunk));
+      return true;
+    },
+    text() {
+      return chunks.join('');
+    },
+  };
+}
+
+/**
+ * @typedef {object} RecordedRequest
+ * @property {string} method
+ * @property {string} path
+ * @property {string | undefined} authorization
+ * @property {unknown} body
+ */
+
+/**
+ * @typedef {object} StubService
+ * @property {string} base base URL, without a trailing slash
+ * @property {RecordedRequest[]} requests every request the service received
+ * @property {Array<{ path: string, status: number, reason: string }>} rejections
+ *   every request the contract refused
+ * @property {() => string[]} routes `METHOD /path` for each request, in order
+ * @property {() => Promise<void>} close shut the server down
+ */
+
+/**
+ * Start a stub of the local coordination service that enforces
+ * {@link PROTOCOL_ROUTES} the way a service enforces it.
+ *
+ * @param {object} [options]
+ * @param {readonly { method: string, path: string, authenticated: boolean, required: readonly string[], optional: readonly string[] }[]} [options.implemented]
+ *   routes this build answers; defaults to the whole contract
+ * @param {number} [options.launchStatus] status for the launch route
+ * @param {number} [options.stopStatus] status for the stop route
+ * @param {Record<string, unknown>} [options.launchBody] body the launch route answers with
+ * @returns {Promise<StubService>}
+ */
+async function startStubService(options = {}) {
+  const implemented = options.implemented ?? ALL_PROTOCOL_ROUTES;
+  const launchStatus = options.launchStatus ?? 200;
+  const stopStatus = options.stopStatus ?? 200;
+  const launchBody = options.launchBody ?? LAUNCHED;
+
+  /** @type {RecordedRequest[]} */
+  const requests = [];
+  /** @type {Array<{ path: string, status: number, reason: string }>} */
+  const rejections = [];
+
+  const server = http.createServer((req, res) => {
+    /** @type {Buffer[]} */
+    const body = [];
+    req.on('data', (chunk) => body.push(Buffer.from(chunk)));
+    req.on('end', () => {
+      const raw = Buffer.concat(body).toString('utf8');
+      /** @type {unknown} */
+      let parsed;
+      try {
+        parsed = raw === '' ? undefined : JSON.parse(raw);
+      } catch {
+        parsed = raw;
+      }
+
+      const requestPath = new URL(req.url ?? '/', 'http://127.0.0.1').pathname;
+      const method = req.method ?? 'GET';
+      requests.push({
+        method,
+        path: requestPath,
+        authorization: req.headers.authorization,
+        body: parsed,
+      });
+
+      /**
+       * @param {number} status
+       * @param {unknown} payload
+       * @returns {void}
+       */
+      const answer = (status, payload) => {
+        res.writeHead(status, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(payload));
+      };
+
+      /**
+       * @param {number} status
+       * @param {string} reason
+       * @returns {void}
+       */
+      const refuse = (status, reason) => {
+        rejections.push({ path: requestPath, status, reason });
+        answer(status, { message: reason });
+      };
+
+      const route = implemented.find((entry) => entry.path === requestPath);
+      if (route === undefined) {
+        refuse(404, `no route ${requestPath}`);
+        return;
+      }
+      if (route.method !== method) {
+        refuse(405, `${requestPath} accepts ${route.method}, not ${method}`);
+        return;
+      }
+      if (route.authenticated) {
+        if (req.headers.authorization !== `Bearer ${EDITOR_TOKEN}`) {
+          refuse(401, `${requestPath} requires the editor credential`);
+          return;
+        }
+        if (!String(req.headers['content-type'] ?? '').includes('application/json')) {
+          refuse(415, `${requestPath} accepts application/json`);
+          return;
+        }
+        if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+          refuse(400, `${requestPath} expects a JSON object body`);
+          return;
+        }
+        const record = /** @type {Record<string, unknown>} */ (parsed);
+        for (const key of route.required) {
+          const value = record[key];
+          if (typeof value !== 'string' || value === '') {
+            refuse(400, `${requestPath} requires ${key}`);
+            return;
+          }
+        }
+        if (typeof record.projectRoot === 'string' && !path.isAbsolute(record.projectRoot)) {
+          refuse(400, `${requestPath} requires an absolute projectRoot`);
+          return;
+        }
+        const allowed = new Set([...route.required, ...route.optional]);
+        const unknown = Object.keys(record).filter((key) => !allowed.has(key));
+        if (unknown.length > 0) {
+          refuse(400, `${requestPath} does not accept ${unknown.join(', ')}`);
+          return;
+        }
+      }
+
+      if (requestPath === HEALTH) {
+        answer(200, { status: 'ok', version: '0.1.0', pairing: true });
+        return;
+      }
+      if (requestPath === LAUNCH) {
+        answer(launchStatus, launchStatus === 200 ? launchBody : { message: 'launch refused' });
+        return;
+      }
+      answer(stopStatus, stopStatus === 200 ? { stopped: true } : { message: 'stop refused' });
+    });
+  });
+
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve(undefined)));
+  const address = server.address();
+  const port = typeof address === 'object' && address !== null ? address.port : 0;
+
+  return {
+    base: `http://127.0.0.1:${port}`,
+    requests,
+    rejections,
+    routes: () => requests.map((request) => `${request.method} ${request.path}`),
+    close: () =>
+      new Promise((resolve) => {
+        server.closeAllConnections();
+        server.close(() => resolve(undefined));
+      }),
+  };
+}
+
+/**
+ * @typedef {object} Fixture
+ * @property {string} root repository root the command resolves against
+ * @property {string} home session home holding `auth.json`
+ * @property {string} projectDir absolute path of the default target project
+ * @property {string} preloadUrl `file://` URL of the fabricated preload
+ */
+
+/** Every temporary directory this suite created, removed in `afterAll`. */
+const temporaryRoots = [];
+
+/**
+ * Build a temporary tree that looks like this repository to the command: a
+ * built telemetry preload, a target project with a `dev` script, and a session
+ * home with an editor credential.
+ *
+ * @param {object} [options]
+ * @param {boolean} [options.withCredential] write `auth.json`
+ * @returns {Promise<Fixture>}
+ */
+async function createFixture(options = {}) {
+  const base = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'dev-instrumented-test-'));
+  temporaryRoots.push(base);
+
+  const root = path.join(base, 'repo');
+  const preloadDir = path.join(root, 'packages', 'telemetry', 'dist', 'node');
+  await fs.promises.mkdir(preloadDir, { recursive: true });
+  const preload = path.join(preloadDir, 'register.mjs');
+  await fs.promises.writeFile(preload, 'export default {};\n', 'utf8');
+
+  const projectDir = path.join(root, 'apps', 'demo-app');
+  await fs.promises.mkdir(projectDir, { recursive: true });
+  await fs.promises.writeFile(
+    path.join(projectDir, 'package.json'),
+    `${JSON.stringify({ name: 'target-app', private: true, scripts: { dev: 'next dev' } }, null, 2)}\n`,
+    'utf8',
+  );
+
+  const home = path.join(base, 'home');
+  await fs.promises.mkdir(home, { recursive: true });
+  if (options.withCredential !== false) {
+    await fs.promises.writeFile(
+      path.join(home, 'auth.json'),
+      `${JSON.stringify({ token: EDITOR_TOKEN, role: 'vscode' }, null, 2)}\n`,
+      'utf8',
+    );
+  }
+
+  return { root, home, projectDir, preloadUrl: pathToFileURL(preload).href };
+}
+
+/**
+ * The context `main` is driven with: the fixture tree, an environment naming
+ * the fixture's session home, and captured output streams.
+ *
+ * @param {Fixture} fixture
+ * @returns {{ context: Record<string, unknown>, stdout: ReturnType<typeof captureStream>, stderr: ReturnType<typeof captureStream> }}
+ */
+function contextFor(fixture) {
+  const stdout = captureStream();
+  const stderr = captureStream();
+  return {
+    context: {
+      root: fixture.root,
+      cwd: fixture.root,
+      env: { DEBUGGEN_HOME: fixture.home, PATH: process.env.PATH ?? '' },
+      stdout,
+      stderr,
+    },
+    stdout,
+    stderr,
+  };
+}
+
+/**
+ * Poll until a predicate holds, so a test can act once the command has reached
+ * a point (the launch request landing) without sleeping for a fixed time.
+ *
+ * @param {() => boolean} predicate
+ * @param {string} description what was being waited for, for the failure message
+ * @returns {Promise<void>}
+ */
+async function waitFor(predicate, description) {
+  const deadline = Date.now() + 5_000;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${description}`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+/** @type {StubService | undefined} */
+let service;
+
+afterEach(async () => {
+  if (service !== undefined) {
+    await service.close();
+    service = undefined;
+  }
+});
+
+afterAll(async () => {
+  for (const directory of temporaryRoots) {
+    await fs.promises.rm(directory, { recursive: true, force: true });
+  }
+});
+
+describe('the route contract the caller is held to', () => {
+  it('matches the protocol, route for route', () => {
+    // Left side: the caller's exported list. Right side: the contract
+    // transcribed from AAP 0.4.2 at the top of this file. A rename on either
+    // side fails here.
+    expect([...SERVICE_ROUTES]).toEqual([HEALTH, LAUNCH, STOP]);
+    expect([HEALTH, LAUNCH, STOP]).toEqual(['/health', '/dev-server/launch', '/dev-server/stop']);
+  });
+
+  it('contains no invented credential route and no route override', () => {
+    // The defect this guards: three guessed credential endpoints plus a
+    // DEBUGGEN_CREDENTIAL_PATH override, none of which the service defines.
+    for (const invented of [
+      '/dev-server/credential',
+      '/credentials/server-agent',
+      '/dev-server/token',
+      'DEBUGGEN_CREDENTIAL_PATH',
+    ]) {
+      expect(SCRIPT_SOURCE).not.toContain(invented);
+    }
+  });
+
+  it('agrees with the protocol definition once it lands', async () => {
+    // The definer of these routes is `packages/protocol/src/http.ts` and the
+    // service's route module. Neither is in the tree at this boundary, so this
+    // test records that fact today and turns into a cross-file agreement check
+    // the moment either file appears - no edit required.
+    /** @type {string[]} */
+    const definers = [];
+    for (const candidate of [
+      'packages/protocol/src/http.ts',
+      'apps/local-service/src/server/routes/dev-server.ts',
+    ]) {
+      if (fs.existsSync(path.join(REPO_ROOT, candidate))) definers.push(candidate);
+    }
+
+    if (definers.length === 0) {
+      const message = [
+        'No protocol/service definer of the dev-server routes exists yet.',
+        'When packages/protocol/src/http.ts or',
+        'apps/local-service/src/server/routes/dev-server.ts lands, this test',
+        'requires it to declare every path in PROTOCOL_ROUTES, and the',
+        "service boundary's own integration suite must drive this CLI across",
+        'HTTP into the real authorised handler.',
+      ].join(' ');
+      expect(definers, message).toEqual([]);
+      return;
+    }
+
+    for (const definer of definers) {
+      const source = await fs.promises.readFile(path.join(REPO_ROOT, definer), 'utf8');
+      for (const route of ALL_PROTOCOL_ROUTES) {
+        expect(source, `${definer} must declare ${route.path}`).toContain(route.path);
+      }
+    }
+  });
+});
+
+describe('launching through the service', () => {
+  it('asks the launcher route once, with the editor credential and the project root', async () => {
+    service = await startStubService();
+    const fixture = await createFixture();
+    const { context, stdout, stderr } = contextFor(fixture);
+
+    const code = await main(['--service', service.base, '--detach'], context);
+
+    expect(stderr.text()).toBe('');
+    expect(code).toBe(0);
+    expect(service.routes()).toEqual([`GET ${HEALTH}`, `POST ${LAUNCH}`]);
+
+    const launch = service.requests[1];
+    expect(launch?.authorization).toBe(`Bearer ${EDITOR_TOKEN}`);
+    expect(launch?.body).toEqual({ projectRoot: fixture.projectDir });
+
+    const report = stdout.text();
+    expect(report).toContain(LAUNCHED.devServerUrl);
+    expect(report).toContain(String(LAUNCHED.pid));
+    expect(report).toContain(`POST ${LAUNCH}`);
+  });
+
+  it('satisfies every rule the contract enforces, provoking no refusal', async () => {
+    service = await startStubService();
+    const fixture = await createFixture();
+    const { context } = contextFor(fixture);
+
+    const code = await main(['--service', service.base, '--detach'], context);
+
+    // Method, bearer credential, content-type and body shape all accepted: the
+    // definer refused nothing, so caller and contract agree on more than the
+    // route name.
+    expect(service.rejections).toEqual([]);
+    expect(code).toBe(0);
+  });
+
+  it('requests no path outside the protocol route set', async () => {
+    service = await startStubService();
+    const fixture = await createFixture();
+    const { context } = contextFor(fixture);
+
+    await main(['--service', service.base, '--detach'], context);
+
+    const contractPaths = ALL_PROTOCOL_ROUTES.map((route) => route.path);
+    const unknown = service.requests.filter((request) => !contractPaths.includes(request.path));
+    expect(unknown).toEqual([]);
+  });
+
+  it('never leaks the editor credential into its own output', async () => {
+    service = await startStubService();
+    const fixture = await createFixture();
+    const { context, stdout, stderr } = contextFor(fixture);
+
+    await main(['--service', service.base, '--detach'], context);
+
+    expect(stdout.text()).not.toContain(EDITOR_TOKEN);
+    expect(stderr.text()).not.toContain(EDITOR_TOKEN);
+  });
+
+  it('stops the launched server when the foreground run is interrupted', async () => {
+    service = await startStubService();
+    const fixture = await createFixture();
+    const { context, stdout } = contextFor(fixture);
+    const started = service;
+
+    const run = main(['--service', started.base], context);
+    await waitFor(
+      () => started.requests.some((request) => request.path === LAUNCH),
+      'the launch request',
+    );
+    process.emit('SIGINT');
+
+    await expect(run).resolves.toBe(0);
+    expect(started.routes()).toEqual([`GET ${HEALTH}`, `POST ${LAUNCH}`, `POST ${STOP}`]);
+    expect(started.requests[2]?.body).toEqual({ projectRoot: fixture.projectDir });
+    expect(started.rejections).toEqual([]);
+    expect(stdout.text()).toContain('stopped the dev server');
+  });
+
+  it('reports a launch route the service does not implement, without trying another path', async () => {
+    service = await startStubService({
+      implemented: [PROTOCOL_ROUTES.health, PROTOCOL_ROUTES.stop],
+    });
+    const fixture = await createFixture();
+    const { context, stderr } = contextFor(fixture);
+
+    const code = await main(['--service', service.base, '--detach'], context);
+
+    expect(code).toBe(2);
+    expect(stderr.text()).toContain(LAUNCH);
+    expect(stderr.text()).toContain('nothing was launched');
+    // Exactly one attempt at the launcher route: no fallback, no probing.
+    expect(service.routes()).toEqual([`GET ${HEALTH}`, `POST ${LAUNCH}`]);
+  });
+
+  it('reports a refused launch with the service reason', async () => {
+    service = await startStubService({ launchStatus: 409 });
+    const fixture = await createFixture();
+    const { context, stderr } = contextFor(fixture);
+
+    const code = await main(['--service', service.base, '--detach'], context);
+
+    expect(code).toBe(2);
+    expect(stderr.text()).toContain('409');
+    expect(stderr.text()).toContain('launch refused');
+    expect(stderr.text()).toContain('--stop');
+  });
+
+  it('rejects a 2xx answer that does not carry the devServerUrl the contract promises', async () => {
+    service = await startStubService({ launchBody: { started: true } });
+    const fixture = await createFixture();
+    const { context, stderr } = contextFor(fixture);
+
+    const code = await main(['--service', service.base, '--detach'], context);
+
+    expect(code).toBe(2);
+    expect(stderr.text()).toContain('without a devServerUrl');
+    expect(stderr.text()).toContain('--stop');
+  });
+
+  it('accepts an answer that names the URL but reports no pid', async () => {
+    service = await startStubService({ launchBody: { devServerUrl: 'http://localhost:3100' } });
+    const fixture = await createFixture();
+    const { context, stdout } = contextFor(fixture);
+
+    const code = await main(['--service', service.base, '--detach'], context);
+
+    expect(code).toBe(0);
+    expect(stdout.text()).toContain('http://localhost:3100');
+    expect(stdout.text()).toContain('(not reported)');
+  });
+
+  it('reports a rejected credential and never reaches the launch route', async () => {
+    service = await startStubService();
+    const fixture = await createFixture({ withCredential: false });
+    const { context, stderr } = contextFor(fixture);
+
+    const code = await main(['--service', service.base, '--detach'], context);
+
+    expect(code).toBe(2);
+    expect(stderr.text()).toContain('no editor credential');
+    expect(service.routes()).toEqual([]);
+  });
+});
+
+describe('stopping through the service', () => {
+  it('calls the stop route with the project root and nothing else', async () => {
+    service = await startStubService();
+    const fixture = await createFixture();
+    const { context, stdout } = contextFor(fixture);
+
+    const code = await main(['--service', service.base, '--stop'], context);
+
+    expect(code).toBe(0);
+    expect(service.routes()).toEqual([`GET ${HEALTH}`, `POST ${STOP}`]);
+    expect(service.requests[1]?.body).toEqual({ projectRoot: fixture.projectDir });
+    expect(service.rejections).toEqual([]);
+    expect(stdout.text()).toContain('stopped the dev server');
+  });
+
+  it('fails loudly when the stop is refused, because the server is still running', async () => {
+    service = await startStubService({ stopStatus: 500 });
+    const fixture = await createFixture();
+    const { context, stderr } = contextFor(fixture);
+
+    const code = await main(['--service', service.base, '--stop'], context);
+
+    expect(code).toBe(2);
+    expect(stderr.text()).toContain('may still be running');
+  });
+});
+
+describe('route helpers in isolation', () => {
+  it('parses the launch response into the reported URL and pid', async () => {
+    service = await startStubService();
+
+    const result = await launchDevServer({
+      base: service.base,
+      editorToken: EDITOR_TOKEN,
+      projectRoot: path.join(os.tmpdir(), 'some-project'),
+    });
+
+    expect(result).toEqual({ devServerUrl: LAUNCHED.devServerUrl, pid: LAUNCHED.pid });
+  });
+
+  it('rejects a launch the service refuses on credentials', async () => {
+    service = await startStubService();
+
+    await expect(
+      launchDevServer({
+        base: service.base,
+        editorToken: 'not-the-editor-credential',
+        projectRoot: path.join(os.tmpdir(), 'some-project'),
+      }),
+    ).rejects.toThrow(/rejected the editor credential/u);
+    expect(service.rejections.map((entry) => entry.status)).toEqual([401]);
+  });
+
+  it('resolves when the stop route accepts', async () => {
+    service = await startStubService();
+
+    await expect(
+      stopDevServer({
+        base: service.base,
+        editorToken: EDITOR_TOKEN,
+        projectRoot: path.join(os.tmpdir(), 'some-project'),
+      }),
+    ).resolves.toBeUndefined();
+  });
+});
+
+describe('the local spawn mode', () => {
+  it('attaches the preload and the ingest URL and carries no credential', () => {
+    const childEnv = buildChildEnv({
+      preloadUrl: 'file:///tmp/register.mjs',
+      base: 'http://127.0.0.1:43117',
+      projectRoot: '/tmp/target',
+      token: undefined,
+      env: {
+        NODE_OPTIONS: '--trace-warnings',
+        DEBUGGEN_TOKEN: 'stale-credential',
+        PATH: '/usr/bin',
+      },
+    });
+
+    expect(childEnv.NODE_OPTIONS).toBe('--trace-warnings --import file:///tmp/register.mjs');
+    expect(childEnv.DEBUGGEN_INGEST_URL).toBe(`http://127.0.0.1:43117${INGEST_PATH}`);
+    expect(childEnv.DEBUGGEN_PROJECT_ROOT).toBe('/tmp/target');
+    expect('DEBUGGEN_TOKEN' in childEnv).toBe(false);
+  });
+
+  it('carries a credential through when one is supplied', () => {
+    // The builder stays general - a credential belongs in the child's
+    // environment when the caller has one - even though the CLI's local spawn
+    // never has one, because only the service's launcher mints them.
+    const childEnv = buildChildEnv({
+      preloadUrl: 'file:///tmp/register.mjs',
+      base: 'http://127.0.0.1:43117',
+      projectRoot: '/tmp/target',
+      token: 'server-agent-credential',
+      env: { PATH: '/usr/bin' },
+    });
+
+    expect(childEnv.DEBUGGEN_TOKEN).toBe('server-agent-credential');
+    // Described by length only: a credential never reaches a terminal or a log.
+    expect(describeToken(childEnv.DEBUGGEN_TOKEN)).toBe(
+      `<set, ${'server-agent-credential'.length} bytes>`,
+    );
+    expect(describeToken(undefined)).toContain('--spawn-local');
+  });
+});
+
+describe('the command as a process', () => {
+  /**
+   * Copy the script into a fixture tree and run it there, so the entry point
+   * itself is exercised with the fixture as its repository root. The script
+   * imports nothing but `node:` builtins, which is what makes the copy a
+   * faithful instance of it.
+   *
+   * @param {Fixture} fixture
+   * @returns {Promise<string>} absolute path of the copied script
+   */
+  const installScript = async (fixture) => {
+    const directory = path.join(fixture.root, 'scripts');
+    await fs.promises.mkdir(directory, { recursive: true });
+    const target = path.join(directory, 'dev-instrumented.mjs');
+    await fs.promises.writeFile(target, SCRIPT_SOURCE, 'utf8');
+    return target;
+  };
+
+  it('stays in the foreground until a signal arrives, then stops the dev server', async () => {
+    service = await startStubService();
+    const fixture = await createFixture();
+    const script = await installScript(fixture);
+    const started = service;
+
+    const child = spawn(process.execPath, [script, '--service', started.base], {
+      env: { PATH: process.env.PATH ?? '', DEBUGGEN_HOME: fixture.home },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let output = '';
+    child.stdout.on('data', (chunk) => (output += String(chunk)));
+    child.stderr.on('data', (chunk) => (output += String(chunk)));
+
+    const exited = new Promise((resolve) => {
+      child.once('exit', (code, signal) => resolve({ code, signal }));
+    });
+
+    await waitFor(
+      () => started.requests.some((request) => request.path === LAUNCH),
+      'the launch request from the child process',
+    );
+    // The regression this guards: Node's signal watchers do not hold the event
+    // loop open, so a foreground wait with nothing else pending used to exit
+    // with status 13 the instant the launch was reported.
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    expect(child.exitCode).toBeNull();
+    expect(started.requests.some((request) => request.path === STOP)).toBe(false);
+
+    child.kill('SIGINT');
+    const result = await exited;
+
+    expect(result).toEqual({ code: 0, signal: null });
+    expect(started.routes()).toEqual([`GET ${HEALTH}`, `POST ${LAUNCH}`, `POST ${STOP}`]);
+    expect(started.rejections).toEqual([]);
+    expect(output).toContain('stopped the dev server');
+    expect(output).not.toContain(EDITOR_TOKEN);
+  });
+
+  it('prints usage and exits 0 for --help', async () => {
+    const fixture = await createFixture();
+    const script = await installScript(fixture);
+
+    const child = spawn(process.execPath, [script, '--help'], {
+      env: { PATH: process.env.PATH ?? '' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let output = '';
+    child.stdout.on('data', (chunk) => (output += String(chunk)));
+
+    const code = await new Promise((resolve) => child.once('exit', (value) => resolve(value)));
+
+    expect(code).toBe(0);
+    for (const route of ALL_PROTOCOL_ROUTES) expect(output).toContain(route.path);
+    expect(output).toContain('--spawn-local');
+    expect(output).toContain('--stop');
+    expect(output).toContain('--detach');
+  });
+});
+
+describe('argument parsing', () => {
+  it('rejects the removed credential-era flags so a typo is never silent', () => {
+    expect(() => parseArgs(['--no-token'])).toThrow(/unrecognised argument/u);
+    expect(() => parseArgs(['--via-service'])).toThrow(/unrecognised argument/u);
+  });
+
+  it('rejects contradictory modes', () => {
+    expect(() => parseArgs(['--stop', '--spawn-local'])).toThrow(/cannot be combined/u);
+    expect(() => parseArgs(['--stop', '--detach'])).toThrow(/cannot be combined/u);
+    expect(() => parseArgs(['--spawn-local', '--detach'])).toThrow(/cannot be combined/u);
+  });
+
+  it('accepts each mode on its own', () => {
+    expect(parseArgs([]).spawnLocal).toBe(false);
+    expect(parseArgs(['--spawn-local']).spawnLocal).toBe(true);
+    expect(parseArgs(['--detach']).detach).toBe(true);
+    expect(parseArgs(['--stop']).stop).toBe(true);
+    expect(parseArgs(['--project=../elsewhere']).project).toBe('../elsewhere');
+  });
+});
+
+describe('shutdown signals', () => {
+  it('resolves with the signal and unregisters its listeners', async () => {
+    const before = process.listenerCount('SIGINT');
+    const arrived = awaitShutdownSignal(['SIGINT']);
+    expect(process.listenerCount('SIGINT')).toBe(before + 1);
+
+    process.emit('SIGINT');
+
+    await expect(arrived).resolves.toBe('SIGINT');
+    expect(process.listenerCount('SIGINT')).toBe(before);
+  });
+});
+
+describe('the documented environment contract', () => {
+  /** @type {string} */
+  let envExample;
+  /** @type {string} */
+  let playwrightConfig;
+
+  beforeAll(() => {
+    envExample = fs.readFileSync(path.join(REPO_ROOT, '.env.example'), 'utf8');
+    playwrightConfig = fs.readFileSync(path.join(REPO_ROOT, 'playwright.config.ts'), 'utf8');
+  });
+
+  /**
+   * Configuration variable names a file reads, taken from the two forms these
+   * files use: `env.NAME` / `process.env.NAME` and `readEnv('NAME')`. Only the
+   * product's own namespace is collected; `PATH`, `PATHEXT`, `ComSpec`, `CI`
+   * and `NODE_OPTIONS` are the operating system's and the runner's, not this
+   * product's configuration.
+   *
+   * @param {string} source
+   * @returns {string[]}
+   */
+  const configurationVariables = (source) => {
+    const names = new Set();
+    const patterns = [
+      /\benv\.([A-Z][A-Z0-9_]*)/gu,
+      /\benv\[['"]([A-Z][A-Z0-9_]*)['"]\]/gu,
+      /\breadEnv\(['"]([A-Z][A-Z0-9_]*)['"]\)/gu,
+    ];
+    for (const pattern of patterns) {
+      for (const match of source.matchAll(pattern)) {
+        const name = match[1];
+        const productNamespace =
+          /^(DEBUGGEN_|DEMO_URL|FIXTURE_APP_URL|DATABASE_URL|ANTHROPIC_|NEXT_OTEL_)/u;
+        if (name !== undefined && productNamespace.test(name)) names.add(name);
+      }
+    }
+    return [...names].sort();
+  };
+
+  it('documents every variable this script reads', () => {
+    const missing = configurationVariables(SCRIPT_SOURCE).filter(
+      (name) => !envExample.includes(name),
+    );
+    expect(missing).toEqual([]);
+  });
+
+  it('documents every variable playwright.config.ts reads', () => {
+    const read = configurationVariables(playwrightConfig);
+    // Guards the extraction itself: these two are the keys the finding named.
+    expect(read).toContain('DEMO_URL');
+    expect(read).toContain('FIXTURE_APP_URL');
+    expect(read.filter((name) => !envExample.includes(name))).toEqual([]);
+  });
+
+  it('documents the defaults playwright.config.ts applies for the two suite URLs', () => {
+    for (const value of ['http://localhost:3000', 'http://localhost:3100']) {
+      expect(playwrightConfig).toContain(value);
+      expect(envExample).toContain(value);
+    }
+  });
+
+  it('marks the launcher-injected variables as injected rather than configurable', () => {
+    const injectedSection = envExample.slice(envExample.indexOf('Injected by the tool'));
+    for (const name of [
+      'DEBUGGEN_TOKEN',
+      'DEBUGGEN_INGEST_URL',
+      'DEBUGGEN_PROJECT_ROOT',
+      'DEBUGGEN_PROMPTS_DIR',
+    ]) {
+      expect(injectedSection).toContain(name);
+      // Never as an assignable line: setting them by hand has no effect.
+      expect(envExample).not.toMatch(new RegExp(`^${name}=`, 'mu'));
+    }
+  });
+});

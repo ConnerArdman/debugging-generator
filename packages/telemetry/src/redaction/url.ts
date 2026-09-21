@@ -58,12 +58,34 @@
  * `MAX_SCAN_LENGTH` code units, which is what keeps the second pass on the
  * unbounded path (see {@link redactUrl} for the argument).
  *
- * The only import is `./rules.js`: the mask token, the marker and `scrub` are
+ * The two **redaction entry points** — {@link redactUrl} and
+ * {@link redactQueryString} — take `unknown`, because a URL reaches them from a
+ * parsed JSON event body or an OpenTelemetry span attribute, where nothing has
+ * checked that it is a string; `asScannableText` decides what each type
+ * becomes. The **parsers** ({@link parseUrlParts}, {@link parseQueryPairs},
+ * {@link formatUrlParts}, {@link decodeQueryComponent},
+ * {@link isUrlAttributeKey}) deliberately keep `string`: `./request-key.ts`
+ * shares them for canonicalisation, and coercing there would change what a
+ * request *keys* as rather than what it is redacted to — a value that is not a
+ * string is not a request this parser has anything to say about, and the
+ * caller that holds it is the one that must decide.
+ *
+ * The only import is `./rules.js`: the mask token, the marker, `scrub` and the
+ * two boundary primitives (`asScannableText` for every value that arrives
+ * untyped, `cutAtCredentialBoundary` for every cut this module makes) are
  * shared with the other handlers of this folder so that a URL and a SQL
- * statement come back in the same vocabulary.
+ * statement come back in the same vocabulary, coerced and cut by the same
+ * rules.
  */
 
-import { MAX_SCAN_LENGTH, REDACTION_MARKER, REDACTION_MASK, scrub } from './rules.js';
+import {
+  MAX_SCAN_LENGTH,
+  REDACTION_MARKER,
+  REDACTION_MASK,
+  asScannableText,
+  cutAtCredentialBoundary,
+  scrub,
+} from './rules.js';
 
 /**
  * Largest number of query parameters {@link parseQueryPairs} returns and
@@ -155,26 +177,6 @@ export interface UrlParts {
   query?: string;
   /** Fragment without the `#`; `undefined` when there was no `#`. */
   fragment?: string;
-}
-
-/**
- * Slices `value` to at most `end` UTF-16 code units without splitting a
- * surrogate pair, so a bounded result never ends in a lone surrogate.
- *
- * Local to this module on purpose: `./rules.js` keeps its own copy private,
- * and duplicating eight lines is cheaper than widening that module's surface,
- * which is deliberately import-free for the browser-agent bundle.
- */
-function sliceWithoutSplit(value: string, end: number): string {
-  if (end <= 0) {
-    return '';
-  }
-  if (end >= value.length) {
-    return value;
-  }
-  const lastUnit = value.charCodeAt(end - 1);
-  const splitsPair = lastUnit >= 0xd800 && lastUnit <= 0xdbff;
-  return value.slice(0, splitsPair ? end - 1 : end);
 }
 
 /**
@@ -507,11 +509,18 @@ function buildMaskedQuery(query: string): MaskedQuery {
  *
  * Idempotent: masking a masked query returns it unchanged.
  *
- * @param query - Query string **without** the leading `?`.
+ * **Never throws**, for any input of any type: this is a redaction entry point,
+ * so a query that is not a string is coerced by `asScannableText` rather than
+ * rejected — see the module documentation for why the parsers do not do the
+ * same.
+ *
+ * @param query - Query string **without** the leading `?`. A number, bigint or
+ * boolean is rendered by its canonical text; anything else that is not a string
+ * becomes {@link REDACTION_MARKER}, per `asScannableText`.
  * @returns The masked query, without a leading `?`; `""` for an empty query.
  */
-export function redactQueryString(query: string): string {
-  return buildMaskedQuery(query).text;
+export function redactQueryString(query: unknown): string {
+  return buildMaskedQuery(asScannableText(query)).text;
 }
 
 /**
@@ -522,6 +531,14 @@ export function redactQueryString(query: string): string {
  * that matches a prefix matched the whole and was already replaced) and
  * appending the marker cannot create a match, so the result is a fixed point
  * of `scrub` and short enough that a second call does not cut again.
+ *
+ * The cut nevertheless goes through `cutAtCredentialBoundary` rather than a
+ * plain slice. That argument holds only because `scrub` runs *first* here, and
+ * it is exactly the kind of ordering that a later change reverses without
+ * noticing; routing every cut in this module through the one primitive means
+ * the guarantee does not rest on the order of two lines. It also keeps the
+ * path and query budgets cutting by the same rule as the scan bound, so a
+ * truncated URL reads the same wherever the cut fell.
  */
 function boundedScrub(text: string, limit: number): string {
   const cleaned = scrub(text);
@@ -529,7 +546,7 @@ function boundedScrub(text: string, limit: number): string {
     return cleaned;
   }
   const room = limit - REDACTION_MARKER.length;
-  return sliceWithoutSplit(cleaned, room) + REDACTION_MARKER;
+  return cutAtCredentialBoundary(cleaned, room) + REDACTION_MARKER;
 }
 
 /**
@@ -601,6 +618,15 @@ function withOverflowSegment(query: string | undefined): string {
  * therefore never longer than `MAX_SCAN_LENGTH`, which is what keeps a second
  * call on the unbounded path.
  *
+ * **No credential is split by a bound.** Every cut goes through
+ * `cutAtCredentialBoundary`, never a plain slice. A plain cut is made *before*
+ * any pattern can run, so a credential straddling the bound loses the run that
+ * identifies it and keeps the head that reveals it — and that head then
+ * survives as a stored path segment or query key, because `scrub` has nothing
+ * left to match it against. Cutting at the credential's start instead is what
+ * makes the marker mean *nothing examined here* rather than *the first
+ * characters of something*.
+ *
  * **Fallback.** A value with no URL structure at all (no authority, no query,
  * no fragment, no absolute path) is returned as `scrub(value)` — pattern
  * cleaned, never raw — because there is nothing to mask positionally but the
@@ -613,19 +639,33 @@ function withOverflowSegment(query: string | undefined): string {
  * because the output is always within every bound, the second pass takes the
  * unbounded path and reproduces the first.
  *
- * **Never throws**, for any input.
+ * **Never throws**, for any input of any type. A URL reaches this function from
+ * a parsed JSON event body, an OpenTelemetry span attribute or a page's own
+ * `fetch` argument, none of which guarantees a string, and a privacy boundary
+ * that threw on the value it was meant to redact would take the whole batch
+ * with it. Coercion is `asScannableText`'s single policy rather than one
+ * invented here, so a non-string URL, header value and SQL statement all come
+ * back in the same vocabulary.
  *
  * @param value - Absolute, origin-relative, protocol-relative, bare-relative
- * or malformed URL text, as captured from a fetch, XHR or span attribute.
+ * or malformed URL text, as captured from a fetch, XHR or span attribute. A
+ * value of any other type is normalised by `asScannableText` first: a number,
+ * bigint or boolean keeps its canonical text as evidence, and anything else
+ * (`null`, `undefined`, an object, an array, a function, a symbol) becomes
+ * {@link REDACTION_MARKER} without a single property of it being read.
  * @returns The redacted URL.
  */
-export function redactUrl(value: string): string {
-  if (value.length === 0) {
-    return value;
+export function redactUrl(value: unknown): string {
+  const text = asScannableText(value);
+  if (text.length === 0) {
+    return text;
   }
 
-  const overLength = value.length > MAX_SCAN_LENGTH;
-  const scanned = overLength ? sliceWithoutSplit(value, MAX_SCAN_LENGTH) : value;
+  // `overLength` decides whether a marker is appended; `scanned` decides what
+  // is examined. They are computed separately because a boundary-aware cut may
+  // fall short of `MAX_SCAN_LENGTH` — the loss still has to be reported.
+  const overLength = text.length > MAX_SCAN_LENGTH;
+  const scanned = cutAtCredentialBoundary(text, MAX_SCAN_LENGTH);
   const parts = parseUrlParts(scanned);
 
   if (!isUrlShaped(parts)) {

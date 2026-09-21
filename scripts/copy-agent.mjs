@@ -24,6 +24,21 @@
  * the bytes `@crxjs/vite-plugin` republishes verbatim out of `public/`. This
  * script only ever moves bytes; it never edits them.
  *
+ * Why the destination is never trusted: every path written here is generated
+ * output under `apps/chrome-extension/public/`, the directory
+ * `@crxjs/vite-plugin` republishes verbatim into the packed extension. If a
+ * component of that path may be a symbolic link, then whoever planted the link
+ * — a stale generated tree, an unpacked archive, another tool's convenience
+ * symlink — chooses which file the agent's bytes overwrite, and the run looks
+ * entirely successful afterwards because every check reads back through the
+ * same link (CWE-22). So: the destination is inspected with `lstat` (never
+ * `stat`, which reports the link's *target* and therefore calls a link a
+ * regular file) before a single byte is compared or written, in `--check` mode
+ * as well; every destination read opens with `O_NOFOLLOW`; and every write
+ * lands on a freshly created `O_EXCL | O_NOFOLLOW` temporary file inside the
+ * verified directory which is then `rename`d over the target, because `rename`
+ * replaces a symbolic link instead of following it.
+ *
  * The target is git-ignored: the extension's `prebuild`/`predev` hook
  * regenerates it on every build, and it is never committed.
  *
@@ -76,7 +91,7 @@ const EXIT_OK = 0;
 /** `--check` found the target missing or out of date. */
 const EXIT_DRIFT = 1;
 
-/** Source bundle missing, I/O failure, or bad usage. */
+/** Source bundle missing, unusable target path, I/O failure, or bad usage. */
 const EXIT_ERROR = 2;
 
 /**
@@ -167,6 +182,12 @@ function sha256(buffer) {
 /**
  * Read a file as a Buffer, or `undefined` when it does not exist. Any other
  * failure becomes an exit-2 `CopyAgentError` with the underlying reason.
+ *
+ * Follows symbolic links, which makes this the reader for the SOURCE side
+ * only: resolving a link on a path the caller asked to read *is* the copy's
+ * semantics, and the source tree is this repository's own build output. Every
+ * read of a DESTINATION path goes through {@link readNoFollow} instead, where
+ * a link is not a convenience but a choice of victim.
  *
  * @param {string} file
  * @returns {Buffer | undefined}
@@ -260,17 +281,30 @@ function readSourceBundle(root, source) {
 }
 
 /**
- * `stat` a path, or `undefined` when it cannot be inspected (absent, a broken
- * symlink, an unreadable parent).
+ * `lstat` a path, or `undefined` when nothing is there (`ENOENT`, or `ENOTDIR`
+ * from a non-directory earlier in the path).
+ *
+ * `lstat`, never `stat`: this function's answers drive every destination
+ * guard below, and `stat` follows symbolic links, so it describes the link's
+ * *target*. A planted link then answers `isFile()` with `true` and the
+ * "not a regular file" guard it exists to trip never fires — which is exactly
+ * how a symlinked `agent.iife.js` used to redirect this copy onto an
+ * arbitrary file. Reporting the link itself is the whole point.
+ *
+ * Any other failure (a permission problem on a parent, an I/O error) is
+ * surfaced as exit 2 rather than silently read as "nothing there": a guard
+ * that cannot see a path must not conclude the path is safe.
  *
  * @param {string} file
- * @returns {fs.Stats | undefined}
+ * @returns {fs.Stats | undefined} the link's own stats, not its target's
+ * @throws {CopyAgentError} when the path exists but cannot be inspected
  */
-function statOptional(file) {
+function lstatOptional(file) {
   try {
-    return fs.statSync(file);
-  } catch {
-    return undefined;
+    return fs.lstatSync(file);
+  } catch (error) {
+    if (isErrnoCode(error, 'ENOENT') || isErrnoCode(error, 'ENOTDIR')) return undefined;
+    throw ioError(`could not inspect ${file}`, error);
   }
 }
 
@@ -323,11 +357,25 @@ Options
   --quiet   suppress the success line; failures are still reported
   --help    print this text
 
+Target path safety
+  Nothing is ever written through a symbolic link. Before a byte is compared
+  or written — with --check too — every directory component from the
+  repository root down to the target's directory, the target itself and both
+  source-map names are inspected with lstat; a symbolic link or a
+  non-regular file at any of them exits 2 naming the path (and, for a link,
+  what it points at) rather than reporting drift, because "re-run without
+  --check" is no fix for a link that decides which file gets overwritten:
+  remove whatever occupies that path. Writes land on a freshly created
+  temporary file inside that verified directory and are renamed over the
+  target, which replaces a link instead of following it.
+
 Exit codes
   0  copied, already identical, or verified with --check
   1  --check found drift; re-run without --check to refresh the copy
-  2  the source bundle is missing or empty, an I/O error occurred, or the
-     arguments were not understood
+  2  the source bundle is missing or empty, the target path is unusable (a
+     symbolic link or a non-regular file at the target, either of its
+     source-map names, or a directory component below the repository root),
+     an I/O error occurred, or the arguments were not understood
 
 Both paths resolve from the repository root inferred from this script's own
 location, so the result is identical from any working directory. The target
@@ -377,7 +425,321 @@ export function parseArgs(argv) {
 }
 
 /**
+ * Where a symbolic link points, as text, or `undefined` when the link cannot
+ * be read. Every rejection message carries it: "the target is a symbolic
+ * link" alone leaves the reader guessing which file the run would have
+ * overwritten, and that file is the diagnosis.
+ *
+ * @param {string} link
+ * @returns {string | undefined}
+ */
+function readLinkTarget(link) {
+  try {
+    return fs.readlinkSync(link);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The rejection for a symbolic link anywhere in a destination path.
+ *
+ * Exit 2 in both modes, `--check` included. `--check`'s exit 1 means "the copy
+ * is stale, re-run without --check to refresh it", and re-running is precisely
+ * what must not happen while a link chooses where the bytes land; the link is
+ * a broken workspace to repair by hand, not drift to reconcile.
+ *
+ * @param {string} root
+ * @param {string} link absolute path of the offending component
+ * @param {string} what how that component relates to the copy, for the message
+ * @returns {CopyAgentError}
+ */
+function symlinkError(root, link, what) {
+  const destination = readLinkTarget(link);
+  const points = destination === undefined ? '' : ` → ${toPosix(destination)}`;
+
+  return new CopyAgentError(`${what} is a symbolic link: ${display(root, link)}${points}`, {
+    hint: [
+      'Writing through that link would overwrite whatever it points at, and',
+      'reading through it would compare the wrong bytes, so nothing was',
+      'written and nothing was verified. Remove whatever occupies that path',
+      'and re-run the copy:',
+      '',
+      `  rm ${display(root, link)}`,
+      '  node scripts/copy-agent.mjs',
+    ].join('\n'),
+  });
+}
+
+/**
+ * Verify every directory component from `root` (exclusive) down to
+ * `directory` (inclusive) is a real directory, using `lstat` so a link is seen
+ * as a link rather than as whatever it resolves to.
+ *
+ * The walk never climbs above `root`. `root` is derived from this script's own
+ * location, so it is trusted input, and a checkout may legitimately sit under
+ * a symlinked ancestor — macOS's `/tmp`, a home directory on a mounted
+ * volume, a worktree reached through a convenience link. Everything *below*
+ * `root` on this path is either committed or generated by this repository's
+ * own tooling, so a link there is never legitimate and is what an attacker (or
+ * a careless recovery from a backup) would plant to redirect the write.
+ *
+ * A missing component ends the walk successfully: nothing below it can exist
+ * either, and {@link ensureDirectory} creates the chain with `mkdir`, which
+ * follows no link it did not create itself.
+ *
+ * @param {string} root
+ * @param {string} directory absolute path inside `root`
+ * @returns {void}
+ * @throws {CopyAgentError} exit 2 when a component is a link or not a
+ *   directory, or when `directory` does not lie inside `root` at all
+ */
+function verifyDestinationDirectory(root, directory) {
+  const relative = path.relative(root, directory);
+  if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    // Unreachable through the CLI (the target is `root` joined with a fixed
+    // relative constant) and rejected anyway: a destination outside `root` is
+    // a path this guard has no mandate over, so it must not be written.
+    throw new CopyAgentError(
+      `the target resolves outside the repository root: ${display(root, directory)}`,
+      { hint: 'Run the copy against a repository root that contains the target.' },
+    );
+  }
+
+  const segments = relative === '' ? [] : relative.split(path.sep);
+  let current = root;
+
+  for (const segment of segments) {
+    current = path.join(current, segment);
+    const stats = lstatOptional(current);
+    if (stats === undefined) return;
+    if (stats.isSymbolicLink()) {
+      throw symlinkError(root, current, 'a directory on the way to the target');
+    }
+    if (!stats.isDirectory()) {
+      throw new CopyAgentError(
+        `a directory on the way to the target is not a directory: ${display(root, current)}`,
+        { hint: 'Remove whatever occupies that path and re-run the copy.' },
+      );
+    }
+  }
+}
+
+/**
+ * Verify the final component of a destination path: an existing symbolic link
+ * is rejected naming what it points at, an existing non-regular file (a
+ * directory, a socket, a device) is rejected, and an absent path is fine —
+ * that is the ordinary first run.
+ *
+ * The parent chain must already have been verified by
+ * {@link verifyDestinationDirectory}; on its own this check would still be
+ * bypassable through a symlinked parent directory.
+ *
+ * @param {string} root
+ * @param {string} file absolute path whose parents are already verified
+ * @param {string} what how the file relates to the copy, for the message
+ * @returns {void}
+ * @throws {CopyAgentError} exit 2 when the path cannot be written safely
+ */
+function verifyDestinationFile(root, file, what) {
+  const stats = lstatOptional(file);
+  if (stats === undefined) return;
+  if (stats.isSymbolicLink()) throw symlinkError(root, file, what);
+  if (!stats.isFile()) {
+    throw new CopyAgentError(`${what} is not a regular file: ${display(root, file)}`, {
+      hint: 'Remove whatever occupies that path and re-run the copy.',
+    });
+  }
+}
+
+/**
+ * Validate every path this run may write, read back or compare, before it
+ * touches a single byte.
+ *
+ * Runs in `--check` mode too, and before the byte comparison: a drift gate
+ * that compares through a symbolic link certifies the link's target as "in
+ * sync" and hides exactly the condition it is there to catch.
+ *
+ * Both source-map names are guarded unconditionally, even when the source
+ * build produced no map for this run. Their directory is published verbatim
+ * by `@crxjs/vite-plugin`, so a link sitting under either name is a live
+ * hazard the moment a map appears, and the copy that would follow it is the
+ * same copy.
+ *
+ * @param {string} root
+ * @param {string} target absolute path of the copied bundle
+ * @returns {void}
+ * @throws {CopyAgentError} exit 2 when any destination path is unusable
+ */
+function verifyDestinations(root, target) {
+  const directory = path.dirname(target);
+
+  verifyDestinationDirectory(root, directory);
+  verifyDestinationFile(root, target, 'the target');
+
+  for (const name of TARGET_MAP_NAMES) {
+    verifyDestinationFile(root, path.join(directory, name), `the source-map target ${name}`);
+  }
+}
+
+/**
+ * `O_NOFOLLOW` where the platform defines it, `0` where it does not.
+ *
+ * Windows has no `O_NOFOLLOW`, so the flag is dropped there and the `lstat`
+ * guards above are the protection: they close the same hole without the
+ * kernel's help, at the cost of the TOCTOU window the flag would have removed.
+ *
+ * @type {number}
+ */
+const O_NOFOLLOW = fs.constants.O_NOFOLLOW ?? 0;
+
+/**
+ * Read a destination file without following a symbolic link at its final
+ * component, or `undefined` when it does not exist.
+ *
+ * The no-follow open is what makes the identity fast path, the post-write
+ * SHA-256 verification and the `--check` comparison describe the file this
+ * script is responsible for rather than whatever a link points at. It also
+ * closes the window between the `lstat` guard and the read: a link planted in
+ * between fails the open with `ELOOP` instead of silently redirecting it.
+ *
+ * @param {string} root
+ * @param {string} file absolute destination path
+ * @returns {Buffer | undefined} the bytes on disk, or `undefined` if absent
+ * @throws {CopyAgentError} exit 2 on a symbolic link or any other I/O failure
+ */
+function readNoFollow(root, file) {
+  /** @type {number | undefined} */
+  let handle;
+  try {
+    handle = fs.openSync(file, fs.constants.O_RDONLY | O_NOFOLLOW);
+    return fs.readFileSync(handle);
+  } catch (error) {
+    if (isErrnoCode(error, 'ENOENT')) return undefined;
+    // ELOOP is what O_NOFOLLOW reports for a link at the final component;
+    // EMLINK is the same condition on some BSD kernels.
+    if (isErrnoCode(error, 'ELOOP') || isErrnoCode(error, 'EMLINK')) {
+      throw symlinkError(root, file, 'the destination path');
+    }
+    if (isErrnoCode(error, 'EISDIR')) {
+      throw new CopyAgentError(`expected a file but found a directory: ${display(root, file)}`, {
+        hint: 'Remove whatever occupies that path and re-run the copy.',
+      });
+    }
+    throw ioError(`could not read ${display(root, file)}`, error);
+  } finally {
+    if (handle !== undefined) fs.closeSync(handle);
+  }
+}
+
+/**
+ * Serial number for temporary write names, so the three files one run may
+ * write (the bundle and both source-map names) can never collide with each
+ * other inside this process.
+ *
+ * @type {number}
+ */
+let temporaryWriteSerial = 0;
+
+/**
+ * The temporary path a write lands on before it is renamed into place: a
+ * sibling of `to`, named `<basename>.<pid>-<serial>.tmp`.
+ *
+ * A sibling, not `os.tmpdir()`, because `rename` is only atomic within one
+ * filesystem and `public/` may well sit on a different mount than `/tmp`. The
+ * pid and serial make the name collision-resistant across concurrent runs
+ * (`pnpm -r build` can run this script from more than one workspace at once);
+ * `O_EXCL` then turns any residual collision into an error rather than a
+ * clobber of someone else's in-flight write.
+ *
+ * @param {string} to absolute destination path
+ * @returns {string} absolute temporary path in `to`'s directory
+ */
+function temporaryPathFor(to) {
+  temporaryWriteSerial += 1;
+  const name = `${path.basename(to)}.${process.pid}-${temporaryWriteSerial}.tmp`;
+  return path.join(path.dirname(to), name);
+}
+
+/**
+ * Write `expected` to `to` atomically, following no symbolic link on the way.
+ *
+ * Three properties matter here, in this order:
+ *
+ *   1. No-follow. `fs.copyFileSync(from, to)` and a plain `writeFileSync`
+ *      both follow a symbolic link at `to`, which hands the choice of
+ *      overwritten file to whoever planted the link. Creating a *new* file
+ *      with `O_CREAT | O_EXCL | O_NOFOLLOW` cannot follow anything: the
+ *      kernel either creates that exact name or fails.
+ *   2. Atomic publication. `rename` replaces the destination — symbolic link
+ *      included — in one step, so no reader (Chrome loading the extension,
+ *      Vite's watcher during `vite build --watch`) ever sees a half-written
+ *      `agent.iife.js`, and a crash leaves either the old file or the new one.
+ *   3. Byte fidelity. The buffer written is the one read from the source, so
+ *      nothing transcodes, adds a BOM, normalises line endings or touches the
+ *      trailing `//# sourceMappingURL=` comment. `writeSync` is looped because
+ *      it may report a short count.
+ *
+ * The temporary file is removed on every path out, successful or not:
+ * `apps/chrome-extension/public/` is published verbatim into the packed
+ * extension, so a leftover `.tmp` would ship.
+ *
+ * @param {string} root
+ * @param {string} to absolute destination path, already verified
+ * @param {Buffer} expected exact bytes to publish at `to`
+ * @returns {void}
+ * @throws {CopyAgentError} exit 2 on any failure to create, write or rename
+ */
+function writeNoFollow(root, to, expected) {
+  const temporary = temporaryPathFor(to);
+  /** @type {number | undefined} */
+  let handle;
+
+  try {
+    // 0o644: this is a public static asset Chrome reads out of the packed
+    // extension, not private state - unlike $DEBUGGEN_HOME, which is 0600.
+    const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | O_NOFOLLOW;
+    handle = fs.openSync(temporary, flags, 0o644);
+
+    let offset = 0;
+    while (offset < expected.byteLength) {
+      offset += fs.writeSync(handle, expected, offset, expected.byteLength - offset);
+    }
+
+    // Flush before publishing: the rename is what makes the name visible, and
+    // a crash between the two would otherwise publish a name whose bytes are
+    // still only in the page cache.
+    fs.fsyncSync(handle);
+    fs.closeSync(handle);
+    handle = undefined;
+
+    fs.renameSync(temporary, to);
+  } catch (error) {
+    throw ioError(`could not write ${display(root, to)}`, error);
+  } finally {
+    if (handle !== undefined) {
+      try {
+        fs.closeSync(handle);
+      } catch {
+        // The descriptor is being abandoned on a failure path; a failed close
+        // adds nothing to the error already on its way up.
+      }
+    }
+    try {
+      fs.unlinkSync(temporary);
+    } catch {
+      // Already gone: the rename consumed it on the success path, or the open
+      // never created it. Either way there is nothing left to clean up.
+    }
+  }
+}
+
+/**
  * Compare what is on disk with the source, writing nothing.
+ *
+ * Every read is no-follow ({@link readNoFollow}): the destinations have
+ * already been verified by {@link verifyDestinations}, and reading them
+ * through a link would let the gate certify the link's target as in sync.
  *
  * @param {string} root
  * @param {string} target absolute path of the copied bundle
@@ -386,7 +748,7 @@ export function parseArgs(argv) {
  * @returns {string | undefined} why it drifted, or `undefined` when in sync
  */
 function findDrift(root, target, sourceBuffer, sourceMap) {
-  const existing = readOptional(target);
+  const existing = readNoFollow(root, target);
   if (existing === undefined) {
     return `${display(root, target)} does not exist`;
   }
@@ -402,7 +764,7 @@ function findDrift(root, target, sourceBuffer, sourceMap) {
   const directory = path.dirname(target);
   for (const name of TARGET_MAP_NAMES) {
     const mapPath = path.join(directory, name);
-    const copy = readOptional(mapPath);
+    const copy = readNoFollow(root, mapPath);
     if (copy === undefined) {
       return `${display(root, mapPath)} does not exist`;
     }
@@ -430,7 +792,7 @@ function ensureDirectory(root, directory) {
 }
 
 /**
- * Copy one file verbatim and prove the result.
+ * Publish one file verbatim and prove the result.
  *
  * Skips the write when the destination already holds exactly these bytes,
  * which keeps Vite's file watcher quiet during `vite build --watch`. After a
@@ -438,27 +800,26 @@ function ensureDirectory(root, directory) {
  * source's, so a truncated or partially written copy fails loudly instead of
  * shipping a broken agent.
  *
+ * Both reads and the write are no-follow, and the destination path must
+ * already have passed {@link verifyDestinations}. The bytes come from
+ * `expected` — the buffer read from the source — rather than from a
+ * `copyFileSync`, so the write can be the atomic no-follow publication
+ * {@link writeNoFollow} performs while staying byte for byte.
+ *
  * @param {string} root
- * @param {string} from absolute source path
  * @param {string} to absolute destination path
- * @param {Buffer} expected bytes `from` is known to hold
+ * @param {Buffer} expected bytes the source is known to hold
  * @returns {boolean} whether bytes were actually written
  */
-function copyVerified(root, from, to, expected) {
-  const existing = readOptional(to);
+function copyVerified(root, to, expected) {
+  const existing = readNoFollow(root, to);
   if (existing !== undefined && Buffer.compare(existing, expected) === 0) {
     return false;
   }
 
-  try {
-    // copyFileSync, never a utf8 round-trip: no transcoding, no BOM, no
-    // line-ending translation, nothing that could alter a single byte.
-    fs.copyFileSync(from, to);
-  } catch (error) {
-    throw ioError(`could not write ${display(root, to)}`, error);
-  }
+  writeNoFollow(root, to, expected);
 
-  const written = readOptional(to);
+  const written = readNoFollow(root, to);
   if (written === undefined || sha256(written) !== sha256(expected)) {
     throw new CopyAgentError(`the copy at ${display(root, to)} does not match its source`, {
       hint: [
@@ -481,20 +842,24 @@ function copyVerified(root, from, to, expected) {
  * bundle's own `sourceMappingURL` comment must keep resolving and the bundle's
  * bytes may not be edited.
  *
+ * Both names go through {@link copyVerified}, so both get the identical
+ * no-follow treatment the bundle gets: a link planted under a map name
+ * redirects a write exactly as well as one planted at the target, and a map is
+ * the file a developer opens in DevTools.
+ *
  * @param {string} root
  * @param {string} target absolute path of the copied bundle
- * @param {string} sourceMapPath absolute path of the source map
- * @param {Buffer} sourceMap bytes at `sourceMapPath`
+ * @param {Buffer} sourceMap source map bytes read from the source tree
  * @returns {string[]} absolute paths actually written
  */
-function copySourceMaps(root, target, sourceMapPath, sourceMap) {
+function copySourceMaps(root, target, sourceMap) {
   const directory = path.dirname(target);
   /** @type {string[]} */
   const written = [];
 
   for (const name of TARGET_MAP_NAMES) {
     const mapPath = path.join(directory, name);
-    if (copyVerified(root, sourceMapPath, mapPath, sourceMap)) {
+    if (copyVerified(root, mapPath, sourceMap)) {
       written.push(mapPath);
     }
   }
@@ -522,12 +887,18 @@ function copySourceMaps(root, target, sourceMapPath, sourceMap) {
  * Chrome and capture nothing, which is far harder to diagnose than a failed
  * build.
  *
+ * Nothing is written or compared through a symbolic link either, in either
+ * mode: an unusable destination path (a link or a non-regular file at the
+ * target, at either source-map name, or at a directory component below
+ * `root`) is an exit-2 failure naming the path, never `"drift"`.
+ *
  * @param {{ root?: string, check?: boolean }} [options] `root` defaults to the
  *   repository root derived from this script's location; `check` verifies
  *   without writing
  * @returns {CopyAgentResult}
- * @throws {CopyAgentError} when the source is missing or empty, the target
- *   cannot be written, or the written copy fails verification
+ * @throws {CopyAgentError} when the source is missing or empty, a destination
+ *   path is unusable, the target cannot be written, or the written copy fails
+ *   verification
  */
 export function copyAgent({ root = REPO_ROOT, check = false } = {}) {
   const source = path.join(root, SOURCE_REL);
@@ -540,6 +911,12 @@ export function copyAgent({ root = REPO_ROOT, check = false } = {}) {
   const sourceMap = readOptional(sourceMapPath);
   const base = { bytes: sourceBuffer.byteLength, source, target };
 
+  // Then validate the destination, before any comparison and before any write,
+  // in both modes: a symbolic link at (or above) the target would otherwise
+  // decide which file this run overwrites, and would make `--check` compare
+  // the link's target and report the copy as in sync.
+  verifyDestinations(root, target);
+
   if (check) {
     const reason = findDrift(root, target, sourceBuffer, sourceMap);
     if (reason !== undefined) {
@@ -548,17 +925,9 @@ export function copyAgent({ root = REPO_ROOT, check = false } = {}) {
     return { ...base, action: 'unchanged', maps: [] };
   }
 
-  const existingStats = statOptional(target);
-  if (existingStats !== undefined && !existingStats.isFile()) {
-    throw new CopyAgentError(`the target is not a regular file: ${display(root, target)}`, {
-      hint: 'Remove whatever occupies that path and re-run the copy.',
-    });
-  }
-
   ensureDirectory(root, path.dirname(target));
-  const copied = copyVerified(root, source, target, sourceBuffer);
-  const maps =
-    sourceMap === undefined ? [] : copySourceMaps(root, target, sourceMapPath, sourceMap);
+  const copied = copyVerified(root, target, sourceBuffer);
+  const maps = sourceMap === undefined ? [] : copySourceMaps(root, target, sourceMap);
 
   return { ...base, action: copied ? 'copied' : 'unchanged', maps };
 }

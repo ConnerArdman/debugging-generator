@@ -410,15 +410,12 @@ export default tseslint.config(
       '**/node_modules/**',
       '**/dist/**',
       '**/out/**',
-      '**/build/**',
       '**/.next/**',
       '**/.tsbuild/**',
       '**/coverage/**',
       '**/playwright-report/**',
-      '**/blob-report/**',
       '**/test-results/**',
       '**/.vscode-test/**',
-      '**/.playwright/**',
 
       // Generated, not authored: the Prisma client the demo app imports, the
       // ambient declarations Next.js writes, and the browser-agent IIFE that

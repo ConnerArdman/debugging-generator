@@ -1,223 +1,54 @@
 {
-  // ---------------------------------------------------------------------------
-  // @debuggen/panel-renderer - the compiler project for the monorepo typecheck gate.
-  //
-  // `pnpm typecheck` (= `pnpm demo:generate && tsc -b`) builds the root solution
-  // file, whose `references` list this project after packages/shared,
-  // packages/telemetry, packages/code-analysis, packages/instrumentation and
-  // packages/panel-schema: the renderer sits at the top of the library half of the
-  // acyclic package graph (AAP 0.2.2) and depends on three workspaces - shared,
-  // telemetry and panel-schema - so `references` below has exactly those three
-  // entries, foundational-first, and `tsc -b` builds them before this project.
-  //
-  // Three consumers read this one file and all three must stay satisfied:
-  //   1. the solution build `tsc -b`, which requires `composite` (see below);
-  //   2. the sibling `tsup.config.ts`, which points at it with
-  //      `tsconfig: "./tsconfig.json"` for the bundle and the declaration pass, so
-  //      the shipped artefacts and the gate type-check under one configuration;
-  //   3. typescript-eslint's project service, which resolves the type information
-  //      behind the type-aware rules and `eslint-plugin-react-hooks` for
-  //      `src/**/*.tsx` - which is why the colocated tests are inside `include`.
-  //
-  // What this package is: the in-repo design system (AAP 0.6) - one token source
-  // (src/tokens/tokens.ts, from which scripts/build-tokens.mjs generates
-  // src/tokens/tokens.css), the UI primitives, the layout primitives, the thirteen
-  // visualization components of the node catalog and the `PanelHost` that renders
-  // only validated panel specifications. It is browser-only React code: it renders
-  // inside the Chrome DevTools panel and the VS Code webview, and it reaches data
-  // exclusively through the `DataProvider`/`PanelActions` interfaces it declares,
-  // never through a socket or `fetch` of its own.
-  //
-  // Everything not stated below is inherited from tsconfig.base.json and must stay
-  // that way - in particular `strict`, `noUncheckedIndexedAccess`,
-  // `verbatimModuleSyntax`, `isolatedModules`, the no-unused/no-implicit
-  // diagnostics, `target` ES2023 and the declaration-emit settings (`declaration`,
-  // `declarationMap`, `sourceMap`, `emitDeclarationOnly`, `incremental`).
-  // `noEmit` must never be added: TypeScript 6.0.3 rejects a referenced project
-  // that disables emit with TS6310 and the whole gate fails.
-  //
-  // This file is JSONC. tsc, ESLint, Vitest, tsup and Prettier all parse comments
-  // in tsconfig files; anything reading it programmatically must use a JSONC-aware
-  // reader (`ts.readConfigFile`), never bare `JSON.parse`.
-  // ---------------------------------------------------------------------------
   "$schema": "https://json.schemastore.org/tsconfig",
+
+  "// purpose": "@debuggen/panel-renderer - the compiler project for the monorepo typecheck gate. `pnpm typecheck` (= `pnpm demo:generate && tsc -b`) builds the root solution file, whose `references` list this project after packages/shared, packages/telemetry, packages/code-analysis, packages/instrumentation and packages/panel-schema: the renderer sits at the top of the library half of the acyclic package graph (AAP 0.2.2) and depends on three workspaces - shared, telemetry and panel-schema - so `references` below has exactly those three entries, foundational-first, and `tsc -b` builds them before this project.",
+
+  "// consumers": "Three consumers read this one file and all three must stay satisfied: (1) the solution build `tsc -b`, which requires `composite` (see below); (2) the sibling `tsup.config.ts`, which points at it with `tsconfig: \"./tsconfig.json\"` for the bundle and the declaration pass, so the shipped artefacts and the gate type-check under one configuration; (3) typescript-eslint's project service, which resolves the type information behind the type-aware rules and `eslint-plugin-react-hooks` for `src/**/*.tsx` - which is why the colocated tests are inside `include`.",
+
+  "// package": "What this package is: the in-repo design system (AAP 0.6) - one token source (src/tokens/tokens.ts, from which scripts/build-tokens.mjs generates src/tokens/tokens.css), the UI primitives, the layout primitives, the thirteen visualization components of the node catalog and the `PanelHost` that renders only validated panel specifications. It is browser-only React code: it renders inside the Chrome DevTools panel and the VS Code webview, and it reaches data exclusively through the `DataProvider`/`PanelActions` interfaces it declares, never through a socket or `fetch` of its own.",
+
+  "// ambient-css": "NOT declared anywhere in this package: an ambient `*.css` module. No TypeScript file here imports a stylesheet - tsup.config.ts concatenates src/tokens/tokens.css, src/styles/base.css and src/styles/components.css into dist/styles.css, which the two consumers import as \"@debuggen/panel-renderer/styles.css\". A need for a `declare module \"*.css\"` means a source file grew a CSS import that must be removed instead, because it would also break `\"sideEffects\": [\"**/*.css\"]` and consumer tree-shaking.",
+
+  "// inherited": "Everything not stated below is inherited from tsconfig.base.json and must stay that way - in particular `strict`, `noUncheckedIndexedAccess`, `verbatimModuleSyntax`, `isolatedModules`, the no-unused/no-implicit diagnostics, `target` ES2023 and the declaration-emit settings (`declaration`, `declarationMap`, `sourceMap`, `emitDeclarationOnly`, `incremental`). `noEmit` must never be added: TypeScript 6.0.3 rejects a referenced project that disables emit with TS6310 and the whole gate fails.",
+
+  "// format": "Strict JSON, like tsconfig.base.json, the root tsconfig.json and every other tsconfig in this repository: both a JSONC-aware reader (`ts.readConfigFile`) and a bare `JSON.parse` can read it, so no consumer has to know which one to reach for. tsc, ESLint, Vitest, tsup and Prettier would all accept comments in a tsconfig file, but the rationale is recorded in the `\"// …\"` string keys of this object instead so that every reader gets it. TypeScript ignores unknown TOP-LEVEL keys, which is what makes the convention safe; a `\"// …\"` key inside `compilerOptions` is a hard error instead (TS5023, \"Unknown compiler option\"), so every note about a single option lives up here under a `\"// compilerOptions.<option>\"` key and never beside the option itself.",
+
+  "// compilerOptions.composite": "Already true in the base; restated because the root solution file references this project and a non-composite reference fails `tsc -b` outright (TS6306). Keeping it local means a future edit to the base cannot silently break the gate at this project. The declaration pass of tsup is the one consumer that may need the opposite value; when it does, it overrides `composite` inside tsup.config.ts (`dts: { compilerOptions: { composite: false } }`) - never by removing it from here, which would break `pnpm typecheck` repository-wide.",
+
+  "// compilerOptions.rootDir": "Per-workspace (the base deliberately leaves it unset), so the declaration tree under .tsbuild/ mirrors src/ exactly: src/index.ts -> .tsbuild/index.d.ts and src/components/Timeline.tsx -> .tsbuild/components/Timeline.d.ts, matching the path the package.json `exports` map advertises under dist/. It also pins the program's boundary: nothing outside src/ may be an input, which is what keeps scripts/build-tokens.mjs out of the program (`allowJs` stays false, and that script is linted, never compiled).",
+
+  "// compilerOptions.lib": "Widened from the base's ES2023-only set, which exists so that a Node-only package cannot reference `window` and still compile. This project is the opposite case: every module renders in a page. The components legitimately use `document`, `ResizeObserver`, `Element.getBoundingClientRect`, `KeyboardEvent`/`PointerEvent`, the SVG interfaces behind the timeline, flame, waterfall and dependency-graph views (`SVGSVGElement`, `SVGGElement`), and `window.matchMedia` for resolving the high-contrast and colour-scheme preference in src/tokens/theme.ts. DOM.Iterable is what makes iteration over `NodeList`, `DOMTokenList` and `SVGElement` children type-check. ES2023 is restated alongside the browser libs because `lib` REPLACES the inherited array rather than merging with it - omitting ES2023 here would silently drop `Array.prototype.findLast`, `toSorted` and the rest, all of which the sorting and grouping helpers in src/utils/** rely on. No \"DOM.AsyncIterable\" and no \"WebWorker\": nothing in this package streams from a `ReadableStream` or runs off the main thread.",
+
+  "// compilerOptions.types": "The base sets no `types` so that one workspace's ambient globals cannot bleed into another. This project needs exactly one: @types/node 24.13.6 (a root devDependency, resolved through the workspace-root node_modules/@types). It exists for ONE colocated test - src/tokens/tokens.test.ts - which reads the generated src/tokens/tokens.css from disk with `node:fs` to make the byte-wise drift assertion AAP 0.6.1 requires (the committed CSS must match what src/tokens/tokens.ts generates). The Vitest project for this package runs under happy-dom, where `node:*` builtins keep working. THE BOUNDARY THIS DOES NOT MOVE: no non-test module under src/** may import a `node:*` builtin or touch `process`/`Buffer`/`require`. The compiler cannot express \"ambient in tests only\", so the guarantee is mechanical instead - tsup.config.ts sets `platform: \"browser\"`, which fails the build if a Node builtin appears anywhere in the src/index.ts import graph, and the colocated `*.test.ts(x)` files are not build inputs. Anything that needs a filesystem, a socket or an environment variable belongs in the host application (apps/chrome-extension, apps/vscode-extension) or in apps/local-service. Not listed: \"react\" / \"react-dom\". They are not ambient global type packages. JSX types arrive through the automatic runtime's `react/jsx-runtime` module import, and component code writes `import type { ReactNode } from \"react\"`; naming them here would instead make React's globals ambient package-wide. Not listed: \"vitest/globals\". The Vitest project for this package sets `globals: true` only so @testing-library/react can register its automatic `cleanup` on the global `afterEach`; the suites themselves still import `{ describe, it, expect }` from \"vitest\" explicitly, exactly as every sibling package does.",
+
+  "// compilerOptions.module": "NOT overridden: \"module\" / \"moduleResolution\". The base's \"ESNext\" + \"bundler\" is the correct flavour for this package and AAP 0.3.4 assigns it: bundler resolution for web and extension code, NodeNext only for the Node-targeted packages. Nothing here is ever loaded by Node - the two consumers bundle dist/index.js with Vite - so the stricter Node flavour would buy nothing and cost the whole source tree an extension convention. CONSEQUENCE FOR EVERY SOURCE FILE IN src/**, and the single most likely avoidable break in this workspace: relative specifiers are EXTENSIONLESS - `import { Button } from \"./Button\";`, `import { resolveTheme } from \"../tokens/theme\";`, `export * from \"./host/PanelHost\";` - which is the exact OPPOSITE of the \".js\"-suffixed convention that packages/shared, packages/telemetry and packages/panel-schema must use because they override this setting to NodeNext. Copying an import line from one of those packages into this one is a compile error (TS2307: the file \"./Button.js\" does not exist), and the mistake reads as correct. Package specifiers are written without an extension in both flavours - \"react\", \"clsx\", \"@debuggen/panel-schema\" - and resolve through the pnpm workspace symlink and each package's `exports` map.",
+
+  "// compilerOptions.jsx": "NOT overridden. The base already sets \"react-jsx\" (React 19.3.0 automatic runtime), so no .tsx file in this package needs an `import React`.",
+
+  "// compilerOptions.outDir": "NOT overridden: \"outDir\" / \"declarationDir\" / \"tsBuildInfoFile\". The base anchors all three per project with `${configDir}`, which resolves to the directory of THIS file and not to the base's own directory, so declarations and the incremental stamp land in packages/panel-renderer/.tsbuild - ignored by .gitignore and .prettierignore. tsc must never write into packages/panel-renderer/dist: that directory belongs to tsup and holds dist/index.js, dist/index.d.ts and the assembled dist/styles.css that the `exports` map points at.",
+
+  "// compilerOptions.paths": "NOT set: \"paths\" / \"baseUrl\". The three workspace dependencies resolve through their `exports` maps plus the project references below, exactly as the runtime and the bundlers resolve them (AAP 0.2.2). An alias to a sibling's src/** would hide a broken `exports` map, let this package import internals past a declared entry point, and let the acyclic layering be violated without anything failing.",
+
+  "// compilerOptions.noEmit": "NOT set, and no strictness flag is relaxed on top of the base.",
+
+  "// include": "src/** only, and both extensions: the library is React, so most modules are .tsx (primitives, layout, the thirteen visualization components, PanelHost and NodeRenderer) while the tokens, registry, data-provider, hooks and utils are .ts. The colocated `*.test.ts(x)` suites are deliberately part of the program - src/components/*.test.tsx, src/host/PanelHost.test.tsx, src/host/registry.test.ts and src/tokens/tokens.test.ts - because `tsc -b` is the typecheck gate and an untypechecked test is how contract drift escapes: registry.test.ts asserting one-to-one coverage of PANEL_NODE_CATALOG is only a guarantee if it is type-checked against that catalog. `strict`, `noUncheckedIndexedAccess`, `noUnusedLocals` and `noUnusedParameters` therefore apply to the tests exactly as they do to the sources. The same glob is what gives typescript-eslint's project service a program covering every linted file in this workspace. Not included, on purpose: scripts/build-tokens.mjs (plain Node ESM tooling, linted but never compiled - `allowJs` stays false) and the *.css files, which are data for tsup and for tokens.test.ts, not program inputs. Until the first src file lands, `tsc -b` on this project answers TS18003 (\"No inputs were found in config file\") - expected on an empty subtree, not a configuration fault.",
+
+  "// exclude": "Replaces the base's inherited list rather than merging with it, so the output directories are named again here; resolved relative to this directory, meaning packages/panel-renderer/{dist,.tsbuild,node_modules}. `include` already restricts the input set to src/**, which leaves dist/ (tsup output) and .tsbuild/ (declaration output) outside the program; these entries document that intent and keep it true if `include` is ever widened. Note what `exclude` does NOT do: it filters the `include` globs only, so a file reached by an import still joins the program - `rootDir` above is what rejects one from outside src/ (TS6059).",
+
+  "// references": "The ONLY project references, foundational-first to match the root solution's ordering, and exactly the `dependencies` of this package's package.json: ../shared - SourceLocation and its formatting helper, the millisecond rounding used by DurationCell, and DebuggenError; ../telemetry - the aggregate result shapes the components render (TelemetryEvent, TraceTree, RenderStat, RequestGroup, QueryGroup, StateTransition, ComponentTreeSnapshot, MetricValue), consumed as types; ../panel-schema - PanelSpec, PanelNode, DataQuery and PANEL_NODE_CATALOG, which keys the component registry. What the references do, precisely: they order the build, so `tsc -b` on this project (or on the root solution) builds those three projects first and reports errors in dependency order. They are NOT what resolves the specifiers: each package's `exports` map points at its tsup output (dist/index.d.ts), which lies outside the `${configDir}/.tsbuild` declaration directory `tsc -b` writes, so no output-to-source redirect applies. That is deliberate - this package is type-checked against the very declarations its consumers import - and it is why `pnpm verify` runs `pnpm build` before `pnpm typecheck`: on a tree where a dependency's dist/ is missing, the import fails with TS2307 rather than silently resolving to source. Never add ../protocol: the renderer must not know the wire protocol at all. Its data arrives through the `DataProvider` interface this package declares and its interactions leave through `PanelActions`, so the DevTools panel and the VS Code webview own every socket (AAP 0.4.2). The root eslint.config.js enforces the same rule with `no-restricted-imports`, and a reference here would additionally invert the layering that keeps protocol above this package. Never add an app either: both apps consume this one.",
+
   "extends": "../../tsconfig.base.json",
+
   "compilerOptions": {
-    // Already true in the base; restated because the root solution file references
-    // this project and a non-composite reference fails `tsc -b` outright (TS6306).
-    // Keeping it local means a future edit to the base cannot silently break the
-    // gate at this project. The declaration pass of tsup is the one consumer that
-    // may need the opposite value; when it does, it overrides `composite` inside
-    // tsup.config.ts (`dts: { compilerOptions: { composite: false } }`) - never by
-    // removing it from here, which would break `pnpm typecheck` repository-wide.
     "composite": true,
-
-    // Per-workspace (the base deliberately leaves it unset), so the declaration
-    // tree under .tsbuild/ mirrors src/ exactly: src/index.ts -> .tsbuild/index.d.ts
-    // and src/components/Timeline.tsx -> .tsbuild/components/Timeline.d.ts, matching
-    // the path the package.json `exports` map advertises under dist/. It also pins
-    // the program's boundary: nothing outside src/ may be an input, which is what
-    // keeps scripts/build-tokens.mjs out of the program (`allowJs` stays false, and
-    // that script is linted, never compiled).
     "rootDir": "src",
-
-    // Widened from the base's ES2023-only set, which exists so that a Node-only
-    // package cannot reference `window` and still compile. This project is the
-    // opposite case: every module renders in a page. The components legitimately
-    // use `document`, `ResizeObserver`, `Element.getBoundingClientRect`,
-    // `KeyboardEvent`/`PointerEvent`, the SVG interfaces behind the timeline,
-    // flame, waterfall and dependency-graph views (`SVGSVGElement`,
-    // `SVGGElement`), and `window.matchMedia` for resolving the high-contrast and
-    // colour-scheme preference in src/tokens/theme.ts. DOM.Iterable is what makes
-    // iteration over `NodeList`, `DOMTokenList` and `SVGElement` children
-    // type-check.
-    //
-    // ES2023 is restated alongside the browser libs because `lib` REPLACES the
-    // inherited array rather than merging with it - omitting ES2023 here would
-    // silently drop `Array.prototype.findLast`, `toSorted` and the rest, all of
-    // which the sorting and grouping helpers in src/utils/** rely on.
-    //
-    // No "DOM.AsyncIterable" and no "WebWorker": nothing in this package streams
-    // from a `ReadableStream` or runs off the main thread.
     "lib": ["ES2023", "DOM", "DOM.Iterable"],
-
-    // The base sets no `types` so that one workspace's ambient globals cannot bleed
-    // into another. This project needs exactly one: @types/node 24.13.6 (a root
-    // devDependency, resolved through the workspace-root node_modules/@types). It
-    // exists for ONE colocated test - src/tokens/tokens.test.ts - which reads the
-    // generated src/tokens/tokens.css from disk with `node:fs` to make the
-    // byte-wise drift assertion AAP 0.6.1 requires (the committed CSS must match
-    // what src/tokens/tokens.ts generates). The Vitest project for this package
-    // runs under happy-dom, where `node:*` builtins keep working.
-    //
-    // THE BOUNDARY THIS DOES NOT MOVE: no non-test module under src/** may import a
-    // `node:*` builtin or touch `process`/`Buffer`/`require`. The compiler cannot
-    // express "ambient in tests only", so the guarantee is mechanical instead -
-    // tsup.config.ts sets `platform: "browser"`, which fails the build if a Node
-    // builtin appears anywhere in the src/index.ts import graph, and the colocated
-    // `*.test.ts(x)` files are not build inputs. Anything that needs a filesystem,
-    // a socket or an environment variable belongs in the host application
-    // (apps/chrome-extension, apps/vscode-extension) or in apps/local-service.
-    //
-    // Not listed: "react" / "react-dom". They are not ambient global type packages.
-    // JSX types arrive through the automatic runtime's `react/jsx-runtime` module
-    // import, and component code writes `import type { ReactNode } from "react"`;
-    // naming them here would instead make React's globals ambient package-wide.
-    // Not listed: "vitest/globals". The Vitest project for this package sets
-    // `globals: true` only so @testing-library/react can register its automatic
-    // `cleanup` on the global `afterEach`; the suites themselves still import
-    // `{ describe, it, expect }` from "vitest" explicitly, exactly as every sibling
-    // package does.
     "types": ["node"]
-
-    // NOT overridden: "module" / "moduleResolution". The base's "ESNext" +
-    // "bundler" is the correct flavour for this package and AAP 0.3.4 assigns it:
-    // bundler resolution for web and extension code, NodeNext only for the
-    // Node-targeted packages. Nothing here is ever loaded by Node - the two
-    // consumers bundle dist/index.js with Vite - so the stricter Node flavour would
-    // buy nothing and cost the whole source tree an extension convention.
-    //
-    // CONSEQUENCE FOR EVERY SOURCE FILE IN src/**, and the single most likely
-    // avoidable break in this workspace: relative specifiers are EXTENSIONLESS -
-    //     import { Button } from "./Button";
-    //     import { resolveTheme } from "../tokens/theme";
-    //     export * from "./host/PanelHost";
-    // - which is the exact OPPOSITE of the ".js"-suffixed convention that
-    // packages/shared, packages/telemetry and packages/panel-schema must use
-    // because they override this setting to NodeNext. Copying an import line from
-    // one of those packages into this one is a compile error (TS2307: the file
-    // "./Button.js" does not exist), and the mistake reads as correct. Package
-    // specifiers are written without an extension in both flavours - "react",
-    // "clsx", "@debuggen/panel-schema" - and resolve through the pnpm workspace
-    // symlink and each package's `exports` map.
-    //
-    // NOT overridden: "jsx". The base already sets "react-jsx" (React 19.3.0
-    // automatic runtime), so no .tsx file in this package needs an `import React`.
-    // NOT overridden: "outDir" / "declarationDir" / "tsBuildInfoFile". The base
-    // anchors all three per project with `${configDir}`, which resolves to the
-    // directory of THIS file and not to the base's own directory, so declarations
-    // and the incremental stamp land in packages/panel-renderer/.tsbuild - ignored
-    // by .gitignore and .prettierignore. tsc must never write into
-    // packages/panel-renderer/dist: that directory belongs to tsup and holds
-    // dist/index.js, dist/index.d.ts and the assembled dist/styles.css that the
-    // `exports` map points at.
-    // NOT set: "paths" / "baseUrl". The three workspace dependencies resolve
-    // through their `exports` maps plus the project references below, exactly as
-    // the runtime and the bundlers resolve them (AAP 0.2.2). An alias to a
-    // sibling's src/** would hide a broken `exports` map, let this package import
-    // internals past a declared entry point, and let the acyclic layering be
-    // violated without anything failing.
-    // NOT declared anywhere in this package: an ambient `*.css` module. No
-    // TypeScript file here imports a stylesheet - tsup.config.ts concatenates
-    // src/tokens/tokens.css, src/styles/base.css and src/styles/components.css into
-    // dist/styles.css, which the two consumers import as
-    // "@debuggen/panel-renderer/styles.css". A need for a `declare module "*.css"`
-    // means a source file grew a CSS import that must be removed instead, because
-    // it would also break `"sideEffects": ["**/*.css"]` and consumer tree-shaking.
-    // NOT set: "noEmit", and no strictness flag is relaxed on top of the base.
   },
 
-  // src/** only, and both extensions: the library is React, so most modules are
-  // .tsx (primitives, layout, the thirteen visualization components, PanelHost and
-  // NodeRenderer) while the tokens, registry, data-provider, hooks and utils are
-  // .ts. The colocated `*.test.ts(x)` suites are deliberately part of the program -
-  // src/components/*.test.tsx, src/host/PanelHost.test.tsx, src/host/registry.test.ts
-  // and src/tokens/tokens.test.ts - because `tsc -b` is the typecheck gate and an
-  // untypechecked test is how contract drift escapes: registry.test.ts asserting
-  // one-to-one coverage of PANEL_NODE_CATALOG is only a guarantee if it is
-  // type-checked against that catalog. `strict`, `noUncheckedIndexedAccess`,
-  // `noUnusedLocals` and `noUnusedParameters` therefore apply to the tests exactly
-  // as they do to the sources. The same glob is what gives typescript-eslint's
-  // project service a program covering every linted file in this workspace.
-  //
-  // Not included, on purpose: scripts/build-tokens.mjs (plain Node ESM tooling,
-  // linted but never compiled - `allowJs` stays false) and the *.css files, which
-  // are data for tsup and for tokens.test.ts, not program inputs.
-  //
-  // Until the first src file lands, `tsc -b` on this project answers TS18003 ("No
-  // inputs were found in config file") - expected on an empty subtree, not a
-  // configuration fault.
   "include": ["src/**/*.ts", "src/**/*.tsx"],
 
-  // Replaces the base's inherited list rather than merging with it, so the output
-  // directories are named again here; resolved relative to this directory, meaning
-  // packages/panel-renderer/{dist,.tsbuild,node_modules}. `include` already
-  // restricts the input set to src/**, which leaves dist/ (tsup output) and
-  // .tsbuild/ (declaration output) outside the program; these entries document that
-  // intent and keep it true if `include` is ever widened. Note what `exclude` does
-  // NOT do: it filters the `include` globs only, so a file reached by an import
-  // still joins the program - `rootDir` above is what rejects one from outside src/
-  // (TS6059).
   "exclude": ["dist", ".tsbuild", "node_modules"],
 
-  // The ONLY project references, foundational-first to match the root solution's
-  // ordering, and exactly the `dependencies` of this package's package.json:
-  //   ../shared      - SourceLocation and its formatting helper, the millisecond
-  //                    rounding used by DurationCell, and DebuggenError;
-  //   ../telemetry   - the aggregate result shapes the components render
-  //                    (TelemetryEvent, TraceTree, RenderStat, RequestGroup,
-  //                    QueryGroup, StateTransition, ComponentTreeSnapshot,
-  //                    MetricValue), consumed as types;
-  //   ../panel-schema - PanelSpec, PanelNode, DataQuery and PANEL_NODE_CATALOG,
-  //                    which keys the component registry.
-  //
-  // What the references do, precisely: they order the build, so `tsc -b` on this
-  // project (or on the root solution) builds those three projects first and reports
-  // errors in dependency order. They are NOT what resolves the specifiers: each
-  // package's `exports` map points at its tsup output (dist/index.d.ts), which lies
-  // outside the `${configDir}/.tsbuild` declaration directory `tsc -b` writes, so no
-  // output-to-source redirect applies. That is deliberate - this package is
-  // type-checked against the very declarations its consumers import - and it is why
-  // `pnpm verify` runs `pnpm build` before `pnpm typecheck`: on a tree where a
-  // dependency's dist/ is missing, the import fails with TS2307 rather than silently
-  // resolving to source.
-  //
-  // Never add ../protocol: the renderer must not know the wire protocol at all. Its
-  // data arrives through the `DataProvider` interface this package declares and its
-  // interactions leave through `PanelActions`, so the DevTools panel and the VS Code
-  // webview own every socket (AAP 0.4.2). The root eslint.config.js enforces the
-  // same rule with `no-restricted-imports`, and a reference here would additionally
-  // invert the layering that keeps protocol above this package. Never add an app
-  // either: both apps consume this one.
   "references": [{ "path": "../shared" }, { "path": "../telemetry" }, { "path": "../panel-schema" }]
 }

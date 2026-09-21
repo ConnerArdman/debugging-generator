@@ -218,7 +218,6 @@
   },
   "devDependencies": {
     "@debuggen/local-service": "workspace:*",
-    "@types/mocha": "10.0.10",
     "@types/react": "19.3.0",
     "@types/react-dom": "19.3.0",
     "@types/vscode": "1.125.0",
