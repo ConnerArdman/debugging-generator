@@ -1,0 +1,1957 @@
+// @vitest-environment happy-dom
+/**
+ * Colocated tests for `./fiber-diff.ts` — the product-owned fiber differ that
+ * decides **why** a React component re-rendered and what may be said about the
+ * values behind that decision.
+ *
+ * **What this suite owns.** AAP §0.8.3 names this file in the row "React fiber
+ * hook compatibility and privacy": `fiber-diff` must handle "cyclic objects,
+ * DOM nodes and functions without throwing or serialising them", stop at
+ * `MAX_TRACKED_KEYS`, truncate previews at `MAX_PREVIEW_LENGTH` and redact
+ * values matching the secret patterns of AAP §0.5.2. Two guarantees follow
+ * from that, and every test below serves one of them:
+ *
+ * 1. **The differ cannot be made to throw or to leak.** It runs inside React's
+ *    commit callback on the page's own stack, so an exception escaping it
+ *    breaks the developer's application, and it is the **first** redaction
+ *    boundary — the only one that ever sees raw application values. The
+ *    service redacts again at ingest and the model provider a third time on
+ *    the outbound path, but neither can put back what a leak here already
+ *    sent, so a value that gets past these assertions is a hole in the privacy
+ *    claim of `docs/SECURITY.md`.
+ * 2. **The classification is correct enough to carry two metrics.**
+ *    `unchanged_render_count` means, precisely (AAP §0.2.3): props
+ *    shallow-equal, own hook state unchanged **and** no consumed context value
+ *    changed. A render for which any one of the three could not be evaluated
+ *    is `unknown` and is counted separately as
+ *    `render_trigger_unknown_count`. The "nothing changed but a dimension was
+ *    unevaluable → unknown" case below is what keeps that distinction honest.
+ *
+ * **Why every credential fixture is assembled at runtime.** This file is
+ * tracked, and `scripts/check-secrets.mjs` scans tracked content for provider
+ * key prefixes, JOSE token shapes, key-file delimiters, credentialed
+ * connection strings and high-entropy values bound to key-like names. A
+ * realistic credential written as a contiguous literal would fail that gate
+ * even as a test fixture, so no prefix, token body or delimiter appears as one
+ * literal here: alphabets come from character ranges, bodies are cycled from
+ * those alphabets, and prefixes are joined from fragments through
+ * {@link assemble}. The sibling suites in `../redaction/` follow the same
+ * convention, and `./fiber-diff.ts` itself is written that way too.
+ *
+ * **Why the bounds are imported and never restated.** `MAX_TRACKED_KEYS`,
+ * `MAX_PREVIEW_LENGTH` and `RENDER_TRIGGERS` come from
+ * `../schema/attributes.ts` and `REDACTION_MARKER` from
+ * `../redaction/rules.ts`. A suite that asserted `32` or `120` as literals
+ * would keep passing while the production bound drifted — and both numbers are
+ * documented privacy guarantees rather than tuning knobs, so a drift is
+ * exactly what this suite exists to catch.
+ *
+ * **Harness.** The root `vitest.config.ts` collects this file into the
+ * `telemetry` project, which runs under happy-dom with `globals: true`. The
+ * environment docblock on line 1 states the requirement locally all the same:
+ * the DOM-node cases construct real elements with `document.createElement`, so
+ * this file needs a document whatever the project default becomes.
+ * `describe`/`it`/`expect` are imported explicitly, the convention across this
+ * monorepo's suites. No `node:` builtin is imported and no fixture file is
+ * read: the module under test is bundled into the page-injected agent
+ * (`esbuild.agent.mjs` hard-fails on a Node builtin) and must be provable
+ * without any I/O, so every input below is built inline.
+ */
+
+import { describe, expect, it } from 'vitest';
+
+import { REDACTION_MARKER } from '../redaction/rules.js';
+import { MAX_PREVIEW_LENGTH, MAX_TRACKED_KEYS, RENDER_TRIGGERS } from '../schema/attributes.js';
+import type { FiberDiff, RenderTrigger, ValueSummary } from './fiber-diff.js';
+import {
+  analyzeFiber,
+  classifyRenderTrigger,
+  diffContexts,
+  diffHookState,
+  diffProps,
+  summarizeValue,
+} from './fiber-diff.js';
+
+// ---------------------------------------------------------------------------
+// Fixture assembly
+//
+// Three helpers stand in for every long or credential-shaped literal this
+// suite would otherwise contain (see the module documentation above).
+// ---------------------------------------------------------------------------
+
+/**
+ * The inclusive character range from `first` to `last`, by code unit.
+ *
+ * Used instead of writing an alphabet out: a 64-character alphabet literal is
+ * both long and high-entropy, which is precisely the shape the repository
+ * secret gate's `entropy` rule looks for.
+ */
+function charRange(first: string, last: string): string {
+  let result = '';
+  for (let code = first.charCodeAt(0); code <= last.charCodeAt(0); code += 1) {
+    result += String.fromCharCode(code);
+  }
+  return result;
+}
+
+const DIGITS = charRange('0', '9');
+const LOWER_LETTERS = charRange('a', 'z');
+const UPPER_LETTERS = charRange('A', 'Z');
+
+/** Base64url alphabet: the body characters of opaque and JOSE credentials. */
+const URLSAFE_CHARS = UPPER_LETTERS + LOWER_LETTERS + DIGITS + '-_';
+
+/** Body characters of underscore-delimited forge tokens. */
+const WORD_CHARS = UPPER_LETTERS + LOWER_LETTERS + DIGITS + '_';
+
+/** Body characters of upper-case cloud access identifiers. */
+const UPPER_ID_CHARS = UPPER_LETTERS + DIGITS;
+
+/** Credential characters permitted after an HTTP authentication scheme. */
+const BEARER_CHARS = UPPER_LETTERS + LOWER_LETTERS + DIGITS + '._~+/=-';
+
+/**
+ * A deterministic body of `length` characters cycled from `alphabet`.
+ *
+ * Deterministic rather than random so a failure is reproducible, and cycled
+ * over the whole alphabet so the result is dense enough to look like key
+ * material to the redaction rules the module under test composes.
+ */
+function cycle(alphabet: string, length: number): string {
+  let result = '';
+  for (let index = 0; index < length; index += 1) {
+    result += alphabet.charAt(index % alphabet.length);
+  }
+  return result;
+}
+
+/**
+ * Joins credential fragments.
+ *
+ * Every call site exists to keep a credential prefix or a key-file delimiter
+ * from appearing as one contiguous literal in this tracked file. The split
+ * points carry no meaning beyond that, which is worth knowing before
+ * "simplifying" a call away.
+ */
+function assemble(...fragments: readonly string[]): string {
+  return fragments.join('');
+}
+
+/**
+ * The distinctive tail every credential fixture ends with.
+ *
+ * Its characters belong to each rule's body class, so a rule that consumes
+ * "the whole run of credential characters, not just the length that
+ * identified it" must swallow this too. Finding it anywhere in a summary is
+ * therefore proof that a credential tail survived redaction, which is the
+ * single assertion the secret cases below all share.
+ */
+const SECRET_TAIL = assemble('TAIL', 'SENTINEL', '9');
+
+/** Low-entropy prose, cycled to any length a bounds case needs. */
+const PROSE_ALPHABET = 'lorem ipsum dolor sit amet ';
+
+/** A single astral-plane code point: two UTF-16 units, one code point. */
+const ASTRAL_CHAR = '\u{1F600}';
+
+/** Matches a high or low surrogate that is not part of a valid pair. */
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
+// ---------------------------------------------------------------------------
+// Synthetic fiber builders
+//
+// The module under test accepts `unknown` on purpose — real fibers vary by
+// React version and a synthetic fiber-shaped object is a legitimate input — so
+// the builders below are typed loosely and describe the fiber fields the
+// differ actually reads: `memoizedProps`, `memoizedState`, `dependencies` and
+// `alternate`.
+// ---------------------------------------------------------------------------
+
+/** A loosely typed page object: what every fiber field is, as far as this suite cares. */
+type Bag = Record<string, unknown>;
+
+/** One consumed-context dependency: the context object and the value read from it. */
+interface ContextEntry {
+  /** The context object React records on the dependency. */
+  readonly context: Bag;
+  /** The value the fiber read from that context on this render. */
+  readonly value: unknown;
+}
+
+/**
+ * A singly-linked chain of `useState`-shaped hook nodes, one per value.
+ *
+ * Each node carries `memoizedState` and a `queue` whose `dispatch` is a
+ * function, which is how `./fiber-diff.ts` recognises a state-bearing hook.
+ * `queue.lastRenderedReducer` is deliberately absent, which the differ reads
+ * as `useState` and labels `state`.
+ */
+function makeHookChain(values: readonly unknown[]): Bag | null {
+  let head: Bag | null = null;
+  for (let index = values.length - 1; index >= 0; index -= 1) {
+    head = {
+      memoizedState: values[index],
+      queue: {
+        dispatch: (): void => {
+          // Never called. The differ reads `dispatch` to recognise the hook
+          // kind and must never invoke anything it finds on a page object.
+        },
+      },
+      next: head,
+    };
+  }
+  return head;
+}
+
+/**
+ * A chain of `useReducer`-shaped hook nodes: a dispatching queue whose
+ * `lastRenderedReducer` is a *named* function other than React's
+ * `basicStateReducer`, which is what the differ labels `reducer`.
+ */
+function makeReducerHookChain(values: readonly unknown[]): Bag | null {
+  let head: Bag | null = null;
+  for (let index = values.length - 1; index >= 0; index -= 1) {
+    head = {
+      memoizedState: values[index],
+      queue: {
+        dispatch: (): void => {
+          // Never called; see makeHookChain.
+        },
+        lastRenderedReducer: function cartReducer(): number {
+          throw new Error('a reducer must never be invoked by the differ');
+        },
+      },
+      next: head,
+    };
+  }
+  return head;
+}
+
+/**
+ * A chain of effect-shaped hook nodes — `{ create, destroy, deps, tag }` — so
+ * that a suite can prove an effect record is not treated as state.
+ *
+ * `destroy` is a function the differ must never read through and never call:
+ * invoking a cleanup during a commit would tear down the developer's effects.
+ */
+function makeEffectHookChain(values: readonly unknown[]): Bag | null {
+  let head: Bag | null = null;
+  for (let index = values.length - 1; index >= 0; index -= 1) {
+    head = {
+      memoizedState: {
+        create: (): void => {
+          throw new Error('an effect must never be created by the differ');
+        },
+        destroy: (): void => {
+          throw new Error('an effect must never be destroyed by the differ');
+        },
+        deps: [values[index]],
+        tag: 5,
+      },
+      next: head,
+    };
+  }
+  return head;
+}
+
+/** A chain of `useRef`-shaped hook nodes: `memoizedState` is a `{ current }` box. */
+function makeRefHookChain(values: readonly unknown[]): Bag | null {
+  let head: Bag | null = null;
+  for (let index = values.length - 1; index >= 0; index -= 1) {
+    head = { memoizedState: { current: values[index] }, next: head };
+  }
+  return head;
+}
+
+/** A chain of `useMemo`-shaped hook nodes: `memoizedState` is a `[value, deps]` pair. */
+function makeMemoHookChain(values: readonly unknown[]): Bag | null {
+  let head: Bag | null = null;
+  for (let index = values.length - 1; index >= 0; index -= 1) {
+    head = { memoizedState: [values[index], [values[index]]], next: head };
+  }
+  return head;
+}
+
+/**
+ * Links the last node of a chain back to its head, making it cyclic.
+ *
+ * React never produces such a chain; a page that corrupted one, or a
+ * synthetic fiber, can. The differ has to survive it, so the suite has to be
+ * able to build it.
+ */
+function closeChain(head: Bag | null): Bag | null {
+  if (head === null) {
+    return null;
+  }
+  let tail = head;
+  while (tail['next'] !== null && tail['next'] !== undefined) {
+    const next = tail['next'];
+    if (next === head) {
+      return head;
+    }
+    tail = next as Bag;
+  }
+  tail['next'] = head;
+  return head;
+}
+
+/**
+ * A fiber `dependencies` object: `{ firstContext: { context, memoizedValue,
+ * next } }`, the shape React records consumed contexts in.
+ *
+ * Returns `null` for an empty list, which is what React leaves on a fiber
+ * whose render read no context at all.
+ */
+function makeContextChain(entries: readonly ContextEntry[]): Bag | null {
+  let head: Bag | null = null;
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index];
+    if (entry === undefined) {
+      continue;
+    }
+    head = { context: entry.context, memoizedValue: entry.value, next: head };
+  }
+  return head === null ? null : { firstContext: head };
+}
+
+/** What {@link makeFiber} accepts: this render's values, and the previous render's. */
+interface FiberSpec {
+  /** `memoizedProps` for this render. */
+  readonly props?: Bag;
+  /** `memoizedProps` for the previous render; defaults to a copy of {@link props}. */
+  readonly prevProps?: Bag;
+  /** `memoizedState` head for this render, from one of the hook-chain builders. */
+  readonly hooks?: unknown;
+  /** `memoizedState` head for the previous render. */
+  readonly prevHooks?: unknown;
+  /** `dependencies` for this render, from {@link makeContextChain}. */
+  readonly contexts?: unknown;
+  /** `dependencies` for the previous render. */
+  readonly prevContexts?: unknown;
+  /** `false` builds a mount: a fiber with no `alternate` at all. */
+  readonly withAlternate?: boolean;
+}
+
+/**
+ * A synthetic fiber, with an `alternate` mirroring the previous render's
+ * values.
+ *
+ * The previous props default to a **shallow copy** of this render's props
+ * rather than the same object, so the default fiber exercises the real
+ * per-key comparison instead of the differ's identical-object fast path. A
+ * test that wants the fast path passes the same object as both.
+ */
+function makeFiber(spec: FiberSpec = {}): Bag {
+  const fiber: Bag = {
+    memoizedProps: spec.props ?? {},
+    memoizedState: spec.hooks ?? null,
+    dependencies: spec.contexts ?? null,
+  };
+  if (spec.withAlternate !== false) {
+    fiber['alternate'] = {
+      memoizedProps: { ...(spec.prevProps ?? spec.props ?? {}) },
+      memoizedState: spec.prevHooks ?? null,
+      dependencies: spec.prevContexts ?? null,
+    };
+  }
+  return fiber;
+}
+
+// ---------------------------------------------------------------------------
+// Assertion helpers
+// ---------------------------------------------------------------------------
+
+/** Length in code points, which is the unit `MAX_PREVIEW_LENGTH` is counted in. */
+function codePointLength(value: string): number {
+  return Array.from(value).length;
+}
+
+/**
+ * The invariants **every** summary must satisfy, whatever produced it: a
+ * non-empty category, a preview within the bound, no lone surrogate, and a
+ * `truncated` flag that is either absent or `true` (never `false`, which is
+ * the shape `./fiber-diff.ts` documents under `exactOptionalPropertyTypes`).
+ */
+function expectWellFormedSummary(summary: ValueSummary): void {
+  expect(typeof summary.type).toBe('string');
+  expect(summary.type.length).toBeGreaterThan(0);
+  expect(typeof summary.preview).toBe('string');
+  expect(codePointLength(summary.preview)).toBeLessThanOrEqual(MAX_PREVIEW_LENGTH);
+  expect(summary.preview).not.toMatch(LONE_SURROGATE);
+  if (summary.truncated !== undefined) {
+    expect(summary.truncated).toBe(true);
+  }
+}
+
+/**
+ * A JSON-safe skeleton of an arbitrary value: its keys, its primitives and the
+ * *shape* of everything else, with cycles collapsed and reads guarded.
+ *
+ * Used only to prove {@link analyzeFiber} does not mutate its input, so it
+ * must be total (a synthetic fiber can hold a throwing getter) and stable
+ * (object keys are visited in sorted order) rather than faithful.
+ */
+type Skeleton = string | number | boolean | null | Skeleton[] | { [key: string]: Skeleton };
+
+function structuralSnapshot(value: unknown, seen: WeakSet<object> = new WeakSet()): Skeleton {
+  if (value === null) {
+    return null;
+  }
+  switch (typeof value) {
+    case 'string':
+    case 'number':
+    case 'boolean':
+      return value;
+    case 'undefined':
+      return '[undefined]';
+    case 'bigint':
+    case 'symbol':
+      return '[' + typeof value + ']';
+    case 'function':
+      return '[function]';
+    default:
+      break;
+  }
+  // Every other `typeof` returned above, so the value is an object here.
+  const object: object = value;
+  if (seen.has(object)) {
+    return '[circular]';
+  }
+  seen.add(object);
+  if (Array.isArray(object)) {
+    return (object as readonly unknown[]).map((entry) => structuralSnapshot(entry, seen));
+  }
+  const result: { [key: string]: Skeleton } = {};
+  for (const key of Object.keys(object).sort()) {
+    try {
+      result[key] = structuralSnapshot((object as Bag)[key], seen);
+    } catch {
+      result[key] = '[unreadable]';
+    }
+  }
+  return result;
+}
+
+/**
+ * Collects `typeof` for every leaf of a diff result.
+ *
+ * The transport is `window.postMessage` to the isolated-world bridge and then
+ * JSON over a WebSocket, and the event schema's attribute refinement rejects a
+ * function or a symbol outright. Asserting the leaf vocabulary is how this
+ * suite proves a diff can make that journey: a `function`, `symbol`,
+ * `undefined` or `bigint` leaf would be dropped or rejected downstream.
+ */
+function collectLeafTypes(value: unknown, into: Set<string>): void {
+  if (value === null || typeof value !== 'object') {
+    into.add(typeof value);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const entry of value as readonly unknown[]) {
+      collectLeafTypes(entry, into);
+    }
+    return;
+  }
+  for (const entry of Object.values(value as Record<string, unknown>)) {
+    collectLeafTypes(entry, into);
+  }
+}
+
+/**
+ * Asserts a diff survives the transport: only JSON primitives at the leaves,
+ * `JSON.stringify` succeeds, and the parsed result is strictly equal to the
+ * original (which no object holding an explicit `undefined`, a function or a
+ * symbol could be).
+ */
+function expectTransportable(diff: FiberDiff): void {
+  const leafTypes = new Set<string>();
+  collectLeafTypes(diff, leafTypes);
+  for (const leafType of leafTypes) {
+    expect(['string', 'number', 'boolean']).toContain(leafType);
+  }
+  const encoded = JSON.stringify(diff);
+  expect(typeof encoded).toBe('string');
+  const decoded: unknown = JSON.parse(encoded);
+  expect(decoded).toStrictEqual(diff);
+}
+
+// ---------------------------------------------------------------------------
+// Adversarial value catalogue
+//
+// One factory per value, rather than one value: a revoked `Proxy` and a
+// settled promise are single-use, and a shared fixture that one test mutated
+// would make another test's failure a mystery.
+// ---------------------------------------------------------------------------
+
+/** A named adversarial value, built fresh on demand. */
+interface ValueCase {
+  /** What the case is, so a failure names the shape rather than the bytes. */
+  readonly label: string;
+  /** Builds the value. */
+  readonly make: () => unknown;
+}
+
+/**
+ * Text put inside a DOM node: the developer's page, and on a form control
+ * whatever their user typed into it. Never diagnostic, so never previewed.
+ */
+const DOM_TEXT_CONTENT = 'Ada Lovelace, 12 Orchard Lane';
+
+/**
+ * An error message carrying what error messages routinely carry. A category
+ * (`TypeError`) explains a render; the message never has to.
+ */
+const ERROR_MESSAGE = 'card 4111 1111 1111 1111 declined for ada@example.com';
+
+/** The distinctive token inside every function body used as a fixture. */
+const FUNCTION_BODY_TOKEN = '7919';
+
+/**
+ * Page-owned content that must never appear in a summary, whatever value it
+ * was reached through.
+ *
+ * Each entry is a fragment of one of the fixtures below — a DOM node's text, an
+ * error's message, a function's body, the leaf of a deep object, a React
+ * element's prop — and the sweep over {@link ADVERSARIAL_VALUES} asserts the
+ * absence of all of them for every value in the catalogue. That is one
+ * assertion standing in for the whole privacy contract: a preview describes,
+ * and never carries.
+ */
+const NEVER_TRAVELS: readonly string[] = [
+  DOM_TEXT_CONTENT,
+  'Lovelace',
+  'Orchard',
+  ERROR_MESSAGE,
+  '4111',
+  'example.com',
+  FUNCTION_BODY_TOKEN,
+  'bottom',
+  'LS-4471',
+  '4471',
+];
+
+/** A named function whose body carries {@link FUNCTION_BODY_TOKEN}. */
+function handleCheckout(items: number): number {
+  return items * 7919;
+}
+
+/** An arrow function, named through its binding, with the same body token. */
+const quoteShipping = (weight: number): number => weight * 7919;
+
+/**
+ * A function with no inferable name: a function expression in an array
+ * literal gets no named evaluation, so `fn.name` is the empty string.
+ */
+function makeAnonymousFunction(): unknown {
+  return [
+    function (weight: number): number {
+      return weight * 7919;
+    },
+  ][0];
+}
+
+/** An object that refers to itself: the AAP's first named robustness case. */
+function makeCyclicObject(): Bag {
+  const node: Bag = { id: 1 };
+  node['self'] = node;
+  return node;
+}
+
+/** An array that contains itself, which is how a cycle reaches a nested walk. */
+function makeCyclicArray(): unknown[] {
+  const list: unknown[] = ['first'];
+  list.push(list);
+  return list;
+}
+
+/** A DOM element with an id, three classes and text content that must not travel. */
+function makeDomElement(): HTMLElement {
+  const element = document.createElement('div');
+  element.id = 'checkout-root';
+  element.className = 'row active extra';
+  element.textContent = DOM_TEXT_CONTENT;
+  return element;
+}
+
+/** A revoked `Proxy`: every operation on it throws, including enumeration. */
+function makeRevokedProxy(): unknown {
+  const revocable = Proxy.revocable({ shape: 1 }, {});
+  revocable.revoke();
+  return revocable.proxy;
+}
+
+/** An object with an enumerable getter that throws when read. */
+function makeThrowingGetter(): Bag {
+  const object: Bag = { ok: 1 };
+  Object.defineProperty(object, 'boom', {
+    enumerable: true,
+    get(): never {
+      throw new Error('a getter the differ must survive');
+    },
+  });
+  return object;
+}
+
+/** An object whose `toString` and `Symbol.toPrimitive` both throw if invoked. */
+function makeThrowingCoercion(): Bag {
+  return {
+    ok: 1,
+    toString(): never {
+      throw new Error('toString must never be called');
+    },
+    [Symbol.toPrimitive](): never {
+      throw new Error('Symbol.toPrimitive must never be called');
+    },
+  };
+}
+
+/** How deep the nesting cases go: far past the module's preview depth bound. */
+const DEEP_NESTING_LEVELS = 20;
+
+/** A twenty-level object, to prove the depth bound elides rather than descends. */
+function makeDeepObject(): Bag {
+  let node: Bag = { leaf: 'bottom' };
+  for (let level = 0; level < DEEP_NESTING_LEVELS; level += 1) {
+    node = { nest: node };
+  }
+  return node;
+}
+
+/** A twenty-level array, the same case through the one type that does recurse. */
+function makeDeepArray(): unknown[] {
+  let node: unknown[] = ['bottom'];
+  for (let level = 0; level < DEEP_NESTING_LEVELS; level += 1) {
+    node = [node];
+  }
+  return node;
+}
+
+/** A React element, marked the way React 19 marks them. */
+function makeReactElement(): Bag {
+  return {
+    $$typeof: Symbol.for('react.transitional.element'),
+    type: { displayName: 'ProductCard' },
+    key: null,
+    props: { sku: 'LS-4471', onSelect: (): void => undefined },
+  };
+}
+
+/**
+ * Every adversarial value the robustness cases sweep over.
+ *
+ * The sweep asserts the two properties that must hold for all of them — no
+ * throw, and a well-formed bounded summary — while the individual cases below
+ * assert what each one's preview must and must not contain.
+ */
+const ADVERSARIAL_VALUES: readonly ValueCase[] = [
+  { label: 'a self-referential object', make: makeCyclicObject },
+  { label: 'a self-referential array', make: makeCyclicArray },
+  { label: 'a DOM element', make: makeDomElement },
+  { label: 'a detached text node', make: (): unknown => document.createTextNode(DOM_TEXT_CONTENT) },
+  { label: 'a named function', make: (): unknown => handleCheckout },
+  { label: 'an anonymous function', make: makeAnonymousFunction },
+  { label: 'an arrow function', make: (): unknown => quoteShipping },
+  { label: 'a symbol', make: (): unknown => Symbol('customer-4471') },
+  { label: 'a bigint', make: (): unknown => 9007199254740993n },
+  { label: 'a pending promise', make: (): unknown => new Promise<void>(() => undefined) },
+  { label: 'a thenable', make: (): unknown => ({ then: (): void => undefined }) },
+  { label: 'an error', make: (): unknown => new TypeError(ERROR_MESSAGE) },
+  { label: 'a map', make: (): unknown => new Map([['sku', 1]]) },
+  { label: 'a weak map', make: (): unknown => new WeakMap() },
+  { label: 'a set', make: (): unknown => new Set([1, 2, 3]) },
+  { label: 'a weak set', make: (): unknown => new WeakSet() },
+  { label: 'a date', make: (): unknown => new Date(0) },
+  { label: 'a regular expression', make: (): unknown => /customer-(\d+)/gi },
+  {
+    label: 'a prototype-less object',
+    make: (): unknown => Object.assign(Object.create(null), { sku: 'LS-4471' }),
+  },
+  { label: 'a revoked proxy', make: makeRevokedProxy },
+  { label: 'an object with a throwing getter', make: makeThrowingGetter },
+  { label: 'an object with throwing coercion', make: makeThrowingCoercion },
+  { label: 'a deeply nested object', make: makeDeepObject },
+  { label: 'a deeply nested array', make: makeDeepArray },
+  { label: 'a React element', make: makeReactElement },
+  { label: 'null', make: (): unknown => null },
+  { label: 'undefined', make: (): unknown => undefined },
+  { label: 'not a number', make: (): unknown => Number.NaN },
+  { label: 'negative infinity', make: (): unknown => Number.NEGATIVE_INFINITY },
+  { label: 'a typed array', make: (): unknown => new Uint8Array([1, 2, 3]) },
+  { label: 'an empty string', make: (): unknown => '' },
+];
+
+// ---------------------------------------------------------------------------
+// Credential fixtures: one per content-driven class of AAP 0.5.2
+//
+// Every one ends in SECRET_TAIL, drawn from that class's own body characters,
+// so a rule that stopped at the length which merely *identified* the
+// credential would leave the tail behind and fail the shared assertion.
+// ---------------------------------------------------------------------------
+
+/** A credential-shaped value and what must survive its redaction. */
+interface SecretCase {
+  /** The class under test, named rather than shown. */
+  readonly label: string;
+  /** The value, assembled at runtime from fragments. */
+  readonly value: string;
+  /**
+   * Text that must still be present afterwards because it is diagnostic
+   * rather than secret — a scheme word, a URL's scheme and authority — or the
+   * marker alone when nothing about the value may survive.
+   */
+  readonly survives: readonly string[];
+}
+
+/** Every credential class `scrub` replaces by content. */
+const SECRET_CASES: readonly SecretCase[] = [
+  {
+    label: 'a vendor-scoped model provider key',
+    value: assemble('s', 'k-', 'ant-') + cycle(URLSAFE_CHARS, 40) + SECRET_TAIL,
+    survives: [REDACTION_MARKER],
+  },
+  {
+    label: 'a short-form model provider key',
+    value: assemble('s', 'k-') + cycle(URLSAFE_CHARS, 32) + SECRET_TAIL,
+    survives: [REDACTION_MARKER],
+  },
+  {
+    label: 'a classic forge access token',
+    value: assemble('gh', 'p_') + cycle(WORD_CHARS, 36) + SECRET_TAIL,
+    survives: [REDACTION_MARKER],
+  },
+  {
+    label: 'a fine-grained forge access token',
+    value: assemble('git', 'hub_', 'pat_') + cycle(WORD_CHARS, 40) + SECRET_TAIL,
+    survives: [REDACTION_MARKER],
+  },
+  {
+    label: 'a cloud access key identifier',
+    value: assemble('AK', 'IA') + cycle(UPPER_ID_CHARS, 16) + SECRET_TAIL,
+    survives: [REDACTION_MARKER],
+  },
+  {
+    label: 'an HTTP bearer credential',
+    value: assemble('Bea', 'rer ') + cycle(BEARER_CHARS, 40) + SECRET_TAIL,
+    // The scheme word stays: that a request was authenticated is diagnostic,
+    // and the credential is what must not be.
+    survives: [REDACTION_MARKER, assemble('Bea', 'rer')],
+  },
+  {
+    label: 'a JOSE compact token',
+    value:
+      assemble('ey', 'J') +
+      cycle(URLSAFE_CHARS, 20) +
+      '.' +
+      cycle(URLSAFE_CHARS, 24) +
+      '.' +
+      cycle(URLSAFE_CHARS, 20) +
+      SECRET_TAIL,
+    survives: [REDACTION_MARKER],
+  },
+  {
+    label: 'a PEM private-key block',
+    value:
+      assemble('-'.repeat(5), 'BEGIN RSA ', 'PRIVATE', ' KEY', '-'.repeat(5)) +
+      '\n' +
+      cycle(URLSAFE_CHARS, 48) +
+      SECRET_TAIL +
+      '\n' +
+      assemble('-'.repeat(5), 'END RSA ', 'PRIVATE', ' KEY', '-'.repeat(5)),
+    survives: [REDACTION_MARKER],
+  },
+  {
+    label: 'a credentialed connection string',
+    value:
+      assemble('postgres', 'ql://', 'reporting', ':') +
+      cycle(URLSAFE_CHARS, 16) +
+      SECRET_TAIL +
+      assemble('@localhost:5432/', 'lumen'),
+    // Scheme and authority stay: a redacted connection string must remain
+    // diagnosable, which is what tells a developer which database was reached.
+    survives: [REDACTION_MARKER, 'postgres', 'localhost:5432'],
+  },
+];
+
+/** Key-like names whose values are replaced whole, however short. */
+const SENSITIVE_PROP_NAMES: readonly string[] = ['token', 'apiKey', 'password', 'authHeader'];
+
+/** A short, low-entropy value: redacted under a sensitive name and only then. */
+const SHORT_NAMED_VALUE = 'hunter2';
+
+// ---------------------------------------------------------------------------
+// summarizeValue
+// ---------------------------------------------------------------------------
+
+describe('summarizeValue', () => {
+  describe('robustness', () => {
+    it.each(ADVERSARIAL_VALUES)(
+      'summarises $label without throwing and within the bounds',
+      ({ make }) => {
+        const value = make();
+        const summary = summarizeValue(value);
+        expectWellFormedSummary(summary);
+        // Under a name as well: the name-driven path is a second code path
+        // through the same composition, and it must be just as total.
+        expectWellFormedSummary(summarizeValue(value, 'optionsBag'));
+      },
+    );
+
+    it('describes a self-referential object by its keys rather than recursing', () => {
+      const summary = summarizeValue(makeCyclicObject());
+
+      expect(summary.type).toBe('object');
+      // Key names are diagnostic (AAP 0.5.2); the value behind `self` is
+      // reported as a category, which is what terminates the walk.
+      expect(summary.preview).toContain('self');
+      expect(summary.preview).toContain('id');
+      expectWellFormedSummary(summary);
+    });
+
+    it('marks a cycle reached through a nested walk as circular rather than serialising it', () => {
+      const summary = summarizeValue(makeCyclicArray());
+
+      expect(summary.type).toBe('array');
+      expect(summary.preview).toContain('[circular]');
+      expect(summary.preview).toContain('first');
+      expectWellFormedSummary(summary);
+    });
+
+    it('reports a repeated reference as circular even when the graph is acyclic', () => {
+      const shared = { sku: 'LS-4471' };
+
+      const summary = summarizeValue([shared, shared]);
+
+      // The visited set is what bounds a wide graph, not just a cyclic one:
+      // the second occurrence is reported rather than described again.
+      expect(summary.preview).toContain('[circular]');
+      expectWellFormedSummary(summary);
+    });
+
+    it('describes a DOM node by its tag and never by its content', () => {
+      const summary = summarizeValue(makeDomElement());
+
+      expect(summary.type).toBe('dom');
+      expect(summary.preview).toContain('div');
+      expect(summary.preview).toContain('checkout-root');
+      expect(summary.preview).toContain('row');
+      // The page's text is the developer's data, and on a form control it is
+      // whatever their user typed.
+      expect(summary.preview).not.toContain(DOM_TEXT_CONTENT);
+      expect(summary.preview).not.toContain('Lovelace');
+      expect(summary.preview).not.toContain('<div ');
+      expect(summary.preview).not.toContain('</div>');
+      expectWellFormedSummary(summary);
+    });
+
+    it('describes a DOM node nested inside a prop without walking into it', () => {
+      const summary = summarizeValue({ node: makeDomElement(), rows: 3 });
+
+      expect(summary.preview).not.toContain(DOM_TEXT_CONTENT);
+      expect(summary.preview).toContain('node');
+      expectWellFormedSummary(summary);
+    });
+
+    it('names a function without reading its source text', () => {
+      const named = summarizeValue(handleCheckout);
+      const arrow = summarizeValue(quoteShipping);
+      const anonymous = summarizeValue(makeAnonymousFunction());
+
+      expect(named.type).toBe('function');
+      expect(named.preview).toBe('[function handleCheckout]');
+      expect(arrow.type).toBe('function');
+      expect(arrow.preview).toBe('[function quoteShipping]');
+      expect(anonymous.type).toBe('function');
+      expect(anonymous.preview).toBe('[function]');
+      for (const summary of [named, arrow, anonymous]) {
+        // A closure can hold anything, and `Function.prototype.toString`
+        // returns the body, so neither is ever reached.
+        expect(summary.preview).not.toContain(FUNCTION_BODY_TOKEN);
+        expect(summary.preview).not.toContain('return');
+        expect(summary.preview).not.toContain('=>');
+        expectWellFormedSummary(summary);
+      }
+    });
+
+    it('describes an error by its class and never by its message', () => {
+      const summary = summarizeValue(new TypeError(ERROR_MESSAGE));
+
+      expect(summary.type).toBe('error');
+      expect(summary.preview).toContain('TypeError');
+      expect(summary.preview).not.toContain('4111');
+      expect(summary.preview).not.toContain('example.com');
+      expect(summary.preview).not.toContain(ERROR_MESSAGE);
+      expectWellFormedSummary(summary);
+    });
+
+    it('describes a symbol, a bigint, a date and a regular expression by shape', () => {
+      expect(summarizeValue(Symbol('customer-4471')).preview).not.toContain('4471');
+      expect(summarizeValue(Symbol('customer-4471')).type).toBe('symbol');
+      // A bigint is a scalar the evidence layer legitimately carries.
+      expect(summarizeValue(9007199254740993n).preview).toBe('9007199254740993');
+      // A date is a value — a birth date, an appointment — so identity is
+      // reported and the instant is not.
+      expect(summarizeValue(new Date(86_400_000)).type).toBe('date');
+      expect(summarizeValue(new Date(86_400_000)).preview).not.toContain('1970');
+      expect(summarizeValue(/customer-(\d+)/gi).type).toBe('regexp');
+      expect(summarizeValue(/customer-(\d+)/gi).preview).not.toContain('customer');
+    });
+
+    it('describes a collection by its size and never by its entries', () => {
+      const map = summarizeValue(new Map([['ada@example.com', 3]]));
+      const set = summarizeValue(new Set(['ada@example.com']));
+
+      expect(map.type).toBe('map');
+      expect(map.preview).toContain('1');
+      expect(map.preview).not.toContain('example.com');
+      expect(set.type).toBe('set');
+      expect(set.preview).not.toContain('example.com');
+      // A weak collection cannot be enumerated at all and has no size.
+      expect(summarizeValue(new WeakMap()).type).toBe('map');
+      expect(summarizeValue(new WeakSet()).type).toBe('set');
+    });
+
+    it('reports a value whose keys cannot be enumerated as unreadable', () => {
+      const summary = summarizeValue(makeRevokedProxy());
+
+      // Every operation on a revoked proxy throws, including `for…in`,
+      // `Object.hasOwn`, `Array.isArray` and `Object.prototype.toString`.
+      expect(summary.preview).toBe('[unreadable]');
+      expectWellFormedSummary(summary);
+    });
+
+    it('skips a property whose getter throws while still describing the rest', () => {
+      const summary = summarizeValue(makeThrowingGetter());
+
+      expect(summary.type).toBe('object');
+      expect(summary.preview).toContain('ok');
+      expect(summary.preview).toContain('boom');
+      expect(summary.preview).toContain('unreadable');
+      expectWellFormedSummary(summary);
+    });
+
+    it('never invokes a value it found: coercion hooks that throw are not called', () => {
+      // Calling `toString`, `valueOf` or `Symbol.toPrimitive` would run the
+      // page's code inside React's commit callback. If any were reached the
+      // fixture's throw would escape and this test would fail.
+      const summary = summarizeValue(makeThrowingCoercion());
+
+      expect(summary.type).toBe('object');
+      expect(summary.preview).toContain('ok');
+      expectWellFormedSummary(summary);
+    });
+
+    it('elides depth rather than descending a deeply nested value', () => {
+      const object = summarizeValue(makeDeepObject());
+      const array = summarizeValue(makeDeepArray());
+
+      expect(object.preview).not.toContain('bottom');
+      expect(array.preview).not.toContain('bottom');
+      // Twenty levels in, a depth bound of two means the preview is a few
+      // characters long — proof the walk stopped rather than being truncated
+      // at the end of a 120-character serialisation.
+      expect(object.preview.length).toBeLessThan(MAX_PREVIEW_LENGTH);
+      expect(array.preview.length).toBeLessThan(MAX_PREVIEW_LENGTH);
+      expectWellFormedSummary(object);
+      expectWellFormedSummary(array);
+    });
+
+    it('names the component of a React element without walking its props', () => {
+      const summary = summarizeValue(makeReactElement());
+
+      expect(summary.type).toBe('react-element');
+      expect(summary.preview).toContain('ProductCard');
+      expect(summary.preview).not.toContain('LS-4471');
+      expectWellFormedSummary(summary);
+    });
+
+    it.each(ADVERSARIAL_VALUES)('never lets $label carry its content out', ({ make }) => {
+      const encoded = JSON.stringify(summarizeValue(make(), 'optionsBag'));
+
+      // One assertion for the whole catalogue: whatever a value is, none of
+      // the page-owned content the fixtures hold may appear in the summary
+      // that leaves the page.
+      for (const forbidden of NEVER_TRAVELS) {
+        expect(encoded).not.toContain(forbidden);
+      }
+    });
+  });
+
+  describe('bounds', () => {
+    it('truncates a long value to the preview bound and says so', () => {
+      const summary = summarizeValue(cycle(PROSE_ALPHABET, 500));
+
+      expect(summary.type).toBe('string');
+      expect(summary.truncated).toBe(true);
+      expect(codePointLength(summary.preview)).toBeLessThanOrEqual(MAX_PREVIEW_LENGTH);
+      // A consumer must never present a shortened preview as a whole value,
+      // which is what the flag is for.
+      expect(summary.preview.length).toBeLessThan(500);
+    });
+
+    it('leaves a value of exactly the bound unmarked', () => {
+      const exact = cycle(PROSE_ALPHABET, MAX_PREVIEW_LENGTH);
+
+      const summary = summarizeValue(exact);
+
+      expect(codePointLength(exact)).toBe(MAX_PREVIEW_LENGTH);
+      expect(summary.preview).toBe(exact);
+      expect(summary.truncated).toBeUndefined();
+    });
+
+    it('counts the bound in code points, not UTF-16 units', () => {
+      // Half the bound in astral characters is twice the bound in code units:
+      // a length check written in `String.length` would cut this value.
+      const withinBound = ASTRAL_CHAR.repeat(MAX_PREVIEW_LENGTH - 20);
+
+      const summary = summarizeValue(withinBound);
+
+      expect(withinBound.length).toBeGreaterThan(MAX_PREVIEW_LENGTH);
+      expect(summary.preview).toBe(withinBound);
+      expect(summary.truncated).toBeUndefined();
+    });
+
+    it('never splits a surrogate pair when it does truncate', () => {
+      const summary = summarizeValue(ASTRAL_CHAR.repeat(MAX_PREVIEW_LENGTH * 2));
+
+      expect(summary.truncated).toBe(true);
+      expect(codePointLength(summary.preview)).toBeLessThanOrEqual(MAX_PREVIEW_LENGTH);
+      expect(summary.preview).not.toMatch(LONE_SURROGATE);
+      // A lone surrogate would also make the preview unencodable, which the
+      // round trip proves it is not.
+      expect(JSON.parse(JSON.stringify(summary.preview))).toBe(summary.preview);
+    });
+
+    it('bounds a preview composed from a wide value', () => {
+      const wide: Bag = {};
+      for (let index = 0; index < MAX_TRACKED_KEYS + 8; index += 1) {
+        wide['warehouseRegion' + String(index)] = index;
+      }
+
+      const summary = summarizeValue(wide);
+
+      expectWellFormedSummary(summary);
+      // The last key is beyond every bound the composition applies, so it
+      // cannot be in the preview however the elision is spelled.
+      expect(summary.preview).not.toContain('warehouseRegion' + String(MAX_TRACKED_KEYS + 7));
+    });
+  });
+
+  describe('redaction', () => {
+    it.each(SECRET_CASES)('removes $label from a prop value', ({ value, survives }) => {
+      const summary = summarizeValue(value);
+      const encoded = JSON.stringify(summary);
+
+      expect(summary.preview).toContain(REDACTION_MARKER);
+      // The tail is drawn from the credential's own body characters, so its
+      // absence is what proves the whole run went and not just the prefix
+      // that identified it.
+      expect(encoded).not.toContain(SECRET_TAIL);
+      for (const kept of survives) {
+        expect(summary.preview).toContain(kept);
+      }
+      expectWellFormedSummary(summary);
+    });
+
+    it.each(SECRET_CASES)('removes $label nested inside a prop', ({ value }) => {
+      // A credential does not have to be the prop: it can sit inside an array
+      // the prop holds, which is a different composition path.
+      const encoded = JSON.stringify(summarizeValue([value]));
+
+      expect(encoded).toContain(REDACTION_MARKER);
+      expect(encoded).not.toContain(SECRET_TAIL);
+    });
+
+    it.each(SENSITIVE_PROP_NAMES)('replaces a value captured under %s whole', (name) => {
+      const named = summarizeValue(SHORT_NAMED_VALUE, name);
+
+      // Name-driven redaction is stricter than content detection on purpose: a
+      // four-character password is still a password, and this is the path the
+      // `key` argument exists for.
+      expect(named.preview).toBe(REDACTION_MARKER);
+      expect(named.preview).not.toContain(SHORT_NAMED_VALUE);
+    });
+
+    it('uses the key argument: the same value under an ordinary name survives', () => {
+      const anonymous = summarizeValue(SHORT_NAMED_VALUE);
+      const ordinary = summarizeValue(SHORT_NAMED_VALUE, 'shippingMethod');
+
+      // Without this pair the previous test would pass even if the name were
+      // ignored and every string were replaced.
+      expect(anonymous.preview).toBe(SHORT_NAMED_VALUE);
+      expect(ordinary.preview).toBe(SHORT_NAMED_VALUE);
+    });
+
+    it('scrubs a credential split across the keys of one value', () => {
+      // Scrubbing runs on the composed preview rather than on each piece, so a
+      // credential assembled by the composition itself is still caught.
+      const summary = summarizeValue([
+        assemble('s', 'k-', 'ant-') + cycle(URLSAFE_CHARS, 40) + SECRET_TAIL,
+        assemble('Bea', 'rer ') + cycle(BEARER_CHARS, 40) + SECRET_TAIL,
+      ]);
+
+      expect(summary.preview).toContain(REDACTION_MARKER);
+      expect(JSON.stringify(summary)).not.toContain(SECRET_TAIL);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// diffProps
+// ---------------------------------------------------------------------------
+
+describe('diffProps', () => {
+  it('reports a changed primitive prop with both ends of the transition', () => {
+    const result = diffProps(
+      makeFiber({ props: { count: 2, label: 'cart' }, prevProps: { count: 1, label: 'cart' } }),
+    );
+
+    expect(result.evaluable).toBe(true);
+    expect(result.truncated).toBe(false);
+    expect(result.changed).toHaveLength(1);
+    const change = result.changed[0];
+    expect(change?.key).toBe('count');
+    expect(change?.from.preview).toBe('1');
+    expect(change?.to.preview).toBe('2');
+  });
+
+  it('reports a prop that changed identity while its contents stayed equal', () => {
+    // The point of a shallow comparison: React's own bailout works on
+    // identity, so a new object or a new inline callback with identical
+    // contents is a prop that caused the render.
+    const result = diffProps(
+      makeFiber({ props: { filters: { region: 'eu' } }, prevProps: { filters: { region: 'eu' } } }),
+    );
+
+    expect(result.evaluable).toBe(true);
+    expect(result.changed.map((change) => change.key)).toStrictEqual(['filters']);
+    expect(result.changed[0]?.from.preview).toBe(result.changed[0]?.to.preview);
+  });
+
+  it('reports a new inline callback as a changed prop', () => {
+    const result = diffProps(
+      makeFiber({
+        props: { onSelect: (): void => undefined },
+        prevProps: { onSelect: (): void => undefined },
+      }),
+    );
+
+    expect(result.changed.map((change) => change.key)).toStrictEqual(['onSelect']);
+    expect(result.changed[0]?.to.type).toBe('function');
+  });
+
+  it('reports nothing when every prop is the same value', () => {
+    const result = diffProps(makeFiber({ props: { count: 1, label: 'cart' } }));
+
+    expect(result).toStrictEqual({ changed: [], evaluable: true, truncated: false });
+  });
+
+  it('reports nothing when React reused the props object', () => {
+    const shared = { count: 1 };
+
+    const result = diffProps({ memoizedProps: shared, alternate: { memoizedProps: shared } });
+
+    // The bailout path hands the same object to both renders; the same object
+    // cannot differ from itself, so no key is read at all.
+    expect(result).toStrictEqual({ changed: [], evaluable: true, truncated: false });
+  });
+
+  it('reports an added and a removed prop as transitions with both ends', () => {
+    const result = diffProps(makeFiber({ props: { added: 1 }, prevProps: { removed: 2 } }));
+
+    expect(result.changed.map((change) => change.key)).toStrictEqual(['added', 'removed']);
+    expect(result.changed[0]?.from.type).toBe('undefined');
+    expect(result.changed[1]?.to.type).toBe('undefined');
+  });
+
+  it('examines at most the tracked-key bound and reports the overflow', () => {
+    const props: Bag = {};
+    const prevProps: Bag = {};
+    const keyAt = (index: number): string => 'p' + String(index).padStart(2, '0');
+    for (let index = 0; index < MAX_TRACKED_KEYS + 8; index += 1) {
+      prevProps[keyAt(index)] = index;
+      props[keyAt(index)] = index + 1;
+    }
+
+    const result = diffProps(makeFiber({ props, prevProps }));
+
+    expect(result.evaluable).toBe(true);
+    expect(result.truncated).toBe(true);
+    expect(result.changed).toHaveLength(MAX_TRACKED_KEYS);
+    const reported = result.changed.map((change) => change.key);
+    // The bound caps exposure as well as size: a key past it is dropped
+    // rather than summarised more coarsely.
+    expect(reported).toContain(keyAt(0));
+    expect(reported).not.toContain(keyAt(MAX_TRACKED_KEYS + 7));
+    // Deterministic order, so two captures of the same render agree.
+    expect(reported).toStrictEqual([...reported].sort());
+  });
+
+  it('skips a prop whose getter throws and keeps comparing the rest', () => {
+    const props = makeThrowingGetter();
+
+    const result = diffProps(makeFiber({ props, prevProps: { ok: 2, boom: 3 } }));
+
+    // One hostile prop must not blind the comparison of its neighbours, and
+    // must not make the dimension unevaluable either.
+    expect(result.evaluable).toBe(true);
+    expect(result.changed.map((change) => change.key)).toStrictEqual(['ok']);
+  });
+
+  it('is unevaluable for a mount, because there is nothing to compare against', () => {
+    const result = diffProps(makeFiber({ props: { count: 1 }, withAlternate: false }));
+
+    expect(result).toStrictEqual({ changed: [], evaluable: false, truncated: false });
+  });
+
+  it('is unevaluable when either side of the props is not an object', () => {
+    expect(
+      diffProps({ memoizedProps: 'text', alternate: { memoizedProps: { a: 1 } } }).evaluable,
+    ).toBe(false);
+    expect(
+      diffProps({ memoizedProps: { a: 1 }, alternate: { memoizedProps: null } }).evaluable,
+    ).toBe(false);
+  });
+
+  it('is unevaluable when the props cannot be enumerated at all', () => {
+    const result = diffProps({
+      memoizedProps: makeRevokedProxy(),
+      alternate: { memoizedProps: { a: 1 } },
+    });
+
+    // An empty key list is indistinguishable from an unchanged one, so a
+    // value that cannot be enumerated must never read as "nothing changed".
+    expect(result.evaluable).toBe(false);
+    expect(result.changed).toStrictEqual([]);
+  });
+
+  it('summarises a changed prop under its own name, so name-driven redaction applies', () => {
+    const result = diffProps(
+      makeFiber({ props: { apiKey: SHORT_NAMED_VALUE }, prevProps: { apiKey: 'previous' } }),
+    );
+
+    expect(result.changed).toHaveLength(1);
+    expect(result.changed[0]?.to.preview).toBe(REDACTION_MARKER);
+    expect(result.changed[0]?.from.preview).toBe(REDACTION_MARKER);
+    expect(JSON.stringify(result)).not.toContain(SHORT_NAMED_VALUE);
+  });
+
+  it('never throws for a fiber that is not a fiber', () => {
+    for (const fiber of [null, undefined, 7, 'fiber', makeRevokedProxy()]) {
+      const result = diffProps(fiber);
+      expect(result.evaluable).toBe(false);
+      expect(result.changed).toStrictEqual([]);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// diffHookState
+// ---------------------------------------------------------------------------
+
+describe('diffHookState', () => {
+  it('pairs hooks positionally and reports the one that changed', () => {
+    const result = diffHookState(
+      makeFiber({
+        hooks: makeHookChain(['stable', 2]),
+        prevHooks: makeHookChain(['stable', 1]),
+      }),
+    );
+
+    expect(result.evaluable).toBe(true);
+    expect(result.changed).toHaveLength(1);
+    // Hooks are anonymous; their position in the list is the only stable
+    // identifier they have.
+    expect(result.changed[0]?.index).toBe(1);
+    expect(result.changed[0]?.label).toBe('state');
+    expect(result.changed[0]?.from.preview).toBe('1');
+    expect(result.changed[0]?.to.preview).toBe('2');
+  });
+
+  it('labels a reducer hook as a reducer', () => {
+    const result = diffHookState(
+      makeFiber({ hooks: makeReducerHookChain([2]), prevHooks: makeReducerHookChain([1]) }),
+    );
+
+    expect(result.changed[0]?.label).toBe('reducer');
+  });
+
+  it('reports nothing when every hook holds the same value', () => {
+    const result = diffHookState(
+      makeFiber({ hooks: makeHookChain(['a', 'b']), prevHooks: makeHookChain(['a', 'b']) }),
+    );
+
+    expect(result).toStrictEqual({ changed: [], evaluable: true, truncated: false });
+  });
+
+  it('treats a component with no hooks as evaluable and unchanged', () => {
+    const result = diffHookState(makeFiber({ props: { count: 1 } }));
+
+    // Without this case `unchanged` would be unreachable for most components
+    // and `unchanged_render_count` would always read zero.
+    expect(result).toStrictEqual({ changed: [], evaluable: true, truncated: false });
+  });
+
+  it('ignores an effect record, which is a queue entry and not state', () => {
+    const result = diffHookState(
+      makeFiber({
+        hooks: makeEffectHookChain(['next']),
+        prevHooks: makeEffectHookChain(['previous']),
+      }),
+    );
+
+    // Reading through an effect's `destroy`, let alone calling it, would tear
+    // down the developer's effects during a commit; the fixture's functions
+    // throw if either happens.
+    expect(result).toStrictEqual({ changed: [], evaluable: true, truncated: false });
+  });
+
+  it('ignores a ref box, which cannot be the reason a render happened', () => {
+    const result = diffHookState(
+      makeFiber({ hooks: makeRefHookChain([2]), prevHooks: makeRefHookChain([1]) }),
+    );
+
+    expect(result.changed).toStrictEqual([]);
+    expect(result.evaluable).toBe(true);
+  });
+
+  it('ignores a memo cache, which is replaced during the render it would be blamed for', () => {
+    const result = diffHookState(
+      makeFiber({ hooks: makeMemoHookChain([2]), prevHooks: makeMemoHookChain([1]) }),
+    );
+
+    // Counting a memo cache as state would report "state changed" for exactly
+    // the renders that make `unchanged_render_count` meaningful.
+    expect(result.changed).toStrictEqual([]);
+    expect(result.evaluable).toBe(true);
+  });
+
+  it('bounds a long hook chain and reports the overflow', () => {
+    const length = MAX_TRACKED_KEYS + 6;
+    const result = diffHookState(
+      makeFiber({
+        hooks: makeHookChain(Array.from({ length }, (_, index) => 'next-' + String(index))),
+        prevHooks: makeHookChain(Array.from({ length }, (_, index) => 'prev-' + String(index))),
+      }),
+    );
+
+    expect(result.evaluable).toBe(true);
+    expect(result.truncated).toBe(true);
+    expect(result.changed).toHaveLength(MAX_TRACKED_KEYS);
+    expect(result.changed.at(-1)?.index).toBe(MAX_TRACKED_KEYS - 1);
+  });
+
+  it('terminates on a cyclic hook chain and reports the dimension unevaluable', () => {
+    // Both sides cycle, and with the same period: a walk that only stopped at
+    // the tracked-key bound would collect equal-length lists on both sides,
+    // pair them happily and report a comparison over a chain it had walked
+    // eleven times round. Detecting the cycle is what makes this unevaluable,
+    // and having both sides cycle is what makes the detection observable.
+    const result = diffHookState(
+      makeFiber({
+        hooks: closeChain(makeHookChain(['a', 'b', 'c'])),
+        prevHooks: closeChain(makeHookChain(['x', 'y', 'z'])),
+      }),
+    );
+
+    expect(result).toStrictEqual({ changed: [], evaluable: false, truncated: false });
+  });
+
+  it('reports an asymmetrically cyclic chain as unevaluable rather than mispairing it', () => {
+    const result = diffHookState(
+      makeFiber({
+        hooks: closeChain(makeHookChain(['a', 'b', 'c'])),
+        prevHooks: makeHookChain(['a', 'b', 'c']),
+      }),
+    );
+
+    expect(result).toStrictEqual({ changed: [], evaluable: false, truncated: false });
+  });
+
+  it('is unevaluable when the chains cannot be paired', () => {
+    const mismatched = diffHookState(
+      makeFiber({ hooks: makeHookChain(['a', 'b']), prevHooks: makeHookChain(['a']) }),
+    );
+    const appeared = diffHookState(makeFiber({ hooks: makeHookChain(['a']), prevHooks: null }));
+
+    // A mispaired chain would compare one hook's value against another's and
+    // invent a state change out of nothing.
+    expect(mismatched.evaluable).toBe(false);
+    expect(mismatched.changed).toStrictEqual([]);
+    expect(appeared.evaluable).toBe(false);
+  });
+
+  it('is unevaluable for a class component, whose memoizedState is not a hook list', () => {
+    const result = diffHookState(makeFiber({ hooks: { count: 2 }, prevHooks: { count: 1 } }));
+
+    // "We could not check the fiber's hook state" is the honest answer for a
+    // shape this code would otherwise have to guess at.
+    expect(result.evaluable).toBe(false);
+  });
+
+  it('is unevaluable for a mount and never throws for a non-fiber', () => {
+    expect(
+      diffHookState(makeFiber({ hooks: makeHookChain(['a']), withAlternate: false })),
+    ).toStrictEqual({ changed: [], evaluable: false, truncated: false });
+    for (const fiber of [null, undefined, 7, makeRevokedProxy()]) {
+      expect(diffHookState(fiber).evaluable).toBe(false);
+    }
+  });
+
+  it('summarises hook values without a name, and still scrubs by content', () => {
+    const credential = assemble('s', 'k-', 'ant-') + cycle(URLSAFE_CHARS, 40) + SECRET_TAIL;
+
+    const result = diffHookState(
+      makeFiber({ hooks: makeHookChain([credential]), prevHooks: makeHookChain(['empty']) }),
+    );
+
+    expect(result.changed).toHaveLength(1);
+    expect(result.changed[0]?.to.preview).toContain(REDACTION_MARKER);
+    expect(JSON.stringify(result)).not.toContain(SECRET_TAIL);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// diffContexts
+// ---------------------------------------------------------------------------
+
+describe('diffContexts', () => {
+  /** A context object with a display name, as React records one. */
+  const shippingContext: Bag = { displayName: 'ShippingEta', _currentValue: { etaMinutes: 2 } };
+
+  /** A context object with no display name: the label falls back to a category. */
+  const cartContext: Bag = { _currentValue: 0 };
+
+  it('reports a consumed context whose value changed', () => {
+    const result = diffContexts(
+      makeFiber({
+        contexts: makeContextChain([{ context: shippingContext, value: { etaMinutes: 2 } }]),
+        prevContexts: makeContextChain([{ context: shippingContext, value: { etaMinutes: 3 } }]),
+      }),
+    );
+
+    expect(result.evaluable).toBe(true);
+    expect(result.changed).toHaveLength(1);
+    expect(result.changed[0]?.index).toBe(0);
+    expect(result.changed[0]?.label).toBe('ShippingEta');
+  });
+
+  it('reports nothing when the consumed value is the same reference', () => {
+    const value = { etaMinutes: 4 };
+
+    const result = diffContexts(
+      makeFiber({
+        contexts: makeContextChain([{ context: shippingContext, value }]),
+        prevContexts: makeContextChain([{ context: shippingContext, value }]),
+      }),
+    );
+
+    // `Object.is` is the comparison React itself uses to decide whether to
+    // propagate a context change to its consumers.
+    expect(result).toStrictEqual({ changed: [], evaluable: true, truncated: false });
+  });
+
+  it('treats a component that consumes no context as evaluable and unchanged', () => {
+    const result = diffContexts(makeFiber({ props: { count: 1 } }));
+
+    expect(result).toStrictEqual({ changed: [], evaluable: true, truncated: false });
+  });
+
+  it('pairs dependencies by context identity, not by position', () => {
+    const result = diffContexts(
+      makeFiber({
+        contexts: makeContextChain([
+          { context: cartContext, value: 5 },
+          { context: shippingContext, value: 9 },
+        ]),
+        prevContexts: makeContextChain([
+          { context: shippingContext, value: 9 },
+          { context: cartContext, value: 5 },
+        ]),
+      }),
+    );
+
+    // A conditional `useContext` can reorder the chain between renders, and
+    // comparing two different contexts' values would manufacture a change.
+    expect(result.changed).toStrictEqual([]);
+    expect(result.evaluable).toBe(true);
+  });
+
+  it('is unevaluable when the previous value of a consumed context is unavailable', () => {
+    const result = diffContexts({
+      dependencies: makeContextChain([{ context: shippingContext, value: 1 }]),
+      alternate: { memoizedProps: {} },
+    });
+
+    // This is the case AAP 0.7.1 names as producing `unknown`: the context is
+    // consumed now, and what it held before cannot be known.
+    expect(result).toStrictEqual({ changed: [], evaluable: false, truncated: false });
+  });
+
+  it('is unevaluable for a mount and never throws for a non-fiber', () => {
+    expect(
+      diffContexts(
+        makeFiber({
+          contexts: makeContextChain([{ context: cartContext, value: 1 }]),
+          withAlternate: false,
+        }),
+      ).evaluable,
+    ).toBe(false);
+    for (const fiber of [null, undefined, 7, makeRevokedProxy()]) {
+      expect(diffContexts(fiber).evaluable).toBe(false);
+    }
+  });
+
+  it('summarises a context value without carrying it', () => {
+    const credential = assemble('Bea', 'rer ') + cycle(BEARER_CHARS, 40) + SECRET_TAIL;
+
+    const result = diffContexts(
+      makeFiber({
+        contexts: makeContextChain([{ context: cartContext, value: credential }]),
+        prevContexts: makeContextChain([{ context: cartContext, value: 'anonymous' }]),
+      }),
+    );
+
+    expect(result.changed).toHaveLength(1);
+    expect(result.changed[0]?.to.preview).toContain(REDACTION_MARKER);
+    expect(JSON.stringify(result)).not.toContain(SECRET_TAIL);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// classifyRenderTrigger
+//
+// The precedence rules of AAP 0.7.1, asserted twice over: once on the
+// classifier in isolation, where the inputs can be stated exactly, and once
+// end to end through `analyzeFiber` on a synthetic fiber, where they have to
+// survive the three comparisons that produce them.
+// ---------------------------------------------------------------------------
+
+/** A stand-in summary: the classifier never looks inside a change. */
+const STUB_SUMMARY: ValueSummary = { type: 'number', preview: '1' };
+
+/** Every dimension compared successfully. */
+const ALL_EVALUABLE: FiberDiff['evaluable'] = { props: true, state: true, context: true };
+
+/** How many changes each dimension found. */
+interface ChangeCounts {
+  readonly props: number;
+  readonly state: number;
+  readonly context: number;
+}
+
+/** Runs the classifier on stated inputs rather than on a fiber. */
+function classify(counts: ChangeCounts, evaluable: FiberDiff['evaluable']): RenderTrigger {
+  return classifyRenderTrigger({
+    propChanges: Array.from({ length: counts.props }, (_unused, index) => ({
+      key: 'prop' + String(index),
+      from: STUB_SUMMARY,
+      to: STUB_SUMMARY,
+    })),
+    hookChanges: Array.from({ length: counts.state }, (_unused, index) => ({
+      index,
+      from: STUB_SUMMARY,
+      to: STUB_SUMMARY,
+    })),
+    contextChanges: Array.from({ length: counts.context }, (_unused, index) => ({
+      index,
+      from: STUB_SUMMARY,
+      to: STUB_SUMMARY,
+    })),
+    evaluable,
+  });
+}
+
+/** One row of the classification matrix. */
+interface TriggerCase {
+  /** What the render looked like. */
+  readonly label: string;
+  /** The change counts the dimensions reported. */
+  readonly counts: ChangeCounts;
+  /** Which dimensions could be compared. */
+  readonly evaluable: FiberDiff['evaluable'];
+  /** The one value the classifier may return. */
+  readonly expected: RenderTrigger;
+}
+
+const TRIGGER_MATRIX: readonly TriggerCase[] = [
+  {
+    label: 'only props changed',
+    counts: { props: 1, state: 0, context: 0 },
+    evaluable: ALL_EVALUABLE,
+    expected: 'props',
+  },
+  {
+    label: 'only own hook state changed',
+    counts: { props: 0, state: 1, context: 0 },
+    evaluable: ALL_EVALUABLE,
+    expected: 'state',
+  },
+  {
+    label: 'only a consumed context value changed',
+    counts: { props: 0, state: 0, context: 1 },
+    evaluable: ALL_EVALUABLE,
+    expected: 'context',
+  },
+  {
+    label: 'nothing changed and all three dimensions were evaluated',
+    counts: { props: 0, state: 0, context: 0 },
+    evaluable: ALL_EVALUABLE,
+    expected: 'unchanged',
+  },
+  {
+    label: 'nothing changed but the context dimension was unevaluable',
+    counts: { props: 0, state: 0, context: 0 },
+    evaluable: { props: true, state: true, context: false },
+    expected: 'unknown',
+  },
+  {
+    label: 'nothing changed but the props dimension was unevaluable',
+    counts: { props: 0, state: 0, context: 0 },
+    evaluable: { props: false, state: true, context: true },
+    expected: 'unknown',
+  },
+  {
+    label: 'nothing changed but the state dimension was unevaluable',
+    counts: { props: 0, state: 0, context: 0 },
+    evaluable: { props: true, state: false, context: true },
+    expected: 'unknown',
+  },
+  {
+    label: 'no dimension could be evaluated at all',
+    counts: { props: 0, state: 0, context: 0 },
+    evaluable: { props: false, state: false, context: false },
+    expected: 'unknown',
+  },
+  {
+    label: 'props changed while the context dimension was unevaluable',
+    counts: { props: 1, state: 0, context: 0 },
+    evaluable: { props: true, state: true, context: false },
+    expected: 'props',
+  },
+  {
+    label: 'state changed while the props dimension was unevaluable',
+    counts: { props: 0, state: 1, context: 0 },
+    evaluable: { props: false, state: true, context: true },
+    expected: 'state',
+  },
+  {
+    label: 'props and state both changed',
+    counts: { props: 1, state: 1, context: 0 },
+    evaluable: ALL_EVALUABLE,
+    expected: 'props',
+  },
+  {
+    label: 'state and context both changed',
+    counts: { props: 0, state: 1, context: 1 },
+    evaluable: ALL_EVALUABLE,
+    expected: 'state',
+  },
+  {
+    label: 'all three changed',
+    counts: { props: 2, state: 2, context: 2 },
+    evaluable: ALL_EVALUABLE,
+    expected: 'props',
+  },
+];
+
+describe('classifyRenderTrigger', () => {
+  it.each(TRIGGER_MATRIX)('classifies $label as $expected', ({ counts, evaluable, expected }) => {
+    const trigger = classify(counts, evaluable);
+
+    expect(trigger).toBe(expected);
+    // The catalog vocabulary is the contract with every consumer: a trigger
+    // outside it would reach a panel that cannot render it.
+    expect(RENDER_TRIGGERS).toContain(trigger);
+  });
+
+  it('never returns unchanged unless all three dimensions were evaluated', () => {
+    const dimensions: readonly (keyof FiberDiff['evaluable'])[] = ['props', 'state', 'context'];
+
+    for (const dimension of dimensions) {
+      const trigger = classify(
+        { props: 0, state: 0, context: 0 },
+        { ...ALL_EVALUABLE, [dimension]: false },
+      );
+
+      // This is what keeps `unchanged_render_count` meaning what AAP 0.2.3
+      // says it means, and what sends an unobservable render to
+      // `render_trigger_unknown_count` instead.
+      expect(trigger).not.toBe('unchanged');
+      expect(trigger).toBe('unknown');
+    }
+  });
+
+  it('covers the whole catalog vocabulary', () => {
+    const produced = new Set(TRIGGER_MATRIX.map((row) => row.expected));
+
+    // A value the matrix never produces is a value nothing asserts about.
+    for (const trigger of RENDER_TRIGGERS) {
+      expect(produced).toContain(trigger);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// analyzeFiber
+// ---------------------------------------------------------------------------
+
+/** A context object used by the end-to-end fiber fixtures. */
+const ETA_CONTEXT: Bag = { displayName: 'ShippingEta', _currentValue: { etaMinutes: 1 } };
+
+/** One end-to-end classification case, built from a real synthetic fiber. */
+interface FiberTriggerCase {
+  readonly label: string;
+  readonly make: () => unknown;
+  readonly expected: RenderTrigger;
+}
+
+const FIBER_TRIGGER_CASES: readonly FiberTriggerCase[] = [
+  {
+    label: 'a render whose props changed',
+    make: (): unknown => makeFiber({ props: { count: 2 }, prevProps: { count: 1 } }),
+    expected: 'props',
+  },
+  {
+    label: 'a render whose own hook state changed',
+    make: (): unknown =>
+      makeFiber({
+        props: { count: 1 },
+        hooks: makeHookChain([2]),
+        prevHooks: makeHookChain([1]),
+      }),
+    expected: 'state',
+  },
+  {
+    label: 'a render whose consumed context value changed',
+    make: (): unknown =>
+      makeFiber({
+        props: { count: 1 },
+        contexts: makeContextChain([{ context: ETA_CONTEXT, value: { etaMinutes: 2 } }]),
+        prevContexts: makeContextChain([{ context: ETA_CONTEXT, value: { etaMinutes: 3 } }]),
+      }),
+    expected: 'context',
+  },
+  {
+    label: 'a re-render with stable inputs',
+    make: (): unknown => makeFiber({ props: { count: 1, label: 'cart' } }),
+    expected: 'unchanged',
+  },
+  {
+    label: 'a render whose context history is unavailable',
+    make: (): unknown => ({
+      memoizedProps: { count: 1 },
+      memoizedState: null,
+      dependencies: makeContextChain([{ context: ETA_CONTEXT, value: 1 }]),
+      alternate: { memoizedProps: { count: 1 }, memoizedState: null, dependencies: null },
+    }),
+    expected: 'unknown',
+  },
+  {
+    label: 'a mount',
+    make: (): unknown => makeFiber({ props: { count: 1 }, withAlternate: false }),
+    expected: 'unknown',
+  },
+  {
+    label: 'a render whose props changed while its context history is unavailable',
+    make: (): unknown => ({
+      memoizedProps: { count: 2 },
+      memoizedState: null,
+      dependencies: makeContextChain([{ context: ETA_CONTEXT, value: 1 }]),
+      alternate: { memoizedProps: { count: 1 }, memoizedState: null, dependencies: null },
+    }),
+    expected: 'props',
+  },
+  {
+    label: 'a render whose props and hook state both changed',
+    make: (): unknown =>
+      makeFiber({
+        props: { count: 2 },
+        prevProps: { count: 1 },
+        hooks: makeHookChain([2]),
+        prevHooks: makeHookChain([1]),
+      }),
+    expected: 'props',
+  },
+];
+
+/**
+ * A fiber exercising all three dimensions at once, with more props and more
+ * hooks than the tracked-key bound allows.
+ */
+function makeRichFiber(): Bag {
+  const props: Bag = {};
+  const prevProps: Bag = {};
+  for (let index = 0; index < MAX_TRACKED_KEYS + 4; index += 1) {
+    const key = 'field' + String(index).padStart(2, '0');
+    prevProps[key] = index;
+    props[key] = index % 2 === 0 ? index : index + 1;
+  }
+  return makeFiber({
+    props,
+    prevProps,
+    hooks: makeHookChain([{ items: 2 }, 'checkout']),
+    prevHooks: makeHookChain([{ items: 1 }, 'checkout']),
+    contexts: makeContextChain([{ context: ETA_CONTEXT, value: { etaMinutes: 2 } }]),
+    prevContexts: makeContextChain([{ context: ETA_CONTEXT, value: { etaMinutes: 5 } }]),
+  });
+}
+
+describe('analyzeFiber', () => {
+  it.each(FIBER_TRIGGER_CASES)('classifies $label as $expected', ({ make, expected }) => {
+    const diff = analyzeFiber(make());
+
+    expect(diff.trigger).toBe(expected);
+    expect(RENDER_TRIGGERS).toContain(diff.trigger);
+    expectTransportable(diff);
+  });
+
+  it('reports a result consistent with the three dimensions it composed', () => {
+    const fiber = makeRichFiber();
+
+    const diff = analyzeFiber(fiber);
+    const props = diffProps(fiber);
+    const hooks = diffHookState(fiber);
+    const contexts = diffContexts(fiber);
+
+    expect(diff.propChanges).toStrictEqual(props.changed);
+    expect(diff.hookChanges).toStrictEqual(hooks.changed);
+    expect(diff.contextChanges).toStrictEqual(contexts.changed);
+    // `changedProps` is the plain key list the render event carries; it must
+    // name exactly the transitions behind it, in the same order.
+    expect(diff.changedProps).toStrictEqual(props.changed.map((change) => change.key));
+    expect(diff.evaluable).toStrictEqual({
+      props: props.evaluable,
+      state: hooks.evaluable,
+      context: contexts.evaluable,
+    });
+    expect(diff.truncated).toBe(props.truncated || hooks.truncated || contexts.truncated);
+    expect(diff.truncated).toBe(true);
+    expect(diff.trigger).toBe(
+      classifyRenderTrigger({
+        propChanges: props.changed,
+        hookChanges: hooks.changed,
+        contextChanges: contexts.changed,
+        evaluable: diff.evaluable,
+      }),
+    );
+  });
+
+  it('leaves the fiber and its alternate exactly as it found them', () => {
+    const fiber = makeRichFiber();
+    const before = structuralSnapshot(fiber);
+
+    analyzeFiber(fiber);
+
+    // The differ reads the developer's live fiber tree during a commit.
+    // Writing anything back — a cached diff, a marker, a normalised prop —
+    // would change the behaviour of the application under observation.
+    expect(structuralSnapshot(fiber)).toStrictEqual(before);
+  });
+
+  it('does not share mutable state between results', () => {
+    const first = analyzeFiber(null);
+    const second = analyzeFiber(null);
+
+    first.changedProps.push('mutated');
+
+    // Each call allocates its own arrays, so a consumer that appends to one
+    // result cannot reach into another's.
+    expect(second.changedProps).toStrictEqual([]);
+    expect(first).not.toBe(second);
+  });
+
+  it.each([
+    { label: 'null', make: (): unknown => null },
+    { label: 'undefined', make: (): unknown => undefined },
+    { label: 'a number', make: (): unknown => 7 },
+    { label: 'a string', make: (): unknown => 'fiber' },
+    { label: 'a revoked proxy', make: makeRevokedProxy },
+    { label: 'an object of throwing getters', make: makeThrowingGetter },
+  ])('degrades to an unknown diff for $label', ({ make }) => {
+    const diff = analyzeFiber(make());
+
+    // "The debugger threw inside a commit" is the one outcome this module may
+    // never produce; an honest "could not be analysed" is what it produces
+    // instead, and it keeps the render out of `unchanged_render_count`.
+    expect(diff).toStrictEqual({
+      trigger: 'unknown',
+      changedProps: [],
+      propChanges: [],
+      hookChanges: [],
+      contextChanges: [],
+      evaluable: { props: false, state: false, context: false },
+      truncated: false,
+    });
+  });
+
+  it('makes a mount indistinguishable from an unanalysable fiber, which is why phase decides', () => {
+    const mount = analyzeFiber(makeFiber({ props: { count: 1 }, withAlternate: false }));
+
+    // A mount has no alternate, so all three dimensions are unevaluable and
+    // the diff is byte-identical to the one an unanalysable fiber produces.
+    // Nothing in this result can tell the two apart, which is exactly why
+    // `../browser/react.ts` must decide from the render's `phase` and OMIT the
+    // `trigger` attribute for a mount: a mount's cause is not in doubt, and
+    // emitting this `unknown` would inflate `render_trigger_unknown_count`
+    // with the one case nobody needs explained (AAP 0.2.3).
+    expect(mount).toStrictEqual(analyzeFiber(null));
+    expect(mount.trigger).toBe('unknown');
+    expect(mount.evaluable).toStrictEqual({ props: false, state: false, context: false });
+  });
+
+  it.each(ADVERSARIAL_VALUES)(
+    'survives $label in a prop slot and stays transportable',
+    ({ make }) => {
+      // The baseline is a fresh object, so the prop changes for every value in
+      // the catalogue — including `null`, `undefined` and `NaN`, each of which
+      // would compare equal to a fixed baseline of its own kind.
+      const baseline = { baseline: true };
+      const diff = analyzeFiber(
+        makeFiber({
+          props: { payload: make(), count: 2 },
+          prevProps: { payload: baseline, count: 1 },
+        }),
+      );
+
+      expect(diff.trigger).toBe('props');
+      expect(diff.changedProps).toContain('payload');
+      expectTransportable(diff);
+      for (const forbidden of NEVER_TRAVELS) {
+        expect(JSON.stringify(diff)).not.toContain(forbidden);
+      }
+    },
+  );
+
+  it.each(ADVERSARIAL_VALUES)(
+    'survives $label in a hook slot and stays transportable',
+    ({ make }) => {
+      const diff = analyzeFiber(
+        makeFiber({
+          props: { count: 1 },
+          hooks: makeHookChain([make()]),
+          prevHooks: makeHookChain(['initial']),
+        }),
+      );
+
+      expect(RENDER_TRIGGERS).toContain(diff.trigger);
+      expectTransportable(diff);
+      for (const forbidden of NEVER_TRAVELS) {
+        expect(JSON.stringify(diff)).not.toContain(forbidden);
+      }
+    },
+  );
+
+  it.each(SECRET_CASES)('never carries $label out of a prop slot', ({ value }) => {
+    // An ordinary prop name, so the credential has to be caught by content
+    // rather than by the name rule: this is the path a credential that arrived
+    // in a response payload takes.
+    const diff = analyzeFiber(
+      makeFiber({ props: { lastResponse: value }, prevProps: { lastResponse: 'anonymous' } }),
+    );
+
+    const encoded = JSON.stringify(diff);
+    expect(diff.trigger).toBe('props');
+    expect(encoded).not.toContain(SECRET_TAIL);
+    expect(encoded).toContain(REDACTION_MARKER);
+  });
+});

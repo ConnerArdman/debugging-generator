@@ -1,0 +1,36 @@
+{
+  "version": 3,
+  "file": "turbopack-gauge-route.js",
+  "sections": [
+    {
+      "offset": { "line": 0, "column": 0 },
+      "map": {
+        "version": 3,
+        "sources": ["turbopack:///[project]/app/api/gauges/%5Bid%5D/route.ts"],
+        "names": ["GET"],
+        "mappings": ";;;;;;;;;;;;qBAgEsBA;QAIpB;QAEA"
+      }
+    },
+    {
+      "offset": { "line": 26, "column": 0 },
+      "map": {
+        "version": 3,
+        "sources": [
+          "turbopack:///[project]/src/lib/station-service.ts",
+          "turbopack:///_N_E/src/widgets/BasinSummary.tsx"
+        ],
+        "names": ["summarizeBasin"],
+        "mappings": ";;;;;;;;;;;;;qBAuFsBA;QAEpB;;;;QC7BA"
+      }
+    },
+    {
+      "offset": { "line": 48, "column": 0 },
+      "map": {
+        "version": 3,
+        "sources": ["turbopack:///./app/(observatory)/basins/%5Bid%5D/page.tsx"],
+        "names": ["BasinDetailPage"],
+        "mappings": ";;;;;;;;;;qBAyD8BA;;QAI5B;;;;;YAOI"
+      }
+    }
+  ]
+}

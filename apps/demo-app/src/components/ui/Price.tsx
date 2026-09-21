@@ -123,8 +123,14 @@ interface Props {
    * margin that a figure cannot know about. It is composed after the base class, so it wins on
    * equal specificity; the size, tone and strike rules are attribute-qualified and are unaffected
    * by it.
+   *
+   * It spells `| undefined` out, as `ui/Card` and `ui/Skeleton` do, because this workspace
+   * compiles with `exactOptionalPropertyTypes`: a bare `className?: string` means "absent or a
+   * string" and rejects the present-but-undefined value every realistic caller holds, since a CSS
+   * Module lookup is typed `string | undefined` under `noUncheckedIndexedAccess` and the caller
+   * pattern is exactly `className={styles.someCell}`.
    */
-  className?: string;
+  className?: string | undefined;
 }
 
 /**
