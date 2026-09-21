@@ -24,21 +24,32 @@
  *   2. the column gap        `--ls-space-3`
  *   3. the inline padding    `--ls-space-3` on the strip and on the row
  *
- * The tracks are deliberately four identical `minmax(0, 1fr)` fractions rather than `auto` or
- * `max-content`: a content-sized track is measured per grid, so the strip would settle on the
- * width of its labels and a row on the width of its values, and the two would drift apart by a
- * few pixels on every page of results. Fractions are measured from the container alone, which
- * makes the alignment exact and independent of what any single order happens to contain, and
- * `minmax(0, ...)` is what lets a long order reference truncate instead of widening its track.
+ * The template is one flexible track followed by three sized from the spacing scale, and it is
+ * written below out of the three seam custom properties `OrderHistoryRow.module.css` reads -
+ * `--order-row-status-track`, `--order-row-items-track` and `--order-row-total-track` - with the
+ * same defaults that file states, so the strip and every row resolve their trailing tracks from
+ * one place and a container that overrides a seam property moves both grids together.
+ *
+ * The three trailing tracks are deliberately NOT `auto` or `max-content`: a content-sized track is
+ * measured per grid, and every row is its own grid container, so the strip would settle on the
+ * width of its labels and each row on the width of its own values - the column edges would then
+ * wander from row to row and match no header. They are not fractions either, because a fraction of
+ * the container would make the money column as wide as a quarter of the page. `minmax(0, 1fr)` on
+ * the first track is what lets a long order reference truncate instead of widening its track.
  */
 
 .root {
   /*
    * The shared four-track template: identity, status, items, total. It lives here, on the
    * element that wraps both the strip and the list, so a row can consume the very same value
-   * (`grid-template-columns: var(--order-history-columns, ...)`) instead of restating it.
+   * (`grid-template-columns: var(--order-history-columns, ...)`) instead of restating it, and it
+   * is composed from the row stylesheet's three seam properties so the two files state one
+   * template between them rather than two that have to be kept in step by hand.
    */
-  --order-history-columns: repeat(4, minmax(0, 1fr));
+  --order-history-columns: minmax(0, 1fr)
+    var(--order-row-status-track, calc(var(--ls-space-6, 32px) * 3))
+    var(--order-row-items-track, calc(var(--ls-space-6, 32px) * 2.5))
+    var(--order-row-total-track, calc(var(--ls-space-6, 32px) * 4));
 
   display: flex;
   min-width: 0;
@@ -88,7 +99,12 @@
  */
 .columns {
   display: grid;
-  grid-template-columns: var(--order-history-columns, repeat(4, minmax(0, 1fr)));
+  grid-template-columns: var(
+    --order-history-columns,
+    minmax(0, 1fr) var(--order-row-status-track, calc(var(--ls-space-6, 32px) * 3))
+      var(--order-row-items-track, calc(var(--ls-space-6, 32px) * 2.5))
+      var(--order-row-total-track, calc(var(--ls-space-6, 32px) * 4))
+  );
   align-items: baseline;
   gap: var(--ls-space-3, 12px);
   border-block-end: 1px solid var(--ls-border, #cbd5e1);
@@ -154,13 +170,19 @@
 /*
  * An available direction, rendered by the component as a `next/link` anchor.
  *
- * BLITZY [A11Y]: the accent colour measures 2.15:1 against the page surface, below the WCAG AA
- * 4.5:1 minimum for text, and the chip is about 30px tall, below the 44x44px touch-target
- * recommendation. Both are implemented exactly as the design specifies - accent text, and
- * `--ls-space-1`/`--ls-space-2` padding on 13px text - rather than silently darkened or
- * enlarged. Direction is never carried by colour alone: the component supplies the label, the
- * border and background carry the affordance, and the unavailable direction is not an anchor at
- * all. Flagged for design review.
+ * Colour: link text in this application is `--ls-focus` (the teal #0f766e, 5.5:1 on the page
+ * surface), which is also what `OrderHistoryRow.module.css` gives the row's own anchor, so the two
+ * links of this component read alike. It is deliberately NOT `--ls-accent`: `app/globals.css`
+ * declares that token the brand amber and states its contract in the same breath - a fill, a
+ * border tint or a decorative accent, "never as a text colour on a light surface", where it
+ * measures 2.15:1. Amber chip text would be that exact usage.
+ *
+ * BLITZY [A11Y]: the chip is about 30px tall, below the 44x44px touch-target recommendation,
+ * because the design for this view is a dense data table's footer. It is implemented at the
+ * designed size - `--ls-space-1`/`--ls-space-2` padding on 13px text - rather than silently
+ * enlarged. Flagged for design review. Direction is never carried by colour alone: the component
+ * supplies the label, the border and background carry the affordance, and the unavailable
+ * direction is not an anchor at all.
  */
 .pagerLink {
   display: inline-flex;
@@ -169,7 +191,7 @@
   border: 1px solid var(--ls-border, #cbd5e1);
   border-radius: var(--ls-radius-md, 8px);
   padding: var(--ls-space-1, 4px) var(--ls-space-2, 8px);
-  color: var(--ls-accent, #f59e0b);
+  color: var(--ls-focus, #0f766e);
   font-size: var(--ls-text-sm, 13px);
   text-decoration: none;
   white-space: nowrap;
@@ -224,15 +246,18 @@
 }
 
 /*
- * The narrow arrangement. Below this width a row stacks its cells, so the four-column strip no
- * longer describes anything and is removed; the row supplies its own labels from there on.
+ * The narrow arrangement. At this width a row stacks its cells onto three lines, so the
+ * four-column strip no longer describes anything and is removed; each row carries its own labels
+ * for assistive technology from there on.
  *
- * The threshold is 640px - twenty times the 32px `--ls-space-6` step - written as a calculation
- * over that step rather than as a bare pixel literal. It is spelled out in full because a
- * container condition is evaluated without an element to read custom properties from, so
- * `var(--ls-space-6)` is not available here; the row's query states the same width the same way.
+ * The threshold is the row's, stated exactly as `OrderHistoryRow.module.css` states it - 32rem,
+ * sixteen times the 32px `--ls-space-6` step, in rem so it tracks the reader's root font size -
+ * because the strip must disappear at the moment the columns it labels do, and not one pixel
+ * earlier: a wider threshold would drop the labels while the rows were still in four columns. It
+ * is spelled out in full rather than read from the token, because a container condition is
+ * evaluated without an element to read custom properties from.
  */
-@container (max-width: calc(32px * 20)) {
+@container (max-width: calc(2rem * 16)) {
   .columns {
     display: none;
   }
