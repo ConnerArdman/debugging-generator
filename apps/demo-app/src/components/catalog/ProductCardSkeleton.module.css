@@ -56,6 +56,21 @@
   gap: var(--ls-space-2, 8px);
 }
 
+/* `@/components/ui/Card` wraps whatever it is given in one slot element of its own and declares no
+ * layout for it - its stylesheet owns the surface and leaves arrangement to the caller - so the
+ * rhythm between the four rows is composed here, on that slot, rather than by reaching into the
+ * primitive's class names. This is the same composition `ProductCard.module.css` uses for the
+ * loaded tile, and it is what makes the `gap` above reach the rows at all: the rule sits on the
+ * card element, whose only child is that single slot, so without this rule the media, body, meta
+ * and action rows stack flush and the placeholder reserves less than the card it stands in for
+ * (measured in a browser: three gaps of exactly 0px, a card 24px short). */
+.card > * {
+  display: grid;
+  min-inline-size: 0;
+  align-content: start;
+  gap: var(--ls-space-2, 8px);
+}
+
 /* The image placeholder. Catalog product art is 4:3, so the reserved box carries that ratio
  * instead of a height, and rounds its own corners independently of the card. */
 .media {
@@ -103,6 +118,16 @@
   gap: var(--ls-space-2, 8px);
 }
 
+/* The action row's height reaches a placeholder through `--skeleton-size`, which is the hook
+ * `@/components/ui/Skeleton`'s own module documents for a caller that knows a length rather than a
+ * box. It is needed as well as the `block-size` below, not instead of it: that file's
+ * `.root[data-shape='block']` rule carries an attribute in its selector and therefore outweighs a
+ * single class here on the same property, so `block-size` alone loses the cascade and the
+ * placeholder falls back to the primitive's own floor (measured in a browser: 32px, where this row
+ * reserves 2.25rem). `block-size` stays for any child that is not a placeholder, and a `circle`
+ * placeholder is unaffected because it declares its own diameter on itself. */
 .actions > * {
+  --skeleton-size: var(--catalog-action-block);
+
   block-size: var(--catalog-action-block);
 }
