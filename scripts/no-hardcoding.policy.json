@@ -142,6 +142,7 @@
     "RelatedProductsInput",
     "RelativeTimeRung",
     "ReservedLine",
+    "RootLayout",
     "ShippingAddress",
     "ShippingAddressInput",
     "ShippingEtaProvider",
