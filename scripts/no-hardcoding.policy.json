@@ -64,6 +64,7 @@
     "CheckoutFieldKey",
     "CheckoutForm",
     "CheckoutOutcome",
+    "CheckoutPage",
     "CheckoutResult",
     "CheckoutSummaryPanel",
     "ContactFields",
@@ -250,7 +251,6 @@
     "categoryName",
     "categorySlug",
     "changeCart",
-    "checkedAt",
     "checkoutBodySchema",
     "checkoutDraftFrom",
     "checkoutFailureCopy",
@@ -528,6 +528,7 @@
     "/api/mock/payment",
     "/api/orders",
     "/api/products",
+    "/api/products/[slug]",
     "/api/recommendations",
     "/api/shipping/quote"
   ]
