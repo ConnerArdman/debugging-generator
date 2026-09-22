@@ -55,6 +55,19 @@
  *   control object the test built. Without that, a provider leaked by one test
  *   would let the next one pass for the wrong reason — which is the single most
  *   likely way a suite about removing globals could lie.
+ * - **One harness stands for one preload process.** The global tracer provider
+ *   belongs to a process, and the API *refuses* a second registration while the
+ *   first is installed, which `./control.ts` detects and treats as a capture it
+ *   cannot arm. A test that wants a second harness therefore tears the first
+ *   one down first — the release a separate process would have given it for
+ *   free — and the refusal itself is asserted deliberately, in its own test,
+ *   with a foreign provider installed.
+ * - **A provider a test attaches is registered the way `register.ts` registers
+ *   one.** {@link StandInTracerProvider}'s `register()` performs the
+ *   `trace.setGlobalTracerProvider(this)` that the real
+ *   `NodeTracerProvider.register()` performs and whose refusal it swallows, so
+ *   the bootstrap-attachment path is exercised against a global that is really
+ *   there rather than against a flag the object was told to believe.
  * - **Providers are built through the constructor, never mutated.** SDK 2.0
  *   removed `addSpanProcessor()` and `getActiveSpanProcessor()` and made the
  *   provider's resource private, so every provider here is assembled with
@@ -93,7 +106,7 @@ import {
   trace,
   TraceFlags,
 } from '@opentelemetry/api';
-import type { Context, SpanContext } from '@opentelemetry/api';
+import type { Context, SpanContext, Tracer, TracerOptions } from '@opentelemetry/api';
 import { isWrapped } from '@opentelemetry/instrumentation';
 import { PgInstrumentation } from '@opentelemetry/instrumentation-pg';
 import { resourceFromAttributes } from '@opentelemetry/resources';
@@ -105,6 +118,8 @@ import { PrismaInstrumentation } from '@prisma/instrumentation';
 import { ID_PREFIXES, newSpanId, newTraceId } from '@debuggen/shared';
 import type { HrTime, LogFields, Logger, LogLevel, LogLevelSetting } from '@debuggen/shared';
 
+import { truncate } from '../redaction/rules.js';
+import { MAX_PREVIEW_LENGTH } from '../schema/attributes.js';
 import { TELEMETRY_KINDS } from '../schema/kinds.js';
 import type { TelemetryKind } from '../schema/kinds.js';
 import {
@@ -115,18 +130,25 @@ import {
   RECONNECT_MIN_MS,
   TRACER_NAME,
   TRACER_VERSION,
+  WIRE_PROTOCOL_VERSION,
 } from './config.js';
 import type { PreloadConfig } from './config.js';
 import {
   ANY_SIGNAL_KINDS,
+  CAPTURE_RESOURCES,
+  classifyInstrumentation,
   computeReconnectDelayMs,
   CONTROL_CLIENT_KIND,
   CONTROL_CLOSE_UNAUTHORIZED,
   CONTROL_MESSAGE_TYPES,
+  DB_SOURCE_SIGNALS,
   DebuggenCaptureSampler,
+  INSTRUMENTATION_ROLES,
   NO_SIGNALS,
+  resolveFunctionAllowList,
   ServerAgentControl,
   SIGNAL_KINDS,
+  wantsInstrumentation,
 } from './control.js';
 import type {
   ControlFlushTarget,
@@ -134,19 +156,23 @@ import type {
   ControlSocketCloseEvent,
   ControlSocketConstructor,
   ControlSocketMessageEvent,
+  ControlTracerProvider,
+  EnableReport,
   ServerAgentSignalName,
   ServerAgentSignals,
   ToggleableInstrumentation,
   TracerProviderFactory,
 } from './control.js';
 import {
+  classifyDatabaseSource,
   classifySpan,
+  DB_CLIENT_VALUES,
   DB_INSTRUMENTATION_SCOPES,
   DB_SPAN_NAME_PREFIXES,
   NEXT_SPAN_TYPE_ATTRIBUTE,
   NEXT_SPAN_TYPES,
 } from './convert.js';
-import { DebuggenSpanProcessor } from './exporter.js';
+import { computeIngestBackoffMs, DebuggenSpanProcessor } from './exporter.js';
 
 /*
  * ---------------------------------------------------------------------------
@@ -190,6 +216,9 @@ const CAPTURE_A = `${ID_PREFIXES.capture}_${'a'.repeat(16)}`;
 /** A second capture id, for the transition and re-enable cases. */
 const CAPTURE_B = `${ID_PREFIXES.capture}_${'b'.repeat(16)}`;
 
+/** A third capture id, for the cases that need two transitions. */
+const CAPTURE_C = `${ID_PREFIXES.capture}_${'d'.repeat(16)}`;
+
 /** A session id, for the cases that assert it reaches the gate. */
 const SESSION_ID = `${ID_PREFIXES.session}_${'c'.repeat(16)}`;
 
@@ -204,6 +233,12 @@ const SPAN_NAME = 'sampleOperation';
 
 /** The patched symbol a `function` span reports, and the plan's function list. */
 const FUNCTION_SYMBOL = 'sampleOperation';
+
+/**
+ * A second patched symbol, for the cases that assert what happens to a
+ * `function` span the active plan did not ask for.
+ */
+const UNPLANNED_FUNCTION_SYMBOL = 'unrelatedOperation';
 
 /** A route template that belongs to no particular project. */
 const REQUEST_ROUTE = '/api/example';
@@ -491,6 +526,12 @@ class SpySpanProcessor implements SpanProcessor {
 interface RecordingFlushTargetOptions {
   /** A failure to raise from `forceFlush`, for the resilience cases. */
   readonly failOnFlush?: Error | undefined;
+  /**
+   * Whether `reopen()` leaves the processor closed, for the case where the
+   * transport cannot be revived and a capture must be refused rather than
+   * armed over something that exports nothing.
+   */
+  readonly staysShutDown?: boolean | undefined;
 }
 
 /**
@@ -510,6 +551,20 @@ class RecordingFlushTarget implements ControlFlushTarget {
   /** Shutdowns requested; must stay at zero. */
   shutdownCount = 0;
 
+  /** Reopenings requested, once a provider that closed it was replaced. */
+  reopenCount = 0;
+
+  /** Whether the processor is closed and dropping everything. */
+  isShutDown = false;
+
+  /**
+   * Called at the moment a flush is requested, where a test needs to observe
+   * *when* it happened — the capture transition has to flush while the
+   * outgoing capture is still the armed one, and only an observation taken
+   * inside the flush can tell.
+   */
+  onFlush: (() => void) | undefined;
+
   readonly #options: RecordingFlushTargetOptions;
 
   /**
@@ -521,6 +576,7 @@ class RecordingFlushTarget implements ControlFlushTarget {
 
   forceFlush(): Promise<void> {
     this.forceFlushCount += 1;
+    this.onFlush?.();
     const failure = this.#options.failOnFlush;
     return failure === undefined ? Promise.resolve() : Promise.reject(failure);
   }
@@ -528,6 +584,11 @@ class RecordingFlushTarget implements ControlFlushTarget {
   shutdown(): Promise<void> {
     this.shutdownCount += 1;
     return Promise.resolve();
+  }
+
+  reopen(): void {
+    this.reopenCount += 1;
+    this.isShutDown = this.#options.staysShutDown === true;
   }
 }
 
@@ -537,6 +598,14 @@ interface RecordingInstrumentationOptions {
   readonly failOnEnable?: Error | undefined;
   /** A failure to raise from `disable()`, for the resilience case. */
   readonly failOnDisable?: Error | undefined;
+  /**
+   * The package name to report, which is how the control object tells the ORM's
+   * instrumentation from the driver's.
+   *
+   * Omitted by default, so a fake stands for an instrumentation this build does
+   * not recognise — the role every existing case here means.
+   */
+  readonly instrumentationName?: string | undefined;
 }
 
 /**
@@ -547,6 +616,11 @@ interface RecordingInstrumentationOptions {
  * about what those two did to the process. The real instances are used where
  * that distinction matters, in the two cases immediately concerned with
  * unwrapping the driver and clearing the ORM's global hook.
+ *
+ * The two failures are writable rather than constructor-only, because a
+ * teardown that failed must be *retryable*: a test asserts the retry by
+ * clearing the failure and calling `disable()` again, which is only meaningful
+ * if the instrumentation can stop refusing.
  */
 class RecordingInstrumentation implements ToggleableInstrumentation {
   /** How many times the patches were re-applied. */
@@ -555,29 +629,69 @@ class RecordingInstrumentation implements ToggleableInstrumentation {
   /** How many times the patches were removed. */
   disableCount = 0;
 
-  readonly #options: RecordingInstrumentationOptions;
+  /** The failure `enable()` raises, or `undefined` once it should succeed. */
+  enableFailure: Error | undefined;
+
+  /** The failure `disable()` raises, or `undefined` once it should succeed. */
+  disableFailure: Error | undefined;
 
   /**
-   * @param options Optional failures to raise.
+   * Whether this fake's "patches" are applied — what an inspection of the
+   * host's modules would find, as distinct from what the SDK's flag claims.
+   *
+   * The two come apart exactly when a toggle fails, which is the case these
+   * fakes exist to model.
+   */
+  patched = true;
+
+  /** The package name this fake reports, where a test gives it one. */
+  readonly instrumentationName: string | undefined;
+
+  /** Mirrors `InstrumentationBase._enabled`: intent, not completion. */
+  #enabled = true;
+
+  /**
+   * @param options Optional failures to raise, and an optional package name.
    */
   constructor(options: RecordingInstrumentationOptions = {}) {
-    this.#options = options;
+    this.enableFailure = options.failOnEnable;
+    this.disableFailure = options.failOnDisable;
+    this.instrumentationName = options.instrumentationName;
   }
 
+  /**
+   * `InstrumentationBase.enable()`'s exact order, which is what makes a failed
+   * toggle ambiguous: the flag is set **first**, the patch callbacks run
+   * after, and a second call returns immediately.
+   */
   enable(): void {
     this.enableCount += 1;
-    const failure = this.#options.failOnEnable;
-    if (failure !== undefined) {
-      throw failure;
+    if (this.#enabled) {
+      return;
     }
+    this.#enabled = true;
+    if (this.enableFailure !== undefined) {
+      throw this.enableFailure;
+    }
+    this.patched = true;
   }
 
+  /** `InstrumentationBase.disable()`'s exact order, for the same reason. */
   disable(): void {
     this.disableCount += 1;
-    const failure = this.#options.failOnDisable;
-    if (failure !== undefined) {
-      throw failure;
+    if (!this.#enabled) {
+      return;
     }
+    this.#enabled = false;
+    if (this.disableFailure !== undefined) {
+      throw this.disableFailure;
+    }
+    this.patched = false;
+  }
+
+  /** `InstrumentationBase.isEnabled()`: the flag, not the patches. */
+  isEnabled(): boolean {
+    return this.#enabled;
   }
 }
 
@@ -861,6 +975,69 @@ function authorizationOf(call: FetchCall): string | undefined {
 
 /*
  * ---------------------------------------------------------------------------
+ * The tracer provider a test attaches
+ * ---------------------------------------------------------------------------
+ */
+
+/** What a test varies about a {@link StandInTracerProvider}. */
+interface StandInProviderOptions {
+  /**
+   * What the nth `shutdown()` does, by attempt number. A rejection is how a
+   * test drives a teardown that could not release the provider: the real
+   * `NodeTracerProvider` has no way to be made to fail.
+   */
+  readonly onShutdown?: (attempt: number) => Promise<void>;
+}
+
+/**
+ * A tracer provider of the shape `register.ts` builds and hands over.
+ *
+ * `register()` performs the part of `NodeTracerProvider.register()` that
+ * `./control.ts` verifies — `trace.setGlobalTracerProvider(this)`, which
+ * `@opentelemetry/api` 1.9.1 answers `false` to, keeping the incumbent, when a
+ * global provider is already installed. `getTracer` delegates to a real
+ * provider, so registering one of these installs a global the host could
+ * actually use rather than a stub it would fail on.
+ */
+class StandInTracerProvider implements ControlTracerProvider {
+  /**
+   * The real provider behind `getTracer`. Built with no resource and no
+   * processors: nothing here asserts on what it produces, only that a tracer
+   * can be obtained from the global.
+   */
+  readonly #delegate = new NodeTracerProvider();
+
+  /** What each `shutdown()` attempt does, where a test said. */
+  readonly #onShutdown: ((attempt: number) => Promise<void>) | undefined;
+
+  /** How many times `register()` was called. */
+  registrations = 0;
+
+  /** How many times `shutdown()` was called, refusals included. */
+  shutdownAttempts = 0;
+
+  constructor(options: StandInProviderOptions = {}) {
+    this.#onShutdown = options.onShutdown;
+  }
+
+  getTracer(name: string, version?: string, options?: TracerOptions): Tracer {
+    return this.#delegate.getTracer(name, version, options);
+  }
+
+  register(): void {
+    this.registrations += 1;
+    trace.setGlobalTracerProvider(this);
+  }
+
+  async shutdown(): Promise<void> {
+    this.shutdownAttempts += 1;
+    await this.#onShutdown?.(this.shutdownAttempts);
+    await this.#delegate.shutdown();
+  }
+}
+
+/*
+ * ---------------------------------------------------------------------------
  * Span fixtures
  *
  * One builder, one cast. The member set is `@opentelemetry/sdk-trace-base`
@@ -980,9 +1157,44 @@ function databaseQuerySpan(): ReadableSpan {
   });
 }
 
+/** The ORM instrumentation's query span → `db.query`, source `prisma`. */
+function ormQuerySpan(): ReadableSpan {
+  return makeSpan({
+    name: `${DB_SPAN_NAME_PREFIXES.orm}client:operation`,
+    scope: DB_INSTRUMENTATION_SCOPES.orm,
+    attributes: { 'db.statement': DB_STATEMENT, 'db.system': 'postgresql' },
+  });
+}
+
+/**
+ * A query span from neither known instrumentation: database attributes and a
+ * scope this build does not recognise.
+ */
+function unattributedQuerySpan(): ReadableSpan {
+  return makeSpan({ attributes: { 'db.statement': DB_STATEMENT, 'db.system': 'postgresql' } });
+}
+
 /** A span the product's own helper created for a patched symbol → `function`. */
 function patchedFunctionSpan(): ReadableSpan {
   return makeSpan({ name: FUNCTION_SYMBOL, scope: TRACER_NAME });
+}
+
+/**
+ * A `function` span for an arbitrary symbol, as the patch's span helper would
+ * emit it.
+ *
+ * @param name The span's display name, which the helper derives from the name
+ * the patch passed.
+ * @param symbol The `symbol` attribute the patch wrote, where the case needs
+ * one.
+ * @returns The span.
+ */
+function functionSpanFor(name: string, symbol?: string): ReadableSpan {
+  return makeSpan({
+    name,
+    scope: TRACER_NAME,
+    ...(symbol === undefined ? {} : { attributes: { symbol } }),
+  });
 }
 
 /*
@@ -1008,6 +1220,23 @@ interface HarnessOptions {
   readonly flushTarget?: RecordingFlushTarget;
   /** The jitter source for the reconnect envelope; defaults to the midpoint. */
   readonly random?: () => number;
+  /**
+   * A provider to attach as one `register.ts` has already registered, instead
+   * of leaving the first capture to build one from the factory.
+   *
+   * The way a test drives a provider whose `shutdown()` refuses: the real
+   * `NodeTracerProvider` has no way to be made to fail.
+   *
+   * The harness registers it globally before attaching, because that is what
+   * `register.ts` does — build, `register()`, attach — and `./control.ts`
+   * *checks* the global rather than believing the attachment.
+   */
+  readonly provider?: StandInTracerProvider;
+  /**
+   * Attach {@link HarnessOptions.provider} without registering it first,
+   * modelling a `register()` whose registration was refused.
+   */
+  readonly attachProviderUnregistered?: boolean;
 }
 
 /** One wired control object and everything it was wired to. */
@@ -1029,13 +1258,37 @@ interface Harness {
   /** How many providers the factory has been asked for. */
   providerBuilds(): number;
   /**
+   * Wire a real span processor the way `register.ts` does: behind every
+   * provider this harness builds from now on, **and** as the control object's
+   * flush target.
+   *
+   * Both halves matter, and they are the product's own wiring: one processor
+   * instance shared across every provider a session builds. It is the only
+   * honest way to assert what happens to a span that outlives the capture it
+   * started in — the stamp is written by the processor the provider calls —
+   * and to assert that the processor survives a provider shutdown.
+   *
+   * @param processor The processor to wire.
+   */
+  useProcessor(processor: SpanProcessor & ControlFlushTarget): void;
+  /**
+   * Make the next provider build throw, once.
+   *
+   * The way a test drives the enable path's mandatory-resource failure without
+   * taking the factory away altogether, which is what the *retry* case needs:
+   * the same request must succeed the second time.
+   *
+   * @param error The failure to raise.
+   */
+  failNextProviderBuild(error: Error): void;
+  /**
    * Arm a capture the way a `server-agent.config` frame with a capture id does.
    *
    * @param captureId The capture window.
    * @param signals The signals to admit.
-   * @returns Whether anything changed.
+   * @returns What was armed, and anything that could not be installed.
    */
-  arm(captureId: string, signals: ServerAgentSignals): Promise<boolean>;
+  arm(captureId: string, signals: ServerAgentSignals): Promise<EnableReport>;
 }
 
 /** Every harness a test built, disposed of in `afterEach`. */
@@ -1058,6 +1311,8 @@ function createHarness(options: HarnessOptions = {}): Harness {
   ];
   const sockets = createSocketRig();
   let builds = 0;
+  let nextBuildFailure: Error | undefined;
+  const extraProcessors: SpanProcessor[] = [];
 
   const control = new ServerAgentControl({
     config,
@@ -1072,14 +1327,33 @@ function createHarness(options: HarnessOptions = {}): Harness {
   // object, so the factory can only be built once that object exists.
   const createProvider: TracerProviderFactory = () => {
     builds += 1;
+    if (nextBuildFailure !== undefined) {
+      const failure = nextBuildFailure;
+      nextBuildFailure = undefined;
+      throw failure;
+    }
     return new NodeTracerProvider({
       resource: resourceFromAttributes({ [ATTR_SERVICE_NAME]: config.serviceName }),
       sampler: new DebuggenCaptureSampler(control),
-      spanProcessors: [spans],
+      spanProcessors: [spans, ...extraProcessors],
     });
   };
 
-  control.attach({ processor: flush, instrumentations, createProvider });
+  if (options.provider !== undefined && options.attachProviderUnregistered !== true) {
+    // `register.ts`'s own sequence: build the provider, register it globally,
+    // then attach it. `./control.ts` asks the global registry whether the
+    // provider it was handed is the one the host's tracers resolve through, so
+    // a provider attached without this step is one it correctly refuses to
+    // treat as installed — which is a different case, with its own test.
+    options.provider.register();
+  }
+
+  control.attach({
+    processor: flush,
+    instrumentations,
+    createProvider,
+    ...(options.provider === undefined ? {} : { provider: options.provider }),
+  });
 
   const harness: Harness = {
     config,
@@ -1090,7 +1364,14 @@ function createHarness(options: HarnessOptions = {}): Harness {
     instrumentations,
     sockets,
     providerBuilds: (): number => builds,
-    arm: (captureId: string, signals: ServerAgentSignals): Promise<boolean> =>
+    useProcessor: (processor: SpanProcessor & ControlFlushTarget): void => {
+      extraProcessors.push(processor);
+      control.attach({ processor });
+    },
+    failNextProviderBuild: (error: Error): void => {
+      nextBuildFailure = error;
+    },
+    arm: (captureId: string, signals: ServerAgentSignals): Promise<EnableReport> =>
       control.enableCapture({ captureId, signals }),
   };
 
@@ -1424,7 +1705,11 @@ describe('the teardown leaves the process unable to create a span', () => {
   it('counts a started span while a capture is armed and none after the teardown', async () => {
     const harness = createHarness();
 
-    await expect(harness.arm(CAPTURE_A, ALL_SIGNALS)).resolves.toBe(true);
+    await expect(harness.arm(CAPTURE_A, ALL_SIGNALS)).resolves.toEqual({
+      armed: true,
+      changed: true,
+      unavailable: [],
+    });
     expect(harness.providerBuilds()).toBe(1);
     expect(harness.control.stats().providerRegistered).toBe(true);
 
@@ -1614,12 +1899,26 @@ describe('the teardown removes the instrumentation patches', () => {
     const harness = createHarness({ instrumentations: [driver, orm] });
 
     await harness.arm(CAPTURE_A, ALL_SIGNALS);
-    await harness.control.disable();
+    await expect(harness.control.disable()).resolves.toEqual({
+      status: 'clean',
+      changed: true,
+      pending: [],
+      failures: [],
+    });
     const afterFirst = harness.control.stats();
 
-    await harness.control.disable();
+    // The second call finds nothing installed, so it reports the state it
+    // found rather than doing the sequence again.
+    await expect(harness.control.disable()).resolves.toEqual({
+      status: 'clean',
+      changed: false,
+      pending: [],
+      failures: [],
+    });
 
     expect(harness.control.stats()).toEqual(afterFirst);
+    expect(afterFirst.cleanupStatus).toBe('clean');
+    expect(afterFirst.pendingCleanup).toEqual([]);
     expect(afterFirst.disableCount).toBe(1);
     expect(driver.disableCount).toBe(1);
     expect(orm.disableCount).toBe(1);
@@ -1635,7 +1934,7 @@ describe('the teardown removes the instrumentation patches', () => {
     await harness.arm(CAPTURE_A, ALL_SIGNALS);
     const cachedTracer = trace.getTracer(TRACER_NAME, TRACER_VERSION);
 
-    await expect(harness.control.disable()).resolves.toBeUndefined();
+    const report = await harness.control.disable();
 
     // Every step after the failure still ran: AAP §0.5.1 requires cleanup to be
     // reliable, so one broken step must not abort the ones behind it.
@@ -1643,10 +1942,145 @@ describe('the teardown removes the instrumentation patches', () => {
     expect(healthy.disableCount).toBe(1);
     expect(harness.control.stats().failures).toBe(1);
     expect(harness.control.stats().providerRegistered).toBe(false);
-    expect(harness.control.stats().instrumentationsEnabled).toBe(false);
     expect(cachedTracer.startSpan(SPAN_NAME).isRecording()).toBe(false);
     expect(propagation.fields()).toEqual([]);
     expect(logText(harness.log)).not.toContain(CONTROL_TOKEN);
+
+    // …and the step that failed is reported as unfinished rather than as done.
+    // The instrumentation that refused may still be patched into the
+    // developer's process, so claiming the preload is inert would be a false
+    // cleanup report (AAP §0.5.1).
+    expect(report.status).toBe('partial');
+    expect(report.pending).toEqual([CAPTURE_RESOURCES.instrumentation]);
+    expect(report.failures.map((entry) => entry.resource)).toEqual([
+      CAPTURE_RESOURCES.instrumentation,
+    ]);
+    expect(report.failures[0]?.reason).not.toContain(CONTROL_TOKEN);
+    expect(harness.control.stats().cleanupStatus).toBe('partial');
+    expect(harness.control.stats().instrumentationsEnabled).toBe(true);
+    expect(harness.control.stats().pendingCleanup).toEqual([CAPTURE_RESOURCES.instrumentation]);
+  });
+
+  it('keeps reporting partial when a failed unpatch cannot be shown to have happened', async () => {
+    const failing = new RecordingInstrumentation({
+      failOnDisable: new Error('the driver refused to unwrap'),
+    });
+    const healthy = new RecordingInstrumentation();
+    const harness = createHarness({ instrumentations: [failing, healthy] });
+
+    await harness.arm(CAPTURE_A, ALL_SIGNALS);
+    await expect(harness.control.disable()).resolves.toMatchObject({ status: 'partial' });
+
+    // The fake models the SDK exactly: `disable()` clears its flag before it
+    // unpatches, so after the failure it reports itself disabled while its
+    // patches are still applied…
+    expect(failing.isEnabled()).toBe(false);
+    expect(failing.patched).toBe(true);
+
+    // …and a second `disable()` therefore returns without unpatching anything.
+    // Its silence is not evidence, so the retry keeps the resource pending and
+    // asks for a restart rather than claiming a cleanup it cannot verify.
+    failing.disableFailure = undefined;
+    const second = await harness.control.disable();
+
+    expect(second.status).toBe('partial');
+    expect(second.pending).toEqual([CAPTURE_RESOURCES.instrumentation]);
+    expect(second.failures[0]?.hint).toContain('Restart the dev server');
+    expect(failing.patched).toBe(true);
+    expect(harness.control.stats().instrumentationsEnabled).toBe(true);
+    expect(harness.control.stats().cleanupStatus).toBe('partial');
+    // The one that succeeded is not disabled twice, and is not reported.
+    expect(healthy.disableCount).toBe(1);
+    expect(healthy.patched).toBe(false);
+  });
+
+  it('verifies the cleanup of an instrumentation whose enable failed', async () => {
+    const failing = new RecordingInstrumentation({
+      failOnEnable: new Error('the ORM instrumentation refused to patch'),
+      instrumentationName: `${DB_INSTRUMENTATION_SCOPES.ormScopePrefix}instrumentation`,
+    });
+    const harness = createHarness({ instrumentations: [failing] });
+
+    // Off, then on: the second frame has to enable it, and that throws.
+    await harness.arm(CAPTURE_A, { ...ALL_SIGNALS, prisma: false });
+    expect(failing.patched).toBe(false);
+    await harness.arm(CAPTURE_B, ALL_SIGNALS);
+
+    // A failed *enable* leaves the SDK's flag set, so the teardown's
+    // `disable()` does real work and its success is evidence.
+    expect(failing.isEnabled()).toBe(true);
+    const report = await harness.control.disable();
+
+    expect(report.status).toBe('clean');
+    expect(report.pending).toEqual([]);
+    expect(failing.patched).toBe(false);
+    expect(harness.control.stats().instrumentationsEnabled).toBe(false);
+  });
+
+  it('takes a bare instrumentation at its word when it reports no state', async () => {
+    let disableCount = 0;
+    // No `isEnabled()`: all a `{ enable, disable }` fake offers is that its
+    // call returned, which is what this module is entitled to believe.
+    const bare: ToggleableInstrumentation = {
+      enable: (): void => undefined,
+      disable: (): void => {
+        disableCount += 1;
+      },
+    };
+    const harness = createHarness({ instrumentations: [bare] });
+
+    await harness.arm(CAPTURE_A, ALL_SIGNALS);
+    const report = await harness.control.disable();
+
+    expect(disableCount).toBe(1);
+    expect(report.status).toBe('clean');
+    expect(harness.control.stats().instrumentationsEnabled).toBe(false);
+  });
+
+  it('carries a partial teardown out through the config frame that asked for it', async () => {
+    const failing = new RecordingInstrumentation({
+      failOnDisable: new Error('the driver refused to unwrap'),
+    });
+    const harness = createHarness({ instrumentations: [failing] });
+
+    await harness.arm(CAPTURE_A, ALL_SIGNALS);
+
+    // `disabled` is a claim about the process — no patches, no provider — that
+    // this teardown has not earned, so the frame is answered `partial`.
+    await expect(harness.control.applyConfig({ signals: NO_SIGNALS })).resolves.toBe('partial');
+
+    expect(harness.control.captureId).toBeNull();
+    expect(harness.control.stats().cleanupStatus).toBe('partial');
+    expect(harness.control.stats().pendingCleanup).toEqual([CAPTURE_RESOURCES.instrumentation]);
+  });
+
+  it('refuses the next capture while a provider shutdown is still pending', async () => {
+    const shutdownFailure = new Error('the provider refused to shut down');
+    const provider = new StandInTracerProvider({
+      onShutdown: (attempt: number): Promise<void> =>
+        attempt === 1 ? Promise.reject(shutdownFailure) : Promise.resolve(),
+    });
+    const harness = createHarness({ provider });
+
+    await harness.arm(CAPTURE_A, ALL_SIGNALS);
+    const first = await harness.control.disable();
+
+    expect(provider.shutdownAttempts).toBe(1);
+    expect(first.status).toBe('partial');
+    expect(first.pending).toContain(CAPTURE_RESOURCES.provider);
+    expect(harness.control.stats().cleanupStatus).toBe('partial');
+
+    // A capture may not be armed on top of a provider this object could not
+    // release: `trace.setGlobalTracerProvider` refuses to replace an installed
+    // global, so the capture would run against the provider that was shut
+    // down. The retry happens first, and only then is the capture armed.
+    const armed = await harness.arm(CAPTURE_B, ALL_SIGNALS);
+
+    expect(provider.shutdownAttempts).toBe(2);
+    expect(armed.armed).toBe(true);
+    expect(harness.providerBuilds()).toBe(1);
+    expect(harness.control.captureId).toBe(CAPTURE_B);
+    expect(harness.control.stats().providerRegistered).toBe(true);
   });
 
   it('completes the teardown when the pre-teardown flush fails', async () => {
@@ -1659,12 +2093,17 @@ describe('the teardown removes the instrumentation patches', () => {
     });
 
     await harness.arm(CAPTURE_A, ALL_SIGNALS);
-    await expect(harness.control.disable()).resolves.toBeUndefined();
+    const report = await harness.control.disable();
 
     expect(harness.flush.forceFlushCount).toBe(1);
     expect(driver.disableCount).toBe(1);
     expect(harness.control.stats().providerRegistered).toBe(false);
     expect(harness.control.stats().failures).toBe(1);
+    // A flush that failed costs evidence, not reversibility: nothing is left
+    // installed, so the teardown is clean and the loss is reported separately.
+    expect(report.status).toBe('clean');
+    expect(report.pending).toEqual([]);
+    expect(report.failures.map((entry) => entry.resource)).toEqual([CAPTURE_RESOURCES.flush]);
   });
 });
 
@@ -1790,7 +2229,10 @@ describe('the capture gate inside a capture', () => {
   it('enables exactly the kinds each signal maps to, and nothing else', async () => {
     for (const name of SIGNAL_NAMES) {
       const harness = createHarness();
-      await expect(harness.arm(CAPTURE_A, onlySignal(name))).resolves.toBe(true);
+      await expect(harness.arm(CAPTURE_A, onlySignal(name))).resolves.toMatchObject({
+        armed: true,
+        changed: true,
+      });
 
       const expected = new Set<TelemetryKind>([...SIGNAL_KINDS[name], ...ANY_SIGNAL_KINDS]);
       for (const kind of TELEMETRY_KINDS) {
@@ -1799,6 +2241,13 @@ describe('the capture gate inside a capture', () => {
         );
       }
       expect([...harness.control.stats().enabledKinds].sort()).toEqual([...expected].sort());
+
+      // One harness stands for one preload process, and the global tracer
+      // provider belongs to a process: the API refuses a second registration
+      // while the first is installed. Releasing it here is what the next
+      // iteration's process would find, and asserting the kinds first is what
+      // makes the release safe.
+      await harness.control.disable();
     }
   });
 
@@ -1829,6 +2278,10 @@ describe('the capture gate inside a capture', () => {
     expect(withoutFunctions.control.isKindEnabled('function')).toBe(false);
     expect(withoutFunctions.control.stats().functions).toEqual([]);
 
+    // Each harness is a process of its own, and the global tracer provider is
+    // a process-wide singleton the API will not let a second capture replace.
+    await withoutFunctions.control.disable();
+
     const withFunctions = createHarness();
     await withFunctions.arm(CAPTURE_B, {
       ...NO_SIGNALS,
@@ -1852,6 +2305,405 @@ describe('the capture gate inside a capture', () => {
  * guessing at a frame this build does not understand is how a gate ends up
  * half-open — recording spans nobody asked for, or armed and admitting nothing.
  */
+/*
+ * ---------------------------------------------------------------------------
+ * One capture's evidence never becomes another's
+ * ---------------------------------------------------------------------------
+ */
+
+describe('a span that outlives the capture it started in', () => {
+  it('is dropped rather than exported into the capture that replaced it', async () => {
+    const harness = createHarness();
+    const rig = createProcessorRig(harness);
+    // Behind the provider, so the SDK itself calls `onStart` and `onEnd` with
+    // the same span object — which is what the capture stamp is keyed on.
+    harness.useProcessor(rig.processor);
+
+    await harness.arm(CAPTURE_A, ALL_SIGNALS);
+    const tracer = trace.getTracer(TRACER_NAME, TRACER_VERSION);
+
+    // A long-running operation: started under capture A, still open when the
+    // service moves the project on to capture B.
+    const straddling = tracer.startSpan(SPAN_NAME, { kind: SpanKind.SERVER });
+    expect(rig.processor.stats().onStartCount).toBe(1);
+
+    await harness.arm(CAPTURE_B, ALL_SIGNALS);
+    straddling.end();
+
+    // An ingest event carries no capture id — the service assigns it on
+    // arrival (AAP §0.2.3) — so exporting this span would file capture A's
+    // work under capture B. There is no way to label it correctly, so it is
+    // refused.
+    expect(rig.processor.stats().droppedStaleCapture).toBe(1);
+    expect(rig.processor.stats().convertedCount).toBe(0);
+    expect(rig.processor.bufferedCount).toBe(0);
+
+    // The positive control: a span that starts *and* ends inside capture B is
+    // evidence as usual.
+    const inside = tracer.startSpan(SPAN_NAME, { kind: SpanKind.SERVER });
+    inside.end();
+
+    expect(rig.processor.stats().convertedCount).toBe(1);
+    expect(rig.processor.stats().droppedStaleCapture).toBe(1);
+    expect(rig.processor.bufferedCount).toBe(1);
+  });
+
+  it('is dropped when the same capture id is armed a second time', async () => {
+    const harness = createHarness();
+    const rig = createProcessorRig(harness);
+    harness.useProcessor(rig.processor);
+
+    await harness.arm(CAPTURE_A, ALL_SIGNALS);
+    const straddling = trace
+      .getTracer(TRACER_NAME, TRACER_VERSION)
+      .startSpan(SPAN_NAME, { kind: SpanKind.SERVER });
+
+    await harness.control.disable();
+    await harness.arm(CAPTURE_A, ALL_SIGNALS);
+    straddling.end();
+
+    // The id is the same, so only the generation can tell these two windows
+    // apart — and the service closed the first one before the second opened.
+    expect(harness.control.stats().captureGeneration).toBe(2);
+    expect(rig.processor.stats().droppedStaleCapture).toBe(1);
+    expect(rig.processor.stats().convertedCount).toBe(0);
+  });
+
+  it('flushes the capture being replaced before the new one is armed', async () => {
+    const order: string[] = [];
+    const harness = createHarness();
+    const rig = createProcessorRig(harness);
+
+    await harness.arm(CAPTURE_A, HTTP_ONLY_SIGNALS);
+    rig.processor.onEnd(serverRequestSpan());
+    expect(rig.processor.bufferedCount).toBe(1);
+    expect(order).toEqual([]);
+
+    // The flush the transition performs is the real processor's, so the
+    // buffered event is posted while capture A is still the one the service
+    // has open.
+    harness.flush.onFlush = (): void => {
+      order.push(`flush:${String(harness.control.captureId)}`);
+    };
+    await harness.arm(CAPTURE_B, HTTP_ONLY_SIGNALS);
+    order.push(`armed:${String(harness.control.captureId)}`);
+
+    expect(order).toEqual([`flush:${CAPTURE_A}`, `armed:${CAPTURE_B}`]);
+    expect(harness.flush.forceFlushCount).toBe(1);
+  });
+
+  it('does not flush when the frame restates the capture already armed', async () => {
+    const harness = createHarness();
+
+    await harness.arm(CAPTURE_A, HTTP_ONLY_SIGNALS);
+    await harness.arm(CAPTURE_A, HTTP_ONLY_SIGNALS);
+
+    expect(harness.flush.forceFlushCount).toBe(0);
+    expect(harness.control.stats().captureGeneration).toBe(1);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The database library that produced a span
+ * ---------------------------------------------------------------------------
+ */
+
+describe('the two database signals, which share one kind', () => {
+  it('maps each database instrumentation to the signal that admits it', () => {
+    expect(DB_SOURCE_SIGNALS).toEqual({
+      [DB_CLIENT_VALUES.orm]: 'prisma',
+      [DB_CLIENT_VALUES.driver]: 'pg',
+    });
+    expect(classifyDatabaseSource(ormQuerySpan())).toBe(DB_CLIENT_VALUES.orm);
+    expect(classifyDatabaseSource(databaseQuerySpan())).toBe(DB_CLIENT_VALUES.driver);
+    // Both are the one kind, which is exactly why the source is needed.
+    expect(classifySpan(ormQuerySpan())).toEqual({ kind: 'db.query', tier: 'db' });
+    expect(classifySpan(databaseQuerySpan())).toEqual({ kind: 'db.query', tier: 'db' });
+    // A source is a property of a database span and of nothing else.
+    expect(classifyDatabaseSource(serverRequestSpan())).toBeNull();
+    expect(classifyDatabaseSource(unattributedQuerySpan())).toBeNull();
+  });
+
+  it('admits the ORM query and refuses the driver query under an ORM-only plan', async () => {
+    const harness = createHarness();
+    const rig = createProcessorRig(harness);
+
+    await harness.arm(CAPTURE_A, onlySignal('prisma'));
+
+    expect(harness.control.stats().enabledDbSources).toEqual([DB_CLIENT_VALUES.orm]);
+    expect(harness.control.isKindEnabled('db.query')).toBe(true);
+
+    rig.processor.onEnd(ormQuerySpan());
+    rig.processor.onEnd(databaseQuerySpan());
+
+    expect(rig.processor.stats().convertedCount).toBe(1);
+    expect(rig.processor.stats().droppedBySource).toBe(1);
+    expect(rig.processor.stats().droppedByKind).toBe(0);
+    expect(rig.processor.bufferedCount).toBe(1);
+  });
+
+  it('admits the driver query and refuses the ORM query under a driver-only plan', async () => {
+    const harness = createHarness();
+    const rig = createProcessorRig(harness);
+
+    await harness.arm(CAPTURE_A, onlySignal('pg'));
+
+    expect(harness.control.stats().enabledDbSources).toEqual([DB_CLIENT_VALUES.driver]);
+
+    rig.processor.onEnd(databaseQuerySpan());
+    rig.processor.onEnd(ormQuerySpan());
+
+    expect(rig.processor.stats().convertedCount).toBe(1);
+    expect(rig.processor.stats().droppedBySource).toBe(1);
+  });
+
+  it('admits both when the plan asked for both', async () => {
+    const harness = createHarness();
+    const rig = createProcessorRig(harness);
+
+    await harness.arm(CAPTURE_A, ALL_SIGNALS);
+
+    expect([...harness.control.stats().enabledDbSources].sort()).toEqual(
+      [DB_CLIENT_VALUES.driver, DB_CLIENT_VALUES.orm].sort(),
+    );
+
+    rig.processor.onEnd(ormQuerySpan());
+    rig.processor.onEnd(databaseQuerySpan());
+
+    expect(rig.processor.stats().convertedCount).toBe(2);
+    expect(rig.processor.stats().droppedBySource).toBe(0);
+  });
+
+  it('admits a query whose producing library cannot be told', async () => {
+    const harness = createHarness();
+    const rig = createProcessorRig(harness);
+
+    await harness.arm(CAPTURE_A, onlySignal('pg'));
+    rig.processor.onEnd(unattributedQuerySpan());
+
+    // The kind was asked for and the span is a query; discarding it for being
+    // unattributable would lose the evidence the plan asked for.
+    expect(rig.processor.stats().convertedCount).toBe(1);
+    expect(rig.processor.stats().droppedBySource).toBe(0);
+  });
+
+  it('refuses every query when the plan asked for no database tracing', async () => {
+    const harness = createHarness();
+    const rig = createProcessorRig(harness);
+
+    await harness.arm(CAPTURE_A, HTTP_ONLY_SIGNALS);
+    rig.processor.onEnd(ormQuerySpan());
+    rig.processor.onEnd(databaseQuerySpan());
+
+    expect(rig.processor.stats().droppedByKind).toBe(2);
+    expect(rig.processor.stats().droppedBySource).toBe(0);
+    expect(rig.processor.stats().convertedCount).toBe(0);
+  });
+
+  it('classifies the real instrumentation instances by the names they report', () => {
+    const orm = new PrismaInstrumentation();
+    const driver = new PgInstrumentation();
+
+    expect(classifyInstrumentation(orm)).toBe(INSTRUMENTATION_ROLES.orm);
+    expect(classifyInstrumentation(driver)).toBe(INSTRUMENTATION_ROLES.driver);
+    // A fake with no name is an instrumentation this build cannot place.
+    expect(classifyInstrumentation(new RecordingInstrumentation())).toBe(
+      INSTRUMENTATION_ROLES.unknown,
+    );
+
+    expect(wantsInstrumentation(INSTRUMENTATION_ROLES.orm, onlySignal('prisma'))).toBe(true);
+    expect(wantsInstrumentation(INSTRUMENTATION_ROLES.driver, onlySignal('prisma'))).toBe(false);
+    expect(wantsInstrumentation(INSTRUMENTATION_ROLES.driver, onlySignal('pg'))).toBe(true);
+    expect(wantsInstrumentation(INSTRUMENTATION_ROLES.orm, onlySignal('pg'))).toBe(false);
+    // Unrecognised stays as it arrived, for every capture.
+    expect(wantsInstrumentation(INSTRUMENTATION_ROLES.unknown, HTTP_ONLY_SIGNALS)).toBe(true);
+
+    orm.disable();
+    driver.disable();
+  });
+
+  it('leaves the library a plan did not ask for unpatched, and patches it when a later plan does', async () => {
+    const orm = new RecordingInstrumentation({
+      instrumentationName: `${DB_INSTRUMENTATION_SCOPES.ormScopePrefix}instrumentation`,
+    });
+    const driver = new RecordingInstrumentation({
+      instrumentationName: DB_INSTRUMENTATION_SCOPES.driver,
+    });
+    const harness = createHarness({ instrumentations: [orm, driver] });
+
+    await harness.arm(CAPTURE_A, onlySignal('prisma'));
+
+    // Both arrived enabled from `registerInstrumentations()`. The ORM stays,
+    // and the driver is unwrapped in the developer's own process — which is
+    // what makes the targeting real rather than a filter after the fact.
+    expect(orm.enableCount).toBe(0);
+    expect(orm.disableCount).toBe(0);
+    expect(driver.disableCount).toBe(1);
+    expect(driver.enableCount).toBe(0);
+
+    await harness.arm(CAPTURE_B, onlySignal('pg'));
+
+    expect(driver.enableCount).toBe(1);
+    expect(orm.disableCount).toBe(1);
+    expect(harness.control.stats().enabledDbSources).toEqual([DB_CLIENT_VALUES.driver]);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The symbols a plan patched
+ * ---------------------------------------------------------------------------
+ */
+
+describe('the function signal, which is a list of symbols rather than a switch', () => {
+  it('accepts a planned name in both its planned and its truncated form', () => {
+    const longSymbol = 'a'.repeat(MAX_PREVIEW_LENGTH + 40);
+    const allowed = resolveFunctionAllowList({
+      ...NO_SIGNALS,
+      functions: [FUNCTION_SYMBOL, longSymbol, '   ', ''],
+    });
+
+    expect(allowed.has(FUNCTION_SYMBOL)).toBe(true);
+    expect(allowed.has(longSymbol)).toBe(true);
+    // The span helper bounds a span name, so the shortened spelling has to be
+    // accepted as the same identity.
+    expect(allowed.has(truncate(longSymbol, MAX_PREVIEW_LENGTH))).toBe(true);
+    expect(allowed.has('')).toBe(false);
+    expect(allowed.has('   ')).toBe(false);
+  });
+
+  it('admits the planned symbol and refuses one the plan never patched', async () => {
+    const harness = createHarness();
+    const rig = createProcessorRig(harness);
+
+    await harness.arm(CAPTURE_A, { ...HTTP_ONLY_SIGNALS, functions: [FUNCTION_SYMBOL] });
+
+    expect(harness.control.isKindEnabled('function')).toBe(true);
+    expect(harness.control.stats().functions).toEqual([FUNCTION_SYMBOL]);
+
+    rig.processor.onEnd(patchedFunctionSpan());
+    rig.processor.onEnd(functionSpanFor(UNPLANNED_FUNCTION_SYMBOL));
+
+    // A patched function from outside the active plan does occur — an earlier
+    // session's patch left in a conflict state, a plan version since narrowed
+    // — and it is not this capture's evidence.
+    expect(rig.processor.stats().convertedCount).toBe(1);
+    expect(rig.processor.stats().droppedUnplannedFunction).toBe(1);
+    expect(rig.processor.bufferedCount).toBe(1);
+  });
+
+  it("admits a span whose name was truncated, on the patch's own symbol attribute", async () => {
+    const longSymbol = `${'b'.repeat(MAX_PREVIEW_LENGTH + 10)}Tail`;
+    const harness = createHarness();
+    const rig = createProcessorRig(harness);
+
+    await harness.arm(CAPTURE_A, { ...HTTP_ONLY_SIGNALS, functions: [longSymbol] });
+
+    // As the span helper emits it: the name bounded, the symbol intact.
+    rig.processor.onEnd(functionSpanFor(truncate(longSymbol, MAX_PREVIEW_LENGTH), longSymbol));
+    // And a span carrying only the truncated name, with no attribute at all.
+    rig.processor.onEnd(functionSpanFor(truncate(longSymbol, MAX_PREVIEW_LENGTH)));
+
+    expect(rig.processor.stats().convertedCount).toBe(2);
+    expect(rig.processor.stats().droppedUnplannedFunction).toBe(0);
+  });
+
+  it('admits a span whose name was overridden but whose symbol attribute was planned', async () => {
+    const harness = createHarness();
+    const rig = createProcessorRig(harness);
+
+    await harness.arm(CAPTURE_A, { ...HTTP_ONLY_SIGNALS, functions: [FUNCTION_SYMBOL] });
+
+    rig.processor.onEnd(functionSpanFor('a name the patch chose instead', FUNCTION_SYMBOL));
+
+    expect(rig.processor.stats().convertedCount).toBe(1);
+    expect(rig.processor.stats().droppedUnplannedFunction).toBe(0);
+  });
+
+  it('refuses every function span when the plan patched nothing', async () => {
+    const harness = createHarness();
+    const rig = createProcessorRig(harness);
+
+    await harness.arm(CAPTURE_A, HTTP_ONLY_SIGNALS);
+
+    expect(harness.control.isKindEnabled('function')).toBe(false);
+    rig.processor.onEnd(patchedFunctionSpan());
+
+    expect(rig.processor.stats().droppedByKind).toBe(1);
+    expect(rig.processor.stats().droppedUnplannedFunction).toBe(0);
+    expect(rig.processor.stats().convertedCount).toBe(0);
+  });
+
+  it('refuses a span that declares an unplanned symbol, whatever it is named', async () => {
+    const harness = createHarness();
+    const rig = createProcessorRig(harness);
+
+    await harness.arm(CAPTURE_A, { ...HTTP_ONLY_SIGNALS, functions: [FUNCTION_SYMBOL] });
+
+    // The patch's own record of what it wrapped outranks the display name: a
+    // span named after a planned symbol while declaring a different one is the
+    // one it declares, and accepting either identity would admit it.
+    rig.processor.onEnd(functionSpanFor(FUNCTION_SYMBOL, UNPLANNED_FUNCTION_SYMBOL));
+
+    expect(rig.processor.stats().droppedUnplannedFunction).toBe(1);
+    expect(rig.processor.stats().convertedCount).toBe(0);
+  });
+
+  it('refuses a shortened identity that two planned symbols share', async () => {
+    // Two distinct symbols agreeing on their first MAX_PREVIEW_LENGTH
+    // characters shorten to the same string, so that string names neither.
+    const shared = 'c'.repeat(MAX_PREVIEW_LENGTH);
+    const first = `${shared}One`;
+    const second = `${shared}Two`;
+    const shortened = truncate(first, MAX_PREVIEW_LENGTH);
+    expect(truncate(second, MAX_PREVIEW_LENGTH)).toBe(shortened);
+
+    const allowed = resolveFunctionAllowList({ ...NO_SIGNALS, functions: [first, second] });
+    expect(allowed.has(first)).toBe(true);
+    expect(allowed.has(second)).toBe(true);
+    expect(allowed.has(shortened)).toBe(false);
+
+    const harness = createHarness();
+    const rig = createProcessorRig(harness);
+    await harness.arm(CAPTURE_A, { ...HTTP_ONLY_SIGNALS, functions: [first, second] });
+
+    // Ambiguous: refused, because admitting it would admit whichever of the two
+    // arrived — including one a narrowed plan no longer patches.
+    rig.processor.onEnd(functionSpanFor(shortened));
+    expect(rig.processor.stats().droppedUnplannedFunction).toBe(1);
+    expect(rig.processor.stats().convertedCount).toBe(0);
+
+    // Unambiguous: the full spelling names one symbol and is admitted.
+    rig.processor.onEnd(functionSpanFor(first, first));
+    expect(rig.processor.stats().convertedCount).toBe(1);
+  });
+
+  it('narrows the allow-list when a later plan version patches fewer symbols', async () => {
+    const harness = createHarness();
+    const rig = createProcessorRig(harness);
+
+    await harness.arm(CAPTURE_A, {
+      ...HTTP_ONLY_SIGNALS,
+      functions: [FUNCTION_SYMBOL, UNPLANNED_FUNCTION_SYMBOL],
+    });
+    rig.processor.onEnd(functionSpanFor(UNPLANNED_FUNCTION_SYMBOL));
+    expect(rig.processor.stats().convertedCount).toBe(1);
+
+    // The same capture id with a different list is a change, not a
+    // restatement: the gate has to re-resolve, or the old list would outlive
+    // the plan that carried it.
+    await expect(
+      harness.arm(CAPTURE_A, { ...HTTP_ONLY_SIGNALS, functions: [FUNCTION_SYMBOL] }),
+    ).resolves.toMatchObject({ armed: true, changed: true });
+
+    rig.processor.onEnd(functionSpanFor(UNPLANNED_FUNCTION_SYMBOL));
+
+    expect(rig.processor.stats().droppedUnplannedFunction).toBe(1);
+    expect(rig.processor.stats().convertedCount).toBe(1);
+  });
+});
+
 interface InvalidConfigCase {
   /** What is wrong with the payload, used as the assertion's message. */
   readonly description: string;
@@ -1914,8 +2766,15 @@ describe('applying a server-agent.config payload', () => {
   it('restates an armed capture without rebuilding anything', async () => {
     const harness = createHarness();
 
-    await expect(harness.arm(CAPTURE_A, HTTP_ONLY_SIGNALS)).resolves.toBe(true);
-    await expect(harness.arm(CAPTURE_A, HTTP_ONLY_SIGNALS)).resolves.toBe(false);
+    await expect(harness.arm(CAPTURE_A, HTTP_ONLY_SIGNALS)).resolves.toMatchObject({
+      armed: true,
+      changed: true,
+    });
+    // A restatement: still armed, nothing changed, nothing rebuilt.
+    await expect(harness.arm(CAPTURE_A, HTTP_ONLY_SIGNALS)).resolves.toMatchObject({
+      armed: true,
+      changed: false,
+    });
 
     expect(harness.providerBuilds()).toBe(1);
     expect(harness.control.stats().enableCount).toBe(1);
@@ -2001,6 +2860,10 @@ describe('applying a server-agent.config payload', () => {
         invalidFrames: before.invalidFrames + 1,
       });
       expect(harness.control.isKindEnabled('http.server'), description).toBe(true);
+
+      // Release the process-wide provider registration before the next payload
+      // gets a harness of its own.
+      await harness.control.disable();
     }
   });
 
@@ -2016,7 +2879,10 @@ describe('applying a server-agent.config payload', () => {
     await expect(
       harness.control.applyConfig({ captureId: CAPTURE_B, signals: ALL_SIGNALS }),
     ).resolves.toBe('disposed');
-    await expect(harness.arm(CAPTURE_B, ALL_SIGNALS)).resolves.toBe(false);
+    await expect(harness.arm(CAPTURE_B, ALL_SIGNALS)).resolves.toMatchObject({
+      armed: false,
+      changed: false,
+    });
     expect(harness.control.captureId).toBeNull();
     expect(harness.providerBuilds()).toBe(1);
   });
@@ -2072,7 +2938,7 @@ describe('the control socket handshake', () => {
     expect(hello.payload).toEqual({
       client: 'server-agent',
       projectRoot: PROJECT_ROOT,
-      version: TRACER_VERSION,
+      version: WIRE_PROTOCOL_VERSION,
       token: CONTROL_TOKEN,
     });
     expect(hello.payload.client).toBe(CONTROL_CLIENT_KIND);
@@ -2080,6 +2946,26 @@ describe('the control socket handshake', () => {
 
     expect(harness.control.stats().helloSent).toBe(1);
     expect(harness.control.stats().connected).toBe(true);
+  });
+
+  it('announces the protocol version, not this package version', () => {
+    const harness = createHarness();
+    harness.control.connect();
+    const socket = socketOf(harness);
+
+    socket.emitOpen();
+
+    const [hello] = socket.frames();
+    // The service parses this field and compares its major component before it
+    // will answer with `server-agent.config`. The package version's major is 0,
+    // which a service on major 1 refuses — the socket closes and the capture
+    // records no server or database spans, with nothing explaining why. So the
+    // value is the protocol's, and it is asserted as a literal here rather than
+    // only against the constant, because a regression that redefined the
+    // constant would otherwise assert itself.
+    expect(hello?.payload.version).toBe('1.0.0');
+    expect(hello?.payload.version).toBe(WIRE_PROTOCOL_VERSION);
+    expect(hello?.payload.version).not.toBe(TRACER_VERSION);
   });
 
   it('opens no second socket while one is live', () => {
@@ -2293,6 +3179,144 @@ describe('the control socket handshake', () => {
 
 /*
  * ---------------------------------------------------------------------------
+ * The ingest transport: where the credential may go, and how hard it retries
+ * ---------------------------------------------------------------------------
+ */
+
+describe('the ingest endpoint trust boundary', () => {
+  /** An endpoint off this machine. `loadPreloadConfig` refuses it outright. */
+  const OFF_MACHINE_INGEST_URL = 'http://telemetry.example.invalid/telemetry/ingest';
+
+  it('sends nothing — no batch, no credential — to an endpoint that is not loopback', async () => {
+    const harness = createHarness();
+    const fetchRig = createFetchRig();
+    // A configuration a caller assembled rather than one the loader produced.
+    // `./config.ts` refuses this endpoint, and the processor refuses it again,
+    // so no path through this class can hand the process-scoped server-agent
+    // credential, or the developer's telemetry, to another origin.
+    const processor = new DebuggenSpanProcessor({
+      gate: harness.control,
+      config: { ...harness.config, ingestUrl: OFF_MACHINE_INGEST_URL },
+      logger: harness.log,
+      fetchImpl: fetchRig.impl,
+    });
+    processors.push(processor);
+
+    await harness.arm(CAPTURE_A, ALL_SIGNALS);
+    processor.onEnd(serverRequestSpan());
+    await processor.forceFlush();
+
+    expect(fetchRig.calls).toEqual([]);
+    expect(processor.stats().postedBatches).toBe(0);
+    expect(processor.stats().postedEvents).toBe(0);
+
+    const diagnostics = logText(harness.log);
+    expect(diagnostics).toContain('loopback');
+    // The host is named so the developer can see what was refused; the URL is
+    // not, because an endpoint that failed the check carries none of
+    // `./config.ts`'s guarantees — including the one about embedded userinfo.
+    expect(diagnostics).toContain('telemetry.example.invalid');
+    expect(diagnostics).not.toContain(OFF_MACHINE_INGEST_URL);
+    expect(diagnostics).not.toContain(CONTROL_TOKEN);
+  });
+
+  it('describes an endpoint it cannot even parse, rather than echoing it', async () => {
+    const harness = createHarness();
+    const fetchRig = createFetchRig();
+    const processor = new DebuggenSpanProcessor({
+      gate: harness.control,
+      config: { ...harness.config, ingestUrl: 'this is not a url' },
+      logger: harness.log,
+      fetchImpl: fetchRig.impl,
+    });
+    processors.push(processor);
+
+    await harness.arm(CAPTURE_A, ALL_SIGNALS);
+    processor.onEnd(serverRequestSpan());
+    await processor.forceFlush();
+
+    expect(fetchRig.calls).toEqual([]);
+    // Arbitrary text is described by its unusability, not quoted: an endpoint
+    // this module could not parse is not something it should be putting in
+    // someone else's dev-server terminal.
+    const diagnostics = logText(harness.log);
+    expect(diagnostics).toContain('(unparseable)');
+    expect(diagnostics).not.toContain('this is not a url');
+  });
+
+  it('posts to the loopback endpoint it was given, and refuses to follow a redirect off it', async () => {
+    const harness = createHarness();
+    const rig = createProcessorRig(harness);
+    await harness.arm(CAPTURE_A, HTTP_ONLY_SIGNALS);
+
+    rig.processor.onEnd(serverRequestSpan());
+    await rig.processor.forceFlush();
+
+    const call = rig.fetches[0];
+    expect(call).toBeDefined();
+    if (call === undefined) {
+      return;
+    }
+
+    expect(requestUrlOf(call)).toBe(harness.config.ingestUrl);
+    expect(authorizationOf(call)).toBe(`Bearer ${CONTROL_TOKEN}`);
+    // A 3xx would move this request, credential and all, to an origin nothing
+    // checked. `fetch` rejects instead, and the batch is retried in place.
+    expect(call.init?.redirect).toBe('error');
+  });
+});
+
+describe('the ingest retry backoff', () => {
+  /** The unjittered delay attempt `attempt` doubles to, before clamping. */
+  const baseFor = (attempt: number): number =>
+    Math.min(RECONNECT_MAX_MS, RECONNECT_MIN_MS * 2 ** (attempt - 1));
+
+  it('spreads every attempt across a ±25 % window, clamped into the shared envelope', () => {
+    // Attempt 2 is where the window is visible: attempt 1's low end falls below
+    // the floor and clamps back to it.
+    expect(computeIngestBackoffMs(2, () => 0)).toBe(baseFor(2) * 0.75);
+    expect(computeIngestBackoffMs(2, () => 1)).toBe(baseFor(2) * 1.25);
+
+    expect(computeIngestBackoffMs(1, () => 0)).toBe(RECONNECT_MIN_MS);
+    expect(computeIngestBackoffMs(1, () => 1)).toBe(RECONNECT_MIN_MS * 1.25);
+
+    // At the ceiling the window is one-sided: the high end clamps down.
+    expect(computeIngestBackoffMs(99, () => 0)).toBe(RECONNECT_MAX_MS * 0.75);
+    expect(computeIngestBackoffMs(99, () => 1)).toBe(RECONNECT_MAX_MS);
+  });
+
+  it('actually varies, which a deterministic envelope would not', () => {
+    const samples = new Set(
+      Array.from({ length: 64 }, () => computeIngestBackoffMs(2, Math.random)),
+    );
+
+    // The property the jitter exists for: a developer restarting the service
+    // has every attached dev server fail its next batch at the same instant,
+    // and identical delays would have them all retry together.
+    expect(samples.size).toBeGreaterThan(1);
+    for (const sample of samples) {
+      expect(sample).toBeGreaterThanOrEqual(baseFor(2) * 0.75);
+      expect(sample).toBeLessThanOrEqual(baseFor(2) * 1.25);
+    }
+  });
+
+  it('stays inside the envelope for a hostile attempt number or randomness source', () => {
+    for (const attempt of [0, 1, -5, Number.NaN, Number.POSITIVE_INFINITY, 1e9]) {
+      for (const random of [(): number => 0, (): number => 1, (): number => Number.NaN]) {
+        const delay = computeIngestBackoffMs(attempt, random);
+        expect(Number.isInteger(delay), `attempt ${String(attempt)} yields whole ms`).toBe(true);
+        expect(delay).toBeGreaterThanOrEqual(RECONNECT_MIN_MS);
+        expect(delay).toBeLessThanOrEqual(RECONNECT_MAX_MS);
+      }
+    }
+    // A source that cannot be sampled falls back to the unjittered delay rather
+    // than producing `NaN` and a timer that never fires.
+    expect(computeIngestBackoffMs(2, () => Number.NaN)).toBe(baseFor(2));
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
  * A second capture after a teardown
  * ---------------------------------------------------------------------------
  */
@@ -2318,7 +3342,10 @@ describe('a capture that follows a teardown', () => {
     expect(orm.disableCount).toBe(1);
     expect(harness.spans.shutdownCount).toBe(1);
 
-    await expect(harness.arm(CAPTURE_B, ALL_SIGNALS)).resolves.toBe(true);
+    await expect(harness.arm(CAPTURE_B, ALL_SIGNALS)).resolves.toMatchObject({
+      armed: true,
+      changed: true,
+    });
 
     // SDK 2.x offers no way back from `shutdown()`, so the second capture must
     // build a fresh provider rather than revive the old one.
@@ -2349,36 +3376,259 @@ describe('a capture that follows a teardown', () => {
     expect(harness.flush.shutdownCount).toBe(0);
   });
 
-  it('keeps recording through a capture replacement, with no teardown in between', async () => {
+  it('exports again through the span processor the provider shutdown closed', async () => {
+    const harness = createHarness();
+    const rig = createProcessorRig(harness);
+    harness.useProcessor(rig.processor);
+
+    await harness.arm(CAPTURE_A, ALL_SIGNALS);
+    trace
+      .getTracer(TRACER_NAME, TRACER_VERSION)
+      .startSpan(SPAN_NAME, { kind: SpanKind.SERVER })
+      .end();
+    expect(rig.processor.stats().convertedCount).toBe(1);
+
+    await harness.control.disable();
+
+    // Not this module's doing: `provider.shutdown()` shuts its processors
+    // down, and the product shares one processor across every provider a
+    // session builds.
+    expect(rig.processor.isShutDown).toBe(true);
+
+    await harness.arm(CAPTURE_B, ALL_SIGNALS);
+
+    expect(rig.processor.isShutDown).toBe(false);
+
+    trace
+      .getTracer(TRACER_NAME, TRACER_VERSION)
+      .startSpan(SPAN_NAME, { kind: SpanKind.SERVER })
+      .end();
+
+    // Without the reopening this is 0 converted and 1 dropped-after-shutdown:
+    // a session whose second reproduction produced no server telemetry.
+    expect(rig.processor.stats().convertedCount).toBe(2);
+    expect(rig.processor.stats().droppedAfterShutdown).toBe(0);
+  });
+
+  it('keeps recording through a capture replacement, flushing the capture it replaces', async () => {
     const harness = createHarness();
 
     await harness.arm(CAPTURE_A, ALL_SIGNALS);
-    await expect(harness.arm(CAPTURE_B, ALL_SIGNALS)).resolves.toBe(true);
+    await expect(harness.arm(CAPTURE_B, ALL_SIGNALS)).resolves.toMatchObject({
+      armed: true,
+      changed: true,
+    });
 
+    // No teardown: the provider and the patches carry straight over.
     expect(harness.providerBuilds()).toBe(1);
     expect(harness.control.captureId).toBe(CAPTURE_B);
 
     trace.getTracer(TRACER_NAME, TRACER_VERSION).startSpan(SPAN_NAME).end();
     expect(harness.spans.onStartCount).toBe(1);
-    expect(harness.flush.forceFlushCount).toBe(0);
+
+    // …but capture A's evidence leaves first. An ingest event carries no
+    // capture id, so anything still buffered when B is armed would be stored
+    // under B (AAP §0.2.3): the flush is what gets A's finished spans out
+    // while A is still the capture the service has open.
+    expect(harness.flush.forceFlushCount).toBe(1);
+    expect(harness.control.stats().captureGeneration).toBe(2);
   });
 
-  it('reports a capture it cannot install machinery for, instead of pretending to record', async () => {
+  it('refuses a capture it cannot install machinery for, instead of pretending to record', async () => {
     const config = activeConfig();
     const log = new RecordingLogger();
     // No factory and no provider: the state `register.ts` leaves behind when the
     // host process could not be given a tracer provider at all.
     const control = new ServerAgentControl({ config, logger: log });
 
-    await expect(
-      control.enableCapture({ captureId: CAPTURE_A, signals: ALL_SIGNALS }),
-    ).resolves.toBe(true);
+    const report = await control.enableCapture({ captureId: CAPTURE_A, signals: ALL_SIGNALS });
 
+    // Not armed, and the gate is shut: a capture with no provider records
+    // nothing, and reporting it as armed would leave every UI in the product
+    // showing a session that is capturing while no span is ever created
+    // (AAP §0.5.5).
+    expect(report.armed).toBe(false);
+    expect(report.changed).toBe(false);
+    expect(report.unavailable.map((entry) => entry.resource)).toEqual([CAPTURE_RESOURCES.provider]);
+    expect(report.unavailable[0]?.hint).toContain('dev server');
+    expect(control.captureId).toBeNull();
+    expect(control.isKindEnabled('http.server')).toBe(false);
+    expect(control.stats().captureGeneration).toBe(0);
     expect(control.stats().providerRegistered).toBe(false);
     expect(control.stats().failures).toBe(1);
     expect(logText(log)).toContain('no tracer provider factory is attached');
     expect(logText(log)).not.toContain(CONTROL_TOKEN);
 
     await control.dispose();
+  });
+
+  it('arms the identical capture on a retry once the provider can be built', async () => {
+    const harness = createHarness();
+    const failure = new Error('the provider refused to install');
+    harness.failNextProviderBuild(failure);
+
+    const refused = await harness.arm(CAPTURE_A, ALL_SIGNALS);
+
+    expect(refused.armed).toBe(false);
+    expect(harness.control.captureId).toBeNull();
+    expect(harness.control.stats().enableCount).toBe(0);
+
+    // The same frame again. The state does not describe a working capture, so
+    // this is a retry and not a restatement — which is the whole point: a
+    // service re-sending its config must be able to recover the session.
+    const retried = await harness.arm(CAPTURE_A, ALL_SIGNALS);
+
+    expect(retried.armed).toBe(true);
+    expect(retried.changed).toBe(true);
+    expect(retried.unavailable).toEqual([]);
+    expect(harness.control.captureId).toBe(CAPTURE_A);
+    expect(harness.control.stats().enableCount).toBe(1);
+    expect(harness.control.stats().providerRegistered).toBe(true);
+    expect(harness.providerBuilds()).toBe(2);
+  });
+
+  it('refuses a capture when another global tracer provider is already registered', async () => {
+    // A second OpenTelemetry setup in the same dev server: an
+    // `instrumentation.ts` that registered its own provider, `@vercel/otel`, a
+    // second preload. `trace.setGlobalTracerProvider` answers `false` and keeps
+    // the incumbent, and `NodeTracerProvider.register()` returns `void`, so
+    // nothing throws and only the global itself can be asked.
+    const foreign = new NodeTracerProvider({});
+    expect(trace.setGlobalTracerProvider(foreign)).toBe(true);
+
+    const harness = createHarness();
+    const refused = await harness.arm(CAPTURE_A, ALL_SIGNALS);
+
+    expect(refused.armed).toBe(false);
+    expect(refused.unavailable.map((entry) => entry.resource)).toEqual([
+      CAPTURE_RESOURCES.provider,
+    ]);
+    expect(refused.unavailable[0]?.reason).toContain('already registered');
+    expect(harness.control.captureId).toBeNull();
+    expect(harness.control.stats().providerRegistered).toBe(false);
+    expect(harness.control.stats().captureGeneration).toBe(0);
+    // The provider it built is held so the teardown still owes it a shutdown.
+    expect(harness.control.stats().pendingCleanup).toContain(CAPTURE_RESOURCES.provider);
+
+    // Remove the conflicting global and send the identical frame again.
+    trace.disable();
+    const armed = await harness.arm(CAPTURE_A, ALL_SIGNALS);
+
+    expect(armed.armed).toBe(true);
+    expect(harness.control.captureId).toBe(CAPTURE_A);
+    expect(harness.control.stats().providerRegistered).toBe(true);
+    // The refused provider was shut down and a second one built.
+    expect(harness.providerBuilds()).toBe(2);
+    expect(trace.getTracer(TRACER_NAME, TRACER_VERSION).startSpan(SPAN_NAME).isRecording()).toBe(
+      true,
+    );
+
+    await foreign.shutdown();
+  });
+
+  it('treats a bootstrap provider that never became the global as not installed', async () => {
+    // What `register.ts` hands over is a provider it *attempted* to register:
+    // `register()` returns `void`, and the API answers a refusal with `false`
+    // rather than by throwing, so the caller cannot pass on an outcome it never
+    // saw. The attachment is therefore checked here, not believed.
+    const bootstrap = new StandInTracerProvider();
+    const harness = createHarness({ provider: bootstrap, attachProviderUnregistered: true });
+
+    expect(harness.control.stats().providerRegistered).toBe(false);
+    expect(logText(harness.log)).toContain('is not the global one');
+    // Held, not dropped: the teardown still owes it a shutdown.
+    expect(harness.control.stats().pendingCleanup).toContain(CAPTURE_RESOURCES.provider);
+
+    // The capture releases it and installs one of its own, which does become
+    // the global because nothing else holds it.
+    const armed = await harness.arm(CAPTURE_A, HTTP_ONLY_SIGNALS);
+
+    expect(armed.armed).toBe(true);
+    expect(bootstrap.shutdownAttempts).toBe(1);
+    expect(harness.providerBuilds()).toBe(1);
+    expect(harness.control.stats().providerRegistered).toBe(true);
+    // And it is the new provider the host's tracers now resolve through.
+    expect(trace.getTracer(TRACER_NAME, TRACER_VERSION).startSpan(SPAN_NAME).isRecording()).toBe(
+      true,
+    );
+  });
+
+  it('refuses a capture whose span processor could not be reopened', async () => {
+    // A processor that stays closed exports nothing, so arming over it would
+    // produce a session that records and sends nothing at all.
+    const harness = createHarness({
+      flushTarget: new RecordingFlushTarget({ staysShutDown: true }),
+    });
+
+    const refused = await harness.arm(CAPTURE_A, ALL_SIGNALS);
+
+    expect(refused.armed).toBe(false);
+    expect(refused.unavailable.map((entry) => entry.resource)).toEqual([
+      CAPTURE_RESOURCES.processor,
+    ]);
+    expect(harness.control.captureId).toBeNull();
+    expect(harness.flush.reopenCount).toBe(1);
+  });
+
+  it('does not re-apply an instrumentation whose earlier toggle failed', async () => {
+    const orm = new RecordingInstrumentation({
+      instrumentationName: DB_INSTRUMENTATION_SCOPES.ormScopePrefix + 'instrumentation',
+      failOnEnable: new Error('the ORM instrumentation refused to patch'),
+    });
+    const harness = createHarness({ instrumentations: [orm] });
+
+    // Armed with the ORM off, so the next capture has to turn it on and fail.
+    await harness.arm(CAPTURE_A, { ...ALL_SIGNALS, prisma: false });
+    await harness.arm(CAPTURE_B, ALL_SIGNALS);
+    expect(orm.enableCount).toBe(1);
+
+    // A third capture asks for the same signal. The SDK's `enable()` sets its
+    // flag before it patches, so the flag now reads "enabled" and a second call
+    // would return without patching anything — while a call made after a failed
+    // *removal* would patch over a wrapper that is still there. Neither can be
+    // reported as the signal being available.
+    const again = await harness.arm(CAPTURE_C, ALL_SIGNALS);
+
+    expect(again.armed).toBe(true);
+    expect(again.unavailable.map((entry) => entry.resource)).toEqual([
+      CAPTURE_RESOURCES.ormInstrumentation,
+    ]);
+    expect(again.unavailable[0]?.hint).toContain('Restart the dev server');
+    // Not called a second time, and still reported as something to clean up.
+    expect(orm.enableCount).toBe(1);
+    expect(harness.control.stats().pendingCleanup).toContain(CAPTURE_RESOURCES.ormInstrumentation);
+
+    // The teardown does the removal the SDK's flag makes possible, and verifies
+    // it, so the entry is knowable again.
+    const report = await harness.control.disable();
+    expect(report.status).toBe('clean');
+    // Twice in the session: once when the first capture asked for the ORM to be
+    // off, and once here. The second call does real work — the failed `enable()`
+    // left the SDK's flag reading "enabled" — and is verified against that flag.
+    expect(orm.disableCount).toBe(2);
+    expect(orm.patched).toBe(false);
+  });
+
+  it('arms a capture whose database instrumentation refuses, and names what it lost', async () => {
+    const orm = new RecordingInstrumentation({
+      instrumentationName: DB_INSTRUMENTATION_SCOPES.ormScopePrefix + 'instrumentation',
+      failOnEnable: new Error('the ORM instrumentation refused to patch'),
+    });
+    const harness = createHarness({ instrumentations: [orm] });
+
+    // Armed with the ORM off, so the first capture must turn it on and fail.
+    await harness.arm(CAPTURE_A, { ...ALL_SIGNALS, prisma: false });
+    const report = await harness.arm(CAPTURE_B, ALL_SIGNALS);
+
+    // Degraded, not refused: the provider is up, so the request, route and
+    // function signals still record (AAP §0.5.5 — "continuing with").
+    expect(report.armed).toBe(true);
+    expect(report.unavailable.map((entry) => entry.resource)).toEqual([
+      CAPTURE_RESOURCES.ormInstrumentation,
+    ]);
+    expect(report.unavailable[0]?.signals).toEqual(['prisma']);
+    expect(harness.control.captureId).toBe(CAPTURE_B);
+    expect(harness.control.isKindEnabled('http.server')).toBe(true);
+    expect(logText(harness.log)).toContain('could not enable prisma');
   });
 });

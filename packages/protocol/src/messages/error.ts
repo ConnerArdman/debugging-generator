@@ -15,7 +15,7 @@
  * it. AAP §0.9.1 lists `packages/protocol/src/messages/**` among the
  * single-definition schema sources, so a second declaration of this shape — in
  * the service, in either extension, in the panel or in a test helper — is a
- * defect rather than a convenience. Three modules in this package consume it
+ * defect rather than a convenience. Three modules in this package build on it
  * instead of restating it:
  *
  * - `envelope.ts` reaches it through `./index.js`, which spreads
@@ -26,9 +26,13 @@
  *   route that refuses a request answers with exactly the object a WebSocket
  *   client would have received, which is why a client needs one error renderer
  *   rather than two.
- * - `./instrumentation.ts` nests it inside the `instrumentation.failed` payload
- *   (`{ sessionId, error: { code, message, hint } }`), the one place AAP §0.4.2
- *   embeds this shape in a larger message.
+ * - `./instrumentation.ts` nests an error object inside the
+ *   `instrumentation.failed` payload (`{ sessionId, error: { code, message,
+ *   hint } }`), the one place AAP §0.4.2 embeds an error inside a larger
+ *   message. That nest is also the reason the generic frame below carries no
+ *   `hint`: AAP §0.4.2 declares the recovery hint on the messages it
+ *   explicitly gives one to, and the generic `error` frame is specified
+ *   exactly as `{ code, message, ref? }`.
  *
  * ## Why this module imports nothing from its own folder
  *
@@ -51,17 +55,24 @@
  *
  * ## Why the schema, and not `DebuggenError`, is the wire contract
  *
- * The shape below is {@link DebuggenError.toPayload}'s return value plus one
- * field, `ref`. That is deliberate: `DebuggenError` is a class, and the four
- * cooperating processes — the local service, the VS Code extension host and its
- * webview, the Chrome service worker and its DevTools panel, and the Node
- * preload inside the target project's dev server — each bundle their own copy of
- * it. An `instanceof` check cannot cross that boundary (which is why the class
- * carries a string-keyed brand at all), so what crosses is a plain JSON object
- * validated against this schema at the receiving end. The compile-time drift
- * guard below ({@link ErrorPayloadDriftAssertions}) ties the two together, so a
- * field added to the class without being added here fails the build instead of
- * being dropped silently by the parser.
+ * The shape below is {@link DebuggenError.toPayload}'s return value *minus* its
+ * `hint`, plus one field, `ref`. That is deliberate: `DebuggenError` is a class,
+ * and the four cooperating processes — the local service, the VS Code extension
+ * host and its webview, the Chrome service worker and its DevTools panel, and
+ * the Node preload inside the target project's dev server — each bundle their
+ * own copy of it. An `instanceof` check cannot cross that boundary (which is why
+ * the class carries a string-keyed brand at all), so what crosses is a plain
+ * JSON object validated against this schema at the receiving end. The
+ * compile-time drift guard below ({@link ErrorPayloadDriftAssertions}) ties the
+ * two together across both of those deliberate differences, so a field added to
+ * the class without being added here fails the build instead of being dropped
+ * silently by the parser.
+ *
+ * Because the class carries one field this frame does not, handing
+ * `toPayload()`'s object straight to a strict parser is a rejection waiting to
+ * happen. {@link toErrorPayload} is the sanctioned crossing: it projects a
+ * `DebuggenError` into exactly the fields this schema accepts, so every producer
+ * has one way over the boundary rather than a local spread each.
  *
  * ## Two product guarantees this file is part of
  *
@@ -114,10 +125,10 @@ import { protocolParseError } from '../version.js';
 //
 // The canonical bounds of this folder, stated once each as a named constant so
 // that the schema, the message text a rejection carries and this comment cannot
-// drift apart. Every sibling message module uses the same three numbers for the
-// same three kinds of field, which is what keeps a payload assembled by one
-// module and re-validated by another from being refused on a length rule the
-// sender never knew about.
+// drift apart. Every sibling message module uses the same numbers for the same
+// kinds of field, which is what keeps a payload assembled by one module and
+// re-validated by another from being refused on a length rule the sender never
+// knew about.
 //
 // They exist at all because a bound is the cheapest defence a parser has: a
 // frame that arrived with a megabyte in its `message` field is refused on a
@@ -134,15 +145,6 @@ import { protocolParseError } from '../version.js';
  * at ten issues with bounded path segments and fragments.
  */
 const MAX_MESSAGE_LENGTH = 2000;
-
-/**
- * The ceiling on {@link ErrorPayload.hint}.
- *
- * A hint is one actionable instruction ("Reload the page and start capture
- * again"), not prose, so half the message budget is ample. Anything longer is a
- * sign the sender put a diagnostic dump where a next step belongs.
- */
-const MAX_HINT_LENGTH = 1000;
 
 /**
  * The ceiling on {@link ErrorPayload.ref}.
@@ -187,8 +189,8 @@ export const errorCodeSchema = z.enum([...DEBUGGEN_ERROR_CODES], {
 });
 
 /**
- * The `error` message payload: `{ code, message, ref? }` plus the optional
- * developer-facing `hint` that `DebuggenError.toPayload()` forwards.
+ * The `error` message payload: exactly `{ code, message, ref? }`, the three
+ * fields and only the three fields AAP §0.4.2 specifies for this frame.
  *
  * Strict by construction. `z.strictObject` refuses an unrecognised key rather
  * than stripping it, for the reason the whole package parses strictly: a sender
@@ -197,6 +199,16 @@ export const errorCodeSchema = z.enum([...DEBUGGEN_ERROR_CODES], {
  * a loud failure — and an unrecognised key is the one thing a rejection is
  * allowed to *name*, since `describeZodIssues` renders key names while never
  * rendering values.
+ *
+ * Strictness is also what keeps this frame at three fields rather than letting
+ * it widen by accident. `DebuggenError.toPayload()` returns a fourth,
+ * developer-facing `hint`, and a producer that forwards that object verbatim is
+ * refused here by name instead of quietly establishing a wire contract wider
+ * than the specified one. The hint is not lost: it stays on the local error for
+ * logging, and it travels on the messages AAP §0.4.2 declares it on — the
+ * `instrumentation.failed` payload's nested `{ code, message, hint }` of
+ * `./instrumentation.ts`. {@link toErrorPayload} is how a producer gets from one
+ * to the other.
  *
  * Each bound below has its own reason, and none of the fields is repaired: a
  * missing `message` is a rejection, never an empty string supplied on the
@@ -226,28 +238,6 @@ export const errorPayloadSchema = z.strictObject({
     .max(MAX_MESSAGE_LENGTH, {
       error: `expected an error message of at most ${MAX_MESSAGE_LENGTH} characters`,
     }),
-
-  /**
-   * The developer-facing recovery hint: the next step, not a restatement of the
-   * failure.
-   *
-   * This is the field the graceful-failure table of AAP §0.5.5 fills — "Check
-   * ANTHROPIC_API_KEY or switch DEBUGGEN_PROVIDER", "Interact with the page
-   * while capture is running, then Capture again", the exact relaunch command
-   * when a dev server was started without the telemetry preload — and it is
-   * what both user interfaces render beneath the message.
-   *
-   * Optional because many failures have no useful next step, and absent rather
-   * than empty when they do not: `DebuggenError.toPayload()` omits the key
-   * instead of sending `undefined`, and this schema neither requires nor
-   * invents it. Bounded by {@link MAX_HINT_LENGTH}.
-   */
-  hint: z
-    .string({ error: 'expected a hint string' })
-    .max(MAX_HINT_LENGTH, {
-      error: `expected a hint of at most ${MAX_HINT_LENGTH} characters`,
-    })
-    .optional(),
 
   /**
    * The correlation reference: what this error is *about*.
@@ -284,15 +274,16 @@ export type ErrorPayload = z.infer<typeof errorPayloadSchema>;
 // ---------------------------------------------------------------------------
 // Compile-time drift guard
 //
-// `DebuggenError.toPayload()` is the producer of this payload in every process:
+// `DebuggenError.toPayload()` is the source of this payload in every process:
 // the service, the extension host, the DevTools panel and the browser agent all
-// send what that method returns. The method and this schema are declared in
-// different packages, so nothing but the assertion below stops them from
-// drifting — and the failure mode of drift is silent, because a strict parser
-// at the receiving end drops an added field by refusing the frame, and a
-// removed field by rejecting a payload the sender believed was complete.
+// report a failure by projecting what that method returns through
+// `toErrorPayload` below. The method and this schema are declared in different
+// packages, so nothing but the assertion below stops them from drifting — and
+// the failure mode of drift is silent, because a strict parser at the receiving
+// end drops an added field by refusing the frame, and a removed field by
+// rejecting a payload the sender believed was complete.
 //
-// Everything here is type-level: four helper aliases, no runtime code, no new
+// Everything here is type-level: helper aliases, no runtime code, no new
 // dependency, nothing emitted into the bundle.
 // ---------------------------------------------------------------------------
 
@@ -310,10 +301,10 @@ type Expect<TAssertion extends true> = TAssertion;
  * Restates every property of `T` as required-and-possibly-`undefined`.
  *
  * This normalisation exists because the repository compiles with
- * `exactOptionalPropertyTypes`, under which `{ hint?: string }` — what the
- * hand-written class returns — and `{ hint?: string | undefined }` — what Zod
- * infers for `.optional()` — are *not* mutually assignable even though they
- * describe the same wire bytes. Comparing the normalised forms asks the question that
+ * `exactOptionalPropertyTypes`, under which `{ ref?: string }` — how a
+ * hand-written type spells an optional field — and `{ ref?: string | undefined }`
+ * — what Zod infers for `.optional()` — are *not* mutually assignable even though
+ * they describe the same wire bytes. Comparing the normalised forms asks the question that
  * actually matters (are these the same fields carrying the same value types?)
  * instead of the question the exactness flag answers (may this property be
  * present holding `undefined`?), and {@link OptionalKeysOf} covers the second
@@ -357,21 +348,50 @@ type Identical<A, B> =
 type DebuggenErrorWirePayload = ReturnType<DebuggenError['toPayload']>;
 
 /**
- * {@link ErrorPayload} as `DebuggenError.toPayload()` produces it — that is,
- * without the `ref` this protocol adds on top of the class's own fields.
+ * {@link ErrorPayload} minus the `ref` this protocol adds on top of the class's
+ * own fields — the schema side of the comparison below, since a correlation
+ * reference is something the *sender of a frame* knows and `DebuggenError` does
+ * not.
  */
 type ErrorPayloadWithoutRef = Omit<ErrorPayload, 'ref'>;
 
 /**
- * The compile-time assertion that this schema still mirrors
- * `DebuggenError.toPayload()`: same fields, same value types, same optionality.
+ * {@link DebuggenErrorWirePayload} as this frame carries it — that is, without
+ * the `hint` the generic `error` message deliberately does not transmit.
  *
- * Add a field to the class and the first element becomes `false`; change a
- * field from required to optional (or back) and the second does; either way
- * this file stops compiling, which is the intent — the alternative is a field
- * that exists on one side of a process boundary and is discarded at the other.
- * `ref` is excluded because it is this protocol's own addition: a correlation
- * reference is something the *sender of a frame* knows and the class does not.
+ * The exclusion is the mirror image of {@link ErrorPayloadWithoutRef}'s, and it
+ * is just as deliberate: AAP §0.4.2 specifies this payload exactly as
+ * `{ code, message, ref? }` and gives the recovery hint to the messages that
+ * declare one of their own (`instrumentation.failed`'s nested
+ * `{ code, message, hint }`), so the class keeps `hint` for logging and for
+ * those messages while the wire schema below does not accept it. Projecting it
+ * away here — rather than dropping the assertion — is what keeps the guard
+ * sensitive to everything else: `Omit` removes only this one known difference,
+ * so any *other* field added to `DebuggenError.toPayload()` still reaches the
+ * comparison and still fails the build.
+ */
+type DebuggenErrorWirePayloadWithoutHint = Omit<DebuggenErrorWirePayload, 'hint'>;
+
+/**
+ * The compile-time assertion that this schema still mirrors
+ * `DebuggenError.toPayload()` across the fields the two are meant to share:
+ * same fields, same value types, same optionality.
+ *
+ * Add a field to the class and the first element becomes `false`; change
+ * `code`'s or `message`'s type and it does too; move a shared field between
+ * required and optional and the second element does; either way this file stops
+ * compiling, which is the intent — the alternative is a field that exists on one
+ * side of a process boundary and is discarded at the other.
+ *
+ * Exactly two fields are projected out of the comparison, one on each side, and
+ * each for a documented reason. `ref` is excluded from the schema side because
+ * it is this protocol's own addition: a correlation reference is something the
+ * *sender of a frame* knows and the class does not (see
+ * {@link ErrorPayloadWithoutRef}). `hint` is excluded from the class side
+ * because the generic `error` frame deliberately does not carry it: AAP §0.4.2
+ * specifies this payload exactly as `{ code, message, ref? }` (see
+ * {@link DebuggenErrorWirePayloadWithoutHint}). Nothing else is projected away,
+ * which is what leaves the guard able to fail.
  *
  * It is exported for a mechanical reason worth stating, since it is otherwise
  * an odd thing to publish: the repository compiles with `noUnusedLocals` and
@@ -381,15 +401,93 @@ type ErrorPayloadWithoutRef = Omit<ErrorPayload, 'ref'>;
  * and it gives the assertion a name a reader can search for.
  */
 export type ErrorPayloadDriftAssertions = [
-  Expect<MutuallyAssignable<DebuggenErrorWirePayload, ErrorPayloadWithoutRef>>,
+  Expect<MutuallyAssignable<DebuggenErrorWirePayloadWithoutHint, ErrorPayloadWithoutRef>>,
   Expect<
-    Identical<OptionalKeysOf<DebuggenErrorWirePayload>, OptionalKeysOf<ErrorPayloadWithoutRef>>
+    Identical<
+      OptionalKeysOf<DebuggenErrorWirePayloadWithoutHint>,
+      OptionalKeysOf<ErrorPayloadWithoutRef>
+    >
   >,
 ];
 
 // ---------------------------------------------------------------------------
-// Parse helper and payload registry
+// Wire projection, parse helper and payload registry
 // ---------------------------------------------------------------------------
+
+/**
+ * Projects a local `DebuggenError` into the wire payload this frame carries.
+ *
+ * This is the producer-side counterpart of {@link parseErrorPayload}, and it
+ * exists because the class and the frame are deliberately not the same shape.
+ * `DebuggenError.toPayload()` returns `{ code, message, hint? }` — the idiom
+ * `packages/shared/src/errors.ts` documents is
+ * `send({ type: 'error', payload: error.toPayload() })` — while AAP §0.4.2
+ * specifies this payload exactly as `{ code, message, ref? }` and
+ * {@link errorPayloadSchema} is strict, so that object is refused at the
+ * receiving end on its `hint` key. Every process that reports a failure
+ * therefore needs one sanctioned way across the boundary; this is it, rather
+ * than a hand-written spread in the service, in each extension and in the panel,
+ * three of which would eventually disagree.
+ *
+ * The `hint` is dropped here, not lost. It stays on the `DebuggenError` for this
+ * process's own logging, and it travels between processes on the messages AAP
+ * §0.4.2 declares it on — the `instrumentation.failed` payload's nested
+ * `{ code, message, hint }`, which `./instrumentation.ts` owns. A caller that
+ * needs a separately rendered next step sends that message, not this frame.
+ * Nothing in AAP §0.5.5 is lost either way: every developer-facing message that
+ * table specifies for a generic failure states its recovery instruction inside
+ * the sentence itself ("Model provider unavailable (‹code›). Check
+ * ANTHROPIC_API_KEY or switch DEBUGGEN_PROVIDER."), so the instruction reaches
+ * the developer through `message` and no extra field is required to carry it.
+ *
+ * Two properties are worth stating because callers depend on them. It validates
+ * nothing: both inputs are already typed — `code` comes from the class's own
+ * `DebuggenErrorCode` and `message` from `Error` — so there is nothing left for
+ * a parser to establish, and the receiving end validates the frame anyway.
+ * Bounds are consequently *not* enforced here: an over-long `message` is refused
+ * by the schema at the boundary rather than truncated on the sender's behalf,
+ * because this module validates and never rewrites (see the byte-faithful rule
+ * in the module header). And an absent `ref` is an absent *key*, never a key
+ * holding `undefined`, so the payload survives a JSON round trip unchanged and
+ * re-parses identically.
+ *
+ * @param error The failure to report, normalised into a `DebuggenError` (use
+ * `DebuggenError.from` on anything caught at a boundary).
+ * @param ref Optional correlation reference: the `id` of the envelope that
+ * provoked the failure, or the id of the session artifact it is about. Omitted
+ * from the result when not supplied.
+ * @returns A plain {@link ErrorPayload} carrying `code`, `message` and, when
+ * supplied, `ref`.
+ *
+ * @example
+ * ```ts
+ * try {
+ *   await loadThing();
+ * } catch (caught) {
+ *   const error = DebuggenError.from(caught, 'STORE_ERROR');
+ *   log.warn(error.message, { hint: error.hint });
+ *   send({ type: 'error', payload: toErrorPayload(error, request.id) });
+ * }
+ * ```
+ */
+export function toErrorPayload(error: DebuggenError, ref?: string): ErrorPayload {
+  // Destructured rather than spread so the projection is explicit: `hint` is
+  // named nowhere below, which is exactly what the wire contract requires.
+  const { code, message } = error.toPayload();
+
+  const payload: ErrorPayload = { code, message };
+
+  // Assigned conditionally rather than written as `ref` in the literal above:
+  // under `exactOptionalPropertyTypes` a key holding `undefined` is not
+  // assignable to `ref?: string` at all, and it would leave the sender holding a
+  // different shape from the receiver — `JSON.stringify` omits such a key, so
+  // the object that crossed the wire would not equal the one built here.
+  if (ref !== undefined) {
+    payload.ref = ref;
+  }
+
+  return payload;
+}
 
 /**
  * Validates an unknown value as an {@link ErrorPayload}, without throwing.
@@ -429,7 +527,7 @@ export type ErrorPayloadDriftAssertions = [
  *   log.warn(parsed.error.message);
  *   return;
  * }
- * showFailure(parsed.value.code, parsed.value.message, parsed.value.hint);
+ * showFailure(parsed.value.code, parsed.value.message, parsed.value.ref);
  * ```
  */
 export function parseErrorPayload(value: unknown): Result<ErrorPayload, DebuggenError> {
@@ -444,7 +542,7 @@ export function parseErrorPayload(value: unknown): Result<ErrorPayload, Debuggen
       'PROTOCOL_INVALID_MESSAGE',
       'Invalid error payload',
       parsed.error.issues,
-      'An error payload carries a code from the @debuggen/shared vocabulary, a non-empty message, and optional hint and ref fields.',
+      'An error payload carries a code from the @debuggen/shared vocabulary, a non-empty message and an optional ref, and nothing else.',
     ),
   );
 }

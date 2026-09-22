@@ -136,10 +136,15 @@ interface Props {
  * the same notice twice. That tone also fixes the accent and title colour, so the failure is
  * carried by words as much as by colour.
  *
- * The title is the headline, and this file adds no heading element of its own. `Alert` renders its
- * title as a paragraph by contract, precisely so that a notice dropped into any route leaves the
- * document outline alone; a competing `<h1>` here would repeat the same sentence to a screen
- * reader that has just been interrupted with it.
+ * The title is the headline, and `titleAs="h1"` is what makes it the route's heading. A notice
+ * dropped inside a page that has its own title renders that headline as a paragraph, which is the
+ * prop's default and why every other `Alert` in this application leaves the document outline
+ * alone. Here the notice IS the page: nothing else on the route declares a title, so rendering the
+ * headline as an `h1` is what puts it in the outline, where a reader who arrives after the
+ * announcement - or who navigates by heading, or who returns to this page later - can still find
+ * what failed. No second heading is added anywhere in this file, so the headline is rendered once
+ * and read once, and the announcement is unchanged: the role and politeness still come from
+ * `Alert`'s `danger` tone alone, so there is exactly one assertive announcement either way.
  *
  * The two controls sit in `Alert`'s `actions` slot, which is a wrapping row: the primary control
  * retries, and the anchor leaves. The anchor carries no class because a link's appearance belongs
@@ -165,6 +170,7 @@ export default function StorefrontErrorBoundary({ error, reset }: Props) {
       <Alert
         tone="danger"
         title="Something went wrong"
+        titleAs="h1"
         actions={
           <>
             <Button

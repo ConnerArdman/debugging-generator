@@ -103,7 +103,11 @@ import {
   walkTrace,
 } from '../correlation/tree.js';
 import type { TraceNode, TraceNodeLineage, TraceTree } from '../correlation/tree.js';
-import { ATTRIBUTE_VALUE_TYPES, MAX_PREVIEW_LENGTH } from '../schema/attributes.js';
+import {
+  ATTRIBUTE_VALUE_TYPES,
+  MAX_PREVIEW_LENGTH,
+  TRANSITION_SOURCES,
+} from '../schema/attributes.js';
 // Type-only: these key tuples are consulted by the *compiler*, which checks the
 // key literals bound below against the sets the catalog declares. There is
 // nothing to consult at runtime, and a value import would pull the whole
@@ -115,7 +119,11 @@ import type {
   ROUTE_HANDLER_ATTRIBUTE_KEYS,
   STATE_ATTRIBUTE_KEYS,
 } from '../schema/attributes.js';
-import type { AttributeValueSummary, AttributeValueType } from '../schema/attributes.js';
+import type {
+  AttributeValueSummary,
+  AttributeValueType,
+  TransitionSource,
+} from '../schema/attributes.js';
 import type { TelemetryEvent } from '../schema/event.js';
 import { STATE_KINDS, TELEMETRY_TIERS } from '../schema/kinds.js';
 import type { TelemetryKind, TelemetryTier } from '../schema/kinds.js';
@@ -183,6 +191,31 @@ const STATE_NEXT_VALUE_KEY: StateAttributeKey = 'nextValue';
 
 /** The event the producer itself blamed for the transition, when it knew. */
 const STATE_TRIGGER_EVENT_ID_KEY: StateAttributeKey = 'triggerEventId';
+
+/**
+ * The span the producer itself blamed, when what it held was a span id.
+ *
+ * The second of the catalog's two trigger keys: `../browser/state.ts` knows the
+ * interaction's — or a settled request's — span id at commit time and cannot
+ * know its event id, so both keys exist and {@link resolveTrigger} reads this
+ * one through the span index.
+ */
+const STATE_TRIGGER_SPAN_ID_KEY: StateAttributeKey = 'triggerSpanId';
+
+/** Which dimension changed: a member of {@link TRANSITION_SOURCES}. */
+const STATE_TRANSITION_SOURCE_KEY: StateAttributeKey = 'transitionSource';
+
+/** The render span the transition was observed inside, as the producer saw it. */
+const STATE_RENDER_SPAN_ID_KEY: StateAttributeKey = 'renderSpanId';
+
+/** The fiber instance whose value changed, so two copies are two rows. */
+const STATE_FIBER_ID_KEY: StateAttributeKey = 'fiberId';
+
+/** Whether the producer's transition list was cut by one of its bounds. */
+const STATE_TRUNCATED_KEY: StateAttributeKey = 'truncated';
+
+/** How many reported transitions the producer's bounds left without an event. */
+const STATE_DROPPED_TRANSITIONS_KEY: StateAttributeKey = 'droppedTransitions';
 
 /** The DOM event type of an interaction (`click`, `keydown`, …). */
 const INTERACTION_EVENT_TYPE_KEY: InteractionAttributeKey = 'event.type';
@@ -508,6 +541,35 @@ function asNonEmptyString(value: unknown): string | undefined {
 /** A non-negative integer, or `undefined` — including for `NaN` and a fraction. */
 function asNonNegativeInteger(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : undefined;
+}
+
+/**
+ * A member of the closed transition-source vocabulary, or `undefined`.
+ *
+ * Strict, for the reason the vocabulary is closed: `state` and `context` say
+ * whose doing a change was — the component's own, or a provider's — and a value
+ * outside the pair is a producer this build does not understand. Absent is the
+ * honest answer to that, because a guess here would attribute a provider's
+ * change to the component reading it.
+ */
+function asTransitionSource(value: unknown): TransitionSource | undefined {
+  const reported = asNonEmptyString(value);
+  if (reported === undefined) {
+    return undefined;
+  }
+  return TRANSITION_SOURCES.find((source) => source === reported);
+}
+
+/**
+ * A disclosure flag, which a producer only ever sets to `true`.
+ *
+ * Exactly `true` passes; anything else — `false`, `'true'`, `1`, absence — is
+ * `undefined`, so the field is omitted rather than carrying a claim the
+ * producer did not make. A truncation flag is read as "the producer said this
+ * list is incomplete", and only the literal says that.
+ */
+function asTrueFlag(value: unknown): true | undefined {
+  return value === true ? true : undefined;
 }
 
 /**
@@ -1359,11 +1421,30 @@ export const MAX_TRIGGER_LOOKUP_HOPS = 8;
  * ## The trigger links to an event, not to an object
  *
  * `triggerEventId` is what the viewer's trigger column links to, and it is
- * populated whenever the producer named a trigger or a parent (or lineage)
- * span could be resolved. The three descriptive fields beside it are filled
- * only when that event is in the slice being aggregated — a producer-named
- * trigger that was filtered out still gets its id, so the link works, without
- * borrowing a name from a different event.
+ * populated whenever the producer named a trigger **event** or a parent (or
+ * lineage) span could be resolved. It is only ever a real event id: a producer
+ * that knows the trigger's *span* id writes `triggerSpanId` instead (the
+ * catalog's two trigger keys are two identifier spaces, not two spellings), and
+ * that span id reaches `triggerSpanId` here even when the span it names is
+ * outside the slice — a link into the trace still works, while inventing an
+ * event id for it would not. `triggerName` and `triggerKind` are filled only
+ * when the trigger's event is in the slice being aggregated, so no row borrows
+ * a name from a different event.
+ *
+ * ## `truncated` is about the list, and marks a row that is not a transition
+ *
+ * `truncated` is the producer's disclosure that the transition list this row
+ * belongs to is **incomplete** — a bound cut it — and `droppedTransitions` is
+ * how many reported transitions it left without an event of their own. Neither
+ * says anything about this row's values, and neither is related to the
+ * truncation of a single preview.
+ *
+ * `../browser/state.ts` also emits one bounded *sentinel* per capture when its
+ * per-capture bound left no transition to mark: a row with `truncated` set, no
+ * `transitionSource`, no value previews and therefore `changed: false`. A
+ * viewer must render such a row as the disclosure it is — "transitions were
+ * dropped" — and never as a value transition, which is exactly what
+ * `changed: false` has always meant here.
  */
 export interface StateTransition {
   /** Stable identity of the row, equal to `eventId`; see {@link TimelineRow}. */
@@ -1396,12 +1477,42 @@ export interface StateTransition {
   readonly changed: boolean;
   /** The event the transition is attributed to; what the viewer links to. */
   readonly triggerEventId?: EventId;
-  /** That event's span id, when it is in the aggregated slice. */
+  /**
+   * The trigger's span id: the producer's own `triggerSpanId` when it named
+   * one, otherwise the span of the event this row was attributed to. Set even
+   * when that span is outside the slice.
+   */
   readonly triggerSpanId?: SpanId;
   /** That event's name, when it is in the slice. */
   readonly triggerName?: string;
   /** That event's kind, when it is in the slice. */
   readonly triggerKind?: TelemetryKind;
+  /**
+   * Which dimension changed — the fiber's own hook state, or a context value it
+   * consumes — when the producer reported a recognised one. Absent on the
+   * truncation sentinel, which describes no value.
+   */
+  readonly transitionSource?: TransitionSource;
+  /** The render span the transition was observed inside, as the producer reported it. */
+  readonly renderSpanId?: SpanId;
+  /**
+   * The fiber instance whose value changed, when the producer resolved one.
+   *
+   * What separates two mounted copies of one component, which `component`
+   * alone groups together.
+   */
+  readonly fiberId?: number;
+  /**
+   * `true` when the producer disclosed that this row's transition list was cut
+   * by a bound; see the interface documentation.
+   */
+  readonly truncated?: boolean;
+  /**
+   * How many reported transitions the producer's bounds left without an event,
+   * when it disclosed a count. A floor, not a total: the producer reports what
+   * it had dropped at the moment it emitted the disclosure.
+   */
+  readonly droppedTransitions?: number;
   /** Where in the developer's project the hook lives, when resolved. */
   readonly source?: SourceLocation;
 }
@@ -1435,6 +1546,11 @@ interface MutableStateTransition {
   triggerSpanId?: SpanId;
   triggerName?: string;
   triggerKind?: TelemetryKind;
+  transitionSource?: TransitionSource;
+  renderSpanId?: SpanId;
+  fiberId?: number;
+  truncated?: boolean;
+  droppedTransitions?: number;
   source?: SourceLocation;
 }
 
@@ -1504,30 +1620,59 @@ function projectValueSummary(value: unknown): ValueProjection {
   return projection;
 }
 
-/** The event a transition is attributed to, and whether it is in the slice. */
+/**
+ * What a transition was attributed to: an event id to link to, a span id to
+ * point at, and the event itself when the slice contains it.
+ *
+ * All three members are optional because the routes below know different
+ * amounts. A producer that named a trigger **event** yields an id whether or
+ * not the slice holds it; a producer that named a trigger **span** outside the
+ * slice yields only that span id, and inventing an event id for it would put a
+ * dead link in the viewer's trigger column; every route that resolves an event
+ * yields all three. A resolution with no member at all is never returned —
+ * {@link resolveTrigger} answers `undefined` for "nothing to attribute this to".
+ */
 interface TriggerResolution {
-  /** The id to link to; always present. */
-  readonly eventId: EventId;
+  /** The event id to link to, when a real one is known. */
+  readonly eventId?: EventId | undefined;
+  /** The trigger's span id: the producer's, or the resolved event's. */
+  readonly spanId?: SpanId | undefined;
   /** The event itself, when the slice contains it. */
   readonly event?: TelemetryEvent | undefined;
+}
+
+/** The resolution of one event in the slice: its id, its span and itself. */
+function triggerFromEvent(event: TelemetryEvent): TriggerResolution {
+  return { eventId: event.id, spanId: event.spanId, event };
 }
 
 /**
  * Chooses the operation a transition is attributed to, in a fixed preference
  * order.
  *
- * 1. **The producer's own answer.** `triggerEventId` on the event is what the
- *    page observed; nothing derived here can beat it, and it is honoured even
- *    when the named event is outside the slice.
- * 2. **The nearest ancestor that is not itself a state transition.** A burst of
+ * 1. **The producer's own answer, as an event id.** `triggerEventId` on the
+ *    event is what the page observed; nothing derived here can beat it, and it
+ *    is honoured even when the named event is outside the slice.
+ * 2. **The producer's own answer, as a span id.** `triggerSpanId` is the same
+ *    answer from a producer that holds a span id rather than an event id — the
+ *    page agent, which knows the interaction's or the settled request's span at
+ *    commit time. Resolved through the span index, so the row gets the event's
+ *    id, name and kind; a span outside the slice still yields the span id,
+ *    because the producer's direct trigger must not be discarded in favour of a
+ *    guess.
+ * 3. **The nearest ancestor that is not itself a state transition.** A burst of
  *    transitions in one commit chains through each other; the useful trigger is
  *    the commit, the settled request or the interaction above them.
- * 3. **A lineage candidate.** When the parent chain leads nowhere and the
+ * 4. **A lineage candidate.** When the parent chain leads nowhere and the
  *    producer recorded alternative continuation parents, the first resolvable
  *    one is a better answer than none — the ambiguity itself is carried on the
  *    timeline row, which is where a view can draw it.
- * 4. **The nearest resolvable ancestor at all**, even another transition: the
+ * 5. **The nearest resolvable ancestor at all**, even another transition: the
  *    span directly above is still what a reader sees above the row.
+ *
+ * The two producer-named routes come first because they are observations rather
+ * than inferences: the page knew what it was responding to, and the parent
+ * chain below is this module reconstructing that from span parentage.
  *
  * Three malformations end the walk rather than trapping it — a span that is its
  * own parent, a cycle among ancestors, and a parent that never arrived — and
@@ -1542,7 +1687,14 @@ function resolveTrigger(
 ): TriggerResolution | undefined {
   const reported = asNonEmptyString(readAttribute(attributes, STATE_TRIGGER_EVENT_ID_KEY));
   if (reported !== undefined && reported !== event.id) {
-    return { eventId: reported, event: eventsById.get(reported) };
+    const named = eventsById.get(reported);
+    return named === undefined ? { eventId: reported } : triggerFromEvent(named);
+  }
+
+  const reportedSpanId = asNonEmptyString(readAttribute(attributes, STATE_TRIGGER_SPAN_ID_KEY));
+  if (reportedSpanId !== undefined && reportedSpanId !== event.spanId) {
+    const named = spansBySpanId.get(reportedSpanId);
+    return named === undefined ? { spanId: reportedSpanId } : triggerFromEvent(named);
   }
 
   const visited = new Set<SpanId>([event.spanId]);
@@ -1564,7 +1716,7 @@ function resolveTrigger(
       nearest = ancestor;
     }
     if (!STATE_KIND_SET.has(ancestor.kind)) {
-      return { eventId: ancestor.id, event: ancestor };
+      return triggerFromEvent(ancestor);
     }
 
     spanId = ancestor.parentSpanId;
@@ -1578,13 +1730,13 @@ function resolveTrigger(
       }
       const candidate = spansBySpanId.get(candidateSpanId);
       if (candidate !== undefined) {
-        return { eventId: candidate.id, event: candidate };
+        return triggerFromEvent(candidate);
       }
     }
   }
 
   if (nearest !== undefined) {
-    return { eventId: nearest.id, event: nearest };
+    return triggerFromEvent(nearest);
   }
 
   return undefined;
@@ -1656,14 +1808,47 @@ function toStateTransition(
 
   const trigger = resolveTrigger(event, attributes, spansBySpanId, eventsById);
   if (trigger !== undefined) {
-    transition.triggerEventId = trigger.eventId;
+    if (trigger.eventId !== undefined) {
+      transition.triggerEventId = trigger.eventId;
+    }
+    if (trigger.spanId !== undefined) {
+      transition.triggerSpanId = trigger.spanId;
+    }
 
     const triggerEvent = trigger.event;
     if (triggerEvent !== undefined) {
-      transition.triggerSpanId = triggerEvent.spanId;
       transition.triggerName = triggerEvent.name;
       transition.triggerKind = triggerEvent.kind;
     }
+  }
+
+  const transitionSource = asTransitionSource(
+    readAttribute(attributes, STATE_TRANSITION_SOURCE_KEY),
+  );
+  if (transitionSource !== undefined) {
+    transition.transitionSource = transitionSource;
+  }
+
+  const renderSpanId = asNonEmptyString(readAttribute(attributes, STATE_RENDER_SPAN_ID_KEY));
+  if (renderSpanId !== undefined) {
+    transition.renderSpanId = renderSpanId;
+  }
+
+  const fiberId = asNonNegativeInteger(readAttribute(attributes, STATE_FIBER_ID_KEY));
+  if (fiberId !== undefined) {
+    transition.fiberId = fiberId;
+  }
+
+  const truncated = asTrueFlag(readAttribute(attributes, STATE_TRUNCATED_KEY));
+  if (truncated !== undefined) {
+    transition.truncated = truncated;
+  }
+
+  const droppedTransitions = asNonNegativeInteger(
+    readAttribute(attributes, STATE_DROPPED_TRANSITIONS_KEY),
+  );
+  if (droppedTransitions !== undefined) {
+    transition.droppedTransitions = droppedTransitions;
   }
 
   if (event.source !== undefined) {
@@ -1830,8 +2015,73 @@ export const DEPENDENCY_NODE_ID_PREFIX = 'dep:';
 /** Prefix of every {@link DependencyGraphEdge.id}. */
 export const DEPENDENCY_EDGE_ID_PREFIX = 'edge:';
 
-/** Separator between the two node ids inside an edge id. */
+/**
+ * Separator between the two **escaped** node ids inside an edge id.
+ *
+ * A node id ends in a participant identity, and that identity is a span name
+ * or an attribute value the producer chose: an interaction's selector, a route
+ * pattern, a module and a symbol. It can therefore contain anything, including
+ * this separator, and a raw `from + '=>' + to` would be ambiguous — the pair
+ * (`a=>b`, `c`) and the pair (`a`, `b=>c`) produce one string, so two distinct
+ * relationships would collide on one edge id and have their counts and
+ * durations merged.
+ *
+ * {@link encodeEdgeEndpoint} escapes each endpoint before the join, so neither
+ * character of this separator can occur inside an endpoint and the separator
+ * occurs in the joined string exactly once. That makes the id injective over
+ * the ordered pair of node ids, which is what an identity has to be.
+ */
 const DEPENDENCY_EDGE_ID_SEPARATOR = '=>';
+
+/** Percent escape of `'%'` — applied first, so an escape cannot be re-escaped. */
+const EDGE_ENDPOINT_PERCENT_ESCAPE = '%25';
+
+/** Percent escape of `'='`, the separator's first character. */
+const EDGE_ENDPOINT_EQUALS_ESCAPE = '%3D';
+
+/** Percent escape of `'>'`, the separator's second character. */
+const EDGE_ENDPOINT_GREATER_THAN_ESCAPE = '%3E';
+
+/**
+ * Escapes one node id so it can be joined with
+ * {@link DEPENDENCY_EDGE_ID_SEPARATOR} unambiguously.
+ *
+ * Percent-escaping restricted to three characters: the two the separator is
+ * made of, and `'%'` itself so the escaping is reversible and therefore
+ * injective — escape `'%'` first, or `'a=b'` and `'a%3Db'` would both become
+ * `'a%3Db'`.
+ *
+ * `encodeURIComponent` is deliberately not used even though it would escape
+ * both separator characters: it throws `URIError` on a lone surrogate, and a
+ * participant identity comes from a page this module does not control, which
+ * would turn one malformed span name into a failed panel-data call. This
+ * function is total over every string.
+ *
+ * @param nodeId A {@link DependencyGraphNode.id}.
+ * @returns The id with `%`, `=` and `>` percent-escaped; every other character
+ * byte for byte as it arrived.
+ */
+function encodeEdgeEndpoint(nodeId: string): string {
+  return nodeId
+    .replaceAll('%', EDGE_ENDPOINT_PERCENT_ESCAPE)
+    .replaceAll('=', EDGE_ENDPOINT_EQUALS_ESCAPE)
+    .replaceAll('>', EDGE_ENDPOINT_GREATER_THAN_ESCAPE);
+}
+
+/**
+ * The id of the edge from one participant to another.
+ *
+ * The one place an edge id is built, so its injectivity is a property of a
+ * named function rather than of a template literal. The `from` and `to` fields
+ * of {@link DependencyGraphEdge} keep the **raw** node ids, because that is
+ * what a consumer matches against {@link DependencyGraphNode.id}; only the id
+ * string is escaped.
+ */
+function dependencyEdgeId(from: string, to: string): string {
+  const head = encodeEdgeEndpoint(from);
+  const tail = encodeEdgeEndpoint(to);
+  return `${DEPENDENCY_EDGE_ID_PREFIX}${head}${DEPENDENCY_EDGE_ID_SEPARATOR}${tail}`;
+}
 
 /**
  * The label of a participant whose span carried no readable name.
@@ -1977,11 +2227,15 @@ export interface DependencyGraphNode {
 
 /** One caller-to-callee relationship between two participants. */
 export interface DependencyGraphEdge {
-  /** `edge:` followed by the two node ids: deterministic across runs. */
+  /**
+   * `edge:` followed by the two node ids, each escaped by
+   * {@link encodeEdgeEndpoint} and joined by `=>`: deterministic across runs,
+   * and distinct for every distinct ordered pair of participants.
+   */
   readonly id: string;
-  /** The calling participant's {@link DependencyGraphNode.id}. */
+  /** The calling participant's {@link DependencyGraphNode.id}, unescaped. */
   readonly from: string;
-  /** The called participant's id. */
+  /** The called participant's id, unescaped. */
   readonly to: string;
   /** How many spans of `to` hung from a span of `from`. */
   readonly count: number;
@@ -2061,14 +2315,75 @@ interface MutableDependencyGraphNode {
 }
 
 /**
+ * Orders two locations of equal confidence, totally and independently of input
+ * order.
+ *
+ * Confidence is what decides between two locations, and it decides nothing
+ * between two that report the same number — which happens routinely, because
+ * every route has a default confidence and several spans of one participant are
+ * usually resolved by the same route. So the locations themselves are compared,
+ * in a fixed field order: `file`, then `line`, then `column`, then `symbol`,
+ * then `resolvedBy`, then `endLine`. That is every field of the shape except
+ * `confidence` itself, which makes the order **total**: two locations compare
+ * equal only when they are the same location, so no pair is left for arrival
+ * order to decide. Comparing them in a declared order is what makes the choice
+ * a function of the *set* of candidates rather than of the order the events
+ * happened to arrive in.
+ *
+ * A location that names a symbol sorts before one that does not, so the more
+ * descriptive of two otherwise identical positions wins. `../aggregate/
+ * renders.ts` orders equal-confidence locations by the same rule, so the
+ * `renders` and `graph` sources cannot send a developer to two different lines
+ * for one component.
+ *
+ * @returns A negative number when `left` sorts first, positive when `right`
+ * does, and `0` only for two identical locations — at which point they are
+ * interchangeable for every consumer.
+ */
+function compareSourceLocations(left: SourceLocation, right: SourceLocation): number {
+  if (left.file !== right.file) {
+    return compareStrings(left.file, right.file);
+  }
+  if (left.line !== right.line) {
+    return left.line < right.line ? -1 : 1;
+  }
+  if (left.column !== right.column) {
+    return left.column < right.column ? -1 : 1;
+  }
+  if (left.symbol !== right.symbol) {
+    if (left.symbol === undefined) {
+      return 1;
+    }
+    if (right.symbol === undefined) {
+      return -1;
+    }
+    return compareStrings(left.symbol, right.symbol);
+  }
+  const byRoute = compareStrings(left.resolvedBy, right.resolvedBy);
+  if (byRoute !== 0) {
+    return byRoute;
+  }
+  // The last field of the shape, and the one that makes the order total: two
+  // locations agreeing on everything above can still describe different spans
+  // of one declaration, and leaving that pair equal would hand the choice back
+  // to arrival order.
+  return (left.endLine ?? 0) - (right.endLine ?? 0);
+}
+
+/**
  * Keeps the more trustworthy of two locations.
  *
  * Resolution routes differ in what they can promise — a patch knows exactly
  * where it wrote, a source map knows a position, an owner chain knows a
  * component — and each location carries the confidence its route assigned. When
  * several spans of one participant disagree, the most confident answer is the
- * one a developer should be sent to; ties keep the incumbent, so the result does
- * not depend on input order.
+ * one a developer should be sent to.
+ *
+ * Confidence takes precedence, and {@link compareSourceLocations} settles a
+ * tie. Keeping the incumbent on a tie would make a participant's source
+ * location depend on the order its spans were folded in, so two builds of one
+ * capture could send a developer to two different lines; the tie-break is a
+ * total order, so they cannot.
  */
 function preferSource(
   current: SourceLocation | undefined,
@@ -2080,7 +2395,10 @@ function preferSource(
   if (current === undefined) {
     return candidate;
   }
-  return candidate.confidence > current.confidence ? candidate : current;
+  if (candidate.confidence !== current.confidence) {
+    return candidate.confidence > current.confidence ? candidate : current;
+  }
+  return compareSourceLocations(candidate, current) < 0 ? candidate : current;
 }
 
 /**
@@ -2394,7 +2712,7 @@ export function buildDependencyGraph(
       continue;
     }
 
-    const id = `${DEPENDENCY_EDGE_ID_PREFIX}${from}${DEPENDENCY_EDGE_ID_SEPARATOR}${to}`;
+    const id = dependencyEdgeId(from, to);
     const durationMs = clampNonNegative(finiteOrZero(event.duration));
 
     const existing = edgeAccumulators.get(id);

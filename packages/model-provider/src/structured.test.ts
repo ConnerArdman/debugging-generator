@@ -836,6 +836,76 @@ describe('a schema failure earns a bounded repair', () => {
       expect(provider.calls).toHaveLength(0);
     },
   );
+
+  // DEFAULT_MAX_REPAIRS is a CEILING, not merely the figure an unset budget
+  // gets: AAP §0.5.3 allows "at most two repairs", which bounds how much of a
+  // developer's project leaves their machine and what a stage costs. An
+  // over-ceiling budget must therefore fail the way a malformed one does —
+  // loudly, and with nothing sent — rather than being clamped, which would let
+  // a caller believe a bound the product does not enforce. Both values are
+  // derived from the constant so the cases track it instead of a literal: the
+  // first is the smallest budget that crosses the ceiling, the second is far
+  // past it.
+  it.each([DEFAULT_MAX_REPAIRS + 1, DEFAULT_MAX_REPAIRS * 50])(
+    'refuses the over-ceiling budget %p before asking the provider for anything',
+    async (maxRepairs) => {
+      const provider = createFakeProvider([decoded(VALID_OUTPUT)]);
+      const call = generateStructuredWithRepair(provider, reportSchema, makeRequest(), {
+        maxRepairs,
+      });
+
+      await expect(call).rejects.toMatchObject({ code: 'INTERNAL' });
+      // Asserted on the same settled rejection: the diagnostic has to quote the
+      // budget that was asked for, because `INTERNAL` alone does not tell
+      // whoever wrote the call which number to change.
+      await expect(call).rejects.toThrowError(String(maxRepairs));
+      expect(provider.calls).toHaveLength(0);
+    },
+  );
+
+  it('accepts an explicit budget at the ceiling, spending exactly the default', async () => {
+    const attempts = DEFAULT_MAX_REPAIRS + 1;
+    const provider = createFakeProvider(
+      Array.from({ length: attempts }, () => decoded(BOUND_VIOLATING_OUTPUT)),
+    );
+
+    // The ceiling is inclusive: a caller that states the bound it would have
+    // been given anyway must not be refused for saying so out loud, and must
+    // get the identical behaviour — one attempt plus DEFAULT_MAX_REPAIRS
+    // repairs, and not one call more. The script holds exactly `attempts`
+    // steps and throws if asked for another, so this is also where an
+    // off-by-one in the cap would surface.
+    const result = await generateStructuredWithRepair(provider, reportSchema, makeRequest(), {
+      maxRepairs: DEFAULT_MAX_REPAIRS,
+    });
+
+    const error = expectErr(result);
+    expect(provider.calls).toHaveLength(attempts);
+    expect(error.code).toBe('MODEL_OUTPUT_INVALID');
+    expect(detailsOf(error).reason).toBe('schema');
+    expect(detailsOf(error).attempts).toBe(attempts);
+    expect(detailsOf(error).repairs).toBe(DEFAULT_MAX_REPAIRS);
+  });
+
+  it('spends the whole ceiling budget on an answer that repairs successfully', async () => {
+    const provider = createFakeProvider([
+      ...Array.from({ length: DEFAULT_MAX_REPAIRS }, () => decoded(BOUND_VIOLATING_OUTPUT)),
+      decoded(VALID_OUTPUT),
+    ]);
+
+    // The companion to the case above: an explicit ceiling budget also reaches
+    // a validated answer on its last permitted attempt, so the inclusive bound
+    // is a usable repair allowance rather than one the loop refuses to spend.
+    const result = await generateStructuredWithRepair(provider, reportSchema, makeRequest(), {
+      maxRepairs: DEFAULT_MAX_REPAIRS,
+    });
+
+    expectOk(result);
+    expect(provider.calls).toHaveLength(DEFAULT_MAX_REPAIRS + 1);
+    expect(result.value.attempts).toBe(DEFAULT_MAX_REPAIRS + 1);
+    expect(result.value.repairs).toBe(DEFAULT_MAX_REPAIRS);
+    expect(result.value.parsed).toEqual(VALID_OUTPUT);
+  });
 });
 
 /*

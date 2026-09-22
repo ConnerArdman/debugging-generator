@@ -54,6 +54,17 @@
  *   on any internal failure the original function is called with the original
  *   arguments and the failure is counted in {@link getFetchStats}. The page
  *   keeps working even when this module does not.
+ * - **Never fail silently.** Counting a contained failure is not reporting it:
+ *   a capture that lost its network signal would otherwise be indistinguishable
+ *   from one whose page made no requests, and with the requests go the
+ *   `traceparent` edges the whole browser-to-server correlation rests on. Every
+ *   contained failure therefore also posts a bounded, sanitized `agent.error`
+ *   frame through `./transport.ts`'s `reportProducerFailure` (AAP 0.5.5). The
+ *   frame names the *step* — `'fetch-plan'`, `'xhr-restore-open'` — and the
+ *   thrown value's type, and nothing else: a URL, a header, a body or an error
+ *   message is application data, control frames are not redacted at ingest, and
+ *   this module's whole reason for not normalising a URL is that the service
+ *   redacts it there instead.
  * - **Never inject cross-origin.** A `traceparent` on a third-party request
  *   would ship correlation ids off the developer's machine, so the header goes
  *   only to `location.origin`. The decision is recorded on the event
@@ -94,6 +105,13 @@
  * memory with them. The initiator stack is capped at
  * {@link MAX_INITIATOR_FRAMES} frames and {@link MAX_INITIATOR_CHARS}
  * characters, which is several times the depth the source-map route resolves.
+ * Teardown is bounded too: a patch the page refuses to let this module remove
+ * is remembered — per prototype, so replacing `XMLHttpRequest` cannot strand
+ * one (see {@link xhrPatchRecords}) — and at
+ * {@link MAX_XHR_PATCH_RECORDS} outstanding records a further install is
+ * refused rather than granted at the cost of forgetting an original.
+ * {@link hasFetchResidue} is how `./agent.ts` learns that anything is still
+ * outstanding.
  *
  * ## Imports: four page modules and two vocabularies
  *
@@ -126,7 +144,7 @@ import {
 } from './continuation.js';
 import { formatTraceparent, newSpanId } from './ids.js';
 import { isTracedContext, resolveEventContext, type EventContext } from './interaction.js';
-import { emit, nowEpochMs, type EventDraft } from './transport.js';
+import { emit, nowEpochMs, reportProducerFailure, type EventDraft } from './transport.js';
 import type { FETCH_ATTRIBUTE_KEYS } from '../schema/attributes.js';
 import type { TelemetryKind, TelemetryStatus } from '../schema/kinds.js';
 
@@ -263,6 +281,41 @@ const KEY_ABORTED = 'aborted';
 const KEY_RESPONSE_TYPE = 'response.type';
 
 /**
+ * The absolute URL this request appears under in the Resource Timing buffer.
+ *
+ * **Invented here**, and the identity half of a join rather than a display
+ * field. `./perf.ts` observes `PerformanceResourceTiming` — the only place a
+ * transferred size is observable at all (AAP 0.6.6) — and its entries are
+ * named by the *resolved absolute* URL the browser fetched, while {@link
+ * KEY_URL} carries the URL exactly as the application wrote it, which is
+ * usually relative. `../aggregate/requests.ts` joins the two by URL and start
+ * time, so without this key a request written `fetch("/api/items")` can never
+ * be matched to its own resource entry and the bytes it transferred are never
+ * attributed to it.
+ *
+ * Three properties make it safe to add:
+ *
+ * - **It is redacted exactly like `url`.** `../redaction/url.ts` recognises
+ *   any attribute whose name ends in `Url`, so the query values are masked by
+ *   the same handler, with no preview truncation — which is what makes the
+ *   masked form here byte-identical to the masked form of the resource entry's
+ *   own `url` for the same raw URL, and therefore a usable key.
+ * - **It is never a grouping or hashing input.** `request_key` is computed at
+ *   ingest from {@link KEY_URL} alone (AAP 0.5.2), and duplicate detection
+ *   groups on that digest, so this attribute cannot influence either.
+ * - **It adds no byte accounting to this module.** The size stays with the
+ *   producer that can measure it; this is only the handle that lets the
+ *   aggregate find it.
+ *
+ * The fragment is stripped, because a fetch is issued without one and a
+ * resource entry is never named with one. `../schema/attributes.ts` should
+ * adopt the spelling in the `fetch` and `xhr` tuples, at which point the
+ * consumer side in `../aggregate/requests.ts` reads it from the catalog
+ * instead of re-declaring it.
+ */
+const KEY_RESOURCE_TIMING_URL = 'resourceTimingUrl';
+
+/**
  * The character ceiling on an event's `name`.
  *
  * `../schema/event.ts` bounds `name` at 512 characters; this is the tighter
@@ -319,6 +372,38 @@ const ONCE_OPTIONS: AddEventListenerOptions = { once: true };
 const DEFAULT_METHOD = 'GET';
 
 /*
+ * The host's own arity for each patched function — the FALLBACK each
+ * replacement reports when the function it replaced states no usable
+ * `Function.length` of its own.
+ *
+ * Every patch forwards the caller's own argument list through a rest
+ * parameter — the only way to leave `arguments.length` untouched, see
+ * {@link withDeclaredArity} — and a rest signature reports a
+ * `Function.length` of 0, so an arity has to be written back onto each
+ * replacement for a page that reads one. The value written is the replaced
+ * function's own ({@link arityOf}), because what was on the property at attach
+ * time may be another library's wrapper with an arity of its own; these four
+ * numbers are what the *host* declares, which is the right answer only when
+ * the captured value cannot supply one. Each is the number of arguments WebIDL
+ * declares **required**, which is the `length` a host operation reports:
+ * `fetch(input, init?)` reports 1, `open(method, url, async?, username?,
+ * password?)` reports 2, `send(body?)` reports 0, and
+ * `setRequestHeader(name, value)` reports 2.
+ */
+
+/** `window.fetch`'s own `length`, as the host declares it. */
+const FETCH_ARITY = 1;
+
+/** `XMLHttpRequest.prototype.open`'s own `length`, as the host declares it. */
+const XHR_OPEN_ARITY = 2;
+
+/** `XMLHttpRequest.prototype.send`'s own `length`, as the host declares it. */
+const XHR_SEND_ARITY = 0;
+
+/** `setRequestHeader`'s own `length`, as the host declares it. */
+const XHR_SET_REQUEST_HEADER_ARITY = 2;
+
+/*
  * ---------------------------------------------------------------------------
  * Public types
  * ---------------------------------------------------------------------------
@@ -328,15 +413,19 @@ const DEFAULT_METHOD = 'GET';
  * A cheap, honest picture of the patch, for `./agent.ts`'s diagnostics and for
  * tests.
  *
- * `inFlight` is the current number of instrumented requests that have not
- * settled; it is reset by {@link detachFetch}, because a detached module is
- * observing nothing. Every other number is cumulative for the life of the
- * document, exactly as `./transport.ts`'s counters are, so a reader can tell
- * "forty requests were correlated and two were not" from "nothing has
- * happened yet".
+ * `inFlight` is the only number scoped to the current **producer generation**:
+ * it is zeroed by {@link detachFetch} and by {@link advanceFetchGeneration},
+ * because a request planned in an earlier generation reports nothing when it
+ * settles and so would never be subtracted again. Every other number is
+ * cumulative for the life of the document, exactly as `./transport.ts`'s
+ * counters are, so a reader can tell "forty requests were correlated and two
+ * were not" from "nothing has happened yet".
  */
 export interface FetchStats {
-  /** Instrumented requests that have started and not yet settled. */
+  /**
+   * Instrumented requests of the **current generation** that have started and
+   * not yet settled; see {@link generation} for what a generation is.
+   */
   inFlight: number;
   /** Requests a `traceparent` header was injected on, cumulative. */
   injected: number;
@@ -421,8 +510,11 @@ type Injection<T> =
  * continuation is outstanding, and which terminal XHR event was seen.
  */
 interface RequestRecord {
-  /** The attach cycle this record belongs to; see {@link isCurrentCycle}. */
-  readonly cycle: number;
+  /**
+   * The producer generation this record was planned in; see
+   * {@link isCurrentGeneration}.
+   */
+  readonly generation: number;
   /** `fetch` or `xhr`. */
   readonly kind: TelemetryKind;
   /** The trace the request joins. */
@@ -437,6 +529,15 @@ interface RequestRecord {
   readonly method: string;
   /** The URL exactly as the caller wrote it. */
   readonly url: string;
+  /**
+   * The absolute URL this request will appear under in the Resource Timing
+   * buffer, or `undefined` when it could not be resolved.
+   *
+   * Resolved once here rather than at settle time: a single-page navigation
+   * between the call and the response changes `location.href`, and a relative
+   * URL re-resolved afterwards would name a resource the page never asked for.
+   */
+  readonly resourceTimingUrl: string | undefined;
   /** `‹METHOD› ‹path›`, bounded, query-free. */
   readonly name: string;
   /** When the request started, in epoch milliseconds. */
@@ -485,6 +586,22 @@ interface XhrState {
   /** The URL from the last `open`, as the caller wrote it. */
   url: string;
   /**
+   * The absolute URL that `open` resolved, or `undefined` when it could not be
+   * resolved then.
+   *
+   * Captured at `open` rather than at `send` because that is when the platform
+   * resolves it: `XMLHttpRequest.open()` parses its URL against the base in
+   * force at that moment and stores the result, so a page that opens `item` at
+   * `/before/page`, navigates the history to `/after/page` and only then calls
+   * `send()` requests — and times — `/before/item`. Re-resolving at send would
+   * name `/after/item`: an identity matching no resource-timing entry, and an
+   * origin test answering for a URL the request never went to.
+   *
+   * Stored as the resolved href rather than as a `URL`, so nothing holds a
+   * platform object for the lifetime of a request.
+   */
+  resolvedHref: string | undefined;
+  /**
    * Whether the application set its own `traceparent` on this request.
    *
    * Reset by every `open`, because `open()` clears the author request headers
@@ -506,6 +623,111 @@ type XhrSendFn = typeof XMLHttpRequest.prototype.send;
 /** The shape of `XMLHttpRequest.prototype.setRequestHeader`. */
 type XhrSetRequestHeaderFn = typeof XMLHttpRequest.prototype.setRequestHeader;
 
+/**
+ * `window.fetch` seen as *a call to forward*: the saved original, through a
+ * signature that accepts the caller's own argument list rather than the two
+ * parameters WebIDL declares.
+ *
+ * The patches forward with `Reflect.apply(original, receiver, args)`, and the
+ * two reasons are worth stating together. The list, because `original` is
+ * whatever was on the property when this module attached — a page's or a
+ * library's pre-existing wrapper is ordinary JavaScript and may branch on
+ * `arguments.length`, which rebuilding the call from named parameters would
+ * change (see {@link createFetchPatch}). `Reflect.apply` rather than
+ * `original.apply`, because the latter is a property *of the original* that a
+ * wrapper may have replaced; `Reflect.apply` reads nothing off the function it
+ * calls, so an exotic `apply` cannot misdirect the forward.
+ *
+ * The cast to this type is safe in exactly the direction that matters: every
+ * parameter is `unknown`, so anything the host declares can be passed, and the
+ * receiver is still the window the original was taken from.
+ */
+type ForwardedFetchFn = (this: Window & typeof globalThis, ...args: unknown[]) => Promise<Response>;
+
+/**
+ * An `XMLHttpRequest.prototype` method seen as a call to forward, for the same
+ * reasons as {@link ForwardedFetchFn}.
+ *
+ * One type for all three methods: `open`, `send` and `setRequestHeader` differ
+ * only in the arguments the caller passed, which is precisely what is being
+ * forwarded verbatim, and all three return `undefined`. The receiver stays the
+ * calling `XMLHttpRequest`, which is what the host requires — the originals
+ * are captured unbound for that reason — and forwarding through this type
+ * changes nothing about it.
+ */
+type ForwardedXhrFn = (this: XMLHttpRequest, ...args: unknown[]) => void;
+
+/**
+ * One of the three patched `XMLHttpRequest.prototype` properties.
+ *
+ * Named rather than positional because every step of the install and the
+ * restore is now per-slot: which slots this module actually holds is the
+ * difference between a rollback that undoes what it did and one that either
+ * forgets a patch or overwrites a property it never touched.
+ */
+type XhrSlot = 'open' | 'send' | 'setRequestHeader';
+
+/**
+ * One prototype property this module patched and has not yet put back.
+ *
+ * A record is the *whole* route from an installed patch to the host's own
+ * function: the object the property lives on, which property it is, the
+ * function found there before the patch, and the patch itself. Nothing about
+ * it is keyed on "the current `XMLHttpRequest`", which is the point — see
+ * {@link xhrPatchRecords} for the defect that shape removes.
+ *
+ * Discriminated on {@link XhrSlot} rather than holding a union of the three
+ * function types, so a restore reads and writes the property the record names
+ * with no cast: `record.slot === 'open'` narrows `original` and `installed` to
+ * {@link XhrOpenFn} together.
+ */
+type XhrPatchRecord =
+  | {
+      /** The prototype the patch was installed on. */
+      readonly prototype: XMLHttpRequest;
+      /** Which property this record owns. */
+      readonly slot: 'open';
+      /** The function found in the property before the patch. */
+      readonly original: XhrOpenFn;
+      /** The function this module assigned into the property. */
+      readonly installed: XhrOpenFn;
+    }
+  | {
+      /** The prototype the patch was installed on. */
+      readonly prototype: XMLHttpRequest;
+      /** Which property this record owns. */
+      readonly slot: 'send';
+      /** The function found in the property before the patch. */
+      readonly original: XhrSendFn;
+      /** The function this module assigned into the property. */
+      readonly installed: XhrSendFn;
+    }
+  | {
+      /** The prototype the patch was installed on. */
+      readonly prototype: XMLHttpRequest;
+      /** Which property this record owns. */
+      readonly slot: 'setRequestHeader';
+      /** The function found in the property before the patch. */
+      readonly original: XhrSetRequestHeaderFn;
+      /** The function this module assigned into the property. */
+      readonly installed: XhrSetRequestHeaderFn;
+    };
+
+/**
+ * What one attempt at putting an original back achieved.
+ *
+ * - `restored` — the original is in place; this slot's saved references are
+ *   now stale and are dropped.
+ * - `foreign` — the property is no longer the function this module installed,
+ *   so another library patched over us. Theirs is left alone (see
+ *   {@link restoreFetchPatch}) and our references are dropped, because nothing
+ *   of ours is installed any more.
+ * - `retained` — the restoration failed, so **our patch is still installed**.
+ *   The references are kept so a later {@link detachFetch} can try again, and
+ *   so a later {@link attachFetch} re-adopts the patch instead of wrapping it.
+ */
+type RestoreOutcome = 'restored' | 'foreign' | 'retained';
+
 /*
  * ---------------------------------------------------------------------------
  * Module state
@@ -519,18 +741,37 @@ type XhrSetRequestHeaderFn = typeof XMLHttpRequest.prototype.setRequestHeader;
 let attached = false;
 
 /**
- * Which attach cycle is current, incremented by **both**
- * {@link attachFetch} and {@link detachFetch}.
+ * Which **producer generation** is current, advanced by {@link attachFetch},
+ * by {@link detachFetch} and by every capture boundary
+ * ({@link advanceFetchGeneration}).
  *
- * This is how an in-flight request survives a detach without escaping it. A
- * record carries the cycle it was planned in; when it settles, a record from
- * any other cycle emits nothing and settles no continuation, so a capture that
- * the developer has stopped cannot be extended by a request that was already
- * on the wire (AAP 0.5.1). Incrementing on detach as well as on attach is what
- * makes that true across a stop/start pair, where a plain boolean would let a
- * request planned before the stop report into the capture after it.
+ * This is how an in-flight request survives the end of the capture it belongs
+ * to without escaping into the next one. A record carries the generation it
+ * was planned in; when it settles, a record from any other generation emits
+ * nothing, settles no continuation and moves no counter, so neither a capture
+ * the developer has stopped nor the capture that follows it can be extended by
+ * a request that was already on the wire (AAP 0.5.1).
+ *
+ * Three events advance it, and each is a boundary a plain boolean would let a
+ * request cross:
+ *
+ * - **attach** — every record planned from now on belongs to this generation,
+ *   and every record from before it is already invalid.
+ * - **detach** — without this, a stop/start pair would let a request planned
+ *   before the stop report into the capture after it.
+ * - **a direct capture change** — `agent.config` can move a bound tab from
+ *   capture A to capture B with the network hook still enabled, so the patches
+ *   stay installed and nothing detaches. A request still on the wire from A
+ *   would settle inside B and be stamped with B's `captureId` and a `seq` from
+ *   B's restarted sequence, since AAP 0.2.3 scopes `seq` to
+ *   `(producerId, captureId)`. That is capture A's evidence inside capture B,
+ *   carrying a sequence number that belongs to another event.
+ *
+ * Hence "generation" rather than "attach cycle": the counter identifies which
+ * run of this producer a record belongs to, and attaching is only one of the
+ * three ways a run can end.
  */
-let cycle = 0;
+let generation = 0;
 
 /** This module's own script URL, for dropping its frames from a stack. */
 let agentScriptUrl: string | undefined;
@@ -544,26 +785,67 @@ let installedFetch: FetchFn | undefined;
 /** The `fetch` that was there before, restored at detach. */
 let originalFetch: FetchFn | undefined;
 
-/** The prototype whose methods were patched, held so a later global swap cannot misdirect the restore. */
-let xhrPrototype: XMLHttpRequest | undefined;
+/**
+ * How many {@link XhrPatchRecord}s may be outstanding at once.
+ *
+ * Records are not per attach: one survives a detach exactly when its
+ * restoration failed, so in ordinary operation the list is the three slots of
+ * the one live prototype and is empty between captures. It grows only when the
+ * page refuses a restoration *and* then replaces the `XMLHttpRequest`
+ * constructor, which is how a bound becomes necessary at all: a page that
+ * swapped the constructor in a loop while refusing every restoration would
+ * otherwise make this module retain a record — and, through it, the replaced
+ * prototype and two functions — for every iteration.
+ *
+ * Four prototypes' worth of slots. Deliberately small: a real application
+ * replaces `XMLHttpRequest` at most once (a mock, a polyfill, a tracing
+ * library installing its own transport), and residue past the fourth
+ * unrestorable prototype is a page actively fighting the teardown rather than
+ * a case worth holding memory for. What happens at the bound is in
+ * {@link reserveXhrRecordRoom}: the install is *refused* and reported, never
+ * granted at the cost of overwriting a record.
+ */
+const MAX_XHR_PATCH_RECORDS = 12;
 
-/** The `open` this module installed. */
-let installedOpen: XhrOpenFn | undefined;
+/** How many prototype properties one XHR install patches; see {@link XhrSlot}. */
+const XHR_SLOT_COUNT = 3;
 
-/** The `open` that was there before. */
-let originalOpen: XhrOpenFn | undefined;
-
-/** The `send` this module installed. */
-let installedSend: XhrSendFn | undefined;
-
-/** The `send` that was there before. */
-let originalSend: XhrSendFn | undefined;
-
-/** The `setRequestHeader` this module installed. */
-let installedSetRequestHeader: XhrSetRequestHeaderFn | undefined;
-
-/** The `setRequestHeader` that was there before. */
-let originalSetRequestHeader: XhrSetRequestHeaderFn | undefined;
+/**
+ * Every `XMLHttpRequest.prototype` property this module has patched and not
+ * yet put back, oldest install first.
+ *
+ * **This list replaces a single tracked prototype, and that is the fix for
+ * R1-F23.** The earlier shape held one `xhrPrototype` and one saved original
+ * per slot, so an install on a *replaced* constructor's prototype overwrote
+ * the only reference to the previous prototype's original — and any patch
+ * whose restoration had failed on that prototype became unremovable for the
+ * life of the document, which AAP 0.5.1's reversibility guarantee forbids. A
+ * record is per prototype *and* per slot, so a new install can never overwrite
+ * an unresolved original: it appends.
+ *
+ * The trade, stated: memory is held per unrestored patch rather than per
+ * module, and the walk in {@link restoreXhrRecords} is O(records) at every
+ * detach instead of O(1). Both are bounded by
+ * {@link MAX_XHR_PATCH_RECORDS} — twelve records, twelve retried assignments
+ * on a teardown — which buys the property that residue on an *earlier*
+ * prototype is retried at every detach and cleared the moment the page lets it
+ * back, instead of being forgotten at the next attach. The alternative,
+ * refusing to install on a new prototype while residue on the old one stands,
+ * would cost the capture its whole XHR signal for the rest of the session
+ * because a sealed property never unseals; this shape only refuses at the
+ * bound.
+ *
+ * The invariants, once any function in the installation section has returned:
+ *
+ * - a record's patch is installed in its property, or was and its restoration
+ *   failed; either way this module knows the function to put back;
+ * - a property this module never successfully wrote has no record (see the
+ *   drop in {@link installXhrPatch});
+ * - order is install order, and {@link restoreXhrRecords} walks it oldest
+ *   first, so the prototype that was patched first is the one whose
+ *   restoration is retried first.
+ */
+let xhrPatchRecords: XhrPatchRecord[] = [];
 
 /**
  * Per-instance XHR state.
@@ -601,14 +883,17 @@ let failureTotal = 0;
  */
 
 /**
- * Whether a record still belongs to the live attach cycle.
+ * Whether a record still belongs to the live producer generation.
  *
- * The guard on every settle path. A record from an earlier cycle belongs to a
- * capture that has been stopped, and the contract is that nothing escapes a
- * stopped capture: no event, no continuation, no counter movement.
+ * The guard on every settle path. A record from an earlier generation belongs
+ * to a capture that has ended — stopped by the developer, or replaced by the
+ * next capture on the same tab — and the contract is that nothing escapes a
+ * capture it does not belong to: no event, no continuation, no counter
+ * movement. See {@link generation} for the three boundaries that end a
+ * generation.
  */
-function isCurrentCycle(record: RequestRecord): boolean {
-  return attached && record.cycle === cycle;
+function isCurrentGeneration(record: RequestRecord): boolean {
+  return attached && record.generation === generation;
 }
 
 /**
@@ -689,23 +974,105 @@ function readUrlString(value: unknown): string {
 }
 
 /**
- * Resolve a URL against the document, for the origin test and the label.
+ * The base a relative request URL is resolved against: the document's base
+ * URL, exactly as the platform uses.
+ *
+ * `document.baseURI` and **not** `location.href`, because those two differ
+ * whenever the page carries a `<base href>` — and when they differ, the
+ * platform follows `baseURI`. A page at `/page` with `<base href="/base/">`
+ * that fetches `item` requests `/base/item` and files its resource-timing
+ * entry under that name, so resolving against `location.href` would produce
+ * `/item`: an identity matching no entry, and an origin test answering for a
+ * request the page never made. The origin test is the reason this matters
+ * beyond the join — with a cross-origin `<base>`, resolving against
+ * `location.href` would call a third-party request same-origin and inject a
+ * `traceparent` into it, which AAP 0.4.2 forbids outright.
+ *
+ * Falls back to `location.href` where there is no document (a worker context)
+ * and yields `undefined` where there is neither, which the caller reads as
+ * "origin not establishable".
+ */
+function documentBaseUrl(): string | undefined {
+  try {
+    if (typeof document !== 'undefined') {
+      const baseUri: unknown = document.baseURI;
+      if (typeof baseUri === 'string' && baseUri.length > 0) {
+        return baseUri;
+      }
+    }
+    if (typeof location !== 'undefined') {
+      const href: unknown = location.href;
+      if (typeof href === 'string' && href.length > 0) {
+        return href;
+      }
+    }
+    return undefined;
+  } catch {
+    // A host that throws while reading either cannot establish a base, which
+    // the caller treats exactly as it treats an unparseable URL.
+    return undefined;
+  }
+}
+
+/**
+ * Resolve a URL against the document's base, for the origin test, the label
+ * and the resource-timing identity.
  *
  * Returns `undefined` rather than throwing for a URL no parser accepts and for
- * a host with no `URL` or no `location` (the Node preload imports this
- * package, and a worker context has neither in the same shape). The caller
- * treats an unresolvable URL as cross-origin: a request whose origin cannot be
+ * a host with no `URL` or no base (the Node preload imports this package, and
+ * a worker context has neither in the same shape). The caller treats an
+ * unresolvable URL as cross-origin: a request whose origin cannot be
  * established must not receive a correlation id.
+ *
+ * @see documentBaseUrl for why the base is the document's rather than the
+ * location's.
  */
 function resolveAbsolute(url: string): URL | undefined {
   try {
-    if (typeof URL === 'undefined' || typeof location === 'undefined') {
+    if (typeof URL === 'undefined') {
       return undefined;
     }
-    return new URL(url, location.href);
+    const base = documentBaseUrl();
+    if (base === undefined) {
+      return undefined;
+    }
+    return new URL(url, base);
   } catch {
     // A malformed or exotic URL is the application's business; ours is only to
     // decline to inject into it.
+    return undefined;
+  }
+}
+
+/**
+ * The identity this request will carry in the Resource Timing buffer.
+ *
+ * `URL.href` is the browser's own normalised spelling of the absolute URL,
+ * which is what `PerformanceResourceTiming.name` reports, so no normalisation
+ * of our own is applied — and none may be, for the reason the module header
+ * gives about URLs generally. The fragment is removed by a plain string cut
+ * rather than by mutating the `URL` (cheaper, and it cannot disturb an object
+ * the caller might hold): a fetch never sends one, and an entry is never named
+ * with one, so leaving it on would break the match for a page that fetches a
+ * URL carrying a hash.
+ *
+ * @param resolved The absolute URL, or `undefined` when resolution failed.
+ * @returns The identity, or `undefined` when there is none to report.
+ */
+function resourceTimingIdentity(resolved: URL | undefined): string | undefined {
+  try {
+    if (resolved === undefined) {
+      return undefined;
+    }
+    const href = resolved.href;
+    if (typeof href !== 'string' || href.length === 0) {
+      return undefined;
+    }
+    const hashIndex = href.indexOf('#');
+    return hashIndex < 0 ? href : href.slice(0, hashIndex);
+  } catch {
+    // A `URL` whose `href` getter throws is not one this module will describe;
+    // the request still goes out untouched.
     return undefined;
   }
 }
@@ -1004,6 +1371,93 @@ function isAbortError(error: unknown): boolean {
   }
 }
 
+/**
+ * Give a patched function the `length` of the function it replaces.
+ *
+ * Each patch below is written with a **rest parameter**, because forwarding
+ * the caller's exact argument list is the only way to leave `arguments.length`
+ * alone for a pre-existing wrapper that branches on it — and a rest signature
+ * reports a `Function.length` of 0, where `fetch` reports 1 and `open`
+ * 2. Restoring the declared arity is what keeps the two halves of "never
+ * change application behaviour" from trading places: a library that
+ * feature-detects by arity, or that copies the descriptor onto a wrapper of
+ * its own, must read the patch as the same function it was handed.
+ *
+ * **The arity copied is the replaced function's own, not the host's.** What was
+ * on the property when this module attached may already be somebody else's
+ * wrapper, reporting an arity of its own, and that is exactly the situation the
+ * forwarding rules exist for — so {@link arityOf} asks the captured value first
+ * and falls back to the host's constant (the {@link FETCH_ARITY} group) only
+ * when it has no usable `length` to copy.
+ *
+ * `length` is a configurable own property of every function by specification,
+ * so writing it is the sanctioned operation and not a trick; `value` alone is
+ * passed, which leaves the non-writable, non-enumerable flags a function's own
+ * `length` already carries exactly as they were. The alternative — leading
+ * optional parameters, whose emitted arity is already right — was rejected
+ * because such a signature cannot express "the caller passed nothing here"
+ * separately from "the caller passed `undefined` here", and that distinction
+ * is exactly what the forwarding exists to preserve.
+ *
+ * Returns its argument so a call site can
+ * `return withDeclaredArity(patch, original, n)`, and never throws: a host that
+ * refuses the definition keeps the arity it has, the failure is counted in
+ * {@link getFetchStats}, and the patch still forwards every call correctly.
+ *
+ * @param patch The replacement this module installs.
+ * @param replaced The function it replaces, whose arity is copied.
+ * @param fallback The host's own arity, for a `replaced` that cannot state one.
+ */
+function withDeclaredArity<T extends (...args: never[]) => unknown>(
+  patch: T,
+  replaced: unknown,
+  fallback: number,
+): T {
+  try {
+    Object.defineProperty(patch, 'length', {
+      value: arityOf(replaced, fallback),
+      configurable: true,
+    });
+  } catch {
+    // A frozen function object or a host that rejects the redefinition: the
+    // patch is installed regardless, reporting a rest signature's arity.
+    failureTotal += 1;
+  }
+  return patch;
+}
+
+/**
+ * The arity a replacement should report: the one the function being replaced
+ * reports, and the host's constant only when that cannot be read.
+ *
+ * The distinction is the whole point of taking the replaced function as an
+ * argument. `window.fetch` and the three `XMLHttpRequest.prototype` methods may
+ * already be somebody else's wrapper by the time this module attaches — that is
+ * the case the argument-forwarding rules exist for — and such a wrapper is free
+ * to report an arity of its own. Copying the host's constant over it would make
+ * the patch describe a function nobody installed, so the captured value is
+ * asked first and the constant is the fallback for a wrapper whose `length` is
+ * missing, negative, fractional or not a number at all.
+ *
+ * @param replaced The original this module captured.
+ * @param fallback The host's own arity for that operation; see the
+ * {@link FETCH_ARITY} group.
+ * @returns A non-negative integer.
+ */
+function arityOf(replaced: unknown, fallback: number): number {
+  try {
+    const declared = (replaced as { readonly length?: unknown }).length;
+    if (typeof declared === 'number' && Number.isInteger(declared) && declared >= 0) {
+      return declared;
+    }
+  } catch {
+    // A throwing `length` accessor on a foreign wrapper: the host's constant is
+    // the better of the two answers available.
+    failureTotal += 1;
+  }
+  return fallback;
+}
+
 /*
  * ---------------------------------------------------------------------------
  * Request lifecycle
@@ -1040,7 +1494,7 @@ function beginRequest(input: {
   readonly initiator: string | undefined;
 }): RequestRecord {
   const record: RequestRecord = {
-    cycle,
+    generation,
     kind: input.kind,
     traceId: input.context.traceId,
     spanId: input.spanId,
@@ -1048,6 +1502,7 @@ function beginRequest(input: {
     lineageAttributes: input.context.attributes,
     method: input.method,
     url: input.url,
+    resourceTimingUrl: resourceTimingIdentity(input.resolved),
     name: requestName(input.method, input.url, input.resolved),
     startedAt: input.startedAt,
     sameOrigin: input.resolved !== undefined && isSameOrigin(input.resolved),
@@ -1088,13 +1543,20 @@ function beginRequest(input: {
  * certainty, and none of this module's own keys collide with it.
  *
  * Every declared key comes from the `fetch` / `xhr` vocabulary of
- * `../schema/attributes.ts`; the three invented ones are documented at their
+ * `../schema/attributes.ts`; the four invented ones are documented at their
  * constants. A value that is unknown for this request is **omitted rather
  * than sent as `null`**, which is how the rest of this folder says "not
- * observed". Notably absent: `transferSize`, which only
- * `PerformanceResourceTiming` can supply and which `./perf.ts` owns (AAP
- * 0.6.6), and `request_key`, which the service computes at ingest from the
- * unredacted URL and which a producer must never set.
+ * observed".
+ *
+ * Notably absent: `transferSize`, which only `PerformanceResourceTiming` can
+ * supply and which `./perf.ts` owns (AAP 0.6.6), and `request_key`, which the
+ * service computes at ingest from the unredacted URL and which a producer must
+ * never set. Present instead of the size is
+ * {@link KEY_RESOURCE_TIMING_URL} — the identity under which this request's
+ * resource entry will appear, which is what lets
+ * `../aggregate/requests.ts` find that entry and attribute its bytes to this
+ * request. Emitting the handle rather than the number keeps each measurement
+ * with the producer that can actually make it.
  */
 function buildAttributes(record: RequestRecord, outcome: RequestOutcome): Record<string, unknown> {
   const attributes: Record<string, unknown> = { ...record.lineageAttributes };
@@ -1103,6 +1565,13 @@ function buildAttributes(record: RequestRecord, outcome: RequestOutcome): Record
   attributes[KEY_URL] = record.url;
   attributes[KEY_SAME_ORIGIN] = record.sameOrigin;
   attributes[KEY_TRACEPARENT_INJECTED] = record.injected;
+
+  // Written whenever the URL resolved, including when it is byte-identical to
+  // `url`: the aggregate must not have to guess whether the display URL is
+  // already the absolute form the resource entry is named by.
+  if (record.resourceTimingUrl !== undefined) {
+    attributes[KEY_RESOURCE_TIMING_URL] = record.resourceTimingUrl;
+  }
 
   if (!record.injected && record.skipReason !== undefined) {
     attributes[KEY_TRACEPARENT_SKIP_REASON] = record.skipReason;
@@ -1132,8 +1601,8 @@ function buildAttributes(record: RequestRecord, outcome: RequestOutcome): Record
  * `http.server` span a child of this event rather than a sibling.
  *
  * `./transport.ts` drops the event when no capture is active, so this function
- * neither checks nor knows about the capture state; the attach cycle is the
- * only gate applied here (see {@link settleRequest}).
+ * neither checks nor knows about the capture state; the producer generation is
+ * the only gate applied here (see {@link settleRequest}).
  */
 function emitRequestEvent(record: RequestRecord, outcome: RequestOutcome): void {
   const draft: EventDraft = {
@@ -1160,10 +1629,14 @@ function emitRequestEvent(record: RequestRecord, outcome: RequestOutcome): void 
  * `abort` and then `loadend` — and a second event would double every request
  * count in the capture.
  *
- * Nothing is reported for a record from an earlier attach cycle: the capture
- * it belonged to has stopped, and AAP 0.5.1 requires a stopped capture to
- * receive nothing. Such a record is still marked settled, so it can never be
- * reconsidered.
+ * Nothing is reported for a record from an earlier producer generation: the
+ * capture it belonged to has ended, and a capture that has ended must receive
+ * nothing — neither the stopped capture, which AAP 0.5.1 requires to be left
+ * alone, nor the capture that replaced it, whose `(producerId, captureId)`
+ * sequence the event would be stamped with (see {@link generation}). Such a
+ * record is still marked settled, so it can never be reconsidered, and the
+ * in-flight counter it was holding is released by whichever boundary ended its
+ * generation rather than here.
  *
  * The continuation is settled for **both** outcomes. A network error is still
  * a response arriving, and the React work that renders the failure belongs to
@@ -1177,7 +1650,7 @@ function settleRequest(record: RequestRecord, outcome: RequestOutcome): void {
     }
     record.settled = true;
 
-    if (!isCurrentCycle(record)) {
+    if (!isCurrentGeneration(record)) {
       return;
     }
 
@@ -1187,11 +1660,13 @@ function settleRequest(record: RequestRecord, outcome: RequestOutcome): void {
     if (record.continuation) {
       settleContinuation(record.spanId, outcome.settledAt);
     }
-  } catch {
+  } catch (error: unknown) {
     // The settle path runs inside the application's own promise chain and its
     // event listeners, so a failure here costs one event and never the
-    // request it describes.
+    // request it describes. The event is lost either way; what the report adds
+    // is that the capture *knows* a request went unrecorded (AAP 0.5.5).
     failureTotal += 1;
+    reportProducerFailure('fetch', 'settle', error);
   }
 }
 
@@ -1203,6 +1678,12 @@ function settleRequest(record: RequestRecord, outcome: RequestOutcome): void {
  * what keeps `./continuation.ts` honest: a pending entry that never settles
  * would sit in its map until an age bound evicted it, and until then the
  * bound would be spent on a request nobody is waiting for.
+ *
+ * The in-flight counter is released only for a record of the current producer
+ * generation, for the reason {@link settleRequest} states: an earlier
+ * generation's count was already zeroed by the boundary that ended it, and
+ * subtracting again would make the number describe fewer requests than are
+ * actually in flight.
  */
 function abandonRequest(record: RequestRecord): void {
   try {
@@ -1211,15 +1692,18 @@ function abandonRequest(record: RequestRecord): void {
     }
     record.settled = true;
 
-    if (isCurrentCycle(record)) {
+    if (isCurrentGeneration(record)) {
       inFlightCount = inFlightCount > 0 ? inFlightCount - 1 : 0;
     }
     if (record.continuation) {
       cancelPendingContinuation(record.spanId);
     }
-  } catch {
-    // Best effort by construction: both steps above are independent.
+  } catch (error: unknown) {
+    // Best effort by construction: both steps above are independent. A
+    // continuation that could not be withdrawn holds one entry in
+    // `./continuation.ts`'s bound until it ages out, which is worth stating.
     failureTotal += 1;
+    reportProducerFailure('fetch', 'abandon', error);
   }
 }
 
@@ -1246,10 +1730,12 @@ function responseOutcome(response: Response): RequestOutcome {
     if (typeof type === 'string' && type !== '') {
       responseType = type;
     }
-  } catch {
+  } catch (error: unknown) {
     // An opaque or exotic response object still produces an event; the two
-    // fields above are simply absent from it.
+    // fields above are simply absent from it, and the report says the event
+    // was emitted with less than it should carry.
     failureTotal += 1;
+    reportProducerFailure('fetch', 'response-read', error);
   }
 
   return {
@@ -1296,10 +1782,11 @@ function xhrOutcome(xhr: XMLHttpRequest, record: RequestRecord): RequestOutcome 
     if (typeof status === 'number' && Number.isFinite(status) && status > 0) {
       statusCode = status;
     }
-  } catch {
+  } catch (error: unknown) {
     // A host that throws while reading `status` in this state leaves the code
     // absent, which the `error` status below already implies.
     failureTotal += 1;
+    reportProducerFailure('fetch', 'xhr-status-read', error);
   }
 
   const terminal = record.terminal;
@@ -1418,6 +1905,20 @@ function planFetch(input: RequestInfo | URL, init: RequestInit | undefined): Fet
  * in which the patch exists without the original it must call — the one
  * failure mode that would leave the page without a working `fetch`.
  *
+ * **The caller's own argument list is what reaches the original.** The patch
+ * takes a rest parameter and forwards it with `Reflect.apply` (see
+ * {@link ForwardedFetchFn}), instead of rebuilding the call from named
+ * parameters. Rebuilding is equivalent *by WebIDL* — `fetch(url)` and
+ * `fetch(url, undefined)` are the same request to the host's own native
+ * function — and that equivalence is beside the point: `original` is whatever
+ * was on `window.fetch` when this module attached, and a page's or a library's
+ * pre-existing wrapper is ordinary JavaScript. Mocking libraries, polyfills
+ * and other instrumentation SDKs routinely branch on `arguments.length`, so
+ * handing such a wrapper two arguments where the application passed one is a
+ * change in the behaviour of the code under investigation, which is the first
+ * thing this module may not do. The only substitutions made are the copied
+ * carriers the injection produced, each in the slot it came from.
+ *
  * The settle handlers `return response` and `throw error` rather than
  * producing values of their own, so the promise this function returns settles
  * with **the same** `Response` instance or **the same** rejection reason the
@@ -1425,26 +1926,70 @@ function planFetch(input: RequestInfo | URL, init: RequestInit | undefined): Fet
  * `error.name`, cannot tell the difference.
  */
 function createFetchPatch(original: FetchFn, receiver: Window & typeof globalThis): FetchFn {
-  return (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+  const forward = original as ForwardedFetchFn;
+
+  const patchedFetch = (...args: unknown[]): Promise<Response> => {
     let plan: FetchPlan | undefined;
-    try {
-      plan = planFetch(input, init);
-    } catch {
-      // Any failure in planning costs the observation, never the request: the
-      // application's own arguments are forwarded below as if this module were
-      // not installed.
-      failureTotal += 1;
-      plan = undefined;
+    // `fetch()` with no arguments at all is a `TypeError` the host owes the
+    // application, so it is never planned: instrumenting it would invent a
+    // request nobody made, and injecting an `init` into it would turn the
+    // error into a real request to the document's own URL. The empty list
+    // falls through to the forward below and the original throws its own.
+    if (args.length > 0) {
+      try {
+        // The two carrier slots, read through the types the host declares for
+        // them. A page may of course pass anything at all, which is why every
+        // helper that reads either value — `asRequestLike`, `readUrlString`,
+        // `normalizeMethod` — is total over an arbitrary input, and why this
+        // assertion narrows the forwarded list without ever narrowing what is
+        // forwarded.
+        plan = planFetch(args[0] as RequestInfo | URL, args[1] as RequestInit | undefined);
+      } catch (error: unknown) {
+        // Any failure in planning costs the observation, never the request:
+        // the application's own arguments are forwarded below as if this
+        // module were not installed. An uninstrumented request is a hole in
+        // the trace — and therefore in the browser-to-server correlation — so
+        // it is stated rather than only counted (AAP 0.5.5).
+        failureTotal += 1;
+        reportProducerFailure('fetch', 'fetch-plan', error);
+        plan = undefined;
+      }
     }
 
     if (plan === undefined) {
-      return original.call(receiver, input, init);
+      // Planning was skipped, declined (capacity) or failed: the list goes
+      // through completely untouched, length included.
+      return Reflect.apply(forward, receiver, args);
+    }
+
+    // The caller's list, with nothing changed but the carriers the injection
+    // copied. `planFetch` returns the caller's own values unless it built a
+    // copy to hold the header, so an identity comparison is exactly the
+    // question "was a copy built for this slot?".
+    const forwarded: unknown[] = [...args];
+    if (plan.callInput !== forwarded[0]) {
+      // A `Request` copy carrying the header. Same slot, same length: the
+      // application's own `Request` is untouched and is simply not the object
+      // the host is handed.
+      forwarded[0] = plan.callInput;
+    }
+    if (plan.callInit !== forwarded[1]) {
+      // A copy of `init` carrying the header — and the one legitimate case in
+      // which the forwarded length may GROW, from one argument to two, when
+      // the application passed no `init` for the header to go in. It is the
+      // unavoidable cost of injecting a header on a call whose only other
+      // carrier would be a `Request` object this call does not have: without
+      // it there is no `traceparent`, and without the header the developer's
+      // browser half and server half are two disconnected traces (AAP 0.4.2).
+      // Nothing else about the list changes, and the growth cannot happen on a
+      // call that passed an `init` of its own.
+      forwarded[1] = plan.callInit;
     }
 
     const { record } = plan;
     let pending: Promise<Response>;
     try {
-      pending = original.call(receiver, plan.callInput, plan.callInit);
+      pending = Reflect.apply(forward, receiver, forwarded);
     } catch (error: unknown) {
       // `fetch` reports its failures by rejecting, so a synchronous throw
       // means the host refused to start the request at all. Nothing went on
@@ -1466,6 +2011,8 @@ function createFetchPatch(original: FetchFn, receiver: Window & typeof globalThi
       },
     );
   };
+
+  return withDeclaredArity(patchedFetch, original, FETCH_ARITY);
 }
 
 /*
@@ -1487,15 +2034,31 @@ function createFetchPatch(original: FetchFn, receiver: Window & typeof globalThi
  * clears the author request headers by specification, so a reused instance
  * starts each request with no header of its own, and a flag that survived
  * would silently suppress injection for the rest of the instance's life.
+ *
+ * The URL is **resolved here as well as recorded**, because `open` is where
+ * the platform resolves it; see {@link XhrState.resolvedHref}. Resolution is
+ * the only work this function does beyond storing three values, and it cannot
+ * throw: `resolveAbsolute` answers `undefined` for anything it cannot parse.
+ *
+ * Both values are taken as `unknown`, because they are the page's own
+ * arguments and this is an **observation**, not the call: `open` forwards the
+ * caller's list verbatim (see {@link createOpenPatch}), so the only thing that
+ * happens to a method or a URL here is that `normalizeMethod` and
+ * `readUrlString` — both total over any input — turn it into a label for the
+ * event. Coercing before the forward would be the argument rewriting this
+ * module must not do; declining to instrument an unusual value would lose the
+ * request from the capture for no gain.
  */
-function noteOpen(xhr: XMLHttpRequest, method: string, url: string | URL): void {
+function noteOpen(xhr: XMLHttpRequest, method: unknown, url: unknown): void {
   const states = xhrStates;
   if (states === undefined) {
     return;
   }
+  const asWritten = readUrlString(url);
   states.set(xhr, {
     method: normalizeMethod(method),
-    url: readUrlString(url),
+    url: asWritten,
+    resolvedHref: resolveAbsolute(asWritten)?.href,
     explicitTraceparent: false,
   });
 }
@@ -1533,7 +2096,14 @@ function planXhr(xhr: XMLHttpRequest, setHeader: XhrSetRequestHeaderFn): Request
   }
 
   const startedAt = nowEpochMs();
-  const resolved = resolveAbsolute(state.url);
+  // The `open`-time resolution, which is the one the platform will use. Only a
+  // request whose URL could not be resolved then is re-tried here, and then
+  // only so that a host which failed to resolve at `open` is no worse off than
+  // it was.
+  const resolved =
+    state.resolvedHref === undefined
+      ? resolveAbsolute(state.url)
+      : resolveAbsolute(state.resolvedHref);
   const context = resolveEventContext(startedAt);
   const spanId = newSpanId();
   const initiator = captureInitiatorStack();
@@ -1607,10 +2177,11 @@ function observeXhr(xhr: XMLHttpRequest, record: RequestRecord): void {
       },
       ONCE_OPTIONS,
     );
-  } catch {
+  } catch (error: unknown) {
     // A host or a page that refuses a listener on this object costs the
     // request its event; the send below still happens.
     failureTotal += 1;
+    reportProducerFailure('fetch', 'xhr-observe', error);
     abandonRequest(record);
   }
 }
@@ -1618,36 +2189,38 @@ function observeXhr(xhr: XMLHttpRequest, record: RequestRecord): void {
 /**
  * Build the replacement for `XMLHttpRequest.prototype.open`.
  *
- * Every argument is forwarded. The two-argument form is forwarded as such, and
- * the longer form normalises only `undefined` to the values the specification
- * itself defaults to (`async` is `true`, `username` and `password` are
- * `null`), so the request the host sees is the request the application asked
- * for.
+ * **Every argument is forwarded exactly as the caller wrote it**, through the
+ * caller's own list: `open(m, u)` reaches the original with two arguments,
+ * `open(m, u, false)` with three and a `false` that is still `false`, and a
+ * sixth argument nobody has ever passed with six. No slot is defaulted here.
+ * WebIDL would indeed resolve an omitted `async` to `true` and an omitted
+ * `username` / `password` to `null` for the host's own `open` — but the
+ * function being called is whatever was on the prototype when this module
+ * attached, and substituting a specification default for an omission is a
+ * different call for any wrapper that counts its arguments (see
+ * {@link createFetchPatch} for the same reasoning on `fetch`).
+ *
+ * The observation is taken before the forward, from the same arguments, and
+ * `noteOpen` normalises them for the *event* only.
  */
 function createOpenPatch(original: XhrOpenFn): XhrOpenFn {
-  return function patchedOpen(
-    this: XMLHttpRequest,
-    method: string,
-    url: string | URL,
-    ...rest: [async?: boolean, username?: string | null, password?: string | null]
-  ): void {
+  const forward = original as ForwardedXhrFn;
+
+  const patchedOpen = function patchedOpen(this: XMLHttpRequest, ...args: unknown[]): void {
     try {
-      noteOpen(this, method, url);
-    } catch {
+      noteOpen(this, args[0], args[1]);
+    } catch (error: unknown) {
       // A page that hands `open` an exotic method or URL object still gets its
-      // request opened; only the observation is lost.
+      // request opened; only the observation is lost — which is exactly what a
+      // reader of the capture needs told.
       failureTotal += 1;
+      reportProducerFailure('fetch', 'xhr-note-open', error);
     }
 
-    // One call form for both arities, and identical to either by
-    // specification: `open()` declares `optional boolean async = true` and
-    // `optional USVString? username = null` / `password = null`, and WebIDL
-    // resolves an `undefined` argument to a declared default. So
-    // `open(m, u)`, `open(m, u, undefined)` and `open(m, u, true, null, null)`
-    // are the same request, which is what lets the arguments be forwarded
-    // through a single typed call instead of through `arguments`.
-    original.call(this, method, url, rest[0] ?? true, rest[1] ?? null, rest[2] ?? null);
+    Reflect.apply(forward, this, args);
   };
+
+  return withDeclaredArity(patchedOpen, original, XHR_OPEN_ARITY);
 }
 
 /**
@@ -1656,49 +2229,69 @@ function createOpenPatch(original: XhrOpenFn): XhrOpenFn {
  * Reads the header **name** only, and only to compare it with
  * `traceparent` — a header value set by the application is never read, copied
  * or transported, which is what keeps an `Authorization` header out of this
- * module entirely. The call is always forwarded, unchanged, whatever the
- * comparison said.
+ * module entirely. The call is then forwarded as the caller's own list,
+ * whatever the comparison said and however many arguments there were: a third
+ * argument the specification does not declare is still the application's call
+ * to make and not this module's to drop.
  */
 function createSetRequestHeaderPatch(original: XhrSetRequestHeaderFn): XhrSetRequestHeaderFn {
-  return function patchedSetRequestHeader(this: XMLHttpRequest, name: string, value: string): void {
+  const forward = original as ForwardedXhrFn;
+
+  const patchedSetRequestHeader = function patchedSetRequestHeader(
+    this: XMLHttpRequest,
+    ...args: unknown[]
+  ): void {
     try {
+      const name = args[0];
       if (typeof name === 'string' && name.toLowerCase() === TRACEPARENT_HEADER) {
         const state = xhrStates?.get(this);
         if (state !== undefined) {
           state.explicitTraceparent = true;
         }
       }
-    } catch {
+    } catch (error: unknown) {
       // The worst case of a failure here is that this module injects its own
       // header over an application header it failed to notice, which
       // `injectIntoRequest`'s equivalent check makes impossible for `fetch`
-      // and which the host resolves for XHR by keeping both values.
+      // and which the host resolves for XHR by keeping both values. The header
+      // *name* is the only thing this block reads and neither it nor the value
+      // goes into the report.
       failureTotal += 1;
+      reportProducerFailure('fetch', 'xhr-note-header', error);
     }
 
-    original.call(this, name, value);
+    Reflect.apply(forward, this, args);
   };
+
+  return withDeclaredArity(patchedSetRequestHeader, original, XHR_SET_REQUEST_HEADER_ARITY);
 }
 
 /**
  * Build the replacement for `XMLHttpRequest.prototype.send`.
  *
- * The body is forwarded without being inspected, and the no-argument form is
- * forwarded as such. Instrumentation happens strictly before the forward, so
- * the `traceparent` header is set while the request is still in the state that
- * accepts headers.
+ * The body is never inspected and never rewritten: the caller's own list is
+ * forwarded, so `send()` reaches the original with **zero** arguments and
+ * `send(body)` with one. The specification would resolve an explicit
+ * `undefined` to the same `null` an omission resolves to, and that is again a
+ * statement about the host's own `send` rather than about the function on the
+ * prototype (see {@link createFetchPatch}); a wrapper that distinguishes "no
+ * body" from "a body of `undefined`" must keep seeing the difference.
+ *
+ * Instrumentation happens strictly before the forward, so the `traceparent`
+ * header is set while the request is still in the state that accepts headers.
  */
 function createSendPatch(original: XhrSendFn, setHeader: XhrSetRequestHeaderFn): XhrSendFn {
-  return function patchedSend(
-    this: XMLHttpRequest,
-    ...rest: [body?: Document | XMLHttpRequestBodyInit | null]
-  ): void {
+  const forward = original as ForwardedXhrFn;
+
+  const patchedSend = function patchedSend(this: XMLHttpRequest, ...args: unknown[]): void {
     let record: RequestRecord | undefined;
     try {
       record = planXhr(this, setHeader);
-    } catch {
-      // As for `fetch`: the observation is lost, the request is not.
+    } catch (error: unknown) {
+      // As for `fetch`: the observation is lost, the request is not, and the
+      // loss is stated.
       failureTotal += 1;
+      reportProducerFailure('fetch', 'xhr-plan', error);
       record = undefined;
     }
 
@@ -1707,11 +2300,7 @@ function createSendPatch(original: XhrSendFn, setHeader: XhrSetRequestHeaderFn):
     }
 
     try {
-      // One call form for both arities, as in `open`: `send()` declares
-      // `optional (Document or XMLHttpRequestBodyInit)? body = null`, so an
-      // `undefined` argument resolves to the same `null` an omitted one does.
-      // The body itself is never inspected.
-      original.call(this, rest[0]);
+      Reflect.apply(forward, this, args);
     } catch (error: unknown) {
       // `send` throws `InvalidStateError` when the host refuses to start the
       // request — no `open`, or an instance already sent. No request means no
@@ -1724,88 +2313,621 @@ function createSendPatch(original: XhrSendFn, setHeader: XhrSetRequestHeaderFn):
       throw error;
     }
   };
+
+  // `send` declares no required argument, so the host's fallback is zero — but
+  // the arity actually published is the replaced function's own, which a
+  // pre-existing wrapper may state differently.
+  return withDeclaredArity(patchedSend, original, XHR_SEND_ARITY);
 }
 
 /*
  * ---------------------------------------------------------------------------
  * Installation and restoration
  *
- * Four patched properties, installed independently and restored
+ * Four patched properties — `window.fetch` and three
+ * `XMLHttpRequest.prototype` methods — installed independently and restored
  * independently. The restore of each is guarded by an identity check, because
  * "put the original back" and "put *our* original back over whatever is there
  * now" are different operations and only the first is correct.
+ *
+ * Six rules hold across every function in this section. They are not tidiness:
+ * this module mutates two of the most heavily used APIs of somebody else's
+ * running application, and a patch that cannot be removed is a permanent
+ * modification of it — the exact opposite of the reversibility AAP 0.5.1
+ * requires and `../../tests/e2e/cleanup.spec.ts` asserts.
+ *
+ * 1. **Disarm before restoring.** {@link detachFetch} invalidates the attach
+ *    cycle and clears `attached` before a single property is touched, and
+ *    {@link restoreXhrPatch} releases the per-instance map whatever its
+ *    restorations achieved. A patch that outlives its restoration therefore
+ *    observes nothing: {@link isCurrentCycle} is false for every record,
+ *    {@link noteOpen} and {@link planXhr} return immediately, and no event and
+ *    no continuation can come out of it.
+ * 2. **One guard per step.** Every read, every assignment and every reference
+ *    drop sits in its own `try`. A property the page refuses to let us write
+ *    can never skip the restoration of the next one — the defect this section
+ *    was rewritten to remove.
+ * 3. **Retain what did not restore.** A slot's record is dropped only after
+ *    its own restoration has returned. A patch that is still installed is a
+ *    patch this module still knows how to remove, so the next
+ *    {@link detachFetch} tries again instead of having forgotten the original
+ *    for the life of the document.
+ * 4. **Publish before mutating.** The whole rollback state reaches module
+ *    scope before the first assignment, so a throw part-way through an install
+ *    has everything it needs to undo the assignments that did land.
+ * 5. **Re-attaching repairs.** An install that finds its own retained patch
+ *    still in place re-adopts it and keeps the original it already saved,
+ *    instead of wrapping its own patch a second time — which would produce two
+ *    events and two `traceparent` decisions per request and would put the
+ *    host's own function permanently out of reach.
+ * 6. **Never overwrite an unresolved original.** The XHR rollback state is a
+ *    bounded list of per-prototype, per-slot {@link XhrPatchRecord}s
+ *    ({@link xhrPatchRecords}) rather than one set of references to "the"
+ *    prototype, because a page may replace the `XMLHttpRequest` constructor
+ *    between two captures. An install on a new prototype appends; it cannot
+ *    reach the records of an earlier one, so a patch whose restoration failed
+ *    on the prototype the page discarded stays known, is retried at every
+ *    detach and comes back out the moment the page allows it. At the bound the
+ *    install is refused and reported rather than granted
+ *    ({@link reserveXhrRecordRoom}) — a capture with no XHR signal is a stated
+ *    gap, a stranded patch is a permanent modification of the developer's
+ *    application.
+ *
+ * Every contained failure is also *stated*: `reportProducerFailure` posts a
+ * bounded, sanitized `agent.error` frame so a capture that lost the network
+ * signal is a capture known to have lost it (AAP 0.5.5), rather than one that
+ * merely counts the loss in {@link FetchStats.failures}. The frames carry a
+ * slot name and the thrown value's type — never a URL, a header, a body or a
+ * message, which are the application's data and are not redacted on the
+ * control channel.
  * ---------------------------------------------------------------------------
  */
 
 /**
- * Install the `fetch` patch on a window.
+ * Whether a patched property currently holds what we think it holds, for a
+ * check that must not throw either.
  *
- * @returns Whether the patch is now installed.
+ * The predicates handed to the two functions below read a property of a page
+ * object, and a page can back a prototype property with a throwing getter. A
+ * check that cannot be made is answered `false`, which is the conservative
+ * direction in both callers: an install does not claim a patch, and a restore
+ * keeps the references it would otherwise have dropped.
  */
-function installFetchPatch(target: Window & typeof globalThis): boolean {
+function checkQuietly(predicate: () => boolean): boolean {
   try {
-    // The original is deliberately kept unbound: it is re-invoked as
-    // `original.call(receiver, …)` so the host sees its own receiver, and
-    // `restoreFetchPatch` puts it back by identity — which a bound wrapper
-    // would defeat, since it would install a function the host never had.
-    // eslint-disable-next-line @typescript-eslint/unbound-method -- kept unbound on purpose; called with an explicit receiver and restored by identity.
-    const current: unknown = target.fetch;
-    if (typeof current !== 'function') {
-      return false;
-    }
-
-    const original = current as FetchFn;
-    const patched = createFetchPatch(original, target);
-    target.fetch = patched;
-
-    host = target;
-    originalFetch = original;
-    installedFetch = patched;
-    return true;
+    return predicate();
   } catch {
-    // A window whose `fetch` is a non-writable own property, or a host that
-    // throws on assignment: the module simply does not observe `fetch` here.
-    failureTotal += 1;
-    host = undefined;
-    originalFetch = undefined;
-    installedFetch = undefined;
     return false;
   }
 }
 
 /**
- * Restore `window.fetch`, if it is still ours to restore.
+ * Perform one patched-property assignment and report whether our function is
+ * in place afterwards.
  *
- * A mismatch means another library patched over this module after it
- * attached. Overwriting theirs would uninstall a working instrumentation the
- * developer may depend on, so theirs is left in place and the anomaly is
- * counted in {@link FetchStats.failures} — visible in the agent's diagnostics
- * rather than silent.
+ * The verification read is not redundant with the `try`: a property backed by
+ * a setter that ignores its argument accepts the assignment *without throwing*
+ * and leaves the host's own function installed. Claiming that as a patch would
+ * publish rollback state for a property this module never changed, and the
+ * detach that followed would restore over — or count as foreign — a function
+ * it had never fought with.
+ *
+ * @param stage Short, stable identifier of the slot, for the failure report.
+ * No application data: a slot name only.
+ * @param assign Performs the assignment. Whatever it throws is contained.
+ * @param isInstalled Reads the property back and compares it, by identity,
+ * with the function {@link assign} installs.
+ * @returns Whether the property now holds this module's patch.
  */
-function restoreFetchPatch(): void {
+function installPatchedSlot(
+  stage: string,
+  assign: () => void,
+  isInstalled: () => boolean,
+): boolean {
   try {
-    const target = host;
-    const installed = installedFetch;
-    const original = originalFetch;
-    if (target === undefined || installed === undefined || original === undefined) {
-      return;
+    assign();
+    if (isInstalled()) {
+      return true;
     }
 
+    // Accepted and discarded. The page keeps its own function and this module
+    // holds nothing here, which is a lost signal and so is reported.
+    failureTotal += 1;
+    reportProducerFailure('fetch', stage);
+    return false;
+  } catch (error: unknown) {
+    // A sealed prototype, a non-writable property, a setter that throws. The
+    // identity check decides whether anything landed *before* the throw — a
+    // setter may take the value and then fail — because a patch that is
+    // installed must be tracked whether or not the assignment reported success.
+    failureTotal += 1;
+    reportProducerFailure('fetch', stage, error);
+    return checkQuietly(isInstalled);
+  }
+}
+
+/**
+ * Put one original back, if the property is still ours to put back.
+ *
+ * The three outcomes are the whole of rule 3: only `restored` and `foreign`
+ * license the caller to forget the slot, and `retained` means our patch is
+ * still installed and must stay known. See {@link RestoreOutcome}.
+ *
+ * @param stage Short, stable identifier of the slot, for the failure report.
+ * @param isOurs Whether the property still holds the function this module
+ * installed.
+ * @param putBack Performs the restoring assignment.
+ * @returns What the attempt achieved.
+ */
+function restorePatchedSlot(
+  stage: string,
+  isOurs: () => boolean,
+  putBack: () => void,
+): RestoreOutcome {
+  try {
+    if (!isOurs()) {
+      // Another library patched over this module after it attached.
+      // Overwriting theirs would uninstall a working instrumentation the
+      // developer may depend on, so theirs is left in place and the anomaly is
+      // counted in `FetchStats.failures`. It is an observation about the page
+      // rather than a failure of this teardown, which is why it is counted and
+      // not reported as a cleanup error.
+      failureTotal += 1;
+      return 'foreign';
+    }
+
+    putBack();
+
+    if (isOurs()) {
+      // The restoring assignment was swallowed by a setter that keeps its own
+      // value: our patch is still installed, so its references are kept and
+      // the next detach tries again.
+      failureTotal += 1;
+      reportProducerFailure('fetch', stage);
+      return 'retained';
+    }
+
+    return 'restored';
+  } catch (error: unknown) {
+    // A frozen window or prototype, a cross-realm object at teardown, a
+    // throwing accessor. Our patch is presumed still installed.
+    failureTotal += 1;
+    reportProducerFailure('fetch', stage, error);
+    return 'retained';
+  }
+}
+
+/**
+ * Install the `fetch` patch on a window.
+ *
+ * Idempotent in the way that matters (rule 5): called while our own retained
+ * patch is still on the window — which is the state a failed restoration
+ * leaves — it re-adopts that patch and the original saved with it rather than
+ * wrapping itself.
+ *
+ * @param target The window whose `fetch` is patched and whose receiver the
+ * original is called with.
+ * @returns Whether this module's patch is now installed on `target.fetch`.
+ */
+function installFetchPatch(target: Window & typeof globalThis): boolean {
+  let current: unknown;
+  try {
+    // The original is deliberately kept unbound: it is re-invoked as
+    // `Reflect.apply(original, receiver, args)` so the host sees its own
+    // receiver and the caller's own argument list, and `restoreFetchPatch`
+    // puts it back by identity — which a bound wrapper would defeat, since it
+    // would install a function the host never had.
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- kept unbound on purpose; called with an explicit receiver and restored by identity.
+    current = target.fetch;
+  } catch (error: unknown) {
+    // A window that throws while reading `fetch`: the module simply does not
+    // observe `fetch` here.
+    failureTotal += 1;
+    reportProducerFailure('fetch', 'fetch-read', error);
+    return false;
+  }
+
+  if (typeof current !== 'function') {
+    return false;
+  }
+
+  const held = installedFetch;
+  if (host === target && held !== undefined && current === held && originalFetch !== undefined) {
+    // Rule 5. The patch is live, the original behind it is still saved, and
+    // the fresh attach cycle is enough to re-arm it.
+    return true;
+  }
+
+  const original = current as FetchFn;
+  const patched = createFetchPatch(original, target);
+
+  // Rule 4: published before the assignment, so a host that takes the value
+  // and *then* throws does not leave a patch nothing can restore.
+  host = target;
+  originalFetch = original;
+  installedFetch = patched;
+
+  const installed = installPatchedSlot(
+    'fetch-install',
+    () => {
+      target.fetch = patched;
+    },
+    () => target.fetch === patched,
+  );
+  if (installed) {
+    return true;
+  }
+
+  // Nothing of ours reached the window — a `fetch` that is a non-writable own
+  // property, or a host that refused the assignment outright. The references
+  // are dropped so a later detach neither restores over nor counts as foreign
+  // a property this module never wrote.
+  host = undefined;
+  originalFetch = undefined;
+  installedFetch = undefined;
+  return false;
+}
+
+/**
+ * Restore `window.fetch`, if it is still ours to restore.
+ *
+ * Nothing is dropped in a `finally`: the saved original is this module's only
+ * route back to the host's own `fetch`, and forgetting it because the
+ * assignment failed would make the patch permanent. On `retained` the
+ * references stay exactly as they are, which both lets the next
+ * {@link detachFetch} try again and lets {@link installFetchPatch} re-adopt
+ * the patch instead of wrapping it.
+ */
+function restoreFetchPatch(): void {
+  const target = host;
+  const installed = installedFetch;
+  const original = originalFetch;
+  if (target === undefined || installed === undefined || original === undefined) {
+    return;
+  }
+
+  const outcome = restorePatchedSlot(
+    'fetch-restore',
     // An identity comparison, not a call: the reference is never invoked, and
     // `unbound-method` exempts a comparison for exactly that reason.
-    if (target.fetch === installed) {
+    () => target.fetch === installed,
+    () => {
       target.fetch = original;
-    } else {
-      failureTotal += 1;
+    },
+  );
+
+  if (outcome === 'retained') {
+    return;
+  }
+
+  host = undefined;
+  installedFetch = undefined;
+  originalFetch = undefined;
+}
+
+/**
+ * The record this module holds for one prototype property, newest first.
+ *
+ * Newest first because a foreign patch installed *over* a retained one leaves
+ * two records for the same property: the older one is buried under someone
+ * else's wrapper and can no longer be restored by identity, while the newer
+ * one is the patch actually in the property. Adoption (rule 5) must consider
+ * the newer one, and the caller confirms by identity in any case.
+ *
+ * Returns the union; the caller narrows with `record.slot === …`, which is
+ * what gives `original` and `installed` their concrete function types without
+ * a cast.
+ *
+ * @param prototype The prototype the record must belong to. A record for
+ * another prototype is never returned, which is rule 6: an install on a
+ * replaced constructor cannot see — and so cannot overwrite — the rollback
+ * state of the prototype the page discarded.
+ * @param slot Which property is being asked about.
+ * @returns The most recent record for that prototype and property, or
+ * `undefined` if this module holds none.
+ */
+function findXhrRecord(prototype: XMLHttpRequest, slot: XhrSlot): XhrPatchRecord | undefined {
+  for (let index = xhrPatchRecords.length - 1; index >= 0; index -= 1) {
+    const record = xhrPatchRecords[index];
+    if (record !== undefined && record.prototype === prototype && record.slot === slot) {
+      return record;
     }
-  } catch {
-    // A frozen or cross-realm window at teardown; the references are dropped
-    // by the caller either way.
+  }
+  return undefined;
+}
+
+/**
+ * Forget one record, by identity.
+ *
+ * Called only where this module holds nothing in the property the record names
+ * — an assignment that did not land, or a restoration that did — so that what
+ * is retained is exactly what is still installed (rule 3).
+ *
+ * @param target The record to drop. Identity comparison, so a record for the
+ * same prototype and slot installed since is left alone.
+ */
+function dropXhrRecord(target: XhrPatchRecord): void {
+  xhrPatchRecords = xhrPatchRecords.filter((record) => record !== target);
+}
+
+/**
+ * Put one record's original back, if its property is still ours to put back.
+ *
+ * The `switch` is the whole reason {@link XhrPatchRecord} is discriminated: in
+ * each arm `installed` and `original` have the one function type the property
+ * accepts, so the identity check and the restoring assignment need no cast and
+ * no shared supertype.
+ *
+ * @param record The prototype, property, original and patch to reverse.
+ * @returns What the attempt achieved; `retained` means the patch is still
+ * installed and the record must be kept.
+ */
+function restoreXhrRecord(record: XhrPatchRecord): RestoreOutcome {
+  const { prototype } = record;
+
+  // The two references are read into locals inside each arm, not destructured
+  // ahead of the `switch`: destructuring the union loses the discrimination,
+  // and each arm needs the one function type its property accepts.
+  switch (record.slot) {
+    case 'open': {
+      const { installed, original } = record;
+      return restorePatchedSlot(
+        'xhr-restore-open',
+        () => prototype.open === installed,
+        () => {
+          prototype.open = original;
+        },
+      );
+    }
+    case 'send': {
+      const { installed, original } = record;
+      return restorePatchedSlot(
+        'xhr-restore-send',
+        () => prototype.send === installed,
+        () => {
+          prototype.send = original;
+        },
+      );
+    }
+    case 'setRequestHeader': {
+      const { installed, original } = record;
+      return restorePatchedSlot(
+        'xhr-restore-set-request-header',
+        () => prototype.setRequestHeader === installed,
+        () => {
+          prototype.setRequestHeader = original;
+        },
+      );
+    }
+  }
+}
+
+/**
+ * Walk the records oldest first, restoring each and keeping only what did not
+ * come back.
+ *
+ * Oldest first so that residue on a prototype the page has since replaced is
+ * retried *before* the live prototype's own slots — it has been waiting
+ * longest, and a page that unseals it (a mock removed, a library's own
+ * teardown running) gets it back at the very next detach (rule 6).
+ *
+ * The list is snapshotted before the walk because every step calls into page
+ * code — a setter on the prototype property — and the module state it would
+ * re-enter is this list. Records the walk resolved are then removed by
+ * identity, which leaves both the retained ones and anything a re-entrant
+ * install appended in their install order.
+ *
+ * @param shouldAttempt Which records to try. The bound path passes a predicate
+ * that excludes the prototype an install is about to adopt on, because
+ * restoring a slot that install intends to re-adopt would leave it claiming a
+ * patch that is no longer installed.
+ */
+function restoreXhrRecords(shouldAttempt: (record: XhrPatchRecord) => boolean): void {
+  const walked = [...xhrPatchRecords];
+  const resolved = new Set<XhrPatchRecord>();
+
+  for (const record of walked) {
+    if (!shouldAttempt(record)) {
+      continue;
+    }
+    if (restoreXhrRecord(record) !== 'retained') {
+      resolved.add(record);
+    }
+  }
+
+  if (resolved.size === 0) {
+    return;
+  }
+
+  xhrPatchRecords = xhrPatchRecords.filter((record) => !resolved.has(record));
+}
+
+/**
+ * Decide whether an install has room for the records it needs, and make room
+ * if it can.
+ *
+ * The bound exists because records are retained across a detach exactly when
+ * the page refused a restoration, and a page can replace `XMLHttpRequest`
+ * without limit. Its enforcement is the one place rule 6 has to choose between
+ * two bad outcomes, and it chooses the visible one:
+ *
+ * 1. Room already available — install.
+ * 2. Otherwise, retry the residue on *other* prototypes first. A record that
+ *    finally restores frees its room, so the common case of one long-dead
+ *    prototype whose property the page has since unsealed resolves itself here
+ *    and the install proceeds. The prototype being installed on is excluded:
+ *    its own records are what an adopting install re-adopts.
+ * 3. Still no room — **refuse**. No patch is installed, the XHR signal is
+ *    absent for this capture and says so through
+ *    `reportProducerFailure('fetch', 'xhr-residue-bound')` (AAP 0.5.5), and
+ *    every retained record keeps pointing at the original it can still put
+ *    back. The alternative — dropping the oldest record to make room — would
+ *    strand that patch in the developer's application for the life of the
+ *    document, which is precisely the defect this design removes.
+ *
+ * @param prototype The prototype the install would patch.
+ * @param adopted How many of the three slots are already installed and are
+ * being re-adopted rather than assigned; each of those already has its record.
+ * @returns Whether the install may proceed.
+ */
+function reserveXhrRecordRoom(prototype: XMLHttpRequest, adopted: number): boolean {
+  const needed = XHR_SLOT_COUNT - adopted;
+  if (xhrPatchRecords.length + needed <= MAX_XHR_PATCH_RECORDS) {
+    return true;
+  }
+
+  restoreXhrRecords((record) => record.prototype !== prototype);
+
+  if (xhrPatchRecords.length + needed <= MAX_XHR_PATCH_RECORDS) {
+    return true;
+  }
+
+  failureTotal += 1;
+  reportProducerFailure('fetch', 'xhr-residue-bound', undefined, {
+    retained: xhrPatchRecords.length,
+  });
+  return false;
+}
+
+/**
+ * The three originals and the three patches an install will use, decided
+ * before anything is assigned.
+ *
+ * Deciding first is what makes rule 4 possible: the rollback state cannot be
+ * published ahead of the first assignment unless every part of it is already
+ * known, and `createSendPatch` must be given the *original*
+ * `setRequestHeader` (see {@link planXhr}) rather than whatever the prototype
+ * holds once patching has begun.
+ */
+interface XhrInstallPlan {
+  /** The prototype the patches go on, read once. */
+  readonly prototype: XMLHttpRequest;
+  /** The `open` to restore, which for an adopted slot is the one already saved. */
+  readonly originalOpen: XhrOpenFn;
+  /** The `send` to restore. */
+  readonly originalSend: XhrSendFn;
+  /** The `setRequestHeader` to restore, and the one `send` injects through. */
+  readonly originalSetRequestHeader: XhrSetRequestHeaderFn;
+  /** The `open` patch to install, or the one already installed. */
+  readonly patchedOpen: XhrOpenFn;
+  /** The `send` patch to install, or the one already installed. */
+  readonly patchedSend: XhrSendFn;
+  /** The `setRequestHeader` patch to install, or the one already installed. */
+  readonly patchedSetRequestHeader: XhrSetRequestHeaderFn;
+  /**
+   * Slots that already hold this module's patch from an earlier install whose
+   * restoration failed, and are therefore re-adopted rather than assigned
+   * (rule 5).
+   */
+  readonly adopted: ReadonlySet<XhrSlot>;
+}
+
+/**
+ * Decide what an XHR install would do, without doing any of it.
+ *
+ * Returns `undefined` on a host with no `XMLHttpRequest`, or one whose three
+ * methods are not all functions — the instrumentation needs the URL from
+ * `open`, the application's own header from `setRequestHeader` and the start
+ * from `send`, so a prototype missing any of them is not instrumented at all.
+ */
+function planXhrInstall(): XhrInstallPlan | undefined {
+  try {
+    if (typeof XMLHttpRequest === 'undefined') {
+      return undefined;
+    }
+
+    const prototype = XMLHttpRequest.prototype;
+    /* eslint-disable @typescript-eslint/unbound-method -- prototype methods
+       are captured unbound on purpose: each is re-invoked with the calling
+       instance as its receiver (`original.call(this, …)`) and restored by
+       identity at detach. Binding them would break both. */
+    const currentOpen: unknown = prototype.open;
+    const currentSend: unknown = prototype.send;
+    const currentSetRequestHeader: unknown = prototype.setRequestHeader;
+    /* eslint-enable @typescript-eslint/unbound-method */
+
+    if (
+      typeof currentOpen !== 'function' ||
+      typeof currentSend !== 'function' ||
+      typeof currentSetRequestHeader !== 'function'
+    ) {
+      return undefined;
+    }
+
+    // Rule 5 applies per slot, and rule 6 confines it to the prototype the
+    // record was taken on: a page that swapped the global constructor gets a
+    // fresh install on the new prototype, and the records of the old one are
+    // left untouched for a later detach to retry.
+    const adopted = new Set<XhrSlot>();
+
+    const openRecord = findXhrRecord(prototype, 'open');
+    let originalOpenFn: XhrOpenFn;
+    let patchedOpenFn: XhrOpenFn;
+    if (
+      openRecord !== undefined &&
+      openRecord.slot === 'open' &&
+      currentOpen === openRecord.installed
+    ) {
+      originalOpenFn = openRecord.original;
+      patchedOpenFn = openRecord.installed;
+      adopted.add('open');
+    } else {
+      originalOpenFn = currentOpen as XhrOpenFn;
+      patchedOpenFn = createOpenPatch(originalOpenFn);
+    }
+
+    const headerRecord = findXhrRecord(prototype, 'setRequestHeader');
+    let originalSetRequestHeaderFn: XhrSetRequestHeaderFn;
+    let patchedSetRequestHeaderFn: XhrSetRequestHeaderFn;
+    if (
+      headerRecord !== undefined &&
+      headerRecord.slot === 'setRequestHeader' &&
+      currentSetRequestHeader === headerRecord.installed
+    ) {
+      originalSetRequestHeaderFn = headerRecord.original;
+      patchedSetRequestHeaderFn = headerRecord.installed;
+      adopted.add('setRequestHeader');
+    } else {
+      originalSetRequestHeaderFn = currentSetRequestHeader as XhrSetRequestHeaderFn;
+      patchedSetRequestHeaderFn = createSetRequestHeaderPatch(originalSetRequestHeaderFn);
+    }
+
+    const sendRecord = findXhrRecord(prototype, 'send');
+    let originalSendFn: XhrSendFn;
+    let patchedSendFn: XhrSendFn;
+    if (
+      sendRecord !== undefined &&
+      sendRecord.slot === 'send' &&
+      currentSend === sendRecord.installed
+    ) {
+      originalSendFn = sendRecord.original;
+      patchedSendFn = sendRecord.installed;
+      adopted.add('send');
+    } else {
+      originalSendFn = currentSend as XhrSendFn;
+      // The send patch injects through the *original* `setRequestHeader`, not
+      // through the patch installed beside it; see `planXhr`. The original of
+      // an adopted header slot is the one saved at its first install, which is
+      // why that slot is resolved above this one.
+      patchedSendFn = createSendPatch(originalSendFn, originalSetRequestHeaderFn);
+    }
+
+    return {
+      prototype,
+      originalOpen: originalOpenFn,
+      originalSend: originalSendFn,
+      originalSetRequestHeader: originalSetRequestHeaderFn,
+      patchedOpen: patchedOpenFn,
+      patchedSend: patchedSendFn,
+      patchedSetRequestHeader: patchedSetRequestHeaderFn,
+      adopted,
+    };
+  } catch (error: unknown) {
+    // A prototype whose methods cannot be read, or a `createXPatch` that
+    // failed: nothing has been mutated, so there is nothing to undo.
     failureTotal += 1;
-  } finally {
-    host = undefined;
-    installedFetch = undefined;
-    originalFetch = undefined;
+    reportProducerFailure('fetch', 'xhr-plan-install', error);
+    return undefined;
   }
 }
 
@@ -1815,121 +2937,158 @@ function restoreFetchPatch(): void {
  * All three or none: the instrumentation needs the URL from `open`, the
  * application's own header from `setRequestHeader` and the start from `send`,
  * and a partial install would produce events with missing fields rather than
- * no events. A failure part-way through rolls the whole thing back.
+ * no events. A failure part-way through rolls back exactly the slots that
+ * landed — which is only possible because each slot's {@link XhrPatchRecord}
+ * reaches module state before its assignment (rule 4) and is dropped again
+ * only when nothing of ours landed — and leaves this module **not** attached
+ * to XHR.
  *
- * @returns Whether the patches are now installed.
+ * The records are appended, never overwritten (rule 6), so an install on a
+ * prototype the page installed after a failed teardown cannot cost the
+ * previous prototype its route back. {@link reserveXhrRecordRoom} is what
+ * keeps that unbounded-looking promise bounded, and what refuses the install
+ * when it cannot be kept.
+ *
+ * @returns Whether all three patches are now installed.
  */
 function installXhrPatch(): boolean {
   try {
-    if (typeof XMLHttpRequest === 'undefined') {
+    const plan = planXhrInstall();
+    if (plan === undefined) {
       return false;
     }
 
-    const prototype = XMLHttpRequest.prototype;
-    /* eslint-disable @typescript-eslint/unbound-method -- prototype methods
-       are captured unbound on purpose: each is re-invoked with the calling
-       instance as its receiver (`original.call(this, …)`) and restored by
-       identity at detach. Binding them would break both. */
-    const open: unknown = prototype.open;
-    const send: unknown = prototype.send;
-    const setRequestHeader: unknown = prototype.setRequestHeader;
-    /* eslint-enable @typescript-eslint/unbound-method */
+    const { prototype } = plan;
 
-    if (
-      typeof open !== 'function' ||
-      typeof send !== 'function' ||
-      typeof setRequestHeader !== 'function'
-    ) {
+    if (!reserveXhrRecordRoom(prototype, plan.adopted.size)) {
+      // Refused, reported, and nothing mutated: the capture has no XHR signal
+      // rather than a patch this module could not promise to remove.
       return false;
     }
 
-    const originalOpenFn = open as XhrOpenFn;
-    const originalSendFn = send as XhrSendFn;
-    const originalSetRequestHeaderFn = setRequestHeader as XhrSetRequestHeaderFn;
+    // Rule 2: three independent assignments. Rule 4: each slot's record is in
+    // module scope before its property is written, and is dropped again only
+    // when the assignment left nothing of ours behind — so rollback state for
+    // a property that was never changed is never mistaken for a patch. An
+    // adopted slot is already installed and already has its record.
+    let openInstalled = plan.adopted.has('open');
+    if (!openInstalled) {
+      const patched = plan.patchedOpen;
+      const record: XhrPatchRecord = {
+        prototype,
+        slot: 'open',
+        original: plan.originalOpen,
+        installed: patched,
+      };
+      xhrPatchRecords.push(record);
+      openInstalled = installPatchedSlot(
+        'xhr-install-open',
+        () => {
+          prototype.open = patched;
+        },
+        () => prototype.open === patched,
+      );
+      if (!openInstalled) {
+        dropXhrRecord(record);
+      }
+    }
 
-    const patchedOpen = createOpenPatch(originalOpenFn);
-    const patchedSetRequestHeader = createSetRequestHeaderPatch(originalSetRequestHeaderFn);
-    // The send patch injects through the *original* `setRequestHeader`, not
-    // through the patch installed below; see `planXhr`.
-    const patchedSend = createSendPatch(originalSendFn, originalSetRequestHeaderFn);
+    let sendInstalled = plan.adopted.has('send');
+    if (!sendInstalled) {
+      const patched = plan.patchedSend;
+      const record: XhrPatchRecord = {
+        prototype,
+        slot: 'send',
+        original: plan.originalSend,
+        installed: patched,
+      };
+      xhrPatchRecords.push(record);
+      sendInstalled = installPatchedSlot(
+        'xhr-install-send',
+        () => {
+          prototype.send = patched;
+        },
+        () => prototype.send === patched,
+      );
+      if (!sendInstalled) {
+        dropXhrRecord(record);
+      }
+    }
 
-    prototype.open = patchedOpen;
-    prototype.send = patchedSend;
-    prototype.setRequestHeader = patchedSetRequestHeader;
+    let headerInstalled = plan.adopted.has('setRequestHeader');
+    if (!headerInstalled) {
+      const patched = plan.patchedSetRequestHeader;
+      const record: XhrPatchRecord = {
+        prototype,
+        slot: 'setRequestHeader',
+        original: plan.originalSetRequestHeader,
+        installed: patched,
+      };
+      xhrPatchRecords.push(record);
+      headerInstalled = installPatchedSlot(
+        'xhr-install-set-request-header',
+        () => {
+          prototype.setRequestHeader = patched;
+        },
+        () => prototype.setRequestHeader === patched,
+      );
+      if (!headerInstalled) {
+        dropXhrRecord(record);
+      }
+    }
 
-    xhrPrototype = prototype;
-    originalOpen = originalOpenFn;
-    originalSend = originalSendFn;
-    originalSetRequestHeader = originalSetRequestHeaderFn;
-    installedOpen = patchedOpen;
-    installedSend = patchedSend;
-    installedSetRequestHeader = patchedSetRequestHeader;
-    xhrStates = new WeakMap();
-    return true;
-  } catch {
-    // A sealed prototype, or a host that rejects one of the assignments: undo
-    // whatever landed so the page is left exactly as it was.
+    if (openInstalled && sendInstalled && headerInstalled) {
+      // The map is created last, on the success path only: it is what arms the
+      // patches (`noteOpen`, `planXhr`), so a rolled-back install never leaves
+      // an armed patch behind.
+      xhrStates = new WeakMap();
+      return true;
+    }
+
+    // A partial patch is not an instrumentation, and leaving one installed
+    // would be a change to the application this module could not undo. The
+    // failing slot has already reported itself; this undoes exactly the slots
+    // that landed, retaining anything that will not come back out so the next
+    // detach can try again.
+    restoreXhrPatch();
+    return false;
+  } catch (error: unknown) {
+    // Structural: every step above guards itself, and this is the guarantee
+    // that an install cannot throw into the page whatever a host does.
     failureTotal += 1;
+    reportProducerFailure('fetch', 'xhr-install', error);
     restoreXhrPatch();
     return false;
   }
 }
 
 /**
- * Restore the three `XMLHttpRequest.prototype` methods, each only if it is
- * still ours.
+ * Restore every `XMLHttpRequest.prototype` property this module still holds,
+ * on every prototype it holds one on, each independently of the others.
  *
- * The prototype captured at install is used rather than
+ * The prototypes come from {@link xhrPatchRecords} rather than from
  * `XMLHttpRequest.prototype` read again, because a page may have replaced the
- * global constructor in between — in which case the methods to restore are
- * the ones that were patched, not whichever object the name now resolves to.
+ * global constructor — possibly several times — since the patches went on. The
+ * methods to restore are the ones that were patched, not whichever object the
+ * name now resolves to, and that includes the prototype of a constructor the
+ * page has already discarded: its patch is still installed in it, so it is
+ * still this module's to remove (rule 6).
+ *
+ * Nothing is dropped in a `finally`. A single `try` around all the
+ * restorations, with the records released regardless of the outcome, is
+ * precisely the shape that leaves methods patched for the life of the document
+ * with their originals forgotten; each record is therefore dropped only after
+ * its own restoration has returned (rule 3), and a record that did not come
+ * back is retried at the next detach.
  */
 function restoreXhrPatch(): void {
-  const prototype = xhrPrototype;
-  try {
-    if (prototype === undefined) {
-      return;
-    }
+  restoreXhrRecords(() => true);
 
-    // Every read below is an identity comparison rather than a call, so no
-    // receiver is ever lost and nothing is invoked unbound.
-    if (installedOpen !== undefined && originalOpen !== undefined) {
-      if (prototype.open === installedOpen) {
-        prototype.open = originalOpen;
-      } else {
-        failureTotal += 1;
-      }
-    }
-
-    if (installedSend !== undefined && originalSend !== undefined) {
-      if (prototype.send === installedSend) {
-        prototype.send = originalSend;
-      } else {
-        failureTotal += 1;
-      }
-    }
-
-    if (installedSetRequestHeader !== undefined && originalSetRequestHeader !== undefined) {
-      if (prototype.setRequestHeader === installedSetRequestHeader) {
-        prototype.setRequestHeader = originalSetRequestHeader;
-      } else {
-        failureTotal += 1;
-      }
-    }
-  } catch {
-    // Each restore above is independent, so a failure in one leaves the
-    // others done; the references are dropped below regardless.
-    failureTotal += 1;
-  } finally {
-    xhrPrototype = undefined;
-    installedOpen = undefined;
-    originalOpen = undefined;
-    installedSend = undefined;
-    originalSend = undefined;
-    installedSetRequestHeader = undefined;
-    originalSetRequestHeader = undefined;
-    xhrStates = undefined;
-  }
+  // Rule 1, and unconditional: the per-instance map is what arms the patches,
+  // so releasing it disarms even a patch that could not be removed — `noteOpen`
+  // and `planXhr` both return immediately without it. It is also this module's
+  // only reference to any request the developer made.
+  xhrStates = undefined;
 }
 
 /*
@@ -1957,6 +3116,14 @@ function restoreXhrPatch(): void {
  * says so; the Node preload and the service import this package without ever
  * reaching this function.
  *
+ * **Re-attaching repairs.** A previous detach that could not put a property
+ * back leaves this module's patch installed *and known*; this call re-adopts
+ * such a patch with the original already saved behind it, instead of wrapping
+ * it a second time (see rule 5 of the installation section). That is why a
+ * transport is reported installed only when its patch — every one of the three
+ * XHR properties — is actually in place: a partial XHR patch is rolled back and
+ * reported rather than counted as an attachment.
+ *
  * Never throws. A failure part-way through detaches, so the module is either
  * fully attached or fully detached and never holds a patch it cannot restore.
  */
@@ -1966,10 +3133,10 @@ export function attachFetch(): void {
       return;
     }
 
-    // Bumped before anything is installed: every record planned from here on
-    // belongs to this cycle, and every record from a previous one is already
-    // invalid (see `cycle`).
-    cycle += 1;
+    // Advanced before anything is installed: every record planned from here
+    // on belongs to this generation, and every record from a previous one is
+    // already invalid (see `generation`).
+    generation += 1;
     agentScriptUrl = detectAgentScriptUrl();
 
     const fetchInstalled = installFetchPatch(window);
@@ -1978,11 +3145,15 @@ export function attachFetch(): void {
 
     if (!attached) {
       // Neither transport could be patched. Release the little state that was
-      // taken so the module is indistinguishable from never having attached.
+      // taken so the module is indistinguishable from never having attached,
+      // and say so: a capture whose network signal is missing entirely must
+      // not look like one that simply saw no requests (AAP 0.5.5).
+      reportProducerFailure('fetch', 'attach-unavailable');
       detachFetch();
     }
-  } catch {
+  } catch (error: unknown) {
     failureTotal += 1;
+    reportProducerFailure('fetch', 'attach', error);
     detachFetch();
   }
 }
@@ -2000,30 +3171,92 @@ export function attachFetch(): void {
  *
  * **Requests already on the wire are left alone.** They complete normally and
  * deliver their responses to the application, and they report *nothing*: the
- * attach cycle they were planned in is no longer current, so their settle
- * handlers emit no event and settle no continuation. An event that arrived
- * after the developer stopped the capture would be an observation of a capture
- * that had ended.
+ * producer generation they were planned in is no longer current, so their
+ * settle handlers emit no event and settle no continuation. An event that
+ * arrived after the developer stopped the capture would be an observation of a
+ * capture that had ended.
+ *
+ * **A property that will not come back out is retried, not forgotten.** Each
+ * of the four is restored in its own guard, and one that fails keeps its saved
+ * original so a later call can put it back — while this call still leaves the
+ * module disarmed and detached, because {@link isFetchAttached} means
+ * "observing" and a patch this module has stopped listening to observes
+ * nothing. The failure is reported as an `agent.error` frame (AAP 0.5.5), so a
+ * capture cannot end with a silently unremoved patch.
  *
  * Safe to call when already detached, and never throws.
+ *
+ * @see advanceFetchGeneration for the same invalidation *without* detaching,
+ * which is what a move from one capture to the next needs.
  */
 export function detachFetch(): void {
   try {
-    // First, and unconditionally: this is what invalidates every in-flight
-    // record, and it must hold even if a restore below fails.
-    cycle += 1;
+    // First, and unconditionally: together these disarm every patch still
+    // installed — `isCurrentGeneration` is false for every in-flight record and
+    // for every record a retained patch could still plan — and they must hold
+    // even if a restore below fails.
+    generation += 1;
+    attached = false;
 
     restoreFetchPatch();
     restoreXhrPatch();
-  } catch {
-    // Both restores guard their own bodies; this is the structural guarantee
-    // that a teardown cannot throw into the agent's hook handling.
+  } catch (error: unknown) {
+    // Both restores guard their own bodies and each of their steps; this is the
+    // structural guarantee that a teardown cannot throw into the agent's hook
+    // handling.
     failureTotal += 1;
+    reportProducerFailure('fetch', 'detach', error);
   } finally {
     inFlightCount = 0;
     agentScriptUrl = undefined;
     attached = false;
   }
+}
+
+/**
+ * Start a new producer generation, leaving both patches installed.
+ *
+ * Called by `./agent.ts`'s `arm()` when an `agent.config` moves the bound tab
+ * from one capture to the next — a new `captureId` with the network hook still
+ * enabled. Nothing may detach: the developer is still capturing requests, and
+ * a detach/attach pair would restore and re-patch two of the application's
+ * most heavily used APIs for no reason and would lose any request opened but
+ * not yet sent. What must not survive the boundary is the *evidence* of the
+ * capture that just ended. A request that went on the wire during capture A
+ * settles during capture B; `./transport.ts` has already restarted its
+ * sequence for B, so the event would be stamped with B's `captureId` and a
+ * `seq` from B's sequence — AAP 0.2.3 scopes `seq` to
+ * `(producerId, captureId)` — and capture A's request would be reported as
+ * part of capture B's evidence, under a sequence number that belongs to
+ * another event.
+ *
+ * Advancing the generation makes every record planned before this call stale,
+ * which {@link isCurrentGeneration} already turns into the three guarantees
+ * that matter: no event, no continuation settle, no counter movement.
+ *
+ * `inFlightCount` is zeroed for exactly the reason {@link detachFetch} zeroes
+ * it. A stale record returns from {@link settleRequest} *before* the
+ * decrement, so a count left standing would never come back down: it would
+ * climb with every capture boundary until every later request was forwarded
+ * uninstrumented against {@link MAX_IN_FLIGHT}, and a capture would silently
+ * lose its requests. The number therefore describes the current generation and
+ * not the document, which is what {@link FetchStats.inFlight} says.
+ *
+ * What this deliberately does **not** do is cancel the stale records' pending
+ * continuations. `./agent.ts`'s `arm()` calls `resetContinuations()` in the
+ * same capture-changed branch, which clears `./continuation.ts`'s maps
+ * wholesale; withdrawing each span here would be the same work done twice, and
+ * this module holds no list of outstanding spans to walk.
+ *
+ * Idempotent in the sense that matters — a second call starts a second
+ * generation and leaves the same nothing in flight — safe to call while
+ * detached, where there is nothing to invalidate and the module stays
+ * detached, and it cannot throw: two counter writes have no failure mode, and
+ * arming must never fail on a counter.
+ */
+export function advanceFetchGeneration(): void {
+  generation += 1;
+  inFlightCount = 0;
 }
 
 /**
@@ -2035,6 +3268,74 @@ export function detachFetch(): void {
  */
 export function isFetchAttached(): boolean {
   return attached;
+}
+
+/**
+ * Whether the page still carries a patch this module's last detach could
+ * not restore — a modification of the developer's application that outlived
+ * the capture it was installed for.
+ *
+ * {@link isFetchAttached} answers "is this module *observing*", which is the
+ * question the readiness and status frames ask and is `false` the moment
+ * {@link detachFetch} has disarmed the patches. That deliberately says nothing
+ * about whether the patches came *out*: a property the page refuses to let us
+ * write is retained, retried at the next detach, and invisible to a caller
+ * reading `isFetchAttached()` alone. This is the other half, and it is what
+ * lets `./agent.ts` name `fetch` in its `hooks-not-released` announcement —
+ * the developer is the only party who can act on residue, by reloading the
+ * tab, and they can only act on what they are told (AAP 0.5.1, 0.5.5).
+ *
+ * `true` when this module holds an installed patch it has not been able to put
+ * back:
+ *
+ * - `window.fetch` is still, by identity, the function this module installed,
+ *   and the host's own `fetch` is still saved behind it; or
+ * - any {@link XhrPatchRecord} is still outstanding — on the current
+ *   `XMLHttpRequest.prototype` or on the prototype of a constructor the page
+ *   has since replaced.
+ *
+ * `false` when everything this module installed has been restored, and
+ * `false` while it is attached: a live patch during a capture is
+ * instrumentation, not residue, and a caller that treated it as residue would
+ * announce every armed capture as an unreleased hook. The corollary is that
+ * residue is a *post-detach* reading — which is exactly when `./agent.ts`
+ * takes it.
+ *
+ * Never throws and never mutates: every property read goes through
+ * {@link checkQuietly}, because a page can back `window.fetch` with a throwing
+ * getter and this question must still have an answer. An unanswerable read is
+ * answered `false`, the same conservative direction the install and the
+ * restore take.
+ *
+ * @returns Whether an unrestored patch of this module's is still installed in
+ * the page.
+ */
+export function hasFetchResidue(): boolean {
+  try {
+    if (attached) {
+      return false;
+    }
+
+    const target = host;
+    const installed = installedFetch;
+    if (
+      target !== undefined &&
+      installed !== undefined &&
+      originalFetch !== undefined &&
+      checkQuietly(() => target.fetch === installed)
+    ) {
+      return true;
+    }
+
+    // A record exists only for a property this module successfully wrote and
+    // has not put back, so its mere presence after a detach is residue; see
+    // `xhrPatchRecords`.
+    return xhrPatchRecords.length > 0;
+  } catch {
+    // Structural. Nothing above can throw, and this is the guarantee that a
+    // diagnostic question never becomes a failure of the page.
+    return false;
+  }
 }
 
 /**

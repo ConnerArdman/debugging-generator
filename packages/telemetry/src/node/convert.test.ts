@@ -84,10 +84,18 @@ import { SpanKind, SpanStatusCode, TraceFlags } from '@opentelemetry/api';
 import type { SpanContext } from '@opentelemetry/api';
 import type { ReadableSpan } from '@opentelemetry/sdk-trace-base';
 
-import { ID_PREFIXES, isErr, isOk, newSpanId, newTraceId } from '@debuggen/shared';
+import {
+  DEFAULT_RESOLUTION_CONFIDENCE,
+  ID_PREFIXES,
+  isErr,
+  isOk,
+  newSpanId,
+  newTraceId,
+} from '@debuggen/shared';
 import type { HrTime } from '@debuggen/shared';
 
 import {
+  ALL_ATTRIBUTE_KEYS,
   attributeKeysFor,
   MAX_PREVIEW_LENGTH,
   MAX_TRACKED_KEYS,
@@ -105,14 +113,17 @@ import {
   DB_CLIENT_VALUES,
   DB_INSTRUMENTATION_SCOPES,
   DB_SPAN_NAME_PREFIXES,
+  DENIED_ATTRIBUTE_KEY_FAMILIES,
   EXCEPTION_EVENT_ATTRIBUTES,
   EXCEPTION_EVENT_NAME,
   FUNCTION_SPAN_MARKER_ATTRIBUTE,
   FUNCTION_SPAN_MARKER_ATTRIBUTES,
   isEmittableSpan,
   MAX_EVENT_NAME_LENGTH,
+  MAX_TRACKED_PRODUCERS,
   NEXT_SPAN_NAME_PREFIXES,
   NEXT_SPAN_TYPE_ATTRIBUTE,
+  PASS_THROUGH_ATTRIBUTE_KEYS,
   NEXT_SPAN_TYPES,
   spanToIngressEvent,
 } from './convert.js';
@@ -216,6 +227,21 @@ const FUNCTION_SYMBOL = 'sampleOperation';
 /** The module a `function` span reports, project-relative and POSIX. */
 const FUNCTION_MODULE = 'src/lib/sample.ts';
 
+/**
+ * The file a patch recorded for the wrapped function.
+ *
+ * The same path the helper reports as `module` — a patch wraps a declaration in
+ * the module it lives in — kept as its own constant because it is read through
+ * a different key and feeds a different field.
+ */
+const FUNCTION_FILE = FUNCTION_MODULE;
+
+/** The 1-based line a patch recorded for the wrapped declaration. */
+const FUNCTION_LINE = 42;
+
+/** The 1-based column a patch recorded for the wrapped declaration. */
+const FUNCTION_COLUMN = 3;
+
 /** A parameterized statement: placeholders only, never an inline literal. */
 const DB_STATEMENT = 'SELECT id, label FROM widgets WHERE owner_id = $1 ORDER BY id LIMIT $2';
 
@@ -236,6 +262,9 @@ const LEAK_SENTINEL = `REDACT_ME_${'x'.repeat(40)}`;
 
 /** A fixed producer id, so a context's value can be traced through a conversion. */
 const FIXED_PRODUCER_ID = `${ID_PREFIXES.producer}_${'0'.repeat(16)}`;
+
+/** A second producer id, for the sequence's per-producer scoping. */
+const SECOND_PRODUCER_ID = `${ID_PREFIXES.producer}_${'1'.repeat(16)}`;
 
 /** A fixed capture id: the sequence scope every case that does not vary it uses. */
 const CAPTURE_A = `${ID_PREFIXES.capture}_${'a'.repeat(16)}`;
@@ -455,7 +484,14 @@ function serverFetchSpan(fixture: SpanFixture = {}): ReadableSpan {
   });
 }
 
-/** A named application function timed by the product's own span helper. */
+/**
+ * A named application function timed by the product's own span helper.
+ *
+ * Carries the patch metadata every real one carries: `span-helper.ts` copies
+ * the wrapper's `meta` — the `file`, `line`, `column` and `symbol` the patcher
+ * recorded — onto the span, which is what makes a function span the one kind
+ * that can report its own source location.
+ */
 function functionSpan(fixture: SpanFixture = {}): ReadableSpan {
   return makeSpan({
     scope: { name: TRACER_NAME, version: '0.1.0' },
@@ -465,9 +501,42 @@ function functionSpan(fixture: SpanFixture = {}): ReadableSpan {
       symbol: FUNCTION_SYMBOL,
       module: FUNCTION_MODULE,
       async: true,
+      file: FUNCTION_FILE,
+      line: FUNCTION_LINE,
+      column: FUNCTION_COLUMN,
     },
     ...fixture,
   });
+}
+
+/**
+ * The position metadata a patch records, as `span-helper.ts` leaves it on a
+ * span.
+ *
+ * Without the product's own marker, so a case can put the same attributes on a
+ * framework or driver span - which must not be read as a patch location,
+ * because only a span the product's tracer created can have been patched.
+ */
+function patchLocationAttributes(
+  overrides: Readonly<Record<string, unknown>> = {},
+): Readonly<Record<string, unknown>> {
+  return {
+    symbol: FUNCTION_SYMBOL,
+    file: FUNCTION_FILE,
+    line: FUNCTION_LINE,
+    column: FUNCTION_COLUMN,
+    ...overrides,
+  };
+}
+
+/** The patch metadata a `function` span carries, for a case that varies one field. */
+function patchMeta(
+  overrides: Readonly<Record<string, unknown>> = {},
+): Readonly<Record<string, unknown>> {
+  return {
+    [FUNCTION_SPAN_MARKER_ATTRIBUTE]: 'function',
+    ...patchLocationAttributes(overrides),
+  };
 }
 
 /** A database span from the driver instrumentation. */
@@ -1162,14 +1231,17 @@ const INGRESS_KEYS: readonly string[] = [
   'traceId',
 ];
 
-/** The three fields only the service may assign, plus the two it may fill in. */
-const SERVICE_OWNED_FIELDS: readonly string[] = [
-  'sessionId',
-  'captureId',
-  'ingestSeq',
-  'source',
-  'redacted',
-];
+/**
+ * The fields a producer may never assign.
+ *
+ * `sessionId`, `captureId` and `ingestSeq` exist only on the persisted schema;
+ * `redacted` is the redaction layer's record of its own work. `source` is
+ * deliberately **absent from this list**: the patch-recorded location is
+ * evidence this producer holds and forwards, so it has a section of its own
+ * below, and the fields-it-never-sets rule is asserted against a kind that
+ * carries no patch metadata.
+ */
+const SERVICE_OWNED_FIELDS: readonly string[] = ['sessionId', 'captureId', 'ingestSeq', 'redacted'];
 
 describe('spanToIngressEvent: identity', () => {
   it('mints a fresh product event id that is not the span id', () => {
@@ -1269,10 +1341,8 @@ describe('spanToIngressEvent: identity', () => {
 
   it.each(SERVICE_OWNED_FIELDS)('never sets %s, which the service owns', (field: string) => {
     // Attribution (`sessionId`, `captureId`, `ingestSeq`) is assigned at ingest;
-    // `source` is resolved there through the code graph, the route map and
-    // recorded patch metadata; `redacted` is the redaction layer's record of
-    // its own work. A producer that supplied any of them would be claiming work
-    // that had not happened.
+    // `redacted` is the redaction layer's record of its own work. A producer
+    // that supplied any of them would be claiming work that had not happened.
     const event = convertOk(dbQuerySpan({ parentSpanId: newSpanId() }));
 
     expect(hasKey(event, field)).toBe(false);
@@ -1306,30 +1376,84 @@ describe('createSeqAllocator', () => {
     const allocator = createSeqAllocator();
 
     expect([
-      allocator.next(CAPTURE_A),
-      allocator.next(CAPTURE_A),
-      allocator.next(CAPTURE_A),
+      allocator.next(FIXED_PRODUCER_ID, CAPTURE_A),
+      allocator.next(FIXED_PRODUCER_ID, CAPTURE_A),
+      allocator.next(FIXED_PRODUCER_ID, CAPTURE_A),
     ]).toEqual([0, 1, 2]);
   });
 
   it('restarts at zero whenever the capture changes', () => {
     // `seq` is scoped to `(producerId, captureId)`, so a new capture is a new
     // sequence. Returning to an earlier capture restarts too: the allocator
-    // compares against the previous call's scope, which is the documented rule.
+    // compares against that producer's previous scope, which is the documented
+    // rule.
     const allocator = createSeqAllocator();
 
-    expect(allocator.next(CAPTURE_A)).toBe(0);
-    expect(allocator.next(CAPTURE_A)).toBe(1);
-    expect(allocator.next(CAPTURE_B)).toBe(0);
-    expect(allocator.next(CAPTURE_A)).toBe(0);
+    expect(allocator.next(FIXED_PRODUCER_ID, CAPTURE_A)).toBe(0);
+    expect(allocator.next(FIXED_PRODUCER_ID, CAPTURE_A)).toBe(1);
+    expect(allocator.next(FIXED_PRODUCER_ID, CAPTURE_B)).toBe(0);
+    expect(allocator.next(FIXED_PRODUCER_ID, CAPTURE_A)).toBe(0);
   });
 
   it('treats no capture as a scope of its own', () => {
     const allocator = createSeqAllocator();
 
-    expect([allocator.next(null), allocator.next(null)]).toEqual([0, 1]);
-    expect(allocator.next(CAPTURE_A)).toBe(0);
-    expect(allocator.next(null)).toBe(0);
+    expect([
+      allocator.next(FIXED_PRODUCER_ID, null),
+      allocator.next(FIXED_PRODUCER_ID, null),
+    ]).toEqual([0, 1]);
+    expect(allocator.next(FIXED_PRODUCER_ID, CAPTURE_A)).toBe(0);
+    expect(allocator.next(FIXED_PRODUCER_ID, null)).toBe(0);
+  });
+
+  it('keeps two producers of one capture in separate sequences', () => {
+    // The regression this pins is silent and unrecoverable: the correlator
+    // orders one producer's events by `(producerId, seq)`, so a counter two
+    // producers drew from in turn makes *each* of their subsequences jump
+    // forwards and backwards - 0, 2, 4 for one and 1, 3, 5 for the other is
+    // still ordered, but 0, 1 followed by 2, 3 read as one producer's events
+    // arriving out of order once the numbers interleave under equal
+    // timestamps.
+    const allocator = createSeqAllocator();
+
+    expect([
+      allocator.next(FIXED_PRODUCER_ID, CAPTURE_A),
+      allocator.next(SECOND_PRODUCER_ID, CAPTURE_A),
+      allocator.next(FIXED_PRODUCER_ID, CAPTURE_A),
+      allocator.next(SECOND_PRODUCER_ID, CAPTURE_A),
+    ]).toEqual([0, 0, 1, 1]);
+  });
+
+  it("restarts one producer's capture without disturbing the other's", () => {
+    const allocator = createSeqAllocator();
+
+    expect(allocator.next(FIXED_PRODUCER_ID, CAPTURE_A)).toBe(0);
+    expect(allocator.next(SECOND_PRODUCER_ID, CAPTURE_A)).toBe(0);
+    expect(allocator.next(SECOND_PRODUCER_ID, CAPTURE_B)).toBe(0);
+    expect(allocator.next(FIXED_PRODUCER_ID, CAPTURE_A)).toBe(1);
+  });
+
+  it('keeps numbering monotonically past the producers it tracks', () => {
+    // The allocator lives for the whole process, so its per-producer map is
+    // bounded. Past the bound a producer draws from one shared counter that
+    // never restarts: numbers from a strictly increasing counter are still
+    // strictly increasing read per producer, so ordering survives, while
+    // evicting a counter would hand one pair a number it had already used.
+    const allocator = createSeqAllocator();
+    const drawn: number[] = [];
+
+    for (let index = 0; index < MAX_TRACKED_PRODUCERS * 2; index += 1) {
+      drawn.push(
+        allocator.next(`${ID_PREFIXES.producer}_${String(index).padStart(16, '0')}`, CAPTURE_A),
+      );
+    }
+    const overflowDraws = drawn.slice(MAX_TRACKED_PRODUCERS);
+
+    expect(drawn.slice(0, MAX_TRACKED_PRODUCERS)).toEqual(
+      Array.from({ length: MAX_TRACKED_PRODUCERS }, () => 0),
+    );
+    expect(overflowDraws).toEqual([...overflowDraws].sort((left, right) => left - right));
+    expect(new Set(overflowDraws).size).toBe(overflowDraws.length);
   });
 });
 
@@ -1356,6 +1480,46 @@ describe('spanToIngressEvent: sequence', () => {
     expect(convertOk(serverRequestSpan(), first).seq).toBe(1);
     expect(convertOk(serverRequestSpan(), second).seq).toBe(0);
     expect(convertOk(serverRequestSpan(), second).seq).toBe(1);
+  });
+
+  it('scopes the sequence to the producer the event is stamped with', () => {
+    // One allocator, two producer ids, one capture: each producer's events are
+    // numbered from zero, because `seq` is scoped to the pair and the id drawn
+    // against is the resolved id the event carries - not the caller's raw
+    // candidate, and not the module's default.
+    const allocator = createSeqAllocator();
+    const first = makeContext({ producerId: FIXED_PRODUCER_ID, seq: allocator });
+    const second = makeContext({ producerId: SECOND_PRODUCER_ID, seq: allocator });
+
+    const events = [
+      convertOk(serverRequestSpan(), first),
+      convertOk(serverRequestSpan(), second),
+      convertOk(serverRequestSpan(), first),
+      convertOk(serverRequestSpan(), second),
+    ];
+
+    expect(events.map((event) => [event.producerId, event.seq])).toEqual([
+      [FIXED_PRODUCER_ID, 0],
+      [SECOND_PRODUCER_ID, 0],
+      [FIXED_PRODUCER_ID, 1],
+      [SECOND_PRODUCER_ID, 1],
+    ]);
+  });
+
+  it("numbers a fallen-back producer in this process's own sequence", () => {
+    // An unusable candidate id is replaced by this process's, and the sequence
+    // follows the replacement rather than the candidate: the pair stamped on
+    // the event and the pair the number came from are the same pair.
+    const allocator = createSeqAllocator();
+    const real = makeContext({ producerId: PRODUCER_ID, seq: allocator });
+    const unusable = makeContext({ producerId: '  ', seq: allocator });
+
+    expect(convertOk(serverRequestSpan(), real).seq).toBe(0);
+
+    const fallenBack = convertOk(serverRequestSpan(), unusable);
+
+    expect(fallenBack.producerId).toBe(PRODUCER_ID);
+    expect(fallenBack.seq).toBe(1);
   });
 
   it('is not advanced by a span that was skipped', () => {
@@ -1592,10 +1756,12 @@ describe('spanToIngressEvent: attributes', () => {
   it('emits no more keys than the tracked bound allows', () => {
     // An attribute nobody declared is an attribute nobody reasoned about, so
     // the pass-through is bounded - and the order is the span's own key order,
-    // which is what makes the result deterministic.
+    // which is what makes the result deterministic. The keys are in the
+    // product's own namespace because that is what the pass-through pass admits
+    // at all; an unreviewed key never reaches the budget.
     const attributes: Record<string, unknown> = {};
     for (let index = 0; index < MAX_TRACKED_KEYS * 2; index += 1) {
-      attributes[`extra_${String(index).padStart(3, '0')}`] = index;
+      attributes[`debuggen.extra_${String(index).padStart(3, '0')}`] = index;
     }
 
     const event = convertOk(functionSpan({ attributes }));
@@ -1608,9 +1774,9 @@ describe('spanToIngressEvent: attributes', () => {
 
   it('cuts an undeclared string value to the preview bound', () => {
     const event = convertOk(
-      functionSpan({ attributes: { extra: 'y'.repeat(MAX_PREVIEW_LENGTH * 3) } }),
+      functionSpan({ attributes: { 'debuggen.extra': 'y'.repeat(MAX_PREVIEW_LENGTH * 3) } }),
     );
-    const value = stringAttribute(event, 'extra');
+    const value = stringAttribute(event, 'debuggen.extra');
 
     expect(value).toHaveLength(MAX_PREVIEW_LENGTH);
     expect(value.endsWith('\u2026')).toBe(true);
@@ -1618,9 +1784,9 @@ describe('spanToIngressEvent: attributes', () => {
 
   it('leaves an undeclared value inside the bound untouched', () => {
     const exact = 'y'.repeat(MAX_PREVIEW_LENGTH);
-    const event = convertOk(functionSpan({ attributes: { extra: exact } }));
+    const event = convertOk(functionSpan({ attributes: { 'debuggen.extra': exact } }));
 
-    expect(stringAttribute(event, 'extra')).toBe(exact);
+    expect(stringAttribute(event, 'debuggen.extra')).toBe(exact);
   });
 
   it('passes the framework key set through even where no kind declares it', () => {
@@ -1665,19 +1831,19 @@ describe('spanToIngressEvent: attributes', () => {
     cyclic.self = cyclic;
 
     const attributes: Readonly<Record<string, unknown>> = {
-      kept: 'value',
-      keptNumber: 42,
-      keptBoolean: false,
-      callback: (): number => 1,
-      marker: Symbol('marker'),
-      nested: { depth: 1 },
-      list: [1, 2, 3],
-      cyclic,
-      huge: 10n,
-      notANumber: Number.NaN,
-      infinite: Number.POSITIVE_INFINITY,
-      nothing: undefined,
-      empty: null,
+      'debuggen.kept': 'value',
+      'debuggen.keptNumber': 42,
+      'debuggen.keptBoolean': false,
+      'debuggen.callback': (): number => 1,
+      'debuggen.marker': Symbol('marker'),
+      'debuggen.nested': { depth: 1 },
+      'debuggen.list': [1, 2, 3],
+      'debuggen.cyclic': cyclic,
+      'debuggen.huge': 10n,
+      'debuggen.notANumber': Number.NaN,
+      'debuggen.infinite': Number.POSITIVE_INFINITY,
+      'debuggen.nothing': undefined,
+      'debuggen.empty': null,
     };
 
     const span = functionSpan({ attributes });
@@ -1685,7 +1851,11 @@ describe('spanToIngressEvent: attributes', () => {
 
     const event = convertOk(functionSpan({ attributes }));
 
-    expect(Object.keys(event.attributes).sort()).toEqual(['kept', 'keptBoolean', 'keptNumber']);
+    expect(Object.keys(event.attributes).sort()).toEqual([
+      'debuggen.kept',
+      'debuggen.keptBoolean',
+      'debuggen.keptNumber',
+    ]);
     expect(() => JSON.stringify(event)).not.toThrow();
     expect(ingressRejection(event)).toBeNull();
   });
@@ -1811,6 +1981,484 @@ describe('spanToIngressEvent: attributes', () => {
     const event = convertOk(makeSpan({ kind: SpanKind.CLIENT, attributes: {} }));
 
     expect(event.attributes).toEqual({});
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The pass-through privacy gate
+ *
+ * Everything on a span that the product's catalog does not declare was put
+ * there by some instrumentation loaded into the developer's process, and
+ * whatever this file forwards is persisted, streamed to the live tail and
+ * eventually summarised into a model prompt. The downstream redactor
+ * recognises token-shaped *values* and *declared* keys - which a request body,
+ * a result row or a customer's e-mail address under an undeclared key is
+ * not - so the refusal has to happen here. These cases are the refusal.
+ * ---------------------------------------------------------------------------
+ */
+
+/** Whether the emitted bag carries `key` at all. */
+function hasAttribute(event: TelemetryEventIngress, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(event.attributes, key);
+}
+
+/**
+ * An outgoing-request span carrying one extra attribute beside its own.
+ *
+ * The fixture's declared keys are restated because a fixture's `attributes` is
+ * replaced wholesale: keeping `url` present is what lets each case assert that
+ * a refused attribute costs its own key and nothing else.
+ */
+function withExtraAttribute(key: string, value: unknown): ReadableSpan {
+  return serverFetchSpan({
+    attributes: { 'http.method': 'POST', url: OUTGOING_URL, [key]: value },
+  });
+}
+
+describe('spanToIngressEvent: the pass-through privacy gate', () => {
+  it.each([
+    { label: 'a request body', key: 'http.request.body' },
+    { label: 'a response body under a camel-cased key', key: 'httpResponseBody' },
+    { label: 'a serialised payload', key: 'rpc.payload' },
+    { label: 'response content', key: 'response.content' },
+    { label: 'returned rows', key: 'db.result.rows' },
+    { label: 'a fetched record', key: 'cache.record' },
+    { label: 'bound statement parameters', key: 'db.query.parameters' },
+    { label: 'call arguments', key: 'code.function.arguments' },
+    { label: 'a request header bag', key: 'http.request.headers' },
+    { label: 'a single header', key: 'http.request.header.accept' },
+    { label: 'a cookie', key: 'http.request.cookie' },
+    { label: 'an undeclared statement', key: 'orm.statement' },
+    { label: 'raw SQL under another spelling', key: 'vendor.sql' },
+    { label: 'a process environment entry', key: 'process.env.EXAMPLE' },
+    { label: 'an authorization value', key: 'request.authorization' },
+    { label: 'an API key', key: 'client.apiKey' },
+    { label: 'a bearer token', key: 'auth.bearerToken' },
+    { label: 'a password', key: 'db.password' },
+    { label: 'a private key', key: 'tls.privateKey' },
+    { label: 'a signature', key: 'webhook.signature' },
+    { label: "a customer's e-mail address", key: 'customer.email' },
+    { label: 'an end-user id', key: 'enduser.id' },
+    { label: 'a user name', key: 'user.name' },
+    { label: 'a phone number', key: 'contact.phoneNumber' },
+    { label: 'a card number', key: 'payment.cardNumber' },
+    { label: 'a postal code', key: 'shipping.postalCode' },
+    { label: 'coordinates', key: 'geo.latitude' },
+  ])('refuses to forward $label ($key)', ({ key }: { key: string }) => {
+    const event = convertOk(withExtraAttribute(key, 'whatever the instrumentation attached'));
+
+    expect(hasAttribute(event, key)).toBe(false);
+    // The rest of the event is unaffected: a refused attribute costs its own
+    // key and nothing else, because the span's timing is still evidence.
+    expect(event.attributes.url).toBe(OUTGOING_URL);
+    expect(ingressRejection(event)).toBeNull();
+  });
+
+  it.each(DENIED_ATTRIBUTE_KEY_FAMILIES)(
+    'refuses every token of the $family family',
+    ({ tokens }: { readonly tokens: readonly string[] }) => {
+      // Swept through the product's own namespace on purpose: that prefix is
+      // admissible, so the deny list is the *only* rule that can refuse these
+      // keys and the sweep therefore tests the deny list rather than the
+      // allowlist. Not even the product's own namespace may carry content.
+      // Iterating the module's own tables is what makes a token impossible to
+      // add without a refusal, and impossible to remove without a failure.
+      const forwarded = tokens.filter((token) => {
+        const key = `debuggen.${token}`;
+        return hasAttribute(convertOk(withExtraAttribute(key, 'a captured value')), key);
+      });
+
+      expect(forwarded).toEqual([]);
+    },
+  );
+
+  it.each([
+    { label: 'a framework span name', key: 'next.span_name' },
+    { label: 'a peer host', key: 'net.peer.name' },
+    { label: 'a server address', key: 'server.address' },
+    { label: 'a transport name', key: 'net.transport' },
+    { label: 'a function name', key: 'code.function' },
+    { label: 'a source line', key: 'code.lineno' },
+    { label: 'a runtime version', key: 'process.runtime.version' },
+    { label: "the product's own marker", key: FUNCTION_SPAN_MARKER_ATTRIBUTE },
+    { label: "a marker in the product's namespace", key: 'debuggen.instrumentation' },
+  ])('still forwards $label ($key)', ({ key }: { key: string }) => {
+    // The reviewed vocabulary is what keeps the gate from costing evidence: a
+    // route shape, a host, a port, a code location and the product's own
+    // markers all describe an operation without carrying anything captured
+    // from it.
+    const event = convertOk(withExtraAttribute(key, 'a reviewed value'));
+
+    expect(event.attributes[key]).toBe('a reviewed value');
+  });
+
+  it('forwards every key of its own reviewed vocabulary', () => {
+    // The assertion that stops the allowlist and the deny list contradicting
+    // each other: a reviewed key whose words a family refuses would be listed
+    // as useful and dropped in practice, which is the worst of both tables.
+    const dropped = PASS_THROUGH_ATTRIBUTE_KEYS.filter(
+      (key) => !hasAttribute(convertOk(withExtraAttribute(key, 'a reviewed value')), key),
+    );
+
+    expect(dropped).toEqual([]);
+  });
+
+  it.each([
+    { label: 'a URL-encoded form body', key: 'request.data', value: 'name=A.+Buyer&qty=2' },
+    {
+      label: 'a one-line plain-text record',
+      key: 'vendor.detail',
+      value: 'order 1 for A. Buyer, buyer@example.invalid',
+    },
+    { label: 'an opaque vendor field', key: 'cache.extra', value: 'whatever it holds' },
+    { label: 'an unreviewed count', key: 'vendor.retries', value: 3 },
+    { label: 'an unreviewed flag', key: 'vendor.hit', value: true },
+    { label: 'a word that merely contains a refused one', key: 'index.cardinality', value: 4 },
+    { label: 'a device name that contains one', key: 'input.keyboard', value: 'qwerty' },
+  ])(
+    'refuses $label under the unreviewed key $key',
+    ({ key, value }: { key: string; value: unknown }) => {
+      // The leak a name test and a shape test both miss: a body under an
+      // innocuous key, on one line, made of ordinary characters, is
+      // indistinguishable from a label - so nothing unreviewed is forwarded at
+      // all. AAP 0.5.2 excludes bodies and row contents from what may be
+      // *captured*, not merely from what may be displayed, and the two harmless
+      // last cases are the price: an unreviewed key is dropped even when it is
+      // plainly innocent, and a reviewer adds it to the vocabulary instead.
+      const event = convertOk(withExtraAttribute(key, value));
+
+      expect(hasAttribute(event, key)).toBe(false);
+      expect(event.attributes.url).toBe(OUTGOING_URL);
+    },
+  );
+
+  it.each([
+    { label: 'a request body size', key: 'http.request.body.size', value: 1024 },
+    { label: 'a response body size', key: 'http.response.body.size', value: 4096 },
+    { label: 'a row count in the product namespace', key: 'debuggen.rowCount', value: 7 },
+    { label: 'a parameter count in the product namespace', key: 'debuggen.paramCount', value: 2 },
+  ])(
+    'forwards $label, which measures content instead of carrying it',
+    ({ key, value }: { key: string; value: number }) => {
+      const event = convertOk(withExtraAttribute(key, value));
+
+      expect(event.attributes[key]).toBe(value);
+    },
+  );
+
+  it.each([
+    { label: 'a token length', key: 'auth.token.length' },
+    { label: 'a password size', key: 'user.password.size' },
+    { label: 'a count of e-mail addresses', key: 'notification.email.count' },
+  ])('does not let a measurement rescue $label ($key)', ({ key }: { key: string }) => {
+    // A measurement *of* content is a number; a measurement of a credential or
+    // of a person is still about the credential or the person, so the
+    // exemption is the content family's alone.
+    const event = convertOk(withExtraAttribute(key, 32));
+
+    expect(hasAttribute(event, key)).toBe(false);
+  });
+
+  it.each([
+    { label: 'a JSON object', value: '{"id":1,"email":"buyer@example.invalid"}' },
+    { label: 'a JSON array', value: '[{"sku":"A-1"},{"sku":"A-2"}]' },
+    { label: 'markup', value: '<html><body>order 1</body></html>' },
+    { label: 'a quoted blob', value: '"serialised value"' },
+    { label: 'an indented document', value: '   {"nested":true}' },
+    { label: 'a multi-line record', value: 'name: A. Buyer\nemail: buyer@example.invalid' },
+    { label: 'a tab-separated row', value: 'A-1\t2\t19.99' },
+  ])('refuses $label even under an admissible key', ({ value }: { value: string }) => {
+    // Defence in depth behind the allowlist: a reviewed key whose value turns
+    // out to be a document is refused on its shape, because every label a panel
+    // renders is one line of text. `debuggen.detail` is admissible by
+    // namespace, so the shape guard is what decides these cases.
+    const event = convertOk(withExtraAttribute('debuggen.detail', value));
+
+    expect(hasAttribute(event, 'debuggen.detail')).toBe(false);
+  });
+
+  it('judges the shape of the value it would actually emit', () => {
+    // The guard runs on the *bounded* value, so its cost is fixed whatever an
+    // instrumentation attached - and a document whose first line is longer than
+    // the preview bound is bounded rather than refused, which is the documented
+    // limit of a shape test and the reason the allowlist is the rule that keeps
+    // unknown values out.
+    const oneLine = 'a'.repeat(MAX_PREVIEW_LENGTH * 3);
+    const documentAfterTheBound = `${'a'.repeat(MAX_PREVIEW_LENGTH * 3)}\n{"leaked":true}`;
+
+    expect(
+      stringAttribute(convertOk(withExtraAttribute('debuggen.detail', oneLine)), 'debuggen.detail'),
+    ).toHaveLength(MAX_PREVIEW_LENGTH);
+    expect(
+      hasAttribute(
+        convertOk(withExtraAttribute('debuggen.detail', documentAfterTheBound)),
+        'debuggen.detail',
+      ),
+    ).toBe(true);
+  });
+
+  it('exempts a declared key from the value-shape guard', () => {
+    // A key the catalog declares is vouched for by the catalog: it has a
+    // documented meaning, a consumer that reads it and a redaction rule that
+    // knows how to treat it. `attribution` belongs to `perf.longtask`, so on
+    // this kind it travels through the pass-through pass - and is not judged on
+    // its shape, while the admissible-but-undeclared key beside it is.
+    const declared = 'attribution';
+    const event = convertOk(
+      serverFetchSpan({
+        attributes: { [declared]: '[{"containerType":"window"}]', 'debuggen.detail': '[{"a":1}]' },
+      }),
+    );
+
+    expect(ALL_ATTRIBUTE_KEYS).toContain(declared);
+    expect(hasAttribute(event, declared)).toBe(true);
+    expect(hasAttribute(event, 'debuggen.detail')).toBe(false);
+  });
+
+  it('refuses a key too long to be a name anybody reads', () => {
+    const key = `debuggen.${'segment.'.repeat(64)}label`;
+    const event = convertOk(withExtraAttribute(key, 'value'));
+
+    expect(hasAttribute(event, key)).toBe(false);
+  });
+
+  it('leaves the passes that write declared keys alone', () => {
+    // The gate is the pass-through pass's alone. `db.statement` is a refused
+    // *word* and a declared *key*: the catalog documents it, the query table
+    // renders it and `../redaction/sql.ts` scrubs it, so the declared path must
+    // carry it verbatim - and the alias spelling must still deliver its value
+    // under that canonical key.
+    const declared = convertOk(dbQuerySpan({ attributes: { 'db.statement': DB_STATEMENT } }));
+    const aliased = convertOk(
+      dbQuerySpan({
+        attributes: { 'db.query.text': DB_STATEMENT, 'db.response.returned_rows': 4 },
+      }),
+    );
+
+    expect(declared.attributes['db.statement']).toBe(DB_STATEMENT);
+    expect(aliased.attributes['db.statement']).toBe(DB_STATEMENT);
+    expect(aliased.attributes['db.rowCount']).toBe(4);
+  });
+
+  it.each([
+    { kind: 'http.server', span: serverRequestSpan },
+    { kind: 'route.handler', span: routeHandlerSpan },
+    { kind: 'http.client', span: serverFetchSpan },
+    { kind: 'function', span: functionSpan },
+    { kind: 'db.query', span: dbQuerySpan },
+    { kind: 'server.error', span: serverErrorSpan },
+  ])(
+    'carries every key $kind declares, whatever the deny list says of the words',
+    ({ kind, span }: { kind: string; span: (fixture?: SpanFixture) => ReadableSpan }) => {
+      // The property that bounds the deny list's cost: it judges *undeclared*
+      // keys, so a kind's own declared evidence arrives whole even when a key's
+      // words are ones the gate refuses elsewhere - `db.statement` is the
+      // standing example. `request_key` is the one declared key that never
+      // arrives, because the service assigns it.
+      const declared = attributeKeysFor(kind as TelemetryKind).filter(
+        (key) => !SERVICE_ASSIGNED_ATTRIBUTE_KEYS.includes(key),
+      );
+      const attributes: Record<string, unknown> = {};
+      for (const key of declared) {
+        attributes[key] = `declared-${key}`;
+      }
+
+      const event = convertOk(span({ attributes }));
+
+      expect(event.kind).toBe(kind);
+      for (const key of declared) {
+        expect(event.attributes[key]).toBe(`declared-${key}`);
+      }
+    },
+  );
+
+  it('counts a refused key against nothing', () => {
+    // A refused key is not emitted, so it cannot consume one of the bounded
+    // budget's places either: the keys that survive are the ones that would
+    // have survived without it.
+    const attributes: Record<string, unknown> = {
+      'http.request.body': 'refused by its family',
+      'vendor.detail': 'refused as unreviewed',
+    };
+    for (let index = 0; index < MAX_TRACKED_KEYS; index += 1) {
+      attributes[`debuggen.kept_${String(index).padStart(3, '0')}`] = index;
+    }
+
+    const event = convertOk(serverFetchSpan({ attributes }));
+
+    expect(Object.keys(event.attributes)).toHaveLength(MAX_TRACKED_KEYS);
+    expect(hasAttribute(event, 'http.request.body')).toBe(false);
+    expect(hasAttribute(event, 'vendor.detail')).toBe(false);
+    expect(event.attributes['debuggen.kept_000']).toBe(0);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The patch-recorded source location
+ *
+ * AAP 0.4.2's first and most precise source route: the file, line and column
+ * the patcher recorded when it wrapped the function, which `span-helper.ts`
+ * puts on the span it creates. Forwarding them is what makes a server function
+ * row in a generated panel clickable through to the editor, and
+ * `../aggregate/queries.ts` reads exactly this field to name the caller of a
+ * query. Everything about it is all-or-nothing: the strict schema would drop
+ * the whole event over a malformed location, so a location that cannot be
+ * vouched for is omitted and the timing still arrives.
+ * ---------------------------------------------------------------------------
+ */
+
+describe('spanToIngressEvent: source', () => {
+  it('emits the location a patch recorded for a function span', () => {
+    const event = convertOk(functionSpan());
+
+    expect(event.source).toEqual({
+      file: FUNCTION_FILE,
+      line: FUNCTION_LINE,
+      column: FUNCTION_COLUMN,
+      symbol: FUNCTION_SYMBOL,
+      resolvedBy: 'patch',
+      confidence: DEFAULT_RESOLUTION_CONFIDENCE.patch,
+    });
+    // The route's own confidence, from the table that ranks the four routes:
+    // a patch location is exact by construction, so it outranks every other.
+    expect(DEFAULT_RESOLUTION_CONFIDENCE.patch).toBe(1);
+    expect(ingressRejection(event)).toBeNull();
+  });
+
+  it('emits the ingress field set plus the location', () => {
+    const event = convertOk(functionSpan({ parentSpanId: newSpanId() }));
+
+    expect(Object.keys(event).sort()).toEqual([...INGRESS_KEYS, 'source'].sort());
+  });
+
+  it('consumes the position metadata instead of repeating it', () => {
+    // `source` is the structured, validated home for a location. Repeating
+    // three fields on every function span would cost bytes on the hot path and
+    // leave two answers to one question, one of them unvalidated. `symbol` is
+    // the exception: it is the span's label as well as the location's, and the
+    // catalog declares it for this kind.
+    const event = convertOk(functionSpan());
+
+    expect(hasAttribute(event, 'file')).toBe(false);
+    expect(hasAttribute(event, 'line')).toBe(false);
+    expect(hasAttribute(event, 'column')).toBe(false);
+    expect(event.attributes.symbol).toBe(FUNCTION_SYMBOL);
+    expect(event.attributes.module).toBe(FUNCTION_MODULE);
+  });
+
+  it.each([
+    { label: 'no file at all', meta: { file: undefined } },
+    { label: 'an empty file', meta: { file: '   ' } },
+    { label: 'a file that is not a string', meta: { file: 42 } },
+    { label: 'an absolute path', meta: { file: '/etc/shadow' } },
+    { label: 'a Windows path', meta: { file: String.raw`C:\project\src\lib\sample.ts` } },
+    { label: 'a traversal', meta: { file: '../../secret.ts' } },
+    { label: 'a path that is the project root', meta: { file: '.' } },
+    { label: 'a path with a control character', meta: { file: 'src/lib/sam\u0000ple.ts' } },
+    { label: 'an over-long path', meta: { file: `src/${'a'.repeat(600)}.ts` } },
+    { label: 'no line', meta: { line: undefined } },
+    { label: 'a zero line', meta: { line: 0 } },
+    { label: 'a negative line', meta: { line: -1 } },
+    { label: 'a fractional line', meta: { line: 42.5 } },
+    { label: 'a line as a string', meta: { line: '42' } },
+    { label: 'no column', meta: { column: undefined } },
+    { label: 'a zero column', meta: { column: 0 } },
+  ])(
+    'omits the location for $label, and keeps the event',
+    ({ meta }: { meta: Readonly<Record<string, unknown>> }) => {
+      const event = convertOk(functionSpan({ attributes: patchMeta(meta) }));
+
+      expect(hasKey(event, 'source')).toBe(false);
+      expect(event.kind).toBe('function');
+      expect(event.name).toBe(FUNCTION_SYMBOL);
+      expect(ingressRejection(event)).toBeNull();
+    },
+  );
+
+  it('leaves rejected metadata visible as ordinary attributes', () => {
+    // The malformed hint is what lets whoever has to explain a missing source
+    // link see *why* it is missing, so a rejected location does not also hide
+    // its own cause. A traversal path is a scalar label like any other string
+    // and travels under the bounded pass-through rules.
+    const event = convertOk(functionSpan({ attributes: patchMeta({ line: 0 }) }));
+
+    expect(event.attributes.file).toBe(FUNCTION_FILE);
+    expect(event.attributes.line).toBe(0);
+    expect(event.attributes.column).toBe(FUNCTION_COLUMN);
+  });
+
+  it('bounds an over-long symbol instead of rejecting the location', () => {
+    // The `file` is the part that must arrive whole - a shortened path is a
+    // different path - while a symbol long enough to need cutting is a
+    // presentation detail either way.
+    const symbol = `${FUNCTION_SYMBOL}${'X'.repeat(MAX_PREVIEW_LENGTH * 2)}`;
+    const event = convertOk(functionSpan({ attributes: patchMeta({ symbol }) }));
+
+    expect(event.source?.symbol).toHaveLength(MAX_PREVIEW_LENGTH);
+    expect(event.source?.file).toBe(FUNCTION_FILE);
+    expect(ingressRejection(event)).toBeNull();
+  });
+
+  it('emits a location without a symbol when the patch recorded none', () => {
+    const event = convertOk(functionSpan({ attributes: patchMeta({ symbol: undefined }) }));
+
+    expect(event.source).toEqual({
+      file: FUNCTION_FILE,
+      line: FUNCTION_LINE,
+      column: FUNCTION_COLUMN,
+      resolvedBy: 'patch',
+      confidence: DEFAULT_RESOLUTION_CONFIDENCE.patch,
+    });
+    expect(Object.prototype.hasOwnProperty.call(event.source ?? {}, 'symbol')).toBe(false);
+  });
+
+  it('normalises a path the schema accepts', () => {
+    // `src/../src/lib/sample.ts` resolves back inside the project, so the
+    // shared refinement accepts it; the value is carried as the patch recorded
+    // it, because rewriting a path is the service's business and not a
+    // producer's.
+    const file = 'src/../src/lib/sample.ts';
+    const event = convertOk(functionSpan({ attributes: patchMeta({ file }) }));
+
+    expect(event.source?.file).toBe(file);
+    expect(ingressRejection(event)).toBeNull();
+  });
+
+  it.each([
+    {
+      label: 'an incoming request',
+      span: () => serverRequestSpan({ attributes: patchLocationAttributes() }),
+    },
+    {
+      label: 'a route handler',
+      span: () => routeHandlerSpan({ attributes: patchLocationAttributes() }),
+    },
+    {
+      label: 'a database query',
+      span: () => dbQuerySpan({ attributes: patchLocationAttributes() }),
+    },
+  ])('claims no patch location for $label', ({ span }: { span: () => ReadableSpan }) => {
+    // Only a `function` classification means the product's own tracer created
+    // the span, which is the only way a patch could have recorded its position.
+    // A framework or driver span carrying a `file` attribute of its own says
+    // nothing about the developer's project, so its location is resolved in the
+    // service - and the attribute travels as an ordinary one.
+    const event = convertOk(span());
+
+    expect(event.kind).not.toBe('function');
+    expect(hasKey(event, 'source')).toBe(false);
+    expect(event.attributes.file).toBe(FUNCTION_FILE);
+  });
+
+  it('claims no location for a function span with no patch metadata', () => {
+    const event = convertOk(
+      functionSpan({ attributes: { [FUNCTION_SPAN_MARKER_ATTRIBUTE]: 'function' } }),
+    );
+
+    expect(hasKey(event, 'source')).toBe(false);
+    expect(event.kind).toBe('function');
   });
 });
 

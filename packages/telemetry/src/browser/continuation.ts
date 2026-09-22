@@ -215,7 +215,9 @@ export const MAX_LINEAGE_CANDIDATES = 8;
  * developer is debugging interactively and far short of a leak.
  *
  * The deadline is inclusive, exactly as {@link CONTINUATION_WINDOW_MS} is: at
- * `startedAt + PENDING_MAX_AGE_MS` the entry is already gone.
+ * `startedAt + PENDING_MAX_AGE_MS` the entry is already gone — and gone means
+ * gone on every path, so a settle arriving at or after that instant discards
+ * the entry instead of promoting it (see {@link settleContinuation}).
  */
 export const PENDING_MAX_AGE_MS = 30_000;
 
@@ -508,12 +510,25 @@ function optionalName(value: string | undefined): string | undefined {
  */
 
 /**
+ * Whether a pending request has reached its {@link PENDING_MAX_AGE_MS}
+ * deadline by `now`.
+ *
+ * The single expression of that deadline, read by every phase that has to
+ * apply it — the prune pass below and the settle phase — so the two can never
+ * drift apart: an entry {@link pruneAgedPending} would discard is exactly an
+ * entry {@link settleContinuation} refuses to promote. The comparison is
+ * inclusive, matching the window's.
+ */
+function hasAgedOut(entry: PendingContinuation, now: number): boolean {
+  return now - entry.startedAt >= PENDING_MAX_AGE_MS;
+}
+
+/**
  * Discard pending requests whose deadline has arrived, counting each in
  * `dropped`.
  *
  * A pending request that ages out never settles, so the events it would have
- * parented lose their lineage — which is exactly what `dropped` reports. The
- * deadline is inclusive, matching the window's.
+ * parented lose their lineage — which is exactly what `dropped` reports.
  *
  * Deleting from a `Map` while iterating it is well defined: an entry removed
  * before it is reached is simply not visited.
@@ -523,7 +538,7 @@ function pruneAgedPending(now: number): void {
     return;
   }
   for (const [spanId, entry] of pendingContinuations) {
-    if (now - entry.startedAt >= PENDING_MAX_AGE_MS) {
+    if (hasAgedOut(entry, now)) {
       pendingContinuations.delete(spanId);
       droppedTotal += 1;
     }
@@ -720,6 +735,10 @@ export function cancelPendingContinuation(spanId: string): void {
  * them is an error, and a second settle must never extend an existing window,
  * which is why the promotion consumes the pending entry.
  *
+ * A pending entry that has reached its {@link PENDING_MAX_AGE_MS} deadline by
+ * `settledAt` is discarded rather than promoted, and is counted in `dropped`.
+ * See the comment in the body for why a stale entry must not open a window.
+ *
  * The window runs from `settledAt` to `settledAt + `
  * {@link CONTINUATION_WINDOW_MS}. If the open map is full, the least recently
  * settled window makes room.
@@ -736,10 +755,10 @@ export function settleContinuation(spanId: string, settledAt?: number): void {
 
     const at = instant(settledAt);
 
-    // Take the entry out before pruning, so a request that outlived
-    // PENDING_MAX_AGE_MS but whose settle arrived first is counted as a settle
-    // and not as a drop. Once it has been removed here, the prune below cannot
-    // see it, so the two counters can never both claim it.
+    // Take the entry out before pruning: once it has been removed here the
+    // prune pass below cannot see it, so exactly one of the two outcomes that
+    // follow — promoted, or discarded as stale — accounts for it, and the two
+    // counters can never both claim the same entry.
     const entry = pendingContinuations.get(id);
     if (entry !== undefined) {
       pendingContinuations.delete(id);
@@ -749,6 +768,28 @@ export function settleContinuation(spanId: string, settledAt?: number): void {
     pruneExpiredOpen(at);
 
     if (entry === undefined) {
+      return;
+    }
+
+    if (hasAgedOut(entry, at)) {
+      // The settle arrived at or after the pending deadline, so the entry is
+      // discarded on the same inclusive rule `pruneAgedPending` applies, and
+      // no window opens. Promoting it would take a request registered thirty
+      // seconds or more ago — a navigation left it behind, the socket hung, or
+      // its registration and its settle arrived out of order — and give it a
+      // fresh CONTINUATION_WINDOW_MS in which whatever React commit, state
+      // transition or request lands next inherits its trace. That is the
+      // ambient-current-trace failure this module exists to prevent, and the
+      // asymmetry in the module doc is why it is the worse outcome: a missing
+      // parent is flagged downstream, a wrong one is invisible and a generated
+      // panel then states it as an observed fact.
+      //
+      // Counted in `dropped` and never in `settled`, which is the accounting
+      // ContinuationStats already publishes — `dropped` is "entries discarded
+      // without settling (bound reached, or aged out)" and `settled` is
+      // "requests that opened a window". One loss, reported exactly once, by
+      // the counter a developer reads when a trace comes out short.
+      droppedTotal += 1;
       return;
     }
 
@@ -974,6 +1015,87 @@ export function getContinuationStats(): ContinuationStats {
     expired: expiredTotal,
     dropped: droppedTotal,
   };
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * Lifecycle adapter
+ *
+ * `./agent.ts` drives every producer in this folder through one registry of
+ * `{ attach, detach, isAttached }` triples, so that arming and disarming a
+ * capture is a single ordered walk over every family rather than a hand-kept
+ * list of calls — an omission from which is a family that keeps observing
+ * after a capture ends, which is exactly what AAP 0.5.1's "disabled, not
+ * merely idled" forbids. This module is a *support* family: it holds no
+ * listener, no observer, no patch, no timer and no subscription, only the two
+ * maps and three counters above, so its adapter is an explicit no-resource one
+ * — attach establishes the empty state the arbitration starts from, and detach
+ * releases every reference the page's requests left behind.
+ *
+ * **The predicate does not gate the registry's entry points**, and that is
+ * deliberate rather than an omission. `registerPendingContinuation`,
+ * `settleContinuation` and `getLineage` are called from `./fetch.ts`,
+ * `./interaction.ts`, `./react.ts` and `./state.ts` — families the agent arms
+ * and disarms on their own flags — so *they* are the gate: nothing registers a
+ * continuation unless the request producer is armed, and a detached registry
+ * therefore stays empty because nothing feeds it. Gating here as well would
+ * add a second, redundant check on the developer's click path and would make
+ * this module's behaviour depend on an attach call its own callers have no way
+ * to make.
+ * ---------------------------------------------------------------------------
+ */
+
+/** Whether the agent currently holds this family attached. */
+let attached = false;
+
+/**
+ * Arm the continuation registry: start from the empty state.
+ *
+ * Idempotent — a second call while attached changes nothing, which matters
+ * because `apps/chrome-extension/src/background/agent-control.ts` re-sends the
+ * live `agent.config` after every reconnect and every same-origin navigation,
+ * and a re-send must not discard the windows of a capture that is still
+ * running. The reset therefore happens on the transition into the attached
+ * state only; `./agent.ts` calls {@link resetContinuations} separately when the
+ * capture id itself changes.
+ *
+ * Cannot throw: the only work is clearing two maps that this module owns.
+ */
+export function attachContinuations(): void {
+  if (attached) {
+    return;
+  }
+  resetContinuations();
+  attached = true;
+}
+
+/**
+ * Disarm the continuation registry and forget every window and pending request.
+ *
+ * Called by `./agent.ts` on disarm — an `agent.config` with every hook false —
+ * so a dormant agent holds no reference to any request the page made
+ * (AAP 0.5.1). Delegates to {@link resetContinuations}, which is the same reset
+ * the capture-change path uses, so there is one implementation of "forget
+ * everything" rather than two.
+ *
+ * Safe to call when already detached, and cannot throw.
+ */
+export function detachContinuations(): void {
+  attached = false;
+  resetContinuations();
+}
+
+/**
+ * Whether the continuation registry is armed right now.
+ *
+ * "Attached" is this folder's uniform vocabulary for an armed family, and
+ * `./agent.ts` reports this predicate — not a record of what was requested —
+ * in its state and diagnostics frames. For this module it is exactly the flag:
+ * there is nothing else to be attached to, and {@link getContinuationStats}
+ * answers what the armed family currently holds.
+ */
+export function isContinuationsAttached(): boolean {
+  return attached;
 }
 
 /*

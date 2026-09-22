@@ -5,8 +5,8 @@
  * The page answers a single product for the slug in its address: its artwork, its copy, the stock
  * behind its badge, what it costs, the control that puts it in the cart, its specifications, and
  * the strip of suggestions below them. It is a server component - it parses the route segment,
- * calls the catalog service directly and hands the answer to the components that draw it - and it
- * declares no component, no state and no style of its own.
+ * asks this application's own product endpoint for the answer and hands it to the components that
+ * draw it - and it declares no component, no state and no style of its own.
  *
  * WHAT THIS FILE OWNS, AND WHAT IT DOES NOT
  * It owns the request - the segment, the service call, the two failure paths - the page's heading
@@ -18,11 +18,14 @@
  * `RecommendationsRail`. That division is why no card, no control and no piece of copy about a
  * product appears in this file.
  *
- * THE SERVICE IS CALLED, NOT THE ENDPOINT
- * `readProductBySlug` is invoked as a function. A server component that fetched its own
- * `/api/products/[slug]` instead would pay for a second HTTP exchange, a second serialization and
- * a second trip through the same service on every page view, and would report one request where
- * the reader made none.
+ * THE PRODUCT COMES FROM THE ENDPOINT
+ * `GET /api/products/[slug]` answers this product, and the page reads it over HTTP through
+ * `loadProductDetail` in `@/lib/api-client` rather than calling the catalog service in process.
+ * One code path therefore answers the page a reader is looking at and any other caller of the same
+ * endpoint, so the two cannot describe a product differently. A server render has no relative base
+ * to resolve `/api/...` against, so the address the read is sent to comes from `@/server/origin`,
+ * which answers with the storefront's configured address or the loopback address on the port this
+ * process bound - never with anything a request carries.
  *
  * EVERY VISIT IS ITS OWN REQUEST
  * `dynamic = 'force-dynamic'` opts the segment out of static generation, so the price and the
@@ -55,10 +58,10 @@ import { RecommendationsRail } from '@/components/product/RecommendationsRail';
 import { StockBadge } from '@/components/product/StockBadge';
 import { Alert } from '@/components/ui/Alert';
 import { Price } from '@/components/ui/Price';
+import { StorefrontApiError, loadProductDetail } from '@/lib/api-client';
 import { formatSlugLabel } from '@/lib/format';
 import type { ProductDetail } from '@/lib/types';
-import { StorefrontNotFoundError } from '@/server/errors';
-import { readProductBySlug } from '@/server/services/catalog.service';
+import { storefrontOrigin } from '@/server/origin';
 import { productSlugParamsSchema } from '@/server/validation/products';
 
 /**
@@ -139,17 +142,21 @@ export default async function ProductDetailPage({ params }: Props): Promise<Reac
   }
 
   // Declared before the read so the render below sits outside the `try`. Wrapping the JSX would
-  // put every error React raises while rendering into the catch that is here for the database,
-  // and would report a rendering bug as an unavailable product.
+  // put every error React raises while rendering into the catch that is here for the read, and
+  // would report a rendering bug as an unavailable product.
   let product: ProductDetail | null = null;
 
   try {
-    product = await readProductBySlug(requested.data.slug);
+    product = await loadProductDetail({
+      slug: requested.data.slug,
+      origin: storefrontOrigin(),
+    });
   } catch (error) {
     // `notFound` signals by throwing, so it is called from the catch rather than from the block
     // above: called inside the `try`, its control-flow error would be caught here and a missing
-    // product would render as a failure instead of as a 404.
-    if (error instanceof StorefrontNotFoundError) {
+    // product would render as a failure instead of as a 404. The endpoint reports a slug no
+    // product owns as `NOT_FOUND`, which is the same statement the service made directly.
+    if (error instanceof StorefrontApiError && error.code === 'NOT_FOUND') {
       notFound();
     }
 

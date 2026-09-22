@@ -1214,6 +1214,107 @@ describe('adversarial input', () => {
     expect(report.findings[0]?.path).toBe('input.first.notes');
   });
 
+  /*
+   * The two cases above pin the cheap half of aliasing: two benign names for
+   * one object are one inspection. The five below pin the half that is not a
+   * function of the value at all. Whether a subtree yields a finding depends on
+   * the *name context* it is reached under, because the entropy rule binds to
+   * the nearest enclosing key and an array inherits that key from its parent —
+   * so an alias reached under a benign name and again under a credential-like
+   * one has to be inspected twice, while a second alias in a context already
+   * inspected must not cost a third traversal.
+   */
+
+  it('inspects an aliased array again under the credential-like name it is also reached by', () => {
+    // The escape the context-keyed memo exists to close. The array is reached
+    // first under `notes`, a name the entropy rule never measures under, and
+    // then under `accessToken`, a name it does: a walk-wide visited set marked
+    // the array inspected on the benign path and skipped the credential-like
+    // one, so the value left the machine unexamined.
+    const shared: readonly string[] = [OPAQUE_SECRET];
+    const payload: JsonObject = { notes: shared, accessToken: shared };
+    const report = inspectPayloadReport(payload, { rules: ['high-entropy-secret'] });
+    expect(report.findings).toHaveLength(1);
+    expect(report.findings[0]?.ruleId).toBe('high-entropy-secret');
+    expect(report.findings[0]?.path).toBe(`${DEFAULT_ROOT_PATH}.accessToken[0]`);
+    expect(report.complete).toBe(true);
+    expect(assertOutboundSafe(makeRequest({ input: payload })).ok).toBe(false);
+  });
+
+  it('reports an aliased array once when the credential-like name comes first', () => {
+    // The same two names in the other order. The credential-like context is
+    // inspected first and reported; the benign re-inspection that follows adds
+    // no second finding, because the entropy rule does not apply under it.
+    const shared: readonly string[] = [OPAQUE_SECRET];
+    const payload: JsonObject = { accessToken: shared, notes: shared };
+    const report = inspectPayloadReport(payload, { rules: ['high-entropy-secret'] });
+    expect(report.findings).toHaveLength(1);
+    expect(report.findings[0]?.ruleId).toBe('high-entropy-secret');
+    expect(report.findings[0]?.path).toBe(`${DEFAULT_ROOT_PATH}.accessToken[0]`);
+    expect(report.complete).toBe(true);
+  });
+
+  it('keys the memo on the name context rather than on the name, so a third alias is free', () => {
+    // There are exactly two contexts, so an object is traversed at most twice
+    // however many names alias it: `apiKey` and `accessToken` are the same
+    // equivalence class and the second of them is a skip. Asserted through the
+    // node count as well as the findings, because the bound on work is what
+    // makes re-inspection affordable: root, the array and its element under
+    // `apiKey`, the skipped visit under `accessToken`, then the array and its
+    // element under `notes` — six visits, not nine.
+    const shared: readonly string[] = [OPAQUE_SECRET];
+    const payload: JsonObject = { apiKey: shared, accessToken: shared, notes: shared };
+    const report = inspectPayloadReport(payload, { rules: ['high-entropy-secret'] });
+    expect(report.findings.map((finding) => finding.path)).toEqual([
+      `${DEFAULT_ROOT_PATH}.apiKey[0]`,
+    ]);
+    expect(report.inspected).toBe(6);
+    expect(report.complete).toBe(true);
+  });
+
+  it('terminates on a cycle whose paths interleave the two name contexts', () => {
+    // The memo is the *only* cycle-detection mechanism, so a structure that
+    // returns to itself under a benign name, under a credential-like name and
+    // through an array has to terminate on the memo alone. Each (object,
+    // context) pair is entered at most once and there are two contexts, so the
+    // descent is finite and no bound is reached.
+    const cyclic: Record<string, unknown> = { notes: 'ordinary text' };
+    cyclic.self = cyclic;
+    cyclic.sessionToken = cyclic;
+    cyclic.branch = [cyclic, { clientSecret: cyclic }];
+    let report: RedactGuardReport | undefined;
+    expect(() => {
+      report = inspectPayloadReport(cyclic);
+    }).not.toThrow();
+    expect(report?.findings).toEqual([]);
+    expect(report?.complete).toBe(true);
+    expect(report?.limitsReached).toEqual([]);
+  });
+
+  it('names the aliased field in the refusal without carrying any part of the value', () => {
+    // Re-inspection must not become a second disclosure route: the finding and
+    // every part of the refusal built from it name the aliased path and nothing
+    // about the value, under every rule rather than the entropy rule alone.
+    const shared: readonly string[] = [OPAQUE_SECRET];
+    const payload: JsonObject = { notes: shared, accessToken: shared };
+    const findings = inspectPayload(payload);
+    expect(ruleIdsOf(findings)).toEqual(['high-entropy-secret']);
+    expectNoValueLeak(serialise(findings), OPAQUE_SECRET);
+    const result = assertOutboundSafe(makeRequest({ input: payload }));
+    expect(result.ok).toBe(false);
+    if (result.ok) {
+      return;
+    }
+    expect(result.error.details?.paths).toEqual([`${DEFAULT_ROOT_PATH}.accessToken[0]`]);
+    const printed = [
+      result.error.message,
+      result.error.hint ?? '',
+      JSON.stringify(result.error.details),
+      JSON.stringify(result.error.toPayload()),
+    ].join('\n');
+    expectNoValueLeak(printed, OPAQUE_SECRET);
+  });
+
   it('reports a throwing getter as an inspection error rather than propagating it', () => {
     const payload: Record<string, unknown> = { component: 'SummaryCard' };
     Object.defineProperty(payload, 'apiKey', {

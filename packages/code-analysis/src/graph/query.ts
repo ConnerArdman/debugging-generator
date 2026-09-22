@@ -828,9 +828,16 @@ export interface CodeQueries {
    * reported as {@link CodeMatch.score}; within a tier, nodes are ordered by
    * `id`, so the answer is identical on every run. The exact tier is a
    * constant-time index read; the other tiers scan the graph's nodes in
-   * canonical order and stop at the limit, so a name matching more of a large
-   * project than the budget allows yields the first `limit` candidates that
-   * scan found, ranked among themselves.
+   * canonical order.
+   *
+   * **The whole scan is ranked, and only then truncated.** A name matching more
+   * of a large project than the budget allows yields the `limit` *best-ranked*
+   * candidates and not the first `limit` the scan reached, so a substring hit
+   * on an early node id never displaces a case-insensitive exact or prefix hit
+   * on a later one. That costs no memory: the ranked candidates held are capped
+   * at `limit` however many nodes match, and a candidate that cannot beat the
+   * ones already held — on its score, or on its `id` at an equal score — is
+   * rejected by that comparison alone, before any location is minted for it.
    *
    * Bound: {@link CodeQueryLimits.maxResults}, lowerable per call. An empty
    * name, a name longer than {@link CodeQueryLimits.maxNameLength} and an empty
@@ -1261,6 +1268,192 @@ function compareMatches(left: CodeMatch, right: CodeMatch): number {
   }
 
   return compareStrings(left.nodeId, right.nodeId);
+}
+
+/**
+ * A bounded, ranked accumulator of name matches.
+ *
+ * The structure behind {@link CodeQueries.findByName}, and the reason its answer
+ * is the *best* `limit` matches rather than the first `limit` a scan happened to
+ * reach. Both name tiers offer every candidate they find to one of these; it
+ * holds at most `limit` matches, keeps them in {@link compareMatches} order at
+ * all times, and drops the worst held match the moment a better one arrives.
+ * Ranking therefore happens **before** truncation while the scan stays bounded,
+ * so a substring hit at a low node id can no longer displace a case-insensitive
+ * exact or prefix hit at a high one — which is the ranking
+ * {@link MATCH_SCORES} and {@link CodeMatch.score} promise a caller, and the
+ * order a model reasons over the candidates in.
+ *
+ * Two properties are worth stating, because the obvious alternatives each lose
+ * one of them:
+ *
+ * - **Memory is bounded by `limit`, never by the number of matching nodes.**
+ *   Collecting every candidate and sorting at the end would rank correctly too,
+ *   but it would allocate a {@link CodeMatch} — and mint a
+ *   {@link SourceLocation} — per matching node, and a short needle matches a
+ *   large share of a large project's names. Both pieces of state here are
+ *   bounded: the held matches by `limit`, and the set of ids that de-duplicates
+ *   offers by the same, because an evicted match's id leaves the set with it.
+ * - **A hopeless candidate stays cheap.** {@link RankedMatches.admits} is a
+ *   score comparison and, at an equal score, a string comparison of the node
+ *   id — the whole of {@link compareMatches} against the worst held match — and
+ *   is what a scan tests *before* asking for a conversion. So a node that
+ *   cannot earn a place costs one tier test and one comparison and never
+ *   reaches `locationOf`, however many of its kind the graph holds.
+ */
+interface RankedMatches {
+  /**
+   * Whether this candidate could still earn a place.
+   *
+   * `true` while fewer than `limit` matches are held. Once the accumulator is
+   * full it answers the *whole* of {@link compareMatches}: a better score wins,
+   * an equal score wins only when `nodeId` sorts before the worst held match's,
+   * and anything else is refused. Taking the tie-break into account here rather
+   * than after conversion is what keeps the accumulator's cost proportional to
+   * `limit` instead of to the number of matching nodes — a needle matching a
+   * whole score tier of a large project would otherwise mint a
+   * {@link SourceLocation} for every one of them only to discard it.
+   *
+   * @param score The candidate's tier score.
+   * @param nodeId The candidate's node id, which breaks a tie on score.
+   * @returns `true` when the candidate is worth converting.
+   */
+  admits(score: number, nodeId: string): boolean;
+
+  /**
+   * Offers one node at one score.
+   *
+   * A node that is already held is ignored, which is what stops the loose tier
+   * re-reporting — or silently downgrading to a lower tier — a node the exact
+   * tier already contributed. A node that was held and has since been evicted
+   * is not remembered, and does not need to be: the tiers offer a node at a
+   * strictly lower score each time, so a re-offer of an evicted node is refused
+   * by {@link RankedMatches.admits} on its own merits. The candidate is
+   * re-tested against that predicate here, so a scan may use it as a pre-filter
+   * but never has to.
+   *
+   * A node whose conversion is refused — its file is not a safe
+   * project-relative path — is dropped without consuming any of the budget,
+   * exactly like a node that never matched.
+   *
+   * @param node The matching node.
+   * @param score The tier score, from {@link MATCH_SCORES}.
+   */
+  offer(node: CodeNode, score: number): void;
+
+  /**
+   * The matches held, already ordered and frozen.
+   *
+   * @returns The ranked matches, best first, or {@link EMPTY_MATCHES} when none
+   * was kept.
+   */
+  drain(): readonly CodeMatch[];
+}
+
+/**
+ * Builds a {@link RankedMatches} over one node-to-match conversion.
+ *
+ * Insertion into a sorted array of at most `limit` entries — at most
+ * {@link CodeQueryLimits.maxResults}, so at most fifty — deliberately rather
+ * than a heap: at that size the linear insert beats a heap's bookkeeping, it
+ * leaves the held matches in their final order so {@link RankedMatches.drain}
+ * needs no sort, and the tiers arrive in roughly descending score order, which
+ * makes the common insertion a comparison or two at the tail.
+ *
+ * @param limit The greatest number of matches to hold, at least `1` — every
+ * caller passes a {@link clampCap} result.
+ * @param convert The node-to-match conversion, which answers `undefined` for a
+ * node that must be skipped.
+ * @returns The accumulator, frozen.
+ */
+function createRankedMatches(
+  limit: number,
+  convert: (node: CodeNode, score: number) => CodeMatch | undefined,
+): RankedMatches {
+  /** The held matches, in {@link compareMatches} order, never more than `limit`. */
+  const held: CodeMatch[] = [];
+
+  /**
+   * The id of every node currently held, so an offer is never counted twice.
+   *
+   * Exactly the ids in `held`, added when a match is placed and removed when it
+   * is evicted, which is what keeps this set bounded by `limit` alongside the
+   * array it mirrors. It exists as a set rather than as a scan of `held`
+   * because both tiers offer into the accumulator for every node they visit,
+   * and that lookup is the hot path.
+   */
+  const heldIds = new Set<string>();
+
+  const admits = (score: number, nodeId: string): boolean => {
+    if (held.length < limit) {
+      return true;
+    }
+
+    const worst = held[held.length - 1];
+    if (worst === undefined) {
+      return true;
+    }
+
+    const worstScore = worst.score ?? 0;
+    if (score !== worstScore) {
+      return score > worstScore;
+    }
+
+    // Equal scores are ordered by `nodeId`, so a candidate takes the last place
+    // only by sorting before the match holding it. Deciding that here — rather
+    // than by inserting and popping — is what stops a whole score tier being
+    // converted into matches the accumulator immediately discards.
+    return compareStrings(nodeId, worst.nodeId) < 0;
+  };
+
+  /**
+   * Places a match in rank order, then discards the overflow.
+   *
+   * A backwards linear scan, because an admitted candidate usually belongs at
+   * or near the tail. Every match reaching here has already been admitted
+   * against the worst held match, so the overflow it displaces is another
+   * match and never itself.
+   *
+   * @param match The match to place.
+   */
+  const insert = (match: CodeMatch): void => {
+    let at = held.length;
+    while (at > 0) {
+      const previous = held[at - 1];
+      if (previous === undefined || compareMatches(previous, match) <= 0) {
+        break;
+      }
+      at -= 1;
+    }
+
+    held.splice(at, 0, match);
+    heldIds.add(match.nodeId);
+
+    if (held.length > limit) {
+      const evicted = held.pop();
+      if (evicted !== undefined) {
+        heldIds.delete(evicted.nodeId);
+      }
+    }
+  };
+
+  const offer = (node: CodeNode, score: number): void => {
+    if (heldIds.has(node.id) || !admits(score, node.id)) {
+      return;
+    }
+
+    const match = convert(node, score);
+    if (match === undefined) {
+      return;
+    }
+
+    insert(match);
+  };
+
+  const drain = (): readonly CodeMatch[] =>
+    held.length === 0 ? EMPTY_MATCHES : Object.freeze([...held]);
+
+  return Object.freeze({ admits, offer, drain });
 }
 
 /**
@@ -1754,6 +1947,17 @@ export function createCodeQueries(graph: CodeGraph, options?: CodeQueryOptions):
     return matched.length === 0 ? EMPTY_NODES : matched.sort(compareSymbolCandidates);
   };
 
+  /**
+   * The ranked candidates for a name — see {@link CodeQueries.findByName} for
+   * the contract.
+   *
+   * Both tiers offer into one {@link RankedMatches}, which is what keeps the
+   * answer ranked while the work stays bounded: the accumulator holds at most
+   * `limit` matches and orders them as they arrive, so the whole bounded node
+   * set is ranked and only then truncated. Neither loop breaks at the cap —
+   * breaking would decide the *membership* of the answer by node id, which is
+   * the tie-break and not the ranking.
+   */
   const findByName = (name: string, queryOptions?: FindByNameOptions): readonly CodeMatch[] => {
     if (!usableName(name)) {
       logger.debug('rejected a name argument outside the length bound', {
@@ -1771,48 +1975,39 @@ export function createCodeQueries(graph: CodeGraph, options?: CodeQueryOptions):
     const limit = clampCap(queryOptions?.limit, limits.maxResults);
     const acceptable = (node: CodeNode): boolean =>
       kinds === undefined || kinds.includes(node.kind);
-    const collected = new Map<string, CodeMatch>();
+    const ranked = createRankedMatches(limit, toMatch);
 
     // The exact tier is a single index read; it is also the only tier a caller
-    // asking for `exact` gets.
+    // asking for `exact` gets. Every hit here scores the same, so which of them
+    // survives the cap is decided by the `nodeId` tie-break inside the
+    // accumulator rather than by this index's arrival order.
     for (const node of graph.nodesByName(name)) {
-      if (collected.size >= limit) {
-        break;
-      }
       if (!acceptable(node)) {
         continue;
       }
-      const match = toMatch(node, MATCH_SCORES.exact);
-      if (match !== undefined) {
-        collected.set(node.id, match);
-      }
+      ranked.offer(node, MATCH_SCORES.exact);
     }
 
     if (queryOptions?.exact !== true) {
+      // The loose tiers genuinely scan, in node-id order. The admission test is
+      // what keeps that scan cheap: a candidate that cannot beat the worst held
+      // match — on its score, or on its node id at an equal score — costs one
+      // `looseMatchScore` call and one comparison, and is never converted into
+      // a match or a location.
       const needle = name.toLowerCase();
       for (const node of graph.nodes()) {
-        if (collected.size >= limit) {
-          break;
-        }
-        if (collected.has(node.id) || !acceptable(node)) {
+        if (!acceptable(node)) {
           continue;
         }
         const score = looseMatchScore(node.name, needle);
-        if (score === undefined) {
+        if (score === undefined || !ranked.admits(score, node.id)) {
           continue;
         }
-        const match = toMatch(node, score);
-        if (match !== undefined) {
-          collected.set(node.id, match);
-        }
+        ranked.offer(node, score);
       }
     }
 
-    if (collected.size === 0) {
-      return EMPTY_MATCHES;
-    }
-
-    return Object.freeze([...collected.values()].sort(compareMatches));
+    return ranked.drain();
   };
 
   const findSymbol = (file: string, symbol: string): CodeSymbolMatch | undefined => {

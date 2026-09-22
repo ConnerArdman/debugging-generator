@@ -84,9 +84,10 @@
  * the stylesheet finds clearer - without either needing a class this file does not write.
  *
  * Not one CSS value is written here - no coordinate, no stacking value, no colour, no inline style
- * at all - and no motion either: the transition constants live under the `--dgx-` prefix in
- * ../styles/base.css beside the `prefers-reduced-motion` block that switches them off, and
- * animating from TSX would escape that block.
+ * at all - and no motion either: transition timing comes from the `--dg-motion-*` design tokens in
+ * ../tokens/tokens.ts, consumed by ../styles/components.css and switched off by the
+ * `prefers-reduced-motion` block in ../styles/base.css, and animating from TSX would escape that
+ * block.
  */
 
 import clsx from 'clsx';

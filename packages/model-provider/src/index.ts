@@ -81,7 +81,12 @@
  *   {@link generateStructuredWithRepair}, plus the issue formatter and the
  *   repair-turn builder the suites assert against.
  * - `prompt-loader` — the versioned prompt files, their manifest schema and
- *   {@link renderPrompt}.
+ *   {@link renderPrompt}. A loaded prompt is `{ stage, version, text }`: `text`
+ *   is the content a stage renders and the only name it carries, and `version`
+ *   is what the session records as the provenance of what it sent. `path` comes
+ *   back beside them as an additive diagnostic — the real file that was read,
+ *   for a log line or a session record — and never as the way to obtain the
+ *   prompt.
  * - `redact-guard` — the outbound guard, the rule and header vocabularies it
  *   reports against, and the pure predicates behind them.
  * - `providers` — the provider id vocabulary and the two construction

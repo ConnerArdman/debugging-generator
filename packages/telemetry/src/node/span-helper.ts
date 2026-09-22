@@ -45,28 +45,38 @@
  *    *availability* rather than on its return value — "a `null`/`undefined`
  *    result never re-invokes the body" (AAP §0.5.1) — and this file honours the
  *    other half of that bargain. The single textual `fn(` call site below, held
- *    inside one `invoke` closure with an `invoked` flag, is how that is kept
- *    provable by inspection.
+ *    inside one `invoke` closure that records what the callback did in a
+ *    `CallbackOutcome`, is how that is kept provable by inspection.
  * 2. **The callback's value is returned unchanged.** Same reference, same
  *    falsiness, not awaited, not wrapped, not cloned. {@link span} is
  *    deliberately **not** `async` and returns `T` rather than `Promise<T>`: an
  *    `async` helper would turn every patched synchronous function in the
- *    developer's project into one that returns a promise.
+ *    developer's project into one that returns a promise. A callback that
+ *    returned successfully hands that value back even when the instrumentation
+ *    around it fails afterwards — see the `returned` case in {@link span}.
  * 3. **A returned promise ends the span when it settles.** Detected by
  *    duck-typing (`then` is callable), observed on a *side branch* that carries
  *    both handlers, and the original promise is handed back untouched — so the
- *    caller's own `catch` still runs and this module never manufactures an
- *    unhandled rejection. A synchronous throw records the exception, sets
- *    `ERROR`, ends the span and rethrows the **original** error, preserving its
- *    identity and its stack. `span.end()` happens exactly once per span on
- *    every one of those paths; a second end, or a span never ended, corrupts
- *    the correlated tree the whole product is built on.
+ *    caller's own `catch` still runs. The branch's own derived promise is
+ *    observed in turn (`sinkDerivedRejections`), because a userland `then` can
+ *    return a promise that rejects for reasons our two swallowing handlers know
+ *    nothing about, and this module never manufactures an unhandled rejection.
+ *    A synchronous throw records the exception, sets `ERROR`, ends the span and
+ *    rethrows the **original** error, preserving its identity and its stack.
+ *    `span.end()` happens exactly once per span on every one of those paths —
+ *    enforced by a flag, since a thenable is free to call both handlers — and a
+ *    second end, or a span never ended, corrupts the correlated tree the whole
+ *    product is built on.
  *
  * A fourth rule follows from the first three: **this module never throws an
  * error the application did not throw.** Every interaction with the
- * OpenTelemetry API, with the developer's `meta` object and with the logger is
- * wrapped, and a failure degrades to running the function uninstrumented. A
- * dev server with no telemetry is a correct outcome; a dev server broken by its
+ * OpenTelemetry API, with the developer's `meta` object, with the shared
+ * `globalThis` property and with the logger is wrapped. A failure before the
+ * callback ran degrades to running the function uninstrumented; a failure after
+ * it returned degrades to reporting the failure and handing back the value the
+ * callback produced, because re-running someone's function or replacing their
+ * result with an exception would be a worse outcome than lost telemetry. A dev
+ * server with no telemetry is a correct outcome; a dev server broken by its
  * debugger never is.
  *
  * ## Why the tracer is resolved per call
@@ -218,10 +228,15 @@ export interface InstallSpanHelperOptions {
    * Where this module's own diagnostics go.
    *
    * Defaults to `createPreloadLogger()` from `./config.ts`, which is quiet
-   * (`warn`) unless the developer sets `DEBUGGEN_LOG_LEVEL` — everything this
-   * module logs is `debug`, so the default is silence in someone else's
-   * terminal. `register.ts` passes its own logger so every preload line shares
-   * one prefix and one threshold.
+   * (`warn`) unless the developer sets `DEBUGGEN_LOG_LEVEL`. Almost everything
+   * this module logs is `debug`, so the default is silence in someone else's
+   * terminal; the exceptions are the genuinely degraded outcomes — a global the
+   * helper could not be installed into, and one it could not be removed from or
+   * even read back to confirm the removal — which are `warn` precisely because
+   * a developer who is not told would spend the session debugging an absence of
+   * spans, or believe a product global had gone when it had not. `register.ts`
+   * passes its own logger so every preload line shares one prefix and one
+   * threshold.
    */
   readonly logger?: Logger | undefined;
 }
@@ -229,11 +244,12 @@ export interface InstallSpanHelperOptions {
 /**
  * The property name this module installs on `globalThis`, as one constant.
  *
- * The declaration above and the removal in {@link uninstallSpanHelper} are the
- * only writers of that property, and `Reflect.deleteProperty` needs the name as
- * a string, so the spelling lives here rather than twice as a literal. It is
- * the same spelling `packages/instrumentation/src/patch/wrap-template.ts` emits
- * and `scripts/check-no-residual-instrumentation.mjs` looks for.
+ * `readGlobalHelperSlot`, `globalHelperSlotAcceptsWrite` and
+ * `writeGlobalHelperSlot` are the only accessors of that property, and each of
+ * them needs the name as a string for `Reflect`, so the spelling lives here
+ * rather than four times as a literal. It is the same spelling
+ * `packages/instrumentation/src/patch/wrap-template.ts` emits and
+ * `scripts/check-no-residual-instrumentation.mjs` looks for.
  */
 export const DEBUGGEN_GLOBAL_KEY = '__DEBUGGEN__';
 
@@ -365,6 +381,32 @@ function debug(message: string, fields?: Record<string, unknown>): void {
 }
 
 /**
+ * Write a warning record, swallowing anything the sink does.
+ *
+ * Reserved for the two outcomes that genuinely degrade the session: a global
+ * this module could not install into, and a global it could not clean up.
+ * Everything else stays at `debug`, because the default preload threshold is
+ * `warn` and this module is a guest in someone else's terminal — but a
+ * developer whose patched functions will silently produce no spans has to be
+ * told, or they debug the absence instead of their application.
+ *
+ * @param message Human-readable, value-free description.
+ * @param fields Optional structured context; never a credential, and never the
+ * value found on the global.
+ */
+function warn(message: string, fields?: Record<string, unknown>): void {
+  try {
+    if (fields === undefined) {
+      logger.warn(message);
+      return;
+    }
+    logger.warn(message, fields);
+  } catch {
+    // A logger that throws must not become an application failure.
+  }
+}
+
+/**
  * Report, once per install, that a span could not be created.
  *
  * @param error Whatever the OpenTelemetry API threw.
@@ -487,34 +529,180 @@ function setSpanAttribute(span: Span, key: string, value: AttributeValue): void 
 }
 
 /**
+ * Terminal handler for a promise this module derived rather than received.
+ *
+ * Intentionally empty, and installed on *both* outcomes: the derived value
+ * exists only because observing the application's promise created it, so
+ * neither its value nor its rejection is the application's — and a userland
+ * `then` that calls its first argument without checking it is callable must not
+ * be handed `undefined`.
+ */
+function swallowDerivedSettlement(): void {
+  // Nothing to do, by design: this is the last handler in a chain of our own
+  // making, and its only job is to leave no rejection unobserved.
+}
+
+/**
+ * Whether a thenable is a native promise still using the built-in `then`.
+ *
+ * Load-bearing for {@link sinkDerivedRejections}: `Promise.prototype.then`
+ * rejects its derived promise only when one of the handlers passed to it
+ * throws, and {@link swallowDerivedSettlement} cannot throw. Attaching that
+ * pair to an intrinsic promise therefore yields a value that provably never
+ * rejects, which is what makes one call terminal — nothing further is
+ * allocated on the path patched functions take on every asynchronous call.
+ *
+ * @param value A thenable, already duck-typed by {@link isThenable}.
+ * @returns `true` only for a genuine promise whose `then` is the intrinsic one.
+ */
+function isIntrinsicPromise(value: PromiseLike<unknown>): boolean {
+  try {
+    const then: unknown = (value as { readonly then?: unknown }).then;
+    return value instanceof Promise && then === Promise.prototype.then;
+  } catch {
+    // A proxy with a throwing `getPrototypeOf` trap, or a throwing `then`
+    // getter, is not an object whose behaviour may be assumed.
+    return false;
+  }
+}
+
+/**
+ * Attach a terminal, provably non-rejecting observer to a value this module
+ * derived.
+ *
+ * `thenable.then(…)` returns a *new* value, and for a userland promise
+ * implementation that value is whatever its `then` chose to produce —
+ * including a promise that rejects for reasons of its own, independently of
+ * the two swallowing handlers {@link observeSettlement} attached. Nothing
+ * observes that derived value unless this module does, and an unobserved
+ * rejection is fatal to the process under Node's default
+ * `--unhandled-rejections=throw`: dropping it would mean instrumentation
+ * manufacturing the crash of a dev server that was working.
+ *
+ * So this function always terminates, and only in a state where what it holds
+ * can reject nothing. There are exactly three, no loop and no hop budget:
+ *
+ * 1. **Not a thenable.** There is nothing that can reject and nothing to
+ *    attach to.
+ * 2. **An intrinsic promise** ({@link isIntrinsicPromise}). One
+ *    `then(swallow, swallow)` through the built-in `then`, whose derived
+ *    promise rejects only if a handler throws — and neither handler can. The
+ *    common case, an `async` application function returning a native promise,
+ *    ends here one call deep and allocates nothing beyond it.
+ * 3. **Anything else**, which is a foreign thenable. It is *adopted* by a
+ *    native promise rather than walked another hop: resolving a native promise
+ *    with a thenable makes the runtime read and call that thenable's `then`
+ *    and settle the native promise from it, so a rejection of the foreign
+ *    chain — or a `then` that throws, or a `then` getter that throws, all of
+ *    which the specification turns into a rejection rather than an exception —
+ *    becomes the rejection of an *intrinsic* promise, which case 2's handler
+ *    pair then settles for good. One bounded step, terminal whatever the
+ *    foreign implementation does with its own derived values: a `then` that
+ *    hands back a fresh rejecting thenable every time cannot outrun a single
+ *    adoption, which is why the hop budget this function used to carry is gone
+ *    rather than raised.
+ *
+ * The adoption is `new Promise((resolve) => resolve(value))` and deliberately
+ * **not** `Promise.resolve(value)`: the latter hands *the same object* straight
+ * back when the value is a native promise whose own `then` has been replaced
+ * (a zone-patched or otherwise instrumented runtime does exactly that), and
+ * attaching to that object would call the replacement `then` and leave us
+ * holding an unobserved derived value again. The constructor always yields a
+ * fresh intrinsic promise.
+ *
+ * The application's own promise is never passed here: this sees only the side
+ * branch {@link observeSettlement} created, so nothing about the caller's
+ * settlement, timing or handler set changes. Both attachments are wrapped,
+ * because reaching a `then` at all means touching someone else's object.
+ *
+ * @param value The value a `then` call returned; usually a promise, possibly
+ * something a non-conforming implementation made up.
+ */
+function sinkDerivedRejections(value: unknown): void {
+  if (!isThenable(value)) {
+    // A `then` that returned a plain value has nothing left that can reject.
+    return;
+  }
+  try {
+    if (isIntrinsicPromise(value)) {
+      // Deliberately discarded rather than kept: the built-in `then` with two
+      // handlers that cannot throw returns a promise that cannot reject, so
+      // this is the end of the chain — nothing is left for this module to
+      // observe, and `void` says so for the reader and for
+      // `@typescript-eslint/no-floating-promises`.
+      void value.then(swallowDerivedSettlement, swallowDerivedSettlement);
+      return;
+    }
+    // Adoption, not another hop: `resolve` reads and calls the foreign `then`
+    // itself and turns everything it can do — reject, throw, throw from its
+    // getter, or produce yet another thenable — into the settlement of this
+    // intrinsic promise.
+    const adopted: Promise<unknown> = new Promise<unknown>((resolve) => {
+      resolve(value);
+    });
+    // Terminal for exactly the reason the intrinsic branch above is.
+    void adopted.then(swallowDerivedSettlement, swallowDerivedSettlement);
+  } catch {
+    // Reaching either `then` meant reading a property off an object this
+    // module does not own, and the adoption needs the intrinsic `Promise`
+    // constructor to be intact. A failure here means there is nothing left to
+    // attach to, which is the one acceptable stopping point: what could not be
+    // reached was never this module's to observe. The span is unaffected — it
+    // was already closed by whichever handler ran, or will be.
+  }
+}
+
+/**
  * Observe a returned promise **without altering it**.
  *
  * The caller keeps the exact reference the patched function produced, so its
  * own `await`, `then` and `catch` behave as they did before instrumentation.
  * The derived promise created here is a side branch with handlers on both
- * outcomes, each of which swallows, so it always settles fulfilled and can
- * never become an unhandled rejection of this module's making.
+ * outcomes, each of which swallows, so it never rejects of its own accord — and
+ * the value that branch produces is itself sunk by
+ * {@link sinkDerivedRejections}, because a userland `then` can return a promise
+ * that rejects for reasons those handlers know nothing about. Between the two,
+ * this module leaves no rejection of its own making unobserved.
  *
  * @param thenable The value the callback returned.
  * @param span The span to end when it settles.
  */
 function observeSettlement(thenable: PromiseLike<unknown>, span: Span): void {
+  // A badly behaved userland thenable may call both handlers, or one of them
+  // twice. "`span.end()` exactly once per span" is a stated guarantee of this
+  // module, so it is enforced here rather than left to the SDK's own internal
+  // guard, which is an implementation detail of whichever span this is.
+  let settled = false;
   try {
-    // Deliberately unawaited: this is an observation, not a link in the
-    // caller's chain. `void` states that for the reader and for
-    // `@typescript-eslint/no-floating-promises`.
-    void thenable.then(
+    // The value `then` returns is kept rather than discarded: it is a promise
+    // of this module's making, and an unobserved rejection on it would be a
+    // crash instrumentation caused. Not `void`-ed, so there is no floating
+    // promise for `@typescript-eslint/no-floating-promises` to flag either.
+    const derived: unknown = thenable.then(
       () => {
+        if (settled) {
+          return;
+        }
+        settled = true;
         endSpan(span);
       },
       (reason: unknown) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
         failSpan(span, reason);
       },
     );
+    sinkDerivedRejections(derived);
   } catch {
     // A thenable whose `then` throws synchronously cannot be observed; close
-    // the span now rather than leaving it open for the rest of the process.
-    endSpan(span);
+    // the span now rather than leaving it open for the rest of the process,
+    // unless a handler already ran before the throw.
+    if (!settled) {
+      settled = true;
+      endSpan(span);
+    }
   }
 }
 
@@ -614,6 +802,141 @@ function toSpanAttributes(meta: unknown): Attributes {
 }
 
 /**
+ * The outcome of one guarded read of `globalThis.__DEBUGGEN__`.
+ *
+ * Tagged rather than a bare `unknown`, because "the slot holds `undefined`"
+ * and "the slot could not be read" are different facts and only the first is
+ * evidence of anything: a throwing accessor that yields nothing is not a slot
+ * that was successfully emptied. Collapsing the two into one `undefined` is
+ * what let {@link writeGlobalHelperSlot} report a write of `undefined` as
+ * verified when its verification read had in fact thrown, and
+ * {@link uninstallSpanHelper} report a removal it had not achieved. Every call
+ * site now has to decide what an unreadable slot means for it, and each of the
+ * three does so explicitly.
+ */
+type GlobalSlotRead = { readonly ok: true; readonly value: unknown } | { readonly ok: false };
+
+/**
+ * Read `globalThis.__DEBUGGEN__` without trusting the global object.
+ *
+ * The global is shared with the developer's application, its framework and
+ * anything else loaded into the dev-server process. Any of them may have
+ * defined this name as an accessor, and a getter that throws would otherwise
+ * take the preload — and the dev server with it — down from inside a property
+ * read. What the failure *means* is not decided here: this function reports
+ * only whether the read succeeded, and the callers differ — the install treats
+ * an unreadable slot as an absent one and lets the write be judged, while the
+ * write and the uninstall treat it as a failed verification.
+ *
+ * @returns `{ ok: true, value }` carrying whatever the property yielded, or
+ * `{ ok: false }` when reading it threw.
+ */
+function readGlobalHelperSlot(): GlobalSlotRead {
+  try {
+    return { ok: true, value: globalThis.__DEBUGGEN__ };
+  } catch {
+    // A throwing accessor on the global tells us nothing about what is there.
+    return { ok: false };
+  }
+}
+
+/**
+ * Whether the global slot can be made to hold a value of ours at all.
+ *
+ * Checked *before* attempting a write so that a refusal is reported as one
+ * rather than discovered as a thrown `TypeError` on the application's stack: in
+ * ESM strict mode an assignment to a non-writable data property, or to an
+ * accessor with no setter, throws. Two shapes cannot be satisfied, and both are
+ * final because a non-configurable property cannot be redefined:
+ *
+ * - a data property with `writable: false` and `configurable: false`;
+ * - an accessor with no `set` and `configurable: false`.
+ *
+ * Everything else is attemptable. A `writable: false` but *configurable* data
+ * property is not a refusal: {@link writeGlobalHelperSlot} redefines it through
+ * `Reflect.defineProperty`, which succeeds where an assignment would have
+ * thrown — so the helper installs where the previous assignment-based code
+ * crashed. An accessor with a setter is attemptable too, and the verification
+ * read is what decides whether the setter actually kept the value.
+ *
+ * @returns `true` when a write may be attempted.
+ */
+function globalHelperSlotAcceptsWrite(): boolean {
+  let descriptor: PropertyDescriptor | undefined;
+  try {
+    descriptor = Reflect.getOwnPropertyDescriptor(globalThis, DEBUGGEN_GLOBAL_KEY);
+  } catch {
+    // A global whose descriptor cannot even be read is not one to write to.
+    return false;
+  }
+  if (descriptor === undefined) {
+    // Absent: only a non-extensible global object can refuse the definition,
+    // and `Object.isExtensible` is the one question left to ask.
+    try {
+      return Object.isExtensible(globalThis);
+    } catch {
+      return false;
+    }
+  }
+  if (descriptor.configurable === true) {
+    return true;
+  }
+  if (descriptor.get !== undefined || descriptor.set !== undefined) {
+    return typeof descriptor.set === 'function';
+  }
+  return descriptor.writable === true;
+}
+
+/**
+ * Write the global slot through `Reflect`, and confirm the write took.
+ *
+ * `Reflect.defineProperty` is used rather than an assignment because it reports
+ * a refusal by returning `false` instead of throwing, and because the four
+ * attributes below reproduce exactly what the assignment this replaced created
+ * for a new property — a writable, enumerable, configurable data property — so
+ * nothing observable about the installed global changes. `Reflect.set` is the
+ * fallback for the one case where defining is wrong: a property whose owner
+ * installed a setter, which is entitled to see the value.
+ *
+ * The verification read is not belt-and-braces. A setter may transform or
+ * discard what it is given, and a host may refuse a definition for reasons no
+ * descriptor shows; identity is the only proof that a patched function reaching
+ * for this global will find our helper. A read that *fails* proves nothing and
+ * is therefore a failed verification — including, and especially, when the
+ * value being written is `undefined`, where a thrown getter would otherwise
+ * look exactly like a slot successfully cleared.
+ *
+ * @param value The value the slot should hold afterwards.
+ * @returns `true` only when the slot can be read back and yields exactly
+ * `value`.
+ */
+function writeGlobalHelperSlot(value: DebuggenSpanHelper | undefined): boolean {
+  let defined = false;
+  try {
+    defined = Reflect.defineProperty(globalThis, DEBUGGEN_GLOBAL_KEY, {
+      value,
+      writable: true,
+      enumerable: true,
+      configurable: true,
+    });
+  } catch {
+    // Some hosts throw from `defineProperty` where the specification returns
+    // false; either way the fallback below is what is left to try.
+  }
+  if (!defined) {
+    try {
+      Reflect.set(globalThis, DEBUGGEN_GLOBAL_KEY, value);
+    } catch {
+      // `Reflect.set` returns false rather than throwing for an ordinary
+      // refusal; a throw here comes from a setter of someone else's, and the
+      // verification below is what turns either into a reported refusal.
+    }
+  }
+  const readBack = readGlobalHelperSlot();
+  return readBack.ok && readBack.value === value;
+}
+
+/**
  * Whether a value already satisfies the patch contract at runtime.
  *
  * The same test the patch template performs — `typeof value.span === 'function'`
@@ -662,6 +985,28 @@ function createHelper(existing: unknown): DebuggenSpanHelper {
   return { ...carried, span };
 }
 
+/**
+ * What the application's callback did, recorded at the single `fn(` call site.
+ *
+ * `undefined` — the variable's initial value — means the callback has not run
+ * yet, which is the only state in which {@link span} may still invoke it. The
+ * two members then tell the two *successful observations* apart from each
+ * other: `returned` carries the value by reference (never re-derived, never
+ * awaited), `threw` carries the thrown value itself so its identity and stack
+ * can be handed back to the application unchanged.
+ *
+ * Why a record rather than a boolean: `context.with` can fail *after* the
+ * callback returned — its own cleanup, restoring the previous context, is code
+ * this module does not own. A boolean "did it run" cannot distinguish that from
+ * "the application threw", and reporting a successful call as a failure would
+ * break both the second and the fourth guarantee of the module overview at
+ * once: the caller would lose the value it produced *and* receive an error it
+ * never threw.
+ */
+type CallbackOutcome<T> =
+  | { readonly state: 'returned'; readonly value: T }
+  | { readonly state: 'threw'; readonly error: unknown };
+
 /*
  * ---------------------------------------------------------------------------
  * Public API
@@ -677,10 +1022,27 @@ function createHelper(existing: unknown): DebuggenSpanHelper {
  * changing anything here.
  *
  * The one textual `fn(` call site in this file is inside `invoke`, and the
- * `invoked` flag it sets is what distinguishes "the application function threw"
- * — rethrow, unchanged — from "the context manager threw before the application
- * function ran", where the function still has to run, uninstrumented. There is
- * no path on which `fn` runs twice, and none on which it does not run at all.
+ * {@link CallbackOutcome} it records is what tells the three ways a `catch`
+ * around `context.with` can be reached apart:
+ *
+ * - **No outcome** — the context manager threw before the application function
+ *   ran. The orphan span is ended, the tracer failure is reported once, and the
+ *   function still has to run, uninstrumented: that is its first and only
+ *   invocation.
+ * - **`threw`** — the application function failed. The span records *its*
+ *   error and the same error object is rethrown, so identity and stack are the
+ *   application's. If what `context.with` rethrew is not that error, the
+ *   difference is an instrumentation failure and is reported before the
+ *   application's error goes back up.
+ * - **`returned`** — the application function succeeded and `context.with`'s
+ *   own cleanup failed afterwards. **That must never surface as an application
+ *   failure.** The instrumentation failure is reported once and the stored
+ *   value continues down the normal completion path, so the thenable check, the
+ *   `async` attribute and the single `span.end()` all still happen and the
+ *   caller receives exactly the value its function produced.
+ *
+ * There is no path on which `fn` runs twice, and none on which it does not run
+ * at all.
  *
  * @param name The patched symbol's name; becomes the span name.
  * @param meta Attribute candidates from the patch (`symbol`, `module`,
@@ -698,10 +1060,19 @@ export function span<T>(
   fn: () => T,
   kind: SpanKind = SpanKind.INTERNAL,
 ): T {
-  let invoked = false;
+  let outcome: CallbackOutcome<T> | undefined;
   const invoke = (): T => {
-    invoked = true;
-    return fn();
+    try {
+      const value = fn();
+      outcome = { state: 'returned', value };
+      return value;
+    } catch (error) {
+      // Recorded and rethrown, not handled: the application's error keeps
+      // travelling up its own stack, and the record is what stops a later
+      // instrumentation failure from being mistaken for this one.
+      outcome = { state: 'threw', error };
+      throw error;
+    }
   };
 
   // Resolved per call, never cached: see "Why the tracer is resolved per call".
@@ -735,15 +1106,33 @@ export function span<T>(
     // creates children of it.
     result = context.with(scope, invoke);
   } catch (error) {
-    if (!invoked) {
+    // Read once into a constant: `outcome` is written from a closure, and the
+    // branches below must all reason about the same observation.
+    const recorded = outcome;
+    if (recorded === undefined) {
       // The context manager failed before `fn` ran. The application's function
       // still owes its caller a result, so run it outside the span.
       endSpan(started);
       reportTracerFailure(error);
       return invoke();
     }
-    failSpan(started, error);
-    throw error;
+    if (recorded.state === 'threw') {
+      if (error !== recorded.error) {
+        // The callback's error was swallowed or replaced on the way out of
+        // `context.with`; that substitution is ours to report, not the
+        // application's to receive.
+        reportTracerFailure(error);
+      }
+      failSpan(started, recorded.error);
+      throw recorded.error;
+    }
+    // The callback succeeded and only the context manager's own cleanup failed.
+    // Guarantee four: that is this module's failure, so it is reported here and
+    // the call continues through the normal completion path below with the
+    // value `fn` produced — which is also the only way the span still gets its
+    // `async` attribute and its single `end()`.
+    reportTracerFailure(error);
+    result = recorded.value;
   }
 
   if (isThenable(result)) {
@@ -777,13 +1166,27 @@ export function span<T>(
  *    installed, carrying over the own members of a non-conforming object so
  *    nothing is destroyed.
  *
+ * Every read and every write of that property is guarded, and a global this
+ * module cannot install into is a *refusal*, not an exception: one `warn`
+ * naming the consequence — patched functions run uninstrumented — and no
+ * ownership recorded, so a later {@link uninstallSpanHelper} cannot touch a
+ * value this module does not own. The property is left exactly as its owner
+ * defined it, and the session degrades to having no function spans, which is a
+ * correct outcome where crashing the developer's dev server never is.
+ *
  * @param options See {@link InstallSpanHelperOptions}.
  */
 export function installSpanHelper(options: InstallSpanHelperOptions = {}): void {
   logger = options.logger ?? createPreloadLogger();
   reportedTracerFailure = false;
 
-  const existing: unknown = globalThis.__DEBUGGEN__;
+  // An unreadable slot is treated as an absent one: a throwing accessor
+  // proves nothing either way, and treating it as absent is what lets the
+  // install attempt proceed and be judged on whether the *write* took —
+  // `globalHelperSlotAcceptsWrite` and the verified write below are what
+  // decide, and both of them report a refusal rather than assuming one.
+  const slot = readGlobalHelperSlot();
+  const existing: unknown = slot.ok ? slot.value : undefined;
   if (existing !== undefined && existing === installedHelper) {
     debug('span helper already installed');
     return;
@@ -793,8 +1196,24 @@ export function installSpanHelper(options: InstallSpanHelperOptions = {}): void 
     return;
   }
 
+  if (!globalHelperSlotAcceptsWrite()) {
+    warn(
+      'the __DEBUGGEN__ global is not writable in this process; patched functions will run uninstrumented and produce no function spans',
+      { property: DEBUGGEN_GLOBAL_KEY },
+    );
+    return;
+  }
+
   const helper = createHelper(existing);
-  globalThis.__DEBUGGEN__ = helper;
+  if (!writeGlobalHelperSlot(helper)) {
+    // The descriptor allowed an attempt and the attempt did not take: a setter
+    // that kept something else, or a host that refused the definition anyway.
+    warn(
+      'the __DEBUGGEN__ span helper could not be installed on the global; patched functions will run uninstrumented and produce no function spans',
+      { property: DEBUGGEN_GLOBAL_KEY },
+    );
+    return;
+  }
   installedHelper = helper;
   debug('span helper installed', { tracer: TRACER_NAME, version: TRACER_VERSION });
 }
@@ -810,6 +1229,23 @@ export function installSpanHelper(options: InstallSpanHelperOptions = {}): void 
  * Identity-tracked in both directions: a helper installed by someone else is
  * never removed, and a global replaced after our install is left alone. Calling
  * this without a preceding install, or twice, is a no-op.
+ *
+ * Removal never throws, and never claims a success it cannot demonstrate.
+ * `span helper removed` is logged only where a *successful* read proves the
+ * helper is no longer what the global yields; the two outcomes where that
+ * proof cannot be obtained each produce exactly one value-free `warn` and a
+ * normal return, because an unreported failed cleanup is how a developer ends
+ * up with a product global they were told had gone:
+ *
+ * - **The slot cannot be read at all.** Identity cannot be established, so the
+ *   property is left exactly as its owner defined it — deleting one this
+ *   module cannot prove is its own would destroy someone else's — and the
+ *   unverifiable state is reported.
+ * - **The deletion was refused or unverifiable and the guarded write did not
+ *   verify either.** What remains is the helper this module installed, still
+ *   functional and still harmless: outside a capture `trace.getTracer` yields
+ *   a non-recording span, so a patched function costs a lookup and records
+ *   nothing.
  */
 export function uninstallSpanHelper(): void {
   const helper = installedHelper;
@@ -819,7 +1255,20 @@ export function uninstallSpanHelper(): void {
     debug('span helper was not installed by this module; nothing to remove');
     return;
   }
-  if (globalThis.__DEBUGGEN__ !== helper) {
+
+  const before = readGlobalHelperSlot();
+  if (!before.ok) {
+    // Nothing can be concluded from a throwing accessor, and the second
+    // direction of identity tracking — never touch a value that is not ours —
+    // cannot be satisfied without reading it. Leave the property alone and say
+    // so: this is a cleanup whose outcome is genuinely unknown.
+    warn(
+      'the __DEBUGGEN__ global could not be read, so removal of the span helper could not be confirmed; the property is left exactly as it stands',
+      { property: DEBUGGEN_GLOBAL_KEY },
+    );
+    return;
+  }
+  if (before.value !== helper) {
     debug('__DEBUGGEN__ was replaced after installation; leaving it in place');
     return;
   }
@@ -828,16 +1277,32 @@ export function uninstallSpanHelper(): void {
   // declaration (TypeScript requires the operand of `delete` to be optional),
   // and removing the property outright is tidier than leaving an `undefined`
   // behind, so the removal goes through `Reflect`. A non-configurable property
-  // — nothing creates one, but the global object is shared — falls back to an
-  // assignment, which is all the patch template's availability check needs.
+  // — nothing here creates one, but the global object is shared — falls back to
+  // the same guarded write the install uses, which is all the patch template's
+  // availability check needs.
   let removed = false;
   try {
     removed = Reflect.deleteProperty(globalThis, DEBUGGEN_GLOBAL_KEY);
   } catch {
-    // A refusal leaves `removed` false and takes the assignment below.
+    // A refusal leaves `removed` false and takes the guarded write below.
   }
-  if (!removed) {
-    globalThis.__DEBUGGEN__ = undefined;
+  if (removed) {
+    const after = readGlobalHelperSlot();
+    if (after.ok && after.value !== helper) {
+      debug('span helper removed');
+      return;
+    }
+    // The deletion reported success, but the slot still yields our helper (an
+    // inherited property took the name over) or can no longer be read at all.
+    // Either way the removal is unproven, so the guarded write below is what
+    // is left to try — and its own verification decides.
   }
-  debug('span helper removed');
+  if (writeGlobalHelperSlot(undefined)) {
+    debug('span helper removed');
+    return;
+  }
+  warn(
+    'the __DEBUGGEN__ span helper could not be removed from the global; it stays in place and records nothing outside a capture',
+    { property: DEBUGGEN_GLOBAL_KEY },
+  );
 }

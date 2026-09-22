@@ -380,11 +380,41 @@ function totalCharsOf(loaded: LoadedProject): number {
   return loaded.sourceFiles().reduce((sum, file) => sum + file.getFullText().length, 0);
 }
 
-/** The largest single file of the handle, in characters. */
-function largestFileCharsOf(loaded: LoadedProject): number {
-  return loaded
-    .sourceFiles()
-    .reduce((largest, file) => Math.max(largest, file.getFullText().length), 0);
+/**
+ * The project-relative path of the file the module examines **first**.
+ *
+ * Derived rather than written out: files are scanned in ascending
+ * project-relative POSIX path order under a UTF-16 code-unit comparison, which
+ * is exactly what `Array#sort` gives for strings, so a corpus that grows a file
+ * sorting before today's first one does not silently invalidate the
+ * scanned-bytes cases that start from it.
+ */
+function firstScannedPathOf(loaded: LoadedProject): string {
+  const paths = [...relativePathsOf(loaded)].sort();
+  return at(paths, 0, 'the first file in the scan order');
+}
+
+/**
+ * The 0-based offset of the first case-insensitive occurrence of `needle` in
+ * `text`, or `-1`.
+ *
+ * Computed with `indexOf` rather than with a regular expression, for the same
+ * reason as {@link occurrencesOf}: a derived expectation must not lean on the
+ * mechanism the module under test uses.
+ */
+function firstOffsetOf(text: string, needle: string): number {
+  return text.toLowerCase().indexOf(needle.toLowerCase());
+}
+
+/**
+ * `literal` as a regular-expression pattern that matches exactly itself.
+ *
+ * The test's own escaper rather than the module's: a case that asserts what a
+ * *pattern* does must be able to build one out of the corpus' real text without
+ * borrowing the mechanism under test to do it.
+ */
+function escapeForPattern(literal: string): string {
+  return literal.replace(/[.*+?^${}()|[\]\\/-]/g, (character) => `\\${character}`);
 }
 
 /** One record a {@link createRecordingLogger} logger captured. */
@@ -808,8 +838,24 @@ describe('searchText: the per-file cap', () => {
   });
 });
 
+/*
+ * ---------------------------------------------------------------------------
+ * The scanned-bytes ceiling
+ *
+ * The one cap that spans files, and therefore the one that bounds the cost of
+ * a query matching nothing. It is a *hard* total: the file the budget runs out
+ * in is examined only as far as the budget reaches, so `bytesScanned` lands on
+ * the ceiling rather than up to one whole file past it — an overrun of almost
+ * a megabyte, since `maxFileBytes` admits a million characters. These cases
+ * guard that the ceiling is enforced (not merely documented), that a budget
+ * smaller than the first file is *spent* rather than abandoned, that a match
+ * touching the cut is not reported from characters that were never read, and
+ * that clipping the text a scan reads corrupts no hit's location or excerpt.
+ * ---------------------------------------------------------------------------
+ */
+
 describe('searchText: the scanned-bytes ceiling', () => {
-  it('stops reading files instead of treating the ceiling as advisory', () => {
+  it('stops exactly on the ceiling instead of treating it as advisory', () => {
     const loaded = corpusProject();
     const ceiling = 100;
     expect(ceiling).toBeLessThan(totalCharsOf(loaded));
@@ -822,13 +868,275 @@ describe('searchText: the scanned-bytes ceiling', () => {
 
     expect(found.truncated).toBe(true);
     expect(found.filesSearched).toBeGreaterThanOrEqual(1);
+    // Files left unexamined, which is what proves the scan stopped early.
     expect(found.filesSearched).toBeLessThan(loaded.sourceFiles().length);
 
-    // The ceiling is checked before each file rather than mid-file, so the
-    // accounting lands within one file of it — and far below the corpus total,
-    // which is what proves the scan stopped early.
+    // The accounting lands ON the ceiling: the accumulated total is checked
+    // against the budget *before* a file's text is scanned, and a file that
+    // does not fit contributes only the characters the budget had left.
+    expect(found.bytesScanned).toBe(ceiling);
     expect(found.bytesScanned).toBeLessThan(totalCharsOf(loaded));
-    expect(found.bytesScanned).toBeLessThanOrEqual(ceiling + largestFileCharsOf(loaded));
+  });
+
+  it('reports the partially examined file to the logger as counts and a path', () => {
+    const loaded = corpusProject();
+    const { logger, records } = createRecordingLogger();
+    const ceiling = 100;
+
+    const found = searchOrFail(loaded, {
+      ...BUDGET,
+      query: REPEATED_TOKEN,
+      maxScannedBytes: ceiling,
+      logger,
+    });
+    expect(found.bytesScanned).toBe(ceiling);
+
+    // A partial examination is invisible in the envelope beyond `truncated`, so
+    // the diagnostic record is the only thing that says *which* file was cut
+    // and how far the scan got into it — and it has to say it in counts and a
+    // project-relative path, never in the file's text.
+    const clipEvents = records.filter((record) => record.fields?.['scannedLength'] === ceiling);
+    expect(
+      clipEvents.length,
+      `the scan must report the file it examined only in part, and logged: ${records.map((record) => record.message).join(' | ')}`,
+    ).toBe(1);
+
+    const event = at(clipEvents, 0, 'the record naming the partially examined file');
+    expect(event.level).toBe('debug');
+    expect(event.fields?.['maxScannedBytes']).toBe(ceiling);
+    expect(relativePathsOf(loaded)).toContain(event.fields?.['file']);
+    for (const [key, value] of Object.entries(event.fields ?? {})) {
+      expect(
+        typeof value,
+        `field '${key}' of the partial-examination record must be a count or a path`,
+      ).toMatch(/^(?:number|string)$/);
+    }
+  });
+
+  it('examines the head of the first file when the ceiling is smaller than it', () => {
+    const loaded = corpusProject();
+    const firstPath = firstScannedPathOf(loaded);
+    const firstText = fileTextOf(loaded, firstPath);
+    const offset = firstOffsetOf(firstText, REPEATED_TOKEN);
+    expect(
+      offset,
+      `the first file in the scan order, '${firstPath}', must hold '${REPEATED_TOKEN}' for this case to mean anything`,
+    ).toBeGreaterThanOrEqual(0);
+
+    // One character past the end of that first occurrence: the match sits
+    // strictly inside the prefix rather than touching the cut, and the budget
+    // cannot even finish the first candidate file.
+    const ceiling = offset + REPEATED_TOKEN.length + 1;
+    expect(ceiling).toBeLessThan(firstText.length);
+
+    const found = findInCorpus({ ...BUDGET, query: REPEATED_TOKEN, maxScannedBytes: ceiling });
+
+    // The budget is *spent*, not abandoned. Skipping a file that does not fit
+    // would make any ceiling below the first file scan nothing at all, which
+    // would leave the cap untestable at a small value and hide a hit the
+    // caller's budget did pay to read.
+    expect(found.bytesScanned).toBe(ceiling);
+    expect(found.filesSearched).toBe(1);
+    expect(found.truncated).toBe(true);
+    expect(found.hits.length).toBeGreaterThanOrEqual(1);
+    expect(new Set(filesOf(found))).toEqual(new Set([firstPath]));
+
+    const hit = at(found.hits, 0, `a hit inside the examined head of '${firstPath}'`);
+    expect(matchedTextOf(hit).toLowerCase()).toBe(REPEATED_TOKEN.toLowerCase());
+
+    // The location comes from the whole file, never from the prefix, so it
+    // names the same place a complete scan would have named.
+    const line = lineTextOf(loaded, firstPath, hit.location.line);
+    const columnIndex = hit.location.column - 1;
+    expect(
+      line.slice(columnIndex, columnIndex + REPEATED_TOKEN.length).toLowerCase(),
+      `'${firstPath}' line ${String(hit.location.line)} must hold the token at column ${String(hit.location.column)}, and holds: ${line}`,
+    ).toBe(REPEATED_TOKEN.toLowerCase());
+  });
+
+  it('reports no match that reaches the cut, because its extent was never read', () => {
+    const loaded = corpusProject();
+    const firstPath = firstScannedPathOf(loaded);
+    const firstText = fileTextOf(loaded, firstPath);
+    const offset = firstOffsetOf(firstText, REPEATED_TOKEN);
+    expect(offset).toBeGreaterThanOrEqual(0);
+
+    // The cut falls exactly at the end of the only occurrence inside the
+    // prefix. Its trailing `wholeWord` boundary — and, for a pattern, its own
+    // greedy extent — would be decided by characters the ceiling forbade
+    // reading, so it is neither reported nor counted as observed.
+    const ceiling = offset + REPEATED_TOKEN.length;
+    expect(ceiling).toBeLessThan(firstText.length);
+
+    const found = findInCorpus({ ...BUDGET, query: REPEATED_TOKEN, maxScannedBytes: ceiling });
+
+    expect(found.hits).toEqual([]);
+    expect(found.totalMatches).toBe(0);
+    expect(found.bytesScanned).toBe(ceiling);
+    expect(found.filesSearched).toBe(1);
+    expect(found.truncated).toBe(true);
+  });
+
+  it('reports an exhaustive scan when the ceiling covers the whole corpus', () => {
+    const loaded = corpusProject();
+    const total = totalCharsOf(loaded);
+
+    // A ceiling exactly equal to the corpus clips nothing: the last file fits
+    // the budget that remains, so `truncated` must stay `false` — a cap that
+    // reported truncation at its own boundary would make an exhaustive result
+    // indistinguishable from a partial one.
+    const exact = findInCorpus({ ...BUDGET, query: MARKER, maxScannedBytes: total });
+    expect(exact.truncated).toBe(false);
+    expect(exact.bytesScanned).toBe(total);
+    expect(exact.filesSearched).toBe(loaded.sourceFiles().length);
+    expect(exact.hits.length).toBe(MARKER_OCCURRENCES);
+
+    const generous = findInCorpus({ ...BUDGET, query: MARKER, maxScannedBytes: total + 1 });
+    expect(generous.truncated).toBe(false);
+    expect(generous.bytesScanned).toBe(total);
+    expect(generous.filesSearched).toBe(loaded.sourceFiles().length);
+    expect(generous.hits.length).toBe(MARKER_OCCURRENCES);
+  });
+
+  it('keeps every location valid and every excerpt intact under a clipped scan', () => {
+    const loaded = corpusProject();
+    const known = relativePathsOf(loaded);
+    // A third of the corpus: several files whole, and one examined only as far
+    // as the budget reached.
+    const ceiling = Math.floor(totalCharsOf(loaded) / 3);
+    expect(ceiling).toBeGreaterThan(0);
+
+    const found = findInCorpus({ ...BUDGET, query: REPEATED_TOKEN, maxScannedBytes: ceiling });
+
+    expect(found.bytesScanned).toBe(ceiling);
+    expect(found.truncated).toBe(true);
+    expect(found.hits.length).toBeGreaterThan(1);
+
+    for (const hit of found.hits) {
+      // The bounded prefix bounds the excerpt window and nothing else. If it
+      // had been mistaken for the file's text anywhere else — in the line and
+      // column, or in the match offset — these are the invariants that would
+      // break, one process away from where the mistake was made.
+      const parsed = parseSourceLocation(hit.location);
+      expect(
+        isOk(parsed),
+        `the location of ${hit.location.file}:${String(hit.location.line)} must satisfy the shared schema under a clipped scan`,
+      ).toBe(true);
+      expect(known).toContain(hit.location.file);
+
+      expect(matchedTextOf(hit).toLowerCase()).toBe(REPEATED_TOKEN.toLowerCase());
+      expect(hit.matchOffsetInExcerpt + hit.matchLength).toBeLessThanOrEqual(hit.excerpt.length);
+      expect(hit.excerpt).not.toContain('\n');
+      expect(hit.excerpt).not.toContain('\r');
+
+      const line = lineTextOf(loaded, hit.location.file, hit.location.line);
+      const columnIndex = hit.location.column - 1;
+      expect(
+        line.slice(columnIndex, columnIndex + REPEATED_TOKEN.length).toLowerCase(),
+        `'${hit.location.file}' line ${String(hit.location.line)} must hold the token at column ${String(hit.location.column)}, and holds: ${line}`,
+      ).toBe(REPEATED_TOKEN.toLowerCase());
+      // A contiguous slice of the real line, even when the prefix ended inside
+      // that line.
+      expect(line).toContain(hit.excerpt);
+    }
+  });
+
+  it('never runs a pattern against a file it could only examine in part', () => {
+    // The reason a *pattern* may not be handed the leading characters of a file
+    // the way a literal may. A regular expression is evaluated against the
+    // string it is executed over, so a budget cut would present itself as the
+    // end of the file: `$`, `\b` and every lookahead would answer about the cut
+    // rather than about the file. The two patterns below are built to match at
+    // the cut and *not* in the real file, so a partial examination would return
+    // them as evidence for something that is not in the developer's code —
+    // which is worse than an incomplete answer, because this module's output is
+    // what an investigation reasons over.
+    const loaded = corpusProject();
+    const firstPath = firstScannedPathOf(loaded);
+    const firstText = fileTextOf(loaded, firstPath);
+    const offset = firstOffsetOf(firstText, REPEATED_TOKEN);
+    expect(offset).toBeGreaterThanOrEqual(0);
+
+    const cut = offset + REPEATED_TOKEN.length;
+    expect(cut).toBeLessThan(firstText.length);
+
+    // Taken from the file's own text rather than from the token, so the case
+    // does not depend on how the corpus capitalises it.
+    const occurrence = firstText.slice(offset, cut);
+    const head = escapeForPattern(occurrence.slice(0, -1));
+    const tail = escapeForPattern(occurrence.slice(-1));
+    expect(occurrence).toHaveLength(REPEATED_TOKEN.length);
+
+    // Each pattern consumes only `head`, so its consumed extent ends *before*
+    // the cut and the rule that drops a match touching the cut cannot catch it;
+    // what reaches the cut is the assertion.
+    const anchored = `${head}(?=${tail}$)`;
+    const negated = `${head}(?!${tail}[\\s\\S])`;
+
+    for (const pattern of [anchored, negated]) {
+      // Full-file truth first: the token is not at the end of the file, so
+      // neither pattern matches anything when every file is examined whole.
+      const whole = findInCorpus({ ...BUDGET, query: pattern, regex: true });
+      expect(
+        whole.hits,
+        `'${pattern}' must match nothing in the whole corpus for this case to mean anything`,
+      ).toEqual([]);
+      expect(whole.totalMatches).toBe(0);
+
+      // And the same truth under a budget that stops inside the first file.
+      const clipped = findInCorpus({
+        ...BUDGET,
+        query: pattern,
+        regex: true,
+        maxScannedBytes: cut,
+      });
+
+      expect(clipped.hits).toEqual([]);
+      expect(clipped.totalMatches).toBe(0);
+      // Skipping is still a cap clipping something, and the caller has to know.
+      expect(clipped.truncated).toBe(true);
+      // A file the budget cannot hold whole is skipped rather than examined in
+      // part, so it contributes to neither total — exactly as a file over the
+      // single-file size cap does. The counts are not zero, because the scan
+      // goes on to the smaller files that *do* still fit the budget whole, and
+      // a pattern run over a whole file is answering about that file.
+      expect(clipped.bytesScanned).toBeLessThanOrEqual(cut);
+      expect(clipped.filesSearched).toBeLessThan(loaded.sourceFiles().length);
+    }
+  });
+
+  it('reports the file a pattern could not be run against in part', () => {
+    const loaded = corpusProject();
+    const { logger, records } = createRecordingLogger();
+    const firstPath = firstScannedPathOf(loaded);
+
+    const found = searchOrFail(loaded, {
+      ...BUDGET,
+      query: escapeForPattern(REPEATED_TOKEN),
+      regex: true,
+      maxScannedBytes: 10,
+      logger,
+    });
+
+    expect(found.truncated).toBe(true);
+    expect(found.bytesScanned).toBe(0);
+
+    // One record per skipped file, and the first candidate must be among them.
+    const skipped = records.filter((record) => record.fields?.['remaining'] !== undefined);
+    expect(
+      skipped.length,
+      `the scan must say which files a pattern could not be run against, and logged: ${records.map((record) => record.message).join(' | ')}`,
+    ).toBeGreaterThanOrEqual(1);
+    expect(skipped.map((record) => record.fields?.['file'])).toContain(firstPath);
+    for (const record of skipped) {
+      expect(record.level).toBe('debug');
+      for (const [key, value] of Object.entries(record.fields ?? {})) {
+        expect(
+          typeof value,
+          `field '${key}' of the skipped-file record must be a count or a path`,
+        ).toMatch(/^(?:number|string)$/);
+      }
+    }
   });
 });
 

@@ -43,8 +43,29 @@
  * **dispatch table** that decides which of those handlers a given attribute
  * goes to, plus the bounded, cycle-safe, total walk that applies it to a
  * whole event. Every number it needs is imported; the only bounds declared
- * here are the two structural ones the walk itself needs
- * ({@link MAX_ATTRIBUTE_DEPTH}, {@link MAX_ATTRIBUTE_NODES}).
+ * here are the structural ones the walks themselves need — the attribute
+ * walk's {@link MAX_ATTRIBUTE_DEPTH} and {@link MAX_ATTRIBUTE_NODES}, and the
+ * component-tree rebuild's own two, which bound a document rather than a bag
+ * (see {@link COMPONENT_TREE_KEY}).
+ *
+ * ## Keys, not only values
+ *
+ * An attribute bag is a `Record<string, unknown>` whose **names** are as
+ * page-supplied as its values: the browser agent fills it from whatever object
+ * a producer summarised, and a Node span carries whatever attribute names its
+ * instrumentation chose. A name can therefore be the secret rather than label
+ * one — a token used as a cache key, a connection string used as a map key —
+ * so the walk judges names as well as values (`deniedKeyNameRules`), and a
+ * name that matches a content rule or the entropy test takes its whole entry
+ * with it. Names this repository declared are exempt, because the heuristics
+ * would otherwise drop `request_key`, whose value is 64 characters of
+ * high-entropy hex by design.
+ *
+ * The same rule reaches inside a whole-header-map attribute
+ * (`filterDeniedHeaderNames`). `./headers.ts` keeps every member key so that a
+ * denied header's *presence* survives with its value masked, which is a stated
+ * guarantee — and that makes a header map the one place a page-supplied name
+ * would otherwise be emitted without being judged.
  *
  * ## The `redacted` provenance marker
  *
@@ -91,13 +112,19 @@
  *   `bigint` or `undefined`.
  */
 import {
+  ALL_ATTRIBUTE_KEYS,
+  MAX_COMPONENT_TREE_JSON_CHARS,
   MAX_PREVIEW_LENGTH,
   MAX_TRACKED_KEYS,
+  COMPONENT_TREE_ATTRIBUTE_KEYS,
+  COMPONENT_TREE_TRUNCATED_FIELD,
   DB_QUERY_ATTRIBUTE_KEYS,
+  ERROR_ATTRIBUTE_KEYS,
   FETCH_ATTRIBUTE_KEYS,
   RENDER_ATTRIBUTE_KEYS,
   SERVICE_ASSIGNED_ATTRIBUTE_KEYS,
   STATE_ATTRIBUTE_KEYS,
+  type AttributeValueSummary,
   type ChangedPropEntry,
 } from '../schema/attributes.js';
 import type { TelemetryEvent, TelemetryEventIngress } from '../schema/event.js';
@@ -124,6 +151,7 @@ import {
   REDACTION_RULE_IDS,
   asScannableText,
   findDeniedRules,
+  isHighEntropySecret,
   isSensitiveKeyName,
   scrub,
   scrubNamedValue,
@@ -131,7 +159,7 @@ import {
   type RedactionRuleId,
 } from './rules.js';
 import { redactSqlStatement } from './sql.js';
-import { URL_ATTRIBUTE_KEYS, isUrlAttributeKey, redactUrl } from './url.js';
+import { URL_ATTRIBUTE_KEYS, isUrlAttributeKey, redactStackUrls, redactUrl } from './url.js';
 
 /*
  * ---------------------------------------------------------------------------
@@ -156,6 +184,9 @@ const DB_STATEMENT_KEY: (typeof DB_QUERY_ATTRIBUTE_KEYS)[number] = 'db.statement
 /** The `fetch`/`xhr` key carrying the call-site stack of a request. */
 const FETCH_INITIATOR_KEY: (typeof FETCH_ATTRIBUTE_KEYS)[number] = 'initiator';
 
+/** The `error` key carrying the captured stack text, from the catalog tuple. */
+const ERROR_STACK_KEY: (typeof ERROR_ATTRIBUTE_KEYS)[number] = 'error.stack';
+
 /** The `render` key carrying the changed-prop entry list. */
 const CHANGED_PROPS_KEY: (typeof RENDER_ATTRIBUTE_KEYS)[number] = 'changedProps';
 
@@ -164,6 +195,18 @@ const STATE_PREVIOUS_VALUE_KEY: (typeof STATE_ATTRIBUTE_KEYS)[number] = 'previou
 
 /** The `state` key carrying the post-transition value summary. */
 const STATE_NEXT_VALUE_KEY: (typeof STATE_ATTRIBUTE_KEYS)[number] = 'nextValue';
+
+/**
+ * The key carrying a serialized React component tree.
+ *
+ * Annotated with the component-tree tuple's member union, so the handler
+ * cannot drift from the catalog's spelling of the key it fires on. Matched
+ * exactly and on **every** kind: the snapshot travels as a `log` event, and a
+ * producer that attaches the same document to its `commit` event writes the
+ * same key (`../aggregate/renders.ts` reads both), so gating the handler on a
+ * kind would leave one of the two routes taking the generic string path.
+ */
+const COMPONENT_TREE_KEY: (typeof COMPONENT_TREE_ATTRIBUTE_KEYS)[number] = 'componentTree';
 
 /**
  * The field of a {@link ChangedPropEntry} that holds a **prop name** rather
@@ -236,6 +279,28 @@ export const UNTRUNCATED_ATTRIBUTE_KEYS = Object.freeze([
   ...URL_ATTRIBUTE_KEYS,
   FETCH_INITIATOR_KEY,
 ] as const);
+
+/**
+ * Attribute keys whose value is **stack text**, and whose embedded URLs are
+ * therefore masked by `./url.ts` before the value is emitted.
+ *
+ * A stack is the one value shape that carries URLs *inside* other text. The
+ * request initiator is a captured `Error().stack` (`../browser/fetch.ts`) and
+ * `error.stack` is the stack of a thrown error (`../browser/errors.ts`); both
+ * name the generated chunk each frame came from, and a dev-server chunk URL
+ * carries a query string exactly like any other request URL. `scrub` cannot
+ * reach it — masking a query parameter is positional, not pattern-driven — and
+ * the initiator is additionally exempt from the preview bound, so the whole
+ * stack travels. Without this pass, a frame's parameters were stored,
+ * broadcast and sent to the model provider under a key the privacy model had
+ * already ruled on everywhere else (AAP 0.5.2).
+ *
+ * The declared keys come from the catalog tuples. {@link isStackAttributeKey}
+ * additionally accepts the conventional `*.stack` and `*Stack` spellings, so a
+ * producer's own `componentStack` or `cause.stack` is covered by shape rather
+ * than by enumeration.
+ */
+export const STACK_ATTRIBUTE_KEYS = Object.freeze([FETCH_INITIATOR_KEY, ERROR_STACK_KEY] as const);
 
 /**
  * How deep the attribute walk descends before it stops emitting containers.
@@ -387,6 +452,51 @@ const DROPPED_KEY_FOLDS: ReadonlySet<string> = new Set<string>(DROPPED_ATTRIBUTE
  * value — likewise stays truncatable, which a folded match would not manage.
  */
 const UNTRUNCATED_KEYS: ReadonlySet<string> = new Set<string>(UNTRUNCATED_ATTRIBUTE_KEYS);
+
+/**
+ * {@link STACK_ATTRIBUTE_KEYS}, matched exactly; the suffix rule in
+ * {@link isStackAttributeKey} covers everything else.
+ */
+const STACK_KEYS: ReadonlySet<string> = new Set<string>(STACK_ATTRIBUTE_KEYS);
+
+/**
+ * The structural field names of a {@link ChangedPropEntry}.
+ *
+ * Annotated with `keyof` so a rename of any of the three is a compile error
+ * here rather than a field that silently starts being judged as a
+ * page-supplied name by {@link deniedKeyNameRules}.
+ */
+const CHANGED_PROP_FIELDS: readonly (keyof ChangedPropEntry)[] = ['key', 'previous', 'next'];
+
+/** The structural field names of an {@link AttributeValueSummary}, likewise annotated. */
+const VALUE_SUMMARY_FIELDS: readonly (keyof AttributeValueSummary)[] = [
+  'type',
+  'preview',
+  'truncated',
+];
+
+/**
+ * Every key name this product itself declares, and therefore the only names
+ * exempt from the key-*name* deny check in {@link deniedKeyNameRules}.
+ *
+ * Not a whitelist of what may travel — `../schema/attributes.ts` says plainly
+ * that its catalog is not one, and an undeclared key still travels with its
+ * value redacted. It is the opposite: the set of names this repository wrote
+ * itself, which cannot be a captured secret however they measure, so they are
+ * never dropped on account of how they look. `request_key` is the case that
+ * makes the distinction concrete — 64 characters of high-entropy hex live
+ * *under* it, and the name itself ends in "key".
+ *
+ * The preview shapes' field names are included because they are structure a
+ * producer serialises rather than a name it chose, and `preview` in particular
+ * appears under every changed prop of every render event.
+ */
+const DECLARED_KEY_NAMES: ReadonlySet<string> = new Set<string>([
+  ...ALL_ATTRIBUTE_KEYS,
+  ...SERVICE_ASSIGNED_ATTRIBUTE_KEYS,
+  ...CHANGED_PROP_FIELDS,
+  ...VALUE_SUMMARY_FIELDS,
+]);
 
 /**
  * {@link SERVICE_ASSIGNED_ATTRIBUTE_KEYS}, matched exactly at the top level of
@@ -678,6 +788,142 @@ function sameHeaderRecord(before: unknown, after: Record<string, HeaderValue>): 
 }
 
 /**
+ * Whether `key` names stack text: a declared stack key, or a conventional
+ * `*.stack` / `*Stack` spelling.
+ *
+ * Matched on any kind rather than gated like {@link isStatementKey}. A
+ * statement key is kind-gated because the same name means something else on
+ * another kind; a value under a `stack` name is stack text whatever the kind,
+ * and the treatment it selects — masking URLs *inside* the text, leaving every
+ * frame otherwise intact — costs nothing when applied to a value that turns
+ * out not to be a stack at all.
+ *
+ * Case-sensitive on the suffixes, for the reason `isUrlAttributeKey` gives:
+ * `componentStack` must match while an unrelated word ending in "stack" does
+ * not.
+ */
+function isStackAttributeKey(key: string): boolean {
+  if (STACK_KEYS.has(key)) {
+    return true;
+  }
+  return key.endsWith('.stack') || key.endsWith('Stack');
+}
+
+/** The rule list reported for a key name caught by the entropy test alone. */
+const ENTROPY_ONLY_RULES: readonly RedactionRuleId[] = Object.freeze<RedactionRuleId[]>([
+  'entropy',
+]);
+
+/**
+ * Which deny-list rules an attribute **key name** matches, or `undefined`
+ * when the name may be emitted.
+ *
+ * Every other rule in this module judges a *value*. A key name is
+ * page-supplied text too: the attribute bag is a `Record<string, unknown>`
+ * filled by the browser agent from whatever object a producer summarised, and
+ * a Node span can carry any attribute name its instrumentation chose. So a
+ * name can *be* the secret — `{ "sk-ant-…": 1 }`, a bearer token used as a
+ * cache key, a connection string used as a map key — and a walk that redacted
+ * only values re-emitted it verbatim into the store, the live tail and every
+ * outbound prompt built from the event (CWE-200, and AAP 0.5.2 admits no
+ * exception for the side of the pair a secret happens to sit on).
+ *
+ * The test is deliberately narrower than the one applied to values:
+ *
+ * - **Declared names are exempt** ({@link DECLARED_KEY_NAMES}): this
+ *   repository wrote them, and `request_key` would otherwise be dropped by the
+ *   very heuristic its value is built to trip.
+ * - **A header attribute key is judged by its header name only.** The
+ *   `http.request.header.` prefix is declared structure, and the name after it
+ *   is a protocol token; retaining a denied header's *presence* while masking
+ *   its value is a stated guarantee (AAP 0.5.2), which dropping the attribute
+ *   would break. A header whose own name matches a credential pattern is not a
+ *   header any client sent, and loses nothing by being dropped.
+ * - **Only content rules and the entropy test apply** — never
+ *   `isSensitiveKeyName`. A key *called* `apiKey` is an ordinary, useful
+ *   attribute name whose value the name rule already replaces; dropping the
+ *   entry would hide from the developer that a credential-shaped field was
+ *   there at all, which is the opposite of what the marker exists for.
+ * - `findDeniedRules` is called with the name as a **value** and no name
+ *   argument, so it reports the patterns it found and nothing name-driven; the
+ *   entropy test is applied separately because that function only reports
+ *   `entropy` for a value under a sensitive name.
+ *
+ * A name that trips this test is dropped rather than masked. There is no
+ * masked form of a key: a name replaced by the marker collides with every
+ * other dropped key in the same record, and a name mangled to avoid the
+ * collision is an invented attribute. The drop is reported instead — in the
+ * report's `droppedKeys` count, in the matched rule ids, and as a path whose
+ * last segment is the marker.
+ *
+ * @param key - Attribute key, exactly as captured.
+ * @returns The matched rule ids, or `undefined` when the name is safe.
+ */
+function deniedNameRules(name: string): readonly RedactionRuleId[] | undefined {
+  const matched = findDeniedRules(name);
+  if (matched.length > 0) {
+    return matched;
+  }
+  return isHighEntropySecret(name) ? ENTROPY_ONLY_RULES : undefined;
+}
+
+function deniedKeyNameRules(key: string): readonly RedactionRuleId[] | undefined {
+  if (DECLARED_KEY_NAMES.has(key) || isHeaderObjectAttributeKey(key)) {
+    return undefined;
+  }
+  return deniedNameRules(headerNameFromAttributeKey(key) ?? key);
+}
+
+/**
+ * Drops the members of a masked header map whose **names** are themselves
+ * credential-shaped, and reports what it removed.
+ *
+ * `./headers.ts` masks header *values* and deliberately keeps every member
+ * key, because retaining a denied header's presence is the guarantee that
+ * module exists to provide (AAP 0.5.2: "value replaced with `[redacted]`;
+ * header presence retained"). A whole-header-map attribute is therefore the
+ * one route by which a page-supplied name reaches the emitted event without
+ * passing {@link deniedKeyNameRules} — the walk judges the *attribute* key
+ * (`headers`, `http.request.headers`), not the names inside it — and a page
+ * can send a request header with any name it likes, a token included.
+ *
+ * Only the content rules and the entropy test apply, exactly as for an
+ * attribute key: an ordinary header name is kept whatever it is called, a
+ * denied header keeps its presence with its value masked, and a member whose
+ * own name is a credential is dropped whole. Such a name is not a header any
+ * client meaningfully sent, so its presence carries nothing worth the leak.
+ *
+ * @param masked - The output of `redactHeaders`, already value-masked.
+ * @param state - Walk state; matched rule ids and the dropped count go here.
+ * @returns A new record, or `masked` itself when no member was denied.
+ */
+function filterDeniedHeaderNames(
+  masked: Record<string, HeaderValue>,
+  state: WalkState,
+): Record<string, HeaderValue> {
+  const entries: [string, HeaderValue][] = [];
+  let denied = 0;
+
+  for (const [name, value] of Object.entries(masked)) {
+    const rules = deniedNameRules(name);
+    if (rules === undefined) {
+      entries.push([name, value]);
+      continue;
+    }
+    for (const rule of rules) {
+      state.matched.add(rule);
+    }
+    denied += 1;
+  }
+
+  if (denied === 0) {
+    return masked;
+  }
+  state.droppedKeys += denied;
+  return Object.fromEntries(entries);
+}
+
+/**
  * Whether `key` names statement text: the catalog's key on any kind, or a
  * conventional spelling on a query-kind event.
  */
@@ -728,6 +974,484 @@ function countCodePoints(value: string): number {
 
 /*
  * ---------------------------------------------------------------------------
+ * Component-tree documents
+ *
+ * The one attribute whose value is a *document* rather than a value: the
+ * serialized React component tree that a snapshot event carries under
+ * {@link COMPONENT_TREE_KEY} (`../schema/attributes.ts` declares the contract,
+ * `../browser/agent.ts` writes it and `../aggregate/renders.ts` reads it).
+ *
+ * It needs a route of its own because both halves of the generic string path
+ * destroy it: `scrub` replaces the tail of any value longer than
+ * `MAX_SCAN_LENGTH` with the marker, and the preview bound then cuts what is
+ * left to 120 code points. A cut JSON document is not a smaller tree — it is
+ * text that no consumer can parse, so the evidence is lost silently rather
+ * than masked.
+ *
+ * What travels instead is the *structure*, rebuilt here field by field: the
+ * component name under whichever of {@link COMPONENT_TREE_NAME_FIELDS} it
+ * arrived on, the React key, the fiber id, the render count and the node-level
+ * truncation marker — each validated — and nothing else. Every other field is
+ * dropped, which is a **stricter** guarantee than the generic path offered: it
+ * never looked inside the document, so a page could hide anything in there.
+ * The two page-supplied labels that do survive, the component name and the
+ * React key, go through the same `scrub`-then-`truncate` treatment as any
+ * other captured string.
+ *
+ * The emitted text is either valid JSON within
+ * {@link MAX_COMPONENT_TREE_JSON_CHARS} or the key is omitted. There is no
+ * third outcome, because a partial document is worse than an absent one.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * The fields a node may carry its component name under, in precedence order.
+ *
+ * `../browser/react.ts` emits `name`; `../aggregate/renders.ts` accepts
+ * `component`, `name` and `displayName` when it parses a forest. The name is
+ * re-emitted under the field it arrived on, so a document keeps the spelling
+ * its producer chose and the aggregate reads it by the route it would have
+ * read it by anyway.
+ */
+const COMPONENT_TREE_NAME_FIELDS: readonly string[] = ['component', 'name', 'displayName'];
+
+/**
+ * The node field holding the instance's React key.
+ *
+ * Exempt from the key-*name* rule for exactly the reason
+ * {@link CHANGED_PROP_NAME_FIELD} is: it is spelled `key`, which the deny
+ * list's name vocabulary treats as sensitive, so `scrubNamedValue` would
+ * replace every React key in every tree with the marker and leave sibling
+ * instances indistinguishable. It is scrubbed by content instead.
+ */
+const COMPONENT_TREE_KEY_FIELD = 'key';
+
+/** The node field holding the child nodes. */
+const COMPONENT_TREE_CHILDREN_FIELD = 'children';
+
+/** The node field holding the component's capture-wide render count. */
+const COMPONENT_TREE_RENDER_COUNT_FIELD = 'renderCount';
+
+/** The node field holding the fiber's identity within its document. */
+const COMPONENT_TREE_FIBER_ID_FIELD = 'fiberId';
+
+/**
+ * The node field marking a node whose children are not all present.
+ *
+ * Bound from the catalog rather than spelled here: `../browser/react.ts` sets
+ * it, this handler keeps it, and `../aggregate/renders.ts` folds it into the
+ * snapshot's truncation flags, so one drifting spelling would present a
+ * partial tree as a whole one.
+ */
+const COMPONENT_TREE_NODE_TRUNCATED_FIELD: string = COMPONENT_TREE_TRUNCATED_FIELD;
+
+/**
+ * Every field a sanitised node may carry: the structural allowlist.
+ *
+ * Used only to count what was dropped. The rebuild reads each field by name
+ * rather than filtering this set, so a field cannot travel merely by being
+ * listed here.
+ */
+const COMPONENT_TREE_NODE_FIELDS: ReadonlySet<string> = new Set<string>([
+  ...COMPONENT_TREE_NAME_FIELDS,
+  COMPONENT_TREE_KEY_FIELD,
+  COMPONENT_TREE_CHILDREN_FIELD,
+  COMPONENT_TREE_RENDER_COUNT_FIELD,
+  COMPONENT_TREE_FIBER_ID_FIELD,
+  COMPONENT_TREE_NODE_TRUNCATED_FIELD,
+]);
+
+/**
+ * Nodes one component-tree document may contribute.
+ *
+ * Deliberately well above the couple of thousand nodes a snapshot carries by
+ * default (`../aggregate/renders.ts` emits at most
+ * `DEFAULT_COMPONENT_TREE_MAX_NODES`), so this handler is never what trims a
+ * legitimate tree — for a document of real nodes the text bound is what bites
+ * first. It exists because the value may also arrive as a *structure*, which
+ * carries no text bound of its own, and because a budget that cannot be
+ * reached costs one comparison per node.
+ */
+const MAX_COMPONENT_TREE_NODES = 4096;
+
+/**
+ * Deepest component nesting the walk follows.
+ *
+ * Twice the depth the aggregate descends to, for the same reason as the node
+ * budget, and the bound that makes the walk's recursion finite for a hostile
+ * document. The ancestor set catches a cycle; this catches a chain that is
+ * merely absurd.
+ */
+const MAX_COMPONENT_TREE_DEPTH = 128;
+
+/**
+ * Rebuild attempts allowed before the key is omitted.
+ *
+ * A sanitised document is smaller than the one that arrived, so the first
+ * attempt fits whenever the input was within the bound. The retries cover the
+ * structure-valued case, where nothing bounded the input: each one scales the
+ * node budget by how far the last attempt overshot, which converges because
+ * serialized size is very nearly linear in node count.
+ */
+const COMPONENT_TREE_FIT_ATTEMPTS = 3;
+
+/**
+ * One rebuild's bookkeeping.
+ *
+ * Separate from {@link WalkState} because a rebuild may be discarded: the
+ * counters are folded into the event's own only when its text is the text that
+ * is emitted, so a retry cannot double-count. The matched rule ids go straight
+ * to the walk — that set is idempotent, and a denied pattern found in a node
+ * the retry dropped was still present in the bag that arrived.
+ */
+interface TreeWalkState {
+  /** Nodes left to emit. */
+  budget: number;
+  /** Values whose content was masked. */
+  maskedValues: number;
+  /** Labels shortened to the preview bound. */
+  truncatedValues: number;
+  /** Fields and nodes not emitted. */
+  droppedKeys: number;
+}
+
+/** Reads one field of an untrusted node without trusting its accessors. */
+function readNodeField(node: Readonly<Record<string, unknown>>, field: string): unknown {
+  try {
+    return node[field];
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Unwraps the attribute into something walkable: JSON text within the
+ * catalogued bound, or a structure.
+ *
+ * The length guard is the transported-text bound itself, which is the contract
+ * for what may travel under this key — text longer than it was never
+ * admissible and could not be emitted anyway. Counted in code points, like the
+ * bound, with a cheap pre-test on code units so a pathological value is
+ * rejected without being measured: a code point costs at least one unit, so
+ * text of more than twice the bound's units cannot be within the bound.
+ */
+function readComponentTreeSource(value: unknown): unknown {
+  if (typeof value === 'string') {
+    if (value.length === 0 || value.length > MAX_COMPONENT_TREE_JSON_CHARS * 2) {
+      return undefined;
+    }
+    if (countCodePoints(value) > MAX_COMPONENT_TREE_JSON_CHARS) {
+      return undefined;
+    }
+    try {
+      const parsed: unknown = JSON.parse(value);
+      return parsed;
+    } catch {
+      return undefined;
+    }
+  }
+  if (typeof value === 'object' && value !== null) {
+    return value;
+  }
+  return undefined;
+}
+
+/**
+ * Bounds one page-supplied label inside a document: scrubbed by content, then
+ * cut to the preview bound.
+ *
+ * Content-only, never the name rule — see {@link COMPONENT_TREE_KEY_FIELD} —
+ * and in that order, because cutting first can split a credential so that no
+ * pattern matches it.
+ *
+ * @param raw - The label as it arrived.
+ * @param name - The name findings are classified under: the field for a
+ * component name, and none for a React key, whose field name would otherwise
+ * report a name-driven finding for every key in the tree.
+ * @returns The bounded label, or `undefined` when nothing survived.
+ */
+function boundTreeLabel(
+  raw: string,
+  name: string,
+  state: WalkState,
+  walk: TreeWalkState,
+): string | undefined {
+  const scrubbed = scrub(raw);
+  const bounded = truncate(scrubbed, state.limits.maxPreviewLength);
+  if (scrubbed !== raw) {
+    walk.maskedValues += 1;
+    classify(state, raw, name);
+  }
+  if (bounded !== scrubbed) {
+    walk.truncatedValues += 1;
+  }
+  return bounded.length > 0 ? bounded : undefined;
+}
+
+/** A component name, bounded, together with the field it arrived on. */
+interface TreeNodeName {
+  readonly field: string;
+  readonly name: string;
+}
+
+/**
+ * The component name of an untrusted node.
+ *
+ * The first of {@link COMPONENT_TREE_NAME_FIELDS} holding a non-empty string
+ * wins; a node with no usable name is not a node. The other name fields of
+ * such a node do not travel, so a document cannot carry two spellings of one
+ * component's name.
+ */
+function readTreeNodeName(
+  node: Readonly<Record<string, unknown>>,
+  state: WalkState,
+  walk: TreeWalkState,
+): TreeNodeName | undefined {
+  for (const field of COMPONENT_TREE_NAME_FIELDS) {
+    const raw = readNodeField(node, field);
+    if (typeof raw !== 'string' || raw.length === 0) {
+      continue;
+    }
+    const name = boundTreeLabel(raw, field, state, walk);
+    if (name === undefined) {
+      continue;
+    }
+    return { field, name };
+  }
+  return undefined;
+}
+
+/**
+ * The React key of an untrusted node, bounded.
+ *
+ * A numeric key is accepted and stringified, because that is what a list index
+ * used as a key becomes after a JSON round trip, and `../aggregate/renders.ts`
+ * reads it the same way. `null` — what a fiber carries for an element with no
+ * key — and every other type yield no key at all.
+ */
+function readTreeNodeKey(
+  node: Readonly<Record<string, unknown>>,
+  state: WalkState,
+  walk: TreeWalkState,
+): string | undefined {
+  const raw = readNodeField(node, COMPONENT_TREE_KEY_FIELD);
+  if (typeof raw === 'number' && Number.isFinite(raw)) {
+    return String(raw);
+  }
+  if (typeof raw !== 'string' || raw.length === 0) {
+    return undefined;
+  }
+  // Judged by content alone: `key` is in the deny list's name vocabulary, and
+  // the name rule would replace every React key in the tree.
+  return boundTreeLabel(raw, ARRAY_ELEMENT_KEY, state, walk);
+}
+
+/** A non-negative integer count, or `undefined` for anything else. */
+function readTreeNodeCount(
+  node: Readonly<Record<string, unknown>>,
+  field: string,
+): number | undefined {
+  const raw = readNodeField(node, field);
+  if (typeof raw !== 'number' || !Number.isInteger(raw) || raw < 0) {
+    return undefined;
+  }
+  return raw;
+}
+
+/** Own fields of a node that the structural allowlist does not carry. */
+function countDroppedNodeFields(node: Readonly<Record<string, unknown>>): number {
+  try {
+    return Object.keys(node).filter((field) => !COMPONENT_TREE_NODE_FIELDS.has(field)).length;
+  } catch {
+    // An object that refuses to be enumerated says nothing about what it held.
+    return 0;
+  }
+}
+
+/**
+ * Rebuilds one node of an untrusted document, and its children beneath it.
+ *
+ * Four defences, none of which throws: the depth bound, the node budget, an
+ * ancestor set that refuses a reference already open on the current path —
+ * which is how a cycle is stopped — and the plain-object test, since data
+ * behind accessors or internal slots cannot be read without running the page's
+ * code. A dropped child marks its parent {@link COMPONENT_TREE_NODE_TRUNCATED_FIELD},
+ * which is the marker `../browser/react.ts` defines for a node whose children
+ * are not all present, so a partial tree is presented as partial rather than
+ * as a component that rendered nothing.
+ *
+ * The fields are assigned in a fixed order, which is what makes the emitted
+ * text a fixed point of a second pass over it.
+ */
+function sanitizeTreeNode(
+  candidate: unknown,
+  depth: number,
+  ancestors: Set<object>,
+  state: WalkState,
+  walk: TreeWalkState,
+): Record<string, unknown> | undefined {
+  if (typeof candidate !== 'object' || candidate === null || Array.isArray(candidate)) {
+    walk.droppedKeys += 1;
+    return undefined;
+  }
+  if (!isPlainObject(candidate) || ancestors.has(candidate)) {
+    walk.droppedKeys += 1;
+    return undefined;
+  }
+  if (depth > MAX_COMPONENT_TREE_DEPTH || walk.budget <= 0) {
+    walk.droppedKeys += 1;
+    return undefined;
+  }
+
+  const named = readTreeNodeName(candidate, state, walk);
+  if (named === undefined) {
+    walk.droppedKeys += 1;
+    return undefined;
+  }
+
+  walk.budget -= 1;
+  walk.droppedKeys += countDroppedNodeFields(candidate);
+  const key = readTreeNodeKey(candidate, state, walk);
+  const fiberId = readTreeNodeCount(candidate, COMPONENT_TREE_FIBER_ID_FIELD);
+  const renderCount = readTreeNodeCount(candidate, COMPONENT_TREE_RENDER_COUNT_FIELD);
+
+  let truncated = readNodeField(candidate, COMPONENT_TREE_NODE_TRUNCATED_FIELD) === true;
+  const children: Record<string, unknown>[] = [];
+  const childValues = readNodeField(candidate, COMPONENT_TREE_CHILDREN_FIELD);
+
+  if (Array.isArray(childValues)) {
+    ancestors.add(candidate);
+    const listed: readonly unknown[] = childValues;
+    for (const child of listed) {
+      const built = sanitizeTreeNode(child, depth + 1, ancestors, state, walk);
+      if (built === undefined) {
+        truncated = true;
+        continue;
+      }
+      children.push(built);
+    }
+    ancestors.delete(candidate);
+  } else if (childValues !== undefined) {
+    // A `children` field that is not a list carries no readable structure, and
+    // the node's descendants are therefore missing from the document.
+    truncated = true;
+  }
+
+  const node: Record<string, unknown> = {};
+  node[named.field] = named.name;
+  if (key !== undefined) {
+    node[COMPONENT_TREE_KEY_FIELD] = key;
+  }
+  if (fiberId !== undefined) {
+    node[COMPONENT_TREE_FIBER_ID_FIELD] = fiberId;
+  }
+  if (renderCount !== undefined) {
+    node[COMPONENT_TREE_RENDER_COUNT_FIELD] = renderCount;
+  }
+  if (truncated) {
+    node[COMPONENT_TREE_NODE_TRUNCATED_FIELD] = true;
+  }
+  node[COMPONENT_TREE_CHILDREN_FIELD] = children;
+  return node;
+}
+
+/**
+ * Rebuilds a whole forest, preserving the shape it arrived in: a list of roots
+ * stays a list, a single root stays a single node.
+ *
+ * Both are shapes `../aggregate/renders.ts` accepts, and keeping the arriving
+ * one is what makes a second pass over the emitted text reproduce it byte for
+ * byte.
+ */
+function sanitizeComponentForest(
+  source: unknown,
+  state: WalkState,
+  walk: TreeWalkState,
+): Record<string, unknown>[] | Record<string, unknown> | undefined {
+  const ancestors = new Set<object>();
+
+  if (Array.isArray(source)) {
+    const listed: readonly unknown[] = source;
+    const roots: Record<string, unknown>[] = [];
+    for (const candidate of listed) {
+      const node = sanitizeTreeNode(candidate, 0, ancestors, state, walk);
+      if (node !== undefined) {
+        roots.push(node);
+      }
+    }
+    return roots.length === 0 ? undefined : roots;
+  }
+
+  return sanitizeTreeNode(source, 0, ancestors, state, walk);
+}
+
+/** `JSON.stringify` behind a guard, returning `undefined` on any refusal. */
+function serializeComponentForest(forest: unknown): string | undefined {
+  try {
+    const text = JSON.stringify(forest);
+    return typeof text === 'string' && text.length > 0 ? text : undefined;
+  } catch {
+    // Unreachable for a forest this module built — it holds strings, integers,
+    // booleans and arrays only — and guarded because nothing here may throw.
+    return undefined;
+  }
+}
+
+/**
+ * Redacts a serialized component tree into bounded, parseable JSON text.
+ *
+ * Accepts the document as text or as a structure and always emits text, so a
+ * consumer has one shape to read. The key is omitted — not emitted cut, and
+ * not emitted as the marker — when the value is not a readable document, when
+ * it holds no usable node, or when no attempt fit the text bound: an absent
+ * key is something `../aggregate/renders.ts` already handles by falling back to
+ * its other construction routes, whereas unparseable text would cost it the
+ * snapshot silently.
+ *
+ * @param value - The attribute value as captured.
+ * @param state - The event's walk, whose counters and matched rules this
+ * contributes to.
+ * @returns The bounded JSON text, or {@link OMITTED}.
+ */
+function redactComponentTree(value: unknown, state: WalkState): ValueResult {
+  const source = readComponentTreeSource(value);
+  if (source === undefined) {
+    return OMITTED;
+  }
+
+  let budget = MAX_COMPONENT_TREE_NODES;
+  for (let attempt = 0; attempt < COMPONENT_TREE_FIT_ATTEMPTS; attempt += 1) {
+    const walk: TreeWalkState = { budget, maskedValues: 0, truncatedValues: 0, droppedKeys: 0 };
+    const forest = sanitizeComponentForest(source, state, walk);
+    if (forest === undefined) {
+      return OMITTED;
+    }
+
+    const text = serializeComponentForest(forest);
+    if (text === undefined) {
+      return OMITTED;
+    }
+
+    const points = countCodePoints(text);
+    if (points <= MAX_COMPONENT_TREE_JSON_CHARS) {
+      state.maskedValues += walk.maskedValues;
+      state.truncatedValues += walk.truncatedValues;
+      state.droppedKeys += walk.droppedKeys;
+      return emitted(text, text !== value);
+    }
+
+    // Scale the budget by the overshoot and try again with strictly fewer
+    // nodes, so the loop cannot repeat the same attempt.
+    const emittedNodes = budget - walk.budget;
+    const scaled = Math.floor((emittedNodes * MAX_COMPONENT_TREE_JSON_CHARS) / points);
+    budget = Math.max(1, Math.min(budget - 1, scaled));
+  }
+
+  return OMITTED;
+}
+
+/*
+ * ---------------------------------------------------------------------------
  * The dispatch table
  * ---------------------------------------------------------------------------
  */
@@ -764,17 +1488,32 @@ function emitted(value: unknown, changed: boolean): ValueResult {
  *    travels ({@link DROPPED_ATTRIBUTE_KEYS}).
  * 2. **Header value** — masked positionally by `./headers.ts`, with the
  *    header's presence and multi-value count retained.
- * 3. **Header map** — masked field by field; a map that did not arrive as a
- *    record cannot be, so it is replaced whole.
+ * 3. **Header map** — masked field by field, then filtered by member name
+ *    ({@link filterDeniedHeaderNames}), because `./headers.ts` keeps every
+ *    member key by design and a page can name a request header anything;
+ *    a map that did not arrive as a record cannot be masked field by field,
+ *    so it is replaced whole.
  * 4. **URL** — query parameter values masked, path and authority kept
  *    (`./url.ts`).
  * 5. **Statement** — inline literals masked, placeholders and structure kept
  *    (`./sql.ts`). `db.rowCount` and `db.system` are not statements and take
  *    the generic path, which leaves them as they are: AAP 0.5.2 keeps the row
  *    *count* and never a row.
- * 6. **Preview subtree** — a React prop or hook-state summary, walked with
+ * 6. **Component tree** — a serialized React forest under
+ *    {@link COMPONENT_TREE_KEY}: parsed, rebuilt from the structural
+ *    allowlist with every other field dropped, its component names and React
+ *    keys scrubbed and bounded, and re-serialised as JSON text inside
+ *    `MAX_COMPONENT_TREE_JSON_CHARS`. Placed ahead of the generic path
+ *    because that path would cut the document to a preview and leave it
+ *    unparseable.
+ * 7. **Preview subtree** — a React prop or hook-state summary, walked with
  *    the structural-field exemption of {@link CHANGED_PROP_NAME_FIELD}.
- * 7. **Generic** — a string is scrubbed then truncated (never the reverse:
+ * 8. **Stack text** — a string under a stack key is scrubbed and then has
+ *    every URL embedded in its frames masked by `./url.ts`
+ *    ({@link isStackAttributeKey}), which is the only way a query parameter
+ *    inside a frame can be removed: masking a query is positional, and the
+ *    content rules are not.
+ * 9. **Generic** — a string is scrubbed then truncated (never the reverse:
  *    cutting first can split a credential so that no pattern matches it);
  *    a number or boolean under a key-like name is masked, because a short
  *    numeric secret is still a secret; `null` passes through; a value that
@@ -826,7 +1565,10 @@ function redactValue(
         classify(state, value, key);
         return emitted(REDACTION_MARKER, value !== REDACTION_MARKER);
       }
-      const masked = redactHeaders(value as HeaderRecord);
+      // Values first, then names: `redactHeaders` keeps every member key by
+      // design, so a member whose own name is a credential is removed here —
+      // the walk's key-name rule saw only the attribute key.
+      const masked = filterDeniedHeaderNames(redactHeaders(value as HeaderRecord), state);
       const changed = !sameHeaderRecord(value, masked);
       if (changed) {
         // Reported only when something was actually masked: a header set of
@@ -864,6 +1606,10 @@ function redactValue(
       return emitted(masked, changed);
     }
 
+    if (key === COMPONENT_TREE_KEY) {
+      return redactComponentTree(value, state);
+    }
+
     // A preview key opens the subtree; the exemption applies to the fields
     // *inside* it, which is why the child flag is computed separately from
     // the one this value was reached under.
@@ -875,14 +1621,25 @@ function redactValue(
 
     if (typeof value === 'string') {
       const scrubbed = applyNameRule ? scrubNamedValue(key, value) : scrub(value);
+      // Stack text embeds URLs inside other text, and a query parameter can
+      // only be masked positionally, which `scrub` cannot do. Masking runs
+      // after scrubbing (a cut before scrubbing can split a credential) and
+      // before the preview bound, so a truncated stack is truncated after its
+      // URLs are already safe.
+      const masked = isStackAttributeKey(key) ? redactStackUrls(scrubbed) : scrubbed;
       const bounded = UNTRUNCATED_KEYS.has(key)
-        ? scrubbed
-        : truncate(scrubbed, limits.maxPreviewLength);
-      if (scrubbed !== value) {
+        ? masked
+        : truncate(masked, limits.maxPreviewLength);
+      if (masked !== value) {
         state.maskedValues += 1;
         classify(state, value, key);
       }
-      if (bounded !== scrubbed) {
+      if (masked !== scrubbed && value.includes('?')) {
+        // Positional, so `findDeniedRules` cannot report it — the same
+        // reasoning as the URL arm above, for a URL found inside a frame.
+        state.matched.add('url-query-value');
+      }
+      if (bounded !== masked) {
         state.truncatedValues += 1;
       }
       return emitted(bounded, bounded !== value);
@@ -969,6 +1726,11 @@ function redactValue(
  * Walks a record — the attribute bag itself at depth 0, or a nested object —
  * into a **new** object, preserving insertion order.
  *
+ * This is where a key's **name** is judged, before its value is read: a name
+ * that is itself credential-shaped ({@link deniedKeyNameRules}) takes its
+ * entry with it, since a key has no masked form. The drop is reported as a
+ * path whose last segment is the marker, never as the name itself.
+ *
  * Bounds, all silent by design (a synthetic marker key would invent a member
  * of the declared attribute vocabulary, which `../schema/attributes.ts` is
  * the only place allowed to do):
@@ -1004,7 +1766,24 @@ function redactRecordValue(
   const entries: [string, unknown][] = [];
 
   for (const key of keys) {
-    const childPath = joinKeyPath(path, key);
+    // The key *name* is page-supplied text, and a name that is itself a
+    // credential may not be emitted — see `deniedKeyNameRules`. It is judged
+    // first because **every** exit below records a path built from it, the
+    // bound's exit included, and `normalizePath` scrubs a path by content
+    // only, which a high-entropy name survives. The marker takes the name's
+    // place in that path: the name is the thing being removed.
+    //
+    // Judging before the value is read also means a secret-named property's
+    // getter is never invoked, and the rule ids are recorded whichever exit
+    // takes the key, so the report states what was seen in the bag rather
+    // than what happened to fit inside a bound.
+    const deniedName = deniedKeyNameRules(key);
+    const childPath = joinKeyPath(path, deniedName === undefined ? key : REDACTION_MARKER);
+    if (deniedName !== undefined) {
+      for (const rule of deniedName) {
+        state.matched.add(rule);
+      }
+    }
 
     if (entries.length >= keyBudget || state.nodes >= state.limits.maxNodes) {
       state.droppedKeys += 1;
@@ -1017,6 +1796,12 @@ function redactRecordValue(
     // would let each open container overshoot by one, and the total is what
     // decides the size of a stored row.
     state.nodes += 1;
+
+    if (deniedName !== undefined) {
+      state.droppedKeys += 1;
+      recordPath(state, childPath);
+      continue;
+    }
 
     let value: unknown;
     try {

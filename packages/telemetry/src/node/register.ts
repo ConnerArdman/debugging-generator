@@ -81,6 +81,32 @@
  *    arrive before the machinery it configures exists. It is started, never
  *    awaited: the dev server must not wait on the local service.
  *
+ * ## Nothing acquired is ever left unowned
+ *
+ * Six of those steps take something with a **process-global** effect — the
+ * `diag` logger, the control object, the long-lived processor, the registered
+ * provider and propagator, the `pg`/Prisma patches and
+ * `globalThis.__DEBUGGEN__` — so each one is pushed onto a rollback ledger the
+ * moment it exists, and for the instrumentations *before* the first instance is
+ * constructed, because `InstrumentationBase` enables one in its constructor.
+ * The failure path gives every one of them back in reverse order. AAP §0.5.1
+ * requires that what remains loaded is an inert module with "no active patches,
+ * no provider and no file changes", and that has to hold for an installation
+ * that *failed part-way* exactly as it does for one that was torn down.
+ *
+ * Because {@link installPreload} returns synchronously, the ledger separates
+ * what has to be *revoked* from what merely has to be *closed*: the global
+ * effects (`diag`, the provider and propagator, the `pg`/Prisma patches, the
+ * span helper) are undone before the `failed` result exists, and the closable
+ * ones (the control socket, the exporter, the provider's processors) are drained
+ * by the promise that result's `shutdown()` hands back, which a caller may
+ * await. {@link RollbackStep} documents the split.
+ *
+ * Ownership of a *successful* installation is reserved on the global slot
+ * **before** the first step runs ({@link bootstrap}), because the alternative —
+ * installing first and claiming afterwards — has a window in which an active
+ * preload exists that {@link shutdownPreload} cannot reach.
+ *
  * ## Instrumentations deliberately NOT installed
  *
  * - `@opentelemetry/instrumentation-http` and `@opentelemetry/instrumentation-undici`:
@@ -112,7 +138,7 @@
 
 import { nowEpochMs } from '@debuggen/shared';
 import type { Logger } from '@debuggen/shared';
-import { diag, DiagLogLevel } from '@opentelemetry/api';
+import { diag, DiagLogLevel, propagation, trace } from '@opentelemetry/api';
 import type { Context, DiagLogger } from '@opentelemetry/api';
 import { W3CTraceContextPropagator } from '@opentelemetry/core';
 import { registerInstrumentations } from '@opentelemetry/instrumentation';
@@ -137,7 +163,7 @@ import type {
   TracerProviderFactory,
 } from './control.js';
 import { DebuggenSpanProcessor, SHUTDOWN_FLUSH_DEADLINE_MS } from './exporter.js';
-import { installSpanHelper } from './span-helper.js';
+import { installSpanHelper, uninstallSpanHelper } from './span-helper.js';
 
 /*
  * ---------------------------------------------------------------------------
@@ -296,9 +322,9 @@ export interface InstalledPreload {
 /**
  * A preload that installed nothing, and why.
  *
- * `shutdown` is present and resolves immediately, so every caller of
- * {@link installPreload} can treat the result uniformly instead of branching on
- * the status before it can clean up.
+ * `shutdown` is always present, so every caller of {@link installPreload} can
+ * treat the result uniformly instead of branching on the status before it can
+ * clean up.
  */
 export interface InactivePreload {
   /**
@@ -314,7 +340,21 @@ export interface InactivePreload {
   /** A value-free explanation: it names variables and steps, never values. */
   readonly reason: string;
 
-  /** Resolves immediately; there is nothing to tear down. */
+  /**
+   * For `inert` and `duplicate`: resolves immediately, because nothing was
+   * taken.
+   *
+   * For `failed`: the best-effort close of whatever the abandoned attempt had
+   * already opened — the control socket, the exporter, the provider's
+   * processors — which begins the instant the failure is caught, so awaiting it
+   * waits for that work to finish rather than starting it. Every *process-global*
+   * effect the attempt had is already undone before the `failed` result exists
+   * and is deliberately not part of this promise (see {@link RollbackStep}):
+   * awaiting is how a caller learns the process is quiet, never how it becomes
+   * clean.
+   *
+   * Idempotent and it never rejects, whatever the status.
+   */
   readonly shutdown: () => Promise<void>;
 }
 
@@ -326,13 +366,27 @@ export type PreloadInstallation = InstalledPreload | InactivePreload;
  * installation and to tear it down from a module scope that did not create it.
  */
 interface PreloadSlot {
-  /** Epoch milliseconds at which the installation completed. */
+  /**
+   * Epoch milliseconds at which the owning evaluation reserved the slot, which
+   * is a moment *before* its installation completed: ownership is claimed first
+   * (see {@link bootstrap}) and this record is never replaced afterwards.
+   */
   readonly installedAt: number;
 
   /** The installing build's version, so a mismatch is visible in a log line. */
   readonly version: string;
 
-  /** {@link InstalledPreload.shutdown} of the installation that claimed it. */
+  /**
+   * The way to tear down the installation this record owns.
+   *
+   * It delegates rather than holding a teardown directly, because the slot is
+   * claimed *before* the installation is attempted — so that an active preload
+   * can never exist without an owner — and this is the one record the slot ever
+   * holds for that evaluation. While there is nothing to tear down yet it
+   * resolves immediately; from the moment there is, every caller reaching the
+   * slot reaches that work, including the rollback of an installation that
+   * failed.
+   */
   readonly shutdown: () => Promise<void>;
 }
 
@@ -539,10 +593,18 @@ const noopShutdown = (): Promise<void> => Promise.resolve();
  *
  * @param status Why nothing was installed.
  * @param reason A value-free explanation.
+ * @param shutdown What the caller gets to await; defaults to
+ * {@link noopShutdown}, which is right for every status but `failed` — a failed
+ * attempt hands back the rollback of what it had already acquired, so the one
+ * caller who wants to know the process is clean again can wait for it.
  * @returns The inactive installation.
  */
-function inactive(status: InactivePreload['status'], reason: string): InactivePreload {
-  return { status, reason, shutdown: noopShutdown };
+function inactive(
+  status: InactivePreload['status'],
+  reason: string,
+  shutdown: () => Promise<void> = noopShutdown,
+): InactivePreload {
+  return { status, reason, shutdown };
 }
 
 /**
@@ -656,6 +718,189 @@ class ProviderScopedSpanProcessor implements SpanProcessor {
 
 /*
  * ---------------------------------------------------------------------------
+ * Crash-safe rollback
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * One thing {@link installPreload} took from the process, and the way to give it
+ * back.
+ *
+ * The installation acquires six resources with process-global effects, and a
+ * throw between any two of them would otherwise leave the earlier ones live in
+ * the developer's server owned by nobody — a registered provider still
+ * collecting Next.js's spans, a `pg` still wrapped, a buffer still holding
+ * evidence — while the function reports `failed`. So an entry is pushed here the
+ * moment each resource exists — and, where the acquisition itself takes effect
+ * in steps that can fail part-way (registering the provider, constructing and
+ * configuring the instrumentations, installing the span helper), *before* it
+ * begins — and the failure path runs the ledger in reverse.
+ *
+ * ## Two kinds of undo, because the function that runs them cannot await
+ *
+ * {@link installPreload} is called at module scope under `--import`, so it
+ * returns synchronously and may *start* teardown work but never wait for it.
+ * That is fine for a resource which merely has to be closed, and not fine at all
+ * for one whose effect is **process-global**: a registered provider keeps
+ * collecting Next.js's spans, a shimmer-wrapped `pg` keeps calling into an
+ * abandoned tracer and `globalThis.__DEBUGGEN__` keeps answering patched
+ * functions for as long as nobody undoes them — and the normal caller of a
+ * `failed` result is a module evaluation that awaits nothing. So the word
+ * `failed` has to be true of the process the moment it is returned, which splits
+ * every ledger entry's undo in two:
+ *
+ * - `revoke` — **synchronous**, and the failure path runs every one of them to
+ *   completion, newest first, *before* {@link installPreload} returns:
+ *   `diag.disable()`, `trace.disable()` + `propagation.disable()`, `disable()`
+ *   on each instrumentation instance that came into existence, and
+ *   `uninstallSpanHelper()`. After a `failed` result exists, no global provider,
+ *   no global propagator, no `pg`/Prisma patch and no `__DEBUGGEN__` remain.
+ * - `drain` — **asynchronous**, for what needs closing rather than revoking:
+ *   `control.dispose()`, `processor.shutdown()` and `provider.shutdown()`. These
+ *   are gathered into the one memoized, never-rejecting promise the `failed`
+ *   result's `shutdown()` hands back, so a caller that wants to know the socket
+ *   is closed and the buffered evidence has had its last chance awaits exactly
+ *   that work rather than starting a second copy of it.
+ *
+ * A step may carry either or both: the provider registration is revoked
+ * globally *and* drained.
+ *
+ * A plain array rather than a disposer stack class: it is read exactly once, on
+ * one code path, in one function.
+ */
+interface RollbackStep {
+  /** What this step gives back, for one `warn` line. A name, never a value. */
+  readonly label: string;
+
+  /**
+   * Undo this step's process-global effect, synchronously.
+   *
+   * Absent on a step that has no such effect. Must not block: it runs inside
+   * {@link installPreload}, before it returns.
+   */
+  readonly revoke?: (() => void) | undefined;
+
+  /**
+   * Close what this step opened, asynchronously.
+   *
+   * Absent on a step with nothing to close. Awaited only from the `failed`
+   * result's `shutdown()`, never from {@link installPreload} itself.
+   */
+  readonly drain?: (() => Promise<void>) | undefined;
+}
+
+/**
+ * Undo every process-global effect this attempt had, newest first, synchronously
+ * and without raising.
+ *
+ * Reversed for the same reason the drain is: the steps are ordered by
+ * acquisition, and a global installed over an earlier one has to come off first.
+ * Each step is independently guarded, so one that refuses still leaves the rest
+ * to run, and each refusal is a single scrubbed `warn` naming the step. Total by
+ * construction: the caller is a `catch` in a function that must not throw.
+ *
+ * @param steps The ledger, in acquisition order.
+ * @param log Where a step that could not be revoked is reported.
+ */
+function revokeGlobalEffects(steps: readonly RollbackStep[], log: PreloadLog): void {
+  let revoked = 0;
+
+  for (const step of [...steps].reverse()) {
+    const revoke = step.revoke;
+    if (revoke === undefined) {
+      continue;
+    }
+    try {
+      revoke();
+      revoked += 1;
+    } catch (error) {
+      log.warn('a failed preload installation could not revoke one process-global effect', {
+        step: step.label,
+        error: describeError(error),
+      });
+    }
+  }
+
+  log.debug('the process-global effects of a failed preload installation were revoked', {
+    steps: revoked,
+  });
+}
+
+/**
+ * Close every resource this attempt opened, newest first, and resolve either
+ * way.
+ *
+ * Sequential and reversed on purpose: closing them concurrently — or in
+ * acquisition order — would shut the long-lived processor down while the
+ * provider layered above it is still flushing through it. Each step is
+ * independently guarded, so one that fails still leaves the rest to run, and
+ * each failure is a single scrubbed `warn` naming the step. The returned promise
+ * never rejects: it is started from a `--import` module scope and handed back as
+ * an {@link InactivePreload.shutdown}, and neither may see a rejection.
+ *
+ * @param steps The ledger, in acquisition order.
+ * @param log Where a step that could not be closed is reported.
+ */
+async function drainAcquisitions(steps: readonly RollbackStep[], log: PreloadLog): Promise<void> {
+  let drained = 0;
+
+  for (const step of [...steps].reverse()) {
+    const drain = step.drain;
+    if (drain === undefined) {
+      continue;
+    }
+    try {
+      await drain();
+      drained += 1;
+    } catch (error) {
+      log.warn('a failed preload installation could not close one resource', {
+        step: step.label,
+        error: describeError(error),
+      });
+    }
+  }
+
+  log.debug('failed preload installation drained', { steps: drained });
+}
+
+/**
+ * Return the global tracer provider and the global propagator to the API's
+ * no-op defaults: the same two calls, in the same order, that `control.ts`'s
+ * disable path makes.
+ *
+ * Synchronous, and that is the point — these two are the registration's whole
+ * process-global footprint, so they are the `revoke` half of the provider's
+ * ledger entry and are gone before a `failed` result exists. What is left of the
+ * registration is `provider.shutdown()`, which drains the provider's processors
+ * (for this provider, {@link ProviderScopedSpanProcessor} — a flush, and
+ * deliberately not a terminal shutdown of the long-lived processor, whose own
+ * ledger step owns that) and is therefore the entry's `drain`.
+ *
+ * Both calls are guarded on their own so a host that refuses the first still
+ * gets the second. `context.disable()` is deliberately **not** called;
+ * `control.ts` does not call it either: the context manager `register()`
+ * installs is the SDK's default `AsyncLocalStorage` one, and resetting the
+ * global context manager would reach past our own installation into whatever the
+ * host had before it.
+ *
+ * @param log Where a call that failed is reported.
+ */
+function revokeGlobalTracing(log: PreloadLog): void {
+  try {
+    trace.disable();
+  } catch (error) {
+    log.warn('could not remove the global tracer provider', { error: describeError(error) });
+  }
+
+  try {
+    propagation.disable();
+  } catch (error) {
+    log.warn('could not remove the global propagator', { error: describeError(error) });
+  }
+}
+
+/*
+ * ---------------------------------------------------------------------------
  * Installation
  * ---------------------------------------------------------------------------
  */
@@ -681,11 +926,30 @@ class ProviderScopedSpanProcessor implements SpanProcessor {
  * returned here. A second disposer over the same instances would be a second
  * owner of one piece of state.
  *
- * @returns The Prisma and `pg` instrumentations, enabled, in registration order.
+ * **Why the caller passes a list in.** `InstrumentationBase` **enables an
+ * instrumentation in its constructor**, and `registerInstrumentations`
+ * configures the list it is given one entry at a time — so this function reaches
+ * the process in three steps, not one, and a throw at the second or the third
+ * leaves the first one's patches live. Reporting the instances only through the
+ * return value would therefore hand the caller nothing to undo on exactly the
+ * paths that need undoing. Each instance is appended to `acquired` the moment it
+ * exists instead, so the rollback entry the caller establishes *before* calling
+ * this function already covers a partial acquisition.
+ *
+ * @param acquired Mutable list the caller owns the contents of; every
+ * instrumentation instance this function constructs is appended to it
+ * immediately, whether or not registration then succeeds.
+ * @returns The Prisma and `pg` instrumentations, enabled, in registration order,
+ * frozen — the pair `control.attach` holds for the life of the process.
  */
-function registerServerInstrumentations(): readonly ToggleableInstrumentation[] {
+function registerServerInstrumentations(
+  acquired: ToggleableInstrumentation[],
+): readonly ToggleableInstrumentation[] {
   const prisma = new PrismaInstrumentation();
+  acquired.push(prisma);
+
   const pg = new PgInstrumentation();
+  acquired.push(pg);
 
   registerInstrumentations({ instrumentations: [prisma, pg] });
 
@@ -765,9 +1029,21 @@ async function runShutdown(
  * Install the server tier's telemetry into this process, or explain why not.
  *
  * The whole sequence — every step of the order documented at the top of this
- * file — sits inside one `try/catch`. On failure whatever was built is torn down
- * again, one `warn` is emitted, and the developer keeps a working, untraced dev
- * server. **Nothing escapes this function.**
+ * file — sits inside one `try/catch`. Every resource with a process-global
+ * effect is registered with a {@link RollbackStep} the moment it is acquired —
+ * and the instrumentations before the first of them is constructed, since
+ * constructing one enables it — so a throw at any point gives back everything
+ * taken up to it, newest first: one `warn` is emitted, every global effect is
+ * revoked before this function returns, the close of what remains open starts
+ * immediately and is what the `failed` result's `shutdown()` hands back, and the
+ * developer keeps a working, untraced dev server whose process holds no
+ * provider, no propagator, no patches and no span helper. **Nothing escapes this
+ * function.**
+ *
+ * Synchronous by contract: `--import` evaluates this module, and
+ * {@link bootstrap} calls this at module scope, so nothing here may block on
+ * teardown — which is exactly why the rollback revokes the global half inline
+ * and merely *starts* the asynchronous half (see {@link RollbackStep}).
  *
  * Calling it more than once in a process registers a second provider and a
  * second control socket; the module's own bootstrap guards against that through
@@ -796,23 +1072,48 @@ export function installPreload(options: PreloadInstallOptions = {}): PreloadInst
   const config = outcome.config;
   const log = createPreloadLog(logger, config.token);
 
-  let control: ServerAgentControl | undefined;
-  let diagWired = false;
+  // What this attempt has taken from the process, in acquisition order. Pushed
+  // to as each resource appears and read only on the failure path below, which
+  // is what makes "whatever was acquired is owned" true at every line of the
+  // sequence rather than only at its end.
+  const rollback: RollbackStep[] = [];
 
   try {
-    diagWired = wireDiagnostics(logger, log);
+    const diagWired = wireDiagnostics(logger, log);
+    if (diagWired) {
+      rollback.push({
+        label: 'OpenTelemetry diagnostic logger',
+        revoke: (): void => {
+          diag.disable();
+        },
+      });
+    }
 
-    // 1. The resource: what every span of this process says it came from.
+    // 1. The resource: what every span of this process says it came from. A
+    //    plain value with no process-global effect, so it needs no rollback.
     const resource = buildResource(config);
 
     // 2. The control object, before its two consumers: the processor and the
     //    sampler both read it as their capture gate, so it has to exist first.
     //    It needs no provider at construction time and receives the rest of its
     //    collaborators through `attach` below.
-    control = new ServerAgentControl({
+    const control = new ServerAgentControl({
       config,
       logger,
       webSocketImpl: options.webSocketImpl,
+    });
+    // A drain rather than a revoke: `dispose()` closes a socket and flushes,
+    // which is asynchronous by nature. Everything global it would also undo —
+    // the provider, the propagator and the instrumentation patches — has its own
+    // synchronous `revoke` below, so the failure path does not depend on this
+    // one having finished. The cleanup report `dispose()` resolves with is for
+    // a capture's `disable` handshake; on this path there is no capture to
+    // report to, so it is awaited and dropped.
+    rollback.push({
+      label: 'control channel',
+      drain: async (): Promise<void> => {
+        await control.dispose();
+      },
     });
 
     // 3. One long-lived processor for the whole process: it owns the ingest
@@ -823,6 +1124,13 @@ export function installPreload(options: PreloadInstallOptions = {}): PreloadInst
       config,
       logger,
       fetchImpl: options.fetchImpl,
+    });
+    // `control.dispose()` deliberately never shuts the processor down — that is
+    // what lets one capture follow another — so a failed install is the one
+    // place that has to make it terminal itself.
+    rollback.push({
+      label: 'telemetry exporter',
+      drain: (): Promise<void> => processor.shutdown(),
     });
 
     // 4. The gating sampler: outside a capture it answers NOT_RECORD, so an
@@ -840,6 +1148,24 @@ export function installPreload(options: PreloadInstallOptions = {}): PreloadInst
 
     const provider = createProvider();
 
+    // Registered with the ledger *before* `register()` is called, not after:
+    // registration is the step that puts the provider, the propagator and the
+    // context manager into the process, and a throw part-way through it must be
+    // covered too. Undoing an unregistered provider is harmless — the two
+    // `disable()` calls are no-ops against the API's defaults and
+    // `shutdown()` on a provider nobody registered simply flushes.
+    //
+    // Both halves, because registration is both: the two `disable()` calls are
+    // the global effect and are revoked synchronously, while draining the
+    // provider's processors is asynchronous and belongs to the awaited half.
+    rollback.push({
+      label: 'tracer provider registration',
+      revoke: (): void => {
+        revokeGlobalTracing(log);
+      },
+      drain: (): Promise<void> => provider.shutdown(),
+    });
+
     // 6. Registering is what makes Next.js's own spans appear and what lets its
     //    request tracer extract the `traceparent` the page agent injects. The
     //    propagator is passed explicitly because 2.0 dropped environment-variable
@@ -849,13 +1175,51 @@ export function installPreload(options: PreloadInstallOptions = {}): PreloadInst
     provider.register({ propagator: new W3CTraceContextPropagator() });
 
     // 7. Instrumentations: after the provider, before the application's modules.
-    const instrumentations = registerServerInstrumentations();
+    //
+    // The ledger entry is established *before the first instance is
+    // constructed*, over a list the acquisition appends to as each one comes
+    // into existence: `InstrumentationBase` enables an instrumentation in its
+    // constructor and `registerInstrumentations` configures the list
+    // sequentially, so "one instrumentation exists and is patched, the other
+    // does not" is a reachable state — a throw while constructing `pg`, or
+    // part-way through registration — and it has to be owned like any other.
+    // `disable()` is what unwraps the `pg` methods shimmer wrapped and clears
+    // Prisma's global hook (AAP §0.5.1). Each instance is guarded on its own, so
+    // one that refuses does not strand the other one's patches.
+    const acquiredInstrumentations: ToggleableInstrumentation[] = [];
+    rollback.push({
+      label: 'pg and Prisma instrumentation',
+      revoke: (): void => {
+        for (const instrumentation of acquiredInstrumentations) {
+          try {
+            instrumentation.disable();
+          } catch (error) {
+            log.warn('could not remove an instrumentation patch', {
+              error: describeError(error),
+            });
+          }
+        }
+      },
+    });
+    const instrumentations = registerServerInstrumentations(acquiredInstrumentations);
 
     control.attach({ processor, instrumentations, createProvider, provider });
 
     // 8. `globalThis.__DEBUGGEN__`, so a function the session patches later —
     //    including one HMR reloads mid-capture — finds the helper already there
     //    on its first invocation.
+    //
+    // Ledgered before the install, for the same reason as the provider and the
+    // instrumentations: the entry has to exist from the first moment the effect
+    // can. `uninstallSpanHelper()` is identity-tracked and reports rather than
+    // raises, so an entry whose install never happened, or whose global belongs
+    // to another copy of the preload, is a no-op rather than a hazard.
+    rollback.push({
+      label: 'span helper global',
+      revoke: (): void => {
+        uninstallSpanHelper();
+      },
+    });
     installSpanHelper({ logger });
 
     // 9. The control socket, last: a `server-agent.config` frame can now only
@@ -867,6 +1231,9 @@ export function installPreload(options: PreloadInstallOptions = {}): PreloadInst
       control.connect();
     }
 
+    // Ownership transfers here: from this line the ledger is abandoned unrun and
+    // everything it described belongs to this closure, which is what the global
+    // slot and `shutdownPreload()` reach.
     const shutdown = createShutdownSequence(control, processor, diagWired, log);
 
     log.debug('preload installed', {
@@ -897,22 +1264,26 @@ export function installPreload(options: PreloadInstallOptions = {}): PreloadInst
       { error: reason },
     );
 
-    // Best effort: give back whatever was taken, so the process is left as it
-    // was found. `dispose()` never rejects and is a no-op for the collaborators
-    // that were never attached, and it is not awaited because module evaluation
-    // must not block on it.
-    if (control !== undefined) {
-      void control.dispose();
-    }
-    if (diagWired) {
-      try {
-        diag.disable();
-      } catch {
-        // Nothing left to report it to.
-      }
-    }
+    // Give back everything this attempt took, newest first, so the process is
+    // left as it was found: no registered provider, no wrapped `pg`, no Prisma
+    // hook, no span helper, no live exporter, no open socket (AAP §0.5.1).
+    //
+    // The global half first, and *to completion*: this function returns
+    // synchronously — module scope under `--import` — so a caller reading
+    // `failed` may never await anything, and "failed" has to already be true of
+    // the process rather than true once somebody waits. No provider, no
+    // propagator, no `pg`/Prisma patch and no `__DEBUGGEN__` survive this line.
+    revokeGlobalEffects(rollback, log);
 
-    return inactive('failed', reason);
+    // Then the closable half, started here rather than queued — the developer's
+    // process must not keep an open socket or a live exporter a moment longer
+    // than it has to — and *not* awaited, for the same reason as above. The one
+    // promise is handed back as the result's `shutdown`, so a caller that needs
+    // to know the process is quiet again awaits exactly this work instead of
+    // starting a second copy of it. It never rejects.
+    const drained = drainAcquisitions(rollback, log);
+
+    return inactive('failed', reason, (): Promise<void> => drained);
   }
 }
 
@@ -936,41 +1307,171 @@ function slotHost(): Record<symbol, unknown> {
 }
 
 /**
- * The installation already present in this process, if there is one.
+ * Whatever sits at the slot symbol right now, read without raising.
  *
- * @returns The slot, or `undefined` when it is absent or unrecognisable.
+ * Raw and unvalidated on purpose: {@link readPreloadSlot} builds the structural
+ * check on top of it, and {@link bootstrap} needs the value *itself* to compare
+ * against the record it parked there — an equivalent-looking object is not the
+ * same owner, and only identity distinguishes "our reservation is still the
+ * slot" from "something replaced it with a record of its own".
+ *
+ * A read can throw: the slot may be an accessor another actor defined, on an
+ * exotic or proxied global. An unreadable slot is reported as `undefined`, which
+ * every caller already treats as "not ours".
+ *
+ * @returns The current value, or `undefined` when it is absent or unreadable.
  */
-function readPreloadSlot(): PreloadSlot | undefined {
+function readRawSlotValue(): unknown {
   try {
-    const value = slotHost()[PRELOAD_SLOT_KEY];
-    if (typeof value !== 'object' || value === null) {
-      return undefined;
-    }
-    const candidate = value as { shutdown?: unknown };
-    return typeof candidate.shutdown === 'function' ? (value as PreloadSlot) : undefined;
+    return slotHost()[PRELOAD_SLOT_KEY];
   } catch {
-    // A frozen or exotic global is not worth a throw; the caller treats an
-    // unreadable slot as an absent one and installs.
+    // A frozen, proxied or exotic global is not worth a throw; the caller treats
+    // an unreadable slot as one that is not ours.
     return undefined;
   }
 }
 
 /**
- * Claim the slot for this installation.
+ * The installation already present in this process, if there is one.
+ *
+ * @returns The slot, or `undefined` when it is absent or unrecognisable.
+ */
+function readPreloadSlot(): PreloadSlot | undefined {
+  const value = readRawSlotValue();
+  if (typeof value !== 'object' || value === null) {
+    return undefined;
+  }
+  const candidate = value as { shutdown?: unknown };
+  return typeof candidate.shutdown === 'function' ? (value as PreloadSlot) : undefined;
+}
+
+/**
+ * Claim the slot for this installation, reporting a refusal rather than raising
+ * it.
  *
  * Non-enumerable, so nothing that walks `globalThis` — a test's snapshot, a
  * serialiser in the developer's own application — trips over it, and
  * configurable so a later build can replace it.
  *
+ * `Object.defineProperty` is the one call here that can throw at a host's
+ * discretion: a frozen `globalThis`, a sealed one, or a non-configurable
+ * property already sitting at this symbol. That is a refusal to answer, never a
+ * reason to take a dev server down, so it is returned as `false` — and
+ * {@link bootstrap} makes the refusal mean "install nothing" while there is
+ * still nothing to lose.
+ *
+ * Called **once** per evaluation, for the reservation {@link bootstrap} makes
+ * before it installs anything. There is deliberately no second claim afterwards:
+ * the reservation already carries this build's version and this evaluation's
+ * timestamp and already delegates to the installation, so replacing it would buy
+ * nothing and would open a window in which the slot's value can change under an
+ * installation that is complete.
+ *
  * @param slot The record to park.
+ * @param log Where a refusal is reported.
+ * @returns Whether the slot now holds `slot`.
  */
-function claimPreloadSlot(slot: PreloadSlot): void {
-  Object.defineProperty(globalThis, PRELOAD_SLOT_KEY, {
-    value: slot,
-    writable: true,
-    enumerable: false,
-    configurable: true,
-  });
+function claimPreloadSlot(slot: PreloadSlot, log: PreloadLog): boolean {
+  try {
+    Object.defineProperty(globalThis, PRELOAD_SLOT_KEY, {
+      value: slot,
+      writable: true,
+      enumerable: false,
+      configurable: true,
+    });
+    return true;
+  } catch (error) {
+    log.warn('could not claim the preload slot on globalThis', {
+      error: describeError(error),
+    });
+    return false;
+  }
+}
+
+/**
+ * Give the slot up again, so a later evaluation of this module is free to
+ * install.
+ *
+ * The counterpart of {@link claimPreloadSlot} for the two paths that reserved
+ * ownership and then had nothing to own: an inert or failed installation, and
+ * bootstrap's last-resort catch. Deletion first — the slot should leave no trace
+ * — with an overwrite as the fallback, because a property another actor made
+ * non-configurable refuses `delete` (silently in a sloppy-mode host, by throwing
+ * in a strict one) while still accepting a write. `undefined` is a value
+ * {@link readPreloadSlot} reads as an absent slot, which is what makes the
+ * fallback equivalent.
+ *
+ * Never throws: it runs on failure paths that have nowhere to report to.
+ *
+ * @param log Where an unreleasable slot is reported.
+ */
+function releasePreloadSlot(log: PreloadLog): void {
+  try {
+    if (Reflect.deleteProperty(globalThis, PRELOAD_SLOT_KEY)) {
+      return;
+    }
+    log.debug('the preload slot refused deletion; overwriting it instead');
+  } catch (error) {
+    log.debug('the preload slot refused deletion; overwriting it instead', {
+      error: describeError(error),
+    });
+  }
+
+  try {
+    slotHost()[PRELOAD_SLOT_KEY] = undefined;
+  } catch (error) {
+    log.warn(
+      'could not release the preload slot; a later evaluation of this module will report a duplicate and install nothing',
+      { error: describeError(error) },
+    );
+  }
+}
+
+/**
+ * Keep the slot until `teardown` has settled, then give it up — but only if it
+ * is still this evaluation's to give.
+ *
+ * The failure paths of {@link bootstrap} have two obligations that pull against
+ * each other: a rollback that is still running must stay **reachable** — it is
+ * an active installation until it finishes, and `shutdownPreload()` only reaches
+ * what the slot leads to — while a later evaluation of this module, the dev
+ * server relaunched with a credential, must eventually be free to install. So
+ * the reservation stays in place for exactly as long as the teardown runs, and
+ * the slot is released the moment it is over.
+ *
+ * The identity check before the release is the same one bootstrap makes after a
+ * successful install, for the same reason: releasing a value another actor has
+ * since parked there would strand *its* owner.
+ *
+ * Started rather than awaited by its callers, because module evaluation must not
+ * block; the returned promise therefore never rejects, and nothing is left for a
+ * caller to handle.
+ *
+ * @param reservation The record this evaluation claimed, compared by identity.
+ * @param teardown The rollback already in flight; it never rejects, and the
+ * guard here is for the case where a future one does.
+ * @param log Where a teardown that ended badly, or an unreleasable slot, is
+ * reported.
+ */
+async function releasePreloadSlotAfter(
+  reservation: PreloadSlot,
+  teardown: Promise<void>,
+  log: PreloadLog,
+): Promise<void> {
+  try {
+    await teardown;
+  } catch (error) {
+    log.warn('the rollback of a failed preload installation did not complete cleanly', {
+      error: describeError(error),
+    });
+  }
+
+  if (readRawSlotValue() !== reservation) {
+    log.debug('the preload slot is no longer held by this evaluation; leaving it to its owner');
+    return;
+  }
+
+  releasePreloadSlot(log);
 }
 
 /**
@@ -1014,7 +1515,15 @@ let terminationHandlersAttached = false;
  * `uncaughtException` or `unhandledRejection` handler — the host's own error
  * behaviour is not ours to change.
  *
- * @param log Where the handlers report.
+ * **Total by construction.** Every registration is guarded, because this runs
+ * after {@link bootstrap} already owns a live installation: a `process` that
+ * refuses a listener (one whose `once` a test framework or a sandbox replaced,
+ * or one at its listener limit) costs the flush on the way out, which is a
+ * degradation, while a throw from here would cost the installation itself, which
+ * is not acceptable. What is lost is buffered evidence at exit, never the
+ * teardown — `shutdownPreload()` still reaches the installation through the slot.
+ *
+ * @param log Where the handlers, and a refused registration, report.
  */
 function attachTerminationHandlers(log: PreloadLog): void {
   if (terminationHandlersAttached) {
@@ -1023,20 +1532,33 @@ function attachTerminationHandlers(log: PreloadLog): void {
   terminationHandlersAttached = true;
 
   for (const signal of TERMINATION_SIGNALS) {
-    // The signal is taken from the loop rather than from the listener's
-    // argument, so the handler knows which signal it is re-raising even on a
-    // host that calls the listener with nothing.
-    process.once(signal, () => {
-      void handleTerminationSignal(signal, log);
-    });
+    try {
+      // The signal is taken from the loop rather than from the listener's
+      // argument, so the handler knows which signal it is re-raising even on a
+      // host that calls the listener with nothing.
+      process.once(signal, () => {
+        void handleTerminationSignal(signal, log);
+      });
+    } catch (error) {
+      log.warn('could not install the flush-on-signal handler', {
+        signal,
+        error: describeError(error),
+      });
+    }
   }
 
-  // `beforeExit` covers the process that ends because its work is done. It does
-  // not fire for `process.exit()` or for a signal, which is what the handlers
-  // above are for.
-  process.once('beforeExit', () => {
-    void withDeadline(shutdownPreload(), SHUTDOWN_DEADLINE_MS);
-  });
+  try {
+    // `beforeExit` covers the process that ends because its work is done. It
+    // does not fire for `process.exit()` or for a signal, which is what the
+    // handlers above are for.
+    process.once('beforeExit', () => {
+      void withDeadline(shutdownPreload(), SHUTDOWN_DEADLINE_MS);
+    });
+  } catch (error) {
+    log.warn('could not install the flush-on-exit handler', {
+      error: describeError(error),
+    });
+  }
 }
 
 /**
@@ -1079,7 +1601,7 @@ async function handleTerminationSignal(signal: NodeJS.Signals, log: PreloadLog):
  */
 
 /**
- * Install once per process, claim the slot, and arm the exit handlers.
+ * Reserve ownership, install once per process, and arm the exit handlers.
  *
  * The duplicate guard is the reason this is separate from
  * {@link installPreload}: two evaluations of this module mean two module scopes
@@ -1088,47 +1610,184 @@ async function handleTerminationSignal(signal: NodeJS.Signals, log: PreloadLog):
  * slot claimed and installs nothing, because two providers would double every
  * span and two control sockets would fight over one capture.
  *
- * The slot is claimed **only** on the active path. An inert preload has built
- * nothing to find and nothing to tear down, so a later evaluation is free to try
- * again — which is what lets a developer's second dev server, launched with a
+ * ## The invariant: an active preload is never unowned
+ *
+ * {@link shutdownPreload} resolves the installation *through the slot*, so an
+ * installation the slot does not lead to cannot be torn down at all — not by the
+ * launcher, not by the signal handlers, not by a second evaluation. Claiming the
+ * slot after installing would therefore leave a window in which a refused claim
+ * (a frozen `globalThis`, or a non-configurable property already at that symbol)
+ * abandons a fully active preload: provider registered, `pg` patched, socket
+ * connected, and nothing left holding its teardown.
+ *
+ * So ownership is reserved **first**, with a record whose `shutdown` delegates
+ * to a binding this function fills in the moment there is something to delegate
+ * to. That one record is the slot's *permanent* entry: it already carries this
+ * build's version and this evaluation's timestamp, and it already leads to the
+ * installation, so there is nothing a second claim could add — and a second
+ * claim is itself a window, since the slot's value can change between the
+ * `defineProperty` that would replace the reservation and the installation that
+ * depends on being reachable. There is therefore exactly one claim per
+ * evaluation, and after the install this function *verifies* instead: the slot
+ * must still hold the reservation object itself.
+ *
+ * That makes every ending safe:
+ *
+ * - a refused reservation happens before anything is acquired, so "install
+ *   nothing" is a complete answer;
+ * - a successful install is reachable the instant it exists, through a record
+ *   that was already on the slot;
+ * - a slot that no longer holds the reservation means ownership was taken away
+ *   and cannot be re-established — another actor's value may be non-configurable,
+ *   and overwriting it would strand *its* owner — so the installation is torn
+ *   down and reported `failed` rather than left active and unreachable;
+ * - a *failed* install keeps the reservation until its rollback has settled, so
+ *   the work is reachable while it runs, and releases the slot afterwards so a
+ *   later evaluation can retry;
+ * - `inert` and `duplicate` acquired nothing, so they release immediately (a
+ *   duplicate never reserved anything in the first place).
+ *
+ * An inert preload has built nothing, so a later evaluation is free to try again
+ * — which is what lets a developer's second dev server, launched with a
  * credential, install in a process that already loaded this module without one.
+ *
+ * Nothing here blocks: every teardown this function begins is started and never
+ * awaited, because a `--import` module that waits delays the developer's dev
+ * server from starting.
  *
  * @returns What the evaluation did.
  */
 function bootstrap(): PreloadInstallation {
+  // The teardown of whatever this evaluation owns, once it owns something: a
+  // completed installation's shutdown, or the still-running rollback of one that
+  // failed. The reservation below closes over this *binding* rather than over a
+  // value, which is what lets the slot be claimed before the installation
+  // exists.
+  let owned: (() => Promise<void>) | undefined;
+  // The record this evaluation parked on the slot, kept because ownership is
+  // verified by identity against it and released only while it is still there.
+  // `undefined` until the claim succeeds.
+  let reservation: PreloadSlot | undefined;
+  // Built inside the try, so a logger that cannot be constructed still cannot
+  // throw out of module evaluation; the catch falls back to building its own.
+  let log: PreloadLog | undefined;
+
   try {
+    log = createPreloadLog(createPreloadLogger(), '');
+
     const existing = readPreloadSlot();
     if (existing !== undefined) {
-      createPreloadLog(createPreloadLogger(), '').debug(
-        'preload already installed in this process; this evaluation installs nothing',
-        { installedAt: existing.installedAt, version: existing.version },
-      );
+      log.debug('preload already installed in this process; this evaluation installs nothing', {
+        installedAt: existing.installedAt,
+        version: existing.version,
+      });
       return inactive(
         'duplicate',
         'another evaluation of this module already installed the preload in this process',
       );
     }
 
+    // The permanent slot record, claimed once and never replaced: it carries
+    // this build's version and this evaluation's timestamp, and its `shutdown`
+    // delegates to whatever this evaluation comes to own.
+    const claimed: PreloadSlot = {
+      installedAt: nowEpochMs(),
+      version: TRACER_VERSION,
+      // Resolves immediately while `owned` is unset: a caller who reaches the
+      // slot during the reservation window is asking to tear down something
+      // that does not exist yet, and there is nothing for them to wait for.
+      shutdown: async (): Promise<void> => {
+        await owned?.();
+      },
+    };
+
+    if (!claimPreloadSlot(claimed, log)) {
+      // Nothing has been acquired, so nothing can be left unowned — which is
+      // precisely why the reservation comes first.
+      return inactive(
+        'failed',
+        `the ${String(PRELOAD_SLOT_KEY.description)} slot on globalThis could not be claimed; nothing was installed`,
+      );
+    }
+    reservation = claimed;
+
     const installation = installPreload();
     if (installation.status !== 'installed') {
+      if (installation.status === 'failed') {
+        // A failed attempt has already revoked every process-global effect it
+        // had, but the close of what it opened is still in flight — and until
+        // that settles this evaluation owns live work, which `shutdownPreload()`
+        // has to be able to reach. So the reservation stays, now delegating to
+        // that rollback, and the slot is given up only once it is over, which is
+        // what still lets a later evaluation retry.
+        owned = installation.shutdown;
+        void releasePreloadSlotAfter(claimed, installation.shutdown(), log);
+      } else {
+        // An inert evaluation acquired nothing, so it must leave the slot
+        // exactly as it found it and the next evaluation of this module — the
+        // dev server relaunched with a credential — is free to install.
+        releasePreloadSlot(log);
+        reservation = undefined;
+      }
       return installation;
     }
 
-    claimPreloadSlot({
-      installedAt: nowEpochMs(),
-      version: TRACER_VERSION,
-      shutdown: installation.shutdown,
-    });
+    // Ownership becomes real here, before any other statement can run: from
+    // this assignment the record already on the slot leads to this
+    // installation's teardown.
+    owned = installation.shutdown;
+
+    // …and it is only ownership while the slot still holds that very record.
+    // Compared by identity against the raw value, because an equivalent-looking
+    // record is a *different* owner: anything that replaced the reservation —
+    // another actor's own slot value, a non-configurable property defined over
+    // it, a getter that now answers something else — has taken this
+    // installation's only route to `shutdownPreload()` away, and an active
+    // preload nobody can reach is the single outcome this ordering exists to
+    // prevent. Ownership cannot be re-established either: overwriting whatever
+    // is there now would strand its owner in exactly the same way. So the
+    // installation is handed back to the process and the evaluation reports
+    // `failed`, with the teardown as the result's `shutdown`.
+    if (readRawSlotValue() !== claimed) {
+      log.warn(
+        'the preload slot on globalThis was taken over while the preload was installing; this installation is being torn down and this dev server will run without server telemetry',
+      );
+      const teardown = installation.shutdown();
+      return inactive(
+        'failed',
+        `the ${String(PRELOAD_SLOT_KEY.description)} slot on globalThis no longer holds this evaluation's reservation; the installation was torn down`,
+        (): Promise<void> => teardown,
+      );
+    }
 
     attachTerminationHandlers(createPreloadLog(createPreloadLogger(), installation.config.token));
 
     return installation;
   } catch (error) {
-    // `installPreload` does not throw, and neither do the steps around it — but
-    // this module runs inside `--import`, where an escaping error takes the
-    // developer's dev server down before it starts. So the last word is a catch
-    // that cannot be reached and still refuses to rethrow.
+    // `installPreload` does not throw, the slot helpers report refusals instead
+    // of raising them and `attachTerminationHandlers` is total — but this module
+    // runs inside `--import`, where an escaping error takes the developer's dev
+    // server down before it starts. So the last word is a catch that cannot be
+    // reached and still refuses to rethrow, and it keeps this function's
+    // invariant on the one path nobody can plan for: whatever this evaluation
+    // owns is torn down (its `shutdown` never rejects, and it is started rather
+    // than awaited because module evaluation must not block) while the
+    // reservation still leads to that work, the slot is released once the work
+    // has settled, and a reservation with nothing behind it is released at once.
     const reason = describeError(error);
+
+    if (owned !== undefined) {
+      const teardown = owned();
+      // `owned` is only ever set after both the logger and the reservation
+      // exist, so the release below is always reached on this branch; the guards
+      // are what keep that true for a future edit rather than assumed.
+      if (reservation !== undefined && log !== undefined) {
+        void releasePreloadSlotAfter(reservation, teardown, log);
+      }
+    } else if (reservation !== undefined && log !== undefined) {
+      releasePreloadSlot(log);
+    }
+
     try {
       createPreloadLogger().warn(
         'the Debug Generator preload could not start; this dev server will run without server telemetry',

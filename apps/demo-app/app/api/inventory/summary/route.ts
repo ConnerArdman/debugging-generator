@@ -2,11 +2,12 @@
  * `GET /api/inventory/summary` - the inventory dashboard's feed.
  *
  * One request answers the dashboard's whole surface: the figures on its cards,
- * the stocking locations its filter row lists and the lines that have fallen to
- * their reorder point. The handler does what a route handler in this workspace
- * does and nothing else - it parses the query string with the schema that
- * declares it, hands the parsed values to the service that answers it, and
- * serializes that answer as it stands.
+ * the stocking locations its filter row lists, one page of the stock lines its
+ * table renders and the lines that have fallen to their reorder point. The
+ * handler does what a route handler in this workspace does and nothing else -
+ * it parses the query string with the schema that declares it, hands the parsed
+ * values to the service that answers it, and serializes that answer as it
+ * stands.
  *
  * Four decisions are worth stating, because a reader would otherwise reasonably
  * expect the opposite:
@@ -28,19 +29,19 @@
  *    `no-store`, and nothing is memoized at module scope. The payload is
  *    already stated in `InventorySummary` from `@/lib/types` - plain integer
  *    quantities and an ISO-8601 UTC instant - so re-labelling or re-rounding
- *    anything on the way out could only put this endpoint at odds with the page
- *    that reads the same shape from the service directly.
- * 4. **CONSUMER CLASSIFICATION: this endpoint is reached over HTTP and has no
- *    browser caller, by design.** `@/lib/api-client` exposes no inventory
- *    function, and that absence is deliberate rather than an omission: the
- *    inventory dashboard is server-rendered, so `app/dashboard/page.tsx` calls
- *    `readInventorySummary` directly instead of fetching its own endpoint, and
- *    the one client component on that surface - the filter row - changes the
- *    page's own query string rather than fetching anything. The query is
- *    nevertheless parsed and bounded by `inventorySummaryQuerySchema` exactly
- *    as one with a browser caller would be, because an endpoint reachable over
- *    HTTP is reachable by anyone: having no caller in this application relaxes
- *    nothing about how a request is parsed.
+ *    anything on the way out could only put this endpoint at odds with itself
+ *    on the next request.
+ * 4. **CONSUMER CLASSIFICATION: this endpoint answers the inventory dashboard
+ *    itself.** `app/dashboard/page.tsx` parses its own address and then reads
+ *    this endpoint through `loadInventorySummary` in `@/lib/api-client`, so the
+ *    figures a reader sees and the figures an outside caller receives are the
+ *    same answer to the same request, produced by this code path. The one
+ *    client component on that surface - the filter row - changes the page's own
+ *    query string rather than fetching anything, and the page's next render
+ *    asks here again. The query is parsed and bounded by
+ *    `inventorySummaryQuerySchema` whoever sent it, because an endpoint
+ *    reachable over HTTP is reachable by anyone: a caller inside this
+ *    application relaxes nothing about how a request is parsed.
  *
  * There is no SQL here, no paging arithmetic and no business rule: the work
  * lives in `@/server/services/inventory.service`, and this module is where the
@@ -68,21 +69,21 @@ export const dynamic = 'force-dynamic';
  *
  * @param request The incoming request. Its query string carries an optional
  * `warehouseId`, the headroom above a reorder point that still counts as low,
- * the page window of the low-stock list and the optional stock-state and
- * movement filters; `inventorySummaryQuerySchema` owns which of those are
- * accepted, what they are bounded to and what they default to, so a request
- * carrying no query string at all is a perfectly good one. `warehouseId` names
- * one stocking location by its identifier - `WarehouseSummary.id` as
- * `@/lib/types` declares it - while the short code a location is listed under
- * is display wording only; a request that carries no `warehouseId` reports on
- * every location.
+ * the page window of the stock lines and the optional stock-state and movement
+ * filters; `inventorySummaryQuerySchema` owns which of those are accepted, what
+ * they are bounded to and what they default to, so a request carrying no query
+ * string at all is a perfectly good one. `warehouseId` names one stocking
+ * location by its identifier - `WarehouseSummary.id` as `@/lib/types` declares
+ * it - while the short code a location is listed under is display wording only;
+ * a request that carries no `warehouseId` reports on every location.
  * @returns 200 with an `InventorySummary` - the totals across the locations the
- * filters matched, those locations, and the page of lines at or below their
- * reorder point - and `no-store`, so neither the dev server nor the browser
- * serves the figures again. Any failure is answered by `storefrontErrorResponse`
- * in the one envelope every endpoint of this application uses: 400 for a query
- * the schema rejected, 404 for a stocking location that does not exist, and a
- * message that names no value the caller supplied for anything else.
+ * filters matched, those locations, the page of stock lines with the products
+ * naming them, and the most urgent lines at or below their reorder point - and
+ * `no-store`, so neither the dev server nor the browser serves the figures
+ * again. Any failure is answered by `storefrontErrorResponse` in the one
+ * envelope every endpoint of this application uses: 400 for a query the schema
+ * rejected, 404 for a stocking location that does not exist, and a message that
+ * names no value the caller supplied for anything else.
  */
 export async function GET(request: Request): Promise<Response> {
   try {

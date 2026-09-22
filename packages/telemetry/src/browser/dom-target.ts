@@ -703,6 +703,97 @@ export function ownerHintsFor(el: unknown): OwnerHints | undefined {
 
 /*
  * ---------------------------------------------------------------------------
+ * Lifecycle adapter
+ *
+ * `./agent.ts` drives every producer in this folder through one registry of
+ * `{ attach, detach, isAttached }` triples, so arming and disarming is a
+ * single ordered walk over every family instead of a hand-kept list of calls.
+ * This module is one of those families, and the only one whose scope is the
+ * **document** rather than a capture: the DevTools panel selects an element
+ * before a question is even asked — "Pick element" and
+ * `panels.elements.onSelectionChanged` run while the agent is dormant
+ * (AAP 0.1.1, 0.4.2) — so the capability is armed by the agent's opening
+ * sequence and released when the document goes away, never by a capture.
+ *
+ * It is an explicit **no-resource** adapter: the four functions above are pure
+ * reads of the page, this module installs no listener, observer, patch, timer
+ * or subscription, and it caches nothing. Initialization is therefore a
+ * prerequisite check — a host with no `document` cannot describe an element,
+ * and saying so once is better than answering `undefined` forever — and
+ * cleanup is the flag, which is what `./agent.ts` consults before it offers
+ * `describeTarget` to the panel or answers a relayed `target.request`.
+ *
+ * **The predicate does not gate the four descriptor functions.**
+ * `./interaction.ts` calls {@link describeElement} in the capture phase of the
+ * developer's own click, and the DevTools page reaches it through the page
+ * global, so a second check there would add work to the click path and would
+ * make a pure function's answer depend on an attach call its callers cannot
+ * make. The functions stay callable in both states and keep degrading to their
+ * documented narrowest answer; what the flag governs is whether the *agent*
+ * offers the capability.
+ * ---------------------------------------------------------------------------
+ */
+
+/** Whether the agent currently holds this family attached. */
+let attached = false;
+
+/**
+ * Arm element description for this document.
+ *
+ * Called by `./agent.ts`'s opening sequence, before it publishes
+ * `describeTarget` on the page global, and again after a back/forward-cache
+ * restore. Idempotent, and never throws.
+ *
+ * The one prerequisite checked is a reachable `document`: without it there is
+ * no element to describe and no way to verify a selector, so the family stays
+ * detached and the agent reports the capability as unavailable rather than
+ * publishing a function that can only answer `undefined`. A React renderer is
+ * deliberately *not* a prerequisite — a page without React still yields a
+ * selector, a tag name and a label, with an empty component chain.
+ */
+export function attachDomTarget(): void {
+  if (attached) {
+    return;
+  }
+  try {
+    if (typeof document === 'undefined') {
+      return;
+    }
+    attached = true;
+  } catch {
+    // A host whose `document` getter throws cannot describe an element; the
+    // family stays detached, which is the honest report.
+  }
+}
+
+/**
+ * Disarm element description.
+ *
+ * Called by `./agent.ts` when the document is going away (`pagehide`, the only
+ * teardown a content script has). There is nothing to release — see this
+ * section's note on the no-resource adapter — so this is exactly the flag,
+ * which is what makes the agent stop offering `describeTarget`.
+ *
+ * Safe to call when already detached, and cannot throw.
+ */
+export function detachDomTarget(): void {
+  attached = false;
+}
+
+/**
+ * Whether element description is armed right now.
+ *
+ * "Attached" is this folder's uniform vocabulary for an armed family, and
+ * `./agent.ts` reports this predicate rather than a record of what it asked
+ * for, so a host that refused the prerequisite in {@link attachDomTarget} is
+ * visible as a missing capability instead of a silent `null` target.
+ */
+export function isDomTargetAttached(): boolean {
+  return attached;
+}
+
+/*
+ * ---------------------------------------------------------------------------
  * Internal: guarded reads
  *
  * Everything below treats the page as a foreign object graph. A DOM accessor

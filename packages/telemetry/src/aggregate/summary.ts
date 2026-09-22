@@ -54,7 +54,13 @@
  *    **no** `value` — never as `0`. `transferred_bytes` is the metric this
  *    exists for: a transfer size is exposed for same-origin responses only
  *    (AAP 0.6.6), so a capture may genuinely have nothing to report, and the
- *    card reads `n/a`.
+ *    card reads `n/a`. A *reported* zero is not automatically a measurement
+ *    either: a cross-origin response served without `Timing-Allow-Origin`
+ *    reports every byte count as `0`, and `./requests.ts`'s
+ *    `readExposedTransferSize` — the single reader of those attributes in this
+ *    layer — is what tells that absence apart from the genuine zero of a
+ *    same-origin cache hit. This module counts only what it can tell was
+ *    measured.
  * 2. A render whose trigger could not be determined counts into
  *    `render_trigger_unknown_count` and **never** into
  *    `unchanged_render_count`. That split is `./renders.js`'s classification,
@@ -109,7 +115,13 @@ import {
   type RenderStat,
   type RenderTriggerSummary,
 } from './renders.js';
-import { aggregateRequests, countDuplicateRequests, type RequestGroup } from './requests.js';
+import {
+  RESOURCE_ENTRY_TYPE,
+  aggregateRequests,
+  countDuplicateRequests,
+  readExposedTransferSize,
+  type RequestGroup,
+} from './requests.js';
 import { subtractIntervalsDurationMs, unionDurationMs, type Interval } from './timeline.js';
 
 /*
@@ -226,6 +238,14 @@ const BLOCKING_TIME_ATTRIBUTE: (typeof PERF_LONGTASK_ATTRIBUTE_KEYS)[number] = '
  * those are rather than restating them.
  */
 const TRANSFER_SIZE_ATTRIBUTE: (typeof PERF_ENTRY_ATTRIBUTE_KEYS)[number] = 'transferSize';
+
+/**
+ * The attribute naming which `PerformanceEntry` type a `perf.entry` describes.
+ *
+ * Read by {@link measuresTransferSize} alone, to keep a paint mark — an
+ * instant with no response — out of the transfer-coverage denominator.
+ */
+const ENTRY_TYPE_ATTRIBUTE: (typeof PERF_ENTRY_ATTRIBUTE_KEYS)[number] = 'entry.type';
 
 /** The span status that marks a failed operation of any kind. */
 const ERROR_STATUS: TelemetryEvent['status'] = 'error';
@@ -689,9 +709,6 @@ const PERF_KIND_SET: ReadonlySet<TelemetryKind> = new Set(PERF_KINDS);
 /** Events whose subject is a failure: the error kind group, as a lookup. */
 const ERROR_KIND_SET: ReadonlySet<TelemetryKind> = new Set(ERROR_KINDS);
 
-/** The attribute naming what a request or resource entry addressed. */
-const URL_ATTRIBUTE: (typeof PERF_ENTRY_ATTRIBUTE_KEYS)[number] = 'url';
-
 /**
  * The caveat published with `transferred_bytes`, whether the metric is
  * unavailable or only partially covered.
@@ -741,12 +758,32 @@ function isFailureEvent(event: TelemetryEvent): boolean {
  * Whether a kind's attribute catalog declares a transfer size.
  *
  * Asked of the registry rather than answered with a list of kinds, so the set
- * of kinds that *could* report bytes follows `../schema/attributes.ts`. It is
- * the denominator behind the partial-coverage note: a capture where every
- * candidate reported a size needs no caveat.
+ * of kinds that *could* report bytes follows `../schema/attributes.ts`.
  */
 function reportsTransferSize(kind: TelemetryKind): boolean {
   return KIND_ATTRIBUTE_KEYS[kind].includes(TRANSFER_SIZE_ATTRIBUTE);
+}
+
+/**
+ * Whether an event describes a response whose bytes could have been measured.
+ *
+ * The denominator behind the partial-coverage note, and narrower than "a kind
+ * that declares the key": `perf.entry` covers resource loads *and* paint
+ * marks, and a paint mark is an instant with no response and no bytes, so
+ * counting one as a candidate that failed to report would put a coverage
+ * caveat on captures with complete coverage. An entry whose `entry.type` is
+ * absent is admitted, matching `./requests.ts`'s join — a producer that omits
+ * the label may still have measured a response.
+ */
+function measuresTransferSize(event: TelemetryEvent): boolean {
+  if (!reportsTransferSize(event.kind)) {
+    return false;
+  }
+  if (!PERF_KIND_SET.has(event.kind)) {
+    return true;
+  }
+  const entryType: unknown = event.attributes[ENTRY_TYPE_ATTRIBUTE];
+  return entryType === undefined || entryType === RESOURCE_ENTRY_TYPE;
 }
 
 /*
@@ -776,15 +813,6 @@ function intervalOf(event: TelemetryEvent): Interval {
 function readNonNegativeNumber(event: TelemetryEvent, key: string): number | undefined {
   const value: unknown = event.attributes[key];
   if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
-    return undefined;
-  }
-  return value;
-}
-
-/** A non-empty string at `key`, or `undefined`. */
-function readNonEmptyString(event: TelemetryEvent, key: string): string | undefined {
-  const value: unknown = event.attributes[key];
-  if (typeof value !== 'string' || value.length === 0) {
     return undefined;
   }
   return value;
@@ -829,11 +857,20 @@ interface TraceWindow {
   endTime: number;
 }
 
-/** One reported transfer size, with what it addressed when that was readable. */
+/**
+ * One measured transfer size observed outside the request stream, and the
+ * event it came from.
+ *
+ * The event id is the whole point: `./requests.ts` reports which resource
+ * entries its join attributed to a request, and a report is added to the total
+ * only when its id is **not** among them. Matching by id rather than by URL is
+ * what makes "count each response once" exact — two loads of one URL are two
+ * ids, while a redacted URL cannot tell them apart.
+ */
 interface TransferReport {
-  /** The redacted URL the size belongs to, when the producer reported one. */
-  readonly url: string | undefined;
-  /** The reported size, in bytes. */
+  /** The event that measured the size. */
+  readonly eventId: EventId;
+  /** The measured size, in bytes. */
   readonly bytes: number;
 }
 
@@ -871,15 +908,11 @@ interface CaptureScan {
   blockingTimeMs: number;
   /** Failures, counted once per event. */
   errorCount: number;
-  /** Events of a kind that could have reported a transfer size. */
+  /** Events that describe a response whose bytes could have been measured. */
   transferCandidateCount: number;
-  /** Events that actually reported one. */
+  /** Candidates whose bytes actually were; see {@link readExposedTransferSize}. */
   transferReportCount: number;
-  /** Bytes reported by request events. */
-  requestTransferredBytes: number;
-  /** URLs a request event reported bytes for; see {@link resolveTransferredBytes}. */
-  readonly requestTransferUrls: Set<string>;
-  /** Bytes reported by navigation and resource entries, pending de-duplication. */
+  /** Measured sizes from navigation and resource entries; see {@link TransferReport}. */
   readonly resourceTransferReports: TransferReport[];
   /** The slowest spans, ranked and bounded later. */
   readonly spans: TelemetryEvent[];
@@ -950,8 +983,6 @@ function createScan(): CaptureScan {
     errorCount: 0,
     transferCandidateCount: 0,
     transferReportCount: 0,
-    requestTransferredBytes: 0,
-    requestTransferUrls: new Set<string>(),
     resourceTransferReports: [],
     spans: [],
     failures: [],
@@ -996,28 +1027,34 @@ function recordWindows(scan: CaptureScan, event: TelemetryEvent): void {
   traceWindow.endTime = Math.max(traceWindow.endTime, end);
 }
 
-/** Files a reported transfer size under the route that reported it. */
+/**
+ * Count one transfer-size candidate, and keep the measurement if it made one.
+ *
+ * Coverage is counted for every candidate, requests included, because the
+ * caveat is about how much of the capture could be measured at all. The
+ * *bytes* of a request are not accumulated here: they belong to the request
+ * groups, where `./requests.ts` has already joined each request to its
+ * resource-timing entry and counted each response once (AAP 0.6.6 makes that
+ * join the only route to a browser byte count). Keeping a second running total
+ * beside the groups is exactly how a metric card and the table under it come
+ * to disagree.
+ */
 function recordTransferSize(scan: CaptureScan, event: TelemetryEvent): void {
-  if (!reportsTransferSize(event.kind)) {
+  if (!measuresTransferSize(event)) {
     return;
   }
   scan.transferCandidateCount += 1;
 
-  const bytes = readNonNegativeNumber(event, TRANSFER_SIZE_ATTRIBUTE);
+  const bytes = readExposedTransferSize(event);
   if (bytes === undefined) {
     return;
   }
   scan.transferReportCount += 1;
 
-  const url = readNonEmptyString(event, URL_ATTRIBUTE);
   if (isRequestEvent(event)) {
-    scan.requestTransferredBytes += bytes;
-    if (url !== undefined) {
-      scan.requestTransferUrls.add(url);
-    }
     return;
   }
-  scan.resourceTransferReports.push({ url, bytes });
+  scan.resourceTransferReports.push({ eventId: event.id, bytes });
 }
 
 /**
@@ -1058,27 +1095,47 @@ function scanEvents(events: readonly TelemetryEvent[]): CaptureScan {
 }
 
 /**
- * The bytes the capture reported, counting each response once.
+ * The bytes the capture measured, counting each response once.
  *
- * Request events carry a transfer size copied from the matching resource
- * timing, and the resource entry itself may also be captured, so summing both
- * routes naively would count one response twice. Request reports are therefore
- * authoritative — they are the page's own requests, which is what the metric
- * is about — and a navigation or resource report is added only when no request
- * report claimed the same URL.
+ * Two disjoint contributions, and their disjointness is what makes the total
+ * exact:
  *
- * A report with no readable URL is always added: it cannot be matched against
- * anything, and dropping an unattributable measurement would understate the
- * total.
+ * - **What the requests account for.** Each group's `transferredBytes` is the
+ *   sum its own occurrences carry, every one of them either the request's own
+ *   exposed reading or the bytes of the single resource-timing entry that
+ *   occurrence claimed. This is the same number the `requestTable` shows, so
+ *   the card and the table state one fact (AAP 0.6.2).
+ * - **What nothing requested.** A resource entry no occurrence claimed — a
+ *   script, a stylesheet, an image — and the document's own navigation entry.
+ *   They are added by event id, so an entry a request already accounted for is
+ *   skipped rather than counted a second time.
+ *
+ * @param scan the single pass over the events.
+ * @param requestGroups the groups the metrics and the sections share.
  */
-function resolveTransferredBytes(scan: CaptureScan): number {
-  let total = scan.requestTransferredBytes;
+function resolveTransferredBytes(
+  scan: CaptureScan,
+  requestGroups: readonly RequestGroup[],
+): number {
+  let total = 0;
+  const claimed = new Set<EventId>();
+
+  for (const group of requestGroups) {
+    if (group.transferredBytes !== undefined) {
+      total += group.transferredBytes;
+    }
+    for (const eventId of group.transferEventIds ?? []) {
+      claimed.add(eventId);
+    }
+  }
+
   for (const report of scan.resourceTransferReports) {
-    if (report.url !== undefined && scan.requestTransferUrls.has(report.url)) {
+    if (claimed.has(report.eventId)) {
       continue;
     }
     total += report.bytes;
   }
+
   return total;
 }
 
@@ -1182,18 +1239,27 @@ function countMeasurement(value: number): Measurement {
  * The `transferred_bytes` measurement, with the three coverage cases the
  * platform limitation forces (AAP 0.6.6):
  *
- * - nothing reported a size → **unavailable**, no value, with the caveat. The
- *   card reads `n/a`, which is the honest answer; `0` would claim the capture
- *   observed no bytes.
- * - some candidates reported → the partial sum, with the same caveat.
- * - every candidate reported → the sum, no caveat.
+ * - nothing **measured** a size → **unavailable**, no value, with the caveat.
+ *   The card reads `n/a`, which is the honest answer; `0` would claim the
+ *   capture observed no bytes. A capture of nothing but cross-origin responses
+ *   takes this path even though every one of them *reported* `transferSize:
+ *   0`, because a withheld count is not a measurement — see the header and
+ *   `./requests.ts`'s `readExposedTransferSize`.
+ * - some candidates measured → the partial sum, with the same caveat.
+ * - every candidate measured → the sum, no caveat.
+ *
+ * @param scan the single pass over the events.
+ * @param requestGroups the groups the value is composed from.
  */
-function transferredBytesMeasurement(scan: CaptureScan): Measurement {
+function transferredBytesMeasurement(
+  scan: CaptureScan,
+  requestGroups: readonly RequestGroup[],
+): Measurement {
   if (scan.transferReportCount === 0) {
     return { note: TRANSFER_SIZE_NOTE };
   }
 
-  const value = Math.round(clampNonNegative(resolveTransferredBytes(scan)));
+  const value = Math.round(clampNonNegative(resolveTransferredBytes(scan, requestGroups)));
   if (scan.transferReportCount < scan.transferCandidateCount) {
     return { value, note: TRANSFER_SIZE_NOTE };
   }
@@ -1326,7 +1392,7 @@ function metricValuesFrom(
     render_trigger_unknown_count: countMeasurement(triggers.unknownTriggerCount),
     request_count: countMeasurement(scan.requestCount),
     query_count: countMeasurement(scan.queryCount),
-    transferred_bytes: transferredBytesMeasurement(scan),
+    transferred_bytes: transferredBytesMeasurement(scan, requestGroups),
     blocking_time: durationMeasurement(scan.blockingTimeMs),
     duplicate_request_count: countMeasurement(countDuplicateRequests(requestGroups)),
     long_task_count: countMeasurement(scan.longTaskCount),

@@ -53,10 +53,14 @@
  * 3. **A returned promise ends the span when it settles**, observed on a *side
  *    branch* that carries both handlers, with the original promise handed back
  *    untouched — so the caller's own `catch` still runs and this module never
- *    manufactures an `unhandledrejection` the page did not have. A synchronous
- *    throw rethrows the **original** error, preserving its identity and stack,
- *    and records the error's `name` and nothing else (AAP §0.5.2 keeps values
- *    out: no message, no stack, no arguments).
+ *    manufactures an `unhandledrejection` the page did not have. The branch is
+ *    *terminated* on promise machinery captured at `document_start`
+ *    ({@link NATIVE_PROMISE}), because the promise the application's `then`
+ *    derives belongs to the application's implementation and can reject on its
+ *    own; see {@link observeSettlement}. A synchronous throw rethrows the
+ *    **original** error, preserving its identity and stack, and records the
+ *    error's `name` and nothing else (AAP §0.5.2 keeps values out: no message,
+ *    no stack, no arguments).
  * 4. **This module never throws an error the application did not throw.**
  *    Every interaction with the clock, with the id generator, with the
  *    developer's `meta` object and with the transport is wrapped, and a failure
@@ -116,7 +120,7 @@
  * @example Installed by the agent, used by patched code, retired by cleanup
  * ```ts
  * installSpanHelper({ describeTarget });   // agent.ts, once, at document_start
- * setSpanHelperEnabled(true);              // when a capture arms the agent
+ * setSpanHelperEnabled(true, captureId);   // when a capture arms the agent
  * // …the patched function in the developer's project, unchanged semantics:
  * globalThis.__DEBUGGEN__?.span('handleCheckout', { symbol: 'handleCheckout' }, () => orig());
  * setSpanHelperEnabled(false);             // capture stopped: inert, still installed
@@ -443,11 +447,48 @@ const LAST_C1_CONTROL = 0x9f;
 /** A Windows drive-letter prefix: one ASCII letter followed by a colon. */
 const WINDOWS_DRIVE_PREFIX = /^[A-Za-z]:/;
 
+/**
+ * How many attachments deep {@link terminateSettlementBranch} follows the
+ * settlement side branch before it stops looking.
+ *
+ * One pass closes the branch in every realm whose promise machinery is intact,
+ * because {@link attachTerminalObserver} reports a provably terminated branch
+ * rather than a value to follow. The extra two exist for the realm where that
+ * is not available — a replaced `Promise.prototype.then` handing back a fresh
+ * rejecting thenable from each attachment — and the bound is what stops this
+ * module from iterating page-controlled code without end: a loop whose exit
+ * the application decides is a hang inside the developer's own call stack, and
+ * guarantee 4 of the module overview forbids that. What the bound gives up is
+ * stated where it is spent.
+ */
+const MAX_SETTLEMENT_OBSERVER_DEPTH = 3;
+
 /*
  * ---------------------------------------------------------------------------
  * Internal types
  * ---------------------------------------------------------------------------
  */
+
+/**
+ * `Promise.prototype.then` as the terminal settlement observer calls it: two
+ * mandatory handlers, an unconstrained receiver, and a result of `unknown`.
+ *
+ * Declared locally rather than spelled `typeof Promise.prototype.then` because
+ * both of those widenings are load-bearing. The receiver is `unknown` because
+ * the function is invoked with `.call(…)` on a promise this module built, and
+ * the result is `unknown` because `then` derives its promise through
+ * `SpeciesConstructor` — so "what comes back is a promise" holds only while the
+ * realm's species is intact, which is precisely the assumption
+ * {@link observeSettlement} refuses to make. Reading the member through
+ * {@link memberView} (see {@link captureNativeThen}) rather than off the
+ * prototype directly also keeps it an ordinary value rather than an unbound
+ * method reference.
+ */
+type SettlementThen = (
+  this: unknown,
+  onFulfilled: (value: unknown) => void,
+  onRejected: (reason: unknown) => void,
+) => unknown;
 
 /**
  * One frame of the nesting stack: the trace a span joined and its own id.
@@ -484,6 +525,16 @@ interface SpanRecord {
   readonly attributes: Record<string, unknown>;
   /** The patch-recorded location, when `meta` carried a usable one. */
   readonly source: PatchSourceLocation | undefined;
+  /**
+   * The value of {@link captureGeneration} when the span opened: the capture
+   * this span's work belongs to.
+   *
+   * As `readonly` as the span's other identity fields, and for the same reason
+   * — a span cannot change which capture observed it. {@link finishSpan} emits
+   * only while it still matches, which is what keeps a promise opened in one
+   * capture from reporting into the next.
+   */
+  readonly generation: number;
   /** Whether the event has been emitted, so it can never be emitted twice. */
   ended: boolean;
 }
@@ -494,9 +545,10 @@ interface SpanRecord {
  *
  * Module scope is per JavaScript context and the agent bundle is evaluated once
  * per page document, so this state is exactly one document's helper. Declaring
- * an empty array and two flags is not a side effect: nothing observable happens
- * until a function is called, which is the invariant `./agent.ts` relies on to
- * be the only module in this folder that acts when it is evaluated.
+ * an empty array and a few flags is not a side effect, and neither is reading
+ * the realm's promise intrinsic below: nothing observable happens until a
+ * function is called, which is the invariant `./agent.ts` relies on to be the
+ * only module in this folder that acts when it is evaluated.
  * ---------------------------------------------------------------------------
  */
 
@@ -506,6 +558,38 @@ interface SpanRecord {
  * assertion is required rather than stylistic.
  */
 const globalScope = globalThis as unknown as DebuggenGlobalScope;
+
+/**
+ * The realm's own `Promise` constructor, captured at module evaluation.
+ *
+ * Captured rather than resolved at call time — the opposite of what `./ids.ts`
+ * does for `crypto`, and for a reason worth stating. `Promise` is an
+ * ECMAScript intrinsic, present from the instant the realm exists, where a
+ * host global may still be arriving at `document_start`; and the agent bundle
+ * is a MAIN-world content script that runs **at** `document_start`, before any
+ * page script has executed. So what this constant holds is the page's own
+ * promise machinery as the page received it, which is exactly the property
+ * {@link attachTerminalObserver} needs: a later replacement of `Promise`,
+ * `Promise.prototype.then` or the promise species cannot reach it.
+ *
+ * `undefined` on an exotic host with no `Promise` at all — a realm the fallback
+ * path in {@link attachTerminalObserver} still copes with.
+ */
+const NATIVE_PROMISE: PromiseConstructor | undefined =
+  typeof Promise === 'function' ? Promise : undefined;
+
+/**
+ * `Promise.prototype.then` as it stood when {@link NATIVE_PROMISE} was
+ * captured, or `undefined` when there was none to have.
+ *
+ * Held separately from the constructor because it is the member a page is most
+ * likely to replace — every promise-instrumentation library does — and the
+ * terminal observer has to attach its handlers through the real one, whose
+ * return value is a promise, rather than through a replacement whose return
+ * value is anyone's guess. See {@link captureNativeThen} for why the read is
+ * wrapped.
+ */
+const NATIVE_PROMISE_THEN: SettlementThen | undefined = captureNativeThen();
 
 /** The nesting stack; empty whenever no enabled `span` call is in progress. */
 const spanStack: SpanFrame[] = [];
@@ -519,6 +603,35 @@ const spanStack: SpanFrame[] = [];
  * setter's parameter so the two can never be confused inside that function.
  */
 let armed = false;
+
+/**
+ * The normalised capture id of the last configuration handed to
+ * {@link setSpanHelperEnabled}, or `undefined` when none was usably stated.
+ *
+ * Remembered only to decide whether {@link setSpanHelperEnabled} was handed a
+ * *different* configuration; nothing stamps it onto an event, because
+ * `./transport.js` owns the `captureId` an event carries and one module
+ * deciding that twice is how the two would drift apart.
+ */
+let armedCaptureId: string | undefined;
+
+/**
+ * Which capture generation is current, advanced by {@link setSpanHelperEnabled}
+ * whenever the armed configuration actually changes and by
+ * {@link uninstallSpanHelper}.
+ *
+ * This is how an `async` patched function survives a capture boundary without
+ * escaping into the next capture. A {@link SpanRecord} carries the generation
+ * it was opened in; when it settles, a record from any other generation emits
+ * nothing, so a promise opened in capture A and settled during capture B
+ * reports into neither. A bare `armed` flag cannot express that: it is `true`
+ * in both captures, and `./transport.js` would stamp the late event with
+ * capture B's `captureId` and capture B's restarted per-capture `seq` (AAP
+ * §0.2.3 scopes `seq` to `(producerId, captureId)`) — work nobody observed,
+ * inside somebody else's capture. `./fetch.ts` prevents the same class of
+ * defect with the same mechanism for requests already on the wire.
+ */
+let captureGeneration = 0;
 
 /**
  * The helper object this module installed, for identity-tracked removal.
@@ -544,6 +657,36 @@ let hasConfig = false;
  * this module has no right to unwind.
  * ---------------------------------------------------------------------------
  */
+
+/**
+ * Read `then` off {@link NATIVE_PROMISE}'s prototype, once, at module
+ * evaluation.
+ *
+ * Wrapped even though the read happens before any page script could have
+ * installed a throwing accessor: this one runs while the module is still being
+ * evaluated, where an exception would take the whole agent bundle down instead
+ * of costing a single span, so guarantee 4 of the module overview applies here
+ * more than anywhere else. A realm that refuses the read simply leaves the
+ * fallback path of {@link attachTerminalObserver} in charge.
+ *
+ * The member is read through {@link memberView}, which yields a plain
+ * `unknown`, so the `typeof` guard below is the only thing that decides whether
+ * there is a function to keep.
+ *
+ * @returns The realm's own `then`, or `undefined` when there is none.
+ */
+function captureNativeThen(): SettlementThen | undefined {
+  if (NATIVE_PROMISE === undefined) {
+    return undefined;
+  }
+
+  try {
+    const candidate = memberView(NATIVE_PROMISE.prototype)['then'];
+    return typeof candidate === 'function' ? (candidate as SettlementThen) : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 /**
  * Round to microsecond precision, the resolution the event contract keeps.
@@ -760,6 +903,42 @@ function spanNameFor(name: string): string {
   }
 
   return truncate(trimmed, MAX_SPAN_NAME_LENGTH);
+}
+
+/**
+ * Normalise the capture id {@link setSpanHelperEnabled} was handed.
+ *
+ * The value arrives on a relayed `agent.config` message and generated code can
+ * call the setter too, so the `typeof` check is not redundant in practice — the
+ * same reasoning that makes the setter compare `enabled` against `true` rather
+ * than coercing it. An empty string is the one further reading of "no capture
+ * stated", and collapsing it to `undefined` keeps two spellings of the same
+ * absence from looking like two different captures and advancing the generation
+ * for nothing.
+ *
+ * **The id is compared verbatim, by no method call at all.** This module runs
+ * in the page's MAIN world and a configuration arrives long after page scripts
+ * have run, so `String.prototype.trim` — or any other method reachable from a
+ * value the page can influence — may have been replaced with something that
+ * throws. A throw here would escape {@link setSpanHelperEnabled} into
+ * `./agent.js`'s arming sequence and abort a capture transition part-way
+ * through, which is precisely the cross-capture leak the generation exists to
+ * prevent. A capture id is a service-generated identifier that is already
+ * canonical (`../../protocol` mints it), so there was never anything to
+ * normalise beyond its presence, and an id with surrounding whitespace is
+ * simply a different capture from one without.
+ *
+ * @param captureId The raw second argument, of any type at runtime.
+ * @returns The id exactly as given, or `undefined` when none was usably
+ * stated. Never truncated: the id is only ever compared with itself here, never
+ * reported.
+ */
+function normalizeCaptureId(captureId: unknown): string | undefined {
+  if (typeof captureId !== 'string' || captureId === '') {
+    return undefined;
+  }
+
+  return captureId;
 }
 
 /**
@@ -988,6 +1167,9 @@ function beginSpan(name: string, meta: Record<string, unknown>): SpanRecord | un
       startTime: nowEpochMs(),
       attributes,
       source,
+      // Stamped at the moment the span opens, never read again until it
+      // settles: this is the capture that asked for the work.
+      generation: captureGeneration,
       ended: false,
     };
 
@@ -1010,10 +1192,14 @@ function beginSpan(name: string, meta: Record<string, unknown>): SpanRecord | un
  * badly behaved userland promise: a second event for one call would double-count
  * the function in every duration the capture reports.
  *
- * Nothing is emitted while the helper is disabled. A span that was opened
- * inside a capture and settles after it stopped therefore reports nothing,
- * which is the honest outcome: `./transport.js` would drop it anyway with no
- * `captureId` in force, and attributing it to a *later* capture would put work
+ * Nothing is emitted while the helper is disabled, **and nothing is emitted
+ * into a capture other than the one the span opened in**. A span that was
+ * opened inside a capture and settles after it stopped therefore reports
+ * nothing, which is the honest outcome: `./transport.js` would drop it anyway
+ * with no `captureId` in force. A span that settles once a *different* capture
+ * has been armed reports nothing either — that is the {@link SpanRecord.generation}
+ * check, and without it `./transport.js` would stamp the late event with the
+ * new capture's `captureId` and its restarted per-capture `seq`, putting work
  * nobody observed inside somebody else's trace.
  *
  * @param record The record {@link beginSpan} returned.
@@ -1035,7 +1221,11 @@ function finishSpan(
   }
   record.ended = true;
 
-  if (!armed) {
+  // Both halves of the capture gate, in the order they can fail: the helper may
+  // have been disarmed since the span opened, and — the case a Boolean cannot
+  // see — the helper may have been re-armed for a *different* capture while
+  // this span was in flight.
+  if (!armed || record.generation !== captureGeneration) {
     return;
   }
 
@@ -1077,24 +1267,315 @@ function finishSpan(
 }
 
 /**
+ * The terminal observer's handler, used for both outcomes.
+ *
+ * Deliberately empty, and named rather than inlined twice: its entire job is to
+ * *exist*, because a promise that carries a rejection handler is a handled
+ * promise and never reaches `unhandledrejection`. Naming it also makes it
+ * visible in a profile and provable by inspection that fulfilment and rejection
+ * are treated identically — the observer reports nothing, it only absorbs.
+ */
+function ignoreSettlement(): void {
+  // Intentionally empty; see this function's documentation.
+}
+
+/**
+ * Whether a value carries the internal slots the native `then` requires.
+ *
+ * `instanceof` is the closest test available — a promise's slots are not
+ * readable from script — so it is right for the question being asked and wrong
+ * for one case: a `Proxy` over a promise inherits the prototype and passes,
+ * while the native `then` still rejects it as a receiver. That is why the
+ * in-place path of {@link attachTerminalObserver} has a fallback rather than a
+ * guarantee, and why this predicate may be optimistic.
+ *
+ * @param value A value {@link isThenable} has already accepted.
+ * @returns `true` when the native `then` can probably be called on it directly.
+ */
+function isNativePromise(value: PromiseLike<unknown>): boolean {
+  if (NATIVE_PROMISE === undefined) {
+    return false;
+  }
+
+  try {
+    return value instanceof NATIVE_PROMISE;
+  } catch {
+    // A `Proxy` whose `getPrototypeOf` trap throws answers nothing, and the
+    // adoption path copes with it.
+    return false;
+  }
+}
+
+/**
+ * Whether `then` on this promise would derive its result through the
+ * *intrinsic* promise constructor, so that attaching two non-throwing handlers
+ * can only produce a promise that fulfils.
+ *
+ * `then` builds its result with `SpeciesConstructor(promise, %Promise%)`: it
+ * reads the promise's `constructor` and then that constructor's
+ * `Symbol.species`. Two readings return the intrinsic — an absent
+ * `constructor`, for which the algorithm returns the default, and the intrinsic
+ * `Promise` itself, whose inherited species getter returns the receiver. Both
+ * are checked here, and anything else — a subclass, a replaced
+ * `Promise.prototype.constructor`, a replaced species getter — is reported as
+ * *not provably intrinsic* rather than as hostile, because the two are
+ * indistinguishable from script and only the safe reading may be assumed.
+ *
+ * Asking the question at all is what keeps {@link attachTerminalObserver} from
+ * writing on a promise in the overwhelmingly common case where it has no need
+ * to.
+ *
+ * @param promise A promise {@link isNativePromise} has accepted.
+ * @returns `true` only when both reads say the intrinsic.
+ */
+function derivesThroughIntrinsic(promise: PromiseLike<unknown>): boolean {
+  try {
+    const constructor = memberView(promise)['constructor'];
+    if (constructor === undefined) {
+      return true;
+    }
+    if (constructor !== NATIVE_PROMISE) {
+      return false;
+    }
+    return (constructor as PromiseConstructor)[Symbol.species] === NATIVE_PROMISE;
+  } catch {
+    // A throwing `constructor` accessor: nothing is provable, so nothing is
+    // assumed.
+    return false;
+  }
+}
+
+/**
+ * Make one promise derive its `then` result through the intrinsic constructor,
+ * by giving it an own `constructor` of `undefined`.
+ *
+ * `SpeciesConstructor` returns its default when `constructor` is `undefined`,
+ * so this one own property is what turns a subverted species into the
+ * intrinsic. It is a **write on an object this module does not own**, so it is
+ * paired with {@link restoreOwnConstructor} on every path and held for the
+ * shortest time a write can be held: `then` performs its species lookup
+ * synchronously, inside the call, so the property goes back the moment that
+ * call returns and no application code can observe it in between (see
+ * {@link attachTerminalObserver}).
+ *
+ * `Reflect.defineProperty` reports a refusal instead of throwing, and
+ * `configurable` is what keeps the restore able to take the property off again.
+ *
+ * @param promise The promise to pin.
+ * @returns Whether the property is now in place, and therefore whether the
+ * caller owes a restore.
+ */
+function forceIntrinsicSpecies(promise: PromiseLike<unknown>): boolean {
+  try {
+    return Reflect.defineProperty(promise, 'constructor', {
+      value: undefined,
+      writable: false,
+      enumerable: false,
+      configurable: true,
+    });
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Put a promise's own `constructor` back exactly as it was found.
+ *
+ * The counterpart of {@link forceIntrinsicSpecies}, and deliberately stated in
+ * terms of the *descriptor* rather than of a value: a promise the application
+ * owns may legitimately carry an own `constructor` of its own — a shared
+ * instance of a subclass, say — and replacing that with a deletion would leave
+ * the object changed in a way its owner can see. An absent descriptor is
+ * restored by deleting, which is the same absence it started with.
+ *
+ * @param promise The promise the pin was applied to.
+ * @param prior The descriptor read before the pin, or `undefined` when the
+ * property was not an own property at all.
+ */
+function restoreOwnConstructor(
+  promise: PromiseLike<unknown>,
+  prior: PropertyDescriptor | undefined,
+): void {
+  try {
+    if (prior === undefined) {
+      Reflect.deleteProperty(promise, 'constructor');
+      return;
+    }
+    Reflect.defineProperty(promise, 'constructor', prior);
+  } catch {
+    // A host that refuses both operations leaves an own `constructor` of
+    // `undefined` on an object whose species lookup has already happened;
+    // nothing further is available to try.
+  }
+}
+
+/**
+ * Read a promise's own `constructor` descriptor, for the restore that follows
+ * a pin.
+ *
+ * Separate from the pin so that the read happens *before* anything is written,
+ * which is the only order in which "exactly as it was found" is knowable.
+ *
+ * @param promise The promise about to be pinned.
+ * @returns Its own `constructor` descriptor, or `undefined` when it has none —
+ * including when the read itself is refused, which is the same thing as far as
+ * the restore is concerned.
+ */
+function ownConstructorDescriptor(promise: PromiseLike<unknown>): PropertyDescriptor | undefined {
+  try {
+    return Reflect.getOwnPropertyDescriptor(promise, 'constructor');
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Attach rejection-swallowing handlers to one value on the settlement side
+ * branch, through the promise machinery this module captured rather than
+ * through the page's.
+ *
+ * Two paths, and which one runs decides whether the branch ends here:
+ *
+ * 1. **A native promise, observed in place.** The handlers go straight onto it
+ *    with the captured `then`. The species is read first
+ *    ({@link derivesThroughIntrinsic}) and pinned only when it is not provably
+ *    the intrinsic already ({@link forceIntrinsicSpecies}) — the common case
+ *    writes nothing at all — and a pin is taken back off in a `finally`, from
+ *    the descriptor read before it went on, because `then` performs its species
+ *    lookup synchronously inside the call. Either way the promise `then`
+ *    derives is a native one carrying two handlers that cannot throw, so it can
+ *    only fulfil: the branch is provably terminated and there is nothing left
+ *    to chase.
+ * 2. **A foreign thenable, whose own `then` is called directly** and whose
+ *    return value is handed back. Calling it is what registers a handler on the
+ *    value; returning its result is what lets the caller keep following the
+ *    chain. Deliberately **not** promise adoption: resolving a native promise
+ *    with a thenable does call that thenable's `then`, but the specification's
+ *    thenable-adoption job *discards* what that call returns, so a `then` that
+ *    hands back a rejecting promise would go unobserved — an
+ *    instrumentation-only rejection, which is the whole defect this function
+ *    exists to prevent.
+ *
+ * A `then` that throws synchronously, or a `then` accessor that throws on this
+ * second read having succeeded for {@link isThenable}, produced nothing to
+ * observe; the throw is swallowed and the branch reported terminated, because a
+ * value that was never created cannot reject.
+ *
+ * @param thenable A thenable sitting on the side branch.
+ * @returns `undefined` when the branch is provably terminated, or the value the
+ * foreign `then` produced, which may itself still need observing.
+ */
+function attachTerminalObserver(thenable: PromiseLike<unknown>): unknown {
+  const nativeThen = NATIVE_PROMISE_THEN;
+
+  if (nativeThen !== undefined && isNativePromise(thenable)) {
+    // Asked, and the descriptor read, before anything is written: both answers
+    // are only knowable ahead of the pin.
+    const intrinsic = derivesThroughIntrinsic(thenable);
+    const prior = intrinsic ? undefined : ownConstructorDescriptor(thenable);
+    const pinned = intrinsic ? false : forceIntrinsicSpecies(thenable);
+    try {
+      nativeThen.call(thenable, ignoreSettlement, ignoreSettlement);
+      return undefined;
+    } catch {
+      // `instanceof` said promise and the native `then` disagreed: a `Proxy`
+      // over one. It is the application's object, so the pin comes off in the
+      // `finally` below and the value is observed as a foreign thenable
+      // instead, through the proxy's own traps.
+    } finally {
+      if (pinned) {
+        restoreOwnConstructor(thenable, prior);
+      }
+    }
+  }
+
+  try {
+    return thenable.then(ignoreSettlement, ignoreSettlement);
+  } catch {
+    // Nothing was created, so nothing can reject, and this module does not
+    // raise on the application's stack over it.
+    return undefined;
+  }
+}
+
+/**
+ * Follow the settlement side branch until nothing on it can reject, at most
+ * {@link MAX_SETTLEMENT_OBSERVER_DEPTH} attachments deep.
+ *
+ * The loop exists because every attachment produces a *new* value, and in a
+ * realm whose promise species has been subverted that value can be another
+ * rejecting thenable. It terminates on the first non-thenable — a value with no
+ * `then` cannot reject — which is what {@link attachTerminalObserver} returns
+ * whenever it could guarantee the outcome itself, so the ordinary case costs
+ * one pass.
+ *
+ * @param value Whatever the application's `then` returned.
+ */
+function terminateSettlementBranch(value: unknown): void {
+  let current = value;
+
+  for (let depth = 0; depth < MAX_SETTLEMENT_OBSERVER_DEPTH; depth += 1) {
+    if (!isThenable(current)) {
+      // Nothing left that can reject: the branch is closed.
+      return;
+    }
+
+    const next = attachTerminalObserver(current);
+    if (next === undefined) {
+      // Provably terminated — a native promise carrying two swallowing
+      // handlers, which can only fulfil.
+      return;
+    }
+
+    current = next;
+  }
+
+  // The bound is spent, which takes a foreign `then` handing back a fresh
+  // thenable at every level: a native promise never gets here, because
+  // observing one in place terminates the branch. The value in hand may
+  // nonetheless be a native promise the last foreign `then` produced, and that
+  // one *can* reach `unhandledrejection`, so it gets the one attachment that is
+  // terminal by construction.
+  if (isThenable(current) && isNativePromise(current)) {
+    attachTerminalObserver(current);
+    return;
+  }
+
+  // What is left unobserved is a *foreign* thenable: its rejection is its own
+  // implementation's business and cannot raise `unhandledrejection`, which the
+  // host fires for native promises only. That is the honest end of the chain —
+  // better than following application code around a loop whose exit the
+  // application controls, which guarantee 4 of the module overview forbids.
+}
+
+/**
  * Observe a returned thenable **without altering it**.
  *
  * The caller keeps the exact reference the patched function produced, so its
- * own `await`, `then` and `catch` behave as they did before instrumentation.
- * The derived promise created here is a side branch carrying handlers for both
- * outcomes, each of which swallows, so it always settles fulfilled and can
- * never become an `unhandledrejection` of this module's making — including when
- * the application handles the rejection itself, and when it does not.
+ * own `await`, `then` and `catch` behave as they did before instrumentation:
+ * this is a side branch, never a replacement.
+ *
+ * The branch's own end is this module's responsibility. `then` here is the
+ * *application's* — a userland promise implementation, or a native subclass
+ * whose species has been changed — so the promise it derives is the
+ * application's too, and swallowing handlers do not make that derived promise
+ * incapable of rejecting. Discarding it would hand the page an
+ * `unhandledrejection` that exists only because this module is installed, which
+ * guarantee 3 of the module overview forbids; so the value is captured and
+ * terminated on machinery captured at `document_start`
+ * ({@link terminateSettlementBranch}).
  *
  * @param thenable The value the callback returned.
  * @param record The record to finish when it settles.
  */
 function observeSettlement(thenable: PromiseLike<unknown>, record: SpanRecord): void {
+  let derived: unknown;
+
   try {
-    // Deliberately unawaited: this is an observation, not a link in the
-    // caller's chain. `void` states that for the reader and for
-    // `@typescript-eslint/no-floating-promises`.
-    void thenable.then(
+    // Called exactly once, with both handlers, and deliberately unawaited: this
+    // is an observation, not a link in the caller's chain. What it returns is
+    // no longer discarded, for the reason in this function's documentation.
+    derived = thenable.then(
       () => {
         finishSpan(record, 'ok', true);
       },
@@ -1106,9 +1587,13 @@ function observeSettlement(thenable: PromiseLike<unknown>, record: SpanRecord): 
     // A thenable whose `then` throws synchronously cannot be observed. The span
     // is closed now with an unset status rather than left open for the rest of
     // the document's life: the duration is real, the outcome is genuinely
-    // unknown, and saying so is better than claiming either.
+    // unknown, and saying so is better than claiming either. There is no
+    // derived value to terminate — `then` never returned one.
     finishSpan(record, 'unset', true);
+    return;
   }
+
+  terminateSettlementBranch(derived);
 }
 
 /**
@@ -1393,6 +1878,12 @@ export function uninstallSpanHelper(): void {
   const helper = installedHelper;
   installedHelper = undefined;
   armed = false;
+  armedCaptureId = undefined;
+  // Advanced unconditionally, and before the global is touched: a teardown is a
+  // capture boundary whatever state the helper was in, so a span opened before
+  // it must not report if a later install and arm lets it settle. A test that
+  // uninstalls and reinstalls between cases gets the same isolation.
+  captureGeneration += 1;
   spanStack.length = 0;
 
   if (helper === undefined || readGlobal() !== helper) {
@@ -1449,12 +1940,54 @@ export function getSpanHelper(): BrowserSpanHelper | undefined {
  * to preserve, and a frame left over from a previous capture would misparent the
  * first span of the next one.
  *
+ * **The capture generation advances only when the configuration actually
+ * changes** — a different armed state, or a different capture id. Re-sending
+ * the live configuration is therefore a no-op, which is load-bearing rather
+ * than an optimisation: the Chrome service worker re-sends `agent.config` after
+ * every reconnect and after every same-origin navigation, with the *same*
+ * `captureId` continuing (AAP §0.5.5), and an in-flight `async` span must
+ * survive that. A genuine change invalidates every span still in flight, which
+ * is what {@link SpanRecord.generation} exists for.
+ *
  * @param enabled Whether instrumentation is armed. Compared against `true`
  * rather than coerced, because the value ultimately comes off a relayed
  * message and generated code can call this too.
+ * @param captureId The capture being armed, when the caller knows it. Optional
+ * because arming is meaningful without it — the gate that matters is `enabled`,
+ * and `./transport.js` is what stamps an event's `captureId` — so a caller that
+ * has not been wired to pass it keeps working unchanged. An *optional
+ * parameter* rather than one declared `string | undefined`: the two behave
+ * identically for every caller (an optional parameter accepts omission, an
+ * explicit `undefined` and a `string | undefined` value alike, and
+ * `exactOptionalPropertyTypes` governs properties, not parameters), and the
+ * explicit union on a parameter is an
+ * `@typescript-eslint/no-duplicate-type-constituents` error under
+ * `--max-warnings 0`. Read exactly as defensively as `enabled` is compared,
+ * since it arrives from the same relayed message: anything that is not a
+ * non-empty string is treated as "not stated" rather than as an identity of its
+ * own (see {@link normalizeCaptureId}).
+ *
+ * **Total.** Nothing in this function can throw: it compares two primitives,
+ * assigns three variables and truncates an array this module owns, and it calls
+ * nothing on a value the page can influence. That matters beyond guarantee 4 of
+ * the module overview — `./agent.js`'s `arm()` calls this in the middle of a
+ * capture transition, and an exception here would leave that transition part
+ * done, with the transport on the new capture while a producer was still on the
+ * old generation.
  */
-export function setSpanHelperEnabled(enabled: boolean): void {
-  armed = enabled === true;
+export function setSpanHelperEnabled(enabled: boolean, captureId?: string): void {
+  const nextArmed = enabled === true;
+  const nextCaptureId = normalizeCaptureId(captureId);
+
+  if (nextArmed !== armed || nextCaptureId !== armedCaptureId) {
+    // A real capture boundary: every span still in flight was opened for work
+    // the previous configuration asked about, and belongs to neither side of
+    // the boundary from here on.
+    captureGeneration += 1;
+  }
+
+  armed = nextArmed;
+  armedCaptureId = nextCaptureId;
   spanStack.length = 0;
 }
 

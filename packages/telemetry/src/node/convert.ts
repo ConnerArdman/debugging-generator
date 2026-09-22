@@ -45,27 +45,41 @@
  * ## `seq` is scoped to `(producerId, captureId)`
  *
  * `seq` is a zero-based per-producer counter, and its scope is the pair
- * `(producerId, captureId)` (AAP §0.2.3): {@link createSeqAllocator} restarts
- * at zero whenever the capture changes. It matters because the correlator's
+ * `(producerId, captureId)` (AAP §0.2.3): {@link createSeqAllocator} keeps one
+ * counter per producer id and restarts it at zero whenever that producer's
+ * capture changes. Both halves of the scope are the allocator's arguments
+ * rather than one argument and one convention, because the correlator's
  * canonical ordering is *parent before child*, then `startTime`, then
  * `(producerId, seq)`, then the store-assigned `ingestSeq` — so `seq` is what
- * separates two events of one producer that share a millisecond. Gaps are
- * harmless (a skipped span consumes no number); going backwards is not, which
- * is why the counter is never recomputed from anything else.
+ * separates two events of one producer that share a millisecond, and a counter
+ * two producers drew from in turn would report each of them as a producer whose
+ * events arrived out of order. Gaps are harmless (a skipped span consumes no
+ * number); going backwards is not, which is why the counter is never recomputed
+ * from anything else.
  *
- * ## Three fields this file must never set
+ * ## Four fields this file must never set, and one it may
  *
  * `sessionId`, `captureId` and `ingestSeq` belong to the **persisted** schema
  * only. `../schema/event.ts` makes the ingress schema strict, so any one of
  * them would be a hard rejection at ingest — which is the intended outcome,
  * because attribution is the service's job
- * (`apps/local-service/src/telemetry/attribute.ts`). `source` is left unset for
- * the same reason: server-side source resolution runs in the service, through
- * the code graph, the route map and recorded patch metadata, and a preload that
- * guessed at a location would be inventing evidence. `redacted` belongs to
+ * (`apps/local-service/src/telemetry/attribute.ts`). `redacted` belongs to
  * `../redaction/redactor.ts`, and `attributes.request_key` is computed at
  * ingest from the *unredacted* URL under a per-session HMAC key — writing one
  * here would both be wrong and leak the grouping key.
+ *
+ * `source` is the exception, and only on one kind. The first of the four source
+ * routes (AAP §0.4.2) is the metadata a reversible patch *recorded* when it
+ * wrapped a function: `packages/instrumentation/src/patch/wrap-template.ts`
+ * emits a project-relative POSIX `file`, a 1-based `line` and `column` and the
+ * wrapped `symbol` into the `meta` literal of every wrapper it writes, and
+ * `./span-helper.ts` puts them on the span. Forwarding recorded evidence is not
+ * guessing at a location, so {@link spanToIngressEvent} emits it as
+ * `resolvedBy: 'patch'` — see {@link deriveFunctionSource}, which validates the
+ * candidate against the one shared schema and omits the field entirely rather
+ * than emitting a location it cannot vouch for. Every other kind's location is
+ * still resolved in the service through the code graph, the route map and
+ * source maps, and this file invents nothing for them.
  *
  * ## Redaction happens downstream; widening is what is forbidden here
  *
@@ -79,6 +93,19 @@
  * parameterized text (`$1` placeholders) and is scrubbed and length-bounded by
  * `../redaction/sql.ts` at ingest, which is why it is copied verbatim here
  * instead of being cut to a preview length that would ruin the query table.
+ *
+ * The keys the product declares are a reviewed set; anything else on a span is
+ * whatever a third-party instrumentation in the host process chose to attach,
+ * and it reaches the store, the live tail and a model prompt. The downstream
+ * redactor recognises *patterns* (a token-shaped value) and *declared* keys (a
+ * URL, a statement, a header), which is exactly what a body, a result row or a
+ * customer's e-mail address under an undeclared key is not — and a one-line
+ * `name=Alice&email=…` under `request.data` is a body that looks like a label
+ * to every rule except one. So the pass-through pass admits a key only when a
+ * reviewer has vouched for it ({@link isAdmissibleAttributeKey}: the product's
+ * catalog, this module's reviewed vocabulary, or the product's own namespace),
+ * and refuses whole families of key on top of that
+ * ({@link DENIED_ATTRIBUTE_KEY_FAMILIES}).
  *
  * ## Failure contract
  *
@@ -107,18 +134,22 @@
 
 import {
   clampNonNegative,
+  DEFAULT_RESOLUTION_CONFIDENCE,
   hrTimeDurationMs,
   hrTimeToEpochMs,
+  isSourceLocation,
   isSpanId,
   isTraceId,
   newEventId,
+  normalizePosix,
   roundMs,
 } from '@debuggen/shared';
-import type { HrTime } from '@debuggen/shared';
+import type { HrTime, SourceLocation } from '@debuggen/shared';
 import { SpanKind } from '@opentelemetry/api';
 import type { ReadableSpan, TimedEvent } from '@opentelemetry/sdk-trace-base';
 
 import {
+  ALL_ATTRIBUTE_KEYS,
   attributeKeysFor,
   MAX_PREVIEW_LENGTH,
   MAX_TRACKED_KEYS,
@@ -286,6 +317,63 @@ export const FUNCTION_SPAN_MARKER_ATTRIBUTES: readonly string[] = Object.freeze(
 ]);
 
 /**
+ * The attribute keys carrying the location a reversible patch recorded, as
+ * `./span-helper.ts` leaves them on a function span.
+ *
+ * **Where the values come from.**
+ * `packages/instrumentation/src/patch/wrap-template.ts` builds the wrapper's
+ * `meta` literal from its own `PATCH_META_KEYS` — `file`, `line`, `column`,
+ * `symbol` — with `file` already normalised to a project-relative POSIX path
+ * and `line`/`column` already 1-based, because the patcher read them off the
+ * declaration it was wrapping. `./span-helper.ts` copies `meta`'s primitives
+ * onto the span it creates. So these four keys are *recorded evidence*, not an
+ * inference, which is what makes the location they describe
+ * `resolvedBy: 'patch'` — the most precise of AAP §0.4.2's four routes.
+ *
+ * Stated at this end rather than imported, for the same reason
+ * {@link FUNCTION_SPAN_MARKER_ATTRIBUTE} is: `@debuggen/telemetry` sits *below*
+ * `@debuggen/instrumentation` in the layering (AAP §0.2.2), so the dependency
+ * would be backwards. `convert.test.ts` pins these literals from this side, and
+ * `packages/instrumentation`'s own suite pins them from the other, so a rename
+ * at either end fails a test instead of silently emptying every function
+ * span's source link.
+ *
+ * `symbol` is deliberately *also* a declared `function` attribute
+ * (`../schema/attributes.ts`): it is the span's label as well as the location's,
+ * so it travels in both places. `file`, `line` and `column` are consumed into
+ * the location — see {@link SOURCE_ONLY_ATTRIBUTE_KEYS}.
+ */
+export const PATCH_SOURCE_ATTRIBUTES = Object.freeze({
+  /** Project-relative POSIX path of the patched declaration. */
+  file: 'file',
+  /** 1-based line of the patched declaration. */
+  line: 'line',
+  /** 1-based column of the patched declaration. */
+  column: 'column',
+  /** The wrapped symbol's name, as the code graph knows it. */
+  symbol: 'symbol',
+} as const);
+
+/**
+ * The patch-metadata keys a successfully built location **consumes**.
+ *
+ * `source` is the structured, validated home for a location, so repeating three
+ * fields in the attribute bag of every function span would cost bytes on the
+ * hot path for nothing, and would leave two answers to one question where a
+ * consumer could pick the unvalidated one. When the location is *rejected* they
+ * travel like any other undeclared attribute, so the malformed hint stays
+ * visible to whoever has to explain a missing source link.
+ *
+ * Exactly the rule `../browser/span-helper.ts` applies to the same metadata on
+ * the page side, so a function span means the same thing on both tiers.
+ */
+const SOURCE_ONLY_ATTRIBUTE_KEYS: ReadonlySet<string> = new Set([
+  PATCH_SOURCE_ATTRIBUTES.file,
+  PATCH_SOURCE_ATTRIBUTES.line,
+  PATCH_SOURCE_ATTRIBUTES.column,
+]);
+
+/**
  * The OpenTelemetry span-event name a recorded exception uses, and the event
  * attributes it carries.
  *
@@ -405,6 +493,369 @@ const ALIAS_KEYS: ReadonlySet<string> = new Set(
 const SERVICE_ASSIGNED_KEYS: ReadonlySet<string> = new Set(SERVICE_ASSIGNED_ATTRIBUTE_KEYS);
 
 /**
+ * Every key the product's catalog declares, for any kind, as a set.
+ *
+ * Half of the pass-through pass's **allowlist**: a key in here is one the
+ * product reasoned about — `../schema/attributes.ts` documents what it means,
+ * an aggregate or a panel node reads it, and `../redaction/*` knows how to
+ * treat it.
+ *
+ * `ALL_ATTRIBUTE_KEYS` is *not* a whitelist for the schema (that module says so
+ * itself: an event may legally carry keys outside it). It is one *here*, for
+ * this producer's pass-through decision only, which is a different question:
+ * the schema asks "is this event well-formed", and this file asks "may this
+ * process forward a value nobody reviewed".
+ */
+const DECLARED_KEYS: ReadonlySet<string> = new Set(ALL_ATTRIBUTE_KEYS);
+
+/**
+ * The other half of the allowlist: keys the product does not declare but has
+ * **reviewed**, from the vocabulary of the pinned framework, instrumentations
+ * and semantic conventions.
+ *
+ * Each one is metadata about an operation — a route shape, a host, a port, a
+ * protocol, a code location, a runtime version, a scope name — and none of them
+ * can carry a request body, a result row or a person's details, which is the
+ * standard for being on this list. A key that would be *useful* but is missing
+ * is added here, by a reviewer, rather than admitted by a rule that would let
+ * every unknown key through with it.
+ *
+ * Why an exact-key list and not a namespace rule: the leak this list closes is
+ * the *unknown* key with the *innocuous* name. `http.request.data` carrying
+ * `name=Alice&email=…` is in the `http` namespace, has no word the deny list
+ * refuses, and is one line of ordinary text — so a namespace rule, a name rule
+ * and a shape rule all admit it, and only an allowlist does not. AAP §0.5.2
+ * puts bodies and row contents outside what may be captured at all, and that is
+ * a rule about what arrives, not a hope about what a later layer recognises.
+ *
+ * Grouped by where each spelling comes from, so an upgrade is checked against
+ * one table.
+ */
+export const PASS_THROUGH_ATTRIBUTE_KEYS: readonly string[] = Object.freeze([
+  // The framework's own span vocabulary, beyond the keys the catalog declares.
+  'next.span_name',
+  'next.page',
+  'next.rsc',
+  'next.segment',
+  // The position a reversible patch recorded. Written by the product's own
+  // patch template rather than by a foreign instrumentation, and consumed into
+  // `source` when the location validates - so they are forwarded only when it
+  // did not, which is what keeps a malformed hint visible.
+  PATCH_SOURCE_ATTRIBUTES.file,
+  PATCH_SOURCE_ATTRIBUTES.line,
+  PATCH_SOURCE_ATTRIBUTES.column,
+  // HTTP and network metadata: who was talked to, over what, never what was
+  // said. The two body *sizes* are the semantic conventions' own spellings and
+  // are the `transferred_bytes` evidence AAP 0.6.6 asks for; the bodies
+  // themselves have no spelling on this list.
+  'http.scheme',
+  'http.host',
+  'http.flavor',
+  'http.request.body.size',
+  'http.response.body.size',
+  'net.transport',
+  'net.peer.name',
+  'net.peer.port',
+  'net.host.name',
+  'net.host.port',
+  'network.transport',
+  'network.protocol.name',
+  'network.protocol.version',
+  'server.address',
+  'server.port',
+  'url.scheme',
+  'url.path',
+  // Code location, which is evidence of exactly the kind this product exists to
+  // show: where an operation runs.
+  'code.function',
+  'code.function.name',
+  'code.namespace',
+  'code.filepath',
+  'code.file.path',
+  'code.lineno',
+  'code.line.number',
+  'code.column',
+  'code.column.number',
+  // The database clients' own operation vocabulary. Deliberately no
+  // connection string, no database user and no statement spelling the catalog
+  // does not already declare.
+  'db.collection.name',
+  'method',
+  'model',
+  // The SDK, the service and the process, as the pinned SDK reports them.
+  'otel.status_code',
+  'otel.status_description',
+  'otel.scope.name',
+  'otel.scope.version',
+  'otel.library.name',
+  'otel.library.version',
+  'service.name',
+  'service.version',
+  'service.instance.id',
+  'process.pid',
+  'process.runtime.name',
+  'process.runtime.version',
+  'thread.id',
+  'thread.name',
+  // Remote-call metadata, for an instrumentation that reports one.
+  'rpc.system',
+  'rpc.service',
+  'rpc.method',
+  // Exception metadata. The message and the stack arrive through pass C's
+  // `error.*` keys instead, where the redactor knows to scrub them.
+  'exception.type',
+  'exception.escaped',
+]);
+
+/** {@link PASS_THROUGH_ATTRIBUTE_KEYS} as a set. */
+const REVIEWED_KEYS: ReadonlySet<string> = new Set(PASS_THROUGH_ATTRIBUTE_KEYS);
+
+/**
+ * The namespace only this product's own code writes.
+ *
+ * `./span-helper.ts`'s marker, and any marker a sibling module adds for the
+ * exporter's capture gate to read, live under it. Admitted by prefix rather
+ * than enumerated because the writer is the product itself — nothing in this
+ * namespace comes from a foreign instrumentation, so nothing in it can be
+ * captured application data. The deny list still applies to it, which is why
+ * `convert.test.ts` sweeps the denied families through this prefix: not even
+ * the product's own namespace may carry content.
+ */
+const PRODUCT_ATTRIBUTE_PREFIX = 'debuggen.';
+
+/*
+ * ---------------------------------------------------------------------------
+ * The pass-through deny list
+ *
+ * Declared here, with the rest of the vocabulary, because it is matched on
+ * exactly like the framework names above: one table, checked in one place.
+ *
+ * It applies to pass D only, *after* the allowlist has admitted the key, so it
+ * is defence in depth over the reviewed sets rather than the thing that keeps
+ * unknown keys out — {@link isAdmissibleAttributeKey} does that. A deliberately
+ * blunt name test will always refuse something harmless, so what it costs is
+ * measured rather than assumed: across the product's whole key catalog it
+ * refuses `request_key` (which this file never emits anyway),
+ * `domContentLoaded`, `previousValue` and `nextValue` (all `navigation` and
+ * `state` keys, which are browser-tier and so never reach this Node producer),
+ * and `db.statement` — which passes A and B carry verbatim on the one kind that
+ * declares it, and which is dropped only when some *other* kind's span
+ * volunteers a statement. That is the whole of the collateral, and
+ * `convert.test.ts` holds it there twice over: every key a kind declares
+ * survives conversion of that kind, and every key of
+ * {@link PASS_THROUGH_ATTRIBUTE_KEYS} survives too, so the two tables can never
+ * drift into contradicting each other.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * Key name tokens that mark an attribute as carrying **captured content**
+ * rather than a measurement of it.
+ *
+ * The categories AAP §0.5.2 excludes outright — request and response bodies,
+ * query result rows, bound parameter values — plus the three carriers a
+ * downstream redactor can only scrub when it *recognises the key*: a header
+ * bag, a cookie, and a statement or query string. An undeclared
+ * `http.request.header.authorization` is a credential the pattern rules may
+ * well catch, but an undeclared `response.content` holding a customer record is
+ * not a pattern at all, and `env` is the whole process environment.
+ *
+ * Matched as tokens, never as substrings: see {@link tokenizeAttributeKey} for
+ * why (`cardinality` contains `card`, `keyboard` contains `key`).
+ *
+ * Exempt when the key *measures* the content instead of carrying it — see
+ * {@link MEASUREMENT_TOKENS} — so `http.request.body.size` survives while
+ * `http.request.body` does not.
+ */
+export const CONTENT_ATTRIBUTE_TOKENS: readonly string[] = Object.freeze([
+  'body',
+  'bodies',
+  'payload',
+  'content',
+  'contents',
+  'row',
+  'rows',
+  'record',
+  'records',
+  'result',
+  'results',
+  'value',
+  'values',
+  'param',
+  'params',
+  'parameter',
+  'parameters',
+  'arg',
+  'args',
+  'argument',
+  'arguments',
+  'query',
+  'statement',
+  'sql',
+  'header',
+  'headers',
+  'cookie',
+  'cookies',
+  'env',
+  'environ',
+  'environment',
+]);
+
+/**
+ * Key name tokens that mark an attribute as carrying a **credential**.
+ *
+ * Never exempted by {@link MEASUREMENT_TOKENS}: the length of a password is not
+ * evidence anybody asked for, and a "token count" is not worth the risk of
+ * admitting `auth.token`.
+ *
+ * `key` is included even though it is a generic word. The cost is a dropped
+ * cache-key attribute; the alternative cost is `api_key` reaching a model
+ * prompt, and the product's own declared keys — the ones a panel actually
+ * reads — are admitted by {@link DECLARED_KEYS} before this list is consulted
+ * at all.
+ */
+export const CREDENTIAL_ATTRIBUTE_TOKENS: readonly string[] = Object.freeze([
+  'password',
+  'passwd',
+  'pwd',
+  'secret',
+  'secrets',
+  'credential',
+  'credentials',
+  'token',
+  'tokens',
+  'apikey',
+  'key',
+  'keys',
+  'auth',
+  'authorization',
+  'authentication',
+  'bearer',
+  'jwt',
+  'signature',
+  'private',
+  'certificate',
+  'cert',
+  'salt',
+  'otp',
+  'passphrase',
+]);
+
+/**
+ * Key name tokens that mark an attribute as carrying **personal data**.
+ *
+ * The identifiers a storefront's own instrumentation attaches most readily —
+ * the signed-in customer, their contact details, their payment instrument —
+ * and the ones a developer debugging a slow checkout has no need of: the
+ * product reasons about *timing and shape*, never about whose order it was.
+ *
+ * `address` is deliberately absent: `server.address` and `net.peer.address` are
+ * hostnames of the developer's own machine and are useful in a waterfall, while
+ * a postal address is caught by `postal`, `street` and `zip`. `user` is
+ * deliberately present, which also refuses `http.user_agent` — a fingerprint
+ * this product has no use for, since a developer debugging their own page knows
+ * which browser they opened it in.
+ */
+export const PERSONAL_DATA_ATTRIBUTE_TOKENS: readonly string[] = Object.freeze([
+  'user',
+  'users',
+  'username',
+  'enduser',
+  'customer',
+  'email',
+  'mail',
+  'phone',
+  'telephone',
+  'mobile',
+  'firstname',
+  'lastname',
+  'surname',
+  'fullname',
+  'birthdate',
+  'birthday',
+  'dob',
+  'ssn',
+  'nino',
+  'passport',
+  'iban',
+  'creditcard',
+  'card',
+  'cvv',
+  'cvc',
+  'postal',
+  'postcode',
+  'street',
+  'zip',
+  'latitude',
+  'longitude',
+  'geo',
+  'gender',
+]);
+
+/**
+ * The three families, in the order a diagnostic reads best, so a caller (and
+ * `convert.test.ts`) can iterate them instead of restating the lists.
+ *
+ * `exempt` records whether {@link MEASUREMENT_TOKENS} may rescue a key of that
+ * family: a measurement *of* content is a number, while a measurement of a
+ * credential or of a person is still about the credential or the person.
+ */
+export const DENIED_ATTRIBUTE_KEY_FAMILIES: readonly {
+  readonly family: string;
+  readonly tokens: readonly string[];
+  readonly exempt: boolean;
+}[] = Object.freeze([
+  Object.freeze({ family: 'content', tokens: CONTENT_ATTRIBUTE_TOKENS, exempt: true }),
+  Object.freeze({ family: 'credential', tokens: CREDENTIAL_ATTRIBUTE_TOKENS, exempt: false }),
+  Object.freeze({ family: 'personal', tokens: PERSONAL_DATA_ATTRIBUTE_TOKENS, exempt: false }),
+]);
+
+/**
+ * Final key tokens that turn a content-family key into a measurement of the
+ * content rather than the content itself.
+ *
+ * Only as the **last** token, which is where a semantic convention puts the
+ * unit (`http.request.body.size`, `db.rows.count`). A leading or interior
+ * `size` says nothing about what the value holds (`size.body`).
+ */
+export const MEASUREMENT_TOKENS: readonly string[] = Object.freeze([
+  'size',
+  'length',
+  'count',
+  'bytes',
+  'total',
+  'duration',
+]);
+
+/** One family's tokens as a set, with the exemption that applies to it. */
+interface DeniedTokenSet {
+  /** The family's tokens, for a constant-time membership test. */
+  readonly tokens: ReadonlySet<string>;
+  /** Whether {@link MEASUREMENT_TOKENS} may rescue a key of this family. */
+  readonly exempt: boolean;
+}
+
+/** {@link DENIED_ATTRIBUTE_KEY_FAMILIES} as sets, built once at module load. */
+const DENIED_TOKEN_SETS: readonly DeniedTokenSet[] = Object.freeze(
+  DENIED_ATTRIBUTE_KEY_FAMILIES.map((entry) =>
+    Object.freeze({ tokens: new Set(entry.tokens), exempt: entry.exempt }),
+  ),
+);
+
+/** {@link MEASUREMENT_TOKENS} as a set. */
+const MEASUREMENT_TOKEN_SET: ReadonlySet<string> = new Set(MEASUREMENT_TOKENS);
+
+/**
+ * The longest attribute key this file will tokenize.
+ *
+ * A key longer than this is refused by the pass-through pass rather than
+ * examined: a name that long is not a name anybody reads, and bounding the
+ * input is what keeps the tokenizer's cost independent of what a foreign
+ * instrumentation attached.
+ */
+const MAX_ATTRIBUTE_KEY_LENGTH = 256;
+
+/**
  * The longest `name` this file emits.
  *
  * Deliberately below the event schema's own name bound — which
@@ -416,6 +867,22 @@ const SERVICE_ASSIGNED_KEYS: ReadonlySet<string> = new Set(SERVICE_ASSIGNED_ATTR
  * evidence lost for a presentation detail.
  */
 export const MAX_EVENT_NAME_LENGTH = 256;
+
+/**
+ * The longest `file` this file accepts in a source location.
+ *
+ * A path cannot be truncated — a shortened path is a *different* path, and one
+ * the editor would open at the wrong place or not at all — so an over-long
+ * value costs the location rather than being cut. The number is the one both
+ * ends of the patch contract already state:
+ * `packages/instrumentation/src/patch/wrap-template.ts`'s
+ * `MAX_META_FILE_LENGTH` (what the wrapper is allowed to emit) and
+ * `../browser/span-helper.ts`'s `MAX_SOURCE_PATH_LENGTH` (what the page tier
+ * accepts). Longer than any real project-relative path, and short enough that
+ * a foreign instrumentation setting a `file` attribute cannot push an
+ * unbounded string into the store.
+ */
+export const MAX_SOURCE_FILE_LENGTH = 512;
 
 /** An attribute bag with nothing in it, shared by the guarded readers below. */
 const EMPTY_ATTRIBUTES: Readonly<Record<string, unknown>> = Object.freeze({});
@@ -779,6 +1246,63 @@ export function isEmittableSpan(span: ReadableSpan): boolean {
   return classifySpan(span) !== null;
 }
 
+/**
+ * Which database instrumentation produced a span: `'prisma'` for the ORM's own
+ * span, `'pg'` for the driver's.
+ *
+ * The values are {@link DB_CLIENT_VALUES}, so the type a caller switches on and
+ * the `db.client` attribute a panel reads are the same two strings.
+ */
+export type DatabaseSpanSource = (typeof DB_CLIENT_VALUES)[keyof typeof DB_CLIENT_VALUES];
+
+/**
+ * The instrumentation a database span came from, or `null` when the span's
+ * scope and name identify neither.
+ *
+ * {@link classifySpan} answers with a *kind*, and `../schema/kinds.ts` has one
+ * database kind: a query is database work whether the ORM's instrumentation or
+ * the driver's reported it. That is right for rendering and wrong for gating —
+ * `server-agent.config` carries an independent `prisma` and `pg` switch (AAP
+ * §0.4.2), so a plan that asked for ORM tracing alone must not collect the
+ * driver's spans. The kind cannot express that difference, so this second,
+ * independent axis exists alongside it: `./exporter.ts` asks for the source of
+ * every `db.query` span and `./control.ts` answers whether the capture wanted
+ * it.
+ *
+ * Derived from the same evidence as the `db.client` attribute — the
+ * instrumentation scope name, then the span-name prefix — through the one
+ * function that owns that derivation, so the gate and the attribute can never
+ * disagree about which library reported a query.
+ *
+ * Never throws: a foreign span whose own getters fail answers `null`, which the
+ * gate treats as unattributable rather than as either source.
+ *
+ * @param span A finished span, normally one {@link classifySpan} called
+ * `db.query`.
+ * @returns The producing instrumentation, or `null` when it cannot be told.
+ */
+export function classifyDatabaseSource(span: ReadableSpan): DatabaseSpanSource | null {
+  try {
+    if (typeof span !== 'object' || span === null) {
+      return null;
+    }
+    const client = deriveDbClient({
+      attributes: readAttributes(span),
+      name: readSpanName(span),
+      scope: readScopeName(span),
+    });
+    if (client === DB_CLIENT_VALUES.orm) {
+      return DB_CLIENT_VALUES.orm;
+    }
+    if (client === DB_CLIENT_VALUES.driver) {
+      return DB_CLIENT_VALUES.driver;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 /*
  * ---------------------------------------------------------------------------
  * Attributes
@@ -821,6 +1345,164 @@ function isEmittableAttributeValue(value: unknown): value is string | number | b
     return true;
   }
   return typeof value === 'number' && Number.isFinite(value);
+}
+
+/**
+ * Splits an attribute key into lower-case word tokens.
+ *
+ * Both spellings an instrumentation may use are handled by one pass: the
+ * separated forms (`http.request.body`, `request_body`, `request-body`) split
+ * on the separator, and the camel-cased form (`requestBody`) splits at the
+ * lower-to-upper transition. ASCII only: a letter outside it is treated as a
+ * separator, which can only ever split a token further and so can only make the
+ * deny check *more* permissive — never a false positive on a key nobody meant.
+ *
+ * **Why tokens rather than substrings.** A substring test on short words is
+ * wrong and quietly so: `keyboard` contains `key`, `cardinality` and `discard`
+ * contain `card`, `tokenizer` contains `token`, so a deny list matched on
+ * characters would refuse a pile of harmless keys while still missing a body
+ * spelled in a way nobody enumerated. A token test answers the question the
+ * deny list actually asks — "is one of this key's *words* the name of a thing
+ * we refuse to forward".
+ *
+ * @param key An attribute key of any shape.
+ * @returns Its lower-case tokens, in order; empty for a key with no
+ * alphanumeric character at all.
+ */
+function tokenizeAttributeKey(key: string): readonly string[] {
+  const tokens: string[] = [];
+  let current = '';
+  let previousWasLowerOrDigit = false;
+
+  for (let index = 0; index < key.length; index += 1) {
+    const code = key.charCodeAt(index);
+    const isUpper = code >= 0x41 && code <= 0x5a;
+    const isLower = code >= 0x61 && code <= 0x7a;
+    const isDigit = code >= 0x30 && code <= 0x39;
+
+    if (!isUpper && !isLower && !isDigit) {
+      if (current.length > 0) {
+        tokens.push(current);
+        current = '';
+      }
+      previousWasLowerOrDigit = false;
+      continue;
+    }
+
+    if (isUpper && previousWasLowerOrDigit && current.length > 0) {
+      tokens.push(current);
+      current = '';
+    }
+
+    current += isUpper ? String.fromCharCode(code + 0x20) : key.charAt(index);
+    previousWasLowerOrDigit = isLower || isDigit;
+  }
+
+  if (current.length > 0) {
+    tokens.push(current);
+  }
+
+  return tokens;
+}
+
+/**
+ * Whether a key belongs to one of {@link DENIED_ATTRIBUTE_KEY_FAMILIES}.
+ *
+ * Every token is tested against every family, so a key in two families is
+ * refused by the stricter one: `token.count` measures a credential and is
+ * refused, while `body.count` measures content and is admitted.
+ *
+ * @param key An attribute key of any shape.
+ * @returns `true` when the key must not be forwarded.
+ */
+function isDeniedAttributeKey(key: string): boolean {
+  const tokens = tokenizeAttributeKey(key);
+  if (tokens.length === 0) {
+    return false;
+  }
+
+  const last = tokens.at(-1) ?? '';
+  const measuresRatherThanCarries = MEASUREMENT_TOKEN_SET.has(last);
+
+  for (const token of tokens) {
+    for (const family of DENIED_TOKEN_SETS) {
+      if (!family.tokens.has(token)) {
+        continue;
+      }
+      if (family.exempt && measuresRatherThanCarries) {
+        continue;
+      }
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Whether a key is one this producer is allowed to forward at all.
+ *
+ * The admission requirement of the pass-through pass, and the answer to "may
+ * this process forward a value nobody reviewed": no. Three ways to be
+ * admissible, each of them a reviewed decision rather than a shape:
+ *
+ * 1. the product's catalog declares the key ({@link DECLARED_KEYS});
+ * 2. this module's reviewed vocabulary lists it
+ *    ({@link PASS_THROUGH_ATTRIBUTE_KEYS});
+ * 3. it is in the product's own namespace
+ *    ({@link PRODUCT_ATTRIBUTE_PREFIX}), which only this product writes.
+ *
+ * Everything else is dropped — a key from a third-party instrumentation nobody
+ * has read, whatever its name and whatever its value looks like. That is the
+ * only rule that keeps a one-line request body out of the store, because a
+ * body under an innocuous name is indistinguishable from a label (see
+ * {@link PASS_THROUGH_ATTRIBUTE_KEYS} for the worked example), and AAP §0.5.2
+ * excludes bodies and row contents from what may be captured rather than from
+ * what may be displayed.
+ *
+ * @param key An attribute key of any shape.
+ * @returns `true` when the key is one a reviewer has vouched for.
+ */
+function isAdmissibleAttributeKey(key: string): boolean {
+  return (
+    DECLARED_KEYS.has(key) || REVIEWED_KEYS.has(key) || key.startsWith(PRODUCT_ATTRIBUTE_PREFIX)
+  );
+}
+
+/**
+ * Whether a string looks like a scalar label rather than serialised data.
+ *
+ * The second half of the pass-through gate, and the half the deny list cannot
+ * do: a body, a result row or a serialised record under an *innocuous* key —
+ * `cache.extra`, `vendor.detail` — is caught by its shape instead of its name.
+ * Two signals, both cheap and both one-directional (they refuse; they never
+ * admit something a name refused):
+ *
+ * - **A control character**, newline and tab included. Every label a panel
+ *   renders is one line; a value with a line break is a document.
+ * - **An opening bracket, brace, angle bracket or quote** as the first
+ *   non-space character — JSON, an array, markup or a quoted blob.
+ *
+ * Applied to the *bounded* value, so the cost is a fixed number of characters
+ * whatever a foreign instrumentation attached, and so the check describes
+ * exactly what would be emitted.
+ *
+ * @param value The bounded candidate value.
+ * @returns `true` when the value may be forwarded.
+ */
+function isScalarLabel(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code <= 0x1f || code === 0x7f) {
+      return false;
+    }
+  }
+
+  const first = value.trimStart().charCodeAt(0);
+  // `{`, `[`, `<`, `"` - the four openings of a serialised structure. `NaN`
+  // from an empty string compares false against all of them, which is right:
+  // an empty value is not a document.
+  return first !== 0x7b && first !== 0x5b && first !== 0x3c && first !== 0x22;
 }
 
 /**
@@ -998,28 +1680,51 @@ function applyDerivedAttributes(
  * every one of them at ingest, before anything is persisted, broadcast or sent
  * to a model.
  *
- * Pass D is where the bounds apply, because an attribute nobody declared is an
- * attribute nobody reasoned about: at most {@link MAX_TRACKED_KEYS} keys in
- * total, string values cut to {@link MAX_PREVIEW_LENGTH}, primitives only.
- * Declared keys are never the ones a full budget drops — the largest declared
- * set is a small fraction of the budget and it is filled first — and the
- * pass-through order is the span's own key order, so the result is
- * deterministic.
+ * Pass D is where the bounds and the privacy gate apply, because an attribute
+ * nobody reviewed is an attribute nobody reasoned about. In order: the key must
+ * be admissible ({@link isAdmissibleAttributeKey}), must not belong to a denied
+ * family ({@link isDeniedAttributeKey}), must be shorter than
+ * {@link MAX_ATTRIBUTE_KEY_LENGTH}, and — unless the catalog declares it — must
+ * carry a value that looks like a label rather than serialised data
+ * ({@link isScalarLabel}); then at most {@link MAX_TRACKED_KEYS} keys in total,
+ * string values cut to {@link MAX_PREVIEW_LENGTH}, primitives only. Declared
+ * keys are never the ones a full budget drops — the largest declared set is a
+ * small fraction of the budget and it is filled first — and the pass-through
+ * order is the span's own key order, so the result is deterministic.
+ *
+ * The gate is pass D's alone, deliberately. Passes A to C write keys the
+ * product's catalog declares, each with documented meaning, a consumer that
+ * reads it and a redaction rule that knows how to treat it: `db.statement` is
+ * scrubbed by `../redaction/sql.ts`, `url` by `../redaction/url.ts`,
+ * `db.rowCount` is a count of rows and never a row. Running the deny list over
+ * them would drop exactly the evidence the product is built to show, which is
+ * why an alias such as `db.query.text` still delivers its value — under the
+ * canonical spelling a redactor recognises.
  *
  * `request_key` can never appear: every key of
  * {@link SERVICE_ASSIGNED_ATTRIBUTE_KEYS} is filtered out of all four passes,
  * whoever set it.
+ *
+ * @param consumeSourceKeys Whether {@link SOURCE_ONLY_ATTRIBUTE_KEYS} were
+ * taken into a validated `source` and must therefore not travel here as well.
  */
 function buildAttributes(
   span: ReadableSpan,
   kind: TelemetryKind,
   facts: SpanFacts,
+  consumeSourceKeys: boolean,
 ): Record<string, unknown> {
   const result: Record<string, unknown> = {};
 
   // Pass A - the keys this kind declares, in catalog order.
   for (const key of attributeKeysFor(kind)) {
     if (SERVICE_ASSIGNED_KEYS.has(key)) {
+      continue;
+    }
+    // Consumed means consumed, whichever pass would have written it: a catalog
+    // that declares a position key for this kind must not reintroduce the
+    // second, unvalidated answer that `source` exists to replace.
+    if (consumeSourceKeys && SOURCE_ONLY_ATTRIBUTE_KEYS.has(key)) {
       continue;
     }
     const value = facts.attributes[key];
@@ -1042,7 +1747,7 @@ function buildAttributes(
   // Pass C - the derivations.
   applyDerivedAttributes(span, kind, facts, result);
 
-  // Pass D - bounded pass-through of everything the catalog does not declare.
+  // Pass D - bounded, gated pass-through of everything left.
   let emitted = Object.keys(result).length;
   for (const [key, value] of Object.entries(facts.attributes)) {
     if (emitted >= MAX_TRACKED_KEYS) {
@@ -1052,15 +1757,153 @@ function buildAttributes(
       result[key] !== undefined ||
       ALIAS_KEYS.has(key) ||
       SERVICE_ASSIGNED_KEYS.has(key) ||
+      (consumeSourceKeys && SOURCE_ONLY_ATTRIBUTE_KEYS.has(key)) ||
       !isEmittableAttributeValue(value)
     ) {
       continue;
     }
-    result[key] = typeof value === 'string' ? boundText(value, MAX_PREVIEW_LENGTH) : value;
+    // The allowlist first: a key no reviewer has vouched for is dropped
+    // whatever it is called and whatever it holds. Then the deny list, as
+    // defence in depth over the reviewed sets themselves - an unreadably long
+    // key is refused before tokenizing, which also keeps this pass's cost
+    // independent of what a foreign instrumentation attached.
+    if (!isAdmissibleAttributeKey(key)) {
+      continue;
+    }
+    if (key.length > MAX_ATTRIBUTE_KEY_LENGTH || isDeniedAttributeKey(key)) {
+      continue;
+    }
+
+    if (typeof value !== 'string') {
+      result[key] = value;
+      emitted += 1;
+      continue;
+    }
+
+    const bounded = boundText(value, MAX_PREVIEW_LENGTH);
+    // A key the catalog declares is vouched for by the catalog; anything else
+    // has to look like the label a panel would render.
+    if (!DECLARED_KEYS.has(key) && !isScalarLabel(bounded)) {
+      continue;
+    }
+    result[key] = bounded;
     emitted += 1;
   }
 
   return result;
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * Source location
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * A 1-based line or column from an attribute, or `undefined`.
+ *
+ * `sourceLocationSchema` requires an integer of at least one on both axes, so a
+ * fractional value, a zero, a negative or a numeric string is rejected here
+ * rather than turned into a plausible-looking guess. A patch records both
+ * exactly; anything else did not come from a patch.
+ */
+function readPositionAttribute(
+  attributes: Readonly<Record<string, unknown>>,
+  key: string,
+): number | undefined {
+  const value = attributes[key];
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 1) {
+    return undefined;
+  }
+  return value;
+}
+
+/**
+ * The location a reversible patch recorded for a function span, or `undefined`.
+ *
+ * **Why this file may report one at all.** AAP §0.4.2's first and most precise
+ * source route is the metadata the patcher recorded when it wrapped the
+ * function: `packages/instrumentation/src/patch/wrap-template.ts` writes a
+ * project-relative POSIX `file`, a 1-based `line` and `column` and the wrapped
+ * `symbol` into the wrapper's `meta`, and `./span-helper.ts` puts them on the
+ * span. Forwarding that is not inference — it is the position the patcher read
+ * off the declaration — and without it a server function row in a generated
+ * panel has nothing to click through to, while the identical row from the page
+ * tier has (`../browser/span-helper.ts` builds the same location there).
+ * `../aggregate/queries.ts` reads exactly this field to name the caller of a
+ * query, so the link is consumed and not decorative.
+ *
+ * **Only on `function`.** The location is vouched for by the patch, and a
+ * `function` classification means the span came from the product's own tracer
+ * scope or carried its marker — the only spans a patch can have created. A
+ * framework or driver span carrying a `file` attribute of its own says nothing
+ * about the developer's project, so no other kind is offered a location here;
+ * theirs are resolved in the service through the code graph, the route map and
+ * source maps.
+ *
+ * **All or nothing.** The candidate is validated with `@debuggen/shared`'s
+ * `isSourceLocation` — the *same* schema, refinements included, that the
+ * ingress boundary applies — rather than with a local restatement of its rules,
+ * so a location this file emits cannot be one ingest would reject. A malformed
+ * candidate omits the field and keeps the event: the timing is still evidence,
+ * and `sourceLocationSchema` would otherwise take the whole event down with the
+ * location. The three metadata keys then travel as ordinary attributes
+ * ({@link SOURCE_ONLY_ATTRIBUTE_KEYS}) so the malformed hint stays visible.
+ *
+ * Never throws: every read is guarded, and the validator is a predicate.
+ *
+ * @param kind The classified kind; only `function` can carry a patch location.
+ * @param attributes The span's attribute bag, guarded to an object.
+ * @returns A schema-valid location, or `undefined` to omit the field.
+ */
+function deriveFunctionSource(
+  kind: TelemetryKind,
+  attributes: Readonly<Record<string, unknown>>,
+): SourceLocation | undefined {
+  if (kind !== 'function') {
+    return undefined;
+  }
+
+  const file = readStringAttribute(attributes, PATCH_SOURCE_ATTRIBUTES.file);
+  if (file === undefined || file.length > MAX_SOURCE_FILE_LENGTH) {
+    return undefined;
+  }
+  // One rule stricter than `sourceLocationSchema`, and the same one
+  // `../browser/span-helper.ts` applies: the shared refinement answers "is this
+  // path safe to treat as project-relative", and `'.'` is - but a function
+  // lives in a file, never in a directory, so a path that normalises to the
+  // project root did not come from a patch.
+  if (normalizePosix(file) === '.') {
+    return undefined;
+  }
+
+  const line = readPositionAttribute(attributes, PATCH_SOURCE_ATTRIBUTES.line);
+  const column = readPositionAttribute(attributes, PATCH_SOURCE_ATTRIBUTES.column);
+  if (line === undefined || column === undefined) {
+    return undefined;
+  }
+
+  // `symbol` is optional in the schema and constrained to a non-empty string.
+  // It is bounded like any other label: the location's `file` is the part that
+  // must arrive whole, and a symbol name long enough to need cutting is a
+  // presentation detail either way.
+  const symbol = readStringAttribute(attributes, PATCH_SOURCE_ATTRIBUTES.symbol);
+
+  const candidate: SourceLocation = {
+    file,
+    line,
+    column,
+    // Omitted rather than set to `undefined`: the schema is strict about the
+    // difference and the package compiles with `exactOptionalPropertyTypes`.
+    ...(symbol === undefined ? {} : { symbol: boundText(symbol, MAX_PREVIEW_LENGTH) }),
+    resolvedBy: 'patch',
+    // The route's own confidence, from the one table that ranks the four
+    // routes, so this location sorts against the others correctly instead of
+    // carrying a number invented here.
+    confidence: DEFAULT_RESOLUTION_CONFIDENCE.patch,
+  };
+
+  return isSourceLocation(candidate) ? candidate : undefined;
 }
 
 /*
@@ -1321,55 +2164,100 @@ function resolveProducerId(candidate: string | undefined): string {
  */
 
 /**
- * A monotonic sequence counter for one producer, scoped to the capture it is
- * numbering.
+ * A monotonic sequence counter, scoped to the `(producerId, captureId)` pair
+ * the correlator orders on.
  *
- * One process is one producer, so an allocator is per process — or, in a test,
- * per fixed producer id. Sharing one allocator between two producer ids would
- * interleave their sequences and break the `(producerId, seq)` tie-breaker the
- * correlator depends on.
+ * Both halves of the scope are arguments, because both halves matter and only
+ * one of them was ever enforceable by convention. A process is normally one
+ * producer, so one allocator would do — but nothing about an allocator's
+ * ownership *proves* that, and a counter drawn from by two producer ids in turn
+ * reports each of them as a producer whose events arrived out of order: within
+ * `(producerId, captureId)` the numbers must increase, and interleaving them
+ * makes each subsequence jump forwards and backwards. Keying by the pair makes
+ * a shared allocator correct rather than merely discouraged.
  */
 export interface SeqAllocator {
   /**
-   * The next sequence number for `captureId`, starting at zero and restarting
-   * at zero whenever `captureId` differs from the previous call's.
+   * The next sequence number for `(producerId, captureId)`: zero-based within
+   * that pair, restarting at zero whenever the producer's capture changes.
    *
+   * @param producerId The producer the event will be stamped with — the
+   * *resolved* id, the one that reaches the event, never the caller's raw
+   * candidate.
    * @param captureId The active capture window's id, or `null` outside a
    * capture. `null` is a scope like any other: an event emitted outside a
    * capture is numbered in its own sequence.
    */
-  next(captureId: string | null): number;
+  next(producerId: string, captureId: string | null): number;
+}
+
+/**
+ * The number of producer ids one allocator tracks with a counter of its own.
+ *
+ * A dev-server process is one producer, and a test is a handful, so the bound
+ * is never reached in practice. It exists because the producer id arrives from
+ * a caller: an allocator lives for the whole process (`./exporter.ts`
+ * constructs one per span processor and never resets it), and a map keyed by
+ * something a caller supplies would otherwise be an unbounded structure in
+ * somebody else's dev server.
+ */
+export const MAX_TRACKED_PRODUCERS = 16;
+
+/** One producer's counter: the capture it is numbering, and the next number. */
+interface ProducerSequence {
+  /** The capture this counter is scoped to; `null` is a scope of its own. */
+  capture: string | null;
+  /** The number the next call will return. */
+  next: number;
 }
 
 /**
  * Creates a sequence allocator.
  *
- * Zero-based, and it counts *emitted events* rather than spans: a skipped span
- * consumes no number, so the sequence has no gap where a span was dropped — and
- * a gap would be harmless anyway, while going backwards would not, since `seq`
- * is what orders two events of one producer that share a millisecond (module
- * documentation).
+ * Zero-based per pair, and it counts *emitted events* rather than spans: a
+ * skipped span consumes no number, so the sequence has no gap where a span was
+ * dropped — and a gap would be harmless anyway, while going backwards would
+ * not, since `seq` is what orders two events of one producer that share a
+ * millisecond (module documentation).
  *
- * Exported so `convert.test.ts` can assert the three properties that matter —
- * strictly increasing within one capture, reset on a capture change, unaffected
- * by spans that were skipped — against an instance it owns, without the
- * module-level counter making one test depend on another.
+ * Past {@link MAX_TRACKED_PRODUCERS} distinct producers, further producers draw
+ * from one shared counter that **never restarts**. That degradation is chosen
+ * deliberately: numbers drawn from a strictly increasing counter are still
+ * strictly increasing when read per producer, so ordering — the property the
+ * correlator depends on — survives, and only the cosmetic restart-at-zero is
+ * lost. Evicting a counter instead would hand the same pair a number it had
+ * already used, which is the one failure no ordering can repair.
+ *
+ * Exported so `convert.test.ts` can assert the properties that matter — strictly
+ * increasing within one pair, reset on a capture change, independent between
+ * producers, unaffected by spans that were skipped — against an instance it
+ * owns, without the module-level counter making one test depend on another.
  */
 export function createSeqAllocator(): SeqAllocator {
-  let scoped = false;
-  let scope: string | null = null;
-  let next = 0;
+  const perProducer = new Map<string, ProducerSequence>();
+  let overflow = 0;
 
   return {
-    next(captureId: string | null): number {
-      if (!scoped || captureId !== scope) {
-        scoped = true;
-        scope = captureId;
-        next = 0;
+    next(producerId: string, captureId: string | null): number {
+      const existing = perProducer.get(producerId);
+      if (existing !== undefined) {
+        if (existing.capture !== captureId) {
+          existing.capture = captureId;
+          existing.next = 0;
+        }
+        const value = existing.next;
+        existing.next = value + 1;
+        return value;
       }
-      const value = next;
-      next += 1;
-      return value;
+
+      if (perProducer.size >= MAX_TRACKED_PRODUCERS) {
+        const value = overflow;
+        overflow = value + 1;
+        return value;
+      }
+
+      perProducer.set(producerId, { capture: captureId, next: 1 });
+      return 0;
     },
   };
 }
@@ -1416,8 +2304,10 @@ export interface ConvertContext {
   /**
    * The sequence allocator to draw from, defaulting to this process's.
    *
-   * A caller that overrides {@link producerId} should override this too: a
-   * sequence belongs to the `(producerId, captureId)` pair, not to the module.
+   * Overriding {@link producerId} without overriding this one is safe: an
+   * allocator keys its counters by the `(producerId, captureId)` pair, so two
+   * producers sharing an allocator keep separate sequences. A caller still
+   * owns one per test to keep one case's numbering out of another's.
    */
   readonly seq?: SeqAllocator | undefined;
 }
@@ -1434,11 +2324,13 @@ export interface ConvertContext {
  * range; or a foreign span object threw while being read. `./exporter.ts`
  * filters those out and counts them.
  *
- * The emitted object is exactly the ingress field set — `sessionId`,
- * `captureId`, `ingestSeq`, `source` and `redacted` are never set, and
+ * The emitted object is within the ingress field set — `sessionId`,
+ * `captureId`, `ingestSeq` and `redacted` are never set, and
  * `attributes.request_key` can never appear — because the ingress schema is
  * strict and performs no coercion: one extra key is a hard rejection of an
- * event the capture cannot recover.
+ * event the capture cannot recover. `source` is present only on a `function`
+ * span whose patch metadata validated ({@link deriveFunctionSource}), and
+ * omitted as a key otherwise.
  *
  * Never throws, whatever the span's shape.
  *
@@ -1487,10 +2379,17 @@ export function spanToIngressEvent(
       scope: readScopeName(span),
     };
 
-    const attributes = buildAttributes(span, kind, facts);
+    // Resolved before the attribute passes, because a location that validated
+    // consumes the three metadata keys it was built from, and one that did not
+    // leaves them visible as ordinary attributes.
+    const source = deriveFunctionSource(kind, facts.attributes);
+    const attributes = buildAttributes(span, kind, facts, source !== undefined);
     const derivedName = deriveName(kind, facts, attributes);
     const parentSpanId = readParentSpanId(span, ids.spanId);
     const allocator = context?.seq ?? processSeqAllocator;
+    // One value, used twice: the id stamped on the event is the id its sequence
+    // is scoped to, so the two can never describe different producers.
+    const producerId = resolveProducerId(context?.producerId);
 
     return {
       id: newEventId(),
@@ -1505,9 +2404,12 @@ export function spanToIngressEvent(
       tier,
       attributes,
       status: toStatus(span),
-      producerId: resolveProducerId(context?.producerId),
+      // Omitted, never `undefined`: the strict schema distinguishes the two,
+      // and absence means no resolver could commit to a location.
+      ...(source === undefined ? {} : { source }),
+      producerId,
       // Drawn last, so a span rejected by any check above consumes no number.
-      seq: allocator.next(context?.captureId ?? null),
+      seq: allocator.next(producerId, context?.captureId ?? null),
     };
   } catch {
     // The same contract as `classifySpan`: a span whose own getters throw is

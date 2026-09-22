@@ -55,8 +55,8 @@
  * `minmax(0, 1fr)` and `flex: 1 1 auto`, font-relative squares such as `1em`,
  * `inset(50%)`, unitless SVG geometry (for example `stroke-dasharray`), and
  * the CSS border-width keywords `thin` and `medium` — which is how a hairline
- * rule is expressed here, never as a length. Time values (`ms`, `s`) are
- * permitted for the internal motion constants declared below.
+ * rule is expressed here, never as a length. A duration is not among them: a
+ * transition or animation takes its timing from the motion tokens.
  *
  * ## Type roles
  *
@@ -80,9 +80,11 @@
  *                           (a computed offset, a lane colour). Always
  *                           consumed with a token fallback, for example
  *                           `background: var(--dgc-lane-fill, var(--dg-kind-render))`.
- *   --dgx-<name>            the internal, non-token constants declared in this
- *                           file and nowhere else. The `--dgx-` prefix exists
- *                           so nothing can be mistaken for a design token.
+ *
+ * There is no third namespace. Motion durations and easing are design tokens
+ * like every other value — `--dg-motion-duration`, `--dg-motion-easing` and
+ * `--dg-shimmer-duration` — so this file declares no custom property at all
+ * and consumes no constant the token table does not govern.
  *
  * The `dg-` prefix on every class keeps these rules from colliding with the
  * chrome of either host document, which is also why the element-level rules
@@ -112,30 +114,6 @@
  * containers, no spacing beyond zeroing user-agent defaults. Spacing and
  * alignment belong to the layout primitives in components.css.
  */
-
-/* ==========================================================================
- * Internal constants
- *
- * The token table has no motion family, so these three values are declared
- * here — once, for the whole package — under the `--dgx-` prefix that marks
- * them as internal constants rather than design tokens. Nothing else may be
- * declared in this namespace, and no `--dg-*` token may be declared at all.
- * ========================================================================== */
-
-:root {
-  /* Gap: no motion-duration token exists in the token table. Interactive state
-   * transitions use this single duration so hover, focus and selection feedback
-   * stay consistent across every component. */
-  --dgx-motion-duration: 160ms;
-
-  /* Gap: no easing token exists in the token table. Decelerating easing for
-   * state feedback that settles rather than overshoots. */
-  --dgx-motion-easing: ease-out;
-
-  /* Gap: no animation-duration token exists in the token table. One sweep of a
-   * loading skeleton's shimmer. */
-  --dgx-shimmer-duration: 1200ms;
-}
 
 /* ==========================================================================
  * Reset

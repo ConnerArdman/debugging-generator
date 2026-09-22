@@ -34,17 +34,18 @@
  * Four habits in here are deliberate.
  *
  * 1. **Refusals are proven with a double, never with a closed port.** Every
- *    case in the first three sections injects `fetchImpl`, so a refusal is
- *    observed as the *absence of a call* rather than as a request that happened
- *    to fail. A refusal that "worked" because nothing was listening would prove
- *    nothing, and no assertion could tell the two apart.
- * 2. **The pairing contract is also run over a real server.** The last section
- *    serves the same fixtures from a throwaway `node:http` listener on
- *    `127.0.0.1` and an ephemeral port — the harness the fixtures' README
- *    specifies — so the default `fetch` path, a real `Content-Length`, a real
- *    chunked body without one, a real 404 and a real refused connection are
- *    exercised rather than simulated, and "no request for `<chunk>.js.map`" is
- *    asserted from the *receiving* end. Nothing there leaves loopback.
+ *    case in this file injects `fetchImpl`, so a refusal is observed as the
+ *    *absence of a call* rather than as a request that happened to fail. A
+ *    refusal that "worked" because nothing was listening would prove nothing,
+ *    and no assertion could tell the two apart.
+ * 2. **The pairing contract is also run through full response doubles.** The
+ *    last section serves the same fixtures as real `Response` objects — an
+ *    accurate `Content-Length`, a framed `ReadableStream` body that declares no
+ *    length at all, a 404, a request that never answers and one the caller
+ *    cancels — so the *response-reading* half of the module is exercised
+ *    beside the request-shaping half. No socket is opened anywhere in this
+ *    file, and the global `fetch` is never called: transport itself belongs to
+ *    the browser and integration suites (AAP 0.8.3), which have one.
  * 3. **Exact call lists.** `expect(double.calls).toEqual([...])` rather than a
  *    call-count assertion, so a request to the wrong URL fails as loudly as an
  *    extra one.
@@ -53,13 +54,10 @@
  *    `error.code` plus `error.details.reason`, never on a caught exception.
  */
 import { readFileSync } from 'node:fs';
-import { createServer } from 'node:http';
-import type { IncomingMessage, Server, ServerResponse } from 'node:http';
-import type { Socket } from 'node:net';
 
 import type { DebuggenError, Result } from '@debuggen/shared';
 import { isErr, isOk } from '@debuggen/shared';
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'vitest';
 
 import type { FetchSourceMapOptions, SourceMapDocument, SourceMapLookup } from './fetch-map.js';
 import {
@@ -163,11 +161,18 @@ function chunkNaming(directive: string): string {
   return `globalThis.x = 1;\n//# sourceMappingURL=${directive}\n`;
 }
 
-/** What a route serves: a body string, or a factory for a specific response. */
-type Route = string | (() => Response);
-
 /** The init argument of a `fetch` call, named without reaching for a global. */
 type FetchInit = Parameters<typeof fetch>[1];
+
+/**
+ * What a route serves: a body string, or a factory for a specific response.
+ *
+ * The factory form receives the request's own `init`, which is what lets a
+ * route reproduce the two behaviours of `fetch` that a bare `Response` cannot:
+ * refusing a request whose signal is already aborted, and never answering one
+ * until its signal aborts. It may answer asynchronously for the same reason.
+ */
+type Route = string | ((init: FetchInit) => Response | Promise<Response>);
 
 /** An injected `fetch` that records every URL it was asked for. */
 interface FetchDouble {
@@ -224,26 +229,7 @@ function fetchDouble(routes: Readonly<Record<string, Route>>): FetchDouble {
     if (route === undefined) {
       return Promise.resolve(new Response('not found', { status: 404 }));
     }
-    return Promise.resolve(typeof route === 'string' ? new Response(route) : route());
-  };
-  return { calls, inits, impl };
-}
-
-/**
- * A recording `fetch` that delegates to the global one.
- *
- * For the live-server cases, where the request must really happen: the recorded
- * list then says what the module *asked* for and the harness's own log says
- * what *arrived*, so a claim about "no second request" is checked at both ends
- * of the socket rather than at one.
- */
-function recordingFetch(): FetchDouble {
-  const calls: string[] = [];
-  const inits: FetchInit[] = [];
-  const impl: typeof fetch = (input, init) => {
-    calls.push(hrefOf(input));
-    inits.push(init);
-    return globalThis.fetch(input, init);
+    return Promise.resolve(typeof route === 'string' ? new Response(route) : route(init));
   };
   return { calls, inits, impl };
 }
@@ -1013,35 +999,68 @@ describe('isSectionedSourceMap', () => {
 });
 
 // ---------------------------------------------------------------------------
-// The same pairing contract, over a real loopback dev server.
+// The same pairing contract, over full response doubles.
 //
-// Everything above injects `fetchImpl`, which is the only way to prove that a
-// refused URL produced no request at all. This section runs the pairing
-// contract the other way round: a throwaway `node:http` listener on
-// `127.0.0.1` and an ephemeral port serves the committed fixtures as inert
-// bytes — the harness the fixtures' README prescribes — and keeps its own log
-// of what it was asked for.
+// Everything above injects `fetchImpl` to prove what the module *asks for*: a
+// refused URL produces no request at all, and only an injected `fetch` can show
+// the absence of a call. This section runs the pairing contract the other way
+// round and proves what the module *does with an answer*. The committed
+// fixtures are served as real `Response` objects — an accurate
+// `Content-Length` and the right media type — alongside the answers a dev
+// server gives when something is wrong: a 404, a declared length past the
+// ceiling, a body that arrives in frames and declares no length at all, a
+// document truncated mid-array, a request that is never answered, and one the
+// caller cancels while it is in flight.
 //
-// It buys four things the doubles cannot:
+// It is socket-free on purpose. Nothing here binds a port and nothing calls the
+// global `fetch`, so the suite is hermetic: its results depend on the committed
+// bytes and on nothing else that happens to be listening on this host. The
+// transport itself — a kernel socket, keep-alive framing, a connection the
+// operating system refuses — is covered where a transport exists to exercise,
+// in the browser and integration suites of AAP 0.8.3. No case in this file
+// stands in for those, and none claims to.
 //
-//   * the **default** `fetch` path, which most cases here use by passing no
-//     `fetchImpl` at all;
-//   * real HTTP semantics — an accurate `Content-Length`, a chunked body with
-//     none, a genuine 404, a refused connection, a request never answered;
-//   * "no request for `<chunk>.js.map`" asserted from the *receiving* end,
-//     which is how the fixture README words that requirement;
-//   * proof that the fixture bytes survive a socket round trip and parse into
-//     the documents their README documents.
+// Three things the doubles have to reproduce faithfully, and do:
 //
-// Nothing here leaves loopback, nothing runs a bundler or a dev server, and
-// nothing writes to the fixture folder: the bytes are read once, in
-// `beforeAll`, and served from memory.
+//   * **A body that arrives in pieces.** `framedResponse` builds a
+//     `ReadableStream` that hands out fixed-size frames and declares no
+//     `Content-Length`, so the ceiling has to stop the read *while* the body is
+//     arriving rather than after it has been buffered. The stream records how
+//     many frames were pulled and whether it was cancelled, and the case
+//     asserts both — a partial read, not a whole one.
+//   * **`fetch`'s refusal of an aborted request.** A real `fetch` rejects
+//     rather than answering when its signal is already aborted, so
+//     `answerUnlessAborted` does too. Without that, a cancellation case would
+//     be served a document and pass for the wrong reason.
+//   * **"No request for `<chunk>.js.map`."** Asserted from the recorded call
+//     list, with every unrouted URL answering 404 — so an implementation that
+//     derived a map name from the chunk name would both leave its guess in the
+//     log and fail the lookup, exactly as it would against a dev server that
+//     does not have that file.
+//
+// The fixture bytes are read once, as bytes, and served from memory; nothing
+// here writes to the fixture folder.
 // ---------------------------------------------------------------------------
 
-/** Where the harness serves artifacts, so a relative directive resolves beside it. */
-const LIVE_CHUNK_PREFIX = '/_next/static/chunks/';
+/** Where the doubles serve artifacts, so a relative directive resolves beside it. */
+const SERVED_CHUNK_PREFIX = '/_next/static/chunks/';
 
-/** The committed artifacts the harness serves, by fixture filename. */
+/**
+ * The dev-server origin this section pins to and serves from.
+ *
+ * A fixed port is the deterministic choice now that nothing binds: there is no
+ * listener to clash with another checkout of this repository on the same host,
+ * and no ephemeral port, so every assertion below names the exact URL it
+ * expects instead of deriving it at run time. It differs from `PINNED_ORIGIN`
+ * only so that neither half of this file comes to depend on sharing one
+ * constant with the other.
+ */
+const SERVED_ORIGIN = 'http://127.0.0.1:4318';
+
+/** A loopback origin whose dev server is not running: every request is refused. */
+const UNREACHABLE_ORIGIN = 'http://127.0.0.1:4319';
+
+/** The committed artifacts these cases serve, by fixture filename. */
 const SERVED_FIXTURES: readonly string[] = [
   'webpack-basin-page.js',
   'webpack-basin-page.js.map',
@@ -1053,10 +1072,21 @@ const SERVED_FIXTURES: readonly string[] = [
   'unmapped-observatory-runtime.js',
 ];
 
+/**
+ * The bytes of those artifacts, read once at module scope.
+ *
+ * Read as bytes and served verbatim: this suite is a reader of the fixture
+ * folder and never a writer of it, and a `Buffer` is what a response body is,
+ * so nothing re-encodes the committed bytes on the way through.
+ */
+const SERVED_BODIES = new Map<string, Buffer>(
+  SERVED_FIXTURES.map((name): [string, Buffer] => [name, readFileSync(new URL(name, FIXTURE_DIR))]),
+);
+
 /** A route answering with a declared length far past any ceiling a case passes. */
 const DECLARED_OVERSIZED_CHUNK = 'declared-oversized.js';
 
-/** A chunk whose directive names the chunked, length-less oversized map below. */
+/** A chunk whose directive names the framed, length-less oversized map below. */
 const STREAMED_CHUNK = 'streamed-oversized.js';
 
 /** A map served in frames with **no** `Content-Length`, so only the read bounds it. */
@@ -1068,13 +1098,16 @@ const MALFORMED_OWNER_CHUNK = 'malformed-document.js';
 /** A `.map` route answering 200 with JSON that stops mid-array. */
 const MALFORMED_MAP = 'malformed-document.js.map';
 
+/** The truncated document that route serves: valid JSON up to the cut. */
+const TRUNCATED_DOCUMENT = '{"version":3,"sources":[';
+
 /** A route that accepts the request and never answers it. */
 const SILENT_CHUNK = 'silent.js';
 
-/** The body size both oversized routes produce. */
+/** The body size both oversized routes claim or produce. */
 const OVERSIZED_BYTES = 64 * 1024;
 
-/** How much the chunked route writes per frame, so it streams rather than buffers. */
+/** How much the framed route hands over per frame, so it streams rather than buffers. */
 const STREAM_FRAME_BYTES = 4 * 1024;
 
 /** The ceiling the oversized cases pass: small enough to be hit at the first frame. */
@@ -1083,7 +1116,7 @@ const TIGHT_MAX_BYTES = 1024;
 /** The deadline the never-answered case gives, far inside the suite's own budget. */
 const TIGHT_TIMEOUT_MS = 50;
 
-/** The filler byte the oversized routes are padded with (`x`). */
+/** The filler byte the framed route pads its frames with (`x`). */
 const PAD_BYTE = 0x78;
 
 /** The highest port number a URL can name, for the adjacent-port case below. */
@@ -1091,7 +1124,6 @@ const MAX_TCP_PORT = 65_535;
 
 const JS_MEDIA_TYPE = 'application/javascript; charset=utf-8';
 const JSON_MEDIA_TYPE = 'application/json; charset=utf-8';
-const TEXT_MEDIA_TYPE = 'text/plain; charset=utf-8';
 
 describe('the published request bounds', () => {
   it('leaves room for an inline map inside the response ceiling', () => {
@@ -1108,173 +1140,182 @@ describe('the published request bounds', () => {
   });
 });
 
-/** Sends one complete response with an accurate `Content-Length`. */
-function respond(response: ServerResponse, status: number, mediaType: string, body: Buffer): void {
-  response.writeHead(status, {
-    'content-type': mediaType,
-    'content-length': String(body.byteLength),
-  });
-  response.end(body);
+/** The URL of `name` on the served dev-server origin. */
+function servedUrl(name: string): string {
+  return `${SERVED_ORIGIN}${SERVED_CHUNK_PREFIX}${name}`;
 }
 
-describe('fetchSourceMap — against a real loopback dev server', () => {
-  /** Every path the harness was asked for, in arrival order, cleared per case. */
-  const received: string[] = [];
+/** The committed bytes of `name`, or a failure naming the artifact that is missing. */
+function bodyOf(name: string): Buffer {
+  const body = SERVED_BODIES.get(name);
+  if (body === undefined) {
+    throw new Error(`${name} is not one of the artifacts this section serves`);
+  }
+  return body;
+}
 
-  /** Requests deliberately left unanswered; their sockets are closed in teardown. */
-  const heldOpen: ServerResponse[] = [];
+/** The media type a dev server answers with for `name`. */
+function mediaTypeOf(name: string): string {
+  return name.endsWith('.map') ? JSON_MEDIA_TYPE : JS_MEDIA_TYPE;
+}
 
-  /** Every accepted socket, so teardown cannot block on a held request. */
-  const openSockets = new Set<Socket>();
-
-  /** The bytes the harness serves. Read once, never written back. */
-  const bodies = new Map<string, Buffer>();
-
-  let server: Server | undefined;
-  let liveOrigin = '';
-
-  beforeAll(async () => {
-    for (const name of SERVED_FIXTURES) {
-      // Read as bytes and served verbatim: this suite is a reader of the
-      // fixture folder and never a writer of it.
-      bodies.set(name, readFileSync(new URL(name, FIXTURE_DIR)));
-    }
-    bodies.set(STREAMED_CHUNK, Buffer.from(chunkNaming(STREAMED_MAP), 'utf8'));
-    bodies.set(MALFORMED_OWNER_CHUNK, Buffer.from(chunkNaming(MALFORMED_MAP), 'utf8'));
-    bodies.set(MALFORMED_MAP, Buffer.from('{"version":3,"sources":[', 'utf8'));
-
-    const listener = createServer((request: IncomingMessage, response: ServerResponse) => {
-      const path = request.url ?? '';
-      received.push(path);
-
-      if (!path.startsWith(LIVE_CHUNK_PREFIX)) {
-        respond(response, 404, TEXT_MEDIA_TYPE, Buffer.from('not found', 'utf8'));
-        return;
-      }
-
-      const name = path.slice(LIVE_CHUNK_PREFIX.length);
-
-      if (name === SILENT_CHUNK) {
-        // Answered by nothing, on purpose: the timeout case needs a request
-        // that stays in flight until the module's own deadline ends it.
-        heldOpen.push(response);
-        return;
-      }
-
-      if (name === DECLARED_OVERSIZED_CHUNK) {
-        respond(response, 200, JS_MEDIA_TYPE, Buffer.alloc(OVERSIZED_BYTES, PAD_BYTE));
-        return;
-      }
-
-      if (name === STREAMED_MAP) {
-        // No `Content-Length`, so Node frames this chunked and the header half
-        // of the ceiling cannot be what refuses it.
-        response.writeHead(200, { 'content-type': JSON_MEDIA_TYPE });
-        for (let written = 0; written < OVERSIZED_BYTES; written += STREAM_FRAME_BYTES) {
-          response.write(Buffer.alloc(STREAM_FRAME_BYTES, PAD_BYTE));
-        }
-        response.end();
-        return;
-      }
-
-      const body = bodies.get(name);
-      if (body === undefined) {
-        // Every unrouted path 404s, including the three map paths the fixture
-        // folder deliberately does not contain.
-        respond(response, 404, TEXT_MEDIA_TYPE, Buffer.from('not found', 'utf8'));
-        return;
-      }
-
-      respond(response, 200, name.endsWith('.map') ? JSON_MEDIA_TYPE : JS_MEDIA_TYPE, body);
-    });
-
-    listener.on('connection', (socket: Socket) => {
-      openSockets.add(socket);
-      socket.on('close', () => {
-        openSockets.delete(socket);
-      });
-    });
-
-    await new Promise<void>((resolve, reject) => {
-      listener.once('error', (error: Error) => {
-        reject(error);
-      });
-      // Loopback and port 0: never a wildcard bind, and never a fixed port a
-      // sibling checkout on this host could already own.
-      listener.listen(0, '127.0.0.1', () => {
-        resolve();
-      });
-    });
-
-    const address = listener.address();
-    if (address === null || typeof address === 'string') {
-      throw new Error('the loopback harness did not bind to a TCP port');
-    }
-
-    server = listener;
-    liveOrigin = `http://127.0.0.1:${String(address.port)}`;
+/**
+ * One complete 200 response with an **accurate** `Content-Length`.
+ *
+ * Accurate rather than omitted, because that is the header half of the module's
+ * ceiling: a response inside the ceiling has to pass it, and the case that
+ * proves the ceiling refuses an oversized *claim* declares its own length
+ * instead of using this.
+ */
+function servedResponse(body: Uint8Array, mediaType: string): Response {
+  return new Response(body, {
+    status: 200,
+    headers: { 'content-type': mediaType, 'content-length': String(body.byteLength) },
   });
+}
 
-  afterAll(async () => {
-    // Held requests first, then every socket: an unanswered request keeps its
-    // connection open, and `close` waits for connections rather than cutting
-    // them, so skipping this hangs the suite instead of ending it.
-    for (const response of heldOpen.splice(0)) {
-      response.destroy();
-    }
-    for (const socket of openSockets) {
-      socket.destroy();
-    }
-    openSockets.clear();
+/** The same, for a body given as text: the length is measured in bytes, not characters. */
+function textResponse(body: string, mediaType: string): Response {
+  return servedResponse(Buffer.from(body, 'utf8'), mediaType);
+}
 
-    const listener = server;
-    server = undefined;
-    if (listener === undefined) {
-      return;
-    }
+/** The rejection an aborted `fetch` produces, in the shape the platform produces it. */
+function abortError(): DOMException {
+  return new DOMException('The operation was aborted.', 'AbortError');
+}
 
-    await new Promise<void>((resolve, reject) => {
-      listener.close((error) => {
-        if (error) {
-          reject(error);
-          return;
-        }
-        resolve();
-      });
+/**
+ * Answers with `build()`, unless the request's signal is already aborted.
+ *
+ * `fetch` refuses an aborted request rather than serving it, and the
+ * cancellation cases turn on exactly that: a double that answered regardless
+ * would hand the module a document and let a broken signal composition pass.
+ */
+function answerUnlessAborted(init: FetchInit, build: () => Response): Promise<Response> {
+  if (init?.signal?.aborted === true) {
+    return Promise.reject(abortError());
+  }
+  return Promise.resolve(build());
+}
+
+/**
+ * A route that never answers until the request's own signal aborts it.
+ *
+ * A request made *without* a signal is rejected with a message saying so
+ * instead of hanging, so "the module bounded this itself" cannot be confused
+ * with "the module never asked to be bounded" — the timeout case asserts the
+ * recorded signal as well, and this is the half of that pair that fails fast.
+ */
+function neverAnswers(init: FetchInit): Promise<Response> {
+  const signal = init?.signal;
+  if (signal === undefined || signal === null) {
+    return Promise.reject(new Error('the module made a request with no signal'));
+  }
+  if (signal.aborted) {
+    return Promise.reject(abortError());
+  }
+  return new Promise<Response>((_resolve, reject) => {
+    signal.addEventListener('abort', () => {
+      reject(abortError());
     });
   });
+}
 
-  beforeEach(() => {
-    received.length = 0;
+/**
+ * The rejection `fetch` produces for a connection the operating system refuses.
+ *
+ * Shaped the way the runtime shapes it — a `TypeError` carrying the
+ * `ECONNREFUSED` system error as its `cause` — because this module classifies
+ * *any* rejection as `request-failed`, and a case that rejected with a bare
+ * `Error` would not show that the realistic failure is classified the same way.
+ */
+function connectionRefused(): TypeError {
+  return new TypeError('fetch failed', {
+    cause: new Error(`connect ECONNREFUSED ${new URL(UNREACHABLE_ORIGIN).host}`),
+  });
+}
+
+/** A framed, length-less response together with the log of how it was read. */
+interface FramedBody {
+  /** The response to serve. Built once, because a body can be read once. */
+  readonly response: Response;
+
+  /** How many frames draining the whole body would take. */
+  readonly frames: number;
+
+  /** What the consumer did: frames pulled, and whether it cancelled the stream. */
+  readonly log: { pulled: number; cancelled: boolean };
+}
+
+/**
+ * Builds a response whose body arrives in `frameBytes` frames and declares no
+ * length, and records how much of it the consumer pulled.
+ *
+ * This is the case the module's streaming ceiling exists for, so the evidence
+ * has to be about the *read* rather than about the outcome: a consumer that
+ * buffered the whole body and measured afterwards would produce the same
+ * refusal, and only `log.pulled` and `log.cancelled` tell the two apart.
+ */
+function framedResponse(totalBytes: number, frameBytes: number): FramedBody {
+  const frames = Math.ceil(totalBytes / frameBytes);
+  const log = { pulled: 0, cancelled: false };
+  const stream = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (log.pulled >= frames) {
+        controller.close();
+        return;
+      }
+      log.pulled += 1;
+      controller.enqueue(Buffer.alloc(frameBytes, PAD_BYTE));
+    },
+    cancel() {
+      log.cancelled = true;
+    },
   });
 
-  /** The URL of `name` on the harness's origin. */
-  function liveUrl(name: string): string {
-    return `${liveOrigin}${LIVE_CHUNK_PREFIX}${name}`;
-  }
+  return {
+    // No `content-length` at all: the header check must have nothing to go on,
+    // so that only the streaming check can refuse this body.
+    response: new Response(stream, { status: 200, headers: { 'content-type': JSON_MEDIA_TYPE } }),
+    frames,
+    log,
+  };
+}
 
-  /** The path the harness records for `name`. */
-  function livePath(name: string): string {
-    return `${LIVE_CHUNK_PREFIX}${name}`;
+/**
+ * The route table of the served dev server: every committed artifact, plus any
+ * per-case route given in `extra`.
+ *
+ * Each artifact is a factory rather than a prepared `Response` because a body
+ * can only be read once and the cache cases fetch the same chunk twice. Every
+ * URL not in the table answers 404 through {@link fetchDouble}, which is what
+ * makes "a derived `<chunk>.js.map` is never requested" observable: the guess
+ * would be answered "not found" rather than served a map.
+ */
+function servedRoutes(extra: Readonly<Record<string, Route>> = {}): Record<string, Route> {
+  const routes: Record<string, Route> = {};
+  for (const name of SERVED_FIXTURES) {
+    routes[servedUrl(name)] = (init) =>
+      answerUnlessAborted(init, () => servedResponse(bodyOf(name), mediaTypeOf(name)));
   }
+  return { ...routes, ...extra };
+}
 
-  /** Options pinned to the harness; `fetchImpl` is the global one unless overridden. */
-  function liveOptions(overrides: Partial<FetchSourceMapOptions> = {}) {
-    return {
-      devServerOrigin: liveOrigin,
-      ...overrides,
-    } satisfies FetchSourceMapOptions;
-  }
+/** Options pinned to the served origin, with the double and any overrides filled in. */
+function servedOptions(double: FetchDouble, overrides: Partial<FetchSourceMapOptions> = {}) {
+  return options(double, { devServerOrigin: SERVED_ORIGIN, ...overrides });
+}
 
-  it('pairs a chunk with its same-stem map over the default fetch path', async () => {
-    // No `fetchImpl` at all: this is the case that exercises the global `fetch`
-    // the module falls back to, over a real socket.
+describe('fetchSourceMap — reading a served dev-server response', () => {
+  it('pairs a chunk with its same-stem map and parses the document it was served', async () => {
+    const double = fetchDouble(servedRoutes());
+
     const found = expectFound(
-      await fetchSourceMap(liveUrl('webpack-basin-page.js'), liveOptions()),
+      await fetchSourceMap(servedUrl('webpack-basin-page.js'), servedOptions(double)),
     );
 
     expect(found.inline).toBe(false);
-    expect(found.mapUrl).toBe(liveUrl('webpack-basin-page.js.map'));
+    expect(found.mapUrl).toBe(servedUrl('webpack-basin-page.js.map'));
     expect(isSectionedSourceMap(found.map)).toBe(false);
     if (!isSectionedSourceMap(found.map)) {
       expect(found.map.version).toBe(3);
@@ -1286,36 +1327,34 @@ describe('fetchSourceMap — against a real loopback dev server', () => {
       expect(found.map.sourcesContent).toHaveLength(WEBPACK_MAP_SOURCES.length);
       expect(found.map.sourcesContent?.[2]).toBeNull();
     }
-    expect(received).toEqual([
-      livePath('webpack-basin-page.js'),
-      livePath('webpack-basin-page.js.map'),
+    // Both responses declared an accurate length (see `servedResponse`) and
+    // both are inside the default ceiling, so the header check passed them
+    // through instead of refusing them.
+    expect(bodyOf('webpack-basin-page.js.map').byteLength).toBeLessThan(DEFAULT_MAX_MAP_BYTES);
+    expect(double.calls).toEqual([
+      servedUrl('webpack-basin-page.js'),
+      servedUrl('webpack-basin-page.js.map'),
     ]);
   });
 
   it('requests only the map its directive names, never a same-stem guess', async () => {
-    const recorder = recordingFetch();
+    const double = fetchDouble(servedRoutes());
 
     const found = expectFound(
-      await fetchSourceMap(
-        liveUrl('turbopack-station-widget.js'),
-        liveOptions({ fetchImpl: recorder.impl }),
-      ),
+      await fetchSourceMap(servedUrl('turbopack-station-widget.js'), servedOptions(double)),
     );
 
-    expect(found.mapUrl).toBe(liveUrl('turbopack-station-widget-6f3ad91c.js.map'));
-    // Both ends of the socket: what the module asked for, and what the harness
-    // was handed. `turbopack-station-widget.js.map` does not exist in the
-    // fixture folder — the harness 404s it — so a name-deriving implementation
-    // would both fail the lookup and leave its guess in this log.
-    expect(recorder.calls).toEqual([
-      liveUrl('turbopack-station-widget.js'),
-      liveUrl('turbopack-station-widget-6f3ad91c.js.map'),
+    expect(found.mapUrl).toBe(servedUrl('turbopack-station-widget-6f3ad91c.js.map'));
+    expect(double.calls).toEqual([
+      servedUrl('turbopack-station-widget.js'),
+      servedUrl('turbopack-station-widget-6f3ad91c.js.map'),
     ]);
-    expect(received).toEqual([
-      livePath('turbopack-station-widget.js'),
-      livePath('turbopack-station-widget-6f3ad91c.js.map'),
-    ]);
-    expect(received).not.toContain(livePath('turbopack-station-widget.js.map'));
+    // `turbopack-station-widget.js.map` is not in the fixture folder, so it has
+    // no route and would be answered 404: a name-deriving implementation would
+    // both fail the lookup and leave its guess in the recorded list.
+    const derived = servedUrl('turbopack-station-widget.js.map');
+    expect(servedRoutes()[derived]).toBeUndefined();
+    expect(double.calls).not.toContain(derived);
     if (!isSectionedSourceMap(found.map)) {
       expect(found.map.file).toBe('turbopack-station-widget.js');
       // Absent on purpose: this map exercises the read-from-disk fallback.
@@ -1323,15 +1362,17 @@ describe('fetchSourceMap — against a real loopback dev server', () => {
     }
   });
 
-  it('carries a sectioned document across the wire intact', async () => {
+  it('carries a sectioned document through the response intact', async () => {
+    const double = fetchDouble(servedRoutes());
+
     const found = expectFound(
-      await fetchSourceMap(liveUrl('turbopack-gauge-route.js'), liveOptions()),
+      await fetchSourceMap(servedUrl('turbopack-gauge-route.js'), servedOptions(double)),
     );
 
     expect(isSectionedSourceMap(found.map)).toBe(true);
     if (isSectionedSourceMap(found.map)) {
       expect(found.map.sections).toHaveLength(FIXTURE_SECTION_COUNT);
-      // A transport that dropped or reordered a section would still produce a
+      // A response that dropped or reordered a section would still produce a
       // document the shape check accepts, so the offsets are asserted too.
       expect(found.map.sections.map((section) => section.offset)).toEqual(FIXTURE_SECTION_OFFSETS);
     }
@@ -1344,18 +1385,15 @@ describe('fetchSourceMap — against a real loopback dev server', () => {
     // real inline maps look like and what a prefix match on
     // `data:application/json;base64,` refuses. That is this case's point.
     expect(chunkText).toContain('data:application/json;charset=utf-8;base64,');
-    const recorder = recordingFetch();
+    const double = fetchDouble(servedRoutes());
 
     const found = expectFound(
-      await fetchSourceMap(
-        liveUrl('inline-map-basin-detail.js'),
-        liveOptions({ fetchImpl: recorder.impl }),
-      ),
+      await fetchSourceMap(servedUrl('inline-map-basin-detail.js'), servedOptions(double)),
     );
 
     expect(found.inline).toBe(true);
     // An embedded map has no URL of its own; the chunk is where it lives.
-    expect(found.mapUrl).toBe(liveUrl('inline-map-basin-detail.js'));
+    expect(found.mapUrl).toBe(servedUrl('inline-map-basin-detail.js'));
     expect(found.map).toEqual(JSON.parse(INLINE_MAP_JSON) as unknown);
     if (!isSectionedSourceMap(found.map)) {
       expect(found.map.sources).toHaveLength(1);
@@ -1363,68 +1401,127 @@ describe('fetchSourceMap — against a real loopback dev server', () => {
     }
     // One request, and it was the chunk: `inline-map-basin-detail.js.map` does
     // not exist and must never be asked for.
-    expect(recorder.calls).toEqual([liveUrl('inline-map-basin-detail.js')]);
-    expect(received).toEqual([livePath('inline-map-basin-detail.js')]);
+    expect(double.calls).toEqual([servedUrl('inline-map-basin-detail.js')]);
   });
 
   it('reports a chunk with no directive after exactly one request', async () => {
-    const result = await fetchSourceMap(liveUrl('unmapped-observatory-runtime.js'), liveOptions());
+    const double = fetchDouble(servedRoutes());
+
+    const result = await fetchSourceMap(
+      servedUrl('unmapped-observatory-runtime.js'),
+      servedOptions(double),
+    );
 
     // An `Ok`, not an `Err`: the resolver's fallback to its other three routes
     // depends on "this chunk has no map" not looking like a failure.
     expect(expectNone(result)).toBe('no-directive');
-    expect(received).toEqual([livePath('unmapped-observatory-runtime.js')]);
-    expect(received.some((path) => path.endsWith('.map'))).toBe(false);
+    expect(double.calls).toEqual([servedUrl('unmapped-observatory-runtime.js')]);
+    expect(double.calls.some((href) => href.endsWith('.map'))).toBe(false);
   });
 
   it("reports the dev server's 404 for a chunk it no longer serves", async () => {
-    const error = expectErr(await fetchSourceMap(liveUrl('evicted-chunk.js'), liveOptions()));
+    // Unrouted, so the double answers 404 — which is what a dev server does
+    // with a chunk name from a previous build.
+    const double = fetchDouble(servedRoutes());
+
+    const error = expectErr(
+      await fetchSourceMap(servedUrl('evicted-chunk.js'), servedOptions(double)),
+    );
 
     expect(error.code).toBe('DEV_SERVER_UNAVAILABLE');
     expect(error.details?.['reason']).toBe('http-status');
     expect(error.details?.['status']).toBe(404);
     expect(error.details?.['role']).toBe('chunk');
+    expect(double.calls).toEqual([servedUrl('evicted-chunk.js')]);
   });
 
-  it('refuses a real response whose declared length exceeds the ceiling', async () => {
+  it('refuses a response whose declared length exceeds the ceiling, before reading it', async () => {
+    // A declared length is a *claim*, and a one-byte body is what proves the
+    // claim alone refused this response: nothing read the body, so `bodyUsed`
+    // is still false when the refusal comes back.
+    const declared = new Response('x', {
+      status: 200,
+      headers: { 'content-type': JS_MEDIA_TYPE, 'content-length': String(OVERSIZED_BYTES) },
+    });
+    const double = fetchDouble(
+      servedRoutes({ [servedUrl(DECLARED_OVERSIZED_CHUNK)]: () => declared }),
+    );
+
     const error = expectErr(
       await fetchSourceMap(
-        liveUrl(DECLARED_OVERSIZED_CHUNK),
-        liveOptions({ maxBytes: TIGHT_MAX_BYTES }),
+        servedUrl(DECLARED_OVERSIZED_CHUNK),
+        servedOptions(double, { maxBytes: TIGHT_MAX_BYTES }),
       ),
     );
 
     expect(error.details?.['reason']).toBe('too-large');
+    expect(error.details?.['role']).toBe('chunk');
     expect(error.details?.['maxBytes']).toBe(TIGHT_MAX_BYTES);
     expect(error.details?.['observedBytes']).toBe(OVERSIZED_BYTES);
+    expect(declared.bodyUsed).toBe(false);
   });
 
-  it('stops reading a chunked body that declares no length', async () => {
+  it('stops reading a framed body that declares no length', async () => {
+    const framed = framedResponse(OVERSIZED_BYTES, STREAM_FRAME_BYTES);
+    const double = fetchDouble(
+      servedRoutes({
+        [servedUrl(STREAMED_CHUNK)]: (init) =>
+          answerUnlessAborted(init, () => textResponse(chunkNaming(STREAMED_MAP), JS_MEDIA_TYPE)),
+        [servedUrl(STREAMED_MAP)]: () => framed.response,
+      }),
+    );
+
     const error = expectErr(
-      await fetchSourceMap(liveUrl(STREAMED_CHUNK), liveOptions({ maxBytes: TIGHT_MAX_BYTES })),
+      await fetchSourceMap(
+        servedUrl(STREAMED_CHUNK),
+        servedOptions(double, { maxBytes: TIGHT_MAX_BYTES }),
+      ),
     );
 
     expect(error.details?.['reason']).toBe('too-large');
     expect(error.details?.['role']).toBe('map');
-    // Read, not declared: the harness sends no `Content-Length` for this route,
-    // so the header check cannot be what refused it, and the observed count is
-    // a partial read rather than the whole body.
+    // Read, not declared: this response carries no `Content-Length` at all, so
+    // the header check cannot be what refused it, and the observed count is a
+    // partial read rather than the whole body.
+    expect(framed.response.headers.get('content-length')).toBeNull();
     expect(error.details?.['observedBytes']).toBeGreaterThan(TIGHT_MAX_BYTES);
     expect(error.details?.['observedBytes']).toBeLessThanOrEqual(OVERSIZED_BYTES);
-    expect(received).toEqual([livePath(STREAMED_CHUNK), livePath(STREAMED_MAP)]);
+    // And it stopped *while* the body was arriving: strictly fewer frames were
+    // pulled than draining it would take, and the stream was cancelled rather
+    // than left open for the rest of the body.
+    expect(framed.frames).toBeGreaterThan(1);
+    expect(framed.log.pulled).toBeGreaterThan(0);
+    expect(framed.log.pulled).toBeLessThan(framed.frames);
+    expect(framed.log.cancelled).toBe(true);
+    expect(double.calls).toEqual([servedUrl(STREAMED_CHUNK), servedUrl(STREAMED_MAP)]);
   });
 
   it('degrades a truncated document served with a 200', async () => {
-    const error = expectErr(await fetchSourceMap(liveUrl(MALFORMED_OWNER_CHUNK), liveOptions()));
+    const double = fetchDouble(
+      servedRoutes({
+        [servedUrl(MALFORMED_OWNER_CHUNK)]: (init) =>
+          answerUnlessAborted(init, () => textResponse(chunkNaming(MALFORMED_MAP), JS_MEDIA_TYPE)),
+        [servedUrl(MALFORMED_MAP)]: (init) =>
+          answerUnlessAborted(init, () => textResponse(TRUNCATED_DOCUMENT, JSON_MEDIA_TYPE)),
+      }),
+    );
+
+    const error = expectErr(
+      await fetchSourceMap(servedUrl(MALFORMED_OWNER_CHUNK), servedOptions(double)),
+    );
 
     expect(error.code).toBe('CODE_INDEX_FAILED');
     expect(error.details?.['reason']).toBe('invalid-json');
+    expect(double.calls).toEqual([servedUrl(MALFORMED_OWNER_CHUNK), servedUrl(MALFORMED_MAP)]);
   });
 
   it('bounds a request the dev server never answers, without throwing', async () => {
+    const double = fetchDouble(servedRoutes({ [servedUrl(SILENT_CHUNK)]: neverAnswers }));
+    const startedAt = Date.now();
+
     const pending = fetchSourceMap(
-      liveUrl(SILENT_CHUNK),
-      liveOptions({ timeoutMs: TIGHT_TIMEOUT_MS }),
+      servedUrl(SILENT_CHUNK),
+      servedOptions(double, { timeoutMs: TIGHT_TIMEOUT_MS }),
     );
 
     // The contract is a `Result`, so the promise fulfils even when nothing ever
@@ -1434,96 +1531,128 @@ describe('fetchSourceMap — against a real loopback dev server', () => {
     const error = expectErr(await pending);
     expect(error.code).toBe('DEV_SERVER_UNAVAILABLE');
     expect(error.details?.['reason']).toBe('request-failed');
-    expect(received).toEqual([livePath(SILENT_CHUNK)]);
+    // The deadline this call passed is what ended it, promptly: the route
+    // answers nothing on its own, and the module's own default is two orders of
+    // magnitude longer than the lookup took.
+    expect(Date.now() - startedAt).toBeLessThan(DEFAULT_FETCH_TIMEOUT_MS);
+    // A signal was passed at all, which is the only reason the route could end
+    // the request: one made without it is rejected as such by `neverAnswers`.
+    expect(double.calls).toEqual([servedUrl(SILENT_CHUNK)]);
+    expect(double.inits[0]?.signal).toBeDefined();
   });
 
   it('refuses an already-aborted lookup promptly', async () => {
     // The caller's signal is composed with the per-request deadline, so an
     // already-aborted one must end the lookup regardless of the timeout.
+    const double = fetchDouble(servedRoutes());
+
     const error = expectErr(
       await fetchSourceMap(
-        liveUrl('webpack-basin-page.js'),
-        liveOptions({ signal: AbortSignal.abort(), timeoutMs: 60_000 }),
+        servedUrl('webpack-basin-page.js'),
+        servedOptions(double, { signal: AbortSignal.abort(), timeoutMs: 60_000 }),
       ),
     );
 
     expect(error.code).toBe('DEV_SERVER_UNAVAILABLE');
     expect(error.details?.['reason']).toBe('request-failed');
+    // This chunk has a route that serves it to any live request, so the
+    // refusal is the composed signal's doing and not a missing route.
+    expect(double.calls).toEqual([servedUrl('webpack-basin-page.js')]);
+    expect(double.inits[0]?.signal?.aborted).toBe(true);
   });
 
-  it('reports a refused connection on a loopback port with no listener', async () => {
-    // Port 1 is privileged and unbound wherever this suite runs, so the
-    // connection is refused rather than answered by something unrelated.
-    const unreachableOrigin = 'http://127.0.0.1:1';
+  it('ends an in-flight lookup when the caller aborts, ahead of its own deadline', async () => {
+    const controller = new AbortController();
+    const double = fetchDouble(servedRoutes({ [servedUrl(SILENT_CHUNK)]: neverAnswers }));
+
+    const pending = fetchSourceMap(
+      servedUrl(SILENT_CHUNK),
+      servedOptions(double, { signal: controller.signal, timeoutMs: 60_000 }),
+    );
+    controller.abort();
+
+    const error = expectErr(await pending);
+    expect(error.code).toBe('DEV_SERVER_UNAVAILABLE');
+    expect(error.details?.['reason']).toBe('request-failed');
+    // Composed, not forwarded: the signal the module passed carries both the
+    // caller's cancellation and its own deadline, which is why a minute-long
+    // timeout did not keep this request in flight.
+    const passed = double.inits[0]?.signal;
+    expect(passed).toBeDefined();
+    expect(passed).not.toBe(controller.signal);
+    expect(passed?.aborted).toBe(true);
+  });
+
+  it('reports an origin whose dev server is not running, without throwing', async () => {
+    const chunkUrl = `${UNREACHABLE_ORIGIN}${SERVED_CHUNK_PREFIX}page.js`;
+    const double = fetchDouble({ [chunkUrl]: () => Promise.reject(connectionRefused()) });
 
     const error = expectErr(
-      await fetchSourceMap(`${unreachableOrigin}/chunk.js`, {
-        devServerOrigin: unreachableOrigin,
-        timeoutMs: TIGHT_TIMEOUT_MS * 20,
-      }),
+      await fetchSourceMap(chunkUrl, options(double, { devServerOrigin: UNREACHABLE_ORIGIN })),
     );
 
     expect(error.code).toBe('DEV_SERVER_UNAVAILABLE');
     expect(error.details?.['reason']).toBe('request-failed');
-    expect(received).toEqual([]);
+    expect(error.details?.['role']).toBe('chunk');
+    // The request was attempted and refused, rather than never made: a pin the
+    // module accepted and a server that is not there are different failures.
+    expect(double.calls).toEqual([chunkUrl]);
   });
 
   it('treats a zero ceiling as the default rather than as no budget', async () => {
     // `0` is a bound that does not bound, so the module takes its default —
     // which is why a few kilobytes of fixture still resolve here.
+    const double = fetchDouble(servedRoutes());
+
     const found = expectFound(
-      await fetchSourceMap(liveUrl('webpack-basin-page.js'), liveOptions({ maxBytes: 0 })),
+      await fetchSourceMap(
+        servedUrl('webpack-basin-page.js'),
+        servedOptions(double, { maxBytes: 0 }),
+      ),
     );
 
-    expect(found.mapUrl).toBe(liveUrl('webpack-basin-page.js.map'));
+    expect(found.mapUrl).toBe(servedUrl('webpack-basin-page.js.map'));
+    expect(bodyOf('webpack-basin-page.js.map').byteLength).toBeLessThan(DEFAULT_MAX_MAP_BYTES);
   });
 
-  it('serves a repeated lookup from an injected cache over the real transport', async () => {
-    const recorder = recordingFetch();
+  it('serves a repeated lookup from an injected cache', async () => {
+    const double = fetchDouble(servedRoutes());
     const cache = createSourceMapCache();
 
     const first = expectFound(
-      await fetchSourceMap(
-        liveUrl('webpack-basin-page.js'),
-        liveOptions({ fetchImpl: recorder.impl, cache }),
-      ),
+      await fetchSourceMap(servedUrl('webpack-basin-page.js'), servedOptions(double, { cache })),
     );
     const second = expectFound(
-      await fetchSourceMap(
-        liveUrl('webpack-basin-page.js'),
-        liveOptions({ fetchImpl: recorder.impl, cache }),
-      ),
+      await fetchSourceMap(servedUrl('webpack-basin-page.js'), servedOptions(double, { cache })),
     );
 
     expect(second.map).toEqual(first.map);
     // The chunk is re-read — only it can say where its map is — and the map is
-    // not, so the harness saw two requests rather than four.
-    expect(received).toEqual([
-      livePath('webpack-basin-page.js'),
-      livePath('webpack-basin-page.js.map'),
-      livePath('webpack-basin-page.js'),
+    // not, so three requests were made rather than four.
+    expect(double.calls).toEqual([
+      servedUrl('webpack-basin-page.js'),
+      servedUrl('webpack-basin-page.js.map'),
+      servedUrl('webpack-basin-page.js'),
     ]);
     expect(cache.size).toBe(1);
   });
 
   it('refuses a chunk on a different port of this same host, with no request', async () => {
-    // The pin under real conditions: the harness is listening, and a URL one
-    // port away from it is still refused before any socket is opened.
-    const recorder = recordingFetch();
-    const neighbour = new URL(liveUrl('webpack-basin-page.js'));
-    // One port along from the harness's own — inside the ephemeral range, so it
-    // can belong to nothing this host reserves, and unequal to the pin, which
-    // is the only property the refusal turns on.
-    const adjacent = Number(neighbour.port);
-    neighbour.port = String(adjacent === MAX_TCP_PORT ? adjacent - 1 : adjacent + 1);
+    // The pin against a served origin: every artifact resolves on
+    // `SERVED_ORIGIN`, and a URL one port away from it is still refused before
+    // any request is made.
+    const double = fetchDouble(servedRoutes());
+    const neighbour = new URL(servedUrl('webpack-basin-page.js'));
+    // One port along from the served origin's own, clamped so the URL stays
+    // legal wherever that constant sits. Inequality with the pin is the only
+    // property the refusal turns on.
+    const servedPort = Number(neighbour.port);
+    neighbour.port = String(servedPort === MAX_TCP_PORT ? servedPort - 1 : servedPort + 1);
 
-    const error = expectErr(
-      await fetchSourceMap(neighbour.href, liveOptions({ fetchImpl: recorder.impl })),
-    );
+    const error = expectErr(await fetchSourceMap(neighbour.href, servedOptions(double)));
 
     expect(error.code).toBe('FORBIDDEN_ORIGIN');
     expect(error.details?.['reason']).toBe('origin-mismatch');
-    expect(recorder.calls).toEqual([]);
-    expect(received).toEqual([]);
+    expect(double.calls).toEqual([]);
   });
 });

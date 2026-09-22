@@ -44,6 +44,18 @@
  * entirely rather than set to anything. {@link buildRenderAttributes} is where
  * that happens.
  *
+ * Which of the two a render is gets decided **per fiber**, from whether React
+ * holds a previous fiber for it: no `alternate` is a `mount`, an `alternate`
+ * an `update`. That is deliberately not what bippy's traversal did. It diffed
+ * each root against the last fiber tree it had seen for that root, so the
+ * first commit observed after the hook was subscribed was walked as a whole
+ * *mount pass* — a capture armed on an already-rendered page opened with a
+ * baseline commit that reported updates as mounts and, by the rule above,
+ * withheld every `trigger`, which is exactly the evidence an excessive-render
+ * question is asked about. The first commit this module observes now reports
+ * the update it actually is, and a fiber React has genuinely just created is
+ * still a mount.
+ *
  * ## Division of labour
  *
  * This module owns the *subscription* and the *events*. It deliberately owns
@@ -84,8 +96,23 @@
  * attached to it, and removing it would break the page and the real React
  * DevTools extension alongside it. Unsubscribing the handlers is what AAP
  * 0.5.1 asks for ("bippy handlers unsubscribed via the function `instrument()`
- * returned"), and it is complete: after a detach this module holds no
- * subscription, no counts and no fiber tree, and a commit costs one comparison.
+ * returned"), and it is complete: after a detach this module observes nothing,
+ * holds no counts and no fiber tree, and a commit costs one comparison.
+ *
+ * The one thing a detach may *not* do is throw away the means of finishing.
+ * `instrument()`'s release is the only handle that can remove the handlers it
+ * installed, so a release that fails leaves them installed — and a dropped
+ * handle would leave them installed for the life of the document, with a later
+ * {@link attachReact} stacking a second subscription on top and doubling every
+ * commit event. The handle is therefore *retained* until a call to it returns
+ * normally, the next detach retries it, and the observing flag that gates the
+ * callbacks is separate from it so a failed release still stops every event
+ * (AAP 0.5.1). The failure itself is reported as an `agent.error`
+ * `producer-failure` frame rather than merely counted, because a capture that
+ * lost a signal must be a capture known to have lost it (AAP 0.5.5), and the
+ * subscription it left behind stays readable through {@link hasReactResidue},
+ * so `./agent.js` can name it in the announcement it makes after every detach
+ * instead of concluding that everything was released.
  *
  * ## Cost, and why the hot path looks the way it does
  *
@@ -95,22 +122,34 @@
  * - Host fibers are skipped immediately (`isCompositeFiber`). A commit touches
  *   several times more DOM fibers than components, none of which a
  *   `renderTable` reader wants, and each one would cost an event.
- * - The traversal already yields only fibers that performed work — that is what
- *   `traverseRenderedFibers` means, and bippy's walkers gate on the same
- *   `PerformedWork` flag `didFiberRender` reads — so no second per-fiber
- *   confirmation is made. It would be redundant work on the busiest path in
- *   the agent.
+ * - **The walk is this module's own**, iterative and bounded on both axes.
+ *   bippy's `traverseRenderedFibers` recurses over the whole changed subtree
+ *   and ignores what its callback returns, so there is no way to ask it to
+ *   stop: bounding the *events* a commit produces would leave the *walk*
+ *   unbounded on the developer's click path, which is a cost this file may not
+ *   hand them. {@link collectRenders} therefore keeps an explicit stack, emits
+ *   a fiber when bippy's own `isCompositeFiber` and `didFiberRender` (React's
+ *   `PerformedWork` flag) both hold, and descends into a fiber's children only
+ *   when it has no `alternate` — everything below it is new — or its `child`
+ *   pointer differs from that alternate's, which is React having reconciled
+ *   those children. Identical pointers mean React reused the subtree and
+ *   nothing inside it rendered. That is the pruning React DevTools performs,
+ *   and it is what keeps an update commit proportional to the subtree that
+ *   changed rather than to the whole tree.
  * - Renders are collected into drafts and handed over in **one**
  *   {@link emitMany} call after the traversal: one capture gate, consecutive
  *   sequence numbers, and — the reason for the ordering — a commit event whose
  *   `renderCount` is the exact count rather than an estimate made before the
  *   work was done. The commit draft leads that batch, so the parent's sequence
  *   number precedes its children's.
- * - A commit is bounded at {@link MAX_RENDERS_PER_COMMIT} render events. The
- *   demo's seeded defect 2 re-renders 48 catalogue cards on a 250 ms ticker
+ * - A commit is bounded twice: at {@link MAX_RENDERS_PER_COMMIT} render events
+ *   and at {@link MAX_FIBER_VISITS_PER_COMMIT} fibers visited. The demo's
+ *   seeded defect 2 re-renders 48 catalogue cards on a 250 ms ticker
  *   (AAP 0.8.2); one pathological commit must not consume the transport's
- *   whole 5 000-event buffer. The commit event says it was cut, and
- *   `renderedFiberCount` says by how much.
+ *   whole 5 000-event buffer, and — this is what the second bound buys — must
+ *   not consume an unbounded slice of the commit phase either. The commit
+ *   event says it was cut, and `renderedFiberCount` says how much of it was
+ *   counted.
  * - Nothing here sorts, clones, stringifies or retains application values.
  *
  * ## Nothing here throws, ever
@@ -123,12 +162,18 @@
  * and swallowed, which is the same contract `./transport.js`, `./state.js` and
  * `./perf.ts` keep.
  *
- * One consequence of bippy's traversal worth knowing when reading a capture:
- * it diffs each root against the last fiber tree it saw for that root, so the
- * **first commit observed after the hook starts being traversed is walked as a
- * mount pass**. A capture armed on an already-rendered page therefore opens
- * with a baseline commit reporting mounts, and — by the rule above — no
- * triggers. Every commit after it is a true update.
+ * Swallowed is not silent. Every one of those guards also calls
+ * `./transport.js`'s {@link reportProducerFailure}, which posts a bounded
+ * `agent.error` frame naming this producer, the stage that failed and the
+ * thrown value's type — never a prop, a state value or an error message. One
+ * frame per source per capture is the whole budget
+ * (`MAX_PRODUCER_FAILURE_REPORTS`), so a render storm that fails on every
+ * commit costs one frame rather than one per commit, and that bound lives in
+ * the transport: nothing here rate-limits, because two independent limiters
+ * would each be reasoning about half the traffic. Without the reports a
+ * capture could lose every render event — the entire evidence base for "why is
+ * this component rendering so many times?" (AAP 0.8.4) — while both UIs showed
+ * a capture that had succeeded, which AAP 0.5.5 forbids.
  *
  * Nothing observable happens at import time: the bindings are declared and the
  * first subscription is made only when {@link attachReact} runs. Module scope
@@ -152,6 +197,7 @@
  */
 
 import {
+  didFiberRender,
   getDisplayName,
   getFiberId,
   getRDTHook,
@@ -159,7 +205,6 @@ import {
   instrument,
   isCompositeFiber,
   traverseFiber,
-  traverseRenderedFibers,
 } from 'bippy';
 import type { Fiber, FiberRoot } from 'bippy';
 
@@ -170,9 +215,8 @@ import { resolveEventContext } from './interaction.js';
 import type { EventContext } from './interaction.js';
 import { recordStateTransitions } from './state.js';
 import type { RecordTransitionsInput } from './state.js';
-import { emitMany, nowEpochMs, toEpochMs } from './transport.js';
+import { emitMany, nowEpochMs, reportProducerFailure, toEpochMs } from './transport.js';
 import type { EventDraft } from './transport.js';
-import { RENDER_PHASES } from '../schema/attributes.js';
 import type {
   COMMIT_ATTRIBUTE_KEYS,
   RENDER_ATTRIBUTE_KEYS,
@@ -187,9 +231,13 @@ import type {
  * Exported because each is part of a contract a caller or a test reasons
  * about — a panel's "list was cut" banner is only honest if the bound that cut
  * it can be named, and `./agent.js` passes the tree bounds through from the
- * service's request. None is a tuning knob: raising the per-commit bound
+ * service's request. None is a tuning knob: raising the per-commit bounds
  * raises what one commit may cost the developer's page, and raising the tree
  * bounds raises what one snapshot event carries.
+ *
+ * One constant here is *not* exported — the visited-to-emitted ratio the two
+ * visit bounds are derived from. It is an input to those contracts rather than
+ * a contract itself, and it sits here so both walks read the same number.
  * ---------------------------------------------------------------------------
  */
 
@@ -205,9 +253,51 @@ import type {
  *
  * A commit that reaches the bound still reports the truth about itself: the
  * `truncated` attribute says the list was cut and `renderedFiberCount` says
- * how many fibers actually rendered.
+ * how many rendered fibers the walk counted. It bounds the *events*, not the
+ * walk — {@link MAX_FIBER_VISITS_PER_COMMIT} is what bounds the walk.
  */
 export const MAX_RENDERS_PER_COMMIT = 500;
+
+/**
+ * How many fibers a bounded walk may visit per fiber it is allowed to emit: 16.
+ *
+ * Host, text, fragment and offscreen fibers are stepped over rather than
+ * emitted, so a walk legitimately visits several times more fibers than it
+ * reports — a card of six DOM elements around one component, say. Sixteen is
+ * generous for that ratio and still bounds a walk absolutely, which is what
+ * keeps a DOM-heavy page from turning a commit traversal, or a snapshot, into
+ * the expensive part of the work it is observing.
+ *
+ * Stated once because the two bounded walks in this file justify it the same
+ * way: {@link MAX_FIBER_VISITS_PER_COMMIT} derives from it, and
+ * {@link snapshotComponentTree} multiplies its node budget by it. Two numbers
+ * would drift apart.
+ */
+const MAX_VISITS_PER_EMITTED_FIBER = 16;
+
+/**
+ * The most fibers one commit's traversal may visit: 8 000, which is
+ * {@link MAX_RENDERS_PER_COMMIT} × {@link MAX_VISITS_PER_EMITTED_FIBER}.
+ *
+ * The event bound above stops drafts being built; it does not stop the walk,
+ * which would otherwise keep descending through the developer's tree inside
+ * React's commit phase. This is the bound on the walk itself, and it is what
+ * makes a commit cost the page a predictable amount whatever the tree looks
+ * like. A commit stopped by it reports `truncated`, exactly as one cut by the
+ * event bound does, and `renderedFiberCount` is then the count as far as the
+ * walk got.
+ *
+ * It is also how the traversal terminates on a malformed or hand-built
+ * structure whose `child`/`sibling` links form a cycle. The commit callback is
+ * far too hot for the `Set` of visited fibers {@link snapshotComponentTree}
+ * can afford, and a bound on visits needs no such memory; React's own trees
+ * never contain a cycle.
+ *
+ * Exported for the same reason as its neighbours: a panel that tells the
+ * developer a render list was cut is only honest if the bound that cut it can
+ * be named.
+ */
+export const MAX_FIBER_VISITS_PER_COMMIT = MAX_RENDERS_PER_COMMIT * MAX_VISITS_PER_EMITTED_FIBER;
 
 /**
  * The most ancestor names a render's `ownerChain` may carry: 8.
@@ -412,8 +502,9 @@ const KEY_RENDERER_ID = 'rendererId';
 const KEY_PRIORITY = 'priority';
 
 /**
- * Set to `true` on a commit whose render list was cut at
- * {@link MAX_RENDERS_PER_COMMIT}.
+ * Set to `true` on a commit that either of the two per-commit bounds cut:
+ * {@link MAX_RENDERS_PER_COMMIT} render events, or
+ * {@link MAX_FIBER_VISITS_PER_COMMIT} fibers visited.
  *
  * **Addition**, spelled `truncated` — the same spelling `./state.ts` uses for
  * the same kind of statement, and at the same level: it describes the *list*,
@@ -422,12 +513,18 @@ const KEY_PRIORITY = 'priority';
 const KEY_TRUNCATED = 'truncated';
 
 /**
- * How many fibers the commit rendered, before any bound was applied.
+ * How many rendered fibers the traversal counted, before the event bound was
+ * applied.
  *
  * **Addition**, spelled `renderedFiberCount`. It is the difference between
  * "this commit rendered 500 components" and "this commit rendered 8 000 and we
  * reported 500 of them", which is a conclusion a reader would otherwise draw
  * wrongly from a truncated list.
+ *
+ * Counting continues past {@link MAX_RENDERS_PER_COMMIT}, so for every commit
+ * the walk completed this is the exact total. Where the walk was stopped by
+ * {@link MAX_FIBER_VISITS_PER_COMMIT} it is the count as far as the walk got,
+ * which is a lower bound; `truncated` is on the commit in both cases.
  */
 const KEY_RENDERED_FIBER_COUNT = 'renderedFiberCount';
 
@@ -489,21 +586,27 @@ export interface ComponentTreeNode {
  * diagnostics view and for `./agent.js`'s readiness frames to read often.
  *
  * - `commits` — commits observed. Stops growing after {@link detachReact},
- *   which is the observable proof that the subscription was released.
+ *   which is the observable form of a capture that has stopped observing.
  * - `renders` — `render` events handed to `./transport.js`.
- * - `truncatedCommits` — commits whose render list was cut at
- *   {@link MAX_RENDERS_PER_COMMIT}. Non-zero means a panel's render list is
- *   incomplete for those commits, which the events themselves also say.
- * - `failures` — commit bodies or per-fiber iterations that failed and were
- *   swallowed. Never the page's fault to fix; a non-zero value is this
- *   module's bug report.
+ * - `truncatedCommits` — commits cut by {@link MAX_RENDERS_PER_COMMIT} or by
+ *   {@link MAX_FIBER_VISITS_PER_COMMIT}. Non-zero means a panel's render list
+ *   is incomplete for those commits, which the events themselves also say.
+ * - `failures` — commit bodies, per-fiber iterations, teardown steps or a
+ *   subscription release that failed and was swallowed. Never the page's fault
+ *   to fix; a non-zero value is this module's bug report, and every one of
+ *   them is also stated on the channel as an `agent.error` `producer-failure`
+ *   frame (AAP 0.5.5), bounded by `./transport.js`.
+ *
+ * Four numbers, and the set is closed: whether a release is still outstanding
+ * is internal state that shows up in behaviour — a retried release, no second
+ * subscription — rather than in a field a reader would have to interpret.
  */
 export interface ReactStats {
   /** Commits observed since the last reset. */
   commits: number;
   /** `render` events emitted since the last reset. */
   renders: number;
-  /** Commits whose render list was cut by the per-commit bound. */
+  /** Commits cut by either per-commit bound. */
   truncatedCommits: number;
   /** Swallowed failures, per commit body or per fiber. */
   failures: number;
@@ -543,15 +646,18 @@ interface PendingTransitions {
 
 /** What one commit's traversal produced. */
 interface CommitTally {
-  /** The render drafts, in traversal order, bounded by the per-commit cap. */
+  /** The render drafts, in traversal order, bounded by the event bound. */
   readonly drafts: EventDraft[];
   /** The transitions to hand to `./state.js` once the drafts are away. */
   readonly transitions: PendingTransitions[];
-  /** How many composite fibers rendered, before the cap was applied. */
+  /**
+   * How many composite fibers the walk found had rendered, counted past the
+   * event bound and therefore the true total for a walk that completed.
+   */
   readonly renderedFibers: number;
   /** How many of those were mounts, for the commit's phase summary. */
   readonly mounts: number;
-  /** Whether the cap stopped the list short. */
+  /** Whether either per-commit bound stopped the walk or the list short. */
   readonly truncated: boolean;
 }
 
@@ -575,24 +681,71 @@ interface ProfiledFiber {
  * ---------------------------------------------------------------------------
  * Module state
  *
- * One page document's worth. Every field is cleared by {@link detachReact},
- * because AAP 0.5.1 requires a cleared hook to be disabled rather than idled:
- * afterwards this module holds no subscription, no counts and no reference
- * into the developer's fiber tree.
+ * One page document's worth. {@link detachReact} clears every field, because
+ * AAP 0.5.1 requires a cleared hook to be disabled rather than idled:
+ * afterwards this module holds no counts and no reference into the developer's
+ * fiber tree, and observes nothing.
+ *
+ * {@link subscriptionRelease} — together with
+ * {@link subscriptionReleaseFailed}, which says whether a call to it ever
+ * returned — is the single exception, and only while a release has failed. See
+ * their own documentation, and the module documentation's note on why the
+ * handle outlives the detach that could not use it.
  * ---------------------------------------------------------------------------
  */
 
-/** Whether the commit handlers are subscribed right now. */
-let attached = false;
+/**
+ * Whether the commit handlers are *observing* right now.
+ *
+ * Deliberately not "whether a subscription exists": the two are different
+ * facts, and conflating them is what let a failed release be mistaken for a
+ * completed one. This flag is the gate every handler body checks and the value
+ * {@link isReactAttached} reports, so clearing it is sufficient to make a
+ * capture stop producing events — whatever the state of the subscription
+ * underneath.
+ */
+let armed = false;
 
 /**
- * The function `instrument()` returned, kept so the handlers can be released.
+ * The function `instrument()` returned, **retained until calling it succeeds**.
+ *
+ * It is the only thing that can remove the handlers `instrument()` installed
+ * (AAP 0.5.1), which makes dropping it unrecoverable: bippy's release deletes
+ * this module's entry from the set every commit is dispatched to, so an
+ * un-released subscription keeps calling into this module for the life of the
+ * document and a fresh `instrument()` would add a *second* entry — two
+ * dispatches per commit, every event doubled. So the handle is cleared only by
+ * a call that returned normally. Until then {@link detachReact} retries it on
+ * every call and {@link attachReact} re-arms *this* subscription instead of
+ * making another.
  *
  * Typed as a plain callable rather than as bippy's `Unsubscribe` (which also
  * declares `Symbol.dispose`) because calling it is the entire use, and the
  * narrower type cannot be mistaken for a disposable this module manages.
  */
-let unsubscribe: (() => void) | undefined;
+let subscriptionRelease: (() => void) | undefined;
+
+/**
+ * Whether the last release attempt on {@link subscriptionRelease} failed to
+ * return — the one fact that tells a *live* subscription apart from one a
+ * detach could not get rid of.
+ *
+ * The handle alone cannot make that distinction, and neither can {@link armed}:
+ * an armed capture holds the handle on purpose, and {@link attachReact} re-arms
+ * *through* a handle a failed release left behind, so a predicate reading only
+ * those two would call a working subscription residue or miss residue the
+ * re-arm path adopted. This flag records the release itself: {@link detachReact}
+ * sets it before it calls the handle — the pessimistic order, because a call
+ * that never returns proves nothing — and clears it only from inside a call
+ * that did return. It is what {@link hasReactResidue} reads, and it exists
+ * because AAP 0.5.1 requires an incomplete cleanup to be visible rather than
+ * assumed complete.
+ *
+ * `false` while nothing has been released yet, which is the honest answer
+ * before the first {@link attachReact} and during a capture: no release has
+ * failed, so no handler of this module's is outliving a detach.
+ */
+let subscriptionReleaseFailed = false;
 
 /**
  * Renders per component name, for the current capture.
@@ -668,21 +821,6 @@ function boundedString(value: unknown, limit: number): string | undefined {
     return undefined;
   }
   return value.length > limit ? value.slice(0, limit) : value;
-}
-
-/**
- * A member of the catalog's phase vocabulary, or `undefined`.
- *
- * bippy's traversal phase is `mount | unmount | update` while the product's
- * `RENDER_PHASES` is `mount | update` — deliberately, since an unmounted fiber
- * renders nothing and so has no render to phase. A phase outside the
- * vocabulary is therefore not a failure to count but a fiber to skip.
- */
-function asRenderPhase(value: unknown): RenderPhase | undefined {
-  if (typeof value !== 'string') {
-    return undefined;
-  }
-  return RENDER_PHASES.find((phase) => phase === value);
 }
 
 /**
@@ -986,8 +1124,66 @@ function buildRenderAttributes(
 }
 
 /**
+ * Queue one fiber's children for the commit walk, in fiber order.
+ *
+ * Pushed in reverse because the pending list is a stack: that is what makes
+ * the emitted events read parent before child, with siblings in the order
+ * React holds them, which is the order `../aggregate/renders.ts` rebuilds a
+ * component tree from.
+ *
+ * The sibling scan is bounded by the visits the walk has left over what is
+ * already queued. A fiber queued past that point could never be visited —
+ * {@link MAX_FIBER_VISITS_PER_COMMIT} stops the walk first — so scanning on
+ * could only cost time, and the bound is also what keeps a hand-built
+ * `sibling` chain that loops from spinning here rather than at the walk's own
+ * bound.
+ *
+ * @param fiber The fiber whose children are to be walked.
+ * @param pending The walk's stack, pushed in place.
+ * @param visitBudget How many more fibers the walk may hold and visit.
+ * @returns `true` when the sibling list was longer than the budget, which is a
+ * truncation the commit event has to report.
+ */
+function queueCommitChildren(fiber: Fiber, pending: Fiber[], visitBudget: number): boolean {
+  const children: Fiber[] = [];
+  let child: Fiber | null = fiber.child;
+  while (child !== null && children.length < visitBudget) {
+    children.push(child);
+    child = child.sibling;
+  }
+  for (let index = children.length - 1; index >= 0; index -= 1) {
+    const entry = children[index];
+    if (entry !== undefined) {
+      pending.push(entry);
+    }
+  }
+  return child !== null;
+}
+
+/**
  * One commit's traversal: a draft per rendered composite fiber, and the state
  * transitions to hand on afterwards.
+ *
+ * The walk is product-owned, iterative and bounded on both axes, for the
+ * reason the module documentation gives: bippy's `traverseRenderedFibers`
+ * recurses through the whole changed subtree and discards whatever its
+ * callback returns, so bounding the drafts left the walk itself unbounded
+ * inside React's commit phase. Three rules define it, and they are chosen to
+ * emit exactly the set of fibers bippy's walkers emitted:
+ *
+ * - **Emission.** `isCompositeFiber` keeps host, text, fragment and offscreen
+ *   fibers out — the same fibers bippy filtered, and a commit touches several
+ *   times more of them than it renders — and `didFiberRender` is React's
+ *   `PerformedWork` flag, which is what "rendered in this commit" means. Both
+ *   readings go through the renderer's work-tag map inside bippy and throw for
+ *   a fiber whose renderer it does not recognise, which is why they sit inside
+ *   the per-fiber `try`.
+ * - **Phase.** No `alternate` is a `mount`, an `alternate` an `update`, per
+ *   fiber rather than per pass.
+ * - **Descent.** Into the children when the fiber has no `alternate`
+ *   (everything below it is new) or its `child` pointer differs from that
+ *   alternate's (React reconciled them). Identical pointers mean React reused
+ *   the subtree, so nothing in it rendered and there is nothing to find.
  *
  * Every per-fiber body is inside its own `try`, which is the point of the loop
  * being written this way: a component whose props throw from a getter, or a
@@ -1008,19 +1204,60 @@ function collectRenders(
   let mounts = 0;
   let truncated = false;
 
-  traverseRenderedFibers(root, (fiber, rawPhase) => {
+  const rootFiber = readRootFiber(root);
+  if (rootFiber === undefined) {
+    // A root React has torn down, or one mid-teardown: there is no tree to
+    // walk, and the commit event is still worth emitting without renders.
+    return { drafts, transitions, renderedFibers, mounts, truncated };
+  }
+
+  // Seeded with the committed tree's root fiber and never its siblings: a
+  // `HostRoot` has none, and `readRootFiber` has already resolved whichever
+  // of the two shapes the hook was handed.
+  const pending: Fiber[] = [rootFiber];
+  let visits = 0;
+
+  while (pending.length > 0) {
+    const fiber = pending.pop();
+    if (fiber === undefined) {
+      break;
+    }
+
+    visits += 1;
+    if (visits > MAX_FIBER_VISITS_PER_COMMIT) {
+      // The walk's own bound, and the reason a commit costs the page a
+      // predictable amount: the event bound below stops drafts, this stops
+      // work. It is also what terminates a cyclic hand-built structure, which
+      // is why this hot path carries no set of visited fibers.
+      truncated = true;
+      break;
+    }
+
     try {
-      if (!isCompositeFiber(fiber)) {
-        // Host fibers — the DOM nodes React committed — are not components and
-        // would swamp the render table many times over.
-        return;
+      // The descent decision is taken before this fiber's own readings, which
+      // are the ones that can throw: two pointer comparisons cost nothing,
+      // and a subtree kept when one hostile fiber above it failed is evidence
+      // that would otherwise be lost for a reason the developer cannot see.
+      const previous: Fiber | null = fiber.alternate ?? null;
+      if (previous === null || fiber.child !== previous.child) {
+        if (
+          queueCommitChildren(fiber, pending, MAX_FIBER_VISITS_PER_COMMIT - visits - pending.length)
+        ) {
+          truncated = true;
+        }
       }
-      const phase = asRenderPhase(rawPhase);
-      if (phase === undefined) {
-        // `unmount` and anything else outside the catalog's vocabulary: a
-        // fiber that rendered nothing has no render to report.
-        return;
+
+      if (!isCompositeFiber(fiber) || !didFiberRender(fiber)) {
+        // Not a component, or a component React did not render in this commit:
+        // either way there is no render to report, and its children have
+        // already been queued above.
+        continue;
       }
+
+      // React keeps the previous fiber of an instance as its `alternate`, so
+      // the absence of one is this instance's first render. Annotated so the
+      // literal is held to the catalog's vocabulary, which `RenderPhase` is.
+      const phase: RenderPhase = previous === null ? 'mount' : 'update';
 
       renderedFibers += 1;
       if (phase === 'mount') {
@@ -1028,12 +1265,13 @@ function collectRenders(
       }
 
       if (drafts.length >= MAX_RENDERS_PER_COMMIT) {
-        // Counting continues past the bound so `renderedFiberCount` is the
-        // true total rather than "at least the cap", which is the difference
-        // between a reader concluding "500 components rendered" and "8 000
-        // did, and 500 are listed".
+        // Counting continues past the event bound so `renderedFiberCount` is
+        // the true total rather than "at least the cap", which is the
+        // difference between a reader concluding "500 components rendered" and
+        // "8 000 did, and 500 are listed". The walk carries on under the visit
+        // bound, and stops there.
         truncated = true;
-        return;
+        continue;
       }
 
       const component = componentNameOf(fiber);
@@ -1086,10 +1324,14 @@ function collectRenders(
               : undefined,
         });
       }
-    } catch {
+    } catch (error) {
       failureCount += 1;
+      // One fiber's worth of the commit is missing from the render table, and
+      // the report is what keeps that absence from reading as "this component
+      // did not render".
+      reportProducerFailure('react', 'commit-traversal', error);
     }
-  });
+  }
 
   return { drafts, transitions, renderedFibers, mounts, truncated };
 }
@@ -1179,15 +1421,37 @@ function buildCommitDraft(
 }
 
 /**
- * The root's current fiber, read defensively.
+ * The fiber tree the hook was handed, read defensively.
  *
- * A `FiberRoot` from React always has one; a hand-built root in a test, or a
- * root mid-teardown, may not, and the commit event is still worth emitting
- * without the root's timings.
+ * Two shapes, resolved the way bippy's own traversal resolved them: a
+ * `FiberRoot` carries the tree on `current`, while a renderer with no root
+ * object would hand the callback the root *fiber* itself. A container with a
+ * `current` property is therefore read through it, and one without is taken to
+ * be the fiber. The second case is defensive — bippy's installed hook reads
+ * `root.current` before it dispatches, so nothing reaching these handlers
+ * through it can be a bare fiber — and it costs one `in` check on a path that
+ * runs once per commit.
+ *
+ * A `FiberRoot` from React always has a current fiber; a hand-built root in a
+ * test, or a root mid-teardown, may not, and the commit event is still worth
+ * emitting without the root's timings and without renders. The single reader
+ * is shared by the commit walk, the commit event's timings, the unmount
+ * housekeeping and {@link snapshotComponentTree}, so all four agree on what
+ * the tree is.
  */
 function readRootFiber(root: FiberRoot): Fiber | undefined {
   try {
-    const current: unknown = (root as { current?: unknown }).current;
+    // Cast through a nullable structural type rather than asserted upon: the
+    // value arrives from the page's React, so "is it even an object" is a
+    // question that has to be asked before `in` can be.
+    const container = root as unknown as { current?: unknown } | null;
+    if (container === null || typeof container !== 'object') {
+      return undefined;
+    }
+    if (!('current' in container)) {
+      return container as unknown as Fiber;
+    }
+    const current: unknown = container.current;
     return current !== null && typeof current === 'object' ? (current as Fiber) : undefined;
   } catch {
     return undefined;
@@ -1226,8 +1490,9 @@ function flushTransitions(context: EventContext, pending: readonly PendingTransi
         input.lineageAttributes = context.attributes;
       }
       recordStateTransitions(input);
-    } catch {
+    } catch (error) {
       failureCount += 1;
+      reportProducerFailure('react', 'state-transitions', error);
     }
   }
 }
@@ -1265,9 +1530,11 @@ function flushTransitions(context: EventContext, pending: readonly PendingTransi
  */
 function onCommitFiberRoot(rendererId: number, root: FiberRoot, priority: unknown): void {
   try {
-    if (!attached) {
+    if (!armed) {
       // A batch already in flight when the hooks were cleared must produce
-      // nothing: AAP 0.5.1 asks for a disabled hook, not an idle one.
+      // nothing — and so must every commit after a release that failed, which
+      // is why the gate is a flag of its own rather than "a handle exists".
+      // AAP 0.5.1 asks for a disabled hook, not an idle one.
       return;
     }
 
@@ -1299,8 +1566,13 @@ function onCommitFiberRoot(rendererId: number, root: FiberRoot, priority: unknow
     emitMany([commitDraft, ...tally.drafts]);
 
     flushTransitions(context, tally.transitions);
-  } catch {
+  } catch (error) {
     failureCount += 1;
+    // The whole commit is missing: no commit event, no render events, and
+    // therefore no evidence of a render storm the developer is asking about.
+    // Reporting it is the difference between a capture that lost its renders
+    // and a capture that appears to have observed none (AAP 0.5.5).
+    reportProducerFailure('react', 'commit', error);
   }
 }
 
@@ -1316,6 +1588,13 @@ function onCommitFiberRoot(rendererId: number, root: FiberRoot, priority: unknow
  * would leave that commit's renders parented to a span that was never emitted.
  * A commit event that is certainly present and slightly narrower than the
  * truth beats an exact one that sometimes never arrives.
+ *
+ * It is the one handler with no `try`/`catch` and no failure report, because
+ * an empty body has nothing to contain and nothing to lose: a guard here would
+ * be a `catch` no input can reach and a stage no reader would ever see. Any
+ * work added to this function must arrive with a guard and a
+ * `reportProducerFailure('react', 'post-commit', …)` call, like its two
+ * siblings.
  */
 function onPostCommitFiberRoot(): void {
   /* Intentionally empty; see the documentation above. */
@@ -1345,8 +1624,9 @@ function onCommitFiberUnmount(_rendererId: number, fiber: Fiber): void {
     if (readRootFiber(root) === fiber) {
       releaseRoot();
     }
-  } catch {
+  } catch (error) {
     failureCount += 1;
+    reportProducerFailure('react', 'unmount', error);
   }
 }
 
@@ -1359,17 +1639,6 @@ function onCommitFiberUnmount(_rendererId: number, fiber: Fiber): void {
  * overflow inside a capture would be this module crashing their page.
  * ---------------------------------------------------------------------------
  */
-
-/**
- * How many fibers one snapshot may visit per node it is allowed to emit.
- *
- * Host fibers are stepped over rather than emitted, so a walk legitimately
- * visits several times more fibers than it reports — a card of six DOM
- * elements around one component, say. Sixteen is generous for that ratio and
- * still bounds the walk absolutely, which is what keeps a DOM-heavy page from
- * turning a snapshot into the expensive part of stopping a capture.
- */
-const MAX_TREE_VISITS_PER_NODE = 16;
 
 /** What the synthetic container node is called when the root has no name. */
 const DEFAULT_ROOT_LABEL = 'ReactRoot';
@@ -1496,7 +1765,7 @@ function buildTree(
   const seen = new Set<Fiber>([rootFiber]);
   let visits = 0;
   let nodeCount = 1;
-  const maxVisits = maxNodes * MAX_TREE_VISITS_PER_NODE;
+  const maxVisits = maxNodes * MAX_VISITS_PER_EMITTED_FIBER;
 
   queueChildren(rootFiber, container, 1, frames, maxNodes);
 
@@ -1551,6 +1820,34 @@ function buildTree(
  */
 
 /**
+ * Run one teardown step, contained and reported.
+ *
+ * The reason {@link detachReact} is a list of these rather than one `try` over
+ * the whole body: with a single guard the first step that throws skips every
+ * step after it, and a detach that stopped halfway would leave the render
+ * counts of a finished capture — or a reference into the developer's fiber
+ * tree — behind while reporting nothing. One guard per step makes every step
+ * independent of its neighbours' luck.
+ *
+ * No step is assumed safe. This code runs in the page's own world, where
+ * `Map.prototype.clear` and the subscription's own release function belong to
+ * the developer's page and can have been replaced by anything, so the uniform
+ * guard costs one `try` and removes a class of failure rather than a line.
+ *
+ * @param stage The step's short, stable identifier, for the failure report.
+ * @param step The step. Whatever it throws is counted and reported, never
+ * propagated: `./agent.js` calls this on the capture-stop path.
+ */
+function detachStep(stage: string, step: () => void): void {
+  try {
+    step();
+  } catch (error) {
+    failureCount += 1;
+    reportProducerFailure('react', stage, error);
+  }
+}
+
+/**
  * Subscribe to React's commit hook.
  *
  * Called by `./agent.js` when an `agent.config` arms the React hook. Does
@@ -1558,87 +1855,187 @@ function buildTree(
  * before React loaded, and is the precondition this module cannot create for
  * itself (see the module documentation).
  *
- * Idempotent: a second call while attached returns without touching the
- * subscription, which matters because a service-worker reconnect re-sends the
- * configuration mid-capture and re-subscribing would double every event.
+ * Three cases, in this order, and the middle one is the repair:
+ *
+ * 1. **Already observing** — return without touching the subscription. A
+ *    service-worker reconnect re-sends the configuration mid-capture, and
+ *    re-subscribing would double every event.
+ * 2. **A retained release** ({@link subscriptionRelease} set while not armed)
+ *    — a previous {@link detachReact} could not release the handlers, so they
+ *    are *still installed and still dispatching into this module*. Re-arming
+ *    the gate is therefore all that is needed, and calling `instrument()`
+ *    again would add a second subscription on top of the first: two dispatches
+ *    per commit, every render event duplicated.
+ * 3. **Neither** — subscribe, and keep the handle.
  *
  * Cannot throw. A page with no hook, or one whose hook belongs to the real
  * React DevTools extension in a shape bippy declines to patch, leaves this
- * module detached and the agent's other hooks unaffected.
+ * module detached and the agent's other hooks unaffected; the failure is
+ * counted and reported as `producer-failure` (AAP 0.5.5).
  */
 export function attachReact(): void {
   try {
-    if (attached) {
+    if (armed) {
+      return;
+    }
+
+    if (subscriptionRelease !== undefined) {
+      // Case 2: the handlers are already installed. Arming the gate resumes
+      // observation through the subscription that was never released.
+      armed = true;
       return;
     }
 
     // Published before `instrument` returns, so a commit dispatched during
     // registration — React can commit at any moment — finds the module
-    // attached rather than dropping its batch.
-    attached = true;
+    // observing rather than dropping its batch.
+    armed = true;
 
-    unsubscribe = instrument({
+    subscriptionRelease = instrument({
       name: 'debuggen',
       onCommitFiberRoot,
       onPostCommitFiberRoot,
       onCommitFiberUnmount,
     });
-  } catch {
-    // Registration failed, so no handler can fire: leave no claim behind.
-    attached = false;
-    unsubscribe = undefined;
+  } catch (error) {
+    // `instrument()` threw, so it returned no handle and there is nothing to
+    // retain: no handler of this module's can fire, and leaving a claim behind
+    // would make the next call take the repair path with no subscription to
+    // repair.
+    armed = false;
+    subscriptionRelease = undefined;
     failureCount += 1;
+    reportProducerFailure('react', 'subscribe', error);
   }
 }
 
 /**
- * Release the subscription and forget everything this capture observed.
+ * Stop observing, forget everything this capture observed, and release the
+ * subscription.
  *
- * Calls the function `instrument()` returned, which removes exactly the
- * handlers {@link attachReact} registered (AAP 0.5.1), then clears the render
- * counts, the retained root and the counters. Afterwards a commit costs one
- * comparison and this module holds no observation of the developer's page.
+ * The order is the contract:
+ *
+ * 1. **Stop observing.** The gate the handlers check is cleared first, so a
+ *    commit delivered during the teardown — or one delivered for ever after,
+ *    because the release below failed — produces nothing. AAP 0.5.1 asks for a
+ *    disabled hook, not an idle one, and this is the part of that guarantee
+ *    that cannot fail.
+ * 2. **Forget.** The counters, the per-component render counts and the
+ *    retained fiber root, each in its own guard (see {@link detachStep}), so
+ *    one failing step never skips the rest.
+ * 3. **Release.** Call the function `instrument()` returned, which removes
+ *    exactly the handlers {@link attachReact} registered (AAP 0.5.1). On
+ *    success the handle is dropped and this module holds nothing at all.
+ *    **On failure the handle is kept**: it is the only way those handlers can
+ *    ever be removed, the next call to this function retries it, and
+ *    {@link attachReact} re-arms through it rather than stacking a second
+ *    subscription. The failure is counted in {@link getReactStats} and posted
+ *    as an `agent.error` `producer-failure` frame, so an incomplete cleanup is
+ *    stated rather than assumed complete (AAP 0.5.5).
  *
  * The DevTools hook itself is left installed, on purpose: React is already
  * attached to it and the real React DevTools extension may be using it too, so
  * removing it would break both. What the developer removes by ending a session
  * is the *capture*, and an installed hook with no subscribers observes nothing.
  *
- * Safe to call when already detached, and cannot throw.
+ * Safe to call when already detached, safe to call repeatedly — which is what
+ * makes the retry above reachable — and cannot throw.
  */
 export function detachReact(): void {
-  const release = unsubscribe;
+  // Step 1. Not guarded because a boolean assignment cannot fail, which is
+  // exactly why the flag and the handle are separate pieces of state.
+  armed = false;
 
-  // Cleared first, so a commit delivered while the handlers are being removed
-  // finds the module detached and returns.
-  attached = false;
-  unsubscribe = undefined;
+  // Step 2. The counters go first, so a failure in a later step is still
+  // visible in `getReactStats().failures` after this call returns.
+  detachStep('reset-stats', () => {
+    commitCount = 0;
+    renderEventCount = 0;
+    truncatedCommitCount = 0;
+    failureCount = 0;
+  });
+  detachStep('clear-counts', () => {
+    componentRenderCounts.clear();
+  });
+  detachStep('release-root', releaseRoot);
 
-  try {
-    release?.();
-  } catch {
-    // A hook that throws on unsubscribe has already stopped dispatching to
-    // these handlers; the reference is dropped either way.
-    failureCount += 1;
+  // Step 3. Read once: a release that succeeds must clear the same handle it
+  // was taken from, and a release that throws must leave it in place.
+  const release = subscriptionRelease;
+  if (release === undefined) {
+    return;
   }
 
-  componentRenderCounts.clear();
-  releaseRoot();
-  commitCount = 0;
-  renderEventCount = 0;
-  truncatedCommitCount = 0;
-  failureCount = 0;
+  // Assumed failed until the call proves otherwise, for the same reason the
+  // handle is kept until then: a release that throws — or one this module never
+  // gets an answer from — leaves the handlers installed, and the interval
+  // between the two assignments below is the only place a truthful residue
+  // answer can come from (see {@link subscriptionReleaseFailed}).
+  subscriptionReleaseFailed = true;
+
+  detachStep('release', () => {
+    release();
+    // Only a call that returned normally proves the handlers are gone.
+    subscriptionRelease = undefined;
+    subscriptionReleaseFailed = false;
+  });
 }
 
 /**
- * Whether the commit handlers are subscribed right now.
+ * Whether the commit handlers are *observing* right now.
  *
  * `./agent.js` reports it in the readiness and status frames the DevTools
  * panel shows. "Attached" is this folder's uniform vocabulary for an armed
- * hook.
+ * hook, and this answer is about observation alone: `false` after a detach,
+ * including a detach whose release failed. The residue of such a detach is the
+ * retained handle {@link detachReact} will retry, reported by
+ * {@link hasReactResidue} — never a flag claiming an observation that is not
+ * happening.
  */
 export function isReactAttached(): boolean {
-  return attached;
+  return armed;
+}
+
+/**
+ * Whether this module still holds a bippy subscription its last detach could
+ * not release.
+ *
+ * The counterpart of {@link isReactAttached}, and a second function rather than
+ * a different answer from that one, because they answer different questions.
+ * "Attached" is this folder's word for *observing*, and a subscription whose
+ * release failed observes nothing — {@link armed} is cleared first, by design.
+ * So `./agent.js` needs both: its readiness and status frames say what is being
+ * recorded, while the `hooks-not-released` announcement it posts after asking
+ * every producer to detach has to name what survived those calls. Deriving that
+ * from {@link isReactAttached} would answer the observation question and
+ * conclude that everything was released — which AAP 0.5.1 does not allow, since
+ * a cleared hook must be disabled rather than idled and a cleanup that did not
+ * complete has to be visible rather than assumed.
+ *
+ * `true` means {@link detachReact} called the function `instrument()` returned
+ * and that call did not return normally, so bippy's entry for this module is
+ * still in the set every commit is dispatched to: the handlers are installed,
+ * they are inert (every one of them gates on {@link armed}), and only a later
+ * release can remove them. `false` means no release is outstanding — before the
+ * first {@link attachReact}, after a detach whose release returned, and after a
+ * retry that finally succeeded.
+ *
+ * **An armed subscription is not residue.** During a capture the handle is held
+ * on purpose, so this is `false` for as long as this module is observing. That
+ * includes the re-arm: {@link attachReact}, finding a retained handle while not
+ * armed, adopts *that* subscription — arming the gate again rather than calling
+ * `instrument()` a second time, which would put two entries in the dispatch set
+ * and double every render event — and from that moment the handlers are a live
+ * subscription again rather than residue. They become residue again the moment a
+ * detach cannot release them, which is why the outstanding-release fact lives in
+ * its own field ({@link subscriptionReleaseFailed}) instead of being guessed
+ * from the handle or from the gate.
+ *
+ * Reports state and changes none: two boolean reads, one reference read, and it
+ * cannot throw, so `./agent.js` may call it on every disarm.
+ */
+export function hasReactResidue(): boolean {
+  return !armed && subscriptionReleaseFailed && subscriptionRelease !== undefined;
 }
 
 /**
@@ -1712,8 +2109,11 @@ export function snapshotComponentTree(options?: {
     }
 
     return buildTree(rootFiber, root, maxNodes, maxDepth);
-  } catch {
+  } catch (error) {
     failureCount += 1;
+    // `undefined` reads as "no tree to report", which is also the answer for a
+    // page that never committed; the report is what distinguishes the two.
+    reportProducerFailure('react', 'tree-snapshot', error);
     return undefined;
   }
 }

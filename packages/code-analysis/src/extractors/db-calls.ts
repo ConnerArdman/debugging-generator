@@ -75,8 +75,12 @@
  *    alias-aware and extensionless-aware), module-specifier re-exports are
  *    followed up to {@link MAX_RESOLUTION_HOPS} hops with a cycle guard, and
  *    construction discovery is applied to the declaration found there. A
- *    namespace import is followed the same way, with the first member of the
- *    access chain treated as the exported name (`ns.pool.query(…)`).
+ *    namespace *import* is followed the same way, with the first member of the
+ *    access chain treated as the exported name (`ns.pool.query(…)`); a
+ *    namespace *export* (`export * as store from './pg'`) re-exports no
+ *    individual name and is deliberately not followed, so a handle reached only
+ *    through a namespace object is a miss rather than a guess — see
+ *    {@link collectExportDeclaration}.
  * 3. **Borrowed client.** A variable initialised from
  *    `await <poolHandle>.connect()` is a connection borrowed from a pool: a
  *    `.query(…)` on it is a pooled-driver call, and a later `.release()` on it
@@ -184,8 +188,8 @@
  * spelling in brackets:
  *
  * 1. the innermost addressable declaration that is a module-level,
- *    function-valued declaration carrying a plain `export` keyword, in a module
- *    that is neither a route/page module nor a component module → its
+ *    function-valued declaration **leaving its module as a function**, in a
+ *    module that is neither a route/page module nor a component module → its
  *    **`server-function`** node (`./server-functions.ts`);
  * 2. any other addressable declaration — module-level, or a member of a
  *    module-level class → its **`symbol`** node (`./symbols.ts`);
@@ -194,11 +198,27 @@
  *    call site with no enclosing declaration is still connected rather than
  *    silently unreachable.
  *
- * The server-function branch is taken only for that unambiguous shape, for the
- * asymmetry `./api-calls.ts` names: a `symbol` node exists for every
- * module-level declaration, while a `server-function` node exists only where
- * the sibling extractor agreed, so `export { f }`, `export default` and a
- * component or route module fall through to the `symbol` step — a disagreement
+ * "Leaving its module as a function" is the **export surface** and not the
+ * `export` keyword, because the surface is what the node's existence follows:
+ * `./server-functions.ts` emits a `server-function` node for every exported
+ * module-level function of a server module *as resolved through that module's
+ * export surface*, which includes `export { load }`, `export { load as read }`,
+ * `export default load` and `export default async () => {}` as much as
+ * `export async function load()`. Asking only about the keyword would send the
+ * calls of a clause-exported or default-exported service function to a `symbol`
+ * node while its `server-function` node sat unused — a legal edge starting at a
+ * node a developer does not look for, and the service function missing from
+ * `pathBetween`'s terminal hop. {@link collectExportedFunctions} is the whole
+ * of that rule, mirroring the sibling's collection shape by shape, and
+ * {@link ModuleFacts.exportedFunctions} is how a declaration is matched against
+ * it — by identity, so a shadowing local of the same name cannot answer for it.
+ *
+ * The asymmetry `./api-calls.ts` names governs everything the surface does not
+ * settle: a `symbol` node exists for every module-level declaration, while a
+ * `server-function` node exists only where the sibling extractor agreed, so a
+ * route/page module's exports (framework entry points), a component module's
+ * (components), a class member (whose name space is its class's) and a
+ * declaration holding no function keep their `symbol` owner — a disagreement
  * costs the edge rather than degrading it. Component-module detection is
  * correspondingly **permissive** for the same reason: over-answering can only
  * move an edge from `server-function` to `symbol`, both of which exist.
@@ -263,11 +283,14 @@ import type {
   CallExpression,
   ClassDeclaration,
   ClassExpression,
+  ExportAssignment,
   ExportDeclaration,
+  FunctionDeclaration,
   ImportDeclaration,
   SourceFile,
   TaggedTemplateExpression,
   TypeNode,
+  VariableStatement,
 } from 'ts-morph';
 
 import { isSafeRelativePath } from '@debuggen/shared';
@@ -805,19 +828,27 @@ interface ImportedBinding {
   readonly exportName: string;
 }
 
-/** One module-specifier re-export clause, in source order. */
+/**
+ * One module-specifier re-export clause, in source order.
+ *
+ * A named clause (`export { store } from './pg'`) or an **unqualified** star
+ * (`export * from './pg'`). The qualified star `export * as store from './pg'`
+ * is not one of these and is never recorded — see
+ * {@link collectExportDeclaration}.
+ */
 interface ReexportClause {
   /** The declaration, kept so its specifier can be resolved lazily. */
   readonly declaration: ExportDeclaration;
 
-  /** The name this clause exports, or `undefined` for a star re-export. */
+  /** The name this clause exports, or `undefined` for an unqualified star. */
   readonly exportedAs: string | undefined;
 
   /**
    * The name to look for in the target module, which differs from
    * {@link ReexportClause.exportedAs} for `export { local as Public } from` and
-   * is `'default'` for `export { default as Public } from`. `undefined` for a
-   * star re-export, where the looked-up name is whatever the caller asked for.
+   * is `'default'` for `export { default as Public } from`. `undefined` for an
+   * unqualified star, where the looked-up name is whatever the caller asked
+   * for.
    */
   readonly sourceName: string | undefined;
 }
@@ -880,7 +911,7 @@ interface DiscoveryState {
  * What the file under extraction's own syntax says, for the owner cascade.
  *
  * Computed **lazily**, on the first database call site found: most modules of a
- * project hold none, and both answers cost a walk of the tree.
+ * project hold none, and every answer here costs a walk of the tree.
  */
 interface ModuleFacts {
   /**
@@ -895,6 +926,23 @@ interface ModuleFacts {
    * **permissively** — see {@link declaresComponentName}.
    */
   readonly componentModule: boolean;
+
+  /**
+   * The module's **exported-function identity set**: the start offsets of the
+   * module-level declarations that leave this module as functions, however they
+   * leave it — see {@link collectExportedFunctions}.
+   *
+   * A start offset is the key because it identifies a node *within one source
+   * file* exactly: `Node#getStart()` is that node's offset into the file's
+   * text, two distinct nodes of one file that begin at the same offset are
+   * always in an ancestor relationship (a statement and its first child), and
+   * the only kinds compared here — a module-level function declaration, a
+   * module-level variable declarator, an export assignment and, negatively, a
+   * class member — can never stand in that relationship to one another. Both
+   * sides of the comparison are read from `ctx.sourceFile`, the file under
+   * extraction, so the offsets are always in the same text.
+   */
+  readonly exportedFunctions: ReadonlySet<number>;
 }
 
 /** The node a `queries` edge starts at, and the symbol it lends the call site. */
@@ -918,10 +966,11 @@ interface Owner {
  * declarations and members of module-level class declarations — and
  * {@link addressableDeclarationOf} is the whole of this module's knowledge of
  * it. The anchor is the node whose start position that extractor records, which
- * is the declaration's name node in every case but the two it spells
+ * is the declaration's name node in every case but the three it spells
  * differently: a nameless default-exported function (recorded as `default` at
- * the declaration's own start) and a constructor (recorded as `constructor` at
- * the member's own start).
+ * the declaration's own start), a default-exported function *expression*
+ * (recorded as `default` at the expression's own start) and a constructor
+ * (recorded as `constructor` at the member's own start).
  */
 interface AddressableDeclaration {
   /** The name the declaration is recorded under. */
@@ -933,8 +982,19 @@ interface AddressableDeclaration {
   /** Whether the declaration holds a function, which a `server-function` node requires. */
   readonly functionValued: boolean;
 
-  /** Whether it carries a plain `export` keyword — not `export default`, not a clause. */
-  readonly plainlyExported: boolean;
+  /**
+   * The declaration's own start offset — its identity within the file under
+   * extraction, and the key {@link declaredOwner} looks up in
+   * {@link ModuleFacts.exportedFunctions} to decide whether this declaration
+   * leaves the module as a function.
+   *
+   * The *declaration's* offset and not the anchor's: a function-valued
+   * declarator is anchored at its name but identified as the declarator, which
+   * is the node the export surface is collected from. For a class member it is
+   * recorded all the same and simply never matches, because
+   * {@link collectExportedFunctions} collects module-level declarations only.
+   */
+  readonly declarationStart: number;
 
   /** Whether it is a class member, which can never be a module export. */
   readonly classMember: boolean;
@@ -1280,6 +1340,237 @@ function containsJsx(sourceFile: SourceFile): boolean {
 }
 
 /**
+ * The start offsets of the module-level declarations that leave this module
+ * **as functions** — its exported-function identity set, and the whole of the
+ * `server-function` step's evidence.
+ *
+ * A `server-function` node exists for a declaration exactly when
+ * `./server-functions.ts` resolved it through its module's *export surface*, so
+ * that surface — not the `export` keyword — is what the cascade has to ask
+ * about. The forms collected here are the forms that extractor collects, and
+ * the reason each one counts:
+ *
+ * - a module-level **function declaration** exported by keyword
+ *   (`export function load() {}`), by `export default`
+ *   (`export default function load() {}`, and the nameless
+ *   `export default function () {}`), or named by a local export clause
+ *   (`export { load }`, `export { load as read }`, `export { load as default }`);
+ * - a module-level **function-valued variable declarator** exported by keyword
+ *   (`export const load = async () => {}`) or named by a local export clause,
+ *   judged by {@link isFunctionValued} so that the two extractors read one
+ *   initialiser the same way;
+ * - the identifier form `export default load`, which exports a declaration
+ *   written elsewhere in the module;
+ * - `export default <function expression>`, where the export statement *is* the
+ *   declaration — see {@link addressableDeclarationOf} for the one shape of it
+ *   this module claims.
+ *
+ * Two passes, because a clause or a default assignment may precede the
+ * declaration it names: the first records every module-level function under its
+ * declared name and marks the keyword and `export default` exports, the second
+ * applies the clause and default intents to the names they resolve to. A clause
+ * carrying a module specifier (`export { load } from './x'`) declares nothing
+ * local and is ignored; a type-only clause or specifier exports no value and is
+ * ignored by {@link collectExportDeclaration} itself. `export =` is a
+ * TypeScript-only form no ECMAScript import can bind.
+ *
+ * What is deliberately **not** collected is a declaration that is exported but
+ * is not a function (a `const` holding a handle, a class), because the
+ * `server-function` step also requires {@link AddressableDeclaration.functionValued},
+ * and a class member, which shares its class's name space rather than the
+ * module's.
+ *
+ * @param sourceFile The file under extraction.
+ * @returns The start offsets of its exported functions.
+ */
+function collectExportedFunctions(sourceFile: SourceFile): ReadonlySet<number> {
+  const exported = new Set<number>();
+
+  /** Declared name → the start offset of the module-level function it names. */
+  const declared = new Map<string, number>();
+  const clauses: { readonly localName: string; readonly exportedAs: string }[] = [];
+  const defaultIntents: string[] = [];
+
+  // Filled by the shared clause reader and discarded with this walk: a
+  // module-specifier re-export names a *target module's* binding, so it can
+  // never mark a declaration of this file.
+  const foreignReexports: ReexportClause[] = [];
+
+  for (const statement of sourceFile.getStatements()) {
+    if (Node.isFunctionDeclaration(statement)) {
+      collectExportedFunctionDeclaration(statement, declared, exported);
+
+      continue;
+    }
+
+    if (Node.isVariableStatement(statement)) {
+      collectExportedDeclarators(statement, declared, exported);
+
+      continue;
+    }
+
+    if (Node.isExportDeclaration(statement)) {
+      collectExportDeclaration(statement, clauses, foreignReexports);
+
+      continue;
+    }
+
+    if (Node.isExportAssignment(statement) && !statement.isExportEquals()) {
+      collectExportedDefault(statement, defaultIntents, exported);
+    }
+  }
+
+  // Second pass. `export { load }`, `export { load as read }` and
+  // `export default load` differ only in the *name* the function leaves under,
+  // which this set does not record, so all three are the same intent here: the
+  // declaration they name leaves the module as a function.
+  for (const clause of clauses) {
+    const start = declared.get(clause.localName);
+
+    if (start !== undefined) {
+      exported.add(start);
+    }
+  }
+
+  for (const name of defaultIntents) {
+    const start = declared.get(name);
+
+    if (start !== undefined) {
+      exported.add(start);
+    }
+  }
+
+  return exported;
+}
+
+/**
+ * Records one module-level function declaration in the export-identity walk:
+ * always under its declared name, and as an export when the declaration itself
+ * says so.
+ *
+ * A later declaration of the same name replaces an earlier one, which is what
+ * makes an **overloaded** function resolve to its implementation — the
+ * declaration a call site actually sits inside, and the one
+ * `./server-functions.ts` anchors its node at. A nameless declaration that is
+ * not a default export is what the parser produces for broken source
+ * (`export function {`); it names nothing a clause could reach and holds no
+ * node.
+ *
+ * @param declaration The function declaration.
+ * @param declared The module's function declarations by name, appended to.
+ * @param exported The export-identity set, appended to.
+ */
+function collectExportedFunctionDeclaration(
+  declaration: FunctionDeclaration,
+  declared: Map<string, number>,
+  exported: Set<number>,
+): void {
+  const nameNode = declaration.getNameNode();
+  const declaredName = nameNode === undefined ? undefined : memberName(nameNode);
+  const start = declaration.getStart();
+
+  if (declaredName !== undefined) {
+    declared.set(declaredName, start);
+  }
+
+  // `export default function () {}` and `export default function load() {}`
+  // both leave the module, the first under no name of its own.
+  if (declaration.hasDefaultKeyword()) {
+    exported.add(start);
+
+    return;
+  }
+
+  if (declaration.hasExportKeyword() && declaredName !== undefined) {
+    exported.add(start);
+  }
+}
+
+/**
+ * Records the function-valued declarators of one module-level variable
+ * statement in the export-identity walk.
+ *
+ * A destructured declarator binds several names and none of them is the
+ * declarator, so it can hold no function this cascade could name; a declarator
+ * whose initialiser is not a function is not a `server-function` whatever
+ * exports it.
+ *
+ * @param statement The variable statement.
+ * @param declared The module's function declarations by name, appended to.
+ * @param exported The export-identity set, appended to.
+ */
+function collectExportedDeclarators(
+  statement: VariableStatement,
+  declared: Map<string, number>,
+  exported: Set<number>,
+): void {
+  const hasKeyword = statement.hasExportKeyword();
+
+  for (const declaration of statement.getDeclarations()) {
+    const nameNode = declaration.getNameNode();
+
+    if (!Node.isIdentifier(nameNode) || !isFunctionValued(declaration.getInitializer())) {
+      continue;
+    }
+
+    const declaredName = memberName(nameNode);
+
+    if (declaredName === undefined) {
+      continue;
+    }
+
+    const start = declaration.getStart();
+
+    declared.set(declaredName, start);
+
+    if (hasKeyword) {
+      exported.add(start);
+    }
+  }
+}
+
+/**
+ * Records one `export default <expression>` statement in the export-identity
+ * walk.
+ *
+ * The expression either **names** a declaration written elsewhere in the module
+ * — recorded as an intent and applied in the second pass, since it may precede
+ * that declaration — or **is** a function, in which case the export statement
+ * is itself the declaration and is recorded under its own start offset.
+ *
+ * Only a *directly* written function expression is recorded, which is the same
+ * narrowing {@link addressableDeclarationOf} applies and for the reason stated
+ * there: a wrapped form is anchored differently by the two extractors whose
+ * node ids this module spells, and a node id that differs by one column is a
+ * dropped edge rather than an imprecise one.
+ *
+ * @param statement The export assignment, known not to be `export =`.
+ * @param defaultIntents Identifier intents, appended to.
+ * @param exported The export-identity set, appended to.
+ */
+function collectExportedDefault(
+  statement: ExportAssignment,
+  defaultIntents: string[],
+  exported: Set<number>,
+): void {
+  const expression = statement.getExpression();
+
+  if (Node.isIdentifier(expression)) {
+    const name = nonEmptyText(expression);
+
+    if (name !== undefined) {
+      defaultIntents.push(name);
+    }
+
+    return;
+  }
+
+  if (Node.isArrowFunction(expression) || Node.isFunctionExpression(expression)) {
+    exported.add(statement.getStart());
+  }
+}
+
+/**
  * What the file under extraction's own syntax says, for the owner cascade.
  *
  * @param ctx The file being visited.
@@ -1289,6 +1580,7 @@ function moduleFactsOf(ctx: ExtractorContext): ModuleFacts {
   return {
     routeModule: isRouteOrPageModule(ctx.file),
     componentModule: containsJsx(ctx.sourceFile) && declaresComponentName(ctx.sourceFile),
+    exportedFunctions: collectExportedFunctions(ctx.sourceFile),
   };
 }
 
@@ -2021,6 +2313,22 @@ function collectImportBindings(
  * specifier names a local binding and is resolved in a second pass, because it
  * may precede the declaration it names.
  *
+ * The two star forms are **not** the same statement and are not recorded alike:
+ *
+ * - `export * from './store'` re-exports every name of its target under that
+ *   same name, so a lookup for any name is worth following through it;
+ * - `export * as store from './store'` binds **one namespace object** under one
+ *   name and re-exports no individual name at all, so a lookup for a name is
+ *   deliberately a **miss** here. Following it would resolve `pool` through a
+ *   module that never binds `pool`, and a `db-call` node would then claim a
+ *   driver on evidence the source does not contain. Leaving it unresolved
+ *   costs, at worst, a handle reached only through a namespace object — an
+ *   under-detection, never a wrong driver, which is the trade the header's
+ *   "structural first" order fixes for every discovery step.
+ *
+ * `./server-functions.ts`'s own `collectExportDeclaration` draws the same
+ * distinction for the same reason, and the two read alike on purpose.
+ *
  * @param declaration The export declaration.
  * @param clauses Local clause intents, appended to.
  * @param reexports Module-specifier re-export clauses, appended to.
@@ -2036,9 +2344,12 @@ function collectExportDeclaration(
 
   const hasSpecifier = declaration.getModuleSpecifier() !== undefined;
 
+  // ts-morph answers `isNamespaceExport()` with "this clause holds no named
+  // exports", which is true of both star forms, so it cannot be the question
+  // on its own: `getNamespaceExport()` is the node that tells them apart and is
+  // present only for the qualified `export * as store from` form.
   if (declaration.isNamespaceExport()) {
-    // `export * from './store'` — every name, under the same name.
-    if (hasSpecifier) {
+    if (hasSpecifier && declaration.getNamespaceExport() === undefined) {
       reexports.push(Object.freeze({ declaration, exportedAs: undefined, sourceName: undefined }));
     }
 
@@ -3192,6 +3503,18 @@ function dbCallCandidate(
  * does not reproduce how the symbol extractor anchors one, and an edge to a
  * node spelled differently would be dropped rather than merely imprecise.
  *
+ * `export default <function expression>` is claimed — the export statement is
+ * the only declaration that shape has — but **only** when the exported
+ * expression is directly an arrow function or a function expression. In that
+ * spelling `./server-functions.ts` (which anchors at the export assignment's
+ * expression) and `./symbols.ts` (which anchors at the *unwrapped* expression)
+ * name the same node, so whichever branch {@link declaredOwner} then takes, the
+ * id is right. In a wrapped spelling (`export default (fn as T)`,
+ * `export default memo(fn)`) the two anchor differently, so the shape is left
+ * to the walk exactly as before: an id that differs by one column is not a
+ * degraded edge but a `dangling-edge` diagnostic and no edge at all, whereas
+ * falling through costs only precision.
+ *
  * @param node The ancestor to classify.
  * @returns The declaration, or `undefined`.
  */
@@ -3212,7 +3535,7 @@ function addressableDeclarationOf(node: Node): AddressableDeclaration | undefine
             name: DEFAULT_EXPORT_NAME,
             anchor: node,
             functionValued: true,
-            plainlyExported: false,
+            declarationStart: node.getStart(),
             classMember: false,
           }
         : undefined;
@@ -3222,7 +3545,7 @@ function addressableDeclarationOf(node: Node): AddressableDeclaration | undefine
       name: declaredName,
       anchor: nameNode,
       functionValued: true,
-      plainlyExported: node.hasExportKeyword() && !node.hasDefaultKeyword(),
+      declarationStart: node.getStart(),
       classMember: false,
     };
   }
@@ -3239,7 +3562,7 @@ function addressableDeclarationOf(node: Node): AddressableDeclaration | undefine
       name: declaredName,
       anchor: nameNode,
       functionValued: false,
-      plainlyExported: node.hasExportKeyword() && !node.hasDefaultKeyword(),
+      declarationStart: node.getStart(),
       classMember: false,
     };
   }
@@ -3262,7 +3585,31 @@ function addressableDeclarationOf(node: Node): AddressableDeclaration | undefine
       name: declaredName,
       anchor: nameNode,
       functionValued: isFunctionValued(node.getInitializer()),
-      plainlyExported: statement.hasExportKeyword(),
+      // The declarator rather than its statement: one `export const` statement
+      // may declare several functions, and each is its own node.
+      declarationStart: node.getStart(),
+      classMember: false,
+    };
+  }
+
+  if (Node.isExportAssignment(node)) {
+    const expression = node.getExpression();
+
+    // `export = <expression>` is the TypeScript form for a CommonJS module's
+    // single export rather than a declaration, and a wrapped default export is
+    // anchored differently by the two extractors this module names nodes from.
+    if (
+      node.isExportEquals() ||
+      !(Node.isArrowFunction(expression) || Node.isFunctionExpression(expression))
+    ) {
+      return undefined;
+    }
+
+    return {
+      name: DEFAULT_EXPORT_NAME,
+      anchor: expression,
+      functionValued: true,
+      declarationStart: node.getStart(),
       classMember: false,
     };
   }
@@ -3273,7 +3620,7 @@ function addressableDeclarationOf(node: Node): AddressableDeclaration | undefine
           name: CONSTRUCTOR_NAME,
           anchor: node,
           functionValued: true,
-          plainlyExported: false,
+          declarationStart: node.getStart(),
           classMember: true,
         }
       : undefined;
@@ -3302,7 +3649,7 @@ function addressableDeclarationOf(node: Node): AddressableDeclaration | undefine
       // so the server-function branch is unreachable for one — `classMember` is
       // what keeps it that way.
       functionValued: !Node.isPropertyDeclaration(node),
-      plainlyExported: false,
+      declarationStart: node.getStart(),
       classMember: true,
     };
   }
@@ -3313,14 +3660,30 @@ function addressableDeclarationOf(node: Node): AddressableDeclaration | undefine
 /**
  * The owner of a call site whose innermost addressable declaration is known.
  *
- * The `server-function` branch is taken only for the unambiguous shape — a
- * module-level, function-valued declaration carrying a plain `export` keyword,
- * in a module that is neither a route/page module nor a component module — for
- * the asymmetry the header states: a `symbol` node exists for every
- * module-level declaration, while a `server-function` node exists only where
- * `./server-functions.ts` agreed, and a disagreement costs the edge rather than
- * degrading it. Both kinds are what the `queries` edge table sanctions as a
- * `from`, so either answer is a legal edge.
+ * The `server-function` branch is taken for a module-level, function-valued
+ * declaration that **leaves its module as a function** — by keyword, by a local
+ * export clause, or as the default export, all four of which
+ * {@link ModuleFacts.exportedFunctions} records by declaration identity — in a
+ * module that is neither a route/page module nor a component module. Export
+ * *identity* rather than the `export` keyword, because that is what the node's
+ * existence follows: `./server-functions.ts` emits a `server-function` node for
+ * every exported module-level function resolved through its module's export
+ * surface, so `export { load }`, `export { load as read }`,
+ * `export default load` and `export default async () => {}` all have one, and
+ * attributing their database calls to a `symbol` node instead would start the
+ * `queries` edge at a node a developer never looks for — costing
+ * `../graph/query.ts`'s `pathBetween` its terminal hop's service function and
+ * `whoCalls` the caller that issues the query.
+ *
+ * The asymmetry the header states still governs every *other* conjunct, and
+ * each one keeps a `symbol` owner: a route or page module's exports are
+ * framework entry points, a component module's are components, a class member
+ * shares its class's name space rather than its module's, and a declaration
+ * holding no function is no `server-function` however it is exported. A
+ * `symbol` node exists for all of them (`./symbols.ts` inventories every
+ * module-level declaration and every member of a module-level class), and both
+ * kinds are what the `queries` edge table sanctions as a `from`, so either
+ * answer is a legal, present edge.
  *
  * @param file The module's project-relative POSIX path.
  * @param declaration The innermost addressable declaration.
@@ -3340,7 +3703,7 @@ function declaredOwner(
     !facts.componentModule &&
     !declaration.classMember &&
     declaration.functionValued &&
-    declaration.plainlyExported
+    facts.exportedFunctions.has(declaration.declarationStart)
   ) {
     return {
       id: makeNodeId({ kind: 'server-function', file, name, line, column }),
@@ -3636,7 +3999,8 @@ export const dbCallsExtractor: Extractor = Object.freeze({
       const emittedNodes = new Set<string>();
       const emittedEdges = new Set<string>();
 
-      // The owner cascade's module facts cost two walks of the tree, and most
+      // The owner cascade's module facts cost a walk of the tree each — the
+      // markup scan, the component-name scan and the export surface — and most
       // modules of a project hold no database call at all, so they are computed
       // on the first call site found and reused for the rest of the file.
       let facts: ModuleFacts | undefined;

@@ -47,27 +47,49 @@
  * whether the `react` module happens to be evaluated.
  *
  * **Two paths, one set of assertions.** Every commit assertion goes through
- * {@link expectWellFormedCommit} and is exercised twice: once by a real React
- * 19.3.0 tree rendered with `react-dom/client` under happy-dom, and once by a
- * hand-built fiber root driven straight through the installed hook
+ * {@link expectWellFormedCommits}, or through the single-commit
+ * {@link expectWellFormedCommit} built on it, and is exercised twice: once by a
+ * real React 19.3.0 tree rendered with `react-dom/client` under happy-dom, and
+ * once by a hand-built fiber root driven straight through the installed hook
  * (`getRDTHook().onCommitFiberRoot(1, root)`). The synthetic path is not a
  * stand-in — it is how the bounds (`MAX_RENDERS_PER_COMMIT`,
- * `MAX_OWNER_CHAIN`) and the hostile-value cases (an absent or negative
- * `actualDuration`) are reached at all, since React will not produce them on
- * request — and it also means the traversal contract stays proven if
- * `react-dom` is ever unavailable, in which case the React block *skips* with
- * a stated reason instead of vanishing.
+ * `MAX_FIBER_VISITS_PER_COMMIT`, `MAX_OWNER_CHAIN`) and the hostile-value
+ * cases (an absent or negative `actualDuration`, a `child` link that loops)
+ * are reached at all, since React will not produce them on request. The React
+ * path carries what a hand-built fiber cannot honestly claim: the structures
+ * React 19.3.0 actually builds, including a `React.Suspense` boundary and the
+ * `React.lazy` child it re-parents into an offscreen fragment while a fallback
+ * is showing, and a memoized component React re-renders only because a context
+ * it reads changed — the fiber shape of the demo's excessive-render defect
+ * (AAP §0.8.2) and the one case where the traversal's descent rule could be
+ * wrong with every other test still green.
  *
- * **Why no duration is ever asserted exactly.** `actualDuration` and
- * `actualStartTime` come from React's profiling timer in a development build,
- * on a shared CI host, under happy-dom's clock. The product's value is in the
- * relative ordering and the aggregate counts, not in microsecond accuracy —
- * which is why AAP §0.8.3 asks for "the expected components, phases and
- * durations" and not for numbers. Every timing assertion here is therefore a
- * *kind* assertion: finite, non-negative, and an epoch-millisecond reading of
- * this machine's clock ({@link expectAdvisoryTiming}). A later contributor
- * must not tighten them into equalities; they would pass locally and flake
- * everywhere else.
+ * **Neither path is optional.** AAP §0.8.3 names React 19.3.0, `react-dom` and
+ * bippy 0.7.3 as the runtime combination this file exists to verify, and all
+ * three are exact devDependencies of `packages/telemetry`. So a failure to
+ * import them is **suite setup failure**, not a reason to skip: a suite that
+ * skipped exactly when its subject was unavailable would report green for the
+ * one outcome it was written to catch. {@link loadReactRuntime} therefore
+ * rethrows with the diagnostic, which fails this file's collection, and every
+ * block below is registered unconditionally. Synthetic fibers cover cases
+ * React cannot be asked to produce; they are not equivalent evidence for the
+ * real renderer and are never treated as a fallback for it.
+ *
+ * **Timing is asserted exactly, against a clock this suite owns.**
+ * `actualDuration` and `actualStartTime` come from React's profiling timer, and
+ * a render's `startTime` is `performance.timeOrigin + actualStartTime` — so on
+ * a live clock the only true assertion is "somewhere near now", which is also
+ * true of a *document-relative* reading mistaken for an epoch one, and of an
+ * epoch reading computed from the wrong origin. Those are the errors that
+ * matter here, because the correlator orders browser, server and database
+ * events on one epoch-millisecond base (AAP §0.2.3). {@link installFixedClock}
+ * therefore pins `performance.timeOrigin`, `performance.now()` and `Date.now()`
+ * for the duration of each test, which makes every timestamp the producer
+ * derives an exact, stated number ({@link expectEventTiming} for the invariant,
+ * {@link epochAt} for the value) while leaving the *kind* assertions AAP §0.8.3
+ * asks for — finite, non-negative durations — in place. A frozen clock also
+ * means React measures every render as taking zero milliseconds, which is why
+ * no test asserts a duration above zero.
  *
  * **Harness.** The root `vitest.config.ts` collects this file into the
  * `telemetry` project, which already runs under happy-dom; the docblock on
@@ -100,6 +122,7 @@ import {
   isInteractionsAttached,
 } from './interaction.js';
 import {
+  MAX_FIBER_VISITS_PER_COMMIT,
   MAX_OWNER_CHAIN,
   MAX_RENDERS_PER_COMMIT,
   MAX_TREE_DEPTH,
@@ -197,46 +220,42 @@ interface ReactRuntime {
 /**
  * Load React and its DOM renderer, dynamically and after the hook install.
  *
- * `undefined` rather than a throw when either module is missing, so the React
- * block can skip with a stated reason while the synthetic block still proves
- * the traversal contract. AAP §0.3.2 did not list `react-dom` as a dependency
- * of this package — `react` is there only as bippy's peer — so it was added
- * (exact `19.3.0`, like every pin in this repository) to make the React path
- * runnable; this function is what keeps the suite meaningful if that ever
- * regresses.
+ * Both modules are **required**: AAP §0.8.3 defines this file as the proof that
+ * the product's commit observation works against React 19.3.0 with bippy
+ * installed first, and `react` 19.3.0 and `react-dom` 19.3.0 are exact
+ * devDependencies of `packages/telemetry` for that reason. (AAP §0.3.2 listed
+ * only `react`, as bippy's peer; `react-dom`, `@types/react` and
+ * `@types/react-dom` were added at the same exact pin to make the React path
+ * runnable.)
+ *
+ * So an import failure is rethrown with its cause rather than swallowed, and
+ * this file then fails to load. That is the intended outcome: the alternative —
+ * returning `undefined` and skipping the React block — hides a broken or
+ * missing dependency behind a green run, which is precisely the state the
+ * suite is meant to detect. The synthetic cases below cover inputs React
+ * cannot be asked for; they are not a substitute for the real renderer.
  */
-async function loadReactRuntime(): Promise<ReactRuntime | undefined> {
+async function loadReactRuntime(): Promise<ReactRuntime> {
   try {
     const react = await import('react');
     const { createRoot } = await import('react-dom/client');
     return { react, createRoot };
-  } catch {
-    return undefined;
+  } catch (cause) {
+    throw new Error(
+      'react and react-dom/client are required by this suite (AAP 0.8.3) and are exact devDependencies of @debuggen/telemetry; importing one of them failed, so the React 19.3.0 commit-traversal evidence cannot be produced',
+      { cause },
+    );
   }
 }
-
-/** The loaded runtime, or `undefined` when `react-dom` is unavailable. */
-const reactRuntime: ReactRuntime | undefined = await loadReactRuntime();
-
-/** Stated on the skipped React block so a skip is never silent. */
-const REACT_SKIP_REASON =
-  'react-dom/client could not be imported; the synthetic fiber-root cases below still cover the traversal contract';
 
 /**
- * The loaded runtime, for use inside a test body.
+ * The loaded runtime.
  *
- * The React block is registered with `describe.skipIf`, and a skipped suite's
- * *bodies* never run, so this never throws there. It exists because
- * `describe.skipIf` still evaluates the suite callback at collection time,
- * which means the components cannot be built at collection time from a runtime
- * that may be absent — they are built per test instead.
+ * Non-optional by construction — {@link loadReactRuntime} throws instead of
+ * reporting absence — so every test below uses it directly and no test carries
+ * a guard that could quietly become a skip.
  */
-function requireRuntime(): ReactRuntime {
-  if (reactRuntime === undefined) {
-    throw new Error(REACT_SKIP_REASON);
-  }
-  return reactRuntime;
-}
+const reactRuntime: ReactRuntime = await loadReactRuntime();
 
 /*
  * ---------------------------------------------------------------------------
@@ -258,6 +277,15 @@ const SHELL = 'Shell';
 const SIBLING = 'Sibling';
 const EXPLODER = 'Exploder';
 const BOUNDARY = 'Boundary';
+const SUSPENSE_SHELL = 'SuspenseShell';
+const FALLBACK = 'Fallback';
+const LAZY_LEAF = 'LazyLeaf';
+const CONTEXT_APP = 'ContextApp';
+const CONSUMER = 'Consumer';
+const QUIET = 'Quiet';
+
+/** The prop the lazily loaded component renders, so the DOM proves it ran. */
+const LAZY_LABEL = 'lazy-label';
 
 /**
  * The W3C trace-context id shapes, restated locally on purpose.
@@ -272,39 +300,166 @@ const TRACE_ID_SHAPE = /^[0-9a-f]{32}$/;
 const SPAN_ID_SHAPE = /^[0-9a-f]{16}$/;
 
 /**
- * How far an event's `startTime` may sit from `Date.now()`: ten minutes.
+ * The document time origin every test runs against: 2026-01-01T00:00:00Z.
  *
- * Deliberately loose. The assertion being made is "this is an
- * epoch-millisecond reading of this machine's clock", which is what the
- * correlator and the service's ingest schema require, and nothing narrower is
- * true: a render's `startTime` is `performance.timeOrigin + actualStartTime`,
- * so it is anchored to when the document was created rather than to when the
- * assertion runs, and the synthetic cases supply relative offsets of their
- * own. Narrowing this window would buy no information and would fail on a
- * loaded host.
+ * Pinned rather than read, because the product's whole time contract is that a
+ * borrowed document-relative reading becomes epoch milliseconds by adding this
+ * number (AAP §0.2.3, `./transport.ts`'s `toEpochMs`). With the origin known,
+ * "did the producer convert?" has an exact answer — `epochAt(12)` and not "a
+ * number near now" — and the two failures a loose window cannot see, a
+ * relative reading emitted unconverted and a conversion against the wrong
+ * origin, both fail immediately: this value is 1.767 × 10¹², while every
+ * relative reading in this suite is below {@link FIXED_NOW_MS}.
  */
-const CLOCK_WINDOW_MS = 10 * 60 * 1000;
+const FIXED_TIME_ORIGIN = 1_767_225_600_000;
 
 /**
- * React's own work tags for a function component and a host root.
+ * What `performance.now()` reads while a test runs: 5 000 ms into the document.
+ *
+ * Non-zero on purpose, so a producer that forgot the origin and emitted the
+ * relative reading is still distinguishable from one that emitted the origin
+ * alone; and larger than every synthetic `actualStartTime` below, so "this
+ * event started at or before now" is a real bound rather than one the fixtures
+ * violate.
+ */
+const FIXED_NOW_MS = 5_000;
+
+/**
+ * The current reading of the fixed clock, in document-relative milliseconds.
+ *
+ * Only {@link installFixedClock} and {@link advanceClock} write it, so a test
+ * that does not advance it observes one instant — every timestamp of a commit
+ * is then exactly {@link FIXED_TIME_ORIGIN} plus a number the test chose.
+ */
+let clockNow = FIXED_NOW_MS;
+
+/** The own `performance.now` property descriptor displaced by the fixed clock. */
+let savedPerformanceNow: PropertyDescriptor | undefined;
+
+/** The own `performance.timeOrigin` descriptor displaced by the fixed clock. */
+let savedTimeOrigin: PropertyDescriptor | undefined;
+
+/** `Date.now` as the host implements it, restored after each test. */
+let savedDateNow: (() => number) | undefined;
+
+/** Whether the fixed clock is currently installed. */
+let clockInstalled = false;
+
+/**
+ * Pin the document clock for one test.
+ *
+ * All three readings the producer can reach are pinned together —
+ * `performance.timeOrigin` and `performance.now()` because
+ * `./transport.ts`'s `nowEpochMs`/`toEpochMs` prefer them, and `Date.now()`
+ * because those functions fall back to it when a clock cannot be read — so
+ * there is exactly one instant in play however the code under test asks for
+ * it.
+ *
+ * Installed by defining **own** properties over the `Performance` instance and
+ * restored by deleting them, rather than through `vi.spyOn`: one test below
+ * calls `vi.restoreAllMocks()` in its body to remove the transport recorder,
+ * and a clock restored there would leave the assertions after it reading the
+ * host's clock instead. `Reflect.deleteProperty` is the typed way to remove a
+ * property TypeScript declares as always present.
+ *
+ * A frozen `performance.now()` is also what makes React's profiling timer
+ * deterministic: every fiber of a commit records the same `actualStartTime`
+ * and an `actualDuration` of zero. React's scheduler tolerates it because the
+ * work `act()` drives is flushed synchronously — no code waits for the clock
+ * to advance.
+ */
+function installFixedClock(): void {
+  clockNow = FIXED_NOW_MS;
+  savedPerformanceNow = Object.getOwnPropertyDescriptor(performance, 'now');
+  savedTimeOrigin = Object.getOwnPropertyDescriptor(performance, 'timeOrigin');
+  savedDateNow = Date.now;
+
+  Object.defineProperty(performance, 'now', {
+    configurable: true,
+    enumerable: true,
+    value: (): number => clockNow,
+    writable: true,
+  });
+  Object.defineProperty(performance, 'timeOrigin', {
+    configurable: true,
+    enumerable: true,
+    value: FIXED_TIME_ORIGIN,
+    writable: true,
+  });
+  Date.now = (): number => FIXED_TIME_ORIGIN + clockNow;
+  clockInstalled = true;
+}
+
+/** Hand the clock back to the host, exactly as it was found. */
+function restoreFixedClock(): void {
+  if (!clockInstalled) {
+    return;
+  }
+  clockInstalled = false;
+
+  if (savedPerformanceNow === undefined) {
+    Reflect.deleteProperty(performance, 'now');
+  } else {
+    Object.defineProperty(performance, 'now', savedPerformanceNow);
+  }
+  if (savedTimeOrigin === undefined) {
+    Reflect.deleteProperty(performance, 'timeOrigin');
+  } else {
+    Object.defineProperty(performance, 'timeOrigin', savedTimeOrigin);
+  }
+  if (savedDateNow !== undefined) {
+    Date.now = savedDateNow;
+  }
+  savedPerformanceNow = undefined;
+  savedTimeOrigin = undefined;
+  savedDateNow = undefined;
+}
+
+/**
+ * Move the fixed clock forward, for a test that needs two distinguishable
+ * instants.
+ *
+ * @param ms Milliseconds to advance; fractional values are allowed, because
+ * the event contract's sub-millisecond precision is part of what is asserted.
+ */
+function advanceClock(ms: number): void {
+  clockNow += ms;
+}
+
+/**
+ * The epoch-millisecond value a document-relative reading must become.
+ *
+ * The one conversion `./transport.ts` performs, restated here so an assertion
+ * states the arithmetic it expects instead of importing the code that
+ * performs it.
+ */
+function epochAt(relativeMs: number): number {
+  return FIXED_TIME_ORIGIN + relativeMs;
+}
+
+/**
+ * React's own work tags for a function component, a host component and a host
+ * root.
  *
  * Needed by the synthetic fiber cases, because bippy reads a fiber's `tag`
  * through its version map and exposes that map only via
  * `getReactWorkTagsForFiber`, which needs a fiber that already carries a tag —
- * so the two values cannot be derived from the library and are stated here.
- * Both have been stable across every React version in bippy's map.
+ * so the values cannot be derived from the library and are stated here. All
+ * three have been stable across every React version in bippy's map.
  */
 const WORK_TAG_FUNCTION_COMPONENT = 0;
+const WORK_TAG_HOST_COMPONENT = 5;
 const WORK_TAG_HOST_ROOT = 3;
 
 /**
  * React's `PerformedWork` fiber flag.
  *
- * `traverseRenderedFibers` only visits a fiber that rendered, which it decides
- * from this flag; a synthetic fiber without it is skipped, and the commit then
- * carries no renders at all. bippy exports the flag table as `ReactFiberFlags`
- * but the agent prompt's verified surface for bippy 0.7.3 does not include it,
- * so the one bit this file needs is stated rather than imported.
+ * "Rendered in this commit" is this bit, and it is what `./react.ts` asks
+ * bippy's `didFiberRender` for before emitting a fiber; a synthetic composite
+ * fiber without it is stepped over, and the commit then carries no renders at
+ * all. bippy exports the flag table as `ReactFiberFlags` but the agent
+ * prompt's verified surface for bippy 0.7.3 does not include it, so the one
+ * bit this file needs is stated rather than imported.
  */
 const FIBER_FLAG_PERFORMED_WORK = 1;
 
@@ -379,21 +534,28 @@ function isRenderTrigger(value: unknown): value is RenderTrigger {
 }
 
 /**
- * The timing assertions, and the only ones any test makes about a duration.
+ * The timing invariants every draft must satisfy, on the fixed clock.
  *
- * Finite and non-negative, because the service's ingress schema rejects
- * anything else and a panel must never render a negative cost; and an
- * epoch-millisecond reading, because that single time base is what lets the
- * correlator order browser, server and database events in one trace. Never an
- * equality: see the note on {@link CLOCK_WINDOW_MS} and the module
- * documentation.
+ * Two separate statements, kept separate on purpose:
+ *
+ * - **The duration is finite and non-negative**, because the service's ingress
+ *   schema rejects anything else and a panel must never render a negative
+ *   cost. This is a *kind* assertion and stays one: React's profiling timer
+ *   reports what it reports, and on a frozen clock that is zero.
+ * - **The start time is an epoch-millisecond reading of this document's
+ *   clock**, bounded exactly: at or after {@link FIXED_TIME_ORIGIN} and at or
+ *   before the current reading of that clock. A document-relative value
+ *   emitted unconverted fails the lower bound by twelve orders of magnitude,
+ *   and a value from a different origin fails one of the two. Individual tests
+ *   add the exact equality for the reading they chose ({@link epochAt}); this
+ *   is the floor under all of them.
  */
-function expectAdvisoryTiming(draft: EventDraft, now: number): void {
+function expectEventTiming(draft: EventDraft): void {
   expect(Number.isFinite(draft.duration)).toBe(true);
   expect(draft.duration).toBeGreaterThanOrEqual(0);
   expect(Number.isFinite(draft.startTime)).toBe(true);
-  expect(draft.startTime).toBeGreaterThan(now - CLOCK_WINDOW_MS);
-  expect(draft.startTime).toBeLessThan(now + CLOCK_WINDOW_MS);
+  expect(draft.startTime).toBeGreaterThanOrEqual(FIXED_TIME_ORIGIN);
+  expect(draft.startTime).toBeLessThanOrEqual(epochAt(clockNow));
 }
 
 /**
@@ -418,68 +580,107 @@ interface CommitShape {
 }
 
 /**
- * Every structural guarantee one commit must satisfy, whatever produced it.
+ * Every structural guarantee each observed commit must satisfy, whatever
+ * produced it and however many there are.
  *
  * The relationships asserted here are the ones the timeline's band-inside-band
- * reading and a generated panel's evidence references both depend on: one
- * commit event, every render parented to it, one trace across the whole
- * commit, distinct span ids, a phase from the closed vocabulary, advisory
- * timings and a JSON-safe payload.
+ * reading and a generated panel's evidence references both depend on: every
+ * render parented to a commit that was actually emitted, one trace per commit,
+ * distinct span ids across the whole recording, each commit ahead of its own
+ * renders, a phase from the closed vocabulary, a `trigger` exactly when the
+ * phase is an update, epoch timings and a JSON-safe payload.
+ *
+ * Written per commit rather than for one, because a case can legitimately
+ * produce two: a Suspense boundary commits its fallback and then, when the
+ * lazy module settles, its resolved content. Holding both to the same rules is
+ * the point — {@link expectWellFormedCommit} is this function plus the two
+ * assertions that are only true of a single-commit case.
+ *
+ * @returns One shape per commit, in emission order.
+ */
+function expectWellFormedCommits(): CommitShape[] {
+  const commits = draftsOfKind('commit');
+  expect(commits.length).toBeGreaterThan(0);
+  const renders = draftsOfKind('render');
+  const commitSpanIds = new Set(commits.map((commit) => commit.spanId));
+
+  // No orphans: a render parented to a span that was never emitted would leave
+  // the timeline with a band whose container does not exist.
+  for (const render of renders) {
+    expect(typeof render.parentSpanId).toBe('string');
+    expect(commitSpanIds.has(render.parentSpanId ?? '')).toBe(true);
+  }
+
+  const spanIds = new Set<string>();
+  const shapes: CommitShape[] = [];
+
+  for (const commit of commits) {
+    const own = renders.filter((render) => render.parentSpanId === commit.spanId);
+
+    expect(commit.name).toBe('React commit');
+    expect(commit.attributes['renderCount']).toBe(own.length);
+
+    for (const draft of [commit, ...own]) {
+      expect(draft.traceId).toMatch(TRACE_ID_SHAPE);
+      expect(draft.spanId).toMatch(SPAN_ID_SHAPE);
+      // One commit is one moment, so it is one trace: `./react.ts` resolves the
+      // context once, before the first fiber is visited, precisely so an
+      // interaction window closing mid-traversal cannot split a commit in two.
+      expect(draft.traceId).toBe(commit.traceId);
+      expect(draft.status).toBe('ok');
+      spanIds.add(draft.spanId);
+      expectEventTiming(draft);
+      expectJsonSafe(draft);
+    }
+
+    for (const render of own) {
+      // The commit event leads its own batch, so a raw log ordered by sequence
+      // reads parent before children.
+      expect(captured.indexOf(commit)).toBeLessThan(captured.indexOf(render));
+      expect(render.name).toBe(render.attributes['component']);
+      const phase = render.attributes['phase'];
+      expect(isRenderPhase(phase)).toBe(true);
+      expect(render.attributes['renderCount']).toBeGreaterThanOrEqual(1);
+      expect(Array.isArray(render.attributes['changedProps'])).toBe(true);
+
+      if (phase === 'mount') {
+        // The rule that keeps `render_trigger_unknown_count` honest (AAP
+        // §0.2.3): a mount has no previous fiber, so "why did it render" has no
+        // answer, and an absent key is how this product says "not observed".
+        expect('trigger' in render.attributes).toBe(false);
+      } else {
+        expect(isRenderTrigger(render.attributes['trigger'])).toBe(true);
+      }
+    }
+
+    shapes.push({ commit, renders: own });
+  }
+
+  expect(spanIds.size).toBe(commits.length + renders.length);
+  return shapes;
+}
+
+/**
+ * The single-commit case: {@link expectWellFormedCommits} plus the two things
+ * only one commit can be held to — that it is the batch's first event, and
+ * that every render it parents reports the phase the test expects.
  *
  * @param expectedPhase The phase every render of this commit must report.
  * @returns The commit and its renders, for assertions specific to one case.
  */
 function expectWellFormedCommit(expectedPhase: RenderPhase): CommitShape {
-  const now = Date.now();
-  const commits = draftsOfKind('commit');
-  expect(commits).toHaveLength(1);
-  const commit = first(commits, 'commit draft');
-  const renders = draftsOfKind('render');
-  expect(renders.length).toBeGreaterThan(0);
+  const shapes = expectWellFormedCommits();
+  expect(shapes).toHaveLength(1);
+  const shape = first(shapes, 'commit draft');
+  expect(shape.renders.length).toBeGreaterThan(0);
+  expect(captured.indexOf(shape.commit)).toBe(0);
+  expect(shape.commit.attributes['phase']).toBe(expectedPhase);
 
-  const all = [commit, ...renders];
-  const spanIds = new Set<string>();
-  for (const draft of all) {
-    expect(draft.traceId).toMatch(TRACE_ID_SHAPE);
-    expect(draft.spanId).toMatch(SPAN_ID_SHAPE);
-    // One commit is one moment, so it is one trace: `./react.ts` resolves the
-    // context once, before the first fiber is visited, precisely so an
-    // interaction window closing mid-traversal cannot split a commit in two.
-    expect(draft.traceId).toBe(commit.traceId);
-    expect(draft.status).toBe('ok');
-    spanIds.add(draft.spanId);
-    expectAdvisoryTiming(draft, now);
-    expectJsonSafe(draft);
-  }
-  expect(spanIds.size).toBe(all.length);
-
-  // The commit event leads the batch, so a raw log ordered by sequence reads
-  // parent before children.
-  expect(captured.indexOf(commit)).toBe(0);
-  expect(commit.name).toBe('React commit');
-  expect(commit.attributes['renderCount']).toBe(renders.length);
-  expect(commit.attributes['phase']).toBe(expectedPhase);
-
-  for (const render of renders) {
-    expect(render.parentSpanId).toBe(commit.spanId);
-    expect(render.name).toBe(render.attributes['component']);
-    const phase = render.attributes['phase'];
-    expect(isRenderPhase(phase)).toBe(true);
-    expect(phase).toBe(expectedPhase);
-    expect(render.attributes['renderCount']).toBeGreaterThanOrEqual(1);
-    expect(Array.isArray(render.attributes['changedProps'])).toBe(true);
-
-    if (expectedPhase === 'mount') {
-      // The rule that keeps `render_trigger_unknown_count` honest (AAP
-      // §0.2.3): a mount has no previous fiber, so "why did it render" has no
-      // answer, and an absent key is how this product says "not observed".
-      expect('trigger' in render.attributes).toBe(false);
-    } else {
-      expect(isRenderTrigger(render.attributes['trigger'])).toBe(true);
-    }
+  for (const render of shape.renders) {
+    expect(render.attributes['phase']).toBe(expectedPhase);
   }
 
-  return { commit, renders };
+  return shape;
 }
 
 /** Forget what has been recorded, between the phases of one test. */
@@ -503,15 +704,17 @@ function clearCaptured(): void {
 const RENDERER_ID = 1;
 
 /**
- * The root fiber's `memoizedState`, in the shape the traversal requires before
- * it will call a second commit of the same root an update.
+ * The root fiber's `memoizedState`, in the shape a live React `HostRoot`
+ * carries: an `element` and no `isDehydrated` flag.
  *
- * `traverseRenderedFibers` decides mount-versus-update from the root fiber it
- * remembers per `FiberRoot`, and takes the update path only when both the
- * remembered and the current root fiber look like a live React root — a
- * `memoizedState` carrying an `element` and no `isDehydrated` flag. A
- * synthetic root that omits it is treated as a mount for ever, which is the
- * one piece of this structure a reader would never guess.
+ * Not read by the module under test, which decides mount-versus-update per
+ * fiber from that fiber's `alternate`. It is read by the layer above: bippy's
+ * installed hook wrapper inspects `root.current.memoizedState` on every commit
+ * to decide whether the root is still mounted and worth tracking. A synthetic
+ * root that omits it is dispatched to the subscriber all the same, but it is
+ * dropped from bippy's own root registry — so the realistic shape is the one
+ * to hand it, and it is the piece of this structure a reader would never
+ * guess.
  */
 const HYDRATED_ROOT_STATE = { element: {}, isDehydrated: false };
 
@@ -584,13 +787,47 @@ function pairAlternates(current: Fiber, previous: Fiber): void {
 }
 
 /**
- * A nested chain of composite fibers: the first spec is the outermost.
+ * One host fiber — a DOM node React committed — in the shape React 19 gives
+ * one.
  *
- * Returned in the same order as the specs, so a caller can assert on any level
- * of the chain it built.
+ * A component is not the only thing a commit contains, and the walk has to
+ * step over these: they are not emitted, but they are visited, which is what
+ * the visit bound counts. Built without `alternate`, so the walk descends
+ * through it, and with `PerformedWork` set, so the bound is reached for the
+ * right reason rather than because the flag stopped the walk early.
  */
-function syntheticChain(specs: readonly SyntheticFiberSpec[]): Fiber[] {
-  const fibers = specs.map((spec) => syntheticFiber(spec));
+function syntheticHostFiber(): Fiber {
+  const fiber: Record<string, unknown> = {
+    tag: WORK_TAG_HOST_COMPONENT,
+    key: null,
+    elementType: 'div',
+    type: 'div',
+    stateNode: null,
+    return: null,
+    child: null,
+    sibling: null,
+    index: 0,
+    memoizedProps: {},
+    memoizedState: null,
+    dependencies: null,
+    mode: 0,
+    flags: FIBER_FLAG_PERFORMED_WORK,
+    subtreeFlags: FIBER_FLAG_PERFORMED_WORK,
+    lanes: 0,
+    childLanes: 0,
+    alternate: null,
+  };
+
+  return fiber as unknown as Fiber;
+}
+
+/**
+ * Link `fibers` into a parent-to-child chain, outermost first.
+ *
+ * Shared by the composite and host chain builders so both produce the same
+ * shape of `child`/`return` links.
+ */
+function linkChain(fibers: readonly Fiber[]): void {
   fibers.forEach((fiber, index) => {
     const child = fibers[index + 1];
     if (child !== undefined) {
@@ -598,6 +835,37 @@ function syntheticChain(specs: readonly SyntheticFiberSpec[]): Fiber[] {
       mutateFiber(child, 'return', fiber);
     }
   });
+}
+
+/**
+ * A chain of `depth` host fibers with one composite fiber at the bottom.
+ *
+ * The structure a commit walk cannot short-circuit: nothing in it is emitted
+ * until the very last fiber, so a walk bounded only by the events it produces
+ * would descend the whole chain. Used to reach
+ * `MAX_FIBER_VISITS_PER_COMMIT`.
+ *
+ * @param depth How many host fibers to stack above the composite leaf.
+ * @param leafName The display name the leaf would report if it were reached.
+ * @returns The outermost fiber of the chain.
+ */
+function syntheticHostChain(depth: number, leafName: string): Fiber {
+  const hosts = Array.from({ length: depth }, () => syntheticHostFiber());
+  const leaf = syntheticFiber({ name: leafName });
+  const chain = [...hosts, leaf];
+  linkChain(chain);
+  return first(chain, 'host chain fiber');
+}
+
+/**
+ * A nested chain of composite fibers: the first spec is the outermost.
+ *
+ * Returned in the same order as the specs, so a caller can assert on any level
+ * of the chain it built.
+ */
+function syntheticChain(specs: readonly SyntheticFiberSpec[]): Fiber[] {
+  const fibers = specs.map((spec) => syntheticFiber(spec));
+  linkChain(fibers);
   return fibers;
 }
 
@@ -636,11 +904,12 @@ function syntheticRootFiber(children: readonly Fiber[]): Fiber {
 /**
  * A fiber root over `children`, optionally with a previous tree behind it.
  *
- * `previousChildren` builds the root's `alternate` — React's other tree — and
- * that pairing is what a second commit of the same root needs before the
- * traversal will descend into the children as updates: it compares the two
- * roots' `child` pointers and recurses only where they differ, exactly as
- * React DevTools does.
+ * `previousChildren` builds the root's `alternate` — React's other tree — which
+ * is what makes the root a *re-render* rather than a first render: the
+ * traversal descends into a fiber's children when it has no `alternate` or when
+ * its `child` pointer differs from that alternate's, and skips the subtree when
+ * the pointers are identical, exactly as React DevTools does. Two distinct
+ * child lists therefore keep the walk descending.
  *
  * @param containerId Becomes the commit's `rootName`, so two roots in one test
  * stay distinguishable.
@@ -734,11 +1003,9 @@ function createHostRoot(
 async function unmountAll(): Promise<void> {
   const trees = mounted.splice(0, mounted.length);
   for (const tree of trees) {
-    if (reactRuntime !== undefined) {
-      await inAct(reactRuntime, () => {
-        tree.root.unmount();
-      });
-    }
+    await inAct(reactRuntime, () => {
+      tree.root.unmount();
+    });
     tree.container.remove();
   }
 }
@@ -858,6 +1125,155 @@ function flattenTree(node: ComponentTreeNode): ComponentTreeNode[] {
   return [node, ...node.children.flatMap((child) => flattenTree(child))];
 }
 
+/** The provider tree, and the control that changes the context value. */
+interface ContextFixture {
+  /** A provider over one memoized consumer and one memoized non-consumer. */
+  readonly App: ComponentType<Record<string, never>>;
+  /** Publish a new context value, without changing any prop below. */
+  bumpTick(): void;
+}
+
+/**
+ * A provider whose value changes, over two memoized children: one reads the
+ * context, one does not.
+ *
+ * This is the fiber shape of the demo's seeded excessive-render defect (AAP
+ * §0.8.2) and the one case where the traversal's descent rule can be wrong
+ * without any other test noticing. React bails out on both memoized children
+ * at the props level — their props are identical — and re-renders only the one
+ * whose context changed, reaching it through fibers it cloned on the way down.
+ * A traversal that treated an unchanged parent as an unchanged subtree would
+ * report the provider and lose the consumer, which is exactly the render the
+ * developer's question is about.
+ */
+function createContextFixture(runtime: ReactRuntime): ContextFixture {
+  const react = runtime.react;
+  const TickContext = react.createContext(0);
+  TickContext.displayName = 'TickContext';
+
+  function ConsumerImplementation(): ReactNode {
+    const tick = react.useContext(TickContext);
+    return <span data-tick={String(tick)} />;
+  }
+  ConsumerImplementation.displayName = CONSUMER;
+  const Consumer = react.memo(ConsumerImplementation);
+  Consumer.displayName = CONSUMER;
+
+  function QuietImplementation(): ReactNode {
+    return <span data-quiet="stable" />;
+  }
+  QuietImplementation.displayName = QUIET;
+  const Quiet = react.memo(QuietImplementation);
+  Quiet.displayName = QUIET;
+
+  /** A `useState` setter, narrowed to the functional form the fixture uses. */
+  type Bump = (updater: (previous: number) => number) => void;
+
+  let bumpTickState: Bump | undefined;
+
+  function ContextApp(): ReactNode {
+    const [tick, setTick] = react.useState(0);
+    // Captured during render for the same reason as the three-level fixture
+    // above: the test needs the setter before any effect has run.
+    bumpTickState = setTick;
+    return (
+      <TickContext.Provider value={tick}>
+        <div className="context-app">
+          <Consumer />
+          <Quiet />
+        </div>
+      </TickContext.Provider>
+    );
+  }
+  ContextApp.displayName = CONTEXT_APP;
+
+  return {
+    App: ContextApp,
+    bumpTick: () => {
+      if (bumpTickState === undefined) {
+        throw new Error(`bumpTick is unavailable: ${CONTEXT_APP} has not rendered yet`);
+      }
+      bumpTickState((previous) => previous + 1);
+    },
+  };
+}
+
+/** Props of the component loaded behind the Suspense boundary. */
+interface LazyLeafProps {
+  /** Rendered into the DOM, so a commit's effect is observable there too. */
+  readonly label: string;
+}
+
+/** The lazy tree, and the control that lets its module settle. */
+interface SuspenseFixture {
+  /** A shell whose Suspense boundary wraps a `React.lazy` component. */
+  readonly Shell: ComponentType<Record<string, never>>;
+  /** Resolve the lazy module, so React can commit the primary content. */
+  settleLazy(): void;
+}
+
+/**
+ * A `React.lazy` component behind a `React.Suspense` boundary, with the
+ * module's arrival under the test's control.
+ *
+ * The structure worth covering here is not the API but the *fibers*: a
+ * Suspense boundary wraps its children in fibers that are not components —
+ * the boundary itself and the offscreen fragment React re-parents the primary
+ * content into while a fallback is showing — and a lazy child begins life as a
+ * fiber with no component at all, which React retags once the module arrives.
+ * A traversal that named those fibers would put structure a developer never
+ * wrote into the render table, and one that stopped at them would lose the
+ * component underneath. Both mistakes are invisible without a case that
+ * suspends, which is why this fixture exists (AAP §0.8.3's "expected
+ * components, phases and durations" over a real React tree).
+ *
+ * The loader returns a promise the test settles rather than an `import()`, so
+ * both commits — the fallback, then the resolved content — are observed
+ * deliberately instead of raced against a module graph.
+ */
+function createSuspenseFixture(runtime: ReactRuntime): SuspenseFixture {
+  const react = runtime.react;
+
+  function LazyLeafImplementation(props: LazyLeafProps): ReactNode {
+    return <span data-lazy={props.label}>{props.label}</span>;
+  }
+  LazyLeafImplementation.displayName = LAZY_LEAF;
+
+  let settle: (() => void) | undefined;
+  const loaded = new Promise<{ default: ComponentType<LazyLeafProps> }>((resolve) => {
+    settle = () => {
+      resolve({ default: LazyLeafImplementation });
+    };
+  });
+  const Lazy = react.lazy(() => loaded);
+
+  function Fallback(): ReactNode {
+    return <span data-fallback="pending" />;
+  }
+  Fallback.displayName = FALLBACK;
+
+  function SuspenseShell(): ReactNode {
+    return (
+      <div className="suspense-shell">
+        <react.Suspense fallback={<Fallback />}>
+          <Lazy label={LAZY_LABEL} />
+        </react.Suspense>
+      </div>
+    );
+  }
+  SuspenseShell.displayName = SUSPENSE_SHELL;
+
+  return {
+    Shell: SuspenseShell,
+    settleLazy: () => {
+      if (settle === undefined) {
+        throw new Error('the lazy module cannot settle: its promise has no resolver yet');
+      }
+      settle();
+    },
+  };
+}
+
 /** Props of the error boundary the robustness case renders. */
 interface BoundaryProps {
   /** The subtree whose failure the boundary contains. */
@@ -927,12 +1343,17 @@ function createExplodingTree(runtime: ReactRuntime): ComponentType<Record<string
  *
  * A leaked subscription would make every later assertion non-deterministic —
  * two attached observers double every event — so the teardown detaches all
- * three hooks before it unmounts anything, and resets the transport last.
+ * three hooks before it unmounts anything, resets the transport, and hands the
+ * clock back last: the unmounts it performs run under the same fixed clock the
+ * test did.
  * ---------------------------------------------------------------------------
  */
 
 beforeEach(() => {
   clearCaptured();
+  // Before anything renders, so React's profiling timer and every timestamp
+  // the producer derives read the one pinned instant.
+  installFixedClock();
   enableActEnvironment();
   transport.resetTransport();
   transport.configureTransport({ sessionId: SESSION_ID, captureId: CAPTURE_ID, enabled: true });
@@ -948,6 +1369,7 @@ afterEach(async () => {
   vi.restoreAllMocks();
   transport.resetTransport();
   clearCaptured();
+  restoreFixedClock();
 });
 
 /*
@@ -970,15 +1392,15 @@ describe('hook installation before React', () => {
     expect(REACT_DETECTED_BEFORE_REACT_DOM).toBe(false);
   });
 
-  it.skipIf(reactRuntime === undefined)(
-    'sees a registered renderer once react-dom has been imported',
-    () => {
-      expect(hasRDTHook()).toBe(true);
-      expect(rendererCount()).toBeGreaterThanOrEqual(1);
-      expect(rendererCount()).toBeGreaterThan(RENDERERS_BEFORE_REACT_DOM);
-      expect(detectReact()).toBe(true);
-    },
-  );
+  it('sees a registered renderer once react-dom has been imported', () => {
+    // Unconditional: `react-dom` is a required devDependency and its import
+    // failure fails this file's collection, so there is no state in which this
+    // assertion may be skipped rather than made.
+    expect(hasRDTHook()).toBe(true);
+    expect(rendererCount()).toBeGreaterThanOrEqual(1);
+    expect(rendererCount()).toBeGreaterThan(RENDERERS_BEFORE_REACT_DOM);
+    expect(detectReact()).toBe(true);
+  });
 
   it('answers detectReact without a commit having been observed', () => {
     expect(getReactStats().commits).toBe(0);
@@ -1013,6 +1435,24 @@ describe('commit traversal — synthetic fiber root', () => {
     expect(commit.attributes['rendererId']).toBe(RENDERER_ID);
     expect(commit.attributes['rootName']).toBe('#synthetic-mount');
     expect('truncated' in commit.attributes).toBe(false);
+
+    // The conversion the event contract turns on (AAP 0.2.3): each fiber's
+    // document-relative `actualStartTime` plus this document's time origin,
+    // exactly. `12` emitted as `12` would be a relative reading escaping to
+    // the service, where it would sort a whole capture before every span the
+    // Node preload produced.
+    expect(renderOf(PARENT)?.startTime).toBe(epochAt(12));
+    expect(renderOf(CHILD)?.startTime).toBe(epochAt(13));
+    expect(renderOf(LEAF)?.startTime).toBe(epochAt(14));
+    expect(renderOf(PARENT)?.duration).toBe(6);
+    expect(renderOf(CHILD)?.duration).toBe(4);
+    expect(renderOf(LEAF)?.duration).toBe(2);
+    // The synthetic root fiber carries no profiling values, so the commit is
+    // stamped with the instant the callback ran, read from the same clock;
+    // its duration is this module's own measurement of a traversal that took
+    // no measurable time on a clock that did not move.
+    expect(commit.startTime).toBe(epochAt(FIXED_NOW_MS));
+    expect(commit.duration).toBe(0);
 
     // Interactions are dormant in this suite, so `resolveEventContext` answers
     // with a synthetic origin: the commit is its own trace root and carries no
@@ -1090,8 +1530,48 @@ describe('commit traversal — synthetic fiber root', () => {
       // would read as a measurement of zero.
       expect('actualDuration' in render.attributes).toBe(false);
       expect('selfTime' in render.attributes).toBe(false);
+      // No usable relative start either — absent, negative and infinite are
+      // all rejected — so each render falls back to the commit's own instant,
+      // which is an epoch reading and not a `-1` or a `NaN` reaching the
+      // service's ingress schema.
+      expect(render.startTime).toBe(epochAt(FIXED_NOW_MS));
     }
     expect(getReactStats().failures).toBe(0);
+  });
+
+  it('converts each fiber start against the document origin as the clock moves', () => {
+    const fibers = syntheticChain([
+      // Fractional, because the event contract keeps sub-millisecond
+      // precision: two renders of one commit routinely start inside the same
+      // millisecond and `../correlation/correlator.ts` orders by `startTime`
+      // first.
+      { name: PARENT, actualDuration: 1.25, actualStartTime: 12.5 },
+      { name: CHILD, actualDuration: 0.5, actualStartTime: 13.75 },
+    ]);
+    const root = syntheticRoot([first(fibers, 'synthetic fiber')], 'synthetic-clock');
+
+    attachReact();
+    commitSynthetic(root);
+
+    expect(renderOf(PARENT)?.startTime).toBe(epochAt(12.5));
+    expect(renderOf(CHILD)?.startTime).toBe(epochAt(13.75));
+    expect(renderOf(PARENT)?.duration).toBe(1.25);
+    expect(first(draftsOfKind('commit'), 'commit draft').startTime).toBe(epochAt(FIXED_NOW_MS));
+
+    // A second commit 40.5 ms later. A producer that had captured the origin,
+    // or the instant, once at import time would stamp this commit with the
+    // first one's time.
+    clearCaptured();
+    advanceClock(40.5);
+    commitSynthetic(root);
+
+    const later = first(draftsOfKind('commit'), 'commit draft');
+    expect(later.startTime).toBe(epochAt(FIXED_NOW_MS + 40.5));
+    // The fibers still carry their own relative starts, which are anchored to
+    // the document origin rather than to when the commit was observed — so
+    // they do not move with the clock.
+    expect(renderOf(PARENT)?.startTime).toBe(epochAt(12.5));
+    expect(renderOf(CHILD)?.startTime).toBe(epochAt(13.75));
   });
 
   it('cuts a commit at MAX_RENDERS_PER_COMMIT and still reports the true total', () => {
@@ -1106,11 +1586,104 @@ describe('commit traversal — synthetic fiber root', () => {
 
     const { commit, renders } = expectWellFormedCommit('mount');
     expect(renders).toHaveLength(MAX_RENDERS_PER_COMMIT);
-    // The bound cuts the list; it does not cut the truth about the list.
+    // The bound cuts the list; it does not cut the truth about the list. The
+    // walk itself runs to the end of this tree, which is well inside
+    // `MAX_FIBER_VISITS_PER_COMMIT`, so the count is the exact total.
+    expect(total).toBeLessThan(MAX_FIBER_VISITS_PER_COMMIT);
     expect(commit.attributes['renderedFiberCount']).toBe(total);
     expect(commit.attributes['truncated']).toBe(true);
     expect(getReactStats().truncatedCommits).toBe(1);
     expect(getReactStats().renders).toBe(MAX_RENDERS_PER_COMMIT);
+  });
+
+  it('stops the walk at MAX_FIBER_VISITS_PER_COMMIT when nothing is being emitted', () => {
+    // The case the event bound cannot bound: a chain of host fibers, none of
+    // which is a component, with one component at the bottom. Emitting stops
+    // after zero events because there is nothing to emit — so a traversal
+    // bounded only by its output would descend every one of these fibers
+    // inside React's commit phase, on the developer's click path. The walk has
+    // to stop on its own, and it must not reach the leaf.
+    const depth = MAX_FIBER_VISITS_PER_COMMIT + 50;
+    const chain = syntheticHostChain(depth, 'UnreachableLeaf');
+    const root = syntheticRoot([chain], 'synthetic-visit-bound');
+
+    attachReact();
+    commitSynthetic(root);
+
+    const commits = draftsOfKind('commit');
+    expect(commits).toHaveLength(1);
+    const commit = first(commits, 'commit draft');
+    expect(draftsOfKind('render')).toHaveLength(0);
+    expect(renderedComponents()).not.toContain('UnreachableLeaf');
+    // Truncation is stated even though no list was cut: what was cut is the
+    // walk, and a reader of this commit has to know the tree was not fully
+    // examined.
+    expect(commit.attributes['truncated']).toBe(true);
+    expect(commit.attributes['renderCount']).toBe(0);
+    expect(commit.attributes['renderedFiberCount']).toBe(0);
+    // A commit that rendered nothing gets no phase summary: neither `mount`
+    // nor `update` would be true of it.
+    expect('phase' in commit.attributes).toBe(false);
+    expect(getReactStats()).toStrictEqual({
+      commits: 1,
+      renders: 0,
+      truncatedCommits: 1,
+      // Stopping at a bound is not a failure: nothing threw, and a non-zero
+      // count here would be this module reporting its own bug.
+      failures: 0,
+    });
+    expectJsonSafe(commit);
+  });
+
+  it('counts rendered fibers only as far as the visit bound let the walk go', () => {
+    // Wide rather than deep, and every fiber a component: the event bound cuts
+    // the list at 500 while counting continues — but only as far as the walk
+    // goes, and the walk may hold and visit at most
+    // `MAX_FIBER_VISITS_PER_COMMIT` fibers including the root it starts from.
+    // So the count stops one short of that bound, and on a tree this large it
+    // is a lower bound rather than the total, which is the one thing
+    // `renderedFiberCount` must not overstate.
+    const total = MAX_FIBER_VISITS_PER_COMMIT + 1_000;
+    const rows = Array.from({ length: total }, (_unused, index) =>
+      syntheticFiber({ name: `Wide${String(index)}` }),
+    );
+    const root = syntheticRoot(rows, 'synthetic-visit-bound-wide');
+
+    attachReact();
+    commitSynthetic(root);
+
+    const { commit, renders } = expectWellFormedCommit('mount');
+    expect(renders).toHaveLength(MAX_RENDERS_PER_COMMIT);
+    expect(commit.attributes['renderedFiberCount']).toBe(MAX_FIBER_VISITS_PER_COMMIT - 1);
+    expect(commit.attributes['renderedFiberCount']).toBeLessThan(total);
+    expect(commit.attributes['truncated']).toBe(true);
+    expect(getReactStats().truncatedCommits).toBe(1);
+    expect(getReactStats().failures).toBe(0);
+  });
+
+  it('terminates on a fiber whose child link points back into the walk', () => {
+    // No structure React builds, and exactly what a bounded walk with no set
+    // of visited fibers has to survive: the visit bound is the termination
+    // argument, so this test is the one that proves it.
+    const [outer, inner] = syntheticChain([{ name: PARENT }, { name: CHILD }]);
+    if (outer === undefined || inner === undefined) {
+      throw new Error('expected two synthetic fibers');
+    }
+    mutateFiber(inner, 'child', outer);
+    const root = syntheticRoot([outer], 'synthetic-cyclic');
+
+    attachReact();
+    expect(() => {
+      commitSynthetic(root);
+    }).not.toThrow();
+
+    const commit = first(draftsOfKind('commit'), 'commit draft');
+    expect(commit.attributes['truncated']).toBe(true);
+    // The two components are reported over and over as the cycle is walked,
+    // up to the event bound — evidence that is odd but honest, and bounded.
+    expect(draftsOfKind('render')).toHaveLength(MAX_RENDERS_PER_COMMIT);
+    expect(new Set(renderedComponents())).toStrictEqual(new Set([PARENT, CHILD]));
+    expect(getReactStats().failures).toBe(0);
   });
 
   it('bounds a deep ownerChain at MAX_OWNER_CHAIN', () => {
@@ -1136,16 +1709,19 @@ describe('commit traversal — synthetic fiber root', () => {
  * ---------------------------------------------------------------------------
  * Commit traversal, driven by a real React 19.3.0 render
  *
- * The suite AAP 0.8.3 names. Skipped — never deleted — with a stated reason if
- * `react-dom` cannot be imported, in which case the synthetic suite above is
- * what keeps the traversal contract proven.
+ * The suite AAP 0.8.3 names, and the reason this file exists: a hand-built
+ * fiber proves what the walk does with a structure, while only the real
+ * renderer proves the structure is the one React 19.3.0 actually builds.
+ * Registered unconditionally — `react` and `react-dom` are required
+ * devDependencies and an import failure fails this file's collection
+ * ({@link loadReactRuntime}), so this block can never be quietly absent from a
+ * green run.
  * ---------------------------------------------------------------------------
  */
 
-describe.skipIf(reactRuntime === undefined)('commit traversal — React 19 under happy-dom', () => {
+describe('commit traversal — React 19 under happy-dom', () => {
   it('mounts a three-level tree as one commit with a render per component', async () => {
-    const runtime = requireRuntime();
-    await mountTree(runtime, 'react-mount');
+    await mountTree(reactRuntime, 'react-mount');
 
     const { commit, renders } = expectWellFormedCommit('mount');
     expect(renders).toHaveLength(3);
@@ -1158,6 +1734,18 @@ describe.skipIf(reactRuntime === undefined)('commit traversal — React 19 under
     expect(commit.attributes['rendererId']).toBe(RENDERER_ID);
     expect(renderOf(LEAF)?.attributes['ownerChain']).toStrictEqual([CHILD, PARENT]);
 
+    // The AAP's "durations" half, on a clock this suite pinned. React's
+    // profiling timer reads `performance.now()`, which does not move while the
+    // tree renders, so every fiber of this commit records the same start and a
+    // duration of zero — and the product's own fallback, the instant the
+    // commit callback ran, is that same reading. Both routes therefore land on
+    // one stated epoch value, which is what makes this an equality rather than
+    // a window.
+    for (const draft of [commit, ...renders]) {
+      expect(draft.startTime).toBe(epochAt(FIXED_NOW_MS));
+      expect(draft.duration).toBe(0);
+    }
+
     expect(getReactStats()).toStrictEqual({
       commits: 1,
       renders: 3,
@@ -1168,8 +1756,7 @@ describe.skipIf(reactRuntime === undefined)('commit traversal — React 19 under
   });
 
   it('carries no trigger key at all on a mount render', async () => {
-    const runtime = requireRuntime();
-    await mountTree(runtime, 'react-mount-trigger');
+    await mountTree(reactRuntime, 'react-mount-trigger');
 
     const renders = draftsOfKind('render');
     expect(renders).toHaveLength(3);
@@ -1184,11 +1771,10 @@ describe.skipIf(reactRuntime === undefined)('commit traversal — React 19 under
   });
 
   it('reports an update whose trigger and changedProps name the changed prop', async () => {
-    const runtime = requireRuntime();
-    const { fixture } = await mountTree(runtime, 'react-update');
+    const { fixture } = await mountTree(reactRuntime, 'react-update');
     clearCaptured();
 
-    await inAct(runtime, () => {
+    await inAct(reactRuntime, () => {
       fixture.bumpLabel();
     });
 
@@ -1208,11 +1794,10 @@ describe.skipIf(reactRuntime === undefined)('commit traversal — React 19 under
   });
 
   it('reports a stable-input re-render as unchanged, or not at all when memo bails out', async () => {
-    const runtime = requireRuntime();
-    const { fixture } = await mountTree(runtime, 'react-quiet');
+    const { fixture } = await mountTree(reactRuntime, 'react-quiet');
     clearCaptured();
 
-    await inAct(runtime, () => {
+    await inAct(reactRuntime, () => {
       fixture.bumpQuietly();
     });
 
@@ -1241,16 +1826,182 @@ describe.skipIf(reactRuntime === undefined)('commit traversal — React 19 under
     expect(renders.length).toBeGreaterThanOrEqual(2);
   });
 
+  it('reports the fallback commit of a suspended lazy component', async () => {
+    const fixture = createSuspenseFixture(reactRuntime);
+    const tree = createHostRoot(reactRuntime, 'react-suspense-fallback');
+
+    attachReact();
+    await inAct(reactRuntime, () => {
+      tree.root.render(<fixture.Shell />);
+    });
+
+    // React rendered the shell, hit the unresolved lazy child, and committed
+    // the boundary's fallback instead of the primary content. The DOM says so
+    // independently of the events.
+    expect(
+      document
+        .querySelector('#react-suspense-fallback [data-fallback]')
+        ?.getAttribute('data-fallback'),
+    ).toBe('pending');
+    expect(document.querySelector('#react-suspense-fallback [data-lazy]')).toBeNull();
+
+    // Two commits, which is React 19.3.0's own behaviour for a mount that
+    // suspends: the boundary's fallback is committed, and a second commit
+    // follows for the same root that renders no fiber at all. Both are
+    // reported, because a commit that rendered nothing is still a commit a
+    // reader may need to account for — and the second one is where a producer
+    // that assumed "a commit has renders" would emit a phase summary or a
+    // count it cannot support.
+    const shapes = expectWellFormedCommits();
+    expect(shapes).toHaveLength(2);
+    const rendering = first(shapes, 'fallback commit');
+    const empty = shapes[1];
+    if (empty === undefined) {
+      throw new Error('expected a second commit for the suspended boundary');
+    }
+
+    // The components a developer wrote, and only those: the Suspense boundary
+    // and the offscreen fragment React re-parents the primary tree into are
+    // not components and are stepped over, while the lazy child has no
+    // component yet and so has nothing to report.
+    expect(renderedComponents()).toStrictEqual([SUSPENSE_SHELL, FALLBACK]);
+    expect(renderedComponents()).not.toContain(LAZY_LEAF);
+    expect(rendering.commit.attributes['rootName']).toBe('#react-suspense-fallback');
+    expect(rendering.commit.attributes['renderedFiberCount']).toBe(2);
+    expect(rendering.commit.attributes['phase']).toBe('mount');
+    expect(rendering.renders).toHaveLength(2);
+
+    expect(empty.renders).toStrictEqual([]);
+    expect(empty.commit.attributes['renderCount']).toBe(0);
+    expect(empty.commit.attributes['renderedFiberCount']).toBe(0);
+    // Neither `mount` nor `update` would be true of a commit that rendered
+    // nothing, so the key is omitted rather than guessed.
+    expect('phase' in empty.commit.attributes).toBe(false);
+
+    // Parentage twice over: every render nests in the commit that performed
+    // it, and the fallback's owner chain names the shell above it — the
+    // boundary's own fibers are not levels of the component tree.
+    for (const render of rendering.renders) {
+      expect(render.parentSpanId).toBe(rendering.commit.spanId);
+      expect(render.attributes['phase']).toBe('mount');
+      expect('trigger' in render.attributes).toBe(false);
+      expect(render.startTime).toBe(epochAt(FIXED_NOW_MS));
+      expect(Number.isFinite(render.duration)).toBe(true);
+      expect(render.duration).toBeGreaterThanOrEqual(0);
+    }
+    expect(renderOf(FALLBACK)?.attributes['ownerChain']).toStrictEqual([SUSPENSE_SHELL]);
+    expect('ownerChain' in (renderOf(SUSPENSE_SHELL)?.attributes ?? {})).toBe(false);
+  });
+
+  it('reports the resolved commit once the lazy module settles', async () => {
+    const fixture = createSuspenseFixture(reactRuntime);
+    const tree = createHostRoot(reactRuntime, 'react-suspense-resolved');
+
+    attachReact();
+    await inAct(reactRuntime, () => {
+      tree.root.render(<fixture.Shell />);
+    });
+    expect(renderedComponents()).toStrictEqual([SUSPENSE_SHELL, FALLBACK]);
+    const fallbackCommitSpanIds = new Set(draftsOfKind('commit').map((draft) => draft.spanId));
+    clearCaptured();
+
+    // 3 ms later, so the second commit is distinguishable from the first by
+    // its timestamp as well as by its contents.
+    advanceClock(3);
+    await inAct(reactRuntime, () => {
+      fixture.settleLazy();
+    });
+
+    expect(
+      document.querySelector('#react-suspense-resolved [data-lazy]')?.getAttribute('data-lazy'),
+    ).toBe(LAZY_LABEL);
+    expect(document.querySelector('#react-suspense-resolved [data-fallback]')).toBeNull();
+
+    // Exactly one commit, and not one already seen: the module settling starts
+    // a fresh render pass rather than continuing the commit that showed the
+    // fallback.
+    const resolved = expectWellFormedCommit('mount');
+    expect(fallbackCommitSpanIds.has(resolved.commit.spanId)).toBe(false);
+    expect(resolved.renders).toHaveLength(1);
+    expect(resolved.commit.attributes['renderedFiberCount']).toBe(1);
+    expect(resolved.commit.attributes['rootName']).toBe('#react-suspense-resolved');
+
+    // The component React retagged from the lazy placeholder, named from the
+    // implementation the module exported, and a mount — this instance has no
+    // previous fiber, so there is no `trigger` to report and none is written
+    // (AAP §0.2.3).
+    const lazyRender = renderOf(LAZY_LEAF);
+    if (lazyRender === undefined) {
+      throw new Error(
+        `expected a render for ${LAZY_LEAF}, observed ${JSON.stringify(renderedComponents())}`,
+      );
+    }
+    expect(lazyRender.name).toBe(LAZY_LEAF);
+    expect(lazyRender.attributes['phase']).toBe('mount');
+    expect('trigger' in lazyRender.attributes).toBe(false);
+    expect(lazyRender.attributes['ownerChain']).toStrictEqual([SUSPENSE_SHELL]);
+    expect(lazyRender.parentSpanId).toBe(resolved.commit.spanId);
+    expect(lazyRender.startTime).toBe(epochAt(FIXED_NOW_MS + 3));
+    expect(Number.isFinite(lazyRender.duration)).toBe(true);
+    expect(lazyRender.duration).toBeGreaterThanOrEqual(0);
+
+    // The fallback left the tree; an unmount is not a render, so nothing is
+    // reported for it.
+    expect(renderedComponents()).not.toContain(FALLBACK);
+    expect(getReactStats().failures).toBe(0);
+    for (const draft of captured) {
+      expectJsonSafe(draft);
+    }
+  });
+
+  it('reports a context-driven render inside a memoized subtree', async () => {
+    const fixture = createContextFixture(reactRuntime);
+    const tree = createHostRoot(reactRuntime, 'react-context');
+
+    attachReact();
+    await inAct(reactRuntime, () => {
+      tree.root.render(<fixture.App />);
+    });
+    expect(renderedComponents()).toStrictEqual([CONTEXT_APP, CONSUMER, QUIET]);
+    clearCaptured();
+
+    await inAct(reactRuntime, () => {
+      fixture.bumpTick();
+    });
+
+    // The shape of the demo's seeded excessive-render defect (AAP §0.8.2), and
+    // the case the traversal's descent rule has to get right: the memoized
+    // consumer's props are identical, so React bails out on it at the props
+    // level and only reaches it because a context it reads changed. A walk
+    // that pruned the subtree on its parent's unchanged children would report
+    // the provider's render and silently lose the render the developer is
+    // asking about.
+    const { renders } = expectWellFormedCommit('update');
+    expect(renderedComponents()).toStrictEqual([CONTEXT_APP, CONSUMER]);
+    expect(renderOf(CONTEXT_APP)?.attributes['trigger']).toBe('state');
+    expect(renderOf(CONSUMER)?.attributes['trigger']).toBe('context');
+    expect(renderOf(CONSUMER)?.attributes['changedProps']).toStrictEqual([]);
+    expect(renderOf(CONSUMER)?.attributes['renderCount']).toBe(2);
+
+    // The memoized component that reads nothing did not render, so there is no
+    // event for it — `unchanged_render_count` counts components React did
+    // re-render with stable inputs, not components it correctly skipped.
+    expect(renderOf(QUIET)).toBeUndefined();
+    expect(renders).toHaveLength(2);
+    expect(document.querySelector('#react-context [data-tick]')?.getAttribute('data-tick')).toBe(
+      '1',
+    );
+  });
+
   it('counts renders per component within the capture and restarts after a reset', async () => {
-    const runtime = requireRuntime();
-    const { fixture } = await mountTree(runtime, 'react-counts');
+    const { fixture } = await mountTree(reactRuntime, 'react-counts');
 
     expect(renderOf(PARENT)?.attributes['renderCount']).toBe(1);
     expect(renderOf(CHILD)?.attributes['renderCount']).toBe(1);
     expect(renderOf(LEAF)?.attributes['renderCount']).toBe(1);
 
     clearCaptured();
-    await inAct(runtime, () => {
+    await inAct(reactRuntime, () => {
       fixture.bumpLabel();
     });
     expect(renderOf(PARENT)?.attributes['renderCount']).toBe(2);
@@ -1262,7 +2013,7 @@ describe.skipIf(reactRuntime === undefined)('commit traversal — React 19 under
     // this interaction's (AAP 0.2.3).
     resetReactCounters();
     clearCaptured();
-    await inAct(runtime, () => {
+    await inAct(reactRuntime, () => {
       fixture.bumpLabel();
     });
     expect(renderOf(PARENT)?.attributes['renderCount']).toBe(1);
@@ -1271,15 +2022,14 @@ describe.skipIf(reactRuntime === undefined)('commit traversal — React 19 under
   });
 
   it('joins the interaction trace when a click drives the commit', async () => {
-    const runtime = requireRuntime();
-    const { tree } = await mountTree(runtime, 'react-interaction');
+    const { tree } = await mountTree(reactRuntime, 'react-interaction');
     attachInteractions();
     expect(isInteractionsAttached()).toBe(true);
     clearCaptured();
 
     const target = tree.container.querySelector('.parent');
     expect(target).not.toBeNull();
-    await inAct(runtime, () => {
+    await inAct(reactRuntime, () => {
       target?.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
       // The capture-phase listener opens the window before the page's own
       // handler runs, which is what makes the commit below attributable.
@@ -1295,12 +2045,11 @@ describe.skipIf(reactRuntime === undefined)('commit traversal — React 19 under
   });
 
   it('emits a state transition for a useState update', async () => {
-    const runtime = requireRuntime();
-    const { fixture } = await mountTree(runtime, 'react-state');
+    const { fixture } = await mountTree(reactRuntime, 'react-state');
     attachState();
     clearCaptured();
 
-    await inAct(runtime, () => {
+    await inAct(reactRuntime, () => {
       fixture.bumpLabel();
     });
 
@@ -1336,8 +2085,7 @@ describe.skipIf(reactRuntime === undefined)('commit traversal — React 19 under
   });
 
   it('stops observing after detachReact', async () => {
-    const runtime = requireRuntime();
-    const { fixture } = await mountTree(runtime, 'react-detach');
+    const { fixture } = await mountTree(reactRuntime, 'react-detach');
     expect(isReactAttached()).toBe(true);
     expect(getReactStats().commits).toBe(1);
 
@@ -1345,7 +2093,7 @@ describe.skipIf(reactRuntime === undefined)('commit traversal — React 19 under
     expect(isReactAttached()).toBe(false);
     clearCaptured();
 
-    await inAct(runtime, () => {
+    await inAct(reactRuntime, () => {
       fixture.bumpLabel();
     });
 
@@ -1363,15 +2111,14 @@ describe.skipIf(reactRuntime === undefined)('commit traversal — React 19 under
   });
 
   it('tolerates attachReact and detachReact being called twice', async () => {
-    const runtime = requireRuntime();
-    const fixture = createTreeFixture(runtime);
-    const tree = createHostRoot(runtime, 'react-idempotent');
+    const fixture = createTreeFixture(reactRuntime);
+    const tree = createHostRoot(reactRuntime, 'react-idempotent');
 
     attachReact();
     attachReact();
     expect(isReactAttached()).toBe(true);
 
-    await inAct(runtime, () => {
+    await inAct(reactRuntime, () => {
       tree.root.render(<fixture.Parent />);
     });
 
@@ -1389,10 +2136,9 @@ describe.skipIf(reactRuntime === undefined)('commit traversal — React 19 under
   });
 
   it('snapshots the component tree as JSON-safe nodes', async () => {
-    const runtime = requireRuntime();
-    const { fixture } = await mountTree(runtime, 'react-tree');
+    const { fixture } = await mountTree(reactRuntime, 'react-tree');
     clearCaptured();
-    await inAct(runtime, () => {
+    await inAct(reactRuntime, () => {
       fixture.bumpLabel();
     });
 
@@ -1425,8 +2171,7 @@ describe.skipIf(reactRuntime === undefined)('commit traversal — React 19 under
   });
 
   it('respects the snapshot bounds and reports no tree once detached', async () => {
-    const runtime = requireRuntime();
-    await mountTree(runtime, 'react-tree-bounds');
+    await mountTree(reactRuntime, 'react-tree-bounds');
 
     const truncated = snapshotComponentTree({ maxNodes: 2 });
     if (truncated === undefined) {
@@ -1451,15 +2196,14 @@ describe.skipIf(reactRuntime === undefined)('commit traversal — React 19 under
   });
 
   it('keeps observing the rest of a commit when a component throws', async () => {
-    const runtime = requireRuntime();
-    const Shell = createExplodingTree(runtime);
+    const Shell = createExplodingTree(reactRuntime);
     let caught = 0;
-    const tree = createHostRoot(runtime, 'react-boundary', () => {
+    const tree = createHostRoot(reactRuntime, 'react-boundary', () => {
       caught += 1;
     });
 
     attachReact();
-    await inAct(runtime, () => {
+    await inAct(reactRuntime, () => {
       tree.root.render(<Shell />);
     });
 
@@ -1488,7 +2232,6 @@ describe.skipIf(reactRuntime === undefined)('commit traversal — React 19 under
   });
 
   it('hands a commit to the transport only while a capture is armed', async () => {
-    const runtime = requireRuntime();
     // The recorder is removed for this case on purpose: the point is that
     // the real `emitMany` is in the path and that its capture gate decides.
     vi.restoreAllMocks();
@@ -1496,9 +2239,9 @@ describe.skipIf(reactRuntime === undefined)('commit traversal — React 19 under
     attachReact();
 
     transport.configureTransport({ enabled: false });
-    const dormantFixture = createTreeFixture(runtime);
-    const dormantTree = createHostRoot(runtime, 'react-dormant');
-    await inAct(runtime, () => {
+    const dormantFixture = createTreeFixture(reactRuntime);
+    const dormantTree = createHostRoot(reactRuntime, 'react-dormant');
+    await inAct(reactRuntime, () => {
       dormantTree.root.render(<dormantFixture.Parent />);
     });
     // A dormant agent on a page the developer is merely browsing keeps
@@ -1508,9 +2251,9 @@ describe.skipIf(reactRuntime === undefined)('commit traversal — React 19 under
     expect(getReactStats().commits).toBe(1);
 
     transport.configureTransport({ sessionId: SESSION_ID, captureId: CAPTURE_ID, enabled: true });
-    const armedFixture = createTreeFixture(runtime);
-    const armedTree = createHostRoot(runtime, 'react-armed');
-    await inAct(runtime, () => {
+    const armedFixture = createTreeFixture(reactRuntime);
+    const armedTree = createHostRoot(reactRuntime, 'react-armed');
+    await inAct(reactRuntime, () => {
       armedTree.root.render(<armedFixture.Parent />);
     });
     // One commit and one render per component, in one hand-off, consuming
@@ -1518,5 +2261,311 @@ describe.skipIf(reactRuntime === undefined)('commit traversal — React 19 under
     expect(transport.getTransportStats().seq).toBe(4);
     expect(transport.getTransportStats().buffered).toBe(4);
     expect(transport.getTransportStats().dropped).toBe(0);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * A release that fails, and the failures a swallowing producer owes the channel
+ *
+ * Two guarantees the suites above cannot reach, because bippy 0.7.3's real
+ * unsubscribe deletes one entry from a `Set` and has nothing in it that can
+ * throw:
+ *
+ * 1. **A cleanup that fails is not a cleanup that lied** (AAP §0.5.1). The
+ *    function `instrument()` returned is the only thing that can remove the
+ *    handlers it installed, so `detachReact()` keeps it when calling it throws
+ *    and retries on the next call, while the flag the handlers gate on is
+ *    cleared first — a capture that could not be released still observes
+ *    nothing. Dropping the handle instead would leave those handlers installed
+ *    for the life of the document, and the next `attachReact()` would stack a
+ *    *second* subscription on top: two dispatches per commit, every render
+ *    event duplicated.
+ * 2. **A swallowed failure is stated, not merely counted** (AAP §0.5.5). Every
+ *    guard in `./react.ts` also posts an `agent.error` frame with
+ *    `code: 'producer-failure'`, so a capture that lost its render evidence —
+ *    the whole basis of "why is this component rendering so many times?"
+ *    (AAP §0.8.4) — cannot present itself to either UI as a capture that
+ *    succeeded.
+ *
+ * Everything needed to provoke that path is built **inside** the tests, never
+ * at module scope, so the cases above keep running against the real library
+ * through this file's static imports:
+ *
+ * - `vi.doMock` is not hoisted, so it may close over locals and applies only
+ *   to imports made after it;
+ * - its factory starts from `await vi.importActual('bippy')` and overrides
+ *   `instrument` alone, leaving the traversal, the work-tag tables and the
+ *   hook helpers real;
+ * - `vi.resetModules()` then `await import('./react.js')` gives the module a
+ *   fresh graph, `./transport.js` included — which is why the transport this
+ *   section observes is imported the same way rather than reused from the top
+ *   of the file;
+ * - the `finally` unmocks and resets the registry, so no later test file
+ *   inherits any of it.
+ *
+ * The failure frames are read off `window.postMessage`, because a control
+ * frame needs no bridge handshake: `postControl` posts it whether or not a
+ * bridge has announced itself, which is what makes a producer failure
+ * reportable during teardown.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The callbacks `./react.ts` registers, as the faked `instrument()` sees them. */
+interface RegisteredHandlers {
+  /** React's commit callback: the source of every event in this file. */
+  onCommitFiberRoot?: (rendererId: number, root: FiberRoot, priority?: unknown) => unknown;
+  /** React's post-commit callback. */
+  onPostCommitFiberRoot?: (rendererId: number, root: FiberRoot) => unknown;
+  /** React's unmount callback. */
+  onCommitFiberUnmount?: (rendererId: number, fiber: Fiber) => unknown;
+}
+
+/**
+ * Import `./react.ts` against a bippy whose release throws its first
+ * `releaseFailures` calls and succeeds afterwards.
+ *
+ * The counter is explicit rather than read off the spy so the schedule is a
+ * property of the fake and not of the assertion order.
+ *
+ * @param releaseFailures How many release attempts throw before one succeeds.
+ * @returns The freshly imported module, its fresh transport, the two spies and
+ * the handlers the module registered.
+ */
+async function mockedReactModule(releaseFailures: number) {
+  let releaseAttempts = 0;
+  const release = vi.fn(() => {
+    releaseAttempts += 1;
+    if (releaseAttempts <= releaseFailures) {
+      throw new TypeError('react.test.tsx: deliberate release failure');
+    }
+  });
+
+  let registered: RegisteredHandlers = {};
+  const instrumentFake = vi.fn((options: RegisteredHandlers) => {
+    registered = options;
+    return release;
+  });
+
+  vi.doMock('bippy', async () => {
+    const actual = await vi.importActual<typeof import('bippy')>('bippy');
+    return { ...actual, instrument: instrumentFake };
+  });
+  vi.resetModules();
+
+  const reactModule = await import('./react.js');
+  const transportModule = await import('./transport.js');
+
+  return {
+    /** The module under test, on its own module graph. */
+    react: reactModule,
+    /** The transport instance that module posts through. */
+    transport: transportModule,
+    /** The faked release; its call count is the retry evidence. */
+    release,
+    /** The faked `instrument`; its call count is the no-double-subscribe evidence. */
+    instrument: instrumentFake,
+    /** The handlers the module registered, empty until it subscribes. */
+    handlers: (): RegisteredHandlers => registered,
+  };
+}
+
+/**
+ * Run `scenario` against a freshly imported `./react.ts` and undo the mock
+ * whatever the scenario does.
+ *
+ * @param releaseFailures Handed to {@link mockedReactModule}.
+ * @param scenario The case body, which receives the harness.
+ */
+async function withMockedBippy(
+  releaseFailures: number,
+  scenario: (harness: Awaited<ReturnType<typeof mockedReactModule>>) => Promise<void> | void,
+): Promise<void> {
+  const harness = await mockedReactModule(releaseFailures);
+  try {
+    await scenario(harness);
+  } finally {
+    vi.doUnmock('bippy');
+    vi.resetModules();
+  }
+}
+
+/** Dispatch one commit to the handlers the module registered. */
+function dispatchCommit(handlers: RegisteredHandlers, root: FiberRoot): void {
+  const onCommitFiberRoot = handlers.onCommitFiberRoot;
+  if (onCommitFiberRoot === undefined) {
+    throw new Error('expected ./react.ts to have registered an onCommitFiberRoot handler');
+  }
+  onCommitFiberRoot(RENDERER_ID, root, undefined);
+}
+
+/** A one-component synthetic root, named so two roots stay distinguishable. */
+function oneComponentRoot(containerId: string): FiberRoot {
+  return syntheticRoot([first(syntheticChain([{ name: PARENT }]), 'synthetic fiber')], containerId);
+}
+
+/**
+ * The `producer-failure` payloads a spied `window.postMessage` observed.
+ *
+ * Filtered on the agent's source tag, so an unrelated frame — a page's own
+ * `postMessage`, a bridge frame — is never read as a report.
+ *
+ * @param messages The first argument of each recorded `postMessage` call.
+ * @returns The payload of each `agent.error` frame that reports a producer
+ * failure, in the order they were posted.
+ */
+function producerFailurePayloads(messages: readonly unknown[]): Record<string, unknown>[] {
+  const payloads: Record<string, unknown>[] = [];
+  for (const message of messages) {
+    if (typeof message !== 'object' || message === null) {
+      continue;
+    }
+    const frame = message as { source?: unknown; type?: unknown; payload?: unknown };
+    if (frame.source !== 'debuggen-agent' || frame.type !== 'agent.error') {
+      continue;
+    }
+    const payload = frame.payload;
+    if (typeof payload !== 'object' || payload === null) {
+      continue;
+    }
+    const record = payload as Record<string, unknown>;
+    if (record['code'] === 'producer-failure') {
+      payloads.push(record);
+    }
+  }
+  return payloads;
+}
+
+describe('cleanup that cannot complete, and the failures it reports', () => {
+  it('stops observing and reports producer-failure when the release throws', async () => {
+    const postSpy = vi.spyOn(window, 'postMessage');
+
+    await withMockedBippy(
+      1,
+      ({ react: reactModule, release, instrument: instrumentFake, handlers }) => {
+        reactModule.attachReact();
+        expect(instrumentFake).toHaveBeenCalledTimes(1);
+        expect(reactModule.isReactAttached()).toBe(true);
+
+        reactModule.detachReact();
+
+        expect(release).toHaveBeenCalledTimes(1);
+        // The gate is cleared before the release is attempted, so "attached"
+        // keeps meaning "observing" — never a flag claiming an observation that
+        // is not happening.
+        expect(reactModule.isReactAttached()).toBe(false);
+        expect(reactModule.getReactStats().failures).toBe(1);
+
+        // The handlers really are still installed — that is why the handle is
+        // retained — and a commit dispatched to them produces nothing at all.
+        dispatchCommit(handlers(), oneComponentRoot('release-failure-gate'));
+        expect(reactModule.getReactStats().commits).toBe(0);
+        expect(reactModule.getReactStats().renders).toBe(0);
+
+        const failures = producerFailurePayloads(
+          postSpy.mock.calls.map((call) => call[0] as unknown),
+        );
+        expect(failures).toHaveLength(1);
+        expect(failures[0]?.['source']).toBe('react');
+        expect(failures[0]?.['stage']).toBe('release');
+        // The thrown value's type, and nothing the developer's page could have
+        // put in its message.
+        expect(failures[0]?.['error']).toBe('TypeError');
+        expect(failures[0]?.['occurrence']).toBe(1);
+      },
+    );
+  });
+
+  it('retries the retained release on the next detachReact and drops it once it succeeds', async () => {
+    await withMockedBippy(1, ({ react: reactModule, release }) => {
+      reactModule.attachReact();
+
+      reactModule.detachReact();
+      expect(release).toHaveBeenCalledTimes(1);
+
+      // The retry: the handle a failed release left behind is the only thing
+      // that can still remove those handlers (AAP §0.5.1).
+      reactModule.detachReact();
+      expect(release).toHaveBeenCalledTimes(2);
+      expect(reactModule.isReactAttached()).toBe(false);
+      // Nothing failed this time, so the counters a detach resets stay reset.
+      expect(reactModule.getReactStats()).toStrictEqual({
+        commits: 0,
+        renders: 0,
+        truncatedCommits: 0,
+        failures: 0,
+      });
+
+      // A call that returned normally proved the handlers are gone, so there
+      // is nothing left to retry.
+      reactModule.detachReact();
+      expect(release).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  it('re-arms the retained subscription instead of instrumenting a second time', async () => {
+    await withMockedBippy(
+      1,
+      ({ react: reactModule, release, instrument: instrumentFake, handlers }) => {
+        reactModule.attachReact();
+        reactModule.detachReact();
+        expect(release).toHaveBeenCalledTimes(1);
+        expect(reactModule.isReactAttached()).toBe(false);
+
+        reactModule.attachReact();
+
+        // The regression this case exists for: a second `instrument()` adds a
+        // second entry to bippy's dispatch set, and every commit from then on
+        // would be observed — and emitted — twice.
+        expect(instrumentFake).toHaveBeenCalledTimes(1);
+        expect(reactModule.isReactAttached()).toBe(true);
+
+        // Observation resumed through the subscription that was never released:
+        // one dispatch, one commit, one render.
+        dispatchCommit(handlers(), oneComponentRoot('release-failure-rearm'));
+        expect(reactModule.getReactStats().commits).toBe(1);
+        expect(reactModule.getReactStats().renders).toBe(1);
+
+        reactModule.detachReact();
+        expect(release).toHaveBeenCalledTimes(2);
+        expect(reactModule.isReactAttached()).toBe(false);
+      },
+    );
+  });
+
+  it('reports a commit whose body throws once and keeps it away from React', async () => {
+    const postSpy = vi.spyOn(window, 'postMessage');
+
+    await withMockedBippy(0, ({ react: reactModule, transport: freshTransport, handlers }) => {
+      // The hand-off is the last step of the commit body, so a throw here is a
+      // whole commit lost: no commit event, no render events, no evidence.
+      vi.spyOn(freshTransport, 'emitMany').mockImplementation(() => {
+        throw new TypeError('react.test.tsx: deliberate emit failure');
+      });
+
+      reactModule.attachReact();
+      const root = oneComponentRoot('commit-body-failure');
+
+      // A throw out of here would surface inside React's commit phase, which
+      // is the one failure this product may never cause.
+      expect(() => {
+        dispatchCommit(handlers(), root);
+      }).not.toThrow();
+
+      expect(reactModule.getReactStats().commits).toBe(1);
+      expect(reactModule.getReactStats().failures).toBe(1);
+
+      const failures = producerFailurePayloads(
+        postSpy.mock.calls.map((call) => call[0] as unknown),
+      );
+      expect(failures).toHaveLength(1);
+      expect(failures[0]?.['source']).toBe('react');
+      expect(failures[0]?.['stage']).toBe('commit');
+      expect(failures[0]?.['error']).toBe('TypeError');
+      // Bounded by the transport, not by a second limiter here: a source gets
+      // one frame per capture (`MAX_PRODUCER_FAILURE_REPORTS`), so the frame
+      // this commit produced is also the last one this source gets.
+      expect(failures[0]?.['final']).toBe(true);
+    });
   });
 });

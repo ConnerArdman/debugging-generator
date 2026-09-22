@@ -3,8 +3,8 @@
  *
  * One route, one question: what has this account ordered, when, and how far along is each one. The
  * page reads the query string, parses it with the schema that declares the listing's parameters,
- * calls the order service directly and hands the page of orders to `OrderHistoryList`. There is
- * nothing else here.
+ * asks this application's own orders endpoint for the page of orders and hands it to
+ * `OrderHistoryList`. There is nothing else here.
  *
  * WHAT THIS FILE OWNS, AND WHAT IT DOES NOT
  * It owns the request - the query string, the one service call, the failure path - together with
@@ -15,12 +15,14 @@
  * component of its own. The list has no error prop by design, so the notice is this page's own
  * surface rather than something passed into it.
  *
- * THE SERVICE IS CALLED, NOT THE ENDPOINT
- * `listCustomerOrders` is invoked as a function. `GET /api/orders` answers the same listing for a
- * caller outside this application, and a server render that fetched its own route would pay for a
- * second HTTP exchange, a second serialization and a second chance to fail on every visit - which
- * is also why `@/lib/api-client` exposes no wrapper for that endpoint and nothing in the browser
- * asks for it.
+ * THE HISTORY COMES FROM THE ENDPOINT
+ * `GET /api/orders` answers this listing, and the page reads it over HTTP through
+ * `loadOrderHistory` in `@/lib/api-client` rather than calling the order service in process. One
+ * code path therefore answers the list a customer is looking at and any other caller of the same
+ * endpoint, so a bound, a default or a payload change cannot apply to one and not the other. A
+ * server render has no relative base to resolve `/api/...` against, so the address the read is sent
+ * to comes from `@/server/origin`, which answers with the storefront's configured address or the
+ * loopback address on the port this process bound - never with anything a request carries.
  *
  * EVERY VISIT IS ITS OWN REQUEST
  * An order moves from pending to paid to fulfilled while the customer is watching, so the segment
@@ -53,9 +55,9 @@ import type { ReactElement } from 'react';
 import { OrderHistoryList } from '@/components/checkout/OrderHistoryList';
 import { BreadcrumbTrail, type BreadcrumbCrumb } from '@/components/layout/BreadcrumbTrail';
 import { Alert } from '@/components/ui/Alert';
+import { StorefrontApiError, loadOrderHistory } from '@/lib/api-client';
 import type { OrderSummary, PagedList, StorefrontErrorCode } from '@/lib/types';
-import { isStorefrontError } from '@/server/errors';
-import { listCustomerOrders, type CustomerOrdersInput } from '@/server/services/order.service';
+import { storefrontOrigin } from '@/server/origin';
 import { ordersQuerySchema, type OrdersQueryInput } from '@/server/validation/orders';
 
 /* ---------------------------------------------------------------------------
@@ -250,16 +252,18 @@ function base(query: OrdersQueryInput): string {
 /**
  * The sentence shown in place of the list for a caught value.
  *
- * `catch` binds `unknown`, and the only thing read off it is the code it carries when it is one of
- * this application's own errors: no message, no `details`, no `cause` and no stringification
- * reaches the markup, so nothing the database, the driver or a bug wrote can be printed on the
- * page.
+ * `catch` binds `unknown`, and the only thing read off it is the code the endpoint reported: no
+ * message, no `details`, no status and no stringification reaches the markup, so nothing the
+ * database, the driver or a bug wrote can be printed on the page. A reason this application did
+ * not state itself - a request that never arrived, a reply that could not be read - collapses into
+ * the generic sentence rather than becoming advice about the address bar, because it says nothing
+ * about the address bar.
  *
  * @param error Any caught value.
  * @returns One of {@link NOTICES}, or {@link GENERIC_NOTICE}.
  */
 function notice(error: unknown): string {
-  if (isStorefrontError(error)) {
+  if (error instanceof StorefrontApiError && error.reported) {
     return NOTICES[error.code] ?? GENERIC_NOTICE;
   }
 
@@ -311,9 +315,9 @@ export default async function OrderHistoryPage({ searchParams }: Props): Promise
    * The account is resolved before the query is parsed, so the schema sees a complete request and
    * applies its own defaults to everything else. A rejected query is then answered with the
    * listing's defaults rather than with an error: `safeParse` never throws, and re-parsing the
-   * account alone is exact because every other parameter of this schema is defaulted. The third
-   * binding is an annotation rather than a conversion - it is the compiler, not a cast, that
-   * establishes the parsed query is an argument the order service accepts.
+   * account alone is exact because every other parameter of this schema is defaulted. The parsed
+   * values are the endpoint's own parameters, so they are forwarded by name below rather than
+   * reshaped.
    */
   const parsed = ordersQuerySchema.safeParse({
     ...supplied,
@@ -322,21 +326,30 @@ export default async function OrderHistoryPage({ searchParams }: Props): Promise
   const query: OrdersQueryInput = parsed.success
     ? parsed.data
     : ordersQuerySchema.parse({ [ACCOUNT_PARAM]: DEMO_ACCOUNT });
-  const input: CustomerOrdersInput = query;
 
   /*
-   * One read, and the only thing in this file that can fail. The notice starts out as the wording
-   * for a failure nobody can act on, so the page always has something to say; a caught value
-   * replaces it with the sentence its code earns and leaves the page of orders unset, which is what
-   * selects the notice below. The log line carries a fixed label and the failure's kind only - a
-   * message or a stack may hold a path, a statement or a connection string - and it goes to the
-   * server's own output, never to the page.
+   * One read, and the only thing in this file that can fail - the authority the request is
+   * addressed to included, which is established inside the same `try` because an address this
+   * store may not call itself on and an endpoint that answered with a failure are the same thing
+   * to a reader. The notice starts out as the wording for a failure nobody can act on, so the page
+   * always has something to say; a caught value replaces it with the sentence its code earns and
+   * leaves the page of orders unset, which is what selects the notice below. The log line carries a
+   * fixed label and the failure's kind only - a message or a stack may hold a path, a statement or
+   * a connection string - and it goes to the server's own output, never to the page.
    */
   let orders: PagedList<OrderSummary> | null = null;
   let failure = GENERIC_NOTICE;
 
   try {
-    orders = await listCustomerOrders(input);
+    const origin = storefrontOrigin();
+
+    orders = await loadOrderHistory({
+      customerId: query.customerId,
+      status: query.status,
+      page: query.page,
+      pageSize: query.pageSize,
+      origin,
+    });
   } catch (error) {
     console.error(
       'Lumen Supply: the order history could not be read:',

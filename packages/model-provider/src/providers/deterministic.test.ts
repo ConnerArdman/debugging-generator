@@ -68,7 +68,7 @@ import type { Result } from '@debuggen/shared';
 
 import { COMPUTED_METRIC_IDS, INSTRUMENTATION_ACTION_TYPES } from '../deterministic/rules.js';
 import { EMPTY_CAPTURE_NOTICE } from '../deterministic/templates.js';
-import { isModelProvider } from '../provider.js';
+import { isModelProvider, modelUnavailableMessage } from '../provider.js';
 import type { ModelProvider } from '../provider.js';
 import { PROMPT_STAGES } from '../types.js';
 import type {
@@ -79,12 +79,7 @@ import type {
   StructuredAttempt,
   ToolDefinition,
 } from '../types.js';
-import {
-  DEFAULT_PROVIDER_ID,
-  createModelProvider,
-  modelUnavailableMessage,
-  resolveProviderConfig,
-} from '../factory.js';
+import { DEFAULT_PROVIDER_ID, createModelProvider, resolveProviderConfig } from '../factory.js';
 import { createDeterministicProvider } from './deterministic.js';
 import type { DeterministicProviderOptions } from './deterministic.js';
 import { PROVIDER_IDS } from './index.js';
@@ -2085,6 +2080,11 @@ describe('the factory selects this provider by default and never needs a credent
     const malformed: readonly (readonly [string, number])[] = [
       ['maxTokens', 0],
       ['temperature', -1],
+      // The selector refuses exactly what the network-backed provider would
+      // refuse: the messages API deprecated the sampling temperature and
+      // rejects every value but one, so a plausible-looking 0.7 is a
+      // configuration failure here rather than a 400 on every later call.
+      ['temperature', 0.7],
       ['timeoutMs', 1.5],
       ['maxRetries', Number.NaN],
     ];

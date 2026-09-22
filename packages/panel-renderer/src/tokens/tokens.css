@@ -36,6 +36,7 @@
   --dg-space-7: 24px;
   --dg-font-ui: -apple-system, "Segoe UI", Inter, sans-serif;
   --dg-font-mono: "JetBrains Mono", "SF Mono", Menlo, monospace;
+  --dg-font-weight-medium: 500;
   --dg-text-xs: 400 11px/16px var(--dg-font-ui);
   --dg-text-sm: 400 12px/16px var(--dg-font-ui);
   --dg-text-md: 400 13px/18px var(--dg-font-ui);
@@ -50,6 +51,9 @@
   --dg-shadow-1: 0 1px 2px rgba(0, 0, 0, 0.4);
   --dg-shadow-2: 0 4px 12px rgba(0, 0, 0, 0.5);
   --dg-focus-ring: 1px solid var(--dg-accent);
+  --dg-motion-duration: 160ms;
+  --dg-motion-easing: ease-out;
+  --dg-shimmer-duration: 1200ms;
   --dg-z-base: 0;
   --dg-z-overlay: 100;
   --dg-z-tooltip: 200;
@@ -91,6 +95,7 @@
   --dg-space-7: 24px;
   --dg-font-ui: -apple-system, "Segoe UI", Inter, sans-serif;
   --dg-font-mono: "JetBrains Mono", "SF Mono", Menlo, monospace;
+  --dg-font-weight-medium: 500;
   --dg-text-xs: 400 11px/16px var(--dg-font-ui);
   --dg-text-sm: 400 12px/16px var(--dg-font-ui);
   --dg-text-md: 400 13px/18px var(--dg-font-ui);
@@ -105,6 +110,9 @@
   --dg-shadow-1: 0 1px 2px rgba(16, 24, 40, 0.08);
   --dg-shadow-2: 0 4px 12px rgba(16, 24, 40, 0.16);
   --dg-focus-ring: 1px solid var(--dg-accent);
+  --dg-motion-duration: 160ms;
+  --dg-motion-easing: ease-out;
+  --dg-shimmer-duration: 1200ms;
   --dg-z-base: 0;
   --dg-z-overlay: 100;
   --dg-z-tooltip: 200;
@@ -146,6 +154,7 @@
   --dg-space-7: 24px;
   --dg-font-ui: -apple-system, "Segoe UI", Inter, sans-serif;
   --dg-font-mono: "JetBrains Mono", "SF Mono", Menlo, monospace;
+  --dg-font-weight-medium: 500;
   --dg-text-xs: 400 11px/16px var(--dg-font-ui);
   --dg-text-sm: 400 12px/16px var(--dg-font-ui);
   --dg-text-md: 400 13px/18px var(--dg-font-ui);
@@ -160,6 +169,9 @@
   --dg-shadow-1: none;
   --dg-shadow-2: none;
   --dg-focus-ring: 2px solid var(--dg-accent);
+  --dg-motion-duration: 160ms;
+  --dg-motion-easing: ease-out;
+  --dg-shimmer-duration: 1200ms;
   --dg-z-base: 0;
   --dg-z-overlay: 100;
   --dg-z-tooltip: 200;

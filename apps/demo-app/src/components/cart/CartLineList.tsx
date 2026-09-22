@@ -32,10 +32,15 @@
  *      with a retry control beside it. The list stays rendered underneath whenever there are still
  *      lines in hand: a refused change leaves the previously published cart in place, and replacing
  *      a cart a shopper can still read and still act on with an error screen would lose them work
- *      that was never lost.
+ *      that was never lost. With no lines in hand it is the only thing on the surface, for the
+ *      reason 3 gives.
  *   2. The first read. Placeholder rows, and only while there is nothing else to show - a re-read
  *      over a cart that already has lines keeps those lines on screen rather than blanking them.
- *   3. An empty cart, once it is known to be empty rather than merely unread.
+ *   3. An empty cart, once it is known to be empty rather than merely unread. A published failure
+ *      is the second of those and rules this state out: lines a failed read never returned say
+ *      nothing about what the cart holds, so the notice from 1 is shown on its own rather than
+ *      over a block telling a shopper their cart is empty on the strength of contents nobody
+ *      established.
  *   4. The lines.
  *
  * `syncStatus === 'saving'` is not one of the four. A change being carried to the server is
@@ -263,11 +268,15 @@ export function CartLineList({ variant = 'drawer', emptySlot, className }: Props
         : null}
 
       {/*
-        State 3. Known to be empty, not merely unread, which is why the loading branch above is
-        excluded rather than left to ordering. `emptySlot` replaces the whole block when a placing
-        supplies one.
+        State 3. Known to be empty, not merely unread, which is why the loading branch above and a
+        published failure are both excluded rather than left to ordering: a read that did not
+        answer leaves no lines behind either, and a cart whose contents nobody established is not
+        a cart holding nothing - the notice above stands alone for that. `cartError` is compared
+        against `null` for the same reason state 1 compares it that way, so a failure the provider
+        described in an empty string suppresses this block as any other failure does. `emptySlot`
+        replaces the whole block when a placing supplies one.
       */}
-      {lines.length === 0 && syncStatus !== 'loading'
+      {cartError === null && lines.length === 0 && syncStatus !== 'loading'
         ? (emptySlot ?? (
             <BlankSlate art="empty-cart" alt={EMPTY_ART_ALT} heading={EMPTY_HEADING}>
               {EMPTY_BODY}

@@ -20,17 +20,25 @@
  * together in one transaction so an order and an orderable cart cannot both
  * exist.
  *
+ * **Nothing is charged for an order the order service would refuse.** The draft
+ * is assembled as soon as the freight and the total are known and put through
+ * `checkOrderDraft` - every question `recordOrder` can answer from the draft
+ * alone - before an amount is sent to the processor, and the very same draft is
+ * what the order is then written from. So a submission that is not a recordable
+ * order is refused while nothing has been spent, and the figures approved are
+ * the figures checked.
+ *
  * **What a failed checkout gives back depends on what a second attempt could
  * do.** The stock always goes back, because no order was written. The cart goes
  * back whenever nothing has been sent to the processor, or the processor has
- * answered that it took nothing, or the order service refused the draft outright
- * - the last of those because a refused submission can never become an order,
- * however often it is sent, so holding its cart would strand the session
- * without preventing anything. A cart that may carry an authorization for an
- * order that could still be written is left held instead, so a second attempt
- * cannot authorize the same order again. Either way, an authorization that may
- * stand with no order against it is named in the log for the store to settle.
- * {@link undo} is where that line is drawn.
+ * answered that it took nothing - a declined card, a rejected request, a cart
+ * that ran short, a draft that is not an order. A cart that may carry an
+ * authorization is never put back, whatever ended the checkout: putting it back
+ * is what would let a second attempt authorize the same order again, and one
+ * authorization that has to be settled by hand is a smaller wrong than two
+ * charges. The cart it holds and the authorization that may stand against it
+ * are named together in the log, so the store can settle them. {@link undo} is
+ * where that line is drawn.
  *
  * **A customer is told whether an amount may have been captured.** What a
  * failed checkout leaves the cart in is the store's business; what may have
@@ -121,8 +129,8 @@ import {
 
 import { readActiveCart } from './cart.service';
 import { release, reserveStock } from './inventory.service';
-import type { CartOutcome } from './order.service';
-import { claim, readCartOutcome, recordOrder, unclaim } from './order.service';
+import type { CartOutcome, UnpaidOrderDraft } from './order.service';
+import { checkOrderDraft, claim, readCartOutcome, recordOrder, unclaim } from './order.service';
 import { authorize } from './payment.service';
 import { applyPromotions } from './pricing.service';
 import { quote } from './shipping.service';
@@ -276,29 +284,36 @@ function offered(
  *
  * The cart is the part that depends on how far the checkout got. Up to the
  * moment an amount is sent to the processor, nothing has been charged and the
- * cart goes back to its session, so a customer whose card was declined or whose
- * cart ran short finds it where they left it and can try again.
+ * cart goes back to its session, so a customer whose card was declined, whose
+ * cart ran short or whose submission was not a recordable order finds it where
+ * they left it and can try again.
  *
  * Once an amount has been sent and the answer is either an approval or no
- * answer at all, an authorization may stand against that cart, and the question
- * becomes what putting it back would allow. For every failure whose order could
- * still have been written - a condition inside the order's transaction, a
- * database that did not answer - putting it back would let the next attempt
- * authorize the same order a second time, so the cart is left held: one
- * authorization that has to be settled by hand is a smaller wrong than two
- * charges, and the state it is left in says exactly that - a held cart, no
- * order, and a line in the log naming both.
+ * answer at all, an authorization may stand against that cart, and the cart is
+ * left held - every time, whatever ended the checkout. Putting it back is the
+ * one thing that would let the next attempt authorize the same order a second
+ * time, and no failure is worth that: one authorization that has to be settled
+ * by hand is a smaller wrong than two charges. The state the cart is left in
+ * says exactly that - held, with no order against it - and the line in the log
+ * names all three: the authorization that may stand, the order that was not
+ * written, and the cart that is being held rather than reopened.
  *
- * A draft the order service refused is the one charged failure that is not like
- * that. Nothing was written and nothing was going to be: the refusal is a
- * statement about the submission itself, so every retry of that submission
- * would be refused in the same place, and holding the cart would protect
- * against a second charge that cannot happen while making the session
- * permanently un-orderable. So the cart goes back to its session, the
- * authorization that may stand is reported in the log exactly as it is, and the
- * customer is still told that the outcome of their payment is unresolved -
- * which is why recovery is a corrected submission under a new name rather than
- * a repeat of this one.
+ * Nothing is exempt from that rule, because nothing needs to be. A draft the
+ * order service cannot record is refused before an amount is sent at all - see
+ * {@link attempt} - so the failures that reach here charged are the ones whose
+ * order could still have been written: a figure that stopped reconciling with
+ * the amount approved, a condition inside the order's transaction, a database
+ * that did not answer. For all of them, a cart put back is a second
+ * authorization waiting to happen.
+ *
+ * Holding it is also what makes the answer survive this process. `claim` parked
+ * the cart at `ABANDONED` in the database, so `readActiveCart` finds no open
+ * cart for the session from then on and {@link settled} answers the cart that
+ * exists and became no order with `PAYMENT_STATUS_UNKNOWN` - from any process,
+ * however long afterwards, and without this module persisting anything of its
+ * own. The customer is told the outcome of their payment is unresolved and asked
+ * to check their orders rather than place them again, and recovery is the
+ * store's: settle the authorization, then reopen or convert the cart by hand.
  *
  * Neither step is allowed to become the error reported. A cart that could not
  * be put back is a matter for whoever runs the store, and the reason the
@@ -308,16 +323,9 @@ function offered(
  * @param cart The cart the checkout was holding.
  * @param reference The hold it had raised, or `null` if it had not got that far.
  * @param charged Whether an amount reached the processor without a definite
- * answer that nothing was taken.
- * @param refused Whether the failure was the order service refusing the draft,
- * which is what makes a charged failure's cart safe to reopen.
+ * answer that nothing was taken. When it did, the cart stays held.
  */
-async function undo(
-  cart: string,
-  reference: string | null,
-  charged: boolean,
-  refused: boolean,
-): Promise<void> {
+async function undo(cart: string, reference: string | null, charged: boolean): Promise<void> {
   if (reference !== null) {
     try {
       await release(reference);
@@ -326,22 +334,15 @@ async function undo(
     }
   }
 
-  if (charged && !refused) {
+  if (charged) {
+    // All three facts in one line, because an operator needs all three: an
+    // amount that may have been approved, nothing recorded against it, and the
+    // cart deliberately left held rather than returned to its session.
     console.error(
-      `checkout: cart ${cart} is still held because an authorization may stand against it, and no order was written for it - settle it before reopening the cart`,
+      `checkout: an authorization may stand against cart ${cart} and no order was written for it - the cart is being held rather than returned to its session, so that a second attempt cannot authorize it again. Settle the authorization before reopening the cart`,
     );
 
     return;
-  }
-
-  if (charged) {
-    // Both facts in one line, because an operator needs both: an amount that
-    // may have been approved and has nothing recorded against it, and a cart
-    // that is being reopened even so. If the reopening then fails, the line
-    // below says so.
-    console.error(
-      `checkout: an authorization may stand against cart ${cart} with no order written for it - settle it. The cart is being returned to its session because the order was refused before any of it was written, so this submission cannot become an order however often it is sent`,
-    );
   }
 
   try {
@@ -477,10 +478,15 @@ async function settled(cause: unknown): Promise<CheckoutResult> {
  * @returns The order as it was written - its lines, the service it ships by and
  * the destination the draft carried - together with the authorization that paid
  * for it.
- * @throws StorefrontValidationError When the cart holds nothing to order.
+ * @throws StorefrontValidationError When the cart holds nothing to order, and
+ * when the assembled order is not one the order service can record - the latter
+ * refused by `checkOrderDraft` before any amount is sent to the processor, so a
+ * submission that cannot become an order is never charged for.
  * @throws StorefrontConflictError When another checkout is already holding the
- * cart, when the cart has already become an order, or when the chosen shipping
- * service is not among those now offered to the destination.
+ * cart, when the cart has already become an order, when the chosen shipping
+ * service is not among those now offered to the destination, or when the
+ * assembled order's figures do not reconcile with one another - the last of
+ * those, like a non-recordable draft, before any amount is sent.
  * @throws StorefrontError `PAYMENT_DECLINED` when the processor declined the
  * authorization. No order is written for a payment nobody approved.
  * @throws StorefrontError `PAYMENT_STATUS_UNKNOWN` when an amount was sent to
@@ -519,7 +525,6 @@ async function attempt(draft: CheckoutDraft, origin: string): Promise<CheckoutRe
 
   let reference: string | null = null;
   let charged = false;
-  let refused = false;
 
   try {
     const reservation = await reserveStock(cart.lines);
@@ -541,6 +546,33 @@ async function attempt(draft: CheckoutDraft, origin: string): Promise<CheckoutRe
     const { option, quote: recorded } = offered(shipping, draft.shippingOptionId);
     const freight = option.priceCents;
     const total = pricing.totalCents + freight;
+
+    // The order is assembled once, here, and the payment is the only thing
+    // added to it later: one object means the figures the check passes and the
+    // figures the order is written from cannot differ.
+    const unpaid: UnpaidOrderDraft = {
+      cart: cart.id,
+      quote: recorded,
+      customer: draft.contact,
+      address: draft.shippingAddress,
+      lines: pricing.lines,
+      option,
+      subtotalCents: pricing.subtotalCents,
+      discountCents: pricing.discountCents,
+      freightCents: freight,
+      totalCents: total,
+    };
+
+    // Asked before anything is spent, and this is the whole reason it is asked
+    // here rather than left to `recordOrder`: every question it answers is
+    // answered from the draft alone, so a draft it accepts cannot be refused
+    // after an amount has been approved for it - and a refusal after a charge
+    // would leave an authorization standing with no order against it and no
+    // retry that could ever produce one. A draft it refuses fails with `charged`
+    // still false, so the cart goes back to its session like any other
+    // pre-authorization failure. It is synchronous and issues no query, so it
+    // adds nothing to what this attempt waits for.
+    checkOrderDraft(unpaid);
 
     charged = true;
 
@@ -575,46 +607,32 @@ async function attempt(draft: CheckoutDraft, origin: string): Promise<CheckoutRe
     }
 
     try {
-      const order = await recordOrder({
-        cart: cart.id,
-        quote: recorded,
-        customer: draft.contact,
-        address: draft.shippingAddress,
-        lines: pricing.lines,
-        option,
-        payment,
-        subtotalCents: pricing.subtotalCents,
-        discountCents: pricing.discountCents,
-        freightCents: freight,
-        totalCents: total,
-      });
+      const order = await recordOrder({ ...unpaid, payment });
 
       return { order, payment, outcome: 'placed' };
     } catch (cause) {
-      // A rejected draft is told apart from everything else here, and the test
-      // is exact rather than approximate: the order service asks whether the
-      // draft is recordable before it opens its transaction, and that check is
-      // the only thing there that raises a rejection - a condition inside the
-      // transaction is a collision, and a database that fails raises its own
-      // error. So a rejection means the write was never begun and no retry of
-      // this submission would begin it either, which is what lets the cart go
-      // back to its session below while every other failure's cart stays held.
-      refused = cause instanceof StorefrontValidationError;
-
+      // No failure is told apart here, and none needs to be: a draft the order
+      // service refuses outright cannot arrive at this point, because the same
+      // questions were put to the same figures above, before the authorization.
+      // What can still fail is what could still have become an order - the
+      // amount approved disagreeing with the total, a condition inside the
+      // order's transaction, a database that did not answer - and for every one
+      // of those the cart has to stay held. It does: `charged` is already set
+      // and nothing here revises it.
+      //
       // An amount has been approved for this order by the time the write is
       // attempted, so a write that does not happen leaves an authorization with
-      // nothing recorded against it - whatever refused it, and whichever of the
-      // conditions inside that transaction failed. The customer must be told
-      // that rather than told the collision or the fault that caused it: those
-      // read as "nothing was charged, place it again", which is the one thing
-      // that could authorize this order twice. The cause stays on the error for
-      // the server log, and it is the same answer whether or not the cart was
-      // reopened: what the cart is in is a matter for the store, and what may
-      // have been charged is what the customer is owed.
+      // nothing recorded against it - whichever of those failed. The customer
+      // must be told that rather than told the collision or the fault that
+      // caused it: those read as "nothing was charged, place it again", which is
+      // the one thing that could authorize this order twice. The cause stays on
+      // the error for the server log, and what the cart was left in is not part
+      // of the answer: what the cart is in is a matter for the store, and what
+      // may have been charged is what the customer is owed.
       throw paymentStatusUnknown(UNSETTLED, { upstream: 'payment', status: 500, cause });
     }
   } catch (cause) {
-    await undo(cart.id, reference, charged, refused);
+    await undo(cart.id, reference, charged);
 
     throw cause;
   }

@@ -372,7 +372,9 @@ Options
                     repository). The directory needs a package.json with a
                     "dev" script.
   --service <url>   base URL of the local service, overriding
-                    DEBUGGEN_HOST/DEBUGGEN_PORT (example: http://127.0.0.1:43117)
+                    DEBUGGEN_HOST/DEBUGGEN_PORT (example: http://127.0.0.1:43117).
+                    Must address a loopback host: these requests carry the
+                    editor credential, and the service binds loopback.
   --detach          report the launch and exit immediately instead of waiting
                     for Ctrl-C. The dev server keeps running under the service;
                     stop it with --stop, or from VS Code by ending the session.
@@ -387,7 +389,8 @@ Options
   --help, -h        print this text
 
 Environment it reads
-  DEBUGGEN_HOST     service interface (default ${DEFAULT_SERVICE_HOST})
+  DEBUGGEN_HOST     service interface, loopback only — ${DEFAULT_SERVICE_HOST},
+                    localhost or [::1] (default ${DEFAULT_SERVICE_HOST})
   DEBUGGEN_PORT     service port (default ${DEFAULT_SERVICE_PORT})
   DEBUGGEN_HOME     session home holding ${AUTH_FILE_NAME} (default ${DEFAULT_DEBUGGEN_HOME});
                     a leading ~ is expanded
@@ -585,15 +588,127 @@ export async function resolvePreload(root = REPO_ROOT) {
 }
 
 /**
+ * The one host name this script accepts as loopback, matching
+ * `packages/telemetry/src/node/config.ts`. Subdomains of it are refused: their
+ * resolution is resolver-dependent, so they are not verifiable loopback.
+ *
+ * @type {string}
+ */
+const LOOPBACK_HOST_NAME = 'localhost';
+
+/** An IPv4 dotted quad, each octet captured. @type {RegExp} */
+const IPV4_QUAD = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/u;
+
+/** An IPv4-mapped IPv6 address; the capture is the embedded address. @type {RegExp} */
+const IPV4_MAPPED_IPV6 = /^::ffff:([0-9a-f.:]+)$/u;
+
+/** First octet of the IPv4 loopback range, 127.0.0.0/8 (RFC 1122). @type {number} */
+const IPV4_LOOPBACK_FIRST_OCTET = 127;
+
+/**
+ * Whether a dotted quad is a well-formed address inside 127.0.0.0/8.
+ *
+ * @param {string} value candidate dotted quad
+ * @returns {boolean}
+ */
+function isIpv4LoopbackAddress(value) {
+  const match = IPV4_QUAD.exec(value);
+  if (match === null) return false;
+  const octets = match.slice(1).map((part) => Number.parseInt(part, 10));
+  if (octets.some((octet) => !Number.isInteger(octet) || octet < 0 || octet > 255)) return false;
+  return octets[0] === IPV4_LOOPBACK_FIRST_OCTET;
+}
+
+/**
+ * Whether the IPv4 address embedded in an IPv4-mapped IPv6 address is loopback.
+ * Accepts the hextet spelling the WHATWG parser produces (`7f00:1`) and the
+ * dotted one (`127.0.0.1`).
+ *
+ * @param {string} embedded everything after the `::ffff:` prefix
+ * @returns {boolean}
+ */
+function isMappedIpv4Loopback(embedded) {
+  if (embedded.includes('.')) return isIpv4LoopbackAddress(embedded);
+  const hextets = embedded.split(':');
+  if (hextets.length !== 2) return false;
+  const [high, low] = hextets;
+  if (high === undefined || low === undefined) return false;
+  if (!/^[0-9a-f]{1,4}$/u.test(high) || !/^[0-9a-f]{1,4}$/u.test(low)) return false;
+  // The high hextet's upper byte is the embedded address's first octet.
+  return Number.parseInt(high, 16) >>> 8 === IPV4_LOOPBACK_FIRST_OCTET;
+}
+
+/**
+ * Whether a host name denotes this machine's loopback interface:
+ * {@link LOOPBACK_HOST_NAME}, any IPv4 address in 127.0.0.0/8, IPv6 `::1`, or
+ * an IPv4-mapped address whose embedded IPv4 is loopback. A wildcard bind
+ * (`0.0.0.0`, `::`) is refused — reachable from the network is not loopback.
+ *
+ * This is the same policy `isLoopbackHostname` applies in
+ * `packages/telemetry/src/node/config.ts`, deliberately duplicated rather than
+ * imported: this script is run with bare `node` and imports nothing but `node:`
+ * builtins, which is what lets it work on a checkout that has not been built.
+ * A change to the policy belongs in both places, and the suite covers both.
+ *
+ * Exported so `scripts/dev-instrumented.test.mjs` can assert the boundary case
+ * by case rather than only through the resolved base URL.
+ *
+ * @param {string} hostname host name or IP literal, bracketed or bare
+ * @returns {boolean} true when the host is verifiably loopback
+ */
+export function isLoopbackHostname(hostname) {
+  const normalised = typeof hostname === 'string' ? hostname.trim().toLowerCase() : '';
+  if (normalised === '') return false;
+  if (normalised === LOOPBACK_HOST_NAME) return true;
+
+  const bare =
+    normalised.startsWith('[') && normalised.endsWith(']') ? normalised.slice(1, -1) : normalised;
+  if (bare === '::1') return true;
+
+  const mapped = IPV4_MAPPED_IPV6.exec(bare);
+  if (mapped !== null) {
+    const embedded = mapped[1];
+    return embedded !== undefined && isMappedIpv4Loopback(embedded);
+  }
+  return isIpv4LoopbackAddress(bare);
+}
+
+/**
+ * The hint every refusal of a non-loopback service address carries.
+ *
+ * @param {string} subject what named the address, for the first line
+ * @returns {string}
+ */
+function loopbackHint(subject) {
+  return [
+    `The local service binds a loopback interface (AAP 0.5.6), so ${subject} can`,
+    'only address this machine. Requests here carry the editor credential as a',
+    'bearer token, and a non-loopback address would disclose it — and the launch',
+    'it authorises — to another origin.',
+    '',
+    `Use ${DEFAULT_SERVICE_HOST}, localhost or [::1], and set DEBUGGEN_PORT (or`,
+    'pass --service) if the service listens on another port.',
+  ].join('\n');
+}
+
+/**
  * Resolve the local service's base URL: `--service` wins, otherwise
  * `DEBUGGEN_HOST` and `DEBUGGEN_PORT` with the documented defaults.
  *
  * The returned value never has a trailing slash, so `${base}${path}` is always
  * a valid URL. A bare IPv6 host is bracketed.
  *
+ * Whichever route produced it, the address must be **loopback**: this is the
+ * trust boundary for every request the command makes, because those requests
+ * carry the editor credential — the most privileged one on the machine, since
+ * it is what authorises minting a server-agent credential and launching a
+ * process. An address off this machine is therefore refused rather than
+ * attempted, whether it arrived on the command line or in the environment.
+ *
  * @param {{ service?: string | undefined, env?: NodeJS.ProcessEnv }} [options]
  * @returns {string}
- * @throws {DevInstrumentedError} when `--service` is not an http(s) URL
+ * @throws {DevInstrumentedError} when `--service` is not an http(s) URL, or when
+ * either route names a host that is not loopback
  */
 export function resolveServiceBase(options = {}) {
   const env = options.env ?? process.env;
@@ -612,6 +727,17 @@ export function resolveServiceBase(options = {}) {
     if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
       throw new DevInstrumentedError(`--service must be http or https, got ${parsed.protocol}`);
     }
+    if (parsed.username !== '' || parsed.password !== '') {
+      throw new DevInstrumentedError('--service must not embed credentials in the URL', {
+        hint: 'The service authenticates with a bearer token, which this command reads from $DEBUGGEN_HOME/auth.json.',
+      });
+    }
+    if (!isLoopbackHostname(parsed.hostname)) {
+      throw new DevInstrumentedError(
+        `--service must address a loopback host, got ${parsed.hostname}`,
+        { hint: loopbackHint('--service') },
+      );
+    }
     return `${parsed.origin}${parsed.pathname.replace(/\/+$/, '')}`;
   }
 
@@ -620,6 +746,11 @@ export function resolveServiceBase(options = {}) {
   if (!/^\d+$/.test(port)) {
     throw new DevInstrumentedError(`DEBUGGEN_PORT is not a number: ${port}`, {
       hint: `Unset it to use the default (${DEFAULT_SERVICE_PORT}) or pass --service <url>.`,
+    });
+  }
+  if (!isLoopbackHostname(host)) {
+    throw new DevInstrumentedError(`DEBUGGEN_HOST is not a loopback host: ${host}`, {
+      hint: loopbackHint('DEBUGGEN_HOST'),
     });
   }
   const authority = host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
@@ -779,6 +910,10 @@ export async function checkServiceHealth(base) {
     response = await globalThis.fetch(url, {
       method: 'GET',
       headers: { accept: 'application/json' },
+      // Refused, not followed: the liveness of some other origin says nothing
+      // about the service this command is about to launch a dev server against,
+      // and the requests that follow this one carry the editor credential.
+      redirect: 'error',
       signal: globalThis.AbortSignal.timeout(HEALTH_TIMEOUT_MS),
     });
   } catch (error) {
@@ -819,6 +954,13 @@ async function postJson({ url, editorToken, body }) {
         authorization: `Bearer ${editorToken}`,
       },
       body: JSON.stringify(body),
+      // Refused, not followed. `resolveServiceBase` accepted this origin as
+      // loopback; a redirect would move this request — carrying the editor
+      // credential in its `Authorization` header — to an origin nothing
+      // accepted. The service answers its routes directly, so a 3xx is a
+      // misconfiguration or a hostile listener, and either way the answer is to
+      // stop rather than to follow.
+      redirect: 'error',
       signal: globalThis.AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
   } catch (error) {

@@ -57,6 +57,7 @@ import {
   parseQueryPairs,
   parseUrlParts,
   redactQueryString,
+  redactStackUrls,
   redactUrl,
   type UrlParts,
 } from './url.js';
@@ -1057,6 +1058,16 @@ describe('the redaction entry points accept untrusted input of any type', () => 
       expect(masked).toBe(expected);
       expect(redactQueryString(masked)).toBe(masked);
     });
+
+    it(`redactStackUrls: ${label}`, () => {
+      expect(() => redactStackUrls(value)).not.toThrow();
+      const masked = redactStackUrls(value);
+      // Coercion is shared with the other entry points; masking is positional,
+      // and none of these coerced values holds an `http` URL, so the coerced
+      // text is the whole result.
+      expect(masked).toBe(expected);
+      expect(redactStackUrls(masked)).toBe(masked);
+    });
   }
 
   it('reports a value it could not examine rather than erasing it', () => {
@@ -1154,9 +1165,18 @@ describe('isUrlAttributeKey', () => {
     for (const key of URL_ATTRIBUTE_KEYS) {
       expect(isUrlAttributeKey(key)).toBe(true);
     }
-    // `url` is the key the fetch attribute vocabulary declares; the others are
-    // the OpenTelemetry spellings that arrive from the Node preload.
+    // `url` is the key the fetch attribute vocabulary declares; `http.url`,
+    // `http.target` and `target` are the OpenTelemetry spellings that arrive
+    // from the Node preload.
     expect(URL_ATTRIBUTE_KEYS).toContain('url');
+    // `error.source` is the script or resource URL an `error` event carries,
+    // recorded verbatim by `../browser/errors.ts`. It ends in `source`, so no
+    // suffix rule reaches it and only membership masks its query values — the
+    // spelling is the one `../schema/attributes.ts` declares in
+    // `ERROR_ATTRIBUTE_KEYS`, a tie this file asserts because the module
+    // deliberately imports nothing but `./rules.js`.
+    expect(URL_ATTRIBUTE_KEYS).toContain('error.source');
+    expect(isUrlAttributeKey('error.source')).toBe(true);
   });
 
   it('accepts the conventional dotted and camelCase suffixes', () => {
@@ -1177,6 +1197,181 @@ describe('isUrlAttributeKey', () => {
   it('is case-sensitive about the camelCase suffix, so an ordinary word is not a URL key', () => {
     expect(isUrlAttributeKey('curl')).toBe(false);
     expect(isUrlAttributeKey('documentUrl')).toBe(true);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Stack text
+ *
+ * A captured stack is the one value that carries URLs *inside* other text, and
+ * `./redactor.ts` exempts a request's `initiator` from the preview bound so the
+ * whole of it travels. Masking a query parameter is positional, so `scrub` —
+ * the only treatment stack text used to get — cannot touch it: every
+ * expectation below therefore uses an ordinary identifier as the parameter
+ * value, one no deny-list pattern matches, so nothing but this function can
+ * make the assertion pass.
+ * ---------------------------------------------------------------------------
+ */
+
+describe('redactStackUrls', () => {
+  /** A dev-server chunk URL, which carries a cache-busting query. */
+  const CHUNK_URL = 'http://127.0.0.1:20450/_next/static/chunks/alpha.js';
+
+  /** An ordinary identifier: PII in a query string, invisible to `scrub`. */
+  const IDENTIFIER = 'person' + '@example.test';
+
+  it('masks the query of a frame URL and keeps the frame, position included', () => {
+    // A dev-server chunk URL carries a cache-busting query, so this is the
+    // common frame: the value goes, and the `:42:17` the runtime appended
+    // stays, because AAP 0.4.2 resolves exactly that position back to source.
+    expect(redactStackUrls(`    at send (${CHUNK_URL}?email=${IDENTIFIER}:42:17)`)).toBe(
+      `    at send (${CHUNK_URL}?email=${REDACTION_MASK}:42:17)`,
+    );
+  });
+
+  it('keeps the position of a bare frame and of the SpiderMonkey form', () => {
+    expect(redactStackUrls(`    at ${CHUNK_URL}?email=${IDENTIFIER}:8:1`)).toBe(
+      `    at ${CHUNK_URL}?email=${REDACTION_MASK}:8:1`,
+    );
+    expect(redactStackUrls(`send@${CHUNK_URL}?email=${IDENTIFIER}:8:1`)).toBe(
+      `send@${CHUNK_URL}?email=${REDACTION_MASK}:8:1`,
+    );
+  });
+
+  it('masks a fragment inside a frame and keeps the position', () => {
+    expect(redactStackUrls(`    at boot (http://127.0.0.1:20450/app#${IDENTIFIER}:3:5)`)).toBe(
+      `    at boot (http://127.0.0.1:20450/app#${REDACTION_MASK}:3:5)`,
+    );
+  });
+
+  it('keeps the position of a frame whose URL has no query', () => {
+    // The ordinary case, and the one that resolves to source: a frame with no
+    // query comes back byte-identical, position included, so
+    // `packages/code-analysis/src/source-map/resolver.ts` can still map it.
+    const frame = '    at flush (http://127.0.0.1:20450/src/lib/alpha-client.ts:31:9)';
+
+    expect(redactStackUrls(frame)).toBe(frame);
+  });
+
+  it('masks the position with the query when the text is not a frame', () => {
+    // Outside a frame nothing licenses reading a trailing `:10:5` as a
+    // position — `?v=1730:10:5` is equally "the value `1730:10:5`" — so the
+    // whole run is masked and the digits go with the value.
+    expect(redactStackUrls(`loaded ${CHUNK_URL}?v=1730:10:5 in 2ms`)).toBe(
+      `loaded ${CHUNK_URL}?v=${REDACTION_MASK} in 2ms`,
+    );
+    // "look at" is not the frame token followed by a URL on this line, but it
+    // is close enough to show which way the test cuts: the value is masked
+    // either way, and only the position's fate differs.
+    expect(redactStackUrls(`chunk ${CHUNK_URL}?v=1730:10:5`)).toBe(
+      `chunk ${CHUNK_URL}?v=${REDACTION_MASK}`,
+    );
+  });
+
+  it('masks userinfo inside a frame URL', () => {
+    expect(
+      redactStackUrls('at fetch (http://svc:' + 'e5'.repeat(6) + '@127.0.0.1:20450/p:1:1)'),
+    ).toBe(`at fetch (http://${REDACTION_MARKER}@127.0.0.1:20450/p:1:1)`);
+  });
+
+  it('leaves a scheme it does not model exactly as the bundler wrote it', () => {
+    // `webpack-internal:` and `turbopack:` identifiers are module paths with no
+    // query, and the source-map resolver's own grammar is `http`/`https` only.
+    const stack =
+      'at commit (webpack-internal:///./src/lib/alpha-client.ts:7:11)\n' +
+      '    at boot (turbopack:///[project]/src/main.ts:3:5)\n' +
+      '    at run (file:///workspace/src/main.ts:9:1)';
+
+    expect(redactStackUrls(stack)).toBe(stack);
+  });
+
+  it('leaves a stack of project-relative frames untouched', () => {
+    const stack =
+      'Error\n    at send (src/lib/alpha-client.ts:18:3)\n    at flush (src/lib/x.ts:31:9)';
+
+    expect(redactStackUrls(stack)).toBe(stack);
+  });
+
+  it('masks every frame of a multi-frame stack and keeps their order', () => {
+    const stack =
+      'Error\n' +
+      `    at a (${CHUNK_URL}?email=${IDENTIFIER}:1:1)\n` +
+      `    at b (http://127.0.0.1:20450/beta.js?email=${IDENTIFIER}:2:2)`;
+
+    const masked = redactStackUrls(stack);
+
+    expect(masked).toBe(
+      'Error\n' +
+        `    at a (${CHUNK_URL}?email=${REDACTION_MASK}:1:1)\n` +
+        `    at b (http://127.0.0.1:20450/beta.js?email=${REDACTION_MASK}:2:2)`,
+    );
+    expect(masked).not.toContain(IDENTIFIER);
+    // The frame text itself is diagnostic evidence and survives whole.
+    expect(masked.split('\n')).toHaveLength(3);
+  });
+
+  it('masks a quoted or bracketed URL without swallowing the punctuation', () => {
+    expect(redactStackUrls(`loaded "${CHUNK_URL}?email=${IDENTIFIER}".`)).toBe(
+      `loaded "${CHUNK_URL}?email=${REDACTION_MASK}".`,
+    );
+    expect(redactStackUrls(`[${CHUNK_URL}?email=${IDENTIFIER}]`)).toBe(
+      `[${CHUNK_URL}?email=${REDACTION_MASK}]`,
+    );
+  });
+
+  it('is idempotent', () => {
+    for (const input of [
+      `at a (${CHUNK_URL}?email=${IDENTIFIER}:1:1)`,
+      `at b (http://127.0.0.1:20450/src/x.ts:9:2)`,
+      `at c (${CHUNK_URL}?v=${REDACTION_MASK}:1:1)`,
+      `at d (${CHUNK_URL}?v=${REDACTION_MASK})`,
+      `loaded ${CHUNK_URL}?v=1730:10:5`,
+      `send@${CHUNK_URL}?email=${IDENTIFIER}:8:1`,
+      'at e (webpack-internal:///./src/x.ts:1:1)',
+      `at f (${CHUNK_URL}?email=${IDENTIFIER.slice(0, 4)}${REDACTION_MARKER}`,
+      '',
+    ]) {
+      const once = redactStackUrls(input);
+      expect(redactStackUrls(once)).toBe(once);
+    }
+  });
+
+  it('keeps a marker `scrub` left inside a cut frame, on its own line', () => {
+    // `./redactor.ts` scrubs before masking, and `scrub`'s own bound appends
+    // the marker with nothing between it and the URL it cut. The marker is
+    // this layer's token, so it survives — moved to its own line, where a
+    // later pass cannot read it as query text.
+    expect(redactStackUrls(`at a (${CHUNK_URL}?email=pers${REDACTION_MARKER}`)).toBe(
+      `at a (${CHUNK_URL}?email=${REDACTION_MASK}\n${REDACTION_MARKER}`,
+    );
+  });
+
+  it('bounds what it examines and reports the loss', () => {
+    const frame = `at a (${CHUNK_URL}?email=${IDENTIFIER}:1:1)\n`;
+    const long = frame.repeat(Math.ceil((MAX_SCAN_LENGTH * 2) / frame.length));
+
+    const masked = redactStackUrls(long);
+
+    expect(masked.length).toBeLessThanOrEqual(MAX_SCAN_LENGTH);
+    // Reported on a line of its own, which is also what keeps the second pass
+    // from reading the marker as part of the cut frame's URL.
+    expect(masked.endsWith(`\n${REDACTION_MARKER}`)).toBe(true);
+    // The bound must not become a way past the rule: nothing that was examined
+    // kept its parameter value, and nothing past the bound was emitted at all.
+    expect(masked).not.toContain(IDENTIFIER);
+    expect(redactStackUrls(masked)).toBe(masked);
+  });
+
+  it('does not scrub by content, which is its caller`s job', () => {
+    // `./redactor.ts` runs `scrub` first and then this function, in that order
+    // (cutting before scrubbing can split a credential). Stating the division
+    // here keeps a later change from making the two overlap silently.
+    const credential = 'ey' + 'J0eXAiOiJKV1QifQ.' + 'c3'.repeat(12) + '.' + 'd4'.repeat(12);
+    const line = `at send (src/lib/alpha-client.ts:18:3) token=${credential}`;
+
+    expect(redactStackUrls(line)).toBe(line);
+    expect(scrub(line)).not.toContain(credential);
   });
 });
 

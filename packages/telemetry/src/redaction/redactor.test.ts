@@ -39,11 +39,28 @@
  *   {@link checkedEvent}), and its tier is derived from `KIND_ALLOWED_TIERS`
  *   rather than typed by hand, so a failure below means the redactor is
  *   wrong and never that the fixture was malformed.
+ * - **The four committed corpora are loaded, not restated.** Inline fixtures
+ *   cover the rules; `../../test/fixtures/redaction-*.json` are the *shared*
+ *   before/after pairs of AAP 0.2.5, read by other checkpoints and by
+ *   `docs/SECURITY.md`'s examples, and a corpus nothing loads can drift
+ *   silently while every test here stays green. The suite therefore reads all
+ *   four from disk, parses both sides with `../schema/event.ts` and asserts
+ *   the redactor reproduces them — see
+ *   {@link describe `the committed redaction corpora`}. That one filesystem
+ *   read is the only I/O in this file; nothing here opens a socket, and the
+ *   path is resolved with `fileURLToPath` rather than `new URL` for the
+ *   reason given on {@link FIXTURE_DIRECTORY}.
  */
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
 import { describe, expect, it } from 'vitest';
 
 import {
   ALL_ATTRIBUTE_KEYS,
+  COMPONENT_TREE_ATTRIBUTE_KEYS,
+  ERROR_ATTRIBUTE_KEYS,
   MAX_PREVIEW_LENGTH,
   MAX_TRACKED_KEYS,
   SERVICE_ASSIGNED_ATTRIBUTE_KEYS,
@@ -62,10 +79,12 @@ import {
   type TelemetryKind,
   type TelemetryTier,
 } from '../schema/kinds.js';
+import { HEADER_OBJECT_ATTRIBUTE_KEYS } from './headers.js';
 import {
   DROPPED_ATTRIBUTE_KEYS,
   MAX_ATTRIBUTE_DEPTH,
   MAX_ATTRIBUTE_NODES,
+  STACK_ATTRIBUTE_KEYS,
   UNTRUNCATED_ATTRIBUTE_KEYS,
   redactAttributes,
   redactAttributesWithFindings,
@@ -73,7 +92,16 @@ import {
   redactEventName,
   redactEventWithFindings,
 } from './redactor.js';
-import { REDACTION_MARKER, REDACTION_MASK, TRUNCATION_SUFFIX, findDeniedRules } from './rules.js';
+import {
+  MAX_SCAN_LENGTH,
+  REDACTION_MARKER,
+  REDACTION_MASK,
+  TRUNCATION_SUFFIX,
+  findDeniedRules,
+  isHighEntropySecret,
+} from './rules.js';
+import { redactSqlStatement } from './sql.js';
+import { isUrlAttributeKey, redactUrl } from './url.js';
 
 /*
  * ---------------------------------------------------------------------------
@@ -128,6 +156,33 @@ const PEM_HEADER = '-'.repeat(5) + 'BEGIN ' + PEM_LABEL + '-'.repeat(5);
  */
 const PEM_BLOCK =
   PEM_HEADER + '\n' + PEM_BODY + '\n' + '-'.repeat(5) + 'END ' + PEM_LABEL + '-'.repeat(5);
+
+/**
+ * An ordinary personal identifier, of the kind a real query string carries.
+ *
+ * Deliberately **not** credential-shaped: no deny-list pattern matches it, and
+ * `scrub` leaves it exactly as it arrived. That is what makes it the right
+ * fixture for the positional rules — a value that only masking a query
+ * parameter can remove, so a test using it cannot pass because some content
+ * rule happened to catch it on the way past. The domain is the reserved
+ * `example.test`, which resolves nowhere.
+ */
+const CONTACT_ADDRESS = 'person' + '@example.test';
+
+/**
+ * An attribute **name** with no structure and high entropy: thirty-two
+ * characters, each distinct.
+ *
+ * A producer that uses an opaque handle as an attribute name hands the walk a
+ * name indistinguishable from a captured secret, which is the case
+ * `deniedKeyNameRules` drops. Assembled from fragments and named without a
+ * key-like term, so `scripts/check-secrets.mjs` sees neither a contiguous
+ * high-entropy literal bound to a `key`/`token`/`secret`/`password` name nor
+ * any provider prefix in the committed bytes (AAP 0.3.4). The tests that use
+ * it assert `isHighEntropySecret` agrees, so the fixture's premise is checked
+ * rather than assumed.
+ */
+const OPAQUE_ATTRIBUTE_NAME = 'A1b2C3d4' + 'E5f6G7h8' + 'I9j0K1l2' + 'M3n4O5p6';
 
 /*
  * ---------------------------------------------------------------------------
@@ -495,8 +550,421 @@ describe('redactAttributes — URLs', () => {
       'http.url',
       'http.target',
       'target',
+      'error.source',
       'initiator',
     ]);
+  });
+
+  it("routes an error event's source URL through the URL handler", () => {
+    // `../browser/errors.ts` records `error.source` verbatim from
+    // `ErrorEvent.filename` or a failing element's `src`, so it is an
+    // ordinary page URL with an ordinary query string on it. The key ends in
+    // `source`, not `url`, so the suffix rule does not reach it and
+    // membership in `URL_ATTRIBUTE_KEYS` is what masks it.
+    expect(ERROR_ATTRIBUTE_KEYS).toContain('error.source');
+    expect(isUrlAttributeKey('error.source')).toBe(true);
+
+    const redacted = redactAttributes(
+      {
+        'error.type': 'TypeError',
+        'error.message': 'Cannot read properties of undefined',
+        'error.source': `http://127.0.0.1:20450/checkout?email=${CONTACT_ADDRESS}&step=2`,
+        component: 'AlphaPanel',
+      },
+      { kind: 'error' },
+    );
+
+    expect(redacted['error.source']).toBe(
+      `http://127.0.0.1:20450/checkout?email=${REDACTION_MASK}&step=${REDACTION_MASK}`,
+    );
+    expect(JSON.stringify(redacted)).not.toContain(CONTACT_ADDRESS);
+    expect(redacted['error.type']).toBe('TypeError');
+    expect(redacted.component).toBe('AlphaPanel');
+  });
+
+  it('never truncates an error source URL to the preview bound', () => {
+    // The source-map resolution route reads the whole value, exactly as it
+    // does for a request URL, so the key belongs to the untruncated set.
+    const longSource = 'http://127.0.0.1:20450/static/' + 'y'.repeat(MAX_PREVIEW_LENGTH * 2);
+    const redacted = redactAttributes({ 'error.source': longSource }, { kind: 'error' });
+
+    expect(redacted['error.source']).toBe(longSource);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Stack text
+ *
+ * A stack is the one captured value that holds URLs *inside* other text, and
+ * the initiator is exempt from the preview bound, so the whole of it travels.
+ * Query masking is positional — `scrub` cannot do it — which is why these
+ * fixtures carry {@link CONTACT_ADDRESS} rather than a credential: a content
+ * rule must not be able to pass the test on the URL handler's behalf.
+ * ---------------------------------------------------------------------------
+ */
+
+/** A dev-server chunk URL, which carries a cache-busting query like any other. */
+const CHUNK_FRAME_URL = 'http://127.0.0.1:20450/_next/static/chunks/alpha.js';
+
+/** A served source URL with a position and no query: the frame that resolves. */
+const SOURCE_FRAME_URL = 'http://127.0.0.1:20450/src/lib/alpha-client.ts:31:9';
+
+/** A bundler's own module identifier, which is not an `http` URL at all. */
+const INTERNAL_FRAME = 'webpack-internal:///./src/lib/alpha-client.ts:7:11';
+
+/** A three-frame initiator stack, as `../browser/fetch.ts` captures one. */
+function initiatorStack(): string {
+  return (
+    'Error\n' +
+    `    at send (${CHUNK_FRAME_URL}?email=${CONTACT_ADDRESS}:42:17)\n` +
+    `    at flush (${SOURCE_FRAME_URL})\n` +
+    `    at commit (${INTERNAL_FRAME})`
+  );
+}
+
+describe('redactAttributes — stack text', () => {
+  it('names exactly the declared stack keys', () => {
+    expect([...STACK_ATTRIBUTE_KEYS]).toEqual(['initiator', 'error.stack']);
+  });
+
+  it('masks query values inside an initiator stack and keeps every frame', () => {
+    const redacted = redactAttributes(
+      {
+        url: `http://127.0.0.1:20450/api/alpha?email=${CONTACT_ADDRESS}`,
+        initiator: initiatorStack(),
+      },
+      { kind: 'fetch' },
+    );
+
+    expect(redacted.initiator).toBe(
+      'Error\n' +
+        // The chunk URL's query value is masked and the position the runtime
+        // appended survives, because the run sits in a recognised frame — the
+        // position is what AAP 0.4.2's source-map route resolves.
+        `    at send (${CHUNK_FRAME_URL}?email=${REDACTION_MASK}:42:17)\n` +
+        // No query at all, so the frame survives byte-identical.
+        `    at flush (${SOURCE_FRAME_URL})\n` +
+        // Not an `http` URL: left exactly as the bundler wrote it.
+        `    at commit (${INTERNAL_FRAME})`,
+    );
+    expect(JSON.stringify(redacted)).not.toContain(CONTACT_ADDRESS);
+  });
+
+  it('keeps a queried frame resolvable end to end through redactAttributes', () => {
+    // The composition the source-map route actually sees: `scrub` first, then
+    // the URL masking, then the untruncated-key exemption. What comes out must
+    // still carry the file, the line and the column of every frame.
+    const redacted = redactAttributes(
+      {
+        initiator:
+          `Error\n` +
+          `    at send (${CHUNK_FRAME_URL}?v=1730&email=${CONTACT_ADDRESS}:42:17)\n` +
+          `    at boot (http://127.0.0.1:20450/app#${CONTACT_ADDRESS}:3:5)`,
+      },
+      { kind: 'fetch' },
+    );
+
+    expect(redacted.initiator).toBe(
+      `Error\n` +
+        `    at send (${CHUNK_FRAME_URL}?v=${REDACTION_MASK}&email=${REDACTION_MASK}:42:17)\n` +
+        `    at boot (http://127.0.0.1:20450/app#${REDACTION_MASK}:3:5)`,
+    );
+    expect(String(redacted.initiator)).not.toContain(CONTACT_ADDRESS);
+    expect(redactAttributes(redacted, { kind: 'fetch' })).toEqual(redacted);
+  });
+
+  it('reports the truncation of an over-bound stack, whatever the cut fell on', () => {
+    // `scrub`'s bound cuts long stack text and appends the marker. Both passes
+    // have to agree about it: the marker must still be there afterwards —
+    // "something was removed here" is a fact the developer needs — the value
+    // must stay inside the bound and free of the parameter, and the result
+    // must be a fixed point so the second redaction changes nothing.
+    const frame = `    at send (${CHUNK_FRAME_URL}?email=${CONTACT_ADDRESS}:42:17)\n`;
+    const redacted = redactAttributes(
+      { initiator: frame.repeat(Math.ceil((MAX_SCAN_LENGTH * 2) / frame.length)) },
+      { kind: 'fetch' },
+    );
+    const initiator = String(redacted.initiator);
+
+    expect(initiator.endsWith(REDACTION_MARKER)).toBe(true);
+    expect(initiator).not.toContain(CONTACT_ADDRESS);
+    expect(initiator.length).toBeLessThanOrEqual(MAX_SCAN_LENGTH);
+    expect(redactAttributes(redacted, { kind: 'fetch' })).toEqual(redacted);
+  });
+
+  it("moves the marker to its own line when the bound cut a frame's URL", () => {
+    // The case that used to destroy it: the cut lands *inside* a URL, so
+    // `scrub` leaves `…http://1[redacted]` with nothing between, and the URL
+    // scan would otherwise read the marker as query text and mask it away.
+    // The padding puts the last frame's URL across the bound deterministically.
+    const pad = 'x'.repeat(MAX_SCAN_LENGTH - REDACTION_MARKER.length - 30);
+    const redacted = redactAttributes(
+      {
+        initiator: `${pad}\n    at send (${CHUNK_FRAME_URL}?email=${CONTACT_ADDRESS}:42:17)`,
+      },
+      { kind: 'fetch' },
+    );
+    const initiator = String(redacted.initiator);
+
+    expect(initiator.endsWith(`\n${REDACTION_MARKER}`)).toBe(true);
+    expect(initiator).not.toContain(CONTACT_ADDRESS);
+    expect(initiator.length).toBeLessThanOrEqual(MAX_SCAN_LENGTH);
+    expect(redactAttributes(redacted, { kind: 'fetch' })).toEqual(redacted);
+  });
+
+  it('masks a URL inside an error stack and reports the query-value rule', () => {
+    const { attributes, report } = redactAttributesWithFindings(
+      {
+        'error.type': 'TypeError',
+        'error.stack': `at load (http://127.0.0.1:20450/a.js?email=${CONTACT_ADDRESS}:1:1)`,
+      },
+      { kind: 'error' },
+    );
+
+    expect(attributes['error.stack']).toBe(
+      `at load (http://127.0.0.1:20450/a.js?email=${REDACTION_MASK}:1:1)`,
+    );
+    expect(report.rules).toContain('url-query-value');
+    expect(report.maskedValues).toBe(1);
+  });
+
+  it('recognises the conventional stack spellings', () => {
+    const redacted = redactAttributes({
+      componentStack: `at AlphaPanel (http://127.0.0.1:20450/b.js?email=${CONTACT_ADDRESS})`,
+      'cause.stack': `at boot (http://127.0.0.1:20450/c.js?email=${CONTACT_ADDRESS})`,
+    });
+
+    expect(redacted.componentStack).toBe(
+      `at AlphaPanel (http://127.0.0.1:20450/b.js?email=${REDACTION_MASK})`,
+    );
+    expect(redacted['cause.stack']).toBe(
+      `at boot (http://127.0.0.1:20450/c.js?email=${REDACTION_MASK})`,
+    );
+  });
+
+  it('leaves a stack whose frames carry no URL untouched', () => {
+    // The frames `../browser/fetch.ts` produces for application source are
+    // project-relative paths with no scheme, and nothing in them is maskable.
+    const stack =
+      'at send (src/lib/alpha-client.ts:18:3)\n    at flush (src/lib/alpha-client.ts:31:9)';
+
+    expect(redactAttributes({ initiator: stack }, { kind: 'fetch' }).initiator).toBe(stack);
+  });
+
+  it('masks a stack idempotently', () => {
+    const once = redactAttributes({ initiator: initiatorStack() }, { kind: 'fetch' });
+    const twice = redactAttributes(once, { kind: 'fetch' });
+
+    expect(twice).toEqual(once);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Key names
+ *
+ * Every other block here judges a value. An attribute bag's *names* are as
+ * page-supplied as its values, so a name can be the secret rather than label
+ * one, and a walk that redacted only values re-emitted it verbatim.
+ * ---------------------------------------------------------------------------
+ */
+
+describe('redactAttributes — key names', () => {
+  it('drops an attribute whose key name is itself a credential', () => {
+    const { attributes, report } = redactAttributesWithFindings({
+      component: 'AlphaPanel',
+      [PROVIDER_CREDENTIAL]: 'cache-hit',
+    });
+
+    expect(Object.keys(attributes)).toEqual(['component']);
+    expect(report.rules).toContain('provider-key');
+    expect(report.droppedKeys).toBe(1);
+    expect(JSON.stringify(attributes)).not.toContain(PROVIDER_CREDENTIAL);
+  });
+
+  it('drops an opaque high-entropy key name and reports the entropy rule', () => {
+    // The fixture's premise, checked rather than assumed: this name is what
+    // the entropy test is for.
+    expect(isHighEntropySecret(OPAQUE_ATTRIBUTE_NAME)).toBe(true);
+
+    const { attributes, report } = redactAttributesWithFindings({
+      component: 'AlphaPanel',
+      [OPAQUE_ATTRIBUTE_NAME]: 'cache-hit',
+    });
+
+    expect(Object.keys(attributes)).toEqual(['component']);
+    expect(report.rules).toContain('entropy');
+  });
+
+  it('records a dropped key name as the marker, never as the name', () => {
+    // `normalizePath` scrubs a path by content, which a high-entropy name
+    // survives, so the name must not reach the path list at all — the
+    // `redacted` list travels on the event and is serialised with it.
+    const event = checkedEvent(
+      eventOfKind('log', 'boot alpha', {
+        component: 'AlphaPanel',
+        [OPAQUE_ATTRIBUTE_NAME]: 'cache-hit',
+      }),
+    );
+
+    const redacted = redactEvent(event);
+
+    expect(redacted.redacted).toEqual([REDACTION_MARKER]);
+    expect(JSON.stringify(redacted)).not.toContain(OPAQUE_ATTRIBUTE_NAME);
+  });
+
+  it('drops a secret-named key at any depth, with its subtree', () => {
+    expect(redactAttributes({ detail: { [PROVIDER_CREDENTIAL]: { nested: 1 } } })).toEqual({
+      detail: {},
+    });
+  });
+
+  it('keeps a secret-shaped name out of the path list when a bound drops the key', () => {
+    // The bound's exit records a path too, and it is reached before the value
+    // is ever looked at — so the name rule has to run first or a key past the
+    // node budget rides out on the `redacted` list it populates.
+    const event = checkedEvent(
+      eventOfKind('log', 'boot alpha', {
+        component: 'AlphaPanel',
+        [OPAQUE_ATTRIBUTE_NAME]: 'cache-hit',
+      }),
+    );
+
+    // A budget of one node: the first key is emitted, and the second is
+    // dropped by the bound before the name rule's own exit is reached.
+    const { event: redacted, report } = redactEventWithFindings(event, { maxNodes: 1 });
+
+    expect(redacted.attributes).toEqual({ component: 'AlphaPanel' });
+    expect(redacted.redacted).toEqual([REDACTION_MARKER]);
+    expect(report.droppedKeys).toBe(1);
+    // Reported whichever exit took the key: the report states what the bag
+    // held, not what fitted inside a bound.
+    expect(report.rules).toContain('entropy');
+    expect(JSON.stringify(redacted)).not.toContain(OPAQUE_ATTRIBUTE_NAME);
+  });
+
+  it('never reads the value of a secret-named key', () => {
+    // The name is judged before the property is read, so a getter on a
+    // secret-named key does not run — a page's object can do anything in one.
+    let read = 0;
+    const bag: Record<string, unknown> = { component: 'AlphaPanel' };
+    Object.defineProperty(bag, PROVIDER_CREDENTIAL, {
+      enumerable: true,
+      get: () => {
+        read += 1;
+        return 'cache-hit';
+      },
+    });
+
+    expect(Object.keys(redactAttributes(bag))).toEqual(['component']);
+    expect(read).toBe(0);
+  });
+
+  it('keeps an ordinary application name, and masks the value under a key-like one', () => {
+    // A key *called* `apiKey` is a useful attribute name: its value is
+    // replaced, and the key stays so the developer can see the field was
+    // there. Dropping it would hide the evidence instead of the secret.
+    expect(redactAttributes({ customerLabel: 'Alpha Industrial', apiKey: 'F9'.repeat(8) })).toEqual(
+      {
+        customerLabel: 'Alpha Industrial',
+        apiKey: REDACTION_MARKER,
+      },
+    );
+  });
+
+  it('keeps every key name the catalog declares', () => {
+    // The regression guard for the name rule: a heuristic that reached a
+    // declared name would delete evidence on every event of that kind, and
+    // `request_key` is the name it would reach first.
+    //
+    // The component-tree key is judged by its *value* as well: its handler
+    // re-serialises a parsed forest and omits the key when there is no
+    // document to parse (a `null` is not one), so it is fed the smallest valid
+    // forest — one named node — instead. The name rule is what this case is
+    // about.
+    const componentTreeKeys: ReadonlySet<string> = new Set<string>(COMPONENT_TREE_ATTRIBUTE_KEYS);
+    const minimalForest = JSON.stringify([{ name: 'App' }]);
+    for (const key of ALL_ATTRIBUTE_KEYS) {
+      const value = componentTreeKeys.has(key) ? minimalForest : null;
+      expect(redactAttributes({ [key]: value })).toHaveProperty([key]);
+    }
+  });
+
+  it('keeps the service-assigned request key, name and value', () => {
+    const requestKey = 'a1'.repeat(32);
+
+    expect(
+      redactAttributes({ request_key: requestKey, url: '/api/alpha' }, { kind: 'fetch' }),
+    ).toEqual({
+      request_key: requestKey,
+      url: '/api/alpha',
+    });
+  });
+
+  it.each([...HEADER_OBJECT_ATTRIBUTE_KEYS])(
+    'drops a credential-shaped member name inside %s',
+    (attributeKey) => {
+      // `./headers.ts` keeps every member key so a denied header's presence
+      // survives with its value masked — which makes a header map the one
+      // place a page-supplied name reaches the event without the walk's own
+      // key rule seeing it. A page may name a request header anything.
+      const { attributes, report } = redactAttributesWithFindings(
+        {
+          [attributeKey]: {
+            accept: 'application/json',
+            authorization: BEARER_HEADER_VALUE,
+            [PROVIDER_CREDENTIAL]: 'cache-hit',
+            [OPAQUE_ATTRIBUTE_NAME]: 'cache-hit',
+          },
+        },
+        { kind: 'fetch' },
+      );
+
+      expect(attributes[attributeKey]).toEqual({
+        accept: 'application/json',
+        // Presence retained, value masked: the guarantee stays intact.
+        authorization: REDACTION_MARKER,
+      });
+      expect(report.droppedKeys).toBe(2);
+      expect(report.rules).toContain('provider-key');
+      expect(report.rules).toContain('entropy');
+
+      const serialised = JSON.stringify(attributes);
+      expect(serialised).not.toContain(PROVIDER_CREDENTIAL);
+      expect(serialised).not.toContain(OPAQUE_ATTRIBUTE_NAME);
+    },
+  );
+
+  it('keeps a secret-shaped header member name out of the path list', () => {
+    const event = checkedEvent(
+      eventOfKind('fetch', 'fetch GET /api/alpha', {
+        'http.request.headers': { accept: 'application/json', [PROVIDER_CREDENTIAL]: 'cache-hit' },
+      }),
+    );
+
+    const redacted = redactEvent(event);
+
+    // The recorded path is the *attribute's*, which is declared vocabulary;
+    // the member name appears nowhere, in the bag or in the provenance list.
+    expect(redacted.redacted).toEqual(['http.request.headers']);
+    expect(JSON.stringify(redacted)).not.toContain(PROVIDER_CREDENTIAL);
+  });
+
+  it('judges a header attribute key by its header name alone', () => {
+    // Retaining a denied header's presence is a stated guarantee, so the
+    // declared `http.request.header.` prefix cannot be what condemns a key;
+    // only the protocol token after it is judged, and a header no client
+    // could have sent is dropped.
+    const redacted = redactAttributes(
+      {
+        'http.request.header.authorization': BEARER_HEADER_VALUE,
+        ['http.request.header.' + PROVIDER_CREDENTIAL]: 'cache-hit',
+      },
+      { kind: 'fetch' },
+    );
+
+    expect(redacted).toEqual({ 'http.request.header.authorization': REDACTION_MARKER });
   });
 });
 
@@ -2002,6 +2470,68 @@ describe('redactEvent — the leak suite', () => {
           {},
         ),
     },
+    {
+      // The key side of the pair: a producer that used a credential as an
+      // attribute *name*. The name must reach neither the emitted bag nor the
+      // `redacted` path list built from it.
+      secretClass: 'credential used as an attribute key name',
+      secrets: [PROVIDER_CREDENTIAL],
+      keeps: 'AlphaPanel',
+      build: () =>
+        eventOfKind('log', 'boot alpha', {
+          component: 'AlphaPanel',
+          [PROVIDER_CREDENTIAL]: 'cache-hit',
+        }),
+    },
+    {
+      secretClass: 'opaque high-entropy attribute key name',
+      secrets: [OPAQUE_ATTRIBUTE_NAME],
+      keeps: 'AlphaPanel',
+      build: () =>
+        eventOfKind('log', 'boot alpha', {
+          component: 'AlphaPanel',
+          [OPAQUE_ATTRIBUTE_NAME]: 'cache-hit',
+        }),
+    },
+    {
+      // The header handler keeps every member key on purpose, so a name
+      // inside a header map is the one that reaches the event unjudged.
+      secretClass: 'credential used as a header name inside a header map',
+      secrets: [PROVIDER_CREDENTIAL],
+      keeps: 'application/json',
+      build: () =>
+        eventOfKind('fetch', 'fetch GET /api/alpha', {
+          'http.request.headers': {
+            accept: 'application/json',
+            [PROVIDER_CREDENTIAL]: 'cache-hit',
+          },
+        }),
+    },
+    {
+      // Not a credential: a query parameter value of the kind every real
+      // request carries, under the key an error records its script URL in.
+      // No content rule matches it, so only the URL handler can remove it.
+      secretClass: 'personal identifier inside an error source URL',
+      secrets: [CONTACT_ADDRESS],
+      keeps: '/checkout',
+      build: () =>
+        eventOfKind('error', 'TypeError in AlphaPanel', {
+          'error.type': 'TypeError',
+          'error.source': `http://127.0.0.1:20450/checkout?email=${CONTACT_ADDRESS}&step=2`,
+        }),
+    },
+    {
+      secretClass: 'personal identifier inside a request initiator stack',
+      secrets: [CONTACT_ADDRESS],
+      // The frame that must survive whole: a URL with no query keeps its
+      // position, which is what the source-map route resolves.
+      keeps: SOURCE_FRAME_URL,
+      build: () =>
+        eventOfKind('fetch', 'fetch GET /api/alpha', {
+          url: 'http://127.0.0.1:20450/api/alpha',
+          initiator: initiatorStack(),
+        }),
+    },
   ];
 
   it.each(LEAK_CASES)(
@@ -2036,4 +2566,372 @@ describe('redactEvent — the leak suite', () => {
     // that stops being checked, and nothing else in this file would notice.
     expect(classes.length).toBeGreaterThanOrEqual(10);
   });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The committed corpora
+ *
+ * `../../test/fixtures/redaction-*.json` are the four shared before/after
+ * pairs of AAP 0.2.5 — the single tracked-telemetry exemption of AAP 0.3.4 —
+ * and they are read by other checkpoints and quoted by `docs/SECURITY.md`.
+ * Everything above builds its own fixtures, so until this block existed all
+ * four could drift from the redactor while every test in the file stayed
+ * green. Each is therefore loaded from disk, parsed with `../schema/event.ts`
+ * and replayed through `redactEvent` here.
+ *
+ * ## Why two of them are masked on both sides
+ *
+ * A corpus is committed telemetry, so it is held to the policy it documents:
+ * a query string in it carries `?` for every value and a statement carries
+ * `?`/`$n` placeholders rather than literals, on the `before` side as much as
+ * the `after` side. `redaction-headers.json` already encodes that convention
+ * for the fields it is not demonstrating ("`url`: already in its masked
+ * form"), and the two corpora whose *subject* is a query string and a
+ * statement follow the same rule.
+ *
+ * The pre-redaction value each one stands for is therefore rebuilt at run
+ * time, by substituting synthetic sentinels for the masks — see
+ * {@link materialiseQueryValues} and {@link materialiseSqlLiterals}. The
+ * demonstration is unchanged and strictly stronger: the sentinels are values
+ * no content rule matches, they are asserted present before redaction and
+ * absent after it, and the masked bytes on disk are additionally asserted to
+ * be a fixed point of the very handler they document.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * The fixture directory, as a filesystem path.
+ *
+ * Resolved with `fileURLToPath` and `resolve` rather than with
+ * `new URL(relative, import.meta.url)`: this package's Vitest project runs
+ * under happy-dom, whose global `URL` resolves a relative specifier against
+ * the document base (`http://localhost:3000/`) instead of against the `file:`
+ * URL it was handed, which yields an unreadable http URL. Converting the
+ * module URL to a path first keeps the resolution pure path arithmetic and
+ * independent of the environment — the convention
+ * `../schema/attributes.test.ts` documents for the same reason.
+ */
+const FIXTURE_DIRECTORY = resolve(dirname(fileURLToPath(import.meta.url)), '../../test/fixtures');
+
+/** One committed pair, with each side normalised to an array of raw events. */
+interface RawCorpus {
+  /** File name, used in every assertion message. */
+  readonly file: string;
+  readonly before: readonly unknown[];
+  readonly after: readonly unknown[];
+}
+
+/** Normalises one side to an array, and says which file is malformed if not. */
+function corpusSide(file: string, side: string, value: unknown): readonly unknown[] {
+  if (value === undefined) {
+    throw new Error(`${file} is missing its ${side} side`);
+  }
+  return Array.isArray(value) ? (value as readonly unknown[]) : [value];
+}
+
+/**
+ * Reads one corpus at module load.
+ *
+ * Throws rather than asserting: `expect` may not be called outside a test, and
+ * a corpus that cannot be read is not a redaction failure. The message names
+ * the resolved path, because the usual cause is a moved fixture.
+ *
+ * `redaction-props-state.json` carries a two-element array per side (a render
+ * event and a state event) while the other three carry one event; both shapes
+ * are normalised here so every assertion below is written once.
+ */
+function readCorpus(file: string): RawCorpus {
+  const path = resolve(FIXTURE_DIRECTORY, file);
+  let raw: string;
+  try {
+    raw = readFileSync(path, 'utf8');
+  } catch (cause) {
+    throw new Error(
+      `the redaction corpus could not be read at ${path}. It is a tracked fixture of ` +
+        'AAP 0.2.5; if it has moved, point this suite at its new path rather than removing ' +
+        'the check.',
+      { cause },
+    );
+  }
+  const parsed: unknown = JSON.parse(raw);
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new Error(`${file} must hold an object with a before and an after side`);
+  }
+  const { before, after } = parsed as { before?: unknown; after?: unknown };
+  return {
+    file,
+    before: corpusSide(file, 'before', before),
+    after: corpusSide(file, 'after', after),
+  };
+}
+
+/** Parses one raw event with the schema the ingest path uses. */
+function parsedEvent(label: string, raw: unknown): TelemetryEventIngress {
+  const parsed = telemetryEventIngressSchema.safeParse(raw);
+  expect(parsed.success, `${label} must parse as an ingress event`).toBe(true);
+  if (!parsed.success) {
+    // Unreachable: the expectation above has already failed the test.
+    throw parsed.error;
+  }
+  return parsed.data;
+}
+
+/** Reads a string attribute, failing with the key when it is not one. */
+function stringAttribute(event: TelemetryEventIngress, key: string): string {
+  const value = event.attributes[key];
+  expect(typeof value, `the corpus event must carry a string under ${key}`).toBe('string');
+  return String(value);
+}
+
+/**
+ * The synthetic values the URL corpus's masked query stands for, in order.
+ *
+ * Not credential-shaped and not short: no deny-list pattern matches them, so
+ * the assertions they drive can only pass if `./url.ts` masked the query, and
+ * each is distinctive enough that "absent after redaction" cannot be satisfied
+ * by a coincidental substring of an id, a timestamp or a key name.
+ */
+const URL_CORPUS_QUERY_VALUES = [
+  'sentinel-item-a17',
+  'sentinel-sort-desc',
+  'sentinel-page-two',
+] as const;
+
+/** The synthetic literals the SQL corpus's masked statement stands for, in order. */
+const SQL_CORPUS_LITERALS = ["'sentinel-status'", "'sentinel-since'", '9081726'] as const;
+
+/**
+ * Rebuilds a pre-redaction query string from its masked form.
+ *
+ * Each `=?` pair value, in order, becomes the next synthetic sentinel. The
+ * count is asserted rather than assumed, so a corpus edited to hold a
+ * different number of parameters fails here with that as its reason instead of
+ * silently testing fewer values than the sentinel list names.
+ */
+function materialiseQueryValues(masked: string, values: readonly string[]): string {
+  let next = 0;
+  const filled = masked.replace(/=\?(?=&|$)/g, () => {
+    const value = values[next];
+    next += 1;
+    return value === undefined ? `=${REDACTION_MASK}` : `=${value}`;
+  });
+
+  expect(next, `expected ${String(values.length)} masked query values in "${masked}"`).toBe(
+    values.length,
+  );
+  return filled;
+}
+
+/**
+ * Rebuilds a pre-redaction statement from its parameterised form.
+ *
+ * Every `?` mask, in order, becomes the next synthetic literal; `$n`
+ * placeholders hold no `?` and are therefore untouched, which is the
+ * distinction the corpus exists to document — `$1` is structure the developer
+ * needs, `?` is data that was removed.
+ */
+function materialiseSqlLiterals(masked: string, literals: readonly string[]): string {
+  let next = 0;
+  const filled = masked.replace(/\?/g, () => {
+    const literal = literals[next];
+    next += 1;
+    return literal ?? REDACTION_MASK;
+  });
+
+  expect(next, `expected ${String(literals.length)} masks in "${masked}"`).toBe(literals.length);
+  return filled;
+}
+
+/** The URL corpus's pre-redaction event: sentinels in the span name and the URL. */
+function materialiseUrlEvent(event: TelemetryEventIngress): TelemetryEventIngress {
+  return {
+    ...event,
+    name: materialiseQueryValues(event.name, URL_CORPUS_QUERY_VALUES),
+    attributes: {
+      ...event.attributes,
+      url: materialiseQueryValues(stringAttribute(event, 'url'), URL_CORPUS_QUERY_VALUES),
+    },
+  };
+}
+
+/** The SQL corpus's pre-redaction event: sentinel literals in the statement. */
+function materialiseSqlEvent(event: TelemetryEventIngress): TelemetryEventIngress {
+  return {
+    ...event,
+    attributes: {
+      ...event.attributes,
+      'db.statement': materialiseSqlLiterals(
+        stringAttribute(event, 'db.statement'),
+        SQL_CORPUS_LITERALS,
+      ),
+    },
+  };
+}
+
+/** One corpus, how its pre-redaction side is rebuilt, and what must not survive. */
+interface CorpusCase {
+  readonly file: string;
+  readonly corpus: RawCorpus;
+  /** Identity where the committed `before` side *is* the pre-redaction event. */
+  readonly materialise: (event: TelemetryEventIngress) => TelemetryEventIngress;
+  /**
+   * Substrings that must be present before redaction and absent after it, so
+   * no row can pass by demonstrating nothing.
+   */
+  readonly removed: readonly string[];
+}
+
+const CORPUS_CASES: readonly CorpusCase[] = [
+  {
+    file: 'redaction-headers.json',
+    corpus: readCorpus('redaction-headers.json'),
+    materialise: (event) => event,
+    removed: ['example-placeholder'],
+  },
+  {
+    file: 'redaction-url.json',
+    corpus: readCorpus('redaction-url.json'),
+    materialise: materialiseUrlEvent,
+    removed: [...URL_CORPUS_QUERY_VALUES],
+  },
+  {
+    file: 'redaction-sql.json',
+    corpus: readCorpus('redaction-sql.json'),
+    materialise: materialiseSqlEvent,
+    removed: ['sentinel-status', 'sentinel-since', '9081726'],
+  },
+  {
+    file: 'redaction-props-state.json',
+    corpus: readCorpus('redaction-props-state.json'),
+    materialise: (event) => event,
+    // The tails of the two over-bound previews, which truncation removes.
+    removed: ['anyone on the team', 'pinned to the left edge'],
+  },
+];
+
+describe('the committed redaction corpora', () => {
+  it('covers every corpus the fixture folder ships', () => {
+    expect(CORPUS_CASES.map((corpusCase) => corpusCase.file)).toEqual([
+      'redaction-headers.json',
+      'redaction-url.json',
+      'redaction-sql.json',
+      'redaction-props-state.json',
+    ]);
+  });
+
+  it.each([...CORPUS_CASES])('parses both sides of $file as ingress events', ({ corpus }) => {
+    expect(corpus.before.length).toBeGreaterThan(0);
+    expect(corpus.after).toHaveLength(corpus.before.length);
+
+    for (const [index, raw] of corpus.before.entries()) {
+      const before = parsedEvent(`${corpus.file} before[${String(index)}]`, raw);
+      const after = parsedEvent(`${corpus.file} after[${String(index)}]`, corpus.after[index]);
+
+      // Same event, redacted: identity, timing and provenance are untouched,
+      // and `redacted` is the one key the after side may add.
+      expect(after.id).toBe(before.id);
+      expect(after.traceId).toBe(before.traceId);
+      expect(after.spanId).toBe(before.spanId);
+      expect(after.kind).toBe(before.kind);
+      expect(after.tier).toBe(before.tier);
+      expect(after.startTime).toBe(before.startTime);
+      expect(after.duration).toBe(before.duration);
+      expect(after.producerId).toBe(before.producerId);
+      expect(after.seq).toBe(before.seq);
+      expect(after.source).toEqual(before.source);
+      expect(Object.keys(before)).not.toContain('redacted');
+      expect(new Set(Object.keys(after))).toEqual(
+        new Set([...Object.keys(before), ...(after.redacted === undefined ? [] : ['redacted'])]),
+      );
+    }
+  });
+
+  it.each([...CORPUS_CASES])(
+    'reproduces $file from its pre-redaction side',
+    ({ corpus, materialise, removed }) => {
+      const inputs = corpus.before.map((raw, index) => {
+        const label = `${corpus.file}[${String(index)}]`;
+        // The pre-redaction event, validated exactly as the ingest path
+        // validates a producer's event before redaction runs.
+        return parsedEvent(
+          `${label} materialised`,
+          materialise(parsedEvent(`${label} before`, raw)),
+        );
+      });
+      const outputs = inputs.map((input) => redactEvent(input));
+
+      // Asserted over the whole side rather than per event, because a pair
+      // may spread what it demonstrates across its elements: the props/state
+      // corpus puts one over-bound preview on its render event and another on
+      // its state event.
+      const arrived = JSON.stringify(inputs);
+      for (const secret of removed) {
+        expect(arrived, `${corpus.file} must carry "${secret}" before redaction`).toContain(secret);
+      }
+
+      inputs.forEach((_input, index) => {
+        const label = `${corpus.file}[${String(index)}]`;
+        expect(outputs[index], label).toEqual(parsedEvent(`${label} after`, corpus.after[index]));
+      });
+
+      const serialised = JSON.stringify(outputs);
+      for (const secret of removed) {
+        expect(serialised, `"${secret}" survived redaction in ${corpus.file}`).not.toContain(
+          secret,
+        );
+      }
+    },
+  );
+
+  it.each([...CORPUS_CASES])('re-redacts $file to itself', ({ corpus }) => {
+    // Idempotence on real data: the after side is a fixed point of the whole
+    // event-level pass, `redacted` path list included.
+    for (const [index, raw] of corpus.after.entries()) {
+      const after = parsedEvent(`${corpus.file} after[${String(index)}]`, raw);
+
+      expect(redactEvent(after)).toEqual(after);
+    }
+  });
+
+  it.each([...CORPUS_CASES])('does not mutate the loaded $file events', ({ corpus }) => {
+    for (const [index, raw] of corpus.before.entries()) {
+      const event = parsedEvent(`${corpus.file} before[${String(index)}]`, raw);
+      const snapshot = structuredClone(event);
+
+      redactEvent(event);
+
+      expect(event).toEqual(snapshot);
+    }
+  });
+
+  it.each([...CORPUS_CASES])(
+    'holds no unmasked query value or SQL literal in $file',
+    ({ corpus }) => {
+      // The committed-bytes policy, stated as a check rather than as a
+      // comment: every URL in the corpus is already `?`-masked and every
+      // statement already parameterised, on both sides. Deliberately narrow —
+      // the header corpus's placeholder credentials and the props/state
+      // corpus's over-bound previews are the dimensions those pairs
+      // demonstrate, and each is masked by its own `after` side.
+      for (const side of ['before', 'after'] as const) {
+        for (const [index, raw] of corpus[side].entries()) {
+          const label = `${corpus.file} ${side}[${String(index)}]`;
+          const event = parsedEvent(label, raw);
+
+          expect(redactEventName(event.kind, event.name), `${label}.name`).toBe(event.name);
+
+          for (const [key, value] of Object.entries(event.attributes)) {
+            if (isUrlAttributeKey(key)) {
+              expect(redactUrl(value), `${label}.${key}`).toBe(value);
+            }
+            // The catalog's statement key, as the corpus spells it.
+            if (key === 'db.statement') {
+              expect(redactSqlStatement(value), `${label}.${key}`).toBe(value);
+            }
+          }
+        }
+      }
+    },
+  );
 });

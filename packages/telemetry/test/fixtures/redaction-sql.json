@@ -11,7 +11,7 @@
     "tier": "db",
     "attributes": {
       "db.system": "postgresql",
-      "db.statement": "SELECT id, name FROM items WHERE tenant_id = $1 AND status = 'active' AND updated_at > '2026-01-01' LIMIT 50",
+      "db.statement": "SELECT id, name FROM items WHERE tenant_id = $1 AND status = ? AND updated_at > ? LIMIT ?",
       "db.rowCount": 24
     },
     "status": "ok",

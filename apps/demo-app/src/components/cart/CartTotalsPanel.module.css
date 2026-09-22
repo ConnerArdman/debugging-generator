@@ -1,6 +1,7 @@
 /*
- * CartTotalsPanel - the cart's derived-totals block (items, subtotal, free-freight state,
- * dispatch/delivery line, emphasised total).
+ * CartTotalsPanel - the cart's derived-totals block (items, merchandise subtotal, one line per
+ * charge the placing surface passes, the emphasised closing figure, free-freight state and the
+ * dispatch/delivery line).
  *
  * Scope, and deliberately nothing more
  * ---------------------------------------------------------------------------------------------
@@ -48,6 +49,17 @@
  *
  * Variants come from `data-variant` on the root (`drawer` | `page`), which the component sets.
  * There is deliberately no second class name for a variant: one element, one class, one attribute.
+ *
+ * Which row is the closing row is the component's decision, not this file's
+ * ---------------------------------------------------------------------------------------------
+ * `.total` is the closing treatment and nothing else - a hairline, a weight and a size step - and
+ * the component puts it on whichever row closes the block: the merchandise subtotal where a
+ * surface passed no charges, the summed row where it passed some. So there is no `.subtotal` and
+ * no `.orderTotal` here; a second class for each arrangement would be two places to keep one
+ * hierarchy in step. The two classes the charge rows add - `.chargeDetail` for a quiet
+ * qualification beside a label, `.chargePending` for wording where an amount is not established -
+ * are quiet registers of the row they sit in and declare no geometry, because the row's grid
+ * already owns both columns.
  */
 
 .root {
@@ -96,6 +108,27 @@
   justify-self: end;
   min-width: var(--totals-value-min, calc(var(--ls-space-6, 32px) * 2));
   text-align: end;
+  font-variant-numeric: tabular-nums;
+}
+
+/* A charge's quiet qualification beside its label - the chosen service on a freight row. One step
+ * down from the label it follows and in the same muted colour, so it reads as a note about that
+ * row rather than as a second row; it inherits the label's wrapping, because the `1fr` track is
+ * what both of them share. Tabular figures because a service name can carry a number. */
+.chargeDetail {
+  color: var(--ls-text-muted, #475569);
+  font-size: var(--ls-text-xs, 12px);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Wording in a charge's value column where the amount is not established yet. It sits where a
+ * figure would, so it takes the muted colour and the small step to read as a note rather than as
+ * an amount, and it keeps `tabular-nums` for the row it shares a column with. `text-wrap: balance`
+ * is deliberately absent: the column is narrow and the phrase is short, and a balanced break would
+ * shift the line as the cart's figures change beside it. */
+.chargePending {
+  color: var(--ls-text-muted, #475569);
+  font-size: var(--ls-text-xs, 12px);
   font-variant-numeric: tabular-nums;
 }
 

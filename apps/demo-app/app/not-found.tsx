@@ -58,8 +58,10 @@ const BODY =
 
 /**
  * What the illustration shows, for a reader who cannot see it. `BlankSlate` accepts `''` for
- * artwork that only decorates, but this page has no other picture and no heading element, so the
- * drawing is described rather than hidden.
+ * artwork that only decorates, and the `<h1>` beneath it already carries the page's meaning, but
+ * this sentence describes the drawing rather than restating that heading - it is the page's only
+ * picture and nothing else here says what it depicts - so it adds a description instead of
+ * announcing the same words twice.
  */
 const ART_ALT = 'A magnifier held over a stocking bay, with nothing on its shelves.';
 
@@ -86,12 +88,22 @@ export const metadata: Metadata = {
  * two screens whose emptiness is ordinary, and `tone="neutral"` keeps this page's reading
  * ordinary too. Everything that makes the block mean "you took a wrong turn" is the copy above.
  *
- * The block renders its heading as a paragraph styled as one, on purpose: the right heading level
- * depends on the page around it, and the block appears at four different depths in this
- * application. This page therefore adds no `<h1>` that would repeat the same sentence, and takes
- * the route the component documents instead - it wraps the block in a labelled `<section>`, so
- * the page's only content is a named region a screen reader can find and announce, with no
- * visible change of any kind.
+ * The block renders its heading as a paragraph by default, because the right level depends on the
+ * page around it and the block appears at several different depths in this application. Here the
+ * block IS the page, so its visible title is the page's title and `headingAs="h1"` makes it the
+ * route's one real heading: it is reachable by heading navigation, and its role as the title is
+ * conveyed programmatically rather than only by its size. Nothing moves - `BlankSlate.module.css`
+ * states the heading class's margin, colour, size, weight and line height outright, and a
+ * CSS-module class outranks the element rules in `app/globals.css` - and there is still exactly
+ * one heading on the route, because the title is rendered once, in one place.
+ *
+ * The labelled `<section>` is kept alongside that heading. It is not what exposes the title any
+ * more, but it is what gives this page's single block a named region a reader can jump to, and its
+ * name is the heading's own words: entering the region announces those three words and the heading
+ * inside it reads the same three, which is a repeated label rather than a second sentence of copy.
+ * `aria-label` adds no text to the page, so the title is visible exactly once. Naming the region
+ * from the heading's id instead would read identically and cost a second `BlankSlate` prop plus
+ * an id this page has no other use for, which is not a trade worth making for one route.
  *
  * The way out is an anchor, not a button: it navigates, and `Button` in this workspace is a
  * `<button>` with no link mode by design. It carries no class of its own - the utility set in
@@ -108,6 +120,7 @@ export default function NotFoundPage() {
         art="no-results"
         alt={ART_ALT}
         heading={HEADING}
+        headingAs="h1"
         tone="neutral"
         action={
           <div className="ls-actions">

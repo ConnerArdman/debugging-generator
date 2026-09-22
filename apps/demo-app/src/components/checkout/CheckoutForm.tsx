@@ -44,6 +44,21 @@
  *      so the safe action and the retry are one control. And the cart: a cart that could not be
  *      read is not an empty cart, so its totals are withheld rather than printed as zero.
  *
+ *   5. THE CHOSEN FREIGHT CHARGE IS OWNED HERE AND PUBLISHED FROM HERE. The buyer chooses a
+ *      service in the group below, and the review column beside this form has to quote what that
+ *      service costs - the two are siblings on `/checkout`, so the figure has to travel. This form
+ *      is where it can: it already owns `shippingOptionId`, so it holds the freight lookup as well
+ *      (`useFreightQuote`, hoisted out of the picker, which is handed the result) and publishes the
+ *      chosen service and its quoted rate on `./CheckoutCharges`. Three consequences are
+ *      deliberate. The lookup names the shipment as well as the address - `cart.itemCount`, the
+ *      same unit count `POST /api/checkout` rates the order's freight against - because freight is
+ *      charged per piece and a lookup that named only the postal code would be answered for one
+ *      unit. The published amount comes from that quote and never from the list rates this form
+ *      was handed, so the review column either states the figure the order will be charged or
+ *      states that the charge is not established yet. And there is still exactly one
+ *      `GET /api/shipping/quote` per shipment, because the panel asks for nothing once the lookup
+ *      is handed to it.
+ *
  * Validation is a mirror of the server's bounds, not a second opinion about them: the lengths and
  * shapes below are the ones `checkoutBodySchema` enforces, so a value this form accepts is a value
  * that endpoint accepts, and the endpoint remains the authority on everything that depends on data
@@ -61,6 +76,7 @@ import { FormField } from '@/components/ui/FormField';
 import { Input } from '@/components/ui/Input';
 import { Select } from '@/components/ui/Select';
 import { useCart } from '@/hooks/useCart';
+import { useFreightQuote } from '@/hooks/useShippingEta';
 import { StorefrontApiError, submitCheckout } from '@/lib/api-client';
 import { formatQuantityLabel } from '@/lib/format';
 import type {
@@ -73,6 +89,7 @@ import type {
 import { useToastCenter } from '@/providers/ToastProvider';
 
 import { CheckoutButton } from './CheckoutButton';
+import { usePublishSelectedFreight } from './CheckoutCharges';
 import { OrderConfirmation } from './OrderConfirmation';
 import { ShippingOptionPicker } from './ShippingOptionPicker';
 
@@ -578,6 +595,12 @@ function orderSizeLabel(itemCount: number, subtotalLabel: string): string {
  * derived copy of the cart: the cart is read from the provider that owns it, and the two composite
  * blocks below own their own presentation.
  *
+ * Two things are read from elsewhere and neither is state of this form's. The freight lookup for
+ * the destination in the fields comes from `@/hooks/useShippingEta`, which owns the request and its
+ * three outcomes; the charge channel comes from `./CheckoutCharges`, and all this form does with it
+ * is publish what the buyer chose. The chosen service itself is derived from the option list and
+ * that lookup on every render rather than stored, so it cannot go stale against either.
+ *
  * Two handlers matter. `submitOrder` is the form's `onSubmit`, and it is described where it is
  * written. The other is the `void`-returning arrow the form attaches it with: a promise handed
  * straight to a DOM event attribute is a promise nothing awaits, so the arrow starts the
@@ -596,6 +619,7 @@ export function CheckoutForm({
 }: Props): ReactElement {
   const cart = useCart();
   const { showToast } = useToastCenter();
+  const publishFreight = usePublishSelectedFreight();
 
   const [contact, setContact] = useState<ContactFields>(() => ({
     name: initialContact?.name ?? '',
@@ -619,6 +643,61 @@ export function CheckoutForm({
   const [failure, setFailure] = useState<OrderFailureCopy | null>(null);
   const [placed, setPlaced] = useState<CheckoutResult | null>(null);
 
+  /*
+   * Where the order is going, as the freight lookup and the service group are both given it: the
+   * postal-code field trimmed, or `null` while there is nothing to quote for. One `const` rather
+   * than the same expression written at two call sites, because the lookup and the panel must
+   * describe one address - a panel priced for a destination the lookup was not asked about would
+   * put rates for the previous address beside the new one.
+   */
+  const typedPostalCode = address.postalCode.trim();
+  const destination = typedPostalCode.length > 0 ? typedPostalCode : null;
+
+  /*
+   * The freight lookup, held here rather than inside the service group, because the rate the buyer
+   * is looking at has to reach the review column beside this form - see decision 5 in the header.
+   * The panel is handed this state, so it asks nothing itself and the page makes one request per
+   * shipment.
+   *
+   * Both halves of the question are passed, and the second one is not optional in practice.
+   * Freight is charged per piece as well as per destination, and `POST /api/checkout` rates the
+   * order's freight against the units it reserved - so a lookup that named only the address would
+   * be answered for a single unit and would show a buyer a fraction of what their order is about
+   * to be charged. `cart.itemCount` is that same unit count, summed across the cart's lines by the
+   * provider that owns them.
+   */
+  const freight = useFreightQuote(destination, cart.itemCount);
+
+  /*
+   * The chosen service, and the one amount this form is entitled to publish for it.
+   *
+   * The service itself is the option this form was given, matched on the chosen id - that is the
+   * row the panel shows as checked and the service the order names. The amount is taken from the
+   * quote and from nowhere else, and that restriction is the point: the list rates this form was
+   * handed are what a service costs to carry one unit to an unspecified address, so publishing one
+   * would quote the review column a figure the order will not be charged. Until a quote for this
+   * shipment has arrived - before the first lookup, while one is in flight, after a failed one -
+   * there is no freight amount to state, and `null` is what says so; the column then prints the
+   * row as a charge still to be confirmed rather than as an amount. Once the quote is in, the
+   * figure is the quote's entry for the chosen id, which is both what the panel prints beside the
+   * checked row and what `POST /api/checkout` rates the same shipment at.
+   *
+   * Three primitives rather than an object, because they are what the publishing effect below
+   * depends on: an object literal in a dependency array is a fresh identity on every render, and
+   * this form re-renders several times a second (AAP 0.8.2 defect 2).
+   */
+  const chosenOption =
+    shippingOptionId === null
+      ? undefined
+      : shippingOptions.find((option) => option.id === shippingOptionId);
+  const quotedOption =
+    chosenOption === undefined
+      ? undefined
+      : freight.quote?.options.find((candidate) => candidate.id === chosenOption.id);
+  const chosenOptionId = chosenOption?.id ?? null;
+  const chosenOptionLabel = chosenOption?.label ?? null;
+  const chosenOptionAmountCents = quotedOption?.priceCents ?? null;
+
   const failureRegion = useRef<HTMLDivElement | null>(null);
 
   // The name every submission of the order in front of the buyer travels under, drawn on the
@@ -638,6 +717,31 @@ export function CheckoutForm({
       failureRegion.current?.focus();
     }
   }, [failure]);
+
+  // The chosen freight charge, published for the review column beside this form. The dependencies
+  // are the three primitives the charge is made of and the publisher, which is stable for the life
+  // of its provider, so this runs when the chosen service or its quoted rate changes and not when
+  // the cart or the dispatch countdown does - and the value itself is built inside the effect,
+  // where a fresh object costs nothing. Nothing chosen, or a service with no rate to quote yet,
+  // publishes `null`, which the column renders as a charge still to be established rather than as
+  // a zero; the cleanup publishes `null` too, so a form that goes away leaves no freight row
+  // behind it. The publisher ignores a value equal to the one already published, which is what
+  // keeps a form re-rendering four times a second from writing state four times a second.
+  useEffect(() => {
+    if (chosenOptionId === null || chosenOptionLabel === null || chosenOptionAmountCents === null) {
+      publishFreight(null);
+    } else {
+      publishFreight({
+        optionId: chosenOptionId,
+        label: chosenOptionLabel,
+        amountCents: chosenOptionAmountCents,
+      });
+    }
+
+    return () => {
+      publishFreight(null);
+    };
+  }, [chosenOptionId, chosenOptionLabel, chosenOptionAmountCents, publishFreight]);
 
   /**
    * Place the order.
@@ -969,7 +1073,8 @@ export function CheckoutForm({
           <ShippingOptionPicker
             options={shippingOptions}
             selectedId={shippingOptionId}
-            postalCode={address.postalCode.trim().length > 0 ? address.postalCode.trim() : null}
+            postalCode={destination}
+            quote={freight}
             disabled={pending}
             onSelect={(optionId) => {
               setShippingOptionId(optionId);

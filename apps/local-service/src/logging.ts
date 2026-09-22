@@ -15,9 +15,10 @@
  *    whose six level methods call `pinoLogger[level](fields, message)` — and
  *    `pinoLogger[level](message)` when there are no fields, so pino never
  *    emits an empty merge object. Inverting the pair produces records whose
- *    `msg` is `[object Object]`; the compiler cannot catch it, so the
- *    colocated proof in Phase 5 of the file's validation asserts the emitted
- *    JSON directly.
+ *    `msg` is `[object Object]`; the compiler cannot catch it, so it is
+ *    asserted against emitted JSON rather than against the call signature —
+ *    by the integration suites, which run every session through this logger,
+ *    and by the colocated suite when it lands at its assigned checkpoint.
  * 2. **Redact.** A log record is the third and last checkpoint between the
  *    developer's runtime data and a file on disk (the first two are
  *    `packages/telemetry/src/redaction/` at ingest and
@@ -36,7 +37,11 @@
  *      string appearing *anywhere* in a value — including inside an error
  *      message this service did not author, or inside a rejected model
  *      payload that `@debuggen/model-provider`'s `structured.ts` logs through
- *      this very logger.
+ *      this very logger. Layer 2 also owns the one name rule the telemetry
+ *      vocabulary has no reason to carry: a database connection URL
+ *      ({@link SERVICE_DATABASE_URL_KEY_NAMES}), which AAP §0.5.2 forbids
+ *      capturing at all and which no content rule recognises once it carries
+ *      no credentials.
  *    The message string is scrubbed too: it is cheap and it catches a
  *    credential interpolated into text by a library.
  * 3. **Standardise the bindings.** {@link LOG_BINDING_KEYS} fixes the names
@@ -162,6 +167,17 @@ export const LOG_MARKERS = Object.freeze({
 export const FIELDS_TRUNCATED_KEY = 'fieldsTruncated';
 
 /**
+ * The flag added to a record whose keys could not be enumerated at all.
+ *
+ * Distinct from {@link FIELDS_TRUNCATED_KEY}: truncation means the walk chose
+ * to stop, while this means the object refused to be read — a `Proxy` whose
+ * `ownKeys` trap throws, for instance. The record is emitted with this key
+ * rather than dropped, so a reader sees that fields were present and
+ * unreadable instead of seeing nothing at all.
+ */
+export const FIELDS_UNREADABLE_KEY = 'fieldsUnreadable';
+
+/**
  * Keys pino owns in the emitted record, which a field must not collide with.
  *
  * pino does **not** guard these in the merge object: a field named `msg`
@@ -170,6 +186,36 @@ export const FIELDS_TRUNCATED_KEY = 'fieldsTruncated';
  * {@link RESERVED_FIELD_PREFIX} before it reaches pino.
  */
 export const RESERVED_LOG_KEYS = Object.freeze(['level', 'time', 'msg'] as const);
+
+/**
+ * Key names that break pino when they reach it as top-level field names.
+ *
+ * pino resolves a field's serializer as `serializers[key]` on a plain object,
+ * so a field named after an `Object.prototype` property finds that property
+ * through the prototype chain instead of finding nothing. Measured against
+ * pino 10.3.1, with one merge object per name:
+ *
+ * - **Throws** for `__proto__`, `valueOf`, `hasOwnProperty`, `toLocaleString`,
+ *   `propertyIsEnumerable`, `__defineGetter__` and `__defineSetter__` — the
+ *   inherited value is either not a function or a function that rejects
+ *   pino's arguments. A throw here escapes `logger.error(...)` itself, which
+ *   is the never-throw boundary this module promises.
+ * - **Emits invalid JSON** for `constructor` and `toString`: the inherited
+ *   function is *called* as the serializer and its result is interpolated
+ *   unquoted, producing a line no consumer can parse (`"constructor":V`).
+ * - **Silently loses the field** for `__lookupGetter__`, `__lookupSetter__`
+ *   and `isPrototypeOf`.
+ *
+ * Derived from the runtime rather than transcribed, so a future engine
+ * addition to `Object.prototype` is covered without an edit here. Each name is
+ * renamed with {@link RESERVED_FIELD_PREFIX} at the top record, exactly like
+ * pino's own keys; a *nested* occurrence is ordinary data and travels
+ * unchanged, which is safe because nested objects are serialised without a
+ * serializer lookup.
+ */
+export const PROTOTYPE_LOG_KEYS: readonly string[] = Object.freeze([
+  ...Object.getOwnPropertyNames(Object.prototype),
+]);
 
 /** The prefix applied to a field whose name collides with a reserved key. */
 export const RESERVED_FIELD_PREFIX = 'field_';
@@ -208,6 +254,55 @@ export const SERVICE_SENSITIVE_KEY_NAMES = Object.freeze([
 ] as const);
 
 /**
+ * Field names carrying a database connection URL, which is never logged.
+ *
+ * AAP §0.5.2 lists `DATABASE_URL` alongside `.env*` files and passwords as
+ * data the product must *never capture*, and neither heuristic this layer
+ * composes reaches it on its own:
+ *
+ * - **By name**: `@debuggen/telemetry`'s `isSensitiveKeyName` matches the
+ *   terms `key`, `token`, `secret`, `password`, `passwd`, `pwd`, `credential`
+ *   and `auth`. `DATABASE_URL` normalises to `databaseurl` and contains none
+ *   of them, so the predicate answers `false`.
+ * - **By content**: the `connection-string` rule redacts the *userinfo* of an
+ *   absolute URL, so it removes the password from a `postgresql://` URL whose
+ *   authority carries a `user:password@` prefix but leaves a credential-free
+ *   internal DSN such as `postgresql://localhost:5432/lumen_supply` intact — and a bare
+ *   host, port and database name is exactly the internal topology this
+ *   product has no reason to write to a log file.
+ *
+ * So the log layer owns the name rule for these, and this list is the single
+ * source of it: {@link SERVICE_LOG_REDACT_PATHS} spreads each spelling into
+ * pino's path list (Layer 1) and {@link isDatabaseUrlKey} matches the same
+ * names at any depth (Layer 2), so the two layers cannot drift apart.
+ *
+ * Both case conventions are listed because a pino `redact` path is matched
+ * **case-sensitively** against the literal property name: `DATABASE_URL` is
+ * the environment variable (AAP §0.3.4, and what the dev-server launcher
+ * passes to the target project), `databaseUrl`/`database_url` are what the
+ * same value is called once it travels inside a configuration object or a
+ * JSON body, `connectionString` is `pg`'s own `Pool` option, `datasourceUrl`
+ * is Prisma's client option, and `DIRECT_URL`/`DB_URL`/`POSTGRES_URL` are the
+ * conventional siblings of `DATABASE_URL` in this stack. Layer 2 needs only
+ * one spelling of each, and folds the rest onto it.
+ */
+export const SERVICE_DATABASE_URL_KEY_NAMES = Object.freeze([
+  'DATABASE_URL',
+  'database_url',
+  'databaseUrl',
+  'DIRECT_URL',
+  'direct_url',
+  'directUrl',
+  'DB_URL',
+  'db_url',
+  'dbUrl',
+  'POSTGRES_URL',
+  'connectionString',
+  'connection_string',
+  'datasourceUrl',
+] as const);
+
+/**
  * Layer 1 — the structural deny-list handed to pino's `redact` option.
  *
  * Path-scoped and therefore incomplete on its own: pino's `*` matches exactly
@@ -216,6 +311,11 @@ export const SERVICE_SENSITIVE_KEY_NAMES = Object.freeze([
  * even if a record reaches pino by some path that skipped the value walk —
  * an injected pino instance shared with a test, say — and a cheap declaration
  * of intent a reviewer can read at a glance.
+ *
+ * The database URL entries are generated from
+ * {@link SERVICE_DATABASE_URL_KEY_NAMES} rather than written out, so adding a
+ * spelling there covers both the exact and the one-level-nested path here and
+ * the whole-value mask in Layer 2 at the same time.
  *
  * Exported so a test can assert the set rather than re-derive it.
  */
@@ -259,6 +359,7 @@ export const SERVICE_LOG_REDACT_PATHS: readonly string[] = Object.freeze([
   '*.requestBody',
   'responseBody',
   '*.responseBody',
+  ...SERVICE_DATABASE_URL_KEY_NAMES.flatMap((name) => [name, `*.${name}`]),
 ]);
 
 /**
@@ -339,6 +440,99 @@ function matchesFolded(key: string, candidates: readonly string[]): boolean {
 }
 
 /**
+ * Splits a key into lower-cased words at camelCase, acronym and separator
+ * boundaries: `DATABASE_URL`, `databaseUrl`, `database.url` and `DatabaseURL`
+ * all become `['database', 'url']`.
+ *
+ * Words rather than a folded string, because {@link isDatabaseUrlKey} matches
+ * a *run of words* and folding loses the boundaries that keep the match
+ * precise. Folded containment would mask `redirectUrl`, whose folded form
+ * `redirecturl` contains `directurl`; as words, `['redirect', 'url']` does not
+ * begin with `direct`, so a redirect URL stays readable while `DIRECT_URL`
+ * does not.
+ */
+function keyWords(key: string): readonly string[] {
+  return key
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
+    .split(/[^A-Za-z0-9]+/)
+    .filter((word) => word.length > 0)
+    .map((word) => word.toLowerCase());
+}
+
+/**
+ * The word runs a database URL name is recognised by, derived once from
+ * {@link SERVICE_DATABASE_URL_KEY_NAMES} so the two layers share one
+ * vocabulary. Duplicates collapse: the three spellings of `DATABASE_URL`
+ * yield the same run.
+ */
+const DATABASE_URL_WORD_RUNS: readonly (readonly string[])[] = Object.freeze(
+  [...new Set(SERVICE_DATABASE_URL_KEY_NAMES.map((name) => keyWords(name).join(' ')))].map((run) =>
+    Object.freeze(run.split(' ')),
+  ),
+);
+
+/** The same names folded, so a separator-free spelling (`DATABASEURL`) matches too. */
+const DATABASE_URL_FOLDED: readonly string[] = Object.freeze([
+  ...new Set(SERVICE_DATABASE_URL_KEY_NAMES.map(foldKeyName)),
+]);
+
+/**
+ * Whether `words` contains `run` as a consecutive sub-run.
+ *
+ * The run's last word also matches its plural, so `connectionStrings` and
+ * `databaseUrls` — a pool configuration holding several DSNs — are masked
+ * like the singular. Nothing else is inflected: a match must otherwise be
+ * word-for-word.
+ */
+function containsWordRun(words: readonly string[], run: readonly string[]): boolean {
+  if (run.length === 0 || run.length > words.length) {
+    return false;
+  }
+  const last = run.length - 1;
+  for (let start = 0; start + run.length <= words.length; start += 1) {
+    let matched = true;
+    for (let offset = 0; offset < run.length; offset += 1) {
+      const word = words[start + offset];
+      const expected = run[offset];
+      if (word === undefined || expected === undefined) {
+        matched = false;
+        break;
+      }
+      if (word === expected || (offset === last && word === `${expected}s`)) {
+        continue;
+      }
+      matched = false;
+      break;
+    }
+    if (matched) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Whether a field under this name carries a database connection URL.
+ *
+ * Word-run matching means the name is recognised wherever it appears in a
+ * compound: `DATABASE_URL`, `shadowDatabaseUrl`, `DATABASE_URL_UNPOOLED` and
+ * `pool.connectionString` all match, while `redirectUrl` and `databasePath`
+ * — the session store's own SQLite path, which is a diagnostic — do not. A
+ * bare `url` key is deliberately *not* matched: request URLs are the core of
+ * the network diagnostics this product exists to show, and AAP §0.5.2 keeps
+ * their path while redacting their query values rather than masking them
+ * whole.
+ */
+function isDatabaseUrlKey(key: string): boolean {
+  if (matchesFolded(key, DATABASE_URL_FOLDED)) {
+    return true;
+  }
+  const words = keyWords(key);
+  return DATABASE_URL_WORD_RUNS.some((run) => containsWordRun(words, run));
+}
+
+/**
  * Whether a field under this name must be masked whole rather than scanned.
  *
  * Two sources: `@debuggen/telemetry`'s `isSensitiveKeyName`, which owns the
@@ -355,12 +549,18 @@ function matchesFolded(key: string, candidates: readonly string[]): boolean {
  * not fold onto a sensitive term — `setting` or `variable` rather than
  * `envKey` — and the product's own identifiers (`sessionId`, `traceId`,
  * `spanId`, `request_key`) are already exempt by name upstream.
+ *
+ * {@link isDatabaseUrlKey} is the third source and the reason this predicate
+ * is not simply the telemetry one: a database URL is sensitive by name but
+ * matches neither the telemetry vocabulary nor a content rule when it carries
+ * no credentials (see {@link SERVICE_DATABASE_URL_KEY_NAMES}).
  */
 function isSensitiveLogKey(key: string): boolean {
   return (
     isSensitiveKeyName(key) ||
     isSensitiveKeyName(lastSegmentOf(key)) ||
-    matchesFolded(key, SERVICE_SENSITIVE_FOLDED)
+    matchesFolded(key, SERVICE_SENSITIVE_FOLDED) ||
+    isDatabaseUrlKey(key)
   );
 }
 
@@ -429,8 +629,11 @@ export function scrubLogMessage(message: string): string {
  *
  * Never mutates its argument — the shared `Logger` contract promises a caller
  * gets its object back unchanged — and never throws: a value that resists
- * reading becomes `LOG_MARKERS.unserializable` rather than an exception
- * escaping a log call.
+ * reading becomes `LOG_MARKERS.unserializable` under its own key rather than
+ * an exception escaping a log call, and a bag that refuses enumeration
+ * altogether comes back carrying {@link FIELDS_UNREADABLE_KEY}. The result is
+ * also safe for pino to receive: prototype-derived names are renamed and the
+ * top-level object keeps a prototype, which pino's `child()` requires.
  *
  * Bounded three ways, using the redaction layer's own constants so this
  * checkpoint cannot be looser than the ingest one: at most
@@ -445,21 +648,83 @@ export function scrubLogMessage(message: string): string {
 export function scrubLogFields(fields: LogFields): LogFields {
   const budget: ScrubBudget = { nodes: MAX_ATTRIBUTE_NODES, bounded: false };
   const result = scrubRecord(fields, 0, budget, new WeakSet<object>(), true);
-  if (budget.bounded && !(FIELDS_TRUNCATED_KEY in result)) {
+  if (budget.bounded && !Object.hasOwn(result, FIELDS_TRUNCATED_KEY)) {
     result[FIELDS_TRUNCATED_KEY] = true;
   }
   return result;
 }
 
 /**
+ * Lists a record's own enumerable string keys, or `undefined` if it refuses.
+ *
+ * `Object.keys` is not inert on an arbitrary value: a `Proxy` can throw from
+ * its `ownKeys` or `getOwnPropertyDescriptor` trap, and the values that reach
+ * this layer include rejected model payloads and objects this service did not
+ * author. Enumeration is therefore a guarded step of its own rather than part
+ * of the loop header.
+ */
+function ownKeysOf(source: Readonly<Record<string, unknown>>): readonly string[] | undefined {
+  try {
+    return Object.keys(source);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * What {@link readProperty} returns when a property could not be read.
+ *
+ * A module-private symbol rather than `undefined`, because `undefined` is a
+ * legitimate value with its own meaning here — the key is omitted — and must
+ * stay distinguishable from a failed read. Never emitted: every branch that
+ * receives it substitutes {@link LOG_MARKERS.unserializable}.
+ */
+const READ_FAILED = Symbol('debuggen.readFailed');
+
+/**
+ * Reads one property, or reports that it could not be read.
+ *
+ * A property may be an accessor that throws — a lazily computed `stack`, a
+ * getter on a rejected payload, a `Proxy` `get` trap. `Object.entries` would
+ * invoke every such getter while building its array, outside any guard, so
+ * one hostile field would take down the whole log call. Reading each property
+ * inside its own `try` costs nothing and confines the damage to that field.
+ */
+function readProperty(source: object, key: string): unknown {
+  try {
+    return (source as Record<string, unknown>)[key];
+  } catch {
+    return READ_FAILED;
+  }
+}
+
+/**
  * Walks one record.
+ *
+ * Neither enumerating the source nor reading one of its properties can throw
+ * out of this function: both are guarded, and a value that resists reading
+ * becomes {@link LOG_MARKERS.unserializable} under its own key while every
+ * other field still travels. That is what makes `logger.error(...)` safe on
+ * the error path, where the object being logged is least likely to be
+ * well-behaved.
+ *
+ * The destination's prototype depends on `top`. A nested record is created
+ * with `Object.create(null)` so that a source key named `__proto__` becomes an
+ * ordinary own property instead of reaching `Object.prototype`'s setter, which
+ * would change the destination's prototype and drop the field. The **top**
+ * record cannot use a null prototype: pino's `child()` calls
+ * `bindings.hasOwnProperty(...)` on the object it is handed and throws
+ * ("bindings.hasOwnProperty is not a function") when the prototype is absent.
+ * It is a plain object instead, and {@link reserveKey} renames the
+ * prototype-derived names there, which removes the hazard at its source.
  *
  * @param source - the record being copied
  * @param depth - the record's own depth; the root bag is 0
  * @param budget - shared node accounting
  * @param seen - containers on the path from the root, for cycle detection
  * @param top - whether this is the record pino merges, where its own keys
- *   (`level`, `time`, `msg`) must not be collided with
+ *   (`level`, `time`, `msg`) and the prototype-derived names must not be
+ *   collided with
  */
 function scrubRecord(
   source: Readonly<Record<string, unknown>>,
@@ -468,13 +733,24 @@ function scrubRecord(
   seen: WeakSet<object>,
   top: boolean,
 ): LogFields {
-  const result: LogFields = {};
-  let keys = 0;
+  const result: LogFields = top ? {} : (Object.create(null) as LogFields);
+  const sourceKeys = ownKeysOf(source);
+  if (sourceKeys === undefined) {
+    result[reserveKey(FIELDS_UNREADABLE_KEY, result, top)] = LOG_MARKERS.unserializable;
+    return result;
+  }
 
-  for (const [key, value] of Object.entries(source)) {
+  let keys = 0;
+  for (const key of sourceKeys) {
     if (keys >= MAX_TRACKED_KEYS) {
       budget.bounded = true;
       break;
+    }
+    const value = readProperty(source, key);
+    if (value === READ_FAILED) {
+      keys += 1;
+      result[reserveKey(key, result, top)] = LOG_MARKERS.unserializable;
+      continue;
     }
     if (value === undefined) {
       // Omit the key rather than emit `undefined`, matching the shared
@@ -491,17 +767,31 @@ function scrubRecord(
 /**
  * Resolves the name a field is emitted under.
  *
- * Only the record pino merges can collide with pino's own keys, so the
- * renaming is confined to it; a nested `msg` is ordinary data. A collision
- * with the prefixed name is resolved by prefixing again, bounded by the key
- * cap so the loop always terminates.
+ * Two families are renamed, and only in the record pino merges: pino's own
+ * keys ({@link RESERVED_LOG_KEYS}), because a duplicate `msg` would be read
+ * last-wins as the message, and the prototype-derived names
+ * ({@link PROTOTYPE_LOG_KEYS}), because pino's serializer lookup finds them on
+ * `Object.prototype` and then throws, emits unquoted JSON, or drops the field.
+ * A nested `msg` or `__proto__` is ordinary data and keeps its name.
+ *
+ * A collision with the prefixed name is resolved by prefixing again, bounded
+ * by the key cap so the loop always terminates. `Object.hasOwn` rather than
+ * `in`, so an inherited property of a plain destination cannot masquerade as
+ * a collision.
  */
 function reserveKey(key: string, result: Readonly<LogFields>, top: boolean): string {
-  if (!top || !(RESERVED_LOG_KEYS as readonly string[]).includes(key)) {
+  if (
+    !top ||
+    !((RESERVED_LOG_KEYS as readonly string[]).includes(key) || PROTOTYPE_LOG_KEYS.includes(key))
+  ) {
     return key;
   }
   let candidate = `${RESERVED_FIELD_PREFIX}${key}`;
-  for (let attempt = 0; attempt < MAX_TRACKED_KEYS && candidate in result; attempt += 1) {
+  for (
+    let attempt = 0;
+    attempt < MAX_TRACKED_KEYS && Object.hasOwn(result, candidate);
+    attempt += 1
+  ) {
     candidate = `${RESERVED_FIELD_PREFIX}${candidate}`;
   }
   return candidate;
@@ -684,7 +974,10 @@ function scrubMap(
   budget: ScrubBudget,
   seen: WeakSet<object>,
 ): LogFields {
-  const entries: Record<string, unknown> = {};
+  // Null prototype, for the same reason a nested record has one: a map key of
+  // `__proto__` must become an own property here rather than reach
+  // `Object.prototype`'s setter and silently replace this object's prototype.
+  const entries = Object.create(null) as Record<string, unknown>;
   let keys = 0;
   for (const [mapKey, mapValue] of value) {
     if (keys >= MAX_TRACKED_KEYS) {
@@ -729,7 +1022,15 @@ function serializeError(
   budget: ScrubBudget,
   seen: WeakSet<object>,
 ): LogFields {
-  const result: LogFields = { type: error.name };
+  // `name`, `message`, `stack` and `cause` are read through the same guard the
+  // record walk uses: they are ordinary properties on an ordinary error, but
+  // any of them may be an accessor on an object this service did not author,
+  // and losing the whole error record to one hostile getter is the outcome
+  // this file exists to prevent.
+  const name = readProperty(error, 'name');
+  const result: LogFields = {
+    type: typeof name === 'string' ? name : LOG_MARKERS.unserializable,
+  };
 
   if (DebuggenError.is(error)) {
     const payload = error.toPayload();
@@ -743,14 +1044,18 @@ function serializeError(
       result.details = scrubRecord(details, depth, budget, seen, false);
     }
   } else {
-    result.message = scrub(error.message);
+    const message = readProperty(error, 'message');
+    result.message = message === READ_FAILED ? LOG_MARKERS.unserializable : scrub(message);
   }
 
-  if (typeof error.stack === 'string' && error.stack.length > 0) {
-    result.stack = scrub(error.stack);
+  const stack = readProperty(error, 'stack');
+  if (typeof stack === 'string' && stack.length > 0) {
+    result.stack = scrub(stack);
   }
-  const cause: unknown = error.cause;
-  if (cause !== undefined) {
+  const cause = readProperty(error, 'cause');
+  if (cause === READ_FAILED) {
+    result.cause = LOG_MARKERS.unserializable;
+  } else if (cause !== undefined) {
     result.cause = scrubUnnamedValue(cause, depth, budget, seen);
   }
 

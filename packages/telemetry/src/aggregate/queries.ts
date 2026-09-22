@@ -21,9 +21,11 @@
  * place and its behaviour is pinned by `../redaction/sql.test.ts` rather than
  * restated by a test of this module.
  *
- * So `select col_a from t1 where id = $1` and `SELECT col_a FROM t1 WHERE id =
- * $2` are one group (placeholders unify, case is identical), while
- * `select col_a from t1` and `SELECT col_a FROM t1` are two.
+ * So `select col_a from t1 where id = $1` and `select col_a from t1 where id =
+ * $2` are one group — the placeholders unify and nothing else about the two
+ * differs — while `select col_a from t1` and `SELECT col_a FROM t1` are two
+ * groups, because case is preserved and differently cased text is different
+ * text.
  *
  * ## Privacy (AAP 0.5.2)
  *

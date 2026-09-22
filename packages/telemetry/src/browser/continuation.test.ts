@@ -26,14 +26,25 @@
  *   and `lineageCandidates` — the attributes `../correlation/tree.ts` reads
  *   back into `TraceNodeLineage` and the `timeline` renderer draws dashed.
  *
- * **No fake timers, no wall clock, no `await`.** Expiry in the module under
- * test is prune-on-read: it owns no timer, and its own documentation makes
- * that a contract rather than an implementation detail. So every case here
- * drives the module purely through injected `startedAt` / `settledAt` / `now`
- * values on a small synthetic epoch-millisecond base ({@link T0}), which makes
- * the suite a pure function of its call sequence — deterministic, instant, and
- * unable to pass for the wrong reason if somebody later adds the timer the
- * module forbids. A fake-timer test would pass today and rot tomorrow.
+ * **No fake timers, no `await`, and one explicitly pinned clock.** Expiry in
+ * the module under test is prune-on-read: it owns no timer, and its own
+ * documentation makes that a contract rather than an implementation detail. So
+ * every case here drives the module purely through injected `startedAt` /
+ * `settledAt` / `now` values on a small synthetic epoch-millisecond base
+ * ({@link T0}), which makes the suite a pure function of its call sequence —
+ * deterministic, instant, and unable to pass for the wrong reason if somebody
+ * later adds the timer the module forbids. A fake-timer test would pass today
+ * and rot tomorrow.
+ *
+ * The single exception is the nested `describe` covering what a *non-finite*
+ * timestamp degrades to, because that one path genuinely reads a clock
+ * (`nowEpochMs()` in `./transport.js`). Those cases pin it — an own
+ * `performance.timeOrigin` shadowing the prototype accessor, plus
+ * `performance.now` and `Date.now` — so they assert the exact instant the
+ * fallback resolves to and both sides of the window boundary around it,
+ * instead of proving only that a window happens to still be open on this host
+ * at this moment. The pin is installed and removed per case inside that block
+ * and nowhere else; no other case in the suite reads a clock at all.
  *
  * **Attribute keys are never spelled out.** The three lineage keys and the one
  * lineage value are resolved from the imported `LINEAGE_ATTRIBUTE_KEYS` and
@@ -56,15 +67,18 @@
  * (AAP §0.2.2, §0.7.1 Group 1).
  */
 
-import { beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { LINEAGE_ATTRIBUTE_KEYS, LINEAGE_VALUES } from '../schema/attributes.js';
 import {
   applyLineageAttributes,
+  attachContinuations,
   cancelPendingContinuation,
   CONTINUATION_WINDOW_MS,
+  detachContinuations,
   getContinuationStats,
   getLineage,
+  isContinuationsAttached,
   MAX_LINEAGE_CANDIDATES,
   MAX_OPEN_CONTINUATIONS,
   MAX_PENDING_CONTINUATIONS,
@@ -905,8 +919,16 @@ describe('bounds', () => {
 
     settleContinuation(spanId(1), T0 + PENDING_MAX_AGE_MS);
 
+    // The settle names an entry the registration above already pruned, so it
+    // finds nothing: no window, and one lost request still counted once.
     expect(getLineage(T0 + PENDING_MAX_AGE_MS)).toBeUndefined();
-    expect(getContinuationStats().settled).toBe(0);
+    expect(getContinuationStats()).toEqual({
+      pending: 1,
+      open: 0,
+      settled: 0,
+      expired: 0,
+      dropped: 1,
+    });
   });
 
   it('prunes an aged pending request on a read as well', () => {
@@ -923,20 +945,69 @@ describe('bounds', () => {
     });
   });
 
-  it('counts a settle that arrives at the pending deadline as a settle, not a drop', () => {
+  it('still promotes a settle that arrives one millisecond before the pending deadline', () => {
     registerPendingContinuation({ traceId: traceId(1), spanId: spanId(1), startedAt: T0 });
 
-    // The entry is taken out before pruning, so the two counters can never
-    // both claim it, and a slow response still parents the work it caused.
-    settleContinuation(spanId(1), T0 + PENDING_MAX_AGE_MS);
+    // A slow response is still a response: inside the deadline the entry is
+    // live, so it opens a window and parents the work it caused.
+    settleContinuation(spanId(1), T0 + PENDING_MAX_AGE_MS - 1);
 
-    expect(lineageAt(T0 + PENDING_MAX_AGE_MS).parentSpanId).toBe(spanId(1));
+    expect(lineageAt(T0 + PENDING_MAX_AGE_MS - 1)).toEqual({
+      traceId: traceId(1),
+      parentSpanId: spanId(1),
+      ambiguous: false,
+      candidates: [],
+    });
     expect(getContinuationStats()).toEqual({
       pending: 0,
       open: 1,
       settled: 1,
       expired: 0,
       dropped: 0,
+    });
+  });
+
+  it('discards a settle that arrives at exactly the pending deadline', () => {
+    registerPendingContinuation({ traceId: traceId(1), spanId: spanId(1), startedAt: T0 });
+
+    // The pending deadline is inclusive, exactly as the window's is: at
+    // `startedAt + PENDING_MAX_AGE_MS` the entry is already gone, and it is
+    // gone on the settle path too. Reaching the settle first must not let a
+    // stale request escape the deadline and open a fresh window.
+    settleContinuation(spanId(1), T0 + PENDING_MAX_AGE_MS);
+
+    expect(getLineage(T0 + PENDING_MAX_AGE_MS)).toBeUndefined();
+    // Counted as the loss it is — `dropped`, once — and never as a settle:
+    // nothing opened a window, so `settled` would be a false claim.
+    expect(getContinuationStats()).toEqual({
+      pending: 0,
+      open: 0,
+      settled: 0,
+      expired: 0,
+      dropped: 1,
+    });
+  });
+
+  it('attributes nothing to a request whose settle arrives long past the deadline', () => {
+    registerPendingContinuation({ traceId: traceId(1), spanId: spanId(1), startedAt: T0 });
+
+    // The misattribution the deadline exists to prevent: a request left
+    // behind by a navigation, or one whose registration and settle arrived out
+    // of order, settling minutes later. Promoting it would give it a fresh
+    // CONTINUATION_WINDOW_MS in which the next unrelated commit, state
+    // transition or request would inherit its trace — the ambient
+    // current-trace failure, wearing a different name.
+    settleContinuation(spanId(1), T0 + PENDING_MAX_AGE_MS * 2);
+
+    expect(getLineage(T0 + PENDING_MAX_AGE_MS * 2)).toBeUndefined();
+    expect(getLineage(T0 + PENDING_MAX_AGE_MS * 2 + 1)).toBeUndefined();
+    expect(getLineage(T0 + PENDING_MAX_AGE_MS * 2 + CONTINUATION_WINDOW_MS - 1)).toBeUndefined();
+    expect(getContinuationStats()).toEqual({
+      pending: 0,
+      open: 0,
+      settled: 0,
+      expired: 0,
+      dropped: 1,
     });
   });
 });
@@ -980,34 +1051,6 @@ describe('malformed input', () => {
     expect(getContinuationStats()).toEqual(EMPTY_STATS);
   });
 
-  it('degrades a non-finite timestamp to the clock instead of throwing', () => {
-    registerPendingContinuation({
-      traceId: traceId(1),
-      spanId: spanId(1),
-      startedAt: Number.NaN,
-    });
-    settleContinuation(spanId(1), Number.POSITIVE_INFINITY);
-
-    // Every unusable timestamp becomes the current instant, and the module
-    // only ever compares timestamps from the same caller — so a window opened
-    // and read on that fallback still attributes correctly.
-    const lineage = getLineage(Number.NEGATIVE_INFINITY);
-    expect(lineage).toBeDefined();
-    expect(lineage?.parentSpanId).toBe(spanId(1));
-    expect(lineage?.traceId).toBe(traceId(1));
-  });
-
-  it('survives a non-finite instant on the interaction and stats paths', () => {
-    openWindow({ trace: 1, request: 1, startedAt: T0, settledAt: T0 });
-
-    expect(() => {
-      notifyInteraction(Number.NaN);
-    }).not.toThrow();
-
-    expect(getLineage(T0 + 1)).toBeUndefined();
-    expect(getContinuationStats().open).toBe(0);
-  });
-
   it('writes no attributes when the bag is not an object', () => {
     openWindow({ trace: 1, request: 1, startedAt: T0, settledAt: T0 });
     const lineage = lineageAt(T0 + 1);
@@ -1040,6 +1083,183 @@ describe('malformed input', () => {
     }).not.toThrow();
 
     expect(Object.keys(frozen)).toHaveLength(0);
+  });
+
+  describe('a non-finite timestamp, on a pinned clock', () => {
+    // The one path in the module that consults a clock: `instant()` degrades a
+    // non-finite (or absent) timestamp to `nowEpochMs()` from `./transport.js`,
+    // which is `performance.timeOrigin + performance.now()` when both are
+    // finite and `Date.now()` otherwise. Reading the *live* clock here would
+    // make these cases prove only that a two-second window happens to still be
+    // open on this host at this moment, so the clock is pinned and the exact
+    // instant the fallback resolves to is what the assertions name — both
+    // sides of the window boundary included. This is the only block in the
+    // suite that touches a clock at all; the rest run on injected timestamps
+    // (see the module docblock).
+
+    /** The document time origin these cases pin `performance` to. */
+    const PINNED_TIME_ORIGIN = 1_700_000_000_000;
+
+    /**
+     * The `performance.now()` reading each case starts from.
+     *
+     * Fractional on purpose: `nowEpochMs()` keeps microsecond resolution
+     * (`round3`), so a pinned instant with a fraction proves the fallback is
+     * the high-resolution pair and not a whole-millisecond `Date.now()`.
+     */
+    const PINNED_RELATIVE_MS = 250.5;
+
+    /** The exact epoch instant `instant()`'s fallback resolves to. */
+    const PINNED_NOW = PINNED_TIME_ORIGIN + PINNED_RELATIVE_MS;
+
+    /** The pinned `performance.now()` reading, movable within a case. */
+    let relativeMs = PINNED_RELATIVE_MS;
+
+    /** The host's own `timeOrigin` descriptor, when it has one to restore. */
+    let hostTimeOrigin: PropertyDescriptor | undefined;
+
+    /** Move the pinned clock so the fallback resolves to `at`. */
+    function pinClockTo(at: number): void {
+      relativeMs = at - PINNED_TIME_ORIGIN;
+    }
+
+    beforeEach(() => {
+      relativeMs = PINNED_RELATIVE_MS;
+      hostTimeOrigin = Object.getOwnPropertyDescriptor(performance, 'timeOrigin');
+      // `timeOrigin` is an accessor on `Performance.prototype` rather than an
+      // own value, so it is shadowed by an own property instead of assigned
+      // to — which works whatever the accessor does with a write. The
+      // descriptor captured above is what restores a host that publishes
+      // `timeOrigin` as an own property, rather than stripping it.
+      Object.defineProperty(performance, 'timeOrigin', {
+        value: PINNED_TIME_ORIGIN,
+        configurable: true,
+      });
+      vi.spyOn(performance, 'now').mockImplementation(() => relativeMs);
+      // `nowEpochMs()` falls back to `Date.now()` when it cannot read the pair
+      // above, so both readings are pinned to the same instant: whichever
+      // branch the transport takes, the answer is `PINNED_NOW`.
+      vi.spyOn(Date, 'now').mockImplementation(() => PINNED_TIME_ORIGIN + relativeMs);
+    });
+
+    afterEach(() => {
+      // Vitest 5 clears mocks between cases but does not restore them
+      // (`restoreMocks` is false), so the spies and the shadowing property are
+      // removed here — the rest of the suite must see the host's own clock.
+      vi.restoreAllMocks();
+      if (hostTimeOrigin === undefined) {
+        Reflect.deleteProperty(performance, 'timeOrigin');
+      } else {
+        Object.defineProperty(performance, 'timeOrigin', hostTimeOrigin);
+      }
+    });
+
+    it('pins the clock the fallback reads, at microsecond resolution', () => {
+      // The harness case for this block: were the shadowing to stop working,
+      // every assertion below would quietly go back to reading the live clock
+      // and would stop proving anything about the instant.
+      expect(performance.timeOrigin).toBe(PINNED_TIME_ORIGIN);
+      expect(performance.now()).toBe(PINNED_RELATIVE_MS);
+      expect(Date.now()).toBe(PINNED_NOW);
+      expect(Number.isInteger(PINNED_NOW)).toBe(false);
+    });
+
+    it('attributes an event when the registration, the settle and the read are all unusable', () => {
+      registerPendingContinuation({
+        traceId: traceId(1),
+        spanId: spanId(1),
+        startedAt: Number.NaN,
+      });
+      settleContinuation(spanId(1), Number.POSITIVE_INFINITY);
+
+      // `NaN`, `Infinity` and `-Infinity` all resolve to the same pinned
+      // instant, and the module only ever compares timestamps from one
+      // caller — so the read still finds the window the settle opened. Which
+      // instant that window is anchored to is what the next case pins.
+      expect(getLineage(Number.NEGATIVE_INFINITY)).toEqual({
+        traceId: traceId(1),
+        parentSpanId: spanId(1),
+        ambiguous: false,
+        candidates: [],
+      });
+      // `startedAt` fell back to the same instant as `settledAt`, so the entry
+      // was live at its settle and was promoted rather than aged out — which
+      // it would not have been had the two fallbacks resolved differently.
+      expect(getContinuationStats()).toEqual({
+        pending: 0,
+        open: 1,
+        settled: 1,
+        expired: 0,
+        dropped: 0,
+      });
+    });
+
+    it('closes that window on the inclusive boundary measured from the pinned instant', () => {
+      registerPendingContinuation({
+        traceId: traceId(1),
+        spanId: spanId(1),
+        startedAt: Number.NaN,
+      });
+      settleContinuation(spanId(1), Number.POSITIVE_INFINITY);
+
+      // The boundary the live clock made unassertable: open one millisecond
+      // before `PINNED_NOW + CONTINUATION_WINDOW_MS`, gone at exactly it.
+      expect(lineageAt(PINNED_NOW + CONTINUATION_WINDOW_MS - 1).parentSpanId).toBe(spanId(1));
+      expect(getLineage(PINNED_NOW + CONTINUATION_WINDOW_MS)).toBeUndefined();
+      expect(getContinuationStats().expired).toBe(1);
+    });
+
+    it('resolves a non-finite read to the pinned instant, both sides of the deadline', () => {
+      openWindow({ trace: 1, request: 1, startedAt: PINNED_NOW, settledAt: PINNED_NOW });
+
+      pinClockTo(PINNED_NOW + CONTINUATION_WINDOW_MS - 1);
+      expect(lineageAt(Number.NaN).parentSpanId).toBe(spanId(1));
+
+      // Moving the pinned clock onto the deadline is what closes the window,
+      // and a read with no usable `now` sees exactly that instant.
+      pinClockTo(PINNED_NOW + CONTINUATION_WINDOW_MS);
+      expect(getLineage(Number.NaN)).toBeUndefined();
+      expect(getContinuationStats()).toEqual({
+        pending: 0,
+        open: 0,
+        settled: 1,
+        expired: 1,
+        dropped: 0,
+      });
+    });
+
+    it('ages pending requests from the pinned instant on a non-finite interaction', () => {
+      openWindow({ trace: 1, request: 1, startedAt: PINNED_NOW, settledAt: PINNED_NOW });
+      registerPendingContinuation({
+        traceId: traceId(1),
+        spanId: spanId(2),
+        startedAt: PINNED_NOW - PENDING_MAX_AGE_MS,
+      });
+      registerPendingContinuation({
+        traceId: traceId(1),
+        spanId: spanId(3),
+        startedAt: PINNED_NOW - PENDING_MAX_AGE_MS + 1,
+      });
+
+      expect(() => {
+        notifyInteraction(Number.NaN);
+      }).not.toThrow();
+
+      // The fallback resolved to exactly `PINNED_NOW`: the open window closed
+      // as neither an expiry nor a drop, the request at the inclusive pending
+      // deadline aged out, and the one a millisecond inside it survived.
+      expect(getContinuationStats()).toEqual({
+        pending: 1,
+        open: 0,
+        settled: 1,
+        expired: 0,
+        dropped: 1,
+      });
+
+      settleContinuation(spanId(3), PINNED_NOW);
+
+      expect(lineageAt(PINNED_NOW).parentSpanId).toBe(spanId(3));
+    });
   });
 });
 
@@ -1152,6 +1372,96 @@ describe('purity', () => {
       parentSpanId: spanId(2),
       ambiguous: true,
       candidates: [spanId(1)],
+    });
+  });
+});
+
+describe('the lifecycle adapter', () => {
+  // `./agent.ts` drives every producer in this folder through one registry of
+  // attach/detach/isAttached triples, so that disarming a capture is one
+  // ordered walk over every family and not a hand-kept list of calls — which
+  // is what this module's reset used to depend on. These cases pin the
+  // adapter's own semantics; they hand the module back detached, which is its
+  // state at import.
+  afterEach(() => {
+    detachContinuations();
+  });
+
+  it('starts detached and arms on request, idempotently', () => {
+    expect(isContinuationsAttached()).toBe(false);
+
+    attachContinuations();
+    expect(isContinuationsAttached()).toBe(true);
+
+    attachContinuations();
+    expect(isContinuationsAttached()).toBe(true);
+  });
+
+  it('arms from the empty state the arbitration starts from', () => {
+    openWindow({ trace: 1, request: 1, startedAt: T0, settledAt: T0 + 10 });
+
+    attachContinuations();
+
+    expect(getContinuationStats()).toEqual(EMPTY_STATS);
+    expect(getLineage(T0 + 20)).toBeUndefined();
+  });
+
+  it('keeps a running capture intact when the configuration is re-sent', () => {
+    // The service worker re-sends the live `agent.config` after every
+    // reconnect and after every same-origin navigation, so a second attach
+    // must not discard the windows of the interaction the developer is
+    // reproducing right now.
+    attachContinuations();
+    openWindow({ trace: 1, request: 1, startedAt: T0, settledAt: T0 + 10 });
+
+    attachContinuations();
+
+    expect(getContinuationStats().open).toBe(1);
+    expect(lineageAt(T0 + 20).parentSpanId).toBe(spanId(1));
+  });
+
+  it('releases every window, every pending request and every counter', () => {
+    attachContinuations();
+    openWindow({ trace: 1, request: 1, startedAt: T0, settledAt: T0 + 10 });
+    registerPendingContinuation({
+      traceId: traceId(1),
+      spanId: spanId(2),
+      startedAt: T0 + 5,
+    });
+
+    detachContinuations();
+
+    // AAP §0.5.1's "disabled, not merely idled": a dormant agent holds no
+    // reference to any request the page made.
+    expect(isContinuationsAttached()).toBe(false);
+    expect(getContinuationStats()).toEqual(EMPTY_STATS);
+    expect(getLineage(T0 + 20)).toBeUndefined();
+  });
+
+  it('is safe to release before it was ever armed, and to re-arm afterwards', () => {
+    detachContinuations();
+    expect(isContinuationsAttached()).toBe(false);
+
+    attachContinuations();
+    expect(isContinuationsAttached()).toBe(true);
+  });
+
+  it('never gates the registry, because its producers are the gate', () => {
+    // `./fetch.ts`, `./interaction.ts`, `./react.ts` and `./state.ts` are the
+    // families the agent arms and disarms on their own flags, so nothing feeds
+    // this registry while they are detached. Checking the flag here as well
+    // would add a redundant comparison to the developer's click path and would
+    // make a pure registry's answer depend on an attach its callers cannot
+    // make.
+    expect(isContinuationsAttached()).toBe(false);
+
+    openWindow({ trace: 1, request: 1, startedAt: T0, settledAt: T0 + 10 });
+
+    expect(lineageAt(T0 + 20)).toEqual({
+      traceId: traceId(1),
+      parentSpanId: spanId(1),
+      ambiguous: false,
+      candidates: [],
     });
   });
 });

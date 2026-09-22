@@ -209,6 +209,14 @@ export interface WarehouseSummary {
  *
  * `available` is `onHand - reserved`: reserved units are still on the shelf but
  * already promised to an order, so only the available ones may be sold again.
+ *
+ * `reorderPoint` is the level this line is restocked at, at this warehouse, and
+ * it is what makes the row self-describing: a line is out of stock when nothing
+ * is available, low when the available units have fallen to the point (plus
+ * whatever headroom the reader asked to allow for), and in stock above it. A
+ * consumer that classified a line by the product's own selling state instead
+ * would be reading a figure summed across every warehouse and measured against
+ * no headroom, which is a different question than the one a row answers.
  */
 export interface InventoryLevelRow {
   warehouseId: string;
@@ -217,6 +225,7 @@ export interface InventoryLevelRow {
   onHand: number;
   reserved: number;
   available: number;
+  reorderPoint: number;
 }
 
 /**
@@ -247,7 +256,8 @@ export interface LowStockRow {
 
 /**
  * The inventory dashboard's payload: totals across every warehouse, the
- * warehouses themselves and the rows the low-stock list renders.
+ * warehouses themselves, one page of stock lines and the rows the low-stock
+ * list renders.
  *
  * `movementVolume` is the units the recorded stock changes account for, counting
  * a receipt and a shipment alike as the units they moved. It reads as
@@ -264,7 +274,41 @@ export interface InventorySummary {
   lowStockCount: number;
   movementVolume: number;
   warehouses: WarehouseSummary[];
+
+  /**
+   * One page of the individual stock lines the filters matched - a product at a
+   * stocking location - as the dashboard's table renders them.
+   *
+   * `total` counts every line the filters matched rather than the lines on the
+   * page, and `page`/`pageSize` are the window the answer was built with, so
+   * the table's pager is sized from the payload rather than from the address
+   * bar. A page number past the end of the listing is answered as an empty page
+   * rather than as a failure.
+   */
+  levels: PagedList<InventoryLevelRow>;
+
+  /**
+   * The catalog entries naming the products on that page of stock lines,
+   * matched by `id`.
+   *
+   * A stock line names its product by identifier only, and the table needs a
+   * name, a code, a unit price and the category to group under; they are
+   * carried here rather than folded into {@link InventoryLevelRow} because one
+   * product holds several lines, and because the same row shape is what a
+   * product's own detail page lists its per-location stock with. A line whose
+   * product is missing from this list still renders, identified by the
+   * identifier it carries.
+   */
+  levelProducts: ProductSummary[];
+
+  /**
+   * The lines at or below their reorder point, most urgent first, bounded to
+   * the most urgent few rather than paged: this is a list of what to act on
+   * today, and `lowStockCount` above is the number of lines the filters matched
+   * in total.
+   */
   lowStock: LowStockRow[];
+
   generatedAt: string;
 }
 

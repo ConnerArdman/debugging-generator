@@ -3,13 +3,20 @@
  * design system (AAP 0.6.1, 0.6.3).
  *
  * No third-party component library or design system is used, so this module
- * *is* the value layer: every colour, space, font, radius, shadow, focus ring
- * and stacking level that either host surface renders resolves to a `--dg-*`
- * custom property whose value originates here, once. Nothing downstream may
- * define a colour or a metric of its own (AAP 0.6.4 permits only the literals
- * `0`, `none`, `auto`, `inherit`, `currentColor` and `transparent` in a
- * component), so a value that is missing here has no legal way to be
- * expressed — the fix is to add it here, never to inline it in a component.
+ * *is* the value layer: every colour, space, font, weight, radius, shadow,
+ * focus ring, motion duration, easing function and stacking level that either
+ * host surface renders resolves to a `--dg-*` custom property whose value
+ * originates here, once. Nothing downstream may define a colour, a metric or a
+ * motion constant of its own: AAP 0.6.4 permits only the literals `0`, `none`,
+ * `auto`, `inherit`, `currentColor` and `transparent` in a component, so a
+ * value that is missing here has no legal way to be expressed — the fix is to
+ * add it here, never to inline it in a component.
+ *
+ * There is likewise no second namespace and no "internal constant" escape
+ * hatch. A value declared beside these — under any other prefix, in any other
+ * file — sits outside the drift, completeness, theme and contrast checks that
+ * are the only reason this table can be trusted, and it takes whatever consumes
+ * it outside them too.
  *
  * ## The generated stylesheet
  *
@@ -142,6 +149,18 @@ const darkTokens = {
    * render code and durations — deliberately not a token of its own.
    */
   fontMono: '"JetBrains Mono", "SF Mono", Menlo, monospace',
+  /**
+   * The raised interface weight, as a weight on its own.
+   *
+   * The type roles below are complete `font` shorthands, and the shorthand
+   * RESETS weight — so a rule that wants a role's size and line-height but a
+   * heavier face has to restate the weight in a declaration of its own. That
+   * declaration needs a token, because a numeral written in a stylesheet is a
+   * visual value outside this table and AAP 0.6.4 admits none. This is that
+   * token, and it is the same weight the `textLg` role carries; the token test
+   * pins the two together so they cannot drift apart.
+   */
+  fontWeightMedium: '500',
   // Type roles are complete `font` shorthands, so a rule can set a role with
   // one declaration: `font: var(--dg-text-sm);`.
   textXs: '400 11px/16px var(--dg-font-ui)',
@@ -167,6 +186,22 @@ const darkTokens = {
   // --- Focus ----------------------------------------------------------------
   /** Applied through `:focus-visible`, so pointer clicks show no ring. */
   focusRing: '1px solid var(--dg-accent)',
+
+  // --- Motion ---------------------------------------------------------------
+  // Motion is a design decision like any other, so it is stated here rather
+  // than in a stylesheet: every transition and animation in `src/styles`
+  // resolves its duration and easing to one of these three, which is what keeps
+  // hover, focus and selection feedback consistent across every component and
+  // keeps the values inside the drift, completeness and theme checks the token
+  // test applies to the rest of the table. `@media (prefers-reduced-motion:
+  // reduce)` in `src/styles/base.css` switches motion off wholesale and is
+  // unaffected by these values.
+  /** One interactive state transition — hover, focus, selection. */
+  motionDuration: '160ms',
+  /** Decelerating easing for feedback that settles rather than overshoots. */
+  motionEasing: 'ease-out',
+  /** One sweep of a loading skeleton's shimmer. */
+  shimmerDuration: '1200ms',
 
   // --- Stacking -------------------------------------------------------------
   zBase: '0',
@@ -254,6 +289,7 @@ const lightTokens: TokenValues = {
   // --- Typography -----------------------------------------------------------
   fontUi: '-apple-system, "Segoe UI", Inter, sans-serif',
   fontMono: '"JetBrains Mono", "SF Mono", Menlo, monospace',
+  fontWeightMedium: '500',
   textXs: '400 11px/16px var(--dg-font-ui)',
   textSm: '400 12px/16px var(--dg-font-ui)',
   textMd: '400 13px/18px var(--dg-font-ui)',
@@ -275,6 +311,11 @@ const lightTokens: TokenValues = {
 
   // --- Focus ----------------------------------------------------------------
   focusRing: '1px solid var(--dg-accent)',
+
+  // --- Motion ---------------------------------------------------------------
+  motionDuration: '160ms',
+  motionEasing: 'ease-out',
+  shimmerDuration: '1200ms',
 
   // --- Stacking -------------------------------------------------------------
   zBase: '0',
@@ -348,6 +389,7 @@ const highContrastTokens: TokenValues = {
   // --- Typography (as dark) -------------------------------------------------
   fontUi: '-apple-system, "Segoe UI", Inter, sans-serif',
   fontMono: '"JetBrains Mono", "SF Mono", Menlo, monospace',
+  fontWeightMedium: '500',
   textXs: '400 11px/16px var(--dg-font-ui)',
   textSm: '400 12px/16px var(--dg-font-ui)',
   textMd: '400 13px/18px var(--dg-font-ui)',
@@ -368,6 +410,15 @@ const highContrastTokens: TokenValues = {
 
   // --- Focus (delta 2: a 2 px ring) -----------------------------------------
   focusRing: '2px solid var(--dg-accent)',
+
+  // --- Motion (as dark) -----------------------------------------------------
+  // Reducing motion is a user preference rather than a theme, so the
+  // high-contrast set carries the default durations and the
+  // `prefers-reduced-motion` block in `src/styles/base.css` remains the one
+  // place motion is switched off.
+  motionDuration: '160ms',
+  motionEasing: 'ease-out',
+  shimmerDuration: '1200ms',
 
   // --- Stacking (as dark) ---------------------------------------------------
   zBase: '0',

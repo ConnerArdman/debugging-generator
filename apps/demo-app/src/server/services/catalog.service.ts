@@ -60,6 +60,7 @@ type Stocks = readonly {
   warehouseId: string;
   onHand: number;
   reserved: number;
+  reorderPoint: number;
   warehouse: { name: string };
 }[];
 
@@ -213,6 +214,7 @@ function availability(levels: Stocks): InventoryLevelRow[] {
     onHand: level.onHand,
     reserved: level.reserved,
     available: level.onHand - level.reserved,
+    reorderPoint: level.reorderPoint,
   }));
 }
 
@@ -293,6 +295,55 @@ export async function browseCatalog(query: CatalogQuery = {}): Promise<PagedList
     page,
     pageSize: size,
   };
+}
+
+/**
+ * The catalog cards for a set of products named by identifier.
+ *
+ * It answers the surfaces that hold product identifiers without holding the
+ * products themselves - the inventory dashboard's stock table is one, where a
+ * stock line names its product by identifier and the table prints its name, its
+ * code, its unit price and the category it groups under. Reading them here
+ * rather than beside the caller is what keeps one derivation of a card: the
+ * price, the units available to promise and the selling state on one of these
+ * come from the same code as the ones on a catalog card, so two surfaces can
+ * never badge the same product differently.
+ *
+ * The catalog's own merchandising condition is deliberately not applied. A
+ * product the catalog no longer lists can still be stocked, and a stock line
+ * with no name is worse than a line naming a delisted product - which is the
+ * same reading {@link readProductBySlug} takes of a delisted product's own
+ * page.
+ *
+ * @param ids The products to name; repeats are collapsed and an empty set is
+ * answered without a query.
+ * @returns One card per product that exists, ordered by identifier. An
+ * identifier no product owns is simply absent, so a caller matches by `id`
+ * rather than by position.
+ */
+export async function readProductsByIds(ids: readonly string[]): Promise<ProductSummary[]> {
+  const wanted = [...new Set(ids)];
+
+  if (wanted.length === 0) {
+    return [];
+  }
+
+  const rows = await prisma.product.findMany({
+    where: { id: { in: wanted } },
+    orderBy: { id: 'asc' },
+    select: {
+      id: true,
+      sku: true,
+      slug: true,
+      name: true,
+      unitPriceCents: true,
+      imageUrl: true,
+      category: { select: { name: true, slug: true } },
+      inventoryLevels: { select: { onHand: true, reserved: true, reorderPoint: true } },
+    },
+  });
+
+  return rows.map(card);
 }
 
 /**

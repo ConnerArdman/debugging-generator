@@ -203,6 +203,7 @@ const EXPECTED_EXPORTS: readonly string[] = [
   'isWithin',
   'toProjectRelative',
   'resolveWithinProject',
+  'resolveRealPathWithinProject',
 
   // ./logger.js — the Logger interface, its levels and two implementations.
   'LOG_LEVELS',
@@ -244,7 +245,10 @@ const NODE_ONLY_EXPORTS: readonly string[] = [
   'createFileExclusive',
   'writeSecureFileAtomic',
   'atomicReplaceFile',
+  'atomicReplaceFileIfUnchanged',
   'readFileNoFollow',
+  'readFileSnapshotNoFollow',
+  'pinFileWithinRoot',
 ];
 
 /** Console methods a module could plausibly reach for at load time. */

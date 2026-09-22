@@ -7,8 +7,8 @@
  * units it promised; it runs while an order is being placed, and `release`
  * gives those units back when the order it was promising did not happen.
  * `readInventorySummary` answers the inventory dashboard: the figures on its
- * cards, the stocking locations its filter row lists, and the lines that have
- * fallen to their reorder point.
+ * cards, the stocking locations its filter row lists, one page of the stock
+ * lines themselves, and the lines that have fallen to their reorder point.
  *
  * Both read the same two tables, and the difference between them is the whole
  * reason a reservation is not a single lookup. `inventory_levels` holds one row
@@ -40,14 +40,18 @@
 import { MovementType } from '@/generated/prisma/client';
 import type {
   CartLine,
+  InventoryLevelRow,
   InventorySummary,
   LowStockRow,
+  PagedList,
+  ProductSummary,
   StockState,
   WarehouseSummary,
 } from '@/lib/types';
 import { pool } from '@/server/db/pool';
 import { prisma } from '@/server/db/prisma';
 import { StorefrontError, StorefrontNotFoundError } from '@/server/errors';
+import { readProductsByIds } from '@/server/services/catalog.service';
 
 /* ---------------------------------------------------------------------------
  * Figures the two operations are tuned by
@@ -86,14 +90,29 @@ const DEFAULT_THRESHOLD = 10;
 /** The widest headroom a caller may ask the low-stock rule to allow for. */
 const MAX_THRESHOLD = 10_000;
 
-/** Lines on one page of the low-stock list, when the caller names no size. */
+/** Stock lines on one page of the dashboard's table, when the caller names no size. */
 const DEFAULT_PAGE_SIZE = 50;
 
-/** The most lines one page of the low-stock list may carry. */
+/**
+ * The most stock lines one page may carry. The ceiling is deliberate: a page
+ * stays a page, so no single request turns the paged table into a full extract
+ * of the stock records.
+ */
 const MAX_PAGE_SIZE = 200;
 
-/** The highest page number the low-stock list answers; beyond it the page is empty. */
+/** The highest page number answered; beyond it the page is empty rather than refused. */
 const MAX_PAGE = 10_000;
+
+/**
+ * How many of the lines at or below their reorder point the payload carries.
+ *
+ * The low-stock list is what to act on today rather than a second paged
+ * listing - the page's own pager belongs to the stock table - so it names the
+ * most urgent lines and stops. The figure the filters matched in full is
+ * reported separately as `lowStockCount`, so a reader is never left thinking
+ * twelve is all there are.
+ */
+const LOW_STOCK_LINES = 12;
 
 /**
  * How a hold names itself in the ledger, ahead of the identifier that makes it
@@ -191,9 +210,9 @@ export interface InventorySummaryInput {
   warehouseId?: string | null | undefined;
   /** Units of headroom above a line's reorder point that still count as low. */
   threshold?: number | undefined;
-  /** Which page of the low-stock list to answer with, counted from `1`. */
+  /** Which page of the stock lines to answer with, counted from `1`. */
   page?: number | undefined;
-  /** How many low-stock lines one page carries. */
+  /** How many stock lines one page carries. */
   pageSize?: number | undefined;
   /** Report only the lines in one selling state. `null` applies no constraint. */
   state?: StockState | null | undefined;
@@ -634,8 +653,21 @@ async function hold(lines: readonly ReservedLine[], reference: string): Promise<
 
 /**
  * The inventory dashboard's payload: the figures on its cards, the stocking
- * locations its filter row lists, and one page of the lines that have fallen to
- * their reorder point.
+ * locations its filter row lists, one page of the stock lines the filters
+ * matched, and the lines that have fallen to their reorder point.
+ *
+ * A stock line is one product at one stocking location. `page` and `pageSize`
+ * window that listing - it is the surface the dashboard pages - and `levels`
+ * reports the window it was answered with together with the number of lines the
+ * filters matched in full, so a pager is sized from the payload rather than
+ * re-derived from a query string. A page past the end of the listing is
+ * answered as an empty page, which is what keeps a bookmarked dashboard address
+ * working after the stock behind it has moved on. The page is ordered by
+ * category, then by product, then by location, so a reader scans it the way the
+ * table groups it, and the order is broken deterministically by product and
+ * location identifier so paging never shows a line twice. `levelProducts` names
+ * the products on that page, read through the catalog so a card's price and
+ * selling state are derived in exactly one place.
  *
  * A line counts as low once its available units - the units on the shelf less
  * the units already promised - reach its reorder point plus the caller's
@@ -644,11 +676,10 @@ async function hold(lines: readonly ReservedLine[], reference: string): Promise<
  * reported line carries its own reorder point, so a reader always sees the
  * figure that classified it.
  *
- * `lowStockCount` counts every line the filters matched rather than the lines on
- * the page, so the list can be paged without a second request. The low-stock
- * page is ordered by how far each line has fallen below its point, which puts
- * the lines worth acting on first, and is broken deterministically by SKU and
- * then by location code so that paging never shows a line twice.
+ * `lowStock` holds the most urgent of those lines - ordered by how far each has
+ * fallen below its point, broken deterministically by SKU and then by location
+ * code - and `lowStockCount` counts every line the filters matched, which is
+ * how a reader can tell a short list from a complete one.
  *
  * `movementVolume` is the throughput behind those figures rather than another
  * balance: the units the ledger has recorded against the lines the filters
@@ -668,9 +699,20 @@ export async function readInventorySummary(
 ): Promise<InventorySummary> {
   type Totals = {
     skus: string | null;
+    lines: string | null;
     on_hand: string | null;
     reserved: string | null;
     low: string | null;
+  };
+
+  type Level = {
+    product_id: string;
+    warehouse_id: string;
+    warehouse_name: string;
+    on_hand: number;
+    reserved: number;
+    available: number;
+    reorder_point: number;
   };
 
   type Shortage = {
@@ -733,16 +775,17 @@ export async function readInventorySummary(
     only = groups.map((group) => group.productId);
   }
 
-  // Three questions about the same stock, and none of them reads another's
-  // answer: the figures on the cards, the page of lines that have fallen to
-  // their point, and the units the ledger accounts for. They are issued
-  // together and awaited once, so the dashboard costs one round trip to the
-  // database rather than three in turn.
-  const [totals, shortages, volume] = await Promise.all([
+  // Four questions about the same stock, and none of them reads another's
+  // answer: the figures on the cards, the page of stock lines, the lines that
+  // have fallen to their point, and the units the ledger accounts for. They are
+  // issued together and awaited once, so the dashboard costs one round trip to
+  // the database rather than four in turn.
+  const [totals, stock, shortages, volume] = await Promise.all([
     pool.query<Totals>(
       `
         SELECT
           COUNT(DISTINCT l.product_id) AS skus,
+          COUNT(*) AS lines,
           SUM(l.on_hand) AS on_hand,
           SUM(l.reserved) AS reserved,
           COUNT(*) FILTER (WHERE l.on_hand - l.reserved <= l.reorder_point + $2::int) AS low
@@ -757,6 +800,39 @@ export async function readInventorySummary(
           AND ($4::text[] IS NULL OR l.product_id = ANY($4::text[]))
       `,
       [location, threshold, state, only],
+    ),
+    // One page of the stock lines the same filters matched, under the same
+    // selling-state rule as the figures above so the table and the cards can
+    // never describe different stock. The two joins past the location are there
+    // for the order alone: a reader scans the table by category and then by
+    // product, and the line's own identifiers break the order so that a page is
+    // the same page on every request.
+    pool.query<Level>(
+      `
+        SELECT
+          l.product_id,
+          l.warehouse_id,
+          w.name AS warehouse_name,
+          l.on_hand,
+          l.reserved,
+          l.on_hand - l.reserved AS available,
+          l.reorder_point
+        FROM inventory_levels l
+        JOIN warehouses w ON w.id = l.warehouse_id
+        JOIN products p ON p.id = l.product_id
+        JOIN categories c ON c.id = p.category_id
+        WHERE ($1::text IS NULL OR l.warehouse_id = $1::text)
+          AND ($3::text IS NULL
+               OR ($3::text = 'OUT_OF_STOCK' AND l.on_hand - l.reserved <= 0)
+               OR ($3::text = 'LOW_STOCK'
+                   AND l.on_hand - l.reserved > 0
+                   AND l.on_hand - l.reserved <= l.reorder_point + $2::int)
+               OR ($3::text = 'IN_STOCK' AND l.on_hand - l.reserved > l.reorder_point + $2::int))
+          AND ($4::text[] IS NULL OR l.product_id = ANY($4::text[]))
+        ORDER BY c.name, p.name, l.product_id, w.code
+        LIMIT $5::int OFFSET $6::int
+      `,
+      [location, threshold, state, only, size, (page - 1) * size],
     ),
     pool.query<Shortage>(
       `
@@ -778,9 +854,9 @@ export async function readInventorySummary(
                OR ($3::text = 'IN_STOCK' AND l.on_hand - l.reserved > l.reorder_point + $2::int))
           AND ($4::text[] IS NULL OR l.product_id = ANY($4::text[]))
         ORDER BY (l.on_hand - l.reserved) - l.reorder_point, p.sku, w.code
-        LIMIT $5::int OFFSET $6::int
+        LIMIT $5::int
       `,
-      [location, threshold, state, only, size, (page - 1) * size],
+      [location, threshold, state, only, LOW_STOCK_LINES],
     ),
     // Both directions count as the units they moved, so goods in and goods out
     // add up instead of cancelling: the figure is what the ledger has handled,
@@ -810,6 +886,21 @@ export async function readInventorySummary(
   const figures = totals.rows[0];
   const moved = volume.rows[0];
 
+  const levels: PagedList<InventoryLevelRow> = {
+    items: stock.rows.map((row) => ({
+      warehouseId: row.warehouse_id,
+      warehouseName: row.warehouse_name,
+      productId: row.product_id,
+      onHand: row.on_hand,
+      reserved: row.reserved,
+      available: row.available,
+      reorderPoint: row.reorder_point,
+    })),
+    total: amount(figures?.lines ?? null),
+    page,
+    pageSize: size,
+  };
+
   const lowStock: LowStockRow[] = shortages.rows.map((row) => ({
     productId: row.product_id,
     sku: row.sku,
@@ -819,6 +910,14 @@ export async function readInventorySummary(
     reorderPoint: row.reorder_point,
   }));
 
+  // The products behind the page of lines, and the one read that has to follow
+  // another: which products to name is what the page of lines just decided. A
+  // page holding no lines names none, and the catalog answers that without a
+  // query of its own.
+  const levelProducts: ProductSummary[] = await readProductsByIds(
+    levels.items.map((row) => row.productId),
+  );
+
   return {
     totalSkus: amount(figures?.skus ?? null),
     totalOnHand: amount(figures?.on_hand ?? null),
@@ -826,6 +925,8 @@ export async function readInventorySummary(
     lowStockCount: amount(figures?.low ?? null),
     movementVolume: amount(moved?.units ?? null),
     warehouses,
+    levels,
+    levelProducts,
     lowStock,
     generatedAt: new Date().toISOString(),
   };

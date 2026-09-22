@@ -5,13 +5,13 @@
     "spanId": "d2a91f7b46c085e3",
     "parentSpanId": "5c8e03b1f7d24a96",
     "kind": "fetch",
-    "name": "GET /api/items?itemId=42&sort=name&page=2",
+    "name": "GET /api/items?itemId=?&sort=?&page=?",
     "startTime": 1789812900006.214,
     "duration": 118.742,
     "tier": "browser",
     "attributes": {
       "http.method": "GET",
-      "url": "/api/items?itemId=42&sort=name&page=2",
+      "url": "/api/items?itemId=?&sort=?&page=?",
       "http.status_code": 200,
       "initiator": "fetchItemList"
     },

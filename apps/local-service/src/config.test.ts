@@ -3,8 +3,30 @@
  * nine-key contract it enforces, the five `$DEBUGGEN_HOME` paths it derives and
  * the failure policy that keeps a credential out of every error it produces.
  *
- * Three different things are on trial here, and only the first is ordinary
+ * Five different things are on trial here, and only the first is ordinary
  * parsing.
+ *
+ * The **three schemas** are the contract's enforcement, and each is exercised
+ * on its own as well as through the loader: `serviceEnvSchema` over raw
+ * variables, `serviceConfigOverridesSchema` over a host's own values, and
+ * `resolvedServiceConfigSchema` over a whole configuration — the last of which
+ * is what a caller reaching a configuration from somewhere other than the
+ * environment validates against, so it is tested as the public surface it is.
+ *
+ * The **access boundary** is a rule about values, not about documentation. AAP
+ * 0.5.6 makes reachability from this machine alone the assumption the
+ * authentication, role and Origin rules rest on, so a host value that is not a
+ * loopback interface is refused here rather than bound and regretted: the suite
+ * pins both halves — every spelling of loopback that must work, and the
+ * wildcard, private and public binds that must not.
+ *
+ * The **provider requirements** are the other cross-field rule. A provider that
+ * reaches the network needs a model and a credential; a selection missing
+ * either must fail at start-up naming the missing key, because the alternative
+ * is a session that fails after the developer has asked a question and after
+ * the project has been indexed and instrumented. The requirement table is
+ * imported rather than restated, so the positive cases are built from the same
+ * source the rule is.
  *
  * The **contract** — `SERVICE_ENV_KEYS` and `serviceConfigSchema` — is paired
  * documentation: the root `.env.example` documents exactly these nine
@@ -106,12 +128,18 @@ import {
   LOG_LEVEL_SETTINGS,
   MAX_PORT,
   PROMPTS_DIRECTORY_NAME,
+  PROVIDER_REQUIREMENTS,
   SERVICE_ENV_KEYS,
   SESSIONS_DATABASE_FILE_NAME,
   describeServiceConfig,
+  isServiceEnvKey,
   loadServiceConfig,
+  resolvedServiceConfigSchema,
+  serviceConfigOverridesSchema,
   serviceConfigSchema,
+  serviceEnvSchema,
   toModelProviderOverrides,
+  type ProviderRequirementKey,
   type ServiceConfig,
   type ServiceConfigOverrides,
   type ServiceEnvKey,
@@ -212,11 +240,14 @@ const EXPECTED_DEFAULT_PROMPTS_DIR = normalizePosix(
 const CONFIG_CODE: DebuggenErrorCode = 'CONFIG_INVALID';
 
 /**
- * The nine keys the loader reads, in the order `.env.example` declares them.
+ * The nine keys the loader reads, in the order it resolves and reports them.
  *
  * Deliberately a hand-written second copy of `SERVICE_ENV_KEYS`: see this
  * file's overview. The two lists disagreeing is the signal, and a generated
- * expectation could not produce it.
+ * expectation could not produce it. The comparison is between these two
+ * TypeScript lists only — `.env.example` documents the same nine keys but
+ * groups them for a reader, so its layout neither constrains nor is
+ * constrained by this expectation.
  */
 const EXPECTED_ENV_KEYS: readonly ServiceEnvKey[] = [
   'ANTHROPIC_API_KEY',
@@ -335,6 +366,51 @@ const URLSAFE_CHARS =
  * assertions by coincidence, and never written as one literal.
  */
 const PLANTED_CREDENTIAL = assemble('s', 'k-ant-', 'api03-') + cycle(URLSAFE_CHARS, 48);
+
+/*
+ * ---------------------------------------------------------------------------
+ * Provider requirements, built from the contract rather than restated
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * A value that satisfies each setting a provider can require.
+ *
+ * Total over `ProviderRequirementKey`, which is derived from the module's own
+ * requirement table: a provider that starts requiring a third setting fails
+ * this file at `pnpm typecheck` until the suite knows what a satisfied one
+ * looks like, rather than silently building an environment that no longer
+ * satisfies the rule.
+ */
+const REQUIREMENT_VALUES: Readonly<Record<ProviderRequirementKey, string>> = {
+  ANTHROPIC_API_KEY: PLANTED_CREDENTIAL,
+  DEBUGGEN_MODEL: CONFIGURED_MODEL_ID,
+};
+
+/**
+ * An environment that selects `id` and satisfies everything it requires.
+ *
+ * Derived from `PROVIDER_REQUIREMENTS`, so the positive cases and the rule come
+ * from one source: the offline provider gets nothing beyond its selection, and
+ * the network-backed one gets both a model and a credential without this file
+ * deciding which those are.
+ *
+ * @param id The provider to select.
+ * @param extra Further variables to set alongside it.
+ */
+function usableEnvFor(id: ProviderId, extra: ServiceEnv = {}): ServiceEnv {
+  return {
+    DEBUGGEN_PROVIDER: id,
+    ...Object.fromEntries(
+      PROVIDER_REQUIREMENTS[id].map((key) => [key, REQUIREMENT_VALUES[key]] as const),
+    ),
+    ...extra,
+  };
+}
+
+/** The settings the network-backed provider requires, which is what the rule is about. */
+const NETWORK_REQUIREMENTS: readonly ProviderRequirementKey[] =
+  PROVIDER_REQUIREMENTS[NETWORK_PROVIDER_ID];
 
 /*
  * ---------------------------------------------------------------------------
@@ -470,6 +546,20 @@ function asLogLevelSetting(value: string): LogLevelSetting {
   return value as LogLevelSetting;
 }
 
+/**
+ * An unvalidated value in the position of the environment record.
+ *
+ * The same deliberate widening as {@link asLogLevelSetting}, for the same
+ * reason: `loadServiceConfig`'s parameter type makes a non-record unreachable
+ * from TypeScript, while the bundled service inside the editor extension is
+ * ultimately called from JavaScript — so the module answers with a typed
+ * failure instead of throwing, and that branch is exercised rather than
+ * assumed.
+ */
+function asServiceEnv(value: unknown): ServiceEnv {
+  return value as ServiceEnv;
+}
+
 /*
  * ---------------------------------------------------------------------------
  * Tables: rejected environment values
@@ -566,7 +656,7 @@ const RETENTION_REJECTIONS: readonly RejectionCase[] = [
   },
 ];
 
-/** `DEBUGGEN_PROVIDER`, `DEBUGGEN_LOG_LEVEL` and `DEBUGGEN_HOST` values the loader must refuse. */
+/** `DEBUGGEN_PROVIDER` and `DEBUGGEN_LOG_LEVEL` values the loader must refuse. */
 const VOCABULARY_REJECTIONS: readonly RejectionCase[] = [
   {
     label: 'a provider this build does not offer',
@@ -580,11 +670,111 @@ const VOCABULARY_REJECTIONS: readonly RejectionCase[] = [
     value: 'extremely-loud',
     reason: 'the value names no known log level',
   },
+];
+
+/** The clause recorded against a host value that does not name this machine. */
+const NOT_LOOPBACK_REASON = 'the value is not a loopback interface';
+
+/**
+ * `DEBUGGEN_HOST` values the loader must refuse.
+ *
+ * The two wildcard entries are the ones this table exists for: `0.0.0.0` and
+ * the IPv6 any-address bind an authenticated local service to every interface
+ * the machine has, which publishes a surface holding a developer's source
+ * excerpts, telemetry and session history to anything that can route to it —
+ * and neither looks alarming in a `.env` file. A private address, a public
+ * address and a name that is not `localhost` follow the same rule: reachability
+ * from this machine alone is the boundary the rest of the service assumes (AAP
+ * 0.5.6), so this module refuses to widen it rather than trusting a listener to
+ * fail later.
+ *
+ * Every value here is also checked against the privacy sweep below, which is
+ * why none of them appears as a substring of the remedy the failure carries.
+ */
+const HOST_REJECTIONS: readonly RejectionCase[] = [
   {
     label: 'a host name containing whitespace',
     key: 'DEBUGGEN_HOST',
     value: 'left interface',
     reason: 'the value contains whitespace',
+  },
+  {
+    label: 'the IPv4 wildcard bind',
+    key: 'DEBUGGEN_HOST',
+    value: '0.0.0.0',
+    reason: NOT_LOOPBACK_REASON,
+  },
+  {
+    label: 'the IPv6 wildcard bind',
+    key: 'DEBUGGEN_HOST',
+    value: '::',
+    reason: NOT_LOOPBACK_REASON,
+  },
+  {
+    label: 'a private network address',
+    key: 'DEBUGGEN_HOST',
+    value: '192.168.1.10',
+    reason: NOT_LOOPBACK_REASON,
+  },
+  {
+    label: 'another private network address',
+    key: 'DEBUGGEN_HOST',
+    value: '10.1.2.3',
+    reason: NOT_LOOPBACK_REASON,
+  },
+  {
+    label: 'a public address',
+    key: 'DEBUGGEN_HOST',
+    value: '203.0.113.7',
+    reason: NOT_LOOPBACK_REASON,
+  },
+  {
+    label: 'a link-local IPv6 address',
+    key: 'DEBUGGEN_HOST',
+    value: 'fe80::1',
+    reason: NOT_LOOPBACK_REASON,
+  },
+  {
+    label: 'an IPv4-mapped address that is not loopback',
+    key: 'DEBUGGEN_HOST',
+    value: '::ffff:192.168.1.10',
+    reason: NOT_LOOPBACK_REASON,
+  },
+  {
+    label: 'a routable address embedded behind a different prefix',
+    key: 'DEBUGGEN_HOST',
+    value: '2001:db8::127.0.0.1',
+    reason: NOT_LOOPBACK_REASON,
+  },
+  {
+    label: 'a host name that is not the loopback name',
+    key: 'DEBUGGEN_HOST',
+    value: 'service.example.test',
+    reason: NOT_LOOPBACK_REASON,
+  },
+  {
+    label: 'a name that merely contains the loopback name',
+    key: 'DEBUGGEN_HOST',
+    value: 'localhost.example.test',
+    reason: NOT_LOOPBACK_REASON,
+  },
+  {
+    label: 'a loopback address with a port suffix',
+    key: 'DEBUGGEN_HOST',
+    value: '127.0.0.1:8080',
+    reason: NOT_LOOPBACK_REASON,
+  },
+  {
+    label: 'an unbalanced bracketed address',
+    key: 'DEBUGGEN_HOST',
+    value: '[::1',
+    reason: NOT_LOOPBACK_REASON,
+  },
+  {
+    label: 'an octet outside the accepted range',
+    key: 'DEBUGGEN_HOST',
+    value: '127.0.0.999',
+    reason: NOT_LOOPBACK_REASON,
   },
 ];
 
@@ -646,7 +836,53 @@ const ALL_REJECTIONS: readonly RejectionCase[] = [
   ...PORT_REJECTIONS,
   ...RETENTION_REJECTIONS,
   ...VOCABULARY_REJECTIONS,
+  ...HOST_REJECTIONS,
   ...PATH_REJECTIONS,
+];
+
+/**
+ * `DEBUGGEN_HOST` values the loader must accept, and what each resolves to.
+ *
+ * Every spelling of "this machine" a developer might reasonably write, because
+ * the boundary is only defensible if the legitimate forms work: the loopback
+ * name in any letter case, any address in `127.0.0.0/8` rather than only the
+ * first, the IPv6 loopback written compressed, expanded or zero-padded, the two
+ * embedded-IPv4 mappings, and the bracketed form copied out of a URL — which
+ * resolves without its brackets, because that is what a listener binds.
+ */
+const HOST_ACCEPTED: readonly HomeCase[] = [
+  { label: 'the default loopback address', value: DEFAULT_HOST, expected: DEFAULT_HOST },
+  { label: 'a padded loopback address', value: `  ${DEFAULT_HOST}  `, expected: DEFAULT_HOST },
+  { label: 'another address in the loopback block', value: '127.0.0.53', expected: '127.0.0.53' },
+  { label: 'the lowest address in the block', value: '127.0.0.0', expected: '127.0.0.0' },
+  { label: 'the loopback name', value: 'localhost', expected: 'localhost' },
+  { label: 'the loopback name in capitals', value: 'LOCALHOST', expected: 'LOCALHOST' },
+  { label: 'the compressed IPv6 loopback address', value: '::1', expected: '::1' },
+  {
+    label: 'the bracketed IPv6 loopback address, without its brackets',
+    value: '[::1]',
+    expected: '::1',
+  },
+  {
+    label: 'the written-out IPv6 loopback address',
+    value: '0:0:0:0:0:0:0:1',
+    expected: '0:0:0:0:0:0:0:1',
+  },
+  {
+    label: 'the zero-padded IPv6 loopback address',
+    value: '0000:0000:0000:0000:0000:0000:0000:0001',
+    expected: '0000:0000:0000:0000:0000:0000:0000:0001',
+  },
+  {
+    label: 'the IPv4-mapped loopback address',
+    value: `::ffff:${DEFAULT_HOST}`,
+    expected: `::ffff:${DEFAULT_HOST}`,
+  },
+  {
+    label: 'the IPv4-compatible loopback address',
+    value: `::${DEFAULT_HOST}`,
+    expected: `::${DEFAULT_HOST}`,
+  },
 ];
 
 /**
@@ -1128,7 +1364,10 @@ describe('accepting a configured value', () => {
   );
 
   it.each([...PROVIDER_IDS])('accepts the provider id %s', (id: ProviderId) => {
-    expect(loadOk({ DEBUGGEN_PROVIDER: id }).provider).toBe(id);
+    // Each provider is selected alongside whatever it requires, taken from the
+    // module's own requirement table: a usable selection is the positive case,
+    // and an incomplete one belongs to the requirement suite below.
+    expect(loadOk(usableEnvFor(id)).provider).toBe(id);
   });
 
   it.each([...PROVIDER_IDS])(
@@ -1136,7 +1375,9 @@ describe('accepting a configured value', () => {
     (id: ProviderId) => {
       // The normalisation `@debuggen/model-provider` applies to the same
       // variable, so a hand-edited `.env` selects the provider it obviously means.
-      expect(loadOk({ DEBUGGEN_PROVIDER: `  ${id.toUpperCase()}  ` }).provider).toBe(id);
+      expect(
+        loadOk(usableEnvFor(id, { DEBUGGEN_PROVIDER: `  ${id.toUpperCase()}  ` })).provider,
+      ).toBe(id);
     },
   );
 
@@ -1145,13 +1386,8 @@ describe('accepting a configured value', () => {
     expect(loadOk({ DEBUGGEN_LOG_LEVEL: ` ${level.toUpperCase()} ` }).logLevel).toBe(level);
   });
 
-  it('accepts a host name, an address literal and an interface it cannot vouch for', () => {
-    // The module owns only the question "could this be a host name" - which
-    // interfaces exist on the machine is the listener's to answer, and a
-    // rejection here would refuse a legitimate address it had never heard of.
-    expect(loadOk({ DEBUGGEN_HOST: 'localhost' }).host).toBe('localhost');
-    expect(loadOk({ DEBUGGEN_HOST: '::1' }).host).toBe('::1');
-    expect(loadOk({ DEBUGGEN_HOST: `  ${DEFAULT_HOST}  ` }).host).toBe(DEFAULT_HOST);
+  it.each(HOST_ACCEPTED)('accepts $label as DEBUGGEN_HOST', ({ value, expected }: HomeCase) => {
+    expect(loadOk({ DEBUGGEN_HOST: value }).host).toBe(expected);
   });
 
   it('accepts a model identifier from either channel, the override winning', () => {
@@ -1174,6 +1410,35 @@ describe('accepting a configured value', () => {
     expect(config.port).toBe(EPHEMERAL_PORT);
     expect(config.host).toBe('localhost');
     expect(config.logLevel).toBe('warn');
+  });
+
+  it('does not read a variable an override has already superseded', () => {
+    // Precedence per setting means the losing value is not read at all, which
+    // matters when it is unusable: an integration suite that pins an ephemeral
+    // port must not be stopped by whatever DEBUGGEN_PORT a developer's shell
+    // happens to export, and a stale value nobody uses is not a reason to
+    // refuse to start.
+    const config = loadOk(
+      {
+        DEBUGGEN_PORT: REJECTED_PORT_VALUE,
+        DEBUGGEN_LOG_LEVEL: 'extremely-loud',
+        DEBUGGEN_HOST: '0.0.0.0',
+      },
+      { port: EPHEMERAL_PORT, logLevel: 'warn', host: DEFAULT_HOST },
+    );
+
+    expect(config.port).toBe(EPHEMERAL_PORT);
+    expect(config.logLevel).toBe('warn');
+    expect(config.host).toBe(DEFAULT_HOST);
+  });
+
+  it('still reads DEBUGGEN_HOME when only the home directory is injected', () => {
+    // `homeDir` is the context a `~` expands against, not a value for
+    // DEBUGGEN_HOME, so injecting one must leave the variable in force - which
+    // is what every suite in this file relies on.
+    const config = loadOk({ DEBUGGEN_HOME: '~/state' }, { homeDir: HOME_DIR });
+
+    expect(config.debuggenHome).toBe(`${HOME_DIR}/state`);
   });
 
   it('treats a blank value for every key as absent rather than as a configured empty', () => {
@@ -1342,6 +1607,440 @@ describe('rejecting an unusable environment', () => {
       expect(isErr(result)).toBe(true);
     }
   });
+
+  it('answers with a typed failure rather than a throw when the environment is not a record', () => {
+    // Unreachable from TypeScript and reachable from JavaScript, which the
+    // bundled service inside the editor extension ultimately is. It has no key
+    // to name, so it is the one failure that names none - and it still carries
+    // the details shape every log consumer expects.
+    const error = errorOf(loadServiceConfig(asServiceEnv(null)));
+
+    expect(error.code).toBe(CONFIG_CODE);
+    expect(error.details?.subsystem).toBe('config');
+    expect(error.details?.keys).toStrictEqual([]);
+    expect(error.details?.issues).toStrictEqual([]);
+    expect(error.hint ?? '').toContain('loadServiceConfig');
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The access boundary
+ * ---------------------------------------------------------------------------
+ */
+
+describe('the loopback bind', () => {
+  it('states the accepted spellings when a value is not one of them', () => {
+    const error = loadErr({ DEBUGGEN_HOST: '0.0.0.0' });
+    const hint = error.hint ?? '';
+
+    expect(reasonFor(error, 'DEBUGGEN_HOST')).toBe(NOT_LOOPBACK_REASON);
+    expect(hint).toContain('Set DEBUGGEN_HOST');
+    expect(hint).toContain('loopback');
+    expect(hint).toContain(DEFAULT_HOST);
+    expect(hint).toContain('localhost');
+  });
+
+  it('holds an injected interface to the same rule as the variable', () => {
+    // A VS Code setting and a command-line flag reach this module as overrides,
+    // so an override that widened the bind would be a hole in the boundary
+    // rather than a convenience.
+    const error = loadErr({}, { host: '0.0.0.0' });
+
+    expect(keysOf(error)).toStrictEqual(['DEBUGGEN_HOST']);
+    expect(reasonFor(error, 'DEBUGGEN_HOST')).toBe(NOT_LOOPBACK_REASON);
+  });
+
+  it('accepts an injected loopback interface, brackets and all', () => {
+    expect(loadOk({}, { host: '[::1]' }).host).toBe('::1');
+    expect(loadOk({ DEBUGGEN_HOST: '0.0.0.0' }, { host: DEFAULT_HOST }).host).toBe(DEFAULT_HOST);
+  });
+
+  it('refuses the wildcard binds by name, which is the whole point of the rule', () => {
+    // The two values that widen the boundary by accident: they look like
+    // configuration rather than like a decision to publish an authenticated
+    // local service to every interface the machine has (AAP 0.5.6).
+    for (const wildcard of ['0.0.0.0', '::']) {
+      const result = load({ DEBUGGEN_HOST: wildcard });
+
+      expect(isErr(result)).toBe(true);
+    }
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The settings the selected provider requires
+ * ---------------------------------------------------------------------------
+ */
+
+describe('the settings the selected provider requires', () => {
+  /** The reason recorded when the selected provider has no credential. */
+  const MISSING_CREDENTIAL_REASON =
+    'the selected provider requires a credential and none is configured';
+
+  /** The reason recorded when the selected provider has no model. */
+  const MISSING_MODEL_REASON = 'the selected provider requires a model and none is configured';
+
+  it('names both keys the network-backed provider needs', () => {
+    // Derived from the module's own table rather than restated, so the suite
+    // cannot keep asserting a rule the implementation has changed.
+    expect([...NETWORK_REQUIREMENTS].sort()).toStrictEqual(['ANTHROPIC_API_KEY', 'DEBUGGEN_MODEL']);
+    expect(PROVIDER_REQUIREMENTS[DEFAULT_PROVIDER_ID]).toStrictEqual([]);
+    for (const key of NETWORK_REQUIREMENTS) {
+      expect(isServiceEnvKey(key)).toBe(true);
+    }
+  });
+
+  it('refuses the network-backed provider with no credential, naming the key', () => {
+    const error = loadErr({
+      DEBUGGEN_PROVIDER: NETWORK_PROVIDER_ID,
+      DEBUGGEN_MODEL: CONFIGURED_MODEL_ID,
+    });
+
+    expect(error.code).toBe(CONFIG_CODE);
+    expect(keysOf(error)).toStrictEqual(['ANTHROPIC_API_KEY']);
+    expect(reasonFor(error, 'ANTHROPIC_API_KEY')).toBe(MISSING_CREDENTIAL_REASON);
+    expect(error.hint ?? '').toContain('Set ANTHROPIC_API_KEY');
+    // The remedy offers the offline alternative, which is the other way out of
+    // this failure and the one that needs no credential at all.
+    expect(error.hint ?? '').toContain(`DEBUGGEN_PROVIDER=${DEFAULT_PROVIDER_ID}`);
+  });
+
+  it('treats a blank credential as absent rather than as a configured empty', () => {
+    // `.env.example` ships `ANTHROPIC_API_KEY=` and the repository's Vitest
+    // projects export it as `''`, so a blank value must fail this rule exactly
+    // as an unset one does - otherwise the provider receives a zero-length
+    // credential and the failure moves to the first model call.
+    for (const blank of ['', '   ']) {
+      const error = loadErr({
+        DEBUGGEN_PROVIDER: NETWORK_PROVIDER_ID,
+        DEBUGGEN_MODEL: CONFIGURED_MODEL_ID,
+        ANTHROPIC_API_KEY: blank,
+      });
+
+      expect(reasonFor(error, 'ANTHROPIC_API_KEY')).toBe(MISSING_CREDENTIAL_REASON);
+    }
+  });
+
+  it('refuses the network-backed provider with no model, naming the key', () => {
+    const error = loadErr({
+      DEBUGGEN_PROVIDER: NETWORK_PROVIDER_ID,
+      ANTHROPIC_API_KEY: PLANTED_CREDENTIAL,
+    });
+
+    expect(keysOf(error)).toStrictEqual(['DEBUGGEN_MODEL']);
+    expect(reasonFor(error, 'DEBUGGEN_MODEL')).toBe(MISSING_MODEL_REASON);
+    expect(error.hint ?? '').toContain('Set DEBUGGEN_MODEL');
+    // AAP 0.5.3: never defaulted, because a session records the model it used.
+    expect(error.hint ?? '').toContain('never defaulted');
+  });
+
+  it('reports both missing settings at once, in the order the contract declares', () => {
+    const error = loadErr({ DEBUGGEN_PROVIDER: NETWORK_PROVIDER_ID });
+
+    expect(keysOf(error)).toStrictEqual(['ANTHROPIC_API_KEY', 'DEBUGGEN_MODEL']);
+    expect(error.details?.keys).toStrictEqual(['ANTHROPIC_API_KEY', 'DEBUGGEN_MODEL']);
+    expect(error.message).toContain('ANTHROPIC_API_KEY');
+    expect(error.message).toContain('DEBUGGEN_MODEL');
+  });
+
+  it('refuses a selection injected by a host just as firmly', () => {
+    const error = loadErr({}, { provider: NETWORK_PROVIDER_ID });
+
+    expect(keysOf(error)).toStrictEqual(['ANTHROPIC_API_KEY', 'DEBUGGEN_MODEL']);
+  });
+
+  it('reports a missing credential alongside an unrelated rejection', () => {
+    // One failure carries the whole list: a developer filling in a `.env` file
+    // should not discover the credential rule on the next attempt.
+    const error = loadErr({
+      DEBUGGEN_PROVIDER: NETWORK_PROVIDER_ID,
+      DEBUGGEN_MODEL: CONFIGURED_MODEL_ID,
+      DEBUGGEN_LOG_LEVEL: 'extremely-loud',
+    });
+
+    expect(keysOf(error)).toStrictEqual(['ANTHROPIC_API_KEY', 'DEBUGGEN_LOG_LEVEL']);
+  });
+
+  it('never carries the credential into a failure about the model', () => {
+    // The planted value is present in the environment and missing from the
+    // error: the rule that fails here is about the *model*, and the credential
+    // beside it must not travel into a message, a hint, the details or the
+    // wire payload.
+    const serialised = serialiseError(
+      loadErr({
+        DEBUGGEN_PROVIDER: NETWORK_PROVIDER_ID,
+        ANTHROPIC_API_KEY: PLANTED_CREDENTIAL,
+      }),
+    );
+
+    expect(serialised).toContain('DEBUGGEN_MODEL');
+    expect(serialised).not.toContain(PLANTED_CREDENTIAL);
+    expect(serialised).not.toContain(PLANTED_CREDENTIAL.slice(0, 16));
+  });
+
+  it('names no provider id in a requirement failure, only the key and the remedy', () => {
+    // The clause says "the selected provider" on purpose: a reason names the
+    // key and the condition, and the configured value - even a vocabulary
+    // member - is not part of the failure policy of this module.
+    const error = loadErr({ DEBUGGEN_PROVIDER: NETWORK_PROVIDER_ID });
+
+    expect(error.message).not.toContain(NETWORK_PROVIDER_ID);
+    for (const entry of issuesOf(error)) {
+      expect(entry.reason).not.toContain(NETWORK_PROVIDER_ID);
+    }
+  });
+
+  it('accepts the network-backed provider once both settings are present', () => {
+    const config = loadOk(usableEnvFor(NETWORK_PROVIDER_ID));
+
+    expect(config.provider).toBe(NETWORK_PROVIDER_ID);
+    expect(config.model).toBe(CONFIGURED_MODEL_ID);
+    expect(config.anthropicApiKey).toBe(PLANTED_CREDENTIAL);
+  });
+
+  it('accepts them from the override channel too', () => {
+    const config = loadOk(
+      { DEBUGGEN_PROVIDER: NETWORK_PROVIDER_ID },
+      { model: OVERRIDE_MODEL_ID, anthropicApiKey: PLANTED_CREDENTIAL },
+    );
+
+    expect(config.model).toBe(OVERRIDE_MODEL_ID);
+    expect(config.anthropicApiKey).toBe(PLANTED_CREDENTIAL);
+  });
+
+  it('asks nothing of the offline provider, which is what keeps a checkout runnable', () => {
+    // AAP 0.5.2: the default provider reaches no network, so an unconfigured
+    // checkout must start and run the whole pipeline. A rule that demanded a
+    // credential here would make the private path the inconvenient one.
+    const config = loadOk({ DEBUGGEN_PROVIDER: DEFAULT_PROVIDER_ID });
+
+    expect(config.provider).toBe(DEFAULT_PROVIDER_ID);
+    expect('model' in config).toBe(false);
+    expect('anthropicApiKey' in config).toBe(false);
+    expect(isOk(load({}))).toBe(true);
+  });
+
+  it('accepts a credential the offline provider will not use', () => {
+    // A developer who switches back to the offline provider leaves the key in
+    // their `.env`; refusing it would be a rule about tidiness rather than
+    // about whether the service can run.
+    const config = loadOk({
+      DEBUGGEN_PROVIDER: DEFAULT_PROVIDER_ID,
+      ANTHROPIC_API_KEY: PLANTED_CREDENTIAL,
+      DEBUGGEN_MODEL: CONFIGURED_MODEL_ID,
+    });
+
+    expect(config.provider).toBe(DEFAULT_PROVIDER_ID);
+    expect(config.anthropicApiKey).toBe(PLANTED_CREDENTIAL);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The schemas themselves
+ * ---------------------------------------------------------------------------
+ */
+
+describe('serviceEnvSchema', () => {
+  it('normalises every raw variable into its resolved type', () => {
+    const parsed = serviceEnvSchema.safeParse({
+      DEBUGGEN_PORT: '  8080  ',
+      DEBUGGEN_RETENTION_DAYS: '90',
+      DEBUGGEN_PROVIDER: `  ${NETWORK_PROVIDER_ID.toUpperCase()}  `,
+      DEBUGGEN_LOG_LEVEL: ' WARN ',
+      DEBUGGEN_HOST: '[::1]',
+      DEBUGGEN_MODEL: '',
+    });
+
+    if (!parsed.success) {
+      throw new Error(`Expected the environment to parse: ${parsed.error.message}`);
+    }
+    expect(parsed.data.DEBUGGEN_PORT).toBe(8080);
+    expect(parsed.data.DEBUGGEN_RETENTION_DAYS).toBe(90);
+    expect(parsed.data.DEBUGGEN_PROVIDER).toBe(NETWORK_PROVIDER_ID);
+    expect(parsed.data.DEBUGGEN_LOG_LEVEL).toBe('warn');
+    expect(parsed.data.DEBUGGEN_HOST).toBe('::1');
+    // Blank is absent, which is the rule the whole contract rests on.
+    expect(parsed.data.DEBUGGEN_MODEL).toBeUndefined();
+  });
+
+  it('ignores every variable outside the contract', () => {
+    // The input is an environment: it carries the operating system's variables
+    // and the launcher's child-process ones, and rejecting them would make the
+    // service unstartable on any real machine.
+    const parsed = serviceEnvSchema.safeParse({
+      PATH: '/usr/bin',
+      DEBUGGEN_TOKEN: 'launcher-minted',
+      DEBUGGEN_PORT: '5000',
+    });
+
+    if (!parsed.success) {
+      throw new Error(`Expected unknown keys to be ignored: ${parsed.error.message}`);
+    }
+    // Only contract keys survive, and only the ones that had a value: an
+    // absent setting is absent from the output rather than present as
+    // `undefined`, which is the distinction the resolved contract rests on.
+    expect(Object.keys(parsed.data).every((key) => isServiceEnvKey(key))).toBe(true);
+    expect(Object.keys(parsed.data)).toStrictEqual(['DEBUGGEN_PORT']);
+    expect(parsed.data.DEBUGGEN_PORT).toBe(5000);
+  });
+
+  it('rejects a value with this module’s own clause, never the library’s message', () => {
+    const parsed = serviceEnvSchema.safeParse({ DEBUGGEN_PORT: REJECTED_PORT_VALUE });
+
+    if (parsed.success) {
+      throw new Error('Expected a non-numeric port to be rejected');
+    }
+    const messages = parsed.error.issues.map((entry) => entry.message);
+
+    expect(messages).toStrictEqual([NOT_AN_INTEGER_REASON]);
+    // The privacy rule at its source: the rejected value is absent from the
+    // schema's own output, so nothing downstream has to strip it.
+    expect(JSON.stringify(parsed.error.issues)).not.toContain(REJECTED_PORT_VALUE);
+  });
+});
+
+describe('serviceConfigOverridesSchema', () => {
+  it('accepts the values a host decides and normalises them the same way', () => {
+    const parsed = serviceConfigOverridesSchema.safeParse({
+      port: EPHEMERAL_PORT,
+      host: `  ${DEFAULT_HOST}  `,
+      provider: DEFAULT_PROVIDER_ID.toUpperCase(),
+      promptsDir: '',
+    });
+
+    if (!parsed.success) {
+      throw new Error(`Expected the overrides to parse: ${parsed.error.message}`);
+    }
+    expect(parsed.data.port).toBe(EPHEMERAL_PORT);
+    expect(parsed.data.host).toBe(DEFAULT_HOST);
+    expect(parsed.data.provider).toBe(DEFAULT_PROVIDER_ID);
+    expect(parsed.data.promptsDir).toBeUndefined();
+  });
+
+  it('says "the injected override" when a host supplies the bad value', () => {
+    const parsed = serviceConfigOverridesSchema.safeParse({ port: 8080.5 });
+
+    if (parsed.success) {
+      throw new Error('Expected a fractional injected port to be rejected');
+    }
+    expect(parsed.error.issues.map((entry) => entry.message)).toStrictEqual([
+      'the injected override is not a whole number',
+    ]);
+  });
+});
+
+describe('resolvedServiceConfigSchema', () => {
+  /** A configuration the loader produced, which the resolved schema must accept. */
+  const resolvedConfig = loadOk(
+    usableEnvFor(NETWORK_PROVIDER_ID, { DEBUGGEN_HOME: EXPLICIT_HOME }),
+  );
+
+  /** The reasons a rejected candidate recorded, from the issue messages the module authors. */
+  const reasonsFor = (candidate: unknown): readonly string[] => {
+    const parsed = resolvedServiceConfigSchema.safeParse(candidate);
+    if (parsed.success) {
+      throw new Error(`Expected the candidate to be rejected: ${JSON.stringify(candidate)}`);
+    }
+    return parsed.error.issues.map((entry) => entry.message);
+  };
+
+  it('accepts what the loader produced', () => {
+    const parsed = resolvedServiceConfigSchema.safeParse(resolvedConfig);
+
+    if (!parsed.success) {
+      throw new Error(`Expected the loaded configuration to validate: ${parsed.error.message}`);
+    }
+    expect(parsed.data.debuggenHome).toBe(EXPLICIT_HOME);
+    expect(parsed.data.provider).toBe(NETWORK_PROVIDER_ID);
+  });
+
+  it('refuses a configuration that binds something other than loopback', () => {
+    // The reason the resolved contract exists rather than living only in the
+    // loader: a configuration assembled elsewhere - a host object, a record
+    // read back from disk - is held to exactly the same boundary.
+    expect(reasonsFor({ ...resolvedConfig, host: '0.0.0.0' })).toContain(NOT_LOOPBACK_REASON);
+  });
+
+  it('refuses a configuration whose provider has nothing to authenticate with', () => {
+    const withoutCredential: Record<string, unknown> = { ...resolvedConfig };
+    delete withoutCredential['anthropicApiKey'];
+
+    expect(reasonsFor(withoutCredential)).toContain(
+      'the selected provider requires a credential and none is configured',
+    );
+  });
+
+  it('refuses a derived path that does not sit under the state root', () => {
+    // The invariant four subsystems trust without re-deriving it: the store,
+    // the backup writer, the retention sweep and the credential writer read
+    // these paths from the configuration and join nothing themselves.
+    expect(
+      reasonsFor({
+        ...resolvedConfig,
+        databasePath: joinPosix('/var/lib/elsewhere', SESSIONS_DATABASE_FILE_NAME),
+      }),
+    ).toContain('the derived state-root paths do not agree with the resolved root');
+  });
+
+  it('refuses a path that is relative or unnormalised', () => {
+    const unnormalised = 'the resolved path is not an absolute, normalised path';
+
+    expect(reasonsFor({ ...resolvedConfig, promptsDir: 'service/prompts' })).toContain(
+      unnormalised,
+    );
+    expect(reasonsFor({ ...resolvedConfig, promptsDir: `${EXPLICIT_PROMPTS_DIR}/` })).toContain(
+      unnormalised,
+    );
+  });
+
+  it('refuses a port and a retention window outside their ranges', () => {
+    expect(reasonsFor({ ...resolvedConfig, port: MAX_PORT + 1 })).toStrictEqual([
+      PORT_RANGE_REASON,
+    ]);
+    expect(reasonsFor({ ...resolvedConfig, retentionDays: -1 })).toStrictEqual([
+      RETENTION_RANGE_REASON,
+    ]);
+  });
+});
+
+describe('serviceConfigSchema as the whole contract', () => {
+  it('carries the three schemas that do the validating', () => {
+    expect(serviceConfigSchema.env).toBe(serviceEnvSchema);
+    expect(serviceConfigSchema.overrides).toBe(serviceConfigOverridesSchema);
+    expect(serviceConfigSchema.resolved).toBe(resolvedServiceConfigSchema);
+  });
+
+  it('agrees with the loader about what a valid configuration is', () => {
+    // The two halves of the contract, checked against each other: anything the
+    // loader returns must satisfy the resolved schema, and the loader is the
+    // schema's only producer inside the service.
+    const config = loadOk({ DEBUGGEN_HOME: EXPLICIT_HOME, DEBUGGEN_PORT: '5000' });
+
+    expect(serviceConfigSchema.resolved.safeParse(config).success).toBe(true);
+  });
+
+  it('answers a valid environment identically through either entry point', () => {
+    expect(serviceConfigSchema.safeParse({}, { homeDir: HOME_DIR })).toStrictEqual(
+      loadServiceConfig({}, { homeDir: HOME_DIR }),
+    );
+  });
+});
+
+describe('isServiceEnvKey', () => {
+  it('accepts every key in the contract and nothing else', () => {
+    for (const key of SERVICE_ENV_KEYS) {
+      expect(isServiceEnvKey(key)).toBe(true);
+    }
+    for (const other of [...LAUNCHER_ONLY_ENV_KEYS, 'PATH', '', 'debuggen_port']) {
+      expect(isServiceEnvKey(other)).toBe(false);
+    }
+    for (const nonString of [undefined, null, 42, {}, ['DEBUGGEN_PORT']]) {
+      expect(isServiceEnvKey(nonString)).toBe(false);
+    }
+  });
 });
 
 /*
@@ -1448,7 +2147,7 @@ describe('loading is pure', () => {
     // with a literal. Asserted by the answer tracking the argument exactly, in
     // both directions, while nothing here touches the process environment.
     expect(loadOk({}).provider).toBe(DEFAULT_PROVIDER_ID);
-    expect(loadOk({ DEBUGGEN_PROVIDER: NETWORK_PROVIDER_ID }).provider).toBe(NETWORK_PROVIDER_ID);
+    expect(loadOk(usableEnvFor(NETWORK_PROVIDER_ID)).provider).toBe(NETWORK_PROVIDER_ID);
     expect(loadOk({ DEBUGGEN_PORT: String(EPHEMERAL_PORT) }).port).toBe(EPHEMERAL_PORT);
     expect(loadOk({}).port).toBe(DEFAULT_PORT);
   });
@@ -1457,12 +2156,10 @@ describe('loading is pure', () => {
     // No clock, no randomness, no cached state: a session records the
     // configuration it started under, and a value that varied between reads
     // would make that record meaningless.
-    const env: ServiceEnv = {
+    const env: ServiceEnv = usableEnvFor(NETWORK_PROVIDER_ID, {
       DEBUGGEN_HOME: EXPLICIT_HOME,
       DEBUGGEN_PORT: '5000',
-      DEBUGGEN_PROVIDER: NETWORK_PROVIDER_ID,
-      DEBUGGEN_MODEL: CONFIGURED_MODEL_ID,
-    };
+    });
 
     expect(loadOk(env)).toStrictEqual(loadOk(env));
     expect(loadErr({ DEBUGGEN_PORT: REJECTED_PORT_VALUE }).message).toBe(
@@ -1502,9 +2199,21 @@ describe('loading is pure', () => {
 
 describe('toModelProviderOverrides', () => {
   it('forwards the validated selection', () => {
-    const config = loadOk({ DEBUGGEN_PROVIDER: NETWORK_PROVIDER_ID });
+    const config = loadOk(usableEnvFor(NETWORK_PROVIDER_ID));
 
     expect(toModelProviderOverrides(config).providerId).toBe(NETWORK_PROVIDER_ID);
+  });
+
+  it('forwards a selection that needs no credential without inventing one', () => {
+    // The offline provider is the default and requires nothing, so the
+    // overrides carry the selection alone - which is what makes
+    // `@debuggen/model-provider` construct the rules-based implementation
+    // rather than look for a key nobody configured.
+    const overrides = toModelProviderOverrides(loadOk(usableEnvFor(DEFAULT_PROVIDER_ID)));
+
+    expect(overrides.providerId).toBe(DEFAULT_PROVIDER_ID);
+    expect('apiKey' in overrides).toBe(false);
+    expect('model' in overrides).toBe(false);
   });
 
   it('omits an absent model and an absent credential rather than passing undefined', () => {
@@ -1538,12 +2247,12 @@ describe('toModelProviderOverrides', () => {
 
 describe('describeServiceConfig', () => {
   it('reports every value a developer diagnosing a start-up needs', () => {
-    const config = loadOk({
-      DEBUGGEN_HOME: EXPLICIT_HOME,
-      DEBUGGEN_PROMPTS_DIR: EXPLICIT_PROMPTS_DIR,
-      DEBUGGEN_MODEL: CONFIGURED_MODEL_ID,
-      DEBUGGEN_PROVIDER: NETWORK_PROVIDER_ID,
-    });
+    const config = loadOk(
+      usableEnvFor(NETWORK_PROVIDER_ID, {
+        DEBUGGEN_HOME: EXPLICIT_HOME,
+        DEBUGGEN_PROMPTS_DIR: EXPLICIT_PROMPTS_DIR,
+      }),
+    );
 
     expect(describeServiceConfig(config)).toStrictEqual({
       subsystem: 'config',
@@ -1553,7 +2262,10 @@ describe('describeServiceConfig', () => {
       retentionDays: DEFAULT_RETENTION_DAYS,
       provider: NETWORK_PROVIDER_ID,
       model: CONFIGURED_MODEL_ID,
-      anthropicApiKeyPresent: false,
+      // Presence, never content: the network-backed selection carries a
+      // credential by necessity, and this is the one view of a configuration
+      // that may be logged.
+      anthropicApiKeyPresent: true,
       debuggenHome: EXPLICIT_HOME,
       databasePath: joinPosix(EXPLICIT_HOME, SESSIONS_DATABASE_FILE_NAME),
       backupsDir: joinPosix(EXPLICIT_HOME, BACKUPS_DIRECTORY_NAME),

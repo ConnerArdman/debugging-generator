@@ -13,10 +13,9 @@
  * handler and no browser read. `app/orders/page.tsx` resolves the page of orders and passes it in
  * as a `PagedList<OrderSummary>`, so this component is a function of its props alone - it adds no
  * client component of its own to the orders page, and the markup it sends is the markup the
- * browser keeps. Because that page resolves the orders itself through the order service, nothing
- * on this surface calls `GET /api/orders` from the browser, and `@/lib/api-client` exposes no
- * wrapper for that endpoint by design: this list is a function of its props alone and issues no
- * request of any kind.
+ * browser keeps. That page reads the orders from `GET /api/orders` while it renders, so nothing on
+ * this surface calls that endpoint from the browser: this list issues no request of any kind, and
+ * a page turn is a new request for the page rather than a fetch from this component.
  *
  * That constraint decides how a reader moves between pages. A server component cannot read the
  * address bar - the hook that reports the query string runs in a client component only - and it

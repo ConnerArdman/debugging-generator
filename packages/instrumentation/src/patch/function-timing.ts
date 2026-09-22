@@ -137,10 +137,15 @@ import { Node, Project, ScriptKind, SyntaxKind, ts } from 'ts-morph';
 import type {
   ArrowFunction,
   ClassDeclaration,
+  ClassExpression,
   CommentRange,
   FunctionDeclaration,
   FunctionExpression,
+  GetAccessorDeclaration,
+  Identifier,
   MethodDeclaration,
+  ParameterDeclaration,
+  PropertyDeclaration,
   SourceFile,
   Statement,
 } from 'ts-morph';
@@ -171,11 +176,15 @@ import {
   SPAN_HELPER_GLOBAL,
   SPAN_HELPER_TYPE_NAME,
   buildWrapperBody,
+  detectArgumentsHazard,
   isDirectivePrologueLiteral,
+  isStrictModeDirective,
   needsHelperTypeAlias,
   resolvePatchLanguage,
 } from './wrap-template.js';
 import type {
+  ArgumentsHazard,
+  ArgumentsHazardFacts,
   PatchLanguage,
   PatchSpanMeta,
   WrapperBody,
@@ -278,6 +287,9 @@ const SCRATCH_ROOT = '/__debuggen_patch__';
 /** The directory the re-parse verification copy is created under. */
 const VERIFY_ROOT = '/__debuggen_verify__';
 
+/** The directory the receiver-typing pre-flight's copies are created under. */
+const TYPE_VERIFY_ROOT = '/__debuggen_typecheck__';
+
 /**
  * The compiler options the private in-memory project is built with.
  *
@@ -301,6 +313,52 @@ const SCRATCH_COMPILER_OPTIONS = Object.freeze({
   noResolve: true,
   target: ts.ScriptTarget.ESNext,
 });
+
+/**
+ * The compiler options the receiver-typing pre-flight's project is built with.
+ *
+ * A **second** configuration rather than a relaxation of
+ * {@link SCRATCH_COMPILER_OPTIONS}, because the two ask different questions.
+ * The parse path must stay `noLib`/`noResolve` — it needs a syntax tree and
+ * nothing else, and that is what keeps it cheap. This path asks whether the
+ * `this` annotation the transform *wrote* type-checks, which cannot be answered
+ * without the library files: `strictBindCallApply` (part of `strict`) is what
+ * makes `__orig.apply(this, …)` check the receiver at all, and it lives in
+ * `lib.es*.d.ts`.
+ *
+ * - `strict` because the developer's project is expected to be strict and
+ *   because the two diagnostics the emitted annotation exists to avoid —
+ *   `noImplicitThis` and `strictBindCallApply` — are both inside it. A
+ *   non-strict target project simply reports fewer diagnostics, and the
+ *   comparison is against the *same* configuration on both sides either way.
+ * - `lib`/`target` ES2023 to match `tsconfig.base.json`, which is the floor
+ *   this product's own code and the projects it patches are written against.
+ * - `noResolve` because an import must not drag a dependency tree into an
+ *   in-memory project; the unresolved-import noise that follows appears
+ *   identically in both programs and cancels in the delta — measured as the
+ *   same single `TS2307` before and after the patch.
+ * - `noEmit` because nothing here is compiled; only diagnostics are read.
+ */
+const TYPE_VERIFY_COMPILER_OPTIONS = Object.freeze({
+  allowJs: true,
+  checkJs: false,
+  jsx: ts.JsxEmit.Preserve,
+  lib: ['lib.es2023.d.ts'],
+  noEmit: true,
+  noResolve: true,
+  strict: true,
+  target: ts.ScriptTarget.ES2023,
+});
+
+/**
+ * How many introduced diagnostics an introduced-diagnostic refusal carries.
+ *
+ * Bounded because `details` travels into a log line and a user interface: the
+ * first few name the problem, and a file whose patch introduces dozens of type
+ * errors is refused for the same reason whether the caller can read all of them
+ * or not.
+ */
+const MAX_REPORTED_DIAGNOSTICS = 4;
 
 /**
  * How a {@link FunctionTimingPatcher} is configured.
@@ -368,6 +426,28 @@ export interface FunctionTimingPatcherOptions {
    * into a refusal that touches nothing. Turn it off only in a benchmark.
    */
   readonly verifyPatchedSyntax?: boolean | undefined;
+
+  /**
+   * Whether to **type-check** the emitted text for the receiver-typing errors
+   * the wrapper's `this` annotation could introduce, and refuse it if it does.
+   * Defaults to `true`, and applies to TypeScript targets only.
+   *
+   * On by default for the same reason as
+   * {@link FunctionTimingPatcherOptions.verifyPatchedSyntax}, one level up: a
+   * text that parses can still break the developer's build, and a syntax-only
+   * check cannot see it — the parse path runs with `noLib` and `noResolve`
+   * precisely so that it stays cheap. This check builds a second, lib-loaded
+   * in-memory project and compares *every* semantic diagnostic of the original
+   * text against those of the patched text under the same configuration,
+   * refusing on any difference. It never alters the patch, so the emitted
+   * bytes — and therefore `instrumentedHash` — are identical whether it runs or
+   * not.
+   *
+   * Costs one type-check of one file per patch, twice (20–110 ms per program as
+   * measured on this product's own fixtures), which is why it is a flag: turn it
+   * off in a benchmark, or in a caller that type-checks the result itself.
+   */
+  readonly verifyPatchedTypes?: boolean | undefined;
 }
 
 /**
@@ -629,9 +709,21 @@ interface Refusal {
    * `'unsupported-declaration'`, `'unsupported-accessor'`,
    * `'unsupported-constructor'`, `'unsupported-generator'`,
    * `'unsupported-async-generator'`, `'unsupported-super-reference'`,
-   * `'unsupported-new-target'`, `'already-instrumented'`,
-   * `'identifier-unavailable'`, `'malformed-symbol'`, `'overlapping-edits'`
-   * and `'invalid-syntax'`.
+   * `'unsupported-new-target'`, `'unsupported-mapped-arguments'`,
+   * `'unsupported-arguments-callee'`, `'unsupported-direct-eval'`,
+   * `'already-instrumented'`, `'identifier-unavailable'`,
+   * `'malformed-symbol'`, `'unsupported-polymorphic-this'`,
+   * `'unsupported-anonymous-class'`, `'overlapping-edits'`,
+   * `'invalid-syntax'` and `'unsupported-introduced-diagnostic'`.
+   *
+   * Six of them are the ones a *semantics-preserving* wrapper cannot be
+   * emitted for: the three `arguments` spellings come from
+   * {@link detectArgumentsHazard} and cover a sloppy-mode body whose mapped
+   * arguments object the move would rebind; the two `this` spellings come from
+   * the receiver-typing rules and cover a receiver that cannot be named in the
+   * inner function's signature; and `'unsupported-introduced-diagnostic'` is
+   * the semantic pre-flight reporting that the emitted text would add a
+   * compiler diagnostic the target file does not already have.
    *
    * `../feasibility.ts` gates most of these upstream against the code graph and
    * owns its own rejection vocabulary; the overlapping spellings are
@@ -712,6 +804,9 @@ export class FunctionTimingPatcher {
   /** Whether the emitted text is re-parsed before it is returned. */
   readonly #verifyPatchedSyntax: boolean;
 
+  /** Whether the emitted text is type-checked before it is returned. */
+  readonly #verifyPatchedTypes: boolean;
+
   /**
    * The private in-memory project, built on first use.
    *
@@ -723,9 +818,22 @@ export class FunctionTimingPatcher {
   #scratch: Project | undefined;
 
   /**
+   * The private **lib-loaded** project the receiver-typing pre-flight runs in,
+   * built on first use and then reused.
+   *
+   * Separate from {@link FunctionTimingPatcher.#scratch} because the two are
+   * configured for different questions — see
+   * {@link TYPE_VERIFY_COMPILER_OPTIONS} — and lazy because a caller that
+   * patches only JavaScript files, or that turns the check off, must not pay for
+   * loading the library files at all. Its files are created with `overwrite` and
+   * removed again in a `finally`, exactly as the parse project's are.
+   */
+  #typeScratch: Project | undefined;
+
+  /**
    * @param options See {@link FunctionTimingPatcherOptions}. Every field is
    * optional; the defaults are no project root, `noopLogger`, no injected
-   * project and syntax verification on.
+   * project, and syntax and receiver-typing verification both on.
    */
   constructor(options: FunctionTimingPatcherOptions = {}) {
     this.#projectRoot =
@@ -733,7 +841,9 @@ export class FunctionTimingPatcher {
     this.#logger = options.logger ?? noopLogger;
     this.#project = options.project;
     this.#verifyPatchedSyntax = options.verifyPatchedSyntax ?? true;
+    this.#verifyPatchedTypes = options.verifyPatchedTypes ?? true;
     this.#scratch = undefined;
+    this.#typeScratch = undefined;
   }
 
   /** The configured project root, in POSIX form, or `undefined`. */
@@ -805,6 +915,25 @@ export class FunctionTimingPatcher {
     });
 
     return this.#scratch;
+  }
+
+  /**
+   * The private lib-loaded project the receiver-typing pre-flight runs in,
+   * created on first use.
+   *
+   * The library files are loaded — the one difference from
+   * {@link FunctionTimingPatcher.#scratchProject} that matters — because
+   * `strictBindCallApply` is what checks the receiver `__orig.apply(this, …)`
+   * forwards, and it cannot check anything without `Function.prototype.apply`'s
+   * declared signature.
+   */
+  #typeProject(): Project {
+    this.#typeScratch ??= new Project({
+      useInMemoryFileSystem: true,
+      compilerOptions: { ...TYPE_VERIFY_COMPILER_OPTIONS },
+    });
+
+    return this.#typeScratch;
   }
 
   /**
@@ -1030,7 +1159,7 @@ export class FunctionTimingPatcher {
       return location;
     }
 
-    const targetEdit = buildTargetEdit(target, originalText, built.value, callStyle);
+    const targetEdit = buildTargetEdit(target, originalText, built.value, callStyle, file);
 
     if (!targetEdit.ok) {
       return targetEdit;
@@ -1056,6 +1185,23 @@ export class FunctionTimingPatcher {
 
       if (invalid !== undefined) {
         return err(invalid);
+      }
+    }
+
+    // After the syntax check, because text that does not parse has no
+    // meaningful semantic diagnostics, and only for TypeScript: a JavaScript
+    // target carries no `this` annotation to be wrong about, and `checkJs` is
+    // off for the same reason the parse project has it off.
+    if (this.#verifyPatchedTypes && language === 'typescript') {
+      const mistyped = this.#introducedDiagnosticRefusal(
+        file,
+        originalText,
+        patchedText.value,
+        target.declaredName,
+      );
+
+      if (mistyped !== undefined) {
+        return err(mistyped);
       }
     }
 
@@ -1148,6 +1294,87 @@ export class FunctionTimingPatcher {
       scratch.removeSourceFile(verifyFile);
     }
   }
+
+  /**
+   * Type-checks the emitted text and returns a refusal when the patch
+   * **introduced** a compiler diagnostic.
+   *
+   * The `this` annotation the wrapper's inner function carries is the one piece
+   * of *semantics* this transform writes rather than moves, and
+   * {@link FunctionTimingPatcher.#syntaxRefusal} cannot see a single thing wrong
+   * with it: a wrong receiver type parses perfectly. So the original and the
+   * patched text are type-checked under one configuration and compared.
+   *
+   * ## Why the comparison is sound
+   *
+   * The body text is unchanged by the patch, and the project resolves no import
+   * and holds no `node_modules`, so a target's own pre-existing diagnostics —
+   * the unresolved-import `TS2307`s above all, measured as identical in both
+   * programs — appear on both sides and cancel. What survives the subtraction is
+   * a diagnostic the patch is responsible for.
+   *
+   * ## Why every code counts, and not a list of them
+   *
+   * An earlier form of this check compared only the codes a receiver annotation
+   * is known to cause (2302, 2322, 2339, 2345, 2526, 2683 — measured, in that
+   * order, from a generic static's type arguments, a declared `this` return, a
+   * shadowed class name, `this: C` on a static method, a moved body's own `this`
+   * annotation, and an un-annotatable receiver). Those are still the usual
+   * findings, but a list of them is a promise this module cannot keep: measured
+   * on a class of two mutually recursive un-annotated methods, the wrapper adds
+   * `TS7023` for the inner function and `TS7024` beside it — two more build
+   * errors in the developer's project, under codes no receiver-typing list would
+   * hold. Since the subtraction already removes what the file brought with it,
+   * the honest comparison is over everything the compiler says.
+   *
+   * The two texts are checked **one at a time at the same path**, so neither can
+   * see the other: two copies of one module in one program would redeclare
+   * every global a script file declares and report it as a difference that is
+   * really an artefact of the check.
+   *
+   * ## What it never does
+   *
+   * It never changes the patch. Its only outcomes are `undefined` and a
+   * refusal, so the emitted bytes are a function of the input text alone and
+   * `instrumentedHash` is unaffected by whether the check ran.
+   *
+   * @param file The project-relative POSIX path, whose extension decides the
+   * script kind.
+   * @param originalText The text the patch was computed against.
+   * @param patchedText The emitted text.
+   * @param symbol The wrapped symbol, for the refusal's details.
+   * @returns A `PATCH_UNSUPPORTED` error, or `undefined` when the patch
+   * introduced no receiver-typing diagnostic.
+   */
+  #introducedDiagnosticRefusal(
+    file: string,
+    originalText: string,
+    patchedText: string,
+    symbol: string,
+  ): DebuggenError | undefined {
+    const project = this.#typeProject();
+    const path = joinPosix(TYPE_VERIFY_ROOT, file);
+    const before = semanticDiagnosticKeys(project, path, file, originalText);
+    const after = semanticDiagnosticKeys(project, path, file, patchedText);
+    const introduced = introducedDiagnostics(before, after);
+
+    if (introduced.length === 0) {
+      return undefined;
+    }
+
+    return refusal(
+      'PATCH_UNSUPPORTED',
+      'unsupported-introduced-diagnostic',
+      'The instrumented text would not type-check: it introduces compiler diagnostics the target file does not already have, so the text was discarded rather than written.',
+      {
+        file,
+        symbol,
+        diagnosticCount: introduced.length,
+        diagnostics: introduced.slice(0, MAX_REPORTED_DIAGNOSTICS),
+      },
+      `Time a different symbol, or resolve the reported diagnostics for ${symbol} in ${file} — a shadowed receiver type and a missing return-type annotation are the usual causes.`,
+    );
+  }
 }
 
 /** Everything {@link FunctionTimingPatcher} resolves before it rewrites. */
@@ -1201,6 +1428,92 @@ export function patchFunctionTiming(
 }
 
 /**
+ * The semantic diagnostics one text produces, as comparable keys.
+ *
+ * A key is `'<code>: <message>'` and deliberately carries **no position**: the
+ * wrapper shifts every line below it, so a position would make every
+ * pre-existing diagnostic look new. Code and message together are specific
+ * enough to identify a diagnostic — both name the types involved — and
+ * duplicates are kept rather than deduplicated so that
+ * {@link introducedDiagnostics} can compare multiplicities.
+ *
+ * The file is created and removed inside this function, so the project it is
+ * given holds exactly one file at a time and never accumulates state.
+ *
+ * @param project The lib-loaded verification project.
+ * @param path The in-memory path to create the copy at.
+ * @param file The project-relative path, whose extension decides the script
+ * kind.
+ * @param text The text to check.
+ * @returns Every semantic diagnostic, in the compiler's own order.
+ */
+function semanticDiagnosticKeys(
+  project: Project,
+  path: string,
+  file: string,
+  text: string,
+): readonly string[] {
+  const sourceFile = project.createSourceFile(path, text, {
+    overwrite: true,
+    scriptKind: scriptKindFor(file),
+  });
+
+  try {
+    return project
+      .getProgram()
+      .getSemanticDiagnostics(sourceFile)
+      .map((diagnostic) => {
+        const messageText = diagnostic.getMessageText();
+
+        return `${String(diagnostic.getCode())}: ${
+          typeof messageText === 'string' ? messageText : messageText.getMessageText()
+        }`;
+      });
+  } finally {
+    project.removeSourceFile(sourceFile);
+  }
+}
+
+/**
+ * The diagnostics present after the patch that were not present before it,
+ * comparing multiplicities.
+ *
+ * Multiplicity matters: a file that already reports one `TS2339` of its own must
+ * not hide a second one the patch introduced, and it must not be blamed for the
+ * first. Each `after` entry cancels at most one identical `before` entry, and
+ * what is left over is what the patch added.
+ *
+ * @param before The keys from the original text.
+ * @param after The keys from the patched text.
+ * @returns The introduced keys, in `after` order.
+ */
+function introducedDiagnostics(
+  before: readonly string[],
+  after: readonly string[],
+): readonly string[] {
+  const unmatched = new Map<string, number>();
+
+  for (const entry of before) {
+    unmatched.set(entry, (unmatched.get(entry) ?? 0) + 1);
+  }
+
+  const introduced: string[] = [];
+
+  for (const entry of after) {
+    const remaining = unmatched.get(entry) ?? 0;
+
+    if (remaining > 0) {
+      unmatched.set(entry, remaining - 1);
+      continue;
+    }
+
+    introduced.push(entry);
+  }
+
+  return introduced;
+}
+
+/**
  * The name a class constructor is addressed by, matching the name
  * `packages/code-analysis/src/extractors/symbols.ts` records it under.
  *
@@ -1217,19 +1530,25 @@ const MAX_INITIALIZER_UNWRAP_DEPTH = 8;
 const DEFAULT_INDENT = '  ';
 
 /**
- * Node kinds that give their own bodies a fresh `this`, `super` binding or
- * `new.target`, and whose subtrees are therefore skipped when scanning a
- * target's body for references to the enclosing one.
+ * Node kinds that give their own bodies a fresh `this`, `super` binding,
+ * `new.target` or `arguments`, and whose subtrees are therefore skipped when
+ * scanning a target's body for references to the enclosing one.
  *
  * `PropertyDeclaration` is in the list because a class field initialiser runs
  * with the instance as its receiver. `ArrowFunction` deliberately is **not**:
- * an arrow inherits all three lexically, so a `this` inside a nested arrow is a
- * `this` the wrapper must forward.
+ * an arrow inherits all four lexically, so a `this` — or an `arguments` — inside
+ * a nested arrow is one the wrapper must forward.
+ *
+ * The set is exactly right for `arguments` as well as for the receiver, which is
+ * why one scan answers both questions: every kind listed here binds its own
+ * `arguments` object, and the one kind deliberately absent inherits it.
  *
  * A class declaration is not skipped as a whole, only its members: a `this` in
  * a nested class's `extends` clause is evaluated in the enclosing scope, so
  * skipping the class outright would miss it and the wrapper would drop a
- * receiver the code depends on.
+ * receiver the code depends on. For the same reason a skipped member's
+ * *definition-time* expressions — its computed name and its decorators — are
+ * scanned rather than skipped with it; see {@link definitionTimeExpressions}.
  */
 const RECEIVER_REBINDING_KINDS: readonly SyntaxKind[] = Object.freeze([
   SyntaxKind.ClassStaticBlockDeclaration,
@@ -1252,6 +1571,28 @@ interface ReceiverUsage {
 
   /** Whether the body reads `new.target`, which an inner function rebinds. */
   readonly referencesNewTarget: boolean;
+
+  /**
+   * Whether the body reads the `arguments` binding of the function whose body
+   * is moving — which the inner function rebinds to an arguments object of its
+   * own. See `detectArgumentsHazard` in `./wrap-template.js` for what that
+   * costs, and when it costs nothing.
+   */
+  readonly referencesArguments: boolean;
+
+  /**
+   * Whether the body reads `arguments.callee` (or `arguments['callee']`), whose
+   * value is the function the arguments object was created for and therefore
+   * changes when the body moves.
+   */
+  readonly referencesArgumentsCallee: boolean;
+
+  /**
+   * Whether the body contains a **direct** `eval(…)` call, which runs with the
+   * body's own scope and can reach `arguments` or `arguments.callee` without
+   * either appearing in the syntax tree.
+   */
+  readonly containsDirectEval: boolean;
 }
 
 /** The three identifiers a wrapper declares, once collisions are resolved. */
@@ -1866,7 +2207,7 @@ function unwrapInitializer(
  * The refusal a resolved target still earns, or `undefined` when it may be
  * wrapped.
  *
- * Three conditions, each of which would otherwise produce a file that compiles
+ * Four conditions, each of which would otherwise produce a file that compiles
  * and misbehaves:
  *
  * - **A generator.** A wrapper that calls the body as a function cannot
@@ -1875,14 +2216,27 @@ function unwrapInitializer(
  *   the code graph, and `buildWrapperBody` *throws* rather than refusing if one
  *   reaches it, so this check is what keeps a skipped gate from becoming an
  *   exception on a caller's stack.
+ * - **A target that is already instrumented.** Wrapping a wrapper would time
+ *   the wrapper, nest two spans for one call, and leave a file whose restore
+ *   depends on two journal records applying in an order neither one states.
  * - **`super` or `new.target` in a body that would move into an inner
  *   function.** `super` is a syntax error inside a function declared in a
  *   method, and `new.target` would silently become `undefined` — a wrapper
  *   cannot preserve either, so the target is refused rather than broken. Arrow
  *   targets are exempt: their inner function is an arrow, which inherits both.
- * - **A target that is already instrumented.** Wrapping a wrapper would time
- *   the wrapper, nest two spans for one call, and leave a file whose restore
- *   depends on two journal records applying in an order neither one states.
+ * - **An observable `arguments` object in a sloppy-mode body.** The inner
+ *   function binds an arguments object of its own, so a sloppy function's
+ *   mapping between `arguments[i]` and its named parameters, and its
+ *   `arguments.callee` identity, do not survive the move — measured in Node as
+ *   `arguments[0] = 9` updating the parameter before the patch and not after.
+ *   `detectArgumentsHazard` in `./wrap-template.js` owns the rule and states the
+ *   measurements; this is where it is applied. Arrow targets are exempt for the
+ *   same reason as above: an arrow has no `arguments` binding of its own, so a
+ *   reference in its body resolves lexically and is unaffected by the move.
+ *
+ * Strict code is unaffected by the last condition, which is why it almost never
+ * fires: every TypeScript and ES-module target is strict, and so is every class
+ * member. See {@link isDefinitelyStrict}.
  *
  * @param target The resolved target.
  * @param callStyle The call style its shape implies.
@@ -1938,17 +2292,87 @@ function supportRefusal(
         'Time a function that does not depend on how it was called.',
       );
     }
+
+    const facts: ArgumentsHazardFacts = {
+      strictMode: isDefinitelyStrict(target, file),
+      ...parameterListFacts(target.fn),
+      referencesArguments: usage.referencesArguments,
+      referencesArgumentsCallee: usage.referencesArgumentsCallee,
+      containsDirectEval: usage.containsDirectEval,
+    };
+    const hazard = detectArgumentsHazard(facts);
+
+    if (hazard !== undefined) {
+      const stated = ARGUMENTS_HAZARD_REFUSALS[hazard];
+
+      return refusal(
+        'PATCH_UNSUPPORTED',
+        stated.reason,
+        stated.message,
+        {
+          file,
+          symbol: target.declaredName,
+          hazard,
+          parameterList: facts.parameterList,
+          parameterCount: facts.parameterCount,
+        },
+        stated.hint,
+      );
+    }
   }
 
   return undefined;
 }
 
 /**
+ * What each `arguments` hazard is reported as: the `reason` a caller branches
+ * on, the sentence the developer reads, and the change that would make the
+ * target wrappable.
+ *
+ * Stated as data, keyed by the hazard vocabulary `./wrap-template.js` exports,
+ * so the three refusals cannot drift apart and a new hazard there is a compile
+ * error here rather than a silent gap. Frozen because it is vocabulary rather
+ * than state.
+ *
+ * Every hint is something the developer can actually do: `'use strict'` makes
+ * the arguments object unmapped and the move transparent; reading the
+ * parameters by name — or through a rest parameter — removes the dependency
+ * altogether; and `arguments.callee` has a named-function-expression
+ * replacement in every case, which is why it has been deprecated since ES5.
+ */
+const ARGUMENTS_HAZARD_REFUSALS: Readonly<
+  Record<
+    ArgumentsHazard,
+    { readonly reason: string; readonly message: string; readonly hint: string }
+  >
+> = Object.freeze({
+  'mapped-arguments': Object.freeze({
+    reason: 'unsupported-mapped-arguments',
+    message:
+      'The target is a sloppy-mode function whose body reads arguments, and the inner function the wrapper declares binds an arguments object of its own: the mapping between arguments[0] and the first parameter would stop working while the patch is installed.',
+    hint: "Add a 'use strict' directive to the file, or read the parameters by name or through a rest parameter instead of arguments.",
+  }),
+  'arguments-callee': Object.freeze({
+    reason: 'unsupported-arguments-callee',
+    message:
+      'The target body reads arguments.callee, whose value is the function the arguments object was created for, so moving the body into an inner function would change what it answers.',
+    hint: "Replace arguments.callee with the function's own name, or with a named function expression, and the target becomes patchable.",
+  }),
+  'direct-eval': Object.freeze({
+    reason: 'unsupported-direct-eval',
+    message:
+      "The target is a sloppy-mode function whose body contains a direct eval call, which runs in that body's scope and can therefore observe the arguments object the inner function would rebind.",
+    hint: "Add a 'use strict' directive to the file, or time a function that does not call eval directly.",
+  }),
+});
+
+/**
  * What a body references of the bindings its enclosing function owns.
  *
- * One traversal, skipping the subtrees that rebind all three — see
- * {@link RECEIVER_REBINDING_KINDS} for which those are and why an arrow is not
- * among them.
+ * **One** traversal for all six answers, skipping the subtrees that rebind them
+ * — see {@link RECEIVER_REBINDING_KINDS} for which those are, why an arrow is
+ * not among them, and why the same skip set is correct for `arguments` as for
+ * the receiver.
  *
  * `new.target` and `import.meta` are the same node kind, so the keyword token
  * is checked: `import.meta` is module-scoped and survives being moved into an
@@ -1956,34 +2380,504 @@ function supportRefusal(
  * perfectly wrappable function.
  *
  * @param body The target's body.
- * @returns The three flags.
+ * @returns The six flags.
  */
 function scanReceiverUsage(body: Node): ReceiverUsage {
-  let referencesThis = false;
-  let referencesSuper = false;
-  let referencesNewTarget = false;
+  const usage: MutableReceiverUsage = {
+    referencesThis: false,
+    referencesSuper: false,
+    referencesNewTarget: false,
+    referencesArguments: false,
+    referencesArgumentsCallee: false,
+    containsDirectEval: false,
+  };
 
-  body.forEachDescendant((node, traversal): undefined => {
-    const kind = node.getKind();
+  scanEnclosingScope(body, usage);
 
-    if (RECEIVER_REBINDING_KINDS.includes(kind)) {
+  return { ...usage };
+}
+
+/** {@link ReceiverUsage} while the scan is still filling it in. */
+interface MutableReceiverUsage {
+  referencesThis: boolean;
+  referencesSuper: boolean;
+  referencesNewTarget: boolean;
+  referencesArguments: boolean;
+  referencesArgumentsCallee: boolean;
+  containsDirectEval: boolean;
+}
+
+/**
+ * Records every use of the enclosing scope's bindings in one subtree.
+ *
+ * Skipping a nested member's subtree is not the same as skipping every
+ * expression written inside it, and the difference is observable. A **computed
+ * member name** and a **decorator** are evaluated where the member is
+ * *defined* — in this scope, with this `arguments` object — not when the
+ * member is called, so they must be scanned even though the member's own
+ * parameters and body must not be. Measured on the shape this module emits,
+ * with `a` assigned before the member is defined:
+ *
+ * ```text
+ * function f(a) { a = 'after'; const o = { [arguments[0]]() {} }; … }
+ * f('before')   ->  original 'after',  patched 'before'
+ * ```
+ *
+ * so a scan that skipped the computed name would accept that target and change
+ * a property key. The member's subtree is therefore skipped and its
+ * definition-time expressions are re-entered through this same function, which
+ * applies the same rules one scope up — including to a nested function written
+ * inside a decorator argument.
+ *
+ * @param root The subtree to scan, whose own node is examined as well as its
+ * descendants.
+ * @param usage The flags to fill in.
+ */
+function scanEnclosingScope(root: Node, usage: MutableReceiverUsage): void {
+  // `forEachDescendant` does not visit the node it is called on, and a
+  // re-entered expression can *be* the reference (`{ [arguments]() {} }`).
+  recordReceiverUsage(root, usage);
+
+  root.forEachDescendant((node, traversal): undefined => {
+    if (RECEIVER_REBINDING_KINDS.includes(node.getKind())) {
       traversal.skip();
+
+      for (const expression of definitionTimeExpressions(node)) {
+        scanEnclosingScope(expression, usage);
+      }
 
       return undefined;
     }
 
-    if (kind === SyntaxKind.ThisKeyword) {
-      referencesThis = true;
-    } else if (kind === SyntaxKind.SuperKeyword) {
-      referencesSuper = true;
-    } else if (Node.isMetaProperty(node) && node.getKeywordToken() === SyntaxKind.NewKeyword) {
-      referencesNewTarget = true;
-    }
+    recordReceiverUsage(node, usage);
 
     return undefined;
   });
+}
 
-  return { referencesThis, referencesSuper, referencesNewTarget };
+/**
+ * Records what one node uses of the enclosing scope's bindings.
+ *
+ * `new.target` and `import.meta` are the same node kind, so the keyword token
+ * is checked: `import.meta` is module-scoped and survives being moved into an
+ * inner function untouched, and treating it as `new.target` would refuse a
+ * perfectly wrappable function.
+ *
+ * @param node The node to examine.
+ * @param usage The flags to fill in.
+ */
+function recordReceiverUsage(node: Node, usage: MutableReceiverUsage): void {
+  const kind = node.getKind();
+
+  if (kind === SyntaxKind.ThisKeyword) {
+    usage.referencesThis = true;
+  } else if (kind === SyntaxKind.SuperKeyword) {
+    usage.referencesSuper = true;
+  } else if (Node.isMetaProperty(node) && node.getKeywordToken() === SyntaxKind.NewKeyword) {
+    usage.referencesNewTarget = true;
+  }
+
+  if (isArgumentsCalleeAccess(node)) {
+    usage.referencesArgumentsCallee = true;
+  }
+
+  if (Node.isIdentifier(node) && node.getText() === ARGUMENTS_BINDING_NAME) {
+    usage.referencesArguments ||= isIdentifierReference(node);
+  }
+
+  if (isDirectEvalCall(node)) {
+    usage.containsDirectEval = true;
+  }
+}
+
+/**
+ * The expressions a nested member evaluates **where it is defined** rather than
+ * where it is called, and which therefore belong to the scanned scope.
+ *
+ * A computed name and a decorator both run at definition time, in the
+ * surrounding function's scope; a parameter decorator does too, even though the
+ * parameter it decorates is bound per call. Everything else about the member —
+ * its parameter defaults, its body — runs against its own `this` and its own
+ * `arguments`, which is why {@link RECEIVER_REBINDING_KINDS} skips it.
+ *
+ * @param member The nested declaration whose subtree is being skipped.
+ * @returns The expressions to scan in the enclosing scope, possibly none.
+ */
+function definitionTimeExpressions(member: Node): readonly Node[] {
+  const expressions: Node[] = [];
+
+  if (
+    Node.isMethodDeclaration(member) ||
+    Node.isPropertyDeclaration(member) ||
+    Node.isGetAccessorDeclaration(member) ||
+    Node.isSetAccessorDeclaration(member)
+  ) {
+    const nameNode = member.getNameNode();
+
+    if (Node.isComputedPropertyName(nameNode)) {
+      expressions.push(nameNode.getExpression());
+    }
+
+    for (const decorator of member.getDecorators()) {
+      expressions.push(decorator.getExpression());
+    }
+  }
+
+  if (
+    Node.isMethodDeclaration(member) ||
+    Node.isConstructorDeclaration(member) ||
+    Node.isGetAccessorDeclaration(member) ||
+    Node.isSetAccessorDeclaration(member)
+  ) {
+    for (const parameter of member.getParameters()) {
+      for (const decorator of parameter.getDecorators()) {
+        expressions.push(decorator.getExpression());
+      }
+    }
+  }
+
+  return expressions;
+}
+
+/**
+ * Whether a node is a **direct** `eval(…)` call — one that evaluates its
+ * argument in the scope it is written in, and can therefore read mapped
+ * `arguments` or `arguments.callee` with neither identifier anywhere in the
+ * syntax tree.
+ *
+ * Parentheses do not make a call indirect, and neither do TypeScript's
+ * type-only wrappers, which erase before the code runs. Measured in Node 24,
+ * in a sloppy function that assigns its parameter and then reads
+ * `arguments[0]` through the call:
+ *
+ * ```text
+ * eval('…')              -> 9   direct
+ * (eval)('…')            -> 9   direct
+ * ((eval))('…')          -> 9   direct
+ * (0, eval)('…')         -> ReferenceError   indirect, evaluates globally
+ * eval?.('…')            -> ReferenceError   indirect
+ * globalThis.eval('…')   -> ReferenceError   indirect
+ * ```
+ *
+ * The three indirect forms cannot see the body's bindings at all, so none of
+ * them is a hazard — nor is the `Function` constructor, for the same reason.
+ *
+ * @param node Any node reached by the scan.
+ * @returns `true` for a direct `eval` call.
+ */
+function isDirectEvalCall(node: Node): boolean {
+  if (!Node.isCallExpression(node) || node.getQuestionDotTokenNode() !== undefined) {
+    return false;
+  }
+
+  const callee = unwrapCalleeReference(node.getExpression());
+
+  return callee !== undefined && Node.isIdentifier(callee) && callee.getText() === DIRECT_EVAL_NAME;
+}
+
+/**
+ * The reference a callee position really names, looking through the wrappers
+ * that change neither the reference nor how the call is performed.
+ *
+ * Grouping parentheses and the type-only assertions are transparent; a comma
+ * expression is deliberately **not** unwrapped, because `(0, eval)(…)` is the
+ * canonical way to ask for an *indirect* eval and reading through it would
+ * refuse a target that is not a hazard.
+ *
+ * @param expression The callee expression.
+ * @returns The innermost callee, or `undefined` past the wrapper bound.
+ */
+function unwrapCalleeReference(expression: Node): Node | undefined {
+  let current: Node | undefined = expression;
+
+  for (let depth = 0; depth < MAX_CALLEE_UNWRAP_DEPTH; depth += 1) {
+    if (current === undefined) {
+      return undefined;
+    }
+
+    if (
+      Node.isParenthesizedExpression(current) ||
+      Node.isAsExpression(current) ||
+      Node.isSatisfiesExpression(current) ||
+      Node.isNonNullExpression(current) ||
+      Node.isTypeAssertion(current)
+    ) {
+      current = current.getExpression();
+      continue;
+    }
+
+    return current;
+  }
+
+  return undefined;
+}
+
+/** How many transparent wrappers may hide the reference a call names. */
+const MAX_CALLEE_UNWRAP_DEPTH = 8;
+
+/**
+ * The name of the binding every non-arrow function receives for its call's
+ * arguments, and the one this module's `arguments` scan looks for.
+ */
+const ARGUMENTS_BINDING_NAME = 'arguments';
+
+/** The property of an arguments object whose value is the callee itself. */
+const CALLEE_PROPERTY_NAME = 'callee';
+
+/** The callee spelling that makes a call a *direct* `eval`. */
+const DIRECT_EVAL_NAME = 'eval';
+
+/** The parameter name TypeScript reserves for the receiver's annotation. */
+const THIS_PARAMETER_NAME = 'this';
+
+/**
+ * Whether `node` reads `arguments.callee`, in either spelling.
+ *
+ * Both forms are checked because both answer the same value and both are
+ * written in real legacy code: `arguments.callee` and `arguments['callee']`. A
+ * computed read through a variable (`arguments[key]`) cannot be resolved
+ * syntactically — which is one reason a body that mentions `arguments` at all is
+ * treated as depending on the binding.
+ *
+ * @param node Any node reached by the scan.
+ * @returns `true` for a property or element access of `callee` on `arguments`.
+ */
+function isArgumentsCalleeAccess(node: Node): boolean {
+  if (Node.isPropertyAccessExpression(node)) {
+    return isArgumentsIdentifier(node.getExpression()) && node.getName() === CALLEE_PROPERTY_NAME;
+  }
+
+  if (Node.isElementAccessExpression(node)) {
+    const argument = node.getArgumentExpression();
+
+    return (
+      isArgumentsIdentifier(node.getExpression()) &&
+      argument !== undefined &&
+      (Node.isStringLiteral(argument) || Node.isNoSubstitutionTemplateLiteral(argument)) &&
+      argument.getLiteralText() === CALLEE_PROPERTY_NAME
+    );
+  }
+
+  return false;
+}
+
+/**
+ * Whether `node` is the bare identifier `arguments`.
+ *
+ * @param node Any node.
+ * @returns `true` for the identifier, `false` for anything else.
+ */
+function isArgumentsIdentifier(node: Node): boolean {
+  return Node.isIdentifier(node) && node.getText() === ARGUMENTS_BINDING_NAME;
+}
+
+/**
+ * Whether an identifier occurrence *reads a binding*, rather than sitting in a
+ * position where it names something else.
+ *
+ * The positions that are not reads: a property name (`o.arguments`), a
+ * property-assignment key (`{ arguments: 1 }`), any declaration's own name, and
+ * an import or export specifier's name. A **shorthand** property
+ * (`{ arguments }`) is the one name position that *is* a read, and is reported
+ * as one.
+ *
+ * A type-position occurrence — a type reference that happens to be spelled
+ * `arguments` — is treated as a read, which is deliberately conservative and
+ * costs nothing: the only decision that consults this scan's `arguments` flags
+ * is gated on the body **not** being definitely strict, and a file with type
+ * annotations is either an ES module or a TypeScript file, both of which are
+ * strict. See {@link isDefinitelyStrict}.
+ *
+ * @param node The identifier the scan reached.
+ * @returns `true` when the occurrence reads the binding of that name.
+ */
+function isIdentifierReference(node: Identifier): boolean {
+  const parent = node.getParent();
+
+  if (parent === undefined) {
+    return false;
+  }
+
+  if (Node.isShorthandPropertyAssignment(parent)) {
+    return true;
+  }
+
+  if (Node.isImportSpecifier(parent) || Node.isExportSpecifier(parent)) {
+    return false;
+  }
+
+  if (Node.isQualifiedName(parent) && parent.getRight() === node) {
+    return false;
+  }
+
+  return !(Node.hasName(parent) && parent.getNameNode() === node);
+}
+
+/**
+ * Whether the target's body is **definitely** strict code.
+ *
+ * Certainty in one direction only: `true` means the ECMAScript rules make the
+ * body strict whatever else the project does, and `false` means this module
+ * could not prove it — which is treated as sloppy, because the cost of being
+ * wrong that way is a refusal the developer can read rather than an application
+ * that computes different values while it is instrumented.
+ *
+ * The four grounds, each purely syntactic and therefore valid under the
+ * `noResolve`/`noLib` parse this module runs:
+ *
+ * - **A class body.** Every part of a class declaration or class expression is
+ *   strict, so a method — and a function or arrow in a field initialiser — is.
+ * - **An `.mjs` or `.mts` file.** Always a module, and modules are strict.
+ * - **An ES module.** `ts.isExternalModule` answers from the presence of a
+ *   top-level `import` or `export`, which is exactly the spec's own test; a
+ *   dynamic `import(…)` alone does not make a module, and it is not counted.
+ * - **A `'use strict'` prologue** on the file, on the target's own body, or on
+ *   any enclosing function's body.
+ *
+ * In the stack this product supports — TypeScript and TSX in ES modules — the
+ * answer is always `true`, so the refusals it gates only ever fire for a legacy
+ * script: a `.js`, `.jsx` or `.cjs` file with no `import`, no `export` and no
+ * `'use strict'`.
+ *
+ * @param target The resolved target.
+ * @param file The project-relative POSIX path, for its extension.
+ * @returns `true` when the body is certainly strict.
+ */
+function isDefinitelyStrict(target: ResolvedTarget, file: string): boolean {
+  const extension = extnamePosix(file);
+
+  if (extension === '.mjs' || extension === '.mts') {
+    return true;
+  }
+
+  const sourceFile = target.fn.getSourceFile();
+
+  if (ts.isExternalModule(sourceFile.compilerNode)) {
+    return true;
+  }
+
+  if (hasStrictDirectivePrologue(sourceFile.getStatements())) {
+    return true;
+  }
+
+  if (Node.isBlock(target.body) && hasStrictDirectivePrologue(target.body.getStatements())) {
+    return true;
+  }
+
+  for (const ancestor of target.fn.getAncestors()) {
+    if (Node.isClassDeclaration(ancestor) || Node.isClassExpression(ancestor)) {
+      return true;
+    }
+
+    // Only these three can enclose a target without also being inside a class
+    // body, which the branch above has already answered for.
+    const body =
+      Node.isFunctionDeclaration(ancestor) ||
+      Node.isFunctionExpression(ancestor) ||
+      Node.isArrowFunction(ancestor)
+        ? ancestor.getBody()
+        : undefined;
+
+    if (
+      body !== undefined &&
+      Node.isBlock(body) &&
+      hasStrictDirectivePrologue(body.getStatements())
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Whether a statement list opens with a `'use strict'` directive.
+ *
+ * Stricter than {@link isDirectivePrologueStatement} on purpose, in the two
+ * ways that decide whether code is actually strict:
+ *
+ * - **Only a string literal is a directive.** A template-literal spelling of
+ *   `` `use strict` `` is an ordinary expression statement and enables nothing.
+ * - **Only the unescaped spelling is a directive.** The raw source characters
+ *   are compared, so `'use\u0020strict'` — which cooks to the same string — is
+ *   correctly *not* a directive.
+ *
+ * The scan stops at the first statement that is not a string-literal
+ * expression, because a directive is only a directive inside the prologue.
+ *
+ * @param statements A file's or a body's statements, in source order.
+ * @returns `true` when one of the leading directives is `'use strict'`.
+ */
+function hasStrictDirectivePrologue(statements: readonly Statement[]): boolean {
+  for (const statement of statements) {
+    if (!Node.isExpressionStatement(statement)) {
+      return false;
+    }
+
+    const expression = statement.getExpression();
+
+    if (!Node.isStringLiteral(expression)) {
+      return false;
+    }
+
+    const raw = expression.getText();
+
+    if (isStrictModeDirective(raw.slice(1, raw.length - 1))) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * The two parameter-list facts `detectArgumentsHazard` records in a refusal.
+ *
+ * A list is *simple* when every parameter is a plain identifier with no
+ * initialiser and no rest element — the condition under which a sloppy
+ * function's arguments object is **mapped** to its parameter bindings. A
+ * TypeScript `this` parameter is excluded from the count because it erases and
+ * binds nothing at run time.
+ *
+ * @param fn The target's function-like node.
+ * @returns The list's shape and its runtime parameter count.
+ */
+function parameterListFacts(fn: PatchableFunctionNode): {
+  readonly parameterList: 'simple' | 'non-simple';
+  readonly parameterCount: number;
+} {
+  const parameters = fn.getParameters();
+  let parameterCount = 0;
+  let simple = true;
+
+  for (const [index, parameter] of parameters.entries()) {
+    if (index === 0 && isThisParameter(parameter)) {
+      continue;
+    }
+
+    parameterCount += 1;
+
+    if (
+      !Node.isIdentifier(parameter.getNameNode()) ||
+      parameter.hasInitializer() ||
+      parameter.isRestParameter()
+    ) {
+      simple = false;
+    }
+  }
+
+  return { parameterList: simple ? 'simple' : 'non-simple', parameterCount };
+}
+
+/**
+ * Whether a parameter is TypeScript's `this` parameter — the annotation-only
+ * first parameter that types the receiver and emits nothing.
+ *
+ * @param parameter The parameter to test.
+ * @returns `true` for a `this` parameter.
+ */
+function isThisParameter(parameter: ParameterDeclaration): boolean {
+  return parameter.getName() === THIS_PARAMETER_NAME && !parameter.isRestParameter();
 }
 
 /**
@@ -2140,17 +3034,20 @@ function allocateIdentifier(base: string, taken: Set<string>): string | undefine
  * @param originalText The text the patch is computed against.
  * @param wrapper The built wrapper.
  * @param callStyle The call style the target's shape implies.
- * @returns The edit, or a refusal when the target's syntax could not be read.
+ * @param file The project-relative path, for the refusal details.
+ * @returns The edit, or a refusal when the target's syntax could not be read or
+ * its receiver could not be typed.
  */
 function buildTargetEdit(
   target: ResolvedTarget,
   originalText: string,
   wrapper: WrapperBody,
   callStyle: WrapperCallStyle,
+  file: string,
 ): Result<PatchEdit> {
   return callStyle === 'rest'
     ? buildArrowEdit(target, originalText, wrapper)
-    : buildBodyEdit(target, originalText, wrapper);
+    : buildBodyEdit(target, originalText, wrapper, file);
 }
 
 /**
@@ -2171,13 +3068,22 @@ function buildTargetEdit(
  * @param target The resolved target, whose `body` is the block to move.
  * @param originalText The text the patch is computed against.
  * @param wrapper The built wrapper.
- * @returns The edit.
+ * @param file The project-relative path, for the refusal details.
+ * @returns The edit, or the refusal {@link innerThisParameter} returns for a
+ * receiver the inner function cannot declare.
  */
 function buildBodyEdit(
   target: ResolvedTarget,
   originalText: string,
   wrapper: WrapperBody,
+  file: string,
 ): Result<PatchEdit> {
+  const thisParameter = innerThisParameter(target, wrapper, file);
+
+  if (!thisParameter.ok) {
+    return thisParameter;
+  }
+
   const start = target.body.getStart();
   const end = target.body.getEnd();
   const newline = detectNewline(originalText);
@@ -2191,10 +3097,7 @@ function buildBodyEdit(
   // module published. The wrapper returns the inner call unchanged either way:
   // it never awaits, so a promise stays a promise and a synchronous throw stays
   // synchronous.
-  const innerDeclaration = `${asyncPrefix}function ${wrapper.innerIdentifier}(${innerThisParameter(
-    target,
-    wrapper,
-  )}) ${originalText.slice(start, end)}`;
+  const innerDeclaration = `${asyncPrefix}function ${wrapper.innerIdentifier}(${thisParameter.value}) ${originalText.slice(start, end)}`;
 
   return ok({
     start,
@@ -2210,7 +3113,8 @@ function buildBodyEdit(
 }
 
 /**
- * The `this` parameter the inner function declares, or the empty string.
+ * The `this` parameter the inner function declares, the empty string when none
+ * applies, or a refusal when the receiver cannot be typed at all.
  *
  * A TypeScript-only annotation, and the reason it exists is a type error that
  * would otherwise be *introduced* by the patch. The moved body keeps whatever
@@ -2221,16 +3125,42 @@ function buildBodyEdit(
  * temporary patch has no business breaking.
  *
  * `this: this` is not an option — TypeScript allows the `this` *type* only in a
- * class or interface member, not in a function nested inside one — so the type
- * is named instead:
+ * class or interface member, not in a function nested inside one, and answers
+ * `TS2526` when asked — so the receiver's type is **named**, by these rules in
+ * this order:
  *
- * - A target that declares its own `this` parameter lends its annotation
- *   verbatim, which is exactly the type the body was written against.
- * - A method of a named class names that class, with its type parameters
- *   applied by name (`C<T>`), all of which are in scope inside the method.
- * - Anything else gets no annotation: a standalone function's `this` is the
- *   call-time receiver and there is no type to name, and such a body already
- *   fails `noImplicitThis` before the patch, so nothing is made worse.
+ * 1. A target that declares its own `this` parameter **with** a type lends that
+ *    annotation verbatim: it is exactly the type the body was written against.
+ * 2. A `this` parameter with no type yields no annotation. Such a file already
+ *    fails `noImplicitThis` on its own, and guessing a type for it would be
+ *    this function inventing a receiver the developer did not state.
+ * 3. A target that is not a method yields no annotation: a standalone
+ *    function's `this` is the call-time receiver and no type names it.
+ * 4. A **static** method names the constructor: `this: typeof C`, never with
+ *    type arguments. `this: C` there is wrong — the receiver is the class
+ *    object, measured as `TS2345` "Argument of type 'typeof C' is not
+ *    assignable to parameter of type 'C'" — and `this: typeof C<T>` is wrong
+ *    twice over, because a static member may not reference the class's type
+ *    parameters at all (`TS2302`).
+ * 5. An **instance** method names the class with its type parameters applied by
+ *    name (`this: C<T, U>`), all of which are in scope inside the method.
+ * 6. A method that relies on the **polymorphic `this` type** is refused; see
+ *    {@link polymorphicThisSite} for what that means and why naming the
+ *    concrete class instead would be a silent behaviour change in files this
+ *    module cannot see.
+ * 7. A method of an **anonymous** class — reachable as
+ *    `export default class { … }` — is refused when its body reads `this`,
+ *    because there is no name to put in the annotation and leaving it off
+ *    produces `TS2683` ("'this' implicitly has type 'any'") in the developer's
+ *    build. When the body does not read `this`, nothing is emitted and the
+ *    patch proceeds.
+ *
+ * Name **shadowing** needs no rule of its own. A binding that hides the class
+ * name at the annotation's position surfaces as `TS2339`/`TS2345`, and
+ * `FunctionTimingPatcher`'s receiver-typing pre-flight refuses on exactly those
+ * codes — measured for the case that actually shadows the annotation, a method
+ * type parameter named after its class. Writing a scanner for it here would
+ * duplicate a check that already answers from the compiler.
  *
  * Emitted only when the wrapper actually forwards a receiver, and never into a
  * JavaScript file, where a parameter annotation is a syntax error. It erases
@@ -2238,40 +3168,638 @@ function buildBodyEdit(
  *
  * @param target The resolved target.
  * @param wrapper The built wrapper, for its language and receiver.
- * @returns `'this: T'`, or `''` when no annotation applies.
+ * @param file The project-relative path, for the refusal details.
+ * @returns `ok('this: T')`, `ok('')` when no annotation applies, or a refusal.
  */
-function innerThisParameter(target: ResolvedTarget, wrapper: WrapperBody): string {
+function innerThisParameter(
+  target: ResolvedTarget,
+  wrapper: WrapperBody,
+  file: string,
+): Result<string> {
   if (wrapper.language !== 'typescript' || wrapper.receiver !== 'this') {
-    return '';
+    return ok('');
   }
 
-  const firstParameter = target.fn.getParameters()[0];
+  const fn = target.fn;
+  const firstParameter = fn.getParameters()[0];
 
-  if (firstParameter !== undefined && firstParameter.getName() === 'this') {
+  if (firstParameter !== undefined && isThisParameter(firstParameter)) {
     const typeNode = firstParameter.getTypeNode();
 
-    return typeNode === undefined ? '' : `this: ${typeNode.getText()}`;
+    if (typeNode === undefined) {
+      return ok('');
+    }
+
+    // A declared receiver of `this` — or one containing it, such as
+    // `this[]` — is the polymorphic type again, under rule 6 rather than 1.
+    if (containsThisType(typeNode)) {
+      return err(polymorphicThisRefusal(target, file, 'this-parameter'));
+    }
+
+    return ok(`this: ${typeNode.getText()}`);
   }
 
   if (target.shape !== 'method') {
-    return '';
+    return ok('');
   }
 
-  const owner = target.fn.getParent();
+  const owner = fn.getParent();
 
-  if (!Node.isClassDeclaration(owner)) {
-    return '';
+  if (!Node.isClassDeclaration(owner) && !Node.isClassExpression(owner)) {
+    return ok('');
+  }
+
+  const polymorphicSite = polymorphicThisSite(target, owner);
+
+  if (polymorphicSite !== undefined) {
+    return err(polymorphicThisRefusal(target, file, polymorphicSite));
   }
 
   const name = owner.getName();
 
   if (name === undefined) {
-    return '';
+    if (!scanReceiverUsage(target.body).referencesThis) {
+      return ok('');
+    }
+
+    return err(
+      refusal(
+        'PATCH_UNSUPPORTED',
+        'unsupported-anonymous-class',
+        'The target is a method of an anonymous class and its body reads this, so there is no class name the inner function could annotate its receiver with.',
+        { file, symbol: target.declaredName, shape: target.shape },
+        'Give the class a name — export default class Name { … } — and the method becomes patchable.',
+      ),
+    );
+  }
+
+  if (Node.isMethodDeclaration(fn) && fn.isStatic()) {
+    return ok(`this: typeof ${name}`);
   }
 
   const typeParameters = owner.getTypeParameters().map((parameter) => parameter.getName());
 
-  return `this: ${name}${typeParameters.length === 0 ? '' : `<${typeParameters.join(', ')}>`}`;
+  return ok(`this: ${name}${typeParameters.length === 0 ? '' : `<${typeParameters.join(', ')}>`}`);
+}
+
+/**
+ * Where a method was found to depend on the polymorphic `this` type, as the
+ * value carried in the refusal's details.
+ *
+ * - `'this-parameter'` — its own `this` parameter is declared as `this`.
+ * - `'signature'` — a `this` type in the return type, a parameter type, or a
+ *   type parameter's constraint or default.
+ * - `'body-annotation'` — a `this` type in an annotation inside the body, which
+ *   would move into a plain function where no `this` type exists (`TS2526`).
+ * - `'returned-this'` — no declared return type, and the receiver escapes
+ *   through a `return`, so the method's *inferred* return type is `this`.
+ * - `'delegated-this'` — no declared return type, and the method returns the
+ *   result of a sibling member that itself answers with the `this` type, so the
+ *   inferred return type is `this` at one remove.
+ */
+type PolymorphicThisSite =
+  'this-parameter' | 'signature' | 'body-annotation' | 'returned-this' | 'delegated-this';
+
+/**
+ * Whether — and where — a method relies on the polymorphic `this` type.
+ *
+ * The `this` *type* means "the type of the receiver at the call site", which is
+ * what makes a fluent API work through a subclass: `class B extends A` inherits
+ * a method declared `(): this` and callers of `new B().step()` receive a `B`.
+ * The inner function the patch declares cannot carry that type — `this: this` is
+ * `TS2526` — and naming the concrete class instead is worse than an error,
+ * because it *compiles*: the method's type quietly narrows from `this` to the
+ * class, and the chained call in some other file that relied on the subclass
+ * type stops type-checking, or silently loses members. Measured on this
+ * module's own emitted shape, `return () => this` annotated with `this: C`
+ * produces **no diagnostic at all** in the patched file — so no same-file check,
+ * including the semantic pre-flight, can catch it. Refusing the target is the
+ * only honest answer.
+ *
+ * The scan of the fourth case skips nested `function`s, methods, accessors and
+ * static blocks — each of which has a `this` of its own — but deliberately not
+ * arrows: `return () => this` returns a closure over the method's receiver, and
+ * its type carries `this` just as `return this` does.
+ *
+ * The fifth case is the same dependency at one remove, and it is the one a
+ * fluent class is most likely to be written with: `run() { return this.step(); }`
+ * beside `step(): this`. Nothing in the patched file is wrong — measured, the
+ * patched method type-checks cleanly — but the method's inferred return type has
+ * narrowed from `this` to the class, and the breakage lands at a *call site*:
+ * `const x: B = new B().run()` becomes `TS2741` in a file the in-memory
+ * verification project never loads. See {@link delegatesReceiverType} for the
+ * bound on how far that is followed.
+ *
+ * @param target The resolved target, a class method.
+ * @param owner The class that declares it, whose members the fifth case reads.
+ * @returns The site, or `undefined` when nothing depends on the `this` type.
+ */
+function polymorphicThisSite(
+  target: ResolvedTarget,
+  owner: ReceiverOwner,
+): PolymorphicThisSite | undefined {
+  const fn = target.fn;
+  const returnTypeNode = fn.getReturnTypeNode();
+  const signatureTypes: readonly (Node | undefined)[] = [
+    returnTypeNode,
+    ...fn.getParameters().map((parameter) => parameter.getTypeNode()),
+    ...fn
+      .getTypeParameters()
+      .flatMap((parameter) => [parameter.getConstraint(), parameter.getDefault()]),
+  ];
+
+  for (const node of signatureTypes) {
+    if (node !== undefined && containsThisType(node)) {
+      return 'signature';
+    }
+  }
+
+  if (target.body.getDescendantsOfKind(SyntaxKind.ThisType).length > 0) {
+    return 'body-annotation';
+  }
+
+  // With a declared return type there is nothing to infer: a `return this`
+  // under an annotation that is not `this` is already an error in the
+  // developer's own file, and one under `(): this` was caught above.
+  if (returnTypeNode !== undefined) {
+    return undefined;
+  }
+
+  if (returnsReceiver(target.body)) {
+    return 'returned-this';
+  }
+
+  if (
+    delegatesReceiverType(
+      owner,
+      target.body,
+      Node.isMethodDeclaration(fn) && fn.isStatic(),
+      new Set<string>(),
+      0,
+    )
+  ) {
+    return 'delegated-this';
+  }
+
+  return undefined;
+}
+
+/**
+ * Whether a type node is, or contains, the `this` type.
+ *
+ * Containment rather than identity because `this` composes: `this[]`,
+ * `Promise<this>`, `this | undefined` and `Readonly<this>` all carry the
+ * polymorphic type into the annotation.
+ *
+ * @param typeNode The type node to inspect.
+ * @returns `true` when the `this` type appears anywhere inside it.
+ */
+function containsThisType(typeNode: Node): boolean {
+  return (
+    Node.isThisTypeNode(typeNode) ||
+    typeNode.getFirstDescendantByKind(SyntaxKind.ThisType) !== undefined
+  );
+}
+
+/**
+ * Whether the receiver escapes through one of a body's `return` statements.
+ *
+ * A `this` that is only ever the *object* of a property or element access —
+ * `return this.total`, `return this.load()`, `return this['key']` — does not
+ * escape: what is returned is the property's type, not the receiver's, so the
+ * annotation cannot narrow anything a caller can observe. That distinction is
+ * what keeps the overwhelmingly common `this`-reading method patchable, which
+ * AAP §0.5.1 requires of this transform; every other position (`return this`,
+ * `return [this]`, `return { self: this }`, `return () => this`,
+ * `return cond ? this : other`) is treated as an escape, erring towards a
+ * refusal the developer can read.
+ *
+ * @param body The method's body.
+ * @returns `true` when a `return` carries the receiver out of the method.
+ */
+function returnsReceiver(body: Node): boolean {
+  let escapes = false;
+
+  body.forEachDescendant((node, traversal): undefined => {
+    if (RECEIVER_REBINDING_KINDS.includes(node.getKind())) {
+      traversal.skip();
+
+      return undefined;
+    }
+
+    if (!Node.isReturnStatement(node)) {
+      return undefined;
+    }
+
+    const expression = node.getExpression();
+
+    if (expression !== undefined && carriesReceiver(expression)) {
+      escapes = true;
+    }
+
+    return undefined;
+  });
+
+  return escapes;
+}
+
+/**
+ * Whether an expression carries the receiver itself, rather than reading
+ * through it.
+ *
+ * @param expression The returned expression.
+ * @returns `true` when a `this` appears in a position whose value is the
+ * receiver.
+ */
+function carriesReceiver(expression: Node): boolean {
+  if (expression.getKind() === SyntaxKind.ThisKeyword) {
+    return true;
+  }
+
+  let carries = false;
+
+  expression.forEachDescendant((node, traversal): undefined => {
+    if (RECEIVER_REBINDING_KINDS.includes(node.getKind())) {
+      traversal.skip();
+
+      return undefined;
+    }
+
+    if (node.getKind() !== SyntaxKind.ThisKeyword) {
+      return undefined;
+    }
+
+    const parent = node.getParent();
+    const readThrough =
+      (Node.isPropertyAccessExpression(parent) || Node.isElementAccessExpression(parent)) &&
+      parent.getExpression() === node;
+
+    if (!readThrough) {
+      carries = true;
+    }
+
+    return undefined;
+  });
+
+  return carries;
+}
+
+/** A class-like declaration that can own a method and type its receiver. */
+type ReceiverOwner = ClassDeclaration | ClassExpression;
+
+/** A class member whose declared type can carry the polymorphic `this`. */
+type ReceiverMember = GetAccessorDeclaration | MethodDeclaration | PropertyDeclaration;
+
+/**
+ * How many sibling members deep the delegated-receiver scan follows an
+ * undeclared return type.
+ *
+ * Bounded because the scan is a graph walk over a class's own members and a
+ * class may be written with any amount of internal delegation; four is past
+ * every shape this is meant to catch — a method returning a builder step that
+ * itself returns `this`. Reaching the bound means the scan ran out of budget
+ * with the question still open, which is **not** an answer of "safe": it
+ * refuses, like every other case this module cannot prove.
+ */
+const MAX_DELEGATION_DEPTH = 4;
+
+/** How many transparent wrappers may hide the expression a `return` answers. */
+const MAX_RETURN_UNWRAP_DEPTH = 8;
+
+/**
+ * Whether a method's inferred return type is the polymorphic `this` because it
+ * hands back what a **sibling member** answered.
+ *
+ * `run() { return this.step(); }` beside `step(): this` is the fluent shape
+ * this exists for: the receiver never appears in `run`'s own `return`, so
+ * {@link returnsReceiver} does not see it, and the patched file type-checks
+ * perfectly — the narrowing shows up only where the method is *called*, in a
+ * file the verification project holds no copy of. A syntactic answer is the only
+ * one available, so this is deliberately narrow and deliberately honest about
+ * where it stops:
+ *
+ * - Only a member read **directly** off the receiver counts — `this.m`,
+ *   `this['m']` or either of them called, through any number of parentheses,
+ *   `await`s and type assertions. A longer chain (`this.items.map(…)`,
+ *   `this.service.load()`) answers with some other object's member and is not
+ *   followed, which is what keeps the commonest method bodies patchable.
+ * - A member that **declares** a return type is decided by that type alone.
+ * - A member that declares none is followed into its own body, up to
+ *   {@link MAX_DELEGATION_DEPTH}, with each member visited once so a cycle
+ *   (`a() { return this.b(); } b() { return this.a(); }`) terminates.
+ * - Static and instance members are looked up separately: a static method
+ *   delegating to `this.make()` reaches the static `make`, never an instance
+ *   member of the same name.
+ * - A name the class does **not** declare is a refusal when the class extends
+ *   or implements anything, and otherwise is not: a base class in another file
+ *   may well answer `this` and nothing readable here will say, whereas a name
+ *   no base could supply is the developer's own error and already reported in
+ *   their file. A computed access (`this[key]`) resolves to no name and is
+ *   decided by that same rule.
+ *
+ * @param owner The class that declares both members.
+ * @param body The body to read the `return` statements of.
+ * @param isStatic Whether the receiver is the constructor rather than an
+ * instance, which decides which members `this.m` can name.
+ * @param seen The members already followed, keyed by staticness and name.
+ * @param depth How many members have been followed to get here.
+ * @returns `true` when the receiver type escapes through a sibling member.
+ */
+function delegatesReceiverType(
+  owner: ReceiverOwner,
+  body: Node,
+  isStatic: boolean,
+  seen: Set<string>,
+  depth: number,
+): boolean {
+  // Exhausting the bound is "not proven safe", not "proven safe": the scan ran
+  // out of budget with the question open, and the answer to an open question
+  // about a developer's build is a refusal.
+  if (depth >= MAX_DELEGATION_DEPTH) {
+    return true;
+  }
+
+  let delegates = false;
+
+  /**
+   * Decides one expression that leaves the method as its value.
+   *
+   * @param expression The answered expression, or `undefined`.
+   */
+  const consider = (expression: Node | undefined): void => {
+    const name = delegatedMemberName(expression);
+
+    if (name === undefined) {
+      return;
+    }
+
+    const key = `${isStatic ? 'static' : 'instance'}:${name}`;
+
+    if (seen.has(key)) {
+      return;
+    }
+
+    seen.add(key);
+
+    const member = findReceiverMember(owner, name, isStatic);
+
+    if (member === undefined) {
+      // The class does not declare it. Either the member does not exist — which
+      // is the developer's own error, already reported in their file, and not
+      // something to refuse over — or it is inherited from, or mixed in by, a
+      // base class whose declaration is in another file this module holds no
+      // copy of. In that second case the member may well answer `this`, and no
+      // amount of reading this file will say, so a heritage clause turns the
+      // unresolved name into a refusal.
+      delegates = owner.getHeritageClauses().length > 0;
+
+      return;
+    }
+
+    if (memberAnswersReceiver(owner, member, isStatic, seen, depth)) {
+      delegates = true;
+    }
+  };
+
+  body.forEachDescendant((node, traversal): undefined => {
+    if (RECEIVER_REBINDING_KINDS.includes(node.getKind())) {
+      traversal.skip();
+
+      return undefined;
+    }
+
+    if (delegates) {
+      return undefined;
+    }
+
+    if (Node.isReturnStatement(node)) {
+      consider(node.getExpression());
+    }
+
+    return undefined;
+  });
+
+  return delegates;
+}
+
+/**
+ * The name of the receiver's own member a `return` hands back, or `undefined`
+ * when it hands back something else.
+ *
+ * A returned **concise arrow** is looked through, because its type is the type
+ * of the expression it answers: `return () => this.step()` is `() => this` when
+ * `step` answers `this`, and a concise body has no `return` statement for the
+ * caller's statement scan to reach. A *block*-bodied arrow needs nothing here —
+ * arrows are not in {@link RECEIVER_REBINDING_KINDS}, so its own `return`
+ * statements are reached by that same scan, which is exactly how
+ * {@link returnsReceiver} treats the two forms.
+ *
+ * @param expression The returned expression, or `undefined` for a bare
+ * `return`.
+ * @returns The member's name, or `undefined`.
+ */
+function delegatedMemberName(expression: Node | undefined): string | undefined {
+  let returned = unwrapTransparentExpression(expression);
+
+  for (let depth = 0; depth < MAX_RETURN_UNWRAP_DEPTH; depth += 1) {
+    if (returned === undefined || !Node.isArrowFunction(returned)) {
+      break;
+    }
+
+    const arrowBody = returned.getBody();
+
+    if (Node.isBlock(arrowBody)) {
+      return undefined;
+    }
+
+    returned = unwrapTransparentExpression(arrowBody);
+  }
+
+  if (returned === undefined) {
+    return undefined;
+  }
+
+  const accessed = Node.isCallExpression(returned)
+    ? unwrapTransparentExpression(returned.getExpression())
+    : returned;
+
+  if (accessed === undefined) {
+    return undefined;
+  }
+
+  if (Node.isPropertyAccessExpression(accessed)) {
+    return accessed.getExpression().getKind() === SyntaxKind.ThisKeyword
+      ? accessed.getName()
+      : undefined;
+  }
+
+  // `this['self']` names a member exactly as `this.self` does, and
+  // `this[key]` names one this module cannot know: the first is looked up, and
+  // the second answers with a name no class declares, which
+  // `delegatesReceiverType` turns into a refusal whenever the class could have
+  // inherited the member — the conservative reading of "cannot be proven".
+  if (Node.isElementAccessExpression(accessed)) {
+    if (accessed.getExpression().getKind() !== SyntaxKind.ThisKeyword) {
+      return undefined;
+    }
+
+    const argument = accessed.getArgumentExpression();
+
+    if (argument === undefined) {
+      return undefined;
+    }
+
+    return Node.isStringLiteral(argument) || Node.isNoSubstitutionTemplateLiteral(argument)
+      ? argument.getLiteralText()
+      : UNRESOLVED_MEMBER_NAME;
+  }
+
+  return undefined;
+}
+
+/**
+ * The name stood in for a member read off the receiver whose spelling is not
+ * statically known, as in `return this[key]`.
+ *
+ * Deliberately a name no class can declare — a computed access is the one form
+ * whose target cannot be looked up — so
+ * {@link delegatesReceiverType}'s unresolved-member branch decides it, under
+ * the same rule as an inherited member.
+ */
+const UNRESOLVED_MEMBER_NAME = '\u0000unresolved';
+
+/**
+ * The expression a `return` really answers, looking through the wrappers that
+ * do not change its value.
+ *
+ * `await` is included because `Promise<this>` carries the polymorphic type just
+ * as `this` does, and the type assertions are included because a target may
+ * well be written with one.
+ *
+ * @param expression The expression to unwrap, or `undefined`.
+ * @returns The innermost expression, or `undefined`.
+ */
+function unwrapTransparentExpression(expression: Node | undefined): Node | undefined {
+  let current = expression;
+
+  for (let depth = 0; depth < MAX_RETURN_UNWRAP_DEPTH; depth += 1) {
+    if (current === undefined) {
+      return undefined;
+    }
+
+    if (
+      Node.isParenthesizedExpression(current) ||
+      Node.isAwaitExpression(current) ||
+      Node.isAsExpression(current) ||
+      Node.isSatisfiesExpression(current) ||
+      Node.isNonNullExpression(current) ||
+      Node.isTypeAssertion(current)
+    ) {
+      current = current.getExpression();
+      continue;
+    }
+
+    return current;
+  }
+
+  return undefined;
+}
+
+/**
+ * The class's own method, get accessor or property of that name and staticness.
+ *
+ * @param owner The class to search.
+ * @param name The member name read off the receiver.
+ * @param isStatic Whether a static or an instance member is wanted.
+ * @returns The member, or `undefined` when the class declares none — an
+ * inherited one, whose declaration is in another file this module holds no copy
+ * of, included.
+ */
+function findReceiverMember(
+  owner: ReceiverOwner,
+  name: string,
+  isStatic: boolean,
+): ReceiverMember | undefined {
+  const members: readonly ReceiverMember[] = [
+    ...owner.getMethods(),
+    ...owner.getGetAccessors(),
+    ...owner.getProperties(),
+  ];
+
+  return members.find((member) => member.getName() === name && member.isStatic() === isStatic);
+}
+
+/**
+ * Whether a member answers with the polymorphic `this` type.
+ *
+ * Decided by its declared type where it has one, and otherwise by following it:
+ * a method or accessor into its body, and a property into its initialiser,
+ * which is the one shape a field can carry the receiver in (`self = this`).
+ *
+ * @param owner The class that declares it.
+ * @param member The member being followed.
+ * @param isStatic The staticness the lookup was made under.
+ * @param seen The members already followed.
+ * @param depth How many members have been followed to get here.
+ * @returns `true` when the member's type is, or contains, the `this` type.
+ */
+function memberAnswersReceiver(
+  owner: ReceiverOwner,
+  member: ReceiverMember,
+  isStatic: boolean,
+  seen: Set<string>,
+  depth: number,
+): boolean {
+  if (Node.isPropertyDeclaration(member)) {
+    const typeNode = member.getTypeNode();
+
+    if (typeNode !== undefined) {
+      return containsThisType(typeNode);
+    }
+
+    const initializer = member.getInitializer();
+
+    return initializer !== undefined && carriesReceiver(initializer);
+  }
+
+  const returnTypeNode = member.getReturnTypeNode();
+
+  if (returnTypeNode !== undefined) {
+    return containsThisType(returnTypeNode);
+  }
+
+  const memberBody = member.getBody();
+
+  if (memberBody === undefined) {
+    return false;
+  }
+
+  return (
+    returnsReceiver(memberBody) ||
+    delegatesReceiverType(owner, memberBody, isStatic, seen, depth + 1)
+  );
+}
+
+/**
+ * The refusal a polymorphic-`this` target earns.
+ *
+ * @param target The resolved target.
+ * @param file The project-relative path, for the refusal details.
+ * @param site Where the dependency was found.
+ * @returns The coded refusal.
+ */
+function polymorphicThisRefusal(
+  target: ResolvedTarget,
+  file: string,
+  site: PolymorphicThisSite,
+): DebuggenError {
+  return refusal(
+    'PATCH_UNSUPPORTED',
+    'unsupported-polymorphic-this',
+    "The target depends on the polymorphic this type, which the inner function cannot declare: naming the concrete class instead would narrow the method's type and break subclass call sites in other files without any error in this one.",
+    { file, symbol: target.declaredName, container: target.container, site },
+    'Declare the receiver and return types concretely, or time a method that does not hand its receiver back to its caller.',
+  );
 }
 
 /**

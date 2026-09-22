@@ -32,6 +32,18 @@
  * unconditionally at the top of the component, and this module adds no effect, no state and no
  * request of its own - `GET /api/shipping/quote` is reached through that hook and nowhere else.
  *
+ * THE LOOKUP CAN BE HOISTED, AND IS NEVER PERFORMED TWICE
+ * The rate this panel prints beside a service is also the rate the order being placed is charged,
+ * so a surface that has to quote the same figure elsewhere - the checkout page's review column
+ * reads it from the form - must be able to hold the lookup itself rather than watch this component
+ * hold a second one. That is the `quote` prop: given one, this panel renders from it and asks for
+ * nothing, and the caller's `useFreightQuote()` is the only lookup on the page. It is not a
+ * conditional hook, which `react-hooks/rules-of-hooks` forbids and which would break the moment a
+ * caller passed the prop on one render and omitted it on the next: the hook is still called on
+ * every render, and what changes is its argument - `null`, which is that hook's documented
+ * "ask nothing" state. So exactly one `GET /api/shipping/quote` is in flight per destination
+ * however this component is placed, and a panel placed with no `quote` behaves exactly as before.
+ *
  * WHAT A QUOTE CHANGES, AND WHAT IT DOES NOT
  * The rows are the `options` prop: it decides which services exist, in what order, and which ids
  * `onSelect` may report, so an answer that arrives from the network can never move the selection or
@@ -53,7 +65,12 @@ import { Alert } from '@/components/ui/Alert';
 import { Badge } from '@/components/ui/Badge';
 import { Price } from '@/components/ui/Price';
 import { VisuallyHidden } from '@/components/ui/VisuallyHidden';
-import { useFreightQuote, useShippingEta, type DispatchEta } from '@/hooks/useShippingEta';
+import {
+  useFreightQuote,
+  useShippingEta,
+  type DispatchEta,
+  type FreightQuoteState,
+} from '@/hooks/useShippingEta';
 import { formatShippingEtaLabel } from '@/lib/format';
 import type { ShippingOption, ShippingQuoteResult } from '@/lib/types';
 
@@ -214,6 +231,35 @@ interface Props {
   postalCode?: string | null;
 
   /**
+   * How many units the shipment carries, passed straight to the freight lookup, or `null` when
+   * there is nothing to describe yet.
+   *
+   * It belongs in the question because freight is charged per piece: a lookup that names only a
+   * destination is answered for a single unit, and the rows would then price a shipment nobody is
+   * sending. A caller that hoists the lookup (see `quote`) names the shipment there instead, and
+   * this prop is then unused.
+   *
+   * @default null
+   */
+  itemCount?: number | null;
+
+  /**
+   * The freight lookup, hoisted to a caller that has to quote the same figures elsewhere; omitted,
+   * this component performs the lookup itself.
+   *
+   * Pass the whole {@link FreightQuoteState} a caller's own `useFreightQuote()` returned - the
+   * services, the in-flight flag and the failure wording - and this panel renders from it and asks
+   * `GET /api/shipping/quote` for nothing, so the caller's lookup is the page's only one. The
+   * caller is then responsible for quoting the destination this panel was given: a state quoted for
+   * a different postal code would price these rows for an address nobody is shipping to.
+   *
+   * It spells `| undefined` out because absent and present-but-undefined have to mean the same
+   * thing here - both are "no hoisted lookup, do it yourself" - and `exactOptionalPropertyTypes`
+   * would otherwise reject the second from a caller that resolves the value conditionally.
+   */
+  quote?: FreightQuoteState | undefined;
+
+  /**
    * The group's visible heading, which a `<legend>` also makes its accessible name.
    *
    * @default 'Shipping method'
@@ -266,14 +312,30 @@ interface Props {
  * placement the alert cannot know about; the two agree on type size, and the alert paints its own
  * text colour.
  *
- * @example The ordinary case, inside the checkout form's shipping group.
+ * @example The ordinary case, where this panel performs the freight lookup itself.
  * ```tsx
  * <ShippingOptionPicker
  *   options={services}
  *   selectedId={draft.shippingOptionId}
  *   onSelect={(optionId) => setDraft({ ...draft, shippingOptionId: optionId })}
  *   postalCode={draft.shippingAddress.postalCode}
+ *   itemCount={cart.itemCount}
  *   disabled={submitting}
+ * />
+ * ```
+ *
+ * @example Inside the checkout form, which holds the lookup because it publishes the chosen rate to
+ * the review column beside it. The shipment is described where the lookup is held, so this
+ * placing passes no `itemCount`; the destination and the hoisted state describe one shipment.
+ * ```tsx
+ * const quote = useFreightQuote(destination, cart.itemCount);
+ *
+ * <ShippingOptionPicker
+ *   options={services}
+ *   selectedId={shippingOptionId}
+ *   onSelect={setShippingOptionId}
+ *   postalCode={destination}
+ *   quote={quote}
  * />
  * ```
  */
@@ -282,12 +344,20 @@ export function ShippingOptionPicker({
   selectedId,
   onSelect,
   postalCode = null,
+  itemCount = null,
+  quote: hoistedQuote,
   legend = DEFAULT_LEGEND,
   disabled = false,
   className,
 }: Props) {
   const eta = useShippingEta();
-  const { quote, isQuoting, quoteError } = useFreightQuote(postalCode);
+  // Unconditional, as the rules of hooks require, and asked nothing at all when a caller hoisted
+  // the lookup: `null` is this hook's documented no-request state, so the page never holds two
+  // lookups for one shipment. The unit count travels with the destination, because freight is
+  // charged per piece and a lookup named for an address alone is answered for one unit. See the
+  // header.
+  const ownLookup = useFreightQuote(hoistedQuote === undefined ? postalCode : null, itemCount);
+  const { quote, isQuoting, quoteError } = hoistedQuote ?? ownLookup;
 
   const dispatchNote = dispatchClause(eta);
   // Whether the buyer has written a destination at all, which is a question about the field rather

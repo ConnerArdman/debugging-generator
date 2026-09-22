@@ -476,7 +476,17 @@ export interface RedactGuardReport {
   /** The bounds that were reached, in {@link REDACT_GUARD_LIMIT_IDS} order. */
   readonly limitsReached: readonly RedactGuardLimitId[];
 
-  /** How many nodes — scalars, strings, arrays and objects — were visited. */
+  /**
+   * How many node **visits** the walk made — scalars, strings, arrays and
+   * objects — which is not the same as how many distinct nodes the payload has.
+   *
+   * It counts visits because that is what the node budget is spent from: work
+   * is the thing being bounded, not distinct values. The two numbers differ
+   * only for an aliased or cyclic payload, where a skipped revisit still costs
+   * its visit, and where an object reached under two different
+   * `NameContext`s — see the walk — is inspected under each and so counted
+   * twice.
+   */
   readonly inspected: number;
 }
 
@@ -1139,6 +1149,50 @@ function scanWindows(
 // The walk
 // ---------------------------------------------------------------------------
 
+/**
+ * The detection-relevant equivalence class of the nearest enclosing field name.
+ *
+ * Two classes, and *two* is the load-bearing part. {@link isKeyLikeName} is the
+ * only question any rule asks about a name — `high-entropy-secret` is applied
+ * under a credential-like one and not under a plain one, which is the whole of
+ * the name's contribution in {@link scanString} — so the invariant this module
+ * relies on is:
+ *
+ * > The set of rule ids a subtree can raise is a function of `(value,
+ * > nameContext(name), the selected rules)`. The path decides only **where** a
+ * > finding is reported, never **whether** one is raised.
+ *
+ * That is what makes {@link WalkState.inspectedUnder} a sound memo: an object
+ * already inspected under this context can raise nothing new under it, while
+ * one inspected only under the *other* context can — which is exactly the
+ * escape a single walk-wide visited set allowed, since an array passes its
+ * inherited name down to its elements and so a credential aliased under both
+ * `notes` and `accessToken` was inspected only under `notes`.
+ *
+ * **Widen this key with any rule that reads `name` more finely.** A rule that
+ * distinguished `password` from `apiKey`, or that looked at a grandparent key,
+ * would make three or more classes out of these two, and a subtree inspected
+ * under `plain` would then skip it on the path where it applied — the same
+ * defect, one rule along. `sensitive-header` reads a name too but not through
+ * here: {@link checkDeniedHeader} is applied by the parent before the member is
+ * walked at all, so it runs on every path to an aliased value whatever the memo
+ * says.
+ */
+type NameContext = 'credential-like' | 'plain';
+
+/**
+ * Classifies one enclosing field name into its {@link NameContext}.
+ *
+ * A named function rather than a raw boolean in the memo key, so the two states
+ * read as what they are at the call site and so the invariant above has one
+ * place to be documented and one place to be widened.
+ *
+ * @param name - The nearest enclosing object key, or the empty string at a root.
+ */
+function nameContext(name: string): NameContext {
+  return isKeyLikeName(name) ? 'credential-like' : 'plain';
+}
+
 /** The four bounds of one walk, resolved from options and defaults. */
 interface WalkLimits {
   readonly maxDepth: number;
@@ -1168,8 +1222,17 @@ interface WalkState {
   readonly findings: RedactGuardFinding[];
   /** `ruleId` and `path`, joined, so one class is reported once per field. */
   readonly reported: Set<string>;
-  /** Objects already walked, so a cycle is skipped rather than followed. */
-  readonly visited: WeakSet<object>;
+  /**
+   * Which {@link NameContext}s each object has already been inspected under, so
+   * a cycle terminates while an alias is still re-inspected wherever the
+   * verdict could differ.
+   *
+   * Keyed on the object **and** its context rather than on the object alone:
+   * see {@link nameContext} for the invariant that makes the pair the right key
+   * and a bare object the wrong one. A `WeakMap` because the guard must not
+   * keep an inspected payload alive.
+   */
+  readonly inspectedUnder: WeakMap<object, Set<NameContext>>;
   readonly limitsReached: Set<RedactGuardLimitId>;
   nodes: number;
   /** Set once a walk-wide budget is gone: no further node is visited. */
@@ -1240,7 +1303,7 @@ function createState(options: RedactGuardOptions | undefined): WalkState {
     logger,
     findings: [],
     reported: new Set(),
-    visited: new WeakSet(),
+    inspectedUnder: new WeakMap(),
     limitsReached: new Set(),
     nodes: 0,
     exhausted: false,
@@ -1386,9 +1449,24 @@ function checkDeniedHeader(state: WalkState, value: unknown, path: string): void
  *
  * What is skipped, and why none of it is a hole:
  *
- * - **A revisited object.** A `WeakSet` of visited objects makes a cycle — or a
- *   value shared between two fields — a skip rather than an infinite descent.
- *   The first visit inspected it.
+ * - **An object already inspected under this name context.** A cycle — or a
+ *   value shared between two fields — is a skip rather than an infinite
+ *   descent, because a subtree already inspected under this
+ *   {@link NameContext} can raise nothing new under it. The memo is keyed on
+ *   the *pair*: an alias first reached under a benign name **is** descended
+ *   into again under a credential-like one, since that is the path where
+ *   `high-entropy-secret` applies, and skipping it was how a credential under
+ *   `accessToken` escaped the last gate before the network. An aliased subtree
+ *   that matches under both contexts is therefore reported at both of its
+ *   paths, which is the honest answer: the value really is reachable at each.
+ *
+ *   This memo is the *only* cycle detection here, and it is sufficient. Each
+ *   `(object, context)` pair is entered at most once and {@link nameContext}
+ *   has exactly two values, so every descent is finite and a cycle terminates
+ *   on the second class just as it did on the first. The price is bounded at
+ *   two traversals per object however many names alias it — `apiKey` and
+ *   `accessToken` are one class, not two — so `maxNodes` and `maxDepth` still
+ *   bound the walk and neither was widened to pay for it.
  * - **A non-object, non-string value.** A number, a boolean, `null`,
  *   `undefined`, a symbol and a function cannot carry a credential into a
  *   request: the first four have no room for one and the last two are not
@@ -1420,10 +1498,15 @@ function walk(state: WalkState, value: unknown, path: string, depth: number, nam
   if (typeof value !== 'object' || value === null) {
     return;
   }
-  if (state.visited.has(value)) {
+  const context = nameContext(name);
+  let contexts = state.inspectedUnder.get(value);
+  if (contexts === undefined) {
+    contexts = new Set<NameContext>();
+    state.inspectedUnder.set(value, contexts);
+  } else if (contexts.has(context)) {
     return;
   }
-  state.visited.add(value);
+  contexts.add(context);
   if (isOpaqueObject(value)) {
     return;
   }
@@ -1661,9 +1744,10 @@ function metadataDetails(request: ModelRequest): Record<string, unknown> {
  * prompt, every prior message's content and the structured context.
  *
  * One {@link WalkState} across all four is what makes it one pass — the node
- * budget, the finding cap, the cycle set and the reported set are shared — so a
- * request cannot spend four budgets, and a value shared between the prose and
- * the context is inspected once.
+ * budget, the finding cap, the revisit memo and the reported set are shared —
+ * so a request cannot spend four budgets, and a value shared between the prose
+ * and the context is inspected once per {@link NameContext} rather than once
+ * per field that reaches it.
  *
  * Each field is walked under its own root path, so a finding says which half of
  * the dual payload it came from: `'system'`, `'prompt'`, `'messages[0].content'`

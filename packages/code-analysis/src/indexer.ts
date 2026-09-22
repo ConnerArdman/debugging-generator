@@ -15,15 +15,26 @@
  * ## The stages
  *
  * ```text
- * ./project.ts        openProject         → a ts-morph program over the project's own files
- * this module         prepareFiles        → the indexable set, capped, with one fingerprint each
- * ./cache.ts          load                → a hit ends the pipeline here
- * ./extractors/*.ts   extract(ctx)        → nodes, edges and diagnostics, per file
- * this module         assemble            → the CodeIndex envelope
- * ./graph/graph.ts    CodeGraph.fromIndex → validation, de-duplication, canonical order
- * ./route-map.ts      buildRouteMap       → the URL→module map that rides along
- * ./cache.ts          save                → best effort, never load-bearing
+ * ./project.ts        discoverProjectFiles → the screened path set; no program, nothing read
+ * this module         prepareFingerprints  → one fingerprint per path — the cache key's input
+ * ./cache.ts          load                 → a hit ends the pipeline here, with no program built
+ * ./project.ts        openProject          → a ts-morph program over the discovered files
+ * this module         prepareFiles         → the indexable set, capped, with one fingerprint each
+ * ./extractors/*.ts   extract(ctx)         → nodes, edges and diagnostics, per file
+ * this module         assemble             → the CodeIndex envelope
+ * ./graph/graph.ts    CodeGraph.fromIndex  → validation, de-duplication, canonical order
+ * ./route-map.ts      buildRouteMap        → the URL→module map that rides along
+ * ./cache.ts          save                 → best effort, never load-bearing
  * ```
+ *
+ * The first three stages exist so that the fourth can be skipped: constructing
+ * the program is what indexing a real application actually costs, so the cache
+ * is consulted from a *discovery* — a directory walk and one `stat` per file —
+ * rather than from a loaded project. A caller that supplies its own
+ * {@link IndexProjectOptions.loaded} handle has already paid for the program
+ * and skips the first stage instead, fingerprinting the handle's file set with
+ * `prepareFiles`; both orders derive the key through one function, so an entry
+ * saved by either is found by either.
  *
  * The envelope this module returns is `graph.toIndex()` rather than the one it
  * assembled, which is the contract `./graph/graph.ts` documents: construction
@@ -117,7 +128,7 @@ import { serverFunctionsExtractor } from './extractors/server-functions.js';
 import { symbolsExtractor } from './extractors/symbols.js';
 import { CodeGraph } from './graph/graph.js';
 import { CODE_INDEX_SCHEMA_VERSION } from './graph/types.js';
-import { openProject } from './project.js';
+import { discoverProjectFiles, openProject } from './project.js';
 import { buildRouteMap, routeMapFromIndex } from './route-map.js';
 
 import type { Logger, Result, SourceLocation } from '@debuggen/shared';
@@ -135,7 +146,7 @@ import type {
   ReferenceQuery,
   ReferenceResolver,
 } from './graph/types.js';
-import type { LoadedProject } from './project.js';
+import type { DiscoveredProject, LoadedProject } from './project.js';
 import type { RouteMap } from './route-map.js';
 
 /* -------------------------------------------------------------------------------------------------
@@ -276,9 +287,11 @@ export interface IndexProjectOptions {
    * opened.
    *
    * Required even when {@link IndexProjectOptions.loaded} is supplied, because
-   * it is what a caller's own configuration names; the value that reaches the
-   * index and the cache key is always `LoadedProject.projectRoot`, which
-   * `./project.ts` normalised.
+   * it is what a caller's own configuration names. The value that reaches the
+   * index and the cache key is never this string but always the one
+   * `./project.ts` normalised — `LoadedProject.projectRoot`, or the identical
+   * `DiscoveredProject.projectRoot` on the path that consults the cache before
+   * opening anything.
    */
   readonly projectRoot: string;
 
@@ -286,8 +299,9 @@ export interface IndexProjectOptions {
    * The TypeScript configuration to take compiler options from, when the
    * project's own `tsconfig.json` is not the one in force.
    *
-   * Passed through to `openProject`, and part of the cache key, because it
-   * decides which specifiers resolve — `paths` aliases above all — and
+   * Passed through to `./project.ts` — to `discoverProjectFiles` and to
+   * `openProject`, which resolve it identically — and part of the cache key,
+   * because it decides which specifiers resolve (`paths` aliases above all) and
    * therefore which edges the graph ends up holding.
    */
   readonly tsConfigFilePath?: string | undefined;
@@ -299,6 +313,11 @@ export interface IndexProjectOptions {
    * reference resolver, a route map, a second index with different options —
    * because constructing the ts-morph program is the expensive part of an
    * index and there is no reason to pay for it twice.
+   *
+   * Supplying a handle also decides the order of the stages: the program exists
+   * already, so its file set is prepared first and the cache is consulted from
+   * that, rather than from a discovery taken before anything is parsed. The key
+   * is the same either way; see {@link indexProject}.
    */
   readonly loaded?: LoadedProject | undefined;
 
@@ -327,10 +346,20 @@ export interface IndexProjectOptions {
   /**
    * The extractors to run. Defaults to {@link DEFAULT_EXTRACTORS}.
    *
-   * A subset narrows an index deliberately; an extra entry extends it. Note
-   * that the set is *not* part of the cache key, so a caller that narrows the
-   * extractors and caches the result would serve that narrow index to a later
-   * full request — pass `cache: false` alongside a non-default set.
+   * A subset narrows an index deliberately; an extra entry extends it. The
+   * identities of this set — every {@link Extractor.id}, in the order given —
+   * are **part of the cache key**, so a narrowed or extended run has its own
+   * cache entry and can neither be served to a request that wanted the full
+   * index nor be displaced by one. Caching a deliberately narrow run is
+   * therefore safe and needs no `cache: false` alongside it.
+   *
+   * Two consequences worth knowing. The *order* counts, for the reason given
+   * on {@link DEFAULT_EXTRACTORS}: it decides which claimant of a duplicate id
+   * graph construction keeps, so the same extractors in another order are
+   * another index and another key. And an `id` is an identity contract — a
+   * caller's own extractor that reuses an id from this package shares that
+   * package's key space, which {@link INDEXER_VERSION} only covers for
+   * extractors that ship here.
    */
   readonly extractors?: readonly Extractor[] | undefined;
 
@@ -529,19 +558,21 @@ interface PreparedFile {
 }
 
 /**
- * The outcome of the preparation stage: the indexable set and what deciding it
- * cost.
+ * What deciding the indexable set produced, without reference to whether those
+ * files have been parsed: the cache key's input, and the diagnostics that
+ * describe how the set was arrived at.
  *
- * Preparation is what *defines* the indexable set — a file whose metadata could
- * not be read is dropped from both the fingerprint list and the extraction
- * loop, because an index that claimed to cover a file it could not even stat
- * would key a cache entry against a state that no longer exists.
+ * Both of {@link indexProject}'s cache paths hold one of these — the cache-first
+ * path from {@link prepareFingerprints} over a discovery, the
+ * already-opened-project path from {@link prepareFiles} over a program — which
+ * is what lets the key derivation, the hit result and the statistics be written
+ * once instead of once per path.
  */
-interface PreparedFiles {
-  /** The files to index, sorted ascending by project-relative path. */
-  readonly entries: readonly PreparedFile[];
-
-  /** Their fingerprints, in the same order — the cache key's input. */
+interface PreparedFingerprints {
+  /**
+   * One fingerprint per file of the indexable set, sorted ascending by
+   * project-relative path — the cache key's input.
+   */
   readonly fingerprints: readonly FileFingerprint[];
 
   /** What preparation found out; carried into the index's diagnostics. */
@@ -556,6 +587,23 @@ interface PreparedFiles {
    * The reason a truncated index is never written to the cache.
    */
   readonly truncated: boolean;
+}
+
+/**
+ * The outcome of the preparation stage: the indexable set and what deciding it
+ * cost.
+ *
+ * Preparation is what *defines* the indexable set — a file whose metadata could
+ * not be read is dropped from both the fingerprint list and the extraction
+ * loop, because an index that claimed to cover a file it could not even stat
+ * would key a cache entry against a state that no longer exists.
+ */
+interface PreparedFiles extends PreparedFingerprints {
+  /**
+   * The files to index, sorted ascending by project-relative path and in the
+   * same order as {@link PreparedFingerprints.fingerprints}.
+   */
+  readonly entries: readonly PreparedFile[];
 }
 
 /** The outcome of the extraction and assembly stages. */
@@ -890,6 +938,107 @@ async function prepareFiles(
   });
 }
 
+/**
+ * Fingerprints a *discovered* file set — the same decision {@link prepareFiles}
+ * makes, taken before there is a program to make it from.
+ *
+ * This is what lets the cache be consulted first. `./project.ts`'s
+ * `discoverProjectFiles` establishes which files the indexer is willing to read
+ * without constructing a ts-morph program, and this function reduces that list
+ * to the fingerprints the cache key is derived from, so a hit costs a directory
+ * walk and one `stat` per file instead of a full parse of the project.
+ *
+ * It mirrors {@link prepareFiles} deliberately and in every detail that can
+ * affect the key: the `maxFiles` bound is applied as a prefix of the same
+ * sorted order, the same {@link fingerprintOf} takes the same metadata (and the
+ * same optional digest), a file whose path is unusable or whose metadata cannot
+ * be read produces the same {@link fileSkipped} diagnostic and increments the
+ * same counter, truncation produces the same {@link limitReached} diagnostic
+ * and the same `warn`, and cancellation is checked at the same two places. Any
+ * divergence between the two would show up as a cache that never hits — one
+ * path would save under a key the other never computes — which is why they are
+ * written against the same helpers rather than merely to the same description.
+ *
+ * No abstract syntax tree is walked and no file is opened unless
+ * `hashContents` was asked for.
+ *
+ * @param discovered The screened file set from `discoverProjectFiles`.
+ * @param options The resolved pipeline options.
+ * @returns The fingerprints and what deciding them found out, or `Err` when the
+ * run was cancelled.
+ */
+async function prepareFingerprints(
+  discovered: DiscoveredProject,
+  options: PipelineOptions,
+): Promise<Result<PreparedFingerprints>> {
+  const cancelled = abortedError(options.signal);
+  if (cancelled !== undefined) {
+    return err(cancelled);
+  }
+
+  const all = discovered.files;
+  const limit =
+    options.maxFiles === undefined ? undefined : Math.max(Math.trunc(options.maxFiles), 0);
+  const truncated = limit !== undefined && all.length > limit;
+  const selected = limit === undefined ? all : all.slice(0, limit);
+
+  const diagnostics: IndexDiagnostic[] = [];
+  const fingerprints: FileFingerprint[] = [];
+  let skippedFiles = 0;
+
+  if (truncated) {
+    skippedFiles += all.length - selected.length;
+    diagnostics.push(limitReached(all.length, selected.length));
+    options.logger.warn('the code index was truncated by a file limit', {
+      total: all.length,
+      indexed: selected.length,
+    });
+  }
+
+  for (const [index, absolutePath] of selected.entries()) {
+    const aborted = abortedError(options.signal);
+    if (aborted !== undefined) {
+      return err(aborted);
+    }
+
+    // The discovery states that the two lists are the same length and in the
+    // same order; reading the relative path by index rather than deriving it
+    // again keeps this function free of path arithmetic, and the `undefined`
+    // case — which a hand-built discovery could produce — is the same "no
+    // usable project-relative path" outcome `prepareFiles` reports.
+    const file = discovered.relativeFiles[index];
+
+    if (file === undefined || !isSafeRelativePath(file)) {
+      skippedFiles += 1;
+      diagnostics.push(fileSkipped(undefined, 'outside-project'));
+      continue;
+    }
+
+    const fingerprint = await fingerprintOf(absolutePath, file, options.hashContents);
+
+    if (isErr(fingerprint)) {
+      skippedFiles += 1;
+      diagnostics.push(fileSkipped(file, fingerprint.error));
+      continue;
+    }
+
+    fingerprints.push(fingerprint.value);
+  }
+
+  // Sorted here as well as in the discovery, for the reason `prepareFiles`
+  // sorts its own entries: the order is part of what the key is derived from
+  // and of what a built index records, so it is established by this module
+  // rather than trusted from its input.
+  fingerprints.sort((left, right) => compareStrings(left.file, right.file));
+
+  return ok({
+    fingerprints: fingerprints.length === 0 ? EMPTY_FINGERPRINTS : Object.freeze(fingerprints),
+    diagnostics: diagnostics.length === 0 ? EMPTY_DIAGNOSTICS : Object.freeze(diagnostics),
+    skippedFiles,
+    truncated,
+  });
+}
+
 /* -------------------------------------------------------------------------------------------------
  * Stage 2: extraction and assembly
  * ---------------------------------------------------------------------------------------------- */
@@ -1170,6 +1319,43 @@ async function runPipeline(
  * ---------------------------------------------------------------------------------------------- */
 
 /**
+ * The cache key for one run: the single definition both of
+ * {@link indexProject}'s cache paths use.
+ *
+ * It exists as a function rather than as two call sites because the two paths
+ * reach the key from different places — one from the discovered path set
+ * before any file is parsed, the other from an already-opened project's
+ * prepared file set — and a key computed two ways is a key that can drift, at
+ * which point a save and the next run's lookup stop agreeing and the cache
+ * never hits. Everything the key covers is passed here and nothing is decided
+ * here, so the two paths differ only in the values they hold.
+ *
+ * The extractor identities are contributed **in run order** and are not
+ * sorted; `./cache.ts` explains why on `IndexCacheKeyInput.extractors`, and
+ * {@link DEFAULT_EXTRACTORS} explains what the order decides.
+ *
+ * @param projectRoot The project root as `./project.ts` normalised it.
+ * @param tsConfigFilePath The configuration in force, or `undefined`.
+ * @param extractors The extractors this run will use, in order.
+ * @param files The fingerprints of the file set the run covers.
+ * @returns The key, 64 lowercase hexadecimal characters.
+ */
+function indexCacheKeyFor(
+  projectRoot: string,
+  tsConfigFilePath: string | undefined,
+  extractors: readonly Extractor[],
+  files: readonly FileFingerprint[],
+): string {
+  return computeIndexCacheKey({
+    projectRoot,
+    tsConfigFilePath,
+    indexerVersion: INDEXER_VERSION,
+    extractors: extractors.map((extractor) => extractor.id),
+    files,
+  });
+}
+
+/**
  * Reads a cache entry, or `undefined` for anything that is not a usable hit.
  *
  * `./cache.ts` already treats an absent, unparsable, stale or unsafe entry as a
@@ -1187,16 +1373,22 @@ async function runPipeline(
  * Log fields are counts, the key digest and booleans — never a project path,
  * for the reason `IndexCacheOptions.logger` gives.
  *
+ * The project is identified by its **root** rather than by an opened handle,
+ * because the whole point of consulting the cache is to find out whether a
+ * handle has to be built at all: on the cache-first path there is no
+ * `LoadedProject` yet, only the normalised root the discovery established — and
+ * that is the one field the check below ever needed.
+ *
  * @param cache The cache to read.
  * @param key The key from {@link computeIndexCacheKey}.
- * @param loaded The opened project the entry must describe.
+ * @param projectRoot The normalised project root the entry must describe.
  * @param logger Where the hit and miss lines go.
  * @returns The cached index, or `undefined`.
  */
 async function loadFromCache(
   cache: IndexCache,
   key: string,
-  loaded: LoadedProject,
+  projectRoot: string,
   logger: Logger,
 ): Promise<CodeIndex | undefined> {
   let entry: CodeIndex | undefined;
@@ -1215,12 +1407,12 @@ async function loadFromCache(
     return undefined;
   }
 
-  if (entry.projectRoot !== loaded.projectRoot || entry.indexerVersion !== INDEXER_VERSION) {
+  if (entry.projectRoot !== projectRoot || entry.indexerVersion !== INDEXER_VERSION) {
     logger.warn(
       'a cached code index described a different project or indexer version; ignoring it',
       {
         key,
-        sameProjectRoot: entry.projectRoot === loaded.projectRoot,
+        sameProjectRoot: entry.projectRoot === projectRoot,
         sameIndexerVersion: entry.indexerVersion === INDEXER_VERSION,
       },
     );
@@ -1235,6 +1427,68 @@ async function loadFromCache(
   });
 
   return entry;
+}
+
+/**
+ * The {@link IndexResult} of a cache hit: the stored index, the two views
+ * rebuilt from it, and this run's statistics.
+ *
+ * One definition for both of {@link indexProject}'s cache paths, so a hit is
+ * the same answer whether the caller supplied a project handle or not — and so
+ * that the invariant this function embodies cannot be broken on one path only:
+ * **nothing here needs a program.** The graph comes from the stored envelope,
+ * the route map comes from the graph's index (`buildRouteMap` is the
+ * compiler-backed variant and is not reachable from here), and
+ * {@link IndexStats.extractorDurations} is {@link EMPTY_DURATIONS} because no
+ * extractor ran.
+ *
+ * The returned index is `graph.toIndex()` rather than the stored envelope, for
+ * the reason the module documentation gives: construction is where a duplicate
+ * id, a dangling edge or an unknown kind is found, and a caller must hold what
+ * construction validated rather than what was on disk.
+ *
+ * @param entry The index the cache returned.
+ * @param preparation This run's own preparation outcome, for the diagnostics
+ * and the skipped-file count.
+ * @param startedAt The `performance.now()` reading the run began at.
+ * @param logger Where the one `info` line goes.
+ * @returns The result to hand back with `fromCache: true`.
+ */
+function cacheHitResult(
+  entry: CodeIndex,
+  preparation: PreparedFingerprints,
+  startedAt: number,
+  logger: Logger,
+): IndexResult {
+  const graph = CodeGraph.fromIndex(entry, { logger });
+  const index = graph.toIndex();
+
+  // This run's own preparation findings are not in the stored envelope — they
+  // describe the state of the tree now — so they lead, followed by everything
+  // the cached index and its construction reported.
+  const diagnostics =
+    preparation.diagnostics.length === 0
+      ? graph.diagnostics
+      : Object.freeze([...preparation.diagnostics, ...graph.diagnostics]);
+
+  const stats: IndexStats = {
+    fileCount: index.files.length,
+    nodeCount: graph.size.nodes,
+    edgeCount: graph.size.edges,
+    durationMs: roundMs(performance.now() - startedAt, 3),
+    extractorDurations: EMPTY_DURATIONS,
+    skippedFiles: preparation.skippedFiles,
+    diagnostics,
+  };
+
+  logger.info('code index served from cache', {
+    files: stats.fileCount,
+    nodes: stats.nodeCount,
+    edges: stats.edgeCount,
+    durationMs: stats.durationMs,
+  });
+
+  return { index, graph, routeMap: routeMapFromIndex(index), fromCache: true, stats };
 }
 
 /**
@@ -1315,6 +1569,7 @@ async function saveToCache(
  *   projectRoot: loaded.projectRoot,
  *   tsConfigFilePath: loaded.tsConfigFilePath,
  *   indexerVersion: INDEXER_VERSION,
+ *   extractors: DEFAULT_EXTRACTORS.map((extractor) => extractor.id),
  *   files,
  * });
  * ```
@@ -1386,24 +1641,48 @@ export async function buildIndex(
  *
  * ## What it does, in order
  *
- * The project is opened (or the supplied handle is used), the indexable set is
- * decided and fingerprinted, and — when a cache was given — the key is computed
- * and looked up. A hit rebuilds the graph and the route map from the stored
- * index and returns with `fromCache: true`, having parsed nothing and run no
- * extractor. A miss runs every extractor over every prepared file, assembles
- * the envelope, builds the graph, derives the route map with the compiler and
- * writes the entry back.
+ * **With a cache and no supplied handle** — the local service's path — the
+ * project's files are *discovered*: the tree is walked, every candidate is
+ * screened, each survivor is fingerprinted, the key is computed and the cache
+ * is consulted. All of that is `readdir`, `realpath` and `stat`; no ts-morph
+ * program exists yet. A hit rebuilds the graph and the route map from the
+ * stored index and returns with `fromCache: true`, having **constructed no
+ * program, parsed nothing and run no extractor**. A miss opens the project —
+ * handing over the discovery, so the tree is not walked twice — prepares the
+ * file set from the program, runs every extractor over every prepared file,
+ * assembles the envelope, builds the graph, derives the route map with the
+ * compiler and writes the entry back under the key already computed.
+ *
+ * **With a supplied {@link IndexProjectOptions.loaded} handle** the program is
+ * already paid for, so there is nothing to defer: the file set is prepared from
+ * the handle, then the key is computed and looked up, then a hit or a build
+ * follows exactly as above. **With no cache** the lookup is simply absent.
+ *
+ * Every path derives its key through the same function over the project's
+ * identity, the extractor identities and the fingerprints of the file set it
+ * holds, so an entry one path saved is an entry the next run finds from the
+ * other.
  *
  * ## What it reports as a failure
  *
- * Two things only: the project could not be opened (`openProject`'s `Err` is
- * propagated unchanged, so its code, hint and `details.reason` survive), or the
- * run was cancelled through {@link IndexProjectOptions.signal}. Everything
- * else degrades — a file that cannot be read, an extractor that throws, a cache
- * that cannot be read or written, a project with nothing indexable in it — and
- * is reported in {@link IndexStats.diagnostics} rather than as an error,
- * because a partial graph is what an investigation can still work with and an
- * error is not (AAP 0.5.5).
+ * Two things only: the project could not be opened, or the run was cancelled
+ * through {@link IndexProjectOptions.signal}. The first is propagated unchanged
+ * — from `discoverProjectFiles` on the cache-first path and from `openProject`
+ * otherwise, and the two report the same codes, hints and `details.reason`
+ * values for the same bad path, so which one answered is not observable.
+ * Everything else degrades — a file that cannot be read, an extractor that
+ * throws, a cache that cannot be read or written, a project with nothing
+ * indexable in it — and is reported in {@link IndexStats.diagnostics} rather
+ * than as an error, because a partial graph is what an investigation can still
+ * work with and an error is not (AAP 0.5.5).
+ *
+ * One consequence of consulting the cache first is worth stating: a
+ * configuration file that *exists but cannot be parsed* is a failure of
+ * building the program, so it is reported on a miss and not on a hit. A hit is
+ * an answer about a tree whose files are unchanged since an index was built
+ * from them, and the module's contract is that a hit ends the pipeline — the
+ * key covers the configuration's path, and an entry can only have been written
+ * by a run that parsed it successfully.
  *
  * ## Re-indexing
  *
@@ -1435,12 +1714,6 @@ export async function indexProject(options: IndexProjectOptions): Promise<Result
   const startedAt = performance.now();
   const logger = options.logger ?? noopLogger;
 
-  const resolved = resolveProject(options, logger);
-  if (isErr(resolved)) {
-    return resolved;
-  }
-  const loaded = resolved.value;
-
   const pipeline: PipelineOptions = {
     extractors: options.extractors ?? DEFAULT_EXTRACTORS,
     hashContents: options.hashContents ?? false,
@@ -1449,59 +1722,139 @@ export async function indexProject(options: IndexProjectOptions): Promise<Result
     logger,
   };
 
+  const cache = options.cache === false || options.cache === undefined ? undefined : options.cache;
+
+  // ── The cache-first path ──────────────────────────────────────────────────
+  // A cache to consult and no project handle to reuse: the only situation in
+  // which building the program *might* be avoidable, and therefore the only one
+  // that discovers and fingerprints before it decides.
+  if (cache !== undefined && options.loaded === undefined) {
+    const discovered = discoverProjectFiles({
+      projectRoot: options.projectRoot,
+      tsConfigFilePath: options.tsConfigFilePath,
+      logger,
+    });
+    if (isErr(discovered)) {
+      // Propagated unchanged: `discoverProjectFiles` reports exactly the
+      // failures `openProject` reports for the same inputs, so consulting the
+      // cache first cannot change what a caller is told about a bad path.
+      return discovered;
+    }
+
+    const fingerprinted = await prepareFingerprints(discovered.value, pipeline);
+    if (isErr(fingerprinted)) {
+      return fingerprinted;
+    }
+
+    const key = indexCacheKeyFor(
+      discovered.value.projectRoot,
+      discovered.value.tsConfigFilePath,
+      pipeline.extractors,
+      fingerprinted.value.fingerprints,
+    );
+
+    const entry = await loadFromCache(cache, key, discovered.value.projectRoot, logger);
+    if (entry !== undefined) {
+      // No `Project` has been constructed and no file has been parsed, which is
+      // the whole point of this path.
+      return ok(cacheHitResult(entry, fingerprinted.value, startedAt, logger));
+    }
+
+    // A miss: the program has to be built after all. The discovery already made
+    // is handed to `openProject`, so the tree is walked once per run rather
+    // than once per stage, and the entry is written under the key computed
+    // above — the same key the next run's discovery will compute for an
+    // unchanged tree.
+    const opened = resolveProject(options, logger, discovered.value);
+    if (isErr(opened)) {
+      return opened;
+    }
+
+    const prepared = await prepareFiles(opened.value, pipeline);
+    if (isErr(prepared)) {
+      return prepared;
+    }
+
+    return buildAndReport(opened.value, prepared.value, pipeline, { cache, key }, startedAt);
+  }
+
+  // ── The program-first path ────────────────────────────────────────────────
+  // Either the caller supplied the handle — the expensive stage is already paid
+  // for, so there is nothing to save by deferring it — or there is no cache to
+  // consult at all. Both keep the straight-line order: open, prepare, and
+  // (where there is a cache) look up.
+  const resolved = resolveProject(options, logger, undefined);
+  if (isErr(resolved)) {
+    return resolved;
+  }
+  const loaded = resolved.value;
+
   const prepared = await prepareFiles(loaded, pipeline);
   if (isErr(prepared)) {
     return prepared;
   }
 
-  const cache = options.cache === false || options.cache === undefined ? undefined : options.cache;
-  const key =
-    cache === undefined
-      ? undefined
-      : computeIndexCacheKey({
-          projectRoot: loaded.projectRoot,
-          tsConfigFilePath: loaded.tsConfigFilePath,
-          indexerVersion: INDEXER_VERSION,
-          files: prepared.value.fingerprints,
-        });
-
-  if (cache !== undefined && key !== undefined) {
-    const entry = await loadFromCache(cache, key, loaded, logger);
-
-    if (entry !== undefined) {
-      const graph = CodeGraph.fromIndex(entry, { logger });
-      const index = graph.toIndex();
-
-      // This run's own preparation findings are not in the stored envelope —
-      // they describe the state of the tree now — so they lead, followed by
-      // everything the cached index and its construction reported.
-      const diagnostics =
-        prepared.value.diagnostics.length === 0
-          ? graph.diagnostics
-          : Object.freeze([...prepared.value.diagnostics, ...graph.diagnostics]);
-
-      const stats: IndexStats = {
-        fileCount: index.files.length,
-        nodeCount: graph.size.nodes,
-        edgeCount: graph.size.edges,
-        durationMs: roundMs(performance.now() - startedAt, 3),
-        extractorDurations: EMPTY_DURATIONS,
-        skippedFiles: prepared.value.skippedFiles,
-        diagnostics,
-      };
-
-      logger.info('code index served from cache', {
-        files: stats.fileCount,
-        nodes: stats.nodeCount,
-        edges: stats.edgeCount,
-        durationMs: stats.durationMs,
-      });
-
-      return ok({ index, graph, routeMap: routeMapFromIndex(index), fromCache: true, stats });
-    }
+  if (cache === undefined) {
+    return buildAndReport(loaded, prepared.value, pipeline, undefined, startedAt);
   }
 
-  const built = extractAll(loaded, prepared.value, pipeline);
+  // The same key definition as the cache-first path, over the file set this
+  // path holds: `indexCacheKeyFor` is what keeps a save here reachable from a
+  // lookup there.
+  const key = indexCacheKeyFor(
+    loaded.projectRoot,
+    loaded.tsConfigFilePath,
+    pipeline.extractors,
+    prepared.value.fingerprints,
+  );
+
+  const entry = await loadFromCache(cache, key, loaded.projectRoot, logger);
+  if (entry !== undefined) {
+    return ok(cacheHitResult(entry, prepared.value, startedAt, logger));
+  }
+
+  return buildAndReport(loaded, prepared.value, pipeline, { cache, key }, startedAt);
+}
+
+/** Where a completed build should be written, when it should be written at all. */
+interface CacheWrite {
+  /** The cache to write to. */
+  readonly cache: IndexCache;
+
+  /** The key the entry belongs under — always one {@link indexCacheKeyFor} produced. */
+  readonly key: string;
+}
+
+/**
+ * Runs extraction over a prepared file set, derives the route map, writes the
+ * cache entry and reports the run: the tail both of {@link indexProject}'s
+ * paths finish through.
+ *
+ * One definition rather than one per path, so that a fresh index is the same
+ * answer however the run reached it — the same `graph.toIndex()` envelope, the
+ * same compiler-backed {@link buildRouteMap} (which is what gives a fresh route
+ * map its per-method positions), the same best-effort save, the same statistics
+ * and the same two log lines.
+ *
+ * @param loaded The opened project.
+ * @param prepared The indexable set from {@link prepareFiles}.
+ * @param pipeline The resolved pipeline options, including the logger.
+ * @param write The cache and key to store the index under, or `undefined` when
+ * the run is not caching.
+ * @param startedAt The `performance.now()` reading the run began at.
+ * @returns `Ok` with the built result, or extraction's `Err` for a cancelled
+ * run.
+ */
+async function buildAndReport(
+  loaded: LoadedProject,
+  prepared: PreparedFiles,
+  pipeline: PipelineOptions,
+  write: CacheWrite | undefined,
+  startedAt: number,
+): Promise<Result<IndexResult>> {
+  const { logger } = pipeline;
+
+  const built = extractAll(loaded, prepared, pipeline);
   if (isErr(built)) {
     return built;
   }
@@ -1509,8 +1862,8 @@ export async function indexProject(options: IndexProjectOptions): Promise<Result
   const { index, graph, extractorDurations, skippedFiles } = built.value;
   const routeMap = buildRouteMap(loaded, { logger });
 
-  if (cache !== undefined && key !== undefined) {
-    await saveToCache(cache, key, index, prepared.value.truncated, logger);
+  if (write !== undefined) {
+    await saveToCache(write.cache, write.key, index, prepared.truncated, logger);
   }
 
   const stats: IndexStats = {
@@ -1548,9 +1901,17 @@ export async function indexProject(options: IndexProjectOptions): Promise<Result
  *
  * @param options The caller's options.
  * @param logger The resolved logger, passed on to `openProject`.
+ * @param discovered The discovery this run has already made, when it has made
+ * one, so `openProject` does not repeat the directory walk. `openProject`
+ * screens every path in it regardless and ignores a discovery that does not
+ * describe the project being opened.
  * @returns The handle, or `openProject`'s failure.
  */
-function resolveProject(options: IndexProjectOptions, logger: Logger): Result<LoadedProject> {
+function resolveProject(
+  options: IndexProjectOptions,
+  logger: Logger,
+  discovered: DiscoveredProject | undefined,
+): Result<LoadedProject> {
   const { loaded } = options;
 
   if (loaded !== undefined) {
@@ -1570,6 +1931,7 @@ function resolveProject(options: IndexProjectOptions, logger: Logger): Result<Lo
   return openProject({
     projectRoot: options.projectRoot,
     tsConfigFilePath: options.tsConfigFilePath,
+    discovered,
     logger,
   });
 }

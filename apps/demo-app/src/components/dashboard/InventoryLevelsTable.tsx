@@ -24,11 +24,18 @@
  *
  * WHAT IT READS, AND WHAT IT CANNOT KNOW
  * `InventoryLevelRow` names its product by identifier only. The optional `products` prop is how a
- * row acquires a name, a code, a price and the catalog's derived selling state; a row whose product
- * is absent from it still renders, identified by the identifier it does carry, because a row a
- * reader cannot place is worse than a row with a plain name. That lookup is the one place
+ * row acquires a name, a code, a price and a category to group under; a row whose product is
+ * absent from it still renders, identified by the identifier it does carry, because a row a reader
+ * cannot place is worse than a row with a plain name. That lookup is the one place
  * `noUncheckedIndexedAccess` bites hardest, and it is handled by narrowing every time rather than
  * by asserting once.
+ *
+ * The selling state is deliberately *not* one of the things a row borrows from its product. A row
+ * carries the units available at its own location and the reorder point that location restocks it
+ * at, and the `threshold` prop carries the headroom the listing was read under, so the badge is
+ * derived from the line under the same rule the listing was filtered by. A product's own state is
+ * summed across every location and allows for no headroom, so using it here would badge a row the
+ * low-stock filter had just selected as "In stock".
  *
  * WHAT BELONGS TO SOMEONE ELSE
  *   - Surface: `ui/Card` owns background, border, radius, elevation and padding. This module's
@@ -218,20 +225,32 @@ function hrefForPage(basePath: string, carried: URLSearchParams, target: number)
 }
 
 /**
- * The selling state of one stock line.
+ * The selling state of one stock line, at this location and under the threshold in force.
  *
- * The line's own availability decides whether anything can be promised at this location, which is a
- * fact the row carries. The low-stock distinction is not: it needs a reorder point this row does
- * not hold, so it is taken from the catalog's derived state when the product is known and is never
- * guessed when it is not. `available` is expected to be finite - the caller prints a placeholder
- * instead of a badge when it is not.
+ * Every figure it reads belongs to the line: the units available at this location, and the reorder
+ * point that location restocks it at. That is the same rule the listing is filtered by - nothing
+ * available is out of stock, available units at or below the reorder point plus the reader's
+ * headroom are low, anything above that is in stock - so a row the low-stock filter selected is
+ * badged low. A product's own selling state cannot answer this question: it is summed across every
+ * location and measured against no headroom, so it would badge a location that has fallen to its
+ * point as in stock whenever the network as a whole has plenty.
+ *
+ * The two figures that arrive from a payload are folded through {@link finiteOr} for the same
+ * reason the paging arithmetic is - they answer a query string a reader can type by hand - and a
+ * negative reorder point or threshold narrows the low band to nothing rather than widening it.
+ * `available` is expected to be finite; the caller prints a placeholder instead of a badge when it
+ * is not.
  */
-function stockStateFor(available: number, product: ProductSummary | undefined): StockState {
+function stockStateFor(available: number, reorderPoint: number, threshold: number): StockState {
   if (available <= 0) {
     return 'OUT_OF_STOCK';
   }
 
-  return product?.stockState === 'LOW_STOCK' ? 'LOW_STOCK' : 'IN_STOCK';
+  const point =
+    Math.max(0, Math.trunc(finiteOr(reorderPoint, 0))) +
+    Math.max(0, Math.trunc(finiteOr(threshold, 0)));
+
+  return available <= point ? 'LOW_STOCK' : 'IN_STOCK';
 }
 
 /**
@@ -276,10 +295,23 @@ interface Props {
 
   /**
    * Catalog entries naming the products behind those lines, matched by `id`. Optional, and a row
-   * whose product is missing is rendered all the same: the name, code, unit price, category and
-   * derived selling state are the only things it goes without.
+   * whose product is missing is rendered all the same: the name, code, unit price and category are
+   * the only things it goes without. The selling state is not among them - a line carries the
+   * figures that classify it, so every row is badged whether or not its product is named.
    */
   products?: readonly ProductSummary[] | undefined;
+
+  /**
+   * The headroom above a line's reorder point that still counts as low, in units, exactly as the
+   * listing was read: `0` badges only the lines already at or under their point, and a larger
+   * figure badges the lines heading there too.
+   *
+   * It is required, and it is the threshold *in force* rather than a default of this component's
+   * own, because it is what makes the Stock column agree with the filter that produced the rows: a
+   * page read under a threshold of ten and badged under a threshold of zero would show "In stock"
+   * on every row a low-stock filter had just selected.
+   */
+  threshold: number;
 
   /**
    * The instant the page treats as "now", as an ISO-8601 UTC timestamp. Required, and required to
@@ -324,6 +356,7 @@ interface Props {
  * <InventoryLevelsTable
  *   levels={levels}
  *   products={catalog.items}
+ *   threshold={query.threshold}
  *   generatedAt={summary.generatedAt}
  *   referenceIso={renderedAt}
  *   query={search}
@@ -334,6 +367,7 @@ interface Props {
 export function InventoryLevelsTable({
   levels,
   products,
+  threshold,
   referenceIso,
   generatedAt,
   heading,
@@ -500,10 +534,13 @@ export function InventoryLevelsTable({
               /*
                * `null` is "this line's availability is not a number", which is the one case that
                * gets no badge: `formatQuantityLabel` already prints a placeholder for the figure,
-               * and a chip would have to assert a selling state the row cannot support.
+               * and a chip would have to assert a selling state the row cannot support. Everything
+               * else is decided by the line itself - its available units against its own reorder
+               * point, widened by the threshold the listing was read under - so the badge says
+               * what the filter above it means.
                */
               const state = Number.isFinite(available)
-                ? stockStateFor(available, line.product)
+                ? stockStateFor(available, line.row.reorderPoint, threshold)
                 : null;
 
               return (

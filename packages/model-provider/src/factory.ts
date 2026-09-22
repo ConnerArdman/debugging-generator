@@ -30,32 +30,40 @@
  *
  * ## Two boundaries, one sentence
  *
- * {@link modelUnavailableMessage} is defined here and imported by
- * `./providers/anthropic.js`, so a configuration this module refused and a
- * runtime refusal inside the provider show the developer the identical
- * sentence (AAP 0.5.5) and both suites can assert the same string.
+ * `modelUnavailableMessage` is declared once, in `./provider.js`, and imported
+ * both here and by `./providers/anthropic.js`, so a configuration this module
+ * refused and a runtime refusal inside the provider show the developer the
+ * identical sentence (AAP 0.5.5) and both suites can assert the same string.
  *
- * That import makes this module and `./providers/index.js` mutually dependent,
- * which is intended and safe under one rule this file keeps deliberately: **no
- * imported binding is read at module scope.** Every use of `PROVIDER_IDS`,
- * `isProviderId`, `createAnthropicProvider` and `createDeterministicProvider`
- * sits inside a function body, evaluated at call time, so whichever of the two
- * modules a bundle or a Node loader starts with, neither observes the other's
- * uninitialised binding. The list of valid provider ids a failure quotes is
- * consequently joined inside the error builder rather than cached in a
- * constant.
+ * It used to be declared *here*, which forced the implementation to import
+ * upward and closed the runtime cycle
+ * `factory → providers/index → providers/anthropic → factory`. That cycle is
+ * gone: the one import edge between this module and the provider folder now
+ * runs in a single direction, from here down to `./providers/index.js`, and
+ * `./provider.js` — a leaf that imports only types — holds the shared sentence
+ * both ends need. No module under `./providers/` imports this one.
+ *
+ * One habit from that arrangement is kept because it is worth keeping on its
+ * own merits rather than for load order: **no imported binding is read at
+ * module scope.** The list of valid provider ids a failure quotes is joined
+ * inside the error builder at call time rather than cached in a constant, so a
+ * provider added to `PROVIDER_IDS` updates the developer-facing wording with
+ * nothing to edit here.
  */
 
 import { DebuggenError, assertNever, andThen, err, ok } from '@debuggen/shared';
 import type { DebuggenErrorCode, Logger, Result } from '@debuggen/shared';
 import { z } from 'zod';
 
+import { modelUnavailableMessage } from './provider.js';
 import type { ModelProvider } from './provider.js';
 import {
+  ANTHROPIC_SUPPORTED_TEMPERATURE,
   PROVIDER_IDS,
   createAnthropicProvider,
   createDeterministicProvider,
   isProviderId,
+  resolveAnthropicTransportBudgets,
 } from './providers/index.js';
 import type { ProviderId } from './providers/index.js';
 import type { ModelProviderConfig } from './types.js';
@@ -99,30 +107,6 @@ const CREDENTIAL_VARIABLE = 'ANTHROPIC_API_KEY';
  * `./providers/index.js`, which declares the vocabulary and no policy.
  */
 export const DEFAULT_PROVIDER_ID = 'deterministic' satisfies ProviderId;
-
-/* -------------------------------------------------------------------------------------------------
- * The sentence both boundaries show
- * ---------------------------------------------------------------------------------------------- */
-
-/**
- * Builds the developer-facing sentence for a model provider that cannot be
- * used, in AAP 0.5.5's exact wording:
- *
- * > `Model provider unavailable (‹code›). Check ANTHROPIC_API_KEY or switch
- * > DEBUGGEN_PROVIDER.`
- *
- * The `code` argument is the condition being reported — by convention the
- * closed-vocabulary `DebuggenErrorCode` the failure carries, so the code a
- * user interface branches on and the code the sentence quotes cannot drift
- * apart. The sentence names only the *presence* of a credential and the
- * switch that avoids needing one; no credential value may ever be passed in.
- *
- * @param code The condition code to quote inside the sentence.
- * @returns The complete sentence, ready to be used as a `DebuggenError` message.
- */
-export function modelUnavailableMessage(code: string): string {
-  return `Model provider unavailable (${code}). Check ANTHROPIC_API_KEY or switch DEBUGGEN_PROVIDER.`;
-}
 
 /* -------------------------------------------------------------------------------------------------
  * Remediation text
@@ -231,11 +215,11 @@ function unrecognisedProviderError(source: SettingSource): DebuggenError {
 /**
  * The failure for a required setting the network-backed path did not receive.
  *
- * Its message is {@link modelUnavailableMessage} — AAP 0.5.5's sentence, in
- * the single definition both this module and `./providers/anthropic.js` use —
- * and the specific setting is named by the hint and by `details.setting`, so a
- * developer reads which of the two is missing without the message having to
- * vary.
+ * Its message is `modelUnavailableMessage` — AAP 0.5.5's sentence, in the
+ * single definition in `./provider.js` that both this module and
+ * `./providers/anthropic.js` import — and the specific setting is named by the
+ * hint and by `details.setting`, so a developer reads which of the two is
+ * missing without the message having to vary.
  *
  * @param variable The name of the absent environment variable.
  * @param condition This module's label for the failure.
@@ -302,12 +286,13 @@ function readSetting(
  * compile error here rather than a silently skipped check.
  *
  * The bounds mirror `./providers/anthropic.js`'s own predicates exactly — a
- * positive integer response bound, a non-negative sampling temperature, a
- * positive integer timeout in milliseconds, a non-negative integer retry
- * count — so this module never refuses a value the provider would accept, nor
- * passes one it would refuse. No upper ceiling is invented: an arbitrary
- * maximum here would reject a legitimate configuration the transport is
- * perfectly able to send.
+ * positive integer response bound, a sampling temperature of exactly
+ * {@link ANTHROPIC_SUPPORTED_TEMPERATURE}, a positive integer timeout in
+ * milliseconds, a non-negative integer retry count — so this module never
+ * refuses a value the provider would accept, nor passes one it would refuse.
+ * Other than the temperature, whose accepted value the messages API itself
+ * fixes, no upper ceiling is invented: an arbitrary maximum here would reject a
+ * legitimate configuration the transport is perfectly able to send.
  *
  * `z.coerce.number()` is what makes this a real boundary rather than a
  * formality. The declared type of an override is already `number`, but a host
@@ -319,7 +304,7 @@ function readSetting(
  */
 const NUMERIC_SCHEMAS = {
   maxTokens: z.coerce.number().int().positive(),
-  temperature: z.coerce.number().min(0),
+  temperature: z.coerce.number().refine((value) => value === ANTHROPIC_SUPPORTED_TEMPERATURE),
   timeoutMs: z.coerce.number().int().positive(),
   maxRetries: z.coerce.number().int().nonnegative(),
 } as const satisfies Readonly<Partial<Record<keyof ModelProviderConfig, z.ZodType<number>>>>;
@@ -330,7 +315,7 @@ type NumericField = keyof typeof NUMERIC_SCHEMAS;
 /** How each budget's requirement is worded to a developer. */
 const NUMERIC_EXPECTATIONS = {
   maxTokens: 'a positive integer number of tokens',
-  temperature: 'a non-negative finite number',
+  temperature: `exactly ${String(ANTHROPIC_SUPPORTED_TEMPERATURE)}: the field is deprecated and current models reject every other value`,
   timeoutMs: 'a positive integer number of milliseconds',
   maxRetries: 'a non-negative integer',
 } as const satisfies Readonly<Record<NumericField, string>>;
@@ -594,7 +579,10 @@ export interface CreateModelProviderOptions {
  * - `anthropic` — the network-backed provider. Both `DEBUGGEN_MODEL` and
  *   `ANTHROPIC_API_KEY` must be present; either one missing is a configuration
  *   failure reported before any call is attempted, carrying AAP 0.5.5's
- *   sentence.
+ *   sentence. Its per-request timeout and transport retry budget are always
+ *   explicit: a host that configured neither is given the product defaults
+ *   `./providers/anthropic.js` declares, never whichever bound the vendor's
+ *   software development kit happens to apply.
  *
  * Synchronous, so a host's startup stays straight-line, and **unmemoised**: no
  * module-scope cache holds a provider, so a rotated credential takes effect on
@@ -680,8 +668,19 @@ function constructProvider(
           ),
         );
       }
+      // The transport budgets are made explicit here rather than left to the
+      // software development kit's own defaults. No environment variable
+      // carries them and `apps/local-service`'s configuration module supplies
+      // neither, so without this the kit's blanket per-request timeout and
+      // retry count would govern how long a stage can hang — a decision this
+      // product would never have taken, applied silently. The values come from
+      // `./providers/anthropic.js`, which owns the transport and re-applies the
+      // same resolver to a configuration handed to it directly, so the two
+      // boundaries cannot disagree; a host that configured either budget keeps
+      // its own value.
+      const budgets = resolveAnthropicTransportBudgets(config);
       return createAnthropicProvider({
-        config,
+        config: { ...config, timeoutMs: budgets.timeoutMs, maxRetries: budgets.maxRetries },
         ...(logger === undefined ? {} : { logger }),
       });
     }

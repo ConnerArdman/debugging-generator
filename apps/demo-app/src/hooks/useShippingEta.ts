@@ -147,13 +147,39 @@ function freightQuoteNotice(code: StorefrontErrorCode, status: number): string {
  * leave as many carrier lookups in flight, and no answer for a superseded
  * destination can reach state - not even to report having been cut off.
  *
+ * The shipment is the second half of the question, and leaving it out is not a
+ * smaller version of asking: freight is charged per piece as well as per
+ * destination, so a lookup that names no unit count is answered for a shipment
+ * of one unit - a figure that understates every larger order, and understates
+ * it by more the larger the order is. `itemCount` is therefore what a caller
+ * quoting a cart passes, and it is the cart's unit count, because that is the
+ * figure `POST /api/checkout` rates the order's freight against. The lookup is
+ * keyed on it as well as on the destination, so a quantity change re-quotes
+ * exactly as a change of address does; a `null`, absent, non-finite or
+ * non-positive count is treated as no shipment description at all and left to
+ * the endpoint's own default.
+ *
  * @param postalCode Where the order is going, or `null` when nobody has said.
+ * @param itemCount How many units the shipment carries, or `null`/omitted
+ * where there is no shipment to describe yet.
  * @returns The quoted services, the in-flight flag and the failure wording.
  */
-export function useFreightQuote(postalCode: string | null): FreightQuoteState {
+export function useFreightQuote(
+  postalCode: string | null,
+  itemCount?: number | null,
+): FreightQuoteState {
   // The trimmed text is what the lookup is keyed on, so surrounding whitespace
   // a pasted or padded field carried does not read as a different destination.
   const destination = postalCode === null ? '' : postalCode.trim();
+
+  // A whole number of units, or `0` for "no shipment described". Floored rather
+  // than rounded, and guarded against a non-finite figure, so the key below is
+  // always a plain integer and the request either carries a usable count or
+  // carries none - never a fraction the endpoint would coerce.
+  const units =
+    itemCount === undefined || itemCount === null || !Number.isFinite(itemCount)
+      ? 0
+      : Math.max(0, Math.floor(itemCount));
 
   const [quote, setQuote] = useState<ShippingQuoteResult | null>(null);
   const [isQuoting, setIsQuoting] = useState<boolean>(false);
@@ -176,7 +202,13 @@ export function useFreightQuote(postalCode: string | null): FreightQuoteState {
     setIsQuoting(shouldQuote);
 
     if (shouldQuote) {
-      requestShippingQuote({ postalCode: destination, signal: controller.signal })
+      requestShippingQuote({
+        postalCode: destination,
+        // Sent only when there is a shipment to describe; otherwise the
+        // parameter is dropped and the endpoint rates its default single unit.
+        itemCount: units > 0 ? units : undefined,
+        signal: controller.signal,
+      })
         .then((result) => {
           if (controller.signal.aborted) {
             return;
@@ -200,7 +232,12 @@ export function useFreightQuote(postalCode: string | null): FreightQuoteState {
     return () => {
       controller.abort();
     };
-  }, [destination]);
+    // Both halves of the question, so a shipment that grew is re-quoted exactly
+    // as a corrected address is: the services on screen are cleared, the lookup
+    // for the previous shipment is aborted, and one lookup asks about what the
+    // customer is actually sending now. Two integers, so a re-render while
+    // neither has changed asks nothing further.
+  }, [destination, units]);
 
   return { quote, isQuoting, quoteError };
 }

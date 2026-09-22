@@ -73,6 +73,11 @@ const CART_ADDITION_UNKNOWN_LABEL =
  * and `'error'` a read or write that came back unhappy - which leaves the previously published
  * cart in place so the buyer keeps seeing what they had, except where the failure was read back
  * from the server, in which case what that read found is published and the wording stays with it.
+ *
+ * `'error'` states nothing about what the cart holds. Where the failure was the first read there
+ * was never a cart to leave in place, so {@link CartContextValue.lines} is empty for want of ever
+ * having been filled rather than because the cart is empty. A surface must not present an empty
+ * state while {@link CartContextValue.cartError} is non-null; see that member and `lines`.
  */
 export type CartSyncStatus = 'loading' | 'idle' | 'saving' | 'error';
 
@@ -108,7 +113,17 @@ export class CartAdditionError extends Error {
 
 /** The cart and its operations, as published on the context. */
 export interface CartContextValue {
-  /** The lines of the cart, in the order the server returned them. */
+  /**
+   * The lines of the cart, in the order the server returned them.
+   *
+   * An empty array is two different statements and {@link CartContextValue.cartError} is what
+   * tells them apart: with no failure published it is a cart the server answered with nothing in,
+   * and alongside a non-null `cartError` it is contents that could not be established - the read
+   * that would have filled this array is the one that failed. A surface must therefore not show an
+   * empty state, "your cart is empty" or otherwise, while a failure is published: an array nobody
+   * managed to fill is not a cart known to hold nothing, and the failure notice is what a buyer
+   * has to act on there.
+   */
   readonly lines: readonly CartLine[];
   /** Number of lines, which is what the cart drawer lists. */
   readonly lineCount: number;
@@ -124,7 +139,15 @@ export interface CartContextValue {
   readonly dispatchCountdownMs: number | null;
   /** Where the cart stands with the server; see {@link CartSyncStatus}. */
   readonly syncStatus: CartSyncStatus;
-  /** Wording for the last failure, or `null` when the cart is in step with the server. */
+  /**
+   * Wording for the last failure, or `null` when the cart is in step with the server.
+   *
+   * It is also what qualifies {@link CartContextValue.lines}, per that member: non-null, an empty
+   * `lines` means the contents are unknown rather than known to be nothing. Compare it against
+   * `null` rather than testing it for truthiness - a failure the server could only describe in an
+   * empty string is still a failure, and a surface that reads it as absent would go on to claim
+   * the cart is empty.
+   */
   readonly cartError: string | null;
   /**
    * Puts a quantity of one product into the cart, then publishes the cart the server answers.

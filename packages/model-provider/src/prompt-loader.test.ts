@@ -23,6 +23,19 @@
  * 3. **A missing prompt is an error, never a substitute.** Every failure is
  *    asserted by `DebuggenError` code, so a loader that started inventing a
  *    body — the one thing AAP 0.5.4 forbids — could not pass.
+ * 4. **Only a bounded, regular file is ever read.** The loader opens with
+ *    no-follow, non-blocking semantics and refuses anything that is not a
+ *    regular file no larger than its subject's ceiling, so the cases under
+ *    *the bounded read* plant a named pipe and a directory at a prompt path and
+ *    drive both ceilings from one byte either side. Those are the failures that
+ *    are invisible in a passing read: a loader that called `readFileSync`
+ *    answers identically for every well-formed file here and hangs forever on
+ *    the pipe.
+ * 5. **The prompts this product ships load.** The cases under *the shipped
+ *    prompt tree* read `apps/local-service/prompts` out of the checkout itself,
+ *    so a manifest that names a version no file provides — or a prompt whose
+ *    placeholders have drifted from the stage that renders it — fails here
+ *    rather than at the first stage of a developer's first session.
  *
  * ## How caching is observed without mocking the filesystem
  *
@@ -73,11 +86,23 @@
  *   file, which is the same rule the product source lives under (AAP 0.5.4).
  */
 
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
-import { isAbsolute, join } from 'node:path';
+import { dirname, isAbsolute, join, parse as parsePath } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 
 import {
   DEBUGGEN_ERROR_CODES,
@@ -218,6 +243,34 @@ const CAN_SYMLINK = ((): boolean => {
     return true;
   } catch {
     return false;
+  } finally {
+    rmSync(probe, { recursive: true, force: true });
+  }
+})();
+
+/**
+ * Creates a named pipe, the way a shell would.
+ *
+ * `node:fs` has no `mkfifo`, so the one portable way to plant a FIFO from a
+ * test is the POSIX utility. Failure is reported as `false` rather than thrown
+ * for the same reason {@link CAN_SYMLINK} exists: a Windows runner, an image
+ * without coreutils and a hardened sandbox must read as "this host cannot host
+ * the case", never as a loader defect.
+ */
+function tryMakeFifo(path: string): boolean {
+  try {
+    execFileSync('mkfifo', [path], { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Whether this host lets the test process create a named pipe at all. */
+const CAN_MKFIFO = ((): boolean => {
+  const probe = mkdtempSync(join(tmpdir(), 'debuggen-fifo-probe-'));
+  try {
+    return tryMakeFifo(join(probe, 'probe.fifo'));
   } finally {
     rmSync(probe, { recursive: true, force: true });
   }
@@ -581,7 +634,7 @@ describe('PromptLoader.load', () => {
       expect(prompt.value.stage).toBe('analyze');
       expect(prompt.value.version).toBe('v002');
       expect(prompt.value.path).toBe(join(promptsDir, 'analyze', 'v002.md'));
-      expect(prompt.value.body).toContain('v002');
+      expect(prompt.value.text).toContain('v002');
     }
   });
 
@@ -600,9 +653,30 @@ describe('PromptLoader.load', () => {
       // Inside the sandbox, and inside this stage's own directory.
       expect(isWithin(promptsDir, prompt.path)).toBe(true);
       expect(prompt.path).toBe(join(promptsDir, stage, 'v001.md'));
-      expect(prompt.body.length).toBeGreaterThan(0);
-      expect(prompt.body).toContain(stage);
+      expect(prompt.text.length).toBeGreaterThan(0);
+      expect(prompt.text).toContain(stage);
     }
+  });
+
+  it('publishes exactly stage, version and text, plus the diagnostic path', () => {
+    // The published shape itself, pinned by its own keys rather than by the
+    // members a case happens to read. The contract is `{ stage, version, text
+    // }` — `text` is the content a stage renders and `version` is what the
+    // session records as its provenance — with `path` as an additive
+    // diagnostic. A rename of the content member, or a second alias for it
+    // alongside (`body`, say, kept "for compatibility"), passes every other
+    // case in this file and fails here: one string with two names is how a
+    // caller ends up sending the stale one.
+    const promptsDir = seedPromptTree(join(createSandbox(), 'prompts'));
+
+    const prompt = valueOf(loaderFor(promptsDir).load('understand'));
+
+    expect(Object.keys(prompt).sort()).toEqual(['path', 'stage', 'text', 'version']);
+    expect(typeof prompt.text).toBe('string');
+    expect(Object.hasOwn(prompt, 'body')).toBe(false);
+    // Frozen, so a stage cannot edit the text of a prompt whose version it has
+    // already recorded on the session.
+    expect(Object.isFrozen(prompt)).toBe(true);
   });
 
   it('loads the current version even when a higher one sits beside it', () => {
@@ -619,7 +693,7 @@ describe('PromptLoader.load', () => {
     const prompt = valueOf(loaderFor(promptsDir).load('investigate'));
 
     expect(prompt.version).toBe('v001');
-    expect(prompt.body).toContain('revision v001');
+    expect(prompt.text).toContain('revision v001');
   });
 
   it('reports the missing stages when the manifest leaves one out', () => {
@@ -773,8 +847,8 @@ describe('PromptLoader.load', () => {
 
     expect(isOk(prompt)).toBe(true);
     if (isOk(prompt)) {
-      expect(prompt.value.body.startsWith('# plan')).toBe(true);
-      expect(prompt.value.body).toBe('# plan\n\nBody text.\n');
+      expect(prompt.value.text.startsWith('# plan')).toBe(true);
+      expect(prompt.value.text).toBe('# plan\n\nBody text.\n');
     }
   });
 
@@ -867,7 +941,7 @@ describe('PromptLoader.loadVersion', () => {
     // test touches. If this case ever fails, the reopen path is broken; do not
     // "fix" it by relaxing the assertion.
     expect(superseded.version).toBe('v001');
-    expect(superseded.body).toContain('revision v001');
+    expect(superseded.text).toContain('revision v001');
     expect(superseded.path).toBe(join(promptsDir, 'analyze', 'v001.md'));
     // The manifest's own answer is still the current version, unaffected.
     expect(valueOf(loader.load('analyze')).version).toBe('v003');
@@ -1141,6 +1215,178 @@ describe('the traversal guard', () => {
 
 /*
  * ---------------------------------------------------------------------------
+ * The bounded read
+ * ---------------------------------------------------------------------------
+ *
+ * The loader opens a resolved prompt path with no-follow, non-blocking
+ * semantics, requires `fstat` to report a regular file, and refuses a size
+ * above the subject's ceiling before it reads a byte. The cases below drive
+ * each of those decisions from the outside, because every one of them is
+ * invisible in a passing read: a loader that called `readFileSync` answers
+ * identically for every well-formed file in this suite and hangs forever on the
+ * first case here.
+ */
+
+/**
+ * The loader's two documented ceilings, restated.
+ *
+ * They are module constants rather than exports on purpose — a ceiling is not
+ * something a caller configures — so these cases pin the *behaviour* at the
+ * boundary instead of reading the numbers back. Restating them here is what
+ * makes a silent change to either one fail: the case that loads a body one byte
+ * under the prompt ceiling, and the case that refuses one byte over it, cannot
+ * both pass if the number moves.
+ */
+const PROMPT_BYTE_CEILING = 256 * 1024;
+const MANIFEST_BYTE_CEILING = 64 * 1024;
+
+/**
+ * A well-formed prompt body of exactly `bytes` bytes.
+ *
+ * ASCII only, so a character is a byte and the size a case asks for is the size
+ * on disk, and terminated with a single newline and no other trailing
+ * whitespace, so the loader's normalisation returns the string unchanged — which
+ * is what lets a case assert the loaded text byte for byte rather than merely
+ * asserting its length.
+ */
+function paddedPrompt(bytes: number): string {
+  const header = '# prompt\n\nInstructions for a stage.\n\n';
+  const padding = bytes - header.length - 1;
+  if (padding < 0) {
+    throw new Error(`A padded prompt needs at least ${header.length + 1} bytes.`);
+  }
+  return `${header}${'x'.repeat(padding)}\n`;
+}
+
+describe('the bounded read', () => {
+  it.skipIf(!CAN_MKFIFO)('refuses a named pipe at a prompt path instead of blocking on it', () => {
+    // THE OBSERVATION IS THAT THIS CASE RETURNS AT ALL. The pipe below has no
+    // writer and never gets one, so a blocking `open` — which is what
+    // `readFileSync` performs — never returns, and this case would fail by the
+    // runner's timeout with the whole file's worker stuck. It returns because
+    // the loader puts O_NONBLOCK in its flag word, and then refuses the pipe on
+    // its kind rather than on its contents, of which a pipe has none.
+    const promptsDir = seedPromptTree(join(createSandbox(), 'prompts'));
+    const promptPath = join(promptsDir, 'plan', 'v001.md');
+    rmSync(promptPath);
+    expect(tryMakeFifo(promptPath)).toBe(true);
+
+    const error = errorOf(loaderFor(promptsDir).load('plan'));
+
+    expect(error.code).toBe('CONFIG_INVALID');
+    expect(error.message).toContain('is a named pipe, not a file');
+    // The kind travels as a token a log line can group on, and the path as the
+    // one thing a developer needs in order to go and look.
+    expect(error.details?.kind).toBe('fifo');
+    expect(error.details?.path).toBe(promptPath);
+  });
+
+  it('refuses a stage directory in the file position on its kind', () => {
+    // A directory opens perfectly well read-only, so the kind check is what
+    // refuses this, not the open and not a failed read.
+    const promptsDir = join(createSandbox(), 'prompts');
+    seedPromptTree(promptsDir);
+    const promptPath = join(promptsDir, 'analyze', 'v001.md');
+    rmSync(promptPath);
+    mkdirSync(promptPath, { recursive: true });
+    writeFileSync(join(promptPath, 'inner.md'), '# not the prompt\n', 'utf8');
+
+    const error = errorOf(loaderFor(promptsDir).load('analyze'));
+
+    expect(error.code).toBe('CONFIG_INVALID');
+    expect(error.message).toContain('is a directory, not a file');
+    expect(error.details?.kind).toBe('directory');
+    expect(reportOf(error)).not.toContain('not the prompt');
+  });
+
+  it('refuses a prompt file one byte over the ceiling, and quotes none of it', () => {
+    const promptsDir = seedPromptTree(join(createSandbox(), 'prompts'));
+    const promptPath = join(promptsDir, 'understand', 'v001.md');
+    // A marker in the first bytes of the file: an implementation that read the
+    // file and then measured it would have the contents in hand at the moment
+    // it built this failure, and the assertions below are what stop them
+    // travelling into a log or across a process boundary.
+    const marker = 'MARKER-INSIDE-THE-OVERSIZED-FILE';
+    const oversized = `${marker}\n${'x'.repeat(PROMPT_BYTE_CEILING + 1 - marker.length - 2)}\n`;
+    expect(oversized.length).toBe(PROMPT_BYTE_CEILING + 1);
+    writeFileSync(promptPath, oversized, 'utf8');
+
+    const error = errorOf(loaderFor(promptsDir).load('understand'));
+
+    expect(error.code).toBe('CONFIG_INVALID');
+    expect(error.message).toContain('larger than the 256 KiB');
+    expect(error.details?.bytes).toBe(PROMPT_BYTE_CEILING + 1);
+    expect(error.details?.maxBytes).toBe(PROMPT_BYTE_CEILING);
+    expect(error.details?.path).toBe(promptPath);
+    const report = reportOf(error);
+    expect(report).not.toContain(marker);
+    expect(report).not.toContain('xxxx');
+  });
+
+  it('reads an ordinary prompt of a few kilobytes unchanged', () => {
+    const promptsDir = seedPromptTree(join(createSandbox(), 'prompts'));
+    const body = paddedPrompt(4 * 1024);
+    writeFileSync(join(promptsDir, 'investigate', 'v001.md'), body, 'utf8');
+
+    const prompt = valueOf(loaderFor(promptsDir).load('investigate'));
+
+    expect(prompt.text).toBe(body);
+    expect(prompt.text.length).toBe(4 * 1024);
+  });
+
+  it('reads a prompt one byte under the ceiling byte for byte', () => {
+    // The read is a loop over a descriptor, so a body this size is assembled
+    // from however many chunks the platform hands back. Byte-for-byte equality
+    // is what proves the loop neither truncates at the first short read nor
+    // repeats a chunk, and that the probe for a further byte does not consume
+    // one.
+    const promptsDir = seedPromptTree(join(createSandbox(), 'prompts'));
+    const body = paddedPrompt(PROMPT_BYTE_CEILING - 1);
+    writeFileSync(join(promptsDir, 'generate-panel', 'v001.md'), body, 'utf8');
+
+    const prompt = valueOf(loaderFor(promptsDir).load('generate-panel'));
+
+    expect(prompt.text).toBe(body);
+    expect(prompt.text.length).toBe(PROMPT_BYTE_CEILING - 1);
+  });
+
+  it('bounds the manifest separately from, and more tightly than, a prompt body', () => {
+    // One size, two answers: the two subjects are bounded for different
+    // reasons, and a single shared ceiling would have to be the larger of the
+    // two, which would leave the manifest effectively unbounded.
+    expect(MANIFEST_BYTE_CEILING).toBeLessThan(PROMPT_BYTE_CEILING);
+    const promptsDir = seedPromptTree(join(createSandbox(), 'prompts'));
+    const betweenTheCeilings = MANIFEST_BYTE_CEILING + 1;
+    const body = paddedPrompt(betweenTheCeilings);
+    writeFileSync(join(promptsDir, 'followup', 'v001.md'), body, 'utf8');
+
+    // Inside the prompt ceiling: it loads, and `loadVersion` reads no manifest,
+    // so this half is settled before the manifest below is rewritten.
+    expect(valueOf(loaderFor(promptsDir).loadVersion('followup', 'v001')).text).toBe(body);
+
+    // The same length at the manifest's path. The padding sits in a
+    // documentation key this repository's JSON convention allows and the
+    // manifest schema tolerates, so the file would parse if it were read — which
+    // is what makes the failure below about the ceiling and nothing else.
+    writeManifest(promptsDir, {
+      version: 1,
+      '// padding': 'x'.repeat(MANIFEST_BYTE_CEILING),
+      stages: Object.fromEntries(PROMPT_STAGES.map((stage) => [stage, { current: 'v001' }])),
+    });
+
+    const error = errorOf(loaderFor(promptsDir).load('followup'));
+
+    expect(error.code).toBe('CONFIG_INVALID');
+    expect(error.message).toBe('The prompt manifest is larger than the 64 KiB this loader reads.');
+    expect(error.message).not.toContain('not valid JSON');
+    expect(Number(error.details?.bytes)).toBeGreaterThan(MANIFEST_BYTE_CEILING);
+    expect(error.details?.maxBytes).toBe(MANIFEST_BYTE_CEILING);
+    expect(reportOf(error)).not.toContain('xxxx');
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
  * Caching
  * ---------------------------------------------------------------------------
  */
@@ -1160,9 +1406,9 @@ describe('caching', () => {
     writeFileSync(join(promptsDir, 'understand', 'v001.md'), '# rewritten\n', 'utf8');
     const second = loader.load('understand');
 
-    expect(isOk(first) ? first.value.body : '').toContain('Instructions for the understand stage');
-    expect(isOk(second) ? second.value.body : '').toBe(
-      isOk(first) ? first.value.body : 'different',
+    expect(isOk(first) ? first.value.text : '').toContain('Instructions for the understand stage');
+    expect(isOk(second) ? second.value.text : '').toBe(
+      isOk(first) ? first.value.text : 'different',
     );
   });
 
@@ -1175,7 +1421,7 @@ describe('caching', () => {
     loader.clearCache();
     const afterClear = loader.load('understand');
 
-    expect(isOk(afterClear) ? afterClear.value.body : '').toBe('# rewritten\n');
+    expect(isOk(afterClear) ? afterClear.value.text : '').toBe('# rewritten\n');
   });
 
   it('re-reads the manifest after clearCache, so a version bump is picked up', () => {
@@ -1208,7 +1454,7 @@ describe('caching', () => {
     writeFileSync(join(promptsDir, 'investigate', 'v001.md'), '# rewritten\n', 'utf8');
     const second = loader.load('investigate');
 
-    expect(isOk(second) ? second.value.body : '').toBe('# rewritten\n');
+    expect(isOk(second) ? second.value.text : '').toBe('# rewritten\n');
   });
 
   it('keeps one loader out of another loader\u2019s cache', () => {
@@ -1231,15 +1477,15 @@ describe('caching', () => {
     const fromFirst = valueOf(firstLoader.load('plan'));
     const fromSecond = valueOf(secondLoader.load('plan'));
 
-    expect(fromFirst.body).toBe('# plan from the first tree\n');
-    expect(fromSecond.body).toBe('# plan from the second tree\n');
+    expect(fromFirst.text).toBe('# plan from the first tree\n');
+    expect(fromSecond.text).toBe('# plan from the second tree\n');
     expect(fromFirst.path).toBe(join(first, 'plan', 'v001.md'));
     expect(fromSecond.path).toBe(join(second, 'plan', 'v001.md'));
 
     // Clearing one loader's cache leaves the other's intact.
     firstLoader.clearCache();
     writeFileSync(join(second, 'plan', 'v001.md'), '# rewritten\n', 'utf8');
-    expect(valueOf(secondLoader.load('plan')).body).toBe('# plan from the second tree\n');
+    expect(valueOf(secondLoader.load('plan')).text).toBe('# plan from the second tree\n');
   });
 
   it('does not cache failures, so a directory that appears later is picked up', () => {
@@ -1446,7 +1692,7 @@ describe('renderPrompt', () => {
     expect(error.code).toBe('INTERNAL');
   });
 
-  it('renders a body that came from the loader, and reports its unfilled tokens', () => {
+  it('renders a text that came from the loader, and reports its unfilled tokens', () => {
     // The seam the two halves of this module meet at: a stage loads its
     // versioned file and renders it. Both directions are asserted on the same
     // body, because the failure mode that matters is a prompt file and the code
@@ -1455,7 +1701,7 @@ describe('renderPrompt', () => {
     const loaded = valueOf(loaderFor(promptsDir).load('analyze'));
 
     const rendered = valueOf(
-      renderPrompt(loaded.body, {
+      renderPrompt(loaded.text, {
         schema: '{"type":"object"}',
         evidenceRule: 'every observed fact cites an event id',
       }),
@@ -1467,9 +1713,289 @@ describe('renderPrompt', () => {
     // The prompt's own text is untouched around the substitutions.
     expect(rendered).toContain('Instructions for the analyze stage, revision v001.');
 
-    const incomplete = errorOf(renderPrompt(loaded.body, { schema: '{"type":"object"}' }));
+    const incomplete = errorOf(renderPrompt(loaded.text, { schema: '{"type":"object"}' }));
 
     expect(incomplete.code).toBe('CONFIG_INVALID');
     expect(incomplete.details?.missingPlaceholders).toEqual(['evidenceRule']);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The shipped prompt tree
+ * ---------------------------------------------------------------------------
+ *
+ * Every case above this point runs against a tree it seeded itself under
+ * `mkdtemp`, which is what makes them hermetic — and what makes them blind to
+ * the one prompt tree this product actually ships. The manifest in
+ * `apps/local-service/prompts` pins a current version for all six stages, and a
+ * version it names with no file behind it is a `CONFIG_INVALID` at the first
+ * stage of a developer's first session, on a clean checkout, with every
+ * synthetic case still green.
+ *
+ * So the cases below read the checkout. They locate the workspace root, parse
+ * the real manifest with the schema the loader applies, load every current
+ * prompt through `createPromptLoader`, and render each one with the exact
+ * placeholder set its stage supplies. **They only read**: the shipped tree is
+ * an input here, and the fingerprint asserted around them proves none of them
+ * wrote into it.
+ */
+
+/**
+ * The directory holding `pnpm-workspace.yaml`, found by walking up from this
+ * file.
+ *
+ * Walked rather than computed: this file is compiled and run from several
+ * working directories (the package, the repository root under `vitest --root`,
+ * and a coverage run), so `process.cwd()` is not a fixed point, while this
+ * module's own URL always is.
+ *
+ * Failure **throws**, and that is deliberate: a case that cannot find the tree
+ * it is meant to be checking must fail loudly. Skipping instead would turn the
+ * one closure test in this suite into a silent no-op the day the layout
+ * changed, which is the failure mode it exists to prevent.
+ */
+function locateWorkspaceRoot(): string {
+  const start = dirname(fileURLToPath(import.meta.url));
+  const filesystemRoot = parsePath(start).root;
+  let directory = start;
+
+  for (;;) {
+    if (existsSync(join(directory, 'pnpm-workspace.yaml'))) {
+      return directory;
+    }
+    if (directory === filesystemRoot) {
+      throw new Error(
+        `No 'pnpm-workspace.yaml' was found between '${start}' and the filesystem root, so the ` +
+          'shipped prompt tree could not be located. Run this suite inside the repository.',
+      );
+    }
+    directory = dirname(directory);
+  }
+}
+
+/** The prompts directory this product ships, as an absolute real path. */
+const SHIPPED_PROMPTS_DIR = realpathSync(
+  join(locateWorkspaceRoot(), 'apps', 'local-service', 'prompts'),
+);
+
+/**
+ * The placeholders each shipped prompt is allowed to name.
+ *
+ * This table is the contract between a versioned prompt file and the stage that
+ * renders it, written out here so that a prompt edited to name a new input
+ * fails in this suite rather than at the stage: `renderPrompt` treats every
+ * token as a required key, so an unrecognised one is a `CONFIG_INVALID` on a
+ * live session. A prompt that stops naming one of these fails here too, which
+ * is the same drift seen from the other side.
+ */
+const SHIPPED_PLACEHOLDERS: Readonly<Record<PromptStage, readonly string[]>> = {
+  understand: ['question', 'target', 'currentUrl', 'projectSummary', 'outputSchema'],
+  investigate: [
+    'question',
+    'understanding',
+    'toolCatalog',
+    'queryResults',
+    'remainingQueries',
+    'outputSchema',
+  ],
+  plan: ['understanding', 'investigation', 'adapterCatalog', 'outputSchema'],
+  analyze: ['question', 'understanding', 'captureSummary', 'codeExcerpts', 'outputSchema'],
+  'generate-panel': ['question', 'analysis', 'nodeCatalog', 'captureOverview', 'outputSchema'],
+  followup: [
+    'followUpQuestion',
+    'understanding',
+    'plan',
+    'captureSummary',
+    'analysis',
+    'panel',
+    'outputSchema',
+  ],
+};
+
+/**
+ * Every `{{token}}` in a prompt, in the order it appears and with repeats kept.
+ *
+ * The pattern is the renderer's own grammar — `{{key}}` with optional
+ * whitespace inside the braces — so what this returns is exactly the set of
+ * keys `renderPrompt` will demand a value for.
+ */
+function tokensOf(text: string): string[] {
+  const tokens: string[] = [];
+  for (const match of text.matchAll(/\{\{\s*([A-Za-z0-9_.]+)\s*\}\}/g)) {
+    const key = match[1];
+    if (key !== undefined) {
+      tokens.push(key);
+    }
+  }
+  return tokens;
+}
+
+/** A distinct, recognisable value per placeholder, so a substitution is visible. */
+function valuesFor(placeholders: readonly string[]): Record<string, string> {
+  return Object.fromEntries(placeholders.map((key) => [key, `[value supplied for ${key}]`]));
+}
+
+/** The `vNNN` stems that genuinely exist as prompt files for one stage. */
+function versionsOnDisk(stage: PromptStage): string[] {
+  return readdirSync(join(SHIPPED_PROMPTS_DIR, stage), { withFileTypes: true })
+    .filter((entry) => entry.isFile() && entry.name.endsWith('.md'))
+    .map((entry) => entry.name.slice(0, -'.md'.length))
+    .filter((stem) => PROMPT_VERSION_PATTERN.test(stem))
+    .sort();
+}
+
+/** The shipped manifest, read as data rather than through the loader. */
+function readShippedManifest(): unknown {
+  return JSON.parse(readFileSync(join(SHIPPED_PROMPTS_DIR, 'manifest.json'), 'utf8'));
+}
+
+/**
+ * Every file in the shipped tree with its byte length, as one sorted string.
+ *
+ * The read-only guarantee, made executable: the fingerprint is taken before
+ * these cases run and compared after, so a case that wrote, rewrote or removed
+ * anything in the checkout fails even though the assertion it was making
+ * passed.
+ */
+function fingerprintShippedTree(): string {
+  return readdirSync(SHIPPED_PROMPTS_DIR, { withFileTypes: true, recursive: true })
+    .filter((entry) => entry.isFile())
+    .map((entry) => {
+      const path = join(entry.parentPath, entry.name);
+      return `${path}:${readFileSync(path).length}`;
+    })
+    .sort()
+    .join('\n');
+}
+
+describe('the shipped prompt tree', () => {
+  let fingerprintBefore = '';
+
+  beforeAll(() => {
+    fingerprintBefore = fingerprintShippedTree();
+  });
+
+  afterAll(() => {
+    expect(fingerprintShippedTree()).toBe(fingerprintBefore);
+  });
+
+  it('ships a manifest that parses against the schema the loader applies', () => {
+    const parsed = promptManifestSchema.safeParse(readShippedManifest());
+
+    expect(parsed.success).toBe(true);
+    if (!parsed.success) {
+      return;
+    }
+    expect(parsed.data.version).toBe(1);
+    // Every stage, and only known stages: the schema refuses an unknown key, so
+    // the check that adds anything here is completeness.
+    expect(Object.keys(parsed.data.stages).sort()).toEqual([...PROMPT_STAGES].sort());
+    for (const stage of PROMPT_STAGES) {
+      const entry = parsed.data.stages[stage];
+      expect(entry).toBeDefined();
+      expect(PROMPT_VERSION_PATTERN.test(entry?.current ?? '')).toBe(true);
+    }
+  });
+
+  it('answers a complete version map from the shipped manifest', () => {
+    const loader = createPromptLoader({ promptsDir: SHIPPED_PROMPTS_DIR, env: {} });
+
+    const versions = valueOf(loader.versions());
+
+    expect(Object.keys(versions).sort()).toEqual([...PROMPT_STAGES].sort());
+    for (const stage of PROMPT_STAGES) {
+      expect(PROMPT_VERSION_PATTERN.test(versions[stage])).toBe(true);
+    }
+  });
+
+  it('loads the current prompt of every stage out of the checkout', () => {
+    // THIS IS THE CLOSURE CASE. It is the only one in this file that would fail
+    // on a checkout whose manifest names a version no file provides — the state
+    // this product shipped in before the six bodies existed, with every
+    // synthetic case in this suite green.
+    const loader = createPromptLoader({ promptsDir: SHIPPED_PROMPTS_DIR, env: {} });
+    const versions = valueOf(loader.versions());
+
+    for (const stage of PROMPT_STAGES) {
+      const prompt = valueOf(loader.load(stage));
+
+      expect(prompt.stage).toBe(stage);
+      expect(prompt.version).toBe(versions[stage]);
+      expect(prompt.text.trim().length).toBeGreaterThan(0);
+      expect(isAbsolute(prompt.path)).toBe(true);
+      expect(isWithin(SHIPPED_PROMPTS_DIR, prompt.path)).toBe(true);
+      expect(prompt.path).toBe(join(SHIPPED_PROMPTS_DIR, stage, `${versions[stage]}.md`));
+    }
+  });
+
+  it('lists in each available entry exactly the versions that exist on disk', () => {
+    const parsed = promptManifestSchema.safeParse(readShippedManifest());
+    expect(parsed.success).toBe(true);
+    if (!parsed.success) {
+      return;
+    }
+
+    for (const stage of PROMPT_STAGES) {
+      const onDisk = versionsOnDisk(stage);
+
+      // The list is advisory — the loader never consults it — which is exactly
+      // why it drifts unless something checks it. A developer reads it to
+      // decide what to bump to.
+      expect([...(parsed.data.stages[stage]?.available ?? [])].sort()).toEqual(onDisk);
+      // And the version the manifest actually selects is one of them.
+      expect(onDisk).toContain(parsed.data.stages[stage]?.current);
+    }
+  });
+
+  it('renders every shipped prompt from its stage\u2019s own placeholder set', () => {
+    const loader = createPromptLoader({ promptsDir: SHIPPED_PROMPTS_DIR, env: {} });
+
+    for (const stage of PROMPT_STAGES) {
+      const prompt = valueOf(loader.load(stage));
+      const tokens = tokensOf(prompt.text);
+      const declared = SHIPPED_PLACEHOLDERS[stage];
+
+      // The prompt names neither more nor fewer inputs than its stage supplies.
+      expect([...new Set(tokens)].sort()).toEqual([...declared].sort());
+
+      const rendered = valueOf(renderPrompt(prompt.text, valuesFor(declared)));
+
+      expect(rendered).not.toContain('{{');
+      for (const key of declared) {
+        expect(rendered).toContain(`[value supplied for ${key}]`);
+      }
+    }
+  });
+
+  it('names exactly the withheld key when a shipped prompt cannot be rendered', () => {
+    const loader = createPromptLoader({ promptsDir: SHIPPED_PROMPTS_DIR, env: {} });
+
+    for (const stage of PROMPT_STAGES) {
+      const prompt = valueOf(loader.load(stage));
+      const declared = SHIPPED_PLACEHOLDERS[stage];
+
+      for (const withheld of declared) {
+        const supplied = valuesFor(declared.filter((key) => key !== withheld));
+
+        const error = errorOf(renderPrompt(prompt.text, supplied));
+
+        expect(error.code).toBe('CONFIG_INVALID');
+        expect(error.details?.missingPlaceholders).toEqual([withheld]);
+      }
+    }
+  });
+
+  it('names each of the planning prompt\u2019s inputs exactly once', () => {
+    // The planning stage renders an understanding, an investigation and an
+    // adapter catalog, any of which can be large, plus its output schema. Each
+    // token is substituted wherever it appears, so a prompt that names one
+    // twice sends that input twice — and this is the stage where that costs the
+    // most.
+    const loader = createPromptLoader({ promptsDir: SHIPPED_PROMPTS_DIR, env: {} });
+
+    const tokens = tokensOf(valueOf(loader.load('plan')).text);
+
+    expect(tokens.sort()).toEqual([...SHIPPED_PLACEHOLDERS.plan].sort());
   });
 });

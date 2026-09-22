@@ -22,7 +22,11 @@
  *    gate rather than a belt-and-braces duplicate.
  * 4. **A schema failure earns a bounded repair.** The validation issues — paths
  *    and the schema's own messages, never the rejected values — go back as a
- *    new turn, at most {@link DEFAULT_MAX_REPAIRS} times.
+ *    new turn, at most {@link DEFAULT_MAX_REPAIRS} times. That figure is a
+ *    **ceiling, not a default**: AAP §0.5.3's *"at most two repairs"* bounds how
+ *    much of a developer's project leaves their machine and what the stage
+ *    costs, so a caller may ask for fewer repairs — `0` disables them — while a
+ *    caller that asks for more is refused before the first request is sent.
  * 5. **An exhausted budget is a typed rejection**, never a fabricated
  *    substitute. This module reports; the caller decides. AAP §0.5.3 puts the
  *    fallbacks there: a rejected plan falls back to a runtime-only default plan
@@ -878,13 +882,19 @@ const NORMALIZE_REJECTION_HINT =
  * | Already-aborted signal | `'provider'` | 0 | no |
  * | Provider returned `Err` | `'provider'` | the one that failed | **no** |
  * | Answer empty | `'empty'` | 1 | no |
- * | Answer failed the schema | `'schema'` | 1 + `maxRepairs` | yes, each time |
+ * | Answer failed the schema | `'schema'` | 1 + `maxRepairs`, never past the ceiling below | yes, each time |
  * | Normaliser threw | `'normalize'` | 1 | **no** |
  *
- * Total provider calls never exceed `1 + maxRepairs`, which defaults to
- * {@link DEFAULT_MAX_REPAIRS} repairs and therefore three calls. The bound
- * holds because this is the only counter: `./provider.js` forbids an
- * implementation from looping, so nothing multiplies it.
+ * Total provider calls never exceed `1 + maxRepairs`, and `maxRepairs` itself
+ * never exceeds {@link DEFAULT_MAX_REPAIRS} — so `1 + DEFAULT_MAX_REPAIRS` is
+ * the ceiling on *every* call this function serves, not merely the figure a
+ * caller happens to get by leaving the budget unset. AAP §0.5.3 states the
+ * bound as *"at most two repairs"*: it limits how much of a developer's project
+ * leaves their machine and what a stage costs, so it is not a tunable, and a
+ * larger budget is rejected outright rather than honoured (see `@throws`) while
+ * a smaller one, `0` included, is always allowed. The bound holds because this
+ * is the only counter: `./provider.js` forbids an implementation from looping,
+ * so nothing multiplies it.
  *
  * ## What this function will not do
  *
@@ -915,9 +925,15 @@ const NORMALIZE_REJECTION_HINT =
  * normalised — value, or `Err` with a coded rejection whose `details.reason` is
  * one of {@link StructuredRejectionReason}.
  * @throws A `DebuggenError` with code `INTERNAL` when `options.maxRepairs` is
- * not a non-negative integer. A negative or fractional budget is a programmer
- * error, not a runtime condition: it cannot be recovered from and must not be
- * silently rounded into a different guarantee.
+ * not an integer from `0` to {@link DEFAULT_MAX_REPAIRS} inclusive. A negative,
+ * fractional or over-ceiling budget is a programmer error, not a runtime
+ * condition: it cannot be recovered from and must not be silently rounded or
+ * clamped into a different guarantee, because a caller that asked for four
+ * repairs and quietly received two would go on believing a bound the product
+ * does not enforce. The ceiling is AAP §0.5.3's *"at most two repairs"* — a
+ * privacy and cost bound on what leaves the developer's machine rather than a
+ * tunable — and it is checked ahead of the first provider call, so an
+ * over-budget request sends nothing at all.
  *
  * @example Validating and normalising in one call
  * ```ts
@@ -940,10 +956,18 @@ export async function generateStructuredWithRepair<TInput, TOutput = TInput>(
   options?: StructuredOptions<TInput, TOutput>,
 ): Promise<Result<StructuredSuccess<TInput, TOutput>, DebuggenError>> {
   // --- Step 0: the budget, fixed before anything is asked of the provider. ---
+  // One guard, covering shape and magnitude, and it sits above the loop so an
+  // unusable budget cannot cost a single request. `DEFAULT_MAX_REPAIRS` is the
+  // inclusive ceiling as well as the default: AAP §0.5.3 allows "at most two
+  // repairs", which bounds what leaves the developer's machine, so a caller
+  // asking for more is a programmer error to report — not a number to clamp,
+  // since a call silently granted fewer repairs than it requested would behave
+  // differently from what its author wrote. The cap is read from the constant
+  // rather than restated, so the message and the check cannot drift from it.
   const maxRepairs = options?.maxRepairs ?? DEFAULT_MAX_REPAIRS;
   assert(
-    Number.isInteger(maxRepairs) && maxRepairs >= 0,
-    `generateStructuredWithRepair requires a non-negative integer maxRepairs; received ${String(maxRepairs)}.`,
+    Number.isInteger(maxRepairs) && maxRepairs >= 0 && maxRepairs <= DEFAULT_MAX_REPAIRS,
+    `generateStructuredWithRepair requires an integer maxRepairs from 0 to ${String(DEFAULT_MAX_REPAIRS)} inclusive; received ${String(maxRepairs)}.`,
   );
 
   const logger: Logger = options?.logger ?? noopLogger;

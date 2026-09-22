@@ -145,6 +145,18 @@ export const TEXT_SEARCH_LIMITS = Object.freeze({
    * would read every byte of every file. Eight megabytes of TypeScript is a
    * substantial application; a project larger than that is searched partially
    * and {@link TextSearchResult.truncated} says so.
+   *
+   * A **hard** ceiling, and the only cap whose enforcement spans files:
+   * {@link TextSearchResult.bytesScanned} never exceeds it. A file that the
+   * remaining budget cannot hold whole is examined only up to that budget — its
+   * leading characters are searched and the rest of it is not read — so the
+   * total lands *on* the ceiling rather than a file's length past it.
+   *
+   * That partial examination is for a **literal** query only. A regular
+   * expression is never run against a clipped haystack, because `$`, `\b` and
+   * every lookahead would read the cut as the end of the file and report a
+   * match the file does not contain; such a file is skipped whole instead. See
+   * {@link TextSearchOptions.regex}.
    */
   maxScannedBytes: 8_000_000,
 
@@ -306,6 +318,17 @@ export interface TextSearchOptions {
    * contains a quantifier or an alternation is rejected with a hint. That screen
    * errs towards refusal — `(?:foo|bar)*` is harmless in practice and is still
    * refused — because the alternative is a stage that hangs.
+   *
+   * One interaction with {@link TextSearchOptions.maxScannedBytes} follows from
+   * those anchoring semantics. Because a pattern is evaluated against the
+   * string it is executed over, a file too large for the *remaining* aggregate
+   * budget is **skipped whole** in this mode rather than examined as far as the
+   * budget reaches: presenting a pattern with the leading characters of a file
+   * would make the budget cut look like the end of the file, and `x$` or
+   * `x(?=y$)` would then report a match the file does not contain. A literal
+   * query has no such assertion to mislead, so it does examine that leading
+   * text. Either way {@link TextSearchResult.truncated} reports that something
+   * was not examined.
    */
   readonly regex?: boolean | undefined;
 
@@ -336,6 +359,16 @@ export interface TextSearchOptions {
    * `[1, TEXT_SEARCH_LIMITS.maxScannedBytes]`. Present so that the aggregate
    * ceiling is reachable — and therefore testable — without an eight-megabyte
    * fixture.
+   *
+   * A hard ceiling at whatever value it takes, including a value smaller than
+   * the first file: {@link TextSearchResult.bytesScanned} never exceeds it. For
+   * a literal query the budget is *spent* rather than abandoned, so a small
+   * value examines the leading characters of the first files and marks the
+   * result truncated; it does not scan nothing and it does not overrun by a
+   * file. With {@link TextSearchOptions.regex} a file too large for the
+   * remaining budget is skipped whole instead — a pattern must never be run
+   * against a clipped haystack — so a small value there can leave
+   * `bytesScanned` well below the ceiling.
    */
   readonly maxScannedBytes?: number | undefined;
 
@@ -440,11 +473,18 @@ export interface TextSearchResult {
   readonly totalMatches: number;
 
   /**
-   * How many files were actually examined.
+   * How many files were actually examined, whole or in part.
    *
    * A file skipped for exceeding {@link TEXT_SEARCH_LIMITS.maxFileBytes} is not
    * counted, because none of it was read; neither is a file the scan never
-   * reached, nor one removed by a glob or by the inherited exclusions.
+   * reached, nor one removed by a glob or by the inherited exclusions, nor — in
+   * {@link TextSearchOptions.regex} mode — one skipped because the remaining
+   * scanned-bytes budget could not hold it whole. A file the scanned-bytes
+   * ceiling left *partially* examined, which only a literal query does, **is**
+   * counted — its leading characters were read and its matches are in `hits` —
+   * so this is a count of files opened to the matcher rather than of files
+   * exhausted, and {@link TextSearchResult.truncated} is what says one of them
+   * was clipped.
    */
   readonly filesSearched: number;
 
@@ -452,10 +492,17 @@ export interface TextSearchResult {
    * How much file text was examined, in **characters** of file text (UTF-16
    * code units, the unit `String.length` counts).
    *
-   * Accumulated per file, as the whole length of each file that was examined.
-   * A file skipped for size contributes nothing. The unit is characters rather
-   * than encoded bytes because the text is already in memory as a string and
-   * re-encoding every file to count its bytes would cost more than the search.
+   * Accumulated per file, as the whole length of each file that was examined —
+   * except the last file examined, which is counted only up to the budget that
+   * remained when the scan reached it. **Never more than the effective
+   * `maxScannedBytes`**, which is the caller's value clamped into
+   * `[1, TEXT_SEARCH_LIMITS.maxScannedBytes]`; a literal scan stopped by that
+   * ceiling lands exactly on it, while a {@link TextSearchOptions.regex} scan
+   * can stop below it, because a file the remaining budget cannot hold whole is
+   * skipped rather than clipped in that mode. A file skipped for size or for
+   * that reason contributes nothing. The unit is characters rather than encoded
+   * bytes because the text is already in memory as a string and re-encoding
+   * every file to count its bytes would cost more than the search.
    */
   readonly bytesScanned: number;
 
@@ -465,10 +512,14 @@ export interface TextSearchResult {
    *
    * Set when any of these happened: the result cap was reached with input still
    * remaining, the scan stopped with files left unexamined, a per-file cap was
-   * reached, the scanned-bytes ceiling was hit, a file was skipped for
-   * exceeding the single-file size cap, the time budget expired, or any hit's
-   * excerpt was clipped. `false` means the result is complete for the query as
-   * asked, within the file set the project was opened with.
+   * reached, the scanned-bytes ceiling was hit — including the case where it
+   * left one file examined only as far as the remaining budget reached, whose
+   * unread tail may hold matches this scan could not see, and the case where a
+   * pattern could not be run against such a file at all and it was skipped — a
+   * file was skipped for exceeding the single-file size cap, the time budget
+   * expired, or any hit's excerpt was clipped. `false` means the result is
+   * complete for the query as asked, within the file set the project was opened
+   * with.
    *
    * Reaching a per-file cap counts even though it does not prove more matches
    * existed in that file. That is the conservative direction, and the only one
@@ -1318,6 +1369,17 @@ function abortError(details: Readonly<Record<string, unknown>>): DebuggenError {
  * anything, {@link TextSearchResult.truncated} is `true`, so a `false` there
  * can be read as "this is everything".
  *
+ * `maxScannedBytes` is the one cap that spans files, and it is exact rather
+ * than approached: the file the budget runs out in is examined only as far as
+ * the budget reaches, so {@link TextSearchResult.bytesScanned} never exceeds
+ * the effective ceiling. A match that touches that cut is not reported, because
+ * its extent — and, under `wholeWord`, its trailing boundary — is decided by
+ * characters the budget did not allow to be read. In `regex` mode that partial
+ * examination does not happen at all: a pattern is evaluated against the string
+ * it is run over, so a cut would present itself as the end of the file and an
+ * anchor or a lookahead would report a match the file does not contain. Such a
+ * file is skipped whole instead, and the result says it was truncated.
+ *
  * ## Ordering
  *
  * Files in ascending project-relative POSIX path order, byte-wise; within a
@@ -1499,8 +1561,54 @@ export function searchText(
       continue;
     }
 
+    // The aggregate ceiling is hard, so a file the remaining budget cannot hold
+    // whole is examined only up to that budget rather than in full. `remaining`
+    // is strictly positive: the guard at the top of this iteration already
+    // ended the scan when the budget was spent.
+    const remaining = maxScannedBytes - bytesScanned;
+    const clipped = text.length > remaining;
+
+    if (clipped && useRegex) {
+      // A pattern is never run against a clipped haystack. A literal has no way
+      // to tell a budget cut from a file's end — an occurrence found in the
+      // leading characters is an occurrence in the file, at that offset — but a
+      // pattern does: `$`, `\b` and every lookahead are evaluated against the
+      // *string* they are executed over, so a cut would present itself as the
+      // end of the file and `…(?=x$)` would match text the budget never read.
+      // A hit reported from that is not an incomplete answer, it is a false
+      // one, and this module's output is evidence a model reasons over. So the
+      // file is skipped whole — counted in neither `filesSearched` nor
+      // `bytesScanned`, exactly like a file over the single-file size cap — and
+      // the scan continues to the files that do still fit the budget.
+      truncated = true;
+      logger.debug('text search skipped a file a pattern could not be run against in part', {
+        file: candidate.relativePath,
+        textLength: text.length,
+        remaining,
+        maxScannedBytes,
+      });
+      continue;
+    }
+
+    const scanned = clipped ? text.slice(0, remaining) : text;
+
+    // A partially examined file still counts in `filesSearched`, because part
+    // of it was read and its matches are reported; `bytesScanned` grows by
+    // exactly what was examined, which lands the total *on* the ceiling and
+    // lets the next iteration's guard end the scan.
     filesSearched += 1;
-    bytesScanned += text.length;
+    bytesScanned += scanned.length;
+
+    if (clipped) {
+      truncated = true;
+      logger.debug('text search examined only the head of a file at the scanned-bytes ceiling', {
+        file: candidate.relativePath,
+        scannedLength: scanned.length,
+        textLength: text.length,
+        bytesScanned,
+        maxScannedBytes,
+      });
+    }
 
     matcher.lastIndex = 0;
     let matchesInFile = 0;
@@ -1525,7 +1633,7 @@ export function searchText(
         }
       }
 
-      const match = matcher.exec(text);
+      const match = matcher.exec(scanned);
       if (match === null) {
         break;
       }
@@ -1541,14 +1649,28 @@ export function searchText(
         // makes every iteration consume a character, so the loop terminates;
         // an empty match is not evidence of anything and is not recorded.
         matcher.lastIndex = match.index + 1;
-        if (matcher.lastIndex > text.length) {
+        if (matcher.lastIndex > scanned.length) {
           break;
         }
         continue;
       }
 
       const matchStart = match.index;
-      if (wholeWord && !hasWordBoundaries(text, matchStart, matchStart + matched.length)) {
+
+      if (clipped && matchStart + matched.length >= scanned.length) {
+        // A match that reaches the cut was decided by characters the budget did
+        // not allow to be read: under `wholeWord` its trailing boundary is one
+        // of them, and under `regex` a greedy match's own extent is. So the
+        // rule is that an occurrence touching the cut is not reported — and not
+        // counted in `totalMatches` either, which counts matches *observed* and
+        // this one was not: what was seen is a prefix of something whose extent
+        // is unknown. The file's scan ends here; `truncated` already says the
+        // ceiling clipped this file.
+        truncated = true;
+        break;
+      }
+
+      if (wholeWord && !hasWordBoundaries(scanned, matchStart, matchStart + matched.length)) {
         // Retry from one character in rather than from the end of the rejected
         // match: an occurrence that does stand alone may overlap this one.
         matcher.lastIndex = matchStart + 1;
@@ -1571,7 +1693,15 @@ export function searchText(
         break;
       }
 
-      const hit = buildHit(candidate, text, matchStart, matched.length, maxExcerptChars);
+      // The scanned prefix, never the whole text: an excerpt may only be cut
+      // from text the budget paid for. Line and column still come from the
+      // whole file — `buildHit` asks the `SourceFile` for them — so a hit found
+      // in a clipped file points at exactly the same place it would have in a
+      // complete scan, and only its excerpt window is bounded by the cut. An
+      // excerpt whose line runs past the cut therefore ends at the cut; the
+      // envelope's `truncated` is what reports that, since a hit's own
+      // `truncated` is about the excerpt budget.
+      const hit = buildHit(candidate, scanned, matchStart, matched.length, maxExcerptChars);
       if (hit === undefined) {
         continue;
       }

@@ -2,10 +2,11 @@
  * SiteHeader - the sticky top bar of the "Lumen Supply" storefront.
  *
  * Imported exactly once, by its sibling `SiteHeader.tsx`
- * (`import styles from './SiteHeader.module.css';`). It places five things and nothing else: the
- * skip link, the brand lockup, the search form, the bounded track that carries a compact
- * "frequently bought with" strip on a product route, and the right-hand cluster holding the cart
- * control and its count chip.
+ * (`import styles from './SiteHeader.module.css';`). It places six things and nothing else: the
+ * skip link, the brand lockup, the search form - in the row at desktop widths, in a panel below
+ * the bar at phone widths - the control that discloses that panel, the bounded track that carries
+ * a compact "frequently bought with" strip on a product route, and the right-hand cluster holding
+ * the cart control and its count chip.
  *
  * TOKENS
  * `apps/demo-app/app/globals.css` declares the `--ls-*` custom properties read below and is
@@ -24,6 +25,16 @@
  * `max-height: 100%`, `overflow: hidden`, a capped `max-width`). A route that made the bar taller
  * would tuck its own first line of content underneath it and shift the page mid-interaction.
  *
+ * It is also why the phone-width search is a panel taken out of flow rather than a second row: an
+ * absolutely positioned box hanging off the bar's bottom edge adds nothing to the bar's height,
+ * whether it is open or closed, so the offset `PageContainer` applies stays correct at every width
+ * and in every state of the disclosure.
+ *
+ * WIDTH CONDITIONS
+ * Three, all at the end of the file, none of them redefining the row: 960px steps the gutter with
+ * the page shell, 1023px drops the suggestions strip, and 639px shows the disclosure control and
+ * moves the form into the panel. Every other rule in the file applies at every width.
+ *
  * OWNERSHIP
  * The chrome of the controls inside the bar belongs to their own modules: `Input.module.css` owns
  * the field's border, background and focus ring; `Button.module.css` owns every button surface;
@@ -31,11 +42,13 @@
  * `RecommendationTile.module.css` own the strip's heading, gaps and tile sizing. This file places
  * those elements and never reaches inside them - no selector here crosses into another module's
  * class names, and no declaration restates one of theirs. The wrappers (`.searchField`,
- * `.searchSubmit`, `.cartButton`) exist because those primitives accept no `className` of their
- * own, so the caller's geometry needs an element to live on.
+ * `.searchSubmit`, `.searchToggle`, `.cartButton`) exist because those primitives accept no
+ * `className` of their own, so the caller's geometry needs an element to live on.
  *
  * STACKING
- * The bar sits on `--ls-z-header` (30). The cart drawer (`--ls-z-drawer`, 40) and the toast region
+ * The bar sits on `--ls-z-header` (30), and the two boxes this file lifts out of the row - the
+ * focused skip link and the phone-width search panel - are painted on that same tier, inside the
+ * bar's own stacking context. The cart drawer (`--ls-z-drawer`, 40) and the toast region
  * (`--ls-z-toast`, 60) are deliberately above it, so nothing in this file may reach either tier.
  */
 
@@ -190,6 +203,18 @@
   align-items: center;
 }
 
+/* The compact disclosure's control, in the trailing cluster. Dropped entirely at the widths where
+ * the form is already in the row: there is nothing to disclose there, and an element removed with
+ * `display: none` is out of the focus order as well as out of the layout, which is what keeps the
+ * wide bar's tab order exactly what it was. The narrow breakpoint at the end of the file is the
+ * only place it is drawn, and `SiteHeader.tsx` keeps it mounted at every width so the form `id`
+ * its `aria-controls` names always belongs to a form in the document. */
+.searchToggle {
+  display: none;
+  flex: 0 0 auto;
+  align-items: center;
+}
+
 /* The strip track - the one element in the bar whose content is not this module's to size, so it
  * is bounded instead: it may shrink but never grow (`flex: 0 1 auto`), it is capped in width, and
  * it is capped in height by the bar itself with anything taller clipped. The rail inside keeps its
@@ -267,6 +292,53 @@
 @media (max-width: 1023px) {
   .miniRail {
     display: none;
+  }
+}
+
+/* Phone widths, and the only place in the file where anything the bar places leaves the row. The
+ * brand, a field wide enough to read a term in, that field's submit control and the cart cluster
+ * cannot share one row here without every one of them shrinking past legibility, so the form
+ * becomes a panel that the disclosure control in the trailing cluster opens.
+ *
+ * The constant-height invariant survives it untouched, which is the whole reason for the mechanism:
+ * the panel is absolutely positioned against `.root` - `position: sticky` makes the bar the
+ * containing block, exactly as `.skipLink` above relies on - so it is out of flow and contributes
+ * nothing to the fixed height. It hangs from the bar's own bottom edge (`inset-block-start: 100%`)
+ * across the bar's full width, painted on the bar's surface with the bar's hairline and the
+ * elevation token one step up from it, on the bar's own stacking tier: an extension of the bar
+ * rather than content of the page it covers. No second row, and no height anywhere in the block.
+ *
+ * `SiteHeader.tsx` keeps the form mounted at every width and reports the disclosure state in
+ * `data-open`, so visibility is decided here instead of by unmounting - which is what keeps the
+ * toggle's `aria-controls` pointing at an element that exists. Escape is safe against the closed
+ * rule below because that file moves focus to the toggle before it writes the attribute, so the
+ * path never leaves focus inside a panel this rule stops drawing. */
+@media (max-width: 639px) {
+  .searchToggle {
+    display: inline-flex;
+  }
+
+  .search {
+    position: absolute;
+    inset-block-start: 100%;
+    inset-inline: 0;
+    display: none;
+    padding-block: var(--ls-space-3, 12px);
+    padding-inline: var(--header-gutter, 16px);
+    background: var(--ls-surface, #ffffff);
+    border-block-end: var(--header-hairline, 1px) solid var(--ls-border, #cbd5e1);
+    box-shadow: var(--ls-shadow-2, 0 4px 12px rgba(15, 23, 42, 0.1));
+    z-index: var(--ls-z-header, 30);
+  }
+
+  .search[data-open='true'] {
+    display: flex;
+  }
+
+  /* The panel is as wide as the bar, so the field takes all of it: the desktop cap is a fraction
+   * of the page measure and would leave a gap between the field and its submit control here. */
+  .searchField {
+    max-width: none;
   }
 }
 

@@ -5,19 +5,24 @@
  *
  * Two surfaces render it and neither owns a figure: the cart drawer's footer (`variant="drawer"`,
  * the default, which is the tight form) and the `/cart` page together with the checkout review
- * column (`variant="page"`, the roomy one). Both get the same rows in the same order - the units
- * in the cart, the merchandise subtotal, the closing total, the free-freight state and the
- * dispatch promise - because a shopper who opens the drawer and then the page must not be quoted
- * two different carts.
+ * column (`variant="page"`, the roomy one). All of them get the same rows in the same order - the
+ * units in the cart, the merchandise subtotal, one row per charge the placing surface knows about,
+ * the closing figure those charges add up to, and the dispatch promise - because a shopper who
+ * opens the drawer and then the page must not be quoted two different carts. The one line that is
+ * not printed everywhere is the store's free-freight offer, which belongs to a surface quoting a
+ * cart rather than one quoting an order; the last of the decisions below says why.
  *
  * EVERY FIGURE ARRIVES ALREADY DERIVED
  * `@/hooks/useCartSummary` is the one place the cart's totals are worked out, and this component
- * reads its `CartSummary` and prints it. Nothing here sums, multiplies, compares against a
- * threshold or divides cents: `freeFreightRemainingCents`, `freeFreightThresholdCents` and
+ * reads its `CartSummary` and prints it. Nothing here multiplies, compares against a threshold or
+ * divides cents: `freeFreightRemainingCents`, `freeFreightThresholdCents` and
  * `qualifiesForFreeFreight` are read as published, so the free-freight sentence can never
- * disagree with the state the badge beside it shows. Money goes through `../ui/Price`, which takes
- * integer cents and is the application's only monetary formatter, and the two bare counts go
- * through `formatQuantityLabel`. There is deliberately no `Intl` instance in this file.
+ * disagree with the state the badge beside it shows. The one piece of arithmetic in the file is
+ * the closing row, which adds the charges a caller passed to the merchandise subtotal in integer
+ * cents - a total of figures its caller derived, never a figure derived here. Money goes through
+ * `../ui/Price`, which takes integer cents and is the application's only monetary formatter, and
+ * the two bare counts go through `formatQuantityLabel`. There is deliberately no `Intl` instance
+ * in this file.
  *
  * THE PROP IS AN OVERRIDE, NOT AN ALTERNATIVE
  * The hook is called unconditionally and a `summary` prop, when one is given, replaces its result.
@@ -49,8 +54,8 @@
  * padding rhythm and optional head slot belong to `../ui/Card`, which this component renders
  * inside and to which a caller's `className` is passed, because a caller's class is placement -
  * the cart drawer's footer and the checkout column both use it that way. Every length, colour and
- * type size lives in `./CartTotalsPanel.module.css`, whose nine classes are all used below; there
- * is no `style` prop. Variants are `data-variant` and the free-freight state is `data-qualifies`,
+ * type size lives in `./CartTotalsPanel.module.css`, whose eleven classes are all used below;
+ * there is no `style` prop. Variants are `data-variant` and the free-freight state is `data-qualifies`,
  * both read by attribute selectors in that file rather than by looking a class name up.
  *
  * Two presentation decisions worth recording, because both look arbitrary otherwise:
@@ -59,11 +64,28 @@
  *     document, and `<h3>` in the drawer, whose dialog already carries the `<h2>`. A caller that
  *     titles the column itself passes its own `heading` text, and a blank one suppresses the head
  *     slot entirely rather than leaving an empty heading in the outline.
- *   - The cart has no tax or freight line of its own - checkout owns both - so the subtotal and
- *     the total print the same amount. The subtotal therefore recedes (muted, one step down) and
- *     the total carries the emphasis, which is the hierarchy `../checkout/OrderConfirmation` uses
- *     for its own breakdown. Inventing a tax or shipping row to make the two differ would put a
- *     figure on the page that no server computed.
+ *   - A MERCHANDISE SUBTOTAL AND AN ORDER TOTAL ARE NEVER THE SAME CLAIM, so this block never
+ *     prints one figure under both labels. The cart itself has no freight, discount or tax line -
+ *     those belong to the order the checkout request creates - so a surface that knows nothing
+ *     about them passes no `charges` and gets a single money row, labelled "Merchandise subtotal"
+ *     and carrying the closing emphasis: it is the only figure there is, and it says in words what
+ *     it is a total of. A surface that does know them - the checkout review column, which reads
+ *     the chosen freight charge from `../checkout/CheckoutCharges` - passes them as `charges`, and
+ *     then the merchandise figure recedes (muted, one step down), each charge prints its own row,
+ *     and the closing row is the sum, labelled "Order total" when every charge is settled and
+ *     "Estimated total" while any of them is still to be confirmed. Nothing is ever invented to
+ *     fill a row: a charge whose amount is not yet established says so in words, because a zero or
+ *     a dash in a money column reads as a figure somebody computed.
+ *   - THE FREE-FREIGHT OFFER IS A STATEMENT ABOUT A CART, SO IT IS PRINTED ONLY WHERE A CART IS
+ *     BEING QUOTED. It is measured against the merchandise subtotal, and the checkout request
+ *     charges the freight it quotes whatever that subtotal is - it applies no allowance. On a
+ *     surface quoting charges, therefore, every reading of the offer would be a claim about this
+ *     order's freight that no server stands behind: "ships at no freight charge" contradicts the
+ *     freight row above it, and "add $120.00 more for free freight" promises a reduction the order
+ *     will not receive. So the line is printed on the merchandise-only surfaces, where nothing
+ *     contradicts it and no order total is asserted, and omitted where charges are quoted - there,
+ *     what is true of freight is the freight row and the caption the placing surface prints under
+ *     these figures.
  */
 
 import clsx from 'clsx';
@@ -84,17 +106,41 @@ const DEFAULT_HEADING = 'Order summary';
 /** Introduces the cart's unit count: eight of one product and two of another read as ten. */
 const ITEMS_LABEL = 'Items';
 
-/** Introduces the merchandise subtotal, which is the amount before checkout adds anything. */
-const SUBTOTAL_LABEL = 'Subtotal';
-
-/** Introduces the closing figure. */
-const TOTAL_LABEL = 'Total';
+/**
+ * Introduces the merchandise figure: what the lines come to, before anything the order adds.
+ *
+ * Never "Subtotal" on its own, and never "Total". A bare "Subtotal" leaves a reader to guess what
+ * it is a subtotal of, and "Total" over this figure is the claim the cart is not entitled to make -
+ * freight, discounts and tax are settled on the order.
+ */
+const MERCHANDISE_LABEL = 'Merchandise subtotal';
 
 /**
- * Read to assistive technology after {@link TOTAL_LABEL}, because the reason this figure equals
- * the subtotal is not written anywhere on screen: the cart quotes merchandise only.
+ * Read to assistive technology after {@link MERCHANDISE_LABEL} where that row is also the closing
+ * one, because what the figure precedes is then written nowhere on screen: there are no charge
+ * rows beneath it to say so.
  */
-const TOTAL_READING = 'merchandise only';
+const MERCHANDISE_READING = 'before freight, discounts and tax';
+
+/** Introduces the closing figure where every charge beneath the merchandise row is settled. */
+const ORDER_TOTAL_LABEL = 'Order total';
+
+/** Introduces the closing figure while any charge is still to be confirmed on the order. */
+const ESTIMATED_TOTAL_LABEL = 'Estimated total';
+
+/**
+ * Read to assistive technology after {@link ESTIMATED_TOTAL_LABEL}: the word "estimated" says that
+ * something is missing without saying what, and a buyer reading the figure out is entitled to both.
+ */
+const ESTIMATED_TOTAL_READING = 'excludes the charges still to be confirmed on the order';
+
+/**
+ * What a charge's value column says in place of an amount that is not yet established.
+ *
+ * Words rather than a zero or a dash: both of those read as a figure somebody worked out, and this
+ * row exists precisely to say that nobody has yet.
+ */
+const PENDING_CHARGE_NOTE = 'Confirmed on the order';
 
 /** Names the dispatch line for a reader, since its value can be a bare dash before the first
  * countdown reading arrives and would otherwise be announced with nothing to attach it to. */
@@ -103,7 +149,10 @@ const DELIVERY_READING = 'Delivery estimate:';
 /** The qualifying state, as the label that carries it rather than as a colour alone. */
 const FREE_FREIGHT_BADGE = 'Free freight';
 
-/** Confirms the qualifying state in words beside that label. */
+/**
+ * Confirms the qualifying state in words beside that label, on the surfaces that print it: see the
+ * header for why the whole free-freight line belongs to a surface quoting merchandise only.
+ */
 const FREIGHT_EARNED_NOTE = 'This order ships at no freight charge.';
 
 /** Introduces the line count under the units row; see {@link PRODUCT_NOUN}. */
@@ -170,10 +219,40 @@ function dispatchCutoffNote(countdownMs: number | null): string | null {
 }
 
 /**
+ * One charge a placing surface adds to the merchandise figure.
+ *
+ * Exported, unlike the props type below, because a caller has to build an array of these: freight,
+ * a discount and tax are each assembled from state that surface owns, and a shape it cannot name is
+ * a shape it cannot assemble without repeating the literal at every call site.
+ *
+ * `amountCents` carries the one distinction that matters on a checkout page: a number is an amount
+ * this charge is, in integer cents like every monetary field in `@/lib/types`, and `null` means the
+ * charge applies to the order but its amount is not established yet - which is a different
+ * statement from a charge of nothing, and is printed as words rather than as a figure.
+ */
+export interface CartCharge {
+  /** Stable key for the row. The charge's own name - `'freight'`, `'tax'` - not an array index. */
+  readonly id: string;
+
+  /** What the row is called, for example `'Freight'`. Printed as written. */
+  readonly label: string;
+
+  /**
+   * A quiet qualification beside the label - the chosen service for a freight row, say. Omitted
+   * where there is nothing to qualify; it is never used to explain a missing amount, which the row
+   * says for itself.
+   */
+  readonly detail?: string | undefined;
+
+  /** The amount in integer cents, or `null` while it is still to be established. */
+  readonly amountCents: number | null;
+}
+
+/**
  * Props of `CartTotalsPanel`, intentionally local and unexported, like every other props type in
  * this workspace: a caller that needs the shape reads it back with
- * `ComponentProps<typeof CartTotalsPanel>`, so this file puts exactly one new name into
- * circulation.
+ * `ComponentProps<typeof CartTotalsPanel>`. So the file exports two names and no more - the
+ * component, and the {@link CartCharge} a caller has to build an array of before it can call it.
  *
  * The optional members spell `| undefined` out because the workspace compiles with
  * `exactOptionalPropertyTypes`, under which `className?: string` means "absent or a string" and
@@ -187,6 +266,20 @@ interface Props {
    * already holds a `CartSummary`; omitted, the cart's own totals are read from the provider.
    */
   summary?: CartSummary | undefined;
+
+  /**
+   * What the placing surface adds to the merchandise figure, in the order the rows should be read.
+   *
+   * Omitted - the cart drawer and the `/cart` page, neither of which knows a destination or a
+   * service - the block prints the merchandise subtotal as its single, closing money row and
+   * asserts no order total. Given, each entry prints a row and the closing row becomes their sum
+   * over that subtotal: see {@link CartCharge} for what an unestablished amount means, and the
+   * header for why the two arrangements are labelled differently.
+   *
+   * An empty array is the same as omitting it, so a caller assembling charges conditionally needs
+   * no branch at the call site.
+   */
+  charges?: readonly CartCharge[] | undefined;
 
   /**
    * Which surface is rendering: `drawer` (the default) is the slide-over's short footer, `page`
@@ -212,14 +305,30 @@ interface Props {
 /**
  * Renders the cart's totals.
  *
- * @example The drawer's footer and the `/cart` page's summary column.
+ * @example The drawer's footer and the `/cart` page's summary column: merchandise only, so the
+ * subtotal is the closing figure and no order total is claimed.
  * ```tsx
  * <CartTotalsPanel variant="drawer" />
  * <CartTotalsPanel variant="page" className={styles.totals} />
  * ```
+ *
+ * @example The checkout review column, which knows the chosen freight charge and knows that the
+ * discount and the tax are settled when the order is written.
+ * ```tsx
+ * <CartTotalsPanel
+ *   variant="page"
+ *   heading=""
+ *   charges={[
+ *     { id: 'freight', label: 'Freight', detail: 'Standard ground', amountCents: 1250 },
+ *     { id: 'discounts', label: 'Discounts', amountCents: null },
+ *     { id: 'tax', label: 'Tax', amountCents: null },
+ *   ]}
+ * />
+ * ```
  */
 export function CartTotalsPanel({
   summary,
+  charges,
   variant = 'drawer',
   heading,
   className,
@@ -227,6 +336,27 @@ export function CartTotalsPanel({
   // Unconditional, and overridden by the prop rather than skipped for it - see the header.
   const derived = useCartSummary();
   const totals = summary ?? derived;
+
+  /*
+   * The charges as the rows below iterate them, and the two questions the arrangement turns on.
+   * An absent prop and an empty array are one case on purpose - a caller assembling charges
+   * conditionally should not have to branch at the call site - and `hasCharges` is what decides
+   * whether the merchandise row is the closing row or the first of several.
+   */
+  const chargeRows: readonly CartCharge[] = charges ?? [];
+  const hasCharges = chargeRows.length > 0;
+  const hasPendingCharge = chargeRows.some((charge) => charge.amountCents === null);
+
+  /*
+   * The closing figure: the merchandise subtotal plus every charge whose amount is established, in
+   * cents, which is the only arithmetic this component performs on money. A pending charge
+   * contributes nothing to the sum and the closing row says so in its label, so the figure is
+   * always the floor of what the order comes to rather than a guess at it.
+   */
+  const closingCents = chargeRows.reduce(
+    (running, charge) => running + (charge.amountCents ?? 0),
+    totals.subtotalCents,
+  );
 
   const title = (heading ?? DEFAULT_HEADING).trim();
 
@@ -245,6 +375,16 @@ export function CartTotalsPanel({
    * so the threshold is stated as the offer it is instead. The remaining two are the published
    * state - qualifying, which the badge carries in words, and the shortfall, which names both the
    * amount left and the threshold it is measured against.
+   *
+   * All three are the store's offer about a cart, and the offer is only printed on a surface that
+   * is quoting a cart. Where charges are being quoted - the checkout review, where one of the rows
+   * is the freight this order is actually being charged - the line is not printed at all, because
+   * every reading of it would be a claim about that charge which no server stands behind: the
+   * offer is measured against the merchandise subtotal and the checkout request charges the quoted
+   * freight regardless, so "ships at no freight charge" would contradict the row above it and "add
+   * $120.00 more for free freight" would promise a reduction that request never applies. What is
+   * true of freight there is on the freight row and in the caption the placing surface prints
+   * beneath these figures.
    */
   let freight: ReactNode;
   if (totals.qualifiesForFreeFreight) {
@@ -281,25 +421,77 @@ export function CartTotalsPanel({
             <dd className={styles.rowValue}>{totals.unitCountLabel}</dd>
           </div>
 
-          <div className={styles.row}>
-            <dt className={styles.rowLabel}>{SUBTOTAL_LABEL}</dt>
+          {/* The merchandise figure. With no charges beneath it, it IS the closing row: it takes
+              the `.total` treatment and the emphasised size step, and the hidden reading says what
+              it comes before, because no row below it does. With charges it recedes to the quiet
+              register the closing row is then read against. */}
+          <div className={hasCharges ? styles.row : clsx(styles.row, styles.total)}>
+            <dt className={styles.rowLabel}>
+              {MERCHANDISE_LABEL}
+              {hasCharges ? null : (
+                <>
+                  {' '}
+                  <VisuallyHidden>{MERCHANDISE_READING}</VisuallyHidden>
+                </>
+              )}
+            </dt>
             <dd className={styles.rowValue}>
-              <Price
-                cents={totals.subtotalCents}
-                size={variant === 'page' ? 'md' : 'sm'}
-                tone="muted"
-              />
+              {hasCharges ? (
+                <Price
+                  cents={totals.subtotalCents}
+                  size={variant === 'page' ? 'md' : 'sm'}
+                  tone="muted"
+                />
+              ) : (
+                <Price cents={totals.subtotalCents} size={variant === 'page' ? 'lg' : 'md'} />
+              )}
             </dd>
           </div>
 
-          <div className={clsx(styles.row, styles.total)}>
-            <dt className={styles.rowLabel}>
-              {TOTAL_LABEL} <VisuallyHidden>{TOTAL_READING}</VisuallyHidden>
-            </dt>
-            <dd className={styles.rowValue}>
-              <Price cents={totals.subtotalCents} size={variant === 'page' ? 'lg' : 'md'} />
-            </dd>
-          </div>
+          {/* One row per charge, in the order the caller listed them. The key is the charge's own
+              id rather than its position, so a freight row that arrives between renders does not
+              inherit the identity of the row that was there before it. */}
+          {chargeRows.map((charge) => (
+            <div key={charge.id} className={styles.row}>
+              <dt className={styles.rowLabel}>
+                {charge.label}
+                {charge.detail === undefined ? null : (
+                  <>
+                    {' '}
+                    <span className={styles.chargeDetail}>{charge.detail}</span>
+                  </>
+                )}
+              </dt>
+              <dd className={styles.rowValue}>
+                {charge.amountCents === null ? (
+                  <span className={styles.chargePending}>{PENDING_CHARGE_NOTE}</span>
+                ) : (
+                  <Price cents={charge.amountCents} size={variant === 'page' ? 'md' : 'sm'} />
+                )}
+              </dd>
+            </div>
+          ))}
+
+          {/* The closing row exists only where charges do: without them the merchandise row above
+              is already the closing figure, and a second row repeating it is exactly the
+              duplicate this block used to print under the word "Total". */}
+          {hasCharges ? (
+            <div className={clsx(styles.row, styles.total)}>
+              <dt className={styles.rowLabel}>
+                {hasPendingCharge ? (
+                  <>
+                    {ESTIMATED_TOTAL_LABEL}{' '}
+                    <VisuallyHidden>{ESTIMATED_TOTAL_READING}</VisuallyHidden>
+                  </>
+                ) : (
+                  ORDER_TOTAL_LABEL
+                )}
+              </dt>
+              <dd className={styles.rowValue}>
+                <Price cents={closingCents} size={variant === 'page' ? 'lg' : 'md'} />
+              </dd>
+            </div>
+          ) : null}
         </dl>
 
         {/* The line count, printed only when it says something the units row does not: a cart of
@@ -318,13 +510,18 @@ export function CartTotalsPanel({
             boxes only - measured in the browser, the note and dispatch lines below are exposed as
             paragraphs while this one was ignored, so a reader navigating by paragraph skipped the
             one line that carries the freight state. */}
-        <p
-          className={styles.freight}
-          role="paragraph"
-          data-qualifies={totals.qualifiesForFreeFreight ? 'true' : 'false'}
-        >
-          {freight}
-        </p>
+        {/* Printed only where the surface quotes merchandise alone; a surface quoting charges
+            says what is true of this order's freight on the freight row itself. See the reasoning
+            beside `freight` above. */}
+        {hasCharges ? null : (
+          <p
+            className={styles.freight}
+            role="paragraph"
+            data-qualifies={totals.qualifiesForFreeFreight ? 'true' : 'false'}
+          >
+            {freight}
+          </p>
+        )}
 
         {/* The space after the hidden prefix is load-bearing: without it the accessible reading
             runs the two together, and the clipped span is out of flow, so the character collapses

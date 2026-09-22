@@ -3,8 +3,8 @@
  *
  * The page answers one page of the product catalog, together with the categories its filter chips
  * offer. It is a server component: it reads the query string, parses it with the schema that
- * declares the catalog's parameters, calls the catalog service directly and hands the two answers
- * to `CatalogGrid`. Nothing else happens here.
+ * declares the catalog's parameters, asks this application's own catalog endpoint for the listing
+ * and hands the two answers to `CatalogGrid`. Nothing else happens here.
  *
  * WHAT THIS FILE OWNS, AND WHAT IT DOES NOT
  * It owns the request - the query string, the two service calls, the failure path - and the page's
@@ -13,11 +13,19 @@
  * listing did not arrive intact. That division is why no control, no card and no piece of state
  * appears in this file, and why it declares no component of its own.
  *
- * THE SERVICE IS CALLED, NOT THE ENDPOINT
- * `browseCatalog` and `listCategoryOptions` are invoked as functions. A server component that
- * fetched its own `/api/products` instead would pay for a second HTTP exchange, a second
- * serialization and a second trip through the same service on every page view, and would report
- * one request where the reader made none.
+ * THE LISTING COMES FROM THE ENDPOINT
+ * `GET /api/products` is the catalog's listing, and this page reads it over HTTP through
+ * `loadCatalogPage` in `@/lib/api-client` rather than calling the catalog service in process. One
+ * code path therefore answers the grid a reader is looking at and any other caller of the same
+ * endpoint, so a bound, a default or a payload change cannot apply to one and not the other. A
+ * server render has no relative base to resolve `/api/...` against, so the address the read is sent
+ * to comes from `@/server/origin`, which answers with the storefront's configured address or the
+ * loopback address on the port this process bound - never with anything a request carries.
+ *
+ * The chips' categories are the exception, and the reason is plain: this application publishes no
+ * category endpoint, so `listCategoryOptions` is called as a function. An endpoint that does not
+ * exist cannot be read, and inventing one for a list of chips would add a surface no caller asked
+ * for.
  *
  * EVERY VISIT IS ITS OWN REQUEST
  * `dynamic = 'force-dynamic'` opts the segment out of static generation, so stock levels and
@@ -39,9 +47,10 @@ import type { Metadata } from 'next';
 import type { ReactElement } from 'react';
 
 import { CatalogGrid } from '@/components/catalog/CatalogGrid';
+import { StorefrontApiError, loadCatalogPage } from '@/lib/api-client';
 import type { CategoryOption, PagedList, ProductSummary } from '@/lib/types';
-import { isStorefrontError } from '@/server/errors';
-import { browseCatalog, listCategoryOptions } from '@/server/services/catalog.service';
+import { storefrontOrigin } from '@/server/origin';
+import { listCategoryOptions } from '@/server/services/catalog.service';
 import { catalogQuerySchema, type CatalogQueryInput } from '@/server/validation/products';
 
 /**
@@ -143,16 +152,18 @@ function scalars(params: Record<string, string | string[] | undefined>): Record<
  * The sentence to show for a listing that could not be read.
  *
  * A failure this application raised on purpose already carries a complete sentence written for a
- * visitor - that is the contract of `StorefrontError`, whose message reaches the browser verbatim
- * through every route handler - so it is shown as it stands. Anything else is a bug, a driver
- * refusal or an unreachable database, and gets the fixed sentence above: its message may name a
- * file, a statement or a host, none of which belongs on this page.
+ * visitor - that is the contract of `StorefrontError`, whose message every route handler puts into
+ * the response envelope verbatim and which arrives here as a reported `StorefrontApiError` - so it
+ * is shown as it stands. Anything else is a bug, a driver refusal, an unreachable database or a
+ * request that never arrived, and gets the fixed sentence above: an unreported message is this
+ * page's own reading of a status rather than the store's statement, and a message the store did
+ * write may name a file, a statement or a host, none of which belongs on this page.
  *
  * @param error The caught value; `catch` binds `unknown`.
  * @returns Copy a visitor can read and act on.
  */
 function notice(error: unknown): string {
-  if (isStorefrontError(error) && error.message.trim().length > 0) {
+  if (error instanceof StorefrontApiError && error.reported && error.message.trim().length > 0) {
     return error.message;
   }
 
@@ -162,7 +173,8 @@ function notice(error: unknown): string {
 /**
  * Reads the page of products and the categories for `query`.
  *
- * Both reads are issued together because neither depends on the other's result, and they are
+ * The authority is established first, because a request cannot be addressed without one. The two
+ * reads that follow are issued together because neither depends on the other's result, and they are
  * awaited as one so the page waits for the slower of the two rather than for their sum. The filters
  * are forwarded by name, and each of the two optional ones is spread in only when it holds a value:
  * this workspace compiles with `exactOptionalPropertyTypes`, under which an unconstrained filter is
@@ -179,13 +191,18 @@ function notice(error: unknown): string {
  */
 async function load(query: CatalogQueryInput): Promise<Listing> {
   try {
+    const origin = storefrontOrigin();
+
     const [products, categories] = await Promise.all([
-      browseCatalog({
-        sort: query.sort,
-        page: query.page,
-        pageSize: query.pageSize,
-        ...(query.categorySlug === undefined ? {} : { categorySlug: query.categorySlug }),
-        ...(query.search === undefined ? {} : { search: query.search }),
+      loadCatalogPage({
+        query: {
+          sort: query.sort,
+          page: query.page,
+          pageSize: query.pageSize,
+          ...(query.categorySlug === undefined ? {} : { categorySlug: query.categorySlug }),
+          ...(query.search === undefined ? {} : { search: query.search }),
+        },
+        origin,
       }),
       listCategoryOptions(),
     ]);

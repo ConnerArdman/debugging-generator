@@ -20,6 +20,7 @@
  * | Headers | `Content-Type: application/json`, `Authorization: Bearer <token>` — and no others |
  * | Body | `{ projectRoot, events }`, `events` being {@link TelemetryEventIngress}[] |
  * | Timeout | {@link INGEST_TIMEOUT_MS}, enforced with an abort signal |
+ * | Redirects | refused (`redirect: 'error'`) |
  *
  * Three of those rows are traps worth naming:
  *
@@ -42,7 +43,7 @@
  * module therefore posts exactly the objects `./convert.ts` produced and adds
  * nothing to them.
  *
- * ## Two drop rules, in this order
+ * ## Three drop rules, in this order
  *
  * The capture gate ({@link CaptureGate}, implemented by `./control.ts`) owns
  * capture state; this processor is what enforces it, on every span, before any
@@ -52,12 +53,27 @@
  *    means no session has armed this process, and the guarantee is that "an
  *    unrelated plan collects no backend or database telemetry" (AAP §0.7.1
  *    Group 1). A span is not merely left unsent — it is never converted.
- * 2. **A disabled signal is dropped by kind.** The span is classified with
- *    {@link classifySpan} and, if the gate does not want that kind, dropped.
+ * 2. **A span belonging to a capture that has been replaced is dropped.**
+ *    `onStart` stamps every span with the capture and generation in force when
+ *    it started, and `onEnd` rejects a stamp that is no longer current. This
+ *    rule exists because an ingest event carries **no capture id**: the service
+ *    assigns `sessionId`, `captureId` and `ingestSeq` on arrival, so a span
+ *    from capture A exported after capture B was armed would be *stored under
+ *    B*. Attribution cannot be corrected downstream, which is why it is
+ *    enforced here, and why `./control.ts` flushes the outgoing capture before
+ *    it arms the next one — that is what gets A's finished spans out while A is
+ *    still the capture the service has open.
+ * 3. **A signal the capture did not ask for is dropped.** The span is
+ *    classified with {@link classifySpan} and offered to the gate, which
+ *    answers on three axes, because one kind is not one signal: the kind
+ *    itself, the *instrumentation source* of a `db.query` span (`prisma` and
+ *    `pg` are independent switches over that single kind), and the *symbol* of
+ *    a `function` span (`functions` is the list of names the plan patched, not
+ *    a switch). Each refusal lands on its own counter.
  *
- * Only a span that survives both is converted, and a conversion that returns
- * `null` is counted and skipped. The order is deliberate: the cheapest check
- * runs first, and the counters it increments are what
+ * Only a span that survives all three is converted, and a conversion that
+ * returns `null` is counted and skipped. The order is deliberate: the cheapest
+ * check runs first, and the counters it increments are what
  * `./control.test.ts` asserts on.
  *
  * ## Batching and backpressure
@@ -81,8 +97,10 @@
  * time and a batch is never posted twice. A batch is taken out of the buffer
  * before it is posted and **is not re-queued on failure**: it is retried in
  * place, bounded by {@link MAX_POST_ATTEMPTS} attempts over a backoff that
- * starts at {@link RECONNECT_MIN_MS} and doubles under a
- * {@link RECONNECT_MAX_MS} ceiling, and then dropped
+ * starts at {@link RECONNECT_MIN_MS}, doubles under a
+ * {@link RECONNECT_MAX_MS} ceiling and carries ±25 % jitter
+ * ({@link computeIngestBackoffMs}) so several attached dev servers do not
+ * retry in lockstep after the service restarts, and then dropped
  * and counted. Re-queuing would let one unsendable batch cycle forever and
  * starve the evidence behind it; losing dev-time telemetry is acceptable,
  * degrading the developer's dev server never is.
@@ -105,6 +123,14 @@
  * status code and counts — and every message is passed through a scrub that
  * removes the token should a foreign error text ever quote it.
  *
+ * Where the credential may travel is checked as well as how it is written. The
+ * constructor re-applies `./config.ts`'s trust boundary
+ * ({@link isTrustedServiceEndpoint}) to the endpoint it was handed: a
+ * non-loopback endpoint disables the transport outright, so no batch and no
+ * `Authorization` header is ever sent to it, and redirects are refused rather
+ * than followed so an answer cannot move a credentialed request somewhere the
+ * check did not cover.
+ *
  * @example Wiring it into the provider
  * ```ts
  * const processor = new DebuggenSpanProcessor({ gate: control, config, logger });
@@ -118,19 +144,26 @@ import type { Context, Span } from '@opentelemetry/api';
 import type { ReadableSpan, SpanProcessor } from '@opentelemetry/sdk-trace-base';
 
 import type { TelemetryEventIngress } from '../schema/event.js';
+import { QUERY_KINDS } from '../schema/kinds.js';
 import type { TelemetryKind } from '../schema/kinds.js';
 import {
   BATCH_FLUSH_INTERVAL_MS,
   BATCH_MAX_EVENTS,
   createPreloadLogger,
   INGEST_TIMEOUT_MS,
+  isTrustedServiceEndpoint,
   MAX_BUFFERED_EVENTS,
   RECONNECT_MAX_MS,
   RECONNECT_MIN_MS,
 } from './config.js';
 import type { PreloadConfig } from './config.js';
-import { classifySpan, createSeqAllocator, spanToIngressEvent } from './convert.js';
-import type { ConvertContext, SeqAllocator } from './convert.js';
+import {
+  classifyDatabaseSource,
+  classifySpan,
+  createSeqAllocator,
+  spanToIngressEvent,
+} from './convert.js';
+import type { ConvertContext, DatabaseSpanSource, SeqAllocator } from './convert.js';
 
 /*
  * ---------------------------------------------------------------------------
@@ -226,16 +259,120 @@ export interface CaptureGate {
   readonly captureId: string | null;
 
   /**
+   * A counter the gate advances every time it opens a capture window.
+   *
+   * The reason it exists: an ingest event carries **no capture id** — the
+   * service assigns `sessionId`, `captureId` and `ingestSeq` when it receives
+   * the batch (module documentation, AAP §0.2.3) — so an event posted after
+   * the service has moved on to capture B is *stored under B*, whatever
+   * capture the work belonged to. Comparing {@link captureId} at `onEnd` does
+   * not catch it either: a span that started inside capture A and ends after B
+   * was armed reads B's id, because that is the only id there is by then.
+   *
+   * So the processor stamps the generation on every span it sees start and
+   * rejects a span whose stamp is not the generation in force when it ends
+   * ({@link DebuggenSpanProcessorStats.droppedStaleCapture}). The value is
+   * meaningful only by inequality; its absolute magnitude says nothing.
+   *
+   * Optional so a two-line fake gate stays a two-line fake gate: a gate that
+   * does not track generations gets no stale detection, which is the honest
+   * degradation for something that never transitions between captures. The
+   * real gate — `./control.ts` — always supplies it.
+   */
+  readonly captureGeneration?: number | undefined;
+
+  /**
    * Whether the capture wants events of this kind.
    *
    * Asked once per span, after the capture check and before any conversion. A
    * plan that plans no database tracing answers `false` for `db.query`, and the
    * span is dropped rather than converted, stored or posted.
    *
+   * The kind is the coarse axis, and a gate that implements
+   * {@link admitSpan} refines it: this method is the fallback the processor
+   * uses when the gate does not.
+   *
    * @param kind The kind `./convert.ts` classified the span as.
    */
   isKindEnabled(kind: TelemetryKind): boolean;
+
+  /**
+   * Whether the capture wants *this span*, with the reason when it does not.
+   *
+   * The kind alone cannot answer the question for two of the signals
+   * `server-agent.config` carries. `prisma` and `pg` are independent switches
+   * over one kind (`db.query`), and `functions` is a list of the exact symbols
+   * the plan patched rather than a switch at all (AAP §0.4.2), so admitting a
+   * span by kind would collect the driver's queries for a plan that asked only
+   * for the ORM's, and every `function` span in the process for a plan that
+   * named one symbol. This method is where those two axes are enforced, and
+   * the verdict says which one refused so the drop is countable rather than
+   * silent.
+   *
+   * Optional for the same reason as {@link captureGeneration}: a gate that
+   * implements only {@link isKindEnabled} keeps the kind-level behaviour.
+   *
+   * @param candidate The classified kind plus the span facts the finer rules
+   * need.
+   * @returns `'admitted'`, or the rule that refused the span.
+   */
+  admitSpan?(candidate: SpanAdmissionCandidate): SpanAdmission;
 }
+
+/**
+ * The facts {@link CaptureGate.admitSpan} judges a span on.
+ *
+ * Deliberately not the span itself: the gate lives in `./control.ts`, which
+ * owns capture *policy* and has no business reading a `ReadableSpan`'s getters
+ * (any of which may throw on a foreign span). The processor reads them once,
+ * inside its own guard, and passes values.
+ */
+export interface SpanAdmissionCandidate {
+  /** The kind `./convert.ts` classified the span as. */
+  readonly kind: TelemetryKind;
+
+  /**
+   * The span's display name, or `''` when it has none.
+   *
+   * For a `function` span this is the patched symbol's name, which is what the
+   * plan's `functions` list holds.
+   */
+  readonly name: string;
+
+  /**
+   * Which instrumentation produced a database span, or `null` for every other
+   * kind and for a database span whose producer cannot be told.
+   */
+  readonly source: DatabaseSpanSource | null;
+
+  /**
+   * The span's attributes, guarded to a plain object.
+   *
+   * Carried so the gate can read a patch's own identity — the `symbol`
+   * attribute `../schema/attributes.ts` declares for the `function` kind —
+   * without this module deciding which key means what.
+   */
+  readonly attributes: Readonly<Record<string, unknown>>;
+}
+
+/**
+ * The verdict of {@link CaptureGate.admitSpan}.
+ *
+ * One member per drop rule, so each refusal lands on its own counter in
+ * {@link DebuggenSpanProcessorStats} and a test can tell "the capture did not
+ * want this kind" from "the capture wanted the other database library".
+ */
+export type SpanAdmission =
+  /** The capture wants the span. */
+  | 'admitted'
+  /** No capture is armed; the gate closed between the two reads. */
+  | 'no-capture'
+  /** The capture's plan asked for no signal that admits this kind. */
+  | 'kind-disabled'
+  /** A database span from the library this capture did not ask for. */
+  | 'source-disabled'
+  /** A `function` span whose symbol is not one this plan patched. */
+  | 'unplanned-function';
 
 /** Everything {@link DebuggenSpanProcessor} takes; only two members are required. */
 export interface DebuggenSpanProcessorOptions {
@@ -266,6 +403,16 @@ export interface DebuggenSpanProcessorOptions {
    * afterwards does not change this instance's behaviour.
    */
   readonly fetchImpl?: typeof fetch | undefined;
+
+  /**
+   * The `[0, 1)` source {@link computeIngestBackoffMs} draws its jitter from,
+   * defaulting to `Math.random`.
+   *
+   * Injectable for the same reason the `fetch` is: a suite asserting the retry
+   * path should not have to wait on a randomised delay, and one asserting the
+   * envelope should be able to pin it to either extreme.
+   */
+  readonly random?: (() => number) | undefined;
 }
 
 /**
@@ -298,6 +445,38 @@ export interface DebuggenSpanProcessorStats {
 
   /** Spans dropped by the second rule: the capture disabled that kind. */
   readonly droppedByKind: number;
+
+  /**
+   * Spans dropped because they belong to a capture that has since been
+   * replaced.
+   *
+   * A span that started inside capture A and ended after capture B was armed.
+   * Its work is A's, an ingest event carries no capture id, and the service
+   * attributes what it receives to the capture that is active when it arrives —
+   * so exporting it would file A's evidence under B. `./control.ts` flushes A
+   * before it arms B, which is what gets A's *finished* spans out in time;
+   * this counter is the ones that were still running.
+   */
+  readonly droppedStaleCapture: number;
+
+  /**
+   * Database spans dropped because the capture asked for the other library.
+   *
+   * `prisma` and `pg` are independent switches over one kind, so a plan that
+   * asked for ORM tracing collects no driver spans even though both
+   * instrumentations may be installed.
+   */
+  readonly droppedBySource: number;
+
+  /**
+   * `function` spans dropped because their symbol is not one this plan
+   * patched.
+   *
+   * Non-zero means a patched function from outside the active plan is still
+   * running in the process — an earlier session's patch that was never
+   * reverted, or a plan version that has since been narrowed.
+   */
+  readonly droppedUnplannedFunction: number;
 
   /**
    * Spans the conversion declined to emit.
@@ -401,13 +580,59 @@ async function sleep(ms: number): Promise<void> {
 
 /**
  * The delay before attempt `attempt` (1-based), doubling from
- * {@link RECONNECT_MIN_MS} and capped at {@link RECONNECT_MAX_MS}.
+ * {@link RECONNECT_MIN_MS}, jittered by ±25 %, and clamped into
+ * `[RECONNECT_MIN_MS, RECONNECT_MAX_MS]`.
+ *
+ * The jitter is the point of the function. A developer restarting the local
+ * service has every attached dev server fail its next batch at once, and a
+ * deterministic envelope then has all of them retry in lockstep — the same
+ * thundering herd on the service's first breath that `control.ts`'s
+ * `computeReconnectDelayMs` spreads, with the same ±25 % window, so the two
+ * outbound paths of one process do not synchronise with each other either.
+ *
+ * Exported with an injectable source of randomness so a suite can assert the
+ * envelope at both extremes rather than sampling it; the processor passes the
+ * source from its own options.
  *
  * @param attempt The attempt that just failed, 1-based.
+ * @param random A `[0, 1)` source; defaults to `Math.random`.
+ * @returns A delay in whole milliseconds, within the envelope.
  */
-function backoffDelayMs(attempt: number): number {
-  const exponent = Math.max(0, attempt - 1);
-  return Math.min(RECONNECT_MAX_MS, RECONNECT_MIN_MS * 2 ** exponent);
+export function computeIngestBackoffMs(
+  attempt: number,
+  random: () => number = Math.random,
+): number {
+  const safeAttempt = Number.isFinite(attempt) && attempt > 1 ? Math.floor(attempt) : 1;
+  // Capping the exponent keeps the arithmetic finite; 2 ** 31 is already far
+  // beyond the ceiling the result is clamped to.
+  const exponent = Math.min(safeAttempt - 1, 31);
+  const base = Math.min(RECONNECT_MAX_MS, RECONNECT_MIN_MS * 2 ** exponent);
+
+  const sample = random();
+  const factor = Number.isFinite(sample) ? 0.75 + Math.min(Math.max(sample, 0), 1) * 0.5 : 1;
+  const jittered = Math.round(base * factor);
+
+  return Math.min(Math.max(jittered, RECONNECT_MIN_MS), RECONNECT_MAX_MS);
+}
+
+/**
+ * The host of an endpoint, for a diagnostic, with no credential in it.
+ *
+ * `URL.host` is host and port only — never userinfo — so this is safe to print
+ * even for an endpoint that failed {@link isTrustedServiceEndpoint} and
+ * therefore carries none of `./config.ts`'s guarantees. A value that will not
+ * parse is described rather than echoed, because an unparseable endpoint is
+ * arbitrary text this module has no business putting in a terminal.
+ *
+ * @param value The endpoint as configured.
+ * @returns The host, or a fixed placeholder.
+ */
+function endpointHostForDiagnostics(value: string): string {
+  try {
+    return new URL(value).host;
+  } catch {
+    return '(unparseable)';
+  }
 }
 
 /**
@@ -427,6 +652,40 @@ function describeError(error: unknown): string {
   }
   return `non-error value of type ${typeof error}`;
 }
+
+/**
+ * The span's display name, or `''` when it has none.
+ *
+ * Guarded because the span may be foreign — a span from an instrumentation
+ * this build has never seen, or a test double — and a getter that throws or a
+ * name that is not a string must become a value the gate can compare, never an
+ * exception on the host's span pipeline.
+ *
+ * @param span The span being judged.
+ */
+function readSpanDisplayName(span: ReadableSpan): string {
+  const name: unknown = span.name;
+  return typeof name === 'string' ? name : '';
+}
+
+/**
+ * The span's attribute bag, guarded to a plain object.
+ *
+ * An array or a primitive under `attributes` becomes an empty bag rather than
+ * something the gate has to defend itself against.
+ *
+ * @param span The span being judged.
+ */
+function readSpanAttributes(span: ReadableSpan): Readonly<Record<string, unknown>> {
+  const attributes: unknown = span.attributes;
+  if (typeof attributes !== 'object' || attributes === null || Array.isArray(attributes)) {
+    return EMPTY_ATTRIBUTES;
+  }
+  return attributes as Readonly<Record<string, unknown>>;
+}
+
+/** The bag {@link readSpanAttributes} answers with when a span has none. */
+const EMPTY_ATTRIBUTES: Readonly<Record<string, unknown>> = Object.freeze({});
 
 /**
  * Release a response body so the underlying socket can be reused.
@@ -484,6 +743,21 @@ type PostOutcome = 'sent' | 'retry' | 'permanent';
 type BatchOutcome = 'sent' | 'failed' | 'unserializable';
 
 /**
+ * What `onStart` records about the capture a span was started in.
+ *
+ * Both members are needed. The generation is what detects a replacement, since
+ * it changes on every arming; the capture id is what detects a span started
+ * while the gate was shut (`null`) and is the id the event's sequence is
+ * scoped to, so the number a span is given belongs to the capture it ran in.
+ */
+interface SpanCaptureStamp {
+  /** The capture armed when the span started, or `null` if none was. */
+  readonly captureId: string | null;
+  /** The gate's generation at that moment, or `undefined` if it tracks none. */
+  readonly generation: number | undefined;
+}
+
+/**
  * Stand-in written wherever a diagnostic might otherwise have quoted the
  * credential.
  *
@@ -539,8 +813,14 @@ export class DebuggenSpanProcessor implements SpanProcessor {
   /** The `fetch` captured at construction, global or injected. */
   readonly #fetchImpl: typeof fetch;
 
-  /** Whether {@link DebuggenSpanProcessor.#fetchImpl} is callable at all. */
+  /**
+   * Whether this processor may post at all: a callable `fetch` **and** an
+   * endpoint the credential is allowed to reach.
+   */
   readonly #transportAvailable: boolean;
+
+  /** The jitter source {@link computeIngestBackoffMs} is called with. */
+  readonly #random: () => number;
 
   /**
    * This processor's `(producerId, captureId)`-scoped sequence.
@@ -552,6 +832,18 @@ export class DebuggenSpanProcessor implements SpanProcessor {
    * test from numbering each other's events.
    */
   readonly #seq: SeqAllocator;
+
+  /**
+   * The capture each span was started in, keyed on the span object itself.
+   *
+   * The SDK hands the same object to `onStart` and to `onEnd` — it is one
+   * `Span` implementing `ReadableSpan` — so the key is available at both ends
+   * without touching the span's own state. A `WeakMap` because the entry must
+   * not outlive the span: this processor lives for the whole dev-server
+   * process, and a `Map` here would be an unbounded leak keyed on every span
+   * the developer's application ever created.
+   */
+  readonly #stamps = new WeakMap<object, SpanCaptureStamp>();
 
   /** Converted events waiting for a flush; the oldest is at index 0. */
   readonly #buffer: TelemetryEventIngress[] = [];
@@ -594,6 +886,15 @@ export class DebuggenSpanProcessor implements SpanProcessor {
   /** {@link DebuggenSpanProcessorStats.droppedByKind} */
   #droppedByKind = 0;
 
+  /** {@link DebuggenSpanProcessorStats.droppedStaleCapture} */
+  #droppedStaleCapture = 0;
+
+  /** {@link DebuggenSpanProcessorStats.droppedBySource} */
+  #droppedBySource = 0;
+
+  /** {@link DebuggenSpanProcessorStats.droppedUnplannedFunction} */
+  #droppedUnplannedFunction = 0;
+
   /** {@link DebuggenSpanProcessorStats.droppedUnconvertible} */
   #droppedUnconvertible = 0;
 
@@ -633,15 +934,35 @@ export class DebuggenSpanProcessor implements SpanProcessor {
     this.#config = options.config;
     this.#logger = options.logger ?? createPreloadLogger();
     this.#seq = createSeqAllocator();
+    this.#random = options.random ?? Math.random;
 
     const resolvedFetch: typeof fetch = options.fetchImpl ?? globalThis.fetch;
     this.#fetchImpl = resolvedFetch;
     // A host without `fetch` is not a shape Node 24 has, but a bundled preload
     // can be loaded anywhere. Establishing it once means a missing transport
     // costs one warning rather than the full backoff envelope per batch.
-    this.#transportAvailable = typeof resolvedFetch === 'function';
-    if (!this.#transportAvailable) {
+    const fetchAvailable = typeof resolvedFetch === 'function';
+
+    // The trust boundary, re-checked here rather than assumed. `./config.ts`
+    // refuses a non-loopback endpoint, so a configuration that came from
+    // `loadPreloadConfig` always passes — but this constructor takes a
+    // `PreloadConfig` the caller supplies, and the credential on it is the
+    // process-scoped server-agent bearer (AAP §0.5.6). One check here means no
+    // path through this class can post that credential, or the developer's
+    // telemetry, to an origin off this machine.
+    const endpointTrusted = isTrustedServiceEndpoint(options.config.ingestUrl);
+
+    this.#transportAvailable = fetchAvailable && endpointTrusted;
+    if (!fetchAvailable) {
       this.#log('warn', 'no fetch implementation is available; server telemetry will be dropped');
+    } else if (!endpointTrusted) {
+      // The host, never the URL: an endpoint that failed the check carries none
+      // of `./config.ts`'s guarantees, including the one about userinfo.
+      this.#log(
+        'warn',
+        'the telemetry ingest endpoint is not a loopback address; no telemetry and no credential will be sent',
+        { host: endpointHostForDiagnostics(options.config.ingestUrl) },
+      );
     }
   }
 
@@ -685,6 +1006,9 @@ export class DebuggenSpanProcessor implements SpanProcessor {
       convertedCount: this.#convertedCount,
       droppedNoCapture: this.#droppedNoCapture,
       droppedByKind: this.#droppedByKind,
+      droppedStaleCapture: this.#droppedStaleCapture,
+      droppedBySource: this.#droppedBySource,
+      droppedUnplannedFunction: this.#droppedUnplannedFunction,
       droppedUnconvertible: this.#droppedUnconvertible,
       droppedOverflow: this.#droppedOverflow,
       droppedUnserializable: this.#droppedUnserializable,
@@ -713,10 +1037,33 @@ export class DebuggenSpanProcessor implements SpanProcessor {
    */
   onStart(span: Span, parentContext: Context): void {
     this.#onStartCount += 1;
-    // The signature is the interface's, and neither argument is needed to
-    // count. They are referenced explicitly so it can stay exact under a lint
-    // gate that reports unused parameters; both statements compile away.
-    void span;
+
+    // Which capture the span belongs to is decided *here*, not when it ends.
+    // A span outlives the moment it started — a slow query, a route handler
+    // awaiting an external call — and by the time it ends the gate may hold a
+    // different capture, at which point nothing about the span says which one
+    // it ran in. Recording the answer costs one `WeakMap` write on a path that
+    // is already inside the developer's request, and it is the only thing that
+    // keeps capture A's work out of capture B's evidence.
+    try {
+      this.#stamps.set(span, {
+        captureId: this.#gate.captureId,
+        generation: this.#gate.captureGeneration,
+      });
+    } catch (error) {
+      // A gate getter that threw, or a span object a `WeakMap` refuses as a
+      // key. The span simply goes unstamped and is judged by the gate's
+      // current state at `onEnd`, exactly as one started before this processor
+      // existed is.
+      this.#internalErrors += 1;
+      this.#log('debug', 'a started span could not be stamped with its capture', {
+        error: describeError(error),
+      });
+    }
+
+    // The interface's signature, and the parent context is not needed to stamp.
+    // Referenced explicitly so the signature can stay exact under a lint gate
+    // that reports unused parameters; the statement compiles away.
     void parentContext;
   }
 
@@ -746,7 +1093,18 @@ export class DebuggenSpanProcessor implements SpanProcessor {
         return;
       }
 
-      // Rule 2 - the capture decides which signals it wants. Classification is
+      // Rule 2 - the span must belong to the capture that is current. Ahead of
+      // classification because it is two comparisons and because it is the
+      // rule that keeps one capture's evidence out of another's: the event
+      // carries no capture id of its own, so whatever is exported now is
+      // filed under whatever the service has armed now.
+      const stamp = this.#stamps.get(span);
+      if (stamp !== undefined && this.#isStaleStamp(stamp, captureId)) {
+        this.#droppedStaleCapture += 1;
+        return;
+      }
+
+      // Rule 3 - the capture decides which signals it wants. Classification is
       // cheap (attributes, name, scope) and strictly less work than a full
       // conversion, so a disabled kind never pays for one.
       const classification = classifySpan(span);
@@ -754,13 +1112,15 @@ export class DebuggenSpanProcessor implements SpanProcessor {
         this.#droppedUnconvertible += 1;
         return;
       }
-      if (!this.#gate.isKindEnabled(classification.kind)) {
-        this.#droppedByKind += 1;
+      if (!this.#admit(span, classification.kind)) {
         return;
       }
 
       const context: ConvertContext = {
-        captureId,
+        // The capture the span *ran in*, which the stale check has just proved
+        // is the current one — stated through the stamp where there is one so
+        // the sequence a span is numbered in cannot belong to another capture.
+        captureId: stamp?.captureId ?? captureId,
         producerId: this.#config.producerId,
         seq: this.#seq,
       };
@@ -779,6 +1139,93 @@ export class DebuggenSpanProcessor implements SpanProcessor {
       this.#log('debug', 'span was dropped by an internal failure', {
         error: describeError(error),
       });
+    }
+  }
+
+  /**
+   * Whether a span's stamp names a capture other than the one in force.
+   *
+   * Two independent comparisons, because they catch different things. The
+   * capture id catches the ordinary replacement — a span that started in A and
+   * ends once B is armed, or one that started while the gate was shut and ends
+   * inside a capture. The generation catches a capture arming *twice* under the
+   * same id, which the id alone cannot distinguish: a disable and a re-arm in
+   * between mean the earlier span's work belongs to a window the service has
+   * already closed.
+   *
+   * A gate that tracks no generation ({@link CaptureGate.captureGeneration} is
+   * optional) is judged by the capture id alone.
+   *
+   * @param stamp What `onStart` recorded for this span.
+   * @param captureId The capture armed now, already known to be non-`null`.
+   */
+  #isStaleStamp(stamp: SpanCaptureStamp, captureId: string): boolean {
+    if (stamp.captureId !== captureId) {
+      return true;
+    }
+    const generation = this.#gate.captureGeneration;
+    return (
+      stamp.generation !== undefined && generation !== undefined && stamp.generation !== generation
+    );
+  }
+
+  /**
+   * Ask the gate for this span, count the refusal, and answer whether to
+   * convert it.
+   *
+   * The kind is one axis and it is not sufficient on its own: `prisma` and
+   * `pg` are independent switches over the single `db.query` kind, and
+   * `functions` names exact symbols rather than switching a kind on, so the
+   * gate is offered the span's facts and returns which rule applies. A gate
+   * that implements only {@link CaptureGate.isKindEnabled} keeps the
+   * kind-level behaviour, which is what a minimal fake gets.
+   *
+   * The facts are read here rather than in the gate: reading them is what can
+   * throw on a foreign span, and this method runs inside `onEnd`'s guard.
+   *
+   * @param span The span that ended.
+   * @param kind The kind `./convert.ts` classified it as.
+   * @returns `true` to convert and enqueue it.
+   */
+  #admit(span: ReadableSpan, kind: TelemetryKind): boolean {
+    const gate = this.#gate;
+    if (typeof gate.admitSpan !== 'function') {
+      if (gate.isKindEnabled(kind)) {
+        return true;
+      }
+      this.#droppedByKind += 1;
+      return false;
+    }
+
+    const candidate: SpanAdmissionCandidate = {
+      kind,
+      name: readSpanDisplayName(span),
+      // Only a database span has a source to tell, and telling it costs a
+      // scope read and two string comparisons, so it is not paid for the
+      // request and render spans that make up most of a capture.
+      source: QUERY_KINDS.includes(kind) ? classifyDatabaseSource(span) : null,
+      attributes: readSpanAttributes(span),
+    };
+
+    switch (gate.admitSpan(candidate)) {
+      case 'admitted':
+        return true;
+      case 'source-disabled':
+        this.#droppedBySource += 1;
+        return false;
+      case 'unplanned-function':
+        this.#droppedUnplannedFunction += 1;
+        return false;
+      case 'no-capture':
+        // The gate closed between the capture read at the top of `onEnd` and
+        // this call. Counted as what it is rather than as a kind refusal.
+        this.#droppedNoCapture += 1;
+        return false;
+      default:
+        // `'kind-disabled'`, and any verdict a newer gate invents: a span the
+        // capture did not ask for is dropped, never admitted by default.
+        this.#droppedByKind += 1;
+        return false;
     }
   }
 
@@ -835,6 +1282,43 @@ export class DebuggenSpanProcessor implements SpanProcessor {
       this.#droppedAtShutdown += abandoned;
       this.#log('debug', 'buffered events were abandoned at shutdown', { events: abandoned });
     }
+  }
+
+  /**
+   * Make this processor usable again, after a tracer provider shut it down.
+   *
+   * This exists because of a mismatch between two lifetimes. OpenTelemetry's
+   * SDK treats a span processor as owned by the provider it was constructed
+   * with, and `TracerProvider.shutdown()` shuts its processors down — but this
+   * processor is deliberately **shared across providers**: `register.ts`
+   * constructs exactly one and hands it to every provider the capture
+   * lifecycle builds, so its buffer, its transport and its sequence survive
+   * each enable/disable cycle. Without this method the provider shutdown that
+   * ends the first capture would close the processor for good, and every span
+   * of the *second* capture would be counted as
+   * {@link DebuggenSpanProcessorStats.droppedAfterShutdown} — a session whose
+   * second reproduction silently produced no server telemetry at all.
+   *
+   * Idempotent, and it deliberately does **not** undo the abandonment
+   * `shutdown()` performed: whatever was still buffered then is already lost
+   * and counted, and resurrecting it would post the previous capture's
+   * evidence into the next one.
+   *
+   * Only the lifecycle owner (`./control.ts`, when it installs a replacement
+   * provider) calls this. Nothing calls it on the process-exit path, where the
+   * shutdown is final.
+   */
+  reopen(): void {
+    if (!this.#shuttingDown && !this.#shutdownComplete) {
+      return;
+    }
+    this.#shuttingDown = false;
+    this.#shutdownComplete = false;
+    // Anything that arrived between the shutdown and now was dropped, so the
+    // buffer is either empty or holds spans enqueued since; either way the
+    // window is re-armed rather than assumed.
+    this.#armFlushTimer();
+    this.#log('debug', 'the span processor was reopened for a new tracer provider');
   }
 
   /*
@@ -1054,7 +1538,7 @@ export class DebuggenSpanProcessor implements SpanProcessor {
         return 'failed';
       }
       if (attempt < maxAttempts) {
-        await sleep(backoffDelayMs(attempt));
+        await sleep(computeIngestBackoffMs(attempt, this.#random));
       }
     }
 
@@ -1085,6 +1569,14 @@ export class DebuggenSpanProcessor implements SpanProcessor {
           Authorization: `Bearer ${this.#config.token}`,
         },
         body,
+        // Refused, not followed. The endpoint was accepted as loopback before
+        // this request existed, and a redirect would move the request — with
+        // the server-agent credential on it — to an origin nothing checked. The
+        // local service answers ingest directly, so a 3xx here is a
+        // misconfiguration or a hostile listener, and either way the batch is
+        // better retried than redirected. `fetch` rejects, which the catch
+        // below treats as a transport failure.
+        redirect: 'error',
         // Bounded, so a wedged service cannot leave a request pending and stall
         // the drain chain behind it.
         signal: AbortSignal.timeout(INGEST_TIMEOUT_MS),

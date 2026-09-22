@@ -8,6 +8,19 @@
  * checkout summary repeats both beside the order being placed. The figures are worked out here,
  * in one place, so none of those surfaces can arrive at a different answer from the others.
  *
+ * EVERY FIGURE PUBLISHED HERE IS MERCHANDISE ONLY, AND NONE OF THEM IS AN ORDER TOTAL
+ * The lines the cart holds are all this module can see. It therefore publishes what those lines
+ * come to and what that qualifies for - a subtotal, a unit count, a line count, the free-freight
+ * threshold and the shortfall against it - and it publishes no freight charge, no discount, no tax
+ * and no order total, because none of those is a property of a cart: they belong to the order the
+ * checkout request creates, and the storefront's own free-freight offer is measured against the
+ * subtotal below rather than applied to an order by the checkout service. So a surface printing
+ * `subtotalCents` must label it as the merchandise subtotal it is, and a surface that has to state
+ * what an order comes to must add the charges it knows about to this figure and say which of them
+ * are still unsettled - which is exactly what the checkout review column does with
+ * `@/components/cart/CartTotalsPanel`. A figure from here printed under the word "Total" would
+ * quote a buyer less than the order they are about to place.
+ *
  * Every figure is summed from the lines the cart published, and every string beside it comes from
  * `@/lib/format`. Money and counts are deliberately not formatted in this module: that one pins
  * the store's locale, currency and time zone, which is what keeps the markup the server rendered
@@ -40,7 +53,10 @@ export interface CartSummary {
   readonly unitCount: number;
   /** True while the cart holds no lines at all, which is what a blank slate is shown for. */
   readonly isCartEmpty: boolean;
-  /** The lines' totals summed, in cents. */
+  /**
+   * The lines' totals summed, in cents: the merchandise subtotal, and never an order total.
+   * Freight, discounts and tax are not in it - see the note at the head of this module.
+   */
   readonly subtotalCents: number;
   /** Wording for {@link CartSummary.subtotalCents}, for example `'$1,299.00'`. */
   readonly subtotalLabel: string;
@@ -110,9 +126,10 @@ function buildCartSummary(cart: CartContextValue): CartSummary {
  *
  * A consumer renders straight from the returned {@link CartSummary}: `lineCount` and `unitCount`
  * with their wording for the two counts a cart is quoted by, `subtotalCents` and `subtotalLabel`
- * for the money, `freeFreightRemainingLabel` with `qualifiesForFreeFreight` for the free-carriage
- * line, and `estimatedDeliveryLabel` with `dispatchCountdownMs` for the delivery promise printed
- * beside them. `isCartEmpty` is what a surface shows its blank slate for.
+ * for the money - which is the merchandise subtotal and nothing more, so a consumer labels it as
+ * one - `freeFreightRemainingLabel` with `qualifiesForFreeFreight` for the free-carriage line, and
+ * `estimatedDeliveryLabel` with `dispatchCountdownMs` for the delivery promise printed beside
+ * them. `isCartEmpty` is what a surface shows its blank slate for.
  *
  * The cart's own state is deliberately not repeated here. A surface that has to say a change is
  * being saved, or show wording in place of a total it no longer trusts, reads `syncStatus` and

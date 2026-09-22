@@ -21,10 +21,21 @@
  *     retry, placeholders while the cart is first read, the block that says the cart is empty, and
  *     the lines. That is why no lines are passed to it, and why the empty case is left to it
  *     wherever the list is shown rather than being decided a second time here.
- *   - `CartTotalsPanel` reads the totals itself and prints every figure - the units, the subtotal,
- *     the closing total, the free-freight state and the dispatch promise. It renders inside
+ *   - `CartTotalsPanel` reads the cart's totals itself and prints every figure - the units, the
+ *     merchandise subtotal, the charge rows this column hands it, the closing figure they add up
+ *     to, the free-freight state and the dispatch promise. It renders inside
  *     `@/components/ui/Card`, so `.totals` below is placement only and nothing wraps it in a
  *     second card.
+ *
+ * THE CHARGE ROWS ARE THIS COLUMN'S ONE CONTRIBUTION TO THE FIGURES
+ * A cart knows what the merchandise comes to and nothing else, so a review column that printed
+ * that subtotal as the order's total would quote a buyer less than the order they are about to
+ * place - the freight they chose is part of it. So this column names the charges: the freight the
+ * buyer chose, which `./CheckoutCharges` carries here from `./CheckoutForm` beside it, and the
+ * discount and the tax, which the endpoint settles when it writes the order and which are
+ * therefore listed with no amount rather than left out. `CartTotalsPanel` labels its closing row
+ * "Estimated total" for as long as any of them is unsettled, which is the truthful description of
+ * a figure assembled from a priced cart, a quoted rate and two charges nobody has computed yet.
  *
  * `variant="page"` for both, which is the arrangement `/cart` uses: the document scrolls, so
  * neither block caps its own height the way the cart drawer's compact variant does. A capped,
@@ -38,6 +49,13 @@
  * string is either published by that hook or produced by `@/lib/format`, which pins the store's
  * locale, currency and time zone. The cart itself belongs to `@/providers/CartProvider`: this file
  * issues no request, keeps no copy of the lines and imports no API client.
+ *
+ * That still holds now that a freight amount appears in the column, and it is worth saying why:
+ * the figure is *published to* this column, not derived in it. `./CheckoutForm` holds the freight
+ * lookup for the destination in its own fields, prices the chosen service exactly as the service
+ * group prints it, and publishes the result; this file reads that value and hands it on in a
+ * charge row. No rate is looked up here, no service is chosen here, and the cents are added up by
+ * the component that prints the closing row.
  *
  * HEADINGS AND THE READING ORDER
  * The column is a `<section>` named by its own heading, so it is reachable as a landmark, and that
@@ -55,11 +73,13 @@ import clsx from 'clsx';
 import type { ReactElement } from 'react';
 
 import { CartLineList } from '@/components/cart/CartLineList';
-import { CartTotalsPanel } from '@/components/cart/CartTotalsPanel';
+import { CartTotalsPanel, type CartCharge } from '@/components/cart/CartTotalsPanel';
 import { BlankSlate } from '@/components/ui/BlankSlate';
 import { VisuallyHidden } from '@/components/ui/VisuallyHidden';
 import { useCartSummary } from '@/hooks/useCartSummary';
 import { formatQuantityLabel } from '@/lib/format';
+
+import { useSelectedFreight } from './CheckoutCharges';
 
 import styles from './CheckoutSummaryPanel.module.css';
 
@@ -100,13 +120,51 @@ const EMPTY_BODY =
  */
 const EMPTY_ART_ALT = 'An empty shopping cart';
 
+/* ---------------------------------------------------------------------------
+ * The charge rows
+ *
+ * Three rows, in the order a buyer reads them, and each is a statement about what is known rather
+ * than a figure invented to fill a column. Their ids are the charges' own names, which is what
+ * `CartCharge` keys its rows on; their labels are what the column prints.
+ * ------------------------------------------------------------------------- */
+
+/** The freight row: the rate quoted for the service chosen in the form beside this column. */
+const FREIGHT_CHARGE_ID = 'freight';
+const FREIGHT_CHARGE_LABEL = 'Freight';
+
 /**
- * The caption under the figures: what the column does not yet include, stated as a note about the
- * review rather than as an amount. Freight, discounts and tax belong to the order the checkout
- * request creates, so quoting any of them beside a cart subtotal would put a figure on the page
- * that no server computed.
+ * The discount row. Listed with no amount on purpose: contract prices and promotions are applied
+ * by the checkout service against the data of the moment, so the only honest thing this review can
+ * say about them is that they are settled on the order.
  */
-const REVIEW_NOTE = 'Freight, discounts and tax are confirmed on the order when it is placed.';
+const DISCOUNT_CHARGE_ID = 'discounts';
+const DISCOUNT_CHARGE_LABEL = 'Discounts';
+
+/** The tax row, for the same reason: the order's destination decides it, and the order is not
+ * written yet. */
+const TAX_CHARGE_ID = 'tax';
+const TAX_CHARGE_LABEL = 'Tax';
+
+/**
+ * The caption under the figures: what the rows above it are and are not.
+ *
+ * Every clause is load-bearing, and each one is a claim some server stands behind. The freight
+ * figure is the rate the carrier quoted for this shipment - these units, to this destination, by
+ * the chosen service - which is the same question `POST /api/checkout` puts to the carrier when it
+ * writes the order, so the note says it is quoted for the order and re-rated when the order is
+ * placed rather than promising it as the final charge. The discount and the tax carry no amount
+ * because the checkout request works both out against the data of the moment. And the closing
+ * figure is called an estimate for exactly as long as any of that is unsettled.
+ *
+ * What the note deliberately does not mention is a freight allowance. The storefront's
+ * free-freight offer is a property of the cart's merchandise subtotal and the checkout service
+ * charges the quoted freight whatever that subtotal is, so a clause about an allowance being
+ * "settled on the order" would be this page promising a reduction no server applies.
+ */
+const REVIEW_NOTE =
+  'Freight is the rate quoted for these units, this destination and the chosen service, and it is ' +
+  're-rated when the order is placed. Discounts and tax are worked out on the order at that ' +
+  'point, so the total above is an estimate rather than the final charge.';
 
 /**
  * The column's inputs.
@@ -160,6 +218,7 @@ export function CheckoutSummaryPanel({
   className,
 }: Props): ReactElement {
   const summary = useCartSummary();
+  const freight = useSelectedFreight();
 
   const trimmed = heading.trim();
   const title = trimmed.length > 0 ? trimmed : DEFAULT_HEADING;
@@ -189,6 +248,34 @@ export function CheckoutSummaryPanel({
    */
   const totalsShown = showLines || !summary.isCartEmpty;
 
+  /*
+   * What the order adds to the merchandise subtotal, as the totals block prints it.
+   *
+   * The freight row is the published charge when the buyer has chosen a service and a rate exists
+   * for it - with the service's own wording as the row's quiet detail, so the row says which
+   * service the figure is for - and a row with no amount before that, because a freight charge
+   * nobody has quoted yet is not a freight charge of nothing. The other two carry no amount at
+   * all: the checkout service applies contract prices and promotions and works out tax when it
+   * writes the order, so this column lists them as charges still to be settled rather than
+   * omitting them and letting the closing figure look complete.
+   *
+   * Built on each render and handed straight down. There is no `useMemo` here and none is wanted:
+   * the block below holds no `memo`, so a stable array identity would buy nothing, and the cart
+   * this column quotes re-renders it several times a second anyway (AAP 0.8.2 defect 2).
+   */
+  const charges: readonly CartCharge[] = [
+    freight === null
+      ? { id: FREIGHT_CHARGE_ID, label: FREIGHT_CHARGE_LABEL, amountCents: null }
+      : {
+          id: FREIGHT_CHARGE_ID,
+          label: FREIGHT_CHARGE_LABEL,
+          detail: freight.label,
+          amountCents: freight.amountCents,
+        },
+    { id: DISCOUNT_CHARGE_ID, label: DISCOUNT_CHARGE_LABEL, amountCents: null },
+    { id: TAX_CHARGE_ID, label: TAX_CHARGE_LABEL, amountCents: null },
+  ];
+
   return (
     <section className={clsx(styles.root, className)} aria-label={title}>
       <h2 className={styles.heading}>{title}</h2>
@@ -206,7 +293,7 @@ export function CheckoutSummaryPanel({
 
       {totalsShown ? (
         <div className={styles.totals}>
-          <CartTotalsPanel variant="page" heading={SUPPRESSED_TOTALS_HEADING} />
+          <CartTotalsPanel variant="page" heading={SUPPRESSED_TOTALS_HEADING} charges={charges} />
         </div>
       ) : (
         /*

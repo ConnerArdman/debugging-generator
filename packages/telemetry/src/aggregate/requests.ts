@@ -41,6 +41,47 @@
  * two or more occurrences counts, and `duplicateCount` reports the number of
  * *redundant* occurrences rather than the number of windows.
  *
+ * ## Transferred bytes arrive by a join, not from the request span
+ *
+ * A request span cannot report how many bytes crossed the wire: `fetch` and
+ * `XMLHttpRequest` expose no such figure, and the only browser API that does
+ * is `PerformanceResourceTiming` (AAP 0.6.6). `../browser/perf.ts` observes
+ * those entries as `perf.entry` events, and this module is where the two
+ * halves of one exchange are put back together — {@link joinResourceTimings},
+ * the "join resource entries to `fetch` spans by URL and start time" the
+ * producer modules are written against.
+ *
+ * Four rules make the join safe to base a metric on:
+ *
+ * - **Identity is a URL, compared after redaction.** A request event carries
+ *   `resourceTimingUrl`, the absolute URL the browser will file its resource
+ *   entry under, beside the `url` the application wrote; a resource entry
+ *   carries that same absolute URL as its own `url`. Redaction is
+ *   deterministic and masks both through the same handler, so the masked
+ *   strings match exactly when the raw ones did. The as-written `url` is the
+ *   fallback identity, for a producer that predates the key.
+ * - **Timing narrows what identity cannot.** Masking makes `?id=1` and
+ *   `?id=2` indistinguishable, so identity alone could attach one response's
+ *   bytes to another request for the same path. A candidate qualifies only if
+ *   it started inside the request's own window, widened by
+ *   {@link DEFAULT_RESOURCE_TIMING_TOLERANCE_MS}, and among the qualifying
+ *   candidates the closest start wins.
+ * - **One entry, one request.** A claimed entry is never offered again, so two
+ *   requests for the same URL take two different entries and a group's
+ *   `transferredBytes` can never count one response twice. Claims are recorded
+ *   on the occurrence (`transferEventId`) and on the group
+ *   (`transferEventIds`) precisely so `./summary.ts` can add the resource
+ *   entries *nobody* claimed without double-counting the ones that were.
+ * - **Bytes must have been exposed.** A cross-origin response served without
+ *   `Timing-Allow-Origin` reports `transferSize: 0`, which is an absence
+ *   rather than a measurement; {@link readExposedTransferSize} is the single
+ *   reader that tells the two apart, and an unexposed entry is not a candidate
+ *   at all.
+ *
+ * The join is a function of the events alone: occurrences are considered in
+ * canonical order and candidates in start order, so the same capture yields
+ * the same pairing however the events arrived.
+ *
  * ## Purity
  *
  * The input is an already-ingested, already-redacted event list. This module
@@ -53,9 +94,13 @@
 import type { EventId, SourceLocation, SpanId, TraceId } from '@debuggen/shared';
 import { clampNonNegative, roundMs } from '@debuggen/shared';
 
-import { FETCH_ATTRIBUTE_KEYS, SERVICE_ASSIGNED_ATTRIBUTE_KEYS } from '../schema/attributes.js';
+import {
+  FETCH_ATTRIBUTE_KEYS,
+  PERF_ENTRY_ATTRIBUTE_KEYS,
+  SERVICE_ASSIGNED_ATTRIBUTE_KEYS,
+} from '../schema/attributes.js';
 import type { TelemetryEvent } from '../schema/event.js';
-import { REQUEST_KINDS, type TelemetryKind } from '../schema/kinds.js';
+import { PERF_KINDS, REQUEST_KINDS, type TelemetryKind } from '../schema/kinds.js';
 
 /*
  * ---------------------------------------------------------------------------
@@ -102,6 +147,58 @@ const TRANSFER_SIZE_ATTRIBUTE: RequestAttributeKey = 'transferSize';
 
 /** The service-assigned grouping key described in this module's header. */
 const REQUEST_KEY_ATTRIBUTE: RequestAttributeKey = 'request_key';
+
+/**
+ * A key the attribute catalog declares for resource-timing entries.
+ *
+ * The join reads the other half of the exchange, so the resource-entry
+ * vocabulary types its constants exactly as the request vocabulary types the
+ * ones above.
+ */
+type ResourceAttributeKey = (typeof PERF_ENTRY_ATTRIBUTE_KEYS)[number];
+
+/**
+ * Which `PerformanceEntry` type a `perf.entry` event describes.
+ *
+ * `perf.entry` covers resource loads and paint marks, and only the first can
+ * carry bytes, so the join reads this key instead of inferring the shape from
+ * which other attributes happen to be present.
+ */
+const ENTRY_TYPE_ATTRIBUTE: ResourceAttributeKey = 'entry.type';
+
+/** The resource entry's own URL: absolute, and the join's identity. */
+const RESOURCE_URL_ATTRIBUTE: ResourceAttributeKey = 'url';
+
+/** What initiated the load — `fetch`, `xmlhttprequest`, `script`, `link`, … */
+const INITIATOR_TYPE_ATTRIBUTE: ResourceAttributeKey = 'initiator.type';
+
+/**
+ * The absolute URL a request event will appear under in the Resource Timing
+ * buffer.
+ *
+ * **Not declared by the catalog.** `../browser/fetch.ts` invents the spelling
+ * and documents why the key exists; this is the consumer-side half of the same
+ * contract, exported so a test can pin the two spellings together and so
+ * `./summary.ts` never re-states it. When `../schema/attributes.ts` adopts the
+ * key in the `fetch` and `xhr` tuples, this constant becomes a typed read of
+ * the catalog like its neighbours above.
+ */
+export const RESOURCE_TIMING_URL_ATTRIBUTE = 'resourceTimingUrl';
+
+/**
+ * Whether Resource Timing exposed byte counts for an event at all.
+ *
+ * **Not declared by the catalog.** `../browser/perf.ts` invents the spelling
+ * and states the reasoning: a cross-origin response served without
+ * `Timing-Allow-Origin` reports every size as `0`, which is indistinguishable
+ * by value from a same-origin response that genuinely transferred nothing, so
+ * the producer answers the question explicitly rather than leaving a consumer
+ * to guess. Exported for the same reasons as
+ * {@link RESOURCE_TIMING_URL_ATTRIBUTE}, and read by
+ * {@link readExposedTransferSize}, which is the only place either module
+ * interprets it.
+ */
+export const TRANSFER_SIZE_EXPOSED_ATTRIBUTE = 'transferSizeExposed';
 
 /**
  * Whether the grouping key is still a service-assigned attribute.
@@ -188,6 +285,51 @@ export const REQUEST_GROUPED_BY = Object.freeze(['request-key', 'method-path'] a
 /** @see REQUEST_GROUPED_BY */
 export type RequestGroupedBy = (typeof REQUEST_GROUPED_BY)[number];
 
+/**
+ * How far outside a request's own window a resource entry may have started and
+ * still be considered the same exchange, in milliseconds.
+ *
+ * A resource entry's `startTime` is the fetch start, so it lies inside the
+ * request span in the ordinary case and this tolerance covers only the ways the
+ * two readings can disagree at the edges: the request event's duration is
+ * rounded to milliseconds before it reaches here, the two producers timestamp
+ * at slightly different points of the same operation, and a `fetch` promise
+ * settles when the headers arrive while the entry is completed when the body
+ * does.
+ *
+ * Deliberately small. Widening it does not find more matches — identity has
+ * already narrowed the candidates to one URL — it only makes it likelier that
+ * a *different* request for the same masked URL is credited with this
+ * response's bytes, which is the one error the join must not make.
+ */
+export const DEFAULT_RESOURCE_TIMING_TOLERANCE_MS = 50;
+
+/**
+ * The `entry.type` value of a resource load.
+ *
+ * Named once here because the join tests for it twice: a `perf.entry` event
+ * whose type is something else (a paint mark) never carries bytes, and one
+ * whose type is missing is admitted, because a producer that omits the label
+ * but reports a size has still measured a response.
+ */
+export const RESOURCE_ENTRY_TYPE = 'resource';
+
+/**
+ * Where an occurrence's `transferredBytes` came from.
+ *
+ * `request` means the request event carried its own exposed size — the
+ * authoritative reading when it exists, since it is the page's own account of
+ * its own request. `resource-timing` means the number was joined from a
+ * `PerformanceResourceTiming` entry, which is the ordinary case in a browser
+ * capture because no request API reports a size at all (AAP 0.6.6). The panel
+ * and the analysis stage can weigh a number differently for knowing which it
+ * is, and a reader of a group's total can see whether a join happened.
+ */
+export const REQUEST_TRANSFER_SOURCES = Object.freeze(['request', 'resource-timing'] as const);
+
+/** @see REQUEST_TRANSFER_SOURCES */
+export type RequestTransferSource = (typeof REQUEST_TRANSFER_SOURCES)[number];
+
 /*
  * ---------------------------------------------------------------------------
  * Shapes
@@ -233,8 +375,29 @@ export interface RequestOccurrence {
   readonly initiator?: string;
   /** Where the request was issued from, when a location could be resolved. */
   readonly source?: SourceLocation;
-  /** Bytes over the wire, when the timing entry exposed them. */
+  /**
+   * Bytes over the wire, when a reading was exposed for this occurrence.
+   *
+   * Absent whenever nothing measured the response — which is the ordinary case
+   * for a cross-origin request (AAP 0.6.6) — never `0` standing in for
+   * unknown. {@link transferSource} says where a present figure came from.
+   */
   readonly transferredBytes?: number;
+  /**
+   * Which side of the join supplied {@link transferredBytes}; absent with it.
+   */
+  readonly transferSource?: RequestTransferSource;
+  /**
+   * The resource-timing event this occurrence was joined to, when the join
+   * found one.
+   *
+   * Present whenever a candidate was claimed, including when the request's own
+   * size won as the authoritative reading: the id records the *claim*, which
+   * is what stops the same response being counted a second time as an
+   * unattributed resource entry. A panel can also use it to open the timing
+   * entry behind a byte figure.
+   */
+  readonly transferEventId?: EventId;
   /** The tier that produced the event. */
   readonly tier: TelemetryEvent['tier'];
   /** The request kind (a member of the catalog's request kind group). */
@@ -336,14 +499,29 @@ export interface RequestGroup {
    */
   readonly initiators: readonly string[];
   /**
-   * Summed bytes over the wire, absent unless at least one occurrence reported
-   * a size.
+   * Summed bytes over the wire, absent unless at least one occurrence has a
+   * size.
    *
-   * `transferSize` is exposed for same-origin fetches only (AAP 0.6.6 records
-   * this as a known gap), so the field must be able to be missing for the
-   * metric card to show "n/a" rather than a misleading zero.
+   * `transferSize` is exposed for same-origin responses only (AAP 0.6.6
+   * records this as a known gap), so the field must be able to be missing for
+   * the metric card to show "n/a" rather than a misleading zero. Summed over
+   * the occurrences that have a figure, each counted once — see the header's
+   * "one entry, one request".
    */
   readonly transferredBytes?: number;
+  /**
+   * The resource-timing events this group's occurrences claimed, ascending,
+   * absent when the join matched nothing.
+   *
+   * Identifiers only, like {@link DuplicateWindow.eventIds}, and the reason
+   * the group carries them rather than leaving them on the occurrences: an
+   * occurrence list is bounded by
+   * {@link RequestAggregateOptions.maxOccurrencesPerGroup} and is omitted
+   * entirely when a caller wants arithmetic without samples, while
+   * `./summary.ts` must know every claim to add the *unclaimed* resource
+   * entries to `transferred_bytes` without counting a response twice.
+   */
+  readonly transferEventIds?: readonly EventId[];
   /** Occurrences in canonical order, bounded by the option of the same name. */
   readonly occurrences: readonly RequestOccurrence[];
   /** Whether {@link occurrences} omits occurrences that {@link count} includes. */
@@ -365,6 +543,13 @@ export interface RequestAggregateOptions {
    * while leaving every count intact.
    */
   readonly maxOccurrencesPerGroup?: number;
+  /**
+   * Tolerance for the resource-timing join, in milliseconds; defaults to
+   * {@link DEFAULT_RESOURCE_TIMING_TOLERANCE_MS}. A negative or non-finite
+   * value falls back to the default; zero requires the entry to have started
+   * inside the request's window exactly.
+   */
+  readonly resourceTimingToleranceMs?: number;
 }
 
 /*
@@ -482,6 +667,51 @@ function readNonNegativeNumber(event: TelemetryEvent, key: string): number | und
     return undefined;
   }
   return value;
+}
+
+/**
+ * The transfer size an event **measured**, or `undefined` when it measured
+ * none.
+ *
+ * The single reader of byte counts in the aggregate layer, exported so that
+ * `./summary.ts` applies exactly this rule to the `transferred_bytes` metric
+ * rather than a second reading of the same attributes. Three cases, in order:
+ *
+ * 1. The producer says the counts were **not exposed**
+ *    ({@link TRANSFER_SIZE_EXPOSED_ATTRIBUTE} is `false`). Decisive: the value
+ *    beside it is the specification's `0` for a failed timing-allow check, not
+ *    a measurement, and reporting it would present an absence as an
+ *    observation (AAP 0.6.6, 0.8.4).
+ * 2. The producer says they **were** exposed. The reading is taken as it
+ *    stands, `0` included — a same-origin response served from cache really
+ *    did transfer nothing.
+ * 3. The producer says **nothing**, which is how an event from a producer that
+ *    predates the exposure contract arrives. A positive number is then still a
+ *    measurement (nothing withheld reports bytes it did not transfer), while a
+ *    bare `0` is ambiguous and is therefore not counted. That is the
+ *    conservative direction the metric requires: `n/a` is the honest answer
+ *    when "nothing was transferred" and "nothing was measured" cannot be told
+ *    apart.
+ *
+ * A non-numeric, negative or non-finite value is never a reading in any case.
+ *
+ * @param event Any already-ingested event.
+ * @returns The measured bytes, or `undefined`.
+ */
+export function readExposedTransferSize(event: TelemetryEvent): number | undefined {
+  const bytes = readNonNegativeNumber(event, TRANSFER_SIZE_ATTRIBUTE);
+  if (bytes === undefined) {
+    return undefined;
+  }
+
+  const exposed = readAttribute(event, TRANSFER_SIZE_EXPOSED_ATTRIBUTE);
+  if (exposed === false) {
+    return undefined;
+  }
+  if (exposed === true) {
+    return bytes;
+  }
+  return bytes > 0 ? bytes : undefined;
 }
 
 /**
@@ -604,8 +834,15 @@ interface GroupAccumulator {
   readonly statusCodes: Set<number>;
   errorCount: number;
   readonly initiators: Set<string>;
-  /** Stays `undefined` until an occurrence actually reports a size. */
+  /** Stays `undefined` until an occurrence actually has a size. */
   transferredBytes: number | undefined;
+  /**
+   * Resource-timing events this group's occurrences claimed.
+   *
+   * Collected here rather than read back off the published occurrence list,
+   * which the caller's bound may have truncated or omitted.
+   */
+  readonly transferEventIds: Set<EventId>;
 }
 
 /**
@@ -639,6 +876,7 @@ function createAccumulator(
     errorCount: 0,
     initiators: new Set<string>(),
     transferredBytes: undefined,
+    transferEventIds: new Set<EventId>(),
   };
 }
 
@@ -688,6 +926,9 @@ function mergeOccurrence(
   if (occurrence.transferredBytes !== undefined) {
     accumulator.transferredBytes =
       (accumulator.transferredBytes ?? 0) + occurrence.transferredBytes;
+  }
+  if (occurrence.transferEventId !== undefined) {
+    accumulator.transferEventIds.add(occurrence.transferEventId);
   }
   if (isEarlierThanRepresentative(occurrence, accumulator)) {
     accumulator.method = method;
@@ -806,6 +1047,9 @@ function finalizeGroup(
     ...(accumulator.transferredBytes !== undefined
       ? { transferredBytes: Math.round(accumulator.transferredBytes) }
       : {}),
+    ...(accumulator.transferEventIds.size > 0
+      ? { transferEventIds: [...accumulator.transferEventIds].sort(compareStrings) }
+      : {}),
     occurrences,
     occurrencesTruncated: occurrences.length < count,
   };
@@ -815,6 +1059,14 @@ function finalizeGroup(
 function resolveDuplicateWindowMs(value: number | undefined): number {
   if (value === undefined || !Number.isFinite(value) || value < 0) {
     return DEFAULT_DUPLICATE_WINDOW_MS;
+  }
+  return value;
+}
+
+/** Resolve the join tolerance, falling back on an unusable value. */
+function resolveResourceTimingToleranceMs(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value) || value < 0) {
+    return DEFAULT_RESOURCE_TIMING_TOLERANCE_MS;
   }
   return value;
 }
@@ -840,6 +1092,343 @@ function isRequestEvent(event: TelemetryEvent): boolean {
 
 /*
  * ---------------------------------------------------------------------------
+ * Internals: the resource-timing join
+ *
+ * The header states the four rules; this section is their implementation and
+ * nothing else. It reads only already-redacted attributes, mints no id, and is
+ * a pure function of the event list.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * The kind of the event a resource load arrives as.
+ *
+ * Named because the performance kind group holds both a long task and a
+ * performance entry and only the latter can describe a response;
+ * {@link isResourceTimingEvent} still selects *through* the group, so a kind
+ * that leaves it can never be joined.
+ */
+const PERF_ENTRY_KIND: TelemetryKind = 'perf.entry';
+
+/** The request kind whose loads Resource Timing labels `fetch`. */
+const FETCH_KIND: TelemetryKind = 'fetch';
+
+/** The request kind whose loads Resource Timing labels `xmlhttprequest`. */
+const XHR_KIND: TelemetryKind = 'xhr';
+
+/**
+ * The `initiator.type` a resource entry carries for each request transport.
+ *
+ * Hosts agree on these two spellings, so a *stated* type that is neither of
+ * them describes a different load of the same URL — a `<link rel="preload">`,
+ * a `<script>`, an image — and {@link rankCandidate} rejects it outright
+ * rather than accepting it as a last resort: attributing a preload's bytes to
+ * a fetch is a wrong number, which is worse than the honest absence AAP 0.6.6
+ * provides for. An entry that states **no** type is still eligible, because a
+ * redirect chain, a service-worker response and a shimmed host all produce
+ * one, and refusing those would lose a join identity and timing had already
+ * established.
+ */
+const RESOURCE_INITIATOR_TYPE_BY_KIND: ReadonlyMap<TelemetryKind, string> = new Map([
+  [FETCH_KIND, 'fetch'],
+  [XHR_KIND, 'xmlhttprequest'],
+]);
+
+/**
+ * One resource-timing entry offered to the join.
+ *
+ * Only entries that measured something are collected: an entry with no
+ * readable URL cannot be matched and an entry with no exposed bytes has
+ * nothing to contribute, so admitting either would only let it be claimed —
+ * and a claim's purpose is to stop a *measured* response being counted twice.
+ */
+interface ResourceTimingCandidate {
+  /** The event the entry arrived as. */
+  readonly eventId: EventId;
+  /** The entry's URL, already redacted: the join's identity. */
+  readonly url: string;
+  /** Start of the load, in epoch milliseconds. */
+  readonly startTime: number;
+  /** The `initiator.type` the host reported, when it reported one. */
+  readonly initiatorType: string | undefined;
+  /** The measured bytes; always present by construction. */
+  readonly bytes: number;
+  /** Set once the entry has been attributed to an occurrence. */
+  claimed: boolean;
+}
+
+/** Whether an event is a resource load this join can read. */
+function isResourceTimingEvent(event: TelemetryEvent): boolean {
+  if (typeof event !== 'object' || event === null) {
+    return false;
+  }
+  if (!PERF_KINDS.includes(event.kind) || event.kind !== PERF_ENTRY_KIND) {
+    return false;
+  }
+
+  // A labelled paint mark is excluded; an unlabelled entry is admitted,
+  // because a producer that omits the label but reports an exposed size has
+  // still measured a response.
+  const entryType = readAttribute(event, ENTRY_TYPE_ATTRIBUTE);
+  return entryType === undefined || entryType === RESOURCE_ENTRY_TYPE;
+}
+
+/**
+ * Index the capture's resource entries by identity.
+ *
+ * Each bucket is sorted by start time, then by event id, so the candidate a
+ * given occurrence sees first does not depend on the order the events arrived
+ * in.
+ */
+function collectResourceTimings(
+  events: readonly TelemetryEvent[],
+): Map<string, ResourceTimingCandidate[]> {
+  const byUrl = new Map<string, ResourceTimingCandidate[]>();
+
+  for (const event of events) {
+    if (!isResourceTimingEvent(event)) {
+      continue;
+    }
+    const url = readNonBlankString(event, RESOURCE_URL_ATTRIBUTE);
+    if (url === undefined) {
+      continue;
+    }
+    const bytes = readExposedTransferSize(event);
+    if (bytes === undefined) {
+      continue;
+    }
+
+    const candidate: ResourceTimingCandidate = {
+      eventId: event.id,
+      url,
+      startTime: finiteOrZero(event.startTime),
+      initiatorType: readNonBlankString(event, INITIATOR_TYPE_ATTRIBUTE),
+      bytes,
+      claimed: false,
+    };
+
+    const bucket = byUrl.get(url);
+    if (bucket === undefined) {
+      byUrl.set(url, [candidate]);
+      continue;
+    }
+    bucket.push(candidate);
+  }
+
+  for (const bucket of byUrl.values()) {
+    bucket.sort((left, right) => {
+      if (left.startTime !== right.startTime) {
+        return left.startTime < right.startTime ? -1 : 1;
+      }
+      return compareStrings(left.eventId, right.eventId);
+    });
+  }
+
+  return byUrl;
+}
+
+/**
+ * The identities one request may appear under in the timing buffer, in
+ * preference order.
+ *
+ * The resolved absolute URL first, because that is what the browser names the
+ * entry with; the as-written URL second, which matches only when the
+ * application already wrote an absolute one, and is the fallback for a
+ * producer that predates the resolved key. A duplicate between the two is
+ * dropped so a candidate bucket is never searched twice.
+ */
+function resourceIdentitiesOf(event: TelemetryEvent, url: string | undefined): string[] {
+  const identities: string[] = [];
+  const resolved = readNonBlankString(event, RESOURCE_TIMING_URL_ATTRIBUTE);
+  if (resolved !== undefined) {
+    identities.push(resolved);
+  }
+  if (url !== undefined && url !== resolved) {
+    identities.push(url);
+  }
+  return identities;
+}
+
+/**
+ * How good a match a candidate is for an occurrence, or `undefined` when it is
+ * not a match at all: lower sorts first.
+ *
+ * The initiator type decides eligibility before it decides order. A candidate
+ * that states a type the request's transport never produces is **rejected** —
+ * it is a different load of the same URL, and crediting its bytes to this
+ * request would publish a wrong number where AAP 0.6.6 provides for an honest
+ * absence. A candidate whose type matches outranks one that states none, which
+ * is what keeps a `<link rel="preload">`-free page from having its fetch
+ * matched to an unlabelled entry when its own labelled entry is present.
+ * Within a rank the closest start wins, which is the only ordering that
+ * behaves correctly when a page issues the same request twice in quick
+ * succession.
+ */
+function rankCandidate(
+  candidate: ResourceTimingCandidate,
+  expectedInitiatorType: string | undefined,
+  occurrenceStartTime: number,
+): readonly [number, number] | undefined {
+  if (
+    expectedInitiatorType !== undefined &&
+    candidate.initiatorType !== undefined &&
+    candidate.initiatorType !== expectedInitiatorType
+  ) {
+    return undefined;
+  }
+
+  const initiatorRank = candidate.initiatorType === expectedInitiatorType ? 0 : 1;
+  return [initiatorRank, Math.abs(candidate.startTime - occurrenceStartTime)];
+}
+
+/**
+ * Claim the best unclaimed entry for one occurrence, or nothing.
+ *
+ * Qualification is identity, timing **and** transport: the entry must sit in
+ * one of the occurrence's identity buckets, must have started no earlier than
+ * the occurrence's start minus the tolerance and no later than its end plus
+ * the tolerance, and must not state an `initiator.type` this transport never
+ * produces ({@link rankCandidate} rejects that one outright). Among the
+ * qualifying entries the best rank wins, ties broken by event id so the choice
+ * is total.
+ *
+ * Claiming mutates only this module's own candidate records, never an event.
+ */
+function claimResourceTiming(
+  byUrl: Map<string, ResourceTimingCandidate[]>,
+  identities: readonly string[],
+  kind: TelemetryKind,
+  startTime: number,
+  endTime: number,
+  toleranceMs: number,
+): ResourceTimingCandidate | undefined {
+  const expectedInitiatorType = RESOURCE_INITIATOR_TYPE_BY_KIND.get(kind);
+  const earliest = startTime - toleranceMs;
+  const latest = endTime + toleranceMs;
+
+  let best: ResourceTimingCandidate | undefined;
+  let bestRank: readonly [number, number] | undefined;
+
+  for (const identity of identities) {
+    const bucket = byUrl.get(identity);
+    if (bucket === undefined) {
+      continue;
+    }
+
+    for (const candidate of bucket) {
+      if (candidate.claimed) {
+        continue;
+      }
+      if (candidate.startTime < earliest || candidate.startTime > latest) {
+        continue;
+      }
+
+      const rank = rankCandidate(candidate, expectedInitiatorType, startTime);
+      if (rank === undefined) {
+        continue;
+      }
+      if (
+        bestRank === undefined ||
+        rank[0] < bestRank[0] ||
+        (rank[0] === bestRank[0] && rank[1] < bestRank[1]) ||
+        (rank[0] === bestRank[0] &&
+          rank[1] === bestRank[1] &&
+          best !== undefined &&
+          compareStrings(candidate.eventId, best.eventId) < 0)
+      ) {
+        best = candidate;
+        bestRank = rank;
+      }
+    }
+  }
+
+  if (best === undefined) {
+    return undefined;
+  }
+  best.claimed = true;
+  return best;
+}
+
+/**
+ * One request occurrence before the join, with what the join needs to run.
+ *
+ * The occurrence is built in two steps because the join has to consider every
+ * request in the capture in one canonical order — a per-group pass would let
+ * the grouping decide which request got which response — and because
+ * {@link RequestOccurrence} is published `readonly`, so its transfer fields are
+ * set at construction rather than patched afterwards.
+ */
+interface PendingOccurrence {
+  /** Everything about the occurrence except the three transfer fields. */
+  readonly base: RequestOccurrence;
+  /** The group this occurrence belongs to. */
+  readonly groupId: string;
+  /** How that group's identity was established. */
+  readonly groupedBy: RequestGroupedBy;
+  /** The group's service-assigned key, when it has one. */
+  readonly requestKey: string | undefined;
+  /** Method, URL and path as this occurrence reported them. */
+  readonly method: string;
+  readonly url: string;
+  readonly path: string;
+  /** The identities this request may appear under in the timing buffer. */
+  readonly identities: readonly string[];
+  /** The occurrence's own exposed size, when the request event carried one. */
+  readonly ownTransferredBytes: number | undefined;
+}
+
+/** Canonical order for the join pass: start time, then the always-distinct id. */
+function comparePending(left: PendingOccurrence, right: PendingOccurrence): number {
+  if (left.base.startTime !== right.base.startTime) {
+    return left.base.startTime < right.base.startTime ? -1 : 1;
+  }
+  return compareStrings(left.base.id, right.base.id);
+}
+
+/**
+ * Attach transfer evidence to one pending occurrence.
+ *
+ * The request's own exposed size stays authoritative when it has one — it is
+ * the page's account of its own request — but a matching entry is still
+ * claimed, because an unclaimed entry is added to `transferred_bytes` by
+ * `./summary.ts` and this response has already been counted. When the request
+ * reported nothing, which is the ordinary browser case, the claimed entry's
+ * bytes become the occurrence's.
+ */
+function resolveOccurrenceTransfer(
+  pending: PendingOccurrence,
+  byUrl: Map<string, ResourceTimingCandidate[]>,
+  toleranceMs: number,
+): RequestOccurrence {
+  const claimed =
+    pending.identities.length === 0
+      ? undefined
+      : claimResourceTiming(
+          byUrl,
+          pending.identities,
+          pending.base.kind,
+          pending.base.startTime,
+          pending.base.endTime,
+          toleranceMs,
+        );
+
+  const own = pending.ownTransferredBytes;
+  if (own === undefined && claimed === undefined) {
+    return pending.base;
+  }
+
+  const bytes = own ?? claimed?.bytes;
+  const source: RequestTransferSource = own !== undefined ? 'request' : 'resource-timing';
+
+  return {
+    ...pending.base,
+    ...(bytes !== undefined ? { transferredBytes: bytes, transferSource: source } : {}),
+    ...(claimed !== undefined ? { transferEventId: claimed.eventId } : {}),
+  };
+}
+
+/*
+ * ---------------------------------------------------------------------------
  * Public API
  * ---------------------------------------------------------------------------
  */
@@ -859,8 +1448,17 @@ function isRequestEvent(event: TelemetryEvent): boolean {
  * No event is dropped — an unreadable method or URL is labelled, not discarded —
  * and no input is mutated.
  *
+ * The capture's `perf.entry` resource events are read too, but never as
+ * requests: they are the join candidates of the header's "transferred bytes
+ * arrive by a join", and an entry that matches no request contributes nothing
+ * here (`./summary.ts` accounts for those). Three passes, in this order and for
+ * this reason: occurrences and candidates are built from the events, then every
+ * occurrence in the capture is matched in one canonical order — so the pairing
+ * cannot depend on how the events were grouped or on the order they arrived —
+ * and only then are the matched occurrences folded into their groups.
+ *
  * @param events already-ingested, already-redacted events, in any order.
- * @param options window and bounding overrides.
+ * @param options window, tolerance and bounding overrides.
  * @returns a new array in the base order {@link compareGroups} defines.
  */
 export function aggregateRequests(
@@ -869,8 +1467,11 @@ export function aggregateRequests(
 ): RequestGroup[] {
   const duplicateWindowMs = resolveDuplicateWindowMs(options?.duplicateWindowMs);
   const maxOccurrences = resolveMaxOccurrences(options?.maxOccurrencesPerGroup);
-  const accumulators = new Map<string, GroupAccumulator>();
+  const toleranceMs = resolveResourceTimingToleranceMs(options?.resourceTimingToleranceMs);
 
+  // Pass 1 — read every request into a pending occurrence, and index the
+  // resource entries that measured something.
+  const pending: PendingOccurrence[] = [];
   for (const event of events) {
     if (!isRequestEvent(event)) {
       continue;
@@ -885,9 +1486,8 @@ export function aggregateRequests(
     const requestKey = readRequestKey(event);
     const statusCode = readInteger(event, STATUS_CODE_ATTRIBUTE);
     const initiator = readNonBlankString(event, INITIATOR_ATTRIBUTE);
-    const transferredBytes = readNonNegativeNumber(event, TRANSFER_SIZE_ATTRIBUTE);
 
-    const occurrence: RequestOccurrence = {
+    const base: RequestOccurrence = {
       id: event.id,
       eventId: event.id,
       spanId: event.spanId,
@@ -900,23 +1500,44 @@ export function aggregateRequests(
       status: event.status,
       ...(initiator !== undefined ? { initiator } : {}),
       ...(event.source !== undefined ? { source: event.source } : {}),
-      ...(transferredBytes !== undefined ? { transferredBytes } : {}),
       tier: event.tier,
       kind: event.kind,
     };
 
     const groupedBy: RequestGroupedBy = requestKey === undefined ? 'method-path' : 'request-key';
-    const id =
-      requestKey === undefined
-        ? groupIdForMethodPath(method, path)
-        : groupIdForRequestKey(requestKey);
+    pending.push({
+      base,
+      groupId:
+        requestKey === undefined
+          ? groupIdForMethodPath(method, path)
+          : groupIdForRequestKey(requestKey),
+      groupedBy,
+      requestKey,
+      method,
+      url,
+      path,
+      identities: resourceIdentitiesOf(event, rawUrl),
+      ownTransferredBytes: readExposedTransferSize(event),
+    });
+  }
+  const resourceTimings = collectResourceTimings(events);
 
-    let accumulator = accumulators.get(id);
+  // Pass 2 — the join, in canonical occurrence order.
+  pending.sort(comparePending);
+  const resolved = pending.map((occurrence) => ({
+    pending: occurrence,
+    occurrence: resolveOccurrenceTransfer(occurrence, resourceTimings, toleranceMs),
+  }));
+
+  // Pass 3 — fold the joined occurrences into their groups.
+  const accumulators = new Map<string, GroupAccumulator>();
+  for (const { pending: source, occurrence } of resolved) {
+    let accumulator = accumulators.get(source.groupId);
     if (accumulator === undefined) {
-      accumulator = createAccumulator(id, groupedBy, requestKey);
-      accumulators.set(id, accumulator);
+      accumulator = createAccumulator(source.groupId, source.groupedBy, source.requestKey);
+      accumulators.set(source.groupId, accumulator);
     }
-    mergeOccurrence(accumulator, occurrence, method, url, path);
+    mergeOccurrence(accumulator, occurrence, source.method, source.url, source.path);
   }
 
   const groups: RequestGroup[] = [];

@@ -141,13 +141,43 @@ const PORT_PATTERN = /^[0-9]{0,15}$/;
  * Attribute keys whose value is a URL and therefore belongs to
  * {@link redactUrl} rather than to the generic value scrubber.
  *
- * `url` is the key the fetch attribute vocabulary declares; the rest are the
- * OpenTelemetry spellings that reach the service from the Node preload's span
- * attributes. `redactor.ts` dispatches on {@link isUrlAttributeKey}, which
- * also accepts the conventional suffixes, and treats these keys as exempt from
- * preview truncation so a URL stays readable end to end.
+ * `url` is the key the fetch attribute vocabulary declares; `http.url`,
+ * `http.target` and `target` are the OpenTelemetry spellings that reach the
+ * service from the Node preload's span attributes; `error.source` is the
+ * script or resource URL an `error` event carries, which `../browser/errors.ts`
+ * takes from `ErrorEvent.filename` or from the failing element's `src` and
+ * records verbatim.
+ *
+ * `error.source` is a full page URL with an ordinary query string on it — the
+ * address the failing script or image was fetched from, which on a real
+ * application routinely carries the same identifiers as any other request.
+ * Without membership here it fell through to the generic string arm, which
+ * masks credential *patterns* but never a query parameter value, so an error
+ * raised from a page or asset URL kept every parameter it was loaded with,
+ * into the store, the live tail and outbound prompts. AAP 0.5.2 admits a URL
+ * only as "URL query parameter values → replaced with `?` per key for display
+ * and storage; path retained", and that applies wherever a URL is captured,
+ * not only under the keys a request span happens to use.
+ *
+ * The suffix rule in {@link isUrlAttributeKey} does not reach it: the key ends
+ * in `source`, not in `url`. Naming it explicitly is the whole fix, and it is
+ * spelled exactly as `../schema/attributes.ts` declares it in
+ * `ERROR_ATTRIBUTE_KEYS` — a tie asserted by the colocated tests rather than
+ * by an import, because this module deliberately imports nothing but
+ * `./rules.js` so the page agent can bundle it.
+ *
+ * `redactor.ts` dispatches on {@link isUrlAttributeKey}, which also accepts
+ * the conventional suffixes, and treats these keys as exempt from preview
+ * truncation so a URL stays readable end to end — which `error.source` needs
+ * too, since the source-map resolution route reads the whole value.
  */
-export const URL_ATTRIBUTE_KEYS = ['url', 'http.url', 'http.target', 'target'] as const;
+export const URL_ATTRIBUTE_KEYS = [
+  'url',
+  'http.url',
+  'http.target',
+  'target',
+  'error.source',
+] as const;
 
 /**
  * The decomposition of a URL-ish string, byte-faithful by construction.
@@ -718,6 +748,219 @@ export function redactUrl(value: unknown): string {
   }
 
   return formatUrlParts(output);
+}
+
+/**
+ * An `http`/`https` URL embedded in surrounding text.
+ *
+ * The run stops at whitespace, at a quote and at an angle bracket, none of
+ * which can appear in a URL a runtime prints, and deliberately *not* at a
+ * closing parenthesis: `(` and `)` are legal path characters and a V8 frame
+ * wraps its URL in parentheses, so the bracket is peeled afterwards by
+ * {@link FRAME_TRAILING_PATTERN} rather than guessed at here.
+ *
+ * Only `http` and `https` are matched. Every other scheme a bundler emits —
+ * `webpack-internal:///`, `turbopack:///`, `file://`, `node:` — is either a
+ * module identifier with no query string or a path this module has nothing to
+ * mask in, and `packages/code-analysis/src/source-map/resolver.ts` restricts
+ * its own frame grammar to `http`/`https` for the same reason. Leaving them
+ * untouched keeps a frame that resolves to source byte-identical.
+ *
+ * Global, and therefore used only with `replace`, which resets `lastIndex`
+ * around every call.
+ */
+const STACK_URL_PATTERN = /https?:\/\/[^\s"'<>`]+/g;
+
+/**
+ * The `:line` or `:line:column` position a runtime appends directly to a
+ * frame's URL, anchored at the end of the run.
+ *
+ * Digits are bounded so a long numeric tail cannot be read as a position.
+ */
+const FRAME_POSITION_PATTERN = /(?::\d{1,9}){1,2}$/;
+
+/**
+ * Characters that follow a URL in stack text rather than belonging to it: the
+ * closing bracket of a V8 frame, a quote, and ordinary sentence punctuation.
+ *
+ * `?` is **not** in the set. A trailing `?` is a query delimiter, and peeling
+ * it would hand {@link redactUrl} a URL whose query it can no longer see.
+ */
+const FRAME_TRAILING_PATTERN = /[)\]}>,;'".]+$/;
+
+/**
+ * What must precede a URL for the text around it to be a **stack frame**
+ * rather than prose that happens to contain a URL.
+ *
+ * Both engine forms are recognised, tested against the text from the start of
+ * the line up to the URL:
+ *
+ * - V8 / JavaScriptCore: `    at fn (‹url›:42:17)`, `    at ‹url›:42:17`,
+ *   `    at new Fn (‹url›…)`, `    at async fn (‹url›…)` — the `at` token,
+ *   matched as a word so "look at" in a log line is not mistaken for it (a
+ *   false positive costs only a preserved position, never a value).
+ * - SpiderMonkey / WebKit: `fn@‹url›:42:17` — the `@` immediately before.
+ *
+ * Why the distinction matters: inside a frame, the trailing `:line:column` was
+ * appended by the runtime, which is exactly the assumption
+ * `packages/code-analysis/src/source-map/resolver.ts` makes when it reads a
+ * frame, so the position can be detached before masking and re-attached after
+ * it. In arbitrary text nothing licenses that reading, and the conservative
+ * treatment applies instead.
+ */
+const FRAME_CONTEXT_PATTERN = /(?:^|[\s(])at\s|@$/;
+
+/**
+ * Cuts masked stack text to {@link MAX_SCAN_LENGTH} and reports the loss on a
+ * line of its own.
+ *
+ * The marker goes on a **new line** rather than at the end of the last one.
+ * A stack is line-oriented, so the truncation reads as its own frame — but the
+ * load-bearing reason is idempotence: {@link STACK_URL_PATTERN} runs up to
+ * whitespace, so a marker appended directly after a cut URL would be re-read
+ * as part of that URL's query on the next pass and masked away, and the second
+ * pass would return something different from the first. A newline terminates
+ * the run, and the marker alone matches no pattern here.
+ *
+ * The text being cut has already had its URLs masked, so the cut itself cannot
+ * expose data — wherever it falls, what remains is a host, a path, a bare
+ * parameter name or a mask, each of which is a fixed point of
+ * {@link redactUrl}. The cut nevertheless goes through
+ * `cutAtCredentialBoundary` like every other cut in this module.
+ */
+function truncatedStack(masked: string): string {
+  // One code unit is reserved for the separator on top of the marker's own.
+  const room = Math.max(0, MAX_SCAN_LENGTH - REDACTION_MARKER.length - 1);
+  return `${cutAtCredentialBoundary(masked, room)}\n${REDACTION_MARKER}`;
+}
+
+/**
+ * Masks one URL run found in stack text, keeping the frame's position when it
+ * can be told apart from the URL's own data.
+ *
+ * A frame is `at fn (‹url›:‹line›:‹column›)`, appended by the runtime with no
+ * delimiter, so the position is only recoverable by shape. It is detached
+ * before masking and re-attached after it in two cases:
+ *
+ * 1. **The URL carries no query and no fragment.** Nothing else could have
+ *    produced a trailing `:digits:digits`, and the whole run comes back
+ *    byte-identical.
+ * 2. **The run sits in a recognised stack frame**
+ *    ({@link FRAME_CONTEXT_PATTERN}) — then the runtime appended the position,
+ *    which is exactly how `packages/code-analysis/src/source-map/resolver.ts`
+ *    reads the same text, and AAP 0.4.2 requires that route to map a
+ *    generated-chunk frame back to TypeScript. A dev-server chunk URL almost
+ *    always carries a cache-busting query, so dropping the position here would
+ *    disable source resolution for the common case. The residual risk is a
+ *    query value that itself ends in `:digits:digits`, of which at most two
+ *    short numeric groups would be kept — digits only, never an identifier —
+ *    and only inside text a runtime wrote as a frame.
+ *
+ * Otherwise — a URL in prose, a log line, anything not shaped like a frame —
+ * the position is *inside* the query or fragment as far as any parser can tell
+ * (`?v=1:10:5` is both "the chunk `?v=1` at 10:5" and "the value `1:10:5`"),
+ * so the whole run goes through {@link redactUrl} and the position is masked
+ * along with the value it might be part of.
+ *
+ * @param candidate - The matched URL run.
+ * @param offset - Where the run starts in `whole`, supplied by `replace`.
+ * @param whole - The stack text being masked, used only to read the frame
+ * context on the run's own line.
+ */
+function maskFrameUrl(candidate: string, offset: number, whole: string): string {
+  // `scrub` runs before this function on the redaction path and may have cut
+  // the text mid-URL, appending its marker with nothing between. The marker is
+  // this layer's own token, so it is lifted out rather than read as query
+  // text — and it comes back on a line of its own, where a later pass cannot
+  // absorb it into the URL it was cut from.
+  const cut = candidate.endsWith(REDACTION_MARKER);
+  const body = cut ? candidate.slice(0, candidate.length - REDACTION_MARKER.length) : candidate;
+  const suffix = cut ? `\n${REDACTION_MARKER}` : '';
+
+  const trailing = FRAME_TRAILING_PATTERN.exec(body)?.[0] ?? '';
+  const url = trailing.length === 0 ? body : body.slice(0, body.length - trailing.length);
+  const position = FRAME_POSITION_PATTERN.exec(url)?.[0] ?? '';
+  if (position.length === 0) {
+    return redactUrl(url) + trailing + suffix;
+  }
+
+  const head = url.slice(0, url.length - position.length);
+  const parts = parseUrlParts(head);
+  if (parts.query === undefined && parts.fragment === undefined) {
+    return redactUrl(head) + position + trailing + suffix;
+  }
+
+  // The URL carries a query or a fragment, so the position is only
+  // distinguishable from that text by the frame it sits in.
+  const lineStart = whole.lastIndexOf('\n', Math.max(0, offset - 1)) + 1;
+  if (FRAME_CONTEXT_PATTERN.test(whole.slice(lineStart, offset))) {
+    return redactUrl(head) + position + trailing + suffix;
+  }
+  return redactUrl(url) + trailing + suffix;
+}
+
+/**
+ * Redacts every URL embedded in stack text, leaving the frames around them
+ * intact.
+ *
+ * A call-site stack is captured for two attributes — a request's `initiator`
+ * and an error's `error.stack` — and both are read end to end: the initiator
+ * is what duplicate-request analysis attributes a request to, and the
+ * source-map resolution route maps a generated-chunk frame back to
+ * TypeScript (AAP 0.4.2). They are therefore exempt from the preview bound in
+ * `redactor.ts`, which means a frame's URL travels whole, and a dev-server
+ * chunk URL carries a query string like any other request URL. Scrubbing by
+ * content does not touch a query value — that is positional, and only this
+ * module can see it — so before this function existed every parameter inside
+ * a frame's URL was stored, broadcast and sent to the model provider, under
+ * keys the privacy model had already ruled on everywhere else (AAP 0.5.2).
+ *
+ * What is kept is what a stack is for: `at`, the function names, the
+ * indentation, the parentheses, the frame order, and each frame's file and
+ * position. What changes is inside the URLs, and by exactly the rules
+ * {@link redactUrl} applies to a request URL — query values masked, path and
+ * authority kept.
+ *
+ * Content scrubbing is **not** performed here: the caller in `redactor.ts`
+ * runs `scrub` first (and must, since cutting before scrubbing can split a
+ * credential), and this function's single job is the positional masking that
+ * `scrub` cannot do.
+ *
+ * **Idempotent.** Every component of the output is a fixed point of its own
+ * treatment: `redactUrl` is idempotent, a masked query re-parses to itself, a
+ * re-attached position re-detaches to the same place, and peeled punctuation
+ * is re-appended verbatim. The result is bounded, so a second pass takes the
+ * same path as the first.
+ *
+ * **Never throws**, for any input of any type, like every other entry point
+ * here: a stack reaches this function from a parsed JSON event body, where
+ * nothing has checked that it is a string.
+ *
+ * @param value - Stack text, as captured by `../browser/fetch.ts` or
+ * `../browser/errors.ts`. A non-string value is normalised by
+ * `asScannableText` first.
+ * @returns The stack with every embedded `http`/`https` URL redacted.
+ */
+export function redactStackUrls(value: unknown): string {
+  const text = asScannableText(value);
+  if (text.length === 0) {
+    return text;
+  }
+
+  // Nothing past the bound is examined, and an unexamined frame is reported as
+  // removed rather than passed through — the rule `scrub` applies to any
+  // over-long value. The masked result can also come back marginally longer
+  // than what went in (a short `userinfo` becomes the ten-character marker),
+  // and a result over the bound would be cut again on the next pass, so both
+  // cases take the same exit.
+  const overLength = text.length > MAX_SCAN_LENGTH;
+  const scanned = overLength ? cutAtCredentialBoundary(text, MAX_SCAN_LENGTH) : text;
+  const masked = scanned.replace(STACK_URL_PATTERN, maskFrameUrl);
+
+  if (!overLength && masked.length <= MAX_SCAN_LENGTH) {
+    return masked;
+  }
+  return truncatedStack(masked);
 }
 
 /**

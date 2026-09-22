@@ -48,22 +48,41 @@
  *
  * ## Fixture conventions
  *
- * Data is **synthetic and deterministic** (AAP §0.5.2): identifiers are minted
- * from a counter so a failing assertion names the same span on every run, span
- * and trace ids are schema-shaped hex (asserted by the harness self-checks
- * below), timings are explicit millisecond offsets from one fixed epoch base,
- * and the only permutation source is a seeded linear-congruential shuffle. No
- * wall clock, no `Math.random`, no locale-sensitive comparison, no filesystem
- * and no captured telemetry is involved. Span names are derived from their span
- * id, so nothing in this file is a URL, a SQL statement, a credential or an
- * identifier a pipeline is meant to discover by analysing a project's code
- * (AAP §0.5.4).
+ * Most of the data is built here and is **synthetic and deterministic**
+ * (AAP §0.5.2): identifiers are minted from a counter so a failing assertion
+ * names the same span on every run, span and trace ids are schema-shaped hex
+ * (asserted by the harness self-checks below), timings are explicit
+ * millisecond offsets from one fixed epoch base, and the only permutation
+ * source is a seeded linear-congruential shuffle. No wall clock, no
+ * `Math.random` and no locale-sensitive comparison is read anywhere in this
+ * file. Span names are derived from their span id, so nothing built here is a
+ * URL, a SQL statement, a credential or an identifier a pipeline is meant to
+ * discover by analysing a project's code (AAP §0.5.4).
+ *
+ * The first three guarantees — and the input-purity half of the fourth — are
+ * **additionally** driven by one committed corpus,
+ * `test/fixtures/correlation-mixed-tiers.json` — the mixed browser/Node
+ * capture AAP §0.2.3 names this suite against — which the last section of the
+ * file reads from disk at run time and validates row by row through
+ * `telemetryEventSchema`. That read is this suite's only filesystem access,
+ * and what it reads is deterministic repository data rather than captured
+ * telemetry: eleven already-redacted persisted rows in a deliberately shuffled
+ * file order, no clock and no network, so its expectations are as reproducible
+ * as the inline ones. It is there because a corpus with no executable consumer
+ * is free to drift — it could lose its server tier or its orphan and leave
+ * every hand-built case above green — so parsing it *is* the fixture-contract
+ * assertion, and the structure it pins (the chain span by span, the depths,
+ * the per-tier counts) is stated as literals for the same reason.
  *
  * Expectations are derived from the imported vocabularies (`TELEMETRY_KINDS`,
  * `TELEMETRY_TIERS`, `ORPHAN_REASONS`, `LINEAGE_ATTRIBUTE_KEYS`,
  * `DEFAULT_MAX_DEPTH`) rather than restated as literals, so a vocabulary change
  * surfaces here as a failure instead of as a stale copy that still passes.
  */
+
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it } from 'vitest';
 
@@ -75,7 +94,7 @@ import {
   LINEAGE_ATTRIBUTE_KEYS,
   LINEAGE_VALUES,
 } from '../schema/attributes.js';
-import { isTelemetryEvent } from '../schema/event.js';
+import { isTelemetryEvent, telemetryEventSchema } from '../schema/event.js';
 import type { TelemetryEvent } from '../schema/event.js';
 import { TELEMETRY_KINDS, TELEMETRY_TIERS, allowedTiersFor } from '../schema/kinds.js';
 import type { TelemetryKind, TelemetryTier } from '../schema/kinds.js';
@@ -2315,5 +2334,755 @@ describe('scale', () => {
     expect(truncatedTree.truncated).toBe(true);
     expect(truncatedTree.orphanCount).toBe(1);
     expect(orphanNodesIn(truncatedTree).map((node) => node.orphanReason)).toEqual(['max-depth']);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The committed mixed-tier corpus (AAP 0.2.3, 0.4.2)
+ *
+ * Every case above builds its own events, which is what a boundary case needs:
+ * a two-node cycle or a chain one level past the depth guard has to be stated
+ * exactly, not searched for in a file. It leaves one gap, and this section
+ * closes it. `test/fixtures/correlation-mixed-tiers.json` is the mixed
+ * browser/Node capture AAP 0.2.3 requires this suite to cover — one click
+ * resolving across the page agent and the dev-server preload, with an
+ * equal-timestamp pair across the two producers and one render whose parent
+ * never arrived — and with no executable consumer it is data nothing holds to
+ * account: a row could lose its `server` tier, its orphan or its tie and every
+ * case above would still pass.
+ *
+ * The blocks below therefore drive the canonical order, the nesting, the
+ * orphan repair and the mixed-producer summary from that file, read at run
+ * time and validated through the persisted schema. Two deliberate choices in
+ * how they assert:
+ *
+ * - **Derived where derivation keeps the test honest.** The producer set, the
+ *   kind set and the window are computed from the parsed rows and compared
+ *   against what the tree reports, so the tree is checked against its own
+ *   input rather than against a copy of it.
+ * - **Pinned where drift must fail.** The chain span by span, the depths, the
+ *   per-tier node counts and the one orphan are literals. A corpus edit that
+ *   quietly dropped the server tier would keep every derived assertion true
+ *   and must fail here.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * `packages/telemetry/test/fixtures`, resolved from this module's own URL.
+ *
+ * The resolution is deliberately `fileURLToPath` **then** `join`, not
+ * `new URL('../../test/fixtures/…', import.meta.url)`: the `telemetry` Vitest
+ * project runs under happy-dom, whose global `URL` resolves a relative
+ * specifier against the document origin instead of the `file:` base it was
+ * given, which makes the tidier one-liner throw "The URL must be of scheme
+ * file" inside `readFileSync`. Resolving from `import.meta.url` rather than
+ * from the process working directory also keeps the path right whether Vitest
+ * is invoked on this one file or on the whole repository. The same rationale
+ * is recorded in `../redaction/rules.test.ts` and `../schema/attributes.test.ts`.
+ */
+const FIXTURES_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'test', 'fixtures');
+
+/** The committed mixed browser/Node capture this section is driven by. */
+const MIXED_TIER_FIXTURE_PATH = join(FIXTURES_DIR, 'correlation-mixed-tiers.json');
+
+/**
+ * Narrows a parsed JSON document to an array without letting `any` escape.
+ *
+ * `JSON.parse` returns `any` and `Array.isArray` widens to `any[]`, either of
+ * which would hand the schema an unchecked value and defeat the point of
+ * validating at all. The predicate keeps the elements `unknown` so that the
+ * only way to obtain a `TelemetryEvent` below is to parse one.
+ *
+ * @param value The parsed document.
+ * @returns Whether it is an array, narrowing its elements to `unknown`.
+ */
+function isUnknownArray(value: unknown): value is readonly unknown[] {
+  return Array.isArray(value);
+}
+
+/**
+ * The corpus, read from disk once and validated row by row.
+ *
+ * The file is **read**, never `import`ed: this package's `tsconfig.json` pins
+ * `rootDir` to `src` and excludes `test/**`, and a JSON import would hand the
+ * suite an `any`-shaped literal that no schema had seen — the opposite of the
+ * contract this corpus exists to hold. Parsing every row through
+ * `telemetryEventSchema` *is* that contract: it is the same strict,
+ * cross-field-checked schema the store re-validates a row against, so a corpus
+ * that drifted into an unknown key, a kind/tier disagreement, a malformed
+ * identifier or a timestamp outside the accepted window fails at module load
+ * naming the row and the field, instead of surfacing later as a puzzling
+ * structural mismatch.
+ *
+ * @returns The rows in committed file order, typed as the store's own records.
+ * @throws An `Error` naming the offending row and issue when the file is not a
+ * JSON array of persisted telemetry events.
+ */
+function loadMixedTierCorpus(): readonly TelemetryEvent[] {
+  const corpusJson: unknown = JSON.parse(readFileSync(MIXED_TIER_FIXTURE_PATH, 'utf8'));
+  if (!isUnknownArray(corpusJson)) {
+    throw new Error(`${MIXED_TIER_FIXTURE_PATH} must hold a JSON array of persisted events`);
+  }
+
+  const events: TelemetryEvent[] = [];
+  for (const [index, row] of corpusJson.entries()) {
+    const parsed = telemetryEventSchema.safeParse(row);
+    if (!parsed.success) {
+      const issues = parsed.error.issues
+        .map((issue) => `${issue.path.join('.') || '<row>'}: ${issue.message}`)
+        .join('; ');
+      throw new Error(
+        `correlation-mixed-tiers.json row ${String(index)} is not a persisted telemetry event (${issues})`,
+      );
+    }
+    events.push(parsed.data);
+  }
+
+  return events;
+}
+
+/** The parsed corpus. Read once at module load; never handed to a case as-is. */
+const MIXED_TIER_CORPUS: readonly TelemetryEvent[] = loadMixedTierCorpus();
+
+/**
+ * A fresh, mutable copy of the corpus in its committed file order.
+ *
+ * Every case takes its events from here rather than from
+ * {@link MIXED_TIER_CORPUS} directly. The cases below freeze their input to
+ * assert purity and one of them mutates a row on purpose, and a shared array
+ * would make those cases observable in each other — the precise failure mode
+ * that makes a suite's passing result meaningless.
+ *
+ * @returns Eleven deeply cloned events.
+ */
+function mixedTierEvents(): TelemetryEvent[] {
+  return MIXED_TIER_CORPUS.map((event) => structuredClone(event));
+}
+
+/**
+ * The corpus row carrying `spanId`, or a failure naming the row that went
+ * missing.
+ *
+ * @param events A copy of the corpus.
+ * @param spanId The span the case is about.
+ * @returns That row.
+ */
+function corpusEventFor(events: readonly TelemetryEvent[], spanId: SpanId): TelemetryEvent {
+  const row = events.find((event) => event.spanId === spanId);
+  if (row === undefined) {
+    throw new Error(`the corpus no longer carries span ${spanId}`);
+  }
+  return row;
+}
+
+/** How many nodes of `tree` each tier of the vocabulary holds. */
+function nodeCountsByTier(tree: TraceTree): Record<TelemetryTier, number> {
+  // Written out rather than derived from TELEMETRY_TIERS so that the record
+  // stays exhaustive at compile time: a tier added to the vocabulary stops this
+  // initialiser from compiling and demands an expected count for it.
+  const counts: Record<TelemetryTier, number> = { browser: 0, server: 0, db: 0 };
+  for (const node of flattenTrace(tree)) {
+    counts[node.event.tier] += 1;
+  }
+  return counts;
+}
+
+/** How many rows the corpus holds. */
+const CORPUS_EVENT_COUNT = 11;
+
+/** The one trace id every row of the corpus carries. */
+const CORPUS_TRACE_ID: TraceId = '7b41e0c82d9f36a5148e7c02fb95d3a6';
+
+/**
+ * The corpus's page-agent producer, and the lexicographically **smaller** of
+ * its two: the equal-timestamp case below turns on which way `producerId`
+ * breaks the tie, so the fact is named here rather than left implicit in two
+ * opaque identifiers.
+ */
+const CORPUS_BROWSER_PRODUCER: ProducerId = 'prd_j4m8q2t6w0z3b7fh';
+
+/** The corpus's dev-server preload producer; after the page agent's. */
+const CORPUS_SERVER_PRODUCER: ProducerId = 'prd_r9v3y7c1f5h8k2np';
+
+/**
+ * The corpus's spans, by the role each plays in the capture.
+ *
+ * Naming them is what lets the expectations below read as the tree they
+ * describe: `CORPUS_SPANS.dbQuery` under `CORPUS_SPANS.serviceFunction` is the
+ * assertion AAP 0.8.3 states in words, where two bare hex strings would not be.
+ */
+const CORPUS_SPANS = {
+  /** The browser `interaction` the whole trace descends from. */
+  interaction: 'c92a3f07d1b48e65',
+  /** The page's `fetch`, whose span id joined the browser trace to the server. */
+  fetch: '5e18b4c60a97d23f',
+  /** The framework's request span. */
+  httpServer: '0d7f2b9631ea48c5',
+  /** The App Router route-handler span. */
+  routeHandler: 'b6a45e08c7132f9d',
+  /** The named service function a reversible patch timed. */
+  serviceFunction: '38f1c705ae24b6d9',
+  /** The SQL that function ran: the only `db` tier row. */
+  dbQuery: 'a70e5c28f13b649d',
+  /** A React render that ties, in time, with the server's external call. */
+  renderSummaryCard: '4c8b1d63e0a927f5',
+  /** The external call the route handler made. */
+  httpClient: '1a5b93e70c28d4f6',
+  /** The React commit that ties, in time, with the render below it. */
+  commit: 'e21d908457c3b6fa',
+  /** A React render emitted in the commit's millisecond, one `seq` later. */
+  renderItemList: '96f3a0b71c48e52d',
+  /** The render whose parent the corpus deliberately omits: the one orphan. */
+  renderFilterPanel: '7d24c1f8b530a96e',
+} as const satisfies Record<string, SpanId>;
+
+/** The parent the FilterPanel render names and no row of the corpus carries. */
+const CORPUS_ABSENT_PARENT_SPAN_ID: SpanId = 'f04b8d1e6a37c952';
+
+/** The store's arrival numbers for the corpus: eleven contiguous values. */
+const CORPUS_FIRST_INGEST_SEQ = 61;
+
+/**
+ * The instant the browser's SummaryCard render and the server's external call
+ * share, to the last bit of the double.
+ *
+ * This is AAP 0.2.3's mandated hard case as a committed row pair rather than as
+ * a constructed one: the page agent and the preload read different clocks and
+ * landed on the same millisecond.
+ */
+const CORPUS_TIED_INSTANT = 1_789_812_900_733.5;
+
+/** The earliest `startTime` in the corpus: the interaction's. */
+const CORPUS_START_TIME = 1_789_812_900_000;
+
+/** The latest end in the corpus, which is also the interaction's. */
+const CORPUS_END_TIME = 1_789_812_901_175.402;
+
+/**
+ * The corpus window, to the three decimals the product's rounding policy keeps.
+ *
+ * `TraceTree.totalDuration` is `roundMs(endTime - startTime)`, and the binary
+ * difference of the two doubles above is `1175.402099609375` — so this literal
+ * is the rounded value by design, not an approximation of one.
+ */
+const CORPUS_TOTAL_DURATION = 1_175.402;
+
+/** The deepest node in the corpus: the SQL, five levels under the click. */
+const CORPUS_MAX_DEPTH = 5;
+
+/**
+ * The depth a repaired node is re-attached at: one level below the anchor.
+ *
+ * `./correlator.ts` keeps its own `ORPHAN_DEPTH` private — the repair position
+ * is an implementation decision, not part of the module's surface — so the
+ * expectation is stated here rather than imported.
+ */
+const ORPHAN_ATTACHMENT_DEPTH = 1;
+
+/**
+ * The corpus in canonical order: `startTime`, then `producerId`, then `seq`,
+ * then `ingestSeq` (AAP 0.2.3).
+ *
+ * Two pairs in this sequence are decided by a key later than `startTime`. The
+ * SummaryCard render precedes the external call because the page agent's
+ * producer id sorts before the preload's — and only because of that: the
+ * preload's row reached the store first, so `ingestSeq` would invert the pair.
+ * The commit precedes the ItemList render because one producer's `seq` records
+ * the emission order inside a millisecond that the timestamp cannot resolve.
+ */
+const CORPUS_CANONICAL_ORDER: readonly SpanId[] = [
+  CORPUS_SPANS.interaction,
+  CORPUS_SPANS.fetch,
+  CORPUS_SPANS.httpServer,
+  CORPUS_SPANS.routeHandler,
+  CORPUS_SPANS.serviceFunction,
+  CORPUS_SPANS.dbQuery,
+  CORPUS_SPANS.renderSummaryCard,
+  CORPUS_SPANS.httpClient,
+  CORPUS_SPANS.commit,
+  CORPUS_SPANS.renderItemList,
+  CORPUS_SPANS.renderFilterPanel,
+];
+
+/** One expected node of the correlated corpus, as `flattenTrace` returns it. */
+interface ExpectedCorpusNode {
+  /** The span this node carries. */
+  readonly spanId: SpanId;
+  /** The span that placed it, `undefined` for the trace root. */
+  readonly parentSpanId: SpanId | undefined;
+  /** Its level, counting the root as zero. */
+  readonly depth: number;
+  /** The kind it reports. */
+  readonly kind: TelemetryKind;
+  /** Its children, in the order the tree lists them. */
+  readonly childSpanIds: readonly SpanId[];
+}
+
+/**
+ * The tree the corpus must correlate into, in `flattenTrace` pre-order.
+ *
+ * This table is the whole of AAP 0.8.4's acceptance test 1 read off committed
+ * data — click → `fetch` → `http.server` → `route.handler` → patched
+ * `function` → SQL, with the route handler's external call beside the function
+ * and the React work beside the fetch — plus the repaired render at the end.
+ * The child lists pin sibling order as well as parentage, including the two
+ * facts that are decisions rather than data: the service function precedes the
+ * external call because it started first, and the repaired render is
+ * **appended** after the structure the application actually had.
+ */
+const CORPUS_TREE: readonly ExpectedCorpusNode[] = [
+  {
+    spanId: CORPUS_SPANS.interaction,
+    parentSpanId: undefined,
+    depth: 0,
+    kind: 'interaction',
+    childSpanIds: [
+      CORPUS_SPANS.fetch,
+      CORPUS_SPANS.renderSummaryCard,
+      CORPUS_SPANS.commit,
+      CORPUS_SPANS.renderItemList,
+      CORPUS_SPANS.renderFilterPanel,
+    ],
+  },
+  {
+    spanId: CORPUS_SPANS.fetch,
+    parentSpanId: CORPUS_SPANS.interaction,
+    depth: 1,
+    kind: 'fetch',
+    childSpanIds: [CORPUS_SPANS.httpServer],
+  },
+  {
+    spanId: CORPUS_SPANS.httpServer,
+    parentSpanId: CORPUS_SPANS.fetch,
+    depth: 2,
+    kind: 'http.server',
+    childSpanIds: [CORPUS_SPANS.routeHandler],
+  },
+  {
+    spanId: CORPUS_SPANS.routeHandler,
+    parentSpanId: CORPUS_SPANS.httpServer,
+    depth: 3,
+    kind: 'route.handler',
+    childSpanIds: [CORPUS_SPANS.serviceFunction, CORPUS_SPANS.httpClient],
+  },
+  {
+    spanId: CORPUS_SPANS.serviceFunction,
+    parentSpanId: CORPUS_SPANS.routeHandler,
+    depth: 4,
+    kind: 'function',
+    childSpanIds: [CORPUS_SPANS.dbQuery],
+  },
+  {
+    spanId: CORPUS_SPANS.dbQuery,
+    parentSpanId: CORPUS_SPANS.serviceFunction,
+    depth: CORPUS_MAX_DEPTH,
+    kind: 'db.query',
+    childSpanIds: [],
+  },
+  {
+    spanId: CORPUS_SPANS.httpClient,
+    parentSpanId: CORPUS_SPANS.routeHandler,
+    depth: 4,
+    kind: 'http.client',
+    childSpanIds: [],
+  },
+  {
+    spanId: CORPUS_SPANS.renderSummaryCard,
+    parentSpanId: CORPUS_SPANS.interaction,
+    depth: 1,
+    kind: 'render',
+    childSpanIds: [],
+  },
+  {
+    spanId: CORPUS_SPANS.commit,
+    parentSpanId: CORPUS_SPANS.interaction,
+    depth: 1,
+    kind: 'commit',
+    childSpanIds: [],
+  },
+  {
+    spanId: CORPUS_SPANS.renderItemList,
+    parentSpanId: CORPUS_SPANS.interaction,
+    depth: 1,
+    kind: 'render',
+    childSpanIds: [],
+  },
+  {
+    spanId: CORPUS_SPANS.renderFilterPanel,
+    parentSpanId: CORPUS_SPANS.interaction,
+    depth: ORPHAN_ATTACHMENT_DEPTH,
+    kind: 'render',
+    childSpanIds: [],
+  },
+];
+
+describe('the committed mixed-tier corpus', () => {
+  it('parses every committed row through the persisted schema', () => {
+    const events = mixedTierEvents();
+
+    // The load above would have thrown on an invalid row, so what is left to
+    // assert is that the corpus is still the capture these cases describe: an
+    // empty or truncated file is a valid JSON array and would otherwise make
+    // every case below vacuous.
+    expect(events).toHaveLength(CORPUS_EVENT_COUNT);
+
+    for (const event of events) {
+      expect(isTelemetryEvent(event)).toBe(true);
+      expect(event.traceId).toBe(CORPUS_TRACE_ID);
+      expect(isTraceId(event.traceId)).toBe(true);
+      expect(isSpanId(event.spanId)).toBe(true);
+    }
+
+    // Distinct ids and distinct span ids, so neither the "nothing dropped"
+    // counts nor the span lookups below can be satisfied by a repeated row.
+    expect(new Set(events.map((event) => event.id)).size).toBe(CORPUS_EVENT_COUNT);
+    expect(new Set(spanIdsOfEvents(events)).size).toBe(CORPUS_EVENT_COUNT);
+    expect([...spanIdsOfEvents(events)].sort()).toEqual([...Object.values(CORPUS_SPANS)].sort());
+
+    // A contiguous block of arrival numbers: these are rows the store wrote,
+    // which is what makes `ingestSeq` usable as the final tie-breaker.
+    expect([...events.map((event) => event.ingestSeq)].sort((left, right) => left - right)).toEqual(
+      Array.from(
+        { length: CORPUS_EVENT_COUNT },
+        (_unused, index) => CORPUS_FIRST_INGEST_SEQ + index,
+      ),
+    );
+  });
+
+  it('is committed in a non-canonical order, so a case that sorts it is doing work', () => {
+    const events = mixedTierEvents();
+
+    expect(spanIdsOfEvents(events)).not.toEqual([...CORPUS_CANONICAL_ORDER]);
+    // Nor is the file in reverse canonical order, and its first row is neither
+    // the trace root nor the earliest event: the shuffle is real.
+    expect(spanIdsOfEvents(events)).not.toEqual([...CORPUS_CANONICAL_ORDER].reverse());
+    expect(events.at(0)?.spanId).not.toBe(CORPUS_SPANS.interaction);
+    expect(events.at(0)?.startTime).not.toBe(CORPUS_START_TIME);
+  });
+
+  it('hands each case a fresh copy, so one case cannot leak into another', () => {
+    const mutated = mixedTierEvents().at(0);
+    if (mutated === undefined) {
+      throw new Error('the corpus holds eleven rows');
+    }
+
+    const committedStart = mutated.startTime;
+    const committedAttributes = structuredClone(mutated.attributes);
+    mutated.startTime = 0;
+    mutated.attributes = {};
+
+    const reread = mixedTierEvents().at(0);
+    expect(reread?.startTime).toBe(committedStart);
+    expect(reread?.attributes).toEqual(committedAttributes);
+    // The clone is deep, so the module-level parse is untouched too — which is
+    // what keeps the next case's expectations true.
+    expect(MIXED_TIER_CORPUS.at(0)?.startTime).toBe(committedStart);
+    expect(MIXED_TIER_CORPUS.at(0)?.attributes).toEqual(committedAttributes);
+  });
+});
+
+describe('canonical ordering over the committed corpus', () => {
+  it('sorts the committed file order into the documented total order', () => {
+    const events = mixedTierEvents();
+    const sorted = sortEventsCanonical(events);
+
+    expect(spanIdsOfEvents(sorted)).toEqual([...CORPUS_CANONICAL_ORDER]);
+
+    // The sequence is the comparator's own, pairwise: every adjacent pair is
+    // strictly ordered, so no two rows of the corpus tie on all five keys and
+    // the order above cannot depend on the sort implementation.
+    for (let index = 1; index < sorted.length; index += 1) {
+      const earlier = sorted.at(index - 1);
+      const later = sorted.at(index);
+      if (earlier === undefined || later === undefined) {
+        throw new Error('sortEventsCanonical returns a dense array');
+      }
+      expect(compareEventsCanonical(earlier, later)).toBeLessThan(0);
+      expect(compareEventsCanonical(later, earlier)).toBeGreaterThan(0);
+    }
+
+    // And the caller's array is untouched, still in committed file order.
+    expect(spanIdsOfEvents(events)).not.toEqual([...CORPUS_CANONICAL_ORDER]);
+  });
+
+  it('reaches that same order from the reversed and from seeded shuffles of the corpus', () => {
+    const reversed = mixedTierEvents().reverse();
+    expect(spanIdsOfEvents(sortEventsCanonical(reversed))).toEqual([...CORPUS_CANONICAL_ORDER]);
+
+    for (const seed of [3, 97, 4_242]) {
+      const permuted = shuffle(mixedTierEvents(), seed);
+      expect(spanIdsOfEvents(permuted)).not.toEqual([...CORPUS_CANONICAL_ORDER]);
+      expect(spanIdsOfEvents(sortEventsCanonical(permuted))).toEqual([...CORPUS_CANONICAL_ORDER]);
+    }
+  });
+
+  it('separates the corpus row pair that two producers put in one millisecond', () => {
+    const events = mixedTierEvents();
+    const fromBrowser = corpusEventFor(events, CORPUS_SPANS.renderSummaryCard);
+    const fromPreload = corpusEventFor(events, CORPUS_SPANS.httpClient);
+
+    // The committed premise: one instant, two producers, two tiers.
+    expect(fromBrowser.startTime).toBe(CORPUS_TIED_INSTANT);
+    expect(fromPreload.startTime).toBe(fromBrowser.startTime);
+    expect(fromBrowser.producerId).toBe(CORPUS_BROWSER_PRODUCER);
+    expect(fromPreload.producerId).toBe(CORPUS_SERVER_PRODUCER);
+    expect(fromBrowser.tier).toBe('browser');
+    expect(fromPreload.tier).toBe('server');
+    expect(CORPUS_BROWSER_PRODUCER < CORPUS_SERVER_PRODUCER).toBe(true);
+
+    // The preload's row reached the store first, so the final tie-breaker
+    // points the *other* way: an implementation that fell straight through to
+    // `ingestSeq` would invert this pair and fail here. What this committed
+    // pair cannot settle on its own is `producerId` **before** `seq` — the
+    // page agent's third emission and the preload's fifth agree on the
+    // outcome — so that discrimination stays with the constructed pair in
+    // `compareEventsCanonical` above, where both keys are made to disagree.
+    expect(fromPreload.ingestSeq).toBeLessThan(fromBrowser.ingestSeq);
+    expect(fromBrowser.seq).toBeLessThan(fromPreload.seq);
+
+    expect(compareEventsCanonical(fromBrowser, fromPreload)).toBeLessThan(0);
+    expect(compareEventsCanonical(fromPreload, fromBrowser)).toBeGreaterThan(0);
+    expect(spanIdsOfEvents(sortEventsCanonical([fromBrowser, fromPreload]))).toEqual([
+      CORPUS_SPANS.renderSummaryCard,
+      CORPUS_SPANS.httpClient,
+    ]);
+    expect(spanIdsOfEvents(sortEventsCanonical([fromPreload, fromBrowser]))).toEqual([
+      CORPUS_SPANS.renderSummaryCard,
+      CORPUS_SPANS.httpClient,
+    ]);
+  });
+
+  it('falls through to seq for the commit and render the page agent emitted together', () => {
+    const events = mixedTierEvents();
+    const commit = corpusEventFor(events, CORPUS_SPANS.commit);
+    const render = corpusEventFor(events, CORPUS_SPANS.renderItemList);
+
+    // One producer, one instant: `producerId` ties and `seq` is what records
+    // the order React's commit callback observed.
+    expect(commit.startTime).toBe(render.startTime);
+    expect(commit.producerId).toBe(render.producerId);
+    expect(commit.producerId).toBe(CORPUS_BROWSER_PRODUCER);
+    expect(commit.seq).toBeLessThan(render.seq);
+
+    expect(compareEventsCanonical(commit, render)).toBeLessThan(0);
+    expect(compareEventsCanonical(render, commit)).toBeGreaterThan(0);
+    expect(spanIdsOfEvents(sortEventsCanonical([render, commit]))).toEqual([
+      CORPUS_SPANS.commit,
+      CORPUS_SPANS.renderItemList,
+    ]);
+  });
+});
+
+describe('nesting across tiers over the committed corpus', () => {
+  it('reproduces the cross-tier chain span by span, with its depths', () => {
+    const events = mixedTierEvents();
+    const result = correlateEvents(events);
+    const tree = onlyTrace(result);
+
+    expectNothingDropped(result, events);
+    expect(tree.traceId).toBe(CORPUS_TRACE_ID);
+    expect(tree.roots).toHaveLength(1);
+    expect(tree.primaryRootSpanId).toBe(CORPUS_SPANS.interaction);
+    expect(primaryRootOf(tree).event.kind).toBe('interaction');
+    expect(tree.nodeCount).toBe(CORPUS_EVENT_COUNT);
+    expect(tree.maxDepth).toBe(CORPUS_MAX_DEPTH);
+    expect(tree.truncated).toBe(false);
+    expect(tree.duplicateSpanIds).toEqual([]);
+
+    const flat = flattenTrace(tree);
+    expect(spanIdsOfNodes(flat)).toEqual(CORPUS_TREE.map((expected) => expected.spanId));
+    expect(flat.map((node) => node.depth)).toEqual(CORPUS_TREE.map((expected) => expected.depth));
+    expect(flat.map((node) => node.event.kind)).toEqual(
+      CORPUS_TREE.map((expected) => expected.kind),
+    );
+    expect(flat.map((node) => spanIdsOfNodes(node.children))).toEqual(
+      CORPUS_TREE.map((expected) => [...expected.childSpanIds]),
+    );
+  });
+
+  it('places every node after the parent that placed it', () => {
+    const tree = onlyTrace(correlateEvents(mixedTierEvents()));
+
+    expectParentsBeforeChildren(tree);
+
+    const visited: [SpanId, SpanId | undefined][] = [];
+    walkTrace(tree, (node, parent) => {
+      visited.push([node.event.spanId, parent?.event.spanId]);
+    });
+    expect(visited).toEqual(
+      CORPUS_TREE.map((expected) => [expected.spanId, expected.parentSpanId]),
+    );
+
+    // AAP 0.8.3's end-to-end assertion, read off the corpus: the SQL sits under
+    // the patched function, under the route handler, under the request span,
+    // under the browser's fetch, under the click — root-first, one ancestor per
+    // tier boundary, and the tiers cross browser → server → db exactly once.
+    const ancestry = ancestorsOfSpanId(tree, CORPUS_SPANS.dbQuery);
+    expect(spanIdsOfNodes(ancestry)).toEqual([
+      CORPUS_SPANS.interaction,
+      CORPUS_SPANS.fetch,
+      CORPUS_SPANS.httpServer,
+      CORPUS_SPANS.routeHandler,
+      CORPUS_SPANS.serviceFunction,
+    ]);
+    expect(ancestry.map((node) => node.event.tier)).toEqual([
+      'browser',
+      'browser',
+      'server',
+      'server',
+      'server',
+    ]);
+    expect(nodeFor(tree, CORPUS_SPANS.dbQuery).event.tier).toBe('db');
+    expect(ancestry).toHaveLength(nodeFor(tree, CORPUS_SPANS.dbQuery).depth);
+    expect(subtreeNodeCount(primaryRootOf(tree))).toBe(CORPUS_EVENT_COUNT);
+  });
+
+  it('correlates the reversed and the shuffled corpus into the identical tree', () => {
+    const canonical = correlateEvents(sortEventsCanonical(mixedTierEvents()));
+    expect(spanIdsOfNodes(flattenTrace(onlyTrace(canonical)))).toEqual(
+      CORPUS_TREE.map((expected) => expected.spanId),
+    );
+
+    // Two producers mean two arrival orders for the same capture, and the
+    // service re-correlates the whole capture as each batch lands.
+    expect(correlateEvents(mixedTierEvents().reverse()).traces).toEqual(canonical.traces);
+    for (const seed of [11, 613, 20_252]) {
+      expect(correlateEvents(shuffle(mixedTierEvents(), seed)).traces).toEqual(canonical.traces);
+    }
+  });
+
+  it('reads the frozen corpus without mutating it', () => {
+    const events = mixedTierEvents();
+    const snapshot: readonly TelemetryEvent[] = structuredClone(events);
+
+    for (const event of events) {
+      Object.freeze(event.attributes);
+      Object.freeze(event);
+    }
+    Object.freeze(events);
+
+    const result = correlateEvents(events);
+    expect(onlyTrace(result).nodeCount).toBe(CORPUS_EVENT_COUNT);
+    expect(correlateTrace(events, CORPUS_TRACE_ID)?.nodeCount).toBe(CORPUS_EVENT_COUNT);
+    expect(correlateTrace(events, DEFAULT_TRACE_ID)).toBeUndefined();
+
+    // The persisted rows are byte-for-byte what the file holds.
+    expect(events).toEqual(snapshot);
+  });
+});
+
+describe('orphan attachment over the committed corpus', () => {
+  it('retains the render whose parent never arrived, re-attached under the click', () => {
+    const events = mixedTierEvents();
+    const result = correlateEvents(events);
+    const tree = onlyTrace(result);
+
+    expectNothingDropped(result, events);
+    expect(result.orphanCount).toBe(1);
+    expect(tree.orphanCount).toBe(1);
+
+    // The corpus's premise: the named parent is genuinely absent, so this is a
+    // repair rather than a misplacement.
+    expect(corpusEventFor(events, CORPUS_SPANS.renderFilterPanel).parentSpanId).toBe(
+      CORPUS_ABSENT_PARENT_SPAN_ID,
+    );
+    expect(events.some((event) => event.spanId === CORPUS_ABSENT_PARENT_SPAN_ID)).toBe(false);
+    expect(findNodeBySpanId(tree, CORPUS_ABSENT_PARENT_SPAN_ID)).toBeUndefined();
+
+    const orphan = nodeFor(tree, CORPUS_SPANS.renderFilterPanel);
+    expect(orphan.orphaned).toBe(true);
+    expect(orphan.orphanReason).toBe('missing-parent');
+    expect(orphan.missingParentSpanId).toBe(CORPUS_ABSENT_PARENT_SPAN_ID);
+    expect(orphan.depth).toBe(ORPHAN_ATTACHMENT_DEPTH);
+    expect(orphan.children).toEqual([]);
+    expect(orphanFlagsOf(orphan.event)).toBeUndefined();
+
+    // Exactly one repair, exactly one reason, and it is the last child of the
+    // anchor: the structure the application had is read first, the repair after.
+    expect(spanIdsOfNodes(orphanNodesIn(tree))).toEqual([CORPUS_SPANS.renderFilterPanel]);
+    expect(orphanReasonsIn(tree)).toEqual(['missing-parent']);
+    expect(spanIdsOfNodes(primaryRootOf(tree).children).at(-1)).toBe(
+      CORPUS_SPANS.renderFilterPanel,
+    );
+  });
+
+  it('leaves every other node of the corpus unflagged', () => {
+    const tree = onlyTrace(correlateEvents(mixedTierEvents()));
+
+    const flagged = flattenTrace(tree).filter(
+      (node) =>
+        node.orphaned || node.orphanReason !== undefined || node.missingParentSpanId !== undefined,
+    );
+    expect(spanIdsOfNodes(flagged)).toEqual([CORPUS_SPANS.renderFilterPanel]);
+
+    // The repair is a re-parenting and nothing else: the row still reports the
+    // parent it named, so a developer can see what went missing.
+    expect(nodeFor(tree, CORPUS_SPANS.renderFilterPanel).event.parentSpanId).toBe(
+      CORPUS_ABSENT_PARENT_SPAN_ID,
+    );
+  });
+});
+
+describe('the mixed-producer facts of the committed corpus', () => {
+  it('summarises both producers, all three tiers and every kind present', () => {
+    const events = mixedTierEvents();
+    const result = correlateEvents(events);
+    const tree = onlyTrace(result);
+
+    expect(result.traceCount).toBe(1);
+    expect(result.eventCount).toBe(CORPUS_EVENT_COUNT);
+    expect([...result.byTraceId.keys()]).toEqual([CORPUS_TRACE_ID]);
+
+    // Derived from the corpus, so the tree is checked against its own input.
+    const producersPresent = [...new Set(events.map((event) => event.producerId))].sort();
+    const kindsPresent = new Set<TelemetryKind>(events.map((event) => event.kind));
+    expect(producersPresent).toEqual([CORPUS_BROWSER_PRODUCER, CORPUS_SERVER_PRODUCER]);
+    expect(tree.producerIds).toEqual(producersPresent);
+    expect(tree.kinds).toEqual(TELEMETRY_KINDS.filter((kind) => kindsPresent.has(kind)));
+
+    // Pinned, so a corpus that quietly lost its server or db tier fails here
+    // rather than agreeing with a smaller derived set.
+    expect(tree.tiers).toEqual([...TELEMETRY_TIERS]);
+    expect(tree.kinds).toEqual([
+      'interaction',
+      'render',
+      'commit',
+      'fetch',
+      'http.server',
+      'route.handler',
+      'function',
+      'db.query',
+      'http.client',
+    ]);
+    expect(nodeCountsByTier(tree)).toEqual({ browser: 6, server: 4, db: 1 });
+    expect(events.filter((event) => event.producerId === CORPUS_BROWSER_PRODUCER)).toHaveLength(6);
+    expect(events.filter((event) => event.producerId === CORPUS_SERVER_PRODUCER)).toHaveLength(5);
+  });
+
+  it('opens its window at the click and closes it where the click ended', () => {
+    const events = mixedTierEvents();
+    const tree = onlyTrace(correlateEvents(events));
+
+    expect(tree.startTime).toBe(Math.min(...events.map((event) => event.startTime)));
+    expect(tree.endTime).toBe(Math.max(...events.map((event) => event.startTime + event.duration)));
+    expect(tree.startTime).toBe(CORPUS_START_TIME);
+    expect(tree.endTime).toBe(CORPUS_END_TIME);
+    expect(tree.totalDuration).toBe(CORPUS_TOTAL_DURATION);
+
+    // The interaction is the widest span in the capture, so the tree's window
+    // and the anchor's coincide — which is what makes a timeline's percentage
+    // scale meaningful for this capture.
+    const root = primaryRootOf(tree);
+    expect(root.event.startTime).toBe(tree.startTime);
+    expect(nodeEndTime(root)).toBe(tree.endTime);
+    expect(totalTimeOf(root)).toBe(CORPUS_TOTAL_DURATION);
+
+    // Every row's own window falls inside the trace window, which is what lets
+    // the aggregates treat the two producers' clocks as one time base.
+    for (const event of events) {
+      expect(event.startTime).toBeGreaterThanOrEqual(tree.startTime);
+      expect(event.startTime + event.duration).toBeLessThanOrEqual(tree.endTime);
+    }
   });
 });

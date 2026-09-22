@@ -96,14 +96,22 @@
   --alert-tone: var(--ls-danger, #b42318);
 }
 
-/* The one-line heading, rendered as a paragraph rather than a heading element so an alert dropped
- * into a page never disturbs its outline. It is the element that carries the tone in colour, and
- * its text is what carries the tone in words. */
+/* The one-line heading. `Alert.tsx` renders it as a paragraph by default - which is what keeps an
+ * alert dropped into a page from disturbing that page's outline - and as the heading level the
+ * caller asks for through `titleAs` where the notice is the page rather than a message inside one.
+ * It is the element that carries the tone in colour, and its text is what carries the tone in
+ * words.
+ *
+ * Because either element can turn up here, this rule states every property `app/globals.css` sets
+ * on `h1`-`h6`: margin, colour, size, weight and, for the same reason, the line height the box
+ * itself uses. A class outranks those element rules, so the headline is painted identically
+ * whichever element it is, and a page-level error reads exactly as the paragraph did. */
 .title {
   margin: 0;
   color: var(--alert-tone);
   font-size: var(--ls-text-sm, 13px);
   font-weight: 600;
+  line-height: 1.45;
 }
 
 /* The message itself: primary text colour at the box's own size, whatever the tone. Block rhythm

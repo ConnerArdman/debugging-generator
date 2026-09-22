@@ -43,10 +43,25 @@
  * provider down also stops a cached tracer from processing anything it managed
  * to start.
  *
- * **Layer C — kind filtering.** `./exporter.ts` asks {@link CaptureGate} for
- * every ended span, which is what gives a plan per-signal granularity *inside*
- * an active capture: a plan that asked for no database tracing collects no
- * `db.query` events even though the driver is patched.
+ * **Layer C — per-span admission.** `./exporter.ts` asks {@link CaptureGate}
+ * about every ended span, which is what gives a plan per-signal granularity
+ * *inside* an active capture, on three axes — because one event kind is not one
+ * signal:
+ *
+ * - **kind**, so a plan that asked for no database tracing collects no
+ *   `db.query` events even though the driver is patched;
+ * - **instrumentation source**, so a plan that asked for the ORM's queries
+ *   collects none of the driver's, which share that single kind;
+ * - **patched identity**, so a `function` span is collected only for a symbol
+ *   *this* plan patched — a patch left behind by an earlier session is not this
+ *   capture's evidence.
+ *
+ * And **capture identity**: a span is evidence for the capture it started in,
+ * not for whichever capture is armed when it ends. The service assigns
+ * `captureId` when a batch arrives, so a span from a replaced capture cannot be
+ * labelled correctly and is refused. This module's part of that is to flush the
+ * outgoing capture before it arms the next one and to advance the capture
+ * generation `./exporter.ts` stamps spans with.
  *
  * ## The disable sequence, in order
  *
@@ -59,9 +74,31 @@
  * 4. `trace.disable()` and `propagation.disable()`;
  * 5. `await provider.shutdown()`, then drop the reference.
  *
- * Every step is independently guarded: a failure in one is logged at `warn` and
- * the rest still run. The path is idempotent, and it never unloads the module,
- * never exits the process and never touches a file in the developer's project.
+ * Every step is independently guarded *and independently tracked*: a failure in
+ * one is logged at `warn`, the rest still run, and the step that failed keeps
+ * its handle and its recorded state so the teardown reports `partial` naming
+ * that resource and the next attempt — a second `disable()`, or the next
+ * capture's installation — retries exactly it. Reporting a failed step as done
+ * is the one outcome AAP §0.5.1 rules out: the preload would claim to be inert
+ * while `pg` was still wrapped or a provider still registered, and nothing
+ * would ever try again. The path is idempotent, and it never unloads the
+ * module, never exits the process and never touches a file in the developer's
+ * project.
+ *
+ * What "tracked" has to mean is set by the SDK rather than chosen here.
+ * `InstrumentationBase` (`@opentelemetry/instrumentation` 0.222.0) sets its own
+ * enabled flag **before** it runs the patch or unpatch callbacks and returns
+ * immediately when the flag already holds the target value. So a `disable()`
+ * that throws leaves the flag reading "disabled" with the host's modules
+ * possibly still wrapped, and a *second* `disable()` on that instrumentation
+ * does nothing at all — its silence is not evidence of anything. An
+ * instrumentation whose toggle threw is therefore recorded as
+ * {@link INSTRUMENTATION_STATES.unknown} and keeps the report `partial`, with a
+ * restart named as the remedy, rather than being upgraded to `clean` by a
+ * no-op. Forcing an enable/unpatch cycle to recover was considered and
+ * rejected: shimmer tracks one layer of original per method, so a double wrap
+ * followed by a single unwrap can leave a live wrapper behind — worse than an
+ * honest report.
  *
  * `globalThis.__DEBUGGEN__` is deliberately **left installed**. With no
  * provider the span helper degrades to a bare callback invocation, so it costs
@@ -80,6 +117,31 @@
  * injects. Forget it and the browser↔server correlation seam breaks *silently*
  * on the second capture of a session — every tier still produces spans, they
  * simply stop sharing a trace.
+ *
+ * Two more things belong to that re-registration. A teardown that did **not**
+ * finish is completed first, because `trace.setGlobalTracerProvider` refuses to
+ * replace an installed global: registering over a registration this object
+ * could not remove would silently leave the capture running against the
+ * provider that was shut down. And the shared span processor is **reopened**,
+ * because `provider.shutdown()` shuts its processors down — the SDK owns them,
+ * while this product shares one across every provider a session builds — so
+ * without it the second capture would create spans and export none.
+ *
+ * A capture that cannot get a provider is **not armed**. The gate stays shut,
+ * the outcome says `failed`, and the same frame retries; the alternative is a
+ * session that every surface of the product shows as capturing while no span is
+ * ever created (AAP §0.5.5).
+ *
+ * Whether it *got* one is asked of the global registry, not inferred from the
+ * absence of a throw. `trace.setGlobalTracerProvider` answers `false` — keeping
+ * the incumbent — when a global provider is already registered, and
+ * `NodeTracerProvider.register()` returns `void`, so a second OpenTelemetry
+ * setup in the same dev server (an `instrumentation.ts` `register()`,
+ * `@vercel/otel`, a second preload) produces a refusal that nothing reports.
+ * This module compares the global against the provider it holds — including the
+ * one `register.ts` attaches at bootstrap, whose registration the caller could
+ * not have observed either — and refuses the capture with that diagnosis when
+ * they differ.
  *
  * ## Privacy
  *
@@ -114,17 +176,21 @@ import {
 } from '@opentelemetry/sdk-trace-base';
 import type { Sampler, SamplingResult } from '@opentelemetry/sdk-trace-base';
 
+import { FUNCTION_ATTRIBUTE_KEYS, MAX_PREVIEW_LENGTH } from '../schema/attributes.js';
 import { QUERY_KINDS } from '../schema/kinds.js';
 import type { TelemetryKind } from '../schema/kinds.js';
+import { truncate } from '../redaction/rules.js';
 import {
   HELLO_TIMEOUT_MS,
   RECONNECT_MAX_MS,
   RECONNECT_MIN_MS,
-  TRACER_VERSION,
+  WIRE_PROTOCOL_VERSION,
   createPreloadLogger,
 } from './config.js';
 import type { PreloadConfig } from './config.js';
-import type { CaptureGate } from './exporter.js';
+import { DB_CLIENT_VALUES, DB_INSTRUMENTATION_SCOPES } from './convert.js';
+import type { DatabaseSpanSource } from './convert.js';
+import type { CaptureGate, SpanAdmission, SpanAdmissionCandidate } from './exporter.js';
 
 /*
  * ---------------------------------------------------------------------------
@@ -202,6 +268,17 @@ const SOCKET_CLOSE_NORMAL = 1000;
 const REDACTED_PLACEHOLDER = '[redacted]';
 
 /**
+ * The W3C Trace Context header the propagator must carry.
+ *
+ * Checked after registration, because the propagator is what extracts the
+ * `traceparent` the page agent injects: without it every tier still produces
+ * spans and they simply stop sharing a trace (AAP §0.4.2). Spelled here rather
+ * than imported from `@opentelemetry/semantic-conventions`, which does not
+ * declare propagation fields.
+ */
+const TRACEPARENT_FIELD = 'traceparent';
+
+/**
  * The envelope every WebSocket frame travels in: `{ id, type, sessionId?, ts,
  * payload }` (AAP §0.2.3).
  *
@@ -234,7 +311,15 @@ export interface ClientHelloPayload {
   readonly client: typeof CONTROL_CLIENT_KIND;
   /** The project this dev server serves; the scope of the credential. */
   readonly projectRoot: string;
-  /** This package's version, as advisory metadata. */
+  /**
+   * The **protocol** version, {@link WIRE_PROTOCOL_VERSION} — never this
+   * package's version.
+   *
+   * It is a compatibility signal rather than metadata: the service parses it
+   * and compares its major component against its own before it will send
+   * `server-agent.config`, so a package version here is a refused handshake
+   * and a capture with no server-tier spans.
+   */
   readonly version: string;
   /** The server-agent bearer credential. Never logged. */
   readonly token: string;
@@ -323,20 +408,34 @@ export interface ParsedControlFrame {
  * | `pg` | `db.query` |
  * | `functions` | `function` |
  *
- * `prisma` and `pg` share `db.query` because the kind describes the operation,
- * not which library reported it: a query is database work whether the ORM's
- * instrumentation or the driver's saw it, and `../schema/kinds.ts` has one kind
- * for it. Either flag therefore admits the kind, which is also the honest
- * reading of a plan that asked for "database tracing" against a project using
- * both.
+ * **This table is the coarse axis, and it is not the whole policy.** Two of the
+ * six signals cannot be expressed as a kind:
  *
- * `functions` is a **presence-based** policy: a non-empty list enables the
- * `function` kind wholesale rather than filtering by symbol name. The list is
- * kept on the gate so a future refinement can narrow it, but filtering by name
- * here would be the wrong place to do it — a function span's name comes from
- * the patch the plan itself applied, so an unplanned function span cannot exist
- * in the first place, and a name mismatch would silently discard the one signal
- * the developer paid a file modification for.
+ * - `prisma` and `pg` share `db.query` because the kind describes the
+ *   operation, not which library reported it: a query is database work whether
+ *   the ORM's instrumentation or the driver's saw it, and `../schema/kinds.ts`
+ *   has one kind for it. But the two flags are *independent* in
+ *   `server-agent.config` (AAP §0.4.2), so admitting the kind is not the same
+ *   as admitting the span. {@link DB_SOURCE_SIGNALS} maps a span's
+ *   instrumentation source back to the flag that admits it, and
+ *   {@link ServerAgentControl.admitSpan} applies it.
+ * - `functions` is a **list of symbols the plan patched**, not a switch. A
+ *   non-empty list enables the `function` kind here, and
+ *   {@link ServerAgentControl.admitSpan} then requires the span's own identity
+ *   to be one of those symbols — the `symbol` attribute the patch wrote where
+ *   there is one, and the span's name only where there is not, so a span named
+ *   after a planned symbol while declaring a different one is refused. A
+ *   patched function from outside the active plan does exist in
+ *   practice: an earlier session whose patch was left in a conflict state, a
+ *   plan version that has since been narrowed, a second project sharing the
+ *   process. Admitting it would put a symbol nobody asked about into the
+ *   capture, which is the opposite of the targeted instrumentation the plan
+ *   paid a file modification for.
+ *
+ * Both refinements are enforced at `onEnd`, never at sampling time: a
+ * `NOT_RECORD` decision propagates to a span's children, so filtering by
+ * identity in the sampler would silently cut the subtree underneath a function
+ * nobody planned — including the queries that *were* planned.
  */
 export const SIGNAL_KINDS: Readonly<Record<ServerAgentSignalName, readonly TelemetryKind[]>> =
   Object.freeze({
@@ -366,6 +465,43 @@ export const ANY_SIGNAL_KINDS: readonly TelemetryKind[] = Object.freeze<Telemetr
   'server.error',
 ]);
 
+/**
+ * The signal that admits each database instrumentation's spans.
+ *
+ * The second gating axis, and the reason it is a table rather than an `if`:
+ * `SIGNAL_KINDS` maps both flags onto `db.query`, so without this the ORM flag
+ * would admit the driver's spans and the driver's flag the ORM's. Keyed by the
+ * source `./convert.ts` derives from a span's instrumentation scope, so the
+ * names on both sides of the mapping come from one declaration.
+ */
+export const DB_SOURCE_SIGNALS: Readonly<Record<DatabaseSpanSource, ServerAgentSignalName>> =
+  Object.freeze({
+    [DB_CLIENT_VALUES.orm]: 'prisma',
+    [DB_CLIENT_VALUES.driver]: 'pg',
+  });
+
+/**
+ * The kinds whose admission needs the span's own identity, not just its kind.
+ *
+ * `function` spans are named after the symbol the plan patched, and that name
+ * is what {@link resolveFunctionAllowList} is checked against. Derived from
+ * {@link SIGNAL_KINDS} so the kind is named once.
+ */
+export const FUNCTION_KINDS: readonly TelemetryKind[] = SIGNAL_KINDS.functions;
+
+/**
+ * The `function` span attribute carrying the patched symbol's name.
+ *
+ * `packages/instrumentation`'s wrapper template passes `meta.symbol` to
+ * `globalThis.__DEBUGGEN__.span`, and `./span-helper.ts` copies it onto the
+ * span, so it is the patch's own record of what it wrapped — independent of
+ * the span's display name, which a caller may override and which
+ * `./span-helper.ts` truncates. Typed as a member of the `function` kind's
+ * declared vocabulary so it cannot drift out of `../schema/attributes.ts`
+ * without a compile error, exactly as `./span-helper.ts` types its own keys.
+ */
+const FUNCTION_SYMBOL_ATTRIBUTE: (typeof FUNCTION_ATTRIBUTE_KEYS)[number] = 'symbol';
+
 /** Signals with everything off — the gate's state outside a capture. */
 export const NO_SIGNALS: ServerAgentSignals = Object.freeze({
   http: false,
@@ -382,10 +518,19 @@ const BOOLEAN_SIGNAL_NAMES: readonly Exclude<ServerAgentSignalName, 'functions'>
 >(['http', 'routeHandlers', 'fetch', 'prisma', 'pg']);
 
 /**
- * Resolve a signal set into the exact kinds the gate will admit.
+ * Resolve a signal set into the kinds the gate will admit.
  *
  * Computed once per config frame and held as a set, because `isKindEnabled` is
  * asked for every ended span and a set lookup is the cheapest honest answer.
+ *
+ * **The coarse axis only.** A kind in this set is *necessary* for a span to be
+ * admitted and not sufficient: a `db.query` span must also come from the
+ * instrumentation the capture asked for ({@link resolveEnabledDbSources}) and
+ * a `function` span must name a symbol the plan patched
+ * ({@link resolveFunctionAllowList}). `functions` therefore enables the kind on
+ * presence here — there is no other kind for a patched function to arrive as —
+ * while the list itself is enforced per span by
+ * {@link ServerAgentControl.admitSpan}.
  *
  * @param signals The capture's signal switches.
  * @returns The admitted kinds; empty when no signal is on.
@@ -414,6 +559,93 @@ export function resolveEnabledKinds(signals: ServerAgentSignals): ReadonlySet<Te
   }
 
   return kinds;
+}
+
+/**
+ * Resolve a signal set into the database instrumentations whose spans the
+ * capture wants.
+ *
+ * The second axis of the `db.query` kind. A plan that asked for ORM tracing
+ * alone resolves to `{'prisma'}`, and the driver's query spans — which the
+ * driver instrumentation may still be producing for another reason, or which a
+ * shared process may be producing at all — are refused at `onEnd`.
+ *
+ * @param signals The capture's signal switches.
+ * @returns The admitted sources; empty when neither database flag is on.
+ */
+export function resolveEnabledDbSources(
+  signals: ServerAgentSignals,
+): ReadonlySet<DatabaseSpanSource> {
+  const sources = new Set<DatabaseSpanSource>();
+  for (const [source, signal] of Object.entries(DB_SOURCE_SIGNALS) as [
+    DatabaseSpanSource,
+    ServerAgentSignalName,
+  ][]) {
+    if (signals[signal] === true) {
+      sources.add(source);
+    }
+  }
+  return sources;
+}
+
+/**
+ * Resolve a plan's `functions` list into the identities a `function` span may
+ * present.
+ *
+ * Every name is admitted in two forms, because the span may carry either:
+ *
+ * - **as planned** — the name the plan patched, which is what
+ *   `packages/instrumentation` writes as the span's `symbol` attribute and, by
+ *   default, as the span's name; and
+ * - **as truncated** — `./span-helper.ts` bounds a span name at
+ *   `MAX_PREVIEW_LENGTH`, while a plan's symbol may be longer (the plan schema
+ *   allows 200 characters), so a long symbol arrives shortened with an
+ *   ellipsis. Without its truncated form the one signal the developer paid a
+ *   file modification for would be discarded for being too long. A shortened
+ *   spelling is admitted only where it still names **one** planned symbol: two
+ *   symbols that agree on their first `MAX_PREVIEW_LENGTH - 1` characters
+ *   shorten to the same string, and admitting it would admit whichever of them
+ *   arrived — so in that case only their full spellings are accepted.
+ *
+ * Names are trimmed and empties dropped: a blank entry can never match a span,
+ * and leaving it in would make an all-blank list look like a plan that patched
+ * something.
+ *
+ * @param signals The capture's signal switches.
+ * @returns The accepted identities; empty when the plan patched nothing.
+ */
+export function resolveFunctionAllowList(signals: ServerAgentSignals): ReadonlySet<string> {
+  const allowed = new Set<string>();
+  const shortened = new Map<string, number>();
+
+  for (const name of signals.functions) {
+    if (typeof name !== 'string') {
+      continue;
+    }
+    const trimmed = name.trim();
+    if (trimmed.length === 0) {
+      continue;
+    }
+    allowed.add(trimmed);
+    const short = truncate(trimmed, MAX_PREVIEW_LENGTH);
+    if (short !== trimmed) {
+      shortened.set(short, (shortened.get(short) ?? 0) + 1);
+    }
+  }
+
+  for (const [short, count] of shortened) {
+    // Only where the shortened spelling still names one symbol. Two planned
+    // symbols agreeing on their first `MAX_PREVIEW_LENGTH - 1` characters
+    // shorten to the same string, and admitting that string would admit either
+    // of them — including one this plan did not patch. Both are still accepted
+    // in full, so the only span refused is one that arrived shortened and
+    // genuinely cannot be told apart.
+    if (count === 1 && !allowed.has(short)) {
+      allowed.add(short);
+    }
+  }
+
+  return allowed;
 }
 
 /*
@@ -858,6 +1090,115 @@ export interface ToggleableInstrumentation {
   enable(): void;
   /** Remove the patches — for `pg`, unwrap the wrapped methods. */
   disable(): void;
+
+  /**
+   * Whether the SDK considers this instrumentation enabled, as
+   * `InstrumentationBase.isEnabled()` reports it.
+   *
+   * Read during teardown, and it is the only residual-state evidence the SDK
+   * offers. It matters because `InstrumentationBase.enable()` and `disable()`
+   * flip their internal flag **before** running the patch and unpatch
+   * callbacks and return early when the flag already holds the target value
+   * (verified in `@opentelemetry/instrumentation` 0.222.0). So a `disable()`
+   * that threw part-way leaves the flag `false` with patches possibly still
+   * applied, and a second `disable()` would return without unpatching
+   * anything — a no-op this module must not mistake for verified cleanup.
+   *
+   * Optional, because a counting fake need not model the SDK; when it is
+   * absent a non-throwing toggle is taken at face value.
+   */
+  isEnabled?(): boolean;
+
+  /**
+   * The instrumentation's package name, as `InstrumentationBase` exposes it.
+   *
+   * Read — never written — to tell the ORM's instrumentation from the driver's,
+   * because `server-agent.config` switches them independently and a plan that
+   * asked for one must leave the other unpatched. The real instances supply it
+   * (`@prisma/instrumentation` and `@opentelemetry/instrumentation-pg` name
+   * themselves after their packages), so nothing in `register.ts` has to label
+   * them; optional so a counting fake stays a counting fake, and one without a
+   * name is treated as {@link INSTRUMENTATION_ROLES.unknown}.
+   */
+  readonly instrumentationName?: string | undefined;
+}
+
+/**
+ * Which signal an attached instrumentation serves.
+ *
+ * `unknown` is not a failure: it is an instrumentation this build cannot
+ * identify, which is handled by keeping it enabled for every capture rather
+ * than by guessing at the flag that governs it.
+ */
+export const INSTRUMENTATION_ROLES = Object.freeze({
+  /** The ORM's instrumentation, governed by the `prisma` flag. */
+  orm: 'prisma',
+  /** The driver's instrumentation, governed by the `pg` flag. */
+  driver: 'pg',
+  /** An instrumentation this build does not recognise. */
+  unknown: 'unknown',
+} as const);
+
+/** One member of {@link INSTRUMENTATION_ROLES}. */
+export type InstrumentationRole =
+  (typeof INSTRUMENTATION_ROLES)[keyof typeof INSTRUMENTATION_ROLES];
+
+/**
+ * Which signal an instrumentation serves, from the name it reports.
+ *
+ * Matched against the same scope names `./convert.ts` classifies *spans* by, so
+ * the instrumentation that gets enabled and the spans that get admitted are
+ * decided from one declaration: `@prisma/instrumentation` matches the ORM's
+ * package prefix (and the bare tracer name it creates spans with), and
+ * `@opentelemetry/instrumentation-pg` is the driver's package name.
+ *
+ * @param instrumentation The attached instrumentation.
+ * @returns Its role; {@link INSTRUMENTATION_ROLES.unknown} when the name is
+ * absent or unrecognised.
+ */
+export function classifyInstrumentation(
+  instrumentation: ToggleableInstrumentation,
+): InstrumentationRole {
+  const name =
+    typeof instrumentation.instrumentationName === 'string'
+      ? instrumentation.instrumentationName.trim()
+      : '';
+  if (
+    name === DB_INSTRUMENTATION_SCOPES.orm ||
+    name.startsWith(DB_INSTRUMENTATION_SCOPES.ormScopePrefix)
+  ) {
+    return INSTRUMENTATION_ROLES.orm;
+  }
+  if (name === DB_INSTRUMENTATION_SCOPES.driver) {
+    return INSTRUMENTATION_ROLES.driver;
+  }
+  return INSTRUMENTATION_ROLES.unknown;
+}
+
+/**
+ * Whether a capture's signals want an instrumentation of this role patched in.
+ *
+ * The ORM and the driver follow their own flags, which is what makes a
+ * prisma-only plan leave `pg.Client.prototype.query` unwrapped in the
+ * developer's process. An unrecognised instrumentation is kept enabled for
+ * every capture: it arrived from `register.ts` enabled, this build cannot say
+ * which signal it serves, and disabling it on a guess would remove a signal a
+ * plan may depend on.
+ *
+ * @param role The instrumentation's role.
+ * @param signals The capture's signal switches.
+ */
+export function wantsInstrumentation(
+  role: InstrumentationRole,
+  signals: ServerAgentSignals,
+): boolean {
+  if (role === INSTRUMENTATION_ROLES.orm) {
+    return signals.prisma;
+  }
+  if (role === INSTRUMENTATION_ROLES.driver) {
+    return signals.pg;
+  }
+  return true;
 }
 
 /**
@@ -893,7 +1234,7 @@ export type TracerProviderFactory = () => ControlTracerProvider;
 
 /**
  * The span processor, as this module uses one: something to flush before
- * teardown.
+ * teardown, and to hand on to the next provider.
  *
  * `DebuggenSpanProcessor` satisfies it. The instance is deliberately **not**
  * shut down by the disable path — it survives every enable/disable cycle so
@@ -902,6 +1243,32 @@ export type TracerProviderFactory = () => ControlTracerProvider;
 export interface ControlFlushTarget {
   /** Post everything currently buffered; resolves when it has settled. */
   forceFlush(): Promise<void>;
+
+  /**
+   * Make the processor usable again after a provider shut it down.
+   *
+   * The disable path does not shut the processor down, but
+   * `provider.shutdown()` — which it must call, so a cached tracer stops
+   * processing — does: OpenTelemetry's SDK treats processors as owned by the
+   * provider they were constructed with, while this product shares one across
+   * every provider a session builds. So the replacement provider adopts a
+   * processor that has been closed, and this is how it is opened again.
+   * Without it the second capture of a session would create spans and export
+   * none of them.
+   *
+   * Optional, so a flush-only fake remains a flush-only fake.
+   */
+  reopen?(): void;
+
+  /**
+   * Whether the processor is closed and dropping everything it is given.
+   *
+   * Read *after* {@link ControlFlushTarget.reopen} to confirm the reopening
+   * took, because a processor that is still closed exports nothing: arming a
+   * capture over one would produce spans that are counted as arriving after a
+   * shutdown and never sent. Optional for the same reason as `reopen`.
+   */
+  readonly isShutDown?: boolean;
 }
 
 /** The `data` member is all this module reads from an inbound message event. */
@@ -1039,16 +1406,240 @@ export interface CaptureRequest {
   readonly signals: ServerAgentSignals;
 }
 
+/**
+ * The resources the capture lifecycle installs and removes, named so a report
+ * says *what* could not be done rather than only that something could not.
+ *
+ * One entry per thing that can fail independently, which is also the unit the
+ * teardown retries: a failed provider shutdown and a failed `pg` unwrap are
+ * different problems with different consequences for the developer, and a
+ * report that collapsed them would leave the second invisible.
+ */
+export const CAPTURE_RESOURCES = Object.freeze({
+  /** The tracer provider: built, registered globally, later shut down. */
+  provider: 'tracer-provider',
+  /** The global tracer registration, removed with `trace.disable()`. */
+  globalTracer: 'global-tracer',
+  /** The global propagator, removed with `propagation.disable()`. */
+  globalPropagator: 'global-propagator',
+  /** The ORM's instrumentation patches. */
+  ormInstrumentation: 'prisma-instrumentation',
+  /** The driver's instrumentation patches. */
+  driverInstrumentation: 'pg-instrumentation',
+  /** An instrumentation this build could not identify. */
+  instrumentation: 'instrumentation',
+  /** The pre-teardown flush of evidence already captured. */
+  flush: 'telemetry-flush',
+  /**
+   * The shared span processor, which a provider shutdown closes and a
+   * replacement provider has to reopen.
+   */
+  processor: 'span-processor',
+} as const);
+
+/** One member of {@link CAPTURE_RESOURCES}. */
+export type CaptureResource = (typeof CAPTURE_RESOURCES)[keyof typeof CAPTURE_RESOURCES];
+
+/**
+ * Reported when a capture is requested after {@link ServerAgentControl.dispose}.
+ *
+ * Not a failure of anything: the process is on its way out, and the honest
+ * answer to "arm a capture" is that this preload will not be arming any more.
+ */
+const DISPOSED_FAILURE: CaptureResourceFailure = Object.freeze({
+  resource: CAPTURE_RESOURCES.provider,
+  signals: Object.freeze<ServerAgentSignalName[]>([]),
+  reason: 'the preload has been disposed and will not arm another capture',
+  hint: 'Restart the dev server to capture again.',
+});
+
+/**
+ * Reported when a queued state change failed in a way its own guards did not
+ * catch.
+ *
+ * {@link ServerAgentControl.#serialize} answers with a fallback rather than
+ * rejecting, and for an enable the only safe fallback is "not armed": a caller
+ * told otherwise would wait for telemetry from a gate that may never have
+ * opened.
+ */
+const INTERNAL_FAILURE: CaptureResourceFailure = Object.freeze({
+  resource: CAPTURE_RESOURCES.provider,
+  signals: Object.freeze<ServerAgentSignalName[]>([]),
+  reason: 'the capture state change failed unexpectedly',
+  hint: 'Retry the capture; the dev-server log records the failure.',
+});
+
+/**
+ * The cleanup report used when a queued teardown failed unexpectedly.
+ *
+ * `partial` rather than `clean`, for the same reason: a teardown whose outcome
+ * is unknown must never be reported as having left nothing running.
+ */
+const INTERNAL_CLEANUP_REPORT: CleanupReport = Object.freeze({
+  status: 'partial',
+  changed: false,
+  pending: Object.freeze<CaptureResource[]>([]),
+  failures: Object.freeze<CaptureResourceFailure[]>([INTERNAL_FAILURE]),
+});
+
+/**
+ * One resource that could not be installed or removed, and what it costs.
+ *
+ * The shape follows AAP §0.5.5's contract for an unavailable signal — *"Could
+ * not enable ‹signal›: ‹reason›. Continuing with: ‹enabled list›"* — so the
+ * service can render it without translating: `signals` names what the developer
+ * loses, `reason` is the description, `hint` is the action.
+ *
+ * `reason` is always scrubbed of the credential before it is stored here.
+ */
+export interface CaptureResourceFailure {
+  /** Which resource. */
+  readonly resource: CaptureResource;
+  /** The signals this failure costs the capture; empty when it costs none. */
+  readonly signals: readonly ServerAgentSignalName[];
+  /** What went wrong, in one line, with no credential in it. */
+  readonly reason: string;
+  /** What would fix it, where there is an action to name. */
+  readonly hint?: string;
+}
+
+/** The resource name a failure report uses for each instrumentation role. */
+const INSTRUMENTATION_RESOURCES: Readonly<Record<InstrumentationRole, CaptureResource>> =
+  Object.freeze({
+    [INSTRUMENTATION_ROLES.orm]: CAPTURE_RESOURCES.ormInstrumentation,
+    [INSTRUMENTATION_ROLES.driver]: CAPTURE_RESOURCES.driverInstrumentation,
+    [INSTRUMENTATION_ROLES.unknown]: CAPTURE_RESOURCES.instrumentation,
+  });
+
+/** The signals an instrumentation of each role supplies, for a failure report. */
+const INSTRUMENTATION_SIGNALS: Readonly<
+  Record<InstrumentationRole, readonly ServerAgentSignalName[]>
+> = Object.freeze({
+  [INSTRUMENTATION_ROLES.orm]: Object.freeze<ServerAgentSignalName[]>(['prisma']),
+  [INSTRUMENTATION_ROLES.driver]: Object.freeze<ServerAgentSignalName[]>(['pg']),
+  [INSTRUMENTATION_ROLES.unknown]: Object.freeze<ServerAgentSignalName[]>([]),
+});
+
+/**
+ * What this module knows about one instrumentation's patches.
+ *
+ * Three states rather than a boolean, because a toggle that throws leaves the
+ * truth *unknown* and a boolean would have to guess. `InstrumentationBase`
+ * flips its internal flag before it runs the patch callbacks and returns early
+ * when the flag already holds the target value, so a `disable()` that threw
+ * part-way through unpatching leaves the SDK claiming "disabled" while a
+ * module may still be wrapped — and the next `disable()` does nothing at all.
+ * Recording that as `disabled` is precisely the false cleanup report AAP §0.5.1
+ * forbids.
+ */
+export const INSTRUMENTATION_STATES = Object.freeze({
+  /** Patches applied, as far as this module can tell. */
+  enabled: 'enabled',
+  /** Patches removed, verified by a toggle that did real work and returned. */
+  disabled: 'disabled',
+  /** A toggle threw: the patches may or may not be applied. */
+  unknown: 'unknown',
+} as const);
+
+/** One member of {@link INSTRUMENTATION_STATES}. */
+export type InstrumentationState =
+  (typeof INSTRUMENTATION_STATES)[keyof typeof INSTRUMENTATION_STATES];
+
+/**
+ * One attached instrumentation, with the two things the lifecycle needs to know
+ * about it beyond how to toggle it.
+ *
+ * `state` is this module's own record. It cannot be delegated to the SDK: the
+ * SDK's flag describes its *intent* (it is set before the patching runs), not
+ * whether the patching finished, and the difference is the whole of
+ * {@link INSTRUMENTATION_STATES.unknown}.
+ */
+interface InstrumentationEntry {
+  /** The instrumentation itself. */
+  readonly instrumentation: ToggleableInstrumentation;
+  /** Which signal it serves. */
+  readonly role: InstrumentationRole;
+  /** What this module knows about its patches. */
+  state: InstrumentationState;
+}
+
+/**
+ * The outcome of arming a capture.
+ *
+ * Structured rather than a boolean because "did anything change" and "is this
+ * process recording" are different questions, and the second is the one that
+ * must never be answered optimistically: a capture whose tracer provider could
+ * not be installed is reported `armed: false` and the gate stays shut, so the
+ * service sees a failure instead of a session that silently produces no server
+ * telemetry (AAP §0.5.5).
+ */
+export interface EnableReport {
+  /**
+   * Whether the gate is now open for this capture.
+   *
+   * `false` means a mandatory resource could not be installed. The state is
+   * unchanged-or-closed, nothing is recording, and the identical frame may be
+   * applied again to retry.
+   */
+  readonly armed: boolean;
+
+  /** Whether this call changed the state; `false` for a restatement. */
+  readonly changed: boolean;
+
+  /**
+   * Resources that could not be installed.
+   *
+   * Non-empty with `armed: true` is the degraded case: the capture is
+   * recording what it can, and the entries name the signals it cannot supply.
+   */
+  readonly unavailable: readonly CaptureResourceFailure[];
+}
+
+/**
+ * The outcome of a teardown: how inert the preload actually is.
+ *
+ * AAP §0.5.1's guarantee is that a session leaves "no active patches, no
+ * provider and no file changes", and the honest report of a teardown that
+ * could not finish is `partial` with the resources still held — never silence.
+ * `packages/instrumentation`'s cleanup status uses the same vocabulary for file
+ * modifications.
+ */
+export interface CleanupReport {
+  /** `clean` when nothing is left running; `partial` when something is. */
+  readonly status: 'clean' | 'partial';
+  /** Whether this call did any teardown work; `false` when already inert. */
+  readonly changed: boolean;
+  /** Resources still installed, and therefore still to be retried. */
+  readonly pending: readonly CaptureResource[];
+  /** Every step that failed, in the order it was attempted. */
+  readonly failures: readonly CaptureResourceFailure[];
+}
+
 /** How {@link ServerAgentControl.applyConfig} resolved a frame. */
 export type ApplyConfigOutcome =
   /** A capture was armed, or re-armed with a different id or signal set. */
   | 'enabled'
   /** The capture was torn down and the preload is inert. */
   | 'disabled'
+  /**
+   * The capture was torn down but something could not be removed: the gate is
+   * shut and nothing is recording, and the preload is **not** inert.
+   *
+   * Distinct from `disabled` because `disabled` is a claim about the process —
+   * no patches, no provider — that a partial teardown has not earned.
+   * {@link ServerAgentControlStats.pendingCleanup} names what is left.
+   */
+  | 'partial'
   /** The frame restated the state the gate was already in. */
   | 'unchanged'
   /** The payload did not validate; the previous state was kept. */
   | 'invalid'
+  /**
+   * A mandatory resource could not be installed, so the capture was **not**
+   * armed: the gate is shut, nothing is recording, and re-sending the frame
+   * retries.
+   */
+  | 'failed'
   /** The control object has been disposed and no longer applies frames. */
   | 'disposed';
 
@@ -1063,8 +1654,23 @@ export interface ServerAgentControlStats {
   readonly sessionId: string | null;
   /** The active capture, or `null` when the preload is gated shut. */
   readonly captureId: string | null;
+  /**
+   * How many captures this object has armed.
+   *
+   * The generation `./exporter.ts` stamps on a starting span and compares at
+   * `onEnd`, so a span from a replaced capture is rejected instead of being
+   * filed under its successor. Monotonic and never reset.
+   */
+  readonly captureGeneration: number;
   /** The kinds the gate currently admits, in declaration order. */
   readonly enabledKinds: readonly TelemetryKind[];
+  /**
+   * The database instrumentations whose spans the active capture admits.
+   *
+   * Independent of {@link enabledKinds}: both sources share the `db.query`
+   * kind, and this is what separates them.
+   */
+  readonly enabledDbSources: readonly DatabaseSpanSource[];
   /** The symbols the active plan patched. */
   readonly functions: readonly string[];
   /** Whether a socket is currently open. */
@@ -1085,10 +1691,40 @@ export interface ServerAgentControlStats {
   readonly enableCount: number;
   /** Teardowns that did real work. */
   readonly disableCount: number;
-  /** Whether the instrumentations are currently patched in. */
+  /**
+   * Whether any attached instrumentation may still be patched in.
+   *
+   * `true` includes an instrumentation whose toggle threw and whose patches
+   * therefore cannot be shown to be gone — the conservative reading, because
+   * the alternative is reporting a developer's `pg` as unwrapped when it may
+   * not be.
+   */
   readonly instrumentationsEnabled: boolean;
-  /** Whether a provider is registered globally. */
+  /** Whether a provider is registered globally and usable for a capture. */
   readonly providerRegistered: boolean;
+  /**
+   * How inert the preload is, as the last teardown left it.
+   *
+   * `active` before any teardown, or after a capture re-installed what a
+   * teardown removed; `clean` when a teardown left nothing running; `partial`
+   * when something is still installed — see {@link pendingCleanup}, which
+   * names it. `partial` is the state AAP §0.5.1 requires be reported rather
+   * than glossed over: pg may still be wrapped, or a provider may still be
+   * registered.
+   */
+  readonly cleanupStatus: 'active' | 'clean' | 'partial';
+  /**
+   * The resources still installed, in teardown order.
+   *
+   * Read against {@link cleanupStatus}: while the status is `active` this is
+   * what the preload currently holds — the provider, the globals and the
+   * patched instrumentations a capture needs — and after a teardown it is what
+   * that teardown could not remove. Empty whenever the status is `clean`.
+   * Non-empty with `partial` means the handles are retained: the next
+   * `disable()`, and the next capture's installation, both finish the work
+   * rather than losing it.
+   */
+  readonly pendingCleanup: readonly CaptureResource[];
   /** Whether the service refused the credential with 4401. */
   readonly credentialRejected: boolean;
   /** Whether {@link ServerAgentControl.dispose} has run. */
@@ -1120,9 +1756,22 @@ export interface ServerAgentControlStats {
  * project already captured by another session is answered `409` with the owning
  * session's id. So `server-agent.config` always names the single owner, and this
  * object keeps one capture id rather than a set. A frame naming a different
- * capture is a clean transition, not a second tenant — and the transition needs
- * no extra bookkeeping, because `./convert.ts`'s `seq` allocator is keyed on
- * `(producerId, captureId)` and restarts itself the moment the id changes.
+ * capture is a transition, not a second tenant — and the transition is
+ * *bookkept*, in two steps that exist because an ingest event carries no
+ * capture id of its own (the service assigns `sessionId`, `captureId` and
+ * `ingestSeq` on arrival, AAP §0.2.3):
+ *
+ * 1. the span processor is **flushed** before the new capture is armed, so
+ *    everything already finished reaches the service while the capture it
+ *    belongs to is still the open one; and
+ * 2. {@link ServerAgentControl.captureGeneration} **advances**, so a span that
+ *    started under the outgoing capture and ends under the incoming one is
+ *    refused by `./exporter.ts` rather than filed under a capture it never ran
+ *    in.
+ *
+ * `./convert.ts`'s `seq` allocator, keyed on `(producerId, captureId)`,
+ * restarts itself when the id changes, which numbers the new capture's events
+ * from zero but says nothing about which capture a span belonged to.
  *
  * **Ordered application.** Config frames arrive on a socket while a teardown
  * may still be awaiting a flush, so every state change runs through one
@@ -1151,30 +1800,60 @@ export class ServerAgentControl implements CaptureGate {
   /** The span processor to flush before teardown; never shut down here. */
   #processor: ControlFlushTarget | undefined;
 
-  /** The instrumentation instances whose patches the teardown removes. */
-  #instrumentations: readonly ToggleableInstrumentation[] = [];
+  /**
+   * The attached instrumentations, each with its role and its own enabled
+   * state.
+   *
+   * Per-entry rather than one list and one flag, for two reasons the findings
+   * behind this design name directly: the ORM and the driver are switched
+   * independently by a capture's signals, and a toggle that throws must leave
+   * *that* entry's state unknown — so the teardown knows its patches may still
+   * be applied and keeps saying so — without implying anything about the
+   * others. Three states rather than two, because "the removal failed" is
+   * neither "patched" nor "clean".
+   */
+  #instrumentations: InstrumentationEntry[] = [];
 
   /** Builds a fresh provider when a capture follows a disable. */
   #createProvider: TracerProviderFactory | undefined;
 
-  /** The registered provider, or `null` when none is installed. */
+  /**
+   * The provider this object owns, or `null` when it holds none.
+   *
+   * Retained after a failed `shutdown()` — see
+   * {@link ServerAgentControl.#providerShutdownPending} — because dropping the
+   * reference would make the retry impossible and leave a provider processing
+   * spans with nothing able to stop it.
+   */
   #provider: ControlTracerProvider | null = null;
 
-  /** Whether a provider is installed globally. */
+  /**
+   * Whether {@link ServerAgentControl.#provider} is installed globally *and*
+   * usable for a capture.
+   *
+   * Set only by a successful registration, cleared by a successful
+   * `trace.disable()` or by the start of a shutdown. It is deliberately not
+   * the same fact as "a global tracer is installed", which
+   * {@link ServerAgentControl.#globalTracerInstalled} tracks: a provider that
+   * has been shut down but whose global registration could not be removed is
+   * unusable *and* still installed, and both halves matter.
+   */
   #providerRegistered = false;
 
-  /** Whether the instrumentations are currently patched in. */
-  #instrumentationsEnabled = false;
+  /** Whether a global tracer provider installed by this object is still there. */
+  #globalTracerInstalled = false;
+
+  /** Whether the global propagator installed with it is still there. */
+  #globalPropagatorInstalled = false;
 
   /**
-   * Whether the preload is torn down: no provider, no patches, no spans.
+   * Whether a provider shutdown failed and must be retried.
    *
-   * Starts `false` because `register.ts` installs a provider and enables the
-   * instrumentations before this object ever sees a frame — the preload begins
-   * *armed but gated*, which is why the sampler and not this flag is what keeps
-   * an idle dev server silent.
+   * While this is set the provider handle is kept and no capture may use it;
+   * the next teardown, and the next capture's installation, both retry it
+   * first.
    */
-  #inert = false;
+  #providerShutdownPending = false;
 
   /** The session that owns the active capture. */
   #sessionId: string | null = null;
@@ -1182,11 +1861,31 @@ export class ServerAgentControl implements CaptureGate {
   /** The active capture, or `null`: the gate's whole answer. */
   #captureId: string | null = null;
 
+  /**
+   * How many captures this object has armed.
+   *
+   * Advanced when — and only when — the gate opens, so a span stamped with an
+   * earlier value is a span from a capture that has since been replaced.
+   * `./exporter.ts` reads it on every started and every ended span, which is
+   * what keeps one capture's work out of another's evidence in a store that
+   * attributes events by arrival.
+   */
+  #captureGeneration = 0;
+
   /** The active capture's signals. */
   #signals: ServerAgentSignals = NO_SIGNALS;
 
   /** The kinds those signals admit, resolved once per config frame. */
   #enabledKinds: ReadonlySet<TelemetryKind> = new Set<TelemetryKind>();
+
+  /** The database instrumentations those signals admit spans from. */
+  #enabledDbSources: ReadonlySet<DatabaseSpanSource> = new Set<DatabaseSpanSource>();
+
+  /** The identities a `function` span may present, planned and truncated. */
+  #functionAllowList: ReadonlySet<string> = new Set<string>();
+
+  /** Whether the last teardown left something installed. */
+  #cleanupStatus: 'active' | 'clean' | 'partial' = 'active';
 
   /** The live socket, or `null` while disconnected. */
   #socket: ControlSocket | null = null;
@@ -1258,6 +1957,18 @@ export class ServerAgentControl implements CaptureGate {
   }
 
   /**
+   * How many captures this object has armed — the generation `./exporter.ts`
+   * stamps spans with.
+   *
+   * Advanced only when the gate opens, so two spans carrying the same value
+   * ran in the same capture window and a span carrying an older one did not.
+   * Read on every started and every ended span, so it is a field read.
+   */
+  get captureGeneration(): number {
+    return this.#captureGeneration;
+  }
+
+  /**
    * Whether the active capture wants events of this kind.
    *
    * Two questions in one answer: is a capture armed at all, and did its plan
@@ -1275,12 +1986,62 @@ export class ServerAgentControl implements CaptureGate {
     return this.#enabledKinds.has(kind);
   }
 
+  /**
+   * Whether the active capture wants *this span*, and which rule refused it if
+   * not.
+   *
+   * Three questions, in increasing specificity, because one kind is not one
+   * signal (see {@link SIGNAL_KINDS}):
+   *
+   * 1. is a capture armed, and did its plan ask for this kind;
+   * 2. for a `db.query` span, did it ask for *this* library — `prisma` and `pg`
+   *    are independent switches over the one database kind, so a plan that
+   *    asked for ORM tracing collects no driver spans;
+   * 3. for a `function` span, is the symbol one this plan patched — `functions`
+   *    is a list of names, and a patched function from an earlier plan version
+   *    or an unreverted session is not this capture's evidence.
+   *
+   * A database span whose producing library cannot be told is **admitted**
+   * rather than discarded: the kind was enabled by at least one database
+   * signal, and dropping an unattributable query would lose the very evidence
+   * the plan asked for. A `function` span, by contrast, always carries its own
+   * identity — its name, or the `symbol` the patch wrote — so an unmatched one
+   * is a span from outside the plan.
+   *
+   * Never throws; `./exporter.ts` calls it inside its own guard and counts the
+   * verdict.
+   *
+   * @param candidate The classified kind and the span facts the finer rules
+   * need.
+   */
+  admitSpan(candidate: SpanAdmissionCandidate): SpanAdmission {
+    if (this.#captureId === null) {
+      return 'no-capture';
+    }
+    if (!this.#enabledKinds.has(candidate.kind)) {
+      return 'kind-disabled';
+    }
+    if (QUERY_KINDS.includes(candidate.kind)) {
+      const source = candidate.source;
+      if (source !== null && !this.#enabledDbSources.has(source)) {
+        return 'source-disabled';
+      }
+      return 'admitted';
+    }
+    if (FUNCTION_KINDS.includes(candidate.kind) && !this.#isPlannedFunction(candidate)) {
+      return 'unplanned-function';
+    }
+    return 'admitted';
+  }
+
   /** A snapshot of everything this object tracks. */
   stats(): ServerAgentControlStats {
     return {
       sessionId: this.#sessionId,
       captureId: this.#captureId,
+      captureGeneration: this.#captureGeneration,
       enabledKinds: [...this.#enabledKinds],
+      enabledDbSources: [...this.#enabledDbSources],
       functions: this.#signals.functions,
       connected: this.#socket !== null && this.#socket.readyState === SOCKET_OPEN,
       connectAttempts: this.#connectAttempts,
@@ -1291,8 +2052,12 @@ export class ServerAgentControl implements CaptureGate {
       configsApplied: this.#configsApplied,
       enableCount: this.#enableCount,
       disableCount: this.#disableCount,
-      instrumentationsEnabled: this.#instrumentationsEnabled,
+      instrumentationsEnabled: this.#instrumentations.some(
+        (entry) => entry.state !== INSTRUMENTATION_STATES.disabled,
+      ),
       providerRegistered: this.#providerRegistered,
+      cleanupStatus: this.#cleanupStatus,
+      pendingCleanup: this.#pendingCleanup(),
       credentialRejected: this.#credentialRejected,
       disposed: this.#disposed,
       reconnectPending: this.#reconnectTimer !== undefined,
@@ -1313,9 +2078,13 @@ export class ServerAgentControl implements CaptureGate {
    * Each member replaces the previous value when present and leaves it alone
    * when absent, so a caller can attach in stages. Instrumentations arrive
    * **enabled** — `registerInstrumentations()` enables what it registers — and
-   * a provider passed here is one that is **already registered globally**;
-   * passing a factory alone means nothing is installed yet and the first
-   * capture must build one.
+   * a provider passed here is one the caller has **attempted** to register
+   * globally: whether it became the global is checked here against the API's
+   * registry, not taken from the attachment, because `register()` returns
+   * `void` and the API answers a refusal with `false`. One that did not become
+   * the global is held for the shutdown it is owed and is not treated as
+   * installed. Passing a factory alone means nothing is installed yet and the
+   * first capture must build one.
    *
    * @param attachment The collaborators to adopt.
    */
@@ -1324,15 +2093,45 @@ export class ServerAgentControl implements CaptureGate {
       this.#processor = attachment.processor;
     }
     if (attachment.instrumentations !== undefined) {
-      this.#instrumentations = attachment.instrumentations;
-      this.#instrumentationsEnabled = attachment.instrumentations.length > 0;
+      // Each arrives enabled and is classified once, so a capture's signals can
+      // toggle the ORM's and the driver's patches independently and a teardown
+      // can report which of them is still applied.
+      this.#instrumentations = attachment.instrumentations.map((instrumentation) => ({
+        instrumentation,
+        role: classifyInstrumentation(instrumentation),
+        state: INSTRUMENTATION_STATES.enabled,
+      }));
     }
     if (attachment.createProvider !== undefined) {
       this.#createProvider = attachment.createProvider;
     }
     if (attachment.provider !== undefined) {
+      // A provider passed here is one `register.ts` has already *attempted* to
+      // register globally, with the W3C propagator. Attempted, not necessarily
+      // installed: `trace.setGlobalTracerProvider` answers `false` and keeps
+      // the incumbent when another provider is already registered, and
+      // `NodeTracerProvider.register()` returns `void`, so the caller cannot
+      // pass on an outcome it never saw. The global is therefore *checked*
+      // here rather than assumed, and a provider that did not become the
+      // global is held only so the teardown can shut it down — the first
+      // capture will build and register its own.
       this.#provider = attachment.provider;
-      this.#providerRegistered = true;
+      this.#globalPropagatorInstalled = true;
+      if (this.#isProviderGlobal(attachment.provider)) {
+        this.#providerRegistered = true;
+        this.#providerShutdownPending = false;
+        this.#globalTracerInstalled = true;
+      } else {
+        this.#providerRegistered = false;
+        this.#providerShutdownPending = true;
+        this.#log(
+          'warn',
+          'the tracer provider handed to this preload is not the global one; another provider is registered',
+        );
+      }
+    }
+    if (this.#instrumentations.length > 0 || this.#providerRegistered) {
+      this.#cleanupStatus = 'active';
     }
   }
 
@@ -1375,11 +2174,17 @@ export class ServerAgentControl implements CaptureGate {
       // the instruction to stop recording is the one that must not wait.
       this.#clearGate();
       return this.#serialize(async (): Promise<ApplyConfigOutcome> => {
-        const changed = await this.#runDisable();
-        if (changed) {
+        const report = await this.#runDisable();
+        if (report.changed) {
           this.#configsApplied += 1;
         }
-        return changed ? 'disabled' : 'unchanged';
+        if (report.status === 'partial') {
+          // Carried out to the caller rather than folded into `disabled`: the
+          // capture is off either way, but "the preload is inert" is a
+          // different statement and only one of them is true here.
+          return 'partial';
+        }
+        return report.changed ? 'disabled' : 'unchanged';
       }, 'unchanged');
     }
 
@@ -1388,12 +2193,19 @@ export class ServerAgentControl implements CaptureGate {
       sessionId: parsed.sessionId,
       signals: parsed.signals,
     };
-    return this.#serialize((): ApplyConfigOutcome => {
-      const changed = this.#runEnable(request);
-      if (changed) {
+    return this.#serialize(async (): Promise<ApplyConfigOutcome> => {
+      const report = await this.#runEnable(request);
+      if (!report.armed) {
+        // Nothing was applied: the gate is shut and the same frame may be
+        // re-sent to retry. Reported as its own outcome rather than as
+        // `enabled`, because a service told `enabled` would wait for telemetry
+        // that is never coming (AAP §0.5.5).
+        return 'failed';
+      }
+      if (report.changed) {
         this.#configsApplied += 1;
       }
-      return changed ? 'enabled' : 'unchanged';
+      return report.changed ? 'enabled' : 'unchanged';
     }, 'unchanged');
   }
 
@@ -1404,16 +2216,27 @@ export class ServerAgentControl implements CaptureGate {
    * `captureId`, exposed so a test — and `register.ts`, if it ever needs to —
    * can arm a capture without constructing a frame.
    *
-   * Idempotent: re-arming the same capture with the same signals does nothing.
+   * Idempotent: re-arming the same capture with the same signals, with every
+   * resource it needs already installed, does nothing and reports
+   * `changed: false`. A capture whose installation *failed* is not in that
+   * state, so the identical request retries rather than being swallowed.
    *
    * @param request The capture and the signals to admit.
-   * @returns Whether anything changed; never rejects.
+   * @returns What was armed and what could not be; never rejects.
    */
-  enableCapture(request: CaptureRequest): Promise<boolean> {
+  enableCapture(request: CaptureRequest): Promise<EnableReport> {
     if (this.#disposed) {
-      return Promise.resolve(false);
+      return Promise.resolve<EnableReport>({
+        armed: false,
+        changed: false,
+        unavailable: [DISPOSED_FAILURE],
+      });
     }
-    return this.#serialize((): boolean => this.#runEnable(request), false);
+    return this.#serialize((): Promise<EnableReport> => this.#runEnable(request), {
+      armed: false,
+      changed: false,
+      unavailable: [INTERNAL_FAILURE],
+    });
   }
 
   /**
@@ -1425,16 +2248,18 @@ export class ServerAgentControl implements CaptureGate {
    * after that is queued behind any state change already in flight.
    *
    * Idempotent. Calling it twice, or with nothing enabled, resolves without
-   * doing anything a second time.
+   * doing anything a second time — but a teardown that could not finish is
+   * *not* in that state: it reports `partial`, keeps the handles it could not
+   * release, and the next call retries exactly those.
    *
-   * @returns A promise that resolves when the sequence has finished; never
-   * rejects.
+   * @returns How inert the preload actually is; never rejects.
    */
-  disable(): Promise<void> {
+  disable(): Promise<CleanupReport> {
     this.#clearGate();
-    return this.#serialize(async (): Promise<void> => {
-      await this.#runDisable();
-    }, undefined);
+    return this.#serialize(
+      (): Promise<CleanupReport> => this.#runDisable(),
+      INTERNAL_CLEANUP_REPORT,
+    );
   }
 
   /**
@@ -1445,25 +2270,26 @@ export class ServerAgentControl implements CaptureGate {
    * further reconnects, which is what lets a dev server exit promptly instead of
    * waiting out a backoff.
    *
-   * @returns A promise that resolves when teardown has finished; never rejects.
+   * @returns How inert the preload actually is; never rejects.
    */
-  async dispose(): Promise<void> {
+  async dispose(): Promise<CleanupReport> {
     this.#clearGate();
     this.#disposed = true;
     this.#clearTimers();
     this.#closeSocket(SOCKET_CLOSE_NORMAL, 'preload shutting down');
-    await this.#serialize(async (): Promise<void> => {
-      await this.#runDisable();
-    }, undefined);
+    return await this.#serialize(
+      (): Promise<CleanupReport> => this.#runDisable(),
+      INTERNAL_CLEANUP_REPORT,
+    );
   }
 
   /**
    * Alias of {@link dispose}, for a caller that thinks of this object as a
    * connection.
    *
-   * @returns A promise that resolves when teardown has finished.
+   * @returns How inert the preload actually is.
    */
-  close(): Promise<void> {
+  close(): Promise<CleanupReport> {
     return this.dispose();
   }
 
@@ -1474,47 +2300,95 @@ export class ServerAgentControl implements CaptureGate {
    */
 
   /**
-   * Arm the gate and make sure the machinery behind it is installed.
+   * Arm the gate, and make sure the machinery behind it is installed **first**.
    *
-   * The first capture of a process finds the provider already registered by
-   * `register.ts` and the instrumentations already enabled, so it is a state
-   * assignment and nothing more. A capture that follows a disable finds neither
-   * — the globals were removed and the provider shut down — and has to
-   * re-register both, propagator included.
+   * The order is the whole point of this method. Installation happens with the
+   * gate shut, and the gate opens only once the one mandatory resource — a
+   * registered tracer provider — is in place, because a capture armed without
+   * a provider records nothing at all while every UI in the product shows it as
+   * capturing (AAP §0.5.5: a failure is never presented as a success).
+   *
+   * The sequence:
+   *
+   * 1. **Nothing to do?** A restatement of the capture already armed, with
+   *    every resource it needs installed, changes nothing. A capture whose
+   *    installation failed is deliberately *not* in that state, so re-sending
+   *    the same frame retries instead of being swallowed.
+   * 2. **A different capture?** Flush first, while the outgoing capture is
+   *    still the one the service has open. An ingest event carries no capture
+   *    id — the service assigns it on arrival — so evidence that leaves after
+   *    the switch is filed under the new capture. Flushing here is what gets
+   *    the finished spans out in time; the generation bump in step 5 is what
+   *    rejects the ones that were still running.
+   * 3. **Install the provider.** The first capture of a process finds one
+   *    already registered by `register.ts`; a capture that follows a teardown
+   *    finds none and builds one, and a capture that follows a teardown which
+   *    *failed* finishes that teardown first. Mandatory: on failure the gate
+   *    stays shut and the report says so.
+   * 4. **Install the instrumentations this capture's signals ask for**, and
+   *    remove the ones they do not. Optional: a database library whose
+   *    instrumentation refuses to patch costs that signal and no more, which
+   *    the report names so the service can say "continuing with …".
+   * 5. **Open the gate**, advancing the capture generation as it opens.
    *
    * @param request The capture and the signals to admit.
-   * @returns Whether anything changed.
+   * @returns What was armed, and every resource that could not be installed.
    */
-  #runEnable(request: CaptureRequest): boolean {
+  async #runEnable(request: CaptureRequest): Promise<EnableReport> {
     if (this.#disposed) {
-      return false;
+      return { armed: false, changed: false, unavailable: [DISPOSED_FAILURE] };
     }
 
     const kinds = resolveEnabledKinds(request.signals);
+    const sources = resolveEnabledDbSources(request.signals);
+    const functions = resolveFunctionAllowList(request.signals);
     const sessionId = request.sessionId ?? null;
 
-    if (
-      !this.#inert &&
-      this.#captureId === request.captureId &&
-      this.#sessionId === sessionId &&
-      sameKinds(this.#enabledKinds, kinds)
-    ) {
-      return false;
+    if (this.#isArmedFor(request, sessionId, kinds, sources, functions)) {
+      return { armed: true, changed: false, unavailable: [] };
     }
 
+    const unavailable: CaptureResourceFailure[] = [];
+
+    if (this.#captureId !== null && this.#captureId !== request.captureId) {
+      const flushFailure = await this.#flushCaptured('the outgoing capture');
+      if (flushFailure !== null) {
+        unavailable.push(flushFailure);
+      }
+    }
+
+    // Shut while installing: a half-applied signal set must never be able to
+    // admit a span, and the spans of the capture being replaced must stop
+    // being admitted the moment its flush has been attempted.
+    this.#clearGate();
+
+    const providerFailure = await this.#ensureProvider();
+    if (providerFailure !== null) {
+      unavailable.push(providerFailure);
+      this.#log('warn', 'the capture was not armed: this process can create no spans', {
+        captureId: request.captureId,
+        resource: providerFailure.resource,
+      });
+      return { armed: false, changed: false, unavailable };
+    }
+
+    unavailable.push(...this.#applyInstrumentationSignals(request.signals));
+
+    this.#captureGeneration += 1;
     this.#sessionId = sessionId;
     this.#captureId = request.captureId;
     this.#signals = request.signals;
     this.#enabledKinds = kinds;
-
-    this.#ensureProvider();
-    this.#enableInstrumentations();
-    this.#inert = false;
+    this.#enabledDbSources = sources;
+    this.#functionAllowList = functions;
+    this.#cleanupStatus = 'active';
     this.#enableCount += 1;
 
     this.#log('debug', 'capture armed', {
       captureId: request.captureId,
+      generation: this.#captureGeneration,
       kinds: [...kinds].join(','),
+      sources: [...sources].join(','),
       functions: request.signals.functions.length,
     });
 
@@ -1529,75 +2403,106 @@ export class ServerAgentControl implements CaptureGate {
       );
     }
 
-    return true;
+    for (const failure of unavailable) {
+      if (failure.signals.length === 0) {
+        // Already logged where it happened, and it costs the capture no signal
+        // — a flush that failed loses evidence already recorded, which is a
+        // different sentence from "this signal is unavailable".
+        continue;
+      }
+      // AAP §0.5.5's wording, from this end of it: what could not be enabled,
+      // why, and what is still being collected.
+      this.#log('warn', `could not enable ${failure.signals.join(', ')}`, {
+        reason: failure.reason,
+        continuingWith: [...kinds].join(','),
+      });
+    }
+
+    return { armed: true, changed: true, unavailable };
   }
 
   /**
-   * The disable sequence of AAP §0.5.1, in order, with every step guarded.
+   * Whether this exact capture is already armed with everything it needs.
    *
-   * 1. the gate is already closed by the caller, and closed again here so a
-   *    direct call is as safe as a queued one;
-   * 2. flush, so evidence already captured still reaches the service;
-   * 3. `disable()` on each instrumentation — this is what unwraps `pg`'s
-   *    patched methods and clears Prisma's global instrumentation hook;
-   * 4. `trace.disable()` and `propagation.disable()`, removing the global
-   *    provider so the host framework's own spans become no-ops;
-   * 5. `provider.shutdown()`, so a tracer cached from it stops processing.
+   * Every clause is load-bearing. The first five are the capture's identity and
+   * its admission policy — all three axes of it, so a frame that narrows only
+   * the patched-symbol list is still applied; the last three are the machinery,
+   * and they are what makes a retry possible: after a failed installation the
+   * state does not describe a working capture, so the identical request is not
+   * a restatement of it.
    *
-   * The span processor is **not** shut down: it outlives every cycle, and the
-   * next capture reuses its buffer and its transport. `globalThis.__DEBUGGEN__`
-   * is **not** uninstalled either — see this module's overview.
-   *
-   * @returns Whether this call did the work, `false` when already inert.
+   * @param request The requested capture.
+   * @param sessionId Its session, already normalised to `null` when absent.
+   * @param kinds The kinds its signals resolve to.
+   * @param sources The database sources its signals resolve to.
+   * @param functions The function identities its signals resolve to.
    */
-  async #runDisable(): Promise<boolean> {
-    this.#clearGate();
-
-    if (this.#inert) {
-      return false;
-    }
-    this.#inert = true;
-    this.#disableCount += 1;
-
-    const processor = this.#processor;
-    if (processor !== undefined) {
-      try {
-        await processor.forceFlush();
-      } catch (error) {
-        this.#fail('could not flush captured telemetry before teardown', error);
-      }
-    }
-
-    this.#disableInstrumentations();
-
-    try {
-      trace.disable();
-    } catch (error) {
-      this.#fail('could not remove the global tracer provider', error);
-    }
-    try {
-      propagation.disable();
-    } catch (error) {
-      this.#fail('could not remove the global propagator', error);
-    }
-
-    const provider = this.#provider;
-    this.#provider = null;
-    this.#providerRegistered = false;
-    if (provider !== null) {
-      try {
-        await provider.shutdown();
-      } catch (error) {
-        this.#fail('could not shut the tracer provider down', error);
-      }
-    }
-
-    this.#log('debug', 'instrumentation removed; the preload is inert');
-    return true;
+  #isArmedFor(
+    request: CaptureRequest,
+    sessionId: string | null,
+    kinds: ReadonlySet<TelemetryKind>,
+    sources: ReadonlySet<DatabaseSpanSource>,
+    functions: ReadonlySet<string>,
+  ): boolean {
+    return (
+      this.#captureId === request.captureId &&
+      this.#sessionId === sessionId &&
+      sameSet(this.#enabledKinds, kinds) &&
+      sameSet(this.#enabledDbSources, sources) &&
+      sameSet(this.#functionAllowList, functions) &&
+      this.#providerRegistered &&
+      !this.#providerShutdownPending &&
+      this.#instrumentations.every(
+        (entry) =>
+          entry.state ===
+          (wantsInstrumentation(entry.role, request.signals)
+            ? INSTRUMENTATION_STATES.enabled
+            : INSTRUMENTATION_STATES.disabled),
+      )
+    );
   }
 
   /**
-   * Install a provider if none is registered.
+   * Flush the span processor, so evidence already captured reaches the service
+   * while the capture it belongs to is still the open one.
+   *
+   * The processor is never shut down here: it outlives every cycle and the next
+   * capture reuses its buffer and its transport.
+   *
+   * @param subject What is being flushed, for the diagnostic.
+   * @returns The failure, or `null` when there was nothing to flush or it
+   * worked.
+   */
+  async #flushCaptured(subject: string): Promise<CaptureResourceFailure | null> {
+    const processor = this.#processor;
+    if (processor === undefined) {
+      return null;
+    }
+    try {
+      await processor.forceFlush();
+      return null;
+    } catch (error) {
+      return this.#resourceFailure(
+        CAPTURE_RESOURCES.flush,
+        [],
+        `could not flush captured telemetry for ${subject}`,
+        error,
+        'Some telemetry from this capture may not have reached the service.',
+      );
+    }
+  }
+
+  /**
+   * Install a provider if this object does not hold a usable one, finishing an
+   * unfinished teardown first.
+   *
+   * Finishing the teardown is not tidiness. `trace.setGlobalTracerProvider`
+   * **refuses to replace** an already-installed global, so registering a new
+   * provider while a previous registration is still in place silently does
+   * nothing and the capture would run against a provider that has been shut
+   * down — spans created, none processed. A teardown whose `trace.disable()` or
+   * `provider.shutdown()` failed is therefore retried here, and a retry that
+   * fails again refuses the capture rather than arming a broken one.
    *
    * Re-registering the W3C propagator is the part that is easy to lose and
    * expensive to lose: it is what extracts the incoming `traceparent` the page
@@ -1609,77 +2514,736 @@ export class ServerAgentControl implements CaptureGate {
    * `register()` supplies the Node `AsyncLocalStorage` context manager itself,
    * which is why this package needs no direct dependency on
    * `@opentelemetry/context-async-hooks`.
+   *
+   * Every path through this method ends in the same question, asked of the
+   * global registry rather than of this object's own flags: is the provider
+   * held here the one the host's tracers resolve through? A provider that was
+   * installed and has since been displaced is as silent as one that was
+   * refused, so the capture is refused in both cases.
+   *
+   * @returns The failure that leaves this process unable to record, or `null`.
    */
-  #ensureProvider(): void {
-    if (this.#providerRegistered) {
-      return;
+  async #ensureProvider(): Promise<CaptureResourceFailure | null> {
+    if (this.#providerRegistered && !this.#providerShutdownPending) {
+      const installed = this.#provider;
+      if (installed !== null && this.#isProviderGlobal(installed)) {
+        return null;
+      }
+
+      // The registration this object made is gone: something else removed it
+      // and installed a provider of its own, so the provider held here
+      // processes nothing the host creates. Recorded as lost rather than
+      // retried — the global now belongs to that other actor and removing it
+      // is not this object's to do — while the handle is kept for the shutdown
+      // the teardown still owes it.
+      this.#providerRegistered = false;
+      this.#globalTracerInstalled = false;
+      if (installed !== null) {
+        this.#providerShutdownPending = true;
+        return this.#resourceFailure(
+          CAPTURE_RESOURCES.provider,
+          [],
+          'the tracer provider this process installed is no longer the global one, so no span would be recorded',
+          undefined,
+          'Restart the dev server; another OpenTelemetry setup replaced this process\u2019s tracer provider.',
+        );
+      }
+    }
+
+    const pending = await this.#finishTeardown();
+    const blocking = pending[0];
+    if (blocking !== undefined) {
+      return {
+        ...blocking,
+        hint:
+          blocking.hint ??
+          'Restart the dev server to install a tracer provider; the previous one could not be released.',
+      };
     }
 
     const factory = this.#createProvider;
     if (factory === undefined) {
-      this.#fail(
-        'no tracer provider factory is attached; server spans cannot be re-enabled for this capture',
+      return this.#resourceFailure(
+        CAPTURE_RESOURCES.provider,
+        [],
+        'no tracer provider factory is attached; server spans cannot be enabled for this capture',
         undefined,
+        'Relaunch the dev server through Debug Generator so the preload can install a tracer provider.',
+      );
+    }
+
+    let provider: ControlTracerProvider;
+    try {
+      provider = factory();
+      provider.register({ propagator: new W3CTraceContextPropagator() });
+    } catch (error) {
+      return this.#resourceFailure(
+        CAPTURE_RESOURCES.provider,
+        [],
+        'could not register a tracer provider for this capture',
+        error,
+        'Restart the dev server; the OpenTelemetry provider refused to install.',
+      );
+    }
+
+    // The propagator was installed alongside the provider, whether or not the
+    // provider itself took, so its removal is this object's to perform.
+    this.#globalPropagatorInstalled = true;
+
+    // `register()` returns `void` and swallows a refusal:
+    // `trace.setGlobalTracerProvider` answers `false` — and leaves the
+    // incumbent in place — when a global provider is already registered
+    // (`@opentelemetry/api` 1.9.1). Nothing throws, so the only way to know
+    // whether this provider is the one the host's tracers now resolve through
+    // is to ask the global.
+    if (!this.#isProviderGlobal(provider)) {
+      // Held, not dropped: it is this object's provider and the teardown owes
+      // it a shutdown, and the next attempt must retry that before building
+      // another.
+      this.#provider = provider;
+      this.#providerRegistered = false;
+      this.#providerShutdownPending = true;
+      return this.#resourceFailure(
+        CAPTURE_RESOURCES.provider,
+        [],
+        'another global tracer provider is already registered, so this one was refused and no span would be recorded',
+        undefined,
+        'Restart the dev server without the other OpenTelemetry setup (an instrumentation.ts register(), @vercel/otel or a second preload), then capture again.',
+      );
+    }
+
+    this.#provider = provider;
+    this.#providerRegistered = true;
+    this.#providerShutdownPending = false;
+    this.#globalTracerInstalled = true;
+
+    // The replacement provider has adopted the shared span processor, which the
+    // *previous* provider's shutdown closed — the SDK shuts its processors down
+    // with it. Reopening is what makes this capture's spans exportable rather
+    // than counted as arriving after a shutdown, so a reopening that did not
+    // take refuses the capture instead of arming a silent one.
+    const processorFailure = this.#reopenProcessor();
+    if (processorFailure !== null) {
+      return processorFailure;
+    }
+
+    this.#log('debug', 'tracer provider and W3C propagator registered');
+
+    if (!propagation.fields().includes(TRACEPARENT_FIELD)) {
+      // Not fatal — the tier still records — but the browser↔server seam
+      // silently stops joining, which is the one regression AAP §0.4.2 calls
+      // out by name, so it is reported rather than left to be noticed in a
+      // panel with two unrelated traces.
+      return this.#resourceFailure(
+        CAPTURE_RESOURCES.globalPropagator,
+        [],
+        'the global propagator does not carry traceparent, so browser and server spans will not share a trace',
+        undefined,
+        'Another OpenTelemetry propagator is registered; restart the dev server without it.',
+      );
+    }
+
+    return null;
+  }
+
+  /**
+   * Whether a provider is the one the host's tracers resolve through.
+   *
+   * The API installs a `ProxyTracerProvider` as the global and points it at the
+   * registered provider, so the question is whether that proxy's delegate is
+   * this provider. Asked structurally rather than with `instanceof`: two copies
+   * of `@opentelemetry/api` in one process would fail an identity check on the
+   * class while the delegate comparison still answers correctly.
+   *
+   * @param provider The provider this object registered.
+   */
+  #isProviderGlobal(provider: ControlTracerProvider): boolean {
+    try {
+      const global: unknown = trace.getTracerProvider();
+      if (global === provider) {
+        return true;
+      }
+      if (typeof global !== 'object' || global === null) {
+        return false;
+      }
+      const delegate = (global as { getDelegate?: () => unknown }).getDelegate;
+      return typeof delegate === 'function' && delegate.call(global) === provider;
+    } catch {
+      // A global object that threw on inspection cannot be shown to be ours.
+      return false;
+    }
+  }
+
+  /**
+   * Hand the shared span processor to the provider just installed, and confirm
+   * it is open.
+   *
+   * A no-op for a processor that was never closed — the first capture of a
+   * process, or a capture that follows a replacement rather than a teardown —
+   * and for a flush target that does not implement it. When it *is* needed it
+   * is mandatory: a processor left closed drops every span it is given, so the
+   * failure is returned and the capture is refused rather than armed over a
+   * transport that exports nothing.
+   *
+   * @returns The failure that would leave this capture silent, or `null`.
+   */
+  #reopenProcessor(): CaptureResourceFailure | null {
+    const processor = this.#processor;
+    if (processor === undefined || processor.reopen === undefined) {
+      return null;
+    }
+    try {
+      processor.reopen();
+    } catch (error) {
+      return this.#resourceFailure(
+        CAPTURE_RESOURCES.processor,
+        [],
+        'could not reopen the span processor for this capture',
+        error,
+        'Restart the dev server; the telemetry processor is closed and would export nothing.',
+      );
+    }
+    if (processor.isShutDown === true) {
+      return this.#resourceFailure(
+        CAPTURE_RESOURCES.processor,
+        [],
+        'the span processor is still closed after being reopened, so no span would be exported',
+        undefined,
+        'Restart the dev server; the telemetry processor is closed and would export nothing.',
+      );
+    }
+    return null;
+  }
+
+  /**
+   * Bring each instrumentation into the state this capture's signals ask for.
+   *
+   * Per instrumentation, and in both directions. A plan that asked for ORM
+   * tracing and not the driver's leaves `pg.Client.prototype.query`
+   * **unwrapped** in the developer's process — which is what makes the
+   * targeting real rather than a filter applied after the fact — and a plan
+   * that asks for it again re-applies the patch.
+   *
+   * A toggle that throws leaves that entry **unknown** rather than at either
+   * end of the switch: the SDK changes its own enabled flag before it runs the
+   * patch callbacks, so a failure part-way through has applied some of them and
+   * not others. Unknown is what keeps the entry in the cleanup report and costs
+   * only the signals that instrumentation serves — the capture itself proceeds,
+   * degraded, as AAP §0.5.5 requires. It is deliberately not rolled back here:
+   * a signal this capture asked for is admitted whether its patches are whole
+   * or partial, and an immediate second toggle would add a failure mode without
+   * making the state any more knowable. The teardown is where it is resolved.
+   *
+   * @param signals The capture's signal switches.
+   * @returns One failure per instrumentation that refused to toggle.
+   */
+  #applyInstrumentationSignals(signals: ServerAgentSignals): CaptureResourceFailure[] {
+    const failures: CaptureResourceFailure[] = [];
+
+    for (const entry of this.#instrumentations) {
+      const wanted = wantsInstrumentation(entry.role, signals);
+      const target = wanted ? INSTRUMENTATION_STATES.enabled : INSTRUMENTATION_STATES.disabled;
+      if (entry.state === target) {
+        continue;
+      }
+      if (wanted) {
+        this.#enableInstrumentation(entry, failures);
+      } else {
+        const failure = this.#disableInstrumentation(entry);
+        if (failure !== null) {
+          failures.push(failure);
+        }
+      }
+    }
+
+    return failures;
+  }
+
+  /**
+   * Apply one instrumentation's patches, recording what is known afterwards.
+   *
+   * A throw leaves the state **unknown** rather than unchanged: the SDK sets
+   * its own flag before it patches, so a callback that failed part-way may have
+   * wrapped some modules and not others. Unknown keeps the entry in
+   * {@link ServerAgentControl.#pendingCleanup}, so the teardown still tries to
+   * remove it and the cleanup report still tells the truth about it.
+   *
+   * An entry that is *already* unknown is not re-applied, and there is nothing
+   * to be gained by trying. If its flag reads "enabled" — a failed `enable()` —
+   * a second `enable()` returns immediately and patches nothing, so treating it
+   * as installed would promise a signal that may be half-wrapped. If its flag
+   * reads "disabled" — a failed `disable()` — patching *would* run, over
+   * modules that may still carry the previous wrapper: shimmer records one
+   * original per method, so the double wrap it produces survives a later single
+   * unwrap. Either way the honest answer is that this process cannot supply the
+   * signal, with a restart named. A teardown that later removes the patches
+   * *verifiably* returns the entry to `disabled`, and the capture after that
+   * enables it cleanly.
+   *
+   * @param entry The instrumentation to enable.
+   * @param failures Where to record a failure.
+   */
+  #enableInstrumentation(entry: InstrumentationEntry, failures: CaptureResourceFailure[]): void {
+    if (entry.state === INSTRUMENTATION_STATES.unknown) {
+      failures.push(
+        this.#resourceFailure(
+          INSTRUMENTATION_RESOURCES[entry.role],
+          INSTRUMENTATION_SIGNALS[entry.role],
+          'an instrumentation whose earlier toggle failed cannot be re-applied in this process without risking a doubled patch',
+          undefined,
+          'Restart the dev server to collect this signal.',
+        ),
       );
       return;
     }
 
     try {
-      const provider = factory();
-      provider.register({ propagator: new W3CTraceContextPropagator() });
-      this.#provider = provider;
-      this.#providerRegistered = true;
-      this.#log('debug', 'tracer provider and W3C propagator registered');
+      entry.instrumentation.enable();
+      entry.state = INSTRUMENTATION_STATES.enabled;
     } catch (error) {
-      this.#fail('could not register a tracer provider for this capture', error);
+      entry.state = INSTRUMENTATION_STATES.unknown;
+      failures.push(
+        this.#resourceFailure(
+          INSTRUMENTATION_RESOURCES[entry.role],
+          INSTRUMENTATION_SIGNALS[entry.role],
+          'could not enable an instrumentation for this capture',
+          error,
+          'The signal is unavailable for this capture; the patches it may have applied are removed at cleanup.',
+        ),
+      );
     }
-  }
-
-  /** Re-apply the instrumentation patches, if they are not already applied. */
-  #enableInstrumentations(): void {
-    if (this.#instrumentationsEnabled || this.#instrumentations.length === 0) {
-      return;
-    }
-    for (const instrumentation of this.#instrumentations) {
-      try {
-        instrumentation.enable();
-      } catch (error) {
-        this.#fail('could not enable an instrumentation', error);
-      }
-    }
-    this.#instrumentationsEnabled = true;
   }
 
   /**
-   * Remove the instrumentation patches.
+   * Remove one instrumentation's patches, and only claim it when the removal
+   * can be shown to have done the work.
    *
-   * Guarded by the local flag so a second teardown is observably a no-op, even
-   * though the SDK's own `disable()` is idempotent. The flag starts `true` when
+   * The SDK makes this subtle. `InstrumentationBase.disable()` sets its flag to
+   * `false` **before** it unpatches and returns immediately when the flag is
+   * already `false`, so:
+   *
+   * - a `disable()` that throws leaves the flag `false` with modules possibly
+   *   still wrapped, and the state becomes `unknown`;
+   * - a *second* `disable()` on such an instrumentation returns without
+   *   unpatching anything. Its silence is not evidence, so an entry that is
+   *   already `unknown` and whose SDK flag reports "not enabled" stays
+   *   `unknown` and is reported with a restart hint. The only honest
+   *   alternatives would be to inspect the host's modules for residual
+   *   wrappers, which this package cannot do without importing them, or to
+   *   force an enable/unpatch cycle, which can leave a doubled wrapper — worse
+   *   than an honest report.
+   *
+   * An instrumentation that does not expose the accessor is taken at its word:
+   * a non-throwing `disable()` is treated as done, which is the previous
+   * behaviour and all a bare `{ enable, disable }` offers.
+   *
+   * @param entry The instrumentation to disable.
+   * @returns The failure, or `null` when the patches are verifiably gone.
+   */
+  #disableInstrumentation(entry: InstrumentationEntry): CaptureResourceFailure | null {
+    const reportsEnabled = this.#readInstrumentationFlag(entry);
+    if (entry.state === INSTRUMENTATION_STATES.unknown && reportsEnabled === false) {
+      return this.#resourceFailure(
+        INSTRUMENTATION_RESOURCES[entry.role],
+        INSTRUMENTATION_SIGNALS[entry.role],
+        'an instrumentation whose removal failed reports itself already disabled, so its patches cannot be shown to be gone',
+        undefined,
+        'Restart the dev server to remove them; a further disable() would do nothing.',
+      );
+    }
+
+    try {
+      entry.instrumentation.disable();
+    } catch (error) {
+      entry.state = INSTRUMENTATION_STATES.unknown;
+      return this.#resourceFailure(
+        INSTRUMENTATION_RESOURCES[entry.role],
+        INSTRUMENTATION_SIGNALS[entry.role],
+        'could not remove an instrumentation',
+        error,
+        'The patches may still be applied; restart the dev server to remove them.',
+      );
+    }
+
+    if (this.#readInstrumentationFlag(entry) === true) {
+      // It returned without throwing and still reports itself enabled, so the
+      // unpatching did not happen.
+      entry.state = INSTRUMENTATION_STATES.unknown;
+      return this.#resourceFailure(
+        INSTRUMENTATION_RESOURCES[entry.role],
+        INSTRUMENTATION_SIGNALS[entry.role],
+        'an instrumentation still reports itself enabled after being disabled',
+        undefined,
+        'Restart the dev server to remove its patches.',
+      );
+    }
+
+    entry.state = INSTRUMENTATION_STATES.disabled;
+    return null;
+  }
+
+  /**
+   * The SDK's own enabled flag for an instrumentation, or `undefined` when it
+   * does not expose one.
+   *
+   * Guarded: this runs on the teardown path, where an accessor that throws must
+   * not abort the rest of the sequence.
+   *
+   * @param entry The instrumentation to ask.
+   */
+  #readInstrumentationFlag(entry: InstrumentationEntry): boolean | undefined {
+    const instrumentation = entry.instrumentation;
+    if (typeof instrumentation.isEnabled !== 'function') {
+      return undefined;
+    }
+    try {
+      return instrumentation.isEnabled();
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * The disable sequence of AAP §0.5.1, in order, with every resource tracked
+   * on its own.
+   *
+   * 1. the gate is already closed by the caller, and closed again here so a
+   *    direct call is as safe as a queued one;
+   * 2. flush, so evidence already captured still reaches the service;
+   * 3. `disable()` on each instrumentation — this is what unwraps `pg`'s
+   *    patched methods and clears Prisma's global instrumentation hook;
+   * 4. `trace.disable()` and `propagation.disable()`, removing the global
+   *    provider so the host framework's own spans become no-ops;
+   * 5. `provider.shutdown()`, so a tracer cached from it stops processing.
+   *
+   * **A step that fails is not recorded as done.** Its flag stays set, its
+   * handle is kept, the report comes back `partial` naming the resource, and
+   * the next `disable()` — or the next capture's installation — retries exactly
+   * that step. The alternative, which this method deliberately does not do, is
+   * to clear the flags regardless: the preload would then report itself inert
+   * while `pg` was still wrapped or a provider was still registered, and
+   * nothing in the product would ever try again.
+   *
+   * The span processor is **not** shut down: it outlives every cycle, and the
+   * next capture reuses its buffer and its transport. `globalThis.__DEBUGGEN__`
+   * is **not** uninstalled either — see this module's overview.
+   *
+   * @returns How inert the preload actually is.
+   */
+  async #runDisable(): Promise<CleanupReport> {
+    this.#clearGate();
+
+    if (this.#isInert()) {
+      // Nothing is installed, so nothing is running — whatever an earlier
+      // teardown reported. A `partial` that has since been finished (by a
+      // retry, or by the enable path completing it) is `clean` now, and saying
+      // otherwise would leave a session reporting a conflict it no longer has.
+      this.#cleanupStatus = 'clean';
+      return { status: 'clean', changed: false, pending: [], failures: [] };
+    }
+
+    this.#disableCount += 1;
+    const failures: CaptureResourceFailure[] = [];
+
+    const flushFailure = await this.#flushCaptured('the teardown');
+    if (flushFailure !== null) {
+      failures.push(flushFailure);
+    }
+
+    failures.push(...this.#disableInstrumentations());
+    failures.push(...(await this.#finishTeardown()));
+
+    const pending = this.#pendingCleanup();
+    const status = pending.length === 0 ? 'clean' : 'partial';
+    this.#cleanupStatus = status;
+
+    if (status === 'clean') {
+      this.#log('debug', 'instrumentation removed; the preload is inert');
+    } else {
+      // Named, not summarised: "partial" without the list is not something a
+      // developer or the service can act on.
+      this.#log('warn', 'the preload could not be made fully inert', {
+        pending: pending.join(','),
+      });
+    }
+
+    return { status, changed: true, pending, failures };
+  }
+
+  /**
+   * Remove the instrumentation patches, one instrumentation at a time.
+   *
+   * Every entry that is not already verifiably disabled is attempted, whatever
+   * the previous one did, and an entry whose removal could not be shown to have
+   * happened stays `unknown` — so it appears in
+   * {@link ServerAgentControl.#pendingCleanup}, keeps the cleanup report
+   * `partial`, and is attempted again next time. Entries start `enabled` when
    * instrumentations are attached, so a session that ends without ever having
    * captured anything still leaves the developer's `pg` unwrapped — which is
    * exactly what `./control.test.ts` asserts through shimmer's `isWrapped`.
+   *
+   * @returns One failure per instrumentation whose patches are not provably
+   * gone.
    */
-  #disableInstrumentations(): void {
-    if (!this.#instrumentationsEnabled) {
-      return;
-    }
-    for (const instrumentation of this.#instrumentations) {
-      try {
-        instrumentation.disable();
-      } catch (error) {
-        this.#fail('could not disable an instrumentation', error);
+  #disableInstrumentations(): CaptureResourceFailure[] {
+    const failures: CaptureResourceFailure[] = [];
+
+    for (const entry of this.#instrumentations) {
+      if (entry.state === INSTRUMENTATION_STATES.disabled) {
+        continue;
+      }
+      const failure = this.#disableInstrumentation(entry);
+      if (failure !== null) {
+        failures.push(failure);
       }
     }
-    this.#instrumentationsEnabled = false;
+
+    return failures;
   }
 
-  /** Close the gate: no capture, no signals, no admitted kinds. */
+  /**
+   * Remove the globals this object installed: the tracer provider and the
+   * propagator.
+   *
+   * Each is tracked separately and cleared only on success. A `trace.disable()`
+   * that failed leaves a global registration in place, which the *next*
+   * installation has to retry before it can register anything — see
+   * {@link ServerAgentControl.#ensureProvider}.
+   *
+   * @returns One failure per global that could not be removed.
+   */
+  #removeGlobals(): CaptureResourceFailure[] {
+    const failures: CaptureResourceFailure[] = [];
+
+    if (this.#globalTracerInstalled) {
+      try {
+        trace.disable();
+        this.#globalTracerInstalled = false;
+        this.#providerRegistered = false;
+      } catch (error) {
+        failures.push(
+          this.#resourceFailure(
+            CAPTURE_RESOURCES.globalTracer,
+            [],
+            'could not remove the global tracer provider',
+            error,
+            'Restart the dev server; the framework may still be creating spans.',
+          ),
+        );
+      }
+    }
+
+    if (this.#globalPropagatorInstalled) {
+      try {
+        propagation.disable();
+        this.#globalPropagatorInstalled = false;
+      } catch (error) {
+        failures.push(
+          this.#resourceFailure(
+            CAPTURE_RESOURCES.globalPropagator,
+            [],
+            'could not remove the global propagator',
+            error,
+          ),
+        );
+      }
+    }
+
+    return failures;
+  }
+
+  /**
+   * Shut the provider down, and keep the handle if that fails.
+   *
+   * The registration is dropped *before* the await: a provider whose shutdown
+   * has begun must never serve the next capture, whatever the shutdown goes on
+   * to do. The handle itself is released only on success — a retained handle is
+   * the only thing that makes a retry possible, and a provider whose shutdown
+   * failed may still be processing spans.
+   *
+   * @returns The failure, or `null` when there was nothing to shut down or it
+   * worked.
+   */
+  async #shutdownProvider(): Promise<CaptureResourceFailure | null> {
+    const provider = this.#provider;
+    if (provider === null) {
+      this.#providerShutdownPending = false;
+      return null;
+    }
+
+    this.#providerRegistered = false;
+
+    try {
+      await provider.shutdown();
+      this.#provider = null;
+      this.#providerShutdownPending = false;
+      return null;
+    } catch (error) {
+      this.#providerShutdownPending = true;
+      return this.#resourceFailure(
+        CAPTURE_RESOURCES.provider,
+        [],
+        'could not shut the tracer provider down',
+        error,
+        'Restart the dev server; a tracer cached from this provider may still be processing spans.',
+      );
+    }
+  }
+
+  /**
+   * The part of the teardown both paths share: remove the globals, then shut
+   * the provider down.
+   *
+   * Called by {@link ServerAgentControl.#runDisable} as steps 4 and 5, and by
+   * {@link ServerAgentControl.#ensureProvider} as the retry of a teardown that
+   * did not finish. Idempotent, because each step is guarded by its own flag.
+   *
+   * @returns One failure per step that could not be completed.
+   */
+  async #finishTeardown(): Promise<CaptureResourceFailure[]> {
+    const failures = this.#removeGlobals();
+    const shutdownFailure = await this.#shutdownProvider();
+    if (shutdownFailure !== null) {
+      failures.push(shutdownFailure);
+    }
+    return failures;
+  }
+
+  /**
+   * The resources still installed, in teardown order.
+   *
+   * The list is what makes `partial` actionable, and it is computed from the
+   * flags rather than remembered, so it cannot disagree with them.
+   */
+  #pendingCleanup(): CaptureResource[] {
+    const pending: CaptureResource[] = [];
+    for (const entry of this.#instrumentations) {
+      // `unknown` counts: an instrumentation whose toggle threw may still be
+      // patched into the host, and the point of the report is to say so.
+      if (entry.state !== INSTRUMENTATION_STATES.disabled) {
+        pending.push(INSTRUMENTATION_RESOURCES[entry.role]);
+      }
+    }
+    if (this.#globalTracerInstalled) {
+      pending.push(CAPTURE_RESOURCES.globalTracer);
+    }
+    if (this.#globalPropagatorInstalled) {
+      pending.push(CAPTURE_RESOURCES.globalPropagator);
+    }
+    if (this.#providerShutdownPending || this.#provider !== null || this.#providerRegistered) {
+      pending.push(CAPTURE_RESOURCES.provider);
+    }
+    return pending;
+  }
+
+  /**
+   * Whether there is nothing left to tear down.
+   *
+   * Derived from the per-resource flags rather than held as a flag of its own,
+   * which is the difference between "a teardown ran" and "the teardown
+   * finished": the second is the only one worth asserting, and the first is
+   * what a single `inert` boolean would have recorded.
+   */
+  #isInert(): boolean {
+    return this.#pendingCleanup().length === 0;
+  }
+
+  /**
+   * Count a failure, log it without the credential, and describe it for a
+   * report.
+   *
+   * One place, so every failure this module reports is also counted in
+   * {@link ServerAgentControlStats.failures} and logged once — and so the
+   * `reason` carried in a report has been through the same scrub as the log
+   * line.
+   *
+   * @param resource Which resource failed.
+   * @param signals The signals the failure costs the capture.
+   * @param message What was being attempted.
+   * @param error The caught value, or `undefined` when the failure is a missing
+   * collaborator rather than a throw.
+   * @param hint What would fix it, where there is an action to name.
+   */
+  #resourceFailure(
+    resource: CaptureResource,
+    signals: readonly ServerAgentSignalName[],
+    message: string,
+    error: unknown,
+    hint?: string,
+  ): CaptureResourceFailure {
+    this.#fail(message, error);
+    const reason = error === undefined ? message : `${message}: ${describeError(error)}`;
+    return {
+      resource,
+      signals,
+      reason: this.#scrub(reason),
+      ...(hint === undefined ? {} : { hint }),
+    };
+  }
+
+  /**
+   * Whether a `function` span names a symbol the active plan patched.
+   *
+   * One identity, in order of authority. The `symbol` attribute the patch wrote
+   * is the plan's own record of what was wrapped, so where a span declares one
+   * it is **the** identity and the display name is not consulted — a span named
+   * after a planned symbol while declaring a different one is the one it
+   * declares. Only a span with no declared symbol falls back to its display
+   * name, which `./span-helper.ts` derives from the name the patch passed.
+   *
+   * Both spellings of a planned name are in the allow-list, the full one and
+   * (where it is unambiguous) the shortened one
+   * ({@link resolveFunctionAllowList}), because the helper bounds both the span
+   * name and a string attribute at `MAX_PREVIEW_LENGTH`.
+   *
+   * @param candidate The span facts `./exporter.ts` read.
+   */
+  #isPlannedFunction(candidate: SpanAdmissionCandidate): boolean {
+    if (this.#functionAllowList.size === 0) {
+      return false;
+    }
+
+    const symbol = candidate.attributes[FUNCTION_SYMBOL_ATTRIBUTE];
+    if (typeof symbol === 'string') {
+      const declared = symbol.trim();
+      if (declared.length > 0) {
+        // The patch's own record of what it wrapped **outranks** the display
+        // name, and replaces it rather than joining it: a span that happens to
+        // be named after a planned symbol while declaring an unplanned one is
+        // the unplanned one, and accepting either identity would admit it.
+        return this.#functionAllowList.has(declared);
+      }
+    }
+
+    return this.#functionAllowList.has(candidate.name.trim());
+  }
+
+  /**
+   * Close the gate: no capture, no signals, no admitted kinds, no admitted
+   * sources and no planned functions.
+   *
+   * Every axis of the admission policy is cleared, not only the kinds: a
+   * closed gate answers `no-capture` before any of them is consulted, and
+   * leaving one populated would make a stale answer possible the moment the
+   * capture id came back.
+   *
+   * The capture generation is deliberately **not** advanced here. It counts
+   * captures armed, so a span started and ended inside one capture carries the
+   * same value at both ends, and a span outliving a closed gate is already
+   * dropped by the capture id being `null`.
+   */
   #clearGate(): void {
     this.#sessionId = null;
     this.#captureId = null;
     this.#signals = NO_SIGNALS;
     if (this.#enabledKinds.size > 0) {
       this.#enabledKinds = new Set<TelemetryKind>();
+    }
+    if (this.#enabledDbSources.size > 0) {
+      this.#enabledDbSources = new Set<DatabaseSpanSource>();
+    }
+    if (this.#functionAllowList.size > 0) {
+      this.#functionAllowList = new Set<string>();
     }
   }
 
@@ -1791,7 +3355,11 @@ export class ServerAgentControl implements CaptureGate {
         payload: {
           client: CONTROL_CLIENT_KIND,
           projectRoot: this.#config.projectRoot,
-          version: TRACER_VERSION,
+          // The protocol's version, whose major the service compares before it
+          // answers with configuration — not this package's version, which
+          // belongs to OpenTelemetry scope metadata and would be read as an
+          // incompatible major and close the socket.
+          version: WIRE_PROTOCOL_VERSION,
           token: this.#config.token,
         },
       };
@@ -2110,22 +3678,24 @@ export class ServerAgentControl implements CaptureGate {
 }
 
 /**
- * Whether two kind sets admit exactly the same kinds.
+ * Whether two sets hold exactly the same members.
  *
- * Used for the enable path's idempotence check: a service that re-sends the
- * capture it already sent — on a reconnect, for instance — must not cause a
- * provider to be rebuilt or a counter to move.
+ * Used for the enable path's idempotence check, over each axis of the
+ * admission policy — kinds, database sources, planned function identities — so
+ * that a service re-sending the capture it already sent (on a reconnect, for
+ * instance) causes no provider to be rebuilt and no counter to move, while a
+ * frame that differs on any axis is applied.
  *
  * @param left One set.
  * @param right The other.
  * @returns Whether they are equal.
  */
-function sameKinds(left: ReadonlySet<TelemetryKind>, right: ReadonlySet<TelemetryKind>): boolean {
+function sameSet<T>(left: ReadonlySet<T>, right: ReadonlySet<T>): boolean {
   if (left.size !== right.size) {
     return false;
   }
-  for (const kind of left) {
-    if (!right.has(kind)) {
+  for (const member of left) {
+    if (!right.has(member)) {
       return false;
     }
   }

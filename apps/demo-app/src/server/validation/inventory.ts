@@ -1,11 +1,12 @@
 /**
  * Request validation for the inventory dashboard's feed — `GET /api/inventory/summary`.
  *
- * The dashboard is rendered on the server, so one request produces its whole surface: the KPI
- * figures, one page of stock lines, the stocking locations its filter row lists and the low-stock
- * list. Everything a caller may vary about that request is a query parameter, and this module is
- * the single place those parameters are turned into values the inventory service can trust. It
- * describes the request and nothing else — the response shapes live in `@/lib/types`.
+ * One request produces the dashboard's whole surface: the KPI figures, one page of stock lines,
+ * the stocking locations its filter row lists and the low-stock list. The page is rendered on the
+ * server and asks this endpoint for that payload, so this schema parses the dashboard's own visits
+ * and an outside caller's requests alike. Everything either may vary is a query parameter, and this
+ * module is the single place those parameters are turned into values the inventory service can
+ * trust. It describes the request and nothing else — the response shapes live in `@/lib/types`.
  *
  * Four conventions shape the schema below, and they are the reason it is not simply a handful of
  * strings and numbers:
@@ -180,7 +181,11 @@ export const inventorySummaryQuerySchema = z.object({
   threshold: z.preprocess(unset, z.coerce.number().int().min(0).max(10_000).default(10)),
 
   /**
-   * Which page of stock lines to answer with, counted from `1` as `PagedList` numbers its pages.
+   * Which page of stock lines to answer with - one line being one product at one stocking
+   * location - counted from `1` as `PagedList` numbers its pages. It is the dashboard's stock
+   * table this windows, which is the surface that carries a pager; the low-stock list beside it is
+   * the most urgent lines and is not paged.
+   *
    * A page number past the end of the listing is accepted here and answered as an empty page
    * rather than rejected, which is what keeps a bookmarked dashboard URL working after the stock
    * behind it has moved on; the ceiling only keeps the number a page number.

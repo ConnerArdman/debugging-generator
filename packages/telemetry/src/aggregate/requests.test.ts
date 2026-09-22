@@ -52,6 +52,22 @@
  *   a WebSocket inside `CaptureSummary` and an HTTP response as the `requests`
  *   DataResult.
  *
+ * ## Two fixture sources, on purpose
+ *
+ * Most cases below build their events inline, because a windowing boundary or a
+ * hostile attribute is stated most clearly by the two-event fixture written for
+ * it. The **final section** drives the same module from the committed capture
+ * `packages/telemetry/test/fixtures/capture-batch.json`, which it reads from
+ * disk at run time and validates element by element against the persisted
+ * schema of `../schema/event.ts` before it asserts anything. That file is
+ * deterministic repository data — a curated, already-redacted sample authored
+ * and reviewed in the repository (AAP 0.2.5 lists it; 0.3.4 permits only
+ * redacted samples to be committed), never a recording taken off a running
+ * browser — which is what makes exact assertions on its groups,
+ * windows and counts legitimate, and it is the only place in this suite where a
+ * *whole* capture reaches the aggregate: seven request events among
+ * twenty-three that must leave no trace in the result.
+ *
  * ## Fixture conventions
  *
  * Every path, component and parameter name here is invented (`/api/items`,
@@ -66,7 +82,11 @@
  * is why no fixture needs a real parameter value.
  *
  * Request keys are assembled at run time from a short label and a run of one
- * character rather than written out as dense 64-character literals:
+ * character rather than written out as dense 64-character literals — and the
+ * fixture-driven section keeps that convention by reading each key off the
+ * parsed event instead of repeating the digest the JSON file holds, so this
+ * tracked TypeScript file still contains no dense value bound to a key-like
+ * name:
  * `scripts/check-secrets.mjs` scans this tracked file and its entropy rule
  * looks for exactly such a string bound to a name containing "key", so the
  * convention `../redaction/request-key.test.ts` established is followed here
@@ -81,25 +101,39 @@
  * time, then id — is predictable by construction.
  */
 
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
 import { describe, expect, it } from 'vitest';
 
 import { DEFAULT_RESOLUTION_CONFIDENCE, ID_PREFIXES, roundMs } from '@debuggen/shared';
 import type { EventId, SourceLocation, SpanId, TraceId } from '@debuggen/shared';
 
-import { FETCH_ATTRIBUTE_KEYS, SERVICE_ASSIGNED_ATTRIBUTE_KEYS } from '../schema/attributes.js';
-import { isTelemetryEvent } from '../schema/event.js';
+import {
+  FETCH_ATTRIBUTE_KEYS,
+  PERF_ENTRY_ATTRIBUTE_KEYS,
+  SERVICE_ASSIGNED_ATTRIBUTE_KEYS,
+} from '../schema/attributes.js';
+import { isTelemetryEvent, telemetryEventSchema } from '../schema/event.js';
 import type { TelemetryEvent } from '../schema/event.js';
-import { REQUEST_KINDS, TELEMETRY_KINDS, allowedTiersFor } from '../schema/kinds.js';
+import { PERF_KINDS, REQUEST_KINDS, TELEMETRY_KINDS, allowedTiersFor } from '../schema/kinds.js';
 import type { TelemetryKind, TelemetryStatus, TelemetryTier } from '../schema/kinds.js';
 import {
   DEFAULT_DUPLICATE_WINDOW_MS,
   DEFAULT_MAX_OCCURRENCES_PER_GROUP,
   DEFAULT_MAX_REQUEST_OCCURRENCES_PER_GROUP,
+  DEFAULT_RESOURCE_TIMING_TOLERANCE_MS,
   REQUEST_GROUPED_BY,
+  REQUEST_TRANSFER_SOURCES,
+  RESOURCE_ENTRY_TYPE,
+  RESOURCE_TIMING_URL_ATTRIBUTE,
+  TRANSFER_SIZE_EXPOSED_ATTRIBUTE,
   UNKNOWN_METHOD_LABEL,
   UNKNOWN_URL_LABEL,
   aggregateRequests,
   countDuplicateRequests,
+  readExposedTransferSize,
 } from './requests.js';
 import type {
   DuplicateWindow,
@@ -137,6 +171,39 @@ const INITIATOR_ATTRIBUTE: RequestAttributeKey = 'initiator';
 
 /** Bytes over the wire, as `PerformanceResourceTiming` spells it. */
 const TRANSFER_SIZE_ATTRIBUTE: RequestAttributeKey = 'transferSize';
+
+/**
+ * A key the attribute catalog declares for resource-timing entries.
+ *
+ * The join reads the other half of one exchange, so its fixtures type their
+ * keys against the resource-entry tuple exactly as the request fixtures type
+ * theirs against the request tuple.
+ */
+type ResourceAttributeKey = (typeof PERF_ENTRY_ATTRIBUTE_KEYS)[number];
+
+/** Which `PerformanceEntry` type a `perf.entry` event describes. */
+const ENTRY_TYPE_ATTRIBUTE: ResourceAttributeKey = 'entry.type';
+
+/** What initiated a resource load: `fetch`, `xmlhttprequest`, `link`, … */
+const INITIATOR_TYPE_ATTRIBUTE: ResourceAttributeKey = 'initiator.type';
+
+/**
+ * The kind a resource-timing entry arrives as.
+ *
+ * Narrowed out of the performance kind group rather than written freehand: the
+ * group holds a long task and a performance entry, and only the second can
+ * describe a response.
+ */
+function resourceEntryKind(): TelemetryKind {
+  const kind = PERF_KINDS.find((candidate) => candidate === 'perf.entry');
+  if (kind === undefined) {
+    throw new Error('PERF_KINDS no longer declares the performance-entry kind');
+  }
+  return kind;
+}
+
+/** @see resourceEntryKind */
+const RESOURCE_ENTRY_EVENT_KIND = resourceEntryKind();
 
 /**
  * The grouping key's attribute name, *read* from the catalog rather than typed.
@@ -620,7 +687,10 @@ function noDuplicates(group: RequestGroup): RequestGroup {
  * The harness itself
  *
  * A fixture that the persisted schema would reject, or two fixtures that
- * accidentally share an identifier, would make every case below vacuous.
+ * accidentally share an identifier, would make every case below vacuous. What
+ * follows covers the inline builder only; the committed capture this suite also
+ * reads is held to the same schema by `describe('the committed capture
+ * fixture')` at the end of the file, beside the loader that reads it.
  * ---------------------------------------------------------------------------
  */
 
@@ -1846,5 +1916,1235 @@ describe('the requests module contract', () => {
       // group can never be mistaken for an observed value.
       expect(label).toContain(' ');
     }
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The resource-timing join
+ *
+ * No request API reports how many bytes crossed the wire; only
+ * `PerformanceResourceTiming` does (AAP 0.6.6), and `../browser/perf.ts`
+ * observes those entries as `perf.entry` events of their own. This section is
+ * the consuming half of that contract: it pins the identity the two producers
+ * agree on, the timing constraint that makes a masked URL safe to join on, and
+ * the one-entry-one-request rule the `transferred_bytes` metric depends on.
+ *
+ * Why each case earns its place:
+ *
+ * - **Identity.** A request is written `/api/items` and its entry is named
+ *   `http://app.localhost/api/items`, so without the resolved identity the
+ *   producer emits there is nothing to match and the bytes are lost. Both the
+ *   resolved key and the as-written fallback are asserted.
+ * - **Timing.** Redaction masks `?productId=A` and `?productId=B` to one
+ *   string, so identity alone would let one response's bytes land on a
+ *   different request. The two-requests-one-URL case is the decisive one: each
+ *   occurrence must take *its own* entry.
+ * - **Exposure.** A cross-origin response reports `transferSize: 0` with
+ *   nothing measured, and counting that zero is what AAP 0.8.4 forbids. The
+ *   truth table of `readExposedTransferSize` is asserted directly, because
+ *   `./summary.ts` publishes the metric from the same reader.
+ * - **Claims.** `./summary.ts` adds the entries *nobody* claimed, so an entry
+ *   a request accounted for must be reported as claimed even when the
+ *   request's own reading won. A missing claim double-counts a response on the
+ *   metric card while the table stays right.
+ *
+ * Fixture URLs stay invented and stay in their redacted form, exactly as the
+ * rest of this file's do.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The origin a fixture's resolved identity is built against; invented. */
+const RESOURCE_FIXTURE_ORIGIN = 'http://app.localhost';
+
+/** The `entry.type` of a paint mark: a `perf.entry` that never carries bytes. */
+const PAINT_ENTRY_TYPE = 'paint';
+
+/** What a resource-timing fixture may state. */
+interface ResourceEventOverrides {
+  /** The entry's URL; absolute in a real capture. */
+  readonly url?: string;
+  /** Start of the load, in epoch milliseconds. */
+  readonly startTime?: number;
+  /** Duration of the load, in milliseconds. */
+  readonly duration?: number;
+  /** The measured size. */
+  readonly transferSize?: number;
+  /** The producer's exposure verdict; omitted when the case is about absence. */
+  readonly transferSizeExposed?: boolean;
+  /** `fetch`, `xmlhttprequest`, `link`, … */
+  readonly initiatorType?: string;
+  /** `resource` unless the case is about a paint mark. */
+  readonly entryType?: string;
+  /** A fixed id, for the cases that assert on which entry was claimed. */
+  readonly id?: EventId;
+}
+
+/**
+ * One persisted resource-timing event, as `../browser/perf.ts` emits it.
+ *
+ * `entry.type` and the exposure verdict are present by default because a real
+ * producer always writes both; a case that wants an unlabelled or legacy entry
+ * says so. The kind and tier come from the schema, so every fixture satisfies
+ * the persisted event contract by construction.
+ */
+function makeResourceEvent(overrides: ResourceEventOverrides = {}): TelemetryEvent {
+  const attributes: Record<string, unknown> = {
+    [ENTRY_TYPE_ATTRIBUTE]: overrides.entryType ?? RESOURCE_ENTRY_TYPE,
+  };
+  if (overrides.url !== undefined) {
+    attributes[URL_ATTRIBUTE] = overrides.url;
+  }
+  if (overrides.initiatorType !== undefined) {
+    attributes[INITIATOR_TYPE_ATTRIBUTE] = overrides.initiatorType;
+  }
+  if (overrides.transferSize !== undefined) {
+    attributes[TRANSFER_SIZE_ATTRIBUTE] = overrides.transferSize;
+  }
+  if (overrides.transferSizeExposed !== undefined) {
+    attributes[TRANSFER_SIZE_EXPOSED_ATTRIBUTE] = overrides.transferSizeExposed;
+  }
+
+  return {
+    id: overrides.id ?? nextEventId(),
+    traceId: nextTraceId(),
+    spanId: nextSpanId(),
+    kind: RESOURCE_ENTRY_EVENT_KIND,
+    name: RESOURCE_ENTRY_TYPE,
+    startTime: overrides.startTime ?? BASE_TIME,
+    duration: overrides.duration ?? DEFAULT_DURATION_MS,
+    tier: firstAllowedTier(RESOURCE_ENTRY_EVENT_KIND),
+    attributes,
+    status: OK_STATUS,
+    producerId: PRODUCER_ID,
+    seq: nextSeq(),
+    sessionId: SESSION_ID,
+    captureId: CAPTURE_ID,
+    ingestSeq: nextIngestSeq(),
+  };
+}
+
+describe('aggregateRequests resource-timing join', () => {
+  it('attributes a resource entry to the request that caused it, by resolved identity', () => {
+    // The shape a real capture has: the application wrote a relative URL, so
+    // the request event carries the absolute identity beside it, and the entry
+    // is named by that absolute URL alone.
+    const requestKey = opaqueRequestKey('j1');
+    const request = makeRequestEvent({
+      requestKey,
+      url: ITEMS_PATH,
+      extraAttributes: {
+        [RESOURCE_TIMING_URL_ATTRIBUTE]: `${RESOURCE_FIXTURE_ORIGIN}${ITEMS_PATH}`,
+      },
+    });
+    const entry = makeResourceEvent({
+      url: `${RESOURCE_FIXTURE_ORIGIN}${ITEMS_PATH}`,
+      transferSize: 4096,
+      transferSizeExposed: true,
+      initiatorType: 'fetch',
+    });
+
+    const group = onlyGroup(aggregateRequests([request, entry]));
+    const occurrence = occurrenceAt(group, 0);
+
+    expect(occurrence.transferredBytes).toBe(4096);
+    expect(occurrence.transferSource).toBe('resource-timing');
+    expect(occurrence.transferEventId).toBe(entry.id);
+    expect(group.transferredBytes).toBe(4096);
+    expect(group.transferEventIds).toStrictEqual([entry.id]);
+    // The entry is evidence about a request, never a request of its own.
+    expect(group.count).toBe(1);
+  });
+
+  it('falls back to the URL as written when no resolved identity was reported', () => {
+    // A producer that predates `resourceTimingUrl`, or an application that
+    // wrote the absolute URL itself: the display URL is then the identity.
+    const requestKey = opaqueRequestKey('j2');
+    const absolute = `${RESOURCE_FIXTURE_ORIGIN}${THINGS_PATH}`;
+    const group = onlyGroup(
+      aggregateRequests([
+        makeRequestEvent({ requestKey, url: absolute }),
+        makeResourceEvent({ url: absolute, transferSize: 128, transferSizeExposed: true }),
+      ]),
+    );
+
+    expect(group.transferredBytes).toBe(128);
+    expect(occurrenceAt(group, 0).transferSource).toBe('resource-timing');
+  });
+
+  it('joins nothing when no entry names the same URL', () => {
+    const group = onlyGroup(
+      aggregateRequests([
+        makeRequestEvent({ requestKey: opaqueRequestKey('j3'), url: ITEMS_PATH }),
+        makeResourceEvent({ url: THINGS_PATH, transferSize: 900, transferSizeExposed: true }),
+      ]),
+    );
+
+    expect(group.transferredBytes).toBeUndefined();
+    expect(Object.hasOwn(group, 'transferredBytes')).toBe(false);
+    expect(Object.hasOwn(group, 'transferEventIds')).toBe(false);
+    expect(Object.hasOwn(occurrenceAt(group, 0), 'transferSource')).toBe(false);
+  });
+
+  it('joins nothing when the entry started outside the request window and the tolerance', () => {
+    const requestKey = opaqueRequestKey('j4');
+    const events = [
+      makeRequestEvent({ requestKey, url: ITEMS_PATH, startTime: BASE_TIME, duration: 10 }),
+      makeResourceEvent({
+        url: ITEMS_PATH,
+        // Past the request's end (BASE_TIME + 10) by more than the tolerance.
+        startTime: BASE_TIME + 10 + DEFAULT_RESOURCE_TIMING_TOLERANCE_MS + 1,
+        transferSize: 512,
+        transferSizeExposed: true,
+      }),
+    ];
+
+    expect(onlyGroup(aggregateRequests(events)).transferredBytes).toBeUndefined();
+
+    // The boundary is inclusive, and the tolerance is an option: widening it
+    // by one millisecond admits exactly this entry.
+    const widened = onlyGroup(
+      aggregateRequests(events, {
+        resourceTimingToleranceMs: DEFAULT_RESOURCE_TIMING_TOLERANCE_MS + 1,
+      }),
+    );
+
+    expect(widened.transferredBytes).toBe(512);
+  });
+
+  it('gives each of two requests for one masked URL its own entry', () => {
+    // The decisive case. Both requests display as `…?productId=?` and only
+    // their keys keep them apart; two responses of different sizes arrived.
+    // Identity alone cannot tell which is which, so the nearest start decides
+    // and neither entry may be counted twice.
+    const events = [
+      makeRequestEvent({
+        requestKey: opaqueRequestKey('j5a'),
+        url: MASKED_ITEMS_URL,
+        startTime: BASE_TIME,
+        duration: 8,
+      }),
+      makeRequestEvent({
+        requestKey: opaqueRequestKey('j5b'),
+        url: MASKED_ITEMS_URL,
+        startTime: BASE_TIME + 30,
+        duration: 8,
+      }),
+      makeResourceEvent({ url: MASKED_ITEMS_URL, startTime: BASE_TIME, transferSize: 100 }),
+      makeResourceEvent({ url: MASKED_ITEMS_URL, startTime: BASE_TIME + 30, transferSize: 700 }),
+    ];
+
+    const groups = aggregateRequests(events);
+    const first = groups.find((group) => group.transferredBytes === 100);
+    const second = groups.find((group) => group.transferredBytes === 700);
+
+    expect(groups).toHaveLength(2);
+    expect(first).toBeDefined();
+    expect(second).toBeDefined();
+    // Two distinct claims: the sum over the capture is 800, never 1400 and
+    // never 200.
+    const claimed = groups.flatMap((group) => [...(group.transferEventIds ?? [])]);
+    expect(new Set(claimed).size).toBe(2);
+    expect(groups.reduce((sum, group) => sum + (group.transferredBytes ?? 0), 0)).toBe(800);
+  });
+
+  it('never lets one entry answer for two occurrences that both fit it', () => {
+    // The one-entry-one-request rule, isolated. Both occurrences of this group
+    // qualify for the single entry on identity *and* timing — it started
+    // between them, well inside both windows — so the rule is the only thing
+    // deciding the total. Without it the group would report 128 bytes for a
+    // 64-byte response, and `transferred_bytes` would inherit the error.
+    const requestKey = opaqueRequestKey('j6');
+    const entry = makeResourceEvent({
+      url: ITEMS_PATH,
+      startTime: BASE_TIME + 1,
+      transferSize: 64,
+      transferSizeExposed: true,
+    });
+    const group = onlyGroup(
+      aggregateRequests([
+        makeRequestEvent({ requestKey, url: ITEMS_PATH, startTime: BASE_TIME, duration: 4 }),
+        makeRequestEvent({ requestKey, url: ITEMS_PATH, startTime: BASE_TIME + 3, duration: 4 }),
+        entry,
+      ]),
+    );
+
+    expect(group.count).toBe(2);
+    expect(group.transferredBytes).toBe(64);
+    expect(group.transferEventIds).toStrictEqual([entry.id]);
+    // The earlier occurrence takes it, since the join walks occurrences in
+    // canonical order; the later one reports nothing rather than borrowing the
+    // same number.
+    expect(occurrenceAt(group, 0).transferEventId).toBe(entry.id);
+    expect(Object.hasOwn(occurrenceAt(group, 1), 'transferEventId')).toBe(false);
+    expect(Object.hasOwn(occurrenceAt(group, 1), 'transferredBytes')).toBe(false);
+  });
+
+  it('leaves a request unjoined when the only entry belongs to another one', () => {
+    // Two requests for one URL far apart in time, one entry: the timing
+    // constraint hands it to the request it actually describes, and the other
+    // reports nothing.
+    const events = [
+      makeRequestEvent({
+        requestKey: opaqueRequestKey('j6a'),
+        url: ITEMS_PATH,
+        startTime: BASE_TIME,
+        duration: 5,
+      }),
+      makeRequestEvent({
+        requestKey: opaqueRequestKey('j6b'),
+        url: ITEMS_PATH,
+        startTime: BASE_TIME + 500,
+        duration: 5,
+      }),
+      makeResourceEvent({ url: ITEMS_PATH, startTime: BASE_TIME + 500, transferSize: 64 }),
+    ];
+
+    const groups = aggregateRequests(events);
+    const withBytes = groups.filter((group) => group.transferredBytes !== undefined);
+
+    expect(groups).toHaveLength(2);
+    expect(withBytes).toHaveLength(1);
+    expect(elementAt(withBytes, 0, 'the joined group').transferredBytes).toBe(64);
+  });
+
+  it('prefers the entry whose initiator type matches the request transport', () => {
+    // A page that preloads a URL and then fetches it produces two entries for
+    // one URL in one window. The fetch's own entry is the one that describes
+    // the request; the preload's is a different load of the same resource.
+    const requestKey = opaqueRequestKey('j7');
+    const fetchEntryId = nextEventId();
+    const group = onlyGroup(
+      aggregateRequests([
+        makeRequestEvent({ requestKey, url: ITEMS_PATH, startTime: BASE_TIME, duration: 20 }),
+        makeResourceEvent({
+          url: ITEMS_PATH,
+          startTime: BASE_TIME,
+          transferSize: 10,
+          initiatorType: 'link',
+        }),
+        makeResourceEvent({
+          id: fetchEntryId,
+          url: ITEMS_PATH,
+          startTime: BASE_TIME + 5,
+          transferSize: 2048,
+          initiatorType: 'fetch',
+        }),
+      ]),
+    );
+
+    // Chosen despite starting further from the request: the transport match
+    // outranks proximity.
+    expect(group.transferredBytes).toBe(2048);
+    expect(group.transferEventIds).toStrictEqual([fetchEntryId]);
+  });
+
+  it('leaves a lone entry unclaimed when its transport contradicts the request', () => {
+    // The same collision with the fetch's own entry missing — a cross-origin
+    // response, a service worker that answered from a cache, a buffer that had
+    // already rolled over. All that is left is the preload's entry: the same
+    // URL, inside the window, and demonstrably a *different* load, because a
+    // fetch is never attributed to `link`.
+    //
+    // Nothing here is a matter of degree. Taking it as a last resort would put
+    // the preload's byte count on the fetch's row and into
+    // `transferred_bytes`, where it reads as a measurement of this request;
+    // declining leaves the column empty, which AAP 0.6.6 provides for and a
+    // developer can act on. The group survives either way — this only decides
+    // whether it carries a number that is about something else.
+    const requestKey = opaqueRequestKey('j7b');
+    const group = onlyGroup(
+      aggregateRequests([
+        makeRequestEvent({ requestKey, url: ITEMS_PATH, startTime: BASE_TIME, duration: 20 }),
+        makeResourceEvent({
+          url: ITEMS_PATH,
+          startTime: BASE_TIME,
+          transferSize: 10,
+          initiatorType: 'link',
+        }),
+      ]),
+    );
+
+    expect(group.transferredBytes).toBeUndefined();
+    expect(Object.hasOwn(group, 'transferEventIds')).toBe(false);
+    // Still one request, counted and timed: only the byte claim was refused.
+    expect(group.count).toBe(1);
+  });
+
+  it('claims an entry that names no transport, which most hosts do not', () => {
+    // The boundary the case above is drawn against. An absent `initiatorType`
+    // — a shimmed host, a redirect chain, a service-worker response — is not
+    // evidence of a different load, so identity and timing still decide, as
+    // they did before any transport was consulted.
+    const entryId = nextEventId();
+    const requestKey = opaqueRequestKey('j7c');
+    const group = onlyGroup(
+      aggregateRequests([
+        makeRequestEvent({ requestKey, url: ITEMS_PATH, startTime: BASE_TIME, duration: 20 }),
+        makeResourceEvent({ id: entryId, url: ITEMS_PATH, startTime: BASE_TIME, transferSize: 10 }),
+      ]),
+    );
+
+    expect(group.transferredBytes).toBe(10);
+    expect(group.transferEventIds).toStrictEqual([entryId]);
+  });
+
+  it('ignores an entry whose bytes the host did not expose, and a paint mark', () => {
+    const requestKey = opaqueRequestKey('j8');
+    const group = onlyGroup(
+      aggregateRequests([
+        makeRequestEvent({ requestKey, url: ITEMS_PATH }),
+        // A cross-origin response without `Timing-Allow-Origin`: the zero is
+        // the specification's "not exposed", not a measurement.
+        makeResourceEvent({ url: ITEMS_PATH, transferSize: 0, transferSizeExposed: false }),
+        // A paint mark carrying a size it has no business carrying.
+        makeResourceEvent({
+          url: ITEMS_PATH,
+          entryType: PAINT_ENTRY_TYPE,
+          transferSize: 5000,
+          transferSizeExposed: true,
+        }),
+      ]),
+    );
+
+    expect(group.transferredBytes).toBeUndefined();
+    expect(Object.hasOwn(group, 'transferEventIds')).toBe(false);
+  });
+
+  it('keeps the request’s own exposed size authoritative, and still records the claim', () => {
+    // The page's own account of its own request wins; the entry is claimed all
+    // the same, because `./summary.ts` adds the entries nobody claimed and
+    // this response has already been counted.
+    const requestKey = opaqueRequestKey('j9');
+    const entry = makeResourceEvent({
+      url: ITEMS_PATH,
+      transferSize: 4000,
+      transferSizeExposed: true,
+    });
+    const group = onlyGroup(
+      aggregateRequests([
+        makeRequestEvent({ requestKey, url: ITEMS_PATH, transferSize: 1234 }),
+        entry,
+      ]),
+    );
+    const occurrence = occurrenceAt(group, 0);
+
+    expect(occurrence.transferredBytes).toBe(1234);
+    expect(occurrence.transferSource).toBe('request');
+    expect(occurrence.transferEventId).toBe(entry.id);
+    expect(group.transferredBytes).toBe(1234);
+    expect(group.transferEventIds).toStrictEqual([entry.id]);
+  });
+
+  it('sums a group’s joined occurrences and lists every claim, ascending', () => {
+    const requestKey = opaqueRequestKey('ja');
+    const events = [
+      makeRequestEvent({ requestKey, url: ITEMS_PATH, startTime: BASE_TIME, duration: 4 }),
+      makeRequestEvent({ requestKey, url: ITEMS_PATH, startTime: BASE_TIME + 9, duration: 4 }),
+      makeResourceEvent({ url: ITEMS_PATH, startTime: BASE_TIME, transferSize: 300 }),
+      makeResourceEvent({ url: ITEMS_PATH, startTime: BASE_TIME + 9, transferSize: 45 }),
+    ];
+
+    const group = onlyGroup(aggregateRequests(events));
+    const claims = [...(group.transferEventIds ?? [])];
+
+    expect(group.count).toBe(2);
+    expect(group.duplicateCount).toBe(1);
+    expect(group.transferredBytes).toBe(345);
+    expect(claims).toHaveLength(2);
+    expect(claims).toStrictEqual([...claims].sort());
+  });
+
+  it('pairs identically however the events arrive', () => {
+    const events = [
+      makeRequestEvent({
+        requestKey: opaqueRequestKey('jb1'),
+        url: MASKED_ITEMS_URL,
+        startTime: BASE_TIME,
+        duration: 6,
+      }),
+      makeRequestEvent({
+        requestKey: opaqueRequestKey('jb2'),
+        url: MASKED_ITEMS_URL,
+        startTime: BASE_TIME + 20,
+        duration: 6,
+      }),
+      makeResourceEvent({ url: MASKED_ITEMS_URL, startTime: BASE_TIME, transferSize: 11 }),
+      makeResourceEvent({ url: MASKED_ITEMS_URL, startTime: BASE_TIME + 20, transferSize: 22 }),
+      makeResourceEvent({ url: THINGS_PATH, startTime: BASE_TIME + 1, transferSize: 33 }),
+    ];
+
+    // The join runs over occurrences in canonical order, so the pairing is a
+    // function of the events and not of their arrival order — the property the
+    // service's paging depends on for every aggregate.
+    expect(aggregateRequests([...events].reverse())).toStrictEqual(aggregateRequests(events));
+  });
+
+  it('does not mutate the resource entries it reads', () => {
+    const entry = makeResourceEvent({ url: ITEMS_PATH, transferSize: 77 });
+    const before = JSON.parse(JSON.stringify(entry)) as unknown;
+
+    aggregateRequests([
+      makeRequestEvent({ requestKey: opaqueRequestKey('jc'), url: ITEMS_PATH }),
+      entry,
+    ]);
+
+    expect(JSON.parse(JSON.stringify(entry))).toStrictEqual(before);
+  });
+
+  it('survives a resource entry whose every attribute is hostile', () => {
+    const entry = makeResourceEvent({ url: ITEMS_PATH, transferSize: 88 });
+    for (const key of [
+      ENTRY_TYPE_ATTRIBUTE,
+      URL_ATTRIBUTE,
+      TRANSFER_SIZE_ATTRIBUTE,
+      TRANSFER_SIZE_EXPOSED_ATTRIBUTE,
+      INITIATOR_TYPE_ATTRIBUTE,
+    ]) {
+      Object.defineProperty(entry.attributes, key, {
+        configurable: true,
+        enumerable: true,
+        get(): never {
+          throw new Error(`the "${key}" attribute is hostile by design`);
+        },
+      });
+    }
+
+    const group = onlyGroup(
+      aggregateRequests([
+        makeRequestEvent({ requestKey: opaqueRequestKey('jd'), url: ITEMS_PATH }),
+        entry,
+      ]),
+    );
+
+    expect(group.count).toBe(1);
+    expect(group.transferredBytes).toBeUndefined();
+  });
+});
+
+describe('readExposedTransferSize', () => {
+  it('takes a reading the producer says was exposed, zero included', () => {
+    // A same-origin response served from cache transferred nothing, and that
+    // is an observation rather than a gap.
+    expect(
+      readExposedTransferSize(makeResourceEvent({ transferSize: 0, transferSizeExposed: true })),
+    ).toBe(0);
+    expect(
+      readExposedTransferSize(makeResourceEvent({ transferSize: 950, transferSizeExposed: true })),
+    ).toBe(950);
+  });
+
+  it('refuses a reading the producer says was not exposed, however large', () => {
+    // An explicit `false` is decisive: whatever number sits beside it is the
+    // host's placeholder, not a measurement.
+    expect(
+      readExposedTransferSize(makeResourceEvent({ transferSize: 0, transferSizeExposed: false })),
+    ).toBeUndefined();
+    expect(
+      readExposedTransferSize(makeResourceEvent({ transferSize: 700, transferSizeExposed: false })),
+    ).toBeUndefined();
+  });
+
+  it('accepts a positive number and refuses a bare zero when the producer said nothing', () => {
+    // The legacy case. A positive figure is still evidence; a zero with no
+    // verdict cannot be told from a withheld count, so the metric must be able
+    // to report `n/a` rather than claim a measurement (AAP 0.6.6, 0.8.4).
+    expect(readExposedTransferSize(makeResourceEvent({ transferSize: 42 }))).toBe(42);
+    expect(readExposedTransferSize(makeResourceEvent({ transferSize: 0 }))).toBeUndefined();
+  });
+
+  it('refuses anything that is not a usable number', () => {
+    expect(readExposedTransferSize(makeResourceEvent())).toBeUndefined();
+    expect(
+      readExposedTransferSize(makeResourceEvent({ transferSize: -1, transferSizeExposed: true })),
+    ).toBeUndefined();
+    expect(
+      readExposedTransferSize(
+        makeRequestEvent({ extraAttributes: { [TRANSFER_SIZE_ATTRIBUTE]: 'a lot' } }),
+      ),
+    ).toBeUndefined();
+  });
+});
+
+describe('the resource-timing contract', () => {
+  it('spells the two invented attribute keys exactly as the producers write them', () => {
+    // Neither key is in `../schema/attributes.ts` yet, so the producer and the
+    // consumer each spell it once: `../browser/fetch.ts` writes
+    // `resourceTimingUrl` and `../browser/perf.ts` writes
+    // `transferSizeExposed`. Pinning the literals here is what makes a
+    // one-sided rename a test failure instead of a column that silently stops
+    // populating. When the catalog adopts them, these assertions become a
+    // check that the constants follow it.
+    expect(RESOURCE_TIMING_URL_ATTRIBUTE).toBe('resourceTimingUrl');
+    expect(TRANSFER_SIZE_EXPOSED_ATTRIBUTE).toBe('transferSizeExposed');
+    // Both are producer-supplied, so neither may be mistaken for a
+    // service-assigned key that redaction exempts from masking.
+    for (const key of [RESOURCE_TIMING_URL_ATTRIBUTE, TRANSFER_SIZE_EXPOSED_ATTRIBUTE]) {
+      expect(SERVICE_ASSIGNED_ATTRIBUTE_KEYS).not.toContain(key);
+    }
+  });
+
+  it('exports the tolerance the no-options path applies', () => {
+    expect(Number.isFinite(DEFAULT_RESOURCE_TIMING_TOLERANCE_MS)).toBe(true);
+    expect(DEFAULT_RESOURCE_TIMING_TOLERANCE_MS).toBeGreaterThan(0);
+
+    const events = [
+      makeRequestEvent({ requestKey: opaqueRequestKey('n1'), url: ITEMS_PATH }),
+      makeResourceEvent({ url: ITEMS_PATH, transferSize: 64 }),
+    ];
+
+    expect(aggregateRequests(events)).toStrictEqual(
+      aggregateRequests(events, {
+        resourceTimingToleranceMs: DEFAULT_RESOURCE_TIMING_TOLERANCE_MS,
+      }),
+    );
+  });
+
+  it('falls back to the default tolerance for an unusable option', () => {
+    const events = [
+      makeRequestEvent({ requestKey: opaqueRequestKey('n2'), url: ITEMS_PATH }),
+      makeResourceEvent({ url: ITEMS_PATH, transferSize: 64 }),
+    ];
+    const expected = aggregateRequests(events);
+
+    for (const resourceTimingToleranceMs of [-1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(aggregateRequests(events, { resourceTimingToleranceMs })).toStrictEqual(expected);
+    }
+  });
+
+  it('publishes the transfer sources as a frozen, duplicate-free vocabulary', () => {
+    expect(Object.isFrozen(REQUEST_TRANSFER_SOURCES)).toBe(true);
+    expect(new Set(REQUEST_TRANSFER_SOURCES).size).toBe(REQUEST_TRANSFER_SOURCES.length);
+    expect(REQUEST_TRANSFER_SOURCES).toContain('request');
+    expect(REQUEST_TRANSFER_SOURCES).toContain('resource-timing');
+  });
+
+  it('names the resource entry type the join and the summary both test for', () => {
+    expect(RESOURCE_ENTRY_TYPE).toBe('resource');
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The committed capture fixture
+ *
+ * `packages/telemetry/test/fixtures/capture-batch.json` is this package's
+ * curated, already-redacted capture: thirty persisted events of eleven kinds,
+ * one trace, one capture window and two producers, spanning the browser, server
+ * and database tiers. It is repository data rather than captured telemetry —
+ * hand-authored and reviewed, with every URL query value already masked, which
+ * is the only form a sample may be committed in (AAP 0.5.2, and the fixture
+ * carve-out of 0.3.4's never-committed list) — and it is deterministic, which
+ * is what makes the exact assertions below legitimate rather than brittle.
+ *
+ * What driving the module from it adds to the inline cases above:
+ *
+ * - **The fixture is a contract, so it is validated as one.** Every element is
+ *   parsed through the persisted schema of `../schema/event.ts` before a single
+ *   assertion runs — the same gate the store applies to a row it reads back.
+ *   Without that parse, a fixture that had drifted out of the persisted shape
+ *   would sit in the tree proving nothing.
+ * - **The decisive grouping case arrives as data rather than as a
+ *   construction.** Two `/api/items/detail` fetches whose redacted URLs are
+ *   byte-identical carry *different* keys, because their query values differed
+ *   before redaction; four `/api/summary` fetches inside twenty-two
+ *   milliseconds carry *one*. Both halves of AAP 0.5.2's sentence therefore
+ *   hold on a sample shaped like what ingest produces, and not only on events
+ *   this file assembled to make the point.
+ * - **It is a whole capture.** Twenty-three of the thirty events are not
+ *   request-shaped — an interaction, renders and commits, route handlers and
+ *   server functions, database queries, state transitions, a long task, an
+ *   error, and the two `http.server` spans that answered two of the fetches and
+ *   carry the same `request_key` — so "reports on the request kinds only" is
+ *   exercised against a realistic mixture instead of a swept list of kinds.
+ *
+ * ## How the file is reached
+ *
+ * `fileURLToPath` first, then `join` — never
+ * `new URL('../../test/fixtures/capture-batch.json', import.meta.url)`. The
+ * `telemetry` Vitest project runs under happy-dom, whose global `URL` resolves
+ * a relative specifier against the document's `http://localhost` origin instead
+ * of the `file:` base it was handed, so the tidier one-liner (the form this
+ * package's `tsconfig.json` notes suggest) throws `The URL must be of scheme
+ * file` here. `../redaction/rules.test.ts` records the same resolution for the
+ * same reason.
+ *
+ * The file is read, never `import`ed: the package pins `rootDir` to `src` and
+ * leaves `test/**` outside the program, and a JSON import would hand this suite
+ * an `any`-shaped literal typed by the fixture rather than by the schema — the
+ * trap that same tsconfig note describes. It is read once at module scope, and
+ * every case takes a `structuredClone` of the parsed events, so no case can
+ * observe another's mutation and the purity guarantee asserted above holds here
+ * too.
+ * ---------------------------------------------------------------------------
+ */
+
+/** This package's committed fixture directory, `test/fixtures`. */
+const FIXTURES_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'test', 'fixtures');
+
+/** The persisted capture this section is driven from. */
+const CAPTURE_BATCH_FIXTURE_PATH = join(FIXTURES_DIR, 'capture-batch.json');
+
+/**
+ * The committed capture, parsed and validated element by element.
+ *
+ * A failure names the element's index and the schema issues by path and code
+ * only — never a value — which is the discipline `../schema/event.ts`'s own
+ * rejection helper follows, and which keeps a fixture value out of a test log
+ * even for a sample that carries nothing sensitive.
+ *
+ * @returns Every event of the fixture, in the order the file holds them.
+ */
+function readCaptureBatchFixture(): readonly TelemetryEvent[] {
+  const parsed: unknown = JSON.parse(readFileSync(CAPTURE_BATCH_FIXTURE_PATH, 'utf8'));
+
+  if (!Array.isArray(parsed)) {
+    throw new Error(`${CAPTURE_BATCH_FIXTURE_PATH} must hold an array of persisted events`);
+  }
+
+  return parsed.map((candidate: unknown, index): TelemetryEvent => {
+    const result = telemetryEventSchema.safeParse(candidate);
+
+    if (!result.success) {
+      const issues = result.error.issues
+        .map((issue) => `${issue.path.join('.')}: ${issue.code}`)
+        .join('; ');
+      throw new Error(
+        `capture-batch.json[${String(index)}] is not a persisted telemetry event (${issues})`,
+      );
+    }
+
+    return result.data;
+  });
+}
+
+/** @see readCaptureBatchFixture */
+const CAPTURE_BATCH_EVENTS: readonly TelemetryEvent[] = readCaptureBatchFixture();
+
+/** A fresh copy of the committed capture, so no case shares state with another. */
+function captureBatchEvents(): readonly TelemetryEvent[] {
+  return structuredClone(CAPTURE_BATCH_EVENTS);
+}
+
+/*
+ * The fixture's own facts, stated here so that an edit to the JSON file fails
+ * in this suite with a readable diff instead of quietly changing what the cases
+ * below measure. They are counts and identifiers only: every request key is
+ * read off the parsed event (see the header's note on key literals).
+ */
+
+/** Events the committed capture holds, all told. */
+const FIXTURE_EVENT_COUNT = 30;
+
+/** Of those, the ones whose kind is a request kind — the aggregate's input. */
+const FIXTURE_REQUEST_EVENT_COUNT = 7;
+
+/** The rest, which must reach the aggregate and leave no trace in its output. */
+const FIXTURE_IGNORED_EVENT_COUNT = FIXTURE_EVENT_COUNT - FIXTURE_REQUEST_EVENT_COUNT;
+
+/** Ignored events that nevertheless carry a `request_key`: the server's spans. */
+const FIXTURE_KEYED_SERVER_SPAN_COUNT = 2;
+
+/** Distinct request keys in the capture, and therefore groups in the result. */
+const FIXTURE_REQUEST_GROUP_COUNT = 4;
+
+/** Redundant occurrences the whole capture holds: the burst's three. */
+const FIXTURE_REDUNDANT_REQUEST_COUNT = 3;
+
+/** The fetch that was issued once, and that the server also spanned. */
+const FIXTURE_ITEMS_FETCH_ID = 'evt_j3n7p1r5v9x3c7fk';
+
+/** The four byte-identical fetches of the burst, in the order they were issued. */
+const FIXTURE_BURST_FETCH_IDS = [
+  'evt_r9w3y7b1g5h9k3ns',
+  'evt_s0x4z8c2h6j0m4pt',
+  'evt_t1y5b9d3j7k1n5qv',
+  'evt_w3b7d1g5m9n3q7sx',
+] as const;
+
+/** The two fetches whose query values differed before redaction masked them. */
+const FIXTURE_DETAIL_FETCH_IDS = ['evt_k4q8s2v6z0b4f8gm', 'evt_m5r9t3w7b1c5g9hn'] as const;
+
+/** The origin every request in the capture was issued against. */
+const FIXTURE_ORIGIN = 'http://localhost:3000';
+
+/** The path the burst was issued against. */
+const FIXTURE_BURST_PATH = '/api/summary';
+
+/** The path of the single request the server also spanned. */
+const FIXTURE_ITEMS_PATH = '/api/items';
+
+/** The path both differently parameterised fetches share. */
+const FIXTURE_DETAIL_PATH = '/api/items/detail';
+
+/** The redacted URL every occurrence of the burst carries, values already masked. */
+const FIXTURE_BURST_URL = `${FIXTURE_ORIGIN}${FIXTURE_BURST_PATH}?groupId=?&window=?`;
+
+/** The redacted URL of the request the server also spanned. */
+const FIXTURE_ITEMS_URL = `${FIXTURE_ORIGIN}${FIXTURE_ITEMS_PATH}?filter=?&page=?`;
+
+/** The redacted URL both detail fetches carry, byte for byte. */
+const FIXTURE_DETAIL_URL = `${FIXTURE_ORIGIN}${FIXTURE_DETAIL_PATH}?itemId=?`;
+
+/** The hook that issued the first half of the burst, and the items fetch. */
+const FIXTURE_HOOK_INITIATOR = 'fetchItemList';
+
+/** The component that issued the second half of the burst. */
+const FIXTURE_COMPONENT_INITIATOR = 'WidgetPanel';
+
+/** The component that issued both detail fetches. */
+const FIXTURE_DETAIL_INITIATOR = 'ItemRow';
+
+/** The interaction span every fetch of the capture is a child of. */
+const FIXTURE_INTERACTION_SPAN_ID = 'd1a83f5c27e90b46';
+
+/** The event the fixture identifies as `id`, or a failure naming the absent id. */
+function fixtureEvent(events: readonly TelemetryEvent[], id: string): TelemetryEvent {
+  const found = events.find((event) => event.id === id);
+  if (found === undefined) {
+    throw new Error(`the committed capture holds no event "${id}"`);
+  }
+  return found;
+}
+
+/**
+ * The service-assigned key an event carries, narrowed from its attribute bag.
+ *
+ * The bag is `Record<string, unknown>` by schema, so the narrowing is real work
+ * rather than a cast: a fixture that lost its key, or gained a key of the wrong
+ * type, names itself here instead of silently sending an event into the
+ * `method-path` fallback and changing the group count.
+ */
+function fixtureRequestKey(event: TelemetryEvent): string {
+  const key = event.attributes[REQUEST_KEY_ATTRIBUTE];
+  if (typeof key !== 'string' || key.length === 0) {
+    throw new Error(`event "${event.id}" carries no ${REQUEST_KEY_ATTRIBUTE} attribute`);
+  }
+  return key;
+}
+
+/** The group formed from `requestKey`, or a failure naming the ids the result has. */
+function groupForRequestKey(groups: readonly RequestGroup[], requestKey: string): RequestGroup {
+  const found = groups.find((group) => group.requestKey === requestKey);
+  if (found === undefined) {
+    throw new Error(
+      `no group was formed from that request key; the result holds ${String(groups.length)}: ${groups
+        .map((group) => group.id)
+        .join(', ')}`,
+    );
+  }
+  return found;
+}
+
+/** The consecutive differences of `values`, in the order they were given. */
+function consecutiveGaps(values: readonly number[]): number[] {
+  return values
+    .slice(1)
+    .map((value, index) => value - elementAt(values, index, 'a preceding start time'));
+}
+
+describe('the committed capture fixture', () => {
+  it('reads one whole capture from disk and the persisted schema accepts every event', () => {
+    expect(CAPTURE_BATCH_EVENTS).toHaveLength(FIXTURE_EVENT_COUNT);
+    expect(CAPTURE_BATCH_EVENTS.every((event) => isTelemetryEvent(event))).toBe(true);
+    // One trace, one capture and one session: the aggregate is handed a single
+    // capture window, which is what `POST /sessions/:id/panel-data` asks it for.
+    expect(new Set(CAPTURE_BATCH_EVENTS.map((event) => event.traceId)).size).toBe(1);
+    expect(new Set(CAPTURE_BATCH_EVENTS.map((event) => event.captureId)).size).toBe(1);
+    expect(new Set(CAPTURE_BATCH_EVENTS.map((event) => event.sessionId)).size).toBe(1);
+    // Store-assigned arrival numbers, contiguous and one-based, so the file
+    // really is a capture in arrival order rather than a bag of events.
+    expect(CAPTURE_BATCH_EVENTS.map((event) => event.ingestSeq)).toStrictEqual(
+      Array.from({ length: FIXTURE_EVENT_COUNT }, (_unused, index) => index + 1),
+    );
+    // A clone per case, and the clone is a faithful copy.
+    expect(captureBatchEvents()).toStrictEqual(CAPTURE_BATCH_EVENTS);
+    expect(captureBatchEvents()).not.toBe(CAPTURE_BATCH_EVENTS);
+  });
+
+  it('holds seven request events among twenty-three the aggregate must ignore', () => {
+    const events = captureBatchEvents();
+    const requestEvents = events.filter((event) => REQUEST_KINDS.includes(event.kind));
+    const ignoredEvents = events.filter((event) => !REQUEST_KINDS.includes(event.kind));
+    const keyedServerSpans = ignoredEvents.filter(
+      (event) => typeof event.attributes[REQUEST_KEY_ATTRIBUTE] === 'string',
+    );
+
+    expect(requestEvents).toHaveLength(FIXTURE_REQUEST_EVENT_COUNT);
+    expect(ignoredEvents).toHaveLength(FIXTURE_IGNORED_EVENT_COUNT);
+    expect(keyedServerSpans).toHaveLength(FIXTURE_KEYED_SERVER_SPAN_COUNT);
+    // Every request event populates the five attributes the aggregate reads,
+    // so a case that observes a missing field below is observing the module's
+    // behaviour and not a gap in the fixture.
+    for (const event of requestEvents) {
+      expect(typeof event.attributes[METHOD_ATTRIBUTE]).toBe('string');
+      expect(typeof event.attributes[URL_ATTRIBUTE]).toBe('string');
+      expect(typeof event.attributes[STATUS_CODE_ATTRIBUTE]).toBe('number');
+      expect(typeof event.attributes[INITIATOR_ATTRIBUTE]).toBe('string');
+      expect(fixtureRequestKey(event)).toMatch(/^[0-9a-f]+$/);
+      expect(fixtureRequestKey(event)).toHaveLength(REQUEST_KEY_HEX_LENGTH);
+      // The sample is committed already redacted: the URL was masked and the
+      // key was exempted, which is exactly why grouping still works on it
+      // (AAP 0.5.2, `../redaction/redactor.ts`).
+      expect(event.redacted).toStrictEqual([URL_ATTRIBUTE]);
+      expect(event.redacted).not.toContain(REQUEST_KEY_ATTRIBUTE);
+    }
+  });
+
+  it('carries the byte-identical burst and the parameterised pair as data', () => {
+    const events = captureBatchEvents();
+    const burst = FIXTURE_BURST_FETCH_IDS.map((id) => fixtureEvent(events, id));
+    const detail = FIXTURE_DETAIL_FETCH_IDS.map((id) => fixtureEvent(events, id));
+
+    // Four issues of one request: identical URLs, one key, and start times in
+    // the order the id list states, so every expectation below can be written
+    // against that order.
+    expect(burst.map((event) => event.attributes[URL_ATTRIBUTE])).toStrictEqual(
+      Array.from(FIXTURE_BURST_FETCH_IDS, () => FIXTURE_BURST_URL),
+    );
+    expect(new Set(burst.map(fixtureRequestKey)).size).toBe(1);
+    expect(consecutiveGaps(burst.map((event) => event.startTime)).every((gap) => gap > 0)).toBe(
+      true,
+    );
+
+    // Two unrelated requests that redaction made indistinguishable: same URL,
+    // different keys. This is the pair whose separation only the pre-redaction
+    // key can produce.
+    expect(detail.map((event) => event.attributes[URL_ATTRIBUTE])).toStrictEqual([
+      FIXTURE_DETAIL_URL,
+      FIXTURE_DETAIL_URL,
+    ]);
+    expect(new Set(detail.map(fixtureRequestKey)).size).toBe(2);
+    expect(new Set([...burst, ...detail].map(fixtureRequestKey)).size).toBe(3);
+  });
+});
+
+describe('aggregateRequests over the committed capture fixture', () => {
+  it('reports one group per distinct request key, in the documented base order', () => {
+    const events = captureBatchEvents();
+    const burstKey = fixtureRequestKey(
+      fixtureEvent(events, elementAt(FIXTURE_BURST_FETCH_IDS, 0, 'the first burst fetch')),
+    );
+    const itemsKey = fixtureRequestKey(fixtureEvent(events, FIXTURE_ITEMS_FETCH_ID));
+    const detailKeys = FIXTURE_DETAIL_FETCH_IDS.map((id) =>
+      fixtureRequestKey(fixtureEvent(events, id)),
+    );
+
+    const groups = aggregateRequests(events);
+
+    // Pinned, so an edit to the fixture surfaces here rather than as a changed
+    // metric in a panel nobody is looking at.
+    expect(groups).toHaveLength(FIXTURE_REQUEST_GROUP_COUNT);
+    expect(groups.map((group) => group.groupedBy)).toStrictEqual(
+      Array.from(groups, () => BY_REQUEST_KEY),
+    );
+    // Redundancy first, then frequency, then total time: the burst leads, the
+    // three singletons follow in descending duration.
+    expect(groups.map((group) => group.requestKey)).toStrictEqual([
+      burstKey,
+      itemsKey,
+      ...detailKeys,
+    ]);
+    expect(groups.map((group) => group.count)).toStrictEqual([4, 1, 1, 1]);
+    expect(groups.map((group) => group.duplicateCount)).toStrictEqual([3, 0, 0, 0]);
+    expect(groups.map((group) => group.totalDurationMs)).toStrictEqual([
+      689.547, 1112.65, 96.4, 88.1,
+    ]);
+    expect(groups.map((group) => group.method)).toStrictEqual(Array.from(groups, () => GET_METHOD));
+    expect(groups.map((group) => group.url)).toStrictEqual([
+      FIXTURE_BURST_URL,
+      FIXTURE_ITEMS_URL,
+      FIXTURE_DETAIL_URL,
+      FIXTURE_DETAIL_URL,
+    ]);
+    expect(groups.map((group) => group.path)).toStrictEqual([
+      FIXTURE_BURST_PATH,
+      FIXTURE_ITEMS_PATH,
+      FIXTURE_DETAIL_PATH,
+      FIXTURE_DETAIL_PATH,
+    ]);
+    // Every request event is accounted for exactly once, and every group id is
+    // distinct even where two groups agree on every displayed field.
+    expect(totalCount(groups)).toBe(FIXTURE_REQUEST_EVENT_COUNT);
+    expect(new Set(groups.map((group) => group.id)).size).toBe(FIXTURE_REQUEST_GROUP_COUNT);
+  });
+
+  it('keeps the two differently parameterised detail fetches in separate groups', () => {
+    // THE DECISIVE CASE, driven by the fixture. The two events display the same
+    // masked URL and were issued 12.5 ms apart - well inside the default
+    // window - so nothing except the pre-redaction key can keep them apart. A
+    // module that grouped on the URL would return one group of two here and
+    // badge two unrelated requests as duplicates of each other.
+    const events = captureBatchEvents();
+    const detail = FIXTURE_DETAIL_FETCH_IDS.map((id) => fixtureEvent(events, id));
+    const first = elementAt(detail, 0, 'the first detail fetch');
+    const second = elementAt(detail, 1, 'the second detail fetch');
+
+    expect(second.startTime - first.startTime).toBeLessThan(DEFAULT_DUPLICATE_WINDOW_MS);
+
+    const groups = aggregateRequests(events);
+    const firstGroup = groupForRequestKey(groups, fixtureRequestKey(first));
+    const secondGroup = groupForRequestKey(groups, fixtureRequestKey(second));
+
+    expect(firstGroup.id).not.toBe(secondGroup.id);
+    expect([firstGroup.count, secondGroup.count]).toStrictEqual([1, 1]);
+    expect([firstGroup.duplicateCount, secondGroup.duplicateCount]).toStrictEqual([0, 0]);
+    expect([firstGroup.hasDuplicates, secondGroup.hasDuplicates]).toStrictEqual([false, false]);
+    expect(firstGroup.duplicateWindows).toStrictEqual([]);
+    expect(secondGroup.duplicateWindows).toStrictEqual([]);
+    // Identical display, distinct evidence.
+    expect([firstGroup.url, secondGroup.url]).toStrictEqual([
+      FIXTURE_DETAIL_URL,
+      FIXTURE_DETAIL_URL,
+    ]);
+    expect(firstGroup.occurrences.map((occurrence) => occurrence.eventId)).toStrictEqual([
+      first.id,
+    ]);
+    expect(secondGroup.occurrences.map((occurrence) => occurrence.eventId)).toStrictEqual([
+      second.id,
+    ]);
+    expect([firstGroup.initiators, secondGroup.initiators]).toStrictEqual([
+      [FIXTURE_DETAIL_INITIATOR],
+      [FIXTURE_DETAIL_INITIATOR],
+    ]);
+  });
+
+  it('collapses the four identical fetches into one window of three redundant calls', () => {
+    const events = captureBatchEvents();
+    const burst = FIXTURE_BURST_FETCH_IDS.map((id) => fixtureEvent(events, id));
+    const anchor = elementAt(burst, 0, 'the first burst fetch');
+    const last = elementAt(burst, FIXTURE_BURST_FETCH_IDS.length - 1, 'the last burst fetch');
+
+    const group = groupForRequestKey(aggregateRequests(events), fixtureRequestKey(anchor));
+
+    expect(group.count).toBe(4);
+    expect(group.duplicateCount).toBe(3);
+    expect(group.hasDuplicates).toBe(true);
+    expect(group.duplicateWindows).toHaveLength(1);
+
+    const window = windowAt(group, 0);
+
+    // The window bounds issuance - first start to last start - so the product's
+    // worked analysis example ("4 requests to /api/prices occurred within
+    // 22 ms", AAP 0.1.2) reads straight off it. The fixture's own spread is
+    // 21.942 ms, comfortably inside the one-second default window.
+    expect(window.id).toBe(`${group.id}#w0`);
+    expect(window.startTime).toBe(anchor.startTime);
+    expect(window.endTime).toBe(last.startTime);
+    expect(roundMs(window.endTime - window.startTime)).toBe(21.942);
+    expect(window.endTime - window.startTime).toBeLessThan(DEFAULT_DUPLICATE_WINDOW_MS);
+    expect(window.count).toBe(4);
+    expect(window.redundantCount).toBe(3);
+    expect(window.eventIds).toStrictEqual([...FIXTURE_BURST_FETCH_IDS]);
+    // The group's own span agrees with the single window it emitted.
+    expect(group.firstStartTime).toBe(anchor.startTime);
+    expect(group.lastStartTime).toBe(last.startTime);
+  });
+
+  it('splits that window when the duplicate window is narrowed to the burst\u2019s own largest gap', () => {
+    const events = captureBatchEvents();
+    const starts = FIXTURE_BURST_FETCH_IDS.map((id) => fixtureEvent(events, id).startTime);
+    const gaps = consecutiveGaps(starts);
+    // Derived from the fixture's own timestamps rather than stated as a
+    // literal, so a re-timed fixture cannot leave this case asserting against
+    // a spacing the file no longer has.
+    const narrowedWindowMs = Math.max(...gaps);
+    const anchorStart = elementAt(starts, 0, 'the first burst start time');
+    const secondStart = elementAt(starts, 1, 'the second burst start time');
+    const thirdStart = elementAt(starts, 2, 'the third burst start time');
+    const lastStart = elementAt(starts, 3, 'the last burst start time');
+
+    // The preconditions that make the split meaningful, asserted so that a
+    // fixture edit reports which of them stopped holding: every neighbour is
+    // still within one narrowed window of its predecessor, the narrowed window
+    // is shorter than the burst's total spread, and the first cluster's anchor
+    // cannot reach the third occurrence.
+    expect(gaps).toHaveLength(3);
+    expect(gaps.every((gap) => gap <= narrowedWindowMs)).toBe(true);
+    expect(narrowedWindowMs).toBeLessThan(lastStart - anchorStart);
+    expect(thirdStart - anchorStart).toBeGreaterThan(narrowedWindowMs);
+
+    const narrowed = aggregateRequests(events, { duplicateWindowMs: narrowedWindowMs });
+    const group = groupForRequestKey(
+      narrowed,
+      fixtureRequestKey(
+        fixtureEvent(events, elementAt(FIXTURE_BURST_FETCH_IDS, 0, 'the first burst fetch')),
+      ),
+    );
+
+    // Two pairs rather than one burst of four: the analysis stage can ask for a
+    // stricter reading of the same capture, and the count of *occurrences* is
+    // untouched by it.
+    expect(group.count).toBe(4);
+    expect(group.duplicateWindows).toHaveLength(2);
+    expect(
+      group.duplicateWindows.map((duplicateWindow) => [
+        duplicateWindow.startTime,
+        duplicateWindow.endTime,
+      ]),
+    ).toStrictEqual([
+      [anchorStart, secondStart],
+      [thirdStart, lastStart],
+    ]);
+    expect(group.duplicateWindows.map((duplicateWindow) => duplicateWindow.count)).toStrictEqual([
+      2, 2,
+    ]);
+    expect(
+      group.duplicateWindows.map((duplicateWindow) => duplicateWindow.redundantCount),
+    ).toStrictEqual([1, 1]);
+    expect(group.duplicateWindows.map((duplicateWindow) => duplicateWindow.eventIds)).toStrictEqual(
+      [FIXTURE_BURST_FETCH_IDS.slice(0, 2), FIXTURE_BURST_FETCH_IDS.slice(2)],
+    );
+    expect(group.duplicateWindows.map((duplicateWindow) => duplicateWindow.id)).toStrictEqual([
+      `${group.id}#w0`,
+      `${group.id}#w1`,
+    ]);
+    expect(group.duplicateCount).toBe(2);
+    expect(countDuplicateRequests(narrowed)).toBe(2);
+  });
+
+  it('describes every occurrence of the burst, in issue order, with its own evidence', () => {
+    const events = captureBatchEvents();
+    const burst = FIXTURE_BURST_FETCH_IDS.map((id) => fixtureEvent(events, id));
+    const anchor = elementAt(burst, 0, 'the first burst fetch');
+
+    const group = groupForRequestKey(aggregateRequests(events), fixtureRequestKey(anchor));
+
+    expect(group.occurrences).toHaveLength(4);
+    expect(group.occurrencesTruncated).toBe(false);
+    expect(group.occurrences.map((occurrence) => occurrence.eventId)).toStrictEqual([
+      ...FIXTURE_BURST_FETCH_IDS,
+    ]);
+    expect(group.occurrences.map((occurrence) => occurrence.startTime)).toStrictEqual(
+      burst.map((event) => event.startTime),
+    );
+    expect(group.occurrences.map((occurrence) => occurrence.durationMs)).toStrictEqual([
+      672.4, 6.418, 5.822, 4.907,
+    ]);
+    // The initiator set is the finding: the first two issues came from a hook,
+    // the last two from the component that consumes it, which is a different
+    // fix from one caller firing four times (AAP 0.8.2).
+    expect(group.occurrences.map((occurrence) => occurrence.initiator)).toStrictEqual([
+      FIXTURE_HOOK_INITIATOR,
+      FIXTURE_HOOK_INITIATOR,
+      FIXTURE_COMPONENT_INITIATOR,
+      FIXTURE_COMPONENT_INITIATOR,
+    ]);
+    // Code-unit order, and both labels kept: 'WidgetPanel' before
+    // 'fetchItemList' because upper case sorts first.
+    expect(group.initiators).toStrictEqual([FIXTURE_COMPONENT_INITIATOR, FIXTURE_HOOK_INITIATOR]);
+    expect(group.occurrences.map((occurrence) => occurrence.status)).toStrictEqual(
+      Array.from(group.occurrences, () => OK_STATUS),
+    );
+    expect(group.occurrences.map((occurrence) => occurrence.statusCode)).toStrictEqual([
+      200, 200, 200, 200,
+    ]);
+    expect(group.statusCodes).toStrictEqual([200]);
+    expect(group.errorCount).toBe(0);
+    expect(group.occurrences.map((occurrence) => occurrence.kind)).toStrictEqual(
+      Array.from(group.occurrences, () => PRIMARY_REQUEST_KIND),
+    );
+    expect(group.occurrences.map((occurrence) => occurrence.tier)).toStrictEqual(
+      Array.from(group.occurrences, () => firstAllowedTier(PRIMARY_REQUEST_KIND)),
+    );
+    // Each occurrence keeps the location its own initiator resolved to, and the
+    // two resolvers the fixture exercises stay distinguishable, because the
+    // request row expands to a source link per occurrence (AAP 0.6.2).
+    expect(group.occurrences.map((occurrence) => occurrence.source)).toStrictEqual(
+      burst.map((event) => event.source),
+    );
+    expect(group.occurrences.map((occurrence) => occurrence.source?.resolvedBy)).toStrictEqual([
+      'source-map',
+      'source-map',
+      'react-owner',
+      'react-owner',
+    ]);
+    expect(group.occurrences.map((occurrence) => occurrence.source?.symbol)).toStrictEqual([
+      FIXTURE_HOOK_INITIATOR,
+      FIXTURE_HOOK_INITIATOR,
+      FIXTURE_COMPONENT_INITIATOR,
+      FIXTURE_COMPONENT_INITIATOR,
+    ]);
+    // Trace attribution survives per occurrence: one trace, and the
+    // interaction span every fetch of this capture hangs off.
+    expect(group.occurrences.map((occurrence) => occurrence.traceId)).toStrictEqual(
+      burst.map((event) => event.traceId),
+    );
+    expect(group.occurrences.map((occurrence) => occurrence.parentSpanId)).toStrictEqual(
+      Array.from(group.occurrences, () => FIXTURE_INTERACTION_SPAN_ID),
+    );
+    expect(group.occurrences.map((occurrence) => occurrence.spanId)).toStrictEqual(
+      burst.map((event) => event.spanId),
+    );
+    // One value under two names, on a fixture-sourced event as on a built one.
+    expect(group.occurrences.map((occurrence) => occurrence.id)).toStrictEqual(
+      group.occurrences.map((occurrence) => occurrence.eventId),
+    );
+
+    const first = occurrenceAt(group, 0);
+
+    expect(first.endTime).toBe(1_789_812_901_212.518);
+    expect(group.averageDurationMs).toBe(roundMs(group.totalDurationMs / group.count));
+    expect(group.averageDurationMs).toBe(172.387);
+    expect(group.maxDurationMs).toBe(672.4);
+    expect(group.minDurationMs).toBe(4.907);
+  });
+
+  it('ignores every event whose kind is not a request kind, the keyed server spans included', () => {
+    const events = captureBatchEvents();
+    const ignoredEvents = events.filter((event) => !REQUEST_KINDS.includes(event.kind));
+    const keyedServerSpans = ignoredEvents.filter(
+      (event) => typeof event.attributes[REQUEST_KEY_ATTRIBUTE] === 'string',
+    );
+    const itemsFetch = fixtureEvent(events, FIXTURE_ITEMS_FETCH_ID);
+    const burstKey = fixtureRequestKey(
+      fixtureEvent(events, elementAt(FIXTURE_BURST_FETCH_IDS, 0, 'the first burst fetch')),
+    );
+
+    // Twenty-three events - an interaction, renders and commits, route
+    // handlers, server functions, queries, state transitions, a long task, an
+    // error and the two server spans - produce no group at all.
+    expect(ignoredEvents).toHaveLength(FIXTURE_IGNORED_EVENT_COUNT);
+    expect(aggregateRequests(ignoredEvents)).toStrictEqual([]);
+
+    // The two server spans carry the *same* keys as two of the fetches, and are
+    // still not occurrences of them: `requests` is the browser's view of a
+    // request, and the server's half of it is the waterfall's row (AAP 0.6.2).
+    // Were they counted, the items group would report two occurrences and the
+    // burst five, inflating both the `request_count` card and the badge.
+    expect(keyedServerSpans.map(fixtureRequestKey)).toStrictEqual([
+      fixtureRequestKey(itemsFetch),
+      burstKey,
+    ]);
+
+    const groups = aggregateRequests(events);
+    const itemsGroup = groupForRequestKey(groups, fixtureRequestKey(itemsFetch));
+
+    expect(itemsGroup.count).toBe(1);
+    expect(itemsGroup.occurrences.map((occurrence) => occurrence.eventId)).toStrictEqual([
+      itemsFetch.id,
+    ]);
+    expect(itemsGroup.initiators).toStrictEqual([FIXTURE_HOOK_INITIATOR]);
+    expect(itemsGroup.hasDuplicates).toBe(false);
+    expect(groupForRequestKey(groups, burstKey).count).toBe(4);
+    expect(totalCount(groups)).toBe(FIXTURE_REQUEST_EVENT_COUNT);
+  });
+
+  it('publishes three redundant requests for the whole capture', () => {
+    const events = captureBatchEvents();
+
+    const groups = aggregateRequests(events);
+
+    // The `duplicate_request_count` metric card `./summary.ts` publishes for
+    // this capture, and the same arithmetic the request table badges: three
+    // redundant calls, all of them in the one group that repeated.
+    expect(countDuplicateRequests(groups)).toBe(FIXTURE_REDUNDANT_REQUEST_COUNT);
+    expect(countDuplicateRequests(groups)).toBe(totalDuplicateCount(groups));
+    expect(groups.filter((group) => group.hasDuplicates).map((group) => group.count)).toStrictEqual(
+      [4],
+    );
+    expect(
+      groups.flatMap((group) => group.duplicateWindows).map((window) => window.redundantCount),
+    ).toStrictEqual([FIXTURE_REDUNDANT_REQUEST_COUNT]);
   });
 });

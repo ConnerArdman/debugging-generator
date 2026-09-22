@@ -44,6 +44,18 @@ interface Props {
   alt: string;
   /** The one-line answer to "what is missing here". */
   heading: ReactNode;
+  /**
+   * Which element the heading is rendered as. Defaults to `'p'`, which is what every block nested
+   * inside a screen that already declares its own title wants: a paragraph carrying the heading's
+   * type role without adding a level to that screen's outline.
+   *
+   * A screen whose whole content is this block is the other case - the not-found route is one -
+   * and there the visible title is the page's title, so it is passed `'h1'` and becomes a real
+   * heading a reader can navigate to. The level stays the caller's decision because only the
+   * caller knows what the page around the block already declares; this prop only makes that
+   * decision expressible instead of forcing a paragraph on both cases.
+   */
+  headingAs?: 'p' | 'h1' | 'h2' | 'h3';
   /** Optional sentence under the heading: why the list is empty, or what to do about it. */
   children?: ReactNode;
   /**
@@ -69,12 +81,21 @@ export function BlankSlate({
   art,
   alt,
   heading,
+  headingAs = 'p',
   children,
   action,
   tone = 'neutral',
   framed = false,
   className,
 }: Props) {
+  /*
+    The heading's element, held in a capitalised local because a lower-case JSX tag is read as a
+    literal DOM tag name and a capitalised one as a value. The union above is what keeps this safe:
+    every member of it is an intrinsic element React knows, so there is no assertion here and no
+    component type to widen.
+  */
+  const Heading = headingAs;
+
   return (
     <div
       className={clsx(styles.root, className)}
@@ -98,12 +119,15 @@ export function BlankSlate({
         alt={alt}
       />
       {/*
-        A paragraph styled as a heading rather than an h2 or h3, and no prop to choose the level:
-        the right level depends on what the page around the block already declares, and the same
-        block appears at four different depths. A caller that needs it in the document outline
-        wraps it in its own labelled section, which keeps that decision where the context is.
+        A paragraph by default, styled as a heading, with `headingAs` as the opt-in for a real
+        heading level: the right level depends on what the page around the block already declares,
+        and the same block appears at four different depths, so the choice stays with the caller
+        rather than being fixed here. Whichever element turns up, it carries the one `heading`
+        class, and BlankSlate.module.css states that class's margin reset, colour, size, weight and
+        line height outright - a CSS-module class outranks the element rules in app/globals.css, so
+        `headingAs="h1"` renders exactly what the paragraph rendered.
       */}
-      <p className={styles.heading}>{heading}</p>
+      <Heading className={styles.heading}>{heading}</Heading>
       {children === undefined ? null : <p className={styles.body}>{children}</p>}
       {action === undefined ? null : <div className={styles.action}>{action}</div>}
     </div>

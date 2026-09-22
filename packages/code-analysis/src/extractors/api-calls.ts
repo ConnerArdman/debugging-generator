@@ -56,7 +56,13 @@
  *    property access named `fetch` on `window`, `globalThis` or `self`.
  * 2. **`XMLHttpRequest`** — a `new XMLHttpRequest()` construction paired with
  *    the `.open(method, url)` call on the same local binding in the same
- *    enclosing function.
+ *    function **body**. Pairing does not cross into a nested function, where a
+ *    separate body runs at a time of its own and may re-declare the name, and
+ *    it is abandoned unless the name has exactly one binding in that body and
+ *    that binding is the construction's own: a block, `for` head or `catch`
+ *    clause re-declaring it, or an assignment or increment of it, each make a
+ *    later `.open(…)` some other object's. An unpaired construction is still a
+ *    request, with an unknown target.
  * 3. **A client wrapper** — a call whose callee is a property access whose
  *    member name is an HTTP verb *and* whose first argument is a path-like
  *    string or template. The verb-plus-path shape is what a real project's
@@ -92,13 +98,23 @@
  *   remainder. The URL lives in `data.url`, never in the name.
  * - **`symbol` is the enclosing function's name**, and is omitted when the
  *   owner cascade below falls through to the file node.
- * - **A `fetch` always records a method.** A string-literal `method` property
- *   on the second argument wins; otherwise `GET` is recorded, because `GET` is
- *   what the platform API *does* in that case — a documented property of
- *   `fetch`, not a guess. `ApiCallNodeData.method`'s "absent when the call
- *   relies on the default" is honoured for the shape that has no platform
- *   default to state: an XHR whose `open()` method argument is not a literal
- *   records no method at all.
+ * - **Every method recorded is a member of the shared vocabulary.**
+ *   `HTTP_METHOD_NAMES` minus `ANY` is the closed set a *route* declares, and
+ *   a call site's method is only comparable with a route's if it is drawn from
+ *   the same set — so a literal the set lacks (`TRACE`, `CONNECT`, a
+ *   project's own verb) records **no** method, and no vocabulary member is
+ *   ever invented for it. The omission is logged once per site, and it is
+ *   deliberately *not* the platform default: a `TRACE` request recorded as a
+ *   `GET` would be a confident wrong answer, which is worse than a missing
+ *   field.
+ * - **A `fetch` records a method whenever the source states none.** A
+ *   string-literal `method` property on the second argument wins; with no
+ *   statically known method `GET` is recorded, because `GET` is what the
+ *   platform API *does* in that case — a documented property of `fetch`, not a
+ *   guess. `ApiCallNodeData.method`'s "absent when the call relies on the
+ *   default" is honoured for the shape that has no platform default to state:
+ *   an XHR whose `open()` method argument is not a literal records no method
+ *   at all.
  * - **A literal target is recorded as its decoded literal *value***
  *   (`getLiteralValue()`), so an escape sequence resolves to the path the
  *   request is actually made to, which is what a route match needs. A dynamic
@@ -122,12 +138,16 @@
  * 1. the enclosing declaration is referenced by an `on[A-Z]` markup attribute
  *    in this file (or *is* the inline function in one) → the **handler** node
  *    (`./event-handlers.ts`);
- * 2. otherwise, in a module that is neither a route/page module nor a
- *    component module, an exported module-level function-valued declaration →
- *    the **server-function** node (`./server-functions.ts`);
- * 3. otherwise any module-level declaration, or a member of a module-level
+ * 2. otherwise, in a request-handling route module, the declaration that
+ *    answers the route — an HTTP-method export under the App Router, the
+ *    default export of a legacy `pages/api/**` module → the **api-route**
+ *    node (`./api-routes.ts`);
+ * 3. otherwise, in a module that is neither a route/page module nor a
+ *    component module, a module-level function-valued declaration the module
+ *    exports → the **server-function** node (`./server-functions.ts`);
+ * 4. otherwise any module-level declaration, or a member of a module-level
  *    class → its **symbol** node (`./symbols.ts`);
- * 4. otherwise the **file** node (`./imports.ts`).
+ * 5. otherwise the **file** node (`./imports.ts`).
  *
  * The walk is over the call's *ancestors*, innermost first, which is why no
  * wrapper peeling is needed: a memoisation call (`useCallback`, `useMemo`,
@@ -137,6 +157,14 @@
  * members only — so the walk continues past one, and the file node is reached
  * only when *no* enclosing declaration anywhere up the chain is addressable.
  *
+ * One shape reaches steps 2 to 4 without a declaration at all:
+ * `export default <function>`, which binds no name. It is addressable
+ * regardless — a legacy `pages/api/**` module's default export *is* the route,
+ * a server module's is one of its exported functions, and `./symbols.ts` mints
+ * a `default` node for any default export that names no declaration — so
+ * {@link defaultExportOwner} answers for it at the same three steps rather
+ * than letting the walk run past to the file node.
+ *
  * Step 1 is deliberately **independent of that addressability**, and this is
  * the case the cascade exists for: `const handleClick = useCallback(…)` inside
  * a component body is function-local and has no `symbol` node, yet
@@ -145,30 +173,47 @@
  * attribute every memoised handler's requests to the component instead, which
  * is precisely the attribution the product needs to be right.
  *
- * ### Two reconciliations this file documents rather than guesses
+ * ### How steps 2 and 3 name a node this module may not ask about
  *
- * - **A route module's handlers are attributed to their `symbol` node, not to
- *   an `api-route` node.** The plan's cascade names `api-route` for a call
- *   inside an HTTP-method export, but an `api-route` node's id is built from a
- *   route *path* and a route entry's location, both derived exclusively by
- *   `../route-map.ts` — a module this extractor may not import and whose
- *   derivation it may not duplicate. A re-derived path that differs by one
- *   character would not be a slightly wrong edge, it would be a dropped one.
- *   The HTTP-method export's own `symbol` node is guaranteed by
- *   `./symbols.ts`, and the `file → symbol → api-call` shape is explicitly
- *   sanctioned by the reachability invariant on `CODE_EDGE_KINDS`, so the
- *   route's calls stay reachable through the `declares` hop. The cost is
- *   specificity; the alternative was silence.
- * - **The server-function branch is taken only for the unambiguous shape**: a
- *   module-level, function-valued declaration carrying a plain `export`
- *   keyword. `export { f }` and `export default` fall through to step 3, for
- *   the same asymmetry — a `symbol` node exists for every module-level
- *   declaration, while a `server-function` node exists only where the sibling
- *   extractor agreed, and disagreement costs the edge. Component-module
- *   detection is permissive for the same reason: a call in a component body
- *   falls through to that component's `symbol` node (the cascade has no
- *   `component` step by design), so over-detecting a component module can only
- *   ever move an edge from `server-function` to `symbol`, never delete it.
+ * Both of those node ids are built from facts another module owns, and neither
+ * may be imported (see the contract below). The rule is therefore *reproduced*
+ * here, which is the same coupling point `./event-handlers.ts`'s and
+ * `./symbols.ts`'s naming rules are reproduced at, and it is reproduced
+ * **strictly**: where the reproduction cannot vouch for its answer it declines,
+ * and the cascade falls through to a node that certainly exists.
+ *
+ * - **Step 2 needs a route path and a route entry's position**, both derived
+ *   exclusively by `../route-map.ts`. {@link routeIdentityOf} reproduces that
+ *   derivation from the same `@debuggen/shared` path primitives, over the same
+ *   two conventional router directories `./api-routes.ts` probes, for the two
+ *   request-handling conventions only — an App Router `route.*` module and a
+ *   legacy `pages/api/**` module. Anything it cannot read the same way
+ *   (a private `_folder`, an intercepting route, a malformed bracket segment,
+ *   a misplaced catch-all, an unsupported extension, a tree in a
+ *   non-conventional directory) yields no route identity, and the call is
+ *   attributed to the handler's own `symbol` node instead. So a re-derivation
+ *   that differs cannot produce a dropped edge: it produces the less specific
+ *   edge this module used to produce for every route, and the
+ *   `file → symbol → api-call` shape stays sanctioned by the reachability
+ *   invariant on `CODE_EDGE_KINDS`.
+ * - **Step 3 needs the module's export surface**, because a
+ *   `server-function` node exists for every *exported* function however it is
+ *   exported: with the keyword, by a clause (`export { load }`,
+ *   `export { load as fetchAll }`) or by a default assignment
+ *   (`export default load`). All three are read here, and the id is spelled
+ *   under the declaration's **own** name at its own position, which is how
+ *   `./server-functions.ts` names the node for each of them — an alias is a
+ *   fact about the export, not about the function. A default export with no
+ *   declaration at all (`export default async () => {}`) is that sibling's
+ *   `default` node, positioned at the assignment's own expression, wrappers
+ *   included; the `symbol` fallback for the same shape is positioned at the
+ *   *peeled* expression instead, which is why {@link defaultExportOwner}
+ *   takes that last step only when no wrapper stands in between and the two
+ *   positions coincide. Component-module detection stays permissive: a call in
+ *   a component body falls through to that component's `symbol` node (the
+ *   cascade has no `component` step by design), so over-detecting a component
+ *   module can only ever move an edge from `server-function` to `symbol`,
+ *   never delete it.
  *
  * The chosen step is legible without a new field: the edge's `from` is a node
  * id whose first component is that node's kind, which is what makes a wrong
@@ -224,21 +269,40 @@
  * message is never repeated, because an abstract-syntax-tree library routinely
  * embeds the developer's source in one.
  *
+ * Two observations are **logged rather than diagnosed**, because in neither
+ * case is an item missing from the index: a call attributed to its file node
+ * (the least specific owner, at `debug`), and a method literal outside the
+ * shared vocabulary, where the node exists and one optional field does not.
+ * `IndexDiagnostic` is the channel for an index that is *incomplete*, and a
+ * closed code vocabulary has no member meaning "an extractor found something
+ * odd". Both log lines carry the same constraint the diagnostics do: they name
+ * a file, a call shape and a position, and quote no source — the rejected verb
+ * itself is never a field.
+ *
  * @packageDocumentation
  */
 
-import { Node } from 'ts-morph';
+import { Node, SyntaxKind } from 'ts-morph';
 import type {
   CallExpression,
+  ExportAssignment,
   JsxAttribute,
   NewExpression,
   ObjectLiteralExpression,
   ParameterDeclaration,
   SourceFile,
   Statement,
+  VariableDeclaration,
 } from 'ts-morph';
 
-import { isSafeRelativePath } from '@debuggen/shared';
+import {
+  basenamePosix,
+  extnamePosix,
+  isSafeRelativePath,
+  joinPosix,
+  normalizePosix,
+  toPosix,
+} from '@debuggen/shared';
 
 import { makeEdgeId, makeNodeId } from '../graph/graph.js';
 import { HTTP_METHOD_NAMES } from '../graph/types.js';
@@ -373,6 +437,32 @@ const BIND_METHOD_NAME = 'bind';
 const ASSIGNMENT_OPERATOR = '=';
 
 /**
+ * The operators that end in `=` without assigning anything.
+ *
+ * The exclusion list behind {@link isAssignmentOperator}, which recognises the
+ * assignment family by its shape rather than by enumerating it.
+ */
+const COMPARISON_OPERATORS: readonly string[] = Object.freeze([
+  '==',
+  '===',
+  '!=',
+  '!==',
+  '<=',
+  '>=',
+]);
+
+/**
+ * The prefix operators that replace what a name holds.
+ *
+ * `!xhr` and `-xhr` read the binding without changing it; `++xhr` and `--xhr`
+ * leave it holding a number, which is no longer a request object.
+ */
+const UPDATE_OPERATORS: readonly SyntaxKind[] = Object.freeze([
+  SyntaxKind.PlusPlusToken,
+  SyntaxKind.MinusMinusToken,
+]);
+
+/**
  * A target is path-like when it starts with this, or matches
  * {@link URL_SCHEME_PATTERN}.
  *
@@ -421,21 +511,159 @@ const PAGES_ROUTER_DIRECTORY = 'pages';
 /** The one directory a router directory may be nested under. */
 const SOURCE_DIRECTORY = 'src';
 
+/** The App Router file stem whose module answers requests rather than renders. */
+const APP_HANDLER_STEM = 'route';
+
+/** The App Router file stem whose module renders a document. */
+const APP_PAGE_STEM = 'page';
+
 /**
  * The App Router file stems that make a module a route or page module.
  *
- * Used **only** to classify a module, never to derive a URL: every question
- * about what path a file serves belongs to `../route-map.ts`, and this module
- * asks none of them. The classification's only effect is to keep a route
- * module's calls out of the server-function branch of the cascade.
+ * Used **only** to classify a module for the cascade's server-function branch,
+ * never to derive a URL. The stricter reading that *does* produce a route path
+ * is {@link routeIdentityOf}, and it is deliberately separate: this
+ * classification is allowed to over-answer, and that one is not.
  */
-const ROUTE_MODULE_STEMS: readonly string[] = Object.freeze(['route', 'page']);
+const ROUTE_MODULE_STEMS: readonly string[] = Object.freeze([APP_HANDLER_STEM, APP_PAGE_STEM]);
 
 /** The file extension separator, for taking a basename's stem. */
 const EXTENSION_SEPARATOR = '.';
 
 /** The path separator every project-relative path uses. */
 const PATH_SEPARATOR = '/';
+
+/**
+ * Where an App Router tree lives, in probe order.
+ *
+ * The **conventional** locations, and only those, because `../route-map.ts` is
+ * asked for a route by `./api-routes.ts` without options and therefore probes
+ * exactly these two. A project whose tree lives elsewhere gets no `api-route`
+ * node at all, so the route step of the cascade must not claim one either —
+ * which it cannot, since it reads the same two names.
+ */
+const APP_DIRECTORY_CANDIDATES: readonly string[] = Object.freeze([
+  APP_ROUTER_DIRECTORY,
+  `${SOURCE_DIRECTORY}/${APP_ROUTER_DIRECTORY}`,
+]);
+
+/** Where a Pages Router tree lives, in probe order, on the same terms. */
+const PAGES_DIRECTORY_CANDIDATES: readonly string[] = Object.freeze([
+  PAGES_ROUTER_DIRECTORY,
+  `${SOURCE_DIRECTORY}/${PAGES_ROUTER_DIRECTORY}`,
+]);
+
+/**
+ * The extensions an App Router `route.*` module may carry.
+ *
+ * The set `../route-map.ts` accepts, reproduced rather than narrowed: a route
+ * module written in JavaScript is ordinary in a project mid-migration, and
+ * refusing one here would attribute its handler's calls to a `symbol` node
+ * while the route node exists.
+ */
+const APP_ROUTE_EXTENSIONS: readonly string[] = Object.freeze([
+  '.ts',
+  '.tsx',
+  '.mts',
+  '.cts',
+  '.js',
+  '.jsx',
+  '.mjs',
+  '.cjs',
+]);
+
+/**
+ * The extensions a Pages Router module may carry.
+ *
+ * Narrower than the App Router set, because the framework's default page
+ * extensions are these four and a `.mjs`/`.cjs` module under `pages/` is not
+ * served — the same asymmetry `../route-map.ts` encodes.
+ */
+const PAGES_ROUTE_EXTENSIONS: readonly string[] = Object.freeze(['.ts', '.tsx', '.js', '.jsx']);
+
+/** The Pages Router file stem that collapses to its own directory. */
+const PAGES_INDEX_STEM = 'index';
+
+/** The Pages Router file stem that intercepts requests instead of serving one. */
+const PAGES_MIDDLEWARE_STEM = 'middleware';
+
+/** The directory under a Pages Router tree whose modules answer requests. */
+const PAGES_API_SEGMENT = 'api';
+
+/** The route path of a route with no URL segment of its own. */
+const ROOT_ROUTE_PATH = '/';
+
+/** The prefix that opts a directory, and its whole subtree, out of routing. */
+const PRIVATE_SEGMENT_PREFIX = '_';
+
+/** The prefix of a parallel-route slot, which organises the tree without appearing in the URL. */
+const SLOT_SEGMENT_PREFIX = '@';
+
+/** A route group's delimiters: a directory that organises the tree and contributes no segment. */
+const GROUP_SEGMENT_OPEN = '(';
+
+/** The closing delimiter of a route group. */
+const GROUP_SEGMENT_CLOSE = ')';
+
+/**
+ * An intercepting-route marker at the start of a segment: `(.)`, `(..)`,
+ * `(...)` and, by the same prefix, `(..)(..)`.
+ *
+ * Such a route's served URL depends on where it is rendered from, which a path
+ * cannot know, so `../route-map.ts` refuses the file — and so must this
+ * module, or it would point an edge at a node that extractor never emitted.
+ */
+const INTERCEPTING_SEGMENT_PREFIX = /^\(\.{1,3}\)/;
+
+/**
+ * A usable dynamic-parameter name: anything but a separator, a bracket, a dot
+ * or whitespace.
+ *
+ * The same permissive rule `../route-map.ts` applies — a parameter reaches
+ * application code as an object key, so a hyphen or a non-ASCII letter is
+ * legal — rejecting only spellings that would make the segment ambiguous.
+ */
+const ROUTE_PARAM_NAME = /^[^[\].\s/]+$/;
+
+/** The opening of an optional catch-all segment, `[[...param]]`. */
+const OPTIONAL_CATCH_ALL_OPEN = '[[...';
+
+/** The closing of an optional catch-all segment. */
+const OPTIONAL_CATCH_ALL_CLOSE = ']]';
+
+/** The opening of a catch-all segment, `[...param]`. */
+const CATCH_ALL_OPEN = '[...';
+
+/** The opening of a dynamic segment, `[param]`. */
+const DYNAMIC_OPEN = '[';
+
+/**
+ * The doubled opening that tells a dynamic segment from an optional catch-all.
+ *
+ * `[[…` can only begin the optional form, so a name starting with it is never
+ * read as a plain `[param]` — the disambiguation `../route-map.ts` makes with
+ * the same test.
+ */
+const OPTIONAL_DYNAMIC_OPEN = '[[';
+
+/** The closing of a dynamic or catch-all segment. */
+const DYNAMIC_CLOSE = ']';
+
+/**
+ * What {@link classifyRouteDirectory} answers for a directory that is legal but
+ * contributes no URL segment.
+ *
+ * A distinct sentinel rather than `undefined`, which already means "this file
+ * serves no URL": conflating the two would turn every route group into a
+ * module with no route at all.
+ */
+const SKIPPED_SEGMENT = Symbol('debuggen.api-calls.skipped-segment');
+
+/** The export-name list of a declaration no clause and no assignment exports. */
+const NO_EXPORT_NAMES: readonly string[] = Object.freeze([]);
+
+/** The export surface of a module whose statements could not be read. */
+const EMPTY_EXPORTS: ReadonlyMap<string, readonly string[]> = new Map<string, readonly string[]>();
 
 /** The line a `file` node is anchored at, by the convention `./imports.ts` uses. */
 const FILE_NODE_LINE = 1;
@@ -479,6 +707,8 @@ const EMPTY_FACTS: ModuleFacts = Object.freeze({
   routeModule: false,
   componentModule: false,
   handlers: new Map<number, HandlerRef>(),
+  route: undefined,
+  exports: EMPTY_EXPORTS,
 });
 
 /**
@@ -494,6 +724,12 @@ const UNKNOWN_TARGET: RequestTarget = Object.freeze({
   dynamic: true,
   urlExpression: undefined,
 });
+
+/** The method reading for source that states no method at all. */
+const ABSENT_METHOD: MethodReading = Object.freeze({ kind: 'absent' });
+
+/** The method reading for a literal the shared vocabulary does not contain. */
+const UNSUPPORTED_METHOD: MethodReading = Object.freeze({ kind: 'unsupported' });
 
 /* -------------------------------------------------------------------------------------------------
  * Internal shapes
@@ -539,6 +775,43 @@ interface RequestTarget {
 }
 
 /**
+ * What a piece of source says about a request's HTTP method.
+ *
+ * Three outcomes, and keeping them apart is the whole point: "the source
+ * states no method" and "the source states a method the shared vocabulary does
+ * not contain" have to lead to *different* recorded values, because collapsing
+ * them is how a `TRACE` request comes to be recorded as a `GET`.
+ *
+ * - `absent` — nothing statically known: no `method` property, a computed one,
+ *   a non-literal `open()` argument. The caller applies whatever default the
+ *   platform API documents for that shape, if there is one.
+ * - `unsupported` — a literal method outside {@link CALL_SITE_METHODS}. No
+ *   method is recorded and no platform default is substituted: the call
+ *   performs the method it wrote, which this vocabulary cannot name.
+ * - `method` — a member of the shared vocabulary, in its spelling.
+ */
+type MethodReading =
+  | { readonly kind: 'absent' }
+  | { readonly kind: 'unsupported' }
+  | { readonly kind: 'method'; readonly method: string };
+
+/**
+ * What a `fetch` call's node records about its method.
+ *
+ * Two fields rather than one, because "no method" has two causes that the node
+ * and the log treat differently: the platform default covers the absent case,
+ * so a missing method here always means the source stated a verb the shared
+ * vocabulary lacks.
+ */
+interface FetchMethod {
+  /** The method to record, or `undefined` when none may be. */
+  readonly method: string | undefined;
+
+  /** Whether the source stated a literal method outside the vocabulary. */
+  readonly unsupported: boolean;
+}
+
+/**
  * One recognised call site, before ownership is resolved.
  *
  * The four node references it carries are each used for one thing, and keeping
@@ -565,8 +838,20 @@ interface CallSite {
   /** What the source says about the target. */
   readonly target: RequestTarget;
 
-  /** The HTTP method, or `undefined` when the source states none. */
+  /** The HTTP method, or `undefined` when the source states none this vocabulary contains. */
   readonly method: string | undefined;
+
+  /**
+   * Whether the source stated a literal method the shared vocabulary does not
+   * contain, so none was recorded.
+   *
+   * Internal, and the reason the omission is observable rather than silent:
+   * the extractor logs one line per such site (see
+   * {@link extractApiCalls}). It is deliberately not a node field —
+   * `ApiCallNodeData` is closed — and it is a boolean rather than the verb
+   * itself, because the verb is source text and a log field may not carry any.
+   */
+  readonly unsupportedMethod: boolean;
 }
 
 /**
@@ -588,7 +873,7 @@ interface HandlerRef {
 
 /**
  * What one file's own syntax says, computed once per extraction because every
- * call site in the file asks the same three questions.
+ * call site in the file asks the same questions.
  */
 interface ModuleFacts {
   /** Whether the path makes this a route or page module. */
@@ -599,6 +884,48 @@ interface ModuleFacts {
 
   /** Handler nodes by the character offset of the node they were derived from. */
   readonly handlers: ReadonlyMap<number, HandlerRef>;
+
+  /**
+   * The `api-route` node of this module, when it is a request-handling route
+   * module whose identity is unambiguous — otherwise `undefined`.
+   */
+  readonly route: RouteIdentity | undefined;
+
+  /**
+   * The names this module exports each of its declarations under, by the
+   * declaration's own declared name.
+   *
+   * Only the export *clauses* and the `export default <identifier>` assignment
+   * are recorded here, because those are the ones a declaration cannot be
+   * asked about directly; a declaration's own `export`/`default` keyword is
+   * read from the declaration itself in {@link exportNamesOf}.
+   */
+  readonly exports: ReadonlyMap<string, readonly string[]>;
+}
+
+/**
+ * Which router convention a route module belongs to.
+ *
+ * The two `../route-map.ts` derives, and the discriminator the cascade's route
+ * step needs: an App Router handler module is addressed by its HTTP-method
+ * exports, while a legacy Pages Router API module *is* its default export.
+ */
+type RouterConvention = 'app' | 'pages';
+
+/**
+ * The `api-route` node of one request-handling route module, reduced to what
+ * the cascade needs.
+ *
+ * Present only when this module's route identity is unambiguous — see
+ * {@link routeIdentityOf} — so a value here is a node `./api-routes.ts`
+ * emitted for the same file.
+ */
+interface RouteIdentity {
+  /** The `api-route` node's id, spelled as that extractor spells it. */
+  readonly id: string;
+
+  /** Which convention decides what counts as this route's handler. */
+  readonly router: RouterConvention;
 }
 
 /**
@@ -620,8 +947,23 @@ interface AddressableDeclaration {
   /** Whether its value is a function, written as one. */
   readonly functionValued: boolean;
 
-  /** Whether it carries a plain `export` keyword (not `export default`). */
-  readonly plainlyExported: boolean;
+  /**
+   * Whether it carries a plain `export` keyword, which exports it under its
+   * own declared name.
+   *
+   * One of the three ways a declaration can leave its module, and the only one
+   * legible from the declaration alone. The other two — an export clause and a
+   * default assignment — are recorded on {@link ModuleFacts.exports}, because
+   * either may be written anywhere in the module, including above the
+   * declaration it names.
+   */
+  readonly keywordExported: boolean;
+
+  /**
+   * Whether it carries a `default` keyword, which exports it as `default`
+   * rather than under its declared name.
+   */
+  readonly defaultExported: boolean;
 
   /** Whether it is a member of a module-level class rather than a module-level declaration. */
   readonly classMember: boolean;
@@ -638,7 +980,7 @@ interface AddressableDeclaration {
  */
 interface Owner {
   /** The cascade step taken. */
-  readonly kind: 'handler' | 'server-function' | 'symbol' | 'file';
+  readonly kind: 'handler' | 'api-route' | 'server-function' | 'symbol' | 'file';
 
   /** The owning node's id. */
   readonly id: string;
@@ -857,24 +1199,31 @@ function isPathLike(node: Node): boolean {
 }
 
 /**
- * An HTTP method normalised to the shared vocabulary's spelling, or
- * `undefined` when the text states none.
+ * An HTTP method read from a literal and checked against the shared
+ * vocabulary.
  *
  * Upper-cased, because that is how `HTTP_METHOD_NAMES` spells a method and how
  * the runtime evidence records one, and trimmed, because
- * `{ method: ' post ' }` is a method the platform accepts. A method outside
- * the vocabulary (`TRACE`, a project's own verb) is kept as written rather
- * than dropped or coerced: `ApiCallNodeData.method` is documented as "what a
- * call site *wrote*", a plain string precisely so an unusual method is not
- * lost, and inventing a vocabulary member for it is what must not happen.
+ * `{ method: ' post ' }` is a method the platform accepts. Membership of
+ * {@link CALL_SITE_METHODS} is then required rather than assumed: the method a
+ * node carries has to be a member of the closed vocabulary a route declares —
+ * that is what lets a captured request be compared with a route's methods at
+ * all — so a verb the vocabulary lacks (`TRACE`, `CONNECT`, a project's own)
+ * is reported as {@link UNSUPPORTED_METHOD} and recorded as no method, never
+ * admitted as an invented member and never coerced into a neighbouring one.
  *
  * @param raw The method text as written.
- * @returns The normalised method, or `undefined` for empty text.
+ * @returns The reading: a vocabulary member, unsupported, or absent for empty
+ * text.
  */
-function normaliseMethod(raw: string): string | undefined {
+function readMethod(raw: string): MethodReading {
   const upper = raw.trim().toUpperCase();
 
-  return upper.length === 0 ? undefined : upper;
+  if (upper.length === 0) {
+    return ABSENT_METHOD;
+  }
+
+  return CALL_SITE_METHODS.includes(upper) ? { kind: 'method', method: upper } : UNSUPPORTED_METHOD;
 }
 
 /**
@@ -919,18 +1268,21 @@ function propertyNameOf(nameNode: Node): string | undefined {
 }
 
 /**
- * The literal method an init object declares, or `undefined`.
+ * What an init object says about the method.
  *
- * Only a *literal* method counts. A shorthand (`{ method }`), a computed
+ * Only a *literal* method is read. A shorthand (`{ method }`), a computed
  * value (`{ method: verb }`) and a spread (`{ ...options }`) each mean the
- * method is decided at runtime, and none of them is read as one — the caller
- * then records the platform default, which is what the call performs unless
- * something it cannot see says otherwise.
+ * method is decided at runtime, so each reads as {@link ABSENT_METHOD} and the
+ * caller applies the platform default — which is what the call performs unless
+ * something it cannot see says otherwise. A literal outside the shared
+ * vocabulary reads as {@link UNSUPPORTED_METHOD} instead, which is *not* the
+ * same as absent: the platform default must not be substituted for a method
+ * the source states.
  *
  * @param object The init object literal.
- * @returns The normalised method, or `undefined`.
+ * @returns The reading.
  */
-function literalMethodIn(object: ObjectLiteralExpression): string | undefined {
+function literalMethodIn(object: ObjectLiteralExpression): MethodReading {
   for (const property of object.getProperties()) {
     if (!Node.isPropertyAssignment(property)) {
       continue;
@@ -943,35 +1295,49 @@ function literalMethodIn(object: ObjectLiteralExpression): string | undefined {
     const initializer = property.getInitializer();
 
     if (initializer === undefined) {
-      return undefined;
+      return ABSENT_METHOD;
     }
 
     const literal = literalTextOf(initializer);
 
-    return literal === undefined ? undefined : normaliseMethod(literal);
+    return literal === undefined ? ABSENT_METHOD : readMethod(literal);
   }
 
-  return undefined;
+  return ABSENT_METHOD;
 }
 
 /**
- * The method a `fetch` call performs.
+ * The method a `fetch` call performs, and whether the source stated one this
+ * vocabulary cannot name.
  *
- * Always a method, never `undefined`: a literal `method` property on the init
- * object when there is one, and {@link DEFAULT_FETCH_METHOD} otherwise, which
- * is what the platform API does rather than a guess about intent. See the
- * header for how this reconciles with `ApiCallNodeData.method`'s
- * "absent when the call relies on the default".
+ * Two of the three readings produce a method: an init object's literal
+ * `method` when it is a vocabulary member, and {@link DEFAULT_FETCH_METHOD}
+ * when the source states none — which is what the platform API does rather
+ * than a guess about intent, and how this reconciles with
+ * `ApiCallNodeData.method`'s "absent when the call relies on the default".
+ *
+ * The third produces none. A literal the vocabulary lacks means the call
+ * performs neither that method (it cannot be recorded) nor `GET` (it is not
+ * what the call does), so the node records no method and says so through
+ * `unsupported`, which the caller surfaces once per site.
  *
  * @param init The second argument, or `undefined` when the call has one argument.
- * @returns The method to record.
+ * @returns The method to record, or `undefined` with `unsupported` set.
  */
-function fetchMethodOf(init: Node | undefined): string {
-  if (init === undefined || !Node.isObjectLiteralExpression(init)) {
-    return DEFAULT_FETCH_METHOD;
-  }
+function fetchMethodOf(init: Node | undefined): FetchMethod {
+  const reading =
+    init === undefined || !Node.isObjectLiteralExpression(init)
+      ? ABSENT_METHOD
+      : literalMethodIn(init);
 
-  return literalMethodIn(init) ?? DEFAULT_FETCH_METHOD;
+  switch (reading.kind) {
+    case 'method':
+      return { method: reading.method, unsupported: false };
+    case 'unsupported':
+      return { method: undefined, unsupported: true };
+    default:
+      return { method: DEFAULT_FETCH_METHOD, unsupported: false };
+  }
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -1039,6 +1405,8 @@ function classifyCall(call: CallExpression): CallSite | undefined {
 
   // Shape 1 — `fetch('/x')`, `window.fetch('/x', { method: 'POST' })`.
   if (isFetchCallee(callee)) {
+    const { method, unsupported } = fetchMethodOf(second);
+
     return {
       shape: 'fetch',
       name: textOr(callee, FETCH_NAME),
@@ -1046,7 +1414,8 @@ function classifyCall(call: CallExpression): CallSite | undefined {
       extent: call,
       expression: call,
       target: targetOf(first),
-      method: fetchMethodOf(second),
+      method,
+      unsupportedMethod: unsupported,
     };
   }
 
@@ -1071,6 +1440,9 @@ function classifyCall(call: CallExpression): CallSite | undefined {
     expression: call,
     target: targetOf(first),
     method,
+    // A wrapper call is recognised *by* its verb being a vocabulary member, so
+    // this shape can never carry an unsupported one.
+    unsupportedMethod: false,
   };
 }
 
@@ -1152,20 +1524,53 @@ function scopeOf(node: Node): Node {
 }
 
 /**
- * How many `XMLHttpRequest` constructions in one scope are bound to a name.
+ * Visits every descendant of a scope that belongs to **its own** body, never a
+ * nested function's.
  *
- * More than one means the name is re-bound, so no single construction owns the
- * `.open(…)` calls that follow and pairing is abandoned. Counting is cheaper
- * and more honest than trying to order re-bindings against calls.
+ * The traversal every question about an `XMLHttpRequest` binding is asked
+ * through, and the reason is lifetime rather than tidiness: a nested function
+ * is a separate body that runs at a time of its own and may re-declare the
+ * name, so a construction there and an `.open(…)` here (or the reverse) are
+ * two different objects however alike the source looks. Descending into
+ * blocks, loops and conditionals is still correct — those are the same body —
+ * which is why the skip is specifically of function-like nodes.
+ *
+ * The scope node itself is not visited, which is what `forEachDescendant`
+ * already does, so a function-like scope does not skip its own body.
+ *
+ * @param scope The enclosing function or file.
+ * @param visit Called for each node of that scope's own body.
+ */
+function forEachInBody(scope: Node, visit: (node: Node) => void): void {
+  scope.forEachDescendant((node, traversal) => {
+    if (Node.isFunctionLikeDeclaration(node)) {
+      traversal.skip();
+
+      return;
+    }
+
+    visit(node);
+  });
+}
+
+/**
+ * How many `XMLHttpRequest` constructions in one body are bound to a name.
+ *
+ * More than one means the name is re-bound within the same body, so no single
+ * construction owns the `.open(…)` calls that follow and pairing is abandoned.
+ * Counting is cheaper and more honest than trying to order re-bindings against
+ * calls. Constructions inside nested functions are *not* counted — they bind
+ * their own name in their own body, and counting them would make a shadowing
+ * construction elsewhere cost this one its target.
  *
  * @param scope The enclosing function or file.
  * @param name The bound name to count constructions for.
- * @returns The number of constructions bound to that name.
+ * @returns The number of constructions bound to that name in this body.
  */
 function xhrConstructionCount(scope: Node, name: string): number {
   let count = 0;
 
-  scope.forEachDescendant((node) => {
+  forEachInBody(scope, (node) => {
     if (
       Node.isNewExpression(node) &&
       isXhrCallee(node.getExpression()) &&
@@ -1179,12 +1584,195 @@ function xhrConstructionCount(scope: Node, name: string): number {
 }
 
 /**
- * Every `<name>.open(…)` call in one scope that starts after an offset, in
+ * The declaration and the assignment that bind a construction to its name, as
+ * far as one of them does.
+ *
+ * Exactly one is present for a construction {@link boundNameOf} named: the
+ * declarator of `const xhr = new XMLHttpRequest()`, or the assignment of
+ * `xhr = new XMLHttpRequest()`. They are the *permitted* binding events for
+ * that name; {@link bindingRebound} treats every other one as a re-binding.
+ *
+ * @param construction The `new` expression.
+ * @returns Its own binding events.
+ */
+function ownBindingOf(construction: NewExpression): {
+  readonly declaration: Node | undefined;
+  readonly assignment: Node | undefined;
+} {
+  const parent = construction.getParent();
+
+  if (Node.isVariableDeclaration(parent) && parent.getInitializer() === construction) {
+    return { declaration: parent, assignment: undefined };
+  }
+
+  if (
+    Node.isBinaryExpression(parent) &&
+    parent.getOperatorToken().getText() === ASSIGNMENT_OPERATOR &&
+    parent.getRight() === construction
+  ) {
+    return { declaration: undefined, assignment: parent };
+  }
+
+  return { declaration: undefined, assignment: undefined };
+}
+
+/**
+ * Whether an operator token replaces what its left-hand side holds.
+ *
+ * Every assignment form, not only `=`: `xhr = other`, `xhr ??= other` and
+ * `xhr &&= other` all leave the name holding something this construction did
+ * not create, and a compound arithmetic assignment leaves it holding a value
+ * that is not a request object at all. The test is "ends with `=` and is not a
+ * comparison", which covers the whole family — including one added to the
+ * language later — without enumerating it.
+ *
+ * @param operator The operator token's source text.
+ * @returns `true` for an assignment of any form.
+ */
+function isAssignmentOperator(operator: string): boolean {
+  return operator.endsWith(ASSIGNMENT_OPERATOR) && !COMPARISON_OPERATORS.includes(operator);
+}
+
+/**
+ * Whether a declaration is the `let xhr;` of a `let xhr; xhr = new …` pair.
+ *
+ * The one declaration that binds the name and is still the construction's own
+ * binding, recognised by three facts rather than by its spelling: it declares
+ * no value of its own, the statement list it belongs to encloses the
+ * assignment, and it is written before that assignment. A declarator in a
+ * nested block, a `for` head or a `catch` clause satisfies none of them, which
+ * is what makes each of those a shadow.
+ *
+ * @param declaration A declaration that binds the construction's name.
+ * @param ownAssignment The assignment that bound the construction, if one did.
+ * @returns `true` when the declaration is that assignment's own binding.
+ */
+function declaresOwnBinding(
+  declaration: VariableDeclaration,
+  ownAssignment: Node | undefined,
+): boolean {
+  if (ownAssignment === undefined || declaration.getInitializer() !== undefined) {
+    return false;
+  }
+
+  const statement = declaration.getVariableStatement();
+  const container = statement?.getParent();
+
+  if (statement === undefined || container === undefined) {
+    return false;
+  }
+
+  return (
+    container.getStart() <= ownAssignment.getStart() &&
+    container.getEnd() >= ownAssignment.getEnd() &&
+    statement.getEnd() <= ownAssignment.getStart()
+  );
+}
+
+/**
+ * Whether anything in one body binds a name other than as this construction's
+ * own binding.
+ *
+ * Lexical honesty, and deliberately **conservative**: pairing is abandoned
+ * unless the name has exactly one binding in the body and that binding is this
+ * construction's. Every other binding event counts, whatever its shape —
+ *
+ * - a declaration of the name that is not this construction's, **including one
+ *   that declares no value**: `{ let xhr; xhr.open(…) }` in a nested block,
+ *   a `for (const xhr of …)` head, a `catch (xhr)` clause and a destructured
+ *   `const { xhr } = …` each bind a *different* object for every use inside
+ *   their scope. The one exception is the `let xhr; xhr = new XMLHttpRequest()`
+ *   pair, which {@link declaresOwnBinding} recognises;
+ * - an assignment of any form — `=`, `??=`, `&&=`, `+=` — other than the one
+ *   that bound this construction;
+ * - an increment or decrement of the name, which leaves it holding a number.
+ *
+ * That strictness is what lets {@link openCallsOn} match an `.open(…)`
+ * receiver by its identifier text: when this returns `false`, the name has one
+ * binding in the body and the text therefore *is* the binding.
+ *
+ * @param scope The enclosing function or file.
+ * @param name The construction's bound name.
+ * @param construction The construction whose binding is in question.
+ * @returns `true` when the name is bound anywhere else in this body.
+ */
+function bindingRebound(scope: Node, name: string, construction: NewExpression): boolean {
+  const own = ownBindingOf(construction);
+  let rebound = false;
+  let permitted = 0;
+
+  forEachInBody(scope, (node) => {
+    if (rebound) {
+      return;
+    }
+
+    if (Node.isVariableDeclaration(node)) {
+      if (boundIdentifier(node.getNameNode(), name) === undefined || node === own.declaration) {
+        return;
+      }
+
+      if (declaresOwnBinding(node, own.assignment)) {
+        permitted += 1;
+        // Two initialiser-free declarations of one name leave no single binding
+        // the assignment can be said to have bound.
+        rebound = permitted > 1;
+
+        return;
+      }
+
+      rebound = true;
+
+      return;
+    }
+
+    rebound = assignsName(node, name, own.assignment);
+  });
+
+  return rebound;
+}
+
+/**
+ * Whether a node assigns, increments or decrements a name other than as the
+ * construction's own binding.
+ *
+ * The expression half of {@link bindingRebound}, separated so each shape is a
+ * single expression rather than an assignment whose correctness depends on the
+ * order of the walk.
+ *
+ * @param node The node to test.
+ * @param name The construction's bound name.
+ * @param ownAssignment The assignment that bound the construction, if one did.
+ * @returns `true` when this node rebinds the name.
+ */
+function assignsName(node: Node, name: string, ownAssignment: Node | undefined): boolean {
+  if (Node.isBinaryExpression(node) && isAssignmentOperator(node.getOperatorToken().getText())) {
+    const left = node.getLeft();
+
+    return Node.isIdentifier(left) && left.getText() === name && node !== ownAssignment;
+  }
+
+  if (Node.isPostfixUnaryExpression(node)) {
+    // `xhr++` and `xhr--`, the only postfix operators there are.
+    return Node.isIdentifier(node.getOperand()) && node.getOperand().getText() === name;
+  }
+
+  if (Node.isPrefixUnaryExpression(node) && UPDATE_OPERATORS.includes(node.getOperatorToken())) {
+    return Node.isIdentifier(node.getOperand()) && node.getOperand().getText() === name;
+  }
+
+  return false;
+}
+
+/**
+ * Every `<name>.open(…)` call in one body that starts after an offset, in
  * source order.
  *
- * The descendant walk deliberately includes nested functions: an `.open(…)`
- * inside a callback of the same function is still that function's request, and
- * including it costs nothing under the exactly-one rule the caller applies.
+ * Confined to the scope's own body by {@link forEachInBody}: an `.open(…)`
+ * written inside a callback is that callback's statement, made at a time this
+ * module cannot order against the construction, and pairing across that
+ * boundary is the mixing of lifetimes the caller's confidence rule exists to
+ * refuse. Such a construction records an unknown target instead, which is the
+ * honest answer rather than a lost one.
  *
  * @param scope The enclosing function or file.
  * @param name The binding the call must be written on.
@@ -1194,7 +1782,7 @@ function xhrConstructionCount(scope: Node, name: string): number {
 function openCallsOn(scope: Node, name: string, afterOffset: number): readonly CallExpression[] {
   const calls: CallExpression[] = [];
 
-  scope.forEachDescendant((node) => {
+  forEachInBody(scope, (node) => {
     if (!Node.isCallExpression(node) || node.getStart() < afterOffset) {
       return;
     }
@@ -1219,10 +1807,16 @@ function openCallsOn(scope: Node, name: string, afterOffset: number): readonly C
  * The `.open(method, url)` call that states a construction's target, or
  * `undefined` when the pairing is not unambiguous.
  *
- * Confident means: the construction binds a plain local name, that name is
- * bound by exactly one construction in the enclosing function, and exactly one
- * `.open(…)` call on it follows. Anything less is unpaired — the prompt's rule
- * and the honest one, since a wrong target is worse than a missing one.
+ * Confident means all four of these, and the last two are what keep one
+ * request's target off another request's node:
+ *
+ * 1. the construction binds a plain local name;
+ * 2. that name is bound by exactly one construction **in the same body**;
+ * 3. nothing else in that body binds the name (see {@link bindingRebound});
+ * 4. exactly one `.open(…)` call on it follows, in that same body.
+ *
+ * Anything less is unpaired — the prompt's rule and the honest one, since a
+ * wrong target is worse than a missing one.
  *
  * @param construction The `new XMLHttpRequest()` expression.
  * @returns The paired call, or `undefined`.
@@ -1237,6 +1831,10 @@ function pairedOpenCall(construction: NewExpression): CallExpression | undefined
   const scope = scopeOf(construction);
 
   if (xhrConstructionCount(scope, name) !== 1) {
+    return undefined;
+  }
+
+  if (bindingRebound(scope, name, construction)) {
     return undefined;
   }
 
@@ -1278,6 +1876,7 @@ function classifyConstruction(construction: NewExpression): CallSite | undefined
       expression: construction,
       target: UNKNOWN_TARGET,
       method: undefined,
+      unsupportedMethod: false,
     };
   }
 
@@ -1285,6 +1884,12 @@ function classifyConstruction(construction: NewExpression): CallSite | undefined
   const methodArgument = args[0];
   const urlArgument = args[1];
   const literalMethod = methodArgument === undefined ? undefined : literalTextOf(methodArgument);
+  // `open()`'s method argument is required, so a non-literal one means the
+  // method is computed — the case `ApiCallNodeData.method` prescribes absence
+  // for. There is no platform default to fall back on, so an unsupported
+  // literal is recorded the same way an absent one is: as no method, with the
+  // omission reported.
+  const reading = literalMethod === undefined ? ABSENT_METHOD : readMethod(literalMethod);
 
   return {
     shape: 'xhr',
@@ -1293,10 +1898,8 @@ function classifyConstruction(construction: NewExpression): CallSite | undefined
     extent: paired,
     expression: construction,
     target: targetOf(urlArgument),
-    // `open()`'s method argument is required, so a non-literal one means the
-    // method is computed — the case `ApiCallNodeData.method` prescribes
-    // absence for. There is no platform default to fall back on.
-    method: literalMethod === undefined ? undefined : normaliseMethod(literalMethod),
+    method: reading.kind === 'method' ? reading.method : undefined,
+    unsupportedMethod: reading.kind === 'unsupported',
   };
 }
 
@@ -1476,6 +2079,633 @@ function declaresComponentName(sourceFile: SourceFile): boolean {
   }
 
   return false;
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * Route identity, reproduced from `../route-map.ts`
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * What one URL-contributing directory or file name contributes to a route
+ * path, or nothing at all.
+ *
+ * Three outcomes: the segment as written, {@link SKIPPED_SEGMENT} for a
+ * directory that organises the tree without appearing in the URL, and
+ * `undefined` for a spelling that makes the file non-routable — which stops
+ * the whole derivation rather than dropping one segment.
+ *
+ * Only the *legal* dynamic spellings are recognised, longest form first, and
+ * any other bracketed name is refused: a segment whose URL contribution is
+ * unknowable has no honest reading, and inventing one would spell a route path
+ * `../route-map.ts` never derived and therefore an `api-route` node id nobody
+ * emitted.
+ *
+ * @param raw The directory or file name, exactly as written on disk.
+ * @returns The segment text, the skip marker, or `undefined`.
+ */
+function classifyRouteSegment(raw: string): string | undefined {
+  if (raw.length === 0) {
+    return undefined;
+  }
+
+  if (raw.startsWith(OPTIONAL_CATCH_ALL_OPEN) && raw.endsWith(OPTIONAL_CATCH_ALL_CLOSE)) {
+    return ROUTE_PARAM_NAME.test(
+      raw.slice(OPTIONAL_CATCH_ALL_OPEN.length, -OPTIONAL_CATCH_ALL_CLOSE.length),
+    )
+      ? raw
+      : undefined;
+  }
+
+  if (
+    raw.startsWith(CATCH_ALL_OPEN) &&
+    raw.endsWith(DYNAMIC_CLOSE) &&
+    !raw.endsWith(OPTIONAL_CATCH_ALL_CLOSE)
+  ) {
+    return ROUTE_PARAM_NAME.test(raw.slice(CATCH_ALL_OPEN.length, -DYNAMIC_CLOSE.length))
+      ? raw
+      : undefined;
+  }
+
+  if (
+    raw.startsWith(DYNAMIC_OPEN) &&
+    raw.endsWith(DYNAMIC_CLOSE) &&
+    !raw.startsWith(OPTIONAL_DYNAMIC_OPEN)
+  ) {
+    return ROUTE_PARAM_NAME.test(raw.slice(DYNAMIC_OPEN.length, -DYNAMIC_CLOSE.length))
+      ? raw
+      : undefined;
+  }
+
+  if (raw.includes(DYNAMIC_OPEN) || raw.includes(DYNAMIC_CLOSE)) {
+    return undefined;
+  }
+
+  return raw;
+}
+
+/**
+ * What one directory above an App Router module contributes to its URL.
+ *
+ * The App Router's three organisational forms come first — a private
+ * `_folder` opts its subtree out of routing entirely, an intercepting-route
+ * marker makes the served URL unknowable from the path, and a `(group)` or an
+ * `@slot` contributes nothing — and an ordinary name then falls through to
+ * {@link classifyRouteSegment}.
+ *
+ * @param raw The directory name, exactly as written on disk.
+ * @returns The segment text, the skip marker, or `undefined` when the file is
+ * not routable.
+ */
+function classifyRouteDirectory(raw: string): string | typeof SKIPPED_SEGMENT | undefined {
+  if (raw.startsWith(PRIVATE_SEGMENT_PREFIX) || INTERCEPTING_SEGMENT_PREFIX.test(raw)) {
+    return undefined;
+  }
+
+  if (raw.startsWith(GROUP_SEGMENT_OPEN) && raw.endsWith(GROUP_SEGMENT_CLOSE)) {
+    return SKIPPED_SEGMENT;
+  }
+
+  if (raw.startsWith(SLOT_SEGMENT_PREFIX)) {
+    return SKIPPED_SEGMENT;
+  }
+
+  return classifyRouteSegment(raw);
+}
+
+/**
+ * Whether a segment consumes the remainder of a request path.
+ *
+ * @param raw The segment as written.
+ * @returns `true` for `[...param]` and `[[...param]]`.
+ */
+function isCatchAllSegment(raw: string): boolean {
+  return raw.startsWith(CATCH_ALL_OPEN) || raw.startsWith(OPTIONAL_CATCH_ALL_OPEN);
+}
+
+/**
+ * The route path a list of segments spells, or `undefined` when a catch-all
+ * sits anywhere but last.
+ *
+ * The one cross-segment rule of the convention: a catch-all consumes every
+ * remaining segment, so anything after it could never match and the framework
+ * rejects such a tree outright. `joinPosix` does the separator arithmetic, as
+ * `../route-map.ts` has it do, so the two spell the same path for the same
+ * segments rather than merely similar ones.
+ *
+ * @param segments The URL segments, in URL order, as written.
+ * @returns The route path, or `undefined` for a misplaced catch-all.
+ */
+function routePathOf(segments: readonly string[]): string | undefined {
+  for (const [index, segment] of segments.entries()) {
+    if (isCatchAllSegment(segment) && index !== segments.length - 1) {
+      return undefined;
+    }
+  }
+
+  return segments.length === 0 ? ROOT_ROUTE_PATH : joinPosix(PATH_SEPARATOR, ...segments);
+}
+
+/**
+ * The part of a path below a directory, or `undefined` when it is not below
+ * it.
+ *
+ * A segment-boundary test rather than a string prefix test, so
+ * `application/route.ts` is not below `app`.
+ *
+ * @param file A normalised project-relative path.
+ * @param directory A project-relative directory path.
+ * @returns The remainder, with no leading separator, or `undefined`.
+ */
+function belowDirectory(file: string, directory: string): string | undefined {
+  const prefix = `${directory}${PATH_SEPARATOR}`;
+
+  return file.startsWith(prefix) ? file.slice(prefix.length) : undefined;
+}
+
+/** The non-empty segments of a POSIX path, in order. */
+function pathSegmentsOf(path: string): readonly string[] {
+  return path.split(PATH_SEPARATOR).filter((segment) => segment.length > 0);
+}
+
+/**
+ * The route path of an App Router **request-handler** module, or `undefined`.
+ *
+ * `route.*` only: a `page.*` module renders a document, and the cascade's
+ * route step is about the function that *answers* a request (see
+ * {@link declaredOwner}), so a page's route identity is deliberately not
+ * derived here. The URL is the directory the module sits in, which is the
+ * whole idea of the convention.
+ *
+ * @param rest The part of the path below the app directory.
+ * @returns The route path, or `undefined` when the module serves no URL this
+ * step can claim.
+ */
+function appRoutePathOf(rest: string): string | undefined {
+  const base = basenamePosix(rest);
+  const extension = extnamePosix(base);
+
+  if (!APP_ROUTE_EXTENSIONS.includes(extension)) {
+    return undefined;
+  }
+
+  if (basenamePosix(base, extension) !== APP_HANDLER_STEM) {
+    return undefined;
+  }
+
+  const segments: string[] = [];
+
+  for (const raw of pathSegmentsOf(rest).slice(0, -1)) {
+    const classified = classifyRouteDirectory(raw);
+
+    if (classified === undefined) {
+      return undefined;
+    }
+
+    if (classified !== SKIPPED_SEGMENT) {
+      segments.push(classified);
+    }
+  }
+
+  return routePathOf(segments);
+}
+
+/**
+ * The route path of a legacy Pages Router **API** module, or `undefined`.
+ *
+ * `pages/api/**` only, for the same reason `appRoutePathOf` takes `route.*`
+ * only: a page renders. Unlike the App Router the file name is part of the
+ * URL, `index` collapses to its own directory, and parentheses carry no
+ * meaning in this convention — a parenthesised directory is an ordinary static
+ * segment.
+ *
+ * @param rest The part of the path below the pages directory.
+ * @returns The route path, or `undefined`.
+ */
+function pagesRoutePathOf(rest: string): string | undefined {
+  const base = basenamePosix(rest);
+  const extension = extnamePosix(base);
+
+  if (!PAGES_ROUTE_EXTENSIONS.includes(extension)) {
+    return undefined;
+  }
+
+  const stem = basenamePosix(base, extension);
+
+  // `_app`, `_document`, `_error` and any other underscore-prefixed module are
+  // framework hooks; a dotfile is not served; `middleware` intercepts requests
+  // rather than answering one.
+  if (
+    stem.startsWith(PRIVATE_SEGMENT_PREFIX) ||
+    stem.startsWith(EXTENSION_SEPARATOR) ||
+    stem === PAGES_MIDDLEWARE_STEM
+  ) {
+    return undefined;
+  }
+
+  const directories = pathSegmentsOf(rest).slice(0, -1);
+
+  // Everything outside `api/` renders a document rather than answering a
+  // request, so it is not a case for the cascade's route step.
+  if (directories[0] !== PAGES_API_SEGMENT) {
+    return undefined;
+  }
+
+  const segments: string[] = [];
+
+  for (const raw of directories) {
+    if (raw.startsWith(PRIVATE_SEGMENT_PREFIX)) {
+      return undefined;
+    }
+
+    const classified = classifyRouteSegment(raw);
+
+    if (classified === undefined) {
+      return undefined;
+    }
+
+    segments.push(classified);
+  }
+
+  if (stem !== PAGES_INDEX_STEM) {
+    const classified = classifyRouteSegment(stem);
+
+    if (classified === undefined) {
+      return undefined;
+    }
+
+    segments.push(classified);
+  }
+
+  return routePathOf(segments);
+}
+
+/**
+ * The 1-based position of the **first** HTTP-method handler an App Router
+ * module declares, or `undefined` when it declares none.
+ *
+ * This is the position `../route-map.ts` gives a handler module's route entry,
+ * and therefore half of the `api-route` node's id — so the three export
+ * shapes and their anchors are reproduced exactly as that module reads them:
+ *
+ * - `export function GET` — the declaration's own start, which is its `export`
+ *   keyword. `isExported()` rather than `hasExportKeyword()`, because a
+ *   function declared locally and exported through a clause is exported too;
+ *   a default export is excluded, since a default is not a method.
+ * - `export const POST = …` — the statement's start for a single-declarator
+ *   statement, which is where a developer expects to land, and the binding's
+ *   own name for a statement declaring several.
+ * - `export { handler as PUT }` — the specifier's own start, including for a
+ *   re-export from another module, so the position is always inside the route
+ *   module a developer clicked.
+ *
+ * The **earliest** of those positions is the entry's, which is why only a
+ * minimum is tracked: that module orders its handlers by position and then
+ * drops each method's later duplicates, and dropping later entries cannot
+ * change which one comes first.
+ *
+ * @param sourceFile The route module to read.
+ * @returns The first handler's position, or `undefined`.
+ */
+function appHandlerPosition(sourceFile: SourceFile): Position | undefined {
+  let earliest: number | undefined;
+
+  const record = (offset: number): void => {
+    if (earliest === undefined || offset < earliest) {
+      earliest = offset;
+    }
+  };
+
+  for (const declaration of sourceFile.getFunctions()) {
+    const name = declaration.getName();
+
+    if (name === undefined || !declaration.isExported() || declaration.isDefaultExport()) {
+      continue;
+    }
+
+    if (CALL_SITE_METHODS.includes(name)) {
+      record(declaration.getStart());
+    }
+  }
+
+  for (const statement of sourceFile.getVariableStatements()) {
+    if (!statement.isExported()) {
+      continue;
+    }
+
+    const declarations = statement.getDeclarations();
+    const single = declarations.length === 1;
+
+    for (const declaration of declarations) {
+      if (!CALL_SITE_METHODS.includes(declaration.getName())) {
+        continue;
+      }
+
+      record(single ? statement.getStart() : declaration.getNameNode().getStart());
+    }
+  }
+
+  for (const exportDeclaration of sourceFile.getExportDeclarations()) {
+    for (const specifier of exportDeclaration.getNamedExports()) {
+      const exportedName = specifier.getAliasNode()?.getText() ?? specifier.getName();
+
+      if (CALL_SITE_METHODS.includes(exportedName)) {
+        record(specifier.getStart());
+      }
+    }
+  }
+
+  if (earliest === undefined) {
+    return undefined;
+  }
+
+  const { line, column } = sourceFile.getLineAndColumnAtPos(earliest);
+
+  return { line, column };
+}
+
+/**
+ * The 1-based position of a module's default export, or `undefined` when it
+ * has none.
+ *
+ * The position `../route-map.ts` gives a legacy Pages Router API module's
+ * route entry, in the same probe order: `export default function`,
+ * `export default class`, `export default <expression>` and
+ * `export { X as default }`. `export =` is skipped — a CommonJS-only form no
+ * supported router serves.
+ *
+ * @param sourceFile The route module to read.
+ * @returns The default export's position, or `undefined`.
+ */
+function defaultExportPosition(sourceFile: SourceFile): Position | undefined {
+  const offset = defaultExportOffset(sourceFile);
+
+  if (offset === undefined) {
+    return undefined;
+  }
+
+  const { line, column } = sourceFile.getLineAndColumnAtPos(offset);
+
+  return { line, column };
+}
+
+/**
+ * The character offset a module's default export starts at, probed in
+ * `../route-map.ts`'s order.
+ *
+ * Split from {@link defaultExportPosition} so the probe can return at its
+ * first hit — the behaviour that module has — rather than collecting every
+ * candidate and choosing afterwards.
+ *
+ * @param sourceFile The module to read.
+ * @returns The offset, or `undefined` when the module has no default export.
+ */
+function defaultExportOffset(sourceFile: SourceFile): number | undefined {
+  for (const declaration of sourceFile.getFunctions()) {
+    if (declaration.isDefaultExport()) {
+      return declaration.getStart();
+    }
+  }
+
+  for (const declaration of sourceFile.getClasses()) {
+    if (declaration.isDefaultExport()) {
+      return declaration.getStart();
+    }
+  }
+
+  for (const assignment of sourceFile.getExportAssignments()) {
+    if (!assignment.isExportEquals()) {
+      return assignment.getStart();
+    }
+  }
+
+  for (const exportDeclaration of sourceFile.getExportDeclarations()) {
+    for (const specifier of exportDeclaration.getNamedExports()) {
+      const exportedName = specifier.getAliasNode()?.getText() ?? specifier.getName();
+
+      if (exportedName === DEFAULT_EXPORT_NAME) {
+        return specifier.getStart();
+      }
+    }
+  }
+
+  return undefined;
+}
+
+/**
+ * The `api-route` node of one module, when that module is a request-handling
+ * route module whose identity is unambiguous.
+ *
+ * **A reproduced sibling rule, not a second derivation.** The `api-route`
+ * node's id is built from a route *path* and a route entry's position, both of
+ * which `../route-map.ts` owns and this module may not import (see the
+ * header's contract). The rule is therefore reproduced here in the same way
+ * `./event-handlers.ts`'s and `./symbols.ts`'s naming rules are — from the
+ * same `@debuggen/shared` path primitives that module uses, over the same two
+ * conventional router directories `./api-routes.ts` probes — and it is
+ * reproduced **strictly**: every spelling the derivation cannot vouch for
+ * (a private folder, an intercepting route, a malformed bracket segment, a
+ * misplaced catch-all, an unsupported extension, a tree in a non-conventional
+ * directory) answers `undefined`, and the cascade then falls through to the
+ * `symbol` node that exists for the declaration regardless. The failure
+ * direction is a less specific edge, never a dangling one.
+ *
+ * Only the two request-handling conventions are derived, because they are the
+ * two the cascade's route step names: an App Router `route.*` module and a
+ * legacy `pages/api/**` module. A `page.*` module's default export renders a
+ * document rather than answering a request, so its calls keep the owner the
+ * declaration itself provides.
+ *
+ * @param file The module's project-relative POSIX path, as `ExtractorContext`
+ * spells it.
+ * @param sourceFile The module, for the position its route entry carries.
+ * @returns The route identity, or `undefined`.
+ */
+function routeIdentityOf(file: string, sourceFile: SourceFile): RouteIdentity | undefined {
+  const normalized = normalizePosix(toPosix(file));
+
+  // The same refinement `./api-routes.ts` applies before emitting a node, so
+  // this step cannot claim a node that extractor declined to emit.
+  if (!isSafeRelativePath(normalized)) {
+    return undefined;
+  }
+
+  for (const directory of APP_DIRECTORY_CANDIDATES) {
+    const rest = belowDirectory(normalized, directory);
+
+    if (rest === undefined) {
+      continue;
+    }
+
+    const routePath = appRoutePathOf(rest);
+
+    return routePath === undefined
+      ? undefined
+      : {
+          id: apiRouteNodeId(normalized, routePath, appHandlerPosition(sourceFile)),
+          router: 'app',
+        };
+  }
+
+  for (const directory of PAGES_DIRECTORY_CANDIDATES) {
+    const rest = belowDirectory(normalized, directory);
+
+    if (rest === undefined) {
+      continue;
+    }
+
+    const routePath = pagesRoutePathOf(rest);
+
+    return routePath === undefined
+      ? undefined
+      : {
+          id: apiRouteNodeId(normalized, routePath, defaultExportPosition(sourceFile)),
+          router: 'pages',
+        };
+  }
+
+  return undefined;
+}
+
+/**
+ * The id of the `api-route` node `./api-routes.ts` emits for one route.
+ *
+ * Spelled exactly as that extractor spells it: the node's `name` is the route
+ * path and its position is the route entry's, which is the first handler
+ * declaration (or the default export) of the module. A module whose handler
+ * could not be located is anchored at the start of the file — the fallback
+ * `../route-map.ts` uses, and the reason this takes an optional position
+ * rather than refusing one.
+ *
+ * @param file The module's project-relative POSIX path, normalised.
+ * @param routePath The URL the module answers.
+ * @param position The route entry's position, or `undefined` for the fallback.
+ * @returns The node id.
+ */
+function apiRouteNodeId(file: string, routePath: string, position: Position | undefined): string {
+  return makeNodeId({
+    kind: 'api-route',
+    file,
+    name: routePath,
+    line: position?.line ?? FILE_NODE_LINE,
+    column: position?.column ?? FILE_NODE_COLUMN,
+  });
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * The module's export surface
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * The names a module exports each of its own declarations under, by declared
+ * name.
+ *
+ * The two export forms a declaration cannot be asked about directly, because
+ * either may be written anywhere in the module — including above the
+ * declaration it names:
+ *
+ * - `export { load }` and `export { load as fetchAll }` — a **local** clause,
+ *   which is the one `./server-functions.ts` resolves against its own
+ *   declarations. A clause carrying a module specifier exports something this
+ *   module does not declare, so it contributes nothing here, and a type-only
+ *   clause or specifier contributes nothing either: a type vanishes at run
+ *   time, so it can never own a call site.
+ * - `export default load` — a default assignment naming a local declaration.
+ *   A `default` **keyword** on the declaration itself is read from the
+ *   declaration, and `export = load` is skipped, which is what that sibling
+ *   does: it is a CommonJS-only form, and no `server-function` node exists for
+ *   one.
+ *
+ * Keyed by the declared name because that is the key that sibling resolves a
+ * clause through, so the two agree on which declaration a clause exports.
+ *
+ * @param sourceFile The module to read.
+ * @returns Exported names by declared name; empty for a module that exports
+ * nothing this way.
+ */
+function localExportNamesOf(sourceFile: SourceFile): ReadonlyMap<string, readonly string[]> {
+  const names = new Map<string, string[]>();
+
+  const record = (localName: string, exportedAs: string): void => {
+    if (localName.length === 0 || exportedAs.length === 0) {
+      return;
+    }
+
+    const existing = names.get(localName);
+
+    if (existing === undefined) {
+      names.set(localName, [exportedAs]);
+    } else if (!existing.includes(exportedAs)) {
+      existing.push(exportedAs);
+    }
+  };
+
+  for (const statement of sourceFile.getStatements()) {
+    if (Node.isExportDeclaration(statement)) {
+      if (statement.isTypeOnly() || statement.getModuleSpecifier() !== undefined) {
+        continue;
+      }
+
+      for (const specifier of statement.getNamedExports()) {
+        if (specifier.isTypeOnly()) {
+          continue;
+        }
+
+        record(specifier.getName(), specifier.getAliasNode()?.getText() ?? specifier.getName());
+      }
+
+      continue;
+    }
+
+    if (Node.isExportAssignment(statement) && !statement.isExportEquals()) {
+      const expression = statement.getExpression();
+
+      if (Node.isIdentifier(expression)) {
+        record(expression.getText(), DEFAULT_EXPORT_NAME);
+      }
+    }
+  }
+
+  return names;
+}
+
+/**
+ * Every name one declaration leaves its module under: none, its own, or
+ * `default`.
+ *
+ * The whole of this module's export reading, and the reason it is a list
+ * rather than a flag: the cascade asks two different questions of it — "is
+ * this declaration exported at all" for the server-function step, and "is it
+ * exported under an HTTP method's name" for the route step — and both need the
+ * names rather than the fact.
+ *
+ * Precise about which name each form contributes, because the route step turns
+ * on it: a declaration carrying `export default` leaves the module as
+ * `default` and **not** under its declared name, so
+ * `export default function GET() {}` in a handler module is a default export
+ * rather than a `GET` handler — which is exactly what the framework and
+ * `../route-map.ts` both make of it.
+ *
+ * @param declaration The innermost addressable declaration.
+ * @param facts What this module's own syntax says, for its export clauses.
+ * @returns The exported names, in a deterministic order; empty when the
+ * declaration stays inside its module.
+ */
+function exportNamesOf(declaration: AddressableDeclaration, facts: ModuleFacts): readonly string[] {
+  const clauseNames = facts.exports.get(declaration.name) ?? NO_EXPORT_NAMES;
+
+  if (declaration.defaultExported) {
+    return clauseNames.includes(DEFAULT_EXPORT_NAME)
+      ? clauseNames
+      : [DEFAULT_EXPORT_NAME, ...clauseNames];
+  }
+
+  if (declaration.keywordExported) {
+    return clauseNames.includes(declaration.name)
+      ? clauseNames
+      : [declaration.name, ...clauseNames];
+  }
+
+  return clauseNames;
 }
 
 /**
@@ -2092,7 +3322,8 @@ function addressableDeclarationOf(node: Node): AddressableDeclaration | undefine
             name: DEFAULT_EXPORT_NAME,
             anchor: node,
             functionValued: true,
-            plainlyExported: false,
+            keywordExported: false,
+            defaultExported: true,
             classMember: false,
           }
         : undefined;
@@ -2102,7 +3333,8 @@ function addressableDeclarationOf(node: Node): AddressableDeclaration | undefine
       name: declaredName,
       anchor: nameNode,
       functionValued: true,
-      plainlyExported: node.hasExportKeyword() && !node.hasDefaultKeyword(),
+      keywordExported: node.hasExportKeyword(),
+      defaultExported: node.hasDefaultKeyword(),
       classMember: false,
     };
   }
@@ -2122,7 +3354,8 @@ function addressableDeclarationOf(node: Node): AddressableDeclaration | undefine
       name: declaredName,
       anchor: nameNode,
       functionValued: false,
-      plainlyExported: node.hasExportKeyword() && !node.hasDefaultKeyword(),
+      keywordExported: node.hasExportKeyword(),
+      defaultExported: node.hasDefaultKeyword(),
       classMember: false,
     };
   }
@@ -2145,7 +3378,8 @@ function addressableDeclarationOf(node: Node): AddressableDeclaration | undefine
       name: declaredName,
       anchor: nameNode,
       functionValued: isFunctionValued(node.getInitializer()),
-      plainlyExported: statement.hasExportKeyword(),
+      keywordExported: statement.hasExportKeyword(),
+      defaultExported: false,
       classMember: false,
     };
   }
@@ -2168,7 +3402,8 @@ function addressableDeclarationOf(node: Node): AddressableDeclaration | undefine
       name: declaredName,
       anchor: nameNode,
       functionValued: false,
-      plainlyExported: node.hasExportKeyword(),
+      keywordExported: node.hasExportKeyword(),
+      defaultExported: node.hasDefaultKeyword(),
       classMember: false,
     };
   }
@@ -2179,7 +3414,8 @@ function addressableDeclarationOf(node: Node): AddressableDeclaration | undefine
           name: CONSTRUCTOR_NAME,
           anchor: node,
           functionValued: true,
-          plainlyExported: false,
+          keywordExported: false,
+          defaultExported: false,
           classMember: true,
         }
       : undefined;
@@ -2206,10 +3442,11 @@ function addressableDeclarationOf(node: Node): AddressableDeclaration | undefine
       name: declaredName,
       anchor: nameNode,
       // A class member is not a module export, whatever its class's status is,
-      // so the server-function branch is unreachable for one — `classMember`
-      // is what keeps it that way.
+      // so neither the route step nor the server-function step is reachable
+      // for one — `classMember` is what keeps it that way.
       functionValued: !Node.isPropertyDeclaration(node),
-      plainlyExported: false,
+      keywordExported: false,
+      defaultExported: false,
       classMember: true,
     };
   }
@@ -2259,16 +3496,66 @@ function declarationAnchorOf(node: Node): Node | undefined {
 }
 
 /**
- * The owner of a call site whose innermost addressable declaration is known:
- * the cascade's steps 2 and 3.
+ * Whether one declaration is the request handler of this route module.
  *
- * The server-function branch is taken only for the unambiguous shape — a
- * module-level, function-valued declaration carrying a plain `export` keyword,
- * in a module that is neither a route/page module nor a component module — for
- * the asymmetry the header states: a `symbol` node exists for every
- * module-level declaration, while a `server-function` node exists only where
- * `./server-functions.ts` agreed, and a disagreement costs the edge rather
- * than degrading it.
+ * The convention decides what counts, which is why
+ * {@link RouteIdentity.router} is carried at all:
+ *
+ * - **App Router** — a declaration this module exports under the name of an
+ *   HTTP method (`export async function GET`, `export const POST = …`,
+ *   `export { handler as PUT }`). The name *is* the method, which is the whole
+ *   of the framework's rule and of `../route-map.ts`'s reading of it.
+ * - **Legacy Pages Router** — the module's default export, which *is* the
+ *   route: one function dispatching on the request method, with nothing
+ *   per-method to enumerate.
+ *
+ * A class member is never a handler whatever its name, because a route module
+ * exports functions and a member is not an export.
+ *
+ * @param route This module's route identity.
+ * @param declaration The innermost addressable declaration.
+ * @param exportNames The names that declaration leaves the module under.
+ * @returns `true` when the declaration answers this route's requests.
+ */
+function servesRoute(
+  route: RouteIdentity,
+  declaration: AddressableDeclaration,
+  exportNames: readonly string[],
+): boolean {
+  if (declaration.classMember) {
+    return false;
+  }
+
+  return route.router === 'pages'
+    ? exportNames.includes(DEFAULT_EXPORT_NAME)
+    : exportNames.some((exported) => CALL_SITE_METHODS.includes(exported));
+}
+
+/**
+ * The owner of a call site whose innermost addressable declaration is known:
+ * the cascade's steps 2, 3 and 4.
+ *
+ * Most specific first, and each step names a node kind whose spelling is
+ * guaranteed by the extractor in brackets:
+ *
+ * 1. the declaration answers this module's route → the **api-route** node
+ *    (`./api-routes.ts`), claimed only where {@link routeIdentityOf} could
+ *    vouch for the route's identity;
+ * 2. otherwise, in a module that is neither a route/page module nor a
+ *    component module, an exported function-valued declaration → the
+ *    **server-function** node (`./server-functions.ts`);
+ * 3. otherwise its **symbol** node (`./symbols.ts`).
+ *
+ * "Exported" is the module's whole export surface and not a keyword: a
+ * declaration exported by a clause (`export { load }`, `export { load as
+ * fetchAll }`) or by a default assignment (`export default load`) is as much a
+ * `server-function` node as one carrying the keyword, because that is what
+ * `./server-functions.ts` emits for each of them — under the declaration's own
+ * name, at its own position, which is what the id spelled here reproduces.
+ * Both steps therefore claim a node that exists; the asymmetry that remains is
+ * the safe one, since the `symbol` node of step 3 exists for every
+ * module-level declaration and is reached whenever either of the more specific
+ * steps declines.
  *
  * @param file The module's project-relative POSIX path.
  * @param declaration The innermost addressable declaration.
@@ -2280,15 +3567,25 @@ function declaredOwner(
   declaration: AddressableDeclaration,
   facts: ModuleFacts,
 ): Owner {
-  const { line, column } = positionOf(declaration.anchor);
   const { name } = declaration;
+  const exportNames = exportNamesOf(declaration, facts);
+
+  if (facts.route !== undefined && servesRoute(facts.route, declaration, exportNames)) {
+    // The route node is named for a URL and positioned at the route entry, so
+    // the call site's `symbol` still names the function it sits inside — the
+    // handler — rather than the route path. The declaration's own position is
+    // not needed, and is deliberately not computed on this path.
+    return { kind: 'api-route', id: facts.route.id, symbol: name };
+  }
+
+  const { line, column } = positionOf(declaration.anchor);
 
   if (
     !facts.routeModule &&
     !facts.componentModule &&
     !declaration.classMember &&
     declaration.functionValued &&
-    declaration.plainlyExported
+    exportNames.length > 0
   ) {
     return {
       kind: 'server-function',
@@ -2301,6 +3598,111 @@ function declaredOwner(
     kind: 'symbol',
     id: makeNodeId({ kind: 'symbol', file, name, line, column }),
     symbol: name,
+  };
+}
+
+/**
+ * Whether an expression is a wrapper that changes nothing about what it
+ * encloses.
+ *
+ * `(fn)`, `fn as T`, `fn satisfies T`, `fn!` and `<T>fn` — the set
+ * `./symbols.ts` peels when it positions a default export's node. The set is
+ * *tested* rather than peeled here, because the two siblings this module
+ * points at disagree about which node a wrapped default export is anchored at:
+ * `./server-functions.ts` positions it at the assignment's own expression and
+ * `./symbols.ts` at the peeled one. A wrapper therefore rules the `symbol`
+ * step out (see {@link defaultExportOwner}) rather than being read through.
+ *
+ * @param expression The default export's expression.
+ * @returns `true` when a wrapper stands between the assignment and its value.
+ */
+function isTransparentWrapper(expression: Node): boolean {
+  return (
+    Node.isParenthesizedExpression(expression) ||
+    Node.isAsExpression(expression) ||
+    Node.isSatisfiesExpression(expression) ||
+    Node.isNonNullExpression(expression) ||
+    Node.isTypeAssertion(expression)
+  );
+}
+
+/**
+ * The owner of a call site written inside an `export default <expression>`
+ * assignment, or `undefined` when that assignment addresses no node.
+ *
+ * The default-export shape has no declaration of its own — there is no name to
+ * hang one on — so {@link addressableDeclarationOf} answers nothing for it and
+ * the ancestor walk would otherwise run past it to the file node. Three nodes
+ * *are* addressable for it, and which one applies is the cascade's own order:
+ *
+ * 1. a legacy `pages/api/**` module's default export **is** the route, so a
+ *    call inside it belongs to the **api-route** node — the same step
+ *    {@link declaredOwner} takes for a named default-exported handler;
+ * 2. in a server module, a default-exported function is one of its exports, so
+ *    the **server-function** node `./server-functions.ts` emits for it applies.
+ *    That node is named `default` and positioned at the assignment's own
+ *    expression, wrappers included, which is what is spelled here;
+ * 3. otherwise the **symbol** node `./symbols.ts` mints for a default export
+ *    that names no declaration — also `default`, but positioned at the
+ *    *peeled* expression, so this step is taken only when no wrapper stands in
+ *    between and the two positions coincide.
+ *
+ * `export =` addresses nothing: it is the TypeScript form for a CommonJS
+ * module's single export, and neither sibling records a default export for it.
+ * A bare identifier addresses nothing here either — it names a declaration
+ * that owns its own calls, and a call site inside that declaration reaches it
+ * earlier in the walk.
+ *
+ * @param file The module's project-relative POSIX path.
+ * @param facts What this module's own syntax says.
+ * @param assignment The `export default` statement.
+ * @returns The owner, or `undefined` when the walk should continue.
+ */
+function defaultExportOwner(
+  file: string,
+  facts: ModuleFacts,
+  assignment: ExportAssignment,
+): Owner | undefined {
+  if (assignment.isExportEquals()) {
+    return undefined;
+  }
+
+  const expression = assignment.getExpression();
+
+  if (Node.isIdentifier(expression)) {
+    return undefined;
+  }
+
+  const { line, column } = positionOf(expression);
+
+  if (isFunctionValued(expression)) {
+    if (facts.route?.router === 'pages') {
+      return { kind: 'api-route', id: facts.route.id, symbol: DEFAULT_EXPORT_NAME };
+    }
+
+    if (!facts.routeModule && !facts.componentModule) {
+      return {
+        kind: 'server-function',
+        id: makeNodeId({
+          kind: 'server-function',
+          file,
+          name: DEFAULT_EXPORT_NAME,
+          line,
+          column,
+        }),
+        symbol: DEFAULT_EXPORT_NAME,
+      };
+    }
+  }
+
+  if (isTransparentWrapper(expression)) {
+    return undefined;
+  }
+
+  return {
+    kind: 'symbol',
+    id: makeNodeId({ kind: 'symbol', file, name: DEFAULT_EXPORT_NAME, line, column }),
+    symbol: DEFAULT_EXPORT_NAME,
   };
 }
 
@@ -2353,8 +3755,8 @@ function fileOwner(ctx: ExtractorContext, site: CallSite): Owner {
  *    anchor a markup binding resolved to → the **handler** node (this is the
  *    memoised shape: the declaration is reached *through* the `useCallback`
  *    call, which the walk simply steps over);
- * 3. the innermost addressable declaration otherwise → its **server-function**
- *    or **symbol** node, per {@link declaredOwner};
+ * 3. the innermost addressable declaration otherwise → its **api-route**,
+ *    **server-function** or **symbol** node, per {@link declaredOwner};
  * 4. nothing addressable anywhere up the chain → the **file** node.
  *
  * Returning at the first addressable declaration is what makes step 3
@@ -2389,11 +3791,19 @@ function ownerOf(ctx: ExtractorContext, site: CallSite, facts: ModuleFacts): Own
 
     const declaration = addressableDeclarationOf(ancestor);
 
-    if (declaration === undefined) {
-      continue;
+    if (declaration !== undefined) {
+      return declaredOwner(ctx.file, declaration, facts);
     }
 
-    return declaredOwner(ctx.file, declaration, facts);
+    // `export default <function>` declares nothing, so the step above answers
+    // nothing for it — and three nodes are addressable for it anyway.
+    if (Node.isExportAssignment(ancestor)) {
+      const exported = defaultExportOwner(ctx.file, facts, ancestor);
+
+      if (exported !== undefined) {
+        return exported;
+      }
+    }
   }
 
   return fileOwner(ctx, site);
@@ -2412,7 +3822,9 @@ function ownerOf(ctx: ExtractorContext, site: CallSite, facts: ModuleFacts): Own
  * round-trippable through JSON.
  *
  * @param target What the source says about the request's target.
- * @param method The HTTP method, or `undefined` when the source states none.
+ * @param method The HTTP method, or `undefined` when none may be recorded —
+ * the source stated none and the shape has no platform default, or it stated a
+ * verb outside the shared vocabulary.
  * @returns The payload.
  */
 function apiCallData(target: RequestTarget, method: string | undefined): ApiCallNodeData {
@@ -2705,6 +4117,8 @@ function extractApiCalls(ctx: ExtractorContext): ExtractorResult {
       routeModule: isRouteModulePath(ctx.file),
       componentModule: jsx.hasJsx && declaresComponentName(ctx.sourceFile),
       handlers: handlerRefsOf(jsx.attributes, ctx.file, diagnostics),
+      route: routeIdentityOf(ctx.file, ctx.sourceFile),
+      exports: localExportNamesOf(ctx.sourceFile),
     };
     sites = collectCallSites(ctx.sourceFile, ctx.file, diagnostics);
   } catch (cause) {
@@ -2718,6 +4132,24 @@ function extractApiCalls(ctx: ExtractorContext): ExtractorResult {
     try {
       const owner = ownerOf(ctx, site, facts);
       const node = apiCallNode(ctx.file, site, owner);
+
+      // The one case where a node is deliberately less complete than the
+      // source: a literal method outside the shared vocabulary. Logged rather
+      // than raised as a diagnostic — the index is not missing an item, one
+      // item is missing an optional field — and the verb itself is not named,
+      // because it is source text.
+      if (site.unsupportedMethod) {
+        ctx.logger.debug(
+          'API call method not recorded: the literal is outside the HTTP vocabulary',
+          {
+            extractorId: API_CALLS_EXTRACTOR_ID,
+            file: ctx.file,
+            shape: site.shape,
+            line: node.line,
+            column: node.column,
+          },
+        );
+      }
 
       nodes.push(node);
       edges.push(callsEdge(node, owner.id));

@@ -66,19 +66,34 @@
  *
  * ## Harness
  *
- * One throwaway `node:http` listener on `127.0.0.1` and an ephemeral port
- * serves that folder as inert bytes with an accurate `Content-Length` — the
- * harness the fixtures' README specifies, and the origin every case pins to.
- * Nothing leaves loopback, no port is fixed (a sibling checkout on this host
- * may be running the same suite), and the two mutable cases copy into an
- * `mkdtemp` sandbox: `packages/code-analysis/test/fixtures/**` is a read-only
- * input, and `git status --porcelain packages/code-analysis` must stay empty
- * after `pnpm test`.
+ * An in-memory `fetch` double, injected as `fetchImpl`, answers the fixture
+ * folder as inert bytes with an accurate `Content-Length` from a route table
+ * keyed by absolute URL on a fixed loopback origin — the artifacts the
+ * fixtures' README specifies, and the origin every case pins to. **No socket
+ * is opened, no port is bound and the global `fetch` is never reached**, so
+ * every case here is a statement about what the resolver requested and what it
+ * did with the answer, with no transport in the way; transport integration
+ * belongs to the Playwright browser and end-to-end suites (AAP 0.8.3), which
+ * run a real dev server. See "The dev-server double" below.
+ *
+ * The filesystem is the one real resource this suite does use, and only under
+ * an `mkdtemp` sandbox: `packages/code-analysis/test/fixtures/**` is a
+ * read-only input, so every case that needs a missing, different or
+ * deliberately hostile original — including the symbolic links of "canonical
+ * containment of the project read", which cannot be expressed any other way —
+ * plants its own and removes it when the case ends. `git status --porcelain
+ * packages/code-analysis` must stay empty after `pnpm test`.
  */
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
-import { createServer } from 'node:http';
-import type { IncomingMessage, Server, ServerResponse } from 'node:http';
-import type { Socket } from 'node:net';
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -93,7 +108,7 @@ import {
 import type { LogFields, LogLevel, Logger, SourceLocation } from '@debuggen/shared';
 import { AnyMap, FlattenMap, TraceMap } from '@jridgewell/trace-mapping';
 import type { SectionedSourceMapInput, SourceMapInput } from '@jridgewell/trace-mapping';
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { createSourceMapCache, fetchSourceMap, isSectionedSourceMap } from './fetch-map.js';
 import type { SourceMapCache, SourceMapDocument, SourceMapLookup } from './fetch-map.js';
@@ -184,7 +199,7 @@ const RELATIVE_CHUNK = 'relative-sources-chunk.js';
 /** The map named by {@link RELATIVE_CHUNK}'s directive. */
 const RELATIVE_MAP = 'relative-sources.js.map';
 
-/** Every fixture artifact the harness serves, read once as bytes. */
+/** Every fixture artifact the double serves, read once as bytes. */
 const SERVED_FIXTURES: readonly string[] = [
   WEBPACK_CHUNK,
   WEBPACK_MAP,
@@ -530,10 +545,40 @@ const NORMALISATION_CASES: readonly (readonly [source: string, file: string])[] 
 ];
 
 // ---------------------------------------------------------------------------
-// The loopback harness
+// The dev-server double
 // ---------------------------------------------------------------------------
 
-/** Where the harness pretends a dev server serves its chunks from. */
+/**
+ * A strict, in-memory stand-in for the dev server: a route table of committed
+ * fixture bytes, injected as `fetchImpl`, answering from memory.
+ *
+ * **No socket is opened and no port is bound.** Nothing here listens, connects
+ * or touches the global `fetch`, so the suite is hermetic by construction
+ * rather than by being pointed at loopback: there is no bind to fail under a
+ * restricted sandbox, no ephemeral port for a sibling checkout on this host to
+ * clash over, no accepted connection to leak, and no keep-alive socket that
+ * could hang teardown. Every case is therefore a statement about what
+ * `resolver.ts` *asked for* and what it did with the answer — which is what
+ * this suite is for.
+ *
+ * Transport itself is deliberately not exercised here. Whether a real
+ * `Response` arrives over a real connection is integration ground and is
+ * covered by the Playwright browser and end-to-end suites (AAP 0.8.3), which
+ * run a real dev server; `./fetch-map.ts` owns the request policy and is tested
+ * against its own doubles. What this file needs from the transport is only that
+ * the bytes and the status reach the resolver unchanged, and a `Response` built
+ * over the fixture bytes delivers exactly that — including a real body stream,
+ * which is the rung `fetchSourceMap` prefers when it enforces its size ceiling.
+ *
+ * The double is strict in three ways, each of which a laxer stub would hide:
+ * it answers **only** the exact absolute URLs in its table, it 404s everything
+ * else (including the three `.map` paths the fixture folder deliberately does
+ * not contain, so a resolver that derived a map name from a chunk name gets
+ * "not found" rather than a map), and it records every URL and every init so a
+ * case can assert precisely what was requested.
+ */
+
+/** Where the double serves its chunks from. */
 const CHUNK_PREFIX = '/_next/static/chunks/';
 
 /** The media type a chunk is served with. */
@@ -545,20 +590,46 @@ const JSON_MEDIA_TYPE = 'application/json; charset=utf-8';
 /** The media type the 404 body is served with. */
 const TEXT_MEDIA_TYPE = 'text/plain; charset=utf-8';
 
-/** Every path the harness was asked for, in arrival order. Cleared per case. */
+/** The body an unrouted URL is answered with. */
+const NOT_FOUND_BODY = 'not found';
+
+/**
+ * The origin every case pins as its `devServerOrigin`.
+ *
+ * Fixed, which is exactly what binding a socket made impossible: with nothing
+ * listening there is no port to contend for, so a literal is deterministic and
+ * cannot clash with a sibling checkout. `fetchSourceMap` requires the pin to be
+ * a credential-free loopback `http(s)` origin and nothing more, and this is
+ * one.
+ */
+const liveOrigin = 'http://127.0.0.1:43219';
+
+/** Every path the double was asked for, in arrival order. Cleared per case. */
 const received: string[] = [];
 
-/** The bytes the harness serves, keyed by artifact name. */
-const bodies = new Map<string, Buffer>();
+/** One request the double answered. */
+interface RecordedRequest {
+  /** The absolute URL, as the module asked for it. */
+  readonly url: string;
 
-/** Every accepted socket, so teardown cannot block on a live connection. */
-const openSockets = new Set<Socket>();
+  /** The init the module passed, untouched. */
+  readonly init: RequestInit | undefined;
+}
 
-/** The listener, held so `afterAll` can close exactly the one it opened. */
-let server: Server | undefined;
+/**
+ * Every request the double answered, in order. Cleared per case.
+ *
+ * {@link received} is the same log reduced to paths, kept because most cases
+ * assert the exact sequence of artifacts requested; this one keeps the init so
+ * the credential-free, redirect-refusing request policy can be asserted too.
+ */
+const requests: RecordedRequest[] = [];
 
-/** `http://127.0.0.1:<ephemeral>`: the origin every case pins to. */
-let liveOrigin = '';
+/** One artifact the double serves. */
+interface ServedArtifact {
+  readonly bytes: Buffer;
+  readonly mediaType: string;
+}
 
 /** Reads one fixture artifact as bytes. This suite never writes to that tree. */
 function fixtureBytes(name: string): Buffer {
@@ -570,98 +641,89 @@ function fixtureText(name: string): string {
   return readFileSync(new URL(name, FIXTURE_DIR), 'utf8');
 }
 
-/** Sends one complete response with an accurate `Content-Length`. */
-function respond(response: ServerResponse, status: number, mediaType: string, body: Buffer): void {
-  response.writeHead(status, {
-    'content-type': mediaType,
-    'content-length': String(body.byteLength),
-  });
-  response.end(body);
+/**
+ * The route table: absolute URL to artifact, built once at module load.
+ *
+ * Each committed artifact is read exactly once, and the two synthetic pairs are
+ * served beside them from memory. Keyed by the full URL rather than by name so
+ * that a request to any other origin — a chunk URL a case deliberately puts on
+ * a different port — misses the table and 404s instead of being answered.
+ */
+function buildRoutes(): ReadonlyMap<string, ServedArtifact> {
+  const routes = new Map<string, ServedArtifact>();
+
+  const serve = (name: string, bytes: Buffer): void => {
+    routes.set(liveUrl(name), {
+      bytes,
+      mediaType: name.endsWith('.map') ? JSON_MEDIA_TYPE : JS_MEDIA_TYPE,
+    });
+  };
+
+  for (const name of SERVED_FIXTURES) {
+    serve(name, fixtureBytes(name));
+  }
+  serve(ESCAPING_CHUNK, Buffer.from(ESCAPING_CHUNK_JS, 'utf8'));
+  serve(ESCAPING_MAP, Buffer.from(ESCAPING_MAP_JSON, 'utf8'));
+  serve(RELATIVE_CHUNK, Buffer.from(RELATIVE_CHUNK_JS, 'utf8'));
+  serve(RELATIVE_MAP, Buffer.from(RELATIVE_MAP_JSON, 'utf8'));
+
+  return routes;
 }
 
-beforeAll(async () => {
-  for (const name of SERVED_FIXTURES) {
-    bodies.set(name, fixtureBytes(name));
-  }
-  bodies.set(ESCAPING_CHUNK, Buffer.from(ESCAPING_CHUNK_JS, 'utf8'));
-  bodies.set(ESCAPING_MAP, Buffer.from(ESCAPING_MAP_JSON, 'utf8'));
-  bodies.set(RELATIVE_CHUNK, Buffer.from(RELATIVE_CHUNK_JS, 'utf8'));
-  bodies.set(RELATIVE_MAP, Buffer.from(RELATIVE_MAP_JSON, 'utf8'));
+const ROUTES: ReadonlyMap<string, ServedArtifact> = buildRoutes();
 
-  const listener = createServer((request: IncomingMessage, response: ServerResponse) => {
-    const path = request.url ?? '';
-    received.push(path);
+/** The absolute URL of a `fetch` argument, in any of its three forms. */
+function requestedUrl(input: Parameters<typeof fetch>[0]): string {
+  return typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+}
 
-    const body = path.startsWith(CHUNK_PREFIX)
-      ? bodies.get(path.slice(CHUNK_PREFIX.length))
-      : undefined;
+/**
+ * What {@link received} records for a URL: its path and query, which is what
+ * a server would have seen on the request line.
+ */
+function requestedPath(url: string): string {
+  const parsed = new URL(url);
+  return `${parsed.pathname}${parsed.search}`;
+}
 
-    if (body === undefined) {
-      // Everything unrouted 404s, including the three `.map` paths the fixture
-      // folder deliberately does not contain: a resolver that derived a map
-      // name from a chunk name would get this, not a map.
-      respond(response, 404, TEXT_MEDIA_TYPE, Buffer.from('not found', 'utf8'));
-      return;
-    }
-
-    respond(response, 200, path.endsWith('.map') ? JSON_MEDIA_TYPE : JS_MEDIA_TYPE, body);
+/** One complete response with an accurate `Content-Length`. */
+function respond(status: number, mediaType: string, body: Buffer): Response {
+  return new Response(body, {
+    status,
+    headers: {
+      'content-type': mediaType,
+      'content-length': String(body.byteLength),
+    },
   });
+}
 
-  listener.on('connection', (socket: Socket) => {
-    openSockets.add(socket);
-    socket.on('close', () => {
-      openSockets.delete(socket);
-    });
-  });
+/**
+ * The double itself: pass as {@link ResolveStackOptions.fetchImpl}.
+ *
+ * Every answer is already in memory, so the promise is resolved rather than
+ * awaited on anything — answering on a microtask instead of after a round trip
+ * is the whole point of the conversion. The shape still satisfies
+ * `typeof fetch`, which is what the module under test awaits.
+ */
+function serveFixtures(
+  input: Parameters<typeof fetch>[0],
+  init?: Parameters<typeof fetch>[1],
+): ReturnType<typeof fetch> {
+  const url = requestedUrl(input);
+  requests.push({ url, init });
+  received.push(requestedPath(url));
 
-  await new Promise<void>((resolve, reject) => {
-    listener.once('error', (error: Error) => {
-      reject(error);
-    });
-    // Loopback and port 0: never a wildcard bind, and never a fixed port a
-    // sibling checkout on this host could already own.
-    listener.listen(0, '127.0.0.1', () => {
-      resolve();
-    });
-  });
-
-  const address = listener.address();
-  if (address === null || typeof address === 'string') {
-    throw new Error('the loopback harness did not bind to a TCP port');
-  }
-
-  server = listener;
-  liveOrigin = `http://127.0.0.1:${String(address.port)}`;
-});
-
-afterAll(async () => {
-  // Sockets first: `close` waits for connections rather than cutting them, so
-  // a keep-alive connection left open would hang the suite instead of ending
-  // it.
-  for (const socket of openSockets) {
-    socket.destroy();
-  }
-  openSockets.clear();
-
-  const listener = server;
-  server = undefined;
-  if (listener === undefined) {
-    return;
-  }
-
-  await new Promise<void>((resolve, reject) => {
-    listener.close((error) => {
-      if (error) {
-        reject(error);
-        return;
-      }
-      resolve();
-    });
-  });
-});
+  const artifact = ROUTES.get(url);
+  return Promise.resolve(
+    artifact === undefined
+      ? respond(404, TEXT_MEDIA_TYPE, Buffer.from(NOT_FOUND_BODY, 'utf8'))
+      : respond(200, artifact.mediaType, artifact.bytes),
+  );
+}
 
 beforeEach(() => {
   received.length = 0;
+  requests.length = 0;
 });
 
 // ---------------------------------------------------------------------------
@@ -708,12 +770,12 @@ afterEach(() => {
 // Frames, options and spies
 // ---------------------------------------------------------------------------
 
-/** The URL of `name` on the harness's origin. */
+/** The URL of `name` on the double's origin. */
 function liveUrl(name: string): string {
   return `${liveOrigin}${CHUNK_PREFIX}${name}`;
 }
 
-/** The path the harness records for `name`. */
+/** The path the double records for `name`. */
 function livePath(name: string): string {
   return `${CHUNK_PREFIX}${name}`;
 }
@@ -763,8 +825,14 @@ function stackOf(...frames: readonly string[]): string {
 }
 
 /**
- * The options every case starts from: the fixture project and the harness's
- * origin as the mandatory pin, plus a cache of this case's own.
+ * The options every case starts from: the fixture project, the double's origin
+ * as the mandatory pin, the double itself as `fetchImpl`, and a cache of this
+ * case's own.
+ *
+ * Injecting `fetchImpl` here rather than leaving it to default is what keeps
+ * the suite hermetic: the module's default is the global `fetch`, and a case
+ * that forgot to pass one would reach the network instead of failing loudly.
+ * An override still wins, which is how the recording wrapper below is used.
  *
  * A fresh `createSourceMapCache()` per call is deliberate — a cache shared
  * across cases would let one case's parsed document satisfy the next case's
@@ -774,12 +842,20 @@ function resolveOptions(overrides: Partial<ResolveStackOptions> = {}): ResolveSt
   return {
     projectRoot: PROJECT_ROOT,
     devServerOrigin: liveOrigin,
+    fetchImpl: serveFixtures,
     cache: createSourceMapCache(),
     ...overrides,
   };
 }
 
-/** A `fetchImpl` that records every URL it is asked for and then delegates. */
+/**
+ * A `fetchImpl` that records every URL it is asked for and then delegates to
+ * {@link serveFixtures}.
+ *
+ * Two logs, not one duplicated: this one belongs to a single case and counts
+ * calls, which is how "no request at all" is asserted, while {@link received}
+ * is the double's own log of what it answered.
+ */
 interface FetchRecorder {
   /** Pass as {@link ResolveStackOptions.fetchImpl}. */
   readonly impl: typeof fetch;
@@ -798,8 +874,8 @@ function recordingFetch(): FetchRecorder {
       input: Parameters<typeof fetch>[0],
       init?: Parameters<typeof fetch>[1],
     ): ReturnType<typeof fetch> => {
-      urls.push(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
-      return await globalThis.fetch(input, init);
+      urls.push(requestedUrl(input));
+      return await serveFixtures(input, init);
     },
   );
 
@@ -1821,9 +1897,14 @@ describe('the two content branches', () => {
     );
 
     expect(onlyLocation(located).file).toBe('src/lib/http.ts');
-    // Called only with an absolute path the containment check has vouched for,
-    // which is the contract of that seam.
-    expect(seen).toStrictEqual([join(PROJECT_ROOT, 'src/lib/http.ts')]);
+    // The strengthened contract of that seam: called exactly once, and with the
+    // **canonical** absolute path — the realpath of a path the string-level
+    // check accepted, proven to lie inside the realpath of the project root.
+    // `realpathSync` on both sides rather than a bare `join`, because a host
+    // whose checkout or temp directory is reached through a symbolic link would
+    // otherwise make this assertion a statement about the host.
+    expect(seen).toStrictEqual([realpathSync(join(PROJECT_ROOT, 'src/lib/http.ts'))]);
+    expect(readSourceFile).toHaveBeenCalledTimes(1);
   });
 
   it('derives a symbol from the project file when the segment carries no name', async () => {
@@ -1870,6 +1951,12 @@ describe('the two content branches', () => {
     // root, so the position cannot be sanity-checked. The resolver's documented
     // behaviour is to emit it anyway — a location the map reports is better
     // than none — and to record the fact rather than hide it.
+    //
+    // Which gate answers "nothing on disk" is now the canonicalisation of the
+    // candidate — an absent file has no realpath — rather than the read
+    // failing with `ENOENT`. The outcome this case is about is unchanged, and
+    // the seam's own "the reader had nothing" route is asserted in "canonical
+    // containment of the project read".
     const located = await resolveStack(
       stackOf(frameLine(HASHED_CHUNK, { line: 9, column: 21 })),
       resolveOptions({ projectRoot: createSandbox(), logger: recording.logger }),
@@ -1903,10 +1990,323 @@ describe('the two content branches', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Canonical containment of the project read (CWE-22)
+// ---------------------------------------------------------------------------
+
+/**
+ * Real symbolic links in a real `mkdtemp` sandbox, which is the only way this
+ * property can be asserted at all: the defect is a *filesystem* fact that no
+ * string-level check and no injected reader can expose.
+ *
+ * What is under test is the composition the rest of the module relies on. The
+ * map's `sources` entry is untrusted — served by the dev server, reached from
+ * an `Error().stack` captured in the inspected page — and `resolveWithinProject`
+ * is string-level while `readFileNoFollow`'s `O_NOFOLLOW` refuses a link only at
+ * the *final* component. So `<root>/src/lib -> <outside>` satisfies both gates
+ * and `<root>/src/lib/http.ts` reads a file outside the project, whose text
+ * then feeds position validation and, through `symbolFor`, becomes a
+ * `SourceLocation.symbol` that leaves the module as protocol data.
+ * `packages/shared/src/node/safe-fs.test.ts` proves that composition
+ * insufficient, and `paths.ts` records the realpath-then-containment sequence as
+ * an obligation on the caller. These cases are this module discharging it.
+ *
+ * Every case uses {@link HASHED_CHUNK}, whose map carries no `sourcesContent`,
+ * so the project read is the only route to the original. All but one use its
+ * generated `10:8` row, the one whose segment carries **no** `names` entry: its
+ * `symbol` can come from nowhere but the file's text, so an omitted `symbol` is
+ * the assertion that no text was used and a present one names the file that
+ * supplied it. The remaining case uses `9:21`, whose segment does carry a name,
+ * to show that a refusal still emits the map's own location.
+ */
+describe('canonical containment of the project read', () => {
+  /**
+   * The identifier an escaping read would surface, planted at the row's
+   * original position (line 28, raw column 2) in the file *outside* the
+   * project.
+   *
+   * If a case ever reports `symbol: 'outsideTheProjectCursor'`, the resolver
+   * read outside the project root and put what it found on a source chip.
+   */
+  const OUTSIDE_SYMBOL = 'outsideTheProjectCursor';
+
+  /** The identifier planted at the same position *inside* the project. */
+  const INSIDE_SYMBOL = 'gaugeReadingCursor';
+
+  /** A source whose line 28 begins, at raw column 2, with `name`. */
+  function sourceNaming(name: string): string {
+    return `${'\n'.repeat(27)}  ${name}();\n`;
+  }
+
+  /** The `10:8` row of the hashed map's README table, with `symbol`. */
+  function hashedRow(symbol: string | undefined): MappingCase {
+    return {
+      generated: { line: 10, column: 8 },
+      file: 'src/lib/http.ts',
+      original: { line: 28, column: 2 },
+      ...(symbol === undefined ? { symbol: undefined } : { symbol }),
+    };
+  }
+
+  /** Whether any record's message contains `fragment`. */
+  function logged(records: readonly RecordedLog[], fragment: string): boolean {
+    return records.some((record) => record.level === 'debug' && record.message.includes(fragment));
+  }
+
+  /**
+   * A reader that genuinely reads whatever path it is handed.
+   *
+   * Deliberately faithful rather than inert: a spy that returned `undefined`
+   * would satisfy "no symbol was derived" even while the module handed it an
+   * escaping path, so the escape would show up only as a call count. This one
+   * follows links exactly as an ordinary reader would — which is also what the
+   * default reader's `O_NOFOLLOW` cannot prevent for an *interior* component —
+   * so an unrefused escape surfaces twice: as a call, and as the outside file's
+   * identifier reported as `symbol`.
+   */
+  function readingSpy(): ReturnType<typeof vi.fn<(absPath: string) => string | undefined>> {
+    return vi.fn((absPath: string): string | undefined => readFileSync(absPath, 'utf8'));
+  }
+
+  it('refuses a read through an in-project parent directory that links outside', async () => {
+    const root = createSandbox();
+    const outside = createSandbox();
+    const readSourceFile = readingSpy();
+    const recording = createRecordingLogger();
+
+    // `<outside>/http.ts` is what `<root>/src/lib/http.ts` reaches once the
+    // parent component is followed: lexically contained, canonically outside.
+    plant(outside, 'http.ts', sourceNaming(OUTSIDE_SYMBOL));
+    mkdirSync(join(root, 'src'), { recursive: true });
+    symlinkSync(outside, join(root, 'src', 'lib'), 'dir');
+
+    const located = await resolveStack(
+      stackOf(frameLine(HASHED_CHUNK, { line: 10, column: 8 })),
+      resolveOptions({ projectRoot: root, readSourceFile, logger: recording.logger }),
+    );
+
+    // Zero read attempts: the refusal happens before the seam is consulted, so
+    // the security property cannot be widened by injecting a reader — and the
+    // default reader would have opened the escaping path just as readily,
+    // since `O_NOFOLLOW` does not see an interior component.
+    expect(readSourceFile).not.toHaveBeenCalled();
+    // The outside file had no effect: the map's own position is emitted, and
+    // `symbol` is omitted rather than derived from text read outside the
+    // project.
+    expect(onlyLocation(located)).toStrictEqual(expectedSourceLocation(hashedRow(undefined)));
+    expect(onlyLocation(located)).not.toHaveProperty('symbol');
+    expectSchemaValid(onlyLocation(located));
+    // Explained once, at debug, and the map is then the authority.
+    expect(logged(recording.records, 'leaves the project once resolved')).toBe(true);
+    expect(logged(recording.records, 'trusting the map')).toBe(true);
+  });
+
+  it('refuses a read through a final component that links outside', async () => {
+    const root = createSandbox();
+    const outside = createSandbox();
+    const readSourceFile = readingSpy();
+    const recording = createRecordingLogger();
+
+    // The same class of escape at the other component: this one `O_NOFOLLOW`
+    // would also have caught, which is why the refusal must not depend on it.
+    plant(outside, 'escaped-http.ts', sourceNaming(OUTSIDE_SYMBOL));
+    mkdirSync(join(root, 'src', 'lib'), { recursive: true });
+    symlinkSync(join(outside, 'escaped-http.ts'), join(root, 'src', 'lib', 'http.ts'), 'file');
+
+    const located = await resolveStack(
+      stackOf(frameLine(HASHED_CHUNK, { line: 10, column: 8 })),
+      resolveOptions({ projectRoot: root, readSourceFile, logger: recording.logger }),
+    );
+
+    expect(readSourceFile).not.toHaveBeenCalled();
+    expect(onlyLocation(located)).toStrictEqual(expectedSourceLocation(hashedRow(undefined)));
+    expect(onlyLocation(located)).not.toHaveProperty('symbol');
+    expect(logged(recording.records, 'leaves the project once resolved')).toBe(true);
+  });
+
+  it('reads through an in-project link whose canonical target stays inside', async () => {
+    const root = createSandbox();
+    const recording = createRecordingLogger();
+
+    // The other side of the gate, and a deliberate behavioural improvement: a
+    // link inside the project pointing at project source now resolves and is
+    // read, where a no-follow open of the unresolved path failed with `ELOOP`.
+    // The file *is* project source, and canonicalising first is what makes
+    // reading it provably safe.
+    plant(root, 'src/real/http.ts', sourceNaming(INSIDE_SYMBOL));
+    mkdirSync(join(root, 'src', 'lib'), { recursive: true });
+    symlinkSync(join(root, 'src', 'real', 'http.ts'), join(root, 'src', 'lib', 'http.ts'), 'file');
+
+    const located = await resolveStack(
+      stackOf(frameLine(HASHED_CHUNK, { line: 10, column: 8 })),
+      resolveOptions({ projectRoot: root, logger: recording.logger }),
+    );
+
+    // The symbol proves the content was used, not merely that the frame
+    // survived: it exists nowhere but in the planted file's text.
+    expect(onlyLocation(located)).toStrictEqual(expectedSourceLocation(hashedRow(INSIDE_SYMBOL)));
+    expect(logged(recording.records, 'leaves the project once resolved')).toBe(false);
+    expect(logged(recording.records, 'trusting the map')).toBe(false);
+  });
+
+  it('reads nothing when the project root itself cannot be canonicalised', async () => {
+    const readSourceFile = vi.fn((): string | undefined => undefined);
+    const recording = createRecordingLogger();
+
+    // A root that does not exist is absolute and lexically fine, so every
+    // string-level gate passes it; containment against it is simply
+    // unprovable. Fail closed: no read, and the map stays the authority.
+    const located = await resolveStack(
+      stackOf(frameLine(HASHED_CHUNK, { line: 9, column: 21 })),
+      resolveOptions({
+        projectRoot: join(createSandbox(), 'no-such-project'),
+        readSourceFile,
+        logger: recording.logger,
+      }),
+    );
+
+    expect(readSourceFile).not.toHaveBeenCalled();
+    expect(onlyLocation(located)).toStrictEqual(
+      expectedSourceLocation({
+        generated: { line: 9, column: 21 },
+        file: 'src/lib/http.ts',
+        original: { line: 21, column: 22 },
+        symbol: 'fetchGaugeIndex',
+      }),
+    );
+    expect(logged(recording.records, 'Project root has no canonical form')).toBe(true);
+    expect(logged(recording.records, 'trusting the map')).toBe(true);
+  });
+
+  it('discards content whose path was replaced while it was being read', async () => {
+    const root = createSandbox();
+    const outside = createSandbox();
+    const recording = createRecordingLogger();
+
+    plant(root, 'src/lib/http.ts', sourceNaming(INSIDE_SYMBOL));
+    plant(outside, 'http.ts', sourceNaming(OUTSIDE_SYMBOL));
+    const target = join(root, 'src', 'lib', 'http.ts');
+
+    // The time-of-check to time-of-use window, driven through the seam rather
+    // than hoped about: the path is canonical and contained when it is checked,
+    // and a link out of the project by the time the content comes back. The
+    // revalidation after the read is what catches it.
+    const readSourceFile = vi.fn((absPath: string): string | undefined => {
+      expect(absPath).toBe(realpathSync(target));
+      unlinkSync(target);
+      symlinkSync(join(outside, 'http.ts'), target, 'file');
+      return sourceNaming(OUTSIDE_SYMBOL);
+    });
+
+    const located = await resolveStack(
+      stackOf(frameLine(HASHED_CHUNK, { line: 10, column: 8 })),
+      resolveOptions({ projectRoot: root, readSourceFile, logger: recording.logger }),
+    );
+
+    // The swap genuinely ran, and the content it returned was still discarded.
+    expect(readSourceFile).toHaveBeenCalledTimes(1);
+    expect(onlyLocation(located)).toStrictEqual(expectedSourceLocation(hashedRow(undefined)));
+    expect(logged(recording.records, 'changed during the read')).toBe(true);
+    expect(logged(recording.records, 'trusting the map')).toBe(true);
+  });
+
+  it('discards content whose path no longer resolves at all after the read', async () => {
+    const root = createSandbox();
+    const recording = createRecordingLogger();
+
+    plant(root, 'src/lib/http.ts', sourceNaming(INSIDE_SYMBOL));
+
+    // The other half of the revalidation: the path is not re-pointed but
+    // removed, so the check after the read has nothing to compare against
+    // rather than something that differs. Both are the same answer — content
+    // that cannot be attributed to a file inside the project is not used — and
+    // this branch would otherwise be reached only by a race no test can time.
+    const readSourceFile = vi.fn((absPath: string): string | undefined => {
+      const text = readFileSync(absPath, 'utf8');
+      rmSync(join(root, 'src'), { recursive: true, force: true });
+      return text;
+    });
+
+    const located = await resolveStack(
+      stackOf(frameLine(HASHED_CHUNK, { line: 10, column: 8 })),
+      resolveOptions({ projectRoot: root, readSourceFile, logger: recording.logger }),
+    );
+
+    expect(readSourceFile).toHaveBeenCalledTimes(1);
+    // The text it returned really did carry the identifier, so the omission
+    // below is the revalidation discarding it and not an empty read.
+    expect(readSourceFile.mock.results[0]?.value).toContain(INSIDE_SYMBOL);
+    expect(onlyLocation(located)).toStrictEqual(expectedSourceLocation(hashedRow(undefined)));
+    expect(logged(recording.records, 'changed during the read')).toBe(true);
+    expect(logged(recording.records, 'trusting the map')).toBe(true);
+  });
+
+  it('treats a reader that supplies nothing for a contained path as no content', async () => {
+    const root = createSandbox();
+    const recording = createRecordingLogger();
+
+    // The seam's own "there was no content" route, which the gates above must
+    // not have displaced: a real, canonically contained file, and a reader that
+    // declines to supply its text. The reader is reached, and the outcome is
+    // the documented one.
+    plant(root, 'src/lib/http.ts', sourceNaming(INSIDE_SYMBOL));
+    const readSourceFile = vi.fn((): string | undefined => undefined);
+
+    const located = await resolveStack(
+      stackOf(frameLine(HASHED_CHUNK, { line: 10, column: 8 })),
+      resolveOptions({ projectRoot: root, readSourceFile, logger: recording.logger }),
+    );
+
+    expect(readSourceFile).toHaveBeenCalledTimes(1);
+    expect(onlyLocation(located)).toStrictEqual(expectedSourceLocation(hashedRow(undefined)));
+    expect(logged(recording.records, 'trusting the map')).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Lookups, bounds, ordering and cancellation
 // ---------------------------------------------------------------------------
 
 describe('map lookups and the bounds on them', () => {
+  it('requests each artifact by exact URL, credential-free and redirect-refusing', async () => {
+    await resolveStack(stackOf(frameLine(HASHED_CHUNK, { line: 9, column: 21 })), resolveOptions());
+
+    // The exact URLs: the chunk, then the map its directive names under a
+    // different stem. Nothing is normalised, guessed or appended by the module
+    // on the way out.
+    expect(requests.map((request) => request.url)).toStrictEqual([
+      liveUrl(HASHED_CHUNK),
+      liveUrl(HASHED_MAP),
+    ]);
+
+    // And the exact options. This is `fetchSourceMap`'s request policy as the
+    // resolver receives it, asserted on the real init rather than trusted:
+    // `credentials: 'omit'` and **no `headers` at all** (no ambient authority —
+    // the absence of the field is the point), `redirect: 'error'` so a 3xx
+    // cannot move the request to another origin, and a signal, which is the
+    // composition of the lookup's own timeout with the caller's. The key list
+    // is asserted whole, so a header quietly added later fails this case.
+    expect(requests).toHaveLength(2);
+    for (const request of requests) {
+      const init = request.init;
+      if (init === undefined) {
+        throw new Error(`the lookup sent no init for ${request.url}`);
+      }
+
+      expect(Object.keys(init).sort()).toStrictEqual([
+        'credentials',
+        'method',
+        'redirect',
+        'signal',
+      ]);
+      expect(init.method).toBe('GET');
+      expect(init.credentials).toBe('omit');
+      expect(init.redirect).toBe('error');
+      expect(init.headers).toBeUndefined();
+      expect(init.signal).toBeInstanceOf(AbortSignal);
+      expect(init.signal?.aborted).toBe(false);
+    }
+  });
+
   it('looks a chunk map up exactly once however many frames point into it', async () => {
     const recorder = recordingFetch();
 
@@ -2223,18 +2623,25 @@ describe('the promise that neither entry point throws', () => {
   });
 
   it('survives a source reader that throws', async () => {
-    const readSourceFile = (): string | undefined => {
+    const readSourceFile = vi.fn((): string | undefined => {
       throw new Error('this reader is hostile');
-    };
+    });
 
     // The hashed map carries no `sourcesContent`, so the reader is the only
     // route to the original: a throw from it means "no content", which leaves
     // the map as the authority rather than failing the frame.
+    //
+    // `PROJECT_ROOT` and not a sandbox, deliberately: `src/lib/http.ts` exists
+    // there, so the read is actually attempted and the throw is actually
+    // caught. The call count is asserted because a case that stopped reaching
+    // the hostile reader — a containment gate refusing the path first — would
+    // otherwise still pass while proving nothing.
     const located = await resolveStack(
       stackOf(frameLine(HASHED_CHUNK, { line: 9, column: 21 })),
       resolveOptions({ readSourceFile }),
     );
 
+    expect(readSourceFile).toHaveBeenCalledTimes(1);
     expect(onlyLocation(located).file).toBe('src/lib/http.ts');
   });
 

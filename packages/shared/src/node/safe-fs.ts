@@ -69,6 +69,31 @@
  * weaken the credential store, so each one's documentation names the other and
  * says which cases belong to it.
  *
+ * ## Conditional writes, for a replacement computed from what was read
+ *
+ * {@link atomicReplaceFileIfUnchanged} is {@link atomicReplaceFile} with a
+ * precondition: it writes only while the target still holds the bytes, and is
+ * still the inode, that {@link readFileSnapshotNoFollow} observed. Guarantee 2
+ * above depends on it. An unconditional rename over a source file cannot fail,
+ * so a developer's edit arriving between the read and the write is discarded
+ * without a trace — and "fully reversible" would then mean reversible to
+ * something the developer no longer had. Because `rename` cannot be made
+ * conditional, the install is built from the two primitives that can refuse:
+ * `rename`, which retains what it displaces, and `link`, which will not
+ * overwrite. No entry at the target path is destroyed without first being
+ * retained and inspected, at any interleaving.
+ *
+ * ## Pinned paths, for a path that must not be re-resolved
+ *
+ * {@link pinFileWithinRoot} holds the containing directory open and hands back
+ * a path that addresses that descriptor, so the read and the write reach the
+ * directory that was verified rather than whatever the path names by then.
+ * Guarantee 1's project-side counterpart depends on it: a containment *check*
+ * on a path is only ever true of an instant, and `O_NOFOLLOW` constrains a
+ * path's final component only, so a directory component replaced after the
+ * check redirects everything that follows. Pinning removes the re-resolution
+ * rather than repeating the check.
+ *
  * ## POSIX scope
  *
  * `O_NOFOLLOW` and the owner and permission-bit checks are POSIX concepts.
@@ -94,7 +119,9 @@ import {
   closeSync,
   constants,
   fchmodSync,
+  fstatSync,
   fsyncSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   openSync,
@@ -159,6 +186,26 @@ const PERMISSION_BITS = 0o777;
  * that file's own mode, which is the whole point of that function.
  */
 const DEFAULT_REPLACEMENT_FILE_MODE = 0o644;
+
+/**
+ * The directory whose entries address this process's own open descriptors.
+ *
+ * A path beginning here is resolved by the kernel from the *inode* a descriptor
+ * holds rather than from the directory tree, which is what gives
+ * {@link pinFileWithinRoot} `openat` semantics without a native addon. Named
+ * once, and probed for rather than assumed — see
+ * {@link canAddressDescriptorsAsPaths}, which is why no behaviour here is
+ * selected by platform name.
+ */
+const DESCRIPTOR_DIRECTORY = '/proc/self/fd';
+
+/**
+ * Whether {@link DESCRIPTOR_DIRECTORY} works on this host, once probed.
+ *
+ * `undefined` until the first pin is taken, so importing this module still
+ * opens nothing.
+ */
+let descriptorPathsUsable: boolean | undefined;
 
 /**
  * How many bytes of randomness go into a temporary file's name.
@@ -1433,4 +1480,834 @@ export function readFileNoFollow(path: string): Buffer {
   } finally {
     closeSync(fd);
   }
+}
+
+/**
+ * Which file on disk a set of bytes came from: the device and inode number of
+ * the entry that was open when they were read.
+ *
+ * Content alone cannot answer "is this still the same file". A file replaced by
+ * a `rename` — which is how every editor in this product's world saves — keeps
+ * its path and gets a **new inode**, so a caller comparing only content would
+ * happily overwrite a different file that happened to hold the same bytes.
+ * Comparing the inode as well turns "the bytes look right" into "this is the
+ * file I read".
+ *
+ * Both members are `bigint`, read through `stat`'s `{ bigint: true }` form and
+ * **not** through Node's default numeric one. That is not fastidiousness: a
+ * device or inode number beyond 2^53 loses precision as a double, and the
+ * failure it produces is the dangerous direction — two *different* inodes
+ * rounding to the same value compare equal, and a comparison that exists to
+ * refuse a swapped file would accept one. `bigint` comparison is exact for
+ * every value the kernel can report.
+ */
+export interface FileIdentity {
+  /** The device the file lives on, as `stat` reports it. */
+  readonly dev: bigint;
+
+  /** The file's inode number on that device. */
+  readonly ino: bigint;
+}
+
+/** A file's bytes together with the identity of the inode they were read from. */
+export interface FileSnapshot {
+  /** The bytes, exactly as stored. */
+  readonly bytes: Buffer;
+
+  /** Which file on disk they came from. See {@link FileIdentity}. */
+  readonly identity: FileIdentity;
+}
+
+/**
+ * Reads a file's bytes **and** the identity of the inode they came from, from
+ * one descriptor, refusing to follow a symbolic link at the final component.
+ *
+ * {@link readFileNoFollow} with the stat a compare-and-swap needs. The single
+ * descriptor is the point: an `open` followed by a separate `stat` of the same
+ * *path* can describe two different files if the path is replaced in between,
+ * and a caller that then treats the pair as one observation has recorded an
+ * identity that never held those bytes. `fstat` on the descriptor the bytes
+ * were read from cannot disagree with itself.
+ *
+ * Use it wherever a later write has to be conditional on what was read —
+ * {@link atomicReplaceFileIfUnchanged} is the counterpart — and
+ * {@link readFileNoFollow} wherever only the bytes matter.
+ *
+ * @param path The file to read.
+ * @returns Its bytes and the identity of the file they came from.
+ * @throws The runtime's own filesystem error, with its `code` intact: `ELOOP`
+ * when the final component is a symbolic link, `ENOENT` when nothing is there,
+ * `EACCES` when it cannot be read, `EISDIR` when it is a directory.
+ *
+ * @example
+ * ```ts
+ * const before = readFileSnapshotNoFollow(absoluteSourcePath);
+ * // … compute a replacement from before.bytes …
+ * atomicReplaceFileIfUnchanged(absoluteSourcePath, patched, before);
+ * ```
+ */
+export function readFileSnapshotNoFollow(path: string): FileSnapshot {
+  const targetAbs = resolve(path);
+
+  // Where the platform has no `O_NOFOLLOW`, the open below is an ordinary one
+  // and would return the content of whatever a link at this path points at.
+  // `lstat` reports a link on every platform, so the refusal is stated here
+  // instead of being silently reduced — a link read and then backed up as the
+  // developer's own file is a worse outcome than a refusal.
+  if (noFollowFlag() === 0 && lstatSync(targetAbs).isSymbolicLink()) {
+    throw refuseAsLoop(targetAbs);
+  }
+
+  const fd = openSync(targetAbs, constants.O_RDONLY | noFollowFlag());
+  try {
+    // The stat comes from this descriptor, never from the path: that is what
+    // binds the identity below to the bytes returned beside it.
+    const stats = fstatSync(fd, { bigint: true });
+
+    if (!stats.isFile()) {
+      throw refuseAsLoop(targetAbs);
+    }
+
+    return { bytes: readFileSync(fd), identity: { dev: stats.dev, ino: stats.ino } };
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
+ * The error a refused link or non-regular entry is reported as, carrying the
+ * `ELOOP` the platform itself would have produced.
+ *
+ * Coded rather than typed as a `DebuggenError`, because every caller of the
+ * reads and writes here already branches on `error.code` and an `ELOOP` from
+ * `O_NOFOLLOW` and an `ELOOP` from this check must be indistinguishable to
+ * them: the platform that has the flag and the platform that does not then
+ * behave the same way rather than one of them silently succeeding.
+ */
+function refuseAsLoop(pathAbs: string): Error & { code: string } {
+  return Object.assign(
+    new Error(`ELOOP: not a regular file, or a symbolic link, at '${pathAbs}'`),
+    { code: 'ELOOP' },
+  );
+}
+
+/**
+ * A file whose containing directory is held open, so that every operation on it
+ * reaches the directory that was verified rather than whatever its path names
+ * later.
+ *
+ * Returned by {@link pinFileWithinRoot}. {@link PinnedFile.path} is the only
+ * path a holder should use for I/O, and {@link PinnedFile.release} must be
+ * called — a descriptor per patched file otherwise accumulates for the lifetime
+ * of the process.
+ */
+export interface PinnedFile {
+  /**
+   * The path to use for every read, create, link, rename and unlink of this
+   * file and of a temporary sibling beside it.
+   *
+   * When the pin is {@link PinnedFile.enforced}, this is a path *through the
+   * held descriptor* rather than through the directory tree, so replacing any
+   * component of the original path afterwards cannot redirect it. `dirname`,
+   * `basename` and `join` behave on it exactly as they do on an ordinary path,
+   * which is what lets the writers here place a temporary sibling beside it
+   * without knowing it is pinned.
+   */
+  readonly path: string;
+
+  /** The canonical directory path this file was pinned inside. */
+  readonly directory: string;
+
+  /** The identity of that directory at the moment it was opened. */
+  readonly directoryIdentity: FileIdentity;
+
+  /** The file's name inside {@link PinnedFile.directory}. */
+  readonly name: string;
+
+  /**
+   * Whether the platform actually enforces the pin.
+   *
+   * `true` where a descriptor can be addressed as a path (Linux's
+   * `/proc/self/fd`), which is what gives these operations `openat`
+   * semantics. `false` where it cannot: {@link PinnedFile.path} is then the
+   * ordinary path, every component was still checked for a symbolic link
+   * while the pin was taken, and {@link PinnedFile.verifyDirectory} still
+   * detects a directory swapped afterwards — but a swap *during* the sequence
+   * is no longer impossible, only detected. The reduction is inherent to the
+   * platform and is reported rather than hidden.
+   */
+  readonly enforced: boolean;
+
+  /**
+   * Whether {@link PinnedFile.directory} still names the directory that was
+   * pinned.
+   *
+   * `lstat` of the original path compared against
+   * {@link PinnedFile.directoryIdentity}: `false` means the directory was
+   * moved, replaced or turned into a link since the pin was taken. A caller
+   * about to write calls this immediately beforehand — on an enforced pin the
+   * write is already safe and this makes the situation *visible* rather than
+   * silently writing to a relocated directory; on a degraded one it is the only
+   * check there is.
+   */
+  readonly verifyDirectory: () => boolean;
+
+  /** Closes the held descriptor. Idempotent. */
+  readonly release: () => void;
+}
+
+/**
+ * Opens the directory holding a project-relative file, one component at a time,
+ * refusing a symbolic link at every step, and returns a handle whose operations
+ * cannot be redirected afterwards.
+ *
+ * This is the answer to the half of CWE-22 that a containment *check* cannot
+ * reach. Canonicalising a path and comparing it against the project root —
+ * `resolveRealPathWithinProject` in the sibling `../paths.js` — proves where the
+ * path led *at that moment*. Every later `open`, `rename` or `link` by that path
+ * resolves the components again, so replacing one of them in between redirects
+ * the operation to somewhere the check never saw. Checking again does not fix
+ * it: there is always another instant between the last check and the use.
+ *
+ * The fix is not to resolve the path again at all. Each component is opened
+ * relative to the descriptor of the one above it — `O_DIRECTORY | O_NOFOLLOW`,
+ * so a link anywhere in the chain is refused rather than followed — and the
+ * deepest descriptor is kept. Operations then address the directory *inode*,
+ * which no change to any path can alter. A component replaced afterwards is
+ * simply not consulted, and a directory moved afterwards is still the directory
+ * whose contents were verified, which {@link PinnedFile.verifyDirectory} lets a
+ * caller notice.
+ *
+ * The walk starts at the filesystem root and descends every component of
+ * `rootAbs` as well as of `relativeFile`, so the chain above the project is
+ * pinned too. `rootAbs` is expected to be **canonical** already (the output of
+ * `resolveRealPathWithinProject`), which is what makes a refusal here mean "a
+ * component was replaced since it was canonicalised" rather than "this project
+ * lives under a symlinked home directory".
+ *
+ * @param rootAbs The canonical absolute path of the project root.
+ * @param relativeFile The project-relative POSIX path of the file, whose final
+ * component is **not** opened — it is left for the caller's own no-follow open.
+ * @returns The pinned file. The caller must `release()` it.
+ * @throws {DebuggenError} With code `FS_UNSAFE_PATH` and
+ * `details.reason: 'symlink-component'` when a component of either path is a
+ * symbolic link or is not a directory.
+ * @throws The runtime's own filesystem error, with its `code` intact, when a
+ * component cannot be opened: `ENOENT`, `EACCES`.
+ *
+ * @example
+ * ```ts
+ * const pinned = pinFileWithinRoot(canonicalRoot, 'src/lib/thing.ts');
+ * try {
+ *   const before = readFileSnapshotNoFollow(pinned.path);
+ *   atomicReplaceFileIfUnchanged(pinned.path, patched, before);
+ * } finally {
+ *   pinned.release();
+ * }
+ * ```
+ */
+export function pinFileWithinRoot(rootAbs: string, relativeFile: string): PinnedFile {
+  const targetAbs = resolve(rootAbs, relativeFile);
+  const directoryAbs = dirname(targetAbs);
+  const name = basename(targetAbs);
+  const descriptor = openDirectoryChain(directoryAbs);
+  let released = false;
+
+  const release = (): void => {
+    if (released) {
+      return;
+    }
+    released = true;
+    try {
+      closeSync(descriptor.fd);
+    } catch {
+      // The descriptor is going away with the process in the worst case, and a
+      // failure to close is not something a caller can act on.
+    }
+  };
+
+  const base = descriptor.enforced ? descriptorPath(descriptor.fd) : directoryAbs;
+
+  return {
+    path: join(base, name),
+    directory: directoryAbs,
+    directoryIdentity: descriptor.identity,
+    name,
+    enforced: descriptor.enforced,
+    verifyDirectory: (): boolean => {
+      try {
+        const stats = lstatSync(directoryAbs, { bigint: true });
+        return (
+          stats.isDirectory() &&
+          stats.dev === descriptor.identity.dev &&
+          stats.ino === descriptor.identity.ino
+        );
+      } catch {
+        // Gone, or unreadable: either way it is no longer demonstrably the
+        // directory that was pinned.
+        return false;
+      }
+    },
+    release,
+  };
+}
+
+/** The open directory at the end of a pinned walk. */
+interface PinnedDirectoryDescriptor {
+  /** The descriptor, owned by the {@link PinnedFile} that requested it. */
+  readonly fd: number;
+
+  /** Its identity, read from the descriptor itself. */
+  readonly identity: FileIdentity;
+
+  /** Whether a descriptor can be addressed as a path on this platform. */
+  readonly enforced: boolean;
+}
+
+/**
+ * Opens every component of an absolute directory path in turn, each relative to
+ * the descriptor of the one above it, and returns the deepest.
+ *
+ * The first component is the filesystem root, which is opened by path because
+ * there is nothing above it to be relative to. Every component after it is
+ * opened with `O_NOFOLLOW`, so the walk refuses a symbolic link rather than
+ * following one, and intermediate descriptors are closed as the walk descends —
+ * only the deepest one is handed out.
+ */
+function openDirectoryChain(directoryAbs: string): PinnedDirectoryDescriptor {
+  const enforced = canAddressDescriptorsAsPaths();
+  const parts = directoryAbs.split(/[\\/]+/u).filter((part) => part.length > 0);
+  const anchor = isWindowsRooted(directoryAbs) ? `${parts.shift() ?? ''}\\` : '/';
+
+  // The anchor is opened by path because there is nothing above it to be
+  // relative to, and it is the one component no attacker can replace.
+  let fd = openSync(anchor, constants.O_RDONLY | directoryFlag());
+  let walked = anchor;
+
+  try {
+    for (const part of parts) {
+      walked = join(walked, part);
+
+      // Relative to the descriptor when the platform allows it, which is what
+      // makes the component that was just verified the one actually descended
+      // into. Otherwise the accumulated path, which still refuses a link at
+      // each component but can be overtaken between two of them.
+      const next = openComponent(enforced ? join(descriptorPath(fd), part) : walked, directoryAbs);
+
+      closeSync(fd);
+      fd = next;
+    }
+
+    const stats = fstatSync(fd, { bigint: true });
+
+    if (!stats.isDirectory()) {
+      throw unsafePath(
+        `'${directoryAbs}' is not a directory.`,
+        'not-a-directory',
+        directoryAbs,
+        'Point the tool at a directory inside the project.',
+      );
+    }
+
+    return { fd, identity: { dev: stats.dev, ino: stats.ino }, enforced };
+  } catch (error) {
+    // The descriptor in hand is always the one this frame owns: the previous
+    // one is closed only after its successor has been opened.
+    closeSync(fd);
+    throw error;
+  }
+}
+
+/**
+ * Opens one component of a pinned walk, translating the platform's refusal of a
+ * symbolic link into this module's own.
+ *
+ * `O_NOFOLLOW` on a directory open reports `ELOOP` on some platforms and
+ * `ENOTDIR` on others when it meets a link, because the link is not a
+ * directory. Both mean the same thing here and both become
+ * `FS_UNSAFE_PATH`/`symlink-component`, the vocabulary {@link assertSecureDir}
+ * already uses, so a caller has one reason to handle rather than two errnos to
+ * decode.
+ */
+function openComponent(componentPath: string, directoryAbs: string): number {
+  try {
+    return openSync(componentPath, constants.O_RDONLY | directoryFlag() | noFollowFlag());
+  } catch (error) {
+    const code = errnoCodeOf(error);
+
+    if (code === 'ELOOP' || code === 'ENOTDIR') {
+      throw unsafePath(
+        `A component of '${directoryAbs}' is a symbolic link or is not a directory, so the path cannot be pinned.`,
+        'symlink-component',
+        directoryAbs,
+        'Replace the link with a real directory, or point the tool at a location that is not reached through a link.',
+      );
+    }
+
+    throw error;
+  }
+}
+
+/** Whether a path names a Windows drive or share rather than a POSIX root. */
+function isWindowsRooted(pathAbs: string): boolean {
+  return /^([A-Za-z]:|[\\/]{2})/u.test(pathAbs);
+}
+
+/** The path that addresses an open descriptor, on a platform that has one. */
+function descriptorPath(fd: number): string {
+  return `${DESCRIPTOR_DIRECTORY}/${String(fd)}`;
+}
+
+/**
+ * Whether this platform lets an open descriptor be addressed as a path, probed
+ * once.
+ *
+ * Linux's `/proc/self/fd/<n>` is what gives the walk above `openat` semantics
+ * without a native addon: a path beginning there is resolved from the *inode*
+ * the descriptor holds. The probe opens a directory this module knows exists,
+ * compares what the descriptor path reports against what the descriptor
+ * reports, and caches the answer; it is deliberately a capability test rather
+ * than a check of `process.platform`, and it runs on first use so that
+ * importing this module still touches nothing.
+ */
+function canAddressDescriptorsAsPaths(): boolean {
+  if (descriptorPathsUsable === undefined) {
+    descriptorPathsUsable = probeDescriptorPaths();
+  }
+
+  return descriptorPathsUsable;
+}
+
+/**
+ * Performs the probe {@link canAddressDescriptorsAsPaths} caches.
+ *
+ * The filesystem root is the probe subject, because it exists on every host
+ * this can run on and needs no temporary directory — which keeps the probe
+ * free of any write and of any further import.
+ */
+function probeDescriptorPaths(): boolean {
+  let fd: number | undefined;
+
+  try {
+    fd = openSync('/', constants.O_RDONLY | directoryFlag());
+    const viaDescriptor = statSync(descriptorPath(fd), { bigint: true });
+    const viaHandle = fstatSync(fd, { bigint: true });
+
+    return viaDescriptor.dev === viaHandle.dev && viaDescriptor.ino === viaHandle.ino;
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        // Nothing to report: the probe's answer is already decided.
+      }
+    }
+  }
+}
+
+/** What the target must still be for {@link atomicReplaceFileIfUnchanged} to write. */
+export interface AtomicReplaceExpectation {
+  /**
+   * The bytes the target must still hold, compared byte for byte.
+   *
+   * The authoritative half of the condition. No normalisation of any kind: CRLF
+   * and LF content differ, a byte-order mark is content, and a file that is not
+   * valid UTF-8 compares like any other — because the caller's reason for
+   * writing was computed from exactly these bytes.
+   */
+  readonly bytes: Uint8Array;
+
+  /**
+   * The identity the target must still have, when the caller observed one.
+   *
+   * Supply it — {@link readFileSnapshotNoFollow} hands it over — and a file
+   * replaced by a different one with identical content is refused too. Omit it
+   * and the condition is content only, which is weaker and says so.
+   */
+  readonly identity?: FileIdentity | undefined;
+}
+
+/**
+ * Why {@link atomicReplaceFileIfUnchanged} did not write.
+ *
+ * - `content-changed` — something rewrote the file's bytes.
+ * - `identity-changed` — the entry at that path is a different file now, or has
+ *   become a symbolic link.
+ * - `target-missing` — nothing is at that path any more.
+ */
+export type AtomicReplaceStaleReason = 'content-changed' | 'identity-changed' | 'target-missing';
+
+/** The outcome of a conditional replacement. */
+export type AtomicReplaceVerdict =
+  | {
+      /** The condition held and the target now holds the new bytes. */
+      readonly kind: 'replaced';
+    }
+  | {
+      /** The condition no longer held, and **nothing was written**. */
+      readonly kind: 'stale';
+
+      /** Which part of the condition failed. See {@link AtomicReplaceStaleReason}. */
+      readonly reason: AtomicReplaceStaleReason;
+
+      /**
+       * Where the entry that was displaced from the target path is, when it
+       * could not be put back.
+       *
+       * Present only in the one pathological interleaving described on
+       * {@link atomicReplaceFileIfUnchanged}: the entry at the target was
+       * retained under a temporary name, found not to be the expected one, and
+       * then could not be restored because something else had appeared at the
+       * target meanwhile. Both files exist and neither was destroyed; a caller
+       * that sees this must tell the developer where the retained one is.
+       */
+      readonly retainedAt?: string;
+    };
+
+/**
+ * The refusal half of {@link AtomicReplaceVerdict}, named so that the helpers
+ * that can only produce a refusal say so in their signatures.
+ */
+export type AtomicReplaceStaleVerdict = Extract<AtomicReplaceVerdict, { kind: 'stale' }>;
+
+/** Extra behaviour for {@link atomicReplaceFileIfUnchanged}. */
+export interface AtomicReplaceOptions {
+  /**
+   * Invoked once the precondition has held and the displaced entry has been
+   * retained, immediately before the new entry is installed.
+   *
+   * It exists so that the one interval this function cannot make atomic can be
+   * *tested*: a suite passes a callback that writes to the target path, and the
+   * install below must then refuse rather than discard what the callback
+   * created. Production callers pass nothing. A throw from it propagates, after
+   * the same cleanup a failing write receives.
+   */
+  readonly onBeforeInstall?: (() => void) | undefined;
+}
+
+/**
+ * Replaces a file atomically **only if it is still what the caller last read**,
+ * preserving the mode it already had.
+ *
+ * {@link atomicReplaceFile} with a precondition, and the difference matters
+ * wherever the replacement was computed from the file's previous content. An
+ * unconditional `rename` over a path is a write that cannot fail: it discards
+ * whatever is there, including an edit a developer made in the seconds between
+ * the read and the write, with no trace that anything was lost. That is
+ * CWE-367, and for this product it is the difference between "temporarily
+ * instrumented, fully reversible" and "silently destroyed the developer's
+ * work".
+ *
+ * ## Sequence
+ *
+ * 1. The target's mode and kind are read with `lstat`. Nothing there →
+ *    `target-missing`; a symbolic link, or an inode other than the expected one
+ *    → `identity-changed`. Neither creates anything.
+ * 2. An unpredictably named temporary sibling is created in the same directory
+ *    at the target's own mode, written and flushed — the expensive part, and
+ *    deliberately *before* the check below.
+ * 3. The target is re-read through a no-follow descriptor and compared against
+ *    {@link AtomicReplaceExpectation}: the identity first, then every byte. A
+ *    mismatch removes the temporary file and returns `stale` **without
+ *    touching the target**.
+ * 4. The entry at the target is **retained**: `rename`d aside to a second
+ *    temporary name, which is atomic, so nothing at that path is ever
+ *    destroyed. It is then inspected — if it is not the expected entry after
+ *    all, a write landed between steps 3 and 4, and it is put back and reported
+ *    rather than lost.
+ * 5. The new entry is installed with `link`, which **fails if anything exists
+ *    at the target**. A write that created a file at the target between step 4
+ *    and here is therefore refused rather than discarded.
+ * 6. The temporary names are dropped and the directory entry is flushed best
+ *    effort.
+ *
+ * ## Why not one rename
+ *
+ * `rename` over a path is a write that cannot fail: the destination, whatever
+ * it has become since it was compared, is discarded. Compare-then-rename
+ * therefore still loses a write that lands in between, and loses it *silently*
+ * — the only outcome this product may never produce. POSIX offers no
+ * compare-and-swap `rename` (`renameat2`'s `RENAME_EXCHANGE` and
+ * `RENAME_NOREPLACE` are Linux-only and are not in Node's `fs`), so the swap is
+ * built from the two primitives that *can* refuse: `rename`, which retains what
+ * it displaces, and `link`, which will not overwrite. The result is that **no
+ * entry at the target path is destroyed without first being retained and
+ * inspected**, at any interleaving.
+ *
+ * What remains is not a loss but a visible gap: between steps 4 and 5 the
+ * target path does not exist, for the duration of two adjacent syscalls. A
+ * watcher polling in that instant sees the file disappear and reappear, where a
+ * plain rename would have shown one modification. That is the trade this
+ * function makes deliberately — a transient, self-healing observation in
+ * exchange for the impossibility of silent data loss.
+ *
+ * ## Crash behaviour
+ *
+ * A crash before step 4 leaves the target untouched and a temporary file
+ * behind. A crash between 4 and 5 leaves the target absent and its content
+ * under the retained temporary name in the same directory — recoverable by
+ * hand, and for this product's use also present in the recorded backup, which
+ * is written and flushed before the replacement is attempted. Any failure this
+ * function can observe itself removes what it created, restores what it
+ * retained, and rethrows the original error.
+ *
+ * @param path The file to replace. It must already exist; this function refuses
+ * to create one, because a precondition about content has no meaning otherwise.
+ * @param data The bytes to write, verbatim, or text encoded as UTF-8.
+ * @param expected What the target must still be. See
+ * {@link AtomicReplaceExpectation}.
+ * @param options The install-boundary seam. See {@link AtomicReplaceOptions}.
+ * @returns `replaced` when the condition held, or `stale` with the reason it
+ * did not. **A `stale` verdict guarantees the target was not written**, and
+ * carries `retainedAt` in the one interleaving where the displaced entry could
+ * not be put back.
+ * @throws The runtime's own filesystem error, with its `code` intact, for a
+ * genuine I/O failure: `EACCES` when the directory cannot be written, `EISDIR`
+ * when the target is a directory, `ENOSPC` when the write cannot complete. No
+ * policy error is raised — this function asserts no directory policy, for the
+ * reason given on {@link atomicReplaceFile}.
+ *
+ * @example
+ * ```ts
+ * const before = readFileSnapshotNoFollow(absoluteSourcePath);
+ * const verdict = atomicReplaceFileIfUnchanged(absoluteSourcePath, instrumented, before);
+ * if (verdict.kind === 'stale') {
+ *   return reportConflict(verdict.reason); // the file still holds the developer's bytes
+ * }
+ * ```
+ */
+export function atomicReplaceFileIfUnchanged(
+  path: string,
+  data: string | Uint8Array,
+  expected: AtomicReplaceExpectation,
+  options?: AtomicReplaceOptions,
+): AtomicReplaceVerdict {
+  const targetAbs = resolve(path);
+  const entry = existingEntryFor(targetAbs, expected.identity);
+
+  if (entry.kind === 'stale') {
+    return entry;
+  }
+
+  const tempAbs = temporarySiblingPath(targetAbs);
+  const retainedAbs = temporarySiblingPath(targetAbs);
+  let retained = false;
+
+  try {
+    // The parent's suitability is the caller's decision — a developer's project
+    // directory is an ordinary 0755 this product did not create — so the
+    // temporary sibling does not re-ask, exactly as `writeThenRename` does not.
+    createFileExclusive(tempAbs, data, { mode: entry.mode, requireSecureParents: false });
+
+    const stale = staleVerdictFor(targetAbs, expected);
+
+    if (stale !== undefined) {
+      removeQuietly(tempAbs);
+      return stale;
+    }
+
+    // Step 4. Atomic, so whatever is at the target now exists under
+    // `retainedAbs` and nowhere else — it cannot be destroyed by anything that
+    // follows, including a failure in this frame.
+    renameSync(targetAbs, retainedAbs);
+    retained = true;
+
+    // Which is what makes this check meaningful rather than another guess: it
+    // inspects the entry that was actually taken, not the one at a path that
+    // may have changed again since.
+    const displaced = staleVerdictFor(retainedAbs, expected);
+
+    if (displaced !== undefined) {
+      removeQuietly(tempAbs);
+      return restoreRetained(retainedAbs, targetAbs, displaced);
+    }
+
+    options?.onBeforeInstall?.();
+
+    // Step 5. `link` refuses to overwrite, so a file created at the target
+    // since step 4 is reported rather than discarded. The retained entry is the
+    // expected one, and the caller holds its bytes in `expected.bytes`, so
+    // dropping it loses nothing.
+    if (!installByLink(tempAbs, targetAbs)) {
+      removeQuietly(tempAbs);
+      removeQuietly(retainedAbs);
+      return { kind: 'stale', reason: 'identity-changed' };
+    }
+
+    removeQuietly(tempAbs);
+    removeQuietly(retainedAbs);
+  } catch (error) {
+    // `EEXIST` can only come from the exclusive create, and only when something
+    // already occupied the path, so removing it would delete a file this
+    // process never created. See `writeThenRename` for the same reasoning.
+    if (errnoCodeOf(error) !== 'EEXIST') {
+      removeQuietly(tempAbs);
+    }
+
+    // A failure after the retention must not leave the target absent: the
+    // entry goes back where it came from before the error is rethrown.
+    if (retained) {
+      restoreRetained(retainedAbs, targetAbs, { kind: 'stale', reason: 'identity-changed' });
+    }
+
+    throw error;
+  }
+
+  syncDirectoryQuietly(dirname(targetAbs));
+
+  return { kind: 'replaced' };
+}
+
+/**
+ * Installs the prepared entry at the target path without overwriting anything.
+ *
+ * `link` is the only install primitive that refuses an existing destination, so
+ * it — and not `rename` — is what turns "install the replacement" into an
+ * operation that cannot discard a file someone else created in the meantime.
+ * The temporary name is dropped by the caller afterwards, leaving the new entry
+ * with a single name.
+ *
+ * @returns `true` when the entry was installed, `false` when something already
+ * occupied the target.
+ */
+function installByLink(tempAbs: string, targetAbs: string): boolean {
+  try {
+    linkSync(tempAbs, targetAbs);
+    return true;
+  } catch (error) {
+    if (errnoCodeOf(error) === 'EEXIST') {
+      return false;
+    }
+    throw error;
+  }
+}
+
+/**
+ * Puts a retained entry back at the target path, and reports what happened.
+ *
+ * Restored with `link` rather than `rename` for the same reason the install
+ * uses it: if something has appeared at the target since the retention, a
+ * rename would destroy *that*, and this function's whole purpose is that
+ * nothing is destroyed. When the target is occupied the retained entry stays
+ * where it is and its path travels on the verdict, so the caller can tell the
+ * developer where their content went instead of leaving them to find it.
+ */
+function restoreRetained(
+  retainedAbs: string,
+  targetAbs: string,
+  verdict: AtomicReplaceStaleVerdict,
+): AtomicReplaceVerdict {
+  if (installByLink(retainedAbs, targetAbs)) {
+    removeQuietly(retainedAbs);
+    return verdict;
+  }
+
+  return { ...verdict, retainedAt: retainedAbs };
+}
+
+/** What {@link existingEntryFor} found: a usable regular file, or a refusal. */
+type ExistingEntry = { readonly kind: 'file'; readonly mode: number } | AtomicReplaceStaleVerdict;
+
+/**
+ * Establishes that the target is a regular file this replacement may proceed
+ * against, and reads the mode to give the temporary sibling.
+ *
+ * `lstat`, never `stat`: a symbolic link that appeared at the target is a
+ * changed target, and following it would read the mode of something else
+ * entirely and then write a file the caller never named. It is reported as
+ * `identity-changed` rather than as an error because that is what it is — the
+ * entry at that path is no longer the file the caller read.
+ *
+ * The inode comparison here is an early exit, not the decision: the
+ * authoritative check is {@link staleVerdictFor}, which runs immediately before
+ * the rename. Failing fast simply avoids writing a temporary file for a
+ * replacement that is already known to be refused.
+ */
+function existingEntryFor(targetAbs: string, identity: FileIdentity | undefined): ExistingEntry {
+  let stats;
+
+  try {
+    // `{ bigint: true }`, so the inode comparison below is exact: see
+    // {@link FileIdentity} for why a rounded inode number is the dangerous
+    // direction of that comparison.
+    stats = lstatSync(targetAbs, { bigint: true });
+  } catch (error) {
+    if (errnoCodeOf(error) === 'ENOENT') {
+      return { kind: 'stale', reason: 'target-missing' };
+    }
+    throw error;
+  }
+
+  if (!stats.isFile()) {
+    return { kind: 'stale', reason: 'identity-changed' };
+  }
+
+  if (identity !== undefined && !isSameFile(identity, stats)) {
+    return { kind: 'stale', reason: 'identity-changed' };
+  }
+
+  return { kind: 'file', mode: Number(stats.mode) & PERMISSION_BITS };
+}
+
+/**
+ * Re-reads the target and reports which part of the expectation no longer
+ * holds, or `undefined` when all of it does.
+ *
+ * Called as late as the sequence allows — after the temporary file is written
+ * and flushed, immediately before the rename — because every instruction
+ * between this check and that rename is window in which a change goes
+ * unnoticed.
+ *
+ * `ELOOP` and `ENOENT` are answers rather than failures here: a link or a
+ * deletion arriving at the target after it was read is precisely the change the
+ * condition exists to catch, and reporting them as `stale` keeps the caller's
+ * one code path — refuse, and report a conflict — instead of making it decode
+ * an errno to find out whether anything was written.
+ */
+function staleVerdictFor(
+  targetAbs: string,
+  expected: AtomicReplaceExpectation,
+): AtomicReplaceStaleVerdict | undefined {
+  let snapshot: FileSnapshot;
+
+  try {
+    snapshot = readFileSnapshotNoFollow(targetAbs);
+  } catch (error) {
+    const code = errnoCodeOf(error);
+
+    if (code === 'ENOENT') {
+      return { kind: 'stale', reason: 'target-missing' };
+    }
+
+    if (code === 'ELOOP') {
+      return { kind: 'stale', reason: 'identity-changed' };
+    }
+
+    throw error;
+  }
+
+  if (expected.identity !== undefined && !sameIdentity(expected.identity, snapshot.identity)) {
+    return { kind: 'stale', reason: 'identity-changed' };
+  }
+
+  if (
+    snapshot.bytes.byteLength !== expected.bytes.byteLength ||
+    Buffer.compare(snapshot.bytes, expected.bytes) !== 0
+  ) {
+    return { kind: 'stale', reason: 'content-changed' };
+  }
+
+  return undefined;
+}
+
+/** Whether two observations name the same inode on the same device. */
+function sameIdentity(expected: FileIdentity, actual: FileIdentity): boolean {
+  return expected.dev === actual.dev && expected.ino === actual.ino;
+}
+
+/** Whether a `stat` result names the same inode as a recorded identity. */
+function isSameFile(expected: FileIdentity, stats: FileIdentity): boolean {
+  return sameIdentity(expected, { dev: stats.dev, ino: stats.ino });
 }

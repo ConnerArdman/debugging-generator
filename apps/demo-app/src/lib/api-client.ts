@@ -1,13 +1,23 @@
 /**
- * The storefront's browser-side HTTP layer.
+ * The storefront's HTTP layer.
  *
  * Client components, providers and hooks reach the route handlers under `/api`
- * through the functions below rather than calling `fetch` themselves, so a new
+ * through the functions below rather than calling `fetch` themselves, and so do
+ * the server-rendered pages that read their own surface's endpoint, so a new
  * endpoint belongs here as one more thin wrapper over {@link storefrontRequest}
  * written to the same rules. Stock, pricing and cart contents are read through
- * to the server on every call, and every path stays relative, so the module
- * has no origin of its own to resolve and is as safe to import from a server
- * component as from a client one.
+ * to the server on every call.
+ *
+ * Every path written here is relative, and this module resolves no origin of
+ * its own: it reads no environment variable, no `window.location` and no
+ * header. A caller that has no relative base to resolve against - a
+ * server-rendered page, which runs where a bare `/api/...` names nothing -
+ * hands in the scheme and authority to prefix the path with, and the only place
+ * that authority is established and checked is `@/server/origin`. That keeps
+ * one HTTP layer for the whole storefront while leaving the question "which
+ * server is this?" where it is answered: a browser answers it by construction,
+ * and a server render answers it from its own configuration and the port it
+ * bound, never from a header a client wrote.
  *
  * Which cart a request concerns is never stated here: the server resolves it
  * from the storefront's own cookie, which is what `credentials: 'same-origin'`
@@ -19,15 +29,12 @@
  * held to the end for nobody. The signal belongs to the caller: nothing here
  * creates one, and a call made without one behaves exactly as it always has.
  *
- * The route handlers behind the order history and the inventory dashboard
- * deliberately have no wrapper here, because the surfaces that read their data
- * are server-rendered and call the services behind them directly rather than
- * fetching their own endpoints: `GET /api/orders`, whose page of orders the
- * order-history page resolves through the order service, and
- * `GET /api/inventory/summary`, whose figures the inventory dashboard resolves
- * through the inventory service. That is a classification of those two
- * server-rendered surfaces and nothing more: an endpoint a browser calls
- * belongs here as one more thin wrapper, exactly as above.
+ * The two `/api/mock` handlers are the only endpoints of this application with
+ * no wrapper here, and that is deliberate: the carrier and the payment
+ * processor are called server-to-server by `@/server/services`, the way a
+ * third-party dependency would be, so a browser call to either would be wrong.
+ * Every other endpoint is reached through this module, by the browser or by the
+ * page that renders the surface it belongs to.
  */
 
 import type {
@@ -35,10 +42,19 @@ import type {
   CartLineQuantityDraft,
   CartMutation,
   CartView,
+  CatalogQuery,
   CheckoutDraft,
   CheckoutResult,
+  InventorySummary,
+  MovementType,
+  OrderStatus,
+  OrderSummary,
+  PagedList,
+  ProductDetail,
+  ProductSummary,
   RecommendationItem,
   ShippingQuoteResult,
+  StockState,
   StorefrontErrorBody,
   StorefrontErrorCode,
 } from './types';
@@ -172,9 +188,15 @@ function storefrontCodeForStatus(status: number): StorefrontErrorCode {
  * the single place in the storefront's client code that reaches the network.
  *
  * @param path Route-handler path, relative and beginning `/api/`.
- * @param options Method (`GET` unless stated), query parameters, JSON body and
- *   the caller's `signal`, under which the whole exchange - the request and the
- *   reading of its body - is carried out.
+ * @param options Method (`GET` unless stated), query parameters, JSON body, the
+ *   caller's `signal`, under which the whole exchange - the request and the
+ *   reading of its body - is carried out, and `origin`: the scheme and
+ *   authority to resolve `path` against for a caller with no relative base of
+ *   its own. A browser omits it and the request stays same-origin by
+ *   construction; a server render supplies the authority `@/server/origin`
+ *   answers with, which is configuration and this process's own port rather
+ *   than anything a request carried. Nothing about the authority is decided in
+ *   this module.
  * @throws StorefrontApiError when the request fails to reach the server, the
  *   response is not successful, or its body is not the JSON the caller expects.
  * @throws The abort reason of `options.signal` when that signal is aborted,
@@ -184,12 +206,13 @@ export async function storefrontRequest<T>(
   path: string,
   options?: {
     method?: 'GET' | 'POST';
-    query?: Record<string, string | number | undefined>;
+    query?: Record<string, string | number | null | undefined>;
     body?: unknown;
     signal?: AbortSignal | undefined;
+    origin?: string | undefined;
   },
 ): Promise<T> {
-  const url = `${path}${storefrontQueryString(options?.query)}`;
+  const url = `${options?.origin ?? ''}${path}${storefrontQueryString(options?.query)}`;
   const payload = options?.body;
   const signal = options?.signal;
   const headers: Record<string, string> = { accept: 'application/json' };
@@ -259,7 +282,130 @@ export async function storefrontRequest<T>(
 }
 
 /* ---------------------------------------------------------------------------
- * Endpoints
+ * Listing and detail reads
+ *
+ * The four endpoints behind the storefront's server-rendered surfaces: the
+ * catalog, one product, the order history and the inventory dashboard. Each
+ * page parses its own address, hands the parsed values to one of these
+ * functions and renders the payload that comes back, so the surface a reader
+ * sees and the endpoint an outside caller reaches answer the same question
+ * through the same code.
+ *
+ * Every one of them takes `origin`, because their callers render on the server
+ * where a bare `/api/...` names nothing. It is a parameter rather than
+ * something resolved here: `@/server/origin` is the single place the
+ * storefront's own address is established, and a page passes in what it
+ * answers.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * One page of the catalog; `GET /api/products`.
+ *
+ * Every member of `input.query` is optional, and one that is absent constrains
+ * nothing rather than constraining on nothing - the endpoint's own schema owns
+ * the defaults, so `{ query: {} }` is a complete request for the first page in
+ * the catalog's own order.
+ */
+export function loadCatalogPage(input: {
+  query: CatalogQuery;
+  origin?: string | undefined;
+  signal?: AbortSignal | undefined;
+}): Promise<PagedList<ProductSummary>> {
+  return storefrontRequest<PagedList<ProductSummary>>('/api/products', {
+    query: {
+      categorySlug: input.query.categorySlug,
+      search: input.query.search,
+      sort: input.query.sort,
+      page: input.query.page,
+      pageSize: input.query.pageSize,
+    },
+    signal: input.signal,
+    origin: input.origin,
+  });
+}
+
+/**
+ * One product, by the slug its address carries; `GET /api/products/[slug]`.
+ *
+ * The slug is encoded into the path, so a value carrying a separator addresses
+ * one segment rather than a deeper path. A slug no product owns is answered
+ * with a `NOT_FOUND` {@link StorefrontApiError}, which is what lets a page
+ * answer the reader with its own 404.
+ */
+export function loadProductDetail(input: {
+  slug: string;
+  origin?: string | undefined;
+  signal?: AbortSignal | undefined;
+}): Promise<ProductDetail> {
+  return storefrontRequest<ProductDetail>(`/api/products/${encodeURIComponent(input.slug)}`, {
+    signal: input.signal,
+    origin: input.origin,
+  });
+}
+
+/**
+ * One page of an account's orders, most recently placed first;
+ * `GET /api/orders`.
+ *
+ * The account is named explicitly because an order belongs to exactly one and a
+ * listing with no account named would be every account's orders. The page
+ * window and the status filter are optional and default at the endpoint.
+ */
+export function loadOrderHistory(input: {
+  customerId: string;
+  status?: OrderStatus | undefined;
+  page?: number | undefined;
+  pageSize?: number | undefined;
+  origin?: string | undefined;
+  signal?: AbortSignal | undefined;
+}): Promise<PagedList<OrderSummary>> {
+  return storefrontRequest<PagedList<OrderSummary>>('/api/orders', {
+    query: {
+      customerId: input.customerId,
+      status: input.status,
+      page: input.page,
+      pageSize: input.pageSize,
+    },
+    signal: input.signal,
+    origin: input.origin,
+  });
+}
+
+/**
+ * The inventory dashboard's figures, stocking locations, page of stock lines
+ * and low-stock lines; `GET /api/inventory/summary`.
+ *
+ * A filter that is not applied may be passed as `null` - which is how the
+ * dashboard's parsed query carries "every location", "any selling state" and
+ * "any kind of recorded change" - and is dropped from the request rather than
+ * sent as the word `null`.
+ */
+export function loadInventorySummary(input: {
+  warehouseId?: string | null | undefined;
+  threshold?: number | undefined;
+  page?: number | undefined;
+  pageSize?: number | undefined;
+  state?: StockState | null | undefined;
+  movement?: MovementType | null | undefined;
+  origin?: string | undefined;
+  signal?: AbortSignal | undefined;
+}): Promise<InventorySummary> {
+  return storefrontRequest<InventorySummary>('/api/inventory/summary', {
+    query: {
+      warehouseId: input.warehouseId,
+      threshold: input.threshold,
+      page: input.page,
+      pageSize: input.pageSize,
+      state: input.state,
+      movement: input.movement,
+    },
+    signal: input.signal,
+    origin: input.origin,
+  });
+}
+
+/* ---------------------------------------------------------------------------
+ * Cart, checkout and suggestion reads
  * ------------------------------------------------------------------------- */
 
 /**
@@ -374,13 +520,26 @@ export function submitCheckout(draft: CheckoutDraft): Promise<CheckoutResult> {
  * `input.signal` is the caller's, and rejecting with its abort reason is how
  * this call reports having been cut short - a lookup for a destination the
  * customer has since corrected costs nothing after that point.
+ *
+ * `input.itemCount` is how many units the shipment is made of, and naming it
+ * matters to what comes back: the freight a service charges is a function of
+ * the shipment as well as of the destination, so a caller that omits it is
+ * quoted the endpoint's default of a single unit - a figure that is correct for
+ * nothing but a one-unit order. A caller quoting a cart therefore passes the
+ * cart's unit count, which is the same figure the checkout request rates the
+ * order's freight against, so the rate a customer is shown is the rate their
+ * order is charged. Omit it only where there is no shipment to describe yet.
  */
 export function requestShippingQuote(input: {
   postalCode: string;
+  itemCount?: number | undefined;
   signal?: AbortSignal | undefined;
 }): Promise<ShippingQuoteResult> {
   return storefrontRequest<ShippingQuoteResult>('/api/shipping/quote', {
-    query: { postalCode: input.postalCode },
+    // `storefrontQueryString` drops an absent `itemCount` rather than sending
+    // an empty parameter, so a caller with no shipment to describe addresses
+    // exactly the URL it addressed before this parameter existed.
+    query: { postalCode: input.postalCode, itemCount: input.itemCount },
     signal: input.signal,
   });
 }

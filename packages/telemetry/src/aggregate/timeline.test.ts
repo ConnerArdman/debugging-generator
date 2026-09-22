@@ -1,0 +1,372 @@
+/**
+ * The two contracts this module holds with its producers, and the identity it
+ * hands its consumers.
+ *
+ * `./summary.ts`'s suite exercises the lanes and the metric arithmetic; this
+ * one covers the three things that are invisible in an aggregate total and
+ * wrong in a way a developer would act on:
+ *
+ * - **The state-transition trigger.** `../browser/state.ts` knows the span the
+ *   work was attributed to — the interaction, or a settled request — and says
+ *   so under the catalogued `triggerSpanId`. If the consumer ignores it and
+ *   walks the parent chain instead, every row in `StateTransitionViewer` blames
+ *   the commit the transition sat inside rather than the interaction that
+ *   caused it: a plausible answer, and the wrong one (AAP 0.4.2, 0.6.2).
+ * - **Truncation disclosure.** A capture that spent its transition budget
+ *   emits one sentinel rather than a transition, and a list that arrives short
+ *   without saying so is presented as exhaustive.
+ * - **Edge identity in the dependency graph.** An edge id is built from two
+ *   producer-controlled node ids. If the join is ambiguous, two distinct
+ *   relationships collapse into one row whose count and duration are the sum of
+ *   two unrelated things.
+ *
+ * Plus the determinism the panel-data contract needs: a location chosen from a
+ * *set* of candidates rather than from the order they arrived in, since two
+ * reads of one capture must send a developer to the same line (AAP 0.4.2's
+ * stable ordering, which paging depends on).
+ *
+ * Events are built by hand here rather than loaded from a fixture: every case
+ * turns on one attribute or one parent link, and a literal event is what makes
+ * the case readable.
+ */
+
+import { describe, expect, it } from 'vitest';
+
+import type { SourceLocation } from '@debuggen/shared';
+
+import {
+  DEPENDENCY_EDGE_ID_PREFIX,
+  aggregateStateTransitions,
+  buildDependencyGraph,
+} from './timeline.js';
+import type { TelemetryEvent } from '../schema/event.js';
+
+/** The trace every event in this suite belongs to. */
+const TRACE_ID = 'c'.repeat(32);
+
+/** Monotonic counter behind the generated ids, span ids and sequences. */
+let counter = 0;
+
+/**
+ * A persisted event with the fields these cases need and defaults for the rest.
+ *
+ * `ingestSeq` and `seq` follow construction order, which is what makes the
+ * canonical ordering total and therefore the assertions independent of the
+ * order the events are handed over in.
+ */
+function event(over: Partial<TelemetryEvent>): TelemetryEvent {
+  counter += 1;
+  const base: TelemetryEvent = {
+    id: `evt_${String(counter).padStart(4, '0')}`,
+    traceId: TRACE_ID,
+    spanId: String(counter).padStart(16, '0'),
+    kind: 'render',
+    name: 'render',
+    startTime: 1_700_000_000_000 + counter,
+    duration: 1,
+    tier: 'browser',
+    attributes: {},
+    status: 'ok',
+    producerId: 'producer-1',
+    seq: counter,
+    sessionId: 'ses_1',
+    captureId: 'cap_1',
+    ingestSeq: counter,
+  };
+  return { ...base, ...over };
+}
+
+/** A readable value summary, the shape a producer's diff emits. */
+function summary(preview: string): { type: 'number'; preview: string; truncated: boolean } {
+  return { type: 'number', preview, truncated: false };
+}
+
+describe('the state-transition trigger', () => {
+  it('prefers the span the producer named over the parent chain', () => {
+    const interaction = event({
+      kind: 'interaction',
+      name: 'click button',
+      attributes: { 'event.type': 'click' },
+    });
+    const commit = event({
+      kind: 'commit',
+      name: 'commit',
+      parentSpanId: interaction.spanId,
+      attributes: { phase: 'update', renderCount: 1 },
+    });
+    const render = event({
+      kind: 'render',
+      name: 'render row',
+      parentSpanId: commit.spanId,
+      attributes: { component: 'ListRow', trigger: 'context' },
+    });
+    const transition = event({
+      kind: 'state',
+      name: 'ListRow context[0]',
+      duration: 0,
+      parentSpanId: render.spanId,
+      attributes: {
+        component: 'ListRow',
+        hookIndex: 0,
+        transitionSource: 'context',
+        triggerSpanId: interaction.spanId,
+        renderSpanId: render.spanId,
+        fiberId: 12,
+        previousValue: summary('1'),
+        nextValue: summary('2'),
+      },
+    });
+
+    const rows = aggregateStateTransitions([interaction, commit, render, transition]);
+
+    expect(rows).toHaveLength(1);
+    const row = rows[0];
+    expect(row?.triggerSpanId).toBe(interaction.spanId);
+    expect(row?.triggerEventId).toBe(interaction.id);
+    expect(row?.triggerName).toBe('click button');
+    expect(row?.triggerKind).toBe('interaction');
+    // The parent chain would have answered with the render's parent commit.
+    expect(row?.triggerEventId).not.toBe(commit.id);
+  });
+
+  it('keeps a producer-named trigger span that is outside the slice', () => {
+    const absentSpanId = 'f'.repeat(16);
+    const transition = event({
+      kind: 'state',
+      name: 'ListRow hook[0]',
+      duration: 0,
+      attributes: {
+        component: 'ListRow',
+        transitionSource: 'state',
+        triggerSpanId: absentSpanId,
+        previousValue: summary('1'),
+        nextValue: summary('2'),
+      },
+    });
+
+    const row = aggregateStateTransitions([transition])[0];
+
+    expect(row?.triggerSpanId).toBe(absentSpanId);
+    // No event id is invented for a span nobody sent: the field is only ever a
+    // real event's id.
+    expect(row?.triggerEventId).toBeUndefined();
+    expect(row?.triggerName).toBeUndefined();
+  });
+
+  it('lets a producer-named event id win over a producer-named span id', () => {
+    const cause = event({ kind: 'fetch', name: 'GET /resource', attributes: {} });
+    const other = event({ kind: 'interaction', name: 'click button', attributes: {} });
+    const transition = event({
+      kind: 'state',
+      name: 'ListRow hook[0]',
+      duration: 0,
+      attributes: {
+        component: 'ListRow',
+        triggerEventId: cause.id,
+        triggerSpanId: other.spanId,
+        previousValue: summary('1'),
+      },
+    });
+
+    const row = aggregateStateTransitions([cause, other, transition])[0];
+
+    expect(row?.triggerEventId).toBe(cause.id);
+    expect(row?.triggerSpanId).toBe(cause.spanId);
+  });
+
+  it('still walks the parent chain when the producer named neither', () => {
+    const interaction = event({ kind: 'interaction', name: 'click button', attributes: {} });
+    const render = event({
+      kind: 'render',
+      name: 'render row',
+      parentSpanId: interaction.spanId,
+      attributes: { component: 'ListRow', trigger: 'state' },
+    });
+    const transition = event({
+      kind: 'state',
+      name: 'ListRow hook[0]',
+      duration: 0,
+      parentSpanId: render.spanId,
+      attributes: { component: 'ListRow', previousValue: summary('1') },
+    });
+
+    const row = aggregateStateTransitions([interaction, render, transition])[0];
+
+    expect(row?.triggerEventId).toBe(render.id);
+    expect(row?.triggerSpanId).toBe(render.spanId);
+  });
+
+  it('carries the transition description the producer reported', () => {
+    const transition = event({
+      kind: 'state',
+      name: 'ListRow context[2]',
+      duration: 0,
+      attributes: {
+        component: 'ListRow',
+        hookIndex: 2,
+        hookLabel: 'ThemeContext',
+        transitionSource: 'context',
+        renderSpanId: '9'.repeat(16),
+        fiberId: 48,
+        previousValue: summary('1'),
+        nextValue: summary('2'),
+      },
+    });
+
+    const row = aggregateStateTransitions([transition])[0];
+
+    expect(row?.transitionSource).toBe('context');
+    expect(row?.renderSpanId).toBe('9'.repeat(16));
+    expect(row?.fiberId).toBe(48);
+    expect(row?.hookLabel).toBe('ThemeContext');
+    expect(row?.changed).toBe(true);
+  });
+
+  it('drops a transition source this build does not recognise', () => {
+    const transition = event({
+      kind: 'state',
+      name: 'ListRow hook[0]',
+      duration: 0,
+      attributes: { component: 'ListRow', transitionSource: 'telepathy' },
+    });
+
+    expect(aggregateStateTransitions([transition])[0]?.transitionSource).toBeUndefined();
+  });
+
+  it('reads the producer\u2019s truncation disclosure as an incomplete list', () => {
+    const sentinel = event({
+      kind: 'state',
+      name: 'state transitions dropped',
+      duration: 0,
+      attributes: { component: 'ListRow', truncated: true, droppedTransitions: 41 },
+    });
+
+    const row = aggregateStateTransitions([sentinel])[0];
+
+    expect(row?.truncated).toBe(true);
+    expect(row?.droppedTransitions).toBe(41);
+    // It describes no value, which is the shape a viewer must not render as a
+    // transition.
+    expect(row?.changed).toBe(false);
+    expect(row?.previousValue).toBeUndefined();
+  });
+});
+
+describe('dependency-graph edge identity', () => {
+  /** A span whose participant identity is its own name. */
+  function participant(name: string, durationMs: number, parentSpanId?: string): TelemetryEvent {
+    return event({
+      kind: 'function',
+      tier: 'server',
+      name,
+      duration: durationMs,
+      attributes: {},
+      ...(parentSpanId === undefined ? {} : { parentSpanId }),
+    });
+  }
+
+  it('keeps two edges distinct when a span name contains the id separator', () => {
+    // Without escaping, `edge:` + A + '=>' + B is byte-identical for these two
+    // pairs, because each identity carries the other pair's separator.
+    const head = participant('X=>dep:function:server:Y', 7);
+    const tail = participant('Z', 7, head.spanId);
+    const otherHead = participant('X', 100);
+    const otherTail = participant('Y=>dep:function:server:Z', 100, otherHead.spanId);
+
+    const graph = buildDependencyGraph([head, tail, otherHead, otherTail]);
+
+    expect(graph.edges).toHaveLength(2);
+    const ids = graph.edges.map((edge) => edge.id);
+    expect(new Set(ids).size).toBe(2);
+    for (const id of ids) {
+      expect(id.startsWith(DEPENDENCY_EDGE_ID_PREFIX)).toBe(true);
+    }
+    // Neither relationship absorbed the other's count or duration.
+    expect(graph.edges.map((edge) => edge.count)).toEqual([1, 1]);
+    expect(new Set(graph.edges.map((edge) => edge.totalDurationMs))).toEqual(new Set([7, 100]));
+  });
+
+  it('keeps an identity that already contains the escape distinct from its plain form', () => {
+    const escaped = participant('A%3D', 3);
+    const escapedChild = participant('child-one', 3, escaped.spanId);
+    const plain = participant('A=', 5);
+    const plainChild = participant('child-two', 5, plain.spanId);
+
+    const graph = buildDependencyGraph([escaped, escapedChild, plain, plainChild]);
+
+    const ids = graph.edges.map((edge) => edge.id);
+    expect(ids).toHaveLength(2);
+    expect(new Set(ids).size).toBe(2);
+  });
+
+  it('points from and to the raw node ids a consumer matches against', () => {
+    const caller = participant('caller', 2);
+    const callee = participant('callee', 2, caller.spanId);
+
+    const graph = buildDependencyGraph([caller, callee]);
+
+    const edge = graph.edges[0];
+    expect(edge).toBeDefined();
+    const nodeIds = graph.nodes.map((node) => node.id);
+    expect(nodeIds).toContain(edge?.from);
+    expect(nodeIds).toContain(edge?.to);
+  });
+});
+
+describe('participant source locations', () => {
+  /** Two locations a resolution route could plausibly report with one confidence. */
+  const first: SourceLocation = {
+    file: 'src/one.ts',
+    line: 10,
+    column: 3,
+    resolvedBy: 'code-graph',
+    confidence: 0.6,
+  };
+  const second: SourceLocation = {
+    file: 'src/two.ts',
+    line: 4,
+    column: 1,
+    resolvedBy: 'source-map',
+    confidence: 0.6,
+  };
+
+  /** One span of a single participant, carrying the location given. */
+  function span(source: SourceLocation, at: number): TelemetryEvent {
+    return event({
+      kind: 'function',
+      tier: 'server',
+      name: 'computeTotals',
+      duration: at,
+      attributes: { symbol: 'computeTotals', module: 'src/service.ts' },
+      source,
+    });
+  }
+
+  it('chooses the same equally confident location whatever order the spans arrive in', () => {
+    const forward = buildDependencyGraph([span(first, 1), span(second, 2)]);
+    const backward = buildDependencyGraph([span(second, 2), span(first, 1)]);
+
+    expect(forward.nodes).toHaveLength(1);
+    expect(forward.nodes[0]?.source).toEqual(backward.nodes[0]?.source);
+  });
+
+  it('still prefers the more confident location from either direction', () => {
+    const confident: SourceLocation = { ...second, resolvedBy: 'patch', confidence: 1 };
+
+    const forward = buildDependencyGraph([span(first, 1), span(confident, 2)]);
+    const backward = buildDependencyGraph([span(confident, 2), span(first, 1)]);
+
+    expect(forward.nodes[0]?.source).toEqual(confident);
+    expect(backward.nodes[0]?.source).toEqual(confident);
+  });
+
+  it('prefers a location that names a symbol over one that does not', () => {
+    const named: SourceLocation = { ...first, symbol: 'computeTotals' };
+
+    const forward = buildDependencyGraph([span(first, 1), span(named, 2)]);
+    const backward = buildDependencyGraph([span(named, 2), span(first, 1)]);
+
+    expect(forward.nodes[0]?.source).toEqual(named);
+    expect(backward.nodes[0]?.source).toEqual(named);
+  });
+});

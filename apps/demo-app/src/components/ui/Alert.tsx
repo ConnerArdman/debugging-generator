@@ -25,6 +25,12 @@
  *      carried semantically by the caller's own copy. The box therefore reads correctly with colour
  *      perception simulated off, and it needs no image asset.
  *
+ * What the box does leave to the caller is the element its optional title is rendered as - a
+ * paragraph by default, a heading level when the notice is the page rather than a message inside
+ * one. That choice belongs to whoever knows the document around the box, and it is deliberately
+ * kept apart from decision 1: the element carries no role, no live-region politeness and no
+ * urgency, so choosing a heading changes the outline and nothing about the announcement.
+ *
  * Presentation belongs entirely to `Alert.module.css`, which selects each tone through the
  * `data-tone` attribute set below. That is why this component performs no class lookup and never
  * indexes into the imported `styles` object dynamically - every class it uses is named literally,
@@ -70,11 +76,25 @@ interface Props {
   tone?: 'info' | 'success' | 'warning' | 'danger';
 
   /**
-   * An optional one-line heading, rendered as a paragraph rather than a heading element so that an
-   * alert dropped into any page never disturbs the document outline. Omit it for a single-sentence
-   * notice; supply it when the message needs a summary a reader can take in at a glance.
+   * An optional one-line heading for the message. Omit it for a single-sentence notice; supply it
+   * when the message needs a summary a reader can take in at a glance. It is rendered as a
+   * paragraph unless `titleAs` says otherwise, so an alert dropped into a page that already has a
+   * title leaves that page's outline alone.
    */
   title?: ReactNode;
+
+  /**
+   * Which element the `title` is rendered as. Defaults to `'p'`, which is right for every notice
+   * that sits inside a page owned by something else: the tone already announces the message, and a
+   * heading level chosen by this component would land at whatever depth the caller happened to
+   * place the box.
+   *
+   * A notice that IS the page is the exception - the storefront's error boundary is one - and
+   * there the failure headline is the route's own title, so it is passed `'h1'` and becomes a real
+   * heading a reader can navigate back to once the announcement has passed. The level stays the
+   * caller's decision, because only the caller knows what the page around the box declares.
+   */
+  titleAs?: 'p' | 'h1' | 'h2' | 'h3';
 
   /**
    * An optional trailing row of controls - retry, reload, "view order". A slot: the caller supplies
@@ -106,8 +126,34 @@ interface Props {
  * caller may legitimately render the digit `0` or an empty string as a title without the element
  * disappearing; passing nothing at all renders no element, leaving no empty row in the box's
  * vertical rhythm.
+ *
+ * The element the title is rendered as comes from `titleAs`, a paragraph unless a caller asks for
+ * a heading level. It changes nothing about the announcement: the role and politeness above are
+ * still derived from the tone alone, so a page-level error that renders its headline as an `h1`
+ * still produces exactly one assertive announcement and gains a heading a reader can navigate to
+ * afterwards.
  */
-export function Alert({ children, tone = 'info', title, actions, className }: Props) {
+export function Alert({
+  children,
+  tone = 'info',
+  title,
+  titleAs = 'p',
+  actions,
+  className,
+}: Props) {
+  /*
+    The title's element, held in a capitalised local because JSX reads a lower-case tag as a
+    literal DOM tag name and a capitalised one as a value. Every member of the union is an
+    intrinsic element, which is what makes this safe with no assertion and no widening.
+
+    Whichever element it is, it carries the one `title` class, and `Alert.module.css` states that
+    class's margin reset, tone colour, size, weight and line height outright - every property
+    app/globals.css sets on a heading level, and a CSS-module class outranks those element rules.
+    So the headline is painted identically in either form: choosing a heading changes the document
+    outline and nothing a reader sees.
+  */
+  const Title = titleAs;
+
   return (
     <div
       className={clsx(styles.root, className)}
@@ -115,7 +161,7 @@ export function Alert({ children, tone = 'info', title, actions, className }: Pr
       role={tone === 'danger' ? 'alert' : 'status'}
       aria-live={tone === 'danger' ? 'assertive' : 'polite'}
     >
-      {title === undefined ? null : <p className={styles.title}>{title}</p>}
+      {title === undefined ? null : <Title className={styles.title}>{title}</Title>}
       <div className={styles.body}>{children}</div>
       {actions === undefined ? null : <div className={styles.actions}>{actions}</div>}
     </div>

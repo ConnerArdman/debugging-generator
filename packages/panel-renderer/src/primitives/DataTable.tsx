@@ -28,9 +28,9 @@
  *   Virtualized with `@tanstack/react-virtual`. This is the only module in the package that
  *   imports it. Long lists render a window of rows inside the shared
  *   `dg-virtual-viewport`/`dg-virtual-canvas`/`dg-virtual-row` triplet, and real measured heights
- *   replace the estimate after first paint. A result is capped at 5 000 rows by AAP 0.4.2, so
- *   virtualization here buys smoothness rather than survival - which is what makes the
- *   measurement-unavailable fallback below safe.
+ *   replace the estimate after first paint. A result is capped at 5 000 rows by AAP 0.4.2, which is
+ *   both why virtualization here buys smoothness rather than survival and why the state before the
+ *   first measurement is bounded rather than whole - see the section on it below.
  *
  *   Keyboard-navigable. A roving `tabIndex` makes the body a single tab stop; Arrow keys, Home,
  *   End, PageUp/PageDown move the active row, Enter and Space activate it, and Arrow Right/Left
@@ -72,15 +72,40 @@
  * announced as data ("row 2 of 2"), and the header stays mounted so column context and the sort
  * controls remain available while the result is empty.
  *
- * ## The measurement-unavailable fallback, which must not be removed
+ * ## What renders before anything has been measured, and why it is bounded
  *
- * When virtualization is on but `virtualizer.getVirtualItems()` is empty while rows exist, every
- * row renders unvirtualized. Two environments produce exactly that state: happy-dom, where
- * `getBoundingClientRect()` answers zeroes so the virtualizer can measure no viewport - which is
- * the environment every `src/components/*.test.tsx` suite mounts these tables in - and the first
- * paint of a real browser, before the scroll element has been observed. Without the fallback those
- * suites would render an empty table and the `pnpm test` gate would fail for a reason that has
- * nothing to do with the components under test.
+ * When virtualization is on but `virtualizer.getVirtualItems()` is empty while rows exist, the
+ * virtualizer has measured no viewport and can produce no window, so rows render in normal flow
+ * instead. Two states produce exactly that: the first paint of a real browser, before the scroll
+ * element has been observed, and an environment that can measure nothing at all - happy-dom, where
+ * every rect and every `offsetHeight` answer zero, which is the environment the component suites of
+ * this package mount these tables in. Rows MUST render in that state: a table that showed nothing
+ * until a measurement arrived would flash empty in the panel and would render empty in every such
+ * suite, failing the `pnpm test` gate for reasons that have nothing to do with the components under
+ * test.
+ *
+ * How many rows render there is the part that is bounded. AAP 0.4.2 caps a result at 5 000 rows, and
+ * creating 5 000 rows with all of their cells - only to replace them with a window of thirty on the
+ * next commit - is a first paint the reader waits through. So the unmeasured state renders
+ * {@link DEFAULT_UNMEASURED_WINDOW_ROWS} rows, or as many as
+ * {@link DataTableVirtualizeOptions.unmeasuredWindowRows} asks for, anchored on the active row
+ * rather than pinned to row zero so that the roving tab stop is always one of them (see
+ * `resolveFlowRowRange`), while the canvas still advertises the scroll range of the whole result
+ * through `--dgc-virtual-total` so the scrollbar is right from that first paint.
+ *
+ * Two things ask for every row instead, and both are explicit:
+ *
+ *   `virtualize={false}` (or `{ enabled: false }`) turns virtualization off altogether and keeps
+ *   every row in the DOM permanently - what a surface that prints, searches or text-selects the
+ *   whole table needs.
+ *
+ *   `virtualize={{ enabled: true, unmeasuredWindowRows: 'all' }}` keeps virtualization on and lifts
+ *   the bound only while nothing has been measured. It is for a suite that must assert against
+ *   every row of a table it renders under happy-dom, where no measurement will ever arrive.
+ *
+ * A note for those suites, before either is reached for: a table of
+ * {@link AUTO_VIRTUALIZE_ROW_THRESHOLD} rows or fewer with `virtualize` omitted is not virtualized
+ * at all and renders whole anyway, so a fixture of that size needs neither escape hatch.
  *
  * ## Zero hardcoded CSS, and the geometry channel
  *
@@ -336,6 +361,27 @@ export interface DataTableVirtualizeOptions {
    * range is closer to the truth.
    */
   readonly estimateRowHeight?: number | undefined;
+
+  /**
+   * How many rows render while virtualization is ON but no viewport has been measured yet - the
+   * first paint of a real browser, before the scroll element has been observed.
+   *
+   * A COUNT of rows, never a length and never a style value (AAP 0.6.4): it decides how many rows
+   * exist in the DOM for one frame, and it reaches no class, custom property or declaration.
+   * Omitted, the table uses its own bound, which is the same count above which an unqualified
+   * table virtualizes itself - so an unmeasured first paint never puts more rows in the DOM than
+   * an unvirtualized table of this component would, and never fewer than the viewport can show.
+   *
+   * `'all'` is the explicit opt-in that keeps EVERY row in the DOM while nothing has been
+   * measured, and it exists for an environment with no layout at all: under happy-dom every rect
+   * and every `offsetHeight` answer zero, so the virtualizer can never measure a viewport and can
+   * never produce a window, which is the state the component test suites of this package mount
+   * these tables in. Pass it from a suite that must assert against every row; in a real browser it
+   * is the 5 000-row first paint this bound exists to prevent (AAP 0.4.2 caps a result at 5 000
+   * rows). {@link DataTableProps.virtualize} `= false` is the other way to get every row, and it
+   * is the right one whenever the rows are wanted permanently rather than only until measurement.
+   */
+  readonly unmeasuredWindowRows?: number | 'all' | undefined;
 }
 
 /**
@@ -459,6 +505,12 @@ export interface DataTableProps<Row> {
    * threshold - a short table pays nothing, a long one stays smooth. `false` (or
    * `{ enabled: false }`) keeps every row in the DOM, which is what a caller wants when an
    * enclosing surface prints or searches the whole table.
+   *
+   * While virtualization is on but no viewport has been measured yet - the first paint of a real
+   * browser, and every environment with no layout - a BOUNDED window of rows renders in normal
+   * flow rather than the whole result; {@link DataTableVirtualizeOptions.unmeasuredWindowRows}
+   * sizes that window and `'all'` opts out of it. See this module's header for the two states
+   * that reach it and which of the two opt-outs each case wants.
    */
   virtualize?: boolean | DataTableVirtualizeOptions | undefined;
 
@@ -542,6 +594,31 @@ const AUTO_VIRTUALIZE_ROW_THRESHOLD = 60;
 const DEFAULT_OVERSCAN_ROWS = 8;
 
 /**
+ * How many rows render while virtualization is on and no viewport has been measured yet. A COUNT,
+ * and deliberately the same count as {@link AUTO_VIRTUALIZE_ROW_THRESHOLD}, for two reasons that
+ * both have to hold:
+ *
+ *   It is the largest table this component is willing to render whole. Below that threshold an
+ *   unqualified table does not virtualize at all, so bounding the unmeasured first paint here
+ *   means a virtualized table never puts more rows in the DOM - not for one frame - than an
+ *   unvirtualized one already does. That is what makes the bound safe to apply by default: AAP
+ *   0.4.2 caps a result at 5 000 rows, and 5 000 rows with all their cells is a first paint the
+ *   reader waits for.
+ *
+ *   It comfortably exceeds the window the virtualizer settles on, so the bound never shows the
+ *   reader fewer rows than the viewport can hold. `../styles/components.css` caps this table's
+ *   scroll container at `max-block-size: calc(var(--dg-space-7) * 18)`, which resolves to 432 CSS
+ *   pixels; at {@link DEFAULT_ESTIMATED_ROW_HEIGHT} that is about thirteen rows, and
+ *   {@link DEFAULT_OVERSCAN_ROWS} beyond each edge brings the settled window to roughly thirty.
+ *
+ * Expressed as a row count rather than as a second pixel figure on purpose: the JSDoc on
+ * {@link DEFAULT_ESTIMATED_ROW_HEIGHT} states that it is the only numeric layout hint in this
+ * package, and that has to stay true. The 432-pixel cap named above lives in the stylesheet, where
+ * the token system can see it, and is read here only as the reasoning behind a count.
+ */
+const DEFAULT_UNMEASURED_WINDOW_ROWS = AUTO_VIRTUALIZE_ROW_THRESHOLD;
+
+/**
  * The default starting guess for a row's height, in CSS pixels.
  *
  * THE SINGLE NUMERIC LAYOUT HINT PERMITTED IN THIS PACKAGE, and it is a measurement hint rather
@@ -618,6 +695,36 @@ interface ResolvedVirtualization {
 
   /** The pre-measurement height guess, in CSS pixels. */
   readonly estimateRowHeight: number;
+
+  /**
+   * How many rows render while virtualization is on and nothing has been measured: a count, or
+   * `'all'` for every row. Already normalised, so the render path reads it without validating it.
+   */
+  readonly unmeasuredWindowRows: number | 'all';
+}
+
+/**
+ * Normalise a caller-supplied {@link DataTableVirtualizeOptions.unmeasuredWindowRows}.
+ *
+ * `'all'` passes through as the explicit opt-in. A number is accepted only when it is finite -
+ * `NaN` and the infinities would otherwise reach `Math.min` and produce a window of `NaN` rows -
+ * and is then floored to a whole row and raised to at least one: a window of zero rows would
+ * render no rows at all while rows exist, which strands the roving tab stop and leaves the body
+ * unreachable by Tab. Anything else (`undefined`, a non-finite number) takes the default bound.
+ *
+ * @param value The option as the caller supplied it, if at all.
+ * @returns A whole row count of at least one, or `'all'`.
+ */
+function resolveUnmeasuredWindowRows(value: number | 'all' | undefined): number | 'all' {
+  if (value === 'all') {
+    return 'all';
+  }
+
+  if (value !== undefined && Number.isFinite(value)) {
+    return Math.max(1, Math.floor(value));
+  }
+
+  return DEFAULT_UNMEASURED_WINDOW_ROWS;
 }
 
 /**
@@ -627,9 +734,14 @@ interface ResolvedVirtualization {
  * an options object without `enabled` means on, because passing options at all expresses that
  * intent.
  *
+ * The unmeasured window is resolved in every branch, including the two where virtualization is
+ * off: the setting describes what happens while virtualization is ON and unmeasured, and a
+ * resolved value that is always present keeps the render path free of a second `undefined` case.
+ * With virtualization off the render path renders every row regardless of it.
+ *
  * @param virtualize The prop as the caller supplied it, if at all.
  * @param rowCount How many rows are being rendered.
- * @returns The mode, the overscan and the height hint.
+ * @returns The mode, the overscan, the height hint and the unmeasured window.
  */
 function resolveVirtualization(
   virtualize: boolean | DataTableVirtualizeOptions | undefined,
@@ -642,6 +754,7 @@ function resolveVirtualization(
       enabled: auto,
       overscan: DEFAULT_OVERSCAN_ROWS,
       estimateRowHeight: DEFAULT_ESTIMATED_ROW_HEIGHT,
+      unmeasuredWindowRows: DEFAULT_UNMEASURED_WINDOW_ROWS,
     };
   }
 
@@ -650,6 +763,7 @@ function resolveVirtualization(
       enabled: virtualize,
       overscan: DEFAULT_OVERSCAN_ROWS,
       estimateRowHeight: DEFAULT_ESTIMATED_ROW_HEIGHT,
+      unmeasuredWindowRows: DEFAULT_UNMEASURED_WINDOW_ROWS,
     };
   }
 
@@ -657,6 +771,7 @@ function resolveVirtualization(
     enabled: virtualize.enabled ?? true,
     overscan: virtualize.overscan ?? DEFAULT_OVERSCAN_ROWS,
     estimateRowHeight: virtualize.estimateRowHeight ?? DEFAULT_ESTIMATED_ROW_HEIGHT,
+    unmeasuredWindowRows: resolveUnmeasuredWindowRows(virtualize.unmeasuredWindowRows),
   };
 }
 
@@ -770,12 +885,72 @@ function resolveActiveIndex(
   return Math.min(Math.max(preferred, 0), rowCount - 1);
 }
 
+/** A half-open range of row indices, `[start, end)`, as `Array.prototype.slice` takes them. */
+interface RowRange {
+  /** The first row index rendered. */
+  readonly start: number;
+
+  /** One past the last row index rendered. */
+  readonly end: number;
+}
+
+/**
+ * The rows that render IN NORMAL FLOW - whenever the virtualizer is not the thing driving the
+ * render. Two states reach it, and they want different answers.
+ *
+ * Virtualization off, by `virtualize={false}`, `{ enabled: false }` or a row count below
+ * {@link AUTO_VIRTUALIZE_ROW_THRESHOLD}: every row, which is the documented meaning of the opt-out
+ * and what a surface that prints, searches or selects the whole table depends on.
+ *
+ * Virtualization on but nothing measured yet - the first paint of a real browser before the scroll
+ * element has been observed, and any environment that can measure nothing at all: a WINDOW of
+ * {@link ResolvedVirtualization.unmeasuredWindowRows} rows, unless that setting is `'all'`, which
+ * is the explicit opt-in back to every row. AAP 0.4.2 caps a result at 5 000 rows, and creating
+ * 5 000 rows with all their cells for one frame is a first paint the reader waits through, which is
+ * the whole reason the bound exists.
+ *
+ * The window is ANCHORED ON THE ACTIVE ROW rather than pinned to row zero, and that is a
+ * correctness requirement rather than a nicety: a caller may arrive with `selectedRowKey` naming
+ * row 4 000, that row holds the roving tab stop, and a tab stop that is not in the DOM leaves the
+ * grid body unreachable by Tab. Anchoring also keeps Home, End and PageUp/PageDown working while
+ * unmeasured - the window follows `activeIndex`, so the row a key moved to exists on the next
+ * commit. The overscan is spent ahead of the anchor so a row reached by ArrowUp is already there,
+ * and the start is clamped so the window never runs off either end of the result.
+ *
+ * @param virtualization The resolved settings, for the mode and the window size.
+ * @param rowCount How many rows exist.
+ * @param activeIndex The row holding the roving tab stop, or `-1` when there are no rows.
+ * @returns The half-open range of row indices to render in flow.
+ */
+function resolveFlowRowRange(
+  virtualization: ResolvedVirtualization,
+  rowCount: number,
+  activeIndex: number,
+): RowRange {
+  if (!virtualization.enabled || virtualization.unmeasuredWindowRows === 'all') {
+    return { start: 0, end: rowCount };
+  }
+
+  const windowRows = Math.min(virtualization.unmeasuredWindowRows, rowCount);
+
+  // The window opens `overscan` rows ahead of the anchor, so a row reached by ArrowUp is already
+  // there - but never so far ahead that the anchor would fall past its end, which is what a window
+  // narrower than the overscan would otherwise do (`unmeasuredWindowRows: 1` with the default
+  // overscan of eight). `earliestStart` is the first start that still contains the anchor; the
+  // outer clamp then keeps the window inside the result at both ends.
+  const earliestStart = activeIndex - windowRows + 1;
+  const anchored = Math.max(activeIndex - virtualization.overscan, earliestStart);
+  const start = Math.min(Math.max(anchored, 0), rowCount - windowRows);
+
+  return { start, end: start + windowRows };
+}
+
 /**
  * The generic data grid of the design system.
  *
  * See this module's header for the four pillars of AAP 0.6.2, the exact ARIA structure, the class
- * and custom-property contract, the measurement-unavailable fallback and the boundaries this
- * primitive keeps; see {@link DataTableProps} and {@link DataTableColumn} for the props.
+ * and custom-property contract, what renders before anything has been measured and the boundaries
+ * this primitive keeps; see {@link DataTableProps} and {@link DataTableColumn} for the props.
  *
  * Written as a generic function rather than an `FC`, so `Row` is inferred from `rows` at every
  * call site and each {@link DataTableColumn.cell} receives the caller's own row type.
@@ -915,6 +1090,18 @@ export function DataTable<Row>(props: DataTableProps<Row>): ReactElement {
     estimateSize: () => virtualization.estimateRowHeight,
     overscan: virtualization.overscan,
     enabled: virtualizationEnabled,
+    // REQUIRED under React 19, not a preference. The adapter's own default is `useFlushSync: true`,
+    // in which case every synchronous notification it raises - a viewport measurement, a row
+    // measurement, a scroll - re-renders this component through `flushSync`. Those notifications
+    // originate in the layout-effect and measurement path (`observeElementRect` fires as the scroll
+    // element is attached, `measureElement` fires from the row refs), so the call lands while React
+    // is already rendering or committing, and React 19.3.0 answers that with a console warning and
+    // a deferred update rather than a synchronous flush. `false` makes the adapter call its own
+    // `rerender` instead, which React batches with the rest of the commit - the window is one
+    // render behind for a single frame, which is what the overscan above exists to cover. The two
+    // versions this reasoning is tied to are pinned by AAP 0.3.2: react/react-dom 19.3.0 and
+    // @tanstack/react-virtual 3.14.13.
+    useFlushSync: false,
     // Measurements follow the row's identity rather than its position, so a re-sort or a re-page
     // does not attribute one row's measured height to another.
     getItemKey: (index) => models[index]?.key ?? index,
@@ -922,17 +1109,15 @@ export function DataTable<Row>(props: DataTableProps<Row>): ReactElement {
 
   const virtualItems = virtualizer.getVirtualItems();
   const viewportHeight = virtualizer.scrollRect === null ? 0 : virtualizer.scrollRect.height;
-  const firstRenderedIndex = virtualItems[0]?.index;
 
-  // THE MEASUREMENT-UNAVAILABLE FALLBACK - do not remove it, and do not narrow it to the item
-  // check alone. Virtualization only drives the render when the virtualizer has actually measured
-  // a viewport and produced a window; when it has not, every row renders in normal flow. Two real
-  // environments land here: happy-dom, where `getBoundingClientRect()` answers zeroes so no
-  // viewport can be measured - the environment every `src/components/*.test.tsx` suite mounts
-  // these tables in, which without this fallback would see an empty table and fail the `pnpm test`
-  // gate for reasons unrelated to the components under test - and the first paint of a real
-  // browser, before the scroll element has been observed. AAP 0.4.2 caps a result at 5 000 rows,
-  // so the fallback renders a bounded table rather than an unbounded one.
+  // THE MEASUREMENT GATE - do not narrow it to the item check alone. Virtualization only drives
+  // the render when the virtualizer has actually measured a viewport AND produced a window; when
+  // it has not, rows render in normal flow instead, and `resolveFlowRowRange` decides how many.
+  // Two real states land there: the first paint of a real browser, before the scroll element has
+  // been observed, and an environment that can measure nothing at all - happy-dom, where every
+  // rect and every `offsetHeight` answer zero, which is the environment the component suites of
+  // this package mount these tables in. See this module's header for the two ways a caller asks
+  // for every row in that state, and why neither is the default.
   const isVirtualized = virtualizationEnabled && virtualItems.length > 0 && viewportHeight > 0;
 
   const selectedIndex =
@@ -941,14 +1126,34 @@ export function DataTable<Row>(props: DataTableProps<Row>): ReactElement {
       : indexByKey.get(selectedRowKey);
   const activeIndex = resolveActiveIndex(navigatedIndex, selectedIndex, rowCount);
 
+  // Resolved after `activeIndex` because the window is anchored on it, and before the tab stop
+  // below because the tab stop depends on which rows this range puts in the DOM.
+  const flowRange = resolveFlowRowRange(virtualization, rowCount, activeIndex);
+
+  // Whether the flow range is a WINDOW rather than the whole result. It drives one thing: the
+  // canvas's scroll range, which has to describe all the rows even while only some are rendered.
+  const flowRangeIsWindowed = !isVirtualized && flowRange.end - flowRange.start < rowCount;
+
   // The roving tab stop has to EXIST in the DOM whenever rows are rendered, and under
   // virtualization the active row can sit far outside the rendered window - scroll a long table
   // away from row one and every rendered row would carry `tabIndex={-1}`, leaving the body
   // unreachable by Tab. While the active row is outside the window, the topmost rendered row
   // takes the tab stop instead; the key handlers read the origin row's own index, so navigation
   // continues from wherever the reader actually entered.
-  const activeIsRendered =
-    !isVirtualized || virtualItems.some((item) => item.index === activeIndex);
+  //
+  // ONE PREDICATE for "is the active row in the DOM?", asked of whichever path is rendering: the
+  // virtual items when the virtualizer drives the render, the flow range when it does not. The
+  // flow range is anchored on `activeIndex` and `resolveFlowRowRange` keeps the anchor inside it,
+  // so on that path the answer is `true` whenever rows exist; it is still computed rather than
+  // assumed, because it is also what the focus effect below waits on and the two must agree.
+  const activeIsRendered = isVirtualized
+    ? virtualItems.some((item) => item.index === activeIndex)
+    : activeIndex >= flowRange.start && activeIndex < flowRange.end;
+  const firstRenderedIndex = isVirtualized
+    ? virtualItems[0]?.index
+    : rowCount === 0
+      ? undefined
+      : flowRange.start;
   const tabStopIndex =
     activeIsRendered || firstRenderedIndex === undefined ? activeIndex : firstRenderedIndex;
 
@@ -1152,23 +1357,19 @@ export function DataTable<Row>(props: DataTableProps<Row>): ReactElement {
   );
 
   // Focus follows the active row, but only when a key handler asked for it. The row is resolved
-  // from the DOM rather than held in a ref because under virtualization it may not have existed
-  // when the key was pressed: `virtualItems` is a dependency, so a scroll that brings the row into
-  // the window runs this again and the pending request survives until the row is there.
+  // from the DOM rather than held in a ref because under either windowing path it may not have
+  // existed when the key was pressed. `activeIsRendered` - the one predicate above, which asks the
+  // path that is actually rendering - is a dependency, so the commit that brings the row into the
+  // DOM runs this again; until then the pending request is deliberately LEFT SET, so it survives
+  // rather than being spent on a row that is not there.
   useEffect(() => {
-    if (!focusPendingRef.current || activeIndex < 0) {
+    if (!focusPendingRef.current || activeIndex < 0 || !activeIsRendered) {
       return;
     }
 
     const viewport = viewportRef.current;
 
     if (viewport === null) {
-      return;
-    }
-
-    const windowed = virtualItems.length > 0;
-
-    if (windowed && !virtualItems.some((item) => item.index === activeIndex)) {
       return;
     }
 
@@ -1180,20 +1381,28 @@ export function DataTable<Row>(props: DataTableProps<Row>): ReactElement {
 
     focusPendingRef.current = false;
     candidate.focus();
-  }, [activeIndex, virtualItems]);
+  }, [activeIndex, activeIsRendered]);
 
   const gridStyle: CssVariableStyle = { '--dgc-columns': columnTemplate };
-  const canvasStyle: CssVariableStyle | undefined = isVirtualized
-    ? { '--dgc-virtual-total': String(virtualizer.getTotalSize()) }
-    : undefined;
+
+  // The canvas carries the scroll range of the WHOLE result, and it has to do so from the first
+  // paint: while the flow range is a window, the rows in the DOM describe only their own share of
+  // the height, and without a total the scrollbar would appear only once the virtualizer took
+  // over. `../styles/components.css` consumes it as `min-block-size`, a MINIMUM, so a value that
+  // is still an estimate can never clip the rows that are actually rendered. It stays unset on the
+  // two paths that render every row, where the rows themselves are the true height.
+  const canvasStyle: CssVariableStyle | undefined =
+    isVirtualized || flowRangeIsWindowed
+      ? { '--dgc-virtual-total': String(virtualizer.getTotalSize()) }
+      : undefined;
 
   /**
    * One data row, its cells and - when open - its detail row, inside the positioning wrapper.
    *
    * A plain function called during this component's render, not a component: it closes over the
-   * columns, handlers and flags resolved above, so the two row paths (windowed and whole) render
-   * byte-identical markup and the difference between them stays where it belongs - in the
-   * geometry.
+   * columns, handlers and flags resolved above, so the two row paths - the virtualizer's window
+   * and the flow range - render byte-identical markup and the difference between them stays where
+   * it belongs, in the geometry.
    *
    * @param model The row model from the single index pass above.
    * @param index The row's index in `rows`.
@@ -1221,8 +1430,8 @@ export function DataTable<Row>(props: DataTableProps<Row>): ReactElement {
         role="presentation"
         className={positioned ? 'dg-virtual-row' : undefined}
         data-index={index}
-        // Measurement is attached only while the window is real, so the fallback path above does
-        // not measure rows whose environment cannot measure anything.
+        // Measurement is attached only while the virtualizer's window is real, so the flow path
+        // above does not measure rows in an environment that can measure nothing.
         ref={isVirtualized ? virtualizer.measureElement : undefined}
         style={wrapperStyle}
       >
@@ -1356,7 +1565,15 @@ export function DataTable<Row>(props: DataTableProps<Row>): ReactElement {
 
                     return model === undefined ? null : renderRow(model, item.index, item.start);
                   })
-                : models.map((model, index) => renderRow(model, index, undefined))}
+                : // The flow range, sliced - every row when virtualization is off or
+                  // `unmeasuredWindowRows` is `'all'`, a window anchored on the active row
+                  // otherwise. The slice offset is added back so each row keeps its TRUE index:
+                  // `data-row-index`, the ARIA indices carried on the model, and the `index`
+                  // argument of `cell`, `onRowActivate` and `onRowToggle` all mean the row's
+                  // position in the caller's `rows`, never its position in the window.
+                  models
+                    .slice(flowRange.start, flowRange.end)
+                    .map((model, offset) => renderRow(model, flowRange.start + offset, undefined))}
             </div>
           )}
         </div>

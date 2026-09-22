@@ -54,11 +54,16 @@
  * 2. else this file is a request-handler route module and the enclosing
  *    function is one of its HTTP-method exports (App Router) or its default
  *    export (legacy `pages/api/**`) → the **`api-route`** node
- *    (`./api-routes.ts`'s naming);
+ *    (`./api-routes.ts`'s naming). Both are read off this module's **export
+ *    surface** rather than off the `export` keyword, so a handler published by
+ *    a clause (`export { handler as PUT }`) or by an `export default
+ *    <identifier>` assignment is recognised as readily as one the keyword
+ *    marks;
  * 3. else the enclosing function matches the component shape → the
  *    **`component`** node (`./react-components.ts`'s naming);
- * 4. else the enclosing function is an exported module-level function of a
- *    server module → its own **`server-function`** node;
+ * 4. else the enclosing function is a module-level function of a server module
+ *    that the same export surface publishes under some name → its own
+ *    **`server-function`** node, which is the node this extractor emits for it;
  * 5. else the enclosing declaration is module-level (or a member of a
  *    module-level class) → its **`symbol`** node (`./symbols.ts`'s naming);
  * 6. else → the **`file`** node (`./imports.ts`'s naming).
@@ -103,6 +108,17 @@
  * A same-file call is resolved by the same rule with the import hop removed:
  * the callee names an exported module-level function of this module, and this
  * module is a server module.
+ *
+ * **"Exported" always means the module's export surface**, never the `export`
+ * keyword: {@link collectModuleExports} resolves the keyword, a local export
+ * clause (`export { loadThing }`, `export { handler as PUT }`) and an
+ * `export default <identifier>` assignment to the declaration each one names,
+ * and every judgement in this module — which nodes it emits, which call target
+ * it resolves, and which node a call is attributed to by steps 2 and 4 of the
+ * cascade — is made against that one surface. That is what keeps the owner
+ * steps and the emitter in agreement: a function the cascade attributes a call
+ * to is a function this extractor has emitted a node for, so the edge cannot
+ * dangle.
  *
  * Anything else yields no edge and no diagnostic: a member-access or namespace
  * callee (`lib.load()`) is a value question rather than a syntactic one, an
@@ -156,24 +172,74 @@
  * byte-identically, which is the reproducibility property `../indexer.ts`
  * promises and the index cache depends on.
  *
- * ## One import outside this folder, and why
+ * ## The local route identity, and the obligation it carries
  *
- * `../route-map.ts` owns every question about what URL a file serves, and
- * `../graph/types.ts` states outright that no other module may implement or
- * duplicate any part of that derivation — the route-group-plus-catch-all case
- * is exactly what a local re-derivation gets wrong. Step 2 of the cascade needs
- * the `api-route` node's identity, which is built from the route path and the
- * route's location, so it is read from `deriveRouteFromFile` and
- * `buildRouteEntry` exactly as `./api-routes.ts` reads them. That import is
- * acyclic (`../route-map.ts` reaches only `@debuggen/shared`, `ts-morph`,
- * `../graph/types.ts` and `../project.ts`) and it is the only one this module
- * makes outside `../graph/` and `../project.ts`: **no sibling extractor is
- * imported and no sibling extractor's output is read.**
+ * This module imports nothing outside `../graph/` and `../project.ts`: its
+ * dependency constraint forbids `../indexer.ts`, `../graph/query.ts`,
+ * `../summary.ts`, `../route-map.ts`, `../cache.ts`, `../search/**`,
+ * `../source-map/**` and every sibling extractor, because all of those sit at
+ * or above the layer an extractor is run from — `../route-map.ts` is a
+ * composition module that consumes a `LoadedProject` and a `CodeIndex`, so
+ * importing it from here inverts the layering.
+ *
+ * Step 2 of the cascade nevertheless needs one thing that derivation knows: the
+ * identity of the `api-route` node `./api-routes.ts` emits for this file. So
+ * {@link routeModuleIdentityOf} re-derives **that one question and nothing
+ * wider** — is this module a request handler, under which convention, and what
+ * is its node's id — from the file path and the module's own syntax. It answers
+ * about request-handler route modules only (`app/**\/route.*` and
+ * `pages/api/**`); it derives no route map, matches no request, reports no
+ * method list and reads no `page.*` module, all of which remain
+ * `../route-map.ts`'s exclusively.
+ *
+ * It **refuses whatever it cannot vouch for**, and refusing is cheap: the
+ * cascade then falls through to the component, server-function or symbol step,
+ * whose nodes always exist, so a refusal costs *specificity* and never
+ * correctness. Returning a wrong id would cost correctness — an `api-route` id
+ * that differs from `./api-routes.ts`'s by one character is a `dangling-edge`
+ * `../graph/graph.ts` drops, which silently deletes the route-to-service tier
+ * boundary. Hence the refusals: an intercepting route, a private folder, a
+ * malformed bracket segment, a misplaced catch-all, an unsupported extension,
+ * an unsafe path, and a module containing an `export =` assignment (a form the
+ * route map sees through the type checker and this abstract-syntax-tree-only
+ * extractor cannot).
+ *
+ * **What a future editor has to keep in step.** The derivation is duplicated,
+ * and a duplicate that drifts is worse than either copy. If `../route-map.ts`
+ * changes any of the following, change it here in the same edit — and if the
+ * two ever cannot be reconciled, make this helper refuse rather than let it
+ * disagree:
+ *
+ * - the router roots, the routable file names, or the supported extensions
+ *   ({@link APP_ROUTER_PREFIXES}, {@link PAGES_ROUTER_PREFIXES},
+ *   {@link APP_HANDLER_STEM}, {@link APP_ROUTE_EXTENSIONS},
+ *   {@link PAGES_ROUTE_EXTENSIONS});
+ * - what a directory contributes to a URL, including route groups, parallel
+ *   slots, private folders and intercepting routes
+ *   ({@link classifyAppRouteDirectory});
+ * - the dynamic-segment spellings, the legal parameter-name grammar or the
+ *   catch-all-must-be-last rule ({@link classifyRouteSegment},
+ *   {@link routePathOf});
+ * - **where an entry is anchored** — the handler shapes it recognises and the
+ *   position it reports for each ({@link appHandlerPosition},
+ *   {@link pagesHandlerPosition}). This is the part that silently breaks:
+ *   the position is half the node id, and the route map reaches it through
+ *   ts-morph's checker-backed `isExported()` / `isDefaultExport()` while this
+ *   helper reproduces the same answers from syntax
+ *   ({@link LocalExportIntents});
+ * - the id shape `./api-routes.ts` mints ({@link apiRouteNodeIdFor}).
  *
  * @module
  */
 
-import { basenamePosix, extnamePosix, isSafeRelativePath } from '@debuggen/shared';
+import {
+  basenamePosix,
+  extnamePosix,
+  isSafeRelativePath,
+  joinPosix,
+  normalizePosix,
+  toPosix,
+} from '@debuggen/shared';
 import { Node } from 'ts-morph';
 import type {
   CallExpression,
@@ -186,6 +252,7 @@ import type {
 } from 'ts-morph';
 
 import { makeEdgeId, makeNodeId } from '../graph/graph.js';
+import { HTTP_METHOD_NAMES } from '../graph/types.js';
 import type {
   CodeEdge,
   CodeNodeOf,
@@ -195,8 +262,6 @@ import type {
   IndexDiagnostic,
 } from '../graph/types.js';
 import { isIndexableFile, shouldExcludePath } from '../project.js';
-import { buildRouteEntry, deriveRouteFromFile } from '../route-map.js';
-import type { RouteEntry } from '../route-map.js';
 
 /* -------------------------------------------------------------------------------------------------
  * Identity and constants
@@ -296,9 +361,9 @@ const RENDER_METHOD_NAME = 'render';
  * The directory names a Next.js router tree can be rooted at, as path prefixes.
  *
  * Both conventional layouts, with and without a `src/` root, which are the same
- * four roots `../route-map.ts` derives a URL from by default. Used only to
- * decide *module shape* — "is this file a route or a page" — never to derive a
- * URL, which is that module's exclusive job.
+ * four roots `../route-map.ts` derives a URL from by default, in the same probe
+ * order. Read by {@link isRouteOrPageModule} to decide *module shape* and by
+ * {@link routerRelativePath} to locate a module below its router root.
  */
 const APP_ROUTER_PREFIXES: readonly string[] = Object.freeze(['app/', 'src/app/']);
 
@@ -313,6 +378,122 @@ const PAGES_ROUTER_PREFIXES: readonly string[] = Object.freeze(['pages/', 'src/p
  * Router tree a route or a page module rather than an ordinary one.
  */
 const APP_ROUTER_MODULE_NAMES: readonly string[] = Object.freeze(['route', 'page']);
+
+/**
+ * The names an App Router route module can export a request handler under.
+ *
+ * Derived from {@link HTTP_METHOD_NAMES} minus `ANY`, on exactly the terms
+ * `../route-map.ts` derives its own set: `ANY` is not an HTTP method and is
+ * never exported — it is what a single dispatching entry point (a legacy
+ * `pages/api/**` module) *reports*. Deriving it rather than spelling a method
+ * list keeps one vocabulary, so a method added to `../graph/types.ts` is
+ * recognised here in the same edit.
+ */
+const EXPORTABLE_HTTP_METHODS: ReadonlySet<string> = new Set<string>(
+  HTTP_METHOD_NAMES.filter((method) => method !== 'ANY'),
+);
+
+/**
+ * The URL separator, which is also the POSIX path separator, spelled once.
+ */
+const ROUTE_SEPARATOR = '/';
+
+/**
+ * The URL a route module with no segment below its router root serves.
+ */
+const ROOT_ROUTE_PATH = ROUTE_SEPARATOR;
+
+/**
+ * The extensions an App Router `route.*` module may carry.
+ *
+ * `../route-map.ts`'s set, which is the set `../project.ts` indexes: a route
+ * module written in JavaScript is ordinary in a project that has not finished
+ * migrating. Kept in step with that module — see the note on the local route
+ * identity in this file's header.
+ */
+const APP_ROUTE_EXTENSIONS: readonly string[] = Object.freeze([
+  '.ts',
+  '.tsx',
+  '.mts',
+  '.cts',
+  '.js',
+  '.jsx',
+  '.mjs',
+  '.cjs',
+]);
+
+/**
+ * The extensions a Pages Router module may carry, narrower than
+ * {@link APP_ROUTE_EXTENSIONS} on purpose: the framework's default page
+ * extensions are `tsx`, `ts`, `jsx` and `js`, and a `.mjs`/`.cjs` file under
+ * `pages/` is not served.
+ */
+const PAGES_ROUTE_EXTENSIONS: readonly string[] = Object.freeze(['.ts', '.tsx', '.js', '.jsx']);
+
+/**
+ * The App Router file name that makes a directory a request handler.
+ *
+ * A `page.*` module — and every other special file, now or later — is not a
+ * request handler, which is why the test is against this one name rather than
+ * against a list of names to exclude.
+ */
+const APP_HANDLER_STEM = 'route';
+
+/** The Pages Router file name that collapses to its own directory. */
+const PAGES_INDEX_STEM = 'index';
+
+/**
+ * The Pages Router file name that intercepts requests rather than answering
+ * them.
+ *
+ * `_app`, `_document` and `_error` need no entry beside it: every name
+ * beginning with `_` is refused as private.
+ */
+const PAGES_MIDDLEWARE_STEM = 'middleware';
+
+/** The directory under a Pages Router tree whose modules answer requests. */
+const PAGES_API_SEGMENT = 'api';
+
+/**
+ * An intercepting-route marker at the start of an App Router directory name:
+ * `(.)`, `(..)`, `(...)` and, by the same prefix, `(..)(..)`.
+ *
+ * The URL such a route serves depends on where it is rendered from, which a
+ * path cannot know, so a module below one is refused rather than guessed at.
+ */
+const INTERCEPTING_ROUTE_PREFIX = /^\(\.{1,3}\)/;
+
+/**
+ * A legal route-parameter name: anything that is not a separator, a bracket, a
+ * dot or whitespace.
+ *
+ * Permissive on purpose, and `../route-map.ts`'s own grammar: a parameter name
+ * reaches application code as an object key, so a hyphen or a non-ASCII letter
+ * is legal there. What it must reject is a name that would make the segment
+ * ambiguous — a nested bracket, an embedded separator, or the dots that spell a
+ * catch-all.
+ */
+const ROUTE_PARAM_NAME = /^[^[\].\s/]+$/;
+
+/**
+ * The marker {@link classifyAppRouteDirectory} returns for a directory that is
+ * legal but contributes nothing to the URL.
+ *
+ * A distinct sentinel rather than `undefined`, because `undefined` already
+ * means "this module is not a route this helper can vouch for", and conflating
+ * the two would turn every route group into a refusal.
+ */
+const SKIPPED_ROUTE_SEGMENT = Symbol('debuggen.server-functions.skipped-route-segment');
+
+/**
+ * The position a route module whose handler cannot be located is anchored at.
+ *
+ * `../route-map.ts`'s own fallback, and therefore the position
+ * `./api-routes.ts` emits such a module's node at: opening the file at its
+ * first line is a worse answer than opening it at the handler and a far better
+ * one than refusing to open it, and the module still serves its path.
+ */
+const FILE_START_POSITION: Position = Object.freeze({ line: 1, column: 1 });
 
 /* -------------------------------------------------------------------------------------------------
  * Internal shapes
@@ -501,6 +682,37 @@ interface FunctionCandidate {
 }
 
 /**
+ * Which convention a request-handler route module declares its handlers by.
+ *
+ * - `app` — one export per HTTP method, named for the method.
+ * - `pages` — one default export dispatching on the request method.
+ *
+ * The spelling matches `../graph/types.ts`'s `RouterKind` members, because it
+ * describes the same two conventions; it is a local type rather than that one
+ * because {@link routeModuleIdentityOf} answers only about request handlers and
+ * therefore never has a third answer to give.
+ */
+type RouteHandlerConvention = 'app' | 'pages';
+
+/**
+ * What this extractor knows about the file under extraction when that file is a
+ * **request-handler route module**: how its handlers are spelled, and the
+ * identity of the `api-route` node `./api-routes.ts` emits for it.
+ *
+ * Absent for every other module — a page module, an App Router special file, a
+ * component, a service — and absent for a route module whose identity this
+ * extractor cannot vouch for. See {@link routeModuleIdentityOf} for what that
+ * costs and why it costs nothing that matters.
+ */
+interface RouteModuleIdentity {
+  /** How this module's handlers are declared. */
+  readonly convention: RouteHandlerConvention;
+
+  /** The id of the `api-route` node `./api-routes.ts` emits for this module. */
+  readonly apiRouteNodeId: string;
+}
+
+/**
  * Everything the owner cascade needs about the file under extraction, computed
  * once per `extract` call.
  */
@@ -512,14 +724,10 @@ interface OwnerScope {
   readonly fileNodeId: string;
 
   /**
-   * The route entry of this module, when it serves a URL: the route path and
-   * the location `./api-routes.ts` builds its node from, read from
-   * `../route-map.ts` rather than re-derived.
+   * This module's route identity, when it is a request-handler route module
+   * whose `api-route` node this extractor can name exactly.
    */
-  readonly route: RouteEntry | undefined;
-
-  /** The id of this module's `api-route` node, when it has one. */
-  readonly apiRouteNodeId: string | undefined;
+  readonly route: RouteModuleIdentity | undefined;
 
   /**
    * The handlers this file binds in markup.
@@ -823,8 +1031,9 @@ function isAsyncFunction(fn: Node): boolean {
  * This is a question about **module shape**, not about URLs: it decides whether
  * a module's exported functions are service functions or framework entry
  * points, and it is deliberately not an attempt to answer what a file serves.
- * That question has exactly one owner, `../route-map.ts`, and the cascade asks
- * *it* whenever an answer about a URL is needed.
+ * What a file serves is asked of {@link routeModuleIdentityOf}, whose scope,
+ * refusals and duty to track `../route-map.ts` are stated in this file's
+ * header.
  *
  * @param file The module's project-relative POSIX path.
  * @returns `true` when the module is a route or page module.
@@ -2154,8 +2363,9 @@ function addressableOwnerId(scope: OwnerScope, candidate: FunctionCandidate): st
 
   // 2. An HTTP-method export of this route module, or its legacy default
   //    handler: the hop that makes a route traversable to the service layer.
-  if (scope.apiRouteNodeId !== undefined && isRouteHandlerExport(scope, candidate)) {
-    return scope.apiRouteNodeId;
+  const route = scope.route;
+  if (route !== undefined && isRouteHandlerExport(scope, route.convention, candidate)) {
+    return route.apiRouteNodeId;
   }
 
   // 3. A component — a call can originate in a rendered page rather than in an
@@ -2231,93 +2441,98 @@ function handlerOwnerId(scope: OwnerScope, candidate: FunctionCandidate): string
 /**
  * Step 2: whether this function is the request handler of this route module.
  *
- * Two module conventions, and the judgement in both cases comes from
- * `../route-map.ts`'s reading of the module rather than from a second one made
- * here:
+ * The judgement is a question about the module's **export surface**, not about
+ * the `export` keyword. {@link collectModuleExports} has already resolved an
+ * export clause (`export { handler as PUT }`) and an `export default
+ * <identifier>` to the declaration each one names, and both spellings are
+ * ordinary in a route module. A keyword-only gate rejected them — so a call
+ * written inside such a handler lost its `api-route` origin and fell through to
+ * a `symbol` node, which silently deletes the route-to-service tier boundary
+ * `../graph/query.ts`'s `pathBetween` is traversed through.
  *
- * - **App Router** — a module-level function this module exports under the name
- *   of one of the methods the route map read off it. Two spellings satisfy
- *   that, and both are ordinary: the declaration is *named* for the method
- *   (`export async function GET`, `export const POST = …`), or it is exported
- *   under that name by a clause (`export { handler as PUT }`). The first is
- *   confirmed against the location the route map recorded for that method,
- *   which keeps a same-named declaration elsewhere in the module from being
- *   mistaken for the handler; the second is confirmed by declaration identity
- *   through this module's own export surface, which is exact.
+ * Two module conventions:
+ *
+ * - **App Router** — a module-level function the export surface publishes under
+ *   the name of an exportable HTTP method, matched by **declaration identity**,
+ *   which is exact where a name comparison would credit a same-named
+ *   declaration in another scope. That covers `export async function GET`,
+ *   `export const POST = …` and `export { handler as PUT }` alike. The one
+ *   shape identity cannot see is an export whose initialiser is not *directly*
+ *   a function — `export const POST = withTiming(handler)`, whose value is a
+ *   call this module deliberately does not evaluate — so an exported
+ *   **declarator** *named* for the method is accepted on that evidence
+ *   instead. That fallback is bounded to the declarator shape on purpose: a
+ *   default export is not a method export under this convention, so
+ *   `export default function POST() {}` declares no `POST` handler — which is
+ *   how `../route-map.ts` reads such a module (it reports no method at all)
+ *   and how {@link appHandlerPosition} anchors it — and the name alone must
+ *   not credit it with one.
  * - **Legacy Pages Router** — the module's default export, which *is* the
- *   route: one function dispatching on the request method.
+ *   route: one function dispatching on the request method. Either the
+ *   declaration carries `export default` itself, or the export surface's
+ *   `default` entry is this very declaration.
  *
- * The recorded location is compared by **line containment** rather than by
- * exact position, because `../route-map.ts` anchors a handler at the start of
- * its declaration — the `export` keyword — while a node is positioned at its
- * identifier. Containment is what makes the two conventions agree without this
- * module re-deriving either of them.
- *
- * A page module is deliberately not a case here. Its default export renders a
- * document, and the component step is what names it; reporting it as the
+ * A page module is deliberately not a case here, and cannot become one: the
+ * route identity this step is gated on is derived for request-handler modules
+ * only ({@link routeModuleIdentityOf} refuses a `page.*` module and a
+ * rendering `pages/**` module outright). A page's default export renders a
+ * document and the component step is what names it; reporting it as the
  * handler of the page's `GET` would conflate rendering with answering, which is
  * the same distinction `../graph/query.ts` draws.
  *
- * @param scope The file under extraction, for its route entry and export surface.
+ * @param scope The file under extraction, for its export surface.
+ * @param convention How this route module declares its handlers.
  * @param candidate One enclosing function.
  * @returns `true` when the function is this route's handler.
  */
-function isRouteHandlerExport(scope: OwnerScope, candidate: FunctionCandidate): boolean {
-  const route = scope.route;
-
-  if (route === undefined || route.kind !== 'route-handler' || !candidate.isModuleLevel) {
+function isRouteHandlerExport(
+  scope: OwnerScope,
+  convention: RouteHandlerConvention,
+  candidate: FunctionCandidate,
+): boolean {
+  if (!candidate.isModuleLevel) {
     return false;
   }
 
-  if (route.router === 'pages') {
-    return candidate.isDefaultExport;
-  }
-
-  if (!candidate.exported) {
-    return false;
-  }
-
-  for (const method of route.methods) {
-    // Exported under the method's own name, at the declaration the route map
-    // located for it.
-    if (
-      candidate.name === method &&
-      declarationCoversLine(candidate.declaration, route.methodLocations?.[method]?.line)
-    ) {
+  if (convention === 'pages') {
+    if (candidate.isDefaultExport) {
       return true;
     }
 
-    // Exported under the method's name by a clause: the export surface already
-    // resolved the alias to a declaration, so identity settles it.
-    const exportedAs = scope.exports.functions.get(method);
-    if (exportedAs !== undefined && isSameNode(exportedAs.declaration, candidate.declaration)) {
+    const defaultExport = scope.exports.functions.get(DEFAULT_EXPORT_NAME);
+
+    return (
+      defaultExport !== undefined && isSameNode(defaultExport.declaration, candidate.declaration)
+    );
+  }
+
+  for (const method of EXPORTABLE_HTTP_METHODS) {
+    // Published under the method's name: the export surface has already
+    // resolved every spelling — the keyword, a clause, an alias — to the
+    // declaration it names, so identity settles it.
+    const published = scope.exports.functions.get(method);
+    if (published !== undefined && isSameNode(published.declaration, candidate.declaration)) {
+      return true;
+    }
+
+    // Declared for the method as an exported **declarator** whose initialiser
+    // the export surface could not read as a function — `export const POST =
+    // withTiming(handler)`, whose value is a call this module deliberately does
+    // not evaluate. The declarator shape is what bounds this evidence to that
+    // case: a declarator is never a module's default export, so a
+    // default-exported function *named* for a method — which declares no method
+    // at all under this convention, as {@link appHandlerPosition} and
+    // `../route-map.ts` both read it — cannot reach here on its name.
+    if (
+      candidate.name === method &&
+      candidate.exported &&
+      Node.isVariableDeclaration(candidate.declaration)
+    ) {
       return true;
     }
   }
 
   return false;
-}
-
-/**
- * Whether a declaration spans a line, with an absent line trivially covered.
- *
- * `undefined` means the route map recorded no per-method location, in which
- * case the method name is the whole of the evidence and there is nothing to
- * confirm against.
- *
- * @param declaration The declaration to measure.
- * @param line The 1-based line to look for, or `undefined`.
- * @returns `true` when the line falls inside the declaration, or is absent.
- */
-function declarationCoversLine(declaration: Node, line: number | undefined): boolean {
-  if (line === undefined) {
-    return true;
-  }
-
-  const start = declaration.getStartLineNumber();
-  const end = Math.max(declaration.getEndLineNumber(), start);
-
-  return line >= start && line <= end;
 }
 
 /**
@@ -2402,6 +2617,19 @@ function componentNodeIdFor(file: string, declaration: Node): string {
  * Matched by declaration identity rather than by name, so a local of the same
  * name in another scope cannot be credited with an exported function's calls.
  *
+ * The identity match against `exports.functions` is the whole of the export
+ * evidence, and deliberately so: that map is built from module-level
+ * statements only, and a function enters it exactly when this module publishes
+ * it under some name — by the `export` keyword, by an export clause
+ * (`export { loadThing }`) or by an `export default <identifier>` assignment.
+ * A match therefore already proves "module-level and exported", and it proves
+ * the stronger thing this step actually needs: that
+ * {@link serverFunctionNodes}, which is built from the same map, **emits** the
+ * node whose id is returned here. Gating on the `export` keyword in front of
+ * that loop rejected the clause and default-assignment spellings, and a call
+ * inside such a service function lost its `server-function` origin even though
+ * the same run had emitted that very node.
+ *
  * @param scope The file under extraction.
  * @param candidate One enclosing function.
  * @returns The server-function node id, or `undefined`.
@@ -2410,7 +2638,7 @@ function serverFunctionOwnerId(
   scope: OwnerScope,
   candidate: FunctionCandidate,
 ): string | undefined {
-  if (!scope.isServerModule || !candidate.isModuleLevel || !candidate.exported) {
+  if (!scope.isServerModule || !candidate.isModuleLevel) {
     return undefined;
   }
 
@@ -2772,55 +3000,713 @@ function sameFileTarget(scope: OwnerScope, declaration: Node): ResolvedTarget | 
 }
 
 /* -------------------------------------------------------------------------------------------------
- * Route reading and failure reporting
+ * Route identity, re-derived locally
+ *
+ * The bounded local re-derivation of one question: "is this module a request
+ * handler, and what is the id of the `api-route` node `./api-routes.ts` emits
+ * for it?" See this file's header for why it is local rather than imported,
+ * and for the standing obligation to keep it in step with `../route-map.ts`.
  * ---------------------------------------------------------------------------------------------- */
 
 /**
- * The route entry of the file under extraction, or `undefined` when it serves
- * no URL.
+ * One URL-contributing piece of a route module's path — an App Router
+ * directory, a Pages Router directory, or a Pages Router file name —
+ * classified as far as this helper needs it.
  *
- * Read entirely from `../route-map.ts`, which owns every part of the
- * derivation, and used for two things only: deciding whether the module is a
- * request handler, and spelling the `api-route` node's id exactly as
- * `./api-routes.ts` spells it — `file`, the route path as the node's name, and
- * the entry location's position.
- *
- * @param ctx The file being visited.
- * @returns The entry, or `undefined`.
+ * Only two facts about a segment matter to a node id: the text it contributes
+ * to the URL, which is the segment **exactly as the path spells it**, brackets
+ * included, and whether it is a catch-all, which is the one cross-segment rule
+ * that can refuse a whole module. The four-way segment kind
+ * `../route-map.ts` carries exists for request *matching*, which is that
+ * module's business and not this one's.
  */
-function routeEntryOf(ctx: ExtractorContext): RouteEntry | undefined {
-  const derived = deriveRouteFromFile(ctx.file);
-  if (derived === undefined) {
-    return undefined;
-  }
+interface ClassifiedRouteSegment {
+  /** The segment as written on disk, brackets included. */
+  readonly raw: string;
 
-  return buildRouteEntry(ctx.sourceFile, derived);
+  /** Whether the segment consumes the remainder of a request path. */
+  readonly isCatchAll: boolean;
 }
 
 /**
- * The id of the `api-route` node `./api-routes.ts` emits for a route entry, or
- * `undefined` when that extractor emits none.
+ * What a module's own `export` statements intend for the declarations it
+ * declares locally.
  *
- * The one condition it checks beyond having an entry is the path refinement
- * every stored path satisfies; mirroring it here keeps this module from
- * pointing at a node the route extractor declined to emit.
+ * The reason this exists is stated in full in this file's header: the route map
+ * asks ts-morph's `isExported()` / `isDefaultExport()`, which fall back to the
+ * **type checker** and therefore see a declaration exported by a clause, while
+ * this extractor is contractually abstract-syntax-tree-only. These two maps are
+ * the syntactic equivalent — every `export { … }` clause of the module that
+ * carries no module specifier, and every `export default <identifier>`
+ * statement — and they reproduce the checker's answer for every shape this
+ * helper is exercised against.
  *
- * @param route The route entry.
- * @returns The node id, or `undefined`.
+ * A **type-only** clause is deliberately not filtered out: a type-only export
+ * of a value declaration still enters the module's export symbol table, so
+ * `isExported()` reports `true` for it, and filtering here would move the
+ * anchor.
  */
-function apiRouteNodeIdFor(route: RouteEntry): string | undefined {
-  if (!isSafeRelativePath(route.file)) {
+interface LocalExportIntents {
+  /**
+   * Local name → the names a module-specifier-less `export { … }` clause
+   * exports it under, in source order.
+   *
+   * A clause that carries a module specifier (`export { GET } from './x'`)
+   * names *another* module's declaration and is therefore absent: it exports
+   * nothing of this module, which is exactly what the checker reports.
+   */
+  readonly clauses: ReadonlyMap<string, readonly string[]>;
+
+  /** The local names an `export default <identifier>` statement names. */
+  readonly defaults: ReadonlySet<string>;
+}
+
+/**
+ * The route identity of the file under extraction: its handler convention and
+ * its `api-route` node id, or `undefined` when this helper will not vouch for
+ * one.
+ *
+ * **Refusal is the safe answer and is used freely.** A refusal drops step 2 of
+ * the cascade for this file, and the call is then attributed by the component,
+ * server-function or symbol step — nodes that always exist, and the same, less
+ * specific, attribution `./api-calls.ts` makes for every route handler. A
+ * *wrong* id is not safe: an `api-route` id that differs from
+ * `./api-routes.ts`'s by one character is a `dangling-edge`
+ * `../graph/graph.ts` drops, which silently deletes the route-to-service tier
+ * boundary. So every refusal below is deliberate, and every value returned is
+ * one the derivation can account for.
+ *
+ * What is refused, beyond the module shapes {@link appRouteIdentity} and
+ * {@link pagesRouteIdentity} state:
+ *
+ * - a path that does not normalise to a safe project-relative path;
+ * - a module containing an `export =` assignment. That form is visible to the
+ *   route map through the type checker and invisible to syntax, so this helper
+ *   cannot reproduce the route map's reading of such a module and declines to
+ *   guess. It is a CommonJS-only form no supported router serves.
+ *
+ * @param sourceFile The module under extraction, as loaded by `../project.ts`.
+ * @param file The module's project-relative POSIX path.
+ * @returns The identity, or `undefined` when this module is not a
+ * request-handler route module this helper can name.
+ */
+function routeModuleIdentityOf(
+  sourceFile: SourceFile,
+  file: string,
+): RouteModuleIdentity | undefined {
+  // Normalised first and validated after, which is the order `../route-map.ts`
+  // applies: the normalised path is what its entry carries, and therefore what
+  // `./api-routes.ts` puts in the node id.
+  const normalized = normalizePosix(toPosix(file));
+  if (!isSafeRelativePath(normalized)) {
     return undefined;
   }
 
-  return makeNodeId({
-    kind: 'api-route',
-    file: route.file,
-    name: route.routePath,
-    line: route.location.line,
-    column: route.location.column,
+  for (const assignment of sourceFile.getExportAssignments()) {
+    if (assignment.isExportEquals()) {
+      return undefined;
+    }
+  }
+
+  // The App Router is probed first and exclusively, as `../route-map.ts` probes
+  // it: one path cannot belong to both trees, and a module below the first
+  // matching root is judged by that root's convention alone.
+  const appRest = routerRelativePath(normalized, APP_ROUTER_PREFIXES);
+  if (appRest !== undefined) {
+    return appRouteIdentity(sourceFile, normalized, appRest);
+  }
+
+  const pagesRest = routerRelativePath(normalized, PAGES_ROUTER_PREFIXES);
+  if (pagesRest !== undefined) {
+    return pagesRouteIdentity(sourceFile, normalized, pagesRest);
+  }
+
+  return undefined;
+}
+
+/**
+ * The part of a path below the first of a router's roots that contains it.
+ *
+ * A segment-boundary test rather than a string-prefix test, because the roots
+ * are spelled with their trailing separator: `application/page.tsx` is not
+ * below `app/`.
+ *
+ * @param file The module's normalised project-relative POSIX path.
+ * @param prefixes The router's roots, in probe order, each ending in a
+ * separator.
+ * @returns The remainder of the path with no leading separator, or `undefined`
+ * when the file is below none of them.
+ */
+function routerRelativePath(file: string, prefixes: readonly string[]): string | undefined {
+  for (const prefix of prefixes) {
+    if (file.startsWith(prefix)) {
+      return file.slice(prefix.length);
+    }
+  }
+
+  return undefined;
+}
+
+/**
+ * The identity of an App Router module, or `undefined` when it is not a
+ * request handler this helper can name.
+ *
+ * The URL is the *directory* the module sits in — `route.*` is a name that
+ * marks a directory as routable rather than a name that appears in a URL — so
+ * the file name contributes nothing beyond making the module a handler.
+ *
+ * Refused: any stem other than `route` (which covers `page.*` and every
+ * special file the framework has now or adds later, because the rule is stated
+ * positively), an unsupported extension, a private `_folder`, an intercepting
+ * `(.)folder`, a malformed bracket segment and a catch-all that is not last.
+ *
+ * @param sourceFile The module.
+ * @param file The module's normalised project-relative POSIX path.
+ * @param rest The part of that path below the App Router root.
+ * @returns The identity, or `undefined`.
+ */
+function appRouteIdentity(
+  sourceFile: SourceFile,
+  file: string,
+  rest: string,
+): RouteModuleIdentity | undefined {
+  const base = basenamePosix(rest);
+  const extension = extnamePosix(base);
+  if (!APP_ROUTE_EXTENSIONS.includes(extension)) {
+    return undefined;
+  }
+
+  if (basenamePosix(base, extension) !== APP_HANDLER_STEM) {
+    return undefined;
+  }
+
+  const segments: ClassifiedRouteSegment[] = [];
+  for (const raw of pathSegmentsOf(rest).slice(0, -1)) {
+    const classified = classifyAppRouteDirectory(raw);
+    if (classified === undefined) {
+      return undefined;
+    }
+
+    if (classified !== SKIPPED_ROUTE_SEGMENT) {
+      segments.push(classified);
+    }
+  }
+
+  const routePath = routePathOf(segments);
+  if (routePath === undefined) {
+    return undefined;
+  }
+
+  return Object.freeze({
+    convention: 'app' as const,
+    apiRouteNodeId: apiRouteNodeIdFor(
+      file,
+      routePath,
+      appHandlerPosition(sourceFile) ?? FILE_START_POSITION,
+    ),
   });
 }
+
+/**
+ * The identity of a legacy Pages Router module, or `undefined` when it is not a
+ * request handler this helper can name.
+ *
+ * Unlike the App Router, the *file name* is part of the URL here, `index`
+ * collapses to its own directory, and only a module below `api/` answers
+ * requests — everything else renders, which makes it a page and therefore not
+ * this step's business. Parentheses carry no meaning in this convention, so a
+ * parenthesised directory is an ordinary static segment rather than a group.
+ *
+ * Refused: an unsupported extension, a stem that is private (`_app`,
+ * `_document`, `_error`, any `_`-prefixed name), a dotfile, `middleware.*`, a
+ * module outside `api/`, a private directory, a malformed bracket segment and a
+ * catch-all that is not last.
+ *
+ * @param sourceFile The module.
+ * @param file The module's normalised project-relative POSIX path.
+ * @param rest The part of that path below the Pages Router root.
+ * @returns The identity, or `undefined`.
+ */
+function pagesRouteIdentity(
+  sourceFile: SourceFile,
+  file: string,
+  rest: string,
+): RouteModuleIdentity | undefined {
+  const base = basenamePosix(rest);
+  const extension = extnamePosix(base);
+  if (!PAGES_ROUTE_EXTENSIONS.includes(extension)) {
+    return undefined;
+  }
+
+  const stem = basenamePosix(base, extension);
+  if (stem.startsWith('_') || stem.startsWith('.') || stem === PAGES_MIDDLEWARE_STEM) {
+    return undefined;
+  }
+
+  const directories = pathSegmentsOf(rest).slice(0, -1);
+  if (directories[0] !== PAGES_API_SEGMENT) {
+    // A rendering module of the Pages Router is a page, and the cascade's step
+    // 2 excludes a page whichever router it belongs to.
+    return undefined;
+  }
+
+  const segments: ClassifiedRouteSegment[] = [];
+  for (const raw of directories) {
+    if (raw.startsWith('_')) {
+      return undefined;
+    }
+
+    const classified = classifyRouteSegment(raw);
+    if (classified === undefined) {
+      return undefined;
+    }
+
+    segments.push(classified);
+  }
+
+  if (stem !== PAGES_INDEX_STEM) {
+    const classified = classifyRouteSegment(stem);
+    if (classified === undefined) {
+      return undefined;
+    }
+
+    segments.push(classified);
+  }
+
+  const routePath = routePathOf(segments);
+  if (routePath === undefined) {
+    return undefined;
+  }
+
+  return Object.freeze({
+    convention: 'pages' as const,
+    apiRouteNodeId: apiRouteNodeIdFor(
+      file,
+      routePath,
+      pagesHandlerPosition(sourceFile) ?? FILE_START_POSITION,
+    ),
+  });
+}
+
+/**
+ * What one directory above an App Router module contributes to its URL.
+ *
+ * Four outcomes, which are `../route-map.ts`'s four: `undefined` for a
+ * directory that makes the module unroutable (a private `_folder`, an
+ * intercepting-route marker, a malformed bracket segment),
+ * {@link SKIPPED_ROUTE_SEGMENT} for a route group `(group)` or a parallel-route
+ * slot `@slot` — both of which organise the tree without appearing in the URL —
+ * and otherwise the segment itself.
+ *
+ * @param raw The directory name, exactly as written on disk.
+ * @returns The contribution, the skip marker, or `undefined`.
+ */
+function classifyAppRouteDirectory(
+  raw: string,
+): ClassifiedRouteSegment | typeof SKIPPED_ROUTE_SEGMENT | undefined {
+  if (raw.startsWith('_')) {
+    return undefined;
+  }
+
+  if (INTERCEPTING_ROUTE_PREFIX.test(raw)) {
+    return undefined;
+  }
+
+  if (raw.startsWith('(') && raw.endsWith(')')) {
+    return SKIPPED_ROUTE_SEGMENT;
+  }
+
+  if (raw.startsWith('@')) {
+    return SKIPPED_ROUTE_SEGMENT;
+  }
+
+  return classifyRouteSegment(raw);
+}
+
+/**
+ * Classifies one URL-contributing piece as static or as one of the three
+ * dynamic forms, refusing a spelling it cannot read.
+ *
+ * The three legal dynamic spellings are recognised exactly, longest form first,
+ * and anything else carrying a bracket is refused: a segment whose URL
+ * contribution is not knowable would, if invented, attribute a captured request
+ * to the wrong module. Brackets are read literally, because a file path carries
+ * them literally.
+ *
+ * @param raw The piece, exactly as written on disk.
+ * @returns The segment, or `undefined` when the spelling is not legal.
+ */
+function classifyRouteSegment(raw: string): ClassifiedRouteSegment | undefined {
+  if (raw.length === 0) {
+    return undefined;
+  }
+
+  if (raw.startsWith('[[...') && raw.endsWith(']]')) {
+    return dynamicRouteSegment(raw, raw.slice('[[...'.length, -']]'.length), true);
+  }
+
+  if (raw.startsWith('[...') && raw.endsWith(']') && !raw.endsWith(']]')) {
+    return dynamicRouteSegment(raw, raw.slice('[...'.length, -']'.length), true);
+  }
+
+  if (raw.startsWith('[') && raw.endsWith(']') && !raw.startsWith('[[')) {
+    return dynamicRouteSegment(raw, raw.slice('['.length, -']'.length), false);
+  }
+
+  if (raw.includes('[') || raw.includes(']')) {
+    return undefined;
+  }
+
+  return Object.freeze({ raw, isCatchAll: false });
+}
+
+/**
+ * Builds a dynamic segment, refusing an unusable parameter name.
+ *
+ * @param raw The segment as written, brackets included.
+ * @param param The captured name, already stripped of its brackets.
+ * @param isCatchAll Whether the form consumes the remainder of a request path.
+ * @returns The segment, or `undefined` when the name is not usable.
+ */
+function dynamicRouteSegment(
+  raw: string,
+  param: string,
+  isCatchAll: boolean,
+): ClassifiedRouteSegment | undefined {
+  return ROUTE_PARAM_NAME.test(param) ? Object.freeze({ raw, isCatchAll }) : undefined;
+}
+
+/**
+ * The URL path a list of segments spells, enforcing the one cross-segment rule:
+ * a catch-all consumes every remaining segment, so anything after it could
+ * never match and the framework rejects such a tree outright.
+ *
+ * Leading `/`, no trailing `/`, bracket forms preserved, and the root when
+ * there are no segments. Built with `joinPosix` so the separator arithmetic is
+ * the shared implementation's rather than this module's; nothing a segment can
+ * hold makes that normalisation lossy, because {@link classifyRouteSegment} has
+ * already established that a segment is non-empty, carries no separator and is
+ * neither `.` nor `..`.
+ *
+ * @param segments The route's segments, in URL order.
+ * @returns The route path, or `undefined` when a catch-all is misplaced.
+ */
+function routePathOf(segments: readonly ClassifiedRouteSegment[]): string | undefined {
+  const lastIndex = segments.length - 1;
+
+  for (const [index, segment] of segments.entries()) {
+    if (segment.isCatchAll && index !== lastIndex) {
+      return undefined;
+    }
+  }
+
+  if (segments.length === 0) {
+    return ROOT_ROUTE_PATH;
+  }
+
+  return joinPosix(ROUTE_SEPARATOR, ...segments.map((segment) => segment.raw));
+}
+
+/**
+ * The non-empty segments of a POSIX path, in order.
+ *
+ * @param path A project-relative path, or the part of one below a router root.
+ * @returns Its non-empty segments.
+ */
+function pathSegmentsOf(path: string): readonly string[] {
+  return path.split(ROUTE_SEPARATOR).filter((segment) => segment.length > 0);
+}
+
+/**
+ * The id of the `api-route` node `./api-routes.ts` emits for a route module.
+ *
+ * The one derivation, spelled exactly as that extractor spells it: the
+ * normalised project-relative path, the route path as the node's **name**, and
+ * the position of the route entry's location. An id that disagreed by one
+ * character would be an edge `../graph/graph.ts` drops.
+ *
+ * @param file The module's normalised project-relative POSIX path.
+ * @param routePath The URL the module serves.
+ * @param position The entry location's 1-based position.
+ * @returns The node id.
+ */
+function apiRouteNodeIdFor(file: string, routePath: string, position: Position): string {
+  return makeNodeId({
+    kind: 'api-route',
+    file,
+    name: routePath,
+    line: position.line,
+    column: position.column,
+  });
+}
+
+/**
+ * Where an App Router handler module's route entry is located: the
+ * earliest-positioned handler declaration in the module.
+ *
+ * Three declaration shapes contribute a position, because all three are
+ * ordinary in real projects and `../route-map.ts` reads all three:
+ *
+ * - a module-level **function declaration** that is exported, is not the
+ *   default export, and whose name is an exportable HTTP method — positioned at
+ *   the declaration's own start, which is its `export` keyword;
+ * - an exported **variable statement** whose declarator is named for a method —
+ *   positioned at the statement's start when it declares exactly one
+ *   declarator, and at the declarator's name otherwise, because a statement
+ *   declaring several bindings has no single start that names one of them;
+ * - an **export specifier** whose exported name (its alias when it has one) is
+ *   a method — positioned at the specifier, so the location is inside the route
+ *   module a developer clicked even for a re-export from elsewhere.
+ *
+ * The earliest of them is the answer. `../route-map.ts` sorts the declarations,
+ * drops a later occurrence of a method it has already seen and reports the
+ * first survivor; the earliest by offset *is* that survivor, because the first
+ * element of a sorted list can never be the duplicate of an earlier one. The
+ * per-method de-duplication matters to the method *list* that module also
+ * reports, and this helper does not report one.
+ *
+ * Exported-ness and default-ness are judged syntactically through
+ * {@link LocalExportIntents}; `sourceFile.getFunctions()` is used for the first
+ * shape precisely because ts-morph narrows it to implementations and ambient
+ * declarations, which is the set the route map iterates.
+ *
+ * @param sourceFile The module to read.
+ * @returns The position, or `undefined` when the module declares no handler —
+ * in which case the caller anchors at {@link FILE_START_POSITION}, which is
+ * what the route map falls back to.
+ */
+function appHandlerPosition(sourceFile: SourceFile): Position | undefined {
+  const intents = localExportIntentsOf(sourceFile);
+  const offsets: number[] = [];
+
+  for (const declaration of sourceFile.getFunctions()) {
+    const name = declaration.getName();
+
+    if (
+      name !== undefined &&
+      EXPORTABLE_HTTP_METHODS.has(name) &&
+      !isDefaultExportedDeclaration(declaration, name, intents) &&
+      isExportedDeclaration(declaration, name, intents)
+    ) {
+      offsets.push(declaration.getStart());
+    }
+  }
+
+  for (const statement of sourceFile.getVariableStatements()) {
+    if (!statement.hasExportKeyword()) {
+      // A variable statement is exported by its keyword alone: the route map's
+      // `isExported()` finds no symbol on a statement, so an `export { GET }`
+      // clause naming a `const` is credited to the *specifier* below.
+      continue;
+    }
+
+    const declarations = statement.getDeclarations();
+    const single = declarations.length === 1;
+
+    for (const declaration of declarations) {
+      if (!EXPORTABLE_HTTP_METHODS.has(declaration.getName())) {
+        continue;
+      }
+
+      offsets.push(single ? statement.getStart() : declaration.getNameNode().getStart());
+    }
+  }
+
+  for (const declaration of sourceFile.getExportDeclarations()) {
+    for (const specifier of declaration.getNamedExports()) {
+      const exportedName = specifier.getAliasNode()?.getText() ?? specifier.getName();
+
+      if (EXPORTABLE_HTTP_METHODS.has(exportedName)) {
+        offsets.push(specifier.getStart());
+      }
+    }
+  }
+
+  return offsets.length === 0 ? undefined : positionAtOffset(sourceFile, Math.min(...offsets));
+}
+
+/**
+ * Where a legacy Pages Router handler module's route entry is located: its
+ * default export, wherever it is spelled.
+ *
+ * Four spellings, and the order they are probed in is `../route-map.ts`'s
+ * **probe order rather than source order** — a function declaration wins over
+ * an `export default <identifier>` statement that precedes it, because that is
+ * the declaration the route map locates:
+ *
+ * 1. a default-exported function declaration;
+ * 2. a default-exported class declaration;
+ * 3. an `export default <expression>` statement, positioned at the statement;
+ * 4. an export specifier whose exported name is `default`, positioned at the
+ *    specifier — which is how a re-exported default is located inside this
+ *    module.
+ *
+ * @param sourceFile The module to read.
+ * @returns The position, or `undefined` when the module has no default export —
+ * in which case the caller anchors at {@link FILE_START_POSITION}.
+ */
+function pagesHandlerPosition(sourceFile: SourceFile): Position | undefined {
+  const intents = localExportIntentsOf(sourceFile);
+
+  for (const declaration of sourceFile.getFunctions()) {
+    if (isDefaultExportedDeclaration(declaration, declaration.getName(), intents)) {
+      return positionAtOffset(sourceFile, declaration.getStart());
+    }
+  }
+
+  for (const declaration of sourceFile.getClasses()) {
+    if (isDefaultExportedDeclaration(declaration, declaration.getName(), intents)) {
+      return positionAtOffset(sourceFile, declaration.getStart());
+    }
+  }
+
+  for (const assignment of sourceFile.getExportAssignments()) {
+    // `export =` cannot reach here — `routeModuleIdentityOf` refuses a module
+    // that spells one — and the guard is kept because the route map's own probe
+    // carries it, so the two readings stay comparable line by line.
+    if (!assignment.isExportEquals()) {
+      return positionAtOffset(sourceFile, assignment.getStart());
+    }
+  }
+
+  for (const declaration of sourceFile.getExportDeclarations()) {
+    for (const specifier of declaration.getNamedExports()) {
+      const exportedName = specifier.getAliasNode()?.getText() ?? specifier.getName();
+
+      if (exportedName === DEFAULT_EXPORT_NAME) {
+        return positionAtOffset(sourceFile, specifier.getStart());
+      }
+    }
+  }
+
+  return undefined;
+}
+
+/**
+ * What a module's `export` statements intend for its local declarations.
+ *
+ * @param sourceFile The module to read.
+ * @returns The clause and default-assignment intents.
+ */
+function localExportIntentsOf(sourceFile: SourceFile): LocalExportIntents {
+  const clauses = new Map<string, string[]>();
+  const defaults = new Set<string>();
+
+  for (const declaration of sourceFile.getExportDeclarations()) {
+    if (declaration.getModuleSpecifier() !== undefined) {
+      continue;
+    }
+
+    for (const specifier of declaration.getNamedExports()) {
+      const localName = specifier.getName();
+      const exportedAs = specifier.getAliasNode()?.getText() ?? localName;
+      const existing = clauses.get(localName);
+
+      if (existing === undefined) {
+        clauses.set(localName, [exportedAs]);
+      } else {
+        existing.push(exportedAs);
+      }
+    }
+  }
+
+  for (const assignment of sourceFile.getExportAssignments()) {
+    if (assignment.isExportEquals()) {
+      continue;
+    }
+
+    const expression = assignment.getExpression();
+    if (Node.isIdentifier(expression)) {
+      const name = nonEmptyText(expression);
+
+      if (name !== undefined) {
+        defaults.add(name);
+      }
+    }
+  }
+
+  return Object.freeze({ clauses, defaults });
+}
+
+/**
+ * Whether a declaration leaves its module, judged from syntax alone.
+ *
+ * The `export` keyword, or a local export clause naming it under any name —
+ * which is the pair of conditions under which the route map's checker-backed
+ * `isExported()` answers `true` for a module-level declaration.
+ *
+ * @param declaration The function or class declaration.
+ * @param name Its declared name, or `undefined` for an anonymous one.
+ * @param intents The module's export intents.
+ * @returns `true` when the declaration is exported.
+ */
+function isExportedDeclaration(
+  declaration: FunctionDeclaration | ClassDeclaration,
+  name: string | undefined,
+  intents: LocalExportIntents,
+): boolean {
+  if (declaration.hasExportKeyword()) {
+    return true;
+  }
+
+  return name !== undefined && intents.clauses.has(name);
+}
+
+/**
+ * Whether a declaration is its module's default export, judged from syntax
+ * alone.
+ *
+ * Three spellings: the `default` keyword, an `export default <identifier>`
+ * statement naming it, and a local export clause aliasing it to `default`. All
+ * three make the route map's `isDefaultExport()` answer `true`, which is what
+ * excludes such a declaration from the App Router's per-method handlers and
+ * what makes it the Pages Router's handler.
+ *
+ * @param declaration The function or class declaration.
+ * @param name Its declared name, or `undefined` for an anonymous one.
+ * @param intents The module's export intents.
+ * @returns `true` when the declaration is the module's default export.
+ */
+function isDefaultExportedDeclaration(
+  declaration: FunctionDeclaration | ClassDeclaration,
+  name: string | undefined,
+  intents: LocalExportIntents,
+): boolean {
+  if (declaration.hasDefaultKeyword()) {
+    return true;
+  }
+
+  if (name === undefined) {
+    return false;
+  }
+
+  return (
+    intents.defaults.has(name) || (intents.clauses.get(name) ?? []).includes(DEFAULT_EXPORT_NAME)
+  );
+}
+
+/**
+ * The 1-based line and column of a character offset in a module.
+ *
+ * The offset-taking counterpart of {@link positionOf}, needed because the route
+ * map anchors an entry at a declaration's **start offset** and this helper has
+ * to convert the same offsets it does. ts-morph's conversion is already 1-based
+ * on both axes and never reports a position below the first character, so the
+ * route map's clamp of the same value is a no-op and is not repeated.
+ *
+ * @param sourceFile The module the offset belongs to.
+ * @param offset The character offset.
+ * @returns The 1-based position.
+ */
+function positionAtOffset(sourceFile: SourceFile, offset: number): Position {
+  const { line, column } = sourceFile.getLineAndColumnAtPos(offset);
+
+  return { line, column };
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * Failure reporting
+ * ---------------------------------------------------------------------------------------------- */
 
 /**
  * The class name of a thrown value, for a diagnostic that has to say *what*
@@ -2929,13 +3815,11 @@ export const serverFunctionsExtractor: Extractor = Object.freeze({
       const cache = newAnalysisCache();
       const exports = moduleExportsOf(cache, ctx.sourceFile);
       const isServerModule = qualifiesAsServerModule(cache, ctx.sourceFile, ctx.file);
-      const route = routeEntryOf(ctx);
 
       const scope: OwnerScope = {
         file: ctx.file,
         fileNodeId: fileNodeIdFor(ctx.file),
-        route,
-        apiRouteNodeId: route === undefined ? undefined : apiRouteNodeIdFor(route),
+        route: routeModuleIdentityOf(ctx.sourceFile, ctx.file),
         handlers: collectHandlerBindings(ctx.sourceFile),
         isServerModule,
         exports,

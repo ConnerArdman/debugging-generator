@@ -62,6 +62,7 @@ import {
 } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { DebuggenError, isErr, isOk } from '@debuggen/shared';
 import type { LogFields, LogLevel, Logger } from '@debuggen/shared';
@@ -76,6 +77,8 @@ import {
 } from './cache.js';
 import type { IndexCache, IndexCacheKeyInput } from './cache.js';
 import { CODE_INDEX_SCHEMA_VERSION } from './graph/types.js';
+import { indexProject } from './indexer.js';
+import { openProject } from './project.js';
 import type { CodeEdge, CodeIndex, CodeNode, FileFingerprint } from './graph/types.js';
 
 // ---------------------------------------------------------------------------
@@ -175,12 +178,23 @@ function makeIndex(options: MakeIndexOptions = {}): CodeIndex {
   };
 }
 
+/**
+ * The extractor identities every fixture key is derived under, in run order.
+ *
+ * Deliberately neutral names rather than the real extractor ids: what the key
+ * must notice is the *set and its order*, and a case that named the shipped
+ * extractors would start failing for the unrelated reason that the package
+ * gained or renamed one.
+ */
+const EXTRACTORS: readonly string[] = Object.freeze(['alpha', 'beta', 'gamma']);
+
 /** The key input every case derives a key from unless it varies one field. */
 function makeKeyInput(overrides: Partial<IndexCacheKeyInput> = {}): IndexCacheKeyInput {
   return {
     projectRoot: overrides.projectRoot ?? PROJECT_ROOT,
     tsConfigFilePath: overrides.tsConfigFilePath,
     indexerVersion: overrides.indexerVersion ?? INDEXER_VERSION,
+    extractors: overrides.extractors ?? EXTRACTORS,
     schemaVersion: overrides.schemaVersion,
     files: overrides.files ?? FINGERPRINTS,
   };
@@ -450,6 +464,61 @@ describe('computeIndexCacheKey', () => {
     expect(computeIndexCacheKey(makeKeyInput({ indexerVersion: 'indexer/next' }))).not.toBe(
       computeIndexCacheKey(makeKeyInput()),
     );
+  });
+
+  it('changes when an extractor is dropped from the set', () => {
+    // The assertion that stops a *narrowed* index being served to a later full
+    // request: a run with fewer extractors covers less of the project, so it
+    // must key to its own entry rather than to the full run's.
+    const narrowed = EXTRACTORS.slice(0, EXTRACTORS.length - 1);
+    expect(narrowed).toHaveLength(EXTRACTORS.length - 1);
+
+    expect(computeIndexCacheKey(makeKeyInput({ extractors: narrowed }))).not.toBe(
+      computeIndexCacheKey(makeKeyInput()),
+    );
+  });
+
+  it('changes when an extractor is added to the set', () => {
+    const extended: readonly string[] = [...EXTRACTORS, 'delta'];
+
+    expect(computeIndexCacheKey(makeKeyInput({ extractors: extended }))).not.toBe(
+      computeIndexCacheKey(makeKeyInput()),
+    );
+  });
+
+  it('changes when the extractors run in a different order', () => {
+    // Order is not cosmetic here: it decides which claimant of a duplicate id
+    // graph construction keeps, so the same extractors in another order are a
+    // different index. The extractor list is therefore the one part of the key
+    // that is deliberately *not* sorted.
+    const reordered = [...EXTRACTORS].reverse();
+    expect(reordered).not.toEqual([...EXTRACTORS]);
+
+    expect(computeIndexCacheKey(makeKeyInput({ extractors: reordered }))).not.toBe(
+      computeIndexCacheKey(makeKeyInput()),
+    );
+  });
+
+  it('does not collide when the boundary between two extractor ids moves', () => {
+    // The same trap as the path/configuration case above, one field earlier:
+    // ['ab', 'c'] and ['a', 'bc'] join to the same text, so a key derived by
+    // concatenating the ids would serve a two-extractor index to a differently
+    // partitioned pair. The count part additionally keeps a one-id list from
+    // aligning with a two-id one.
+    const split = computeIndexCacheKey(makeKeyInput({ extractors: ['ab', 'c'] }));
+    const shifted = computeIndexCacheKey(makeKeyInput({ extractors: ['a', 'bc'] }));
+    const joined = computeIndexCacheKey(makeKeyInput({ extractors: ['abc'] }));
+
+    expect(shifted).not.toBe(split);
+    expect(joined).not.toBe(split);
+    expect(joined).not.toBe(shifted);
+  });
+
+  it('keeps the extractor list the caller passed untouched and in order', () => {
+    const extractors = [...EXTRACTORS];
+    computeIndexCacheKey(makeKeyInput({ extractors }));
+
+    expect(extractors).toEqual([...EXTRACTORS]);
   });
 
   it('changes with the envelope schema version', () => {
@@ -1129,6 +1198,131 @@ describe('key validation', () => {
 
     expect(existsSync(cacheDir)).toBe(false);
   });
+});
+
+// ---------------------------------------------------------------------------
+// What a hit is worth: the pipeline's cache-first path.
+//
+// Every case above asserts what this module does with a key and an entry. This
+// one asserts the thing those cases cannot see and the reason the module
+// exists: that a hit is *cheap*. `./indexer.ts` promises a hit "having
+// constructed no program, parsed nothing and run no extractor", and the only
+// way to hold it to that from outside is to watch for the work itself —
+// `./project.ts` logs `'project opened'` after, and only after, the ts-morph
+// program has been built and its file set retained, so the absence of that
+// record on the second run is the observable proof that the second run built no
+// program. A regression that moved the lookup back behind the parse would keep
+// every assertion in this file green except this one.
+//
+// Run against the committed corpus at `test/fixtures/sample-next-app`, which is
+// READ ONLY: the cache lives in this file's temporary state root, the indexer
+// writes nothing else, and nothing here touches the fixture.
+// ---------------------------------------------------------------------------
+
+describe('a cache hit through indexProject', () => {
+  /** The corpus, resolved through `realpath` so it matches the indexer's own normalisation. */
+  const FIXTURE_ROOT = realpathSync(
+    fileURLToPath(new URL('../test/fixtures/sample-next-app', import.meta.url)),
+  );
+
+  /** Whether a run logged the message `./project.ts` emits once a program exists. */
+  function builtAProgram(lines: readonly RecordedLine[]): boolean {
+    return lines.some((line) => line.message === 'project opened');
+  }
+
+  /**
+   * The per-case budget both runs here are given.
+   *
+   * The `code-analysis` Vitest project uses the default 5 s, and a cold run
+   * parses the whole corpus — so the budget is stated rather than inherited,
+   * and stated once for both cases.
+   */
+  const CORPUS_RUN_TIMEOUT_MS = 30_000;
+
+  it(
+    'serves the second run without opening the project, and the hit is usable',
+    async () => {
+      const first = createRecordingLogger();
+      const cold = await indexProject({
+        projectRoot: FIXTURE_ROOT,
+        cache,
+        logger: first.logger,
+      });
+
+      expect(isOk(cold)).toBe(true);
+      if (!isOk(cold)) {
+        throw new Error('The first indexing run must succeed.');
+      }
+      expect(cold.value.fromCache).toBe(false);
+      // The control half of the assertion below: the message is one this corpus
+      // really does produce, so its absence on the warm run means something.
+      expect(builtAProgram(first.lines)).toBe(true);
+
+      const second = createRecordingLogger();
+      const warm = await indexProject({
+        projectRoot: FIXTURE_ROOT,
+        cache,
+        logger: second.logger,
+      });
+
+      expect(isOk(warm)).toBe(true);
+      if (!isOk(warm)) {
+        throw new Error('The second indexing run must succeed.');
+      }
+      expect(warm.value.fromCache).toBe(true);
+      expect(builtAProgram(second.lines)).toBe(false);
+
+      // A hit that is not usable is not a hit. The graph, the route map and the
+      // "no extractor ran" marker are what a caller acts on.
+      expect(warm.value.graph.size.nodes).toBeGreaterThan(0);
+      expect(warm.value.routeMap.entries.length).toBeGreaterThan(0);
+      expect(Object.keys(warm.value.stats.extractorDurations)).toHaveLength(0);
+
+      // And it describes the same project as the run that built it.
+      expect(warm.value.index.projectRoot).toBe(cold.value.index.projectRoot);
+      expect(warm.value.index.files.length).toBe(cold.value.index.files.length);
+      expect(warm.value.graph.size.nodes).toBe(cold.value.graph.size.nodes);
+    },
+    CORPUS_RUN_TIMEOUT_MS,
+  );
+
+  it(
+    'finds the entry a run that supplied its own project handle wrote',
+    async () => {
+      // The two paths into the cache reach the key from different places — one
+      // from a discovery before anything is parsed, the other from an
+      // already-opened program — and they are only useful to each other if they
+      // agree. A key derived slightly differently on each path would leave both
+      // runs green in isolation while the cache never hit in practice.
+      const opened = openProject({ projectRoot: FIXTURE_ROOT });
+      expect(isOk(opened)).toBe(true);
+      if (!isOk(opened)) {
+        throw new Error('The corpus must open.');
+      }
+
+      const written = await indexProject({
+        projectRoot: FIXTURE_ROOT,
+        loaded: opened.value,
+        cache,
+      });
+
+      expect(isOk(written)).toBe(true);
+      if (!isOk(written)) {
+        throw new Error('The run over the supplied handle must succeed.');
+      }
+      expect(written.value.fromCache).toBe(false);
+
+      const discovered = await indexProject({ projectRoot: FIXTURE_ROOT, cache });
+
+      expect(isOk(discovered)).toBe(true);
+      if (!isOk(discovered)) {
+        throw new Error('The run that discovers for itself must succeed.');
+      }
+      expect(discovered.value.fromCache).toBe(true);
+      expect(discovered.value.index.files.length).toBe(written.value.index.files.length);
+    },
+    CORPUS_RUN_TIMEOUT_MS,
+  );
 });
 
 // ---------------------------------------------------------------------------

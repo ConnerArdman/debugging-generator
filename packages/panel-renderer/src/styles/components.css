@@ -126,8 +126,11 @@
  *                           from `src/utils/color.ts`, which answers only with
  *                           token references, so an inline value can never
  *                           introduce a literal colour or escape the theme.
- *   --dgx-<name>            the internal motion constants, declared in
- *                           `base.css` and nowhere else. None is declared here.
+ *
+ * There is no third namespace: motion durations and easing are design tokens
+ * like every other value (`--dg-motion-duration`, `--dg-motion-easing`,
+ * `--dg-shimmer-duration`), so nothing in this file consumes a constant that
+ * the token table does not govern.
  *
  * Classes reused from `base.css` and never redefined: `dg-scroll`,
  * `dg-visually-hidden` and `dg-icon`. A rule below may only address a class it
@@ -333,8 +336,8 @@
   white-space: nowrap;
   cursor: pointer;
   transition-property: background-color, border-color, color;
-  transition-duration: var(--dgx-motion-duration);
-  transition-timing-function: var(--dgx-motion-easing);
+  transition-duration: var(--dg-motion-duration);
+  transition-timing-function: var(--dg-motion-easing);
 }
 
 /* Sizes carry density and the type role only, so they never fight a variant's
@@ -518,8 +521,8 @@
   border: thin solid var(--dg-border-subtle);
   border-radius: var(--dg-radius-sm);
   transition-property: border-color;
-  transition-duration: var(--dgx-motion-duration);
-  transition-timing-function: var(--dgx-motion-easing);
+  transition-duration: var(--dg-motion-duration);
+  transition-timing-function: var(--dg-motion-easing);
 }
 
 .dg-field__control:hover {
@@ -965,8 +968,8 @@
   border-block-end: thin solid var(--dg-border-subtle);
   border-inline-start: medium solid transparent;
   transition-property: background-color, border-color;
-  transition-duration: var(--dgx-motion-duration);
-  transition-timing-function: var(--dgx-motion-easing);
+  transition-duration: var(--dg-motion-duration);
+  transition-timing-function: var(--dg-motion-easing);
 }
 
 .dg-data-table__row:hover {
@@ -1245,17 +1248,16 @@
 
 /* --- after every role rule: weight and figures ---------------------------- */
 
-/* Gap: the token table encodes weight only inside the complete type-role
- * shorthands and offers no weight family of its own. 500 is the weight the
- * `--dg-text-lg` role carries in that source, used here to raise weight
- * without changing the size role. Only classes whose own `font` shorthand is
- * declared ABOVE may join this group — the shorthand resets weight, so a
- * component that sets a role later in the file declares its raised weight
- * inside its own rule, after the shorthand. */
+/* The type roles are complete `font` shorthands and the shorthand RESETS
+ * weight, so a rule that wants a role's size and line-height with a heavier
+ * face restates the weight — through `--dg-font-weight-medium`, the token that
+ * holds it, never as a numeral. Only classes whose own `font` shorthand is
+ * declared ABOVE may join this group: a component that sets a role later in the
+ * file declares its raised weight inside its own rule, after the shorthand. */
 .dg-text--medium,
 .dg-heading--md,
 .dg-heading--sm {
-  font-weight: 500;
+  font-weight: var(--dg-font-weight-medium);
 }
 
 .dg-text--numeric,
@@ -1472,7 +1474,7 @@
   background-size: 200% 100%;
   border-radius: var(--dg-radius-sm);
   animation-name: dg-shimmer;
-  animation-duration: var(--dgx-shimmer-duration);
+  animation-duration: var(--dg-shimmer-duration);
   animation-timing-function: linear;
   animation-iteration-count: infinite;
 }
@@ -1544,7 +1546,7 @@
   border-block-start-color: var(--dg-accent);
   border-radius: 100%;
   animation-name: dg-spin;
-  animation-duration: calc(var(--dgx-motion-duration) * 5);
+  animation-duration: calc(var(--dg-motion-duration) * 5);
   animation-timing-function: linear;
   animation-iteration-count: infinite;
 }
@@ -1994,7 +1996,7 @@
 .dg-summary-header__section-label {
   color: var(--dg-text-muted);
   font: var(--dg-text-xs);
-  font-weight: 500;
+  font-weight: var(--dg-font-weight-medium);
 }
 
 .dg-summary-header__observed,
@@ -2044,8 +2046,8 @@
   font: var(--dg-mono-sm);
   cursor: pointer;
   transition-property: background-color, border-color;
-  transition-duration: var(--dgx-motion-duration);
-  transition-timing-function: var(--dgx-motion-easing);
+  transition-duration: var(--dg-motion-duration);
+  transition-timing-function: var(--dg-motion-easing);
 }
 
 .dg-summary-header__evidence-chip:hover {
@@ -2371,8 +2373,8 @@
   border-block-end: thin solid var(--dg-border-subtle);
   border-inline-start: medium solid transparent;
   transition-property: background-color, border-color;
-  transition-duration: var(--dgx-motion-duration);
-  transition-timing-function: var(--dgx-motion-easing);
+  transition-duration: var(--dg-motion-duration);
+  transition-timing-function: var(--dg-motion-easing);
 }
 
 .dg-waterfall__row:hover {
@@ -2557,12 +2559,13 @@
   font: var(--dg-text-xs);
 }
 
-/* The prominent numeric role. The `font` shorthand resets weight and figures,
- * so both follow it inside this rule. */
+/* The prominent numeric role. `--dg-text-lg` is the one role whose own
+ * shorthand already carries the medium weight, so the weight needs no restating
+ * here and the rule stays tied to the role; the shorthand does reset figures,
+ * which is why tabular numerals follow it. */
 .dg-metric-card__value {
   color: var(--dgc-severity-color, var(--dg-text-primary));
   font: var(--dg-text-lg);
-  font-weight: 500;
   font-variant-numeric: tabular-nums;
 }
 
@@ -3157,8 +3160,8 @@
   font: var(--dg-mono-sm);
   cursor: pointer;
   transition-property: background-color, border-color, color;
-  transition-duration: var(--dgx-motion-duration);
-  transition-timing-function: var(--dgx-motion-easing);
+  transition-duration: var(--dg-motion-duration);
+  transition-timing-function: var(--dg-motion-easing);
 }
 
 /* Underline on hover rather than a colour change, so the affordance does not

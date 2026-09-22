@@ -35,22 +35,20 @@
  *    is what lets a hundred adversarial strings run in milliseconds, and it
  *    keeps the suite honest about what the gate actually proves.
  *
- *    The requirement that habit hands on, stated here so it cannot be lost in
- *    the handover: **a path that is inside the project root as text, but whose
- *    interior component is a symbolic link resolving outside the root, must be
- *    rejected.** No string can reveal that, so the gate below accepts such a
- *    path by construction — which makes the rejection a composition rule on
- *    every caller that opens a file: resolve the path with `fs.realpath`
- *    first, then ask this gate about the *resolved* path. The rule stays the
- *    caller's obligation, because the filesystem-level refusals in
- *    `src/node/safe-fs.ts` reach a path's **final** component (`O_NOFOLLOW`)
- *    and a directory chain it is given to verify (the parent policy) — an
- *    interior link is read through, which that suite records as a case of its
- *    own. Rule and refusals alike are proven on a real filesystem in
- *    `src/node/safe-fs.test.ts`, in the
+ *    The requirement that habit forces into the open: **a path that is inside
+ *    the project root as text, but whose interior component is a symbolic link
+ *    resolving outside the root, must be rejected.** No string can reveal that,
+ *    so the four lexical gate functions accept such a path by construction —
+ *    which is why `resolveRealPathWithinProject` exists and why it takes its
+ *    canonicaliser as an argument. The composition (lexical gate, canonicalise,
+ *    check containment again) is the module's, and it is tested here against a
+ *    table of links rather than a temporary directory; the *filesystem* half of
+ *    the same claim — that `O_NOFOLLOW` reaches a path's final component only
+ *    and an interior link is read straight through — is proven on a real
+ *    filesystem in `src/node/safe-fs.test.ts`, in the
  *    `describe('a project-internal symbolic link whose target is outside the
- *    root')` block — the resolver that owns the guarantee is the one that
- *    carries its test.
+ *    root')` block. Neither suite is sufficient alone: one proves the rule, the
+ *    other proves the rule is needed.
  * 2. **Tables with labels, one case per test.** `it.each` over a labelled table
  *    names the offending input in the failure line, so a regression reads as
  *    "rejects a NUL byte" rather than "rejects malformed input" with an index.
@@ -84,9 +82,12 @@ import {
   joinPosix,
   normalizePosix,
   relativePosix,
+  resolveRealPathWithinProject,
   resolveWithinProject,
   toPosix,
   toProjectRelative,
+  type ProjectPathResolution,
+  type RealPathResolver,
 } from './paths.js';
 import { isErr, isOk, type Result } from './result.js';
 
@@ -1618,5 +1619,268 @@ describe('the containment gate', () => {
     for (const { path } of [...SAFE_PATHS, ...UNSAFE_PATHS]) {
       expect(isOk(resolveWithinProject(PROJECT_ROOT, path))).toBe(isSafeRelativePath(path));
     }
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * resolveRealPathWithinProject
+ * ---------------------------------------------------------------------------
+ *
+ * The one function here that can see a symbolic link, because it is the one
+ * that is handed a resolver. The cases below are the escape the lexical gate
+ * accepts by construction, plus the three ways the composition could go wrong
+ * in the other direction: refusing a project whose *root* is reached through a
+ * link, calling the filesystem for a path the lexical gate should have refused
+ * outright, and resolving the final component (which would follow a link
+ * planted at the target instead of leaving it for the caller's `O_NOFOLLOW`).
+ *
+ * The resolver is a table rather than a filesystem, exactly as habit 1 above
+ * requires: each entry maps one absolute path to what it really points at, and
+ * resolution walks the components so an entry for a *directory* applies to
+ * every path beneath it — which is what an interior link does.
+ */
+
+/** A recorded call to the fake resolver, so a test can assert what was asked. */
+interface ResolverProbe {
+  /** The resolver to pass to the function under test. */
+  readonly resolve: RealPathResolver;
+
+  /** Every path the function asked about, in order. */
+  readonly calls: readonly string[];
+}
+
+/**
+ * A resolver over a link table, recording what it is asked.
+ *
+ * Components are walked outermost first and a matching entry replaces the
+ * prefix accumulated so far, so `{'/a/b': '/x'}` resolves `/a/b/c/d.ts` to
+ * `/x/c/d.ts` — the behaviour of a directory symlink, and the case no string
+ * check can reach. A link target is taken to be canonical already, which keeps
+ * the fake honest about `realpath`'s contract without giving it a loop
+ * detector it would never exercise.
+ */
+function linkResolver(links: Readonly<Record<string, string>>): ResolverProbe {
+  const calls: string[] = [];
+
+  return {
+    calls,
+    resolve: (absolutePath) => {
+      calls.push(absolutePath);
+
+      let resolved = '/';
+      for (const segment of absolutePath.split('/')) {
+        if (segment.length === 0) {
+          continue;
+        }
+        const joined = joinPosix(resolved, segment);
+        resolved = links[joined] ?? joined;
+      }
+      return resolved;
+    },
+  };
+}
+
+/** A resolver that fails the way `realpath` fails, with the platform errno. */
+function failingResolver(code: string): ResolverProbe {
+  const calls: string[] = [];
+
+  return {
+    calls,
+    resolve: (absolutePath) => {
+      calls.push(absolutePath);
+      throw Object.assign(new Error(`${code}: cannot resolve '${absolutePath}'`), { code });
+    },
+  };
+}
+
+/** The resolution of a successful result, or a failed test naming the error. */
+function resolutionOf(result: Result<ProjectPathResolution>): ProjectPathResolution {
+  if (isErr(result)) {
+    throw new Error(`Expected Ok, received Err ${result.error.code}: ${result.error.message}`);
+  }
+  return result.value;
+}
+
+/** The error of a refused resolution, or a failed test naming the value. */
+function refusalOf(result: Result<ProjectPathResolution>): DebuggenError {
+  if (isOk(result)) {
+    throw new Error(`Expected Err, received Ok('${result.value.path}')`);
+  }
+  return result.error;
+}
+
+describe('resolveRealPathWithinProject', () => {
+  it('resolves an ordinary path exactly as the lexical gate does', () => {
+    const probe = linkResolver({});
+
+    const resolution = resolutionOf(
+      resolveRealPathWithinProject(PROJECT_ROOT, SAFE_RELATIVE, probe.resolve),
+    );
+
+    expect(resolution.projectRoot).toBe(PROJECT_ROOT);
+    expect(resolution.path).toBe(`${PROJECT_ROOT}/${SAFE_RELATIVE}`);
+    expect(resolution.directory).toBe(`${PROJECT_ROOT}/src/lib`);
+    expect(resolution.relative).toBe(SAFE_RELATIVE);
+    expect(okValue(resolveWithinProject(PROJECT_ROOT, SAFE_RELATIVE))).toBe(resolution.path);
+  });
+
+  it('refuses a path whose interior directory component links outside the root', () => {
+    // The whole point of the function: 'src/vendor/thing.ts' has no traversal
+    // in it, lands under the root when joined, and would be read and written
+    // at '/etc/thing.ts' by a caller that stopped at the lexical gate.
+    const probe = linkResolver({ [`${PROJECT_ROOT}/src/vendor`]: '/etc' });
+
+    const result = resolveRealPathWithinProject(PROJECT_ROOT, 'src/vendor/thing.ts', probe.resolve);
+    const error = refusalOf(result);
+
+    expect(error.code).toBe(CONTAINMENT_CODE);
+    expect(reasonOf(error)).toBe('symlink-escapes-project-root');
+    // The lexical gate, asked the same question, says yes — which is the
+    // reason this function is not optional for a caller that opens a file.
+    expect(isOk(resolveWithinProject(PROJECT_ROOT, 'src/vendor/thing.ts'))).toBe(true);
+  });
+
+  it('refuses a path whose interior link lands on the prefix sibling of the root', () => {
+    // `/home/dev/project-evil` shares the root's first characters, so this is
+    // the prefix-sibling mistake arriving by link instead of by string.
+    const probe = linkResolver({ [`${PROJECT_ROOT}/src`]: `${PROJECT_ROOT}-evil/src` });
+
+    const error = refusalOf(
+      resolveRealPathWithinProject(PROJECT_ROOT, SAFE_RELATIVE, probe.resolve),
+    );
+
+    expect(error.code).toBe(CONTAINMENT_CODE);
+    expect(reasonOf(error)).toBe('symlink-escapes-project-root');
+  });
+
+  it('accepts a project whose root is itself reached through a link', () => {
+    // Both sides of the comparison are canonical, so a checkout under a linked
+    // parent - a linked home directory, macOS /tmp - is not refused wholesale.
+    const real = '/var/checkouts/project';
+    const probe = linkResolver({ [PROJECT_ROOT]: real });
+
+    const resolution = resolutionOf(
+      resolveRealPathWithinProject(PROJECT_ROOT, SAFE_RELATIVE, probe.resolve),
+    );
+
+    expect(resolution.projectRoot).toBe(real);
+    expect(resolution.path).toBe(`${real}/${SAFE_RELATIVE}`);
+    expect(resolution.relative).toBe(SAFE_RELATIVE);
+  });
+
+  it('reports a different relative path when a link stays inside the project', () => {
+    // Contained, so not a refusal here - but the file now has two
+    // project-relative names, and a caller that records a path as an identity
+    // has to notice. That is what `relative` is for.
+    const probe = linkResolver({ [`${PROJECT_ROOT}/src/vendor`]: `${PROJECT_ROOT}/lib` });
+
+    const resolution = resolutionOf(
+      resolveRealPathWithinProject(PROJECT_ROOT, 'src/vendor/thing.ts', probe.resolve),
+    );
+
+    expect(resolution.relative).toBe('lib/thing.ts');
+    expect(resolution.path).toBe(`${PROJECT_ROOT}/lib/thing.ts`);
+  });
+
+  it('leaves the final component unresolved, so the caller keeps O_NOFOLLOW', () => {
+    // A link planted at the target must surface as ELOOP from the caller's
+    // no-follow open, not as a silent read of what it points at - so the
+    // returned path still names the target, and the resolver is never asked
+    // about it.
+    const target = `${PROJECT_ROOT}/${SAFE_RELATIVE}`;
+    const probe = linkResolver({ [target]: '/etc/shadow' });
+
+    const resolution = resolutionOf(
+      resolveRealPathWithinProject(PROJECT_ROOT, SAFE_RELATIVE, probe.resolve),
+    );
+
+    expect(resolution.path).toBe(target);
+    expect(probe.calls).not.toContain(target);
+  });
+
+  it('refuses a traversal without consulting the resolver at all', () => {
+    // The lexical gate runs first, so a hostile path never reaches the
+    // filesystem: no existence probe, no permission error, no oracle.
+    const probe = linkResolver({});
+
+    const error = refusalOf(
+      resolveRealPathWithinProject(PROJECT_ROOT, '../../../etc/passwd', probe.resolve),
+    );
+
+    expect(error.code).toBe(CONTAINMENT_CODE);
+    expect(reasonOf(error)).toBe('unsafe-relative-path');
+    expect(probe.calls).toEqual([]);
+  });
+
+  it.each([...UNSAFE_PATHS])('refuses $label without consulting the resolver', ({ path }) => {
+    const probe = linkResolver({});
+
+    const error = refusalOf(resolveRealPathWithinProject(PROJECT_ROOT, path, probe.resolve));
+
+    expect(error.code).toBe(CONTAINMENT_CODE);
+    expect(probe.calls).toEqual([]);
+  });
+
+  it('refuses a relative project root before consulting the resolver', () => {
+    const probe = linkResolver({});
+
+    const error = refusalOf(
+      resolveRealPathWithinProject('relative/root', SAFE_RELATIVE, probe.resolve),
+    );
+
+    expect(error.code).toBe(CONTAINMENT_CODE);
+    expect(reasonOf(error)).toBe('project-root-not-absolute');
+    expect(probe.calls).toEqual([]);
+  });
+
+  it('converts a resolver failure into a refusal that keeps the platform errno', () => {
+    // The caller needs "that file is not there" to read differently from "that
+    // file is not yours", and the errno is how it tells them apart. `details`
+    // still carries nothing but the two strings the caller supplied.
+    const probe = failingResolver('ENOENT');
+
+    const error = refusalOf(
+      resolveRealPathWithinProject(PROJECT_ROOT, SAFE_RELATIVE, probe.resolve),
+    );
+
+    expect(error.code).toBe(CONTAINMENT_CODE);
+    expect(reasonOf(error)).toBe('path-not-resolvable');
+    expect((error.cause as { code?: unknown } | undefined)?.code).toBe('ENOENT');
+    expect(error.details?.path).toBe(SAFE_RELATIVE);
+    expect(error.details?.projectRoot).toBe(PROJECT_ROOT);
+  });
+
+  it('refuses a resolver that answers with something other than an absolute path', () => {
+    const error = refusalOf(
+      resolveRealPathWithinProject(PROJECT_ROOT, SAFE_RELATIVE, () => 'not/absolute'),
+    );
+
+    expect(error.code).toBe(CONTAINMENT_CODE);
+    expect(reasonOf(error)).toBe('resolved-path-not-absolute');
+  });
+
+  it('answers for the project root itself without climbing out of it', () => {
+    // The root has no parent inside the project, so asking `dirname` for one
+    // would canonicalise a directory the caller never named.
+    const probe = linkResolver({});
+
+    const resolution = resolutionOf(resolveRealPathWithinProject(PROJECT_ROOT, '.', probe.resolve));
+
+    expect(resolution.relative).toBe('.');
+    expect(resolution.path).toBe(PROJECT_ROOT);
+    expect(resolution.directory).toBe(PROJECT_ROOT);
+    expect(probe.calls).toEqual([PROJECT_ROOT]);
+  });
+
+  it('normalises a host-flavoured spelling of the target before resolving it', () => {
+    const probe = linkResolver({});
+
+    const resolution = resolutionOf(
+      resolveRealPathWithinProject(PROJECT_ROOT, './src/lib/./thing.ts', probe.resolve),
+    );
+
+    expect(resolution.relative).toBe(SAFE_RELATIVE);
+    expect(resolution.path).toBe(`${PROJECT_ROOT}/${SAFE_RELATIVE}`);
   });
 });

@@ -1,9 +1,11 @@
 /**
  * The attribute-key catalog: the single declaration of *which keys appear in a
  * telemetry event's `attributes` bag for each kind*, of the small value
- * vocabularies those keys draw on, of the two bounds that cap what a
- * summarised value may carry, and of the closed set of computed metric ids a
- * capture can report.
+ * vocabularies those keys draw on, of the bounds that cap what a summarised
+ * value and a serialized component tree may carry, of the one event *name*
+ * that identifies a record by more than its kind
+ * ({@link COMPONENT_TREE_EVENT_NAME}), and of the closed set of computed
+ * metric ids a capture can report.
  *
  * Treat this as a published contract rather than an internal note. Two
  * consumers read it directly — `packages/panel-schema/src/catalog.ts`, which
@@ -203,6 +205,12 @@ export const COMMIT_ATTRIBUTE_KEYS = Object.freeze(['phase', 'renderCount', 'roo
  * `request_key` is assigned at ingest, never by this producer — see
  * {@link SERVICE_ASSIGNED_ATTRIBUTE_KEYS}.
  *
+ * `resourceTimingUrl` is the request's absolute URL as the Performance
+ * Timeline names it — resolved against the document base at the moment the
+ * request was opened — and is the identity `../aggregate/requests.ts` joins a
+ * request to its `perf.entry` resource entry on (AAP 0.6.6). It is masked by
+ * the same URL rule as `url`, so both sides of the join see the same spelling.
+ *
  * Read by `../aggregate/requests.ts` (grouping and duplicate detection) and
  * the `requestTable`, `waterfall` and `timeline` panel nodes.
  */
@@ -215,6 +223,7 @@ export const FETCH_ATTRIBUTE_KEYS = Object.freeze([
   'sameOrigin',
   'traceparentInjected',
   'transferSize',
+  'resourceTimingUrl',
 ] as const);
 
 /**
@@ -239,6 +248,7 @@ export const XHR_ATTRIBUTE_KEYS = Object.freeze([
   'sameOrigin',
   'traceparentInjected',
   'transferSize',
+  'resourceTimingUrl',
 ] as const);
 
 /**
@@ -250,6 +260,9 @@ export const XHR_ATTRIBUTE_KEYS = Object.freeze([
  * apart from one that does not, and `domContentLoaded` and `loadEventEnd` are
  * the two milestones the timeline marks.
  *
+ * `transferSizeExposed` carries the same verdict as on `perf.entry`: whether
+ * the document's own byte counts were exposed by the host or are placeholders.
+ *
  * Read by `../aggregate/timeline.ts` and the `timeline` and `eventLog` nodes.
  */
 export const NAVIGATION_ATTRIBUTE_KEYS = Object.freeze([
@@ -258,6 +271,7 @@ export const NAVIGATION_ATTRIBUTE_KEYS = Object.freeze([
   'domContentLoaded',
   'loadEventEnd',
   'transferSize',
+  'transferSizeExposed',
 ] as const);
 
 /**
@@ -283,7 +297,11 @@ export const PERF_LONGTASK_ATTRIBUTE_KEYS = Object.freeze(['attribution', 'block
  * `renderBlockingStatus` are the resource-timing fields; they are the only
  * place a transferred size is observable at all, which is why
  * `transferred_bytes` is computed from them where present and reported as
- * unavailable otherwise (AAP 0.6.6).
+ * unavailable otherwise (AAP 0.6.6). `transferSizeExposed` is the producer's
+ * verdict on whether the host actually exposed those byte counts — a
+ * cross-origin resource without `Timing-Allow-Origin` reports zeros that are
+ * not measurements — so a consumer can tell "0 bytes" from "not observable"
+ * without re-deriving the CORS rule.
  *
  * Read by `../aggregate/summary.ts` and `../aggregate/requests.ts` (which
  * enriches a request with the timing of its resource) and by the `waterfall`
@@ -297,6 +315,7 @@ export const PERF_ENTRY_ATTRIBUTE_KEYS = Object.freeze([
   'encodedBodySize',
   'decodedBodySize',
   'renderBlockingStatus',
+  'transferSizeExposed',
 ] as const);
 
 /**
@@ -319,14 +338,52 @@ export const ERROR_ATTRIBUTE_KEYS = Object.freeze([
 ] as const);
 
 /**
- * `state` — one React hook state transition.
+ * `state` — one React hook state transition, or one changed consumed-context
+ * value.
  *
- * Written by `../browser/fiber-diff.ts`, which walks a fiber's `memoizedState`
- * hook chain against its alternate. `hookIndex` is the hook's position in that
- * chain and `hookLabel` a human-readable label where one can be derived;
- * `previousValue` and `nextValue` are {@link AttributeValueSummary} values —
- * never the state itself — and `triggerEventId` points at the event that
- * caused the transition.
+ * Written by `../browser/state.ts` from the bounded, scrubbed summaries
+ * `../browser/fiber-diff.ts` produces by walking a fiber's `memoizedState`
+ * hook chain and its context dependencies against the alternate. `hookIndex`
+ * is the hook's position in that chain and `hookLabel` a human-readable label
+ * where one can be derived; `previousValue` and `nextValue` are
+ * {@link AttributeValueSummary} values — never the state itself.
+ *
+ * ## Two trigger keys, because there are two identifier spaces
+ *
+ * `triggerEventId` and `triggerSpanId` both name the operation a transition is
+ * attributed to, and they are **not** interchangeable. An event id (`evt_…`,
+ * minted by `../browser/transport.ts` when an event is queued) and a span id
+ * (16 hex characters) are different identifier spaces, and a producer holds
+ * whichever one it has: the page agent knows the interaction's — or a settled
+ * request's — *span* id at the moment a commit runs, so it writes
+ * `triggerSpanId`, while a producer that knows the trigger's *event* id writes
+ * `triggerEventId`. Both are declared here so that neither producer has to
+ * invent a spelling and neither value is silently unread:
+ * `../aggregate/timeline.ts`'s trigger resolution takes `triggerEventId`
+ * first, then resolves `triggerSpanId` through its span index, and only then
+ * falls back to walking the parent chain.
+ *
+ * ## What the rest of the description says
+ *
+ * `transitionSource` says which dimension changed — a member of
+ * {@link TRANSITION_SOURCES} — which is what separates "this component's own
+ * state changed" from "a context it consumes changed": two observations
+ * supporting different conclusions, since the second one indicts a provider
+ * rather than the component. `renderSpanId` repeats the render the transition
+ * was observed inside (the event's own `parentSpanId`) as a filterable,
+ * groupable attribute, and `fiberId` identifies the *instance*, so two mounted
+ * copies of one component are two rows rather than one.
+ *
+ * ## Truncation is disclosed on the evidence, not only in the producer
+ *
+ * `../browser/state.ts` bounds how many transitions one commit and one capture
+ * may report. `truncated` marks the last event of a run a bound cut — and,
+ * when the capture-wide bound left no room for a run at all, one bounded
+ * sentinel event whose only job is to disclose the loss — while
+ * `droppedTransitions` carries how many reported transitions produced no event
+ * of their own. Note the level: these describe the *list of transitions*,
+ * whereas the `truncated` field inside a {@link AttributeValueSummary}
+ * describes one preview. Neither implies the other.
  *
  * Read by the `stateTransitions` panel source and the `StateTransitionViewer`
  * node, which renders exactly component, hook index or label, old value
@@ -339,6 +396,12 @@ export const STATE_ATTRIBUTE_KEYS = Object.freeze([
   'previousValue',
   'nextValue',
   'triggerEventId',
+  'triggerSpanId',
+  'transitionSource',
+  'renderSpanId',
+  'fiberId',
+  'truncated',
+  'droppedTransitions',
 ] as const);
 
 /**
@@ -494,7 +557,111 @@ export const SERVER_ERROR_ATTRIBUTE_KEYS = Object.freeze([
 ] as const);
 
 /**
- * `log` — an explicit log record correlated into a trace, from either tier.
+ * The event `name` a component-tree snapshot travels under.
+ *
+ * The snapshot is one event, emitted by `../browser/agent.ts` at capture stop
+ * while the retained React root is still reachable, and it is the only source
+ * of the `componentTree` data result that describes the page as it actually
+ * was — AAP 0.4.2 specifies that structure "at the last commit of the
+ * capture", and a tree reconstructed afterwards from owner chains covers only
+ * the components that happened to render.
+ *
+ * It is a **named event rather than a new kind**: AAP 0.2.3 fixes the kind
+ * vocabulary (`./kinds.ts`), `log` is the cross-tier kind a correlated record
+ * travels as, and the name is what identifies this record among log records.
+ * `../aggregate/renders.ts` selects the latest event with this name and reads
+ * {@link COMPONENT_TREE_ATTRIBUTE_KEYS} off it; a producer that instead
+ * attaches the serialized tree to its `commit` event writes the same
+ * `componentTree` key, so there is one spelling either way.
+ *
+ * Dotted-lowercase like the framework span names the timeline shows beside it,
+ * and deliberately generic: it names a React concept, not an application's.
+ */
+export const COMPONENT_TREE_EVENT_NAME = 'react.component-tree';
+
+/**
+ * The attribute keys a component-tree snapshot carries.
+ *
+ * - `componentTree` is the forest **as JSON text**, bounded by
+ *   {@link MAX_COMPONENT_TREE_JSON_CHARS}. Text, not a nested object, and that
+ *   is load-bearing: `../browser/transport.ts` rebuilds every attribute bag
+ *   into clone-safe values and replaces a container nested deeper than two
+ *   levels with a type tag, so a tree posted as structure would arrive with
+ *   its grandchildren's children erased. A string is immune to that walk.
+ * - `componentTreeNodeCount` is how many nodes that text carries, so a
+ *   consumer can report the size of the tree without parsing it.
+ * - `componentTreeTruncated` says the producer had to fall back to a bound
+ *   below the one it was asked for, which is what lets a panel present a
+ *   partial tree *as* partial instead of as the page's whole structure.
+ *
+ * Because the text is a structure rather than a preview, it has a redaction
+ * route of its own: `../redaction/redactor.ts` parses it, keeps the structural
+ * fields, scrubs and bounds every component name and React key inside it, and
+ * re-serialises valid JSON. The generic string rules would cut the document to
+ * a 120-code-point preview and hand the aggregate something unparseable, which
+ * is precisely why this key is declared rather than left to fall through.
+ *
+ * Declared under the `log` kind below (the kind the snapshot travels as) and
+ * exported separately so the producer, the redactor and the aggregate bind the
+ * same three strings.
+ */
+export const COMPONENT_TREE_ATTRIBUTE_KEYS = Object.freeze([
+  'componentTree',
+  'componentTreeNodeCount',
+  'componentTreeTruncated',
+] as const);
+
+/**
+ * The field a node of the serialized tree carries its own truncation marker
+ * under: `truncated`.
+ *
+ * Two bounds cut a component tree, and they cut it in different places.
+ * `componentTreeTruncated` (above) is a statement about the **document**: the
+ * producer had to serialise a smaller tree than it was asked for. This field
+ * is a statement about **one node**: the walk stopped here, so this node's
+ * descendants are not all in the document — which is the only way a reader can
+ * tell a component that rendered nothing from a component whose subtree was
+ * left out.
+ *
+ * It is declared here, beside the attribute keys, because three modules have
+ * to agree on the spelling for the disclosure to survive the trip:
+ * `../browser/react.ts` sets it while walking the fiber tree,
+ * `../redaction/redactor.ts` keeps it in the structural allowlist when it
+ * rebuilds the document at ingest, and `../aggregate/renders.ts` folds it into
+ * the snapshot's `truncated` and `degraded` flags. A spelling that drifted at
+ * any of the three would not fail loudly — it would present a partial tree as
+ * the page's whole structure, which is exactly the claim this product must
+ * never make (AAP 0.5.5).
+ *
+ * The other field names of a node — the component name, the React key, the
+ * children, the render count, the fiber id — are each read by the module that
+ * needs them; this one is singled out because it is the only field whose
+ * *absence* changes what the evidence means.
+ */
+export const COMPONENT_TREE_TRUNCATED_FIELD = 'truncated';
+
+/**
+ * The longest serialized component tree that may travel on an event: 128 KiB
+ * of JSON text.
+ *
+ * Two ceilings sit above it and both would cost the whole snapshot rather than
+ * trimming it — `../browser/transport.ts` refuses a frame larger than 512 KiB,
+ * and `../aggregate/renders.ts` refuses serialized text longer than 512 KiB —
+ * so the producer and the redactor bound their output at a quarter of that,
+ * which leaves room for the rest of a batch and is still several times any
+ * tree worth reading (a snapshot is capped at a couple of thousand nodes, and
+ * those serialise to well under this).
+ *
+ * Counted in code points, like {@link MAX_PREVIEW_LENGTH}, so the bound cannot
+ * split a surrogate pair. It is a transport and cost bound rather than a
+ * privacy guarantee — the privacy guarantee for the values *inside* the tree
+ * is {@link MAX_PREVIEW_LENGTH}, applied per component name and per key.
+ */
+export const MAX_COMPONENT_TREE_JSON_CHARS = 128 * 1024;
+
+/**
+ * `log` — an explicit log record correlated into a trace, from either tier,
+ * and the component-tree snapshot.
  *
  * Written by whichever side produced the record: the page agent for a captured
  * console record, `../node/exporter.ts` for a server one. `logger.name`
@@ -503,13 +670,22 @@ export const SERVER_ERROR_ATTRIBUTE_KEYS = Object.freeze([
  * a log line is free-form text and therefore the most likely attribute to
  * quote a credential.
  *
+ * The three {@link COMPONENT_TREE_ATTRIBUTE_KEYS} are declared here as well,
+ * because the snapshot of {@link COMPONENT_TREE_EVENT_NAME} is a `log` event:
+ * they appear on that one event and on no other log record, which is what the
+ * event name distinguishes. Spread rather than retyped, so the keys have one
+ * declaration.
+ *
  * Read by the `eventLog` node, which renders log records inline with the spans
- * they were emitted under.
+ * they were emitted under, and — for the snapshot keys — by
+ * `../aggregate/renders.ts`, which builds the `componentTree` data result from
+ * them.
  */
 export const LOG_ATTRIBUTE_KEYS = Object.freeze([
   'log.level',
   'log.message',
   'logger.name',
+  ...COMPONENT_TREE_ATTRIBUTE_KEYS,
 ] as const);
 
 /*
@@ -794,6 +970,33 @@ export const RENDER_TRIGGERS = Object.freeze([
 
 /** One member of the closed render-trigger vocabulary. */
 export type RenderTrigger = (typeof RENDER_TRIGGERS)[number];
+
+/**
+ * The two values `attributes.transitionSource` may take on a `state` event:
+ * which dimension of a fiber's inputs changed.
+ *
+ * - `state` — the fiber's own hook state published a new value.
+ * - `context` — a context value the fiber consumes changed, which is a
+ *   provider's doing rather than the component's.
+ *
+ * {@link RENDER_TRIGGERS} is deliberately *not* reused. That vocabulary
+ * classifies **why a fiber rendered** and has members (`props`, `unchanged`,
+ * `unknown`) that describe no transition at all; this one says **which value
+ * changed**, and a transition exists only because something did. Two
+ * vocabularies, two questions — a consumer that conflated them would report a
+ * render cause as a state change.
+ *
+ * Declared here rather than in `../browser/state.ts`, which writes the
+ * attribute, because `../aggregate/timeline.ts` reads it back and an aggregate
+ * cannot import a page-agent module: the schema layer is where a vocabulary
+ * both sides need has to live.
+ *
+ * Frozen: a read-only vocabulary.
+ */
+export const TRANSITION_SOURCES = Object.freeze(['state', 'context'] as const);
+
+/** One member of the closed transition-source vocabulary. */
+export type TransitionSource = (typeof TRANSITION_SOURCES)[number];
 
 /**
  * The values `attributes.lineage` may take.

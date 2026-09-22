@@ -65,6 +65,14 @@
  * what lets `exporter.ts` and `control.ts` treat {@link PreloadConfig.ingestUrl}
  * and {@link PreloadConfig.controlUrl} as safe to print.
  *
+ * The same rule decides *where* the credential may go at all. An environment
+ * variable is set by whatever started the process, so the endpoint is checked
+ * rather than believed: the local service is a loopback service (AAP §0.5.6),
+ * and {@link isTrustedServiceEndpoint} refuses anything else — public, LAN or
+ * wildcard host, `http:` or `https:` alike. That check happens here, before a
+ * control URL is derived, so neither outbound path can reach an origin this
+ * module did not accept.
+ *
  * ## Notes for the siblings that import this
  *
  * - **No `Origin` header.** The service rejects any HTTP request or WebSocket
@@ -159,6 +167,39 @@ export const TRACER_NAME = '@debuggen/telemetry';
  * on.
  */
 export const TRACER_VERSION = '0.1.0';
+
+/**
+ * The version of **the protocol**, which is what every client puts in the
+ * `client.hello` frame's `version` field (AAP §0.4.2).
+ *
+ * ⚠️ This is **not** {@link TRACER_VERSION}, and the two must never be
+ * substituted for one another. `TRACER_VERSION` is this npm package's version
+ * and belongs to OpenTelemetry scope and resource metadata; this constant is
+ * what the four cooperating processes have agreed to say to one another, and
+ * the service compares its **major** component (`isCompatibleProtocolVersion`
+ * in `packages/protocol/src/version.ts`) before it will send configuration.
+ * Announcing a package version here makes the service read major `0` against
+ * its own major `1` and refuse the handshake, so the preload connects, is
+ * closed, and never receives `server-agent.config` — no server or database
+ * spans, with nothing in the developer's terminal explaining why.
+ *
+ * ## Why it is mirrored rather than imported
+ *
+ * `PROTOCOL_VERSION` in `packages/protocol/src/version.ts` is the same string,
+ * and that module is its owner. This package cannot import it: `@debuggen/protocol`
+ * **depends on** `@debuggen/telemetry` (its `telemetry.event` payloads embed
+ * `TelemetryEventIngress`, and its `epochMsSchema` imports our epoch bounds),
+ * so the reverse import would close a cycle in the workspace graph — which is
+ * why `eslint.config.js` restricts this package to `@debuggen/shared` among
+ * `@debuggen/*`. AAP §0.2.2 puts `protocol` above `telemetry` for exactly this
+ * reason, and `control.ts` mirrors the frame *shapes* for the same one.
+ *
+ * So the value is mirrored here, once, where `control.ts` can reach it — and
+ * the mirror is checked rather than trusted: `./config.test.ts` reads
+ * `packages/protocol/src/version.ts` and fails if the two strings drift apart.
+ * A protocol bump is therefore two edits and one failing test until both land.
+ */
+export const WIRE_PROTOCOL_VERSION = '1.0.0';
 
 /**
  * `service.name` used when {@link PreloadConfig.serviceName} cannot be derived
@@ -293,9 +334,9 @@ export const RECONNECT_MAX_MS = 10_000;
  *
  * Produced only by {@link loadPreloadConfig}, and only for the `active` mode, so
  * a sibling that holds one of these needs no further checks: the endpoint parses
- * as an absolute `http(s)` URL carrying no credentials, the control URL is
- * derived from its origin, the credential is non-empty, and the project root is
- * absolute.
+ * as an absolute `http(s)` URL carrying no credentials and addressing a loopback
+ * host, the control URL is derived from its origin, the credential is non-empty,
+ * and the project root is absolute.
  *
  * All members are `readonly`: this is a value describing one launch, and a
  * component that wants a variation builds its own object.
@@ -436,6 +477,202 @@ function parseHttpUrl(value: string): URL | undefined {
 }
 
 /**
+ * The one host name this module accepts as loopback.
+ *
+ * `localhost` is the product's documented loopback name — the Chrome
+ * extension's `host_permissions` are `http://localhost/*` and
+ * `http://127.0.0.1/*` (AAP §0.7.1 Group 4) — so refusing it would refuse an
+ * address the rest of the product offers. Its resolution does ultimately come
+ * from the host's resolver, which this process cannot verify; that is a
+ * property of the developer's own machine, and it is the same assumption every
+ * other surface of the product already makes about this one name.
+ *
+ * Subdomains (`app.localhost`) are deliberately **not** accepted: RFC 6761
+ * reserves them, but whether they resolve to loopback is resolver-dependent, so
+ * they are not verifiable loopback and nothing in this product uses them.
+ */
+const LOOPBACK_HOST_NAME = 'localhost';
+
+/**
+ * An IPv4 dotted quad, with each octet captured.
+ *
+ * Only the canonical form needs matching: {@link isTrustedServiceEndpoint}
+ * reads `URL.hostname`, and the WHATWG parser has already rewritten every
+ * shorthand an environment variable can carry — `127.1`, `0177.0.0.1`,
+ * `2130706433` and `0x7f000001` all arrive here as `127.0.0.1`.
+ */
+const IPV4_QUAD = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/u;
+
+/**
+ * An IPv4-mapped IPv6 address in the two spellings that reach this module:
+ * the parser's normalised hextet form (`::ffff:7f00:1`, which is how
+ * `[::ffff:127.0.0.1]` serialises) and the dotted form a caller can pass
+ * directly (`::ffff:127.0.0.1`).
+ *
+ * The capture is everything after the `ffff:` prefix, which
+ * {@link isLoopbackHostname} then decodes to an IPv4 address.
+ */
+const IPV4_MAPPED_IPV6 = /^::ffff:([0-9a-f.:]+)$/u;
+
+/** The first octet of the IPv4 loopback range, 127.0.0.0/8 (RFC 1122 §3.2.1.3). */
+const IPV4_LOOPBACK_FIRST_OCTET = 127;
+
+/** The largest value an IPv4 octet can hold. */
+const MAX_OCTET = 255;
+
+/** The largest value one IPv6 hextet can hold. */
+const MAX_HEXTET = 0xffff;
+
+/**
+ * Whether a dotted-quad string is an address inside 127.0.0.0/8.
+ *
+ * Each octet is range-checked as well as matched, because `999.0.0.1` satisfies
+ * the pattern and is not an address at all.
+ *
+ * @param value A candidate dotted-quad string.
+ * @returns `true` when the value is a well-formed IPv4 address in the loopback
+ * range.
+ */
+function isIpv4LoopbackAddress(value: string): boolean {
+  const match = IPV4_QUAD.exec(value);
+  if (match === null) {
+    return false;
+  }
+  const octets = match.slice(1).map((part) => Number.parseInt(part, 10));
+  if (octets.some((octet) => !Number.isInteger(octet) || octet < 0 || octet > MAX_OCTET)) {
+    return false;
+  }
+  return octets[0] === IPV4_LOOPBACK_FIRST_OCTET;
+}
+
+/**
+ * Whether the IPv4 address embedded in an IPv4-mapped IPv6 address is loopback.
+ *
+ * Accepts either spelling of the embedded address: two hextets
+ * (`7f00:1` — `::ffff:127.0.0.1` as the WHATWG parser serialises it) or a
+ * dotted quad (`127.0.0.1`). The hextet form is decoded to octets rather than
+ * pattern-matched on its text, so `7f00:1` and `7f00:0001` are the one address
+ * they both denote.
+ *
+ * @param embedded Everything after the `::ffff:` prefix.
+ * @returns `true` when the embedded IPv4 address is in 127.0.0.0/8.
+ */
+function isMappedIpv4Loopback(embedded: string): boolean {
+  if (embedded.includes('.')) {
+    return isIpv4LoopbackAddress(embedded);
+  }
+
+  const hextets = embedded.split(':');
+  if (hextets.length !== 2) {
+    return false;
+  }
+  const [high, low] = hextets;
+  if (high === undefined || low === undefined) {
+    return false;
+  }
+  if (!/^[0-9a-f]{1,4}$/u.test(high) || !/^[0-9a-f]{1,4}$/u.test(low)) {
+    return false;
+  }
+  const highValue = Number.parseInt(high, 16);
+  const lowValue = Number.parseInt(low, 16);
+  if (highValue > MAX_HEXTET || lowValue > MAX_HEXTET) {
+    return false;
+  }
+  // The high hextet's upper byte is the first octet of the embedded address.
+  return highValue >>> 8 === IPV4_LOOPBACK_FIRST_OCTET;
+}
+
+/**
+ * Whether a host name denotes this machine's loopback interface.
+ *
+ * The three accepted shapes, and nothing else:
+ *
+ * - the host name {@link LOOPBACK_HOST_NAME};
+ * - any IPv4 address in 127.0.0.0/8, the whole loopback range rather than only
+ *   `127.0.0.1`, because a developer may legitimately bind another address in
+ *   it;
+ * - IPv6 `::1`, and an IPv4-mapped address whose embedded IPv4 is loopback.
+ *
+ * `0.0.0.0` and `::` are **refused**: they are wildcards, not loopback — a
+ * service reachable at `0.0.0.0` is reachable from the network, which is the
+ * boundary this predicate exists to hold.
+ *
+ * Exported so `./exporter.ts` can re-check an endpoint it was handed without
+ * restating the policy, and so `./config.test.ts` can assert the boundary
+ * case by case. `scripts/dev-instrumented.mjs` implements the same policy
+ * separately because that script may import nothing but `node:` builtins; a
+ * change here belongs there too.
+ *
+ * @param hostname A host name or IP literal, as `URL.hostname` reports it
+ * (IPv6 literals may be bracketed or bare, and matching is case-insensitive).
+ * @returns `true` when the host is verifiably loopback.
+ */
+export function isLoopbackHostname(hostname: string): boolean {
+  const normalised = hostname.trim().toLowerCase();
+  if (normalised.length === 0) {
+    return false;
+  }
+
+  if (normalised === LOOPBACK_HOST_NAME) {
+    return true;
+  }
+
+  // `URL.hostname` brackets IPv6 literals; a direct caller may not.
+  const bare =
+    normalised.startsWith('[') && normalised.endsWith(']') ? normalised.slice(1, -1) : normalised;
+
+  if (bare === '::1') {
+    return true;
+  }
+
+  const mapped = IPV4_MAPPED_IPV6.exec(bare);
+  if (mapped !== null) {
+    const embedded = mapped[1];
+    return embedded !== undefined && isMappedIpv4Loopback(embedded);
+  }
+
+  return isIpv4LoopbackAddress(bare);
+}
+
+/**
+ * Whether a URL is an endpoint this preload may send its credential to.
+ *
+ * The launcher mints a server-agent credential per dev-server launch and hands
+ * it to this process alongside the endpoint it was minted for (AAP §0.5.6).
+ * The endpoint arrives in an environment variable, which anything with a hand
+ * on the process's environment can set, so it is checked rather than believed:
+ * the local service is a **loopback** service (AAP §0.5.6 — "Binding to
+ * `127.0.0.1` keeps other machines out"), and an endpoint that is not loopback
+ * is not the service. Sending to one would disclose the bearer credential and
+ * the developer's telemetry — URLs, SQL statements, component names — to
+ * another origin, in cleartext when the scheme is `http:` (CWE-200, CWE-319).
+ *
+ * The requirements, all of which must hold:
+ *
+ * - it parses as an absolute `http:`/`https:` URL with a host;
+ * - it embeds no userinfo, so nothing that is printed can carry a credential;
+ * - its host is loopback per {@link isLoopbackHostname}, whatever the scheme —
+ *   which is what refuses non-loopback cleartext HTTP along with everything
+ *   else off this machine.
+ *
+ * @param value A candidate endpoint, as a string or an already-parsed URL.
+ * @returns `true` when the endpoint may be used.
+ */
+export function isTrustedServiceEndpoint(value: string | URL): boolean {
+  const parsed = typeof value === 'string' ? parseHttpUrl(value) : value;
+  if (parsed === undefined) {
+    return false;
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    return false;
+  }
+  if (parsed.username.length > 0 || parsed.password.length > 0) {
+    return false;
+  }
+  return isLoopbackHostname(parsed.hostname);
+}
+
+/**
  * Whether a project root is absolute, on either kind of host.
  *
  * POSIX-absolute (`/home/dev/project`) and UNC (`//server/share`) are accepted
@@ -548,8 +785,12 @@ export function deriveControlUrl(ingestUrl: string | URL): string | undefined {
  *    not are named together in one reason (`… is not set` / `… are not set`).
  * 2. `DEBUGGEN_INGEST_URL` must parse as an absolute `http:`/`https:` URL with a
  *    host, and must not embed credentials.
- * 3. A control URL must be derivable from that endpoint's origin.
- * 4. `DEBUGGEN_PROJECT_ROOT` must be an absolute path.
+ * 3. That endpoint's host must be loopback ({@link isLoopbackHostname}). The
+ *    local service is a loopback service, so this is the trust boundary for
+ *    both outbound paths — and it is checked here, before a control URL is
+ *    derived, because the socket inherits this origin.
+ * 4. A control URL must be derivable from that endpoint's origin.
+ * 5. `DEBUGGEN_PROJECT_ROOT` must be an absolute path.
  *
  * Anything else is `{ mode: 'inert', reason }` and the preload installs nothing.
  * **This function never throws**, for any input, including a `process.env`
@@ -618,6 +859,17 @@ export function loadPreloadConfig(env: NodeJS.ProcessEnv = process.env): Preload
   // refused, `ingestUrl` and `controlUrl` are safe for a sibling to log.
   if (endpoint.username.length > 0 || endpoint.password.length > 0) {
     return inert(`${PRELOAD_ENV_KEYS.ingestUrl} must not embed credentials in the URL`);
+  }
+
+  // The trust boundary, checked before a control URL is derived from this
+  // origin and therefore before either outbound path can exist. The local
+  // service is a loopback service, so an endpoint that is not loopback is not
+  // the service, and following it would hand the server-agent credential and
+  // the developer's telemetry to another origin.
+  if (!isLoopbackHostname(endpoint.hostname)) {
+    return inert(
+      `${PRELOAD_ENV_KEYS.ingestUrl} must address the local service on a loopback host (localhost, 127.0.0.0/8 or [::1])`,
+    );
   }
 
   const controlUrl = deriveControlUrl(endpoint);

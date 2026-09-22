@@ -50,9 +50,10 @@
  *
  * A map either carries its originals in `sourcesContent` or it does not, and
  * both cases are supported: `sourceContentFor` first, then a read of the file
- * from the project through {@link resolveWithinProject} and
- * `readFileNoFollow`. The content is used for exactly two things, and nothing
- * else:
+ * from the project through three layered gates — {@link resolveWithinProject},
+ * then **canonical containment** (`fs.realpathSync` on the root and on the
+ * target, re-checked with {@link isWithin}), then `readFileNoFollow`. The
+ * content is used for exactly two things, and nothing else:
  *
  * 1. **Sanity-validating the mapped position.** A map left over from an earlier
  *    edit maps into a file that has since changed, and a location past the end
@@ -64,6 +65,33 @@
  *
  * When no content can be read at all the map is taken as the authority, the
  * position is emitted unvalidated, and the fact is logged at `debug`.
+ *
+ * ### Why the project read is canonicalised, and not merely contained
+ *
+ * The path that second branch opens is derived from a map's `sources` entry.
+ * That entry is served by the dev server and reached from an `Error().stack`
+ * captured in the inspected page, so it is untrusted input, and what it
+ * produces leaves this module as protocol data: the content feeds
+ * {@link positionWithinContent} and {@link symbolFor}, and a derived
+ * `SourceLocation.symbol` is an identifier read out of that file.
+ *
+ * {@link resolveWithinProject} is a **string-level** gate and says so in its
+ * own documentation; `readFileNoFollow`'s `O_NOFOLLOW` refuses a symbolic link
+ * only at the **final** component. Neither sees an *interior* component that is
+ * a link out of the project, so the composition of the two lets
+ * `<root>/src/lib -> /etc` expose `<root>/src/lib/passwd` — a defect
+ * `packages/shared/src/node/safe-fs.test.ts` proves for that exact
+ * composition, and `paths.ts` states as an obligation on every caller that
+ * opens a path it did not construct itself. This module discharges it:
+ * {@link canonicalProjectRoot} resolves the root once per call, every candidate
+ * is resolved with `fs.realpathSync` and re-checked with {@link isWithin}
+ * *before* {@link ResolveStackOptions.readSourceFile} is consulted at all, the
+ * **canonical** path is what the reader is handed, and the identity is
+ * revalidated after the read so a swap during it is caught rather than
+ * trusted. `O_NOFOLLOW` remains underneath as the backstop it is.
+ *
+ * A refusal is a skip like every other: `undefined`, one `debug` record, and
+ * the map left as the authority.
  *
  * ## Two decisions that would break silently if reversed
  *
@@ -107,6 +135,12 @@
  * package, which AAP 0.2.4 rejects repository-wide for its WASM
  * initialisation.
  *
+ * One Node built-in is imported directly, `node:fs`, and for one call:
+ * `realpathSync` in {@link canonicalPathOf}, which is the canonical-containment
+ * gate described above. Nothing else here touches the filesystem directly —
+ * the read itself goes through `@debuggen/shared/node`'s `readFileNoFollow` —
+ * and `@debuggen/shared/node` exposes no realpath helper to route it through.
+ *
  * ## State
  *
  * None. Every export is a pure function or a frozen constant; the per-call
@@ -128,9 +162,12 @@
  * ```
  */
 
+import { realpathSync } from 'node:fs';
+
 import {
   DEFAULT_RESOLUTION_CONFIDENCE,
   isErr,
+  isWithin,
   noopLogger,
   parseSourceLocation,
   resolveWithinProject,
@@ -229,13 +266,15 @@ export interface ResolveStackOptions {
   /**
    * The absolute path of the indexed project root.
    *
-   * Two things resolve against it: `normalizeSourcePath`, which turns a
+   * Three things resolve against it: `normalizeSourcePath`, which turns a
    * bundler's `sources` entry into a project-relative path and rejects anything
-   * that escapes the root or lives in a dependency, and
+   * that escapes the root or lives in a dependency;
    * {@link resolveWithinProject}, the only route in this file from a
-   * project-relative path back to an absolute one. A root that is not absolute
-   * makes containment meaningless, and every source is then rejected rather
-   * than resolved against a guess.
+   * project-relative path back to an absolute one; and its own realpath, which
+   * every path this module opens must lie inside (see "Why the project read is
+   * canonicalised" in the module overview). A root that is not absolute makes
+   * containment meaningless, and one with no realpath makes it unprovable —
+   * every source is then rejected rather than resolved against a guess.
    */
   readonly projectRoot: string;
 
@@ -286,8 +325,13 @@ export interface ResolveStackOptions {
    * The second injection seam: it makes the two content branches testable
    * without a fixture tree on disk, and lets a caller that already has the file
    * in memory avoid a read. It is called **only** with an absolute path that
-   * {@link resolveWithinProject} has vouched for, and may throw freely — a
-   * throw is caught and treated as "no content".
+   * *canonical* containment has vouched for — `fs.realpathSync` of a path
+   * {@link resolveWithinProject} accepted, proven with {@link isWithin} to lie
+   * inside `fs.realpathSync` of {@link projectRoot} — and never with a path
+   * that only passed the string-level check. A path whose canonical form
+   * escapes the project is refused *before* this function is called, so
+   * injecting a reader cannot widen what the module will open. It may throw
+   * freely: a throw is caught and treated as "no content".
    */
   readonly readSourceFile?: ((absPath: string) => string | undefined) | undefined;
 
@@ -539,6 +583,33 @@ interface ResolutionBudget {
   readonly maps: Map<string, LoadedMap | undefined>;
   readonly contentLines: Map<string, readonly string[] | undefined>;
   remaining: number;
+
+  /**
+   * The canonicalised project root, computed at most once per call by
+   * {@link canonicalProjectRoot} and `undefined` until it has been.
+   *
+   * A memo of the *attempt*, not of a path: `{ path: undefined }` records that
+   * the root has no realpath — it does not exist, a component is not a
+   * directory, or this process may not traverse it — which refuses every
+   * project read for the rest of the call rather than being retried once per
+   * source. One `realpathSync` per call is the reason it is memoised here:
+   * click-to-source is an interactive hop, and a stack whose frames land in a
+   * dozen sources would otherwise pay for the same syscall a dozen times.
+   */
+  canonicalRoot: CanonicalPath | undefined;
+}
+
+/**
+ * The outcome of one canonicalisation: the resolved path, or `undefined` when
+ * the path has no canonical form.
+ *
+ * A wrapper rather than a bare `string | undefined` so that "not attempted yet"
+ * and "attempted, and there is no realpath" stay distinguishable in a memo —
+ * the second must not be retried, because a root that cannot be canonicalised
+ * is a refusal for the whole call.
+ */
+interface CanonicalPath {
+  readonly path: string | undefined;
 }
 
 /**
@@ -611,7 +682,12 @@ function logSafely(logger: Logger, message: string, fields?: LogFields): void {
 
 /** A fresh budget for one call. */
 function newBudget(settings: ResolverSettings): ResolutionBudget {
-  return { maps: new Map(), contentLines: new Map(), remaining: settings.maxMaps };
+  return {
+    maps: new Map(),
+    contentLines: new Map(),
+    remaining: settings.maxMaps,
+    canonicalRoot: undefined,
+  };
 }
 
 /** `value` when it is a positive safe integer, otherwise `fallback`. */
@@ -636,18 +712,27 @@ function describeError(error: unknown): string {
  * Reads an original source from the project: the default
  * {@link ResolveStackOptions.readSourceFile}.
  *
- * `readFileNoFollow` refuses a symbolic link at the final component, which is
- * the right stance for a path derived from a map served by a dev server: the
- * string-level containment check {@link resolveWithinProject} performs cannot
- * see that a path inside the project is a link pointing out of it.
+ * `readFileNoFollow` refuses a symbolic link at the final component. That is
+ * the **backstop**, not the answer, to a path derived from a map served by a
+ * dev server: `O_NOFOLLOW` cannot see an interior component that is a link out
+ * of the project, and neither can the string-level check
+ * {@link resolveWithinProject} performs. What answers the interior-link problem
+ * is the canonical containment {@link originalContentFor} applies before this
+ * function is reached — so the path handed here is already a realpath proven to
+ * lie inside the project's realpath, and the no-follow open adds the one thing
+ * a check cannot: it refuses a link planted at the final component *between*
+ * that check and this open.
  *
  * Every filesystem error means the same thing to this module — no content, so
  * no validation and no derived symbol — and none of them is a failure of the
  * resolution: `ENOENT` for a file that moved since the map was built, `ELOOP`
- * for that symlink, `EACCES` for a file this process may not read, `EISDIR`
- * for a source path that names a directory.
+ * for a link planted at the final component after canonicalisation, `EACCES`
+ * for a file this process may not read, `EISDIR` for a source path that names a
+ * directory.
  *
- * @param absPath An absolute path {@link resolveWithinProject} has vouched for.
+ * @param absPath An absolute, canonical path that {@link resolveWithinProject}
+ * accepted and {@link isWithin} proved to be inside the canonicalised project
+ * root.
  * @returns The file's text with a byte-order mark removed, or `undefined`.
  */
 function readProjectFile(absPath: string): string | undefined {
@@ -1311,7 +1396,7 @@ function contentLinesFor(
     return budget.contentLines.get(key);
   }
 
-  const content = originalContentFor(tracer, authoredSource, relativeFile, settings);
+  const content = originalContentFor(tracer, authoredSource, relativeFile, settings, budget);
   const lines = content === undefined ? undefined : content.split(LINE_BREAK);
   budget.contentLines.set(key, lines);
   return lines;
@@ -1329,12 +1414,41 @@ function contentLinesFor(
  * withheld for this source", which is not "file missing" — so the second branch
  * still runs.
  *
- * **Branch B — read it from the project.** The project-relative path already
- * passed `isSafeRelativePath` inside `normalizeSourcePath`;
- * {@link resolveWithinProject} is nevertheless the only route from it to an
- * absolute path, because layering the two is the point — the first check says
- * the string cannot escape, the second proves the join did not. A path the
- * `Result` rejects is never read.
+ * **Branch B — read it from the project.** Three gates, layered, and none of
+ * them redundant:
+ *
+ * 1. The project-relative path already passed `isSafeRelativePath` inside
+ *    `normalizeSourcePath`; {@link resolveWithinProject} is nevertheless the
+ *    only route from it to an absolute path, because layering the two is the
+ *    point — the first check says the string cannot escape, the second proves
+ *    the join did not. A path the `Result` rejects is never read.
+ * 2. **Canonical containment**, which is the gate that answers the interior
+ *    symbolic link. Gate 1 is string-level by its own documentation, and the
+ *    default reader's `O_NOFOLLOW` refuses a link only at the final component,
+ *    so `<root>/src/lib -> /etc` passes both and `<root>/src/lib/passwd` would
+ *    be read from outside the project — the composition
+ *    `packages/shared/src/node/safe-fs.test.ts` proves unsafe. So the root is
+ *    canonicalised once per call ({@link canonicalProjectRoot}), the candidate
+ *    is canonicalised with `fs.realpathSync`, and {@link isWithin} is applied
+ *    to the two *resolved* paths. A root with no realpath, a candidate with no
+ *    realpath, or a canonical candidate outside the canonical root all mean "no
+ *    content" — and the refusal happens **before**
+ *    {@link ResolveStackOptions.readSourceFile} is called, so no reader,
+ *    injected or default, ever sees the escaping path. This matters because
+ *    what the content produces leaves the module: a `symbol` derived from it
+ *    becomes protocol data.
+ * 3. The reader itself, handed the **canonical** path, so the default
+ *    no-follow open works on a path whose final component realpath has just
+ *    shown is not a link — and `O_NOFOLLOW` covers the one window a check
+ *    cannot, a link planted between the two. The identity is then revalidated
+ *    after the read for the other half of that window: content whose path no
+ *    longer canonicalises to what was vouched for is discarded.
+ *
+ * One consequence is deliberate and is an improvement rather than a
+ * regression: an in-project symbolic link whose canonical target is still
+ * inside the project now resolves and is read, where a bare no-follow open of
+ * the unresolved path failed with `ELOOP`. That file *is* project source, and
+ * canonical containment is what makes reading it provably safe.
  *
  * @returns The source text, or `undefined` when neither branch can supply it —
  * in which case the caller proceeds with the map as the authority.
@@ -1344,6 +1458,7 @@ function originalContentFor(
   authoredSource: string,
   relativeFile: string,
   settings: ResolverSettings,
+  budget: ResolutionBudget,
 ): string | undefined {
   try {
     const embedded = sourceContentFor(tracer, authoredSource);
@@ -1356,6 +1471,7 @@ function originalContentFor(
     });
   }
 
+  // Gate 1: string-level containment.
   const resolved = resolveWithinProject(settings.projectRoot, relativeFile);
   if (isErr(resolved)) {
     settings.logger.debug('Original source path was refused by the containment check', {
@@ -1365,14 +1481,115 @@ function originalContentFor(
     return undefined;
   }
 
+  // Gate 2: canonical containment, before any read is attempted.
+  const canonicalRoot = canonicalProjectRoot(settings, budget);
+  if (canonicalRoot === undefined) {
+    return undefined;
+  }
+
+  const canonical = canonicalPathOf(resolved.value);
+  if (canonical === undefined) {
+    // No realpath: the file moved since the map was built (`ENOENT`), a
+    // component is not a directory (`ENOTDIR`), a link chain is circular
+    // (`ELOOP`), or this process may not traverse the chain (`EACCES`).
+    settings.logger.debug('Original source path has no canonical form; not read', {
+      file: relativeFile,
+    });
+    return undefined;
+  }
+
+  if (!isWithin(canonicalRoot, canonical)) {
+    // The lexically contained path resolves outside the project: an interior or
+    // final component is a symbolic link pointing out of it. Refused here, with
+    // no filesystem fact beyond the project-relative path already logged
+    // elsewhere in this module, and with no read attempted at all.
+    settings.logger.debug('Original source leaves the project once resolved; refused unread', {
+      file: relativeFile,
+    });
+    return undefined;
+  }
+
+  // Gate 3: the read, on the canonical path, revalidated around it.
+  let onDisk: string | undefined;
   try {
-    const onDisk = settings.readSourceFile(resolved.value);
-    return typeof onDisk === 'string' ? stripByteOrderMark(onDisk) : undefined;
+    onDisk = settings.readSourceFile(canonical);
   } catch (error) {
     // A caller-injected reader may throw anything; the default one never does.
     settings.logger.debug('Original source could not be read from the project', {
       reason: describeError(error),
     });
+    return undefined;
+  }
+
+  if (typeof onDisk !== 'string') {
+    return undefined;
+  }
+
+  const afterRead = canonicalPathOf(resolved.value);
+  if (afterRead === undefined || afterRead !== canonical || !isWithin(canonicalRoot, afterRead)) {
+    // Time-of-check to time-of-use: the path was replaced while it was being
+    // read, so what came back cannot be attributed to a file inside the
+    // project. Discarded, which leaves the map as the authority.
+    settings.logger.debug('Original source path changed during the read; content discarded', {
+      file: relativeFile,
+    });
+    return undefined;
+  }
+
+  return stripByteOrderMark(onDisk);
+}
+
+/**
+ * The canonicalised project root for this call, computed once and memoised on
+ * the budget.
+ *
+ * Fail-closed by construction: a root with no realpath refuses every project
+ * read for the rest of the call, because containment cannot be proven against a
+ * path that does not resolve, and a guess would be exactly the weakness gate 2
+ * exists to remove. The refusal is logged once per call rather than once per
+ * source — the memo records the attempt, so a second source does not re-log or
+ * re-syscall it.
+ *
+ * @returns The root's realpath, or `undefined` when it has none.
+ */
+function canonicalProjectRoot(
+  settings: ResolverSettings,
+  budget: ResolutionBudget,
+): string | undefined {
+  const memo = budget.canonicalRoot;
+  if (memo !== undefined) {
+    return memo.path;
+  }
+
+  const path = canonicalPathOf(settings.projectRoot);
+  budget.canonicalRoot = { path };
+
+  if (path === undefined) {
+    settings.logger.debug(
+      'Project root has no canonical form; no original source will be read from the project',
+    );
+  }
+
+  return path;
+}
+
+/**
+ * `fs.realpathSync`, contained.
+ *
+ * Every caller treats a failure as "no content", which is this module's answer
+ * to every filesystem question it asks: `realpathSync` throws `ENOENT`,
+ * `ELOOP`, `EACCES` and `ENOTDIR`, all of them ordinary on a project that has
+ * changed since a map was built, and none of them a reason to raise past a
+ * caller promised an array. That is the "Skip, never throw" contract applied to
+ * the security gate rather than exempted from it.
+ *
+ * @param pathAbs An absolute path to resolve.
+ * @returns The fully resolved path, or `undefined` when it cannot be resolved.
+ */
+function canonicalPathOf(pathAbs: string): string | undefined {
+  try {
+    return realpathSync(pathAbs);
+  } catch {
     return undefined;
   }
 }

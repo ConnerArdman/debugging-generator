@@ -65,10 +65,11 @@
  *
  * ## Motion, and why none of it is here
  *
- * The shimmer is a CSS animation and stays one. `../styles/base.css` declares
- * the package's internal motion constants — `--dgx-shimmer-duration` for one
- * sweep of a skeleton, `--dgx-motion-duration` and `--dgx-motion-easing` for
- * state feedback — and carries the single `@media (prefers-reduced-motion:
+ * The shimmer is a CSS animation and stays one. Its timing comes from the
+ * motion design tokens — `--dg-shimmer-duration` for one sweep of a skeleton,
+ * `--dg-motion-duration` and `--dg-motion-easing` for state feedback — which
+ * `../tokens/tokens.ts` declares and `../styles/components.css` consumes, while
+ * `../styles/base.css` carries the single `@media (prefers-reduced-motion:
  * reduce)` block in the package, which suppresses animation everywhere with the
  * one sanctioned `!important`. So this module declares no duration, starts no
  * animation, reads no media query and branches on no motion preference:

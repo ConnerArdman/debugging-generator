@@ -131,6 +131,21 @@ export interface OrderDraft {
 }
 
 /**
+ * An order as it stands before a payment exists for it: everything
+ * {@link OrderDraft} carries except the authorization.
+ *
+ * It is the shape {@link checkOrderDraft} asks its questions of, and it exists
+ * because a checkout assembles all of this before it has anything to pay with -
+ * the cart, the priced lines, the quote, the chosen service and the figures are
+ * settled by the time an amount is sent to a processor, and the authorization is
+ * the one member that is not. Stating that as a type is what lets a checkout
+ * hand the very same object to the check and then to {@link recordOrder} with
+ * the authorization added, so the figures that were checked and the figures that
+ * are written cannot differ.
+ */
+export type UnpaidOrderDraft = Omit<OrderDraft, 'payment'>;
+
+/**
  * Which page of whose orders to read.
  *
  * The optional members are declared as `T | undefined` on purpose. This
@@ -269,28 +284,38 @@ function mint(at: Date): string {
 }
 
 /**
- * Checks that a draft can be written as it stands, and says so by throwing when
- * it cannot.
+ * Checks everything about an order that can be established without a payment,
+ * and says so by throwing when the draft cannot be written as it stands.
  *
  * Two kinds of rejection are distinguished, because a customer can act on one
  * and not the other. A draft that is not an order at all - no lines, a
  * fractional quantity, a negative charge, text no column can hold - is a
  * rejected request. A draft whose figures do not add up is a collision: the
- * cart was priced, quoted and authorized a moment ago, and if its parts no
- * longer reconcile then something moved in between, which a fresh attempt
- * resolves and a silently corrected total would hide.
+ * cart was priced and quoted a moment ago, and if its parts no longer reconcile
+ * then something moved in between, which a fresh attempt resolves and a
+ * silently corrected total would hide. Which error class carries which is part
+ * of the contract, not an implementation detail: a caller distinguishes "this
+ * is not an order" from "these figures do not reconcile" by the class alone.
  *
- * Everything asked here is asked before {@link recordOrder} opens its
- * transaction, and each question is answered from the draft alone, so a draft
- * this function accepts is one whose remaining ways to fail are the conditions
- * inside that transaction. A caller recovering from a failed write can rely on
- * that: a rejection from here means nothing was written, and nothing was going
- * to be.
+ * **It is exported so that a checkout can ask it before it charges anything.**
+ * Every question here is answered from the draft alone, so the answer does not
+ * change between the moment a checkout has assembled the order and the moment
+ * {@link recordOrder} would ask it. A caller that runs it first therefore
+ * cannot be refused after it has authorized a payment - and a refusal after a
+ * charge is the one failure that leaves an amount approved with no order
+ * against it and no safe way to retry. `./checkout.service` depends on exactly
+ * that guarantee: it assembles the draft, runs this, and only then sends an
+ * amount to a processor. The check is synchronous and issues no query, so
+ * running it earlier costs a caller nothing.
  *
+ * What is left to {@link check} is the one question this cannot answer: whether
+ * the amount a processor approved is the total the order is written for.
+ *
+ * @param input The order as it stands before a payment exists for it.
  * @throws StorefrontValidationError When the draft is not a recordable order.
  * @throws StorefrontConflictError When its figures disagree with one another.
  */
-function check(input: OrderDraft): void {
+export function checkOrderDraft(input: UnpaidOrderDraft): void {
   if (input.cart.length === 0 || input.quote.length === 0) {
     throw new StorefrontValidationError(
       'An order has to name the cart it was assembled from and the quote its freight was charged at.',
@@ -377,6 +402,34 @@ function check(input: OrderDraft): void {
       "The order's charges no longer add up to its total. Review your cart and place the order again.",
     );
   }
+}
+
+/**
+ * Checks that a draft with its payment can be written as it stands, and says so
+ * by throwing when it cannot.
+ *
+ * It is everything {@link checkOrderDraft} asks, which is all of the draft's own
+ * questions, followed by the one question that needs the authorization: an
+ * approved amount has to be the total the order is written for, because an order
+ * paid for a different figure than it charges is neither the order the customer
+ * agreed to nor one the store can settle. That is a collision like the other
+ * figures that no longer reconcile, and for the same reason - the cart was
+ * priced, quoted and authorized a moment ago.
+ *
+ * {@link recordOrder} asks this and nothing else before it opens its
+ * transaction, so a draft it accepts is one whose remaining ways to fail are the
+ * conditions inside that transaction. A caller recovering from a failed write
+ * can rely on that, and a caller that has already run {@link checkOrderDraft}
+ * against the same figures can rely on more: the only question left for this to
+ * refuse it on is the one about the amount its own processor approved.
+ *
+ * @param input The order as it will be written, authorization included.
+ * @throws StorefrontValidationError When the draft is not a recordable order.
+ * @throws StorefrontConflictError When its figures disagree with one another or
+ * with the amount approved for payment.
+ */
+function check(input: OrderDraft): void {
+  checkOrderDraft(input);
 
   if (input.payment.authorized && input.payment.amountCents !== input.totalCents) {
     throw new StorefrontConflictError(
@@ -567,6 +620,14 @@ export async function unclaim(id: string): Promise<void> {
  * makes it `PAID`, and anything else leaves it `PENDING` for the store to
  * settle. Nothing else about the order is decided here - the figures are the
  * draft's, checked rather than adjusted.
+ *
+ * What is checked before the transaction opens is {@link check}: the draft's own
+ * questions, which are {@link checkOrderDraft}, and then whether an approved
+ * amount is this order's total. The first half is exported for a reason that
+ * matters to whoever calls this after paying for the order - a caller that ran
+ * {@link checkOrderDraft} before it authorized anything has already answered
+ * every question here that does not concern the authorization, so the only way
+ * this call can refuse its draft is the amount its own processor approved.
  *
  * Three writes share that transaction, and each of the other two is conditional
  * on something the order depends on still being true. The cart the order was

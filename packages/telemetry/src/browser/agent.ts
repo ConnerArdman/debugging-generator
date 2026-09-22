@@ -45,12 +45,14 @@
  * there is no retry and no recovery. So the first thing that happens in this
  * bundle, before any statement of this module's body, is the installation of
  * that hook (step 1). The second is the installation of
- * `globalThis.__DEBUGGEN__` (step 2), because a function patched by
+ * `globalThis.__DEBUGGEN__` (step 2), preceded by arming the document-scoped
+ * families it publishes — element description, which the panel uses to pick a
+ * target long before a capture exists — because a function patched by
  * `packages/instrumentation/src/patch/function-timing.ts` can execute at any
  * moment and its wrapper's `if (__dbg && typeof __dbg.span === "function")`
  * check must find a helper. Both happen while the agent is **dormant**: no
- * listener, no observer, no patch and no subscription exists until the service
- * arms one.
+ * listener, no observer, no patch and no subscription on the developer's
+ * application exists until the service arms one.
  *
  * Then, in order: subscribe to the isolated-world bridge and announce
  * `agent.ready` (step 3); register the two flush hooks that get a capture's
@@ -68,6 +70,15 @@
  * (AAP 0.5.1). The span helper stays installed and becomes a pass-through
  * again, which is deliberate: code patched during the session may still be
  * loaded in the page, and an inert helper serves it at zero cost.
+ *
+ * Arming and disarming walk **one registry of eight producer families** — one
+ * per sibling module in this folder that observes anything — rather than a
+ * hand-kept list of calls, because a family reachable only from a remembered
+ * call is a family whose release depends on that memory. Each entry declares
+ * whether it belongs to a capture or to the document, and which of the seven
+ * wire flags ask for it; see {@link HOOK_NAMES} and {@link HOOK_FLAGS}, which
+ * are deliberately two separate lists because the `componentTree` flag arms no
+ * observer at all.
  *
  * Two races shape the rest of this file, and both are the Chrome extension's
  * doing rather than accidents:
@@ -122,22 +133,45 @@
  */
 import 'bippy/install-hook-only';
 
-import { resetContinuations } from './continuation.js';
-import { describeElement } from './dom-target.js';
-import { attachErrors, detachErrors, isErrorsAttached } from './errors.js';
-import { attachFetch, detachFetch, isFetchAttached } from './fetch.js';
+import {
+  COMPONENT_TREE_ATTRIBUTE_KEYS,
+  COMPONENT_TREE_EVENT_NAME,
+  MAX_COMPONENT_TREE_JSON_CHARS,
+} from '../schema/attributes.js';
+import {
+  attachContinuations,
+  detachContinuations,
+  isContinuationsAttached,
+  resetContinuations,
+} from './continuation.js';
+import {
+  attachDomTarget,
+  describeElement,
+  detachDomTarget,
+  isDomTargetAttached,
+} from './dom-target.js';
+import { attachErrors, detachErrors, hasErrorsResidue, isErrorsAttached } from './errors.js';
+import {
+  advanceFetchGeneration,
+  attachFetch,
+  detachFetch,
+  hasFetchResidue,
+  isFetchAttached,
+} from './fetch.js';
 import { getDocumentId, getProducerId, newSpanId } from './ids.js';
 import {
   attachInteractions,
   detachInteractions,
+  hasInteractionsResidue,
   isInteractionsAttached,
   resolveEventContext,
 } from './interaction.js';
-import { attachPerf, detachPerf, isPerfAttached } from './perf.js';
+import { attachPerf, detachPerf, hasPerfResidue, isPerfAttached } from './perf.js';
 import {
   attachReact,
   detachReact,
   detectReact,
+  hasReactResidue,
   isReactAttached,
   resetReactCounters,
   snapshotComponentTree,
@@ -151,15 +185,17 @@ import {
 } from './span-helper.js';
 import { attachState, detachState, isStateAttached, resetStateCounters } from './state.js';
 import {
+  boundControlText,
   configureTransport,
   emit,
   flush,
   nowEpochMs,
   postControl,
+  reportProducerFailure,
   resetTransport,
   subscribe,
 } from './transport.js';
-import type { BridgeInboundMessage, EventDraft } from './transport.js';
+import type { BridgeInboundMessage, EventDraft, ProducerFailureSource } from './transport.js';
 
 /*
  * ---------------------------------------------------------------------------
@@ -168,30 +204,124 @@ import type { BridgeInboundMessage, EventDraft } from './transport.js';
  */
 
 /**
- * The build version this bundle announces in its `agent.ready` frame.
+ * The build version of this bundle.
  *
  * It matters because the agent is a *static* content script: a page loaded
  * before the extension was updated keeps running the bundle it was loaded
  * with, so the service worker can be talking to an older agent than the one on
  * disk. Bumped whenever the frames this file posts, or the configuration it
  * understands, change in a way a reader could notice.
+ *
+ * **Deliberately not on the wire.** `agent.ready`'s payload is the exact five
+ * fields AAP 0.4.2 specifies (see {@link announceReady}), so this version is
+ * reported only in the page-console diagnostics the service can ask for. The
+ * version negotiation it would enable belongs to the shared message schema,
+ * which has to carry the field before a producer may send it. Until then this
+ * constant is what a reader of a `debug: true` session correlates a bundle
+ * against, and the alias list in {@link HOOK_ALIASES} is what keeps an older
+ * service compatible without one.
  */
 export const AGENT_VERSION = 1;
 
 /**
- * The hook names this agent understands, in **attach order**.
+ * The seven flags an `agent.config` may carry, in the order the service
+ * declares them.
  *
- * The order is the contract, not a listing convenience: interactions come
- * first because {@link resolveEventContext} is what every other producer asks
- * which trace an event belongs to, the network patch second so a request
- * started inside the first interaction is already correlated, state third
- * because `./react.js` hands its transitions to `./state.js` as it walks a
- * commit, and the observers and error listeners last because neither depends
- * on the others. Detach runs this list in reverse, so context outlives the
- * producers that use it.
+ * These names are the **wire vocabulary**, and they are exactly the seven keys
+ * of `AgentHookConfig` — `packages/instrumentation/src/schema/readiness.ts`'s
+ * `AGENT_HOOK_KEYS`, the single canonical definition (AAP 0.4.2, 0.9.1). That
+ * file cannot be imported here (see {@link HOOK_ALIASES}), so the parity is
+ * kept by using its names verbatim rather than a spelling of this file's own.
+ *
+ * Six of them arm an observer; `componentTree` does not, and that asymmetry is
+ * why the vocabulary and the lifecycle registry are two separate lists rather
+ * than one (see {@link HOOK_NAMES}). A tree is one bounded piece of work taken
+ * at the capture's last commit, so the flag is an *authorisation* the agent
+ * stores and honours at that moment (see {@link maybeEmitComponentTreeSnapshot})
+ * — a capture that wants render counts without a tree must not pay for one.
+ */
+const HOOK_FLAGS = Object.freeze([
+  'interactions',
+  'react',
+  'state',
+  'fetch',
+  'perf',
+  'errors',
+  'componentTree',
+] as const);
+
+/** One member of the closed wire vocabulary of {@link HOOK_FLAGS}. */
+export type HookFlag = (typeof HOOK_FLAGS)[number];
+
+/**
+ * Every configuration key accepted for each flag, canonical name first.
+ *
+ * **The canonical names are `AgentHookConfig`'s**, defined once in
+ * `packages/instrumentation/src/schema/readiness.ts` and embedded by
+ * `@debuggen/protocol` in `agent.config` (AAP 0.4.2). Neither file may be
+ * imported here — the agent emits raw event batches and the service worker
+ * wraps them in protocol envelopes, so protocol stays out of the page
+ * (AAP 0.2.3) — which means a naming difference between the two sides fails
+ * nowhere: the hook is simply never attached, the developer reproduces their
+ * problem exactly as asked, and the capture comes back missing the evidence.
+ *
+ * The aliases are therefore a compatibility list, not a guess: each entry is a
+ * spelling a service built against an earlier revision of this file may send
+ * (`interaction`, `renders`, `network`, `performance`, `error`), so an
+ * older service still arms the right signal. Anything unrecognised is ignored
+ * rather than guessed at.
+ *
+ * Exported so the alignment with `AGENT_HOOK_KEYS` can be asserted from
+ * outside this bundle rather than rediscovered by reading it.
+ */
+export const HOOK_ALIASES: Readonly<Record<HookFlag, readonly string[]>> = Object.freeze({
+  interactions: Object.freeze(['interactions', 'interaction']),
+  react: Object.freeze(['react', 'reactRenders', 'renders']),
+  state: Object.freeze(['state', 'stateTransitions']),
+  fetch: Object.freeze(['fetch', 'network', 'fetchTracking']),
+  perf: Object.freeze(['perf', 'performance', 'perfTracking']),
+  errors: Object.freeze(['errors', 'error']),
+  // Not `tree`: the configuration's top level may carry a `tree` object of
+  // snapshot bounds (see `readTreeBounds`), and one word meaning two things on
+  // one frame is how a reader comes to believe a bounds object armed a signal.
+  componentTree: Object.freeze(['componentTree', 'componentTreeSnapshot', 'componentTreeTracking']),
+});
+
+/**
+ * The eight producer families this module holds a lifecycle for, in **attach
+ * order** — one per sibling module in this folder that observes something.
+ *
+ * The list is the agent's cleanup contract made mechanical: AAP 0.5.1 requires
+ * an `agent.config` with every hook false to leave the agent *disabled rather
+ * than idled*, and the only way to be sure of that is for every family to be
+ * reachable from one ordered walk. A family kept outside the registry is a
+ * family whose release depends on someone remembering to call it — which is
+ * how `continuation` came to be reset ad hoc and `dom-target` came to have no
+ * release at all.
+ *
+ * The order is the contract, not a listing convenience:
+ *
+ * 1. `domTarget` — the document-scoped capability the span helper publishes as
+ *    `describeTarget`, so it is armed before the helper exists.
+ * 2. `continuation` — the lineage registry every other producer's attribution
+ *    is resolved against, so it holds its empty state before anything can ask.
+ * 3. `interactions` — mints the trace root and the window
+ *    {@link resolveEventContext} answers from.
+ * 4. `fetch` — the network patch, so a request started inside the first
+ *    interaction is already correlated.
+ * 5. `state` — `./react.js` hands its transitions to `./state.js` as it walks
+ *    a commit, so state is ready before commits are observed.
+ * 6. `react` — the fiber-hook subscription.
+ * 7. `perf`, 8. `errors` — observers and listeners that depend on none of the
+ *    above.
+ *
+ * Detach runs the list in reverse, so context outlives the producers that use
+ * it.
  */
 const HOOK_NAMES = Object.freeze([
-  'interaction',
+  'domTarget',
+  'continuation',
+  'interactions',
   'fetch',
   'state',
   'react',
@@ -199,34 +329,8 @@ const HOOK_NAMES = Object.freeze([
   'errors',
 ] as const);
 
-/** One member of the closed hook vocabulary. */
+/** One member of the closed family vocabulary of {@link HOOK_NAMES}. */
 export type HookName = (typeof HOOK_NAMES)[number];
-
-/**
- * Every configuration key accepted for each hook, canonical name first.
- *
- * **Reconcile with `packages/protocol/src/messages/agent.ts`**, which defines
- * the real `AgentHookConfig` and which this bundle may not import (the agent
- * emits raw event batches and the service worker wraps them in protocol
- * envelopes, so protocol stays out of the page — AAP 0.2.3). Until the two are
- * reconciled, a naming difference between the message schema and this file
- * would silently disable a signal: the developer would reproduce their problem
- * exactly as asked and the capture would come back missing the evidence. The
- * aliases below are the plausible spellings of each signal, so a mismatch
- * costs nothing; anything unrecognised is ignored rather than guessed at.
- *
- * Exported so that a later change can align the two files — and assert the
- * alignment in a test — rather than rediscovering this list by reading the
- * bundle.
- */
-export const HOOK_ALIASES: Readonly<Record<HookName, readonly string[]>> = Object.freeze({
-  interaction: Object.freeze(['interaction', 'interactions']),
-  fetch: Object.freeze(['fetch', 'network', 'fetchTracking']),
-  state: Object.freeze(['state', 'stateTransitions']),
-  react: Object.freeze(['react', 'reactRenders', 'renders']),
-  perf: Object.freeze(['perf', 'performance', 'perfTracking']),
-  errors: Object.freeze(['errors', 'error']),
-});
 
 /*
  * ---------------------------------------------------------------------------
@@ -250,9 +354,6 @@ export const HOOK_ALIASES: Readonly<Record<HookName, readonly string[]>> = Objec
  * any timer at all.
  */
 const REACT_RECHECK_DELAY_MS = 1000;
-
-/** The event name the component-tree snapshot is emitted under. */
-const COMPONENT_TREE_EVENT_NAME = 'react.component-tree';
 
 /**
  * The key this module marks `globalThis` with so a second injection of the
@@ -305,10 +406,10 @@ interface ParsedAgentConfig {
   sessionId: string | undefined;
   /** The capture id, or `undefined` — which by itself means "disarm". */
   captureId: string | undefined;
-  /** Every hook's desired state; a key is always present. */
-  hooks: Readonly<Record<HookName, boolean>>;
-  /** The hooks asked for, in {@link HOOK_NAMES} order. */
-  enabled: readonly HookName[];
+  /** Every flag's desired state; a key is always present. */
+  hooks: Readonly<Record<HookFlag, boolean>>;
+  /** The flags asked for, in {@link HOOK_FLAGS} order. */
+  enabled: readonly HookFlag[];
   /** Whether the service asked for page-console diagnostics. */
   debug: boolean;
   /** Component-tree bounds the service asked for, if any. */
@@ -350,35 +451,163 @@ interface AgentGlobalScope {
   __REACT_DEVTOOLS_GLOBAL_HOOK__?: unknown;
 }
 
-/** One hook's three lifecycle functions, as the ordered loops below use them. */
+/**
+ * How long a family stays armed once it is attached.
+ *
+ * `capture` families are armed and released by {@link arm} and {@link disarm},
+ * so they observe the developer's application only while a capture is running.
+ * `document` families belong to the page document instead: they are armed by
+ * the opening sequence and released when the document goes away, because the
+ * capability they provide is used *outside* a capture — the panel picks an
+ * element before the question is even asked (AAP 0.1.1, 0.4.2) — and they
+ * observe nothing on their own.
+ */
+type HookScope = 'capture' | 'document';
+
+/** One family's lifecycle, as the ordered loops below use it. */
 interface HookBinding {
-  /** Arm the signal. Idempotent and never throws (see each sibling). */
-  attach: () => void;
-  /** Disarm the signal and release everything it held. */
-  detach: () => void;
-  /** Whether the signal is armed right now — the source of truth. */
-  isAttached: () => boolean;
+  /** See {@link HookScope}. */
+  readonly scope: HookScope;
+  /**
+   * The wire flags that ask for this family; empty for a document-scoped one.
+   *
+   * A family is armed when *any* of its flags is set, which is what lets one
+   * flag arm more than one family and one family serve more than one flag
+   * without the arming loop knowing anything about either.
+   */
+  readonly requestedBy: readonly HookFlag[];
+  /** Arm the family. Idempotent and never throws (see each sibling). */
+  readonly attach: () => void;
+  /** Disarm the family and release everything it held. */
+  readonly detach: () => void;
+  /** Whether the family is armed right now — the source of truth. */
+  readonly isAttached: () => boolean;
+  /**
+   * Whether the page still carries something this family's last detach could
+   * not remove.
+   *
+   * A second question, and a different one from {@link isAttached}. Every
+   * producer in this folder reads "attached" as "observing", so a hook that
+   * disarmed its gate and then failed to remove a listener, disconnect an
+   * observer or restore a prototype slot answers `false` there while the
+   * page still runs its registration. Without this probe the unreleased-hook
+   * announcement would conclude, from a predicate answering the other
+   * question, that everything came off — which is exactly the state AAP 0.5.1
+   * requires to be stated rather than assumed.
+   */
+  readonly hasResidue: () => boolean;
 }
 
+/** `requestedBy` for a family no wire flag names. Shared, so it is frozen. */
+const NO_FLAGS: readonly HookFlag[] = Object.freeze([]);
+
 /**
- * The hook table, keyed by {@link HookName}.
+ * The family table, keyed by {@link HookName}.
  *
  * Total by construction: a name added to {@link HOOK_NAMES} without an entry
  * here is a compile error, which is what keeps the attach, detach and
- * reporting loops from silently skipping a signal.
+ * reporting loops from silently skipping a family.
+ *
+ * Two entries repay a second look.
+ *
+ * - **`domTarget` is document-scoped and no flag names it.** Element
+ *   description is what answers `describeTarget`/`target.request`, which the
+ *   panel uses while the agent is dormant, so tying it to a capture would
+ *   break target selection — the step that happens *before* a plan exists. Its
+ *   adapter holds no resource; `./dom-target.js` documents why its own
+ *   functions stay callable in both states.
+ * - **`continuation` is named by two flags.** The lineage registry is fed by
+ *   the request producer and closed by the interaction producer
+ *   (`./continuation.js`), so either of those signals is reason enough to arm
+ *   it, and neither alone is reason to leave it out. In practice the service
+ *   forces `interactions` on whenever anything is on — without it the
+ *   `traceparent` header is never injected and browser↔server correlation
+ *   breaks silently — so this family is armed for every real capture.
  */
 const HOOK_BINDINGS: Readonly<Record<HookName, HookBinding>> = Object.freeze({
-  interaction: {
+  domTarget: {
+    scope: 'document',
+    requestedBy: NO_FLAGS,
+    attach: attachDomTarget,
+    detach: detachDomTarget,
+    isAttached: isDomTargetAttached,
+    // `./dom-target.ts` registers nothing with the page — it is a flag that
+    // gates `describeElement` — so it has no residue to leave behind.
+    hasResidue: (): boolean => false,
+  },
+  continuation: {
+    scope: 'capture',
+    requestedBy: Object.freeze(['interactions', 'fetch'] as const),
+    attach: attachContinuations,
+    detach: detachContinuations,
+    isAttached: isContinuationsAttached,
+    // `./continuation.ts` is a registry of maps driven by the producers; it
+    // holds no page registration and therefore nothing a detach could fail to
+    // release.
+    hasResidue: (): boolean => false,
+  },
+  interactions: {
+    scope: 'capture',
+    requestedBy: Object.freeze(['interactions'] as const),
     attach: attachInteractions,
     detach: detachInteractions,
     isAttached: isInteractionsAttached,
+    hasResidue: hasInteractionsResidue,
   },
-  fetch: { attach: attachFetch, detach: detachFetch, isAttached: isFetchAttached },
-  state: { attach: attachState, detach: detachState, isAttached: isStateAttached },
-  react: { attach: attachReact, detach: detachReact, isAttached: isReactAttached },
-  perf: { attach: attachPerf, detach: detachPerf, isAttached: isPerfAttached },
-  errors: { attach: attachErrors, detach: detachErrors, isAttached: isErrorsAttached },
+  fetch: {
+    scope: 'capture',
+    requestedBy: Object.freeze(['fetch'] as const),
+    attach: attachFetch,
+    detach: detachFetch,
+    isAttached: isFetchAttached,
+    hasResidue: hasFetchResidue,
+  },
+  state: {
+    scope: 'capture',
+    requestedBy: Object.freeze(['state'] as const),
+    attach: attachState,
+    detach: detachState,
+    isAttached: isStateAttached,
+    // `./state.ts` registers nothing with the page — it is a flag and two
+    // counters, driven by `./react.ts`'s commit traversal — so it has no
+    // residue to leave behind and nothing to probe for.
+    hasResidue: (): boolean => false,
+  },
+  react: {
+    scope: 'capture',
+    requestedBy: Object.freeze(['react'] as const),
+    attach: attachReact,
+    detach: detachReact,
+    isAttached: isReactAttached,
+    hasResidue: hasReactResidue,
+  },
+  perf: {
+    scope: 'capture',
+    requestedBy: Object.freeze(['perf'] as const),
+    attach: attachPerf,
+    detach: detachPerf,
+    isAttached: isPerfAttached,
+    hasResidue: hasPerfResidue,
+  },
+  errors: {
+    scope: 'capture',
+    requestedBy: Object.freeze(['errors'] as const),
+    attach: attachErrors,
+    detach: detachErrors,
+    isAttached: isErrorsAttached,
+    hasResidue: hasErrorsResidue,
+  },
 });
+
+/** The families armed and released with a capture, in attach order. */
+const CAPTURE_HOOK_NAMES: readonly HookName[] = Object.freeze(
+  HOOK_NAMES.filter((name) => HOOK_BINDINGS[name].scope === 'capture'),
+);
+
+/** The families that belong to the document, in attach order. */
+const DOCUMENT_HOOK_NAMES: readonly HookName[] = Object.freeze(
+  HOOK_NAMES.filter((name) => HOOK_BINDINGS[name].scope === 'document'),
+);
 
 /*
  * ---------------------------------------------------------------------------
@@ -444,6 +673,29 @@ let debugEnabled = false;
 let treeBounds: TreeBounds = { maxNodes: undefined, maxDepth: undefined };
 
 /**
+ * Whether the live configuration authorised a component-tree snapshot.
+ *
+ * The `componentTree` flag arms no observer, so this is where it lives: the
+ * snapshot is one bounded walk of the retained fiber root taken as the capture
+ * stops, and {@link maybeEmitComponentTreeSnapshot} is the only thing that may
+ * take it. Default `false`, so a capture that did not ask for a tree never
+ * pays for one — which is the point of the flag being separate from `react` on
+ * the wire (AAP 0.4.2).
+ */
+let componentTreeRequested = false;
+
+/**
+ * Whether this capture has already been told its tree request cannot be met.
+ *
+ * Reported once per capture, for the reason {@link failedHooks} exists: the
+ * service worker re-sends the live configuration after every reconnect and
+ * every same-origin navigation, and a request that is impossible in this
+ * document — `componentTree` without the React family attached — is impossible
+ * every time it is re-sent.
+ */
+let componentTreeRefusalReported = false;
+
+/**
  * Hooks that were asked for and did not attach, for the current capture.
  *
  * Cleared whenever the capture changes. Its purpose is idempotence with
@@ -453,6 +705,21 @@ let treeBounds: TreeBounds = { maxNodes: undefined, maxDepth: undefined };
  * unavailable signal for the life of the capture.
  */
 const failedHooks = new Set<HookName>();
+
+/**
+ * Hooks already announced as unreleased, for the current capture.
+ *
+ * The same idempotence-with-honesty bargain {@link failedHooks} makes, for the
+ * opposite failure: a hook that refuses to detach refuses every time it is
+ * asked, so a re-sent configuration, a second {@link disarm} or a detach
+ * attempted from both paths would otherwise post the identical `agent.error`
+ * frame again and again for one unchanged fact.
+ *
+ * Cleared when the capture changes rather than on disarm — which is what makes
+ * "once per capture" true across the disarm that ends the capture and any
+ * repeat of it — so the next capture on this document announces afresh.
+ */
+const reportedUnreleasedHooks = new Set<HookName>();
 
 /**
  * The `pagehide` listener, once registered.
@@ -467,6 +734,16 @@ let pageHideListener: (() => void) | undefined;
 
 /** The `visibilitychange` listener, held for the same reason. */
 let visibilityListener: (() => void) | undefined;
+
+/**
+ * The `pageshow` listener, which re-arms the document-scoped families.
+ *
+ * Its counterpart is the `pagehide` listener above: a document put into the
+ * back/forward cache releases them and a restored one gets them back, so
+ * {@link isDomTargetAttached} always describes the document the panel is
+ * actually looking at.
+ */
+let pageShowListener: (() => void) | undefined;
 
 /*
  * ---------------------------------------------------------------------------
@@ -668,15 +945,30 @@ function readInboundConfig(record: Record<string, unknown> | undefined): Inbound
 }
 
 /**
- * Build a total `HookName` record from a per-name predicate.
+ * Build a total {@link HookFlag} record from a per-flag predicate.
  *
- * The one assertion in this file, and it is total by construction:
- * {@link HOOK_NAMES} is the key domain of `Record<HookName, boolean>` and the
- * loop visits every member, so the partial is fully populated before it is
- * read. Writing the six keys out by hand instead would let a hook added to the
- * vocabulary be silently missing from one of the three records built this way.
+ * Total by construction: {@link HOOK_FLAGS} is the key domain of
+ * `Record<HookFlag, boolean>` and the loop visits every member, so the partial
+ * is fully populated before the assertion reads it. Writing the seven keys out
+ * by hand instead would let a flag added to the vocabulary be silently missing
+ * from a record built this way.
  */
-function hookRecord(predicate: (name: HookName) => boolean): Record<HookName, boolean> {
+function flagRecord(predicate: (flag: HookFlag) => boolean): Record<HookFlag, boolean> {
+  const state: Partial<Record<HookFlag, boolean>> = {};
+  for (const flag of HOOK_FLAGS) {
+    state[flag] = predicate(flag);
+  }
+  return state as Record<HookFlag, boolean>;
+}
+
+/**
+ * Build a total {@link HookName} record from a per-family predicate.
+ *
+ * The family counterpart of {@link flagRecord}, and total for the same reason.
+ * Used for the state snapshot {@link getAgentState} publishes, which reports
+ * all eight families rather than only the ones a capture happened to ask for.
+ */
+function familyRecord(predicate: (name: HookName) => boolean): Record<HookName, boolean> {
   const state: Partial<Record<HookName, boolean>> = {};
   for (const name of HOOK_NAMES) {
     state[name] = predicate(name);
@@ -726,17 +1018,17 @@ function parseConfig(payload: unknown): ParsedAgentConfig {
   const config = readInboundConfig(record);
   const hooksRecord = config.hooks;
 
-  const hooks = hookRecord((name) =>
+  const hooks = flagRecord((flag) =>
     hooksRecord === undefined
       ? false
-      : HOOK_ALIASES[name].some((alias) => readFlag(hooksRecord[alias])),
+      : HOOK_ALIASES[flag].some((alias) => readFlag(hooksRecord[alias])),
   );
 
   return {
     sessionId: readString(config.sessionId),
     captureId: readString(config.captureId),
     hooks,
-    enabled: HOOK_NAMES.filter((name) => hooks[name]),
+    enabled: HOOK_FLAGS.filter((flag) => hooks[flag]),
     debug: readFlag(record?.['debug']),
     tree: readTreeBounds(record),
   };
@@ -749,7 +1041,7 @@ function parseConfig(payload: unknown): ParsedAgentConfig {
  */
 
 /**
- * Whether one hook is armed right now.
+ * Whether one family is armed right now.
  *
  * The sibling's own predicate is the source of truth rather than a copy of the
  * last configuration: `attachPerf()` legitimately declines in a host with no
@@ -765,14 +1057,52 @@ function isHookAttached(name: HookName): boolean {
 }
 
 /**
- * Arm one hook and report whether it took.
+ * Whether a configuration asks for one family.
+ *
+ * Document-scoped families answer `false` whatever the configuration says:
+ * their lifecycle belongs to the document (see {@link HookScope}), so a
+ * capture can neither arm nor release them, and a flag that happened to share
+ * a name with one must not.
+ */
+function isHookRequested(name: HookName, hooks: Readonly<Record<HookFlag, boolean>>): boolean {
+  const binding = HOOK_BINDINGS[name];
+  return binding.scope === 'capture' && binding.requestedBy.some((flag) => hooks[flag]);
+}
+
+/**
+/**
+ * Whether one hook left something of itself in the page.
+ *
+ * The companion to {@link isHookAttached}, and the reason both exist: a
+ * producer's `is…Attached()` answers "am I observing", which a hook that
+ * disarmed its gate answers `false` even when the page still runs the listener
+ * it could not remove, still holds the observer it could not disconnect or
+ * still carries the prototype patch it could not restore. That residue is what
+ * AAP 0.5.1 forbids leaving unstated, so it is asked for separately and
+ * announced separately (see {@link reportUnreleasedHooks}).
+ *
+ * Guarded like its companion: a producer whose probe throws is treated as
+ * having nothing outstanding, because the alternative — announcing residue on
+ * the strength of a failed read — would report the same hook on every disarm
+ * for the life of the document.
+ */
+function hookHasResidue(name: HookName): boolean {
+  try {
+    return HOOK_BINDINGS[name].hasResidue() === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Arm one family and report whether it took.
  *
  * Every sibling's `attach` is idempotent and documented not to throw; the
  * guard is here because this module runs in a page that can redefine the host
- * objects those functions reach for, and one hook failing must not cost the
- * other five.
+ * objects those functions reach for, and one family failing must not cost the
+ * other seven.
  *
- * @returns `true` when the hook is armed afterwards.
+ * @returns `true` when the family is armed afterwards.
  */
 function attachHook(name: HookName): boolean {
   try {
@@ -784,22 +1114,120 @@ function attachHook(name: HookName): boolean {
   return isHookAttached(name);
 }
 
-/** Disarm one hook, in its own guard, for the same reason as {@link attachHook}. */
+/**
+ * The transport source one family's detach failure is reported under.
+ *
+ * `./transport.ts`'s `ProducerFailureSource` names the producer *modules*, and
+ * a family name is not always a module name: the `interactions` family is
+ * produced by `./interaction.ts`, which reports itself as `'interaction'`, and
+ * the two families that hold no host resource — `domTarget` and
+ * `continuation` are a flag and a registry of maps — have no producer source
+ * and nothing a detach could fail to release, so they carry `undefined`.
+ *
+ * Total over {@link HookName} on purpose: a family added to {@link HOOK_NAMES}
+ * without an entry here is a compile error rather than a report the service
+ * would group under nothing.
+ */
+const HOOK_FAILURE_SOURCES: Readonly<Record<HookName, ProducerFailureSource | undefined>> =
+  Object.freeze({
+    domTarget: undefined,
+    continuation: undefined,
+    interactions: 'interaction',
+    fetch: 'fetch',
+    state: 'state',
+    react: 'react',
+    perf: 'perf',
+    errors: 'errors',
+  });
+
+/**
+ * Disarm one family, in its own guard, for the same reason as {@link attachHook}.
+ *
+ * The failure is **reported as well as contained**. A hook that will not
+ * detach is the most expensive failure this agent has — the page keeps a
+ * listener, a wrapper or a bippy callback after the developer ended their
+ * capture — and until this call it was invisible to everything outside the
+ * page. AAP 0.5.5 requires the signal that could not be delivered to be
+ * stated, and AAP 0.5.1 requires a cleared hook to be disabled rather than
+ * idled, so the failure travels as an `agent.error` frame while the caller's
+ * loop still detaches every other family.
+ */
 function detachHook(name: HookName): void {
   try {
     HOOK_BINDINGS[name].detach();
-  } catch {
-    // Contained; the remaining hooks are still detached by the caller's loop.
+  } catch (error) {
+    // Contained; the remaining families are still detached by the caller's
+    // loop, and {@link reportUnreleasedHooks} states whatever is still attached
+    // afterwards.
+    const source = HOOK_FAILURE_SOURCES[name];
+    if (source !== undefined) {
+      reportProducerFailure(source, 'detach', error);
+    }
   }
 }
 
-/** The armed hooks, in {@link HOOK_NAMES} order. */
+/** The armed families, in {@link HOOK_NAMES} order. */
 function attachedHookNames(): HookName[] {
   return HOOK_NAMES.filter((name) => isHookAttached(name));
 }
 
 /**
- * Why a hook that was asked for might not have attached, per signal.
+ * Arm the document-scoped families.
+ *
+ * Called by the opening sequence — before the span helper is published, since
+ * `describeTarget` is exactly what `domTarget` provides — and again from
+ * `pageshow`, so a document restored from the back/forward cache regains them.
+ * Idempotent, and a family that declines leaves its own predicate false rather
+ * than failing the sequence.
+ */
+function attachDocumentHooks(): void {
+  for (const name of DOCUMENT_HOOK_NAMES) {
+    attachHook(name);
+  }
+}
+
+/**
+ * Release the document-scoped families.
+ *
+ * Called from `pagehide`, which is the only teardown a content script has: the
+ * document is being discarded or frozen, and a capability that outlived it
+ * would describe a page that is no longer there. `pageshow` re-arms them if the
+ * document comes back.
+ */
+function detachDocumentHooks(): void {
+  for (const name of [...DOCUMENT_HOOK_NAMES].reverse()) {
+    detachHook(name);
+  }
+}
+
+/**
+ * The wire signal each family supplies, or `undefined` for a support family.
+ *
+ * Six families are named after the flag that arms them, so their name *is* the
+ * signal name the service knows them by (`CaptureSignal` in
+ * `packages/instrumentation/src/schema/readiness.ts`). `continuation` and
+ * `domTarget` supply no signal of their own: the first is the lineage registry
+ * behind every other producer's attribution and the second answers the panel's
+ * element queries, so neither appears in a capture's signal list and neither
+ * may be reported as one — a service that received `continuation` where it
+ * expects a capture signal would reject the frame.
+ *
+ * Total by construction, so a family added to {@link HOOK_NAMES} has to declare
+ * which of the two it is.
+ */
+const HOOK_SIGNALS: Readonly<Record<HookName, HookFlag | undefined>> = Object.freeze({
+  domTarget: undefined,
+  continuation: undefined,
+  interactions: 'interactions',
+  fetch: 'fetch',
+  state: 'state',
+  react: 'react',
+  perf: 'perf',
+  errors: 'errors',
+});
+
+/**
+ * Why a family that was asked for might not have attached.
  *
  * These strings reach the developer: `apps/local-service` turns an unavailable
  * signal into "Could not enable ‹signal›: ‹reason›. Continuing with: ‹enabled
@@ -807,7 +1235,11 @@ function attachedHookNames(): HookName[] {
  * than restating the failure.
  */
 const HOOK_UNAVAILABLE_HINTS: Readonly<Record<HookName, string>> = Object.freeze({
-  interaction: 'The page has no window to listen on. Reload the tab and start the capture again.',
+  domTarget:
+    'This document exposes no DOM, so an element cannot be described. Element selection is unavailable for this page.',
+  continuation:
+    'Async lineage could not be armed, so React work that renders a response may start a trace of its own instead of joining the interaction.',
+  interactions: 'The page has no window to listen on. Reload the tab and start the capture again.',
   fetch:
     'window.fetch and XMLHttpRequest could not be wrapped, usually because another script holds a non-configurable copy. Reload the tab before capturing.',
   state: 'React state transitions could not be recorded; they accompany the React hook.',
@@ -818,30 +1250,255 @@ const HOOK_UNAVAILABLE_HINTS: Readonly<Record<HookName, string>> = Object.freeze
 });
 
 /**
+ * Why a `componentTree` request cannot be met without the React family.
+ *
+ * The snapshot is a walk of the fiber root `./react.js` retains from the
+ * commits it observed, so there is nothing to walk when that family is not
+ * attached. The service pairs the two flags itself — its
+ * `react-render-tracking` action arms `react` and `componentTree` together
+ * (AAP 0.4.2) — so this hint describes a configuration that asked for the tree
+ * alone.
+ */
+const COMPONENT_TREE_UNAVAILABLE_HINT =
+  'A component tree is taken from the React commits this document produced, so the react hook has to be enabled alongside componentTree.';
+
+/** The reason text for a family that was asked for and did not attach. */
+const HOOK_FAILED_REASON = 'the hook did not attach in this document';
+
+/** One signal a capture asked for and cannot have. */
+interface UnavailableSignal {
+  /** The signal's wire name, as the service's vocabulary spells it. */
+  signal: string;
+  /** What happened, in one clause. */
+  reason: string;
+  /** What the developer can do about it. */
+  hint: string;
+}
+
+/**
+ * The signals this document is currently supplying, in {@link HOOK_FLAGS}
+ * order.
+ *
+ * Built from the families' own predicates rather than from the configuration,
+ * so the list the service shows after "Continuing with:" is what the capture
+ * will actually contain. `componentTree` joins it only when the request can be
+ * met, which is the same condition {@link maybeEmitComponentTreeSnapshot}
+ * applies.
+ */
+function enabledSignalNames(): HookFlag[] {
+  const attached = new Set<HookFlag>();
+
+  for (const name of HOOK_NAMES) {
+    const signal = HOOK_SIGNALS[name];
+    if (signal !== undefined && isHookAttached(name)) {
+      attached.add(signal);
+    }
+  }
+
+  if (componentTreeRequested && isHookAttached('react')) {
+    attached.add('componentTree');
+  }
+
+  return HOOK_FLAGS.filter((flag) => attached.has(flag));
+}
+
+/**
  * Tell the service which requested signals are unavailable.
  *
- * Reported once per capture per hook (see {@link failedHooks}), as an
- * `agent.error` frame rather than as telemetry: a missing signal is a fact
- * about the capture's coverage, and AAP 0.5.5 requires it to be surfaced
- * instead of leaving the analysis to be drawn from evidence nobody said was
- * incomplete.
+ * Reported as an `agent.error` frame rather than as telemetry: a missing
+ * signal is a fact about the capture's *coverage*, and AAP 0.5.5 requires it to
+ * be surfaced instead of leaving the analysis to be drawn from evidence nobody
+ * said was incomplete. Every `signal` here is a name from the service's own
+ * capture-signal vocabulary; see {@link HOOK_SIGNALS}.
  *
- * @param failures The hooks that were asked for and did not attach.
+ * @param entries The signals that were asked for and cannot be supplied.
  */
-function reportUnavailableHooks(failures: readonly HookName[]): void {
-  if (failures.length === 0) {
+function reportUnavailableSignals(entries: readonly UnavailableSignal[]): void {
+  if (entries.length === 0) {
     return;
   }
 
   postControl('agent.error', {
     code: 'hooks-unavailable',
-    message: `the page agent could not enable: ${failures.join(', ')}`,
+    message: `the page agent could not enable: ${entries.map((entry) => entry.signal).join(', ')}`,
     sessionId: armedSessionId ?? null,
     captureId: armedCaptureId ?? null,
-    unavailable: failures.map((signal) => ({
+    unavailable: entries.map((entry) => ({ ...entry })),
+    enabled: enabledSignalNames(),
+  });
+}
+
+/**
+ * Report a support family that could not be armed.
+ *
+ * A separate frame with its own code, because these families are not capture
+ * signals (see {@link HOOK_SIGNALS}) and must not arrive where the service
+ * expects one. It is still reported rather than swallowed: a capture whose
+ * lineage registry never armed produces a subtly different trace shape, and
+ * that is worth a line in the session log.
+ *
+ * @param failures The support families that were asked for and did not attach.
+ */
+function reportUnavailableFamilies(failures: readonly HookName[]): void {
+  if (failures.length === 0) {
+    return;
+  }
+
+  postControl('agent.error', {
+    code: 'agent-family-unavailable',
+    message: `the page agent could not arm: ${failures.join(', ')}`,
+    sessionId: armedSessionId ?? null,
+    captureId: armedCaptureId ?? null,
+    families: failures.map((family) => ({
+      family,
+      reason: HOOK_FAILED_REASON,
+      hint: HOOK_UNAVAILABLE_HINTS[family],
+    })),
+    enabled: enabledSignalNames(),
+  });
+}
+
+/**
+ * Report the families that were asked for and did not attach.
+ *
+ * Reported once per capture per family (see {@link failedHooks}), split by
+ * whether the family carries a capture signal so that each half reaches the
+ * service under the shape it can read.
+ *
+ * @param failures The families that were asked for and did not attach.
+ */
+function reportUnavailableHooks(failures: readonly HookName[]): void {
+  const signals: UnavailableSignal[] = [];
+  const families: HookName[] = [];
+
+  for (const name of failures) {
+    const signal = HOOK_SIGNALS[name];
+    if (signal === undefined) {
+      families.push(name);
+      continue;
+    }
+    signals.push({ signal, reason: HOOK_FAILED_REASON, hint: HOOK_UNAVAILABLE_HINTS[name] });
+  }
+
+  reportUnavailableSignals(signals);
+  reportUnavailableFamilies(families);
+}
+
+/**
+ * Tell the service its component-tree request cannot be met in this document.
+ *
+ * Once per capture (see {@link componentTreeRefusalReported}). The alternative
+ * — staying silent — is what AAP 0.5.5 forbids: the panel would render a
+ * `componentTree` node with nothing behind it and the developer would have no
+ * way to tell "this page has no such structure" from "nobody collected it".
+ */
+function reportComponentTreeRefused(): void {
+  if (componentTreeRefusalReported) {
+    return;
+  }
+  componentTreeRefusalReported = true;
+
+  reportUnavailableSignals([
+    {
+      signal: 'componentTree',
+      reason: 'the react hook is not attached in this document',
+      hint: COMPONENT_TREE_UNAVAILABLE_HINT,
+    },
+  ]);
+}
+
+/**
+ * What a hook that would not release is still holding, and how to be rid of it,
+ * per signal.
+ *
+ * The counterpart of {@link HOOK_UNAVAILABLE_HINTS}, and written for the same
+ * reader: these strings reach the developer, so each one names what survives
+ * in their page and the remedy that is certain to work rather than restating
+ * the failure. Every remedy is a fresh document or a fresh process, because
+ * nothing the agent can still call is trustworthy at this point — the call
+ * that was supposed to release the hook is the one that just failed.
+ */
+const HOOK_UNRELEASED_HINTS: Readonly<Record<HookName, string>> = Object.freeze({
+  domTarget:
+    'Element description is a flag on this document and holds no page resource; nothing survives a detach.',
+  continuation: 'The async-lineage registry holds no page resource; nothing survives a detach.',
+  interactions:
+    'Pointer and keyboard listeners are still registered on this page. Reload the tab to remove them.',
+  fetch:
+    'window.fetch or XMLHttpRequest is still wrapped. Reload the tab to restore the original functions.',
+  state:
+    'State transitions are still being recorded; they are released with the React hook. Reload the tab.',
+  react:
+    'The React commit callbacks are still installed, so renders are still being observed. Reload the tab to clear them.',
+  perf: 'One or more PerformanceObservers are still registered. Reload the tab to release them.',
+  errors:
+    'The error and unhandled-rejection listeners are still registered on this page. Reload the tab to remove them.',
+});
+
+/**
+ * Tell the service which hooks refused to release.
+ *
+ * The other half of {@link reportUnavailableHooks}, and the more serious one:
+ * an unavailable signal is evidence the capture never had, while an unreleased
+ * one is instrumentation still running in the developer's page after they
+ * ended their capture. AAP 0.5.1 requires a cleared hook to be *disabled*
+ * rather than idled, so a hook that still reports itself attached after its
+ * own `detach()` ran is a fact the developer has to be given — they are the
+ * only party that can act on it, by reloading the page or restarting the dev
+ * server.
+ *
+ * Two states are announced, and the distinction is in each entry's `reason`
+ * because the developer's remedy is the same but the diagnosis is not:
+ *
+ * - the hook **still reports itself attached** after its own `detach()` ran,
+ *   so it is still observing; and
+ * - the hook **disarmed its gate but left a registration behind** — a listener
+ *   the page refused to remove, an observer that would not disconnect, a
+ *   prototype slot that would not take its original back. Its
+ *   `is…Attached()` says `false`, truthfully, because it is no longer
+ *   observing; {@link hookHasResidue} is what sees the rest. Announcing only
+ *   the first state would have this frame conclude, from a predicate that
+ *   answers a different question, that everything came off.
+ *
+ * Reported **once per capture** (see {@link reportedUnreleasedHooks}), the way
+ * {@link failedHooks} bounds the unavailable report: a hook that refuses to
+ * detach refuses on every attempt, and a re-sent configuration or a second
+ * disarm must not repeat the same frame for the rest of the capture. The
+ * producer's own `producer-failure` frame names the step that failed; this one
+ * names the signal that is still in the page.
+ *
+ * Posted before the transport is reset, so the frame carries the session and
+ * capture it belongs to — which is why {@link disarm} detaches the hooks
+ * before it calls `resetTransport()`.
+ *
+ * @param candidates The hooks whose `detach()` was called and which were
+ * therefore expected to be released; any that still report themselves attached,
+ * or that still hold a registration, are announced.
+ */
+function reportUnreleasedHooks(candidates: readonly HookName[]): void {
+  const unreleased = candidates.filter(
+    (name) => (isHookAttached(name) || hookHasResidue(name)) && !reportedUnreleasedHooks.has(name),
+  );
+
+  if (unreleased.length === 0) {
+    return;
+  }
+
+  for (const name of unreleased) {
+    reportedUnreleasedHooks.add(name);
+  }
+
+  postControl('agent.error', {
+    code: 'hooks-not-released',
+    message: `the page agent could not release: ${unreleased.join(', ')}`,
+    sessionId: armedSessionId ?? null,
+    captureId: armedCaptureId ?? null,
+    unreleased: unreleased.map((signal) => ({
       signal,
-      reason: 'the hook did not attach in this document',
-      hint: HOOK_UNAVAILABLE_HINTS[signal],
+      reason: isHookAttached(signal)
+        ? 'the hook still reports itself attached after detach'
+        : 'the hook stopped observing but the page kept a registration it could not remove',
+      hint: HOOK_UNRELEASED_HINTS[signal],
     })),
     enabled: attachedHookNames(),
   });
@@ -898,13 +1555,32 @@ function reactIsRegistered(): boolean {
  * its buffering state, and a frame posted before the bridge's listener existed
  * is simply lost — which is what `bridge.ready` re-announcement covers.
  *
+ * **The payload is exactly these five fields, and nothing may be added to it
+ * here.** AAP 0.4.2 defines `agent.ready` as
+ * `{ tabId, documentId, producerId, url, installedBeforeReact, reactDetected }`
+ * — the page supplies five and the service worker adds `tabId` — and
+ * `./transport.js` documents the same five for this control frame. The shape is
+ * validated at the far end against one shared schema, so a field this producer
+ * invents is not extra information: it is a frame the service can refuse, and
+ * with it the configuration that would have armed the capture. Widening the
+ * contract means changing the shared schema and every relay and consumer
+ * *first*; until then {@link AGENT_VERSION} and the recorded `readyState` stay
+ * local diagnostics (see {@link bootstrap}'s closing log).
+ *
  * **No `tabId`.** A page has no notion of a tab; the service worker relays
  * this frame under the tab's own connection and adds it (AAP 0.4.2). Inventing
  * one here would give the service two answers for the same field.
  *
  * `url` is raw and unredacted, because the service redacts URL query values at
  * ingest and needs the original to do it — and to map the URL onto a route in
- * the code graph (AAP 0.5.2).
+ * the code graph (AAP 0.5.2). Raw is not unbounded, though: a URL is page data
+ * of a length no page has to justify, and this frame is small enough that its
+ * size would otherwise be the page's to choose. It is passed through
+ * `./transport.ts`'s `boundControlText`, which leaves every ordinary URL
+ * untouched (the bound is several times the longest any server accepts) and
+ * truncates beyond it. The field set is unchanged — the service's schema is
+ * strict, so a bound is applied to the value and never announced as a second
+ * key.
  */
 function announceReady(): void {
   try {
@@ -914,11 +1590,9 @@ function announceReady(): void {
     postControl('agent.ready', {
       documentId: getDocumentId(),
       producerId: getProducerId(),
-      url: readLocationHref(),
+      url: boundControlText(readLocationHref()),
       installedBeforeReact,
       reactDetected,
-      agentVersion: AGENT_VERSION,
-      readyState: initialReadyState,
     });
 
     debugLog('announced agent.ready', { installedBeforeReact, reactDetected });
@@ -1021,13 +1695,21 @@ function resubscribeToBridge(): void {
 }
 
 /**
- * Register the two flush hooks.
+ * Register the document listeners: two flush hooks and one restore hook.
  *
  * `pagehide` is the last moment a document can hand anything to the bridge,
  * and `visibilitychange` covers the tab the developer switches away from and
  * never returns to. Both belong to the document rather than to a capture, so
  * they are registered once and outlive every arm and disarm; {@link flush} is
  * a no-op while nothing is buffered, so a dormant agent pays nothing for them.
+ *
+ * `pagehide` carries a second duty: it releases the document-scoped families
+ * (see {@link HookScope}), because that is the only teardown a content script
+ * has — there is no unload hook a bundle like this may take. `pageshow` is its
+ * counterpart: a document restored from the back/forward cache re-arms them,
+ * so element description follows the document it describes. Both calls are
+ * idempotent, so the `pageshow` that fires on an ordinary load changes
+ * nothing.
  *
  * **Not `beforeunload`.** It blocks navigation, disqualifies the page from the
  * back/forward cache, and is precisely the kind of side effect an
@@ -1038,12 +1720,25 @@ function installFlushHooks(): void {
     if (typeof window !== 'undefined' && pageHideListener === undefined) {
       const listener = (): void => {
         flush();
+        detachDocumentHooks();
       };
       window.addEventListener('pagehide', listener);
       pageHideListener = listener;
     }
   } catch {
     pageHideListener = undefined;
+  }
+
+  try {
+    if (typeof window !== 'undefined' && pageShowListener === undefined) {
+      const listener = (): void => {
+        attachDocumentHooks();
+      };
+      window.addEventListener('pageshow', listener);
+      pageShowListener = listener;
+    }
+  } catch {
+    pageShowListener = undefined;
   }
 
   try {
@@ -1080,16 +1775,28 @@ function installFlushHooks(): void {
  */
 
 /**
- * The longest serialized tree this module will post: 128 KiB of JSON text.
+ * The attribute keys the snapshot travels under, bound from the catalog.
  *
- * Two ceilings sit above it and both would cost the whole event rather than
- * trimming it: `./transport.ts` refuses a frame larger than 512 KiB, and
- * `../aggregate/renders.ts` refuses serialized text longer than 512 KiB. A
- * quarter of that leaves room for the rest of the batch and is still several
- * times any tree worth reading — `./react.ts` caps a snapshot at 2 000 nodes,
- * which serialises to well under this.
+ * `../schema/attributes.ts` declares these three as the component-tree
+ * contract and spreads them into the `log` kind's key tuple, so each is
+ * annotated with that tuple's member union: a rename there is a compile error
+ * here rather than a snapshot `../aggregate/renders.ts` silently stops
+ * finding. The same three strings are read by the redactor's component-tree
+ * handler and by that aggregate, and this is the only place this module names
+ * them.
  */
-const MAX_SERIALIZED_TREE_CHARS = 128 * 1024;
+type ComponentTreeAttributeKey = (typeof COMPONENT_TREE_ATTRIBUTE_KEYS)[number];
+
+/**
+ * The forest as JSON text, bounded by {@link MAX_COMPONENT_TREE_JSON_CHARS}.
+ */
+const KEY_COMPONENT_TREE: ComponentTreeAttributeKey = 'componentTree';
+
+/** How many nodes that text carries, so a consumer need not parse to count. */
+const KEY_COMPONENT_TREE_NODE_COUNT: ComponentTreeAttributeKey = 'componentTreeNodeCount';
+
+/** Set when a bound below the requested one had to be used. */
+const KEY_COMPONENT_TREE_TRUNCATED: ComponentTreeAttributeKey = 'componentTreeTruncated';
 
 /**
  * Node bound for the second attempt, when the first serialised too large.
@@ -1160,7 +1867,7 @@ function serializeTree(tree: ComponentTreeNode): string | undefined {
 
 /** A snapshot and its measurements, as {@link takeComponentTree} resolved them. */
 interface SerializedTree {
-  /** The tree as JSON text, bounded by {@link MAX_SERIALIZED_TREE_CHARS}. */
+  /** The tree as JSON text, bounded by {@link MAX_COMPONENT_TREE_JSON_CHARS}. */
   text: string;
   /** How many nodes that text carries. */
   nodeCount: number;
@@ -1170,6 +1877,13 @@ interface SerializedTree {
 
 /**
  * Take the snapshot and serialise it, retrying smaller if it is too large.
+ *
+ * The bound is {@link MAX_COMPONENT_TREE_JSON_CHARS}, the catalog's single
+ * declaration of how much serialized tree may travel, measured here in UTF-16
+ * code units. That is never fewer than the code points the catalog counts, so
+ * the test is conservative: a tree of astral characters is retried smaller
+ * slightly sooner than the bound's own unit would require, and nothing over
+ * the bound is ever posted.
  *
  * @param bounds The bounds the service asked for, if any.
  * @returns The serialized tree, or `undefined` when there is no tree to report
@@ -1182,7 +1896,7 @@ function takeComponentTree(bounds: TreeBounds): SerializedTree | undefined {
   }
 
   const firstText = serializeTree(first);
-  if (firstText !== undefined && firstText.length <= MAX_SERIALIZED_TREE_CHARS) {
+  if (firstText !== undefined && firstText.length <= MAX_COMPONENT_TREE_JSON_CHARS) {
     return { text: firstText, nodeCount: countTreeNodes(first), reduced: false };
   }
 
@@ -1192,7 +1906,7 @@ function takeComponentTree(bounds: TreeBounds): SerializedTree | undefined {
   }
 
   const secondText = serializeTree(second);
-  if (secondText === undefined || secondText.length > MAX_SERIALIZED_TREE_CHARS) {
+  if (secondText === undefined || secondText.length > MAX_COMPONENT_TREE_JSON_CHARS) {
     return undefined;
   }
 
@@ -1234,13 +1948,35 @@ function snapshotTree(
  * which is what makes the tree the *last* committed structure rather than a
  * reconstruction.
  *
+ * ## The catalogued contract
+ *
+ * `../schema/attributes.ts` declares the whole of it, and this function writes
+ * exactly that: the event's `name` is {@link COMPONENT_TREE_EVENT_NAME}, which
+ * is what identifies this record among `log` records, and the three
+ * {@link COMPONENT_TREE_ATTRIBUTE_KEYS} carry the forest
+ * ({@link KEY_COMPONENT_TREE}), its node count
+ * ({@link KEY_COMPONENT_TREE_NODE_COUNT}) and whether a bound below the
+ * requested one had to be used ({@link KEY_COMPONENT_TREE_TRUNCATED}). The
+ * kind stays `log`: `../schema/kinds.ts` fixes the kind vocabulary, and a
+ * snapshot is a correlated record rather than a new signal type.
+ *
+ * `../aggregate/renders.ts` is the consumer. It selects the latest event with
+ * this name, parses {@link KEY_COMPONENT_TREE} and reports the result as the
+ * `componentTree` data source with origin `commit-snapshot`, folding
+ * {@link KEY_COMPONENT_TREE_TRUNCATED} into the snapshot's own `truncated` and
+ * `degraded` flags — so a reduced tree reaches the panel presented as reduced.
+ * On the way there `../redaction/redactor.ts` recognises
+ * {@link KEY_COMPONENT_TREE} by name, keeps the structural fields, bounds
+ * every component name and React key inside the document and re-serialises
+ * valid JSON; the generic string rules it would otherwise have taken cut a
+ * value to a 120-code-point preview, which no parser can read back.
+ *
  * **The tree travels as JSON text, and that is not incidental.**
  * `./transport.ts` rebuilds every attribute bag into clone-safe values and
  * replaces any container nested deeper than two levels with a type tag, so a
  * component tree posted as a nested object would arrive with its
- * grandchildren's children erased. Text is immune to that walk, stays within
- * one attribute, and is exactly what `../aggregate/renders.ts` accepts for
- * this reason ("the structure itself, and the structure as JSON text").
+ * grandchildren's children erased. Text is immune to that walk and stays
+ * within one attribute.
  *
  * The event is attributed like any other: {@link resolveEventContext} decides
  * which trace it joins, so a snapshot taken while an interaction is still open
@@ -1262,9 +1998,9 @@ function emitComponentTreeSnapshot(bounds: TreeBounds): void {
       'log.level': 'info',
       'log.message': 'component tree at capture stop',
       'logger.name': 'debuggen.agent',
-      tree: snapshot.text,
-      nodeCount: snapshot.nodeCount,
-      truncated: snapshot.reduced,
+      [KEY_COMPONENT_TREE]: snapshot.text,
+      [KEY_COMPONENT_TREE_NODE_COUNT]: snapshot.nodeCount,
+      [KEY_COMPONENT_TREE_TRUNCATED]: snapshot.reduced,
     };
 
     const draft: EventDraft = {
@@ -1295,6 +2031,45 @@ function emitComponentTreeSnapshot(bounds: TreeBounds): void {
   }
 }
 
+/**
+ * Take the component-tree snapshot **only if the capture asked for one**.
+ *
+ * The single gate in front of {@link emitComponentTreeSnapshot}, and the whole
+ * of what the seventh wire flag does. Two conditions, both required:
+ *
+ * 1. **The live configuration set `componentTree`.** The flag is separate from
+ *    `react` on the wire precisely so that a capture can have render counts
+ *    without paying for a tree (AAP 0.4.2), so an unrequested snapshot is work
+ *    the developer did not ask for in a page this product is only visiting —
+ *    and an event nothing in the panel would read.
+ * 2. **The React family is attached.** The snapshot walks the fiber root
+ *    `./react.js` retains from the commits it observed, so without that family
+ *    there is nothing to walk. This is a *prerequisite*, never a reason to arm
+ *    React: arming a signal the configuration did not request is the other
+ *    half of the same mistake. A request that fails it is reported once per
+ *    capture instead (AAP 0.5.5).
+ *
+ * @param trigger Why the snapshot was attempted, for the diagnostics log.
+ * @param bounds The bounds to walk under — the live configuration's for a
+ * capture that is stopping, the requesting frame's for an on-demand snapshot.
+ * @returns `true` when a snapshot was attempted.
+ */
+function maybeEmitComponentTreeSnapshot(trigger: string, bounds: TreeBounds): boolean {
+  if (!componentTreeRequested) {
+    debugLog('component tree was not requested by this capture', { trigger });
+    return false;
+  }
+
+  if (!isHookAttached('react')) {
+    debugLog('component tree needs the react hook', { trigger });
+    reportComponentTreeRefused();
+    return false;
+  }
+
+  emitComponentTreeSnapshot(bounds);
+  return true;
+}
+
 /*
  * ---------------------------------------------------------------------------
  * Arming and disarming
@@ -1307,40 +2082,103 @@ function emitComponentTreeSnapshot(bounds: TreeBounds): void {
  * The five steps of AAP 0.5.1's arming contract, in an order that is itself
  * the contract:
  *
- * 1. **Transport identity first.** A hook can fire during the very attach that
- *    registers it — React commits on its own schedule, a buffered
- *    `PerformanceObserver` flushes as soon as it is started — so the transport
- *    must already know the session and capture. A changed `captureId` also
- *    restarts the sequence there, which is why nothing may be emitted before
- *    this call.
- * 2. **The span helper.** Armed before the producers, so a patched application
- *    function that runs mid-attach is recorded rather than passed through.
- * 3. **Per-capture counters, only for a new capture.** `renderCount`,
- *    `render_count` and the state-transition budget are scoped to the capture,
- *    and the service worker re-sends the live configuration after every
- *    reconnect and after every same-origin navigation. Resetting on a re-send
- *    would zero a running capture's counts halfway through the interaction the
- *    developer is reproducing.
- * 4. **Hooks, detached before attached, each in its own guard.** Detaching
- *    first releases what is no longer wanted before anything new starts
- *    observing; attaching in {@link HOOK_NAMES} order means interaction
- *    context exists before the producers that ask for it.
- * 5. **Unavailable signals are announced.** A hook that would not attach is
- *    reported as an `agent.error` frame, once per capture, so the service can
- *    say which evidence the capture does not have (AAP 0.5.5) instead of the
- *    analysis being drawn from a silently narrower set.
+ * 1. **Per-capture state, only for a new capture.** `renderCount`,
+ *    `render_count`, the state-transition budget, the once-per-capture
+ *    refusal reports and `./fetch.js`'s producer generation are scoped to the
+ *    capture, and the service worker re-sends the live configuration after
+ *    every reconnect and after every same-origin navigation. Resetting on a
+ *    re-send would zero a running capture's counts halfway through the
+ *    interaction the developer is reproducing, and would throw away the events
+ *    of every request still on the wire.
+ *
+ *    A capture boundary that is *not* a stop is the case this step exists for:
+ *    `agent.config` can move the bound tab from capture A to capture B with
+ *    every hook still enabled, so nothing detaches and nothing re-attaches. A
+ *    request on the wire from capture A would otherwise settle inside capture B
+ *    and be reported there, carrying B's `captureId` and a number from B's
+ *    restarted sequence (AAP 0.2.3 scopes `seq` to `(producerId, captureId)`).
+ * 2. **The span helper, with the capture's identity.** Armed before the
+ *    producers, so a patched application function that runs mid-attach is
+ *    recorded rather than passed through — and armed *for a named capture*,
+ *    which is the second half of step 1: a patched `async` function is the
+ *    other producer whose work outlives the synchronous extent of a capture,
+ *    and naming the capture is what makes the helper drop a span that settles
+ *    after this one has been replaced.
+ * 3. **The new identity is published only once both are invalidated.** The
+ *    module's own `armedCaptureId`, and the transport's session and capture,
+ *    are written after steps 1 and 2 rather than before them — the ordering is
+ *    a safety property. Everything before this point leaves the outgoing
+ *    capture's identity in force, so a step that failed would abort the
+ *    transition with nothing mis-attributed and with `armedCaptureId` still
+ *    naming the old capture, which makes the next `agent.config` — the same one
+ *    the service worker re-sends — retry the whole transition instead of
+ *    treating it as already done. Publishing first would leave the transport
+ *    stamping capture B while a producer was still recording under capture A's
+ *    generation, which is the leak steps 1 and 2 exist to close. The transport
+ *    is still told before any hook attaches, which is what that ordering
+ *    requirement is for: a hook can fire during the very attach that registers
+ *    it — React commits on its own schedule, a buffered `PerformanceObserver`
+ *    flushes as soon as it is started — so nothing may be emitted before the
+ *    transport knows the session and capture. A changed `captureId` also
+ *    restarts the sequence there.
+ * 4. **Capture-scoped families, detached before attached, each in its own
+ *    guard.** Detaching first releases what is no longer wanted before
+ *    anything new starts observing; attaching in {@link HOOK_NAMES} order
+ *    means the lineage registry and the interaction context exist before the
+ *    producers that ask for them. Document-scoped families are untouched: the
+ *    opening sequence owns them (see {@link HookScope}).
+ * 5. **The component-tree authorisation is stored, not acted on.** The
+ *    seventh flag arms no observer; it authorises the one snapshot
+ *    {@link maybeEmitComponentTreeSnapshot} takes as the capture stops, and a
+ *    request that cannot be met — no React family attached — is reported here
+ *    rather than discovered silently at capture stop.
+ * 6. **Unavailable and unreleased signals are announced.** A family that would
+ *    not attach is reported as an `agent.error` frame, once per capture, so
+ *    the service can say which evidence the capture does not have (AAP 0.5.5)
+ *    instead of the analysis being drawn from a silently narrower set — and a
+ *    family this configuration dropped that still reports itself attached, or
+ *    that left a registration behind, is reported the same way, because
+ *    instrumentation the developer switched off and that kept running is
+ *    theirs to know about (AAP 0.5.1, {@link reportUnreleasedHooks}).
  *
  * Idempotent by construction: every decision is taken against the siblings'
  * own `is…Attached()` predicates and against {@link armedCaptureId}, never
  * against a diff of the raw payload, so the same configuration applied twice
- * changes nothing and a subset detaches exactly the hooks it dropped.
+ * changes nothing and a subset detaches exactly the families it dropped.
  */
 function arm(config: ParsedAgentConfig): void {
   const captureChanged = config.captureId !== armedCaptureId;
 
+  if (captureChanged) {
+    failedHooks.clear();
+    reportedUnreleasedHooks.clear();
+    componentTreeRefusalReported = false;
+    // Requests already on the wire belong to the capture that has just ended.
+    // Nothing detaches here — the developer is still capturing requests, and
+    // `./fetch.js` keeps both patches installed — so the producer generation is
+    // advanced instead, which makes every in-flight record stale: no event, no
+    // continuation settle, no counter movement.
+    advanceFetchGeneration();
+    resetReactCounters();
+    resetStateCounters();
+    resetContinuations();
+  }
+
+  // The capture identity goes in with the arming, not just the `true`: the
+  // helper stamps every span it opens with the capture it opened in and refuses
+  // to report one that settles in a different one. Passing the id is what tells
+  // it a boundary happened at all — without it, a patched `async` function
+  // whose promise settles after the tab moved from one capture to the next
+  // would be reported inside the capture that replaced its own.
+  setSpanHelperEnabled(true, config.captureId);
+
+  // Published only now, with every producer of the outgoing capture already
+  // invalidated above: see step 3 of this function's documentation for why the
+  // order is a safety property and not a preference.
   armedSessionId = config.sessionId;
   armedCaptureId = config.captureId;
   treeBounds = config.tree;
+  componentTreeRequested = config.hooks.componentTree;
 
   configureTransport({
     sessionId: config.sessionId,
@@ -1348,24 +2186,32 @@ function arm(config: ParsedAgentConfig): void {
     enabled: true,
   });
 
-  setSpanHelperEnabled(true);
-
-  if (captureChanged) {
-    failedHooks.clear();
-    resetReactCounters();
-    resetStateCounters();
-    resetContinuations();
-  }
-
+  // The families this configuration drops. Collected rather than merely
+  // detached, because a family that refused to release has to be announced
+  // (AAP 0.5.1) and the announcement can only name the families a detach was
+  // actually asked of.
+  //
+  // A detach is asked of every dropped family, not only of the ones that report
+  // themselves attached. A producer whose previous teardown could not remove a
+  // listener, disconnect an observer or restore a prototype slot retains that
+  // residue *and* reports itself unattached — `is…Attached()` means
+  // "observing", and a disarmed registration observes nothing — so gating this
+  // call on `isHookAttached` would be the one thing that never lets the retry
+  // happen, leaving the residue in the developer's page for the life of the
+  // document. Every producer's `detach()` is documented idempotent and
+  // non-throwing, so asking twice costs nothing and is the only way the
+  // retained cleanup is ever completed.
+  const released: HookName[] = [];
   for (const name of reversedHookNames()) {
-    if (!config.hooks[name] && isHookAttached(name)) {
+    if (!isHookRequested(name, config.hooks)) {
       detachHook(name);
+      released.push(name);
     }
   }
 
   const failures: HookName[] = [];
-  for (const name of HOOK_NAMES) {
-    if (!config.hooks[name] || isHookAttached(name) || failedHooks.has(name)) {
+  for (const name of CAPTURE_HOOK_NAMES) {
+    if (!isHookRequested(name, config.hooks) || isHookAttached(name) || failedHooks.has(name)) {
       continue;
     }
     if (!attachHook(name)) {
@@ -1374,12 +2220,27 @@ function arm(config: ParsedAgentConfig): void {
     }
   }
 
+  // Both announcements are made here, after the attach loop, so that the
+  // `enabled` list each frame carries is what the capture is actually
+  // continuing with (AAP 0.5.5's "Continuing with: ‹enabled list›") rather
+  // than a mid-arm snapshot taken before the new hooks were armed.
+  reportUnreleasedHooks(released);
   reportUnavailableHooks(failures);
+
+  // The tree is taken at capture stop, so a request that cannot be met is
+  // worth saying now: the developer is about to reproduce their problem, and
+  // "the tree is missing" is not something to learn from an empty panel node
+  // afterwards.
+  if (componentTreeRequested && !isHookAttached('react')) {
+    reportComponentTreeRefused();
+  }
 
   debugLog('armed', {
     sessionId: config.sessionId ?? null,
     captureId: config.captureId ?? null,
     attached: attachedHookNames(),
+    signals: enabledSignalNames(),
+    componentTree: componentTreeRequested,
     unavailable: failures,
   });
 }
@@ -1390,14 +2251,24 @@ function arm(config: ParsedAgentConfig): void {
  * The order is AAP 0.5.1's cleanup sequence and each step depends on the one
  * before it:
  *
- * 1. **The component-tree snapshot, while React is still attached** and the
- *    transport still carries the ending capture — after either, the structure
- *    is gone and the event would be dropped.
+ * 1. **The component-tree snapshot, if the capture authorised one** and while
+ *    React is still attached and the transport still carries the ending
+ *    capture — after either, the structure is gone and the event would be
+ *    dropped. {@link maybeEmitComponentTreeSnapshot} is the gate.
  * 2. **A flush**, so what the capture already recorded leaves before the
  *    transport stops accepting anything.
- * 3. **Detach in reverse attach order**, so interaction context outlives the
- *    producers that resolve against it and nothing resolves a trace from a
- *    half-released window.
+ * 3. **Detach every capture-scoped family in reverse attach order**, so
+ *    interaction context outlives the producers that resolve against it and
+ *    nothing resolves a trace from a half-released window. Unconditionally,
+ *    not only the families whose predicate says they are attached: every
+ *    sibling's `detach` is idempotent, and "disabled, not merely idled"
+ *    (AAP 0.5.1) is a guarantee that must not rest on a predicate being
+ *    accurate. Each detach runs in its own guard, and whatever is still
+ *    attached — or still holds a registration — afterwards is announced while
+ *    the session and capture are still known (see
+ *    {@link reportUnreleasedHooks}). Document-scoped families survive — they
+ *    belong to the document, and the panel still selects elements between
+ *    captures.
  * 4. **Reset the shared state and the transport.** `resetTransport()` also
  *    drops this module's subscription, so the inbound channel is immediately
  *    re-made (see {@link resubscribeToBridge}).
@@ -1409,16 +2280,14 @@ function arm(config: ParsedAgentConfig): void {
  * Afterwards this agent holds no observer, no patch, no bippy subscription, no
  * timer and no buffered event; `window.fetch` is the page's own function
  * again. What remains is exactly the dormant state of the opening sequence —
- * the installed hook, the inert helper, the bridge subscription and the two
- * flush listeners — none of which observes the developer's application.
+ * the installed hook, the inert helper, element description, the bridge
+ * subscription and the flush listeners — none of which observes the
+ * developer's application.
  */
 function disarm(): void {
   const wasArmed = armedCaptureId !== undefined;
-  const reactWasAttached = isHookAttached('react');
 
-  if (reactWasAttached) {
-    emitComponentTreeSnapshot(treeBounds);
-  }
+  maybeEmitComponentTreeSnapshot('capture-stop', treeBounds);
 
   try {
     flush();
@@ -1427,13 +2296,21 @@ function disarm(): void {
     // the honest outcome for events the bridge never took.
   }
 
+  // Every hook, whatever it says about itself: see the same loop in
+  // {@link arm} for why an unattached hook is still asked to detach. A
+  // producer holding residue from a teardown the page refused reports itself
+  // unattached, and this call is its only chance to try again.
   for (const name of reversedHookNames()) {
-    if (isHookAttached(name)) {
-      detachHook(name);
-    }
+    detachHook(name);
   }
 
-  resetContinuations();
+  // Before `resetTransport()` below, and deliberately: a family still holding
+  // on after its own `detach()` is instrumentation left running in the
+  // developer's page, and the frame that says so is only useful if it still
+  // carries the session and capture it belongs to. Every capture-scoped family
+  // is a candidate here because a detach was asked of every one of them.
+  reportUnreleasedHooks(CAPTURE_HOOK_NAMES);
+
   resetSpanStack();
   setSpanHelperEnabled(false);
   configureTransport({ enabled: false });
@@ -1443,6 +2320,8 @@ function disarm(): void {
   failedHooks.clear();
   armedSessionId = undefined;
   armedCaptureId = undefined;
+  componentTreeRequested = false;
+  componentTreeRefusalReported = false;
   treeBounds = { maxNodes: undefined, maxDepth: undefined };
 
   // A pending re-check would be a timer held by a dormant agent, so it is
@@ -1456,9 +2335,16 @@ function disarm(): void {
   }
 }
 
-/** {@link HOOK_NAMES} in detach order. A fresh array; the constant is frozen. */
+/**
+ * The capture-scoped families in detach order.
+ *
+ * A fresh array, because {@link CAPTURE_HOOK_NAMES} is frozen — and
+ * capture-scoped only, because the document-scoped families are released by
+ * {@link detachDocumentHooks} when the document goes away rather than when a
+ * capture ends.
+ */
 function reversedHookNames(): HookName[] {
-  return [...HOOK_NAMES].reverse();
+  return [...CAPTURE_HOOK_NAMES].reverse();
 }
 
 /*
@@ -1523,21 +2409,29 @@ export function applyConfig(payload: unknown): void {
  *
  * For tests and for diagnostics; nothing in the product's runtime depends on
  * it. `installed` is false in a second evaluation of the bundle that stood
- * down, `armed` reflects a live capture even when every hook it asked for
+ * down, `armed` reflects a live capture even when every family it asked for
  * turned out to be unavailable (the span helper and the transport are still
  * armed, so patched function spans still flow), and `hooks` is read from the
  * siblings' own predicates rather than from a record of what was requested.
+ *
+ * `hooks` carries **all eight families** — including the two no wire flag
+ * names — because that is the lifecycle this module is answerable for: a
+ * family missing from this record is a family nothing can prove was released.
+ * `componentTreeRequested` is the seventh flag's state, which has no family of
+ * its own (see {@link maybeEmitComponentTreeSnapshot}).
  */
 export function getAgentState(): {
   installed: boolean;
   armed: boolean;
   hooks: Record<string, boolean>;
+  componentTreeRequested: boolean;
   installedBeforeReact: boolean;
 } {
   return {
     installed,
     armed: armedCaptureId !== undefined,
-    hooks: hookRecord((name) => isHookAttached(name)),
+    hooks: familyRecord((name) => isHookAttached(name)),
+    componentTreeRequested,
     installedBeforeReact,
   };
 }
@@ -1583,8 +2477,12 @@ function handleInbound(message: BridgeInboundMessage): void {
 
       case 'agent.snapshot':
         // An optional inbound the bridge may never send: the panel asking for
-        // the component tree mid-capture. Bounds may accompany the request.
-        emitComponentTreeSnapshot(readTreeBounds(message.payload));
+        // the component tree mid-capture. Bounds may accompany the request,
+        // and the same authorisation applies as at capture stop — the frame
+        // asks *when*, the `componentTree` flag decides *whether*, so a
+        // capture that did not request a tree cannot be made to produce one by
+        // a relayed frame.
+        maybeEmitComponentTreeSnapshot('agent.snapshot', readTreeBounds(message.payload));
         return;
 
       case 'target.request':
@@ -1642,12 +2540,21 @@ function describeCurrentTarget(payload: Record<string, unknown>): void {
  * `url`, so an extra key would be a validation failure at the service rather
  * than extra information.
  *
+ * The `domTarget` family is the gate: element description is a document-scoped
+ * capability (see {@link HOOK_BINDINGS}), armed by the opening sequence and
+ * released when the document goes away, so a call after that release answers
+ * `undefined` rather than describing a page that is no longer there.
+ *
  * @param element Whatever the caller had — `$0` is routinely `null`, a text
  * node, or an object from another realm.
- * @returns The descriptor, or `undefined` when the input is not an element.
+ * @returns The descriptor, or `undefined` when the input is not an element or
+ * the family is not attached.
  */
 function describeTargetForPanel(element: unknown): unknown {
   try {
+    if (!isHookAttached('domTarget')) {
+      return undefined;
+    }
     return describeElement(element);
   } catch {
     return undefined;
@@ -1704,7 +2611,21 @@ function bootstrap(): void {
     installedBeforeReact = false;
   }
 
-  // Step 2 — publish `globalThis.__DEBUGGEN__`, disabled. It must exist this
+  // Step 2a — arm the document-scoped families. Before the helper, because
+  // `domTarget` is what answers the `describeTarget` the helper is about to
+  // publish, and a capability published before it is armed would answer
+  // `undefined` to the panel's first selection. These families observe nothing
+  // on their own, so arming them here does not break the dormancy contract —
+  // it is what makes element selection work before a session has a plan
+  // (AAP 0.1.1, 0.4.2).
+  try {
+    attachDocumentHooks();
+  } catch {
+    // Each family's own predicate reports the failure; the sequence continues
+    // so that a page without a DOM still installs the helper and announces.
+  }
+
+  // Step 2b — publish `globalThis.__DEBUGGEN__`, disabled. It must exist this
   // early because a function patched by
   // `packages/instrumentation/src/patch/function-timing.ts` can run at any
   // moment and its wrapper's availability check must find a helper; leaving it
@@ -1757,8 +2678,15 @@ function bootstrap(): void {
 
   // Step 5 — dormant. No listener on the developer's application, no observer,
   // no patch, no bippy subscription and no buffered event until an
-  // `agent.config` arms one.
-  debugLog('installed', { installedBeforeReact, readyState: initialReadyState });
+  // `agent.config` arms one. The agent version and the recorded `readyState`
+  // are reported here rather than on the wire: `agent.ready`'s payload is the
+  // exact five fields of AAP 0.4.2 (see {@link announceReady}).
+  debugLog('installed', {
+    agentVersion: AGENT_VERSION,
+    installedBeforeReact,
+    readyState: initialReadyState,
+    documentHooks: DOCUMENT_HOOK_NAMES.filter((name) => isHookAttached(name)),
+  });
 }
 
 /*

@@ -517,6 +517,28 @@ export interface OpenProjectOptions {
    * file *contents* never are.
    */
   readonly logger?: Logger | undefined;
+
+  /**
+   * A discovery of this project's files from {@link discoverProjectFiles}, so
+   * the tree is walked once rather than twice.
+   *
+   * The path `./indexer.ts` takes: it discovers the file set first in order to
+   * fingerprint it and look the result up in the index cache, and on a miss it
+   * hands the discovery it already holds to this function instead of paying
+   * for a second `readdir` of every directory in the project.
+   *
+   * Used **only when it describes the same discovery inputs** as this call —
+   * the same normalised root, the same canonical root, the same resolved
+   * configuration path and the same {@link OpenProjectOptions.extraExcludes} —
+   * and otherwise ignored with one `warn` and replaced by a fresh walk. It is
+   * an optimisation and never a widening: every path it names is screened again
+   * — by {@link screenCandidatePath}, against the canonical root *this* call
+   * resolved — before a single one of them is read, which is the module
+   * documentation's third mechanism and is not weakened here. So a stale or
+   * hand-built discovery can make this function slower, or its file set
+   * smaller, and never less safe.
+   */
+  readonly discovered?: DiscoveredProject | undefined;
 }
 
 /**
@@ -618,6 +640,16 @@ export interface LoadedProject {
  *    whose real path leaves the project are unloaded from it, and what remains
  *    is sorted and frozen.
  *
+ * Steps 6 and 7's first half are exactly {@link discoverProjectFiles}, and a
+ * caller that has already run it — `./indexer.ts` does, to fingerprint the file
+ * set for the index cache before anything is parsed — passes the result as
+ * {@link OpenProjectOptions.discovered} and the walk is not repeated. Steps 1
+ * to 5 still run here, in this order, so a malformed configuration is still
+ * refused before the tree is touched and containment is still decided against a
+ * root resolved by *this* call; the supplied discovery is used only when it
+ * agrees with all of that, and every path in it is screened again before it is
+ * read.
+ *
  * Nothing a caller can pass makes this function throw. The failures it reports
  * and the codes they carry are listed on the module documentation above; each
  * `DebuggenError` also carries a `details.reason` for a caller that wants to
@@ -631,22 +663,11 @@ export function openProject(options: OpenProjectOptions): Result<LoadedProject> 
   const logger = options.logger ?? noopLogger;
   const extraExcludes = options.extraExcludes ?? EMPTY_EXCLUDES;
 
-  const normalizedRoot = normalizeProjectRoot(options.projectRoot);
-  if (isErr(normalizedRoot)) {
-    return normalizedRoot;
+  const identity = resolveProjectIdentity(options.projectRoot, options.tsConfigFilePath);
+  if (isErr(identity)) {
+    return identity;
   }
-  const projectRoot = normalizedRoot.value;
-
-  const directory = requireDirectory(projectRoot);
-  if (isErr(directory)) {
-    return directory;
-  }
-
-  const resolvedTsConfig = resolveTsConfigFilePath(projectRoot, options.tsConfigFilePath);
-  if (isErr(resolvedTsConfig)) {
-    return resolvedTsConfig;
-  }
-  const tsConfigFilePath = resolvedTsConfig.value;
+  const { projectRoot, tsConfigFilePath } = identity.value;
 
   const created = createProject(tsConfigFilePath);
   if (isErr(created)) {
@@ -675,10 +696,14 @@ export function openProject(options: OpenProjectOptions): Result<LoadedProject> 
 
   // Discovery yields candidate *paths* only and never follows a directory
   // link, so a tree outside the project is not even enumerated, let alone
-  // read.
-  const discovered = discoverCandidatePaths({
+  // read. A caller that has already discovered this project supplies the
+  // result and the walk is skipped; the paths are screened again below either
+  // way.
+  const discovered = discoveredCandidatePaths({
+    discovered: options.discovered,
     projectRoot,
     canonicalProjectRoot,
+    tsConfigFilePath,
     extraExcludes,
     logger,
   });
@@ -733,8 +758,240 @@ export function openProject(options: OpenProjectOptions): Result<LoadedProject> 
   return ok(Object.freeze(loaded));
 }
 
+/**
+ * What a project looks like before a single byte of it has been read: its
+ * identity, and the indexable files this module is willing to read.
+ *
+ * The cheap half of {@link openProject}, split out so that a caller which only
+ * needs to know *which files there are* — `./indexer.ts`, fingerprinting the
+ * file set to look an index up in the cache — does not have to pay for the
+ * expensive half, which is constructing a ts-morph program and parsing every
+ * one of those files. Produced by {@link discoverProjectFiles} and accepted
+ * back by {@link OpenProjectOptions.discovered}, so the walk that produced it
+ * is not repeated when the project does have to be opened after all.
+ *
+ * Immutable: the record and both path lists are frozen, and `extraExcludes` is
+ * a frozen copy rather than the caller's array, so a discovery cannot change
+ * under a consumer that is still fingerprinting it.
+ */
+export interface DiscoveredProject {
+  /**
+   * The project root as this module normalised it: absolute, POSIX
+   * separators, no trailing separator.
+   *
+   * The same value {@link LoadedProject.projectRoot} would carry for this
+   * root, which is what makes a cache key computed from a discovery and one
+   * computed from an opened project agree.
+   */
+  readonly projectRoot: string;
+
+  /**
+   * The project root with every symbolic link resolved — the base containment
+   * was decided against; see {@link resolveCanonicalRoot}.
+   */
+  readonly canonicalProjectRoot: string;
+
+  /**
+   * The configuration whose `compilerOptions` *would* apply, or `undefined`
+   * when the project has none.
+   *
+   * Resolved — the named file, or `tsconfig.json` in the root when it exists —
+   * but deliberately **not parsed**: parsing it is the first step of building a
+   * program, and a discovery builds no program. So a configuration that exists
+   * but is malformed is reported by {@link openProject} and not here.
+   */
+  readonly tsConfigFilePath: string | undefined;
+
+  /**
+   * The exclusions the walk was performed with, beyond
+   * {@link EXCLUDED_DIRECTORY_NAMES}.
+   *
+   * Carried so that {@link openProject} can tell whether a discovery it was
+   * handed describes the file set it is about to load; a different exclusion
+   * list is a different file set.
+   */
+  readonly extraExcludes: readonly string[];
+
+  /**
+   * The indexable files, absolute and POSIX, sorted ascending by
+   * project-relative path.
+   *
+   * Every one of them has passed {@link screenCandidatePath} — so no
+   * environment file, no path whose real location leaves the project and no
+   * path whose real location could not be established is in this list — and
+   * none of them has been opened. Same length and same order as
+   * {@link DiscoveredProject.relativeFiles}, and the same order
+   * {@link LoadedProject.sourceFiles} would return them in.
+   */
+  readonly files: readonly string[];
+
+  /**
+   * The same files in project-relative POSIX form, in the same order.
+   *
+   * The form every fingerprint, graph node and `SourceLocation` spells a file
+   * in, so a consumer that is building a cache key needs no path arithmetic of
+   * its own — and never has to handle an absolute developer path, which is the
+   * one form this package does not export.
+   */
+  readonly relativeFiles: readonly string[];
+}
+
+/** How {@link discoverProjectFiles} should walk a project. */
+export interface DiscoverProjectFilesOptions {
+  /** The absolute path of the project, as {@link OpenProjectOptions.projectRoot}. */
+  readonly projectRoot: string;
+
+  /**
+   * The configuration to resolve, as {@link OpenProjectOptions.tsConfigFilePath}.
+   *
+   * Resolved and required to exist exactly as it is there, because a caller
+   * that named a configuration which is not present has an error to be told
+   * about whether or not a program is going to be built from it.
+   */
+  readonly tsConfigFilePath?: string | undefined;
+
+  /** Extra exclusions, as {@link OpenProjectOptions.extraExcludes}. */
+  readonly extraExcludes?: readonly string[] | undefined;
+
+  /** Where the walk's refusals and counts go; defaults to `noopLogger`. */
+  readonly logger?: Logger | undefined;
+}
+
+/**
+ * Establishes a project's identity and its indexable file set **without
+ * constructing a program or reading a file**.
+ *
+ * ## Why this exists
+ *
+ * The index cache's key is derived from the project's identity and one
+ * fingerprint — path, modification time, size — per indexable file, and none of
+ * that needs a parsed program. Before this function existed, the only way to
+ * get the file set was {@link openProject}, so `./indexer.ts` had to build the
+ * whole ts-morph program before it could compute the key it was going to use to
+ * decide whether it needed the program at all. A cache hit paid for everything
+ * the cache exists to avoid. Now the indexer discovers, fingerprints, looks up,
+ * and only opens the project when the lookup misses.
+ *
+ * ## What it does, and what it deliberately does not
+ *
+ * It runs {@link openProject}'s steps 1, 2, 3, 5, 6 and 7 — normalise the root,
+ * require a directory, resolve the configuration path, resolve the canonical
+ * root, walk the tree without following a directory link, and screen every
+ * candidate through {@link screenCandidatePath} with the same refusal tally and
+ * the same log records. It does **not** construct a `Project`, does not parse
+ * the configuration, and does not read one byte of any file's content: the only
+ * syscalls are `readdir`, `realpath` and `stat`.
+ *
+ * Because it now runs *first*, it is also the first thing that touches the
+ * developer's tree, and the privacy guarantee this module exists for is
+ * therefore enforced here as well as in the loading path: an environment file,
+ * a path whose real location leaves the project and a path whose real location
+ * cannot be established are refused before anything downstream can ask for
+ * their contents.
+ *
+ * ## Failures
+ *
+ * Exactly the ones {@link openProject} reports for the same inputs, with the
+ * same codes, the same `details.reason` and the same hints: a relative or
+ * network-share root, a root that is absent, unreadable or not a directory, a
+ * named configuration that does not exist, a root whose real location cannot be
+ * established, and a root whose top level cannot be listed. A caller that
+ * propagates this `Err` is indistinguishable from one that propagated
+ * `openProject`'s, which is what lets the indexer consult the cache first
+ * without changing the failures it reports.
+ *
+ * @param options The root to walk, and how to walk it.
+ * @returns `Ok` with the discovery — including for a project with no indexable
+ * file — or `Err` with a `DebuggenError`.
+ *
+ * @example
+ * ```ts
+ * const discovered = discoverProjectFiles({ projectRoot, logger });
+ * if (isErr(discovered)) {
+ *   return discovered; // propagate unchanged; openProject would have said the same
+ * }
+ * // …fingerprint discovered.value.relativeFiles, consult the cache, and only
+ * // then: openProject({ projectRoot, logger, discovered: discovered.value })
+ * ```
+ */
+export function discoverProjectFiles(
+  options: DiscoverProjectFilesOptions,
+): Result<DiscoveredProject> {
+  const logger = options.logger ?? noopLogger;
+  const extraExcludes = options.extraExcludes ?? EMPTY_EXCLUDES;
+
+  const identity = resolveProjectIdentity(options.projectRoot, options.tsConfigFilePath);
+  if (isErr(identity)) {
+    return identity;
+  }
+  const { projectRoot, tsConfigFilePath } = identity.value;
+
+  const canonicalRoot = resolveCanonicalRoot(projectRoot);
+  if (isErr(canonicalRoot)) {
+    return canonicalRoot;
+  }
+
+  return walkAndScreenProject({
+    projectRoot,
+    canonicalProjectRoot: canonicalRoot.value,
+    tsConfigFilePath,
+    extraExcludes,
+    logger,
+  });
+}
+
 /** The shared empty list, so the common call site allocates nothing. */
 const EMPTY_EXCLUDES: readonly string[] = Object.freeze([]);
+
+/** A project's two decided identity values: where it is, and what configures it. */
+interface ProjectIdentity {
+  /** The normalised absolute project root. */
+  readonly projectRoot: string;
+
+  /** The resolved configuration path, or `undefined` when the project has none. */
+  readonly tsConfigFilePath: string | undefined;
+}
+
+/**
+ * The first three steps of opening a project: normalise the root, require it to
+ * be a directory, resolve the configuration path.
+ *
+ * One function rather than three inline calls in two places, so
+ * {@link openProject} and {@link discoverProjectFiles} ask the same questions
+ * in the same order and report the same three failures — a relative or
+ * network-share root, a root that is absent, unreadable or not a directory, and
+ * a named configuration that does not exist — in the same precedence. A second
+ * spelling of this sequence is exactly how the two entry points would come to
+ * disagree about which error a caller sees.
+ *
+ * Nothing here reads a file's contents or walks the tree: two `stat` calls at
+ * most.
+ *
+ * @param projectRoot The root as the caller spelled it.
+ * @param requestedTsConfig The configuration the caller named, if any.
+ * @returns The identity, or the first step's `Err`.
+ */
+function resolveProjectIdentity(
+  projectRoot: string,
+  requestedTsConfig: string | undefined,
+): Result<ProjectIdentity> {
+  const normalizedRoot = normalizeProjectRoot(projectRoot);
+  if (isErr(normalizedRoot)) {
+    return normalizedRoot;
+  }
+
+  const directory = requireDirectory(normalizedRoot.value);
+  if (isErr(directory)) {
+    return directory;
+  }
+
+  const resolvedTsConfig = resolveTsConfigFilePath(normalizedRoot.value, requestedTsConfig);
+  if (isErr(resolvedTsConfig)) {
+    return resolvedTsConfig;
+  }
+
+  return ok({ projectRoot: normalizedRoot.value, tsConfigFilePath: resolvedTsConfig.value });
+}
 
 /**
  * Converts, normalises and validates the project root.
@@ -1563,6 +1820,196 @@ function reportRefusals(
       count: tally.excluded.count,
     });
   }
+}
+
+/** Everything {@link walkAndScreenProject} needs to enumerate and judge a project. */
+interface WalkOptions {
+  /** The normalised absolute project root. */
+  readonly projectRoot: string;
+
+  /** The project root with every symbolic link resolved — the containment base. */
+  readonly canonicalProjectRoot: string;
+
+  /** The resolved configuration path, recorded on the discovery unparsed. */
+  readonly tsConfigFilePath: string | undefined;
+
+  /** Caller-supplied exclusions, already defaulted. */
+  readonly extraExcludes: readonly string[];
+
+  /** Where the walk's refusals and counts go. */
+  readonly logger: Logger;
+}
+
+/**
+ * Walks the project and screens every candidate, producing the file set
+ * without opening a single file.
+ *
+ * The shared body behind {@link discoverProjectFiles} and
+ * {@link openProject}'s own discovery: both reach the file set through this
+ * function, so there is one traversal and one screening rule in this module
+ * rather than a cheap one for the cache path and a thorough one for the
+ * loading path.
+ *
+ * The refusals are reported here, under the same disposition
+ * ({@link RefusalDisposition}) the loading path used to report them with,
+ * because they still describe candidates refused *before being read*. What
+ * {@link admitScreenedSourceFiles} then does with the survivors is screen them
+ * again — which is defence in depth and not redundancy, since a file can change
+ * between the two passes and since a future call site may hand it paths this
+ * function never saw.
+ *
+ * The result is sorted by project-relative path with {@link comparePaths} —
+ * byte-wise, never locale-aware, for the reason that function gives — so the
+ * order is the one {@link LoadedProject.sourceFiles} guarantees and a
+ * fingerprint list taken from it is identical on every machine.
+ *
+ * @param options The project's two roots, the configuration path, the
+ * exclusions and where to report.
+ * @returns `Ok` with the discovery, or `Err` when the root cannot be listed.
+ */
+function walkAndScreenProject(options: WalkOptions): Result<DiscoveredProject> {
+  const { projectRoot, canonicalProjectRoot, tsConfigFilePath, extraExcludes, logger } = options;
+
+  const candidates = discoverCandidatePaths({
+    projectRoot,
+    canonicalProjectRoot,
+    extraExcludes,
+    logger,
+  });
+  if (isErr(candidates)) {
+    return candidates;
+  }
+
+  const tally = createRefusalTally();
+  const kept: { readonly relativePath: string; readonly absolutePath: string }[] = [];
+
+  for (const candidate of candidates.value) {
+    const candidatePath = normalizePosix(toPosix(candidate));
+
+    const verdict = screenCandidatePath({
+      candidatePath,
+      projectRoot,
+      canonicalProjectRoot,
+      extraExcludes,
+    });
+
+    if (verdict !== 'indexable') {
+      recordRefusal(
+        tally,
+        verdict,
+        projectRelativeOrUndefined(projectRoot, candidatePath) ?? candidatePath,
+      );
+      continue;
+    }
+
+    const relative = toProjectRelative(projectRoot, candidatePath);
+    if (isErr(relative)) {
+      // Unreachable through the screen above — a path it calls indexable is
+      // inside the project — and handled rather than asserted, because the
+      // alternative is a non-null assertion on a value the compiler cannot
+      // narrow. Counted as the ordinary exclusion it would be, which reports a
+      // count and no path.
+      recordRefusal(tally, 'excluded', candidatePath);
+      continue;
+    }
+
+    kept.push({ relativePath: relative.value, absolutePath: candidatePath });
+  }
+
+  reportRefusals(tally, projectRoot, 'refused before being read', logger);
+
+  kept.sort((left, right) => comparePaths(left.relativePath, right.relativePath));
+
+  return ok(
+    Object.freeze({
+      projectRoot,
+      canonicalProjectRoot,
+      tsConfigFilePath,
+      // A frozen copy, not the caller's array: a discovery that could change
+      // under the consumer fingerprinting it would be a discovery nothing could
+      // be keyed on.
+      extraExcludes: Object.freeze([...extraExcludes]),
+      files: Object.freeze(kept.map((entry) => entry.absolutePath)),
+      relativeFiles: Object.freeze(kept.map((entry) => entry.relativePath)),
+    }),
+  );
+}
+
+/** What {@link discoveredCandidatePaths} needs to decide between reuse and a walk. */
+interface ReuseOptions extends WalkOptions {
+  /** The discovery the caller supplied, if any. */
+  readonly discovered: DiscoveredProject | undefined;
+}
+
+/**
+ * The candidate paths {@link openProject} will screen and load: the supplied
+ * discovery's, or a fresh walk's.
+ *
+ * A supplied discovery is used only when it describes **the same discovery
+ * inputs** as this open: the same normalised root, the same canonical root, the
+ * same resolved configuration path and the same exclusions. Anything else is a
+ * discovery of a different file set — a sibling directory, a run with
+ * `extraExcludes`, a root that has been relinked since — and reusing it would
+ * make the opened project's file set answer a question nobody asked. A
+ * disagreement costs one `warn` and a fresh walk rather than a failure, because
+ * the walk is always available and a slower open is better than a wrong one.
+ *
+ * Note what reuse does *not* skip: every path returned here is screened again
+ * by {@link admitScreenedSourceFiles} before it is read, against the canonical
+ * root *this* call resolved. So the discovery decides how much work is done and
+ * never what may be read.
+ *
+ * @param options The supplied discovery, the project's two roots, the
+ * configuration path, the exclusions and where to report.
+ * @returns `Ok` with the candidate paths, or the walk's `Err`.
+ */
+function discoveredCandidatePaths(options: ReuseOptions): Result<readonly string[]> {
+  const { discovered, projectRoot, canonicalProjectRoot, tsConfigFilePath, extraExcludes, logger } =
+    options;
+
+  if (discovered !== undefined) {
+    if (
+      discovered.projectRoot === projectRoot &&
+      discovered.canonicalProjectRoot === canonicalProjectRoot &&
+      discovered.tsConfigFilePath === tsConfigFilePath &&
+      sameExcludes(discovered.extraExcludes, extraExcludes)
+    ) {
+      return ok(discovered.files);
+    }
+
+    logger.warn(
+      'the supplied project discovery was taken over a different root, configuration or exclusion set; it was ignored and the project was walked again',
+      { projectRoot },
+    );
+  }
+
+  const screened = walkAndScreenProject({
+    projectRoot,
+    canonicalProjectRoot,
+    tsConfigFilePath,
+    extraExcludes,
+    logger,
+  });
+
+  return isErr(screened) ? screened : ok(screened.value.files);
+}
+
+/**
+ * Whether two exclusion lists are the same list.
+ *
+ * Compared element by element in order rather than as sets: the entries are
+ * matched as written (see {@link shouldExcludePath}), so two lists that differ
+ * only in order describe the same exclusions today — but treating order as
+ * significant is the conservative answer, and the cost of being wrong in this
+ * direction is one extra directory walk rather than a file set that does not
+ * match what was asked for.
+ *
+ * @param left The discovery's exclusions.
+ * @param right The exclusions this open was asked for.
+ * @returns `true` when they are element-wise equal.
+ */
+function sameExcludes(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((entry, index) => entry === right[index]);
 }
 
 /** Everything {@link admitScreenedSourceFiles} needs to load a project's files. */

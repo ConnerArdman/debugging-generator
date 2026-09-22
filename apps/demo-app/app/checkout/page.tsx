@@ -17,22 +17,34 @@
  * between the markup the server sent and the markup the browser first produces.
  *
  * WHAT THE PAGE OWNS
- * Four things: the ancestry trail, the heading block, the two columns and their order, and the
- * baseline freight services the form starts from. Everything else belongs to what it composes -
- * the contact and destination fields with their inline messages, the service group, the
- * place-order control, the receipt that replaces the fields, and the notice a failed submission
- * prints all belong to `CheckoutForm`; the lines under review, the figures they come to and the
- * block shown when there is nothing to review belong to `CheckoutSummaryPanel`. Restating any of
- * it here would describe the order twice in one document.
+ * Five things: the ancestry trail, the heading block, the two columns and their order, the
+ * baseline freight services the form starts from, and the channel the two columns share a charge
+ * over. Everything else belongs to what it composes - the contact and destination fields with
+ * their inline messages, the service group, the place-order control, the receipt that replaces the
+ * fields, and the notice a failed submission prints all belong to `CheckoutForm`; the lines under
+ * review, the figures they come to and the block shown when there is nothing to review belong to
+ * `CheckoutSummaryPanel`. Restating any of it here would describe the order twice in one document.
+ *
+ * The channel is `CheckoutChargesProvider`, and owning it is exactly as much as this page can do
+ * about it. The buyer chooses a freight service in the first column and reads what it costs in the
+ * second, so that figure has to cross between two siblings - and a server component cannot hold it
+ * for them, because it changes in the browser long after this page has finished rendering. So the
+ * page mounts the channel around both columns and holds nothing itself: the form publishes the
+ * chosen service and its quoted rate, the review column reads them, and this file never learns
+ * either. The provider renders no element of its own, which is why the two columns' wrappers and
+ * the class contract below are exactly what they were without it.
  *
  * WHY EACH COMPONENT IS PASSED SO LITTLE
  * `CheckoutSummaryPanel` is passed nothing at all: its defaults - the "Order review" heading and
  * the listed lines - are written for this exact placing, which its own documentation gives as the
  * example call, and naming the same heading again here would keep one string in two files. The
- * form is passed its services and two sets of starting values, and deliberately no `onOrderPlaced`
- * handler: the receipt appears whether a handler was supplied or not, and a page-level hook that
- * navigated or re-requested anything would add a second outcome to a submission that already has
- * one.
+ * freight charge it prints is not passed either, for a better reason than brevity: it reads it off
+ * the shared channel, so the figure travels from the column that owns it to the column that prints
+ * it without this page relaying - and therefore without this page being able to relay a different
+ * one. The form is passed its services and two sets of starting values, and deliberately no
+ * `onOrderPlaced` handler: the receipt appears whether a handler was supplied or not, and a
+ * page-level hook that navigated or re-requested anything would add a second outcome to a
+ * submission that already has one.
  *
  * THE TRAIL AND THE HEADING ARE PAGE CONTENT
  * `app/layout.tsx` mounts `PageContainer` with no heading props, and a page cannot pass props into
@@ -54,6 +66,7 @@
 import type { Metadata } from 'next';
 import type { ReactElement } from 'react';
 
+import { CheckoutChargesProvider } from '@/components/checkout/CheckoutCharges';
 import { CheckoutForm } from '@/components/checkout/CheckoutForm';
 import { CheckoutSummaryPanel } from '@/components/checkout/CheckoutSummaryPanel';
 import { BreadcrumbTrail, type BreadcrumbCrumb } from '@/components/layout/BreadcrumbTrail';
@@ -234,19 +247,23 @@ export default function CheckoutPage(): ReactElement {
         <p className="ls-page-lede">{PAGE_LEDE}</p>
       </div>
 
-      <div className="ls-split">
-        <div className="ls-split-main">
-          <CheckoutForm
-            shippingOptions={BASELINE_SHIPPING_OPTIONS}
-            initialContact={PREFILLED_CONTACT}
-            initialAddress={PREFILLED_ADDRESS}
-          />
-        </div>
+      {/* The charge channel wraps both columns and contributes no element, so the split below is
+          the page's own DOM unchanged - see the note in the header. */}
+      <CheckoutChargesProvider>
+        <div className="ls-split">
+          <div className="ls-split-main">
+            <CheckoutForm
+              shippingOptions={BASELINE_SHIPPING_OPTIONS}
+              initialContact={PREFILLED_CONTACT}
+              initialAddress={PREFILLED_ADDRESS}
+            />
+          </div>
 
-        <div className="ls-split-side">
-          <CheckoutSummaryPanel />
+          <div className="ls-split-side">
+            <CheckoutSummaryPanel />
+          </div>
         </div>
-      </div>
+      </CheckoutChargesProvider>
     </div>
   );
 }

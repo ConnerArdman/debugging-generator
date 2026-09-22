@@ -1,11 +1,11 @@
 {
   "version": 1,
   "stages": {
-    "understand": { "current": "v001" },
-    "investigate": { "current": "v001" },
-    "plan": { "current": "v001" },
-    "analyze": { "current": "v001" },
-    "generate-panel": { "current": "v001" },
-    "followup": { "current": "v001" }
+    "understand": { "current": "v001", "available": ["v001"] },
+    "investigate": { "current": "v001", "available": ["v001"] },
+    "plan": { "current": "v001", "available": ["v001"] },
+    "analyze": { "current": "v001", "available": ["v001"] },
+    "generate-panel": { "current": "v001", "available": ["v001"] },
+    "followup": { "current": "v001", "available": ["v001"] }
   }
 }

@@ -50,15 +50,26 @@
  * The gate is a **string-level** gate. It proves that a path, read as text,
  * cannot leave the project root. It cannot prove anything about what the
  * filesystem does with that path afterwards — most importantly, a symlink
- * inside the project whose target is outside it is invisible here. That escape
- * is caught by two other places, and every function in the gate repeats the
- * warning so no caller mistakes one for the other:
+ * inside the project whose target is outside it is invisible here. Every
+ * function in the gate repeats the warning so no caller mistakes one for the
+ * other, and {@link resolveRealPathWithinProject} is the answer to it: the
+ * lexical gate followed by canonicalisation and a second containment check,
+ * with the one impure step — resolving links — injected, so this module still
+ * imports nothing. A caller that opens a path it did not construct itself uses
+ * that function and not {@link resolveWithinProject}.
  *
+ * Two mechanisms narrow what remains, and neither replaces it:
+ *
+ * - `packages/shared/src/node/safe-fs.ts` opens with `O_NOFOLLOW`, which
+ *   refuses a symlink at the **final** component only — a backstop, never an
+ *   answer for a multi-component path.
  * - `apps/vscode-extension/src/uri-handler.ts` resolves the path with
  *   `fs.realpath` and requires the result to stay inside an open workspace
  *   folder's realpath.
- * - `packages/shared/src/node/safe-fs.ts` opens with `O_NOFOLLOW`, so the
- *   create path refuses to follow a symlink at the final component at all.
+ * - `packages/code-analysis/src/source-map/resolver.ts` canonicalises a
+ *   source-mapped original path with `fs.realpathSync` and re-checks its
+ *   containment in the project root's own realpath before reading it, then
+ *   revalidates the read.
  *
  * ## Deliberate differences from `node:path`'s POSIX behaviour
  *
@@ -158,7 +169,7 @@ const MAX_REPORTED_PATH_LENGTH = 160;
  * Why the gate refused a path. Recorded as `details.reason` on the error, so a
  * caller can branch or report without parsing a message string.
  *
- * Module-internal: the public surface of this file is the thirteen functions
+ * Module-internal: the public surface of this file is the fourteen functions
  * below, and every rejection they produce carries the single error code
  * `PATH_OUTSIDE_PROJECT`. The reason is the finer-grained diagnosis underneath
  * that code.
@@ -170,12 +181,24 @@ const MAX_REPORTED_PATH_LENGTH = 160;
  *   below it.
  * - `unsafe-relative-path` — a relative path that {@link isSafeRelativePath}
  *   refused: traversal, an absolute form, a control character, or empty.
+ * - `symlink-escapes-project-root` — the path is inside the root as text, but a
+ *   symbolic link among its directory components resolves outside it. Only
+ *   {@link resolveRealPathWithinProject} can reach this reason, because it is
+ *   the only function here that is given a resolver.
+ * - `path-not-resolvable` — the resolver {@link resolveRealPathWithinProject}
+ *   was given could not canonicalise the root or the target's directory. The
+ *   thrown value travels on the error's `cause`.
+ * - `resolved-path-not-absolute` — that resolver answered with something that is
+ *   not an absolute path, so containment could not be established against it.
  */
 type RejectionReason =
   | 'project-root-not-absolute'
   | 'network-share-path'
   | 'outside-project-root'
-  | 'unsafe-relative-path';
+  | 'unsafe-relative-path'
+  | 'symlink-escapes-project-root'
+  | 'path-not-resolvable'
+  | 'resolved-path-not-absolute';
 
 /**
  * Whether a UTF-16 code unit is a C0 or C1 control character.
@@ -264,6 +287,7 @@ function outsideProject(
   reason: RejectionReason,
   projectRoot: string,
   path: string,
+  cause?: unknown,
 ): DebuggenError {
   return new DebuggenError('PATH_OUTSIDE_PROJECT', message, {
     hint: 'Use a path inside the project root, written project-relative with forward slashes.',
@@ -272,6 +296,7 @@ function outsideProject(
       projectRoot: reportablePath(projectRoot),
       path: reportablePath(path),
     },
+    ...(cause !== undefined ? { cause } : {}),
   });
 }
 
@@ -755,12 +780,11 @@ export function isSafeRelativePath(path: string): boolean {
  *
  * **Limit of the guarantee.** This is the string-level gate only. A symlink
  * inside the root whose target is outside it passes this check, because a
- * string cannot reveal it. The filesystem-level checks that do are
- * `fs.realpath` in `apps/vscode-extension/src/uri-handler.ts`, which requires
- * the resolved path to stay inside an open workspace folder's realpath, and
- * `O_NOFOLLOW` in this package's `src/node/safe-fs.ts`, which refuses to follow
- * a symlink at the final component. Never treat this function as a complete
- * check on its own.
+ * string cannot reveal it. {@link resolveRealPathWithinProject} is the
+ * filesystem-level composition that does see it — this predicate applied to a
+ * canonicalised pair — and `O_NOFOLLOW` in this package's
+ * `src/node/safe-fs.ts` refuses a symlink at the final component only. Never
+ * treat this function as a complete check on its own.
  *
  * That rejection is *proven* in `src/node/safe-fs.test.ts`, in the
  * `describe('a project-internal symbolic link whose target is outside the
@@ -869,11 +893,13 @@ function projectRootRejection(projectRoot: string, path: string): DebuggenError 
  * separator could make an off-volume path look as though it sat inside the root.
  *
  * **Limit of the guarantee.** String level only: a symlink inside the project
- * whose target is outside it satisfies this function. `fs.realpath` in
- * `apps/vscode-extension/src/uri-handler.ts` is the check that catches that
- * escape — `O_NOFOLLOW` in this package's `src/node/safe-fs.ts` refuses a link
- * only at a path's final component, so it is a backstop rather than an answer
- * for a multi-component path. The escape is proven rejected in
+ * whose target is outside it satisfies this function.
+ * {@link resolveRealPathWithinProject} is the check that catches that escape,
+ * and `fs.realpath` in `apps/vscode-extension/src/uri-handler.ts` is the other
+ * enforcement point that applies it — `O_NOFOLLOW` in this package's
+ * `src/node/safe-fs.ts` refuses a link only at a path's final component, so it
+ * is a backstop rather than an answer for a multi-component path. The escape is
+ * proven rejected in
  * `src/node/safe-fs.test.ts`, in the `describe('a project-internal symbolic
  * link whose target is outside the root')` block — which asserts, among the
  * rest, that this function returns `Err('PATH_OUTSIDE_PROJECT')` for the
@@ -989,14 +1015,12 @@ export function toProjectRelative(projectRoot: string, path: string): Result<str
  *
  * **Limit of the guarantee.** String level only. The returned path is inside
  * the project *as text*; whether opening it stays inside the project is a
- * question for `fs.realpath` in `apps/vscode-extension/src/uri-handler.ts`,
- * which requires the resolved path to stay inside an open workspace folder's
- * realpath, and for `O_NOFOLLOW` in this package's `src/node/safe-fs.ts`, which
- * refuses to follow a symlink at the final component. Those two are not
- * interchangeable: a caller that opens the path this function returns resolves
- * it with `fs.realpath` and re-checks containment on the *resolved* path, and
- * treats the no-follow open as the backstop it is — it cannot see an interior
- * component.
+ * different question, and {@link resolveRealPathWithinProject} is the function
+ * that answers it — this function, then canonicalisation, then containment
+ * again. A caller that is about to open, read or write the path uses that one
+ * instead of this one, and treats `O_NOFOLLOW` in this package's
+ * `src/node/safe-fs.ts` as the backstop it is: it refuses a symlink at the
+ * final component and cannot see an interior one.
  *
  * Both halves of that composition — this function accepting a path through a
  * link, and the realpath-aware form rejecting it — are proven in
@@ -1049,4 +1073,273 @@ export function resolveWithinProject(projectRoot: string, relPath: string): Resu
   }
 
   return ok(resolved);
+}
+
+/**
+ * Canonicalises one path, the single impure operation
+ * {@link resolveRealPathWithinProject} needs, supplied by its caller.
+ *
+ * The shape is `fs.realpathSync`'s, and that is deliberate: this module imports
+ * nothing and touches no filesystem (see the header), so the one step that has
+ * to ask the operating system what a path really points at arrives as an
+ * argument. A caller in Node passes `realpathSync` — or
+ * `(path) => realpathSync.native(path)` — and a caller in a test passes a table
+ * of links, which is what makes the composition below exhaustively testable
+ * without a temporary directory.
+ *
+ * The contract the composition relies on:
+ *
+ * - It **resolves every component**, so a symbolic link anywhere in the path is
+ *   followed to the real entry. A resolver that only inspected the final
+ *   component would defeat the whole check.
+ * - It returns an **absolute** path. A relative answer is refused rather than
+ *   joined onto anything, because there is no directory here to join it to.
+ * - It **throws** when the path cannot be resolved — it does not exist, a
+ *   component is not a directory, or the process may not look at it. The throw
+ *   is caught and converted; the thrown value is preserved on the returned
+ *   error's `cause` so a caller can read the platform errno (`ENOENT`,
+ *   `ENOTDIR`, `EACCES`, `ELOOP`) and answer its user in its own words.
+ *
+ * @param absolutePath The absolute path to canonicalise.
+ * @returns Its canonical absolute path, with every symbolic link resolved.
+ * @throws The platform's own error when the path cannot be resolved.
+ */
+export type RealPathResolver = (absolutePath: string) => string;
+
+/**
+ * A target path proven to stay inside the project **after** every symbolic link
+ * in its directory chain has been resolved.
+ *
+ * Every member is absolute POSIX except {@link ProjectPathResolution.relative},
+ * which is the project-relative form the product stores and displays.
+ */
+export interface ProjectPathResolution {
+  /**
+   * The project root, canonicalised.
+   *
+   * Not necessarily the string that was passed in: a root reached through a
+   * link — `/tmp/x` under macOS's `/tmp` → `/private/tmp`, a home directory on
+   * a linked volume, a checkout under a symlinked parent — canonicalises to
+   * somewhere else entirely, and comparing a canonical target against a
+   * non-canonical root would refuse every path in such a project. Both sides of
+   * the comparison are canonical, or the comparison is meaningless.
+   */
+  readonly projectRoot: string;
+
+  /** The canonical absolute path of the directory holding the target. */
+  readonly directory: string;
+
+  /**
+   * The target itself: {@link ProjectPathResolution.directory} joined with the
+   * final component as the caller spelled it.
+   *
+   * The final component is deliberately **left unresolved**. Resolving it would
+   * silently follow a link planted at the target and report the file it points
+   * at as though the caller had named it; leaving it alone keeps the caller's
+   * `O_NOFOLLOW` open — which constrains exactly that component — meaningful,
+   * so a link there surfaces as `ELOOP` instead of as a successful read or
+   * write of somewhere else. Everything above it is canonical, which is the
+   * half `O_NOFOLLOW` cannot cover.
+   */
+  readonly path: string;
+
+  /**
+   * {@link ProjectPathResolution.path} relative to
+   * {@link ProjectPathResolution.projectRoot}, POSIX, never leading with `'/'`
+   * or `'./'`; `'.'` when the target *is* the root.
+   *
+   * Compare it against the project-relative path you started with: when they
+   * differ, the file was reached through a link that stays inside the project,
+   * so one file has two project-relative names. A caller that records a path as
+   * an identity — a modification record, a source location, a store key — has
+   * to refuse that rather than pick one of the two.
+   */
+  readonly relative: string;
+}
+
+/**
+ * Resolves a project-relative path to an absolute one and proves it is *still*
+ * inside the project once the filesystem has had its say.
+ *
+ * This is the function the "Limit of the guarantee" paragraph on
+ * {@link isWithin}, {@link toProjectRelative} and {@link resolveWithinProject}
+ * describes. Those three answer about text, and text cannot see a symbolic
+ * link: `'src/vendor/thing.ts'` contains no traversal and lands under the root
+ * when joined, so the lexical gate accepts it — and if `src/vendor` is a link
+ * to `/etc`, a caller that stopped there reads and writes `/etc/thing.ts`.
+ * `O_NOFOLLOW` does not close that gap either; it constrains the **final**
+ * component only, and the kernel has already resolved every interior component
+ * before the flag applies. Both halves are proven on a real filesystem in
+ * `src/node/safe-fs.test.ts`, in the `describe('a project-internal symbolic
+ * link whose target is outside the root')` block.
+ *
+ * So the composition every caller owed — canonicalise, then re-check
+ * containment — is written here once, instead of being described in prose and
+ * reimplemented (or forgotten) at each of the enforcement points.
+ *
+ * ## The sequence
+ *
+ * 1. The lexical gate runs first, unchanged: {@link resolveWithinProject}
+ *    refuses traversal, an absolute form, a control character and a network
+ *    share **without touching the filesystem**, so a hostile path is rejected
+ *    before the resolver is handed anything.
+ * 2. The project root is canonicalised, because a canonical target can only be
+ *    compared against a canonical root.
+ * 3. The target's **directory** is canonicalised — every component of it, which
+ *    is what catches the interior link — and the final component is re-joined
+ *    as spelled. See {@link ProjectPathResolution.path} for why the final
+ *    component is left alone.
+ * 4. {@link isWithin} is applied to the canonical pair. A path whose links lead
+ *    out of the project fails here, with reason `symlink-escapes-project-root`.
+ * 5. The canonical remainder is re-validated with {@link isSafeRelativePath},
+ *    so the returned project-relative form is usable as an identity.
+ *
+ * ## What it still does not promise
+ *
+ * Canonicalisation is a **check at a moment**, not a lock. Between this call and
+ * the caller's `open` a component can be replaced by a link — the classic
+ * time-of-check-to-time-of-use window. Narrowing it is the caller's job and is
+ * done in two ways, both of which this function is designed to support: open
+ * with `O_NOFOLLOW` (the final component, which is why it is left unresolved
+ * here), and make the mutating step conditional on the identity and content
+ * observed at check time rather than unconditional.
+ * `@debuggen/instrumentation`'s patcher does both.
+ *
+ * Every refusal is an `Err` carrying a `DebuggenError` with code
+ * `PATH_OUTSIDE_PROJECT` and a `details.reason`, and `details` carries nothing
+ * but the two strings the caller supplied. A resolver failure is distinguishable
+ * from an escape (`path-not-resolvable` versus `symlink-escapes-project-root`)
+ * because the caller needs to tell "that file is not there" from "that file is
+ * not yours"; unlike the lexical functions this one does consult the
+ * filesystem, so do not forward the distinction to an untrusted peer.
+ *
+ * @param projectRoot The absolute path of the project root.
+ * @param relPath The project-relative POSIX path to resolve.
+ * @param resolveRealPath The canonicaliser. See {@link RealPathResolver}.
+ * @returns `Ok` with the canonical resolution, or `Err` with code
+ * `PATH_OUTSIDE_PROJECT`.
+ *
+ * @example Reading a file a plan named
+ * ```ts
+ * const resolved = resolveRealPathWithinProject(projectRoot, 'src/lib/thing.ts', realpathSync);
+ * if (!resolved.ok) {
+ *   return resolved; // 'symlink-escapes-project-root', or not resolvable
+ * }
+ * if (resolved.value.relative !== 'src/lib/thing.ts') {
+ *   return refuse('the file is reached through a link inside the project');
+ * }
+ * const bytes = readFileNoFollow(resolved.value.path);
+ * ```
+ */
+export function resolveRealPathWithinProject(
+  projectRoot: string,
+  relPath: string,
+  resolveRealPath: RealPathResolver,
+): Result<ProjectPathResolution> {
+  const lexical = resolveWithinProject(projectRoot, relPath);
+  if (!lexical.ok) {
+    return lexical;
+  }
+
+  const canonicalRoot = canonicalise(projectRoot, projectRoot, relPath, resolveRealPath);
+  if (!canonicalRoot.ok) {
+    return canonicalRoot;
+  }
+
+  const root = canonicalRoot.value;
+
+  // The root itself is a legitimate target for a caller asking about a
+  // directory, and it has no parent inside the project to canonicalise, so it
+  // answers from the canonical root directly rather than through `dirname`,
+  // which would climb out of the project to get there.
+  if (lexical.value === normalizeToPosix(projectRoot)) {
+    return ok({ projectRoot: root, directory: root, path: root, relative: CURRENT_DIRECTORY });
+  }
+
+  const canonicalDirectory = canonicalise(
+    dirnamePosix(lexical.value),
+    projectRoot,
+    relPath,
+    resolveRealPath,
+  );
+  if (!canonicalDirectory.ok) {
+    return canonicalDirectory;
+  }
+
+  const directory = canonicalDirectory.value;
+  const path = joinPosix(directory, basenamePosix(lexical.value));
+
+  if (!isWithin(root, path)) {
+    return err(
+      outsideProject(
+        `The path '${reportablePath(relPath)}' is inside the project root as text, but a symbolic link among its directory components resolves outside '${reportablePath(projectRoot)}'.`,
+        'symlink-escapes-project-root',
+        projectRoot,
+        relPath,
+      ),
+    );
+  }
+
+  const relative = relativePosix(root, path);
+
+  if (!isSafeRelativePath(relative)) {
+    return err(
+      outsideProject(
+        `The path '${reportablePath(relPath)}' resolves inside the project root but not to a usable project-relative path.`,
+        'unsafe-relative-path',
+        projectRoot,
+        relPath,
+      ),
+    );
+  }
+
+  return ok({ projectRoot: root, directory, path, relative });
+}
+
+/**
+ * Canonicalises one absolute path with the caller's resolver, converting both
+ * failure modes into the module's single rejection shape.
+ *
+ * `projectRoot` and `path` are the caller's *original* arguments, carried
+ * through only so the error names what the caller asked about rather than the
+ * intermediate directory this call happened to be resolving — an error that
+ * reported a path the caller never wrote would be an unhelpful oracle as well
+ * as a confusing message.
+ */
+function canonicalise(
+  absolutePath: string,
+  projectRoot: string,
+  path: string,
+  resolveRealPath: RealPathResolver,
+): Result<string> {
+  let resolved: string;
+
+  try {
+    resolved = resolveRealPath(absolutePath);
+  } catch (cause) {
+    return err(
+      outsideProject(
+        `The path '${reportablePath(path)}' could not be resolved inside the project root '${reportablePath(projectRoot)}', so containment cannot be established.`,
+        'path-not-resolvable',
+        projectRoot,
+        path,
+        cause,
+      ),
+    );
+  }
+
+  const normalized = normalizeToPosix(resolved);
+
+  if (!isAbsolutePosix(normalized) && !isWindowsAbsolute(normalized)) {
+    return err(
+      outsideProject(
+        `Resolving '${reportablePath(path)}' produced a path that is not absolute, so containment cannot be established.`,
+        'resolved-path-not-absolute',
+        projectRoot,
+        path,
+      ),
+    );
+  }
+
+  return ok(normalized);
 }

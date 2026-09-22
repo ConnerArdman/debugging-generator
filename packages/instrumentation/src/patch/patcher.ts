@@ -13,15 +13,41 @@
  * ## The sequence, which is the specification
  *
  * ```text
- * 0. resolve the target inside projectRoot        (nothing read yet)
- * 1. read the original bytes          → originalHash
+ * 0. resolve the target inside projectRoot        (lexically, then canonically)
+ * 1. read the original bytes + inode   → originalHash
  * 1a. confirm the baseline the patch assumes      (./conflict.js decides)
- * 2. build the patched content        → instrumentedHash   (nothing written yet)
- * 3. copy the original to the backup  → backupPath, fsync'd
- * 4. append the record as "pending"   → BOTH hashes + the unified diff
- * 5. temp-write + fsync + rename over the original          (the only write)
+ * 2. build the patched content         → instrumentedHash  (nothing written yet)
+ * 3. copy the original to the backup   → backupPath, fsync'd
+ * 4. append the record as "pending"    → BOTH hashes + the unified diff
+ * 5. temp-write + fsync + re-check the target + rename      (the only write)
  * 6. mark the record "applied"
  * ```
+ *
+ * Two of those steps are there for an adversary rather than for a crash, and
+ * both are easy to mistake for belt and braces:
+ *
+ * - Step 0 resolves the target **twice and then stops resolving it**. Once as a
+ *   string, which refuses traversal without touching the disk; once through the
+ *   filesystem, which canonicalises every directory component and re-checks
+ *   containment; and then the containing directory is *held open*, so the read
+ *   and the write address that descriptor instead of the path. The string check
+ *   cannot see a symbolic link and the no-follow read in step 1 reaches only the
+ *   path's final component, so without the second resolution an in-project
+ *   `src/vendor` linking to `/etc` is read, backed up, journaled and
+ *   overwritten outside the project (CWE-22). And without the pin the second
+ *   resolution is only true of an instant: minutes pass before the rename, and
+ *   a directory component replaced in between redirects everything after it to
+ *   somewhere nothing validated. Checking a third time would have the same
+ *   flaw; not re-resolving the path does not.
+ * - Step 5 is **conditional**. Between step 1's read and the install sit a
+ *   parse, a transform, two digests, a durable backup and a journal append, and
+ *   a developer can save the same file in that time. An unconditional rename
+ *   discards that edit with no trace and leaves a record claiming an
+ *   `originalHash` for bytes they never had (CWE-367), so the replacement
+ *   re-checks the target's bytes and inode, retains whatever it displaces
+ *   rather than destroying it, and installs with an operation that refuses an
+ *   occupied destination. A change it did not authorise becomes a conflict at
+ *   every interleaving, never a loss.
  *
  * Step 4 sits before step 5 deliberately, and that single ordering decision is
  * what turns an ambiguous crash into a decidable one. Because the journal
@@ -104,6 +130,8 @@
  * ```
  */
 
+import { realpathSync } from 'node:fs';
+
 import { createTwoFilesPatch } from 'diff';
 
 import {
@@ -115,11 +143,24 @@ import {
   normalizePosix,
   nowEpochMs,
   ok,
-  resolveWithinProject,
+  resolveRealPathWithinProject,
   toPosix,
 } from '@debuggen/shared';
 import type { Logger, Result, SourceLocation } from '@debuggen/shared';
-import { atomicReplaceFile, readFileNoFollow, sha256Hex } from '@debuggen/shared/node';
+import {
+  atomicReplaceFileIfUnchanged,
+  pinFileWithinRoot,
+  readFileNoFollow,
+  readFileSnapshotNoFollow,
+  sha256Hex,
+} from '@debuggen/shared/node';
+import type {
+  AtomicReplaceExpectation,
+  AtomicReplaceStaleReason,
+  AtomicReplaceVerdict,
+  FileSnapshot,
+  PinnedFile,
+} from '@debuggen/shared/node';
 
 import { MAX_MODIFICATION_DIFF_LENGTH, createModificationRecord } from '../schema/modification.js';
 import type {
@@ -221,10 +262,12 @@ const PATCHABLE_ACTION_TYPES: readonly InstrumentationActionType[] = Object.free
  * in the module addressable by name from a test: throwing from the observer for
  * a given stage is a failure injected *immediately after* that stage completed.
  *
- * - `'resolve-target'` — the action is a patch target and its path is inside
- *   the project. Nothing has been read.
- * - `'read-original'` — the bytes are in memory, hashed as `originalHash`, and
- *   decoded to text that provably re-encodes to those exact bytes.
+ * - `'resolve-target'` — the action is a patch target, its path is inside the
+ *   project as text, and it is still inside the project once every directory
+ *   component has been canonicalised. Nothing has been read.
+ * - `'read-original'` — the bytes and the inode they came from are in memory,
+ *   hashed as `originalHash`, and decoded to text that provably re-encodes to
+ *   those exact bytes.
  * - `'baseline-check'` — the file is in the state the patch assumes: untouched
  *   for a first patch, or holding the previous record's instrumented bytes for
  *   a chained one.
@@ -234,8 +277,10 @@ const PATCHABLE_ACTION_TYPES: readonly InstrumentationActionType[] = Object.free
  *   `<debuggenHome>/backups/<sessionId>/<originalHash>`.
  * - `'journal-pending'` — the record exists with both hashes, the backup path
  *   and the diff. **The linchpoint**: every later crash is decidable.
- * - `'replace-file'` — the temp file was written, flushed and renamed over the
- *   target. This is the only step that changes the developer's project.
+ * - `'replace-file'` — the temp file was written, flushed, checked against the
+ *   bytes and inode step 1 observed, and renamed over the target. This is the
+ *   only step that changes the developer's project, and it is the step that
+ *   declines to when the target is no longer what was read.
  * - `'mark-applied'` — the record says what the disk says.
  *
  * Frozen because it is a module-level table two other suites read.
@@ -297,7 +342,12 @@ export interface PatchStageEvent {
  * before the write", and one that throws for `'replace-file'` produces
  * "crashed after the rename, before the mark". The one boundary it cannot
  * express is *inside* step 5, between the temp write and the rename; that is
- * what {@link PatchFileSystem.replaceFile} is injectable for.
+ * what {@link PatchFileSystem.replaceFileIfUnchanged} is injectable for.
+ *
+ * It is also how the race this sequence defends against is driven: an observer
+ * that rewrites the target file after `'journal-pending'` and returns normally
+ * *is* a developer saving the file while the patch was being prepared, and the
+ * conditional replacement in step 5 must decline rather than overwrite it.
  *
  * A rejection is treated exactly like a throw. Anything else it returns is
  * ignored.
@@ -315,14 +365,85 @@ export type PatchStageObserver = (event: PatchStageEvent) => void | Promise<void
  */
 export interface PatchFileSystem extends ConflictFileReader {
   /**
-   * Replaces a file's content atomically, preserving the mode it already had.
+   * Canonicalises an absolute path, resolving **every** symbolic link component.
    *
-   * The contract is `atomicReplaceFile`'s (`@debuggen/shared/node`): write an
-   * unpredictably named temporary sibling **in the same directory**, flush it,
-   * then `rename` it over the target, removing the temporary file and
-   * rethrowing if any step fails. Same-directory placement is what makes the
-   * rename atomic on POSIX, and mode preservation is what keeps a restored file
-   * identical to what was found in permissions as well as content.
+   * The contract is `fs.realpathSync`'s, and this member exists because neither
+   * of the other two can answer the question it answers. `resolveWithinProject`
+   * is pure string work, so a path whose interior component is a link to
+   * somewhere else entirely satisfies it; `readFileBytes`'s `O_NOFOLLOW`
+   * constrains the **final** component only, because the kernel has already
+   * resolved every interior component before the flag applies. Without this,
+   * `src/vendor/thing.ts` under a `src/vendor` that links to `/etc` is read,
+   * backed up, journaled and overwritten outside the project (CWE-22).
+   *
+   * @param absolutePath The path to canonicalise.
+   * @returns Its canonical absolute path.
+   * @throws The runtime's own filesystem error, with its `code` intact, when
+   * the path cannot be resolved.
+   */
+  readonly realPath: (absolutePath: string) => string;
+
+  /**
+   * Holds the directory containing a project-relative file open, and hands back
+   * a path whose later use cannot be redirected.
+   *
+   * The contract is `pinFileWithinRoot`'s (`@debuggen/shared/node`): every
+   * component of the canonical root and of the file's directory is opened
+   * relative to the one above it with `O_DIRECTORY | O_NOFOLLOW`, and the
+   * returned path addresses the resulting descriptor.
+   *
+   * {@link PatchFileSystem.realPath} and the containment gate above establish
+   * where the path led *at one instant*; this establishes that the read and the
+   * write go to what was established. Without it the sequence is
+   * check-then-use: a directory component replaced between the check and the
+   * `open` — or between the `open` and the `rename`, which is minutes later in
+   * a session — redirects everything that follows to somewhere the check never
+   * saw. Checking again cannot close that; not re-resolving the path can.
+   *
+   * @param rootAbs The canonical absolute path of the project root.
+   * @param relativeFile The project-relative POSIX path of the target.
+   * @returns The pinned file, which the caller must release.
+   * @throws {DebuggenError} `FS_UNSAFE_PATH` when a component is a symbolic
+   * link, or the runtime's own error with its `code` intact.
+   */
+  readonly pinFile: (rootAbs: string, relativeFile: string) => PinnedFile;
+
+  /**
+   * Reads a file's bytes **and** the identity of the inode they came from, from
+   * one descriptor, refusing to follow a symbolic link at the final component.
+   *
+   * The contract is `readFileSnapshotNoFollow`'s (`@debuggen/shared/node`). The
+   * identity is not decoration: it is half the precondition of
+   * {@link PatchFileSystem.replaceFileIfUnchanged}, and it has to come from the
+   * same descriptor as the bytes, or the pair describes an observation that
+   * never held.
+   *
+   * @param absolutePath The file to read.
+   * @returns Its bytes and the identity of the file they came from.
+   * @throws The runtime's own filesystem error, with its `code` intact.
+   */
+  readonly readFileSnapshot: (absolutePath: string) => FileSnapshot;
+
+  /**
+   * Replaces a file's content atomically **only while it is still what was
+   * read**, preserving the mode it already had.
+   *
+   * The contract is `atomicReplaceFileIfUnchanged`'s
+   * (`@debuggen/shared/node`): write an unpredictably named temporary sibling
+   * **in the same directory**, flush it, re-read the target and compare it
+   * against `expected`, then `rename` — removing the temporary file and
+   * rethrowing if any step fails, and removing it and answering `stale` if the
+   * comparison does. Same-directory placement is what makes the rename atomic
+   * on POSIX, and mode preservation is what keeps a restored file identical to
+   * what was found in permissions as well as content.
+   *
+   * The precondition is the whole reason this is not a plain write. Between
+   * this sequence's read and its write sit a parse, a transform, a digest, a
+   * backup and a journal append, and a developer can save the same file in that
+   * time. An unconditional `rename` discards that edit without a trace
+   * (CWE-367); a conditional one refuses, and the edit is still there to be
+   * reported as a conflict. A `stale` verdict is a guarantee that the target
+   * was not written.
    *
    * An implementation must not assert a directory policy: a developer's project
    * is an ordinary `0755` directory this product did not create, so the
@@ -332,27 +453,40 @@ export interface PatchFileSystem extends ConflictFileReader {
    *
    * @param absolutePath The file to replace.
    * @param content The bytes to write, verbatim.
+   * @param expected What the target must still be for the write to happen.
+   * @returns `replaced`, or `stale` with the reason nothing was written.
    * @throws The runtime's own filesystem error, with its `code` intact.
    */
-  readonly replaceFile: (absolutePath: string, content: Uint8Array) => void;
+  readonly replaceFileIfUnchanged: (
+    absolutePath: string,
+    content: Uint8Array,
+    expected: AtomicReplaceExpectation,
+  ) => AtomicReplaceVerdict;
 }
 
 /**
- * The production {@link PatchFileSystem}: `readFileNoFollow`, `sha256Hex` and
- * `atomicReplaceFile` from `@debuggen/shared/node`.
+ * The production {@link PatchFileSystem}: `readFileNoFollow`,
+ * `readFileSnapshotNoFollow`, `sha256Hex` and `atomicReplaceFileIfUnchanged`
+ * from `@debuggen/shared/node`, over `node:fs`'s `realpathSync`.
  *
  * Frozen and shared, because it holds no state. `sha256OfFile` is deliberately
  * not used even though it streams: this sequence needs the bytes anyway — for
  * the backup and for the diff — and one read that refuses to follow a symbolic
  * link at the final component serves all three purposes, where a streaming
  * digest would follow the link and hash something else.
+ *
+ * `readFileBytes` is retained beside `readFileSnapshot` because it is the
+ * member `./conflict.js` declares and uses: this object is handed to the
+ * conflict detector as its reader, and the detector needs bytes and nothing
+ * else.
  */
 export const defaultPatchFileSystem: PatchFileSystem = Object.freeze({
   readFileBytes: readFileNoFollow,
   hashBytes: sha256Hex,
-  replaceFile: (absolutePath: string, content: Uint8Array): void => {
-    atomicReplaceFile(absolutePath, content);
-  },
+  realPath: (absolutePath: string): string => realpathSync(absolutePath),
+  pinFile: pinFileWithinRoot,
+  readFileSnapshot: readFileSnapshotNoFollow,
+  replaceFileIfUnchanged: atomicReplaceFileIfUnchanged,
 });
 
 /**
@@ -651,10 +785,12 @@ export interface PatchBatchFailure {
    * Whether the target file may hold the patched bytes.
    *
    * `false` for every failure up to and including `'journal-pending'` — nothing
-   * had been written. `true` only where the replacement returned and the
-   * failure came afterwards, which is the case the pre-write journal row exists
-   * for: the record is on file with both hashes, so a restore is decidable
-   * whether or not this process gets to perform it.
+   * had been written — and `false` for a `'replace-file'` failure too, whether
+   * the replacement threw before the rename or declined it because the target
+   * had changed. `true` only where the rename returned and the failure came
+   * afterwards, which is the case the pre-write journal row exists for: the
+   * record is on file with both hashes, so a restore is decidable whether or
+   * not this process gets to perform it.
    */
   readonly fileMayHoldPatch: boolean;
 
@@ -1015,6 +1151,7 @@ class SequencedPatcher implements Patcher {
     let previousRecordId: string | undefined;
     let conflict: ModificationConflict | undefined;
     let fileMayHoldPatch = false;
+    let pinned: PinnedFile | undefined;
 
     /**
      * Stops the sequence, leaving a state the reconciliation table can read.
@@ -1162,10 +1299,10 @@ class SequencedPatcher implements Patcher {
 
       file = normalizePosix(toPosix(input.file));
 
-      // `paths.ts` is pure-string work, so this check sees a traversal but not
-      // a symlink escape; the read below uses the no-follow primitive and the
-      // replacement renames over the path entry rather than writing through a
-      // link, which is where the rest of that guarantee comes from.
+      // The lexical gate first, on the string exactly as the plan wrote it: it
+      // refuses traversal, an absolute form and a control character without
+      // touching the filesystem, so a hostile target never becomes an
+      // existence probe.
       if (!isSafeRelativePath(file)) {
         return await failed(
           new DebuggenError(
@@ -1179,13 +1316,53 @@ class SequencedPatcher implements Patcher {
         );
       }
 
-      const resolved = resolveWithinProject(this.projectRoot, file);
+      // Then the filesystem-level gate, because the lexical one cannot see a
+      // symbolic link and the no-follow read below reaches only the final
+      // component. `resolveRealPathWithinProject` canonicalises the root and
+      // every directory component of the target and re-checks containment on
+      // the canonical pair, so a `src/vendor` that links to `/etc` is refused
+      // *here* — before a byte is read, a backup is written or a record is
+      // journaled (CWE-22). Every later step uses the canonical path it
+      // returns, never the lexical one.
+      const resolved = resolveRealPathWithinProject(this.projectRoot, file, this.#files.realPath);
 
       if (isErr(resolved)) {
-        return await failed(resolved.error);
+        return await failed(unresolvableTarget(resolved.error, file));
       }
 
-      const absolutePath = resolved.value;
+      // Contained, but reached through a link that stays inside the project:
+      // the file then has two project-relative names, and a record whose `file`
+      // is one of them would name a path that is not the bytes it describes —
+      // so cleanup would restore through the link and click-to-source would
+      // open the other name. Refused rather than guessed, with the same answer
+      // `readFailure` gives for a link at the target itself.
+      if (resolved.value.relative !== file) {
+        return await failed(
+          new DebuggenError(
+            'FS_UNSAFE_PATH',
+            'The path to patch reaches the file through a symbolic link inside the project.',
+            {
+              hint: 'Instrument the file the link points at, by its own path.',
+              details: { reason: 'symlink-inside-project', file, symbol },
+            },
+          ),
+        );
+      }
+
+      // Containment is established; now it is *held*. Every component of the
+      // canonical root and of the target's directory is opened relative to the
+      // one above it, refusing a symbolic link at each step, and the read and
+      // the write below address the resulting descriptor rather than the path.
+      // The check above answers for one instant; minutes pass before the
+      // rename, and a component replaced in between would otherwise redirect
+      // it. The pin is released in this method's `finally`.
+      try {
+        pinned = this.#files.pinFile(resolved.value.projectRoot, resolved.value.relative);
+      } catch (cause) {
+        return await failed(DebuggenError.is(cause) ? cause : readFailure(cause, file));
+      }
+
+      const absolutePath = pinned.path;
       const reservation = reservationKey(file, symbol);
 
       if (this.#reserved.has(reservation)) {
@@ -1214,13 +1391,19 @@ class SequencedPatcher implements Patcher {
       // ---------------------------------------------------------------------
       stage = 'read-original';
 
-      let originalBytes: Uint8Array;
+      let snapshot: FileSnapshot;
 
+      // Bytes and inode identity from one descriptor. The identity is half the
+      // precondition of step 5: it is what lets the write refuse a file that
+      // was replaced by a different one — which is how every editor saves —
+      // even when the replacement happens to hold identical bytes.
       try {
-        originalBytes = this.#files.readFileBytes(absolutePath);
+        snapshot = this.#files.readFileSnapshot(absolutePath);
       } catch (cause) {
         return await failed(readFailure(cause, file));
       }
+
+      const originalBytes = snapshot.bytes;
 
       originalHash = this.#files.hashBytes(originalBytes);
 
@@ -1265,6 +1448,12 @@ class SequencedPatcher implements Patcher {
       if (parent.value !== undefined) {
         previousRecordId = parent.value.id;
 
+        // The detector resolves the parent record's own `file` lexically inside
+        // the same project root, and `#resolveChainParent` has already
+        // established that `parent.file === file` — the path step 0 proved
+        // canonical and contained. So the delegation cannot reach a file this
+        // sequence has not already validated, and the lexical resolution there
+        // is not a second escape route.
         const baseline = await this.#confirmBaseline(parent.value, originalHash);
 
         if (isErr(baseline)) {
@@ -1431,12 +1620,36 @@ class SequencedPatcher implements Patcher {
 
       // ---------------------------------------------------------------------
       // Step 5 — the only write: temp file in the same directory, fsync,
-      // rename over the original, with the target's mode preserved.
+      // re-check that the target is still the file that was read, rename over
+      // it, with the target's mode preserved.
       // ---------------------------------------------------------------------
       stage = 'replace-file';
 
+      // The pin makes the write reach the directory that was verified whatever
+      // the path names by now — but "whatever the path names by now" is
+      // something the developer should be told about rather than written
+      // through silently. A directory moved or replaced since the pin was
+      // taken is reported as a conflict, so the session does not quietly
+      // instrument a file that is no longer where the plan said it was.
+      if (!pinned.verifyDirectory()) {
+        return await failed(raceLostDuringWrite('directory-changed', file, symbol, backup.path));
+      }
+
+      let replacement: AtomicReplaceVerdict;
+
+      // Conditional, not unconditional. Everything between step 1 and here — a
+      // parse, a transform, two digests, a backup write and a journal append —
+      // is time in which the developer can save the same file, and an
+      // unconditional `rename` would discard that edit with no trace and then
+      // record an `originalHash` for bytes they no longer had (CWE-367). The
+      // condition is the exact bytes step 1 read and the inode it read them
+      // from, and the install refuses rather than overwrites, so nothing at
+      // the target path is destroyed without being retained and inspected.
       try {
-        this.#files.replaceFile(absolutePath, patchedBytes);
+        replacement = this.#files.replaceFileIfUnchanged(absolutePath, patchedBytes, {
+          bytes: originalBytes,
+          identity: snapshot.identity,
+        });
       } catch (cause) {
         return await failed(
           new DebuggenError(
@@ -1449,6 +1662,15 @@ class SequencedPatcher implements Patcher {
             },
           ),
         );
+      }
+
+      if (replacement.kind === 'stale') {
+        // The developer's version is on disk untouched, so this is a conflict
+        // and not a failure to write: the record is moved to `failed` with both
+        // hashes on it, and reconciliation — which finds a file matching
+        // neither digest — reports it and leaves the file alone. AAP §0.5.1:
+        // never overwritten.
+        return await failed(raceLostDuringWrite(replacement.reason, file, symbol, backup.path));
       }
 
       fileMayHoldPatch = true;
@@ -1524,6 +1746,11 @@ class SequencedPatcher implements Patcher {
               cause,
             }),
       );
+    } finally {
+      // One descriptor per patched file, held only for the length of the
+      // sequence. A session that instruments twenty files must not end holding
+      // twenty directory handles.
+      pinned?.release();
     }
   }
 
@@ -1816,6 +2043,64 @@ function readFailure(cause: unknown, file: string): DebuggenError {
       cause,
     },
   );
+}
+
+/**
+ * The coded failure for a target whose canonical path could not be established.
+ *
+ * `resolveRealPathWithinProject` reports one code — `PATH_OUTSIDE_PROJECT` —
+ * for every refusal, which is right for a containment gate and wrong for the
+ * one refusal that is not about containment at all: a directory that is simply
+ * not there. That case is a stale plan, and it has a different answer for the
+ * developer, so it is re-coded here. The distinction comes from the platform
+ * errno the gate preserved on the error's `cause`; an escape carries no cause
+ * and therefore passes through untouched.
+ */
+function unresolvableTarget(error: DebuggenError, file: string): DebuggenError {
+  const errno = errnoCodeOf(error.cause);
+
+  if (errno !== 'ENOENT' && errno !== 'ENOTDIR') {
+    return error;
+  }
+
+  return new DebuggenError('PATCH_TARGET_NOT_FOUND', 'The file to patch is not there.', {
+    hint: 'Re-index the project: the plan named a file that no longer exists.',
+    details: { reason: 'file-not-found', file, errno },
+    cause: error,
+  });
+}
+
+/**
+ * The conflict for a target that stopped being the file this sequence read,
+ * detected by the conditional replacement immediately before the rename.
+ *
+ * `MODIFICATION_CONFLICT` rather than an install failure, because nothing
+ * failed: the write was *declined*, the developer's version is intact on disk,
+ * and the wording follows the baseline refusal in
+ * {@link SequencedPatcher.#confirmBaseline} so the two read alike whether the
+ * change landed before the sequence started or during it.
+ *
+ * The backup path is named in the hint because it is the one thing the
+ * developer cannot see for themselves: the bytes this sequence read are already
+ * durable there, whatever happens next.
+ */
+function raceLostDuringWrite(
+  reason: AtomicReplaceStaleReason | 'directory-changed',
+  file: string,
+  symbol: string,
+  backupPath: string,
+): DebuggenError {
+  const message =
+    reason === 'target-missing'
+      ? 'The file disappeared while it was being prepared for instrumentation.'
+      : reason === 'directory-changed'
+        ? 'The directory holding the file was moved or replaced while it was being prepared for instrumentation.'
+        : 'The file changed while it was being prepared for instrumentation.';
+
+  return new DebuggenError('MODIFICATION_CONFLICT', message, {
+    hint: `Nothing was written, so the file still holds your version; the bytes Debug Generator read are saved at ${backupPath}. Ask again once the file has settled.`,
+    details: { reason, file, symbol },
+  });
 }
 
 /**

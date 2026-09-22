@@ -14,14 +14,36 @@
  *
  * ## Declarations only
  *
- * This module contains **one interface, one optional extension of it and two
- * type guards** — and nothing else. It performs no I/O, constructs no client,
- * reads no environment variable, touches no filesystem, mutates no global and
- * throws nothing. Importing it has no observable effect beyond the declarations
- * it brings into scope, which is what the package manifest's
- * `"sideEffects": false` promises to every bundler that inlines this package
- * (the local service bundles it into its own output, and the editor extension
- * bundles that service into the packaged extension).
+ * This module contains **one interface, one optional extension of it, two type
+ * guards and one pure sentence builder** — and nothing else. It performs no
+ * I/O, constructs no client, reads no environment variable, touches no
+ * filesystem, mutates no global and throws nothing. Importing it has no
+ * observable effect beyond the declarations it brings into scope, which is what
+ * the package manifest's `"sideEffects": false` promises to every bundler that
+ * inlines this package (the local service bundles it into its own output, and
+ * the editor extension bundles that service into the packaged extension).
+ *
+ * ### Why the unavailable sentence is declared here
+ *
+ * {@link modelUnavailableMessage} builds AAP §0.5.5's one developer-facing
+ * sentence for a model boundary that cannot be used. Two very different
+ * boundaries have to show it — `./factory.js`, when the host's configuration
+ * cannot name a usable provider, and the network-backed implementation under
+ * `./providers/`, when a credential is rejected or a call cannot be made — and a
+ * developer must see the identical string from both, so it needs exactly one
+ * definition.
+ *
+ * It lives in this file because this file is a **leaf**: it imports only types,
+ * from `./types.js` and the base package, and nothing in the package imports it
+ * for anything it does not already depend on. Declaring the builder in
+ * `./factory.js` instead — where it began — forced the implementation to import
+ * *upward*, closing the runtime cycle
+ * `factory → providers/index → providers/anthropic → factory`, which is safe
+ * only while no imported binding is read during module evaluation and which no
+ * lint rule in this repository checks. Moving one pure function down to the
+ * contract it belongs to removes the cycle outright and costs nothing: the
+ * sentence is part of the failure contract stated below, and both the selector
+ * and the implementations already depend on this module.
  *
  * ### Why no model SDK is imported here
  *
@@ -59,7 +81,10 @@
  *   process. An implementation with a transport must run it; an implementation
  *   without one has nothing to guard.
  * - `./factory.js` selects and constructs an implementation from the host's
- *   configuration and is the only module that names one.
+ *   configuration and is the only module that names one. It imports
+ *   {@link modelUnavailableMessage} from here, as the network-backed
+ *   implementation does, so the two boundaries report one sentence without
+ *   either of them importing the other.
  */
 
 import type { DebuggenError, Result } from '@debuggen/shared';
@@ -488,4 +513,63 @@ export function isModelProvider(value: unknown): value is ModelProvider {
  */
 export function hasClose(provider: ModelProvider): provider is DisposableModelProvider {
   return 'close' in provider && typeof provider.close === 'function';
+}
+
+// ---------------------------------------------------------------------------
+// The one sentence both boundaries show
+// ---------------------------------------------------------------------------
+
+/**
+ * Builds the developer-facing sentence for a model boundary that cannot be
+ * used, in AAP §0.5.5's exact wording:
+ *
+ * > `Model provider unavailable (‹code›). Check ANTHROPIC_API_KEY or switch
+ * > DEBUGGEN_PROVIDER.`
+ *
+ * **The single definition of that sentence.** Two boundaries raise it:
+ * `./factory.js`, for a configuration that cannot name a usable provider, and
+ * the network-backed implementation under `./providers/`, for a credential the
+ * provider rejected, an exhausted quota, a call that could not be made and a
+ * provider that was closed. A developer must read the identical string from
+ * either, and both suites assert against this builder rather than against a
+ * pasted copy, so the two cannot drift apart. Writing the sentence out a second
+ * time anywhere in this package is the one thing this function exists to
+ * prevent.
+ *
+ * It is declared in this module, rather than beside the selector that first
+ * needed it, because this module is a leaf: an implementation can call it
+ * without importing a module that imports the implementation. See this file's
+ * overview for the cycle that arrangement removes.
+ *
+ * ## What may be passed in, and what may never be
+ *
+ * `code` is the condition being reported, and by convention it is the closed
+ * vocabulary `DebuggenError` code the failure carries — so the code a user
+ * interface branches on and the code the sentence quotes cannot disagree. It is
+ * typed as `string` rather than as `DebuggenErrorCode` for one reason: this
+ * module imports the base package for types only, and a caller that has a code
+ * in hand always has it as one of those members anyway.
+ *
+ * **Nothing about a credential may ever be passed in** — not its value, not a
+ * prefix of it, not its length. The sentence names the *variable* that carries
+ * one and the switch that avoids needing one, and that is the whole of what it
+ * discloses. It is also why there is no second parameter: a builder that
+ * accepted a detail string would eventually be handed one.
+ *
+ * Pure: it reads nothing, allocates one string and has no failure mode.
+ *
+ * @param code The condition code to quote inside the sentence.
+ * @returns The complete sentence, ready to be used as a `DebuggenError` message.
+ *
+ * @example Raising the shared sentence for a rejected credential
+ * ```ts
+ * return err(
+ *   new DebuggenError('MODEL_UNAVAILABLE', modelUnavailableMessage('MODEL_UNAVAILABLE'), {
+ *     hint: 'The provider rejected the credential. Check that it is current.',
+ *   }),
+ * );
+ * ```
+ */
+export function modelUnavailableMessage(code: string): string {
+  return `Model provider unavailable (${code}). Check ANTHROPIC_API_KEY or switch DEBUGGEN_PROVIDER.`;
 }

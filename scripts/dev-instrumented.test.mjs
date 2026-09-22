@@ -52,14 +52,18 @@ import process from 'node:process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import {
+  DEFAULT_SERVICE_HOST,
+  DEFAULT_SERVICE_PORT,
   INGEST_PATH,
   SERVICE_ROUTES,
   awaitShutdownSignal,
   buildChildEnv,
   describeToken,
+  isLoopbackHostname,
   launchDevServer,
   main,
   parseArgs,
+  resolveServiceBase,
   stopDevServer,
 } from './dev-instrumented.mjs';
 
@@ -675,6 +679,208 @@ describe('route helpers in isolation', () => {
   });
 });
 
+describe('the service address trust boundary', () => {
+  /**
+   * Start a loopback server that answers every request with a redirect and
+   * records what it was asked for.
+   *
+   * @param {string} location the `Location` header to answer with
+   * @returns {Promise<{ base: string, requests: string[], close: () => Promise<void> }>}
+   */
+  async function startRedirectingServer(location) {
+    /** @type {string[]} */
+    const requests = [];
+    const server = http.createServer((req, res) => {
+      requests.push(
+        `${req.method ?? 'GET'} ${new URL(req.url ?? '/', 'http://127.0.0.1').pathname}`,
+      );
+      res.writeHead(307, { location });
+      res.end();
+    });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve(undefined)));
+    const address = server.address();
+    const port = typeof address === 'object' && address !== null ? address.port : 0;
+    return {
+      base: `http://127.0.0.1:${port}`,
+      requests,
+      close: () =>
+        new Promise((resolve) => {
+          server.closeAllConnections();
+          server.close(() => resolve(undefined));
+        }),
+    };
+  }
+
+  /**
+   * Start a loopback server that records every request, including its
+   * `Authorization` header, and answers 200.
+   *
+   * @returns {Promise<{ base: string, authorizations: (string | undefined)[], close: () => Promise<void> }>}
+   */
+  async function startRecordingServer() {
+    /** @type {(string | undefined)[]} */
+    const authorizations = [];
+    const server = http.createServer((req, res) => {
+      authorizations.push(req.headers.authorization);
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(LAUNCHED));
+    });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve(undefined)));
+    const address = server.address();
+    const port = typeof address === 'object' && address !== null ? address.port : 0;
+    return {
+      base: `http://127.0.0.1:${port}`,
+      authorizations,
+      close: () =>
+        new Promise((resolve) => {
+          server.closeAllConnections();
+          server.close(() => resolve(undefined));
+        }),
+    };
+  }
+
+  it('recognises loopback addresses and nothing else', () => {
+    for (const host of [
+      DEFAULT_SERVICE_HOST,
+      '127.0.0.2',
+      '127.255.255.254',
+      'localhost',
+      'LOCALHOST',
+      '::1',
+      '[::1]',
+      '::ffff:127.0.0.1',
+      '::ffff:7f00:1',
+    ]) {
+      expect(isLoopbackHostname(host), `${host} is loopback`).toBe(true);
+    }
+
+    for (const host of [
+      '0.0.0.0',
+      '::',
+      '192.168.1.5',
+      '10.0.0.7',
+      '8.8.8.8',
+      'service.example.invalid',
+      // Resolver-dependent, so not verifiable loopback.
+      'app.localhost',
+      // A public name wearing a loopback-looking prefix.
+      '127.0.0.1.example.invalid',
+      '999.0.0.1',
+      '::ffff:192.168.0.1',
+      '',
+    ]) {
+      expect(isLoopbackHostname(host), `${host} is not loopback`).toBe(false);
+    }
+  });
+
+  it('resolves the documented loopback defaults and honours a loopback override', () => {
+    expect(resolveServiceBase({ env: {} })).toBe(
+      `http://${DEFAULT_SERVICE_HOST}:${DEFAULT_SERVICE_PORT}`,
+    );
+    expect(
+      resolveServiceBase({ env: { DEBUGGEN_HOST: 'localhost', DEBUGGEN_PORT: '20000' } }),
+    ).toBe('http://localhost:20000');
+    // A bare IPv6 host is bracketed, and the brackets survive the check.
+    expect(resolveServiceBase({ env: { DEBUGGEN_HOST: '::1', DEBUGGEN_PORT: '20000' } })).toBe(
+      'http://[::1]:20000',
+    );
+    expect(resolveServiceBase({ service: 'https://127.0.0.1:8443', env: {} })).toBe(
+      'https://127.0.0.1:8443',
+    );
+    // A path prefix on the override is preserved; only the trailing slash goes.
+    expect(resolveServiceBase({ service: 'http://127.0.0.1:43117/debuggen/', env: {} })).toBe(
+      'http://127.0.0.1:43117/debuggen',
+    );
+  });
+
+  it('refuses a service address off this machine, from either route', () => {
+    // Every request this command makes carries the editor credential, which is
+    // what authorises minting a server-agent credential and launching a
+    // process. An address that is not loopback is not the local service.
+    for (const service of [
+      'http://192.168.1.5:43117',
+      'http://10.0.0.7:43117',
+      'http://service.example.invalid',
+      'https://service.example.invalid',
+      'http://0.0.0.0:43117',
+    ]) {
+      expect(() => resolveServiceBase({ service, env: {} }), service).toThrow(
+        /--service must address a loopback host/u,
+      );
+    }
+
+    for (const host of ['0.0.0.0', '192.168.1.5', 'service.example.invalid']) {
+      expect(() => resolveServiceBase({ env: { DEBUGGEN_HOST: host } }), host).toThrow(
+        /DEBUGGEN_HOST is not a loopback host/u,
+      );
+    }
+
+    // Assembled from fragments, not written out: `pnpm check:secrets` refuses any
+    // tracked URI whose authority embeds a user and a password, and rightly
+    // cannot tell a rejected test input from a pasted credential.
+    const withUserinfo = ['http://', 'someone', ':', 'placeholder', '@', '127.0.0.1:43117'].join(
+      '',
+    );
+    expect(() => resolveServiceBase({ service: withUserinfo, env: {} })).toThrow(
+      /must not embed credentials/u,
+    );
+  });
+
+  it('refuses a non-loopback address before it reads the credential or spawns anything', async () => {
+    const fixture = await createFixture();
+    const { context, stdout, stderr } = contextFor(fixture);
+
+    const code = await main(['--service', 'http://192.168.1.5:43117', '--detach'], context);
+
+    expect(code).toBe(2);
+    expect(stderr.text()).toContain('loopback');
+    expect(stdout.text()).not.toContain(EDITOR_TOKEN);
+    expect(stderr.text()).not.toContain(EDITOR_TOKEN);
+  });
+
+  it('refuses to follow a redirect, so the credential never reaches the target origin', async () => {
+    const target = await startRecordingServer();
+    const redirector = await startRedirectingServer(`${target.base}${LAUNCH}`);
+
+    try {
+      await expect(
+        launchDevServer({
+          base: redirector.base,
+          editorToken: EDITOR_TOKEN,
+          projectRoot: path.join(os.tmpdir(), 'some-project'),
+        }),
+      ).rejects.toThrow(/failed/u);
+
+      // The redirect was received and refused: the second origin was never
+      // asked for anything, so it never saw the bearer token.
+      expect(redirector.requests).toEqual([`POST ${LAUNCH}`]);
+      expect(target.authorizations).toEqual([]);
+    } finally {
+      await redirector.close();
+      await target.close();
+    }
+  });
+
+  it('refuses a redirected health probe rather than trusting another origin', async () => {
+    const target = await startRecordingServer();
+    const redirector = await startRedirectingServer(`${target.base}${HEALTH}`);
+    const fixture = await createFixture();
+    const { context, stderr } = contextFor(fixture);
+
+    try {
+      const code = await main(['--service', redirector.base, '--detach'], context);
+
+      expect(code).toBe(2);
+      expect(stderr.text()).toContain('not answering');
+      expect(redirector.requests).toEqual([`GET ${HEALTH}`]);
+      expect(target.authorizations).toEqual([]);
+    } finally {
+      await redirector.close();
+      await target.close();
+    }
+  });
+});
+
 describe('the local spawn mode', () => {
   it('attaches the preload and the ingest URL and carries no credential', () => {
     const childEnv = buildChildEnv({
@@ -891,15 +1097,17 @@ describe('the documented environment contract', () => {
 
   it('marks the launcher-injected variables as injected rather than configurable', () => {
     const injectedSection = envExample.slice(envExample.indexOf('Injected by the tool'));
-    for (const name of [
-      'DEBUGGEN_TOKEN',
-      'DEBUGGEN_INGEST_URL',
-      'DEBUGGEN_PROJECT_ROOT',
-      'DEBUGGEN_PROMPTS_DIR',
-    ]) {
+    for (const name of ['DEBUGGEN_TOKEN', 'DEBUGGEN_INGEST_URL', 'DEBUGGEN_PROJECT_ROOT']) {
       expect(injectedSection).toContain(name);
       // Never as an assignable line: setting them by hand has no effect.
       expect(envExample).not.toMatch(new RegExp(`^${name}=`, 'mu'));
     }
+    // DEBUGGEN_PROMPTS_DIR is deliberately NOT in that list: the local service
+    // reads it from `.env` like every other key in its contract
+    // (`SERVICE_ENV_KEYS` in apps/local-service/src/config.ts), so a value set
+    // by hand does take effect - it sits one step below an explicit host
+    // override in the prompt-directory precedence. It is documented as an
+    // assignable service key for that reason.
+    expect(envExample).toMatch(/^DEBUGGEN_PROMPTS_DIR=$/mu);
   });
 });

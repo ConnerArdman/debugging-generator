@@ -53,26 +53,28 @@
  * inventing time the application never spent. Do not give this event a
  * duration.
  *
- * ## Attribute keys: the catalog's where it has them, four named additions
+ * ## Every attribute key comes from the catalog
  *
- * `../schema/attributes.ts` is authoritative, and its `state` tuple supplies
- * `component`, `hookIndex`, `hookLabel`, `previousValue` (this module's
- * `from`) and `nextValue` (its `to`). Four keys have no equivalent there and
- * are spelled out below so that catalog can adopt them verbatim:
- * `transitionSource`, `renderSpanId`, `fiberId` and `truncated`.
+ * `../schema/attributes.ts` is authoritative and its `state` tuple declares
+ * every key this module writes: `component`, `hookIndex`, `hookLabel`,
+ * `previousValue` (this module's `from`), `nextValue` (its `to`),
+ * `transitionSource`, `triggerSpanId`, `renderSpanId`, `fiberId`, `truncated`
+ * and `droppedTransitions`. Each is bound below against that tuple's member
+ * union, so a rename in the catalog is a compile error here rather than an
+ * attribute `../aggregate/timeline.ts` silently stops finding.
  *
- * The one catalog key this module deliberately leaves **unset** is
- * `triggerEventId`, and the reason is a live consumer rather than a
- * preference. `../aggregate/timeline.ts`'s `resolveTrigger` reads that key,
- * looks the value up among event **ids** (`evt_…`, minted by `./transport.ts`)
- * and — when it is present — stops there instead of walking the parent chain.
- * What `./react.ts` holds is the interaction's, or a settled request's, **span
- * id**: a different identifier space. Writing it under `triggerEventId` would
- * give the viewer a link to an event that does not exist *and* suppress the
- * resolution that would have worked. So the span id travels under
- * `triggerSpanId`, matching the field name the aggregate's `StateTransition`
- * already uses, and the parent-chain route keeps answering. A producer that
- * one day knows the trigger's event id should write `triggerEventId` then.
+ * ## The trigger travels as a span id, because that is what this producer holds
+ *
+ * The catalog declares two trigger keys because there are two identifier
+ * spaces. An event id (`evt_…`, minted by `./transport.ts` when an event is
+ * queued) and a span id (16 hex characters) are not interchangeable, and a
+ * producer writes whichever one it has. What `./react.ts` resolves per commit
+ * is the interaction's — or, under async continuation, the settled request's —
+ * **span id**, so this module writes `triggerSpanId`; `triggerEventId` belongs
+ * to a producer that knows the trigger's event id. `../aggregate/timeline.ts`
+ * resolves them in that order — `triggerEventId`, then `triggerSpanId` through
+ * its span index — and only walks the parent chain when the producer named
+ * neither, so the direct trigger this module reports is the one a row shows.
  *
  * ## Bounds are load-bearing
  *
@@ -80,10 +82,15 @@
  * consuming it (AAP 0.8.2): a minute of that is thousands of transitions. Two
  * bounds keep one capture from becoming a memory profile of the page —
  * {@link MAX_TRANSITIONS_PER_COMMIT} per call and
- * {@link MAX_TRANSITIONS_PER_CAPTURE} per capture — and when either bites, the
- * last event emitted says so with `truncated`. A panel that knows a list was
- * cut can tell the developer; a panel handed a silently short list presents it
- * as exhaustive, which is the failure this product exists to avoid.
+ * {@link MAX_TRANSITIONS_PER_CAPTURE} per capture.
+ *
+ * Whichever bites, the loss reaches the evidence rather than only the
+ * counters. A call that emitted something marks its last event `truncated`; a
+ * call the per-capture bound left no room for at all has nothing to mark, so
+ * one bounded sentinel event per capture carries `truncated` and
+ * `droppedTransitions` instead. A panel that knows a list was cut can tell the
+ * developer; a panel handed a silently short list presents it as exhaustive,
+ * which is the failure this product exists to avoid.
  *
  * ## Imports are a constraint, not a coincidence
  *
@@ -93,10 +100,10 @@
  * `@debuggen/shared/node` or `zod`. The four imports below are the whole list:
  * ids and transport for behaviour, `./fiber-diff.js` and `./interaction.js`
  * for the shapes that arrive (type-only, so no dependency direction is
- * implied at runtime), and the attribute catalog for the key spellings and the
- * shared privacy bound. `./react.js` is **not** imported and must never be:
- * that module imports this one, and the cycle would be a build failure rather
- * than a subtle bug.
+ * implied at runtime), and the attribute catalog for the key spellings, the
+ * transition-source vocabulary and the shared privacy bound. `./react.js` is
+ * **not** imported and must never be: that module imports this one, and the
+ * cycle would be a build failure rather than a subtle bug.
  *
  * @see ./fiber-diff.ts for the diff and the privacy bounds it applies.
  * @see ../schema/attributes.ts for the `state` attribute vocabulary.
@@ -104,13 +111,15 @@
  */
 
 import { isSpanId, isTraceId, newSpanId } from './ids.js';
-import { emitMany, nowEpochMs, type EventDraft } from './transport.js';
+import { emitMany, nowEpochMs, reportProducerFailure, type EventDraft } from './transport.js';
 import type { ContextChange, HookChange, ValueSummary } from './fiber-diff.js';
 import type { EventContext } from './interaction.js';
 import {
   MAX_TRACKED_KEYS,
+  TRANSITION_SOURCES,
   type AttributeValueSummary,
   type STATE_ATTRIBUTE_KEYS,
+  type TransitionSource,
 } from '../schema/attributes.js';
 
 /*
@@ -155,34 +164,35 @@ export const MAX_TRANSITIONS_PER_COMMIT = MAX_TRACKED_KEYS;
  *
  * The bound is not a filter on *which* transitions are kept — they are the
  * earliest, in emission order — and reaching it is reported through
- * {@link getStateStats} and on the last emitted event.
+ * {@link getStateStats}, on the last emitted event of a run it cut, and, once
+ * it leaves a call with nothing to emit, on the capture's truncation sentinel.
  */
 export const MAX_TRANSITIONS_PER_CAPTURE = 5000;
 
 /**
- * The two kinds of value a transition can describe: the fiber's own hook state,
- * and a context value it consumes.
+ * The two kinds of value a transition can describe — the fiber's own hook
+ * state, and a context value it consumes — re-exported from
+ * `../schema/attributes.ts`, which declares them.
  *
- * Frozen, like every other vocabulary in this package: a reader of a `state`
- * event's `transitionSource` attribute is reading one of these two strings and
- * nothing else. `unchanged` and the rest of `RenderTrigger` are deliberately
- * absent — that vocabulary classifies *why a fiber rendered*, which is a
- * `render` event's business, while this one says *which dimension changed*.
+ * The vocabulary lives in the schema layer because both sides of the contract
+ * need it and `../aggregate/timeline.ts` cannot import a page-agent module: it
+ * validates a row's `transitionSource` against this same tuple. Re-exported
+ * here because this module writes the attribute, so a reader of the producer
+ * has the vocabulary in front of them, and `TRANSITION_SOURCES` remains
+ * importable from either place without either copy being able to drift.
  */
-export const TRANSITION_SOURCES = Object.freeze(['state', 'context'] as const);
+export { TRANSITION_SOURCES };
 
 /** One member of the closed transition-source vocabulary. */
-export type TransitionSource = (typeof TRANSITION_SOURCES)[number];
+export type { TransitionSource };
 
 /*
  * ---------------------------------------------------------------------------
  * Attribute keys
  *
- * Every key this module writes, resolved once. The five the catalog declares
- * are annotated with its tuple's member union, so a rename there is a compile
- * error here rather than an attribute the aggregate silently stops finding.
- * The four it does not declare are plain string constants, each with the note
- * that names it as an addition.
+ * Every key this module writes, resolved once and annotated with the catalog
+ * tuple's member union, so a rename there is a compile error here rather than
+ * an attribute the aggregate silently stops finding.
  * ---------------------------------------------------------------------------
  */
 
@@ -207,55 +217,65 @@ const KEY_NEXT_VALUE: StateAttributeKey = 'nextValue';
 /**
  * Which dimension changed: a member of {@link TRANSITION_SOURCES}.
  *
- * **Addition**, spelled `transitionSource`, for `../schema/attributes.ts` to
- * adopt into `STATE_ATTRIBUTE_KEYS`. Without it a consumer cannot tell a hook
- * transition from a context transition, and those support different
- * conclusions: a component's own state changing is the component's doing,
- * while a consumed context changing is a provider's.
+ * What separates a hook transition from a context transition, and those
+ * support different conclusions: a component's own state changing is the
+ * component's doing, while a consumed context changing is a provider's.
+ * Written on every value transition and on nothing else — the truncation
+ * sentinel {@link recordStateTransitions} may emit describes no value, so it
+ * carries no source.
  */
-const KEY_TRANSITION_SOURCE = 'transitionSource';
+const KEY_TRANSITION_SOURCE: StateAttributeKey = 'transitionSource';
 
 /**
  * The span id of the interaction, or of the settled request, that this work is
  * attributed to.
  *
- * **Addition**, spelled `triggerSpanId` to match the field
- * `../aggregate/timeline.ts`'s `StateTransition` already exposes. See the
- * module documentation for why the catalog's `triggerEventId` is not used for
- * a span id.
+ * The direct trigger `../aggregate/timeline.ts` resolves through its span
+ * index before it walks a parent chain. See the module documentation for why
+ * this producer writes a span id and not `triggerEventId`.
  */
-const KEY_TRIGGER_SPAN_ID = 'triggerSpanId';
+const KEY_TRIGGER_SPAN_ID: StateAttributeKey = 'triggerSpanId';
 
 /**
  * The span id of the render this transition was observed in — the same value
  * as the event's `parentSpanId`.
  *
- * **Addition**, spelled `renderSpanId`. Duplicating the parent onto the
- * attribute bag costs sixteen characters and buys a filterable, groupable
- * field: the aggregates read attributes, and "every transition seen in this
- * render" is a question a panel asks without walking the trace tree.
+ * Duplicating the parent onto the attribute bag costs sixteen characters and
+ * buys a filterable, groupable field: the aggregates read attributes, and
+ * "every transition seen in this render" is a question a panel asks without
+ * walking the trace tree.
  */
-const KEY_RENDER_SPAN_ID = 'renderSpanId';
+const KEY_RENDER_SPAN_ID: StateAttributeKey = 'renderSpanId';
 
 /**
  * The fiber's identity within the document, when `./react.ts` resolved one.
  *
- * **Addition**, spelled `fiberId`. Two components with the same display name
- * are one row when grouped by `component`; the fiber id is what distinguishes
- * the forty-eighth card from the first.
+ * Two components with the same display name are one row when grouped by
+ * `component`; the fiber id is what distinguishes the forty-eighth card from
+ * the first.
  */
-const KEY_FIBER_ID = 'fiberId';
+const KEY_FIBER_ID: StateAttributeKey = 'fiberId';
 
 /**
  * Set to `true` on the last event of a call whose transition list was cut by
- * one of the two bounds.
+ * one of the two bounds, and on the truncation sentinel.
  *
- * **Addition**, spelled `truncated`. Note the level: this is a statement about
- * the *list of transitions*, whereas the `truncated` field inside a
- * `previousValue` or `nextValue` summary is a statement about that one
- * preview. Both are needed and neither implies the other.
+ * Note the level: this is a statement about the *list of transitions*, whereas
+ * the `truncated` field inside a `previousValue` or `nextValue` summary is a
+ * statement about that one preview. Both are needed and neither implies the
+ * other.
  */
-const KEY_TRUNCATED = 'truncated';
+const KEY_TRUNCATED: StateAttributeKey = 'truncated';
+
+/**
+ * How many reported transitions the bounds left without an event of their own.
+ *
+ * Written beside {@link KEY_TRUNCATED} on the truncation sentinel, the one
+ * event whose only job is to disclose the loss: `truncated` says the list is
+ * incomplete and this says by how much, so the loss is in the persisted
+ * evidence rather than only in {@link getStateStats}.
+ */
+const KEY_DROPPED_TRANSITIONS: StateAttributeKey = 'droppedTransitions';
 
 /*
  * ---------------------------------------------------------------------------
@@ -310,6 +330,18 @@ const HOOK_SLOT = 'hook';
 
 /** The slot word used in a context transition's name. */
 const CONTEXT_SLOT = 'context';
+
+/**
+ * The name of the truncation sentinel: `state transitions dropped`.
+ *
+ * Deliberately unlike a transition's name — no component, no slot, no index —
+ * because the event is not a transition and an event log, a timeline and the
+ * `stateTransitions` table all display this string verbatim. Naming it from a
+ * constant is what lets a consumer recognise the sentinel by its shape
+ * (`truncated` set, no `transitionSource`, no value summaries) *and* read a
+ * sentence that explains itself.
+ */
+const TRUNCATION_SENTINEL_NAME = 'state transitions dropped';
 
 /*
  * ---------------------------------------------------------------------------
@@ -496,6 +528,17 @@ let truncatedCount = 0;
 
 /** Calls that failed part-way and were swallowed, since the last reset. */
 let failureCount = 0;
+
+/**
+ * Whether this capture has already emitted the truncation sentinel.
+ *
+ * One sentinel per capture, not one per call: once the per-capture bound is
+ * exhausted every further commit overflows, and a sentinel each would be the
+ * unbounded flood the bound exists to prevent. The flag says "the loss has
+ * been disclosed on the evidence", and the running total in
+ * {@link getStateStats} is what keeps growing after it.
+ */
+let truncationDisclosed = false;
 
 /*
  * ---------------------------------------------------------------------------
@@ -864,25 +907,114 @@ function planTransitions(context: CallContext, runs: readonly ChangeRun[]): Tran
  * Records on the last emitted event that the list was cut.
  *
  * The last one, not the first, because a consumer reads the run in order and
- * the honest place for "and there were more" is the end. When the per-capture
- * bound left no room at all there is nothing to mark — the loss is still
- * counted in {@link getStateStats}, and a capture that has reached five
- * thousand transitions has already told the developer everything this flag
- * would.
+ * the honest place for "and there were more" is the end. A call that emitted
+ * nothing at all has no event to carry the disclosure, which is what
+ * {@link buildTruncationSentinel} exists for.
+ *
+ * @returns Whether a draft carried the flag.
  */
-function markTruncated(drafts: readonly EventDraft[]): void {
+function markTruncated(drafts: readonly EventDraft[]): boolean {
   const last = drafts[drafts.length - 1];
   if (last === undefined) {
-    return;
+    return false;
   }
   last.attributes[KEY_TRUNCATED] = true;
+  return true;
 }
 
-/** Returns all three counters to zero. */
+/**
+ * Builds the one event that discloses a loss no transition could carry.
+ *
+ * Reached when a call reported transitions and none of them became an event,
+ * so there is no draft for {@link markTruncated} to flag: the per-capture
+ * bound left a budget of zero, or every reported entry was too malformed to
+ * describe. Without this event the loss would live only in the in-page
+ * {@link getStateStats}, which no panel and no generated analysis can read —
+ * the capture's persisted evidence would present a short list as an exhaustive
+ * one, which is the failure the `truncated` attribute exists to prevent.
+ *
+ * What it is, and is not:
+ *
+ * - **Not a transition.** It carries no `transitionSource`, no `hookIndex`, no
+ *   `hookLabel` and no value summaries, so `../aggregate/timeline.ts` reports
+ *   it with `changed: false` — the shape that already means "a viewer must not
+ *   render this row as a value transition".
+ * - **A disclosure.** `truncated` says the transition list is incomplete and
+ *   `droppedTransitions` says how many reported transitions produced no event
+ *   of their own **so far in this capture**: a floor, since one sentinel is
+ *   emitted per capture and the total keeps rising behind it.
+ * - **Context-bearing**, so the disclosure is attributable rather than
+ *   free-floating: the component, trace, render span, trigger span and fiber of
+ *   the call that overflowed, plus the same lineage merge every draft gets, in
+ *   the same order — this module's keys first, the attribution's afterwards.
+ *
+ * Status and duration follow the module's conventions: an overflow is an
+ * observation rather than a failed operation, and a disclosure is an instant.
+ */
+function buildTruncationSentinel(context: CallContext, dropped: number): EventDraft {
+  const attributes: Record<string, unknown> = {};
+
+  if (context.component !== undefined) {
+    attributes[KEY_COMPONENT] = context.component;
+  }
+  attributes[KEY_TRUNCATED] = true;
+  attributes[KEY_DROPPED_TRANSITIONS] = dropped;
+
+  if (context.triggerSpanId !== undefined) {
+    attributes[KEY_TRIGGER_SPAN_ID] = context.triggerSpanId;
+  }
+  if (context.renderSpanId !== undefined) {
+    attributes[KEY_RENDER_SPAN_ID] = context.renderSpanId;
+  }
+  if (context.fiberId !== undefined) {
+    attributes[KEY_FIBER_ID] = context.fiberId;
+  }
+
+  mergeLineage(attributes, context.lineageAttributes);
+
+  const draft: EventDraft = {
+    traceId: context.traceId,
+    spanId: newSpanId(),
+    kind: STATE_KIND,
+    name: TRUNCATION_SENTINEL_NAME,
+    startTime: context.startTime,
+    duration: TRANSITION_DURATION_MS,
+    attributes,
+    status: TRANSITION_STATUS,
+  };
+
+  if (context.renderSpanId !== undefined) {
+    draft.parentSpanId = context.renderSpanId;
+  }
+
+  return draft;
+}
+
+/**
+ * Emits the truncation sentinel, at most once per capture.
+ *
+ * The flag is set before the hand-off, so a second overflow in the same
+ * capture is a comparison and nothing more, and so a hand-off that somehow
+ * failed cannot be retried on every subsequent commit. The sentinel is
+ * deliberately **not** added to {@link emittedCount}: that counter is what
+ * {@link MAX_TRANSITIONS_PER_CAPTURE} bounds and it counts transitions, of
+ * which this event is not one — counting it would spend a transition's budget
+ * on the disclosure that the budget ran out.
+ */
+function discloseTruncation(context: CallContext, dropped: number): void {
+  if (truncationDisclosed) {
+    return;
+  }
+  truncationDisclosed = true;
+  emitMany([buildTruncationSentinel(context, dropped)]);
+}
+
+/** Returns the three counters to zero and re-arms the truncation sentinel. */
 function clearCounters(): void {
   emittedCount = 0;
   truncatedCount = 0;
   failureCount = 0;
+  truncationDisclosed = false;
 }
 
 /*
@@ -905,7 +1037,7 @@ function clearCounters(): void {
  * mid-capture, and resetting the counters then would silently lift the
  * per-capture bound and restate an already-reported truncation as zero.
  *
- * Cannot throw: it assigns two module variables and calls no host API.
+ * Cannot throw: it assigns module variables and calls no host API.
  */
 export function attachState(): void {
   if (enabled) {
@@ -955,13 +1087,21 @@ export function isStateAttached(): boolean {
  * one component's transitions is a gap in evidence, while an exception raised
  * here is a React commit that did not finish.
  *
+ * It is also **reported**, through `./transport.js`'s `reportProducerFailure`:
+ * a counter nobody polls leaves the service, the panel and the VS Code view
+ * describing a capture that succeeded while a whole signal is missing, which
+ * is exactly what AAP 0.5.5 forbids. The report carries the source, the stage
+ * and the thrown value's type — never a value read off the fiber.
+ *
  * What it does, in order:
  *
  * 1. Returns immediately when detached, before allocating anything.
- * 2. Rejects a malformed `traceId` (counted as a failure), because an event
- *    that cannot join a trace cannot be read by any panel.
+ * 2. Rejects a malformed `traceId` (counted and reported as a failure), because
+ *    an event that cannot join a trace cannot be read by any panel.
  * 3. Resolves the call-wide fields once, degrading each unusable one.
- * 4. Plans the run under both bounds and marks a cut list.
+ * 4. Plans the run under both bounds and discloses a cut list — on the run's
+ *    last event, or, when the call produced no event to mark, through the one
+ *    truncation sentinel this capture emits.
  * 5. Hands the whole run to `./transport.ts` in one `emitMany` call, which
  *    takes the capture gate once and consumes consecutive sequence numbers —
  *    the numbers `../correlation/correlator.ts` orders two transitions by when
@@ -980,6 +1120,13 @@ export function recordStateTransitions(input: RecordTransitionsInput): void {
   try {
     if (!isTraceId(input.traceId)) {
       failureCount += 1;
+      // Reported as well as counted: this call's transitions are gone, and a
+      // capture that lost a signal has to be a capture known to have lost it
+      // (AAP 0.5.5). `getStateStats().failures` is read only by a diagnostics
+      // view, so on its own it reaches nobody. Nothing about the rejected
+      // value travels — not the trace id, not the component — because a
+      // control frame is not redacted anywhere on its way to the service.
+      reportProducerFailure('state', 'trace-id');
       return;
     }
 
@@ -988,11 +1135,17 @@ export function recordStateTransitions(input: RecordTransitionsInput): void {
       { source: CONTEXT_SOURCE, changes: input.contextChanges ?? NO_CHANGES },
     ];
 
-    const plan = planTransitions(resolveContext(input), runs);
+    const context = resolveContext(input);
+    const plan = planTransitions(context, runs);
 
     if (plan.dropped > 0) {
       truncatedCount += plan.dropped;
-      markTruncated(plan.drafts);
+      if (!markTruncated(plan.drafts)) {
+        // Nothing of this call survived the bounds, so the disclosure needs an
+        // event of its own; `truncatedCount` is already the capture's running
+        // total, which is the floor the sentinel reports.
+        discloseTruncation(context, truncatedCount);
+      }
     }
 
     if (plan.drafts.length === 0) {
@@ -1006,10 +1159,16 @@ export function recordStateTransitions(input: RecordTransitionsInput): void {
     // bound drift upward.
     emittedCount += plan.drafts.length;
     emitMany(plan.drafts);
-  } catch {
+  } catch (error) {
     // An exotic iterable, a getter that throws, a hostile `label` — none of
-    // them may cost the commit this ran inside.
+    // them may cost the commit this ran inside. The containment is unchanged:
+    // the count stands, the exception stays swallowed, and the report is the
+    // additional statement AAP 0.5.5 requires so the missing transitions are
+    // visible to the service rather than only to a local counter. The reporter
+    // is bounded and never throws, so calling it from inside a commit callback
+    // costs a failing fiber four frames per capture and nothing more.
     failureCount += 1;
+    reportProducerFailure('state', 'transition-record', error);
   }
 }
 
@@ -1020,6 +1179,10 @@ export function recordStateTransitions(input: RecordTransitionsInput): void {
  * {@link MAX_TRANSITIONS_PER_CAPTURE} to a capture rather than to the
  * document's whole lifetime. {@link detachState} resets them too, so an
  * arm/disarm cycle needs no separate call.
+ *
+ * It also re-arms the truncation sentinel: "at most one" is per capture, so a
+ * new capture that exhausts the bound discloses its own loss rather than
+ * inheriting the previous capture's disclosure.
  *
  * Cannot throw.
  */
@@ -1034,11 +1197,16 @@ export function resetStateCounters(): void {
  * module-scope numbers and one small object, with nothing traversed.
  *
  * - `emitted` — transitions handed to `./transport.ts`. The quantity
- *   {@link MAX_TRANSITIONS_PER_CAPTURE} bounds.
+ *   {@link MAX_TRANSITIONS_PER_CAPTURE} bounds, and transitions only: the
+ *   at-most-one truncation sentinel a capture emits is a disclosure rather
+ *   than a transition and is counted in neither this number nor the bound.
  * - `truncated` — reported transitions that produced no event: the remainder
  *   past either bound, plus any entry too malformed to describe. A non-zero
- *   value means a panel's transition list is incomplete, which is exactly what
- *   the `truncated` attribute on the last emitted event says.
+ *   value means a panel's transition list is incomplete, which is what the
+ *   `truncated` attribute on the last emitted event of a run — or on the
+ *   sentinel — says. This number keeps rising after the sentinel was emitted,
+ *   so it is the live total where the sentinel's `droppedTransitions` is the
+ *   floor recorded at the instant of disclosure.
  * - `failures` — calls that were rejected or that failed part-way and were
  *   swallowed. Non-zero means a caller is breaking the input contract; it is
  *   never the page's fault.

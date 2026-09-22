@@ -3,24 +3,26 @@
  *
  * One route, one question: what is in stock, where, and which lines are close enough to their
  * reorder point to be worth acting on. The page reads the dashboard's payload once and hands it to
- * three components - the filter row, the figure row and the low-stock list - each of which owns its
- * own markup, its own heading and its own empty state. There is nothing else here: no query, no
- * paging arithmetic, no formatting and no copy that belongs to a component.
+ * four components - the filter row, the figure row, the stock table and the low-stock list - each
+ * of which owns its own markup, its own heading and its own empty state. There is nothing else
+ * here: no query, no paging arithmetic, no formatting and no copy that belongs to a component.
  *
- * A SERVER COMPONENT THAT CALLS THE SERVICE DIRECTLY
- * There is no `'use client'` directive in this file. The one client boundary in the route is
- * `WarehouseFilter`, which is rendered as a child, so the rest of the page costs the browser
- * nothing. The payload comes from `readInventorySummary` rather than from a `fetch` of
- * `/api/inventory/summary`: the endpoint exists for a caller outside this application, and a server
- * render that fetched its own route would pay for a second HTTP round trip, an absolute URL it has
- * no honest value for, and a second chance to fail.
+ * THE ENDPOINT IS READ, NOT THE SERVICE
+ * `GET /api/inventory/summary` is this dashboard's feed, and the page asks it for the payload over
+ * HTTP - through `loadInventorySummary` in `@/lib/api-client` - rather than calling the inventory
+ * service in process. One code path therefore answers the dashboard a reader is looking at and any
+ * other caller of the same endpoint, so the two cannot drift: the parameters the endpoint bounds
+ * are bounded for this page too, and the payload it serializes is the payload rendered here. A
+ * server render has no relative base to resolve `/api/...` against, so the address the read is sent
+ * to comes from `@/server/origin`, which answers with the storefront's configured address or the
+ * loopback address on the port this process bound - never with anything a request carries.
  *
  * ONE READING OF THE QUERY STRING
  * Every parameter this page accepts is parsed once, by the same schema the endpoint uses, and the
- * parsed values are then passed down: the service receives them as its input, and the filter row
- * receives them as the filter now in force. Nothing below reads `searchParams` twice and nothing
- * reads the address bar in the browser, which is what keeps the figures, the controls and the URL
- * describing the same request.
+ * parsed values are then passed down: the endpoint receives them as its query, the filter row
+ * receives them as the filter now in force, and the stock table's pager carries them across a page
+ * change. Nothing below reads `searchParams` twice and nothing reads the address bar in the
+ * browser, which is what keeps the figures, the controls and the URL describing the same request.
  *
  * A MALFORMED QUERY IS STILL A DASHBOARD VISIT
  * `inventorySummaryQuerySchema` defaults every value-bearing parameter, so a query it rejects is
@@ -33,20 +35,29 @@
  *   - The document, the main landmark and the site chrome: `app/layout.tsx` mounts `PageContainer`
  *     around every route, so this page renders its own breadcrumb trail and its own level-one
  *     heading inside that region and adds neither a second landmark nor a second container.
- *   - Sections and headings: `InventoryKpiCards` and `LowStockList` each render a named section of
- *     their own, so wrapping them here would name every region twice.
+ *   - Sections and headings: `InventoryKpiCards`, `InventoryLevelsTable` and `LowStockList` each
+ *     render a named region of their own, so wrapping them here would name every region twice. The
+ *     table takes its visible title as a prop because its `<caption>` is the alternative, and one
+ *     of the two has to be the name assistive technology hears.
  *   - Layout values: the `.ls-*` utilities in `app/globals.css` are the whole vocabulary a route
  *     file has, and a route file adds no CSS Module. There is no inline `style` below and no colour,
  *     spacing or type value of any kind.
  *   - Numbers, dates and labels: every figure printed on this page is formatted by the component
  *     that prints it, through `@/lib/format`. This file prints no number.
  *
+ * THE SHELL ARRIVES FIRST
+ * The read is not awaited before the page returns. The trail and the heading are sent immediately,
+ * the single `Suspense` boundary below holds the space the data will occupy, and the body swaps in
+ * when the payload lands. What fills that space is each component's own placeholder -
+ * `InventoryKpiCardsPlaceholder`, `InventoryLevelsTablePlaceholder`, `LowStockListPlaceholder` - so
+ * the wait has the shape of the answer and the layout does not jump when the figures arrive.
+ *
  * THE PAYLOAD IS THE WHOLE SURFACE
- * `InventorySummary` carries five figures, the stocking locations the filter lists and one page of
- * the lines at or below their reorder point - and no per-line stock rows. The page therefore
- * composes exactly what its own read returns: a stock table of individual levels belongs to a
- * surface whose payload holds them, and inventing rows here, or rendering an empty table beside
- * figures that are not empty, would both state something the read never said.
+ * `InventorySummary` carries five figures, the stocking locations the filter lists, one page of the
+ * stock lines together with the products naming them, and the most urgent lines at or below their
+ * reorder point. The page composes exactly that and invents nothing: `page` and `pageSize` in the
+ * address window the stock table, which is the surface that carries a pager, while the low-stock
+ * list is the lines worth acting on today and reports its own total through the figure row.
  *
  * NO CLOCK, NO CACHE
  * `formatTimeAgoLabel` takes its reference instant as an argument so that a server render and the
@@ -57,19 +68,23 @@
  */
 
 import type { Metadata } from 'next';
-import type { ReactElement } from 'react';
+import { Suspense, type ReactElement } from 'react';
 
-import { InventoryKpiCards } from '@/components/dashboard/InventoryKpiCards';
-import { LowStockList } from '@/components/dashboard/LowStockList';
+import {
+  InventoryKpiCards,
+  InventoryKpiCardsPlaceholder,
+} from '@/components/dashboard/InventoryKpiCards';
+import {
+  InventoryLevelsTable,
+  InventoryLevelsTablePlaceholder,
+} from '@/components/dashboard/InventoryLevelsTable';
+import { LowStockList, LowStockListPlaceholder } from '@/components/dashboard/LowStockList';
 import { WarehouseFilter } from '@/components/dashboard/WarehouseFilter';
 import { BreadcrumbTrail, type BreadcrumbCrumb } from '@/components/layout/BreadcrumbTrail';
 import { Alert } from '@/components/ui/Alert';
+import { StorefrontApiError, loadInventorySummary } from '@/lib/api-client';
 import type { InventorySummary, StorefrontErrorCode } from '@/lib/types';
-import { isStorefrontError } from '@/server/errors';
-import {
-  readInventorySummary,
-  type InventorySummaryInput,
-} from '@/server/services/inventory.service';
+import { storefrontOrigin } from '@/server/origin';
 import {
   inventorySummaryQuerySchema,
   type InventorySummaryQueryInput,
@@ -101,6 +116,12 @@ const PAGE_LEDE =
  */
 const CRUMBS: readonly BreadcrumbCrumb[] = [{ label: 'Catalog', href: '/' }, { label: PAGE_TITLE }];
 
+/** The stock table's visible title, which is also the name its caption carries. */
+const TABLE_TITLE = 'Stock by location';
+
+/** Where the stock table's pager points, which is this route's own address. */
+const PATH = '/dashboard';
+
 /** The heading of the notice shown in place of the figures when they cannot be read. */
 const NOTICE_TITLE = 'Inventory figures unavailable';
 
@@ -108,9 +129,9 @@ const NOTICE_TITLE = 'Inventory figures unavailable';
  * What the notice says when the reason is not one this page can act on, and the
  * sentence every unrecognised failure collapses into.
  *
- * It describes the situation and nothing about its cause: a thrown value carries
- * a stack, a statement, a driver code or a row, and none of those is a reader's
- * to see. The service layer is where a failure is worth a log line.
+ * It describes the situation and nothing about its cause: a failed read carries
+ * a status, a stack, a statement or a driver code, and none of those is a
+ * reader's to see. The service layer is where a failure is worth a log line.
  */
 const GENERIC_NOTICE =
   'The stock figures could not be read just now. Nothing in the warehouse records has changed, ' +
@@ -118,13 +139,13 @@ const GENERIC_NOTICE =
 
 /**
  * The failures this page can tell a reader what to do about, by the code the
- * error carries.
+ * failure carries.
  *
  * `Partial` on purpose: the application's error vocabulary covers surfaces this
  * page has nothing to do with - a declined card, an unknown payment outcome -
  * and a sentence invented for each of them here would be wording no reader of
  * this page can ever see. An absent entry reads as {@link GENERIC_NOTICE},
- * which is also what a value that is not this application's error becomes.
+ * which is also what an unreported reason becomes.
  *
  * Both sentences name the address bar rather than a parameter: the filter row
  * writes the query string, so "clear the filter" is an instruction a reader can
@@ -140,26 +161,231 @@ const NOTICES: Partial<Record<StorefrontErrorCode, string>> = {
 };
 
 /* ---------------------------------------------------------------------------
- * Failure copy
+ * The read
  * ------------------------------------------------------------------------- */
+
+/**
+ * What one read of the dashboard's feed produced: the payload, or the sentence
+ * to show in its place.
+ *
+ * Two states rather than a payload and an optional message, so the body below
+ * cannot render a table and a notice at the same time.
+ */
+type Outcome =
+  | { readonly summary: InventorySummary; readonly failure: null }
+  | { readonly summary: null; readonly failure: string };
 
 /**
  * The fixed sentence shown in place of the figures for a caught value.
  *
- * `catch` binds `unknown`, and the only thing read off it is the code it carries
- * when it is one of this application's own errors: no message, no `details`, no
- * `cause` and no stringification reaches the markup, so nothing the database,
- * the driver or a bug wrote can be printed on the page.
+ * `catch` binds `unknown`, and the only thing read off it is the code the
+ * endpoint reported: no message, no `details`, no status and no stringification
+ * reaches the markup, so nothing the database, the driver or a bug wrote can be
+ * printed on the page. A reason this application did not state itself - a
+ * request that never arrived, a reply that could not be read - is not treated
+ * as a statement about the filter, because it is not one.
  *
  * @param error Any caught value.
  * @returns One of {@link NOTICES}, or {@link GENERIC_NOTICE}.
  */
 function notice(error: unknown): string {
-  if (isStorefrontError(error)) {
+  if (error instanceof StorefrontApiError && error.reported) {
     return NOTICES[error.code] ?? GENERIC_NOTICE;
   }
 
   return GENERIC_NOTICE;
+}
+
+/**
+ * Reads the dashboard's feed for `query`, and never rejects.
+ *
+ * The authority is established first, because a request cannot be addressed
+ * without one, and both steps sit inside the same `catch`: an address this store
+ * may not call itself on and an endpoint that answered with a failure are the
+ * same thing to a reader, which is a dashboard that cannot show its figures.
+ *
+ * @param query The parsed query, whose members are the endpoint's parameters.
+ * @returns The payload, or the sentence to render in its place.
+ */
+async function read(query: InventorySummaryQueryInput): Promise<Outcome> {
+  try {
+    const origin = storefrontOrigin();
+
+    const summary = await loadInventorySummary({
+      warehouseId: query.warehouseId,
+      threshold: query.threshold,
+      page: query.page,
+      pageSize: query.pageSize,
+      state: query.state,
+      movement: query.movement,
+      origin,
+    });
+
+    return { summary, failure: null };
+  } catch (error) {
+    return { summary: null, failure: notice(error) };
+  }
+}
+
+/**
+ * The parameters the stock table's pager carries across a page change.
+ *
+ * Built from the parsed query rather than from the address the reader arrived
+ * with, so every destination the pager offers is a request that parses: a value
+ * the schema coerced is carried forward in its canonical form, and a value it
+ * rejected is not carried forward at all - the reader is looking at the fallback
+ * figures in that case, and a link still claiming the rejected filter would send
+ * them back to it on every page turn. The page number is deliberately absent:
+ * the pager sets it, and a value here would only be one it overwrites.
+ *
+ * @param query The parsed query the figures on screen were read with.
+ * @returns One string per parameter that is in force.
+ */
+function carried(query: InventorySummaryQueryInput): Record<string, string> {
+  const params: Record<string, string> = {
+    threshold: String(query.threshold),
+    pageSize: String(query.pageSize),
+  };
+
+  if (query.warehouseId !== null) {
+    params.warehouseId = query.warehouseId;
+  }
+
+  if (query.state !== null) {
+    params.state = query.state;
+  }
+
+  if (query.movement !== null) {
+    params.movement = query.movement;
+  }
+
+  return params;
+}
+
+/* ---------------------------------------------------------------------------
+ * The data regions
+ * ------------------------------------------------------------------------- */
+
+/**
+ * The space the data occupies while the feed is still being read: the figure
+ * row, the stock table and the low-stock list, each reserved by its own
+ * component's placeholder so the layout the reader waits in front of is the
+ * layout that arrives.
+ *
+ * Each placeholder owns its own busy region and its own announcement, which is
+ * why this function adds neither: a second `role="status"` here would have the
+ * wait announced twice.
+ */
+function DashboardPlaceholder({ rows }: { rows: number }): ReactElement {
+  return (
+    <>
+      <InventoryKpiCardsPlaceholder />
+
+      <div className="ls-split">
+        <div className="ls-split-main">
+          <InventoryLevelsTablePlaceholder heading={<h2>{TABLE_TITLE}</h2>} rows={rows} />
+        </div>
+
+        <div className="ls-split-side">
+          <LowStockListPlaceholder />
+        </div>
+      </div>
+    </>
+  );
+}
+
+/**
+ * The dashboard's data: one read of the feed, and either the four components it
+ * fills or the notice that stands in for all of them.
+ *
+ * The failure is one notice rather than one per region, because one read
+ * produced all four: three notices would announce a single failure three times,
+ * and `ui/Alert` is announced politely here because the reader did not cause it.
+ * An empty answer is not a failure and is not treated as one - the table and the
+ * list each say what an empty page of their own means.
+ *
+ * @param props The parsed query, which is both what to ask for and what the
+ * controls show as being in force.
+ * @returns The populated dashboard, or the notice in its place.
+ */
+async function DashboardData({
+  query,
+}: {
+  query: InventorySummaryQueryInput;
+}): Promise<ReactElement> {
+  const outcome = await read(query);
+
+  if (outcome.summary === null) {
+    /*
+     * The whole payload is missing, so the filter row, the figures, the table
+     * and the list are all omitted: an empty table or a row of zeroes would
+     * read as "nothing in stock", which is a different and much worse statement
+     * than "the figures are missing". `warning` rather than `danger` because
+     * `ui/Alert` announces `danger` assertively, which belongs to a failure the
+     * reader just caused.
+     */
+    return (
+      <div className="ls-notice">
+        <Alert tone="warning" title={NOTICE_TITLE}>
+          {outcome.failure}
+        </Alert>
+      </div>
+    );
+  }
+
+  const summary = outcome.summary;
+
+  return (
+    <>
+      {/*
+        The locations the filter lists come from the payload already in hand
+        rather than from a second request, and the applied values are the ones
+        parsed above, so the controls open showing the filter the figures beside
+        them were produced under.
+      */}
+      <WarehouseFilter
+        warehouses={summary.warehouses}
+        selectedWarehouseId={query.warehouseId}
+        threshold={query.threshold}
+        stockState={query.state}
+        movementType={query.movement}
+      />
+
+      {/*
+        Every component below measures the payload's age against the instant it
+        was computed, which is the payload's own `generatedAt`: a reference read
+        from the clock would differ between the server's markup and the browser's
+        first render.
+      */}
+      <InventoryKpiCards summary={summary} referenceIso={summary.generatedAt} />
+
+      <div className="ls-split">
+        <div className="ls-split-main">
+          {/*
+            The page of stock lines exactly as the feed answered it - the rows,
+            the page they are on and the number of lines the filters matched -
+            together with the products naming them. The pager's links are this
+            route's own address carrying the filter now in force, so a page
+            change keeps the filter and changes only the page.
+          */}
+          <InventoryLevelsTable
+            levels={summary.levels}
+            products={summary.levelProducts}
+            threshold={query.threshold}
+            generatedAt={summary.generatedAt}
+            referenceIso={summary.generatedAt}
+            heading={<h2>{TABLE_TITLE}</h2>}
+            basePath={PATH}
+            query={carried(query)}
+          />
+        </div>
+
+        <div className="ls-split-side">
+          <LowStockList rows={summary.lowStock} threshold={query.threshold} />
+        </div>
+      </div>
+    </>
+  );
 }
 
 /* ---------------------------------------------------------------------------
@@ -198,8 +424,9 @@ export const dynamic = 'force-dynamic';
 export const metadata: Metadata = { title: PAGE_TITLE };
 
 /**
- * The inventory dashboard: the filter now in force, the figures it produced,
- * and the lines that have fallen to their reorder point.
+ * The inventory dashboard: the filter now in force, the figures it produced, the
+ * page of stock lines behind them, and the lines that have fallen to their
+ * reorder point.
  *
  * @param props The route's props; only the query string is read.
  * @returns The page's content, which the layout places inside the document's
@@ -233,30 +460,11 @@ export default async function InventoryDashboardPage({
    * A rejected query is answered with the dashboard's own defaults rather than
    * with an error: `safeParse` never throws, and re-parsing an empty object is
    * exact because every value-bearing parameter of this schema is defaulted.
-   * The second binding is an annotation rather than a conversion - it is the
-   * compiler, not a cast, that establishes the parsed query is an argument the
-   * inventory service accepts.
    */
   const parsed = inventorySummaryQuerySchema.safeParse(supplied);
   const query: InventorySummaryQueryInput = parsed.success
     ? parsed.data
     : inventorySummaryQuerySchema.parse({});
-  const input: InventorySummaryInput = query;
-
-  /*
-   * One read, and the only thing in this file that can fail. The notice starts
-   * out as the wording for a failure nobody can act on, so the page always has
-   * something to say; a caught value replaces it with the sentence its code
-   * earns and leaves the payload unset, which is what selects the notice below.
-   */
-  let summary: InventorySummary | null = null;
-  let failure = GENERIC_NOTICE;
-
-  try {
-    summary = await readInventorySummary(input);
-  } catch (error) {
-    failure = notice(error);
-  }
 
   return (
     <div className="ls-stack ls-stack-loose">
@@ -267,47 +475,15 @@ export default async function InventoryDashboardPage({
         <p className="ls-page-lede">{PAGE_LEDE}</p>
       </div>
 
-      {summary === null ? (
-        /*
-         * The whole payload is missing, so the filter row, the figures and the
-         * list are all omitted: an empty table or a row of zeroes would read as
-         * "nothing in stock", which is a different and much worse statement
-         * than "the figures are missing". `warning` rather than `danger`
-         * because the notice is here on arrival - `ui/Alert` announces `danger`
-         * assertively, which belongs to a failure the reader just caused.
-         */
-        <div className="ls-notice">
-          <Alert tone="warning" title={NOTICE_TITLE}>
-            {failure}
-          </Alert>
-        </div>
-      ) : (
-        <>
-          {/*
-            The locations the filter lists come from the payload already in
-            hand rather than from a second query, and the applied values are
-            the ones parsed above, so the controls open showing the filter the
-            figures beside them were produced under.
-          */}
-          <WarehouseFilter
-            warehouses={summary.warehouses}
-            selectedWarehouseId={query.warehouseId}
-            threshold={query.threshold}
-            stockState={query.state}
-            movementType={query.movement}
-          />
-
-          {/*
-            Both components measure the payload's age against the instant it
-            was computed, which is the payload's own `generatedAt`: a reference
-            read from the clock would differ between the server's markup and
-            the browser's first render.
-          */}
-          <InventoryKpiCards summary={summary} referenceIso={summary.generatedAt} />
-
-          <LowStockList rows={summary.lowStock} threshold={query.threshold} />
-        </>
-      )}
+      {/*
+        One boundary for one read. The body is not awaited here, so the trail and
+        the heading above reach the browser while the feed is still answering,
+        and the placeholder reserves as many table rows as the page asked for so
+        the swap does not move the page under a reader.
+      */}
+      <Suspense fallback={<DashboardPlaceholder rows={query.pageSize} />}>
+        <DashboardData query={query} />
+      </Suspense>
     </div>
   );
 }

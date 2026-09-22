@@ -30,7 +30,11 @@
  *   alias-tolerant names, unknown keys ignored — which means a key renamed
  *   here does not fail anywhere: the hook is simply never attached, the
  *   developer reproduces their problem exactly as asked, and the capture comes
- *   back missing the evidence.
+ *   back missing the evidence. Its canonical flag names are therefore
+ *   {@link AGENT_HOOK_KEYS} verbatim, and its own alias list carries the older
+ *   spellings (`interaction`, `renders`, `network`, `performance`, `error`) so
+ *   that a service built against an earlier revision of that file still arms
+ *   the right signal.
  * - The dev-server preload (`packages/telemetry/src/node/control.ts`) sits
  *   *below* this package in the layering of AAP §0.2.2, so it too keeps its
  *   own structural mirror of {@link ServerAgentSignals} and of the
@@ -769,6 +773,15 @@ export const agentHookConfigSchema = z.strictObject({
    * tree while the fiber hook is attached: the snapshot is a distinct,
    * page-visiting piece of work at capture stop, and a capture that wants
    * render counts without a tree is a capture that should not pay for it.
+   *
+   * Being separate makes it the one flag that arms no observer, so the agent
+   * honours it differently from the other six: it stores the flag as an
+   * *authorisation*, takes the snapshot only when the flag is true and the
+   * React hook is attached, and reports a request it cannot meet as an
+   * unavailable `componentTree` signal rather than leaving the panel with an
+   * empty node (`browser/agent.ts`'s `maybeEmitComponentTreeSnapshot`). An
+   * on-demand snapshot request relayed to the page is governed by the same
+   * authorisation: the frame asks when, this flag decides whether.
    */
   componentTree: z.boolean(),
 });
@@ -1089,6 +1102,12 @@ const NO_AGENT_HOOKS: readonly AgentHookKey[] = Object.freeze([]);
  *   the tree the `componentTree` data source serves is reconstructed from the
  *   commit-time snapshot and the `render` events of the same capture. A render
  *   question answered without a tree loses the structural half of its answer.
+ *   The pairing is also what satisfies the page agent's prerequisite: a tree is
+ *   walked from the fiber root `browser/react.ts` retains, so the agent refuses
+ *   a `componentTree` request whose `react` flag is off and reports it as an
+ *   unavailable signal (AAP §0.5.5). No derivation here can produce that
+ *   combination — this row is the only source of the flag — so the refusal is a
+ *   guard against a hand-built configuration, not a case the planner reaches.
  * - `'state-tracking'` arms `react` as well as `state`, because
  *   `browser/state.ts`'s transitions are recorded *by* `browser/react.ts` while
  *   it walks a commit. Without the fiber hook there is no commit to walk, so

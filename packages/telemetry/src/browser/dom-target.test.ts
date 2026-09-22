@@ -55,10 +55,16 @@
  * page-injected agent (AAP §0.2.2, §0.7.1 Group 1).
  */
 
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 
 import { cutAtCredentialBoundary, REDACTION_MARKER, scrub, truncate } from '../redaction/rules.js';
-import { describeElement, MAX_TEXT_LENGTH } from './dom-target.js';
+import {
+  attachDomTarget,
+  describeElement,
+  detachDomTarget,
+  isDomTargetAttached,
+  MAX_TEXT_LENGTH,
+} from './dom-target.js';
 
 // ---------------------------------------------------------------------------
 // Budgets under test
@@ -665,5 +671,73 @@ describe('describeElement — descriptor contract against a real DOM', () => {
     for (const input of inputs) {
       expect(describeElement(input)).toBeUndefined();
     }
+  });
+});
+
+describe('the lifecycle adapter', () => {
+  // The family is document-scoped, so the agent arms it in its opening
+  // sequence and leaves it armed; these cases drive it directly and hand the
+  // module back in the state they found it — detached, as at import.
+  afterEach(() => {
+    detachDomTarget();
+  });
+
+  it('starts detached, so nothing is offered before the agent arms it', () => {
+    expect(isDomTargetAttached()).toBe(false);
+  });
+
+  it('arms the family, and a second arm changes nothing', () => {
+    attachDomTarget();
+    expect(isDomTargetAttached()).toBe(true);
+
+    // Idempotence is load-bearing rather than tidy: the agent re-arms the
+    // document-scoped families on every `pageshow`, including the one an
+    // ordinary load fires.
+    attachDomTarget();
+    expect(isDomTargetAttached()).toBe(true);
+  });
+
+  it('releases the family, and a second release changes nothing', () => {
+    attachDomTarget();
+    detachDomTarget();
+    expect(isDomTargetAttached()).toBe(false);
+
+    detachDomTarget();
+    expect(isDomTargetAttached()).toBe(false);
+  });
+
+  it('is safe to release before it was ever armed, and to re-arm afterwards', () => {
+    detachDomTarget();
+    expect(isDomTargetAttached()).toBe(false);
+
+    attachDomTarget();
+    expect(isDomTargetAttached()).toBe(true);
+  });
+
+  it('arms in this environment, which has a document to describe against', () => {
+    // The one prerequisite the adapter checks. Asserting it here is what makes
+    // the flag meaningful: a host with no `document` leaves the family
+    // detached, and the agent reports the capability as unavailable instead of
+    // publishing a `describeTarget` that can only answer `undefined`.
+    expect(typeof document).not.toBe('undefined');
+    attachDomTarget();
+    expect(isDomTargetAttached()).toBe(true);
+  });
+
+  it('never gates the descriptor functions, in either state', () => {
+    // `./interaction.ts` calls `describeElement` in the capture phase of the
+    // developer's own click and the DevTools page reaches it through the page
+    // global, so the pure functions answer the same whatever the flag says —
+    // what the flag governs is whether `./agent.ts` offers the capability.
+    document.body.innerHTML = '<button id="place-order">Place order</button>';
+    const element = document.querySelector('#place-order');
+
+    detachDomTarget();
+    const whileDetached = describeElement(element);
+    attachDomTarget();
+    const whileAttached = describeElement(element);
+
+    expect(whileDetached).toEqual(whileAttached);
+    expect(whileAttached?.selector).toBe('#place-order');
   });
 });

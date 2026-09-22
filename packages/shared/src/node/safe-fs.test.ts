@@ -105,6 +105,7 @@ import {
   readFileSync,
   readdirSync,
   realpathSync,
+  renameSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -123,9 +124,12 @@ import {
   SECURE_FILE_MODE,
   assertSecureDir,
   atomicReplaceFile,
+  atomicReplaceFileIfUnchanged,
   createFileExclusive,
   ensureSecureDir,
+  pinFileWithinRoot,
   readFileNoFollow,
+  readFileSnapshotNoFollow,
   writeSecureFileAtomic,
 } from './safe-fs.js';
 
@@ -267,6 +271,16 @@ const FOREIGN_UID = ((): number | undefined => {
 
 /** Whether this process can hand a directory to another account at all. */
 const CAN_ASSIGN_FOREIGN_OWNER = FOREIGN_UID !== undefined;
+
+/**
+ * Whether a directory's permission bits actually deny this process a write.
+ *
+ * They do not for a privileged account — root writes through a `0500`
+ * directory — and continuous integration commonly runs as root, so a case whose
+ * subject is the *failure* of a write guards on this rather than asserting
+ * something that silently becomes vacuous.
+ */
+const MODE_DENIES_WRITE = typeof process.getuid === 'function' && process.getuid() !== 0;
 
 /*
  * ---------------------------------------------------------------------------
@@ -1790,6 +1804,539 @@ describe('readFileNoFollow', () => {
     });
 
     expect(['EISDIR', 'EACCES']).toContain(code);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * readFileSnapshotNoFollow
+ * ---------------------------------------------------------------------------
+ *
+ * `readFileNoFollow` plus the inode the bytes came from. The identity is what
+ * makes a later conditional write able to tell "the same file, unchanged" from
+ * "a different file that happens to hold the same bytes" — which is what an
+ * editor's save-by-rename produces.
+ */
+
+describe('readFileSnapshotNoFollow', () => {
+  it('returns the stored bytes and the identity of the file they came from', () => {
+    const target = makeFile(join(sandbox, 'source.ts'), NON_UTF8_BYTES);
+    const stats = lstatSync(target, { bigint: true });
+
+    const snapshot = readFileSnapshotNoFollow(target);
+
+    expect(Buffer.compare(snapshot.bytes, NON_UTF8_BYTES)).toBe(0);
+    // `bigint`, not `number`: an inode number past 2^53 rounds as a double, and
+    // two different inodes comparing equal is the direction of that failure
+    // that would make the write condition accept a swapped file.
+    expect(typeof snapshot.identity.dev).toBe('bigint');
+    expect(typeof snapshot.identity.ino).toBe('bigint');
+    expect(snapshot.identity.dev).toBe(stats.dev);
+    expect(snapshot.identity.ino).toBe(stats.ino);
+  });
+
+  it('refuses an entry that is not a regular file', () => {
+    // Stated for the platform without `O_NOFOLLOW`, where the flag contributes
+    // nothing and the refusal has to come from the stat instead.
+    const target = makeDir(join(sandbox, 'directory'), SECURE_DIR_MODE);
+
+    const code = runtimeErrnoFrom(() => {
+      readFileSnapshotNoFollow(target);
+    });
+
+    expect(['ELOOP', 'EISDIR', 'EACCES']).toContain(code);
+  });
+
+  it('reports a different identity after the file is replaced by a rename', () => {
+    // The case content comparison alone cannot see: same path, same bytes,
+    // different inode - which is how every editor in this product's world
+    // saves a file.
+    const target = join(sandbox, 'source.ts');
+    makeFile(target, 'export const a = 1;\n');
+    const before = readFileSnapshotNoFollow(target);
+
+    const replacement = makeFile(join(sandbox, 'replacement.ts'), 'export const a = 1;\n');
+    renameSync(replacement, target);
+    const after = readFileSnapshotNoFollow(target);
+
+    expect(Buffer.compare(after.bytes, before.bytes)).toBe(0);
+    expect(after.identity.ino).not.toBe(before.identity.ino);
+  });
+
+  it.skipIf(!CAN_CREATE_SYMLINKS || NO_NOFOLLOW)(
+    'refuses a planted symbolic link with ELOOP (requires symlink creation and O_NOFOLLOW)',
+    () => {
+      const victim = makeFile(join(sandbox, 'victim.txt'), 'another file\n');
+      const target = join(sandbox, 'source.ts');
+      symlinkSync(victim, target);
+
+      const code = runtimeErrnoFrom(() => {
+        readFileSnapshotNoFollow(target);
+      });
+
+      expect(code).toBe('ELOOP');
+    },
+  );
+
+  it('lets ENOENT through for a file that does not exist', () => {
+    const code = runtimeErrnoFrom(() => {
+      readFileSnapshotNoFollow(join(sandbox, 'absent.ts'));
+    });
+
+    expect(code).toBe('ENOENT');
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * atomicReplaceFileIfUnchanged
+ * ---------------------------------------------------------------------------
+ *
+ * The conditional write. Every case here is about the same question: does the
+ * developer's edit survive? An unconditional `rename` over a source file cannot
+ * fail, so a write computed from bytes that are no longer there destroys work
+ * silently - CWE-367. These cases pin the refusal, and pin that a refusal
+ * leaves the directory exactly as it was found.
+ */
+
+describe('atomicReplaceFileIfUnchanged', () => {
+  /** The content a target starts with in this block. */
+  const ORIGINAL = 'export function work(): void {}\n';
+
+  /** What a caller computed from {@link ORIGINAL} and wants to write. */
+  const INSTRUMENTED = 'export function work(): void {\n  /* timed */\n}\n';
+
+  it('writes when the target still holds the expected bytes', () => {
+    const target = makeFile(join(sandbox, 'source.ts'), ORIGINAL, PROJECT_FILE_MODE);
+    const before = readFileSnapshotNoFollow(target);
+
+    const verdict = atomicReplaceFileIfUnchanged(target, INSTRUMENTED, before);
+
+    expect(verdict).toEqual({ kind: 'replaced' });
+    expectFileBytes(target, INSTRUMENTED);
+    expect(temporaryLeftoversIn(sandbox)).toEqual([]);
+  });
+
+  it('preserves the mode the target already had', () => {
+    // The same guarantee `atomicReplaceFile` makes, and for the same reason: a
+    // patch that turned an executable script into a plain file would be a
+    // modification the product never recorded and cannot revert.
+    const target = makeFile(join(sandbox, 'source.ts'), ORIGINAL, 0o751);
+    const before = readFileSnapshotNoFollow(target);
+
+    expect(atomicReplaceFileIfUnchanged(target, INSTRUMENTED, before).kind).toBe('replaced');
+    expect(octal(permissionsOf(target))).toBe(octal(0o751));
+  });
+
+  it('writes bytes verbatim, including content that is not valid UTF-8', () => {
+    const target = makeFile(join(sandbox, 'source.bin'), ORIGINAL);
+    const before = readFileSnapshotNoFollow(target);
+
+    expect(atomicReplaceFileIfUnchanged(target, NON_UTF8_BYTES, before).kind).toBe('replaced');
+    expectFileBytes(target, NON_UTF8_BYTES);
+  });
+
+  it('refuses and writes nothing when the content changed after it was read', () => {
+    // The developer's edit, arriving between the read and the write. It must
+    // still be there afterwards.
+    const target = makeFile(join(sandbox, 'source.ts'), ORIGINAL, PROJECT_FILE_MODE);
+    const before = readFileSnapshotNoFollow(target);
+
+    const developerEdit = `${ORIGINAL}// edited while instrumented\n`;
+    makeFile(target, developerEdit);
+
+    const verdict = atomicReplaceFileIfUnchanged(target, INSTRUMENTED, before);
+
+    expect(verdict).toEqual({ kind: 'stale', reason: 'content-changed' });
+    expectFileBytes(target, developerEdit);
+    expect(temporaryLeftoversIn(sandbox)).toEqual([]);
+  });
+
+  it('refuses when a different file with identical content took the path', () => {
+    // Content alone cannot see this: an editor that saves by writing a
+    // temporary file and renaming it over the target produces exactly this
+    // shape, and the bytes may well be identical.
+    const target = makeFile(join(sandbox, 'source.ts'), ORIGINAL);
+    const before = readFileSnapshotNoFollow(target);
+
+    renameSync(makeFile(join(sandbox, 'other.ts'), ORIGINAL), target);
+
+    const verdict = atomicReplaceFileIfUnchanged(target, INSTRUMENTED, before);
+
+    expect(verdict).toEqual({ kind: 'stale', reason: 'identity-changed' });
+    expectFileBytes(target, ORIGINAL);
+  });
+
+  it('refuses when the target has been removed', () => {
+    const target = makeFile(join(sandbox, 'source.ts'), ORIGINAL);
+    const before = readFileSnapshotNoFollow(target);
+
+    rmSync(target);
+
+    expect(atomicReplaceFileIfUnchanged(target, INSTRUMENTED, before)).toEqual({
+      kind: 'stale',
+      reason: 'target-missing',
+    });
+    expect(existsSync(target)).toBe(false);
+    expect(temporaryLeftoversIn(sandbox)).toEqual([]);
+  });
+
+  it('refuses to create a file that is not there, rather than writing one', () => {
+    // A precondition about content has no meaning for a file that does not
+    // exist, and creating one would be a modification with no recorded
+    // original to restore.
+    const target = join(sandbox, 'absent.ts');
+
+    expect(
+      atomicReplaceFileIfUnchanged(target, INSTRUMENTED, { bytes: bytesOf(ORIGINAL) }),
+    ).toEqual({ kind: 'stale', reason: 'target-missing' });
+    expect(existsSync(target)).toBe(false);
+  });
+
+  it('compares content alone when the caller observed no identity', () => {
+    const target = makeFile(join(sandbox, 'source.ts'), ORIGINAL);
+
+    // Same path, same bytes, new inode: accepted, because the caller did not
+    // claim to know which file it read.
+    renameSync(makeFile(join(sandbox, 'other.ts'), ORIGINAL), target);
+
+    expect(
+      atomicReplaceFileIfUnchanged(target, INSTRUMENTED, { bytes: bytesOf(ORIGINAL) }).kind,
+    ).toBe('replaced');
+    expectFileBytes(target, INSTRUMENTED);
+  });
+
+  it.skipIf(!CAN_CREATE_SYMLINKS)(
+    'refuses when a symbolic link took the target path, and the file it points at is untouched (requires symlink creation)',
+    () => {
+      // `rename` replaces a path entry, so an unconditional replacement would
+      // quietly swap the link for a regular file. Refusing instead keeps the
+      // developer's tree as it was found and leaves the decision to them.
+      const target = join(sandbox, 'source.ts');
+      makeFile(target, ORIGINAL);
+      const before = readFileSnapshotNoFollow(target);
+
+      const victim = makeFile(join(sandbox, 'victim.txt'), 'another file\n');
+      rmSync(target);
+      symlinkSync(victim, target);
+
+      const verdict = atomicReplaceFileIfUnchanged(target, INSTRUMENTED, before);
+
+      expect(verdict).toEqual({ kind: 'stale', reason: 'identity-changed' });
+      expect(lstatSync(target).isSymbolicLink()).toBe(true);
+      expectFileBytes(victim, 'another file\n');
+      expect(temporaryLeftoversIn(sandbox)).toEqual([]);
+    },
+  );
+
+  it('refuses when a directory took the target path', () => {
+    const target = join(sandbox, 'source.ts');
+    makeFile(target, ORIGINAL);
+    const before = readFileSnapshotNoFollow(target);
+
+    rmSync(target);
+    makeDir(target, PROJECT_DIR_MODE);
+
+    expect(atomicReplaceFileIfUnchanged(target, INSTRUMENTED, before)).toEqual({
+      kind: 'stale',
+      reason: 'identity-changed',
+    });
+    expect(lstatSync(target).isDirectory()).toBe(true);
+  });
+
+  it('replaces a large payload in full', () => {
+    const payload = syntheticBytes(LARGE_PAYLOAD_LENGTH);
+    const target = makeFile(join(sandbox, 'source.bin'), ORIGINAL);
+    const before = readFileSnapshotNoFollow(target);
+
+    expect(atomicReplaceFileIfUnchanged(target, payload, before).kind).toBe('replaced');
+    expectFileBytes(target, payload);
+  });
+
+  it('is a no-op the second time, because the first write replaced the file it named', () => {
+    // Replaying a conditional write is safe by construction, and the reason it
+    // reports is worth pinning: the replacement is a `rename`, so the entry at
+    // that path is a new inode afterwards and the identity half of the
+    // condition answers before the content half is consulted.
+    const target = makeFile(join(sandbox, 'source.ts'), ORIGINAL);
+    const before = readFileSnapshotNoFollow(target);
+
+    expect(atomicReplaceFileIfUnchanged(target, INSTRUMENTED, before).kind).toBe('replaced');
+    expect(atomicReplaceFileIfUnchanged(target, INSTRUMENTED, before)).toEqual({
+      kind: 'stale',
+      reason: 'identity-changed',
+    });
+    expectFileBytes(target, INSTRUMENTED);
+
+    // Content only, so that the same replay is pinned for a caller that
+    // observed no identity: the bytes it named are no longer there.
+    expect(atomicReplaceFileIfUnchanged(target, INSTRUMENTED, { bytes: before.bytes })).toEqual({
+      kind: 'stale',
+      reason: 'content-changed',
+    });
+  });
+
+  it('restores the original bytes when handed the instrumented ones as the condition', () => {
+    // The reverse direction, which is what a cleanup pass performs: the file
+    // must hold what the record says it holds before it is restored.
+    const target = makeFile(join(sandbox, 'source.ts'), ORIGINAL, PROJECT_FILE_MODE);
+    const before = readFileSnapshotNoFollow(target);
+
+    expect(atomicReplaceFileIfUnchanged(target, INSTRUMENTED, before).kind).toBe('replaced');
+
+    const instrumented = readFileSnapshotNoFollow(target);
+    expect(atomicReplaceFileIfUnchanged(target, ORIGINAL, instrumented).kind).toBe('replaced');
+
+    expectFileBytes(target, ORIGINAL);
+    expect(octal(permissionsOf(target))).toBe(octal(PROJECT_FILE_MODE));
+  });
+
+  it('refuses a file created at the target after the displaced entry was retained', () => {
+    // The interval the install exists for: the precondition has held, the old
+    // entry has been retained, and only then does something appear at the
+    // target. `link` refuses to overwrite it, so the newcomer survives and the
+    // caller is told - which is the difference between this protocol and
+    // compare-then-rename.
+    const target = makeFile(join(sandbox, 'source.ts'), ORIGINAL);
+    const before = readFileSnapshotNoFollow(target);
+    const newcomer = '// written after the retention\n';
+
+    const verdict = atomicReplaceFileIfUnchanged(target, INSTRUMENTED, before, {
+      onBeforeInstall: () => {
+        writeFileSync(target, newcomer);
+      },
+    });
+
+    expect(verdict).toEqual({ kind: 'stale', reason: 'identity-changed' });
+    expectFileBytes(target, newcomer);
+    expect(temporaryLeftoversIn(sandbox)).toEqual([]);
+  });
+
+  it('installs normally when nothing appears at the target during the interval', () => {
+    // The control for the case above: the seam must not be what makes the
+    // refusal happen.
+    const target = makeFile(join(sandbox, 'source.ts'), ORIGINAL);
+    const before = readFileSnapshotNoFollow(target);
+    let reached = false;
+
+    const verdict = atomicReplaceFileIfUnchanged(target, INSTRUMENTED, before, {
+      onBeforeInstall: () => {
+        reached = true;
+      },
+    });
+
+    expect(reached).toBe(true);
+    expect(verdict).toEqual({ kind: 'replaced' });
+    expectFileBytes(target, INSTRUMENTED);
+    expect(temporaryLeftoversIn(sandbox)).toEqual([]);
+  });
+
+  it('installs a single-named entry, leaving no hard link to the temporary name', () => {
+    // The install is a `link`, so the new entry starts with two names. The
+    // temporary one has to be dropped, or every patched file would carry a
+    // second, hidden name in the developer's project.
+    const target = makeFile(join(sandbox, 'source.ts'), ORIGINAL);
+    const before = readFileSnapshotNoFollow(target);
+
+    expect(atomicReplaceFileIfUnchanged(target, INSTRUMENTED, before).kind).toBe('replaced');
+
+    expect(lstatSync(target).nlink).toBe(1);
+    expect(entriesIn(sandbox)).toEqual(['source.ts']);
+  });
+
+  it.skipIf(!MODE_DENIES_WRITE)(
+    'lets a genuine I/O failure through rather than reporting it as stale (requires an unprivileged account)',
+    () => {
+      // A stale verdict is an answer and must mean "nothing was written". A
+      // directory that cannot be written is a different thing entirely, and
+      // collapsing the two would make a caller report a conflict to the
+      // developer for what is a permissions problem.
+      //
+      // Guarded on the account: a privileged process writes through a `0500`
+      // directory, so the case would assert nothing rather than fail.
+      const directory = makeDir(join(sandbox, 'readonly'), PROJECT_DIR_MODE);
+      const target = makeFile(join(directory, 'source.ts'), ORIGINAL);
+      const before = readFileSnapshotNoFollow(target);
+      chmodSync(directory, 0o500);
+
+      try {
+        const code = runtimeErrnoFrom(() => {
+          atomicReplaceFileIfUnchanged(target, INSTRUMENTED, before);
+        });
+
+        expect(code).toBe('EACCES');
+        expectFileBytes(target, ORIGINAL);
+      } finally {
+        chmodSync(directory, PROJECT_DIR_MODE);
+      }
+    },
+  );
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * pinFileWithinRoot
+ * ---------------------------------------------------------------------------
+ *
+ * The answer to the half of the containment problem a check cannot reach.
+ * `../paths.ts` can prove where a path led at one instant; these cases prove
+ * that the operations afterwards go to the directory that was verified, whatever
+ * happens to the path in between.
+ */
+
+describe('pinFileWithinRoot', () => {
+  /** Builds `<sandbox>/project/src/server/file.ts` and returns the pieces. */
+  function makeNestedProject(): {
+    readonly root: string;
+    readonly directory: string;
+    readonly target: string;
+    readonly relative: string;
+  } {
+    const root = makeDir(join(sandbox, 'project'), PROJECT_DIR_MODE);
+    const directory = makeDir(join(root, 'src', 'server'), PROJECT_DIR_MODE);
+    const target = makeFile(join(directory, 'file.ts'), 'original\n', PROJECT_FILE_MODE);
+
+    return { root, directory, target, relative: 'src/server/file.ts' };
+  }
+
+  it('resolves to the same file as the plain path', () => {
+    const { root, directory, target, relative } = makeNestedProject();
+    const pinned = pinFileWithinRoot(root, relative);
+
+    try {
+      expect(pinned.name).toBe('file.ts');
+      expect(pinned.directory).toBe(directory);
+      expect(Buffer.compare(readFileNoFollow(pinned.path), readFileSync(target))).toBe(0);
+      expect(pinned.verifyDirectory()).toBe(true);
+    } finally {
+      pinned.release();
+    }
+  });
+
+  it('reports the pinned directory identity from the descriptor itself', () => {
+    const { root, directory, relative } = makeNestedProject();
+    const pinned = pinFileWithinRoot(root, relative);
+
+    try {
+      const stats = lstatSync(directory, { bigint: true });
+
+      expect(pinned.directoryIdentity.dev).toBe(stats.dev);
+      expect(pinned.directoryIdentity.ino).toBe(stats.ino);
+    } finally {
+      pinned.release();
+    }
+  });
+
+  it.skipIf(!CAN_CREATE_SYMLINKS)(
+    'refuses a path with a symbolic link among its components (requires symlink creation)',
+    () => {
+      const { root, relative } = makeNestedProject();
+      const elsewhere = makeDir(join(sandbox, 'beyond'), PROJECT_DIR_MODE);
+
+      rmSync(join(root, 'src', 'server'), { recursive: true });
+      symlinkSync(elsewhere, join(root, 'src', 'server'));
+
+      const error = unsafePathErrorFrom(() => {
+        pinFileWithinRoot(root, relative).release();
+      });
+
+      expect(error.details?.reason).toBe('symlink-component');
+      expect(entriesIn(elsewhere)).toEqual([]);
+    },
+  );
+
+  it.skipIf(!CAN_CREATE_SYMLINKS)(
+    'keeps writing to the directory it verified after that directory is replaced by a link (requires symlink creation)',
+    () => {
+      // The attack the pin exists for, and the sharpest case in this file. The
+      // verified parent is moved away and a link to a DECOY directory - holding
+      // a file of the same name - is planted in its place. A path-based write
+      // would follow the link and rewrite the decoy, which is a file outside
+      // the project that the caller never named and never validated.
+      const { root, directory, target, relative } = makeNestedProject();
+      const pinned = pinFileWithinRoot(root, relative);
+
+      try {
+        const moved = join(sandbox, 'moved-server');
+        const decoy = makeDir(join(sandbox, 'decoy'), PROJECT_DIR_MODE);
+        const decoyFile = makeFile(join(decoy, 'file.ts'), 'decoy content\n');
+
+        renameSync(directory, moved);
+        symlinkSync(decoy, directory);
+
+        // The plain path now leads to the decoy; the pinned path does not.
+        expect(readFileSync(target).toString('utf8')).toBe('decoy content\n');
+
+        const before = readFileSnapshotNoFollow(pinned.path);
+        expect(before.bytes.toString('utf8')).toBe('original\n');
+
+        expect(atomicReplaceFileIfUnchanged(pinned.path, 'patched\n', before).kind).toBe(
+          'replaced',
+        );
+
+        // The write went to the file that was verified, wherever it now lives,
+        // and the decoy is untouched.
+        expectFileBytes(join(moved, 'file.ts'), 'patched\n');
+        expectFileBytes(decoyFile, 'decoy content\n');
+        expect(entriesIn(decoy)).toEqual(['file.ts']);
+
+        // And the caller can see that the situation changed, which is what
+        // turns "wrote to a relocated directory" into a reportable conflict
+        // rather than a silent success.
+        expect(pinned.verifyDirectory()).toBe(false);
+      } finally {
+        pinned.release();
+      }
+    },
+  );
+
+  it('reports a moved directory through verifyDirectory', () => {
+    const { root, directory, relative } = makeNestedProject();
+    const pinned = pinFileWithinRoot(root, relative);
+
+    try {
+      expect(pinned.verifyDirectory()).toBe(true);
+      renameSync(directory, join(sandbox, 'moved'));
+      expect(pinned.verifyDirectory()).toBe(false);
+    } finally {
+      pinned.release();
+    }
+  });
+
+  it('lets ENOENT through for a directory that does not exist', () => {
+    const { root } = makeNestedProject();
+
+    const code = runtimeErrnoFrom(() => {
+      pinFileWithinRoot(root, 'src/absent/file.ts').release();
+    });
+
+    expect(code).toBe('ENOENT');
+  });
+
+  it('is releasable twice without failing', () => {
+    const { root, relative } = makeNestedProject();
+    const pinned = pinFileWithinRoot(root, relative);
+
+    pinned.release();
+
+    expect(() => {
+      pinned.release();
+    }).not.toThrow();
+  });
+
+  it('reports whether the platform enforces the pin', () => {
+    // A boolean, not a platform check: the enforcement comes from being able to
+    // address a descriptor as a path, and where that is unavailable the
+    // reduction is reported rather than hidden.
+    const { root, relative } = makeNestedProject();
+    const pinned = pinFileWithinRoot(root, relative);
+
+    try {
+      expect(typeof pinned.enforced).toBe('boolean');
+      expect(pinned.enforced).toBe(existsSync('/proc/self/fd'));
+    } finally {
+      pinned.release();
+    }
   });
 });
 

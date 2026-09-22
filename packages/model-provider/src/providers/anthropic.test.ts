@@ -65,9 +65,10 @@
  *   product (AAP §0.5.3), so the fixtures below use an obviously synthetic
  *   placeholder whose *presence* is the point and whose content is irrelevant.
  * - **No copy of AAP §0.5.5's sentence.** It is asserted by comparison against
- *   `modelUnavailableMessage`, the single builder both boundaries call. Pasting
- *   the sentence here would let the two drift apart silently, which is the one
- *   thing sharing the builder exists to prevent.
+ *   `modelUnavailableMessage` — declared in `../provider.ts`, the leaf both the
+ *   selector and this implementation import it from. Pasting the sentence here
+ *   would let the two drift apart silently, which is the one thing sharing the
+ *   builder exists to prevent.
  *
  * ## Credential-shaped fixtures are assembled at runtime
  *
@@ -93,16 +94,11 @@ import { z } from 'zod';
 import { DEBUGGEN_ERROR_CODES, DebuggenError, createConsoleLogger } from '@debuggen/shared';
 import type { LogRecord, Result } from '@debuggen/shared';
 
-import {
-  DEFAULT_PROVIDER_ID,
-  createModelProvider,
-  modelUnavailableMessage,
-  resolveProviderConfig,
-} from '../factory.js';
-import { hasClose, isModelProvider } from '../provider.js';
+import { DEFAULT_PROVIDER_ID, createModelProvider, resolveProviderConfig } from '../factory.js';
+import { hasClose, isModelProvider, modelUnavailableMessage } from '../provider.js';
 import type { ModelProvider } from '../provider.js';
 import { assertOutboundSafe } from '../redact-guard.js';
-import { buildRepairRequest } from '../structured.js';
+import { REPAIR_ASSISTANT_NOTICE, buildRepairRequest } from '../structured.js';
 import { DEFAULT_MAX_REPAIRS } from '../types.js';
 import type {
   JsonObject,
@@ -112,7 +108,13 @@ import type {
   PromptStage,
   ToolDefinition,
 } from '../types.js';
-import { createAnthropicProvider } from './anthropic.js';
+import {
+  ANTHROPIC_DEFAULT_MAX_RETRIES,
+  ANTHROPIC_DEFAULT_TIMEOUT_MS,
+  ANTHROPIC_SUPPORTED_TEMPERATURE,
+  createAnthropicProvider,
+  resolveAnthropicTransportBudgets,
+} from './anthropic.js';
 import type {
   AnthropicClientLike,
   AnthropicMessageLike,
@@ -810,7 +812,7 @@ describe('construction reports what it can and cannot do before any call is atte
     expectCodedFailure(error);
     expect(error.code).toBe('CONFIG_INVALID');
     // Compared against the shared builder, never against a pasted sentence:
-    // `../factory.ts` owns the wording and both boundaries must show the same
+    // `../provider.ts` owns the wording and both boundaries must show the same
     // string for the same code.
     expect(error.message).toBe(modelUnavailableMessage(error.code));
     expect(error.hint).toContain('DEBUGGEN_MODEL');
@@ -836,6 +838,11 @@ describe('construction reports what it can and cannot do before any call is atte
     const malformed: readonly ModelProviderConfig[] = [
       { ...BASE_CONFIG, maxTokens: 0 },
       { ...BASE_CONFIG, temperature: -1 },
+      // A plausible sampling temperature, refused for the deprecation rather
+      // than for its sign: the messages API accepts one value and rejects
+      // every other with a 400, so a configuration carrying this would fail
+      // every call of every stage in the session.
+      { ...BASE_CONFIG, temperature: 0.7 },
       { ...BASE_CONFIG, timeoutMs: 1.5 },
       { ...BASE_CONFIG, maxRetries: -2 },
     ];
@@ -876,6 +883,28 @@ describe('construction reports what it can and cannot do before any call is atte
     expect(options.maxRetries).toBe(transportRetries);
     expect(options.maxRetries).not.toBe(DEFAULT_MAX_REPAIRS);
     expect(options.timeout).toBe(4_321);
+  });
+
+  it('builds the transport with explicit budgets when the configuration names none', () => {
+    // The production wiring: `apps/local-service`'s configuration module
+    // supplies a provider id, a model and a credential and nothing else, and
+    // neither budget has an environment form. Left absent, the vendor client's
+    // own defaults would decide how long one request may take and how often it
+    // is re-sent — a product decision taken by a dependency and changed by a
+    // version bump.
+    const created = createAnthropicProvider({
+      config: { ...BASE_CONFIG, apiKey: CREDENTIAL_FIXTURE },
+    });
+
+    expect(okValue(created).id).toBe('anthropic');
+
+    const options = asObject(transportConstruction.options.at(-1));
+    expect(options.timeout).toBe(ANTHROPIC_DEFAULT_TIMEOUT_MS);
+    expect(options.maxRetries).toBe(ANTHROPIC_DEFAULT_MAX_RETRIES);
+    // Present, not merely resolvable: a client constructed without the fields
+    // is the state this case exists to rule out.
+    expect(Object.keys(options)).toContain('timeout');
+    expect(Object.keys(options)).toContain('maxRetries');
   });
 
   it('closes terminally: every later call is a coded failure and reaches no transport', async () => {
@@ -1002,14 +1031,14 @@ describe('the schema-constrained route asks with the rendered format and reports
 
   it('builds the request the messages API requires, letting the call override the configuration', async () => {
     const { provider, transport } = harness({
-      config: { ...BASE_CONFIG, maxTokens: 4_096, temperature: 0.7 },
+      config: { ...BASE_CONFIG, maxTokens: 4_096 },
       script: { parse: answers(structuredAnswer(VALID_ANSWER)) },
     });
 
     okValue(
       await provider.generateStructured(
         answerSchema,
-        makeRequest({ system: CLEAN_SYSTEM, maxTokens: 512, temperature: 0.1 }),
+        makeRequest({ system: CLEAN_SYSTEM, maxTokens: 512 }),
       ),
     );
 
@@ -1018,10 +1047,30 @@ describe('the schema-constrained route asks with the rendered format and reports
     // fall back to anywhere in the product.
     expect(params.model).toBe(MODEL_PLACEHOLDER);
     expect(params.max_tokens).toBe(512);
-    expect(params.temperature).toBe(0.1);
     expect(params.system).toBe(CLEAN_SYSTEM);
     expect(params.messages.map((turn) => turn.role)).toEqual(['user']);
     expect(params.messages.at(0)?.content).toBe(CLEAN_PROMPT);
+  });
+
+  it('never sends the deprecated sampling temperature, even when one is asked for', async () => {
+    const { provider, transport } = harness({
+      // The one value the messages API still tolerates, from both sources at
+      // once. It is also the API's own default, so accepting it and sending
+      // nothing is behaviourally identical to sending it.
+      config: { ...BASE_CONFIG, temperature: ANTHROPIC_SUPPORTED_TEMPERATURE },
+      script: { parse: answers(structuredAnswer(VALID_ANSWER)) },
+    });
+
+    okValue(
+      await provider.generateStructured(
+        answerSchema,
+        makeRequest({ temperature: ANTHROPIC_SUPPORTED_TEMPERATURE }),
+      ),
+    );
+
+    const { params } = onlyCall(transport.parseCalls, 'parse');
+    expect(params.temperature).toBeUndefined();
+    expect('temperature' in params).toBe(false);
   });
 
   it('sends a response-length bound even when neither the call nor the configuration names one', async () => {
@@ -1041,7 +1090,7 @@ describe('the schema-constrained route asks with the rendered format and reports
     expect(params.system).toBeUndefined();
   });
 
-  it('puts the prompt first on a repair turn and last on a follow-up', async () => {
+  it('orders one prompt against the prior turns it belongs with', async () => {
     const { provider, transport } = harness({
       script: { parse: answers(structuredAnswer(VALID_ANSWER)) },
     });
@@ -1066,6 +1115,72 @@ describe('the schema-constrained route asks with the rendered format and reports
     const followUpTurns = onlyCall(transport.parseCalls, 'parse').params.messages;
     expect(followUpTurns.at(-1)?.content).toBe(CLEAN_PROMPT);
     expect(followUpTurns.map((turn) => turn.role)).toEqual(['user', 'assistant', 'user']);
+  });
+
+  it('keeps a correction after the prompt when the call already carried an exchange', async () => {
+    const { provider, transport } = harness({
+      script: { parse: answers(structuredAnswer(VALID_ANSWER)) },
+    });
+
+    // The combination the product actually reaches: a follow-up stage carries
+    // the earlier exchange, its answer fails the schema, and `../structured.ts`
+    // appends the correction to those same prior turns. The prompt is the task
+    // the correction corrects, so it must come *before* the correction and
+    // *after* the exchange — a rule keyed on the first prior turn's role puts
+    // it last, telling the model to fix an answer to a task it has not been
+    // given yet.
+    const exchange: readonly ModelMessage[] = [
+      { role: 'user', content: 'What did the earlier capture show?' },
+      { role: 'assistant', content: 'The outer call dominated the interaction.' },
+    ];
+    const repairedFollowUp = buildRepairRequest(
+      makeRequest({ messages: exchange }),
+      'count: expected at least 2',
+      1,
+    );
+
+    okValue(await provider.generateStructured(answerSchema, repairedFollowUp));
+
+    const turns = onlyCall(transport.parseCalls, 'parse').params.messages;
+    const contents = turns.map((turn) => turn.content);
+    expect(turns.map((turn) => turn.role)).toEqual([
+      'user',
+      'assistant',
+      'user',
+      'assistant',
+      'user',
+    ]);
+    expect(contents.at(0)).toBe(exchange.at(0)?.content);
+    expect(contents.at(1)).toBe(exchange.at(1)?.content);
+    expect(contents.at(2)).toBe(CLEAN_PROMPT);
+    expect(contents.at(3)).toBe(REPAIR_ASSISTANT_NOTICE);
+    // The correcting instruction quotes the validation errors, so it is the
+    // last turn and the prompt precedes it rather than following it.
+    expect(contents.at(4)).toContain('count');
+    expect(contents.indexOf(CLEAN_PROMPT)).toBeLessThan(contents.indexOf(REPAIR_ASSISTANT_NOTICE));
+  });
+
+  it('opens the conversation with a user turn when a prior exchange cannot', async () => {
+    const { provider, transport } = harness({
+      script: { parse: answers(structuredAnswer(VALID_ANSWER)) },
+    });
+
+    // Neither documented shape, so it is a caller defect — but the messages API
+    // expects the first turn to be a user turn, so the prompt leads rather than
+    // the request being sent in a form the provider would refuse.
+    const assistantFirst: readonly ModelMessage[] = [
+      { role: 'assistant', content: 'The outer call dominated the interaction.' },
+      { role: 'user', content: 'And the database?' },
+    ];
+
+    okValue(
+      await provider.generateStructured(answerSchema, makeRequest({ messages: assistantFirst })),
+    );
+
+    const turns = onlyCall(transport.parseCalls, 'parse').params.messages;
+    expect(turns.at(0)?.role).toBe('user');
+    expect(turns.at(0)?.content).toBe(CLEAN_PROMPT);
+    expect(turns.map((turn) => turn.role)).toEqual(['user', 'assistant', 'user']);
   });
 
   it('reports a failure, not a fallback, when the route is pinned and cannot serve the call', async () => {
@@ -1717,7 +1832,91 @@ describe('every failure is a coded DebuggenError, and nothing throws', () => {
     expect(negative.code).toBe('CONFIG_INVALID');
     expect(asObject(negative.details ?? {}).condition).toBe('temperature-invalid');
 
+    // A sampling temperature a caller would plausibly ask for. The provider
+    // would answer 400 to it — to *every* call, not one — so it is refused
+    // here, and the hint names the deprecation rather than sending the
+    // developer to check a credential.
+    const unsupported = errorOf(await provider.generateText(makeRequest({ temperature: 0.2 })));
+    expect(unsupported.code).toBe('CONFIG_INVALID');
+    expect(asObject(unsupported.details ?? {}).condition).toBe('temperature-invalid');
+    expect(unsupported.hint).toContain('deprecated');
+    expect(unsupported.message).not.toBe(modelUnavailableMessage(unsupported.code));
+
     expect(transport.callCount).toBe(0);
+  });
+
+  it('bounds every request with both budgets, configured or defaulted', async () => {
+    const defaulted = harness({ script: { create: answers(textAnswer('bounded')) } });
+    okValue(await defaulted.provider.generateText(makeRequest()));
+
+    // The configuration named neither budget, and the call carries both: with
+    // the fields omitted, how long a stage may hang and how often one request
+    // is re-sent would be decided by the client's own defaults rather than by
+    // this product — and for an injected client, which this file never
+    // constructed, the per-call options are the only place a budget can reach.
+    const defaultedOptions = onlyCall(defaulted.transport.createCalls, 'create').options;
+    expect(defaultedOptions?.timeout).toBe(ANTHROPIC_DEFAULT_TIMEOUT_MS);
+    expect(defaultedOptions?.maxRetries).toBe(ANTHROPIC_DEFAULT_MAX_RETRIES);
+
+    const configured = harness({
+      // Zero is the value that proves the point: the vendor's per-request
+      // default is two, so a host that asked for no re-sending at all is
+      // overruled unless the budget travels with the call.
+      config: { ...BASE_CONFIG, timeoutMs: 9_876, maxRetries: 0 },
+      script: { create: answers(textAnswer('bounded')) },
+    });
+    okValue(await configured.provider.generateText(makeRequest()));
+
+    const configuredOptions = onlyCall(configured.transport.createCalls, 'create').options;
+    expect(configuredOptions?.timeout).toBe(9_876);
+    expect(configuredOptions?.maxRetries).toBe(0);
+    expect(configuredOptions?.maxRetries).not.toBe(ANTHROPIC_DEFAULT_MAX_RETRIES);
+  });
+
+  it('carries both budgets on a schema-constrained call as well as a text one', async () => {
+    const { provider, transport } = harness({
+      config: { ...BASE_CONFIG, maxRetries: 1 },
+      script: { parse: answers(structuredAnswer(VALID_ANSWER)) },
+    });
+
+    okValue(await provider.generateStructured(answerSchema, makeRequest()));
+
+    // Both transport routes go through one options builder, and this is what
+    // keeps that true: the structured route is the one a stage spends most of
+    // its time in.
+    const options = onlyCall(transport.parseCalls, 'parse').options;
+    expect(options?.timeout).toBe(ANTHROPIC_DEFAULT_TIMEOUT_MS);
+    expect(options?.maxRetries).toBe(1);
+  });
+
+  it('resolves both transport budgets from the configuration, then from the product default', () => {
+    // The single definition of the fallback, applied by this file and by
+    // `../factory.ts` to the configuration it hands over. Idempotence is what
+    // makes applying it at both boundaries safe.
+    const defaults = resolveAnthropicTransportBudgets(BASE_CONFIG);
+    expect(defaults).toEqual({
+      timeoutMs: ANTHROPIC_DEFAULT_TIMEOUT_MS,
+      maxRetries: ANTHROPIC_DEFAULT_MAX_RETRIES,
+    });
+    expect(resolveAnthropicTransportBudgets({ ...BASE_CONFIG, ...defaults })).toEqual(defaults);
+
+    // Per setting, not per object: a host that set one budget keeps it and is
+    // given the default for the other.
+    expect(resolveAnthropicTransportBudgets({ ...BASE_CONFIG, timeoutMs: 1_234 })).toEqual({
+      timeoutMs: 1_234,
+      maxRetries: ANTHROPIC_DEFAULT_MAX_RETRIES,
+    });
+    expect(resolveAnthropicTransportBudgets({ ...BASE_CONFIG, maxRetries: 0 })).toEqual({
+      timeoutMs: ANTHROPIC_DEFAULT_TIMEOUT_MS,
+      maxRetries: 0,
+    });
+
+    // Both are bounds a developer waits behind, so each has to be a usable
+    // number rather than merely present.
+    expect(Number.isInteger(ANTHROPIC_DEFAULT_TIMEOUT_MS)).toBe(true);
+    expect(ANTHROPIC_DEFAULT_TIMEOUT_MS).toBeGreaterThan(0);
+    expect(Number.isInteger(ANTHROPIC_DEFAULT_MAX_RETRIES)).toBe(true);
+    expect(ANTHROPIC_DEFAULT_MAX_RETRIES).toBeGreaterThanOrEqual(0);
   });
 });
 
@@ -1944,7 +2143,13 @@ describe('the factory decides which boundary a host runs behind', () => {
     // The injected record wins over the ambient one the suite runs under, which
     // selects the offline provider — proof the decision is the argument's.
     expect(provider.id).toBe('anthropic');
-    expect(asObject(transportConstruction.options.at(-1)).apiKey).toBe(CREDENTIAL_FIXTURE);
+    const constructedWith = asObject(transportConstruction.options.at(-1));
+    expect(constructedWith.apiKey).toBe(CREDENTIAL_FIXTURE);
+    // The environment carries no budget — this package reads three variables
+    // and none of them is one — so the transport the selector built is bounded
+    // by the product's defaults rather than by the vendor client's.
+    expect(constructedWith.timeout).toBe(ANTHROPIC_DEFAULT_TIMEOUT_MS);
+    expect(constructedWith.maxRetries).toBe(ANTHROPIC_DEFAULT_MAX_RETRIES);
     // A logger performs no redaction, so a credential must never be given to
     // one in the first place.
     expectNoValueLeak(serialiseLogs(logs), CREDENTIAL_FIXTURE);
@@ -2015,6 +2220,45 @@ describe('the factory decides which boundary a host runs behind', () => {
     // call site: nothing about a credential may be handed to one, on a failing
     // path any more than on a successful one.
     expectNoValueLeak(serialiseLogs(logs), CREDENTIAL_FIXTURE);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * The module graph, made mechanical
+ *
+ * One sentence has one definition, and it is reached without an implementation
+ * importing its own selector. Nothing in this repository checks an import cycle
+ * — `eslint-plugin-import` is not a dependency — so the edge is asserted from
+ * the unit's own source, where its return would be visible.
+ * ---------------------------------------------------------------------------------------------- */
+
+describe('the unit under test imports nothing that imports it', () => {
+  it('takes the shared sentence from the leaf that declares it, not from the factory', () => {
+    const source = readFileSync(new URL('./anthropic.ts', import.meta.url), 'utf8');
+
+    // `../factory.ts` reaches this module through `./index.ts`, so an import of
+    // it here closes the runtime cycle
+    // `factory -> providers/index -> providers/anthropic -> factory`. That was
+    // safe only while no imported binding was read during module evaluation,
+    // which is why the edge is gone rather than merely documented.
+    expect(source).not.toContain("from '../factory.js'");
+    expect(source).not.toContain("from './index.js'");
+    expect(source).toContain("from '../provider.js'");
+  });
+
+  it('shows the same sentence the selector shows, from the one builder', () => {
+    // Both boundaries refuse a network-backed selection with no credential:
+    // this one when a host constructs it directly, the selector when it reads
+    // the environment. A developer must not be able to tell which refused.
+    const fromProvider = errorOf(createAnthropicProvider({ config: BASE_CONFIG }));
+    const fromFactory = errorOf(
+      createModelProvider({
+        env: { DEBUGGEN_PROVIDER: 'anthropic', DEBUGGEN_MODEL: MODEL_PLACEHOLDER },
+      }),
+    );
+
+    expect(fromProvider.message).toBe(fromFactory.message);
+    expect(fromProvider.message).toBe(modelUnavailableMessage(fromProvider.code));
   });
 });
 

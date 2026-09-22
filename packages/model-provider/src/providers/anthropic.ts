@@ -45,6 +45,35 @@
  *   share a counter — `./types.ts` on `maxRetries` explains what conflating
  *   them would cost.
  *
+ * ## Both transport budgets are always explicit
+ *
+ * Every request carries both a timeout and a retry count, and so does the
+ * client this file constructs, whether or not the host configured either:
+ * {@link resolveAnthropicTransportBudgets} fills them from
+ * {@link ANTHROPIC_DEFAULT_TIMEOUT_MS} and
+ * {@link ANTHROPIC_DEFAULT_MAX_RETRIES}. Neither budget has an environment
+ * form (AAP §0.3.4 fixes this package's environment surface at three names) and
+ * the local service's configuration module passes neither, so leaving them
+ * absent would hand the question "how long may one stage hang, and how many
+ * times is one request re-sent" to whatever the vendor's software development
+ * kit defaults to — a product decision taken by a dependency, changeable by a
+ * version bump, and invisible in the session record. The defaults below are
+ * this product's answer, and a host that sets `timeoutMs` or `maxRetries`
+ * overrides them per setting.
+ *
+ * ## Sampling temperature is validated and never sent
+ *
+ * The messages API deprecated `temperature`: models released after the
+ * generation this SDK documents accept `1` for backwards compatibility and
+ * **reject every other value with a 400**, which would fail every call a
+ * session makes rather than one. This file has no model identifier to gate the
+ * field on (see below), so it takes the only safe route available to it — the
+ * field is never transmitted, a configured or requested
+ * {@link ANTHROPIC_SUPPORTED_TEMPERATURE} is accepted as the no-op it is, since
+ * that is also the API's own default, and any other value is refused locally as
+ * a configuration failure that names the deprecation. `../factory.ts` validates
+ * the same rule at the configuration boundary, so the two agree.
+ *
  * ## Structured output, and why the helper's own parse step is replaced
  *
  * AAP §0.2.4 records the mechanism: `client.messages.parse` with
@@ -75,7 +104,7 @@
  *
  * Every failure is a `DebuggenError` whose `code` comes from the closed set in
  * `@debuggen/shared`, whose `message` is AAP §0.5.5's one sentence built by
- * `modelUnavailableMessage` in `../factory.js`, and whose `hint` is the
+ * `modelUnavailableMessage` in `../provider.js`, and whose `hint` is the
  * concrete next step:
  *
  * | Outcome                                            | Code                   |
@@ -108,15 +137,19 @@
  * as the provider gave it. A missing model is a typed configuration failure,
  * never a substituted default.
  *
- * ## The import cycle, and the discipline it requires
+ * ## Every import edge runs downward
  *
- * `modelUnavailableMessage` is imported from `../factory.js`, which reaches
- * this module through `./index.js`. That cycle is deliberate — one sentence,
- * one definition, asserted by both files' tests — and it is safe only because
- * every call to it happens inside a function body at call time. A call in a
- * module-scope initializer would evaluate while the cycle is still being
- * resolved and throw. No lint rule enforces that here, so every use below sits
- * inside a method or a builder function invoked from one.
+ * This module imports `../provider.js`, `../redact-guard.js`, `../structured.js`
+ * and `../types.js`, and **nothing that imports it**. In particular it does not
+ * import `../factory.js`, which reaches this file through `./index.js`: the
+ * shared `modelUnavailableMessage` it needs is declared in `../provider.js`, a
+ * leaf of the package's module graph, precisely so that one sentence can have
+ * one definition without an implementation importing its own selector. That
+ * cycle existed once. It was safe only while no imported binding was read
+ * during module evaluation — a property no lint rule in this repository checks
+ * and every later edit could have broken — so it was removed rather than
+ * documented, and `./anthropic.test.ts` asserts from this file's own source
+ * that the edge has not come back.
  */
 
 import Anthropic, { APIUserAbortError } from '@anthropic-ai/sdk';
@@ -132,9 +165,10 @@ import type { ZodError, ZodType } from 'zod';
 import { DebuggenError, err, noopLogger, ok, tryCatch } from '@debuggen/shared';
 import type { DebuggenErrorCode, LogFields, Logger, Result } from '@debuggen/shared';
 
-import { modelUnavailableMessage } from '../factory.js';
+import { modelUnavailableMessage } from '../provider.js';
 import type { DisposableModelProvider, ModelProvider } from '../provider.js';
 import { assertOutboundSafe } from '../redact-guard.js';
+import { REPAIR_ASSISTANT_NOTICE } from '../structured.js';
 import type {
   ModelMessage,
   ModelProviderConfig,
@@ -178,6 +212,65 @@ const PROVIDER_ID = 'anthropic';
 const DEFAULT_MAX_OUTPUT_TOKENS = 8_192;
 
 /**
+ * The only sampling temperature the messages API still accepts.
+ *
+ * `temperature` is deprecated: this SDK's own declaration of the field records
+ * that models released after the generation it documents do not support setting
+ * it, that `1` is accepted for backwards compatibility, and that **every other
+ * value is rejected with a 400**. One is also the API's own default, so
+ * accepting this value and sending nothing is behaviourally identical to
+ * sending it — which is why this provider omits the field entirely and treats
+ * any other configured or requested value as a configuration failure it reports
+ * locally, instead of letting every call in a session fail at the provider.
+ *
+ * Exported because `../factory.ts` validates the same rule one boundary earlier
+ * and must not refuse a value this file would accept, nor pass one it would
+ * refuse; a single constant is what keeps the two in step. Gating the field on
+ * the model instead is not available here: a capability table would put model
+ * identifiers in this package, which AAP §0.5.3 forbids.
+ */
+export const ANTHROPIC_SUPPORTED_TEMPERATURE = 1;
+
+/**
+ * How long one request may take before the transport abandons it, when the host
+ * configured no timeout.
+ *
+ * Five minutes, and the number is derived rather than picked. The vendor's
+ * client computes the duration a non-streaming answer may need as
+ * `60 minutes × max_tokens ÷ 128000`, which for {@link DEFAULT_MAX_OUTPUT_TOKENS}
+ * — the largest artifact a stage asks for — is a little under four minutes, so a
+ * tighter bound would abandon a legitimate full-length answer. It is
+ * deliberately *half* the client's own blanket default, because that default is
+ * a vendor decision about the general case, and an interactive debugging
+ * session that has been "analysing" for ten minutes has failed whatever the
+ * transport eventually returns.
+ *
+ * A host that wants a different bound sets `ModelProviderConfig.timeoutMs`;
+ * this value applies only in its absence, and the failure a timeout produces
+ * carries the hint that says so.
+ */
+export const ANTHROPIC_DEFAULT_TIMEOUT_MS = 300_000;
+
+/**
+ * How many times the transport re-sends a request that produced no answer, when
+ * the host configured no retry bound.
+ *
+ * Two, which bounds one stage at three sends. Retries here cover the conditions
+ * that resolve quickly and retry usefully — a rate-limit response, a server
+ * error, a connection that dropped — so the practical cost is short, while the
+ * pathological case of three consecutive timeouts is bounded by
+ * {@link ANTHROPIC_DEFAULT_TIMEOUT_MS} times this count plus the client's own
+ * backoff.
+ *
+ * It is a **transport** budget and shares no counter with the schema repair
+ * budget in `../structured.js`: see this module's overview for what conflating
+ * the two would cost. A host that wants a different bound sets
+ * `ModelProviderConfig.maxRetries`, including `0` to disable re-sending
+ * altogether.
+ */
+export const ANTHROPIC_DEFAULT_MAX_RETRIES = 2;
+
+/**
  * Prefix of the tool the fallback route declares.
  *
  * The full name is this prefix plus the calling stage, which is where the name
@@ -215,7 +308,16 @@ const MISSING_MODEL_HINT =
 
 /** Remediation for a request budget that the messages API cannot accept. */
 const INVALID_BUDGET_HINT =
-  'Correct the value where the request is assembled, or in the service configuration it came from. A response-length bound must be a positive integer and a temperature a non-negative finite number.';
+  'Correct the value where the request is assembled, or in the service configuration it came from. A response-length bound must be a positive integer, a request timeout a positive integer number of milliseconds and a transport retry bound a non-negative integer.';
+
+/**
+ * Remediation for a sampling temperature the messages API no longer accepts.
+ *
+ * States the value the API still tolerates so a developer who wants to keep the
+ * setting can, and recommends removing it, which is what this provider does
+ * with it in every case: the field is never transmitted.
+ */
+const UNSUPPORTED_TEMPERATURE_HINT = `Remove the sampling temperature from the request and from the service configuration, or set it to ${String(ANTHROPIC_SUPPORTED_TEMPERATURE)}. The messages API deprecated the field: current models accept only that value, which is also the API default, so this provider never sends it and no answer changes when it is dropped.`;
 
 /** Remediation for a credential the provider rejected. */
 const UNAUTHORIZED_HINT =
@@ -279,16 +381,34 @@ const PARSE_ROUTE_HINT =
  * The per-call transport options this provider sets.
  *
  * `signal` is the cancellation channel `ModelRequest.signal` is forwarded to —
- * `./types.ts` makes it the only one — and `timeout` is carried per call as
- * well as on the client so that an **injected** client, which this file never
- * configured, still honours a configured timeout.
+ * `./types.ts` makes it the only one — and **both** transport budgets are
+ * carried per call as well as on the client, so that an **injected** client,
+ * which this file never configured, is bounded by the same policy rather than
+ * by its own defaults. The vendor's per-request options accept both.
  */
 export interface AnthropicRequestOptionsLike {
   /** Cancellation for this call, forwarded from the request. */
   readonly signal?: AbortSignal | null | undefined;
 
-  /** Per-call transport timeout in milliseconds, when one is configured. */
+  /**
+   * Per-call transport timeout in milliseconds.
+   *
+   * Optional in the shape because the vendor's own options type declares it so;
+   * this provider always sets it, from the effective budget it was constructed
+   * with.
+   */
   readonly timeout?: number | undefined;
+
+  /**
+   * How many times this call may be re-sent when it produced no answer.
+   *
+   * Optional in the shape for the same reason as `timeout`, and set on every
+   * call for the same purpose: a client this file did not construct — a test's
+   * fake, or a host's own configured client — would otherwise apply its own
+   * retry count, so a configured `maxRetries` of `0` could be silently
+   * overruled by the vendor's default of two.
+   */
+  readonly maxRetries?: number | undefined;
 }
 
 /**
@@ -382,7 +502,13 @@ export interface AnthropicMessageParamsLike {
   /** The system instruction, when the stage has one. */
   readonly system?: unknown;
 
-  /** Sampling temperature, when one is configured or requested. */
+  /**
+   * Sampling temperature — deprecated at the messages API, and a field this
+   * provider never sets.
+   *
+   * Declared because the parameter shape still carries it, so a test can assert
+   * its absence on a recorded call rather than trusting that it was dropped.
+   */
   readonly temperature?: unknown;
 
   /** Tool declarations, on the tool routes only. */
@@ -518,6 +644,60 @@ export interface AnthropicProviderOptions {
    * provider shares.
    */
   readonly structuredOutputMode?: AnthropicStructuredOutputMode;
+}
+
+// ---------------------------------------------------------------------------
+// Transport budgets
+// ---------------------------------------------------------------------------
+
+/**
+ * The two bounds every call this provider makes is subject to.
+ *
+ * Both are resolved to a concrete number rather than left optional, which is
+ * the whole point of the type: an optional budget is one a dependency's default
+ * silently answers for the product.
+ */
+export interface AnthropicTransportBudgets {
+  /** How long one request may take, in milliseconds. */
+  readonly timeoutMs: number;
+
+  /** How many times a request that produced no answer is re-sent. */
+  readonly maxRetries: number;
+}
+
+/**
+ * Resolves the effective transport budgets for one configuration.
+ *
+ * Precedence is the host's configuration, then this module's documented
+ * defaults, per budget rather than per object: a host that set only a timeout
+ * keeps its timeout and is given the default retry count.
+ *
+ * Exported and called from two places, deliberately. `../factory.ts` applies it
+ * to the configuration it hands over, so the configuration a provider is
+ * *constructed from* already states both bounds; this file applies it again to
+ * whatever configuration it receives, so a host that bypasses the factory and
+ * constructs a provider directly gets the same bounds rather than the vendor
+ * client's. Applying it twice is idempotent — the second application sees the
+ * values the first resolved — and having one definition of the fallback is what
+ * makes the two boundaries incapable of disagreeing.
+ *
+ * Validation is **not** its job: a malformed budget is refused by
+ * {@link createAnthropicProvider} (and one boundary earlier by the factory)
+ * rather than replaced here, because substituting a default for a value the
+ * host got wrong hides the mistake. A value present and unusable therefore
+ * travels through this function untouched and fails validation immediately
+ * afterwards.
+ *
+ * @param config The configuration a provider is being built from.
+ * @returns Both budgets, each a concrete number.
+ */
+export function resolveAnthropicTransportBudgets(
+  config: ModelProviderConfig,
+): AnthropicTransportBudgets {
+  return {
+    timeoutMs: config.timeoutMs ?? ANTHROPIC_DEFAULT_TIMEOUT_MS,
+    maxRetries: config.maxRetries ?? ANTHROPIC_DEFAULT_MAX_RETRIES,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -825,28 +1005,44 @@ function classifyTransportFailure(cause: unknown, request: ModelRequest): Debugg
 /**
  * Maps a request's prose onto the messages API's turn list.
  *
- * ## Where the rendered prompt goes, and why it is not always last
+ * ## The conversation is assembled, not inferred
  *
  * `./types.ts` gives a request one rendered `prompt` and an optional list of
- * **prior turns**, and the two documented users of that list want opposite
- * orderings:
+ * **prior turns**, and that list can hold two kinds of turn at once, wanting
+ * opposite sides of the prompt:
  *
- * - A **repair** attempt (`buildRepairRequest` in `./structured.ts`) leaves the
- *   prompt untouched and appends an assistant turn stating that the previous
- *   answer failed, followed by the correction. The prompt is the task those
- *   turns correct, so it belongs **first** — and a conversation whose first
- *   turn is that assistant statement would be malformed.
- * - A **follow-up** stage carries the earlier exchange, oldest first, and its
- *   prompt is the new instruction. It belongs **last**, after the exchange it
- *   continues; putting it first would leave the model continuing an earlier
- *   answer instead of answering the new question.
+ * - A **follow-up** stage carries the earlier exchange, oldest first. It
+ *   *precedes* the prompt, which is the new instruction; placing the prompt
+ *   before it would leave the model continuing an earlier answer instead of
+ *   answering the new question.
+ * - A **repair** attempt (`buildRepairRequest` in `./structured.ts`) appends an
+ *   assistant turn stating that the previous answer failed, followed by the
+ *   correction. Those *follow* the prompt, which is the task they correct.
  *
- * The role of the first prior turn tells the two cases apart with no extra
- * field and no guessing: prior turns that begin with an *assistant* turn
- * continue from the prompt, so the prompt goes first; prior turns that begin
- * with a *user* turn precede it, so the prompt goes last. Either way the turn
- * list starts with a user turn, which is what the messages API expects, and
- * consecutive turns of the same role are the provider's to merge.
+ * The turn list is therefore built in one fixed order — **prior exchange,
+ * prompt, failure notice, correction** — and the boundary between the two kinds
+ * is read from the repair turns themselves rather than guessed at. The notice
+ * is `REPAIR_ASSISTANT_NOTICE`, imported from the module that appends it, so
+ * there is one definition of that marker and no sentence repeated here; the
+ * first turn carrying it begins the correcting suffix, and everything before it
+ * is prior exchange.
+ *
+ * Deciding from the *first* prior turn's role instead — the shape this function
+ * had — got the two ordinary cases right and the combination wrong: a follow-up
+ * whose answer then failed its schema arrives with a user-first exchange *and* a
+ * repair suffix, and a rule keyed on the first turn puts the prompt last, after
+ * the correction, so the model is told to fix an answer to a task it has not
+ * been given yet. That is the one arrangement in which a repair cannot work,
+ * and it is reachable from the product's own follow-up stage.
+ *
+ * ## The one invariant the API imposes
+ *
+ * The messages API expects the conversation to open with a user turn. Prior
+ * exchange that opens with an assistant turn cannot legally lead, so in that
+ * case — a caller defect rather than either documented shape — the prompt is
+ * emitted first, ahead of it. This is a validity guard and nothing more: it
+ * never decides where a *correction* goes, which is what the marker above
+ * settles. Consecutive turns of the same role are the provider's to merge.
  *
  * @param request The request to send.
  * @returns The turn list, oldest first, always beginning with a user turn.
@@ -858,14 +1054,26 @@ function toProviderMessages(request: ModelRequest): MessageParam[] {
     return [promptTurn];
   }
 
-  const carried: MessageParam[] = priorTurns.map((turn) => ({
-    role: turn.role,
-    content: turn.content,
-  }));
-  const first = priorTurns[0];
-  return first !== undefined && first.role === 'assistant'
-    ? [promptTurn, ...carried]
-    : [...carried, promptTurn];
+  const correctionStart = priorTurns.findIndex(
+    (turn) => turn.role === 'assistant' && turn.content === REPAIR_ASSISTANT_NOTICE,
+  );
+  const exchange = (correctionStart === -1 ? priorTurns : priorTurns.slice(0, correctionStart)).map(
+    toProviderTurn,
+  );
+  const correction = (correctionStart === -1 ? [] : priorTurns.slice(correctionStart)).map(
+    toProviderTurn,
+  );
+
+  // A prior exchange that cannot open the conversation is placed after the
+  // prompt; see the note on the API's invariant above.
+  return exchange[0]?.role === 'assistant'
+    ? [promptTurn, ...exchange, ...correction]
+    : [...exchange, promptTurn, ...correction];
+}
+
+/** One prior turn, in the shape the messages API takes. */
+function toProviderTurn(turn: ModelMessage): MessageParam {
+  return { role: turn.role, content: turn.content };
 }
 
 /**
@@ -901,33 +1109,46 @@ function resolveMaxTokens(
 }
 
 /**
- * Resolves the sampling temperature for one call, or reports that none is
- * usable.
+ * Checks the sampling temperature one call asks for, and never produces one to
+ * send.
  *
- * `undefined` is a legitimate answer and means "send no temperature", leaving
- * the provider's own default in place: this package sets no default of its own,
- * because a sensible one is a property of the provider and the model, neither
- * of which this file knows anything about (`./types.ts` on
- * `ModelRequest.temperature`).
+ * The field is deprecated at the messages API:
+ * {@link ANTHROPIC_SUPPORTED_TEMPERATURE} is accepted for backwards
+ * compatibility and every other value is rejected with a 400. Three
+ * consequences, in the order they matter:
+ *
+ * - **Nothing is transmitted.** The accepted value is the API's own default, so
+ *   omitting the field is behaviourally identical to sending it while being
+ *   immune to the deprecation being completed.
+ * - **An unsupported value fails here, not at the provider.** A configuration
+ *   carrying one would otherwise turn every call of every stage in the session
+ *   into a refusal, reported as an unavailable provider — a developer sent to
+ *   check a credential for a sampling setting. Refusing it locally names the
+ *   real cause once, in the same shape as every other unusable budget: a
+ *   caller defect reported rather than silently replaced.
+ * - **No model is consulted.** Gating the field on a model's capabilities would
+ *   require model identifiers in this package, which AAP §0.5.3 forbids; the
+ *   API's own rule is the only rule available, and it is the conservative one.
+ *
+ * @param request The request being built, for the failure's provenance.
+ * @param configured The configuration's temperature, when it set one.
+ * @returns `Ok` when nothing needs sending, or the coded refusal.
  */
-function resolveTemperature(
+function checkTemperature(
   request: ModelRequest,
   configured: number | undefined,
-): Result<number | undefined, DebuggenError> {
+): Result<void, DebuggenError> {
   const requested = request.temperature ?? configured;
-  if (requested === undefined) {
+  if (requested === undefined || requested === ANTHROPIC_SUPPORTED_TEMPERATURE) {
     return ok(undefined);
   }
-  if (!Number.isFinite(requested) || requested < 0) {
-    return err(
-      codedFailure(
-        'CONFIG_INVALID',
-        `A sampling temperature must be a non-negative finite number; this call asked for ${String(requested)}.`,
-        { condition: 'temperature-invalid', hint: INVALID_BUDGET_HINT, request },
-      ),
-    );
-  }
-  return ok(requested);
+  return err(
+    codedFailure(
+      'CONFIG_INVALID',
+      `A sampling temperature other than ${String(ANTHROPIC_SUPPORTED_TEMPERATURE)} is no longer accepted by the messages API; this call asked for ${String(requested)}.`,
+      { condition: 'temperature-invalid', hint: UNSUPPORTED_TEMPERATURE_HINT, request },
+    ),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -1239,6 +1460,16 @@ class AnthropicProvider implements DisposableModelProvider {
   /** The resolved configuration this provider was built from. */
   readonly #config: ModelProviderConfig;
 
+  /**
+   * The transport bounds every call is subject to, each a concrete number.
+   *
+   * Resolved once here rather than read from the configuration per call, so the
+   * per-call options cannot be left without a timeout by a configuration that
+   * named none — which is the state in which a dependency's default silently
+   * decides how long a stage may hang.
+   */
+  readonly #budgets: AnthropicTransportBudgets;
+
   /** Where this provider logs. Never a payload, never a credential. */
   readonly #logger: Logger;
 
@@ -1256,6 +1487,7 @@ class AnthropicProvider implements DisposableModelProvider {
   ) {
     this.#client = client;
     this.#config = config;
+    this.#budgets = resolveAnthropicTransportBudgets(config);
     this.#logger = logger;
     this.#structuredOutputMode = structuredOutputMode;
   }
@@ -1558,30 +1790,33 @@ class AnthropicProvider implements DisposableModelProvider {
 
   /**
    * The parameters every route starts from: the model, the response-length
-   * bound, the conversation, the system instruction and the temperature.
+   * bound, the conversation and the system instruction.
    *
    * Built as the SDK's own parameter type, so every field this provider sends
    * is checked against the real messages API even though the transport seam it
    * passes through is structural.
+   *
+   * No sampling temperature is among them, whatever the call or the
+   * configuration asked for: {@link checkTemperature} either clears the call or
+   * refuses it, and the field is never transmitted — see this module's overview
+   * for the deprecation that settles it.
    */
   #baseParams(request: ModelRequest): Result<MessageCreateParamsNonStreaming, DebuggenError> {
     const maxTokens = resolveMaxTokens(request, this.#config.maxTokens);
     if (!maxTokens.ok) {
       return maxTokens;
     }
-    const temperature = resolveTemperature(request, this.#config.temperature);
+    const temperature = checkTemperature(request, this.#config.temperature);
     if (!temperature.ok) {
       return temperature;
     }
 
     const system = request.system;
-    const sampling = temperature.value;
     return ok({
       model: this.#config.model,
       max_tokens: maxTokens.value,
       messages: toProviderMessages(request),
       ...(system === undefined ? {} : { system }),
-      ...(sampling === undefined ? {} : { temperature: sampling }),
     });
   }
 
@@ -1589,15 +1824,21 @@ class AnthropicProvider implements DisposableModelProvider {
    * The per-call transport options.
    *
    * The abort signal is forwarded so an in-flight call is actually cancellable
-   * rather than merely abandoned, and the configured timeout is carried per call
-   * as well as on the client so that an injected client honours it too.
+   * rather than merely abandoned, and **both** effective budgets are carried on
+   * every call — not only when a host configured them — for two reasons: an
+   * injected client was never configured by this file and would otherwise apply
+   * its own bounds, and a request whose duration and re-send count no product
+   * decision bounds is a stage that can hang for as long as a dependency's
+   * defaults allow. The vendor's client reads a per-request `maxRetries` in
+   * preference to the one it was constructed with, so the two agree by
+   * construction here rather than by luck.
    */
   #requestOptions(request: ModelRequest): AnthropicRequestOptionsLike {
-    const timeout = this.#config.timeoutMs;
     const signal = request.signal;
     return {
       ...(signal === undefined ? {} : { signal }),
-      ...(timeout === undefined ? {} : { timeout }),
+      timeout: this.#budgets.timeoutMs,
+      maxRetries: this.#budgets.maxRetries,
     };
   }
 
@@ -1935,9 +2176,18 @@ function isNonNegativeInteger(candidate: number): boolean {
   return Number.isInteger(candidate) && candidate >= 0;
 }
 
-/** Whether a configured value is a finite, non-negative number. */
-function isNonNegativeNumber(candidate: number): boolean {
-  return Number.isFinite(candidate) && candidate >= 0;
+/**
+ * Whether a configured sampling temperature is one the messages API still
+ * accepts.
+ *
+ * Exactly {@link ANTHROPIC_SUPPORTED_TEMPERATURE}, for the deprecation
+ * {@link checkTemperature} documents. The same rule is applied per call there;
+ * this predicate is the construction-time half, so a configuration carrying an
+ * unusable value is refused where a host can print it rather than at the first
+ * stage of a session.
+ */
+function isSupportedTemperature(candidate: number): boolean {
+  return candidate === ANTHROPIC_SUPPORTED_TEMPERATURE;
 }
 
 /**
@@ -1950,12 +2200,22 @@ function isNonNegativeNumber(candidate: number): boolean {
  *
  * The offending value is named: it is a budget the host configured, not payload
  * and not a credential.
+ *
+ * @param value The configured value, or `undefined` when the host set none.
+ * @param label How the budget is named to a developer.
+ * @param accept Whether a value that is set can be used.
+ * @param requirement What the value must be, completing the message.
+ * @param hint The developer's next step. Defaults to the shared budget
+ * remediation; a budget whose next step is specific — the deprecated sampling
+ * temperature — passes its own.
+ * @returns `Ok` when the value is absent or usable, or the coded refusal.
  */
 function validateBudget(
   value: number | undefined,
   label: string,
   accept: (candidate: number) => boolean,
   requirement: string,
+  hint: string = INVALID_BUDGET_HINT,
 ): Result<void, DebuggenError> {
   if (value === undefined || accept(value)) {
     return ok(undefined);
@@ -1964,7 +2224,7 @@ function validateBudget(
     codedFailure(
       'CONFIG_INVALID',
       `${label} must be ${requirement}; the configuration supplies ${String(value)}.`,
-      { condition: 'configuration-budget-invalid', hint: INVALID_BUDGET_HINT },
+      { condition: 'configuration-budget-invalid', hint },
     ),
   );
 }
@@ -1991,7 +2251,19 @@ function validateBudget(
  *   absent, a missing credential is a configuration failure — never a client
  *   built without one, which would fail later and less clearly.
  * - **Usable budgets.** `maxTokens`, `temperature`, `timeoutMs` and
- *   `maxRetries` are each optional and each checked when present.
+ *   `maxRetries` are each optional and each checked when present. An
+ *   unsupported sampling temperature is refused here for the deprecation
+ *   {@link checkTemperature} documents.
+ *
+ * ## Both transport budgets are set, never defaulted by the dependency
+ *
+ * `timeoutMs` and `maxRetries` are resolved through
+ * {@link resolveAnthropicTransportBudgets} and passed to the client
+ * unconditionally, so a host that configured neither still gets this product's
+ * documented bounds rather than the vendor client's. The resolved values are
+ * kept on the configuration the provider holds, which is what lets every call
+ * carry the same timeout it was constructed with — including a call through an
+ * injected client this file never configured.
  *
  * ## The retry bound is a transport budget
  *
@@ -2047,8 +2319,9 @@ export function createAnthropicProvider(
     validateBudget(
       config.temperature,
       'A sampling temperature',
-      isNonNegativeNumber,
-      'a non-negative finite number',
+      isSupportedTemperature,
+      `exactly ${String(ANTHROPIC_SUPPORTED_TEMPERATURE)}, the only value the messages API still accepts`,
+      UNSUPPORTED_TEMPERATURE_HINT,
     ),
     validateBudget(
       config.timeoutMs,
@@ -2072,7 +2345,18 @@ export function createAnthropicProvider(
   // The model is the one field normalised on its way in: a configured value
   // with surrounding whitespace is a typo rather than a different model, and
   // sending it unchanged would produce an opaque refusal from the provider.
-  const resolved: ModelProviderConfig = { ...config, model };
+  //
+  // The two transport budgets are resolved at the same time, so the
+  // configuration the provider holds states both bounds explicitly — whether
+  // the host named them or this module's defaults answered — and no later read
+  // of it can find a budget absent.
+  const transport = resolveAnthropicTransportBudgets(config);
+  const resolved: ModelProviderConfig = {
+    ...config,
+    model,
+    timeoutMs: transport.timeoutMs,
+    maxRetries: transport.maxRetries,
+  };
 
   const injected = options.client;
   if (injected !== undefined) {
@@ -2093,15 +2377,16 @@ export function createAnthropicProvider(
   }
 
   const baseUrl = config.baseUrl;
-  const maxRetries = config.maxRetries;
-  const timeout = config.timeoutMs;
   const constructed = tryCatch<AnthropicClientLike>(
     () =>
       new Anthropic({
         apiKey,
         ...(baseUrl === undefined ? {} : { baseURL: baseUrl }),
-        ...(maxRetries === undefined ? {} : { maxRetries }),
-        ...(timeout === undefined ? {} : { timeout }),
+        // Both budgets, always. A client built without them applies the
+        // vendor's own bounds instead, which are not this product's decision
+        // and change with a version bump.
+        maxRetries: transport.maxRetries,
+        timeout: transport.timeoutMs,
       }),
     'MODEL_UNAVAILABLE',
   );

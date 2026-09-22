@@ -31,12 +31,16 @@
  * This module sits at the top of the folder's little module graph: it imports
  * the two implementations, the two implementations import neither it nor each
  * other, and nothing here imports `../factory.js` (the factory imports *this*
- * module). Keeping that direction is what makes the vocabulary safe to
- * centralise. It is also why `../provider.ts` types `ModelProvider.id` as
- * `string` rather than as {@link ProviderId}: each implementation narrows
- * `id` to its own private literal, so neither has to import this file to say
- * what it is, and the closed set stays in one place without closing a cycle
- * for a single string. Narrowing that declaration would be a regression, not
+ * module). Neither implementation imports the factory either — the one sentence
+ * both it and the network-backed provider report is declared in
+ * `../provider.js`, a leaf — so the edge from the selector down through this
+ * barrel to the implementations is the only one there is, and it runs one way
+ * in fact rather than merely by intent. Keeping that direction is what makes
+ * the vocabulary safe to centralise. It is also why `../provider.ts` types
+ * `ModelProvider.id` as `string` rather than as {@link ProviderId}: each
+ * implementation narrows `id` to its own private literal, so neither has to
+ * import this file to say what it is, and the closed set stays in one place
+ * without closing a cycle for a single string. Narrowing that declaration would be a regression, not
  * an improvement.
  *
  * Because the two literals therefore exist twice — once in this tuple as
@@ -171,6 +175,28 @@ export function isProviderId(value: unknown): value is ProviderId {
 export { createAnthropicProvider } from './anthropic.js';
 
 /**
+ * The network-backed provider's transport policy: see `./anthropic.js`.
+ *
+ * Forwarded as values because two boundaries apply them. `../factory.js` calls
+ * {@link resolveAnthropicTransportBudgets} on the configuration it hands over,
+ * so the configuration a provider is constructed from states both bounds
+ * explicitly instead of leaving them to the vendor client's own defaults; the
+ * provider applies the same resolver to whatever configuration it receives, so
+ * a host constructing one directly is bounded identically.
+ * `ANTHROPIC_SUPPORTED_TEMPERATURE` is the single definition of the one
+ * sampling temperature the messages API still accepts, which the factory
+ * validates against one boundary earlier than the provider does, and the two
+ * defaults are what a suite asserts a call was actually bounded by rather than
+ * restating a number of its own.
+ */
+export {
+  ANTHROPIC_DEFAULT_MAX_RETRIES,
+  ANTHROPIC_DEFAULT_TIMEOUT_MS,
+  ANTHROPIC_SUPPORTED_TEMPERATURE,
+  resolveAnthropicTransportBudgets,
+} from './anthropic.js';
+
+/**
  * The structured-output routes the network-backed provider can take, as a
  * readonly tuple: see `./anthropic.js`.
  *
@@ -207,6 +233,9 @@ export { createDeterministicProvider } from './deterministic.js';
  *   the resolved configuration, an optional client, a logger and the route.
  * - `AnthropicStructuredOutputMode` — one of
  *   {@link ANTHROPIC_STRUCTURED_OUTPUT_MODES}.
+ * - `AnthropicTransportBudgets` — the resolved per-request timeout and retry
+ *   count {@link resolveAnthropicTransportBudgets} answers with, both concrete
+ *   numbers.
  * - `AnthropicClientLike`, `AnthropicMessagesLike`,
  *   `AnthropicMessageParamsLike`, `AnthropicMessageLike`,
  *   `AnthropicContentBlockLike`, `AnthropicUsageLike` and
@@ -226,6 +255,7 @@ export type {
   AnthropicProviderOptions,
   AnthropicRequestOptionsLike,
   AnthropicStructuredOutputMode,
+  AnthropicTransportBudgets,
   AnthropicUsageLike,
 } from './anthropic.js';
 

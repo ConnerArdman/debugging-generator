@@ -44,13 +44,14 @@
  *
  * ## Structure versus counts
  *
- * A component tree is a *point-in-time* structure: it is built from the **last
- * commit of the capture**, because that is the only commit whose shape is still
- * the shape of the page when the capture ended. The per-node numbers are
- * *cumulative* over the whole capture, because "this node rendered 240 times"
- * is the finding, and it is not visible in a single commit. Both come from one
- * internal accumulation pass, so a node's count and its row in the render table
- * can never disagree.
+ * A component tree is a *point-in-time* structure: it is the structure of the
+ * page **as the capture ended** — the producer's snapshot event, taken at
+ * capture stop, or failing that the last commit of the capture, because that is
+ * the only commit whose shape is still the shape of the page. The per-node
+ * numbers are *cumulative* over the whole capture, because "this node rendered
+ * 240 times" is the finding, and it is not visible in a single commit. Both
+ * come from one internal accumulation pass, so a node's count and its row in
+ * the render table can never disagree.
  *
  * @packageDocumentation
  */
@@ -60,6 +61,10 @@ import type { EventId, SourceLocation, SpanId, TraceId } from '@debuggen/shared'
 
 import {
   COMMIT_ATTRIBUTE_KEYS,
+  COMPONENT_TREE_ATTRIBUTE_KEYS,
+  COMPONENT_TREE_EVENT_NAME,
+  COMPONENT_TREE_TRUNCATED_FIELD,
+  LOG_ATTRIBUTE_KEYS,
   MAX_TRACKED_KEYS,
   RENDER_ATTRIBUTE_KEYS,
   RENDER_PHASES,
@@ -68,7 +73,7 @@ import {
 } from '../schema/attributes.js';
 import type { ChangedPropEntry, RenderPhase, RenderTrigger } from '../schema/attributes.js';
 import type { TelemetryEvent } from '../schema/event.js';
-import { RENDER_KINDS } from '../schema/kinds.js';
+import { RENDER_KINDS, TELEMETRY_KINDS } from '../schema/kinds.js';
 import type { TelemetryKind } from '../schema/kinds.js';
 
 /*
@@ -118,6 +123,19 @@ const [
 const [, , , UNCHANGED_TRIGGER, UNKNOWN_TRIGGER] = RENDER_TRIGGERS;
 
 /**
+ * The component-tree snapshot's attribute keys, bound positionally from the
+ * tuple that declares them.
+ *
+ * `componentTree` holds the forest as JSON text (or as the structure itself)
+ * and `componentTreeTruncated` says the producer had to fall back to a bound
+ * below the one it was asked for. The second key of the tuple,
+ * `componentTreeNodeCount`, is deliberately left unbound: this module counts
+ * the nodes it actually emits, and a count the producer computed over a
+ * document this module may have parsed only part of would contradict it.
+ */
+const [COMPONENT_TREE_KEY, , COMPONENT_TREE_TRUNCATED_KEY] = COMPONENT_TREE_ATTRIBUTE_KEYS;
+
+/**
  * The kind whose declared attribute keys are the render keys, and the kind
  * whose declared keys are the commit keys.
  *
@@ -139,6 +157,26 @@ const RENDER_EVENT_KIND: TelemetryKind | undefined = resolveKindByDeclaredKeys(
 const COMMIT_EVENT_KIND: TelemetryKind | undefined = resolveKindByDeclaredKeys(
   RENDER_KINDS,
   COMMIT_ATTRIBUTE_KEYS,
+);
+
+/**
+ * The kind a component-tree snapshot travels as.
+ *
+ * Resolved the same way, from the whole kind vocabulary rather than from the
+ * render group: the snapshot is not a rendering event but a named record of
+ * the kind whose declared keys include the component-tree keys
+ * (`../schema/attributes.ts` spreads them into that kind's tuple). Resolving
+ * it this way rather than naming the kind is what keeps `../schema/kinds.ts`
+ * the only place a kind string is written.
+ *
+ * Typed as possibly absent, and the selection in {@link toSnapshotRecord}
+ * requires the kind only when it resolved: a catalog reorganised so that no
+ * single kind declares exactly that key set must degrade to selecting
+ * snapshots by event name, not to ignoring them.
+ */
+const SNAPSHOT_EVENT_KIND: TelemetryKind | undefined = resolveKindByDeclaredKeys(
+  TELEMETRY_KINDS,
+  LOG_ATTRIBUTE_KEYS,
 );
 
 /**
@@ -480,8 +518,10 @@ export interface ComponentTreeNode {
 /**
  * How a component-tree snapshot was built, best first.
  *
- * - `commit-snapshot` — the last commit carried a serialized tree, so the
- *   structure is the producer's own and needed only validating.
+ * - `commit-snapshot` — the producer serialized the structure itself, so it
+ *   needed only validating: either on its own snapshot event, taken at capture
+ *   stop while the last committed structure was still reachable, or attached
+ *   to the commit. Both write the catalogued `componentTree` key.
  * - `owner-chains` — the structure was reconstructed from the owner chains the
  *   individual render events carry. Faithful for every path that was rendered,
  *   and silent about parts of the page that did not render.
@@ -505,8 +545,8 @@ export type ComponentTreeOrigin = (typeof COMPONENT_TREE_ORIGINS)[number];
 export interface ComponentTreeSnapshot {
   /**
    * When the structure was observed, in Unix epoch milliseconds: the start of
-   * the commit it came from, or of the latest render when no commit was
-   * captured.
+   * the snapshot event that carried it, of the commit it came from, or of the
+   * latest render when the capture holds neither.
    */
   capturedAt: number;
   /** The commit event the structure came from, when one was captured. */
@@ -669,6 +709,25 @@ interface CommitRecord {
   readonly attributes: AttributeBag;
 }
 
+/**
+ * A component-tree snapshot event, normalised.
+ *
+ * The serialized document is carried **unparsed**: parsing is bounded by the
+ * node and depth limits, which only {@link buildComponentTreeSnapshot} knows,
+ * and {@link aggregateRenders} indexes the same capture without ever needing
+ * the structure. So the index records the candidate and the tree is read once,
+ * for the snapshot that is actually used.
+ */
+interface SnapshotRecord {
+  readonly eventId: EventId;
+  readonly startTime: number;
+  readonly ingestSeq: number;
+  /** The `componentTree` attribute as it arrived: JSON text, or a structure. */
+  readonly serialized: unknown;
+  /** The producer's `componentTreeTruncated` flag: it reduced the tree. */
+  readonly reduced: boolean;
+}
+
 /** Running totals for one component. Mutated only while indexing. */
 interface ComponentAccumulator {
   readonly component: string;
@@ -700,6 +759,8 @@ interface RenderIndex {
   readonly components: ReadonlyMap<string, ComponentAccumulator>;
   readonly renders: readonly RenderRecord[];
   readonly commits: readonly CommitRecord[];
+  /** Component-tree snapshot events, in canonical order. */
+  readonly snapshots: readonly SnapshotRecord[];
 }
 
 /*
@@ -809,14 +870,65 @@ function zeroFilledCounts<Key extends string>(keys: readonly Key[]): Record<Key,
 }
 
 /**
+ * Total order for two locations of equal confidence: file, line, column,
+ * symbol, resolution route, then end line.
+ *
+ * Every field of the shape except `confidence` takes part, in that fixed
+ * order, so the comparison separates any two locations that are not identical
+ * and returns `0` only for two that are. A location that **names a symbol
+ * sorts before one that does not**, so the more descriptive of two otherwise
+ * identical positions wins; an absent `endLine` sorts first. The string
+ * comparisons are by code unit so two machines agree.
+ *
+ * `./timeline.ts` orders equal-confidence locations by the same rule for the
+ * participants of its dependency graph, so the `renders` and `graph` sources
+ * cannot send a developer to two different lines for one component.
+ */
+function compareLocations(left: SourceLocation, right: SourceLocation): number {
+  const byFile = compareStrings(left.file, right.file);
+  if (byFile !== 0) {
+    return byFile;
+  }
+  if (left.line !== right.line) {
+    return left.line - right.line;
+  }
+  if (left.column !== right.column) {
+    return left.column - right.column;
+  }
+  if (left.symbol !== right.symbol) {
+    if (left.symbol === undefined) {
+      return 1;
+    }
+    if (right.symbol === undefined) {
+      return -1;
+    }
+    return compareStrings(left.symbol, right.symbol);
+  }
+  const byRoute = compareStrings(left.resolvedBy, right.resolvedBy);
+  if (byRoute !== 0) {
+    return byRoute;
+  }
+  return (left.endLine ?? 0) - (right.endLine ?? 0);
+}
+
+/**
  * Keeps the more trustworthy of two locations.
  *
  * Resolution routes differ in what they can promise — a patch knows exactly
  * where it wrote, a source map knows a position, an owner chain knows a
  * component — and each location carries the confidence its route assigned. When
  * several renders of one component disagree, the most confident answer is the
- * one a developer should be sent to; ties keep the incumbent, so the result
- * does not depend on input order.
+ * one a developer should be sent to.
+ *
+ * **Equal confidence is broken by the locations themselves**, not by which
+ * render was folded in first: {@link compareLocations} is a total order over
+ * the whole shape and the lesser location wins. Keeping the incumbent instead
+ * would make a component's reported source depend on the order the events
+ * happened to arrive in, so two runs over one capture — or the service and a
+ * page bundle reading the same capture — could send a developer to two
+ * different lines and neither would be wrong. The confidence precedence itself
+ * is untouched: a more confident location still beats a less confident one
+ * whatever their fields say.
  */
 function preferSource(
   current: SourceLocation | undefined,
@@ -828,7 +940,10 @@ function preferSource(
   if (current === undefined) {
     return candidate;
   }
-  return candidate.confidence > current.confidence ? candidate : current;
+  if (candidate.confidence !== current.confidence) {
+    return candidate.confidence > current.confidence ? candidate : current;
+  }
+  return compareLocations(candidate, current) < 0 ? candidate : current;
 }
 
 /** The component name of a render, or {@link UNKNOWN_COMPONENT_LABEL}. */
@@ -985,14 +1100,23 @@ function compareRenderRecords(left: RenderRecord, right: RenderRecord): number {
   return compareStrings(left.eventId, right.eventId);
 }
 
+/** The fields canonical event order is computed from. */
+interface CanonicallyOrdered {
+  readonly startTime: number;
+  readonly ingestSeq: number;
+  readonly eventId: EventId;
+}
+
 /**
- * Canonical order for commits: start time, then ingest sequence, then event id.
+ * Canonical order: start time, then ingest sequence, then event id.
  *
  * The same ordering the correlator uses, and for the same reason: the ingest
  * sequence is store-assigned and always distinct, so the comparison is total
- * and two runs over one capture choose the same "last" commit.
+ * and two runs over one capture choose the same "last" record. Both the
+ * commits and the snapshot events are sorted with it, so "the last commit" and
+ * "the latest snapshot" are decided by one rule.
  */
-function compareCommitRecords(left: CommitRecord, right: CommitRecord): number {
+function compareCanonically(left: CanonicallyOrdered, right: CanonicallyOrdered): number {
   if (left.startTime !== right.startTime) {
     return left.startTime - right.startTime;
   }
@@ -1058,6 +1182,55 @@ function toRenderRecord(event: TelemetryEvent): RenderRecord | undefined {
     ownerChain: ownerChain.chain,
     ownerChainTruncated: ownerChain.truncated,
     source: event.source,
+  };
+}
+
+/**
+ * Whether an attribute value could be a serialized forest.
+ *
+ * The same two transports {@link resolveSerializedValue} accepts — text, or
+ * the structure itself — tested without parsing, so indexing a capture costs
+ * nothing for an event that carries neither.
+ */
+function isSerializedCandidate(value: unknown): boolean {
+  if (typeof value === 'string') {
+    return value.length > 0;
+  }
+  return typeof value === 'object' && value !== null;
+}
+
+/**
+ * Normalises a component-tree snapshot event, or rejects it.
+ *
+ * Three conditions, in the order that costs least: the event's name is the
+ * catalogued snapshot name, its kind is the kind that declares the snapshot
+ * keys (when {@link SNAPSHOT_EVENT_KIND} resolved — otherwise the name alone
+ * decides, so a catalog reorganisation degrades to a looser match rather than
+ * to no match), and its `componentTree` attribute holds something that could
+ * be a forest.
+ */
+function toSnapshotRecord(event: TelemetryEvent): SnapshotRecord | undefined {
+  if (event.name !== COMPONENT_TREE_EVENT_NAME) {
+    return undefined;
+  }
+  if (SNAPSHOT_EVENT_KIND !== undefined && event.kind !== SNAPSHOT_EVENT_KIND) {
+    return undefined;
+  }
+  const startTime = normalizeStartTime(event.startTime);
+  if (startTime === undefined) {
+    return undefined;
+  }
+  const attributes: AttributeBag = event.attributes;
+  const serialized = readAttribute(attributes, COMPONENT_TREE_KEY);
+  if (!isSerializedCandidate(serialized)) {
+    return undefined;
+  }
+  return {
+    eventId: event.id,
+    startTime,
+    ingestSeq: event.ingestSeq,
+    serialized,
+    reduced: readAttribute(attributes, COMPONENT_TREE_TRUNCATED_KEY) === true,
   };
 }
 
@@ -1155,8 +1328,12 @@ function isLaterInCanonicalOrder(record: RenderRecord, accumulator: ComponentAcc
 }
 
 /**
- * Reads a capture once: normalised renders, normalised commits, and per
- * component totals.
+ * Reads a capture once: normalised renders, normalised commits, the
+ * component-tree snapshot events, and per component totals.
+ *
+ * The three event classes are disjoint by construction — a render, a commit,
+ * and a named record of the snapshot kind — and each is tried in turn, so an
+ * event contributes to at most one of them.
  *
  * The input is never mutated and no event object is touched. Every event is
  * read inside a `try`, so a single hostile or malformed event costs itself and
@@ -1167,6 +1344,7 @@ function indexRenderEvents(events: readonly TelemetryEvent[]): RenderIndex {
   const components = new Map<string, ComponentAccumulator>();
   const renders: RenderRecord[] = [];
   const commits: CommitRecord[] = [];
+  const snapshots: SnapshotRecord[] = [];
 
   for (const event of events) {
     try {
@@ -1183,6 +1361,11 @@ function indexRenderEvents(events: readonly TelemetryEvent[]): RenderIndex {
         if (record !== undefined) {
           commits.push(record);
         }
+        continue;
+      }
+      const snapshot = toSnapshotRecord(event);
+      if (snapshot !== undefined) {
+        snapshots.push(snapshot);
       }
     } catch {
       // One unreadable event is skipped, never propagated: aggregation runs
@@ -1193,9 +1376,10 @@ function indexRenderEvents(events: readonly TelemetryEvent[]): RenderIndex {
   }
 
   renders.sort(compareRenderRecords);
-  commits.sort(compareCommitRecords);
+  commits.sort(compareCanonically);
+  snapshots.sort(compareCanonically);
 
-  return { components, renders, commits };
+  return { components, renders, commits, snapshots };
 }
 
 /*
@@ -1425,11 +1609,15 @@ export function summarizeRenderTriggers(
  * ---------------------------------------------------------------------------
  * The `componentTree` data source
  *
- * Three construction routes, tried best first. The point of keeping all three
- * — rather than insisting on the best one — is that a component tree is most
- * wanted exactly when a page is behaving oddly, which is also when a producer
- * is most likely to have managed only part of the job. A partial answer that
- * says it is partial beats an empty panel.
+ * Four construction routes under three origins, tried best first: the
+ * producer's own snapshot event, a document attached to the last commit (both
+ * `commit-snapshot`, because both are the producer's structure rather than a
+ * reconstruction), the owner chains of the individual renders, and a flat
+ * listing. The point of keeping all of them — rather than insisting on the
+ * best one — is that a component tree is most wanted exactly when a page is
+ * behaving oddly, which is also when a producer is most likely to have managed
+ * only part of the job. A partial answer that says it is partial beats an
+ * empty panel.
  * ---------------------------------------------------------------------------
  */
 
@@ -1447,6 +1635,18 @@ const [COMMIT_SNAPSHOT_ORIGIN, OWNER_CHAINS_ORIGIN, FLAT_ORIGIN] = COMPONENT_TRE
 const TREE_NODE_COMPONENT_FIELD: keyof ComponentTreeNode = 'component';
 const TREE_NODE_KEY_FIELD: keyof ComponentTreeNode = 'key';
 const TREE_NODE_CHILDREN_FIELD: keyof ComponentTreeNode = 'children';
+
+/**
+ * The field a serialized node marks its own truncation under.
+ *
+ * Bound from `../schema/attributes.ts` rather than spelled here, because the
+ * producer writes it and the ingest redactor preserves it: one spelling across
+ * the three modules is what makes the disclosure survive the trip. It is
+ * deliberately **not** a field of {@link ComponentTreeNode} — this module
+ * reports truncation once, for the whole snapshot, rather than per node — so
+ * it cannot be annotated with `keyof` like the three fields above.
+ */
+const TREE_NODE_TRUNCATED_FIELD: string = COMPONENT_TREE_TRUNCATED_FIELD;
 
 /**
  * Field names a node may carry its component name under instead.
@@ -1560,12 +1760,22 @@ function resolveSerializedValue(value: unknown): unknown {
 /**
  * Parses one node of an untrusted structure, and its children beneath it.
  *
- * Three defences, each of which marks the result truncated rather than
- * throwing: the depth bound, the node budget, and an ancestor set that refuses
- * a reference already open on the current path — which is how a cycle, the one
- * shape a recursive reader cannot survive, is stopped. A node without a usable
- * component name is not a node, and its subtree goes with it: an anonymous
- * level would be a hole in the tree that no consumer could interpret.
+ * Four defences, each of which marks the result truncated rather than
+ * throwing: the depth bound, the node budget, an ancestor set that refuses a
+ * reference already open on the current path — which is how a cycle, the one
+ * shape a recursive reader cannot survive, is stopped — and a child that is
+ * not a readable node, whose omission is disclosed rather than passed over.
+ * A node without a usable component name is not a node, and its subtree goes
+ * with it: an anonymous level would be a hole in the tree that no consumer
+ * could interpret.
+ *
+ * **The producer's own marker is read here too.** A node the producer's walk
+ * stopped at carries {@link COMPONENT_TREE_TRUNCATED_FIELD}, which is a
+ * statement about that node's missing descendants rather than about the
+ * document (`../schema/attributes.ts` declares both levels). Folding it into
+ * the walk's truncation state is what stops a tree the producer had already
+ * cut from arriving as the page's whole structure: the node looks complete —
+ * a component with no children — and only the marker says otherwise.
  */
 function parseDraft(
   candidate: unknown,
@@ -1593,14 +1803,24 @@ function parseDraft(
   state.budget -= 1;
   ancestors.add(candidate);
 
+  if (readProperty(candidate, TREE_NODE_TRUNCATED_FIELD) === true) {
+    state.truncated = true;
+  }
+
   const children: TreeDraft[] = [];
   const childValues = asArray(readProperty(candidate, TREE_NODE_CHILDREN_FIELD));
   if (childValues !== undefined) {
     for (const child of childValues) {
       const draft = parseDraft(child, depth + 1, maxDepth, ancestors, state);
-      if (draft !== undefined) {
-        children.push(draft);
+      if (draft === undefined) {
+        // A child the reader could not use is a child the tree no longer
+        // shows. The bounds above already record their own losses; this covers
+        // the rest — a nameless node, a string where a node was expected —
+        // so that every omission reaches `degraded`.
+        state.truncated = true;
+        continue;
       }
+      children.push(draft);
     }
   }
 
@@ -1637,20 +1857,33 @@ function parseSerializedForest(
 /**
  * Looks through a commit's attributes for a serialized tree.
  *
- * The key is discovered rather than named: the attribute catalog declares no
- * tree key for a commit, and inventing one here would be this module asserting
- * a producer contract it has no authority over. So every attribute the catalog
- * does *not* declare for this kind is offered to the structural parser — the
- * event schema is explicit that the bag is open precisely so a new signal can
- * ship without a schema change — and the first value that parses as a forest
- * wins. Keys are visited in sorted order, so two producers carrying two
- * candidates still yield one deterministic answer.
+ * The catalogued {@link COMPONENT_TREE_KEY} is read first, because that is the
+ * one spelling the contract fixes: a producer that attaches the document to
+ * its commit rather than emitting a snapshot event writes the same key its
+ * snapshot event would have (`../schema/attributes.ts`), and honouring it here
+ * is what makes the two routes one contract.
+ *
+ * Failing that, the key is *discovered*: every attribute the catalog does not
+ * declare for this kind is offered to the structural parser — the event schema
+ * is explicit that the bag is open precisely so a new signal can ship without a
+ * schema change — and the first value that parses as a forest wins. Keys are
+ * visited in sorted order, so two producers carrying two candidates still
+ * yield one deterministic answer.
  */
 function findSerializedForest(
   commit: CommitRecord,
   maxDepth: number,
   maxNodes: number,
 ): DraftForest | undefined {
+  const catalogued = parseSerializedForest(
+    readAttribute(commit.attributes, COMPONENT_TREE_KEY),
+    maxDepth,
+    maxNodes,
+  );
+  if (catalogued !== undefined) {
+    return catalogued;
+  }
+
   let keys: string[];
   try {
     const declared = new Set(attributeKeysFor(commit.kind, { includeCommon: true }));
@@ -1892,22 +2125,131 @@ function lastRenderStartTime(renders: readonly RenderRecord[]): number | undefin
   return last?.startTime;
 }
 
+/** A snapshot event and the forest its document parsed to. */
+interface SnapshotForest {
+  readonly record: SnapshotRecord;
+  readonly forest: DraftForest;
+}
+
+/**
+ * The latest snapshot event whose document parses, latest first.
+ *
+ * Latest wins because a capture can hold several — the agent takes one at each
+ * capture stop, and the service may ask for one mid-capture — and the last one
+ * describes the page as it most recently was. The records arrive in canonical
+ * order, so "latest" is the same answer whatever order the events were handed
+ * to this module in.
+ *
+ * Earlier snapshots are tried when a later document cannot be read at all: a
+ * producer's unparseable last word is not a reason to discard a structure that
+ * did arrive, and every route below this one is a reconstruction.
+ */
+function selectSnapshotForest(
+  records: readonly SnapshotRecord[],
+  maxDepth: number,
+  maxNodes: number,
+): SnapshotForest | undefined {
+  for (let at = records.length - 1; at >= 0; at -= 1) {
+    const record = records[at];
+    if (record === undefined) {
+      continue;
+    }
+    const forest = parseSerializedForest(record.serialized, maxDepth, maxNodes);
+    if (forest !== undefined) {
+      return { record, forest };
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Splits the snapshot events into the ones that describe the selected commit's
+ * structure and the ones that describe an earlier one.
+ *
+ * A snapshot is **current** when it was observed at or after the last commit:
+ * nothing has committed since, so what it serialised is still the page's
+ * shape. A snapshot observed *before* that commit is **stale** — the page has
+ * committed again since it was taken — and a stale document is not the last
+ * commit's structure however recently it arrived. The distinction matters
+ * because a snapshot is not only taken at capture stop: the service can ask
+ * the agent for one mid-capture, and a capture that renders afterwards then
+ * holds a snapshot with a later commit behind it.
+ *
+ * Comparison is the canonical event order — start time, then ingest sequence,
+ * then event id — the same rule that chose the commit, so a snapshot and a
+ * commit sharing a millisecond are ordered by the store's sequence rather than
+ * by luck.
+ *
+ * @param records Snapshot events in canonical order.
+ * @param commit The commit the structure is attributed to, if the capture has
+ * one. With no commit at all, every snapshot is current: there is no later
+ * structure for it to be stale against.
+ */
+function partitionSnapshots(
+  records: readonly SnapshotRecord[],
+  commit: CommitRecord | undefined,
+): { readonly current: readonly SnapshotRecord[]; readonly stale: readonly SnapshotRecord[] } {
+  if (commit === undefined) {
+    return { current: records, stale: [] };
+  }
+
+  const current: SnapshotRecord[] = [];
+  const stale: SnapshotRecord[] = [];
+  for (const record of records) {
+    if (compareCanonically(record, commit) >= 0) {
+      current.push(record);
+    } else {
+      stale.push(record);
+    }
+  }
+  return { current, stale };
+}
+
 /**
  * The component structure of the page: the `componentTree` data source.
  *
- * The structure comes from the **last commit of the capture** — the commit with
- * the greatest start time, ties broken by ingest sequence and then event id,
- * which is the canonical event order and therefore total. Any earlier commit
- * describes a shape the page has since left.
+ * ## Where the structure comes from
+ *
+ * The producer's own snapshot event first — the event named
+ * {@link COMPONENT_TREE_EVENT_NAME}, which `../browser/agent.ts` emits at
+ * capture stop while the last committed structure is still reachable, and
+ * which therefore describes the page rather than the parts of it that
+ * rendered. The latest such event wins, in canonical order, **among those
+ * observed at or after the last commit**: the agent can also be asked for a
+ * snapshot mid-capture, and a document serialised before the page committed
+ * again is not that commit's structure. Its `componentTreeTruncated` flag —
+ * and any node-level marker inside the document — is folded into this result's
+ * own `truncated` and `degraded` fields, so a tree the producer had to reduce
+ * is presented as reduced rather than as the page's whole structure.
+ *
+ * Failing that, a document attached to the **last commit of the capture** —
+ * the commit with the greatest start time, ties broken by ingest sequence and
+ * then event id, which is the canonical event order and therefore total. Any
+ * earlier commit describes a shape the page has since left.
+ *
+ * Failing that, a **stale** snapshot: one taken before the last commit. It is
+ * still the producer's own structure and beats a reconstruction, but it is
+ * reported with no commit identity at all and always `degraded`, because the
+ * page committed after it was taken. Then the owner chains of the individual
+ * renders, and finally a flat listing.
+ *
+ * `commitEventId`, `commitSpanId` and `traceId` point at the last commit
+ * whenever the structure can honestly be attributed to it — every route except
+ * the stale snapshot — because those three fields are how a panel selects that
+ * commit on the timeline, and naming a commit the structure predates would be
+ * a claim about the page that the evidence does not support.
+ *
+ * ## Structure versus counts
  *
  * The numbers on each node come from the **whole capture**, because "this
  * component rendered 240 times" is the finding and no single commit shows it.
  * Structure and counts are read in one pass, so a node's count always equals
  * that component's row in {@link aggregateRenders}.
  *
- * Returns `undefined` — not an empty tree — when the capture holds no render
- * and no commit evidence at all, so the service can answer with an empty result
- * and the renderer can show its empty state instead of an invented root.
+ * Returns `undefined` — not an empty tree — when the capture holds no render,
+ * no commit and no snapshot evidence at all, so the service can answer with an
+ * empty result and the renderer can show its empty state instead of an invented
+ * root.
  *
  * @param events Capture events, in any order.
  * @param options Node and depth bounds. See {@link ComponentTreeOptions}.
@@ -1918,13 +2260,34 @@ export function buildComponentTreeSnapshot(
   options?: ComponentTreeOptions,
 ): ComponentTreeSnapshot | undefined {
   const index = indexRenderEvents(events);
-  if (index.renders.length === 0 && index.commits.length === 0) {
+  if (index.renders.length === 0 && index.commits.length === 0 && index.snapshots.length === 0) {
     return undefined;
   }
 
   const maxNodes = resolveBound(options?.maxNodes, DEFAULT_COMPONENT_TREE_MAX_NODES);
   const maxDepth = resolveBound(options?.maxDepth, DEFAULT_COMPONENT_TREE_MAX_DEPTH);
   const commit = index.commits[index.commits.length - 1];
+
+  const partitioned = partitionSnapshots(index.snapshots, commit);
+
+  const snapshot = selectSnapshotForest(partitioned.current, maxDepth, maxNodes);
+  if (snapshot !== undefined) {
+    const emitted = emitForest(snapshot.forest.roots, index, maxNodes, maxDepth);
+    return assembleSnapshot({
+      origin: COMMIT_SNAPSHOT_ORIGIN,
+      // The snapshot was observed at or after the commit it is attributed to,
+      // so its own start time is when this structure was observed.
+      capturedAt: snapshot.record.startTime,
+      commit,
+      emitted,
+      // Both mean nodes are missing from the document: the parser refused to
+      // follow part of it, or the producer had already reduced the tree before
+      // it was serialised.
+      droppedWhileReading: snapshot.forest.truncated || snapshot.record.reduced,
+      incomplete: false,
+    });
+  }
+
   const capturedAt = commit?.startTime ?? lastRenderStartTime(index.renders) ?? 0;
 
   if (commit !== undefined) {
@@ -1940,6 +2303,29 @@ export function buildComponentTreeSnapshot(
         incomplete: false,
       });
     }
+  }
+
+  const stale = selectSnapshotForest(partitioned.stale, maxDepth, maxNodes);
+  if (stale !== undefined) {
+    const emitted = emitForest(stale.forest.roots, index, maxNodes, maxDepth);
+    return assembleSnapshot({
+      origin: COMMIT_SNAPSHOT_ORIGIN,
+      // The structure is what it was when the snapshot was taken, which is
+      // before the last commit — so that instant, and not the commit's, is
+      // when it was observed.
+      capturedAt: stale.record.startTime,
+      // Deliberately **not** attributed to the last commit. The three commit
+      // fields say "this is that commit's structure", and this document was
+      // serialised before it: naming the commit would turn a stale tree into a
+      // false claim about the page's final shape. Their absence also makes
+      // `degraded` true on its own.
+      commit: undefined,
+      emitted,
+      droppedWhileReading: stale.forest.truncated || stale.record.reduced,
+      // The page committed again after this document was taken, so whatever it
+      // shows is at best the shape of an earlier moment.
+      incomplete: true,
+    });
   }
 
   const selection = selectCommitRenders(index, commit);

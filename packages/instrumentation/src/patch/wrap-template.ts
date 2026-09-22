@@ -30,9 +30,16 @@
  * ## What a wrapper looks like
  *
  * The patcher moves a function's body into an inner function declared inside
- * the original — which is what preserves `this`, `arguments`, parameter
- * defaults and destructuring — and replaces the original body with the three
- * statements {@link buildWrapperBody} produces:
+ * the original. The outer function keeps its own parameter list, so parameter
+ * defaults, destructuring patterns and the function's `length` are exactly what
+ * they were, and the `arguments` object the wrapper forwards carries exactly
+ * what the caller passed, with the same `length`. In strict mode — where that
+ * object is unmapped and `.callee` throws — the move is fully transparent; what
+ * it cannot preserve is a *sloppy* function's mapping between `arguments[i]` and
+ * its named parameter bindings, or its `arguments.callee` identity, which is why
+ * {@link detectArgumentsHazard} exists and why those targets are refused rather
+ * than rewritten. The original body is then replaced with the three statements
+ * {@link buildWrapperBody} produces:
  *
  * ```ts
  * const __dbg = (globalThis as { __DEBUGGEN__?: __DebuggenSpanHelper }).__DEBUGGEN__;
@@ -228,6 +235,41 @@ export function isDirectivePrologueLiteral(text: string): boolean {
 }
 
 /**
+ * The one member of {@link DIRECTIVE_PROLOGUE_LITERALS} that changes the
+ * *semantics* of the code beneath it rather than a module's role.
+ *
+ * Read out of the tuple rather than spelled a second time, and annotated with
+ * the literal it has to be: reordering the tuple is then a compile error here
+ * instead of a silently different answer in
+ * {@link isStrictModeDirective} — which is the question
+ * `./function-timing.ts` asks of a file's, and a function's, directive prologue
+ * before it decides whether a body is strict. That decision is load-bearing:
+ * see {@link detectArgumentsHazard} for what strict mode makes safe.
+ */
+export const STRICT_MODE_DIRECTIVE: 'use strict' = DIRECTIVE_PROLOGUE_LITERALS[2];
+
+/**
+ * Whether `text` is the `'use strict'` directive.
+ *
+ * Accepts the *unquoted* text of a string literal, exactly as
+ * {@link isDirectivePrologueLiteral} does, and is built on it so that one
+ * spelling rule serves both questions: a directive is matched by its precise
+ * text, so neither surrounding whitespace nor a different case is one.
+ *
+ * @param text The literal text of a candidate directive, without its quotes.
+ * @returns `true` when the statement puts the code beneath it in strict mode.
+ *
+ * @example
+ * ```ts
+ * isStrictModeDirective('use strict'); // true
+ * isStrictModeDirective('use client'); // false — a directive, but not this one
+ * ```
+ */
+export function isStrictModeDirective(text: string): boolean {
+  return isDirectivePrologueLiteral(text) && text === STRICT_MODE_DIRECTIVE;
+}
+
+/**
  * The two languages the template emits, which is a syntax decision rather than
  * a preference.
  *
@@ -393,7 +435,11 @@ export const REST_PARAMETER_IDENTIFIER = '__args' as const;
  *   methods and object-literal methods. The wrapper keeps the original
  *   parameter list, so parameter defaults, destructuring patterns and the
  *   function's `length` are all preserved exactly, and `arguments` carries what
- *   the caller actually passed.
+ *   the caller actually passed, with the same `length`. What it does **not**
+ *   carry is a sloppy-mode body's *mapping* from `arguments[i]` to its named
+ *   parameter bindings, nor its `arguments.callee` identity: the inner function
+ *   the body moves into binds an `arguments` object of its own. Those targets
+ *   are refused rather than rewritten — see {@link detectArgumentsHazard}.
  * - `'rest'` — for arrow functions, which have no `arguments` binding. The
  *   wrapper takes {@link WrapperBody.restParameter} instead of the original
  *   parameter list and forwards it by reference, so an arrow handed to a
@@ -405,6 +451,170 @@ export const WRAPPER_CALL_STYLES = Object.freeze(['arguments', 'rest'] as const)
 
 /** One member of {@link WRAPPER_CALL_STYLES}. */
 export type WrapperCallStyle = (typeof WRAPPER_CALL_STYLES)[number];
+
+/**
+ * The ways a target's use of `arguments` outlives the move into the inner
+ * function, in the order {@link detectArgumentsHazard} reports them.
+ *
+ * - `'mapped-arguments'` — the body reads `arguments` in a sloppy function, so
+ *   the *mapping* between `arguments[i]` and the named parameter bindings is
+ *   observable and does not survive the move.
+ * - `'arguments-callee'` — the body reads `arguments.callee`, whose value is the
+ *   function the object was created for, so the move changes what it answers.
+ * - `'direct-eval'` — the body contains a direct `eval(…)`, which runs with the
+ *   body's own scope and can reach either of the above without the identifier
+ *   `arguments` appearing anywhere in the syntax tree.
+ *
+ * Frozen because it is vocabulary rather than state, and exported so
+ * `./function-timing.ts` and its tests can enumerate the hazards instead of
+ * restating them.
+ */
+export const ARGUMENTS_HAZARDS = Object.freeze([
+  'mapped-arguments',
+  'arguments-callee',
+  'direct-eval',
+] as const);
+
+/** One member of {@link ARGUMENTS_HAZARDS}. */
+export type ArgumentsHazard = (typeof ARGUMENTS_HAZARDS)[number];
+
+/**
+ * What {@link detectArgumentsHazard} needs to know about a target, as facts
+ * already extracted from its syntax tree.
+ *
+ * Facts rather than a node, because this module is text-only: it owns the
+ * *rule*, and `./function-timing.ts` — the one module here that holds an
+ * abstract syntax tree — owns the extraction. Keeping the rule on this side is
+ * what lets it be tested on its own, without parsing anything.
+ */
+export interface ArgumentsHazardFacts {
+  /**
+   * Whether the target's body is **definitely** strict.
+   *
+   * `true` only when strictness is certain from the syntax: a class body, an
+   * ES module, an `.mjs`/`.mts` file, or a `'use strict'` prologue on the file,
+   * the function or an enclosing function. Anything else is `false`, which this
+   * predicate treats as sloppy — the safe direction, because a wrongly
+   * optimistic `true` is a silently miscompiled application while a wrongly
+   * pessimistic `false` is a refusal the developer can read.
+   */
+  readonly strictMode: boolean;
+
+  /**
+   * Whether every parameter is a plain identifier with no initialiser and no
+   * rest element (`'simple'`), or not (`'non-simple'`).
+   *
+   * Carried for the refusal's details and for the documentation of which
+   * ECMAScript rule each fact bears on; it does **not** gate the decision. See
+   * this predicate's own notes for the measurement that settles that.
+   */
+  readonly parameterList: 'simple' | 'non-simple';
+
+  /**
+   * How many runtime parameters the target declares, excluding a TypeScript
+   * `this` parameter, which erases and binds nothing at run time.
+   *
+   * Diagnostic only, for the same reason as
+   * {@link ArgumentsHazardFacts.parameterList}.
+   */
+  readonly parameterCount: number;
+
+  /** Whether the body reads the `arguments` binding of the moving function. */
+  readonly referencesArguments: boolean;
+
+  /** Whether the body reads `arguments.callee` (or `arguments['callee']`). */
+  readonly referencesArgumentsCallee: boolean;
+
+  /** Whether the body contains a direct `eval(…)` call. */
+  readonly containsDirectEval: boolean;
+}
+
+/**
+ * The reason a target's `arguments` usage cannot survive the move into the
+ * inner function, or `undefined` when nothing about it can be observed.
+ *
+ * ## Why strict mode is immune
+ *
+ * A strict function's arguments object is **unmapped**: `arguments[i]` is a
+ * snapshot of what the caller passed, writing to it does not write to the
+ * parameter, and `.callee` is a poison-pill accessor that throws. The wrapper
+ * forwards the caller's own arguments object through `apply`, so a strict body
+ * observes exactly what it observed before the move. Measured in Node 24 on the
+ * patched shape this module emits, with the body in a parameterless inner
+ * function:
+ *
+ * ```text
+ * sloppy   arguments[0] = 9, then read the parameter  -> original 9, patched 1
+ * sloppy   a = 9, then read arguments[0]              -> original 9, patched 1
+ * sloppy   arguments.callee === f                     -> original true, patched false
+ * strict   the same three                             -> identical in both
+ * ```
+ *
+ * ## Why a syntactic scan cannot prove the sloppy case safe
+ *
+ * It can only prove it *unsafe*. `parameterList` and `parameterCount` are
+ * therefore carried but do not gate the decision, and that is a measurement
+ * rather than caution:
+ *
+ * - A **non-simple** parameter list gives even a sloppy function an unmapped
+ *   arguments object, so the aliasing above disappears — but its `.callee` then
+ *   *throws*, while the inner function's parameter list is empty and therefore
+ *   simple, so `.callee` there answers with the inner function. The divergence
+ *   runs the other way rather than vanishing: measured as original `TypeError`,
+ *   patched `'function'`.
+ * - `arguments` can be reached through an alias (`const a = arguments; a[0] = 9`)
+ *   or a property read the scan sees as `arguments` alone, so a body that
+ *   mentions the identifier at all is treated as depending on the binding.
+ *
+ * @param facts The target's already-extracted facts.
+ * @returns The hazard, or `undefined` when the target may be wrapped.
+ *
+ * @example A sloppy script function that reads `arguments`
+ * ```ts
+ * detectArgumentsHazard({
+ *   strictMode: false,
+ *   parameterList: 'simple',
+ *   parameterCount: 1,
+ *   referencesArguments: true,
+ *   referencesArgumentsCallee: false,
+ *   containsDirectEval: false,
+ * }); // 'mapped-arguments'
+ * ```
+ *
+ * @example The same body in a module, or under `'use strict'`
+ * ```ts
+ * detectArgumentsHazard({
+ *   strictMode: true,
+ *   parameterList: 'simple',
+ *   parameterCount: 1,
+ *   referencesArguments: true,
+ *   referencesArgumentsCallee: true,
+ *   containsDirectEval: true,
+ * }); // undefined — an unmapped arguments object survives the move
+ * ```
+ */
+export function detectArgumentsHazard(facts: ArgumentsHazardFacts): ArgumentsHazard | undefined {
+  if (facts.strictMode) {
+    return undefined;
+  }
+
+  // Ordered most specific first, so the refusal names the sharpest reason: a
+  // body that reads `arguments.callee` also reads `arguments`, and a body that
+  // does either may also call `eval`.
+  if (facts.referencesArgumentsCallee) {
+    return 'arguments-callee';
+  }
+
+  if (facts.referencesArguments) {
+    return 'mapped-arguments';
+  }
+
+  if (facts.containsDirectEval) {
+    return 'direct-eval';
+  }
+
+  return undefined;
+}
 
 /**
  * What the wrapper passes as the inner function's receiver.
@@ -897,9 +1107,11 @@ export interface WrapperBody {
  * Builds the text that replaces a patched function's body.
  *
  * The caller has already moved the original body into an inner function
- * declared inside the original — that move is what preserves `this`,
- * `arguments`, parameter defaults and destructuring — and this function
- * produces the statements that call it:
+ * declared inside the original — the outer function keeps its parameter list
+ * with its defaults and destructuring, and the forwarded `arguments` object
+ * carries exactly what the caller passed, apart from the sloppy-mode mapping
+ * and `.callee` identity {@link detectArgumentsHazard} refuses — and this
+ * function produces the statements that call it:
  *
  * ```ts
  * // Debug Generator: temporary instrumentation, removed when the session ends.

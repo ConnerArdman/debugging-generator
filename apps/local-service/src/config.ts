@@ -19,10 +19,10 @@
  *
  * | Key | Shape | Default |
  * | --- | --- | --- |
- * | `ANTHROPIC_API_KEY` | non-empty string | none — only the network provider needs one |
+ * | `ANTHROPIC_API_KEY` | non-empty string | none — **required** when a provider that needs one is selected |
  * | `DEBUGGEN_PROVIDER` | one of `PROVIDER_IDS` | `DEFAULT_PROVIDER_ID` (reaches no network) |
- * | `DEBUGGEN_MODEL` | non-empty string | **none, never defaulted** |
- * | `DEBUGGEN_HOST` | non-empty string without whitespace | {@link DEFAULT_HOST} |
+ * | `DEBUGGEN_MODEL` | non-empty string | **none, never defaulted** — required alongside the credential |
+ * | `DEBUGGEN_HOST` | a loopback interface, without whitespace | {@link DEFAULT_HOST} |
  * | `DEBUGGEN_PORT` | integer `0`–{@link MAX_PORT} | {@link DEFAULT_PORT} |
  * | `DEBUGGEN_HOME` | absolute path, `~` accepted | {@link DEFAULT_DEBUGGEN_HOME} |
  * | `DEBUGGEN_LOG_LEVEL` | one of {@link LOG_LEVEL_SETTINGS} | {@link DEFAULT_LOG_LEVEL} |
@@ -66,15 +66,50 @@
  * spelling the rest of the product speaks; `@debuggen/shared`'s pure-string
  * path helpers do the work, so nothing here touches a filesystem.
  *
- * ## No validation library, on purpose
+ * ## Three schemas, one loader
  *
- * The keys are parsed by hand rather than by a schema library because this
- * workspace declares no `zod` dependency (AAP 0.3.2) — every schema it uses
- * arrives through the `@debuggen/*` package that owns it, and configuration is
- * owned by nobody else. {@link serviceConfigSchema} is the machine-readable
- * description of the contract, with {@link ServiceConfigSchema.safeParse} as
- * its parse entry point; it is a descriptor object, not a library schema, and
- * its documentation says so where a reader would otherwise assume.
+ * Validation is declared, not hand-rolled: the contract is three Zod schemas
+ * and the loader is the deterministic step between them, which is the same
+ * shape every model-facing artifact in this product takes — parse the authored
+ * input, normalise deterministically, then validate the normalised result
+ * against the internal schema.
+ *
+ * | Schema | Validates | Produces |
+ * | --- | --- | --- |
+ * | {@link serviceEnvSchema} | the nine raw environment strings: trimmed, blank treated as absent, each key's vocabulary, range and path shape | optional, already-typed settings |
+ * | {@link serviceConfigOverridesSchema} | the same settings as a host already decided them, under their own "the injected override …" wording | optional, already-typed settings |
+ * | {@link resolvedServiceConfigSchema} | a whole {@link ServiceConfig}: the loopback bind, the port range, the closed vocabularies, absolute normalised paths, the derived-path agreement, and the credentials the selected provider requires | the configuration every subsystem is handed |
+ *
+ * Between the raw schemas and the resolved one sits {@link loadServiceConfig}'s
+ * deterministic normalisation: per-setting precedence (an override wins over a
+ * variable), `~` expansion against an injectable home directory, the defaults,
+ * and the five `$DEBUGGEN_HOME` paths. Nothing in that step decides whether a
+ * value is acceptable — the schemas do — which is why the same object can be
+ * validated again by {@link resolvedServiceConfigSchema} anywhere else it is
+ * read back from, for instance a configuration a host assembled itself.
+ *
+ * The one thing the schemas deliberately do **not** do is speak for
+ * themselves. A rejected setting is reported through this module's own reason
+ * clauses, attached to each issue as structured metadata; no message the
+ * validation library generated is ever read, because several of its default
+ * messages quote the value they rejected and this module's whole failure policy
+ * is that a value never appears. {@link serviceConfigSchema} remains the
+ * machine-readable description of the contract for documentation and tooling —
+ * key, kind, default, vocabulary — and carries references to all three schemas
+ * so a caller reaches them through either name.
+ *
+ * ## Provider credentials are settled here, not at first use
+ *
+ * A provider that reaches the network needs both a model id and a credential.
+ * {@link PROVIDER_REQUIREMENTS} states that per provider and
+ * {@link resolvedServiceConfigSchema} enforces it, so `DEBUGGEN_PROVIDER=…`
+ * with nothing to authenticate with fails at start-up, naming the missing key,
+ * instead of failing when the first pipeline stage tries to call a model —
+ * which is after a developer has asked a question, after the code index has
+ * been built, and after instrumentation has been planned.
+ * `@debuggen/model-provider` keeps the same rule at construction time for
+ * hosts that do not come through this module; the two agree by naming the same
+ * keys and offering the same remedy.
  *
  * ## Failure and privacy policy
  *
@@ -117,6 +152,7 @@ import {
   type ModelProviderConfig,
   type ProviderId,
 } from '@debuggen/model-provider';
+import { z } from 'zod';
 
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -135,10 +171,14 @@ import { fileURLToPath } from 'node:url';
  * added here without a resolver, or resolved without being listed here, is
  * therefore a visible change rather than a quiet one.
  *
- * The order is the order of `.env.example` and the order
- * {@link loadServiceConfig} resolves in, which makes an aggregated failure
- * list its keys predictably instead of in whatever order the resolvers happen
- * to run.
+ * The tuple documents the same nine keys `.env.example` documents, but its
+ * order is this module's own: it is the order {@link loadServiceConfig}
+ * resolves in and the order an aggregated failure lists its keys in, which
+ * makes a rejection predictable instead of dependent on whichever resolver
+ * happened to run first. `.env.example` groups the same keys for a reader
+ * instead — it carries `DEBUGGEN_PROMPTS_DIR` with the other service
+ * settings, where this tuple resolves it last — so the two agree on the set
+ * of keys, not on their positions.
  */
 export const SERVICE_ENV_KEYS = [
   'ANTHROPIC_API_KEY',
@@ -154,6 +194,42 @@ export const SERVICE_ENV_KEYS = [
 
 /** One of the keys in {@link SERVICE_ENV_KEYS}. */
 export type ServiceEnvKey = (typeof SERVICE_ENV_KEYS)[number];
+
+/**
+ * Whether `value` is one of the keys in {@link SERVICE_ENV_KEYS}.
+ *
+ * Used where a key arrives without a type: the issue metadata a schema check
+ * attached, which the validation library carries as `Record<string, unknown>`.
+ * Narrowing it here rather than trusting it is what keeps {@link toConfigIssue}
+ * from reporting a key this service does not read.
+ *
+ * @param value Any value.
+ * @returns `true` when `value` is a {@link ServiceEnvKey}.
+ */
+export function isServiceEnvKey(value: unknown): value is ServiceEnvKey {
+  return typeof value === 'string' && SERVICE_ENV_KEYS.some((candidate) => candidate === value);
+}
+
+/**
+ * Which settings the selected provider must have before a session can call it,
+ * per provider id.
+ *
+ * Total over `ProviderId` on purpose: a provider added to `PROVIDER_IDS` stops
+ * this file compiling until its requirements are stated, which is the same
+ * mechanism `@debuggen/model-provider`'s exhaustive `switch` uses to keep its
+ * construction paths honest. The offline default requires nothing, which is
+ * what lets an unconfigured checkout start and run the whole pipeline.
+ *
+ * Each named key must have an entry in the internal requirement table, so a
+ * requirement cannot be declared without a way to tell whether it is satisfied
+ * and something to say when it is not.
+ */
+export const PROVIDER_REQUIREMENTS: Readonly<
+  Record<ProviderId, readonly ProviderRequirementKey[]>
+> = Object.freeze({
+  anthropic: Object.freeze<ProviderRequirementKey[]>(['ANTHROPIC_API_KEY', 'DEBUGGEN_MODEL']),
+  deterministic: Object.freeze<ProviderRequirementKey[]>([]),
+});
 
 /* -------------------------------------------------------------------------------------------------
  * Defaults
@@ -290,12 +366,15 @@ export interface ServiceConfig {
   readonly retentionDays: number;
 
   /**
-   * The selected model provider, validated against `PROVIDER_IDS`.
+   * The selected model provider, validated against `PROVIDER_IDS` — and
+   * validated as *usable*, not merely as recognised.
    *
-   * Whether that selection is *usable* is not decided here — a network
-   * provider also needs a model and a credential, and
-   * `@debuggen/model-provider` owns that rule. This field only records what
-   * was asked for. See {@link toModelProviderOverrides}.
+   * A provider needing a model and a credential has them by the time this
+   * field exists: {@link PROVIDER_REQUIREMENTS} states what each one needs and
+   * {@link resolvedServiceConfigSchema} enforces it, so a configuration that
+   * reached a caller can be handed to `@debuggen/model-provider` — which keeps
+   * the same rule at construction time for hosts that do not come through this
+   * module. See {@link toModelProviderOverrides}.
    */
   readonly provider: ProviderId;
 
@@ -460,13 +539,18 @@ export interface ServiceEnvKeyDescriptor {
 }
 
 /**
- * The description of the environment contract, plus its parse entry point.
+ * The description of the environment contract, its parse entry point and the
+ * three schemas that do the validating.
  *
- * **Not a validation-library schema.** This workspace declares no `zod`
- * dependency (AAP 0.3.2), so the contract is described by data and enforced by
- * {@link loadServiceConfig}; {@link ServiceConfigSchema.safeParse} is the same
- * function under the name a reader expects to find on a schema, and it returns
- * a `Result` rather than throwing, like everything else here.
+ * The descriptor half — {@link ServiceConfigSchema.keys} and
+ * {@link ServiceConfigSchema.entries} — is what documentation checks and
+ * anything enumerating the surface read: key, kind, default, vocabulary, and
+ * whether a value is a credential. The schema half —
+ * {@link ServiceConfigSchema.env}, {@link ServiceConfigSchema.overrides} and
+ * {@link ServiceConfigSchema.resolved} — is the validation itself, reachable
+ * through this object as well as under its own exported name.
+ * {@link ServiceConfigSchema.safeParse} is {@link loadServiceConfig}: the whole
+ * read, returning a `Result` rather than throwing, like everything else here.
  */
 export interface ServiceConfigSchema {
   /** The keys, in the order a failure reports them. */
@@ -474,6 +558,15 @@ export interface ServiceConfigSchema {
 
   /** One descriptor per key. */
   readonly entries: Readonly<Record<ServiceEnvKey, ServiceEnvKeyDescriptor>>;
+
+  /** {@link serviceEnvSchema}: the nine raw environment strings. */
+  readonly env: ServiceEnvSchema;
+
+  /** {@link serviceConfigOverridesSchema}: the same settings from a host. */
+  readonly overrides: ServiceConfigOverridesSchema;
+
+  /** {@link resolvedServiceConfigSchema}: a whole resolved configuration. */
+  readonly resolved: ResolvedServiceConfigSchema;
 
   /** {@link loadServiceConfig}, reachable through the schema object. */
   readonly safeParse: (
@@ -528,6 +621,44 @@ const WHITESPACE_PATTERN = /\s/;
 /** A Windows path rooted at a drive, for instance `C:/Users/dev`. */
 const WINDOWS_ROOTED_PATTERN = /^[A-Za-z]:\//;
 
+/**
+ * The name that resolves to the loopback interface on every supported
+ * platform, and one of the three spellings {@link isLoopbackHost} accepts.
+ */
+const LOOPBACK_HOST_NAME = 'localhost';
+
+/** A dotted-quad IPv4 literal, one capture group per octet. */
+const IPV4_PATTERN = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
+
+/** The highest value one octet of an IPv4 literal may carry. */
+const MAX_IPV4_OCTET = 255;
+
+/** The first octet of every address in `127.0.0.0/8`, the IPv4 loopback block. */
+const IPV4_LOOPBACK_FIRST_OCTET = 127;
+
+/** How many groups a fully written IPv6 address carries. */
+const IPV6_GROUP_COUNT = 8;
+
+/** The zero-run compression marker of an IPv6 address. */
+const IPV6_COMPRESSION = '::';
+
+/** One group of an IPv6 address: one to four hexadecimal digits. */
+const IPV6_GROUP_PATTERN = /^[0-9A-Fa-f]{1,4}$/;
+
+/**
+ * The two prefixes that may precede an embedded IPv4 address for the result to
+ * still name the same interface as that address: the IPv4-compatible form
+ * (`::a.b.c.d`) and the IPv4-mapped form (`::ffff:a.b.c.d`). Anything else in
+ * front of an embedded address names a different host.
+ */
+const IPV4_EMBEDDED_PREFIXES: ReadonlySet<string> = new Set([
+  IPV6_COMPRESSION,
+  `${IPV6_COMPRESSION}ffff:`,
+]);
+
+/** The bracket a host value carries when it was copied out of a URL authority. */
+const IPV6_BRACKETS = Object.freeze({ open: '[', close: ']' });
+
 /* -------------------------------------------------------------------------------------------------
  * Remediation text
  * ---------------------------------------------------------------------------------------------- */
@@ -556,10 +687,40 @@ function unrecognisedLogLevelHint(): string {
   );
 }
 
-/** The next step for a host name the service cannot bind. */
+/**
+ * The next step for a host value the service will not bind.
+ *
+ * Deliberately free of any address literal other than {@link DEFAULT_HOST} and
+ * the block it belongs to. The privacy rule this module lives by is asserted by
+ * a suite that checks a rejected value appears in no surface of the failure, so
+ * a hint naming `0.0.0.0` or the IPv6 loopback literal would report the very
+ * value it had just refused — as a substring of its own remedy.
+ */
 const HOST_HINT =
-  `Set DEBUGGEN_HOST to a single interface to bind, without whitespace. Leave it unset for ` +
-  `'${DEFAULT_HOST}', which is the loopback interface the access boundary assumes.`;
+  `Set DEBUGGEN_HOST to a loopback interface: '${DEFAULT_HOST}', another address in the ` +
+  `127.0.0.0/8 block, the name '${LOOPBACK_HOST_NAME}', or the IPv6 loopback address. Leave it ` +
+  `unset for '${DEFAULT_HOST}'. The service authenticates every client and refuses web origins ` +
+  'on the understanding that it is reachable only from this machine, so a wildcard bind and any ' +
+  'routable interface are refused here rather than quietly widening that boundary.';
+
+/**
+ * The next step when the selected provider needs a credential and none is
+ * configured.
+ *
+ * Names the key and the offline alternative, and nothing about the credential
+ * itself — there is none to describe, which is the point.
+ */
+const CREDENTIAL_HINT =
+  'Set ANTHROPIC_API_KEY in the environment the local service was started from, or set ' +
+  `DEBUGGEN_PROVIDER=${DEFAULT_PROVIDER_ID} to run the pipeline offline, where no credential is ` +
+  'needed. Its value is never logged, never placed in an error and never written to a session ' +
+  'record.';
+
+/** The next step when the selected provider needs a model and none is configured. */
+const MODEL_HINT =
+  'Set DEBUGGEN_MODEL to the model this session should call. It is never defaulted: a session ' +
+  'records the model it used, and a substituted default would make that record untrue. Set ' +
+  `DEBUGGEN_PROVIDER=${DEFAULT_PROVIDER_ID} to run the pipeline offline, where no model is needed.`;
 
 /** The next step for a port value outside the accepted range. */
 const PORT_HINT =
@@ -581,22 +742,211 @@ const HOME_HINT =
 const PROMPTS_HINT =
   'Set DEBUGGEN_PROMPTS_DIR to the absolute path of the versioned prompt directory, or leave it ' +
   'unset to use the one shipped beside the service. The editor extension sets it for the service ' +
-  'it bundles; it is not a value to set by hand otherwise.';
+  'it bundles, so there is normally nothing to set by hand.';
+
+/**
+ * The next step for each key, as one table.
+ *
+ * Every rejection of a key answers with that key's remedy, whatever the reason:
+ * a port that is not a number and a port outside the range have the same fix,
+ * and a developer reading a failure wants the fix rather than a variant of it.
+ * Holding them here — total over {@link SERVICE_ENV_KEYS}, so a key cannot be
+ * validated without a remedy — is what lets every check in the schemas below
+ * report a reason alone and still produce a complete issue.
+ *
+ * The two vocabulary entries are functions because their text is joined from
+ * the tuple that owns the vocabulary at call time, so a provider or a log level
+ * added there appears in the remedy with nothing to edit here.
+ */
+const KEY_HINTS: Readonly<Record<ServiceEnvKey, () => string>> = Object.freeze({
+  ANTHROPIC_API_KEY: () => CREDENTIAL_HINT,
+  DEBUGGEN_PROVIDER: unrecognisedProviderHint,
+  DEBUGGEN_MODEL: () => MODEL_HINT,
+  DEBUGGEN_HOST: () => HOST_HINT,
+  DEBUGGEN_PORT: () => PORT_HINT,
+  DEBUGGEN_HOME: () => HOME_HINT,
+  DEBUGGEN_LOG_LEVEL: unrecognisedLogLevelHint,
+  DEBUGGEN_RETENTION_DAYS: () => RETENTION_HINT,
+  DEBUGGEN_PROMPTS_DIR: () => PROMPTS_HINT,
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * Reason clauses
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * Every reason clause this module records, in one place.
+ *
+ * A reason is a lower-case clause assembled from the key's kind, its accepted
+ * vocabulary and its accepted range — and from nothing else. The schemas below
+ * attach one of these strings to each issue as structured metadata rather than
+ * leaving the validation library's own message to be interpreted, which is what
+ * makes the privacy rule mechanical instead of remembered: {@link toConfigIssue}
+ * reads only metadata this module authored, so a default message that quotes
+ * the value it rejected cannot reach a log line, a session record or a user
+ * interface even by accident.
+ */
+const REASONS = Object.freeze({
+  /** A value that should have been a whole number and was not. */
+  notAnInteger: 'the value is not a whole number',
+
+  /** The same, for a value a host injected rather than a variable carried. */
+  overrideNotAnInteger: 'the injected override is not a whole number',
+
+  /** A provider selection outside `PROVIDER_IDS`. */
+  unknownProvider: 'the value names no provider this build offers',
+
+  /** A log threshold outside {@link LOG_LEVEL_SETTINGS}. */
+  unknownLogLevel: 'the value names no known log level',
+
+  /** A host value with embedded whitespace, which is never one interface. */
+  hostWhitespace: 'the value contains whitespace',
+
+  /** A host value that names something other than this machine's loopback interface. */
+  hostNotLoopback: 'the value is not a loopback interface',
+
+  /** A path carrying a character no filesystem path may contain. */
+  nulCharacter: 'the value contains a NUL character',
+
+  /** A path naming a share on another host, which normalisation would silently rewrite. */
+  uncPath: 'a UNC path is not supported as a directory root',
+
+  /** `C:state` — rooted at a drive, but relative to that drive's current directory. */
+  driveRelativePath: 'a drive-relative Windows path is not absolute',
+
+  /** A path that is neither absolute nor home-relative. */
+  notAbsolutePath: 'the value is not an absolute path',
+
+  /** `~other/x` — resolving another account's home directory is not this tool's business. */
+  otherAccountHome: 'a home-directory prefix naming another account is not supported',
+
+  /** A `~` value on a system whose home directory could not be determined. */
+  indeterminableHome:
+    'the value starts with a home-directory prefix and no home directory could be determined',
+
+  /** The prompt directory shipped beside the service could not be located. */
+  underivablePromptsDir:
+    "the default directory could not be derived from the service module's own location",
+
+  /** A value that was not a string at all, which only an untyped caller can produce. */
+  unexpectedType: 'the value is not a string',
+
+  /** The same, for a host-supplied override whose type the compiler could not vouch for. */
+  unexpectedOverrideType: 'the injected override is not of the expected type',
+
+  /** A resolved path that is not the absolute, normalised POSIX form every consumer expects. */
+  unnormalisedPath: 'the resolved path is not an absolute, normalised path',
+
+  /** A resolved value that is blank or still carries the padding a reader would have trimmed. */
+  unnormalisedValue: 'the resolved value is blank or carries surrounding whitespace',
+
+  /** A resolved configuration whose derived paths do not sit under its own state root. */
+  derivedPathsDisagree: 'the derived state-root paths do not agree with the resolved root',
+});
+
+/**
+ * The reason for a value outside an integer setting's accepted range.
+ *
+ * Built from the setting's own bounds so the clause and the remedy cannot
+ * disagree about what is accepted.
+ *
+ * @param spec The setting's bounds.
+ * @param source Whether the value came from the environment or from a host.
+ * @returns The reason clause, naming the range and no value.
+ */
+function rangeReason(spec: IntegerSettingSpec, source: 'environment' | 'override'): string {
+  const range = `outside the accepted range ${spec.min} to ${spec.max}`;
+  return source === 'environment' ? `the value is ${range}` : `the injected override is ${range}`;
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * Provider requirements
+ * ---------------------------------------------------------------------------------------------- */
+
+/** What the resolved configuration must carry for a requirement to be satisfied. */
+interface ProviderRequirementSubject {
+  /** The model id from `DEBUGGEN_MODEL`, absent when nothing configured one. */
+  readonly model?: string | undefined;
+
+  /** The credential from `ANTHROPIC_API_KEY`, absent when nothing configured one. */
+  readonly anthropicApiKey?: string | undefined;
+}
+
+/** How to tell whether one required setting is configured, and what to say when it is not. */
+interface ProviderRequirementRule {
+  /** Whether the resolved configuration carries the setting. */
+  readonly isConfigured: (subject: ProviderRequirementSubject) => boolean;
+
+  /** The reason clause recorded against the key when it does not. */
+  readonly reason: string;
+}
+
+/**
+ * The settings a provider may require, each with its test and its reason.
+ *
+ * Keyed by the environment key the failure is reported against, so the
+ * developer is told which variable to set rather than which provider complained
+ * — and keyed exhaustively, because {@link ProviderRequirementKey} is derived
+ * from this table: a requirement named in {@link PROVIDER_REQUIREMENTS} without
+ * an entry here does not compile.
+ *
+ * Neither reason names the provider, and neither names a value. The provider id
+ * is a validated vocabulary member rather than a secret, but the rule this
+ * module holds is that a failure describes the *key* and the condition, so the
+ * clauses say "the selected provider" and the remedy names the offline
+ * alternative.
+ */
+const PROVIDER_REQUIREMENT_RULES = Object.freeze({
+  ANTHROPIC_API_KEY: Object.freeze({
+    isConfigured: (subject: ProviderRequirementSubject) => subject.anthropicApiKey !== undefined,
+    reason: 'the selected provider requires a credential and none is configured',
+  }),
+  DEBUGGEN_MODEL: Object.freeze({
+    isConfigured: (subject: ProviderRequirementSubject) => subject.model !== undefined,
+    reason: 'the selected provider requires a model and none is configured',
+  }),
+} satisfies Readonly<Partial<Record<ServiceEnvKey, ProviderRequirementRule>>>);
+
+/** One of the settings a provider can require: a key of {@link PROVIDER_REQUIREMENT_RULES}. */
+export type ProviderRequirementKey = keyof typeof PROVIDER_REQUIREMENT_RULES;
 
 /* -------------------------------------------------------------------------------------------------
  * Failure construction
  * ---------------------------------------------------------------------------------------------- */
 
 /**
- * Builds one issue.
+ * Builds one issue, taking the remedy from {@link KEY_HINTS}.
+ *
+ * A caller supplies the key and the reason only: the next step belongs to the
+ * key rather than to the reason, so passing it in would let two rejections of
+ * the same variable answer with different remedies.
  *
  * @param key The environment key that was rejected.
  * @param reason Why, as a clause naming no value.
- * @param hint The developer's next step.
  * @returns The issue, for collection by {@link loadServiceConfig}.
  */
-function issue(key: ServiceEnvKey, reason: string, hint: string): ServiceConfigIssue {
-  return { key, reason, hint };
+function issue(key: ServiceEnvKey, reason: string): ServiceConfigIssue {
+  return { key, reason, hint: KEY_HINTS[key]() };
+}
+
+/**
+ * Orders issues the way {@link SERVICE_ENV_KEYS} declares their keys.
+ *
+ * Issues are raised by three schemas and one normalisation step, so the order
+ * they arrive in is the order the checks happen to run. A developer editing a
+ * `.env` file reads the list against that file, which is why the report order
+ * is the contract's order and not the discovery order — and why a cross-field
+ * rejection, raised last, still appears beside the keys it names.
+ *
+ * Stable within a key, though no two issues can share one: each key is
+ * validated once per load.
+ *
+ * @param issues The issues collected during one load.
+ * @returns The same issues, in contract order.
+ */
+function inContractOrder(issues: readonly ServiceConfigIssue[]): ServiceConfigIssue[] {
+  const position = (key: ServiceEnvKey): number => SERVICE_ENV_KEYS.indexOf(key);
+  return [...issues].sort((left, right) => position(left.key) - position(right.key));
 }
 
 /**
@@ -613,15 +963,16 @@ function issue(key: ServiceEnvKey, reason: string, hint: string): ServiceConfigI
  * @returns The `CONFIG_INVALID` error to return inside an `Err`.
  */
 function configError(issues: readonly ServiceConfigIssue[]): DebuggenError {
-  const summary = issues.map((entry) => `${entry.key} (${entry.reason})`).join('; ');
-  const hints = [...new Set(issues.map((entry) => entry.hint))].join(' ');
+  const ordered = inContractOrder(issues);
+  const summary = ordered.map((entry) => `${entry.key} (${entry.reason})`).join('; ');
+  const hints = [...new Set(ordered.map((entry) => entry.hint))].join(' ');
 
   return new DebuggenError(CONFIG_CODE, `The local service configuration is invalid: ${summary}.`, {
     hint: hints,
     details: {
       subsystem: SUBSYSTEM,
-      keys: issues.map((entry) => entry.key),
-      issues: issues.map((entry) => ({ key: entry.key, reason: entry.reason })),
+      keys: ordered.map((entry) => entry.key),
+      issues: ordered.map((entry) => ({ key: entry.key, reason: entry.reason })),
     },
   });
 }
@@ -649,20 +1000,6 @@ function normaliseSetting(value: string | undefined): string | undefined {
 }
 
 /**
- * Reads one key from the injected environment.
- *
- * @param env The environment record `src/main.ts` passes in.
- * @param key The key to read.
- * @returns The trimmed value, or `undefined` when unset or blank.
- */
-function readSetting(
-  env: Readonly<Record<string, string | undefined>>,
-  key: ServiceEnvKey,
-): string | undefined {
-  return normaliseSetting(env[key]);
-}
-
-/**
  * Parses a whole number, rejecting everything that is not exactly one.
  *
  * Deliberately stricter than `Number.parseInt`, which would read `'80abc'` as
@@ -682,9 +1019,9 @@ function parseIntegerSetting(raw: string): number | undefined {
   return Number.isSafeInteger(parsed) ? parsed : undefined;
 }
 
-/** Everything {@link resolveIntegerSetting} needs to validate and report one key. */
+/** The bounds, default and identity of one integer setting. */
 interface IntegerSettingSpec {
-  /** The key being resolved. */
+  /** The key being validated, which is also the key a rejection is reported against. */
   readonly key: ServiceEnvKey;
 
   /** The lowest accepted value, inclusive. */
@@ -695,114 +1032,199 @@ interface IntegerSettingSpec {
 
   /** The value applied when nothing configured the key. */
   readonly fallback: number;
-
-  /** The developer's next step, shared by every failure of this key. */
-  readonly hint: string;
 }
 
 /** `DEBUGGEN_PORT`: a bindable port, or {@link EPHEMERAL_PORT} to let the system choose. */
-const PORT_SPEC: IntegerSettingSpec = {
+const PORT_SPEC: IntegerSettingSpec = Object.freeze({
   key: 'DEBUGGEN_PORT',
   min: EPHEMERAL_PORT,
   max: MAX_PORT,
   fallback: DEFAULT_PORT,
-  hint: PORT_HINT,
-};
+});
 
 /** `DEBUGGEN_RETENTION_DAYS`: a whole number of days, `0` meaning purge everything eligible. */
-const RETENTION_SPEC: IntegerSettingSpec = {
+const RETENTION_SPEC: IntegerSettingSpec = Object.freeze({
   key: 'DEBUGGEN_RETENTION_DAYS',
   min: 0,
   max: Number.MAX_SAFE_INTEGER,
   fallback: DEFAULT_RETENTION_DAYS,
-  hint: RETENTION_HINT,
-};
-
-/**
- * Resolves an integer setting from its override, then its variable, then its
- * default.
- *
- * An override is validated exactly as a variable is. It arrives from code
- * rather than from a shell, but that code is a VS Code setting, a command-line
- * flag or a test helper, so a non-integer or out-of-range value is just as
- * reachable — and a service that bound port `-1` because a caller was trusted
- * would fail far from its cause.
- *
- * @param raw The trimmed variable value, or `undefined`.
- * @param override The host-supplied value, or `undefined`.
- * @param spec The key's bounds, default and hint.
- * @returns The resolved integer, or the issue describing why neither value was
- * usable.
- */
-function resolveIntegerSetting(
-  raw: string | undefined,
-  override: number | undefined,
-  spec: IntegerSettingSpec,
-): Result<number, ServiceConfigIssue> {
-  const range = `outside the accepted range ${spec.min} to ${spec.max}`;
-
-  if (override !== undefined) {
-    if (!Number.isSafeInteger(override)) {
-      return err(issue(spec.key, 'the injected override is not a whole number', spec.hint));
-    }
-    if (override < spec.min || override > spec.max) {
-      return err(issue(spec.key, `the injected override is ${range}`, spec.hint));
-    }
-    return ok(override);
-  }
-
-  if (raw === undefined) {
-    return ok(spec.fallback);
-  }
-
-  const parsed = parseIntegerSetting(raw);
-  if (parsed === undefined) {
-    return err(issue(spec.key, 'the value is not a whole number', spec.hint));
-  }
-  if (parsed < spec.min || parsed > spec.max) {
-    return err(issue(spec.key, `the value is ${range}`, spec.hint));
-  }
-  return ok(parsed);
-}
+});
 
 /* -------------------------------------------------------------------------------------------------
- * Resolving the non-path settings
+ * The loopback vocabulary
  * ---------------------------------------------------------------------------------------------- */
 
 /**
- * Resolves the provider selection.
+ * Strips the brackets a host value carries when it was copied out of a URL.
  *
- * Trimmed and lower-cased before it is asked about, which is the normalisation
- * `@debuggen/model-provider` applies to the same variable: a hand-edited
- * `.env` carrying padding or a capital letter selects the provider it
- * obviously means, and a value that is still not a member is genuinely
- * unrecognised. The default is imported rather than restated, so the two
- * boundaries cannot drift.
+ * `[::1]` is how an IPv6 address is written inside a URL authority, and it is
+ * what a developer copies out of a browser address bar — but it is not what a
+ * listener binds, so the brackets are removed here rather than passed on to
+ * fail several steps later. A value with only one of the two brackets is left
+ * exactly as it is, so it reaches {@link isLoopbackHost} and is refused.
  *
- * @param raw The trimmed `DEBUGGEN_PROVIDER` value, or `undefined`.
- * @param override The host-supplied selection, or `undefined`.
- * @returns The validated id, or the issue listing the accepted ids.
+ * @param value A trimmed host value.
+ * @returns The value without its surrounding brackets.
  */
-function resolveProvider(
-  raw: string | undefined,
-  override: string | undefined,
-): Result<ProviderId, ServiceConfigIssue> {
-  const selected = normaliseSetting(override) ?? raw;
-  if (selected === undefined) {
-    return ok(DEFAULT_PROVIDER_ID);
+function stripIpv6Brackets(value: string): string {
+  const bracketed =
+    value.startsWith(IPV6_BRACKETS.open) &&
+    value.endsWith(IPV6_BRACKETS.close) &&
+    value.length > IPV6_BRACKETS.open.length + IPV6_BRACKETS.close.length;
+
+  return bracketed
+    ? value.slice(IPV6_BRACKETS.open.length, value.length - IPV6_BRACKETS.close.length)
+    : value;
+}
+
+/**
+ * Whether a dotted-quad literal names an address in `127.0.0.0/8`.
+ *
+ * The whole block rather than the single address, because every address in it
+ * is loopback: a developer who binds `127.0.0.2` to keep two tools apart has
+ * not widened anything.
+ *
+ * @param value A string already matched by {@link IPV4_PATTERN}.
+ * @returns `true` when every octet is in range and the first is `127`.
+ */
+function isIpv4Loopback(value: string): boolean {
+  const octets = value.split('.').map((part) => Number.parseInt(part, 10));
+  if (octets.some((octet) => !Number.isInteger(octet) || octet < 0 || octet > MAX_IPV4_OCTET)) {
+    return false;
+  }
+  return octets.at(0) === IPV4_LOOPBACK_FIRST_OCTET;
+}
+
+/**
+ * Expands an IPv6 literal to its eight groups, or `undefined` when it is not
+ * one.
+ *
+ * Only what the loopback question needs: one optional `::` run, no embedded
+ * IPv4 address (which {@link isIpv6Loopback} handles before calling this), and
+ * exactly eight groups once the run is expanded. A zone identifier, a port or a
+ * second `::` leaves a group that fails {@link IPV6_GROUP_PATTERN}, so the
+ * address is refused rather than partially understood.
+ *
+ * @param value A trimmed, bracket-free value containing at least one colon.
+ * @returns The eight groups, or `undefined` when the value is not an IPv6
+ * literal.
+ */
+function expandIpv6Groups(value: string): readonly string[] | undefined {
+  const runs = value.split(IPV6_COMPRESSION);
+  if (runs.length > 2) {
+    return undefined;
   }
 
-  const candidate = selected.toLowerCase();
-  if (isProviderId(candidate)) {
-    return ok(candidate);
+  if (runs.length === 1) {
+    const groups = value.split(':');
+    return groups.length === IPV6_GROUP_COUNT ? groups : undefined;
   }
-  return err(
-    issue(
-      'DEBUGGEN_PROVIDER',
-      'the value names no provider this build offers',
-      unrecognisedProviderHint(),
-    ),
-  );
+
+  const head = runs.at(0) ?? '';
+  const tail = runs.at(1) ?? '';
+  const headGroups = head.length === 0 ? [] : head.split(':');
+  const tailGroups = tail.length === 0 ? [] : tail.split(':');
+  const elided = IPV6_GROUP_COUNT - headGroups.length - tailGroups.length;
+  if (elided < 1) {
+    return undefined;
+  }
+
+  return [...headGroups, ...Array.from({ length: elided }, () => '0'), ...tailGroups];
+}
+
+/**
+ * Whether an IPv6 literal names the loopback interface.
+ *
+ * Two forms count. The plain one is `::1` and every way of writing it out —
+ * seven zero groups and a final `1`, in any mixture of compression and leading
+ * zeros. The other is an embedded IPv4 address, `::127.0.0.1` or
+ * `::ffff:127.0.0.1`, which names the same interface as the address it embeds
+ * and only when its prefix is one of the two mapping prefixes; anything else in
+ * front of an embedded address names a different host and is refused.
+ *
+ * @param value A trimmed, bracket-free value containing at least one colon.
+ * @returns `true` when the value is an IPv6 loopback literal.
+ */
+function isIpv6Loopback(value: string): boolean {
+  const lastColon = value.lastIndexOf(':');
+  const trailing = value.slice(lastColon + 1);
+
+  if (trailing.includes('.')) {
+    return (
+      IPV4_PATTERN.test(trailing) &&
+      isIpv4Loopback(trailing) &&
+      IPV4_EMBEDDED_PREFIXES.has(value.slice(0, lastColon + 1).toLowerCase())
+    );
+  }
+
+  const groups = expandIpv6Groups(value);
+  if (groups === undefined || !groups.every((group) => IPV6_GROUP_PATTERN.test(group))) {
+    return false;
+  }
+
+  return groups.every((group, index) => {
+    const expected = index === IPV6_GROUP_COUNT - 1 ? 1 : 0;
+    return Number.parseInt(group, 16) === expected;
+  });
+}
+
+/**
+ * Whether a host value names this machine's loopback interface.
+ *
+ * The access boundary of the product is that the service is reachable from this
+ * machine only (AAP 0.5.6): the authentication, role and Origin rules in
+ * `src/server/auth.ts` keep other local processes and web pages out, and the
+ * bind is what keeps other machines out. Those rules assume the bind, so a
+ * routable interface would not narrow them — it would publish an authenticated
+ * surface holding a developer's source excerpts, telemetry and session history
+ * to every host that can route to this one. `0.0.0.0` and `::` are the two
+ * values that do it by accident, which is why this check exists at the
+ * configuration boundary rather than as advice in a comment.
+ *
+ * Three spellings are accepted: the name `localhost` in any letter case, any
+ * IPv4 address in `127.0.0.0/8`, and the IPv6 loopback address in any of its
+ * written forms, with URL brackets tolerated. Everything else is refused,
+ * including a name that happens to resolve to a loopback address — resolution
+ * depends on a hosts file this module does not read, and a name whose meaning
+ * can change under the service is not a boundary.
+ *
+ * @param value A trimmed host value.
+ * @returns `true` when the value names the loopback interface.
+ */
+function isLoopbackHost(value: string): boolean {
+  const bare = stripIpv6Brackets(value);
+
+  if (bare.toLowerCase() === LOOPBACK_HOST_NAME) {
+    return true;
+  }
+  if (IPV4_PATTERN.test(bare)) {
+    return isIpv4Loopback(bare);
+  }
+  if (bare.includes(':')) {
+    return isIpv6Loopback(bare);
+  }
+  return false;
+}
+
+/**
+ * The reason a host value cannot be bound, or `undefined` when it can.
+ *
+ * Shared by the environment schema and the override schema so that neither
+ * channel can accept an interface the other refuses; the reasons are
+ * source-agnostic because the rule is a property of the value, not of where it
+ * came from.
+ *
+ * @param value A trimmed host value.
+ * @returns The reason clause, or `undefined` when the value is bindable.
+ */
+function describeHostProblem(value: string): string | undefined {
+  if (WHITESPACE_PATTERN.test(value)) {
+    return REASONS.hostWhitespace;
+  }
+  if (!isLoopbackHost(value)) {
+    return REASONS.hostNotLoopback;
+  }
+  return undefined;
 }
 
 /**
@@ -819,62 +1241,6 @@ function resolveProvider(
  */
 function isLogLevelSetting(value: string): value is LogLevelSetting {
   return LOG_LEVEL_SETTINGS.some((candidate) => candidate === value);
-}
-
-/**
- * Resolves the log threshold, lower-casing the way the severities are spelled.
- *
- * The override is validated too, despite its type: the service is also started
- * from JavaScript — the bundle inside the editor extension — where the type
- * guarantees nothing.
- *
- * @param raw The trimmed `DEBUGGEN_LOG_LEVEL` value, or `undefined`.
- * @param override The host-supplied threshold, or `undefined`.
- * @returns The validated threshold, or the issue listing the accepted values.
- */
-function resolveLogLevel(
-  raw: string | undefined,
-  override: LogLevelSetting | undefined,
-): Result<LogLevelSetting, ServiceConfigIssue> {
-  const selected = normaliseSetting(override) ?? raw;
-  if (selected === undefined) {
-    return ok(DEFAULT_LOG_LEVEL);
-  }
-
-  const candidate = selected.toLowerCase();
-  if (isLogLevelSetting(candidate)) {
-    return ok(candidate);
-  }
-  return err(
-    issue('DEBUGGEN_LOG_LEVEL', 'the value names no known log level', unrecognisedLogLevelHint()),
-  );
-}
-
-/**
- * Resolves the interface to bind.
- *
- * The only rejection is embedded whitespace, which is never a host name and
- * would otherwise surface as a listener failure several steps later. Anything
- * else — a loopback literal, a host name, an IPv6 address — is passed through
- * for the listener to accept or refuse, because this module does not own the
- * question of which interfaces exist on the machine.
- *
- * @param raw The trimmed `DEBUGGEN_HOST` value, or `undefined`.
- * @param override The host-supplied interface, or `undefined`.
- * @returns The interface, or the issue describing why the value cannot be one.
- */
-function resolveHost(
-  raw: string | undefined,
-  override: string | undefined,
-): Result<string, ServiceConfigIssue> {
-  const selected = normaliseSetting(override) ?? raw;
-  if (selected === undefined) {
-    return ok(DEFAULT_HOST);
-  }
-  if (WHITESPACE_PATTERN.test(selected)) {
-    return err(issue('DEBUGGEN_HOST', 'the value contains whitespace', HOST_HINT));
-  }
-  return ok(selected);
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -902,18 +1268,43 @@ function resolveHost(
  */
 function describePathProblem(value: string): string | undefined {
   if (value.includes('\0')) {
-    return 'the value contains a NUL character';
+    return REASONS.nulCharacter;
   }
   if (value.startsWith(UNC_PREFIX)) {
-    return 'a UNC path is not supported as a directory root';
+    return REASONS.uncPath;
   }
   if (isAbsolutePosix(value) || WINDOWS_ROOTED_PATTERN.test(value)) {
     return undefined;
   }
   if (isWindowsAbsolute(value)) {
-    return 'a drive-relative Windows path is not absolute';
+    return REASONS.driveRelativePath;
   }
-  return 'the value is not an absolute path';
+  return REASONS.notAbsolutePath;
+}
+
+/**
+ * The reason a directory setting cannot be used, judged **before** its `~` is
+ * expanded, or `undefined` when it can.
+ *
+ * This is the half of the path contract that needs no context, which is what
+ * lets it live inside a schema: whether a value is absolute, home-relative or
+ * neither is decidable from the value alone, and only the expansion itself
+ * needs a home directory. A `~`-prefixed value is therefore accepted here and
+ * settled during normalisation, where the home directory is known.
+ *
+ * @param value A trimmed value, before separator conversion.
+ * @returns The reason clause, or `undefined` when the value is usable.
+ */
+function describeDirectorySettingProblem(value: string): string | undefined {
+  const posix = toPosix(value);
+
+  if (posix === HOME_MARKER || posix.startsWith(HOME_PREFIX)) {
+    return posix.includes('\0') ? REASONS.nulCharacter : undefined;
+  }
+  if (posix.startsWith(HOME_MARKER)) {
+    return REASONS.otherAccountHome;
+  }
+  return describePathProblem(posix);
 }
 
 /**
@@ -951,59 +1342,48 @@ function resolveHomeDirectory(override: string | undefined): string | undefined 
 }
 
 /**
- * Expands a leading `~` and validates the result as an absolute directory
- * root.
+ * Expands a leading `~` against the home directory and normalises the result.
  *
- * Applied identically to `DEBUGGEN_HOME` and `DEBUGGEN_PROMPTS_DIR`: both
- * routinely arrive from a shell profile or a settings file, where a `~` is
- * ordinary and where nothing else will expand it — no filesystem call does,
- * and neither does `path.resolve`.
- *
- * Three forms are recognised, and the third is a refusal rather than a guess:
+ * The deterministic half of the path contract: the value has already been
+ * accepted by {@link describeDirectorySettingProblem}, so the only thing that
+ * can still fail is the expansion itself, on a system whose home directory
+ * could not be determined. Applied identically to `DEBUGGEN_HOME` and
+ * `DEBUGGEN_PROMPTS_DIR`, both of which routinely arrive from a shell profile
+ * or a settings file where a `~` is ordinary and where nothing else will expand
+ * it — no filesystem call does, and neither does `path.resolve`.
  *
  * | Value | Result |
  * | --- | --- |
  * | `~` | the home directory |
  * | `~/x`, and `~\x` once separators are normalised | `<home>/x` |
- * | `~other/x` | rejected — resolving another account's home is not this tool's business |
+ * | an absolute path | itself, normalised POSIX |
  *
  * @param key The key being resolved, for the issue.
- * @param selected The trimmed value, before separator conversion.
+ * @param selected The trimmed, already-validated value.
  * @param homeDir The home directory from {@link resolveHomeDirectory}, or
  * `undefined` when none could be determined.
- * @param hint The developer's next step for this key.
- * @returns The absolute, normalised POSIX path, or the issue.
+ * @returns The absolute, normalised POSIX path, or the issue naming the key
+ * that needed a home directory.
  */
-function resolveDirectorySetting(
+function expandDirectorySetting(
   key: ServiceEnvKey,
   selected: string,
   homeDir: string | undefined,
-  hint: string,
 ): Result<string, ServiceConfigIssue> {
   const posix = toPosix(selected);
-  let candidate = posix;
 
   if (posix === HOME_MARKER || posix.startsWith(HOME_PREFIX)) {
     if (homeDir === undefined) {
-      return err(
-        issue(
-          key,
-          'the value starts with a home-directory prefix and no home directory could be determined',
-          hint,
-        ),
-      );
+      return err(issue(key, REASONS.indeterminableHome));
     }
-    candidate =
-      posix === HOME_MARKER ? homeDir : joinPosix(homeDir, posix.slice(HOME_PREFIX.length));
-  } else if (posix.startsWith(HOME_MARKER)) {
-    return err(issue(key, 'a home-directory prefix naming another account is not supported', hint));
+    return ok(
+      normalizePosix(
+        posix === HOME_MARKER ? homeDir : joinPosix(homeDir, posix.slice(HOME_PREFIX.length)),
+      ),
+    );
   }
 
-  const problem = describePathProblem(candidate);
-  if (problem !== undefined) {
-    return err(issue(key, problem, hint));
-  }
-  return ok(normalizePosix(candidate));
+  return ok(normalizePosix(posix));
 }
 
 /**
@@ -1040,103 +1420,818 @@ function resolveDefaultPromptsDirectory(): Result<string, ServiceConfigIssue> {
     INTERNAL_CODE,
   );
   if (isErr(derived)) {
-    return err(
-      issue(
-        'DEBUGGEN_PROMPTS_DIR',
-        "the default directory could not be derived from the service module's own location",
-        PROMPTS_HINT,
-      ),
-    );
+    return err(issue('DEBUGGEN_PROMPTS_DIR', REASONS.underivablePromptsDir));
   }
 
   const candidate = toPosix(derived.value);
   const problem = describePathProblem(candidate);
   if (problem !== undefined) {
     return err(
-      issue(
-        'DEBUGGEN_PROMPTS_DIR',
-        `the derived default directory is invalid: ${problem}`,
-        PROMPTS_HINT,
-      ),
+      issue('DEBUGGEN_PROMPTS_DIR', `the derived default directory is invalid: ${problem}`),
     );
   }
   return ok(normalizePosix(candidate));
 }
 
+/* -------------------------------------------------------------------------------------------------
+ * Issue plumbing shared by the three schemas
+ * ---------------------------------------------------------------------------------------------- */
+
 /**
- * Resolves the prompt directory through the three-step precedence the prompt
- * loader documents: an explicit override, then `DEBUGGEN_PROMPTS_DIR`, then
- * the directory shipped beside the service.
+ * The metadata every issue this module's schemas raise carries.
  *
- * @param raw The trimmed `DEBUGGEN_PROMPTS_DIR` value, or `undefined`.
- * @param override The host-supplied directory, or `undefined`.
- * @param homeDir The home directory a leading `~` expands against.
- * @returns The absolute, normalised POSIX directory, or the issue.
+ * A type alias rather than an interface, deliberately: the validation library
+ * types an issue's `params` as `Record<string, unknown>`, and only an alias of
+ * an object type carries the implicit index signature that makes it assignable
+ * there.
  */
-function resolvePromptsDirectory(
-  raw: string | undefined,
-  override: string | undefined,
-  homeDir: string | undefined,
-): Result<string, ServiceConfigIssue> {
-  const selected = normaliseSetting(override) ?? raw;
-  if (selected === undefined) {
-    return resolveDefaultPromptsDirectory();
-  }
-  return resolveDirectorySetting('DEBUGGEN_PROMPTS_DIR', selected, homeDir, PROMPTS_HINT);
+type ConfigIssueParams = {
+  /** The environment key the rejection is reported against. */
+  readonly key: ServiceEnvKey;
+
+  /** A clause from {@link REASONS}, or one built by {@link rangeReason}. */
+  readonly reason: string;
+};
+
+/** A `custom` issue carrying nothing but this module's own metadata. */
+type ConfigIssuePayload = {
+  /** Always `'custom'`: the library's own codes carry the library's own messages. */
+  readonly code: 'custom';
+
+  /** The reason again, so a raw `ZodError` a developer prints is still readable. */
+  readonly message: string;
+
+  /** What {@link toServiceConfigIssues} reads. */
+  readonly params: ConfigIssueParams;
+};
+
+/**
+ * Builds the issue a check inside a schema raises.
+ *
+ * The reason travels as structured metadata *and* as the message: the metadata
+ * is what this module reads back, and the message is a courtesy for anyone
+ * printing a raw `ZodError` while debugging. Both are authored here, so neither
+ * can carry a value.
+ *
+ * @param key The environment key to report against.
+ * @param reason The clause describing what was wrong.
+ * @returns The issue payload to hand to the validation library.
+ */
+function configIssuePayload(key: ServiceEnvKey, reason: string): ConfigIssuePayload {
+  return { code: 'custom', message: reason, params: { key, reason } };
 }
+
+/**
+ * Reads the metadata this module attached to an issue.
+ *
+ * Narrowed rather than trusted: `params` is `Record<string, unknown>` by the
+ * library's own typing, and an issue raised by something other than a check in
+ * this module carries none. That is exactly the case the generic reason exists
+ * for.
+ *
+ * @param params The `params` of a `custom` issue, if it had any.
+ * @returns The key and reason this module attached, or `undefined`.
+ */
+function readIssueParams(
+  params: Readonly<Record<string, unknown>> | undefined,
+): ConfigIssueParams | undefined {
+  const key = params?.['key'];
+  const reason = params?.['reason'];
+
+  if (!isServiceEnvKey(key) || typeof reason !== 'string' || reason.length === 0) {
+    return undefined;
+  }
+  return { key, reason };
+}
+
+/**
+ * Turns the issues one schema reported into this module's own issues.
+ *
+ * **This is the privacy boundary of the module.** Nothing here reads a message
+ * the validation library generated: several of its default messages quote the
+ * value they rejected, and a configuration failure is logged, may be persisted
+ * with a session and is rendered in two user interfaces. An issue therefore
+ * contributes its authored metadata, and an issue without any — one the library
+ * raised itself, for an input whose type no compiler could vouch for —
+ * contributes the key from its path and a generic reason this module wrote.
+ *
+ * An issue whose key cannot be determined at all contributes nothing, which
+ * only a root-level rejection can produce; {@link loadServiceConfig} handles
+ * that case explicitly rather than guessing a key for it.
+ *
+ * @param zodIssues The issues from a failed parse.
+ * @param keyFor Which environment key an issue's leading path segment names.
+ * @param genericReason The reason for an issue this module did not author.
+ * @returns The issues, unordered; {@link configError} puts them in contract
+ * order.
+ */
+function toServiceConfigIssues(
+  zodIssues: readonly z.core.$ZodIssue[],
+  keyFor: (segment: unknown) => ServiceEnvKey | undefined,
+  genericReason: string,
+): ServiceConfigIssue[] {
+  const collected: ServiceConfigIssue[] = [];
+
+  for (const zodIssue of zodIssues) {
+    const authored = zodIssue.code === 'custom' ? readIssueParams(zodIssue.params) : undefined;
+    if (authored !== undefined) {
+      collected.push(issue(authored.key, authored.reason));
+      continue;
+    }
+
+    const key = keyFor(zodIssue.path.at(0));
+    if (key !== undefined) {
+      collected.push(issue(key, genericReason));
+    }
+  }
+
+  return collected;
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * The per-setting schemas
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * One configured value: trimmed, with a blank treated as absent.
+ *
+ * The empty-is-absent rule of this module's overview, expressed once and reused
+ * by both raw layers so a blank variable and a blank override cannot behave
+ * differently.
+ */
+const settingSchema = z
+  .string()
+  .optional()
+  .transform((value) => normaliseSetting(value));
+
+/**
+ * `DEBUGGEN_PROVIDER`, from either channel.
+ *
+ * Lower-cased before it is asked about, which is the normalisation
+ * `@debuggen/model-provider` applies to the same variable: a hand-edited `.env`
+ * carrying padding or a capital letter selects the provider it obviously means,
+ * and a value that is still not a member is genuinely unrecognised.
+ */
+const providerSettingSchema = settingSchema.transform((value, ctx) => {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  const candidate = value.toLowerCase();
+  if (!isProviderId(candidate)) {
+    ctx.addIssue(configIssuePayload('DEBUGGEN_PROVIDER', REASONS.unknownProvider));
+    return z.NEVER;
+  }
+  return candidate;
+});
+
+/**
+ * `DEBUGGEN_LOG_LEVEL`, from either channel.
+ *
+ * The override is validated too, despite its type: the service is also started
+ * from JavaScript — the bundle inside the editor extension — where the type
+ * guarantees nothing.
+ */
+const logLevelSettingSchema = settingSchema.transform((value, ctx) => {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  const candidate = value.toLowerCase();
+  if (!isLogLevelSetting(candidate)) {
+    ctx.addIssue(configIssuePayload('DEBUGGEN_LOG_LEVEL', REASONS.unknownLogLevel));
+    return z.NEVER;
+  }
+  return candidate;
+});
+
+/**
+ * `DEBUGGEN_HOST`, from either channel: one loopback interface.
+ *
+ * URL brackets are removed rather than refused, because `[::1]` is what a
+ * developer copies out of an address bar and is not what a listener binds; the
+ * bracket-free form is what reaches {@link ServiceConfig.host}.
+ */
+const hostSettingSchema = settingSchema.transform((value, ctx) => {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  const problem = describeHostProblem(value);
+  if (problem !== undefined) {
+    ctx.addIssue(configIssuePayload('DEBUGGEN_HOST', problem));
+    return z.NEVER;
+  }
+  return stripIpv6Brackets(value);
+});
+
+/**
+ * A directory setting from either channel, validated as far as a value alone
+ * allows.
+ *
+ * The `~` is left in place: expanding it needs a home directory, which is the
+ * one part of this contract that depends on something outside the value, so it
+ * belongs to the normalisation step rather than to a schema.
+ *
+ * @param key The key being validated, and the key a rejection names.
+ * @returns The schema for that key.
+ */
+function directorySettingSchema(key: ServiceEnvKey) {
+  return settingSchema.transform((value, ctx) => {
+    if (value === undefined) {
+      return undefined;
+    }
+
+    const problem = describeDirectorySettingProblem(value);
+    if (problem !== undefined) {
+      ctx.addIssue(configIssuePayload(key, problem));
+      return z.NEVER;
+    }
+    return value;
+  });
+}
+
+/**
+ * An integer setting as an environment variable carries it: a string of digits
+ * within the setting's range.
+ *
+ * @param spec The setting's key and bounds.
+ * @returns The schema for that setting.
+ */
+function environmentIntegerSchema(spec: IntegerSettingSpec) {
+  return settingSchema.transform((value, ctx) => {
+    if (value === undefined) {
+      return undefined;
+    }
+
+    const parsed = parseIntegerSetting(value);
+    if (parsed === undefined) {
+      ctx.addIssue(configIssuePayload(spec.key, REASONS.notAnInteger));
+      return z.NEVER;
+    }
+    if (parsed < spec.min || parsed > spec.max) {
+      ctx.addIssue(configIssuePayload(spec.key, rangeReason(spec, 'environment')));
+      return z.NEVER;
+    }
+    return parsed;
+  });
+}
+
+/**
+ * An integer setting as a host injects it: a number, validated exactly as
+ * firmly as the variable.
+ *
+ * An override arrives from code rather than from a shell, but that code is a VS
+ * Code setting, a command-line flag or a test helper — so a non-integer or
+ * out-of-range value is just as reachable, and a service that bound port `-1`
+ * because a caller was trusted would fail far from its cause. Its wording says
+ * "the injected override" so a developer knows which of the two channels to
+ * look at.
+ *
+ * @param spec The setting's key and bounds.
+ * @returns The schema for that setting.
+ */
+function overrideIntegerSchema(spec: IntegerSettingSpec) {
+  return z
+    .number()
+    .optional()
+    .transform((value, ctx) => {
+      if (value === undefined) {
+        return undefined;
+      }
+
+      if (!Number.isSafeInteger(value)) {
+        ctx.addIssue(configIssuePayload(spec.key, REASONS.overrideNotAnInteger));
+        return z.NEVER;
+      }
+      if (value < spec.min || value > spec.max) {
+        ctx.addIssue(configIssuePayload(spec.key, rangeReason(spec, 'override')));
+        return z.NEVER;
+      }
+      return value;
+    });
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * The raw schemas
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * The nine environment variables, as strings, validated one key at a time.
+ *
+ * Every key is optional because every key either has a default or is needed
+ * only on one path, and a blank value counts as absent — which is load-bearing
+ * rather than cosmetic: `.env.example` ships `ANTHROPIC_API_KEY=` and
+ * `DEBUGGEN_MODEL=` with no value, and the repository's Vitest projects export
+ * `ANTHROPIC_API_KEY: ''`, so a reader that treated `''` as a value would hand
+ * the provider a zero-length credential.
+ *
+ * Unknown keys are ignored rather than rejected: the input is an environment,
+ * which carries the whole operating system's variables and the launcher's three
+ * child-process ones. What this schema does **not** do is decide anything that
+ * needs a second value — the `~` expansion needs a home directory and the
+ * credential rule needs the selected provider, so both belong further down.
+ *
+ * @example
+ * ```ts
+ * const parsed = serviceEnvSchema.safeParse(process.env);
+ * if (parsed.success) {
+ *   // parsed.data.DEBUGGEN_PORT is a number or undefined, never a string
+ * }
+ * ```
+ */
+export const serviceEnvSchema = z.object({
+  ANTHROPIC_API_KEY: settingSchema,
+  DEBUGGEN_PROVIDER: providerSettingSchema,
+  DEBUGGEN_MODEL: settingSchema,
+  DEBUGGEN_HOST: hostSettingSchema,
+  DEBUGGEN_PORT: environmentIntegerSchema(PORT_SPEC),
+  DEBUGGEN_HOME: directorySettingSchema('DEBUGGEN_HOME'),
+  DEBUGGEN_LOG_LEVEL: logLevelSettingSchema,
+  DEBUGGEN_RETENTION_DAYS: environmentIntegerSchema(RETENTION_SPEC),
+  DEBUGGEN_PROMPTS_DIR: directorySettingSchema('DEBUGGEN_PROMPTS_DIR'),
+});
+
+/** The type of {@link serviceEnvSchema}. */
+export type ServiceEnvSchema = typeof serviceEnvSchema;
+
+/** What {@link serviceEnvSchema} produces: every setting typed, and optional. */
+export type ServiceEnvSettings = z.infer<typeof serviceEnvSchema>;
+
+/**
+ * The same settings as a host already decided them.
+ *
+ * Shape-compatible with {@link ServiceConfigOverrides}, and validated by the
+ * same per-setting schemas, so the two channels cannot disagree about what is
+ * acceptable. Only the integer settings differ, because they arrive as numbers
+ * rather than as strings and their rejections say so.
+ *
+ * `homeDir` is carried but not validated as a setting: it is the context a `~`
+ * expands against rather than a configuration value, and a home directory that
+ * cannot be used is reported against the key that needed it —
+ * `DEBUGGEN_HOME` or `DEBUGGEN_PROMPTS_DIR` — rather than on its own.
+ */
+export const serviceConfigOverridesSchema = z.object({
+  homeDir: settingSchema,
+  debuggenHome: directorySettingSchema('DEBUGGEN_HOME'),
+  promptsDir: directorySettingSchema('DEBUGGEN_PROMPTS_DIR'),
+  host: hostSettingSchema,
+  port: overrideIntegerSchema(PORT_SPEC),
+  logLevel: logLevelSettingSchema,
+  retentionDays: overrideIntegerSchema(RETENTION_SPEC),
+  provider: providerSettingSchema,
+  model: settingSchema,
+  anthropicApiKey: settingSchema,
+});
+
+/** The type of {@link serviceConfigOverridesSchema}. */
+export type ServiceConfigOverridesSchema = typeof serviceConfigOverridesSchema;
+
+/** What {@link serviceConfigOverridesSchema} produces. */
+export type ServiceOverrideSettings = z.infer<typeof serviceConfigOverridesSchema>;
+
+/** What one override field is to the environment contract. */
+interface OverrideFieldDescriptor {
+  /** The environment key a rejection of this field is reported against. */
+  readonly key: ServiceEnvKey;
+
+  /**
+   * Whether a value in this field means the variable is not read at all.
+   *
+   * True for every setting, and false for `homeDir`: that field is the context
+   * a `~` expands against rather than a value for `DEBUGGEN_HOME`, so injecting
+   * one must not stop the variable from being read.
+   */
+  readonly supersedes: boolean;
+}
+
+/**
+ * What each override field is: the key it reports against, and whether it
+ * supersedes that key's variable.
+ *
+ * Total over {@link ServiceConfigOverrides}, so a field added to that interface
+ * stops this file compiling until both questions are answered for it.
+ */
+const OVERRIDE_FIELDS: Readonly<Record<keyof ServiceConfigOverrides, OverrideFieldDescriptor>> =
+  Object.freeze({
+    homeDir: Object.freeze({ key: 'DEBUGGEN_HOME', supersedes: false }),
+    debuggenHome: Object.freeze({ key: 'DEBUGGEN_HOME', supersedes: true }),
+    promptsDir: Object.freeze({ key: 'DEBUGGEN_PROMPTS_DIR', supersedes: true }),
+    host: Object.freeze({ key: 'DEBUGGEN_HOST', supersedes: true }),
+    port: Object.freeze({ key: 'DEBUGGEN_PORT', supersedes: true }),
+    logLevel: Object.freeze({ key: 'DEBUGGEN_LOG_LEVEL', supersedes: true }),
+    retentionDays: Object.freeze({ key: 'DEBUGGEN_RETENTION_DAYS', supersedes: true }),
+    provider: Object.freeze({ key: 'DEBUGGEN_PROVIDER', supersedes: true }),
+    model: Object.freeze({ key: 'DEBUGGEN_MODEL', supersedes: true }),
+    anthropicApiKey: Object.freeze({ key: 'ANTHROPIC_API_KEY', supersedes: true }),
+  });
+
+/** The override field names, for the supersession pass and for issue mapping. */
+const OVERRIDE_FIELD_NAMES = Object.keys(
+  OVERRIDE_FIELDS,
+) as readonly (keyof ServiceConfigOverrides)[];
+
+/**
+ * Whether a string is one of the override field names.
+ *
+ * @param value Any string.
+ * @returns `true` when `value` is a field of {@link ServiceConfigOverrides}.
+ */
+function isOverrideField(value: string): value is keyof ServiceConfigOverrides {
+  return Object.hasOwn(OVERRIDE_FIELDS, value);
+}
+
+/**
+ * The environment key an override field name names, or `undefined` when the
+ * segment is not one of the fields.
+ *
+ * Only consulted for an issue this module did not author — an override whose
+ * type no compiler could vouch for, a `port` that arrived as a string from
+ * JavaScript — so that such a rejection still names the variable a developer
+ * would set rather than the field name of an internal type.
+ *
+ * @param segment The leading path segment of an issue.
+ * @returns The key to report against, or `undefined`.
+ */
+function overrideFieldKey(segment: unknown): ServiceEnvKey | undefined {
+  if (typeof segment !== 'string' || !isOverrideField(segment)) {
+    return undefined;
+  }
+  return OVERRIDE_FIELDS[segment].key;
+}
+
+/**
+ * The environment key an environment-schema path segment names.
+ *
+ * The identity, narrowed: the raw schema is keyed by the variable names
+ * themselves, so an issue's path already carries the key to report.
+ *
+ * @param segment The leading path segment of an issue.
+ * @returns The key to report against, or `undefined`.
+ */
+function environmentFieldKey(segment: unknown): ServiceEnvKey | undefined {
+  return isServiceEnvKey(segment) ? segment : undefined;
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * The resolved schema
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * A resolved path: absolute, normalised POSIX, in the one spelling every
+ * consumer of {@link ServiceConfig} expects.
+ *
+ * The invariant four subsystems depend on without re-deriving it — the store
+ * opens `databasePath`, the patcher and cleanup write under `backupsDir`, the
+ * retention sweep purges `indexCacheDir`, and the credential writer owns
+ * `authFilePath` — so it is stated here as a schema rather than left implicit
+ * in whichever function happened to build the value.
+ *
+ * @param key The key a rejection is reported against.
+ * @returns The schema for one resolved path.
+ */
+function resolvedPathSchema(key: ServiceEnvKey) {
+  return z.string().transform((value, ctx) => {
+    if (describePathProblem(value) !== undefined || normalizePosix(value) !== value) {
+      ctx.addIssue(configIssuePayload(key, REASONS.unnormalisedPath));
+      return z.NEVER;
+    }
+    return value;
+  });
+}
+
+/**
+ * A value carried only when something configured it: present and non-blank, or
+ * absent.
+ *
+ * Absent rather than `undefined`, which the repository's
+ * `exactOptionalPropertyTypes` distinguishes and which
+ * {@link toModelProviderOverrides} relies on: an omitted model means "nothing
+ * configured one", while a present `undefined` would be a model that was
+ * configured as nothing.
+ *
+ * @param key The key a rejection is reported against.
+ * @returns The schema for one optional resolved value.
+ */
+function resolvedOptionalValueSchema(key: ServiceEnvKey) {
+  return z
+    .string()
+    .optional()
+    .transform((value, ctx) => {
+      if (value === undefined) {
+        return undefined;
+      }
+      if (normaliseSetting(value) !== value) {
+        ctx.addIssue(configIssuePayload(key, REASONS.unnormalisedValue));
+        return z.NEVER;
+      }
+      return value;
+    });
+}
+
+/**
+ * A whole resolved configuration, and the last word on whether the service can
+ * start.
+ *
+ * Everything a subsystem is entitled to assume about {@link ServiceConfig},
+ * stated once and checked once:
+ *
+ * - the bind is a loopback interface, which is the product's access boundary
+ *   (AAP 0.5.6) and the assumption the authentication and Origin rules rest on;
+ * - the port is in range, with {@link EPHEMERAL_PORT} meaning "let the system
+ *   choose";
+ * - the log threshold and the provider are members of their closed
+ *   vocabularies;
+ * - the retention window is a whole number of days, `0` meaning "purge
+ *   everything eligible";
+ * - every path is absolute and normalised, and the four derived paths sit
+ *   directly under the state root with the names the rest of the product
+ *   expects;
+ * - the selected provider has the settings {@link PROVIDER_REQUIREMENTS} says
+ *   it needs, so a network-backed selection without a model or a credential
+ *   fails at start-up naming the missing key instead of failing mid-session.
+ *
+ * Reachable on its own, not only through {@link loadServiceConfig}: a
+ * configuration assembled by a host, read back from a record or handed across a
+ * boundary can be validated against exactly the same contract.
+ */
+export const resolvedServiceConfigSchema = z
+  .object({
+    host: z.string().transform((value, ctx) => {
+      const problem = describeHostProblem(value);
+      if (problem !== undefined) {
+        ctx.addIssue(configIssuePayload('DEBUGGEN_HOST', problem));
+        return z.NEVER;
+      }
+      return value;
+    }),
+    port: z.number().transform((value, ctx) => {
+      if (!Number.isSafeInteger(value) || value < PORT_SPEC.min || value > PORT_SPEC.max) {
+        ctx.addIssue(configIssuePayload(PORT_SPEC.key, rangeReason(PORT_SPEC, 'environment')));
+        return z.NEVER;
+      }
+      return value;
+    }),
+    logLevel: z.string().transform((value, ctx): LogLevelSetting => {
+      if (!isLogLevelSetting(value)) {
+        ctx.addIssue(configIssuePayload('DEBUGGEN_LOG_LEVEL', REASONS.unknownLogLevel));
+        return z.NEVER;
+      }
+      return value;
+    }),
+    retentionDays: z.number().transform((value, ctx) => {
+      if (
+        !Number.isSafeInteger(value) ||
+        value < RETENTION_SPEC.min ||
+        value > RETENTION_SPEC.max
+      ) {
+        ctx.addIssue(
+          configIssuePayload(RETENTION_SPEC.key, rangeReason(RETENTION_SPEC, 'environment')),
+        );
+        return z.NEVER;
+      }
+      return value;
+    }),
+    provider: z.string().transform((value, ctx): ProviderId => {
+      if (!isProviderId(value)) {
+        ctx.addIssue(configIssuePayload('DEBUGGEN_PROVIDER', REASONS.unknownProvider));
+        return z.NEVER;
+      }
+      return value;
+    }),
+    model: resolvedOptionalValueSchema('DEBUGGEN_MODEL'),
+    anthropicApiKey: resolvedOptionalValueSchema('ANTHROPIC_API_KEY'),
+    debuggenHome: resolvedPathSchema('DEBUGGEN_HOME'),
+    databasePath: resolvedPathSchema('DEBUGGEN_HOME'),
+    backupsDir: resolvedPathSchema('DEBUGGEN_HOME'),
+    indexCacheDir: resolvedPathSchema('DEBUGGEN_HOME'),
+    authFilePath: resolvedPathSchema('DEBUGGEN_HOME'),
+    promptsDir: resolvedPathSchema('DEBUGGEN_PROMPTS_DIR'),
+  })
+  .superRefine((config, ctx) => {
+    // Runs only once every field above validated, which is the library's
+    // default and the right one here: a field-level rejection means the
+    // candidate was assembled wrongly, and a cross-field clause about values
+    // that are not there yet would not help anyone. Both checks are still
+    // written defensively, because this schema is reachable from callers whose
+    // input no compiler vouched for.
+    const derived: readonly [string, string][] = [
+      [config.databasePath, SESSIONS_DATABASE_FILE_NAME],
+      [config.backupsDir, BACKUPS_DIRECTORY_NAME],
+      [config.indexCacheDir, INDEX_CACHE_DIRECTORY_NAME],
+      [config.authFilePath, AUTH_FILE_NAME],
+    ];
+
+    if (derived.some(([path, name]) => path !== joinPosix(config.debuggenHome, name))) {
+      ctx.addIssue({
+        ...configIssuePayload('DEBUGGEN_HOME', REASONS.derivedPathsDisagree),
+        path: ['DEBUGGEN_HOME'],
+      });
+    }
+
+    // The credential rule, and the reason this validation happens at start-up:
+    // a provider that reaches the network needs both a model and a credential,
+    // and the alternative to naming the missing key here is a session that
+    // fails after the question, after the code index and after the
+    // instrumentation plan.
+    const requirements = isProviderId(config.provider)
+      ? PROVIDER_REQUIREMENTS[config.provider]
+      : [];
+
+    for (const key of requirements) {
+      const rule = PROVIDER_REQUIREMENT_RULES[key];
+      if (!rule.isConfigured(config)) {
+        ctx.addIssue({ ...configIssuePayload(key, rule.reason), path: [key] });
+      }
+    }
+  });
+
+/** The type of {@link resolvedServiceConfigSchema}. */
+export type ResolvedServiceConfigSchema = typeof resolvedServiceConfigSchema;
 
 /* -------------------------------------------------------------------------------------------------
  * Loading
  * ---------------------------------------------------------------------------------------------- */
 
 /**
- * Records a failure and keeps the type concrete for the assembly step.
+ * The failure for an environment that was not a record of values at all.
  *
- * {@link loadServiceConfig} validates every setting before it assembles
- * anything, so it needs each resolver's value *and* each resolver's failure —
- * the failures to report together, the values to build from. This helper gives
- * it both without a cast and without an unreachable branch: a failure is
- * pushed onto the list and the key's own default stands in, and because a
- * non-empty list returns before assembly, **a substituted default is never
- * observed**.
- *
- * @typeParam T The setting's resolved type.
- * @param result The resolver's answer.
- * @param fallback The stand-in for a failed resolution; never observed.
- * @param issues The collector, in {@link SERVICE_ENV_KEYS} order.
- * @returns The resolved value, or `fallback` when the resolver failed.
+ * Unreachable from TypeScript — the parameter type says otherwise — and
+ * reachable from JavaScript, which is what the bundled service inside the
+ * editor extension ultimately is. It has no key to report against, so it is the
+ * one failure this module builds without one, and it still carries the same
+ * `details` shape every other failure does so a log consumer needs no special
+ * case.
  */
-function settle<T>(
-  result: Result<T, ServiceConfigIssue>,
-  fallback: T,
-  issues: ServiceConfigIssue[],
-): T {
-  if (isErr(result)) {
-    issues.push(result.error);
-    return fallback;
+
+/**
+ * A record with the named keys treated as unset.
+ *
+ * Used for the two things per-setting precedence needs. The first is
+ * supersession: a variable an override replaces is **not read**, so a stale
+ * `DEBUGGEN_PORT` in a shell cannot make a service unstartable when the host
+ * has already decided the port — which is what "precedence per setting" means,
+ * and what it meant before the contract became three schemas. The second is
+ * recovery: a rejected setting is blanked and the channel parsed again, so
+ * every *other* setting still resolves and the rules that need more than one
+ * value can report alongside the rejection instead of after it. The rejected
+ * setting has already been recorded by then, and a substituted default is never
+ * returned to a caller — a non-empty issue list is.
+ *
+ * @param source The record to copy.
+ * @param keys The keys to blank.
+ * @returns A copy with those keys `undefined`.
+ */
+function withoutKeys(
+  source: Readonly<Record<string, unknown>>,
+  keys: readonly string[],
+): Record<string, unknown> {
+  const copy: Record<string, unknown> = { ...source };
+  for (const key of keys) {
+    copy[key] = undefined;
   }
-  return result.value;
+  return copy;
+}
+
+/**
+ * The leading path segments of a failed parse, which name the fields to blank.
+ *
+ * @param zodIssues The issues from a failed parse.
+ * @returns The distinct string segments, in the order they were reported.
+ */
+function rejectedFields(zodIssues: readonly z.core.$ZodIssue[]): readonly string[] {
+  const names = zodIssues
+    .map((zodIssue) => zodIssue.path.at(0))
+    .filter((segment): segment is string => typeof segment === 'string');
+
+  return [...new Set(names)];
+}
+
+/**
+ * The failure for an environment that was not a record of values at all.
+ *
+ * @returns The `CONFIG_INVALID` error to return inside an `Err`.
+ */
+function environmentShapeError(): DebuggenError {
+  return new DebuggenError(
+    CONFIG_CODE,
+    'The local service configuration is invalid: the environment was not a record of values.',
+    {
+      hint:
+        'Pass the environment to loadServiceConfig as a record of string values, for instance ' +
+        'process.env after dotenv has populated it.',
+      details: { subsystem: SUBSYSTEM, keys: [], issues: [] },
+    },
+  );
+}
+
+/**
+ * Merges the two validated channels, expands `~` and derives the five
+ * `$DEBUGGEN_HOME` paths.
+ *
+ * The deterministic step between {@link serviceEnvSchema} and
+ * {@link resolvedServiceConfigSchema}: precedence per setting rather than per
+ * object — a host that overrides only the port still has every other variable
+ * read for it — the defaults, and the paths every subsystem reads instead of
+ * joining for itself.
+ *
+ * It decides nothing about acceptability. The only failure it can report is one
+ * that needs the expansion context rather than the value: a `~`-prefixed
+ * directory on a system whose home directory could not be determined.
+ *
+ * @param env The settings {@link serviceEnvSchema} produced.
+ * @param overrides The settings {@link serviceConfigOverridesSchema} produced.
+ * @returns The candidate configuration and any issue the expansion raised. The
+ * candidate is still unvalidated; {@link resolvedServiceConfigSchema} has the
+ * last word.
+ */
+function normaliseServiceSettings(
+  env: ServiceEnvSettings,
+  overrides: ServiceOverrideSettings,
+): {
+  readonly candidate: Readonly<Record<string, unknown>>;
+  readonly issues: ServiceConfigIssue[];
+} {
+  const issues: ServiceConfigIssue[] = [];
+  const homeDir = resolveHomeDirectory(overrides.homeDir);
+
+  const model = overrides.model ?? env.DEBUGGEN_MODEL;
+  const anthropicApiKey = overrides.anthropicApiKey ?? env.ANTHROPIC_API_KEY;
+
+  const homeResult = expandDirectorySetting(
+    'DEBUGGEN_HOME',
+    overrides.debuggenHome ?? env.DEBUGGEN_HOME ?? DEFAULT_DEBUGGEN_HOME,
+    homeDir,
+  );
+  const debuggenHome = isErr(homeResult) ? '' : homeResult.value;
+  if (isErr(homeResult)) {
+    issues.push(homeResult.error);
+  }
+
+  const configuredPrompts = overrides.promptsDir ?? env.DEBUGGEN_PROMPTS_DIR;
+  const promptsResult =
+    configuredPrompts === undefined
+      ? resolveDefaultPromptsDirectory()
+      : expandDirectorySetting('DEBUGGEN_PROMPTS_DIR', configuredPrompts, homeDir);
+  const promptsDir = isErr(promptsResult) ? '' : promptsResult.value;
+  if (isErr(promptsResult)) {
+    issues.push(promptsResult.error);
+  }
+
+  return {
+    candidate: {
+      host: overrides.host ?? env.DEBUGGEN_HOST ?? DEFAULT_HOST,
+      port: overrides.port ?? env.DEBUGGEN_PORT ?? DEFAULT_PORT,
+      logLevel: overrides.logLevel ?? env.DEBUGGEN_LOG_LEVEL ?? DEFAULT_LOG_LEVEL,
+      retentionDays:
+        overrides.retentionDays ?? env.DEBUGGEN_RETENTION_DAYS ?? DEFAULT_RETENTION_DAYS,
+      provider: overrides.provider ?? env.DEBUGGEN_PROVIDER ?? DEFAULT_PROVIDER_ID,
+      // Spread rather than assigned, so an unconfigured model or credential is
+      // absent from the resolved configuration instead of present as
+      // `undefined` — the distinction `exactOptionalPropertyTypes` keeps and
+      // `toModelProviderOverrides` reads.
+      ...(model === undefined ? {} : { model }),
+      ...(anthropicApiKey === undefined ? {} : { anthropicApiKey }),
+      debuggenHome,
+      databasePath: joinPosix(debuggenHome, SESSIONS_DATABASE_FILE_NAME),
+      backupsDir: joinPosix(debuggenHome, BACKUPS_DIRECTORY_NAME),
+      indexCacheDir: joinPosix(debuggenHome, INDEX_CACHE_DIRECTORY_NAME),
+      authFilePath: joinPosix(debuggenHome, AUTH_FILE_NAME),
+      promptsDir,
+    },
+    issues,
+  };
 }
 
 /**
  * Reads, validates and resolves the whole configuration surface.
  *
- * The one entry point of this module. `env` is **required and injected**:
- * nothing here reads `process.env`, so `src/main.ts` passes it in after
- * `dotenv` has populated it, a suite passes a literal, and the two paths are
- * the same code. Precedence is per setting, not per object — a host that
- * overrides only the port still has every other variable read for it.
+ * The one entry point of this module, and the composition of the three schemas
+ * with the normalisation between them:
  *
- * Every setting is resolved before anything is reported, so the returned
- * failure carries **all** of the problems rather than the first one. On
- * success the five `$DEBUGGEN_HOME` paths are derived from the validated root,
- * which is why no other module joins them: `sessions.sqlite`, `backups/`,
- * `index/` and `auth.json` have one spelling, and the retention sweep, the
- * store, the backup writer and the credential writer all read it from here.
+ * 1. {@link serviceEnvSchema} validates the nine variables,
+ *    {@link serviceConfigOverridesSchema} the host's own values, and **both are
+ *    parsed before anything is reported**, so the returned failure carries
+ *    every problem rather than the first one — a developer editing a `.env`
+ *    file fixes it once instead of once per start-up attempt.
+ * 2. {@link normaliseServiceSettings} merges them per setting, expands `~`
+ *    against the injectable home directory, applies the defaults and derives
+ *    the five `$DEBUGGEN_HOME` paths. This is why no other module joins them:
+ *    `sessions.sqlite`, `backups/`, `index/` and `auth.json` have one spelling,
+ *    and the store, the patcher, the retention sweep and the credential writer
+ *    all read it from here.
+ * 3. {@link resolvedServiceConfigSchema} has the last word on the result,
+ *    including the two rules that need more than one value: the loopback bind
+ *    and the settings the selected provider requires.
+ *
+ * `env` is **required and injected**: nothing here reads `process.env`, so
+ * `src/main.ts` passes it in after `dotenv` has populated it, a suite passes a
+ * literal, and the two paths are the same code.
  *
  * Pure: it creates no directory, opens no file and starts nothing.
  * `src/main.ts` creates the state root `0700` from
- * {@link ServiceConfig.debuggenHome} after this returns.
+ * {@link ServiceConfig.debuggenHome} after this returns. The result is frozen,
+ * so a subsystem cannot retune shared configuration by assigning to it.
  *
  * @param env The environment to read. Only the nine keys of
  * {@link SERVICE_ENV_KEYS} are consulted.
@@ -1161,94 +2256,98 @@ export function loadServiceConfig(
   env: Readonly<Record<string, string | undefined>>,
   overrides?: ServiceConfigOverrides,
 ): Result<ServiceConfig, DebuggenError> {
-  const issues: ServiceConfigIssue[] = [];
-  const homeDir = resolveHomeDirectory(overrides?.homeDir);
+  if (typeof env !== 'object' || env === null) {
+    return err(environmentShapeError());
+  }
 
-  // Resolved in SERVICE_ENV_KEYS order, so an aggregated failure lists its
-  // keys in the order `.env.example` declares them.
-  const anthropicApiKey =
-    normaliseSetting(overrides?.anthropicApiKey) ?? readSetting(env, 'ANTHROPIC_API_KEY');
+  // The host's own values are parsed first, because they decide which
+  // variables are read at all. A rejected field is recorded and then blanked
+  // for a second parse, so one bad override does not stop every other setting
+  // from resolving — and the copy means nothing here reaches the caller's own
+  // object.
+  const overridesInput: Readonly<Record<string, unknown>> = { ...overrides };
+  const firstOverridePass = serviceConfigOverridesSchema.safeParse(overridesInput);
+  const overrideIssues = firstOverridePass.success
+    ? []
+    : toServiceConfigIssues(
+        firstOverridePass.error.issues,
+        overrideFieldKey,
+        REASONS.unexpectedOverrideType,
+      );
+  const overridePass = firstOverridePass.success
+    ? firstOverridePass
+    : serviceConfigOverridesSchema.safeParse(
+        withoutKeys(overridesInput, rejectedFields(firstOverridePass.error.issues)),
+      );
 
-  const provider = settle(
-    resolveProvider(readSetting(env, 'DEBUGGEN_PROVIDER'), overrides?.provider),
-    DEFAULT_PROVIDER_ID,
-    issues,
+  // Per-setting precedence: a variable an override supersedes is not read, so
+  // a stale one cannot make the service unstartable — and cannot be rejected.
+  const superseded = overridePass.success
+    ? OVERRIDE_FIELD_NAMES.filter(
+        (field) => OVERRIDE_FIELDS[field].supersedes && overridePass.data[field] !== undefined,
+      ).map((field) => OVERRIDE_FIELDS[field].key)
+    : [];
+  const effectiveEnv = withoutKeys(env, superseded);
+
+  const firstEnvPass = serviceEnvSchema.safeParse(effectiveEnv);
+  const envIssues = firstEnvPass.success
+    ? []
+    : toServiceConfigIssues(firstEnvPass.error.issues, environmentFieldKey, REASONS.unexpectedType);
+  const envPass = firstEnvPass.success
+    ? firstEnvPass
+    : serviceEnvSchema.safeParse(
+        withoutKeys(effectiveEnv, rejectedFields(firstEnvPass.error.issues)),
+      );
+
+  if (!envPass.success || !overridePass.success) {
+    // Every rejected setting has been blanked by now, so a parse that still
+    // fails did so for a reason with no key to name.
+    const rawIssues = [...envIssues, ...overrideIssues];
+    return err(rawIssues.length > 0 ? configError(rawIssues) : environmentShapeError());
+  }
+
+  const normalised = normaliseServiceSettings(envPass.data, overridePass.data);
+  const resolved = resolvedServiceConfigSchema.safeParse(normalised.candidate);
+
+  // A key already reported is not reported twice: a rejected setting stood
+  // down to its default for this pass, and an unexpandable `~` left its
+  // setting empty, either of which the resolved schema would object to a
+  // second time — and a developer reading two clauses about one variable
+  // learns nothing from the second.
+  const alreadyReported = new Set(
+    [...envIssues, ...overrideIssues, ...normalised.issues].map((entry) => entry.key),
   );
+  const resolvedIssues = resolved.success
+    ? []
+    : toServiceConfigIssues(
+        resolved.error.issues,
+        environmentFieldKey,
+        REASONS.unnormalisedPath,
+      ).filter((entry) => !alreadyReported.has(entry.key));
 
-  const model = normaliseSetting(overrides?.model) ?? readSetting(env, 'DEBUGGEN_MODEL');
-
-  const host = settle(
-    resolveHost(readSetting(env, 'DEBUGGEN_HOST'), overrides?.host),
-    DEFAULT_HOST,
-    issues,
-  );
-
-  const port = settle(
-    resolveIntegerSetting(readSetting(env, 'DEBUGGEN_PORT'), overrides?.port, PORT_SPEC),
-    DEFAULT_PORT,
-    issues,
-  );
-
-  const debuggenHome = settle(
-    resolveDirectorySetting(
-      'DEBUGGEN_HOME',
-      normaliseSetting(overrides?.debuggenHome) ??
-        readSetting(env, 'DEBUGGEN_HOME') ??
-        DEFAULT_DEBUGGEN_HOME,
-      homeDir,
-      HOME_HINT,
-    ),
-    '',
-    issues,
-  );
-
-  const logLevel = settle(
-    resolveLogLevel(readSetting(env, 'DEBUGGEN_LOG_LEVEL'), overrides?.logLevel),
-    DEFAULT_LOG_LEVEL,
-    issues,
-  );
-
-  const retentionDays = settle(
-    resolveIntegerSetting(
-      readSetting(env, 'DEBUGGEN_RETENTION_DAYS'),
-      overrides?.retentionDays,
-      RETENTION_SPEC,
-    ),
-    DEFAULT_RETENTION_DAYS,
-    issues,
-  );
-
-  const promptsDir = settle(
-    resolvePromptsDirectory(
-      readSetting(env, 'DEBUGGEN_PROMPTS_DIR'),
-      overrides?.promptsDir,
-      homeDir,
-    ),
-    '',
-    issues,
-  );
-
+  const issues = [...envIssues, ...overrideIssues, ...normalised.issues, ...resolvedIssues];
   if (issues.length > 0) {
     return err(configError(issues));
   }
+  if (!resolved.success) {
+    return err(environmentShapeError());
+  }
 
-  // Derived only once every setting has been validated, so the paths below are
-  // always built from a real absolute root.
-  return ok({
-    host,
-    port,
-    logLevel,
-    retentionDays,
-    provider,
-    ...(model === undefined ? {} : { model }),
-    ...(anthropicApiKey === undefined ? {} : { anthropicApiKey }),
-    debuggenHome,
-    databasePath: joinPosix(debuggenHome, SESSIONS_DATABASE_FILE_NAME),
-    backupsDir: joinPosix(debuggenHome, BACKUPS_DIRECTORY_NAME),
-    indexCacheDir: joinPosix(debuggenHome, INDEX_CACHE_DIRECTORY_NAME),
-    authFilePath: joinPosix(debuggenHome, AUTH_FILE_NAME),
-    promptsDir,
-  });
+  // Reassembled with the two optional members spread in only when they have a
+  // value: the validated object already omits an unconfigured one at run time,
+  // and the spread is what carries that fact into the type, which
+  // `exactOptionalPropertyTypes` distinguishes and `toModelProviderOverrides`
+  // reads. Frozen because every subsystem shares this object: a value read at
+  // start-up is the value in force at the end of the session.
+  const { model, anthropicApiKey, ...rest } = resolved.data;
+
+  return ok(
+    Object.freeze({
+      ...rest,
+      ...(model === undefined ? {} : { model }),
+      ...(anthropicApiKey === undefined ? {} : { anthropicApiKey }),
+    }),
+  );
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -1256,27 +2355,32 @@ export function loadServiceConfig(
  * ---------------------------------------------------------------------------------------------- */
 
 /**
- * The environment contract in machine-readable form, with
- * {@link loadServiceConfig} as its `safeParse`.
+ * The environment contract in machine-readable form, with the three schemas
+ * that enforce it and {@link loadServiceConfig} as its `safeParse`.
  *
  * Frozen, and every descriptor with it: this object is shared by the
  * documentation checks and by anything that enumerates the surface, and a
  * mutation would make one reader disagree with the loader.
  *
- * It is a descriptor object rather than a validation-library schema, for the
- * reason given in this module's overview — this workspace declares no schema
- * library, and configuration is the one contract no `@debuggen/*` package
- * owns.
+ * The descriptors describe; they do not validate. Validation lives in
+ * {@link serviceEnvSchema}, {@link serviceConfigOverridesSchema} and
+ * {@link resolvedServiceConfigSchema}, which are reachable here as `env`,
+ * `overrides` and `resolved` as well as under their own exported names — one
+ * object for a reader who wants the whole contract, and direct exports for a
+ * caller who wants one schema.
  */
 export const serviceConfigSchema: ServiceConfigSchema = Object.freeze({
   keys: SERVICE_ENV_KEYS,
+  env: serviceEnvSchema,
+  overrides: serviceConfigOverridesSchema,
+  resolved: resolvedServiceConfigSchema,
   entries: Object.freeze({
     ANTHROPIC_API_KEY: Object.freeze({
       key: 'ANTHROPIC_API_KEY',
       kind: 'credential',
       secret: true,
       description:
-        'Credential for the network-backed model provider. Needed only when that provider is selected; the requirement itself is enforced by @debuggen/model-provider.',
+        'Credential for the network-backed model provider. Required when that provider is selected, and validated here at start-up so a missing one is named before a session begins; @debuggen/model-provider enforces the same rule when it constructs the provider.',
     }),
     DEBUGGEN_PROVIDER: Object.freeze({
       key: 'DEBUGGEN_PROVIDER',
@@ -1292,7 +2396,7 @@ export const serviceConfigSchema: ServiceConfigSchema = Object.freeze({
       kind: 'string',
       secret: false,
       description:
-        'The model id a session calls. Never defaulted anywhere in the product: a session records the model it used, and a substituted default would make that record untrue.',
+        'The model id a session calls. Never defaulted anywhere in the product: a session records the model it used, and a substituted default would make that record untrue. Required alongside the credential when a network-backed provider is selected.',
     }),
     DEBUGGEN_HOST: Object.freeze({
       key: 'DEBUGGEN_HOST',
@@ -1300,7 +2404,7 @@ export const serviceConfigSchema: ServiceConfigSchema = Object.freeze({
       secret: false,
       defaultValue: DEFAULT_HOST,
       description:
-        'The interface the HTTP and WebSocket surfaces bind. Loopback by default, which is the access boundary the authentication rules assume.',
+        'The interface the HTTP and WebSocket surfaces bind. A loopback interface only - the name localhost, any address in 127.0.0.0/8, or the IPv6 loopback address - because reachability from this machine alone is the access boundary the authentication and Origin rules rest on.',
     }),
     DEBUGGEN_PORT: Object.freeze({
       key: 'DEBUGGEN_PORT',
@@ -1353,13 +2457,16 @@ export const serviceConfigSchema: ServiceConfigSchema = Object.freeze({
 /**
  * The provider settings, shaped for `@debuggen/model-provider`.
  *
- * Transport, not decision. Whether the selected provider is *usable* — a
- * network provider needs both a model and a credential — belongs to that
- * package's `resolveProviderConfig` / `createModelProvider`, which own the
- * developer-facing sentence for an unusable one. This function exists so that
- * `src/main.ts` can hand them the values this module already validated instead
- * of letting them read the environment a second time, which is what would let
- * the two readings disagree.
+ * Transport, not decision — but transport of values already known to be
+ * usable. Whether a selection is usable is settled twice, on purpose: by
+ * {@link resolvedServiceConfigSchema} at start-up, against
+ * {@link PROVIDER_REQUIREMENTS}, so a missing model or credential is named
+ * before a session begins; and again by that package's
+ * `resolveProviderConfig` / `createModelProvider`, which own the same rule for
+ * hosts that assemble a configuration without this module. This function
+ * exists so that `src/main.ts` can hand them the values this module already
+ * validated instead of letting them read the environment a second time, which
+ * is what would let the two readings disagree.
  *
  * Absent members are omitted rather than passed as `undefined`, because the
  * receiving type distinguishes the two under `exactOptionalPropertyTypes` and

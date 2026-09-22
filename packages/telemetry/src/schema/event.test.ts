@@ -79,10 +79,32 @@
  *   keeps knowledge of the demo application out of `packages/**` (AAP §0.5.4),
  *   and a test fixture is no place to start leaking it.
  *
- * Hermetic by construction: no network, no filesystem, no timers, no fake
- * clock. The only non-determinism is identifier generation, which is the point
- * of using it.
+ * ## The one thing this suite reads from disk
+ *
+ * Every case above is built in memory; the section at the end of the file is
+ * the deliberate exception. Three curated corpora are committed under
+ * `../../test/fixtures/` — `event-ingress-batch.json` (one capture's producer
+ * events, browser and server alike), `event-persisted-batch.json` (the same
+ * events as the store holds them, attributed) and `event-invalid-cases.json`
+ * (an object of named producer bugs) — and a corpus with no executable
+ * consumer is not evidence of anything: it can drift from the schema, lose a
+ * case or contradict its own file name and nothing fails. So they are read
+ * synchronously at module load and driven through both schemas, both parsers
+ * and both guards, with their sizes and their case names pinned here, so a
+ * corpus that shrinks fails this suite instead of quietly narrowing the
+ * coverage its other readers assume.
+ *
+ * That read is the *only* filesystem access, and what it reads is
+ * version-controlled repository data — identical on this machine, on a
+ * developer's and in CI — never captured telemetry, an ambient path or
+ * anything a clock or a network could change. Otherwise hermetic by
+ * construction: no network, no timers, no fake clock. The only
+ * non-determinism is identifier generation, which is the point of using it.
  */
+
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it } from 'vitest';
 
@@ -2218,4 +2240,551 @@ describe('the value vocabularies', () => {
       }
     }
   });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The committed corpora (`../../test/fixtures/event-*.json`)
+ *
+ * Everything above proves the schemas against inputs this file authored. That
+ * is the right way to reach an edge case, and the wrong way to establish that
+ * the samples the rest of the repository ships are still the shape those
+ * schemas accept: three JSON corpora are committed under
+ * `packages/telemetry/test/fixtures/`, they are the curated redacted samples
+ * AAP §0.9.1 ships as part of this package, and a corpus nothing executes is a document
+ * rather than evidence.
+ *
+ * What the three files are, and the question each answers here:
+ *
+ * - `event-ingress-batch.json` — one capture's worth of producer events across
+ *   both producers of AAP §0.2.3 (a browser agent and a Node preload) and all
+ *   three tiers, carrying every `source.resolvedBy` route the product
+ *   implements and the `redacted` marker the privacy layer leaves behind. Does
+ *   the producer contract still accept what a producer sends, field for field?
+ * - `event-persisted-batch.json` — the same events, in the same order, as the
+ *   store holds them after attribution. Is the difference between a batch and
+ *   its stored form *exactly* the three fields the service assigns?
+ * - `event-invalid-cases.json` — an object of named producer bugs, each name a
+ *   claim about why the event is invalid. Is every one of them still rejected,
+ *   and still rejected *for the reason its name states*?
+ *
+ * Two mechanical properties are asserted on top of the per-event ones, both
+ * aimed at silent shrinkage rather than at the schemas: the size of each
+ * corpus is pinned, and the invalid corpus' case names are compared as an
+ * exact ordered set against the table that drives them. A fixture that loses a
+ * case therefore fails here instead of reducing this suite to whatever
+ * survived.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * The directory the three corpora live in, resolved from this module's own
+ * location so the suite behaves identically whether Vitest is invoked on this
+ * file, on the package or on the repository root.
+ *
+ * The resolution is `fileURLToPath` **then** `join`, deliberately not
+ * `new URL('../../test/fixtures/x.json', import.meta.url)` — the tidier
+ * one-liner that `../../tsconfig.json` suggests in prose, and that does not
+ * work here: the `telemetry` project runs under happy-dom, whose global `URL`
+ * resolves a relative specifier against the document's origin instead of
+ * against the `file:` base it was handed, and `readFileSync` then fails with
+ * "The URL must be of scheme file". Converting the module URL to a path first
+ * makes the rest pure path arithmetic, independent of the DOM environment —
+ * the same reasoning, and the same shape, as `../redaction/rules.test.ts` and
+ * `./attributes.test.ts`.
+ *
+ * The corpora are *read*, never `import`ed. This package's `tsconfig.json`
+ * sets `rootDir` to `src` and excludes `test/**`, so a JSON import would not
+ * compile from here; more importantly it would hand the suite a literal typed
+ * by the fixture, and a fixture checked against a type derived from itself
+ * proves nothing. Read as text and parsed as `unknown`, every field below is
+ * vouched for by the schema or by a guard in this file.
+ */
+const FIXTURES_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'test', 'fixtures');
+
+/**
+ * The parsed contents of one committed corpus.
+ *
+ * Both failure modes throw with the resolved path in the message, because both
+ * mean the corpus is gone rather than that the schema is wrong: a suite that
+ * answered an unreadable file with an empty case list would pass while the
+ * evidence it exists to drive had been deleted or moved.
+ *
+ * @param fileName The corpus file name, relative to {@link FIXTURES_DIR}.
+ * @returns Its parsed JSON, untyped — nothing has vouched for it yet.
+ */
+function readFixture(fileName: string): unknown {
+  const fixturePath = join(FIXTURES_DIR, fileName);
+  let text: string;
+
+  try {
+    text = readFileSync(fixturePath, 'utf8');
+  } catch (cause) {
+    throw new Error(
+      `the committed corpus ${fileName} could not be read at ${fixturePath}. It is the evidence ` +
+        'the cases below drive; if it has moved, point this suite at its new location rather ' +
+        'than dropping the cases.',
+      { cause },
+    );
+  }
+
+  try {
+    // Annotated rather than asserted: `JSON.parse` is typed `any`, and the
+    // annotation is what stops that `any` from spreading into the corpus
+    // handling below. The guards in this file take it from there.
+    const parsed: unknown = JSON.parse(text);
+
+    return parsed;
+  } catch (cause) {
+    throw new Error(`the committed corpus ${fileName} at ${fixturePath} is not valid JSON.`, {
+      cause,
+    });
+  }
+}
+
+/**
+ * Whether a value is a plain object, so its members can be reached as
+ * `unknown`.
+ *
+ * The object counterpart of {@link isRecordArray}, and written for the same
+ * reason: it is what lets the named corpus be indexed without a type
+ * assertion, keeping every case that reaches a schema an unvouched-for value.
+ *
+ * @param value Any value, typically a parsed corpus.
+ * @returns `true` for a non-null, non-array object.
+ */
+function isRecordOfUnknown(value: unknown): value is Readonly<Record<string, unknown>> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * One corpus as a list of candidate events.
+ *
+ * @param fileName The corpus file name.
+ * @returns Its elements, each an untyped {@link Candidate} bag.
+ */
+function readEventBatch(fileName: string): readonly Candidate[] {
+  const parsed = readFixture(fileName);
+
+  if (!isRecordArray(parsed)) {
+    throw new Error(`the committed corpus ${fileName} must hold an array of event objects.`);
+  }
+
+  return parsed;
+}
+
+/**
+ * The named-case corpus as a record of candidates.
+ *
+ * @param fileName The corpus file name.
+ * @returns Its cases, keyed by the name each one claims.
+ */
+function readNamedCases(fileName: string): Readonly<Record<string, unknown>> {
+  const parsed = readFixture(fileName);
+
+  if (!isRecordOfUnknown(parsed)) {
+    throw new Error(`the committed corpus ${fileName} must hold an object of named cases.`);
+  }
+
+  return parsed;
+}
+
+/** One capture's producer events, as the browser agent and the preload send them. */
+const INGRESS_BATCH = readEventBatch('event-ingress-batch.json');
+
+/** The same events as the store holds them, after attribution at ingest. */
+const PERSISTED_BATCH = readEventBatch('event-persisted-batch.json');
+
+/** The named producer bugs, keyed by the reason each name claims. */
+const INVALID_CASES = readNamedCases('event-invalid-cases.json');
+
+/**
+ * How many events each valid corpus holds.
+ *
+ * Written here as a number rather than derived from the file, so that removing
+ * an event from either corpus is a failing assertion instead of a quietly
+ * smaller loop. The two corpora are the same batch before and after
+ * attribution, so one constant governs both.
+ */
+const BATCH_SIZE = 10;
+
+/**
+ * How many named cases the invalid corpus holds.
+ *
+ * Pinned for the same reason, and checked twice over: against the file's key
+ * count and against the length of {@link INVALID_FIXTURE_CASES}, which is what
+ * makes "the table drives every case in the file" an assertion rather than an
+ * assumption.
+ */
+const INVALID_CASE_COUNT = 11;
+
+/**
+ * The event at `index`, or a failure naming the corpus.
+ *
+ * `noUncheckedIndexedAccess` is in force, so an indexed read is
+ * possibly-undefined; narrowing it by throwing keeps the comparison loops free
+ * of optional chaining that would silently skip a missing event — which is
+ * precisely the drift being guarded.
+ *
+ * @param batch The corpus to read from.
+ * @param index The position to read.
+ * @param corpus The file name, for the failure message.
+ * @returns The event at that position.
+ */
+function eventAt(batch: readonly Candidate[], index: number, corpus: string): Candidate {
+  const event = batch[index];
+
+  if (event === undefined) {
+    throw new Error(`${corpus} holds no event at index ${String(index)}`);
+  }
+
+  return event;
+}
+
+/**
+ * The named case `name`, or a failure naming the corpus.
+ *
+ * Returns `unknown`: an invalid case must reach the schemas with nothing having
+ * vouched for it, which is the same rule {@link Candidate} enforces for the
+ * hand-built cases above.
+ *
+ * @param name The case name the table asks for.
+ * @returns That case's value, untyped.
+ */
+function invalidCase(name: string): unknown {
+  if (!Object.hasOwn(INVALID_CASES, name)) {
+    throw new Error(
+      `event-invalid-cases.json no longer holds a case named "${name}". The case is what the ` +
+        'assertion below is about; restore it in the corpus rather than removing the row.',
+    );
+  }
+
+  return INVALID_CASES[name];
+}
+
+/**
+ * One named case of the invalid corpus, with the issue each schema must report
+ * for it.
+ *
+ * The two issue members are what turns "it was rejected" into "it was rejected
+ * for the reason its name claims": a `traceIdTooShort` case that happened to
+ * fail on `status` would still be a rejection and would still be worthless as
+ * coverage of the trace-id format.
+ */
+interface InvalidFixtureCase {
+  /** The key the case is stored under, and the claim its name makes. */
+  readonly name: string;
+  /** What is wrong with the event, for the failure message. */
+  readonly reason: string;
+  /** The issue the ingress rejection must report. */
+  readonly ingressIssue: ReportedIssue;
+  /**
+   * The issue the persisted rejection must report.
+   *
+   * The same issue as `ingressIssue` wherever the defect is in a field both
+   * schemas declare and a *field* schema is what reports it. Two rows differ,
+   * for two different measured reasons, and each says so in its own comment:
+   * `ingressCarriesSessionId` (the defect is legal in the persisted shape) and
+   * `tierNotAllowedForKind` (the cross-field check never runs, because every
+   * case in this corpus is ingress-shaped and therefore already has field
+   * issues under the persisted schema).
+   */
+  readonly persistedIssue: ReportedIssue;
+}
+
+/**
+ * The eleven named cases, each with the issue its name commits the schemas to
+ * reporting.
+ *
+ * Order matters: the ordered key comparison below is what catches a case being
+ * renamed, reordered or replaced rather than merely removed.
+ */
+const INVALID_FIXTURE_CASES: readonly InvalidFixtureCase[] = [
+  {
+    name: 'traceIdTooShort',
+    reason: 'a 31-character traceId, one hex digit short of a W3C trace id',
+    ingressIssue: { path: 'traceId', code: 'invalid_format' },
+    persistedIssue: { path: 'traceId', code: 'invalid_format' },
+  },
+  {
+    name: 'spanIdWrongLength',
+    reason: 'a 15-character spanId',
+    ingressIssue: { path: 'spanId', code: 'invalid_format' },
+    persistedIssue: { path: 'spanId', code: 'invalid_format' },
+  },
+  {
+    name: 'startTimeRelativePerformanceNow',
+    reason: 'a relative performance.now() reading where epoch milliseconds belong',
+    ingressIssue: { path: 'startTime', code: 'too_small' },
+    persistedIssue: { path: 'startTime', code: 'too_small' },
+  },
+  {
+    name: 'startTimeSeconds',
+    reason: 'a seconds-precision epoch value, a thousand times too small',
+    ingressIssue: { path: 'startTime', code: 'too_small' },
+    persistedIssue: { path: 'startTime', code: 'too_small' },
+  },
+  {
+    name: 'unknownKind',
+    reason: 'a kind outside the seventeen the vocabulary declares',
+    ingressIssue: { path: 'kind', code: 'invalid_value' },
+    persistedIssue: { path: 'kind', code: 'invalid_value' },
+  },
+  {
+    name: 'tierNotAllowedForKind',
+    reason: 'a render reported on the database tier',
+    // The cross-field check, and the one case here whose issue no field schema
+    // could produce: both values are vocabulary members, only the pair is
+    // wrong. Reported on `tier` as a `custom` issue, because the tier is what a
+    // producer can fix.
+    ingressIssue: { path: 'tier', code: 'custom' },
+    // Measured, and worth stating rather than working around: zod runs an
+    // object's `.check()` only once its fields have parsed without issues, and
+    // this case — like every case in an ingress-shaped corpus — is already
+    // missing the attribution under the persisted schema. So the persisted
+    // refusal is about the attribution and the kind/tier check never runs. The
+    // persisted half of that check is covered from an attributed event by
+    // "applies the same rule to a persisted event" above; asserting a `tier`
+    // issue here would assert behaviour the validator does not have.
+    persistedIssue: { path: 'captureId', code: 'invalid_type' },
+  },
+  {
+    name: 'unknownStatus',
+    reason: "the OpenTelemetry spelling 'OK' instead of this schema's 'ok'",
+    ingressIssue: { path: 'status', code: 'invalid_value' },
+    persistedIssue: { path: 'status', code: 'invalid_value' },
+  },
+  {
+    name: 'negativeDuration',
+    reason: 'a negative duration, which no clock produces',
+    ingressIssue: { path: 'duration', code: 'too_small' },
+    persistedIssue: { path: 'duration', code: 'too_small' },
+  },
+  {
+    name: 'unknownExtraField',
+    reason: 'an extra top-level key both schemas are strict about',
+    ingressIssue: { path: '', code: 'unrecognized_keys' },
+    persistedIssue: { path: '', code: 'unrecognized_keys' },
+  },
+  {
+    name: 'ingressCarriesSessionId',
+    reason: 'a producer supplying the attribution the service assigns',
+    ingressIssue: { path: '', code: 'unrecognized_keys' },
+    // The asymmetric row. A `sessionId` is legal in the persisted shape, so the
+    // persisted schema cannot object to it; what it objects to is the rest of
+    // the attribution still being absent. Asserting the missing `captureId`
+    // here keeps the row honest about *why* each schema refuses the value
+    // instead of pretending the two refusals are the same one.
+    persistedIssue: { path: 'captureId', code: 'invalid_type' },
+  },
+  {
+    name: 'missingProducerId',
+    reason: 'no producerId, so no producer to attribute the event to',
+    ingressIssue: { path: 'producerId', code: 'invalid_type' },
+    persistedIssue: { path: 'producerId', code: 'invalid_type' },
+  },
+];
+
+describe('the committed ingress corpus', () => {
+  it('holds one capture of producer events, all distinct', () => {
+    expect(INGRESS_BATCH).toHaveLength(BATCH_SIZE);
+    expect(new Set(INGRESS_BATCH.map((event) => event['id'])).size).toBe(BATCH_SIZE);
+  });
+
+  it('covers both producers and all three tiers', () => {
+    // What makes this corpus worth driving rather than one more single event:
+    // it is the cross-process, cross-tier batch of AAP 0.2.3, and a schema that
+    // only ever saw browser events would not be shown to accept a `db.query`
+    // on the `db` tier from a different producer in the same trace.
+    expect(new Set(INGRESS_BATCH.map((event) => event['producerId'])).size).toBe(2);
+    expect(new Set(INGRESS_BATCH.map((event) => event['tier']))).toEqual(
+      new Set(['browser', 'server', 'db']),
+    );
+  });
+
+  it.each(INGRESS_BATCH)(
+    'accepts the $kind event $id through every ingress entry point, unchanged',
+    (event: Candidate) => {
+      expect(telemetryEventIngressSchema.safeParse(event).success).toBe(true);
+      expect(isTelemetryEventIngress(event)).toBe(true);
+
+      const parsed = okValue(parseTelemetryEventIngress(event));
+
+      // The round trip: no `.transform()`, no `.coerce`, no `.default()`
+      // anywhere in `./event.ts`, so what comes out is what the corpus holds —
+      // including the sub-millisecond `startTime`, the nested `attributes` bag
+      // and the optional `parentSpanId`/`source`/`redacted` where the event
+      // carries them. The key-set comparison is what *names* a field that
+      // appeared or vanished; deep equality alone would print two whole events
+      // and leave the reader to spot the difference.
+      expect(parsed).toStrictEqual(event);
+      expect(Object.keys(parsed).sort()).toEqual(Object.keys(event).sort());
+    },
+  );
+
+  it.each(INGRESS_BATCH)(
+    'refuses the $kind event $id as a persisted event, for want of attribution',
+    (event: Candidate) => {
+      // The ingress/persisted split of AAP 0.2.3 seen from the store's side: an
+      // event straight off the wire is not a row, and the persisted schema says
+      // so by naming each of the three fields ingest has yet to assign.
+      const issues = expectPersistedRejected(event);
+
+      expect(pathsOf(issues)).toEqual(expect.arrayContaining([...ATTRIBUTION_FIELDS]));
+
+      for (const field of ATTRIBUTION_FIELDS) {
+        expect(issues).toContainEqual({ path: field, code: 'invalid_type' });
+      }
+    },
+  );
+});
+
+describe('the committed persisted corpus', () => {
+  it('holds the attributed counterpart of one capture', () => {
+    expect(PERSISTED_BATCH).toHaveLength(BATCH_SIZE);
+    expect(new Set(PERSISTED_BATCH.map((event) => event['id'])).size).toBe(BATCH_SIZE);
+  });
+
+  it.each(PERSISTED_BATCH)(
+    'accepts the attributed $kind event $id through every persisted entry point, unchanged',
+    (event: Candidate) => {
+      expect(telemetryEventSchema.safeParse(event).success).toBe(true);
+      expect(isTelemetryEvent(event)).toBe(true);
+
+      const parsed = okValue(parseTelemetryEvent(event));
+
+      expect(parsed).toStrictEqual(event);
+      expect(Object.keys(parsed).sort()).toEqual(Object.keys(event).sort());
+    },
+  );
+
+  it.each(PERSISTED_BATCH)(
+    'refuses the attributed $kind event $id as producer output',
+    (event: Candidate) => {
+      // The other direction, and the reason the ingress schema is strict: a row
+      // read back out of the store is not something a producer may send, so a
+      // component that validates with the wrong schema is caught rather than
+      // silently stripping the attribution it was handed.
+      const issues = expectIngressRejected(event);
+
+      expect(issues).toContainEqual({ path: '', code: 'unrecognized_keys' });
+    },
+  );
+});
+
+describe('the two corpora are one batch before and after attribution', () => {
+  it('carries the same events in the same order', () => {
+    // Order is part of the claim: `seq` is per-producer and `ingestSeq` is the
+    // store's arrival number, so a corpus whose two halves had drifted out of
+    // step would still parse and would still make every per-event assertion
+    // above pass, while the attribution comparison below compared unrelated
+    // events.
+    expect(PERSISTED_BATCH).toHaveLength(INGRESS_BATCH.length);
+
+    for (let index = 0; index < BATCH_SIZE; index += 1) {
+      const producerEvent = eventAt(INGRESS_BATCH, index, 'event-ingress-batch.json');
+      const storedEvent = eventAt(PERSISTED_BATCH, index, 'event-persisted-batch.json');
+
+      expect(storedEvent['id'], `the corpora disagree at index ${String(index)}`).toBe(
+        producerEvent['id'],
+      );
+    }
+  });
+
+  it('adds exactly the three attribution fields, and alters nothing else', () => {
+    for (let index = 0; index < BATCH_SIZE; index += 1) {
+      const producerEvent = eventAt(INGRESS_BATCH, index, 'event-ingress-batch.json');
+      const storedEvent = eventAt(PERSISTED_BATCH, index, 'event-persisted-batch.json');
+      const label = `event ${String(producerEvent['id'])} at index ${String(index)}`;
+
+      const added = Object.keys(storedEvent).filter((key) => !Object.hasOwn(producerEvent, key));
+      const removed = Object.keys(producerEvent).filter((key) => !Object.hasOwn(storedEvent, key));
+
+      expect(added.sort(), `${label} gained the wrong fields at ingest`).toEqual(
+        [...ATTRIBUTION_FIELDS].sort(),
+      );
+      expect(removed, `${label} lost fields at ingest`).toEqual([]);
+
+      // AAP 0.2.3: attribution adds, it does not normalise. Every value the
+      // producer observed — the sub-millisecond `startTime`, the nested
+      // `attributes` bag, the embedded `source`, the `redacted` list — must
+      // survive byte for byte, because the panel reads the stored copy.
+      for (const [key, value] of Object.entries(producerEvent)) {
+        expect(storedEvent[key], `${label} had its ${key} rewritten at ingest`).toStrictEqual(
+          value,
+        );
+      }
+    }
+  });
+
+  it('attributes the batch to one session and one capture, with a strictly increasing ingestSeq', () => {
+    // Read from the parsed values rather than the raw bags, so `ingestSeq` is
+    // the schema's `number` and the comparison below is a numeric one.
+    const attributed = PERSISTED_BATCH.map((event) => okValue(parseTelemetryEvent(event)));
+
+    expect(new Set(attributed.map((event) => event.sessionId)).size).toBe(1);
+    expect(new Set(attributed.map((event) => event.captureId)).size).toBe(1);
+
+    // Zero is below every number the store can assign (`ingestSeq` is
+    // one-based), so the first comparison is meaningful without special-casing
+    // the first element.
+    let previous = 0;
+
+    for (const event of attributed) {
+      expect(Number.isInteger(event.ingestSeq)).toBe(true);
+      expect(event.ingestSeq, `ingestSeq did not increase at event ${event.id}`).toBeGreaterThan(
+        previous,
+      );
+
+      previous = event.ingestSeq;
+    }
+  });
+});
+
+describe('the committed invalid corpus', () => {
+  it('holds exactly the named cases the table drives, in order', () => {
+    // Both directions at once: a case added to the file without a row here is
+    // an untested case, and a row here without a case in the file is an
+    // assertion about nothing.
+    expect(INVALID_FIXTURE_CASES).toHaveLength(INVALID_CASE_COUNT);
+    expect(Object.keys(INVALID_CASES)).toHaveLength(INVALID_CASE_COUNT);
+    expect(Object.keys(INVALID_CASES)).toEqual(
+      INVALID_FIXTURE_CASES.map((fixtureCase) => fixtureCase.name),
+    );
+  });
+
+  it.each(INVALID_FIXTURE_CASES)(
+    'refuses $name through every entry point, reporting $reason',
+    ({ name, reason, ingressIssue, persistedIssue }: InvalidFixtureCase) => {
+      const candidate = invalidCase(name);
+      const label = `${name} (${reason})`;
+
+      // AAP 0.5.5 first: whatever the corpus holds, none of the four entry
+      // points may throw, because one malformed element must never end a
+      // capture.
+      expect(() => parseTelemetryEventIngress(candidate)).not.toThrow();
+      expect(() => parseTelemetryEvent(candidate)).not.toThrow();
+      expect(() => isTelemetryEventIngress(candidate)).not.toThrow();
+      expect(() => isTelemetryEvent(candidate)).not.toThrow();
+
+      // Each helper asserts the whole refusal: `safeParse` false, the guard
+      // false, and a `Result` carrying a `DebuggenError` whose code is
+      // `PROTOCOL_INVALID_MESSAGE` and whose `details.schema` names the schema
+      // that refused — so a case that is rejected by one entry point and
+      // accepted by another fails here.
+      const ingressIssues = expectIngressRejected(candidate);
+      const persistedIssues = expectPersistedRejected(candidate);
+
+      // And the refusal is the one the case name claims. Without this, a case
+      // that had drifted into being invalid for some unrelated reason would
+      // still pass while covering nothing it is named for.
+      expect(ingressIssues, `${label}: the ingress refusal named something else`).toContainEqual(
+        ingressIssue,
+      );
+      expect(
+        persistedIssues,
+        `${label}: the persisted refusal named something else`,
+      ).toContainEqual(persistedIssue);
+    },
+  );
 });

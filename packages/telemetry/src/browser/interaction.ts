@@ -85,15 +85,62 @@
  * for the new dispatch, and the close deadline moves out — rather than
  * starting a second trace that would split one gesture's evidence in half.
  *
- * ## Nothing here throws, and nothing leaks
+ * ## Nothing here throws, nothing leaks, and nothing is lost in silence
  *
  * Every handler body, every timer callback and every export sits inside a
  * `try`/`catch`: this code runs on the page's own stack, inside the
  * developer's click handler, where an escaping exception would break the
  * application under investigation. `attachInteractions` is idempotent and
- * {@link detachInteractions} leaves no listener, no observer, no timer and no
- * record, because AAP 0.5.1 requires runtime hooks to be "disabled, not merely
- * idled" — a dormant agent holds no observation of the developer's page.
+ * {@link detachInteractions} returns the module to observing nothing —
+ * ordinarily holding no listener, no observer, no timer and no record either —
+ * because AAP 0.5.1 requires runtime hooks to be "disabled, not merely idled":
+ * a dormant agent holds no observation of the developer's page.
+ *
+ * Teardown reaches that state **one guarded step at a time**, and the reason
+ * is the failure mode a single enclosing `try` has: a page that has replaced
+ * `removeEventListener`, or a host that throws from `PerformanceObserver`'s
+ * `disconnect`, would abort the rest of the sequence — the remaining listener
+ * types, the observer, both timers, the state reset — while the module still
+ * reported itself detached. That is the opposite of what AAP 0.5.1 asks for:
+ * the agent would be attached to the page and say it was not. So
+ * {@link detachInteractions} disarms first (nothing observes while it works),
+ * guards each removal on its own, **sweeps every declared event type** rather
+ * than only the ones it believes it registered, and **retains whatever did not
+ * come back** — the listener types still believed registered and an observer
+ * that refused to disconnect — so the next detach retries them and a re-attach
+ * repairs instead of duplicating. The sweep is unconditional because a page
+ * can register a listener inside its own `addEventListener` wrapper and *then*
+ * throw: that registration is real and no bookkeeping here can know of it, so
+ * teardown has to attempt the removal anyway (a removal for a type that was
+ * never registered is a specified no-op). What survives is readable rather
+ * than merely reported: {@link hasInteractionsResidue} answers "does the page
+ * still carry anything of ours", which is the fact `./agent.ts` puts in its
+ * `hooks-not-released` frame.
+ *
+ * ## One capture's evidence never lands in another
+ *
+ * Disarming is not sufficient on its own, because the flag goes true again:
+ * a page that broke `clearTimeout` leaves the close timer of the interaction
+ * in flight pending, and if the developer starts a second capture before it
+ * fires it would find the module attached and emit a gesture that happened
+ * before that capture began — stamped with the new capture's id and sequence,
+ * indistinguishable from a real interaction. So each observation period has a
+ * number ({@link attachGeneration}), every interaction record carries the
+ * number it was opened in, and every deferred callback compares the two before
+ * it acts ({@link isLiveDeferral}). Residue of an ended capture returns
+ * silently; a live interaction is unaffected, since its record's generation is
+ * the current one.
+ *
+ * A contained failure is also a *reported* failure. Every `catch` that costs
+ * the capture evidence calls `reportProducerFailure` from `./transport.js`,
+ * which posts a bounded, sanitized `agent.error` frame carrying the stage and
+ * the thrown value's type and nothing else — never a message, a URL or
+ * anything read off the page. Swallowing keeps the developer's application
+ * alive; reporting is what stops a capture that lost every interaction from
+ * looking like a capture that succeeded (AAP 0.5.5). The few guards that cost
+ * only clock resolution or an unavailable host capability are deliberately
+ * silent, and each says so where it sits, so that a real failure is never
+ * buried under a page's worth of noise.
  *
  * Nothing observable happens at import time. Module scope here is one page
  * document, the same scope `./transport.js` numbers its sequence in and
@@ -117,7 +164,13 @@
 import { applyLineageAttributes, getLineage, notifyInteraction } from './continuation.js';
 import { describeElement, nearestComponentName, type TargetDescriptor } from './dom-target.js';
 import { newSpanId, newTraceId } from './ids.js';
-import { emit, nowEpochMs, toEpochMs, type EventDraft } from './transport.js';
+import {
+  emit,
+  nowEpochMs,
+  reportProducerFailure,
+  toEpochMs,
+  type EventDraft,
+} from './transport.js';
 import type { INTERACTION_ATTRIBUTE_KEYS } from '../schema/attributes.js';
 import type { TelemetryKind } from '../schema/kinds.js';
 
@@ -543,6 +596,21 @@ export interface EventContext {
  */
 interface InteractionRecord extends ActiveInteraction {
   /**
+   * The value {@link attachGeneration} held when this interaction opened —
+   * which capture's observation period it belongs to.
+   *
+   * Every piece of deferred work this module schedules carries the generation
+   * it was scheduled in and compares it with the module's current one before
+   * it does anything (see {@link isLiveDeferral}), so a record cannot be
+   * emitted, extended or refined by a capture that replaced the one it was
+   * opened in. Kept on the record rather than only captured in each closure
+   * because the observer's callback outlives a detach and is *adopted* by the
+   * next attach: its closure's generation would be stale for work that is
+   * genuinely current, while the record's is exact.
+   */
+  generation: number;
+
+  /**
    * The interaction's start on the monotonic clock, taken from the input
    * event's own `timeStamp` when the host reported a usable one.
    *
@@ -643,6 +711,16 @@ type EventTimingEntry = PerformanceEntry & {
   readonly interactionId?: number | undefined;
 };
 
+/**
+ * One member of {@link INTERACTION_EVENT_TYPES}.
+ *
+ * Used for {@link registeredEventTypes} so that the set of currently
+ * registered types is checked against the tuple at compile time: a type added
+ * to or removed from the tuple cannot leave a stale member behind in the
+ * bookkeeping that drives attach and detach.
+ */
+type InteractionEventType = (typeof INTERACTION_EVENT_TYPES)[number];
+
 /*
  * ---------------------------------------------------------------------------
  * Module state
@@ -655,8 +733,52 @@ type EventTimingEntry = PerformanceEntry & {
  * ---------------------------------------------------------------------------
  */
 
-/** Whether {@link attachInteractions} has registered its hooks. */
+/**
+ * Whether this module is observing interactions right now.
+ *
+ * "Observing", not "has listeners": it is set **false first** by
+ * {@link detachInteractions}, before any removal is attempted, and every
+ * callback in this file returns immediately while it is false. That makes the
+ * flag the disarm switch rather than an inventory — a listener the page
+ * refused to remove is inert the moment this becomes false, which is what
+ * turns a failed removal from a producer that keeps opening windows after
+ * detach into a reference that {@link registeredEventTypes} remembers to
+ * retry.
+ *
+ * What is actually still registered is therefore never read from here. It is
+ * read from {@link registeredEventTypes} and {@link observer}, which are the
+ * only honest record of it, and it is exposed to `./agent.ts` as
+ * {@link hasInteractionsResidue}.
+ */
 let attached = false;
+
+/**
+ * Which observation period this module is in: incremented on every
+ * {@link attachInteractions} and every {@link detachInteractions}.
+ *
+ * **Why a counter and not just the {@link attached} flag.** The flag answers
+ * "is this module observing now", and a timer that outlived a teardown can
+ * find it `true` again: a page that broke `clearTimeout` leaves the close
+ * timer of capture A pending, the developer starts capture B, and the flag
+ * says "attached" while the pending callback still holds capture A's record.
+ * Emitting it then would stamp an event that belongs to a capture that has
+ * ended with the sequence and the capture id of the one that replaced it —
+ * evidence in the wrong capture, which is worse than evidence lost, because a
+ * reader cannot tell it apart from a real interaction.
+ *
+ * The counter makes each period distinguishable. Every record carries the
+ * generation it opened in ({@link InteractionRecord.generation}) and every
+ * deferred callback tests it against this value before acting
+ * ({@link isLiveDeferral}), so residue of an ended capture returns silently
+ * instead of producing telemetry. It advances on *both* transitions so that a
+ * detach alone — not only a following attach — is enough to invalidate
+ * everything the previous period scheduled.
+ *
+ * A double counts every integer up to 2^53 exactly, so a page cannot exhaust
+ * this by arming and disarming; it is monotonic for the life of the document
+ * and is deliberately never reset.
+ */
+let attachGeneration = 0;
 
 /**
  * The one listener registered for every type in
@@ -665,10 +787,58 @@ let attached = false;
  * Held so that {@link detachInteractions} can remove it by the same function
  * identity and the same capture flag it was added with, which is the only way
  * `removeEventListener` removes anything.
+ *
+ * Kept — deliberately — across a detach that could not remove every type: the
+ * identity is the *only* handle that can ever remove those registrations, so
+ * dropping it would strand them on the page forever. It is released once
+ * {@link registeredEventTypes} is empty, which is the state a clean detach
+ * reaches.
  */
 let eventListener: ((event: Event) => void) | undefined;
 
-/** The one `PerformanceObserver`, when the host supports `event` timing. */
+/**
+ * Which of {@link INTERACTION_EVENT_TYPES} this module **believes** are
+ * registered with {@link eventListener} right now.
+ *
+ * "Believes", not "are": the page owns `addEventListener` and
+ * `removeEventListener` and can replace either with a wrapper that performs
+ * the native call and *then* throws, so no set can be evidence of what the
+ * window actually holds. What this one records is the conservative answer to
+ * the only question that has to be answered — may
+ * {@link attachInteractions} add a listener for this type? — and the two
+ * behaviours that depend on it:
+ *
+ * 1. **A re-attach repairs rather than duplicates.**
+ *    {@link attachInteractions} registers only the types the set does not
+ *    already hold, so a detach that failed on `click` followed by a re-attach
+ *    leaves one `click` listener and not two — which would otherwise emit two
+ *    interactions for one gesture.
+ * 2. **A later detach retries.** What could not be removed is still listed,
+ *    so the next {@link detachInteractions} sees it as residue
+ *    ({@link hasInteractionsResidue}) even though the sweep no longer needs
+ *    the set to decide what to attempt.
+ *
+ * A type is added when `addEventListener` returned, and also when it threw
+ * *and* the immediate removal of that same registration threw too — a throwing
+ * wrapper may have registered before it threw, and the only safe assumption
+ * about a registration that could not be undone is that it exists. It is
+ * deleted only once `removeEventListener` returned for it. What is **not**
+ * derived from this set is which types teardown attempts: that is every
+ * declared type, unconditionally (see {@link detachInteractions}), because a
+ * registration this set never learned about must still come off the page.
+ */
+const registeredEventTypes = new Set<InteractionEventType>();
+
+/**
+ * The one `PerformanceObserver`, when the host supports `event` timing.
+ *
+ * Cleared only when `disconnect()` actually returned. A host that throws from
+ * `disconnect` has refused to stop the observer, so the reference is retained:
+ * the next detach retries the disconnect, and a re-attach adopts this observer
+ * rather than constructing a second one that would deliver every entry twice.
+ * While detached the observer delivers nothing, because {@link handleEntries}
+ * returns on the disarmed {@link attached} flag.
+ */
 let observer: PerformanceObserver | undefined;
 
 /** The `setTimeout(…, 0)` probe that measures the end of the dispatch. */
@@ -766,6 +936,11 @@ function perfNow(): number {
   } catch {
     // A page that replaced `performance` with a throwing accessor still gets a
     // usable reading; reading a clock must never abort an interaction.
+    //
+    // Deliberately not reported: the fallback keeps every interval in this
+    // module internally consistent, so nothing is lost but resolution, and
+    // this runs several times per event — a report here would spend this
+    // source's whole failure budget on a degradation no consumer can act on.
   }
   return Date.now();
 }
@@ -825,8 +1000,51 @@ function readEventTimeStamp(event: Event): number | undefined {
     }
     return timeStamp;
   } catch {
+    // Same treatment as the clock read above, and for the same reason: a
+    // throwing `timeStamp` accessor costs the input delay, the caller reads
+    // the clock instead, and the interaction is still measured and emitted —
+    // so this is a degradation rather than a lost signal to report.
     return undefined;
   }
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * Capture isolation
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * Whether a deferred callback may still act on the record it was scheduled
+ * for.
+ *
+ * The one test every timer callback in this file makes before it touches an
+ * interaction, and it is three conditions rather than one because each covers
+ * a different way the callback can be residue:
+ *
+ * 1. **The module is observing.** {@link attached} is set `false` before
+ *    teardown releases anything, so a callback that outlived a detach — the
+ *    page broke `clearTimeout`, or the tab was throttled — measures nothing.
+ * 2. **The generation still matches.** A capture that ended and a capture that
+ *    replaced it both see `attached === true`, so the flag alone cannot tell
+ *    them apart: the counter can (see {@link attachGeneration}). Without this
+ *    condition an interaction from capture A whose close timer survived
+ *    teardown is emitted into capture B, carrying B's capture id and its
+ *    sequence — a record of a gesture that happened before B began.
+ * 3. **The record is still the current one.** `activeInteraction === record`
+ *    keeps a callback from reviving an interaction the module has already
+ *    retired inside the same generation (the lifetime safety valve closed it,
+ *    or a second gesture replaced it), which is the pre-existing invariant
+ *    every step of the lifecycle already asserted.
+ *
+ * @param record The interaction the callback was scheduled for.
+ * @param generation The value {@link attachGeneration} held when the callback
+ * was scheduled.
+ * @returns `true` only when all three hold; a `false` answer means the
+ * callback must return silently, having lost nothing that still exists.
+ */
+function isLiveDeferral(record: InteractionRecord, generation: number): boolean {
+  return attached && generation === attachGeneration && activeInteraction === record;
 }
 
 /*
@@ -869,14 +1087,27 @@ function clearCloseTimer(): void {
  */
 function scheduleSyncProbe(record: InteractionRecord): void {
   clearSyncTimer();
+  // Captured at scheduling time: the callback has to compare the period it was
+  // scheduled in against the module's current one, and reading the counter
+  // inside the callback would compare the current period with itself.
+  const generation = record.generation;
   syncTimer = setTimeout(() => {
     syncTimer = undefined;
+    // A timer whose `clearTimeout` failed during teardown still fires, and by
+    // the time it does the module may have been armed again for a *different*
+    // capture. Both cases are residue of a period that has ended and neither
+    // may measure anything (AAP 0.5.1); see {@link isLiveDeferral}.
+    if (!isLiveDeferral(record, generation)) {
+      return;
+    }
     try {
       completeSyncWindow(record);
-    } catch {
+    } catch (error) {
       // A timer callback has no caller to catch for it. The window still
       // closes: either an entry extends the deadline, or the safety valve on
-      // the read path finalises the interaction.
+      // the read path finalises the interaction. Reported because the
+      // interaction's primary duration signal was the thing that was lost.
+      reportProducerFailure('interaction', 'sync-probe', error);
     }
   }, SYNC_PROBE_DELAY_MS);
 }
@@ -909,7 +1140,11 @@ function completeSyncWindow(record: InteractionRecord): void {
  * reading {@link resolveEventContext}, not a moving target.
  */
 function extendWindow(record: InteractionRecord, candidate: number): void {
-  if (activeInteraction !== record || record.emitted) {
+  // The generation test belongs here as well as in the callers' own gates:
+  // this is the single place a timer is armed for a record, so a record from
+  // an ended observation period cannot schedule work in the current one even
+  // if some future caller forgets to check (capture isolation, item 1.2).
+  if (activeInteraction !== record || record.emitted || record.generation !== attachGeneration) {
     return;
   }
 
@@ -942,13 +1177,24 @@ function armCloseTimer(record: InteractionRecord): void {
   }
 
   const delay = nonNegative(deadline - perfNow());
+  // Captured at arming time, for the reason {@link scheduleSyncProbe} states.
+  const generation = record.generation;
   closeTimer = setTimeout(() => {
     closeTimer = undefined;
+    // Same reasoning as the dispatch probe, and this is the callback the
+    // reasoning was written for: detaching **drops** the interaction in flight
+    // rather than emitting it, so a close timer that outlived teardown must
+    // emit neither into the capture the developer ended nor — the case the
+    // disarm flag alone does not cover — into the capture that replaced it.
+    if (!isLiveDeferral(record, generation)) {
+      return;
+    }
     try {
       closeInteraction(record);
-    } catch {
+    } catch (error) {
       // See scheduleSyncProbe: a throw here would escape into the page's task
       // queue, and the interaction is already recorded as emitted.
+      reportProducerFailure('interaction', 'close-timer', error);
     }
   }, delay);
 }
@@ -969,8 +1215,19 @@ function armCloseTimer(record: InteractionRecord): void {
  * page's own dispatch path — ahead of the application's own handler, which is
  * the point — where an escaping exception would surface as an error in the
  * application under investigation.
+ *
+ * **Gated on {@link attached}.** A registration the page would not let
+ * {@link detachInteractions} remove still delivers events, and without this
+ * gate it would go on minting traces and arming timers for a capture that has
+ * ended — the difference between a residue the module remembers to retry and
+ * a producer that is still running. The gate is what makes "disabled, not
+ * merely idled" (AAP 0.5.1) true even when removal itself fails.
  */
 function handleInteractionEvent(event: Event): void {
+  if (!attached) {
+    return;
+  }
+
   try {
     const type: unknown = event.type;
     if (typeof type !== 'string' || type === '') {
@@ -984,9 +1241,12 @@ function handleInteractionEvent(event: Event): void {
     }
 
     startInteraction(event, type);
-  } catch {
+  } catch (error) {
     // Never into the page. Losing one interaction costs a trace; a thrown
-    // exception costs the developer's application.
+    // exception costs the developer's application. The loss is reported so a
+    // capture with no interactions is known to have lost them rather than
+    // read as a developer who never clicked (AAP 0.5.5).
+    reportProducerFailure('interaction', 'interaction-event', error);
   }
 }
 
@@ -1032,6 +1292,9 @@ function startInteraction(event: Event, type: string): void {
   const record: InteractionRecord = {
     traceId: newTraceId(),
     spanId: newSpanId(),
+    // Stamped at birth and never revised: this gesture belongs to the capture
+    // that was armed when it happened, and to no later one.
+    generation: attachGeneration,
     startTime: timeStamp === undefined ? nowEpochMs() : toEpochMs(timeStamp),
     startPerfMs,
     startRelativeMs: timeStamp ?? startPerfMs,
@@ -1068,10 +1331,13 @@ function describeInteractionTarget(record: InteractionRecord, event: Event): voi
     if (component !== undefined) {
       record.component = component;
     }
-  } catch {
+  } catch (error) {
     // An interaction with no target descriptor is still a complete, correlated
     // trace root; the panel shows the event type and the component chain is
-    // simply absent.
+    // simply absent. Reported because "which element was clicked" is evidence
+    // the developer asked for, and its absence is otherwise indistinguishable
+    // from a gesture on a non-element target.
+    reportProducerFailure('interaction', 'target-describe', error);
   }
 }
 
@@ -1279,10 +1545,13 @@ function emitInteraction(record: InteractionRecord): void {
       status: 'ok',
     };
     emit(draft);
-  } catch {
+  } catch (error) {
     // `emit` never throws by contract; this guard covers the attribute build
     // over a descriptor from a hostile page, and costs one event rather than
-    // the close path that called it.
+    // the close path that called it. An interaction that was measured and then
+    // never emitted is the most expensive loss this module can have, so it is
+    // always stated.
+    reportProducerFailure('interaction', 'emit', error);
   }
 }
 
@@ -1357,16 +1626,33 @@ function matchesEntry(record: InteractionRecord, entry: EventTimingEntry): boole
  */
 function findRecordForEntry(entry: EventTimingEntry): InteractionRecord | undefined {
   const active = activeInteraction;
-  if (active !== undefined && matchesEntry(active, entry)) {
+  if (active !== undefined && isCurrentGeneration(active) && matchesEntry(active, entry)) {
     return active;
   }
 
   const previous = lastInteraction;
-  if (previous !== undefined && matchesEntry(previous, entry)) {
+  if (previous !== undefined && isCurrentGeneration(previous) && matchesEntry(previous, entry)) {
     return previous;
   }
 
   return undefined;
+}
+
+/**
+ * Whether a record belongs to the observation period the module is in now.
+ *
+ * The entry path's half of {@link isLiveDeferral}: an observer whose
+ * `disconnect()` threw is retained and adopted by the next attach (see
+ * {@link observer}), so its batches can arrive in a period later than the one
+ * the entries describe — including the `buffered: true` replay. Identity is
+ * not enough there, because refinement legitimately applies to
+ * {@link lastInteraction} as well as to the active record; the generation is
+ * what separates "a late entry for this capture's gesture" from "an entry
+ * about a capture that has ended", and applying the latter would extend a
+ * closed window and emit through {@link extendWindow} into the wrong capture.
+ */
+function isCurrentGeneration(record: InteractionRecord): boolean {
+  return record.generation === attachGeneration;
 }
 
 /**
@@ -1418,8 +1704,18 @@ function applyEntry(record: InteractionRecord, entry: EventTimingEntry): void {
  * Runs in a task of its own, not on the click path, so the cost of the scan is
  * paid off the developer's critical path; an entry that matches nothing is
  * simply dropped.
+ *
+ * **Gated on {@link attached}**, for the same reason the event handler is: an
+ * observer whose `disconnect()` threw is retained rather than forgotten (see
+ * {@link observer}) and keeps delivering batches, and a detached module must
+ * refine nothing — including the `buffered: true` replay a re-attach's
+ * adoption would otherwise hand to a capture that has ended.
  */
 function handleEntries(list: PerformanceObserverEntryList): void {
+  if (!attached) {
+    return;
+  }
+
   try {
     for (const entry of list.getEntries()) {
       if (!isEventTimingEntry(entry)) {
@@ -1430,9 +1726,13 @@ function handleEntries(list: PerformanceObserverEntryList): void {
         applyEntry(record, entry);
       }
     }
-  } catch {
+  } catch (error) {
     // A host whose entry list or entries misbehave costs the refinement and
     // nothing else: the dispatch probe has already measured the interaction.
+    // Reported at the lowest stakes in this file — the input-delay breakdown
+    // is what goes missing — and reported anyway, because a panel showing no
+    // input delay should not be read as an interaction that had none.
+    reportProducerFailure('interaction', 'entry-batch', error);
   }
 }
 
@@ -1444,6 +1744,13 @@ function handleEntries(list: PerformanceObserverEntryList): void {
  * `TypeError` in a host that has `PerformanceObserver` but does not support
  * the `event` entry type. A failed `observe` disconnects what was constructed,
  * so no half-started observer is left holding a callback.
+ *
+ * Neither failure is reported through `reportProducerFailure`, and that is a
+ * decision rather than an omission: both mean "this host does not offer event
+ * timing", which is a capability difference (Firefox, happy-dom) and not a
+ * producer that broke. Reporting it would spend this source's whole failure
+ * budget on every such page and bury the failures that are real, while the
+ * refinement it costs is one this module never depends on.
  *
  * @returns The started observer, or `undefined` when the refinement is
  * unavailable — in which case interactions are still measured and still
@@ -1483,6 +1790,66 @@ function createEventObserver(): PerformanceObserver | undefined {
 
 /*
  * ---------------------------------------------------------------------------
+ * Listener registration
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * Undo an `addEventListener` that threw, and say whether the type has to be
+ * treated as registered anyway.
+ *
+ * **Why an add that threw needs an undo at all.** `addEventListener` is the
+ * page's own function, and a page, an extension or a polyfill can replace it
+ * with a wrapper that forwards to the native implementation — registering the
+ * listener for real — and only then throws from its own bookkeeping. The
+ * throw says nothing about whether the registration landed. Treating it as
+ * "not registered" is what left a live, unrecorded listener on the window:
+ * teardown would never attempt that type, the listener identity would be
+ * released once the set emptied, and the next attach would add a second
+ * closure beside the first, so one gesture would be observed twice by two
+ * listeners under one gate. So the exact inverse call is attempted
+ * immediately, with the same type, the same listener identity and the same
+ * options object `removeEventListener` matches on.
+ *
+ * A removal for a type that was never registered is specified as a no-op, so
+ * the attempt is free in the case where the throw happened before the native
+ * call — which is why it is made unconditionally rather than guessed at.
+ *
+ * **The trade when the removal throws too**, stated the way `./errors.ts`
+ * states the same one for its adoption rule: the type is then recorded as
+ * believed-registered, and a later {@link attachInteractions} skips it. On a
+ * page that has broken *both* functions that costs this module the events of
+ * that one gesture type for the life of the document. The alternative —
+ * assuming it is absent and adding again — costs a duplicated interaction per
+ * gesture and a listener nobody can ever remove, which is the worse of the
+ * two, and both failures report themselves so the frames say which happened.
+ *
+ * @param type The event type whose `addEventListener` threw.
+ * @param listener The exact identity that was passed to it.
+ * @returns `true` when the registration could not be undone and must be
+ * treated as live; `false` once `removeEventListener` has returned for it, or
+ * when there is no `window` and nothing can have been registered.
+ */
+function rollbackFailedAdd(type: InteractionEventType, listener: (event: Event) => void): boolean {
+  if (typeof window === 'undefined') {
+    return false;
+  }
+
+  try {
+    window.removeEventListener(type, listener, LISTENER_OPTIONS);
+    return false;
+  } catch (error) {
+    // Reported with its own stage id: this is the one failure that leaves a
+    // registration this module can neither use nor remove, and it is a
+    // different fact from the add that preceded it (AAP 0.5.5). The event type
+    // is the developer's own vocabulary, not page data.
+    reportProducerFailure('interaction', 'listener-add-rollback', error, { eventType: type });
+    return true;
+  }
+}
+
+/*
+ * ---------------------------------------------------------------------------
  * Public API
  * ---------------------------------------------------------------------------
  */
@@ -1503,9 +1870,32 @@ function createEventObserver(): PerformanceObserver | undefined {
  * detached and {@link isInteractionsAttached} says so; the Node preload and
  * the service import this package without ever reaching this function.
  *
- * Never throws. A failure part-way through registration detaches, so the
- * module is either fully attached or fully detached and never holds a listener
- * it cannot remove.
+ * **A re-attach is a repair, not a second install.** Teardown can leave
+ * residue — a listener type the page refused to remove, an observer that threw
+ * from `disconnect` (see {@link detachInteractions}) — and this function
+ * adopts that residue instead of adding to it: only the types missing from
+ * {@link registeredEventTypes} are registered, and a retained
+ * {@link observer} is reused rather than replaced. Without that rule a
+ * partial detach followed by a re-attach would leave two listeners for one
+ * event type and two observers for one entry stream, which is two
+ * interactions and two refinements for one gesture.
+ *
+ * Never throws. A per-type guard means one refused registration costs that
+ * type and not the other four; the failure is reported, and the module is
+ * attached with what it has — a partial signal that is stated is worth more
+ * than no signal at all (AAP 0.5.5). A registration attempt that yields
+ * nothing at all is treated as a failed attach: teardown runs and
+ * {@link isInteractionsAttached} stays false, because a module with no
+ * listener is not observing.
+ *
+ * **An `addEventListener` that throws is also rolled back**, because the throw
+ * does not mean the registration did not happen: a wrapper around the page's
+ * own `addEventListener` can forward to the native implementation and then
+ * throw from its own bookkeeping, leaving a live listener this module never
+ * recorded. {@link rollbackFailedAdd} attempts the exact inverse call at once
+ * and the type is marked believed-registered when even that fails, so the
+ * registration stays reachable by teardown instead of becoming a listener that
+ * fires beside the next attach's fresh closure (AAP 0.5.1).
  */
 export function attachInteractions(): void {
   try {
@@ -1513,20 +1903,68 @@ export function attachInteractions(): void {
       return;
     }
 
-    const listener = (event: Event): void => {
-      handleInteractionEvent(event);
-    };
+    // A new observation period begins here, before anything can be registered
+    // or recorded. Everything the previous period left scheduled — a close
+    // timer a broken `clearTimeout` would not cancel, a retained observer's
+    // buffered replay — now carries a stale generation and is inert, so this
+    // capture's telemetry cannot contain the previous capture's gestures
+    // (see {@link attachGeneration}).
+    attachGeneration += 1;
+
+    // The identity a retained registration can be removed by is the identity
+    // it was added with, so a listener held from a partial detach is reused
+    // rather than replaced; a fresh one would make the residue unremovable.
+    const listener =
+      eventListener ??
+      ((event: Event): void => {
+        handleInteractionEvent(event);
+      });
 
     // Published before the loop so that a failure part-way through leaves
     // every listener that *was* registered removable by the detach below.
     eventListener = listener;
     for (const type of INTERACTION_EVENT_TYPES) {
-      window.addEventListener(type, listener, LISTENER_OPTIONS);
+      if (registeredEventTypes.has(type)) {
+        // Already on the page from an earlier attach whose detach could not
+        // remove it. Registering again would double-fire this gesture.
+        continue;
+      }
+      try {
+        window.addEventListener(type, listener, LISTENER_OPTIONS);
+        registeredEventTypes.add(type);
+      } catch (error) {
+        // The event type is the developer's own vocabulary (`click`), not page
+        // data, so it travels as detail and says which gesture is unobserved.
+        reportProducerFailure('interaction', 'listener-add', error, { eventType: type });
+        // A wrapper that registered and *then* threw has left a live listener
+        // behind; the inverse call is attempted at once and the type is
+        // recorded as registered only if that removal failed as well (see
+        // {@link rollbackFailedAdd}). Recording it on the way out of a throw
+        // is what keeps the page's actual registrations reachable.
+        if (rollbackFailedAdd(type, listener)) {
+          registeredEventTypes.add(type);
+        }
+      }
     }
 
-    observer = createEventObserver();
+    if (registeredEventTypes.size === 0) {
+      // Not one type registered, so there is no gesture to observe and no
+      // interaction can be measured. Teardown releases the listener identity
+      // and any observer retained from an earlier cycle, and `attached` stays
+      // false: claiming to observe here would put a capability in
+      // `./agent.ts`'s status frame that this module does not have.
+      reportProducerFailure('interaction', 'attach-no-listener');
+      detachInteractions();
+      return;
+    }
+
+    observer = observer ?? createEventObserver();
     attached = true;
-  } catch {
+  } catch (error) {
+    // Reached only by a host that breaks outside the per-step guards above.
+    // Teardown is the safe state: it is itself guarded and it retains
+    // whatever it cannot release.
+    reportProducerFailure('interaction', 'attach', error);
     detachInteractions();
   }
 }
@@ -1536,9 +1974,13 @@ export function attachInteractions(): void {
  *
  * Called by `./agent.ts` when the service clears the hooks — an `agent.config`
  * with every hook false, which AAP 0.5.1 requires to leave the agent
- * "disabled, not merely idled". Afterwards this module holds no listener, no
- * observer, no timer and no record of anything the developer did: a later
- * click emits nothing and schedules nothing.
+ * "disabled, not merely idled". Afterwards this module observes nothing: a
+ * later click emits nothing, measures nothing and schedules nothing. In the
+ * ordinary case it also *holds* nothing — no listener, no observer, no timer
+ * and no record of anything the developer did — and in the case where the page
+ * refuses a removal, what could not be released is retained on purpose and
+ * inert (rule 3 below), because a reference nobody remembers is a leak nobody
+ * can fix.
  *
  * The interaction in flight, if any, is **dropped rather than emitted**.
  * Detaching means the capture has stopped, and an event emitted after that
@@ -1547,49 +1989,225 @@ export function attachInteractions(): void {
  * Does **not** reset `./continuation.js`: teardown ordering across the agent's
  * hooks belongs to `./agent.ts`, which calls `resetContinuations()` itself.
  * Safe to call when already detached, and never throws.
+ *
+ * ## Seven rules, because one `try` around all of it is a lie
+ *
+ * The page owns `removeEventListener`, and a page — or an extension, or a
+ * polyfill — can replace it with something that throws. A host can throw from
+ * `PerformanceObserver.disconnect` or from `clearTimeout`. With the whole
+ * sequence in one `try`, the first such failure would skip the remaining
+ * listener types, the observer, both timers and the state reset, and the
+ * module would still have said it was detached. AAP 0.5.1 requires the
+ * opposite — hooks "disabled, not merely idled" — so teardown is built to
+ * these rules:
+ *
+ * 1. **Disarm first.** {@link attached} is set `false` before anything is
+ *    removed, so every callback in this file is inert from this instant even
+ *    if nothing below succeeds.
+ * 2. **One guard per step.** Each listener removal, the observer disconnect,
+ *    each timer clear and the state reset stand alone. A failure in one is
+ *    contained, reported with its own stage id, and the next step still runs.
+ * 3. **Retain what did not come back.** A type that was not removed stays in
+ *    {@link registeredEventTypes} and an observer that would not disconnect
+ *    stays in {@link observer}, so the next detach retries them and a
+ *    re-attach adopts them (see {@link attachInteractions}).
+ * 4. **Attached state is derived, not asserted.**
+ *    {@link isInteractionsAttached} means "observing" and is `false` from
+ *    rule 1 onwards; what is genuinely still on the page lives in the
+ *    retained set and reference, not in a flag that would have to lie, and
+ *    {@link hasInteractionsResidue} is how a caller reads it.
+ * 5. **Nothing is silent.** Each contained failure posts one bounded
+ *    `agent.error` frame, so a teardown that could not complete is visible in
+ *    both UIs instead of being a clean-looking detach (AAP 0.5.5).
+ * 6. **The sweep is authoritative, the set is not.** While a listener identity
+ *    is held, removal is attempted for **every** member of
+ *    {@link INTERACTION_EVENT_TYPES} rather than for the types the set happens
+ *    to list. The set is a belief about the page (see
+ *    {@link registeredEventTypes}) and a page that registers a listener and
+ *    then throws from its own `addEventListener` wrapper produces a
+ *    registration the belief cannot name: driving teardown from the set would
+ *    skip that type, drop the listener identity once the set emptied, and
+ *    leave a listener firing beside the next attach's own — two observations
+ *    of one gesture, one of them unreachable for ever. Attempting a removal
+ *    for a type that was never registered is a specified no-op, so the
+ *    unconditional sweep is the cheap half of the trade.
+ * 7. **The observation period ends here.** {@link attachGeneration} advances
+ *    beside the disarm, so every record this period opened and every callback
+ *    it scheduled is residue from this instant — including the close timer of
+ *    an interaction in flight, which a page that broke `clearTimeout` leaves
+ *    pending. Without it, that timer would find {@link attached} `true` again
+ *    once the developer started the next capture and would emit a gesture that
+ *    happened before that capture began, stamped with its capture id and its
+ *    sequence number. An event that belongs to a capture that ended must never
+ *    be attributed to the capture that replaced it.
  */
 export function detachInteractions(): void {
+  // Rule 1 — disarm before releasing anything. From here the event handler,
+  // the observer callback and both timer callbacks return immediately, so a
+  // registration that survives the steps below observes nothing.
+  attached = false;
+
+  // Rule 7 — end the observation period in the same breath. The flag alone
+  // goes true again on the next attach, so it cannot keep this period's
+  // residue out of the *next* capture; the generation can, and advancing it
+  // here means a detach on its own is enough to invalidate everything this
+  // period scheduled, even if not one of the releases below succeeds.
+  attachGeneration += 1;
+
   try {
     const listener = eventListener;
-    eventListener = undefined;
     if (listener !== undefined && typeof window !== 'undefined') {
+      // Rule 6 — the sweep, not the set, decides what is attempted. Every
+      // declared type is tried while a listener identity is held, because a
+      // registration this module never recorded (an `addEventListener` wrapper
+      // that registered and then threw) is exactly the one the set cannot name
+      // and the one that would otherwise stay on the page for the life of the
+      // document. A removal for a type that was never registered is a
+      // specified no-op, so the extra attempts cost nothing.
       for (const type of INTERACTION_EVENT_TYPES) {
-        window.removeEventListener(type, listener, LISTENER_OPTIONS);
+        try {
+          window.removeEventListener(type, listener, LISTENER_OPTIONS);
+          // Rule 3 — deleted only once removal returned.
+          registeredEventTypes.delete(type);
+        } catch (error) {
+          // What throws is residue: recorded (or kept) as believed-registered
+          // so the next detach retries it, a re-attach adopts rather than
+          // duplicates it, and {@link hasInteractionsResidue} can name it.
+          registeredEventTypes.add(type);
+          reportProducerFailure('interaction', 'listener-remove', error, { eventType: type });
+        }
       }
+    }
+
+    // The listener identity is released only when nothing is believed
+    // registered with it any more; holding it is the only way a retained
+    // registration can ever be removed.
+    if (registeredEventTypes.size === 0) {
+      eventListener = undefined;
     }
 
     const current = observer;
-    observer = undefined;
     if (current !== undefined) {
       try {
         current.disconnect();
-      } catch {
-        // A host that throws on disconnect has already stopped delivering;
-        // the reference is dropped either way.
+        observer = undefined;
+      } catch (error) {
+        // Retained, not dropped: the host refused to stop it, so the next
+        // detach retries and a re-attach adopts this one instead of adding a
+        // second observer to the same entry stream.
+        reportProducerFailure('interaction', 'observer-disconnect', error);
       }
     }
 
-    clearSyncTimer();
-    clearCloseTimer();
-    activeInteraction = undefined;
-    lastInteraction = undefined;
-  } catch {
-    // Best effort by construction: the steps above are independent, so a
-    // failure in one leaves the others done.
-  } finally {
-    attached = false;
+    // Both timers clear their own handle only after `clearTimeout` returned,
+    // so a failure here leaves the handle for the next detach as well. The
+    // disarm above is what makes a timer that still fires harmless.
+    try {
+      clearSyncTimer();
+    } catch (error) {
+      reportProducerFailure('interaction', 'sync-timer-clear', error);
+    }
+
+    try {
+      clearCloseTimer();
+    } catch (error) {
+      reportProducerFailure('interaction', 'close-timer-clear', error);
+    }
+
+    try {
+      // The interaction in flight is dropped rather than emitted, and the
+      // closed record goes with it: a dormant agent holds no observation of
+      // what the developer did (AAP 0.5.1). Guarded like every other step —
+      // two assignments to module bindings cannot throw today, and the guard
+      // is what keeps that from being a precondition of the rule above, so a
+      // step added here inherits the containment and the report rather than
+      // reintroducing the all-or-nothing teardown this sequence replaced.
+      activeInteraction = undefined;
+      lastInteraction = undefined;
+    } catch (error) {
+      reportProducerFailure('interaction', 'state-reset', error);
+    }
+  } catch (error) {
+    // Unreachable while every step above carries its own guard, and kept so
+    // that "detach never throws into the page" holds structurally rather than
+    // by inspection of the body.
+    reportProducerFailure('interaction', 'detach', error);
   }
 }
 
 /**
- * Whether the listeners and observer are registered right now.
+ * Whether this module is observing interactions right now.
  *
  * `./agent.ts` reports this in its readiness and status frames, and it is
  * `false` in a context with no `window` even after {@link attachInteractions}
  * was called, because nothing was registered there.
+ *
+ * Precisely "observing", which is the question every caller is actually
+ * asking: `false` means no interaction is measured, no trace is minted and no
+ * timer is armed, whatever the page did with the removals in
+ * {@link detachInteractions}. A registration that could not be removed does
+ * **not** make this `true` — it is inert (see {@link handleInteractionEvent}),
+ * it is remembered in {@link registeredEventTypes}, it is reported as an
+ * `agent.error` when it happens, and it is readable at any time through
+ * {@link hasInteractionsResidue} — which is where a caller that needs to know
+ * whether the page is clean asks. Having this answer "attached" for a listener
+ * that observes nothing would give `./agent.ts` a status frame nobody could
+ * act on.
  */
 export function isInteractionsAttached(): boolean {
   return attached;
+}
+
+/**
+ * Whether the page still carries a registration this module's last detach
+ * could not remove — a listener, an observer or a scheduled timer.
+ *
+ * The companion to {@link isInteractionsAttached}, and the reason both exist:
+ * "observing" and "clean" are different questions and a single answer to both
+ * would have to lie about one of them. `isInteractionsAttached()` is `false`
+ * the instant teardown disarms, which is what makes a surviving registration
+ * inert; this function is what makes that survival **visible**, so
+ * `./agent.ts` can name this hook in the `hooks-not-released` frame AAP 0.5.1
+ * and 0.5.5 require — the developer is the only party who can act on it, by
+ * reloading the tab, and they cannot act on a fact nobody reports.
+ *
+ * `true` when any of three things is still held after a detach:
+ *
+ * - a type in {@link registeredEventTypes}, which means a capture-phase
+ *   listener is still on the window (or could not be proved absent — see that
+ *   set for the belief it records);
+ * - a retained {@link observer}, which means `disconnect()` threw and the host
+ *   is still delivering entry batches;
+ * - an uncleared {@link syncTimer} or {@link closeTimer}, which means
+ *   `clearTimeout` threw and a callback is still scheduled in the page.
+ *
+ * `false` while {@link attached} is `true`: an armed module's listeners,
+ * observer and timers are its live instrumentation, not residue, and reporting
+ * them as unreleased during a capture would make the announcement meaningless.
+ * `false` also — and this is the case a clean teardown reaches — when nothing
+ * at all is held.
+ *
+ * Never throws: it is read from a diagnostic path that runs while the agent is
+ * being torn down, so a failure here must not become the reason teardown ends
+ * badly. A read that could not complete answers `true`, because it cannot
+ * prove the page is clean, and states itself as a producer failure.
+ */
+export function hasInteractionsResidue(): boolean {
+  try {
+    if (attached) {
+      return false;
+    }
+
+    return (
+      registeredEventTypes.size > 0 ||
+      observer !== undefined ||
+      syncTimer !== undefined ||
+      closeTimer !== undefined
+    );
+  } catch (error) {
+    reportProducerFailure('interaction', 'residue-read', error);
+    return true;
+  }
 }
 
 /**
@@ -1635,7 +2253,10 @@ export function getActiveInteraction(): ActiveInteraction | undefined {
     }
 
     return snapshot;
-  } catch {
+  } catch (error) {
+    // A status frame that reported "no interaction" for a failed read would be
+    // indistinguishable from an idle page, so the failure is stated instead.
+    reportProducerFailure('interaction', 'snapshot-read', error);
     return undefined;
   }
 }
@@ -1656,7 +2277,11 @@ export function getActiveInteraction(): ActiveInteraction | undefined {
 export function isInteractionWindowOpen(now?: number): boolean {
   try {
     return currentOpenInteraction(now) !== undefined;
-  } catch {
+  } catch (error) {
+    // `false` is the safe answer — it costs `./fetch.ts` a `traceparent`
+    // injection rather than propagating a trace that may not exist — and it
+    // costs the capture the server half of that request, so it is reported.
+    reportProducerFailure('interaction', 'window-read', error);
     return false;
   }
 }
@@ -1725,9 +2350,12 @@ export function resolveEventContext(now?: number): EventContext {
     }
 
     return { traceId: newTraceId(), origin: 'synthetic' };
-  } catch {
+  } catch (error) {
     // An event must always have a trace to belong to. A fresh synthetic root
-    // is the answer that cannot be wrong about causation.
+    // is the answer that cannot be wrong about causation — and it detaches the
+    // event from the gesture that caused it, which is exactly the kind of
+    // silent evidence loss AAP 0.5.5 requires the capture to state.
+    reportProducerFailure('interaction', 'context-resolve', error);
     return { traceId: newTraceId(), origin: 'synthetic' };
   }
 }

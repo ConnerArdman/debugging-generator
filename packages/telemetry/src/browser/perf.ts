@@ -21,7 +21,10 @@
  *   themselves are what `long_task_count` counts.
  * - **`resource` → `perf.entry`.** The only place a transferred size is
  *   observable at all (AAP 0.6.6), and the timing a request row is enriched
- *   with.
+ *   with. Its `url` and `startTime` are the join key `../aggregate/requests.ts`
+ *   matches against the `fetch`/`xhr` span that caused the load, and
+ *   {@link KEY_TRANSFER_SIZE_EXPOSED} tells that aggregate whether the byte
+ *   counts beside them are a measurement or an absence.
  * - **`navigation` → `navigation`.** Whether the capture spans a reload, and
  *   the document milestones the timeline marks.
  * - **`paint` → `perf.entry`.** First paint and first contentful paint, as
@@ -37,31 +40,50 @@
  *
  * ## The two decisions worth reading before changing anything
  *
- * **One observer per entry type, with `buffered: true`.** The Performance
- * Timeline specification forbids combining `entryTypes` with `buffered`, and
- * the buffered flag is exactly what this module needs: a capture is armed when
- * the developer asks a question, which is long after the document loaded, and
- * without buffering the navigation and paint entries — already in the
- * performance buffer, never to be delivered again — would be invisible for
- * every capture that did not happen to start during page load. So four
- * observers it is, each created and started inside its own `try`/`catch`
- * because `observe({ type })` throws a `TypeError` for a type the host does
- * not support (`longtask` is not universally available). A type that throws
- * is recorded in {@link getPerfStats}'s `unavailable` list rather than being
- * allowed to abort the other three, which is what AAP 0.5.5 asks of an
- * unavailable signal: reported, not silently missing.
+ * **One observer per entry type, and buffered replay only for the document's
+ * lifecycle.** The Performance Timeline specification forbids combining
+ * `entryTypes` with `buffered`, so four observers it is, each created and
+ * started inside its own `try`/`catch` because `observe({ type })` throws a
+ * `TypeError` for a type the host does not support (`longtask` is not
+ * universally available). A type that throws is recorded in
+ * {@link getPerfStats}'s `unavailable` list rather than being allowed to abort
+ * the other three, which is what AAP 0.5.5 asks of an unavailable signal:
+ * reported, not silently missing.
  *
- * **Buffered entries become roots of their own traces, deliberately.** Every
+ * Which of those four observers replays the buffer is a separate decision, and
+ * {@link BUFFERED_ENTRY_TYPES} is the whole of it. `navigation` and `paint`
+ * are replayed because their entries exist **once** per document and were
+ * produced long before the developer asked a question: without the flag, a
+ * capture armed after page load could never see them, and "did this capture
+ * span a reload?" would be unanswerable. `resource` and `longtask` are
+ * **not** replayed, because their buffers hold the page's whole history —
+ * every image, script and stylesheet the document ever loaded, and every task
+ * that ever blocked the thread — and replaying them would open a capture with
+ * up to {@link MAX_ENTRIES_PER_TYPE} entries that predate the question, in one
+ * immediate batch, spending the per-type bound on evidence about a moment
+ * nobody is investigating. The two streams a developer arms this hook for are
+ * the ones the capture window itself produces.
+ *
+ * Buffering is not the only guard: every entry of a non-replayed type is also
+ * measured against {@link getCaptureStartTime}, the instant {@link attachPerf}
+ * ran, and one that had already **finished** by then is discarded and counted
+ * in {@link PerfStats.preCapture}. An entry still in flight when the capture
+ * armed is kept — a resource that was loading, or a task that was blocking,
+ * when the developer pressed Capture is part of what they are looking at — and
+ * the two lifecycle types are exempt by construction, since being older than
+ * the capture is precisely why they are replayed.
+ *
+ * **Replayed entries become roots of their own traces, deliberately.** Every
  * event asks `./interaction.js` which trace it belongs to, and that module
  * answers with the interaction window that is open *at the moment of the
- * call*. When a capture starts, the buffered navigation and paint entries
+ * call*. When a capture starts, the replayed navigation and paint entries
  * arrive with no interaction open and so become synthetic roots — which is
  * the honest answer, because page-load timing is a fact about the document
  * and not about a click. Forcing them onto whatever interaction happens to be
  * in flight would claim a causal link the capture never observed. For the
  * same reason the resolution is asked with no timestamp argument: the
  * interaction lookup uses the value it is given for its own lifetime valve
- * rather than as a "was a window open then?" query, so handing it a buffered
+ * rather than as a "was a window open then?" query, so handing it a replayed
  * entry's minutes-old `startTime` would both misattribute the entry and
  * suppress the valve that closes a starved window.
  *
@@ -70,13 +92,30 @@
  * A resource entry reports `transferSize`, `encodedBodySize` and
  * `decodedBodySize` as `0` for a cross-origin response served without
  * `Timing-Allow-Origin`, and older hosts omit some of the fields entirely.
- * Both are read defensively and reported as they stand: a zero is emitted as a
- * zero and an absent field is left absent, so that `transferred_bytes` can
- * report `n/a` where the browser measured nothing (AAP 0.6.6) instead of
- * presenting an invented number as evidence. Nothing here substitutes a
- * plausible value for a missing one, and no non-finite number is ever put on
- * an event: JSON has no spelling for `NaN` or `Infinity`, and the event
- * contract in `../schema/event.ts` bounds the numeric fields that matter.
+ * That zero is **not a measurement**: it is the specification's way of saying
+ * the timing-allow check failed and the byte counts are not exposed, and it is
+ * indistinguishable by value from the genuine zero a same-origin cache hit
+ * reports. Emitting it as a reading would let `transferred_bytes` publish "0
+ * bytes transferred" for a capture in which nothing was measured, turning an
+ * absence into an observation — which AAP 0.8.4 forbids structurally and
+ * AAP 0.6.6 answers with `n/a`.
+ *
+ * So the two cases are separated at the producer, where the evidence to do it
+ * exists. {@link transferSizeExposed} decides whether the host exposed byte
+ * counts for an entry at all — always for a same-origin response, and for a
+ * cross-origin one only when the entry carries the corroboration a passing
+ * timing-allow check leaves behind — and the answer travels on every resource
+ * and navigation event as {@link KEY_TRANSFER_SIZE_EXPOSED}. When it is
+ * `false` the three size fields are **omitted**, because this module's rule is
+ * a readable value or no key at all, and a zero that means "not exposed" is
+ * not a readable value. When it is `true` the sizes are emitted exactly as
+ * measured, zero included: a same-origin response served from cache really did
+ * transfer nothing, and that is a fact worth reporting.
+ *
+ * Nothing here substitutes a plausible value for a missing one, and no
+ * non-finite number is ever put on an event: JSON has no spelling for `NaN` or
+ * `Infinity`, and the event contract in `../schema/event.ts` bounds the
+ * numeric fields that matter.
  *
  * The resource and navigation URLs are emitted **raw and unredacted**. That is
  * the contract, not an oversight: the service redacts at ingest
@@ -90,12 +129,38 @@
  * Observer callbacks run on the page's own task queue, so every body in this
  * file sits inside a `try`/`catch`: a malformed entry costs itself and is
  * counted in {@link getPerfStats}'s `failures`, never the batch it arrived in
- * and never the developer's application. {@link attachPerf} is idempotent and
+ * and never the developer's application. Each of those guards also *reports*
+ * what it contained, through `./transport.ts`'s `reportProducerFailure`: a
+ * counter the service never sees would let a capture that lost its long-task
+ * or resource timing be presented as a complete one, which AAP 0.5.5 forbids.
+ * The reports carry the entry type and the thrown value's type name — never a
+ * field read off an entry, because a control frame is not redacted anywhere on
+ * its way to the service. {@link attachPerf} is idempotent and
  * {@link detachPerf} disconnects every observer and clears every counter,
  * because AAP 0.5.1 requires a cleared hook to be disabled rather than idled —
- * afterwards this module holds no observer, no count and no observation of the
- * developer's page, and a buffered flush that was already queued emits
- * nothing.
+ * afterwards this module holds no count and no observation of the developer's
+ * page, and a buffered flush that was already queued emits nothing. The one
+ * thing a detach may still hold is an observer whose `disconnect()` the host
+ * refused, kept precisely so a later detach can release it (see
+ * {@link detachPerf}).
+ *
+ * That retention is keyed by **entry type**, which is the only shape of it
+ * that is safe. A retained observer is still registered with the host for its
+ * own type, so a later {@link attachPerf} that started a second observer for
+ * that type would have two callbacks processing the same entries and would
+ * emit — and count — every long task, resource, navigation and paint twice,
+ * presenting a capture whose numbers are double what the page did. So
+ * {@link attachPerf} deals with the retained observer for a type before it
+ * considers starting one: it retries the refused `disconnect()` and starts
+ * fresh if the host has changed its mind, and otherwise *adopts* the retained
+ * observer for this attachment rather than adding to it. Adoption is sound
+ * because an observer's callback captures nothing but its entry type — every
+ * per-capture decision (whether the module is attached, the emitted counts,
+ * the bound, the trace context) is read from module state at delivery — so
+ * the observer a previous capture started serves this one exactly as a new
+ * one would. {@link hasPerfResidue} is how `./agent.ts` sees that anything is
+ * retained at all, which is what lets a cleared session say *which* hooks the
+ * page still carries instead of claiming a clean release (AAP 0.5.1, 0.5.5).
  *
  * Nothing observable happens at import time: the module's bindings are
  * declared, and the first observer is created only when {@link attachPerf}
@@ -123,7 +188,13 @@
 
 import { newSpanId } from './ids.js';
 import { resolveEventContext, type EventContext } from './interaction.js';
-import { emit, toEpochMs, type EventDraft } from './transport.js';
+import {
+  emit,
+  nowEpochMs,
+  reportProducerFailure,
+  toEpochMs,
+  type EventDraft,
+} from './transport.js';
 import {
   MAX_PREVIEW_LENGTH,
   type NAVIGATION_ATTRIBUTE_KEYS,
@@ -161,6 +232,26 @@ import type { TelemetryKind } from '../schema/kinds.js';
 export const OBSERVED_ENTRY_TYPES = ['longtask', 'resource', 'navigation', 'paint'] as const;
 
 /**
+ * The entry types observed with `buffered: true`, and therefore the only ones
+ * whose pre-capture entries are allowed into a capture.
+ *
+ * A subset of {@link OBSERVED_ENTRY_TYPES}, and the module's whole buffering
+ * policy — see the header for the reasoning. `navigation` and `paint` describe
+ * the document's lifecycle, occur once, and are gone from the timeline's
+ * delivery path by the time a capture is armed, so replaying them is the only
+ * way to have them at all. `resource` and `longtask` are continuous streams
+ * whose buffers hold the page's entire history; replaying those would open
+ * every capture with a batch of evidence about a moment nobody asked about,
+ * and would spend {@link MAX_ENTRIES_PER_TYPE} before the developer had
+ * interacted with anything.
+ *
+ * Membership also selects the capture-start filter: a type in this list is
+ * exempt from it (an older entry is exactly what it was replayed for), and a
+ * type outside it is measured against {@link getCaptureStartTime}.
+ */
+export const BUFFERED_ENTRY_TYPES = ['navigation', 'paint'] as const;
+
+/**
  * The long-task threshold, in milliseconds: the portion of a task's duration
  * that is *not* counted as blocking.
  *
@@ -176,14 +267,20 @@ export const LONG_TASK_THRESHOLD_MS = 50;
 /**
  * The most events of any one entry type this module emits per capture.
  *
- * A media-heavy page produces hundreds of resource entries before the
- * developer has clicked anything, and a render storm can produce long tasks
- * for as long as it lasts. The bound is per type rather than shared, so a
- * flood of resources cannot starve the long tasks that answer the developer's
- * question. Entries past the bound are counted in {@link getPerfStats}'s
- * `dropped` — reported, not hidden, exactly as `./transport.ts` reports its
- * own queue losses — and the count restarts with each {@link attachPerf}, so
- * the bound is per capture and not per document.
+ * A media-heavy page produces hundreds of resource entries in the course of an
+ * interaction, and a render storm can produce long tasks for as long as it
+ * lasts. The bound is per type rather than shared, so a flood of resources
+ * cannot starve the long tasks that answer the developer's question — and
+ * because the two continuous streams are not replayed, the bound is spent on
+ * the capture's own entries rather than on the page's history.
+ *
+ * Entries past the bound are counted in {@link getPerfStats}'s `dropped` —
+ * reported, not hidden, exactly as `./transport.ts` reports its own queue
+ * losses — and the count restarts with each {@link attachPerf}, so the bound
+ * is per capture and not per document. An entry rejected for predating the
+ * capture is counted separately, in `preCapture`: it was never this capture's
+ * to hold, so charging it to a bound the developer can read as "evidence I
+ * lost" would misreport it.
  */
 export const MAX_ENTRIES_PER_TYPE = 1000;
 
@@ -290,8 +387,35 @@ const KEY_URL: DeclaredPerfEntryKey & DeclaredNavigationKey = 'url';
 /** What initiated the resource load: `script`, `link`, `fetch`, `xmlhttprequest`, … */
 const KEY_INITIATOR_TYPE: DeclaredPerfEntryKey = 'initiator.type';
 
-/** Bytes over the wire, including headers; `0` when the host will not say. */
+/**
+ * Bytes over the wire, including headers.
+ *
+ * Written only when {@link KEY_TRANSFER_SIZE_EXPOSED} is `true`; see the
+ * header's "Faithful numbers, or none". A host that will not say reports `0`,
+ * and that zero is an absence rather than a reading, so it is omitted with the
+ * other two size fields instead of travelling as evidence.
+ */
 const KEY_TRANSFER_SIZE: DeclaredPerfEntryKey & DeclaredNavigationKey = 'transferSize';
+
+/**
+ * Whether Resource Timing exposed byte counts for this entry at all.
+ *
+ * **Invented here**, and load-bearing rather than diagnostic. Neither
+ * `PERF_ENTRY_ATTRIBUTE_KEYS` nor `NAVIGATION_ATTRIBUTE_KEYS` declares a
+ * counterpart, yet without it a consumer cannot tell a same-origin response
+ * that genuinely transferred nothing from a cross-origin response whose sizes
+ * the timing-allow check withheld — both read `transferSize: 0` — and
+ * `transferred_bytes` would publish the second as an observation of zero
+ * bytes (AAP 0.6.6, 0.8.4).
+ *
+ * Emitted on **every** resource and navigation event, `true` or `false`, so
+ * its absence means "a producer that predates this contract" rather than
+ * "not exposed"; `../aggregate/requests.ts` reads exactly this spelling,
+ * re-declares it for the consumer side, and treats an explicit `false` as
+ * decisive. `../schema/attributes.ts` should adopt it in both tuples, at
+ * which point both spellings become one.
+ */
+const KEY_TRANSFER_SIZE_EXPOSED = 'transferSizeExposed';
 
 /** Payload bytes before content decoding. */
 const KEY_ENCODED_BODY_SIZE: DeclaredPerfEntryKey = 'encodedBodySize';
@@ -431,6 +555,10 @@ export interface LongTaskAttribution {
  *   timing".
  * - **`dropped`** — real entries this module declined to emit because the
  *   per-type bound of {@link MAX_ENTRIES_PER_TYPE} was reached.
+ * - **`preCapture`** — real entries that had already finished before this
+ *   capture was armed, discarded by the filter described in the header. A
+ *   non-zero count is ordinary rather than a fault: it is how many pieces of
+ *   somebody else's moment a host offered this capture.
  * - **`failures`** — entries, or whole delivered batches, that could not be
  *   read at all.
  *
@@ -450,6 +578,8 @@ export interface PerfStats {
   emitted: Record<string, number>;
   /** Entries declined because the per-type bound was reached. */
   dropped: number;
+  /** Entries discarded because they had finished before the capture was armed. */
+  preCapture: number;
   /** The entry types the host refused, in {@link OBSERVED_ENTRY_TYPES} order. */
   unavailable: string[];
   /** Entries or batches that could not be read; each costs itself and nothing more. */
@@ -471,14 +601,23 @@ export interface PerfStats {
 let attached = false;
 
 /**
- * The started observers, held so {@link detachPerf} can disconnect every one
- * of them.
+ * The started observers, keyed by the entry type each one observes, held so
+ * {@link detachPerf} can disconnect every one of them.
  *
- * Only observers that actually started are in the list: a type the host
- * refused leaves nothing to release and appears in {@link unavailableTypes}
- * instead.
+ * Only observers that actually started are in the map: a type the host refused
+ * leaves nothing to release and appears in {@link unavailableTypes} instead.
+ *
+ * Keyed rather than listed because the key is load-bearing in two places.
+ * {@link detachPerf} retains exactly the entry whose `disconnect()` the host
+ * refused — that observer is still registered for *that* type — and
+ * {@link attachPerf} must therefore be able to ask "is something already
+ * observing `resource`?" before it starts anything. A flat list cannot answer
+ * that question, and an attach that guesses wrong installs a second observer
+ * for a type already being observed, which makes the capture count every entry
+ * of that type twice. At most one observer per type exists here at any moment,
+ * whether it was started by this attachment or adopted from a previous one.
  */
-const observers: PerformanceObserver[] = [];
+const observersByType = new Map<ObservedEntryType, PerformanceObserver>();
 
 /** Emitted counts per entry type; see {@link PerfStats.emitted}. */
 let emittedCounts = freshCounts();
@@ -486,8 +625,24 @@ let emittedCounts = freshCounts();
 /** Entries declined because a per-type bound was reached. */
 let droppedCount = 0;
 
+/** Entries discarded for having finished before this capture was armed. */
+let preCaptureCount = 0;
+
 /** Entries or batches that could not be read. */
 let failureCount = 0;
+
+/**
+ * When this attachment began, in epoch milliseconds, or `undefined` while
+ * detached.
+ *
+ * {@link attachPerf} is called by `./agent.ts` when the service arms the
+ * performance hook, so this instant *is* the start of the capture as this
+ * module can observe it — no clock other than the one `./transport.ts` already
+ * uses to place every event on the epoch base is consulted, which keeps the
+ * comparison against an entry's converted `startTime` a comparison of two
+ * readings of the same clock.
+ */
+let captureStartedAt: number | undefined;
 
 /** The entry types this host refused, in {@link OBSERVED_ENTRY_TYPES} order. */
 let unavailableTypes: ObservedEntryType[] = [];
@@ -604,6 +759,41 @@ function durationOf(entry: PerformanceEntry): number {
  */
 function nameOf(entry: PerformanceEntry, fallback: string): string {
   return boundedText(entry.name, MAX_EVENT_NAME_LENGTH) ?? fallback;
+}
+
+/**
+ * Whether entries of `type` are replayed from the performance buffer.
+ *
+ * The one place {@link BUFFERED_ENTRY_TYPES} is interpreted, read by both the
+ * observer setup (which passes the flag) and the capture filter (which exempts
+ * the replayed types), so the two can never disagree about which streams carry
+ * pre-capture history on purpose.
+ */
+function isBufferedType(type: ObservedEntryType): boolean {
+  return (BUFFERED_ENTRY_TYPES as readonly ObservedEntryType[]).includes(type);
+}
+
+/**
+ * Whether an entry belongs to the capture in progress.
+ *
+ * The test is on the entry's **end**, not its start: a resource that was still
+ * downloading, or a task that was still blocking, when the developer armed the
+ * capture is part of what they are looking at, while one that had already
+ * finished belongs to a moment nobody asked about. A replayed type is exempt
+ * (see {@link isBufferedType}) and so is the state before an attachment has
+ * recorded its instant, which cannot happen through {@link attachPerf} but
+ * must not become a silent discard if it ever did.
+ *
+ * @param type The entry's type.
+ * @param startTime The entry's start, already on the epoch base.
+ * @param duration The entry's duration in milliseconds.
+ * @returns `true` when the entry may be emitted.
+ */
+function withinCapture(type: ObservedEntryType, startTime: number, duration: number): boolean {
+  if (captureStartedAt === undefined || isBufferedType(type)) {
+    return true;
+  }
+  return startTime + duration >= captureStartedAt;
 }
 
 /*
@@ -760,6 +950,126 @@ function longTaskDraft(
 }
 
 /**
+ * The byte-count fields of resource timing, read defensively.
+ *
+ * Grouped into one shape because they are exposed or withheld together — the
+ * timing-allow check governs all three — so they are read once and decided on
+ * once.
+ */
+interface ResourceByteSizes {
+  /** `transferSize`: bytes over the wire, headers included. */
+  readonly transferSize: number | undefined;
+  /** `encodedBodySize`: payload bytes before content decoding. */
+  readonly encodedBodySize: number | undefined;
+  /** `decodedBodySize`: payload bytes after content decoding. */
+  readonly decodedBodySize: number | undefined;
+}
+
+/**
+ * Whether a URL string names the document's own origin.
+ *
+ * Resolved against `location.href` so a relative entry name — which resource
+ * timing does not produce, but a stub in a test and a shimmed host both can —
+ * is treated as same-origin rather than as unknown. A host with no `URL` or no
+ * `location`, and a name no parser accepts, both answer `false`: the
+ * conservative direction, because the caller uses a `false` to demand
+ * corroboration before it trusts a byte count.
+ */
+function isSameOriginUrl(url: string | undefined): boolean {
+  try {
+    if (url === undefined || typeof URL === 'undefined' || typeof location === 'undefined') {
+      return false;
+    }
+    return new URL(url, location.href).origin === location.origin;
+  } catch {
+    // An unparseable name cannot establish an origin, which is the same answer
+    // as "not the document's".
+    return false;
+  }
+}
+
+/**
+ * Whether this entry's byte counts are a measurement rather than an absence.
+ *
+ * Two routes, and a resource entry needs only one of them:
+ *
+ * 1. **Same origin.** The timing-allow check passes unconditionally for the
+ *    document's own origin, so every field is exposed and a zero is a real
+ *    zero — a response served from cache transferred nothing, which is
+ *    evidence rather than a gap.
+ * 2. **Corroboration, from TAO-gated fields only.** A cross-origin response
+ *    served *with* `Timing-Allow-Origin` exposes the same fields as a
+ *    same-origin one, so any positive size or a non-empty `nextHopProtocol`
+ *    is proof the check passed — those are withheld together, all reading `0`
+ *    or `""`, when it fails. `responseStatus` is deliberately **not** among
+ *    them: Resource Timing exposes a response status for a CORS response
+ *    whether or not the timing-allow check passed, so a plain
+ *    `Access-Control-Allow-Origin` response reports `responseStatus: 200`
+ *    beside three zero sizes and an empty protocol. Treating that status as
+ *    corroboration would certify exactly the case this predicate exists to
+ *    catch.
+ *
+ * The cost of the conservative answer is narrow and worth naming: a
+ * cross-origin response that passed the check and genuinely transferred zero
+ * bytes over every field reads as unexposed. That capture reports `n/a`
+ * instead of `0` — the same answer it would give if the check had failed,
+ * which is the honest one when the two are indistinguishable.
+ *
+ * @param sizes The three byte counts as read from the entry.
+ * @param url The entry's URL, for the origin route.
+ * @param nextHopProtocol The entry's ALPN identifier, when it reported one.
+ */
+function transferSizeExposed(
+  sizes: ResourceByteSizes,
+  url: string | undefined,
+  nextHopProtocol: string | undefined,
+): boolean {
+  if (isSameOriginUrl(url)) {
+    return true;
+  }
+  if (nextHopProtocol !== undefined) {
+    return true;
+  }
+  return (
+    (sizes.transferSize ?? 0) > 0 ||
+    (sizes.encodedBodySize ?? 0) > 0 ||
+    (sizes.decodedBodySize ?? 0) > 0
+  );
+}
+
+/**
+ * Write the byte counts onto an attribute bag, or record that there were none.
+ *
+ * The single place the decision of {@link transferSizeExposed} is applied, so
+ * a resource entry and a navigation entry can never disagree about what an
+ * unexposed size looks like on the wire. {@link KEY_TRANSFER_SIZE_EXPOSED} is
+ * written either way — a consumer needs to know the question was asked — and
+ * the sizes are written only when the answer is `true`, each still subject to
+ * its own defensive read, so a host that exposes two of the three fields
+ * reports two.
+ */
+function applyByteSizes(
+  attributes: Record<string, unknown>,
+  sizes: ResourceByteSizes,
+  exposed: boolean,
+): void {
+  attributes[KEY_TRANSFER_SIZE_EXPOSED] = exposed;
+  if (!exposed) {
+    return;
+  }
+
+  if (sizes.transferSize !== undefined) {
+    attributes[KEY_TRANSFER_SIZE] = sizes.transferSize;
+  }
+  if (sizes.encodedBodySize !== undefined) {
+    attributes[KEY_ENCODED_BODY_SIZE] = sizes.encodedBodySize;
+  }
+  if (sizes.decodedBodySize !== undefined) {
+    attributes[KEY_DECODED_BODY_SIZE] = sizes.decodedBodySize;
+  }
+}
+
+/**
  * Map a `resource` entry to a `perf.entry` event.
  *
  * The event's `name` is the constant `resource` and the URL travels in the
@@ -771,10 +1081,10 @@ function longTaskDraft(
  *
  * Every other field is read defensively and omitted when the host will not
  * say. **This is the only source of `transferred_bytes` in the whole product**
- * (AAP 0.6.6): server spans cannot report a transferred size at all, and this
- * entry reports `0` for a cross-origin response served without
- * `Timing-Allow-Origin`. That zero is emitted as measured, so the aggregate
- * can present the metric as `n/a` rather than as a number nobody measured.
+ * (AAP 0.6.6): server spans cannot report a transferred size at all. The byte
+ * counts therefore carry {@link KEY_TRANSFER_SIZE_EXPOSED} beside them and are
+ * omitted when the host withheld them, so the aggregate presents the metric as
+ * `n/a` rather than as a zero nobody measured — see the header.
  */
 function resourceDraft(
   entry: PerformanceEntry,
@@ -794,28 +1104,14 @@ function resourceDraft(
   const attributes: Record<string, unknown> = { [KEY_ENTRY_TYPE]: 'resource' };
 
   // Raw, unbounded, exactly as the host reported it.
-  if (typeof entry.name === 'string' && entry.name.length > 0) {
-    attributes[KEY_URL] = entry.name;
+  const url = typeof entry.name === 'string' && entry.name.length > 0 ? entry.name : undefined;
+  if (url !== undefined) {
+    attributes[KEY_URL] = url;
   }
 
   const initiatorType = boundedText(source.initiatorType, MAX_ATTRIBUTE_STRING_LENGTH);
   if (initiatorType !== undefined) {
     attributes[KEY_INITIATOR_TYPE] = initiatorType;
-  }
-
-  const transferSize = measurement(source.transferSize);
-  if (transferSize !== undefined) {
-    attributes[KEY_TRANSFER_SIZE] = transferSize;
-  }
-
-  const encodedBodySize = measurement(source.encodedBodySize);
-  if (encodedBodySize !== undefined) {
-    attributes[KEY_ENCODED_BODY_SIZE] = encodedBodySize;
-  }
-
-  const decodedBodySize = measurement(source.decodedBodySize);
-  if (decodedBodySize !== undefined) {
-    attributes[KEY_DECODED_BODY_SIZE] = decodedBodySize;
   }
 
   const nextHopProtocol = boundedText(source.nextHopProtocol, MAX_ATTRIBUTE_STRING_LENGTH);
@@ -825,10 +1121,23 @@ function resourceDraft(
 
   // `0` means "not exposed" for this field rather than "status zero", so it is
   // the one numeric reading here that is dropped instead of reported.
-  const responseStatus = measurement(source.responseStatus);
-  if (responseStatus !== undefined && responseStatus > 0) {
+  const responseStatusReading = measurement(source.responseStatus);
+  const responseStatus =
+    responseStatusReading !== undefined && responseStatusReading > 0
+      ? responseStatusReading
+      : undefined;
+  if (responseStatus !== undefined) {
     attributes[KEY_RESPONSE_STATUS] = responseStatus;
   }
+
+  // Decided together and written together: the timing-allow check governs all
+  // three sizes, so one predicate answers for them.
+  const sizes: ResourceByteSizes = {
+    transferSize: measurement(source.transferSize),
+    encodedBodySize: measurement(source.encodedBodySize),
+    decodedBodySize: measurement(source.decodedBodySize),
+  };
+  applyByteSizes(attributes, sizes, transferSizeExposed(sizes, url, nextHopProtocol));
 
   const renderBlockingStatus = boundedText(
     source.renderBlockingStatus,
@@ -871,8 +1180,9 @@ function navigationDraft(
   const duration = durationOf(entry);
   const attributes: Record<string, unknown> = { [KEY_DURATION]: duration };
 
-  if (typeof entry.name === 'string' && entry.name.length > 0) {
-    attributes[KEY_URL] = entry.name;
+  const url = typeof entry.name === 'string' && entry.name.length > 0 ? entry.name : undefined;
+  if (url !== undefined) {
+    attributes[KEY_URL] = url;
   }
 
   const navigationType = boundedText(source.type, MAX_ATTRIBUTE_STRING_LENGTH);
@@ -895,10 +1205,17 @@ function navigationDraft(
     attributes[KEY_LOAD_EVENT_END] = loadEventEnd;
   }
 
-  const transferSize = measurement(source.transferSize);
-  if (transferSize !== undefined) {
-    attributes[KEY_TRANSFER_SIZE] = transferSize;
-  }
+  // The document's own response, so the origin route of
+  // `transferSizeExposed` answers for it in the ordinary case; the
+  // corroboration route covers a document served from another origin, and a
+  // navigation entry carries neither body sizes nor an ALPN identifier to
+  // corroborate with, which is why only `transferSize` is passed.
+  const sizes: ResourceByteSizes = {
+    transferSize: measurement(source.transferSize),
+    encodedBodySize: undefined,
+    decodedBodySize: undefined,
+  };
+  applyByteSizes(attributes, sizes, transferSizeExposed(sizes, url, undefined));
 
   return buildDraft(NAVIGATION_KIND, 'navigation', startTime, duration, context, attributes);
 }
@@ -923,9 +1240,13 @@ function paintDraft(entry: PerformanceEntry, startTime: number, context: EventCo
  * Exhaustive over {@link ObservedEntryType}, so adding a member to
  * {@link OBSERVED_ENTRY_TYPES} without mapping it is a compile error rather
  * than an observer whose entries are silently discarded.
+ *
+ * `startTime` is supplied by the caller, which has already converted it to
+ * decide whether the entry belongs to this capture: one conversion per entry,
+ * and the instant the event carries is the instant that decision was made
+ * against.
  */
-function draftFor(type: ObservedEntryType, entry: PerformanceEntry): EventDraft {
-  const startTime = epochStartOf(entry);
+function draftFor(type: ObservedEntryType, entry: PerformanceEntry, startTime: number): EventDraft {
   const context = resolveEventContext();
 
   switch (type) {
@@ -947,19 +1268,35 @@ function draftFor(type: ObservedEntryType, entry: PerformanceEntry): EventDraft 
  */
 
 /**
- * Map one entry and hand it to the transport, within the per-type bound.
+ * Map one entry and hand it to the transport, within the per-type bound and
+ * the capture window.
  *
- * The bound is checked before the mapping is done, so an entry past the bound
- * costs a counter increment and nothing else — which matters on the page that
- * makes the bound relevant in the first place.
+ * Both guards are checked before the mapping is done, so a rejected entry
+ * costs two field reads and a counter increment and nothing else — which
+ * matters on exactly the page that makes either guard relevant. The window
+ * check runs first because a host that ignored `buffered: false` would
+ * otherwise spend the whole per-type bound on history before the capture's own
+ * first entry arrived.
+ *
+ * The two readings the window check needs are the same ones the draft would
+ * compute, so they are computed here and handed down rather than read twice:
+ * `epochStartOf` consults the clock, and a second reading could place the same
+ * entry on either side of the boundary.
  */
 function observeEntry(type: ObservedEntryType, entry: PerformanceEntry): void {
+  const startTime = epochStartOf(entry);
+  const duration = type === 'paint' ? 0 : durationOf(entry);
+
+  if (!withinCapture(type, startTime, duration)) {
+    preCaptureCount += 1;
+    return;
+  }
   if (emittedCounts[type] >= MAX_ENTRIES_PER_TYPE) {
     droppedCount += 1;
     return;
   }
 
-  emit(draftFor(type, entry));
+  emit(draftFor(type, entry, startTime));
   emittedCounts[type] += 1;
 }
 
@@ -969,9 +1306,9 @@ function observeEntry(type: ObservedEntryType, entry: PerformanceEntry): void {
  * Two guards, and each earns its place. The outer one contains a host whose
  * entry list itself misbehaves — a stub in a test, a page that replaced
  * `PerformanceObserverEntryList` — to the batch. The inner one contains a
- * single malformed entry to itself, which is the point: a buffered flush can
- * deliver hundreds of resource entries at once, and one unreadable entry among
- * them must not cost the rest.
+ * single malformed entry to itself, which is the point: one flush can deliver
+ * many entries at once, and one unreadable entry among them must not cost the
+ * rest.
  *
  * The attachment check is not redundant with `disconnect()`. A batch queued
  * before the disconnect can still be delivered afterwards, and emitting then
@@ -988,15 +1325,22 @@ function handleEntries(type: ObservedEntryType, list: PerformanceObserverEntryLi
     for (const entry of list.getEntries()) {
       try {
         observeEntry(type, entry);
-      } catch {
-        // One entry's failure is its own: counted, and the batch continues.
+      } catch (error) {
+        // One entry's failure is its own: counted, reported and the batch
+        // continues. The report is what makes the loss visible off this page —
+        // `getPerfStats().failures` is read by a diagnostics view and by
+        // nothing else, so on its own it lets a capture present incomplete
+        // timing as complete (AAP 0.5.5). The entry type is agent vocabulary
+        // and safe to carry; nothing read off the entry is.
         failureCount += 1;
+        reportProducerFailure('perf', 'entry-convert', error, { entryType: type });
       }
     }
-  } catch {
+  } catch (error) {
     // The batch could not be read at all. Nothing in it is recoverable, and
     // the observer stays registered for the next one.
     failureCount += 1;
+    reportProducerFailure('perf', 'entry-batch', error, { entryType: type });
   }
 }
 
@@ -1011,10 +1355,12 @@ function handleEntries(type: ObservedEntryType, list: PerformanceObserverEntryLi
  * disconnects what was constructed, so no half-started observer is left
  * holding a callback.
  *
- * `{ type, buffered: true }` and never `entryTypes`: the Performance Timeline
- * specification forbids combining the two, and buffering is what lets a
- * capture armed after page load still see the navigation and paint entries the
- * document produced once.
+ * `{ type, buffered }` and never `entryTypes`: the Performance Timeline
+ * specification forbids combining the two, and the flag is per type rather
+ * than uniform — {@link BUFFERED_ENTRY_TYPES} holds the document-lifecycle
+ * types a capture armed after page load could not otherwise see, while the
+ * continuous streams start empty so a capture observes its own moment. The
+ * header states the reasoning in full.
  *
  * @returns The started observer, or `undefined` when this host cannot deliver
  * the type — in which case the caller records it as unavailable.
@@ -1025,22 +1371,80 @@ function startObserver(type: ObservedEntryType): PerformanceObserver | undefined
     created = new PerformanceObserver((list) => {
       handleEntries(type, list);
     });
-  } catch {
+  } catch (error) {
     // No usable observer could be constructed; the type is unavailable.
+    reportProducerFailure('perf', 'observer-construct', error, { entryType: type });
     return undefined;
   }
 
   try {
-    const init: PerformanceObserverInit = { type, buffered: true };
+    const init: PerformanceObserverInit = { type, buffered: isBufferedType(type) };
     created.observe(init);
     return created;
-  } catch {
+  } catch (error) {
+    // Reported as well as listed in `unavailable`: the caller's list reaches
+    // the service only when the *whole* hook is refused, while a single type
+    // the host declined is otherwise silent — and "no long tasks" must never
+    // read as "no long-task timing" (AAP 0.5.5).
+    reportProducerFailure('perf', 'observer-start', error, { entryType: type });
     try {
       created.disconnect();
-    } catch {
-      // Nothing was observing, so there is nothing left to release.
+    } catch (disconnectError) {
+      // Nothing was observing, so there is nothing left to release — but the
+      // host refusing both calls is worth saying, because it is the state in
+      // which a half-started observer could still hold a callback.
+      reportProducerFailure('perf', 'observer-rollback', disconnectError, { entryType: type });
     }
     return undefined;
+  }
+}
+
+/**
+ * Settle whatever a previous {@link detachPerf} retained for one entry type,
+ * before this attachment considers starting an observer for it.
+ *
+ * A retained observer is one whose `disconnect()` the host refused while it
+ * was still registered for this type. Two outcomes, and the distinction is the
+ * whole point of keying retention by type:
+ *
+ * - **The retry succeeds.** The observer is released and forgotten, and the
+ *   caller starts a fresh one — the ordinary path once a transient host
+ *   failure has passed.
+ * - **The retry throws again.** The observer stays registered and stays in
+ *   {@link observersByType}, and the caller *adopts* it: it is already
+ *   observing exactly this type, so starting a second one would deliver every
+ *   entry of the type to two callbacks and count it twice. The refusal is
+ *   reported, because a capture running on an observer it could not release is
+ *   a fact about the page rather than an internal detail (AAP 0.5.5), and the
+ *   observer's callback needs no rebinding: it captures only the entry type
+ *   and reads this module's per-capture state when a batch arrives.
+ *
+ * Never throws: the only host call it makes is guarded.
+ *
+ * @param type The entry type whose retained observer, if any, to settle.
+ * @returns `true` when a retained observer is still registered for this type
+ * and has been adopted for this attachment — the caller must not start
+ * another. `false` when nothing was retained, or when the retained observer
+ * was successfully released and a fresh one is needed.
+ */
+function adoptRetainedObserver(type: ObservedEntryType): boolean {
+  const retained = observersByType.get(type);
+  if (retained === undefined) {
+    return false;
+  }
+
+  // Removed before the call, as in `detachPerf`, so a host that throws is the
+  // only thing that puts it back: a `disconnect()` that succeeded must not
+  // leave a reference behind for a later detach to disconnect twice.
+  observersByType.delete(type);
+
+  try {
+    retained.disconnect();
+    return false;
+  } catch (error) {
+    observersByType.set(type, retained);
+    reportProducerFailure('perf', 'observer-adopt', error, { entryType: type });
+    return true;
   }
 }
 
@@ -1063,6 +1467,20 @@ function startObserver(type: ObservedEntryType): PerformanceObserver | undefined
  * counters, so a re-configuration after a reconnect cannot make one capture
  * look like two.
  *
+ * **At most one observer per entry type, across a refused detach.** An
+ * observer a previous {@link detachPerf} could not disconnect is still
+ * registered with the host for its own entry type, so this function settles
+ * that retention per type before it starts anything (see
+ * {@link adoptRetainedObserver}): the refused `disconnect()` is retried, and
+ * either it succeeds and a fresh observer is started, or the retained observer
+ * is adopted as this attachment's observer for that type. The alternative —
+ * starting a second observer for a type something is already observing — is
+ * the one failure mode that corrupts the numbers rather than losing them: two
+ * callbacks would emit and count each of that type's entries twice, and a
+ * capture that reports double the long tasks the page ran is worse than one
+ * that reports none. An adopted observer counts as started, because the type
+ * *is* being observed.
+ *
  * **The counters are reset here**, which is what makes
  * {@link MAX_ENTRIES_PER_TYPE} a per-capture bound and
  * {@link getPerfStats}'s numbers a description of the capture in progress
@@ -1076,7 +1494,9 @@ function startObserver(type: ObservedEntryType): PerformanceObserver | undefined
  *
  * Never throws. A failure part-way through registration detaches, so the
  * module is either attached with every observer it could start or fully
- * detached, and never holding an observer it cannot release.
+ * detached — in the second case holding nothing but an observer the host
+ * itself refused to release, which {@link hasPerfResidue} makes visible and
+ * the next call adopts or retries rather than duplicating.
  */
 export function attachPerf(): void {
   try {
@@ -1086,11 +1506,20 @@ export function attachPerf(): void {
 
     emittedCounts = freshCounts();
     droppedCount = 0;
+    preCaptureCount = 0;
     failureCount = 0;
     unavailableTypes = [];
 
+    // Recorded before the first observer exists, so no entry this attachment
+    // delivers can be measured against an instant later than its own arrival.
+    captureStartedAt = nowEpochMs();
+
     if (typeof PerformanceObserver === 'undefined') {
       unavailableTypes = [...OBSERVED_ENTRY_TYPES];
+      // Nothing was registered, so this attachment never began: the boundary
+      // is cleared with the same reasoning that clears `attached` below, and
+      // the unavailable list stays for the readiness report.
+      captureStartedAt = undefined;
       return;
     }
 
@@ -1099,24 +1528,50 @@ export function attachPerf(): void {
     // be eager — finds the module attached rather than dropping its batch.
     attached = true;
 
+    let started = 0;
     for (const type of OBSERVED_ENTRY_TYPES) {
+      // Anything a previous detach retained for this type is settled first: it
+      // is either released and replaced, or adopted as this attachment's
+      // observer for the type. Either way exactly one observer observes the
+      // type afterwards, which is what keeps a capture from counting every
+      // entry twice.
+      if (adoptRetainedObserver(type)) {
+        started += 1;
+        continue;
+      }
+
       const observer = startObserver(type);
       if (observer === undefined) {
         unavailableTypes.push(type);
         continue;
       }
-      observers.push(observer);
+      observersByType.set(type, observer);
+      started += 1;
     }
 
-    if (observers.length === 0) {
+    if (started === 0) {
       // Every type was refused. Nothing was registered, so there is nothing to
       // disconnect and no signal to claim: clearing the flag keeps
-      // `isPerfAttached()` honest, and the unavailable list stays for the
-      // readiness report — which is the whole value of this state.
+      // `isPerfAttached()` honest, clearing the boundary keeps
+      // `getCaptureStartTime()` honest with it — both report the detached
+      // state, which is what this is — and the unavailable list stays for the
+      // readiness report, which is the whole value of it.
+      //
+      // Counted rather than measured as `observersByType.size`, because
+      // `started` is the statement being made — "this attachment observes n of
+      // the four types" — and an adopted observer counts towards it exactly as
+      // a freshly started one does. Reading the container's size would tie a
+      // readiness decision to how retention happens to be stored.
       attached = false;
+      captureStartedAt = undefined;
     }
-  } catch {
+  } catch (error) {
+    // Registration failed in a way none of the per-type guards covered. The
+    // module is returned to fully detached — never attached with an observer
+    // it cannot release — and the failure is reported rather than left to be
+    // inferred from an empty `perf` signal (AAP 0.5.5).
     detachPerf();
+    reportProducerFailure('perf', 'attach', error);
   }
 }
 
@@ -1136,7 +1591,21 @@ export function attachPerf(): void {
  *
  * Safe to call when already detached, and never throws — each observer is
  * disconnected inside its own guard, so a host that throws on `disconnect`
- * costs that one reference rather than the teardown.
+ * costs that one observer rather than the teardown.
+ *
+ * **An observer that refused to disconnect is kept under its entry type, not
+ * forgotten.** It is still registered with the host, so releasing the last
+ * reference to it would leave the page delivering batches to a callback
+ * nothing can ever stop; the reference stays in {@link observersByType} keyed
+ * by the type it observes, the failure is reported as an `agent.error` frame
+ * (AAP 0.5.5), {@link hasPerfResidue} then answers `true` so `./agent.ts` can
+ * name this hook in its `hooks-not-released` announcement, and the next
+ * {@link detachPerf} tries again. Keying the retention by type is what lets
+ * the next {@link attachPerf} adopt that observer instead of starting a second
+ * one for a type already being observed, which would count every entry of the
+ * type twice. The module is detached either way — `isPerfAttached()` is
+ * `false` and a delivered batch is dropped on arrival — so a retained observer
+ * costs a callback that returns immediately, never an event.
  */
 export function detachPerf(): void {
   try {
@@ -1144,22 +1613,39 @@ export function detachPerf(): void {
     // module detached and drop itself.
     attached = false;
 
-    for (const observer of observers.splice(0, observers.length)) {
+    // Taken out of the map before the loop so a re-entrant call cannot
+    // disconnect the same observer twice, and put back under its own entry
+    // type when the host refuses: an observer whose `disconnect()` threw is
+    // still registered, so dropping the only reference to it would leave the
+    // page holding a callback this module can never release — the opposite of
+    // AAP 0.5.1's "disabled, not merely idled". Retained *with its type*, a
+    // later {@link detachPerf} retries it and a later {@link attachPerf} knows
+    // that type is already being observed instead of starting a second
+    // observer for it.
+    const pending = [...observersByType];
+    observersByType.clear();
+
+    for (const [type, observer] of pending) {
       try {
         observer.disconnect();
-      } catch {
-        // A host that throws on disconnect has already stopped delivering; the
-        // reference is dropped either way.
+      } catch (error) {
+        observersByType.set(type, observer);
+        reportProducerFailure('perf', 'observer-disconnect', error);
       }
     }
 
     emittedCounts = freshCounts();
     droppedCount = 0;
+    preCaptureCount = 0;
     failureCount = 0;
     unavailableTypes = [];
-  } catch {
+    captureStartedAt = undefined;
+  } catch (error) {
     // Best effort by construction: the steps above are independent, so a
-    // failure in one leaves the others done.
+    // failure in one leaves the others done. Reported for the same reason
+    // every other guard here reports — a teardown that half-succeeded is a
+    // fact about the page, not an internal detail (AAP 0.5.5).
+    reportProducerFailure('perf', 'detach', error);
   } finally {
     attached = false;
   }
@@ -1178,6 +1664,56 @@ export function isPerfAttached(): boolean {
 }
 
 /**
+ * When the current attachment began, in epoch milliseconds, or `undefined`
+ * while detached.
+ *
+ * The boundary every non-replayed entry is measured against, exposed so that
+ * `./agent.ts`'s status frame and a test can state the capture's own window
+ * rather than infer it from the events that survived the filter. A reading
+ * from `./transport.ts`'s clock, so it is directly comparable with any
+ * event's `startTime`.
+ *
+ * Defined exactly when {@link isPerfAttached} is `true`. The two states agree
+ * on every path, including the two on which {@link attachPerf} is asked for a
+ * hook the host cannot provide — no `PerformanceObserver` at all, or every
+ * entry type refused — because a boundary without an observer behind it would
+ * describe a capture that never began.
+ */
+export function getCaptureStartTime(): number | undefined {
+  return captureStartedAt;
+}
+
+/**
+ * Whether the page still carries an observer this module's last detach
+ * could not disconnect — residue, as distinct from an observation.
+ *
+ * `isPerfAttached()` answers "is this module observing?", which is what a
+ * readiness or status frame reports, and it is deliberately `false` after a
+ * detach that the host refused: nothing is being harvested and every delivered
+ * batch is dropped on arrival. But the observer is still registered, and
+ * AAP 0.5.1 requires a cleared hook to be *disabled* rather than idled — so
+ * `./agent.ts` needs a second question it can ask, or its
+ * `hooks-not-released` announcement could not name which hooks the page is
+ * still carrying and a session would end claiming a clean release it did not
+ * achieve (AAP 0.5.5). This is that question, with the same name, signature
+ * and meaning in every producer of this folder.
+ *
+ * - `true` while any observer whose `disconnect()` the host refused is still
+ *   held. There is exactly one such observer per entry type at most, and the
+ *   developer clears them by reloading the tab.
+ * - `false` when nothing is retained, and `false` whenever the module is
+ *   armed: an armed module's observers are live observation, not residue —
+ *   including one adopted from a refused detach, which this attachment is
+ *   using as its own (see {@link attachPerf}).
+ *
+ * Never throws: it reads two module bindings and makes no host call. Cheap
+ * enough to ask on every status frame.
+ */
+export function hasPerfResidue(): boolean {
+  return !attached && observersByType.size > 0;
+}
+
+/**
  * What this attachment has observed, and what it could not.
  *
  * A fresh object with a copied count record and a copied list on every call,
@@ -1188,6 +1724,7 @@ export function getPerfStats(): PerfStats {
   return {
     emitted: { ...emittedCounts },
     dropped: droppedCount,
+    preCapture: preCaptureCount,
     unavailable: [...unavailableTypes],
     failures: failureCount,
   };

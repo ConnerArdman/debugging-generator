@@ -45,6 +45,28 @@
  *   inside a `try`/`catch`, and a re-entrancy guard makes the loop
  *   impossible rather than merely unlikely.
  *
+ * ## Only a branded error has its fields read
+ *
+ * A thrown value or a rejection reason is an arbitrary application value, and
+ * the three fields worth recording — `name`, `message`, `stack` — are read
+ * only from a value the language itself vouches for as an error
+ * ({@link isBrandedError}: `Error.isError`, the `[[ErrorData]]` internal-slot
+ * check, whose answer is final where the host has it, and on a host without it
+ * a brand the value cannot supply for itself). Every other value contributes
+ * its category tag, `[object]` or `[array]` or `[dom]`, and no property of it
+ * is touched at all.
+ *
+ * The predicate reads a *brand*, never a shape, and nothing forgeable may
+ * overturn it. Duck typing is the failure it replaced: an object's `name` and
+ * `message` are the application's to shape, so "looks like an error" is a test
+ * the application passes whenever it rejects a record of its own — a response
+ * payload, a validation model, a GraphQL error list — and every such record
+ * would then be copied into the capture, persisted, tailed to DevTools and
+ * aggregated into model input (AAP 0.5.2). `instanceof`, a prototype
+ * declaration and a self-declared `Symbol.toStringTag` are all shapes of the
+ * same failure, one indirection further out, which is why none of them is
+ * consulted either.
+ *
  * ## Why this file does not redact
  *
  * Messages and stacks are recorded verbatim (bounded, see below) and scrubbing
@@ -90,11 +112,12 @@
  * injected into the developer's page at `document_start` and hard-fails on any
  * input resolving to a Node builtin, `@debuggen/protocol`,
  * `@debuggen/shared/node` or `zod`. The four imports below are therefore the
- * whole list: ids and transport for emission, interaction for attribution, and
- * the two dependency-free schema vocabularies type-only, so no vocabulary
- * table reaches the page bundle at runtime (the same shape `./interaction.ts`
- * uses). `./agent.ts` is deliberately absent — it drives this module, and an
- * import back would close a cycle.
+ * whole list: ids and transport for emission and for the bounded
+ * producer-failure report this module's guards send, interaction for
+ * attribution, and the two dependency-free schema vocabularies type-only, so
+ * no vocabulary table reaches the page bundle at runtime (the same shape
+ * `./interaction.ts` uses). `./agent.ts` is deliberately absent — it drives
+ * this module, and an import back would close a cycle.
  *
  * Nothing observable happens at import time. Module scope here is one page
  * document, and a listener exists only between {@link attachErrors} and
@@ -108,7 +131,7 @@
 
 import { resolveEventContext } from './interaction.js';
 import { newSpanId } from './ids.js';
-import { emit, nowEpochMs, type EventDraft } from './transport.js';
+import { emit, nowEpochMs, reportProducerFailure, type EventDraft } from './transport.js';
 import type { AttributeValueType, ERROR_ATTRIBUTE_KEYS } from '../schema/attributes.js';
 import type { TelemetryKind, TelemetryStatus } from '../schema/kinds.js';
 
@@ -269,6 +292,64 @@ const ERROR_EVENT_TYPE = 'error';
 
 /** The event type that carries unhandled promise rejections. */
 const REJECTION_EVENT_TYPE = 'unhandledrejection';
+
+/*
+ * ---------------------------------------------------------------------------
+ * Failure-report stages
+ *
+ * `./transport.ts`'s `reportProducerFailure('errors', stage, …)` turns one of
+ * this module's contained failures into a single `agent.error` frame
+ * (`code: 'producer-failure'`), bounded to `MAX_PRODUCER_FAILURE_REPORTS` per
+ * source per capture and carrying only the source, the stage below and the
+ * thrown value's *type* name. That bound and that sanitization live there, so
+ * nothing here rate-limits and nothing here passes a page string — no
+ * message, no URL, no rejection value — in a stage or a detail field.
+ *
+ * Why report at all: a swallowed failure used to be visible only as
+ * `getErrorStats().failures`, which nothing outside the page reads, so a
+ * capture could lose the error signal entirely while both UIs showed a
+ * capture that succeeded. AAP 0.5.5 requires the missing signal to be stated
+ * rather than inferred.
+ *
+ * One stage id per distinct thing that can go wrong, because the stage is what
+ * a developer reads in the frame:
+ *
+ * - {@link STAGE_RECORD} — a failure arrived and could not be turned into an
+ *   event. The capture is short one error row.
+ * - {@link STAGE_ATTACH} — the hook could not be armed. The capture has no
+ *   error signal at all.
+ * - {@link STAGE_ERROR_LISTENER_REMOVE} /
+ *   {@link STAGE_REJECTION_LISTENER_REMOVE} — a listener could not be taken
+ *   off the window, so instrumentation outlived the capture (AAP 0.5.1).
+ * - {@link STAGE_DETACH_RESIDUAL} — which listeners that detach left behind.
+ * - {@link STAGE_DETACH_STATE_RESET} — the state reset itself failed.
+ *
+ * Deliberately *not* reported: the per-field guards in `readProperty`,
+ * `isDomNode`, `isErrorLike` and `readTagName`. Each costs one attribute of
+ * one event and leaves the event itself intact, they run once per property of
+ * every failure on a page that may be failing in a loop, and one hostile
+ * accessor would otherwise spend this source's whole four-frame budget on a
+ * truncated stack while a genuinely lost signal went unreported.
+ * ---------------------------------------------------------------------------
+ */
+
+/** A failure raised while summarising or emitting one observed failure. */
+const STAGE_RECORD = 'record';
+
+/** A failure raised while registering the listeners in {@link attachErrors}. */
+const STAGE_ATTACH = 'attach';
+
+/** A failure raised removing the `error` listener in {@link detachErrors}. */
+const STAGE_ERROR_LISTENER_REMOVE = 'error-listener-remove';
+
+/** A failure raised removing the `unhandledrejection` listener. */
+const STAGE_REJECTION_LISTENER_REMOVE = 'rejection-listener-remove';
+
+/** Listeners still on the window after {@link detachErrors} returned. */
+const STAGE_DETACH_RESIDUAL = 'detach-residual';
+
+/** A failure raised resetting module state in {@link detachErrors}. */
+const STAGE_DETACH_STATE_RESET = 'detach-state-reset';
 
 /*
  * ---------------------------------------------------------------------------
@@ -473,8 +554,9 @@ interface BoundedText {
  */
 interface DescribedValue {
   /**
-   * The value's class, when the value was error-like: `TypeError`,
-   * `DOMException`, whatever the application named its error subclass.
+   * The value's class, when the value was a branded error
+   * ({@link isBrandedError}): `TypeError`, `DOMException`, whatever the
+   * application named its error subclass.
    *
    * Kept apart from {@link type} because it is the one field fit to become an
    * event `name`: a class groups a hundred occurrences of one bug into one
@@ -546,19 +628,35 @@ interface CapturedError {
  * ---------------------------------------------------------------------------
  */
 
-/** Whether {@link attachErrors} has registered the listeners. */
+/**
+ * Whether this module is *observing* — the single condition {@link record}
+ * gates on.
+ *
+ * Deliberately not "whether a listener is registered": the two can disagree,
+ * and when they do, this is the one that decides whether anything is recorded.
+ * {@link detachErrors} clears it before it touches the window, so a listener
+ * the page refuses to remove is inert from that moment on. What is still
+ * registered is stated by {@link errorListener} and
+ * {@link rejectionListener}, which are the residue a later detach retries.
+ */
 let attached = false;
 
 /**
- * The exact `error` listener reference, kept for symmetric removal.
+ * The exact `error` listener reference while it is (or may still be) on the
+ * window, and `undefined` once its removal has returned.
  *
- * `removeEventListener` matches on the function identity and the capture flag,
- * so a fresh closure or a mismatched flag at detach would leave the page with
- * a listener the agent can no longer reach.
+ * Two jobs, and the second is why it is cleared *after* the removal rather
+ * than before it. First, `removeEventListener` matches on the function
+ * identity and the capture flag, so a fresh closure or a mismatched flag at
+ * detach would leave the page with a listener the agent can no longer reach.
+ * Second, the reference *is* the record of un-finished teardown: a removal
+ * that threw leaves it set, which is what lets the next {@link detachErrors}
+ * retry the same listener and what stops {@link attachErrors} from adding a
+ * second one beside it.
  */
 let errorListener: ((event: Event) => void) | undefined;
 
-/** The exact `unhandledrejection` listener reference, for the same reason. */
+/** The exact `unhandledrejection` listener reference, for the same reasons. */
 let rejectionListener: ((event: Event) => void) | undefined;
 
 /**
@@ -787,39 +885,238 @@ function primitiveTextOf(value: unknown): string | undefined {
   }
 }
 
-/**
- * Whether a value is an `Error`, including one from another realm.
+/*
+ * ---------------------------------------------------------------------------
+ * Error branding
  *
- * `instanceof` answers the ordinary case. The duck-typed fallback is what
- * catches an error thrown inside an iframe or a worker, whose prototype chain
- * belongs to a different global and therefore fails `instanceof` while being
- * exactly the object whose three fields a developer wants to read. The cost of
- * the fallback admitting a plain `{ name, message }` object is three guarded
- * property reads and a message that reads like the one the application wrote,
- * which is a good trade for not losing a real error's stack.
+ * Only a value the language itself calls an error has its `name`, `message`
+ * and `stack` read. Everything else — however error-shaped it looks — is
+ * described by its category tag alone, and no property of it is ever touched.
+ *
+ * **The brand is proof, not resemblance, and a proven negative is final.**
+ * Exactly one thing in the language answers "is this an error" from an
+ * internal slot the page cannot write: `Error.isError`, which reads
+ * `[[ErrorData]]`. Where the host has it, its answer *is* this module's
+ * answer — including its `false`, which no weaker check may overturn. That
+ * ordering is the whole design, because every other available signal is
+ * forgeable in one line of page code:
+ *
+ * - `value instanceof Error` consults `Error[Symbol.hasInstance]` and the
+ *   prototype chain, both of which the page owns, and it is already `true`
+ *   for `Object.create(Error.prototype)` — an object with no error slot,
+ *   whose `message` and `stack` are whatever the application put there.
+ * - `Object.prototype.toString.call(value)` returns a value's
+ *   `Symbol.toStringTag` — own **or inherited** — in preference to any
+ *   internal slot, so `Object.create({ [Symbol.toStringTag]: 'Error' })`
+ *   brands itself `[object Error]` while owning no property at all.
+ *
+ * So `instanceof` is not consulted here, and the brand string is trusted only
+ * on a host with no `Error.isError` at all, and then only for a value that
+ * carries no `@@toStringTag` anywhere on its prototype chain. That condition
+ * is what separates the two: a real `Error` never carries a tag at any level,
+ * because `Error.prototype` defines none, while a forgery has nowhere left to
+ * put its claim.
+ *
+ * The consequence worth stating: on such a host a `DOMException` is described
+ * as `[object]` rather than by its class, because nothing there can prove its
+ * brand. That is the deliberate trade — an unprovable brand costs a class
+ * name, while a forgeable one costs the developer's data (AAP 0.5.2) — and it
+ * is unreachable on the hosts this product declares, where `Error.isError`
+ * exists and WebIDL gives `DOMException` the same `[[ErrorData]]` slot a
+ * built-in error has.
+ *
+ * Both intrinsics are captured here, at module evaluation, rather than read at
+ * the moment a failure arrives. This module is bundled into the agent IIFE
+ * injected at `document_start`, so module evaluation happens before the page's
+ * first line of script: the references below are the realm's own whatever the
+ * page later installs over `Error.isError` or `Object.prototype.toString`.
+ * Read at call time, a polyfill bundle — or a page that deliberately reshapes
+ * the intrinsics — would get a vote on what this module treats as an error,
+ * and so on which of its own objects get copied into the capture.
+ * ---------------------------------------------------------------------------
  */
-function isErrorLike(value: unknown): boolean {
+
+/** The shape of `Error.isError`: a predicate over an arbitrary value. */
+type ErrorBrandPredicate = (value: unknown) => boolean;
+
+/** `Object.prototype.toString`'s answer for a genuine `Error`. */
+const BRAND_ERROR = '[object Error]';
+
+/**
+ * Read `Error.isError` from the `Error` constructor, if this host has it.
+ *
+ * Reached through a capability read rather than a declaration because the
+ * package compiles against `lib` `ES2023` + DOM (see
+ * `packages/telemetry/tsconfig.json`) and `Error.isError` is typed only in
+ * TypeScript's `esnext.error` library. Widening this program's `lib` to reach
+ * one predicate would admit every other unshipped proposal into the preload
+ * and the runtime-neutral modules too, so the single function is typed here
+ * and its absence is handled ({@link hasErrorDataBrand}) instead of being
+ * assumed away.
+ */
+function readIntrinsicIsError(): ErrorBrandPredicate | undefined {
+  try {
+    const candidate: unknown = (Error as unknown as { isError?: unknown }).isError;
+    return typeof candidate === 'function' ? (candidate as ErrorBrandPredicate) : undefined;
+  } catch {
+    // A page that made `Error.isError` a throwing accessor costs this route
+    // and nothing else: the brand check below still answers.
+    return undefined;
+  }
+}
+
+/**
+ * The intrinsic error brand check, or `undefined` on a host without one.
+ *
+ * `Error.isError` is the one predicate exposed to script that answers from the
+ * `[[ErrorData]]` internal slot — which is to say the one that answers "is
+ * this an error" without consulting anything the page can forge. It is true
+ * for `new Error`, for a `DOMException`, and for an error from another realm,
+ * and false for `{ name, message, stack }` however carefully that object is
+ * dressed.
+ */
+const intrinsicIsError: ErrorBrandPredicate | undefined = readIntrinsicIsError();
+
+/**
+ * `Object.prototype.toString`, captured before page script could replace it
+ * and typed as the `this`-taking function it is.
+ *
+ * Used as a free function applied to a foreign value
+ * (`intrinsicObjectToString.call(value)`), which is what it is: the function
+ * is specified over its `this` argument and holds no state of its own.
+ * Spelling that in the type is also what keeps the capture honest to the
+ * reader — nothing here is "calling a method on `Object.prototype`".
+ */
+const intrinsicObjectToString = (
+  Object.prototype as unknown as { readonly toString: (this: unknown) => string }
+).toString;
+
+/**
+ * Whether a value carries `Symbol.toStringTag` **anywhere** on itself or its
+ * prototype chain.
+ *
+ * The question {@link hasErrorDataBrand} turns on, and the reason it asks
+ * about the whole chain rather than about an own property. A tag is what makes
+ * `Object.prototype.toString` report something other than the value's
+ * internal slot, and a forgery needs only to inherit one:
+ * `Object.create({ [Symbol.toStringTag]: 'Error' })` owns no property at all
+ * and still brands itself `[object Error]`. A real `Error` — in this realm or
+ * any other — carries no tag at any level, because `Error.prototype` does not
+ * define one, so requiring the whole chain to be free of it costs a genuine
+ * error nothing and leaves a forgery nowhere to put its claim.
+ *
+ * A check that throws is answered `true`, which rejects the value: the `in`
+ * operator runs a `Proxy`'s `has` trap, which is page code, and a value whose
+ * shape cannot be established is not one to copy fields out of.
+ */
+function carriesToStringTag(value: object): boolean {
+  try {
+    return Symbol.toStringTag in value;
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * Whether `Object.prototype.toString` reports this value's `[[ErrorData]]`
+ * slot, and reports it because the host said so rather than because the value
+ * claimed it.
+ *
+ * The **only** route on a host with no {@link intrinsicIsError}, and it exists
+ * for one case: an error thrown inside an iframe or a worker has a prototype
+ * chain belonging to a different global, so nothing about its identity in this
+ * realm reveals what it is, while it is exactly the object whose three fields
+ * a developer wants to read. `Object.prototype.toString` sees through the realm
+ * boundary because `[[ErrorData]]` is a property of the object and not of its
+ * realm.
+ *
+ * It sees through it only when no `@@toStringTag` intervenes, which is why
+ * {@link carriesToStringTag} is not a refinement of this route but half of
+ * it: a tag anywhere on the chain replaces the slot-derived answer with a
+ * string the page wrote, and trusting the brand without that condition would
+ * readmit, in one line, the forgery this whole section exists to keep out.
+ *
+ * A `DOMException` is therefore *not* accepted here — its platform prototype
+ * carries a tag — and on such a host it is described as `[object]`. See the
+ * section header for why that trade is the right way round.
+ */
+function hasErrorDataBrand(value: object): boolean {
+  try {
+    if (carriesToStringTag(value)) {
+      return false;
+    }
+
+    return intrinsicObjectToString.call(value) === BRAND_ERROR;
+  } catch {
+    // A revoked proxy or a hostile trap: described by its category tag.
+    return false;
+  }
+}
+
+/**
+ * Whether a value is an error the language will vouch for — and deliberately
+ * **not** whether it looks like one.
+ *
+ * Named for the brand rather than for the shape on purpose. This predicate
+ * used to be `isErrorLike` and used to accept any object carrying a string
+ * `name` and a string `message`, which let an ordinary rejected application
+ * record — an API error payload, a GraphQL error, a validation model, any
+ * class instance with a `name` field — have its `name`, `message` and `stack`
+ * copied into a telemetry event, persisted by the service, tailed into
+ * DevTools and, after aggregation, sent to a model provider. AAP 0.5.2 keeps
+ * application data out of the capture; a duck-typed predicate cannot, because
+ * the duck is the application's to shape.
+ *
+ * One check decides it, and a second exists only for a host that lacks the
+ * first:
+ *
+ * 1. {@link intrinsicIsError} — the `[[ErrorData]]` internal-slot check.
+ *    Where the host has it, **its answer is the answer**, `true` or `false`.
+ *    It accepts every real error, in this realm or another, and a
+ *    `DOMException` with it; it refuses a plain record, an object rooted at
+ *    `Error.prototype`, and a `Proxy` around a real error (a proxy has no slot
+ *    of its own, and reading fields through page-written traps is the last
+ *    thing this module should do). Nothing weaker may overturn that `false` —
+ *    an `instanceof` that the page's `Symbol.hasInstance` or prototype graph
+ *    can answer for, or a brand string the value supplies itself, would make
+ *    the forgeable check the deciding one.
+ * 2. {@link hasErrorDataBrand} — reached only when the host has no
+ *    `Error.isError` at all, or when that predicate threw rather than
+ *    answered, since a throw decides nothing either way.
+ *
+ * `instanceof` appears nowhere in this function, and that absence is the fix:
+ * it is both forgeable and already `true` for objects that have no error slot.
+ *
+ * A negative costs nothing but the tag: {@link describeValue} then reports
+ * `[object]`, `[array]` or `[dom]` and reads no property whatsoever.
+ */
+function isBrandedError(value: unknown): boolean {
   if (typeof value !== 'object' || value === null) {
     return false;
   }
 
-  try {
-    if (value instanceof Error) {
-      return true;
+  if (intrinsicIsError !== undefined) {
+    try {
+      return intrinsicIsError(value) === true;
+    } catch {
+      // A predicate that throws on an exotic object decides nothing, so the
+      // brand check below answers instead of the value being accepted.
     }
-  } catch {
-    // `instanceof` against a replaced `Error` can throw; fall through.
   }
 
-  return (
-    typeof readProperty(value, 'name') === 'string' &&
-    typeof readProperty(value, 'message') === 'string'
-  );
+  return hasErrorDataBrand(value);
 }
 
 /**
  * Summarise a thrown value or a rejection reason: its class or category, its
  * message, its stack — and never the value itself.
+ *
+ * The branch is {@link isBrandedError} and nothing else. A branded error has
+ * its three well-known fields read, each inside its own guard because a
+ * getter on an application object is user code. Any other value — a plain
+ * object, an array, a DOM node, a class instance — contributes its category
+ * tag and, if it is a primitive, its own bounded text; not one of its
+ * properties is read (AAP 0.5.2).
  *
  * `undefined` in means `undefined` out. A host that reported no thrown value
  * and a program that literally threw `undefined` are indistinguishable at this
@@ -838,7 +1135,7 @@ function describeValue(value: unknown): DescribedValue | undefined {
 
   const described: DescribedValue = { truncated: false };
 
-  if (isErrorLike(value)) {
+  if (isBrandedError(value)) {
     const className = readStringProperty(value, 'name');
     if (className !== undefined && className.length > 0) {
       const bounded = boundText(className, MAX_MESSAGE_CHARS);
@@ -1204,9 +1501,13 @@ function emitCaptured(captured: CapturedError): void {
  *    counted and not emitted. Attempts rather than successes, so a
  *    persistently throwing emission is bounded too.
  * 4. **Guarded** — anything thrown while summarising or emitting is counted as
- *    a failure and swallowed. Not re-thrown: this runs on the page's own error
- *    path, where an escaping exception would become another error event and
- *    change what the developer's own handlers see.
+ *    a failure, reported once (bounded) as an `agent.error` frame and
+ *    swallowed. Not re-thrown: this runs on the page's own error path, where
+ *    an escaping exception would become another error event and change what
+ *    the developer's own handlers see. The report is what makes the loss
+ *    visible outside the page: {@link ErrorStats.failures} is a number only a
+ *    diagnostics view reads, and a capture that silently lost an error row
+ *    would be presented as a complete one (AAP 0.5.5).
  *
  * @param capture Summarises the host event. Called inside the guard, because
  * reading a hostile object's properties is itself a thing that can throw.
@@ -1229,10 +1530,70 @@ function record(capture: () => CapturedError): void {
   handling = true;
   try {
     emitCaptured(capture());
-  } catch {
+  } catch (error) {
     failureCount += 1;
+    reportProducerFailure('errors', STAGE_RECORD, error);
   } finally {
     handling = false;
+  }
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * Teardown
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * Take one listener off the window under its own guard, and say whether it
+ * came off.
+ *
+ * **Why one guard per listener rather than one around the teardown.** The two
+ * removals are independent actions on the page's window, and either can fail
+ * on its own: a page (or an extension, or a test double) that has replaced
+ * `removeEventListener` makes the *first* call throw, and a single surrounding
+ * `try` would then skip the second call entirely — leaving a listener on the
+ * window for the life of the document while the module reported itself
+ * detached. AAP 0.5.1 requires runtime hooks to be "disabled, not merely
+ * idled", and a leaked `error` listener is a correctness problem for the
+ * page's own error handling too, not only a leak. With a guard per step, a
+ * failure costs exactly its own step.
+ *
+ * @param type The event type exactly as it was registered.
+ * @param listener The exact reference registered, or `undefined` when this
+ * module holds none — in which case there is nothing to do.
+ * @param options The same frozen options object registration used; removal
+ * matches on the capture flag, so re-using the object is what makes the
+ * removal symmetric.
+ * @param stage The failure-report stage id for this listener.
+ * @returns The reference to retain: `undefined` once `removeEventListener` has
+ * returned (the listener is off, or was never on), and the listener itself
+ * when removal threw — it is still registered, so it stays known and the next
+ * {@link detachErrors} retries it.
+ */
+function releaseListener(
+  type: string,
+  listener: ((event: Event) => void) | undefined,
+  options: AddEventListenerOptions,
+  stage: string,
+): ((event: Event) => void) | undefined {
+  if (listener === undefined) {
+    return undefined;
+  }
+
+  // No window means nothing was ever registered — {@link attachErrors}
+  // returns early without one — so there is nothing to remove and no residue
+  // worth retaining.
+  if (typeof window === 'undefined') {
+    return undefined;
+  }
+
+  try {
+    window.removeEventListener(type, listener, options);
+    return undefined;
+  } catch (error) {
+    reportProducerFailure('errors', stage, error);
+    return listener;
   }
 }
 
@@ -1260,13 +1621,28 @@ function record(capture: () => CapturedError): void {
  * the counters (which would hand a re-configuration after a reconnect a fresh
  * budget mid-capture).
  *
+ * **Re-attaching is repair, not a second installation.** A detach whose
+ * removal was refused by the page retains the listener reference it could not
+ * release (see {@link releaseListener}), and that listener is still on the
+ * window. Registering a fresh closure for that event type would leave the page
+ * with *two* of this module's listeners: every failure would be recorded
+ * twice, `error_count` would double, and one of the pair would be unreachable
+ * for ever. So each event type is registered only when its reference is
+ * absent, and a retained reference is re-adopted — the listener that is
+ * already there becomes this capture's listener again. The trade the adoption
+ * makes is deliberate: on a page that has broken *both* `addEventListener` and
+ * `removeEventListener`, adoption can re-arm a handler that is not in fact
+ * registered, which costs events. Duplicated events and a permanently
+ * unreachable listener are the worse failure — and both removals report
+ * themselves, so the frames say which happened.
+ *
  * Without a `window` there is nothing to listen to, so the module stays
  * detached and {@link isErrorsAttached} says so; the Node preload and the
  * service import this package without ever reaching this function.
  *
- * Never throws. A failure part-way through registration detaches, so the
- * module is either fully attached or fully detached and never holds a listener
- * it cannot remove.
+ * Never throws. A failure part-way through registration is reported and then
+ * detaches, so the module is either observing or not, and a listener it could
+ * not remove stays recorded rather than lost.
  */
 export function attachErrors(): void {
   try {
@@ -1279,25 +1655,32 @@ export function attachErrors(): void {
     failureCount = 0;
     handling = false;
 
-    const onError = (event: Event): void => {
-      record(() =>
-        isScriptError(event) ? captureScriptError(event) : captureResourceError(event),
-      );
-    };
-    const onRejection = (event: Event): void => {
-      record(() => captureRejection(event));
-    };
+    if (errorListener === undefined) {
+      const onError = (event: Event): void => {
+        record(() =>
+          isScriptError(event) ? captureScriptError(event) : captureResourceError(event),
+        );
+      };
 
-    // Published before registration so that a failure part-way through leaves
-    // every listener that *was* registered removable by the detach below.
-    errorListener = onError;
-    rejectionListener = onRejection;
+      // Published before registration so that a throw from `addEventListener`
+      // leaves the listener — registered or not — removable by the detach in
+      // the catch below.
+      errorListener = onError;
+      window.addEventListener(ERROR_EVENT_TYPE, onError, ERROR_LISTENER_OPTIONS);
+    }
 
-    window.addEventListener(ERROR_EVENT_TYPE, onError, ERROR_LISTENER_OPTIONS);
-    window.addEventListener(REJECTION_EVENT_TYPE, onRejection, REJECTION_LISTENER_OPTIONS);
+    if (rejectionListener === undefined) {
+      const onRejection = (event: Event): void => {
+        record(() => captureRejection(event));
+      };
+
+      rejectionListener = onRejection;
+      window.addEventListener(REJECTION_EVENT_TYPE, onRejection, REJECTION_LISTENER_OPTIONS);
+    }
 
     attached = true;
-  } catch {
+  } catch (error) {
+    reportProducerFailure('errors', STAGE_ATTACH, error);
     detachErrors();
   }
 }
@@ -1307,13 +1690,37 @@ export function attachErrors(): void {
  *
  * Called by `./agent.ts` when the service clears the hooks — an `agent.config`
  * with every hook false, which AAP 0.5.1 requires to leave the agent
- * "disabled, not merely idled". Afterwards the page carries no listener of
- * this module's and a later exception emits nothing.
+ * "disabled, not merely idled". Afterwards a later exception emits nothing —
+ * always — and the page carries none of this module's listeners unless it
+ * refused a removal, in which case what is left is inert, recorded and
+ * reported (see below).
  *
  * Removal passes the same listener references and the same capture flags used
  * at registration, because `removeEventListener` matches on both; a mismatch
  * would leave the developer's page holding a listener the agent can no longer
  * reach.
+ *
+ * Three independent steps, each under its own guard, in this order and for
+ * these reasons:
+ *
+ * 1. **Disarm.** `attached` is cleared *before* the window is touched, because
+ *    it is the flag {@link record} gates on: from that assignment on nothing
+ *    is recorded, whether or not the removals below succeed. A listener that
+ *    cannot be taken off the page is then inert rather than a producer still
+ *    feeding a stopped capture.
+ * 2. **Remove, one guard each.** A failure removing the `error` listener must
+ *    not skip the `unhandledrejection` listener — the defect this shape
+ *    exists to make impossible. Each removal reports its own failure with its
+ *    own stage id and each keeps its listener reference when it fails, so the
+ *    residue is known and the *next* call retries exactly what is left (see
+ *    {@link releaseListener}).
+ * 3. **Reset.** The re-entrancy flag is cleared and any residue is stated, in
+ *    a third guard so that neither removal can decide whether this happens.
+ *
+ * What remains after a refused removal is therefore an inert, *recorded*
+ * listener rather than a silent leak: a later {@link detachErrors} removes it
+ * once the page allows it, and {@link attachErrors} re-adopts it instead of
+ * adding a second one.
  *
  * The counters are deliberately **not** reset: "how many failures did that
  * capture have" is a question asked after the capture stopped.
@@ -1321,37 +1728,105 @@ export function attachErrors(): void {
  * Safe to call when already detached, and never throws.
  */
 export function detachErrors(): void {
+  // Step 1 — disarm. One assignment, nothing that can throw, and it must not
+  // sit behind anything that can.
+  attached = false;
+
+  // Step 2 — the two removals, independently guarded, each retaining its own
+  // reference when the page refuses it.
+  errorListener = releaseListener(
+    ERROR_EVENT_TYPE,
+    errorListener,
+    ERROR_LISTENER_OPTIONS,
+    STAGE_ERROR_LISTENER_REMOVE,
+  );
+  rejectionListener = releaseListener(
+    REJECTION_EVENT_TYPE,
+    rejectionListener,
+    REJECTION_LISTENER_OPTIONS,
+    STAGE_REJECTION_LISTENER_REMOVE,
+  );
+
+  // Step 3 — state reset and the residue statement. Guarded even though the
+  // assignment cannot throw and the reporter is contracted not to: this
+  // function is called from `./agent.ts`'s message handling and from
+  // {@link attachErrors}'s own catch, and it may not throw into the page on
+  // any future shape of this block either.
   try {
-    const onError = errorListener;
-    errorListener = undefined;
-    if (onError !== undefined && typeof window !== 'undefined') {
-      window.removeEventListener(ERROR_EVENT_TYPE, onError, ERROR_LISTENER_OPTIONS);
-    }
-
-    const onRejection = rejectionListener;
-    rejectionListener = undefined;
-    if (onRejection !== undefined && typeof window !== 'undefined') {
-      window.removeEventListener(REJECTION_EVENT_TYPE, onRejection, REJECTION_LISTENER_OPTIONS);
-    }
-
     handling = false;
-  } catch {
-    // Best effort by construction: the two removals are independent, so a
-    // failure in one leaves the other done.
-  } finally {
-    attached = false;
+
+    if (errorListener !== undefined || rejectionListener !== undefined) {
+      // Which hook outlived the capture, in booleans — never a page value.
+      // Without this, "the agent says it detached" and "the page still carries
+      // an agent listener" would both be true and nothing would say so.
+      reportProducerFailure('errors', STAGE_DETACH_RESIDUAL, undefined, {
+        errorListenerRetained: errorListener !== undefined,
+        rejectionListenerRetained: rejectionListener !== undefined,
+      });
+    }
+  } catch (error) {
+    reportProducerFailure('errors', STAGE_DETACH_STATE_RESET, error);
   }
 }
 
 /**
- * Whether both listeners are registered right now.
+ * Whether this module is observing failures right now.
  *
  * `./agent.ts` reports this in its readiness and status frames, and it is
  * `false` in a context with no `window` even after {@link attachErrors} was
  * called, because nothing was registered there.
+ *
+ * It answers "is anything being recorded", which is the question both UIs ask,
+ * and it is `false` after {@link detachErrors} whatever the page did with the
+ * removals — a listener that could not be taken off the window records
+ * nothing (see {@link attached}). "Is anything still installed" is a different
+ * question: {@link hasErrorsResidue} is what answers it, and a refused removal
+ * also states itself in an `agent.error` frame carrying the `detach-residual`
+ * stage — neither makes this function lie in either direction.
  */
 export function isErrorsAttached(): boolean {
   return attached;
+}
+
+/**
+ * Whether the page still carries a listener this module's last detach could
+ * not remove.
+ *
+ * The counterpart of {@link isErrorsAttached}, and deliberately a second
+ * function rather than a different answer from that one. "Attached" is this
+ * folder's word for *observing*, and a listener the page refused to remove
+ * observes nothing — so the two facts diverge exactly where it matters, and
+ * `./agent.ts` needs both of them: its readiness and status frames report what
+ * is being recorded, while the `hooks-not-released` announcement it posts once
+ * every producer's `detach()` has been called has to name the registrations
+ * that survived those calls. Asking {@link isErrorsAttached} for that would
+ * answer a different question and conclude that everything was released, which
+ * AAP 0.5.1 does not allow: a cleared hook is disabled rather than idled, and a
+ * cleanup that did not complete has to be visible instead of assumed.
+ *
+ * `true` means exactly one thing. {@link detachErrors} ran and
+ * `removeEventListener` threw for the `error` listener, for the
+ * `unhandledrejection` listener, or for both, so the reference it could not
+ * release is still held (see {@link errorListener}) and that listener is still
+ * on the window — inert, because {@link attached} is cleared before the window
+ * is touched, but present for the life of the document unless a later detach
+ * gets it off. `false` means both references have been released: before the
+ * first {@link attachErrors}, after a detach whose removals returned, and in a
+ * context with no `window`, where nothing was ever registered.
+ *
+ * **A live listener during a capture is not residue.** While this module is
+ * attached both references are held on purpose — holding them is what makes
+ * removal symmetric — so this is `false` for as long as it is observing,
+ * including after {@link attachErrors} re-adopts a retained listener rather
+ * than registering a second one beside it. Residue is what outlived a detach,
+ * not what a capture is using; the retained reference becomes residue again the
+ * moment a detach cannot release it.
+ *
+ * Reports state and changes none: two reference reads and a boolean, and it
+ * cannot throw, so `./agent.ts` may call it on every disarm.
+ */
+export function hasErrorsResidue(): boolean {
+  return !attached && (errorListener !== undefined || rejectionListener !== undefined);
 }
 
 /**

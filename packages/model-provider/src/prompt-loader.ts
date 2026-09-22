@@ -37,15 +37,30 @@
  *
  * ## Why the filesystem calls are synchronous
  *
- * `readFileSync`, `realpathSync` and `statSync` throughout, deliberately. A
- * prompt file is a few kilobytes of Markdown; it is read at a stage boundary,
- * once, with nothing else waiting on the event loop; and the manifest and every
- * body are cached after the first read. What the synchronous form buys is the
- * signature: `load()` returns a plain `Result` rather than a
- * `Promise<Result>`, so a stage that needs a prompt in the middle of building a
- * request does not become asynchronous for the sake of a 2 kB read, and a test
- * asserting a rejection needs no await. The asynchronous form would cost a
- * microtask per read and buy nothing measurable.
+ * `realpathSync`, `statSync` and the `openSync`/`fstatSync`/`readSync` sequence
+ * in {@link readBoundedFile} throughout, deliberately. A prompt file is a few
+ * kilobytes of Markdown; it is read at a stage boundary, once, with nothing else
+ * waiting on the event loop; and the manifest and every body are cached after
+ * the first read. What the synchronous form buys is the signature: `load()`
+ * returns a plain `Result` rather than a `Promise<Result>`, so a stage that
+ * needs a prompt in the middle of building a request does not become
+ * asynchronous for the sake of a 2 kB read, and a test asserting a rejection
+ * needs no await. The asynchronous form would cost a microtask per read and buy
+ * nothing measurable.
+ *
+ * ## Why the read is an open, a stat and a bounded loop rather than one call
+ *
+ * `readFileSync(path, 'utf8')` would read whatever is at the path, of whatever
+ * kind and of whatever size. Neither is acceptable for a path that a manifest
+ * on disk, an environment variable or a stored session record contributed to:
+ * a named pipe planted at a prompt path blocks the whole service forever on a
+ * blocking open, a character device streams without end, and a large regular
+ * file is decoded into memory in one piece before anything can object. So the
+ * read opens the resolved path with no-follow, non-blocking semantics, requires
+ * `fstat` to report a **regular file**, refuses a size above the subject's own
+ * ceiling *before* reading a byte, and then reads exactly that many bytes. See
+ * {@link readBoundedFile} for each step and {@link MAX_MANIFEST_BYTES} and
+ * {@link MAX_PROMPT_BYTES} for the two ceilings.
  *
  * ## What this module never does
  *
@@ -72,16 +87,31 @@
  *   return prompt;
  * }
  *
- * const rendered = renderPrompt(prompt.value.body, {
- *   schema: renderedJsonSchema,
- *   evidenceRule: citationRule,
+ * // Every placeholder the loaded version names, and the analysis stage's own
+ * // file names these: a value short of that set is a typed failure naming the
+ * // keys that were missing, never a prompt with a gap in it.
+ * const rendered = renderPrompt(prompt.value.text, {
+ *   question: developerQuestion,
+ *   understanding: understandingJson,
+ *   captureSummary: captureSummaryJson,
+ *   codeExcerpts: excerptsJson,
+ *   outputSchema: renderedJsonSchema,
  * });
  * ```
  *
  * @packageDocumentation
  */
 
-import { readFileSync, realpathSync, statSync, type Stats } from 'node:fs';
+import {
+  closeSync,
+  constants as fsConstants,
+  fstatSync,
+  openSync,
+  readSync,
+  realpathSync,
+  statSync,
+  type Stats,
+} from 'node:fs';
 import { isAbsolute, join, resolve } from 'node:path';
 
 import { z } from 'zod';
@@ -131,6 +161,81 @@ const MANIFEST_FILE_NAME = 'manifest.json';
 
 /** The extension every prompt file carries: they are Markdown documents. */
 const PROMPT_FILE_EXTENSION = '.md';
+
+/**
+ * The most bytes `manifest.json` may occupy — 64 KiB.
+ *
+ * Sized against what a manifest *is*: a version number and one entry per stage,
+ * each naming a current version and, optionally, the versions written so far.
+ * Six stages with an `available` list of a dozen versions each is a few hundred
+ * bytes, and this repository's convention of explaining a JSON file in `"// …"`
+ * keys adds a few hundred more. 64 KiB is therefore two orders of magnitude of
+ * headroom over the largest manifest that could be meant seriously, which is
+ * the point of a ceiling: it never fires for a real file, and it fires
+ * immediately for something that is not a manifest at all.
+ */
+const MAX_MANIFEST_BYTES = 64 * 1024;
+
+/**
+ * The most bytes one prompt file may occupy — 256 KiB.
+ *
+ * A prompt body carries the stage's instructions, its output contract and its
+ * rules, and that is all it carries: the stage's JSON Schema, the node or
+ * adapter catalog, the code excerpts and the capture aggregates all arrive at
+ * *render* time as placeholder values (see {@link renderPrompt}), never as
+ * committed text. A few kilobytes is therefore the natural size of one of these
+ * files, and 256 KiB leaves room for a far longer document than any stage needs
+ * while still bounding what a single `load()` can pull into memory and hand to
+ * a model call.
+ *
+ * Deliberately a *separate* constant from {@link MAX_MANIFEST_BYTES} rather than
+ * one shared "file limit": the two subjects have different sizes for different
+ * reasons, and a single number would have to be the larger of the two, which
+ * would stop the manifest's ceiling saying anything useful.
+ */
+const MAX_PROMPT_BYTES = 256 * 1024;
+
+/** 64 KiB, spelled for the failure a developer reads. */
+const MAX_MANIFEST_BYTES_LABEL = '64 KiB';
+
+/** 256 KiB, spelled for the failure a developer reads. */
+const MAX_PROMPT_BYTES_LABEL = '256 KiB';
+
+/**
+ * An `fs.constants` flag, or `0` when this platform does not define it.
+ *
+ * `O_NOFOLLOW` does not exist on Windows, and a missing constant reaches this
+ * module as `undefined`; `undefined | flag` is `NaN`, and `openSync` with `NaN`
+ * flags is an error rather than a default. Degrading a platform's absent flag
+ * to `0` — the identity of bitwise or — keeps the flag word a number
+ * everywhere, so a platform without the hardening still gets the ordinary
+ * read-only open and the checks that follow it, which are where the actual
+ * refusals happen.
+ */
+function openFlag(flag: number | undefined): number {
+  return typeof flag === 'number' && Number.isInteger(flag) ? flag : 0;
+}
+
+/**
+ * The flags every contained read opens with.
+ *
+ * - `O_RDONLY` — nothing in this module writes.
+ * - `O_NOFOLLOW` — the final component must not be a symbolic link. The path
+ *   handed to `open` has already been through `realpath` and proved contained,
+ *   so a link at it *now* means the file was replaced between the two calls;
+ *   the open fails with `ELOOP` and {@link readBoundedFile} reports that swap as
+ *   a policy refusal instead of reading a file nothing checked.
+ * - `O_NONBLOCK` — **this is the flag that stops a planted named pipe hanging
+ *   the service.** Opening a FIFO for reading blocks until a writer appears,
+ *   which for a FIFO with no writer is forever, and a synchronous loader has no
+ *   timeout to fall back on; with this flag the same open returns immediately
+ *   and `fstat` then rejects the kind. It has no effect on a regular file,
+ *   which is the only kind that survives the check that follows.
+ */
+const READ_OPEN_FLAGS =
+  openFlag(fsConstants.O_RDONLY) |
+  openFlag(fsConstants.O_NOFOLLOW) |
+  openFlag(fsConstants.O_NONBLOCK);
 
 /**
  * The recovery instruction attached to every configuration failure about the
@@ -241,19 +346,27 @@ export const promptManifestSchema = z.object({
 export type PromptManifest = z.infer<typeof promptManifestSchema>;
 
 /**
- * A prompt file the loader read: which stage and version it is, where it came
- * from, and its text.
+ * A prompt file the loader read: which stage and version it is, its text, and
+ * where it came from.
  *
- * `path` is the **resolved absolute path** of the file that was read — the real
- * path, after symbolic links, which is the path that was proven to be inside
- * the prompts directory. It is diagnostic: it is what a log line and a session
- * record cite when a developer asks which file a stage actually used.
+ * The published contract is `{ stage, version, text }` — the three members a
+ * stage needs to render a prompt and to record on the session what it rendered.
+ * `text` is the name the content carries, and the only one: there is no `body`
+ * alias, because two names for one string is how a caller ends up sending the
+ * stale one.
  *
- * `body` is the file's text with a UTF-8 byte-order mark removed if one was
+ * `text` is the file's content with a UTF-8 byte-order mark removed if one was
  * present and with exactly one trailing newline. Nothing else is touched: a
  * prompt embeds a JSON Schema, fenced examples and an evidence-citation rule,
  * and a loader that reformatted any of that would change what the model was
  * asked without anything recording the change.
+ *
+ * `path` is an **additive diagnostic** member beside that contract, not part of
+ * it: the resolved absolute path of the file that was read — the real path,
+ * after symbolic links, which is the path that was proven to be inside the
+ * prompts directory. It exists because a log line and a session record cite it
+ * when a developer asks which file a stage actually used, and nothing in the
+ * pipeline is expected to read it to obtain the prompt.
  */
 export interface PromptFile {
   /** The stage this prompt instructs. */
@@ -262,11 +375,15 @@ export interface PromptFile {
   /** The version stem that was loaded, matching {@link PROMPT_VERSION_PATTERN}. */
   readonly version: PromptVersion;
 
-  /** The resolved absolute path of the file that was read. */
-  readonly path: string;
-
   /** The prompt text; see the interface documentation for the normalisation. */
-  readonly body: string;
+  readonly text: string;
+
+  /**
+   * The resolved absolute path of the file that was read.
+   *
+   * Diagnostic and additive: see the interface documentation.
+   */
+  readonly path: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -396,24 +513,39 @@ function configFailure(
 }
 
 /**
- * A rejected stage, version or relative path.
+ * The recovery instruction on a rejected stage, version or relative path: what
+ * a legal prompt address looks like.
+ */
+const UNSAFE_ADDRESS_HINT =
+  'A prompt is addressed by a stage name from the known set and a version of the form ' +
+  "'vNNN'; nothing else can name a prompt file.";
+
+/**
+ * A rejected stage, version or relative path — or a resolved path this module
+ * refuses to read.
  *
  * `FS_UNSAFE_PATH` is the closed vocabulary's *policy* refusal — a path this
  * product will not construct or open, as opposed to a path that escaped a root
  * (which is {@link containmentFailure}) or a path that simply is not there
- * (which is a configuration failure). Nothing is touched on disk before this is
- * raised: the value never becomes a filesystem call.
+ * (which is a configuration failure). For the four address checks nothing is
+ * touched on disk before this is raised: the value never becomes a filesystem
+ * call.
+ *
+ * @param message What was refused.
+ * @param details The stage, version and paths already known to the caller;
+ * never any file's contents.
+ * @param hint The recovery instruction. Defaults to {@link UNSAFE_ADDRESS_HINT},
+ * which is what every address rejection reports; the one caller that overrides
+ * it is the no-follow open in {@link readBoundedFile}, where the address was
+ * legal and it is the *file* that was swapped, so a hint about version spelling
+ * would send a developer to the wrong place.
  */
 function unsafePathFailure(
   message: string,
   details: Readonly<Record<string, unknown>>,
+  hint: string = UNSAFE_ADDRESS_HINT,
 ): DebuggenError {
-  return new DebuggenError('FS_UNSAFE_PATH', message, {
-    hint:
-      'A prompt is addressed by a stage name from the known set and a version of the form ' +
-      "'vNNN'; nothing else can name a prompt file.",
-    details,
-  });
+  return new DebuggenError('FS_UNSAFE_PATH', message, { hint, details });
 }
 
 /**
@@ -627,6 +759,289 @@ interface ManifestState {
   readonly currents: Readonly<Record<PromptStage, PromptVersion>>;
 }
 
+/**
+ * What is being read, in the words its failures use — and the ceiling that
+ * applies to it.
+ *
+ * One record per subject, supplied by the caller that knows which subject it is
+ * asking for: `readManifest` passes the manifest's vocabulary and
+ * {@link MAX_MANIFEST_BYTES}, `loadFile` the prompt's and
+ * {@link MAX_PROMPT_BYTES}. That is why the ceiling travels here rather than
+ * living as one constant inside the read: the two subjects are bounded
+ * separately, for reasons stated on each constant.
+ */
+interface ReadSubject {
+  /** The subject as a sentence subject, e.g. `'The prompt manifest'`. */
+  readonly label: string;
+
+  /** What to do when the subject is not there. */
+  readonly missingHint: string;
+
+  /** The most bytes this subject may occupy. */
+  readonly maxBytes: number;
+
+  /** {@link maxBytes} as a developer reads it, e.g. `'64 KiB'`. */
+  readonly maxBytesLabel: string;
+
+  /** What to do when the subject is larger than {@link maxBytes}. */
+  readonly oversizeHint: string;
+
+  /** Facts the caller already knows, attached to every failure. */
+  readonly details: Readonly<Record<string, unknown>>;
+}
+
+/**
+ * How `fstat` describes something that is not a regular file: a noun phrase for
+ * the message, and a token for the details.
+ *
+ * Both, because the two fields are read by different audiences. The phrase
+ * completes the sentence a developer reads — "… is a named pipe, not a file." —
+ * while the token is what a log aggregator or a user interface can group on
+ * without parsing English.
+ */
+interface FileKind {
+  /** The noun phrase, with its article: `'a directory'`, `'a named pipe'`. */
+  readonly phrase: string;
+
+  /** The machine-readable kind: `'directory'`, `'fifo'`, `'unknown'`. */
+  readonly token: string;
+}
+
+/**
+ * Names the kind of an opened descriptor that is not a regular file.
+ *
+ * Every POSIX kind a path inside a prompts directory could plausibly be is
+ * named, because the point of the failure is to tell a developer *what* is at
+ * the path: "a directory" is a stage directory left where a version file should
+ * be, "a named pipe" is the hazard the non-blocking open exists for, and a
+ * device or a socket is something that has no business in a prompt tree at all.
+ * The final fallback covers a kind this platform reports that none of the
+ * predicates claim — an honest "something else" beats an inaccurate guess.
+ */
+function describeFileKind(stats: Stats): FileKind {
+  if (stats.isDirectory()) {
+    return { phrase: 'a directory', token: 'directory' };
+  }
+  if (stats.isFIFO()) {
+    return { phrase: 'a named pipe', token: 'fifo' };
+  }
+  if (stats.isSocket()) {
+    return { phrase: 'a socket', token: 'socket' };
+  }
+  if (stats.isCharacterDevice()) {
+    return { phrase: 'a character device', token: 'character-device' };
+  }
+  if (stats.isBlockDevice()) {
+    return { phrase: 'a block device', token: 'block-device' };
+  }
+  if (stats.isSymbolicLink()) {
+    return { phrase: 'a symbolic link', token: 'symbolic-link' };
+  }
+  return { phrase: 'an entry of an unrecognised kind', token: 'unknown' };
+}
+
+/**
+ * Opens an already-resolved, already-contained path with no-follow,
+ * non-blocking semantics, requires a regular file, refuses a size above the
+ * subject's ceiling **before reading**, reads exactly that many bytes and
+ * decodes them as UTF-8.
+ *
+ * The order is the whole of the hardening, so each step says what it is for:
+ *
+ * 1. **Open** with {@link READ_OPEN_FLAGS}. A named pipe returns a descriptor
+ *    immediately instead of blocking; a symbolic link that appeared since
+ *    `realpath` fails with `ELOOP` and is reported as a policy refusal, because
+ *    the file that was checked is no longer the file at the path.
+ * 2. **`fstat` the descriptor**, not the path: what is measured and what is
+ *    read are then provably the same object, with no second lookup in between.
+ *    A directory opens perfectly well read-only on Linux, and a character
+ *    device opens and reports a size of zero, so this check — not the open — is
+ *    what refuses a kind that is not a regular file.
+ * 3. **Compare `size` against the ceiling** before a byte is read, so an
+ *    oversized file costs one `open` and one `fstat` rather than its own length
+ *    in memory.
+ * 4. **Read exactly `size` bytes** in a loop, then probe for one more. A short
+ *    read means the file was truncated under us and a successful probe means it
+ *    grew: either way the bytes in hand are not the file, and a *typed failure*
+ *    is the only honest answer — a silently truncated prompt would be sent to a
+ *    model with its output schema or its rules missing from the end.
+ * 5. **Close in a `finally`**, so no descriptor survives any of the failures
+ *    above.
+ *
+ * No file contents reach any failure this returns: the details carry the
+ * subject's own facts, the path, and sizes.
+ *
+ * @param realPath The resolved path to open; already proved inside the root.
+ * @param candidate The path as it was addressed, for the "not found" message.
+ * @param subject See {@link ReadSubject}.
+ * @param logger Where a failed `close` is reported; the read's own result is
+ * never changed by it.
+ * @returns The decoded text, or a typed failure.
+ */
+function readBoundedFile(
+  realPath: string,
+  candidate: string,
+  subject: ReadSubject,
+  logger: Logger,
+): Result<string, DebuggenError> {
+  let fd: number;
+  try {
+    fd = openSync(realPath, READ_OPEN_FLAGS);
+  } catch (caught) {
+    const errno = errnoOf(caught);
+    if (isMissingEntry(caught)) {
+      return err(
+        configFailure(
+          `${subject.label} was not found at '${reportable(candidate)}'.`,
+          { ...subject.details, path: candidate },
+          subject.missingHint,
+        ),
+      );
+    }
+    if (errno === 'ELOOP') {
+      // `realpath` had already resolved this path and it was not a link, so a
+      // link at it now means the file was replaced between the two calls. The
+      // open refused to follow it, which is the point of the flag.
+      return err(
+        unsafePathFailure(
+          `${subject.label} was replaced by a symbolic link while it was being opened, and was not read.`,
+          { ...subject.details, path: realPath, errno },
+          'A prompt file is opened without following symbolic links. The path resolved to a real ' +
+            'file a moment earlier and is a link now: remove the link, then load again.',
+        ),
+      );
+    }
+    return err(
+      unexpectedFsFailure(
+        `${subject.label} could not be opened.`,
+        { ...subject.details, path: realPath, errno: errno ?? 'unknown' },
+        caught,
+      ),
+    );
+  }
+
+  try {
+    let stats: Stats;
+    try {
+      stats = fstatSync(fd);
+    } catch (caught) {
+      return err(
+        unexpectedFsFailure(
+          `${subject.label} could not be inspected after it was opened.`,
+          { ...subject.details, path: realPath, errno: errnoOf(caught) ?? 'unknown' },
+          caught,
+        ),
+      );
+    }
+
+    if (!stats.isFile()) {
+      const kind = describeFileKind(stats);
+      return err(
+        configFailure(
+          `${subject.label} is ${kind.phrase}, not a file.`,
+          { ...subject.details, path: realPath, kind: kind.token },
+          subject.missingHint,
+        ),
+      );
+    }
+
+    if (stats.size > subject.maxBytes) {
+      return err(
+        configFailure(
+          `${subject.label} is larger than the ${subject.maxBytesLabel} this loader reads.`,
+          {
+            ...subject.details,
+            path: realPath,
+            bytes: stats.size,
+            maxBytes: subject.maxBytes,
+          },
+          subject.oversizeHint,
+        ),
+      );
+    }
+
+    // Zero-filled rather than `allocUnsafe`: the buffer is decoded only after
+    // every byte of it has been read, and a zeroed buffer keeps a future change
+    // to that logic from ever decoding uninitialised heap memory into a prompt.
+    const buffer = Buffer.alloc(stats.size);
+    let filled = 0;
+    try {
+      while (filled < buffer.length) {
+        // `null` position: read from the descriptor's own offset, so the loop
+        // advances rather than re-reading the first chunk.
+        const read = readSync(fd, buffer, filled, buffer.length - filled, null);
+        if (read === 0) {
+          break;
+        }
+        filled += read;
+      }
+
+      if (filled < buffer.length) {
+        return err(changedUnderReadFailure(subject, realPath, stats.size, filled));
+      }
+
+      // One byte past the size that was measured. Reading it means the file
+      // grew while the loop ran, so what was read is a prefix of the file
+      // rather than the file — for a prompt, an instruction set with its end
+      // missing.
+      const probe = Buffer.alloc(1);
+      if (readSync(fd, probe, 0, 1, null) > 0) {
+        return err(changedUnderReadFailure(subject, realPath, stats.size, stats.size + 1));
+      }
+    } catch (caught) {
+      return err(
+        unexpectedFsFailure(
+          `${subject.label} could not be read.`,
+          { ...subject.details, path: realPath, errno: errnoOf(caught) ?? 'unknown' },
+          caught,
+        ),
+      );
+    }
+
+    // `toString('utf8')` decodes exactly as `readFileSync(path, 'utf8')` does,
+    // byte-order mark included, so {@link normalizeBody} and the manifest
+    // parser see precisely what they saw before the read was hardened.
+    return ok(buffer.toString('utf8'));
+  } finally {
+    try {
+      closeSync(fd);
+    } catch (caught) {
+      // A descriptor that will not close cannot change what was already read,
+      // and throwing here would replace a good result — or a precise failure —
+      // with an error about cleanup. It is reported instead, because a host
+      // process seeing this repeatedly is leaking descriptors.
+      logger.warn('A prompt file descriptor could not be closed', {
+        path: realPath,
+        errno: errnoOf(caught) ?? 'unknown',
+      });
+    }
+  }
+}
+
+/**
+ * The failure for a subject whose length changed between the `fstat` and the
+ * end of the read.
+ *
+ * `CONFIG_INVALID`, not `INTERNAL`: nothing is wrong with this process — a
+ * prompt file is immutable once committed, so a file changing under a read
+ * means something is writing into the prompts directory while the service reads
+ * from it, which is a fact about the environment and has an action attached to
+ * it. The sizes travel; no content does.
+ */
+function changedUnderReadFailure(
+  subject: ReadSubject,
+  realPath: string,
+  expectedBytes: number,
+  observedBytes: number,
+): DebuggenError {
+  return configFailure(
+    `${subject.label} changed size while it was being read, so it was not used.`,
+    { ...subject.details, path: realPath, expectedBytes, observedBytes },
+    'A committed prompt file never changes: a new version is a new file plus a manifest update. ' +
+      'Wait for whatever is writing this file to finish, then load again.',
+  );
+}
+
 /** A file that was read from inside the prompts directory. */
 interface ContainedFile {
   /** The resolved absolute path that was proven to be inside the root. */
@@ -637,12 +1052,12 @@ interface ContainedFile {
 }
 
 /**
- * Normalises a prompt body: byte-order mark removed, exactly one trailing
- * newline, nothing else changed.
+ * Normalises a prompt file's content into the published {@link PromptFile.text}:
+ * byte-order mark removed, exactly one trailing newline, nothing else changed.
  *
  * `trimEnd` rather than a `/\s+$/` replacement — same result, linear, and with
  * no regular expression to backtrack over a long run of trailing whitespace. A
- * body that holds nothing but whitespace normalises to the empty string, which
+ * file that holds nothing but whitespace normalises to the empty string, which
  * the caller reports as an empty prompt rather than sending to a model.
  */
 function normalizeBody(text: string): string {
@@ -905,23 +1320,25 @@ export function createPromptLoader(options: PromptLoaderOptions = {}): PromptLoa
    * different fixes, and collapsing them would send a developer looking for a
    * symbolic link that is not there.
    *
-   * The read that follows opens the **resolved** path rather than the candidate,
-   * so the bytes returned come from the location that was actually checked. A
-   * link swapped between the check and the read would still be a window, and
-   * closing it would need an `O_NOFOLLOW` descriptor kept across both steps;
-   * that is not attempted here, because the directory in question is the
-   * developer's own prompt tree on their own machine rather than a path
-   * arriving from a page or a socket — which is the case
-   * `@debuggen/shared`'s hardened filesystem entry exists for.
+   * The read that follows opens the **resolved** path rather than the
+   * candidate, so the bytes returned come from the location that was actually
+   * checked, and it opens it with {@link READ_OPEN_FLAGS} — so a symbolic link
+   * that appeared at that path since `realpath` answered is refused at the open
+   * rather than followed, which is the narrow window this pair of calls used to
+   * leave open. What remains, and is deliberately not chased, is one resolved
+   * *regular file inside the root* being exchanged for another in the same
+   * instant: closing that would mean holding a descriptor on each path
+   * component and opening relative to it, and the subject here is the
+   * developer's own prompt tree on their own machine rather than a path arriving
+   * from a page or a socket — which is the case `@debuggen/shared`'s hardened
+   * filesystem entry exists for. Whatever is read is, in every case, a regular
+   * file inside the prompts directory and no larger than the subject's ceiling:
+   * see {@link readBoundedFile}.
    */
   function readContained(
     root: PromptRoot,
     segments: readonly string[],
-    subject: {
-      readonly label: string;
-      readonly missingHint: string;
-      readonly details: Readonly<Record<string, unknown>>;
-    },
+    subject: ReadSubject,
   ): Result<ContainedFile, DebuggenError> {
     const candidate = join(root.realDir, ...segments);
 
@@ -957,38 +1374,15 @@ export function createPromptLoader(options: PromptLoaderOptions = {}): PromptLoa
       );
     }
 
-    let text: string;
-    try {
-      text = readFileSync(realPath, 'utf8');
-    } catch (caught) {
-      if (isMissingEntry(caught)) {
-        return err(
-          configFailure(
-            `${subject.label} was not found at '${reportable(candidate)}'.`,
-            { ...subject.details, path: candidate },
-            subject.missingHint,
-          ),
-        );
-      }
-      if (errnoOf(caught) === 'EISDIR') {
-        return err(
-          configFailure(
-            `${subject.label} is a directory, not a file.`,
-            { ...subject.details, path: realPath },
-            subject.missingHint,
-          ),
-        );
-      }
-      return err(
-        unexpectedFsFailure(
-          `${subject.label} could not be read.`,
-          { ...subject.details, path: realPath, errno: errnoOf(caught) ?? 'unknown' },
-          caught,
-        ),
-      );
+    // Kind, ceiling and read, in that order: a directory in the file position
+    // is refused by the kind check rather than by an `EISDIR` from a read that
+    // had already been attempted.
+    const text = readBoundedFile(realPath, candidate, subject, logger);
+    if (isErr(text)) {
+      return text;
     }
 
-    return ok({ realPath, text });
+    return ok({ realPath, text: text.value });
   }
 
   /**
@@ -1012,6 +1406,12 @@ export function createPromptLoader(options: PromptLoaderOptions = {}): PromptLoa
     const file = readContained(root.value, [MANIFEST_FILE_NAME], {
       label: 'The prompt manifest',
       missingHint: `Add '${MANIFEST_FILE_NAME}' to the prompts directory, naming the current version of every stage.`,
+      maxBytes: MAX_MANIFEST_BYTES,
+      maxBytesLabel: MAX_MANIFEST_BYTES_LABEL,
+      oversizeHint:
+        'A manifest names the current version of every stage and is a few hundred bytes; check ' +
+        'that the prompts directory is a prompt tree and not another directory that happens to ' +
+        `hold a '${MANIFEST_FILE_NAME}'.`,
       details: { promptsDir: root.value.realDir, manifestFile: MANIFEST_FILE_NAME },
     });
     if (isErr(file)) {
@@ -1148,14 +1548,20 @@ export function createPromptLoader(options: PromptLoaderOptions = {}): PromptLoa
     const file = readContained(root.value, [stage, fileName], {
       label: `The prompt file for stage '${stage}' version '${version}'`,
       missingHint: `Add '${relativePath}' to the prompts directory, or ask for a version that exists.`,
+      maxBytes: MAX_PROMPT_BYTES,
+      maxBytesLabel: MAX_PROMPT_BYTES_LABEL,
+      oversizeHint:
+        'A prompt file holds one stage\u2019s instructions and is a few kilobytes: the output ' +
+        'schema, the catalogs and the captured evidence are supplied as placeholder values at ' +
+        'render time, not committed into the file.',
       details: { stage, version },
     });
     if (isErr(file)) {
       return file;
     }
 
-    const body = normalizeBody(file.value.text);
-    if (body.length === 0) {
+    const text = normalizeBody(file.value.text);
+    if (text.length === 0) {
       // An empty prompt is never legitimate: the stage would call the model with
       // no instructions, no output schema and no citation rule, and the result
       // would fail validation later with nothing pointing back at the cause.
@@ -1168,11 +1574,13 @@ export function createPromptLoader(options: PromptLoaderOptions = {}): PromptLoa
       );
     }
 
+    // The published contract first, the diagnostic path last, in the order
+    // {@link PromptFile} declares them.
     const promptFile: PromptFile = Object.freeze({
       stage,
       version,
+      text,
       path: file.value.realPath,
-      body,
     });
 
     if (cacheEnabled) {
@@ -1183,7 +1591,7 @@ export function createPromptLoader(options: PromptLoaderOptions = {}): PromptLoa
       stage,
       version,
       path: promptFile.path,
-      bytes: body.length,
+      bytes: text.length,
     });
 
     return ok(promptFile);
@@ -1283,7 +1691,7 @@ export function createPromptLoader(options: PromptLoaderOptions = {}): PromptLoa
  * renderer would let captured data name a placeholder and pull another value
  * into a position the prompt author never wrote.
  *
- * @param template The prompt body, normally {@link PromptFile.body}.
+ * @param template The prompt text, normally {@link PromptFile.text}.
  * @param values The substitutions. Strings are inserted as they are; numbers
  * and booleans are stringified without locale involvement, so the same input
  * renders identically on every machine.
@@ -1309,7 +1717,7 @@ export function renderPrompt(
   if (typeof template !== 'string') {
     return err(
       new DebuggenError('INTERNAL', 'A prompt template must be a string.', {
-        hint: 'Render the body of a loaded prompt file.',
+        hint: 'Render the text of a loaded prompt file.',
         details: { templateType: typeof template },
       }),
     );

@@ -61,7 +61,8 @@
  *
  * Nothing is compared field by field at read time: invalidation lives entirely
  * in the **key**, which folds in the project root, the TypeScript configuration
- * in force, the indexer's version, this module's envelope version, the graph
+ * in force, the indexer's version, the identities of the extractors that ran
+ * and the order they ran in, this module's envelope version, the graph
  * vocabulary version and the modification time and size of every indexed file.
  * A tree that has changed in any of those respects asks for a different key,
  * finds nothing and rebuilds. Reading an entry therefore only has to establish
@@ -250,6 +251,34 @@ export interface IndexCacheKeyInput {
   readonly indexerVersion: string;
 
   /**
+   * The identifiers of the extractors the index was built from — or is about to
+   * be built from — **in the order they run in**.
+   *
+   * The second half of "how was this built", beside
+   * {@link IndexCacheKeyInput.indexerVersion}: the version says which
+   * implementations ran, this says *which extractors* ran. An index built from
+   * a narrowed set covers less than a full one, so the two must not share a
+   * key — otherwise a caller that deliberately narrowed its run would write an
+   * incomplete graph under the full run's key and a later full request would be
+   * served it as if it were whole. With the set in the key, a narrowed run
+   * simply gets its own entry.
+   *
+   * **Order is significant and the list is not sorted.** Extraction order
+   * decides the order nodes and edges are appended in, and therefore which
+   * claimant of a duplicate id graph construction keeps, so two orders of the
+   * same identifiers are two different indexes and get two different keys. A
+   * caller passes the ids exactly as its extractor array holds them.
+   *
+   * An extractor's `id` is an **identity contract**, not a label: two different
+   * implementations that share an id share a key, and the key cannot tell them
+   * apart. For extractors that ship with this package that is covered by
+   * `INDEXER_VERSION`, which every change to their output is required to bump;
+   * a caller supplying an extractor of its own owns the same obligation for
+   * that id.
+   */
+  readonly extractors: readonly string[];
+
+  /**
    * The envelope version to key against. Defaults to
    * {@link INDEX_CACHE_SCHEMA_VERSION}.
    *
@@ -277,10 +306,12 @@ export interface IndexCacheKeyInput {
  * ## What the key covers
  *
  * In order: a domain tag, the envelope version, the graph vocabulary version,
- * the indexer version, the project root, the TypeScript configuration path, the
- * number of files, and then four parts per file — its project-relative path,
- * its modification time, its size and its content hash where one was computed.
- * Any difference in any of those is a different key and therefore a rebuild.
+ * the indexer version, the number of extractors followed by each extractor's
+ * identifier in run order, the project root, the TypeScript configuration path,
+ * the number of files, and then four parts per file — its project-relative
+ * path, its modification time, its size and its content hash where one was
+ * computed. Any difference in any of those is a different key and therefore a
+ * rebuild.
  *
  * ## Why it cannot collide by accident
  *
@@ -291,7 +322,11 @@ export interface IndexCacheKeyInput {
  * separator convention that a path could contain. The layout above is also
  * fixed-arity per file, so an absent configuration path or an absent content
  * hash occupies its slot as {@link ABSENT_SLOT} rather than shifting the
- * following parts.
+ * following parts. The two variable-length runs — the extractor identifiers
+ * and the files — are each preceded by their own count for the same reason: a
+ * reader of the stream always knows how many parts the run holds, so no
+ * identifier can be read as a path and no shorter list of extractors can align
+ * with a longer one.
  *
  * ## Order-insensitivity, and the total order behind it
  *
@@ -301,13 +336,20 @@ export interface IndexCacheKeyInput {
  * (which a well-formed {@link CodeIndex} does not contain, and which a caller
  * assembling a list might) still order deterministically.
  *
+ * The **extractor list is the deliberate exception**: it is contributed in the
+ * caller's order and is never sorted, because extraction order decides which
+ * claimant of a duplicate id graph construction keeps and two orders therefore
+ * describe two different indexes. See
+ * {@link IndexCacheKeyInput.extractors}.
+ *
  * Total: it never throws. A non-finite modification time or size — which a real
  * filesystem does not produce, but a synthesised fingerprint might — is
  * contributed as its textual form instead of as a number, so `NaN` and
  * `Infinity` stay distinguishable from each other and from any finite value
  * rather than making the key derivation fail.
  *
- * @param input The project identity and file fingerprints to key.
+ * @param input The project identity, the extractor set and the file
+ * fingerprints to key.
  * @returns The key, matching {@link CACHE_KEY_PATTERN}.
  *
  * @example
@@ -316,6 +358,7 @@ export interface IndexCacheKeyInput {
  *   projectRoot: project.projectRoot,
  *   tsConfigFilePath: project.tsConfigFilePath,
  *   indexerVersion: INDEXER_VERSION,
+ *   extractors: extractors.map((extractor) => extractor.id),
  *   files: fingerprints,
  * });
  * const cached = await cache.load(key);
@@ -329,6 +372,10 @@ export function computeIndexCacheKey(input: IndexCacheKeyInput): string {
     input.schemaVersion ?? INDEX_CACHE_SCHEMA_VERSION,
     CODE_INDEX_SCHEMA_VERSION,
     input.indexerVersion,
+    input.extractors.length,
+    // In the caller's order, deliberately unsorted: see
+    // `IndexCacheKeyInput.extractors`.
+    ...input.extractors,
     toPosix(input.projectRoot),
     input.tsConfigFilePath === undefined ? ABSENT_SLOT : toPosix(input.tsConfigFilePath),
     sorted.length,

@@ -460,16 +460,23 @@ export interface TraceTree {
 /**
  * The facts about a correlated trace that only its builder knows.
  *
- * {@link buildTraceTree} derives everything it can see from the nodes it is
- * handed; these three cannot be seen from the result, so the correlator passes
+ * {@link buildTraceTree} derives everything it can from the nodes it is
+ * handed; these three are the correlator's own observations about its input,
+ * which the builder deliberately does not re-derive, so the correlator passes
  * them in:
  *
  * - `primaryRootSpanId` — which root to anchor on, when the correlator has a
  *   better answer than "the first one" (the browser interaction, say, when a
  *   server span sorts ahead of it).
- * - `duplicateSpanIds` — span ids that arrived twice. A duplicate is visible
- *   only in the correlator's *input*: whichever copy it dropped is not in the
- *   tree, so the tree cannot report it.
+ * - `duplicateSpanIds` — span ids that arrived more than once. **Nothing is
+ *   dropped** (AAP 0.4.2): every copy becomes a node of its own, so a walk of
+ *   the finished tree would find the repeat. What the tree cannot show is
+ *   which occurrence the children went to — the correlator collects children
+ *   under the *first* canonical occurrence of a repeated id and leaves the
+ *   later copies childless, which makes a later copy indistinguishable from an
+ *   ordinary leaf. Listing the ids is what lets a view name the ambiguity
+ *   instead of presenting two rows that look alike, and the correlator is the
+ *   one that saw it.
  * - `truncated` — whether something was left out, for example by the depth
  *   guard or a caller's node budget. A view must be able to say "this is part
  *   of the trace" rather than implying completeness.

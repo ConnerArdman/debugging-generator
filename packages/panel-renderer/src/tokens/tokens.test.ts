@@ -8,7 +8,7 @@
  * the `data-theme` contract that binds both host surfaces to the generated
  * selectors. Nothing else in this package may state a colour or a metric, so
  * those three modules and one stylesheet are the whole visual contract — and
- * four independent things can go wrong with it. This suite covers each:
+ * five independent things can go wrong with it. This suite covers each:
  *
  *   1. **Drift.** The stylesheet is regenerated in memory and compared byte for
  *      byte with the committed file, so a hand edit, a stale artifact or a
@@ -20,16 +20,28 @@
  *   2. **Completeness.** All three value sets declare every token with a usable
  *      value, the high-contrast set differs from the default set in exactly the
  *      documented deltas, the duration steps stay aliases rather than copies,
- *      and the theme-invariant families stay invariant. A theme that silently
- *      inherits the default block's values is the failure this prevents.
- *   3. **Contrast.** Every text/surface and status/surface pair of every theme
+ *      the medium weight stays in step with the type role that carries it, each
+ *      motion token stays a value of its own kind, and the theme-invariant
+ *      families stay invariant. A theme that silently inherits the default
+ *      block's values is the failure this prevents.
+ *   3. **Reach.** The two authored stylesheets consume the table and extend it
+ *      nowhere: neither declares a custom property, every property a rule reads
+ *      is either a catalogued token or a component-scoped `--dgc-*` value, and
+ *      no retired constant namespace is named in a rule or a comment. A value
+ *      declared beside the tokens is covered by none of the checks here, which
+ *      would leave this suite describing less of the product than it appears to.
+ *   4. **Contrast.** Every text/surface and status/surface pair of every theme
  *      is measured and held to the text minimum, and the span-kind scale — used
  *      as fills that carry their own text labels — to the non-text minimum,
  *      with the figures AAP 0.6.3 publishes pinned so a change in the
- *      arithmetic stays distinguishable from a change in the palette.
- *      Accessibility outranks visual fidelity (AAP 0.6.4), so no threshold here
- *      is ever relaxed to make a colour pass: the colour changes instead.
- *   4. **Theme mapping.** The two host signals — the DevTools theme name and
+ *      arithmetic stays distinguishable from a change in the palette. The two
+ *      minimums are stated here as literals rather than imported from the code
+ *      under test, tied to the product's exported constants by one deliberate
+ *      assertion, and exercised at their inclusive and immediately-below
+ *      boundaries against independently computed known answers. Accessibility
+ *      outranks visual fidelity (AAP 0.6.4), so no threshold here is ever
+ *      relaxed to make a colour pass: the colour changes instead.
+ *   5. **Theme mapping.** The two host signals — the DevTools theme name and
  *      the VS Code webview body class list — translate to the three themes, and
  *      the light high-contrast class resolves to the high-contrast value set
  *      rather than to the light one. That last case is a substring trap with a
@@ -66,11 +78,13 @@
  *     generator is a command-line script whose first line is a `#!` shebang,
  *     and an import ahead of a shebang is a syntax error, so that transform
  *     cannot process it at all.
- *   * A byte-identical copy under `node_modules/` is externalised by the runner
- *     and therefore loaded natively by Node, shebang and all. That is what
- *     {@link loadStylesheetGenerator} does: copy, import, delete. The copy is
- *     the generator byte for byte and the two functions it provides are pure,
- *     so the string compared below is the one the committed stylesheet was
+ *   * A byte-identical copy under a `node_modules` path is externalised by the
+ *     runner and therefore loaded natively by Node, shebang and all. That is
+ *     what {@link loadStylesheetGenerator} does: copy into an OS-private
+ *     `mkdtemp` sandbox, import, then remove the whole sandbox — so the suite
+ *     writes nothing into the checkout it is asserting about. The copy is the
+ *     generator byte for byte and the two functions it provides are pure, so
+ *     the string compared below is the one the committed stylesheet was
  *     generated from.
  *
  * Solving this in the shared Vitest configuration instead would make a blocking
@@ -89,7 +103,8 @@
  * drift gate must not do.
  */
 
-import { copyFileSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -132,6 +147,23 @@ const STYLESHEET_PATH = path.join(TOKENS_DIRECTORY, 'tokens.css');
 /** The generator that produced it. */
 const GENERATOR_PATH = path.join(PACKAGE_ROOT, 'scripts', 'build-tokens.mjs');
 
+/**
+ * The two authored stylesheets, which consume this table and extend it nowhere.
+ *
+ * They are read here, in the token suite, because the property they have to
+ * keep is a property of the token system rather than of either file: a value
+ * declared beside the tokens — under any other prefix, in any other file — is
+ * outside the drift, completeness and theme checks below, and the checks then
+ * describe less of the product than they appear to.
+ */
+const AUTHORED_STYLESHEETS = [
+  { rel: 'src/styles/base.css', file: path.join(PACKAGE_ROOT, 'src', 'styles', 'base.css') },
+  {
+    rel: 'src/styles/components.css',
+    file: path.join(PACKAGE_ROOT, 'src', 'styles', 'components.css'),
+  },
+] as const;
+
 /** The command that reconciles the stylesheet, quoted in every drift failure. */
 const REGENERATE_COMMAND = 'node scripts/build-tokens.mjs';
 
@@ -151,21 +183,35 @@ interface StylesheetGenerator {
 }
 
 /**
- * Loads the stylesheet generator natively, through a byte-identical copy.
+ * Loads the stylesheet generator natively, through a byte-identical copy in a
+ * throwaway sandbox of its own.
  *
- * The copy lands under `node_modules/`, which the test runner externalises, so
- * Node imports the real module with its shebang intact instead of the runner's
- * web-mode transform failing on it (see this file's header). The copy carries
- * the process id so two concurrent runs cannot collide, and it is removed
- * whether the import succeeds or fails — Node has already registered the module
- * by then, so deleting the file cannot affect the loaded exports.
+ * The sandbox is an OS-private `mkdtemp` directory, so this suite writes
+ * nothing into the checkout it is asserting about — a test that leaves an
+ * artifact in the repository can be the reason a later gate disagrees with it —
+ * and a fresh unique directory per call also removes any chance of two
+ * concurrent runs colliding.
+ *
+ * Inside it, the copy sits under a `node_modules` segment, which is load-bearing
+ * rather than decorative and was established by measurement: the test runner
+ * externalises a module whose path contains `node_modules`, so Node imports the
+ * real file with its shebang intact, while an import from a bare temporary path
+ * is refused outright (`Cannot find module`) because the runner will not resolve
+ * a file outside the project root. Those are the two constraints together —
+ * private and disposable, yet still loaded natively.
+ *
+ * The whole sandbox is removed whether the import succeeds or fails. Node has
+ * registered the module by then, so deleting the file cannot affect the loaded
+ * exports, and the two functions taken from it are pure — the string compared
+ * below is the one the committed stylesheet was generated from.
  */
 async function loadStylesheetGenerator(): Promise<StylesheetGenerator> {
-  const cacheDirectory = path.join(PACKAGE_ROOT, 'node_modules', '.cache', 'debuggen-tokens');
-  const copyPath = path.join(cacheDirectory, `build-tokens.${String(process.pid)}.mjs`);
+  const sandbox = mkdtempSync(path.join(tmpdir(), 'debuggen-tokens-'));
+  const moduleDirectory = path.join(sandbox, 'node_modules', 'debuggen-build-tokens');
+  const copyPath = path.join(moduleDirectory, 'build-tokens.mjs');
 
   try {
-    mkdirSync(cacheDirectory, { recursive: true });
+    mkdirSync(moduleDirectory, { recursive: true });
     copyFileSync(GENERATOR_PATH, copyPath);
 
     // The specifier is a computed file URL rather than a literal, so the
@@ -183,7 +229,7 @@ async function loadStylesheetGenerator(): Promise<StylesheetGenerator> {
       { cause: error },
     );
   } finally {
-    rmSync(copyPath, { force: true });
+    rmSync(sandbox, { recursive: true, force: true });
   }
 }
 
@@ -210,13 +256,22 @@ const stylesheet = readFileSync(STYLESHEET_PATH, 'utf8');
 const TOKEN_KEYS = Object.keys(DESIGN_TOKENS.dark) as TokenKey[];
 
 /**
- * Every custom property the design system declares (AAP 0.6.3), sorted.
+ * Every custom property the design system declares, sorted.
  *
  * Written out rather than derived so that a typo, a rename or an invented token
  * fails instead of shipping: a derived list would agree with whatever the token
  * source happens to say. Note the digit boundaries — `--dg-space-0`,
  * `--dg-shadow-1` — which a naive camel-to-kebab conversion renders as
  * `--dg-space0` and `--dg-shadow1`, matching nothing in the stylesheet.
+ *
+ * The families AAP 0.6.3 tabulates are here verbatim. Four of these names are
+ * not in that table and belong to it all the same: `--dg-font-weight-medium`,
+ * `--dg-motion-duration`, `--dg-motion-easing` and `--dg-shimmer-duration`
+ * carry a weight, two durations and an easing function that the stylesheets
+ * need and 0.6.3 does not enumerate. AAP 0.6.4 permits no literal for any of
+ * them and 0.6.6 records no exception, so the only lawful place for them is
+ * this table — which is also what puts them under every check below, the
+ * property a parallel "internal constant" namespace could never have.
  */
 const EXPECTED_CSS_PROPERTY_NAMES: readonly string[] = [
   '--dg-accent',
@@ -231,6 +286,7 @@ const EXPECTED_CSS_PROPERTY_NAMES: readonly string[] = [
   '--dg-focus-ring',
   '--dg-font-mono',
   '--dg-font-ui',
+  '--dg-font-weight-medium',
   '--dg-heading',
   '--dg-info',
   '--dg-kind-db',
@@ -242,12 +298,15 @@ const EXPECTED_CSS_PROPERTY_NAMES: readonly string[] = [
   '--dg-kind-render',
   '--dg-mono-md',
   '--dg-mono-sm',
+  '--dg-motion-duration',
+  '--dg-motion-easing',
   '--dg-radius-lg',
   '--dg-radius-md',
   '--dg-radius-sm',
   '--dg-shadow-0',
   '--dg-shadow-1',
   '--dg-shadow-2',
+  '--dg-shimmer-duration',
   '--dg-space-0',
   '--dg-space-1',
   '--dg-space-2',
@@ -316,6 +375,74 @@ const KIND_FILL_KEYS = [
 ] as const satisfies readonly TokenKey[];
 
 /**
+ * The contrast minimum normal-size text must reach, stated here as a literal.
+ *
+ * Written out rather than imported so that this suite states the requirement
+ * instead of restating the implementation. `../utils/color` exports the same
+ * number for the product to compare against; if that export were ever lowered
+ * to make a colour pass, an imported threshold would lower this suite's bar in
+ * the same edit and every pair below would keep passing. The equality between
+ * the two is asserted once, on purpose, as its own failure: accessibility
+ * outranks visual fidelity (AAP 0.6.4), so the colour changes, never the bar.
+ *
+ * 4.5:1 is the figure AAP 0.6.3 holds every text and status colour of every
+ * theme to, and WCAG 2.2 success criterion 1.4.3 (Contrast Minimum, AA) for
+ * normal-size text.
+ */
+const REQUIRED_TEXT_CONTRAST = 4.5;
+
+/**
+ * The contrast minimum a non-text visual must reach, stated here as a literal
+ * for the same reason as {@link REQUIRED_TEXT_CONTRAST}.
+ *
+ * 3:1 is what AAP 0.6.3 holds the span-kind scale to — those tokens are fills
+ * that carry their own text labels — and WCAG 2.2 success criterion 1.4.11
+ * (Non-text Contrast, AA).
+ */
+const REQUIRED_NON_TEXT_CONTRAST = 3;
+
+/**
+ * The largest double strictly below `value`: the immediately-below boundary.
+ *
+ * Decrementing the IEEE-754 bit pattern is exact, which a subtraction of some
+ * chosen epsilon is not — and the whole point of the boundary cases is that
+ * they sit as close to the minimum as the number type allows, on the failing
+ * side. Positive finite input only, which is all a contrast ratio can be.
+ */
+function previousDouble(value: number): number {
+  const bits = new DataView(new ArrayBuffer(8));
+  bits.setFloat64(0, value);
+  bits.setBigUint64(0, bits.getBigUint64(0) - 1n);
+  return bits.getFloat64(0);
+}
+
+/**
+ * Contrast ratios computed independently of the implementation, for the
+ * known-answer checks.
+ *
+ * The two extremes are exact by definition (black on white is 21:1, a colour
+ * with itself is 1:1). The four greys are adjacent pairs that straddle each
+ * minimum: `#767676` on white is the darkest grey that still clears 4.5:1 and
+ * `#777777`, one step lighter, does not; `#949494` clears 3:1 and `#959595`
+ * does not. Each figure was computed from the WCAG relative-luminance formula
+ * outside this repository, so a change to `contrastRatio` that preserves its
+ * own internal consistency still fails here.
+ */
+const KNOWN_CONTRAST_RATIOS = [
+  { foreground: '#000000', background: '#ffffff', ratio: 21, clears: 'both' },
+  { foreground: '#ffffff', background: '#ffffff', ratio: 1, clears: 'neither' },
+  { foreground: '#767676', background: '#ffffff', ratio: 4.5422, clears: 'both' },
+  { foreground: '#777777', background: '#ffffff', ratio: 4.4781, clears: 'non-text' },
+  { foreground: '#949494', background: '#ffffff', ratio: 3.0335, clears: 'non-text' },
+  { foreground: '#959595', background: '#ffffff', ratio: 2.9953, clears: 'neither' },
+] as const satisfies readonly {
+  readonly foreground: string;
+  readonly background: string;
+  readonly ratio: number;
+  readonly clears: 'both' | 'non-text' | 'neither';
+}[];
+
+/**
  * The duration severity steps and the tokens they alias.
  *
  * `declaration` states the expected value literally as well, so the alias
@@ -344,13 +471,89 @@ const THEME_INVARIANT_FAMILIES = [
     keys: ['space0', 'space1', 'space2', 'space3', 'space4', 'space5', 'space6', 'space7'],
   },
   { family: 'font stacks', keys: ['fontUi', 'fontMono'] },
+  { family: 'type weight', keys: ['fontWeightMedium'] },
   {
     family: 'type roles',
     keys: ['textXs', 'textSm', 'textMd', 'textLg', 'heading', 'monoSm', 'monoMd'],
   },
   { family: 'radii', keys: ['radiusSm', 'radiusMd', 'radiusLg'] },
+  // Reducing motion is a user preference expressed through a media query, not a
+  // theme, so a theme never shortens or removes a duration.
+  { family: 'motion constants', keys: ['motionDuration', 'motionEasing', 'shimmerDuration'] },
   { family: 'stacking levels', keys: ['zBase', 'zOverlay', 'zTooltip'] },
 ] as const satisfies readonly { readonly family: string; readonly keys: readonly TokenKey[] }[];
+
+/**
+ * The motion tokens, with the shape each value must keep.
+ *
+ * A duration is asserted as a positive time with an explicit unit, because a
+ * unitless `0`-style value or a bare number is invalid in
+ * `transition-duration` and would silently disable the transition rather than
+ * fail; the easing token is asserted to be a timing function rather than a
+ * time, which is the mix-up that would make every transition instant.
+ */
+const MOTION_TOKENS = [
+  { key: 'motionDuration', kind: 'duration' },
+  { key: 'shimmerDuration', kind: 'duration' },
+  { key: 'motionEasing', kind: 'easing' },
+] as const satisfies readonly {
+  readonly key: TokenKey;
+  readonly kind: 'duration' | 'easing';
+}[];
+
+/**
+ * A CSS time: an integer or decimal with an explicit `ms` or `s` unit. The unit
+ * is required — a bare number is invalid in `transition-duration` — and the
+ * captured magnitude is checked separately, because a zero duration is a valid
+ * time and not a usable one.
+ */
+const CSS_TIME_PATTERN = /^(\d+(?:\.\d+)?)(ms|s)$/u;
+
+/**
+ * A CSS timing function: one of the keywords, or a `cubic-bezier()`/`steps()`/
+ * `linear()` function. Deliberately narrow — the point is to reject a value
+ * that is not an easing function at all.
+ */
+const CSS_EASING_PATTERN =
+  /^(linear|ease|ease-in|ease-out|ease-in-out|step-start|step-end|(cubic-bezier|steps|linear)\([^)]*\))$/u;
+
+/**
+ * The declarations whose value this table now covers completely, and the
+ * literals each may still carry.
+ *
+ * AAP 0.6.4 admits only `0`, `none`, `auto`, `inherit`, `currentColor` and
+ * `transparent` as literals in this package, so for these properties a value
+ * that is neither a token reference nor one of those is a visual decision taken
+ * outside the design system — the exact shape of a hardcoded weight or a
+ * hardcoded duration. Scanning every property in a three-thousand-line
+ * stylesheet is a different job (the structural-value policy in the stylesheet
+ * headers governs lengths, ratios and geometry); these are the families the
+ * token table owns end to end, so they can be held to the rule mechanically.
+ *
+ * Two allowances are deliberate and neither is a threshold to widen:
+ *
+ *   * `none !important` on the `transition` and `animation` shorthands is the
+ *     `prefers-reduced-motion` block, the package's one sanctioned
+ *     `!important`, and `none` is a permitted literal.
+ *   * `linear` as a timing function is the ABSENCE of easing — a constant rate,
+ *     which a rotating or sweeping animation requires and which no theme would
+ *     ever vary. Easing that expresses a feeling uses `--dg-motion-easing`.
+ */
+const TOKEN_BACKED_DECLARATIONS = [
+  { property: 'font', literals: ['inherit'] },
+  { property: 'font-weight', literals: [] },
+  { property: 'transition', literals: ['none', 'none !important'] },
+  { property: 'transition-duration', literals: [] },
+  { property: 'transition-delay', literals: ['0'] },
+  { property: 'transition-timing-function', literals: [] },
+  { property: 'animation', literals: ['none', 'none !important'] },
+  { property: 'animation-duration', literals: [] },
+  { property: 'animation-delay', literals: ['0'] },
+  { property: 'animation-timing-function', literals: ['linear'] },
+] as const satisfies readonly {
+  readonly property: string;
+  readonly literals: readonly string[];
+}[];
 
 /**
  * The keys whose high-contrast value differs from the default theme's, sorted.
@@ -627,7 +830,7 @@ describe('generated token stylesheet', () => {
   });
 
   it('declares exactly the catalogued custom properties', () => {
-    expect(EXPECTED_CSS_PROPERTY_NAMES).toHaveLength(52);
+    expect(EXPECTED_CSS_PROPERTY_NAMES).toHaveLength(56);
     expect(
       new Set(EXPECTED_CSS_PROPERTY_NAMES).size,
       'the catalogue lists a custom property twice',
@@ -766,11 +969,225 @@ describe('design token completeness', () => {
       }
     });
   }
+
+  it('keeps the medium weight token and the type role that carries it in step', () => {
+    // The reason this token exists: the type roles are complete `font`
+    // shorthands and the shorthand RESETS weight, so a rule wanting a role's
+    // size with a heavier face has to restate the weight — and a numeral in a
+    // stylesheet is a visual value outside this table, which AAP 0.6.4 does not
+    // permit. The weight it restates is the one the large role already carries,
+    // so the two are pinned to each other here: change one and this fails
+    // rather than leaving the stylesheet a hair heavier than the role it sets.
+    for (const theme of PANEL_THEMES) {
+      const values = DESIGN_TOKENS[theme];
+
+      expect(
+        values.fontWeightMedium,
+        `${theme}.fontWeightMedium must be a numeric CSS font weight`,
+      ).toMatch(/^[1-9]00$/u);
+
+      const [roleWeight] = values.textLg.split(' ');
+
+      expect(
+        roleWeight,
+        `${theme}.textLg must state its weight first, as the font shorthand requires`,
+      ).toBe(values.fontWeightMedium);
+    }
+
+    expect(cssVar('fontWeightMedium'), 'the form a stylesheet rule writes').toBe(
+      'var(--dg-font-weight-medium)',
+    );
+  });
+
+  for (const { key, kind } of MOTION_TOKENS) {
+    it(`gives ${String(key)} a valid ${kind} value in every theme`, () => {
+      const pattern = kind === 'duration' ? CSS_TIME_PATTERN : CSS_EASING_PATTERN;
+
+      for (const theme of PANEL_THEMES) {
+        const value = DESIGN_TOKENS[theme][key];
+
+        expect(
+          value,
+          `${theme}.${String(key)} holds "${value}", which is not a CSS ${kind}. An invalid ` +
+            'value here does not fail a build: the declaration is dropped and the motion ' +
+            'silently disappears',
+        ).toMatch(pattern);
+
+        if (kind === 'duration') {
+          // A zero duration parses and renders nothing, which is the shape a
+          // typo takes rather than a decision anyone makes.
+          const [, magnitude] = CSS_TIME_PATTERN.exec(value) ?? [];
+
+          expect(
+            Number(magnitude),
+            `${theme}.${String(key)} must last a measurable amount of time`,
+          ).toBeGreaterThan(0);
+        }
+      }
+    });
+  }
 });
 
 /* -------------------------------------------------------------------------- */
-/* 3. WCAG contrast (AAP 0.6.3, 0.6.4) — the accessibility gate               */
+/* 3. Reach: the stylesheets extend the table nowhere (AAP 0.6.1, 0.6.4)      */
 /* -------------------------------------------------------------------------- */
+
+describe('authored stylesheets', () => {
+  for (const { rel, file } of AUTHORED_STYLESHEETS) {
+    describe(rel, () => {
+      const raw = readFileSync(file, 'utf8');
+      // Rules only: a header comment quotes example declarations, and prose is
+      // not a declaration. The namespace assertion below deliberately reads the
+      // raw bytes instead, because a comment naming a retired namespace is a
+      // reader following a pointer to nothing.
+      const rules = raw.replace(/\/\*[\s\S]*?\*\//gu, '');
+
+      it('declares no custom property of its own', () => {
+        const declared = [...rules.matchAll(/^\s*(--[A-Za-z0-9-]+)\s*:/gmu)].map(
+          (match) => match[1] ?? '',
+        );
+
+        expect(
+          declared,
+          'a token declared outside src/tokens/tokens.ts has no single source of truth and is ' +
+            'covered by none of the drift, completeness or theme checks in this suite',
+        ).toEqual([]);
+      });
+
+      it('references only catalogued tokens and component-scoped properties', () => {
+        const referenced = [
+          ...new Set([...rules.matchAll(/var\(\s*(--[A-Za-z0-9-]+)/gu)].map((m) => m[1] ?? '')),
+        ].sort();
+        const catalogued = new Set(EXPECTED_CSS_PROPERTY_NAMES);
+        // `--dgc-*` is the one other sanctioned family: a value only a
+        // component knows (a computed offset, a resolved lane colour), set
+        // inline from TSX and always consumed here with a token fallback. It
+        // names no design decision, which is why it is not a token.
+        const unknown = referenced.filter(
+          (name) => !catalogued.has(name) && !/^--dgc-[a-z][a-z-]*$/u.test(name),
+        );
+
+        expect(
+          unknown,
+          'every custom property a rule reads is either a token from the table or a ' +
+            'component-scoped --dgc-* value; anything else is a value outside the design system',
+        ).toEqual([]);
+        expect(referenced.length, 'the scan found no custom properties at all').toBeGreaterThan(0);
+      });
+
+      for (const { property, literals } of TOKEN_BACKED_DECLARATIONS) {
+        it(`states every ${property} value as a token reference`, () => {
+          // The property name is matched at a declaration boundary so that
+          // `font` does not also collect `font-weight` or `font-variant-numeric`.
+          const pattern = new RegExp(String.raw`(?:^|[;{\s])${property}\s*:\s*([^;}]+)`, 'gu');
+          const offenders = [...rules.matchAll(pattern)]
+            .map((match) => (match[1] ?? '').trim())
+            .filter((value) => !value.includes('var(--dg-') && !literals.includes(value as never));
+
+          expect(
+            offenders,
+            `a ${property} value that is neither a --dg-* token reference nor one of the ` +
+              `permitted literals [${literals.join(', ') || 'none'}] is a visual decision taken ` +
+              'outside the token table (AAP 0.6.4). Add the value to src/tokens/tokens.ts and ' +
+              'reference it here',
+          ).toEqual([]);
+        });
+      }
+
+      it('names no retired constant namespace, in a rule or in a comment', () => {
+        // The `--dgx-` prefix was a parallel motion namespace declared beside
+        // the reset. Its three values are tokens now, and this assertion is
+        // what stops the namespace from being reintroduced as a convenience.
+        expect(raw.includes('--dgx-'), `${rel} still names the retired --dgx- namespace`).toBe(
+          false,
+        );
+      });
+    });
+  }
+});
+
+/* -------------------------------------------------------------------------- */
+/* 4. WCAG contrast (AAP 0.6.3, 0.6.4) — the accessibility gate               */
+/* -------------------------------------------------------------------------- */
+
+describe('contrast thresholds and arithmetic', () => {
+  it('requires the minimums this suite states, not the ones the product exports', () => {
+    expect(REQUIRED_TEXT_CONTRAST, 'normal-size text must clear 4.5:1 (WCAG 2.2 AA 1.4.3)').toBe(
+      4.5,
+    );
+    expect(
+      REQUIRED_NON_TEXT_CONTRAST,
+      'a non-text visual must clear 3:1 (WCAG 2.2 AA 1.4.11)',
+    ).toBe(3);
+
+    // The one place the two are tied together. A product constant lowered to
+    // make a palette pass fails HERE, with the palette suites still measured
+    // against the required figures above.
+    expect(
+      WCAG_AA_TEXT_CONTRAST,
+      'the exported text minimum no longer matches the required 4.5:1; raise the colour, not ' +
+        'the threshold (AAP 0.6.4)',
+    ).toBe(REQUIRED_TEXT_CONTRAST);
+    expect(
+      WCAG_AA_NON_TEXT_CONTRAST,
+      'the exported non-text minimum no longer matches the required 3:1; raise the colour, not ' +
+        'the threshold (AAP 0.6.4)',
+    ).toBe(REQUIRED_NON_TEXT_CONTRAST);
+  });
+
+  for (const minimum of [REQUIRED_TEXT_CONTRAST, REQUIRED_NON_TEXT_CONTRAST]) {
+    it(`treats ${minimum}:1 as inclusive and everything below it as failing`, () => {
+      const justBelow = previousDouble(minimum);
+
+      expect(justBelow, 'the boundary value must sit strictly below the minimum').toBeLessThan(
+        minimum,
+      );
+      expect(meetsContrast(minimum, minimum), `exactly ${minimum}:1 meets ${minimum}:1`).toBe(true);
+      expect(
+        meetsContrast(justBelow, minimum),
+        `${justBelow} is below ${minimum} and must not be rounded into compliance`,
+      ).toBe(false);
+      expect(meetsContrast(minimum - 0.01, minimum)).toBe(false);
+      expect(meetsContrast(minimum + 0.01, minimum)).toBe(true);
+    });
+  }
+
+  it('rounds for reporting only, and never into compliance', () => {
+    // 4.4996 rounds to 4.5 at two decimals, which is exactly why the pair
+    // suites compare the raw ratio.
+    expect(roundContrastRatio(4.4996)).toBe(4.5);
+    expect(meetsContrast(4.4996, REQUIRED_TEXT_CONTRAST)).toBe(false);
+    expect(roundContrastRatio(5.093808)).toBe(5.09);
+    expect(roundContrastRatio(21)).toBe(21);
+  });
+
+  for (const { foreground, background, ratio, clears } of KNOWN_CONTRAST_RATIOS) {
+    it(`measures ${foreground} on ${background} as ${ratio}:1`, () => {
+      const measured = contrastRatio(foreground, background);
+
+      expect(measured, 'the ratio differs from the independently computed figure').toBeCloseTo(
+        ratio,
+        3,
+      );
+      // The formula is symmetric, so the argument names are for readability
+      // only and swapping them must not change the answer.
+      expect(contrastRatio(background, foreground)).toBe(measured);
+      expect(
+        measured,
+        'no pair can fall below the 1:1 ratio of a colour with itself',
+      ).toBeGreaterThanOrEqual(1);
+
+      expect(
+        meetsContrast(measured, REQUIRED_TEXT_CONTRAST),
+        `${foreground} on ${background} against the 4.5:1 text minimum`,
+      ).toBe(clears === 'both');
+      expect(
+        meetsContrast(measured, REQUIRED_NON_TEXT_CONTRAST),
+        `${foreground} on ${background} against the 3:1 non-text minimum`,
+      ).toBe(clears !== 'neither');
+    });
+  }
+});
 
 describe('design token contrast', () => {
   for (const theme of PANEL_THEMES) {
@@ -781,8 +1198,8 @@ describe('design token contrast', () => {
             const ratio = measureContrast(theme, foreground, background);
 
             expect(
-              meetsContrast(ratio, WCAG_AA_TEXT_CONTRAST),
-              describePair({ theme, foreground, background, ratio }, WCAG_AA_TEXT_CONTRAST),
+              meetsContrast(ratio, REQUIRED_TEXT_CONTRAST),
+              describePair({ theme, foreground, background, ratio }, REQUIRED_TEXT_CONTRAST),
             ).toBe(true);
           });
         }
@@ -792,8 +1209,8 @@ describe('design token contrast', () => {
             const ratio = measureContrast(theme, foreground, background);
 
             expect(
-              meetsContrast(ratio, WCAG_AA_TEXT_CONTRAST),
-              describePair({ theme, foreground, background, ratio }, WCAG_AA_TEXT_CONTRAST),
+              meetsContrast(ratio, REQUIRED_TEXT_CONTRAST),
+              describePair({ theme, foreground, background, ratio }, REQUIRED_TEXT_CONTRAST),
             ).toBe(true);
           });
         }
@@ -803,8 +1220,8 @@ describe('design token contrast', () => {
             const ratio = measureContrast(theme, foreground, background);
 
             expect(
-              meetsContrast(ratio, WCAG_AA_NON_TEXT_CONTRAST),
-              describePair({ theme, foreground, background, ratio }, WCAG_AA_NON_TEXT_CONTRAST),
+              meetsContrast(ratio, REQUIRED_NON_TEXT_CONTRAST),
+              describePair({ theme, foreground, background, ratio }, REQUIRED_NON_TEXT_CONTRAST),
             ).toBe(true);
           });
         }
@@ -843,8 +1260,8 @@ describe('published contrast reference figures', () => {
     const worst = worstPairOf(measurePairs(PANEL_THEMES, TEXT_KEYS));
 
     expect(
-      meetsContrast(worst.ratio, WCAG_AA_TEXT_CONTRAST),
-      describePair(worst, WCAG_AA_TEXT_CONTRAST),
+      meetsContrast(worst.ratio, REQUIRED_TEXT_CONTRAST),
+      describePair(worst, REQUIRED_TEXT_CONTRAST),
     ).toBe(true);
     expect(worst.ratio).toBeCloseTo(4.82, 2);
   });
@@ -879,8 +1296,8 @@ describe('published contrast reference figures', () => {
     expect(worst.foreground).toBe('kindFetch');
     expect(worst.background).toBe('surfaceOverlay');
     expect(
-      meetsContrast(worst.ratio, WCAG_AA_NON_TEXT_CONTRAST),
-      describePair(worst, WCAG_AA_NON_TEXT_CONTRAST),
+      meetsContrast(worst.ratio, REQUIRED_NON_TEXT_CONTRAST),
+      describePair(worst, REQUIRED_NON_TEXT_CONTRAST),
     ).toBe(true);
     expect(worst.ratio).toBeCloseTo(3.21, 2);
   });
@@ -901,7 +1318,7 @@ describe('published contrast reference figures', () => {
 });
 
 /* -------------------------------------------------------------------------- */
-/* 4. Theme identity and the two host mappings                                */
+/* 5. Theme identity and the two host mappings                                */
 /* -------------------------------------------------------------------------- */
 
 /**
