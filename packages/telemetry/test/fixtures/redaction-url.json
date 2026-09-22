@@ -1,0 +1,59 @@
+{
+  "before": {
+    "id": "evt_2m9x4c7v1b5n8qhs",
+    "traceId": "b7e41c9d05a2f836e1d4079ba53c62f8",
+    "spanId": "d2a91f7b46c085e3",
+    "parentSpanId": "5c8e03b1f7d24a96",
+    "kind": "fetch",
+    "name": "GET /api/items?itemId=42&sort=name&page=2",
+    "startTime": 1789812900006.214,
+    "duration": 118.742,
+    "tier": "browser",
+    "attributes": {
+      "http.method": "GET",
+      "url": "/api/items?itemId=42&sort=name&page=2",
+      "http.status_code": 200,
+      "initiator": "fetchItemList"
+    },
+    "status": "ok",
+    "producerId": "prd_t4y7u1i9o3p6a2sd",
+    "seq": 3,
+    "source": {
+      "file": "src/hooks/useItemList.ts",
+      "line": 42,
+      "column": 18,
+      "symbol": "fetchItemList",
+      "resolvedBy": "source-map",
+      "confidence": 0.75
+    }
+  },
+  "after": {
+    "id": "evt_2m9x4c7v1b5n8qhs",
+    "traceId": "b7e41c9d05a2f836e1d4079ba53c62f8",
+    "spanId": "d2a91f7b46c085e3",
+    "parentSpanId": "5c8e03b1f7d24a96",
+    "kind": "fetch",
+    "name": "GET /api/items?itemId=?&sort=?&page=?",
+    "startTime": 1789812900006.214,
+    "duration": 118.742,
+    "tier": "browser",
+    "attributes": {
+      "http.method": "GET",
+      "url": "/api/items?itemId=?&sort=?&page=?",
+      "http.status_code": 200,
+      "initiator": "fetchItemList"
+    },
+    "status": "ok",
+    "producerId": "prd_t4y7u1i9o3p6a2sd",
+    "seq": 3,
+    "source": {
+      "file": "src/hooks/useItemList.ts",
+      "line": 42,
+      "column": 18,
+      "symbol": "fetchItemList",
+      "resolvedBy": "source-map",
+      "confidence": 0.75
+    },
+    "redacted": ["url"]
+  }
+}

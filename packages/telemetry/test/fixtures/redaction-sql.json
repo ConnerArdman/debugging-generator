@@ -1,0 +1,57 @@
+{
+  "before": {
+    "id": "evt_8k3p6r1v4y9b2ncw",
+    "traceId": "5b71e0c93da46f28148a35d7c02be9f1",
+    "spanId": "3d72b95ec1408af6",
+    "parentSpanId": "e18f4c60a2d75b93",
+    "kind": "db.query",
+    "name": "SELECT items",
+    "startTime": 1789812900042.371,
+    "duration": 318.664,
+    "tier": "db",
+    "attributes": {
+      "db.system": "postgresql",
+      "db.statement": "SELECT id, name FROM items WHERE tenant_id = $1 AND status = 'active' AND updated_at > '2026-01-01' LIMIT 50",
+      "db.rowCount": 24
+    },
+    "status": "ok",
+    "producerId": "prd_t4w8z1b5n9q3v7ml",
+    "seq": 7,
+    "source": {
+      "file": "src/server/services/items.service.ts",
+      "line": 41,
+      "column": 22,
+      "symbol": "loadItems",
+      "resolvedBy": "code-graph",
+      "confidence": 0.85
+    }
+  },
+  "after": {
+    "id": "evt_8k3p6r1v4y9b2ncw",
+    "traceId": "5b71e0c93da46f28148a35d7c02be9f1",
+    "spanId": "3d72b95ec1408af6",
+    "parentSpanId": "e18f4c60a2d75b93",
+    "kind": "db.query",
+    "name": "SELECT items",
+    "startTime": 1789812900042.371,
+    "duration": 318.664,
+    "tier": "db",
+    "attributes": {
+      "db.system": "postgresql",
+      "db.statement": "SELECT id, name FROM items WHERE tenant_id = $1 AND status = ? AND updated_at > ? LIMIT ?",
+      "db.rowCount": 24
+    },
+    "status": "ok",
+    "producerId": "prd_t4w8z1b5n9q3v7ml",
+    "seq": 7,
+    "source": {
+      "file": "src/server/services/items.service.ts",
+      "line": 41,
+      "column": 22,
+      "symbol": "loadItems",
+      "resolvedBy": "code-graph",
+      "confidence": 0.85
+    },
+    "redacted": ["db.statement"]
+  }
+}

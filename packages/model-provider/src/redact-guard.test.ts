@@ -4,7 +4,13 @@
  * It pins the three things the guard is for and one thing it must never do:
  *
  * 1. **One case per deny-list class of AAP §0.5.2.** Eight rules, eight
- *    positive cases, each on the shape the specification's table names.
+ *    positive cases, each on the shape the specification's table names — plus
+ *    one case per *enumerated member* of the two classes whose table row
+ *    enumerates them: all six denied header names, in three spellings each, and
+ *    all five provider credential prefixes. A rule that recognised five of six
+ *    names would otherwise pass a suite built from one case per class.
+ *    `high-entropy-secret`, which is the one class defined by a measurement,
+ *    additionally pins both of its thresholds from above and below.
  * 2. **The compliant output of the first checkpoint passes.** A denied header
  *    carrying `[redacted]`, a `?`-masked URL, parameterised SQL and a React
  *    prop preview truncated to 120 characters are what the ingest checkpoint
@@ -27,7 +33,11 @@
  * alphabet, exactly as `./redact-guard.ts` assembles its own patterns and as
  * `scripts/check-secrets.test.mjs` builds its own fixtures. Nothing in this file
  * may be "simplified" into a literal; see the pattern-table comment in the
- * module under test for what that costs.
+ * module under test for what that costs. The two entries of
+ * `scripts/check-secrets.allowlist.json` are no help here and must not be
+ * extended to make one: that allowlist is a *tracked-file* concession for the
+ * repository's two development placeholders, while the guard itself has no
+ * allowlist whatsoever — which is its own asserted case below.
  *
  * Fixtures are inline rather than loaded from a fixture directory, because the
  * whole point of one is to be read beside the expectation it drives.
@@ -76,6 +86,7 @@ import type {
   RedactGuardReport,
   RedactionRuleId,
 } from './redact-guard.js';
+import { PROMPT_STAGES } from './types.js';
 import type { JsonObject, ModelMessage, ModelRequest } from './types.js';
 
 /*
@@ -187,11 +198,57 @@ const CREDENTIALED_URI = assemble(
   ':5432/analytics',
 );
 
+/**
+ * A development-placeholder URI of exactly the shape
+ * `scripts/check-secrets.allowlist.json` permits in six tracked files.
+ *
+ * Same shape, deliberately different bytes: a userinfo whose user and password
+ * are the same word, a loopback host and the conventional database port. The
+ * point of the fixture is the distinction the "keeps no allowlist" case below
+ * asserts — that allowlist is a *tracked-file* concession so `.env.example`,
+ * the Compose file and the documentation can carry the demo database
+ * credential, and it grants nothing to an **outbound payload**. The two lists
+ * must never be harmonised.
+ */
+const DEV_CREDENTIALED_URI = assemble(
+  'postgresql',
+  ':',
+  '//',
+  'devuser',
+  ':',
+  'devuser',
+  '@',
+  'localhost',
+  ':5432/',
+  'analytics_dev',
+);
+
+/** An unmasked header value: what the ingest checkpoint should have replaced. */
+const HEADER_VALUE = assemble('Ses', 'sion=') + cycle(URLSAFE_CHARS, 24);
+
 /** An opaque secret: long, dense and bound to a credential-like name. */
 const OPAQUE_SECRET = cycle(URLSAFE_CHARS, 44);
 
 /** A hexadecimal digest: 64 characters, and exactly four bits each. */
 const HEX_DIGEST = cycle(HEX_CHARS, 64);
+
+/**
+ * A dense value exactly {@link ENTROPY_MIN_LENGTH} characters long: the
+ * shortest the entropy rule will measure.
+ */
+const THRESHOLD_LENGTH_VALUE = cycle(URLSAFE_CHARS, ENTROPY_MIN_LENGTH);
+
+/** The same material one character short of the length threshold. */
+const BELOW_LENGTH_VALUE = cycle(URLSAFE_CHARS, ENTROPY_MIN_LENGTH - 1);
+
+/**
+ * Fifteen symbols, so a value cycled from them tops out just below
+ * {@link ENTROPY_MIN_BITS_PER_CHAR} — `log2(15)` is about 3.91 bits.
+ */
+const NARROW_ALPHABET = charRange('a', 'o');
+
+/** A long value that is not dense enough to be measurable key material. */
+const BELOW_ENTROPY_VALUE = cycle(NARROW_ALPHABET, 48);
 
 /** Every fixture whose bytes must never appear in any output of the guard. */
 const SECRET_FIXTURES: readonly string[] = [
@@ -204,6 +261,8 @@ const SECRET_FIXTURES: readonly string[] = [
   WEB_TOKEN,
   PRIVATE_KEY_HEADER,
   CREDENTIALED_URI,
+  DEV_CREDENTIALED_URI,
+  HEADER_VALUE,
   OPAQUE_SECRET,
 ];
 
@@ -685,6 +744,251 @@ describe('each deny-list class is detected', () => {
     );
     expect(findings[0]?.path).toBe('context.environment.url');
   });
+
+  it('names the query parameter of an absolute URL, and never its value', () => {
+    // Both spellings reach a payload: a captured request target is usually
+    // origin-relative (the table case above), and an outgoing call to another
+    // service is absolute. The finding names the parameter because the name is
+    // structure a developer needs and the value is the thing the rule objects
+    // to.
+    const findings = inspectPayload(
+      { requests: [{ url: `https://warehouse.internal.test/v1/summary?token=${QUERY_VALUE}` }] },
+      { rules: ['url-query-value'] },
+    );
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.ruleId).toBe('url-query-value');
+    expect(findings[0]?.path).toBe(`${DEFAULT_ROOT_PATH}.requests[0].url${URL_QUERY_MASK}token`);
+    expectNoValueLeak(serialise(findings), QUERY_VALUE);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Every enumerated member of the two enumerated classes
+ *
+ * `sensitive-header` and `provider-key` are the two classes of AAP §0.5.2 whose
+ * table row enumerates members, so one case per row is not enough: a rule that
+ * recognised five of the six header names, or three of the five credential
+ * prefixes, would pass a single-case suite and leak the rest.
+ * ---------------------------------------------------------------------------
+ */
+
+/** A key the walk appends after a dot rather than bracketing and quoting. */
+const IDENTIFIER_KEY_LIKE = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+
+/** How a denied header's path is spelled once the walk has appended its key. */
+function attributePath(key: string): string {
+  return IDENTIFIER_KEY_LIKE.test(key)
+    ? `${DEFAULT_ROOT_PATH}.attributes.${key}`
+    : `${DEFAULT_ROOT_PATH}.attributes["${key}"]`;
+}
+
+describe('every denied header name is recognised where it sits', () => {
+  for (const name of DENIED_HEADER_NAMES) {
+    it(`reports an unreplaced value under ${name}`, () => {
+      // Nested under an attributes-shaped object, which is how a captured
+      // request's headers reach a prompt payload.
+      const findings = inspectPayload(
+        { attributes: { [name]: HEADER_VALUE } },
+        { rules: ['sensitive-header'] },
+      );
+      expect(findings).toHaveLength(1);
+      expect(findings[0]?.ruleId).toBe('sensitive-header');
+      expect(findings[0]?.path).toBe(attributePath(name));
+      expect(findings[0]?.reason).toBe(REDACTION_RULE_REASONS['sensitive-header']);
+      expectNoValueLeak(serialise(findings), HEADER_VALUE);
+    });
+  }
+
+  it('recognises a header name in the case the producer happened to write', () => {
+    // A browser agent writes `authorization`, a source excerpt spells it
+    // `Authorization`, and a response header arrives as `Set-Cookie`. The case
+    // a producer chose cannot decide whether a credential is redacted.
+    for (const key of ['Authorization', 'Set-Cookie', 'X-Api-Key', 'PROXY-AUTHORIZATION']) {
+      const findings = inspectPayload(
+        { attributes: { [key]: HEADER_VALUE } },
+        { rules: ['sensitive-header'] },
+      );
+      expect(findings).toHaveLength(1);
+      expect(findings[0]?.path).toBe(attributePath(key));
+    }
+  });
+
+  it('recognises each name as the final segment of a flattened attribute key', () => {
+    // A Node exporter flattens headers into span attributes, so the header name
+    // arrives as the last dot-separated segment of a longer key.
+    for (const name of DENIED_HEADER_NAMES) {
+      const key = `http.request.header.${name}`;
+      const findings = inspectPayload(
+        { attributes: { [key]: HEADER_VALUE } },
+        { rules: ['sensitive-header'] },
+      );
+      expect(findings).toHaveLength(1);
+      expect(findings[0]?.path).toBe(`${DEFAULT_ROOT_PATH}.attributes["${key}"]`);
+      expectNoValueLeak(serialise(findings), HEADER_VALUE);
+    }
+  });
+});
+
+/** One credential prefix of the `provider-key` class, and the value carrying it. */
+interface CredentialCase {
+  readonly label: string;
+  readonly value: string;
+}
+
+const CREDENTIAL_CASES: readonly CredentialCase[] = [
+  { label: 'the vendor prefix', value: VENDOR_CREDENTIAL },
+  { label: 'the generic vendor prefix', value: GENERIC_CREDENTIAL },
+  { label: 'a classic forge token prefix', value: FORGE_CLASSIC_CREDENTIAL },
+  { label: 'a fine-grained forge token prefix', value: FORGE_FINE_CREDENTIAL },
+  { label: 'a cloud access-key identifier prefix', value: ACCESS_KEY_IDENTIFIER },
+];
+
+describe('every provider credential prefix is recognised', () => {
+  for (const { label, value } of CREDENTIAL_CASES) {
+    it(`reports ${label}`, () => {
+      const payload: JsonObject = { excerpt: `const client = createClient('${value}');` };
+      const findings = inspectPayload(payload, { rules: ['provider-key'] });
+      expect(findings).toHaveLength(1);
+      expect(findings[0]?.ruleId).toBe('provider-key');
+      expect(findings[0]?.path).toBe(`${DEFAULT_ROOT_PATH}.excerpt`);
+      expect(findings[0]?.reason).toBe(REDACTION_RULE_REASONS['provider-key']);
+      expectNoValueLeak(serialise(findings), value);
+    });
+  }
+
+  it('covers every prefix the class enumerates', () => {
+    // A prefix added to the module's shape table without a case here would be
+    // untested, so the count is pinned rather than left to the reader.
+    expect(CREDENTIAL_CASES).toHaveLength(5);
+  });
+});
+
+describe('the guard keeps no allowlist', () => {
+  it('flags a development-placeholder URI exactly as it flags any other', () => {
+    // `scripts/check-secrets.allowlist.json` exempts two development
+    // placeholders — the demo database URL and the Compose password line — in
+    // six named **tracked files**, so a fresh clone can run `pnpm demo:db`.
+    // That concession is about what may be *committed*. It says nothing about
+    // what may be *sent*: a credentialed URI in an outbound payload is a
+    // finding whatever it authenticates against, because the guard cannot know
+    // that a loopback host in a captured attribute is the developer's own
+    // throwaway container rather than their production warehouse. Do not
+    // harmonise the two lists.
+    for (const uri of [CREDENTIALED_URI, DEV_CREDENTIALED_URI]) {
+      const findings = inspectPayload(
+        { environment: { url: uri } },
+        { rules: ['connection-string'] },
+      );
+      expect(findings).toHaveLength(1);
+      expect(findings[0]?.ruleId).toBe('connection-string');
+      expect(findings[0]?.path).toBe(`${DEFAULT_ROOT_PATH}.environment.url`);
+      expectNoValueLeak(serialise(findings), uri);
+    }
+  });
+
+  it('refuses a request carrying one, rather than exempting it', () => {
+    const result = assertOutboundSafe(
+      makeRequest({ input: { environment: { url: DEV_CREDENTIALED_URI } } }),
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) {
+      return;
+    }
+    expect(result.error.details?.ruleIds).toEqual(['connection-string']);
+    expectNoValueLeak(JSON.stringify(result.error.details), DEV_CREDENTIALED_URI);
+  });
+});
+
+describe('the entropy rule binds to a name and to both thresholds', () => {
+  for (const term of KEY_LIKE_NAME_TERMS) {
+    it(`measures a value bound to a field name containing "${term}"`, () => {
+      // The field name is built from the exported vocabulary rather than
+      // written out, so dropping a term from `KEY_LIKE_NAME_TERMS` fails here
+      // instead of silently narrowing the rule.
+      const key = `outbound_${term}`;
+      expect(isKeyLikeName(key)).toBe(true);
+      const findings = inspectPayload(
+        { environment: { [key]: OPAQUE_SECRET } },
+        { rules: ['high-entropy-secret'] },
+      );
+      expect(findings).toHaveLength(1);
+      expect(findings[0]?.ruleId).toBe('high-entropy-secret');
+      expect(findings[0]?.path).toBe(`${DEFAULT_ROOT_PATH}.environment.${key}`);
+      expectNoValueLeak(serialise(findings), OPAQUE_SECRET);
+    });
+  }
+
+  it('measures a value of exactly the threshold length', () => {
+    // The length bound is inclusive, and this is the case that pins it.
+    expect(THRESHOLD_LENGTH_VALUE).toHaveLength(ENTROPY_MIN_LENGTH);
+    expect(shannonEntropy(THRESHOLD_LENGTH_VALUE)).toBeGreaterThan(ENTROPY_MIN_BITS_PER_CHAR);
+    expect(
+      inspectPayload({ apiKey: THRESHOLD_LENGTH_VALUE }, { rules: ['high-entropy-secret'] }),
+    ).toHaveLength(1);
+  });
+
+  it('leaves a value one character short of the threshold alone', () => {
+    // Below the bound an estimate says nothing: a short dense word and a short
+    // credential are indistinguishable by density, and refusing on one would
+    // refuse ordinary identifiers.
+    expect(BELOW_LENGTH_VALUE).toHaveLength(ENTROPY_MIN_LENGTH - 1);
+    expect(shannonEntropy(BELOW_LENGTH_VALUE)).toBeGreaterThan(ENTROPY_MIN_BITS_PER_CHAR);
+    expect(
+      inspectPayload({ apiKey: BELOW_LENGTH_VALUE }, { rules: ['high-entropy-secret'] }),
+    ).toEqual([]);
+  });
+
+  it('leaves a long value that is not dense enough alone', () => {
+    // Just under the density bound, from an alphabet of fifteen symbols.
+    expect(BELOW_ENTROPY_VALUE.length).toBeGreaterThan(ENTROPY_MIN_LENGTH);
+    expect(shannonEntropy(BELOW_ENTROPY_VALUE)).toBeLessThan(ENTROPY_MIN_BITS_PER_CHAR);
+    expect(
+      inspectPayload({ accessToken: BELOW_ENTROPY_VALUE }, { rules: ['high-entropy-secret'] }),
+    ).toEqual([]);
+  });
+
+  it('stays bound to the name: the same material under an ordinary one passes', () => {
+    // A content hash, a digest and a cache key are dense by construction, so a
+    // rule that measured every long value would refuse every payload carrying
+    // one. `hash` is not credential-like, and that is the whole difference.
+    expect(isKeyLikeName('hash')).toBe(false);
+    expect(inspectPayload({ hash: OPAQUE_SECRET })).toEqual([]);
+    expect(inspectPayload({ digest: OPAQUE_SECRET })).toEqual([]);
+    // The contrast, on the same bytes, so the name is demonstrably what decided
+    // it rather than something about the value.
+    expect(
+      inspectPayload({ clientSecret: OPAQUE_SECRET }, { rules: ['high-entropy-secret'] }),
+    ).toHaveLength(1);
+  });
+});
+
+describe('a rule subset narrows what is reported and nothing else', () => {
+  /** A payload carrying three classes at three distinct paths. */
+  const mixed: JsonObject = {
+    notes: `the cookie held ${WEB_TOKEN}`,
+    environment: { url: CREDENTIALED_URI },
+    keyFile: PRIVATE_KEY_HEADER,
+  };
+
+  it('reports only the selected class', () => {
+    const findings = inspectPayload(mixed, { rules: ['jwt'] });
+    expect(ruleIdsOf(findings)).toEqual(['jwt']);
+    expect(findings[0]?.path).toBe(`${DEFAULT_ROOT_PATH}.notes`);
+  });
+
+  it('reports exactly the selected subset, in reporting order', () => {
+    const findings = inspectPayload(mixed, { rules: ['private-key', 'jwt'] });
+    expect(ruleIdsOf(findings)).toEqual(['jwt', 'private-key']);
+  });
+
+  it('reports all three when no subset is given', () => {
+    // The other classes' fixtures are unchanged: they were silent because they
+    // were not selected, not because they stopped matching.
+    expect(new Set(ruleIdsOf(inspectPayload(mixed)))).toEqual(
+      new Set(['jwt', 'connection-string', 'private-key']),
+    );
+  });
 });
 
 /*
@@ -853,6 +1157,27 @@ describe('a payload the ingest checkpoint already redacted passes', () => {
     expect(inspectPayload({ count: 4, ratio: 0.5, flag: true, absent: null })).toEqual([]);
   });
 
+  it('accepts the ordinary furniture of an evidence payload', () => {
+    // Everything a stage's structured context is mostly made of: project-relative
+    // paths, component and symbol identifiers, prose, scalars and the empty
+    // containers an aggregate produces when it found nothing. None of it is a
+    // finding, and an empty container is not an excuse to stop early either —
+    // the walk still reports itself complete.
+    const report = inspectPayloadReport({
+      files: ['src/components/SummaryCard.tsx', 'src/server/reporting.ts', './relative/module.tsx'],
+      symbols: ['SummaryCard', 'handleSubmit', 'loadSummary'],
+      summary: 'The interaction spent most of its time waiting on one query.',
+      counts: { renders: 4, requests: 2, duplicates: 0 },
+      flags: { duplicateSuspected: true, unresolved: false, owner: null },
+      emptyObject: {},
+      emptyArray: [],
+      nested: { levels: [{}, [], { note: '' }] },
+    });
+    expect(report.findings).toEqual([]);
+    expect(report.complete).toBe(true);
+    expect(report.limitsReached).toEqual([]);
+  });
+
   it('does not match a credential prefix inside a word', () => {
     // A prefix is only a credential where it *starts a token*. Without that
     // boundary, ordinary compound words carry the shortest prefix followed by
@@ -951,6 +1276,65 @@ describe('adversarial input', () => {
     expect(report.complete).toBe(true);
   });
 
+  it('skips values no serialiser could send without losing the ones it can', () => {
+    // `undefined`, a function and a symbol are not JSON values, and a
+    // symbol-keyed property is not enumerable by name, so none of them can
+    // carry a credential into a request — while a plain sibling string still
+    // must be inspected. Typed through `Record<string, unknown>` because
+    // `ModelRequest.input` cannot express any of them.
+    const odd: Record<string | symbol, unknown> = {
+      absent: undefined,
+      handler: (): string => 'noop',
+      marker: Symbol('marker'),
+      notes: `the log line held ${GENERIC_CREDENTIAL}`,
+    };
+    odd[Symbol('hidden')] = VENDOR_CREDENTIAL;
+    let report: RedactGuardReport | undefined;
+    expect(() => {
+      report = inspectPayloadReport(odd, { rules: ['provider-key'] });
+    }).not.toThrow();
+    expect(report?.complete).toBe(true);
+    expect(report?.findings.map((finding) => finding.path)).toEqual([`${DEFAULT_ROOT_PATH}.notes`]);
+  });
+
+  it('finds a credential near the end of a very wide array', () => {
+    // A walk that gave up part-way through a long array would report clean on
+    // a payload whose last element is the credential, so the element index is
+    // asserted rather than merely the count.
+    const width = 5_000;
+    const excerpts: string[] = [];
+    for (let index = 0; index < width - 1; index += 1) {
+      excerpts.push(`line ${String(index)} of the captured excerpt`);
+    }
+    excerpts.push(`tail ${GENERIC_CREDENTIAL}`);
+    const report = inspectPayloadReport({ excerpts }, { rules: ['provider-key'] });
+    expect(report.complete).toBe(true);
+    expect(report.findings.map((finding) => finding.path)).toEqual([
+      `${DEFAULT_ROOT_PATH}.excerpts[${String(width - 1)}]`,
+    ]);
+    expectNoValueLeak(serialise(report.findings), GENERIC_CREDENTIAL);
+  });
+
+  it('caps a wide array of findings while the verdict stays unsafe', () => {
+    const offenders: string[] = [];
+    for (let index = 0; index < 200; index += 1) {
+      offenders.push(CREDENTIALED_URI);
+    }
+    const report = inspectPayloadReport(
+      { environments: offenders },
+      { maxFindings: 4, rules: ['connection-string'] },
+    );
+    expect(report.findings).toHaveLength(4);
+    expect(report.limitsReached).toContain('max-findings');
+    expect(report.complete).toBe(false);
+    // The cap is a reporting bound, never a softer verdict: there is at least
+    // one finding, so the request is refused either way.
+    expect(
+      assertOutboundSafe(makeRequest({ input: { environments: offenders } }), { maxFindings: 4 })
+        .ok,
+    ).toBe(false);
+  });
+
   it('finds a credential in a megabyte string without scanning all of it', () => {
     const large = `${FILLER.repeat(200)}${GENERIC_CREDENTIAL} ${FILLER.repeat(200_000)}`;
     const report = inspectPayloadReport({ excerpt: large }, { rules: ['provider-key'] });
@@ -958,6 +1342,22 @@ describe('adversarial input', () => {
     // Scanning stopped at the bound, so the verdict is "unsafe and truncated".
     expect(report.limitsReached).toContain('max-string-length');
     expect(report.complete).toBe(false);
+  });
+
+  it('inspects a multi-megabyte payload in a sane time rather than hanging', () => {
+    // The bound that matters is per string, so the work one hostile value can
+    // cause is `maxStringLength + SCAN_WINDOW_OVERLAP` code units however long
+    // it is. Three megabytes of it takes tens of milliseconds in practice; the
+    // budget asserted here is two orders of magnitude above that, so it fails
+    // on an unbounded scan and not on a loaded machine.
+    const huge = `${padding(64)}${GENERIC_CREDENTIAL} ${FILLER.repeat(350_000)}`;
+    expect(huge.length).toBeGreaterThan(3_000_000);
+    const startedAt = performance.now();
+    const report = inspectPayloadReport({ excerpt: huge }, { rules: ['provider-key'] });
+    const elapsedMs = performance.now() - startedAt;
+    expect(ruleIdsOf(report.findings)).toEqual(['provider-key']);
+    expect(report.limitsReached).toContain('max-string-length');
+    expect(elapsedMs).toBeLessThan(4_000);
   });
 
   it('finds a credential that straddles the scanned region boundary', () => {
@@ -1037,6 +1437,87 @@ describe('adversarial input', () => {
     );
     expect(ruleIdsOf(report.findings)).toEqual(['connection-string']);
     expect(report.complete).toBe(true);
+  });
+
+  it('refuses every adversarial payload instead of throwing on any of them', () => {
+    // The whole battery above, put through the decision function rather than
+    // the inspection: the last thing between a payload and the network cannot
+    // be the thing that throws, and a payload it could not read in full is
+    // refused rather than sent.
+    const cyclic: Record<string, unknown> = { notes: 'ordinary text' };
+    cyclic.self = cyclic;
+    const bare = Object.create(null) as Record<string, unknown>;
+    bare.cookie = HEADER_VALUE;
+    const throwingGetter: Record<string, unknown> = {};
+    Object.defineProperty(throwingGetter, 'apiKey', {
+      enumerable: true,
+      get(): string {
+        throw new Error('unreadable');
+      },
+    });
+    const hostile = new Proxy(
+      {},
+      {
+        ownKeys(): never {
+          throw new Error('unreadable');
+        },
+      },
+    );
+    // `sendable` records the verdict each shape earns, because "hostile" and
+    // "unsafe" are different questions: a cycle of ordinary text and an opaque
+    // built-in are structures a serialiser would flatten or drop, so they carry
+    // nothing and may be sent. Everything that hid a value, or that could not
+    // be read in full, must be refused.
+    const adversarial: readonly {
+      readonly label: string;
+      readonly input: unknown;
+      readonly sendable: boolean;
+    }[] = [
+      { label: 'a cycle of ordinary text', input: cyclic, sendable: true },
+      {
+        label: 'a null-prototype object holding a header',
+        input: { headers: bare },
+        sendable: false,
+      },
+      { label: 'a throwing getter', input: throwingGetter, sendable: false },
+      { label: 'an unreadable key set', input: { context: hostile }, sendable: false },
+      {
+        label: 'built-ins no serialiser would send',
+        input: { lookup: new Map([['cookie', HEADER_VALUE]]), when: new Date(0) },
+        sendable: true,
+      },
+      {
+        label: 'nesting past the depth ceiling',
+        input: nest(MAX_SUPPORTED_DEPTH + 32, { notes: GENERIC_CREDENTIAL }),
+        sendable: false,
+      },
+      {
+        label: 'a credential past the string bound',
+        input: {
+          excerpt: `${padding(DEFAULT_MAX_STRING_LENGTH + SCAN_WINDOW_OVERLAP + 16)}${WEB_TOKEN}`,
+        },
+        sendable: false,
+      },
+    ];
+    for (const { label, input, sendable } of adversarial) {
+      let result: Result<void, DebuggenError> | undefined;
+      expect(() => {
+        result = assertOutboundSafe(makeRequest({ input: input as JsonObject }));
+      }, label).not.toThrow();
+      expect(result?.ok, label).toBe(sendable);
+      if (result === undefined || result.ok) {
+        continue;
+      }
+      expect(DEBUGGEN_ERROR_CODES, label).toContain(result.error.code);
+      const printed = [
+        result.error.message,
+        result.error.hint ?? '',
+        JSON.stringify(result.error.details),
+      ].join('\n');
+      for (const secret of SECRET_FIXTURES) {
+        expectNoValueLeak(printed, secret);
+      }
+    }
   });
 });
 
@@ -1201,6 +1682,16 @@ describe('summarizeFindings', () => {
  */
 
 describe('assertOutboundSafe', () => {
+  it('is exercised with requests whose provenance is real', () => {
+    // A fixture request has to be one the pipeline could actually make: the
+    // stage comes from the exported vocabulary and the prompt version has the
+    // `vNNN` shape the loader reports, so a request that would never exist
+    // cannot be what the refusal path is proved on.
+    const { metadata } = makeRequest();
+    expect(PROMPT_STAGES).toContain(metadata.stage);
+    expect(metadata.promptVersion).toMatch(/^v\d{3}$/);
+  });
+
   it('passes a request whose every field is already redacted', () => {
     const result = assertOutboundSafe(
       makeRequest({
@@ -1250,6 +1741,55 @@ describe('assertOutboundSafe', () => {
     expect(details?.stage).toBe('analyze');
     expect(details?.promptVersion).toBe('v001');
     expect(details?.sessionId).toBe('ses_01JBQ8Z4T7');
+  });
+
+  it('reads a bearer credential out of the rendered prose, not only out of a header', () => {
+    // A credential reaches the prose half of the payload the same way anything
+    // else does: a bounded source excerpt is substituted into the prompt the
+    // loader rendered. A guard that only inspected structure would send it.
+    const result = assertOutboundSafe(
+      makeRequest({
+        prompt: `${CLEAN_PROMPT} One excerpt reads: fetch(url, { headers: { authorization: '${BEARER_CREDENTIAL}' } }).`,
+      }),
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) {
+      return;
+    }
+    expect(result.error.details?.ruleIds).toEqual(['bearer-token']);
+    expect(result.error.details?.paths).toEqual(['prompt']);
+    expectNoValueLeak(
+      [result.error.message, JSON.stringify(result.error.details)].join('\n'),
+      BEARER_CREDENTIAL,
+    );
+  });
+
+  it('names the full path of a credential buried deep in the structured context', () => {
+    // The path is what makes a refusal actionable, so it has to survive array
+    // indices and a non-identifier key on the way down to the field.
+    const result = assertOutboundSafe(
+      makeRequest({
+        input: {
+          spans: [
+            { name: 'interaction', attributes: {} },
+            { name: 'render', attributes: { component: 'SummaryCard' } },
+            {
+              name: 'fetch',
+              attributes: { 'http.request.header.authorization': HEADER_VALUE },
+            },
+          ],
+        },
+      }),
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) {
+      return;
+    }
+    expect(result.error.details?.ruleIds).toEqual(['sensitive-header']);
+    expect(result.error.details?.paths).toEqual([
+      'input.spans[2].attributes["http.request.header.authorization"]',
+    ]);
+    expectNoValueLeak(JSON.stringify(result.error.details), HEADER_VALUE);
   });
 
   it('keeps every part of the error free of the value that caused it', () => {

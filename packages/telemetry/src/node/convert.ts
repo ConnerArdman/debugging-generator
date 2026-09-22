@@ -266,12 +266,21 @@ export const DB_CLIENT_VALUES = Object.freeze({
  *
  * A marker is honoured whatever its value: presence is the signal, and a
  * helper that sets `true` and one that sets the action id both work.
+ *
+ * The canonical spelling is exactly `./span-helper.ts`'s
+ * `FUNCTION_SPAN_MARKER_KEY`, whose value carries the `TelemetryKind` the span
+ * converts to. The two are stated at both ends rather than imported here: this
+ * module is the one table of the vocabulary it matches on and takes no
+ * dependency on the helper, so `convert.test.ts` pins the literal from this
+ * side and a change to either end fails there instead of silently disabling
+ * the secondary signal.
  */
-export const FUNCTION_SPAN_MARKER_ATTRIBUTE = 'debuggenFunction';
+export const FUNCTION_SPAN_MARKER_ATTRIBUTE = 'debuggen.kind';
 
 /** Accepted spellings of {@link FUNCTION_SPAN_MARKER_ATTRIBUTE}, canonical first. */
 export const FUNCTION_SPAN_MARKER_ATTRIBUTES: readonly string[] = Object.freeze([
   FUNCTION_SPAN_MARKER_ATTRIBUTE,
+  'debuggenFunction',
   'debuggen.function',
   'debuggen.span',
 ]);

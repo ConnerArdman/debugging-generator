@@ -34,17 +34,34 @@
  *   `MAX_TRACKED_KEYS`, `MAX_ATTRIBUTE_DEPTH` and `MAX_ATTRIBUTE_NODES` are
  *   imported, never restated, so a change to a privacy bound fails here with
  *   its reason rather than with an off-by-one.
+ * - **Fixtures are valid before they are redacted.** Every whole-event
+ *   fixture is parsed with `../schema/event.ts` first (see
+ *   {@link checkedEvent}), and its tier is derived from `KIND_ALLOWED_TIERS`
+ *   rather than typed by hand, so a failure below means the redactor is
+ *   wrong and never that the fixture was malformed.
  */
 import { describe, expect, it } from 'vitest';
 
-import { ALL_ATTRIBUTE_KEYS, MAX_PREVIEW_LENGTH, MAX_TRACKED_KEYS } from '../schema/attributes.js';
+import {
+  ALL_ATTRIBUTE_KEYS,
+  MAX_PREVIEW_LENGTH,
+  MAX_TRACKED_KEYS,
+  SERVICE_ASSIGNED_ATTRIBUTE_KEYS,
+} from '../schema/attributes.js';
 import {
   telemetryEventIngressSchema,
   telemetryEventSchema,
   type TelemetryEvent,
   type TelemetryEventIngress,
 } from '../schema/event.js';
-import type { TelemetryKind, TelemetryTier } from '../schema/kinds.js';
+import {
+  KIND_ALLOWED_TIERS,
+  QUERY_KINDS,
+  RENDER_KINDS,
+  REQUEST_KINDS,
+  type TelemetryKind,
+  type TelemetryTier,
+} from '../schema/kinds.js';
 import {
   DROPPED_ATTRIBUTE_KEYS,
   MAX_ATTRIBUTE_DEPTH,
@@ -76,8 +93,41 @@ const BEARER_HEADER_VALUE = 'bearer ' + BEARER_BODY;
 /** A JOSE compact-serialisation token, its identifying prefix split. */
 const JOSE_TOKEN = 'ey' + 'J0eXAiOiJKV1QifQ.' + 'c3'.repeat(12) + '.' + 'd4'.repeat(12);
 
+/**
+ * The credential half of {@link CONNECTION_STRING}, named so the leak table
+ * can search for the password alone as well as for the whole string.
+ */
+const CONNECTION_PASSWORD = 'e5'.repeat(6);
+
 /** A credentialed connection string, scheme and userinfo assembled separately. */
-const CONNECTION_STRING = 'pg' + 'sql://svc:' + 'e5'.repeat(6) + '@127.0.0.1:5432/db_a';
+const CONNECTION_STRING = 'pg' + 'sql://svc:' + CONNECTION_PASSWORD + '@127.0.0.1:5432/db_a';
+
+/** The base64 body of {@link PEM_BLOCK}: key material by position, not by content. */
+const PEM_BODY = 'MIIB' + 'f7'.repeat(20);
+
+/** The label shared by a PEM block's opening and closing delimiter, split in two. */
+const PEM_LABEL = 'RSA ' + 'PRIVATE' + ' KEY';
+
+/**
+ * The opening delimiter of {@link PEM_BLOCK}.
+ *
+ * Named separately because it holds no newline and can therefore be searched
+ * for in JSON text, where the block's own line breaks are escaped.
+ */
+const PEM_HEADER = '-'.repeat(5) + 'BEGIN ' + PEM_LABEL + '-'.repeat(5);
+
+/**
+ * A PEM private-key block.
+ *
+ * Its delimiters are assembled from pieces — the dashes by repetition, the
+ * label in two halves — so the committed bytes of this tracked file hold no
+ * contiguous key header for `scripts/check-secrets.mjs` to report. That is
+ * the same technique the gate itself uses on its own patterns, and the
+ * assembled value is key material in shape only: the body is a repeated
+ * character pair.
+ */
+const PEM_BLOCK =
+  PEM_HEADER + '\n' + PEM_BODY + '\n' + '-'.repeat(5) + 'END ' + PEM_LABEL + '-'.repeat(5);
 
 /*
  * ---------------------------------------------------------------------------
@@ -135,6 +185,53 @@ function persistedEvent(
 /** The attribute bag of a redacted event, for assertions that read one key. */
 function attributesOf(event: TelemetryEventIngress): Record<string, unknown> {
   return event.attributes;
+}
+
+/**
+ * The first tier `KIND_ALLOWED_TIERS` permits for a kind.
+ *
+ * A fixture's tier is *derived* rather than typed, because the event schema
+ * cross-checks the kind/tier pair and a hand-written pair is the fixture
+ * mistake that costs a debugging session: `db.query` on `browser` is rejected
+ * by the schema, so a test written that way would fail for a reason that has
+ * nothing to do with redaction.
+ *
+ * Every kind declares at least one tier, so the fallback is unreachable; it
+ * exists only because `noUncheckedIndexedAccess` types the lookup as
+ * optional, and `browser` is the honest choice — the tier of most kinds these
+ * fixtures use. `checkedEvent` would reject a wrong pair anyway.
+ */
+function tierFor(kind: TelemetryKind): TelemetryTier {
+  return KIND_ALLOWED_TIERS[kind][0] ?? 'browser';
+}
+
+/** An event of `kind` on a tier that kind allows, with no tier to get wrong. */
+function eventOfKind(
+  kind: TelemetryKind,
+  name: string,
+  attributes: Record<string, unknown>,
+): TelemetryEventIngress {
+  return eventOf(kind, tierFor(kind), name, attributes);
+}
+
+/**
+ * Parses a fixture with the schema the ingest path parses a producer's event
+ * with, and returns it unchanged.
+ *
+ * Redaction runs *after* validation in the real pipeline (validate → key →
+ * redact → attribute → persist), so a fixture that the schema would have
+ * rejected tests a state the redactor never sees. Asserting validity here
+ * keeps every failure below attributable: it means the redactor is wrong, not
+ * that the fixture was. The two deliberately invalid fixtures in this file —
+ * the hostile bag the boundary has to make parseable, and the event with no
+ * attribute bag at all — say so at their own call sites and skip this.
+ */
+function checkedEvent(event: TelemetryEventIngress): TelemetryEventIngress {
+  const parsed = telemetryEventIngressSchema.safeParse(event);
+  expect(parsed.success, `fixture for kind "${event.kind}" must be valid before redaction`).toBe(
+    true,
+  );
+  return event;
 }
 
 /*
@@ -976,6 +1073,30 @@ describe('redactAttributesWithFindings — the report', () => {
     expect(report.maskedValues).toBe(1);
     expect(report.truncatedValues).toBe(1);
   });
+
+  it('names no value it masked, benign or not, and no path it found one at', () => {
+    // Most masked values are perfectly ordinary — a query parameter, a prop
+    // preview — and the report is written to logs that a redacted payload
+    // could not be written to. So neither the credential nor the benign value
+    // may appear in it, and nor may the attribute path either was found at: a
+    // path is built from page-supplied key names. The rule ids are the whole
+    // report, which is what makes it loggable.
+    const { report } = redactAttributesWithFindings(
+      {
+        url: 'http://127.0.0.1:20450/api/alpha?itemId=DistinctBenignA17',
+        'log.message': 'used ' + PROVIDER_CREDENTIAL,
+      },
+      { kind: 'fetch' },
+    );
+    const serialised = JSON.stringify(report);
+
+    expect(serialised).not.toContain('DistinctBenignA17');
+    expect(serialised).not.toContain('k-ant-');
+    expect(serialised).not.toContain('log.message');
+    expect(serialised).not.toContain('itemId');
+    // The positional rule is still reported, by id alone.
+    expect(report.rules).toContain('url-query-value');
+  });
 });
 
 /*
@@ -1287,5 +1408,632 @@ describe('redactEvent — schema round-trip', () => {
     expect(parsed.success).toBe(true);
     expect(redacted.name.length).toBeLessThanOrEqual(event.name.length);
     expect(redacted.name).not.toContain('svc:');
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The fixtures themselves
+ * ---------------------------------------------------------------------------
+ */
+
+describe('fixtures — valid before they are redacted', () => {
+  /**
+   * Every kind whose dispatch this file exercises, gathered from the imported
+   * groups plus the single-member kinds that have their own handler or their
+   * own tier.
+   */
+  const EXERCISED_KINDS: readonly TelemetryKind[] = [
+    ...REQUEST_KINDS,
+    ...RENDER_KINDS,
+    ...QUERY_KINDS,
+    'interaction',
+    'state',
+    'error',
+    'http.server',
+    'route.handler',
+    'function',
+    'http.client',
+    'log',
+  ];
+
+  it('builds each exercised kind on a tier that kind allows', () => {
+    for (const kind of EXERCISED_KINDS) {
+      const event = eventOfKind(kind, 'alpha span', { component: 'AlphaPanel' });
+
+      expect(KIND_ALLOWED_TIERS[kind], `tier for kind "${kind}"`).toContain(event.tier);
+      expect(
+        telemetryEventIngressSchema.safeParse(event).success,
+        `ingress fixture for kind "${kind}"`,
+      ).toBe(true);
+    }
+  });
+
+  it('builds shared ingress and persisted fixtures the two schemas accept', () => {
+    expect(
+      telemetryEventIngressSchema.safeParse(fetchEvent({ 'http.method': 'GET' })).success,
+    ).toBe(true);
+    expect(
+      telemetryEventSchema.safeParse(persistedEvent('db.query', 'db', 'pg.query items_t', {}))
+        .success,
+    ).toBe(true);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Per-kind dispatch, on whole events
+ * ---------------------------------------------------------------------------
+ */
+
+describe('redactEvent — per-kind dispatch', () => {
+  it('masks a fetch URL and header while method, status and the stack stay readable', () => {
+    const initiator =
+      'at onAlphaClick (src/components/AlphaPanel.tsx:42:7) token=' +
+      JOSE_TOKEN +
+      ' ' +
+      'at send (src/lib/alpha-client.ts:18:3) '.repeat(6);
+    const event = checkedEvent(
+      eventOfKind('fetch', 'fetch GET /api/alpha', {
+        'http.method': 'POST',
+        url: 'http://127.0.0.1:20450/api/alpha?itemId=A17&mode=full',
+        'http.status_code': 201,
+        'http.request.header.authorization': BEARER_HEADER_VALUE,
+        initiator,
+      }),
+    );
+
+    const attributes = attributesOf(redactEvent(event));
+
+    // Method and status are the two fields AAP 0.5.2 keeps verbatim.
+    expect(attributes['http.method']).toBe('POST');
+    expect(attributes['http.status_code']).toBe(201);
+    expect(attributes.url).toBe(
+      `http://127.0.0.1:20450/api/alpha?itemId=${REDACTION_MASK}&mode=${REDACTION_MASK}`,
+    );
+    // The header's key survives so the panel can say which header was present.
+    expect(attributes['http.request.header.authorization']).toBe(REDACTION_MARKER);
+
+    // `initiator` is in `UNTRUNCATED_ATTRIBUTE_KEYS` because source-map
+    // resolution reads the whole stack: the token goes, every frame stays, and
+    // the preview bound does not apply.
+    const stack = attributes.initiator as string;
+    expect(stack).not.toContain(JOSE_TOKEN);
+    expect(stack).toContain('src/components/AlphaPanel.tsx:42:7');
+    expect(stack).toContain('src/lib/alpha-client.ts:18:3');
+    expect(stack.length).toBeGreaterThan(MAX_PREVIEW_LENGTH);
+    expect(stack.endsWith(TRUNCATION_SUFFIX)).toBe(false);
+  });
+
+  it('keeps a db.query statement parameterised, with row count and system intact', () => {
+    const event = checkedEvent(
+      eventOfKind('db.query', 'pg.query items_t', {
+        'db.system': 'postgresql',
+        'db.statement': "SELECT id FROM items_t WHERE id = $1 AND code = 'L1teralA17'",
+        'db.rowCount': 12,
+      }),
+    );
+
+    const attributes = attributesOf(redactEvent(event));
+
+    // A placeholder is structure and stays; an inline literal is data and
+    // goes. AAP 0.5.2 keeps the row *count* and never a row.
+    expect(attributes['db.statement']).toBe(
+      `SELECT id FROM items_t WHERE id = $1 AND code = ${REDACTION_MASK}`,
+    );
+    expect(attributes['db.rowCount']).toBe(12);
+    expect(attributes['db.system']).toBe('postgresql');
+  });
+
+  it('keeps render evidence and bounds each changed-prop preview', () => {
+    const atBound = 'q'.repeat(MAX_PREVIEW_LENGTH);
+    const overBound = 'r'.repeat(MAX_PREVIEW_LENGTH + 1);
+    const event = checkedEvent(
+      eventOfKind('render', 'AlphaPanel', {
+        component: 'AlphaPanel',
+        phase: 'update',
+        renderCount: 4,
+        trigger: 'props',
+        actualDuration: 3.5,
+        changedProps: [
+          { key: 'atBound', next: { type: 'string', preview: atBound, truncated: false } },
+          { key: 'overBound', next: { type: 'string', preview: overBound, truncated: false } },
+        ],
+      }),
+    );
+
+    const attributes = attributesOf(redactEvent(event));
+    const entries = attributes.changedProps as Record<string, unknown>[];
+    const previewOf = (index: number): string =>
+      ((entries[index] as Record<string, unknown>).next as Record<string, unknown>)
+        .preview as string;
+
+    // Everything `../aggregate/renders.ts` and the `renderTable` node read.
+    expect(attributes.component).toBe('AlphaPanel');
+    expect(attributes.phase).toBe('update');
+    expect(attributes.renderCount).toBe(4);
+    expect(attributes.trigger).toBe('props');
+    expect(attributes.actualDuration).toBe(3.5);
+
+    // A preview exactly at the bound already conforms and is returned as it
+    // arrived; one code point over it is cut to the bound, suffix included.
+    expect(previewOf(0)).toBe(atBound);
+    expect(previewOf(1)).toHaveLength(MAX_PREVIEW_LENGTH);
+    expect(previewOf(1).endsWith(TRUNCATION_SUFFIX)).toBe(true);
+  });
+
+  it('scrubs both state value summaries and keeps the transition readable', () => {
+    const event = checkedEvent(
+      eventOfKind('state', 'setAlphaCount', {
+        component: 'BetaRow',
+        hookIndex: 1,
+        hookLabel: 'alphaCount',
+        previousValue: { type: 'string', preview: BEARER_HEADER_VALUE, truncated: false },
+        nextValue: {
+          type: 'string',
+          preview: 'n'.repeat(MAX_PREVIEW_LENGTH * 2),
+          truncated: true,
+        },
+        triggerEventId: 'evt_e5e5e5e5e5e5e5e5',
+      }),
+    );
+
+    const redacted = redactEvent(event);
+    const attributes = attributesOf(redacted);
+    const previewOf = (key: string): string =>
+      (attributes[key] as Record<string, unknown>).preview as string;
+
+    expect(attributes.component).toBe('BetaRow');
+    expect(attributes.hookIndex).toBe(1);
+    expect(attributes.hookLabel).toBe('alphaCount');
+    // The triggering-event reference is a correlation id, not runtime data:
+    // `StateTransitionViewer` follows it to the event that caused the change.
+    expect(attributes.triggerEventId).toBe('evt_e5e5e5e5e5e5e5e5');
+    expect(previewOf('previousValue')).toBe(`bearer ${REDACTION_MARKER}`);
+    expect(previewOf('nextValue')).toHaveLength(MAX_PREVIEW_LENGTH);
+    expect(redacted.redacted).toEqual(['previousValue.preview', 'nextValue.preview']);
+  });
+
+  it('scrubs an error message and the frame a token was planted in', () => {
+    const event = checkedEvent(
+      eventOfKind('error', 'TypeError in AlphaPanel', {
+        'error.type': 'TypeError',
+        'error.message': 'request rejected: ' + JOSE_TOKEN,
+        'error.stack': 'at send (src/lib/alpha-client.ts:18:3) token=' + JOSE_TOKEN,
+        component: 'AlphaPanel',
+      }),
+    );
+
+    const attributes = attributesOf(redactEvent(event));
+
+    // The structure is the evidence — type, component, the frame that threw —
+    // and only the planted credential goes.
+    expect(attributes['error.type']).toBe('TypeError');
+    expect(attributes.component).toBe('AlphaPanel');
+    expect(attributes['error.message']).toBe(`request rejected: ${REDACTION_MARKER}`);
+    expect(attributes['error.stack']).toBe(
+      `at send (src/lib/alpha-client.ts:18:3) token=${REDACTION_MARKER}`,
+    );
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Dispatch by kind group, never by kind string
+ * ---------------------------------------------------------------------------
+ */
+
+describe('redactEvent — dispatch by kind group', () => {
+  /*
+   * Every kind-gated handler asks `../schema/kinds.ts` for **group
+   * membership** rather than comparing against a literal kind string, which
+   * is that module's stated contract. Each case below therefore iterates the
+   * imported group and covers every member: a handler special-cased on one
+   * member fails here on the others, and a kind added to a group is covered
+   * the moment it is declared.
+   */
+
+  it('opens the preview subtree for every render kind', () => {
+    expect(RENDER_KINDS.length).toBeGreaterThan(1);
+
+    for (const kind of RENDER_KINDS) {
+      const event = checkedEvent(
+        eventOfKind(kind, 'AlphaPanel', {
+          changedProps: [
+            {
+              key: 'itemCount',
+              next: { type: 'string', preview: '"' + PROVIDER_CREDENTIAL + '"', truncated: false },
+            },
+          ],
+        }),
+      );
+
+      const entry = (attributesOf(redactEvent(event)).changedProps as Record<string, unknown>[])[0];
+      const fields = entry as Record<string, unknown>;
+
+      // The prop *name* is the evidence the render table shows and is exempt
+      // from the name rule inside a preview subtree; the prop *value* preview
+      // is page data and is scrubbed.
+      expect(fields.key, `changed-prop name on kind "${kind}"`).toBe('itemCount');
+      expect((fields.next as Record<string, unknown>).preview).toBe(`"${REDACTION_MARKER}"`);
+    }
+  });
+
+  it('masks the URL in the span name of every request kind', () => {
+    expect(REQUEST_KINDS.length).toBeGreaterThan(1);
+
+    for (const kind of REQUEST_KINDS) {
+      const redacted = redactEvent(
+        checkedEvent(eventOfKind(kind, 'GET /api/alpha?itemId=A17', {})),
+      );
+
+      // Method and route survive; the parameter value does not.
+      expect(redacted.name, `span name on kind "${kind}"`).toBe(
+        `GET /api/alpha?itemId=${REDACTION_MASK}`,
+      );
+    }
+  });
+
+  it('treats a conventional statement spelling as SQL on every query kind', () => {
+    for (const kind of QUERY_KINDS) {
+      const event = checkedEvent(
+        eventOfKind(kind, 'pg.query items_t', {
+          statement: "SELECT id FROM items_t WHERE code = 'L1teralA17'",
+        }),
+      );
+
+      expect(attributesOf(redactEvent(event)).statement, `statement on kind "${kind}"`).toBe(
+        `SELECT id FROM items_t WHERE code = ${REDACTION_MASK}`,
+      );
+    }
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Every service-assigned key, not just the one
+ * ---------------------------------------------------------------------------
+ */
+
+describe('redactAttributes — every service-assigned key', () => {
+  /**
+   * 64 characters of hex: the shape `./request-key.ts` produces.
+   *
+   * The exemption these two tests protect is load-bearing and is exactly the
+   * kind a later "tighten the rules" change destroys silently. The key's name
+   * ends in "key" and its value is dense, so the name rule would mask it and
+   * an entropy heuristic would agree — and `../aggregate/requests.ts` groups
+   * duplicate requests by exactly this value, so a masked key would collapse
+   * every request in a capture into one duplicate group and make
+   * `duplicate_request_count` meaningless. It is computed *before* redaction
+   * from the unredacted URL and is a keyed hash of the request's shape, never
+   * of its data (AAP 0.5.2).
+   *
+   * Written as a loop over the imported tuple rather than as one test for
+   * `request_key`, so a key the service starts assigning is covered as soon
+   * as it is declared.
+   */
+  const DIGEST = 'a9'.repeat(32);
+
+  it('passes a scalar through byte-for-byte at the top level of the bag', () => {
+    expect(SERVICE_ASSIGNED_ATTRIBUTE_KEYS.length).toBeGreaterThan(0);
+
+    for (const key of SERVICE_ASSIGNED_ATTRIBUTE_KEYS) {
+      const { attributes, report } = redactAttributesWithFindings(
+        { [key]: DIGEST, 'http.method': 'GET' },
+        { kind: 'fetch' },
+      );
+
+      expect(attributes[key], `service-assigned key "${key}"`).toBe(DIGEST);
+      expect(attributes['http.method']).toBe('GET');
+      // Not merely unchanged: not even reported, so a log cannot suggest a
+      // finding where the service wrote its own value.
+      expect(report).toEqual({ rules: [], droppedKeys: 0, truncatedValues: 0, maskedValues: 0 });
+    }
+  });
+
+  it('records no redaction path for one on a whole event', () => {
+    const event = checkedEvent(
+      eventOfKind(
+        'fetch',
+        'fetch GET /api/alpha',
+        Object.fromEntries(SERVICE_ASSIGNED_ATTRIBUTE_KEYS.map((key) => [key, DIGEST])),
+      ),
+    );
+
+    const redacted = redactEvent(event);
+
+    expect('redacted' in redacted).toBe(false);
+    for (const key of SERVICE_ASSIGNED_ATTRIBUTE_KEYS) {
+      expect(attributesOf(redacted)[key], `service-assigned key "${key}"`).toBe(DIGEST);
+    }
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Event-level invariants
+ * ---------------------------------------------------------------------------
+ */
+
+describe('redactEvent — event-level invariants', () => {
+  /*
+   * `redacted` is the provenance record AAP 0.5.2 asks for, and
+   * `../schema/event.ts` declares it as the attribute **paths** whose values
+   * this module replaced — not a boolean flag. Its absence therefore means
+   * exactly "no value was replaced", and never "this event has not crossed
+   * the boundary". That second question is answered by the ingest path's call
+   * order rather than by any field: an event reaches the store or the
+   * `telemetry.tail` feed only through `redactEvent`, and an event that has
+   * not been through this function must not be persisted or broadcast at all.
+   * Both event schemas are strict, so a boolean marker would make a redacted
+   * event unparseable — which is why this contract cannot drift.
+   */
+
+  it('returns the same key set, gaining redacted only when something was replaced', () => {
+    const clean = checkedEvent(
+      eventOfKind('fetch', 'fetch GET /api/alpha', { 'http.method': 'GET' }),
+    );
+    expect(Object.keys(redactEvent(clean))).toEqual(Object.keys(clean));
+
+    const dirty = checkedEvent(
+      eventOfKind('fetch', 'fetch GET /api/alpha', { apiKey: PROVIDER_CREDENTIAL }),
+    );
+    expect(Object.keys(redactEvent(dirty))).toEqual([...Object.keys(dirty), 'redacted']);
+  });
+
+  it('carries the three attribution fields of a persisted event through untouched', () => {
+    const event = persistedEvent('db.query', 'db', 'pg.query items_t', {
+      'db.statement': "SELECT id FROM items_t WHERE code = 'L1teralA17'",
+      'db.rowCount': 3,
+    });
+    expect(telemetryEventSchema.safeParse(event).success).toBe(true);
+
+    const redacted = redactEvent(event);
+
+    // The three fields the service assigns at ingest: attribution the store
+    // and every aggregate index by, and nothing a producer supplied.
+    expect(redacted.sessionId).toBe(event.sessionId);
+    expect(redacted.captureId).toBe(event.captureId);
+    expect(redacted.ingestSeq).toBe(event.ingestSeq);
+    expect(Object.keys(redacted)).toEqual([...Object.keys(event), 'redacted']);
+    expect(telemetryEventSchema.safeParse(redacted).success).toBe(true);
+  });
+
+  it('is synchronous: the event comes back, never a promise', () => {
+    const redacted: unknown = redactEvent(checkedEvent(fetchEvent({ 'http.method': 'GET' })));
+
+    // Only `./request-key.ts` is async on the ingest path. A thenable here
+    // would be persisted as an object with no attributes and no kind, and the
+    // whole batch's evidence would be lost silently.
+    expect(redacted).not.toBeInstanceOf(Promise);
+    expect((redacted as { then?: unknown }).then).toBeUndefined();
+    expect((redacted as TelemetryEventIngress).kind).toBe('fetch');
+  });
+
+  it('accepts an empty attribute bag and an event whose bag is missing', () => {
+    const empty = checkedEvent(eventOfKind('interaction', 'click AlphaPanel', {}));
+    const redactedEmpty = redactEvent(empty);
+
+    expect(redactedEmpty.attributes).toEqual({});
+    expect('redacted' in redactedEmpty).toBe(false);
+    expect(telemetryEventIngressSchema.safeParse(redactedEmpty).success).toBe(true);
+
+    // A producer that omitted the bag entirely is malformed — the schema
+    // rejects it, which is how ingest reports it — but redaction runs on the
+    // way to that report, so it has to be total here too. The key stays, with
+    // an empty bag under it, and the result parses.
+    const missing = redactEvent({
+      ...empty,
+      attributes: undefined,
+    } as unknown as TelemetryEventIngress);
+
+    expect(missing.attributes).toEqual({});
+    expect(Object.keys(missing)).toEqual(Object.keys(empty));
+    expect(telemetryEventIngressSchema.safeParse(missing).success).toBe(true);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The leak suite
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * One secret class of AAP 0.5.2, the event that carries it, and what must and
+ * must not survive.
+ */
+interface LeakCase {
+  /** The secret class, in the terms AAP 0.5.2 uses. */
+  readonly secretClass: string;
+  /** Substrings that must appear nowhere in the emitted event. */
+  readonly secrets: readonly string[];
+  /** Evidence that must survive, so a row cannot pass by emitting nothing. */
+  readonly keeps: string;
+  /** The event as its producer would send it. */
+  readonly build: () => TelemetryEventIngress;
+}
+
+describe('redactEvent — the leak suite', () => {
+  /*
+   * The most important block in this file: one row per secret class AAP 0.5.2
+   * names, each asserting that the credential appears nowhere in the emitted
+   * event — not in an attribute, not in a nested preview, not in the span
+   * name, and not in the `redacted` path list, which is built from
+   * page-supplied key names and is serialised with everything else.
+   *
+   * CROSS-CHECKPOINT VERIFICATION. Everything this function emits must also
+   * **pass** `packages/model-provider/src/redact-guard.ts`, the second
+   * checkpoint of the privacy boundary, whose documented negative (passing)
+   * cases are exactly `[redacted]` header values, `?`-masked URLs,
+   * `$1`-parameterised SQL and previews of at most `MAX_PREVIEW_LENGTH`
+   * characters — the four shapes every expectation in this file accepts. The
+   * guard *refuses the model call* when a denied pattern survives, so a
+   * credential that gets through here does not merely leak: it fails the
+   * pipeline at its second checkpoint. If the guard would reject an event
+   * this suite accepts, the defect is in `./redactor.ts` and not in the
+   * guard.
+   *
+   * Table-driven so that a new secret class is one row.
+   */
+  const LEAK_CASES: readonly LeakCase[] = [
+    {
+      secretClass: 'provider key in a log message',
+      secrets: [PROVIDER_CREDENTIAL, 'k-ant-'],
+      keeps: 'startup used',
+      build: () =>
+        eventOfKind('log', 'boot alpha', {
+          'log.message': 'startup used ' + PROVIDER_CREDENTIAL + ' for /api/alpha',
+          'logger.name': 'alpha',
+        }),
+    },
+    {
+      secretClass: 'bearer credential in a request header',
+      secrets: [BEARER_BODY],
+      keeps: 'http.request.header.authorization',
+      build: () =>
+        eventOfKind('fetch', 'fetch POST /api/alpha', {
+          'http.method': 'POST',
+          'http.request.header.authorization': BEARER_HEADER_VALUE,
+        }),
+    },
+    {
+      secretClass: 'JOSE token in an error message',
+      secrets: [JOSE_TOKEN, 'J0eXAiOiJKV1QifQ'],
+      keeps: 'request rejected',
+      build: () =>
+        eventOfKind('error', 'TypeError in AlphaPanel', {
+          'error.type': 'TypeError',
+          'error.message': 'request rejected: ' + JOSE_TOKEN,
+        }),
+    },
+    {
+      secretClass: 'PEM private-key block in a log message',
+      // The block's own line breaks are escaped inside JSON text, so the
+      // searched substrings are its newline-free parts: the delimiter, the
+      // label and the body.
+      secrets: [PEM_HEADER, PEM_LABEL, PEM_BODY],
+      keeps: 'operator pasted',
+      build: () =>
+        eventOfKind('log', 'boot alpha', {
+          'log.message': 'operator pasted ' + PEM_BLOCK,
+        }),
+    },
+    {
+      secretClass: 'credentialed connection string in a database attribute',
+      secrets: [CONNECTION_PASSWORD, CONNECTION_STRING],
+      keeps: '127.0.0.1:5432/db_a',
+      build: () =>
+        eventOfKind('db.query', 'pg.query items_t', {
+          'db.system': 'postgresql',
+          'db.name': CONNECTION_STRING,
+          'db.rowCount': 1,
+        }),
+    },
+    {
+      secretClass: 'value under a password, token or apiKey name',
+      secrets: ['D7'.repeat(8), 'E8'.repeat(8), 'F9'.repeat(8)],
+      keeps: 'AlphaPanel',
+      build: () =>
+        eventOfKind('log', 'boot alpha', {
+          component: 'AlphaPanel',
+          password: 'D7'.repeat(8),
+          token: 'E8'.repeat(8),
+          apiKey: 'F9'.repeat(8),
+        }),
+    },
+    {
+      secretClass: 'token inside a URL query value',
+      secrets: [JOSE_TOKEN],
+      keeps: '/api/alpha',
+      build: () =>
+        eventOfKind('fetch', 'fetch GET /api/alpha', {
+          url: 'http://127.0.0.1:20450/api/alpha?access=' + JOSE_TOKEN,
+          'http.status_code': 200,
+        }),
+    },
+    {
+      secretClass: 'inline literal inside a SQL statement',
+      secrets: ["'L1teralA17'", 'L1teralA17'],
+      keeps: 'items_t',
+      build: () =>
+        eventOfKind('db.query', 'pg.query items_t', {
+          'db.statement': "SELECT id FROM items_t WHERE code = 'L1teralA17' LIMIT 1",
+        }),
+    },
+    {
+      secretClass: 'token inside a React prop preview',
+      secrets: [BEARER_BODY],
+      keeps: 'itemCount',
+      build: () =>
+        eventOfKind('render', 'AlphaPanel', {
+          component: 'AlphaPanel',
+          trigger: 'props',
+          changedProps: [
+            {
+              key: 'itemCount',
+              previous: { type: 'string', preview: BEARER_HEADER_VALUE, truncated: false },
+              next: { type: 'string', preview: '"4"', truncated: false },
+            },
+          ],
+        }),
+    },
+    {
+      secretClass: 'token inside an error stack frame',
+      secrets: [JOSE_TOKEN],
+      keeps: 'src/lib/alpha-client.ts:18:3',
+      build: () =>
+        eventOfKind('error', 'TypeError in AlphaPanel', {
+          'error.stack':
+            'at send (src/lib/alpha-client.ts:18:3) token=' +
+            JOSE_TOKEN +
+            '\n    at flush (src/lib/alpha-client.ts:31:9)',
+        }),
+    },
+    {
+      secretClass: 'credential inside a span name',
+      secrets: [CONNECTION_PASSWORD],
+      keeps: '127.0.0.1:20450/api/beta',
+      build: () =>
+        eventOfKind(
+          'http.client',
+          'fetch GET http://svc:' + CONNECTION_PASSWORD + '@127.0.0.1:20450/api/beta',
+          {},
+        ),
+    },
+  ];
+
+  it.each(LEAK_CASES)(
+    'never emits a $secretClass',
+    ({ secretClass, secrets, keeps, build }: LeakCase) => {
+      const fixture = checkedEvent(build());
+
+      // Non-vacuous by construction: the fixture really carries each secret
+      // before redaction, so no expectation below can pass because the
+      // fixture never held what the row claims it does.
+      const arrived = JSON.stringify(fixture);
+      for (const secret of secrets) {
+        expect(arrived, `fixture must carry the ${secretClass} it names`).toContain(secret);
+      }
+
+      const serialised = JSON.stringify(redactEvent(fixture));
+
+      for (const secret of secrets) {
+        expect(serialised, `a ${secretClass} survived redaction`).not.toContain(secret);
+      }
+      // The row's own evidence, so "nothing leaked" cannot be satisfied by
+      // emitting nothing: the boundary removes credentials, not diagnostics.
+      expect(serialised).toContain(keeps);
+    },
+  );
+
+  it('covers every secret class exactly once', () => {
+    const classes = LEAK_CASES.map((leakCase) => leakCase.secretClass);
+
+    expect(new Set(classes).size).toBe(classes.length);
+    // A guard on the table itself: a row deleted in a refactor is a class
+    // that stops being checked, and nothing else in this file would notice.
+    expect(classes.length).toBeGreaterThanOrEqual(10);
   });
 });
