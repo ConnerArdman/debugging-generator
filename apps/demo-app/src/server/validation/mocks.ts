@@ -41,6 +41,50 @@
 import { z } from 'zod';
 
 /**
+ * The highest code point counted as a control character, and the delete character that sits above
+ * the printable range.
+ *
+ * The two figures name the spans an authorization's reference never contains - the C0 controls
+ * `U+0000`–`U+001F`, and `U+007F` - and they are named rather than written into {@link printable}
+ * so that the range being refused can be read where it is applied.
+ */
+const CONTROL = 0x1f;
+const DELETE = 0x7f;
+
+/**
+ * Whether `value` is free of control characters, which is the one thing a length bound cannot say.
+ *
+ * Three of the fields below are held to a pattern and already admit nothing but letters, digits
+ * and the separators inside them. The payment reference is not: it is the identifier of whatever
+ * the attempt is for, so it stays bounded text, and bounded text is where a control character can
+ * hide. Trimming does not remove one - `U+0000` least of all, which a caller can put in a JSON
+ * string and a `UTF8` database parameter cannot represent - and a reference carrying one ties an
+ * authorization to something no record can be found by. It is refused here, where the response is
+ * a 400 naming the field, rather than further in, where the same value is a failure with no field
+ * attached to it.
+ *
+ * The check walks code points instead of matching a pattern, because a pattern for these
+ * characters would have to contain them, and the walk is free over a field bounded to sixty-four
+ * characters. A character with no code point cannot come out of a string iteration, and counting
+ * one as unprintable keeps the check total without an assertion standing in for the impossible
+ * case.
+ *
+ * @param value A field the length rules have already accepted.
+ * @returns `true` when every character is printable, and `false` as soon as one is not.
+ */
+function printable(value: string): boolean {
+  for (const character of value) {
+    const code = character.codePointAt(0);
+
+    if (code === undefined || code <= CONTROL || code === DELETE) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+/**
  * The body `POST /api/mock/carrier` accepts: where a shipment is going, and enough about the
  * parcel to rate it.
  *
@@ -175,8 +219,17 @@ export const paymentMockBodySchema = z.object({
    * here with no default, because the only default available would be an identifier this module
    * invented, and an authorization tied to a made-up reference is worse than one that is
    * honestly tied to nothing: a caller that omits it is saying the attempt stands alone.
+   *
+   * The character check sits after the length bounds and before `optional()`, so a body that
+   * names no reference is still a complete request and a rejection carries this field's own path.
    */
-  reference: z.string().trim().min(1).max(64).optional(),
+  reference: z
+    .string()
+    .trim()
+    .min(1)
+    .max(64)
+    .refine(printable, 'A payment reference contains no control characters.')
+    .optional(),
 });
 
 /**

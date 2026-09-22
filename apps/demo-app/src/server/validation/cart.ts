@@ -96,6 +96,49 @@ function unset(value: unknown): unknown {
 }
 
 /**
+ * The highest code point this module treats as a control character, and the delete character that
+ * sits above the printable range.
+ *
+ * They bound the two spans no identifier a storefront issues ever contains: the C0 controls
+ * `U+0000`–`U+001F` and `U+007F`. The figures are named rather than written into the check below so
+ * that the range being refused is readable at a glance.
+ */
+const CONTROL = 0x1f;
+const DELETE = 0x7f;
+
+/**
+ * Whether `value` is free of control characters, which is what a length bound alone cannot say.
+ *
+ * Trimming removes the whitespace controls a copied link pads a value with, but it leaves every
+ * other one in place - `U+0000` above all, which a cart session token can carry through a query
+ * string. A token holding one is neither a cart this store issued nor a value PostgreSQL can
+ * compare against `carts.session_token`: its `UTF8` encoding has no representation for a NUL byte,
+ * so the driver refuses the parameter and a lookup that would have found nothing fails instead.
+ * Refusing the value here turns that into the 400 it always was - a caller sent a character this
+ * store does not issue - rather than a 500 from a database the request should never have reached.
+ *
+ * The scan is over code points rather than a regular expression because the characters being
+ * refused cannot be written into a pattern without reintroducing them as literals; iterating the
+ * string reads the same and costs nothing on values bounded to sixty-four characters. A character
+ * with no code point cannot come out of a string iteration, and treating one as unprintable keeps
+ * the check total without an assertion standing in for the impossible case.
+ *
+ * @param value A value the field's length and shape rules have already accepted.
+ * @returns `true` when every character is printable, and `false` as soon as one is not.
+ */
+function printable(value: string): boolean {
+  for (const character of value) {
+    const code = character.codePointAt(0);
+
+    if (code === undefined || code <= CONTROL || code === DELETE) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+/**
  * What `GET /api/cart` accepts: the token of the cart to answer with.
  *
  * Parsing succeeds for a request that carries nothing — which is the request the storefront
@@ -116,6 +159,11 @@ export const cartQuerySchema = z.object({
       .trim()
       .min(1, 'A cart session token cannot be blank.')
       .max(64, 'That cart session token is longer than this store issues.')
+      // The character check sits after the length bounds and before the default, so a caller who
+      // said nothing still gets DEMO_CART_TOKEN and a padded value is still trimmed before it is
+      // judged. A rejection here carries this field's own path, so the response names
+      // `sessionToken` exactly as an over-long token's does.
+      .refine(printable, 'A cart session token contains no control characters.')
       .default(DEMO_CART_TOKEN),
   ),
 });
@@ -170,7 +218,11 @@ export const cartItemBodySchema = z.object({
     .string()
     .trim()
     .min(1, 'A product is required.')
-    .max(64, 'That product identifier is longer than this store issues.'),
+    .max(64, 'That product identifier is longer than this store issues.')
+    // A body reaches a product lookup the same way a query parameter does, so the identifier is
+    // held to the same character rule: a key this store minted carries no control character, and
+    // one that does is refused here rather than by the driver that cannot encode it.
+    .refine(printable, 'A product identifier contains no control characters.'),
   quantity: z
     .number()
     .int('A quantity must be a whole number of units.')
@@ -227,7 +279,10 @@ const cartLineIdField = z
   .string()
   .trim()
   .min(1, 'A cart line is required.')
-  .max(64, 'That cart line identifier is longer than this store issues.');
+  .max(64, 'That cart line identifier is longer than this store issues.')
+  // The character rule is stated here too, and once, so both changes that name a line refuse an
+  // identifier no cart line can be found by before it becomes a parameter the database rejects.
+  .refine(printable, 'A cart line identifier contains no control characters.');
 
 /**
  * Adding units of one product: {@link cartItemBodySchema} under the `add` tag.

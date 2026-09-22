@@ -64,6 +64,51 @@ function unset(value: unknown): unknown {
 }
 
 /**
+ * The highest code point counted as a control character, and the delete character above the
+ * printable range.
+ *
+ * The two figures name the spans no identifier the dashboard's filter row submits ever contains -
+ * the C0 controls `U+0000`–`U+001F`, and `U+007F` - and they are named rather than written into
+ * {@link printable} so that the range being refused reads plainly where it is applied.
+ */
+const CONTROL = 0x1f;
+const DELETE = 0x7f;
+
+/**
+ * Whether `value` is free of control characters, which is the one thing the length bounds above
+ * cannot say.
+ *
+ * Trimming takes off the whitespace a copied dashboard URL padded a parameter with; every other
+ * control character survives it, `U+0000` included, which a query string carries and a `UTF8`
+ * database parameter cannot represent. This feed resolves its location filter in memory today and
+ * would answer such a value with "no stocking location matches that filter", but the identifier
+ * filters on the same surface travel into statements, and a parameter no location can be named by
+ * is a caller's mistake on every one of them. Stating the rule here keeps this dashboard's
+ * rejection a 400 that names the parameter rather than a 404 that invites the caller to try the
+ * same value again.
+ *
+ * The check walks code points rather than matching a pattern, because a pattern for these
+ * characters would have to spell them out, and the walk is free over a parameter bounded to
+ * sixty-four characters. A character with no code point cannot come out of a string iteration, and
+ * counting one as unprintable keeps the check total without an assertion standing in for the
+ * impossible case.
+ *
+ * @param value A parameter the length rules have already accepted.
+ * @returns `true` when every character is printable, and `false` as soon as one is not.
+ */
+function printable(value: string): boolean {
+  for (const character of value) {
+    const code = character.codePointAt(0);
+
+    if (code === undefined || code <= CONTROL || code === DELETE) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+/**
  * The selling states a stock line can be reported in.
  *
  * The tuple is annotated with the imported union instead of declaring literals of its own, so the
@@ -102,8 +147,24 @@ export const inventorySummaryQuerySchema = z.object({
    * short enough that no caller can smuggle a document into a filter.
    *
    * `null` is what the dashboard opens on and means every location.
+   *
+   * The character check sits after the length bounds and before `nullable().default(null)`, so an
+   * absent or blank parameter still resolves to "every location" while a value carrying a control
+   * character is refused. It is the one field here that states a message of its own: the figures
+   * and the enumerated filters report themselves readably, whereas "invalid input" over an
+   * identifier tells a reader nothing about which rule the value missed.
    */
-  warehouseId: z.preprocess(unset, z.string().trim().min(1).max(64).nullable().default(null)),
+  warehouseId: z.preprocess(
+    unset,
+    z
+      .string()
+      .trim()
+      .min(1)
+      .max(64)
+      .refine(printable, 'A stocking location identifier contains no control characters.')
+      .nullable()
+      .default(null),
+  ),
 
   /**
    * How much headroom above a stock line's reorder point still counts as low, in units.

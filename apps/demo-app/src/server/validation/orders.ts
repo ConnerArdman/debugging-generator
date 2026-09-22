@@ -62,6 +62,48 @@ const statuses: readonly [OrderStatus, ...OrderStatus[]] = [
 ];
 
 /**
+ * The highest code point counted as a control character, and the delete character that sits above
+ * the printable range.
+ *
+ * The two figures name the spans an identifier this store issues never contains - the C0 controls
+ * `U+0000`–`U+001F`, and `U+007F` - and they are named rather than written into the check below so
+ * that the range being refused can be read where it is applied.
+ */
+const CONTROL = 0x1f;
+const DELETE = 0x7f;
+
+/**
+ * Whether `value` is free of control characters - the one constraint a length bound cannot express.
+ *
+ * Trimming removes the whitespace a copied link pads a parameter with and leaves every other
+ * control character in place, `U+0000` included, which a query string carries happily and a `UTF8`
+ * parameter cannot represent at all. A customer identifier holding one matches no customer this
+ * store has, so the listing it asks for is empty by construction; refusing it here reports the
+ * caller's mistake as a 400 instead of letting the driver refuse the parameter and the endpoint
+ * answer as though the storefront had failed.
+ *
+ * The check walks code points rather than matching a pattern, because a pattern for these
+ * characters would have to contain them, and the walk is free over a parameter bounded to
+ * sixty-four characters. A character with no code point cannot come out of a string iteration, and
+ * counting one as unprintable keeps the check total without an assertion standing in for the
+ * impossible case.
+ *
+ * @param value A parameter the length rules have already accepted.
+ * @returns `true` when every character is printable, and `false` as soon as one is not.
+ */
+function printable(value: string): boolean {
+  for (const character of value) {
+    const code = character.codePointAt(0);
+
+    if (code === undefined || code <= CONTROL || code === DELETE) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+/**
  * The query parameters the order history listing accepts.
  *
  * The bounds are deliberate rather than defensive. A customer identifier is an
@@ -80,13 +122,17 @@ export const ordersQuerySchema = z.object({
    * parameter with no sensible default: every order belongs to exactly one
    * customer, and a listing with no customer would be every customer's orders.
    * Surrounding whitespace is trimmed before the length is measured, so a value
-   * that a copied link padded is accepted while a blank one is not.
+   * that a copied link padded is accepted while a blank one is not, and the
+   * character rule is checked after both, so a rejection carries this field's
+   * own path and the response names `customerId` as an over-long identifier's
+   * does.
    */
   customerId: z
     .string()
     .trim()
     .min(1, 'A customer identifier is required.')
-    .max(64, 'The customer identifier is longer than this store issues.'),
+    .max(64, 'The customer identifier is longer than this store issues.')
+    .refine(printable, 'A customer identifier contains no control characters.'),
 
   /**
    * Narrows the listing to one point in an order's lifecycle. Optional, and

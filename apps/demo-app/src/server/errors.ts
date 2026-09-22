@@ -62,6 +62,17 @@ const MISSING_MESSAGE = 'The requested record no longer exists.';
 const CONFLICT_MESSAGE = 'The change conflicts with a record that already exists.';
 
 /**
+ * What a visitor is told when the request carried a character the database's
+ * encoding cannot represent.
+ *
+ * It is authored here, like every other message in this module, and says what
+ * the store can accept rather than what the driver reported: the driver's own
+ * wording quotes the offending byte and the statement it was bound to, and
+ * neither belongs in a response body.
+ */
+const CHARSET_MESSAGE = 'The request contained a character this storefront cannot store.';
+
+/**
  * How many rejected fields a validation body reports.
  *
  * A schema rejection over a large payload can produce hundreds of issues; a
@@ -85,6 +96,28 @@ const PRISMA_CODE = /^P\d{4}$/;
 
 /** A PostgreSQL `SQLSTATE`: five digits or capitals, as in `23505` or `42P01`. */
 const SQL_STATE = /^[0-9A-Z]{5}$/;
+
+/**
+ * The two `SQLSTATE`s that mean the client sent a character the database's
+ * encoding cannot carry: `22021` (`character_not_in_repertoire`, which
+ * PostgreSQL answers with for a `UTF8` parameter containing a NUL byte) and
+ * `22P05` (`untranslatable_character`, which it answers with when a character
+ * has no representation in the target encoding).
+ *
+ * They are the one family of database refusals that is the caller's mistake
+ * rather than the storefront's, which is why they are the one family answered
+ * with 400 instead of joining {@link DATABASE_MESSAGE}'s generic 500. Every
+ * request surface validates its own characters before a query is built, so
+ * reaching this mapping means a value slipped past a schema - it is defence in
+ * depth, and answering it as a validation failure keeps a client-caused failure
+ * from being reported as an internal one.
+ *
+ * Both spellings of the state are listed because the driver reports one and the
+ * other appears when the encoding conversion happens on the server; matching
+ * either costs nothing and missing one would answer the same mistake with two
+ * different statuses.
+ */
+const SQL_STATE_CHARSET: readonly string[] = ['22021', '22P05'];
 
 /* ---------------------------------------------------------------------------
  * Thrown errors
@@ -387,6 +420,63 @@ function list(value: unknown): value is readonly unknown[] {
 }
 
 /**
+ * Whether a Prisma request error is a driver refusal of an unrepresentable
+ * character, read out of the driver-adapter cause Prisma nests inside `meta`.
+ *
+ * A raw `pg` error carries its `SQLSTATE` as a top-level `code`, so the mapper's
+ * driver branch can read it directly. A Prisma request error does not: the query
+ * it wrapped failed inside the driver adapter, so the error's own `code` is the
+ * generic `P2039` and the `SQLSTATE` sits at
+ * `meta.driverAdapterError.cause.code` (repeated as `originalCode`). Without
+ * this reader the charset mapping would be reachable only for the one service
+ * that queries the pool directly, and every request that reaches the database
+ * through Prisma - which is all but one of them - would answer the same caller
+ * mistake with a 500.
+ *
+ * Every step is duck-typed against `unknown`, exactly as the branches that call
+ * it are, and for the same reason: the generated Prisma client is not in version
+ * control, so this module cannot import the error class to test against, and
+ * `meta` is a bag whose shape belongs to the driver rather than to this
+ * application. Nothing is read out of the cause except the two code fields, and
+ * neither is copied into a response - the mapper's callers only learn that the
+ * answer is a 400.
+ *
+ * @param error A caught value already known to be an object carrying a `code`.
+ * @returns `true` when the nested driver cause names a charset `SQLSTATE`.
+ */
+function charset(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null || !('meta' in error)) {
+    return false;
+  }
+
+  const meta: unknown = error.meta;
+  if (typeof meta !== 'object' || meta === null || !('driverAdapterError' in meta)) {
+    return false;
+  }
+
+  const driver: unknown = meta.driverAdapterError;
+  if (typeof driver !== 'object' || driver === null || !('cause' in driver)) {
+    return false;
+  }
+
+  const cause: unknown = driver.cause;
+  if (typeof cause !== 'object' || cause === null) {
+    return false;
+  }
+
+  // The adapter reports the state twice - as `code` and as `originalCode` - and
+  // which of the two is present has changed between driver releases, so either
+  // one naming a charset state is enough.
+  const code: unknown = 'code' in cause ? cause.code : undefined;
+  const original: unknown = 'originalCode' in cause ? cause.originalCode : undefined;
+
+  return (
+    (typeof code === 'string' && SQL_STATE_CHARSET.includes(code)) ||
+    (typeof original === 'string' && SQL_STATE_CHARSET.includes(original))
+  );
+}
+
+/**
  * Reduces the issue list of a schema rejection to the two fields a form needs:
  * the dotted path of the value at fault and the message explaining it.
  *
@@ -456,13 +546,17 @@ function issues(value: readonly unknown[]): { path: string; message: string }[] 
  *    rejection's own `message` is never used; in the validator this application
  *    uses it is a serialization of every issue, including the input values.
  * 3. A Prisma request error, recognised by its `P####` code: the two codes with
- *    an unambiguous meaning for a storefront are mapped to 404 and 409, and
- *    every other one joins the generic database response.
+ *    an unambiguous meaning for a storefront are mapped to 404 and 409, one
+ *    wrapped driver refusal - a character the database's encoding cannot carry,
+ *    read out of the nested driver-adapter cause by {@link charset} - is mapped
+ *    to 400, and every other one joins the generic database response.
  * 4. A PostgreSQL driver error, recognised by its `SQLSTATE` code or its
- *    `severity` field: collapsed to one generic 500. The distinctions the driver
- *    draws are for the developer reading the log, and its fields cannot be
- *    forwarded - `message` may quote the statement and `detail` may quote the
- *    row that violated a constraint.
+ *    `severity` field: collapsed to one generic 500, except for the two
+ *    {@link SQL_STATE_CHARSET} states, which are the caller's mistake and are
+ *    answered with the same 400 as the wrapped form above. The other
+ *    distinctions the driver draws are for the developer reading the log, and
+ *    its fields cannot be forwarded - `message` may quote the statement and
+ *    `detail` may quote the row that violated a constraint.
  * 5. Anything else, including a plain `Error`, a string or `undefined`: a fixed
  *    500 whose message says nothing about the cause.
  *
@@ -507,10 +601,27 @@ export function mapStorefrontError(error: unknown): StorefrontErrorOutcome {
         return { status: 409, body: envelope('CART_CONFLICT', CONFLICT_MESSAGE) };
       }
 
+      // A driver refusal Prisma wrapped: the value carried a character the
+      // database's encoding cannot represent, which is the caller's mistake and
+      // is answered as one. No `details` accompany it - the driver does not say
+      // which parameter was at fault, and naming a field here would be a guess
+      // presented as a fact.
+      if (charset(error)) {
+        return { status: 400, body: envelope('VALIDATION_FAILED', CHARSET_MESSAGE) };
+      }
+
       return { status: 500, body: envelope('INTERNAL_ERROR', DATABASE_MESSAGE) };
     }
 
     if ((typeof code === 'string' && SQL_STATE.test(code)) || 'severity' in error) {
+      // The same refusal reported by the driver directly, where the `SQLSTATE`
+      // is the error's own code: answered identically, so the one service that
+      // queries the pool without Prisma and the ones that go through it cannot
+      // report the same mistake with two different statuses.
+      if (typeof code === 'string' && SQL_STATE_CHARSET.includes(code)) {
+        return { status: 400, body: envelope('VALIDATION_FAILED', CHARSET_MESSAGE) };
+      }
+
       return { status: 500, body: envelope('INTERNAL_ERROR', DATABASE_MESSAGE) };
     }
   }

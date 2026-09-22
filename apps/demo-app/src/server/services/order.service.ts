@@ -206,6 +206,49 @@ function cents(value: number): boolean {
 }
 
 /**
+ * The last code point below the printable range: the top of the C0 control
+ * block, `U+001F`.
+ */
+const CONTROL = 0x1f;
+
+/** `DEL`, the one control character above the printable ASCII range. */
+const DEL = 0x7f;
+
+/**
+ * Whether `value` is text this store can record: no C0 control character and
+ * no `DEL`.
+ *
+ * It is a property of the column rather than a house style. A text column
+ * cannot hold `U+0000` at all - the write is refused by the database, not
+ * truncated - and the rest of the class is invisible in everything that reads
+ * an order back, so a value carrying one of these characters is a value an
+ * order cannot be written with. Asking here is what turns that into a rejected
+ * draft instead of a transaction that fails partway through, which matters
+ * because by the time a checkout writes an order it has already held stock,
+ * taken a freight quote and had an amount approved.
+ *
+ * Nothing else is refused: an accented letter, an ideograph and an emoji are
+ * ordinary text to this store and to its columns alike. The class is stated as
+ * a code-point test rather than as a pattern because a pattern for it has to
+ * contain the very characters it excludes, and the loop reads UTF-16 units,
+ * which is exact for it: a control character is always one unit and a surrogate
+ * is numerically far above both bounds.
+ *
+ * @param value A value a draft carries into a column.
+ */
+function plain(value: string): boolean {
+  for (let at = 0; at < value.length; at += 1) {
+    const code = value.charCodeAt(at);
+
+    if (code <= CONTROL || code === DEL) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+/**
  * The reference the store prints on an order, unique to it.
  *
  * The year reads first because that is how the reference is filed and quoted,
@@ -231,11 +274,18 @@ function mint(at: Date): string {
  *
  * Two kinds of rejection are distinguished, because a customer can act on one
  * and not the other. A draft that is not an order at all - no lines, a
- * fractional quantity, a negative charge - is a rejected request. A draft whose
- * figures do not add up is a collision: the cart was priced, quoted and
- * authorized a moment ago, and if its parts no longer reconcile then something
- * moved in between, which a fresh attempt resolves and a silently corrected
- * total would hide.
+ * fractional quantity, a negative charge, text no column can hold - is a
+ * rejected request. A draft whose figures do not add up is a collision: the
+ * cart was priced, quoted and authorized a moment ago, and if its parts no
+ * longer reconcile then something moved in between, which a fresh attempt
+ * resolves and a silently corrected total would hide.
+ *
+ * Everything asked here is asked before {@link recordOrder} opens its
+ * transaction, and each question is answered from the draft alone, so a draft
+ * this function accepts is one whose remaining ways to fail are the conditions
+ * inside that transaction. A caller recovering from a failed write can rely on
+ * that: a rejection from here means nothing was written, and nothing was going
+ * to be.
  *
  * @throws StorefrontValidationError When the draft is not a recordable order.
  * @throws StorefrontConflictError When its figures disagree with one another.
@@ -245,6 +295,25 @@ function check(input: OrderDraft): void {
     throw new StorefrontValidationError(
       'An order has to name the cart it was assembled from and the quote its freight was charged at.',
     );
+  }
+
+  // The account the order is written against is the whole of the draft's text
+  // that reaches a column: `recordOrder` writes the email, the contact name and
+  // the company - or the contact name in the company's place - and nothing
+  // else. Those three are therefore what is asked about here. The destination
+  // is deliberately not among them: an order retains no address at all (see
+  // `blank`), so nothing in `input.address` is ever written, and refusing a
+  // draft over a value this module does not store would be a rule nobody could
+  // act on. The request surfaces hold their own fields to the same class, and
+  // this is the layer that has to hold, because a draft can be assembled in
+  // process - by a page or a script - and reach this function without having
+  // been through one of them.
+  for (const value of [input.customer.name, input.customer.email, input.customer.company]) {
+    if (value !== null && !plain(value)) {
+      throw new StorefrontValidationError(
+        'The contact details on the order hold a character this store cannot record. Use ordinary text characters and place the order again.',
+      );
+    }
   }
 
   if (input.lines.length === 0) {

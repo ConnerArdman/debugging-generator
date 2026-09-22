@@ -80,6 +80,54 @@ type Fields = {
 };
 
 /**
+ * The highest code point counted as a control character, and the delete
+ * character that sits above the printable range.
+ *
+ * The two figures name the spans a service tier's name never contains - the C0
+ * controls `U+0000`–`U+001F`, and `U+007F` - and they are named rather than
+ * written into {@link printable} so that the range being refused can be read
+ * where it is applied.
+ */
+const CONTROL = 0x1f;
+const DELETE = 0x7f;
+
+/**
+ * Whether `value` is free of control characters, which is the one constraint a
+ * length bound cannot state.
+ *
+ * The destination parameter is held to a pattern and therefore already admits
+ * nothing but letters, digits, spaces and hyphens; the tier is bounded text by
+ * design, because the tiers belong to the services this store offers rather
+ * than to this endpoint, and bounded text is exactly where a control character
+ * can hide. Trimming does not remove one - `U+0000` in particular travels
+ * through a query string and then cannot be encoded as a `UTF8` parameter at
+ * all - and a tier carrying one is a name no service publishes, so it is
+ * refused here rather than being narrowed against or written into a persisted
+ * quote's service level.
+ *
+ * The check walks code points instead of matching a pattern, because a pattern
+ * for these characters would have to spell them out, and the walk is free over
+ * a parameter bounded to thirty-two characters. A character with no code point
+ * cannot come out of a string iteration, and counting one as unprintable keeps
+ * the check total without an assertion standing in for the impossible case.
+ *
+ * @param value A parameter the length rules have already accepted.
+ * @returns `true` when every character is printable, and `false` as soon as one
+ * is not.
+ */
+function printable(value: string): boolean {
+  for (const character of value) {
+    const code = character.codePointAt(0);
+
+    if (code === undefined || code <= CONTROL || code === DELETE) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+/**
  * The query parameters `GET /api/shipping/quote` accepts.
  *
  * Every bound is stated rather than left open, because each parameter is a
@@ -170,8 +218,18 @@ export const shippingQuoteQuerySchema = z.object({
    * default, so a caller that names nothing is asking the question checkout
    * opens on; a tier no service offers narrows to nothing and is answered with
    * what is offered, which is a result rather than a bad request.
+   *
+   * The character check sits after the length bounds and before the default, so
+   * a caller that names no tier is still quoted on the store's baseline one,
+   * and a rejection carries this field's own path.
    */
-  serviceLevel: z.string().trim().min(1).max(32).default('standard'),
+  serviceLevel: z
+    .string()
+    .trim()
+    .min(1)
+    .max(32)
+    .refine(printable, 'A service level contains no control characters.')
+    .default('standard'),
 } satisfies Fields);
 
 /**

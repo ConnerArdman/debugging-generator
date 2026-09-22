@@ -47,6 +47,54 @@ const sorts: readonly [CatalogSort, ...CatalogSort[]] = [
 ];
 
 /**
+ * The highest code point counted as a control character, and the delete
+ * character that sits above the printable range.
+ *
+ * The two figures name the spans a catalog slug or a search term never
+ * contains - the C0 controls `U+0000`–`U+001F`, and `U+007F` - and they are
+ * named rather than written into {@link printable} so that the range being
+ * refused can be read where it is applied.
+ */
+const CONTROL = 0x1f;
+const DELETE = 0x7f;
+
+/**
+ * Whether `value` is free of control characters, which is the one thing the
+ * length bounds below cannot express.
+ *
+ * Trimming removes the whitespace a copied catalog link padded a parameter
+ * with, and nothing else: every other control character survives it, `U+0000`
+ * above all, which a query string carries and a `UTF8` database parameter has
+ * no representation for. Both textual filters here travel into a statement as
+ * parameters - a slug is compared against a category's, a term is matched
+ * against product names and SKUs - so a value carrying one is refused before it
+ * becomes a query the driver cannot send, which is the difference between a 400
+ * naming the parameter and a 500 naming nothing.
+ *
+ * The check walks code points instead of matching a pattern, because a pattern
+ * for these characters would have to contain them, and the walk is free over
+ * parameters bounded to sixty-four and eighty characters. A character with no
+ * code point cannot come out of a string iteration, and counting one as
+ * unprintable keeps the check total without an assertion standing in for the
+ * impossible case.
+ *
+ * @param value A parameter the length rules have already accepted.
+ * @returns `true` when every character is printable, and `false` as soon as one
+ * is not.
+ */
+function printable(value: string): boolean {
+  for (const character of value) {
+    const code = character.codePointAt(0);
+
+    if (code === undefined || code <= CONTROL || code === DELETE) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+/**
  * The fields `catalogQuerySchema` has to declare, read off `CatalogQuery`.
  *
  * Mapping over `keyof Required<CatalogQuery>` states three requirements at
@@ -89,12 +137,29 @@ type Fields = {
 export const catalogQuerySchema = z.object({
   // A category's slug, as the catalog's filter chips link to it. A slug no
   // category owns is not rejected here: it matches nothing and answers an empty
-  // page, which is a result rather than a bad request.
-  categorySlug: z.string().trim().min(1).max(64).optional(),
+  // page, which is a result rather than a bad request. A slug carrying a
+  // control character is rejected, because that is a value no filter chip
+  // produces and no parameter can be sent as; the check sits after the length
+  // bounds and before `optional()`, so an unconstrained filter is still an
+  // absent key.
+  categorySlug: z
+    .string()
+    .trim()
+    .min(1)
+    .max(64)
+    .refine(printable, 'A category slug contains no control characters.')
+    .optional(),
   // A free-text term matched against product names and SKUs. A blank term is
   // accepted and narrows nothing, so a search box submitted empty is not an
-  // error the customer has to read.
-  search: z.string().trim().max(80).optional(),
+  // error the customer has to read - and a term made only of printable
+  // characters is the whole of what a search box can produce, so one carrying a
+  // control character is refused rather than matched against nothing.
+  search: z
+    .string()
+    .trim()
+    .max(80)
+    .refine(printable, 'A search term contains no control characters.')
+    .optional(),
   sort: z.enum(sorts).default('featured'),
   // 1-based, like `PagedList.page`. The ceiling sits far beyond the catalog's
   // size and exists so that an absurd page number is refused before it becomes

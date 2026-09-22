@@ -68,6 +68,48 @@ type Fields = {
 };
 
 /**
+ * The highest code point counted as a control character, and the delete character above the
+ * printable range.
+ *
+ * Together they name the two spans a catalog key never contains - the C0 controls
+ * `U+0000`–`U+001F` and `U+007F` - and they are named rather than written into the check below so
+ * that the range being refused is readable where it is used.
+ */
+const CONTROL = 0x1f;
+const DELETE = 0x7f;
+
+/**
+ * Whether `value` is free of control characters, which is the one thing a length bound cannot say.
+ *
+ * Trimming strips the whitespace a copied product link pads a parameter with, and leaves every
+ * other control character where it was - `U+0000` in particular, which travels perfectly well
+ * through a query string and then cannot be encoded as a `UTF8` parameter at all. An identifier
+ * carrying one is not a key this catalog minted, so a lookup for it would find nothing even if the
+ * driver could ask; refusing it here answers the caller's mistake as the 400 it is instead of
+ * letting the database report it as a failure of the storefront.
+ *
+ * The scan walks code points rather than matching a pattern, because the characters being refused
+ * cannot appear in a regular expression without being written out as the literals this rule
+ * exists to keep out of a value. Over a parameter bounded to sixty-four characters the walk costs
+ * nothing. A character with no code point cannot come out of a string iteration, and counting one
+ * as unprintable keeps the check total without an assertion standing in for the impossible case.
+ *
+ * @param value A parameter the length rules have already accepted.
+ * @returns `true` when every character is printable, and `false` as soon as one is not.
+ */
+function printable(value: string): boolean {
+  for (const character of value) {
+    const code = character.codePointAt(0);
+
+    if (code === undefined || code <= CONTROL || code === DELETE) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+/**
  * The query parameters `GET /api/recommendations` accepts.
  *
  * The bounds are deliberate rather than defensive. A product identifier is an
@@ -96,12 +138,18 @@ export const recommendationsQuerySchema = z.object({
    * that a parameter left out altogether and one sent blank report the same
    * sentence — wording a form can show as it stands — instead of the validator's
    * own description of a type it did not get.
+   *
+   * The character rule is checked last, after trimming and after the length
+   * bounds, so a padded value is still accepted and a rejection still carries
+   * this field's own path: the response names `productId` exactly as an
+   * over-long identifier's does.
    */
   productId: z
     .string({ error: 'A product identifier is required.' })
     .trim()
     .min(1, 'A product identifier is required.')
-    .max(64, 'The product identifier is longer than this catalog issues.'),
+    .max(64, 'The product identifier is longer than this catalog issues.')
+    .refine(printable, 'A product identifier contains no control characters.'),
 
   /**
    * How many suggestions one response carries — the page size of this feed.

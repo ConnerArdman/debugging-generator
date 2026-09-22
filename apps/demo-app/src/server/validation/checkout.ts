@@ -64,6 +64,77 @@ import type { CheckoutDraft, CustomerContact, ShippingAddress } from '@/lib/type
 type Mirror<T> = { [K in keyof T]: z.ZodType<T[K]> };
 
 /**
+ * The last code point below the printable range: the top of the C0 control
+ * block, `U+001F`.
+ */
+const CONTROL = 0x1f;
+
+/** `DEL`, the one control character above the printable ASCII range. */
+const DEL = 0x7f;
+
+/**
+ * The one wording every free-text field below uses when it holds a character it
+ * does not carry.
+ *
+ * It says what the field takes and never repeats what arrived in it, which is
+ * the fifth convention at the top of this file: the value at fault here is
+ * somebody's name, company or street address.
+ */
+const TYPED =
+  'Use ordinary text characters here: tab, line break and other control characters are not accepted.';
+
+/**
+ * Whether `value` is text a free-text field carries: no C0 control character
+ * and no `DEL`.
+ *
+ * The fields it guards are bounded by length alone, and a length is not the
+ * whole of what makes a value usable. A control character occupies one
+ * character, so it fits inside any bound; it survives `trim()`, which removes
+ * whitespace and leaves `U+0000` exactly where it was; and the columns an order
+ * is written into cannot hold it at all. A body carrying one is therefore a
+ * body this storefront would take and then be unable to act on - the very thing
+ * the postal-code rule below exists to prevent - so it is refused here, before
+ * the checkout service holds any stock, takes any freight quote or asks for any
+ * amount to be approved. The rule is stated for every free-text field rather
+ * than only for the fields an order retains, because which of them it retains
+ * is the order service's to change and not a caller's to keep track of. The
+ * fields carrying a pattern exclude these characters as a by-product of the
+ * shape they demand; this states the same rule for the fields whose content is
+ * the customer's own to write.
+ *
+ * It is the control characters that are refused and nothing else. Everything
+ * else a customer may legitimately type stays acceptable - an accented letter,
+ * an ideograph, an emoji - because an allowlist of the letters a store expects
+ * would refuse customers rather than protect anything.
+ *
+ * The class is stated as a code-point test rather than as a regular expression
+ * because a pattern for it has to contain the very characters it excludes,
+ * which is neither readable nor something this repository's lint settings
+ * accept. The loop reads UTF-16 units, which is what makes it exact: a control
+ * character is always one unit, and a surrogate - half of an emoji, or a lone
+ * one a caller sends - is numerically far above both bounds and therefore
+ * untouched.
+ *
+ * Written out in this module rather than shared with the query-string surfaces
+ * that hold their own values to the same class, for the reason given at
+ * {@link shippingAddressSchema}: the modules of this folder deliberately do not
+ * depend on each other, and each surface carries its own copy of a rule.
+ *
+ * @param value The trimmed, length-checked value a field parsed.
+ */
+function plain(value: string): boolean {
+  for (let at = 0; at < value.length; at += 1) {
+    const code = value.charCodeAt(at);
+
+    if (code <= CONTROL || code === DEL) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+/**
  * A free-text field the customer may leave empty, bounded at `max` characters.
  *
  * The DTO's discipline for such a field is a present `null` rather than an
@@ -74,6 +145,11 @@ type Mirror<T> = { [K in keyof T]: z.ZodType<T[K]> };
  * meaningful string or `null`, and one empty field cannot reach the checkout
  * service in four different forms.
  *
+ * A value that is present is held to {@link plain} as well as to `max`, on the
+ * same terms as the required fields below: the check follows the trim and the
+ * bound, so surrounding whitespace is still normalised away before anything is
+ * refused and a value is judged as the field will carry it.
+ *
  * @param max Longest value accepted, measured after surrounding whitespace is
  *   trimmed.
  * @param message Wording shown when the value is longer than that.
@@ -83,6 +159,7 @@ function blank(max: number, message: string): z.ZodType<string | null> {
     .string()
     .trim()
     .max(max, message)
+    .refine(plain, TYPED)
     .nullable()
     .default(null)
     .transform((value) => (value !== null && value.length > 0 ? value : null));
@@ -118,19 +195,26 @@ export const shippingAddressSchema: z.ZodType<ShippingAddress> = z.object({
     .string()
     .trim()
     .min(1, 'A street address is required.')
-    .max(120, 'Keep the street address to 120 characters.'),
+    .max(120, 'Keep the street address to 120 characters.')
+    .refine(plain, TYPED),
 
   /** Suite, unit or floor; `null` when the customer leaves it blank. */
   line2: blank(120, 'Keep the second address line to 120 characters.'),
 
-  city: z.string().trim().min(1, 'A city is required.').max(80, 'Keep the city to 80 characters.'),
+  city: z
+    .string()
+    .trim()
+    .min(1, 'A city is required.')
+    .max(80, 'Keep the city to 80 characters.')
+    .refine(plain, TYPED),
 
   /** State, province or territory, spelled as the customer writes it. */
   region: z
     .string()
     .trim()
     .min(1, 'A state or region is required.')
-    .max(80, 'Keep the state or region to 80 characters.'),
+    .max(80, 'Keep the state or region to 80 characters.')
+    .refine(plain, TYPED),
 
   postalCode: z
     .string()
@@ -179,7 +263,8 @@ export const customerContactSchema: z.ZodType<CustomerContact> = z.object({
     .string()
     .trim()
     .min(1, 'A contact name is required.')
-    .max(120, 'Keep the contact name to 120 characters.'),
+    .max(120, 'Keep the contact name to 120 characters.')
+    .refine(plain, TYPED),
 
   email: z
     .string()
