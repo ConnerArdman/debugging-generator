@@ -1,0 +1,799 @@
+/*
+ * apps/vscode-extension/src/webview/styles.css
+ *
+ * The only stylesheet authored for the "Debug Generator" VS Code view. It is
+ * layered ON TOP of `@debuggen/panel-renderer/styles.css` (tokens -> base ->
+ * components), which `src/webview/main.tsx` imports first, and adds nothing but
+ * this surface's own layout plus the view-specific `dgv-*` blocks.
+ * It declares NO tokens: every design value below is a `var(--dg-*)` reference
+ * (AAP 0.6.3/0.6.4), and the only literals are `0`, `none`, `auto`, `inherit`,
+ * `currentColor` and `transparent`. The `dgv-*` namespace is consumed only by
+ * `src/webview/App.tsx` and `src/webview/components/**`; every `dg-*` block
+ * belongs to the design system and is never overridden from here.
+ */
+
+/* ==========================================================================
+ * Document
+ *
+ * Deliberately three declarations' worth of work, because the design system's
+ * `base.css` already owns the reset (`box-sizing`), the document surface
+ * (`background: var(--dg-surface-base)`), the default text colour and type role
+ * (`font: var(--dg-text-md)`), `overflow-wrap`, the themed scrollbars, focus
+ * (`:focus-visible` with `var(--dg-focus-ring)`) and the reduced-motion block.
+ * Restating any of those here would fork the design system, so what is left is
+ * only what a VS Code webview specifically needs:
+ *
+ *   - the host's own body margin and padding, which `base.css` does not reset
+ *     because it resets no `body` box at all;
+ *   - a definite height to hang `#root` and `.dgv-view` from, since `base.css`
+ *     sets `min-block-size` rather than a definite `block-size` on `body`;
+ *   - `overflow: hidden` on the document, so the single `PanelShell` viewport
+ *     inside `App` is the one scroll region on this surface. A second scroller
+ *     would give the view two scrollbars and break `scrollIntoView` for the
+ *     `focus` host message.
+ *
+ * No `*` rule, no global `:focus` rule and no `--vscode-*` reference: the theme
+ * is chosen in `src/webview/theme.ts`, which maps the editor's body class onto
+ * the `data-theme` attribute the token stylesheet keys off, so colour here comes
+ * from the design system and never from the editor palette.
+ * ========================================================================== */
+
+html,
+body {
+  block-size: 100%;
+  overflow: hidden;
+}
+
+body {
+  /* The webview host applies its own body box; the product owns this surface. */
+  margin: 0;
+  padding: 0;
+}
+
+/*
+ * The mount element of `main.tsx`, and the one id this file styles: the
+ * provider composes the webview document itself, so `#root` is a cross-file
+ * contract with `src/views/session-view-provider.ts` rather than a styling
+ * hook. It carries topology only — a column that fills the body and may shrink
+ * — and `.dgv-view` below fills a flex or a definite-height parent on its own,
+ * so the layout does not depend on this selector matching.
+ */
+#root {
+  display: flex;
+  flex-direction: column;
+  block-size: 100%;
+  min-block-size: 0;
+  min-inline-size: 0;
+}
+
+/* ==========================================================================
+ * App shell — App.tsx
+ *
+ * `App` renders `PanelShell` as its theme root and its only scroll viewport, so
+ * the shell here is pure flow: a header strip that never shrinks and a body
+ * that takes the remaining space. `min-inline-size: 0` on every level is what
+ * lets a long file path truncate instead of widening the view, which matters
+ * more here than anywhere else in the product: an Activity Bar view can be
+ * dragged very narrow.
+ * ========================================================================== */
+
+.dgv-view {
+  display: flex;
+  /* Fills a flex parent (`PanelShell`) and a definite-height parent (`#root`)
+   * alike; against an indefinite parent the percentage resolves to `auto`, so
+   * neither declaration can collapse the other. */
+  flex: 1 1 auto;
+  flex-direction: column;
+  block-size: 100%;
+  min-block-size: 0;
+  min-inline-size: 0;
+}
+
+.dgv-view__header {
+  display: flex;
+  flex: none;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--dg-space-2);
+  min-inline-size: 0;
+  padding-block: var(--dg-space-2);
+  padding-inline: var(--dg-space-4);
+  background: var(--dg-surface-elevated);
+  border-block-end: thin solid var(--dg-border-subtle);
+}
+
+.dgv-view__body {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  /* The shell's own rhythm. Everything *inside* a feature section spaces itself
+   * through `Stack`, `Split`, `Section` and `Toolbar` (AAP 0.6.4). */
+  gap: var(--dg-space-4);
+  min-block-size: 0;
+  min-inline-size: 0;
+  padding: var(--dg-space-4);
+}
+
+/* ==========================================================================
+ * Notices — App.tsx
+ *
+ * Transient, dismissible messages the host pushes with the `notice` message.
+ * The tone is carried by an edge and by the block's inherited `color`, which is
+ * what an inline `.dg-icon` resolves its `currentColor` against — so the icon
+ * takes the tone without this file styling a `dg-*` class. The message text
+ * stays at the primary text colour, so tone never costs legibility and is
+ * never the sole indicator: the copy itself says what happened.
+ * ========================================================================== */
+
+.dgv-notices {
+  display: flex;
+  flex-direction: column;
+  gap: var(--dg-space-2);
+  min-inline-size: 0;
+  /* Rendered as a list; base.css keeps user-agent markers deliberately, so a
+   * marker-free list opts out here. */
+  list-style: none;
+}
+
+.dgv-notice {
+  display: flex;
+  align-items: start;
+  gap: var(--dg-space-2);
+  min-inline-size: 0;
+  padding-block: var(--dg-space-2);
+  padding-inline: var(--dg-space-3);
+  background: var(--dg-surface-elevated);
+  border: thin solid var(--dg-border-subtle);
+  /* The tone edge. A border-width keyword, because the token table has no
+   * border-width family and a length would be a hardcoded value. */
+  border-inline-start: medium solid var(--dg-border-strong);
+  border-radius: var(--dg-radius-sm);
+  color: var(--dg-text-secondary);
+  font: var(--dg-text-sm);
+}
+
+.dgv-notice--info {
+  border-inline-start-color: var(--dg-info);
+  color: var(--dg-info);
+}
+
+.dgv-notice--warning {
+  border-inline-start-color: var(--dg-warning);
+  color: var(--dg-warning);
+}
+
+.dgv-notice--danger {
+  border-inline-start-color: var(--dg-danger);
+  color: var(--dg-danger);
+}
+
+.dgv-notice__text {
+  /* Takes the room the dismiss control does not, and may shrink, so a long
+   * message wraps inside the notice instead of widening the view. */
+  flex: 1 1 auto;
+  min-inline-size: 0;
+  color: var(--dg-text-primary);
+}
+
+.dgv-notice__dismiss {
+  /* A `Button variant="ghost"`, which owns its own padding, cursor and focus
+   * ring; only its place in the row belongs here. */
+  flex: none;
+}
+
+/* ==========================================================================
+ * StatusBar — components/StatusBar.tsx
+ *
+ * The header strip: service connection on one side, provider on the other, and
+ * nothing that wraps mid-item. Metadata density, so the smallest type role.
+ * ========================================================================== */
+
+.dgv-status-bar {
+  display: flex;
+  flex: 1 1 auto;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--dg-space-2);
+  min-inline-size: 0;
+  color: var(--dg-text-secondary);
+  font: var(--dg-text-xs);
+}
+
+.dgv-status-bar__group {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--dg-space-2);
+  min-inline-size: 0;
+}
+
+/*
+ * An item is a truncating TEXT box, not a flex row: `text-overflow` has no
+ * effect on a flex container, so an item that laid its content out with `flex`
+ * would hard-clip a long project path with no ellipsis (measured in Chromium).
+ * It is a flex item of `__group`, so it blockifies there either way. An item
+ * that pairs a glyph with a label composes `Badge` or `Text`, each of which
+ * brings its own inline row.
+ */
+.dgv-status-bar__item {
+  display: block;
+  min-inline-size: 0;
+  max-inline-size: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ==========================================================================
+ * QuestionForm — components/QuestionForm.tsx
+ *
+ * The multiline `Input`, its submit row and the hint that explains element
+ * selection happens in the DevTools panel. The control itself is a primitive,
+ * so only the column and the action row are here.
+ * ========================================================================== */
+
+.dgv-question-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--dg-space-3);
+  min-inline-size: 0;
+}
+
+.dgv-question-form__actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: end;
+  gap: var(--dg-space-2);
+  min-inline-size: 0;
+}
+
+.dgv-question-form__hint {
+  min-inline-size: 0;
+  color: var(--dg-text-secondary);
+  font: var(--dg-text-xs);
+}
+
+/* ==========================================================================
+ * TargetBadge — components/TargetBadge.tsx
+ *
+ * The element or component chain the developer selected in the DevTools panel,
+ * or the no-target state. Each chain item truncates on its own so a deep owner
+ * chain stays on one wrapped row set rather than forcing the view wider.
+ * ========================================================================== */
+
+.dgv-target {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--dg-space-2);
+  min-inline-size: 0;
+}
+
+.dgv-target__chain {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--dg-space-1);
+  min-inline-size: 0;
+  list-style: none;
+}
+
+/* A truncating text box for the same reason as `.dgv-status-bar__item`: a deep
+ * owner chain routinely carries a display name longer than this view is wide,
+ * and an ellipsis only renders on a block container. */
+.dgv-target__chain-item {
+  display: block;
+  min-inline-size: 0;
+  max-inline-size: 100%;
+  overflow: hidden;
+  color: var(--dg-text-secondary);
+  font: var(--dg-text-xs);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ==========================================================================
+ * ProgressSteps — components/ProgressSteps.tsx
+ *
+ * The pipeline's real `session.progress` entries, grouped by stage, in arrival
+ * order. Each row is a two-column grid — a fixed marker column and a flexible
+ * label column — so markers align down the group whatever the labels say, and
+ * a detail line placed as a third child of the row lands under the label
+ * rather than under the marker.
+ *
+ * Marker colour is the whole state signal in colour terms, so it is always
+ * paired with a glyph the component supplies and with the label text: the
+ * unmarked base is a step not yet started.
+ * ========================================================================== */
+
+.dgv-progress {
+  display: flex;
+  flex-direction: column;
+  gap: var(--dg-space-4);
+  min-inline-size: 0;
+}
+
+.dgv-progress__group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--dg-space-1);
+  min-inline-size: 0;
+  list-style: none;
+}
+
+.dgv-progress__group-title {
+  min-inline-size: 0;
+  color: var(--dg-text-primary);
+  font: var(--dg-text-md);
+}
+
+.dgv-progress__row {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  align-items: baseline;
+  gap: var(--dg-space-2);
+  min-inline-size: 0;
+}
+
+.dgv-progress__marker {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  /* A font-relative square keeps the column steady across the check, spinner
+   * and cross glyphs without pinning a length. */
+  min-inline-size: 1em;
+  color: var(--dg-text-muted);
+}
+
+.dgv-progress__marker--running {
+  color: var(--dg-text-secondary);
+}
+
+.dgv-progress__marker--done {
+  color: var(--dg-success);
+}
+
+.dgv-progress__marker--failed {
+  color: var(--dg-danger);
+}
+
+.dgv-progress__label {
+  min-inline-size: 0;
+  color: var(--dg-text-primary);
+  font: var(--dg-text-sm);
+}
+
+.dgv-progress__detail {
+  /* Second column, so a detail sits under its label. Ignored — harmlessly —
+   * when the component nests the detail inside the label instead. */
+  grid-column: 2;
+  min-inline-size: 0;
+  color: var(--dg-text-secondary);
+  font: var(--dg-text-xs);
+}
+
+/*
+ * "Reproduce the issue now." — the one row in the view that asks the developer
+ * to act. The emphasis is accent-derived (the token pair the design system uses
+ * for selection and active chips), never a colour of its own.
+ */
+.dgv-progress__cta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--dg-space-2);
+  min-inline-size: 0;
+  padding-block: var(--dg-space-2);
+  padding-inline: var(--dg-space-3);
+  background: var(--dg-accent-muted);
+  border-inline-start: medium solid var(--dg-accent);
+  border-radius: var(--dg-radius-sm);
+  color: var(--dg-text-primary);
+  font: var(--dg-text-md);
+}
+
+/* ==========================================================================
+ * RelevantFiles — components/RelevantFiles.tsx
+ *
+ * File, symbol and the reason the investigation selected it; the row opens the
+ * file. Paths render through the `Code` primitive, so nothing here touches
+ * typography on the path — only its box, so it can ellipsise.
+ * ========================================================================== */
+
+.dgv-files {
+  display: flex;
+  flex-direction: column;
+  gap: var(--dg-space-1);
+  min-inline-size: 0;
+  list-style: none;
+}
+
+.dgv-files__row {
+  display: flex;
+  flex-direction: column;
+  gap: var(--dg-space-0);
+  min-inline-size: 0;
+  padding-block: var(--dg-space-1);
+}
+
+.dgv-files__path {
+  display: block;
+  min-inline-size: 0;
+  max-inline-size: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dgv-files__reason {
+  min-inline-size: 0;
+  color: var(--dg-text-secondary);
+  font: var(--dg-text-xs);
+}
+
+/* ==========================================================================
+ * ModificationsList — components/ModificationsList.tsx
+ *
+ * One card per `ModificationRecord`: the instrumented file, an applied /
+ * reverted / conflict `Badge` with the hash and timestamp metadata, and the
+ * "View diff" control. Every modification the tool made is visible here, which
+ * is a product guarantee (AAP 0.5.1), so the row is a card rather than a line:
+ * it has to read as a record, not as a log entry.
+ * ========================================================================== */
+
+.dgv-modifications {
+  display: flex;
+  flex-direction: column;
+  gap: var(--dg-space-2);
+  min-inline-size: 0;
+  list-style: none;
+}
+
+.dgv-modifications__row {
+  display: flex;
+  flex-direction: column;
+  gap: var(--dg-space-1);
+  min-inline-size: 0;
+  padding-block: var(--dg-space-2);
+  padding-inline: var(--dg-space-3);
+  background: var(--dg-surface-elevated);
+  border: thin solid var(--dg-border-subtle);
+  border-radius: var(--dg-radius-sm);
+}
+
+/* `display: block` for the same reason as `.dgv-cleanup__conflict-file` below:
+ * the path renders through the `Code` primitive, and an inline box ignores the
+ * truncation declarations. Being a flex item would blockify it anyway, so this
+ * only removes the dependency on what the component wraps it in. */
+.dgv-modifications__file {
+  display: block;
+  min-inline-size: 0;
+  max-inline-size: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dgv-modifications__meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--dg-space-2);
+  min-inline-size: 0;
+  color: var(--dg-text-secondary);
+  font: var(--dg-text-xs);
+}
+
+.dgv-modifications__actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--dg-space-2);
+  min-inline-size: 0;
+}
+
+/* ==========================================================================
+ * DiffView — components/DiffView.tsx
+ *
+ * The unified diff of one modification record. Two rules govern it:
+ *
+ *   1. Vertical scrolling stays with the `PanelShell` viewport, so the diff
+ *      grows the page instead of nesting a second scroll region. Only the
+ *      horizontal axis scrolls here, for lines wider than a narrow view.
+ *   2. Added and removed lines are distinguished by TEXT colour over the
+ *      elevated surface — the status tokens are text-safe on every surface of
+ *      every theme, and no tinted background colour exists in the token table
+ *      to invent one from. The `+`/`-` marker carries the same information
+ *      without colour, so the distinction never depends on hue alone.
+ * ========================================================================== */
+
+.dgv-diff {
+  display: flex;
+  flex-direction: column;
+  min-inline-size: 0;
+  padding-block: var(--dg-space-1);
+  background: var(--dg-surface-elevated);
+  border: thin solid var(--dg-border-subtle);
+  border-radius: var(--dg-radius-sm);
+}
+
+.dgv-diff__scroll {
+  /* Horizontal only: `.dg-scroll` (base.css) is deliberately not composed here
+   * because it scrolls both axes, which is exactly the second viewport this
+   * surface must not have. The scrollbar keeps the design system's own
+   * treatment, matched to the surface it sits on. */
+  overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior-x: contain;
+  min-inline-size: 0;
+  scrollbar-width: thin;
+  scrollbar-color: var(--dg-border-strong) var(--dg-surface-elevated);
+}
+
+.dgv-diff__line {
+  display: flex;
+  gap: var(--dg-space-2);
+  /* Each line is as wide as its content, which is what gives the scroll
+   * container something to scroll; an intrinsic keyword, not a length. */
+  min-inline-size: max-content;
+  padding-inline: var(--dg-space-3);
+  color: var(--dg-text-primary);
+  font: var(--dg-mono-sm);
+  /* The `font` shorthand resets `font-variant`, so tabular figures are
+   * declared after it — ordering that is required, not stylistic. */
+  font-variant-numeric: tabular-nums;
+}
+
+.dgv-diff__line--added {
+  color: var(--dg-success);
+}
+
+.dgv-diff__line--removed {
+  color: var(--dg-danger);
+}
+
+.dgv-diff__line--context {
+  color: var(--dg-text-secondary);
+}
+
+/* A hunk or file header. Recessed onto the overlay surface with secondary text,
+ * the pair the token tests clear for that surface in every theme. */
+.dgv-diff__line--meta {
+  background: var(--dg-surface-overlay);
+  color: var(--dg-text-secondary);
+}
+
+.dgv-diff__marker {
+  flex: none;
+  min-inline-size: 1em;
+  color: var(--dg-text-muted);
+}
+
+.dgv-diff__text {
+  /* Diff payload: leading indentation and runs of spaces are meaningful. */
+  white-space: pre;
+}
+
+/* ==========================================================================
+ * CaptureControls — components/CaptureControls.tsx
+ *
+ * Start and stop capture plus the armed/capturing state. The indicator is a
+ * static token-coloured dot: the token table has no duration or easing family,
+ * so this file declares no animation at all and the state is carried by the
+ * adjacent text as well as by the dot.
+ * ========================================================================== */
+
+.dgv-capture {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--dg-space-3);
+  min-inline-size: 0;
+}
+
+.dgv-capture__state {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--dg-space-2);
+  min-inline-size: 0;
+  color: var(--dg-text-secondary);
+  font: var(--dg-text-sm);
+}
+
+/* A square space token on each axis and a full radius, so the dot needs no
+ * length of its own — the form the design system uses for every dot. */
+.dgv-capture__indicator {
+  flex: none;
+  inline-size: var(--dg-space-2);
+  block-size: var(--dg-space-2);
+  background: var(--dg-border-strong);
+  border-radius: 100%;
+}
+
+.dgv-capture__indicator--capturing {
+  background: var(--dg-danger);
+}
+
+/* ==========================================================================
+ * AnalysisSummary — components/AnalysisSummary.tsx
+ *
+ * The component renders the design system's `SummaryHeader`, which already
+ * keeps observed facts structurally apart from likely causes, so only the
+ * column and the fallback banner belong here.
+ * ========================================================================== */
+
+.dgv-analysis {
+  display: flex;
+  flex-direction: column;
+  gap: var(--dg-space-3);
+  min-inline-size: 0;
+}
+
+/*
+ * "Showing a fallback view built from captured data." A degraded success is
+ * announced, never silent (AAP 0.5.5), and never styled like an observed fact:
+ * a warning-toned edge and warning text, deliberately the same vocabulary as
+ * the panel's own `dg-panel__banner--fallback` so the two surfaces agree —
+ * mirrored here rather than overridden there.
+ */
+.dgv-analysis__fallback {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--dg-space-2);
+  min-inline-size: 0;
+  padding-block: var(--dg-space-2);
+  padding-inline: var(--dg-space-3);
+  border: thin solid var(--dg-warning);
+  border-inline-start: medium solid var(--dg-warning);
+  border-radius: var(--dg-radius-sm);
+  color: var(--dg-warning);
+  font: var(--dg-text-sm);
+}
+
+/* ==========================================================================
+ * FollowUp — components/FollowUp.tsx
+ * ========================================================================== */
+
+.dgv-followup {
+  display: flex;
+  flex-direction: column;
+  gap: var(--dg-space-2);
+  min-inline-size: 0;
+}
+
+.dgv-followup__actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: end;
+  gap: var(--dg-space-2);
+  min-inline-size: 0;
+}
+
+/* ==========================================================================
+ * PairingCode — components/PairingCode.tsx
+ *
+ * The one-time code that authorises the DevTools panel (AAP 0.5.6). The code
+ * itself renders through the `Code` primitive, so this block only gives it a
+ * surface to sit on and room to be read out loud; the code is never persisted
+ * and never logged, which is the component's concern rather than this file's.
+ * ========================================================================== */
+
+.dgv-pairing {
+  display: flex;
+  flex-direction: column;
+  gap: var(--dg-space-2);
+  min-inline-size: 0;
+}
+
+.dgv-pairing__code {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--dg-space-2);
+  min-inline-size: 0;
+  padding-block: var(--dg-space-3);
+  padding-inline: var(--dg-space-4);
+  background: var(--dg-surface-overlay);
+  border: thin solid var(--dg-border-strong);
+  border-radius: var(--dg-radius-md);
+}
+
+.dgv-pairing__expiry {
+  min-inline-size: 0;
+  color: var(--dg-text-secondary);
+  font: var(--dg-text-xs);
+}
+
+/* ==========================================================================
+ * End session and cleanup — App.tsx
+ *
+ * The cleanup outcome is part of the product's reversibility guarantee
+ * (AAP 0.5.1, 0.5.5), so it stays on screen after the session ends instead of
+ * passing as a toast. A conflict is the one case where a file was left
+ * untouched on purpose: it is called out with a warning edge and lists the
+ * files whose originals are preserved in the backup directory.
+ * ========================================================================== */
+
+.dgv-session-end {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--dg-space-3);
+  min-inline-size: 0;
+}
+
+.dgv-cleanup {
+  display: flex;
+  flex-direction: column;
+  gap: var(--dg-space-2);
+  min-inline-size: 0;
+  color: var(--dg-text-secondary);
+  font: var(--dg-text-sm);
+}
+
+.dgv-cleanup__conflict {
+  display: flex;
+  flex-direction: column;
+  gap: var(--dg-space-1);
+  min-inline-size: 0;
+  padding-block: var(--dg-space-2);
+  padding-inline: var(--dg-space-3);
+  background: var(--dg-surface-elevated);
+  border: thin solid var(--dg-warning);
+  border-inline-start: medium solid var(--dg-warning);
+  border-radius: var(--dg-radius-sm);
+  color: var(--dg-text-primary);
+  list-style: none;
+}
+
+/*
+ * A preserved original's path. `display: block` is load-bearing rather than
+ * decorative: the element renders through the `Code` primitive, so its own box
+ * is inline, and `max-inline-size`, `overflow` and `text-overflow` are all
+ * ignored on a non-replaced inline box while `white-space: nowrap` still
+ * applies. Measured in Chromium: without it a 120-character path grows its
+ * list item by ~490px and gives the panel viewport a second scroll axis.
+ */
+.dgv-cleanup__conflict-file {
+  display: block;
+  min-inline-size: 0;
+  max-inline-size: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ==========================================================================
+ * Stage failure — App.tsx
+ *
+ * A failed pipeline stage is rendered as a failure and never as a result
+ * (AAP 0.5.5): a danger-toned card naming the stage, with the retry action the
+ * component supplies. Visibly distinct from a generated analysis, which sits on
+ * the plain surface with no edge at all.
+ * ========================================================================== */
+
+.dgv-stage-failure {
+  display: flex;
+  flex-direction: column;
+  gap: var(--dg-space-2);
+  min-inline-size: 0;
+  padding-block: var(--dg-space-3);
+  padding-inline: var(--dg-space-4);
+  background: var(--dg-surface-elevated);
+  border: thin solid var(--dg-danger);
+  border-inline-start: medium solid var(--dg-danger);
+  border-radius: var(--dg-radius-sm);
+  color: var(--dg-text-primary);
+  font: var(--dg-text-sm);
+}
+
+/* Colour only: the stage name renders through the `Code` primitive, whose own
+ * type role must keep it monospace. */
+.dgv-stage-failure__stage {
+  color: var(--dg-danger);
+}

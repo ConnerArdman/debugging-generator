@@ -1902,6 +1902,59 @@
   font: var(--dg-text-xs);
 }
 
+/* The three typed control sections of `layout/Toolbar.tsx` — the option
+ * filters, the action chips and the result indicators. Each keeps its own
+ * items on one line and lets the BAR break between sections instead, so a
+ * group of related controls is never split across two rows; `--wrap` below
+ * relaxes that for the narrowest surfaces. None of them grows: the search
+ * section above is the one that takes the free space, so up to its maximum
+ * inline size these sit at the inline end without a spacer, and past it they
+ * pack toward the start with the slack trailing them. */
+.dg-toolbar__controls,
+.dg-toolbar__actions,
+.dg-toolbar__status {
+  display: flex;
+  flex: none;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: var(--dg-space-1);
+  min-inline-size: 0;
+}
+
+/* The keyboard-shortcut hint, last in the bar. Its type role and muted colour
+ * come from the `Text` primitive the component renders it as, so this rule
+ * contributes alignment only. */
+.dg-toolbar__hint {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: var(--dg-space-1);
+  min-inline-size: 0;
+}
+
+/* Denser bar for a narrow host: one step down the spacing scale for the gap
+ * and both padding axes. The controls are already at their dense scale, so
+ * nothing else changes. */
+.dg-toolbar--compact {
+  gap: var(--dg-space-1);
+  padding-block: var(--dg-space-0);
+  padding-inline: var(--dg-space-1);
+}
+
+/* The narrowest form: the sections may break internally as well, and the
+ * search field may span its row instead of stopping at the width above. Still
+ * no horizontal scroller — a DevTools panel's only scroll container is the
+ * panel shell's viewport. */
+.dg-toolbar--wrap .dg-toolbar__controls,
+.dg-toolbar--wrap .dg-toolbar__actions,
+.dg-toolbar--wrap .dg-toolbar__status {
+  flex-wrap: wrap;
+}
+
+.dg-toolbar--wrap .dg-toolbar__search {
+  max-inline-size: none;
+}
+
 /* ==========================================================================
  * layout/SummaryHeader.tsx
  *

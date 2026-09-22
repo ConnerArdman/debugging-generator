@@ -146,6 +146,25 @@ function tierResolver(tiers: Readonly<Record<string, ActionTier>>): ActionTierRe
   };
 }
 
+/**
+ * Freezes an action list and every action in it.
+ *
+ * Purity is asserted by *preventing* mutation rather than by noticing it
+ * afterwards: these modules are ESM and therefore strict, so a write into a
+ * frozen object throws, and a derivation that ever reached for one of its
+ * inputs fails as an error at the call rather than as a diff a reader has to
+ * spot. The installer hands the same action objects to several adapters and
+ * keeps them on the plan it stores, so a derivation that wrote into one would
+ * corrupt a record two user interfaces render.
+ */
+function deepFrozen(actions: InstrumentationAction[]): readonly InstrumentationAction[] {
+  for (const item of actions) {
+    Object.freeze(item);
+  }
+
+  return Object.freeze(actions);
+}
+
 /** The hook keys that are `true` in a configuration, in declaration order. */
 function enabledHooks(config: AgentHookConfig): readonly AgentHookKey[] {
   return AGENT_HOOK_KEYS.filter((key) => config[key]);
@@ -226,6 +245,16 @@ describe('CAPTURE_SIGNALS', () => {
     expect(new Set(CAPTURE_SIGNALS).size).toBe(CAPTURE_SIGNALS.length);
   });
 
+  it('is a readonly tuple of literal members rather than a mutable string array', () => {
+    // The vocabulary is immutable by `as const`, not by `Object.freeze`, so its
+    // immutability is a compile-time guarantee and the annotation below *is*
+    // the assertion: widening the export to `string[]`, or dropping the
+    // readonly modifier, fails `pnpm typecheck` here. The runtime check keeps
+    // the binding in use so the annotation cannot be dropped as dead code.
+    const literalTuple: readonly ['interactions', ...CaptureSignal[]] = CAPTURE_SIGNALS;
+    expect(literalTuple).toBe(CAPTURE_SIGNALS);
+  });
+
   it('accepts every member through the schema and the predicate', () => {
     for (const signal of CAPTURE_SIGNALS) {
       expect(captureSignalSchema.safeParse(signal).success, signal).toBe(true);
@@ -278,13 +307,27 @@ describe('the per-tier signal lists', () => {
 });
 
 describe('CAPTURE_SIGNAL_TO_TELEMETRY_KIND', () => {
-  it('has one non-empty row per signal, and no row for anything else', () => {
+  it('has one non-empty array row per signal, and no row for anything else', () => {
     expect(Object.keys(CAPTURE_SIGNAL_TO_TELEMETRY_KIND).sort()).toEqual(
       [...CAPTURE_SIGNALS].sort(),
     );
 
     for (const signal of CAPTURE_SIGNALS) {
-      expect(telemetryKindsForSignal(signal).length, signal).toBeGreaterThan(0);
+      const kinds = telemetryKindsForSignal(signal);
+
+      expect(Array.isArray(kinds), signal).toBe(true);
+      expect(kinds.length, signal).toBeGreaterThan(0);
+      // A row that named a kind twice would double-count nothing, but it would
+      // mean two readers of the table disagree about what the row says.
+      expect(new Set(kinds).size, signal).toBe(kinds.length);
+    }
+  });
+
+  it('answers telemetryKindsForSignal from the table, for every signal', () => {
+    for (const signal of CAPTURE_SIGNALS) {
+      expect([...telemetryKindsForSignal(signal)], signal).toEqual([
+        ...CAPTURE_SIGNAL_TO_TELEMETRY_KIND[signal],
+      ]);
     }
   });
 
@@ -319,7 +362,32 @@ describe('CAPTURE_SIGNAL_TO_TELEMETRY_KIND', () => {
     expect(kinds).toContain('xhr');
   });
 
+  it('maps each browser row to the kinds that tier actually produces', () => {
+    // Asserted literally, row by row, for the same reason the five server rows
+    // are: the service's readiness module explains a missing signal from this
+    // table and the analysis stage decides from it whether the evidence a
+    // question needs was collected, so a row quietly widened or narrowed
+    // changes what a capture is believed to hold.
+    expect([...telemetryKindsForSignal('interactions')]).toEqual(['interaction']);
+
+    const react = telemetryKindsForSignal('react');
+    expect(react).toContain('render');
+    expect(react).toContain('commit');
+
+    expect([...telemetryKindsForSignal('state')]).toEqual(['state']);
+
+    const perf = telemetryKindsForSignal('perf');
+    expect(perf).toContain('perf.longtask');
+    expect(perf).toContain('perf.entry');
+
+    expect([...telemetryKindsForSignal('errors')]).toEqual(['error']);
+  });
+
   it('reconstructs the component tree from commit and render events', () => {
+    // `componentTree` names no kind of its own: the snapshot arrives as a
+    // commit-time event and the per-node render counts come from `render`
+    // events of the same capture, so the row must consist of exactly those two
+    // and nothing the tree is not built from.
     expect([...telemetryKindsForSignal('componentTree')].sort()).toEqual(['commit', 'render']);
   });
 
@@ -335,6 +403,14 @@ describe('CAPTURE_SIGNAL_TO_TELEMETRY_KIND', () => {
  */
 
 describe('readinessSignalSchema', () => {
+  it('declares the three statuses, from fully ready to not collected at all', () => {
+    // The three-way split is what lets readiness gate a capture without
+    // blocking it for a partial signal: `degraded` still captures, with a
+    // stated limitation, and only `unavailable` is AAP §0.5.5's "Could not
+    // enable ‹signal›: ‹reason›." being reported.
+    expect([...READINESS_STATUSES]).toEqual(['available', 'degraded', 'unavailable']);
+  });
+
   it('accepts a row with only a signal and a status', () => {
     expect(readinessSignalSchema.safeParse(readinessRow()).success).toBe(true);
   });
@@ -409,6 +485,17 @@ describe('readinessSchema', () => {
       delete partial[key];
       expect(readinessSchema.safeParse(partial).success, key).toBe(false);
     }
+  });
+
+  it('refuses a report whose row names an unknown signal or an unknown status', () => {
+    expect(
+      readinessSchema.safeParse({ ...report, signals: [{ signal: 'sql', status: 'available' }] })
+        .success,
+    ).toBe(false);
+    expect(
+      readinessSchema.safeParse({ ...report, signals: [{ signal: 'react', status: 'ready' }] })
+        .success,
+    ).toBe(false);
   });
 
   it('refuses a clock reading that is not a positive finite millisecond', () => {
@@ -495,6 +582,13 @@ describe('buildReadiness', () => {
   const clock = (value: number) => () => value;
 
   it('is ready when nothing is unavailable, including with no rows at all', () => {
+    // An empty report is ready because an adapter that claims nothing in this
+    // project cannot hold a capture back. The preconditions no adapter can see
+    // — a relayed `agent.ready` for the bound tab's current document with
+    // `installedBeforeReact = true`, and a connected `server-agent` for the
+    // project whenever server signals are planned — are added by
+    // `apps/local-service/src/instrumentation/readiness.ts` when it aggregates
+    // these reports into the "Ready to capture" state, never here.
     expect(buildReadiness({ signals: [], now: clock(1) }).ready).toBe(true);
     expect(
       buildReadiness({
@@ -516,9 +610,16 @@ describe('buildReadiness', () => {
   it('stamps the injected clock, and a real one by default', () => {
     expect(buildReadiness({ signals: [], now: clock(1_234) }).checkedAt).toBe(1_234);
 
+    // The default path is pinned between two real readings rather than with
+    // fake timers: every clock in this module is injectable, so no suite here
+    // has to take the global one over.
     const before = Date.now();
     const stamped = buildReadiness({ signals: [] }).checkedAt;
+    const after = Date.now();
+
+    expect(Number.isInteger(stamped)).toBe(true);
     expect(stamped).toBeGreaterThanOrEqual(before);
+    expect(stamped).toBeLessThanOrEqual(after);
   });
 
   it('carries an adapter id when given one and omits the key when not', () => {
@@ -564,6 +665,19 @@ describe('buildReadiness', () => {
 
 describe('agentHookConfigSchema', () => {
   it('declares exactly the seven keys the page agent attaches hooks for', () => {
+    // One key per attach point in `packages/telemetry/src/browser/agent.ts`:
+    //
+    //   interactions  → attachInteractions()
+    //   react         → attachReact()
+    //   state         → attachState()
+    //   fetch         → attachFetch()
+    //   perf          → attachPerf()
+    //   errors        → attachErrors()
+    //   componentTree → snapshotComponentTree(), at the capture's last commit
+    //
+    // The agent parses an inbound frame permissively and cannot import this
+    // schema, so a key renamed on either side compiles: the hook is simply
+    // never attached and the capture comes back missing that evidence.
     expect(Object.keys(agentHookConfigSchema.shape)).toEqual([
       'interactions',
       'react',
@@ -574,6 +688,24 @@ describe('agentHookConfigSchema', () => {
       'componentTree',
     ]);
     expect([...AGENT_HOOK_KEYS]).toEqual(Object.keys(agentHookConfigSchema.shape));
+  });
+
+  it('parses a configuration into exactly those keys, in that order', () => {
+    const parsed = expectOk(
+      parseAgentHookConfig({
+        componentTree: true,
+        errors: false,
+        perf: true,
+        fetch: false,
+        state: false,
+        react: true,
+        interactions: true,
+      }),
+    );
+
+    // Key order survives the parse whatever order the sender wrote them in, so
+    // two producers of the same configuration serialise to the same frame.
+    expect(Object.keys(parsed)).toEqual([...AGENT_HOOK_KEYS]);
   });
 
   it('requires every flag, so "all false" is always explicit', () => {
@@ -605,6 +737,16 @@ describe('agentHookConfigSchema', () => {
       false,
     ]);
     expect(expectOk(parseAgentHookConfig(DORMANT_AGENT_HOOK_CONFIG))).toEqual(
+      DORMANT_AGENT_HOOK_CONFIG,
+    );
+  });
+
+  it('survives the JSON round trip it makes on the way to the page', () => {
+    // This exact value is the AAP §0.4.2 / §0.5.1 payload that returns the
+    // agent to dormant — listeners detached, `fetch`/`XMLHttpRequest`
+    // restored, fiber handlers unsubscribed — and it reaches the agent over a
+    // WebSocket and a `window.postMessage` hop, so it has to be JSON-clean.
+    expect(JSON.parse(JSON.stringify(DORMANT_AGENT_HOOK_CONFIG))).toEqual(
       DORMANT_AGENT_HOOK_CONFIG,
     );
   });
@@ -643,6 +785,21 @@ describe('serverAgentSignalsSchema', () => {
     );
   });
 
+  it('parses a signal set into exactly those keys, in that order', () => {
+    const parsed = expectOk(
+      parseServerAgentSignals({
+        functions: ['handleRequest'],
+        pg: true,
+        prisma: true,
+        fetch: false,
+        routeHandlers: true,
+        http: true,
+      }),
+    );
+
+    expect(Object.keys(parsed)).toEqual([...SERVER_AGENT_SIGNAL_KEYS]);
+  });
+
   it('requires every key', () => {
     for (const key of SERVER_AGENT_SIGNAL_KEYS) {
       const partial: Record<string, unknown> = { ...DISABLED_SERVER_AGENT_SIGNALS };
@@ -659,7 +816,17 @@ describe('serverAgentSignalsSchema', () => {
       }).success,
     ).toBe(true);
 
-    for (const functions of [[''], ['  '], ['two\nlines'], ['x'.repeat(201)], [42]]) {
+    // A bare string, a nested array and a non-string element are all shapes a
+    // hand-built frame reaches for; none of them is a list of symbol names.
+    for (const functions of [
+      'handleRequest',
+      [''],
+      ['  '],
+      ['two\nlines'],
+      ['x'.repeat(201)],
+      [42],
+      [['handleRequest']],
+    ]) {
       expect(
         serverAgentSignalsSchema.safeParse({ ...DISABLED_SERVER_AGENT_SIGNALS, functions }).success,
         JSON.stringify(functions),
@@ -703,6 +870,16 @@ describe('serverAgentSignalsSchema', () => {
       functions: [],
     });
     expect(expectOk(parseServerAgentSignals(DISABLED_SERVER_AGENT_SIGNALS))).toEqual(
+      DISABLED_SERVER_AGENT_SIGNALS,
+    );
+  });
+
+  it('survives the JSON round trip it makes on the way to the preload', () => {
+    // `server-agent.config` with no `captureId` carries this set, and the
+    // preload disables its instrumentations and drops its tracer provider on
+    // receiving it. It crosses a WebSocket, so an empty array and five
+    // booleans is all it may contain.
+    expect(JSON.parse(JSON.stringify(DISABLED_SERVER_AGENT_SIGNALS))).toEqual(
       DISABLED_SERVER_AGENT_SIGNALS,
     );
   });
@@ -774,9 +951,14 @@ describe('deriveAgentHookConfig', () => {
   });
 
   it('forces the interaction listener on, because correlation depends on it', () => {
-    // A plan that asked only for network tracing: without the interaction
-    // listener the fetch patch has no traced context to inject a traceparent
-    // into, and the browser and server traces silently stop being one tree.
+    // A plan that asked only for network tracing. The mechanism, not a
+    // preference: `packages/telemetry/src/browser/fetch.ts` injects the
+    // `traceparent` header only while `isTracedContext()` holds, and
+    // `.../browser/interaction.ts` is what opens that context and mints the
+    // trace root. Without the interaction hook the requests go out untraced,
+    // the server's spans start a trace of their own, and the browser↔server
+    // correlation of AAP §0.4.2 breaks *silently* — the capture still fills
+    // with events and the timeline still renders, as two unrelated trees.
     const derived = deriveAgentHookConfig([action({ type: 'fetch-tracking' })]);
 
     expect(derived.fetch).toBe(true);
@@ -862,12 +1044,15 @@ describe('deriveAgentHookConfig', () => {
     }
   });
 
-  it('leaves its input untouched', () => {
-    const actions = [action({ type: 'react-render-tracking' })];
+  it('leaves a frozen input untouched', () => {
+    const actions = deepFrozen([
+      action({ type: 'react-render-tracking' }),
+      action({ type: 'fetch-tracking' }),
+      action({ type: 'function-timing', mode: 'patch', symbol: 'timedStep' }),
+    ]);
     const snapshot = JSON.parse(JSON.stringify(actions)) as unknown;
 
-    deriveAgentHookConfig(actions);
-
+    expect(deriveAgentHookConfig(actions).react).toBe(true);
     expect(JSON.parse(JSON.stringify(actions))).toEqual(snapshot);
   });
 });
@@ -881,7 +1066,11 @@ describe('deriveAgentHookConfig', () => {
 describe('deriveServerAgentSignals', () => {
   it('collects nothing on the server tier for a purely browser-side plan', () => {
     // AAP §0.5.1: "an unrelated plan collects no backend or database
-    // telemetry". A render question must not read anyone's SQL.
+    // telemetry". A render question must not read anyone's SQL, and this is
+    // the assertion that keeps the promise: the preload gate in
+    // `packages/telemetry/src/node/control.ts` resolves this set into the kinds
+    // it will admit and drops every span outside them, so an all-false set is
+    // what makes it collect nothing rather than collect quietly.
     const derived = deriveServerAgentSignals([
       action({ type: 'react-render-tracking' }),
       action({ type: 'state-tracking' }),
@@ -923,9 +1112,29 @@ describe('deriveServerAgentSignals', () => {
 
     expect(derived.prisma).toBe(true);
     expect(derived.pg).toBe(true);
+    // The spine comes with them: the incoming-request span is where the
+    // browser's `traceparent` is extracted and the route-handler span is what
+    // parents the rest, so a database span collected without them arrives as a
+    // flagged orphan instead of a row in a tree.
     expect(derived.http).toBe(true);
     expect(derived.routeHandlers).toBe(true);
     expect(derived.functions).toEqual([]);
+  });
+
+  it('switches the spine on for a patched symbol alone', () => {
+    // The documented presence rule: a non-empty `functions` list is by itself
+    // enough to request this tier, because a `function` span without the
+    // request and route-handler spans it hangs off is an orphan too.
+    const derived = deriveServerAgentSignals([
+      action({ type: 'function-timing', mode: 'patch', symbol: 'timedStep' }),
+    ]);
+
+    expect(derived.functions).toEqual(['timedStep']);
+    expect(derived.http).toBe(true);
+    expect(derived.routeHandlers).toBe(true);
+    expect(derived.prisma).toBe(false);
+    expect(derived.pg).toBe(false);
+    expect(derived.fetch).toBe(false);
   });
 
   it('enables outgoing request spans only when request tracing was planned', () => {
@@ -1014,12 +1223,34 @@ describe('deriveServerAgentSignals', () => {
     expect(derived.http).toBe(true);
   });
 
-  it('produces a set that parses and survives a JSON round trip, leaving its input untouched', () => {
-    const actions = [
+  it('derives a schema-valid set, keyed in wire order, for every representative plan', () => {
+    const plans: readonly InstrumentationAction[][] = [
+      [],
+      [action({ type: 'react-render-tracking' }), action({ type: 'perf-tracking' })],
+      [action({ type: 'db-query-tracking' }), action({ type: 'fetch-tracking' })],
+      [action({ type: 'server-span', mode: 'patch', symbol: 'handleRequest' })],
+      [
+        action({ type: 'function-timing', mode: 'patch', symbol: 'timedStep' }),
+        action({ type: 'db-query-tracking' }),
+        action({ type: 'interaction-tracking' }),
+      ],
+    ];
+
+    for (const plan of plans) {
+      const derived = deriveServerAgentSignals(plan);
+      const description = plan.map((item) => item.type).join('+') || 'empty plan';
+
+      expect(expectOk(parseServerAgentSignals(derived)), description).toEqual(derived);
+      expect(Object.keys(derived), description).toEqual([...SERVER_AGENT_SIGNAL_KEYS]);
+    }
+  });
+
+  it('produces a set that parses and survives a JSON round trip, leaving its frozen input untouched', () => {
+    const actions = deepFrozen([
       action({ type: 'db-query-tracking' }),
       action({ type: 'server-span', mode: 'patch', symbol: 'handleRequest' }),
       action({ type: 'fetch-tracking' }),
-    ];
+    ]);
     const snapshot = JSON.parse(JSON.stringify(actions)) as unknown;
 
     const derived: ServerAgentSignals = deriveServerAgentSignals(actions);
