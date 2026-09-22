@@ -79,8 +79,15 @@ import type {
   StructuredAttempt,
   ToolDefinition,
 } from '../types.js';
+import {
+  DEFAULT_PROVIDER_ID,
+  createModelProvider,
+  modelUnavailableMessage,
+  resolveProviderConfig,
+} from '../factory.js';
 import { createDeterministicProvider } from './deterministic.js';
 import type { DeterministicProviderOptions } from './deterministic.js';
+import { PROVIDER_IDS } from './index.js';
 
 /* -------------------------------------------------------------------------------------------------
  * harness helpers
@@ -1916,5 +1923,185 @@ describe('callTools selects by name from the structured context and never execut
       safeParseSpy.mockRestore();
       parseSpy.mockRestore();
     }
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * The selection boundary that reaches this provider
+ *
+ * `../factory.ts` is what decides which implementation a host runs behind, and
+ * the answer this suite's provider gives is only reachable because that
+ * decision defaults here: `DEBUGGEN_PROVIDER` unset selects the rules-based
+ * provider, which is what every automated suite and the continuous-integration
+ * end-to-end run depend on (AAP §0.5.2, §0.7.1). The behaviours below therefore
+ * belong beside this provider rather than in a suite of their own — the
+ * offline path must never come to need a credential, a model or a network, and
+ * these assertions are what would notice if it did.
+ *
+ * Every case injects its own environment map, so nothing here mutates
+ * `process.env` and no case can observe another's configuration.
+ * ---------------------------------------------------------------------------------------------- */
+
+describe('the factory selects this provider by default and never needs a credential', () => {
+  /** A model identifier no vendor publishes: the value's content is irrelevant, its presence is not. */
+  const CONFIGURED_MODEL = 'model-under-test';
+
+  /** An obviously fake credential, kept short and low-entropy so no secret scanner has to guess. */
+  const CONFIGURED_CREDENTIAL = 'unit-test-credential';
+
+  /** The two names the factory reads on the network-backed path (AAP §0.3.4). */
+  const ANTHROPIC_ENVIRONMENT: Readonly<Record<string, string>> = {
+    DEBUGGEN_PROVIDER: 'anthropic',
+    DEBUGGEN_MODEL: CONFIGURED_MODEL,
+    ANTHROPIC_API_KEY: CONFIGURED_CREDENTIAL,
+  };
+
+  it('defaults to this provider when nothing is configured', () => {
+    expect(DEFAULT_PROVIDER_ID).toBe(PROVIDER_ID);
+
+    const provider = okValue(createModelProvider({ env: {} }));
+    expect(provider.id).toBe(PROVIDER_ID);
+    expect(isModelProvider(provider)).toBe(true);
+  });
+
+  it('constructs this provider with neither a credential nor a model', () => {
+    const provider = okValue(createModelProvider({ env: { DEBUGGEN_PROVIDER: PROVIDER_ID } }));
+    expect(provider.id).toBe(PROVIDER_ID);
+
+    // The configuration the factory resolved on this path carries no model at
+    // all, which is what this provider is handed nothing for: constructed
+    // without a configuration it records its own id, so an artifact never
+    // claims a model produced it.
+    const config = okValue(resolveProviderConfig({ DEBUGGEN_PROVIDER: PROVIDER_ID }));
+    expect(config.model).toBe('');
+    expect(config.apiKey).toBeUndefined();
+  });
+
+  it('reads a padded, mixed-case selection and a blank variable the way a hand-edited .env means them', () => {
+    const padded = okValue(createModelProvider({ env: { DEBUGGEN_PROVIDER: '  Deterministic ' } }));
+    expect(padded.id).toBe(PROVIDER_ID);
+
+    // `.env.example` ships both of these blank, so blank has to mean unset
+    // rather than "a model called nothing" and "an empty credential".
+    const blank = okValue(
+      createModelProvider({
+        env: { DEBUGGEN_PROVIDER: '   ', DEBUGGEN_MODEL: '', ANTHROPIC_API_KEY: '' },
+      }),
+    );
+    expect(blank.id).toBe(PROVIDER_ID);
+  });
+
+  it('refuses the network-backed path without a credential, in AAP §0.5.5 wording', () => {
+    const error = errorOf(
+      createModelProvider({
+        env: { DEBUGGEN_PROVIDER: 'anthropic', DEBUGGEN_MODEL: CONFIGURED_MODEL },
+      }),
+    );
+
+    expect(DEBUGGEN_ERROR_CODES).toContain(error.code);
+    expect(error.message).toBe(modelUnavailableMessage(error.code));
+    expect(error.message).toBe(
+      'Model provider unavailable (CONFIG_INVALID). Check ANTHROPIC_API_KEY or switch DEBUGGEN_PROVIDER.',
+    );
+    expect(error.hint).toContain('ANTHROPIC_API_KEY');
+    expect(error.hint).toContain(`DEBUGGEN_PROVIDER=${PROVIDER_ID}`);
+    expect(asObject(error.details ?? {}).setting).toBe('ANTHROPIC_API_KEY');
+  });
+
+  it('refuses the network-backed path without a model, naming DEBUGGEN_MODEL', () => {
+    const error = errorOf(
+      createModelProvider({
+        env: { DEBUGGEN_PROVIDER: 'anthropic', ANTHROPIC_API_KEY: CONFIGURED_CREDENTIAL },
+      }),
+    );
+
+    expect(error.message).toBe(modelUnavailableMessage('CONFIG_INVALID'));
+    expect(error.hint).toContain('DEBUGGEN_MODEL');
+    expect(asObject(error.details ?? {}).setting).toBe('DEBUGGEN_MODEL');
+  });
+
+  it('never puts a credential in a message, a hint or a details field', () => {
+    const failures: readonly DebuggenError[] = [
+      errorOf(createModelProvider({ env: { DEBUGGEN_PROVIDER: 'anthropic' } })),
+      errorOf(
+        createModelProvider({
+          env: { DEBUGGEN_PROVIDER: 'anthropic', DEBUGGEN_MODEL: CONFIGURED_MODEL },
+        }),
+      ),
+      errorOf(createModelProvider({ env: { ...ANTHROPIC_ENVIRONMENT, DEBUGGEN_MODEL: ' ' } })),
+      errorOf(
+        createModelProvider({ env: { ...ANTHROPIC_ENVIRONMENT, DEBUGGEN_PROVIDER: 'oops' } }),
+      ),
+    ];
+
+    for (const failure of failures) {
+      const rendered = canonical({
+        message: failure.message,
+        hint: failure.hint,
+        details: failure.details ?? {},
+      });
+      expect(rendered).not.toContain(CONFIGURED_CREDENTIAL);
+      // Not even a prefix: presence is all a failure may report.
+      expect(rendered).not.toContain(CONFIGURED_CREDENTIAL.slice(0, 4));
+    }
+  });
+
+  it('lists exactly the known provider ids for an unrecognised selection', () => {
+    const error = errorOf(createModelProvider({ env: { DEBUGGEN_PROVIDER: 'nonsense' } }));
+
+    expect(error.code).toBe('CONFIG_INVALID');
+    expect(error.hint).toContain(PROVIDER_IDS.join(', '));
+    for (const id of PROVIDER_IDS) {
+      expect(error.message).toContain(id);
+      expect(error.hint).toContain(id);
+    }
+    expect(asObject(error.details ?? {}).setting).toBe('DEBUGGEN_PROVIDER');
+  });
+
+  it('constructs the network-backed provider when both of its settings are present', () => {
+    // Proof that the default is a decision rather than the only path the
+    // factory can take: the same call with the environment filled in selects
+    // the other implementation.
+    const provider = okValue(createModelProvider({ env: ANTHROPIC_ENVIRONMENT }));
+    expect(provider.id).toBe('anthropic');
+    expect(provider.id).not.toBe(PROVIDER_ID);
+  });
+
+  it('prefers a host override over the environment, one setting at a time', () => {
+    const config = okValue(
+      resolveProviderConfig(ANTHROPIC_ENVIRONMENT, { providerId: PROVIDER_ID }),
+    );
+
+    expect(config.providerId).toBe(PROVIDER_ID);
+    // The override replaced the selection only; the remaining settings were
+    // still read for the host.
+    expect(config.model).toBe(CONFIGURED_MODEL);
+    expect(okValue(createModelProvider({ env: ANTHROPIC_ENVIRONMENT, overrides: config })).id).toBe(
+      PROVIDER_ID,
+    );
+  });
+
+  it('refuses a malformed budget instead of quietly defaulting it', () => {
+    const malformed: readonly (readonly [string, number])[] = [
+      ['maxTokens', 0],
+      ['temperature', -1],
+      ['timeoutMs', 1.5],
+      ['maxRetries', Number.NaN],
+    ];
+
+    for (const [field, value] of malformed) {
+      const error = errorOf(resolveProviderConfig({}, { [field]: value }));
+      expect(error.code).toBe('CONFIG_INVALID');
+      expect(error.message).toContain(field);
+      expect(asObject(error.details ?? {}).setting).toBe(field);
+    }
+
+    // A host that read its configuration from a file hands over a string; that
+    // is coerced, because it is a well-formed number, and kept as a number.
+    const coerced = okValue(
+      resolveProviderConfig({}, { maxTokens: '512' as unknown as number, maxRetries: 0 }),
+    );
+    expect(coerced.maxTokens).toBe(512);
+    expect(coerced.maxRetries).toBe(0);
   });
 });

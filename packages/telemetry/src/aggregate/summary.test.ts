@@ -25,6 +25,14 @@
  *    and a render whose trigger could not be determined must never be counted
  *    as an unchanged render (AAP 0.8.4, 0.2.3). Both are asserted on the
  *    published shape — the absence of a `value` **key**, not a falsy value.
+ * 4. **Transportability and reproducibility.** A `CaptureSummary` is the body
+ *    of the `capture.stop` response, the payload of the `capture.stopped`
+ *    broadcast and an input to the analysis stage (AAP 0.4.2), so it is walked
+ *    for anything a JSON payload cannot carry — a `Map`, a `Set`, a class
+ *    instance, a cycle, an `undefined` inside an array — and summarised twice
+ *    from the same events to prove no clock and no minted identifier leaked
+ *    into it. Both are functional requirements of the message contract rather
+ *    than hygiene.
  *
  * ## What the compiler already guarantees, and is not re-tested here
  *
@@ -43,13 +51,15 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  COMMIT_ATTRIBUTE_KEYS,
+  DB_QUERY_ATTRIBUTE_KEYS,
+  ERROR_ATTRIBUTE_KEYS,
   FETCH_ATTRIBUTE_KEYS,
   PERF_ENTRY_ATTRIBUTE_KEYS,
   PERF_LONGTASK_ATTRIBUTE_KEYS,
   RENDER_ATTRIBUTE_KEYS,
   RENDER_TRIGGERS,
   metricUnitFor,
-  type MetricId,
   type RenderTrigger,
 } from '../schema/attributes.js';
 import { isTelemetryEvent, type TelemetryEvent } from '../schema/event.js';
@@ -64,16 +74,28 @@ import {
 import { aggregateQueries } from './queries.js';
 import { aggregateRenders } from './renders.js';
 import { aggregateRequests, countDuplicateRequests } from './requests.js';
+// Everything the module publishes is imported *through* the module under
+// test, including the four vocabulary symbols it re-exports from
+// `../schema/attributes.js` (`METRIC_IDS`, `METRIC_UNITS`, `isMetricId`,
+// `MetricId`). The re-export is part of this module's public surface — a
+// consumer holding a `CaptureSummary` narrows an untrusted metric id with it
+// without a second import — so it is exercised from here rather than from the
+// declaring module, which has its own colocated suite.
 import {
   DEFAULT_MAX_TRACE_IDS,
   DEFAULT_TOP_N,
   LONG_TASK_BLOCKING_THRESHOLD_MS,
   METRIC_DEFINITIONS,
   METRIC_IDS,
+  METRIC_UNITS,
   computeCaptureSummary,
   computeMetrics,
+  isMetricId,
   type CaptureSummary,
+  type ErrorSummary,
+  type MetricId,
   type MetricValue,
+  type SpanSummary,
 } from './summary.js';
 
 /*
@@ -106,6 +128,59 @@ const PLANNED_METRIC_IDS: readonly string[] = [
   'error_count',
 ];
 
+/**
+ * How many ids the plan fixes.
+ *
+ * Restated as its own number rather than read from the array above, because
+ * the two assertions catch different mistakes: the deep comparison catches a
+ * rename or a reordering, and this catches a member added to *both* the
+ * implementation and a hand-edited expectation without the cross-package
+ * consequence being considered.
+ */
+const PLANNED_METRIC_COUNT = 14;
+
+/**
+ * The shape every metric id has: lower-case words joined by single
+ * underscores.
+ *
+ * A style rule with a functional consequence. The ids are keys in a panel
+ * specification's `metricCards.metrics`, written by a model against the
+ * schema `packages/panel-schema` builds from this vocabulary, and they appear
+ * verbatim in stored specifications. An id in another style would still
+ * validate structurally while reading as a different kind of name in every
+ * prompt and every panel, so the shape is pinned here and a future addition
+ * has to match it.
+ */
+const METRIC_ID_SHAPE = /^[a-z]+(?:_[a-z]+)*$/;
+
+/** One value `isMetricId` must reject, with the mistake it represents. */
+interface MetricIdRejectionCase {
+  /** What the value is, for the case name. */
+  readonly label: string;
+  /** The value handed to the predicate. */
+  readonly value: unknown;
+}
+
+/**
+ * Values that are **not** metric ids, each a near miss of a real one.
+ *
+ * The predicate's job is to narrow an untrusted value — a metric id read back
+ * from a stored panel specification, or arriving from another process — so the
+ * cases that matter are the ones a plausible producer really sends: the same
+ * words in another style, an absent value, and a value of the wrong type.
+ */
+const NON_METRIC_IDS: readonly MetricIdRejectionCase[] = [
+  { label: 'a hyphenated spelling of a member', value: 'total-duration' },
+  { label: 'a camel-case spelling of a member', value: 'totalDuration' },
+  { label: 'an upper-case spelling of a member', value: 'TOTAL_DURATION' },
+  { label: 'a member with surrounding whitespace', value: ' total_duration ' },
+  { label: 'the empty string', value: '' },
+  { label: 'a number', value: 42 },
+  { label: 'null', value: null },
+  { label: 'undefined', value: undefined },
+  { label: 'an object that names a member inside itself', value: { id: 'total_duration' } },
+];
+
 /*
  * ---------------------------------------------------------------------------
  * Fixture vocabulary
@@ -123,11 +198,23 @@ const INTERACTION_KIND: TelemetryKind = 'interaction';
 /** The render kind, the only one the render aggregate counts. */
 const RENDER_KIND: TelemetryKind = 'render';
 
+/**
+ * The commit kind: the structural parent of the renders one commit performed.
+ *
+ * A fixture needs it because `render_count` must count renders and not
+ * commits — counting both would inflate every render total, and the inflation
+ * would look like the very symptom a re-render question is asked about.
+ */
+const COMMIT_KIND: TelemetryKind = 'commit';
+
 /** The browser's request kind. */
 const FETCH_KIND: TelemetryKind = 'fetch';
 
 /** The framework's incoming-request kind. */
 const HTTP_SERVER_KIND: TelemetryKind = 'http.server';
+
+/** The framework's route-handler kind, the child of a request span. */
+const ROUTE_HANDLER_KIND: TelemetryKind = 'route.handler';
 
 /** The named-function kind, produced on either tier. */
 const FUNCTION_KIND: TelemetryKind = 'function';
@@ -160,6 +247,17 @@ const ERROR_STATUS: TelemetryStatus = 'error';
 const COMPONENT_ATTRIBUTE: (typeof RENDER_ATTRIBUTE_KEYS)[number] = 'component';
 const TRIGGER_ATTRIBUTE: (typeof RENDER_ATTRIBUTE_KEYS)[number] = 'trigger';
 
+/** Commit attribute keys, from the commit catalog. */
+const PHASE_ATTRIBUTE: (typeof COMMIT_ATTRIBUTE_KEYS)[number] = 'phase';
+const COMMIT_RENDER_COUNT_ATTRIBUTE: (typeof COMMIT_ATTRIBUTE_KEYS)[number] = 'renderCount';
+const ROOT_NAME_ATTRIBUTE: (typeof COMMIT_ATTRIBUTE_KEYS)[number] = 'rootName';
+
+/** The database catalog's statement key, which only ever holds parameterized text. */
+const STATEMENT_ATTRIBUTE: (typeof DB_QUERY_ATTRIBUTE_KEYS)[number] = 'db.statement';
+
+/** The error catalog's stack key, which a summary must never republish. */
+const ERROR_STACK_ATTRIBUTE: (typeof ERROR_ATTRIBUTE_KEYS)[number] = 'error.stack';
+
 /** Request attribute keys, from the fetch catalog. */
 const METHOD_ATTRIBUTE: (typeof FETCH_ATTRIBUTE_KEYS)[number] = 'http.method';
 const URL_ATTRIBUTE: (typeof FETCH_ATTRIBUTE_KEYS)[number] = 'url';
@@ -175,6 +273,68 @@ const UNKNOWN_TRIGGER: RenderTrigger = 'unknown';
 
 /** A trigger that is neither of those two. */
 const PROPS_TRIGGER: RenderTrigger = 'props';
+
+/** One render whose trigger cannot be read, with the shape it arrived in. */
+interface MalformedTriggerCase {
+  /** What is wrong with the attribute, for the case name. */
+  readonly label: string;
+  /** The render event's attribute bag, verbatim. */
+  readonly attributes: Record<string, unknown>;
+}
+
+/**
+ * A render whose trigger cannot be determined, in every shape it arrives in.
+ *
+ * Each of these must count into `render_trigger_unknown_count` and **never**
+ * into `unchanged_render_count`: "we evaluated props, own hook state and every
+ * consumed context and none changed" and "we could not evaluate one of them"
+ * support different conclusions, so a capture must never report a
+ * stable-input re-render it did not observe (AAP 0.2.3). The classification
+ * itself belongs to `./renders.ts`; what is asserted here is that the metrics
+ * carry it through without folding the two buckets together.
+ */
+const MALFORMED_TRIGGER_CASES: readonly MalformedTriggerCase[] = [
+  {
+    label: 'the attribute is missing',
+    attributes: { [COMPONENT_ATTRIBUTE]: 'Gamma' },
+  },
+  {
+    label: 'the attribute is present but undefined',
+    attributes: { [COMPONENT_ATTRIBUTE]: 'Gamma', [TRIGGER_ATTRIBUTE]: undefined },
+  },
+  {
+    label: 'an empty string',
+    attributes: { [COMPONENT_ATTRIBUTE]: 'Gamma', [TRIGGER_ATTRIBUTE]: '' },
+  },
+  {
+    // The upper-cased spelling of a real member: membership is exact, so a
+    // case-insensitive comparison creeping in anywhere would fail here.
+    label: 'a string outside the vocabulary',
+    attributes: {
+      [COMPONENT_ATTRIBUTE]: 'Gamma',
+      [TRIGGER_ATTRIBUTE]: UNCHANGED_TRIGGER.toUpperCase(),
+    },
+  },
+  {
+    label: 'a number',
+    attributes: { [COMPONENT_ATTRIBUTE]: 'Gamma', [TRIGGER_ATTRIBUTE]: 3 },
+  },
+  {
+    label: 'null',
+    attributes: { [COMPONENT_ATTRIBUTE]: 'Gamma', [TRIGGER_ATTRIBUTE]: null },
+  },
+  {
+    label: 'an object that names a member inside itself',
+    attributes: {
+      [COMPONENT_ATTRIBUTE]: 'Gamma',
+      [TRIGGER_ATTRIBUTE]: { [TRIGGER_ATTRIBUTE]: UNCHANGED_TRIGGER },
+    },
+  },
+  {
+    label: 'an array holding a member',
+    attributes: { [COMPONENT_ATTRIBUTE]: 'Gamma', [TRIGGER_ATTRIBUTE]: [UNCHANGED_TRIGGER] },
+  },
+];
 
 /*
  * ---------------------------------------------------------------------------
@@ -287,6 +447,19 @@ function makeEvent(overrides: EventOverrides = {}): TelemetryEvent {
   };
 }
 
+/**
+ * A render whose attribute bag is supplied verbatim.
+ *
+ * The malformed-trigger table needs to deliver values the typed builder below
+ * cannot express — a missing key, `null`, a number — because the bag has
+ * crossed a page boundary, a WebSocket and the store before a metric is
+ * computed from it, and every one of those values is something a producer bug
+ * can really deliver.
+ */
+function makeRawRenderEvent(attributes: Record<string, unknown>): TelemetryEvent {
+  return makeEvent({ kind: RENDER_KIND, duration: 1, attributes });
+}
+
 /** A render of `component` with the given trigger. */
 function makeRenderEvent(component: string, trigger: RenderTrigger, duration = 2): TelemetryEvent {
   return makeEvent({
@@ -326,6 +499,138 @@ function makeRequestEvent(
   });
 }
 
+/**
+ * Where one span sits on the capture's time axis, and what it is.
+ *
+ * Offsets rather than absolute timestamps, because every duration assertion in
+ * this suite is about how two intervals overlap: `{ at: 10, duration: 50 }`
+ * beside `{ at: 20, duration: 20 }` reads as the nesting it describes, while
+ * two epoch millisecond literals do not.
+ */
+interface SpanPlacement {
+  /** The span's kind. */
+  readonly kind: TelemetryKind;
+  /** Offset from {@link BASE_TIME}, in milliseconds. */
+  readonly at: number;
+  /** Inclusive duration, in milliseconds. */
+  readonly duration: number;
+  /** The tier, when the kind permits more than one or the case names it. */
+  readonly tier?: TelemetryTier;
+  /** The trace, when a case correlates several spans. */
+  readonly traceId?: string;
+  /** The parent span, when a case nests one span inside another. */
+  readonly parentSpanId?: string;
+  /** Kind-specific attributes. */
+  readonly attributes?: Record<string, unknown>;
+  /** A fixed id, when a case asserts on ranking order. */
+  readonly id?: string;
+  /** The reported status. */
+  readonly status?: TelemetryStatus;
+}
+
+/** One span placed at an explicit offset and duration. */
+function makeSpanAt(placement: SpanPlacement): TelemetryEvent {
+  return makeEvent({
+    kind: placement.kind,
+    startTime: BASE_TIME + placement.at,
+    duration: placement.duration,
+    ...(placement.tier !== undefined ? { tier: placement.tier } : {}),
+    ...(placement.traceId !== undefined ? { traceId: placement.traceId } : {}),
+    ...(placement.parentSpanId !== undefined ? { parentSpanId: placement.parentSpanId } : {}),
+    ...(placement.attributes !== undefined ? { attributes: placement.attributes } : {}),
+    ...(placement.id !== undefined ? { id: placement.id } : {}),
+    ...(placement.status !== undefined ? { status: placement.status } : {}),
+  });
+}
+
+/**
+ * A server-tier request-handling span: the framework's answer to one request.
+ *
+ * Carries no attributes, deliberately. Every assertion built on it is about
+ * the interval it occupies, and an attribute the arithmetic does not read
+ * would only suggest the number depends on it.
+ */
+function makeServerSpan(at: number, duration: number, traceId?: string): TelemetryEvent {
+  return makeSpanAt({
+    kind: HTTP_SERVER_KIND,
+    at,
+    duration,
+    ...(traceId !== undefined ? { traceId } : {}),
+  });
+}
+
+/** A route-handler span: the child of a request span, on the same tier. */
+function makeRouteHandlerSpan(
+  at: number,
+  duration: number,
+  overrides: { readonly traceId?: string; readonly parentSpanId?: string } = {},
+): TelemetryEvent {
+  return makeSpanAt({
+    kind: ROUTE_HANDLER_KIND,
+    at,
+    duration,
+    ...(overrides.traceId !== undefined ? { traceId: overrides.traceId } : {}),
+    ...(overrides.parentSpanId !== undefined ? { parentSpanId: overrides.parentSpanId } : {}),
+  });
+}
+
+/**
+ * A database-tier statement execution.
+ *
+ * The statement is parameterized text with `$1` placeholders — the only form
+ * the store ever holds, since `../redaction/sql.ts` replaces inline literals
+ * before an event is persisted (AAP 0.5.2). A fixture that carried a literal
+ * would be describing a row the product never produces.
+ */
+function makeQueryEvent(
+  statement: string,
+  placement: {
+    readonly at?: number;
+    readonly duration?: number;
+    readonly traceId?: string;
+    readonly parentSpanId?: string;
+  } = {},
+): TelemetryEvent {
+  return makeSpanAt({
+    kind: DB_QUERY_KIND,
+    tier: DATABASE_TIER,
+    at: placement.at ?? 0,
+    duration: placement.duration ?? 1,
+    attributes: { [STATEMENT_ATTRIBUTE]: statement },
+    ...(placement.traceId !== undefined ? { traceId: placement.traceId } : {}),
+    ...(placement.parentSpanId !== undefined ? { parentSpanId: placement.parentSpanId } : {}),
+  });
+}
+
+/** One React commit: structural, and never counted as a render. */
+function makeCommitEvent(rootName: string, renderCount: number, at = 0): TelemetryEvent {
+  return makeSpanAt({
+    kind: COMMIT_KIND,
+    at,
+    duration: 4,
+    attributes: {
+      [PHASE_ATTRIBUTE]: 'update',
+      [COMMIT_RENDER_COUNT_ATTRIBUTE]: renderCount,
+      [ROOT_NAME_ATTRIBUTE]: rootName,
+    },
+  });
+}
+
+/** A failure by kind: a page error, optionally carrying a scrubbed stack. */
+function makeErrorEvent(
+  name: string,
+  overrides: { readonly at?: number; readonly stack?: string } = {},
+): TelemetryEvent {
+  return makeEvent({
+    kind: ERROR_KIND,
+    name,
+    startTime: BASE_TIME + (overrides.at ?? 0),
+    ...(overrides.stack !== undefined
+      ? { attributes: { [ERROR_STACK_ATTRIBUTE]: overrides.stack } }
+      : {}),
+  });
+}
+
 /** A long task, with or without the producer's own blocking-time figure. */
 function makeLongTaskEvent(duration: number, blockingTime?: number): TelemetryEvent {
   const attributes: Record<string, unknown> = {};
@@ -359,6 +664,93 @@ function clone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
 
+/** One place a published object holds something a JSON payload cannot carry. */
+interface TransportViolation {
+  /** Where it sits, as a dotted path from the root. */
+  readonly path: string;
+  /** What was found there. */
+  readonly reason: string;
+}
+
+/** Whether a value can be enumerated by key. */
+function isKeyedObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+/**
+ * Every place `value` holds something a `capture.stopped` payload cannot
+ * carry.
+ *
+ * A `CaptureSummary` is broadcast over a WebSocket and stored, so `JSON.parse(
+ * JSON.stringify(summary))` has to be the same object. The round-trip
+ * comparison below catches most of that, but not all of it: a `Map` and a
+ * `Set` both serialise to `{}` and compare equal to another empty object, and
+ * an `undefined` element inside an array serialises to `null` in a position a
+ * reader will index. Each of those is a silent change of meaning on the wire,
+ * so the structure is walked rather than only round-tripped.
+ *
+ * @param value The value to inspect.
+ * @param path Dotted path of `value` from the root, for the failure message.
+ * @param seen Objects already on the current path, so a cycle is reported
+ * rather than followed.
+ */
+function collectTransportViolations(
+  value: unknown,
+  path: string,
+  seen: readonly object[],
+): TransportViolation[] {
+  const violations: TransportViolation[] = [];
+
+  if (value === null) {
+    return violations;
+  }
+
+  const valueType = typeof value;
+  if (valueType === 'string' || valueType === 'boolean') {
+    return violations;
+  }
+  if (valueType === 'number') {
+    if (!Number.isFinite(value)) {
+      violations.push({ path, reason: 'a non-finite number' });
+    }
+    return violations;
+  }
+  if (valueType !== 'object') {
+    // `undefined`, a function, a symbol or a bigint: each either disappears
+    // or throws at the transport boundary.
+    violations.push({ path, reason: valueType });
+    return violations;
+  }
+  if (!isKeyedObject(value)) {
+    violations.push({ path, reason: 'a value that cannot be enumerated' });
+    return violations;
+  }
+  if (seen.includes(value)) {
+    violations.push({ path, reason: 'a cycle' });
+    return violations;
+  }
+  if (value instanceof Map) {
+    violations.push({ path, reason: 'a Map' });
+    return violations;
+  }
+  if (value instanceof Set) {
+    violations.push({ path, reason: 'a Set' });
+    return violations;
+  }
+
+  const prototype: unknown = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== Array.prototype && prototype !== null) {
+    violations.push({ path, reason: 'a class instance' });
+    return violations;
+  }
+
+  const nextSeen = [...seen, value];
+  for (const key of Object.keys(value)) {
+    violations.push(...collectTransportViolations(value[key], `${path}.${key}`, nextSeen));
+  }
+  return violations;
+}
+
 /** The context every summary fixture is built with. */
 function makeContext(): { captureId: string; sessionId: string } {
   return { captureId: CAPTURE_ID, sessionId: SESSION_ID };
@@ -372,11 +764,29 @@ function makeContext(): { captureId: string; sessionId: string } {
 
 describe('the computed-metric vocabulary', () => {
   it('publishes exactly the fourteen ids the plan fixes, in the plan order', () => {
+    // The list is CLOSED (AAP 0.2.3). `packages/panel-schema` validates a
+    // `metricCards` node's `metrics` against it, the renderer draws one card
+    // per id and the deterministic prose layer names the counting ones in a
+    // sentence — so adding, renaming or reordering an id here is changing a
+    // cross-package contract, not editing a local constant. If this assertion
+    // fails, the fix is either to restore the id or to carry the change
+    // through the panel schema, the renderer and the prose layer together.
     expect([...METRIC_IDS]).toEqual(PLANNED_METRIC_IDS);
+  });
+
+  it('publishes exactly fourteen of them', () => {
+    expect(METRIC_IDS).toHaveLength(PLANNED_METRIC_COUNT);
+    expect(PLANNED_METRIC_IDS).toHaveLength(PLANNED_METRIC_COUNT);
   });
 
   it('holds no duplicate id', () => {
     expect(new Set(METRIC_IDS).size).toBe(METRIC_IDS.length);
+  });
+
+  it('spells every id in lower snake case', () => {
+    for (const id of METRIC_IDS) {
+      expect(id).toMatch(METRIC_ID_SHAPE);
+    }
   });
 
   it('defines every id exactly once, keyed by the id it describes', () => {
@@ -392,10 +802,37 @@ describe('the computed-metric vocabulary', () => {
       count: 'count',
       bytes: 'bytes',
     };
+    // Exhaustive over the unit vocabulary, so a unit added to `METRIC_UNITS`
+    // without a formatting class fails here rather than rendering a number in
+    // the wrong shape.
+    expect(Object.keys(kindByUnit).sort()).toEqual([...METRIC_UNITS].sort());
     for (const id of METRIC_IDS) {
       const definition = METRIC_DEFINITIONS[id];
+      expect(METRIC_UNITS).toContain(definition.unit);
       expect(definition.unit).toBe(metricUnitFor(id));
       expect(definition.kind).toBe(kindByUnit[definition.unit]);
+    }
+  });
+
+  it('accepts every member of the vocabulary as a metric id', () => {
+    for (const id of METRIC_IDS) {
+      expect(isMetricId(id)).toBe(true);
+    }
+  });
+
+  it.each(NON_METRIC_IDS)('rejects $label', ({ value }: MetricIdRejectionCase) => {
+    expect(isMetricId(value)).toBe(false);
+  });
+
+  it('narrows an untrusted value to a usable metric id', () => {
+    // What the predicate exists for: a metrics list arriving from another
+    // process, narrowed before a definition is looked up. The lookup below
+    // type-checks only because the guard narrowed `candidate`.
+    const candidate: unknown = PLANNED_METRIC_IDS[0];
+    expect(isMetricId(candidate)).toBe(true);
+    if (isMetricId(candidate)) {
+      const narrowed: MetricId = candidate;
+      expect(METRIC_DEFINITIONS[narrowed].id).toBe(narrowed);
     }
   });
 
@@ -471,6 +908,18 @@ describe('computeMetrics', () => {
     expect(valueOf(values, 'total_duration')).toBe(25);
   });
 
+  it('takes the latest END, not the latest start, as the end of the window', () => {
+    const values = computeMetrics([
+      // The long one starts first and ends last: [0, 100].
+      makeSpanAt({ kind: INTERACTION_KIND, at: 0, duration: 100 }),
+      // The last span to START ends well before it: [50, 55]. A window
+      // computed from the latest start plus its own duration would read 55.
+      makeSpanAt({ kind: RENDER_KIND, at: 50, duration: 5 }),
+    ]);
+
+    expect(valueOf(values, 'total_duration')).toBe(100);
+  });
+
   it('unions overlapping intervals per tier instead of summing them', () => {
     const traceId = nextTraceId();
     const events = [
@@ -522,6 +971,20 @@ describe('computeMetrics', () => {
     expect(database).toBeLessThanOrEqual(backend);
   });
 
+  it('sums the server tier when its spans do not overlap', () => {
+    const traceId = nextTraceId();
+    const values = computeMetrics([
+      // [0, 20] and [30, 40]: disjoint, so the union *is* the sum. The
+      // companion of the overlap case above — a union implementation that
+      // silently returned the sum would pass only one of the two.
+      makeServerSpan(0, 20, traceId),
+      makeRouteHandlerSpan(30, 10, { traceId }),
+    ]);
+
+    expect(valueOf(values, 'backend_duration')).toBe(30);
+    expect(valueOf(values, 'total_duration')).toBe(40);
+  });
+
   it('attributes a browser interaction wholly to the front end when no server span exists', () => {
     const values = computeMetrics([
       makeEvent({ kind: INTERACTION_KIND, startTime: BASE_TIME, duration: 40 }),
@@ -530,6 +993,87 @@ describe('computeMetrics', () => {
     expect(valueOf(values, 'frontend_duration')).toBe(40);
     expect(valueOf(values, 'backend_duration')).toBe(0);
     expect(valueOf(values, 'database_duration')).toBe(0);
+  });
+
+  it('reports no front-end time, never a negative one, when the server covered it all', () => {
+    const traceId = nextTraceId();
+    const values = computeMetrics([
+      // The server span [0, 100] covers the browser request [10, 60]
+      // entirely: every millisecond the page spent was spent waiting, so the
+      // front end accounts for none of it. Subtracting durations rather than
+      // intervals would yield -50 here.
+      makeServerSpan(0, 100, traceId),
+      makeRequestEvent({ traceId, startTime: BASE_TIME + 10, duration: 50 }),
+    ]);
+
+    expect(valueOf(values, 'frontend_duration')).toBe(0);
+    expect(valueOf(values, 'backend_duration')).toBe(100);
+    expect(
+      valueOf(values, 'frontend_duration') + valueOf(values, 'backend_duration'),
+    ).toBeLessThanOrEqual(valueOf(values, 'total_duration'));
+  });
+
+  it('nests database time inside server time', () => {
+    const traceId = nextTraceId();
+    const server = makeServerSpan(0, 80, traceId);
+    const values = computeMetrics([
+      server,
+      makeRouteHandlerSpan(2, 70, { traceId, parentSpanId: server.spanId }),
+      makeQueryEvent('select col_a from t1 where id = $1', {
+        at: 10,
+        duration: 30,
+        traceId,
+      }),
+      makeQueryEvent('select col_b from t2 where id = $1', {
+        at: 30,
+        duration: 30,
+        traceId,
+      }),
+    ]);
+
+    // [10, 40] ∪ [30, 60] = 50 ms of wall clock, not the 60 ms the two
+    // durations add up to, and never more than the server's own union.
+    expect(valueOf(values, 'database_duration')).toBe(50);
+    expect(valueOf(values, 'backend_duration')).toBe(80);
+    expect(valueOf(values, 'database_duration')).toBeLessThanOrEqual(
+      valueOf(values, 'backend_duration'),
+    );
+  });
+
+  it('rounds every duration to three decimals and never publishes a negative one', () => {
+    const traceId = nextTraceId();
+    const values = computeMetrics([
+      // Sub-millisecond precision is the event contract's, so the arithmetic
+      // keeps it and the published number is rounded — not truncated to a
+      // whole millisecond, which would erase the difference between a 0.4 ms
+      // render and a 40 ms one at the fourth decimal.
+      makeSpanAt({ kind: INTERACTION_KIND, at: 0, duration: 12.34567, traceId }),
+      makeServerSpan(1, 4.000_49, traceId),
+      makeQueryEvent('select col_a from t1 where id = $1', {
+        at: 2,
+        duration: 2.346_49,
+        traceId,
+      }),
+      // The longest span in the fixture, so it is also what the capture window
+      // ends on.
+      makeLongTaskEvent(LONG_TASK_BLOCKING_THRESHOLD_MS + 3.141_59),
+    ]);
+
+    expect(valueOf(values, 'total_duration')).toBe(53.142);
+    expect(valueOf(values, 'backend_duration')).toBe(4);
+    expect(valueOf(values, 'database_duration')).toBe(2.346);
+    expect(valueOf(values, 'blocking_time')).toBe(3.142);
+
+    for (const published of values) {
+      if (published.unit !== 'milliseconds') {
+        continue;
+      }
+      const measured = valueOf(values, published.id);
+      expect(measured).toBeGreaterThanOrEqual(0);
+      // Three decimals: the value survives a round trip through its own
+      // rounding, which a longer fraction would not.
+      expect(Math.round(measured * 1000) / 1000).toBe(measured);
+    }
   });
 
   it('counts an unclassifiable render apart from an unchanged one', () => {
@@ -553,6 +1097,48 @@ describe('computeMetrics', () => {
     expect(valueOf(values, 'render_trigger_unknown_count')).toBe(1);
   });
 
+  it.each(MALFORMED_TRIGGER_CASES)(
+    'counts a render as unknown, never as unchanged, when the trigger is $label',
+    ({ attributes }: MalformedTriggerCase) => {
+      const values = computeMetrics([
+        // One render nobody could classify, beside one that really was
+        // evaluated and found unchanged: the two totals must stay apart.
+        makeRawRenderEvent(attributes),
+        makeRenderEvent('Delta', UNCHANGED_TRIGGER),
+      ]);
+
+      expect(valueOf(values, 'render_count')).toBe(2);
+      expect(valueOf(values, 'render_trigger_unknown_count')).toBe(1);
+      expect(valueOf(values, 'unchanged_render_count')).toBe(1);
+    },
+  );
+
+  it('counts renders and not the commits that performed them', () => {
+    const events = [
+      makeCommitEvent('AppRoot', 2, 0),
+      makeRenderEvent('Alpha', PROPS_TRIGGER),
+      makeRenderEvent('Beta', UNCHANGED_TRIGGER),
+      makeCommitEvent('AppRoot', 1, 20),
+      makeRenderEvent('Alpha', UNKNOWN_TRIGGER),
+    ];
+
+    const values = computeMetrics(events);
+    const stats = aggregateRenders(events, { includeOccurrences: false });
+
+    // A commit is the structural parent of the renders it performed, so
+    // counting it would inflate the very number a re-render question is asked
+    // about. The identity `render_count` = the sum of the render aggregate's
+    // counts is what `./summary.ts` delegates for, and it is asserted here
+    // rather than assumed.
+    expect(valueOf(values, 'render_count')).toBe(3);
+    expect(valueOf(values, 'render_count')).toBe(
+      stats.reduce((total, stat) => total + stat.renderCount, 0),
+    );
+    expect(stats.map((stat) => stat.component)).toEqual(['Alpha', 'Beta']);
+    expect(valueOf(values, 'unchanged_render_count')).toBe(1);
+    expect(valueOf(values, 'render_trigger_unknown_count')).toBe(1);
+  });
+
   it('counts requests and statements per occurrence, through their kind groups', () => {
     const values = computeMetrics([
       makeRequestEvent(),
@@ -566,6 +1152,35 @@ describe('computeMetrics', () => {
 
     expect(valueOf(values, 'request_count')).toBe(2);
     expect(valueOf(values, 'query_count')).toBe(3);
+  });
+
+  it('counts two occurrences of one request, not the single group they form', () => {
+    const sharedKey = 'occurrence-request-key';
+    const events = [
+      makeRequestEvent({ requestKey: sharedKey, startTime: BASE_TIME }),
+      makeRequestEvent({ requestKey: sharedKey, startTime: BASE_TIME + 4 }),
+    ];
+
+    // One group, two occurrences. `request_count` answers "how many requests
+    // did the page issue", which is the occurrence count; the group count is
+    // what the request table's row count would be, and reporting it here
+    // would make a duplicate burst look like a single request.
+    expect(aggregateRequests(events)).toHaveLength(1);
+    expect(valueOf(computeMetrics(events), 'request_count')).toBe(2);
+  });
+
+  it('counts each database statement execution, not each distinct statement', () => {
+    const statement = 'select col_a from t1 where id = $1';
+    const events = [
+      makeQueryEvent(statement, { at: 0, duration: 3 }),
+      makeQueryEvent(statement, { at: 5, duration: 3 }),
+      makeQueryEvent('select col_b from t2 where id = $1', { at: 10, duration: 3 }),
+    ];
+
+    // Two statements, three executions: the query table groups, the metric
+    // counts.
+    expect(aggregateQueries(events)).toHaveLength(2);
+    expect(valueOf(computeMetrics(events), 'query_count')).toBe(3);
   });
 
   it('reports duplicate requests exactly as the request aggregate counts them', () => {
@@ -603,9 +1218,14 @@ describe('computeMetrics', () => {
 
     expect(published.available).toBe(false);
     // The absence of the key, not a falsy value: a zero here would claim the
-    // capture observed no bytes.
+    // capture observed no bytes, turning "we could not measure this" into an
+    // observation (AAP 0.6.6, 0.8.4). The card must read `n/a`.
     expect('value' in published).toBe(false);
+    expect(published.value).toBeUndefined();
+    expect(published.value).not.toBe(0);
+    expect(JSON.stringify(published)).not.toContain('"value"');
     expect(published.note).toBeDefined();
+    expect(published.note?.length ?? 0).toBeGreaterThan(0);
   });
 
   it('sums the reported sizes when every candidate reported one', () => {
@@ -675,6 +1295,31 @@ describe('computeMetrics', () => {
     expect(expected).toBe(80);
     expect(valueOf(values, 'blocking_time')).toBe(expected);
     expect(valueOf(values, 'long_task_count')).toBe(durations.length);
+  });
+
+  it('adds nothing for a task at the threshold and only the excess above it', () => {
+    // 40 ms is not a long task at all, 60 ms blocks for 10 and 250 ms blocks
+    // for 200: Total Blocking Time is the excess past the threshold, summed,
+    // and the threshold is read from the module rather than restated as 50.
+    const durations = [40, 60, 250];
+    const values = computeMetrics(durations.map((duration) => makeLongTaskEvent(duration)));
+
+    expect(valueOf(values, 'blocking_time')).toBe(
+      0 + (60 - LONG_TASK_BLOCKING_THRESHOLD_MS) + (250 - LONG_TASK_BLOCKING_THRESHOLD_MS),
+    );
+    expect(valueOf(values, 'blocking_time')).toBe(210);
+    expect(valueOf(values, 'long_task_count')).toBe(durations.length);
+  });
+
+  it('reports no blocking time and no long tasks when the capture recorded none', () => {
+    const values = computeMetrics([
+      makeSpanAt({ kind: INTERACTION_KIND, at: 0, duration: 30 }),
+      makeRenderEvent('Alpha', PROPS_TRIGGER),
+      makeEvent({ kind: PERF_ENTRY_KIND }),
+    ]);
+
+    expect(valueOf(values, 'blocking_time')).toBe(0);
+    expect(valueOf(values, 'long_task_count')).toBe(0);
   });
 
   it("prefers the producer's own blocking-time figure where it reported one", () => {
@@ -812,6 +1457,29 @@ describe('computeCaptureSummary', () => {
     expect('sessionId' in summary).toBe(false);
   });
 
+  it('reads no clock, so the same events summarise identically twice', () => {
+    const events = [
+      makeSpanAt({ kind: INTERACTION_KIND, at: 0, duration: 100 }),
+      makeRenderEvent('Alpha', UNCHANGED_TRIGGER),
+      makeRequestEvent({ startTime: BASE_TIME + 5, duration: 20, transferSize: 64 }),
+      makeQueryEvent('select col_a from t1 where id = $1', { at: 10, duration: 30 }),
+      makeLongTaskEvent(140),
+      makeErrorEvent('RangeError', { at: 60 }),
+    ];
+
+    const first = computeCaptureSummary(events, makeContext(), { includeComponentTree: true });
+    const second = computeCaptureSummary(events, makeContext(), { includeComponentTree: true });
+
+    // Every field is a function of the events and the caller's context: no
+    // identifier is minted and `Date.now()` is never consulted, so two calls
+    // are indistinguishable. A summary that embedded "now" would differ here
+    // and would make a stored panel un-reproducible.
+    expect(second).toEqual(first);
+    expect(JSON.stringify(second)).toBe(JSON.stringify(first));
+    expect(first.captureId).toBe(CAPTURE_ID);
+    expect(first.startTime).toBe(BASE_TIME);
+  });
+
   it('lists the distinct traces and producers deterministically', () => {
     const first = nextTraceId();
     const second = nextTraceId();
@@ -842,6 +1510,30 @@ describe('computeCaptureSummary', () => {
     expect(summary.kindCounts[RENDER_KIND]).toBe(1);
     expect(summary.kindCounts[FETCH_KIND]).toBe(1);
     expect(summary.kindCounts[DB_QUERY_KIND]).toBe(0);
+
+    // Every member of both vocabularies carries a real, whole number — a
+    // missing key would read as `undefined` in a consumer that indexes the
+    // tally by a kind the capture happened not to see, and the vocabularies
+    // are iterated rather than sampled so a new kind cannot slip through
+    // uncounted. Seventeen kinds is the vocabulary AAP 0.2.3 fixes.
+    expect(TELEMETRY_KINDS).toHaveLength(17);
+    for (const tier of TELEMETRY_TIERS) {
+      const counted = summary.tierCounts[tier];
+      expect(typeof counted).toBe('number');
+      expect(Number.isInteger(counted)).toBe(true);
+      expect(counted).toBeGreaterThanOrEqual(0);
+    }
+    for (const kind of TELEMETRY_KINDS) {
+      const counted = summary.kindCounts[kind];
+      expect(typeof counted).toBe('number');
+      expect(Number.isInteger(counted)).toBe(true);
+      expect(counted).toBeGreaterThanOrEqual(0);
+    }
+    const tallied = TELEMETRY_KINDS.reduce((total, kind) => total + summary.kindCounts[kind], 0);
+    expect(tallied).toBe(summary.eventCount);
+    expect(TELEMETRY_TIERS.reduce((total, tier) => total + summary.tierCounts[tier], 0)).toBe(
+      summary.eventCount,
+    );
   });
 
   it('carries all fourteen metrics and names the unavailable ones', () => {
@@ -852,6 +1544,30 @@ describe('computeCaptureSummary', () => {
     for (const id of summary.unavailableMetrics) {
       expect(metric(summary.metrics, id).available).toBe(false);
     }
+  });
+
+  it('lists exactly the metrics the capture could not measure, and no others', () => {
+    const withoutBytes = computeCaptureSummary(
+      [makeRequestEvent(), makeRenderEvent('Alpha', PROPS_TRIGGER)],
+      makeContext(),
+    );
+    const withBytes = computeCaptureSummary(
+      [makeRequestEvent({ url: '/api/items', transferSize: 2048 })],
+      makeContext(),
+    );
+
+    // The list is the projection of the values, in vocabulary order, rather
+    // than a hand-maintained second opinion about which metric can be
+    // missing: a card the renderer shows as `n/a` and an id in this list are
+    // the same fact.
+    for (const summary of [withoutBytes, withBytes]) {
+      expect([...summary.unavailableMetrics]).toEqual(
+        summary.metrics.filter((value) => !value.available).map((value) => value.id),
+      );
+    }
+    expect([...withoutBytes.unavailableMetrics]).toEqual(['transferred_bytes']);
+    expect([...withBytes.unavailableMetrics]).toEqual([]);
+    expect(valueOf(withBytes.metrics, 'transferred_bytes')).toBe(2048);
   });
 
   it('anchors on the longest trace', () => {
@@ -990,7 +1706,7 @@ describe('computeCaptureSummary', () => {
     const failure = makeEvent({
       kind: ERROR_KIND,
       name: 'TypeError',
-      attributes: { 'error.stack': 'at somewhere (file.ts:1:1)' },
+      attributes: { [ERROR_STACK_ATTRIBUTE]: 'at somewhere (file.ts:1:1)' },
     });
 
     const summary = computeCaptureSummary([failure], makeContext());
@@ -1018,6 +1734,142 @@ describe('computeCaptureSummary', () => {
     expect(whole.truncated).toBe(false);
   });
 
+  it('bounds every section, not only the spans, and orders each as documented', () => {
+    const duplicateKey = 'bounded-duplicate-key';
+    const events = [
+      makeRenderEvent('Busy', PROPS_TRIGGER),
+      makeRenderEvent('Busy', PROPS_TRIGGER),
+      makeRenderEvent('Quiet', PROPS_TRIGGER),
+      makeRequestEvent({ requestKey: duplicateKey, startTime: BASE_TIME }),
+      makeRequestEvent({ requestKey: duplicateKey, startTime: BASE_TIME + 5 }),
+      makeRequestEvent({ requestKey: 'bounded-lonely-key', startTime: BASE_TIME + 8 }),
+      makeQueryEvent('select col_a from t1 where id = $1', { at: 10, duration: 90 }),
+      makeQueryEvent('select col_b from t2 where id = $1', { at: 20, duration: 5 }),
+      makeErrorEvent('RangeError', { at: 2 }),
+      makeErrorEvent('TypeError', { at: 30 }),
+    ];
+
+    const bounded = computeCaptureSummary(events, makeContext(), { topN: 1 });
+
+    expect(bounded.topSpans).toHaveLength(1);
+    expect(bounded.topRenders).toHaveLength(1);
+    expect(bounded.topRequests).toHaveLength(1);
+    expect(bounded.topQueries).toHaveLength(1);
+    expect(bounded.errors).toHaveLength(1);
+    expect(bounded.truncated).toBe(true);
+
+    // Each section keeps the row a reader would have looked for first: the
+    // slowest span, the busiest component, the duplicated request, the
+    // costliest statement and the earliest failure.
+    expect(bounded.topSpans[0]?.durationMs).toBe(90);
+    expect(bounded.topRenders[0]?.component).toBe('Busy');
+    expect(bounded.topRenders[0]?.renderCount).toBe(2);
+    expect(bounded.topRequests[0]?.hasDuplicates).toBe(true);
+    expect(bounded.topRequests[0]?.requestKey).toBe(duplicateKey);
+    expect(bounded.topQueries[0]?.totalDurationMs).toBe(90);
+    expect(bounded.errors[0]?.name).toBe('RangeError');
+
+    // The counts the capture reports are of everything it saw, never of the
+    // rows the sections kept.
+    expect(bounded.eventCount).toBe(events.length);
+    expect(valueOf(bounded.metrics, 'render_count')).toBe(3);
+    expect(valueOf(bounded.metrics, 'request_count')).toBe(3);
+    expect(valueOf(bounded.metrics, 'query_count')).toBe(2);
+    expect(valueOf(bounded.metrics, 'error_count')).toBe(2);
+  });
+
+  it('still measures the capture when the caller asks for no rows at all', () => {
+    const events = [
+      makeSpanAt({ kind: INTERACTION_KIND, at: 0, duration: 40 }),
+      makeRenderEvent('Alpha', UNCHANGED_TRIGGER),
+      makeRequestEvent({ startTime: BASE_TIME + 5, duration: 10 }),
+      makeQueryEvent('select col_a from t1 where id = $1', { at: 8, duration: 6 }),
+      makeErrorEvent('TypeError', { at: 20 }),
+    ];
+
+    const summary = computeCaptureSummary(events, makeContext(), { topN: 0 });
+
+    // The sections-empty path: a caller that wants the numbers and will fetch
+    // rows through `POST /sessions/:id/panel-data` still gets all fourteen
+    // metrics, because the metrics are computed from the scan rather than
+    // from the published rows.
+    expect(summary.topSpans).toEqual([]);
+    expect(summary.topRenders).toEqual([]);
+    expect(summary.topRequests).toEqual([]);
+    expect(summary.topQueries).toEqual([]);
+    expect(summary.errors).toEqual([]);
+    expect(summary.truncated).toBe(true);
+    expect(summary.metrics.map((value) => value.id)).toEqual([...METRIC_IDS]);
+    expect(summary.metrics).toHaveLength(PLANNED_METRIC_COUNT);
+    expect(valueOf(summary.metrics, 'total_duration')).toBe(40);
+    expect(valueOf(summary.metrics, 'render_count')).toBe(1);
+    expect(valueOf(summary.metrics, 'query_count')).toBe(1);
+    expect(valueOf(summary.metrics, 'error_count')).toBe(1);
+  });
+
+  it('projects a span into identity, position and cost, and nothing else', () => {
+    const traceId = nextTraceId();
+    const server = makeServerSpan(0, 60, traceId);
+    const summary = computeCaptureSummary(
+      [
+        server,
+        makeQueryEvent('select col_a from t1 where id = $1', {
+          at: 10,
+          duration: 20,
+          traceId,
+          parentSpanId: server.spanId,
+        }),
+      ],
+      makeContext(),
+    );
+    const [slowest] = summary.topSpans;
+    if (slowest === undefined) {
+      throw new Error('the summary published no span');
+    }
+    const projection: SpanSummary = slowest;
+
+    expect(projection.id).toBe(server.id);
+    expect(projection.spanId).toBe(server.spanId);
+    expect(projection.traceId).toBe(traceId);
+    expect(projection.kind).toBe(HTTP_SERVER_KIND);
+    expect(projection.tier).toBe(SERVER_TIER);
+    expect(projection.name).toBe(server.name);
+    expect(projection.startTime).toBe(BASE_TIME);
+    expect(projection.durationMs).toBe(60);
+    // 60 ms inclusive, 20 ms of which the statement underneath it covered.
+    expect(projection.selfTimeMs).toBe(40);
+    expect(projection.status).toBe(OK_STATUS);
+    // The attribute bag is deliberately not carried: a panel that wants it
+    // queries the event by id, and a summary that embedded every bag would
+    // not fit the payload it travels in.
+    expect('attributes' in projection).toBe(false);
+  });
+
+  it('projects a failure into identity and position only', () => {
+    const failure = makeErrorEvent('RangeError', { at: 12, stack: 'at handler (redacted:1:1)' });
+    const summary = computeCaptureSummary([failure], makeContext());
+    const [published] = summary.errors;
+    if (published === undefined) {
+      throw new Error('the summary published no failure');
+    }
+    const projection: ErrorSummary = published;
+
+    expect(projection.id).toBe(failure.id);
+    expect(projection.spanId).toBe(failure.spanId);
+    expect(projection.traceId).toBe(failure.traceId);
+    expect(projection.kind).toBe(ERROR_KIND);
+    expect(projection.tier).toBe(BROWSER_TIER);
+    expect(projection.name).toBe('RangeError');
+    expect(projection.startTime).toBe(BASE_TIME + 12);
+    // No duration, no status, no attributes: an error summary answers "what
+    // failed and when", and a stack can quote source text, so it never
+    // travels in a payload that reaches a model stage (AAP 0.5.2).
+    expect('duration' in projection).toBe(false);
+    expect('durationMs' in projection).toBe(false);
+    expect('attributes' in projection).toBe(false);
+    expect(JSON.stringify(projection)).not.toContain('redacted:1:1');
+  });
+
   it('clips the trace list and reports the true trace count', () => {
     const events = Array.from({ length: DEFAULT_MAX_TRACE_IDS + 1 }, () =>
       makeEvent({ traceId: nextTraceId() }),
@@ -1028,6 +1880,33 @@ describe('computeCaptureSummary', () => {
     expect(summary.traceCount).toBe(DEFAULT_MAX_TRACE_IDS + 1);
     expect(summary.traceIds).toHaveLength(DEFAULT_MAX_TRACE_IDS);
     expect(summary.truncated).toBe(true);
+    // The documented relationship, stated as arithmetic: the count is of the
+    // distinct traces the capture holds *before* clipping, and the published
+    // list is the first `DEFAULT_MAX_TRACE_IDS` of them. "These are the
+    // traces" and "these are fifty of the traces" support different
+    // conclusions, so the clip is never silent.
+    expect(summary.traceIds).toHaveLength(Math.min(summary.traceCount, DEFAULT_MAX_TRACE_IDS));
+    expect(summary.traceCount).toBeGreaterThan(summary.traceIds.length);
+  });
+
+  it('publishes each trace once, in ascending order', () => {
+    const traceIds = [nextTraceId(), nextTraceId(), nextTraceId()];
+    const events = traceIds.flatMap((traceId, index) => [
+      makeSpanAt({ kind: INTERACTION_KIND, at: index * 10, duration: 5, traceId }),
+      // A second event on the same trace: the list is of traces, not of
+      // events, so a repeat must not produce a repeated entry.
+      makeSpanAt({ kind: RENDER_KIND, at: index * 10 + 1, duration: 1, traceId }),
+    ]);
+
+    const summary = computeCaptureSummary(events, makeContext(), { topN: events.length });
+    const published = [...summary.traceIds];
+
+    expect(summary.traceCount).toBe(traceIds.length);
+    expect(published).toHaveLength(traceIds.length);
+    expect(new Set(published).size).toBe(published.length);
+    expect(published).toEqual([...published].sort());
+    expect(published).toEqual([...traceIds].sort());
+    expect(summary.truncated).toBe(false);
   });
 
   it('embeds the component tree only when asked', () => {
@@ -1040,6 +1919,11 @@ describe('computeCaptureSummary', () => {
   });
 
   it('answers an empty capture without throwing and without looking successful', () => {
+    // The service takes this path for "No telemetry was captured. Interact
+    // with the page while capture is running, then Capture again." (AAP
+    // 0.5.5): a capture that recorded nothing must summarise into zeroes,
+    // empty sections and an unavailable `transferred_bytes` — never throw, and
+    // never read as a successful analysis with nothing in it.
     const summary = computeCaptureSummary([], { captureId: CAPTURE_ID });
 
     expect(summary.eventCount).toBe(0);
@@ -1088,6 +1972,39 @@ describe('computeCaptureSummary', () => {
       { includeComponentTree: true },
     );
 
+    expect(clone(summary)).toEqual(summary);
+  });
+
+  it('holds nothing a WebSocket payload cannot carry', () => {
+    const traceId = nextTraceId();
+    const server = makeServerSpan(5, 80, traceId);
+    const summary: CaptureSummary = computeCaptureSummary(
+      [
+        makeSpanAt({ kind: INTERACTION_KIND, at: 0, duration: 120, traceId }),
+        makeCommitEvent('AppRoot', 2, 1),
+        makeRenderEvent('Alpha', PROPS_TRIGGER),
+        makeRenderEvent('Alpha', UNCHANGED_TRIGGER),
+        makeRawRenderEvent({ [COMPONENT_ATTRIBUTE]: 'Beta' }),
+        makeRequestEvent({ traceId, startTime: BASE_TIME + 4, duration: 90, transferSize: 512 }),
+        server,
+        makeRouteHandlerSpan(6, 70, { traceId, parentSpanId: server.spanId }),
+        makeQueryEvent('select col_a from t1 where id = $1', {
+          at: 10,
+          duration: 40,
+          traceId,
+        }),
+        makeLongTaskEvent(130),
+        makeErrorEvent('TypeError', { at: 100, stack: 'at handler (redacted:1:1)' }),
+      ],
+      makeContext(),
+      { includeComponentTree: true },
+    );
+
+    // The summary is the `capture.stopped` payload (AAP 0.4.2), so this is a
+    // functional requirement rather than hygiene: a `Map`, a `Set`, a class
+    // instance, a cycle or an `undefined` inside an array would either throw
+    // at the boundary or arrive as something else.
+    expect(collectTransportViolations(summary, '$', [])).toEqual([]);
     expect(clone(summary)).toEqual(summary);
   });
 
