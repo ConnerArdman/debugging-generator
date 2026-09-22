@@ -34,12 +34,20 @@
  *    `0600` on the entry are the reason this module uses the hardened creators
  *    at all, and a regression to `fs.writeFile` would pass every behavioural
  *    case in this file while silently widening a directory that also holds
- *    credentials.
+ *    credentials. Those cases run through `itPosix`, and the one failure that
+ *    only an unprivileged account can provoke through `itUnprivileged`, so a
+ *    platform or an account that cannot answer the question skips it instead of
+ *    asserting its opposite.
  * 3. **Failures are read through the module's own vocabulary** — `isErr`,
  *    `DebuggenError.is`, `error.code`, `error.details.reason` — rather than by
  *    matching message text, which is documentation and free to change.
+ * 4. **Every rejection is followed by a recovery.** A miss that leaves the
+ *    cache unusable would be indistinguishable from a working one in a suite
+ *    that only asserted the `undefined`, so each kind of damage is planted,
+ *    missed, and then written and read back successfully under the same key.
  */
 import {
+  chmodSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -234,6 +242,32 @@ function modeOf(path: string): number | undefined {
   return statSync(path).mode & PERMISSION_BITS;
 }
 
+/**
+ * `it`, skipped where the platform has no POSIX permission bits to assert.
+ *
+ * The `0700`/`0600` posture is the whole reason this module writes through the
+ * hardened creators instead of `fs.writeFileSync`, so it is asserted rather
+ * than assumed — but a mode is a POSIX concept, and `process.getuid` being
+ * absent is the standard test for a platform that has none. Guarding the
+ * assertion rather than dropping it keeps the posture enforced everywhere it
+ * exists without turning a Windows run red for a question that has no answer
+ * there.
+ */
+const itPosix = it.skipIf(process.getuid === undefined);
+
+/**
+ * `it`, skipped for the superuser and for a platform without permission bits.
+ *
+ * A permission-denied write is the one save failure that cannot be provoked as
+ * root: `0500` on a directory does not stop uid 0 from creating inside it, so
+ * the case would assert the opposite of what it was written for. The other two
+ * save failures in this file — a non-directory and a symbolic link at the
+ * cache directory's path — are provoked structurally and therefore run for
+ * every account, which is what keeps the `Err`-not-throw contract covered in
+ * CI, where tests run as root.
+ */
+const itUnprivileged = it.skipIf(process.getuid === undefined || process.getuid?.() === 0);
+
 // ---------------------------------------------------------------------------
 // Sandbox.
 // ---------------------------------------------------------------------------
@@ -335,12 +369,68 @@ describe('computeIndexCacheKey', () => {
     );
   });
 
+  it('changes when a file is removed', () => {
+    const fewer = FINGERPRINTS.filter((fingerprint) => fingerprint.file !== 'src/second.ts');
+    // Guards the case against a fixture change: a filter that matched nothing
+    // would compare the baseline with itself and pass for the wrong reason.
+    expect(fewer).toHaveLength(FINGERPRINTS.length - 1);
+
+    expect(computeIndexCacheKey(makeKeyInput({ files: fewer }))).not.toBe(
+      computeIndexCacheKey(makeKeyInput()),
+    );
+  });
+
   it('changes when a content hash appears', () => {
     const hashed = FINGERPRINTS.map((fingerprint) => ({ ...fingerprint, hash: 'b'.repeat(64) }));
 
     expect(computeIndexCacheKey(makeKeyInput({ files: hashed }))).not.toBe(
       computeIndexCacheKey(makeKeyInput()),
     );
+  });
+
+  it('changes when an existing content hash changes', () => {
+    // Only the fingerprint that already carries a digest is rewritten, so this
+    // is a *changed* hash rather than one appearing where there was none — the
+    // case that catches a key which folds in the hash's presence but not its
+    // value.
+    const rewritten = 'c'.repeat(64);
+    const rehashed = FINGERPRINTS.map((fingerprint) =>
+      fingerprint.hash === undefined ? fingerprint : { ...fingerprint, hash: rewritten },
+    );
+    expect(rehashed.some((fingerprint) => fingerprint.hash === rewritten)).toBe(true);
+
+    expect(computeIndexCacheKey(makeKeyInput({ files: rehashed }))).not.toBe(
+      computeIndexCacheKey(makeKeyInput()),
+    );
+  });
+
+  it('does not collide when the boundary between two parts moves', () => {
+    // Both of these inputs join to the same text — `/work/a/b` + `/c/tsconfig.json`
+    // and `/work/a` + `/b/c/tsconfig.json` are both `/work/a/b/c/tsconfig.json`
+    // once concatenated — so a key derived by joining its parts would serve one
+    // project's index to the other. `stableHash` frames every part with a type
+    // tag and a byte length, which is what makes the two streams different.
+    const deeperRoot = computeIndexCacheKey(
+      makeKeyInput({ projectRoot: '/work/a/b', tsConfigFilePath: '/c/tsconfig.json' }),
+    );
+    const shallowerRoot = computeIndexCacheKey(
+      makeKeyInput({ projectRoot: '/work/a', tsConfigFilePath: '/b/c/tsconfig.json' }),
+    );
+
+    expect(shallowerRoot).not.toBe(deeperRoot);
+
+    // The same trap one field further in, where a path meets a number:
+    // 'src/a.ts' + 12 + 3 and 'src/a.ts1' + 2 + 3 both join to 'src/a.ts123',
+    // and the type tag additionally keeps the number 2 from reading as the
+    // text '2'.
+    const shortPath = computeIndexCacheKey(
+      makeKeyInput({ files: [{ file: 'src/a.ts', mtimeMs: 12, size: 3 }] }),
+    );
+    const longPath = computeIndexCacheKey(
+      makeKeyInput({ files: [{ file: 'src/a.ts1', mtimeMs: 2, size: 3 }] }),
+    );
+
+    expect(longPath).not.toBe(shortPath);
   });
 
   it('changes with the TypeScript configuration path', () => {
@@ -444,6 +534,17 @@ describe('resolveIndexCacheDir', () => {
       '/state/root/index',
     );
   });
+
+  it('always ends with the index segment, in POSIX form', () => {
+    // Every path the product stores, logs or compares is POSIX, so a state root
+    // that arrived with Windows separators must not leak them into a directory
+    // the rest of the system will match against.
+    const resolved = resolveIndexCacheDir({ debuggenHome: 'C:\\Users\\dev\\.debuggen' });
+
+    expect(resolved).toBe('C:/Users/dev/.debuggen/index');
+    expect(resolved.endsWith('/index')).toBe(true);
+    expect(resolved).not.toContain('\\');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -487,7 +588,18 @@ describe('save and load', () => {
     await expect(cache.load(key)).resolves.toEqual(index);
   });
 
-  it('creates the cache directory 0700 and the entry 0600', async () => {
+  it('leaves no temporary file behind after a successful save', async () => {
+    const key = computeIndexCacheKey(makeKeyInput());
+
+    expect(isOk(await cache.save(key, makeIndex()))).toBe(true);
+
+    // The atomic write creates a dotted temporary sibling and renames it over
+    // the entry path, so a survivor would show up here — `readdir` lists
+    // dotfiles — and would accumulate one stray file per save.
+    expect(readdirSync(cacheDir)).toEqual([`${key}.json`]);
+  });
+
+  itPosix('creates the cache directory 0700 and the entry 0600', async () => {
     const key = computeIndexCacheKey(makeKeyInput());
 
     expect(isOk(await cache.save(key, makeIndex()))).toBe(true);
@@ -496,7 +608,7 @@ describe('save and load', () => {
     expect(modeOf(join(cacheDir, `${key}.json`))).toBe(SECURE_FILE_MODE);
   });
 
-  it('recreates the cache directory when it was deleted between runs', async () => {
+  itPosix('recreates the cache directory when it was deleted between runs', async () => {
     const key = computeIndexCacheKey(makeKeyInput());
     expect(isOk(await cache.save(key, makeIndex()))).toBe(true);
 
@@ -511,7 +623,7 @@ describe('save and load', () => {
     await expect(cache.load(key)).resolves.toBeDefined();
   });
 
-  it('tightens a cache directory that was left over-permissive', async () => {
+  itPosix('tightens a cache directory that was left over-permissive', async () => {
     mkdirSync(cacheDir, { recursive: true, mode: 0o755 });
     expect(modeOf(cacheDir)).toBe(0o755);
 
@@ -567,6 +679,40 @@ describe('load misses', () => {
     expect(reasonsOf(lines)).toContain('absent');
   });
 
+  it('misses when the cache directory was deleted after the entry was written', async () => {
+    expect(isOk(await cache.save(key, makeIndex()))).toBe(true);
+    await expect(cache.load(key)).resolves.toBeDefined();
+
+    // Exactly what the service's retention job does to the index cache of a
+    // project that has not been opened inside the retention window, and what a
+    // developer does by removing `~/.debuggen`. The cache was constructed
+    // against a directory that now does not exist, which is an ordinary state
+    // rather than a failure.
+    rmSync(cacheDir, { recursive: true, force: true });
+
+    await expect(cache.load(key)).resolves.toBeUndefined();
+    expect(reasonsOf(lines)).toContain('absent');
+  });
+
+  it('cannot reach an entry written under another indexer version', async () => {
+    const otherVersionKey = computeIndexCacheKey(
+      makeKeyInput({ indexerVersion: 'indexer/2026.10.1' }),
+    );
+    expect(otherVersionKey).not.toBe(key);
+
+    expect(isOk(await cache.save(key, makeIndex()))).toBe(true);
+
+    // The indexer version is folded into the key, so an index built by another
+    // version is *unreachable* rather than read and refused — the cheapest
+    // correct form of invalidation. And an ordinary absent miss must not touch
+    // the entry it never read: a session asking under this version's key still
+    // finds its own entry afterwards.
+    await expect(cache.load(otherVersionKey)).resolves.toBeUndefined();
+    expect(reasonsOf(lines)).toContain('absent');
+    expect(existsSync(join(cacheDir, `${key}.json`))).toBe(true);
+    await expect(cache.load(key)).resolves.toBeDefined();
+  });
+
   it('misses on unparsable JSON and removes the entry', async () => {
     const path = writeRawEntry(key, '{ "schemaVersion": 1, "index": ');
 
@@ -605,6 +751,53 @@ describe('load misses', () => {
     await expect(cache.load(key)).resolves.toBeUndefined();
     expect(reasonsOf(lines)).toContain('malformed-index');
     expect(existsSync(path)).toBe(false);
+  });
+
+  it('misses on every shape of structural damage and removes the entry', async () => {
+    // Three documents that parse as JSON and claim the right envelope version,
+    // and each of which a traversal would fail on somewhere far from the cause:
+    // a collection that is not a collection, a missing envelope field, and an
+    // element without the discriminant every consumer branches on.
+    const damaged: readonly { readonly label: string; readonly index: unknown }[] = [
+      { label: 'nodes is not an array', index: { ...makeIndex(), nodes: 'none' } },
+      {
+        label: 'the project root is missing',
+        index: {
+          schemaVersion: CODE_INDEX_SCHEMA_VERSION,
+          indexerVersion: INDEXER_VERSION,
+          generatedAt: GENERATED_AT,
+          nodes: NODES,
+          edges: EDGES,
+          files: FINGERPRINTS,
+        },
+      },
+      {
+        label: 'a node carries no kind',
+        index: {
+          ...makeIndex(),
+          nodes: [
+            { id: 'file:src/first.ts', name: 'first.ts', file: 'src/first.ts', line: 1, column: 1 },
+          ],
+        },
+      },
+    ];
+
+    for (const { label, index } of damaged) {
+      const path = writeRawEntry(
+        key,
+        JSON.stringify({
+          schemaVersion: INDEX_CACHE_SCHEMA_VERSION,
+          key,
+          writtenAt: GENERATED_AT,
+          index,
+        }),
+      );
+
+      expect(await cache.load(key), label).toBeUndefined();
+      expect(existsSync(path), label).toBe(false);
+    }
+
+    expect(reasonsOf(lines)).toContain('malformed-index');
   });
 
   it('misses on a document that is not an envelope at all', async () => {
@@ -650,16 +843,13 @@ describe('load misses', () => {
 
   it('misses rather than following a symbolic link planted at the entry path', async () => {
     const secret = join(stateRoot, 'elsewhere.json');
-    writeFileSync(
-      secret,
-      JSON.stringify({
-        schemaVersion: INDEX_CACHE_SCHEMA_VERSION,
-        key,
-        writtenAt: GENERATED_AT,
-        index: makeIndex(),
-      }),
-      { mode: SECURE_FILE_MODE },
-    );
+    const secretContents = JSON.stringify({
+      schemaVersion: INDEX_CACHE_SCHEMA_VERSION,
+      key,
+      writtenAt: GENERATED_AT,
+      index: makeIndex(),
+    });
+    writeFileSync(secret, secretContents, { mode: SECURE_FILE_MODE });
 
     mkdirSync(cacheDir, { recursive: true, mode: SECURE_DIR_MODE });
     const link = join(cacheDir, `${key}.json`);
@@ -670,9 +860,13 @@ describe('load misses', () => {
     await expect(cache.load(key)).resolves.toBeUndefined();
     expect(reasonsOf(lines)).toContain('unreadable');
 
-    // The link is removed; what it pointed at is not.
+    // The link is removed; what it pointed at survives byte for byte, which is
+    // the half of the outcome that proves `unlink` took the link and not its
+    // target — the target here stands for a credential file or a backup living
+    // elsewhere under the same state root.
     expect(existsSync(link)).toBe(false);
     expect(existsSync(secret)).toBe(true);
+    expect(readFileSync(secret, 'utf8')).toBe(secretContents);
   });
 
   it('misses when the entry path is a directory', async () => {
@@ -681,6 +875,82 @@ describe('load misses', () => {
     await expect(cache.load(key)).resolves.toBeUndefined();
     expect(reasonsOf(lines)).toContain('unreadable');
   });
+
+  it('recovers from every kind of damage, so a miss is never terminal', async () => {
+    const entryFile = join(cacheDir, `${key}.json`);
+    const linkTarget = join(stateRoot, 'link-target.json');
+
+    /**
+     * One way the entry under `key` can be unusable, planted as real bytes on a
+     * real filesystem. Each plant starts from whatever the previous iteration
+     * left behind — a valid entry — which is why the link case unlinks first.
+     */
+    const damage: readonly { readonly label: string; readonly plant: () => void }[] = [
+      {
+        label: 'unparsable bytes',
+        plant: (): void => {
+          writeRawEntry(key, '{"index":');
+        },
+      },
+      {
+        label: 'a newer envelope version',
+        plant: (): void => {
+          writeRawEntry(
+            key,
+            JSON.stringify({
+              schemaVersion: INDEX_CACHE_SCHEMA_VERSION + 1,
+              key,
+              writtenAt: GENERATED_AT,
+              index: makeIndex(),
+            }),
+          );
+        },
+      },
+      {
+        label: 'a structurally invalid index',
+        plant: (): void => {
+          writeRawEntry(
+            key,
+            JSON.stringify({
+              schemaVersion: INDEX_CACHE_SCHEMA_VERSION,
+              key,
+              writtenAt: GENERATED_AT,
+              index: { schemaVersion: CODE_INDEX_SCHEMA_VERSION },
+            }),
+          );
+        },
+      },
+      {
+        label: 'a deleted cache directory',
+        plant: (): void => {
+          rmSync(cacheDir, { recursive: true, force: true });
+        },
+      },
+      {
+        label: 'a planted symbolic link',
+        plant: (): void => {
+          writeFileSync(linkTarget, '{}', { mode: SECURE_FILE_MODE });
+          mkdirSync(cacheDir, { recursive: true, mode: SECURE_DIR_MODE });
+          rmSync(entryFile, { force: true });
+          symlinkSync(linkTarget, entryFile);
+        },
+      },
+    ];
+
+    const index = makeIndex();
+    for (const { label, plant } of damage) {
+      plant();
+
+      // Rejected, and then immediately usable again: the rejection removed the
+      // offending file, `save` recreated whatever was missing, and the index
+      // the indexer rebuilt is served from disk on the next ask. This is the
+      // whole reason `./indexer.ts` may treat a hit as a bonus.
+      expect(await cache.load(key), label).toBeUndefined();
+      expect(isOk(await cache.save(key, index)), label).toBe(true);
+      expect(existsSync(cacheDir), label).toBe(true);
+      expect(await cache.load(key), label).toEqual(index);
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -688,6 +958,39 @@ describe('load misses', () => {
 // ---------------------------------------------------------------------------
 
 describe('save failures', () => {
+  itUnprivileged('never fails an index for a state root it cannot write into', async () => {
+    // `0500` on the parent rather than on the cache directory itself, and the
+    // distinction is the point: `ensureSecureDir` *repairs* an existing
+    // directory whose mode is too loose or too tight, so a `0500` cache
+    // directory would be tightened to `0700` and the save would succeed. What
+    // cannot be repaired is a parent that refuses the `mkdir`. Traversal is
+    // left in place (`0500`, not `0000`) so the sandbox can still be removed.
+    chmodSync(stateRoot, 0o500);
+    try {
+      const result = await cache.save(computeIndexCacheKey(makeKeyInput()), makeIndex());
+
+      // A value, not an exception: the caller logs it and carries on with the
+      // index it already holds in memory, because an index that was built but
+      // not cached is a slow success rather than a failure.
+      expect(isErr(result)).toBe(true);
+      if (!isErr(result)) {
+        throw new Error('Expected an Err.');
+      }
+      // `DebuggenError.is` checks the code against the product's own
+      // vocabulary, so this also states that the code is one declared in
+      // `@debuggen/shared` rather than an errno leaking through.
+      expect(DebuggenError.is(result.error)).toBe(true);
+      expect(result.error.code).toBe('CODE_INDEX_FAILED');
+      expect(result.error.details?.reason).toBe('cache-write-failed');
+      expect(result.error.hint).toBeDefined();
+      expect(existsSync(cacheDir)).toBe(false);
+    } finally {
+      // Restored here rather than in `afterEach`: the teardown has to be able
+      // to remove the sandbox whether or not the assertions above held.
+      chmodSync(stateRoot, SECURE_DIR_MODE);
+    }
+  });
+
   it('reports an Err when the cache directory cannot be created', async () => {
     // A regular file occupies the directory's path, so the directory cannot be
     // created at all — the kind of failure that must never escape as a throw.

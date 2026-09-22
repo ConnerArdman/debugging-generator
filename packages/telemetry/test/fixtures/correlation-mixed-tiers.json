@@ -1,0 +1,354 @@
+[
+  {
+    "id": "evt_0m4q8u2x6a9e3g7k",
+    "traceId": "7b41e0c82d9f36a5148e7c02fb95d3a6",
+    "spanId": "a70e5c28f13b649d",
+    "parentSpanId": "38f1c705ae24b6d9",
+    "kind": "db.query",
+    "name": "SELECT items",
+    "startTime": 1789812900036.881,
+    "duration": 640.118,
+    "tier": "db",
+    "attributes": {
+      "db.system": "postgresql",
+      "db.statement": "SELECT id, name, unit_price FROM items WHERE category_id = $1 AND archived = $2 ORDER BY name LIMIT $3",
+      "db.rowCount": 24,
+      "db.operation": "SELECT",
+      "db.name": "appdb",
+      "db.client": "pg"
+    },
+    "status": "ok",
+    "producerId": "prd_r9v3y7c1f5h8k2np",
+    "seq": 4,
+    "source": {
+      "file": "src/server/services/items.service.ts",
+      "line": 41,
+      "column": 22,
+      "symbol": "loadItems",
+      "resolvedBy": "code-graph",
+      "confidence": 0.85
+    },
+    "sessionId": "ses_t2w6z0b4f8j1m5qr",
+    "captureId": "cap_x7a1d5g9k3n7r0uv",
+    "ingestSeq": 64
+  },
+  {
+    "id": "evt_5k9n3r7u1x4a8dgp",
+    "traceId": "7b41e0c82d9f36a5148e7c02fb95d3a6",
+    "spanId": "4c8b1d63e0a927f5",
+    "parentSpanId": "c92a3f07d1b48e65",
+    "kind": "render",
+    "name": "SummaryCard",
+    "startTime": 1789812900733.5,
+    "duration": 3.118,
+    "tier": "browser",
+    "attributes": {
+      "component": "SummaryCard",
+      "phase": "update",
+      "renderCount": 2,
+      "changedProps": [
+        {
+          "key": "pending",
+          "previous": { "type": "boolean", "preview": "false", "truncated": false },
+          "next": { "type": "boolean", "preview": "true", "truncated": false }
+        }
+      ],
+      "trigger": "state",
+      "actualDuration": 3.118,
+      "ownerChain": ["WidgetPanel"],
+      "selfTime": 2.004
+    },
+    "status": "unset",
+    "producerId": "prd_j4m8q2t6w0z3b7fh",
+    "seq": 3,
+    "source": {
+      "file": "src/components/SummaryCard.tsx",
+      "line": 18,
+      "column": 1,
+      "symbol": "SummaryCard",
+      "resolvedBy": "react-owner",
+      "confidence": 0.6
+    },
+    "sessionId": "ses_t2w6z0b4f8j1m5qr",
+    "captureId": "cap_x7a1d5g9k3n7r0uv",
+    "ingestSeq": 68
+  },
+  {
+    "id": "evt_1b5e9h3m7q0u4x8a",
+    "traceId": "7b41e0c82d9f36a5148e7c02fb95d3a6",
+    "spanId": "0d7f2b9631ea48c5",
+    "parentSpanId": "5e18b4c60a97d23f",
+    "kind": "http.server",
+    "name": "GET /api/items",
+    "startTime": 1789812900021.76,
+    "duration": 1096.284,
+    "tier": "server",
+    "attributes": {
+      "http.method": "GET",
+      "url": "http://localhost:3000/api/items?filter=?&page=?",
+      "http.route": "/api/items",
+      "http.status_code": 200,
+      "next.route": "/api/items",
+      "next.span_type": "BaseServer.handleRequest"
+    },
+    "status": "ok",
+    "producerId": "prd_r9v3y7c1f5h8k2np",
+    "seq": 1,
+    "redacted": ["url"],
+    "sessionId": "ses_t2w6z0b4f8j1m5qr",
+    "captureId": "cap_x7a1d5g9k3n7r0uv",
+    "ingestSeq": 61
+  },
+  {
+    "id": "evt_2p6s0v4y8b1e5hjm",
+    "traceId": "7b41e0c82d9f36a5148e7c02fb95d3a6",
+    "spanId": "c92a3f07d1b48e65",
+    "kind": "interaction",
+    "name": "click button",
+    "startTime": 1789812900000,
+    "duration": 1175.402,
+    "tier": "browser",
+    "attributes": {
+      "event.type": "click",
+      "target.selector": "#widget-panel-refresh",
+      "target.tagName": "button",
+      "target.text": "Refresh items",
+      "componentChain": ["FilterPanel", "WidgetPanel"],
+      "interactionId": 6104,
+      "inputDelay": 2.118,
+      "processingStart": 1789812900002.118,
+      "processingEnd": 1789812900009.774
+    },
+    "status": "ok",
+    "producerId": "prd_j4m8q2t6w0z3b7fh",
+    "seq": 1,
+    "sessionId": "ses_t2w6z0b4f8j1m5qr",
+    "captureId": "cap_x7a1d5g9k3n7r0uv",
+    "ingestSeq": 66
+  },
+  {
+    "id": "evt_5r9v3z7c1f4j8n2p",
+    "traceId": "7b41e0c82d9f36a5148e7c02fb95d3a6",
+    "spanId": "1a5b93e70c28d4f6",
+    "parentSpanId": "b6a45e08c7132f9d",
+    "kind": "http.client",
+    "name": "fetch GET https://upstream.example.com/v1/lookup",
+    "startTime": 1789812900733.5,
+    "duration": 322.4,
+    "tier": "server",
+    "attributes": {
+      "http.method": "GET",
+      "url": "https://upstream.example.com/v1/lookup?region=?&code=?",
+      "http.status_code": 200
+    },
+    "status": "ok",
+    "producerId": "prd_r9v3y7c1f5h8k2np",
+    "seq": 5,
+    "redacted": ["url"],
+    "sessionId": "ses_t2w6z0b4f8j1m5qr",
+    "captureId": "cap_x7a1d5g9k3n7r0uv",
+    "ingestSeq": 65
+  },
+  {
+    "id": "evt_7f1j5n9s3w6z0c4e",
+    "traceId": "7b41e0c82d9f36a5148e7c02fb95d3a6",
+    "spanId": "7d24c1f8b530a96e",
+    "parentSpanId": "f04b8d1e6a37c952",
+    "kind": "render",
+    "name": "FilterPanel",
+    "startTime": 1789812901142.77,
+    "duration": 1.884,
+    "tier": "browser",
+    "attributes": {
+      "component": "FilterPanel",
+      "phase": "update",
+      "renderCount": 3,
+      "changedProps": [],
+      "trigger": "unchanged",
+      "actualDuration": 1.884,
+      "ownerChain": ["WidgetPanel"],
+      "selfTime": 1.884
+    },
+    "status": "unset",
+    "producerId": "prd_j4m8q2t6w0z3b7fh",
+    "seq": 6,
+    "source": {
+      "file": "src/components/FilterPanel.tsx",
+      "line": 22,
+      "column": 1,
+      "symbol": "FilterPanel",
+      "resolvedBy": "react-owner",
+      "confidence": 0.6
+    },
+    "sessionId": "ses_t2w6z0b4f8j1m5qr",
+    "captureId": "cap_x7a1d5g9k3n7r0uv",
+    "ingestSeq": 71
+  },
+  {
+    "id": "evt_3j7n1r5v9y2b6f0h",
+    "traceId": "7b41e0c82d9f36a5148e7c02fb95d3a6",
+    "spanId": "38f1c705ae24b6d9",
+    "parentSpanId": "b6a45e08c7132f9d",
+    "kind": "function",
+    "name": "loadItems",
+    "startTime": 1789812900031.204,
+    "duration": 700.216,
+    "tier": "server",
+    "attributes": {
+      "symbol": "loadItems",
+      "module": "src/server/services/items.service.ts",
+      "actionId": "act_w3z7c1f5j9n2r6uv",
+      "async": true
+    },
+    "status": "ok",
+    "producerId": "prd_r9v3y7c1f5h8k2np",
+    "seq": 3,
+    "source": {
+      "file": "src/server/services/items.service.ts",
+      "line": 34,
+      "column": 3,
+      "symbol": "loadItems",
+      "endLine": 58,
+      "resolvedBy": "patch",
+      "confidence": 1
+    },
+    "sessionId": "ses_t2w6z0b4f8j1m5qr",
+    "captureId": "cap_x7a1d5g9k3n7r0uv",
+    "ingestSeq": 63
+  },
+  {
+    "id": "evt_9c3f7j1n5q9t2wzx",
+    "traceId": "7b41e0c82d9f36a5148e7c02fb95d3a6",
+    "spanId": "5e18b4c60a97d23f",
+    "parentSpanId": "c92a3f07d1b48e65",
+    "kind": "fetch",
+    "name": "GET /api/items",
+    "startTime": 1789812900008.214,
+    "duration": 1112.65,
+    "tier": "browser",
+    "attributes": {
+      "http.method": "GET",
+      "url": "http://localhost:3000/api/items?filter=?&page=?",
+      "http.status_code": 200,
+      "initiator": "src/hooks/useItemList.ts:42:18",
+      "sameOrigin": true,
+      "traceparentInjected": true,
+      "transferSize": 4821
+    },
+    "status": "ok",
+    "producerId": "prd_j4m8q2t6w0z3b7fh",
+    "seq": 2,
+    "source": {
+      "file": "src/hooks/useItemList.ts",
+      "line": 42,
+      "column": 18,
+      "symbol": "fetchItemList",
+      "resolvedBy": "source-map",
+      "confidence": 0.75
+    },
+    "redacted": ["url"],
+    "sessionId": "ses_t2w6z0b4f8j1m5qr",
+    "captureId": "cap_x7a1d5g9k3n7r0uv",
+    "ingestSeq": 67
+  },
+  {
+    "id": "evt_4d8g2k6p0s3v7y1b",
+    "traceId": "7b41e0c82d9f36a5148e7c02fb95d3a6",
+    "spanId": "96f3a0b71c48e52d",
+    "parentSpanId": "c92a3f07d1b48e65",
+    "kind": "render",
+    "name": "ItemList",
+    "startTime": 1789812901124.86,
+    "duration": 12.418,
+    "tier": "browser",
+    "attributes": {
+      "component": "ItemList",
+      "phase": "update",
+      "renderCount": 4,
+      "changedProps": [
+        {
+          "key": "items",
+          "previous": { "type": "array", "preview": "Array(0)", "truncated": false },
+          "next": { "type": "array", "preview": "Array(24)", "truncated": false }
+        },
+        {
+          "key": "onSelect",
+          "previous": { "type": "function", "preview": "function onSelect", "truncated": false },
+          "next": { "type": "function", "preview": "function onSelect", "truncated": false }
+        }
+      ],
+      "trigger": "props",
+      "actualDuration": 12.418,
+      "ownerChain": ["WidgetPanel"],
+      "selfTime": 3.204
+    },
+    "status": "unset",
+    "producerId": "prd_j4m8q2t6w0z3b7fh",
+    "seq": 5,
+    "source": {
+      "file": "src/components/ItemList.tsx",
+      "line": 27,
+      "column": 1,
+      "symbol": "ItemList",
+      "resolvedBy": "react-owner",
+      "confidence": 0.6
+    },
+    "sessionId": "ses_t2w6z0b4f8j1m5qr",
+    "captureId": "cap_x7a1d5g9k3n7r0uv",
+    "ingestSeq": 70
+  },
+  {
+    "id": "evt_6g0k4p8t2w5z9d3f",
+    "traceId": "7b41e0c82d9f36a5148e7c02fb95d3a6",
+    "spanId": "b6a45e08c7132f9d",
+    "parentSpanId": "0d7f2b9631ea48c5",
+    "kind": "route.handler",
+    "name": "executing api route (app) /api/items",
+    "startTime": 1789812900024.912,
+    "duration": 1090.44,
+    "tier": "server",
+    "attributes": {
+      "http.method": "GET",
+      "http.route": "/api/items",
+      "next.route": "/api/items",
+      "next.span_type": "AppRouteRouteHandlers.runHandler",
+      "symbol": "GET"
+    },
+    "status": "ok",
+    "producerId": "prd_r9v3y7c1f5h8k2np",
+    "seq": 2,
+    "source": {
+      "file": "app/api/items/route.ts",
+      "line": 14,
+      "column": 8,
+      "symbol": "GET",
+      "resolvedBy": "route-map",
+      "confidence": 0.9
+    },
+    "sessionId": "ses_t2w6z0b4f8j1m5qr",
+    "captureId": "cap_x7a1d5g9k3n7r0uv",
+    "ingestSeq": 62
+  },
+  {
+    "id": "evt_8h2m6q0t4w7z1cfk",
+    "traceId": "7b41e0c82d9f36a5148e7c02fb95d3a6",
+    "spanId": "e21d908457c3b6fa",
+    "parentSpanId": "c92a3f07d1b48e65",
+    "kind": "commit",
+    "name": "React commit",
+    "startTime": 1789812901124.86,
+    "duration": 47.126,
+    "tier": "browser",
+    "attributes": {
+      "phase": "update",
+      "renderCount": 9,
+      "rootName": "#app-root"
+    },
+    "status": "unset",
+    "producerId": "prd_j4m8q2t6w0z3b7fh",
+    "seq": 4,
+    "sessionId": "ses_t2w6z0b4f8j1m5qr",
+    "captureId": "cap_x7a1d5g9k3n7r0uv",
+    "ingestSeq": 69
+  }
+]

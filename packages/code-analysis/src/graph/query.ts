@@ -1,0 +1,2541 @@
+/**
+ * The read-only query surface the code-investigation stage puts in front of a
+ * model (AAP 0.4.2, Stage 2).
+ *
+ * The design the plan states is the whole of this module's contract: *"model
+ * proposes queries, deterministic code executes them; no repository dump."* A
+ * stage hands the model a catalogue of the queries below, the model answers
+ * with the query it wants and the arguments it wants, and
+ * `apps/local-service/src/pipeline/tools/code-tools.ts` executes it here. Three
+ * properties follow from that, and every function in this file is written to
+ * keep them:
+ *
+ * - **Read-only.** Nothing here writes, spawns, fetches or reads an environment
+ *   variable. The graph and the loaded project are inputs; the results are
+ *   plain objects. The only filesystem-adjacent operation is reading text that
+ *   `../project.ts` has *already* loaded into a ts-morph project, through that
+ *   handle and never through `node:fs`.
+ * - **Bounded.** Every query has a ceiling, declared once in
+ *   {@link CODE_QUERY_LIMITS}, and a caller can only ask for *less*. These are
+ *   prompt-budget constraints: a result from this module is serialised into a
+ *   prompt, so an unbounded query here is an unbounded prompt, and the useful
+ *   answer to "give me everything" is a capped answer rather than a stage that
+ *   runs out of context. The single query that could otherwise return a whole
+ *   file — {@link CodeQueries.excerpt} — is the one the plan calls out as
+ *   *"bounded excerpts"*, and it clamps its window rather than widening it.
+ * - **Deterministic.** Every result is ordered by a documented key with the
+ *   node or edge `id` as the final tie-break, compared byte-wise and never
+ *   with `localeCompare`, so two runs over the same graph — and two graphs
+ *   built independently from the same source — produce the identical answer.
+ *   The same reasoning `./graph.ts` records for its canonical order applies
+ *   here, one layer up.
+ *
+ * ## Location provenance: two routes, never conflated
+ *
+ * `SourceLocation` carries the mechanism that produced it, and this module
+ * produces or forwards exactly two of the five (AAP 0.2.3):
+ *
+ * - `'code-graph'` for anything minted from a {@link CodeNode} or from an
+ *   edge's call site, with `DEFAULT_RESOLUTION_CONFIDENCE['code-graph']`. The
+ *   constant is imported, never transcribed as a number: four resolvers in
+ *   three packages fill `confidence`, and they agree only because they all read
+ *   that one table.
+ * - `'route-map'` for anything `../route-map.ts` produced —
+ *   {@link CodeQueries.routeForUrl} and the fallback half of
+ *   {@link CodeQueries.handlersFor} forward `RouteEntry.location` and
+ *   `RouteEntry.methodLocations` **unchanged**. Rewriting one of those to
+ *   `'code-graph'` would erase the distinction the schema exists to record.
+ *
+ * ## Route matching is delegated, not reimplemented
+ *
+ * `../route-map.ts` is the single source of URL-to-route resolution: it owns
+ * route groups, dynamic, catch-all and optional-catch-all segments, specificity
+ * ordering, percent-decoding and the collision rule between the two routers.
+ * The two route queries here bound their input, call `matchRoute`, and enrich
+ * the match with the graph's own node. There is deliberately no second
+ * matching algorithm in this folder.
+ *
+ * ## Position in the package graph
+ *
+ * This module imports `./types.js`, `./graph.js`, `../route-map.js`,
+ * `../project.js` and `@debuggen/shared` — and nothing else. In particular it
+ * does **not** import `../indexer.ts`: the expensive ts-morph reference
+ * resolver that module builds is *injected* through
+ * {@link CodeQueryOptions.references} and typed from `./types.js`, which is
+ * what lets {@link CodeQueries.whoCalls} stay a static graph read by default
+ * and reach for `findReferences` only when a caller asks for it.
+ * `@debuggen/shared` is the only `@debuggen` dependency this package has, and
+ * an upward import would close a cycle with `packages/instrumentation`, which
+ * depends on this package.
+ *
+ * @example
+ * ```ts
+ * const queries = createCodeQueries(graph, { loaded, logger });
+ *
+ * queries.findByName('handleSubmit');                  // ranked candidates
+ * queries.hasSymbol('src/server/items.ts', 'listItems'); // feasibility gate
+ * queries.routeForUrl('http://localhost:3000/api/items?page=2');
+ * queries.pathBetween({ name: 'WidgetList' }, { kind: 'db-call' });
+ * ```
+ *
+ * @packageDocumentation
+ */
+
+import {
+  DEFAULT_RESOLUTION_CONFIDENCE,
+  isSafeRelativePath,
+  noopLogger,
+  normalizePosix,
+  toPosix,
+} from '@debuggen/shared';
+import type { Logger, SourceLocation } from '@debuggen/shared';
+
+import { isEnvFilePath } from '../project.js';
+import type { LoadedProject } from '../project.js';
+import { matchRoute, routeMapFromIndex } from '../route-map.js';
+import type { RouteEntry, RouteEntryKind, RouteMatch } from '../route-map.js';
+
+import type { CodeGraph } from './graph.js';
+import type {
+  CodeEdge,
+  CodeEdgeKind,
+  CodeNode,
+  CodeNodeKind,
+  HttpMethodName,
+  ReferenceResolver,
+  RouterKind,
+} from './types.js';
+
+/* -------------------------------------------------------------------------------------------------
+ * Limits
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * The ceilings every query in this module enforces, and the defaults it applies
+ * when a caller does not narrow them.
+ *
+ * Each member is a **hard ceiling**: the matching per-call option can only ask
+ * for less, and a larger value is clamped rather than honoured (see
+ * {@link CodeQueryOptions.limits}). The reason is the one stated on this
+ * module — a result here becomes part of a model prompt, and the budget for
+ * that prompt belongs to the stage assembling it, not to the model proposing
+ * the query.
+ */
+export interface CodeQueryLimits {
+  /**
+   * The greatest number of entries any list-returning query may return (50).
+   *
+   * Fifty candidates already fill a screen and a substantial block of a prompt;
+   * past that the marginal result stops being evidence and starts being noise,
+   * and a query matching more than fifty nodes is telling the caller to ask a
+   * narrower question.
+   */
+  readonly maxResults: number;
+
+  /**
+   * The greatest number of call sites {@link CodeQueries.whoCalls} may return
+   * (50).
+   *
+   * Its own ceiling rather than {@link CodeQueryLimits.maxResults}, because
+   * callers are the one result set that legitimately grows with the popularity
+   * of a symbol: a shared helper can have hundreds, and the investigation needs
+   * a representative, deterministically ordered prefix of them rather than all.
+   */
+  readonly maxCallers: number;
+
+  /**
+   * The greatest number of edges a {@link CodeQueries.pathBetween} result may
+   * traverse (8).
+   *
+   * A flow the investigation stage renders — interaction, handler, request,
+   * route, service, query — is five or six hops, so eight leaves room for an
+   * intermediate module without letting a breadth-first search wander across
+   * an application. It bounds cost as much as output: the frontier of a code
+   * graph grows quickly, and depth is the term that multiplies.
+   */
+  readonly maxPathDepth: number;
+
+  /**
+   * The greatest number of nodes one {@link CodeQueries.pathBetween} search may
+   * expand (32).
+   *
+   * The budget that bounds a search which will never succeed. Without it, an
+   * unreachable target costs a traversal of the whole graph for a `undefined`;
+   * with it, the search gives up early and says so through
+   * {@link CodePath.truncated}.
+   */
+  readonly maxPathNodes: number;
+
+  /**
+   * The greatest number of lines one {@link CodeQueries.excerpt} may return
+   * (40).
+   *
+   * Forty lines shows a function and its immediate context whole, which is what
+   * makes an excerpt evidence. A caller that needs more of a module needs a
+   * different query, not a longer excerpt.
+   */
+  readonly maxExcerptLines: number;
+
+  /**
+   * The greatest length of one {@link CodeQueries.excerpt}, in characters
+   * (4 000).
+   *
+   * The second half of the excerpt budget, and the one that matters for
+   * generated or minified text: forty lines of ordinary TypeScript is well
+   * under this, while forty lines of a bundled module could be hundreds of
+   * kilobytes.
+   */
+  readonly maxExcerptChars: number;
+
+  /**
+   * The greatest length of a name, symbol or file argument, in characters
+   * (200).
+   *
+   * Two hundred characters is far beyond any identifier or project-relative
+   * path a stage should be proposing, so a longer argument is a malformed query
+   * rather than an ambitious one. It is answered with an empty result rather
+   * than an exception, because these arguments arrive from a model and this
+   * surface must never crash the pipeline.
+   */
+  readonly maxNameLength: number;
+
+  /**
+   * The greatest length of a URL argument, in characters (2 048).
+   *
+   * The conventional practical ceiling for a URL, applied before the value
+   * reaches `matchRoute`. A longer value resolves to no route rather than
+   * throwing, for the same reason {@link CodeQueryLimits.maxNameLength} does.
+   */
+  readonly maxUrlLength: number;
+}
+
+/**
+ * The frozen default limits, and simultaneously the hard ceilings of
+ * {@link CodeQueryLimits}.
+ *
+ * Frozen because it is read on every query: a mutation would silently re-budget
+ * every prompt in the process.
+ */
+export const CODE_QUERY_LIMITS: CodeQueryLimits = Object.freeze({
+  maxResults: 50,
+  maxCallers: 50,
+  maxPathDepth: 8,
+  maxPathNodes: 32,
+  maxExcerptLines: 40,
+  maxExcerptChars: 4_000,
+  maxNameLength: 200,
+  maxUrlLength: 2_048,
+});
+
+/**
+ * How many lines of context an excerpt includes on either side of its anchor
+ * when the caller does not say (3).
+ *
+ * Three lines is enough to show a signature above a body and a closing brace
+ * below a statement without spending the line budget of
+ * {@link CodeQueryLimits.maxExcerptLines} on context.
+ */
+const DEFAULT_EXCERPT_CONTEXT_LINES = 3;
+
+/**
+ * The score {@link CodeQueries.findByName} reports for each match tier, highest
+ * first.
+ *
+ * A number rather than an enumeration because it is handed to a model, which
+ * weighs candidates rather than switching on them. The values are the ranking
+ * the plan states — exact, then case-insensitive exact, then prefix, then
+ * substring — expressed so that a descending sort reproduces it.
+ */
+const MATCH_SCORES = Object.freeze({
+  exact: 1,
+  caseInsensitive: 0.75,
+  prefix: 0.5,
+  substring: 0.25,
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * Result shapes
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * One node of the code graph, reduced to what a prompt and a user interface
+ * need.
+ *
+ * The uniform node reference of this module: {@link CallerRef},
+ * {@link ComponentRef}, {@link RouteQueryResult} and {@link CodePath} all
+ * surface a node as one of these rather than as a raw {@link CodeNode}, so a
+ * consumer learns one shape. Plain and JSON-serialisable by construction —
+ * every field is a string, a number or a {@link SourceLocation}, which is
+ * itself plain — because these objects are serialised into prompts and into the
+ * service's tool responses.
+ */
+export interface CodeMatch {
+  /**
+   * The node's `id` in the graph it came from.
+   *
+   * Opaque: it is a handle to pass back into another query (as a
+   * {@link CodeQueries.pathBetween} endpoint or a {@link CodeQueries.excerpt}
+   * target), never a string to parse. `./graph.ts` documents why.
+   */
+  readonly nodeId: string;
+
+  /** The node's kind, so a caller can tell a component from a route handler. */
+  readonly kind: CodeNodeKind;
+
+  /** The node's name as written in the source. */
+  readonly name: string;
+
+  /** The node's file: project-relative, POSIX separators. */
+  readonly file: string;
+
+  /**
+   * Where the declaration is, with `resolvedBy: 'code-graph'`.
+   *
+   * Always present: a match whose file could not be vouched for as a
+   * project-relative path is dropped from the result rather than reported with
+   * an unusable location.
+   */
+  readonly location: SourceLocation;
+
+  /**
+   * How well the node matched, from `0` to `1`, when the query ranked its
+   * candidates.
+   *
+   * Set by {@link CodeQueries.findByName} alone — see {@link MATCH_SCORES} for
+   * the tiers — and absent everywhere else, where the result set is defined by
+   * a relationship rather than by a resemblance and a score would be a number
+   * with no meaning.
+   */
+  readonly score?: number;
+}
+
+/**
+ * A node matched by file and symbol name, with the three facts an
+ * instrumentation plan needs about it.
+ *
+ * The result of {@link CodeQueries.findSymbol}, and the reason that query is a
+ * public export rather than an internal helper:
+ * `packages/instrumentation/src/feasibility.ts` rejects a plan action naming a
+ * file or symbol the graph does not contain, and the patcher that would wrap
+ * the function needs to know whether it is exported and whether it is `async`
+ * before it can choose a template.
+ */
+export interface CodeSymbolMatch extends CodeMatch {
+  /**
+   * The symbol name that matched — the value the caller passed, which is the
+   * node's `name` or its `symbol`.
+   */
+  readonly symbol: string;
+
+  /**
+   * Whether the declaration is exported from its file.
+   *
+   * `false` rather than absent when the graph does not say: a consumer deciding
+   * whether another module can reach this symbol needs an answer, and "not
+   * known to be exported" is the safe one.
+   */
+  readonly exported: boolean;
+
+  /**
+   * Whether the function is declared `async`, when the graph knows.
+   *
+   * Present for a `server-function` node, whose payload records it, and absent
+   * for every other kind — where the question is either meaningless (a `file`)
+   * or unanswered by the extractor that produced the node.
+   */
+  readonly isAsync?: boolean;
+}
+
+/**
+ * How a caller of a symbol was found: from an edge already in the graph, or
+ * from a ts-morph reference search run on demand.
+ *
+ * Reported on every {@link CallerRef} because the two carry different weight. An
+ * `'edge'` result was produced by an extractor that understood the call
+ * expression; a `'references'` result is the type checker's answer to "where is
+ * this identifier used", which includes uses that are not calls.
+ */
+export type CallerProvenance = 'edge' | 'references';
+
+/** One place a symbol is called from. */
+export interface CallerRef {
+  /** The node the call was made from. */
+  readonly caller: CodeMatch;
+
+  /** How this call site was found. See {@link CallerProvenance}. */
+  readonly via: CallerProvenance;
+
+  /**
+   * Where the call is, with `resolvedBy: 'code-graph'`.
+   *
+   * The **call site** rather than the caller's declaration whenever the edge
+   * recorded one, which is the position a developer wants to open: the line
+   * that makes the call, not the top of the function containing it. It falls
+   * back to {@link CallerRef.caller}'s own position for a derived edge that has
+   * no site.
+   */
+  readonly location: SourceLocation;
+}
+
+/**
+ * The route that answers a URL, and the graph's own node for it.
+ *
+ * `routePath`, `router`, `kind`, `methods`, `params` and `file` are lifted out
+ * of the underlying {@link RouteMatch} so a prompt or a tool response can read
+ * them without walking into `match.entry`, and `match` is kept so a caller that
+ * needs the full entry — its segments, its per-method locations — has it.
+ */
+export interface RouteQueryResult {
+  /** The raw match `../route-map.ts` produced, unmodified. */
+  readonly match: RouteMatch;
+
+  /** The route's URL with its dynamic segments in bracket form. */
+  readonly routePath: string;
+
+  /** Which router convention the module belongs to. */
+  readonly router: RouterKind;
+
+  /** Whether the module answers requests or renders a document. */
+  readonly kind: RouteEntryKind;
+
+  /**
+   * The methods the route answers, in the order `../route-map.ts` derived them.
+   *
+   * `['ANY']` for a legacy Pages API module, whose single default-exported
+   * handler serves every method, and empty for a module whose handlers could
+   * not be located — which is a finding rather than a route that answers
+   * nothing.
+   */
+  readonly methods: readonly HttpMethodName[];
+
+  /**
+   * The parameters the URL captured: a string per dynamic segment, an array per
+   * catch-all, percent-decoded.
+   */
+  readonly params: Readonly<Record<string, string | readonly string[]>>;
+
+  /** The route module's file: project-relative, POSIX separators. */
+  readonly file: string;
+
+  /**
+   * Where to open the route, **with `resolvedBy: 'route-map'` preserved**.
+   *
+   * Forwarded from `RouteEntry.location` exactly as produced. The route map is
+   * the resolver here, and stamping this as a code-graph location would
+   * misreport how it was found.
+   */
+  readonly location: SourceLocation;
+
+  /**
+   * The `api-route` node of the graph for this module, when the graph has one.
+   *
+   * Absent when the routes were supplied by a caller that indexed more of the
+   * project than this graph holds, or when the module produced no node. Its
+   * `location` is the `'code-graph'` view of the same module, which is why both
+   * are available: they were found by different mechanisms and are worth
+   * different amounts.
+   */
+  readonly node?: CodeMatch;
+}
+
+/** One HTTP method of a route, and where its handler is declared. */
+export interface HandlerRef {
+  /** The method this entry describes. `'ANY'` for a single dispatching handler. */
+  readonly method: HttpMethodName;
+
+  /**
+   * The name of the handling declaration, when the graph knows it.
+   *
+   * The method name itself for an App Router module (whose handlers are
+   * exported under those names) and the declared name of the default export for
+   * a legacy Pages handler. Absent when the graph holds no declaration for the
+   * route file, in which case {@link HandlerRef.location} is the route map's.
+   */
+  readonly symbol?: string;
+
+  /**
+   * Where the handler is.
+   *
+   * `resolvedBy: 'code-graph'` when a declaration node was found, and the route
+   * map's own location — `resolvedBy: 'route-map'`, forwarded unchanged —
+   * otherwise. The distinction is deliberate and is asserted by this folder's
+   * tests.
+   */
+  readonly location: SourceLocation;
+}
+
+/** One component that renders another, and the element that renders it. */
+export interface ComponentRef {
+  /** The rendering component: the *parent*. See {@link CodeQueries.componentsRendering}. */
+  readonly component: CodeMatch;
+
+  /**
+   * Where the element is, with `resolvedBy: 'code-graph'`.
+   *
+   * The position of the JSX element in the parent when the render edge recorded
+   * one — the line to open to see why the child renders — falling back to the
+   * parent's own declaration.
+   */
+  readonly location: SourceLocation;
+}
+
+/**
+ * One hop of a {@link CodePath}.
+ *
+ * `from` and `to` are the **edge's own** endpoints — the direction the
+ * relationship is written in — which for a hop taken by an undirected search
+ * (`direction: 'both'`) is the reverse of the direction the path travels. The
+ * traversal order is {@link CodePath.nodes}; this records what the relationship
+ * actually says.
+ */
+export interface CodePathEdge {
+  /** The relationship this hop followed. */
+  readonly kind: CodeEdgeKind;
+
+  /** The `nodeId` the relationship starts at. */
+  readonly from: string;
+
+  /** The `nodeId` the relationship points to. */
+  readonly to: string;
+
+  /**
+   * Where the relationship is written, when the edge recorded a site.
+   *
+   * Absent for a derived edge — one computed from two nodes rather than read
+   * off a line of source — and `resolvedBy: 'code-graph'` when present.
+   */
+  readonly location?: SourceLocation;
+}
+
+/**
+ * A traversal from one node to another: the flow the investigation stage
+ * renders.
+ */
+export interface CodePath {
+  /**
+   * The nodes in traversal order, from the `from` endpoint to the `to`
+   * endpoint, each with its `'code-graph'` location.
+   *
+   * At least one entry: a path from a node to itself is that node alone, with
+   * no edges and depth `0`.
+   */
+  readonly nodes: readonly CodeMatch[];
+
+  /**
+   * The hops between them, so `edges[i]` joins `nodes[i]` to `nodes[i + 1]`.
+   *
+   * Exactly one shorter than {@link CodePath.nodes}.
+   */
+  readonly edges: readonly CodePathEdge[];
+
+  /** The number of hops: `edges.length`, and never more than `maxPathDepth`. */
+  readonly depth: number;
+
+  /**
+   * Whether a bound stopped the search before its frontier was exhausted.
+   *
+   * Never a statement about the path itself: a returned path is always complete
+   * and always the shortest one, so this is a fact about the *search*.
+   *
+   * It is consequently `false` on every path the current bounds can return.
+   * Breadth-first order dequeues every shallower node before a node at the
+   * depth limit, and the node budget stops the search outright, so a search a
+   * bound did bite answers `undefined` — "not reachable within these bounds" —
+   * rather than with a path. The field is part of the shape because the shape
+   * is what a prompt and a panel read, and because a bound that applies
+   * per-branch rather than per-search (an edge fan-out cap, say) would surface
+   * here instead of in a new field.
+   */
+  readonly truncated: boolean;
+}
+
+/**
+ * A bounded window of source text.
+ *
+ * This is the *"bounded excerpts"* tool of AAP 0.4.2: how the model is shown
+ * code without being handed a repository. Its contents may therefore reach a
+ * model prompt, which is why the window is clamped here and why `.env*` files
+ * can never be its subject (see {@link CodeQueries.excerpt}). Redacting what
+ * survives that — a credential a developer wrote into a source file — is
+ * `packages/model-provider/src/redact-guard.ts`'s responsibility, on the way
+ * out.
+ */
+export interface CodeExcerpt {
+  /** The file the text came from: project-relative, POSIX separators. */
+  readonly file: string;
+
+  /** The **1-based** line the excerpt starts on. */
+  readonly startLine: number;
+
+  /** The **1-based** line the excerpt ends on, always at least `startLine`. */
+  readonly endLine: number;
+
+  /**
+   * The text of those lines, joined with `'\n'`.
+   *
+   * Never the whole file: a request whose window exceeds the excerpt budget is
+   * clamped to it, and `\r\n` line endings are normalised so the line count and
+   * the text agree.
+   */
+  readonly text: string;
+
+  /**
+   * Whether the requested window was clipped — by the line budget, by the
+   * character budget, or by both.
+   *
+   * `false` when the caller got exactly the lines it asked for. A window that
+   * simply ran past the end of the file is not truncation: the file ended.
+   */
+  readonly truncated: boolean;
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * Argument shapes
+ * ---------------------------------------------------------------------------------------------- */
+
+/*
+ * Every optional member below spells `| undefined` explicitly. The repository
+ * compiles with `exactOptionalPropertyTypes`, and these are the arguments a
+ * stage forwards straight out of a decoded model query — a value it holds as
+ * `number | undefined` has to pass through without the call site branching on
+ * it first.
+ */
+
+/** How to narrow {@link CodeQueries.findByName}. */
+export interface FindByNameOptions {
+  /**
+   * Keep only nodes of these kinds.
+   *
+   * Omitted means every kind, which is the right default for a model that knows
+   * the name it is looking for but not what kind of thing bears it. An empty
+   * array is treated as "no kind is acceptable" and yields no results, because
+   * that is what it says.
+   */
+  readonly kinds?: readonly CodeNodeKind[] | undefined;
+
+  /**
+   * Require an exact, case-sensitive name match.
+   *
+   * `true` takes the constant-time path through the graph's name index and
+   * scans nothing, which is what a caller resolving a name it read out of
+   * another result wants. Anything else admits the case-insensitive, prefix and
+   * substring tiers.
+   */
+  readonly exact?: boolean | undefined;
+
+  /**
+   * Return at most this many matches, clamped to
+   * {@link CodeQueryLimits.maxResults}.
+   */
+  readonly limit?: number | undefined;
+}
+
+/**
+ * A symbol to find the callers of, qualified by the file that declares it.
+ *
+ * The qualified form of {@link CodeQueries.whoCalls}'s argument: a bare string
+ * matches the symbol wherever it is declared, which is ambiguous in a project
+ * where two modules export the same name.
+ */
+export interface WhoCallsTarget {
+  /**
+   * The declaring file: project-relative, POSIX separators.
+   *
+   * Omitted means "wherever it is declared", making the target equivalent to
+   * the bare string form.
+   */
+  readonly file?: string | undefined;
+
+  /** The declared symbol name. */
+  readonly symbol: string;
+}
+
+/** How to run {@link CodeQueries.whoCalls}. */
+export interface WhoCallsOptions {
+  /** Return at most this many call sites, clamped to {@link CodeQueryLimits.maxCallers}. */
+  readonly limit?: number | undefined;
+
+  /**
+   * Consult the injected reference resolver even when the graph already
+   * answered.
+   *
+   * Off by default, and deliberately so: the resolver runs ts-morph's
+   * `findReferences`, which type-checks the program and is orders of magnitude
+   * more expensive than reading the edges an extractor already recorded. It is
+   * consulted anyway — without this flag — when the static answer is empty,
+   * since a symbol with no recorded callers is exactly the case where the
+   * expensive answer is worth having. With no resolver injected the flag has no
+   * effect.
+   */
+  readonly useReferences?: boolean | undefined;
+}
+
+/** How to narrow {@link CodeQueries.handlersFor}. */
+export interface HandlersForOptions {
+  /**
+   * Keep only this method.
+   *
+   * A route that serves `'ANY'` — a single dispatching handler — is reported
+   * for any requested method, because it does answer it.
+   */
+  readonly method?: HttpMethodName | undefined;
+}
+
+/** How to bound {@link CodeQueries.componentsRendering}. */
+export interface ComponentsRenderingOptions {
+  /** Return at most this many rendering sites, clamped to {@link CodeQueryLimits.maxResults}. */
+  readonly limit?: number | undefined;
+}
+
+/**
+ * A description of the node a {@link CodeQueries.pathBetween} endpoint means.
+ *
+ * Every member is optional and all given members must match, so a selector is
+ * as precise as the caller can be: `{ file, symbol }` names one declaration,
+ * `{ name }` names it wherever it is, and `{ kind: 'db-call' }` names *any*
+ * database call site — which is how "does this route reach the database at all"
+ * is asked. A selector matching nothing makes the search fail with `undefined`
+ * rather than an error.
+ */
+export interface CodeNodeSelector {
+  /** The declaring file: project-relative, POSIX separators. */
+  readonly file?: string | undefined;
+
+  /** The declared symbol name, matched against a node's `symbol` or its `name`. */
+  readonly symbol?: string | undefined;
+
+  /** The node's name as written in the source. */
+  readonly name?: string | undefined;
+
+  /** The node's kind. */
+  readonly kind?: CodeNodeKind | undefined;
+}
+
+/**
+ * A {@link CodeQueries.pathBetween} endpoint: a `nodeId` from an earlier result,
+ * or a description of the node to look for.
+ */
+export type CodePathEndpoint = string | CodeNodeSelector;
+
+/** How to run {@link CodeQueries.pathBetween}. */
+export interface PathBetweenOptions {
+  /**
+   * Follow only these edge kinds.
+   *
+   * Omitted means **all** of them, which is the documented default and not an
+   * oversight: a route node may reach a service function directly through a
+   * `calls` edge or through a `declares` hop to the exported method symbol that
+   * calls it, and a path that survives either shape has to be allowed to mix
+   * them. Narrowing is for a caller asking a more specific question, such as a
+   * pure call chain.
+   */
+  readonly edgeKinds?: readonly CodeEdgeKind[] | undefined;
+
+  /**
+   * Which way to traverse: `'out'` downstream (the default) or `'both'` for an
+   * undirected search.
+   *
+   * `'out'` answers "what does this reach", which is the direction a flow is
+   * read in. `'both'` answers "are these two things related at all" and is
+   * markedly more expensive, since every node's incoming edges join the
+   * frontier as well.
+   */
+  readonly direction?: CodePathDirection | undefined;
+
+  /** Allow at most this many hops, clamped to {@link CodeQueryLimits.maxPathDepth}. */
+  readonly maxDepth?: number | undefined;
+
+  /** Expand at most this many nodes, clamped to {@link CodeQueryLimits.maxPathNodes}. */
+  readonly maxNodes?: number | undefined;
+}
+
+/** The traversal directions {@link CodeQueries.pathBetween} supports. */
+export type CodePathDirection = 'out' | 'both';
+
+/**
+ * A region of a file to excerpt.
+ *
+ * The alternative to a `nodeId`, for a caller that has a location — from a
+ * telemetry event, from a plan action — rather than a node.
+ */
+export interface CodeExcerptRegion {
+  /** The file: project-relative, POSIX separators. */
+  readonly file: string;
+
+  /** The **1-based** line to centre the window on. */
+  readonly line: number;
+
+  /**
+   * The **1-based** last line of interest.
+   *
+   * When given, the window ends there rather than `contextLines` past `line` —
+   * so a caller holding a function's extent gets the function, clamped to the
+   * excerpt budget.
+   */
+  readonly endLine?: number | undefined;
+}
+
+/** A {@link CodeQueries.excerpt} target: a `nodeId`, or an explicit region. */
+export type CodeExcerptTarget = string | CodeExcerptRegion;
+
+/** How to bound {@link CodeQueries.excerpt}. */
+export interface ExcerptOptions {
+  /**
+   * How many lines of context to include before the anchor, and after it when
+   * no `endLine` was given.
+   *
+   * Defaults to three. Clamped so the window can never exceed
+   * {@link CodeQueryLimits.maxExcerptLines}.
+   */
+  readonly contextLines?: number | undefined;
+
+  /** Return at most this many characters, clamped to {@link CodeQueryLimits.maxExcerptChars}. */
+  readonly maxChars?: number | undefined;
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * The query surface
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * The read-only queries the code-investigation stage may run, as an interface
+ * so `apps/local-service/src/pipeline/tools/code-tools.ts` depends on the
+ * contract rather than on this implementation.
+ *
+ * Every method is total: an argument that is malformed, over-long or matches
+ * nothing yields an empty list or `undefined`, never an exception. The
+ * arguments come from a model, and a stage that crashes on a bad query has
+ * turned a recoverable answer into a failed session.
+ */
+export interface CodeQueries {
+  /**
+   * The limits actually in force, after the caller's overrides were clamped.
+   *
+   * Exposed so the stage that describes these tools to a model can state the
+   * real bounds instead of restating {@link CODE_QUERY_LIMITS} and drifting
+   * from it.
+   */
+  readonly limits: CodeQueryLimits;
+
+  /**
+   * Finds the nodes a name could refer to, best match first.
+   *
+   * The entry point of an investigation: the model has a name from the
+   * developer's question — a component, a function, a route — and needs the
+   * declarations it might mean.
+   *
+   * Ranking is exact, then case-insensitive exact, then prefix, then substring,
+   * reported as {@link CodeMatch.score}; within a tier, nodes are ordered by
+   * `id`, so the answer is identical on every run. The exact tier is a
+   * constant-time index read; the other tiers scan the graph's nodes in
+   * canonical order and stop at the limit, so a name matching more of a large
+   * project than the budget allows yields the first `limit` candidates that
+   * scan found, ranked among themselves.
+   *
+   * Bound: {@link CodeQueryLimits.maxResults}, lowerable per call. An empty
+   * name, a name longer than {@link CodeQueryLimits.maxNameLength} and an empty
+   * `kinds` array all yield `[]`.
+   *
+   * @param name The name to look for.
+   * @param options Kind filter, exactness and limit.
+   * @returns The matches, best first, capped.
+   *
+   * @example
+   * ```ts
+   * queries.findByName('WidgetList', { kinds: ['component'] });
+   * ```
+   */
+  findByName(name: string, options?: FindByNameOptions): readonly CodeMatch[];
+
+  /**
+   * Resolves one `(file, symbol)` pair to the declaration the graph holds for
+   * it.
+   *
+   * The existence lookup the rest of the product asks before it acts on a name:
+   * `packages/instrumentation/src/feasibility.ts` rejects a plan action whose
+   * file or symbol is absent from the graph, and the patcher needs the
+   * `exported` and `isAsync` facts this returns before it can wrap the
+   * function.
+   *
+   * `file` is normalised to a POSIX project-relative path and rejected if it is
+   * not one, so an absolute path, a traversal or a backslash path answers
+   * `undefined` rather than matching by accident. Among several nodes in the
+   * file bearing the symbol, the most specific wins: `server-function`, then
+   * `component`, then `handler`, then `symbol`, then anything else; ties break
+   * on position and then `id`.
+   *
+   * Bound: constant work per file, one index read and a scan of that file's
+   * nodes.
+   *
+   * @param file The declaring file: project-relative, POSIX separators.
+   * @param symbol The declared symbol name.
+   * @returns The declaration, or `undefined` when the file holds no such
+   * symbol.
+   */
+  findSymbol(file: string, symbol: string): CodeSymbolMatch | undefined;
+
+  /**
+   * Whether the graph holds `symbol` in `file`.
+   *
+   * Exactly `findSymbol(file, symbol) !== undefined`, as a predicate for the
+   * many call sites that need the answer and not the facts.
+   *
+   * @param file The declaring file: project-relative, POSIX separators.
+   * @param symbol The declared symbol name.
+   * @returns `true` when the declaration exists.
+   */
+  hasSymbol(file: string, symbol: string): boolean;
+
+  /**
+   * Finds the places a symbol is called or referenced from.
+   *
+   * **Static first, and by default static only.** The answer is read from the
+   * `calls` and `references` edges an extractor already recorded, which is a
+   * map lookup per target node. The injected reference resolver — ts-morph's
+   * `findReferences`, which type-checks the program — is consulted only when
+   * {@link WhoCallsOptions.useReferences} is set or the static answer is empty,
+   * and only when one was injected at all. That laziness is the contract:
+   * `../indexer.ts` deliberately never runs `findReferences` while building,
+   * and this is the query that decides when it runs instead.
+   *
+   * Each result records which mechanism found it, in
+   * {@link CallerRef.via}, and points at the **call site** rather than at the
+   * caller's declaration wherever the edge recorded one. Results are
+   * de-duplicated by position and ordered by file, then line, then column, then
+   * caller `id`.
+   *
+   * Bound: {@link CodeQueryLimits.maxCallers}, lowerable per call. When the
+   * answer is capped the result holds exactly that many entries and the drop is
+   * logged at `debug`; a caller that needs to know whether more exist asks for
+   * one more than it can use.
+   *
+   * @param target A symbol name, or a `{ file, symbol }` pair to disambiguate
+   * it.
+   * @param options Limit and reference-resolver opt-in.
+   * @returns The call sites, ordered and capped.
+   */
+  whoCalls(target: string | WhoCallsTarget, options?: WhoCallsOptions): readonly CallerRef[];
+
+  /**
+   * Resolves a URL to the route module that answers it.
+   *
+   * Matching is delegated entirely to `../route-map.ts`, which owns route
+   * groups, dynamic and catch-all segments, specificity ordering, decoding and
+   * the rule for a path both routers claim. This query bounds the input at
+   * {@link CodeQueryLimits.maxUrlLength}, hands the raw value over — an
+   * absolute URL, a bare pathname, a query string, a fragment and a trailing
+   * slash are all handled there — and enriches the match with the graph's own
+   * `api-route` node.
+   *
+   * {@link RouteQueryResult.location} keeps `resolvedBy: 'route-map'`.
+   *
+   * Bound: one pass over the route list, which is derived from this graph once
+   * and reused.
+   *
+   * @param url An absolute URL or a bare pathname.
+   * @returns The route, or `undefined` when nothing answers the URL or the
+   * input is unusable.
+   *
+   * @example
+   * ```ts
+   * queries.routeForUrl('http://localhost:3000/api/items?page=2')?.routePath;
+   * ```
+   */
+  routeForUrl(url: string): RouteQueryResult | undefined;
+
+  /**
+   * Lists the handlers of the route that answers a URL, one per HTTP method.
+   *
+   * A route exporting `GET` and `POST` yields two entries with **distinct
+   * locations** — the declaration of each handler, not the top of the module —
+   * which is what makes the result usable as a plan target. A legacy Pages API
+   * module yields one entry for `'ANY'`, pointing at its default export.
+   *
+   * Each entry's location is the declaration's own `'code-graph'` location when
+   * the graph holds a node for it, and the route map's `'route-map'` location
+   * forwarded unchanged when it does not.
+   *
+   * Bound: one {@link CodeQueries.routeForUrl} resolution plus a scan of the
+   * route file's nodes, capped at {@link CodeQueryLimits.maxResults}.
+   *
+   * @param url An absolute URL or a bare pathname.
+   * @param options Method filter.
+   * @returns One entry per matching method, in the route's method order, or
+   * `[]` when no route answers.
+   */
+  handlersFor(url: string, options?: HandlersForOptions): readonly HandlerRef[];
+
+  /**
+   * Finds the components that render the named component.
+   *
+   * **The direction is upward**: given `'WidgetList'`, the answer is the
+   * components whose markup contains a `WidgetList` element — its parents — and
+   * never the components `WidgetList` itself renders. That is the direction an
+   * excessive-render investigation needs, because the cause of a child
+   * re-rendering is a decision its parent made.
+   *
+   * Each result points at the JSX element in the parent when the render edge
+   * recorded its position, falling back to the parent's declaration. Results
+   * are de-duplicated by position and ordered by file, then line, then column,
+   * then `id`. When no `component` node bears the name, component nodes whose
+   * display name matches are tried, which catches a component declared through
+   * a wrapper such as a memo helper.
+   *
+   * Bound: {@link CodeQueryLimits.maxResults}, lowerable per call.
+   *
+   * @param component The rendered component's name.
+   * @param options Limit.
+   * @returns The rendering components and their element sites.
+   */
+  componentsRendering(
+    component: string,
+    options?: ComponentsRenderingOptions,
+  ): readonly ComponentRef[];
+
+  /**
+   * Finds the shortest chain of relationships from one node to another.
+   *
+   * This is what the investigation stage renders as a flow — an interaction, the
+   * handler it triggers, the request it makes, the route that answers it, the
+   * service function behind it, the query that function issues — and it is a
+   * breadth-first search over **all** edge kinds by default, for the reason
+   * {@link PathBetweenOptions.edgeKinds} records.
+   *
+   * Deterministic: endpoint candidates are seeded in `id` order and each
+   * frontier node's edges are expanded in the graph's canonical edge-`id` order,
+   * so the first complete path found is the same path on every run and in every
+   * process, including for two graphs built independently from the same source.
+   * Cycles are excluded by a visited set, and a node reached twice keeps its
+   * first, shortest predecessor.
+   *
+   * Bounds: {@link CodeQueryLimits.maxPathDepth} hops and
+   * {@link CodeQueryLimits.maxPathNodes} expansions, both lowerable per call.
+   * Unreachable within those bounds is `undefined`; reachable but with a bound
+   * hit during the search sets {@link CodePath.truncated}.
+   *
+   * @param from The endpoint to start at.
+   * @param to The endpoint to reach.
+   * @param options Edge-kind filter, direction and bounds.
+   * @returns The path, or `undefined` when either endpoint resolves to nothing
+   * or no path exists within the bounds.
+   */
+  pathBetween(
+    from: CodePathEndpoint,
+    to: CodePathEndpoint,
+    options?: PathBetweenOptions,
+  ): CodePath | undefined;
+
+  /**
+   * Reads a bounded window of source text around a node or a location.
+   *
+   * The only query that returns code, and therefore the one the "no repository
+   * dump" rule is really about: the window is clamped to
+   * {@link CodeQueryLimits.maxExcerptLines} lines and
+   * {@link CodeQueryLimits.maxExcerptChars} characters, on a line boundary, and
+   * a request for an unbounded region is clamped rather than honoured.
+   *
+   * Text is read **only** through the {@link LoadedProject} handed to
+   * {@link createCodeQueries} — the ts-morph project `../project.ts` opened,
+   * which has already excluded `node_modules`, build output and every `.env*`
+   * file. There is no filesystem access here and no path arithmetic against a
+   * project root. Two independent guards run before the project is touched at
+   * all: a path that `isEnvFilePath` recognises is refused, and so is one that
+   * is not a safe project-relative POSIX path. Without a loaded project the
+   * query returns `undefined` rather than failing, so a session that never
+   * opened one degrades to "no excerpts" instead of a broken stage.
+   *
+   * Cost: one lookup of the source file in the loaded project and one split of
+   * its text. Prompt cost is the budget above.
+   *
+   * The returned text may reach a model prompt. Redaction of what it contains
+   * is applied on the way out, by
+   * `packages/model-provider/src/redact-guard.ts`; the contract of *this*
+   * helper is that the window is bounded and is never an environment file.
+   *
+   * @param target A `nodeId` from an earlier result, or an explicit region.
+   * @param options Context lines and character budget.
+   * @returns The excerpt, or `undefined` when there is no loaded project, the
+   * target cannot be resolved, or the path is refused.
+   */
+  excerpt(target: CodeExcerptTarget, options?: ExcerptOptions): CodeExcerpt | undefined;
+}
+
+/** What {@link createCodeQueries} may be given besides the graph. */
+export interface CodeQueryOptions {
+  /**
+   * The loaded project the excerpt helper reads text through.
+   *
+   * Optional: every other query answers from the graph alone, and a caller that
+   * only has a cached index — reconstructed with `CodeGraph.fromIndex` and no
+   * project open — gets every query but {@link CodeQueries.excerpt}, which
+   * returns `undefined`.
+   */
+  readonly loaded?: LoadedProject | undefined;
+
+  /**
+   * The project's routes, when the caller already built them.
+   *
+   * Omitted, they are derived from this graph's `api-route` nodes on the first
+   * route query and reused thereafter. The derivation is lazy because it
+   * materialises an index envelope, and most investigations never ask a route
+   * question. Passing a map built by `buildRouteMap` from a loaded project is
+   * strictly better where one exists: it carries the per-method handler
+   * locations that a map rebuilt from an index cannot know.
+   */
+  readonly routes?: readonly RouteEntry[] | undefined;
+
+  /**
+   * The reference resolver {@link CodeQueries.whoCalls} may deepen with.
+   *
+   * Optional, and consulted only as {@link WhoCallsOptions.useReferences}
+   * describes. Injected rather than imported so this module does not depend on
+   * `../indexer.ts`, and so a caller can decide whether a session is allowed to
+   * spend a type-checking pass at all.
+   */
+  readonly references?: ReferenceResolver | undefined;
+
+  /**
+   * Lower ceilings than {@link CODE_QUERY_LIMITS}.
+   *
+   * Shallow-merged over the defaults and clamped member by member, so a value
+   * above a default is the default: a caller may tighten the prompt budget,
+   * never widen it.
+   */
+  readonly limits?: Partial<CodeQueryLimits> | undefined;
+
+  /**
+   * Where to report what was refused and what was capped.
+   *
+   * Defaults to `noopLogger`. Names, paths, route paths and counts are logged;
+   * **source text never is**, because an excerpt is prompt material and a log
+   * line is not the place to copy it.
+   */
+  readonly logger?: Logger | undefined;
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * Shared empties and ordering
+ * ---------------------------------------------------------------------------------------------- */
+
+/*
+ * One frozen empty array per result type, returned by every miss. Sharing the
+ * instance keeps a miss allocation-free — these queries are run in a loop by a
+ * stage resolving a batch of model-proposed lookups — and freezing states that
+ * a caller must not treat a result as scratch space.
+ */
+const EMPTY_NODES: readonly CodeNode[] = Object.freeze([]);
+const EMPTY_MATCHES: readonly CodeMatch[] = Object.freeze([]);
+const EMPTY_CALLERS: readonly CallerRef[] = Object.freeze([]);
+const EMPTY_HANDLERS: readonly HandlerRef[] = Object.freeze([]);
+const EMPTY_COMPONENTS: readonly ComponentRef[] = Object.freeze([]);
+
+/**
+ * Every line terminator TypeScript itself counts as one, so a split on this
+ * produces the same line numbers the compiler — and therefore every node in the
+ * graph — reports.
+ */
+const LINE_BREAK = /\r\n|\n|\r/;
+
+/**
+ * Which declaration wins when several nodes in one file bear the same symbol
+ * name, most specific first.
+ *
+ * A function that a route delegates to is described by a `server-function`
+ * node, a component by a `component` node and an event handler by a `handler`
+ * node; the `symbol` node for the same declaration is the generic fallback, and
+ * anything else — an `api-call` or `db-call` node that merely records the
+ * symbol it sits *inside* — is last. The order is what makes
+ * {@link CodeQueries.findSymbol} answer with the node an instrumentation plan
+ * can act on rather than with an arbitrary one.
+ */
+const SYMBOL_KIND_PREFERENCE: readonly CodeNodeKind[] = Object.freeze([
+  'server-function',
+  'component',
+  'handler',
+  'symbol',
+]);
+
+/**
+ * Byte-wise lexicographic comparison, never `localeCompare`.
+ *
+ * The reason `./graph.ts` gives for its own comparator applies verbatim: a
+ * locale-aware comparison depends on the machine's collation settings, so two
+ * developers running the same query over the same graph would get results in
+ * different orders — and one of them would be looking at a different "first
+ * candidate" than the other.
+ *
+ * @param left The first string.
+ * @param right The second string.
+ * @returns A negative number, zero, or a positive number.
+ */
+function compareStrings(left: string, right: string): number {
+  if (left < right) {
+    return -1;
+  }
+
+  return left > right ? 1 : 0;
+}
+
+/**
+ * Orders two positions in the same or different files: file, then line, then
+ * column.
+ *
+ * @param left The first location.
+ * @param right The second location.
+ * @returns The comparison, or `0` when the two are the same position.
+ */
+function compareLocations(left: SourceLocation, right: SourceLocation): number {
+  const byFile = compareStrings(left.file, right.file);
+  if (byFile !== 0) {
+    return byFile;
+  }
+
+  if (left.line !== right.line) {
+    return left.line - right.line;
+  }
+
+  return left.column - right.column;
+}
+
+/**
+ * The de-duplication key of a position.
+ *
+ * `NUL`-separated because it cannot occur in a path that
+ * `isSafeRelativePath` accepts, so no pair of distinct positions can collide
+ * on it.
+ *
+ * @param location The position.
+ * @returns A key unique to `(file, line, column)`.
+ */
+function locationKey(location: SourceLocation): string {
+  return `${location.file}\u0000${location.line}\u0000${location.column}`;
+}
+
+/**
+ * Where a kind sits in {@link SYMBOL_KIND_PREFERENCE}.
+ *
+ * @param kind The node kind.
+ * @returns Its rank, or one past the end for a kind the table does not list.
+ */
+function symbolKindRank(kind: CodeNodeKind): number {
+  const rank = SYMBOL_KIND_PREFERENCE.indexOf(kind);
+  return rank === -1 ? SYMBOL_KIND_PREFERENCE.length : rank;
+}
+
+/**
+ * Orders the nodes of one file that bear the same symbol name: most specific
+ * kind, then earliest position, then `id`.
+ *
+ * @param left The first node.
+ * @param right The second node.
+ * @returns The comparison.
+ */
+function compareSymbolCandidates(left: CodeNode, right: CodeNode): number {
+  const byKind = symbolKindRank(left.kind) - symbolKindRank(right.kind);
+  if (byKind !== 0) {
+    return byKind;
+  }
+
+  if (left.line !== right.line) {
+    return left.line - right.line;
+  }
+
+  if (left.column !== right.column) {
+    return left.column - right.column;
+  }
+
+  return compareStrings(left.id, right.id);
+}
+
+/**
+ * Orders ranked name matches: best score first, then `nodeId`.
+ *
+ * @param left The first match.
+ * @param right The second match.
+ * @returns The comparison.
+ */
+function compareMatches(left: CodeMatch, right: CodeMatch): number {
+  const byScore = (right.score ?? 0) - (left.score ?? 0);
+  if (byScore !== 0) {
+    return byScore;
+  }
+
+  return compareStrings(left.nodeId, right.nodeId);
+}
+
+/**
+ * Orders call sites: position, then the calling node's `id`.
+ *
+ * @param left The first call site.
+ * @param right The second call site.
+ * @returns The comparison.
+ */
+function compareCallerRefs(left: CallerRef, right: CallerRef): number {
+  const byLocation = compareLocations(left.location, right.location);
+  if (byLocation !== 0) {
+    return byLocation;
+  }
+
+  return compareStrings(left.caller.nodeId, right.caller.nodeId);
+}
+
+/**
+ * Orders rendering sites: position, then the rendering component's `id`.
+ *
+ * @param left The first site.
+ * @param right The second site.
+ * @returns The comparison.
+ */
+function compareComponentRefs(left: ComponentRef, right: ComponentRef): number {
+  const byLocation = compareLocations(left.location, right.location);
+  if (byLocation !== 0) {
+    return byLocation;
+  }
+
+  return compareStrings(left.component.nodeId, right.component.nodeId);
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * Clamping and path safety
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * Brings a caller-supplied cap into a usable range.
+ *
+ * Clamped, never rejected, and identically for every numeric cap: a value that
+ * is not a finite number becomes the ceiling, a fractional value is floored,
+ * anything below `1` becomes `1`, and anything above the ceiling becomes the
+ * ceiling. A caller can therefore only ever ask for *less* than
+ * {@link CODE_QUERY_LIMITS} allows.
+ *
+ * Clamping rather than failing is the right response to a budget hint from a
+ * caller that is itself assembling a prompt: the useful answer to "give me ten
+ * thousand callers" is fifty callers, not a lost investigation.
+ *
+ * @param value The caller's value, or `undefined` to take the default.
+ * @param ceiling The ceiling for this cap, which is also its default.
+ * @returns An integer in `[1, ceiling]`.
+ */
+function clampCap(value: number | undefined, ceiling: number): number {
+  if (value === undefined || !Number.isFinite(value)) {
+    return ceiling;
+  }
+
+  const floored = Math.floor(value);
+  if (floored < 1) {
+    return 1;
+  }
+
+  return floored > ceiling ? ceiling : floored;
+}
+
+/**
+ * Brings a context-line count into range.
+ *
+ * Distinct from {@link clampCap} in exactly one way that matters: `0` is a
+ * legitimate request — "the anchor line and nothing around it" — so the floor
+ * is zero rather than one, and an absent value takes
+ * {@link DEFAULT_EXCERPT_CONTEXT_LINES} rather than the ceiling, because an
+ * excerpt defaults to a little context and not to the largest window allowed.
+ *
+ * @param value The caller's value, or `undefined` for the default.
+ * @param ceiling The line ceiling in force.
+ * @returns An integer in `[0, ceiling]`.
+ */
+function clampContextLines(value: number | undefined, ceiling: number): number {
+  if (value === undefined || !Number.isFinite(value)) {
+    return DEFAULT_EXCERPT_CONTEXT_LINES;
+  }
+
+  const floored = Math.floor(value);
+  if (floored < 0) {
+    return 0;
+  }
+
+  return floored > ceiling ? ceiling : floored;
+}
+
+/**
+ * Brings a line or column number into the 1-based integer range the
+ * `SourceLocation` schema requires.
+ *
+ * A node built by a well-behaved extractor is already in range; this exists so
+ * that a graph reconstructed from a stale or hand-edited cache can never make
+ * this module emit a location its own schema would reject.
+ *
+ * @param value The candidate position.
+ * @returns A positive integer, defaulting to `1`.
+ */
+function clampPosition(value: number): number {
+  return Number.isFinite(value) && value >= 1 ? Math.floor(value) : 1;
+}
+
+/**
+ * Normalises a path and vouches for it as a project-relative POSIX path.
+ *
+ * The gate every file this module reports or reads passes through. It is the
+ * same check the `SourceLocation` schema applies, applied *before* a location is
+ * minted, so a malformed path becomes a dropped result rather than an invalid
+ * object that fails validation three processes later.
+ *
+ * **Normalisation is lexical only, never a repair.** Redundant `.` and `..`
+ * segments are resolved because two spellings of one project-relative path are
+ * the same path, but a separator is not converted: a backslash path is refused
+ * rather than rewritten, exactly as the shared schema refuses it. That is the
+ * fail-closed direction for a value arriving from a model or from another
+ * process — a path this module cannot vouch for character-for-character is one
+ * it must not pass on, and quietly reinterpreting the separators of an
+ * unfamiliar path is how a lookup silently resolves to the wrong file.
+ *
+ * @param file A path from a caller or from a graph node.
+ * @returns The normalised project-relative POSIX path, or `undefined` when the
+ * value is absolute, escapes the project, or carries a backslash or a control
+ * character.
+ */
+function safeRelative(file: string): string | undefined {
+  if (file.length === 0) {
+    return undefined;
+  }
+
+  const normalized = normalizePosix(file);
+  return isSafeRelativePath(normalized) ? normalized : undefined;
+}
+
+/**
+ * Mints a `'code-graph'` location.
+ *
+ * The single place this module stamps `resolvedBy` and `confidence` for a
+ * location of its own, and the reason the invariant cannot drift: the
+ * confidence is read from {@link DEFAULT_RESOLUTION_CONFIDENCE} rather than
+ * written as a number, positions are clamped into the schema's range, and an
+ * `endLine` that would sit before its `line` is lifted to it.
+ *
+ * @param file The file: project-relative POSIX, already vouched for.
+ * @param line The 1-based line.
+ * @param column The 1-based column.
+ * @param symbol The enclosing or declared symbol name, when known.
+ * @param endLine The last line of the declaration, when known.
+ * @returns The location.
+ */
+function codeGraphLocation(
+  file: string,
+  line: number,
+  column: number,
+  symbol: string | undefined,
+  endLine: number | undefined,
+): SourceLocation {
+  const safeLine = clampPosition(line);
+  const safeColumn = clampPosition(column);
+  const safeEndLine =
+    endLine === undefined ? undefined : Math.max(clampPosition(endLine), safeLine);
+
+  return Object.freeze({
+    file,
+    line: safeLine,
+    column: safeColumn,
+    ...(symbol !== undefined && symbol.length > 0 ? { symbol } : {}),
+    ...(safeEndLine !== undefined && safeEndLine > safeLine ? { endLine: safeEndLine } : {}),
+    resolvedBy: 'code-graph' as const,
+    confidence: DEFAULT_RESOLUTION_CONFIDENCE['code-graph'],
+  });
+}
+
+/**
+ * The `'code-graph'` location of a node's declaration.
+ *
+ * The helper the plan asks for, with one deliberate widening of its signature:
+ * it returns `undefined` for a node whose file is not a safe project-relative
+ * path, which is the *skip* signal every caller here honours. Minting a
+ * location for such a node would produce an object the shared schema rejects,
+ * and the call path from a panel click to an editor is not the place to discover
+ * that.
+ *
+ * The node's `symbol` is preferred over its `name` for the location's `symbol`,
+ * because that is the field that keeps a call site attributable: an `api-call`
+ * node is *named* for what it calls and carries the function it sits inside.
+ *
+ * @param node The node.
+ * @returns Its location, or `undefined` when the node must be skipped.
+ */
+function locationOf(node: CodeNode): SourceLocation | undefined {
+  const file = safeRelative(node.file);
+  if (file === undefined) {
+    return undefined;
+  }
+
+  return codeGraphLocation(file, node.line, node.column, node.symbol ?? node.name, node.endLine);
+}
+
+/**
+ * The `'code-graph'` location of an edge's site — the line that writes the
+ * relationship.
+ *
+ * The position a developer actually wants for a call or a rendered element: the
+ * call expression, not the top of the function containing it. A derived edge
+ * carries no site and yields `undefined`, which every caller answers by falling
+ * back to the node's own declaration.
+ *
+ * @param edge The edge.
+ * @param within The node the site belongs to, for the symbol name.
+ * @returns The site's location, or `undefined` when the edge has no usable
+ * site.
+ */
+function edgeLocation(edge: CodeEdge, within: CodeNode): SourceLocation | undefined {
+  if (edge.file === undefined || edge.line === undefined) {
+    return undefined;
+  }
+
+  const file = safeRelative(edge.file);
+  if (file === undefined) {
+    return undefined;
+  }
+
+  return codeGraphLocation(
+    file,
+    edge.line,
+    edge.column ?? 1,
+    within.symbol ?? within.name,
+    undefined,
+  );
+}
+
+/**
+ * Whether a node declares the given symbol name.
+ *
+ * Both fields are checked because a declaration is found under its `name` while
+ * a call site records the function it sits inside under `symbol`, and a caller
+ * asking about a symbol means either.
+ *
+ * @param node The node.
+ * @param symbol The symbol name.
+ * @returns `true` when the node bears the name.
+ */
+function nodeBearsSymbol(node: CodeNode, symbol: string): boolean {
+  return node.name === symbol || node.symbol === symbol;
+}
+
+/**
+ * Whether a declaration is exported from its file.
+ *
+ * The base field when the extractor filled it, the per-kind payload when it
+ * did, and `false` otherwise — never `undefined`, because a consumer deciding
+ * whether another module can reach this symbol needs an answer and "not known
+ * to be exported" is the safe one.
+ *
+ * @param node The node.
+ * @returns `true` when the declaration is exported.
+ */
+function exportedOf(node: CodeNode): boolean {
+  if (node.exported !== undefined) {
+    return node.exported;
+  }
+
+  switch (node.kind) {
+    case 'server-function':
+      return node.data.exported;
+    case 'component':
+      return node.data.isDefaultExport;
+    case 'symbol':
+      return node.data?.isDefaultExport ?? false;
+    default:
+      return false;
+  }
+}
+
+/**
+ * Whether a function is declared `async`, when the graph records it.
+ *
+ * Only a `server-function` node carries the fact, so every other kind answers
+ * `undefined` — absent rather than `false`, which would assert something the
+ * graph never said.
+ *
+ * @param node The node.
+ * @returns `true` or `false` for a server function, `undefined` otherwise.
+ */
+function asyncOf(node: CodeNode): boolean | undefined {
+  return node.kind === 'server-function' ? node.data.isAsync : undefined;
+}
+
+/**
+ * Whether a node is the default export of its file, as far as the graph knows.
+ *
+ * Used to find the single dispatching handler of a legacy Pages API module,
+ * whose method is reported as `'ANY'` because one function answers all of them.
+ *
+ * @param node The node.
+ * @returns `true` when the node is a default export.
+ */
+function isDefaultExport(node: CodeNode): boolean {
+  switch (node.kind) {
+    case 'symbol':
+      return node.data?.isDefaultExport ?? false;
+    case 'component':
+      return node.data.isDefaultExport;
+    default:
+      return false;
+  }
+}
+
+/**
+ * The tier a non-exact name match falls into, or `undefined` when the name does
+ * not match at all.
+ *
+ * Case-insensitive throughout: the argument comes from a model reading a
+ * developer's question, where the capitalisation of an identifier is the least
+ * reliable part of it.
+ *
+ * @param candidate The node's name.
+ * @param needle The lower-cased query name.
+ * @returns The score for the tier, or `undefined`.
+ */
+function looseMatchScore(candidate: string, needle: string): number | undefined {
+  const lowered = candidate.toLowerCase();
+
+  if (lowered === needle) {
+    return MATCH_SCORES.caseInsensitive;
+  }
+
+  if (lowered.startsWith(needle)) {
+    return MATCH_SCORES.prefix;
+  }
+
+  return lowered.includes(needle) ? MATCH_SCORES.substring : undefined;
+}
+
+/**
+ * The node kinds that can stand for a route's handler declaration.
+ *
+ * A route handler is described by a `server-function` node when the extractor
+ * recognised it as one, by a `symbol` node otherwise, and by a `handler` node in
+ * the unusual case of a module that registers one. A `component` is deliberately
+ * absent: a page module's default export is a component, and reporting it as the
+ * handler of the page's `GET` would conflate rendering with answering.
+ */
+const HANDLER_NODE_KINDS: readonly CodeNodeKind[] = Object.freeze([
+  'server-function',
+  'symbol',
+  'handler',
+]);
+
+/** One entry of the breadth-first frontier of {@link CodeQueries.pathBetween}. */
+interface FrontierStep {
+  /** The node to expand. */
+  readonly node: CodeNode;
+
+  /** How many hops from the nearest `from` endpoint it sits. */
+  readonly depth: number;
+}
+
+/** How a node was first reached, so a completed search can be walked back. */
+interface PathLink {
+  /** The edge that reached it. */
+  readonly edge: CodeEdge;
+
+  /** The `nodeId` the edge was traversed from, which is not always `edge.from`. */
+  readonly from: string;
+}
+
+/**
+ * Merges caller overrides onto {@link CODE_QUERY_LIMITS}, clamping each member
+ * to its default as a ceiling.
+ *
+ * Shallow and exhaustive: every member is named, so adding a limit to
+ * {@link CodeQueryLimits} stops this function compiling until it is handled
+ * rather than silently defaulting to `undefined`.
+ *
+ * @param overrides The caller's partial limits, if any.
+ * @returns The effective limits, frozen.
+ */
+function resolveLimits(overrides: Partial<CodeQueryLimits> | undefined): CodeQueryLimits {
+  if (overrides === undefined) {
+    return CODE_QUERY_LIMITS;
+  }
+
+  return Object.freeze({
+    maxResults: clampCap(overrides.maxResults, CODE_QUERY_LIMITS.maxResults),
+    maxCallers: clampCap(overrides.maxCallers, CODE_QUERY_LIMITS.maxCallers),
+    maxPathDepth: clampCap(overrides.maxPathDepth, CODE_QUERY_LIMITS.maxPathDepth),
+    maxPathNodes: clampCap(overrides.maxPathNodes, CODE_QUERY_LIMITS.maxPathNodes),
+    maxExcerptLines: clampCap(overrides.maxExcerptLines, CODE_QUERY_LIMITS.maxExcerptLines),
+    maxExcerptChars: clampCap(overrides.maxExcerptChars, CODE_QUERY_LIMITS.maxExcerptChars),
+    maxNameLength: clampCap(overrides.maxNameLength, CODE_QUERY_LIMITS.maxNameLength),
+    maxUrlLength: clampCap(overrides.maxUrlLength, CODE_QUERY_LIMITS.maxUrlLength),
+  });
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * Factory
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * Builds the query surface over one code graph.
+ *
+ * The returned object holds no state of the caller's data and writes nothing
+ * anywhere: the graph, the loaded project and the reference resolver are inputs
+ * it reads, and the single piece of internal state is the route list, derived
+ * from the graph on the first route query and reused thereafter (see
+ * {@link CodeQueryOptions.routes}). Two surfaces built over the same graph
+ * therefore answer identically, and one can be discarded at any time.
+ *
+ * @param graph The indexed graph to answer from.
+ * @param options The loaded project, prebuilt routes, reference resolver,
+ * tightened limits and logger — every one optional.
+ * @returns The query surface, frozen.
+ *
+ * @example
+ * ```ts
+ * const queries = createCodeQueries(graph, {
+ *   loaded,
+ *   references: createReferenceResolver(loaded),
+ *   limits: { maxResults: 10 },
+ *   logger,
+ * });
+ * ```
+ */
+export function createCodeQueries(graph: CodeGraph, options?: CodeQueryOptions): CodeQueries {
+  const logger = options?.logger ?? noopLogger;
+  const loaded = options?.loaded;
+  const references = options?.references;
+  const limits = resolveLimits(options?.limits);
+
+  /*
+   * The one mutable binding in this module, and the only state the plan permits:
+   * the route list, either handed in by the caller or derived once from the
+   * graph. The derivation materialises an index envelope, and most
+   * investigations never ask a route question, so it is deferred rather than
+   * paid for up front.
+   */
+  let routes: readonly RouteEntry[] | undefined = options?.routes;
+
+  const routeEntries = (): readonly RouteEntry[] => {
+    if (routes === undefined) {
+      const derived = routeMapFromIndex(graph.toIndex()).entries;
+      routes = derived;
+      logger.debug('derived the route map from the code graph', { routes: derived.length });
+    }
+
+    return routes;
+  };
+
+  /** Whether a name, symbol or file argument is within the length bound. */
+  const usableName = (value: string): boolean =>
+    value.length > 0 && value.length <= limits.maxNameLength;
+
+  /** A node as a {@link CodeMatch}, or `undefined` when the node must be skipped. */
+  const toMatch = (node: CodeNode, score?: number): CodeMatch | undefined => {
+    const location = locationOf(node);
+    if (location === undefined) {
+      logger.debug('dropped a node whose file is not a safe project-relative path', {
+        nodeId: node.id,
+        file: node.file,
+      });
+      return undefined;
+    }
+
+    return Object.freeze({
+      nodeId: node.id,
+      kind: node.kind,
+      name: node.name,
+      file: location.file,
+      location,
+      ...(score !== undefined ? { score } : {}),
+    });
+  };
+
+  /** The nodes of one file that bear a symbol name, most specific first. */
+  const symbolCandidates = (file: string, symbol: string): readonly CodeNode[] => {
+    const normalized = safeRelative(file);
+    if (normalized === undefined) {
+      logger.debug('rejected a file argument that is not a safe project-relative path', { file });
+      return EMPTY_NODES;
+    }
+
+    const matched = graph.nodesByFile(normalized).filter((node) => nodeBearsSymbol(node, symbol));
+    return matched.length === 0 ? EMPTY_NODES : matched.sort(compareSymbolCandidates);
+  };
+
+  const findByName = (name: string, queryOptions?: FindByNameOptions): readonly CodeMatch[] => {
+    if (!usableName(name)) {
+      logger.debug('rejected a name argument outside the length bound', {
+        length: name.length,
+        maxNameLength: limits.maxNameLength,
+      });
+      return EMPTY_MATCHES;
+    }
+
+    const kinds = queryOptions?.kinds;
+    if (kinds !== undefined && kinds.length === 0) {
+      return EMPTY_MATCHES;
+    }
+
+    const limit = clampCap(queryOptions?.limit, limits.maxResults);
+    const acceptable = (node: CodeNode): boolean =>
+      kinds === undefined || kinds.includes(node.kind);
+    const collected = new Map<string, CodeMatch>();
+
+    // The exact tier is a single index read; it is also the only tier a caller
+    // asking for `exact` gets.
+    for (const node of graph.nodesByName(name)) {
+      if (collected.size >= limit) {
+        break;
+      }
+      if (!acceptable(node)) {
+        continue;
+      }
+      const match = toMatch(node, MATCH_SCORES.exact);
+      if (match !== undefined) {
+        collected.set(node.id, match);
+      }
+    }
+
+    if (queryOptions?.exact !== true) {
+      const needle = name.toLowerCase();
+      for (const node of graph.nodes()) {
+        if (collected.size >= limit) {
+          break;
+        }
+        if (collected.has(node.id) || !acceptable(node)) {
+          continue;
+        }
+        const score = looseMatchScore(node.name, needle);
+        if (score === undefined) {
+          continue;
+        }
+        const match = toMatch(node, score);
+        if (match !== undefined) {
+          collected.set(node.id, match);
+        }
+      }
+    }
+
+    if (collected.size === 0) {
+      return EMPTY_MATCHES;
+    }
+
+    return Object.freeze([...collected.values()].sort(compareMatches));
+  };
+
+  const findSymbol = (file: string, symbol: string): CodeSymbolMatch | undefined => {
+    if (!usableName(file) || !usableName(symbol)) {
+      return undefined;
+    }
+
+    for (const node of symbolCandidates(file, symbol)) {
+      const location = locationOf(node);
+      if (location === undefined) {
+        logger.debug('dropped a node whose file is not a safe project-relative path', {
+          nodeId: node.id,
+          file: node.file,
+        });
+        continue;
+      }
+
+      const isAsync = asyncOf(node);
+      return Object.freeze({
+        nodeId: node.id,
+        kind: node.kind,
+        name: node.name,
+        file: location.file,
+        location,
+        symbol,
+        exported: exportedOf(node),
+        ...(isAsync !== undefined ? { isAsync } : {}),
+      });
+    }
+
+    return undefined;
+  };
+
+  const hasSymbol = (file: string, symbol: string): boolean =>
+    findSymbol(file, symbol) !== undefined;
+
+  /** The declaration nodes a {@link CodeQueries.whoCalls} target names. */
+  const callTargets = (target: string | WhoCallsTarget): readonly CodeNode[] => {
+    const symbol = typeof target === 'string' ? target : target.symbol;
+    if (!usableName(symbol)) {
+      return EMPTY_NODES;
+    }
+
+    const file = typeof target === 'string' ? undefined : target.file;
+    if (file === undefined) {
+      return graph.nodesByName(symbol);
+    }
+
+    return usableName(file) ? symbolCandidates(file, symbol) : EMPTY_NODES;
+  };
+
+  /**
+   * The innermost declaration containing a line, for attributing a reference to
+   * a caller.
+   *
+   * Nearest declaration at or above the line whose extent, where the extractor
+   * recorded one, still covers it; ties on the line prefer the more specific
+   * kind, then the first node in canonical `id` order. The file node is the last
+   * resort, so a reference in a module the extractors produced no declaration
+   * for is still attributable to that module.
+   */
+  const enclosingNodeAt = (file: string, line: number): CodeNode | undefined => {
+    const nodes = graph.nodesByFile(file);
+    let best: CodeNode | undefined;
+
+    for (const node of nodes) {
+      if (node.kind === 'file' || node.line > line) {
+        continue;
+      }
+      if (node.endLine !== undefined && node.endLine < line) {
+        continue;
+      }
+      if (best === undefined || node.line > best.line) {
+        best = node;
+        continue;
+      }
+      if (node.line === best.line && symbolKindRank(node.kind) < symbolKindRank(best.kind)) {
+        best = node;
+      }
+    }
+
+    return best ?? nodes.find((node) => node.kind === 'file');
+  };
+
+  /**
+   * Adds the resolver's answers to a caller set already built from edges.
+   *
+   * The expensive half of {@link CodeQueries.whoCalls}: one `findReferences`
+   * pass per distinct `(file, symbol)` target. Each answer is re-minted as a
+   * `'code-graph'` location anchored to the declaration that contains it, so
+   * every location this module returns reports the mechanism that found it
+   * uniformly, and a resolver that throws degrades to the static answer instead
+   * of failing the stage.
+   */
+  const collectReferenceCallers = (
+    targets: readonly CodeNode[],
+    resolver: ReferenceResolver,
+    collected: Map<string, CallerRef>,
+  ): void => {
+    const asked = new Set<string>();
+
+    for (const target of targets) {
+      const file = safeRelative(target.file);
+      if (file === undefined) {
+        continue;
+      }
+
+      const symbol = target.symbol ?? target.name;
+      const askedKey = `${file}\u0000${symbol}`;
+      if (asked.has(askedKey)) {
+        continue;
+      }
+      asked.add(askedKey);
+
+      let found: readonly SourceLocation[];
+      try {
+        found = resolver.referencesTo({ file, symbol });
+      } catch (error) {
+        logger.debug('reference resolution failed; keeping the static answer', {
+          file,
+          symbol,
+          reason: error instanceof Error ? error.message : 'unknown error',
+        });
+        continue;
+      }
+
+      for (const reference of found) {
+        const referenceFile = safeRelative(reference.file);
+        if (referenceFile === undefined) {
+          continue;
+        }
+        // The declaration is not one of its own callers.
+        if (referenceFile === file && reference.line === target.line) {
+          continue;
+        }
+
+        const enclosing = enclosingNodeAt(referenceFile, reference.line);
+        if (enclosing === undefined) {
+          continue;
+        }
+
+        const location = codeGraphLocation(
+          referenceFile,
+          reference.line,
+          reference.column,
+          enclosing.symbol ?? enclosing.name,
+          undefined,
+        );
+        const key = locationKey(location);
+        if (collected.has(key)) {
+          continue;
+        }
+
+        const match = toMatch(enclosing);
+        if (match === undefined) {
+          continue;
+        }
+        collected.set(key, Object.freeze({ caller: match, via: 'references' as const, location }));
+      }
+    }
+  };
+
+  const whoCalls = (
+    target: string | WhoCallsTarget,
+    queryOptions?: WhoCallsOptions,
+  ): readonly CallerRef[] => {
+    const resolved = callTargets(target);
+    if (resolved.length === 0) {
+      return EMPTY_CALLERS;
+    }
+
+    const limit = clampCap(queryOptions?.limit, limits.maxCallers);
+    const collected = new Map<string, CallerRef>();
+
+    for (const node of resolved) {
+      const incoming = [
+        ...graph.incoming(node.id, 'calls'),
+        ...graph.incoming(node.id, 'references'),
+      ];
+      for (const edge of incoming) {
+        const caller = graph.nodeById(edge.from);
+        if (caller === undefined) {
+          continue;
+        }
+        const match = toMatch(caller);
+        if (match === undefined) {
+          continue;
+        }
+        const location = edgeLocation(edge, caller) ?? match.location;
+        const key = locationKey(location);
+        if (collected.has(key)) {
+          continue;
+        }
+        collected.set(key, Object.freeze({ caller: match, via: 'edge' as const, location }));
+      }
+    }
+
+    if (
+      references !== undefined &&
+      (queryOptions?.useReferences === true || collected.size === 0)
+    ) {
+      collectReferenceCallers(resolved, references, collected);
+    }
+
+    if (collected.size === 0) {
+      return EMPTY_CALLERS;
+    }
+
+    const ordered = [...collected.values()].sort(compareCallerRefs);
+    if (ordered.length <= limit) {
+      return Object.freeze(ordered);
+    }
+
+    logger.debug('whoCalls result was capped', { found: ordered.length, limit });
+    return Object.freeze(ordered.slice(0, limit));
+  };
+
+  const routeForUrl = (url: string): RouteQueryResult | undefined => {
+    if (url.length === 0 || url.length > limits.maxUrlLength) {
+      logger.debug('rejected a url argument outside the length bound', {
+        length: url.length,
+        maxUrlLength: limits.maxUrlLength,
+      });
+      return undefined;
+    }
+
+    // Matching, decoding and specificity all belong to ../route-map.ts; this
+    // query contributes the bound above and the graph node below, and nothing
+    // in between.
+    const match = matchRoute(routeEntries(), url);
+    if (match === undefined) {
+      return undefined;
+    }
+
+    const entry = match.entry;
+    const routeNode = graph.nodesByFile(entry.file).find((node) => node.kind === 'api-route');
+    const node = routeNode === undefined ? undefined : toMatch(routeNode);
+
+    return Object.freeze({
+      match,
+      routePath: entry.routePath,
+      router: entry.router,
+      kind: entry.kind,
+      methods: entry.methods,
+      params: match.params,
+      file: entry.file,
+      // Forwarded exactly as ../route-map.ts produced it, `resolvedBy:
+      // 'route-map'` included: that module is the resolver here.
+      location: entry.location,
+      ...(node !== undefined ? { node } : {}),
+    });
+  };
+
+  /** The declaration node standing for one method of a route, when the graph has one. */
+  const handlerNodeFor = (
+    file: string,
+    method: HttpMethodName,
+    declaredName: string | undefined,
+  ): CodeNode | undefined => {
+    const candidates = graph
+      .nodesByFile(file)
+      .filter((node) => HANDLER_NODE_KINDS.includes(node.kind));
+
+    // An App Router module exports one function per method under the method's
+    // own name; a legacy Pages module has a single default export, whose
+    // declared name the route map recorded on the location it resolved.
+    const wanted = method === 'ANY' ? declaredName : method;
+    if (wanted !== undefined) {
+      const named = candidates.filter((node) => node.name === wanted).sort(compareSymbolCandidates);
+      const first = named[0];
+      if (first !== undefined) {
+        return first;
+      }
+    }
+
+    if (method !== 'ANY') {
+      return undefined;
+    }
+
+    return candidates.filter(isDefaultExport).sort(compareSymbolCandidates)[0];
+  };
+
+  const handlersFor = (url: string, queryOptions?: HandlersForOptions): readonly HandlerRef[] => {
+    const route = routeForUrl(url);
+    if (route === undefined) {
+      return EMPTY_HANDLERS;
+    }
+
+    const wanted = queryOptions?.method;
+    const handlers: HandlerRef[] = [];
+
+    for (const method of route.methods) {
+      if (handlers.length >= limits.maxResults) {
+        logger.debug('handlersFor result was capped', {
+          routePath: route.routePath,
+          limit: limits.maxResults,
+        });
+        break;
+      }
+      // A single dispatching handler answers every method, so it survives any
+      // method filter.
+      if (wanted !== undefined && method !== wanted && method !== 'ANY') {
+        continue;
+      }
+
+      const routeMapLocation = route.match.entry.methodLocations?.[method] ?? route.location;
+      const node = handlerNodeFor(route.file, method, routeMapLocation.symbol);
+      const declaration = node === undefined ? undefined : locationOf(node);
+
+      handlers.push(
+        Object.freeze({
+          method,
+          ...(node !== undefined && declaration !== undefined ? { symbol: node.name } : {}),
+          location: declaration ?? routeMapLocation,
+        }),
+      );
+    }
+
+    return handlers.length === 0 ? EMPTY_HANDLERS : Object.freeze(handlers);
+  };
+
+  /** The `component` nodes a name refers to, by name and then by display name. */
+  const componentNodesNamed = (component: string): readonly CodeNode[] => {
+    const named = graph.nodesByName(component).filter((node) => node.kind === 'component');
+    if (named.length > 0) {
+      return named;
+    }
+
+    return graph.nodesByKind('component').filter((node) => node.data.displayName === component);
+  };
+
+  const componentsRendering = (
+    component: string,
+    queryOptions?: ComponentsRenderingOptions,
+  ): readonly ComponentRef[] => {
+    if (!usableName(component)) {
+      return EMPTY_COMPONENTS;
+    }
+
+    const limit = clampCap(queryOptions?.limit, limits.maxResults);
+    const collected = new Map<string, ComponentRef>();
+
+    for (const target of componentNodesNamed(component)) {
+      if (collected.size >= limit) {
+        break;
+      }
+
+      // Incoming `renders` edges: the components that render this one. The
+      // outgoing direction would answer the opposite question.
+      for (const edge of graph.incoming(target.id, 'renders')) {
+        if (collected.size >= limit) {
+          break;
+        }
+        const parent = graph.nodeById(edge.from);
+        if (parent === undefined) {
+          continue;
+        }
+        const match = toMatch(parent);
+        if (match === undefined) {
+          continue;
+        }
+        const location = edgeLocation(edge, parent) ?? match.location;
+        const key = `${match.nodeId}\u0000${locationKey(location)}`;
+        if (collected.has(key)) {
+          continue;
+        }
+        collected.set(key, Object.freeze({ component: match, location }));
+      }
+    }
+
+    if (collected.size === 0) {
+      return EMPTY_COMPONENTS;
+    }
+
+    return Object.freeze([...collected.values()].sort(compareComponentRefs));
+  };
+
+  /** The nodes a {@link CodePathEndpoint} names, in canonical `id` order. */
+  const resolveEndpoint = (endpoint: CodePathEndpoint): readonly CodeNode[] => {
+    if (typeof endpoint === 'string') {
+      const byId = graph.nodeById(endpoint);
+      return byId === undefined ? EMPTY_NODES : Object.freeze([byId]);
+    }
+
+    const { file, name, symbol, kind } = endpoint;
+    if (file === undefined && name === undefined && symbol === undefined && kind === undefined) {
+      return EMPTY_NODES;
+    }
+
+    let candidates: readonly CodeNode[];
+    if (file !== undefined) {
+      const normalized = safeRelative(file);
+      if (normalized === undefined || !usableName(file)) {
+        logger.debug('rejected an endpoint file that is not a safe project-relative path', {
+          file,
+        });
+        return EMPTY_NODES;
+      }
+      candidates = graph.nodesByFile(normalized);
+    } else if (name !== undefined) {
+      candidates = usableName(name) ? graph.nodesByName(name) : EMPTY_NODES;
+    } else if (kind !== undefined) {
+      candidates = graph.nodesByKind(kind);
+    } else {
+      candidates = graph.nodes();
+    }
+
+    const matched = candidates.filter(
+      (node) =>
+        (name === undefined || node.name === name) &&
+        (symbol === undefined || nodeBearsSymbol(node, symbol)) &&
+        (kind === undefined || node.kind === kind),
+    );
+
+    if (matched.length <= limits.maxResults) {
+      return matched;
+    }
+
+    logger.debug('endpoint selector matched more nodes than the limit', {
+      matched: matched.length,
+      limit: limits.maxResults,
+    });
+    return matched.slice(0, limits.maxResults);
+  };
+
+  /**
+   * The edges to expand from one node, in the graph's canonical edge-`id` order.
+   *
+   * The canonical order is what makes the search's outcome reproducible: the
+   * frontier is extended in the same sequence on every run, so the first
+   * complete path found is always the same path.
+   */
+  const expansionEdges = (
+    nodeId: string,
+    direction: CodePathDirection,
+    edgeKinds: readonly CodeEdgeKind[] | undefined,
+  ): readonly CodeEdge[] => {
+    const outgoing = graph.outgoing(nodeId);
+    const candidates =
+      direction === 'both' ? [...outgoing, ...graph.incoming(nodeId)] : [...outgoing];
+    const filtered =
+      edgeKinds === undefined
+        ? candidates
+        : candidates.filter((edge) => edgeKinds.includes(edge.kind));
+
+    return filtered.sort((left, right) => compareStrings(left.id, right.id));
+  };
+
+  /** A resolved node and edge sequence as a {@link CodePath}. */
+  const buildPath = (
+    nodes: readonly CodeNode[],
+    edges: readonly CodeEdge[],
+    truncated: boolean,
+  ): CodePath | undefined => {
+    const matches: CodeMatch[] = [];
+    for (const node of nodes) {
+      const match = toMatch(node);
+      if (match === undefined) {
+        // A path with a hole in it would misrepresent the flow, so the whole
+        // answer is withheld rather than partially reported.
+        return undefined;
+      }
+      matches.push(match);
+    }
+
+    const hops: CodePathEdge[] = [];
+    for (const edge of edges) {
+      const site = graph.nodeById(edge.from);
+      const location = site === undefined ? undefined : edgeLocation(edge, site);
+      hops.push(
+        Object.freeze({
+          kind: edge.kind,
+          from: edge.from,
+          to: edge.to,
+          ...(location !== undefined ? { location } : {}),
+        }),
+      );
+    }
+
+    return Object.freeze({
+      nodes: Object.freeze(matches),
+      edges: Object.freeze(hops),
+      depth: hops.length,
+      truncated,
+    });
+  };
+
+  /** Walks the predecessor map back from a reached target to its source. */
+  const reconstructPath = (
+    target: CodeNode,
+    links: ReadonlyMap<string, PathLink>,
+    maxDepth: number,
+    truncated: boolean,
+  ): CodePath | undefined => {
+    const nodes: CodeNode[] = [target];
+    const edges: CodeEdge[] = [];
+    let current = target.id;
+
+    for (let hop = 0; hop < maxDepth; hop += 1) {
+      const link = links.get(current);
+      if (link === undefined) {
+        break;
+      }
+      const previous = graph.nodeById(link.from);
+      if (previous === undefined) {
+        return undefined;
+      }
+      nodes.push(previous);
+      edges.push(link.edge);
+      current = link.from;
+    }
+
+    nodes.reverse();
+    edges.reverse();
+    return buildPath(nodes, edges, truncated);
+  };
+
+  const pathBetween = (
+    from: CodePathEndpoint,
+    to: CodePathEndpoint,
+    queryOptions?: PathBetweenOptions,
+  ): CodePath | undefined => {
+    const edgeKinds = queryOptions?.edgeKinds;
+    if (edgeKinds !== undefined && edgeKinds.length === 0) {
+      return undefined;
+    }
+
+    const maxDepth = clampCap(queryOptions?.maxDepth, limits.maxPathDepth);
+    const maxNodes = clampCap(queryOptions?.maxNodes, limits.maxPathNodes);
+    const direction: CodePathDirection = queryOptions?.direction === 'both' ? 'both' : 'out';
+
+    const sources = resolveEndpoint(from);
+    const targets = resolveEndpoint(to);
+    if (sources.length === 0 || targets.length === 0) {
+      return undefined;
+    }
+
+    const targetIds = new Set<string>(targets.map((node) => node.id));
+    const links = new Map<string, PathLink>();
+    const visited = new Set<string>();
+    const frontier: FrontierStep[] = [];
+
+    for (const source of sources) {
+      if (targetIds.has(source.id)) {
+        // The endpoints name the same node: a path of one node and no hops.
+        return buildPath([source], [], false);
+      }
+      if (!visited.has(source.id)) {
+        visited.add(source.id);
+        frontier.push({ node: source, depth: 0 });
+      }
+    }
+
+    let expanded = 0;
+    let truncated = false;
+
+    for (let head = 0; head < frontier.length; head += 1) {
+      const step = frontier[head];
+      if (step === undefined) {
+        continue;
+      }
+      if (step.depth >= maxDepth) {
+        truncated = true;
+        continue;
+      }
+      if (expanded >= maxNodes) {
+        truncated = true;
+        break;
+      }
+      expanded += 1;
+
+      for (const edge of expansionEdges(step.node.id, direction, edgeKinds)) {
+        const nextId = edge.from === step.node.id ? edge.to : edge.from;
+        if (visited.has(nextId)) {
+          continue;
+        }
+        const next = graph.nodeById(nextId);
+        if (next === undefined) {
+          continue;
+        }
+        visited.add(nextId);
+        links.set(nextId, { edge, from: step.node.id });
+
+        if (targetIds.has(nextId)) {
+          return reconstructPath(next, links, maxDepth, truncated);
+        }
+        frontier.push({ node: next, depth: step.depth + 1 });
+      }
+    }
+
+    logger.debug('pathBetween found no path within the bounds', {
+      direction,
+      maxDepth,
+      maxNodes,
+      expanded,
+      sources: sources.length,
+      targets: targets.length,
+      truncated,
+    });
+    return undefined;
+  };
+
+  /** A {@link CodeExcerptTarget} as an explicit region, or `undefined`. */
+  const excerptRegion = (target: CodeExcerptTarget): CodeExcerptRegion | undefined => {
+    if (typeof target !== 'string') {
+      return usableName(target.file) ? target : undefined;
+    }
+
+    const node = graph.nodeById(target);
+    if (node === undefined) {
+      return undefined;
+    }
+
+    return {
+      file: node.file,
+      line: node.line,
+      ...(node.endLine !== undefined ? { endLine: node.endLine } : {}),
+    };
+  };
+
+  const excerpt = (
+    target: CodeExcerptTarget,
+    queryOptions?: ExcerptOptions,
+  ): CodeExcerpt | undefined => {
+    if (loaded === undefined) {
+      logger.debug('excerpt requested without a loaded project');
+      return undefined;
+    }
+
+    const region = excerptRegion(target);
+    if (region === undefined) {
+      return undefined;
+    }
+
+    const file = safeRelative(region.file);
+    if (file === undefined) {
+      logger.debug('excerpt refused a path that is not a safe project-relative path', {
+        file: region.file,
+      });
+      return undefined;
+    }
+
+    // The privacy control of AAP 0.5.2, applied here a second time and
+    // independently of ../project.ts's own exclusion: an environment file is
+    // never read, never excerpted and therefore never promptable.
+    if (isEnvFilePath(file)) {
+      logger.debug('excerpt refused an environment file', { file });
+      return undefined;
+    }
+
+    const sourceFile = loaded.project.getSourceFile(
+      (candidate) => loaded.projectRelative(toPosix(candidate.getFilePath())) === file,
+    );
+    if (sourceFile === undefined) {
+      logger.debug('excerpt found no such file in the loaded project', { file });
+      return undefined;
+    }
+
+    const lines = sourceFile.getFullText().split(LINE_BREAK);
+    const lastLine = Math.max(lines.length, 1);
+    // The leading context is capped one line below the line budget, not at it:
+    // the window is `[startLine, startLine + maxExcerptLines - 1]`, so leading
+    // context equal to the whole budget would push the budget's end above the
+    // anchor and return an excerpt that does not contain the line it was asked
+    // about.
+    const contextLines = clampContextLines(
+      queryOptions?.contextLines,
+      Math.max(limits.maxExcerptLines - 1, 0),
+    );
+    const maxChars = clampCap(queryOptions?.maxChars, limits.maxExcerptChars);
+
+    const anchor = Math.min(clampPosition(region.line), lastLine);
+    const startLine = Math.max(anchor - contextLines, 1);
+    const requestedEnd =
+      region.endLine === undefined
+        ? anchor + contextLines
+        : Math.max(clampPosition(region.endLine), anchor);
+    const withinFile = Math.min(requestedEnd, lastLine);
+    const withinBudget = Math.min(withinFile, startLine + limits.maxExcerptLines - 1);
+
+    // Clipping by the line budget is truncation; a window that simply ran past
+    // the end of the file is not — the file ended.
+    let truncated = withinBudget < withinFile;
+
+    const selected = lines.slice(startLine - 1, withinBudget);
+    const kept: string[] = [];
+    let used = 0;
+
+    for (const line of selected) {
+      const cost = kept.length === 0 ? line.length : line.length + 1;
+      if (used + cost > maxChars) {
+        if (kept.length === 0) {
+          // A single line longer than the whole budget is the one case where the
+          // cut cannot fall on a line boundary; an empty excerpt would be worse
+          // than a clipped one.
+          kept.push(line.slice(0, maxChars));
+        }
+        truncated = true;
+        break;
+      }
+      kept.push(line);
+      used += cost;
+    }
+
+    return Object.freeze({
+      file,
+      startLine,
+      endLine: startLine + Math.max(kept.length, 1) - 1,
+      text: kept.join('\n'),
+      truncated,
+    });
+  };
+
+  return Object.freeze({
+    limits,
+    findByName,
+    findSymbol,
+    hasSymbol,
+    whoCalls,
+    routeForUrl,
+    handlersFor,
+    componentsRendering,
+    pathBetween,
+    excerpt,
+  });
+}

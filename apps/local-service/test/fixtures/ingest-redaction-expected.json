@@ -1,0 +1,220 @@
+{
+  "description": "Expected result of the ingest redaction checkpoint for every event of ingest-redaction-input.json: the suite substitutes its own credential-shaped material for each {{SENTINEL}} token, redacts the batch through the service ingest path, and applies exactly one assertion per entry below; no substituted material, no session key and no request_key digest is recorded here, because every claim is either a fixed post-redaction form or an equality relation. The suite must read REDACTION_MARKER and REDACTION_MASK from packages/telemetry/src/redaction/rules.ts and MAX_PREVIEW_LENGTH from packages/telemetry/src/schema/attributes.ts and assert they equal the values in `markers`, so that a change to one of those constants fails loudly here instead of passing silently. A `sentinels[]` entry constrains the material the suite substitutes as well as its fate: `ruleId` names the deny-list rule of REDACTION_RULE_IDS that the material must match, and is null only where removal is positional and therefore holds for any material, while `expect` is the class the slot collapses to - `marker` (the value becomes REDACTION_MARKER), `mask` (the material becomes REDACTION_MASK inside a value whose shape survives) or `scrubbed` (the material is replaced in place while the surrounding text survives, so the exact form depends on the substitution). An `events[]` entry names one redacted event by id: `redactedMarker` is whether that event must carry a non-empty `redacted` attribute-path list, `attributes[].key` resolves against the event's attribute bag by exact key first and only then as a path of dot-separated keys and [index] elements, `expect` carries exactly one of `equals` (deep-equals this value), `marker`, `mask`, `unchanged` (deep-equals the input's value), `maxLength` (every string in the value is at most this many code points), `excludesSubstitutedSentinel` (the leak assertion: none of the credential material the suite substituted into this slot survives anywhere in the value) or `elementCount` (array length preserved and every element the marker), and `absentAttributes` names keys that must not exist on the redacted event at all.",
+  "markers": {
+    "redacted": "[redacted]",
+    "mask": "?",
+    "maxPreviewLength": 120
+  },
+  "sentinels": [
+    { "token": "{{QUERY_SECRET_VALUE}}", "ruleId": "url-query-value", "expect": "mask" },
+    { "token": "{{AUTHORIZATION_VALUE}}", "ruleId": "sensitive-header", "expect": "marker" },
+    { "token": "{{COOKIE_VALUE}}", "ruleId": "sensitive-header", "expect": "marker" },
+    { "token": "{{SET_COOKIE_VALUE_1}}", "ruleId": "sensitive-header", "expect": "marker" },
+    { "token": "{{SET_COOKIE_VALUE_2}}", "ruleId": "sensitive-header", "expect": "marker" },
+    { "token": "{{X_API_KEY_VALUE}}", "ruleId": "sensitive-header", "expect": "marker" },
+    { "token": "{{SQL_LITERAL_OBSERVER}}", "ruleId": null, "expect": "mask" },
+    { "token": "{{PROP_PREVIEW_SECRET}}", "ruleId": "provider-key", "expect": "scrubbed" },
+    { "token": "{{STATE_PREVIEW_JWT}}", "ruleId": "jwt", "expect": "scrubbed" },
+    { "token": "{{ENTROPY_VALUE}}", "ruleId": "entropy", "expect": "marker" },
+    { "token": "{{CONNECTION_STRING}}", "ruleId": "connection-string", "expect": "scrubbed" },
+    { "token": "{{PRIVATE_KEY_BLOCK}}", "ruleId": "private-key", "expect": "marker" }
+  ],
+  "events": [
+    {
+      "id": "evt_rx00000000000001",
+      "redactedMarker": false,
+      "attributes": [
+        { "key": "event.type", "expect": { "unchanged": true } },
+        { "key": "target.selector", "expect": { "unchanged": true } },
+        { "key": "target.tagName", "expect": { "unchanged": true } },
+        { "key": "target.text", "expect": { "unchanged": true } },
+        { "key": "componentChain", "expect": { "unchanged": true } },
+        { "key": "interactionId", "expect": { "unchanged": true } },
+        { "key": "inputDelay", "expect": { "unchanged": true } },
+        { "key": "processingStart", "expect": { "unchanged": true } },
+        { "key": "processingEnd", "expect": { "unchanged": true } }
+      ]
+    },
+    {
+      "id": "evt_rx00000000000002",
+      "redactedMarker": true,
+      "attributes": [
+        { "key": "url", "expect": { "equals": "/api/trail-report?trailId=?&apiKey=?" } },
+        { "key": "url", "expect": { "excludesSubstitutedSentinel": true } },
+        { "key": "http.request.header.authorization", "expect": { "marker": true } },
+        { "key": "http.request.header.cookie", "expect": { "marker": true } },
+        { "key": "http.request.header.accept", "expect": { "equals": "application/json" } },
+        { "key": "http.method", "expect": { "unchanged": true } },
+        { "key": "http.status_code", "expect": { "unchanged": true } },
+        { "key": "initiator", "expect": { "unchanged": true } },
+        { "key": "transferSize", "expect": { "unchanged": true } }
+      ]
+    },
+    {
+      "id": "evt_rx00000000000003",
+      "redactedMarker": true,
+      "attributes": [
+        { "key": "responseHeaders.set-cookie", "expect": { "elementCount": 2 } },
+        { "key": "responseHeaders.x-api-key", "expect": { "marker": true } },
+        { "key": "responseHeaders.content-type", "expect": { "equals": "application/json" } },
+        { "key": "responseHeaders", "expect": { "excludesSubstitutedSentinel": true } },
+        { "key": "url", "expect": { "unchanged": true } },
+        { "key": "http.method", "expect": { "unchanged": true } },
+        { "key": "http.status_code", "expect": { "unchanged": true } }
+      ]
+    },
+    {
+      "id": "evt_rx00000000000004",
+      "redactedMarker": true,
+      "attributes": [
+        { "key": "url", "expect": { "equals": "/api/trail-report?trailId=?" } },
+        { "key": "http.method", "expect": { "unchanged": true } },
+        { "key": "initiator", "expect": { "unchanged": true } },
+        { "key": "transferSize", "expect": { "unchanged": true } }
+      ]
+    },
+    {
+      "id": "evt_rx00000000000005",
+      "redactedMarker": true,
+      "attributes": [
+        { "key": "url", "expect": { "equals": "/api/trail-report?trailId=?" } },
+        { "key": "http.method", "expect": { "unchanged": true } },
+        { "key": "initiator", "expect": { "unchanged": true } },
+        { "key": "transferSize", "expect": { "unchanged": true } }
+      ]
+    },
+    {
+      "id": "evt_rx00000000000006",
+      "redactedMarker": true,
+      "attributes": [
+        { "key": "url", "expect": { "equals": "/api/trail-report?trailId=?" } },
+        { "key": "http.method", "expect": { "unchanged": true } },
+        { "key": "transferSize", "expect": { "unchanged": true } }
+      ]
+    },
+    {
+      "id": "evt_rx00000000000007",
+      "redactedMarker": true,
+      "attributes": [
+        {
+          "key": "db.statement",
+          "expect": {
+            "equals": "select trail_id, snow_depth_cm from trail_conditions where trail_id = ? and observer_email = ? and snow_depth_cm > ? limit ?"
+          }
+        },
+        { "key": "db.statement", "expect": { "excludesSubstitutedSentinel": true } },
+        { "key": "db.system", "expect": { "unchanged": true } },
+        { "key": "db.rowCount", "expect": { "unchanged": true } },
+        { "key": "db.operation", "expect": { "unchanged": true } },
+        { "key": "db.name", "expect": { "unchanged": true } },
+        { "key": "db.client", "expect": { "unchanged": true } }
+      ]
+    },
+    {
+      "id": "evt_rx00000000000008",
+      "redactedMarker": false,
+      "attributes": [
+        { "key": "db.statement", "expect": { "unchanged": true } },
+        {
+          "key": "db.statement",
+          "expect": {
+            "equals": "select trail_id, observed_at from trail_observations where trail_id = $1 and observed_at > $2 order by observed_at desc"
+          }
+        },
+        { "key": "db.system", "expect": { "unchanged": true } },
+        { "key": "db.rowCount", "expect": { "unchanged": true } },
+        { "key": "db.client", "expect": { "unchanged": true } }
+      ]
+    },
+    {
+      "id": "evt_rx00000000000009",
+      "redactedMarker": true,
+      "attributes": [
+        { "key": "changedProps[0].key", "expect": { "equals": "observerNote" } },
+        { "key": "changedProps[0].previous", "expect": { "unchanged": true } },
+        { "key": "changedProps[0].next.type", "expect": { "unchanged": true } },
+        {
+          "key": "changedProps[0].next.preview",
+          "expect": { "excludesSubstitutedSentinel": true }
+        },
+        { "key": "changedProps[0].next.preview", "expect": { "maxLength": 120 } },
+        { "key": "changedProps[1].key", "expect": { "equals": "trailSummary" } },
+        { "key": "changedProps[1].previous", "expect": { "unchanged": true } },
+        { "key": "changedProps[1].next.preview", "expect": { "maxLength": 120 } },
+        { "key": "component", "expect": { "unchanged": true } },
+        { "key": "phase", "expect": { "unchanged": true } },
+        { "key": "renderCount", "expect": { "unchanged": true } },
+        { "key": "trigger", "expect": { "unchanged": true } },
+        { "key": "actualDuration", "expect": { "unchanged": true } }
+      ]
+    },
+    {
+      "id": "evt_rx00000000000010",
+      "redactedMarker": true,
+      "attributes": [
+        { "key": "nextValue.preview", "expect": { "excludesSubstitutedSentinel": true } },
+        { "key": "nextValue.preview", "expect": { "maxLength": 120 } },
+        { "key": "nextValue.type", "expect": { "unchanged": true } },
+        { "key": "previousValue", "expect": { "unchanged": true } },
+        { "key": "previousValue.preview", "expect": { "equals": "anonymous" } },
+        { "key": "component", "expect": { "unchanged": true } },
+        { "key": "hookIndex", "expect": { "unchanged": true } },
+        { "key": "hookLabel", "expect": { "unchanged": true } },
+        { "key": "triggerEventId", "expect": { "unchanged": true } }
+      ]
+    },
+    {
+      "id": "evt_rx00000000000011",
+      "redactedMarker": true,
+      "attributes": [
+        { "key": "url", "expect": { "equals": "/api/trail-report?trailId=?&apiKey=?" } },
+        { "key": "url", "expect": { "excludesSubstitutedSentinel": true } },
+        { "key": "http.method", "expect": { "unchanged": true } },
+        { "key": "http.route", "expect": { "unchanged": true } },
+        { "key": "http.status_code", "expect": { "unchanged": true } },
+        { "key": "next.route", "expect": { "unchanged": true } },
+        { "key": "next.span_type", "expect": { "unchanged": true } }
+      ],
+      "absentAttributes": ["requestBody", "responseBody", "rows"]
+    },
+    {
+      "id": "evt_rx00000000000012",
+      "redactedMarker": true,
+      "attributes": [
+        { "key": "apiToken", "expect": { "marker": true } },
+        { "key": "signingKeyPem", "expect": { "marker": true } },
+        { "key": "databaseUrl", "expect": { "excludesSubstitutedSentinel": true } },
+        { "key": "log.level", "expect": { "unchanged": true } },
+        { "key": "log.message", "expect": { "unchanged": true } },
+        { "key": "logger.name", "expect": { "unchanged": true } }
+      ]
+    },
+    {
+      "id": "evt_rx00000000000013",
+      "redactedMarker": true,
+      "attributes": [
+        { "key": "url", "expect": { "equals": "/api/trail-conditions?window=?&token=?" } },
+        { "key": "url", "expect": { "excludesSubstitutedSentinel": true } },
+        { "key": "http.method", "expect": { "unchanged": true } },
+        { "key": "http.status_code", "expect": { "unchanged": true } },
+        { "key": "initiator", "expect": { "unchanged": true } }
+      ]
+    },
+    {
+      "id": "evt_rx00000000000014",
+      "redactedMarker": false,
+      "attributes": [
+        { "key": "attribution", "expect": { "unchanged": true } },
+        { "key": "blockingTime", "expect": { "unchanged": true } }
+      ]
+    }
+  ],
+  "requestKeyGroups": {
+    "note": "request_key is computed at ingest from the unredacted method and URL (packages/telemetry/src/redaction/request-key.ts canonicalises method + path + sorted decoded query pairs), which is why the byte-identical pair groups while the different-parameter control does not - even though all three are stored and displayed as /api/trail-report?trailId=?. Only these equality relations are recorded: the per-session key is random, so a literal digest would be meaningless.",
+    "mustGroup": [["evt_rx00000000000004", "evt_rx00000000000005"]],
+    "mustNotGroup": [
+      ["evt_rx00000000000004", "evt_rx00000000000006"],
+      ["evt_rx00000000000005", "evt_rx00000000000006"]
+    ]
+  }
+}

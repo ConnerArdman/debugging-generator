@@ -1,0 +1,1735 @@
+/**
+ * The source-map resolution route: a browser stack trace in, project-relative
+ * {@link SourceLocation} values out.
+ *
+ * This is one of the four routes that put a `SourceLocation` on a runtime item
+ * (AAP 0.4.2, "Source resolution path"), and the only one that starts from a
+ * *generated* position. The browser agent captures an `Error().stack` at the
+ * moment a `fetch` or an XHR is started
+ * (`packages/telemetry/src/browser/fetch.ts`); every frame in it points into a
+ * dev-server chunk, which is JavaScript nobody wrote. Mapping those frames back
+ * to the TypeScript the developer is looking at is what turns "this request came
+ * from somewhere in `page-3f2a.js`" into a chip that opens their editor on the
+ * right line.
+ *
+ * The other three routes — patch metadata, the code graph and the React owner
+ * chain — answer for items this one cannot, which is why **skipping is this
+ * module's contract**: see "Skip, never throw" below.
+ *
+ * ## Three coordinate systems meet here
+ *
+ * This is the single most error-prone fact in the file, so it is stated once
+ * here and again at each conversion site:
+ *
+ * | Producer | line | column |
+ * | --- | --- | --- |
+ * | a V8 stack frame ({@link StackFrame}) | 1-based | **1-based** |
+ * | `originalPositionFor`'s needle and result | 1-based | **0-based** |
+ * | {@link SourceLocation} (AAP 0.2.3) | 1-based | **1-based** |
+ *
+ * The two conversions therefore run in *opposite* directions and are written as
+ * two named, commented steps rather than as inline arithmetic:
+ * {@link toNeedleColumn} subtracts one going in, and the assembly in
+ * {@link resolveMappedFrame} adds one coming out. An off-by-one here is silent:
+ * `originalPositionFor` defaults to a greatest-lower-bound search, so a needle
+ * one column early does not fail — it cheerfully returns the *previous*
+ * segment, and the developer lands on the wrong token with full confidence.
+ *
+ * ## Skip, never throw
+ *
+ * Neither {@link resolveStackFrame} nor {@link resolveStack} ever rejects or
+ * throws. A frame that cannot be resolved — no map on the chunk, no mapping at
+ * that position, a source outside the project, a map that no longer matches the
+ * file on disk — yields `undefined` (or is simply absent from the returned
+ * array) and is explained once at `debug` level. That is not leniency: most
+ * frames of a real stack are unresolvable (bundler runtime, dependencies), and
+ * an exception raised here would take down the whole click-to-source feature
+ * instead of one frame of one chain.
+ *
+ * ## Two content branches, and what the content is for
+ *
+ * A map either carries its originals in `sourcesContent` or it does not, and
+ * both cases are supported: `sourceContentFor` first, then a read of the file
+ * from the project through {@link resolveWithinProject} and
+ * `readFileNoFollow`. The content is used for exactly two things, and nothing
+ * else:
+ *
+ * 1. **Sanity-validating the mapped position.** A map left over from an earlier
+ *    edit maps into a file that has since changed, and a location past the end
+ *    of a line or of the file is worse than no location at all — the editor
+ *    silently clamps it. When content is available and the position is out of
+ *    range, the frame is skipped.
+ * 2. **Deriving `symbol`** when the map's segment carries no `names` index, by
+ *    reading the identifier at (or immediately after) the resolved column.
+ *
+ * When no content can be read at all the map is taken as the authority, the
+ * position is emitted unvalidated, and the fact is logged at `debug`.
+ *
+ * ## Two decisions that would break silently if reversed
+ *
+ * - **No `mapUrl` argument.** `TraceMap` and `FlattenMap`/`AnyMap` both accept
+ *   an optional second argument that resolves each `sources` entry against the
+ *   map's own URL. It is deliberately **not** passed: `./normalize.ts` speaks
+ *   the bundler spellings (`webpack://_N_E/./src/x.ts`,
+ *   `turbopack:///[project]/src/x.ts`), and rewriting them into
+ *   `http://127.0.0.1:3000/...` URLs first would turn every source into an
+ *   unrecognised absolute URL, which normalisation then rejects. The resolved
+ *   sources this module reads therefore differ from the authored ones only by
+ *   the `./` collapsing `TraceMap` always performs.
+ * - **`AnyMap` for a sectioned document, `TraceMap` otherwise.** Turbopack
+ *   emits index maps, and in `@jridgewell/trace-mapping` 0.3.31 the plain
+ *   `TraceMap` constructor *throws* on one (it reads `sources` before it checks
+ *   for `sections`). The branch is taken on
+ *   {@link isSectionedSourceMap} — a statement about the document — never by
+ *   trying one constructor and catching the failure.
+ *
+ * ## The dev-server origin pin
+ *
+ * `fetchSourceMap` requires a pinned dev-server origin and refuses every lookup
+ * without a usable one, because loopback alone is not an authorisation on a
+ * developer's machine — this product's own service is one of the things
+ * listening there, and a stack string is untrusted input captured from the
+ * inspected page. This module forwards
+ * {@link ResolveStackOptions.devServerOrigin} verbatim and **resolves nothing
+ * when it is absent**. The field is optional in the type only so that a caller
+ * with no dev server (and therefore no maps to read) gets an empty result
+ * rather than a type error; in behaviour it is required, and the session's
+ * `devServerUrl` (AAP 0.2.3) is what to pass.
+ *
+ * ## Dependencies
+ *
+ * `@debuggen/shared` and `@debuggen/shared/node` are the only `@debuggen/*`
+ * imports (AAP 0.2.2, enforced by `no-restricted-imports`), and
+ * `@jridgewell/trace-mapping` is the only third-party one — no `ts-morph` (so
+ * the click-to-source path stays free of the AST toolchain, which is also why
+ * this module does not import `../project.ts`), no `zod` (validation goes
+ * through shared's {@link parseSourceLocation}), and never the `source-map`
+ * package, which AAP 0.2.4 rejects repository-wide for its WASM
+ * initialisation.
+ *
+ * ## State
+ *
+ * None. Every export is a pure function or a frozen constant; the per-call
+ * memoisation of maps, tracers and file content lives in a value created inside
+ * each call and dropped when it returns, so one resolution can never observe
+ * another's. Cross-call reuse is opt-in through
+ * {@link ResolveStackOptions.cache}.
+ *
+ * @example
+ * ```ts
+ * const cache = createSourceMapCache();
+ * const locations = await resolveStack(event.attributes.initiatorStack, {
+ *   projectRoot: session.projectRoot,
+ *   devServerOrigin: session.devServerUrl,
+ *   cache,
+ *   logger,
+ * });
+ * // locations[0] is the innermost resolvable frame: 'src/lib/thing.ts:41:5'
+ * ```
+ */
+
+import {
+  DEFAULT_RESOLUTION_CONFIDENCE,
+  isErr,
+  noopLogger,
+  parseSourceLocation,
+  resolveWithinProject,
+} from '@debuggen/shared';
+import type { LogFields, Logger, SourceLocation } from '@debuggen/shared';
+import { readFileNoFollow } from '@debuggen/shared/node';
+import { AnyMap, TraceMap, originalPositionFor, sourceContentFor } from '@jridgewell/trace-mapping';
+import type { EncodedSourceMap, SectionedSourceMap } from '@jridgewell/trace-mapping';
+
+import { fetchSourceMap, isSectionedSourceMap } from './fetch-map.js';
+import type {
+  RawSourceMapDocument,
+  SectionedSourceMapDocument,
+  SourceMapCache,
+  SourceMapDocument,
+} from './fetch-map.js';
+import { normalizeSourcePath } from './normalize.js';
+
+/**
+ * How many frames of one stack {@link resolveStack} will resolve by default.
+ *
+ * A responsiveness bound, not a correctness one. The stacks this route sees are
+ * `fetch` initiator stacks captured in the page, which are short, and the
+ * caller is a click-to-source hop that has to feel instant: a developer is
+ * waiting for an editor to open. Every frame past this count is skipped, and
+ * the frames are considered in stack order, so the innermost — the ones a
+ * developer means by "where did this come from" — are the ones resolved.
+ *
+ * Override with {@link ResolveStackOptions.maxFrames} when a caller genuinely
+ * wants a deeper chain and can afford it.
+ */
+export const DEFAULT_MAX_FRAMES = 24;
+
+/**
+ * How many **distinct** chunk URLs {@link resolveStack} will look a map up for
+ * in one call, by default.
+ *
+ * The second responsiveness bound, and the one that matters more: a map lookup
+ * is an HTTP request for a chunk plus a `JSON.parse` of a document that can run
+ * to megabytes, while a second frame in an already-fetched chunk costs nothing.
+ * A real stack spans two or three chunks; a stack that spans a dozen is either
+ * pathological or hostile. Once the budget is spent, remaining frames are
+ * resolved only if their chunk's map was already loaded in this call, and are
+ * otherwise skipped.
+ *
+ * Override with {@link ResolveStackOptions.maxMaps}.
+ */
+export const DEFAULT_MAX_MAPS = 8;
+
+/**
+ * One frame of a V8 stack trace, pointing at a position in a generated chunk.
+ *
+ * **`line` and `column` are both 1-based**, exactly as V8 reports them in the
+ * `at fn (url:line:column)` form — this is the fact the whole file turns on,
+ * and the reason {@link toNeedleColumn} exists. A frame whose numbers came from
+ * anywhere other than a V8 stack string must be converted by its producer
+ * before it arrives here.
+ *
+ * `url` is an absolute `http:`/`https:` URL. Frames pointing at anything else
+ * (`native`, `<anonymous>`, `webpack-internal:///`, `chrome-extension://`,
+ * `node:internal/…`) are dropped by {@link parseStackFrames} and refused by
+ * {@link resolveStackFrame}, because no dev-server map can describe them.
+ */
+export interface StackFrame {
+  /**
+   * The function slot as the runtime printed it, with `async`/`new` decoration
+   * and an `[as alias]` suffix removed, or `undefined` for an anonymous frame.
+   *
+   * **Informational only.** It is the name in the *generated* code, so it is
+   * never used as the resolved `symbol` — see the note on
+   * {@link resolveStackFrame} — and exists so a caller can log or display the
+   * frame it asked about.
+   */
+  readonly fn?: string;
+
+  /** The absolute `http:`/`https:` URL of the generated chunk. */
+  readonly url: string;
+
+  /** The 1-based line in the generated chunk. */
+  readonly line: number;
+
+  /** The **1-based** column in the generated chunk, as V8 reports it. */
+  readonly column: number;
+}
+
+/**
+ * Everything {@link resolveStack} and {@link resolveStackFrame} need.
+ *
+ * Passed per call; this module holds no configuration of its own, so one
+ * session's project root, origin pin or cache can never leak into another's
+ * resolution. Only {@link projectRoot} is required by the type — and
+ * {@link devServerOrigin} is required in behaviour, for the reason given in
+ * this module's overview.
+ */
+export interface ResolveStackOptions {
+  /**
+   * The absolute path of the indexed project root.
+   *
+   * Two things resolve against it: `normalizeSourcePath`, which turns a
+   * bundler's `sources` entry into a project-relative path and rejects anything
+   * that escapes the root or lives in a dependency, and
+   * {@link resolveWithinProject}, the only route in this file from a
+   * project-relative path back to an absolute one. A root that is not absolute
+   * makes containment meaningless, and every source is then rejected rather
+   * than resolved against a guess.
+   */
+  readonly projectRoot: string;
+
+  /**
+   * The session's dev-server origin, forwarded verbatim to `fetchSourceMap` as
+   * its mandatory pin — the one origin a chunk and its map may be read from.
+   *
+   * Pass the session record's `devServerUrl`. Omitting it is not a relaxation
+   * of the policy but a refusal: no frame is resolved, and the call returns
+   * nothing. See "The dev-server origin pin" in this module's overview.
+   */
+  readonly devServerOrigin?: string | undefined;
+
+  /**
+   * A cross-call document cache from `createSourceMapCache`.
+   *
+   * Optional and unshared by default. Within one call, each distinct chunk's
+   * map is fetched and parsed at most once regardless of this option; a cache
+   * extends that to the next call, which is what makes the second click in a
+   * session cheap. Scope it to a session and drop it at `session.end`.
+   */
+  readonly cache?: SourceMapCache | undefined;
+
+  /**
+   * The `fetch` implementation `fetchSourceMap` should use. Defaults to the
+   * global `fetch`.
+   */
+  readonly fetchImpl?: typeof fetch | undefined;
+
+  /**
+   * The map lookup itself. Defaults to `fetchSourceMap`.
+   *
+   * One of the two injection seams this module exposes for tests: a stub here
+   * can count calls, which is how "one fetch per distinct chunk" is asserted,
+   * and can serve a committed fixture document with no listener at all. A
+   * service may also use it to answer from a document it already holds. The
+   * origin pin is forwarded to whatever is injected, since the injected lookup
+   * takes the same required option.
+   */
+  readonly fetchSourceMapImpl?: typeof fetchSourceMap | undefined;
+
+  /**
+   * How an original source is read from the project when the map does not carry
+   * it. Defaults to {@link readProjectFile} — `readFileNoFollow` decoded as
+   * UTF-8, with `ENOENT`, `ELOOP`, `EACCES` and `EISDIR` all meaning "no
+   * content".
+   *
+   * The second injection seam: it makes the two content branches testable
+   * without a fixture tree on disk, and lets a caller that already has the file
+   * in memory avoid a read. It is called **only** with an absolute path that
+   * {@link resolveWithinProject} has vouched for, and may throw freely — a
+   * throw is caught and treated as "no content".
+   */
+  readonly readSourceFile?: ((absPath: string) => string | undefined) | undefined;
+
+  /** Frames to resolve at most. Defaults to {@link DEFAULT_MAX_FRAMES}. */
+  readonly maxFrames?: number | undefined;
+
+  /**
+   * Distinct chunk maps to look up at most, per call. Defaults to
+   * {@link DEFAULT_MAX_MAPS}.
+   */
+  readonly maxMaps?: number | undefined;
+
+  /**
+   * A caller's cancellation signal — a session ending, a panel interaction
+   * superseded.
+   *
+   * Forwarded to the lookup and checked between frames, so an aborted call
+   * returns the locations it had already resolved instead of discarding them or
+   * raising.
+   */
+  readonly signal?: AbortSignal | undefined;
+
+  /**
+   * Where skipped frames are explained, at `debug` level only. Defaults to
+   * `noopLogger`.
+   *
+   * Nothing here logs above `debug`: an unresolvable frame is normal operation,
+   * and a higher level would fill a session's log with entries describing the
+   * design working as intended.
+   */
+  readonly logger?: Logger | undefined;
+}
+
+// ---------------------------------------------------------------------------
+// Internal bounds
+// ---------------------------------------------------------------------------
+
+/**
+ * How much of a stack string {@link parseStackFrames} reads.
+ *
+ * A stack arrives as a captured string from the inspected page, so its length
+ * is whatever that page chose. Scanning is linear, but linear over an
+ * attacker-supplied megabyte is still work this product does not need to do:
+ * the frames that matter are at the top, and V8 itself caps
+ * `Error.stackTraceLimit` at 10 by default.
+ */
+const MAX_STACK_TEXT_LENGTH = 64 * 1024;
+
+/** How many lines of a stack string are examined, for the same reason. */
+const MAX_STACK_LINES = 256;
+
+/**
+ * How deeply a sectioned map may nest before this module declines to flatten
+ * it.
+ *
+ * A section's `map` may itself be sectioned, so the shape is recursive and a
+ * hostile document could nest it until the stack overflows. Real index maps
+ * from Turbopack are one level deep; sixteen is generous and finite.
+ */
+const MAX_SECTION_DEPTH = 16;
+
+/**
+ * The longest `symbol` this module will report.
+ *
+ * A name longer than this is either minified machine output or not a name at
+ * all, and a source chip that renders it would push everything else off the
+ * panel. Names from the map's `names` array are truncated to it; a derived
+ * identifier longer than it is dropped rather than cut, because half an
+ * identifier is a wrong answer rather than a short one.
+ */
+const MAX_SYMBOL_LENGTH = 128;
+
+/** Line terminators a source file may use, in any combination. */
+const LINE_BREAK = /\r\n|\n|\r/;
+
+/**
+ * A V8 frame line: leading whitespace, `at`, then the frame body.
+ *
+ * Deliberately without the `g` flag — a module-level regex with `g` carries
+ * `lastIndex` between calls, which is how a shared pattern starts skipping
+ * matches under concurrent use.
+ */
+const FRAME_LINE = /^\s*at\s+(.+)$/;
+
+/**
+ * A `url:line:column` location inside a frame body, restricted to `http:` and
+ * `https:`.
+ *
+ * The scheme restriction is the frame filter: `webpack-internal:///./src/x.ts`,
+ * `node:internal/deps/undici`, `chrome-extension://…` and `file:///…` never
+ * match, so they are dropped before anything tries to fetch them. The URL's own
+ * characters exclude whitespace and parentheses so a match cannot run past the
+ * end of its frame, and the lookahead requires the two numbers to be the
+ * location's *last* two components — without it the lazy URL would stop at the
+ * port and read `:3000` as the line.
+ *
+ * Constructed per call in {@link locationOf} (it needs the `g` flag) from this
+ * source string, for the `lastIndex` reason given on {@link FRAME_LINE}.
+ */
+const LOCATION_PATTERN_SOURCE = String.raw`(https?:\/\/[^\s()]*?):(\d+):(\d+)(?=[)\s,]|$)`;
+
+/** The identifier at the start of a string, ASCII-conservative. */
+const LEADING_IDENTIFIER = /^[A-Za-z_$][A-Za-z0-9_$]*/;
+
+/** Leading spaces and tabs, for looking just past a mapped column. */
+const LEADING_BLANKS = /^[ \t]+/;
+
+/** A trailing `[as alias]` in a V8 function slot, with the name before it. */
+const AS_ALIAS = /^(.*?)\s*\[as\s+[^\]]*\]$/;
+
+/** Decoration V8 prefixes a function slot with. */
+const FRAME_DECORATIONS: readonly string[] = Object.freeze(['async ', 'await ', 'new ']);
+
+/** What V8 prints for a frame with no function name. */
+const ANONYMOUS_SLOT = '<anonymous>';
+
+/** The separator V8 puts between an `eval` wrapper and the enclosing slot. */
+const EVAL_SLOT_SEPARATOR = ' at ';
+
+/**
+ * Words that are never a symbol, however identifier-shaped they look.
+ *
+ * Symbol derivation reads the text at the mapped column, and a segment that
+ * carries no `names` index very often lands on the start of a statement rather
+ * than on a declaration: `const`, `return`, `await`. Reporting `symbol:
+ * 'const'` on a source chip is worse than reporting nothing — it looks like a
+ * resolved name and is not one. JavaScript's reserved words are listed
+ * alongside the contextual and TypeScript ones, because the originals this
+ * module reads are TypeScript.
+ */
+const RESERVED_WORDS: ReadonlySet<string> = Object.freeze(
+  new Set([
+    'abstract',
+    'as',
+    'async',
+    'await',
+    'break',
+    'case',
+    'catch',
+    'class',
+    'const',
+    'continue',
+    'debugger',
+    'declare',
+    'default',
+    'delete',
+    'do',
+    'else',
+    'enum',
+    'export',
+    'extends',
+    'false',
+    'finally',
+    'for',
+    'function',
+    'get',
+    'if',
+    'implements',
+    'import',
+    'in',
+    'infer',
+    'instanceof',
+    'interface',
+    'is',
+    'keyof',
+    'let',
+    'namespace',
+    'new',
+    'null',
+    'of',
+    'package',
+    'private',
+    'protected',
+    'public',
+    'readonly',
+    'return',
+    'satisfies',
+    'set',
+    'static',
+    'super',
+    'switch',
+    'this',
+    'throw',
+    'true',
+    'try',
+    'type',
+    'typeof',
+    'undefined',
+    'var',
+    'void',
+    'while',
+    'with',
+    'yield',
+  ]),
+);
+
+// ---------------------------------------------------------------------------
+// Settings
+// ---------------------------------------------------------------------------
+
+/**
+ * {@link ResolveStackOptions} with every default applied and every field
+ * narrowed, so the resolution path below never reads a raw option.
+ */
+interface ResolverSettings {
+  readonly projectRoot: string;
+  readonly devServerOrigin: string | undefined;
+  readonly cache: SourceMapCache | undefined;
+  readonly fetchImpl: typeof fetch | undefined;
+  readonly lookupSourceMap: typeof fetchSourceMap;
+  readonly readSourceFile: (absPath: string) => string | undefined;
+  readonly maxFrames: number;
+  readonly maxMaps: number;
+  readonly signal: AbortSignal | undefined;
+  readonly logger: Logger;
+}
+
+/**
+ * A decoded map, with the one thing the tracer cannot report.
+ *
+ * `TraceMap.resolvedSources` is `sources` with `./` collapsed, and for a
+ * *sectioned* document `FlattenMap` concatenates each section's already-resolved
+ * sources — so the spelling the producer authored is unavailable from the
+ * tracer alone. It is kept here, aligned index-for-index with
+ * `tracer.sources`, because one real bundler form depends on it; see
+ * {@link projectFileFor}.
+ */
+interface LoadedMap {
+  readonly tracer: TraceMap;
+
+  /**
+   * The `sources` entries as the producer wrote them, in the tracer's own
+   * source order. A `null` entry is one the producer withheld.
+   */
+  readonly authoredSources: readonly (string | null)[];
+}
+
+/**
+ * Per-call memoisation and the map budget.
+ *
+ * `maps` is keyed by chunk URL and its **presence** means "a lookup was already
+ * attempted in this call", so a chunk with no map is not requested twice
+ * either; that is what makes "one fetch per distinct chunk" hold even for a
+ * stack whose frames alternate between two chunks. `contentLines` is keyed by
+ * chunk URL and source spelling together, because two chunks may name the same
+ * source and need not agree about its text.
+ */
+interface ResolutionBudget {
+  readonly maps: Map<string, LoadedMap | undefined>;
+  readonly contentLines: Map<string, readonly string[] | undefined>;
+  remaining: number;
+}
+
+/**
+ * Reads an options bag defensively and applies every default.
+ *
+ * Read through `unknown` for the same reason `fetchSourceMap` does: this
+ * package is reachable from untyped JavaScript and from a service boundary, and
+ * a caller who forgot an argument must get the same empty result a caller with
+ * no origin pin gets — not a `TypeError` thrown past a caller who was promised
+ * an array.
+ *
+ * A `maxFrames` or `maxMaps` that is not a positive safe integer falls back to
+ * its default rather than being clamped: a caller who asked for `0`, `-1` or
+ * `NaN` frames has a bug, and silently resolving nothing would hide it.
+ */
+function normalizeOptions(options: ResolveStackOptions): ResolverSettings {
+  const bag: unknown = options;
+  // `Partial<ResolveStackOptions>` has no required member, so a narrowed
+  // `object` assigns into it without an assertion: every field is then read
+  // with its own `typeof` check below.
+  const given: Partial<ResolveStackOptions> = typeof bag === 'object' && bag !== null ? bag : {};
+
+  const origin = typeof given.devServerOrigin === 'string' ? given.devServerOrigin.trim() : '';
+
+  return {
+    projectRoot: typeof given.projectRoot === 'string' ? given.projectRoot : '',
+    devServerOrigin: origin.length > 0 ? origin : undefined,
+    cache: given.cache,
+    fetchImpl: given.fetchImpl,
+    lookupSourceMap: given.fetchSourceMapImpl ?? fetchSourceMap,
+    readSourceFile: given.readSourceFile ?? readProjectFile,
+    maxFrames: positiveIntegerOr(given.maxFrames, DEFAULT_MAX_FRAMES),
+    maxMaps: positiveIntegerOr(given.maxMaps, DEFAULT_MAX_MAPS),
+    signal: given.signal,
+    logger: given.logger ?? noopLogger,
+  };
+}
+
+/**
+ * {@link normalizeOptions}, contained.
+ *
+ * The options bag is foreign data, and reading a property of a foreign object
+ * can run a getter that throws. The public entry points promise never to throw,
+ * so even option reading is guarded — and it is guarded *here*, before a logger
+ * exists, which is why this failure is the one thing in the module that is not
+ * logged: the logger that would report it is the value that could not be read.
+ */
+function settingsFor(options: ResolveStackOptions): ResolverSettings | undefined {
+  try {
+    return normalizeOptions(options);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Logs at `debug`, tolerating a logger that throws.
+ *
+ * Used only by the two top-level catch handlers, which must not be able to fail
+ * themselves: everything else logs directly, because a throw from there is
+ * caught by those same handlers.
+ */
+function logSafely(logger: Logger, message: string, fields?: LogFields): void {
+  try {
+    logger.debug(message, fields);
+  } catch {
+    // A caller's logger is not allowed to break click-to-source.
+  }
+}
+
+/** A fresh budget for one call. */
+function newBudget(settings: ResolverSettings): ResolutionBudget {
+  return { maps: new Map(), contentLines: new Map(), remaining: settings.maxMaps };
+}
+
+/** `value` when it is a positive safe integer, otherwise `fallback`. */
+function positiveIntegerOr(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : fallback;
+}
+
+/**
+ * Renders a caught value for a log record: a message for an `Error`, the
+ * runtime type otherwise.
+ *
+ * Never the value itself. What is caught here can be anything a dependency or a
+ * caller-injected function threw, including an object built from page data, and
+ * a log record is one of the places that must not become a channel for it
+ * (AAP 0.5.2).
+ */
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : `[${typeof error}]`;
+}
+
+/**
+ * Reads an original source from the project: the default
+ * {@link ResolveStackOptions.readSourceFile}.
+ *
+ * `readFileNoFollow` refuses a symbolic link at the final component, which is
+ * the right stance for a path derived from a map served by a dev server: the
+ * string-level containment check {@link resolveWithinProject} performs cannot
+ * see that a path inside the project is a link pointing out of it.
+ *
+ * Every filesystem error means the same thing to this module — no content, so
+ * no validation and no derived symbol — and none of them is a failure of the
+ * resolution: `ENOENT` for a file that moved since the map was built, `ELOOP`
+ * for that symlink, `EACCES` for a file this process may not read, `EISDIR`
+ * for a source path that names a directory.
+ *
+ * @param absPath An absolute path {@link resolveWithinProject} has vouched for.
+ * @returns The file's text with a byte-order mark removed, or `undefined`.
+ */
+function readProjectFile(absPath: string): string | undefined {
+  try {
+    return stripByteOrderMark(readFileNoFollow(absPath).toString('utf8'));
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Removes a leading byte-order mark.
+ *
+ * A BOM is not part of the first line's text as far as a source map is
+ * concerned, so leaving it in would shift every column on line 1 by one and
+ * make a valid position look out of range.
+ */
+function stripByteOrderMark(text: string): string {
+  return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+}
+
+// ---------------------------------------------------------------------------
+// Frame parsing
+// ---------------------------------------------------------------------------
+
+/**
+ * Parses a V8 stack string into the frames this module can resolve.
+ *
+ * Exported so that frame parsing can be table-driven in tests with no I/O at
+ * all: it is pure, total and synchronous, and every rejection is silent by
+ * design — a stack is mostly frames this route has nothing to say about.
+ *
+ * What is recognised, all of it Chrome/V8 output:
+ *
+ * - `    at fnName (http://host/chunk.js:12:34)` — the common form.
+ * - `    at http://host/chunk.js:12:34` — the bare form, with no function slot.
+ * - the decorated slots `async fnName`, `new ClassName`,
+ *   `Object.fnName [as alias]` and `<anonymous>`, all of which yield a cleaned
+ *   {@link StackFrame.fn} or none.
+ * - `eval` nesting — `at eval (eval at fnName (http://host/chunk.js:12:34),
+ *   <anonymous>:1:1)` — from which the **innermost parenthesised**
+ *   `(url:line:column)` is taken, since that is the position a map can describe;
+ *   the `<anonymous>` position inside the `eval` cannot be mapped at all.
+ *
+ * What is dropped: the header line (`Error`, `Error: message`, or anything
+ * before the first `at ` line and anything after that is not a frame), every
+ * frame whose URL is not an absolute `http:`/`https:` URL (`native`,
+ * `<anonymous>`, `webpack-internal:///`, `chrome-extension://`,
+ * `node:internal/…`, `file:///…`), and every frame whose line or column is
+ * absent, not an integer, or below 1.
+ *
+ * @param stack A stack string, typically `Error().stack` captured in the page.
+ * @returns The recognised frames in stack order — innermost first, as V8 prints
+ * them. Never throws, for any input, including a value that is not a string.
+ */
+export function parseStackFrames(stack: string): StackFrame[] {
+  const text: unknown = stack;
+  if (typeof text !== 'string' || text.length === 0) {
+    return [];
+  }
+
+  const bounded = text.length > MAX_STACK_TEXT_LENGTH ? text.slice(0, MAX_STACK_TEXT_LENGTH) : text;
+  const frames: StackFrame[] = [];
+
+  // `split` with a limit stops after that many pieces, so a stack with more
+  // lines than the bound costs nothing extra.
+  for (const line of bounded.split(LINE_BREAK, MAX_STACK_LINES)) {
+    // A line that is not a frame line is skipped rather than ending the scan:
+    // that covers the header, a blank line and any decoration a producer added
+    // between frames.
+    const body = FRAME_LINE.exec(line)?.[1];
+    if (body === undefined) {
+      continue;
+    }
+
+    const located = locationOf(body);
+    if (located === undefined) {
+      continue;
+    }
+
+    const fn = functionNameOf(body.slice(0, located.start));
+    frames.push({
+      ...(fn === undefined ? {} : { fn }),
+      url: located.url,
+      line: located.line,
+      column: located.column,
+    });
+  }
+
+  return frames;
+}
+
+/** A location found inside a frame body, with where in the body it started. */
+interface LocatedPosition {
+  readonly url: string;
+  readonly line: number;
+  readonly column: number;
+  readonly start: number;
+}
+
+/**
+ * Finds the position a frame body points at.
+ *
+ * Every `http(s)://…:line:column` candidate in the body is collected, then one
+ * is chosen: the **last parenthesised** candidate if there is one, otherwise
+ * the last candidate overall. That rule is what implements "innermost" for
+ * `eval` nesting — in `eval (eval at fn (http://h/a.js:1:1), http://h/a.js:2:2)`
+ * the parenthesised candidate is the inner one — while still accepting the bare
+ * `at http://h/a.js:1:1` form, where nothing is parenthesised at all.
+ */
+function locationOf(body: string): LocatedPosition | undefined {
+  const pattern = new RegExp(LOCATION_PATTERN_SOURCE, 'g');
+  const candidates: { position: LocatedPosition; parenthesised: boolean }[] = [];
+
+  for (let match = pattern.exec(body); match !== null; match = pattern.exec(body)) {
+    // `noUncheckedIndexedAccess`: every capture group is `string | undefined`,
+    // whatever the pattern guarantees.
+    const rawUrl = match[1];
+    const rawLine = match[2];
+    const rawColumn = match[3];
+    if (rawUrl === undefined || rawLine === undefined || rawColumn === undefined) {
+      continue;
+    }
+
+    const url = screenChunkUrl(rawUrl);
+    const line = positiveIntegerOf(rawLine);
+    const column = positiveIntegerOf(rawColumn);
+    if (url === undefined || line === undefined || column === undefined) {
+      continue;
+    }
+
+    candidates.push({
+      position: { url, line, column, start: match.index },
+      parenthesised: match.index > 0 && body.charAt(match.index - 1) === '(',
+    });
+  }
+
+  const parenthesised = candidates.filter((candidate) => candidate.parenthesised);
+  return (parenthesised.at(-1) ?? candidates.at(-1))?.position;
+}
+
+/**
+ * Parses a decimal integer that must be at least 1.
+ *
+ * Both a line and a V8 column are 1-based, so `0` is not a position a frame can
+ * report and is refused rather than repaired. `Number.isSafeInteger` also
+ * refuses the 20-digit value a hostile stack could carry, which would otherwise
+ * arrive as an imprecise float.
+ */
+function positiveIntegerOf(text: string): number | undefined {
+  const value = Number.parseInt(text, 10);
+  return Number.isSafeInteger(value) && value >= 1 ? value : undefined;
+}
+
+/**
+ * Screens a chunk URL and returns its canonical form.
+ *
+ * `http:`/`https:` only — the one thing a dev server can serve a map for. The
+ * canonical `href` is returned rather than the matched text so that two frames
+ * spelling the same chunk differently share one map lookup and one budget slot.
+ */
+function screenChunkUrl(rawUrl: string): string | undefined {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    return undefined;
+  }
+
+  return parsed.protocol === 'http:' || parsed.protocol === 'https:' ? parsed.href : undefined;
+}
+
+/**
+ * Cleans the text V8 printed before a frame's location into a function name.
+ *
+ * The slot can carry an `eval` wrapper (`eval (eval at fnName `), a decoration
+ * (`async `, `new `), a receiver (`Object.fnName`) and an alias
+ * (`fnName [as handleEvent]`). The enclosing name is the useful part of an
+ * `eval` slot, the alias is dropped in favour of the declared name, and
+ * anything that still does not look like a single function slot — whitespace or
+ * a bracket left in it, `<anonymous>`, nothing at all — yields `undefined`.
+ *
+ * This value never becomes a `SourceLocation.symbol`; see
+ * {@link StackFrame.fn}.
+ */
+function functionNameOf(prefix: string): string | undefined {
+  let text = prefix.trim();
+
+  // Drop the opening parenthesis of the `at fn (url:l:c)` form.
+  if (text.endsWith('(')) {
+    text = text.slice(0, -1).trimEnd();
+  }
+
+  // `eval (eval at fnName` -> `fnName`: the last ` at ` separates the wrapper
+  // from the slot the eval was called in.
+  const evalSeparator = text.lastIndexOf(EVAL_SLOT_SEPARATOR);
+  if (evalSeparator >= 0) {
+    text = text.slice(evalSeparator + EVAL_SLOT_SEPARATOR.length).trim();
+  }
+
+  // `fnName [as handleEvent]` -> `fnName`. The declared name is what a
+  // developer reads in the source; the alias is the property it was reached
+  // through.
+  const aliased = AS_ALIAS.exec(text)?.[1];
+  if (aliased !== undefined) {
+    text = aliased.trim();
+  }
+
+  for (const decoration of FRAME_DECORATIONS) {
+    if (text.startsWith(decoration)) {
+      text = text.slice(decoration.length).trim();
+    }
+  }
+
+  if (text.length === 0 || text.length > MAX_SYMBOL_LENGTH || text === ANONYMOUS_SLOT) {
+    return undefined;
+  }
+
+  return /[\s()[\]<>]/.test(text) ? undefined : text;
+}
+
+/**
+ * Re-screens a frame that did not come from {@link parseStackFrames}.
+ *
+ * {@link resolveStackFrame} and the array form of {@link resolveStack} accept
+ * frames a caller built, and those carry no guarantee at all: the numbers may
+ * be 0-based by mistake, the URL may be a `webpack-internal:` specifier, the
+ * whole value may have arrived as JSON from another process. Every frame
+ * therefore passes the same three checks the parser applies before it is used.
+ */
+function screenFrame(frame: unknown): StackFrame | undefined {
+  if (typeof frame !== 'object' || frame === null) {
+    return undefined;
+  }
+
+  const { fn, url, line, column } = frame as Partial<StackFrame>;
+  if (typeof url !== 'string' || typeof line !== 'number' || typeof column !== 'number') {
+    return undefined;
+  }
+
+  const screenedUrl = screenChunkUrl(url);
+  if (
+    screenedUrl === undefined ||
+    !Number.isSafeInteger(line) ||
+    !Number.isSafeInteger(column) ||
+    line < 1 ||
+    column < 1
+  ) {
+    return undefined;
+  }
+
+  return {
+    ...(typeof fn === 'string' && fn.length > 0 ? { fn } : {}),
+    url: screenedUrl,
+    line,
+    column,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Map loading
+// ---------------------------------------------------------------------------
+
+/**
+ * The decoded map for one chunk, looked up at most once per call.
+ *
+ * Presence of the key in {@link ResolutionBudget.maps} — not the value — means
+ * "already attempted", so a chunk that has no map, or whose map failed to
+ * decode, is not requested again by a later frame pointing into it. The map
+ * budget is charged only when a lookup is actually performed, and once it is
+ * spent a frame is resolved only if its chunk is already in the memo.
+ */
+async function loadedMapFor(
+  chunkUrl: string,
+  settings: ResolverSettings,
+  budget: ResolutionBudget,
+): Promise<LoadedMap | undefined> {
+  if (budget.maps.has(chunkUrl)) {
+    return budget.maps.get(chunkUrl);
+  }
+
+  const devServerOrigin = settings.devServerOrigin;
+  if (devServerOrigin === undefined) {
+    // Unreachable through the public entry points, which refuse a call with no
+    // pin before any frame is touched. Kept because this function is the only
+    // thing that performs a lookup, and a pin is the one option it may not
+    // default.
+    return undefined;
+  }
+
+  if (budget.remaining <= 0) {
+    settings.logger.debug('Source-map budget for this call is spent; frame skipped', {
+      maxMaps: settings.maxMaps,
+    });
+    return undefined;
+  }
+  budget.remaining -= 1;
+
+  const document = await lookupDocument(chunkUrl, devServerOrigin, settings);
+  const loaded = document === undefined ? undefined : createLoadedMap(document, settings.logger);
+  budget.maps.set(chunkUrl, loaded);
+  return loaded;
+}
+
+/**
+ * Asks the lookup for a chunk's map document and reduces its three outcomes to
+ * "a document" or "nothing".
+ *
+ * The distinction `fetchSourceMap` draws between an error and a clean absence
+ * matters to the log and to nothing else: this route has the same answer for
+ * both, which is to let the frame fall through to the other three resolution
+ * routes.
+ */
+async function lookupDocument(
+  chunkUrl: string,
+  devServerOrigin: string,
+  settings: ResolverSettings,
+): Promise<SourceMapDocument | undefined> {
+  const lookup = await settings.lookupSourceMap(chunkUrl, {
+    devServerOrigin,
+    signal: settings.signal,
+    fetchImpl: settings.fetchImpl,
+    cache: settings.cache,
+    logger: settings.logger,
+  });
+
+  if (isErr(lookup)) {
+    settings.logger.debug('Source-map lookup failed; frame skipped', {
+      code: lookup.error.code,
+    });
+    return undefined;
+  }
+
+  if (lookup.value.kind === 'none') {
+    settings.logger.debug('Chunk carries no source map; frame skipped', {
+      reason: lookup.value.reason,
+    });
+    return undefined;
+  }
+
+  return lookup.value.map;
+}
+
+/**
+ * Builds the tracer for a document: `AnyMap` for a sectioned one, `TraceMap`
+ * for a plain one.
+ *
+ * Two decisions are load-bearing, both explained at length in this module's
+ * overview and restated here because this is where they are implemented:
+ *
+ * - The branch is taken on {@link isSectionedSourceMap}, a statement about the
+ *   *document*, never by trying `TraceMap` and catching. In
+ *   `@jridgewell/trace-mapping` 0.3.31 a sectioned document makes the
+ *   `TraceMap` constructor throw a `TypeError` from inside `sources.map(…)`,
+ *   which runs before its own `sections` guard — a failure mode no caller
+ *   should be relying on. `AnyMap` is the published alias of `FlattenMap` and
+ *   flattens the sections' `sources` and `names` in section order while
+ *   shifting each section's mappings by its `offset`, so every position below
+ *   is in absolute generated coordinates.
+ * - **No `mapUrl` second argument.** Passing one would resolve each `sources`
+ *   entry against the map's URL and hand `./normalize.ts` an
+ *   `http://127.0.0.1:…` URL instead of the `webpack://`/`turbopack://`
+ *   spelling it understands — which normalisation then rejects, silently
+ *   costing every frame its location.
+ *
+ * The try/catch is the last resort for a document that satisfies the shape
+ * check but still cannot be decoded (a `mappings` string that is not valid VLQ,
+ * a `sources` array that is not an array). Such a document yields `undefined`,
+ * never a throw.
+ */
+function createLoadedMap(document: SourceMapDocument, logger: Logger): LoadedMap | undefined {
+  try {
+    const authoredSources = authoredSourcesFor(document, 0);
+    if (authoredSources === undefined) {
+      logger.debug('Sectioned source map nests too deeply to flatten; frame skipped', {
+        maxDepth: MAX_SECTION_DEPTH,
+      });
+      return undefined;
+    }
+
+    if (isSectionedSourceMap(document)) {
+      const sectioned = sectionedInputFor(document, 0);
+      if (sectioned === undefined) {
+        logger.debug('Sectioned source map nests too deeply to flatten; frame skipped', {
+          maxDepth: MAX_SECTION_DEPTH,
+        });
+        return undefined;
+      }
+      return { tracer: new AnyMap(sectioned), authoredSources };
+    }
+
+    return { tracer: new TraceMap(plainInputFor(document)), authoredSources };
+  } catch (error) {
+    logger.debug('Source map could not be decoded; frame skipped', {
+      reason: describeError(error),
+    });
+    return undefined;
+  }
+}
+
+/**
+ * The `sources` entries of a document as its producer wrote them, in the order
+ * the tracer will hold them.
+ *
+ * For a plain document that is simply its own `sources`. For a sectioned one it
+ * is every section's `sources` concatenated in section order, recursively —
+ * which is exactly the order `FlattenMap` appends them in, so the result lines
+ * up index-for-index with the flattened tracer's `sources` and
+ * `resolvedSources`. The alignment is what lets {@link projectFileFor} recover
+ * the authored spelling of a resolved source.
+ *
+ * @returns The entries, or `undefined` when the document nests sections beyond
+ * {@link MAX_SECTION_DEPTH}.
+ */
+function authoredSourcesFor(
+  document: SourceMapDocument,
+  depth: number,
+): readonly (string | null)[] | undefined {
+  if (!isSectionedSourceMap(document)) {
+    return document.sources;
+  }
+
+  if (depth >= MAX_SECTION_DEPTH) {
+    return undefined;
+  }
+
+  const flattened: (string | null)[] = [];
+  for (const section of document.sections) {
+    const nested = authoredSourcesFor(section.map, depth + 1);
+    if (nested === undefined) {
+      return undefined;
+    }
+    flattened.push(...nested);
+  }
+
+  return flattened;
+}
+
+/**
+ * Adapts a plain document to what `TraceMap` accepts.
+ *
+ * One field differs: the Source Map Revision 3 specification lists `names` as
+ * required and real producers omit it, so `RawSourceMapDocument` has it
+ * optional while `EncodedSourceMap` demands it. Supplying `[]` is what the
+ * document already means — no named segments.
+ *
+ * The spread is a shallow copy, so the arrays and the `mappings` string are
+ * shared with the document, which may be cache-shared and is treated as
+ * read-only: `TraceMap` builds its own `resolvedSources` and decodes the
+ * mappings into new arrays rather than mutating either.
+ */
+function plainInputFor(document: RawSourceMapDocument): EncodedSourceMap {
+  return { ...document, names: document.names ?? [] };
+}
+
+/**
+ * Adapts a sectioned document to what `AnyMap` accepts, recursively.
+ *
+ * A section's `map` may itself be sectioned, so this walks the whole tree
+ * filling in `names` where a producer omitted it. Depth is bounded by
+ * {@link MAX_SECTION_DEPTH} and a document that exceeds it yields `undefined`
+ * rather than a stack overflow.
+ */
+function sectionedInputFor(
+  document: SectionedSourceMapDocument,
+  depth: number,
+): SectionedSourceMap | undefined {
+  if (depth >= MAX_SECTION_DEPTH) {
+    return undefined;
+  }
+
+  const sections: SectionedSourceMap['sections'] = [];
+  for (const section of document.sections) {
+    const nested = isSectionedSourceMap(section.map)
+      ? sectionedInputFor(section.map, depth + 1)
+      : plainInputFor(section.map);
+    if (nested === undefined) {
+      return undefined;
+    }
+    sections.push({ offset: section.offset, map: nested });
+  }
+
+  return { ...document, sections };
+}
+
+// ---------------------------------------------------------------------------
+// Position, content and symbol
+// ---------------------------------------------------------------------------
+
+/**
+ * A position in an original source, in the source map's own coordinates:
+ * **1-based line, 0-based column**.
+ *
+ * Declared rather than inferred so the two fields `originalPositionFor` types
+ * as `number | null` arrive here as numbers, and so the coordinate convention
+ * is stated on the type that carries it.
+ */
+interface MappedPosition {
+  readonly source: string;
+  readonly line: number;
+  readonly column: number;
+  readonly name: string | null;
+}
+
+/**
+ * **Conversion 1 of 2.** A V8 frame's 1-based column to the 0-based column
+ * `originalPositionFor` takes.
+ *
+ * Clamped at 0 because the library throws for a negative column, and because a
+ * frame reporting column 0 — which V8 does not, but a hand-built frame might —
+ * means "the start of the line" rather than "one before it".
+ */
+function toNeedleColumn(frameColumn: number): number {
+  return Math.max(0, frameColumn - 1);
+}
+
+/**
+ * Looks a generated position up in a tracer.
+ *
+ * Returns `undefined` for the two distinct "no answer" cases, which this route
+ * treats identically: there is no segment at or before this position in the
+ * map, or the position is outside the map's generated range. Wrapped in a
+ * try/catch because `originalPositionFor` *throws* for a line below 1 or a
+ * column below 0 — inputs {@link screenFrame} and {@link toNeedleColumn}
+ * already exclude, which is exactly why a throw from here would be a bug worth
+ * containing rather than propagating.
+ *
+ * @param generatedLine The frame's 1-based line, unchanged.
+ * @param needleColumn The frame's column after {@link toNeedleColumn}.
+ */
+function mappedPositionFor(
+  tracer: TraceMap,
+  generatedLine: number,
+  needleColumn: number,
+  logger: Logger,
+): MappedPosition | undefined {
+  try {
+    const { source, line, column, name } = originalPositionFor(tracer, {
+      line: generatedLine,
+      column: needleColumn,
+    });
+
+    if (source === null || line === null || column === null) {
+      logger.debug('No mapping at this generated position; frame skipped', {
+        line: generatedLine,
+        column: needleColumn,
+      });
+      return undefined;
+    }
+
+    if (!Number.isSafeInteger(line) || !Number.isSafeInteger(column) || line < 1 || column < 0) {
+      logger.debug('Source map reported an out-of-range original position; frame skipped', {
+        line,
+        column,
+      });
+      return undefined;
+    }
+
+    return { source, line, column, name };
+  } catch (error) {
+    logger.debug('Source-map position lookup failed; frame skipped', {
+      reason: describeError(error),
+    });
+    return undefined;
+  }
+}
+
+/**
+ * A source that normalised to a path inside the project, with the spelling that
+ * achieved it.
+ */
+interface ProjectSource {
+  /** The project-relative POSIX path. */
+  readonly file: string;
+
+  /**
+   * The `sources` spelling that normalised — the string to query the map's own
+   * `sourcesContent` with.
+   */
+  readonly source: string;
+}
+
+/**
+ * Turns the source a mapping points at into a project-relative path, trying the
+ * spelling the producer authored before the one the library resolved.
+ *
+ * `originalPositionFor` reports `resolvedSources[i]`, which is `sources[i]`
+ * with `./` collapsed — and that collapsing loses information for one real
+ * bundler form. Turbopack marks the project root of a source with a bare `./`
+ * (`turbopack:///./app/(group)/page.tsx`); collapsed to
+ * `turbopack:///app/(group)/page.tsx` the first path segment reads as a
+ * namespace instead, and `./normalize.ts` refuses the source rather than
+ * guessing. The authored entry is also the spelling that module documents
+ * itself against, so it is tried first.
+ *
+ * The resolved spelling is still tried, second, because it is the *more*
+ * complete form for a map that sets `sourceRoot` or spells its sources
+ * relatively — there the authored entry alone may not say where the source
+ * lives.
+ *
+ * @returns The path and the spelling that produced it, or `undefined` when
+ * neither spelling is project source (a dependency, a bundler internal, or a
+ * path escaping the project root — all already explained by
+ * `normalizeSourcePath` at `debug` level).
+ */
+function projectFileFor(
+  loaded: LoadedMap,
+  resolvedSource: string,
+  settings: ResolverSettings,
+): ProjectSource | undefined {
+  for (const source of sourceSpellingsFor(loaded, resolvedSource)) {
+    const file = normalizeSourcePath(source, {
+      projectRoot: settings.projectRoot,
+      logger: settings.logger,
+    });
+    if (file !== undefined) {
+      return { file, source };
+    }
+  }
+
+  return undefined;
+}
+
+/**
+ * The spellings of one source, authored first, deduplicated.
+ *
+ * {@link LoadedMap.authoredSources} and `TraceMap.resolvedSources` are parallel
+ * arrays, so the authored entry is the one at the resolved entry's index. A
+ * `null` entry means the producer withheld the name, and an index of `-1`
+ * cannot happen for a source a mapping just reported — both fall back to the
+ * resolved spelling rather than failing.
+ */
+function sourceSpellingsFor(loaded: LoadedMap, resolvedSource: string): readonly string[] {
+  const index = loaded.tracer.resolvedSources.indexOf(resolvedSource);
+  const authored = index === -1 ? undefined : loaded.authoredSources[index];
+
+  return authored === undefined || authored === null || authored === resolvedSource
+    ? [resolvedSource]
+    : [authored, resolvedSource];
+}
+
+/**
+ * The lines of an original source, from whichever of the two branches can
+ * supply them, split once per call per source.
+ *
+ * Keyed by chunk URL *and* authored source: two chunks may name the same source
+ * and need not carry the same text for it, and a stack whose frames all land in
+ * one file must not re-read and re-split it once per frame — this is a
+ * click-to-source hop.
+ */
+function contentLinesFor(
+  tracer: TraceMap,
+  chunkUrl: string,
+  authoredSource: string,
+  relativeFile: string,
+  settings: ResolverSettings,
+  budget: ResolutionBudget,
+): readonly string[] | undefined {
+  const key = `${chunkUrl}\u0000${authoredSource}`;
+  if (budget.contentLines.has(key)) {
+    return budget.contentLines.get(key);
+  }
+
+  const content = originalContentFor(tracer, authoredSource, relativeFile, settings);
+  const lines = content === undefined ? undefined : content.split(LINE_BREAK);
+  budget.contentLines.set(key, lines);
+  return lines;
+}
+
+/**
+ * The text of an original source: the map's own copy first, the file in the
+ * project second.
+ *
+ * **Branch A — the content travelled with the map.** `sourceContentFor` is
+ * queried with the *authored* source string, the same one
+ * `normalizeSourcePath` was given, because that is the string the map indexes
+ * its `sourcesContent` by (the library also accepts the resolved spelling, and
+ * the two differ only by `./` collapsing). A `null` entry means "content
+ * withheld for this source", which is not "file missing" — so the second branch
+ * still runs.
+ *
+ * **Branch B — read it from the project.** The project-relative path already
+ * passed `isSafeRelativePath` inside `normalizeSourcePath`;
+ * {@link resolveWithinProject} is nevertheless the only route from it to an
+ * absolute path, because layering the two is the point — the first check says
+ * the string cannot escape, the second proves the join did not. A path the
+ * `Result` rejects is never read.
+ *
+ * @returns The source text, or `undefined` when neither branch can supply it —
+ * in which case the caller proceeds with the map as the authority.
+ */
+function originalContentFor(
+  tracer: TraceMap,
+  authoredSource: string,
+  relativeFile: string,
+  settings: ResolverSettings,
+): string | undefined {
+  try {
+    const embedded = sourceContentFor(tracer, authoredSource);
+    if (embedded !== null) {
+      return stripByteOrderMark(embedded);
+    }
+  } catch (error) {
+    settings.logger.debug('Embedded source content could not be read', {
+      reason: describeError(error),
+    });
+  }
+
+  const resolved = resolveWithinProject(settings.projectRoot, relativeFile);
+  if (isErr(resolved)) {
+    settings.logger.debug('Original source path was refused by the containment check', {
+      code: resolved.error.code,
+      file: relativeFile,
+    });
+    return undefined;
+  }
+
+  try {
+    const onDisk = settings.readSourceFile(resolved.value);
+    return typeof onDisk === 'string' ? stripByteOrderMark(onDisk) : undefined;
+  } catch (error) {
+    // A caller-injected reader may throw anything; the default one never does.
+    settings.logger.debug('Original source could not be read from the project', {
+      reason: describeError(error),
+    });
+    return undefined;
+  }
+}
+
+/**
+ * Whether a mapped position exists in the content that was recovered for it.
+ *
+ * The first of the two uses of original content. A map built before an edit
+ * still resolves, and it resolves to a position the file no longer has; opening
+ * an editor there lands the developer somewhere arbitrary with no indication
+ * that anything went wrong, which is worse than not offering the location at
+ * all.
+ *
+ * @param line The position's 1-based line.
+ * @param column The position's **0-based** column, as the map reports it. A
+ * position one past the last character of a line is legitimate — it is where an
+ * insertion would go — so the valid range is `0 … length`, which is the 1-based
+ * `1 … length + 1` this becomes.
+ */
+function positionWithinContent(lines: readonly string[], line: number, column: number): boolean {
+  const text = lines[line - 1];
+  return text !== undefined && column <= text.length;
+}
+
+/**
+ * The symbol to report, in the documented precedence order.
+ *
+ * 1. The map's own `names` entry for the segment, when it has one. A producer
+ *    that recorded a name recorded the *original* name, which is the best
+ *    answer available.
+ * 2. Otherwise the identifier at the resolved column in the original content —
+ *    the second of the two uses of that content.
+ * 3. Otherwise nothing, and `symbol` is omitted.
+ *
+ * {@link StackFrame.fn} is deliberately *not* a fallback: it is the name in the
+ * generated chunk, so on minified or transformed output it would report
+ * something the developer's source does not contain.
+ */
+function symbolFor(
+  name: string | null,
+  lines: readonly string[] | undefined,
+  line: number,
+  column: number,
+): string | undefined {
+  const mapped = name === null ? '' : name.trim();
+  if (mapped.length > 0) {
+    return mapped.length > MAX_SYMBOL_LENGTH ? mapped.slice(0, MAX_SYMBOL_LENGTH) : mapped;
+  }
+
+  if (lines === undefined) {
+    return undefined;
+  }
+
+  const text = lines[line - 1];
+  return text === undefined ? undefined : identifierAt(text, column);
+}
+
+/**
+ * The JavaScript identifier at, or immediately after, a 0-based column.
+ *
+ * Conservative on purpose, in three ways. Only spaces and tabs are skipped, so
+ * the identifier has to be on the same line as the mapped position. The pattern
+ * is ASCII, so a non-ASCII identifier yields nothing rather than a truncated
+ * fragment of one. And a match that is a reserved word yields nothing: a
+ * segment with no `names` index very often lands on the start of a statement,
+ * and `symbol: 'const'` on a source chip reads as a resolved name while being
+ * nothing of the kind.
+ *
+ * @returns The identifier, or `undefined` when nothing identifier-shaped — or
+ * nothing reportable — is there.
+ */
+function identifierAt(text: string, column: number): string | undefined {
+  if (column < 0 || column > text.length) {
+    return undefined;
+  }
+
+  const tail = text.slice(column).replace(LEADING_BLANKS, '');
+  const candidate = LEADING_IDENTIFIER.exec(tail)?.[0];
+  if (candidate === undefined || candidate.length > MAX_SYMBOL_LENGTH) {
+    return undefined;
+  }
+
+  return RESERVED_WORDS.has(candidate) ? undefined : candidate;
+}
+
+// ---------------------------------------------------------------------------
+// Resolution
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolves one already-screened frame, end to end.
+ *
+ * The order is fixed, and every step's failure is a skip:
+ *
+ * 1. the chunk's map (fetched at most once per chunk per call);
+ * 2. the tracer for that document;
+ * 3. the mapped original position, after conversion 1 of 2;
+ * 4. the project-relative path, which is where a dependency source or one
+ *    escaping the project root is refused;
+ * 5. the original content, from either branch, and the position check it
+ *    enables;
+ * 6. the symbol, in its precedence order;
+ * 7. conversion 2 of 2 and validation against the shared schema.
+ */
+async function resolveMappedFrame(
+  frame: StackFrame,
+  settings: ResolverSettings,
+  budget: ResolutionBudget,
+): Promise<SourceLocation | undefined> {
+  const loaded = await loadedMapFor(frame.url, settings, budget);
+  if (loaded === undefined) {
+    return undefined;
+  }
+
+  // Conversion 1 of 2: a V8 frame's column is 1-based, `originalPositionFor`
+  // takes a 0-based one. Its line is 1-based on both sides and is passed
+  // through unchanged.
+  const position = mappedPositionFor(
+    loaded.tracer,
+    frame.line,
+    toNeedleColumn(frame.column),
+    settings.logger,
+  );
+  if (position === undefined) {
+    return undefined;
+  }
+
+  const projectSource = projectFileFor(loaded, position.source, settings);
+  if (projectSource === undefined) {
+    // Not project source: a dependency, a bundler internal, or a path that
+    // escapes the project root. `normalizeSourcePath` has already explained it.
+    return undefined;
+  }
+  const { file, source } = projectSource;
+
+  const lines = contentLinesFor(loaded.tracer, frame.url, source, file, settings, budget);
+
+  if (lines !== undefined && !positionWithinContent(lines, position.line, position.column)) {
+    settings.logger.debug(
+      'Mapped position falls outside the original source; frame skipped as stale',
+      { file, line: position.line },
+    );
+    return undefined;
+  }
+
+  if (lines === undefined) {
+    // No content from either branch, so the position cannot be sanity-checked.
+    // The map is then the authority — a location it reports is still far better
+    // than none — and the fact is recorded rather than hidden.
+    settings.logger.debug('Original source content unavailable; trusting the map', { file });
+  }
+
+  const symbol = symbolFor(position.name, lines, position.line, position.column);
+
+  // Conversion 2 of 2: the map reports a 0-based column and `SourceLocation` is
+  // 1-based on both axes, so one is added. The line needs no adjustment.
+  const parsed = parseSourceLocation({
+    file,
+    line: position.line,
+    column: position.column + 1,
+    ...(symbol === undefined ? {} : { symbol }),
+    resolvedBy: 'source-map',
+    confidence: DEFAULT_RESOLUTION_CONFIDENCE['source-map'],
+  });
+
+  if (isErr(parsed)) {
+    // The shared schema is the last gate before this value reaches the
+    // `source.open` message and `showTextDocument`, so a location it refuses is
+    // dropped, never repaired: reaching here means this module built something
+    // malformed, which is a product bug to fix rather than a frame to salvage.
+    settings.logger.debug('Resolved location failed schema validation; frame skipped', {
+      code: parsed.error.code,
+      reason: parsed.error.message,
+    });
+    return undefined;
+  }
+
+  return parsed.value;
+}
+
+/**
+ * Resolves a single stack frame to a {@link SourceLocation}.
+ *
+ * Every frame is re-screened first, whatever its type says: the numbers may
+ * have been built 0-based by mistake, the URL may be a `webpack-internal:`
+ * specifier, and the whole value may have arrived as JSON from another process.
+ *
+ * `undefined` is the normal answer for a frame this route cannot map, and it is
+ * never an error: the caller falls through to the other three resolution routes
+ * (AAP 0.4.2). Nothing thrown inside — by the lookup, by an injected
+ * `fetchSourceMapImpl` or `readSourceFile`, by the decoder — escapes.
+ *
+ * The returned `symbol`, when present, is the *original* name: the map's
+ * `names` entry, or the identifier at the resolved column. It is never
+ * {@link StackFrame.fn}, which names the generated function.
+ *
+ * @param frame The frame to resolve. 1-based line and 1-based column.
+ * @param options See {@link ResolveStackOptions};
+ * {@link ResolveStackOptions.devServerOrigin} is required in behaviour.
+ * @returns The validated location, or `undefined`.
+ */
+export async function resolveStackFrame(
+  frame: StackFrame,
+  options: ResolveStackOptions,
+): Promise<SourceLocation | undefined> {
+  const settings = settingsFor(options);
+  if (settings === undefined) {
+    return undefined;
+  }
+
+  try {
+    const screened = screenFrame(frame);
+    if (screened === undefined) {
+      settings.logger.debug('Stack frame is not a resolvable http(s) position; frame skipped');
+      return undefined;
+    }
+
+    if (settings.devServerOrigin === undefined) {
+      settings.logger.debug(
+        'No dev-server origin was supplied, so no source map may be read; frame skipped',
+      );
+      return undefined;
+    }
+
+    return await resolveMappedFrame(screened, settings, newBudget(settings));
+  } catch (error) {
+    logSafely(settings.logger, 'Source-map resolution threw and was contained; frame skipped', {
+      reason: describeError(error),
+    });
+    return undefined;
+  }
+}
+
+/**
+ * Resolves a whole stack to the locations of the frames that could be mapped.
+ *
+ * Accepts the raw stack string — parsed with {@link parseStackFrames} — or
+ * frames a caller already parsed, which are re-screened individually.
+ *
+ * The result is **in original frame order and is not deduplicated**: the caller
+ * wants the chain, and two frames in one function (a callback and its
+ * enclosing call, a loop body) are two rungs of it. Frames that could not be
+ * resolved are simply absent, so the array is shorter than the stack and its
+ * indices do not correspond to frame positions.
+ *
+ * Three bounds apply, all of them about a click-to-source hop staying instant
+ * rather than about correctness:
+ *
+ * - at most {@link ResolveStackOptions.maxFrames} frames are considered, taken
+ *   from the top of the stack;
+ * - at most {@link ResolveStackOptions.maxMaps} **distinct** chunk maps are
+ *   looked up, after which a frame is resolved only if its chunk's map was
+ *   already loaded in this call;
+ * - each distinct chunk is looked up exactly once per call, whatever the cache
+ *   option, because a per-call memo sits in front of it.
+ *
+ * Frames are resolved one at a time rather than concurrently: that is what lets
+ * {@link ResolveStackOptions.signal} stop the work between frames, keeps the
+ * dev server to one in-flight request from this route, and makes the per-chunk
+ * memo effective instead of racing several lookups of the same map.
+ *
+ * Never throws and never rejects. An aborted call returns what it had already
+ * resolved.
+ *
+ * @param stack A stack string or pre-parsed frames.
+ * @param options See {@link ResolveStackOptions};
+ * {@link ResolveStackOptions.devServerOrigin} is required in behaviour.
+ * @returns The resolved locations, in frame order. Empty when nothing resolved.
+ */
+export async function resolveStack(
+  stack: string | readonly StackFrame[],
+  options: ResolveStackOptions,
+): Promise<SourceLocation[]> {
+  const located: SourceLocation[] = [];
+
+  const settings = settingsFor(options);
+  if (settings === undefined) {
+    return located;
+  }
+
+  try {
+    const frames = framesOf(stack, settings).slice(0, settings.maxFrames);
+    if (frames.length === 0) {
+      return located;
+    }
+
+    if (settings.devServerOrigin === undefined) {
+      settings.logger.debug(
+        'No dev-server origin was supplied, so no source map may be read; stack skipped',
+        { frames: frames.length },
+      );
+      return located;
+    }
+
+    const budget = newBudget(settings);
+
+    for (const frame of frames) {
+      if (settings.signal?.aborted === true) {
+        settings.logger.debug('Stack resolution stopped: the caller aborted', {
+          resolved: located.length,
+        });
+        break;
+      }
+
+      try {
+        const location = await resolveMappedFrame(frame, settings, budget);
+        if (location !== undefined) {
+          located.push(location);
+        }
+      } catch (error) {
+        // One frame can never abort the rest: this is a chain of independent
+        // lookups, and the other frames' locations are still worth returning.
+        settings.logger.debug('A stack frame threw during resolution and was skipped', {
+          reason: describeError(error),
+        });
+      }
+    }
+  } catch (error) {
+    // Reached only by something outside the per-frame guard above — parsing the
+    // stack, reading the abort signal, a logger that threw. Whatever resolved
+    // before it is still returned, because a partial chain is useful and an
+    // exception here is not.
+    logSafely(settings.logger, 'Stack resolution threw and was contained', {
+      reason: describeError(error),
+      resolved: located.length,
+    });
+  }
+
+  return located;
+}
+
+/**
+ * Normalises the two accepted stack forms into screened frames.
+ *
+ * Read through `unknown` for the same reason {@link normalizeOptions} is: a
+ * value that is neither a string nor an array yields no frames instead of a
+ * `TypeError` thrown past a caller who was promised an array.
+ */
+function framesOf(stack: string | readonly StackFrame[], settings: ResolverSettings): StackFrame[] {
+  const given: unknown = stack;
+
+  if (typeof given === 'string') {
+    return parseStackFrames(given);
+  }
+
+  if (!Array.isArray(given)) {
+    settings.logger.debug('Stack was neither a string nor an array of frames; nothing to resolve');
+    return [];
+  }
+
+  const frames: StackFrame[] = [];
+  for (const candidate of given as readonly unknown[]) {
+    const screened = screenFrame(candidate);
+    if (screened !== undefined) {
+      frames.push(screened);
+    }
+  }
+
+  return frames;
+}
