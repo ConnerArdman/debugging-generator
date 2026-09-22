@@ -31,6 +31,7 @@
     "CartMutation",
     "CartMutationBodyInput",
     "CartOutcome",
+    "CartPage",
     "CartProvider",
     "CartProviderProps",
     "CartQueryInput",
@@ -106,6 +107,7 @@
     "OrderDraft",
     "OrderFailureCopy",
     "OrderHistoryList",
+    "OrderHistoryPage",
     "OrderHistoryRow",
     "OrderItem",
     "OrderLine",
@@ -129,6 +131,7 @@
     "ProductCardSkeleton",
     "ProductCardSkeletonProps",
     "ProductDetail",
+    "ProductDetailPage",
     "ProductGallery",
     "ProductImage",
     "ProductSlugParamsInput",
@@ -524,6 +527,7 @@
     "/api/mock/carrier",
     "/api/mock/payment",
     "/api/orders",
+    "/api/products",
     "/api/recommendations",
     "/api/shipping/quote"
   ]
