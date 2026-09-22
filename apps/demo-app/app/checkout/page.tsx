@@ -123,17 +123,21 @@ const CRUMBS: readonly BreadcrumbCrumb[] = [
 const FREIGHT_CARRIER = 'NLEX';
 
 /**
- * The three services this store offers, at their list rates.
+ * The three services this store offers, at their list rates - what the checkout form shows until
+ * the store has quoted a destination.
  *
  * A literal rather than a read, for two reasons. The page needs no database and no upstream call
  * to render, which is what lets `next build` produce this route on a clean clone with nothing
  * listening; and a rate is a property of a destination rather than of a service, so there is
  * nothing honest to ask for until an address has been filled in. What is quoted here is therefore
- * the list rate and the usual transit time of each service, and the form's service group refines
- * both against the destination once a postal code is present - matching a rate to a service by
- * `id`, which is why these identifiers are the store's own service vocabulary rather than wording
- * chosen for this page. `label` is what the group prints in either case, so the three names below
- * are the ones a buyer reads.
+ * the list rate and the usual transit time of each service, and it is superseded rather than
+ * refined: once `GET /api/shipping/quote` has answered for the destination in the fields, the
+ * services *it* names are the ones on offer, at its prices, and an order can be placed only with
+ * one of them. A service missing from that answer is not available for that destination, however
+ * plainly it is listed here. The identifiers below are the store's own service vocabulary rather
+ * than wording chosen for this page, which is what lets a quote's services line up with these by
+ * `id`; `label` is what the group prints in either case, so the three names below are the ones a
+ * buyer reads before a quote arrives.
  *
  * Every amount is a whole number of cents and every transit time a whole number of business days,
  * which is how both fields travel everywhere else in the storefront; nothing here is formatted,

@@ -12,6 +12,24 @@
  * not printed everywhere is the store's free-freight offer, which belongs to a surface quoting a
  * cart rather than one quoting an order; the last of the decisions below says why.
  *
+ * IT PRINTS NO FIGURE UNTIL THERE IS A CART BEHIND ONE
+ * `@/hooks/useCartSummary` publishes either the cart's totals or the reason it has none, and this
+ * block renders whichever of the two it is handed. Where the contents are not established - the
+ * first read still in flight, or a read that came back a failure - the rows are not rendered at
+ * all: a zero in the units row, a subtotal of nothing and the empty-cart reading of the
+ * free-freight offer would each be a claim about a cart the storefront never saw, and the charge
+ * rows and closing figure would be a total assembled on a subtotal nobody read. What is printed
+ * instead is the state, in words, with placeholder bars holding the rows' space while a read is
+ * still in flight; the block keeps its heading, its surface and the dispatch line either way, so
+ * the column it sits in neither collapses nor jumps when the figures arrive. The notice a buyer
+ * can act on, and the retry with it, belong to `./CartLineList`, which shows them for the same
+ * cart wherever these figures are withheld.
+ *
+ * A failure that arrives *after* a cart has been read is the other case, and it keeps its figures:
+ * the provider leaves the contents it last published in place when it refuses a change, so the
+ * summary still reports them as established and this block goes on quoting the last figures a
+ * buyer saw while the list beside it shows what was refused.
+ *
  * EVERY FIGURE ARRIVES ALREADY DERIVED
  * `@/hooks/useCartSummary` is the one place the cart's totals are worked out, and this component
  * reads its `CartSummary` and prints it. Nothing here multiplies, compares against a threshold or
@@ -94,6 +112,7 @@ import type { ReactElement, ReactNode } from 'react';
 import { Badge } from '@/components/ui/Badge';
 import { Card } from '@/components/ui/Card';
 import { Price } from '@/components/ui/Price';
+import { Skeleton } from '@/components/ui/Skeleton';
 import { VisuallyHidden } from '@/components/ui/VisuallyHidden';
 import { useCartSummary, type CartSummary } from '@/hooks/useCartSummary';
 import { formatQuantityLabel } from '@/lib/format';
@@ -161,6 +180,31 @@ const ACROSS_PREFIX = 'Across';
 /** Singular and plural of the line-count noun. A cart of one line holding five units is common. */
 const PRODUCT_NOUN = 'product';
 const PRODUCT_NOUN_PLURAL = 'products';
+
+/**
+ * What the block says in place of its figures while the cart is still being read.
+ *
+ * A cart nobody has read yet has no units, no subtotal and no free-freight standing, and a zero
+ * printed for any of them would read as a figure somebody established. So the rows are not
+ * rendered at all and this sentence stands where they would be, alongside the placeholder bars
+ * that hold their space.
+ */
+const CART_PENDING_NOTE = 'Your cart is being read. Its totals appear here once it has been.';
+
+/**
+ * What it says where the read came back a failure and the contents were never established.
+ *
+ * It states what is missing and why, and nothing about the cart itself - "your cart is empty" is
+ * exactly the claim this block must not make for contents nobody could see. The retry belongs to
+ * the failure notice `./CartLineList` shows for the same cart, so this line does not offer a
+ * second one or name where the first is: both surfaces are driven by the same published failure,
+ * so the notice is on screen wherever these figures are withheld.
+ */
+const CART_UNAVAILABLE_NOTE =
+  'Your cart could not be read, so there are no totals to show. They appear here once it has been read.';
+
+/** How many placeholder bars stand in for the rows while the cart is being read. */
+const PENDING_ROW_COUNT = 3;
 
 /** Divides the dispatch estimate from the cut-off countdown printed after it. */
 const NOTE_SEPARATOR = '\u00b7';
@@ -337,6 +381,75 @@ export function CartTotalsPanel({
   const derived = useCartSummary();
   const totals = summary ?? derived;
 
+  const title = (heading ?? DEFAULT_HEADING).trim();
+
+  // `undefined` rather than an empty element: `../ui/Card` renders neither the head slot nor its
+  // divider for an absent head, which is what a surface asking for no heading should get.
+  let head: ReactNode;
+  if (title.length > 0) {
+    head = variant === 'page' ? <h2>{title}</h2> : <h3>{title}</h3>;
+  }
+
+  const cutoff = dispatchCutoffNote(totals.dispatchCountdownMs);
+
+  /*
+   * The dispatch promise, which is the one line that holds in every state of the cart: it is the
+   * store's cut-off as the dispatch provider published it, not a property of what a buyer has
+   * collected, so it is printed whether or not there are figures to print beside it. Assembled
+   * once here and rendered by both arrangements below rather than written twice.
+   *
+   * The space after the hidden prefix is load-bearing: without it the accessible reading runs the
+   * two together, and the clipped span is out of flow, so the character collapses away as leading
+   * whitespace rather than indenting the visible line.
+   */
+  const dispatch = (
+    <p className={styles.dispatch}>
+      <VisuallyHidden>{DELIVERY_READING}</VisuallyHidden> {totals.estimatedDeliveryLabel}
+      {cutoff === null ? null : ` ${NOTE_SEPARATOR} ${cutoff}`}
+    </p>
+  );
+
+  /*
+   * NO FIGURE IS PRINTED FOR A CART NOBODY HAS READ.
+   *
+   * `@/hooks/useCartSummary` publishes either the cart's totals or the reason it has none, and
+   * this is the second of those: the first read is still in flight, or it came back a failure, so
+   * what the cart holds was never established. Every row below this point would be an invention -
+   * "0 items", a subtotal of nothing, and the empty-cart reading of the free-freight offer, which
+   * would tell a buyer their cart is empty when the truth is that the storefront cannot see it.
+   * The charge rows and the closing figure are equally impossible, because a total assembled on a
+   * subtotal nobody read is not a total of anything.
+   *
+   * So the rows are withheld and the state is stated instead, with the block keeping its heading,
+   * its surface and the dispatch line so the column it sits in neither collapses nor jumps when
+   * the figures arrive. A failure a buyer can act on is `./CartLineList`'s to show - it carries
+   * the notice and the retry for this same cart - and it is deliberately not repeated here.
+   *
+   * The early return is what makes this safe rather than merely correct today: `totals` is a
+   * discriminated union, so the arithmetic and the rows after it cannot be reached, and cannot
+   * compile, until the contents are established.
+   */
+  if (!totals.contentsKnown) {
+    return (
+      <Card className={className} pad={variant === 'page' ? 'lg' : 'md'} head={head}>
+        <div className={styles.root} data-variant={variant}>
+          {/* Bars while the read is in flight, so the rows' space is held and the block settles
+              rather than jumps when they land; nothing to hold once the read has failed, since
+              no figures are coming until a buyer retries it. */}
+          {totals.unknownReason === 'loading' ? (
+            <Skeleton shape="text" lines={PENDING_ROW_COUNT} />
+          ) : null}
+
+          <p className={styles.note}>
+            {totals.unknownReason === 'loading' ? CART_PENDING_NOTE : CART_UNAVAILABLE_NOTE}
+          </p>
+
+          {dispatch}
+        </div>
+      </Card>
+    );
+  }
+
   /*
    * The charges as the rows below iterate them, and the two questions the arrangement turns on.
    * An absent prop and an empty array are one case on purpose - a caller assembling charges
@@ -357,17 +470,6 @@ export function CartTotalsPanel({
     (running, charge) => running + (charge.amountCents ?? 0),
     totals.subtotalCents,
   );
-
-  const title = (heading ?? DEFAULT_HEADING).trim();
-
-  // `undefined` rather than an empty element: `../ui/Card` renders neither the head slot nor its
-  // divider for an absent head, which is what a surface asking for no heading should get.
-  let head: ReactNode;
-  if (title.length > 0) {
-    head = variant === 'page' ? <h2>{title}</h2> : <h3>{title}</h3>;
-  }
-
-  const cutoff = dispatchCutoffNote(totals.dispatchCountdownMs);
 
   /*
    * The free-freight line has three readings, and an empty cart needs its own: "add $750.00 for
@@ -523,13 +625,10 @@ export function CartTotalsPanel({
           </p>
         )}
 
-        {/* The space after the hidden prefix is load-bearing: without it the accessible reading
-            runs the two together, and the clipped span is out of flow, so the character collapses
-            away as leading whitespace rather than indenting the visible line. */}
-        <p className={styles.dispatch}>
-          <VisuallyHidden>{DELIVERY_READING}</VisuallyHidden> {totals.estimatedDeliveryLabel}
-          {cutoff === null ? null : ` ${NOTE_SEPARATOR} ${cutoff}`}
-        </p>
+        {/* The same line the no-figures arrangement above prints, assembled once beside the
+            countdown it reads: the dispatch promise is the store's, so it does not change with
+            what a buyer has collected. */}
+        {dispatch}
       </div>
     </Card>
   );

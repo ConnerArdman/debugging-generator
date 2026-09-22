@@ -93,7 +93,9 @@ interface Props {
 
   /**
    * The action is unavailable for a reason of the caller's, independent of any submission: an
-   * empty cart, an incomplete address, a shipping option not yet chosen.
+   * empty cart or one that could not be read, an incomplete address, a cart larger than the store
+   * quotes as one shipment, or no service the store currently offers for this destination chosen -
+   * which includes a service chosen before a quote arrived and then not offered by it.
    *
    * Kept apart from `pending` because the two are different states and the stylesheet paints them
    * differently - a not-allowed cursor against a progress one.

@@ -13,9 +13,10 @@
  *
  * WHAT THIS FILE OWNS, AND WHAT IT DELEGATES
  * It owns the column: the landmark and its heading, the order the blocks are read in, the rhythm
- * between them (`./CheckoutSummaryPanel.module.css`), the note under the figures, and the one
- * state the composed components cannot cover - the totals-only placing with nothing to total.
- * Everything else belongs to what it composes:
+ * between them (`./CheckoutSummaryPanel.module.css`), the note under the figures, and the states
+ * the composed components cannot cover - the totals-only placing with nothing to total, and the
+ * same placing for a cart whose contents nobody established. Everything else belongs to what it
+ * composes:
  *
  *   - `CartLineList` reads the cart itself and resolves its own states: a failure the shopper can
  *     retry, placeholders while the cart is first read, the block that says the cart is empty, and
@@ -42,9 +43,22 @@
  * separately scrolling list beside a long checkout form would hide the very lines the column
  * exists to show.
  *
+ * AN ORDER IS ONLY REVIEWED WHERE THERE IS A CART TO REVIEW
+ * `@/hooks/useCartSummary` publishes either the cart's totals or the reason there are none, and
+ * this column asks that question first. A cart whose contents were never established - the first
+ * read still in flight, or a read that came back a failure - has no order to review: the figures
+ * are not shown, the charges are not quoted over a subtotal nobody read, the closing estimate is
+ * not assembled from the two, and the note that qualifies them is not printed. Nor is the empty
+ * block: its illustration and "nothing to review yet" assert an order with nothing in it, which is
+ * a different statement from an order the storefront cannot see. Where the lines are listed, the
+ * state already has its surface in `CartLineList` - the failure notice with its retry, or the
+ * placeholders while the read is in flight - so this column adds nothing beside it and simply
+ * shows no figures.
+ *
  * NO FIGURE AND NO REQUEST ORIGINATES HERE
- * `@/hooks/useCartSummary` is read for three things only: whether the cart holds anything at all,
- * and the two counts the column's opening reading states. Nothing is summed, no amount is divided
+ * `@/hooks/useCartSummary` is read for three things only: whether the cart's contents are
+ * established and hold anything at all, and the two counts the column's opening reading states.
+ * Nothing is summed, no amount is divided
  * out of cents, no threshold is compared and there is no `Intl` instance in this file - every
  * string is either published by that hook or produced by `@/lib/format`, which pins the store's
  * locale, currency and time zone. The cart itself belongs to `@/providers/CartProvider`: this file
@@ -107,6 +121,27 @@ const ACROSS_WORD = 'across';
 
 /** The opening reading when the cart holds no lines, where the two counts say nothing useful. */
 const EMPTY_READING = 'There is nothing in this order yet.';
+
+/**
+ * The opening reading while the cart is still being read, where there are no counts to state.
+ *
+ * Deliberately not {@link EMPTY_READING}: a cart nobody has read yet is not an order with nothing
+ * in it, and a reader arriving at this landmark is entitled to the difference.
+ */
+const PENDING_READING = 'Your cart is being read, so there is nothing to review yet.';
+
+/** The opening reading where the read came back a failure and the contents were never established. */
+const UNAVAILABLE_READING = 'Your cart could not be read, so this order cannot be reviewed yet.';
+
+/**
+ * The line the totals-only placing prints in place of the figures while the contents are unknown.
+ *
+ * Short, because the reading above already carries the fuller sentence for a reader, and because
+ * the notice a buyer acts on belongs to `CartLineList` - which this placing has turned off. It
+ * states which of the two states the cart is in and nothing about what it holds.
+ */
+const PENDING_BODY = 'Your cart has not been read yet.';
+const UNAVAILABLE_BODY = 'Your cart could not be read.';
 
 /** The heading and sentence of the block shown when there is nothing to total. */
 const EMPTY_HEADING = 'Nothing to review yet';
@@ -224,29 +259,48 @@ export function CheckoutSummaryPanel({
   const title = trimmed.length > 0 ? trimmed : DEFAULT_HEADING;
 
   /*
-   * The counts as words, taken from the summary rather than counted here: `unitCountLabel` is the
-   * grouped wording the hook publishes, and the line count goes through the same formatter every
-   * other count in the storefront does.
-   */
-  const units = `${summary.unitCountLabel} ${summary.unitCount === 1 ? UNIT_NOUN : UNIT_NOUN_PLURAL}`;
-  const products = `${formatQuantityLabel(summary.lineCount)} ${
-    summary.lineCount === 1 ? PRODUCT_NOUN : PRODUCT_NOUN_PLURAL
-  }`;
-
-  /*
    * One sentence, read only to assistive technology, that says what the column covers before
    * either block below it is reached. A shopper sees the same thing at a glance from the lines and
    * the figures; a reader arriving at the landmark has neither yet.
+   *
+   * Which sentence it is turns on whether the cart's contents are established at all.
+   * `@/hooks/useCartSummary` publishes either the totals or the reason there are none, so an
+   * unread cart states that it is unread: the counts do not exist to be quoted, and "there is
+   * nothing in this order yet" would tell a buyer their cart is empty when the storefront simply
+   * cannot see it. The counts come from the summary rather than being counted here -
+   * `unitCountLabel` is the grouped wording the hook publishes, and the line count goes through
+   * the same formatter every other count in the storefront does.
    */
-  const reading = summary.isCartEmpty ? EMPTY_READING : `${units} ${ACROSS_WORD} ${products}`;
+  let reading: string;
+  if (!summary.contentsKnown) {
+    reading = summary.unknownReason === 'loading' ? PENDING_READING : UNAVAILABLE_READING;
+  } else if (summary.isCartEmpty) {
+    reading = EMPTY_READING;
+  } else {
+    const units = `${summary.unitCountLabel} ${
+      summary.unitCount === 1 ? UNIT_NOUN : UNIT_NOUN_PLURAL
+    }`;
+    const products = `${formatQuantityLabel(summary.lineCount)} ${
+      summary.lineCount === 1 ? PRODUCT_NOUN : PRODUCT_NOUN_PLURAL
+    }`;
+
+    reading = `${units} ${ACROSS_WORD} ${products}`;
+  }
 
   /*
    * The figures are shown whenever there is a cart to total, and also whenever the lines are
    * listed - `CartLineList` says that the cart is empty in that case, and the figures beneath it
    * still state the free-freight offer. Only the totals-only placing with an empty cart has
    * nothing to print, and that is the one state this column resolves itself.
+   *
+   * A cart whose contents are not established shows no figures at all, whichever placing this is:
+   * charges quoted over a subtotal nobody read, and a closing figure assembled from the two, would
+   * be an estimate of an order the storefront cannot see. Where the lines are listed, that state
+   * already has a surface - `CartLineList` carries the failure notice with its retry, or the
+   * placeholders while the read is in flight - so this column adds nothing beside it; where they
+   * are not, the block below states it in a line of its own.
    */
-  const totalsShown = showLines || !summary.isCartEmpty;
+  const totalsShown = summary.contentsKnown && (showLines || !summary.isCartEmpty);
 
   /*
    * What the order adds to the merchandise subtotal, as the totals block prints it.
@@ -295,23 +349,41 @@ export function CheckoutSummaryPanel({
         <div className={styles.totals}>
           <CartTotalsPanel variant="page" heading={SUPPRESSED_TOTALS_HEADING} charges={charges} />
         </div>
-      ) : (
-        /*
-         * `.empty` is placement - it gives the block room in the column - so it goes on a wrapper
-         * rather than on `BlankSlate`, whose own module owns the column the illustration, heading
-         * and sentence are stacked in. No `action`: this file has no token-styled link of its own,
-         * and the site header offers the way back to the catalog from every page.
-         */
+      ) : null}
+
+      {/*
+        The two states the column resolves itself, and neither of them is the other. A cart the
+        server answered with nothing in gets the blank slate, which says so; a cart whose contents
+        nobody established gets a line stating that instead, because the illustration and "nothing
+        to review yet" would both assert an empty order the storefront never saw. Where the lines
+        are listed there is nothing to add in either case - `CartLineList` owns the empty block and
+        the failure notice for the same cart - so this is the totals-only placing alone.
+
+        `.empty` is placement - it gives the block room in the column - so it goes on a wrapper
+        rather than on `BlankSlate`, whose own module owns the column the illustration, heading and
+        sentence are stacked in. No `action`: this file has no token-styled link of its own, and
+        the site header offers the way back to the catalog from every page.
+      */}
+      {totalsShown || showLines ? null : (
         <div className={styles.empty}>
-          <BlankSlate art="empty-cart" alt={EMPTY_ART_ALT} heading={EMPTY_HEADING}>
-            {EMPTY_BODY}
-          </BlankSlate>
+          {summary.contentsKnown ? (
+            <BlankSlate art="empty-cart" alt={EMPTY_ART_ALT} heading={EMPTY_HEADING}>
+              {EMPTY_BODY}
+            </BlankSlate>
+          ) : (
+            <p className={styles.meta}>
+              {summary.unknownReason === 'loading' ? PENDING_BODY : UNAVAILABLE_BODY}
+            </p>
+          )}
         </div>
       )}
 
       {/* The note explains what the figures above it leave out, so it is printed only when there
-          are figures to qualify. */}
-      {summary.isCartEmpty ? null : <p className={styles.meta}>{REVIEW_NOTE}</p>}
+          are figures to qualify - never for an empty cart, and never for one whose contents were
+          not established, where there is no estimate for it to qualify. */}
+      {summary.contentsKnown && !summary.isCartEmpty ? (
+        <p className={styles.meta}>{REVIEW_NOTE}</p>
+      ) : null}
     </section>
   );
 }

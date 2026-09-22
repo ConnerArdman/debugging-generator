@@ -67,6 +67,13 @@ import {
  * disagree: the label is the wording the shipping group prints for that service, and `amountCents` is
  * the rate that group prints beside it, so the freight row under the lines and the chosen radio row
  * always quote one figure.
+ *
+ * All three come from the same place, and it is the live quote for the destination and shipment in
+ * the form's fields rather than the store's list rates. A charge is published only while the store
+ * is currently offering that service at that price, so a quote that omits the chosen service - or a
+ * shipment with no quote at all - publishes `null` instead, and the review column prints the row as
+ * a charge still to be established. That is what keeps this channel from carrying a figure the order
+ * would not be charged.
  */
 export interface SelectedFreight {
   /** The chosen service's id, as `ShippingOption.id` and as the order's `shippingOptionId`. */

@@ -23,7 +23,6 @@ import { Badge } from '@/components/ui/Badge';
 import { Button } from '@/components/ui/Button';
 import { Input } from '@/components/ui/Input';
 import { VisuallyHidden } from '@/components/ui/VisuallyHidden';
-import { useCart } from '@/hooks/useCart';
 import { useCartSummary } from '@/hooks/useCartSummary';
 import { formatQuantityLabel } from '@/lib/format';
 
@@ -135,13 +134,17 @@ import styles from './SiteHeader.module.css';
  *
  * It names a figure only where the storefront has one. The cart's lines come from a read, so an
  * empty count is either a cart the server answered with nothing in it or a cart nobody has
- * established - the first read still in flight, or failed - and the summary alone cannot tell those
- * apart. The bar therefore reads `syncStatus` and `cartError` from `@/hooks/useCart` as well, and
- * names the state instead of printing a zero nobody read: "Cart contents loading", "Cart contents
- * unavailable". Lines already in hand stay named with their count whatever the cart is doing, since
- * a refused change leaves the cart it published in place. This is the same distinction
+ * established - the first read still in flight, or failed - and `@/hooks/useCartSummary` is where
+ * the storefront tells those apart: it publishes the totals for a cart whose contents were
+ * established and, for one whose were not, the reason there are none, which the bar reads off
+ * `contentsKnown`. So the control names the state instead of printing a zero nobody read: "Cart
+ * contents loading", "Cart contents unavailable". Lines already in hand stay named with their
+ * count whatever the cart is doing, since a refused change leaves the cart it published in place
+ * and the summary goes on reporting those contents as established. This is the same distinction
  * `@/components/cart/CartLineList` draws when it shows a failure notice rather than "your cart is
- * empty", said in the words a control can carry.
+ * empty", said in the words a control can carry - and reading it from the summary rather than
+ * re-deriving it here is what keeps the badge, the sheet, `/cart` and the checkout review from
+ * disagreeing about whether there is a cart at all.
  *
  * A change to the count is *announced* from a region beside the control, built out of the cart's
  * own figures and nothing else. The bar reads other published values as well, and a region whose
@@ -422,49 +425,37 @@ export function SiteHeader(props: Props): ReactElement {
   // DOM types disagree about what a timer handle is, and this file needs neither name.
   const pending = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // The cart's figures, summed in one place for every surface that quotes them.
+  // The cart's figures, summed in one place for every surface that quotes them - or, where its
+  // contents were never established, the reason there are no figures to quote. `contentsKnown` is
+  // what tells the two apart, and the bar reads it rather than deriving the distinction from the
+  // cart's standing with the server: the summary is where the storefront decides it once, so the
+  // count up here cannot disagree with the totals in the sheet about whether there is a cart.
   const summary = useCartSummary();
-
-  // The same cart, read for what the figures alone cannot say: whether the storefront has
-  // established what it holds. `@/hooks/useCart` is the sanctioned accessor and the hook the
-  // summary is derived from, so this adds no second subscription and no second arithmetic - and it
-  // deliberately reads only `syncStatus` and `cartError`, never a value on the provider's ticker.
-  const cart = useCart();
 
   // The product the reader is on, as the product page published it, or `null` anywhere else.
   const activeProductId = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
 
-  // Singular or plural, decided on the figure itself rather than on the string printed from it, so
-  // a grouped "1,000" is still "items" and a plain "1" is an "item".
-  const unit = summary.unitCount === 1 ? CART_UNIT_WORD : CART_UNIT_WORD_PLURAL;
-
-  // Whether the figures describe contents the storefront has actually established.
-  //
-  // `@/hooks/useCartSummary` counts the lines the cart published, and the provider fills those
-  // lines from a read: an empty array is a cart the server answered with nothing in it, and it is
-  // equally what a first read that is still in flight or that failed leaves behind - which the
-  // provider's own contract states on `lines`. Lines in hand are therefore established whatever the
-  // cart is doing, because a refused change leaves the cart it last published in place; an empty
-  // array is established only when nothing is in flight and no failure is standing.
-  const known = !summary.isCartEmpty || (cart.syncStatus !== 'loading' && cart.cartError === null);
-
-  // The hidden half of the cart control's accessible name, built from the cart's counts and its
-  // standing with the server, and from nothing else.
+  // The hidden half of the cart control's accessible name, built from the cart's counts, or from
+  // the state where there are none, and from nothing else.
   //
   // A figure is named only where there is a figure to name. An unread cart is not a cart holding
   // nothing, so it says which of the two it is instead of printing a zero nobody established - the
   // same distinction `CartLineList` draws when it shows a failure notice rather than "your cart is
-  // empty", said in the words a control can carry. Short, single-token locals throughout this
-  // component: the repository's hardcoding guard harvests every multi-token name this workspace
-  // declares into a policy the debugging product may then not use, so the bar spends none of that
-  // vocabulary on a local.
-  const detail = known
-    ? summary.isCartEmpty
-      ? CART_EMPTY_DETAIL
-      : `${CART_DETAIL_PREFIX}${summary.unitCountLabel}${unit}`
-    : cart.cartError !== null
-      ? CART_UNAVAILABLE_DETAIL
-      : CART_LOADING_DETAIL;
+  // empty", said in the words a control can carry. Singular or plural is decided on the figure
+  // itself rather than on the string printed from it, so a grouped "1,000" is still "items" and a
+  // plain "1" is an "item". Short, single-token locals throughout this component: the repository's
+  // hardcoding guard harvests every multi-token name this workspace declares into a policy the
+  // debugging product may then not use, so the bar spends none of that vocabulary on a local.
+  let detail: string;
+  if (!summary.contentsKnown) {
+    detail = summary.unknownReason === 'loading' ? CART_LOADING_DETAIL : CART_UNAVAILABLE_DETAIL;
+  } else if (summary.isCartEmpty) {
+    detail = CART_EMPTY_DETAIL;
+  } else {
+    const unit = summary.unitCount === 1 ? CART_UNIT_WORD : CART_UNIT_WORD_PLURAL;
+
+    detail = `${CART_DETAIL_PREFIX}${summary.unitCountLabel}${unit}`;
+  }
 
   // Focus follows the disclosure open, in an effect rather than in the toggle's own handler: below
   // the breakpoint the stylesheet draws nothing until `data-open` has been painted, and an element
@@ -742,13 +733,13 @@ export function SiteHeader(props: Props): ReactElement {
                 under `noUncheckedIndexedAccess`, which this workspace's `exactOptionalPropertyTypes`
                 will not hand to an optional `string` - the same composition every other caller of a
                 primitive in this application uses, and no assertion. */}
-            {summary.isCartEmpty ? null : (
+            {summary.contentsKnown && !summary.isCartEmpty ? (
               <span aria-hidden="true">
                 <Badge tone="info" size="sm" className={clsx(styles.cartBadge)}>
                   {formatQuantityLabel(summary.unitCount)}
                 </Badge>
               </span>
-            )}
+            ) : null}
           </div>
 
           {/* The announcement of a change, kept alongside the name above: the name answers "what
@@ -764,7 +755,9 @@ export function SiteHeader(props: Props): ReactElement {
               a reader asks it. */}
           <VisuallyHidden>
             <span role="status" aria-live="polite">
-              {known ? `${formatQuantityLabel(summary.unitCount)}${CART_COUNT_SUFFIX}` : null}
+              {summary.contentsKnown
+                ? `${formatQuantityLabel(summary.unitCount)}${CART_COUNT_SUFFIX}`
+                : null}
             </span>
           </VisuallyHidden>
         </div>

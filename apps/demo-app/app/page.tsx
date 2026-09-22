@@ -7,11 +7,20 @@
  * and hands the two answers to `CatalogGrid`. Nothing else happens here.
  *
  * WHAT THIS FILE OWNS, AND WHAT IT DOES NOT
- * It owns the request - the query string, the two service calls, the failure path - and the page's
- * heading block. Everything below the heading belongs to `CatalogGrid`: the search and sort
- * toolbar, the category chips, the cards, the pager, the blank slate and the notice shown when a
- * listing did not arrive intact. That division is why no control, no card and no piece of state
- * appears in this file, and why it declares no component of its own.
+ * It owns the request - the query string, the two service calls, the failure path - the page's
+ * heading block, and the one sentence that stands in for a listing that did not arrive. Everything
+ * a listing that did arrive is made of belongs to `CatalogGrid`: the search and sort toolbar, the
+ * category chips, the cards, the pager and the blank slate. That division is why no control, no
+ * card and no piece of state appears in this file, and why it declares no component of its own.
+ *
+ * THE ANSWER IS ONE THING OR THE OTHER
+ * A read either produced a listing or produced nothing, and `Outcome` below is which. The two
+ * states are exclusive by construction rather than by a condition somebody has to remember to
+ * write, so this page cannot show a grid and a failure at the same time - and, more to the point,
+ * cannot show a failure and an empty catalog at the same time. There is no empty page to hand over
+ * on the failure path, because that path carries no page at all: a reader whose listing is missing
+ * is told exactly that and nothing about what the catalog holds, which on that path is the only
+ * honest thing to say, since this page does not know.
  *
  * THE LISTING COMES FROM THE ENDPOINT
  * `GET /api/products` is the catalog's listing, and this page reads it over HTTP through
@@ -35,18 +44,28 @@
  * `revalidate`, no cached wrapper around either service call, and no `runtime` override - the
  * segment runs on Node, like the rest of the application.
  *
+ * THE ADDRESS IS THE LISTING
+ * The query string is the only statement of what the reader is looking at. This page parses it,
+ * asks the endpoint for exactly that listing, and hands the parsed values down beside the answer,
+ * so the toolbar, the chips and the pager open showing the filter, the ordering and the page the
+ * products beside them were actually read under. A control the reader then changes writes a new
+ * address and the server answers it; nothing narrows or reorders a listing after it has been read,
+ * because what arrived is one page of a filtered, ordered, counted query rather than a sample of
+ * the catalog to sift through locally.
+ *
  * A MALFORMED ADDRESS IS STILL AN ADDRESS
  * Both ways a request can be wrong are answered with a page rather than an error. A query string
  * the schema rejects - `?page=abc`, a term past the length bound, a parameter nobody sends - falls
  * back to the schema's own defaults, because the reader who followed a truncated link wants the
- * catalog, not a diagnostic. A listing that could not be read renders the page's chrome, an empty
- * page of products and one reader-facing sentence, which `CatalogGrid` shows above its grid.
+ * catalog, not a diagnostic. A listing that could not be read renders the page's chrome and one
+ * reader-facing sentence in place of the listing.
  */
 
 import type { Metadata } from 'next';
 import type { ReactElement } from 'react';
 
 import { CatalogGrid } from '@/components/catalog/CatalogGrid';
+import { Alert } from '@/components/ui/Alert';
 import { StorefrontApiError, loadCatalogPage } from '@/lib/api-client';
 import type { CategoryOption, PagedList, ProductSummary } from '@/lib/types';
 import { storefrontOrigin } from '@/server/origin';
@@ -91,6 +110,15 @@ export const metadata: Metadata = {
  */
 const LOAD_FAILURE = 'We could not load the catalog just now. Please try again in a moment.';
 
+/**
+ * The heading above that sentence.
+ *
+ * It says which part of the page is missing, because the notice takes the listing's place and a
+ * sentence on its own would leave a reader to work out what the empty space below the heading was
+ * meant to hold. It states the outcome rather than a cause, for the reason given above.
+ */
+const LOAD_FAILURE_TITLE = 'The catalog could not be loaded';
+
 interface Props {
   /**
    * The route's query string. It is a promise in Next.js 16 and is awaited before any key is read,
@@ -99,17 +127,34 @@ interface Props {
   searchParams: Promise<Record<string, string | string[] | undefined>>;
 }
 
-/** What the page renders: one page of products, the chips' categories, and how the read went. */
-interface Listing {
-  /** The page the catalog answered with, or an empty page when it could not be read. */
-  products: PagedList<ProductSummary>;
+/**
+ * What one read of the catalog produced: the listing, or the sentence to show in its place.
+ *
+ * Two states rather than a payload with an optional message beside it. A message that travelled
+ * alongside a payload would need a payload to travel with, and the only one a failed read has to
+ * offer is an invented empty page - which, once it reaches a component, is indistinguishable from a
+ * catalog that genuinely has nothing published in it. Giving the failure no payload at all is what
+ * settles that at the source: the grid is only ever handed a listing that exists, so the question
+ * of what an empty `items` array means never has two answers.
+ */
+type Outcome =
+  | {
+      /** The page the catalog answered with. */
+      readonly products: PagedList<ProductSummary>;
 
-  /** Every category the chip row offers; empty when the listing could not be read. */
-  categories: readonly CategoryOption[];
+      /** Every category the chip row offers, in the order the reader sees them. */
+      readonly categories: readonly CategoryOption[];
 
-  /** A reader-facing sentence describing a listing that did not arrive, or `null` when it did. */
-  loadError: string | null;
-}
+      readonly failure: null;
+    }
+  | {
+      readonly products: null;
+
+      readonly categories: null;
+
+      /** A reader-facing sentence describing a listing that did not arrive. */
+      readonly failure: string;
+    };
 
 /**
  * The query string as a record of single values, which is the shape `catalogQuerySchema` reads.
@@ -186,10 +231,14 @@ function notice(error: unknown): string {
  * log for whoever is watching the dev server, carrying a fixed label and the failure's kind only -
  * a message or a stack may hold a path, a statement or a connection string.
  *
- * @param query A parsed catalog query; its `page` and `pageSize` size the empty page below.
- * @returns The listing, with `loadError` set when it could not be read.
+ * The failure branch fabricates nothing. It returns no page, no categories and no counts, because
+ * the read established none of them: a listing this function did not obtain is absent from its
+ * answer rather than represented by an empty one.
+ *
+ * @param query A parsed catalog query; its filters, ordering and page window are the request.
+ * @returns The listing, or the sentence to render in its place.
  */
-async function load(query: CatalogQueryInput): Promise<Listing> {
+async function load(query: CatalogQueryInput): Promise<Outcome> {
   try {
     const origin = storefrontOrigin();
 
@@ -207,18 +256,14 @@ async function load(query: CatalogQueryInput): Promise<Listing> {
       listCategoryOptions(),
     ]);
 
-    return { products, categories, loadError: null };
+    return { products, categories, failure: null };
   } catch (error) {
     console.error(
       'Lumen Supply: the catalog listing could not be read:',
       error instanceof Error ? error.name : typeof error,
     );
 
-    return {
-      products: { items: [], total: 0, page: query.page, pageSize: query.pageSize },
-      categories: [],
-      loadError: notice(error),
-    };
+    return { products: null, categories: null, failure: notice(error) };
   }
 }
 
@@ -233,12 +278,21 @@ async function load(query: CatalogQueryInput): Promise<Listing> {
  *
  * Everything handed to `CatalogGrid` is already serializable: the catalog's data-transfer types
  * carry integer cents and ISO-8601 strings and no `Date`, `Decimal` or class instance, so the two
- * answers cross into the client component exactly as the service produced them.
+ * answers cross into the client component exactly as the service produced them. The query crosses
+ * with them, as the three values that describe the listing to a reader - the term searched for, the
+ * category filtered to and the ordering applied - each in the canonical form the schema parsed it
+ * into. The page window is not among them: the answer already carries the page it was built with,
+ * so passing it a second time would be two statements of one fact.
+ *
+ * A listing that could not be read takes the grid's place with the notice instead, rather than
+ * being handed over as an empty one. `warning` rather than `danger`, because `ui/Alert` announces
+ * `danger` assertively and this failure is here on arrival - the reader did not cause it by
+ * pressing anything.
  */
 export default async function CatalogPage({ searchParams }: Props): Promise<ReactElement> {
   const requested = catalogQuerySchema.safeParse(scalars(await searchParams));
   const query = requested.success ? requested.data : catalogQuerySchema.parse({});
-  const { products, categories, loadError } = await load(query);
+  const outcome = await load(query);
 
   return (
     <div className="ls-stack">
@@ -250,7 +304,23 @@ export default async function CatalogPage({ searchParams }: Props): Promise<Reac
         </p>
       </header>
 
-      <CatalogGrid products={products} categories={categories} loadError={loadError} />
+      {outcome.products === null ? (
+        <div className="ls-notice">
+          <Alert tone="warning" title={LOAD_FAILURE_TITLE}>
+            {outcome.failure}
+          </Alert>
+        </div>
+      ) : (
+        <CatalogGrid
+          products={outcome.products}
+          categories={outcome.categories}
+          query={{
+            search: query.search,
+            categorySlug: query.categorySlug,
+            sort: query.sort,
+          }}
+        />
+      )}
     </div>
   );
 }

@@ -24,6 +24,16 @@
  * `CartTotalsPanel`. Restating any of it here would give the cart two descriptions in one
  * document and one file to forget when the other changed.
  *
+ * That includes the state where the storefront has not established what the cart holds, which is
+ * why both blocks are mounted unconditionally below. A server component cannot read the cart -
+ * its contents belong to the client provider - so the decision cannot be taken here at all, and
+ * it does not need to be: `@/hooks/useCartSummary` publishes either the cart's totals or the
+ * reason there are none, and each block resolves that for itself. `CartTotalsPanel` withholds
+ * every figure while the contents are unestablished, printing the state in their place rather
+ * than a subtotal of nothing, and `CartLineList` carries the failure notice with its retry, or
+ * the placeholders while the first read is in flight. Gating either of them from this file would
+ * be this page deciding a question it has no way to answer.
+ *
  * WHY EACH COMPONENT IS PASSED SO LITTLE
  * `variant="page"` is the whole of the configuration, and it is what selects the roomier of the two
  * arrangements each component declares - the list scrolls with the document rather than capping

@@ -9,7 +9,7 @@ import { Badge } from '@/components/ui/Badge';
 import { BlankSlate } from '@/components/ui/BlankSlate';
 import { Button } from '@/components/ui/Button';
 import { VisuallyHidden } from '@/components/ui/VisuallyHidden';
-import { useCart } from '@/hooks/useCart';
+import { useCartSummary } from '@/hooks/useCartSummary';
 import { formatQuantityLabel } from '@/lib/format';
 
 import { CartLineList } from './CartLineList';
@@ -34,8 +34,14 @@ import styles from './CartDrawer.module.css';
  * file has no floating one to answer for.
  *
  * WHAT IT READS
- * `@/hooks/useCart` and nothing else: `lines`, to decide whether there is a total worth footing the
- * sheet with, and `lineCount` for the badge beside the heading. Every mutation stays where its
+ * `@/hooks/useCartSummary` and nothing else: `contentsKnown` with `isCartEmpty`, to decide whether
+ * there is a total worth footing the sheet with, and `lineCount` for the badge beside the heading.
+ * The summary is read rather than the cart counted here because an empty set of lines is two
+ * different statements - a cart the server answered with nothing in it, or a cart whose read is
+ * still in flight or came back a failure - and that hook is where the storefront tells them apart
+ * once, for the badge up here, the totals in the foot, `/cart` and the checkout review alike. So a
+ * cart nobody has read is announced by neither a zero in the chip nor an empty foot: the body's
+ * own notice says what happened. Every mutation stays where its
  * control is - a quantity stepper and a remove button, inside `./CartLineRow.tsx` - so this
  * component changes nothing about the cart and issues no request of its own.
  *
@@ -203,9 +209,16 @@ interface Props {
 export function CartDrawer(props: Props): ReactElement | null {
   const { open, onClose } = props;
 
-  // The published cart. `lineCount` is the number of lines, which is what this sheet lists and what
-  // the badge beside the heading counts; the header's own badge quotes `itemCount` instead.
-  const { lines, lineCount } = useCart();
+  // The published cart's totals, or the reason it has none: `@/hooks/useCartSummary` publishes a
+  // reading discriminated by `contentsKnown`, which is what says whether the storefront has
+  // established what the cart holds at all. `lineCount` is the number of lines, which is what this
+  // sheet lists and what the badge beside the heading counts; the header's own badge quotes units.
+  //
+  // Read from the summary rather than counted from the cart here, and for one reason: an empty
+  // `lines` array is a cart the server answered with nothing in it *or* a cart whose read is still
+  // in flight or failed, and the summary is where the storefront tells those apart once. A badge
+  // counting the array directly would print "0 lines in your cart" for contents nobody read.
+  const summary = useCartSummary();
 
   // Ties `aria-labelledby` on the sheet to the heading inside it. `useId` rather than a counter or a
   // random value: React produces the same id on the server and during hydration, so the reference is
@@ -354,13 +367,19 @@ export function CartDrawer(props: Props): ReactElement | null {
 
           {/* The count, formatted by the application's own number formatter rather than by an
               `Intl` instance built here, so every figure in the storefront groups its digits the
-              same way. */}
-          <Badge size="sm">
-            {formatQuantityLabel(lineCount)}
-            <VisuallyHidden>
-              {lineCount === 1 ? COUNT_SUFFIX_ONE : COUNT_SUFFIX_MANY}
-            </VisuallyHidden>
-          </Badge>
+              same way - and printed only where the cart's contents were established. A cart still
+              being read, or one whose read failed, has no count to put in a chip: a zero here
+              would state that the sheet is empty while the body below it is showing placeholders
+              or a failure notice for the very same cart. `CartLineList` says which of the two it
+              is, in the one place a reader is looking. */}
+          {summary.contentsKnown ? (
+            <Badge size="sm">
+              {formatQuantityLabel(summary.lineCount)}
+              <VisuallyHidden>
+                {summary.lineCount === 1 ? COUNT_SUFFIX_ONE : COUNT_SUFFIX_MANY}
+              </VisuallyHidden>
+            </Badge>
+          ) : null}
 
           {/* `.close` is placement only - this control's chrome, its focus ring and its explicit
               `type="button"` are `../ui/Button`'s - and it belongs on the control itself rather
@@ -390,9 +409,11 @@ export function CartDrawer(props: Props): ReactElement | null {
           />
         </div>
 
-        {/* Totals and the two ways on, and only once there is a line to total. An explicit ternary
-            rather than `&&`: `0` is what a length yields and React would print it. */}
-        {lines.length === 0 ? null : (
+        {/* Totals and the two ways on, and only once there is a line to total - which is a cart
+            whose contents were established and hold something, exactly the two conditions below.
+            A cart nobody could read has nothing to total and nowhere to send a reader from here,
+            so the foot stays out of the sheet and the body's own notice stands alone. */}
+        {summary.contentsKnown && !summary.isCartEmpty ? (
           <div className={styles.foot}>
             <CartTotalsPanel variant="drawer" />
 
@@ -407,7 +428,7 @@ export function CartDrawer(props: Props): ReactElement | null {
               {VIEW_CART_LABEL}
             </Link>
           </div>
-        )}
+        ) : null}
       </div>
     </div>,
     document.body,

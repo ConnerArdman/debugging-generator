@@ -8,7 +8,7 @@
  * chosen freight service, the delivery note, the inline validation of all of them, the single
  * request that turns the cart into an order, and the two outcomes that request has.
  *
- * Three decisions shape the whole file.
+ * Six decisions shape the whole file.
  *
  *   1. THE FIELDS BELONG HERE, THE CONTROLS DO NOT. Every control is a primitive from
  *      `@/components/ui` inside a `FormField`, which owns the label, the hint, the message and the
@@ -59,6 +59,19 @@
  *      `GET /api/shipping/quote` per shipment, because the panel asks for nothing once the lookup
  *      is handed to it.
  *
+ *   6. THE LIVE QUOTE IS THE AUTHORITY ON WHAT MAY BE ORDERED, AND THE CART'S SIZE IS CHECKED
+ *      BEFORE IT IS QUOTED. The services this form is handed are list rates for an unnamed
+ *      destination; the quote is the store's answer for the destination and the shipment in the
+ *      fields. So once a quote has settled, the service the order names is looked up in *it*: a
+ *      service the quote omits, and every service of a quote that names none, is not something
+ *      this order can be placed with, and the place-order control is unavailable until a quoted
+ *      service is chosen. That is not this form second-guessing the endpoint - `POST /api/checkout`
+ *      re-quotes and refuses an unoffered service outright - it is this form agreeing with it
+ *      instead of showing a buyer a service that would be refused. The cart's size is the same
+ *      kind of statement made earlier: freight is quoted per shipment and a shipment carries at
+ *      most `MAX_SHIPMENT_UNITS` units, so a larger cart is named as the thing to change rather
+ *      than sent to be refused twice - once by the quote and once by the order.
+ *
  * Validation is a mirror of the server's bounds, not a second opinion about them: the lengths and
  * shapes below are the ones `checkoutBodySchema` enforces, so a value this form accepts is a value
  * that endpoint accepts, and the endpoint remains the authority on everything that depends on data
@@ -76,9 +89,10 @@ import { FormField } from '@/components/ui/FormField';
 import { Input } from '@/components/ui/Input';
 import { Select } from '@/components/ui/Select';
 import { useCart } from '@/hooks/useCart';
-import { useFreightQuote } from '@/hooks/useShippingEta';
+import { useFreightQuote, type FreightQuoteState } from '@/hooks/useShippingEta';
 import { StorefrontApiError, submitCheckout } from '@/lib/api-client';
 import { formatQuantityLabel } from '@/lib/format';
+import { MAX_SHIPMENT_UNITS } from '@/lib/types';
 import type {
   CheckoutDraft,
   CheckoutResult,
@@ -459,6 +473,58 @@ function collectFieldErrors(draft: CheckoutDraft): CheckoutFieldErrors {
   return problems;
 }
 
+/**
+ * What is wrong with the freight service this order would be placed with, or `undefined` when a
+ * service the store currently quotes has been chosen.
+ *
+ * {@link collectFieldErrors} judges the draft's shape and deliberately nothing that depends on the
+ * state of the store; this judges the one thing about the order that is settled outside the fields
+ * - which services the store will sell for this destination and shipment - and it is a separate
+ * function for that reason. The two are merged into one validation pass, and this message wins for
+ * the shipping field, because "choose a shipping service" is unhelpful wording for a group that is
+ * still being quoted, that could not be quoted, or that has nothing in it to choose.
+ *
+ * The cases are ordered by what a buyer has to do about them. A shipment larger than one
+ * consignment is first: no quote exists for it and none is coming, so nothing else that could be
+ * said is actionable. A service drawn from the current quote is the end of the matter. Otherwise
+ * there is no such service, and the message says which of the three reasons applies: the lookup is
+ * still running, it has not run or did not come back, or it came back naming nothing the store can
+ * sell to this destination.
+ *
+ * @param freight The freight lookup for the destination and shipment in the fields.
+ * @param quotedChoice The service drawn from the settled quote, or `undefined` when it offers none.
+ * @returns The message for the shipping field, or `undefined` when there is nothing wrong.
+ */
+function freightSelectionProblem(
+  freight: FreightQuoteState,
+  quotedChoice: ShippingOption | undefined,
+): string | undefined {
+  const { shipmentLimit } = freight;
+
+  if (shipmentLimit !== null) {
+    return (
+      `Shipping cannot be quoted for an order of ${formatQuantityLabel(shipmentLimit.units)} units; ` +
+      `a shipment carries at most ${formatQuantityLabel(shipmentLimit.maxUnits)}.`
+    );
+  }
+
+  if (quotedChoice !== undefined) {
+    return undefined;
+  }
+
+  if (freight.isQuoting) {
+    return 'Shipping services are still being quoted for this destination.';
+  }
+
+  if (freight.quote === null) {
+    return 'Shipping services have not been quoted for this destination yet.';
+  }
+
+  // A settled quote with a service in it always yields one to place the order with, so reaching
+  // here means the store answered for this destination and named nothing it can carry there.
+  return 'No shipping service is available for this destination.';
+}
+
 /** The label of the notice's control where placing the order again is the thing to do. */
 const RETRY_ORDER = 'Try again';
 
@@ -514,10 +580,20 @@ function checkoutFailureCopy(cause: unknown): OrderFailureCopy {
   }
 
   switch (cause.code) {
+    // Three things the buyer can act on reach this reason, and naming only the fields would send
+    // somebody to correct an address that was never the problem. The endpoint validates the
+    // contact and the destination, and it also rates the freight for the units it reserved - so a
+    // cart that grew past `MAX_SHIPMENT_UNITS` between this page's last reading of it and the
+    // submission is answered here too, which is the one case this form could not rule out in
+    // advance. The order is what the buyer checks first and the cart last, which is the order
+    // they are named in.
     case 'VALIDATION_FAILED':
       return {
         title: 'Check these order details',
-        body: 'Lumen Supply could not accept these details. Review the contact and address fields, then place the order again.',
+        body:
+          'Lumen Supply could not accept these details. Review the contact and address fields, ' +
+          `and check that the cart holds no more than ${formatQuantityLabel(MAX_SHIPMENT_UNITS)} ` +
+          'units, then place the order again.',
         action: RETRY_ORDER,
       };
     case 'NOT_FOUND':
@@ -597,9 +673,10 @@ function orderSizeLabel(itemCount: number, subtotalLabel: string): string {
  *
  * Two things are read from elsewhere and neither is state of this form's. The freight lookup for
  * the destination in the fields comes from `@/hooks/useShippingEta`, which owns the request and its
- * three outcomes; the charge channel comes from `./CheckoutCharges`, and all this form does with it
- * is publish what the buyer chose. The chosen service itself is derived from the option list and
- * that lookup on every render rather than stored, so it cannot go stale against either.
+ * outcomes - a quote, a lookup in flight, a failed lookup, and a shipment too large to quote at
+ * all; the charge channel comes from `./CheckoutCharges`, and all this form does with it is publish
+ * what the buyer chose. The chosen service itself is derived from that lookup's quote on every
+ * render rather than stored, so it cannot go stale against what the store is currently offering.
  *
  * Two handlers matter. `submitOrder` is the form's `onSubmit`, and it is described where it is
  * written. The other is the `void`-returning arrow the form attaches it with: a promise handed
@@ -665,38 +742,68 @@ export function CheckoutForm({
    * be answered for a single unit and would show a buyer a fraction of what their order is about
    * to be charged. `cart.itemCount` is that same unit count, summed across the cart's lines by the
    * provider that owns them.
+   *
+   * Which is why the destination is withheld until there is a shipment to quote for it. A cart
+   * still being read - or one that could not be read - publishes no units, and a question asked
+   * then is answered for a single unit: a rate for a shipment nobody is sending, shown as
+   * authoritative for the moment between the reply and the cart landing, and then replaced. So the
+   * lookup waits for the cart, which is also what makes this page's one quote per shipment one
+   * rather than two, and the service group shows list rates until the answer arrives.
    */
-  const freight = useFreightQuote(destination, cart.itemCount);
+  const freight = useFreightQuote(cart.itemCount > 0 ? destination : null, cart.itemCount);
 
   /*
-   * The chosen service, and the one amount this form is entitled to publish for it.
+   * The chosen service as the store currently offers it - the one service this order may be placed
+   * with, and the one amount this form is entitled to publish for it.
    *
-   * The service itself is the option this form was given, matched on the chosen id - that is the
-   * row the panel shows as checked and the service the order names. The amount is taken from the
-   * quote and from nowhere else, and that restriction is the point: the list rates this form was
-   * handed are what a service costs to carry one unit to an unspecified address, so publishing one
-   * would quote the review column a figure the order will not be charged. Until a quote for this
-   * shipment has arrived - before the first lookup, while one is in flight, after a failed one -
-   * there is no freight amount to state, and `null` is what says so; the column then prints the
-   * row as a charge still to be confirmed rather than as an amount. Once the quote is in, the
-   * figure is the quote's entry for the chosen id, which is both what the panel prints beside the
-   * checked row and what `POST /api/checkout` rates the same shipment at.
+   * The services this form was handed are list rates for an unnamed destination. The quote is the
+   * store's answer for the destination and the shipment in the fields, so once it has settled it
+   * *is* the offer: the service is drawn from `freight.quote.options` and from nowhere else. The
+   * buyer's own choice is taken when that offer names it; when the offer does not - it names other
+   * services - the first service it does name is taken instead, which is a deliberate reselection
+   * from the current offer rather than an unavailable choice left standing, and it is visible as
+   * both the checked row and the freight charge beside the order. A stored id therefore never
+   * decides anything by itself: it is honoured while the store is offering it and superseded the
+   * moment it is not. That is what keeps this form from placing an order on a service
+   * `POST /api/checkout` would refuse, since that endpoint re-quotes and accepts only a service its
+   * own quote lists. Before a quote has settled - no destination yet, a lookup in flight, a lookup
+   * that failed - there is no offer to draw from and therefore nothing chosen: the panel still
+   * shows the list rates so a buyer can see what the store sells, and the place-order control waits
+   * for the quote rather than committing the order to a figure nobody has been quoted. A quote that
+   * names no service at all leaves nothing chosen for the same reason, and the group says so.
+   *
+   * Which is also why the amount comes from here: it is the quote's price for the chosen service,
+   * which is both what the panel prints beside the checked row and what the order will be charged.
+   * `null` - nothing chosen, or a shipment with no quote - is what tells the review column to print
+   * the freight row as a charge still to be confirmed rather than as a zero.
+   *
+   * `chosenOptionId` is also what the group is told is selected once a quote has settled, so the
+   * row shown as chosen is a row the store is currently offering and nothing else. Before a quote
+   * settles there is no offer to check against and the buyer's own choice is what the baseline rows
+   * show as selected.
    *
    * Three primitives rather than an object, because they are what the publishing effect below
    * depends on: an object literal in a dependency array is a fresh identity on every render, and
    * this form re-renders several times a second (AAP 0.8.2 defect 2).
    */
-  const chosenOption =
-    shippingOptionId === null
+  const quotedOptions = freight.quote?.options ?? null;
+  const quotedChoice =
+    quotedOptions === null
       ? undefined
-      : shippingOptions.find((option) => option.id === shippingOptionId);
-  const quotedOption =
-    chosenOption === undefined
-      ? undefined
-      : freight.quote?.options.find((candidate) => candidate.id === chosenOption.id);
-  const chosenOptionId = chosenOption?.id ?? null;
-  const chosenOptionLabel = chosenOption?.label ?? null;
-  const chosenOptionAmountCents = quotedOption?.priceCents ?? null;
+      : (quotedOptions.find((candidate) => candidate.id === shippingOptionId) ??
+        quotedOptions.at(0));
+  const chosenOptionId = quotedChoice?.id ?? null;
+  const chosenOptionLabel = quotedChoice?.label ?? null;
+  const chosenOptionAmountCents = quotedChoice?.priceCents ?? null;
+
+  /*
+   * What the service group is told is selected: the quoted choice once there is a quote to check
+   * against, and the buyer's own choice until then. Deriving it rather than reading the state
+   * directly is what keeps the group from showing a row as chosen on the strength of a selection
+   * the store has just said it cannot sell - and it is the same value the draft is assembled from,
+   * so what a buyer sees checked and what the order would name are one thing.
+   */
+  const effectiveOptionId = quotedOptions === null ? shippingOptionId : chosenOptionId;
 
   const failureRegion = useRef<HTMLDivElement | null>(null);
 
@@ -722,11 +829,12 @@ export function CheckoutForm({
   // are the three primitives the charge is made of and the publisher, which is stable for the life
   // of its provider, so this runs when the chosen service or its quoted rate changes and not when
   // the cart or the dispatch countdown does - and the value itself is built inside the effect,
-  // where a fresh object costs nothing. Nothing chosen, or a service with no rate to quote yet,
-  // publishes `null`, which the column renders as a charge still to be established rather than as
-  // a zero; the cleanup publishes `null` too, so a form that goes away leaves no freight row
-  // behind it. The publisher ignores a value equal to the one already published, which is what
-  // keeps a form re-rendering four times a second from writing state four times a second.
+  // where a fresh object costs nothing. Nothing the current quote offers - no destination yet, a
+  // lookup in flight or failed, a cart too large to quote, a service the quote omits - publishes
+  // `null`, which the column renders as a charge still to be established rather than as a zero;
+  // the cleanup publishes `null` too, so a form that goes away leaves no freight row behind it.
+  // The publisher ignores a value equal to the one already published, which is what keeps a form
+  // re-rendering four times a second from writing state four times a second.
   useEffect(() => {
     if (chosenOptionId === null || chosenOptionLabel === null || chosenOptionAmountCents === null) {
       publishFreight(null);
@@ -776,8 +884,25 @@ export function CheckoutForm({
     // order.
     attempt.current ??= attemptKey();
 
-    const draft = checkoutDraftFrom(contact, address, shippingOptionId, notes, attempt.current);
+    // The service the draft names is the chosen service *as the current quote offers it*, so an
+    // order is never sent naming a service the store has not just quoted - an id the quote omits
+    // reaches the draft as the empty string, exactly as no choice at all does. The freight
+    // message then replaces the generic "choose a shipping service" wording with the reason that
+    // actually applies, in the same single validation pass: a group still being quoted, one that
+    // could not be quoted, a destination with no service, or a cart too large to quote.
+    const draft = checkoutDraftFrom(
+      contact,
+      address,
+      quotedChoice?.id ?? null,
+      notes,
+      attempt.current,
+    );
     const problems = collectFieldErrors(draft);
+    const freightProblem = freightSelectionProblem(freight, quotedChoice);
+
+    if (freightProblem !== undefined) {
+      problems.shippingOptionId = freightProblem;
+    }
 
     setFieldErrors(problems);
     setFailure(null);
@@ -843,12 +968,19 @@ export function CheckoutForm({
   // had been read leaves the lines it read in place, and those are still the figures to show.
   const cartUnknown = cart.syncStatus === 'error' && cart.lineCount === 0;
 
-  // An order needs something to ship and a service to ship it by. Both are the buyer's to fix -
-  // the cart page for the first, the group below for the second - so the control is unavailable
-  // rather than hidden, and the validation pass says the same thing in words if the form is
-  // submitted with the keyboard. A cart that could not be read disables it too, on the strength of
-  // not knowing rather than of knowing the cart is empty.
-  const readyToPlaceOrder = !cartUnknown && cart.itemCount > 0 && shippingOptionId !== null;
+  // An order needs something to ship, a shipment the store can quote, and a service it currently
+  // offers for it. Each is the buyer's to fix - the cart page for the first two, the group below
+  // for the third - so the control is unavailable rather than hidden, and the validation pass says
+  // which of them applies in words if the form is submitted with the keyboard. A cart that could
+  // not be read disables it too, on the strength of not knowing rather than of knowing the cart is
+  // empty. The service is required to be one the settled quote lists rather than merely chosen:
+  // that is the difference between a buyer being told now that their service is unavailable and
+  // being told after the order was refused.
+  const readyToPlaceOrder =
+    !cartUnknown &&
+    cart.itemCount > 0 &&
+    freight.shipmentLimit === null &&
+    quotedChoice !== undefined;
 
   return (
     <form
@@ -1072,7 +1204,7 @@ export function CheckoutForm({
         <div className={styles.shipping}>
           <ShippingOptionPicker
             options={shippingOptions}
-            selectedId={shippingOptionId}
+            selectedId={effectiveOptionId}
             postalCode={destination}
             quote={freight}
             disabled={pending}
@@ -1127,6 +1259,23 @@ export function CheckoutForm({
             }
           >
             {failure.body}
+          </Alert>
+        </div>
+      )}
+
+      {/* A cart larger than one shipment is stated here rather than discovered by the buyer when
+          the order is refused: freight is quoted per shipment, so this cart has no quote and no
+          freight charge, and the place-order control is unavailable until it fits. This notice is
+          the one that says what to do about it - the service group's own caption states the two
+          figures beside the empty group, so neither surface repeats the other's sentence - and it
+          appears as soon as the cart passes the ceiling, announced by `Alert`'s `danger` tone, and
+          goes away as soon as it no longer does. */}
+      {freight.shipmentLimit === null ? null : (
+        <div className={styles.cartNotice}>
+          <Alert tone="danger" title="This order is larger than one shipment">
+            {'Lumen Supply quotes freight one shipment at a time. Reduce the cart to ' +
+              `${formatQuantityLabel(freight.shipmentLimit.maxUnits)} units or fewer on the cart ` +
+              'page, or order the rest separately, and shipping services will be quoted for it.'}
           </Alert>
         </div>
       )}

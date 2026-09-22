@@ -1,7 +1,7 @@
 /*
  * CatalogEmptyNotice - what the Lumen Supply catalog says when it has no products to show.
  *
- * Two situations reach this block, and `reason` is the discriminant between them:
+ * Three situations reach this block, and `reason` is the discriminant between them:
  *
  *   - `no-matches`: the catalog itself has products, but the active search term and category
  *     filter select none of them. The message is about the filters, and the way out is to change
@@ -9,9 +9,14 @@
  *   - `empty-catalog`: there is nothing published to select from in the first place. No change of
  *     filter will help, so the message says so plainly rather than inviting the reader to try
  *     again.
+ *   - `page-past-end`: the filters matched products, but the page that was asked for lies beyond
+ *     the last one the listing has - a bookmark to page nine of a range that has since shrunk, or a
+ *     page number typed by hand. Nothing is wrong with the filters, so the message is about the
+ *     page, and the way out is the listing's first page rather than a change of filter.
  *
- * Telling those two apart matters: a reader who is shown "try a different search term" in front of
- * a catalog that is genuinely empty is being sent on an errand that cannot succeed.
+ * Telling the three apart matters: a reader shown "try a different search term" in front of a
+ * catalog that is genuinely empty, or in front of a filter that matched four hundred products they
+ * simply cannot see from the page they are on, is being sent on an errand that cannot succeed.
  *
  * DIVISION OF LABOUR
  * `@/components/ui/BlankSlate` owns the inside of the block - the illustration, the heading, the
@@ -73,16 +78,22 @@ import styles from './CatalogEmptyNotice.module.css';
  * object conditionally. `ReactNode` already includes `undefined`, so `action` needs nothing added.
  */
 export interface CatalogEmptyNoticeProps {
-  /** Which of the two situations this is: filters that matched nothing, or nothing to match. */
-  reason: 'no-matches' | 'empty-catalog';
+  /**
+   * Which of the three situations this is: filters that matched nothing, nothing to match, or a
+   * requested page past the end of a listing that did match something.
+   */
+  reason: 'no-matches' | 'empty-catalog' | 'page-past-end';
   /**
    * The search term in effect, echoed back so the reader can see exactly what was looked for.
-   * Omitted, or whitespace only, means no term was searched and none is mentioned.
+   * Omitted, or whitespace only, means no term was searched and none is mentioned. It is not
+   * mentioned for `page-past-end` either, whatever is passed: the term did match products there,
+   * so echoing it under a sentence about the page would read as a statement that it had not.
    */
   searchText?: string | undefined;
   /**
    * The category filter in effect. A URL slug (`'hex-head-bolts'`) is turned into words for
-   * display; a value that is already prose is printed as it stands.
+   * display; a value that is already prose is printed as it stands. Not mentioned for
+   * `page-past-end`, for the reason given above.
    */
   categoryName?: string | undefined;
   /**
@@ -95,30 +106,44 @@ export interface CatalogEmptyNoticeProps {
 /**
  * Every word the reader sees, keyed by `reason`.
  *
- * A `Record` over the closed `reason` union rather than a lookup with a default: adding a third
+ * A `Record` over the closed `reason` union rather than a lookup with a default: adding a fourth
  * reason to the props above without writing its wording here is a compile error, which is the
  * point. Indexing it with a `reason` therefore yields a complete entry, so no fallback is needed
  * at the point of use.
  *
+ * `echoesFilters` is part of the wording rather than a condition at the point of use: it says
+ * whether this situation's sentence is a statement about what the filters selected, and so whether
+ * naming the term and the category in front of it is true. Two of the three are such statements;
+ * the page-past-end sentence is about the address, and prefixing it with "No products are listed
+ * for ..." would contradict the count that produced it.
+ *
  * `alt` is empty on purpose, and is kept per reason so that a future situation whose artwork does
- * carry information of its own can describe it. BlankSlate renders the same drawing for both
- * situations here, and in both the heading already says what is missing: an empty `alt` marks the
+ * carry information of its own can describe it. BlankSlate renders the same drawing for all three
+ * situations here, and in each the heading already says what is missing: an empty `alt` marks the
  * drawing as decorative, which is what stops a screen reader from announcing the same sentence
  * twice.
  */
 const NOTICE_COPY: Record<
   CatalogEmptyNoticeProps['reason'],
-  { heading: string; body: string; alt: string }
+  { heading: string; body: string; alt: string; echoesFilters: boolean }
 > = {
   'no-matches': {
     heading: 'No products match your filters',
     body: 'Try a different search term, or clear the category filter to see the full range.',
     alt: '',
+    echoesFilters: true,
   },
   'empty-catalog': {
     heading: 'No products are available yet',
     body: 'This catalog has no published products at the moment.',
     alt: '',
+    echoesFilters: true,
+  },
+  'page-past-end': {
+    heading: 'That page is past the end of this listing',
+    body: 'The listing has fewer pages than the address asked for. Go to the first page to see the products it does have.',
+    alt: '',
+    echoesFilters: false,
   },
 };
 
@@ -147,6 +172,8 @@ const SLUG_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
  * />
  *
  * <CatalogEmptyNotice reason="empty-catalog" />
+ *
+ * <CatalogEmptyNotice reason="page-past-end" action={<FirstPageButton />} />
  * ```
  */
 export function CatalogEmptyNotice({
@@ -160,12 +187,17 @@ export function CatalogEmptyNotice({
   /*
    * A term of spaces is not a term. The length check is deliberate rather than a truthiness test:
    * it also rejects `'   '`, which reads as a search for nothing and would put an empty pair of
-   * quotation marks in front of the reader.
+   * quotation marks in front of the reader. A situation whose sentence is not about what the
+   * filters selected mentions neither the term nor the category, whatever the caller passed, for
+   * the reason given with `echoesFilters` above.
    */
-  const term = searchText !== undefined && searchText.trim().length > 0 ? searchText : undefined;
+  const term =
+    copy.echoesFilters && searchText !== undefined && searchText.trim().length > 0
+      ? searchText
+      : undefined;
 
   let category: string | undefined;
-  if (categoryName !== undefined && categoryName.trim().length > 0) {
+  if (copy.echoesFilters && categoryName !== undefined && categoryName.trim().length > 0) {
     const name = categoryName.trim();
     category = SLUG_PATTERN.test(name) ? formatSlugLabel(name) : name;
   }

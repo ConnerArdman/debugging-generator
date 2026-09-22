@@ -40,6 +40,8 @@
 
 import { z } from 'zod';
 
+import { MAX_SHIPMENT_UNITS } from '@/lib/types';
+
 /**
  * The highest code point counted as a control character, and the delete character that sits above
  * the printable range.
@@ -134,10 +136,18 @@ export const carrierMockBodySchema = z.object({
 
   /**
    * How many pieces the shipment is made of. Carriers price a multi-piece consignment differently
-   * from a single parcel, and the ceiling is far beyond any cart this store checks out, so an
-   * implausible count is refused before a quote is built around it.
+   * from a single parcel, and the ceiling is the largest consignment this provider rates as one
+   * shipment, so an implausible count is refused before a quote is built around it.
+   *
+   * The figure is {@link MAX_SHIPMENT_UNITS}, read from `@/lib/types` rather than written again
+   * here, and it is the only rule this module shares with anything: the storefront's own ceiling
+   * exists *because* a carrier rates at most this many pieces at once, and the browser holds to
+   * the same number before it asks for a quote at all. One number in one place is what keeps a
+   * cart the checkout accepted from being a shipment this provider then refuses. The postal-code
+   * and service-code patterns below stay this module's own, for the reason the header gives: a
+   * shape belongs to the surface a value arrives on.
    */
-  itemCount: z.number().int().min(1).max(500).default(1),
+  itemCount: z.number().int().min(1).max(MAX_SHIPMENT_UNITS).default(1),
 
   /**
    * Which service is being asked for, as the carrier's own code for it — the value that ends up

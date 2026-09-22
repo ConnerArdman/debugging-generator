@@ -57,6 +57,7 @@
 
 import { z } from 'zod';
 
+import { MAX_SHIPMENT_UNITS } from '@/lib/types';
 import type { ShippingAddress, ShippingOption } from '@/lib/types';
 
 /**
@@ -190,19 +191,31 @@ export const shippingQuoteQuerySchema = z.object({
    * packages the shipment is made up of.
    *
    * At least one, because a shipment of nothing is not a shipment, and at most
-   * five hundred, which is the largest consignment the services offered at
-   * checkout rate as one shipment. The ceiling is a refusal rather than a cap:
-   * a larger order travels as more than one shipment and is quoted once per
-   * shipment, so quoting it here as five hundred pieces would answer with the
-   * cost of a shipment nobody is sending. One unit is the default, so a caller
-   * naming only a destination is quoted on the smallest shipment this store
-   * sends.
+   * {@link MAX_SHIPMENT_UNITS}, which is the largest consignment the services
+   * offered at checkout rate as one shipment. The ceiling is a refusal rather
+   * than a cap: a larger order travels as more than one shipment and is quoted
+   * once per shipment, so quoting it here as five hundred pieces would answer
+   * with the cost of a shipment nobody is sending. One unit is the default, so
+   * a caller naming only a destination is quoted on the smallest shipment this
+   * store sends.
+   *
+   * The ceiling is the one rule this schema imports rather than restates. The
+   * browser has to hold to the same figure *before* it asks — a checkout that
+   * sent a larger cart's count would collect a 400 it could only describe as a
+   * rejected postal code, and a customer would be told to correct an address
+   * that was never the problem — so the figure is published once, in
+   * `@/lib/types`, and read here. The postal-code pattern above is the opposite
+   * case and stays this module's own: it is a shape checked where a value
+   * arrives, not a number a caller has to reason about.
    */
   itemCount: z.coerce
     .number()
     .int()
     .min(1)
-    .max(500, 'A shipment carries at most 500 units; a larger order ships as more than one.')
+    .max(
+      MAX_SHIPMENT_UNITS,
+      `A shipment carries at most ${String(MAX_SHIPMENT_UNITS)} units; a larger order ships as more than one.`,
+    )
     .default(1),
 
   /**

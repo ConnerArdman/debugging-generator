@@ -4,11 +4,12 @@
  * Every route handler response, every route handler request body and every
  * value that crosses the boundary from a server component into a client
  * component is described here, so the server layer, the route handlers, the
- * pages and the React tree all speak one vocabulary. The module declares types
- * and nothing else: it has no imports and no runtime code, which is what lets a
- * browser component and a database-backed service share it.
+ * pages and the React tree all speak one vocabulary. The module has no imports
+ * and no runtime behaviour - nothing here reads a request, a database or the
+ * environment - which is what lets a browser component and a database-backed
+ * service share it.
  *
- * Three conventions hold throughout, and they are why the shapes below do not
+ * Four conventions hold throughout, and they are why the shapes below do not
  * simply re-export the database models:
  *
  * 1. **Money is an integer number of US cents.** Every monetary field is a
@@ -23,6 +24,14 @@
  *    service boundary, because everything below is serialized on its way from
  *    a server component to a client component and from a route handler to the
  *    browser.
+ * 4. **A bound both sides must hold to travels with the shapes.** The module is
+ *    types with one exception, {@link MAX_SHIPMENT_UNITS}, and the exception is
+ *    the point: a request the browser may not send and a request the server
+ *    refuses are the same rule, and a rule stated twice is a rule that drifts.
+ *    A bound is admitted here only when both sides must act on the figure
+ *    itself; a *shape* - what a postal code looks like, what an email is - stays
+ *    each surface's own, because a shape is checked where a value arrives and
+ *    never has to be quoted back to a customer.
  */
 
 /* ---------------------------------------------------------------------------
@@ -511,6 +520,29 @@ export interface CheckoutResult {
 /* ---------------------------------------------------------------------------
  * Shipping and payment
  * ------------------------------------------------------------------------- */
+
+/**
+ * The most units the carriers this store sells rate as one shipment.
+ *
+ * It is a refusal rather than a cap, and that is why the figure is published
+ * here rather than kept behind the endpoint that enforces it. A consignment of
+ * more units than this travels as more than one shipment and is quoted once per
+ * shipment, so `GET /api/shipping/quote` answers a larger count with 400 rather
+ * than rating the first five hundred pieces of it — and a rate taken on fewer
+ * pieces than travel is the price of a shipment nobody is sending.
+ *
+ * Three surfaces hold to it and all three read it from here, because a client
+ * that guessed it wrong would either send a request already known to be refused
+ * or quietly quote the wrong shipment: the browser gates on it before it asks
+ * for a quote (`useFreightQuote` in `@/hooks/useShippingEta`, which reports an
+ * over-ceiling cart to the checkout form instead of asking), the endpoint's
+ * query schema bounds `itemCount` by it (`@/server/validation/shipping`), and
+ * the stand-in carrier's body schema states the same ceiling for the pieces it
+ * will rate (`@/server/validation/mocks`). The shipping service applies it once
+ * more against the values it hands the carrier, so a caller that reaches it by
+ * another route is refused there too.
+ */
+export const MAX_SHIPMENT_UNITS = 500;
 
 /**
  * A destination address. `line2` holds `null` rather than being absent when the

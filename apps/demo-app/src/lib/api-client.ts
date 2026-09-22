@@ -529,6 +529,15 @@ export function submitCheckout(draft: CheckoutDraft): Promise<CheckoutResult> {
  * cart's unit count, which is the same figure the checkout request rates the
  * order's freight against, so the rate a customer is shown is the rate their
  * order is charged. Omit it only where there is no shipment to describe yet.
+ *
+ * It is also bounded, and the bound belongs to the caller as much as to the
+ * endpoint: more than `MAX_SHIPMENT_UNITS` units - the figure `./types`
+ * publishes - is more than one shipment, and the endpoint refuses such a count
+ * with 400 rather than rating part of it. This module sends what it is given
+ * and states no second opinion about it, so a caller quoting a cart compares
+ * the count with that ceiling before it calls: `useFreightQuote` in
+ * `@/hooks/useShippingEta` does exactly that, and reports the cart's size to
+ * checkout instead of asking a question already known to be refused.
  */
 export function requestShippingQuote(input: {
   postalCode: string;
