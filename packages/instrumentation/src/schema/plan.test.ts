@@ -431,12 +431,17 @@ const SWEEP_SEPARATOR_COLLISION_FAMILIES = 2;
  */
 const REJECTED_INPUTS: readonly (readonly [string, unknown])[] = [
   ['an unknown action type', planInputWith([{ file: 'a.ts', symbol: 'x', type: 'guesswork' }])],
+  ['an empty symbol', planInputWith([{ file: 'a.ts', symbol: '', type: 'function-timing' }])],
   ['a blank symbol', planInputWith([{ file: 'a.ts', symbol: '   ', type: 'function-timing' }])],
   [
     'a symbol carrying a line break',
     planInputWith([{ file: 'a.ts', symbol: 'x\ny', type: 'function-timing' }]),
   ],
   ['an empty objective', planInputWith([{ file: 'a.ts', symbol: 'x', type: 'perf-tracking' }], '')],
+  [
+    'an over-long objective',
+    planInputWith([{ file: 'a.ts', symbol: 'x', type: 'perf-tracking' }], 'o'.repeat(501)),
+  ],
   [
     'an over-long capture phrase',
     {
@@ -724,28 +729,40 @@ describe('actionIdentityKey', () => {
 
 describe('normalizePlan', () => {
   it('assigns the adapter and mode the resolver reports, per target, in authored order', () => {
+    const authored = okValue(
+      parseInstrumentationPlanInput(AUTHORING_EXAMPLE),
+      'the authoring example',
+    );
     const plan = okValue(normalizePlan(AUTHORING_EXAMPLE, planContext()), 'the authoring example');
+    const ids = mintedIds(authored.instrumentationTargets.length);
 
-    expect(plan.instrumentationTargets).toEqual([
-      {
-        id: 'act_0000000000000001',
-        file: 'components/CheckoutButton.tsx',
-        symbol: 'handleCheckout',
-        type: 'function-timing',
-        adapter: 'fake-timing-adapter',
-        mode: 'patch',
-        rationale: 'Determine why clicking Checkout takes more than 2 seconds',
-      },
-      {
-        id: 'act_0000000000000002',
-        file: 'app/api/checkout/route.ts',
-        symbol: 'POST',
-        type: 'server-span',
-        adapter: 'fake-server-adapter',
-        mode: 'patch',
-        rationale: 'Determine why clicking Checkout takes more than 2 seconds',
-      },
-    ]);
+    // The resolution each target's type is expected to pick up, stated here
+    // rather than read back out of `ADAPTER_TABLE`: this is *the* assertion
+    // that an action's adapter and mode come from the resolver, so the expected
+    // pair has to be spelled independently of the fake that answered.
+    const expectedResolution: readonly AdapterActionResolution[] = [
+      { adapter: 'fake-timing-adapter', mode: 'patch' },
+      { adapter: 'fake-server-adapter', mode: 'patch' },
+    ];
+
+    // `file`, `symbol` and `type` are compared against the example itself
+    // instead of transcribed, which keeps the §0.1.2 strings to the single
+    // constant the file comment's §0.5.4 note is about and stops an expectation
+    // from drifting away from the example it is about. The rationale is the
+    // objective because the example states none per target, and the example's
+    // objective needs no trimming — the trimming contract has its own test.
+    expect(plan.instrumentationTargets).toHaveLength(expectedResolution.length);
+    expect(plan.instrumentationTargets).toEqual(
+      authored.instrumentationTargets.map((target, index) => ({
+        id: ids[index],
+        file: target.file,
+        symbol: target.symbol,
+        type: target.type,
+        adapter: expectedResolution[index]?.adapter,
+        mode: expectedResolution[index]?.mode,
+        rationale: authored.objective,
+      })),
+    );
   });
 
   it('carries a runtime-mode resolution through as well', () => {
@@ -985,8 +1002,12 @@ describe('normalizePlan', () => {
   });
 
   it('rejects the whole plan when no adapter claims an action type', () => {
-    const error = errValue(
-      normalizePlan(
+    // AAP §0.2.3 makes an unclaimed action type reject the *plan* rather than
+    // drop the action, and AAP §0.5.3 makes that rejection a value: a throw
+    // here would be the violation, so the two outcomes are separated before
+    // anything about the error is asserted.
+    const outcome = notThrown(
+      normalizeOutcome(
         planInputWith([
           { file: 'src/a.ts', symbol: 'first', type: 'function-timing' },
           { file: 'src/b.ts', symbol: 'second', type: 'state-tracking' },
@@ -995,6 +1016,7 @@ describe('normalizePlan', () => {
       ),
       'a plan naming an unclaimed action type',
     );
+    const error = errValue(outcome, 'a plan naming an unclaimed action type');
 
     expect(DebuggenError.is(error)).toBe(true);
     expect(DEBUGGEN_ERROR_CODES).toContain(error.code);
@@ -1003,6 +1025,10 @@ describe('normalizePlan', () => {
     expect(error.message).toContain('target 1');
     expect(error.hint).toBeDefined();
     expect(error.details?.['targetIndex']).toBe(1);
+    // And nothing else: no partial plan travels beside the error, so a caller
+    // cannot read the first target as having been planned while the second
+    // failed. AAP §0.5.5 forbids a failure that looks like a success.
+    expect(Object.keys(outcome).sort()).toEqual(['error', 'ok']);
   });
 
   it.each(HOSTILE_INPUTS)('returns a failure rather than throwing for %s', (label, input) => {

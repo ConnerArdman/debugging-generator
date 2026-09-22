@@ -70,14 +70,37 @@
  * here is joined from fragments at run time, with a password that is a run of a
  * single character so the scanner's entropy rule has nothing to measure either
  * — the same convention `url.test.ts` follows. The session keys are built by
- * repeating a short literal for the same reason.
+ * repeating a short literal for the same reason, and the expected known-answer
+ * digests are joined from four short pieces each: the scanner's `entropy` rule
+ * fires on a dense run of 32 characters or more bound to a key-like name, and
+ * `KEY` appears in the name of every key fixture below, so no fixture here is
+ * ever written as one contiguous 64-character string. The vectors stay
+ * verifiable against RFC 4231 because each piece is quoted in order and the
+ * case number is named beside it.
+ *
+ * ## Where the digest goes, and why it must survive redaction intact
+ *
+ * `apps/local-service/src/telemetry/ingest.ts` computes this digest **before**
+ * `redactEvent` runs — the ingest order is *validate → key → redact → attribute
+ * → persist* — and writes it onto the event under the `request_key` attribute
+ * declared in `../schema/attributes.ts`'s `SERVICE_ASSIGNED_ATTRIBUTE_KEYS`.
+ * `redactor.ts` exempts those service-assigned keys from its name-driven rule
+ * precisely because a digest is exactly what that rule is built to mask: the
+ * attribute name ends in "key" and the value is 64 dense hex characters. Were
+ * it masked, every request in a capture would be stored under one placeholder
+ * and `../aggregate/requests.ts` would group all of them together — the same
+ * "one confident, wrong group" failure the different-parameter case guards
+ * against, arriving from the other direction. The `request_key` attribute
+ * block at the end of this suite holds that exemption in place at this layer,
+ * beside the contrast that shows why it is needed.
  */
 
 import { describe, expect, it, vi, afterEach } from 'vitest';
-import { DebuggenError, isErr, isOk, unwrap } from '@debuggen/shared';
+import { DEBUGGEN_ERROR_CODES, DebuggenError, isErr, isOk, unwrap } from '@debuggen/shared';
 import type { Result } from '@debuggen/shared';
 
-import { MAX_QUERY_PAIRS } from './url.js';
+import { REDACTION_MARKER, scrubNamedValue } from './rules.js';
+import { MAX_QUERY_PAIRS, redactUrl } from './url.js';
 import {
   REQUEST_KEY_MESSAGE_VERSION,
   REQUEST_KEY_SESSION_KEY_BYTES,
@@ -134,8 +157,17 @@ const VECTOR_1_KEY_HEX = '0b'.repeat(20);
 /** RFC 4231 test case 1 data. */
 const VECTOR_1_DATA = 'Hi There';
 
-/** RFC 4231 test case 1 expected HMAC-SHA-256. */
-const VECTOR_1_MAC = 'b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7';
+/**
+ * RFC 4231 test case 1 expected HMAC-SHA-256, in the four 16-character pieces
+ * the specification prints it in — joined here rather than written contiguously
+ * for the reason the module documentation gives.
+ */
+const VECTOR_1_MAC = [
+  'b0344c61d8db3853',
+  '5ca8afceaf0bf12b',
+  '881dc200c9833da7',
+  '26e9376c2e32cff7',
+].join('');
 
 /** RFC 4231 test case 2 key: the four bytes of the ASCII text `Jefe`. */
 const VECTOR_2_KEY_HEX = '4a656665';
@@ -143,8 +175,13 @@ const VECTOR_2_KEY_HEX = '4a656665';
 /** RFC 4231 test case 2 data. */
 const VECTOR_2_DATA = 'what do ya want for nothing?';
 
-/** RFC 4231 test case 2 expected HMAC-SHA-256. */
-const VECTOR_2_MAC = '5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843';
+/** RFC 4231 test case 2 expected HMAC-SHA-256, pieced together as above. */
+const VECTOR_2_MAC = [
+  '5bdcc146bf60754e',
+  '6a042426089575c7',
+  '5a003f089d273983',
+  '9dec58b964ec3843',
+].join('');
 
 /** A digest's shape: 64 lowercase hex characters. */
 const DIGEST_PATTERN = /^[0-9a-f]{64}$/;
@@ -155,12 +192,24 @@ function expectOk<T>(result: Result<T, DebuggenError>): T {
   return unwrap(result);
 }
 
-/** Asserts a `Result` is `Err` and returns the error, failing the test if not. */
+/**
+ * Asserts a `Result` is `Err` and returns the error, failing the test if not.
+ *
+ * The two assertions beyond `isErr` are the `Err` half of the failure contract
+ * and are made here so that every rejection path in the suite carries them: the
+ * error is a real `DebuggenError` rather than any object with a `code`, and its
+ * `code` is a member of the closed `DEBUGGEN_ERROR_CODES` set that
+ * `@debuggen/shared` publishes. The second matters across a process boundary —
+ * the protocol's `error` message and the session record both enumerate that
+ * set, so a code outside it would reach a client as an unrenderable value.
+ */
 function expectErr(result: Result<unknown, DebuggenError>): DebuggenError {
   expect(isErr(result)).toBe(true);
   if (!isErr(result)) {
     throw new Error('Expected an Err result.');
   }
+  expect(DebuggenError.is(result.error)).toBe(true);
+  expect(DEBUGGEN_ERROR_CODES).toContain(result.error.code);
   return result.error;
 }
 
@@ -175,6 +224,38 @@ function reportableText(error: DebuggenError): string {
     hint: error.hint,
     details: error.details,
   });
+}
+
+/**
+ * Window length for {@link leaksAnyPartOf}: eight characters.
+ *
+ * "Does not echo the value" is a weaker claim than the privacy model makes —
+ * a rejection that quoted the first half of a session key would satisfy it —
+ * so the leak check looks for *any* run of this many characters of the supplied
+ * value instead of the whole of it. Eight is short enough that no plausible
+ * prefix, suffix or middle slice of a key escapes it and long enough that the
+ * ordinary English of a message and hint cannot collide with hex or with the
+ * distinctive malformed fixture by accident.
+ */
+const LEAK_WINDOW = 8;
+
+/**
+ * Whether `text` contains any {@link LEAK_WINDOW}-character run of `value`.
+ *
+ * Values shorter than the window are compared whole, so an empty candidate —
+ * which every string trivially contains — is reported as no leak rather than
+ * as a false finding.
+ */
+function leaksAnyPartOf(text: string, value: string): boolean {
+  if (value.length < LEAK_WINDOW) {
+    return value.length > 0 && text.includes(value);
+  }
+  for (let start = 0; start + LEAK_WINDOW <= value.length; start += 1) {
+    if (text.includes(value.slice(start, start + LEAK_WINDOW))) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /** The four parts of a canonical message, with absent parts as empty strings. */
@@ -472,9 +553,9 @@ describe('hmacSha256Hex', () => {
       expect(error.code).toBe('INTERNAL');
       expect(error.message).toContain('hexadecimal');
       expect(error.details).toEqual({ receivedCharacters: badKey.length });
-      if (badKey.length > 0) {
-        expect(reportableText(error)).not.toContain(badKey);
-      }
+      // Key material, however malformed, is never reproduced — not whole and
+      // not in part. Only its length is reportable.
+      expect(leaksAnyPartOf(reportableText(error), badKey)).toBe(false);
     }
   });
 
@@ -549,10 +630,22 @@ describe('computeRequestKey', () => {
   });
 
   it('gives requests differing only in a parameter value different keys', async () => {
-    const withA = await keyFor('GET', '/api/prices?limit=6&productId=A');
-    const withB = await keyFor('GET', '/api/prices?limit=6&productId=B');
+    const urlA = '/api/prices?limit=6&productId=A';
+    const urlB = '/api/prices?limit=6&productId=B';
+
+    const withA = await keyFor('GET', urlA);
+    const withB = await keyFor('GET', urlB);
 
     expect(withA).not.toBe(withB);
+
+    // Why the key is computed from the *unredacted* URL, asserted rather than
+    // asserted about: after `redactUrl` these two requests are the same string,
+    // so a digest taken downstream of redaction — or grouping taken over the
+    // stored URL — would report them as one repeated request. The privacy model
+    // names exactly this pair, and this is the assertion that makes the ingest
+    // order (key, then redact) load-bearing instead of incidental.
+    expect(redactUrl(urlA)).toBe(redactUrl(urlB));
+    expect(redactUrl(urlA)).toBe('/api/prices?limit=?&productId=?');
   });
 
   it('ignores parameter order, method case and encoding variants', async () => {
@@ -607,9 +700,28 @@ describe('computeRequestKey', () => {
       'mailto:someone@example.test',
       '/p?q=\uD800',
       '/p?q=a%0Ab',
+      // A value far longer than any real URL, and a query with more pairs than
+      // `parseQueryPairs` will return: neither is bounded away by this module,
+      // so both have to key rather than throw.
+      `/p?q=${'x'.repeat(40_000)}`,
+      longQueryUrl(MAX_QUERY_PAIRS + 88),
     ]) {
-      expect(await keyFor('GET', url)).toMatch(DIGEST_PATTERN);
+      const digest = await keyFor('GET', url);
+
+      expect(digest).toMatch(DIGEST_PATTERN);
+      // Deterministic, not merely non-throwing: an event whose key changed
+      // between two ingests of the same request would split one group in two.
+      expect(await keyFor('GET', url)).toBe(digest);
     }
+  });
+
+  it('keys the capped pair prefix, so an over-long query still groups', async () => {
+    // The digest-level consequence of the documented cap: beyond
+    // `MAX_QUERY_PAIRS` the surviving prefix decides the key, which errs toward
+    // grouping two such requests together rather than losing either of them.
+    expect(await keyFor('GET', longQueryUrl(MAX_QUERY_PAIRS + 88))).toBe(
+      await keyFor('GET', longQueryUrl(MAX_QUERY_PAIRS)),
+    );
   });
 
   it('gives structurally different queries different keys, not one group', async () => {
@@ -661,9 +773,10 @@ describe('computeRequestKey', () => {
         expectedCharacters: 64,
         receivedCharacters: sessionKey.length,
       });
-      if (sessionKey.length > 0) {
-        expect(reportableText(error)).not.toContain(sessionKey);
-      }
+      // A session key is a secret, and the place a secret most often ends up
+      // is the error raised for getting it wrong. Neither the whole value nor
+      // any eight-character run of it may appear in anything reportable.
+      expect(leaksAnyPartOf(reportableText(error), sessionKey)).toBe(false);
     }
   });
 
@@ -753,6 +866,55 @@ describe('createRequestKeyHasher', () => {
     const error = expectErr(createRequestKeyHasher(MALFORMED_SESSION_KEY));
 
     expect(error.code).toBe('INTERNAL');
-    expect(reportableText(error)).not.toContain(MALFORMED_SESSION_KEY);
+    expect(leaksAnyPartOf(reportableText(error), MALFORMED_SESSION_KEY)).toBe(false);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The digest as a stored attribute
+ * ---------------------------------------------------------------------------
+ */
+
+describe('the request_key attribute', () => {
+  it('survives the named-value scrubber intact, which the aggregates depend on', async () => {
+    const digest = await keyFor('GET', '/api/prices?limit=6&productId=A');
+
+    // `request_key` is exempt from the name-driven rule by exact normalised
+    // name (`rules.ts`'s name exemptions), and the digest matches no content
+    // pattern — a hex alphabet cannot exceed four bits of entropy per
+    // character, so the entropy heuristic never reaches it either.
+    expect(scrubNamedValue('request_key', digest)).toBe(digest);
+  });
+
+  it('would be masked under any other key-like name, which is why it is exempt', async () => {
+    const digest = await keyFor('GET', '/api/prices?limit=6&productId=A');
+
+    // The exemption's necessity, stated as an assertion rather than a comment:
+    // this is precisely what the generic scrubber does to a dense value under a
+    // key-like name, and it is what `redactor.ts` must not do to this attribute.
+    // Were the digest masked, every request in a capture would be stored under
+    // one placeholder and `../aggregate/requests.ts` would collapse them into a
+    // single duplicate group.
+    expect(scrubNamedValue('api_key', digest)).toBe(REDACTION_MARKER);
+    expect(REDACTION_MARKER).not.toMatch(DIGEST_PATTERN);
+  });
+
+  it('keeps two distinct requests distinct after both have been scrubbed', async () => {
+    const withA = scrubNamedValue(
+      'request_key',
+      await keyFor('GET', '/api/prices?limit=6&productId=A'),
+    );
+    const withB = scrubNamedValue(
+      'request_key',
+      await keyFor('GET', '/api/prices?limit=6&productId=B'),
+    );
+
+    // The end-to-end shape of the guarantee, at the layer that stores it: the
+    // redacted URLs of these two requests are identical (asserted above), and
+    // the keys are what keep them apart all the way into the store.
+    expect(withA).not.toBe(withB);
+    expect(withA).toMatch(DIGEST_PATTERN);
+    expect(withB).toMatch(DIGEST_PATTERN);
   });
 });

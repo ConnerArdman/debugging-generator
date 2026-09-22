@@ -55,20 +55,28 @@
  *
  * The remaining groups pin the behaviour the rest of the package is written
  * against: the exact file set of the fixture corpus and its deterministic
- * byte-wise order, `projectRelative` round-tripping, the target's `paths`
- * aliases resolving through the loaded project, generated and vendored trees
- * staying out even when the target's own `tsconfig.json` is widened to
- * `include: ["**\/*"]`, and each documented failure returning `Err` with the
- * documented code and `details.reason` rather than throwing.
+ * byte-wise order, each file present once and only once, `projectRelative`
+ * round-tripping, the target's `paths` aliases resolving through the loaded
+ * project — both hops of the corpus' alias-through-a-barrel chain, which the
+ * import and symbol extractors are written against — the specifiers the corpus
+ * deliberately leaves uninstalled resolving to nothing without failing the
+ * open, generated and vendored trees staying out even when the target's own
+ * `tsconfig.json` is widened to `include: ["**\/*"]` and its `exclude` dropped,
+ * a target with no configuration at all still indexing, and each documented
+ * failure returning `Err` with the documented code and `details.reason` rather
+ * than throwing.
  *
  * ## Three habits, each deliberate
  *
- * - **Every fixture is built in an OS temp directory at test time.** Nothing is
- *   created under `test/fixtures/**` and no symbolic link is ever committed: a
- *   committed link is a path that means something different in every checkout,
- *   and a committed `.env` is a committed secret however synthetic. Where a
- *   realistic project is needed, `test/fixtures/sample-next-app` is *copied*
- *   into the sandbox and planted into there.
+ * - **Every planted fixture is built in an OS temp directory at test time.**
+ *   Nothing is created, changed or deleted under `test/fixtures/**` and no
+ *   symbolic link is ever committed: a committed link is a path that means
+ *   something different in every checkout, and a committed `.env` is a
+ *   committed secret however synthetic. Where a realistic project is needed,
+ *   `test/fixtures/sample-next-app` is *copied* into the sandbox and planted
+ *   into there. The one group that opens the corpus at its committed path
+ *   ("opened where it lives") only ever reads it — which is what a consumer
+ *   does with a developer's project — so `git status` is unchanged by a run.
  * - **The sandbox is resolved through `realpath`.** On a platform whose
  *   temporary directory is reached through a link, an unresolved sandbox path
  *   would make the symlinked-root case indistinguishable from the ordinary one
@@ -87,6 +95,7 @@ import {
   cpSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   realpathSync,
   rmSync,
   symlinkSync,
@@ -424,6 +433,181 @@ function expectNeverLoaded(loaded: LoadedProject, relativePath: string, marker: 
   expect(relativePathsOf(loaded)).not.toContain(relativePath);
   expect(loadedPathsOf(loaded)).not.toContain(absoluteIn(loaded.projectRoot, relativePath));
   expect(loadedTextOf(loaded)).not.toContain(marker);
+}
+
+/**
+ * One file of an opened project, named without importing ts-morph's own type.
+ *
+ * The handle already publishes it — `sourceFiles()` is `readonly SourceFile[]`
+ * — so taking the element type from the handle keeps this suite's imports to
+ * the module under test, `@debuggen/shared` and Node's built-ins, and keeps the
+ * assertions honest about what a consumer can reach through the handle alone.
+ */
+type LoadedSourceFile = ReturnType<LoadedProject['sourceFiles']>[number];
+
+/**
+ * The loaded file at a project-relative path, failing the case when the set
+ * does not hold it.
+ *
+ * A `find` that answered `undefined` would turn a missing file into a confusing
+ * failure several assertions later; naming the whole set in the message makes
+ * the reason immediate.
+ */
+function sourceFileAt(loaded: LoadedProject, relativePath: string): LoadedSourceFile {
+  const found = loaded
+    .sourceFiles()
+    .find((sourceFile) => loaded.projectRelative(sourceFile.getFilePath()) === relativePath);
+  if (found === undefined) {
+    return expect.unreachable(
+      `the project was expected to hold '${relativePath}' and holds: ${relativePathsOf(loaded).join(', ')}`,
+    );
+  }
+  return found;
+}
+
+/**
+ * The generated and vendored directory names the exclusion assertions name
+ * literally, rather than reading {@link EXCLUDED_DIRECTORY_NAMES}.
+ *
+ * The duplication is deliberate. An assertion derived from the module's own
+ * vocabulary agrees with whatever that vocabulary says, including a change that
+ * dropped `node_modules` from it — which is precisely the regression these
+ * cases exist to catch. The frozen vocabulary itself is asserted separately, at
+ * the end of this file.
+ */
+const NEVER_INDEXED_DIRECTORIES: readonly string[] = ['node_modules', '.next', 'dist', 'coverage'];
+
+/** Whether a path names generated or vendored output rather than a developer's source. */
+function isGeneratedOrVendored(path: string): boolean {
+  const posix = toPosix(path);
+  return (
+    NEVER_INDEXED_DIRECTORIES.some((name) => posix.split('/').includes(name)) ||
+    posix.toLowerCase().endsWith('.min.js')
+  );
+}
+
+/**
+ * Asserts that neither file set of an opened project names an environment file,
+ * a generated or vendored file, or anything outside the project.
+ *
+ * Both sets, because they answer different questions. `sourceFiles()` is what
+ * this module *judged* indexable; `project.getSourceFiles()` is what the
+ * compiler actually *read*. A file present only in the second has still been
+ * read into memory, and from there its content could reach a summary, a prompt
+ * or a log — so asserting the judged set alone would pass against an
+ * implementation that reads a file and then hides it, which is not the
+ * guarantee.
+ *
+ * @param loaded The opened project whose two file sets are judged.
+ */
+function expectNothingForbiddenWasRead(loaded: LoadedProject): void {
+  const sets: readonly (readonly [string, readonly string[]])[] = [
+    ['the judged file set', relativePathsOf(loaded)],
+    [
+      "the compiler's own file set",
+      loadedPathsOf(loaded).map((path) => loaded.projectRelative(path) ?? path),
+    ],
+  ];
+
+  for (const [description, paths] of sets) {
+    const envFiles = paths.filter((path) => isEnvFilePath(path));
+    expect(
+      envFiles,
+      `the indexer must never read env files (AAP 0.5.2), yet ${description} names: ${envFiles.join(', ')}`,
+    ).toEqual([]);
+
+    const generated = paths.filter((path) => isGeneratedOrVendored(path));
+    expect(
+      generated,
+      `${description} must name no generated or vendored file, and names: ${generated.join(', ')}`,
+    ).toEqual([]);
+
+    // A path that stayed absolute is one `projectRelative` refused, which for a
+    // file the compiler holds means it is not inside the project at all.
+    const escaping = paths.filter((path) => path.startsWith('/') || path.startsWith('..'));
+    expect(
+      escaping,
+      `${description} must name nothing outside the project, and names: ${escaping.join(', ')}`,
+    ).toEqual([]);
+  }
+}
+
+/**
+ * Plants, in a copy of the corpus, one file of every kind the indexer must
+ * never read, and returns their project-relative paths.
+ *
+ * The payloads are trivially synthetic — a marker constant, and a placeholder
+ * assignment for the environment files — because a committed test that wrote
+ * anything resembling a credential would put that credential in the
+ * repository, whatever directory it wrote it to.
+ *
+ * @param rootAbs The sandbox copy of the corpus to plant into.
+ * @returns The project-relative paths planted, for a message that names them.
+ */
+function plantForbiddenFiles(rootAbs: string): readonly string[] {
+  plantFile(
+    join(rootAbs, 'node_modules', 'example-pkg', 'index.ts'),
+    moduleNaming(GENERATED_MARKER),
+  );
+  plantFile(join(rootAbs, '.next', 'server', 'app', 'page.js'), moduleNaming(GENERATED_MARKER));
+  plantFile(join(rootAbs, 'dist', 'bundle.js'), moduleNaming(GENERATED_MARKER));
+  plantFile(join(rootAbs, 'coverage', 'lcov-report', 'index.ts'), moduleNaming(GENERATED_MARKER));
+  plantFile(join(rootAbs, 'src', 'vendor.min.js'), moduleNaming(GENERATED_MARKER));
+  plantFile(join(rootAbs, '.env'), `PLACEHOLDER=${ENV_MARKER}\n`);
+  plantFile(join(rootAbs, '.env.local'), `PLACEHOLDER=${ENV_MARKER}\n`);
+  // The pathological name, and the one that makes the environment-file
+  // assertions bite: `.env.ts` carries an indexable extension, so the *only*
+  // things keeping it out are the hidden-entry rule and the environment
+  // predicate. A plain `.env` is refused by its extension as well, which would
+  // let a regression in either of those go unnoticed.
+  plantFile(join(rootAbs, '.env.ts'), `PLACEHOLDER=${ENV_MARKER}\n`);
+
+  return [
+    '.env',
+    '.env.local',
+    '.env.ts',
+    '.next/server/app/page.js',
+    'coverage/lcov-report/index.ts',
+    'dist/bundle.js',
+    'node_modules/example-pkg/index.ts',
+    'src/vendor.min.js',
+  ];
+}
+
+/**
+ * Widens a sandbox copy's own `tsconfig.json` as far as a target legitimately
+ * can: `include: ["**\/*"]`, no `exclude`.
+ *
+ * The target's `compilerOptions` are carried over verbatim rather than
+ * rewritten, so the case that follows still proves two things at once — that
+ * the widened file list contributes nothing, and that the options (the `paths`
+ * aliases in particular) are still taken from it.
+ *
+ * @param rootAbs The sandbox copy whose configuration is widened.
+ */
+function widenTsConfigFileList(rootAbs: string): void {
+  const configPath = join(rootAbs, 'tsconfig.json');
+  const original: unknown = JSON.parse(readFileSync(configPath, 'utf8'));
+  const compilerOptions =
+    typeof original === 'object' && original !== null && 'compilerOptions' in original
+      ? original.compilerOptions
+      : undefined;
+
+  expect(
+    compilerOptions,
+    `the corpus configuration at ${configPath} must declare compilerOptions to widen`,
+  ).toBeDefined();
+
+  writeFileSync(
+    configPath,
+    `${JSON.stringify({ compilerOptions, include: ['**/*'] }, undefined, 2)}\n`,
+  );
+
+  // Read back, so a helper that silently failed to widen anything cannot make
+  // the case that depends on it pass for the wrong reason.
+  const widened: unknown = JSON.parse(readFileSync(configPath, 'utf8'));
+  expect(widened).toMatchObject({ include: ['**/*'] });
+  expect(widened).not.toHaveProperty('exclude');
 }
 
 /*
@@ -778,6 +962,116 @@ describe('openProject: links and roots that must keep working', () => {
 
 /*
  * ---------------------------------------------------------------------------
+ * The committed corpus, opened where it lives
+ *
+ * Read-only in every sense. These cases open
+ * `test/fixtures/sample-next-app` at its committed path — which is what a
+ * consumer of this package does with a developer's project — and they write,
+ * change and delete nothing, so a run leaves the checkout clean. Every case
+ * that has to *plant* a file works on a sandbox copy instead.
+ *
+ * Opening the corpus in place is also the only way to assert the corpus'
+ * `tsconfig.json` is the configuration that applied, and the only way to prove
+ * the committed tree indexes as it stands rather than as `cpSync` reproduced
+ * it.
+ * ---------------------------------------------------------------------------
+ */
+
+describe('openProject: the committed corpus, opened where it lives', () => {
+  it("holds exactly the corpus modules, once each, under the corpus' own configuration", () => {
+    const loaded = openOrFail({ projectRoot: FIXTURE_ROOT });
+
+    expect(loaded.tsConfigFilePath).toBe(absoluteIn(FIXTURE_ROOT, 'tsconfig.json'));
+
+    const paths = relativePathsOf(loaded);
+    expect(paths).toEqual(EXPECTED_FIXTURE_FILES);
+    // Order equality alone would tolerate a file counted twice under two
+    // spellings, which a link inside the project is capable of producing.
+    expect(new Set(paths).size, `the file set must hold no duplicate: ${paths.join(', ')}`).toBe(
+      paths.length,
+    );
+    // The handle is memoised, so a second call answers with the same contents.
+    expect(relativePathsOf(loaded)).toEqual(paths);
+    expectNothingForbiddenWasRead(loaded);
+  });
+
+  it("resolves both hops of the corpus' aliased barrel import", () => {
+    // The chain the import and symbol extractors are written against, and the
+    // reason the target's configuration is read at all:
+    //
+    //   app/page.tsx  --'@/widgets'-->  src/widgets/index.ts
+    //                 --'./BasinSummary' (default re-export)-->
+    //                 src/widgets/BasinSummary.tsx
+    //
+    // The first hop needs the target's `paths` mapping; the second needs the
+    // barrel's own module to be loaded, which is what makes the two-hop answer
+    // available at all.
+    const loaded = openOrFail({ projectRoot: FIXTURE_ROOT });
+
+    const aliased = sourceFileAt(loaded, 'app/page.tsx')
+      .getImportDeclarations()
+      .find((declaration) => declaration.getModuleSpecifierValue() === '@/widgets');
+    expect(aliased, "the corpus' root page must import '@/widgets'").toBeDefined();
+
+    const barrel = aliased?.getModuleSpecifierSourceFile();
+    expect(barrel?.getFilePath()).toBe(absoluteIn(FIXTURE_ROOT, 'src/widgets/index.ts'));
+
+    const defaultReExport = barrel
+      ?.getExportDeclarations()
+      .find((declaration) =>
+        declaration
+          .getNamedExports()
+          .some(
+            (named) =>
+              named.getName() === 'default' && named.getAliasNode()?.getText() === 'BasinSummary',
+          ),
+      );
+    expect(
+      defaultReExport,
+      "the corpus' barrel must re-export a default as 'BasinSummary'",
+    ).toBeDefined();
+    expect(defaultReExport?.getModuleSpecifierSourceFile()?.getFilePath()).toBe(
+      absoluteIn(FIXTURE_ROOT, 'src/widgets/BasinSummary.tsx'),
+    );
+  });
+
+  it('tolerates the specifiers the corpus deliberately leaves uninstalled', () => {
+    // The corpus installs nothing, and that is a property of the corpus rather
+    // than a defect: every consumer of this handle reads the abstract syntax
+    // tree first and reaches for a type only where one exists. So these three
+    // specifiers must resolve to nothing, must not fail the open, and must not
+    // contribute a file — and no case may "fix" them with a shim, a `paths`
+    // entry or a suppression.
+    const loaded = openOrFail({ projectRoot: FIXTURE_ROOT });
+
+    const uninstalled: readonly (readonly [string, string])[] = [
+      ['src/widgets/GaugeReadout.tsx', 'react'],
+      ['src/lib/http.ts', 'next/server'],
+      ['pages/api/gauge-log.ts', 'next'],
+    ];
+
+    for (const [relativePath, specifier] of uninstalled) {
+      const declaration = sourceFileAt(loaded, relativePath)
+        .getImportDeclarations()
+        .find((candidate) => candidate.getModuleSpecifierValue() === specifier);
+      expect(declaration, `${relativePath} must still import '${specifier}'`).toBeDefined();
+      expect(
+        declaration?.getModuleSpecifierSourceFile(),
+        `'${specifier}' must resolve to nothing, because the corpus installs nothing`,
+      ).toBeUndefined();
+    }
+
+    // Nothing was pulled in on their behalf: the file set is the corpus
+    // exactly, and every file the compiler holds belongs to the project.
+    expect(relativePathsOf(loaded)).toEqual(EXPECTED_FIXTURE_FILES);
+    for (const path of loadedPathsOf(loaded)) {
+      expect(loaded.projectRelative(path), `${path} must belong to the project`).toBeDefined();
+    }
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
  * The file set of the corpus, and its order
  * ---------------------------------------------------------------------------
  */
@@ -924,6 +1218,132 @@ describe('openProject: trees and files that are never indexed', () => {
     expect(loadedTextOf(loaded)).not.toContain(OUTSIDE_MARKER);
   });
 
+  it('reads no environment file and no generated or vendored tree', () => {
+    // The privacy control of this package, stated as an assertion about paths
+    // rather than about content: one file of every forbidden kind is planted
+    // into a copy of a realistic project, and neither the judged file set nor
+    // the set the compiler actually holds may name any of them. A failure here
+    // is a security regression (AAP 0.5.2), not a broken unit test.
+    const root = copyCorpusInto('app');
+    const planted = plantForbiddenFiles(root);
+
+    // The absence assertions below are only worth their run time if every
+    // planted path is one the predicates call forbidden, so that is asserted
+    // first: a planted file the helper could not recognise would make the rest
+    // of this case pass vacuously.
+    for (const relativePath of planted) {
+      expect(
+        isEnvFilePath(relativePath) || isGeneratedOrVendored(relativePath),
+        `${relativePath} was planted as a file the indexer must never read`,
+      ).toBe(true);
+    }
+
+    const loaded = openOrFail({ projectRoot: root });
+
+    expectNothingForbiddenWasRead(loaded);
+    expect(relativePathsOf(loaded)).toEqual(EXPECTED_FIXTURE_FILES);
+    for (const relativePath of planted) {
+      expect(relativePathsOf(loaded)).not.toContain(relativePath);
+    }
+    // And nothing planted was read under any other spelling either.
+    expect(loadedTextOf(loaded)).not.toContain(GENERATED_MARKER);
+    expect(loadedTextOf(loaded)).not.toContain(ENV_MARKER);
+  });
+
+  it('keeps them out when the target widens its own tsconfig to include ["**/*"]', () => {
+    // What `skipAddingFilesFromTsConfig` and the enumeration-free options
+    // parser exist for: a target's `include` is written for a build, where
+    // reading an environment file is harmless because nothing emits it, and
+    // the same glob handed to an indexer is a disclosure. So the widest legal
+    // file list a target can state must contribute nothing, while its
+    // `compilerOptions` still apply — which the alias assertion below is what
+    // proves.
+    const root = copyCorpusInto('app');
+    const planted = plantForbiddenFiles(root);
+    widenTsConfigFileList(root);
+
+    const loaded = openOrFail({ projectRoot: root });
+
+    expectNothingForbiddenWasRead(loaded);
+    expect(relativePathsOf(loaded)).toEqual(EXPECTED_FIXTURE_FILES);
+    for (const relativePath of planted) {
+      expect(relativePathsOf(loaded)).not.toContain(relativePath);
+    }
+
+    expect(loaded.tsConfigFilePath).toBe(absoluteIn(root, 'tsconfig.json'));
+    const aliased = sourceFileAt(loaded, 'app/page.tsx')
+      .getImportDeclarations()
+      .find((declaration) => declaration.getModuleSpecifierValue() === '@/widgets');
+    expect(aliased?.getModuleSpecifierSourceFile()?.getFilePath()).toBe(
+      absoluteIn(root, 'src/widgets/index.ts'),
+    );
+  });
+
+  it.skipIf(SYMLINKS_UNAVAILABLE)(
+    "refuses a link into the project's own excluded tree, quietly (requires symlink support)",
+    () => {
+      // The one way a candidate reaches the screen and is refused there as an
+      // ordinary exclusion: the link's own name is indexable and sits outside
+      // every excluded tree, and only its *resolved* path lands under one. It
+      // is a build artefact rather than a breach, so it must be counted at
+      // `debug` and must not be reported as an escape or as an environment
+      // file — a spurious warning about a developer's own `dist` link is noise
+      // that trains them to ignore the records that matter.
+      const root = copyCorpusInto('app');
+      plantFile(join(root, 'dist', 'bundle.js'), moduleNaming(GENERATED_MARKER));
+      symlinkSync(join(root, 'dist', 'bundle.js'), join(root, 'src', 'lib', 'bundled.ts'));
+
+      const recorder = createRecordingLogger();
+      const loaded = openOrFail({ projectRoot: root, logger: recorder.logger });
+
+      expectNeverLoaded(loaded, 'src/lib/bundled.ts', GENERATED_MARKER);
+      expect(relativePathsOf(loaded)).toEqual(EXPECTED_FIXTURE_FILES);
+
+      expect(
+        recordsMatching(recorder.records, 'debug', 'excluded from the code index'),
+      ).not.toHaveLength(0);
+      expect(
+        recordsMatching(recorder.records, 'warn', 'real path leaves the project'),
+      ).toHaveLength(0);
+      expect(recordsMatching(recorder.records, 'warn', 'environment files were')).toHaveLength(0);
+    },
+  );
+
+  it.skipIf(SYMLINKS_UNAVAILABLE)(
+    'skips a link that names nothing indexable before resolving it (requires symlink support)',
+    () => {
+      // Two links neither of which can contribute a file: one dangling, whose
+      // target resolves to nothing, and one whose own name is not indexable.
+      // Both are refused during discovery — which is why no fixture in this
+      // file reaches the screen's `unresolvable` verdict — and both are
+      // ordinary enough to be reported at `debug` rather than `warn`.
+      const root = copyCorpusInto('app');
+      symlinkSync(join(root, 'src', 'lib', 'nowhere.ts'), join(root, 'src', 'lib', 'dangling.ts'));
+      symlinkSync(join(root, 'src', 'lib', 'http.ts'), join(root, 'src', 'lib', 'http-notes.md'));
+
+      const recorder = createRecordingLogger();
+      const loaded = openOrFail({ projectRoot: root, logger: recorder.logger });
+
+      expect(relativePathsOf(loaded)).toEqual(EXPECTED_FIXTURE_FILES);
+
+      const skipped = singleRecordMatching(
+        recorder.records,
+        'debug',
+        'links that name nothing indexable',
+      );
+      expect(skipped.fields?.count).toBe(2);
+      // Membership rather than order: the traversal reports entries in the
+      // order `readdir` hands them over, which is the filesystem's business
+      // and not a contract this suite may pin.
+      expect(skipped.fields?.files).toEqual(
+        expect.arrayContaining(['src/lib/dangling.ts', 'src/lib/http-notes.md']),
+      );
+      expect(
+        recordsMatching(recorder.records, 'warn', 'real path could not be established'),
+      ).toHaveLength(0);
+    },
+  );
+
   it('honours extraExcludes as whole segments at any depth', () => {
     const root = copyCorpusInto('app');
     plantFile(join(root, 'src', 'generated', 'client.ts'), moduleNaming(GENERATED_MARKER));
@@ -990,6 +1410,72 @@ describe('openProject: the target configuration', () => {
 
     expect(loaded.tsConfigFilePath).toBe(absoluteIn(root, 'tsconfig.json'));
     expect(relativePathsOf(loaded)).toEqual(EXPECTED_FIXTURE_FILES);
+  });
+
+  it('accepts a configuration named by an absolute path outside the project', () => {
+    // Sharing one base configuration across a workspace is ordinary, and the
+    // configuration only ever contributes compiler options — the file set
+    // stays bounded by the root's own traversal either way.
+    const root = copyCorpusInto('app');
+    const shared = plantFile(
+      join(sandbox, 'shared', 'tsconfig.shared.json'),
+      `${JSON.stringify(
+        {
+          compilerOptions: {
+            target: 'ES2022',
+            jsx: 'preserve',
+            module: 'esnext',
+            moduleResolution: 'bundler',
+            allowJs: true,
+            noEmit: true,
+            paths: { '@/*': ['./src/*'] },
+          },
+        },
+        undefined,
+        2,
+      )}\n`,
+    );
+
+    const loaded = openOrFail({ projectRoot: root, tsConfigFilePath: shared });
+
+    expect(loaded.tsConfigFilePath).toBe(toPosix(shared));
+    expect(relativePathsOf(loaded)).toEqual(EXPECTED_FIXTURE_FILES);
+    // And the documented consequence of naming a configuration elsewhere: its
+    // `paths` are anchored to its *own* directory, so an alias written for the
+    // project resolves to nothing rather than to the project's barrel. Stated
+    // here so that a future change which re-anchored them is visible.
+    const aliased = sourceFileAt(loaded, 'app/page.tsx')
+      .getImportDeclarations()
+      .find((declaration) => declaration.getModuleSpecifierValue() === '@/widgets');
+    expect(aliased, "the corpus' root page must still import '@/widgets'").toBeDefined();
+    expect(aliased?.getModuleSpecifierSourceFile()).toBeUndefined();
+  });
+
+  it('indexes a realistic project whose configuration has been removed', () => {
+    // The documented fallback path, on a project large enough for it to
+    // matter: an *absent* configuration is a success (a malformed one is not —
+    // see the failures below). Alias resolution is legitimately unavailable
+    // without the target's `paths`, so the claim here is about the file set,
+    // which must be complete rather than merely non-empty.
+    const root = copyCorpusInto('app');
+    rmSync(join(root, 'tsconfig.json'));
+
+    const recorder = createRecordingLogger();
+    const loaded = openOrFail({ projectRoot: root, logger: recorder.logger });
+
+    expect(loaded.tsConfigFilePath).toBeUndefined();
+    expect(relativePathsOf(loaded)).toEqual(EXPECTED_FIXTURE_FILES);
+    expect(
+      recordsMatching(recorder.records, 'debug', 'no TypeScript configuration found'),
+    ).toHaveLength(1);
+    // Without a `paths` mapping the aliased specifier resolves to nothing, and
+    // that is the documented consequence rather than a failure. The specifier
+    // itself must still be there, or the assertion after it means nothing.
+    const aliased = sourceFileAt(loaded, 'app/page.tsx')
+      .getImportDeclarations()
+      .find((declaration) => declaration.getModuleSpecifierValue() === '@/widgets');
+    expect(aliased, "the corpus' root page must still import '@/widgets'").toBeDefined();
+    expect(aliased?.getModuleSpecifierSourceFile()).toBeUndefined();
   });
 });
 
@@ -1072,6 +1558,35 @@ describe('openProject: documented failures', () => {
     expect(error.code).toBe('CODE_INDEX_FAILED');
     expect(error.details?.reason).toBe('tsconfig-missing');
   });
+
+  it('returns every refusal as a value and throws for none of them', () => {
+    // Stated as its own case because it is a property of the whole surface
+    // rather than of one input: a caller composes `openProject` into a
+    // `Result` chain, so an exception from any of these would escape a code
+    // path that has no `try` around it. The helpers above would also pass
+    // against a throwing implementation only by failing the case with a
+    // different message, which is a worse diagnosis than this assertion gives.
+    const fileAsRoot = plantFile(join(sandbox, 'root.ts'), 'export const R = 1;\n');
+    const malformed = copyCorpusInto('malformed');
+    writeFileSync(join(malformed, 'tsconfig.json'), '{ "compilerOptions": { "target": "ES2022"\n');
+
+    const refusals: readonly OpenProjectOptions[] = [
+      { projectRoot: 'packages/code-analysis' },
+      { projectRoot: '//server/share/project' },
+      { projectRoot: join(sandbox, 'absent') },
+      { projectRoot: fileAsRoot },
+      { projectRoot: malformed },
+      { projectRoot: copyCorpusInto('named'), tsConfigFilePath: 'tsconfig.build.json' },
+    ];
+
+    for (const options of refusals) {
+      expect(
+        () => openProject(options),
+        `openProject('${options.projectRoot}') must return a refusal rather than throw`,
+      ).not.toThrow();
+      expect(isErr(openProject(options))).toBe(true);
+    }
+  });
 });
 
 /*
@@ -1088,6 +1603,7 @@ describe('isEnvFilePath', () => {
   for (const path of [
     '.env',
     '.env.local',
+    '.env.development',
     '.env.production.local',
     'apps/service/.env',
     'C:\\projects\\app\\.env.development',
@@ -1098,7 +1614,13 @@ describe('isEnvFilePath', () => {
     });
   }
 
-  for (const path of ['env.ts', 'src/lib/environment.ts', 'config.env.ts', '.environment']) {
+  for (const path of [
+    'env.ts',
+    'src/lib/environment.ts',
+    'config.env.ts',
+    'my.env.ts',
+    '.environment',
+  ]) {
     it(`is false for '${path}'`, () => {
       expect(isEnvFilePath(path)).toBe(false);
     });
@@ -1118,6 +1640,8 @@ describe('isIndexableFile', () => {
     'src/types/generated.d.cts',
     'src/styles/base.css',
     'package.json',
+    'docs/notes.md',
+    'src/lib/module.js.map',
     'src/lib/module',
   ]) {
     it(`is false for '${path}'`, () => {
@@ -1161,6 +1685,18 @@ describe('shouldExcludePath', () => {
       false,
     );
     expect(shouldExcludePath('/p', '/p/src/module.ts', ['generated'])).toBe(false);
+  });
+
+  it('ignores an extraExcludes entry that normalises to nothing meaningful', () => {
+    // The fail-open direction, and the only place it is correct: an entry of
+    // `''`, `'.'` or `'./'` names no directory, and treating it as a match
+    // would exclude the entire project — an empty index from a caller's empty
+    // string, with nothing to explain it.
+    expect(shouldExcludePath('/p', '/p/src/module.ts', ['', '.', './'])).toBe(false);
+    // A real entry alongside the meaningless ones still matches.
+    expect(shouldExcludePath('/p', '/p/src/generated/client.ts', ['.', 'src/generated'])).toBe(
+      true,
+    );
   });
 });
 
