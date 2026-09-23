@@ -119,7 +119,8 @@
  *                             --dgc-frame-color     components/FlameChart
  *                             --dgc-node-color      components/DependencyGraph
  *                             --dgc-severity-color  DurationCell, MetricCards
- *                             --dgc-depth           components/ComponentTree
+ *                             --dgc-depth           components/ComponentTree,
+ *                                                   components/FlameChart
  *                             --dgc-stack-gap       layout/Stack
  *                             --dgc-split-weight    layout/Split
  *                           Every colour handed in through one of these comes
@@ -2263,6 +2264,94 @@
   min-inline-size: 0;
 }
 
+/* The class contract layout/SummaryHeader.tsx declares: the region wrapper and
+ * its heading, one list shape for both registers, and the statement, evidence
+ * and chip elements. Same intent as the rules above — a neutral edge on what
+ * was measured, a warning-toned edge on what is inferred, a chip that reads as
+ * the control it is — expressed against the element names the component
+ * renders, with the observed/inferred difference carried by the region variant
+ * rather than by two parallel list classes. Later in source order, so where a
+ * rule above names the same element this one wins at equal specificity. */
+.dg-summary-header__region {
+  display: flex;
+  flex-direction: column;
+  gap: var(--dg-space-2);
+  min-inline-size: 0;
+}
+
+/* "Observed" and "Likely cause". Letter-spacing is not tokenised, so the label
+ * is distinguished by its type role and colour — never by colour alone, since
+ * each region is also a separately labelled landmark with its own heading. */
+.dg-summary-header__region-heading {
+  color: var(--dg-text-muted);
+  font: var(--dg-text-xs);
+  font-weight: var(--dg-font-weight-medium);
+}
+
+.dg-summary-header__facts {
+  display: flex;
+  flex-direction: column;
+  gap: var(--dg-space-2);
+  min-inline-size: 0;
+  padding-inline-start: var(--dg-space-3);
+  /* These render as lists; base.css deliberately keeps user-agent markers, so
+   * a marker-free list opts out here. */
+  list-style: none;
+}
+
+/* Measured facts: a neutral edge, because the region makes no claim beyond what
+ * the capture holds. */
+.dg-summary-header__region--observed .dg-summary-header__facts {
+  border-inline-start: medium solid var(--dg-border-strong);
+}
+
+/* Inference: a warning-toned edge, and every item carries a confidence badge
+ * whose text names the level, so the distinction is never colour alone. */
+.dg-summary-header__region--causes .dg-summary-header__facts {
+  border-inline-start: medium solid var(--dg-warning);
+}
+
+.dg-summary-header__fact {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--dg-space-2);
+  min-inline-size: 0;
+  color: var(--dg-text-primary);
+  font: var(--dg-text-md);
+}
+
+/* A statement wraps instead of truncating: a fact a developer cannot finish
+ * reading is a fact they cannot check. */
+.dg-summary-header__statement {
+  min-inline-size: 0;
+  overflow-wrap: break-word;
+}
+
+.dg-summary-header__evidence {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--dg-space-1);
+  min-inline-size: 0;
+  list-style: none;
+}
+
+/* An evidence chip selects the events that substantiate the statement beside
+ * it, so it is rendered as a control and styled as one: the muted accent
+ * surface over the ghost button's chrome, and the hover feedback of something
+ * clickable. The focus ring comes from base.css. */
+.dg-summary-header__chip {
+  background: var(--dg-accent-muted);
+  border-color: var(--dg-accent);
+  color: var(--dg-text-primary);
+  font: var(--dg-mono-sm);
+}
+
+.dg-summary-header__chip:hover {
+  background: var(--dg-surface-overlay);
+  border-color: var(--dg-border-strong);
+}
+
 /* ==========================================================================
  * components/* — the thirteen visualization components
  *
@@ -2839,6 +2928,53 @@
   pointer-events: none;
 }
 
+/* A provenance or honesty note above the chart: what the widths mean, and what
+ * the chart is not showing. */
+.dg-flame__note {
+  color: var(--dg-text-muted);
+  font: var(--dg-text-xs);
+}
+
+/* The chart's text equivalent. The canvas is `role="img"` and cannot be entered
+ * with a keyboard, so the same frames are listed beneath it, one row each, in
+ * the order the icicle draws them. Markers are dropped here rather than in
+ * base.css, which keeps them for the lists that want them. */
+.dg-flame__equivalent {
+  display: flex;
+  flex-direction: column;
+  min-inline-size: 0;
+  list-style: none;
+}
+
+/* One frame's row. `--dgc-depth` is the frame's depth as a unitless integer and
+ * the indentation is that integer times one space token, exactly as a
+ * component-tree node is indented, so the hierarchy reads without a class per
+ * level. The transparent edge is what keeps an unflagged row aligned with a
+ * flagged one. */
+.dg-flame__equivalent-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--dg-space-1);
+  min-inline-size: 0;
+  padding-block: var(--dg-space-0);
+  padding-inline-end: var(--dg-space-2);
+  padding-inline-start: calc(var(--dgc-depth, 0) * var(--dg-space-4));
+  border-inline-start: medium solid transparent;
+}
+
+.dg-flame__equivalent-row.dg-is-selected {
+  background: var(--dg-accent-muted);
+  border-inline-start-color: var(--dg-accent);
+}
+
+/* A record the correlator re-attached to the trace root: the structure around
+ * it is not the shape the application had, and a guessed relationship must not
+ * read as a measured one. */
+.dg-flame__equivalent-row.dg-is-orphan {
+  border-inline-start-color: var(--dg-warning);
+}
+
 /* ==========================================================================
  * components/SpanTable.tsx
  *
@@ -2987,6 +3123,23 @@
   flex: none;
 }
 
+/* The leaf's placeholder — the empty box the note above describes. `:empty`
+ * addresses exactly the case that needs a rule: a span with no toggle inside
+ * it, which would otherwise collapse to nothing and pull a leaf's label out of
+ * line with its siblings'. It reserves the icon-only toggle's box, and it does
+ * so by restating that control's own recipe rather than a length: the small
+ * type role (`--dg-text-sm`, which is also what `.dg-button--sm` sets, so `1em`
+ * here is the glyph the toggle draws), that control's inline padding
+ * (`--dg-space-1` a side) and its hairline border a side (`--dg-space-0` is the
+ * scale's smallest step and the width `thin` resolves to). The three terms
+ * therefore track the toggle through a token change instead of drifting from
+ * it, and `aspect-ratio` keeps the box square without a second length. */
+.dg-component-tree__toggle:empty {
+  font: var(--dg-text-sm);
+  inline-size: calc(1em + var(--dg-space-1) * 2 + var(--dg-space-0));
+  aspect-ratio: 1;
+}
+
 /* Expansion needs no rule of its own: the node's `aria-expanded` attribute
  * carries the state to a reader and the component swaps the toggle's glyph,
  * so there is nothing left for a state class to say. A leaf renders the
@@ -3123,6 +3276,32 @@
   display: inline-flex;
   align-items: center;
   min-inline-size: 0;
+}
+
+/* The list of caller chips inside one cell, and the list of executions inside an
+ * expanded row. Both are `Stack`s, so their spacing is the stack's; these rules
+ * only let them shrink below their content, which is what keeps a long caller
+ * name or a wide execution row from widening the grid. */
+.dg-query-table__callers,
+.dg-query-table__occurrences {
+  min-inline-size: 0;
+}
+
+/* One execution of a grouped statement, on the elevated surface so the nesting
+ * inside the detail row is legible without a second grid. */
+.dg-query-table__occurrence-row {
+  min-inline-size: 0;
+  padding-block: var(--dg-space-0);
+  padding-inline: var(--dg-space-1);
+  border-radius: var(--dg-radius-sm);
+  background: var(--dg-surface-elevated);
+}
+
+/* The paging footer, below the grid rather than inside it: it composes the
+ * table's own footer element class for its rule and adds nothing but the
+ * refusal to stretch, so the rows above take the free space. */
+.dg-query-table__footer {
+  flex: none;
 }
 
 /* A wrapping statement needs the row to align its cells to the top rather than
