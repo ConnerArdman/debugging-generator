@@ -318,7 +318,6 @@
     "contactEmail",
     "contactName",
     "createMany",
-    "createdAt",
     "currentPage",
     "customerContactSchema",
     "customerFailureBody",

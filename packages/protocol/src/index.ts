@@ -85,10 +85,10 @@
  * ```
  *
  * That graph is the package's plan of record (AAP §0.7.1). What `src/` holds
- * today is `version.ts` and the five `messages/*` modules, and the six groups
- * below re-export exactly those: tsup resolves every specifier in this file
- * when it builds `dist/index.js`, so a barrel can only ever name a module that
- * is there.
+ * today is `version.ts`, `analysis.ts` and the `messages/*` modules that have
+ * landed, and the groups below re-export exactly those: tsup resolves every
+ * specifier in this file when it builds `dist/index.js`, so a barrel can only
+ * ever name a module that is there.
  *
  * `version.ts` is at the top because every other module imports it and none of
  * them may import anything from this package in return — the wire version the
@@ -140,12 +140,31 @@
 export * from './version.js';
 
 // ---------------------------------------------------------------------------
+// analysis — the analysis artifact: the model-authored findings (`observed`
+// facts and `likelyCauses`, each evidence-backed by construction) and the
+// stored, broadcast `AnalysisResult` that adds identity, provenance, timestamp
+// and the capture's metric values, plus the deterministic assembler that turns
+// the first into the second.
+// ---------------------------------------------------------------------------
+export * from './analysis.js';
+
+// ---------------------------------------------------------------------------
 // messages/error — the generic `error` frame (AAP §0.4.2): the failure reply any
 // request or subscription can receive, over the closed error-code vocabulary
 // `@debuggen/shared` defines, with the correlation reference this protocol adds
 // so a receiver can say which of its frames failed.
 // ---------------------------------------------------------------------------
 export * from './messages/error.js';
+
+// ---------------------------------------------------------------------------
+// messages/agent — the client handshake and the two runtime agents' lifecycle:
+// `client.hello`, the first frame every connection sends and the one that names
+// its kind and carries its credential, `agent.ready`, the browser agent's report
+// that it is installed in a document, and the two arming messages,
+// `agent.config` for the page agent and `server-agent.config` for the Node
+// preload, whose cleared form returns each of them to dormant.
+// ---------------------------------------------------------------------------
+export * from './messages/agent.js';
 
 // ---------------------------------------------------------------------------
 // messages/binding — the four messages that pair an inspected Chrome tab with a
@@ -164,11 +183,36 @@ export * from './messages/binding.js';
 export * from './messages/capture.js';
 
 // ---------------------------------------------------------------------------
+// messages/instrumentation — what the tool is about to do to the developer's
+// working tree and what it managed to do: `instrumentation.plan` carrying the
+// normalised plan, `instrumentation.ready` carrying the applied modification
+// records, the runtime hooks that came up and the signals that did not, and
+// `instrumentation.failed` for the one case where nothing at all could be
+// enabled.
+// ---------------------------------------------------------------------------
+export * from './messages/instrumentation.js';
+
+// ---------------------------------------------------------------------------
+// messages/panel — `panel.generated`, the frame that hands a validated panel
+// specification to the DevTools panel and the editor once analysis has produced
+// one, carrying the spec exactly as `@debuggen/panel-schema` defines it.
+// ---------------------------------------------------------------------------
+export * from './messages/panel.js';
+
+// ---------------------------------------------------------------------------
 // messages/source — `source.open`, the hop that carries an already-resolved
 // project location from the DevTools panel to the editor and makes every
 // runtime item in a generated panel clickable.
 // ---------------------------------------------------------------------------
 export * from './messages/source.js';
+
+// ---------------------------------------------------------------------------
+// messages/target — the element-selection round trip: `target.request`, the
+// service asking the bound panel to enter picker mode, and `target.selected`,
+// the panel answering with the selected element's descriptor and component
+// chain.
+// ---------------------------------------------------------------------------
+export * from './messages/target.js';
 
 // ---------------------------------------------------------------------------
 // messages/telemetry — the two directions of the event stream: `telemetry.event`,

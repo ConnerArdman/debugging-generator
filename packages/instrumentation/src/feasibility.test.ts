@@ -33,8 +33,8 @@
  * ## What each group asserts
  *
  * - **Vocabulary** — the frozen code tuple and its predicate.
- * - **Adapter claim** — check 1, and that it is skipped when no resolver is
- *   supplied.
+ * - **Adapter claim** — check 1, that it is skipped when no resolver is
+ *   supplied, and that the resolver is asked exactly one question per action.
  * - **Runtime mode** — checks 2 to 5 are skipped for an action that writes
  *   nothing.
  * - **Containment** — check 2, for a traversal, an absolute path and a
@@ -45,11 +45,16 @@
  * - **The declaration's shape** — check 5: every supported shape in the
  *   fixture accepted, both generators refused with their own codes, and every
  *   unwrappable form refused as `unsupported-declaration`.
+ * - **The route handler** — the fixture's exported request-handler method,
+ *   accepted as a server span and as a function timing, and refused for a
+ *   method the module does not export.
  * - **No syntax tree** — check 5's honest answer when no project is loaded.
  * - **Duplicates** — check 6, for an identical action and for two patches on
  *   one declaration, and its absence for two runtime signals on one component.
- * - **Determinism and bounds** — ordering, repeatability, one log line, and the
- *   truncation every reported value goes through.
+ * - **Determinism and bounds** — ordering, repeatability, serialisability, one
+ *   log line, and the truncation every reported value goes through.
+ * - **What a developer reads** — every code in the vocabulary reached, and
+ *   neither sentence naming a host path or anything shaped like a credential.
  * - **Invariants** — the only conditions this module throws for.
  */
 
@@ -69,7 +74,7 @@ import {
 import type { CodeQueries, LoadedProject, ProjectSummary, RouteMap } from '@debuggen/code-analysis';
 import { DebuggenError, isErr, ok, toPosix } from '@debuggen/shared';
 import type { LogFields, Logger, Result } from '@debuggen/shared';
-import { beforeAll, describe, expect, it } from 'vitest';
+import { beforeAll, describe, expect, it, vi } from 'vitest';
 
 import type { InstrumentationContext } from './adapter.js';
 import {
@@ -138,9 +143,21 @@ const FILES = {
   legacyJs: 'src/legacy/firing-log.js',
   /** Plain JavaScript: arrow constants only, one of them block-bodied. */
   legacyArrows: 'src/legacy/rack-tally.js',
+  /**
+   * Plain JavaScript: function declarations only — a destructured parameter
+   * with defaults, an async one, and a validating one.
+   */
+  legacyBisque: 'src/legacy/bisque-schedule.js',
   /** Plain JSX: a helper function beside a component. */
   legacyJsx: 'src/legacy/kiln-badge.jsx',
+  /** TSX: an async submit handler declared beside the component that uses it. */
+  form: 'src/components/FiringLogForm.tsx',
+  /** An App Router request handler module, exporting one method. */
+  route: 'app/api/firings/route.ts',
 } as const;
+
+/** The method the fixture's one route module exports, and the symbol a plan names. */
+const ROUTE_METHOD = 'POST';
 
 /** One indexing of the fixture, with the handles a context needs. */
 interface IndexedFixture {
@@ -510,6 +527,42 @@ describe('the adapter claim', () => {
     expect(report.rejected).toEqual([]);
     expect(report.feasible).toHaveLength(1);
   });
+
+  it('asks the resolver once per action, with that action’s own type', () => {
+    const resolveActionType = vi.fn(
+      (type: InstrumentationActionType): AdapterActionResolution | undefined =>
+        type === 'server-span' ? undefined : { adapter: 'fixture-adapter', mode: 'patch' },
+    );
+    const claimed = action({ file: FILES.planner, symbol: 'planCycleSegments' });
+    const unclaimed = action({
+      file: FILES.cones,
+      symbol: 'assertConeValue',
+      type: 'server-span',
+    });
+    const report = checkFeasibility([claimed, unclaimed], makeContext(), {
+      resolver: { resolveActionType },
+    });
+
+    expect(resolveActionType.mock.calls).toEqual([['function-timing'], ['server-span']]);
+    expect(report.feasible).toEqual([claimed]);
+    expect(report.rejected.map((refusal) => refusal.code)).toEqual(['no-adapter']);
+  });
+
+  it('holds no resolver between calls: a later call without one asks nothing', () => {
+    const resolveActionType = vi.fn((): AdapterActionResolution => ({
+      adapter: 'fixture-adapter',
+      mode: 'patch',
+    }));
+    const target = { file: FILES.glaze, symbol: 'scoreShelfSlot' } as const;
+
+    checkFeasibility([action(target)], makeContext(), { resolver: { resolveActionType } });
+
+    expect(resolveActionType).toHaveBeenCalledTimes(1);
+
+    checkFeasibility([action(target)], makeContext());
+
+    expect(resolveActionType).toHaveBeenCalledTimes(1);
+  });
 });
 
 /* -------------------------------------------------------------------------------------------------
@@ -722,6 +775,10 @@ describe('a supported declaration', () => {
       input: { file: FILES.controller, symbol: 'totalSoakMinutes' },
     },
     {
+      what: 'a class method named by its bare name, without its class',
+      input: { file: FILES.controller, symbol: 'settleSegments' },
+    },
+    {
       what: 'a server-span target on a function declaration',
       input: { file: FILES.cones, symbol: 'assertConeValue', type: 'server-span' },
     },
@@ -742,8 +799,32 @@ describe('a supported declaration', () => {
       input: { file: FILES.legacyArrows, symbol: 'orderRacksByLoad' },
     },
     {
+      what: 'a comparator arrow constant in plain JavaScript',
+      input: { file: FILES.legacyArrows, symbol: 'compareRackLoad' },
+    },
+    {
+      what: 'a conditional-bodied arrow constant in plain JavaScript',
+      input: { file: FILES.legacyArrows, symbol: 'gradeRackDensity' },
+    },
+    {
       what: 'a helper function in a JSX module',
       input: { file: FILES.legacyJsx, symbol: 'formatKilnBadgeLabel' },
+    },
+    {
+      what: 'a function declaration in plain JavaScript whose one parameter is destructured with defaults',
+      input: { file: FILES.legacyBisque, symbol: 'planBisqueRamp' },
+    },
+    {
+      what: 'an async function declaration in plain JavaScript',
+      input: { file: FILES.legacyBisque, symbol: 'resolveBisqueSoak' },
+    },
+    {
+      what: 'a validating function declaration in plain JavaScript',
+      input: { file: FILES.legacyBisque, symbol: 'assertBisqueCone' },
+    },
+    {
+      what: 'an async submit handler declared in a TSX module beside its component',
+      input: { file: FILES.form, symbol: 'handleFiringSubmit' },
     },
   ];
 
@@ -752,6 +833,46 @@ describe('a supported declaration', () => {
       expectFeasible(input);
     });
   }
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * The route handler — the target every server-side plan starts from
+ * ---------------------------------------------------------------------------------------------- */
+
+describe("an App Router request handler's exported method", () => {
+  it('is a route the index recognises, declaring the method a plan would name', () => {
+    const entry = fixture.routeMap.entries.find((candidate) => candidate.file === FILES.route);
+
+    expect(entry).toBeDefined();
+    expect(entry?.methods).toContain(ROUTE_METHOD);
+  });
+
+  it('is accepted for a server-span action, which is what a route handler is planned as', () => {
+    expectFeasible({ file: FILES.route, symbol: ROUTE_METHOD, type: 'server-span' });
+  });
+
+  it('is accepted for a function-timing action on the same declaration', () => {
+    expectFeasible({ file: FILES.route, symbol: ROUTE_METHOD, type: 'function-timing' });
+  });
+
+  it('carries one patch and not two, however the two actions are typed', () => {
+    const span = action({ file: FILES.route, symbol: ROUTE_METHOD, type: 'server-span' });
+    const timing = action({ file: FILES.route, symbol: ROUTE_METHOD, type: 'function-timing' });
+    const report = checkFeasibility([span, timing], makeContext(), {
+      resolver: claimsEverything(),
+    });
+
+    expect(report.feasible).toEqual([span]);
+    expect(report.rejected[0]?.code).toBe('duplicate-action');
+  });
+
+  it('refuses a method the route module does not export', () => {
+    const refusal = refusalFor({ file: FILES.route, symbol: 'DELETE', type: 'server-span' });
+
+    expect(refusal.code).toBe('symbol-not-found');
+    expect(refusal.reason).toContain(FILES.route);
+    expectReadableRefusal(refusal);
+  });
 });
 
 describe('a generator declaration', () => {
@@ -977,6 +1098,15 @@ describe('the report', () => {
     expect(report.feasible.length + report.rejected.length).toBe(actions.length);
   });
 
+  it('survives the round trip every persisted and broadcast report makes', () => {
+    const report = checkFeasibility(mixedActions(), makeContext(), {
+      resolver: claimsEverything(),
+    });
+    const roundTripped: unknown = JSON.parse(JSON.stringify(report));
+
+    expect(roundTripped).toEqual(report);
+  });
+
   it('answers identically on a second run over the same project', () => {
     const actions = mixedActions();
     const first = checkFeasibility(actions, makeContext(), { resolver: claimsEverything() });
@@ -1013,6 +1143,118 @@ describe('the report', () => {
       rejected: 3,
       codes: ['path-outside-project', 'file-not-indexed', 'unsupported-generator'],
     });
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * What a developer reads — every code in the vocabulary, and nothing leaked into either sentence
+ * ---------------------------------------------------------------------------------------------- */
+
+describe('every refusal this gate can produce', () => {
+  /** Values that would be a disclosure in a sentence shown in two user interfaces. */
+  const LEAKS: readonly string[] = [FIXTURE_ROOT, STATE_ROOT, tmpdir(), toPosix(process.cwd())];
+
+  /**
+   * Absolute-path-looking tokens, so that the only one a sentence may name — the
+   * path the action itself carried — can be told apart from a host path the
+   * module composed.
+   */
+  const ABSOLUTE_TOKEN_PATTERN = /(?:^|[\s'"(])(\/[^\s'")]+)/gu;
+
+  /** Provider key, token and private-key shapes, none of which belongs in a rejection. */
+  const SECRET_PATTERNS: readonly RegExp[] = [
+    /sk-ant-/u,
+    /\bsk-[A-Za-z0-9]{8,}/u,
+    /\bghp_[A-Za-z0-9]{8,}/u,
+    /\bgithub_pat_/u,
+    /\bAKIA[0-9A-Z]{8,}/u,
+    /\bBearer\s+\S+/u,
+    /\beyJ[A-Za-z0-9_-]{8,}\./u,
+    /-----BEGIN [A-Z ]*PRIVATE KEY-----/u,
+    /postgres(?:ql)?:\/\//u,
+  ];
+
+  /**
+   * One refusal of every code in the vocabulary, collected over the few calls
+   * it takes to reach them all.
+   *
+   * Several calls rather than one because two of the codes are properties of a
+   * call rather than of an action: `no-adapter` needs a resolver that claims
+   * nothing, which would then refuse every other action too, and
+   * `ast-unavailable` needs a context with no loaded project.
+   *
+   * @returns Every refusal, in the order the calls produced them.
+   */
+  function everyRefusal(): readonly InfeasibleAction[] {
+    const unclaimed = checkFeasibility(
+      [action({ file: FILES.planner, symbol: 'planCycleSegments' })],
+      makeContext(),
+      { resolver: claimsNothing() },
+    );
+    const projectSide = checkFeasibility(
+      [
+        action({ file: '../escape.ts', symbol: 'escape' }),
+        action({ file: '/etc/hosts', symbol: 'anything' }),
+        action({ file: 'src/server/absent-module.ts', symbol: 'schedule' }),
+        action({ file: FILES.cones, symbol: 'zzzAbsentSymbol' }),
+        action({ file: FILES.generators, symbol: 'walkRampSegments' }),
+        action({ file: FILES.generators, symbol: 'streamKilnSamples' }),
+        action({ file: FILES.controller, symbol: 'KilnController' }),
+        action({ file: FILES.glaze, symbol: 'scoreShelfSlot' }),
+        action({ file: FILES.glaze, symbol: 'scoreShelfSlot' }),
+      ],
+      makeContext(),
+      { resolver: claimsEverything() },
+    );
+    const noTree = checkFeasibility(
+      [action({ file: FILES.planner, symbol: 'planCycleSegments' })],
+      makeContext({ loaded: undefined }),
+      { resolver: claimsEverything() },
+    );
+
+    return [...unclaimed.rejected, ...projectSide.rejected, ...noTree.rejected];
+  }
+
+  it('reaches every code in the vocabulary, and only codes in it', () => {
+    const codes = new Set(everyRefusal().map((refusal) => refusal.code));
+
+    expect([...FEASIBILITY_REJECTION_CODES].filter((code) => !codes.has(code))).toEqual([]);
+
+    for (const code of codes) {
+      expect(isFeasibilityRejectionCode(code)).toBe(true);
+    }
+  });
+
+  it('says something readable in both sentences, every time', () => {
+    for (const refusal of everyRefusal()) {
+      expectReadableRefusal(refusal);
+      expect(refusal.reason.trim()).not.toBe('');
+      expect(refusal.hint.trim()).not.toBe('');
+    }
+  });
+
+  it('names no absolute path except the one the action itself carried', () => {
+    for (const refusal of everyRefusal()) {
+      for (const sentence of [refusal.reason, refusal.hint]) {
+        for (const leak of LEAKS) {
+          expect(sentence).not.toContain(leak);
+        }
+
+        for (const [, token] of sentence.matchAll(ABSOLUTE_TOKEN_PATTERN)) {
+          expect(token).toBe(refusal.action.file);
+        }
+      }
+    }
+  });
+
+  it('carries no value shaped like a credential', () => {
+    for (const refusal of everyRefusal()) {
+      for (const sentence of [refusal.reason, refusal.hint]) {
+        for (const pattern of SECRET_PATTERNS) {
+          expect(sentence).not.toMatch(pattern);
+        }
+      }
+    }
   });
 });
 
@@ -1130,6 +1372,11 @@ describe('an unusable context', () => {
       { file: '../escape.ts', symbol: 'escape' },
       { file: FILES.cones, symbol: 'zzzAbsentSymbol' },
       { file: FILES.planner, symbol: 'planCycleSegments' },
+      { file: FILES.route, symbol: ROUTE_METHOD, type: 'server-span' },
+      { file: FILES.route, symbol: 'DELETE', type: 'server-span' },
+      { file: FILES.form, symbol: 'handleFiringSubmit' },
+      { file: FILES.legacyBisque, symbol: 'resolveBisqueSoak' },
+      { file: FILES.legacyArrows, symbol: 'gradeRackDensity' },
     ];
 
     expect(() =>
