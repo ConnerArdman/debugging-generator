@@ -1,0 +1,250 @@
+[
+  {
+    "id": "evt_ct00000000000001",
+    "traceId": "7f2a4c6e8b0d1f3a5c7e9b0d2f4a6c8e",
+    "spanId": "0000000000000a01",
+    "kind": "interaction",
+    "name": "click TrailCard report button",
+    "startTime": 1789819200000,
+    "duration": 1175,
+    "tier": "browser",
+    "attributes": {
+      "event.type": "click",
+      "target.selector": "[data-testid=\"trail-card-report\"]",
+      "target.tagName": "button",
+      "target.text": "Show conditions report",
+      "componentChain": ["TrailCard", "TrailList"],
+      "interactionId": 4912,
+      "inputDelay": 1.75,
+      "processingStart": 1789819200001.75,
+      "processingEnd": 1789819200009.5
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000001",
+    "seq": 1,
+    "source": {
+      "file": "src/components/TrailCard.tsx",
+      "line": 28,
+      "column": 17,
+      "symbol": "TrailCard",
+      "resolvedBy": "react-owner",
+      "confidence": 0.6
+    }
+  },
+  {
+    "id": "evt_ct00000000000002",
+    "traceId": "7f2a4c6e8b0d1f3a5c7e9b0d2f4a6c8e",
+    "spanId": "0000000000000a02",
+    "parentSpanId": "0000000000000a01",
+    "kind": "fetch",
+    "name": "GET /api/trail-report",
+    "startTime": 1789819200008.125,
+    "duration": 1112.375,
+    "tier": "browser",
+    "attributes": {
+      "http.method": "GET",
+      "url": "/api/trail-report?trailId=cascade-ridge",
+      "http.status_code": 200,
+      "initiator": "src/components/TrailCard.tsx:49:30",
+      "sameOrigin": true,
+      "traceparentInjected": true,
+      "transferSize": 2048
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000001",
+    "seq": 2,
+    "source": {
+      "file": "src/components/TrailCard.tsx",
+      "line": 49,
+      "column": 30,
+      "symbol": "handleShowReport",
+      "resolvedBy": "source-map",
+      "confidence": 0.75
+    }
+  },
+  {
+    "id": "evt_ct00000000000003",
+    "traceId": "7f2a4c6e8b0d1f3a5c7e9b0d2f4a6c8e",
+    "spanId": "0000000000000a03",
+    "parentSpanId": "0000000000000a02",
+    "kind": "http.server",
+    "name": "GET /api/trail-report",
+    "startTime": 1789819200012.5,
+    "duration": 1100.25,
+    "tier": "server",
+    "attributes": {
+      "http.method": "GET",
+      "url": "/api/trail-report?trailId=cascade-ridge",
+      "http.route": "/api/trail-report",
+      "http.status_code": 200,
+      "next.route": "/api/trail-report",
+      "next.span_type": "BaseServer.handleRequest"
+    },
+    "status": "ok",
+    "producerId": "prd_server0000000001",
+    "seq": 1
+  },
+  {
+    "id": "evt_ct00000000000004",
+    "traceId": "7f2a4c6e8b0d1f3a5c7e9b0d2f4a6c8e",
+    "spanId": "0000000000000a04",
+    "parentSpanId": "0000000000000a03",
+    "kind": "route.handler",
+    "name": "executing api route (app) /api/trail-report",
+    "startTime": 1789819200016,
+    "duration": 1094.5,
+    "tier": "server",
+    "attributes": {
+      "http.method": "GET",
+      "http.route": "/api/trail-report",
+      "next.route": "/api/trail-report",
+      "next.span_type": "AppRouteRouteHandlers.runHandler"
+    },
+    "status": "ok",
+    "producerId": "prd_server0000000001",
+    "seq": 2,
+    "source": {
+      "file": "app/api/trail-report/route.ts",
+      "line": 51,
+      "column": 23,
+      "symbol": "GET",
+      "endLine": 76,
+      "resolvedBy": "route-map",
+      "confidence": 0.9
+    }
+  },
+  {
+    "id": "evt_ct00000000000005",
+    "traceId": "7f2a4c6e8b0d1f3a5c7e9b0d2f4a6c8e",
+    "spanId": "0000000000000a05",
+    "parentSpanId": "0000000000000a04",
+    "kind": "function",
+    "name": "loadTrailReport",
+    "startTime": 1789819200020.75,
+    "duration": 1080,
+    "tier": "server",
+    "attributes": {
+      "symbol": "loadTrailReport",
+      "module": "src/server/services/trail-report.service.ts",
+      "actionId": "act_ct00000000000001",
+      "async": true
+    },
+    "status": "ok",
+    "producerId": "prd_server0000000001",
+    "seq": 3,
+    "source": {
+      "file": "src/server/services/trail-report.service.ts",
+      "line": 88,
+      "column": 23,
+      "symbol": "loadTrailReport",
+      "endLine": 96,
+      "resolvedBy": "patch",
+      "confidence": 1
+    }
+  },
+  {
+    "id": "evt_ct00000000000006",
+    "traceId": "7f2a4c6e8b0d1f3a5c7e9b0d2f4a6c8e",
+    "spanId": "0000000000000a06",
+    "parentSpanId": "0000000000000a05",
+    "kind": "db.query",
+    "name": "pg.query",
+    "startTime": 1789819200028.5,
+    "duration": 940.5,
+    "tier": "db",
+    "attributes": {
+      "db.system": "postgresql",
+      "db.statement": "SELECT trail_id, region, surface, snow_depth_cm, snow_line_meters, observed_at FROM trail_condition_reports WHERE trail_id IN ($1) ORDER BY observed_at DESC",
+      "db.rowCount": 128,
+      "db.operation": "select",
+      "db.name": "trail_atlas",
+      "db.client": "pg"
+    },
+    "status": "ok",
+    "producerId": "prd_server0000000001",
+    "seq": 4,
+    "source": {
+      "file": "src/server/db/pool.ts",
+      "line": 80,
+      "column": 24,
+      "symbol": "queryTrailConditionReports",
+      "resolvedBy": "code-graph",
+      "confidence": 0.85
+    }
+  },
+  {
+    "id": "evt_ct00000000000007",
+    "traceId": "7f2a4c6e8b0d1f3a5c7e9b0d2f4a6c8e",
+    "spanId": "0000000000000a07",
+    "parentSpanId": "0000000000000a02",
+    "kind": "render",
+    "name": "render ConditionsPanel",
+    "startTime": 1789819201128,
+    "duration": 47,
+    "tier": "browser",
+    "attributes": {
+      "component": "ConditionsPanel",
+      "phase": "update",
+      "renderCount": 2,
+      "changedProps": [{ "key": "report" }],
+      "trigger": "props",
+      "actualDuration": 47,
+      "ownerChain": ["TrailCard", "TrailList", "TrailFilterProvider"],
+      "selfTime": 44.25,
+      "lineage": "async-continuation"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000001",
+    "seq": 3,
+    "source": {
+      "file": "src/components/ConditionsPanel.tsx",
+      "line": 35,
+      "column": 17,
+      "symbol": "ConditionsPanel",
+      "endLine": 56,
+      "resolvedBy": "code-graph",
+      "confidence": 0.85
+    }
+  },
+  {
+    "id": "evt_ct00000000000008",
+    "traceId": "7f2a4c6e8b0d1f3a5c7e9b0d2f4a6c8e",
+    "spanId": "0000000000000a08",
+    "parentSpanId": "0000000000000a01",
+    "kind": "commit",
+    "name": "commit",
+    "startTime": 1789819201175.5,
+    "duration": 3.5,
+    "tier": "browser",
+    "attributes": {
+      "phase": "update",
+      "renderCount": 1,
+      "rootName": "TrailheadGuideLayout"
+    },
+    "status": "ok",
+    "producerId": "prd_browser000000001",
+    "seq": 4
+  },
+  {
+    "id": "evt_ct00000000000009",
+    "traceId": "7f2a4c6e8b0d1f3a5c7e9b0d2f4a6c8e",
+    "spanId": "0000000000000a09",
+    "parentSpanId": "0000000000000aff",
+    "kind": "db.query",
+    "name": "pg.query",
+    "startTime": 1789819201000,
+    "duration": 12.25,
+    "tier": "db",
+    "attributes": {
+      "db.system": "postgresql",
+      "db.statement": "SELECT trail_id, gate_state, checked_at FROM trailhead_gate_status WHERE trail_id = $1",
+      "db.rowCount": 1,
+      "db.operation": "select",
+      "db.name": "trail_atlas",
+      "db.client": "pg"
+    },
+    "status": "ok",
+    "producerId": "prd_server0000000001",
+    "seq": 5
+  }
+]

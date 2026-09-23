@@ -47,27 +47,58 @@
  *   asked about, which is how "performed no I/O outside the project" becomes an
  *   assertion rather than an inference.
  *
- * ## What this suite does not yet cover
+ * ## The fresh-process matrix
  *
- * AAP §0.5.1 additionally requires a **fresh-process** failure-injection matrix
- * — a child killed at each boundary, then the real reconciliation from
- * `../cleanup.ts` asserting byte identity. `../cleanup.ts` does not exist yet,
- * so that half cannot be written against it; the stage observer below drives
- * the same boundaries in-process (it is what `PatchStageObserver` is for), and
- * every case asserts the *state a reconciliation would read*: which record
- * status is on file, and whether the file's digest equals `originalHash`,
- * `instrumentedHash` or neither. When `../cleanup.ts` lands, the matrix is
- * added here and replaces those state assertions with end-to-end restoration.
+ * AAP §0.5.1 asks for more than an in-process boundary: a **child killed at
+ * each boundary**, then the real reconciliation from `../cleanup.ts`, proving
+ * the developer's file comes back byte-for-byte.
+ * `describe('a process killed mid-sequence')` is that matrix, and the kill is
+ * abrupt by construction: the worker sends itself `SIGKILL`, so no `finally`,
+ * no `process.on('exit')`, no buffered write and no ts-morph teardown can run.
+ * A `try`/`catch` in one process would prove something weaker — that a handler
+ * cleaned up — which is the opposite of the guarantee.
+ *
+ * Two pieces make that observable.
+ *
+ * - **A durable journal.** An in-memory journal dies with the worker, and
+ *   "crashed after the journal, before the write" then looks exactly like
+ *   "crashed before the journal" — the very distinction the ordering of step 4
+ *   and step 5 exists to create. So the worker and the parent share
+ *   {@link openFileJournal}: the `ModificationJournal` port over an append-only
+ *   JSONL log whose every line is `fsync`ed before the call returns, which is
+ *   what `apps/local-service/src/store/modifications-repo.ts` achieves over
+ *   `node:sqlite`. Each replayed line is parsed with `parseModificationRecord`,
+ *   so a row that survived a crash is also proven to satisfy the schema.
+ * - **A worker built from these same sources.** It is generated into the case's
+ *   own temporary directory and run through `tsx` (the root's pinned
+ *   devDependency), importing `./patcher.ts` and `./backup-store.ts` by
+ *   `file://` URL — never a `dist/` build, so the matrix cannot pass against
+ *   stale output and does not couple this suite to build order. It is generated
+ *   rather than committed because its whole content is this file's business,
+ *   and a `.mts` extension rather than `.ts` because a `.ts` file under
+ *   `os.tmpdir()` has no `package.json` above it and would be transformed as
+ *   CommonJS, where top-level `await` is an error.
+ *
+ * Each crash case then asserts what the reconciliation table of AAP §0.5.1
+ * promises for that boundary — which record status is on file, whether the
+ * digest equals `originalHash`, `instrumentedHash` or neither, and that the
+ * backup is deleted only *after* the restored bytes were verified against
+ * `originalHash`, observed through a recording backup store rather than
+ * inferred from the end state.
  */
 
 import { Buffer } from 'node:buffer';
+import { spawn } from 'node:child_process';
 import {
   chmodSync,
+  closeSync,
   cpSync,
   existsSync,
+  fsyncSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readFileSync,
   readdirSync,
   realpathSync,
@@ -76,26 +107,34 @@ import {
   statSync,
   symlinkSync,
   writeFileSync,
+  writeSync,
 } from 'node:fs';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
+import { applyPatch } from 'diff';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { DebuggenError, err, isErr, isOk, newSessionId, ok } from '@debuggen/shared';
+import { DebuggenError, err, isErr, isOk, newActionId, newSessionId, ok } from '@debuggen/shared';
 import type { Result } from '@debuggen/shared';
 import { atomicReplaceFileIfUnchanged, sha256Hex } from '@debuggen/shared/node';
 
+import { reconcileModifications } from '../cleanup.js';
+import type { ReconcileOutcome } from '../cleanup.js';
+import { MODIFICATION_ID_PATTERN, parseModificationRecord } from '../schema/modification.js';
 import type {
   ModificationJournal,
   ModificationRecord,
   ModificationStatus,
   ModificationStatusPatch,
 } from '../schema/modification.js';
+import type { InstrumentationAction } from '../schema/plan.js';
 
 import { createBackupStore } from './backup-store.js';
-import type { BackupStore } from './backup-store.js';
+import type { BackupStore, RemoveBackupOptions, StoredBackup } from './backup-store.js';
+import { SPAN_HELPER_GLOBAL, SPAN_HELPER_TYPE_NAME } from './wrap-template.js';
 import { PATCH_STAGES, createPatcher, defaultPatchFileSystem } from './patcher.js';
 import type {
   PatchFileSystem,
@@ -127,6 +166,45 @@ const FIXTURE_PROJECT = join(
   'project-a',
 );
 
+/**
+ * A digest of every byte of the committed fixture tree.
+ *
+ * Computed by walking the tree in a stable order and hashing each file's path
+ * beside its own digest, so a changed byte, an added file and a removed file
+ * are all visible in one value. Captured at module load — before any case has
+ * run — and asserted again by the last case in the file, which is the cheapest
+ * possible guard against a case addressing the committed fixture instead of its
+ * own copy of it.
+ */
+function digestOfFixtureTree(): string {
+  const lines: string[] = [];
+
+  const walk = (directory: string, prefix: string): void => {
+    const entries = readdirSync(directory, { withFileTypes: true }).sort((left, right) =>
+      left.name.localeCompare(right.name),
+    );
+
+    for (const entry of entries) {
+      const absolute = join(directory, entry.name);
+      const relative = prefix === '' ? entry.name : `${prefix}/${entry.name}`;
+
+      if (entry.isDirectory()) {
+        walk(absolute, relative);
+        continue;
+      }
+
+      lines.push(`${relative} ${sha256Hex(readFileSync(absolute))}`);
+    }
+  };
+
+  walk(FIXTURE_PROJECT, '');
+
+  return sha256Hex(lines.join('\n'));
+}
+
+/** The fixture tree as it stood before this file's first case ran. */
+const FIXTURE_TREE_DIGEST = digestOfFixtureTree();
+
 /** The fixture file every case patches, project-relative POSIX. */
 const TARGET_FILE = 'src/server/cone-rules.ts';
 
@@ -138,6 +216,54 @@ const OTHER_SYMBOL = 'findRampCeiling';
 
 /** An ordinary source-file mode, so mode preservation has something to preserve. */
 const PROJECT_FILE_MODE = 0o644;
+
+/**
+ * The fixture file the crash matrix and the chain cases work on, and the two
+ * symbols in it they wrap.
+ *
+ * A second file, rather than {@link TARGET_FILE} again, so the two plan
+ * versions of a chain have two distinct symbols to instrument in one file and
+ * the matrix is not reading state a neighbouring block also touches.
+ */
+const CHAIN_FILE = 'src/server/cycle-planner.ts';
+
+/** The symbol plan version 1 wraps in {@link CHAIN_FILE}. */
+const CHAIN_FIRST_SYMBOL = 'planCycleSegments';
+
+/** The symbol plan version 2 wraps in {@link CHAIN_FILE}. */
+const CHAIN_SECOND_SYMBOL = 'estimateSoakMinutes';
+
+/** A plain-JavaScript fixture target, so the write path is proven for `.js` too. */
+const JS_FILE = 'src/legacy/bisque-schedule.js';
+
+/** A named declaration in {@link JS_FILE}. */
+const JS_SYMBOL = 'planBisqueRamp';
+
+/** A generator declaration: a form the transform must refuse rather than wrap. */
+const GENERATOR_FILE = 'src/server/segment-stream.ts';
+
+/** The generator in {@link GENERATOR_FILE}. */
+const GENERATOR_SYMBOL = 'walkRampSegments';
+
+/**
+ * How long a crash worker may take before the case fails rather than stalls.
+ *
+ * A worker spawn measures around a second on a warm machine (`tsx` start, two
+ * dynamic imports, one ts-morph transform); the bound is generous enough for a
+ * loaded CI runner and finite so a worker that hangs — a `SIGKILL` that never
+ * arrives, an import that never resolves — is a red test and not a red suite.
+ */
+const WORKER_TIMEOUT_MS = 60_000;
+
+/**
+ * The per-test bound for a case that spawns a worker.
+ *
+ * The `instrumentation` Vitest project takes the default 5 s, which a spawn
+ * plus a reconciliation pass can exceed on a busy host; this is stated per case
+ * rather than raised for the whole project, so the fast cases keep the tight
+ * default.
+ */
+const CRASH_CASE_TIMEOUT_MS = 90_000;
 
 /**
  * Content planted outside the project, which nothing in a case may read or
@@ -312,8 +438,12 @@ function createTestJournal(): TestJournal {
     },
     listBySession: (sessionId: string): Promise<Result<ModificationRecord[]>> =>
       Promise.resolve(ok(rows.filter((row) => row.sessionId === sessionId))),
+    // Everything except `reverted`, which is the port's contract rather than a
+    // convenience: a `pending` row left by a crash and a `conflict` row that
+    // was never resolved both have to keep coming back to a reconciliation
+    // pass, whatever state their session ended in.
     listOpen: (): Promise<Result<ModificationRecord[]>> =>
-      Promise.resolve(ok(rows.filter((row) => row.status === 'pending'))),
+      Promise.resolve(ok(rows.filter((row) => row.status !== 'reverted'))),
   };
 }
 
@@ -524,6 +654,661 @@ function temporaryLeftoversIn(directory: string): string[] {
 /** The permission bits of a path. */
 function permissionsOf(path: string): number {
   return statSync(path).mode & 0o777;
+}
+
+/** A file's bytes and digest as they stood before anything ran. */
+interface Pristine {
+  /** The project-relative POSIX path, as a plan would spell it. */
+  readonly file: string;
+
+  /** The absolute path inside the sandbox copy. */
+  readonly path: string;
+
+  /** The exact bytes. */
+  readonly bytes: Buffer;
+
+  /** SHA-256 of {@link Pristine.bytes}. */
+  readonly hash: string;
+}
+
+/**
+ * Snapshots a file in the sandbox before the patcher has run.
+ *
+ * {@link Sandbox} snapshots {@link TARGET_FILE} only; the crash matrix, the
+ * chain and the byte-fidelity cases work on other files, and every one of them
+ * has to hold the developer's exact bytes from before the sequence started —
+ * that snapshot is what "byte-identical" is measured against.
+ */
+function pristineFile(sandbox: Sandbox, file: string): Pristine {
+  const path = join(sandbox.projectRoot, file);
+  const bytes = readFileSync(path);
+
+  return { file, path, bytes, hash: sha256Hex(bytes) };
+}
+
+/** Asserts a file holds exactly the bytes it held before the suite touched it. */
+function expectPristine(pristine: Pristine): void {
+  expect(existsSync(pristine.path)).toBe(true);
+  expectFileBytes(pristine.path, pristine.bytes);
+  expect(digestOnDisk(pristine.path)).toBe(pristine.hash);
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * The durable journal
+ * ---------------------------------------------------------------------------
+ *
+ * The `ModificationJournal` port over an append-only JSONL log, `fsync`ed per
+ * line. Two processes use it — a worker that is about to be killed and the
+ * parent that reconciles afterwards — which is the whole reason it exists: the
+ * in-memory journal above cannot survive the `SIGKILL` that makes the matrix
+ * meaningful, and the boundary "after the journal, before the write" is
+ * unobservable without a row that outlives the process that wrote it.
+ */
+
+/** One durable line of the log. */
+type JournalLogEntry =
+  | { readonly op: 'append'; readonly record: unknown }
+  | {
+      readonly op: 'status';
+      readonly id: string;
+      readonly status: ModificationStatus;
+      readonly patch: ModificationStatusPatch | null;
+    }
+  | { readonly op: 'crash'; readonly at: string }
+  | { readonly op: 'finished'; readonly ok: boolean };
+
+/** The journal, plus the log-level questions a case asks of it. */
+interface FileJournal extends ModificationJournal {
+  /** Where the log lives. */
+  readonly path: string;
+
+  /** Every record the log describes, in append order, at its current status. */
+  rows(): ModificationRecord[];
+
+  /** The boundary the worker died at, when it recorded one. */
+  crashPoint(): string | undefined;
+
+  /** Whether the worker reached the end of the sequence. */
+  finished(): boolean;
+}
+
+/** The log path for a sandbox, inside its private `$DEBUGGEN_HOME`. */
+function journalPathFor(sandbox: Sandbox): string {
+  return join(sandbox.debuggenHome, 'modifications.jsonl');
+}
+
+/**
+ * Appends one line and flushes it to the platform before returning.
+ *
+ * `fsync` rather than a bare write, because the process that wrote the line is
+ * about to be killed: a line still sitting in a buffer would make a crash after
+ * the journal append look exactly like a crash before it.
+ */
+function appendJournalLine(path: string, entry: JournalLogEntry): void {
+  const fd = openSync(path, 'a', 0o600);
+
+  try {
+    writeSync(fd, `${JSON.stringify(entry)}\n`);
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** Every line of the log, or none when nothing has been written yet. */
+function readJournalLog(path: string): JournalLogEntry[] {
+  if (!existsSync(path)) {
+    return [];
+  }
+
+  return readFileSync(path, 'utf8')
+    .split('\n')
+    .filter((line) => line.trim().length > 0)
+    .map((line) => JSON.parse(line) as JournalLogEntry);
+}
+
+/** The fields a status transition may legitimately revise, as an object. */
+function appliedPatch(patch: ModificationStatusPatch | null): Partial<ModificationRecord> {
+  if (patch === null) {
+    return {};
+  }
+
+  return {
+    ...(patch.instrumentedHash !== undefined ? { instrumentedHash: patch.instrumentedHash } : {}),
+    ...(patch.diff !== undefined ? { diff: patch.diff } : {}),
+    ...(patch.appliedAt !== undefined ? { appliedAt: patch.appliedAt } : {}),
+    ...(patch.backupPath !== undefined ? { backupPath: patch.backupPath } : {}),
+  };
+}
+
+/**
+ * Replays the log into the records it describes.
+ *
+ * Every appended line is put through `parseModificationRecord`, so a row that
+ * crossed a process boundary as JSON is also proven to satisfy
+ * `modificationRecordSchema` — which is what the service's store does with a
+ * row it reads back, and the cheapest place to catch a record the sequence
+ * journaled in a shape no consumer would accept.
+ */
+function replayJournalLog(entries: readonly JournalLogEntry[]): ModificationRecord[] {
+  const rows: ModificationRecord[] = [];
+
+  for (const entry of entries) {
+    if (entry.op === 'append') {
+      const parsed = parseModificationRecord(entry.record);
+
+      if (isErr(parsed)) {
+        throw new Error(
+          `The journal log holds an appended line that is not a modification record: ${parsed.error.message} ${JSON.stringify(parsed.error.details)}`,
+        );
+      }
+
+      rows.push(parsed.value);
+      continue;
+    }
+
+    if (entry.op === 'status') {
+      const index = rows.findIndex((row) => row.id === entry.id);
+      const current = rows[index];
+
+      if (current === undefined) {
+        throw new Error(`The journal log moves a record it never appended: ${entry.id}`);
+      }
+
+      rows[index] = { ...current, ...appliedPatch(entry.patch), status: entry.status };
+    }
+  }
+
+  return rows;
+}
+
+/**
+ * Opens the journal over an existing log, replaying whatever is in it.
+ *
+ * Constructed *after* a worker has run, so the parent's view starts from the
+ * rows the killed process left behind. Its own mutations are appended to the
+ * same log and flushed, so a second journal opened over the same path sees
+ * them — which is how the idempotence case proves the first pass persisted.
+ */
+function openFileJournal(path: string): FileJournal {
+  const entries = readJournalLog(path);
+  const rows = replayJournalLog(entries);
+  const clone = (record: ModificationRecord): ModificationRecord => ({ ...record });
+
+  return {
+    path,
+    rows: () => rows.map(clone),
+    crashPoint: () => {
+      const crash = readJournalLog(path).find((entry) => entry.op === 'crash');
+
+      return crash?.op === 'crash' ? crash.at : undefined;
+    },
+    finished: () => readJournalLog(path).some((entry) => entry.op === 'finished'),
+    append: (record: ModificationRecord): Promise<Result<ModificationRecord>> => {
+      appendJournalLine(path, { op: 'append', record });
+      rows.push(clone(record));
+
+      return Promise.resolve(ok(clone(record)));
+    },
+    updateStatus: (
+      id: string,
+      status: ModificationStatus,
+      patch?: ModificationStatusPatch,
+    ): Promise<Result<ModificationRecord>> => {
+      const index = rows.findIndex((row) => row.id === id);
+      const current = rows[index];
+
+      if (current === undefined) {
+        return Promise.resolve(
+          err(
+            new DebuggenError('STORE_ERROR', 'No modification record with that id.', {
+              hint: 'The journal was asked to move a record it never appended.',
+              details: { recordId: id },
+            }),
+          ),
+        );
+      }
+
+      appendJournalLine(path, { op: 'status', id, status, patch: patch ?? null });
+
+      const updated: ModificationRecord = {
+        ...current,
+        ...appliedPatch(patch ?? null),
+        status,
+      };
+
+      rows[index] = updated;
+
+      return Promise.resolve(ok(clone(updated)));
+    },
+    listBySession: (sessionId: string): Promise<Result<ModificationRecord[]>> =>
+      Promise.resolve(ok(rows.filter((row) => row.sessionId === sessionId).map(clone))),
+    // Everything except `reverted`, which is the port's contract and what
+    // `reconcileModifications` relies on: a `conflict` row must keep coming
+    // back, and a `pending` row left by a crash must be found whatever state
+    // its session ended in.
+    listOpen: (): Promise<Result<ModificationRecord[]>> =>
+      Promise.resolve(ok(rows.filter((row) => row.status !== 'reverted').map(clone))),
+  };
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * The fresh-process harness
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * The five boundaries of AAP §0.5.1's failure-injection matrix, each mapped to
+ * the stage whose completion is the kill signal.
+ *
+ * One table rather than a list beside a map, so a boundary cannot be named in
+ * one place and missing from the other.
+ *
+ * `'mid-replace'` maps to no stage on purpose: it lives *inside* step 5,
+ * between the temporary file being written and the new entry being installed,
+ * which no stage boundary can express — the worker reaches it through
+ * `atomicReplaceFileIfUnchanged`'s own `onBeforeInstall` seam instead.
+ */
+const CRASH_STAGE = Object.freeze({
+  'after-backup': 'store-backup',
+  'after-journal': 'journal-pending',
+  'mid-replace': '',
+  'after-rename': 'replace-file',
+  'after-mark': 'mark-applied',
+} as const satisfies Readonly<Record<string, PatchStage | ''>>);
+
+/** One boundary of {@link CRASH_STAGE}. */
+type CrashPoint = keyof typeof CRASH_STAGE;
+
+/**
+ * The worker, generated into the case's temporary directory and run by `tsx`.
+ *
+ * Plain JavaScript in a `.mts` file: `tsx` compiles it as an ES module, so
+ * top-level `await` works, and nothing here needs a type annotation that a
+ * transform would only erase. It imports `./patcher.ts` and
+ * `./backup-store.ts` by absolute `file://` URL — their own bare imports
+ * (`@debuggen/shared`, `ts-morph`, `diff`) resolve from *their* location, so
+ * the worker needs no `node_modules` of its own and never touches `dist/`.
+ *
+ * `process.kill(process.pid, 'SIGKILL')` rather than `process.exit`: `exit`
+ * runs `'exit'` listeners and flushes what it can, and the guarantee under test
+ * is that nothing ran. The journal is written and flushed before the signal, so
+ * the log is exactly as durable as the sequence made it.
+ */
+const CRASH_WORKER_SOURCE = `
+// Generated by packages/instrumentation/src/patch/patcher.test.ts. Not committed.
+import { closeSync, existsSync, fsyncSync, openSync, readFileSync, writeSync } from 'node:fs';
+
+const NEWLINE = String.fromCharCode(10);
+const config = JSON.parse(process.argv[2]);
+
+const { createPatcher, defaultPatchFileSystem } = await import(config.patcherUrl);
+const { createBackupStore } = await import(config.backupStoreUrl);
+
+const appendLine = (entry) => {
+  const fd = openSync(config.journalPath, 'a', 0o600);
+  try {
+    writeSync(fd, JSON.stringify(entry) + NEWLINE);
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+};
+
+const rows = [];
+
+if (existsSync(config.journalPath)) {
+  for (const line of readFileSync(config.journalPath, 'utf8').split(NEWLINE)) {
+    if (line.trim().length === 0) continue;
+    const entry = JSON.parse(line);
+    if (entry.op === 'append') rows.push(entry.record);
+    if (entry.op === 'status') {
+      const index = rows.findIndex((row) => row.id === entry.id);
+      if (index >= 0) {
+        rows[index] = { ...rows[index], ...(entry.patch || {}), status: entry.status };
+      }
+    }
+  }
+}
+
+const die = (at) => {
+  appendLine({ op: 'crash', at });
+  process.kill(process.pid, 'SIGKILL');
+};
+
+const journal = {
+  append: (record) => {
+    appendLine({ op: 'append', record });
+    rows.push(record);
+    return Promise.resolve({ ok: true, value: record });
+  },
+  updateStatus: (id, status, patch) => {
+    const index = rows.findIndex((row) => row.id === id);
+    if (index < 0) {
+      return Promise.resolve({ ok: false, error: new Error('unknown record ' + id) });
+    }
+    appendLine({ op: 'status', id, status, patch: patch || null });
+    const updated = { ...rows[index], ...(patch || {}), status };
+    rows[index] = updated;
+    return Promise.resolve({ ok: true, value: updated });
+  },
+  listBySession: (sessionId) =>
+    Promise.resolve({
+      ok: true,
+      value: rows.filter((row) => row.sessionId === sessionId).map((row) => ({ ...row })),
+    }),
+  listOpen: () =>
+    Promise.resolve({
+      ok: true,
+      value: rows.filter((row) => row.status !== 'reverted').map((row) => ({ ...row })),
+    }),
+};
+
+const files = {
+  ...defaultPatchFileSystem,
+  replaceFileIfUnchanged: (path, content, expected) =>
+    defaultPatchFileSystem.replaceFileIfUnchanged(
+      path,
+      content,
+      expected,
+      config.crashAt === 'mid-replace' ? { onBeforeInstall: () => die('mid-replace') } : undefined,
+    ),
+};
+
+const patcher = createPatcher({
+  projectRoot: config.projectRoot,
+  sessionId: config.sessionId,
+  planVersion: config.planVersion,
+  backups: createBackupStore({ debuggenHome: config.debuggenHome, sessionId: config.sessionId }),
+  journal,
+  files,
+  onStage: (event) => {
+    if (config.crashStage !== '' && event.stage === config.crashStage) {
+      die(config.crashAt);
+    }
+  },
+});
+
+const result = await patcher.patchTarget({ file: config.file, symbol: config.symbol });
+
+appendLine({ op: 'finished', ok: result.ok === true });
+process.exit(result.ok === true ? 0 : 3);
+`;
+
+/** The `tsx` CLI, resolved from this file so the root's pinned copy is used. */
+const TSX_CLI = createRequire(import.meta.url).resolve('tsx/cli');
+
+/** What the parent asks a worker to do. */
+interface CrashRunOptions {
+  /** The file to patch, project-relative POSIX. */
+  readonly file: string;
+
+  /** The symbol to wrap. */
+  readonly symbol: string;
+
+  /** Where the worker dies. */
+  readonly crashAt: CrashPoint;
+
+  /** The plan version to stamp the record with. Defaults to 1. */
+  readonly planVersion?: number | undefined;
+}
+
+/** How a worker ended. */
+interface CrashRun {
+  /** The signal that killed it, when a signal did. */
+  readonly signal: string | null;
+
+  /** Its exit code, when it exited. */
+  readonly code: number | null;
+
+  /** Whatever it wrote to stderr, for a failure message worth reading. */
+  readonly stderr: string;
+}
+
+/**
+ * Runs the real sequence in a fresh process and kills it at `crashAt`.
+ *
+ * Bounded: a worker that has not ended within {@link WORKER_TIMEOUT_MS} is
+ * killed and the call throws, so a hung child fails its own case instead of
+ * stalling the suite. Every child is awaited to `'close'`, so none is left
+ * unreaped when the case returns.
+ *
+ * @returns How the worker ended, after asserting that it ended abruptly.
+ */
+async function killDuringPatch(sandbox: Sandbox, options: CrashRunOptions): Promise<CrashRun> {
+  const workerPath = join(caseRoot, `crash-worker-${options.crashAt}-${options.symbol}.mts`);
+
+  writeFileSync(workerPath, CRASH_WORKER_SOURCE, { mode: 0o600 });
+
+  const here = dirname(fileURLToPath(import.meta.url));
+  const config = {
+    patcherUrl: pathToFileURL(join(here, 'patcher.ts')).href,
+    backupStoreUrl: pathToFileURL(join(here, 'backup-store.ts')).href,
+    projectRoot: sandbox.projectRoot,
+    debuggenHome: sandbox.debuggenHome,
+    sessionId: sandbox.sessionId,
+    journalPath: journalPathFor(sandbox),
+    file: options.file,
+    symbol: options.symbol,
+    planVersion: options.planVersion ?? 1,
+    crashAt: options.crashAt,
+    crashStage: CRASH_STAGE[options.crashAt],
+  };
+
+  const child = spawn(process.execPath, [TSX_CLI, workerPath, JSON.stringify(config)], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  let stderr = '';
+
+  child.stderr?.setEncoding('utf8');
+  child.stderr?.on('data', (chunk: string) => {
+    stderr += chunk;
+  });
+  child.stdout?.resume();
+
+  const ended = await new Promise<CrashRun>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL');
+      reject(
+        new Error(
+          `The crash worker for '${options.crashAt}' did not end within ${WORKER_TIMEOUT_MS} ms. stderr: ${stderr}`,
+        ),
+      );
+    }, WORKER_TIMEOUT_MS);
+
+    child.once('error', (cause: Error) => {
+      clearTimeout(timer);
+      reject(cause);
+    });
+
+    child.once('close', (code: number | null, signal: string | null) => {
+      clearTimeout(timer);
+      resolve({ code, signal, stderr });
+    });
+  });
+
+  // The kill has to have been abrupt for the case to mean anything: a worker
+  // that exited normally ran its own teardown, and then "no handler cleaned up
+  // after us" is untested. 137 is the shell's spelling of the same signal, for
+  // a host that reports the code rather than the signal.
+  if (ended.signal !== 'SIGKILL' && ended.code !== 137) {
+    throw new Error(
+      `The crash worker for '${options.crashAt}' was expected to die by SIGKILL; it ended with code ${String(ended.code)} and signal ${String(ended.signal)}. stderr: ${ended.stderr}`,
+    );
+  }
+
+  return ended;
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * Reconciliation, and watching it dispose of a backup
+ * ---------------------------------------------------------------------------
+ */
+
+/** One observed call into the backup store during a reconciliation pass. */
+interface BackupEvent {
+  /** Which operation. */
+  readonly op: 'read' | 'remove';
+
+  /** The digest the backup is filed under. */
+  readonly originalHash: string;
+
+  /** What the caller said it had restored, for `remove`. */
+  readonly restoredContentHash: string | undefined;
+
+  /** What the target file hashed to at the moment of the call. */
+  readonly targetDigest: string | undefined;
+}
+
+/**
+ * Wraps a backup store so the order of "restore, verify, then delete" is
+ * observable.
+ *
+ * AAP §0.5.1 requires the backup to be deleted only *after* the restored
+ * content has been verified against `originalHash`. An implementation that
+ * deleted first and restored second would leave the same end state, so the end
+ * state cannot prove the ordering: this records what the target file held at
+ * the instant `remove` was called, and `remove`'s own
+ * `restoredContentHash` argument, which is the verification being demanded.
+ */
+function recordingBackupStore(
+  store: BackupStore,
+  targetPath: string,
+  events: BackupEvent[],
+): BackupStore {
+  const digest = (): string | undefined =>
+    existsSync(targetPath) ? digestOnDisk(targetPath) : undefined;
+
+  return {
+    sessionId: store.sessionId,
+    sessionDirectory: store.sessionDirectory,
+    locate: (originalHash: string) => store.locate(originalHash),
+    put: (originalHash: string, content: Uint8Array): Promise<Result<StoredBackup>> =>
+      store.put(originalHash, content),
+    read: (originalHash: string): Promise<Result<Buffer>> => {
+      events.push({
+        op: 'read',
+        originalHash,
+        restoredContentHash: undefined,
+        targetDigest: digest(),
+      });
+
+      return store.read(originalHash);
+    },
+    has: (originalHash: string) => store.has(originalHash),
+    verify: (originalHash: string) => store.verify(originalHash),
+    remove: (originalHash: string, options?: RemoveBackupOptions): Promise<Result<boolean>> => {
+      events.push({
+        op: 'remove',
+        originalHash,
+        restoredContentHash: options?.restoredContentHash,
+        targetDigest: digest(),
+      });
+
+      return store.remove(originalHash, options);
+    },
+    removeSessionDirectory: () => store.removeSessionDirectory(),
+  };
+}
+
+/** What one reconciliation pass did, and what it did to the backup tree. */
+interface ReconcilePass {
+  /** The pass's own result. */
+  readonly outcome: ReconcileOutcome;
+
+  /** Every backup-store call it made, in order. */
+  readonly backupEvents: BackupEvent[];
+
+  /** The journal it ran against, now holding the statuses it wrote. */
+  readonly journal: FileJournal;
+}
+
+/**
+ * Runs the **real** reconciliation of `../cleanup.ts` over a sandbox.
+ *
+ * The journal is opened fresh from the log each time, so the pass reads exactly
+ * the rows a killed worker left durable rather than anything this process still
+ * remembers.
+ */
+async function reconcileSandbox(sandbox: Sandbox, targetPath: string): Promise<ReconcilePass> {
+  const journal = openFileJournal(journalPathFor(sandbox));
+  const backupEvents: BackupEvent[] = [];
+  const backups = recordingBackupStore(
+    createBackupStore({ debuggenHome: sandbox.debuggenHome, sessionId: sandbox.sessionId }),
+    targetPath,
+    backupEvents,
+  );
+
+  const outcome = await reconcileModifications({
+    projectRoot: sandbox.projectRoot,
+    backups,
+    journal,
+  });
+
+  return { outcome, backupEvents, journal };
+}
+
+/** The backup a record names, if it is still on disk. */
+function backupExists(record: ModificationRecord): boolean {
+  return existsSync(record.backupPath);
+}
+
+/**
+ * Asserts the verification-before-deletion ordering for a restored record.
+ *
+ * Two things at once, both from the recorded call rather than the end state:
+ * the deletion named the digest it had restored, and the file on disk already
+ * held those bytes when the deletion was asked for.
+ */
+function expectBackupDeletedAfterVerification(
+  events: readonly BackupEvent[],
+  originalHash: string,
+): void {
+  const removal = events.find((event) => event.op === 'remove');
+
+  expect(removal).toBeDefined();
+  expect(removal?.restoredContentHash).toBe(originalHash);
+  expect(removal?.targetDigest).toBe(originalHash);
+
+  // And when bytes were restored at all, they were read out of the backup
+  // before the deletion was asked for. A record closed because nothing was
+  // written reads nothing — the comparison that closed it *is* the
+  // verification — so the ordering is only asserted where a read happened.
+  const readAt = events.findIndex((event) => event.op === 'read');
+
+  if (readAt >= 0) {
+    expect(readAt).toBeLessThan(events.findIndex((event) => event.op === 'remove'));
+  }
+}
+
+/** The single record a journal holds, or a failed test saying what it holds. */
+function onlyRow(journal: FileJournal): ModificationRecord {
+  const rows = journal.rows();
+
+  if (rows.length !== 1 || rows[0] === undefined) {
+    throw new Error(
+      `Expected exactly one journaled record, found ${rows.length}: ${JSON.stringify(rows.map((row) => ({ id: row.id, file: row.file, status: row.status })))}`,
+    );
+  }
+
+  return rows[0];
+}
+
+/** A patch-mode function-timing action for a file and symbol. */
+function patchAction(file: string, symbol: string): InstrumentationAction {
+  return {
+    id: newActionId(),
+    file,
+    symbol,
+    type: 'function-timing',
+    adapter: 'nextjs',
+    mode: 'patch',
+    rationale: 'The suite needs a patch-mode action for this symbol.',
+  };
 }
 
 /*
@@ -847,6 +1632,9 @@ describe('a symbolic link among the target path components', () => {
     expect(log.snapshots).toEqual([]);
     expect(log.writes).toEqual([]);
     expect(journal.rows).toEqual([]);
+    // And nothing was copied into the session's backup tree either, which is
+    // where the bytes of a file outside the project would have ended up.
+    expect(existsSync(join(sandbox.debuggenHome, 'backups', sandbox.sessionId))).toBe(false);
   });
 
   it('refuses an absolute target without consulting the filesystem', async () => {
@@ -1349,4 +2137,944 @@ describe('the pinned target', () => {
       expectFileBytes(join(moved, basename(TARGET_FILE)), sandbox.originalBytes);
     },
   );
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The record and the backup the sequence leaves behind
+ * ---------------------------------------------------------------------------
+ *
+ * The block above proves the *order* of the sequence. This one proves that what
+ * it wrote down is usable by everything downstream of it: a backup filed where
+ * the record says and private to this account, a record the schema accepts
+ * whichever process reads it back, and a diff that really is the difference
+ * between the two hashes it sits beside.
+ */
+
+describe('the journaled record and its backup', () => {
+  it('files the original under a private backup directory it can hash back', async () => {
+    const sandbox = makeSandbox();
+    const { patcher, backups } = buildPatcher(sandbox);
+
+    const outcome = appliedOutcome(
+      await patcher.patchTarget({ file: TARGET_FILE, symbol: TARGET_SYMBOL }),
+    );
+
+    // The path AAP §0.2.3 specifies, composed rather than reported: filed under
+    // the digest, so two records that saw identical content share one copy and
+    // the write is idempotent.
+    const expectedPath = join(
+      sandbox.debuggenHome,
+      'backups',
+      sandbox.sessionId,
+      sandbox.originalHash,
+    );
+
+    expect(outcome.backup.path).toBe(expectedPath);
+    expect(outcome.backup.originalHash).toBe(sandbox.originalHash);
+    expect(outcome.backup.byteLength).toBe(sandbox.originalBytes.byteLength);
+    expect(existsSync(expectedPath)).toBe(true);
+    expect(sha256Hex(readFileSync(expectedPath))).toBe(sandbox.originalHash);
+    expect(outcome.record.backupPath).toBe(expectedPath);
+
+    // `0600` under `0700`: the developer's source is in there, so it is as
+    // private as the state directory it lives in. Skipped where the host cannot
+    // report an owner, the pattern `packages/shared/src/node/safe-fs.test.ts`
+    // uses for the same reason.
+    if (typeof process.getuid === 'function') {
+      expect(permissionsOf(expectedPath)).toBe(0o600);
+      expect(permissionsOf(dirname(expectedPath))).toBe(0o700);
+      expect(permissionsOf(join(sandbox.debuggenHome, 'backups'))).toBe(0o700);
+    }
+
+    // And nothing else was put in there.
+    expect(readdirSync(dirname(expectedPath))).toEqual([sandbox.originalHash]);
+    const verified = await backups.verify(sandbox.originalHash);
+
+    expect(isOk(verified)).toBe(true);
+  });
+
+  it('journals a record the schema accepts, with a minted id', async () => {
+    const sandbox = makeSandbox();
+    const { patcher, journal } = buildPatcher(sandbox);
+
+    const outcome = appliedOutcome(
+      await patcher.patchTarget({ file: TARGET_FILE, symbol: TARGET_SYMBOL }),
+    );
+
+    // The record travels as JSON — into a SQLite text column, out through
+    // `instrumentation.ready`, back into a cleanup pass — so what matters is
+    // that the shape survives the round trip, not that this process holds a
+    // typed value.
+    const roundTripped = parseModificationRecord(
+      JSON.parse(JSON.stringify(outcome.record)) as unknown,
+    );
+
+    expect(isOk(roundTripped)).toBe(true);
+    expect(MODIFICATION_ID_PATTERN.test(outcome.record.id)).toBe(true);
+    expect(outcome.record).toMatchObject({
+      sessionId: sandbox.sessionId,
+      planVersion: 1,
+      file: TARGET_FILE,
+      originalHash: sandbox.originalHash,
+      instrumentedHash: outcome.instrumentedHash,
+      status: 'applied',
+    });
+    // Refreshed at the `applied` transition, in the same epoch-millisecond
+    // base as a telemetry event's `startTime`, so the two are comparable when
+    // the session's modification list is read beside its capture.
+    expect(outcome.record.appliedAt).toBeGreaterThan(Date.now() - 60_000);
+    expect(outcome.record.appliedAt).toBeLessThanOrEqual(Date.now());
+    // A first record for a file carries no chain link at all, rather than a
+    // null one: an absent key is the representation every layer agrees on.
+    expect('previousRecordId' in outcome.record).toBe(false);
+    expect(journal.rows[0]).toStrictEqual(outcome.record);
+  });
+
+  it('records a diff that turns the original into exactly what was installed', async () => {
+    const sandbox = makeSandbox();
+    const { patcher } = buildPatcher(sandbox);
+
+    const outcome = appliedOutcome(
+      await patcher.patchTarget({ file: TARGET_FILE, symbol: TARGET_SYMBOL }),
+    );
+
+    const originalText = sandbox.originalBytes.toString('utf8');
+    const installedText = readFileSync(sandbox.targetPath, 'utf8');
+
+    expect(outcome.diffTruncated).toBe(false);
+    // Applied, not merely inspected: this is the field both user interfaces
+    // render as "what the tool did to my file", and a diff that does not
+    // reconstruct the installed content is a lie told in a review panel.
+    expect(applyPatch(originalText, outcome.record.diff)).toBe(installedText);
+    // It describes *this* file and not whatever else it might fit: applied to
+    // another of the fixture's sources there is no context to match.
+    expect(
+      applyPatch(readFileSync(join(sandbox.projectRoot, CHAIN_FILE), 'utf8'), outcome.record.diff),
+    ).toBe(false);
+
+    // Produced over the exact bytes that were hashed, with no
+    // whitespace-insensitive option: every context line of the diff is a line
+    // of the original verbatim, indentation included. A normalising diff would
+    // hand the developer hunks that do not match their file.
+    const originalLines = new Set(originalText.split('\n'));
+    const contextLines = outcome.record.diff
+      .split('\n')
+      .filter((line) => line.startsWith(' ') && line.trim().length > 0)
+      .map((line) => line.slice(1));
+
+    expect(contextLines.length).toBeGreaterThan(0);
+    expect(contextLines.filter((line) => !originalLines.has(line))).toEqual([]);
+
+    expect(outcome.record.diff).toContain(TARGET_SYMBOL);
+    expect(outcome.record.diff).toContain(SPAN_HELPER_GLOBAL);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * A process killed mid-sequence
+ * ---------------------------------------------------------------------------
+ *
+ * AAP §0.5.1's failure-injection matrix, in full. Five boundaries, each in its
+ * own process, each killed with `SIGKILL` so nothing in that process could have
+ * tidied up after it, and each followed by the real `reconcileModifications`
+ * from `../cleanup.ts` over the journal the dead process left on disk.
+ *
+ * The assertion that matters is the same one every time and it is about bytes,
+ * not statuses: the developer's file is exactly what it was. The statuses are
+ * asserted too, because they are how a human is told what happened, and because
+ * a pass that restored the right bytes by luck rather than by reading the table
+ * would get them wrong.
+ */
+
+describe('a process killed mid-sequence', () => {
+  it(
+    'leaves an orphaned backup and an untouched file when it dies after the backup',
+    async () => {
+      const sandbox = makeSandbox();
+      const pristine = pristineFile(sandbox, CHAIN_FILE);
+
+      await killDuringPatch(sandbox, {
+        file: CHAIN_FILE,
+        symbol: CHAIN_FIRST_SYMBOL,
+        crashAt: 'after-backup',
+      });
+
+      const before = openFileJournal(journalPathFor(sandbox));
+
+      expect(before.crashPoint()).toBe('after-backup');
+      expect(before.finished()).toBe(false);
+      // No row at all: the backup is durable, but nothing has claimed a write
+      // is in flight, and nothing was written.
+      expect(before.rows()).toEqual([]);
+      expectPristine(pristine);
+
+      const backupPath = join(sandbox.debuggenHome, 'backups', sandbox.sessionId, pristine.hash);
+
+      expect(existsSync(backupPath)).toBe(true);
+
+      const pass = await reconcileSandbox(sandbox, pristine.path);
+
+      // Nothing to reconcile, and nothing done: no record, so no pass may write
+      // to the project on the strength of it.
+      expect(pass.outcome.examined).toBe(0);
+      expect(pass.outcome.status).toBe('clean');
+      expect(pass.outcome.restored).toEqual([]);
+      expect(pass.outcome.conflicts).toEqual([]);
+      expect(pass.outcome.failures).toEqual([]);
+      expect(pass.backupEvents).toEqual([]);
+      expectPristine(pristine);
+
+      // The orphan is deliberately left: reaping a backup with no record is
+      // `apps/local-service/src/store/retention.ts`'s job, after seven days,
+      // because a copy of the developer's source is the last thing to discard
+      // on a guess.
+      expect(existsSync(backupPath)).toBe(true);
+      expect(temporaryLeftoversIn(dirname(pristine.path))).toEqual([]);
+    },
+    CRASH_CASE_TIMEOUT_MS,
+  );
+
+  it(
+    'closes the pending record without writing when it dies after the journal',
+    async () => {
+      const sandbox = makeSandbox();
+      const pristine = pristineFile(sandbox, CHAIN_FILE);
+
+      await killDuringPatch(sandbox, {
+        file: CHAIN_FILE,
+        symbol: CHAIN_FIRST_SYMBOL,
+        crashAt: 'after-journal',
+      });
+
+      const before = openFileJournal(journalPathFor(sandbox));
+      const pending = onlyRow(before);
+
+      // The row that makes every later crash decidable, exactly as AAP §0.5.1
+      // requires it: both hashes, the backup path and the diff, written while
+      // the file still holds the developer's bytes.
+      expect(before.crashPoint()).toBe('after-journal');
+      expect(pending.status).toBe('pending');
+      expect(pending.originalHash).toBe(pristine.hash);
+      expect(pending.instrumentedHash).not.toBe(pristine.hash);
+      expect(pending.file).toBe(CHAIN_FILE);
+      expect(pending.diff.length).toBeGreaterThan(0);
+      expect(backupExists(pending)).toBe(true);
+      expectPristine(pristine);
+
+      const mtimeBefore = statSync(pristine.path).mtimeMs;
+      const pass = await reconcileSandbox(sandbox, pristine.path);
+
+      // "Nothing was written" is the branch, and `closed` rather than
+      // `restored` is how the table says so: a pass that wrote the backup back
+      // over an identical file would be indistinguishable in content and wrong
+      // in what it told the developer.
+      expect(pass.outcome.status).toBe('clean');
+      expect(pass.outcome.closed.map((record) => record.id)).toEqual([pending.id]);
+      expect(pass.outcome.restored).toEqual([]);
+      expect(pass.outcome.conflicts).toEqual([]);
+      expect(onlyRow(pass.journal).status).toBe('reverted');
+      expect(statSync(pristine.path).mtimeMs).toBe(mtimeBefore);
+      expectPristine(pristine);
+
+      // The bytes on disk already hashed to `originalHash`, which *is* the
+      // verification the deletion requires, so the backup may go.
+      expectBackupDeletedAfterVerification(pass.backupEvents, pristine.hash);
+      expect(backupExists(pending)).toBe(false);
+    },
+    CRASH_CASE_TIMEOUT_MS,
+  );
+
+  it(
+    'recreates the target from the backup when it dies inside the replacement',
+    async () => {
+      const sandbox = makeSandbox();
+      const pristine = pristineFile(sandbox, CHAIN_FILE);
+
+      await killDuringPatch(sandbox, {
+        file: CHAIN_FILE,
+        symbol: CHAIN_FIRST_SYMBOL,
+        crashAt: 'mid-replace',
+      });
+
+      const before = openFileJournal(journalPathFor(sandbox));
+      const pending = onlyRow(before);
+
+      expect(before.crashPoint()).toBe('mid-replace');
+      expect(pending.status).toBe('pending');
+      expect(pending.originalHash).toBe(pristine.hash);
+
+      // The state an abrupt kill inside `atomicReplaceFileIfUnchanged` leaves,
+      // documented rather than wished away: the primitive renames the displaced
+      // entry aside *before* installing the new one, so a `SIGKILL` in that
+      // interval leaves the target momentarily absent with two temporary
+      // siblings — the patched content and the retained original — and no
+      // chance to remove either. Nothing is lost, because the original is also
+      // in the backup, which is what the pass restores from.
+      expect(existsSync(pristine.path)).toBe(false);
+      expect(temporaryLeftoversIn(dirname(pristine.path)).length).toBeGreaterThan(0);
+      expect(backupExists(pending)).toBe(true);
+
+      const pass = await reconcileSandbox(sandbox, pristine.path);
+
+      expect(pass.outcome.status).toBe('clean');
+      expect(pass.outcome.restored.map((record) => record.id)).toEqual([pending.id]);
+      expect(pass.outcome.conflicts).toEqual([]);
+      expect(pass.outcome.failures).toEqual([]);
+      expect(onlyRow(pass.journal).status).toBe('reverted');
+
+      // A real file at the target path, holding the developer's exact bytes -
+      // not a temporary sibling standing in for it.
+      expect(lstatSync(pristine.path).isFile()).toBe(true);
+      expectPristine(pristine);
+      expectBackupDeletedAfterVerification(pass.backupEvents, pristine.hash);
+    },
+    CRASH_CASE_TIMEOUT_MS,
+  );
+
+  it(
+    'restores from the backup when it dies after the rename and before the mark',
+    async () => {
+      // The case the whole ordering of steps 4 and 5 exists for. The patch is
+      // on disk and no record says so beyond `pending` — and because the row
+      // already carries `instrumentedHash`, reconciliation can tell that from
+      // "nothing was written" and from "the developer changed it", and restore.
+      const sandbox = makeSandbox();
+      const pristine = pristineFile(sandbox, CHAIN_FILE);
+
+      await killDuringPatch(sandbox, {
+        file: CHAIN_FILE,
+        symbol: CHAIN_FIRST_SYMBOL,
+        crashAt: 'after-rename',
+      });
+
+      const before = openFileJournal(journalPathFor(sandbox));
+      const pending = onlyRow(before);
+
+      expect(before.crashPoint()).toBe('after-rename');
+      // Never marked applied: the sequence marks only after the rename has
+      // returned, and this process did not get that far.
+      expect(pending.status).toBe('pending');
+      expect(digestOnDisk(pristine.path)).toBe(pending.instrumentedHash);
+      expect(readFileSync(pristine.path, 'utf8')).toContain(SPAN_HELPER_GLOBAL);
+
+      const pass = await reconcileSandbox(sandbox, pristine.path);
+
+      expect(pass.outcome.status).toBe('clean');
+      expect(pass.outcome.restored.map((record) => record.id)).toEqual([pending.id]);
+      expect(pass.outcome.closed).toEqual([]);
+      expect(pass.outcome.conflicts).toEqual([]);
+      expect(onlyRow(pass.journal).status).toBe('reverted');
+
+      // Byte identity, by raw comparison as well as by digest, so a mistake in
+      // hashing cannot hide a mistake in content.
+      expectFileBytes(pristine.path, pristine.bytes);
+      expect(Buffer.compare(readFileSync(pristine.path), pristine.bytes)).toBe(0);
+      expect(readFileSync(pristine.path, 'utf8')).not.toContain(SPAN_HELPER_GLOBAL);
+      expect(digestOnDisk(pristine.path)).toBe(pristine.hash);
+
+      expectBackupDeletedAfterVerification(pass.backupEvents, pristine.hash);
+      expect(backupExists(pending)).toBe(false);
+      expect(temporaryLeftoversIn(dirname(pristine.path))).toEqual([]);
+    },
+    CRASH_CASE_TIMEOUT_MS,
+  );
+
+  it(
+    'restores an applied record when it dies after the mark',
+    async () => {
+      const sandbox = makeSandbox();
+      const pristine = pristineFile(sandbox, CHAIN_FILE);
+
+      await killDuringPatch(sandbox, {
+        file: CHAIN_FILE,
+        symbol: CHAIN_FIRST_SYMBOL,
+        crashAt: 'after-mark',
+      });
+
+      const before = openFileJournal(journalPathFor(sandbox));
+      const applied = onlyRow(before);
+
+      // The ordinary end of a session that never got to end: the record says
+      // what the disk says, and the session died anyway. AAP §0.5.1 requires
+      // the next service start to act on it whatever state the session is in.
+      expect(before.crashPoint()).toBe('after-mark');
+      expect(applied.status).toBe('applied');
+      expect(applied.appliedAt).toBeGreaterThan(0);
+      expect(digestOnDisk(pristine.path)).toBe(applied.instrumentedHash);
+
+      const pass = await reconcileSandbox(sandbox, pristine.path);
+
+      expect(pass.outcome.status).toBe('clean');
+      expect(pass.outcome.restored.map((record) => record.id)).toEqual([applied.id]);
+      expect(onlyRow(pass.journal).status).toBe('reverted');
+      expectPristine(pristine);
+      expectBackupDeletedAfterVerification(pass.backupEvents, pristine.hash);
+    },
+    CRASH_CASE_TIMEOUT_MS,
+  );
+
+  it(
+    'reconciles the same crash twice without writing a second time',
+    async () => {
+      // A service can be started twice, and a pass can be interrupted and run
+      // again. The second pass must find nothing to do — and find it in the
+      // journal on disk, not in this process's memory, which is why the pass
+      // helper opens the log afresh each time.
+      const sandbox = makeSandbox();
+      const pristine = pristineFile(sandbox, CHAIN_FILE);
+
+      await killDuringPatch(sandbox, {
+        file: CHAIN_FILE,
+        symbol: CHAIN_FIRST_SYMBOL,
+        crashAt: 'after-mark',
+      });
+
+      const first = await reconcileSandbox(sandbox, pristine.path);
+
+      expect(first.outcome.restored).toHaveLength(1);
+      expectPristine(pristine);
+
+      const mtimeAfterFirst = statSync(pristine.path).mtimeMs;
+      const second = await reconcileSandbox(sandbox, pristine.path);
+
+      expect(second.outcome.examined).toBe(0);
+      expect(second.outcome.status).toBe('clean');
+      expect(second.outcome.restored).toEqual([]);
+      expect(second.outcome.closed).toEqual([]);
+      expect(second.outcome.conflicts).toEqual([]);
+      expect(second.outcome.failures).toEqual([]);
+      // No write at all the second time: the record is `reverted`, which the
+      // table answers with "nothing to do" and which `listOpen` does not even
+      // return.
+      expect(second.backupEvents).toEqual([]);
+      expect(statSync(pristine.path).mtimeMs).toBe(mtimeAfterFirst);
+      expectPristine(pristine);
+      expect(onlyRow(second.journal).status).toBe('reverted');
+    },
+    CRASH_CASE_TIMEOUT_MS,
+  );
+
+  it(
+    'reports a conflict and preserves the developer bytes when the file was edited after the crash',
+    async () => {
+      // The interleaving AAP §0.5.5 promises an answer for: the patch landed,
+      // the process died, and the developer then edited the instrumented file
+      // before anything reconciled it. The bytes on disk are theirs and
+      // nothing may overwrite them — not even a restore that believes it is
+      // helping.
+      const sandbox = makeSandbox();
+      const pristine = pristineFile(sandbox, CHAIN_FILE);
+
+      await killDuringPatch(sandbox, {
+        file: CHAIN_FILE,
+        symbol: CHAIN_FIRST_SYMBOL,
+        crashAt: 'after-rename',
+      });
+
+      const pending = onlyRow(openFileJournal(journalPathFor(sandbox)));
+      const developerBytes = Buffer.from(
+        `${readFileSync(pristine.path, 'utf8')}\n// edited before anything reconciled this\n`,
+        'utf8',
+      );
+
+      writeFileSync(pristine.path, developerBytes);
+
+      const pass = await reconcileSandbox(sandbox, pristine.path);
+
+      expect(pass.outcome.status).toBe('conflict');
+      expect(pass.outcome.restored).toEqual([]);
+      expect(pass.outcome.conflicts).toHaveLength(1);
+
+      const conflict = pass.outcome.conflicts[0];
+
+      expect(conflict).toMatchObject({
+        recordId: pending.id,
+        sessionId: sandbox.sessionId,
+        file: CHAIN_FILE,
+        reason: 'content-changed',
+        expectedHash: pending.instrumentedHash,
+        backupPath: pending.backupPath,
+      });
+      expect(conflict?.actualHash).toBe(sha256Hex(developerBytes));
+      expect(conflict?.message.length).toBeGreaterThan(0);
+
+      // Their bytes, exactly, and the original still recoverable from the
+      // backup the conflict points them at.
+      expectFileBytes(pristine.path, developerBytes);
+      expect(onlyRow(pass.journal).status).toBe('conflict');
+      expect(backupExists(pending)).toBe(true);
+      expect(sha256Hex(readFileSync(pending.backupPath))).toBe(pristine.hash);
+
+      // And a second pass keeps reporting it rather than deciding for them.
+      const again = await reconcileSandbox(sandbox, pristine.path);
+
+      expect(again.outcome.status).toBe('conflict');
+      expect(again.outcome.retained.map((record) => record.id)).toEqual([pending.id]);
+      expectFileBytes(pristine.path, developerBytes);
+      expect(backupExists(pending)).toBe(true);
+    },
+    CRASH_CASE_TIMEOUT_MS,
+  );
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * A chain over one file, unwound in reverse
+ * ---------------------------------------------------------------------------
+ *
+ * A follow-up question produces plan version n + 1 as the previous plan plus
+ * additive actions (AAP §0.4.2), and a delta action can land on a file an
+ * earlier version already patched. The later record's baseline is then the
+ * earlier record's *output*, its backup holds already-instrumented bytes, and
+ * only an unwind in strict reverse order lands on the developer's original —
+ * with each step verified against that record's own `instrumentedHash` before
+ * anything is written.
+ */
+
+describe('a chain of plan versions over one file', () => {
+  it('layers the second record on the first and unwinds to the original bytes', async () => {
+    const sandbox = makeSandbox();
+    const pristine = pristineFile(sandbox, CHAIN_FILE);
+    const journal = openFileJournal(journalPathFor(sandbox));
+    const backups = createBackupStore({
+      debuggenHome: sandbox.debuggenHome,
+      sessionId: sandbox.sessionId,
+    });
+
+    const first = appliedOutcome(
+      await createPatcher({
+        projectRoot: sandbox.projectRoot,
+        sessionId: sandbox.sessionId,
+        planVersion: 1,
+        backups,
+        journal,
+      }).patchTarget({ file: CHAIN_FILE, symbol: CHAIN_FIRST_SYMBOL }),
+    );
+
+    // What plan version 1 left on disk: the bytes plan version 2 is about to
+    // treat as its baseline, and the bytes its backup must hold.
+    const afterFirst = readFileSync(pristine.path);
+
+    expect(sha256Hex(afterFirst)).toBe(first.instrumentedHash);
+
+    const second = appliedOutcome(
+      await createPatcher({
+        projectRoot: sandbox.projectRoot,
+        sessionId: sandbox.sessionId,
+        planVersion: 2,
+        backups,
+        journal,
+      }).patchTarget({ file: CHAIN_FILE, symbol: CHAIN_SECOND_SYMBOL }),
+    );
+
+    // The chain's wiring, read from the journal rather than from the outcome,
+    // because the journal is what a cleanup pass will see.
+    const rows = journal.rows();
+
+    expect(rows).toHaveLength(2);
+    expect(rows[0]?.id).toBe(first.record.id);
+    expect(rows[1]?.previousRecordId).toBe(first.record.id);
+    expect(rows[1]?.originalHash).toBe(first.instrumentedHash);
+    expect(rows[1]?.planVersion).toBe(2);
+
+    // Applying plan 2 left plan 1's record exactly as it was: a delta install
+    // adds, it never edits or drops what an earlier version recorded.
+    expect(rows[0]).toStrictEqual(first.record);
+
+    // And plan 2's backup holds the already-instrumented bytes, which is
+    // correct: those are the bytes it replaced.
+    const chainedBackup = await backups.read(second.originalHash);
+
+    expect(isOk(chainedBackup)).toBe(true);
+    if (isOk(chainedBackup)) {
+      expect(Buffer.compare(chainedBackup.value, afterFirst)).toBe(0);
+    }
+
+    // Two distinct backups: the developer's original and the first patch's
+    // output, each filed under its own digest.
+    expect(readdirSync(join(sandbox.debuggenHome, 'backups', sandbox.sessionId)).sort()).toEqual(
+      [pristine.hash, first.instrumentedHash].sort(),
+    );
+
+    const pass = await reconcileSandbox(sandbox, pristine.path);
+
+    expect(pass.outcome.status).toBe('clean');
+    expect(pass.outcome.restored).toHaveLength(2);
+    expect(pass.outcome.conflicts).toEqual([]);
+    expect(pass.outcome.failures).toEqual([]);
+
+    // Strict reverse order, observed rather than assumed: the pass read plan
+    // 2's backup — the one filed under the first patch's digest — before plan
+    // 1's. The other order would try to write the developer's original over a
+    // file holding two patches, find a hash it did not expect, and report a
+    // conflict where there is none.
+    // Collapsed to the order the two backups were *first* reached, because a
+    // record's backup is legitimately read more than once — once for the
+    // restore-versus-conflict decision and once for the bytes.
+    const reads = pass.backupEvents
+      .filter((event) => event.op === 'read')
+      .map((event) => event.originalHash)
+      .filter((hash, index, all) => all.indexOf(hash) === index);
+
+    expect(reads).toEqual([second.originalHash, first.originalHash]);
+    expect(pass.journal.rows().map((row) => row.status)).toEqual(['reverted', 'reverted']);
+
+    // The developer's file, byte for byte, after two patches and two restores.
+    expectFileBytes(pristine.path, pristine.bytes);
+    expect(Buffer.compare(readFileSync(pristine.path), pristine.bytes)).toBe(0);
+
+    // Both copies of the developer's content are gone, each after its own
+    // restore was verified. The session directory itself is left behind by a
+    // reconciliation pass — removing it belongs to `cleanupSession`, the
+    // `session.end` entry point — so it is the files that are asserted, not the
+    // directory.
+    const sessionBackups = join(sandbox.debuggenHome, 'backups', sandbox.sessionId);
+
+    expect(existsSync(sessionBackups) ? readdirSync(sessionBackups) : []).toEqual([]);
+    expect(pass.journal.rows().filter(backupExists)).toEqual([]);
+    expect(temporaryLeftoversIn(dirname(pristine.path))).toEqual([]);
+  });
+
+  it('refuses a second patch of a file that drifted after the first', async () => {
+    // Pre-existing drift, which is not the same thing as a mid-sequence race:
+    // the first patch is recorded and applied, and *then* the developer edits
+    // the file. A second patch must not layer a record whose `originalHash`
+    // describes bytes nobody can restore to, so it refuses before touching
+    // anything.
+    const sandbox = makeSandbox();
+    const pristine = pristineFile(sandbox, CHAIN_FILE);
+    const journal = openFileJournal(journalPathFor(sandbox));
+    const backups = createBackupStore({
+      debuggenHome: sandbox.debuggenHome,
+      sessionId: sandbox.sessionId,
+    });
+
+    const first = appliedOutcome(
+      await createPatcher({
+        projectRoot: sandbox.projectRoot,
+        sessionId: sandbox.sessionId,
+        planVersion: 1,
+        backups,
+        journal,
+      }).patchTarget({ file: CHAIN_FILE, symbol: CHAIN_FIRST_SYMBOL }),
+    );
+
+    const drifted = Buffer.from(
+      `${readFileSync(pristine.path, 'utf8')}\n// the developer's own edit\n`,
+      'utf8',
+    );
+
+    writeFileSync(pristine.path, drifted);
+
+    const { files, log } = recordingFileSystem();
+    const error = refusalOf(
+      await createPatcher({
+        projectRoot: sandbox.projectRoot,
+        sessionId: sandbox.sessionId,
+        planVersion: 2,
+        backups,
+        journal,
+        files,
+      }).patchTarget({ file: CHAIN_FILE, symbol: CHAIN_SECOND_SYMBOL }),
+    );
+
+    expect(error.code).toBe('MODIFICATION_CONFLICT');
+    // Nothing written, nothing journaled, no new backup: the refusal is the
+    // whole of the second attempt's effect.
+    expect(log.writes).toEqual([]);
+    expect(journal.rows()).toHaveLength(1);
+    expect(journal.rows()[0]?.id).toBe(first.record.id);
+    expect(readdirSync(join(sandbox.debuggenHome, 'backups', sandbox.sessionId))).toEqual([
+      pristine.hash,
+    ]);
+    expectFileBytes(pristine.path, drifted);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Targets and requests the sequence refuses
+ * ---------------------------------------------------------------------------
+ *
+ * Each of these is gated somewhere upstream as well — `../feasibility.ts`
+ * filters a plan's actions, `../installer.ts` orders them — and each is
+ * asserted here anyway, because "the caller checked" is not a property of this
+ * module and the file being written to belongs to somebody else.
+ */
+
+describe('requests the sequence refuses outright', () => {
+  it('refuses a generator without reading, backing up or writing anything', async () => {
+    const sandbox = makeSandbox();
+    const pristine = pristineFile(sandbox, GENERATOR_FILE);
+    const { patcher, journal, log } = buildPatcher(sandbox);
+
+    const error = refusalOf(
+      await patcher.patchTarget({ file: GENERATOR_FILE, symbol: GENERATOR_SYMBOL }),
+    );
+
+    // A wrapper that calls the body as a function cannot preserve `yield`, so
+    // there is no template for this shape and guessing one would change what
+    // the developer's code does.
+    expect(error.code).toBe('PATCH_UNSUPPORTED');
+    expect(error.details?.['reason']).toBe('unsupported-generator');
+    expect(log.writes).toEqual([]);
+    expect(journal.rows).toEqual([]);
+    // The transform ran — it had to, to see the shape — but nothing was
+    // recorded and no copy of the file was taken.
+    expect(existsSync(join(sandbox.debuggenHome, 'backups', sandbox.sessionId))).toBe(false);
+    expectPristine(pristine);
+  });
+
+  it('refuses the same file and symbol twice in one plan version', async () => {
+    // Two records for one symbol in one plan version would each claim to own
+    // the same edit, and the chain over that file would stop being unwindable.
+    const sandbox = makeSandbox();
+    const pristine = pristineFile(sandbox, CHAIN_FILE);
+    const { patcher, journal } = buildPatcher(sandbox);
+    const action = patchAction(CHAIN_FILE, CHAIN_FIRST_SYMBOL);
+
+    const batch = await patcher.patchActions([action, { ...action, id: newActionId() }]);
+
+    expect(batch.applied).toHaveLength(1);
+    expect(batch.failure?.error.code).toBe('INSTRUMENTATION_INSTALL_FAILED');
+    expect(batch.failure?.error.details?.['reason']).toBe('duplicate-action');
+    expect(batch.failure?.stage).toBe('resolve-target');
+    // Refused before anything was read for the second action, so the first
+    // action's record is the only one and the file holds exactly its patch.
+    expect(batch.journaled).toHaveLength(1);
+    expect(journal.rows).toHaveLength(1);
+    expect(digestOnDisk(pristine.path)).toBe(batch.applied[0]?.instrumentedHash);
+    expect(temporaryLeftoversIn(dirname(pristine.path))).toEqual([]);
+  });
+
+  it('refuses a runtime-mode action, which asks for a hook rather than an edit', async () => {
+    const sandbox = makeSandbox();
+    const pristine = pristineFile(sandbox, CHAIN_FILE);
+    const { patcher, journal, log } = buildPatcher(sandbox);
+
+    const error = refusalOf(
+      await patcher.patchAction({
+        ...patchAction(CHAIN_FILE, CHAIN_FIRST_SYMBOL),
+        type: 'react-render-tracking',
+        adapter: 'react',
+        mode: 'runtime',
+      }),
+    );
+
+    expect(error.code).toBe('PATCH_UNSUPPORTED');
+    expect(log.writes).toEqual([]);
+    expect(journal.rows).toEqual([]);
+    expectPristine(pristine);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * A cancelled install
+ * ---------------------------------------------------------------------------
+ */
+
+describe('an install cancelled between stages', () => {
+  it('stops at a stage boundary and leaves a state reconciliation restores', async () => {
+    // `../installer.ts` aborts a failing install between actions. The signal is
+    // honoured at stage boundaries only — never inside the rename, which is the
+    // one interruption that could leave a half-known state — so the sequence
+    // stops with the journal in a state the table already has an answer for.
+    const sandbox = makeSandbox();
+    const pristine = pristineFile(sandbox, CHAIN_FILE);
+    const journal = openFileJournal(journalPathFor(sandbox));
+    const controller = new AbortController();
+    const stages: PatchStage[] = [];
+
+    const error = refusalOf(
+      await createPatcher({
+        projectRoot: sandbox.projectRoot,
+        sessionId: sandbox.sessionId,
+        planVersion: 1,
+        backups: createBackupStore({
+          debuggenHome: sandbox.debuggenHome,
+          sessionId: sandbox.sessionId,
+        }),
+        journal,
+        signal: controller.signal,
+        onStage: (event: PatchStageEvent) => {
+          stages.push(event.stage);
+
+          // Cancelled once the backup is durable. The signal is read at the
+          // *next* stage boundary, which is the check that sits between the
+          // journal append and the write — so this is the hardest boundary for
+          // a cancellation to arrive at: a record exists by the time it is
+          // seen, and it must not be left claiming a write is in flight.
+          if (event.stage === 'store-backup') {
+            controller.abort();
+          }
+        },
+      }).patchTarget({ file: CHAIN_FILE, symbol: CHAIN_FIRST_SYMBOL }),
+    );
+
+    expect(error.code).toBe('INSTRUMENTATION_INSTALL_FAILED');
+    expect(error.details?.['reason']).toBe('aborted');
+    // Stopped at the boundary between the journal append and the write, which
+    // is where the signal is read — never inside the rename, the one
+    // interruption that could leave a half-known state.
+    expect(error.details?.['stage']).toBe('journal-pending');
+    expect(stages).toEqual([
+      'resolve-target',
+      'read-original',
+      'baseline-check',
+      'build-patch',
+      'store-backup',
+    ]);
+
+    const row = onlyRow(journal);
+
+    // `failed` rather than a `pending` row claiming a write is in flight — and
+    // the table treats the two identically, so a cancelled install and a dead
+    // process reconcile the same way.
+    expect(row.status).toBe('failed');
+    expectPristine(pristine);
+
+    const pass = await reconcileSandbox(sandbox, pristine.path);
+
+    expect(pass.outcome.status).toBe('clean');
+    expect(pass.outcome.closed.map((record) => record.id)).toEqual([row.id]);
+    expect(pass.outcome.restored).toEqual([]);
+    expect(onlyRow(pass.journal).status).toBe('reverted');
+    expectPristine(pristine);
+    expect(backupExists(row)).toBe(false);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Byte fidelity across file kinds
+ * ---------------------------------------------------------------------------
+ *
+ * Hashes are SHA-256 over raw bytes with no newline or encoding normalisation,
+ * because the restore-versus-conflict decision is a comparison of those
+ * digests. `packages/shared/src/node/hash.test.ts` pins that CRLF and LF
+ * content hash differently; these cases are where that matters end to end — a
+ * sequence that normalised line endings anywhere would hand back a file that is
+ * *equivalent* to the developer's and not identical to it, and their next
+ * `git diff` would show every line of it.
+ */
+
+describe('byte fidelity across file kinds', () => {
+  it('patches a plain JavaScript target without emitting TypeScript syntax', async () => {
+    const sandbox = makeSandbox();
+    const pristine = pristineFile(sandbox, JS_FILE);
+    const { patcher, journal } = buildPatcher(sandbox);
+
+    const outcome = appliedOutcome(await patcher.patchTarget({ file: JS_FILE, symbol: JS_SYMBOL }));
+
+    const installed = readFileSync(pristine.path, 'utf8');
+
+    expect(outcome.record.file).toBe(JS_FILE);
+    expect(digestOnDisk(pristine.path)).toBe(outcome.instrumentedHash);
+    expect(installed).toContain(SPAN_HELPER_GLOBAL);
+    // The one-line type alias the template inserts into `.ts` and `.tsx` files
+    // has no business in a `.js` file: it would not parse, and the dev server
+    // would fail to compile the developer's project.
+    expect(installed).not.toContain(SPAN_HELPER_TYPE_NAME);
+    expect(installed).not.toContain(' as {');
+    expect(journal.rows[0]?.status).toBe('applied');
+    expect(permissionsOf(pristine.path)).toBe(PROJECT_FILE_MODE);
+    expect(temporaryLeftoversIn(dirname(pristine.path))).toEqual([]);
+  });
+
+  it(
+    'restores a plain JavaScript target byte for byte after a crash',
+    async () => {
+      const sandbox = makeSandbox();
+      const pristine = pristineFile(sandbox, JS_FILE);
+
+      await killDuringPatch(sandbox, {
+        file: JS_FILE,
+        symbol: JS_SYMBOL,
+        crashAt: 'after-rename',
+      });
+
+      const pending = onlyRow(openFileJournal(journalPathFor(sandbox)));
+
+      expect(pending.file).toBe(JS_FILE);
+      expect(digestOnDisk(pristine.path)).toBe(pending.instrumentedHash);
+
+      const pass = await reconcileSandbox(sandbox, pristine.path);
+
+      expect(pass.outcome.status).toBe('clean');
+      expect(pass.outcome.restored.map((record) => record.id)).toEqual([pending.id]);
+      expectFileBytes(pristine.path, pristine.bytes);
+      expect(Buffer.compare(readFileSync(pristine.path), pristine.bytes)).toBe(0);
+      expectBackupDeletedAfterVerification(pass.backupEvents, pristine.hash);
+    },
+    CRASH_CASE_TIMEOUT_MS,
+  );
+
+  it(
+    'restores CRLF content byte for byte, including the line endings',
+    async () => {
+      const sandbox = makeSandbox();
+      const targetPath = join(sandbox.projectRoot, CHAIN_FILE);
+      const lfBytes = readFileSync(targetPath);
+
+      // A file as a Windows-configured editor left it. Written before anything
+      // is snapshotted, so these bytes are what "the developer's file" means
+      // for this case.
+      writeFileSync(targetPath, lfBytes.toString('utf8').replace(/\n/g, '\r\n'));
+      chmodSync(targetPath, PROJECT_FILE_MODE);
+
+      const pristine = pristineFile(sandbox, CHAIN_FILE);
+
+      expect(pristine.bytes.includes('\r\n')).toBe(true);
+      // The distinction the whole guarantee rests on: the same text with
+      // different line endings is different content.
+      expect(pristine.hash).not.toBe(sha256Hex(lfBytes));
+
+      await killDuringPatch(sandbox, {
+        file: CHAIN_FILE,
+        symbol: CHAIN_FIRST_SYMBOL,
+        crashAt: 'after-mark',
+      });
+
+      const applied = onlyRow(openFileJournal(journalPathFor(sandbox)));
+
+      expect(applied.status).toBe('applied');
+      expect(applied.originalHash).toBe(pristine.hash);
+      expect(sha256Hex(readFileSync(applied.backupPath))).toBe(pristine.hash);
+
+      const pass = await reconcileSandbox(sandbox, pristine.path);
+
+      expect(pass.outcome.status).toBe('clean');
+      expect(pass.outcome.restored.map((record) => record.id)).toEqual([applied.id]);
+
+      const restored = readFileSync(pristine.path);
+
+      expect(Buffer.compare(restored, pristine.bytes)).toBe(0);
+      expect(restored.includes('\r\n')).toBe(true);
+      expect(sha256Hex(restored)).toBe(pristine.hash);
+      expect(sha256Hex(restored)).not.toBe(sha256Hex(lfBytes));
+      expect(permissionsOf(pristine.path)).toBe(PROJECT_FILE_MODE);
+    },
+    CRASH_CASE_TIMEOUT_MS,
+  );
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The committed fixture
+ * ---------------------------------------------------------------------------
+ */
+
+describe('the committed fixture project', () => {
+  it('is byte-identical after the whole suite has run against copies of it', () => {
+    // The real patcher, the real backup store and the real cleanup have run
+    // dozens of times by now, each on a copy. If any of them ever addressed the
+    // committed tree instead, `git status --porcelain packages/instrumentation`
+    // would stop being empty and this repository would carry instrumentation in
+    // its own fixtures. The digest is taken at module load — before any case
+    // runs — and compared here, which is the last case in the file.
+    expect(digestOfFixtureTree()).toBe(FIXTURE_TREE_DIGEST);
+  });
 });

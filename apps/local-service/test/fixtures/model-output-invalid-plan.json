@@ -1,0 +1,35 @@
+{
+  "objective": "Determine why opening a trail report takes more than one second",
+  "capture": [
+    "click event timing",
+    "React renders",
+    "fetch calls",
+    "server request spans",
+    "database query spans"
+  ],
+  "instrumentationTargets": [
+    {
+      "file": "src/components/TrailCard.tsx",
+      "symbol": "handleShowReport",
+      "type": "function-timing"
+    },
+    {
+      "file": "app/api/trail-report/route.ts",
+      "type": "server-span"
+    },
+    {
+      "file": "src/server/services/trail-report.service.ts",
+      "symbol": "loadTrailReport",
+      "type": "sql-trace"
+    },
+    {
+      "file": "../outside-the-project/elsewhere.ts",
+      "symbol": "loadTrailReport",
+      "type": "function-timing"
+    }
+  ],
+  "hypotheses": [
+    "The trail-report route waits on the upstream conditions feed before it reads anything, so most of the second is spent server-side rather than in the card that was clicked.",
+    "The query behind the report loader returns every report on file for the trail instead of the few the card shows, and the wait grows with the trail's history."
+  ]
+}

@@ -27,13 +27,59 @@
  * `@debuggen/shared`, the telemetry kind and tier vocabularies and the fixed
  * metric ids from `@debuggen/telemetry` — keep one import path each, so a
  * consumer that needs one reaches the package that defines it rather than
- * receiving a second route to the same binding through here.
+ * receiving a second route to the same binding through here. Nor is any
+ * third-party binding forwarded: a consumer that wants Zod imports Zod.
+ *
+ * ## The three steps this package exists to make safe
+ *
+ * Panel generation is three fixed steps, and every one of them is a function
+ * behind this entry (AAP 0.5.3):
+ *
+ * 1. **Validate the authoring input.** `parsePanelSpecInput` parses whatever a
+ *    model produced against the *authoring* schema — the forgiving shape in
+ *    which a node's data request may be written flat on the node, ids and
+ *    versions are absent because they are not the author's to mint, and the
+ *    summary is prose. `panelSpecInputJsonSchema` renders that same schema for
+ *    the prompt, so the shape asked for and the shape enforced are one artefact.
+ * 2. **Normalise deterministically.** `normalizePanel` turns a parsed input into
+ *    the internal {@link PanelSpec}: flat query fields move into each node's
+ *    `query`, nodes acquire ids from their position, the document acquires its
+ *    version and identifiers from the caller's context, and the summary acquires
+ *    its observed facts and likely causes **from the validated analysis** and
+ *    from nowhere else. No model, no clock, no randomness: equal arguments give
+ *    an equal document.
+ * 3. **Validate the result.** `validatePanelSpec` parses it against the internal
+ *    schema and `validateAgainstCapture` checks it against the capture it claims
+ *    to describe — that every cited event id and trace filter exists, and that
+ *    each node draws only from a source its catalog entry allows.
+ *
+ * Which failure belongs to whom follows from that order. A step-1 failure is the
+ * model's, and the caller re-prompts with the issues a bounded number of times.
+ * A failure in step 2 or step 3 is **ours**: the normaliser is deterministic and
+ * the internal schema is the normaliser's own target, so a rejection there
+ * reports a product bug, is logged with the input, and is never retried against
+ * the model. In either case the caller stops asking and assembles a fallback
+ * panel deterministically from the capture aggregates, marked `meta.fallback`
+ * — see {@link PanelMeta} — which the renderer draws under a visible banner
+ * rather than presenting as an answer. Nothing here presents a failure as an
+ * analysis.
+ *
+ * ## The catalog is the registry both sides key on
+ *
+ * {@link PANEL_NODE_CATALOG} is the single registry of node types, one entry per
+ * type, each declaring the data sources that type may query, the telemetry
+ * fields it reads and the prose that describes it to a model. It is a runtime
+ * value and not merely a type, because two independent consumers key on it: the
+ * validator here rejects a node type the catalog does not contain, and the
+ * renderer's component registry is built from it and fails its own test on an
+ * entry with no component behind it (AAP 0.6.2). `describeCatalogForPrompt`
+ * turns the same registry into the catalogue a panel-generation prompt embeds,
+ * so a node type cannot be offered to a model without being renderable.
  *
  * ## What lives behind this entry
  *
- * The four modules, re-exported in dependency order, which is also this
- * package's internal layering — `summary` is the root of the module graph,
- * `nodes/query` builds on it, and the two node modules build on that:
+ * Eleven modules, re-exported in dependency order, which is also this package's
+ * internal layering:
  *
  * - `summary` — the evidence boundary, expressed as types rather than as a
  *   convention. `EventRef`; `Fact`, whose `evidence` array is bounded below by
@@ -72,15 +118,55 @@
  *   assembled from. No node below carries a height, a column count, a threshold
  *   or a colour: what a node may vary is which evidence it draws, and every
  *   visual value belongs to the renderer's design tokens (AAP 0.6.2).
+ * - `spec` — the internal document. `panelNodeSchema` closes the recursion by
+ *   feeding the layout factories the node union they parameterise; `PanelSpec`
+ *   and `panelSpecSchema` wrap a summary and a layout in the version, the
+ *   identifiers and the supersession link a stored panel needs; `walkPanelNodes`
+ *   is the one traversal both validators and any consumer walk a layout with, so
+ *   node order and node paths mean the same thing everywhere; `parsePanelSpec`
+ *   is the non-throwing parse of a stored document.
+ * - `input` — the authoring schema in full: the flat data-query form, a node
+ *   input per visualization type, the three layout inputs, the authored summary
+ *   in its prose and statement forms, and `panelSpecInputSchema` with its
+ *   non-throwing `parsePanelSpecInput`. This is the only schema a model's output
+ *   is ever measured against.
+ * - `catalog` — the node registry described above, its entry type, the lookup
+ *   and the two guards over it, and the prompt renderer.
+ * - `normalize` — `normalizePanel` and the two argument shapes it reads: the
+ *   validated analysis the summary's facts and hypotheses are copied from, and
+ *   the context that supplies the identifiers, the panel version and the
+ *   fallback marker.
+ * - `validate` — the internal syntactic and structural gate: `validatePanelSpec`
+ *   for the `Result` form, `assertValidPanelSpec` for the throwing form,
+ *   `collectPanelSpecIssues` for every issue at once, and the issue vocabulary
+ *   and depth bound they share.
+ * - `semantic` — the gate against the capture: `collectSemanticIssues`,
+ *   `validateAgainstCapture` with its three-way outcome, and `toResult` for a
+ *   caller that wants the same answer as a `Result`. Its options carry the id
+ *   resolvers, so a spec can be checked against a capture whose event ids are
+ *   known only to the store.
+ * - `json-schema` — `panelSpecInputJsonSchema` and its text form, the schema id
+ *   and the dialect, for the prompt that asks a model for an authored panel.
  *
- * The re-exports are flat wildcards because the four modules share no export
- * name — each declares its own vocabulary, and the primitives two of them need
- * identically are declared once in `nodes/query` and imported, not restated. A
- * name that did collide would be resolved here, by narrowing the colliding
- * modules to explicit named re-export lists as `@debuggen/telemetry`'s barrel
- * does, rather than by renaming a symbol in the module that owns it: as the
- * modules themselves record, these names are a contract four processes share,
- * not an internal detail that may be renamed for convenience.
+ * ## Why the re-exports below are enumerated
+ *
+ * Every re-export names its symbols instead of forwarding a module wholesale.
+ * That is a deliberate departure from the two sibling schema barrels, and it
+ * buys two things this entry needs: the whole public surface of the package is
+ * auditable in one read, and what crosses the boundary stays a decision rather
+ * than a consequence. Each name below is listed because it belongs to the
+ * package's contract — including the helpers the modules share with one another,
+ * which consumers need for the same reason the modules do. A symbol added to a
+ * module later reaches nobody until it is added to a list here, in review, so a
+ * declaration exported for a test or for one sibling cannot arrive in four
+ * processes as a side effect of an edit elsewhere. AAP 0.8.3 gives this package
+ * no entry-boundary test, so this list *is* that audit and is worth its length.
+ *
+ * Each module is re-exported by exactly two statements — its runtime values,
+ * then its types — because `verbatimModuleSyntax` requires a type-only
+ * re-export to say `export type`, and because the split makes the value/type
+ * character of every name legible. No module is forwarded both wholesale and by
+ * name; the lists are the only route out.
  *
  * Every relative specifier below carries an explicit `.js` extension, which the
  * package's `NodeNext` module resolution requires of a `"type": "module"`
@@ -103,20 +189,23 @@
  * omits `"DOM"` from `lib`, so a `window` or `document` reference does not
  * compile. A review of `dist/index.js` should find no `node:` specifier at all.
  *
- * Importing this module has no side effect. Every export is a declaration; the
- * vocabularies are frozen tuples and the schemas are pure values, both built
- * once at load time; and no module in the graph reads an environment variable,
- * mutates a global, starts a timer, writes to the console or performs I/O while
- * being loaded. The manifest declares `"sideEffects": false` on that basis, so a
- * bundler may drop whatever a consumer does not use.
+ * Importing this module has no side effect, and it declares nothing of its own:
+ * every line below is a re-export. The vocabularies behind them are frozen
+ * tuples and the schemas are pure values, both built once at load time; no
+ * module in the graph reads an environment variable, mutates a global, starts a
+ * timer, writes to the console or performs I/O while being loaded; and there is
+ * no default export, so a consumer names what it takes. The manifest declares
+ * `"sideEffects": false` on that basis, so a bundler may drop whatever a
+ * consumer does not use.
  *
  * @example
  * ```ts
  * import {
- *   VISUALIZATION_NODE_SCHEMAS,
- *   layoutNodeSchemasFor,
- *   parseFact,
- *   type PanelSummary,
+ *   normalizePanel,
+ *   parsePanelSpecInput,
+ *   validateAgainstCapture,
+ *   validatePanelSpec,
+ *   type PanelSpec,
  * } from '@debuggen/panel-schema';
  * ```
  *
@@ -126,11 +215,295 @@
 // ---------------------------------------------------------------------------
 // summary — the fact/hypothesis boundary every generated panel is judged by
 // ---------------------------------------------------------------------------
-export * from './summary.js';
+export {
+  CONFIDENCE_LEVELS,
+  MAX_EVENT_REF_ID_LENGTH,
+  MAX_EVENT_REF_LABEL_LENGTH,
+  MAX_EVIDENCE_REFS,
+  MAX_HEADLINE_LENGTH,
+  MAX_STATEMENT_LENGTH,
+  MAX_SUMMARY_FACTS,
+  MAX_SUMMARY_HYPOTHESES,
+  compareConfidence,
+  confidenceLevelSchema,
+  describeIssues,
+  eventRefSchema,
+  factSchema,
+  hypothesisSchema,
+  isConfidenceLevel,
+  panelSummarySchema,
+  parseFact,
+  parseHypothesis,
+} from './summary.js';
+export type {
+  ConfidenceLevel,
+  EventRef,
+  Fact,
+  Hypothesis,
+  PanelSummary,
+  SchemaIssueSummary,
+} from './summary.js';
 
 // ---------------------------------------------------------------------------
-// nodes — the data-query contract, then the containers, then the leaves
+// nodes/query — the data request every query-backed node is resolved through
 // ---------------------------------------------------------------------------
-export * from './nodes/query.js';
-export * from './nodes/layout.js';
-export * from './nodes/viz.js';
+export {
+  DATA_QUERY_DEFAULT_LIMIT,
+  DATA_QUERY_DEFAULT_OFFSET,
+  DATA_QUERY_FLAT_FIELD_KEYS,
+  DATA_QUERY_MAX_COMPONENT_LENGTH,
+  DATA_QUERY_MAX_LIMIT,
+  DATA_QUERY_MAX_TRACE_ID_LENGTH,
+  DATA_QUERY_SORTS,
+  DATA_QUERY_SOURCES,
+  PANEL_NODE_DESCRIPTION_MAX_LENGTH,
+  PANEL_NODE_ID_MAX_LENGTH,
+  PANEL_NODE_ID_PATTERN,
+  PANEL_NODE_TITLE_MAX_LENGTH,
+  dataQueryFilterSchema,
+  dataQuerySchema,
+  dataQuerySortSchema,
+  dataQuerySourceSchema,
+  isDataQuerySort,
+  isDataQuerySource,
+  panelNodeDescriptionSchema,
+  panelNodeIdSchema,
+  panelNodeTitleSchema,
+  parseDataQuery,
+} from './nodes/query.js';
+export type {
+  DataQuery,
+  DataQueryFilter,
+  DataQueryFlatFieldKey,
+  DataQuerySort,
+  DataQuerySource,
+  PanelNodeId,
+} from './nodes/query.js';
+
+// ---------------------------------------------------------------------------
+// nodes/layout — the three containers, as schema factories over a child schema
+// ---------------------------------------------------------------------------
+export {
+  DEFAULT_SPLIT_DIRECTION,
+  LAYOUT_NODE_MAX_CHILDREN,
+  LAYOUT_NODE_MIN_CHILDREN,
+  LAYOUT_NODE_TYPES,
+  SPLIT_DIRECTIONS,
+  isLayoutNodeType,
+  layoutNodeSchemasFor,
+  layoutNodeTypeSchema,
+  sectionNodeSchema,
+  splitDirectionSchema,
+  splitNodeSchema,
+  stackNodeSchema,
+} from './nodes/layout.js';
+export type {
+  LayoutNodeBase,
+  LayoutNodeOf,
+  LayoutNodeType,
+  SectionNodeOf,
+  SplitDirection,
+  SplitNodeOf,
+  StackNodeOf,
+} from './nodes/layout.js';
+
+// ---------------------------------------------------------------------------
+// nodes/viz — the thirteen leaves: twelve query-backed views and the source link
+// ---------------------------------------------------------------------------
+export {
+  QUERY_BACKED_NODE_TYPES,
+  VISUALIZATION_NODE_SCHEMAS,
+  VISUALIZATION_NODE_TYPES,
+  componentTreeNodeSchema,
+  dependencyGraphNodeSchema,
+  eventLogNodeSchema,
+  flameNodeSchema,
+  isVisualizationNodeType,
+  metricCardsNodeSchema,
+  queryTableNodeSchema,
+  renderTableNodeSchema,
+  requestTableNodeSchema,
+  sourceLinkNodeSchema,
+  stateTransitionsNodeSchema,
+  tableNodeSchema,
+  timelineNodeSchema,
+  visualizationNodeTypeSchema,
+  waterfallNodeSchema,
+} from './nodes/viz.js';
+export type {
+  ComponentTreeNode,
+  DependencyGraphNode,
+  EventLogNode,
+  FlameNode,
+  MetricCardsNode,
+  QueryBackedNode,
+  QueryBackedNodeType,
+  QueryTableNode,
+  RenderTableNode,
+  RequestTableNode,
+  SourceLinkNode,
+  StateTransitionsNode,
+  TableNode,
+  TimelineNode,
+  VisualizationNode,
+  VisualizationNodeType,
+  WaterfallNode,
+} from './nodes/viz.js';
+
+// ---------------------------------------------------------------------------
+// spec — the internal document: the closed node union, the PanelSpec, the walk
+// ---------------------------------------------------------------------------
+export {
+  PANEL_CHILDREN_FIELD,
+  PANEL_ID_MAX_LENGTH,
+  PANEL_LAYOUT_FIELD,
+  PANEL_LAYOUT_MAX_NODES,
+  PANEL_LAYOUT_NODE_TYPES,
+  PANEL_LAYOUT_PATH_ROOT,
+  PANEL_NODE_TYPES,
+  PANEL_SPEC_VERSION,
+  PANEL_TITLE_MAX_LENGTH,
+  PANEL_VIZ_NODE_TYPES,
+  isPanelNodeType,
+  panelMetaSchema,
+  panelNodeSchema,
+  panelSpecSchema,
+  parsePanelSpec,
+  walkPanelNodes,
+} from './spec.js';
+export type {
+  PanelLayoutNode,
+  PanelMeta,
+  PanelNode,
+  PanelNodePath,
+  PanelNodeType,
+  PanelNodeVisitor,
+  PanelSectionNode,
+  PanelSpec,
+  PanelSplitNode,
+  PanelStackNode,
+} from './spec.js';
+
+// ---------------------------------------------------------------------------
+// input — the authoring schema, and the only shape a model's output is measured
+// against
+// ---------------------------------------------------------------------------
+export {
+  authoredSummaryProseSchema,
+  authoredSummaryStatementSchema,
+  dataQueryInputSchema,
+  panelNodeInputSchema,
+  panelSpecInputSchema,
+  parsePanelSpecInput,
+} from './input.js';
+export type {
+  AuthoredSummaryProse,
+  AuthoredSummaryStatement,
+  ComponentTreeNodeInput,
+  DataQueryInput,
+  DependencyGraphNodeInput,
+  EventLogNodeInput,
+  FlameNodeInput,
+  LayoutNodeInput,
+  MetricCardsNodeInput,
+  PanelNodeInput,
+  PanelNodeInputBase,
+  PanelSpecInput,
+  PanelSummaryInput,
+  QueryBackedNodeInput,
+  QueryTableNodeInput,
+  RenderTableNodeInput,
+  RequestTableNodeInput,
+  SectionNodeInput,
+  SourceLinkNodeInput,
+  SplitNodeInput,
+  StackNodeInput,
+  StateTransitionsNodeInput,
+  TableNodeInput,
+  TimelineNodeInput,
+  VisualizationNodeInput,
+  WaterfallNodeInput,
+} from './input.js';
+
+// ---------------------------------------------------------------------------
+// catalog — the single node registry: the validator reads it, the renderer's
+// component registry is keyed by it, and the prompt is rendered from it
+// ---------------------------------------------------------------------------
+export {
+  DEFAULT_CATALOG_PROMPT_BULLET,
+  PANEL_NODE_CATALOG,
+  PANEL_NODE_CATALOG_ENTRIES,
+  PANEL_NODE_CATALOG_KINDS,
+  catalogEntryFor,
+  describeCatalogForPrompt,
+  isKnownPanelNodeType,
+  isSourceAllowedForNode,
+} from './catalog.js';
+export type {
+  DescribeCatalogOptions,
+  PanelNodeCatalogEntry,
+  PanelNodeCatalogKind,
+} from './catalog.js';
+
+// ---------------------------------------------------------------------------
+// normalize — step 2: authored form in, internal document out, deterministically
+// ---------------------------------------------------------------------------
+export { normalizePanel } from './normalize.js';
+export type { NormalizeAnalysis, NormalizeContext } from './normalize.js';
+
+// ---------------------------------------------------------------------------
+// validate — step 3a: the internal syntactic and structural gate
+// ---------------------------------------------------------------------------
+export {
+  PANEL_MAX_NODE_DEPTH,
+  PANEL_VALIDATION_ISSUE_CODES,
+  assertValidPanelSpec,
+  collectPanelSpecIssues,
+  isPanelValidationIssueCode,
+  validatePanelSpec,
+} from './validate.js';
+export type { PanelValidationIssue, PanelValidationIssueCode } from './validate.js';
+
+// ---------------------------------------------------------------------------
+// semantic — step 3b: the gate against the capture the panel claims to describe
+// ---------------------------------------------------------------------------
+export {
+  SEMANTIC_ISSUE_CODES,
+  SEMANTIC_ISSUE_CODE_BY_REASON,
+  SEMANTIC_ISSUE_REASONS,
+  SEMANTIC_ISSUE_SEVERITIES,
+  SEMANTIC_ISSUE_SEVERITY_BY_REASON,
+  SEMANTIC_VALIDATION_STATUSES,
+  collectSemanticIssues,
+  isSemanticIssueReason,
+  toResult,
+  validateAgainstCapture,
+} from './semantic.js';
+export type {
+  EventIdResolver,
+  IdResolution,
+  SemanticIssue,
+  SemanticIssueReason,
+  SemanticIssueSets,
+  SemanticIssueSeverity,
+  SemanticResultOptions,
+  SemanticValidationInvalid,
+  SemanticValidationOptions,
+  SemanticValidationOutcome,
+  SemanticValidationStatus,
+  SemanticValidationUnverifiable,
+  SemanticValidationValid,
+  TraceIdResolver,
+} from './semantic.js';
+
+// ---------------------------------------------------------------------------
+// json-schema — the authoring schema as JSON Schema, for the generation prompt
+// ---------------------------------------------------------------------------
+export {
+  PANEL_SPEC_INPUT_JSON_SCHEMA_ID,
+  PANEL_SPEC_INPUT_SCHEMA_TARGET,
+  PANEL_SPEC_INPUT_SCHEMA_TARGETS,
+  panelSpecInputJsonSchema,
+  panelSpecInputJsonSchemaText,
+} from './json-schema.js';
+export type { PanelSpecInputJsonSchemaOptions, PanelSpecInputSchemaTarget } from './json-schema.js';
