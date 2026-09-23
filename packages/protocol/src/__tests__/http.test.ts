@@ -36,7 +36,15 @@
  *   in order, with one member each, and then parse a real aggregate for every
  *   source — produced by `@debuggen/telemetry`'s own builders rather than
  *   hand-written — because the payload guards are shallow and a guard that
- *   refused a real value would be worse than no guard at all.
+ *   refused a real value would be worse than no guard at all. Which sources page
+ *   is checked from both sides: the echo is required on all seven array-valued
+ *   ones and refused on the three that answer with a single value, and the two
+ *   lists are proved to cover the vocabulary so a new source cannot slip in
+ *   unclassified.
+ * - **The shared error body.** A non-2xx reply carries `./messages/error.ts`'s
+ *   payload unchanged — a code from the closed vocabulary, a message, an
+ *   optional `ref`, and no `hint` — so one renderer serves a failed request and
+ *   an `error` frame alike.
  * - **Ingress versus persisted events.** The ingest body must refuse an event
  *   carrying `sessionId`, `captureId` or `ingestSeq`: attribution is the
  *   service's to assign, and a producer that could claim a session could write
@@ -53,7 +61,13 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { DATA_QUERY_MAX_LIMIT, DATA_QUERY_SOURCES, dataQuerySchema } from '@debuggen/panel-schema';
+import {
+  DATA_QUERY_DEFAULT_LIMIT,
+  DATA_QUERY_DEFAULT_OFFSET,
+  DATA_QUERY_MAX_LIMIT,
+  DATA_QUERY_SOURCES,
+  dataQuerySchema,
+} from '@debuggen/panel-schema';
 import type { DataQuerySource } from '@debuggen/panel-schema';
 import { DEBUGGEN_ERROR_CODES, DebuggenError } from '@debuggen/shared';
 import {
@@ -97,7 +111,9 @@ import {
   isAuthExemptOperation,
   modificationsPath,
   pairCompletePath,
+  pairCompleteResponseSchema,
   pairStartPath,
+  pairStartResponseSchema,
   panelByIdPath,
   panelByIdResponseSchema,
   panelDataPath,
@@ -117,7 +133,15 @@ import {
   telemetryIngestPath,
   telemetryIngestRequestSchema,
 } from '../http.js';
-import type { DataResultFor, HttpOperation, HttpRequestBody, HttpResponseBody } from '../http.js';
+import type {
+  DataResult,
+  DataResultFor,
+  HttpOperation,
+  HttpRequestBody,
+  HttpResponseBody,
+} from '../http.js';
+import { CLEANUP_STATUSES } from '../session-record.js';
+import { PROTOCOL_VERSION } from '../version.js';
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -506,6 +530,44 @@ const VALID_DATA_RESULTS: { readonly [S in DataQuerySource]: DataResultFor<S> } 
 };
 
 /**
+ * The sources whose result is a page of items and therefore carries the echo.
+ *
+ * Written out literally, like the route table: which sources page is a contract
+ * the service's resolver and every client's paging loop both depend on, so it is
+ * stated here rather than read back off the union under test. The case
+ * `classifies every source as paged or single-valued` proves the two lists
+ * together cover the vocabulary, so a source added without being classified
+ * fails rather than going untested.
+ */
+const PAGED_SOURCES = [
+  'spans',
+  'events',
+  'renders',
+  'requests',
+  'queries',
+  'stateTransitions',
+  'metrics',
+] as const satisfies readonly DataQuerySource[];
+
+/** The sources whose result is one value: a tree, a snapshot, a graph. */
+const SINGLE_VALUE_SOURCES = [
+  'trace',
+  'componentTree',
+  'graph',
+] as const satisfies readonly DataQuerySource[];
+
+/**
+ * The two sources whose payload may be `null`.
+ *
+ * `null` is the empty answer rather than an error for both: no trace matched the
+ * filter, and no render evidence was captured to build a tree from.
+ */
+const NULLABLE_SOURCES: readonly DataQuerySource[] = ['trace', 'componentTree'];
+
+/** The four fields of the paging echo, by name. */
+const PAGING_ECHO_KEYS: readonly string[] = ['total', 'limit', 'offset', 'nextOffset'];
+
+/**
  * Serialises a value the way a transport does and parses it back.
  *
  * @param value The body to round-trip.
@@ -514,6 +576,25 @@ const VALID_DATA_RESULTS: { readonly [S in DataQuerySource]: DataResultFor<S> } 
  */
 function throughJson(value: unknown): unknown {
   return JSON.parse(JSON.stringify(value));
+}
+
+/**
+ * Copies a result without its paging echo, leaving the payload untouched.
+ *
+ * Built by filtering rather than by hand so the stripped value is the very
+ * payload the union accepted a moment earlier — which is what makes the
+ * rejection attributable to the missing echo and to nothing else.
+ *
+ * @param result A valid result for a paged source.
+ * @returns The same object with `total`, `limit`, `offset` and `nextOffset`
+ * removed.
+ */
+function withoutPagingEcho(result: DataResult): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(result as unknown as Record<string, unknown>).filter(
+      ([key]) => !PAGING_ECHO_KEYS.includes(key),
+    ),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -753,6 +834,50 @@ describe('the session bodies', () => {
     ).toBe(false);
   });
 
+  it('requires both a project root and a question on session.create', () => {
+    // Neither field has a defensible default. Without the root there is no tree
+    // to index, instrument or contain a later source-open request within, and
+    // without the question the first pipeline stage has no input at all — so the
+    // body is refused here rather than accepted into a session that cannot run.
+    expect(sessionCreateRequestSchema.safeParse({ question: 'Why is this slow?' }).success).toBe(
+      false,
+    );
+    expect(sessionCreateRequestSchema.safeParse({ projectRoot: PROJECT_ROOT }).success).toBe(false);
+    expect(sessionCreateRequestSchema.safeParse({}).success).toBe(false);
+    expect(
+      sessionCreateRequestSchema.safeParse({ projectRoot: '', question: 'Why is this slow?' })
+        .success,
+    ).toBe(false);
+    expect(
+      sessionCreateRequestSchema.safeParse({ projectRoot: PROJECT_ROOT, question: '' }).success,
+    ).toBe(false);
+  });
+
+  it('accepts an optional selected target and refuses a malformed one', () => {
+    // Optional, not nullable: a session created with no target is answered from
+    // the bound tab's current URL instead, and an absent key is how the body
+    // says so. A present one is the imported target descriptor in full, so a
+    // half-built selector cannot enter the pipeline as a real selection.
+    const body = {
+      projectRoot: PROJECT_ROOT,
+      question: 'Why is this slow?',
+      target: {
+        selector: 'main > button.primary',
+        tagName: 'button',
+        text: 'Primary action',
+        componentChain: ['PrimaryAction', 'ActionPanel'],
+        url: `${DEV_SERVER_URL}/step`,
+      },
+    } satisfies HttpRequestBody<'session.create'>;
+
+    expect(parseHttpRequest('session.create', body).ok).toBe(true);
+    expect(sessionCreateRequestSchema.safeParse({ ...body, target: undefined }).success).toBe(true);
+    expect(sessionCreateRequestSchema.safeParse({ ...body, target: null }).success).toBe(false);
+    expect(
+      sessionCreateRequestSchema.safeParse({ ...body, target: { selector: 'button' } }).success,
+    ).toBe(false);
+  });
+
   it('refuses a session.question body with no question', () => {
     expect(sessionQuestionRequestSchema.safeParse({}).success).toBe(false);
     expect(sessionQuestionRequestSchema.safeParse({ question: '' }).success).toBe(false);
@@ -773,6 +898,22 @@ describe('the session bodies', () => {
 
     expect(parseHttpResponse('session.end', { cleanup: 'clean-ish' }).ok).toBe(false);
     expect(parseHttpResponse('session.end', {}).ok).toBe(false);
+  });
+
+  it('draws those four statuses from the session record’s own vocabulary', () => {
+    // The literal list above is written out so a widened vocabulary is a
+    // deliberate edit; this is the other half of that — it proves the four
+    // literals are exactly `./session-record.ts`'s `CLEANUP_STATUSES`, so the
+    // list cannot quietly fall behind the enum the reply is validated against.
+    expect(['pending', 'clean', 'partial', 'conflict']).toEqual([...CLEANUP_STATUSES]);
+
+    for (const status of CLEANUP_STATUSES) {
+      expect(parseHttpResponse('session.end', { cleanup: status }).ok).toBe(true);
+    }
+
+    // A status the record does not know is refused, whatever it reads like.
+    expect(parseHttpResponse('session.end', { cleanup: 'reverted' }).ok).toBe(false);
+    expect(parseHttpResponse('session.end', { cleanup: null }).ok).toBe(false);
   });
 
   it('answers the session list as an object, never as a bare array', () => {
@@ -945,6 +1086,93 @@ describe('the dev-server, health and pairing bodies', () => {
     expect(parseHttpRequest('pair.complete', { code: '' }).ok).toBe(false);
     expect(parseHttpRequest('pair.complete', {}).ok).toBe(false);
   });
+
+  it('answers the health check with the protocol version this build speaks', () => {
+    // Not a literal: the field exists so a client can compare the service's wire
+    // version against its own before it opens a socket, and a fixture that
+    // pinned a different string would pass while the comparison it stands for
+    // could never succeed.
+    expect(VALID_RESPONSES.health.protocolVersion).toBe(PROTOCOL_VERSION);
+    expect(
+      healthResponseSchema.safeParse({
+        ...VALID_RESPONSES.health,
+        protocolVersion: PROTOCOL_VERSION,
+      }).success,
+    ).toBe(true);
+    expect(healthResponseSchema.safeParse({ ...VALID_RESPONSES.health, version: '' }).success).toBe(
+      false,
+    );
+    expect(
+      healthResponseSchema.safeParse({ ...VALID_RESPONSES.health, pairingAvailable: 'yes' })
+        .success,
+    ).toBe(false);
+  });
+
+  it('carries a code and an expiry out of pair.start, and a credential out of pair.complete', () => {
+    // The response side of the pairing flow, and the one reply that hands over a
+    // capability. Both fields of the first are load-bearing — a code with no
+    // expiry is a code the editor keeps offering after the service stopped
+    // accepting it — and the second carries nothing but the credential.
+    expect(
+      pairStartResponseSchema.safeParse({ code: 'PAIR2X7Q', expiresAt: START_TIME + 300_000 })
+        .success,
+    ).toBe(true);
+    expect(pairStartResponseSchema.safeParse({ code: 'PAIR2X7Q' }).success).toBe(false);
+    expect(pairStartResponseSchema.safeParse({ expiresAt: START_TIME + 300_000 }).success).toBe(
+      false,
+    );
+    expect(pairStartResponseSchema.safeParse({ code: '', expiresAt: START_TIME }).success).toBe(
+      false,
+    );
+
+    expect(
+      pairCompleteResponseSchema.safeParse({ token: 'devtools-credential-placeholder' }).success,
+    ).toBe(true);
+    expect(pairCompleteResponseSchema.safeParse({}).success).toBe(false);
+    expect(pairCompleteResponseSchema.safeParse({ token: '' }).success).toBe(false);
+    // Nothing rides along with the credential: a role or a scope echoed here
+    // would be a client's word for what it was granted.
+    expect(
+      pairCompleteResponseSchema.safeParse({
+        token: 'devtools-credential-placeholder',
+        role: 'devtools',
+      }).success,
+    ).toBe(false);
+  });
+});
+
+describe('the error body of a non-2xx reply', () => {
+  it('accepts every code in the shared vocabulary and nothing outside it', () => {
+    for (const code of DEBUGGEN_ERROR_CODES) {
+      expect(
+        httpErrorResponseSchema.safeParse({ code, message: 'Something went wrong.' }).success,
+      ).toBe(true);
+    }
+
+    expect(
+      httpErrorResponseSchema.safeParse({ code: 'SOMETHING_ELSE', message: 'x' }).success,
+    ).toBe(false);
+    expect(httpErrorResponseSchema.safeParse({ message: 'x' }).success).toBe(false);
+    expect(httpErrorResponseSchema.safeParse({ code: 'INTERNAL' }).success).toBe(false);
+    expect(httpErrorResponseSchema.safeParse({ code: 'INTERNAL', message: '' }).success).toBe(
+      false,
+    );
+  });
+
+  it('carries an optional correlation ref and no hint', () => {
+    expect(
+      httpErrorResponseSchema.safeParse({ code: 'INTERNAL', message: 'x', ref: MODIFICATION_ID })
+        .success,
+    ).toBe(true);
+
+    // AAP §0.4.2 fixes the generic error payload at `{ code, message, ref? }`
+    // for both transports. A recovery hint travels on the messages that specify
+    // one of their own, so a hint here would be a second error shape that only
+    // this transport spoke.
+    expect(
+      httpErrorResponseSchema.safeParse({ code: 'INTERNAL', message: 'x', hint: 'Retry.' }).success,
+    ).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1030,6 +1258,134 @@ describe('dataResultSchema — one member per query source', () => {
       }).ok,
     ).toBe(true);
   });
+
+  it('classifies every source as paged or single-valued, with nothing unclassified', () => {
+    // The two lists below are what the next three cases are driven from, so a
+    // source added to the vocabulary without being placed in one of them fails
+    // here rather than going untested.
+    expect(new Set([...PAGED_SOURCES, ...SINGLE_VALUE_SOURCES])).toEqual(
+      new Set(DATA_QUERY_SOURCES),
+    );
+    expect(PAGED_SOURCES.length + SINGLE_VALUE_SOURCES.length).toBe(DATA_QUERY_SOURCES.length);
+
+    // And the classification matches what the union actually declares.
+    for (const source of DATA_QUERY_SOURCES) {
+      expect(Object.hasOwn(VALID_DATA_RESULTS[source], 'total')).toBe(
+        (PAGED_SOURCES as readonly DataQuerySource[]).includes(source),
+      );
+    }
+  });
+
+  it('requires the paging echo on every array-valued source', () => {
+    for (const source of PAGED_SOURCES) {
+      const result = VALID_DATA_RESULTS[source];
+
+      expect(parseDataResult(result).ok).toBe(true);
+      // Strip the echo and the same payload is refused: a caller cannot page
+      // without knowing the total, the applied window and whether more follows.
+      expect(parseDataResult(withoutPagingEcho(result)).ok).toBe(false);
+    }
+  });
+
+  it('refuses the paging echo on the three sources that answer with one value', () => {
+    for (const source of SINGLE_VALUE_SOURCES) {
+      const result = VALID_DATA_RESULTS[source];
+
+      expect(parseDataResult(result).ok).toBe(true);
+      // A tree and a graph are each one value, so a `total` here would be a
+      // number nothing computed and a paging loop nothing could terminate.
+      expect(
+        parseDataResult({
+          ...result,
+          total: 1,
+          limit: DATA_QUERY_DEFAULT_LIMIT,
+          offset: DATA_QUERY_DEFAULT_OFFSET,
+          nextOffset: null,
+        }).ok,
+      ).toBe(false);
+    }
+  });
+
+  it('refuses an absent, null, mistyped or primitive payload for every source', () => {
+    for (const source of DATA_QUERY_SOURCES) {
+      const echo = (PAGED_SOURCES as readonly DataQuerySource[]).includes(source)
+        ? {
+            total: 0,
+            limit: DATA_QUERY_DEFAULT_LIMIT,
+            offset: DATA_QUERY_DEFAULT_OFFSET,
+            nextOffset: null,
+          }
+        : {};
+
+      // The payload field is named after the source and is never optional: an
+      // absent or `undefined` payload would reach a component as a missing value
+      // and throw on its first property access, far from the cause.
+      expect(parseDataResult({ source, ...echo }).ok).toBe(false);
+      expect(parseDataResult({ source, [source]: undefined, ...echo }).ok).toBe(false);
+
+      for (const payload of [42, 'text', true]) {
+        expect(parseDataResult({ source, [source]: payload, ...echo }).ok).toBe(false);
+      }
+
+      if ((SINGLE_VALUE_SOURCES as readonly DataQuerySource[]).includes(source)) {
+        // A record slot: an array is not a record, however empty it looks.
+        expect(parseDataResult({ source, [source]: [], ...echo }).ok).toBe(false);
+        expect(parseDataResult({ source, [source]: {}, ...echo }).ok).toBe(false);
+      } else {
+        // A page slot: an empty page is an ordinary answer, a record is not.
+        expect(parseDataResult({ source, [source]: [], ...echo }).ok).toBe(true);
+        expect(parseDataResult({ source, [source]: {}, ...echo }).ok).toBe(false);
+      }
+
+      // `null` is the documented empty answer for exactly two sources.
+      expect(parseDataResult({ source, [source]: null, ...echo }).ok).toBe(
+        NULLABLE_SOURCES.includes(source),
+      );
+    }
+  });
+
+  it('accepts a metric that was not measured, carrying no value at all', () => {
+    // AAP §0.6.6: a metric the capture could not observe reports
+    // `available: false` and omits `value`, and the card renders "n/a". A schema
+    // that demanded a number would force a producer to invent a zero, which a
+    // panel would then present as a measurement.
+    expect(
+      parseDataResult({
+        source: 'metrics',
+        metrics: [
+          { id: 'transferred_bytes', label: 'Transferred', unit: 'bytes', available: false },
+          { id: 'total_duration', label: 'Total', unit: 'ms', available: true, value: 1_175 },
+        ],
+        total: 2,
+        limit: DATA_QUERY_DEFAULT_LIMIT,
+        offset: DATA_QUERY_DEFAULT_OFFSET,
+        nextOffset: null,
+      }).ok,
+    ).toBe(true);
+
+    // The two fields the guard does insist on, because every card addresses a
+    // value by id and decides what to draw from the flag.
+    expect(
+      parseDataResult({
+        source: 'metrics',
+        metrics: [{ label: 'Total', unit: 'ms', available: true, value: 1 }],
+        total: 1,
+        limit: DATA_QUERY_DEFAULT_LIMIT,
+        offset: DATA_QUERY_DEFAULT_OFFSET,
+        nextOffset: null,
+      }).ok,
+    ).toBe(false);
+    expect(
+      parseDataResult({
+        source: 'metrics',
+        metrics: [{ id: 'total_duration', label: 'Total', unit: 'ms' }],
+        total: 1,
+        limit: DATA_QUERY_DEFAULT_LIMIT,
+        offset: DATA_QUERY_DEFAULT_OFFSET,
+        nextOffset: null,
+      }).ok,
+    ).toBe(false);
+  });
 });
 
 describe('dataPageSchema — the paging echo', () => {
@@ -1043,6 +1399,23 @@ describe('dataPageSchema — the paging echo', () => {
 
   it('accepts a zero limit, which is what an explicit request for no items echoes', () => {
     expect(dataPageSchema.safeParse({ ...page, limit: 0 }).success).toBe(true);
+  });
+
+  it('accepts the window a request that named neither field is answered with', () => {
+    // The echo reports what the service actually applied, including the two
+    // defaults it filled in for an omitted `limit` and `offset` — so a reply
+    // carrying exactly those must be valid, or every unparameterized query
+    // would be refused by the client that made it.
+    expect(
+      dataPageSchema.safeParse({
+        total: 3,
+        limit: DATA_QUERY_DEFAULT_LIMIT,
+        offset: DATA_QUERY_DEFAULT_OFFSET,
+        nextOffset: null,
+      }).success,
+    ).toBe(true);
+    expect(page.limit).toBe(DATA_QUERY_DEFAULT_LIMIT);
+    expect(page.offset).toBe(DATA_QUERY_DEFAULT_OFFSET);
   });
 
   it('refuses a limit above the query ceiling', () => {
@@ -1121,6 +1494,21 @@ describe('buildPath — substitution, encoding and a loud failure', () => {
     expect(() => buildPath('session.get', { id: '' })).toThrow(DebuggenError);
     // A route with no parameters needs none.
     expect(() => buildPath('health')).not.toThrow();
+  });
+
+  it('fails loudly on an operation the table does not hold', () => {
+    // The first guard is the compiler: `HttpOperation` is derived from the table,
+    // so a call naming an operation that does not exist cannot be written without
+    // the cast below. The assertion is that the run-time behaviour behind that
+    // cast is a throw rather than a path built from nothing — a silent
+    // `'undefined'` segment would be a request sent to a route that never
+    // existed, answered with a 404 nobody could trace back to a typo.
+    const unknownOperation = 'session.rename' as HttpOperation;
+
+    expect(() => buildPath(unknownOperation, { id: SESSION_ID })).toThrow();
+    expect(() => buildPath(unknownOperation)).toThrow();
+    expect(HTTP_OPERATIONS).not.toContain(unknownOperation);
+    expect(Object.hasOwn(HTTP_ROUTES, unknownOperation)).toBe(false);
   });
 
   it('agrees with every named builder', () => {
@@ -1204,6 +1592,43 @@ describe('a rejected body never becomes a leak', () => {
     expect(rejected.ok).toBe(false);
     if (!rejected.ok) {
       expect(exposedText(rejected.error)).not.toContain(SENTINEL);
+      expect(DEBUGGEN_ERROR_CODES).toContain(rejected.error.code);
+    }
+  });
+
+  it('reports an invalid panel-data query without echoing its filter', () => {
+    // A panel-data body carries a component name and a trace id the developer's
+    // own runtime produced. The rejection names the field that was wrong —
+    // `filter.tier` — and the values that field allows, never the ones the
+    // caller sent.
+    const rejected = parseHttpRequest('panel.data', {
+      source: 'spans',
+      filter: { component: SENTINEL, traceId: SENTINEL },
+      tier: SENTINEL,
+    });
+
+    expect(rejected.ok).toBe(false);
+    if (!rejected.ok) {
+      expect(exposedText(rejected.error)).not.toContain(SENTINEL);
+      expect(rejected.error.code).toBe('PROTOCOL_INVALID_MESSAGE');
+      expect(DEBUGGEN_ERROR_CODES).toContain(rejected.error.code);
+    }
+  });
+
+  it('reports an invalid ingest batch without echoing the events', () => {
+    // The route the Node preload posts to, and the body that holds the most:
+    // span names, redacted URLs, parameterized statements and a project path.
+    // The issue path locates the offending event by index and field, which is
+    // what a producer needs, and carries none of its content.
+    const rejected = parseHttpRequest('telemetry.event', {
+      projectRoot: PROJECT_ROOT,
+      events: [{ ...INGRESS_EVENT, name: SENTINEL, traceId: 'not-a-trace-id' }],
+    });
+
+    expect(rejected.ok).toBe(false);
+    if (!rejected.ok) {
+      expect(exposedText(rejected.error)).not.toContain(SENTINEL);
+      expect(rejected.error.message).toContain('events[0].traceId');
       expect(DEBUGGEN_ERROR_CODES).toContain(rejected.error.code);
     }
   });
