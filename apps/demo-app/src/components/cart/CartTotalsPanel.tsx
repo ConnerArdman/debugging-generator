@@ -16,14 +16,25 @@
  * `@/hooks/useCartSummary` publishes either the cart's totals or the reason it has none, and this
  * block renders whichever of the two it is handed. Where the contents are not established - the
  * first read still in flight, or a read that came back a failure - the rows are not rendered at
- * all: a zero in the units row, a subtotal of nothing and the empty-cart reading of the
- * free-freight offer would each be a claim about a cart the storefront never saw, and the charge
- * rows and closing figure would be a total assembled on a subtotal nobody read. What is printed
- * instead is the state, in words, with placeholder bars holding the rows' space while a read is
- * still in flight; the block keeps its heading, its surface and the dispatch line either way, so
- * the column it sits in neither collapses nor jumps when the figures arrive. The notice a buyer
- * can act on, and the retry with it, belong to `./CartLineList`, which shows them for the same
- * cart wherever these figures are withheld.
+ * all: a zero in the units row, a subtotal of nothing and an offer read against a threshold would
+ * each be a claim about a cart the storefront never saw, and the charge rows and closing figure
+ * would be a total assembled on a subtotal nobody read. What is printed instead is the state, in
+ * words, with placeholder bars holding the rows' space while a read is still in flight; the block
+ * keeps its heading, its surface and the dispatch line either way, so the column it sits in
+ * neither collapses nor jumps when the figures arrive. The notice a buyer can act on, and the
+ * retry with it, belong to `./CartLineList`, which shows them for the same cart wherever these
+ * figures are withheld.
+ *
+ * AND IT PRINTS NONE FOR A CART THAT HOLDS NOTHING
+ * The same holds one step further on, where the contents *were* established and there are none:
+ * "Items 0", a subtotal of nothing and the free-freight offer measured against an empty cart are
+ * three figures about an order nobody is placing. So a cart-quoting surface prints the state in
+ * words there too, and keeps only the store's dispatch promise beside it. This is the answer the
+ * cart drawer already gives by dropping its footer - totals and both destinations together - for
+ * the same state, and one cart must not be answered two ways by the two surfaces quoting it; on
+ * the cart's own page the row of actions withholds checkout for exactly the same reading. A
+ * surface quoting an order's charges is the exception: it has rows of its own and its own reading
+ * of an empty cart, so the figures there stay as that caller assembled them.
  *
  * A failure that arrives *after* a cart has been read is the other case, and it keeps its figures:
  * the provider leaves the contents it last published in place when it refuses a change, so the
@@ -202,6 +213,17 @@ const CART_PENDING_NOTE = 'Your cart is being read. Its totals appear here once 
  */
 const CART_UNAVAILABLE_NOTE =
   'Your cart could not be read, so there are no totals to show. They appear here once it has been read.';
+
+/**
+ * What it says for a cart that was read and holds nothing.
+ *
+ * A cart with no lines has no units to count, nothing to subtotal and no standing against the
+ * free-freight threshold, so those rows are not printed for it either: "Items 0", "$0.00" and the
+ * offer read against an empty cart are three figures about an order nobody is placing, and the
+ * slide-over quoting this same cart prints none of them - it drops its whole footer. So this
+ * surface says what the state is, in one sentence, and points at the thing that would change it.
+ */
+const CART_EMPTY_NOTE = 'Your cart is empty. Its totals appear here once you add a product.';
 
 /** How many placeholder bars stand in for the rows while the cart is being read. */
 const PENDING_ROW_COUNT = 3;
@@ -415,9 +437,9 @@ export function CartTotalsPanel({
    * `@/hooks/useCartSummary` publishes either the cart's totals or the reason it has none, and
    * this is the second of those: the first read is still in flight, or it came back a failure, so
    * what the cart holds was never established. Every row below this point would be an invention -
-   * "0 items", a subtotal of nothing, and the empty-cart reading of the free-freight offer, which
-   * would tell a buyer their cart is empty when the truth is that the storefront cannot see it.
-   * The charge rows and the closing figure are equally impossible, because a total assembled on a
+   * "0 items", a subtotal of nothing, and an offer read against a threshold, which together would
+   * tell a buyer their cart is empty when the truth is that the storefront cannot see it. The
+   * charge rows and the closing figure are equally impossible, because a total assembled on a
    * subtotal nobody read is not a total of anything.
    *
    * So the rows are withheld and the state is stated instead, with the block keeping its heading,
@@ -461,6 +483,37 @@ export function CartTotalsPanel({
   const hasPendingCharge = chargeRows.some((charge) => charge.amountCents === null);
 
   /*
+   * NOTHING TO TOTAL: A CART THAT WAS READ AND HOLDS NOTHING.
+   *
+   * The contents are established here - this is not the case above - and what they establish is
+   * that there are none. Every row below would then be a figure about an order nobody is placing:
+   * a unit count of nought, a subtotal of nothing under a label that says what it comes before,
+   * and the free-freight offer read against a cart it cannot apply to. The cart drawer answers
+   * this same state by dropping its footer entirely, totals and both destinations together, and
+   * one cart quoted two ways by two surfaces is the thing this component exists to prevent. So the
+   * rows are withheld and the state is stated instead, with the block keeping its heading, its
+   * surface and the dispatch line so the column neither collapses nor jumps when a line is added.
+   * No placeholder bars: nothing is in flight, and a bar standing where a figure will never arrive
+   * would read as a cart still being counted.
+   *
+   * Only where this surface is quoting a cart, which is where `charges` is absent. A surface that
+   * quotes an order's charges - the checkout review column - has rows of its own to print and its
+   * own reading of an empty cart to give, so the figures stay as that caller assembled them and
+   * this branch leaves them alone.
+   */
+  if (totals.isCartEmpty && !hasCharges) {
+    return (
+      <Card className={className} pad={variant === 'page' ? 'lg' : 'md'} head={head}>
+        <div className={styles.root} data-variant={variant}>
+          <p className={styles.note}>{CART_EMPTY_NOTE}</p>
+
+          {dispatch}
+        </div>
+      </Card>
+    );
+  }
+
+  /*
    * The closing figure: the merchandise subtotal plus every charge whose amount is established, in
    * cents, which is the only arithmetic this component performs on money. A pending charge
    * contributes nothing to the sum and the closing row says so in its label, so the figure is
@@ -472,14 +525,15 @@ export function CartTotalsPanel({
   );
 
   /*
-   * The free-freight line has three readings, and an empty cart needs its own: "add $750.00 for
-   * free freight" is a true statement about a cart with nothing in it and a useless one to print,
-   * so the threshold is stated as the offer it is instead. The remaining two are the published
-   * state - qualifying, which the badge carries in words, and the shortfall, which names both the
-   * amount left and the threshold it is measured against.
+   * The free-freight line has two readings, both of them the published state: qualifying, which
+   * the badge carries in words rather than in its colour, and the shortfall, which names both the
+   * amount left and the threshold it is measured against. There is deliberately no third reading
+   * for an empty cart - the branch above returns before this point, because an offer measured
+   * against a cart holding nothing is a statement about an order nobody is placing, and the
+   * slide-over prints nothing for that state either.
    *
-   * All three are the store's offer about a cart, and the offer is only printed on a surface that
-   * is quoting a cart. Where charges are being quoted - the checkout review, where one of the rows
+   * Both are the store's offer about a cart, and the offer is only printed on a surface that is
+   * quoting a cart. Where charges are being quoted - the checkout review, where one of the rows
    * is the freight this order is actually being charged - the line is not printed at all, because
    * every reading of it would be a claim about that charge which no server stands behind: the
    * offer is measured against the merchandise subtotal and the checkout request charges the quoted
@@ -497,13 +551,6 @@ export function CartTotalsPanel({
         </Badge>{' '}
         <span className={styles.rowLabel}>{FREIGHT_EARNED_NOTE}</span>
       </>
-    );
-  } else if (totals.isCartEmpty) {
-    freight = (
-      <span className={styles.rowLabel}>
-        Orders from <Price cents={totals.freeFreightThresholdCents} size="sm" /> ship at no freight
-        charge.
-      </span>
     );
   } else {
     freight = (

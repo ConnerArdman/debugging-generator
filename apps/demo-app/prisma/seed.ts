@@ -750,6 +750,34 @@ const DEMO_CART_LINE_COUNT = 12;
  */
 const DEMO_CART_TOKEN = 'lumen-supply-demo-cart';
 
+/**
+ * The account the storefront shops as: the first customer written, the one the
+ * demo cart is attached to, and the one whose order history `/orders` lists
+ * when the address bar names no account.
+ *
+ * Its contact details are the buyer the checkout form opens on, so the three
+ * surfaces agree about who is shopping across a freshly seeded database: the
+ * cart belongs to this account, an order placed from it is filed under this
+ * account, and the history the storefront shows is this account's - including
+ * the order just placed. Without that agreement an order would be filed under
+ * an account resolved from the typed email address, which no seeded customer
+ * owns, and would be missing from the only history the storefront links to.
+ *
+ * The values are duplicated from `app/checkout/page.tsx` rather than shared
+ * with it, exactly as {@link DEMO_CART_TOKEN} is duplicated from
+ * `@/server/validation/cart` and `@/server/services/checkout.service`: this
+ * file is a script the Prisma CLI runs, nothing under `app/` or `src/` may
+ * import from it, and a readable literal is a cheaper thing to keep in step
+ * than an import edge between a page and a seed script. They are openly
+ * fictional - a reserved `.example` domain and a street that names no real
+ * receiving dock - for the reason that page states.
+ */
+const DEMO_ACCOUNT = {
+  email: 'purchasing@northfield-fabrication.example',
+  companyName: 'Northfield Fabrication',
+  contactName: 'Dana Whitfield',
+} as const;
+
 /** Historical orders. */
 const ORDER_COUNT = 300;
 
@@ -879,12 +907,37 @@ function buildWarehouseRows(): WithAssignedId<Prisma.WarehouseCreateManyInput>[]
 const UNDERSTOCKED_SHARE = 0.03;
 
 /**
+ * How many stock positions are promised out in full: `reserved` equal to
+ * `onHand`, so the location has nothing left to sell although its shelf is not
+ * empty.
+ *
+ * A count rather than a share, and deliberately not zero. "Out of stock" is a
+ * state this storefront renders in three places - the stock badge's danger
+ * tone, the wording `formatStockLabel` produces for it, and the dashboard's own
+ * `?state=OUT_OF_STOCK` filter - and a seed in which no position ever reaches
+ * it leaves all three unexercised: a reader never sees what the state looks
+ * like, and nothing can assert it. Fully promised rather than an empty shelf,
+ * because that is the ordinary way a warehouse runs out - the units are there
+ * and every one of them belongs to an order already taken - and it also gives
+ * the dashboard a line whose available quantity is exactly zero, which is the
+ * figure its zero formatting is for.
+ *
+ * Taken from the front of the generated positions, which is the first product
+ * of the catalog at the first distribution center. The dashboard reaches it
+ * through its low-stock list - a position that far under its reorder point
+ * sorts to the top of it - and through `?state=OUT_OF_STOCK`, rather than by
+ * position in the stock table, which is ordered by category and product name.
+ */
+const PROMISED_OUT_POSITIONS = 1;
+
+/**
  * One stock position per product and distribution center, so the dashboard's
  * inventory table is complete.
  *
  * A small share of the positions is generated below its reorder point, which is
  * what gives the low-stock list something to show; the rest carry comfortable
- * cover. Reserved quantity never exceeds what is on hand.
+ * cover, and the first {@link PROMISED_OUT_POSITIONS} are promised out in full.
+ * Reserved quantity never exceeds what is on hand.
  */
 function buildStockLevelRows(
   products: readonly WithAssignedId<Prisma.ProductCreateManyInput>[],
@@ -899,12 +952,20 @@ function buildStockLevelRows(
         ? between(0, reorderPoint - 1)
         : between(reorderPoint + 40, 4_000);
 
+      /*
+       * Drawn whether or not it is used, so that promising a position out in
+       * full changes that one row and nothing after it: this generator is a
+       * seeded sequence, and skipping a draw would shift every position and
+       * every movement that follows.
+       */
+      const held = between(0, Math.floor(onHand * 0.35));
+
       rows.push({
         id: mint(),
         productId: product.id,
         warehouseId: warehouse.id,
         onHand,
-        reserved: between(0, Math.floor(onHand * 0.35)),
+        reserved: rows.length < PROMISED_OUT_POSITIONS ? onHand : held,
         reorderPoint,
         updatedAt: before(between(0, 14) * DAY_MS + between(0, DAY_MS - 1)),
       });
@@ -1121,7 +1182,16 @@ const SERVICE_LEVEL_WEIGHTS = SERVICE_LEVELS.map((service) => [service, service.
 /** Share of order lines that were sold with a negotiated discount. */
 const DISCOUNTED_LINE_SHARE = 0.35;
 
-/** `CUSTOMER_COUNT` accounts, each with a distinct company, contact and email. */
+/**
+ * `CUSTOMER_COUNT` accounts, each with a distinct company, contact and email.
+ * The first is {@link DEMO_ACCOUNT}, the account the storefront shops as; the
+ * rest are generated.
+ *
+ * Every account draws its identifier and its age from the shared pseudo-random
+ * sequence in the same order whether or not it is the first, so naming the
+ * first one changes which details it carries and nothing else about the data
+ * set - the identifier `/orders` defaults to still belongs to it.
+ */
 function buildCustomerRows(): WithAssignedId<Prisma.CustomerCreateManyInput>[] {
   const rows: WithAssignedId<Prisma.CustomerCreateManyInput>[] = [];
 
@@ -1141,13 +1211,23 @@ function buildCustomerRows(): WithAssignedId<Prisma.CustomerCreateManyInput>[] {
       index * 3 + 1 + Math.floor(index / CONTACT_GIVEN_NAMES.length),
     )}`;
 
-    rows.push({
-      id: mint(),
-      email: `${slugify(contact)}@${slugify(company)}.example.com`,
-      companyName: company,
-      contactName: contact,
-      createdAt: before(between(60, 900) * DAY_MS + between(0, DAY_MS - 1)),
-    });
+    // Drawn for every account, first or not, so the sequence advances
+    // identically and the identifier of each account is the one it has always
+    // had. Only which details the first account carries differs.
+    const id = mint();
+    const createdAt = before(between(60, 900) * DAY_MS + between(0, DAY_MS - 1));
+
+    rows.push(
+      index === 0
+        ? { id, ...DEMO_ACCOUNT, createdAt }
+        : {
+            id,
+            email: `${slugify(contact)}@${slugify(company)}.example.com`,
+            companyName: company,
+            contactName: contact,
+            createdAt,
+          },
+    );
   }
 
   return rows;
@@ -1158,6 +1238,14 @@ function buildCustomerRows(): WithAssignedId<Prisma.CustomerCreateManyInput>[] {
  * always reachable through `DEMO_CART_TOKEN` and always attached to the first
  * customer. The next few are ordinary active carts, and the remainder have
  * either converted into an order or been abandoned.
+ *
+ * A cart that is still `ACTIVE` also holds its session's open-cart pointer,
+ * which is what `@/server/services/cart.service` resolves a session's cart by;
+ * a cart that has converted or been abandoned has given it up, so the session
+ * that filled it is free to open another. Writing the pointer here rather than
+ * leaving it null is what lets the storefront find the seeded demo cart at all,
+ * and leaving it null on the finished carts is what makes their session tokens
+ * history rather than claims on a cart.
  */
 function buildCartRows(
   customers: readonly WithAssignedId<Prisma.CustomerCreateManyInput>[],
@@ -1178,10 +1266,17 @@ function buildCartRows(
       customerId = pick(customers).id;
     }
 
+    // Drawn in the order the fields were once written in, so the identifier and
+    // the session token of every cart are the values they have always had; the
+    // pointer below is derived from the token rather than drawn.
+    const id = mint();
+    const sessionToken = index === 0 ? DEMO_CART_TOKEN : mint();
+
     rows.push({
-      id: mint(),
+      id,
       customerId,
-      sessionToken: index === 0 ? DEMO_CART_TOKEN : mint(),
+      sessionToken,
+      openToken: active ? sessionToken : null,
       status: active
         ? CartStatus.ACTIVE
         : chance(0.6)

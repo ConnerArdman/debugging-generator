@@ -32,7 +32,7 @@
  */
 
 import type { PaymentAuthorization } from '@/lib/types';
-import { StorefrontValidationError, storefrontErrorResponse } from '@/server/errors';
+import { readStorefrontJsonBody, storefrontErrorResponse } from '@/server/errors';
 import { paymentMockBodySchema } from '@/server/validation/mocks';
 
 /**
@@ -64,22 +64,20 @@ const UNREADABLE = 'The payment request body could not be read as JSON.';
  * @param request The POST whose JSON body `paymentMockBodySchema` describes: an
  * amount in whole US cents, optionally a currency code and optionally the
  * identifier of the order or cart being paid for.
- * @returns 200 with a {@link PaymentAuthorization}, or 400 in the storefront's
- * one error envelope when the body is not readable JSON or does not match the
- * schema.
+ * @returns 200 with a {@link PaymentAuthorization}, or the storefront's one
+ * error envelope: 415 when the body was not declared as `application/json`, 413
+ * when it carries more bytes than this endpoint reads, and 400 when the body is
+ * not readable JSON or does not match the schema.
  */
 export async function POST(request: Request): Promise<Response> {
   try {
-    let payload: unknown;
-
-    try {
-      payload = await request.json();
-    } catch (cause) {
-      // An empty or malformed body is the caller's mistake, so it is reported
-      // as the validation failure it is rather than as a failure of this
-      // endpoint.
-      throw new StorefrontValidationError(UNREADABLE, { cause });
-    }
+    // Read through the one guarded reader in `@/server/errors` rather than with
+    // `request.json()`: a body that was not declared as JSON is refused with
+    // 415 and one past the store's byte ceiling with 413, both before anything
+    // is parsed, and an empty or malformed body comes back as the validation
+    // failure it is - the caller's mistake rather than a failure of this
+    // endpoint.
+    const payload: unknown = await readStorefrontJsonBody(request, { unreadable: UNREADABLE });
 
     // Parsing throws, and the rejection names every field at fault: the single
     // mapper behind `storefrontErrorResponse` turns it into the same 400 every

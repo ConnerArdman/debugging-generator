@@ -49,9 +49,13 @@
  *     Both fields are width-filling elements, so the width decision belongs to the element around
  *     them, and that is what `.search` and `.sortField` in `CatalogToolbar.module.css` are. No
  *     control is given a `className` from here.
- *   * Every control is asked for the same density, `scale="sm"` (`size="sm"` on the button), which
- *     their stylesheets describe as the variant for a toolbar row; a control left at the default
- *     `'md'` beside one at `'sm'` would stand a few pixels taller than its neighbour on the line.
+ *   * Both fields are asked for the same density, `scale="sm"`, which their stylesheets describe as
+ *     the variant for a toolbar row; one left at the default `'md'` beside the other at `'sm'`
+ *     would stand a few pixels taller than its neighbour on the line. The submit control is the
+ *     exception and is deliberately `size="md"`: it is the same "Search" action the site header
+ *     offers at that step, and one screen showing that action at two heights read as two different
+ *     controls. The row absorbs the taller control without moving anything: it aligns its items on
+ *     their bottom edge, and each field's own label already makes its wrapper the taller element.
  *
  * THE FIELD IDS ARE LITERAL, AND `useId` IS DELIBERATELY NOT USED. `FormField` takes the id from
  * its caller precisely so a form can render from a server component, and a literal id is identical
@@ -296,7 +300,7 @@ export function CatalogToolbar({
         </FormField>
       </div>
 
-      <Button type="submit" variant="secondary" size="sm" busy={pending}>
+      <Button type="submit" variant="secondary" size="md" busy={pending}>
         Search
       </Button>
 

@@ -52,6 +52,7 @@ import process from 'node:process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import {
+  AUTH_FILE_NAME,
   DEFAULT_SERVICE_HOST,
   DEFAULT_SERVICE_PORT,
   INGEST_PATH,
@@ -63,8 +64,10 @@ import {
   launchDevServer,
   main,
   parseArgs,
+  probeServiceReachability,
   resolveServiceBase,
   stopDevServer,
+  usage,
 } from './dev-instrumented.mjs';
 
 /**
@@ -306,6 +309,7 @@ async function startStubService(options = {}) {
 
 /**
  * @typedef {object} Fixture
+ * @property {string} base temporary directory holding the whole fixture
  * @property {string} root repository root the command resolves against
  * @property {string} home session home holding `auth.json`
  * @property {string} projectDir absolute path of the default target project
@@ -352,7 +356,105 @@ async function createFixture(options = {}) {
     );
   }
 
-  return { root, home, projectDir, preloadUrl: pathToFileURL(preload).href };
+  return { base, root, home, projectDir, preloadUrl: pathToFileURL(preload).href };
+}
+
+/**
+ * @typedef {object} FakeDevServer
+ * @property {string} binDir directory to put first on the child's `PATH`
+ * @property {Record<string, string>} env variables the fake reads
+ * @property {() => Record<string, string>} read what the fake recorded
+ * @property {() => boolean} ran whether the fake was executed at all
+ */
+
+/**
+ * Put a fake package manager on a `PATH` of our own, so the local spawn mode
+ * can be driven as a whole — probe, banner, spawn, exit code — without running
+ * a real development server.
+ *
+ * It stands in for `pnpm`, which is what {@link buildLaunchCommand} looks up,
+ * and it records the argv, working directory and the three injected variables
+ * to a file rather than to stdout: `runDevServer` spawns with
+ * `stdio: 'inherit'`, so anything it printed would land in the test runner's
+ * own output.
+ *
+ * @param {Fixture} fixture
+ * @param {object} [options]
+ * @param {number} [options.exitCode] status the fake exits with (default 0)
+ * @returns {Promise<FakeDevServer>}
+ */
+async function createFakeDevServer(fixture, options = {}) {
+  const binDir = path.join(fixture.base, `bin-${randomUUID()}`);
+  await fs.promises.mkdir(binDir, { recursive: true });
+
+  const dump = path.join(fixture.base, `dev-server-${randomUUID()}.txt`);
+  const executable = path.join(binDir, 'pnpm');
+  await fs.promises.writeFile(
+    executable,
+    [
+      '#!/bin/sh',
+      '{',
+      '  echo "argv=$*"',
+      '  echo "cwd=$(pwd)"',
+      '  echo "NODE_OPTIONS=$NODE_OPTIONS"',
+      '  echo "DEBUGGEN_INGEST_URL=$DEBUGGEN_INGEST_URL"',
+      '  echo "DEBUGGEN_PROJECT_ROOT=$DEBUGGEN_PROJECT_ROOT"',
+      '  echo "DEBUGGEN_TOKEN=${DEBUGGEN_TOKEN-<unset>}"',
+      '} > "$DEV_INSTRUMENTED_DUMP"',
+      'exit "${DEV_INSTRUMENTED_EXIT:-0}"',
+      '',
+    ].join('\n'),
+    'utf8',
+  );
+  await fs.promises.chmod(executable, 0o755);
+
+  return {
+    binDir,
+    env: {
+      PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ''}`,
+      DEV_INSTRUMENTED_DUMP: dump,
+      DEV_INSTRUMENTED_EXIT: String(options.exitCode ?? 0),
+    },
+    ran: () => fs.existsSync(dump),
+    read: () => {
+      const text = fs.readFileSync(dump, 'utf8');
+      /** @type {Record<string, string>} */
+      const record = {};
+      for (const line of text.split('\n')) {
+        const separator = line.indexOf('=');
+        if (separator > 0) record[line.slice(0, separator)] = line.slice(separator + 1);
+      }
+      return record;
+    },
+  };
+}
+
+/**
+ * A loopback address with nothing listening on it: a server is bound to an
+ * ephemeral port only to learn a port number, then closed again. Used for the
+ * "no local service is running" cases, which are the point of the local spawn
+ * mode.
+ *
+ * @returns {Promise<string>} base URL of an address that refuses connections
+ */
+async function closedServiceAddress() {
+  const server = http.createServer(() => {});
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve(undefined)));
+  const address = server.address();
+  const port = typeof address === 'object' && address !== null ? address.port : 0;
+  await new Promise((resolve) => server.close(() => resolve(undefined)));
+  return `http://127.0.0.1:${port}`;
+}
+
+/**
+ * Collapse whitespace so an assertion about a documented claim is about the
+ * claim and not about where the help text happens to wrap.
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+function squash(text) {
+  return text.replace(/\s+/gu, ' ').trim();
 }
 
 /**
@@ -360,16 +462,18 @@ async function createFixture(options = {}) {
  * the fixture's session home, and captured output streams.
  *
  * @param {Fixture} fixture
+ * @param {Record<string, string>} [extraEnv] variables the run needs on top of
+ *   the defaults — a `PATH` carrying a fake package manager, for instance
  * @returns {{ context: Record<string, unknown>, stdout: ReturnType<typeof captureStream>, stderr: ReturnType<typeof captureStream> }}
  */
-function contextFor(fixture) {
+function contextFor(fixture, extraEnv = {}) {
   const stdout = captureStream();
   const stderr = captureStream();
   return {
     context: {
       root: fixture.root,
       cwd: fixture.root,
-      env: { DEBUGGEN_HOME: fixture.home, PATH: process.env.PATH ?? '' },
+      env: { DEBUGGEN_HOME: fixture.home, PATH: process.env.PATH ?? '', ...extraEnv },
       stdout,
       stderr,
     },
@@ -919,6 +1023,121 @@ describe('the local spawn mode', () => {
       `<set, ${'server-agent-credential'.length} bytes>`,
     );
     expect(describeToken(undefined)).toContain('--spawn-local');
+    // What the absence costs, stated as what actually happens: with no
+    // credential the preload reports itself inert and installs nothing, so no
+    // ingest is attempted and there is nothing for the service to reject.
+    expect(describeToken(undefined)).toContain('inert');
+  });
+
+  // The spawn is exercised through a fake `pnpm` on a `PATH` of the test's own,
+  // which POSIX shells can execute directly; `buildLaunchCommand` resolves
+  // `pnpm.cmd` through `PATHEXT` on Windows and `wrapForPlatform` runs it
+  // through the command interpreter, which this fake is not.
+  const spawns = it.skipIf(process.platform === 'win32');
+
+  spawns(
+    'starts the dev server with no local service running, because the mode asks it for nothing',
+    async () => {
+      // No `auth.json` either: this mode reads no credential, so neither the
+      // service nor the session home is a precondition for it. That is the
+      // whole claim the help text makes about it.
+      const fixture = await createFixture({ withCredential: false });
+      const dev = await createFakeDevServer(fixture);
+      const base = await closedServiceAddress();
+      const { context, stdout, stderr } = contextFor(fixture, dev.env);
+
+      const code = await main(['--spawn-local', '--service', base], context);
+
+      // The dev server's own status, not a pre-flight failure of this command.
+      expect(code).toBe(0);
+      expect(stderr.text()).toBe('');
+      expect(dev.ran()).toBe(true);
+
+      const recorded = dev.read();
+      expect(recorded.argv).toBe('--filter target-app dev');
+      expect(recorded.cwd).toBe(fs.realpathSync(fixture.root));
+      expect(recorded.NODE_OPTIONS).toBe(`--import ${fixture.preloadUrl}`);
+      expect(recorded.DEBUGGEN_INGEST_URL).toBe(`${base}${INGEST_PATH}`);
+      expect(recorded.DEBUGGEN_PROJECT_ROOT).toBe(fixture.projectDir);
+      expect(recorded.DEBUGGEN_TOKEN).toBe('<unset>');
+
+      // The unreachable service is reported, and reported as a note: the run
+      // is complete, not degraded.
+      const banner = squash(stdout.text());
+      expect(banner).toContain(`${base} (not answering)`);
+      expect(banner).toContain(
+        'That does not stop this mode and nothing was skipped because of it',
+      );
+      expect(banner).toContain('no server or database spans will be recorded');
+    },
+  );
+
+  spawns('asks a running service nothing except whether it is answering', async () => {
+    service = await startStubService();
+    const fixture = await createFixture();
+    const dev = await createFakeDevServer(fixture);
+    const { context, stdout } = contextFor(fixture, dev.env);
+
+    const code = await main(['--spawn-local', '--service', service.base], context);
+
+    expect(code).toBe(0);
+    // No launch, no stop, no credential: the liveness route and nothing else.
+    expect(service.routes()).toEqual([`GET ${HEALTH}`]);
+    expect(service.rejections).toEqual([]);
+    expect(service.requests.every((request) => request.authorization === undefined)).toBe(true);
+    expect(stdout.text()).not.toContain('not answering');
+    expect(dev.read().DEBUGGEN_TOKEN).toBe('<unset>');
+  });
+
+  spawns('exits with the dev server’s status rather than one of its own', async () => {
+    const fixture = await createFixture({ withCredential: false });
+    const dev = await createFakeDevServer(fixture, { exitCode: 7 });
+    const base = await closedServiceAddress();
+    const { context, stderr } = contextFor(fixture, dev.env);
+
+    const code = await main(['--spawn-local', '--service', base], context);
+
+    // 7 is the child's; 2 would be this command reporting a failure of its own,
+    // which is what an unreachable service used to produce here.
+    expect(code).toBe(7);
+    expect(code).not.toBe(2);
+    expect(stderr.text()).toBe('');
+  });
+
+  it('reports the service probe instead of failing on it, and never rejects', async () => {
+    service = await startStubService();
+
+    await expect(probeServiceReachability(service.base)).resolves.toEqual({ reachable: true });
+    expect(service.routes()).toEqual([`GET ${HEALTH}`]);
+
+    const closed = await closedServiceAddress();
+    const unreachable = await probeServiceReachability(closed);
+
+    expect(unreachable.reachable).toBe(false);
+    expect(unreachable.detail).toContain(`${closed}${HEALTH}`);
+  });
+
+  it('documents the mode it implements: credential-free, inert, and independent of the service', () => {
+    const text = usage();
+    const options = text.slice(text.indexOf('\nOptions\n'));
+    const start = options.indexOf('  --spawn-local');
+    const paragraph = squash(options.slice(start, options.indexOf('  --stop ', start)));
+
+    // The claim and the behaviour asserted above have to stay the same claim:
+    // this paragraph once promised an offline mode that a mandatory health
+    // probe then refused to run.
+    expect(paragraph).toContain('WITHOUT a credential');
+    expect(paragraph).toContain('stays inert');
+    expect(paragraph).toContain('it does not require one');
+    expect(paragraph).toContain('the mode runs offline');
+
+    // And the exit-code table has to agree about which modes a service that is
+    // not answering is fatal for.
+    const exitCodes = squash(text.slice(text.indexOf('Exit codes')));
+    expect(exitCodes).toContain(
+      'In --spawn-local a service that is not answering is a note rather than a failure',
+    );
+    expect(squash(text)).toContain(`it needs neither ${AUTH_FILE_NAME} nor a running service`);
   });
 });
 

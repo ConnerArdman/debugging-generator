@@ -73,6 +73,18 @@ const CONTROL = 0x1f;
 const DEL = 0x7f;
 
 /**
+ * The line feed, `U+000A`: the one control character a multi-line field
+ * carries.
+ *
+ * It is a control character like any other by the classification below, and it
+ * is the only one a customer can produce deliberately rather than by accident:
+ * a `<textarea>` writes it when they press Enter. So the fields whose content
+ * is one line refuse it with the rest of the block, and the one field that is a
+ * paragraph accepts it - see {@link prose}.
+ */
+const FEED = 0x0a;
+
+/**
  * The one wording every free-text field below uses when it holds a character it
  * does not carry.
  *
@@ -82,6 +94,18 @@ const DEL = 0x7f;
  */
 const TYPED =
   'Use ordinary text characters here: tab, line break and other control characters are not accepted.';
+
+/**
+ * The same wording for the one field that is a paragraph rather than a line.
+ *
+ * It differs from {@link TYPED} in exactly the way the rule does: a line break
+ * is text in a delivery note, so a customer who pressed Enter is not told that
+ * what they typed is unacceptable. Everything else the block refuses is still
+ * refused, and the message still says what the field takes without repeating
+ * what arrived in it.
+ */
+const WRITTEN =
+  'Use ordinary text characters here: line breaks are fine, but tab and other control characters are not accepted.';
 
 /**
  * Whether `value` is text a free-text field carries: no C0 control character
@@ -135,6 +159,38 @@ function plain(value: string): boolean {
 }
 
 /**
+ * Whether `value` is text a multi-line field carries: {@link plain}'s rule with
+ * the line feed allowed.
+ *
+ * One field on this surface is a paragraph rather than a line - the delivery
+ * note, which the storefront collects in a `<textarea>` - and a customer
+ * writing two instructions on two lines produces a `U+000A` between them. A
+ * rule that refused it would take a field the store invites free text into and
+ * reject the most ordinary thing anybody types in one, which is the same
+ * failure the class exists to prevent, arriving from the other direction. So
+ * the feed is text here and every other control character is refused exactly as
+ * {@link plain} refuses it: a tab still cannot reach a column that will not
+ * hold it, and a `U+0000` still cannot survive a trim into the order.
+ *
+ * Only the feed, and never the carriage return: the schema below normalises
+ * `\r\n` and a lone `\r` to `\n` before this runs, so a note holds one spelling
+ * of a line break whichever platform the browser is on.
+ *
+ * @param value The normalised, trimmed, length-checked value a field parsed.
+ */
+function prose(value: string): boolean {
+  for (let at = 0; at < value.length; at += 1) {
+    const code = value.charCodeAt(at);
+
+    if (code !== FEED && (code <= CONTROL || code === DEL)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+/**
  * A free-text field the customer may leave empty, bounded at `max` characters.
  *
  * The DTO's discipline for such a field is a present `null` rather than an
@@ -164,6 +220,57 @@ function blank(max: number, message: string): z.ZodType<string | null> {
     .default(null)
     .transform((value) => (value !== null && value.length > 0 ? value : null));
 }
+
+/**
+ * A multi-line free-text field the customer may leave empty, bounded at `max`
+ * characters: {@link blank} for a paragraph.
+ *
+ * It differs from that helper in two ways, both of them about the line break a
+ * `<textarea>` produces. Every spelling of one is normalised to `\n` first, so
+ * a note written in a browser on one platform is stored the same way as the
+ * same note written on another and the bound below counts the same number of
+ * characters either way; and the value is then held to {@link prose} rather
+ * than to {@link plain}, so the break survives while every other control
+ * character is still refused.
+ *
+ * The normalisation runs before the trim and the bound, so the length the
+ * customer is held to is the length of what will be stored, and surrounding
+ * whitespace - including a trailing blank line - is still normalised away
+ * before anything is refused.
+ *
+ * @param max Longest value accepted, measured after the line breaks are
+ *   normalised and surrounding whitespace is trimmed.
+ * @param message Wording shown when the value is longer than that.
+ */
+function note(max: number, message: string): z.ZodType<string | null> {
+  return z
+    .string()
+    .transform((value) => value.replace(/\r\n?/g, '\n'))
+    .pipe(z.string().trim().max(max, message).refine(prose, WRITTEN))
+    .nullable()
+    .default(null)
+    .transform((value) => (value !== null && value.length > 0 ? value : null));
+}
+
+/**
+ * The countries this catalog's warehouses ship to, as the two-letter codes an
+ * address carries.
+ *
+ * A closed list rather than a shape, because that is what it is: the storefront
+ * offers exactly these three destinations in its country control, the warehouse
+ * selection behind an order reads the code to decide which warehouses can serve
+ * it, and a fourth code is not a country this store can ship to - it is a
+ * request nobody can fulfil. Holding the field to a two-letter *shape* would
+ * accept all 676 of them and refuse the order later, somewhere with less to say
+ * about why.
+ *
+ * The list is the same one the checkout form's country control offers. It is
+ * written out here rather than imported from it for the reason the postal-code
+ * rule is written out twice: the browser may not import this module and this
+ * module may not import a component, so each side states the rule and the two
+ * are held together by being the same three codes.
+ */
+const COUNTRIES = ['US', 'CA', 'MX'] as const;
 
 /**
  * Where an order ships to.
@@ -219,7 +326,7 @@ export const shippingAddressSchema: z.ZodType<ShippingAddress> = z.object({
   postalCode: z
     .string()
     .trim()
-    .min(3, 'A postal code is required.')
+    .min(3, 'A postal code of at least 3 characters is required.')
     .max(12, 'Keep the postal code to 12 characters.')
     .regex(
       /^[A-Za-z0-9]+(?:[ -][A-Za-z0-9]+)*$/,
@@ -227,14 +334,20 @@ export const shippingAddressSchema: z.ZodType<ShippingAddress> = z.object({
     ),
 
   /**
-   * Two-letter country code, upper-cased before it is checked so that a form
-   * submitting `us` is accepted and the service reads one canonical form.
+   * One of the countries this store ships to, upper-cased before it is checked
+   * so that a form submitting `us` is accepted and the service reads one
+   * canonical form.
+   *
+   * The check is the closed list {@link COUNTRIES} and not a two-letter shape:
+   * an address the store cannot ship to is refused here, where the message can
+   * name the field, rather than accepted and then failed further in where it
+   * cannot.
    */
   country: z
     .string()
     .trim()
     .toUpperCase()
-    .regex(/^[A-Z]{2}$/, 'Use a two-letter country code.')
+    .pipe(z.enum(COUNTRIES, 'Choose one of the countries this store ships to.'))
     .default('US'),
 } satisfies Mirror<ShippingAddress>);
 
@@ -316,8 +429,15 @@ export const checkoutBodySchema = z.object({
       'A shipping service identifier holds letters, digits, dots, hyphens and underscores.',
     ),
 
-  /** Delivery instructions for the warehouse; `null` when there are none. */
-  notes: blank(500, 'Keep delivery notes to 500 characters.'),
+  /**
+   * Delivery instructions for the warehouse; `null` when there are none.
+   *
+   * The one field on this surface the customer writes a paragraph into - dock
+   * hours on one line, a purchase-order reference on the next - so it is parsed
+   * with {@link note} and keeps the line breaks the storefront's `<textarea>`
+   * produces.
+   */
+  notes: note(500, 'Keep delivery notes to 500 characters.'),
 
   /**
    * What the caller calls this attempt to place the order, so that repeating a

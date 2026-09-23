@@ -115,6 +115,8 @@ import {
   TRACE_ID_PATTERN,
   isErr,
   isOk,
+  isSpanId,
+  isTraceId,
   newCaptureId,
   newEventId,
   newProducerId,
@@ -572,6 +574,18 @@ function absenceCodeFor(field: string): string {
 /** The three fields the service assigns and the store therefore requires. */
 const ATTRIBUTION_FIELDS = ['sessionId', 'captureId', 'ingestSeq'];
 
+/**
+ * The all-zero trace id: 32 characters the shared pattern accepts and W3C
+ * Trace Context defines as invalid.
+ *
+ * Built from the length of a generated id rather than typed out, so it cannot
+ * drift from the width the pattern enforces.
+ */
+const ALL_ZERO_TRACE_ID = '0'.repeat(newTraceId().length);
+
+/** The all-zero span id, the same case at span-id width. */
+const ALL_ZERO_SPAN_ID = '0'.repeat(newSpanId().length);
+
 /** Every way a `traceId` can fail to be 32 lowercase hex characters. */
 const TRACE_ID_REJECTIONS: readonly RejectionCase[] = [
   { label: '31 hex characters', input: 'a'.repeat(31), path: 'traceId', code: 'invalid_format' },
@@ -589,6 +603,15 @@ const TRACE_ID_REJECTIONS: readonly RejectionCase[] = [
     code: 'invalid_format',
   },
   { label: 'an empty string', input: '', path: 'traceId', code: 'invalid_format' },
+  {
+    // The one rejection here that the shared pattern cannot produce: 32
+    // lowercase hex characters, refused for what the value *means* rather than
+    // for its shape. Reported as `custom`, the code a refinement carries.
+    label: 'the all-zero trace id W3C Trace Context defines as invalid',
+    input: ALL_ZERO_TRACE_ID,
+    path: 'traceId',
+    code: 'custom',
+  },
   { label: 'a number', input: 12, path: 'traceId', code: 'invalid_type' },
   { label: 'a boolean', input: true, path: 'traceId', code: 'invalid_type' },
 ];
@@ -600,6 +623,16 @@ const SPAN_ID_REJECTIONS: readonly RejectionCase[] = [
   { label: 'uppercase hex', input: 'ABCDEF0123456789', path: 'spanId', code: 'invalid_format' },
   { label: '16 non-hex characters', input: 'z'.repeat(16), path: 'spanId', code: 'invalid_format' },
   { label: 'an empty string', input: '', path: 'spanId', code: 'invalid_format' },
+  {
+    // Applied to `parentSpanId` as well, since this table drives that field's
+    // battery too: the all-zero span id is precisely the placeholder an SDK
+    // reports for "no parent", and reading it as a trace root would attach
+    // every such event to a span that does not exist.
+    label: 'the all-zero span id W3C Trace Context defines as invalid',
+    input: ALL_ZERO_SPAN_ID,
+    path: 'spanId',
+    code: 'custom',
+  },
   { label: 'a number', input: 1, path: 'spanId', code: 'invalid_type' },
   { label: 'a boolean', input: false, path: 'spanId', code: 'invalid_type' },
 ];
@@ -1025,6 +1058,44 @@ describe('traceId', () => {
       telemetryEventIngressSchema.safeParse(makeIngress({ traceId: sameLengthNonHex })).success,
     ).toBe(false);
   });
+
+  it('rejects the all-zero trace id the shared pattern accepts', () => {
+    // The mirror image of the case above, and the reason this rule lives in the
+    // schema at all: `@debuggen/shared`'s pattern and guard answer a question
+    // about *format*, and both say yes here — their documentation states that a
+    // caller needing the W3C distinction must reject the value explicitly. This
+    // schema is that caller, so the refusal has to be observable from the
+    // pattern's own verdict rather than implied by it.
+    expect(TRACE_ID_PATTERN.test(ALL_ZERO_TRACE_ID)).toBe(true);
+    expect(isTraceId(ALL_ZERO_TRACE_ID)).toBe(true);
+
+    expect(expectIngressRejected(makeIngress({ traceId: ALL_ZERO_TRACE_ID }))).toContainEqual({
+      path: 'traceId',
+      code: 'custom',
+    });
+  });
+
+  it('applies the all-zero refusal to a persisted event too', () => {
+    // One factory feeds one core shape feeds both schemas, so a stored row can
+    // no more carry the value than a producer can send it. Without this, an
+    // event could be refused at ingest and still be readable out of the store.
+    expect(expectPersistedRejected(makePersisted({ traceId: ALL_ZERO_TRACE_ID }))).toContainEqual({
+      path: 'traceId',
+      code: 'custom',
+    });
+  });
+
+  it('accepts a trace id that is mostly zeros but not all of them', () => {
+    // The boundary that keeps the rule narrow: what is refused is the all-zero
+    // id W3C defines as invalid, never the zero digit. A single non-zero nibble
+    // makes a perfectly ordinary trace id, and a random one can look like this.
+    const nearlyZero = `${'0'.repeat(newTraceId().length - 1)}1`;
+
+    expect(nearlyZero).toHaveLength(newTraceId().length);
+    expect(okValue(parseTelemetryEventIngress(makeIngress({ traceId: nearlyZero }))).traceId).toBe(
+      nearlyZero,
+    );
+  });
 });
 
 describe('spanId', () => {
@@ -1049,6 +1120,28 @@ describe('spanId', () => {
     expect(
       telemetryEventIngressSchema.safeParse(makeIngress({ spanId: sameLengthNonHex })).success,
     ).toBe(false);
+  });
+
+  it('rejects the all-zero span id the shared pattern accepts', () => {
+    // A span id becomes a child's parent-id in the `traceparent` header the
+    // agent injects, so the all-zero value is invalid for the same reason at
+    // this width — and, as with the trace id, the shared guard says yes.
+    expect(SPAN_ID_PATTERN.test(ALL_ZERO_SPAN_ID)).toBe(true);
+    expect(isSpanId(ALL_ZERO_SPAN_ID)).toBe(true);
+
+    expect(expectIngressRejected(makeIngress({ spanId: ALL_ZERO_SPAN_ID }))).toContainEqual({
+      path: 'spanId',
+      code: 'custom',
+    });
+  });
+
+  it('accepts a span id that is mostly zeros but not all of them', () => {
+    const nearlyZero = `${'0'.repeat(newSpanId().length - 1)}f`;
+
+    expect(nearlyZero).toHaveLength(newSpanId().length);
+    expect(okValue(parseTelemetryEventIngress(makeIngress({ spanId: nearlyZero }))).spanId).toBe(
+      nearlyZero,
+    );
   });
 });
 
@@ -1085,6 +1178,20 @@ describe('parentSpanId', () => {
     const issues = expectIngressRejected(makeIngress({ parentSpanId: input }));
 
     expect(issues).toContainEqual({ path: 'parentSpanId', code });
+  });
+
+  it('refuses the all-zero span id rather than reading it as a trace root', () => {
+    // The distinction this field turns on. An OpenTelemetry SDK reports the
+    // all-zero span id for "no parent", and a producer forwarding it verbatim
+    // is claiming a parent that does not exist — so the event is rejected,
+    // which is a reported producer bug, instead of being accepted as a second
+    // root that would silently split one interaction's tree in two. Omitting
+    // the key is the only way to say "trace root", and `../node/convert.ts`
+    // does exactly that for such a span.
+    expect(expectIngressRejected(makeIngress({ parentSpanId: ALL_ZERO_SPAN_ID }))).toContainEqual({
+      path: 'parentSpanId',
+      code: 'custom',
+    });
   });
 });
 
@@ -2416,7 +2523,7 @@ const BATCH_SIZE = 10;
  * makes "the table drives every case in the file" an assertion rather than an
  * assumption.
  */
-const INVALID_CASE_COUNT = 11;
+const INVALID_CASE_COUNT = 14;
 
 /**
  * The event at `index`, or a failure naming the corpus.
@@ -2493,7 +2600,7 @@ interface InvalidFixtureCase {
 }
 
 /**
- * The eleven named cases, each with the issue its name commits the schemas to
+ * The fourteen named cases, each with the issue its name commits the schemas to
  * reporting.
  *
  * Order matters: the ordered key comparison below is what catches a case being
@@ -2582,6 +2689,30 @@ const INVALID_FIXTURE_CASES: readonly InvalidFixtureCase[] = [
     reason: 'no producerId, so no producer to attribute the event to',
     ingressIssue: { path: 'producerId', code: 'invalid_type' },
     persistedIssue: { path: 'producerId', code: 'invalid_type' },
+  },
+  {
+    name: 'allZeroTraceId',
+    reason: 'the all-zero trace id W3C Trace Context defines as invalid',
+    // The three rows below are the corpus' only *format-valid* ids: each one
+    // satisfies the pattern `@debuggen/shared` owns and is refused for what it
+    // means, so the issue is `custom` rather than `invalid_format`. They are
+    // also the cases the hand-built tables could not cover on their own — a
+    // committed wire-shaped event is what proves a real batch element carrying
+    // these zeros never reaches the store.
+    ingressIssue: { path: 'traceId', code: 'custom' },
+    persistedIssue: { path: 'traceId', code: 'custom' },
+  },
+  {
+    name: 'allZeroSpanId',
+    reason: 'the all-zero span id, which would become an invalid parent-id on the wire',
+    ingressIssue: { path: 'spanId', code: 'custom' },
+    persistedIssue: { path: 'spanId', code: 'custom' },
+  },
+  {
+    name: 'allZeroParentSpanId',
+    reason: 'the SDK\'s all-zero placeholder for "no parent" sent instead of omitting the field',
+    ingressIssue: { path: 'parentSpanId', code: 'custom' },
+    persistedIssue: { path: 'parentSpanId', code: 'custom' },
   },
 ];
 

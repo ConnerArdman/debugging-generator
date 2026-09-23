@@ -105,6 +105,25 @@
  * starve the evidence behind it; losing dev-time telemetry is acceptable,
  * degrading the developer's dev server never is.
  *
+ * ## A refused credential stops the transport, for good
+ *
+ * A `401` or a `403` from the ingest endpoint is not a failed batch, it is the
+ * end of server-side telemetry in this process: the server-agent credential is
+ * minted per dev-server launch and scoped to one project root (AAP §0.5.6), so
+ * an endpoint that has refused it will refuse it for as long as the process
+ * lives. The first such answer latches
+ * {@link DebuggenSpanProcessorStats.credentialRejected} and, from that instant,
+ * `onEnd` converts nothing, the buffer is released, no flush window is armed
+ * and no request is built — the developer is told once, and the message's own
+ * promise ("server-side telemetry stops until the dev server is relaunched") is
+ * what the code then does. The latch survives `reopen()` and every subsequent
+ * capture; only relaunching the dev server, which mints a new credential,
+ * clears it. Every span and event the condition costs is counted on
+ * {@link DebuggenSpanProcessorStats.droppedCredentialRejected}, and
+ * `./control.ts` republishes the latch as
+ * `ServerAgentControlStats.ingestCredentialRejected` so the condition is
+ * reportable rather than merely logged.
+ *
  * ## Never throw into the host process
  *
  * `onStart` and `onEnd` are called synchronously by the host's span pipeline,
@@ -220,17 +239,26 @@ export const SHUTDOWN_FLUSH_DEADLINE_MS = INGEST_TIMEOUT_MS;
  * `408 Request Timeout` and `429 Too Many Requests` describe a moment, not the
  * batch; every other client error says the batch or the credential will not
  * become acceptable by being sent again.
+ *
+ * Exported for the same reason the bounds above are: `./exporter.test.ts`
+ * asserts that every member here leaves the transport running, and a copy of
+ * the table in the suite would stop covering a status added to this one.
  */
-const RETRYABLE_CLIENT_STATUSES: ReadonlySet<number> = new Set([408, 429]);
+export const RETRYABLE_CLIENT_STATUSES: ReadonlySet<number> = new Set([408, 429]);
 
 /**
  * Statuses that mean the credential was refused.
  *
  * Separated from the rest of the `4xx` family because they earn a developer a
  * specific hint — the one thing they can act on — and because they must never
- * be retried in a loop against an endpoint that has already said no.
+ * be retried in a loop against an endpoint that has already said no: every
+ * member latches {@link DebuggenSpanProcessorStats.credentialRejected} and
+ * stops the transport for the life of the process.
+ *
+ * Exported so the suite drives the real table rather than a copy of it, which
+ * is what makes a status added here covered by the existing cases.
  */
-const AUTH_REJECTED_STATUSES: ReadonlySet<number> = new Set([401, 403]);
+export const AUTH_REJECTED_STATUSES: ReadonlySet<number> = new Set([401, 403]);
 
 /*
  * ---------------------------------------------------------------------------
@@ -422,7 +450,8 @@ export interface DebuggenSpanProcessorOptions {
  * rules through them, so they are stable: add a counter rather than rename one.
  * Every number is cumulative over the processor's life — it is constructed once
  * by `register.ts` and survives every enable/disable cycle — except
- * {@link buffered}, which is the current queue depth.
+ * {@link buffered}, which is the current queue depth, and
+ * {@link credentialRejected}, which is a terminal state rather than a count.
  */
 export interface DebuggenSpanProcessorStats {
   /**
@@ -505,6 +534,19 @@ export interface DebuggenSpanProcessorStats {
   /** Spans that reached `onEnd` after `shutdown()` completed. */
   readonly droppedAfterShutdown: number;
 
+  /**
+   * Spans and events discarded because the ingest endpoint refused this
+   * process's credential.
+   *
+   * The sibling of {@link droppedAfterShutdown}, and read the same way: both
+   * count evidence this processor declined to handle because it is in a state
+   * it cannot leave. It covers the spans `onEnd` refuses once
+   * {@link credentialRejected} is set *and* whatever was still buffered when
+   * the refusal arrived, since none of it can be delivered to an endpoint that
+   * has said no.
+   */
+  readonly droppedCredentialRejected: number;
+
   /** Events still buffered when the shutdown flush ran out of its deadline. */
   readonly droppedAtShutdown: number;
 
@@ -525,6 +567,26 @@ export interface DebuggenSpanProcessorStats {
    * transport problem. It never reaches the host process as an exception.
    */
   readonly internalErrors: number;
+
+  /**
+   * Whether the ingest endpoint refused this process's credential, which stops
+   * server-side telemetry for the life of the process.
+   *
+   * Latched by a `401` or a `403` from `POST /telemetry/ingest` and never
+   * cleared — not by `reopen()`, not by a later capture. The server-agent
+   * credential is minted per dev-server launch and scoped to one project root
+   * (AAP §0.5.6), so one the service has refused never starts being accepted,
+   * and the only remedy is the one the diagnostic names: relaunch the dev
+   * server from the Debug Generator session.
+   *
+   * `true` is therefore the machine-readable form of "relaunch required", and
+   * it is what lets `./control.ts` report the condition instead of leaving a
+   * developer with a session that looks armed and collects nothing. Distinct
+   * from `ServerAgentControlStats.credentialRejected`, which is the *control
+   * socket's* 4401 latch: this one is the HTTP ingest endpoint's answer, and
+   * either can happen without the other.
+   */
+  readonly credentialRejected: boolean;
 
   /** Events currently queued, waiting for a flush. */
   readonly buffered: number;
@@ -868,8 +930,19 @@ export class DebuggenSpanProcessor implements SpanProcessor {
   /** Overflow drops not yet mentioned in a warning — one warning per flush window. */
   #overflowSinceWarning = 0;
 
-  /** Whether the credential hint has been written for the current failure streak. */
-  #authHintLogged = false;
+  /**
+   * Set when the ingest endpoint refused the credential: terminal for this
+   * process, and the gate every outbound path consults.
+   *
+   * One flag rather than two, because "the hint has been logged" and "the
+   * transport has stopped" are the same fact. It used to be only the former,
+   * which made the hint's own promise — *server-side telemetry stops until the
+   * dev server is relaunched* — a claim nothing enforced: the drain kept
+   * posting to the endpoint that had just refused it.
+   *
+   * @see {@link DebuggenSpanProcessorStats.credentialRejected}
+   */
+  #credentialRejected = false;
 
   /** {@link DebuggenSpanProcessorStats.onStartCount} */
   #onStartCount = 0;
@@ -909,6 +982,9 @@ export class DebuggenSpanProcessor implements SpanProcessor {
 
   /** {@link DebuggenSpanProcessorStats.droppedAfterShutdown} */
   #droppedAfterShutdown = 0;
+
+  /** {@link DebuggenSpanProcessorStats.droppedCredentialRejected} */
+  #droppedCredentialRejected = 0;
 
   /** {@link DebuggenSpanProcessorStats.droppedAtShutdown} */
   #droppedAtShutdown = 0;
@@ -1014,13 +1090,28 @@ export class DebuggenSpanProcessor implements SpanProcessor {
       droppedUnserializable: this.#droppedUnserializable,
       droppedFailedBatch: this.#droppedFailedBatch,
       droppedAfterShutdown: this.#droppedAfterShutdown,
+      droppedCredentialRejected: this.#droppedCredentialRejected,
       droppedAtShutdown: this.#droppedAtShutdown,
       postedBatches: this.#postedBatches,
       postedEvents: this.#postedEvents,
       failedBatches: this.#failedBatches,
       internalErrors: this.#internalErrors,
+      credentialRejected: this.#credentialRejected,
       buffered: this.#buffer.length,
     });
+  }
+
+  /**
+   * Whether the ingest endpoint has refused this process's credential.
+   *
+   * A getter as well as a member of {@link stats}, for the same reason
+   * {@link isShutDown} is one: `./control.ts` reads it on every
+   * `ServerAgentControlStats` snapshot through the narrow
+   * `ControlFlushTarget` interface, which declares a property rather than a
+   * method so the read costs nothing and cannot fail.
+   */
+  get credentialRejected(): boolean {
+    return this.#credentialRejected;
   }
 
   /**
@@ -1082,6 +1173,16 @@ export class DebuggenSpanProcessor implements SpanProcessor {
 
       if (this.#shutdownComplete) {
         this.#droppedAfterShutdown += 1;
+        return;
+      }
+
+      // The credential this process holds was refused, so there is nowhere for
+      // this span to go: converting and buffering it would only fill memory
+      // with evidence that can never be posted, and the hint the developer was
+      // given says server-side telemetry has stopped. Counted, like a span that
+      // arrives after shutdown, and dropped before any work is done on it.
+      if (this.#credentialRejected) {
+        this.#droppedCredentialRejected += 1;
         return;
       }
 
@@ -1304,6 +1405,16 @@ export class DebuggenSpanProcessor implements SpanProcessor {
    * and counted, and resurrecting it would post the previous capture's
    * evidence into the next one.
    *
+   * It also deliberately does **not** clear
+   * {@link DebuggenSpanProcessorStats.credentialRejected}. That latch belongs
+   * to the *process*, not to the provider lifetime this method repairs: the
+   * server-agent credential is minted per dev-server launch and scoped to one
+   * project root, so an endpoint that refused it never starts accepting it and
+   * AAP §0.5.6 requires the dev server to be relaunched. This method runs on
+   * every capture re-arm, and clearing the latch here would have the second
+   * capture buffer and post to an endpoint that has already said no — the
+   * precise behaviour the latch exists to stop.
+   *
    * Only the lifecycle owner (`./control.ts`, when it installs a replacement
    * provider) calls this. Nothing calls it on the process-exit path, where the
    * shutdown is final.
@@ -1367,10 +1478,17 @@ export class DebuggenSpanProcessor implements SpanProcessor {
    * something is waiting, so a quiet dev server has no timer at all and a
    * partial batch never waits longer than {@link BATCH_FLUSH_INTERVAL_MS} from
    * the moment it started waiting. It is always `unref`'d — a pending flush
-   * must never hold a process open — and never armed once shutdown has begun.
+   * must never hold a process open — and never armed once shutdown has begun
+   * or the credential has been refused, since neither state has a window in
+   * which anything could travel.
    */
   #armFlushTimer(): void {
-    if (this.#flushTimer !== undefined || this.#shuttingDown || this.#buffer.length === 0) {
+    if (
+      this.#flushTimer !== undefined ||
+      this.#shuttingDown ||
+      this.#credentialRejected ||
+      this.#buffer.length === 0
+    ) {
       return;
     }
 
@@ -1436,6 +1554,15 @@ export class DebuggenSpanProcessor implements SpanProcessor {
   async #drain(mode: DrainMode): Promise<void> {
     this.#reportOverflow();
 
+    // A refused credential ends the outbound path: nothing is posted, and
+    // whatever is still queued is released rather than held for a flush that
+    // can never succeed. Checked before the loop so `forceFlush()` and the
+    // shutdown flush both resolve without touching the endpoint.
+    if (this.#credentialRejected) {
+      this.#discardAfterCredentialRejection();
+      return;
+    }
+
     try {
       const attempts = mode === 'final' ? 1 : MAX_POST_ATTEMPTS;
 
@@ -1454,6 +1581,16 @@ export class DebuggenSpanProcessor implements SpanProcessor {
           this.#droppedUnserializable += batch.length;
         } else {
           this.#droppedFailedBatch += batch.length;
+        }
+
+        // The batch that was just refused is what latched the credential, and
+        // it keeps the counters it has already been given. Everything behind it
+        // stops here: this is the case the drop rule exists for, because
+        // without it the remaining batches of this very drain would each be
+        // posted to an endpoint that has already answered `401`.
+        if (this.#credentialRejected) {
+          this.#discardAfterCredentialRejection();
+          return;
         }
       }
     } catch (error) {
@@ -1488,6 +1625,34 @@ export class DebuggenSpanProcessor implements SpanProcessor {
     });
   }
 
+  /**
+   * Release everything still buffered, once the credential has been refused.
+   *
+   * Held evidence would be held for the life of the process: the endpoint will
+   * not accept this credential again (AAP §0.5.6), `onEnd` admits nothing more,
+   * and no flush window is armed, so the buffer has no future reader. Releasing
+   * it is also what keeps `shutdown()` honest — the abandonment it reports is
+   * for evidence a *reachable* service did not take in time, and counting these
+   * events there would describe the wrong failure.
+   *
+   * The count lands on {@link DebuggenSpanProcessorStats.droppedCredentialRejected},
+   * the same counter as the spans `onEnd` refuses, so one number accounts for
+   * every piece of evidence this condition cost. Diagnostics stay at `debug`:
+   * the one line a developer can act on was already written at `warn`, once.
+   */
+  #discardAfterCredentialRejection(): void {
+    const discarded = this.#buffer.length;
+    if (discarded === 0) {
+      return;
+    }
+    this.#buffer.length = 0;
+    this.#droppedCredentialRejected += discarded;
+    this.#log('debug', 'buffered events were discarded after the credential was refused', {
+      events: discarded,
+      droppedTotal: this.#droppedCredentialRejected,
+    });
+  }
+
   /*
    * -------------------------------------------------------------------------
    * Transport
@@ -1512,6 +1677,13 @@ export class DebuggenSpanProcessor implements SpanProcessor {
       return 'sent';
     }
     if (!this.#transportAvailable) {
+      return 'failed';
+    }
+    // Defence in depth. `#drain` already stops before it gets here, and this is
+    // the single method that builds the credentialed request — so the guarantee
+    // "no post after the endpoint refused this credential" is enforced at the
+    // one place no future caller can go around.
+    if (this.#credentialRejected) {
       return 'failed';
     }
 
@@ -1587,7 +1759,6 @@ export class DebuggenSpanProcessor implements SpanProcessor {
       await releaseResponseBody(response);
 
       if (response.ok) {
-        this.#authHintLogged = false;
         this.#log('debug', 'telemetry batch accepted', {
           events: eventCount,
           status: response.status,
@@ -1613,13 +1784,20 @@ export class DebuggenSpanProcessor implements SpanProcessor {
    * Decide what a non-`2xx` status means for the batch, and tell the developer
    * once when there is something they can do about it.
    *
+   * Every member of {@link AUTH_REJECTED_STATUSES} — `401` and `403` alike —
+   * stops the transport rather than merely abandoning the batch it arrived on.
+   * `'permanent'` describes *this batch*; the latch describes the process, and
+   * without it the warning below would promise something no code kept: the
+   * drain would arm its next window and post the next batch to the endpoint
+   * that had just refused the credential, for as long as the dev server ran.
+   *
    * @param status The response status.
    * @param eventCount Events in the rejected batch, for diagnostics only.
    */
   #classifyRejection(status: number, eventCount: number): PostOutcome {
     if (AUTH_REJECTED_STATUSES.has(status)) {
-      if (!this.#authHintLogged) {
-        this.#authHintLogged = true;
+      if (!this.#credentialRejected) {
+        this.#credentialRejected = true;
         // The one hint that leads somewhere: a server-agent credential is
         // scoped to one project and expires with the process it was minted
         // for, so a rejected one means this dev server is no longer the one the

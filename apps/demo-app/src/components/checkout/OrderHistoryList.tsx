@@ -1,12 +1,25 @@
 /**
  * Lumen Supply - the order history.
  *
- * The collection around the rows: the heading and the result count, the visible column-header
- * strip, the `<ul>` that holds one `./OrderHistoryRow` per order, the pager, and the block that
- * stands in for all of it when a customer has not ordered anything yet. One row is
- * `./OrderHistoryRow`'s `<li>`; the hairline between rows, the strip's tracks and the pager's
- * chrome are `./OrderHistoryList.module.css`'s. This is the same split the cart group draws
- * between its line list and its line row.
+ * The collection around the rows: the heading and the result count, the line that says a filter is
+ * narrowing the list, the visible column-header strip, the `<ul>` that holds one
+ * `./OrderHistoryRow` per order, the pager, and the block that stands in for the rows when this
+ * page of the listing holds none. One row is `./OrderHistoryRow`'s `<li>`; the hairline between
+ * rows, the strip's tracks and the pager's chrome are `./OrderHistoryList.module.css`'s. This is
+ * the same split the cart group draws between its line list and its line row.
+ *
+ * THREE WAYS TO BE EMPTY, AND A WAY OUT OF TWO OF THEM
+ * An empty page of orders is not one situation. The account may never have ordered; a filter may
+ * have matched none of the orders it does have; or the address may name a page past the end of a
+ * listing that matched plenty. The payload distinguishes them - `total` counts what the query
+ * matched, not what this page carries - so the block below says which one it is and offers the
+ * corresponding way out: the unfiltered listing, or the first page. Saying "no orders yet" to a
+ * customer holding nine of them, which one sentence for all three cases amounts to, is simply
+ * untrue, and the result count printed directly above it says as much.
+ *
+ * The pager takes no part in that: it states which page of rows the reader is on, and a window
+ * past the end of the listing is on no page at all, so it stays with the rows and the blank slate
+ * carries the route back.
  *
  * A SERVER COMPONENT, AND WHY PAGING IS LINKS
  * There is no client-component directive here, no hook of any kind, no state, no effect, no event
@@ -51,7 +64,11 @@
  * would otherwise be announced as four loose words with no relationship to anything. The pager is
  * a labelled `<nav>` landmark, each direction extends its visible word with screen-reader-only
  * text so it is announced as "Previous page" rather than "Previous", and the position is stated in
- * words beside the links rather than left to their colour. Focus rings belong to the stylesheets.
+ * words beside the links rather than left to their colour - carrying `aria-current="page"` to mark
+ * it as the place in the sequence, and `role="status"` so that turning a page, which replaces the
+ * list without moving focus, is announced rather than silent. That is the same treatment the
+ * inventory dashboard's pager gives its own indicator, so the two pagers in this application
+ * behave alike. Focus rings belong to the stylesheets.
  */
 
 import clsx from 'clsx';
@@ -70,11 +87,14 @@ import styles from './OrderHistoryList.module.css';
 /** The heading a caller that has nothing more specific to say gets. */
 const DEFAULT_HEADING = 'Your orders';
 
-/** Where an order's own page lives, and where a page of this list lives. */
-const DEFAULT_HREF_BASE = '/orders';
+/** Where a page of this list lives, and so what the pager rewrites the page parameter of. */
+const DEFAULT_PAGE_HREF_BASE = '/orders';
 
 /** The query parameter the pager rewrites, leaving every other one exactly as the reader left it. */
 const PAGE_PARAM = 'page';
+
+/** The page a listing returns to from a page past its end, and from a cleared filter. */
+const FIRST_PAGE = 1;
 
 /**
  * The strip's labels, in the order `OrderHistoryList.module.css` places them - the same order a row
@@ -86,10 +106,38 @@ const COLUMN_LABELS = ['Order', 'Status', 'Items', 'Total'] as const;
 /** The accessible name of the paging landmark. */
 const PAGER_LABEL = 'Order history pages';
 
-/** The empty state's heading, and the sentence under it. */
-const EMPTY_HEADING = 'No orders yet';
-const EMPTY_BODY =
+/**
+ * The three ways this page of the list can be empty, in the words each one needs.
+ *
+ * They are told apart rather than collapsed into one sentence because they leave the reader three
+ * different things to do. An account that has never ordered is told how the history fills up. A
+ * filter that matched nothing is told the filter is why, and handed the way to drop it - the
+ * alternative, telling a customer with nine orders that they have never placed one, is simply
+ * false, and the result count printed directly above says as much. An address that ran off the end
+ * of a listing is told how many orders the history does hold and that the page it named holds none
+ * of them, which is the sentence the inventory dashboard's table uses for the same situation, and
+ * is handed the way back to the first page.
+ *
+ * The past-end sentence is assembled at render time because it quotes two figures, so it lives
+ * with the arithmetic rather than here.
+ */
+const EMPTY_HEADING_NEVER_ORDERED = 'No orders yet';
+const EMPTY_BODY_NEVER_ORDERED =
   'Orders placed from this account appear here, newest first, with what each one cost and how far along it is. Add something to your cart from the catalog to place the first one.';
+
+const EMPTY_HEADING_NO_MATCHES = 'No orders match this filter';
+const EMPTY_BODY_NO_MATCHES =
+  'This account has no orders in the state the filter selects. Clearing it lists the whole history again, newest first.';
+
+const EMPTY_HEADING_PAST_END = 'That page is past the end of this history';
+
+/** The two recovery controls, worded as the destination rather than as the act. */
+const CLEAR_FILTER_LABEL = 'Clear filter';
+const FIRST_PAGE_LABEL = 'Go to the first page';
+
+/** The sentence that says a filter is narrowing the list, around the value it is narrowed to. */
+const FILTER_PREFIX = 'Showing ';
+const FILTER_SUFFIX = ' orders only.';
 
 /**
  * Alternative text for the empty state's illustration.
@@ -171,39 +219,61 @@ interface Props {
   heading?: string | undefined;
 
   /**
-   * The path an order's own page hangs off, forwarded to each row, which appends the order's
-   * identifier to it.
-   *
-   * @default '/orders'
-   */
-  hrefBase?: string | undefined;
-
-  /**
-   * The path this list is served from, which the pager rewrites the `page` parameter of. It is
-   * separate from `hrefBase` because a list embedded somewhere other than the orders page still
-   * links each row to the order's own page under `/orders`.
+   * The path this list is served from, which the pager rewrites the `page` parameter of, and which
+   * the recovery control of a page past the end returns to the first page of.
    *
    * @default '/orders'
    */
   pageHrefBase?: string | undefined;
+
+  /**
+   * What the listing is filtered to, in the reader's words - the name of an order state, not the
+   * parameter's value - or left out when nothing is filtered.
+   *
+   * It is the caller's to word because the query vocabulary is the caller's: the page that parsed
+   * `?status=PAID` is the one that knows it means "Paid", and a list handed the raw value would
+   * either print it as it arrived or have to learn this store's status names. Supplying it is what
+   * makes a narrowed listing say why it is short - "2 orders / Showing paid orders only" - rather
+   * than leaving the reader to wonder where the other seven went.
+   */
+  filterLabel?: string | undefined;
+
+  /**
+   * Where the filter is cleared: the same listing with no filter on it, from its first page.
+   * Rendered as the control at the end of the filter sentence, and as the empty state's recovery
+   * control when the filter is what emptied the list. Leave it out and the filter is stated
+   * without a way to drop it, which is the right behaviour for a caller whose filter is not
+   * expressed in the address.
+   */
+  clearFilterHref?: string | undefined;
 
   /** The placing page's own class, for the geometry a list cannot know about. */
   className?: string | undefined;
 }
 
 /**
- * Render a page of the order history, or the block that says there is nothing in it yet.
+ * Render a page of the order history, or the block that says why this page of it holds nothing.
  *
  * @example
  * // On the orders page, from the payload the route already resolved.
  * <OrderHistoryList orders={page} referenceIso={renderedAt} />
+ *
+ * @example
+ * // The same listing narrowed to one order state, able to say so and to offer the way back.
+ * <OrderHistoryList
+ *   orders={page}
+ *   pageHrefBase="/orders?pageSize=20&status=PAID"
+ *   filterLabel="Paid"
+ *   clearFilterHref="/orders?pageSize=20"
+ * />
  */
 export function OrderHistoryList({
   orders,
   referenceIso,
   heading = DEFAULT_HEADING,
-  hrefBase = DEFAULT_HREF_BASE,
-  pageHrefBase = DEFAULT_HREF_BASE,
+  pageHrefBase = DEFAULT_PAGE_HREF_BASE,
+  filterLabel,
+  clearFilterHref,
   className,
 }: Props): ReactElement {
   const items = orders.items;
@@ -221,9 +291,70 @@ export function OrderHistoryList({
   const total = Math.max(items.length, Math.trunc(Math.max(0, finiteOr(orders.total, 0))));
 
   const pageCount = Math.max(1, Math.ceil(total / safePageSize));
-  const currentPage = Math.min(Math.max(1, Math.trunc(finiteOr(orders.page, 1))), pageCount);
+
+  /*
+   * The page the address asked for, and the page the rows in hand are actually a page of. They are
+   * kept apart because each answers a different question: the request's own number is what the
+   * blank slate has to quote back - "none of them are on page 9,999" is the sentence that explains
+   * an empty window - while the pager, which only ever describes a page that has rows, wants the
+   * number clamped to a page that exists.
+   */
+  const requestedPage = Math.max(1, Math.trunc(finiteOr(orders.page, 1)));
+  const currentPage = Math.min(requestedPage, pageCount);
 
   const count = `${formatQuantityLabel(total)} ${total === 1 ? 'order' : 'orders'}`;
+
+  /*
+   * Which of the three empty situations this is, and the words and the way out that follow from
+   * it. The question is decided by the payload's own count rather than by the emptiness of the
+   * page: a query that matched orders the requested window lies past is a different situation from
+   * one that matched none, and a filter that matched none is different again from an account that
+   * has never ordered.
+   *
+   * Only the first two have a way out, and both destinations are real addresses, so both controls
+   * are anchors carrying this module's own chip class - `../ui/Button` renders a `<button>`, which
+   * this server component has no handler for. The third passes none: its sentence names the
+   * catalog, the site header links to it from every page, and a control repeating that would be a
+   * third route to the same place.
+   */
+  let emptyHeading = EMPTY_HEADING_NEVER_ORDERED;
+  let emptyBody = EMPTY_BODY_NEVER_ORDERED;
+  let emptyAction: ReactElement | undefined;
+  let clearedFromEmptyState = false;
+
+  if (total > 0) {
+    emptyHeading = EMPTY_HEADING_PAST_END;
+    emptyBody = `The history holds ${count}, but none of them are on page ${formatQuantityLabel(requestedPage)}.`;
+    emptyAction = (
+      <Link className={styles.action} href={hrefForPage(pageHrefBase, FIRST_PAGE)}>
+        {FIRST_PAGE_LABEL}
+      </Link>
+    );
+  } else if (filterLabel !== undefined) {
+    emptyHeading = EMPTY_HEADING_NO_MATCHES;
+    emptyBody = EMPTY_BODY_NO_MATCHES;
+
+    if (clearFilterHref !== undefined) {
+      emptyAction = (
+        <Link className={styles.action} href={clearFilterHref}>
+          {CLEAR_FILTER_LABEL}
+        </Link>
+      );
+      clearedFromEmptyState = true;
+    }
+  }
+
+  /*
+   * One control per job on screen. The filter line always states the filter, but it carries the
+   * control to drop it only when nothing below is already offering the same address under the same
+   * label - otherwise the filtered-empty screen would show "Clear filter" twice, pointing at one
+   * destination, styled as two different kinds of control. The blank slate keeps it in that case,
+   * because it is the block the reader is looking at; a listing showing rows has no blank slate, so
+   * the line keeps it there. A window past the end of a *filtered* listing keeps both, and has to:
+   * the blank slate's control goes to the first page of the filter, and dropping the filter
+   * altogether is then only offered by the line.
+   */
+  const clearOnFilterLine = clearFilterHref !== undefined && !clearedFromEmptyState;
 
   return (
     <section className={clsx(styles.root, className)} aria-label={heading}>
@@ -232,20 +363,48 @@ export function OrderHistoryList({
         <p className={styles.count}>{count}</p>
       </div>
 
+      {/*
+        Rendered whenever a filter is narrowing the list, empty or not: a reader looking at two of
+        this account's nine orders is owed the reason as much as a reader looking at none of them.
+        The sentence is plain text around the emphasised value, and the control at the end of it is
+        the same address the empty state offers.
+      */}
+      {filterLabel === undefined ? null : (
+        <p className={styles.filterBar}>
+          <span>
+            {FILTER_PREFIX}
+            {/*
+              `toLowerCase` rather than `toLocaleLowerCase`: the word sits mid-sentence, so it is
+              lower-cased for grammar rather than for a reader's locale, and the locale-sensitive
+              form would fold an `I` differently on a Turkish host than on any other - exactly the
+              kind of ambient input `@/lib/format` pins its own locale to keep out.
+            */}
+            <span className={styles.filterValue}>{filterLabel.toLowerCase()}</span>
+            {FILTER_SUFFIX}
+          </span>
+          {clearOnFilterLine && clearFilterHref !== undefined ? (
+            <Link className={styles.filterClear} href={clearFilterHref}>
+              {CLEAR_FILTER_LABEL}
+              <VisuallyHidden>{` (${filterLabel})`}</VisuallyHidden>
+            </Link>
+          ) : null}
+        </p>
+      )}
+
       {items.length === 0 ? (
         /*
          * `.empty` is placement - it centres the block and gives it its block margin - so it goes
          * on a wrapper rather than on `BlankSlate`, whose own module owns the column the
-         * illustration, heading and sentence are stacked in.
-         *
-         * No `action`: this file has no token-styled anchor of its own (`.pagerLink` is the
-         * pager's, and `ui/Button` renders a `<button>`), so a control here would be either an
-         * unstyled link or a class used against its stated purpose. The sentence names the
-         * catalog, and the site header links to it from every page.
+         * illustration, heading, sentence and control are stacked in.
          */
         <div className={styles.empty}>
-          <BlankSlate art="empty-orders" alt={EMPTY_ART_ALT} heading={EMPTY_HEADING}>
-            {EMPTY_BODY}
+          <BlankSlate
+            art="empty-orders"
+            alt={EMPTY_ART_ALT}
+            heading={emptyHeading}
+            action={emptyAction}
+          >
+            {emptyBody}
           </BlankSlate>
         </div>
       ) : (
@@ -268,19 +427,33 @@ export function OrderHistoryList({
                * an array index is not, since the same row appears at a different offset as newer
                * orders arrive.
                */
-              <OrderHistoryRow
-                key={order.id}
-                order={order}
-                referenceIso={referenceIso}
-                hrefBase={hrefBase}
-              />
+              <OrderHistoryRow key={order.id} order={order} referenceIso={referenceIso} />
             ))}
           </ul>
 
-          {/* Rendered only when there is more history than one page holds. */}
+          {/*
+            Rendered only when there is more history than one page holds, and only beside rows: the
+            pager states which page the reader is on, and a window past the end of the listing is
+            not on a page at all - "Page 3 of 3" printed over no rows would be a position the list
+            is not in, and its Previous would lead past the very page it claimed. The way back from
+            there is the blank slate's own control instead.
+          */}
           {pageCount > 1 ? (
             <nav className={styles.pager} aria-label={PAGER_LABEL}>
-              <p className={styles.pagerStatus}>
+              {/*
+            `aria-current="page"` marks this as the position in the sequence the two anchors move
+            through, which is what the inventory dashboard's pager does with its own indicator, and
+            `role="status"` makes the change audible: a page turn here is a client-side navigation
+            that swaps the list in place, so without a live region a screen-reader user activates
+            Next and is told nothing. `aria-live` is stated alongside the role it is implied by, as
+            every live region in this application states it.
+          */}
+              <p
+                className={styles.pagerStatus}
+                role="status"
+                aria-live="polite"
+                aria-current="page"
+              >
                 {`Page ${formatQuantityLabel(currentPage)} of ${formatQuantityLabel(pageCount)}`}
               </p>
 

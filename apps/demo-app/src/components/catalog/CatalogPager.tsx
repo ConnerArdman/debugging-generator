@@ -2,7 +2,6 @@
 
 import clsx from 'clsx';
 import Link from 'next/link';
-import { usePathname, useSearchParams } from 'next/navigation';
 
 import { VisuallyHidden } from '@/components/ui/VisuallyHidden';
 import { formatQuantityLabel } from '@/lib/format';
@@ -12,11 +11,27 @@ import styles from './CatalogPager.module.css';
 /*
  * CatalogPager - the catalog's page navigation.
  *
- * This is the one file in the catalog folder that knows how a page is addressed. Everything else
- * receives the page it is showing as data; this component turns that page into links, by rewriting
- * a single query parameter - `page` - and preserving every other one exactly as the reader left it.
- * A category filter, a search term and a sort order therefore survive a page change without this
- * file having to know that any of them exist.
+ * Everything this component draws, it is handed. The page it is showing arrives as `page`,
+ * `pageSize` and `total`, and the address of any other page arrives as `hrefForPage`, a function
+ * the catalog surface supplies. This file reads neither the path nor the query string, so it never
+ * learns what a reader typed into the address bar - only what the server made of it. A category
+ * filter, a search term, a sort order and a page size still survive a page change, because the
+ * query those links are built from carries them; this file simply does not have to know that any
+ * of them exist.
+ *
+ * Why the addresses arrive as a function instead of being read from the URL here
+ * -----------------------------------------------------------------------------
+ * Because a link must never be able to ask for a query the server has already refused. The catalog
+ * recovers such an address parameter by parameter: an unparseable one is dropped on its own, every
+ * other parameter of that address is applied as it stands, and the reader is told in the page which
+ * part did not take effect. A pager that copied the current query string and rewrote `page` in it -
+ * which is what this file used to do - would copy the refused parameter into every one of its links
+ * and so carry it forward for the rest of the reader's visit, to be stripped and reported again on
+ * every page change: the notice above the grid would never clear, and the address the reader
+ * copied, bookmarked or shared would keep a parameter this catalog has already said it cannot use.
+ * `hrefForPage` is built from the query the server actually validated and answered with, so every
+ * destination in this row is a listing the server has already agreed to, stated in the parameters
+ * it agreed to - the refused one is left behind at the first page change rather than inherited.
  *
  * Why anchors rather than a router call
  * ------------------------------------
@@ -28,17 +43,21 @@ import styles from './CatalogPager.module.css';
  *
  * The two unavailable directions - Previous on the first page, Next on the last - render as inert
  * `<span>`s instead. A `<span>` has no activation behaviour at all, so there is nothing to
- * intercept, no tab stop to remove and no `aria-disabled` promise the markup cannot keep; the
- * stylesheet's `pointer-events: none` states the same thing to a mouse. They are rendered rather
- * than omitted so the row keeps its shape as the reader moves through the pages.
+ * intercept and no tab stop to remove: it is already unreachable by keyboard and unactivatable by
+ * pointer, which is why `aria-disabled` here is a promise the markup keeps. It carries a link role
+ * alongside that attribute so the annotation has something to annotate - without a role the node
+ * reaches assistive technology as bare static text, and "unavailable link" degrades into an
+ * unexplained word beside the numbers. The stylesheet carries the matching visual cue. Both are
+ * rendered rather than omitted so the row keeps its shape as the reader moves through the pages.
  *
  * What it holds
  * -------------
- * No state. `usePathname` and `useSearchParams` are the only hooks it calls, and both are reads of
- * the route the application is already on; the props carry everything else. The output is a pure
- * function of those two reads and of `page`, `pageSize` and `total`, with no clock, no randomness
- * and no locale-sensitive formatting of its own - `@/lib/format` owns the one number format used
- * here - so the server and client markup of any given URL always agree.
+ * No state, and no hook of any kind: the props carry everything, and the output is a pure function
+ * of `page`, `pageSize`, `total` and `hrefForPage`, with no clock, no randomness, no read of the
+ * address or the document, and no locale-sensitive formatting of its own - `@/lib/format` owns the
+ * one number format used here - so the server and client markup of any given URL always agree.
+ * `'use client'` is still declared because `hrefForPage` is a function prop, which only a client
+ * component may be handed.
  *
  * Defensive arithmetic
  * --------------------
@@ -124,9 +143,12 @@ function buildPageWindow(current: number, pageCount: number): readonly PageWindo
 }
 
 /**
- * Props of {@link CatalogPager}. The three fields are the `page`, `pageSize` and `total` of the
- * `PagedList<T>` the catalog is showing, passed straight through: the pager reports the page the
- * list actually returned rather than re-deriving one from the URL, so the two can never disagree.
+ * Props of {@link CatalogPager}.
+ *
+ * The first three are the `page`, `pageSize` and `total` of the `PagedList<T>` the catalog is
+ * showing, passed straight through: the pager reports the page the list actually returned rather
+ * than re-deriving one from the URL, so the two can never disagree. The fourth is how a page is
+ * addressed, which for the same reason is not derived here either.
  */
 export interface CatalogPagerProps {
   /** The 1-based page the list returned. */
@@ -135,6 +157,15 @@ export interface CatalogPagerProps {
   pageSize: number;
   /** How many items the query matched across every page. */
   total: number;
+  /**
+   * The address of a given 1-based page of the listing on screen.
+   *
+   * Required rather than optional, and a function rather than a template, because the caller is the
+   * only party that holds the query the listing was actually read under - the validated one - and a
+   * link built from anything else can address a query the server refuses. It is called once per
+   * rendered control and must be a pure function of its argument: no state is kept between calls.
+   */
+  hrefForPage: (page: number) => string;
 }
 
 /**
@@ -144,39 +175,21 @@ export interface CatalogPagerProps {
  *
  * @example
  * ```tsx
- * <CatalogPager page={result.page} pageSize={result.pageSize} total={result.total} />
+ * <CatalogPager
+ *   page={result.page}
+ *   pageSize={result.pageSize}
+ *   total={result.total}
+ *   hrefForPage={hrefForCatalogPage}
+ * />
  * ```
  */
-export function CatalogPager({ page, pageSize, total }: CatalogPagerProps) {
-  const pathname = usePathname();
-  // `routeSearchParams` rather than the obvious short name: `scripts/check-no-hardcoding.mjs`
-  // harvests this application's declared names into a policy that no file of the debugging product
-  // may then use, and the short name is one any URL-handling module of that product would reach
-  // for. The longer name costs nothing here and keeps that vocabulary free.
-  const routeSearchParams = useSearchParams();
-
+export function CatalogPager({ page, pageSize, total, hrefForPage }: CatalogPagerProps) {
   const safePageSize = Math.max(1, Math.trunc(finiteOr(pageSize, 0)));
   const pageCount = Math.max(1, Math.ceil(Math.max(0, finiteOr(total, 0)) / safePageSize));
   const currentPage = Math.min(Math.max(1, Math.trunc(finiteOr(page, 1))), pageCount);
 
   if (pageCount <= 1) {
     return null;
-  }
-
-  /**
-   * The URL of `target`, with every query parameter of the current URL kept as it is and only
-   * `page` rewritten.
-   *
-   * The copy is deliberate: `useSearchParams` hands back a read-only view whose mutators throw, so
-   * the parameters are re-parsed into a `URLSearchParams` of this component's own. `page` is set
-   * rather than appended, which replaces an existing value instead of adding a second one.
-   */
-  function hrefForPage(target: number): string {
-    const params = new URLSearchParams(routeSearchParams.toString());
-    params.set('page', String(target));
-    const query = params.toString();
-
-    return query.length > 0 ? `${pathname}?${query}` : pathname;
   }
 
   const pageWindow = buildPageWindow(currentPage, pageCount);
@@ -189,7 +202,11 @@ export function CatalogPager({ page, pageSize, total }: CatalogPagerProps) {
           <VisuallyHidden>{' page'}</VisuallyHidden>
         </Link>
       ) : (
-        <span className={styles.disabled} aria-disabled="true">
+        // A link that is not available, rather than a word: the role gives `aria-disabled`
+        // something to annotate, so the strip is announced as "Previous page, link, unavailable"
+        // instead of leaving the label loose in the text. No `tabIndex` and no handler, because a
+        // control nothing can reach and nothing can activate is the whole point of the <span>.
+        <span className={styles.disabled} role="link" aria-disabled="true">
           Previous
           <VisuallyHidden>{' page'}</VisuallyHidden>
         </span>
@@ -224,7 +241,8 @@ export function CatalogPager({ page, pageSize, total }: CatalogPagerProps) {
           <VisuallyHidden>{' page'}</VisuallyHidden>
         </Link>
       ) : (
-        <span className={styles.disabled} aria-disabled="true">
+        // Unavailable on the last page, annotated exactly as Previous is on the first.
+        <span className={styles.disabled} role="link" aria-disabled="true">
           Next
           <VisuallyHidden>{' page'}</VisuallyHidden>
         </span>

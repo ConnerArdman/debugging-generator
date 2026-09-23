@@ -725,6 +725,32 @@ export interface SymbolNodeData {
    * `default as` form actually points at.
    */
   readonly isDefaultExport: boolean;
+
+  /**
+   * The named declarations this one is nested inside, outermost first.
+   *
+   * **Present ⇒ the declaration is nested inside another declaration**, and can
+   * therefore not be imported by another module: the name exists only within
+   * the enclosing body. That is the fact a planner needs, because a
+   * `(file, symbol)` instrumentation action *can* address such a declaration —
+   * the function-timing patcher resolves it at any depth — while nothing may
+   * treat it as an export, and a bare name occurring in two nested scopes of one
+   * file has to be qualified (`CheckoutForm.submitOrder`) to name one of them.
+   *
+   * Each entry is the name of one enclosing declaration — a function, a class, a
+   * class member, or the variable or property a function was assigned to —
+   * ordered outermost → innermost, so the last entry is the innermost *named*
+   * declaration containing this one. An anonymous scope in between contributes
+   * nothing, which is why `[]` is a meaningful value rather than a gap: the
+   * declaration *is* nested, and nothing enclosing it has a name to report (a
+   * function declared inside an anonymous callback).
+   *
+   * **Absent ⇒ module scope or a class member** — the two forms that are
+   * reachable from outside their own body: a module-level declaration under its
+   * own name, a class member through the class {@link CodeNodeBase.symbol}
+   * names.
+   */
+  readonly enclosing?: readonly string[];
 }
 
 /**
@@ -766,6 +792,28 @@ export interface ComponentNodeData {
    * identifier, and this is the side of the pair that matches the runtime.
    */
   readonly displayName: string;
+
+  /**
+   * The name of the module-level declaration this component **wraps**, when it
+   * is a wrapper around a separately declared function.
+   *
+   * Present only for the referenced wrapper form — `const Widget =
+   * memo(WidgetBody)`, where `WidgetBody` is a declaration of the same module
+   * and therefore has a `component` node of its own — and absent for every
+   * other component, including a wrapper around an inline function
+   * (`memo(() => …)`, `memo(function Inner() {…})`), whose body has no separate
+   * declaration to name.
+   *
+   * It exists because a memoised component is known by two names and a runtime
+   * render event carries only one of them: the exported binding is what other
+   * modules render and what a `renders` edge points at, while the
+   * implementation is what React falls back to for a display name when the
+   * wrapper carries no explicit one. Recording the link lets
+   * `./query.ts`'s `componentsRendering` answer for either name, so the
+   * `'code-graph'` resolution route reaches the declaration whichever half the
+   * evidence names.
+   */
+  readonly implementation?: string | undefined;
 }
 
 /**
@@ -804,7 +852,12 @@ export interface HandlerNodeData {
    * function-level timing and covered by the runtime interaction hook instead.
    * `false` for a reference to a named function, which is the case that check
    * cares about — and in that case {@link CodeNodeBase.symbol} names the
-   * function to look for.
+   * function to look for, *where this file declares it*. Where the reference
+   * resolved to a parameter or to a destructured binding instead — a handler
+   * handed down as a prop (`onClick={props.onSelect}`) — the field is absent,
+   * because the function is declared in the caller and no `(file, symbol)`
+   * action naming this file could reach it; the node still records the binding,
+   * its event and its position.
    */
   readonly inline: boolean;
 }

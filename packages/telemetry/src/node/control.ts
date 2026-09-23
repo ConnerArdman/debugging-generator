@@ -1269,6 +1269,26 @@ export interface ControlFlushTarget {
    * shutdown and never sent. Optional for the same reason as `reopen`.
    */
   readonly isShutDown?: boolean;
+
+  /**
+   * Whether the **ingest endpoint** refused this process's credential, which
+   * stops server-side telemetry until the dev server is relaunched.
+   *
+   * `DebuggenSpanProcessor` latches this on a `401`/`403` answer to
+   * `POST /telemetry/ingest` and never clears it — not on `reopen()`, so not on
+   * a capture re-arm either — because the server-agent credential is minted per
+   * dev-server launch and scoped to one project root (AAP §0.5.6). Read here so
+   * the condition is *reportable*: it is republished as
+   * {@link ServerAgentControlStats.ingestCredentialRejected}, which is how a
+   * session can say "relaunch required" instead of showing a capture that is
+   * armed, recording and delivering nothing.
+   *
+   * Optional for the same reason as `reopen` and `isShutDown`: a flush-only
+   * fake stays a flush-only fake, and one that does not implement it is
+   * reported as `false` — the honest reading for a target that has no ingest
+   * transport of its own to have had refused.
+   */
+  readonly credentialRejected?: boolean;
 }
 
 /** The `data` member is all this module reads from an inbound message event. */
@@ -1725,8 +1745,37 @@ export interface ServerAgentControlStats {
    * rather than losing it.
    */
   readonly pendingCleanup: readonly CaptureResource[];
-  /** Whether the service refused the credential with 4401. */
+  /**
+   * Whether the service refused the credential on the **control socket**, with
+   * close code 4401.
+   *
+   * The socket half of a pair, and the two are independent readings of one
+   * credential. This one means no capture instruction will ever arrive, because
+   * the WebSocket handshake was refused; {@link ingestCredentialRejected} means
+   * no telemetry will ever be accepted, because the HTTP ingest endpoint
+   * refused a batch. Either can be `true` without the other — the socket is
+   * authenticated once at `client.hello` while ingest is authenticated per
+   * request — and both are terminal for the process (AAP §0.5.6: a rotated or
+   * revoked credential requires the dev server to be relaunched).
+   */
   readonly credentialRejected: boolean;
+  /**
+   * Whether the **ingest endpoint** refused the credential, as the attached
+   * span processor reports it.
+   *
+   * `true` means the preload has stopped converting, buffering and posting
+   * server-side telemetry for the life of this process: see
+   * {@link ControlFlushTarget.credentialRejected}, which this member
+   * republishes. `false` while nothing is attached, or while the attached
+   * target does not implement the member — the flush-only fakes of
+   * `./control.test.ts` among them.
+   *
+   * Reported separately from {@link credentialRejected} rather than folded into
+   * it, because they answer different questions about a degraded session and
+   * the remedy is only the same by coincidence: this one is why a capture that
+   * looks armed yields no server evidence.
+   */
+  readonly ingestCredentialRejected: boolean;
   /** Whether {@link ServerAgentControl.dispose} has run. */
   readonly disposed: boolean;
   /** Whether a reconnect timer is pending. */
@@ -2059,6 +2108,11 @@ export class ServerAgentControl implements CaptureGate {
       cleanupStatus: this.#cleanupStatus,
       pendingCleanup: this.#pendingCleanup(),
       credentialRejected: this.#credentialRejected,
+      // The processor's own latch, not this object's: `register.ts` attaches the
+      // real `DebuggenSpanProcessor`, so the ingest endpoint's answer is
+      // readable here. A target that does not implement the member — every
+      // flush-only fake — reads `false`.
+      ingestCredentialRejected: this.#processor?.credentialRejected === true,
       disposed: this.#disposed,
       reconnectPending: this.#reconnectTimer !== undefined,
       reconnectDelayMs: this.#reconnectDelayMs,

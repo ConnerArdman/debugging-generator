@@ -26,6 +26,12 @@
  * a default, and an unknown parameter is stripped rather than rejected, so the
  * bodies the storefront actually posts all address this session's cart.
  *
+ * A session that has no cart is not a failed request either: the service opens
+ * one and the change is applied to it, so the first product a visitor adds -
+ * and the first product added after the last cart became an order - lands in a
+ * cart rather than being refused. The only state that answers `404` for the
+ * cart itself is a cart a checkout is holding.
+ *
  * The cart is serialized exactly as the service built it, and the service reads
  * it back after the write, so a browser is answered with the cart as the
  * database now holds it. Money is already an integer count of cents in its
@@ -44,7 +50,7 @@
  */
 
 import type { CartMutation, CartView } from '@/lib/types';
-import { StorefrontValidationError, storefrontErrorResponse } from '@/server/errors';
+import { readStorefrontJsonBody, storefrontErrorResponse } from '@/server/errors';
 import {
   addCartLine,
   clearCartLines,
@@ -72,12 +78,14 @@ const UNREADABLE = 'The cart request body could not be read as JSON.';
  * read for the cart's session token, which the query schema resolves to this
  * session's cart when the request names none.
  * @returns `200` with the cart's `CartView` as it stands after the change, or
- * the mapper's failure envelope - `400` when the body is not readable JSON or
- * does not match the schema, `404` when the token addresses no open cart, when
- * no product owns the identifier a change named, or when this cart holds no line
- * with the identifier a change named, `409` when the units asked for would take
- * a line past the most one line may hold, and a single generic `500` for
- * anything unaccounted for.
+ * the mapper's failure envelope - `415` when the body was not declared as
+ * `application/json`, `413` when it carries more bytes than this store reads,
+ * `400` when the body is not readable JSON or does not match the schema, `404`
+ * when a checkout is holding this session's cart, when no product owns the
+ * identifier a change named, or when this cart holds no line with the
+ * identifier a change named, `409` when the units asked for would take a line
+ * past the most one line may hold, and a single generic `500` for anything
+ * unaccounted for.
  */
 export async function POST(request: Request): Promise<Response> {
   try {
@@ -85,15 +93,13 @@ export async function POST(request: Request): Promise<Response> {
       Object.fromEntries(new URL(request.url).searchParams),
     );
 
-    let payload: unknown;
-
-    try {
-      payload = await request.json();
-    } catch (cause) {
-      // An empty or malformed body is the caller's mistake, so it is reported as
-      // the validation failure it is rather than as a failure of this endpoint.
-      throw new StorefrontValidationError(UNREADABLE, { cause });
-    }
+    // Read through the one guarded reader in `@/server/errors` rather than with
+    // `request.json()`: a body that was not declared as JSON is refused with 415
+    // and one past the store's byte ceiling with 413, both before anything is
+    // parsed and before this cart is touched, and an empty or malformed body
+    // comes back as the validation failure it is - the caller's mistake rather
+    // than a failure of this endpoint.
+    const payload: unknown = await readStorefrontJsonBody(request, { unreadable: UNREADABLE });
 
     // Parsing throws, and the rejection names every field at fault: the single
     // mapper behind `storefrontErrorResponse` turns it into the same 400 every

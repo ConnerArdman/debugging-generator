@@ -56,14 +56,22 @@
   }
 }
 
-/* The column's heading element. Its weight and line height come from the element baseline; the
- * size, the colour and the step of air beneath it are stated here so the block reads as a column
- * head rather than a page section title. */
+/* The column's heading element. Its weight comes from the element baseline; the size, the colour
+ * and the step of air beneath it are stated here so the block reads as a column head rather than a
+ * page section title.
+ *
+ * The leading is stated too, as `--ls-leading-heading`, rather than left to be inherited. Relying
+ * on the baseline is what let this heading drift apart from its neighbours: the panel took the
+ * baseline's 1.25 while the form beside it and the order history declared 1.3 of their own, so the
+ * same 18px/600/ink `<h2>` was 22.5px tall in one column and 23.4px in the other. Reading the token
+ * here makes the role's leading explicit on every surface that dresses it, so a future module
+ * cannot silently pick a different ratio for it. */
 .heading {
   margin-block-end: var(--ls-space-2, 8px);
   color: var(--ls-text, #0f172a);
   font-size: var(--ls-text-lg, 18px);
   font-weight: 600;
+  line-height: var(--ls-leading-heading, 1.25);
 }
 
 /* Spacing wrapper for the line list. The rule separates the reviewed lines from the heading above

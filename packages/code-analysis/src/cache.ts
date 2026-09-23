@@ -59,15 +59,47 @@
  *
  * ## What invalidates an entry
  *
- * Nothing is compared field by field at read time: invalidation lives entirely
- * in the **key**, which folds in the project root, the TypeScript configuration
- * in force, the indexer's version, the identities of the extractors that ran
- * and the order they ran in, this module's envelope version, the graph
- * vocabulary version and the modification time and size of every indexed file.
- * A tree that has changed in any of those respects asks for a different key,
- * finds nothing and rebuilds. Reading an entry therefore only has to establish
- * that the document is what it claims to be, which is why the checks in
- * {@link IndexCache.load} are structural rather than semantic.
+ * Two mechanisms, and the division between them is deliberate.
+ *
+ * **The key decides what is reachable.** It folds in the project root, the
+ * TypeScript configuration in force, the indexer's version, the identities of
+ * the extractors that ran and the order they ran in, this module's envelope
+ * version, the graph vocabulary version and the modification time and size of
+ * every indexed file. A tree that has changed in any of those respects asks
+ * for a different key, finds nothing and rebuilds — the cheapest correct form
+ * of invalidation, because the stale entry is never even opened.
+ *
+ * **The envelope's stamps decide what is fresh.** `mtimeMs` and `size` are the
+ * only file metadata the key can carry, and a content substitution can preserve
+ * both: `tar -x`, `cp -p`, `rsync --times`, `touch -r` and a hermetic
+ * build-cache restore all write new bytes under an old modification time, and a
+ * replacement body of the same byte length leaves the size alone too. Such a
+ * tree asks for the *same* key and would be served an index describing code
+ * that no longer exists. So {@link IndexCache.save} records a
+ * {@link FileStamp} per indexed file in the envelope and
+ * {@link IndexCache.load} takes the same stamps again and compares them, which
+ * adds the one thing a substitution cannot forge from userspace: the inode's
+ * change time, `ctimeMs`, which the kernel moves on every write to the inode
+ * and which no process can set (with the inode number beside it, so a file
+ * swapped for another by `rename` is caught even where the change times happen
+ * to agree). Any difference is an ordinary miss like every other.
+ *
+ * Three consequences worth stating, because they are what make the
+ * verification affordable:
+ *
+ * - **It is stat-only.** No file is read and nothing is hashed, so the promise
+ *   that a hit is cheap survives: the work is one `stat` per indexed file
+ *   against a rebuild that constructs a ts-morph program and runs every
+ *   extractor — microseconds against seconds.
+ * - **It fails closed.** A `chmod`, a rewrite with identical content, or a
+ *   checkout that changed only the change time all move `ctimeMs` without
+ *   changing what the file says, and each costs one rebuild that produces the
+ *   same index. That is the correct direction for a pure optimisation: a
+ *   spurious miss is slow, a spurious hit is wrong.
+ * - **A synthesised index still round-trips.** A caller may cache an index
+ *   over files that do not exist on disk — a fixture, a projection, a tree that
+ *   has since been removed — and an absent stamp compares equal to an absent
+ *   stamp, so such an entry is stored and served exactly as before.
  *
  * Retention and pruning are **not** this module's responsibility. It never
  * enumerates the directory except when explicitly asked to
@@ -79,6 +111,7 @@
  * @packageDocumentation
  */
 
+import { statSync } from 'node:fs';
 import { readdir, unlink } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -88,11 +121,13 @@ import {
   assert,
   err,
   isErr,
+  isSafeRelativePath,
   joinPosix,
   noopLogger,
   normalizePosix,
   nowEpochMs,
   ok,
+  resolveWithinProject,
   toPosix,
   tryCatch,
 } from '@debuggen/shared';
@@ -139,8 +174,18 @@ import type { CodeIndex, CodeNodeKind, FileFingerprint } from './graph/types.js'
  * with a version *read back from disk* is a real runtime question rather than a
  * comparison the compiler could narrow away, and so that bumping it is a
  * one-character change no consumer's types depend on.
+ *
+ * History, so that the reason for the current value is on the record:
+ *
+ * - `1` — the original envelope: version, key, write time and index.
+ * - `2` — added `stamps`, the per-file change stamps
+ *   {@link IndexCache.load} verifies (see "What invalidates an entry"). The
+ *   persisted document changed shape, so a version-1 entry is missing a field
+ *   this version requires; because the version is folded into the key as well
+ *   as into the envelope, those entries are both unreachable and rejected,
+ *   which is the whole migration.
  */
-export const INDEX_CACHE_SCHEMA_VERSION: number = 1;
+export const INDEX_CACHE_SCHEMA_VERSION: number = 2;
 
 /**
  * The shape of a cache key, and the gate every filesystem operation here passes
@@ -177,7 +222,11 @@ const KEY_DOMAIN = 'debuggen/code-index-cache';
  */
 const ABSENT_SLOT = '';
 
-/** Separates the fields of a fingerprint's sort key; see {@link fingerprintSortKey}. */
+/**
+ * Separates the fields of a composite key built from a path and some numbers —
+ * a fingerprint's ordering key ({@link fingerprintSortKey}) and a stamp's
+ * comparison key ({@link stampKey}).
+ */
 const SORT_KEY_SEPARATOR = '\u0000';
 
 /** The environment variable naming the product's state root, for standalone use. */
@@ -491,10 +540,16 @@ export interface IndexCache {
    * **Never rejects for a filesystem or content problem**, which is the
    * contract the rest of the package is written against. An absent entry, an
    * absent directory, an unparsable document, a stale envelope or vocabulary
-   * version, a document that does not have the shape of an index, a symbolic
-   * link planted at the entry path, a permission error — each is logged and
-   * returns `undefined`. A rejection is only possible for a malformed `key`,
-   * which is a programmer error rather than a state of the disk.
+   * version, a document that does not have the shape of an index, a file whose
+   * change stamp no longer matches the one the entry recorded, a symbolic link
+   * planted at the entry path, a permission error — each is logged and returns
+   * `undefined`. A rejection is only possible for a malformed `key`, which is a
+   * programmer error rather than a state of the disk.
+   *
+   * The freshness half of that list costs one `stat` per indexed file and reads
+   * no file's contents; "What invalidates an entry" in the module
+   * documentation explains why it is there when the key already covers each
+   * file's modification time and size.
    *
    * An entry that is rejected for anything other than being absent is also
    * **removed**, so a corrupt or stale file costs one read once rather than one
@@ -643,11 +698,16 @@ export function createIndexCache(options: IndexCacheOptions): IndexCache {
   const writeEntry = (key: string, index: CodeIndex): Result<void> => {
     assertCacheKey(key);
 
+    // Taken before the document is serialised, and total: `stampFiles` answers
+    // with an absent stamp for every path it cannot screen or cannot stat, so a
+    // project whose files have already been removed is cached rather than
+    // failing to cache. One `stat` per indexed file, no read.
     const entry: IndexCacheEntry = {
       schemaVersion: INDEX_CACHE_SCHEMA_VERSION,
       key,
       writtenAt: nowEpochMs(),
       index,
+      stamps: stampFiles(index),
     };
 
     const written = tryCatch(() => {
@@ -760,7 +820,26 @@ export function createIndexCache(options: IndexCacheOptions): IndexCache {
         return undefined;
       }
 
+      // Freshness, and the one check the key cannot make: a content
+      // substitution that preserved every file's modification time and size
+      // asks for this very key, so the only way to notice it is to take each
+      // file's change stamp again and compare it with the one the entry
+      // recorded. Stat-only and fail-closed; see "What invalidates an entry".
       const { index } = document;
+      const stamps = stampFiles(index);
+      const differences = countStampDifferences(document.stamps, stamps);
+      if (differences > 0) {
+        logger.debug(MISS_MESSAGE, {
+          key,
+          reason: 'stale-file',
+          files: index.files.length,
+          stamps: document.stamps.length,
+          differences,
+        });
+        await removeEntry(key);
+        return undefined;
+      }
+
       logger.debug('code index cache hit', {
         key,
         nodes: index.nodes.length,
@@ -820,9 +899,60 @@ export function createIndexCache(options: IndexCacheOptions): IndexCache {
  * ---------------------------------------------------------------------------------------------- */
 
 /**
+ * What one indexed file looked like to the kernel when the entry was written.
+ *
+ * This module's own private storage shape, deliberately **not**
+ * `FileFingerprint` from `./graph/types.ts`: a fingerprint is part of the
+ * index's public contract and of the cache key, and it carries what the indexer
+ * observed while reading the file. A stamp is the cache's read-time freshness
+ * evidence, it is never hashed into a key, and it carries two fields a
+ * fingerprint has no business holding:
+ *
+ * - `ctimeMs` — the inode's change time. The reason the shape exists: a process
+ *   can set `mtimeMs` to anything (`utimes`, and therefore `tar -x`, `cp -p`,
+ *   `rsync --times`, `touch -r`), and a replacement body of the same byte
+ *   length leaves `size` alone, but nothing in userspace can hold `ctimeMs`
+ *   still across a write. So it is what distinguishes "this file is untouched"
+ *   from "this file was rewritten under its old timestamp".
+ * - `ino` — the inode number, which catches the substitution performed by
+ *   `rename` rather than by writing in place, where the replacement carries its
+ *   own change time that may happen to precede the one recorded here.
+ *
+ * `present` is a field rather than an absent entry so that "the file was not
+ * there when the entry was written" is a state that can compare equal to
+ * itself: an index over files that do not exist on disk must still round-trip
+ * (see "What invalidates an entry"). When it is `false` the four numbers are
+ * zero, so an unreadable file cannot be told apart from a missing one — which
+ * is intentional, because neither is evidence of anything and any *change* in
+ * that state shows up as `present` moving.
+ *
+ * Internal: a version bump is free to change it, and
+ * {@link INDEX_CACHE_SCHEMA_VERSION} is what makes that safe.
+ */
+interface FileStamp {
+  /** The file, project-relative POSIX, exactly as `FileFingerprint.file` spells it. */
+  readonly file: string;
+
+  /** Whether the path resolved inside the project and named a regular file. */
+  readonly present: boolean;
+
+  /** Last-modification time in epoch milliseconds, or `0` when absent. */
+  readonly mtimeMs: number;
+
+  /** Size in bytes, or `0` when absent. */
+  readonly size: number;
+
+  /** Inode change time in epoch milliseconds, or `0` when absent. */
+  readonly ctimeMs: number;
+
+  /** Inode number, or `0` when absent. */
+  readonly ino: number;
+}
+
+/**
  * The document one entry file holds.
  *
- * Four fields, and each is here because reading the file back needs it:
+ * Five fields, and each is here because reading the file back needs it:
  *
  * - `schemaVersion` — the **envelope** version
  *   ({@link INDEX_CACHE_SCHEMA_VERSION}), so a document written by another
@@ -836,6 +966,17 @@ export function createIndexCache(options: IndexCacheOptions): IndexCache {
  *   application vocabulary that `scripts/check-no-hardcoding.mjs` refuses in a
  *   product module, and the field is internal, so the name costs nothing.
  * - `index` — the index itself.
+ * - `stamps` — one {@link FileStamp} per entry of `index.files`, in that order.
+ *   The division of labour with the key: the key carries the project's identity
+ *   and each file's metadata, and this carries the one thing a substitution
+ *   cannot forge from userspace — the inode's change time, and its inode number
+ *   beside it. Without it an entry whose files were rewritten under their old
+ *   modification times and at their old sizes is indistinguishable from a fresh
+ *   one, because those two fields are exactly what the key already agreed on.
+ *   It lives in the envelope rather than in the key because it must be
+ *   *compared*: folding a change time into the key would make every `chmod`
+ *   derive a new key and orphan the old entry instead of replacing it, and
+ *   would leave the entry that is already on disk unexaminable.
  *
  * `indexerVersion` is deliberately **not** repeated here: a
  * {@link CodeIndex} owns that field, and duplicating it would create two
@@ -852,6 +993,7 @@ interface IndexCacheEntry {
   readonly key: string;
   readonly writtenAt: number;
   readonly index: CodeIndex;
+  readonly stamps: readonly FileStamp[];
 }
 
 /**
@@ -886,7 +1028,11 @@ interface IndexCacheEntry {
  * document is an index at all.
  *
  * It also says nothing about *freshness*: whether an index still describes the
- * tree on disk is answered by the key, not by the contents.
+ * tree on disk is not a property of the document at all. Reachability is
+ * answered by the key, and freshness by comparing the envelope's
+ * {@link FileStamp}s with the filesystem — a separate step in
+ * {@link IndexCache.load}, because `mtimeMs` and `size` can both survive a
+ * content substitution and are the only file metadata the key carries.
  *
  * Total: it never throws, and any value — `null`, an array, a string, a
  * revived object with the wrong fields — is simply `false`.
@@ -935,25 +1081,32 @@ function isIndexCacheEntry(value: unknown): value is IndexCacheEntry {
     return false;
   }
 
-  const { schemaVersion, key, writtenAt, index } = value;
+  const { schemaVersion, key, writtenAt, index, stamps } = value;
 
   return (
     isFiniteNumber(schemaVersion) &&
     schemaVersion === INDEX_CACHE_SCHEMA_VERSION &&
     isNonEmptyString(key) &&
     isFiniteNumber(writtenAt) &&
-    isCodeIndex(index)
+    isCodeIndex(index) &&
+    // An entry without a well-formed stamp list is not an entry of this
+    // version: the freshness check has nothing to compare against, and serving
+    // the index anyway would be the very behaviour version 2 exists to end.
+    isUnknownArray(stamps) &&
+    stamps.every(isFileStampShape)
   );
 }
 
 /**
  * The machine-readable reason a parsed document was refused, for the miss log.
  *
- * Three answers, and the distinction is worth the few lines: `schema-version`
+ * Four answers, and the distinction is worth the few lines: `schema-version`
  * is an expected consequence of a version bump and tells a reader nothing is
- * wrong, `malformed-index` points at the index inside the envelope, and
- * `malformed` at the envelope itself. A single "invalid" would leave all three
- * looking like corruption.
+ * wrong, `malformed-index` points at the index inside the envelope,
+ * `malformed-stamps` at the freshness evidence beside it — the one part of the
+ * envelope a hand-edited or truncated document tends to lose while the index
+ * still parses — and `malformed` at the envelope itself. A single "invalid"
+ * would leave all four looking like corruption.
  *
  * @param value The document `isIndexCacheEntry` rejected.
  * @returns The reason, for the log's `reason` field.
@@ -963,12 +1116,15 @@ function rejectionReason(value: unknown): string {
     return 'malformed';
   }
 
-  const { schemaVersion, index } = value;
+  const { schemaVersion, index, stamps } = value;
   if (isFiniteNumber(schemaVersion) && schemaVersion !== INDEX_CACHE_SCHEMA_VERSION) {
     return 'schema-version';
   }
   if (!isCodeIndex(index)) {
     return 'malformed-index';
+  }
+  if (!isUnknownArray(stamps) || !stamps.every(isFileStampShape)) {
+    return 'malformed-stamps';
   }
   return 'malformed';
 }
@@ -1087,6 +1243,34 @@ function isFileFingerprintShape(value: unknown): boolean {
 }
 
 /**
+ * Whether `value` is a usable {@link FileStamp}.
+ *
+ * Every field is required, including the three numbers a stamp for an absent
+ * file carries as zero: a stamp with a field missing cannot be compared, and a
+ * comparison that treated `undefined` as "equal to whatever is there" would
+ * reintroduce exactly the silent hit the stamps exist to prevent.
+ *
+ * @param value One element of a parsed `stamps` array.
+ * @returns `true` when the stamp is comparable.
+ */
+function isFileStampShape(value: unknown): boolean {
+  if (!isRecord(value)) {
+    return false;
+  }
+
+  const { file, present, mtimeMs, size, ctimeMs, ino } = value;
+
+  return (
+    isNonEmptyString(file) &&
+    typeof present === 'boolean' &&
+    isFiniteNumber(mtimeMs) &&
+    isFiniteNumber(size) &&
+    isFiniteNumber(ctimeMs) &&
+    isFiniteNumber(ino)
+  );
+}
+
+/**
  * Whether `value` is a usable indexing diagnostic.
  *
  * Both vocabularies are checked against their own definitions — severity
@@ -1112,6 +1296,185 @@ function isIndexDiagnosticShape(value: unknown): boolean {
     isOptionalNonEmptyString(extractorId) &&
     isOptionalString(detail)
   );
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * File change stamps
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The value every numeric field of a stamp for an absent file carries. */
+const ABSENT_STAMP_NUMBER = 0;
+
+/**
+ * One stamp per entry of `index.files`, in that order.
+ *
+ * The single derivation both sides use — {@link IndexCache.save} to record the
+ * stamps and {@link IndexCache.load} to take them again — which is what makes
+ * the comparison meaningful: two implementations of "stamp this file" that
+ * differed in one detail (`lstat` on one side, a rejected path treated as
+ * absent on only the other) would either miss forever or hit when they should
+ * not.
+ *
+ * Total by construction: every path that cannot be screened, resolved or
+ * stat'ed becomes an absent stamp rather than an error, because a file that has
+ * been removed since the index was built is an ordinary state of a working tree
+ * and a cache is never allowed to turn one into a failure.
+ *
+ * Cost: one `stat` per indexed file, and **no file is read**. That is what
+ * keeps a hit cheap next to a rebuild that constructs a program and runs every
+ * extractor.
+ *
+ * @param index The index whose `files` are to be stamped, supplying the project
+ * root each project-relative path is resolved inside.
+ * @returns The stamps, positionally matching `index.files`.
+ */
+function stampFiles(index: CodeIndex): readonly FileStamp[] {
+  return index.files.map((fingerprint) => stampFile(index.projectRoot, fingerprint.file));
+}
+
+/**
+ * One file's change stamp, or an absent stamp when there is nothing to stamp.
+ *
+ * The path is screened before the filesystem is touched, in the order
+ * `./summary.ts` screens a path it is about to read: `isSafeRelativePath`
+ * refuses traversal, control characters, the empty string and a disguised
+ * absolute form, and `resolveWithinProject` then establishes containment and
+ * produces the absolute path. A refused path is reported absent rather than
+ * repaired — an index whose file list holds one is not an index this module
+ * will stat on behalf of, and treating it as absent keeps the answer stable
+ * across a save and a load instead of making it depend on what is on disk.
+ *
+ * `stat` and not `lstat`: the indexer's own fingerprints are taken with `stat`
+ * (`./indexer.ts`, `fingerprintOf`), so a symbolic link's target is what was
+ * indexed and the target is therefore what has to be compared. Anything that is
+ * not a regular file — a directory, a socket, a dangling link — is absent for
+ * the same reason the indexer skips it.
+ *
+ * @param projectRoot The index's project root, absolute POSIX.
+ * @param file The project-relative POSIX path to stamp.
+ * @returns The stamp.
+ */
+function stampFile(projectRoot: string, file: string): FileStamp {
+  if (!isSafeRelativePath(file)) {
+    return absentStamp(file);
+  }
+
+  const resolved = resolveWithinProject(projectRoot, file);
+  if (isErr(resolved)) {
+    return absentStamp(file);
+  }
+
+  try {
+    const stats = statSync(resolved.value);
+    if (!stats.isFile()) {
+      return absentStamp(file);
+    }
+
+    return {
+      file,
+      present: true,
+      mtimeMs: stats.mtimeMs,
+      size: stats.size,
+      ctimeMs: stats.ctimeMs,
+      ino: stats.ino,
+    };
+  } catch {
+    // `ENOENT`, `EACCES`, `ELOOP`, `ENOTDIR`, `EIO`: none of them is evidence
+    // about the file's contents, and none of them may become an exception —
+    // `load` and `save` both promise never to fail for a filesystem problem.
+    return absentStamp(file);
+  }
+}
+
+/**
+ * The stamp of a file this module has nothing to say about.
+ *
+ * Zeroed rather than left partly absent so that the shape is uniform and the
+ * comparison needs no special case: an absent stamp compares equal to an absent
+ * stamp, which is what lets an index over files that do not exist on disk
+ * round-trip through the cache unchanged.
+ *
+ * @param file The project-relative POSIX path.
+ * @returns The absent stamp for it.
+ */
+function absentStamp(file: string): FileStamp {
+  return {
+    file,
+    present: false,
+    mtimeMs: ABSENT_STAMP_NUMBER,
+    size: ABSENT_STAMP_NUMBER,
+    ctimeMs: ABSENT_STAMP_NUMBER,
+    ino: ABSENT_STAMP_NUMBER,
+  };
+}
+
+/**
+ * How far two stamp lists are apart: the size of the symmetric difference of
+ * the two multisets, and therefore `0` exactly when they describe the same
+ * files in the same state.
+ *
+ * Multiset rather than sequence equality, so the answer does not depend on the
+ * order either list happens to be in — a well-formed {@link CodeIndex} sorts
+ * its `files`, but an entry is untrusted input and a caller may synthesise one
+ * in any order. Multiset rather than set, so a list that holds the same path
+ * twice with two different stamps is not silently collapsed to one.
+ *
+ * A file that was *changed* therefore contributes two to the count — the stamp
+ * that is gone and the stamp that is there now — and one that appeared or
+ * disappeared contributes one. The number is a log field for a reader
+ * estimating how much of a tree moved, never a threshold: any value above zero
+ * is a miss.
+ *
+ * Total: it reads no filesystem and never throws.
+ *
+ * @param recorded The stamps the entry was written with.
+ * @param current The stamps taken again just now.
+ * @returns The number of stamps that differ, `0` when the two agree.
+ */
+function countStampDifferences(
+  recorded: readonly FileStamp[],
+  current: readonly FileStamp[],
+): number {
+  const balance = new Map<string, number>();
+
+  for (const stamp of recorded) {
+    const stampsKey = stampKey(stamp);
+    balance.set(stampsKey, (balance.get(stampsKey) ?? 0) + 1);
+  }
+  for (const stamp of current) {
+    const stampsKey = stampKey(stamp);
+    balance.set(stampsKey, (balance.get(stampsKey) ?? 0) - 1);
+  }
+
+  let differences = 0;
+  for (const count of balance.values()) {
+    differences += Math.abs(count);
+  }
+  return differences;
+}
+
+/**
+ * A stamp's identity as one string: every field, joined by a character no path
+ * or number can contain.
+ *
+ * Used only to compare stamps with each other, never hashed into a cache key,
+ * which is why a plain join is enough here where the key needs `stableHash`'s
+ * framing. Every field participates, because every field is part of "unchanged"
+ * — including `present`, so a file that has since been removed differs from the
+ * one that was stamped.
+ *
+ * @param stamp The stamp to key.
+ * @returns Its comparison key.
+ */
+function stampKey(stamp: FileStamp): string {
+  return [
+    stamp.file,
+    stamp.present ? '1' : '0',
+    String(stamp.mtimeMs),
+    String(stamp.size),
+    String(stamp.ctimeMs),
+    String(stamp.ino),
+  ].join(SORT_KEY_SEPARATOR);
 }
 
 /* -------------------------------------------------------------------------------------------------

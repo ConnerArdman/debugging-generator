@@ -33,16 +33,34 @@
  *
  * Two behaviours here are load-bearing and easy to undo by accident:
  *
- *   1. Page scrolling is never locked. There is deliberately no rule reaching out to the document
- *      body, no `overflow: hidden` on an ancestor and no scrollbar-width compensation, because
- *      taking the page scrollbar away while the drawer is open is precisely the layout shift this
- *      storefront must not produce. `.body`'s `overscroll-behavior: contain` is what keeps a
- *      scroll gesture from chaining through to the page behind once the list reaches its end.
+ *   1. Page scrolling IS locked while the drawer is open, and not from here. The lock belongs to
+ *      `document.documentElement`, which is not in this module's tree and which no CSS Module
+ *      class can name, so `./CartDrawer.tsx` applies it as two inline declarations for exactly as
+ *      long as the sheet is showing - `overflow: hidden`, plus `scrollbar-gutter: stable` when it
+ *      measured a classic scrollbar before locking - and restores both on cleanup. The gutter half
+ *      is what answers the layout shift this storefront must not produce: the page's scrollbar
+ *      goes away with the lock, the space it occupied stays reserved, and nothing behind the scrim
+ *      moves. On a viewport with overlay scrollbars the measurement is zero and nothing is
+ *      reserved, because reserving anything there would create that shift rather than prevent it.
+ *      No rule here may add `overflow: hidden` to an ancestor or a padding compensation of its own:
+ *      a second lock would fight the component's, and the restore would put back only one of them.
+ *      `.body`'s `overscroll-behavior: contain` is still what keeps a scroll gesture from chaining
+ *      through to the page behind once the list reaches its end - with the page locked it can no
+ *      longer scroll the document, and it would still chain into the nearest scroll port.
  *   2. `.overlay`'s `z-index: var(--ls-z-drawer, 40)` is this dialog's single stacking context.
  *      It sits above the site header (`--ls-z-header` 30) and below the toast region
  *      (`--ls-z-toast` 60), so a notice raised by a failed line mutation is never hidden behind
  *      the drawer. Nothing below `.overlay` declares `position` or `z-index`, so no descendant
- *      can open a competing context.
+ *      can open a competing context. Raising the drawer above the toast tier is not an available
+ *      fix for anything: the toast region documents the same contract from its own side.
+ *      The corner the two surfaces share is divided by reservation instead - `./CartDrawer.tsx`
+ *      publishes `.foot`'s measured height as `--ls-toast-inset-block-end` on `document.body`
+ *      while the sheet is open, and `../ui/ToastViewport.module.css` adds it to the notice
+ *      column's own block-end inset, so a notice stacks above this footer rather than over its
+ *      Checkout link. That reservation is a measurement of `.foot`, so a rule that changes the
+ *      footer's height needs nothing here, while one that takes it out of the layout flow (a
+ *      `position: absolute`, a transform that moves it) would publish a height the notice column
+ *      is no longer clear of.
  */
 
 /* The scrim, and the flex row that anchors the sheet to the inline end of the viewport. */
@@ -148,7 +166,11 @@
 
 /* Totals and the two actions, stacked. A fixed grid row, so it needs no `position: sticky` to
  * stay visible while the list above it scrolls; the opaque background keeps a scrolled row from
- * showing through. */
+ * showing through.
+ *
+ * This block's height is measured by the component and published as the toast region's
+ * reservation (numbered note 2 above), so it stays in the grid's flow: whatever these paddings and
+ * the totals panel add up to is what the notice column is lifted clear of. */
 .foot {
   display: grid;
   min-width: 0;

@@ -267,8 +267,68 @@ function opaqueIdentifier(): z.ZodString {
 }
 
 /**
- * A hexadecimal correlation id field, validated against a pattern owned by
- * `@debuggen/shared`.
+ * Whether every character of an already-hex string is `'0'`.
+ *
+ * W3C Trace Context defines the all-zero trace-id and the all-zero parent-id
+ * as **invalid**, and the same rule is applied to a span id here because a
+ * span id is what becomes a child's parent-id on the wire. The value is not
+ * hypothetical: it is what an OpenTelemetry SDK reports for a non-recording
+ * span, what a malformed `traceparent` header degrades to, and what a
+ * producer that zero-initialised an id buffer emits — so it is the one
+ * *format-valid* id that must never be accepted. Every such event would
+ * correlate into a single bogus trace root, and a timeline assembled from
+ * them would read as one interaction that never happened.
+ *
+ * Written as a character scan rather than a regular expression for two
+ * reasons. The alphabet and the length are already the business of
+ * `TRACE_ID_PATTERN` and `SPAN_ID_PATTERN` in `@debuggen/shared`, so a second
+ * pattern here — even a partial one — is the duplicate definition this module
+ * exists to prevent; and the scan is length-agnostic, so one predicate serves
+ * both id widths and neither can drift.
+ *
+ * The empty string returns `false` on purpose. An empty value is a *format*
+ * failure that `hexIdentifier`'s pattern already reports, and a vacuous
+ * "all characters are zero" would add a second, misleading issue to it.
+ *
+ * @param value An already-parsed string, typically a candidate id.
+ * @returns `true` when `value` is non-empty and contains nothing but `'0'`.
+ */
+function isAllZeroHexId(value: string): boolean {
+  if (value.length === 0) {
+    return false;
+  }
+
+  for (let index = 0; index < value.length; index += 1) {
+    if (value[index] !== '0') {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+/**
+ * A hexadecimal correlation id field: the shape its pattern describes, and
+ * never the all-zero value.
+ *
+ * Both checks are applied here rather than at the three field declarations, so
+ * `traceId`, `spanId` and `parentSpanId` cannot come to disagree about what a
+ * correlation id is — and so the rule holds for the ingress schema and the
+ * persisted schema alike, since both are built from the one core shape below.
+ *
+ * The all-zero refusal is the caller-side rule `@debuggen/shared` asks for
+ * explicitly: its `isTraceId`/`isSpanId` guards accept the value (they answer
+ * a question about format) and their documentation says a caller needing the
+ * distinction must reject it. This schema is that caller — the single point
+ * every producer's event passes through — and `../node/convert.ts` refuses the
+ * same value one step earlier, dropping a non-recording span before it is ever
+ * described as an event. Two independent refusals, because the browser agent
+ * and the preload are separate builds from the service that ingests them.
+ *
+ * Both checks report the same message: a producer reading it needs to know
+ * what a correlation id must look like, not which of the two rules it missed,
+ * and one message is one fewer place for a received value to be echoed into an
+ * error (see the privacy note on {@link parseTelemetryEvent}).
  *
  * @param pattern `TRACE_ID_PATTERN` or `SPAN_ID_PATTERN` — never a locally
  * written regular expression.
@@ -276,14 +336,17 @@ function opaqueIdentifier(): z.ZodString {
  * reference to what arrived.
  */
 function hexIdentifier(pattern: RegExp, expectation: string): z.ZodString {
-  return z.string().regex(pattern, { error: expectation });
+  return z
+    .string()
+    .regex(pattern, { error: expectation })
+    .refine((value) => !isAllZeroHexId(value), { error: expectation });
 }
 
 /** What a `traceId` must look like, for the failure message. */
-const TRACE_ID_EXPECTATION = 'expected 32 lowercase hex characters';
+const TRACE_ID_EXPECTATION = 'expected 32 lowercase hex characters, not all zero';
 
 /** What a `spanId` and a `parentSpanId` must look like, for the message. */
-const SPAN_ID_EXPECTATION = 'expected 16 lowercase hex characters';
+const SPAN_ID_EXPECTATION = 'expected 16 lowercase hex characters, not all zero';
 
 /**
  * What an attribute *value* must be, for the failure message.
@@ -392,7 +455,9 @@ const telemetryEventCoreShape = {
    * agent injects on same-origin requests. That header is the only thing that
    * joins a click to the route handler and database queries it caused, which
    * is why the format is validated against the pattern that package owns
-   * rather than against a copy written here.
+   * rather than against a copy written here — and why the all-zero trace id
+   * that the same specification defines as invalid is refused by
+   * {@link hexIdentifier} rather than merely never generated.
    */
   traceId: hexIdentifier(TRACE_ID_PATTERN, TRACE_ID_EXPECTATION),
 
@@ -403,7 +468,8 @@ const telemetryEventCoreShape = {
    * Unique within its trace, and the value a child event names as its
    * `parentSpanId`. For a `fetch` event it is additionally the span id the
    * agent writes into the outgoing `traceparent`, which is how the server's
-   * request span becomes this event's child.
+   * request span becomes this event's child — so the all-zero span id, which
+   * would become an invalid parent-id in that header, is refused here too.
    */
   spanId: hexIdentifier(SPAN_ID_PATTERN, SPAN_ID_EXPECTATION),
 
@@ -412,7 +478,10 @@ const telemetryEventCoreShape = {
    *
    * **Absent means trace root** — the interaction that started everything, or
    * a navigation. Absence is therefore meaningful and is never filled in with
-   * a placeholder.
+   * a placeholder: the all-zero span id is the placeholder an SDK reports for
+   * "no parent", and sending it here is rejected rather than read as a root,
+   * which is the same call `../node/convert.ts` makes when it omits the field
+   * for such a span instead of forwarding the zeros.
    *
    * A parent that never arrived is not an error either: the correlator
    * attaches such an event to the trace root and marks it with the `orphaned`
@@ -855,7 +924,7 @@ function summariseIssues(issues: readonly z.core.$ZodIssue[]): SchemaIssueSummar
 
 /** The hint offered when a producer's event fails validation. */
 const INGRESS_HINT =
-  'A telemetry event needs an id and producerId, a 32-hex traceId, a 16-hex spanId, a kind and tier that agree, a name, a Unix epoch millisecond startTime, a non-negative duration, a status, an attributes object and a zero-based seq. sessionId, captureId and ingestSeq are assigned by the service and must not be sent.';
+  'A telemetry event needs an id and producerId, a 32-hex traceId and a 16-hex spanId that are not all zero, a kind and tier that agree, a name, a Unix epoch millisecond startTime, a non-negative duration, a status, an attributes object and a zero-based seq. sessionId, captureId and ingestSeq are assigned by the service and must not be sent.';
 
 /** The hint offered when a stored or attributed event fails validation. */
 const PERSISTED_HINT =

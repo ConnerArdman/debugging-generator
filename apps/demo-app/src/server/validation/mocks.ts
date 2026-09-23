@@ -91,10 +91,13 @@ function printable(value: string): boolean {
  * parcel to rate it.
  *
  * A carrier rates a shipment from its destination, its weight, how many pieces it is made of and
- * which service is being asked for, and those are the four fields below. Only the destination is
- * required, because it is the one thing no provider can assume: the other three describe a
- * single, ordinary parcel when a caller leaves them out, so a body naming nothing but a postal
- * code is already a complete request.
+ * which service is being asked for, and those are the fields below. The destination is both of its
+ * halves - the postal code and the country it is in - because a zone chart is read from a place
+ * and the same code names a different place in each country that writes codes that way. Only the
+ * postal code is required, because it is the one thing no provider can assume: the country
+ * defaults to the store's own and the other three describe a single, ordinary parcel when a caller
+ * leaves them out, so a body naming nothing but a postal code is already a complete domestic
+ * request.
  */
 export const carrierMockBodySchema = z.object({
   /**
@@ -123,6 +126,26 @@ export const carrierMockBodySchema = z.object({
       /^[A-Za-z0-9][A-Za-z0-9 -]{1,10}[A-Za-z0-9]$/,
       'must be alphanumeric, with single spaces or hyphens inside',
     ),
+
+  /**
+   * Which country the destination is in, as its two-letter code.
+   *
+   * A carrier's zone chart is read from the destination, and a destination is a
+   * country and a postal code together: the same five digits name a place in
+   * one country and a different place in another, at a different distance from
+   * this catalog's warehouses. A provider handed the code alone would rate both
+   * identically, which is a quote for whichever of the two the caller did not
+   * mean. Upper-cased so a caller's spelling does not change the zone, held to
+   * two letters - which country codes exist is the storefront's question and
+   * not this provider's - and defaulted to the store's own country, so a body
+   * naming a postal code alone still describes a complete domestic shipment.
+   */
+  destinationCountry: z
+    .string()
+    .trim()
+    .toUpperCase()
+    .regex(/^[A-Z]{2}$/, 'must be a two-letter country code')
+    .default('US'),
 
   /**
    * What the shipment weighs, counted in whole grams — the unit is in the name, so no caller has

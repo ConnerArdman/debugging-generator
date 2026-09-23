@@ -114,7 +114,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { DebuggenError } from '../errors.js';
 import { isWithin, resolveWithinProject, toProjectRelative } from '../paths.js';
@@ -279,6 +279,11 @@ const CAN_ASSIGN_FOREIGN_OWNER = FOREIGN_UID !== undefined;
  * directory — and continuous integration commonly runs as root, so a case whose
  * subject is the *failure* of a write guards on this rather than asserting
  * something that silently becomes vacuous.
+ *
+ * Every case that guards on this has a companion that provokes the same failure
+ * without a mode bit and therefore runs on every account (see
+ * {@link withInjectedFs}): the guard buys the real-permissions variant on an
+ * unprivileged host, it is never the only coverage of the contract.
  */
 const MODE_DENIES_WRITE = typeof process.getuid === 'function' && process.getuid() !== 0;
 
@@ -448,14 +453,23 @@ function entriesIn(dirAbs: string): string[] {
 }
 
 /**
+ * What the module's temporary names end with.
+ *
+ * It names them `.<target>.<pid>.<random>.tmp`, so the extension is what
+ * identifies one — both for the leftover audit below and for the injected
+ * failure above, which has to recognise the temporary sibling to fail it and
+ * nothing else.
+ */
+const TEMPORARY_SUFFIX = '.tmp';
+
+/**
  * The temporary siblings left in a directory by an atomic write.
  *
- * The module names them `.<target>.<pid>.<random>.tmp`, so the extension is
- * what identifies one, and `readdir` lists dotted entries — a cleanup path that
- * stopped running would show up here rather than being invisible.
+ * `readdir` lists dotted entries, so a cleanup path that stopped running would
+ * show up here rather than being invisible.
  */
 function temporaryLeftoversIn(dirAbs: string): string[] {
-  return entriesIn(dirAbs).filter((entry) => entry.endsWith('.tmp'));
+  return entriesIn(dirAbs).filter((entry) => entry.endsWith(TEMPORARY_SUFFIX));
 }
 
 /**
@@ -561,6 +575,84 @@ function unsafePathErrorFrom(run: () => void): DebuggenError {
   const error = debuggenErrorFrom(run);
   expect(error.code).toBe('FS_UNSAFE_PATH');
   return error;
+}
+
+/**
+ * Runs `use` against a freshly imported copy of this module whose `node:fs` has
+ * the given overrides merged over the real one.
+ *
+ * Why it exists: the cases whose subject is the *failure* of a syscall cannot
+ * provoke one with a permission bit on a privileged account — root writes
+ * through a `0500` directory, and continuous integration commonly runs as root,
+ * so those cases guard on {@link MODE_DENIES_WRITE} and assert nothing there.
+ * Injecting the failure instead asserts the same propagation contract on every
+ * account, which makes the mode-based cases a second opinion on an unprivileged
+ * host rather than the only coverage a fail-closed path has.
+ *
+ * Two properties make it safe to use in the middle of this file:
+ * - The replacement reaches the module under test, not this one. Every helper
+ *   above holds a binding resolved when this file loaded, so they keep the real
+ *   filesystem and can still build a fixture and inspect it afterwards.
+ * - The module registry is reset before the import, so `use` receives a copy
+ *   built against the injected module rather than the cached real one, and
+ *   reset again afterwards — whether `use` passed or threw — so the next case
+ *   imports the genuine module.
+ *
+ * The override is written as a function of the real module so a wrapper can
+ * delegate to the real implementation for every input it does not fail, which
+ * is what keeps the injection narrow: one syscall on one path, everything else
+ * genuinely performed.
+ *
+ * @param overrides Receives the real `node:fs`, returns what to replace on it.
+ * @param use Receives the freshly imported copy of this module.
+ */
+async function withInjectedFs(
+  overrides: (real: typeof import('node:fs')) => Partial<typeof import('node:fs')>,
+  use: (injected: typeof import('./safe-fs.js')) => void,
+): Promise<void> {
+  vi.resetModules();
+  vi.doMock('node:fs', async () => {
+    const real = await vi.importActual<typeof import('node:fs')>('node:fs');
+    return { ...real, ...overrides(real) };
+  });
+
+  try {
+    use(await import('./safe-fs.js'));
+  } finally {
+    vi.doUnmock('node:fs');
+    vi.resetModules();
+  }
+}
+
+/**
+ * An `openSync` that refuses the temporary sibling of an atomic write and
+ * performs every other open for real.
+ *
+ * The temporary name is what a `0500` directory refuses first, so failing it is
+ * the same failure the guarded permissions cases provoke — and failing *only*
+ * it is what keeps the case meaningful: an `openSync` that failed everything
+ * would also break the snapshot read the precondition is built from, and the
+ * case would then prove nothing about the write.
+ *
+ * @param real The genuine `node:fs`, used for every other path.
+ * @param code The errno to raise, matching what the kernel would report.
+ * @returns A drop-in replacement for `openSync`.
+ */
+function openSyncFailingTemporaries(
+  real: typeof import('node:fs'),
+  code: 'EACCES' | 'ENOSPC',
+): typeof real.openSync {
+  return (...args: Parameters<typeof real.openSync>): number => {
+    const [path] = args;
+    if (typeof path === 'string' && path.endsWith(TEMPORARY_SUFFIX)) {
+      throw Object.assign(new Error(`${code}: injected failure, open '${path}'`), {
+        code,
+        syscall: 'open',
+        path,
+      });
+    }
+    return real.openSync(...args);
+  };
 }
 
 /**
@@ -2142,6 +2234,47 @@ describe('atomicReplaceFileIfUnchanged', () => {
 
     expect(lstatSync(target).nlink).toBe(1);
     expect(entriesIn(sandbox)).toEqual(['source.ts']);
+  });
+
+  it('lets an injected I/O failure through rather than reporting it as stale', async () => {
+    // The same contract as the guarded case below, asserted on every account
+    // including root: a `stale` verdict means "nothing was written", so a write
+    // that could not be performed must surface as the runtime's own error and
+    // never be collapsed into a conflict report to the developer.
+    //
+    // The failure is injected at the exclusive create of the temporary sibling
+    // — the first syscall a `0500` directory refuses — so this case exercises
+    // the same branch the permissions case does, on a host where a mode bit
+    // asserts nothing. The fixture and every assertion still run against the
+    // real filesystem; only the module under test sees the injected `openSync`.
+    const target = makeFile(join(sandbox, 'source.ts'), ORIGINAL, PROJECT_FILE_MODE);
+
+    // Two different errnos, because the contract is "the runtime's own error,
+    // with its `code` intact" rather than "a known permissions error": a
+    // `ENOSPC` on a full disk must reach the caller exactly as `EACCES` does,
+    // and neither may be reported as a conflict.
+    for (const expected of ['EACCES', 'ENOSPC'] as const) {
+      await withInjectedFs(
+        (real) => ({ openSync: openSyncFailingTemporaries(real, expected) }),
+        (injected) => {
+          const before = injected.readFileSnapshotNoFollow(target);
+
+          const code = runtimeErrnoFrom(() => {
+            injected.atomicReplaceFileIfUnchanged(target, INSTRUMENTED, before);
+          });
+
+          expect(code).toBe(expected);
+        },
+      );
+    }
+
+    // Byte-for-byte, mode included: a failed conditional write leaves the
+    // developer's file exactly as it was found.
+    expectFileBytes(target, ORIGINAL);
+    expect(octal(permissionsOf(target))).toBe(octal(PROJECT_FILE_MODE));
+    // And leaves nothing behind: the cleanup path ran even though the error was
+    // rethrown rather than handled.
+    expect(temporaryLeftoversIn(sandbox)).toEqual([]);
   });
 
   it.skipIf(!MODE_DENIES_WRITE)(

@@ -108,10 +108,22 @@
   background: var(--ls-surface-sunken, #f8fafc);
   color: var(--ls-text-muted, #475569);
   /* Engines fade a disabled control by two separate routes - a blanket opacity and, on WebKit, a
-   * text fill colour that outranks `color`. Both are pinned back to the declared colour, which
-   * measures 7.2:1 on this recessed surface; left alone they drop it under the contrast floor. */
+   * text fill colour that outranks `color` - and the two are handled differently here on purpose.
+   *
+   * The opacity is the shared `--ls-disabled-opacity`, so this field dims by exactly the amount
+   * Button, Pill and Select dim by. It used to be pinned at 1 to hold the muted text at its
+   * measured 7.2:1 on this recessed surface, but that made an unavailable field the one primitive
+   * in the set that did not look unavailable, and it bought contrast the guideline does not ask
+   * for: WCAG 1.4.3 exempts an inactive control from the 4.5:1 minimum. One disabled treatment
+   * across the four primitives is the better trade, and the state is carried by more than the
+   * dimming anyway - the recessed fill, the `not-allowed` cursor and the native `disabled`
+   * semantics `FormField` announces.
+   *
+   * The WebKit pin stays. It is not a contrast measure but a double-fade guard: that engine
+   * applies its own text fill on top of whatever opacity is in force, so without it the label
+   * would be faded twice and end up visibly lighter on WebKit than on every other engine. */
   -webkit-text-fill-color: var(--ls-text-muted, #475569);
-  opacity: 1;
+  opacity: var(--ls-disabled-opacity, 0.55);
   cursor: not-allowed;
 }
 
@@ -133,9 +145,16 @@
   border-color: var(--ls-danger, #b42318);
 }
 
-/* Dense variant, for a toolbar or a table cell. The floor is the small type size: anything smaller
- * makes mobile Safari zoom the page on focus and costs legibility in the checkout flow. */
+/* Dense variant, for a toolbar or a table cell. The type floor is the small step: anything smaller
+ * makes mobile Safari zoom the page on focus and costs legibility in the checkout flow.
+ *
+ * The height floor is `--ls-control-sm`, the shared compact-control token, and it is here because
+ * this field does not sit alone: the dashboard's filter row and the catalog toolbar put a `sm`
+ * field, a `sm` select and a `sm` Button on one line, and sized from padding alone those came out
+ * at 29.5px, 29.5px and 23px. `min-block-size` raises the box and touches nothing else, so the
+ * padding, border width and type step above still decide everything about how the field reads. */
 .root[data-size='sm'] {
+  min-block-size: var(--ls-control-sm, 32px);
   padding: var(--ls-space-1, 4px) var(--ls-space-2, 8px);
   font-size: var(--ls-text-sm, 13px);
 }

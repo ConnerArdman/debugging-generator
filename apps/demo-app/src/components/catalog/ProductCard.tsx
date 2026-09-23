@@ -10,13 +10,16 @@
  * props rather than reading a query string or a route of its own.
  *
  * COMPOSED FROM THE SHARED PRIMITIVES, NEVER FROM RAW CHROME
- * The surface is `@/components/ui/Card`, the availability chip and the category chip are `Pill`,
- * the saving and the cart count are `Badge`, both figures are `Price`, both controls are `Button`,
- * and the category's drawing is `CategoryGlyph`. Those primitives own their padding, typography,
+ * The surface is `@/components/ui/Card`, the availability chip is `@/components/product/StockBadge`
+ * - the same component the product page shows, so one availability sentence does not read as two
+ * different chips depending on which page a buyer is standing on - the category chip is `Pill`, the
+ * saving and the cart count are `Badge`, both figures are `Price`, both controls are `Button`, and
+ * the category's drawing is `CategoryGlyph`. Those primitives own their padding, typography,
  * borders, hover and focus treatment; `ProductCard.module.css` owns the tile's geometry and
  * nothing about their chrome. That is why no colour, size or space is written here and no element
  * carries an inline style: a value stated in this file could only disagree with the one the
- * primitive already resolves from the token set.
+ * primitive already resolves from the token set. The add-to-cart control is asked for the same
+ * `lg` step the product page's own control uses, for the same reason.
  *
  * WORDING AND MONEY BELONG TO THEIR OWNERS
  * Every string a reader sees that is derived from data comes from `@/lib/format` - the availability
@@ -30,11 +33,13 @@
  * ONE ACCESSIBLE NAME, AND REAL CONTROLS
  * The product's name is a link inside the tile's heading, which makes it the tile's accessible name
  * and its single navigation stop; the artwork beside it is decorative and carries an empty `alt` so
- * a reader is not told the same name twice. The card is only *styled* as clickable - it adds no
- * handler, no role and no tab stop - so the specs toggle and the add-to-cart control stay ordinary
- * buttons that a keyboard reaches in order. The toggle states `aria-expanded` and points
- * `aria-controls` at the specification list it opens, and the availability chip carries its wording
- * as text, so its colour is never the only thing that reports the state.
+ * a reader is not told the same name twice. The card is only *styled* as holding something to act
+ * on - it adds no handler, no role, no tab stop and no pointer cue of its own, so the artwork, the
+ * product code and the price promise nothing they cannot answer - and the specs toggle and the
+ * add-to-cart control stay ordinary buttons that a keyboard reaches in the order they are written.
+ * The toggle states `aria-expanded` and points `aria-controls` at the specification list it opens,
+ * and the availability chip carries its wording as text, so its colour is never the only thing
+ * that reports the state.
  *
  * WHAT A FAILED QUICK-ADD SAYS
  * The press goes to the cart provider, which owns the request and reads the cart back from the
@@ -58,6 +63,7 @@ import clsx from 'clsx';
 import Link from 'next/link';
 import { memo } from 'react';
 
+import { StockBadge } from '@/components/product/StockBadge';
 import { Badge } from '@/components/ui/Badge';
 import { Button } from '@/components/ui/Button';
 import { Card } from '@/components/ui/Card';
@@ -106,18 +112,6 @@ const ADD_TO_CART_QUANTITY = 1;
  * as it was nor invites a second press, both of which would be guesses.
  */
 const UNSETTLED_ADDITION_BODY = 'Check your cart before adding this product again.';
-
-/**
- * Which chip tone reports each availability state. Keyed by the union rather than looked up with a
- * fallback: a state added to `StockState` without a tone here is a compile error, which is the
- * point - the alternative is a new state quietly rendering in the neutral tone nobody chose for
- * it.
- */
-const STOCK_TONES: Record<StockState, 'neutral' | 'info' | 'success' | 'warning' | 'danger'> = {
-  IN_STOCK: 'success',
-  LOW_STOCK: 'warning',
-  OUT_OF_STOCK: 'danger',
-};
 
 /**
  * Which availability states may be added to the cart. Low stock is still sellable - the count in
@@ -225,9 +219,19 @@ function ProductCardBody({
           loading="lazy"
           decoding="async"
         />
-        <Pill tone={STOCK_TONES[product.stockState]} size="sm" className={clsx(styles.stock)}>
-          {stockLabel}
-        </Pill>
+        {/*
+         * Availability is the one statement this tile and the product page make about the same
+         * product in the same words, so it is the same component in both places: `StockBadge`
+         * owns the state-to-tone decision and hands `Badge` the wording `@/lib/format` produced.
+         * Rendering a `Pill` here instead would have put that sentence on the page at a second
+         * size, weight and corner radius - the tile's own class only positions the chip over the
+         * artwork, and the chip's appearance stays the primitive's.
+         */}
+        <StockBadge
+          state={product.stockState}
+          available={product.availableQuantity}
+          className={clsx(styles.stock)}
+        />
       </div>
 
       <div className={styles.body}>
@@ -270,9 +274,23 @@ function ProductCardBody({
           {selected ? 'Hide specs' : 'Quick specs'}
         </Button>
 
+        {/*
+         * The committing action, asked for the `lg` step that `../product/AddToCartControl` asks
+         * for on the product page. "Add to cart" means one thing in this storefront and is
+         * therefore one control at one size: the tile used to offer it at the `sm` step, so the
+         * same intent stood a third of the height on a listing that it stood on the page the
+         * listing leads to, and the smaller of the two was also the one a finger had least to aim
+         * at. The size is the whole of the appearance decision - `Button.module.css` owns what
+         * that step measures - and `styles.add` only places the result.
+         *
+         * It stays second in the DOM, after the specifications toggle, so the tab order a keyboard
+         * reader walks is unchanged: `.actions` gives it a row of its own by spanning both of the
+         * row's columns, which moves nothing in the document.
+         */}
         <Button
           variant="primary"
-          size="sm"
+          size="lg"
+          className={clsx(styles.add)}
           busy={syncStatus === 'saving'}
           disabled={!STOCK_PURCHASABLE[product.stockState]}
           onClick={handleAdd}

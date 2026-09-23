@@ -22,8 +22,13 @@
  * WHAT BELONGS TO SOMEONE ELSE
  *   - Surface. `ui/Card` owns background, border, radius, elevation and its own padding; `.root`
  *     is safe to hand to its `className` because it declares geometry only.
+ *   - Scrolling. `./Scroller.module.css` owns the scrollport the table sits in: the overflow axis,
+ *     the focus ring, the edge fades and the hint that says there is more to see. `.scroller`
+ *     below is only this surface's radius.
  *   - Status colour. Stock state arrives as a `ui/Badge`, which carries a text label, so no rule
- *     here tints a cell to mean "low" or "out" - colour is never this table's only signal.
+ *     here tints a cell to mean "low" or "out" - colour is never this table's only signal. The one
+ *     tint this file does declare is how loudly a *figure* is printed - a muted zero, a negative
+ *     quantity in the danger tone - and the digits and the minus sign carry those facts in text.
  *   - Category artwork. `.groupLabel` sets nothing but layout and inherits `color`; the masked
  *     glyph inside it paints with `currentColor` through `ui/CategoryGlyph`, and no rule here
  *     names an asset path.
@@ -46,51 +51,46 @@
   gap: var(--ls-space-3, 12px);
 }
 
-/* The horizontal scrollport, and the whole responsive answer for a seven-column table: a narrow
- * viewport scrolls the table *inside this box* rather than widening the page. The wrapper is given
- * `role="region"`, an accessible name and `tabIndex={0}` by the component, because a scrollable
- * region that cannot take focus is unreachable from the keyboard - hence the focus ring below.
+/* This table's own contribution to the scrollport: the rounded corner that matches the card it
+ * sits in, and nothing else.
  *
- * Only `overflow-x` is declared: CSS computes the other axis to `auto` when one axis is not
- * `visible`, which makes this element the scrollport its sticky head cells stick to. The head cells
- * therefore hold their position whenever an ancestor bounds this box's block size, and sit
- * harmlessly at the top of the table when nothing does.
+ * The scrollport is rendered by `./Scroller.tsx`, which owns the behaviour a scrollable region has
+ * to have - the overflow axis, the overscroll containment, the focus ring the box needs because it
+ * is focusable, the `role="region"` and accessible name, the Home/End keys, and the edge fade and
+ * one-line hint that say at rest that there is more to see. Those live in
+ * `./Scroller.module.css`; a class handed to that component composes alongside them, so this rule
+ * declares only what is specific to this surface.
  *
- * What this box needs from the page in return: a containing block whose own inline size does not
- * come from its contents. `max-inline-size: 100%` can only cap against a measure that is already
- * bounded, and a seven-column table still reports its minimum width outwards through a scrollport,
- * so a wrapper that sizes to its contents grows to the table and the *page* takes the horizontal
- * scrollbar while this box is left with nothing to scroll - measured in Chrome at a 390px viewport:
- * 459px of page overflow and the last column unreachable. The page shell this application mounts on
- * every route holds up that end of the bargain, centring its measure as `inline-size: 100%` with a
- * `max-inline-size` rather than as an automatic margin against fit-content, and passing
- * `min-inline-size: 0` down its content region; `.root` above does the same here. Containment was
- * measured as an alternative and rejected: zeroing this box's inline contribution collapses a
- * fit-content wrapper to the width of its prose instead, which trades a narrow-viewport fault for a
- * desktop one. */
+ * What the scrollport needs from the page in return: a containing block whose own inline size does
+ * not come from its contents. Its `max-inline-size: 100%` can only cap against a measure that is
+ * already bounded, and a seven-column table still reports its minimum width outwards through a
+ * scrollport, so a wrapper that sizes to its contents grows to the table and the *page* takes the
+ * horizontal scrollbar while the box is left with nothing to scroll - measured in Chrome at a 390px
+ * viewport: 459px of page overflow and the last column unreachable. The page shell this application
+ * mounts on every route holds up that end of the bargain, centring its measure as
+ * `inline-size: 100%` with a `max-inline-size` rather than as an automatic margin against
+ * fit-content, and passing `min-inline-size: 0` down its content region; `.root` above does the
+ * same here. Containment was measured as an alternative and rejected: zeroing the box's inline
+ * contribution collapses a fit-content wrapper to the width of its prose instead, which trades a
+ * narrow-viewport fault for a desktop one. */
 .scroller {
-  max-inline-size: 100%;
-  overflow-x: auto;
   border-radius: var(--ls-radius-md, 8px);
-  -webkit-overflow-scrolling: touch;
-  overscroll-behavior-x: contain;
-}
-
-/* The application's focus ring, refined rather than replaced: the same colour and width as the
- * baseline in `globals.css`, offset by one spacing step. Offsetting *outward* is load-bearing. An
- * inset ring is drawn inside the scrollport, where the opaque sticky head cells paint over it and
- * leave a gap in the indicator the height of the header band - measured in Chrome, because
- * `.scroller` is not a stacking context, so a head cell's `z-index` resolves further up the tree
- * and the cell paints after the box it sits in. Outside the border box nothing can paint over the
- * ring, and one step clears the internal padding of any card this table sits in. */
-.scroller:focus-visible {
-  outline: 2px solid var(--ls-focus, #0f766e);
-  outline-offset: var(--ls-space-1, 4px);
 }
 
 /* `table-layout: auto` so a long product name wraps into a comfortable column instead of being
- * squeezed to one character; the per-column minimums live on the cells, in `ch`, which is what
- * makes the sum of the columns exceed a narrow viewport and the scroller earn its keep. */
+ * squeezed to one character; the per-column minimums live on the cells, in `ch`.
+ *
+ * Those minimums are sized against the measure the page actually gives this table, not against the
+ * viewport. The dashboard's split puts the table in a column that stops growing at 726px, so a
+ * table whose columns cannot add up to less than that is clipped on every display, however wide -
+ * measured in Chrome at 1280, 1440 and 1920, where the scrollport is 726px at all three. The
+ * column sum is therefore held under the 670px this column measures at a 768px viewport, which
+ * leaves the desktop measure with room to distribute and clips nothing: the seven columns come to
+ * 660px of minimum where every one of them is squeezed to its floor (measured in Chrome at 375),
+ * and `inline-size: 100%` spends whatever the column has over that on the columns that can use it
+ * - 726px at 1280 and above, where the widest stock badge then clears the edge by 8px. A 375px
+ * viewport is the one case seven columns genuinely cannot fit, and that is what the scroller and
+ * its affordance below are for. */
 .table {
   inline-size: 100%;
   border-collapse: collapse;
@@ -137,13 +137,22 @@
  * to the top of the scrollport and leaves its border behind - measured in Chrome, where the header
  * then merges into whichever row has scrolled beneath it, invisibly so when that row is a zebra
  * row of the same recessed colour. A shadow is a decoration of the cell box and travels with it.
- * One hairline either way: the border is not also declared, so nothing doubles. */
+ * One hairline either way: the border is not also declared, so nothing doubles.
+ *
+ * A two-word label wraps, and the absence of `white-space: nowrap` here is deliberate. Held on one
+ * line, "UNIT PRICE" and "ON HAND" were the widest thing in their columns - wider than the figures
+ * beneath them - so the header was setting the minimum width of columns carrying five digits, and
+ * the sum of those minimums is part of what pushed the table past its scrollport (measured in
+ * Chrome: the header held those two columns at 100.81px and 77.78px against content that needs
+ * about 86px and 59px). Wrapped, each column falls back to the width of its own content, the
+ * header row grows by one line once, and `vertical-align: bottom` keeps a wrapped label sitting on
+ * the same baseline as the single-word ones beside it. */
 .headCell {
   position: sticky;
   inset-block-start: 0;
   z-index: var(--ls-z-sticky, 1);
   min-inline-size: 8ch;
-  padding: var(--ls-space-2, 8px) var(--ls-space-3, 12px);
+  padding: var(--ls-space-2, 8px);
   box-shadow: inset 0 -1px 0 0 var(--ls-border, #cbd5e1);
   background-color: var(--ls-surface-sunken, #f8fafc);
   color: var(--ls-text-muted, #475569);
@@ -153,14 +162,19 @@
   text-align: start;
   text-transform: uppercase;
   vertical-align: bottom;
-  white-space: nowrap;
 }
 
 /* `<th scope="row">`: the product or SKU that identifies the row. Full-strength text, not muted -
- * it is the row's name, not a label - and wide enough that a product name has somewhere to wrap. */
+ * it is the row's name, not a label - and wide enough that a product name has somewhere to wrap.
+ *
+ * Eighteen characters rather than twenty-two. This column's floor is the single largest term in
+ * the table's minimum width, and at 22ch it spent 163.59px of a 726px measure on a name that wraps
+ * anyway; 18ch is 133.85px, still two thirds wider than any other column and enough for a name to
+ * wrap into two or three readable lines instead of one word per line. The 30px it gives back is
+ * what brings the seven columns inside the measure the dashboard's split actually offers. */
 .rowHeadCell {
-  min-inline-size: 22ch;
-  padding: var(--ls-space-2, 8px) var(--ls-space-3, 12px);
+  min-inline-size: 18ch;
+  padding: var(--ls-space-2, 8px);
   border-block-end: 1px solid var(--ls-border, #cbd5e1);
   color: var(--ls-text, #0f172a);
   font-weight: 500;
@@ -168,10 +182,13 @@
   vertical-align: middle;
 }
 
-/* `<td>`. */
+/* `<td>`. One spacing step on every side rather than one-and-a-half inline: seven columns pay
+ * their inline padding seven times over, so the step down from 12px to 8px returns 56px of the
+ * measure - more than twice the overhang that was clipping the last column - while a table this
+ * dense still reads as ruled columns rather than as a block of figures. */
 .cell {
   min-inline-size: 8ch;
-  padding: var(--ls-space-2, 8px) var(--ls-space-3, 12px);
+  padding: var(--ls-space-2, 8px);
   border-block-end: 1px solid var(--ls-border, #cbd5e1);
   color: var(--ls-text, #0f172a);
   text-align: start;
@@ -195,6 +212,38 @@
   font-variant-numeric: tabular-nums;
   text-align: end;
   white-space: nowrap;
+}
+
+/* The one place the modifier's `nowrap` is withdrawn: a numeric *column heading*. The figures must
+ * stay on one line - a quantity broken across two lines is unreadable - but their labels are prose
+ * and wrap like the rest of the header row (see `.headCell`). Written as both classes so it
+ * outranks the modifier whichever order the bundler emits the two rules in. */
+.headCell.numericCell {
+  white-space: normal;
+}
+
+/* Zero, and below zero, in a column of figures.
+ *
+ * A quantity of nothing is a different statement from a quantity of three thousand, and at the same
+ * ink it reads as neither: a reader scanning the Reserved column cannot see which lines have
+ * nothing promised, and an empty result set looks exactly like a healthy one. Zero is therefore
+ * muted to the same token the column headings use - present, legible, and visibly not a figure to
+ * act on - and a negative available quantity, which means a location has promised more than it
+ * holds, takes the danger token and the table's own weight.
+ *
+ * Colour is not carrying either fact on its own, which is the rule this table is written to: the
+ * digit `0` and the minus sign are in the text, the Stock column states the selling state in
+ * words, and these rules only say how loudly the figure is printed. `data-figure` is set by the
+ * component from the figure itself, so the treatment follows the data rather than a class a caller
+ * remembered to add; both selectors carry the modifier as well, so they outrank `.cell`'s own
+ * colour regardless of the order the two rules are emitted in. */
+.numericCell[data-figure='zero'] {
+  color: var(--ls-text-muted, #475569);
+}
+
+.numericCell[data-figure='negative'] {
+  color: var(--ls-danger, #b42318);
+  font-weight: 600;
 }
 
 /* The product code under a product name inside the row header. */
@@ -228,7 +277,7 @@
  * when the group opens the table - and a second declaration here does not collapse with a shadow,
  * so it measured as a 2px edge under the header in Chrome. */
 .groupRow th {
-  padding: var(--ls-space-2, 8px) var(--ls-space-3, 12px);
+  padding: var(--ls-space-2, 8px);
   border-block-end: 1px solid var(--ls-border, #cbd5e1);
   color: inherit;
   font-size: var(--ls-text-xs, 12px);

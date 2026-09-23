@@ -217,8 +217,11 @@ export interface InventorySummaryInput {
   /** Report only the lines in one selling state. `null` applies no constraint. */
   state?: StockState | null | undefined;
   /**
-   * Report only the lines whose ledger holds a change of one kind. `null`
-   * applies no constraint.
+   * Count only the recorded stock changes of one kind towards the units the
+   * ledger has moved. It is a question about the ledger, so it bounds
+   * `movementVolume` and nothing else: the physical-stock figures, the page of
+   * stock lines and the low-stock list report the same stock with it as
+   * without it. `null` counts every kind of change.
    */
   movement?: MovementType | null | undefined;
 }
@@ -685,8 +688,10 @@ async function hold(lines: readonly ReservedLine[], reference: string): Promise<
  * balance: the units the ledger has recorded against the lines the filters
  * matched, with goods in and goods out both counting as the units they moved.
  * It is read over the whole recorded history, so it answers how much stock has
- * passed through what the caller asked about, and a movement filter narrows it
- * to one kind of change.
+ * passed through what the caller asked about, and a movement filter narrows
+ * that one figure - and only that figure - to a single kind of change: the
+ * totals on the cards, the page of lines and the low-stock list are the same
+ * stock whether a movement kind is named or not.
  *
  * @param input Which locations, states and lines to report on; `{}` answers the
  * figures the dashboard opens on.
@@ -757,24 +762,12 @@ export async function readInventorySummary(
     location = match.id;
   }
 
-  // A movement filter asks for the lines whose ledger holds a change of that
-  // kind, which is a question about the ledger rather than about stock: the
-  // products it names are resolved first and then constrain both statements
-  // below, so neither of them has to reach into the ledger itself.
-  let only: string[] | null = null;
-
-  if (movement !== null) {
-    const groups = await prisma.inventoryMovement.groupBy({
-      by: ['productId'],
-      where:
-        location === null
-          ? { movementType: movement }
-          : { movementType: movement, warehouseId: location },
-    });
-
-    only = groups.map((group) => group.productId);
-  }
-
+  // A movement kind is a question about the ledger, so it narrows the units the
+  // ledger accounted for and nothing else: the last of the four statements
+  // below is the only one that takes it. The physical-stock figures, the page of
+  // stock lines and the low-stock list report the same stock they report
+  // without it.
+  //
   // Four questions about the same stock, and none of them reads another's
   // answer: the figures on the cards, the page of stock lines, the lines that
   // have fallen to their point, and the units the ledger accounts for. They are
@@ -797,9 +790,8 @@ export async function readInventorySummary(
                    AND l.on_hand - l.reserved > 0
                    AND l.on_hand - l.reserved <= l.reorder_point + $2::int)
                OR ($3::text = 'IN_STOCK' AND l.on_hand - l.reserved > l.reorder_point + $2::int))
-          AND ($4::text[] IS NULL OR l.product_id = ANY($4::text[]))
       `,
-      [location, threshold, state, only],
+      [location, threshold, state],
     ),
     // One page of the stock lines the same filters matched, under the same
     // selling-state rule as the figures above so the table and the cards can
@@ -828,11 +820,10 @@ export async function readInventorySummary(
                    AND l.on_hand - l.reserved > 0
                    AND l.on_hand - l.reserved <= l.reorder_point + $2::int)
                OR ($3::text = 'IN_STOCK' AND l.on_hand - l.reserved > l.reorder_point + $2::int))
-          AND ($4::text[] IS NULL OR l.product_id = ANY($4::text[]))
         ORDER BY c.name, p.name, l.product_id, w.code
-        LIMIT $5::int OFFSET $6::int
+        LIMIT $4::int OFFSET $5::int
       `,
-      [location, threshold, state, only, size, (page - 1) * size],
+      [location, threshold, state, size, (page - 1) * size],
     ),
     pool.query<Shortage>(
       `
@@ -852,11 +843,10 @@ export async function readInventorySummary(
                OR ($3::text = 'OUT_OF_STOCK' AND l.on_hand - l.reserved <= 0)
                OR ($3::text = 'LOW_STOCK' AND l.on_hand - l.reserved > 0)
                OR ($3::text = 'IN_STOCK' AND l.on_hand - l.reserved > l.reorder_point + $2::int))
-          AND ($4::text[] IS NULL OR l.product_id = ANY($4::text[]))
         ORDER BY (l.on_hand - l.reserved) - l.reorder_point, p.sku, w.code
-        LIMIT $5::int
+        LIMIT $4::int
       `,
-      [location, threshold, state, only, LOW_STOCK_LINES],
+      [location, threshold, state, LOW_STOCK_LINES],
     ),
     // Both directions count as the units they moved, so goods in and goods out
     // add up instead of cancelling: the figure is what the ledger has handled,

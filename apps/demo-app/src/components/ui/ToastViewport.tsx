@@ -40,6 +40,18 @@
  * reachable in document order like any other button, which is the correct trade for a message that
  * retires by itself anyway.
  *
+ * THE REGION IDENTIFIES ITSELF, SO A MODAL SURFACE CAN LEAVE IT ALONE
+ * `data-ls-live-region="true"` on the root is a contract with exactly one reader:
+ * `@/components/cart/CartDrawer`, which - while its `aria-modal="true"` sheet is open - puts the
+ * `inert` attribute on every other child of `document.body` so no focus move, find-in-page hit or
+ * assistive-technology cursor can land behind the dialog. This region must survive that sweep: the
+ * drawer's own rows raise notices while it is open ("Quantity updated", "Removed from cart"), and
+ * an inert live region is out of the accessibility tree, so it announces nothing. The drawer skips
+ * any body child that is, or contains, `[data-ls-live-region]`, which is this attribute and nothing
+ * else in the document. It is a data attribute rather than an id or a class because the marker
+ * states a role for other code to read, carries no styling, and must not be renamed by a CSS Module
+ * hash. Removing it would silence every notice raised from inside the cart drawer.
+ *
  * STRUCTURE, AND WHY IT IS FLAT
  * `ToastViewport.module.css` lays a notice out as a two-column grid - the message, then the
  * dismiss control - with `.title` and `.body` placed in column 1 and `.dismiss` in column 2 of row
@@ -97,6 +109,9 @@ export function ToastViewport() {
       aria-live="polite"
       aria-atomic="false"
       aria-relevant="additions"
+      // Read by `@/components/cart/CartDrawer` and by nothing else: the one body subtree its
+      // modal `inert` sweep must leave interactive and announceable. See the header.
+      data-ls-live-region="true"
     >
       <ul className={styles.list}>
         {toasts.map((toast) => (

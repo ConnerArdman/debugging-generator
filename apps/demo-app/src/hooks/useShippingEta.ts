@@ -31,6 +31,7 @@
 import { useEffect, useState } from 'react';
 
 import { StorefrontApiError, requestShippingQuote } from '@/lib/api-client';
+import { freightDestinationProblem } from '@/lib/destination';
 import { MAX_SHIPMENT_UNITS } from '@/lib/types';
 import type { ShippingQuoteResult, StorefrontErrorCode } from '@/lib/types';
 import { useDispatchEta, type DispatchEta } from '@/providers/ShippingEtaProvider';
@@ -67,17 +68,22 @@ export function useShippingEta(): DispatchEta {
 }
 
 /**
- * Shortest destination worth asking a quote for.
+ * How long the destination has to stand still before it is quoted, in
+ * milliseconds.
  *
- * `GET /api/shipping/quote` refuses a postal code of fewer than three
- * characters, so anything shorter is a field somebody is still typing rather
- * than a destination, and asking would spend a request on a question already
- * known to be refused. The rest of what makes a postal code plausible - which
- * characters, and how they group - is the endpoint's to judge, and is
- * deliberately not restated here: a second, competing idea of a valid address
- * would go stale the first time the store shipped somewhere new.
+ * A postal code arrives one character at a time, and every intermediate value
+ * is a destination somebody has not finished writing. Quoting each of them
+ * spends a carrier lookup - the slowest thing checkout asks for, and a real
+ * account would be metered per request - on a question nobody asked, and the
+ * answers arrive in an order nobody controls. So the lookup waits for the
+ * typing to stop: a field that changes again inside the window replaces the
+ * pending lookup rather than adding to it, and one destination produces one
+ * request however many keystrokes it took to write.
+ *
+ * Short enough not to be felt beside a carrier that takes several hundred
+ * milliseconds to answer, and long enough to cover an ordinary typing rhythm.
  */
-const MIN_DESTINATION_CODE_LENGTH = 3;
+const QUOTE_DEBOUNCE_MS = 300;
 
 /** Wording for a failed lookup that named no reason this module recognises. */
 const FREIGHT_QUOTE_UNAVAILABLE = 'Shipping services could not be quoted right now.';
@@ -123,19 +129,27 @@ interface FreightLookup {
 }
 
 /**
- * The destination and the unit count as one value, which is what makes two
- * lookups comparable.
+ * The destination - both halves of it - and the unit count as one value, which
+ * is what makes two lookups comparable.
+ *
+ * The country is part of the question because it is part of the answer: the
+ * same postal code names a different place in each country that writes codes
+ * that way, and the store quotes them differently. A key without it would make
+ * a change of country look like no change at all, leaving one country's rates
+ * on screen as the authority for another's.
  *
  * A NUL separator rather than a punctuation character: a postal code is
- * letters, digits, spaces and hyphens, and none of those can be a NUL, so no
- * pair of different questions can be written the same way.
+ * letters, digits, spaces and hyphens and a country code is two letters, so
+ * neither can contain a NUL and no pair of different questions can be written
+ * the same way.
  *
+ * @param country The canonical destination country code, or `''`.
  * @param destination The trimmed destination postal code, or `''`.
  * @param units The whole number of units, or `0` for no shipment described.
  * @returns The comparable form of that question.
  */
-function freightKeyOf(destination: string, units: number): string {
-  return `${String(units)}\u0000${destination}`;
+function freightKeyOf(country: string, destination: string, units: number): string {
+  return `${String(units)}\u0000${country}\u0000${destination}`;
 }
 
 /** Everything a shipping picker needs to render itself. */
@@ -151,8 +165,9 @@ export interface FreightQuoteState {
    * this hook was just called with, which makes it the authority on what is on
    * offer: the services it lists are the services that can be chosen, and a
    * quote listing none is a destination with nothing on offer rather than a
-   * reason to fall back to a list of rates. A caller that renders its own
-   * services before a quote arrives replaces them with these once it does.
+   * reason to fall back to a list of rates. It is also the *only* authority -
+   * a caller with no quote in hand has no services and no prices to show, since
+   * a rate is a property of a destination and the store has not named one.
    *
    * "In hand" is the whole of the guarantee, and it holds from the first render
    * after the arguments change rather than from the effect that follows it: an
@@ -198,13 +213,17 @@ function freightQuoteNotice(code: StorefrontErrorCode, status: number): string {
   switch (code) {
     case 'NETWORK_FAILURE':
       return 'Shipping services cannot be quoted while the connection is down.';
-    // The destination is the only thing this wording can name, and the only
-    // thing it needs to: a lookup carries a postal code and a unit count, and
-    // the count is checked against `MAX_SHIPMENT_UNITS` before anything is sent
-    // - a shipment too large is reported as its own state and never reaches
-    // this function - so a parameter the endpoint rejected is the address.
+    // A rejected request is a disagreement rather than a diagnosis, and this
+    // wording says exactly that much. Every fault in the destination itself -
+    // a country the store does not serve, an unfinished code, a code written as
+    // no code in that country is - is judged before anything is sent, against
+    // the same rule the endpoint applies, and is reported against the field at
+    // fault by the surface that owns it. So a rejection reaching here is one
+    // this browser could not have predicted, and telling the customer their
+    // postal code is incomplete would be a guess - and wrong wherever it is not
+    // the code that the endpoint objected to.
     case 'VALIDATION_FAILED':
-      return 'Enter a complete destination postal code to see shipping services.';
+      return 'The store could not quote shipping for this destination. Check the address and try again.';
     case 'NOT_FOUND':
       return 'No shipping service reaches that destination.';
     case 'MALFORMED_RESPONSE':
@@ -226,12 +245,33 @@ function freightQuoteNotice(code: StorefrontErrorCode, status: number): string {
  * checkout alone - the order can still be reviewed and the address corrected -
  * and a later successful lookup clears the wording again.
  *
- * Nothing is asked until there is a destination to ask about. A `null`, blank
- * or half-typed code leaves the state exactly where it starts and sends no
- * request, so the panel costs nothing on a checkout page nobody has filled in
- * yet. The destination is taken as it is written and trimmed, and the lookup
- * follows that text: the same code typed again, or a re-render while the field
- * stands still, asks nothing further, and a genuinely different code asks once.
+ * Why the destination's own faults are *not* in that state: they are a
+ * statement about the fields rather than about the lookup, they belong against
+ * the control at fault rather than in the shipping panel, and the surface that
+ * owns those controls is the one that has to make it - a caller that withholds
+ * the destination from this hook for a reason of its own (a cart it has not
+ * read yet) would otherwise be told its postal code is missing. So this hook
+ * reads `@/lib/destination` to decide what to ask, and the form and the picker
+ * read the same module to decide what to say.
+ *
+ * Nothing is asked until there is a destination to ask about, and a destination
+ * is both a country and a postal code that is a complete one for it. A `null`,
+ * blank, unfinished or malformed code, and a country this store does not quote
+ * freight to, all leave the state exactly where it starts and send no request -
+ * so the panel costs nothing on a checkout page nobody has filled in yet, and
+ * an address being typed does not spend a carrier lookup on each of the values
+ * it passes through. The judgement is `@/lib/destination`'s, which is the same
+ * rule `GET /api/shipping/quote` applies when a request does arrive, so this
+ * hook withholds exactly the requests that endpoint would refuse; the caller
+ * reads that module for the wording to show against the field at fault.
+ *
+ * The destination is taken as it is written, trimmed, with the country
+ * upper-cased, and the lookup follows that text: the same code typed again, or
+ * a re-render while the fields stand still, asks nothing further, and a
+ * genuinely different destination asks once. Once - not once per keystroke:
+ * the request waits {@link QUOTE_DEBOUNCE_MS} for the fields to stand still,
+ * and a change inside that window replaces the pending lookup before it is
+ * sent.
  *
  * A quote belongs to the one destination it was asked for, so a change of
  * destination clears the services on screen before the next lookup rather than
@@ -264,6 +304,10 @@ function freightQuoteNotice(code: StorefrontErrorCode, status: number): string {
  * from a rejected address.
  *
  * @param postalCode Where the order is going, or `null` when nobody has said.
+ * @param country Which country that postal code is in, or `null` when nobody
+ * has said. Part of the question rather than a refinement of it: it decides
+ * what a complete postal code looks like and it changes the rate, so a change
+ * of country re-quotes exactly as a change of code does.
  * @param itemCount How many units the shipment carries, or `null`/omitted
  * where there is no shipment to describe yet.
  * @returns The quoted services, the in-flight flag, the failure wording and the
@@ -271,11 +315,16 @@ function freightQuoteNotice(code: StorefrontErrorCode, status: number): string {
  */
 export function useFreightQuote(
   postalCode: string | null,
+  country: string | null,
   itemCount?: number | null,
 ): FreightQuoteState {
   // The trimmed text is what the lookup is keyed on, so surrounding whitespace
   // a pasted or padded field carried does not read as a different destination.
   const destination = postalCode === null ? '' : postalCode.trim();
+
+  // The country as every surface writes it, so a code chosen from the checkout
+  // control and one read from a link in lower case are one destination.
+  const region = country === null ? '' : country.trim().toUpperCase();
 
   // A whole number of units, or `0` for "no shipment described". Floored rather
   // than rounded, and guarded against a non-finite figure, so the key below is
@@ -295,13 +344,13 @@ export function useFreightQuote(
     units > MAX_SHIPMENT_UNITS ? { units, maxUnits: MAX_SHIPMENT_UNITS } : null;
 
   // The question the arguments in hand ask, and whether it is one this hook
-  // will ask the store: a half-typed destination is a question nobody has
-  // finished writing, and a shipment above the ceiling is one the endpoint
-  // refuses. Both are computed here so that this render can say what it knows
-  // without waiting for the effect below, and the effect repeats them from the
-  // same two arguments rather than closing over these.
-  const key = freightKeyOf(destination, units);
-  const askable = destination.length >= MIN_DESTINATION_CODE_LENGTH && shipmentLimit === null;
+  // will ask the store: a destination that is not a complete one is a question
+  // nobody has finished writing, and a shipment above the ceiling is one the
+  // endpoint refuses. Both are computed here so that this render can say what
+  // it knows without waiting for the effect below, and the effect repeats them
+  // from the same three arguments rather than closing over these.
+  const key = freightKeyOf(region, destination, units);
+  const askable = freightDestinationProblem(region, destination) === null && shipmentLimit === null;
 
   const [lookup, setLookup] = useState<FreightLookup>(() => ({
     key,
@@ -320,20 +369,39 @@ export function useFreightQuote(
     // produces, which is this hook's own doing and never wording for a
     // customer.
     const controller = new AbortController();
-    // Both halves of the question, written from the two arguments this effect
+    // Every part of the question, written from the three arguments this effect
     // is keyed on, so the state it writes carries the question it answers and
     // the condition it was asked under is legible where it is applied. A
-    // half-typed destination is a question nobody has finished writing; a
-    // shipment above the ceiling is one the endpoint refuses.
-    const asked = freightKeyOf(destination, units);
+    // destination that is not complete is a question nobody has finished
+    // writing; a shipment above the ceiling is one the endpoint refuses.
+    const asked = freightKeyOf(region, destination, units);
     const shouldQuote =
-      destination.length >= MIN_DESTINATION_CODE_LENGTH && units <= MAX_SHIPMENT_UNITS;
+      freightDestinationProblem(region, destination) === null && units <= MAX_SHIPMENT_UNITS;
 
     setLookup({ key: asked, quote: null, isQuoting: shouldQuote, quoteError: null });
 
-    if (shouldQuote) {
+    if (!shouldQuote) {
+      return () => {
+        controller.abort();
+      };
+    }
+
+    // The wait before asking, which is what makes a typed destination one
+    // lookup instead of one per character. The timer is this render's own and
+    // the cleanup below clears it, so a field that changes again inside the
+    // window never sends the superseded question at all - it is replaced rather
+    // than raced. `isQuoting` is already true above: a lookup the store is
+    // about to be asked for is in flight as far as a caller is concerned, so
+    // the picker shows it being quoted and nothing can be ordered on rates
+    // gathered for a destination the customer has moved on from.
+    const timer = setTimeout(() => {
       requestShippingQuote({
         postalCode: destination,
+        // Both halves of the destination. The country is sent whenever there is
+        // one to send, because it changes the rate; an absent one leaves the
+        // endpoint to quote the store's own country, which is the only thing a
+        // question with no country named can mean.
+        country: region.length > 0 ? region : undefined,
         // Sent only when there is a shipment to describe; otherwise the
         // parameter is dropped and the endpoint rates its default single unit.
         itemCount: units > 0 ? units : undefined,
@@ -359,17 +427,19 @@ export function useFreightQuote(
                 : FREIGHT_QUOTE_UNAVAILABLE,
           });
         });
-    }
+    }, QUOTE_DEBOUNCE_MS);
 
     return () => {
+      clearTimeout(timer);
       controller.abort();
     };
-    // Both halves of the question, so a shipment that grew is re-quoted exactly
-    // as a corrected address is: the services on screen are cleared, the lookup
-    // for the previous shipment is aborted, and one lookup asks about what the
-    // customer is actually sending now. Two integers, so a re-render while
-    // neither has changed asks nothing further.
-  }, [destination, units]);
+    // Every part of the question, so a shipment that grew or a country that
+    // changed is re-quoted exactly as a corrected postal code is: the services
+    // on screen are cleared, the lookup for the previous question is cancelled
+    // - before it was sent, or aborted after - and one lookup asks about what
+    // the customer is actually sending now. Two strings and an integer, so a
+    // re-render while none of them has changed asks nothing further.
+  }, [region, destination, units]);
 
   // An answer is returned only to the question it answers. The effect above
   // runs after this render, so the first render for a corrected address or a

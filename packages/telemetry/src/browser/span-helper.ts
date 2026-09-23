@@ -192,7 +192,12 @@ export interface BrowserSpanHelper {
   readonly version: number;
 
   /**
-   * The last `agent.config` payload, verbatim, for diagnostics only.
+   * What the last `agent.config` was read as, for diagnostics only.
+   *
+   * The normalised projection `./agent.ts` publishes (its `publishedConfig`),
+   * never the relayed payload: a closed, JSON-compliant key set built from the
+   * decisions that module took, so a key the wire payload carries cannot
+   * appear on this page-visible global by arriving.
    *
    * Nothing in this module reads it — configuration flows through
    * {@link setSpanHelperEnabled} and `configureTransport` — and it is typed
@@ -1992,7 +1997,7 @@ export function setSpanHelperEnabled(enabled: boolean, captureId?: string): void
 }
 
 /**
- * Record the last `agent.config` payload for diagnostics.
+ * Record what the last `agent.config` was read as, for diagnostics.
  *
  * Published on {@link BrowserSpanHelper.config} so that a developer inspecting
  * `window.__DEBUGGEN__` in the console, and the DevTools panel reading it
@@ -2000,7 +2005,10 @@ export function setSpanHelperEnabled(enabled: boolean, captureId?: string): void
  * told. Nothing in this module reads it, and it is remembered even when no
  * helper is installed yet, so a later {@link installSpanHelper} publishes it.
  *
- * @param config The payload, verbatim and untyped.
+ * @param config The normalised projection `./agent.ts` builds from the parsed
+ * configuration (its `publishedConfig`) — not the relayed payload, which is
+ * never published on a page-visible global. Typed `unknown` because this module
+ * only stores it.
  */
 export function setSpanHelperConfig(config: unknown): void {
   lastConfig = config;

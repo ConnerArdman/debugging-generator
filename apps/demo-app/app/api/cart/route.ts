@@ -14,6 +14,12 @@
  * default, and an unknown parameter is stripped rather than rejected, so an
  * empty query and a query carrying a campaign tag are both complete requests.
  *
+ * A session that has no cart is not a failed request: the service opens one and
+ * this endpoint answers with it, empty. So a browser opening the storefront for
+ * the first time and a browser whose last cart became an order are both told
+ * what their cart holds - nothing - rather than being told there is no cart,
+ * and the only state that answers `404` is a cart a checkout is holding.
+ *
  * The view is serialized exactly as the service built it. Money is already an
  * integer count of cents in its `*Cents` fields and the one timestamp is
  * already an ISO-8601 UTC string, which is why the object is passed to
@@ -42,9 +48,10 @@ export const dynamic = 'force-dynamic';
  * Answers with the cart the request's session token addresses.
  *
  * @param request The incoming request; only its URL is read.
- * @returns `200` with the cart's `CartView`, or the mapper's failure envelope -
- * `404` when the token addresses no open cart and `400` when the query itself
- * was rejected.
+ * @returns `200` with the cart's `CartView` - the session's open cart, or the
+ * empty one opened for it - or the mapper's failure envelope: `404` when a
+ * checkout is holding this session's cart, and `400` when the query itself was
+ * rejected.
  */
 export async function GET(request: Request): Promise<Response> {
   try {

@@ -166,10 +166,15 @@ a.name:focus-visible,
 }
 
 /* The product code. Monospaced and tabular by family, so codes line up down the list. */
+/* `font-variant-numeric` completes the identifier treatment this row shares with the catalog card
+ * and the product page's specification list: those two set it, this row had not, so the one code a
+ * shopper reads on all three surfaces sat on a fixed digit pitch on two of them and the face's
+ * default pitch here. It is the last property of that treatment that still differed. */
 .sku {
   color: var(--ls-text-muted, #475569);
   font-family: var(--ls-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
   font-size: var(--ls-text-xs, 12px);
+  font-variant-numeric: tabular-nums;
   line-height: 1.4;
 }
 

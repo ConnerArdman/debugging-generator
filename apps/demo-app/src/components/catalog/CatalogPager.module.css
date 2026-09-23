@@ -4,7 +4,8 @@
  * Styles src/components/catalog/CatalogPager.tsx, whose markup is a <nav> holding the Previous
  * control, the numbered <ul>, the Next control and the "Page n of m" line. Previous and Next are
  * `next/link` anchors while a page exists in that direction and inert <span>s when one does not,
- * so both shapes share a single chip rule and only their colours differ. Eight classes are
+ * so both shapes share a single chip rule and the inert one restates the few declarations that
+ * have to mark it as unavailable - its ink, its stroke and its cursor. Eight classes are
  * exported and the component uses all eight: root, list, item, link, current, disabled, ellipsis
  * and summary.
  *
@@ -139,14 +140,34 @@
   font-weight: var(--pager-current-weight);
 }
 
-/* An out-of-range Previous or Next. The component renders a <span>, which has no activation
- * behaviour at all; `pointer-events` makes that plain to a mouse too, and the muted label reads
- * as unavailable without colour carrying the meaning on its own. The border is restated rather
- * than inherited so the shared chip's hairline can change without recolouring this state. */
+/* An out-of-range Previous or Next. The component renders a <span> carrying role="link" and
+ * aria-disabled, which has no activation behaviour at all - no href and no handler, so there is
+ * nothing to suppress: what makes this chip inert is its markup, not its styling.
+ *
+ * Unavailability is stated three times over, and only one of those is a colour. The border turns
+ * dashed - a shape a reader takes in at a glance and one that survives greyscale, a colour-vision
+ * deficiency and a forced-colours mode that discards this palette outright - the cursor reports
+ * the same thing on the way to a click that would do nothing, and the label is muted. The
+ * `border-style` here overrides the shared chip's `solid` while the colour below keeps the muted
+ * hairline, so the box and its width stay exactly as specified and only the stroke changes.
+ *
+ * `pointer-events: none` used to stand here and was removed deliberately: it made the chip
+ * unhoverable, which is precisely what suppressed the `not-allowed` cursor and left text colour as
+ * the only cue. It was never what made the control inert.
+ *
+ * NO `opacity` REDUCTION, ON PURPOSE. The muted ink measures ~7.6:1 on the chip's surface fill;
+ * blending the same ink at 0.6 opacity over that fill drops it to about 3.0:1, under the 4.5:1
+ * minimum for body-sized text. A dimmed chip would therefore trade one accessibility defect for a
+ * worse one, so the cue is carried by shape and cursor and the label is left at full strength.
+ *
+ * `cursor`, `border-style` and `pointer-events` take keywords rather than tokens: there is no
+ * palette or scale for them to read, and the file's token contract covers colours, lengths and
+ * type values. */
 .disabled {
+  border-style: dashed;
   border-color: var(--ls-mist, #cbd5e1);
   color: var(--ls-text-muted, #475569);
-  pointer-events: none;
+  cursor: not-allowed;
 }
 
 /* The gap marker between two page windows. It is an <li> of its own, hidden from assistive

@@ -66,7 +66,7 @@
  * browser — which is what makes exact assertions on its groups,
  * windows and counts legitimate, and it is the only place in this suite where a
  * *whole* capture reaches the aggregate: seven request events among
- * twenty-three that must leave no trace in the result.
+ * twenty-eight that must leave no trace in the result.
  *
  * ## Fixture conventions
  *
@@ -2529,7 +2529,7 @@ describe('the resource-timing contract', () => {
  * The committed capture fixture
  *
  * `packages/telemetry/test/fixtures/capture-batch.json` is this package's
- * curated, already-redacted capture: thirty persisted events of eleven kinds,
+ * curated, already-redacted capture: thirty-five persisted events of eleven kinds,
  * one trace, one capture window and two producers, spanning the browser, server
  * and database tiers. It is repository data rather than captured telemetry —
  * hand-authored and reviewed, with every URL query value already masked, which
@@ -2551,7 +2551,7 @@ describe('the resource-timing contract', () => {
  *   milliseconds carry *one*. Both halves of AAP 0.5.2's sentence therefore
  *   hold on a sample shaped like what ingest produces, and not only on events
  *   this file assembled to make the point.
- * - **It is a whole capture.** Twenty-three of the thirty events are not
+ * - **It is a whole capture.** Twenty-eight of the thirty-five events are not
  *   request-shaped — an interaction, renders and commits, route handlers and
  *   server functions, database queries, state transitions, a long task, an
  *   error, and the two `http.server` spans that answered two of the fetches and
@@ -2634,7 +2634,7 @@ function captureBatchEvents(): readonly TelemetryEvent[] {
  */
 
 /** Events the committed capture holds, all told. */
-const FIXTURE_EVENT_COUNT = 30;
+const FIXTURE_EVENT_COUNT = 35;
 
 /** Of those, the ones whose kind is a request kind — the aggregate's input. */
 const FIXTURE_REQUEST_EVENT_COUNT = 7;
@@ -2762,7 +2762,7 @@ describe('the committed capture fixture', () => {
     expect(captureBatchEvents()).not.toBe(CAPTURE_BATCH_EVENTS);
   });
 
-  it('holds seven request events among twenty-three the aggregate must ignore', () => {
+  it('holds seven request events among twenty-eight the aggregate must ignore', () => {
     const events = captureBatchEvents();
     const requestEvents = events.filter((event) => REQUEST_KINDS.includes(event.kind));
     const ignoredEvents = events.filter((event) => !REQUEST_KINDS.includes(event.kind));
@@ -3101,9 +3101,10 @@ describe('aggregateRequests over the committed capture fixture', () => {
       fixtureEvent(events, elementAt(FIXTURE_BURST_FETCH_IDS, 0, 'the first burst fetch')),
     );
 
-    // Twenty-three events - an interaction, renders and commits, route
-    // handlers, server functions, queries, state transitions, a long task, an
-    // error and the two server spans - produce no group at all.
+    // Twenty-eight events - an interaction, renders and commits, route
+    // handlers, server functions, statements and the database tier's own
+    // lifecycle spans, state transitions, a long task, an error and the two
+    // server spans - produce no group at all.
     expect(ignoredEvents).toHaveLength(FIXTURE_IGNORED_EVENT_COUNT);
     expect(aggregateRequests(ignoredEvents)).toStrictEqual([]);
 

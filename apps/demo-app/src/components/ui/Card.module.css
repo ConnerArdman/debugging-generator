@@ -101,6 +101,16 @@
  * deliberate: the catalog renders roughly four dozen cards at once and a hover response on
  * a box that does nothing reads as a bug.
  *
+ * There is deliberately no `cursor: pointer` here. The card itself is not a target - it
+ * takes no click handler, no `role` and no tab stop - so a pointer cue spanning the whole
+ * surface promised that the artwork, the product code and the price could be clicked, and
+ * every one of them does nothing when they are. The cue belongs to the elements that do
+ * answer a press, and each of them already carries it: `Button.module.css` declares
+ * `cursor: pointer` on the control, and a link is a pointer by the browser's own default.
+ * What the attribute signals instead is that the card *contains* something to act on, which
+ * is what the border tint and the lift below say without claiming a target the box has not
+ * got.
+ *
  * Only `box-shadow` and `border-color` ever change, so no geometry moves and a pointer
  * crossing the grid cannot reflow the page - which matters here, because this storefront
  * deliberately exhibits render behaviour that a shifting layout would be mistaken for.
@@ -109,7 +119,6 @@
  * a touch device costs a reader nothing, and the gate would drop the affordance entirely in
  * the headless and emulated environments that report no hovering pointer. */
 .root[data-interactive='true'] {
-  cursor: pointer;
   transition:
     box-shadow 160ms ease-out,
     border-color 160ms ease-out;
@@ -120,13 +129,24 @@
   box-shadow: var(--ls-shadow-2, 0 4px 12px rgba(15, 23, 42, 0.1));
 }
 
-/* Focus belongs to the link or button inside the card, and the ring is drawn on the card so
- * the whole target is obvious rather than just the word that holds focus. An outline, not a
- * border or an inset shadow: it stays out of the layout and clear of the hover treatment
- * above, and it matches the focus indicator the document already uses. */
+/* Focus inside the card, marked with the hover treatment rather than with a ring.
+ *
+ * Every focusable thing this application puts inside a card draws its own indicator - the
+ * document's `:focus-visible` rule in `app/globals.css` covers anything that declares
+ * nothing, and `Button.module.css`, `Pill.module.css` and the catalog tile's own link rule
+ * each refine it - so an outline on the card as well painted a second ring concentric with
+ * the first, in the same colour at a different offset. Two rings for one focused element
+ * tell a reader there are two things focused, and the outer one is the wrong shape: it
+ * surrounds a box that cannot be focused at all.
+ *
+ * So the card answers focus with exactly what it answers a hover with: the accent hairline
+ * and one step of elevation, which places the focused control's own ring in a card that has
+ * visibly come forward without adding an indicator of its own. It is also the same pair of
+ * properties the transition above already covers, so the two states arrive alike, and
+ * neither affects the layout. */
 .root[data-interactive='true']:focus-within {
-  outline: 2px solid var(--ls-focus, #0f766e);
-  outline-offset: 2px;
+  border-color: var(--ls-accent, #f59e0b);
+  box-shadow: var(--ls-shadow-2, 0 4px 12px rgba(15, 23, 42, 0.1));
 }
 
 /* This module's own reduced-motion rule, at its own specificity. The document collapses

@@ -27,8 +27,9 @@
  * The four are resolved in a fixed order, and only the first of them is allowed to coexist with
  * another:
  *
- *   1. A failure. `cartError` carries wording the provider has already made fit to show, so it is
- *      rendered as given inside a `danger` `../ui/Alert` - which announces itself assertively -
+ *   1. A failure. `cartError` carries wording the provider has already made fit to show and
+ *      `cartErrorTitle` the heading for the operation it belongs to, so both are rendered as given
+ *      inside a `danger` `../ui/Alert` - which announces itself assertively -
  *      with a retry control beside it. The list stays rendered underneath whenever there are still
  *      lines in hand: a refused change leaves the previously published cart in place, and replacing
  *      a cart a shopper can still read and still act on with an error screen would lose them work
@@ -93,10 +94,17 @@ import { CartLineRow } from './CartLineRow';
 import styles from './CartLineList.module.css';
 
 /**
- * The failure notice's heading. It names what could not be done rather than what went wrong,
- * because the sentence underneath it is the provider's own wording for the latter.
+ * The failure notice's heading when the cart published none of its own.
+ *
+ * The heading names what could not be done and the sentence underneath it is the provider's own
+ * wording for what went wrong, so the two have to describe the same operation - a change the store
+ * refused, reported under a heading about reading the cart, sends a shopper to fix a cart that
+ * loaded perfectly and is listed correctly right below the notice. The provider publishes the
+ * heading with the wording for exactly that reason and this list prints the one it published; this
+ * constant covers the only state with wording but no heading, a read that never answered, and it
+ * says what the provider's own read heading says so the two readings never differ.
  */
-const ERROR_TITLE = 'Your cart could not be loaded';
+const ERROR_TITLE = 'Your cart could not be read';
 
 /** The retry control's label. */
 const RETRY_LABEL = 'Try again';
@@ -188,7 +196,7 @@ interface Props {
  * ```
  */
 export function CartLineList({ variant = 'drawer', emptySlot, className }: Props): ReactElement {
-  const { lines, syncStatus, cartError, refreshCart } = useCart();
+  const { lines, syncStatus, cartError, cartErrorTitle, refreshCart } = useCart();
 
   /*
    * Ask the provider to read the cart again.
@@ -241,7 +249,7 @@ export function CartLineList({ variant = 'drawer', emptySlot, className }: Props
         <div className={styles.notice}>
           <Alert
             tone="danger"
-            title={ERROR_TITLE}
+            title={cartErrorTitle ?? ERROR_TITLE}
             actions={
               <Button variant="secondary" size="sm" onClick={handleRetry}>
                 {RETRY_LABEL}

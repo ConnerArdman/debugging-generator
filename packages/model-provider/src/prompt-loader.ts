@@ -261,6 +261,22 @@ const MAX_REPORTED_ISSUES = 10;
 const MAX_REPORTED_UNUSED_KEYS = 20;
 
 /**
+ * The substitutions a caller who supplied none is treated as having passed.
+ *
+ * {@link renderPrompt} asks for a record, so `null` and `undefined` can only
+ * reach it through a cast, through an untyped JavaScript call site, or as a
+ * context object a builder returned empty — and all three happen. Standing an
+ * empty record in at the door is what keeps this module's one promise intact:
+ * every malformed input leaves as a `Result`, and nothing leaves as a thrown
+ * `TypeError`, which no caller written against a `Result`-returning function
+ * is positioned to catch.
+ *
+ * Frozen because every such call shares this one instance, and a renderer must
+ * not be able to hand a caller a mutable object that later calls will see.
+ */
+const NO_PROMPT_VALUES: Readonly<Record<string, string | number | boolean>> = Object.freeze({});
+
+/**
  * The placeholder grammar, as a source string rather than a shared instance.
  *
  * `{{key}}`, with optional whitespace inside the braces and a key of letters,
@@ -1682,6 +1698,26 @@ export function createPromptLoader(options: PromptLoaderOptions = {}): PromptLoa
  * never the values, which are derived from the developer's source code and
  * captured telemetry.
  *
+ * ## Supplying nothing at all is the same as supplying an empty record
+ *
+ * A `null` or `undefined` in the `values` position is a caller-side defect the
+ * signature already forbids, and it is handled rather than thrown on: "no
+ * substitutions are available" is exactly what an empty record means here, so
+ * one stands in and the ordinary rules then apply unchanged — a template that
+ * names placeholders fails below naming every one of them, and a template that
+ * names none renders unchanged, there being nothing to substitute. The defect
+ * is still recorded, at `debug` and in the failure's `details.valuesSupplied`,
+ * so it reads as "the call arrived with no values" rather than as "the object
+ * was missing these keys" and the developer looks at the call site instead of
+ * at their key names.
+ *
+ * What must never happen is the alternative: both accesses to this argument —
+ * the presence check per placeholder and the unused-key diagnostic — are
+ * `Object` operations that reject a nullish receiver, so an unguarded renderer
+ * throws a `TypeError` out of a function that every caller invokes for its
+ * `Result`. A stage would lose its typed failure, its hint and its session
+ * status to an exception nothing on that path is written to catch.
+ *
  * ## The single-pass guarantee
  *
  * One left-to-right pass, and substituted text is **never re-scanned**. A value
@@ -1694,13 +1730,16 @@ export function createPromptLoader(options: PromptLoaderOptions = {}): PromptLoa
  * @param template The prompt text, normally {@link PromptFile.text}.
  * @param values The substitutions. Strings are inserted as they are; numbers
  * and booleans are stringified without locale involvement, so the same input
- * renders identically on every machine.
- * @param logger Where the unused-key diagnostic goes. Defaults to
+ * renders identically on every machine. A nullish argument is read as
+ * {@link NO_PROMPT_VALUES}, an empty record.
+ * @param logger Where the unused-key and no-values diagnostics go. Defaults to
  * `noopLogger`, which is why the two-argument call is the ordinary one.
  * @returns The rendered prompt, or `CONFIG_INVALID` naming every placeholder
  * that had no value — a mismatch between a versioned prompt file and the code
- * that renders it — or `INTERNAL` when a value's runtime type is not one the
- * signature permits, which only a cast can produce.
+ * that renders it, or a caller that supplied no values at all, which the
+ * failure's `details.valuesSupplied` distinguishes — or `INTERNAL` when the
+ * template is not a string or a value's runtime type is not one the signature
+ * permits, neither of which anything but a cast can produce.
  *
  * @example
  * ```ts
@@ -1721,6 +1760,32 @@ export function renderPrompt(
         details: { templateType: typeof template },
       }),
     );
+  }
+
+  // Declared as a record and checked anyway, exactly as the template above is.
+  // Left unchecked, a nullish argument reaches `Object.hasOwn(values, key)` in
+  // the scan below — or `Object.keys(values)` in the unused-key diagnostic, for
+  // a template that names no placeholder at all — and both throw `TypeError:
+  // Cannot convert undefined or null to object` past every `Result` this
+  // module returns.
+  //
+  // The condition is read off a widened alias rather than off `values`: the
+  // declared type is not nullable, so a check written against the parameter is
+  // one the compiler narrows away as dead, and the next reader deletes.
+  const argument: unknown = values;
+  const nothingSupplied = argument === null || argument === undefined;
+  const supplied = nothingSupplied ? NO_PROMPT_VALUES : values;
+
+  if (nothingSupplied) {
+    // A caller bug rather than a prompt bug, so it is recorded beside the
+    // unused-key diagnostic rather than raised on its own: with placeholders
+    // present the failure below already names every one of them, and with none
+    // present there is nothing to fail about. The type is logged, never a
+    // value — there is none to log here, and the habit is what keeps this
+    // module's diagnostics free of the developer's code and telemetry.
+    logger.debug('No placeholder values were supplied to render a prompt', {
+      valuesType: argument === null ? 'null' : 'undefined',
+    });
   }
 
   const missing = new Set<string>();
@@ -1754,7 +1819,7 @@ export function renderPrompt(
     // `Object.hasOwn`, never a bare property read: a key may legally contain
     // underscores, so '__proto__' matches the grammar, and an inherited member
     // must not become a substitution.
-    const value: unknown = Object.hasOwn(values, key) ? values[key] : undefined;
+    const value: unknown = Object.hasOwn(supplied, key) ? supplied[key] : undefined;
 
     if (value === undefined || value === null) {
       missing.add(key);
@@ -1803,7 +1868,12 @@ export function renderPrompt(
           hint:
             'Supply a value for every placeholder the prompt names, or write a new prompt version ' +
             'that does not name it.',
-          details: { missingPlaceholders: keys },
+          // `valuesSupplied` appears only when it is false, and says which of
+          // two very different call-site mistakes this is: an object that lacks
+          // some keys, or no object at all.
+          details: nothingSupplied
+            ? { missingPlaceholders: keys, valuesSupplied: false }
+            : { missingPlaceholders: keys },
         },
       ),
     );
@@ -1823,7 +1893,7 @@ export function renderPrompt(
     );
   }
 
-  const unused = Object.keys(values).filter((key) => !used.has(key));
+  const unused = Object.keys(supplied).filter((key) => !used.has(key));
   if (unused.length > 0) {
     logger.debug('Prompt template does not reference every supplied value', {
       unusedKeys: unused.slice(0, MAX_REPORTED_UNUSED_KEYS).sort(),

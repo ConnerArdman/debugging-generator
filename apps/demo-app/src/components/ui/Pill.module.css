@@ -23,15 +23,17 @@
  * card below it - on each click. Selection changes three colours and nothing else; the box is
  * fixed by `.root`.
  *
- * Cascade order matters twice in this file and is the reason the blocks are in the order they
+ * Cascade order matters three times in this file and is the reason the blocks are in the order they
  * are: the selected rule is written after the tone rules because the two have equal specificity,
- * and the selected hover rule carries a longer selector than the plain hover rule so a selected
- * chip stays inverted while the pointer is over it.
+ * the selected hover rule carries a longer selector than the plain hover rule so a selected chip
+ * stays inverted while the pointer is over it, and the two pressed rules are written after both
+ * hover rules - the selected one longer again - so a press wins over a hover on the chip under the
+ * pointer.
  *
  * Every value is `var(--ls-TOKEN, <fallback>)` against the tokens declared in
  * `app/globals.css`; the fallbacks mirror them so this module also renders sensibly on its own.
- * Bare literals appear only for border and outline widths, an opacity, a duration, and the
- * keywords `0`, `none`, `inherit` and `currentColor`.
+ * Bare literals appear only for border and outline widths, the one-pixel press offset, a duration,
+ * and the keywords `0`, `none`, `inherit` and `currentColor`.
  *
  * Two formatting details are Prettier's and not preferences: attribute-selector values are
  * single-quoted and hex colours are lowercase, because `pnpm format:check` is a blocking gate -
@@ -42,19 +44,22 @@
  *
  * `min-height` is what keeps the filter row even: only some categories have glyph art, a glyph is
  * taller than the 13px label, and without a floor the chips with art would stand taller than the
- * ones without. The spacing scale carries no dedicated control height, so the floor is the top of
- * that scale, which clears the tallest chip content this component is used with.
+ * ones without. The floor is the shared compact-control token `--ls-control-sm`, which is the same
+ * 32px this file previously took from the top of the spacing scale: the value has not moved, but a
+ * chip, a `sm` Button and a `sm` Input now read one property instead of three, so a toolbar that
+ * mixes all three lines them up by construction rather than by coincidence.
  *
  * BLITZY [A11Y]: the resulting target is 32px tall, below the 44x44 touch-target recommendation.
- * The height follows from the padding and type steps the shared token contract fixes for a chip,
- * so it is implemented as specified rather than silently enlarged; the chips sit in a pointer-and-
- * keyboard storefront view and every filter they apply is also reachable from the page's own
- * controls. Flagged for design review. */
+ * The height is the compact-control floor the shared token contract fixes for a chip, so it is
+ * implemented as specified rather than silently enlarged; the chips sit in a pointer-and-keyboard
+ * storefront view and every filter they apply is also reachable from the page's own controls. The
+ * surfaces that can carry a full 44px target read `--ls-target-min` instead. Flagged for design
+ * review. */
 .root {
   display: inline-flex;
   align-items: center;
   gap: var(--ls-space-1, 4px);
-  min-height: var(--ls-space-6, 32px);
+  min-height: var(--ls-control-sm, 32px);
   padding-block: var(--ls-space-1, 4px);
   padding-inline: var(--ls-space-3, 12px);
   border: 1px solid var(--ls-border, #cbd5e1);
@@ -65,8 +70,10 @@
   font-size: var(--ls-text-sm, 13px);
   line-height: 1;
   white-space: nowrap;
-  /* Colour only: transitioning a box property would animate the row's geometry. */
-  transition-property: background-color, border-color, color;
+  /* Colour, plus the press offset. Nothing that affects the box is listed: a transitioned box
+   * property would animate the row's geometry, while `transform` paints the chip one pixel lower
+   * without taking part in layout, so no neighbour in the row moves with it. */
+  transition-property: background-color, border-color, color, transform;
   transition-duration: 160ms;
   transition-timing-function: ease-out;
 }
@@ -153,10 +160,12 @@ button.root {
 }
 
 /* Disabled chips keep their colours and lose their affordance, so a row of filters stays legible
- * while one of them is unavailable. Only the toggle path can match this. */
+ * while one of them is unavailable. Only the toggle path can match this. The dimming is the shared
+ * `--ls-disabled-opacity` - the same 0.55 this rule already used, now named in `app/globals.css` so
+ * that Button, Pill, Input and Select fade an unavailable control by one amount. */
 .root:disabled {
   cursor: not-allowed;
-  opacity: 0.55;
+  opacity: var(--ls-disabled-opacity, 0.55);
 }
 
 /* Hover, excluded while disabled so an unavailable chip stays inert - `:hover` still matches a
@@ -181,11 +190,46 @@ button.root {
   background-color: var(--ls-slate, #475569);
 }
 
-/* Honour a reduced-motion preference for the colour transition this module introduced. The
- * duration collapses rather than dropping to `none`, which matches the application's baseline and
- * keeps a `transitionend` listener firing for anything that ever waits on one. The rule carries
- * this module's own specificity, because the baseline's universal rule carries none and would
- * otherwise be overruled by `.root` above. */
+/* Pressed. A chip and a Button sit side by side in this storefront - the catalog toolbar has both
+ * in one row - and until now only one of them answered a press, so a reader pressing a chip got no
+ * confirmation that the press had landed at all. The affordance is deliberately the Button's: one
+ * pixel of travel plus a deeper fill, on the toggle path only, because a labelling `<span>` accepts
+ * no press. Ungated by pointer capability, exactly as Button's pressed rules are: `:active` comes
+ * from a touch, a mouse button and the Space key alike, so a device that reports `hover: none` must
+ * still get it.
+ *
+ * The border is mixed from `currentColor` rather than from `--ls-border`: every tone paints its
+ * border with its own tone colour, and a flat hairline-and-ink mix would erase that tone for as
+ * long as the chip was held. Mixing the chip's own foreground towards the ink colour darkens
+ * whichever tone it started from, so a success chip presses as a deeper teal and a neutral one as a
+ * deeper slate. Only colour and the offset change; the border width, padding and height floor are
+ * `.root`'s, so a dozen chips in a wrapping row cannot reflow on a press. */
+button.root:active:not(:disabled) {
+  transform: translateY(1px);
+  border-color: color-mix(in srgb, currentColor 70%, var(--ls-ink, #0f172a));
+  background-color: color-mix(in srgb, var(--ls-ink, #0f172a) 12%, var(--ls-surface, #ffffff));
+}
+
+/* The same press on an inverted chip, at higher specificity than both the rule above and the
+ * selected hover rule and declared after them, so it wins for a chip that is on. It lightens
+ * instead of darkening: the fill above would leave the chip's white label on a near-white surface,
+ * whereas a 74% ink mix keeps white text at about 8:1 and still reads as one step away from the
+ * resting inversion. */
+.root[data-selected='true']:active:not(:disabled) {
+  border-color: color-mix(in srgb, var(--ls-ink, #0f172a) 74%, var(--ls-white, #ffffff));
+  background-color: color-mix(in srgb, var(--ls-ink, #0f172a) 74%, var(--ls-white, #ffffff));
+}
+
+/* Honour a reduced-motion preference for the transitions this module introduced. The duration
+ * collapses rather than dropping to `none`, which matches the application's baseline and keeps a
+ * `transitionend` listener firing for anything that ever waits on one. The rule carries this
+ * module's own specificity, because the baseline's universal rule carries none and would otherwise
+ * be overruled by `.root` above.
+ *
+ * The press offset itself stays, exactly as it does in `Button.module.css`: it is a static position
+ * held only while the chip is held down, not motion played at the reader, and removing it would
+ * leave a reader who has asked for less motion with the weaker of the two press cues. What this
+ * rule withdraws is the tween into and out of that position. */
 @media (prefers-reduced-motion: reduce) {
   .root {
     transition-duration: 0.01ms;

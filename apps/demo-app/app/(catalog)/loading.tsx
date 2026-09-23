@@ -1,25 +1,33 @@
 /**
- * Lumen Supply - the root segment's loading UI.
+ * Lumen Supply - the catalog segment's loading UI.
  *
- * Next.js renders this file in place of `{children}` while a route beneath the root layout
- * resolves, and swaps it for the page the moment that route's markup is ready. It is the only
- * loading boundary the storefront declares, so it stands in for every route that does not bring
- * one of its own - the catalog at `/`, and equally the cart, checkout, the order list and the
- * inventory dashboard - which is why nothing below names a route, a filter, a sort order or any
- * other wording that belongs to one page rather than all of them.
+ * Next.js renders this file in place of `{children}` while the route beside it resolves, and swaps
+ * it for the page the moment that route's markup is ready. It sits in the `(catalog)` route group
+ * next to `page.tsx`, so the Suspense boundary it declares covers the catalog at `/` and nothing
+ * else - the group contributes no path segment, so the address is unchanged.
+ *
+ * WHY THE BOUNDARY IS SCOPED TO THIS GROUP AND NOT DECLARED AT THE ROOT
+ * A `loading.tsx` at the root would wrap every route beneath the root layout, and a route that has
+ * to answer with a status code cannot be wrapped: Next.js marks a response 404 only when a
+ * `notFound()` signal escapes the shell of the render, and any Suspense boundary between the shell
+ * and the segment absorbs that signal first - so `/products/<unknown-slug>` answered the not-found
+ * document with a 200 status line for as long as this file was the root's. Moving it into the group
+ * that holds the catalog keeps the wait it exists to cover and leaves the product route - whose own
+ * contract is a 404 for a slug no product owns - outside every boundary. The cart and checkout
+ * routes render synchronously and never suspend, so they lose nothing by it; the dashboard
+ * declares its own `<Suspense>` around the work that waits.
  *
  * WHAT IT RESERVES, AND WHY THAT SHAPE
- * A page of this application opens with a heading block and continues with a grid, a table or a
- * list of cards, so the reservation is the same two pieces: the head's two lines of type, then a
- * grid of card-shaped placeholders. Reserving the box the content will occupy - rather than
- * centring a spinner in an empty region - is what keeps the header, navigation and footer still
- * while the swap happens, and it is what makes the wait read as "this page is arriving" instead
- * of "something is happening somewhere".
+ * The catalog opens with a heading block and continues with a grid of product cards, so the
+ * reservation is those two pieces: the head's two lines of type, then a grid of card-shaped
+ * placeholders. Reserving the box the content will occupy - rather than centring a spinner in an
+ * empty region - is what keeps the header, navigation and footer still while the swap happens, and
+ * it is what makes the wait read as "this page is arriving" instead of "something is happening
+ * somewhere".
  *
  * Twelve cards, not the catalog's full page of forty-eight: a dozen fills a desktop fold and a
  * little past it, which is as much as a reader can see while the wait lasts. Reserving the whole
- * page would claim screen space that a shorter route - the cart, an order list - is never going
- * to fill.
+ * page would claim screen space below the fold that the reader never sees the placeholder for.
  *
  * COMPOSITION: THE PAGE UTILITIES AND TWO COMPONENTS, NOTHING ELSE
  * Route files under `app/**` declare no CSS Module of their own, so the arrangement here comes
@@ -70,10 +78,10 @@ import { Skeleton } from '@/components/ui/Skeleton';
 /**
  * How many placeholder cards the grid reserves.
  *
- * A dozen is about a desktop fold's worth of the catalog's `auto-fill` grid, and it is a sensible
- * reservation for the shorter routes this boundary also covers. `ProductCardSkeleton` clamps
- * whatever it is handed into its own supported range, so this value is a choice about how much of
- * the fold to hold, never a bound.
+ * A dozen is about a desktop fold's worth of the catalog's `auto-fill` grid, which is as much as a
+ * reader can take in while the wait lasts. `ProductCardSkeleton` clamps whatever it is handed into
+ * its own supported range, so this value is a choice about how much of the fold to hold, never a
+ * bound.
  */
 const RESERVED_CARD_COUNT = 12;
 
@@ -88,7 +96,7 @@ const RESERVED_CARD_COUNT = 12;
 const BUSY_MESSAGE = 'Loading products';
 
 /**
- * Render the storefront's loading state.
+ * Render the catalog's loading state.
  *
  * Next.js passes no props to a `loading` file, so this takes none; it is a plain synchronous
  * function component whose output depends on nothing outside this module.

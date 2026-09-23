@@ -57,8 +57,9 @@
   font: inherit;
   font-size: var(--ls-text-md, 15px);
   font-weight: 600;
-  /* The line box is the text itself; height comes from padding alone, which is what keeps the
-   * three sizes proportional. */
+  /* The line box is the text itself, so height comes from the padding pair, which is what keeps
+   * the three sizes proportional. `sm` additionally carries a height floor - see Sizes below,
+   * where the reason it needs one is set out. */
   line-height: 1;
   text-decoration: none;
   white-space: nowrap;
@@ -93,14 +94,26 @@
  * One padding pair and one type size each; `md` restates the default explicitly so the whole
  * scale can be read in one place.
  *
- * BLITZY [A11Y]: the two smaller steps fall below the 44x44px touch-target guideline. At the
- * default 16px root the rendered heights are about 23px, 33px and 44px including the border, so
- * only `lg` reaches it. Implemented exactly as the shared size contract specifies rather than
- * silently enlarged: these are pointer- and keyboard-first surfaces of a desktop storefront,
- * every control carries a visible text label, and the focus outline with its 2px offset extends
- * the visible target. Flagged for design review. */
+ * `sm` carries a height floor as well as its padding pair, and it is the shared control floor
+ * (`--ls-control-sm`) rather than a number of this file's own: a compact button, a compact field
+ * and a chip stand side by side in the dashboard's filter row and in the catalog toolbar, and
+ * while each of them sized itself from its own padding that row mixed a 23px button with a 29.5px
+ * field and a 32px chip. The floor is a `min-block-size`, so it raises the box and changes nothing
+ * else - the padding, border width and type step below are untouched, and a label taller than the
+ * floor still grows the control rather than being clipped by it.
+ *
+ * BLITZY [A11Y]: at the default 16px root the rendered heights are now about 32px, 33px and 44px
+ * including the border. `sm` clears the 24x24px minimum of WCAG 2.2 SC 2.5.8 with 8px of margin
+ * and `lg` meets the 44x44px enhanced target of SC 2.5.5, but `sm` and `md` remain under 44px.
+ * That much is implemented as the shared size contract specifies rather than silently enlarged:
+ * these are pointer- and keyboard-first surfaces of a desktop storefront, every control carries a
+ * visible text label, and the focus outline with its 2px offset extends the visible target. The
+ * surfaces that can carry a full 44px target without becoming something else - a history row's
+ * link, a pager chip, a radio row's label - read `--ls-target-min` in their own modules instead.
+ * Flagged for design review. */
 
 .root[data-size='sm'] {
+  min-block-size: var(--ls-control-sm, 32px);
   padding: var(--ls-space-1, 4px) var(--ls-space-2, 8px);
   font-size: var(--ls-text-sm, 13px);
 }
@@ -162,8 +175,15 @@
     background-color: color-mix(in srgb, var(--ls-ink, #0f172a) 86%, var(--ls-white, #ffffff));
   }
 
+  /* The secondary shift is computed from the ink token like the other three rather than swapping
+   * in the recessed surface: `#ffffff` -> `#f8fafc` is a luminance change of roughly 2%, which
+   * measured as close to imperceptible on the page surface, so a reader could not tell a pointed-at
+   * hairline button from a resting one. Mixing 8% of the ink colour into the surface, and 24% of it
+   * into the hairline, gives the variant a cue of the same weight the other three have while
+   * keeping the palette the single source of the colour. */
   .root[data-variant='secondary']:hover:not(:disabled):not([aria-disabled='true']) {
-    background-color: var(--ls-surface-sunken, #f8fafc);
+    border-color: color-mix(in srgb, var(--ls-ink, #0f172a) 24%, var(--ls-border, #cbd5e1));
+    background-color: color-mix(in srgb, var(--ls-ink, #0f172a) 8%, var(--ls-surface, #ffffff));
   }
 
   .root[data-variant='ghost']:hover:not(:disabled):not([aria-disabled='true']) {
@@ -193,16 +213,57 @@
   transform: translateY(1px);
 }
 
-/* Unavailable: dimmed, with the cursor saying so. No hover rule above applies here. */
+/* Pressed colour, and the one block in this file that is deliberately NOT behind a hover
+ * capability query.
+ *
+ * The travel above was the whole of the pressed treatment, and a device that reports
+ * `hover: none` gets none of the four rules in the hover block, so a touch reader's only feedback
+ * for a press was a one-pixel shift of the control - indistinguishable, in a capture or to the
+ * eye, from a press that did nothing at all. A press is not a pointer capability: a touch, a mouse
+ * button and the Space key all produce `:active`, so the cue for it belongs outside the query.
+ *
+ * Each variant shifts both its fill and its border, one step further than its own hover step so a
+ * press still reads as a press on a pointer device that has both, and every value is mixed from
+ * that variant's own tokens rather than named as a new colour. Both properties are already in
+ * `.root`'s transition list, so this introduces no new animation. These rules follow the hover
+ * block and tie with it on specificity, which is what makes the pressed appearance win while a
+ * hovered control is held down. */
+
+.root[data-variant='primary']:active:not(:disabled):not([aria-disabled='true']) {
+  border-color: color-mix(in srgb, var(--ls-ink, #0f172a) 74%, var(--ls-white, #ffffff));
+  background-color: color-mix(in srgb, var(--ls-ink, #0f172a) 74%, var(--ls-white, #ffffff));
+}
+
+.root[data-variant='secondary']:active:not(:disabled):not([aria-disabled='true']) {
+  border-color: color-mix(in srgb, var(--ls-ink, #0f172a) 32%, var(--ls-border, #cbd5e1));
+  background-color: color-mix(in srgb, var(--ls-ink, #0f172a) 16%, var(--ls-surface, #ffffff));
+}
+
+/* Ghost takes a fill only while it is held - it has no resting box to deepen - and its label
+ * darkens to the primary text tone so the pressed state is carried by two changes, as the other
+ * three variants' fill-and-border pair is. */
+.root[data-variant='ghost']:active:not(:disabled):not([aria-disabled='true']) {
+  background-color: color-mix(in srgb, var(--ls-ink, #0f172a) 12%, var(--ls-surface, #ffffff));
+  color: var(--ls-text, #0f172a);
+}
+
+.root[data-variant='danger']:active:not(:disabled):not([aria-disabled='true']) {
+  border-color: color-mix(in srgb, var(--ls-danger, #b42318) 76%, var(--ls-ink, #0f172a));
+  background-color: color-mix(in srgb, var(--ls-danger, #b42318) 76%, var(--ls-ink, #0f172a));
+}
+
+/* Unavailable: dimmed, with the cursor saying so. No hover or pressed rule above applies here.
+ * The dimming is the shared `--ls-disabled-opacity`, which is this value named in `globals.css` so
+ * that Button, Pill, Input and Select all fade an unavailable control by the same amount. */
 .root:disabled {
-  opacity: 0.55;
+  opacity: var(--ls-disabled-opacity, 0.55);
   cursor: not-allowed;
 }
 
 /* The same state for a link, which has no `:disabled`. Removing pointer events is what stops an
  * anchor following its `href`; this is the only rule in the file that does so. */
 .root[aria-disabled='true'] {
-  opacity: 0.55;
+  opacity: var(--ls-disabled-opacity, 0.55);
   cursor: not-allowed;
   pointer-events: none;
 }

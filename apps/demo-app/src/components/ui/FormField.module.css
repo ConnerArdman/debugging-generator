@@ -10,7 +10,8 @@
  *     </label>
  *     {children}                                              the caller's own control
  *     <p class={styles.hint}  id={hintId}>...</p>             (optional)
- *     <p class={styles.error} id={errorId}>...</p>            (optional)
+ *     <p class={styles.error} id={errorId} role="alert">...</p>   (optional)
+ *     <p class={styles.counter} id={countId}>118/120 characters</p>  (optional, near the bound)
  *   </div>
  *
  * The control references the two message ids through `aria-describedby`, so the messages are
@@ -88,4 +89,25 @@
   font-size: var(--ls-text-xs, 12px);
   font-weight: 600;
   line-height: 1.4;
+}
+
+/* The character counter of a bounded field, shown only as its allowance runs out. Same metrics as
+ * the hint, because it is the same kind of remark about the field rather than a problem with it;
+ * `tabular-nums` keeps the figure from shuffling sideways as it counts, and `text-align: end`
+ * places it under the trailing edge of the control where the caret is when it matters. */
+.counter {
+  margin: 0;
+  color: var(--ls-text-muted, #475569);
+  font-size: var(--ls-text-xs, 12px);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.4;
+  text-align: end;
+}
+
+/* Past the bound. The counter takes the error's treatment, because at that point it is stating the
+ * same thing the message above it states - how far over the value is - and the two read as one
+ * remark. The message is still what carries the meaning: colour is never the only signal. */
+.counter[data-over='true'] {
+  color: var(--ls-danger, #b42318);
+  font-weight: 600;
 }

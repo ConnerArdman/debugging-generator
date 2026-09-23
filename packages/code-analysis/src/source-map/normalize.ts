@@ -90,6 +90,25 @@
  * touches the filesystem — this module is pure string work, so it is
  * exhaustively testable with no dev server, no network and no sandbox.
  *
+ * ## A rejection has to travel with the source, not with one spelling of it
+ *
+ * A caller rarely holds one spelling of a source. `./resolver.ts` holds two —
+ * the entry the producer authored and the entry
+ * `@jridgewell/trace-mapping` reports mappings against — and the second is
+ * built by URI resolution, which **removes dot segments**: the escaping
+ * traversal in `webpack://_N_E/../../../../etc/passwd` is gone from the
+ * resolved spelling, which then normalises to `etc/passwd` and reads as an
+ * ordinary project path. A rejection this module makes on the authored
+ * spelling therefore has to be *askable* about the source itself, or a caller
+ * will route around it without meaning to.
+ *
+ * That is what {@link hasEscapingTraversal} and {@link resolveSourceUnderRoot}
+ * are for, and why they live here rather than in the resolver: the vocabulary
+ * they need — bundler schemes, namespaces, markers, loader chains, percent
+ * escapes, `sourceRoot` concatenation — is this module's, and one reading of a
+ * `sources` entry is the whole point. {@link sourcePathOf} is that one reading,
+ * shared by all three exports.
+ *
  * ## Dependencies, deliberately one
  *
  * `@debuggen/shared` is the only import: it is the base of the acyclic package
@@ -207,6 +226,18 @@ const CURRENT_DIRECTORY_PREFIX = './';
 
 /** The single-dot segment, which a normalised path that names its own root reduces to. */
 const CURRENT_DIRECTORY = '.';
+
+/**
+ * The double-dot segment: the one piece of path vocabulary that can take a path
+ * *above* the root it is written against.
+ *
+ * Named here because two different questions turn on it —
+ * {@link normalizeSourcePath}'s final safety gate refuses a path where one
+ * survives normalisation, and {@link hasEscapingTraversal} answers whether one
+ * escapes at all — and a literal `'..'` spelled at each of those sites is a
+ * literal that can drift apart.
+ */
+const PARENT_DIRECTORY = '..';
 
 /**
  * The one non-bundler scheme {@link normalizeSourcePath} interprets.
@@ -346,7 +377,7 @@ const REPLACEMENT_CHARACTER = '\uFFFD';
  * frame, a bundler runtime) from a suspicious one (a path outside the project)
  * without parsing a message.
  *
- * Module-internal: the public surface is the five exports below, and every
+ * Module-internal: the public surface is the exports below, and every
  * rejection they produce is the same `undefined`.
  */
 type RejectionReason =
@@ -683,6 +714,110 @@ function firstSegmentOf(path: string): string | undefined {
 }
 
 /**
+ * The path a source URL carries, or the reason it carries none.
+ *
+ * A discriminated result rather than `string | undefined` because the two
+ * callers need different things from a failure: {@link normalizeSourcePath}
+ * logs the reason, and {@link hasEscapingTraversal} needs only to know that the
+ * source could not be read as a path at all.
+ */
+type SourcePath =
+  | { readonly ok: true; readonly path: string }
+  | { readonly ok: false; readonly reason: RejectionReason };
+
+/**
+ * Steps 3 to 6 of {@link normalizeSourcePath}: everything that turns a bundler
+ * URL into the path it carries, before the path is judged against a project
+ * root.
+ *
+ * Extracted so there is exactly **one** implementation of "what path does this
+ * `sources` entry name". {@link normalizeSourcePath} continues from its result
+ * with containment and the safety gate; {@link hasEscapingTraversal} asks a
+ * different question of the same path. Two copies of this sequence would be two
+ * opinions about the same string, which is the class of divergence
+ * `./resolver.ts` was found relying on: a spelling refused by one reading of a
+ * source and accepted by another.
+ *
+ * The input must already be trimmed, and must already have been screened for
+ * bundler internals by the caller — this function is about *paths*, not about
+ * whether a path is the developer's code.
+ *
+ * @param trimmed A `sources` entry with surrounding whitespace removed.
+ * @returns The path it carries, or the rejection reason that stopped it.
+ */
+function sourcePathOf(trimmed: string): SourcePath {
+  const scheme = schemeOf(trimmed);
+  const bundlerScheme = scheme !== undefined && SOURCE_URL_SCHEMES.includes(scheme);
+
+  let candidate: string;
+  if (scheme === undefined) {
+    candidate = trimmed;
+  } else if (bundlerScheme) {
+    candidate = stripSchemeAndAuthority(trimmed, scheme);
+  } else if (scheme === FILE_URL_SCHEME) {
+    const filePath = fileUrlToPath(trimmed);
+    if (filePath === undefined) {
+      return { ok: false, reason: 'unusable-file-url' };
+    }
+    candidate = filePath;
+  } else {
+    return { ok: false, reason: 'unsupported-scheme' };
+  }
+
+  candidate = stripQueryAndFragment(stripLoaderChain(candidate));
+
+  const decoded = decodePercentEscapes(candidate);
+  if (decoded.malformed) {
+    return { ok: false, reason: 'malformed-percent-escape' };
+  }
+
+  candidate = toPosix(decoded.value);
+  if (bundlerScheme) {
+    candidate = stripBundlerPrefixes(candidate);
+  }
+
+  if (candidate.length === 0) {
+    return { ok: false, reason: 'empty-after-prefix' };
+  }
+
+  return { ok: true, path: candidate };
+}
+
+/**
+ * Whether a path steps above the root it is written against.
+ *
+ * A segment walk with a depth counter rather than a normalisation, because
+ * normalisation is exactly what *hides* the answer: `normalizePosix` drops a
+ * leading `'..'` from an absolute path (`'/../../etc/passwd'` becomes
+ * `'/etc/passwd'`), which is the same silent flattening RFC 3986 dot-segment
+ * removal performs on a URL path — and the question here is whether that
+ * flattening had anything to hide. A `'..'` met at depth zero is an escape; one
+ * met deeper cancels the segment above it and is an ordinary, redundant
+ * spelling.
+ */
+function escapesOwnRoot(path: string): boolean {
+  let depth = 0;
+
+  for (const segment of path.split(SEPARATOR)) {
+    if (segment.length === 0 || segment === CURRENT_DIRECTORY) {
+      continue;
+    }
+
+    if (segment === PARENT_DIRECTORY) {
+      if (depth === 0) {
+        return true;
+      }
+      depth -= 1;
+      continue;
+    }
+
+    depth += 1;
+  }
+
+  return false;
+}
+
+/**
  * Whether a source names bundler-internal code rather than a file the developer
  * wrote.
  *
@@ -759,7 +894,9 @@ export function isWebpackInternalSource(source: string): boolean {
  *    ever re-encoded and no parenthesis is touched, so a route group such as
  *    `(group)` — a real directory — survives exactly as it arrived.
  * 6. **Remove bundler namespaces and markers** (bundler schemes only, where the
- *    vocabulary is defined), converting separators first.
+ *    vocabulary is defined), converting separators first. Steps 3 to 6 are
+ *    {@link sourcePathOf}, which is shared with {@link hasEscapingTraversal} so
+ *    that both exports read a `sources` entry the same way.
  * 7. **Reduce against the project root.** An absolute or Windows-rooted result
  *    goes through `toProjectRelative`, whose `Err` is the "outside the root"
  *    rejection; a relative result is normalised lexically.
@@ -836,39 +973,11 @@ export function normalizeSourcePath(
     return reject('project-root-not-absolute', trimmed);
   }
 
-  const scheme = schemeOf(trimmed);
-  const bundlerScheme = scheme !== undefined && SOURCE_URL_SCHEMES.includes(scheme);
-
-  let candidate: string;
-  if (scheme === undefined) {
-    candidate = trimmed;
-  } else if (bundlerScheme) {
-    candidate = stripSchemeAndAuthority(trimmed, scheme);
-  } else if (scheme === FILE_URL_SCHEME) {
-    const filePath = fileUrlToPath(trimmed);
-    if (filePath === undefined) {
-      return reject('unusable-file-url', trimmed);
-    }
-    candidate = filePath;
-  } else {
-    return reject('unsupported-scheme', trimmed);
+  const parsed = sourcePathOf(trimmed);
+  if (!parsed.ok) {
+    return reject(parsed.reason, trimmed);
   }
-
-  candidate = stripQueryAndFragment(stripLoaderChain(candidate));
-
-  const decoded = decodePercentEscapes(candidate);
-  if (decoded.malformed) {
-    return reject('malformed-percent-escape', trimmed);
-  }
-
-  candidate = toPosix(decoded.value);
-  if (bundlerScheme) {
-    candidate = stripBundlerPrefixes(candidate);
-  }
-
-  if (candidate.length === 0) {
-    return reject('empty-after-prefix', trimmed);
-  }
+  const candidate = parsed.path;
 
   let relative: string;
   if (isAbsolutePosix(candidate) || isWindowsAbsolute(candidate)) {
@@ -918,4 +1027,148 @@ export function normalizeSourcePath(
   }
 
   return relative;
+}
+
+/**
+ * Whether a `sources` entry steps above the root it is written against — or
+ * cannot be read as a path at all.
+ *
+ * ## Why a caller needs this, when {@link normalizeSourcePath} already refuses
+ *
+ * Because a caller may hold a *second spelling* of the same source, and the
+ * refusal does not travel with it. `@jridgewell/trace-mapping` reports
+ * mappings against `resolvedSources`, which it builds by handing
+ * `sourceRoot + '/' + source` to RFC 3986 URI resolution — and dot-segment
+ * removal **silently drops** a `'..'` that would leave the root of an absolute
+ * path. So `'webpack://_N_E/../../../../etc/passwd'`, which
+ * {@link normalizeSourcePath} refuses, is reported as
+ * `'webpack://_N_E/etc/passwd'`, which it accepts as `'etc/passwd'`: a
+ * project-relative path, indistinguishable from a real one, for a file the
+ * project does not contain. Map contents come from the dev server and from
+ * every third-party bundle it serves, so that is attacker-influenced input
+ * turned into a trusted-looking click-to-source target.
+ *
+ * `./resolver.ts` therefore asks this question of the *authored* entry (under
+ * its map's `sourceRoot`, see {@link resolveSourceUnderRoot}) before it will
+ * consider a resolved spelling of it. A `true` answer means no derived
+ * spelling may be trusted, because the derivation is free to have normalised
+ * the escape away; a `false` answer means resolution had no traversal to
+ * remove, so the two spellings can differ only by the prefixing and `./`
+ * collapsing that carry no such risk.
+ *
+ * ## What counts as escaping
+ *
+ * The path is read with {@link escapesOwnRoot}, so an *interior* traversal that
+ * cancels a real segment above it —
+ * `'webpack://_N_E/./src/widgets/../lib/http.ts'` — is not an escape and this
+ * predicate reports `false` for it, exactly as {@link normalizeSourcePath}
+ * resolves it. A rooted spelling is read the same way, because `'/../etc'`
+ * escapes just as `'../etc'` does: the leading separator is where the
+ * flattening happens, not a reason to trust it.
+ *
+ * ## An unreadable source is reported as escaping
+ *
+ * `true` is also the answer for a source this module cannot turn into a path at
+ * all: a non-string, an empty one, a foreign scheme, an unusable `file:` URL, a
+ * malformed percent escape, or a URL carrying no path. That is not a claim that
+ * such a source traverses — it is the same fail-closed rule the question is
+ * asked for. A source whose own path cannot be read cannot vouch for a spelling
+ * derived from it, and resolution of such a source is a path-shaped string
+ * built out of parts this module rejected: `'http://evil.example/x.ts'` under
+ * `sourceRoot: 'src/'` resolves to `'src/http:/evil.example/x.ts'`, which reads
+ * as an ordinary relative path and is not one.
+ *
+ * Total, like every export here: never throws, for any input.
+ *
+ * @param source A `sources` entry from a source map.
+ * @returns `true` when no spelling derived from this source may be trusted.
+ *
+ * @example
+ * ```ts
+ * hasEscapingTraversal('webpack://_N_E/../../../../etc/passwd'); // true
+ * hasEscapingTraversal('webpack://_N_E/./src/widgets/../lib/http.ts'); // false
+ * hasEscapingTraversal('webpack://_N_E/./src/lib/http.ts'); // false
+ * ```
+ */
+export function hasEscapingTraversal(source: string): boolean {
+  if (typeof source !== 'string') {
+    // Defensive for the same reason `normalizeSourcePath` is: the value arrives
+    // from a parsed source-map document, which the type system does not vouch
+    // for at runtime.
+    return true;
+  }
+
+  const trimmed = source.trim();
+  if (trimmed.length === 0) {
+    return true;
+  }
+
+  const parsed = sourcePathOf(trimmed);
+  if (!parsed.ok) {
+    return true;
+  }
+
+  return escapesOwnRoot(parsed.path);
+}
+
+/**
+ * A `sources` entry as it reads beneath its map's `sourceRoot`, with any
+ * traversal left intact.
+ *
+ * The concatenation is `@jridgewell/trace-mapping`'s own: its resolver prefixes
+ * every entry with `sourceRoot + '/'` before resolving it, so this produces the
+ * same string that library starts from — and stops there, handing it to
+ * {@link normalizeSourcePath}, whose POSIX normalisation keeps an escaping
+ * `'..'` where URI resolution would drop it. That is the whole difference, and
+ * it is the point: `sourceRoot: 'webpack://_N_E/./src/deep/deeper/'` with
+ * `'../../real.ts'` yields `'src/real.ts'` either way, while
+ * `sourceRoot: 'webpack://_N_E/./src/'` with `'../../../../etc/passwd'` yields
+ * a refusal here and `'etc/passwd'` there. A traversal in the *root* is caught
+ * by the same reading, which a check on the entry alone would miss.
+ *
+ * The entry is returned unchanged — the root deliberately ignored — when it is
+ * an **absolute reference**: it carries a scheme, or it is POSIX- or
+ * Windows-rooted. That is URI semantics (an absolute reference resolves against
+ * no base) and it is also what stops a root from being pasted onto a spelling
+ * that is not a path: `'http://evil.example/x.ts'` under `sourceRoot: 'src/'`
+ * would otherwise read as the relative path `'src/http:/evil.example/x.ts'`.
+ * A blank root and an empty entry likewise change nothing.
+ *
+ * Duplicate separators are not trimmed: `normalizeSourcePath` collapses them,
+ * so a root written with or without a trailing `'/'` resolves identically.
+ *
+ * Total, like every export here. A `sourceRoot` or entry that is not a string
+ * at runtime — both arrive from a parsed source-map document, which the type
+ * system does not vouch for — leaves the entry untouched rather than throwing,
+ * and the guards in {@link normalizeSourcePath} and
+ * {@link hasEscapingTraversal} refuse it downstream.
+ *
+ * @param sourceRoot The map's `sourceRoot`, or `undefined` when it declares none.
+ * @param source A `sources` entry from that map.
+ * @returns The entry beneath the root, or the entry unchanged.
+ *
+ * @example
+ * ```ts
+ * resolveSourceUnderRoot('webpack://_N_E/./src/', 'lib/http.ts');
+ * // 'webpack://_N_E/./src//lib/http.ts' — normalises to 'src/lib/http.ts'
+ * resolveSourceUnderRoot('webpack://_N_E/./src/', 'webpack://_N_E/./app/page.tsx');
+ * // 'webpack://_N_E/./app/page.tsx' — an absolute reference ignores the root
+ * ```
+ */
+export function resolveSourceUnderRoot(sourceRoot: string | undefined, source: string): string {
+  if (typeof sourceRoot !== 'string' || typeof source !== 'string') {
+    return source;
+  }
+
+  const root = sourceRoot.trim();
+  const trimmed = source.trim();
+  if (root.length === 0 || trimmed.length === 0) {
+    return source;
+  }
+
+  if (schemeOf(trimmed) !== undefined || isAbsolutePosix(trimmed) || isWindowsAbsolute(trimmed)) {
+    return source;
+  }
+
+  return `${root}${SEPARATOR}${trimmed}`;
 }

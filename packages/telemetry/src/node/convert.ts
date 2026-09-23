@@ -257,13 +257,29 @@ export const DB_INSTRUMENTATION_SCOPES = Object.freeze({
  * signal when a scope name is missing.
  *
  * `prisma:client:<operation>` and `prisma:engine:<operation>` for the ORM;
- * `pg.query:<COMMAND>[ <database>]` for the driver.
+ * `pg.query:<COMMAND>[ <database>]` for the driver's statements, plus the
+ * driver's two connection-acquisition spans, which are the pinned
+ * `@opentelemetry/instrumentation-pg` 0.74.0 `SpanNames.CONNECT` and
+ * `SpanNames.POOL_CONNECT`.
+ *
+ * The two connect names are here because they are database spans that carry no
+ * `db.statement`: a capture that acquires a pooled connection spends real
+ * database-tier time on it, and a span this table did not know would be judged
+ * by span kind instead — the driver reports a client-kind span, so it would be
+ * mistaken for an outgoing HTTP request. They are also what lets
+ * {@link deriveDbOperation} name a connection acquisition `connect`, which is
+ * how `../aggregate/queries.ts` can tell lifecycle work from a statement
+ * execution rather than inferring it from an absent attribute.
  */
 export const DB_SPAN_NAME_PREFIXES = Object.freeze({
   /** ORM span names, client and engine alike. */
   orm: 'prisma:',
   /** Driver query span names. */
   driver: 'pg.query',
+  /** The driver's span for acquiring a connection directly. */
+  driverConnect: 'pg.connect',
+  /** The driver's span for acquiring a connection from its pool. */
+  driverPoolConnect: 'pg-pool.connect',
 } as const);
 
 /**
@@ -281,6 +297,70 @@ export const DB_CLIENT_VALUES = Object.freeze({
   /** The driver's span. */
   driver: 'pg',
 } as const);
+
+/**
+ * {@link DB_SPAN_NAME_PREFIXES}, grouped by the {@link DB_CLIENT_VALUES} each
+ * prefix identifies.
+ *
+ * One table, two readers: {@link classifySpan} iterates *every* prefix in it to
+ * decide that a span is database work at all, and {@link deriveDbClient}
+ * iterates one group to decide which library reported it. Iterating a table
+ * rather than naming `orm` and `driver` in each function is what keeps a prefix
+ * added above from being honoured by one reader and ignored by the other — the
+ * failure mode that would classify a span as `db.query` and then leave its
+ * `db.client` empty, which is the attribute the aggregates use to tell two
+ * observations of one statement apart.
+ *
+ * Every value of the prefix table appears in exactly one group, and
+ * `convert.test.ts` asserts that behaviourally: it drives
+ * `Object.values(DB_SPAN_NAME_PREFIXES)` through {@link classifySpan} and
+ * {@link classifyDatabaseSource} and requires an answer from both, so a prefix
+ * added to the table without a group here fails a test instead of silently
+ * losing its client attribution.
+ */
+const DB_SPAN_NAME_PREFIXES_BY_CLIENT: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  [DB_CLIENT_VALUES.orm]: Object.freeze([DB_SPAN_NAME_PREFIXES.orm]),
+  [DB_CLIENT_VALUES.driver]: Object.freeze([
+    DB_SPAN_NAME_PREFIXES.driver,
+    DB_SPAN_NAME_PREFIXES.driverConnect,
+    DB_SPAN_NAME_PREFIXES.driverPoolConnect,
+  ]),
+});
+
+/**
+ * The driver's connection-acquisition span names, as the one list both the
+ * client derivation and the operation derivation read.
+ *
+ * A connection acquisition is the driver's own lifecycle work rather than a
+ * statement, and its span name carries no `:<COMMAND>` segment to parse, so it
+ * is named rather than parsed; see {@link DRIVER_CONNECT_OPERATION}.
+ */
+const DRIVER_CONNECT_SPAN_NAMES: readonly string[] = Object.freeze([
+  DB_SPAN_NAME_PREFIXES.driverConnect,
+  DB_SPAN_NAME_PREFIXES.driverPoolConnect,
+]);
+
+/**
+ * The `db.operation` value of the driver's two connection-acquisition spans.
+ *
+ * Neither span reports an operation and neither name carries one, so without
+ * this a connection acquisition would arrive as a database span with no
+ * statement *and* no operation — indistinguishable from a statement whose text
+ * the producer failed to report. Naming it is what lets a consumer say what the
+ * span was, and `../aggregate/queries.ts` documents the same distinction from
+ * the reading end.
+ */
+const DRIVER_CONNECT_OPERATION = 'connect';
+
+/**
+ * The separator inside a segmented database span name
+ * (`prisma:client:<operation>`, `pg.query:<COMMAND>`).
+ *
+ * Read by {@link deriveDbOperation} to tell a segmented ORM span name from the
+ * engine's bare ones (`start_transaction`, `commit_transaction`,
+ * `transaction`), whose whole name *is* the operation.
+ */
+const DB_SPAN_NAME_SEGMENT_SEPARATOR = ':';
 
 /**
  * The attribute `./span-helper.ts` sets on a span it created for an
@@ -1064,13 +1144,46 @@ function hasFunctionMarker(attributes: Readonly<Record<string, unknown>>): boole
   return hasAnyAttribute(attributes, FUNCTION_SPAN_MARKER_ATTRIBUTES);
 }
 
-/** Whether an instrumentation scope name belongs to a database instrumentation. */
-function isDatabaseScope(scope: string): boolean {
+/**
+ * Whether an instrumentation scope name is the ORM's.
+ *
+ * Both spellings, for the reason {@link DB_INSTRUMENTATION_SCOPES} records: the
+ * instrumentation registers under its package name and creates its spans
+ * through a tracer named `prisma`.
+ */
+function isOrmScope(scope: string): boolean {
   return (
     scope === DB_INSTRUMENTATION_SCOPES.orm ||
-    scope.startsWith(DB_INSTRUMENTATION_SCOPES.ormScopePrefix) ||
-    scope === DB_INSTRUMENTATION_SCOPES.driver
+    scope.startsWith(DB_INSTRUMENTATION_SCOPES.ormScopePrefix)
   );
+}
+
+/** Whether an instrumentation scope name belongs to a database instrumentation. */
+function isDatabaseScope(scope: string): boolean {
+  return isOrmScope(scope) || scope === DB_INSTRUMENTATION_SCOPES.driver;
+}
+
+/**
+ * Whether a span name starts with any prefix a database instrumentation uses.
+ *
+ * Iterates {@link DB_SPAN_NAME_PREFIXES_BY_CLIENT}, which covers every value of
+ * {@link DB_SPAN_NAME_PREFIXES}, so a prefix added to that table is honoured
+ * here without this function being edited.
+ */
+function hasDatabaseSpanName(name: string): boolean {
+  for (const prefixes of Object.values(DB_SPAN_NAME_PREFIXES_BY_CLIENT)) {
+    for (const prefix of prefixes) {
+      if (name.startsWith(prefix)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/** Whether a span name is one of the driver's connection-acquisition spans. */
+function isDriverConnectSpanName(name: string): boolean {
+  return DRIVER_CONNECT_SPAN_NAMES.some((prefix) => name.startsWith(prefix));
 }
 
 /**
@@ -1164,6 +1277,20 @@ function classifyFrameworkSpan(
  *    failure is never lost merely because the operation had no recognised
  *    shape.
  *
+ * ## A database span is not necessarily a statement
+ *
+ * Both instrumentations also span their own lifecycle work: the ORM's
+ * `prisma:client:serialize`, `prisma:client:operation` and transaction spans,
+ * and the driver's `pg.connect` and `pg-pool.connect`. Every one of them is
+ * emitted here as `db.query` on the `db` tier, because `../schema/kinds.ts` has
+ * exactly one database kind and that time really was spent in the database
+ * tier: dropping them would remove real nodes from the waterfall and the flame
+ * view and would shrink `database_duration` below what the process actually
+ * spent. What they are *not* is statement executions, and that distinction is
+ * drawn where it can be: this file names each one's `db.operation` (see
+ * {@link deriveDbOperation}) and `../aggregate/queries.ts` selects the spans
+ * that carry a `db.statement` when it counts executions and groups statements.
+ *
  * ## Why anything left over is skipped
  *
  * A span that reaches the end of that list is internal framework machinery
@@ -1200,12 +1327,7 @@ export function classifySpan(span: ReadableSpan): SpanClassification | null {
       return FUNCTION_SPAN;
     }
 
-    if (
-      isDatabaseScope(scope) ||
-      name.startsWith(DB_SPAN_NAME_PREFIXES.orm) ||
-      name.startsWith(DB_SPAN_NAME_PREFIXES.driver) ||
-      hasDatabaseAttributes(attributes)
-    ) {
+    if (isDatabaseScope(scope) || hasDatabaseSpanName(name) || hasDatabaseAttributes(attributes)) {
       return DB_QUERY_SPAN;
     }
 
@@ -1513,20 +1635,29 @@ function isScalarLabel(value: string): boolean {
  * instead of counting one query twice.
  */
 function deriveDbClient(facts: SpanFacts): string | undefined {
-  if (
-    facts.scope === DB_INSTRUMENTATION_SCOPES.orm ||
-    facts.scope.startsWith(DB_INSTRUMENTATION_SCOPES.ormScopePrefix) ||
-    facts.name.startsWith(DB_SPAN_NAME_PREFIXES.orm)
-  ) {
+  if (isOrmScope(facts.scope) || matchesAnyPrefix(facts.name, DB_CLIENT_VALUES.orm)) {
     return DB_CLIENT_VALUES.orm;
   }
   if (
     facts.scope === DB_INSTRUMENTATION_SCOPES.driver ||
-    facts.name.startsWith(DB_SPAN_NAME_PREFIXES.driver)
+    matchesAnyPrefix(facts.name, DB_CLIENT_VALUES.driver)
   ) {
     return DB_CLIENT_VALUES.driver;
   }
   return undefined;
+}
+
+/**
+ * Whether a span name starts with any of one client's span-name prefixes.
+ *
+ * The lookup that lets {@link deriveDbClient} read
+ * {@link DB_SPAN_NAME_PREFIXES_BY_CLIENT} instead of restating which prefixes
+ * belong to which library. A client with no group answers `false` rather than
+ * throwing, because this function is on the conversion path of a foreign span.
+ */
+function matchesAnyPrefix(name: string, client: string): boolean {
+  const prefixes = DB_SPAN_NAME_PREFIXES_BY_CLIENT[client] ?? [];
+  return prefixes.some((prefix) => name.startsWith(prefix));
 }
 
 /**
@@ -1539,10 +1670,27 @@ function deriveDbClient(facts: SpanFacts): string | undefined {
  * operation is the last colon-separated segment. Both formats are the pinned
  * versions' own, declared in {@link DB_SPAN_NAME_PREFIXES}, and this parse runs
  * only when the attribute is absent.
+ *
+ * Two lifecycle shapes are named rather than parsed, so that **every** database
+ * span this file emits says what operation it was:
+ *
+ * - the driver's `pg.connect` and `pg-pool.connect` carry no segment at all and
+ *   become {@link DRIVER_CONNECT_OPERATION};
+ * - an ORM-scope span whose name carries no separator is the engine naming one
+ *   operation and nothing else (`start_transaction`, `commit_transaction`,
+ *   `transaction`), so the name itself is the operation.
+ *
+ * Without those two, a connection acquisition and a transaction boundary would
+ * arrive with neither a `db.statement` nor a `db.operation`, which is precisely
+ * the shape a consumer cannot tell from a statement whose text went missing.
  */
 function deriveDbOperation(facts: SpanFacts): string | undefined {
+  if (isDriverConnectSpanName(facts.name)) {
+    return DRIVER_CONNECT_OPERATION;
+  }
+
   if (facts.name.startsWith(DB_SPAN_NAME_PREFIXES.driver)) {
-    const separator = facts.name.indexOf(':');
+    const separator = facts.name.indexOf(DB_SPAN_NAME_SEGMENT_SEPARATOR);
     if (separator < 0) {
       return undefined;
     }
@@ -1553,10 +1701,17 @@ function deriveDbOperation(facts: SpanFacts): string | undefined {
   }
 
   if (facts.name.startsWith(DB_SPAN_NAME_PREFIXES.orm)) {
-    const segments = facts.name.split(':').filter((segment) => segment.length > 0);
+    const segments = facts.name
+      .split(DB_SPAN_NAME_SEGMENT_SEPARATOR)
+      .filter((segment) => segment.length > 0);
     const operation = segments.at(-1);
     // A bare `prisma:` name carries no operation; the prefix itself is not one.
     return operation !== undefined && operation !== DB_CLIENT_VALUES.orm ? operation : undefined;
+  }
+
+  if (isOrmScope(facts.scope) && !facts.name.includes(DB_SPAN_NAME_SEGMENT_SEPARATOR)) {
+    const operation = facts.name.trim();
+    return operation.length > 0 ? operation : undefined;
   }
 
   return undefined;

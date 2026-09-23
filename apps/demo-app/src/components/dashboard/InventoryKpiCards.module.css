@@ -11,7 +11,8 @@
  *   .card           passed to `Card`'s `className`, so it lands on the card's outer element.
  *   .metric         the `<dl>` inside a card: `<dt>` label, `<dd>` figure, optional `<dd>` note.
  *   .label          the `<dt>`.
- *   .value          the `<dd>` carrying the figure. Also carries `data-emphasis`.
+ *   .value          the `<dd>` carrying the figure. Also carries `data-emphasis`, and `data-zero`
+ *                   when the figure is nothing.
  *   .secondary      the optional `<dd>` under the figure.
  *   .skeletonValue  passed to `Skeleton`'s `className` for a `shape="block"` figure placeholder.
  *
@@ -109,6 +110,24 @@
 
 .value[data-emphasis='positive'] {
   color: var(--ls-success, #0f766e);
+}
+
+/* A figure of nothing, on a card that has no state to name.
+ *
+ * Four of these five figures are simply current, so they are printed in the page's own ink - and at
+ * that ink a zero is indistinguishable from four and a half million: a reader who filters the
+ * dashboard to a location or a selling state nothing matched sees a row of confident dark numerals
+ * that happen to be zeroes, which reads as a report rather than as the absence of one. Muted to the
+ * token the labels use, a zero still reads clearly and visibly is not a quantity.
+ *
+ * Only the neutral cards, and that is the point of naming both attributes: a zero the row has
+ * something to say about - no lines left to reorder, out of lines that were reported - keeps the
+ * tint its emphasis gives it and the badge word beside it. Two attributes also outrank the single
+ * `[data-emphasis]` rules above whichever order the bundler emits them in, so this is not a
+ * question of declaration order. The muting carries no meaning of its own: the `<dt>` says what
+ * the figure is and the digit says there is none of it. */
+.value[data-emphasis='neutral'][data-zero='true'] {
+  color: var(--ls-text-muted, #475569);
 }
 
 .secondary {

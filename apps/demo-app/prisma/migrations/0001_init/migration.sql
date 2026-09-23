@@ -104,6 +104,7 @@ CREATE TABLE "carts" (
     "id" TEXT NOT NULL,
     "customer_id" TEXT,
     "session_token" TEXT NOT NULL,
+    "open_token" TEXT,
     "status" "cart_status" NOT NULL DEFAULT 'ACTIVE',
     "created_at" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updated_at" TIMESTAMP(3) NOT NULL,
@@ -133,6 +134,16 @@ CREATE TABLE "orders" (
     "shipping_cents" INTEGER NOT NULL,
     "total_cents" INTEGER NOT NULL,
     "placed_at" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "contact_name" TEXT,
+    "contact_email" TEXT,
+    "contact_company" TEXT,
+    "ship_line1" TEXT,
+    "ship_line2" TEXT,
+    "ship_city" TEXT,
+    "ship_region" TEXT,
+    "ship_postal_code" TEXT,
+    "ship_country" TEXT,
+    "delivery_notes" TEXT,
 
     CONSTRAINT "orders_pkey" PRIMARY KEY ("id")
 );
@@ -198,10 +209,13 @@ CREATE INDEX "price_rules_category_id_idx" ON "price_rules"("category_id");
 CREATE UNIQUE INDEX "customers_email_key" ON "customers"("email");
 
 -- CreateIndex
-CREATE UNIQUE INDEX "carts_session_token_key" ON "carts"("session_token");
+CREATE UNIQUE INDEX "carts_open_token_key" ON "carts"("open_token");
 
 -- CreateIndex
 CREATE INDEX "carts_customer_id_idx" ON "carts"("customer_id");
+
+-- CreateIndex
+CREATE INDEX "carts_session_token_updated_at_idx" ON "carts"("session_token", "updated_at");
 
 -- CreateIndex
 CREATE INDEX "cart_items_product_id_idx" ON "cart_items"("product_id");

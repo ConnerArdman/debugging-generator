@@ -2,16 +2,22 @@
  * Tests for `./cache.ts`: the key derivation, and the promise that every
  * problem is a miss.
  *
- * Two things are on trial, and they fail in different ways.
+ * Three things are on trial, and they fail in different ways.
  *
- * The **key** is where invalidation lives. Nothing is compared field by field
- * at read time, so if the key is insensitive to something it should notice — a
- * file's modification time, its size, a file appearing, a different TypeScript
- * configuration, a different indexer version — the cache serves a stale index
- * and every later answer in the session is wrong about the tree on disk. The
- * assertions are therefore paired: each input that must change the key has a
- * case, and the one thing that must *not* change it — the order the caller
- * happened to hold the file list in — has one too.
+ * The **key** is what decides which entry a project can reach. If it is
+ * insensitive to something it should notice — a file's modification time, its
+ * size, a file appearing, a different TypeScript configuration, a different
+ * indexer version — the cache serves a stale index and every later answer in
+ * the session is wrong about the tree on disk. The assertions are therefore
+ * paired: each input that must change the key has a case, and the one thing
+ * that must *not* change it — the order the caller happened to hold the file
+ * list in — has one too.
+ *
+ * The **change stamps in the envelope** are what decides whether a reachable
+ * entry is still fresh, and they exist because the two pieces of file metadata
+ * the key can carry are both forgeable: a content substitution that preserves
+ * `mtimeMs` and `size` asks for the same key. Those cases live in the last
+ * section of this file, which states what they plant and why.
  *
  * The **miss contract** is a negative guarantee, which is why these cases plant
  * damage rather than mock it. A corrupt entry is written as real bytes, a
@@ -58,6 +64,7 @@ import {
   rmSync,
   statSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
@@ -79,6 +86,7 @@ import type { IndexCache, IndexCacheKeyInput } from './cache.js';
 import { CODE_INDEX_SCHEMA_VERSION } from './graph/types.js';
 import { indexProject } from './indexer.js';
 import { openProject } from './project.js';
+import type { IndexResult } from './indexer.js';
 import type { CodeEdge, CodeIndex, CodeNode, FileFingerprint } from './graph/types.js';
 
 // ---------------------------------------------------------------------------
@@ -274,11 +282,14 @@ const itPosix = it.skipIf(process.getuid === undefined);
  *
  * A permission-denied write is the one save failure that cannot be provoked as
  * root: `0500` on a directory does not stop uid 0 from creating inside it, so
- * the case would assert the opposite of what it was written for. The other two
+ * the case would assert the opposite of what it was written for. The other
  * save failures in this file — a non-directory and a symbolic link at the
- * cache directory's path — are provoked structurally and therefore run for
- * every account, which is what keeps the `Err`-not-throw contract covered in
- * CI, where tests run as root.
+ * cache directory's path, and a parent that refuses the `mkdir` because a
+ * regular file stands where it belongs — are provoked structurally and
+ * therefore run for every account, which is what keeps the `Err`-not-throw
+ * contract covered in CI, where tests run as root. The last of those is the
+ * direct companion of the guarded case: same branch, same assertions, no
+ * permission bit involved.
  */
 const itUnprivileged = it.skipIf(process.getuid === undefined || process.getuid?.() === 0);
 
@@ -882,10 +893,15 @@ describe('load misses', () => {
     const path = writeRawEntry(
       key,
       JSON.stringify({
+        // An empty stamp list, which is well-formed and therefore gets this
+        // document past the shape guard: the key check runs before the
+        // freshness comparison, so this case still exercises the reason it was
+        // written for rather than being refused a step earlier.
         schemaVersion: INDEX_CACHE_SCHEMA_VERSION,
         key: otherKey,
         writtenAt: GENERATED_AT,
         index: makeIndex(),
+        stamps: [],
       }),
     );
 
@@ -898,10 +914,13 @@ describe('load misses', () => {
     const path = writeRawEntry(
       key,
       JSON.stringify({
+        // Well-formed and empty for the same reason as the case above: the
+        // vocabulary check also runs before the freshness comparison.
         schemaVersion: INDEX_CACHE_SCHEMA_VERSION,
         key,
         writtenAt: GENERATED_AT,
         index: makeIndex({ schemaVersion: CODE_INDEX_SCHEMA_VERSION + 1 }),
+        stamps: [],
       }),
     );
 
@@ -1058,6 +1077,40 @@ describe('save failures', () => {
       // to remove the sandbox whether or not the assertions above held.
       chmodSync(stateRoot, SECURE_DIR_MODE);
     }
+  });
+
+  it('never fails an index for a state root it cannot create, on any account', async () => {
+    // The companion to the case above, and the one that runs everywhere: a
+    // regular file stands where the cache directory's parent belongs, so the
+    // `mkdir` inside `ensureSecureDir` fails with `ENOTDIR` for every account,
+    // root included. A privileged process writes straight through the `0500`
+    // the case above relies on, which would leave this branch — an index that
+    // was built but could not be cached — asserted nowhere in CI.
+    const occupied = join(stateRoot, 'occupied');
+    writeFileSync(occupied, 'not a directory', { mode: SECURE_FILE_MODE });
+
+    const recording = createRecordingLogger();
+    const blocked = createIndexCache({
+      cacheDir: join(occupied, 'index'),
+      logger: recording.logger,
+    });
+
+    const result = await blocked.save(computeIndexCacheKey(makeKeyInput()), makeIndex());
+
+    // A value, not an exception, exactly as in the guarded case: the caller
+    // logs it and carries on with the index it holds in memory.
+    expect(isErr(result)).toBe(true);
+    if (!isErr(result)) {
+      throw new Error('Expected an Err.');
+    }
+    expect(DebuggenError.is(result.error)).toBe(true);
+    expect(result.error.code).toBe('CODE_INDEX_FAILED');
+    expect(result.error.details?.reason).toBe('cache-write-failed');
+    expect(result.error.hint).toBeDefined();
+    expect(existsSync(blocked.cacheDir)).toBe(false);
+
+    // And it is reported once, at warning level, without the index in the line.
+    expect(recording.lines.filter((line) => line.level === 'warn')).toHaveLength(1);
   });
 
   it('reports an Err when the cache directory cannot be created', async () => {
@@ -1419,5 +1472,327 @@ describe('isCodeIndex', () => {
     expect(
       isCodeIndex({ ...index, diagnostics: [{ severity: 'info', code: 'nope', message: 'x' }] }),
     ).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Freshness: the change stamps in the envelope.
+//
+// The key folds in each file's modification time and size, and a content
+// substitution can preserve both — `tar -x`, `cp -p`, `rsync --times`,
+// `touch -r`, a hermetic build-cache restore — so a tree whose bytes were
+// replaced under its old timestamps asks for the *same* key and would be served
+// an index describing code that no longer exists. Every case below holds one
+// half of the answer to that: `save` records a per-file change stamp in the
+// envelope, `load` takes the stamps again, and a difference is an ordinary miss.
+//
+// The assertions are paired the way the key's are. The substitution must be a
+// miss, and it must be a miss *for this reason* — the recorded `reason` is
+// asserted, because a key that had accidentally changed would also produce a
+// second cold run and would prove nothing. An unchanged tree, and an index over
+// files that never existed on disk, must still be hits: a freshness check that
+// disabled the cache would pass the first assertion and defeat the module.
+//
+// Every file these cases write lives inside the per-case `mkdtemp` state root
+// that `afterEach` removes. The committed corpus at `test/fixtures` is read
+// only and is deliberately not used here, because these cases have to *change*
+// a file.
+// ---------------------------------------------------------------------------
+
+describe('freshness verification', () => {
+  /**
+   * The modification time every file written here carries, in whole seconds.
+   *
+   * Pinned *before* the first index, and the reason is exactness: `utimesSync`
+   * takes seconds as a floating-point number, so restoring a timestamp that
+   * carried a fractional millisecond can land a nanosecond away from where it
+   * started — which would change the cache key and leave the case proving
+   * nothing about freshness. An integer second round-trips bit for bit, so the
+   * substitution below really does hold `mtimeMs` and `size` still and varies
+   * nothing but the bytes.
+   */
+  const FIXED_MTIME_SECONDS = 1_777_000_000;
+
+  /** The body the sandbox project starts with. */
+  const ALPHA_BODY = 'export function alpha(): number {\n  return 1;\n}\n';
+
+  /**
+   * The replacement body: a different declaration of **exactly** the same byte
+   * length, which is what makes `size` survive the substitution.
+   */
+  const BETA_BODY = 'export function beta_(): number {\n  return 1;\n}\n';
+
+  /** The budget an indexing run here is given; a one-file project, but ts-morph still starts. */
+  const RUN_TIMEOUT_MS = 30_000;
+
+  /** Writes `contents` and pins the modification time, so a later restore is exact. */
+  function writeWithFixedMtime(path: string, contents: string): void {
+    writeFileSync(path, contents, { mode: SECURE_FILE_MODE });
+    utimesSync(path, FIXED_MTIME_SECONDS, FIXED_MTIME_SECONDS);
+  }
+
+  /**
+   * A one-file project inside the state root.
+   *
+   * Inside the sandbox rather than beside the corpus, so the teardown removes
+   * it however the case ends, and named per case so two cases cannot collide.
+   *
+   * @param name The directory to create it under.
+   * @param body The contents of its single source file.
+   * @returns The project root and the file's absolute path.
+   */
+  function createSandboxProject(
+    name: string,
+    body: string,
+  ): { readonly root: string; readonly file: string } {
+    const root = join(stateRoot, name);
+    mkdirSync(join(root, 'src'), { recursive: true, mode: SECURE_DIR_MODE });
+    const file = join(root, 'src', 'a.ts');
+    writeWithFixedMtime(file, body);
+    return { root, file };
+  }
+
+  /**
+   * One indexing run over `root`, unwrapped.
+   *
+   * The cases below are sequences of three and four runs, and unwrapping each
+   * `Result` in place would bury the sequence in assertions about something no
+   * case here is testing.
+   *
+   * @param root The project to index.
+   * @param label What this run is, for the failure message.
+   * @returns The run's result.
+   */
+  async function indexOnce(root: string, label: string): Promise<IndexResult> {
+    const result = await indexProject({ projectRoot: root, cache });
+
+    expect(isOk(result), label).toBe(true);
+    if (!isOk(result)) {
+      throw new Error(`The ${label} indexing run must succeed.`);
+    }
+    return result.value;
+  }
+
+  /** Every name the index's nodes carry, which is where a declared symbol shows up. */
+  function nodeNames(index: CodeIndex): readonly string[] {
+    return index.nodes.map((node) => node.name);
+  }
+
+  /** A fingerprint of a real file, as the indexer would have taken it. */
+  function fingerprintOnDisk(root: string, relative: string): FileFingerprint {
+    const stats = statSync(join(root, relative));
+    return { file: relative, mtimeMs: stats.mtimeMs, size: stats.size };
+  }
+
+  it(
+    'sees a substitution that preserved the modification time and size',
+    async () => {
+      // The fixture guard: a replacement of a different length would be caught
+      // by the key's `size` part, and the case would pass for the wrong reason.
+      expect(BETA_BODY).toHaveLength(ALPHA_BODY.length);
+      const { root, file } = createSandboxProject('substituted', ALPHA_BODY);
+
+      const cold = await indexOnce(root, 'cold');
+      expect(cold.fromCache).toBe(false);
+      expect(nodeNames(cold.index)).toContain('alpha');
+
+      // The cache still caches: without this the case would be satisfied by a
+      // fix that simply stopped serving hits.
+      const warm = await indexOnce(root, 'warm');
+      expect(warm.fromCache).toBe(true);
+      expect(nodeNames(warm.index)).toContain('alpha');
+
+      // What `tar -x`, `cp -p`, `rsync --times` and `touch -r` all do: new
+      // bytes under the old modification time. Same length, so the size is
+      // unchanged too, and the tree therefore asks for the key the entry above
+      // was written under.
+      const before = statSync(file);
+      writeWithFixedMtime(file, BETA_BODY);
+      const after = statSync(file);
+
+      expect(after.mtimeMs).toBe(before.mtimeMs);
+      expect(after.size).toBe(before.size);
+      // The one thing userspace could not hold still, and the whole basis of
+      // the check: the kernel moved the inode's change time.
+      expect(after.ctimeMs).not.toBe(before.ctimeMs);
+
+      const third = await indexOnce(root, 'third');
+      expect(third.fromCache).toBe(false);
+      expect(nodeNames(third.index)).toContain('beta_');
+      expect(nodeNames(third.index)).not.toContain('alpha');
+      // And it missed for the right reason. A miss recorded as `absent` would
+      // mean the key had changed after all — the same observable outcome,
+      // reached without the stamps proving anything.
+      expect(reasonsOf(lines)).toContain('stale-file');
+
+      // A stale entry is replaced rather than left to miss forever: the third
+      // run wrote its own index under the same key (the metadata the key
+      // covers did not change), so the fourth run is a hit again.
+      const fourth = await indexOnce(root, 'fourth');
+      expect(fourth.fromCache).toBe(true);
+      expect(nodeNames(fourth.index)).toContain('beta_');
+    },
+    RUN_TIMEOUT_MS,
+  );
+
+  it('hits when nothing under a real project root has changed', async () => {
+    const { root } = createSandboxProject('unchanged', ALPHA_BODY);
+    const files: readonly FileFingerprint[] = [fingerprintOnDisk(root, 'src/a.ts')];
+    const index = makeIndex({ projectRoot: root, files });
+    const key = computeIndexCacheKey(makeKeyInput({ projectRoot: root, files }));
+
+    expect(isOk(await cache.save(key, index))).toBe(true);
+
+    // The regression this guards: a verification that compared something a
+    // second `stat` cannot reproduce — an access time, a read of the file, a
+    // clock — would make every hit a miss and turn the cache off.
+    await expect(cache.load(key)).resolves.toEqual(index);
+    expect(reasonsOf(lines)).not.toContain('stale-file');
+  });
+
+  it('hits for an index over files that do not exist on disk', async () => {
+    // A caller may cache an index it synthesised — a fixture, a projection, a
+    // tree that has since been removed — and several cases in this file do
+    // exactly that with `makeIndex()`, whose fingerprints name paths under a
+    // project root that was never created. An absent stamp compares equal to
+    // an absent stamp, so such an entry round-trips.
+    const key = computeIndexCacheKey(makeKeyInput());
+    const index = makeIndex();
+    expect(existsSync(index.projectRoot)).toBe(false);
+
+    expect(isOk(await cache.save(key, index))).toBe(true);
+
+    await expect(cache.load(key)).resolves.toEqual(index);
+    expect(reasonsOf(lines)).not.toContain('stale-file');
+  });
+
+  it('misses when a file changed only its change time, and removes the entry', async () => {
+    const { root, file } = createSandboxProject('touched', ALPHA_BODY);
+    const files: readonly FileFingerprint[] = [fingerprintOnDisk(root, 'src/a.ts')];
+    const key = computeIndexCacheKey(makeKeyInput({ projectRoot: root, files }));
+
+    expect(isOk(await cache.save(key, makeIndex({ projectRoot: root, files })))).toBe(true);
+
+    // The same bytes rewritten, with the modification time restored: nothing a
+    // reader of the file would notice, and nothing the key covers. The entry is
+    // dropped anyway, and that is the intended direction — this check fails
+    // *closed*, so a rewrite with identical content, a `chmod` or a checkout
+    // that moved only the change time each cost one rebuild that produces the
+    // same index. A spurious miss is slow; a spurious hit is wrong.
+    const before = statSync(file);
+    writeWithFixedMtime(file, ALPHA_BODY);
+    expect(statSync(file).mtimeMs).toBe(before.mtimeMs);
+    expect(statSync(file).size).toBe(before.size);
+
+    await expect(cache.load(key)).resolves.toBeUndefined();
+    expect(reasonsOf(lines)).toContain('stale-file');
+    expect(existsSync(join(cacheDir, `${key}.json`))).toBe(false);
+
+    // And the cache is immediately usable again, because the miss removed the
+    // entry rather than leaving it to be re-read on every run.
+    const rebuilt = makeIndex({ projectRoot: root, files: [fingerprintOnDisk(root, 'src/a.ts')] });
+    expect(isOk(await cache.save(key, rebuilt))).toBe(true);
+    await expect(cache.load(key)).resolves.toEqual(rebuilt);
+  });
+
+  it('misses when a file that was stamped has since been removed', async () => {
+    const { root, file } = createSandboxProject('deleted', ALPHA_BODY);
+    const files: readonly FileFingerprint[] = [fingerprintOnDisk(root, 'src/a.ts')];
+    const key = computeIndexCacheKey(makeKeyInput({ projectRoot: root, files }));
+
+    expect(isOk(await cache.save(key, makeIndex({ projectRoot: root, files })))).toBe(true);
+
+    // A file that was present when the entry was written and is not present
+    // now: the asymmetric case, and the one an absent-compares-equal-to-absent
+    // rule must not swallow.
+    rmSync(file, { force: true });
+
+    await expect(cache.load(key)).resolves.toBeUndefined();
+    expect(reasonsOf(lines)).toContain('stale-file');
+    expect(existsSync(join(cacheDir, `${key}.json`))).toBe(false);
+  });
+
+  it('misses on an entry with no stamps at all and removes it', async () => {
+    const key = computeIndexCacheKey(makeKeyInput());
+    // Exactly what an entry written by envelope version 1 looks like, and what
+    // a hand-edited or truncated document tends to look like: the index still
+    // parses and the key still matches, and the freshness evidence is gone.
+    const path = writeRawEntry(
+      key,
+      JSON.stringify({
+        schemaVersion: INDEX_CACHE_SCHEMA_VERSION,
+        key,
+        writtenAt: GENERATED_AT,
+        index: makeIndex(),
+      }),
+    );
+
+    await expect(cache.load(key)).resolves.toBeUndefined();
+    expect(reasonsOf(lines)).toContain('malformed-stamps');
+    expect(existsSync(path)).toBe(false);
+
+    // Recovered, like every other kind of damage in this file.
+    const index = makeIndex();
+    expect(isOk(await cache.save(key, index))).toBe(true);
+    await expect(cache.load(key)).resolves.toEqual(index);
+  });
+
+  it('misses on malformed stamps and removes the entry', async () => {
+    const key = computeIndexCacheKey(makeKeyInput());
+    const damaged: readonly { readonly label: string; readonly stamps: unknown }[] = [
+      { label: 'not a collection', stamps: 'none' },
+      { label: 'an element that is not a document', stamps: [null] },
+      { label: 'a stamp with no path', stamps: [{ present: false }] },
+      {
+        label: 'a stamp missing the change time',
+        stamps: [{ file: 'src/first.ts', present: true, mtimeMs: 1, size: 2, ino: 3 }],
+      },
+      {
+        label: 'a stamp whose numbers are not finite',
+        stamps: [
+          { file: 'src/first.ts', present: true, mtimeMs: null, size: 2, ctimeMs: 3, ino: 4 },
+        ],
+      },
+    ];
+
+    for (const { label, stamps } of damaged) {
+      const path = writeRawEntry(
+        key,
+        JSON.stringify({
+          schemaVersion: INDEX_CACHE_SCHEMA_VERSION,
+          key,
+          writtenAt: GENERATED_AT,
+          index: makeIndex(),
+          stamps,
+        }),
+      );
+
+      expect(await cache.load(key), label).toBeUndefined();
+      expect(existsSync(path), label).toBe(false);
+    }
+
+    expect(reasonsOf(lines)).toContain('malformed-stamps');
+  });
+
+  it('misses when the stamps do not cover the files the index names', async () => {
+    const key = computeIndexCacheKey(makeKeyInput());
+    // Well-formed stamps, but not the ones this index's file list would
+    // produce: a shorter list than `files`, which is what a truncated write or
+    // a hand-assembled document looks like. There is nothing to compare the
+    // uncovered file against, so the entry goes.
+    const path = writeRawEntry(
+      key,
+      JSON.stringify({
+        schemaVersion: INDEX_CACHE_SCHEMA_VERSION,
+        key,
+        writtenAt: GENERATED_AT,
+        index: makeIndex(),
+        stamps: [{ file: 'src/first.ts', present: false, mtimeMs: 0, size: 0, ctimeMs: 0, ino: 0 }],
+      }),
+    );
+
+    await expect(cache.load(key)).resolves.toBeUndefined();
+    expect(reasonsOf(lines)).toContain('stale-file');
+    expect(existsSync(path)).toBe(false);
   });
 });

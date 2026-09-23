@@ -3,9 +3,10 @@
  *
  * The strip appears twice on a product page: full size in the detail body, and as a short row
  * inside the site header. Both mounts render this same tile from the same props, and the whole
- * difference between them - the tile's width, its inner spacing and the type size of the name -
- * is stated in `RecommendationTile.module.css` and selected by the `data-variant` attribute
- * written below. Nothing the tile does varies with the variant.
+ * difference between them - a vertical card where a page has the room for one, and a thumbnail
+ * beside a single line of name and price where the site header's fixed 64px bar does not - is
+ * stated in `RecommendationTile.module.css` and selected by the `data-variant` attribute written
+ * below. Nothing the tile does varies with the variant.
  *
  * ITS OWN PRESENTATION UNIT, NOT THE CATALOG'S CARD
  * The catalog has a product card of its own, and this tile deliberately borrows nothing from it:
@@ -35,17 +36,18 @@
  * TEXT AND MONEY BELONG TO THEIR OWNERS
  * The figure is `@/components/ui/Price`, which takes the payload's whole number of cents and owns
  * every formatting decision; nothing here does arithmetic on an amount or spells one out. The
- * name is printed exactly as it arrives and is clamped to two lines by the stylesheet rather than
- * shortened here, so the full wording stays selectable and searchable while a row of tiles keeps
- * one height.
+ * name is printed exactly as it arrives and is clamped by the stylesheet - to two lines in the
+ * page, to one in the header - rather than shortened here, so the full wording stays selectable
+ * and searchable while a row of tiles keeps one height.
  *
  * ELEMENTS
  * The anchor from `next/link` wrapping `<span class="media"> > <img>` and `<span class="body"> >
- * <span class="name"> + the price. The two wrappers are spans rather than divs so the tile is
- * phrasing content throughout and stays valid wherever the strip places it; the stylesheet makes
- * them the boxes it needs - `.root` and `.body` are flex containers, which blockifies their
- * children. All six classes the module exports are used here, composed with `clsx`, and nothing
- * is set with an inline style.
+ * <span class="name"> + the price + `<span class="reason">`, that last one only when the payload
+ * words one. The two wrappers are spans rather than divs so the tile is phrasing content
+ * throughout and stays valid wherever the strip places it; the stylesheet makes them the boxes it
+ * needs - `.root` and `.body` are flex containers, which blockifies their children. All seven
+ * classes the module exports are used here, composed with `clsx`, and nothing is set with an
+ * inline style.
  */
 
 import clsx from 'clsx';
@@ -84,8 +86,9 @@ const PLACEHOLDER_IMAGE = '/products/product-placeholder.svg';
 interface Props {
   /**
    * The suggested product, as `/api/recommendations` returns one. Its `slug` is the route this
-   * tile navigates to, `name` is the text it prints, `priceCents` the figure, and `imageUrl` the
-   * thumbnail when the product has one.
+   * tile navigates to, `name` is the text it prints, `priceCents` the figure, `imageUrl` the
+   * thumbnail when the product has one, and `reason` the endpoint's own line about why the
+   * product is being suggested, printed under the figure wherever the tile has room for it.
    */
   item: RecommendationItem;
 
@@ -131,6 +134,14 @@ export function RecommendationTile({ item, variant = 'detail', className }: Prop
   const src =
     item.imageUrl === null || item.imageUrl.length === 0 ? PLACEHOLDER_IMAGE : item.imageUrl;
 
+  // Why this product is being suggested, as `/api/recommendations` words it - "In the same
+  // category as <the product on screen>". The endpoint always sends the field, so what is guarded
+  // here is its content rather than its presence: it is trimmed of the surrounding whitespace a
+  // payload can carry, and a value that holds nothing else renders no element at all. An empty
+  // footnote would still take its line of the tile and lengthen the row's tiles to say nothing,
+  // and the stylesheet's clamp cannot take back a line it has already reserved.
+  const reason = item.reason.trim();
+
   return (
     <Link
       href={`/products/${item.slug}`}
@@ -143,12 +154,32 @@ export function RecommendationTile({ item, variant = 'detail', className }: Prop
           frame is reserved before the file arrives and the strip does not shift as its tiles
           paint. The stylesheet then fits the drawing inside that frame, and keeps the frame
           legible on its own when images are turned off.
+
+          `alt=""` because the thumbnail is decorative here: it is a product photograph, most often
+          the shared placeholder drawing, inside a link that already prints the product's name and
+          its price as text. Naming it after the product would put that name into the link's
+          accessible name twice - which is what a reader hears, once for the image and once for the
+          text beside it - and say nothing a buyer has not already been told. The catalog's
+          `ProductCard` and the cart's `CartLineRow` treat their thumbnails the same way, for the
+          same reason.
         */}
-        <img className={styles.image} src={src} alt={item.name} width={400} height={300} />
+        <img className={styles.image} src={src} alt="" width={400} height={300} />
       </span>
       <span className={styles.body}>
         <span className={styles.name}>{item.name}</span>
         <Price cents={item.priceCents} size="sm" className={styles.price} />
+        {/*
+          The endpoint's own merchandising line, printed under the figure. It is inside the anchor
+          like the name and the price, so it joins the link's accessible name and a reader hears
+          why the suggestion is being made rather than only what it is; it is phrasing content and
+          adds no second target inside the link. The stylesheet mutes it, lets it wrap in full -
+          the sentence ends in the name of the product on screen, which is the part a clamp would
+          cut - and leaves it out of the header's row, which has no height for a footnote at all:
+          `display: none`
+          takes it out of that layout and out of that link's accessible name alike, so a reader
+          there hears the name and the price, exactly as they are shown.
+        */}
+        {reason.length === 0 ? null : <span className={styles.reason}>{reason}</span>}
       </span>
     </Link>
   );

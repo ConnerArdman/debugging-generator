@@ -10,15 +10,23 @@
  *
  * What a rating request is made of is the same in both cases. A carrier prices
  * a shipment from its destination, its weight, the number of pieces it is made
- * of and the tier of service being asked for, so those are the four values sent
- * and the four members of {@link ShippingQuoteInput}. Only the destination is
- * required: the other three describe one ordinary parcel when a caller leaves
- * them out, which is what lets the browser ask for a quote with a postal code
- * and nothing else. A weight a caller does name is held to the range a carrier
- * will rate rather than passed on as it stands, so an implausible one is quoted
- * at the boundary instead of coming back as a rejected request; a destination or
- * a piece count beyond what a carrier rates is refused instead, because a rate
- * taken on a shorter code or on fewer pieces would price a different shipment.
+ * of and the tier of service being asked for, so those are the values sent and
+ * the members of {@link ShippingQuoteInput}. The destination is both of its
+ * halves - a postal code and the country it is in, because `44301` names one
+ * place in the United States and another in Mexico, and the two are rated
+ * differently - and only the postal code is required: the country defaults to
+ * the store's own and the remaining three describe one ordinary parcel when a
+ * caller leaves them out, which is what lets the browser ask for a quote with a
+ * domestic postal code and nothing else. A weight a caller does name is held to
+ * the range a carrier will rate rather than passed on as it stands, so an
+ * implausible one is quoted at the boundary instead of coming back as a
+ * rejected request; a destination or a piece count beyond what a carrier rates
+ * is refused instead, because a rate taken on a shorter code or on fewer pieces
+ * would price a different shipment. A destination that is not a place -
+ * a country this store does not serve, or a postal code no destination in the
+ * chosen country is written as - is refused for the same reason, against the
+ * one rule `@/lib/destination` publishes and every surface of the storefront
+ * holds to.
  *
  * The request goes out over HTTP, to `/api/mock/carrier` on the origin the
  * caller hands over. That endpoint stands in for a carrier account this store
@@ -39,8 +47,12 @@
  * different thing, and is answered with an empty option list - a result, not a
  * failure.
  *
- * The rate a quote was taken at is recorded, one row per quote, so a price the
- * customer was shown can be reconciled with the order that followed it.
+ * The rate a quote was taken at is recorded when the quote was taken for a
+ * cart, one row per such quote, so the price behind an order can be reconciled
+ * with the order that was placed on it. A quote taken for a destination alone -
+ * the checkout form asking what freight costs while somebody types an address -
+ * writes nothing: nothing would ever reference the row, and the `GET` that asks
+ * is a question a browser, a prefetch or a retry may repeat at will.
  *
  * The conventions of `@/lib/types` hold at this boundary: money is an integer
  * number of US cents in a `…Cents` field, transit time is a whole number of
@@ -49,6 +61,11 @@
  * through a route handler to the browser and into a client component.
  */
 
+import {
+  DEFAULT_FREIGHT_DESTINATION_CODE,
+  freightDestinationProblem,
+  freightDestination,
+} from '@/lib/destination';
 import type { ShippingOption, ShippingQuoteResult } from '@/lib/types';
 import { prisma } from '@/server/db/prisma';
 import { StorefrontUpstreamError, StorefrontValidationError } from '@/server/errors';
@@ -166,6 +183,19 @@ const LEVEL_PATTERN = /^[A-Za-z0-9]+(?:[ _-][A-Za-z0-9]+)*$/;
 export interface ShippingQuoteInput {
   /** Where the shipment is going, as the destination's postal code. */
   postalCode: string;
+
+  /**
+   * Which country that postal code is in, as its two-letter code.
+   *
+   * The other half of the destination, and not a detail of it: a carrier rates
+   * a shipment to a place, and `44301` names one place in the United States and
+   * another in Mexico. A caller that leaves it out is quoting a domestic
+   * shipment - the store's own country - which is what a request naming a
+   * postal code alone is asking about; a caller quoting a buyer's address
+   * passes the country that buyer chose, so the rate they are shown is the rate
+   * their order is charged.
+   */
+  country?: string | undefined;
 
   /** What the shipment weighs, in whole grams. Defaults to one light parcel. */
   weightGrams?: number | undefined;
@@ -372,20 +402,24 @@ function chosen(options: readonly ShippingOption[], level: string): ShippingOpti
  * Quotes the services that can carry a shipment to a destination, and records
  * the rate the quote was taken at.
  *
- * @param input The shipment. Only `postalCode` is required; what a caller does
- *   not describe is rated as one ordinary parcel at the store's baseline tier.
+ * @param input The shipment. Only `postalCode` is required; the country
+ *   defaults to the store's own and what a caller does not describe is rated as
+ *   one ordinary parcel at the store's baseline tier. `cart` is what decides
+ *   whether the quote is recorded.
  * @param origin Where the carrier is reached, as the scheme and authority of
  *   the request being served - read from the incoming request by the route
  *   handler rather than configured or assumed anywhere, and checked here before
  *   anything is addressed to it.
  * @returns The quote the store recorded, the services on offer, the destination
- *   they were quoted for and the instant they were quoted at. A destination
- *   with no service offered to it is answered with no options and no recorded
- *   quote, which is a result rather than a failure.
+ *   they were quoted for - both halves of it - and the instant they were quoted
+ *   at. A destination with no service offered to it is answered with no options
+ *   and no recorded quote, which is a result rather than a failure; a quote
+ *   taken for no cart is answered with `id: null` for the reason given above.
  * @throws StorefrontValidationError When the shipment names no destination a
- *   carrier could rate, names more pieces than a carrier rates as one
- *   shipment, or when the address handed over is not one this store may reach
- *   itself at.
+ *   carrier could rate - no postal code, a country this store does not quote
+ *   freight to, or a postal code that is not a complete one for that country -
+ *   names more pieces than a carrier rates as one shipment, or when the address
+ *   handed over is not one this store may reach itself at.
  * @throws StorefrontUpstreamError When the carrier cannot be reached, refuses
  *   the request, or answers with nothing this storefront can read. A failure of
  *   the insert that records the quote propagates as it was raised, for the
@@ -401,6 +435,32 @@ export async function quote(
   if (postal === undefined) {
     throw new StorefrontValidationError(
       `A shipment needs a destination postal code of at most ${String(MAX_POSTAL)} characters.`,
+    );
+  }
+
+  // The destination as a place rather than as two strings. A caller that named
+  // no country is quoting the store's own, which is what a request carrying a
+  // postal code alone asks about; a country this store does not serve, and a
+  // code no destination in the named country is written as, are refused rather
+  // than rated. Every surface holds to this one judgement - the browser before
+  // it asks, the query schema when a request arrives, and this module before a
+  // carrier is addressed - so a rate is never taken on an unfinished code,
+  // which would price a different place from the one the shipment is going to.
+  const country = input.country ?? DEFAULT_FREIGHT_DESTINATION_CODE;
+  const problem = freightDestinationProblem(country, postal);
+
+  if (problem !== null) {
+    throw new StorefrontValidationError(problem.message);
+  }
+
+  // Present for every value the check above accepted; read for the canonical
+  // code rather than for the caller's spelling of it, so the carrier and the
+  // recorded quote both name the destination the same way.
+  const destination = freightDestination(country);
+
+  if (destination === undefined) {
+    throw new StorefrontValidationError(
+      'A shipment needs a destination country this store quotes freight to.',
     );
   }
 
@@ -438,6 +498,7 @@ export async function quote(
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         destinationPostalCode: postal,
+        destinationCountry: destination.code,
         weightGrams: weight,
         itemCount: items,
         serviceLevel: level,
@@ -497,18 +558,30 @@ export async function quote(
   const when = instant(record(payload) ? payload.quotedAt : undefined, new Date());
   const rate = chosen(options, level);
 
-  // One row per quote, recorded at the rate the customer is shown, and against
-  // the cart the shipment is for when there is one - which is what lets the
-  // order that cart becomes be placed on this quote and no other. A quote that
-  // came back with nothing on offer has no rate to record.
+  // One row per quote a cart was quoted for, recorded at the rate the customer
+  // is shown - which is what lets the order that cart becomes be placed on this
+  // quote and no other.
+  //
+  // A quote taken for a destination alone is not recorded, and that is the
+  // whole of the difference between the two callers. `GET /api/shipping/quote`
+  // is a question the checkout form asks while somebody is typing an address,
+  // and a question is not a commitment either side keeps: nothing will ever
+  // reference such a row, a browser, a prefetch, a link revisited or a retried
+  // request may ask again at any time, and a `GET` that writes turns each of
+  // those into a permanent record. So the row is written where it means
+  // something - a quote against a cart, which `POST /api/checkout` then places
+  // its order on - and the standalone answer carries `id: null`, which
+  // `ShippingQuoteResult` documents as one of its two "not recorded" cases.
+  // A quote that came back with nothing on offer has no rate to record either
+  // way.
   let recorded: string | null = null;
 
-  if (rate !== undefined) {
+  if (rate !== undefined && input.cart !== undefined) {
     const code = record(payload) ? text(payload.carrierCode, MAX_TEXT) : undefined;
 
     const row = await prisma.shippingQuote.create({
       data: {
-        cartId: input.cart ?? null,
+        cartId: input.cart,
         carrierCode: code ?? rate.carrier,
         serviceLevel: rate.service,
         amountCents: rate.priceCents,
@@ -525,6 +598,7 @@ export async function quote(
     id: recorded,
     options,
     destinationPostalCode: postal,
+    destinationCountry: destination.code,
     quotedAt: when.toISOString(),
   };
 }

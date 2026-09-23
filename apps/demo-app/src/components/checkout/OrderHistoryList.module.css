@@ -2,8 +2,9 @@
  * OrderHistoryList - the order-history collection on the "Lumen Supply" orders page.
  *
  * This module owns the chrome around the rows and nothing inside them: the heading block, the
- * visible column-header strip, the `<ul>` reset with the hairline that separates one order from
- * the next, the link-based pager and the wrapper the blank slate sits in.
+ * active-filter line, the visible column-header strip, the `<ul>` reset with the hairline that
+ * separates one order from the next, the link-based pager, and the wrapper and recovery control
+ * the blank slate sits in.
  *
  * OWNERSHIP, so that no rule here has a second owner
  *   - OrderHistoryRow.module.css owns the row grid, the whole-row hover and focus affordance, the
@@ -24,18 +25,22 @@
  *   2. the column gap        `--ls-space-3`
  *   3. the inline padding    `--ls-space-3` on the strip and on the row
  *
- * The template is one flexible track followed by three sized from the spacing scale, and it is
- * written below out of the three seam custom properties `OrderHistoryRow.module.css` reads -
+ * The template divides the row 2:1:1:1, and each of the three trailing tracks is written below as
+ * `minmax()` over the seam custom property `OrderHistoryRow.module.css` reads -
  * `--order-row-status-track`, `--order-row-items-track` and `--order-row-total-track` - with the
- * same defaults that file states, so the strip and every row resolve their trailing tracks from
- * one place and a container that overrides a seam property moves both grids together.
+ * same defaults that file states, so the strip and every row resolve their minimums from one
+ * place and a container that overrides a seam property moves both grids together.
  *
- * The three trailing tracks are deliberately NOT `auto` or `max-content`: a content-sized track is
- * measured per grid, and every row is its own grid container, so the strip would settle on the
- * width of its labels and each row on the width of its own values - the column edges would then
- * wander from row to row and match no header. They are not fractions either, because a fraction of
- * the container would make the money column as wide as a quarter of the page. `minmax(0, 1fr)` on
- * the first track is what lets a long order reference truncate instead of widening its track.
+ * No track is `auto` or `max-content`: a content-sized track is measured per grid, and every row
+ * is its own grid container, so the strip would settle on the width of its labels and each row on
+ * the width of its own values - the column edges would then wander from row to row and match no
+ * header. Fractions are safe in the same situation and are what the tracks use, because a
+ * fraction is resolved from the container and the strip and the rows are laid out in boxes of
+ * exactly the same width. The seam properties survive as the fractions' floors, so a track never
+ * shrinks below the content it holds; the alternative, three fixed trailing tracks, left the
+ * whole surplus of a page-wide row inside the first track as an empty band, which is the
+ * arrangement this template replaces. `minmax(0, 2fr)` on the first track is what lets a long
+ * order reference truncate instead of widening its track.
  */
 
 .root {
@@ -46,10 +51,10 @@
    * is composed from the row stylesheet's three seam properties so the two files state one
    * template between them rather than two that have to be kept in step by hand.
    */
-  --order-history-columns: minmax(0, 1fr)
-    var(--order-row-status-track, calc(var(--ls-space-6, 32px) * 3))
-    var(--order-row-items-track, calc(var(--ls-space-6, 32px) * 2.5))
-    var(--order-row-total-track, calc(var(--ls-space-6, 32px) * 4));
+  --order-history-columns: minmax(0, 2fr)
+    minmax(var(--order-row-status-track, calc(var(--ls-space-6, 32px) * 3)), 1fr)
+    minmax(var(--order-row-items-track, calc(var(--ls-space-6, 32px) * 2.5)), 1fr)
+    minmax(var(--order-row-total-track, calc(var(--ls-space-6, 32px) * 4)), 1fr);
 
   display: flex;
   min-width: 0;
@@ -76,12 +81,16 @@
   gap: var(--ls-space-3, 12px);
 }
 
-/* Styles the real heading element the component renders, whatever its level. */
+/* Styles the real heading element the component renders, whatever its level. The leading comes from
+ * the shared `--ls-leading-heading` and not from a ratio of this file's own: it read 1.3 here while
+ * the element baseline gives every other heading in the application 1.25, so this list's `<h2>`
+ * stood 23.4px tall against 22.5px for the same role on the checkout review panel and the
+ * dashboard. */
 .heading {
   color: var(--ls-text, #0f172a);
   font-size: var(--ls-text-lg, 18px);
   font-weight: 600;
-  line-height: 1.3;
+  line-height: var(--ls-leading-heading, 1.25);
 }
 
 /* "312 orders" and the like: quiet, and tabular so the number does not jitter between pages. */
@@ -93,6 +102,56 @@
 }
 
 /*
+ * The line that says a filter is narrowing the list, rendered only while one is. It is a sentence
+ * with a control at the end of it rather than a chip, because the count above it is the figure the
+ * filter explains and the two read as one statement: "2 orders / Showing paid orders only.
+ * Clear filter". The recessed surface and hairline are the same pair the pager uses at the other
+ * end of the list, so the block is framed without introducing a colour of its own.
+ */
+.filterBar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--ls-space-2, 8px);
+  border: 1px solid var(--ls-border, #cbd5e1);
+  border-radius: var(--ls-radius-md, 8px);
+  background-color: var(--ls-surface-sunken, #f8fafc);
+  padding: var(--ls-space-2, 8px) var(--ls-space-3, 12px);
+  color: var(--ls-text-muted, #475569);
+  font-size: var(--ls-text-sm, 13px);
+}
+
+/* The filtered-to value inside that sentence: the same ink as body text so the state the reader
+ * is looking at is the emphasised word, with no colour of its own. */
+.filterValue {
+  color: var(--ls-text, #0f172a);
+  font-weight: 600;
+}
+
+/*
+ * "Clear filter", an anchor sitting at the end of the sentence, so it is underlined like the
+ * running text it belongs to rather than boxed like the pager's chips - a control inside a
+ * sentence reads as a link, and a chip there would compete with the count above it.
+ *
+ * Colour: link text in this application is `--ls-focus` (the teal #0f766e, 5.5:1 on the page
+ * surface and 5.4:1 on the recessed one behind it), never `--ls-accent` - `app/globals.css`
+ * declares that token the brand amber and reserves it for fills and decorative accents, "never as
+ * a text colour on a light surface", where it measures 2.15:1.
+ */
+.filterClear {
+  color: var(--ls-focus, #0f766e);
+  font-size: var(--ls-text-sm, 13px);
+  text-decoration: underline;
+  text-underline-offset: calc(var(--ls-space-1, 4px) / 2);
+  white-space: nowrap;
+}
+
+.filterClear:focus-visible {
+  outline: calc(var(--ls-space-1, 4px) / 2) solid var(--ls-focus, #0f766e);
+  outline-offset: calc(var(--ls-space-1, 4px) / 2);
+}
+
+/*
  * The visible column-header strip. Same tracks, same gap and same inline padding as a row, so
  * its labels sit exactly over the values beneath them. Small and muted, and deliberately not
  * uppercased or letter-spaced: four quiet labels read as a table header without shouting.
@@ -101,9 +160,9 @@
   display: grid;
   grid-template-columns: var(
     --order-history-columns,
-    minmax(0, 1fr) var(--order-row-status-track, calc(var(--ls-space-6, 32px) * 3))
-      var(--order-row-items-track, calc(var(--ls-space-6, 32px) * 2.5))
-      var(--order-row-total-track, calc(var(--ls-space-6, 32px) * 4))
+    minmax(0, 2fr) minmax(var(--order-row-status-track, calc(var(--ls-space-6, 32px) * 3)), 1fr)
+      minmax(var(--order-row-items-track, calc(var(--ls-space-6, 32px) * 2.5)), 1fr)
+      minmax(var(--order-row-total-track, calc(var(--ls-space-6, 32px) * 4)), 1fr)
   );
   align-items: baseline;
   gap: var(--ls-space-3, 12px);
@@ -177,17 +236,21 @@
  * border tint or a decorative accent, "never as a text colour on a light surface", where it
  * measures 2.15:1. Amber chip text would be that exact usage.
  *
- * BLITZY [A11Y]: the chip is about 30px tall, below the 44x44px touch-target recommendation,
- * because the design for this view is a dense data table's footer. It is implemented at the
- * designed size - `--ls-space-1`/`--ls-space-2` padding on 13px text - rather than silently
- * enlarged. Flagged for design review. Direction is never carried by colour alone: the component
- * supplies the label, the border and background carry the affordance, and the unavailable
- * direction is not an anchor at all.
+ * Height: the chip carries the pointer-target floor of WCAG 2.5.5 / 2.5.8 (`--ls-target-min`). It
+ * is a `min-block-size`, so the designed padding and type step still decide how the chip reads and
+ * only its box is raised; the two directions sit on their own row at the foot of the list, where
+ * 44px costs the page nothing. Measured before the floor: 46.53x29.5px, which is short on the
+ * block axis while the inline axis was already clear. The disabled twin below takes the identical
+ * floor - see the note there.
+ *
+ * Direction is never carried by colour alone: the component supplies the label, the border and
+ * background carry the affordance, and the unavailable direction is not an anchor at all.
  */
 .pagerLink {
   display: inline-flex;
   align-items: center;
   gap: var(--ls-space-1, 4px);
+  min-block-size: var(--ls-target-min, 44px);
   border: 1px solid var(--ls-border, #cbd5e1);
   border-radius: var(--ls-radius-md, 8px);
   padding: var(--ls-space-1, 4px) var(--ls-space-2, 8px);
@@ -219,15 +282,18 @@
 
 /*
  * The unavailable direction, rendered as a `<span>`. It keeps the metrics of an anchor - same
- * type size, same padding, same radius, and a transparent border of the same width - so the two
- * directions sit on one baseline and the strip does not shift when a reader reaches the first or
- * last page. Everything that says "clickable" is absent: no border, no accent, no hover, no
- * pointer, and no motion to remove.
+ * type size, same padding, same radius, the same height floor, and a transparent border of the
+ * same width - so the two directions sit on one baseline and the strip does not shift when a
+ * reader reaches the first or last page. The floor is repeated here for exactly that reason: the
+ * two are metric twins, so raising one alone would make the strip change height on the first and
+ * last page, which is the shift this pairing exists to prevent. Everything that says "clickable"
+ * is absent: no border, no accent, no hover, no pointer, and no motion to remove.
  */
 .pagerLinkDisabled {
   display: inline-flex;
   align-items: center;
   gap: var(--ls-space-1, 4px);
+  min-block-size: var(--ls-target-min, 44px);
   border: 1px solid transparent;
   border-radius: var(--ls-radius-md, 8px);
   padding: var(--ls-space-1, 4px) var(--ls-space-2, 8px);
@@ -243,6 +309,53 @@
   display: flex;
   justify-content: center;
   margin-block: var(--ls-space-2, 8px);
+}
+
+/*
+ * The way out of an empty list, handed to `BlankSlate` as its `action`: back to the first page of
+ * a listing the address ran off the end of, or back to the unfiltered history. It is an anchor
+ * rather than a button because this component renders on the server and the destination is a real
+ * address - so the platform's own affordances come with it - and it is this module's own class
+ * because `../ui/Button` renders a `<button>` and the pager's chip class states a pager's
+ * geometry. It borrows that chip's colour, border, radius and type deliberately: the two are the
+ * same kind of control, one at the end of a populated list and one in the middle of an empty one.
+ *
+ * What it does not borrow is the pager's density. The pager's chips sit in a table footer, where
+ * `.pagerLink` documents its sub-44px height as a deliberate cost of that density; this control
+ * stands alone in the middle of a page with nothing to be dense about, so the padding is a step
+ * larger and the box is floored at 44x44 - the touch-target recommendation, and the same floor the
+ * inventory dashboard's own blank-slate recovery link sets. The minimum only ever grows the box,
+ * so the padding above still decides how the chip looks.
+ */
+.action {
+  display: inline-flex;
+  min-block-size: calc(var(--ls-space-6, 32px) + var(--ls-space-3, 12px));
+  min-inline-size: calc(var(--ls-space-6, 32px) + var(--ls-space-3, 12px));
+  align-items: center;
+  justify-content: center;
+  gap: var(--ls-space-1, 4px);
+  border: 1px solid var(--ls-border, #cbd5e1);
+  border-radius: var(--ls-radius-md, 8px);
+  padding: var(--ls-space-2, 8px) var(--ls-space-3, 12px);
+  color: var(--ls-focus, #0f766e);
+  font-size: var(--ls-text-sm, 13px);
+  text-decoration: none;
+  white-space: nowrap;
+  transition:
+    background-color 180ms ease-out,
+    border-color 180ms ease-out;
+}
+
+@media (hover: hover) {
+  .action:hover {
+    border-color: var(--ls-text-muted, #475569);
+    background-color: var(--ls-surface-sunken, #f8fafc);
+  }
+}
+
+.action:focus-visible {
+  outline: calc(var(--ls-space-1, 4px) / 2) solid var(--ls-focus, #0f766e);
+  outline-offset: calc(var(--ls-space-1, 4px) / 2);
 }
 
 /*
@@ -267,7 +380,8 @@
  * this module's own specificity, as every module in this application does, rather than left to
  * the baseline's universal rule. */
 @media (prefers-reduced-motion: reduce) {
-  .pagerLink {
+  .pagerLink,
+  .action {
     transition: none;
   }
 }

@@ -25,19 +25,24 @@
  * page, and it leaves `@/hooks/useRecommendations` as the single place that number is stated.
  *
  * THE VARIANT IS PRESENTATION, AND ONLY PRESENTATION
- * `variant` picks a heading, how many of the suggestions are put on screen, and - through the
- * `data-variant` attribute the stylesheet selects on - the type size, the gaps and the tile width.
+ * `variant` picks the title and the element that states it, how many of the suggestions are put on
+ * screen, and - through the `data-variant` attribute the stylesheet selects on - the type sizes, the
+ * gaps, the tile width and how a tile is laid out, which in the header is a short row sized for its
+ * fixed 64px bar rather than the page's card.
  * It reaches nothing else: the same suggestions are read either way, and the compact row renders
  * the first few of them rather than asking for fewer.
  *
  * ACCESSIBILITY
- * A `<section>` named by its own heading, so both strips are landmarks a reader can move between
- * and neither is an unnamed region. The heading is rendered in both variants - smaller in the
- * header, never removed - because the name is what makes the region findable. The scroll container
- * is a `role="group"` with `tabIndex={0}` carrying that same name: a strip that overflows has to be
- * reachable and scrollable from the keyboard, and the stylesheet draws it a focus ring for exactly
- * that arrival. Each `ui/Skeleton` is `aria-hidden`, so the waiting state states what it is waiting
- * for in `ui/VisuallyHidden` text on the region that owns the busy state.
+ * A `<section>` named by its own title, so both strips are landmarks a reader can move between and
+ * neither is an unnamed region. The title is rendered in both variants - smaller in the header,
+ * never removed - because the name is what makes the region findable, and only its element differs:
+ * an `h2` in the detail body, where the strip is a section of the page under its `h1`, and a
+ * paragraph in the header, where a heading would open the document's outline at level 2 above the
+ * `h1` it belongs under. The scroll container is a `role="group"` with `tabIndex={0}` carrying that
+ * same name: a strip that overflows has to be reachable and scrollable from the keyboard, and the
+ * stylesheet draws it a focus ring for exactly that arrival. Each `ui/Skeleton` is `aria-hidden`,
+ * so the waiting state states what it is waiting for in `ui/VisuallyHidden` text on the region that
+ * owns the busy state.
  */
 
 import clsx from 'clsx';
@@ -263,9 +268,26 @@ export function RecommendationsRail({
       aria-labelledby={railHeadingId}
     >
       <div className={styles.head}>
-        <h2 id={railHeadingId} className={styles.heading}>
-          {compact ? COMPACT_HEADING : DETAIL_HEADING}
-        </h2>
+        {/*
+          The title, and the one place the variant decides an element rather than a measurement.
+          The detail body's strip is a section of the page, so its title is a real `h2` under the
+          product's `h1`. The header's row is mounted inside the site banner, which precedes that
+          `h1` in the document: a heading there would open the page's outline at level 2 before its
+          level 1, and at a position - clipped into the banner - where nothing is painted for a
+          sighted reader to match it to. So the compact row states its title as a paragraph. It
+          keeps the same id and the same class, and `aria-labelledby` takes a name from the
+          referenced element's text whatever that element is, so both regions stay named exactly as
+          they were and only the heading outline changes.
+        */}
+        {compact ? (
+          <p id={railHeadingId} className={styles.heading}>
+            {COMPACT_HEADING}
+          </p>
+        ) : (
+          <h2 id={railHeadingId} className={styles.heading}>
+            {DETAIL_HEADING}
+          </h2>
+        )}
       </div>
       {body}
     </section>

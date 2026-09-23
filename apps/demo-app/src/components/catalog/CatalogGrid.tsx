@@ -25,10 +25,21 @@
  * never disagree with the listing for longer than the navigation it is waiting for.
  *
  * PAGING IS THE PAGER'S, AND EVERY OTHER CHANGE RETURNS TO THE FIRST PAGE
- * `CatalogPager` writes the page parameter; this file never does. That is a rule rather than a gap:
- * page four of one filter is not page four of another, so a changed term, category or ordering asks
- * for the first page of the new listing by leaving the parameter out and letting the catalog
- * query's own default apply - the same rule the inventory dashboard's filter row follows.
+ * The page parameter is written in exactly one place, `hrefForCatalogPage` below, and only ever on
+ * the pager's behalf. That is a rule rather than a gap: page four of one filter is not page four of
+ * another, so a changed term, category or ordering asks for the first page of the new listing by
+ * leaving the parameter out and letting the catalog query's own default apply - the same rule the
+ * inventory dashboard's filter row follows.
+ *
+ * EVERY ADDRESS THIS SURFACE PRODUCES IS BUILT FROM THE QUERY THE SERVER VALIDATED
+ * Including the pager's, which is why the pager is handed its links instead of reading the address
+ * bar for them. `query` is what the page parsed, so an address built from it is one the server has
+ * already agreed to; an address the reader arrived by may carry a parameter the catalog query
+ * refuses, and such a parameter is dropped on its own - the rest of that address is applied, and
+ * the page says above the listing which part it could not use. A link that copied the address and
+ * rewrote only the page would therefore carry the refused parameter into every later page, to be
+ * stripped and reported again on each one, and into whatever the reader copies or bookmarks from
+ * there. One builder, `buildCatalogQuery`, over one validated source is what rules that out.
  *
  * THE PARAMETER NAMES ARE THE SERVER'S
  * Every key written below is a parameter of the one catalog query the endpoint and the page both
@@ -38,11 +49,13 @@
  * something, so the unfiltered catalog in its own order is addressed by the bare path.
  *
  * COMPOSED FROM THIS FOLDER AND THE SHARED PRIMITIVES
- * The five children come from this folder and the control inside the blank slate is
- * `@/components/ui/Button`; `CatalogGrid.module.css` places them and states no colour, border or
- * font of its own. The grid itself is a real list - a `<ul>` of `<li>` cells whose marker and
- * padding the stylesheet resets - so a reader is told how many products are in it, and the section
- * carries one accessible name for the whole surface.
+ * The five children come from this folder; the control inside the blank slate is
+ * `@/components/ui/Button` and the surface's own title is wrapped in
+ * `@/components/ui/VisuallyHidden`. `CatalogGrid.module.css` places them and states no colour,
+ * border or font of its own. The grid itself is a real list - a `<ul>` of `<li>` cells whose marker
+ * and padding the stylesheet resets - so a reader is told how many products are in it, and the
+ * section is named by that one title, which is also the level-2 heading the cards' own titles sit
+ * under.
  *
  * NOTHING HERE VARIES BETWEEN THE SERVER'S MARKUP AND THE BROWSER'S FIRST RENDER
  * Every value rendered is derived from the props - the page of products and the query it was read
@@ -56,6 +69,7 @@ import { useState, useTransition } from 'react';
 import type { ReactNode } from 'react';
 
 import { Button } from '@/components/ui/Button';
+import { VisuallyHidden } from '@/components/ui/VisuallyHidden';
 import type {
   CatalogQuery,
   CatalogSort,
@@ -173,6 +187,16 @@ const DEFAULT_CATALOG_SORT: CatalogSort = 'featured';
 const DEFAULT_CATALOG_PAGE_SIZE = 48;
 
 /**
+ * The id of the surface's own title, which is what the section is named by.
+ *
+ * A literal rather than a `useId()` value: one catalog surface is mounted per document - the
+ * listing is the page - so the id cannot collide with a second copy of itself, and a constant is
+ * the same string in the server's markup and in the browser's first render without a hook standing
+ * between the two.
+ */
+const CATALOG_HEADING_ID = 'catalog-grid-heading';
+
+/**
  * A listing a set of controls asks for: what to search for, what to filter to, how to order.
  *
  * The three values a reader can change, in the form the controls hold them - an empty term rather
@@ -205,10 +229,12 @@ const DELETE = 0x7f;
  * Every step is a decision about the address rather than about the field, and together they are the
  * whole of what the catalog query asks of a search term. A term of nothing but spaces is not a
  * term; a term past the bound, or one carrying a control character - a tab or a newline pasted from
- * a spreadsheet cell or a wrapped document - would be refused by the schema, and a refused query is
- * answered with the *default* listing, discarding every filter the reader can see in front of them.
- * A control must never be able to produce one, so what cannot be sent is turned into a space rather
- * than dropped: a term stays two words when the separator between them was a tab.
+ * a spreadsheet cell or a wrapped document - would be refused by the schema, and the page would
+ * then read the listing without that term and tell the reader above it that their search term could
+ * not be applied. That notice is owed to someone who followed a broken link, not to someone using
+ * the search box in front of them: a control of this surface must never be able to produce an
+ * address the page has to recover from, so what cannot be sent is turned into a space rather than
+ * dropped - a term stays two words when the separator between them was a tab.
  *
  * Cutting by UTF-16 units is deliberate, because that is the length the schema's own bound counts.
  */
@@ -400,6 +426,30 @@ export function CatalogGrid({ products, categories, query }: CatalogGridProps) {
     commit({ search: '', categorySlug: null, sort: DEFAULT_CATALOG_SORT });
   }
 
+  /**
+   * The address of page `target` of the listing on screen: the applied query, at the page size this
+   * answer was built with, with the page rewritten.
+   *
+   * The pager is handed this rather than reading the address bar itself, and the distinction
+   * matters for one reason: `applied` is the query the page *parsed*, so it is by construction a
+   * query the server accepts. An address the reader arrived by can carry a parameter the catalog
+   * query's schema refuses; that parameter is dropped on its own and reported above the listing,
+   * while the rest of the address takes effect. A link that copied the address and rewrote only the
+   * page would hand the refused parameter on to the next page and every page after it, so the
+   * notice would never clear and the reader would go on carrying a parameter this catalog has said
+   * it cannot use. Building from the applied query cannot produce such a link.
+   * `products.pageSize` rather than the requested one for the same reason: it is the size the
+   * answer was actually built with, and it is what the pager's own page count is derived from.
+   *
+   * Declared as a plain function and passed straight down - the pager is not memoised, so there is
+   * nothing for a stable identity to save here.
+   */
+  function hrefForCatalogPage(target: number): string {
+    const wantedCatalogQuery = buildCatalogQuery(applied, products.pageSize, target);
+
+    return wantedCatalogQuery.length === 0 ? pathname : `${pathname}?${wantedCatalogQuery}`;
+  }
+
   /*
    * The active category's label, for the blank slate's sentence. `find` answers `undefined` for an
    * unfiltered listing and for a slug the page's category list does not offer - a stale link, say -
@@ -465,7 +515,20 @@ export function CatalogGrid({ products, categories, query }: CatalogGridProps) {
   carried.delete(CATALOG_SORT_PARAM);
 
   return (
-    <section className={styles.root} aria-label="Product catalog">
+    <section className={styles.root} aria-labelledby={CATALOG_HEADING_ID}>
+      {/*
+        The surface's name, as a real heading rather than the `aria-label` that used to carry it.
+        An `aria-label` names a region for a reader who lists regions, but it contributes nothing to
+        the page's heading outline, which left every card's level-3 title with no level-2 heading
+        above it - an outline that stepped from the page's `h1` straight to level 3. The text is the
+        one the label stated, so the region's accessible name is unchanged; `ui/VisuallyHidden`
+        keeps the heading out of the visual rendering and out of layout, because the toolbar and the
+        grid beneath it already say what this surface is.
+      */}
+      <VisuallyHidden>
+        <h2 id={CATALOG_HEADING_ID}>Product catalog</h2>
+      </VisuallyHidden>
+
       <CatalogToolbar
         searchText={searchDraft}
         onSearchTextChange={setSearchDraft}
@@ -517,7 +580,12 @@ export function CatalogGrid({ products, categories, query }: CatalogGridProps) {
         </ul>
       )}
 
-      <CatalogPager page={products.page} pageSize={products.pageSize} total={products.total} />
+      <CatalogPager
+        page={products.page}
+        pageSize={products.pageSize}
+        total={products.total}
+        hrefForPage={hrefForCatalogPage}
+      />
     </section>
   );
 }

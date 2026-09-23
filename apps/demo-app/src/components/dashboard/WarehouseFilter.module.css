@@ -22,8 +22,12 @@
  * declares `display`, `flex-direction`, `gap` and `min-width: 0`. Two single-class rules in two
  * stylesheets tie on specificity, and which one wins then depends on the order the bundler emits
  * the modules in - not something this file should rely on. So `.field` declares none of those four
- * properties: it sizes its column with the `flex` shorthand, which `FormField` never sets, and its
- * floor is `flex-shrink: 0` rather than a `min-width` that `min-width: 0` could out-order.
+ * properties: it sizes its column with the `flex` shorthand, which `FormField` never sets. Where
+ * this file does need one of them - the shrink floor, and the visual order of a column's children -
+ * it says so through a selector rooted at `.root`, which outranks a single-class rule outright
+ * rather than tying with it. Anything added here that touches `display`, `flex-direction`, `gap`,
+ * `min-width`/`min-inline-size` or a column's children belongs in that two-class form for the same
+ * reason.
  *
  * Token contract: every colour, space and type size is `var(--ls-TOKEN, <literal fallback>)`, as
  * declared in `apps/demo-app/app/globals.css`. The fallback keeps this module sensible on its own
@@ -56,21 +60,96 @@
 
 /* One labelled column, passed to `FormField`'s `className`.
  *
- * `flex: 1 0 20ch` reads as: take an equal share of the leftover width, never shrink below the
- * basis, and let the row wrap when the basis no longer fits. The `ch` basis is measured in the
- * row's own font, so a column is sized by the text it has to show - roughly a warehouse name -
- * rather than by a pixel figure guessed at authoring time. Refusing to shrink is what stops a long
- * warehouse name from squeezing its neighbour down to an unusable sliver. */
+ * `flex: 1 1 15ch` reads as: take an equal share of the leftover width, hand width back rather
+ * than overhang a line narrower than the basis, and let the row wrap when the basis no longer
+ * fits. The `ch` basis is measured in the row's own font - 8.58px here, so 15ch is 128.70px - and
+ * a column is therefore sized by the text it has to show rather than by a pixel figure guessed at
+ * authoring time.
+ *
+ * The basis is the width the row wraps at, not the width a column ends up at. A flex line is
+ * filled from the items' bases and only then has its leftover width distributed, and all three
+ * growable columns share one basis, so each ends up at (line - 291.17px) / 3 whatever that basis
+ * is - 291.17px being the headroom column's fixed 128.69px, the action group's 114.48px and the
+ * row's four 12px gaps. What the basis does decide is how much has to fit before a line accepts
+ * everything: the row keeps the controls and the Apply group together while the line measures at
+ * least 3 x 15ch + 291.17px = 677.27px.
+ *
+ * Hence 15ch rather than the 20ch this rule carried before. At 768 the line is 704px and a 20ch
+ * basis wanted 805.97px, so the group wrapped 41.50px below the controls it applies to - measured
+ * 503.31px against 461.81px - while the line it had left was full to -0.01px. At 15ch the group
+ * sits on that line with 26.73px still to spare and each column measures 137.61px; on the 1136px
+ * line the page container caps at, all three still measure 281.61px, which is exactly what they
+ * measured before this change, so 1280, 1440 and 1920 are untouched. Below 677.27px the row wraps
+ * as it always did - at 375 into the same four lines, the narrowest control 128.69px wide.
+ *
+ * 15ch is also the narrowest a column can be and still say what it holds at rest. A `Select` at
+ * the `sm` scale spends 32.5px of its width on two borders, its 8px inline-start padding and the
+ * 22.5px lane reserved for the caret, so a 128.70px column leaves 96.20px of text against the
+ * 92.26px of the widest unconstrained option any of the three carries ("Any movement", measured at
+ * the 13px `sm` size) - so a column at the wrapping threshold still shows its resting value whole.
+ * A longer selection, a warehouse name, truncates with the ellipsis `Select` already asks for
+ * instead of being clipped mid-glyph, at this width as at every other. */
 .field {
-  flex: 1 0 20ch;
+  flex: 1 1 15ch;
+}
+
+/* The floor those columns shrink to, now that they shrink at all.
+ *
+ * Two classes deep deliberately. `FormField.module.css` puts `min-width: 0` on this same element;
+ * a logical and a physical property are resolved against each other by the cascade, so a
+ * single-class rule here would tie with it and be settled by whichever module the bundler emits
+ * last - the hazard the header opens with. `.root .field` outranks it by specificity instead.
+ *
+ * 12ch (102.96px) sits below the 15ch basis, so it never enters the wrapping arithmetic above: a
+ * line is filled from bases, and shrinking only happens to a column left alone on a line narrower
+ * than its own basis. That is narrower than the 343px the 375 viewport gives this row, so on this
+ * dashboard the floor is a guarantee rather than a working value - inside a narrower track it
+ * holds the control wide enough to still show an option and lets the row overhang instead. The
+ * row has no clipping ancestor, so an overhanging control stays legible and operable, where one
+ * squeezed to the track's width would be neither. */
+.root .field {
+  min-inline-size: 12ch;
 }
 
 /* The compact variant, for the low-stock threshold: a fixed, visibly narrower column that neither
  * grows nor shrinks, so the numeric control stays the size of the number it holds and the text
  * selects absorb the leftover width instead. Declared after `.field`, in the same file, so the
- * override order is deterministic; a control with long option labels should take plain `.field`. */
+ * override order is deterministic; a control with long option labels should take plain `.field`.
+ *
+ * The two rules name the same 15ch for different jobs: here it is the width the column takes, in
+ * `.field` it is only the width the row wraps at. That is why this is still the narrow column even
+ * though the figures match - a growable column ends up wider than its basis on any line with
+ * width to give, measured 137.61px against this column's 128.69px at 768 and 281.61px at 1136. */
 .fieldNarrow {
   flex: 0 0 15ch;
+}
+
+/* The control inside a labelled column, made the last thing in that column.
+ *
+ * `FormField` renders the label, then the control, then the hint - the right order to hear, and
+ * the wrong one to look at in this row. `align-items: flex-end` above aligns the columns' boxes,
+ * not the controls inside them, and only the headroom column carries a hint: measured, its box is
+ * 104.88px tall against 50.39px for a select's, and the hint's own 33.59px plus the column's
+ * 4.00px gap lifted its input exactly 37.59px clear of the three selects at 768, 1280, 1440 and
+ * 1920 (37.60px at 375). Showing the hint above the control leaves a control as the last box in
+ * all four columns, so aligning the boxes' bottom edges aligns the controls' bottom edges too -
+ * and four controls of the same measured 29.50px height then share one top edge exactly.
+ *
+ * It settles the narrow-viewport reading as well. At 375 the headroom column shares a line with
+ * "Stocking location", and with the hint below the input the hint fell between that label and its
+ * select, so guidance about one field read as belonging to the field beside it. Above the input it
+ * sits directly under the label it describes. Nothing about the announcement changes: the DOM
+ * order and `aria-describedby` are untouched, so the control is still read with its label first
+ * and its guidance after.
+ *
+ * `order` carries the whole change because `FormField`'s column is already a flex container, so
+ * this file states no `display`, `flex-direction` or `gap` of its own - the properties the header
+ * warns would tie with `FormField.module.css`. The selector reads as "a child of a column that is
+ * neither the label nor a message paragraph", which names the control without this file naming an
+ * `input`, `select` or `button` element, and being two classes deep it outranks that module's
+ * single-class rules by specificity rather than by the order the bundler happens to emit them. */
+.root .field > :not(label):not(p) {
+  order: 1;
 }
 
 /* The trailing control group: the Apply submit button, and a reset control beside it if the

@@ -57,12 +57,30 @@
  *   name and declaration kind as tie-breakers), so two runs over unchanged
  *   source serialise byte-identically — the reproducibility property
  *   `../indexer.ts` promises and the index cache depends on.
- * - **Scope.** Module-level declarations and class members only. A declaration
- *   nested inside a function body is deliberately *not* recorded: nothing
- *   downstream can address it — an instrumentation action names a
- *   `(file, symbol)` pair, and a function-local helper is not reachable under
- *   one — and recording them would flood `findByName` with noise during Stage 2
- *   investigation.
+ * - **Scope.** Module-level declarations, class members, and **named
+ *   function-valued declarations nested inside a function-like body** —
+ *   `function submitOrder() {}` or `const handleRetry = () => {}` written
+ *   inside a component, a hook, a method or a callback, to
+ *   {@link MAX_DECLARATION_SCOPE_DEPTH} deep. A nested declaration *is*
+ *   addressable: an instrumentation action names a `(file, symbol)` pair, and
+ *   the function-timing patcher resolves that pair against a declaration at any
+ *   depth in the file (refusing an ambiguous bare name with a "qualify it"
+ *   hint), which is exactly the shape AAP §6's canonical plan names — a React
+ *   submit handler declared inside its component. Each such node carries
+ *   `SymbolNodeData.enclosing`, the chain of enclosing named declarations, so a
+ *   consumer can tell it from a module-level declaration it could import and
+ *   can qualify the spelling; it never carries {@link CodeNodeBase.symbol},
+ *   which is reserved for a class member's owning class and is matched as a
+ *   call target.
+ *
+ *   Nothing else nested is recorded, and that exclusion is as load-bearing as
+ *   the inclusion: **no parameter** (including a destructured prop,
+ *   `function Row({ onPick })`), **no binding-pattern element** (`const { open,
+ *   onClose } = props`, `const [q, setQ] = useState()`), **no object-literal
+ *   property or method**, and **no nested declarator whose initialiser is not a
+ *   written function** (`const cb = useCallback(…)`). None of those is a
+ *   declaration whose body this file holds, so a node asserting one is how the
+ *   graph came to affirm an instrumentable symbol that does not exist.
  *
  * @module
  */
@@ -84,6 +102,7 @@ import type {
   SourceFile,
   Statement,
   TypeAliasDeclaration,
+  VariableDeclaration,
   VariableStatement,
 } from 'ts-morph';
 
@@ -98,6 +117,7 @@ import type {
   ExtractorResult,
   IndexDiagnostic,
   SymbolDeclarationKind,
+  SymbolNodeData,
 } from '../graph/types.js';
 
 /* -------------------------------------------------------------------------------------------------
@@ -157,6 +177,41 @@ const FILE_NODE_COLUMN = 1;
  */
 const MAX_NESTING_DEPTH = 16;
 
+/**
+ * How many function-like bodies deep a nested declaration is still recorded.
+ *
+ * Depth `1` is a declaration written directly in a module-level function's body
+ * — the shape this exists for, a handler inside its component — and each further
+ * function, arrow, method or accessor body counts one more. Eight covers every
+ * real nesting the supported stack produces (component → callback → callback is
+ * three) with room to spare, and bounds the walk on generated or minified source
+ * where declarations can nest arbitrarily.
+ *
+ * A declaration below the limit is recorded; one deeper is not, and that is
+ * stated here because a silent bound is worse than a documented one. It is
+ * separate from {@link MAX_NESTING_DEPTH}, which bounds two *syntactic* reads
+ * (a destructuring pattern, an initialiser's wrappers) rather than lexical
+ * scope, and the two must stay independent: raising one for a pathological
+ * expression must not widen what counts as an addressable declaration.
+ */
+const MAX_DECLARATION_SCOPE_DEPTH = 8;
+
+/**
+ * The enclosing chain of a declaration at module scope: no enclosing
+ * declaration at all.
+ *
+ * A single frozen empty array, shared by every walk that has not entered a
+ * function-like body yet, so the common case allocates nothing and no collector
+ * can extend a chain in place.
+ *
+ * A module-scope draft never carries it — it carries `undefined`, which is what
+ * `SymbolNodeData.enclosing` documents as "not nested". This value does reach
+ * that field in one case, and it is the case the field documents as `[]`: a
+ * declaration nested inside scopes none of which has a name, such as a function
+ * declared in a callback passed to a module-level call.
+ */
+const MODULE_SCOPE_CHAIN: readonly string[] = Object.freeze([]);
+
 /* -------------------------------------------------------------------------------------------------
  * Internal shapes
  * ---------------------------------------------------------------------------------------------- */
@@ -198,11 +253,22 @@ interface SymbolDraft {
   /**
    * Whether an export clause in this module can name this declaration.
    *
-   * `true` for a module-level declaration, `false` for a class member: a member
-   * is reachable through its class and can never be the subject of
-   * `export { … }`, so the export passes must not match it by bare name.
+   * `true` for a module-level declaration, `false` for a class member and for
+   * every nested declaration: neither is reachable through `export { … }` — a
+   * member is reached through its class, a nested declaration not at all — so
+   * the export passes must not match either by bare name.
    */
   isModuleLevel: boolean;
+
+  /**
+   * The enclosing named declarations, outermost first, for a nested
+   * declaration; `undefined` for module scope and for a class member.
+   *
+   * Carried to `SymbolNodeData.enclosing` unchanged, including the empty array,
+   * which means "nested, but nothing enclosing it has a name". See that field
+   * for the semantics consumers rely on.
+   */
+  enclosing: readonly string[] | undefined;
 }
 
 /**
@@ -532,6 +598,7 @@ function collectFunctionDeclaration(walk: Walk, declaration: FunctionDeclaration
       isDefaultExport: true,
       container: undefined,
       isModuleLevel: true,
+      enclosing: undefined,
     });
 
     return;
@@ -549,6 +616,7 @@ function collectFunctionDeclaration(walk: Walk, declaration: FunctionDeclaration
     isDefaultExport,
     container: undefined,
     isModuleLevel: true,
+    enclosing: undefined,
   });
 }
 
@@ -597,6 +665,7 @@ function collectClassDeclaration(walk: Walk, declaration: ClassDeclaration): voi
     isDefaultExport,
     container: undefined,
     isModuleLevel: true,
+    enclosing: undefined,
   });
 
   for (const member of declaration.getMembers()) {
@@ -657,6 +726,7 @@ function collectClassMember(
       isDefaultExport: false,
       container,
       isModuleLevel: false,
+      enclosing: undefined,
     });
 
     collectParameterProperties(walk, member, container, exported);
@@ -688,6 +758,7 @@ function collectClassMember(
     isDefaultExport: false,
     container,
     isModuleLevel: false,
+    enclosing: undefined,
   });
 }
 
@@ -736,6 +807,7 @@ function collectParameterProperties(
       isDefaultExport: false,
       container,
       isModuleLevel: false,
+      enclosing: undefined,
     });
   }
 }
@@ -814,6 +886,7 @@ function collectVariableStatement(walk: Walk, statement: VariableStatement): voi
       isDefaultExport: false,
       container: undefined,
       isModuleLevel: true,
+      enclosing: undefined,
     });
   }
 }
@@ -874,6 +947,7 @@ function collectBindingPattern(
       isDefaultExport: false,
       container: undefined,
       isModuleLevel: true,
+      enclosing: undefined,
     });
   }
 }
@@ -928,6 +1002,7 @@ function collectTypeLevelDeclaration(
     isDefaultExport: false,
     container: undefined,
     isModuleLevel: true,
+    enclosing: undefined,
   });
 }
 
@@ -977,6 +1052,7 @@ function collectModuleDeclaration(walk: Walk, declaration: ModuleDeclaration): v
     isDefaultExport: false,
     container: undefined,
     isModuleLevel: true,
+    enclosing: undefined,
   });
 }
 
@@ -1059,6 +1135,333 @@ function collectExportDeclaration(walk: Walk, declaration: ExportDeclaration): v
       isDefault: alias === DEFAULT_EXPORT_NAME,
     });
   }
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * Nested declarations
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * Whether a node's body is a lexical scope this walk counts and descends into.
+ *
+ * The seven forms that own a body a declaration can be written inside: a
+ * function declaration, a function expression, an arrow function, a method, a
+ * constructor and the two accessors. A class body is *not* one of them — it
+ * declares members rather than holding statements — and is handled separately
+ * so that entering a class does not spend depth (see
+ * {@link collectNestedDeclarations}).
+ *
+ * @param node The node to classify.
+ * @returns `true` when the node opens a nested function-like scope.
+ */
+function isFunctionLikeScope(node: Node): boolean {
+  return (
+    Node.isFunctionDeclaration(node) ||
+    Node.isFunctionExpression(node) ||
+    Node.isArrowFunction(node) ||
+    Node.isMethodDeclaration(node) ||
+    Node.isConstructorDeclaration(node) ||
+    Node.isGetAccessorDeclaration(node) ||
+    Node.isSetAccessorDeclaration(node)
+  );
+}
+
+/**
+ * The name the declaration *holding* a function expression or arrow gives it,
+ * or `undefined` when nothing names it.
+ *
+ * `const handleRetry = () => {}` and `{ onPick: function () {} }` write a
+ * function with no identifier of its own, and the name a developer would use to
+ * address anything inside it is the one on the left of the `=` or the `:`. The
+ * wrappers {@link unwrapExpression} peels are climbed here in the opposite
+ * direction, and for the same reason: `const f = (() => {}) as Fn` names its
+ * function `f`.
+ *
+ * Anything else — a call argument (`useEffect(() => {})`), a return statement,
+ * an array element — names nothing, which is the case
+ * `SymbolNodeData.enclosing` records as an anonymous link in the chain.
+ *
+ * @param fn The function expression or arrow function.
+ * @returns The holder's declared name, or `undefined`.
+ */
+function holderNameOf(fn: Node): string | undefined {
+  let current: Node | undefined = fn.getParent();
+
+  for (let depth = 0; depth < MAX_NESTING_DEPTH && current !== undefined; depth += 1) {
+    if (
+      Node.isParenthesizedExpression(current) ||
+      Node.isAsExpression(current) ||
+      Node.isSatisfiesExpression(current) ||
+      Node.isNonNullExpression(current) ||
+      Node.isTypeAssertion(current)
+    ) {
+      current = current.getParent();
+      continue;
+    }
+
+    if (
+      Node.isVariableDeclaration(current) ||
+      Node.isPropertyAssignment(current) ||
+      Node.isPropertyDeclaration(current)
+    ) {
+      return declaredNameOf(current.getNameNode());
+    }
+
+    return undefined;
+  }
+
+  return undefined;
+}
+
+/**
+ * The name a nested scope contributes to an enclosing chain, or `undefined` for
+ * an anonymous one.
+ *
+ * Read from the scope itself wherever it has an identifier — a function
+ * declaration, a named function expression, a method or accessor name, the
+ * `constructor` keyword — and from the declaration that holds it otherwise, so
+ * the chain reads the way a developer would qualify the declaration inside it.
+ *
+ * @param scope A node {@link isFunctionLikeScope} accepted, or a class.
+ * @returns The name to append to the chain, or `undefined` to leave it
+ * unchanged.
+ */
+function scopeNameOf(scope: Node): string | undefined {
+  if (Node.isConstructorDeclaration(scope)) {
+    return CONSTRUCTOR_NAME;
+  }
+
+  if (
+    Node.isMethodDeclaration(scope) ||
+    Node.isGetAccessorDeclaration(scope) ||
+    Node.isSetAccessorDeclaration(scope)
+  ) {
+    return declaredNameOf(scope.getNameNode());
+  }
+
+  if (
+    Node.isFunctionDeclaration(scope) ||
+    Node.isFunctionExpression(scope) ||
+    Node.isClassDeclaration(scope) ||
+    Node.isClassExpression(scope)
+  ) {
+    const own = declaredNameOf(scope.getNameNode());
+
+    if (own !== undefined) {
+      return own;
+    }
+  }
+
+  return holderNameOf(scope);
+}
+
+/**
+ * One enclosing chain extended by one scope, or returned unchanged for an
+ * anonymous scope.
+ *
+ * A new array every time rather than a mutated one: a chain is handed to the
+ * drafts of a whole subtree and stored on the node payload, so sharing a
+ * mutable array between sibling scopes would make the recorded chain depend on
+ * the walk order.
+ *
+ * @param chain The chain of the enclosing scope.
+ * @param name The name this scope contributes, or `undefined`.
+ * @returns The chain to use inside the scope.
+ */
+function extendChain(chain: readonly string[], name: string | undefined): readonly string[] {
+  return name === undefined ? chain : [...chain, name];
+}
+
+/**
+ * Records a named function declaration written inside a function-like body.
+ *
+ * The shape AAP §6's canonical plan names — `async function submitOrder() {}`
+ * inside the component that submits — and the reason this whole section exists:
+ * the declaration has a body at a position, so an instrumentation action can
+ * name it, and a graph that omits it makes the one plan the product is built
+ * around infeasible.
+ *
+ * `exported` is `false` unconditionally: a nested declaration cannot carry an
+ * export keyword and, with `isModuleLevel: false`, cannot be reached by an
+ * `export { … }` clause either. A declaration whose name is not a plain
+ * identifier is not recorded — there is none in valid TypeScript, and the guard
+ * keeps a parser-recovered construct from producing an unaddressable node.
+ *
+ * @param walk The file walk to append to.
+ * @param declaration The nested function declaration.
+ * @param enclosing The chain of enclosing named declarations, outermost first.
+ */
+function collectNestedFunctionDeclaration(
+  walk: Walk,
+  declaration: FunctionDeclaration,
+  enclosing: readonly string[],
+): void {
+  const nameNode = declaration.getNameNode();
+
+  if (nameNode === undefined || !Node.isIdentifier(nameNode)) {
+    return;
+  }
+
+  const name = declaredNameOf(nameNode);
+
+  if (name === undefined) {
+    return;
+  }
+
+  const position = positionOf(walk.sourceFile, nameNode);
+
+  walk.drafts.push({
+    name,
+    declaration: 'function',
+    line: position.line,
+    column: position.column,
+    endLine: declaration.getEndLineNumber(),
+    exported: false,
+    isDefaultExport: false,
+    container: undefined,
+    isModuleLevel: false,
+    enclosing,
+  });
+}
+
+/**
+ * Records a `const`/`let`/`var` declarator written inside a function-like body
+ * whose initialiser is a function.
+ *
+ * Two guards, and both are the difference between an addressable declaration
+ * and a claim the patcher cannot honour:
+ *
+ * - **A plain identifier name.** A binding pattern (`const { open, onClose } =
+ *   props`, `const [q, setQ] = useState()`) binds a value that arrives from
+ *   somewhere else; this file holds no body for it, so it is not recorded —
+ *   unlike the module-level case, where the bound name is a real export of the
+ *   module (see {@link collectBindingPattern}).
+ * - **A function-valued initialiser**, by {@link isFunctionValued}: a written
+ *   arrow or function expression has a body to wrap, while `const cb =
+ *   useCallback(fn, [])` is a call whose result is a value — the body it returns
+ *   is written elsewhere, or is the argument, which carries its own node when it
+ *   is itself declared.
+ *
+ * Classified as `function`, exactly as the module-scope path classifies
+ * `const f = () => {}`, so a consumer reading `data.declaration` needs no
+ * special case for nesting.
+ *
+ * @param walk The file walk to append to.
+ * @param declaration The nested variable declarator.
+ * @param enclosing The chain of enclosing named declarations, outermost first.
+ */
+function collectNestedDeclarator(
+  walk: Walk,
+  declaration: VariableDeclaration,
+  enclosing: readonly string[],
+): void {
+  const nameNode = declaration.getNameNode();
+
+  if (!Node.isIdentifier(nameNode) || !isFunctionValued(declaration.getInitializer())) {
+    return;
+  }
+
+  const name = declaredNameOf(nameNode);
+
+  if (name === undefined) {
+    return;
+  }
+
+  const position = positionOf(walk.sourceFile, nameNode);
+
+  walk.drafts.push({
+    name,
+    declaration: 'function',
+    line: position.line,
+    column: position.column,
+    endLine: declaration.getEndLineNumber(),
+    exported: false,
+    isDefaultExport: false,
+    container: undefined,
+    isModuleLevel: false,
+    enclosing,
+  });
+}
+
+/**
+ * Walks one module-level statement for the declarations nested inside it.
+ *
+ * Recursive, and deliberately narrow about what it records versus what it
+ * traverses:
+ *
+ * - **A function-like scope** is entered at one greater depth, with the
+ *   enclosing chain extended by whatever names it. A function *declaration*
+ *   found at depth 1 or deeper is recorded before the descent; a method, an
+ *   accessor and a constructor are not, because the module-level pass already
+ *   recorded the members of a module-level class and a member of a *nested*
+ *   class is reachable only through a class nothing outside the body can name.
+ * - **A class** extends the chain without spending depth: its body holds
+ *   members, not statements, so a function declared in a method is exactly as
+ *   deep as one declared in a free function beside it.
+ * - **A variable declarator** at depth 1 or deeper is offered to
+ *   {@link collectNestedDeclarator}, which applies the two guards that decide
+ *   whether it declares a function at all.
+ * - **Everything else** is traversed without being recorded, which is how a
+ *   handler inside a `useEffect` callback, a JSX attribute or an `if` block is
+ *   reached while a parameter, a binding element and an object-literal member
+ *   stay out of the graph: none of the three is a form recorded above.
+ *
+ * The traversal uses `forEachChild` rather than `forEachDescendant` so the
+ * depth of every visited node is known exactly, which is what makes
+ * {@link MAX_DECLARATION_SCOPE_DEPTH} a real bound: past it the walk stops
+ * descending instead of recording deeper declarations it would have to filter
+ * afterwards.
+ *
+ * @param walk The file walk to append to.
+ * @param node The node to read — a module-level statement on the first call.
+ * @param enclosing The chain of enclosing named declarations, outermost first;
+ * {@link MODULE_SCOPE_CHAIN} on the first call.
+ * @param depth How many function-like bodies `node` sits inside; `0` at module
+ * scope.
+ */
+function collectNestedDeclarations(
+  walk: Walk,
+  node: Node,
+  enclosing: readonly string[],
+  depth: number,
+): void {
+  if (isFunctionLikeScope(node)) {
+    if (depth >= 1 && Node.isFunctionDeclaration(node)) {
+      collectNestedFunctionDeclaration(walk, node, enclosing);
+    }
+
+    const inner = depth + 1;
+
+    if (inner > MAX_DECLARATION_SCOPE_DEPTH) {
+      return;
+    }
+
+    const chain = extendChain(enclosing, scopeNameOf(node));
+
+    node.forEachChild((child) => {
+      collectNestedDeclarations(walk, child, chain, inner);
+    });
+
+    return;
+  }
+
+  if (Node.isClassDeclaration(node) || Node.isClassExpression(node)) {
+    const chain = extendChain(enclosing, scopeNameOf(node));
+
+    node.forEachChild((child) => {
+      collectNestedDeclarations(walk, child, chain, depth);
+    });
+
+    return;
+  }
+
+  if (depth >= 1 && Node.isVariableDeclaration(node)) {
+    collectNestedDeclarator(walk, node, enclosing);
+  }
+
+  node.forEachChild((child) => {
+    collectNestedDeclarations(walk, child, enclosing, depth);
+  });
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -1216,6 +1619,7 @@ function applyDefaultExports(walk: Walk): void {
       isDefaultExport: true,
       container: undefined,
       isModuleLevel: true,
+      enclosing: undefined,
     });
   }
 }
@@ -1271,6 +1675,21 @@ function compareDrafts(left: SymbolDraft, right: SymbolDraft): number {
  * @returns The node to emit.
  */
 function toSymbolNode(draft: SymbolDraft, file: string): CodeNodeOf<'symbol'> {
+  // `SymbolNodeData.enclosing` is omitted rather than set to `undefined` for a
+  // module-level declaration or a class member: the field's *absence* is what
+  // says "reachable from outside its own body", and the package compiles under
+  // `exactOptionalPropertyTypes`, where absent and present-but-undefined are
+  // not the same type. An empty array is passed through, because "nested inside
+  // declarations none of which has a name" is a different answer from "not
+  // nested".
+  const data: SymbolNodeData =
+    draft.enclosing === undefined
+      ? { declaration: draft.declaration, isDefaultExport: draft.isDefaultExport }
+      : {
+          declaration: draft.declaration,
+          isDefaultExport: draft.isDefaultExport,
+          enclosing: draft.enclosing,
+        };
   const node = {
     id: makeNodeId({
       kind: 'symbol',
@@ -1286,7 +1705,7 @@ function toSymbolNode(draft: SymbolDraft, file: string): CodeNodeOf<'symbol'> {
     column: draft.column,
     endLine: Math.max(draft.endLine, draft.line),
     exported: draft.exported,
-    data: { declaration: draft.declaration, isDefaultExport: draft.isDefaultExport },
+    data,
   } as const satisfies CodeNodeOf<'symbol'>;
 
   // `CodeNodeBase.symbol` is "the enclosing or declared symbol name, when it
@@ -1294,6 +1713,12 @@ function toSymbolNode(draft: SymbolDraft, file: string): CodeNodeOf<'symbol'> {
   // is omitted rather than set to `undefined` for a module-level declaration,
   // whose name already *is* its symbol (and the package compiles under
   // `exactOptionalPropertyTypes`, where the two are not the same thing).
+  //
+  // A **nested** declaration has no container and therefore no `symbol`, which
+  // is deliberate and not an omission: `../graph/query.ts`'s `nodeBearsSymbol`
+  // matches that field, and a nested helper must not become a call target under
+  // the name of the function it happens to sit inside. Its enclosing chain
+  // travels in the payload instead.
   return draft.container === undefined ? node : { ...node, symbol: draft.container };
 }
 
@@ -1344,9 +1769,14 @@ function toDeclaresEdge(fileNodeId: string, node: CodeNodeOf<'symbol'>): CodeEdg
  *    not a path this package may put in a node — node ids are derived from it
  *    and a `SourceLocation` is refined by the same predicate — so the file is
  *    skipped with a diagnostic instead.
- * 2. Every module-level statement is dispatched to the collector for its form,
- *    each inside a `try`/`catch`, so one unexpected construct costs one
- *    statement and not the file.
+ * 2. Every module-level statement is dispatched to the collector for its form
+ *    and then walked for the declarations nested inside it, both inside one
+ *    `try`/`catch`, so one unexpected construct costs one statement and not the
+ *    file. The two reads are separate passes over the same statement rather
+ *    than one: the module-level collectors classify by *form* and know nothing
+ *    about scope, while the nested walk classifies by *scope* and records only
+ *    the two nested forms that declare a function (see
+ *    {@link collectNestedDeclarations}).
  * 3. Export clauses and default-export statements are applied, which can only
  *    happen once the whole file is known.
  * 4. Drafts are ordered and materialised into nodes and edges.
@@ -1384,6 +1814,7 @@ function extractSymbols(ctx: ExtractorContext): ExtractorResult {
   for (const statement of ctx.sourceFile.getStatements()) {
     try {
       collectStatement(walk, statement);
+      collectNestedDeclarations(walk, statement, MODULE_SCOPE_CHAIN, 0);
     } catch (error) {
       walk.diagnostics.push(
         unexpectedFailure(

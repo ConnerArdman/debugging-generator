@@ -50,7 +50,13 @@ import { describe, expect, it } from 'vitest';
 
 import type { Result } from '@debuggen/shared';
 
-import { FunctionTimingPatcher, patchFunctionTiming } from './function-timing.js';
+import {
+  PATCH_NON_ADDRESSABLE_POSITIONS,
+  PATCH_REACT_SITES,
+  PATCH_TARGET_SHAPES,
+  FunctionTimingPatcher,
+  patchFunctionTiming,
+} from './function-timing.js';
 import type { FunctionTimingPatch, FunctionTimingRequest } from './function-timing.js';
 import {
   ARGUMENTS_HAZARDS,
@@ -82,12 +88,18 @@ const unverifiedPatcher = new FunctionTimingPatcher({ verifyPatchedTypes: false 
  *
  * @param result The patch result.
  * @param reason The `details.reason` the refusal must carry.
+ * @param code The error code it must carry. `'PATCH_UNSUPPORTED'` by default,
+ * which is every refusal of a target that *resolved*; the resolution refusals —
+ * a symbol the file does not declare, one it declares in a position no wrapper
+ * can replace, an ambiguous one — carry `'PATCH_TARGET_NOT_FOUND'` instead,
+ * because nothing was resolved to refuse.
  * @returns The refusal's `details`, so a caller can assert on the context it
  * carries.
  */
 function expectRefusal(
   result: Result<FunctionTimingPatch>,
   reason: string,
+  code: 'PATCH_TARGET_NOT_FOUND' | 'PATCH_UNSUPPORTED' = 'PATCH_UNSUPPORTED',
 ): Readonly<Record<string, unknown>> {
   if (result.ok) {
     throw new Error(`expected the refusal ${reason}, received a patch`);
@@ -95,7 +107,7 @@ function expectRefusal(
 
   const error = result.error;
 
-  expect(error.code).toBe('PATCH_UNSUPPORTED');
+  expect(error.code).toBe(code);
   expect(error.details?.reason).toBe(reason);
   // A refusal with no next step is a dead end for the developer, and AAP §0.5.5
   // makes the hint part of the graceful path rather than decoration.
@@ -541,6 +553,80 @@ describe('executed semantics of an accepted patch', () => {
     expect(patchedInstrumented(4)).toBe(8);
     expect(withHelper.state).toEqual({ calls: 1 });
     expect(spans).toEqual([{ name: 'tally', meta: patch.meta }]);
+  });
+
+  it('runs a patched nested function exactly once, answering identically', () => {
+    // The nested case of the guarantee above. The wrapper now sits inside the
+    // enclosing function's body, so the enclosing call is what exercises it,
+    // and the closure the body reads — `seed` — is a binding the move must not
+    // disturb.
+    const text =
+      'function outer(seed) {\n' +
+      '  function tally(first) {\n' +
+      '    globalThis.state.calls += 1;\n' +
+      '    return first + seed;\n' +
+      '  }\n' +
+      '  const sibling = seed + 1;\n' +
+      '  return tally(2) + tally(3) + sibling;\n' +
+      '}\n';
+    const patch = expectPatch({ file: 'src/legacy/tally.js', symbol: 'tally', text });
+
+    expect(patch.enclosing).toBe('outer');
+
+    const originalSandbox: Record<string, unknown> = { state: { calls: 0 } };
+    const original = evaluateTarget(text, 'outer', originalSandbox);
+    const withoutHelper: Record<string, unknown> = { state: { calls: 0 } };
+    const patched = evaluateTarget(patch.patchedText, 'outer', withoutHelper);
+
+    expect(patched(10)).toBe(original(10));
+    expect(withoutHelper.state).toEqual({ calls: 2 });
+
+    const spans: { name: unknown; meta: unknown }[] = [];
+    const withHelper: Record<string, unknown> = {
+      state: { calls: 0 },
+      __DEBUGGEN__: {
+        span: (name: unknown, meta: unknown, fn: () => unknown): unknown => {
+          spans.push({ name, meta });
+
+          return fn();
+        },
+      },
+    };
+    const instrumented = evaluateTarget(patch.patchedText, 'outer', withHelper);
+
+    expect(instrumented(10)).toBe(original(10));
+    expect(withHelper.state).toEqual({ calls: 2 });
+    // One span per call of the nested function, each carrying the nested
+    // declaration's own position rather than the enclosing function's.
+    expect(spans).toEqual([
+      { name: 'tally', meta: patch.meta },
+      { name: 'tally', meta: patch.meta },
+    ]);
+  });
+
+  it('preserves a nested body that reads an enclosing binding named __orig', () => {
+    // The collision the wider identifier scan exists for: the binding the body
+    // reads is declared one frame out, in the enclosing function, so a wrapper
+    // that named its inner function `__orig` would shadow it and the body would
+    // read a function where it expected a string.
+    const text =
+      'function outer(input) {\n' +
+      '  const __orig = input.trim();\n' +
+      '  function normalise() {\n' +
+      '    return __orig.toUpperCase();\n' +
+      '  }\n' +
+      '  return normalise();\n' +
+      '}\n';
+    const patch = expectPatch({ file: 'src/legacy/tally.js', symbol: 'normalise', text });
+
+    expect(patch.innerIdentifier).toBe('__orig_1');
+    expect(patch.patchedText).toContain('return __orig.toUpperCase();');
+
+    const original = evaluateTarget(text, 'outer');
+    const patched = evaluateTarget(patch.patchedText, 'outer');
+
+    expect(patched('  ab ')).toBe('AB');
+    expect(patched('  ab ')).toBe(original('  ab '));
   });
 
   it('propagates a thrown error unchanged', () => {
@@ -1044,5 +1130,912 @@ describe('receiver typing (R1-F46)', () => {
 
     expect(patch.receiver).toBe('this');
     expect(innerDeclarationOf(patch)).toContain(`function ${patch.innerIdentifier}()`);
+  });
+});
+
+describe('nested declarations (C1-F06)', () => {
+  /** A component-shaped enclosing function with a handler nested inside it. */
+  const NESTED_FUNCTION_TEXT =
+    'export function outer(seed: number): number {\n' +
+    '  function tally(first: number): number {\n' +
+    '    return first + seed;\n' +
+    '  }\n' +
+    '  const sibling = seed + 1;\n' +
+    '\n' +
+    '  return tally(2) + sibling;\n' +
+    '}\n';
+
+  it('patches a nested function declaration in place', () => {
+    const patch = expectPatch({
+      file: 'src/panel.ts',
+      symbol: 'tally',
+      text: NESTED_FUNCTION_TEXT,
+    });
+
+    expect(patch.shape).toBe('function-declaration');
+    expect(patch.callStyle).toBe('arguments');
+    expect(patch.enclosing).toBe('outer');
+    expect(patch.container).toBeUndefined();
+    // The recorded position is the nested name's own, not the enclosing one's.
+    expect(patch.location.line).toBe(2);
+    expect(patch.meta.symbol).toBe('tally');
+  });
+
+  it('confines a nested patch to the nested declaration', () => {
+    const patch = expectPatch({
+      file: 'src/panel.ts',
+      symbol: 'tally',
+      text: NESTED_FUNCTION_TEXT,
+    });
+    const bodyEdit = patch.edits.at(-1);
+
+    expect(bodyEdit?.purpose).toBe('function-body');
+    // The edit starts after the nested declaration begins and ends before the
+    // next statement of the enclosing body, so everything the enclosing
+    // function declares around the target is untouched.
+    expect(bodyEdit?.start).toBeGreaterThan(NESTED_FUNCTION_TEXT.indexOf('  function tally('));
+    expect(bodyEdit?.end).toBeLessThan(NESTED_FUNCTION_TEXT.indexOf('  const sibling'));
+    expect(patch.patchedText).toContain('  const sibling = seed + 1;\n');
+    expect(patch.patchedText).toContain('  return tally(2) + sibling;\n');
+    // The enclosing signature is not even read, let alone rewritten.
+    expect(patch.patchedText).toContain('export function outer(seed: number): number {\n');
+  });
+
+  it('indents a nested wrapper with the file\u2019s own indentation', () => {
+    const patch = expectPatch({
+      file: 'src/panel.ts',
+      symbol: 'tally',
+      text: NESTED_FUNCTION_TEXT,
+    });
+
+    // The nested body is indented four spaces in the original, and the
+    // statements inserted beside it take that same indentation back.
+    expect(patch.patchedText).toContain(`    const ${patch.helperIdentifier} = `);
+  });
+
+  it('patches a nested arrow declarator with the rest-parameter template', () => {
+    const patch = expectPatch({
+      file: 'src/panel.tsx',
+      symbol: 'handleRetry',
+      text:
+        'export function Panel(props: { retry: () => void }): number {\n' +
+        '  const handleRetry = (): void => {\n' +
+        '    props.retry();\n' +
+        '  };\n' +
+        '\n' +
+        '  handleRetry();\n' +
+        '\n' +
+        '  return 1;\n' +
+        '}\n',
+    });
+
+    expect(patch.shape).toBe('arrow-function');
+    expect(patch.callStyle).toBe('rest');
+    expect(patch.restIdentifier).toBe('__args');
+    expect(patch.enclosing).toBe('Panel');
+    expect(patch.edits.at(-1)?.purpose).toBe('function-declaration');
+  });
+
+  it('patches a nested function expression declarator', () => {
+    const patch = expectPatch({
+      file: 'src/panel.ts',
+      symbol: 'settle',
+      text:
+        'export function outer(): number {\n' +
+        '  const settle = function (a: number): number {\n' +
+        '    return a + 1;\n' +
+        '  };\n' +
+        '\n' +
+        '  return settle(1);\n' +
+        '}\n',
+    });
+
+    expect(patch.shape).toBe('function-expression');
+    expect(patch.enclosing).toBe('outer');
+  });
+
+  it('names a nested declaration inside an arrow-bodied enclosing declaration', () => {
+    // The enclosing scope has no name of its own; the declaration it
+    // initialises supplies one, which is what makes `Panel.handleThing`
+    // addressable for a component written as a `const`.
+    const patch = expectPatch({
+      file: 'src/panel.tsx',
+      symbol: 'Panel.handleThing',
+      text:
+        'export const Panel = (): number => {\n' +
+        '  function handleThing(): number {\n' +
+        '    return 1;\n' +
+        '  }\n' +
+        '\n' +
+        '  return handleThing();\n' +
+        '}\n',
+    });
+
+    expect(patch.enclosing).toBe('Panel');
+    expect(patch.shape).toBe('function-declaration');
+  });
+
+  it('addresses a nested declaration by the bare name and both qualified spellings', () => {
+    const bare = expectPatch({ file: 'src/panel.ts', symbol: 'tally', text: NESTED_FUNCTION_TEXT });
+    const dotted = expectPatch({
+      file: 'src/panel.ts',
+      symbol: 'outer.tally',
+      text: NESTED_FUNCTION_TEXT,
+    });
+    const hashed = expectPatch({
+      file: 'src/panel.ts',
+      symbol: 'outer#tally',
+      text: NESTED_FUNCTION_TEXT,
+    });
+
+    // One declaration, three spellings, one set of bytes: the spelling selects
+    // the target and contributes nothing to the output.
+    expect(dotted.patchedText).toBe(bare.patchedText);
+    expect(hashed.patchedText).toBe(bare.patchedText);
+  });
+
+  it('lets a module-scope declaration keep the bare name', () => {
+    // The precedence that keeps every target that worked before nested
+    // resolution existed working: the outer declaration answers the bare name,
+    // and the nested one is reachable only through its qualified spelling.
+    const text =
+      'export function tally(a: number): number {\n' +
+      '  return a;\n' +
+      '}\n' +
+      '\n' +
+      'export function outer(seed: number): number {\n' +
+      '  function tally(first: number): number {\n' +
+      '    return first + seed;\n' +
+      '  }\n' +
+      '\n' +
+      '  return tally(2);\n' +
+      '}\n';
+    const outerTarget = expectPatch({ file: 'src/panel.ts', symbol: 'tally', text });
+
+    expect(outerTarget.enclosing).toBeUndefined();
+    expect(outerTarget.location.line).toBe(1);
+
+    const nestedTarget = expectPatch({ file: 'src/panel.ts', symbol: 'outer.tally', text });
+
+    expect(nestedTarget.enclosing).toBe('outer');
+    expect(nestedTarget.location.line).toBe(6);
+  });
+
+  it('refuses two nested declarations of one name, naming the spellings that disambiguate', () => {
+    const text =
+      'export function First(): number {\n' +
+      '  function handleThing(): number {\n' +
+      '    return 1;\n' +
+      '  }\n' +
+      '\n' +
+      '  return handleThing();\n' +
+      '}\n' +
+      '\n' +
+      'export function Second(): number {\n' +
+      '  function handleThing(): number {\n' +
+      '    return 2;\n' +
+      '  }\n' +
+      '\n' +
+      '  return handleThing();\n' +
+      '}\n';
+    const result = patcher.patch({ file: 'src/panel.ts', symbol: 'handleThing', text });
+    const details = expectRefusal(result, 'ambiguous-symbol', 'PATCH_TARGET_NOT_FOUND');
+
+    expect(details.candidates).toEqual([
+      { container: undefined, enclosing: 'First', line: 2 },
+      { container: undefined, enclosing: 'Second', line: 10 },
+    ]);
+
+    if (result.ok) {
+      throw new Error('expected an ambiguity refusal');
+    }
+
+    expect(result.error.hint).toContain('First.handleThing');
+    expect(result.error.hint).toContain('Second.handleThing');
+
+    // And each spelling the hint offers actually resolves.
+    expect(
+      expectPatch({ file: 'src/panel.ts', symbol: 'First.handleThing', text }).location.line,
+    ).toBe(2);
+    expect(
+      expectPatch({ file: 'src/panel.ts', symbol: 'Second.handleThing', text }).location.line,
+    ).toBe(10);
+  });
+
+  it('disambiguates the inner identifier against a binding in the enclosing scope', () => {
+    // `allocateIdentifiers` scans the enclosing top-level declaration for a
+    // nested target precisely so this binding is seen: it is not inside the
+    // nested declaration at all.
+    const patch = expectPatch({
+      file: 'src/panel.ts',
+      symbol: 'normalise',
+      text:
+        'export function outer(input: string): string {\n' +
+        '  const __orig = input.trim();\n' +
+        '  function normalise(): string {\n' +
+        '    return __orig.toUpperCase();\n' +
+        '  }\n' +
+        '\n' +
+        '  return normalise();\n' +
+        '}\n',
+    });
+
+    expect(patch.innerIdentifier).toBe('__orig_1');
+    expect(patch.patchedText).toContain('function __orig_1(');
+    expect(patch.patchedText).toContain('return __orig.toUpperCase();');
+  });
+
+  it('patches a declaration at the supported nesting depth and refuses one beyond it', () => {
+    /**
+     * Builds a file whose `target` sits `scopes` function bodies deep.
+     *
+     * @param scopes How many function-like scopes enclose the target.
+     * @returns The source text.
+     */
+    function nestText(scopes: number): string {
+      let text = '';
+
+      for (let level = 0; level < scopes; level += 1) {
+        text += `${'  '.repeat(level)}${level === 0 ? 'export ' : ''}function level${String(level)}(): number {\n`;
+      }
+
+      text += `${'  '.repeat(scopes)}function target(): number {\n${'  '.repeat(scopes + 1)}return 1;\n${'  '.repeat(scopes)}}\n`;
+      text += `${'  '.repeat(scopes)}return target();\n`;
+
+      for (let level = scopes - 1; level >= 0; level -= 1) {
+        text += `${'  '.repeat(level)}}\n`;
+      }
+
+      return text;
+    }
+
+    const deepest = expectPatch({ file: 'src/panel.ts', symbol: 'target', text: nestText(8) });
+
+    expect(deepest.enclosing).toBe('level7');
+
+    const details = expectRefusal(
+      patcher.patch({ file: 'src/panel.ts', symbol: 'target', text: nestText(9) }),
+      'symbol-not-addressable',
+      'PATCH_TARGET_NOT_FOUND',
+    );
+
+    expect(details.position).toBe('unreachable-scope');
+  });
+});
+
+describe('a declaration in a position no wrapper can replace (C1-F07)', () => {
+  /**
+   * Asserts a target is refused as not addressable, and returns the details.
+   *
+   * The distinction the finding is about: this is `PATCH_TARGET_NOT_FOUND` like
+   * `'symbol-not-found'` — nothing may be written either way — but it says the
+   * declaration *was* found, which is what makes "re-index the project" the
+   * wrong advice and the hint's own next step the right one.
+   *
+   * @param request The target to patch.
+   * @param position The `details.position` the refusal must carry.
+   * @param enclosing The declaration the hint must name, or `undefined` when
+   * the declaration sits at module scope.
+   * @returns The refusal's `details`.
+   */
+  function expectNotAddressable(
+    request: FunctionTimingRequest,
+    position: string,
+    enclosing: string | undefined,
+  ): Readonly<Record<string, unknown>> {
+    const result = patcher.patch(request);
+    const details = expectRefusal(result, 'symbol-not-addressable', 'PATCH_TARGET_NOT_FOUND');
+
+    expect(details.position).toBe(position);
+    expect(details.enclosing).toBe(enclosing);
+    expect(details.shapes).toEqual([...PATCH_TARGET_SHAPES]);
+
+    if (result.ok) {
+      throw new Error('expected a refusal');
+    }
+
+    const hint = result.error.hint ?? '';
+
+    if (enclosing !== undefined) {
+      expect(hint).toContain(enclosing);
+    }
+
+    // Never a fragment of the developer's source, in the message or the hint.
+    expect(result.error.message).not.toContain('=>');
+    expect(result.error.message).not.toContain('{');
+
+    return details;
+  }
+
+  it('refuses a destructured prop parameter', () => {
+    expectNotAddressable(
+      {
+        file: 'src/panel.tsx',
+        symbol: 'onPick',
+        text:
+          'export function Row({ onPick }: { onPick: () => void }): number {\n' +
+          '  onPick();\n' +
+          '\n' +
+          '  return 1;\n' +
+          '}\n',
+      },
+      'parameter',
+      'Row',
+    );
+  });
+
+  it('refuses a plain parameter', () => {
+    expectNotAddressable(
+      {
+        file: 'src/panel.tsx',
+        symbol: 'onPick',
+        text:
+          'export function Row(onPick: () => void): number {\n' +
+          '  onPick();\n' +
+          '\n' +
+          '  return 1;\n' +
+          '}\n',
+      },
+      'parameter',
+      'Row',
+    );
+  });
+
+  it('refuses an object binding element', () => {
+    expectNotAddressable(
+      {
+        file: 'src/panel.tsx',
+        symbol: 'onClose',
+        text:
+          'export function Panel(props: { onClose: () => void }): number {\n' +
+          '  const { onClose } = props;\n' +
+          '\n' +
+          '  onClose();\n' +
+          '\n' +
+          '  return 1;\n' +
+          '}\n',
+      },
+      'binding-element',
+      'Panel',
+    );
+  });
+
+  it('refuses an array binding element', () => {
+    // The `const [q, setQ] = useState('')` shape: the second element is a
+    // function at run time and no declaration at all in the syntax.
+    expectNotAddressable(
+      {
+        file: 'src/panel.tsx',
+        symbol: 'setQ',
+        text:
+          "import { useState } from 'react';\n" +
+          '\n' +
+          'export function Field(): string {\n' +
+          "  const [q, setQ] = useState('');\n" +
+          '\n' +
+          '  return q + String(setQ);\n' +
+          '}\n',
+      },
+      'binding-element',
+      'Field',
+    );
+  });
+
+  it('refuses a nested declarator whose initialiser is not a function', () => {
+    expectNotAddressable(
+      {
+        file: 'src/panel.tsx',
+        symbol: 'cb',
+        text:
+          "import { useCallback } from 'react';\n" +
+          '\n' +
+          'export function Panel(): number {\n' +
+          '  const cb = useCallback(() => 1, []);\n' +
+          '\n' +
+          '  return cb();\n' +
+          '}\n',
+      },
+      'non-function-declarator',
+      'Panel',
+    );
+  });
+
+  it('keeps unsupported-declaration for a module-scope declarator that holds no function', () => {
+    // The module-scope counterpart is *resolved* and refused for holding no
+    // function, which is unchanged: a plan naming it is naming a real export.
+    expectRefusal(
+      patcher.patch({
+        file: 'src/panel.ts',
+        symbol: 'limit',
+        text: 'export const limit = 4;\n',
+      }),
+      'unsupported-declaration',
+    );
+  });
+
+  it('refuses an object-literal method', () => {
+    expectNotAddressable(
+      {
+        file: 'src/panel.ts',
+        symbol: 'settle',
+        text: 'export const handlers = {\n  settle() {\n    return 1;\n  },\n};\n',
+      },
+      'object-literal-member',
+      undefined,
+    );
+  });
+
+  it('refuses an object-literal property that holds a function', () => {
+    expectNotAddressable(
+      {
+        file: 'src/panel.ts',
+        symbol: 'settle',
+        text: 'export const handlers = {\n  settle: (): number => 1,\n};\n',
+      },
+      'object-literal-member',
+      undefined,
+    );
+  });
+
+  it('refuses a type-level declaration', () => {
+    // The more precise answer for a case that used to report "no such symbol":
+    // a type alias is declared right there, and erases before anything runs.
+    expectNotAddressable(
+      {
+        file: 'src/panel.ts',
+        symbol: 'Settings',
+        text: 'export type Settings = {\n  readonly mode: string;\n};\n',
+      },
+      'type-declaration',
+      undefined,
+    );
+
+    expectNotAddressable(
+      {
+        file: 'src/panel.ts',
+        symbol: 'Mode',
+        text: 'export interface Mode {\n  readonly kind: string;\n}\n',
+      },
+      'type-declaration',
+      undefined,
+    );
+
+    expectNotAddressable(
+      {
+        file: 'src/panel.ts',
+        symbol: 'Level',
+        text: 'export enum Level {\n  Low = 1,\n}\n',
+      },
+      'type-declaration',
+      undefined,
+    );
+  });
+
+  it('refuses a class and a member of a class it does not address', () => {
+    expectNotAddressable(
+      {
+        file: 'src/panel.ts',
+        symbol: 'Kiln',
+        text: 'export class Kiln {\n  heat = 1;\n}\n',
+      },
+      'class-declaration',
+      undefined,
+    );
+
+    expectNotAddressable(
+      {
+        file: 'src/panel.ts',
+        symbol: 'settle',
+        text:
+          'export const Kiln = class {\n' +
+          '  settle(): number {\n' +
+          '    return 1;\n' +
+          '  }\n' +
+          '};\n',
+      },
+      'class-member',
+      undefined,
+    );
+  });
+
+  it('refuses an imported binding and points at the module that declares it', () => {
+    const result = patcher.patch({
+      file: 'src/panel.ts',
+      symbol: 'load',
+      text: "import { load } from './store.js';\n\nexport function run(): number {\n  return load();\n}\n",
+    });
+    const details = expectRefusal(result, 'symbol-not-addressable', 'PATCH_TARGET_NOT_FOUND');
+
+    expect(details.position).toBe('import-binding');
+
+    if (result.ok) {
+      throw new Error('expected a refusal');
+    }
+
+    expect(result.error.hint).toContain('load');
+  });
+
+  it('refuses an aliased import under its local name only', () => {
+    const text =
+      "import { load as fetchRows } from './store.js';\n\nexport const rows = fetchRows;\n";
+
+    expect(
+      expectRefusal(
+        patcher.patch({ file: 'src/panel.ts', symbol: 'fetchRows', text }),
+        'symbol-not-addressable',
+        'PATCH_TARGET_NOT_FOUND',
+      ).position,
+    ).toBe('import-binding');
+
+    // The imported module's own spelling is not something this file declares.
+    expectRefusal(
+      patcher.patch({ file: 'src/panel.ts', symbol: 'load', text }),
+      'symbol-not-found',
+      'PATCH_TARGET_NOT_FOUND',
+    );
+  });
+
+  it('refuses a function declared in a namespace body', () => {
+    expectNotAddressable(
+      {
+        file: 'src/panel.ts',
+        symbol: 'helper',
+        text:
+          'export namespace Support {\n' +
+          '  export function helper(): number {\n' +
+          '    return 1;\n' +
+          '  }\n' +
+          '}\n',
+      },
+      'unreachable-scope',
+      undefined,
+    );
+  });
+
+  it('refuses a qualified spelling whose container does not match, naming the one that does', () => {
+    const result = patcher.patch({
+      file: 'src/panel.ts',
+      symbol: 'Nowhere.tally',
+      text:
+        'export function outer(): number {\n' +
+        '  function tally(): number {\n' +
+        '    return 1;\n' +
+        '  }\n' +
+        '\n' +
+        '  return tally();\n' +
+        '}\n',
+    });
+    const details = expectRefusal(result, 'symbol-not-addressable', 'PATCH_TARGET_NOT_FOUND');
+
+    expect(details.position).toBe('mismatched-container');
+    expect(details.container).toBe('Nowhere');
+
+    if (result.ok) {
+      throw new Error('expected a refusal');
+    }
+
+    expect(result.error.hint).toContain('outer.tally');
+  });
+
+  it('names the class a mis-qualified member really belongs to', () => {
+    const text = 'export class Kiln {\n  settle(): number {\n    return 1;\n  }\n}\n';
+    const result = patcher.patch({ file: 'src/kiln.ts', symbol: 'Nowhere.settle', text });
+    const details = expectRefusal(result, 'symbol-not-addressable', 'PATCH_TARGET_NOT_FOUND');
+
+    expect(details.position).toBe('mismatched-container');
+    expect(details.enclosing).toBe('Kiln');
+
+    if (result.ok) {
+      throw new Error('expected a refusal');
+    }
+
+    expect(result.error.hint).toContain('Kiln.settle');
+
+    // And the spelling the hint offers is the one that patches.
+    expect(expectPatch({ file: 'src/kiln.ts', symbol: 'Kiln.settle', text }).container).toBe(
+      'Kiln',
+    );
+  });
+
+  it('keeps symbol-not-found for a name the file does not declare', () => {
+    // The other half of the distinction, unchanged to the byte: this is the
+    // answer re-indexing can act on.
+    const result = patcher.patch({
+      file: 'src/panel.ts',
+      symbol: 'ZZZ',
+      text: 'export function run(): number {\n  return 1;\n}\n',
+    });
+
+    expectRefusal(result, 'symbol-not-found', 'PATCH_TARGET_NOT_FOUND');
+
+    if (result.ok) {
+      throw new Error('expected a refusal');
+    }
+
+    expect(result.error.message).toBe(
+      'The target file declares no such symbol at module scope or on a class it declares.',
+    );
+    expect(result.error.hint).toBe(
+      'Re-index the project: the plan names a symbol this file does not declare.',
+    );
+  });
+
+  it('keeps symbol-not-found for a property read that only looks like a declaration', () => {
+    // `props.onClick` is a member access, not a declaration, so there is
+    // nothing in this file to report as unaddressable.
+    expectRefusal(
+      patcher.patch({
+        file: 'src/pill.tsx',
+        symbol: 'onClick',
+        text:
+          'export function Pill(props: { onClick: () => void }): number {\n' +
+          '  props.onClick();\n' +
+          '\n' +
+          '  return 1;\n' +
+          '}\n',
+      }),
+      'symbol-not-found',
+      'PATCH_TARGET_NOT_FOUND',
+    );
+  });
+
+  it('reports positions only from its own vocabulary', () => {
+    expect(Object.isFrozen(PATCH_NON_ADDRESSABLE_POSITIONS)).toBe(true);
+
+    const reported = [
+      'parameter',
+      'binding-element',
+      'non-function-declarator',
+      'object-literal-member',
+      'class-member',
+      'class-declaration',
+      'type-declaration',
+      'namespace',
+      'import-binding',
+      'mismatched-container',
+      'unreachable-scope',
+    ];
+
+    // Every position this suite has asserted is in the exported vocabulary, and
+    // the one it has not exercised above is the function-expression name.
+    expect(
+      PATCH_NON_ADDRESSABLE_POSITIONS.filter((position) => !reported.includes(position)),
+    ).toEqual(['function-expression-name']);
+
+    expect(
+      expectRefusal(
+        patcher.patch({
+          file: 'src/panel.ts',
+          symbol: 'inner',
+          text: 'export const settle = function inner(): number {\n  return 1;\n};\n',
+        }),
+        'symbol-not-addressable',
+        'PATCH_TARGET_NOT_FOUND',
+      ).position,
+    ).toBe('function-expression-name');
+  });
+});
+
+describe('React components and hooks (C1-F13)', () => {
+  /**
+   * Asserts a target is refused as a React render, and returns the details.
+   *
+   * The refusal exists because the patched file *works* — hook order is
+   * preserved, since the helper invokes the callback synchronously — while the
+   * developer's own lint reports every moved hook call as a rules-of-hooks
+   * violation. So the assertion is on the reason, the recognised site and the
+   * hint that sends the planner to the runtime route AAP §0.5.1 designates for
+   * renders.
+   *
+   * @param request The target to patch.
+   * @param site The `details.site` the refusal must carry.
+   * @returns The refusal's `details`.
+   */
+  function expectReactRefusal(
+    request: FunctionTimingRequest,
+    site: string,
+  ): Readonly<Record<string, unknown>> {
+    const result = patcher.patch(request);
+    const details = expectRefusal(result, 'unsupported-react-component');
+
+    expect(details.site).toBe(site);
+
+    if (result.ok) {
+      throw new Error('expected a refusal');
+    }
+
+    // The next step must be an action the planner can actually emit, and one
+    // that touches no file.
+    expect(result.error.hint).toContain('react-render-tracking');
+
+    return details;
+  }
+
+  it('refuses a JSX-returning function declaration', () => {
+    const details = expectReactRefusal(
+      {
+        file: 'src/components/Notice.tsx',
+        symbol: 'Notice',
+        text:
+          'export function Notice(props: { label: string }) {\n' +
+          '  return <p>{props.label}</p>;\n' +
+          '}\n',
+      },
+      'jsx-return',
+    );
+
+    expect(details.hook).toBeUndefined();
+    expect(details.line).toBe(2);
+  });
+
+  it('refuses a self-closing element, a fragment and a conditional JSX return', () => {
+    for (const returned of ['<Row />', '<>{props.label}</>', 'props.label ? <Row /> : null']) {
+      expectReactRefusal(
+        {
+          file: 'src/components/Notice.tsx',
+          symbol: 'Notice',
+          text:
+            'export function Notice(props: { label: string }) {\n' +
+            `  return ${returned};\n` +
+            '}\n',
+        },
+        'jsx-return',
+      );
+    }
+  });
+
+  it('refuses an arrow whose expression body is JSX', () => {
+    // A concise-bodied component has no `return` statement for a
+    // statement-wise scan to find, so the body itself is the return.
+    expectReactRefusal(
+      {
+        file: 'src/components/Notice.tsx',
+        symbol: 'Notice',
+        text: 'export const Notice = (props: { label: string }) => <p>{props.label}</p>;\n',
+      },
+      'jsx-return',
+    );
+  });
+
+  it('refuses a declaration that calls a React hook in its own scope', () => {
+    const details = expectReactRefusal(
+      {
+        file: 'src/components/Field.tsx',
+        symbol: 'Field',
+        text:
+          "import { useState } from 'react';\n" +
+          '\n' +
+          'export function Field(seed: string) {\n' +
+          '  const [value, setValue] = useState(seed);\n' +
+          '\n' +
+          '  return value.length + Number(setValue !== undefined);\n' +
+          '}\n',
+      },
+      'hook-call',
+    );
+
+    expect(details.hook).toBe('useState');
+  });
+
+  it('refuses a hook called through a property access', () => {
+    expect(
+      expectReactRefusal(
+        {
+          file: 'src/components/Field.tsx',
+          symbol: 'Field',
+          text:
+            "import * as React from 'react';\n" +
+            '\n' +
+            'export function Field(seed: number) {\n' +
+            '  React.useEffect(() => undefined, [seed]);\n' +
+            '\n' +
+            '  return seed;\n' +
+            '}\n',
+        },
+        'hook-call',
+      ).hook,
+    ).toBe('useEffect');
+  });
+
+  it('refuses a nested custom hook that calls a hook', () => {
+    // Nested resolution makes this target addressable, and the shape guard is
+    // what then declines it: a custom hook is as much a rules-of-hooks subject
+    // as a component.
+    const details = expectReactRefusal(
+      {
+        file: 'src/components/Panel.tsx',
+        symbol: 'useRows',
+        text:
+          "import { useMemo } from 'react';\n" +
+          '\n' +
+          'export function Panel(seed: number) {\n' +
+          '  function useRows(): number {\n' +
+          '    return useMemo(() => seed + 1, [seed]);\n' +
+          '  }\n' +
+          '\n' +
+          '  return useRows();\n' +
+          '}\n',
+      },
+      'hook-call',
+    );
+
+    expect(details.hook).toBe('useMemo');
+    expect(details.shape).toBe('function-declaration');
+  });
+
+  it('patches a function whose callback returns JSX', () => {
+    // The shape a whole-subtree scan would get wrong: the JSX belongs to the
+    // nested arrow, which has its own scope, and this function is an ordinary
+    // one that happens to build elements.
+    const patch = expectPatch({
+      file: 'src/components/rows.tsx',
+      symbol: 'buildRows',
+      text:
+        'export function buildRows(items: readonly string[]) {\n' +
+        '  return items.map((item) => <li key={item}>{item}</li>);\n' +
+        '}\n',
+    });
+
+    expect(patch.shape).toBe('function-declaration');
+  });
+
+  it('patches a function that calls a hook only inside a nested callback', () => {
+    expectPatch({
+      file: 'src/components/register.tsx',
+      symbol: 'register',
+      text:
+        "import { useState } from 'react';\n" +
+        '\n' +
+        'export function register(handlers: (() => unknown)[]): number {\n' +
+        '  handlers.push(() => useState(1));\n' +
+        '\n' +
+        '  return handlers.length;\n' +
+        '}\n',
+    });
+  });
+
+  it('patches a PascalCase function that returns no JSX and calls no hook', () => {
+    // There is no name list and no naming rule: the guard reads what the
+    // declaration does, so a PascalCase helper stays patchable.
+    const patch = expectPatch({
+      file: 'src/components/Notice.tsx',
+      symbol: 'Notice',
+      text: 'export function Notice(label: string): number {\n  return label.length;\n}\n',
+    });
+
+    expect(patch.shape).toBe('function-declaration');
+  });
+
+  it('patches a use-prefixed function that calls no hook and returns no JSX', () => {
+    // The other half of the same point, from the hook side.
+    expectPatch({
+      file: 'src/hooks/useLabel.ts',
+      symbol: 'useLabel',
+      text: 'export function useLabel(value: string): string {\n  return value.trim();\n}\n',
+    });
+  });
+
+  it('patches a function whose call is not hook-shaped', () => {
+    // `user(…)`, `used(…)` and a bare `use(…)` are not hooks, and refusing
+    // them would decline ordinary functions for the shape of a prefix.
+    for (const call of ['user(1)', 'used(1)', 'use(1)']) {
+      expectPatch({
+        file: 'src/components/Field.ts',
+        symbol: 'field',
+        text:
+          'declare function user(a: number): number;\n' +
+          'declare function used(a: number): number;\n' +
+          'declare function use(a: number): number;\n' +
+          '\n' +
+          'export function field(): number {\n' +
+          `  return ${call};\n` +
+          '}\n',
+      });
+    }
+  });
+
+  it('recognises sites only within its own vocabulary', () => {
+    expect(Object.isFrozen(PATCH_REACT_SITES)).toBe(true);
+    expect([...PATCH_REACT_SITES]).toEqual(['jsx-return', 'hook-call']);
   });
 });

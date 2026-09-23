@@ -40,10 +40,16 @@
  * the field's border, background and focus ring; `Button.module.css` owns every button surface;
  * `Badge.module.css` owns the chip's fill, border and radius; `RecommendationsRail.module.css` and
  * `RecommendationTile.module.css` own the strip's heading, gaps and tile sizing. This file places
- * those elements and never reaches inside them - no selector here crosses into another module's
- * class names, and no declaration restates one of theirs. The wrappers (`.searchField`,
- * `.searchSubmit`, `.searchToggle`, `.cartButton`) exist because those primitives accept no
- * `className` of their own, so the caller's geometry needs an element to live on.
+ * those elements and never reaches inside them: no selector here names another module's class, and
+ * the wrappers (`.searchField`, `.searchSubmit`, `.searchToggle`, `.cartButton`) are where the
+ * caller's geometry lives, so a primitive's own surface stays its own to declare.
+ *
+ * One declaration is an exception, and it is the only one: `.cartControl` sets the trailing
+ * padding of the cart control itself, overriding the inline padding `Button.module.css` gives its
+ * `md` size. It is not a restatement for its own sake - the count chip is positioned against that
+ * control and overhangs it, so the room the chip needs can only be the control's own padding. It
+ * is written as three of this file's classes so specificity, and not the order the bundler emits
+ * the two modules in, is what decides it.
  *
  * STACKING
  * The bar sits on `--ls-z-header` (30), and the two boxes this file lifts out of the row - the
@@ -75,6 +81,11 @@
   --header-strip-max: calc(var(--ls-page-max, 1200px) / 4);
   --header-chip-offset: calc(-1 * var(--ls-space-1, 4px));
   --header-chip-min-width: var(--ls-space-5, 24px);
+  /* The trailing room the cart control reserves for the chip that overhangs it: the inline padding
+   * `Button.module.css` gives its `md` size, plus one step of the spacing scale, so the chip
+   * reaches back across padding only and never over the last glyph of the label. Derived from the
+   * same two tokens the primitive and this file already read, so it moves with the scale. */
+  --header-chip-clearance: calc(var(--ls-space-4, 16px) + var(--ls-space-3, 12px));
 
   /* Sticky, never fixed: the bar stays in the page column that `<body>` lays out, which is what
    * `PageContainer`'s offset is measured against. `inset-block-start` is the logical form of
@@ -131,7 +142,8 @@
 }
 
 /* Fully visible for a keyboard reader: a real chip pinned inside the bar, aligned with the page
- * gutter and painted above the brand beside it. */
+ * gutter, in the slot the brand lockup otherwise occupies - the rule below is what hands that slot
+ * over for as long as the link holds focus. */
 .skipLink:focus-visible {
   inset-block-start: var(--ls-space-2, 8px);
   inset-inline-start: var(--header-gutter, 16px);
@@ -152,6 +164,25 @@
   outline: var(--header-ring-width, 2px) solid var(--ls-focus, #0f766e);
   outline-offset: var(--header-ring-offset, 2px);
   z-index: var(--ls-z-header, 30);
+}
+
+/* The brand yields the bar's inline-start slot while the skip link is being read.
+ *
+ * The chip above is pinned at the gutter, inside the one 64px band the lockup occupies, and the
+ * band's height is an invariant this file may not spend: `PageContainer.module.css` offsets the
+ * document's `<main>` by `--ls-header-height`, so no row may be added and nothing may be shifted
+ * down. The two elements are adjacent siblings inside `.inner` - `SiteHeader.tsx` renders the link
+ * first, because it is the document's first tab stop - so the sibling combinator can say "only
+ * while that link has focus", with no state for this file to track and nothing to reset.
+ *
+ * `opacity` and not `visibility: hidden` or `display: none`, which is the whole point of the rule:
+ * a browser works out the next tab stop at the moment Tab is pressed, and either of those would
+ * have taken the lockup out of the focus order at exactly that moment - Tab off the skip link
+ * would have skipped the wordmark, which is a link to the catalog. Faded, it stays a tab stop, and
+ * it is back with its own focus ring the instant focus lands on it. Where the pointer transition
+ * at the end of the file applies, the yield fades rather than cuts; under reduced motion it cuts. */
+.skipLink:focus-visible + .brand {
+  opacity: 0;
 }
 
 /* The home link wrapping the lockup. */
@@ -248,13 +279,31 @@
   align-items: center;
 }
 
+/* The trailing room the chip overhangs into, on the cart control itself.
+ *
+ * The chip is offset against `.cartButton` and is wider than the corner it is pinned to, so it
+ * reaches back into the control. Where it reaches has to be padding: at the primitive's `md`
+ * inline padding the chip crossed the end of the "Cart" label and covered its last glyph, so this
+ * adds a step of the spacing scale to the trailing side and the chip clears the text. The label
+ * itself is untouched - the control grows by that one step, and `.actions` is pinned to the end of
+ * the row, so the row is measured from the same edge it was.
+ *
+ * Three classes deliberately: this has to beat `Button.module.css`'s `.root[data-size='md']`
+ * padding, and a single class would tie the outcome to which module's rules the bundler emits
+ * first. `.actions .cartButton .cartControl` is (0,3,0) against that rule's (0,2,0), so
+ * specificity decides it and source order cannot. It is the one selector in this file that
+ * overrides a declaration of another module's, and it overrides padding alone. */
+.actions .cartButton .cartControl {
+  padding-inline-end: var(--header-chip-clearance, 28px);
+}
+
 /* The count chip. Position and numerals only: `Badge` owns the fill, border and radius.
  *
- * The chip is lifted just past the control's top-right corner, never takes a pointer event that
- * was meant for the control beneath it, and reserves a width that suits two digits so the row does
- * not nudge sideways as the count changes - tabular figures in the monospace stack are what make
- * every digit the same width, which matters because this header re-renders several times a
- * second. */
+ * The chip is lifted just past the control's top-right corner, overhanging the trailing padding
+ * the rule above reserves for it rather than the label, never takes a pointer event that was meant
+ * for the control beneath it, and reserves a width that suits two digits so the row does not nudge
+ * sideways as the count changes - tabular figures in the monospace stack are what make every digit
+ * the same width, which matters because this header re-renders several times a second. */
 .cartBadge {
   position: absolute;
   inset-block-start: var(--header-chip-offset, -4px);
@@ -342,8 +391,10 @@
   }
 }
 
-/* The only motion this file introduces: a pointer-driven fade on the brand, declared behind
- * `hover: hover` so a touch reader never gets a state stuck on. */
+/* The only motion this file introduces: the brand's opacity is transitioned rather than switched,
+ * declared behind `hover: hover` so a touch reader never gets a hover state stuck on. It carries
+ * two changes of that one property - the pointer fade declared here, and the yield to the focused
+ * skip link above - and neither is announced by motion alone. */
 @media (hover: hover) {
   .brand {
     transition: opacity 160ms ease-out;

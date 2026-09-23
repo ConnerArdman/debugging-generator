@@ -71,6 +71,22 @@
  * again, which is deliberate: code patched during the session may still be
  * loaded in the page, and an inert helper serves it at zero cost.
  *
+ * **Only the extension can drive either transition.** `agent.config` reaches
+ * {@link applyConfig} from one place — `./transport.js`'s inbound channel — and
+ * that channel is authenticated: every frame the bridge posts carries a
+ * per-document secret the agent minted and disclosed over a `CustomEvent`
+ * inside the `document_start` window, before any script the page loads has run
+ * (see `./transport.ts`'s handshake section, which is where both sides of it
+ * are defined). A page script can still post a frame that satisfies every
+ * structural check — its own window, its own origin, the published source tag,
+ * the current channel version, a known frame type — and it is dropped for want
+ * of the token, so neither arming a signal nor tearing a live capture down is
+ * something page script can do. Nothing in this file re-checks that; the guard
+ * belongs to the module that owns the channel, and this one treats a delivered
+ * frame's *payload* as untrusted data exactly as it always has
+ * ({@link parseConfig} reads it structurally and {@link publishedConfig} is
+ * what reaches the page-visible global).
+ *
  * Arming and disarming walk **one registry of eight producer families** — one
  * per sibling module in this folder that observes anything — rather than a
  * hand-kept list of calls, because a family reachable only from a remembered
@@ -414,6 +430,36 @@ interface ParsedAgentConfig {
   debug: boolean;
   /** Component-tree bounds the service asked for, if any. */
   tree: TreeBounds;
+}
+
+/**
+ * The page-visible projection of a {@link ParsedAgentConfig}, published on
+ * `window.__DEBUGGEN__.config` for diagnostics.
+ *
+ * A named type rather than a `Record<string, unknown>`, because the closed key
+ * set *is* the property this value exists to have: see
+ * {@link publishedConfig}. Every member is JSON-compliant — no `undefined`
+ * anywhere — so the whole object survives the
+ * `chrome.devtools.inspectedWindow.eval` the DevTools panel reads it with.
+ */
+interface PublishedAgentConfig {
+  /** The session the capture belongs to, or `null` when none was readable. */
+  sessionId: string | null;
+  /** The active capture, or `null` — which by itself means the agent is dormant. */
+  captureId: string | null;
+  /** Every wire flag's state, as this module read it; always all seven keys. */
+  hooks: Record<HookFlag, boolean>;
+  /** The flags that were asked for, in {@link HOOK_FLAGS} order. */
+  enabled: HookFlag[];
+  /** Whether page-console diagnostics were asked for. */
+  debug: boolean;
+  /** The component-tree bounds, with `null` for "the producer's default". */
+  tree: {
+    /** Most nodes the service asked for, or `null`. */
+    maxNodes: number | null;
+    /** Deepest level the service asked for, or `null`. */
+    maxDepth: number | null;
+  };
 }
 
 /**
@@ -1031,6 +1077,52 @@ function parseConfig(payload: unknown): ParsedAgentConfig {
     enabled: HOOK_FLAGS.filter((flag) => hooks[flag]),
     debug: readFlag(record?.['debug']),
     tree: readTreeBounds(record),
+  };
+}
+
+/**
+ * Project a parsed configuration into the value published on
+ * `window.__DEBUGGEN__.config`.
+ *
+ * **Not the payload.** The published value used to be the relayed frame's
+ * `payload` verbatim, and a probe that posted an `agent.config` with extra keys
+ * of its own — `ingestUrl`, `transport` — found them mirrored on that global,
+ * unchanged, for any page script to read back. Nothing in this bundle ever read
+ * them, so the mirror gave an attacker no capability; what it gave was a
+ * page-writable, page-readable slot inside the agent's own published surface,
+ * which is not a thing a diagnostic should be. `./transport.js`'s handshake now
+ * keeps a page-forged frame from reaching this module at all, and this
+ * projection is the second half of the same argument: even a legitimate
+ * configuration is published as the decisions this module *took*, never as the
+ * bytes it was handed.
+ *
+ * Three properties the projection is built for:
+ *
+ * - **A closed key set.** Exactly the six members below, all of them parsed by
+ *   {@link parseConfig}, so a key the service (or anyone else) adds to the wire
+ *   payload cannot appear here by arriving.
+ * - **JSON-compliant.** `apps/chrome-extension/src/devtools/devtools.ts` reads
+ *   this global through `chrome.devtools.inspectedWindow.eval`, which can only
+ *   transport JSON values, so an absent id is `null` rather than `undefined` —
+ *   a key that serialises away is a key the panel cannot tell from a typo.
+ * - **A copy, not a view.** `hooks`, `enabled` and `tree` are rebuilt rather
+ *   than referenced, so a page that mutates `__DEBUGGEN__.config.tree.maxNodes`
+ *   is mutating its own copy and not the bounds {@link arm} stored.
+ *
+ * @param config The configuration as {@link parseConfig} read it.
+ * @returns The value to publish, safe to hand to a page-visible global.
+ */
+function publishedConfig(config: ParsedAgentConfig): PublishedAgentConfig {
+  return {
+    sessionId: config.sessionId ?? null,
+    captureId: config.captureId ?? null,
+    hooks: { ...config.hooks },
+    enabled: [...config.enabled],
+    debug: config.debug,
+    tree: {
+      maxNodes: config.tree.maxNodes ?? null,
+      maxDepth: config.tree.maxDepth ?? null,
+    },
   };
 }
 
@@ -2388,7 +2480,14 @@ export function applyConfig(payload: unknown): void {
     // developer inspects in the console and what the panel reads through
     // `chrome.devtools.inspectedWindow.eval`. Done for both paths, so the
     // helper always shows what the page was last told.
-    setSpanHelperConfig(payload);
+    //
+    // A normalised projection of the parsed configuration, never the relayed
+    // payload: see {@link publishedConfig} for why the published shape is this
+    // module's decisions rather than the bytes it received. An agent that has
+    // never been configured still publishes nothing at all, which is the
+    // dormancy probe (`typeof __DEBUGGEN__.config === 'undefined'`) — this is
+    // the only call site, and it is reached only from an `agent.config`.
+    setSpanHelperConfig(publishedConfig(config));
 
     announceReactIfNewlyDetected();
 

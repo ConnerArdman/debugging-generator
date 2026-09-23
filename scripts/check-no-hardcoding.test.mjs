@@ -97,7 +97,7 @@ import {
 import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it, vi } from 'vitest';
 
 import {
   ALLOWLIST_FILE,
@@ -360,13 +360,83 @@ function writeFileOfSize(root, relPath, size) {
  * skipped there rather than silently asserting nothing. Every other fail-closed
  * case below is uid-independent by construction, and CI runs as a normal user,
  * where this case does run.
+ *
+ * The unlistable-directory contract itself is never left to this guard: the case
+ * immediately after it provokes the same failure by injecting it into the
+ * scanner's `readdirSync` (see `withInjectedFs`), so the propagation is asserted
+ * on every account and the `chmod` case is the real-permissions second opinion.
  */
 const canBeDeniedByMode = typeof process.getuid === 'function' && process.getuid() !== 0;
 if (!canBeDeniedByMode) {
   process.stderr.write(
     'check-no-hardcoding.test: skipping the permission-denied traversal case - this process is root, ' +
-      'which bypasses mode bits; the other fail-closed cases assert the same propagation without permissions.\n',
+      'which bypasses mode bits; the injected-failure case beside it asserts the same propagation on ' +
+      'this account, and the other fail-closed cases need no permissions at all.\n',
   );
+}
+
+/**
+ * Runs `use` against a freshly imported copy of the scanner whose `node:fs` has
+ * the given overrides merged over the real one.
+ *
+ * Why it exists: an unlistable directory is a fail-closed path - the scan must
+ * stop rather than report a tree it could not read as clean (AAP 0.5.4) - and a
+ * mode bit cannot provoke it for a privileged account, which is what `chmod`
+ * with root leaves untested. Injecting the failure asserts the propagation on
+ * every account, so the guarded `chmod` case becomes a second opinion instead of
+ * the only coverage the path has.
+ *
+ * It is narrow on purpose: the override delegates to the real implementation for
+ * every input it does not fail, so the rest of the synthetic tree is genuinely
+ * walked, parsed and reported on. The module registry is reset before the import
+ * so the copy is built against the injected module, and again afterwards -
+ * passed or thrown - so every later case imports the genuine scanner. This
+ * file's own `node:fs` bindings were resolved when it loaded and are untouched,
+ * which is what lets a case build its fixture and inspect it normally.
+ *
+ * @param {(real: typeof import('node:fs')) => Partial<typeof import('node:fs')>} overrides
+ * @param {(injected: typeof import('./check-no-hardcoding.mjs')) => Promise<void>} use
+ * @returns {Promise<void>}
+ */
+async function withInjectedFs(overrides, use) {
+  vi.resetModules();
+  vi.doMock('node:fs', async () => {
+    const real = /** @type {typeof import('node:fs')} */ (await vi.importActual('node:fs'));
+    return { ...real, ...overrides(real) };
+  });
+
+  try {
+    await use(await import('./check-no-hardcoding.mjs'));
+  } finally {
+    vi.doUnmock('node:fs');
+    vi.resetModules();
+  }
+}
+
+/**
+ * A `readdirSync` that refuses to list one directory by name and lists every
+ * other for real.
+ *
+ * `EACCES` on a `scandir` is exactly what a `0500` directory reports to an
+ * unprivileged account, so the injected failure is the one the guarded case
+ * provokes with `chmod` - and failing only the named directory is what lets the
+ * same case assert that the readable half of the tree was still scanned.
+ *
+ * @param {typeof import('node:fs')} real The genuine `node:fs`.
+ * @param {string} name Base name of the directory that cannot be listed.
+ * @returns {typeof import('node:fs').readdirSync}
+ */
+function readdirSyncFailingDirectory(real, name) {
+  return (/** @type {any} */ target, /** @type {any} */ options) => {
+    if (typeof target === 'string' && path.basename(target) === name) {
+      throw Object.assign(new Error(`EACCES: injected failure, scandir '${target}'`), {
+        code: 'EACCES',
+        syscall: 'scandir',
+        path: target,
+      });
+    }
+    return real.readdirSync(target, options);
+  };
 }
 
 /**
@@ -1982,6 +2052,41 @@ describe('fail-closed scanning', () => {
       }
     },
   );
+
+  it('stops the run when a directory cannot be listed, on any account', astCase(), async () => {
+    // The same contract as the case above, on the account this suite actually
+    // runs as: a directory the walk could not list is vocabulary that went
+    // unchecked, so the run must stop with the environment exit code instead
+    // of reporting a clean tree (AAP 0.5.4). The failure is injected into the
+    // scanner's `readdirSync` rather than provoked with `chmod`, because uid 0
+    // bypasses mode bits and the guarded case then asserts nothing.
+    const root = makeTree({
+      ...artifacts({ identifiers: ['RecommendationsRail'] }),
+      'apps/local-service/src/sessions/manager.ts': READABLE_PRODUCT_FILE,
+      'apps/local-service/src/panels/generate.ts': source('export const panel = 1;'),
+    });
+
+    await withInjectedFs(
+      (real) => ({ readdirSync: readdirSyncFailingDirectory(real, 'panels') }),
+      async (injected) => {
+        const result = await injected.check(root, { stale: false });
+
+        const [failure] = failuresFor(result.failures, 'apps/local-service/src/panels');
+        expect(failure).toBeDefined();
+        expect(failure.reason).toBe('unreadable-directory');
+        // The message says what was lost, not merely that something failed.
+        expect(failure.detail).toContain('unscanned');
+        expect(failure.detail).toContain('EACCES');
+
+        // The readable half of the tree was still scanned, and the run still
+        // fails: a partial scan is reported as a failure, never as findings.
+        expect(result.sourceFilesScanned).toBe(1);
+        expect(result.findings).toEqual([]);
+        expect(result.ok).toBe(false);
+        expect(result.exitCode).toBe(EXIT_ERROR);
+      },
+    );
+  });
 
   it(
     'refuses to judge or rewrite the policy from a corpus it could only partly read',

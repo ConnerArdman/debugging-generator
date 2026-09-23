@@ -41,7 +41,7 @@
  */
 
 import type { ShippingOption } from '@/lib/types';
-import { storefrontErrorResponse } from '@/server/errors';
+import { readStorefrontJsonBody, storefrontErrorResponse } from '@/server/errors';
 import { carrierMockBodySchema, type CarrierMockBodyInput } from '@/server/validation/mocks';
 
 /**
@@ -186,19 +186,39 @@ function checksum(value: string): number {
 }
 
 /**
+ * The destination as one comparable value: the country and the postal code,
+ * upper-cased and joined.
+ *
+ * Both halves, because a postal code names a place only within a country -
+ * `44301` is in Ohio in the United States and in Jalisco in Mexico, and the two
+ * are different distances from this catalog's warehouses. A zone taken from the
+ * code alone would rate them identically, which is a rate for whichever of the
+ * two the caller did not mean.
+ *
+ * Upper-cased so a code or a country written in lower case is rated as the same
+ * destination, and joined with a separator neither half contains, so no pair of
+ * different destinations is written the same way.
+ *
+ * @param body The shipment, as the schema parsed it.
+ * @returns The destination in the form the chart below is read with.
+ */
+function destination(body: CarrierMockBodyInput): string {
+  return `${body.destinationCountry.toUpperCase()}/${body.destinationPostalCode.toUpperCase()}`;
+}
+
+/**
  * Which band of distance a destination falls in: `1` for the nearest,
  * {@link ZONES} for the farthest.
  *
  * A carrier reads this off a zone chart. There is no chart here, so the band is
- * taken from the postal code itself - upper-cased first, so a code written in
- * lower case is rated as the same destination - and every destination therefore
- * has one stable band rather than a band that moves between quotes.
+ * taken from the destination itself, and every destination therefore has one
+ * stable band rather than a band that moves between quotes.
  *
- * @param postal The destination's postal code, as the body carried it.
+ * @param place The destination, as {@link destination} writes it.
  * @returns A whole number between `1` and {@link ZONES}.
  */
-function band(postal: string): number {
-  return (checksum(postal.toUpperCase()) % ZONES) + 1;
+function band(place: string): number {
+  return (checksum(place) % ZONES) + 1;
 }
 
 /**
@@ -245,7 +265,7 @@ function rate(service: Service, kilos: number, pieces: number, zone: number): Sh
  */
 function reference(body: CarrierMockBodyInput, zone: number): string {
   const signature = checksum(
-    [body.destinationPostalCode, body.weightGrams, body.itemCount, body.serviceLevel].join('|'),
+    [destination(body), body.weightGrams, body.itemCount, body.serviceLevel].join('|'),
   );
 
   return [
@@ -259,26 +279,25 @@ function reference(body: CarrierMockBodyInput, zone: number): string {
  * Rates a shipment and answers with every service that can carry it.
  *
  * @param request The POST whose JSON body `carrierMockBodySchema` describes: a
- * destination postal code, and optionally what the shipment weighs, how many
- * pieces it is made of and which service is being asked about.
+ * destination postal code, and optionally the country it is in, what the
+ * shipment weighs, how many pieces it is made of and which service is being
+ * asked about.
  * @returns 200 with the services on offer, the carrier's code, the reference the
- * quote is filed under and the instant it was taken; or 400 in the storefront's
- * one error envelope when the body is not readable JSON or does not match the
- * schema.
+ * quote is filed under and the instant it was taken; or the storefront's one
+ * error envelope: 415 when the body was not declared as `application/json`, 413
+ * when it carries more bytes than this endpoint reads, and 400 when the body is
+ * not readable JSON or does not match the schema.
  */
 export async function POST(request: Request): Promise<Response> {
   try {
-    let raw: unknown;
-
-    try {
-      raw = await request.json();
-    } catch {
-      // A body that is not readable JSON describes no shipment, so it is handed
-      // to the schema as the nothing it is: the rejection that follows names
-      // what a rating request needs, in the same envelope a body with a bad
-      // field is answered with.
-      raw = undefined;
-    }
+    // Read through the one guarded reader in `@/server/errors` rather than with
+    // `request.json()`: a body that was not declared as JSON is refused with
+    // 415 and one past the store's byte ceiling with 413, both before anything
+    // is parsed. No unreadable message is given, so a body that is readable but
+    // not JSON describes no shipment and is handed to the schema as the nothing
+    // it is: the rejection that follows names what a rating request needs, in
+    // the same envelope a body with a bad field is answered with.
+    const raw: unknown = await readStorefrontJsonBody(request);
 
     // Parsing throws, and the rejection names every field at fault: the single
     // mapper behind `storefrontErrorResponse` turns it into the same 400 every
@@ -292,7 +311,7 @@ export async function POST(request: Request): Promise<Response> {
     const quotedAt = new Date().toISOString();
 
     const kilos = Math.ceil(body.weightGrams / GRAMS);
-    const zone = band(body.destinationPostalCode);
+    const zone = band(destination(body));
     const delay =
       RATING_MS + Math.min(VARIANCE_MS, (body.itemCount - 1) * PIECE_MS + kilos * KILO_MS);
 

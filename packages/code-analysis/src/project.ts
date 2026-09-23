@@ -145,6 +145,17 @@
  *   module specifiers, missing `lib` files and missing ambient types produce no
  *   failure here, because every consumer of this handle works from the abstract
  *   syntax tree first and reaches for a type only when one is available.
+ * - **One function here deliberately looks *above* the project root**, and it
+ *   contributes no file to any index. {@link findWorkspaceRoot} climbs the
+ *   project's ancestors to find the workspace root a *member* project belongs
+ *   to — `./summary.ts` needs it because a monorepo keeps its lockfile and its
+ *   `packageManager` pin at the repository root, so a member that declares
+ *   neither would otherwise be described as using an unknown package manager.
+ *   It reads two basenames per ancestor (`pnpm-workspace.yaml`,
+ *   `package.json`), takes nothing from them but member patterns, applies the
+ *   same bounded-read and {@link isEnvFilePath} refusals as everything else
+ *   here, and never widens the file set: the traversal, the screen and the
+ *   compiler's program remain bounded by the project root.
  *
  * @example
  * ```ts
@@ -239,10 +250,33 @@ export const INDEXABLE_EXTENSIONS: readonly string[] = Object.freeze([
  * - `.git` — repository internals: object and index files, never source.
  * - `.turbo`, `.tsbuild`, `.cache`, `.vercel` — task-runner, incremental
  *   compiler, tooling and platform caches.
+ * - `generated` — a code generator's output written into the project's *own*
+ *   source tree, which is where the convention puts it: Prisma's
+ *   `prisma-client` generator `output` directory, a protobuf or OpenAPI client,
+ *   a framework's route or schema artefacts. The developer did not write it, so
+ *   the product must not attribute it to them, and here the volume is as
+ *   damaging as the provenance: a generated database client declares a type per
+ *   model, per operation and per input shape, so the names it contributes are
+ *   *exactly* the domain words a question about the application would use
+ *   (`Cart`, `Category`, `Order`, `Product`, `Warehouse`) and they would
+ *   dominate the candidate set `./graph/query.ts`'s `findByName` offers the
+ *   model. Measured on this repository's own demo target, one
+ *   `src/generated/prisma` tree contributed 1,492 of 2,998 index nodes, 1,471
+ *   of them symbols — half an index of code no instrumentation plan may name.
+ * - `__generated__` — the same tree under the other prevailing convention,
+ *   which graphql-codegen and Relay write their operation documents and
+ *   artefact modules into.
+ *
+ * A `.generated` directory needs no entry of its own: the {@link HIDDEN_PREFIX}
+ * rule already skips every dot-prefixed entry at any depth — it is applied in
+ * {@link discoverCandidatePaths} before a name is judged at all — which is the
+ * same rule that keeps `.next`, `.git`, `.turbo` and `.cache` out twice over.
  *
  * Matching is on a path segment *relative to the project root*, so a project
- * that happens to be checked out beneath a directory literally named `dist` is
- * indexed normally — see {@link shouldExcludePath}.
+ * that happens to be checked out beneath a directory literally named `dist` or
+ * `generated` is indexed normally, and it is on a *whole* segment, so a
+ * developer's own `src/generated-docs/` or `src/generated.ts` is untouched —
+ * see {@link shouldExcludePath}.
  */
 export const EXCLUDED_DIRECTORY_NAMES: readonly string[] = Object.freeze([
   'node_modules',
@@ -256,6 +290,8 @@ export const EXCLUDED_DIRECTORY_NAMES: readonly string[] = Object.freeze([
   '.tsbuild',
   '.cache',
   '.vercel',
+  'generated',
+  '__generated__',
 ]);
 
 /**
@@ -292,6 +328,57 @@ const HIDDEN_PREFIX = '.';
 
 /** The configuration file {@link openProject} probes for when none is named. */
 const TSCONFIG_BASENAME = 'tsconfig.json';
+
+/**
+ * The manifest basename, read by {@link findWorkspaceRoot} for its `workspaces`
+ * field and for nothing else.
+ *
+ * `./summary.ts` reads the same basename for the project's own name, declared
+ * ranges and `packageManager` pin; this module never looks at any of those.
+ */
+const MANIFEST_BASENAME = 'package.json';
+
+/**
+ * The manifest field that declares an npm or yarn workspace, in both of the
+ * shapes those tools accept.
+ */
+const WORKSPACES_FIELD = 'workspaces';
+
+/**
+ * pnpm's workspace declaration, in both spellings pnpm itself accepts, most
+ * common first.
+ */
+const PNPM_WORKSPACE_BASENAMES: readonly string[] = Object.freeze([
+  'pnpm-workspace.yaml',
+  'pnpm-workspace.yml',
+]);
+
+/** The top-level key whose sequence lists a workspace's member patterns. */
+const WORKSPACE_PACKAGES_KEY = 'packages';
+
+/**
+ * The largest workspace declaration {@link findWorkspaceRoot} will read, in
+ * bytes.
+ *
+ * One mebibyte, which is the ceiling `./summary.ts` already applies to a target
+ * manifest — the same kind of file, read for the same reason, so the same
+ * bound. A declaration larger than this is not a declaration a package manager
+ * wrote, and reading it would be unbounded work on a path a developer did not
+ * choose.
+ */
+const MAX_WORKSPACE_DECLARATION_BYTES = 1_048_576;
+
+/**
+ * How many ancestors {@link findWorkspaceRoot} examines when the caller names
+ * no bound.
+ *
+ * Thirty-two is far beyond any real repository layout — a workspace member sits
+ * one or two directories below its root — and small enough that the walk is
+ * trivially finite on a pathological path. Reaching the filesystem root ends
+ * the walk as well, so this bound only ever bites on a path that is deeper than
+ * any project.
+ */
+const DEFAULT_WORKSPACE_SEARCH_DEPTH = 32;
 
 /**
  * Whether a path names an environment file.
@@ -418,13 +505,16 @@ export function isIndexableFile(path: string): boolean {
  *
  * ## What `extraExcludes` accepts
  *
- * Either a bare directory name (`'generated'`) or a project-relative directory
- * path (`'src/generated'`), each matched at any depth as a whole run of
- * segments — `'src/generated'` excludes `src/generated/client.ts` and
- * `packages/<name>/src/generated/client.ts`, and does not exclude
- * `src/generated-docs/index.ts`. Entries are **not** globs: a `*` in an entry
+ * Either a bare directory name (`'vendorlib'`) or a project-relative directory
+ * path (`'src/vendorlib'`), each matched at any depth as a whole run of
+ * segments — `'src/vendorlib'` excludes `src/vendorlib/client.ts` and
+ * `packages/<name>/src/vendorlib/client.ts`, and does not exclude
+ * `src/vendorlib-docs/index.ts`. Entries are **not** globs: a `*` in an entry
  * matches a literal asterisk, because a caller that wants pattern matching is
- * better served by naming the directory.
+ * better served by naming the directory. The examples deliberately name a
+ * directory that is *not* already in {@link EXCLUDED_DIRECTORY_NAMES}: a
+ * generated tree needs no `extraExcludes` entry, since `generated` and
+ * `__generated__` are excluded by default.
  *
  * @param projectRoot The absolute path of the project root.
  * @param absolutePath The path being judged, normally absolute. A relative path
@@ -938,6 +1028,748 @@ export function discoverProjectFiles(
     extraExcludes,
     logger,
   });
+}
+
+/**
+ * How a directory declares that it is the root of a workspace.
+ *
+ * Two mechanisms, and the first is checked first because a repository that has
+ * both means the pnpm declaration: `pnpm-workspace.yaml` is what pnpm reads,
+ * and a `workspaces` field left in the root manifest beside it is a leftover
+ * from the repository's npm or yarn past.
+ */
+export type WorkspaceDeclarationKind = 'pnpm-workspace' | 'package-json';
+
+/**
+ * The workspace root a project belongs to, and the declaration that says so.
+ *
+ * Carries no dependency, script or manager value of its own: it is an *answer
+ * about location*, and every consumer that wants a fact about the root reads it
+ * from the root with the same root-parameterised functions it would use for any
+ * other project — `./summary.ts`'s `readTargetManifest(root)` and
+ * `createProjectProbe(root)`. That keeps this type free of anything that could
+ * carry a developer's configuration into a prompt.
+ */
+export interface WorkspaceRoot {
+  /**
+   * The workspace root: absolute, POSIX separators, no trailing separator.
+   *
+   * Normalised exactly as {@link LoadedProject.projectRoot} is, so it is safe
+   * to hand straight back to `toProjectRelative`, {@link shouldExcludePath} or
+   * any root-parameterised function in this package.
+   */
+  readonly root: string;
+
+  /** Which declaration named this directory as a workspace root. */
+  readonly declaredBy: WorkspaceDeclarationKind;
+
+  /**
+   * The declared pattern the project matched, verbatim as the declaration
+   * spelled it (`'apps/*'`, `'packages/**'`).
+   *
+   * Reported so a diagnostic can say *why* the project was accepted as a
+   * member. A project that matched no pattern is not a member at all, and
+   * {@link findWorkspaceRoot} answers `undefined` rather than returning this
+   * object with an empty pattern.
+   */
+  readonly memberPattern: string;
+}
+
+/** How {@link findWorkspaceRoot} should search, all of it optional. */
+export interface FindWorkspaceRootOptions {
+  /**
+   * Where the search reports what it read and why it stopped.
+   *
+   * Defaults to `noopLogger`. Every record is `debug` or `trace`: a project
+   * that is not part of a workspace is the ordinary case and must not produce a
+   * warning, and the *content* of a declaration is never logged — only a path,
+   * a pattern and a reason.
+   */
+  readonly logger?: Logger | undefined;
+
+  /**
+   * How many ancestor directories to examine, counting the project's parent as
+   * the first.
+   *
+   * Defaults to {@link DEFAULT_WORKSPACE_SEARCH_DEPTH}. The bound exists so the
+   * walk is finite work on a pathological path — a deeply nested checkout, a
+   * mount presenting a long chain — independently of reaching the filesystem
+   * root, which also ends it. A value that is not a non-negative integer is
+   * ignored in favour of the default; `0` searches nothing and answers
+   * `undefined`.
+   */
+  readonly maxDepth?: number | undefined;
+}
+
+/**
+ * The workspace root the given project is a *member* of, or `undefined`.
+ *
+ * ## The question this answers, and the one it does not
+ *
+ * A monorepo keeps its lockfile and its `packageManager` pin at the repository
+ * root, so a target that is one workspace member — `apps/<name>`, which is
+ * exactly the shape of this product's own demo target — declares neither. A
+ * detector that consults only the target's own directory therefore answers
+ * `'unknown'` for a project whose package manager is perfectly well determined
+ * two directories up, and the launcher that would have formed
+ * `<manager> run dev` from it has nothing to form it with (AAP 0.7.1 Group 2).
+ * This function is what supplies the missing root, and `./summary.ts`'s
+ * `detectPackageManager` is its one consumer today.
+ *
+ * What it does **not** answer is "which directory above this one has a
+ * lockfile". That question has a wrong answer available to it — this tool's own
+ * repository, or any unrelated monorepo a developer happens to have checked
+ * their project out beneath — and the difference between the two questions is
+ * the membership check below.
+ *
+ * ## Membership is required, and it is the point
+ *
+ * An ancestor that declares a workspace is accepted **only** when the project's
+ * path relative to it matches one of the patterns that declaration lists. So a
+ * project parked inside an unrelated monorepo — a fixture application under
+ * `packages/<name>/test/fixtures/<app>`, which matches neither `apps/*` nor
+ * `packages/*` — is correctly reported as belonging to no workspace, while
+ * `apps/<name>` is reported as a member. Without that check this function would
+ * report the *host* repository's manager for any project nested anywhere
+ * beneath it, which is a confidently wrong answer of the kind the summary
+ * documentation forbids.
+ *
+ * ## How the walk terminates
+ *
+ * It starts at the project's **parent**, so a project that is itself a
+ * workspace root answers `undefined`: its own manifest and its own lockfile
+ * already answered the question, and naming itself as its own workspace root
+ * would add nothing. It then climbs one directory at a time until any one of
+ * four things happens:
+ *
+ * 1. **A declaring ancestor is found.** That directory is the *boundary*
+ *    whether or not the project matches its patterns: a nearer workspace root
+ *    shadows a further one, exactly as a package manager's own resolution does,
+ *    so the walk stops there and the answer is the match or `undefined`.
+ * 2. **The filesystem root is reached**, or the walk would leave the absolute
+ *    domain. A relative candidate is never probed: it would resolve against
+ *    this *tool's* working directory rather than the developer's project.
+ * 3. **{@link FindWorkspaceRootOptions.maxDepth} is exhausted.**
+ * 4. **The project root is not usable** — relative, or a network share — which
+ *    is refused before the walk begins.
+ *
+ * ## Failure is always `undefined`, never a throw and never a guess
+ *
+ * A declaration that is malformed, unreadable, oversized or empty is treated as
+ * a declaration with no usable patterns: the walk stops at it and the answer is
+ * `undefined`. That is the fail-closed direction — "this project's manager is
+ * not established" costs a prompt, while a manager read from the wrong
+ * repository costs a command that fails on the developer's machine. Nothing
+ * here throws for any input: an absent directory, a path with a control
+ * character, a permission error and a link cycle all produce `undefined`.
+ *
+ * ## What it reads, and what it does not
+ *
+ * Exactly two basenames per ancestor — `pnpm-workspace.yaml` (or `.yml`) and
+ * `package.json` — each required to be a regular file and smaller than
+ * {@link MAX_WORKSPACE_DECLARATION_BYTES} before a byte is read, and each read
+ * for its **member patterns only**. No dependency, script, name or
+ * `packageManager` value is taken from them here, and the read is refused
+ * outright for a path {@link isEnvFilePath} recognises, so the module's privacy
+ * guarantee holds for the one place in this package that deliberately reads
+ * *above* the project root.
+ *
+ * The walk is lexical: it climbs the normalised path rather than resolving each
+ * ancestor with `realpath`, which is what a package manager does with the
+ * working directory it was invoked in, and which keeps a project reached through
+ * a symlinked home directory answering about the workspace the developer
+ * actually opened.
+ *
+ * @param projectRoot The project root, absolute; normalised here exactly as
+ * {@link openProject} normalises it.
+ * @param options The logger and the depth bound, both optional.
+ * @returns The workspace root the project is a member of, or `undefined` when
+ * there is none, when the project is itself the root, or when nothing could be
+ * established.
+ *
+ * @example
+ * ```ts
+ * // A member of this repository's own workspace.
+ * findWorkspaceRoot('/repo/apps/demo-app');
+ * // { root: '/repo', declaredBy: 'pnpm-workspace', memberPattern: 'apps/*' }
+ *
+ * // A fixture project that merely sits beneath it: not a member.
+ * findWorkspaceRoot('/repo/packages/code-analysis/test/fixtures/sample-app');
+ * // undefined
+ * ```
+ */
+export function findWorkspaceRoot(
+  projectRoot: string,
+  options?: FindWorkspaceRootOptions,
+): WorkspaceRoot | undefined {
+  const logger = options?.logger ?? noopLogger;
+  const maxDepth = workspaceSearchDepth(options?.maxDepth);
+
+  const normalized = normalizeProjectRoot(projectRoot);
+  if (isErr(normalized)) {
+    // A relative root or a network share: "which workspace is this in" is not
+    // answerable without an absolute path, exactly as containment is not.
+    logger.debug('workspace search refused a project root it cannot reason about', {
+      reason: 'project-root-not-absolute',
+    });
+    return undefined;
+  }
+
+  const root = normalized.value;
+  let directory = dirnamePosix(root);
+
+  for (let depth = 0; depth < maxDepth; depth += 1) {
+    // A candidate that is no longer absolute — which `dirnamePosix` produces
+    // when a Windows-rooted path is exhausted — would be resolved against this
+    // process's working directory, i.e. against the tool's own checkout. That
+    // is precisely the wrong answer this function exists to avoid.
+    if (!isAbsolutePosix(directory) && !isWindowsAbsolute(directory)) {
+      break;
+    }
+
+    const declaration = readWorkspaceDeclaration(directory, logger);
+    if (declaration !== undefined) {
+      return workspaceMembership(directory, root, declaration, logger);
+    }
+
+    const parent = dirnamePosix(directory);
+    if (parent === directory) {
+      break;
+    }
+    directory = parent;
+  }
+
+  logger.debug('project belongs to no declared workspace', { projectRoot: root, maxDepth });
+  return undefined;
+}
+
+/** The empty pattern list, shared by every unusable declaration. */
+const EMPTY_WORKSPACE_PATTERNS: readonly string[] = Object.freeze([]);
+
+/**
+ * One ancestor's workspace declaration: which mechanism declared it, and the
+ * member patterns it lists.
+ *
+ * An *empty* `patterns` is meaningful and is not the same as no declaration at
+ * all: it says "this directory is a workspace root whose members this module
+ * could not establish", which stops the walk with no match — see
+ * {@link findWorkspaceRoot}'s fail-closed rule.
+ */
+interface WorkspaceDeclaration {
+  /** Which of the two declaration mechanisms was found. */
+  readonly kind: WorkspaceDeclarationKind;
+
+  /** The member patterns, verbatim as the declaration spelled them. */
+  readonly patterns: readonly string[];
+}
+
+/**
+ * The depth bound to search with, defaulted and validated.
+ *
+ * A `NaN`, an infinity, a fraction or a negative number is ignored rather than
+ * clamped: each of them is a caller mistake, and silently searching a
+ * *different* depth than either the caller asked for or the documented default
+ * would be the harder failure to notice. `0` is legitimate and searches
+ * nothing.
+ */
+function workspaceSearchDepth(requested: number | undefined): number {
+  if (requested === undefined) {
+    return DEFAULT_WORKSPACE_SEARCH_DEPTH;
+  }
+  return Number.isSafeInteger(requested) && requested >= 0
+    ? requested
+    : DEFAULT_WORKSPACE_SEARCH_DEPTH;
+}
+
+/**
+ * The workspace declaration of one directory, or `undefined` when it declares
+ * no workspace.
+ *
+ * pnpm's declaration is checked first, and its mere *presence* is the
+ * declaration — pnpm treats the file as the marker of a workspace root — so a
+ * `pnpm-workspace.yaml` whose `packages:` sequence is absent, malformed or
+ * unreadable yields a declaration with no patterns rather than "no
+ * declaration".
+ *
+ * `package.json` is different in exactly one way that matters: every package
+ * has one, so the *file* cannot be the marker and the `workspaces` field is.
+ * A manifest without that field is therefore not a declaration and the walk
+ * continues past it, which is what lets a nested package
+ * (`packages/<name>/package.json`) sit between a member and its root. A
+ * manifest that cannot be read or parsed is treated as a declaration with no
+ * patterns: it *may* have carried the field, this module cannot prove it did
+ * not, and refusing to walk past it is the fail-closed direction.
+ *
+ * @param directory The absolute POSIX ancestor being examined.
+ * @param logger Where the one `debug` line per refusal goes.
+ * @returns The declaration, or `undefined` when this directory declares none.
+ */
+function readWorkspaceDeclaration(
+  directory: string,
+  logger: Logger,
+): WorkspaceDeclaration | undefined {
+  for (const basename of PNPM_WORKSPACE_BASENAMES) {
+    const path = joinPosix(directory, basename);
+    if (!isReadableFile(path)) {
+      continue;
+    }
+    const text = readWorkspaceDeclarationText(path, logger);
+    if (text === undefined) {
+      return { kind: 'pnpm-workspace', patterns: EMPTY_WORKSPACE_PATTERNS };
+    }
+    return { kind: 'pnpm-workspace', patterns: parsePnpmWorkspacePackages(text) };
+  }
+
+  const manifestPath = joinPosix(directory, MANIFEST_BASENAME);
+  if (!isReadableFile(manifestPath)) {
+    return undefined;
+  }
+
+  const text = readWorkspaceDeclarationText(manifestPath, logger);
+  if (text === undefined) {
+    return { kind: 'package-json', patterns: EMPTY_WORKSPACE_PATTERNS };
+  }
+
+  const parsed = tryCatch((): unknown => JSON.parse(text));
+  if (isErr(parsed)) {
+    logger.debug('workspace search found a manifest that is not valid JSON', {
+      path: manifestPath,
+    });
+    return { kind: 'package-json', patterns: EMPTY_WORKSPACE_PATTERNS };
+  }
+
+  return readWorkspacesField(parsed.value);
+}
+
+/**
+ * The `workspaces` field of a parsed manifest, as a declaration.
+ *
+ * Both accepted shapes are read: the array form npm, yarn (modern) and bun use
+ * (`"workspaces": ["apps/*"]`), and the yarn-classic object form
+ * (`"workspaces": { "packages": ["apps/*"] }`), whose `nohoist` sibling is
+ * irrelevant here and is ignored. Non-string entries are dropped rather than
+ * stringified, because a pattern is a string and anything else is a mistake in
+ * the declaration.
+ *
+ * A manifest whose top level is not a JSON object is treated as a declaration
+ * with no patterns, on the same fail-closed reasoning as malformed JSON: it is
+ * not a manifest this module can prove says nothing about a workspace.
+ *
+ * @param raw The parsed manifest.
+ * @returns The declaration, or `undefined` when the field is absent — an
+ * ordinary package manifest, which the walk continues past.
+ */
+function readWorkspacesField(raw: unknown): WorkspaceDeclaration | undefined {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    return { kind: 'package-json', patterns: EMPTY_WORKSPACE_PATTERNS };
+  }
+
+  const record: Readonly<Record<string, unknown>> = raw as Readonly<Record<string, unknown>>;
+  if (!(WORKSPACES_FIELD in record)) {
+    return undefined;
+  }
+
+  const field = record[WORKSPACES_FIELD];
+  if (Array.isArray(field)) {
+    return { kind: 'package-json', patterns: stringPatterns(field) };
+  }
+
+  if (typeof field === 'object' && field !== null) {
+    const nested: unknown = (field as Readonly<Record<string, unknown>>)[WORKSPACE_PACKAGES_KEY];
+    if (Array.isArray(nested)) {
+      return { kind: 'package-json', patterns: stringPatterns(nested) };
+    }
+  }
+
+  return { kind: 'package-json', patterns: EMPTY_WORKSPACE_PATTERNS };
+}
+
+/** The non-empty string entries of a declared list, in declaration order. */
+function stringPatterns(entries: readonly unknown[]): readonly string[] {
+  const patterns: string[] = [];
+  for (const entry of entries) {
+    if (typeof entry === 'string' && entry.trim().length > 0) {
+      patterns.push(entry.trim());
+    }
+  }
+  return patterns;
+}
+
+/**
+ * Reads a workspace declaration's text, bounded, or `undefined` when it cannot
+ * be read as one.
+ *
+ * Four refusals, each before or instead of a read: an environment-file path,
+ * anything that is not a regular file, a file larger than
+ * {@link MAX_WORKSPACE_DECLARATION_BYTES}, and a read that throws. The
+ * environment-file guard is not reachable through the two constant basenames
+ * this module passes in — it is what keeps the module's privacy guarantee
+ * structural rather than incidental if a future declaration file is ever added
+ * to {@link PNPM_WORKSPACE_BASENAMES}.
+ *
+ * The file's *content* is never logged, here or anywhere below.
+ *
+ * @param path The absolute POSIX path of the declaration.
+ * @param logger Where the refusal is recorded, at `debug`.
+ * @returns The text, or `undefined`.
+ */
+function readWorkspaceDeclarationText(path: string, logger: Logger): string | undefined {
+  if (isEnvFilePath(path)) {
+    logger.debug('workspace search refused an environment-file path', { path });
+    return undefined;
+  }
+
+  const stats = tryCatch(() => statSync(path, { throwIfNoEntry: false }));
+  if (isErr(stats) || stats.value === undefined || !stats.value.isFile()) {
+    return undefined;
+  }
+
+  if (stats.value.size > MAX_WORKSPACE_DECLARATION_BYTES) {
+    logger.debug('workspace search refused a declaration larger than it will read', {
+      path,
+      size: stats.value.size,
+      limit: MAX_WORKSPACE_DECLARATION_BYTES,
+    });
+    return undefined;
+  }
+
+  const text = tryCatch(() => readFileSync(path, 'utf8'));
+  if (isErr(text)) {
+    logger.debug('workspace search could not read a declaration', { path });
+    return undefined;
+  }
+
+  return text.value;
+}
+
+/**
+ * The member patterns of a `pnpm-workspace.yaml`, read line by line.
+ *
+ * ## Why this is not a YAML parser, and must not become one
+ *
+ * This package takes one dependency (`ts-morph`) and adding a YAML parser to it
+ * to read a six-line file of the shape
+ *
+ * ```yaml
+ * packages:
+ *   - "apps/*"
+ *   - "packages/*"
+ * ```
+ *
+ * would be a dependency, a supply-chain surface and an upgrade obligation for a
+ * fallback that runs once per session. So exactly the two spellings pnpm's own
+ * documentation and every real repository use are read:
+ *
+ * - the **block sequence** above, with quoted or bare items, at any
+ *   indentation, and
+ * - the **inline flow sequence** `packages: ["apps/*", "packages/*"]`,
+ *   complete on one line.
+ *
+ * Everything else about YAML is deliberately not implemented, and each omission
+ * fails in the direction of reporting *fewer* members — which
+ * {@link findWorkspaceRoot} turns into `undefined`, never into a wrong
+ * workspace root. Specifically: only a *top-level*, unquoted `packages` key is
+ * recognised (a nested or quoted one is skipped, as is an anchor, an alias, a
+ * merge key or a multi-document stream); the block sequence ends at the first
+ * line that is neither blank, a comment, nor an item, so a following key ends it
+ * whatever its indentation; a `#` at the start of a line or preceded by
+ * whitespace begins a comment, as in YAML, and one inside a quoted scalar does
+ * not; quotes are stripped without interpreting escape sequences, which glob
+ * patterns do not use; and a comma is an item separator in the flow form, so a
+ * pattern containing a literal comma is not read.
+ *
+ * @param text The declaration's full text.
+ * @returns The patterns in declaration order; empty when none could be read.
+ */
+function parsePnpmWorkspacePackages(text: string): readonly string[] {
+  const patterns: string[] = [];
+  let inSequence = false;
+
+  for (const rawLine of text.split('\n')) {
+    const line = stripYamlComment(rawLine.replace(/\r$/, ''));
+    if (line.trim().length === 0) {
+      continue;
+    }
+
+    if (!inSequence) {
+      const value = topLevelPackagesValue(line);
+      if (value === undefined) {
+        continue;
+      }
+      if (value.length === 0) {
+        // `packages:` with nothing after it: a block sequence follows.
+        inSequence = true;
+        continue;
+      }
+      // The inline flow form is self-contained, so it is the whole answer.
+      return parseYamlFlowSequence(value);
+    }
+
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('-')) {
+      // The next key, at any indentation: the sequence is over. Stopping here
+      // rather than scanning on is what keeps a `catalog:` or `onlyBuiltDependencies:`
+      // block from contributing its own items to this list.
+      break;
+    }
+
+    const item = unquoteYamlScalar(trimmed.slice(1).trim());
+    if (item.length > 0) {
+      patterns.push(item);
+    }
+  }
+
+  return patterns;
+}
+
+/**
+ * The text after a top-level `packages:` key, or `undefined` when the line is
+ * not that key.
+ *
+ * "Top-level" is decided by indentation: a line that begins with whitespace
+ * belongs to some other mapping, and reading a nested `packages:` — pnpm's
+ * `catalogs:` blocks can contain one — would produce patterns from the wrong
+ * key.
+ */
+function topLevelPackagesValue(line: string): string | undefined {
+  if (line.length === 0 || /^\s/.test(line)) {
+    return undefined;
+  }
+
+  const separator = line.indexOf(':');
+  if (separator < 0) {
+    return undefined;
+  }
+
+  return line.slice(0, separator).trim() === WORKSPACE_PACKAGES_KEY
+    ? line.slice(separator + 1).trim()
+    : undefined;
+}
+
+/**
+ * The line with any trailing YAML comment removed.
+ *
+ * A `#` begins a comment at the start of a line or when preceded by whitespace,
+ * which is YAML's own rule, and never inside a single- or double-quoted scalar.
+ * A `#` in the middle of a bare scalar is therefore part of it, so a pattern
+ * is not silently truncated at a character a glob may legitimately contain.
+ */
+function stripYamlComment(line: string): string {
+  let quote: string | undefined;
+
+  for (let index = 0; index < line.length; index += 1) {
+    const character = line[index];
+    if (character === undefined) {
+      break;
+    }
+
+    if (quote !== undefined) {
+      if (character === quote) {
+        quote = undefined;
+      }
+      continue;
+    }
+
+    if (character === "'" || character === '"') {
+      quote = character;
+      continue;
+    }
+
+    if (character === '#') {
+      const previous = index === 0 ? undefined : line[index - 1];
+      if (previous === undefined || /\s/.test(previous)) {
+        return line.slice(0, index);
+      }
+    }
+  }
+
+  return line;
+}
+
+/**
+ * The items of an inline flow sequence (`["a", "b"]`).
+ *
+ * An unterminated or non-sequence value yields nothing rather than a guess: it
+ * is a declaration this module cannot read, which
+ * {@link findWorkspaceRoot} reports as no workspace root at all.
+ */
+function parseYamlFlowSequence(value: string): readonly string[] {
+  if (!value.startsWith('[') || !value.endsWith(']')) {
+    return EMPTY_WORKSPACE_PATTERNS;
+  }
+
+  const inner = value.slice(1, -1);
+  if (inner.trim().length === 0) {
+    return EMPTY_WORKSPACE_PATTERNS;
+  }
+
+  const patterns: string[] = [];
+  for (const part of inner.split(',')) {
+    const item = unquoteYamlScalar(part.trim());
+    if (item.length > 0) {
+      patterns.push(item);
+    }
+  }
+  return patterns;
+}
+
+/**
+ * A scalar with one layer of matching quotes removed.
+ *
+ * Escape sequences are not interpreted, which is safe for the values this reads:
+ * a workspace pattern is a path glob, and neither `\n` nor `\"` appears in one.
+ */
+function unquoteYamlScalar(value: string): string {
+  const first = value[0];
+  if (value.length >= 2 && (first === "'" || first === '"') && value[value.length - 1] === first) {
+    return value.slice(1, -1).trim();
+  }
+  return value;
+}
+
+/**
+ * Whether the project is a member of the declaration found at `root`, as a
+ * {@link WorkspaceRoot} or `undefined`.
+ *
+ * Every pattern is examined even after one has matched, because a negation
+ * vetoes membership wherever it appears in the list — which is how both pnpm
+ * and npm treat `!`-prefixed patterns, and the only reading under which a
+ * declaration can exclude a subtree it has already included with a `*`.
+ *
+ * @param root The declaring ancestor, absolute and normalised.
+ * @param projectRoot The normalised project root being judged.
+ * @param declaration The patterns that ancestor declares.
+ * @param logger Where the outcome is recorded, at `debug`.
+ * @returns The membership, or `undefined` when the project is not a member.
+ */
+function workspaceMembership(
+  root: string,
+  projectRoot: string,
+  declaration: WorkspaceDeclaration,
+  logger: Logger,
+): WorkspaceRoot | undefined {
+  const relative = toProjectRelative(root, projectRoot);
+  if (isErr(relative)) {
+    // The project sits under this ancestor by construction — the walk came from
+    // it — so this is reachable only for a path the shared validator refuses
+    // outright, such as one carrying a control character.
+    logger.debug('workspace search could not reduce the project against a declaring ancestor', {
+      root,
+    });
+    return undefined;
+  }
+
+  const segments = relative.value.split(SEPARATOR).filter((segment) => segment.length > 0);
+  let matched: string | undefined;
+
+  for (const pattern of declaration.patterns) {
+    const negated = pattern.startsWith('!');
+    const tokens = patternSegments(negated ? pattern.slice(1) : pattern);
+    if (tokens === undefined || !matchesPatternSegments(segments, tokens, 0, 0)) {
+      continue;
+    }
+    if (negated) {
+      logger.debug('workspace declaration excludes this project from membership', {
+        root,
+        pattern,
+      });
+      return undefined;
+    }
+    matched ??= pattern;
+  }
+
+  if (matched === undefined) {
+    logger.debug('project sits beneath a workspace root without being one of its members', {
+      root,
+      declaredBy: declaration.kind,
+      patterns: declaration.patterns.length,
+    });
+    return undefined;
+  }
+
+  logger.debug('project resolved to a workspace root', {
+    root,
+    declaredBy: declaration.kind,
+    memberPattern: matched,
+  });
+
+  return Object.freeze({ root, declaredBy: declaration.kind, memberPattern: matched });
+}
+
+/**
+ * A member pattern split into the tokens the matcher compares, or `undefined`
+ * when the pattern is not one this module will act on.
+ *
+ * `'./apps/*'`, `'apps/*'` and the same with a trailing separator all yield
+ * `['apps', '*']`. A pattern
+ * containing `'..'` is refused: a declaration that reaches above its own root
+ * is not one this function will credit a project's membership to.
+ */
+function patternSegments(pattern: string): readonly string[] | undefined {
+  const tokens = toPosix(pattern)
+    .split(SEPARATOR)
+    .map((token) => token.trim())
+    .filter((token) => token.length > 0 && token !== '.');
+
+  if (tokens.length === 0 || tokens.includes('..')) {
+    return undefined;
+  }
+  return tokens;
+}
+
+/**
+ * Whether a project's path segments match a member pattern's tokens.
+ *
+ * A **whole-segment** matcher and deliberately not a glob: a literal token must
+ * equal its segment, `'*'` matches exactly one segment whatever it contains,
+ * and `'**'` matches zero or more. Nothing else is interpreted — a token such
+ * as `'*-utils'` is compared literally and therefore matches nothing, and brace
+ * expansion, character classes and `?` are not implemented. Every one of those
+ * omissions makes a project *not* a member, which
+ * {@link findWorkspaceRoot} reports as `undefined`; the alternative — a partial
+ * matcher that guesses — would attribute a project to a workspace root that
+ * does not contain it.
+ *
+ * The recursion is bounded by the pattern and the path: `'**'` tries each
+ * remaining split point once, so the work is at most the product of the two
+ * lengths, both of which are path depths.
+ *
+ * @param segments The project's path relative to the workspace root.
+ * @param tokens The pattern's tokens, from {@link patternSegments}.
+ * @param segmentIndex The segment being matched.
+ * @param tokenIndex The token being matched.
+ * @returns `true` when the whole path is consumed by the whole pattern.
+ */
+function matchesPatternSegments(
+  segments: readonly string[],
+  tokens: readonly string[],
+  segmentIndex: number,
+  tokenIndex: number,
+): boolean {
+  if (tokenIndex >= tokens.length) {
+    return segmentIndex >= segments.length;
+  }
+
+  const token = tokens[tokenIndex];
+  if (token === '**') {
+    for (let skip = segmentIndex; skip <= segments.length; skip += 1) {
+      if (matchesPatternSegments(segments, tokens, skip, tokenIndex + 1)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  const segment = segments[segmentIndex];
+  if (segment === undefined || token === undefined) {
+    return false;
+  }
+
+  if (token !== '*' && token !== segment) {
+    return false;
+  }
+
+  return matchesPatternSegments(segments, tokens, segmentIndex + 1, tokenIndex + 1);
 }
 
 /** The shared empty list, so the common call site allocates nothing. */

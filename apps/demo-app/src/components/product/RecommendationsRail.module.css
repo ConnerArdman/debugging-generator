@@ -4,7 +4,10 @@
  * Consumed only by ./RecommendationsRail.tsx, which renders exactly this tree:
  *
  *   section.root[data-variant]      the labelled region
- *     div.head > h2.heading         the strip's title row
+ *     div.head > h2.heading         the strip's title row in the detail body,
+ *     div.head > p.heading          and in the site header, where the banner
+ *                                   precedes the page's h1 and a heading would
+ *                                   open its outline at the wrong level
  *     div.viewport[tabindex="0"]    the horizontal scroll container
  *       ul.list > li.item           one tile per recommendation
  *     div.state                     the loading and empty slots - and the class
@@ -21,12 +24,16 @@
  * and lives entirely in the `[data-variant]` blocks at the end of this file, as
  * a set of file-local `--rail-*` metrics that the rules above read. Each of
  * those again resolves to an `--ls-*` token with a literal fallback, apart from
- * the strip's own measures, which are stated in rem, and none of them changes
- * what the component does. The compact block is followed by the one rule that
- * tunes a slot instead of a metric - `.root[data-variant='compact'] .state`,
- * which puts the header's failed-read notice on the smallest type step and holds
- * it to the width of the tile row, so a sentence cannot make the navigation row
- * taller than the suggestions it stands in for would have.
+ * the strip's own measures and its label tracking, which are stated in rem and
+ * em, and none of them changes what the component does. The header's slot is a
+ * fixed 63px of usable height with `overflow: hidden`, so the compact block
+ * states the arithmetic it is held to and is followed by the three rules that
+ * tune a slot instead of a metric, each needing weight the metrics cannot
+ * supply: the compact title's leading and its label treatment, `.state` - which
+ * takes the block padding off the header's waiting and failed-read slots, puts a
+ * notice on the smallest type step and holds it to the width of the tile row -
+ * and `.skeleton`, which gives a pending mini tile the short row's height in
+ * place of the card's 4:3 frame.
  *
  * Hex values are lowercase because Prettier normalises CSS colours to lowercase
  * and `pnpm format:check` is a blocking gate.
@@ -49,23 +56,37 @@
   gap: var(--ls-space-2, 8px);
 }
 
+/* The title, worn by an `h2` in the detail body and by a `p` in the header's
+ * row. The weight and the leading are stated here rather than left to the
+ * `h1..h6` rule in app/globals.css, which is where both used to reach this
+ * element: that rule does not select a paragraph, so a class that relied on it
+ * would render the two titles differently. The two literals are the values that
+ * rule declares - there is no weight or leading token in the set - and
+ * globals resets the margins of `h1..h6` and `p` alike, so the `margin: 0` here
+ * is what it always was. */
 .heading {
   margin: 0;
   color: var(--ls-text, #0f172a);
   font-size: var(--rail-heading-size, var(--ls-text-lg, 18px));
+  font-weight: 600;
+  line-height: 1.25;
 }
 
 /* The scroll container, and the only box here that scrolls: the strip overflows
  * inside it, so a narrow viewport never gains page-level horizontal scroll. The
- * block-end padding is clearance for the scrollbar, not a gap under the rail. */
+ * block-end padding is clearance for the scrollbar, not a gap under the rail,
+ * and the compact block at the foot of the file spends neither - it suppresses
+ * the bar and reclaims the clearance, because the header's row has no height to
+ * give either. Both are `--rail-*` metrics so the variant decides them without a
+ * second rule for this box. */
 .viewport {
   min-width: 0;
-  padding-block-end: var(--ls-space-1, 4px);
+  padding-block-end: var(--rail-viewport-pad, var(--ls-space-1, 4px));
   overflow-x: auto;
   overflow-y: hidden;
   /* A flick past either end scrolls the strip only, never the page behind it. */
   overscroll-behavior-x: contain;
-  scrollbar-width: thin;
+  scrollbar-width: var(--rail-scrollbar, thin);
   scroll-behavior: smooth;
 }
 
@@ -125,10 +146,12 @@
   overflow: hidden;
 }
 
-/* One pending tile. The width travels as a flex basis as well as a width, so the
- * placeholder primitive's own full-width default cannot stretch it however the
- * two stylesheets happen to be ordered, and the ratio is the tile's thumbnail
- * frame, so a pending row stands as tall as the thumbnails it will become. */
+/* One pending tile, in the measure the detail body's card has. The width travels
+ * as a flex basis as well as a width, so the placeholder primitive's own
+ * full-width default cannot stretch it however the two stylesheets happen to be
+ * ordered, and the ratio is that card's thumbnail frame, so a pending row stands
+ * as tall as the thumbnails it will become. The header's mini tile is a different
+ * shape and takes its height from the compact rule at the foot of this file. */
 .skeleton {
   flex: 0 0 var(--rail-tile-width, 12rem);
   width: var(--rail-tile-width, 12rem);
@@ -136,24 +159,65 @@
   border-radius: var(--ls-radius-md, 8px);
 }
 
-/* In the product detail body: the full-size strip. */
+/* In the product detail body: the full-size strip, with the room a page has. */
 .root[data-variant='detail'] {
   --rail-block-gap: var(--ls-space-2, 8px);
   --rail-heading-size: var(--ls-text-lg, 18px);
   --rail-item-gap: var(--ls-space-3, 12px);
   --rail-state-pad: var(--ls-space-3, 12px);
   --rail-tile-width: 12rem;
+  --rail-viewport-pad: var(--ls-space-1, 4px);
+  --rail-scrollbar: thin;
 }
 
-/* In the site header: a smaller label, tighter spacing and narrower tiles, so the
- * strip asks the row around it for no more height than the tiles themselves
- * need - a label, a 4px gap and the scrollbar clearance above them. */
+/* In the site header: the same strip sized for a row that cannot grow. The bar is
+ * a fixed `--ls-header-height` of 64px and its bottom hairline takes 1px of that,
+ * so the slot holding this strip is 63px tall with `overflow: hidden` - whatever
+ * the strip asks for beyond that is simply cut off, top and bottom. Every metric
+ * below is chosen against that budget, and the total is:
+ *
+ *   heading 12px x 1.15   = 13.8px
+ *   --rail-block-gap      =  4px
+ *   compact tile          = 37.6px  (RecommendationTile.module.css states this
+ *                                    arithmetic: border, padding, one line of
+ *                                    name and one line of price)
+ *                           ------
+ *   loaded strip          = 55.4px
+ *
+ * and the two states that replace the tiles come in under the same figure - 53.8px
+ * waiting (36px placeholder) and 54.6px for a two-line failed-read notice - so no
+ * state of this strip is clipped by the slot.
+ *
+ * The tile width and the item gap are load-bearing in the inline axis too: two
+ * 9rem tiles plus the 8px gap between them are 296px, which is the slot's own
+ * measured width, so both suggestions are fully visible rather than the second
+ * one sitting half-scrolled. */
 .root[data-variant='compact'] {
   --rail-block-gap: var(--ls-space-1, 4px);
-  --rail-heading-size: var(--ls-text-sm, 13px);
+  --rail-heading-size: var(--ls-text-xs, 12px);
   --rail-item-gap: var(--ls-space-2, 8px);
-  --rail-state-pad: var(--ls-space-2, 8px);
+  --rail-state-pad: 0;
   --rail-tile-width: 9rem;
+  /* No clearance under the row and no scrollbar track: the 63px slot has neither
+   * to spend, and a horizontal bar is the one thing here that can take height
+   * the strip never asked for. It appears only when the slot is narrower than
+   * the tile row - the slot may shrink, and the strip then scrolls - which is
+   * precisely the moment another dozen pixels of track would put the whole
+   * strip outside the bar. The box stays `overflow-x: auto` and the component
+   * keeps its `tabIndex` and `role="group"` on it, so the strip still scrolls
+   * with the wheel, a trackpad flick and the arrow keys, and still draws the
+   * focus ring above when a keyboard reader lands on it: only the bar itself is
+   * withdrawn, never the scrolling. */
+  --rail-viewport-pad: 0;
+  --rail-scrollbar: none;
+
+  /* The tracking the header's title takes as a label. Uppercase letterforms at the smallest type
+   * step set tighter than their lowercase counterparts read, so a little is added back; the
+   * amount is stated in `em` so it follows whatever size the step above resolves to, which is
+   * also why no `--ls-*` token expresses it - the token set models sizes, spaces and colours and
+   * not tracking, exactly as it models none of the `--rail-*` geometry above. */
+  --rail-label-tracking: 0.06em;
+
   /* The measure the header's slot is held to: the width the strip already spends
    * on its row of tiles, so a sentence wraps inside the space the suggestions
    * would have occupied instead of stretching the navigation row wider. Stated
@@ -163,15 +227,70 @@
   --rail-state-measure: 20rem;
 }
 
-/* The failed-read notice in the site header. Two classes and an attribute, which
- * outranks Alert.module.css's own single-class `.root` however the two modules
- * happen to be ordered: the notice arrives at the alert's 13px body size, and a
- * row that shares its height with the navigation has less than that to spend.
- * The smaller type step and the bounded measure together keep the sentence from
- * growing the row it sits in - it wraps inside the strip's own width. The
- * waiting slot carries this class too and is unaffected: its placeholders are
- * narrower than the measure and its only text is visually hidden. */
+/* The compact title. Two jobs, one rule.
+ *
+ * Leading: a 12px label at the inherited 1.5 leading of body copy would stand
+ * 18px tall and push the strip past the slot, so the leading is tightened here;
+ * the shared token set carries no leading token, so 1.15 is a literal, exactly
+ * as the 1.25 on headings in app/globals.css is. Scoped to the variant rather
+ * than declared on `.heading`, so the detail strip's title keeps the document's
+ * own heading rhythm.
+ *
+ * Treatment: as a label rather than as a second size of the heading role. This
+ * file used to give one role two type steps - 18px in a product page's detail
+ * body and 13px in the header - so the same class named the same thing at two
+ * sizes on one screen, and a reader had no way to tell which of the two was the
+ * section heading. The heading role keeps exactly one size in this application,
+ * the detail variant's, and the header's title stops competing for it: the
+ * smallest step, the muted foreground, uppercase with a little tracking to hold
+ * it open - the treatment a caption or a field label already takes across this
+ * storefront, which is what the header's one-word title actually is. The
+ * component renders it as a paragraph rather than an `<h2>` for the same reason,
+ * and it still names the region through `aria-labelledby`, so nothing about the
+ * strip's accessible name changes. The weight is restated rather than inherited
+ * so this block reads as one complete treatment, and no property here enlarges
+ * anything: uppercase and tracking widen the word, not the line.
+ *
+ * Two classes and an attribute, which outranks the single-class `.heading` rule
+ * above however the two happen to be ordered, and scoped to the compact variant
+ * so the detail body's heading is untouched. */
+.root[data-variant='compact'] .heading {
+  color: var(--ls-text-muted, #475569);
+  font-weight: 600;
+  line-height: 1.15;
+  letter-spacing: var(--rail-label-tracking, 0.06em);
+  text-transform: uppercase;
+}
+
+/* The waiting and failed-read slots in the site header. Two classes and an
+ * attribute, which outranks both `.state` above and Alert.module.css's own
+ * single-class `.root` however the three rules happen to be ordered - and that
+ * weight is the whole point of the rule: the block padding is what has to go,
+ * and neither the metric above nor a plain class can take it off an alert that
+ * declares 12px of its own. What remains is the alert's inline padding, which
+ * costs the row no height and is what keeps the sentence off its own border.
+ *
+ * The notice arrives at the alert's 13px body size; the smaller type step and the
+ * bounded measure together keep it to two 17.4px lines inside the strip's own
+ * width, so a failed read reports itself in 36.8px rather than growing the
+ * navigation row. The waiting slot carries this class too and is unaffected by
+ * the measure: its placeholders are narrower than it and its only text is
+ * visually hidden. */
 .root[data-variant='compact'] .state {
   max-inline-size: var(--rail-state-measure, 20rem);
+  padding-block: var(--rail-state-pad, 0);
   font-size: var(--ls-text-xs, 12px);
+}
+
+/* One pending mini tile. The placeholder is the shape of the tile it stands in
+ * for, and in the header that tile is a short row rather than a 4:3 card - so the
+ * ratio the base rule sets is withdrawn and the height stated instead, through
+ * `--skeleton-size`, the property `ui/Skeleton`'s block shape reads for exactly
+ * this case. 32px + 4px is the nearest the spacing scale comes to the compact
+ * tile's own 37.6px, and it clears that primitive's own 32px floor, so the strip
+ * settles by under 2px when the suggestions land. */
+.root[data-variant='compact'] .skeleton {
+  --skeleton-size: calc(var(--ls-space-6, 32px) + var(--ls-space-1, 4px));
+
+  aspect-ratio: auto;
 }

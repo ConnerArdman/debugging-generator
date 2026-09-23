@@ -1,0 +1,38 @@
+/*
+ * Lumen Supply - Textarea: the multi-line field's stylesheet.
+ *
+ * Owned by `Textarea.tsx`, a thin wrapper over the native `<textarea>` that renders this module's
+ * single `.root` class and expresses its variants as data attributes, exactly as the single-line
+ * field does:
+ *
+ *   data-size="sm" | "md"   field density; "md" is the base metric set, so only "sm" needs a rule
+ *   data-invalid="true"     the field failed validation
+ *
+ * What this file deliberately does not own: the field's chrome. `.root` composes
+ * `Input.module.css`'s `.root`, so the box, border, radius, background, focus ring, hover,
+ * read-only, disabled and invalid treatments are that module's single set of declarations rather
+ * than a second copy of them here. A buyer filling in the checkout page therefore sees one field
+ * in two heights, and a change to the field's appearance is made in one place. Everything below is
+ * only what a text area needs that a text input does not.
+ *
+ * `composes` is a CSS Modules feature and must stay the first declaration in the rule; it composes
+ * class *names*, so the two classes both land on the element and the cascade between them is
+ * ordinary source order.
+ *
+ * Tokens: every length is `var(--ls-NAME, <literal fallback>)` or a `calc()` over one. The
+ * declarations live in `app/globals.css`; the fallbacks mirror them so a field still renders
+ * sensibly if it is ever mounted outside the application shell.
+ */
+
+.root {
+  composes: root from './Input.module.css';
+  /* A floor under the height, so a field dragged flat cannot collapse to something a paragraph
+   * cannot be read in. Two spacing steps of 32px is a little over three lines of the field's own
+   * type, which is the smallest a multi-line field is still worth having. */
+  min-height: calc(var(--ls-space-6, 32px) * 2);
+  /* Height only. A text area may be dragged in both directions by default, and one dragged wider
+   * than its grid track would reach over the edge of the form it sits in - the checkout page's
+   * field grid is two columns inside a padded card - so the reader gets the dimension that helps
+   * and not the one that breaks the layout. */
+  resize: vertical;
+}

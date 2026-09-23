@@ -57,7 +57,7 @@
  * The three suites at the end of the file run on the opposite kind of input:
  * the committed `packages/telemetry/test/fixtures/capture-batch.json`, read
  * from disk at run time, validated element by element against
- * `telemetryEventSchema` and summarised whole. It is a complete thirty-event
+ * `telemetryEventSchema` and summarised whole. It is a complete thirty-five-event
  * capture spanning all three tiers — the shape the service really rolls up —
  * and it is checked-in repository data rather than captured telemetry: no
  * network, no clock and no minted identifier take part, every timestamp and
@@ -99,7 +99,7 @@ import {
   type TelemetryStatus,
   type TelemetryTier,
 } from '../schema/kinds.js';
-import { aggregateQueries } from './queries.js';
+import { aggregateQueries, isDatabaseStatementEvent } from './queries.js';
 import { aggregateRenders } from './renders.js';
 import {
   RESOURCE_ENTRY_TYPE,
@@ -680,6 +680,31 @@ function makeQueryEvent(
   });
 }
 
+/**
+ * A database-tier span that ran no statement: the tier's own lifecycle work.
+ *
+ * Both instrumentations span their overhead — a connection acquisition, an
+ * argument serialization, a transaction boundary — and `../node/convert.ts`
+ * emits every one of them as `db.query` on the database tier, because there is
+ * one database kind and the time really was spent there. The absent
+ * `db.statement` is what tells it from an execution, so this builder carries
+ * the operation the producer derived and no statement.
+ */
+function makeLifecycleQueryEvent(
+  name: string,
+  operation: string,
+  placement: { readonly at: number; readonly duration: number },
+): TelemetryEvent {
+  return makeEvent({
+    kind: DB_QUERY_KIND,
+    tier: DATABASE_TIER,
+    name,
+    startTime: BASE_TIME + placement.at,
+    duration: placement.duration,
+    attributes: { 'db.operation': operation },
+  });
+}
+
 /** One React commit: structural, and never counted as a render. */
 function makeCommitEvent(rootName: string, renderCount: number, at = 0): TelemetryEvent {
   return makeSpanAt({
@@ -1227,19 +1252,63 @@ describe('computeMetrics', () => {
     expect(valueOf(values, 'render_trigger_unknown_count')).toBe(1);
   });
 
-  it('counts requests and statements per occurrence, through their kind groups', () => {
+  it('counts requests per occurrence and statements per execution', () => {
     const values = computeMetrics([
       makeRequestEvent(),
       makeRequestEvent(),
       // A server-side outgoing request is not a request the page issued.
       makeEvent({ kind: 'http.client', tier: SERVER_TIER }),
-      makeEvent({ kind: DB_QUERY_KIND, tier: DATABASE_TIER }),
-      makeEvent({ kind: DB_QUERY_KIND, tier: DATABASE_TIER }),
-      makeEvent({ kind: DB_QUERY_KIND, tier: DATABASE_TIER }),
+      makeQueryEvent('select col_a from t1 where id = $1', { at: 0, duration: 3 }),
+      makeQueryEvent('select col_b from t2 where id = $1', { at: 5, duration: 3 }),
+      makeQueryEvent('select col_c from t3 where id = $1', { at: 10, duration: 3 }),
     ]);
 
     expect(valueOf(values, 'request_count')).toBe(2);
     expect(valueOf(values, 'query_count')).toBe(3);
+  });
+
+  it('counts no query for database work that ran no statement', () => {
+    // A `db.query` event is a database *span*, and the database tier spans its
+    // own overhead too: a pooled connection acquisition, the ORM serializing
+    // its arguments, a transaction boundary. None of them is a statement a
+    // `queryTable` row could describe (AAP 0.6.2), and counting them made this
+    // card report almost three times the statements a capture really ran.
+    const events = [
+      makeLifecycleQueryEvent('pg-pool.connect', 'connect', { at: 0, duration: 12 }),
+      makeLifecycleQueryEvent('prisma:client:serialize', 'serialize', { at: 20, duration: 2 }),
+      makeLifecycleQueryEvent('prisma:client:operation', 'operation', { at: 30, duration: 30 }),
+    ];
+    const values = computeMetrics(events);
+
+    expect(aggregateQueries(events)).toEqual([]);
+    expect(valueOf(values, 'query_count')).toBe(0);
+    // The evidence is not hidden, only classified: the spans are still counted
+    // by kind and their three disjoint intervals are still the capture's
+    // database time.
+    const summary = computeCaptureSummary(events, makeContext());
+    expect(summary.kindCounts[DB_QUERY_KIND]).toBe(3);
+    expect(valueOf(summary.metrics, 'database_duration')).toBe(44);
+  });
+
+  it('counts one execution two instrumentations both observed once', () => {
+    // The ORM over the driver: one statement, spanned by the ORM and again by
+    // the driver nested inside it with the same text. The card counts the
+    // execution, not the observations.
+    const orm = makeQueryEvent('select col_a from t1 where id = $1', { at: 0, duration: 24 });
+    const driver = makeQueryEvent('select col_a from t1 where id = $1', {
+      at: 4,
+      duration: 9,
+      traceId: orm.traceId,
+      parentSpanId: orm.spanId,
+    });
+    const events = [orm, driver];
+
+    expect(valueOf(computeMetrics(events), 'query_count')).toBe(1);
+    // And the card equals the table, which is the identity this metric is now
+    // computed to hold by construction.
+    expect(valueOf(computeMetrics(events), 'query_count')).toBe(
+      aggregateQueries(events).reduce((running, group) => running + group.executionCount, 0),
+    );
   });
 
   it('counts two occurrences of one request, not the single group they form', () => {
@@ -2229,7 +2298,7 @@ describe('computeCaptureSummary', () => {
  * The committed capture fixture
  *
  * `packages/telemetry/test/fixtures/capture-batch.json` is the repository's
- * one complete persisted capture: thirty events of a single interaction,
+ * one complete persisted capture: thirty-five events of a single interaction,
  * spanning the browser agent and the server preload, correlated into one
  * trace and already redacted (AAP 0.5.2 — the URLs carry `?` placeholders and
  * every statement is parameterized). It is the shape the service actually
@@ -2280,7 +2349,7 @@ const CAPTURE_BATCH_PATH = join(FIXTURES_DIR, 'capture-batch.json');
  * fixture's path in the message, because the two most likely causes are a
  * moved file and an edited fixture, and they need different fixes.
  *
- * @returns The thirty persisted events, in file order.
+ * @returns The thirty-five persisted events, in file order.
  */
 function loadCaptureBatch(): readonly TelemetryEvent[] {
   let text: string;
@@ -2345,7 +2414,28 @@ const FIXTURE_BROWSER_PRODUCER_ID = 'prd_n4q8t2w6z0c3f7jm';
 const FIXTURE_SERVER_PRODUCER_ID = 'prd_v5y9b3e7h1k4n8qs';
 
 /** How many events the fixture holds. */
-const FIXTURE_EVENT_COUNT = 30;
+const FIXTURE_EVENT_COUNT = 35;
+
+/**
+ * How many of the fixture's nine database spans are statement executions.
+ *
+ * The other three ran no statement: an ORM operation wrapper, an argument
+ * serialization and a pooled connection acquisition. They are database-tier
+ * work and they are in every tally of database spans; they are not rows of a
+ * query table (AAP 0.6.2), which is what `isDatabaseStatementEvent` decides.
+ */
+const FIXTURE_STATEMENT_EVENT_COUNT = 6;
+
+/**
+ * How many of those six are an inner observation of an execution another
+ * instrumentation had already spanned.
+ *
+ * One: the fixture's `pg.query` span nested inside a `prisma:client:db_query`
+ * span carrying byte-identical text. One execution, two spans, and the
+ * outermost of the two is the one counted — so the capture's executions are
+ * {@link FIXTURE_STATEMENT_EVENT_COUNT} minus this.
+ */
+const FIXTURE_DOUBLE_OBSERVED_STATEMENT_COUNT = 1;
 
 /** The identity a summary of the fixture is built with. */
 function fixtureContext(): { captureId: string; sessionId: string } {
@@ -2401,8 +2491,15 @@ const COVERAGE_LIMITED_METRIC_ID: MetricId = 'transferred_bytes';
  *   database work they issued, so both are unions rather than sums.
  * - the render totals — six renders of three components, two of which
  *   reported stable inputs and one of which could not be classified.
- * - `request_count` / `query_count` — per occurrence, through the kind
- *   groups: seven browser fetches and four statement executions.
+ * - `request_count` — per occurrence, through the request kind group: seven
+ *   browser fetches.
+ * - `query_count` — per **execution**, through the query groups, which is
+ *   five and not the nine `db.query` events the capture holds. Three of those
+ *   nine ran no statement at all (an ORM operation wrapper, an argument
+ *   serialization, a pooled connection acquisition) and one is the driver's
+ *   observation of a statement the ORM had already spanned. The three
+ *   lifecycle spans are still in `kindCounts['db.query']` and still in
+ *   `database_duration`; what they are not is statements that ran.
  * - `duplicate_request_count` — the four `/api/summary` fetches share one
  *   request key inside the duplicate window, so three of them are redundant.
  * - `blocking_time` — the single 180 ms long task reported 130 ms of
@@ -2417,7 +2514,7 @@ const FIXTURE_METRIC_VALUES: readonly FixtureMetricExpectation[] = [
   { id: 'unchanged_render_count', value: 2 },
   { id: 'render_trigger_unknown_count', value: 1 },
   { id: 'request_count', value: 7 },
-  { id: 'query_count', value: 4 },
+  { id: 'query_count', value: 5 },
   { id: 'blocking_time', value: 130 },
   { id: 'duplicate_request_count', value: 3 },
   { id: 'long_task_count', value: 1 },
@@ -2445,7 +2542,7 @@ const FIXTURE_KIND_COUNTS: Readonly<Partial<Record<TelemetryKind, number>>> = {
   'http.server': 2,
   'route.handler': 2,
   function: 2,
-  'db.query': 4,
+  'db.query': 9,
 };
 
 /**
@@ -2455,7 +2552,7 @@ const FIXTURE_KIND_COUNTS: Readonly<Partial<Record<TelemetryKind, number>>> = {
 const FIXTURE_TIER_COUNTS: Readonly<Record<TelemetryTier, number>> = {
   browser: 20,
   server: 6,
-  db: 4,
+  db: 9,
 };
 
 /** One row of the fixture's span ranking. */
@@ -2827,13 +2924,20 @@ interface ExpectedQuery {
 }
 
 /**
- * The two statement groups of the fixture, costliest first.
+ * The three statement groups of the fixture, costliest first.
  *
  * The first group is the one that matters: two executions of the *same*
  * statement with different parameter arities (`IN ($1, $2, $3)` and
  * `IN ($1)`), issued from two different server functions. They group together
  * because normalisation collapses the parameter list, and the group therefore
  * carries two callers — the N+1 shape the query table exists to surface.
+ *
+ * The third is the fixture's double-observed execution, and every number in it
+ * is the **outer** ORM span's: the driver span nested inside it reported the
+ * same statement 2.6 ms later and 9.442 ms long, and it is not a second
+ * execution. A `totalDurationMs` of 23.76, a `maxDurationMs` of 9.442 or an
+ * `executionCount` of 2 here would each be a different way of reporting one
+ * statement twice.
  */
 const FIXTURE_TOP_QUERIES: readonly ExpectedQuery[] = [
   {
@@ -2867,6 +2971,22 @@ const FIXTURE_TOP_QUERIES: readonly ExpectedQuery[] = [
     totalRowCount: 2,
     callerNames: ['executing api route (app) /api/summary', 'loadItems'],
     eventIds: ['evt_q8v2x6z0f4g8j2mr', 'evt_j3p7r1t5y9z3d7fk'],
+  },
+  {
+    id: 'qg_7c35798f6e5fe587',
+    statement: 'SELECT count(*) AS total FROM items WHERE group_id = $1',
+    normalizedStatement: 'SELECT count(*) AS total FROM items WHERE group_id = ?',
+    system: 'postgresql',
+    executionCount: 1,
+    totalDurationMs: 14.318,
+    averageDurationMs: 14.318,
+    minDurationMs: 14.318,
+    maxDurationMs: 14.318,
+    firstStartTime: 1_789_812_900_110.3,
+    lastStartTime: 1_789_812_900_110.3,
+    totalRowCount: 1,
+    callerNames: ['loadItems'],
+    eventIds: ['evt_y5g9j3n7q1t5w9xb'],
   },
 ];
 
@@ -3021,7 +3141,7 @@ function fixtureRendersTriggeredBy(trigger: RenderTrigger): readonly TelemetryEv
 }
 
 describe('the committed capture fixture', () => {
-  it('is thirty persisted events the store could hold, parsed from the file on disk', () => {
+  it('is thirty-five persisted events the store could hold, parsed from the file on disk', () => {
     // The loader threw if any element failed `telemetryEventSchema`, so
     // reaching this line already establishes the contract. It is restated
     // through the public guard as well, because that is the predicate every
@@ -3177,7 +3297,28 @@ describe('computeMetrics on the committed capture fixture', () => {
 
     expect(valueOf(values, 'render_count')).toBe(fixtureEventsOfKind(RENDER_KIND).length);
     expect(valueOf(values, 'request_count')).toBe(fixtureEventsOfKinds(REQUEST_KINDS).length);
-    expect(valueOf(values, 'query_count')).toBe(fixtureEventsOfKinds(QUERY_KINDS).length);
+    // `query_count` is the one count that is not "events of a kind": three of
+    // the nine database spans ran no statement and one is the driver's second
+    // observation of a statement the ORM had already spanned, so the capture
+    // ran five statements. Both intermediate facts are read off the fixture
+    // through the module's own selector, so a fixture that gained or lost one
+    // of these shapes fails here rather than quietly changing the metric.
+    const databaseEvents = fixtureEventsOfKinds(QUERY_KINDS);
+    const statementEvents = databaseEvents.filter((event) => isDatabaseStatementEvent(event));
+
+    expect(databaseEvents).toHaveLength(FIXTURE_KIND_COUNTS[DB_QUERY_KIND] ?? 0);
+    expect(statementEvents).toHaveLength(FIXTURE_STATEMENT_EVENT_COUNT);
+    expect(valueOf(values, 'query_count')).toBe(
+      FIXTURE_STATEMENT_EVENT_COUNT - FIXTURE_DOUBLE_OBSERVED_STATEMENT_COUNT,
+    );
+    // And the identity the metric is computed to hold: the card is the sum of
+    // the query table's execution counts, never a second count beside it.
+    expect(valueOf(values, 'query_count')).toBe(
+      aggregateQueries(CAPTURE_BATCH_EVENTS).reduce(
+        (running, group) => running + group.executionCount,
+        0,
+      ),
+    );
     expect(valueOf(values, 'long_task_count')).toBe(fixtureEventsOfKind(LONG_TASK_KIND).length);
     expect(valueOf(values, 'error_count')).toBe(failures.length);
 
@@ -3450,7 +3591,7 @@ describe('computeCaptureSummary on the committed capture fixture', () => {
     }
   });
 
-  it('publishes the two statement groups, costliest first, with their callers', () => {
+  it('publishes the three statement groups, costliest first, with their callers', () => {
     const events = captureBatchEvents();
     const summary = computeCaptureSummary(events, fixtureContext());
 

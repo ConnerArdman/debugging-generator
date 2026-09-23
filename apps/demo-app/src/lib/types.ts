@@ -491,15 +491,21 @@ export interface OrderSummary {
 
 /**
  * An order as the confirmation screen and the order detail view render it: the
- * list payload plus its lines, the service it ships by and where it ships to.
+ * list payload plus its lines, the service it ships by, where it ships to and
+ * what the buyer asked the packers to know.
  *
- * `shippingOption` is `null` for an order whose chosen service was not recorded.
+ * `shippingOption` is `null` for an order whose chosen service was not
+ * recorded. `notes` is `null` when the buyer left the delivery notes empty, and
+ * for an order placed before the store recorded them; `shippingAddress` reads
+ * back with empty fields for the same reason, which says the store does not
+ * know where that order went rather than inventing a destination for it.
  */
 export interface OrderDetail extends OrderSummary {
   lines: OrderLine[];
   shippingOption: ShippingOption | null;
   contact: CustomerContact;
   shippingAddress: ShippingAddress;
+  notes: string | null;
 }
 
 /**
@@ -587,13 +593,22 @@ export interface ShippingOption {
  *
  * `id` names the quote the store recorded for the service it offered, so a
  * checkout can put the order it places on the very quote its customer chose
- * rather than on whichever quote was taken most recently. It is `null` only
- * when nothing was on offer and there was therefore no rate to record.
+ * rather than on whichever quote was taken most recently. It is `null` for a
+ * quote the store did not record, which is either of two cases: nothing was on
+ * offer, so there was no rate to record, or the quote was taken for a
+ * destination rather than for a cart - the checkout form's own lookup, which is
+ * a question asked and answered and not a commitment either side keeps.
+ *
+ * The destination is echoed as both of its halves, because a rate means nothing
+ * without them: `44301` is one place in the United States and another in
+ * Mexico, and the two are quoted differently. A caller comparing what it asked
+ * for with what it was answered therefore compares the pair.
  */
 export interface ShippingQuoteResult {
   id: string | null;
   options: ShippingOption[];
   destinationPostalCode: string;
+  destinationCountry: string;
   quotedAt: string;
 }
 

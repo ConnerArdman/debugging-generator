@@ -94,15 +94,43 @@ export class StorefrontApiError extends Error {
    */
   readonly reported: boolean;
 
+  /**
+   * Whether the request provably left this browser.
+   *
+   * `reported` says whether the reason is the server's own; this says whether
+   * the server was ever addressed, and the two are independent questions about
+   * the same failure. `fetch` rejects for a request that never went out - the
+   * machine is offline, so nothing was sent and nothing can have been carried
+   * out - and it rejects for a request that went out and whose connection was
+   * then lost, where the server may well have carried it out and only the reply
+   * was lost. Both arrive here as `NETWORK_FAILURE` with no reason from the
+   * server, which is why a caller placing an order cannot distinguish them from
+   * `code` and `reported` alone.
+   *
+   * `false` is therefore a statement and not a guess: it is set only where the
+   * browser itself says it had no connection at the moment the request failed,
+   * which is the one case in which "nothing was sent" is a fact. Every other
+   * failure - including every reply the server did send - leaves this `true`,
+   * so a caller that reads it is told "this never went out" only when that is
+   * established, and is left with the cautious answer otherwise.
+   */
+  readonly dispatched: boolean;
+
   constructor(
     message: string,
-    options: { status: number; code: StorefrontErrorCode; reported?: boolean },
+    options: {
+      status: number;
+      code: StorefrontErrorCode;
+      reported?: boolean;
+      dispatched?: boolean;
+    },
   ) {
     super(message);
     this.name = 'StorefrontApiError';
     this.status = options.status;
     this.code = options.code;
     this.reported = options.reported ?? false;
+    this.dispatched = options.dispatched ?? true;
   }
 }
 
@@ -239,9 +267,19 @@ export async function storefrontRequest<T>(
     // A caller that has stopped waiting gets its own abort reason back, before
     // anything decides this was a connection the customer should hear about.
     signal?.throwIfAborted();
+    // Whether this request ever went out, asked of the browser at the moment it
+    // failed rather than inferred afterwards. A machine that reports itself
+    // offline sent nothing, which is the one case a caller may treat as "the
+    // store never heard this"; a connection lost after the bytes left looks
+    // identical from here, reports itself online, and is left as dispatched -
+    // see `StorefrontApiError.dispatched`. `navigator` is read defensively
+    // because this module also runs during a server render, where there is
+    // none, and an absent navigator establishes nothing either way.
+    const offline = typeof navigator !== 'undefined' && navigator.onLine === false;
+
     throw new StorefrontApiError(
       'Lumen Supply could not be reached. Check your connection and try again.',
-      { status: 0, code: 'NETWORK_FAILURE' },
+      { status: 0, code: 'NETWORK_FAILURE', dispatched: !offline },
     );
   }
 
@@ -503,15 +541,35 @@ export function clearCartContents(): Promise<CartView> {
 /**
  * Turns the cart into an order and pays for it; `POST /api/checkout`.
  *
- * `draft.idempotencyKey` is what makes sending this twice safe: the endpoint
- * answers a submission whose name it has already seen with the order that
- * attempt placed - `result.outcome` says which of the two it is - so a caller
- * whose reply was lost resolves the attempt by sending the same draft again
- * rather than by deciding for itself whether an order exists. A caller that
- * mints a new name is asking for a new order.
+ * `input.draft.idempotencyKey` is what makes sending this twice safe: the
+ * endpoint answers a submission whose name it has already seen with the order
+ * that attempt placed - `result.outcome` says which of the two it is - so a
+ * caller whose reply was lost resolves the attempt by sending the same draft
+ * again rather than by deciding for itself whether an order exists. A caller
+ * that mints a new name is asking for a new order.
+ *
+ * `input.signal` is the caller's, on the same terms as every other wrapper
+ * here - a component that goes away releases the connection rather than
+ * holding it open for nobody - but what an abort means is different for this
+ * endpoint than for a read, and a caller has to know it. Aborting stops this
+ * browser waiting for the reply. It does not stop the order: the route handler
+ * reads no signal and the work it has started - the stock reservation, the
+ * carrier, the payment - runs to completion, so an aborted submission may
+ * still have placed an order and taken a payment for it. A caller therefore
+ * treats its own abort as "the outcome of this attempt is unknown" and never
+ * as "no order exists", and resolves it later by sending the same
+ * `idempotencyKey` again, which the endpoint answers with the order it already
+ * holds.
  */
-export function submitCheckout(draft: CheckoutDraft): Promise<CheckoutResult> {
-  return storefrontRequest<CheckoutResult>('/api/checkout', { method: 'POST', body: draft });
+export function submitCheckout(input: {
+  draft: CheckoutDraft;
+  signal?: AbortSignal | undefined;
+}): Promise<CheckoutResult> {
+  return storefrontRequest<CheckoutResult>('/api/checkout', {
+    method: 'POST',
+    body: input.draft,
+    signal: input.signal,
+  });
 }
 
 /**
@@ -520,6 +578,20 @@ export function submitCheckout(draft: CheckoutDraft): Promise<CheckoutResult> {
  * `input.signal` is the caller's, and rejecting with its abort reason is how
  * this call reports having been cut short - a lookup for a destination the
  * customer has since corrected costs nothing after that point.
+ *
+ * `input.country` is the other half of the destination, and it changes the
+ * answer: freight is rated to a place, and a postal code names a place only
+ * within a country - the same five digits are one town in the United States and
+ * another in Mexico, at different distances from this catalog's warehouses. A
+ * caller quoting a buyer's address therefore sends the country that buyer
+ * chose, because that is the destination `POST /api/checkout` will rate the
+ * order's freight to, and a quote taken for a different country is a rate the
+ * order would not be charged. Omitting it quotes the store's own country, which
+ * is what a caller naming a domestic postal code alone is asking about. The
+ * endpoint also pairs the two: a postal code that is not a complete one for the
+ * country sent with it is answered 400 rather than rated, so a caller checks
+ * the destination before it asks - `useFreightQuote` in `@/hooks/useShippingEta`
+ * does exactly that, against the one rule `@/lib/destination` publishes.
  *
  * `input.itemCount` is how many units the shipment is made of, and naming it
  * matters to what comes back: the freight a service charges is a function of
@@ -541,14 +613,19 @@ export function submitCheckout(draft: CheckoutDraft): Promise<CheckoutResult> {
  */
 export function requestShippingQuote(input: {
   postalCode: string;
+  country?: string | undefined;
   itemCount?: number | undefined;
   signal?: AbortSignal | undefined;
 }): Promise<ShippingQuoteResult> {
   return storefrontRequest<ShippingQuoteResult>('/api/shipping/quote', {
-    // `storefrontQueryString` drops an absent `itemCount` rather than sending
-    // an empty parameter, so a caller with no shipment to describe addresses
-    // exactly the URL it addressed before this parameter existed.
-    query: { postalCode: input.postalCode, itemCount: input.itemCount },
+    // `storefrontQueryString` drops an absent `itemCount` or `country` rather
+    // than sending an empty parameter, so a caller with no shipment to describe
+    // addresses exactly the URL it addressed before those parameters existed.
+    query: {
+      postalCode: input.postalCode,
+      country: input.country,
+      itemCount: input.itemCount,
+    },
     signal: input.signal,
   });
 }

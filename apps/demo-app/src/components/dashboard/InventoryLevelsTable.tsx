@@ -20,7 +20,15 @@
  * which buys middle-click, Ctrl/Cmd-click, hover preview, "Copy link address" and a link announced
  * as a link - none of which a click handler could give back. Every other parameter the reader
  * arrived with is carried across untouched, so a location filter survives a page change without
- * this file knowing that the filter exists.
+ * this file knowing that the filter exists. Both links carry `scroll={false}`: this table is the
+ * bottom of a very long page, and a page turn that scrolled the document back to the top would
+ * leave the reader four viewports away from the pager they had just used.
+ *
+ * The one thing a server component cannot do here is measure itself, and the scrollport needs
+ * measuring: it has to say when the table is wider than the space the page gave it, and it has to
+ * answer Home and End with its own scroll rather than the document's. That box is therefore
+ * `./Scroller`, a small client leaf this file wraps the table in. The rows still render on the
+ * server and pass through it as `children`, so nothing about the table itself moves to the browser.
  *
  * WHAT IT READS, AND WHAT IT CANNOT KNOW
  * `InventoryLevelRow` names its product by identifier only. The optional `products` prop is how a
@@ -40,8 +48,13 @@
  * WHAT BELONGS TO SOMEONE ELSE
  *   - Surface: `ui/Card` owns background, border, radius, elevation and padding. This module's
  *     `.root` is geometry only and is handed to its `className`.
+ *   - The scrollport: `./Scroller` owns the focusable, named region the table scrolls inside, its
+ *     edge fades, its hint and its Home/End keys. This file hands it the caption to be named by,
+ *     the sentence to show, and the radius that matches the card.
  *   - Status colour: `ui/Badge` paints the selling state, and always with the words
- *     `formatStockLabel` produces, so the state never rests on colour alone.
+ *     `formatStockLabel` produces, so the state never rests on colour alone. The figures' own
+ *     `data-figure` states - a muted zero, a negative quantity in the danger tone - are this
+ *     file's, and both are still said in the text of the figure itself.
  *   - Money: `ui/Price` formats every `...Cents` figure. Nothing here divides by a hundred.
  *   - Category artwork: `ui/CategoryGlyph` holds the only copy of the "not every category has a
  *     drawing" rule and answers `null` when there is no asset, so no broken image can reach a
@@ -82,6 +95,7 @@ import {
 import type { InventoryLevelRow, PagedList, ProductSummary, StockState } from '@/lib/types';
 
 import styles from './InventoryLevelsTable.module.css';
+import { Scroller } from './Scroller';
 
 /* ---------------------------------------------------------------------------
  * Constants
@@ -120,6 +134,19 @@ const DEFAULT_PLACEHOLDER_ROWS = 8;
  */
 const CAPTION_ID = 'inventory-levels-caption';
 const PLACEHOLDER_CAPTION_ID = 'inventory-levels-placeholder-caption';
+
+/**
+ * What the scrollport says when the table is wider than the space the page gives it.
+ *
+ * Seven columns fit the measure a dashboard-width page offers, so this sentence is shown only
+ * where they genuinely cannot - a phone, a split window, a reader at a large text size. `Scroller`
+ * decides that by measuring, not by guessing at a breakpoint, and hides the line entirely when
+ * there is nothing to scroll; it also names the keys, because the region takes focus and a reader
+ * who cannot see the edge fade has no other way to learn that.
+ */
+const SCROLL_HINT =
+  'This table is wider than the space available: scroll it sideways for the remaining columns, ' +
+  'or give it focus and use the arrow, Home and End keys.';
 
 /** Introduces the rows whose product the page's catalog listing does not name. */
 const UNGROUPED_LABEL = 'Other products';
@@ -251,6 +278,34 @@ function stockStateFor(available: number, reorderPoint: number, threshold: numbe
     Math.max(0, Math.trunc(finiteOr(threshold, 0)));
 
   return available <= point ? 'LOW_STOCK' : 'IN_STOCK';
+}
+
+/**
+ * Which data state a quantity is in, spelled as the value `InventoryLevelsTable.module.css` reads
+ * through its `data-figure` selectors - and `undefined` for an ordinary figure, so the common case
+ * carries no attribute at all and the cell keeps the column's own ink.
+ *
+ * Zero is a state because it is a different statement from a quantity, and at the same ink it reads
+ * as neither: a reader scanning the Reserved column cannot see which lines have nothing promised,
+ * and an empty result set looks exactly like a healthy one. Below zero is a state because a
+ * location that has promised more than it holds is a figure to act on today. Both are still said
+ * in text - the digit and the minus sign - and the Stock column states the selling state in words,
+ * so nothing here is carried by colour alone.
+ *
+ * A figure that is not a number returns `undefined` rather than a state of its own: the caller
+ * prints `@/lib/format`'s placeholder for it, and a placeholder tinted as "zero" would assert a
+ * quantity the row does not have.
+ */
+function figure(value: number): 'zero' | 'negative' | undefined {
+  if (!Number.isFinite(value)) {
+    return undefined;
+  }
+
+  if (value === 0) {
+    return 'zero';
+  }
+
+  return value < 0 ? 'negative' : undefined;
 }
 
 /**
@@ -486,12 +541,15 @@ export function InventoryLevelsTable({
   return (
     <Card className={clsx(styles.root, className)} head={heading}>
       {/*
-        The scrollport, and the whole responsive answer for seven columns: a narrow viewport scrolls
-        the table inside this box rather than widening the page. It is focusable and named because a
-        scrollable region a keyboard cannot reach is an accessibility defect, and the caption it
+        The scrollport, and the whole responsive answer for seven columns: a viewport too narrow for
+        them scrolls the table inside this box rather than widening the page. `Scroller` is what
+        makes that honest - it is focusable and named, because a scrollable region a keyboard cannot
+        reach is an accessibility defect; it fades the edge the content continues past and shows the
+        sentence above, because an overlay scrollbar is no indication at rest; and it answers Home
+        and End with the region's own scroll instead of letting the document jump. The caption it
         points at is the name a reader of the surrounding page already has.
       */}
-      <div className={styles.scroller} role="region" aria-labelledby={CAPTION_ID} tabIndex={0}>
+      <Scroller labelledBy={CAPTION_ID} hint={SCROLL_HINT} className={styles.scroller}>
         <table className={styles.table}>
           <caption
             className={styles.caption}
@@ -578,15 +636,31 @@ export function InventoryLevelsTable({
                       )}
                     </td>
 
-                    <td className={clsx(styles.cell, styles.numericCell)}>
+                    {/*
+                      The three quantity columns carry their data state as `data-figure`, so a
+                      line with nothing on the shelf, nothing promised or nothing left to promise
+                      is visibly not a line holding three thousand units. The money column beside
+                      them does not: a unit price is a property of the product rather than a
+                      position to act on, and `ui/Price` owns how it is printed.
+                    */}
+                    <td
+                      className={clsx(styles.cell, styles.numericCell)}
+                      data-figure={figure(line.row.onHand)}
+                    >
                       {formatQuantityLabel(line.row.onHand)}
                     </td>
 
-                    <td className={clsx(styles.cell, styles.numericCell)}>
+                    <td
+                      className={clsx(styles.cell, styles.numericCell)}
+                      data-figure={figure(line.row.reserved)}
+                    >
                       {formatQuantityLabel(line.row.reserved)}
                     </td>
 
-                    <td className={clsx(styles.cell, styles.numericCell)}>
+                    <td
+                      className={clsx(styles.cell, styles.numericCell)}
+                      data-figure={figure(available)}
+                    >
                       {formatQuantityLabel(available)}
                     </td>
 
@@ -609,7 +683,7 @@ export function InventoryLevelsTable({
             })}
           </tbody>
         </table>
-      </div>
+      </Scroller>
 
       {/*
         The pager. It is a `<nav>` only when there is somewhere to go: a one-page listing still says
@@ -617,6 +691,13 @@ export function InventoryLevelsTable({
         direct children of the row, which is how the stylesheet groups them, and the two directions
         the current page leaves nowhere to go are inert `<span>`s - rendered rather than omitted, so
         the row keeps its shape as the reader moves through the pages.
+
+        Both links carry `scroll={false}`. A page change swaps the rows of a table that sits at the
+        bottom of a five-thousand-pixel page, and Next.js's default would scroll the document back
+        to the top: the reader would be thrown four viewports away from the control they had just
+        clicked, and would have to scroll all the way back to turn another page (measured in
+        Chrome: scroll position 4,139 to 195). Staying put is also what the filter row above this
+        table already does with its own navigations, so one component no longer behaves two ways.
       */}
       {lastPage > 1 ? (
         <nav className={styles.pager} aria-label="Inventory levels pages">
@@ -627,6 +708,7 @@ export function InventoryLevelsTable({
               className={styles.pagerLink}
               href={hrefForPage(basePath, carried, page - 1)}
               rel="prev"
+              scroll={false}
             >
               Previous
               <VisuallyHidden>{' page'}</VisuallyHidden>
@@ -647,6 +729,7 @@ export function InventoryLevelsTable({
               className={styles.pagerLink}
               href={hrefForPage(basePath, carried, page + 1)}
               rel="next"
+              scroll={false}
             >
               Next
               <VisuallyHidden>{' page'}</VisuallyHidden>
@@ -713,12 +796,7 @@ export function InventoryLevelsTablePlaceholder({
 
   return (
     <Card className={clsx(styles.root, className)} head={heading}>
-      <div
-        className={styles.scroller}
-        role="region"
-        aria-labelledby={PLACEHOLDER_CAPTION_ID}
-        tabIndex={0}
-      >
+      <Scroller labelledBy={PLACEHOLDER_CAPTION_ID} hint={SCROLL_HINT} className={styles.scroller}>
         <table className={styles.table}>
           <caption
             className={styles.caption}
@@ -772,7 +850,7 @@ export function InventoryLevelsTablePlaceholder({
             ))}
           </tbody>
         </table>
-      </div>
+      </Scroller>
     </Card>
   );
 }

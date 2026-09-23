@@ -47,6 +47,44 @@ const sorts: readonly [CatalogSort, ...CatalogSort[]] = [
 ];
 
 /**
+ * Normalises a parameter that says nothing onto `undefined`, so that the
+ * field's own default - or its absence - takes over.
+ *
+ * Three inputs mean "nothing was said" about a catalog parameter, and
+ * collapsing them in one place is what gives this module a single empty-value
+ * policy rather than one per field: a parameter the caller never sent (already
+ * `undefined`), one read with `URLSearchParams.get()` and found absent, which
+ * answers `null` rather than `undefined`, and one carrying nothing but
+ * whitespace - which is exactly what a GET form submitted with an untouched
+ * control, or a filter UI that emits every key it knows, puts on the query
+ * string. Everything else is passed through untouched for the field's own
+ * schema to judge, which is why the parameter is `unknown`: this step decides
+ * whether a value is worth judging, never what it means.
+ *
+ * It is the same helper, with the same reasoning, that
+ * `@/server/validation/cart` and `@/server/validation/inventory` apply to their
+ * own parameters. It is duplicated rather than shared because these modules are
+ * deliberately inert and import nothing of each other: a six-line
+ * normalisation is a cheaper thing to keep in step than an import edge between
+ * three validation modules would be.
+ *
+ * @param value Whatever the caller supplied for the field.
+ * @returns `undefined` when the value says nothing, and `value` itself
+ * otherwise.
+ */
+function unset(value: unknown): unknown {
+  if (value === null) {
+    return undefined;
+  }
+
+  if (typeof value === 'string' && value.trim().length === 0) {
+    return undefined;
+  }
+
+  return value;
+}
+
+/**
  * The highest code point counted as a control character, and the delete
  * character that sits above the printable range.
  *
@@ -128,6 +166,18 @@ type Fields = {
  * filter is an absent key rather than a value meaning "everything", exactly the
  * distinction `CatalogQuery` draws.
  *
+ * Every field - the filters included - is wrapped in {@link unset}, so one
+ * empty-value policy covers the whole query: a parameter sent blank says
+ * nothing, and a parameter that says nothing resolves to the field's default or
+ * to absence rather than being rejected. That matters because a blank value is
+ * not a caller's mistake but the ordinary output of the surfaces that build
+ * these addresses - a search box submitted empty, a filter row that emits every
+ * key it knows, a copied link whose value was truncated away - and because a
+ * caller reading `?sort=` as a failure while `?search=` succeeded would be
+ * meeting two policies on one endpoint. A value that says something is still
+ * held to every bound below: `?sort=bogus`, `?page=0` and `?pageSize=97` are
+ * rejected, and the rejection names the field.
+ *
  * `satisfies Fields` is a compile-time check and nothing more — it narrows no
  * type, emits no code and is not an assertion — so `CatalogQueryInput` below is
  * still inferred from the schema itself and keeps what parsing guarantees:
@@ -142,32 +192,43 @@ export const catalogQuerySchema = z.object({
   // produces and no parameter can be sent as; the check sits after the length
   // bounds and before `optional()`, so an unconstrained filter is still an
   // absent key.
-  categorySlug: z
-    .string()
-    .trim()
-    .min(1)
-    .max(64)
-    .refine(printable, 'A category slug contains no control characters.')
-    .optional(),
-  // A free-text term matched against product names and SKUs. A blank term is
-  // accepted and narrows nothing, so a search box submitted empty is not an
-  // error the customer has to read - and a term made only of printable
-  // characters is the whole of what a search box can produce, so one carrying a
-  // control character is refused rather than matched against nothing.
-  search: z
-    .string()
-    .trim()
-    .max(80)
-    .refine(printable, 'A search term contains no control characters.')
-    .optional(),
-  sort: z.enum(sorts).default('featured'),
+  categorySlug: z.preprocess(
+    unset,
+    z
+      .string()
+      .trim()
+      .min(1)
+      .max(64)
+      .refine(printable, 'A category slug contains no control characters.')
+      .optional(),
+  ),
+  // A free-text term matched against product names and SKUs. A blank term
+  // narrows nothing, so a search box submitted empty is not an error the
+  // customer has to read: `unset` turns it into an absent filter, which is the
+  // same unfiltered listing the field's own lower bound used to allow as an
+  // empty string. A term made only of printable characters is the whole of what
+  // a search box can produce, so one carrying a control character is refused
+  // rather than matched against nothing.
+  search: z.preprocess(
+    unset,
+    z
+      .string()
+      .trim()
+      .max(80)
+      .refine(printable, 'A search term contains no control characters.')
+      .optional(),
+  ),
+  sort: z.preprocess(unset, z.enum(sorts).default('featured')),
   // 1-based, like `PagedList.page`. The ceiling sits far beyond the catalog's
   // size and exists so that an absurd page number is refused before it becomes
-  // an offset the database has to count through.
-  page: z.coerce.number().int().min(1).max(10_000).default(1),
+  // an offset the database has to count through. `unset` runs before the
+  // coercion, which is what makes a blank parameter resolve to the default:
+  // `Number('')` is `0`, so an empty value reaching the coercion would be
+  // refused by the lower bound as a page number nobody asked for.
+  page: z.preprocess(unset, z.coerce.number().int().min(1).max(10_000).default(1)),
   // A full page of catalog cards. The maximum is the largest page the grid is
   // laid out for; a caller who wants more asks for the next page.
-  pageSize: z.coerce.number().int().min(1).max(96).default(48),
+  pageSize: z.preprocess(unset, z.coerce.number().int().min(1).max(96).default(48)),
 } satisfies Fields);
 
 /**
@@ -182,6 +243,185 @@ export const catalogQuerySchema = z.object({
  * it holds a value, instead of handing this value over whole.
  */
 export type CatalogQueryInput = z.infer<typeof catalogQuerySchema>;
+
+/**
+ * One of the catalog's query parameters, named by its own schema field.
+ *
+ * It is `keyof CatalogQuery` rather than a union written out here, so the
+ * vocabulary a rejection is reported in cannot drift from the vocabulary the
+ * query string, the schema and the service already share. A consumer that
+ * turns a rejected parameter into words for a reader therefore declares its
+ * wording against this type and is told by the compiler when a parameter is
+ * added, renamed or removed.
+ */
+export type CatalogQueryParameter = keyof CatalogQuery;
+
+/**
+ * Where each parameter sits in the order a rejection is reported in.
+ *
+ * The order is this module's own declaration order - the two filters, then the
+ * ordering, then the page window - and it exists so that what a reader is told
+ * is a function of the address rather than of the order Zod happened to collect
+ * its issues in. Two addresses that fail the same way therefore produce the same
+ * sentence, whichever parameter tripped first.
+ *
+ * `Record<CatalogQueryParameter, number>` is the compile check that keeps this
+ * map honest in both directions: every parameter has to appear, so a field
+ * added to the schema cannot be silently unreportable, and a name no parameter
+ * carries cannot be added. That is stronger than an ordered tuple of names,
+ * which catches the invented name but not the forgotten one.
+ */
+const order: Record<CatalogQueryParameter, number> = {
+  categorySlug: 1,
+  search: 2,
+  sort: 3,
+  page: 4,
+  pageSize: 5,
+};
+
+/**
+ * Whether `name` is one of the catalog's parameters.
+ *
+ * The test is membership of {@link order}, which `Record<CatalogQueryParameter,
+ * …>` holds to exactly the fields `catalogQuerySchema` declares, so the guard
+ * cannot claim a name the schema does not know or miss one it does.
+ *
+ * @param name The first segment of a Zod issue's path, or a key off the raw
+ * query string.
+ * @returns `true` when the name is a parameter this module declares.
+ */
+function parameter(name: string): name is CatalogQueryParameter {
+  return Object.hasOwn(order, name);
+}
+
+/**
+ * The parameter names in `names`, deduplicated and in reporting order.
+ *
+ * A name no parameter carries is dropped rather than reported: the only names
+ * that reach here come from this schema's own issues and from the query string,
+ * and a caller who appended an analytics parameter is not owed a sentence about
+ * a filter this catalog does not have.
+ *
+ * @param names Candidate parameter names, in any order and with repeats.
+ * @returns The declared parameters among them, each once, ordered by
+ * {@link order}.
+ */
+function reported(names: Iterable<string>): CatalogQueryParameter[] {
+  const declared = new Set<CatalogQueryParameter>();
+
+  for (const name of names) {
+    if (parameter(name)) {
+      declared.add(name);
+    }
+  }
+
+  return [...declared].sort((left, right) => order[left] - order[right]);
+}
+
+/**
+ * A recovered catalog query: the listing to read, and the parameters that could
+ * not be applied to it.
+ *
+ * The two travel together because neither is complete on its own. A query
+ * without the rejections is what the catalog page used to render - a listing
+ * nobody can tell has ignored half of its address - and a list of rejections
+ * without a query is a diagnostic rather than a page.
+ */
+export interface CatalogQueryResult {
+  /** The query to read the catalog with; complete, whatever the caller sent. */
+  readonly query: CatalogQueryInput;
+
+  /**
+   * The parameters the caller stated that could not be applied, in reporting
+   * order, and empty when the whole query was accepted. Each one fell back to
+   * its own declared default or to absence, so the query above is a listing
+   * that exists rather than the address as it was written.
+   */
+  readonly rejected: readonly CatalogQueryParameter[];
+}
+
+/**
+ * Parses a catalog query field by field, keeping every parameter that is valid
+ * and reporting the ones that are not.
+ *
+ * WHY THIS EXISTS BESIDE THE SCHEMA'S OWN PARSE
+ * `catalogQuerySchema` judges a query as one value: a single rejected field
+ * fails the whole object, which is exactly right for `GET /api/products`. A
+ * caller of an endpoint wants the 400 - it names the parameter it could not
+ * accept, and inventing a page for a request that was not made would hide a
+ * caller's bug behind a plausible answer. That is why the route handler keeps
+ * the throwing `catalogQuerySchema.parse(...)` and does not call this function.
+ *
+ * A page is the other case. A reader who followed a link that a mail client
+ * truncated, or that carried a parameter from an older version of this
+ * storefront, wants the catalog - so the valid parameters of that address are
+ * applied rather than discarded along with the invalid one, and the reader is
+ * told, in the page, which part of the address did not take effect. Both halves
+ * matter: recovering without reporting is how an address and a listing come to
+ * contradict each other silently.
+ *
+ * HOW IT RECOVERS
+ * Deterministically, and on top of the one schema rather than beside it, so no
+ * bound, default or refinement is restated here. The whole record is parsed
+ * first, which is the ordinary case and costs one parse. On failure, the first
+ * path segment of every issue names the field that failed; those keys are
+ * removed from the record and it is parsed again, so each failed parameter
+ * falls back to its own declared default or to absence while every other
+ * parameter the caller stated survives untouched.
+ *
+ * The second parse cannot normally fail - every field either defaults or is
+ * optional, and every field that objected has been removed - but the function
+ * is written to be total rather than to rely on that: should it fail, the query
+ * is the schema's own defaults and the report names every parameter the caller
+ * stated, which is the truth on that path, because a query of bare defaults
+ * applied none of them.
+ *
+ * @param raw The query string as a record of single values, exactly the shape
+ * {@link catalogQuerySchema} reads. Keys this module does not declare are
+ * carried in and dropped by the schema.
+ * @returns The query to read the catalog with, and the parameters that could
+ * not be applied.
+ */
+export function parseCatalogQuery(raw: Record<string, string>): CatalogQueryResult {
+  const requested = catalogQuerySchema.safeParse(raw);
+
+  if (requested.success) {
+    return { query: requested.data, rejected: [] };
+  }
+
+  const failed = new Set<string>();
+
+  for (const issue of requested.error.issues) {
+    const [first] = issue.path;
+
+    // A field's issue carries that field's name as its first path segment. The
+    // type check is what keeps the set of names a set of names: a path may hold
+    // an index or a symbol for nested shapes, and this schema's fields are flat
+    // strings.
+    if (typeof first === 'string') {
+      failed.add(first);
+    }
+  }
+
+  const retained: Record<string, string> = {};
+
+  for (const [key, value] of Object.entries(raw)) {
+    if (!failed.has(key)) {
+      retained[key] = value;
+    }
+  }
+
+  const recovered = catalogQuerySchema.safeParse(retained);
+
+  if (recovered.success) {
+    return { query: recovered.data, rejected: reported(failed) };
+  }
+
+  return {
+    query: catalogQuerySchema.parse({}),
+    rejected: reported([...Object.keys(raw), ...failed]),
+  };
+}
 
 /**
  * The route parameters `GET /api/products/[slug]` accepts.

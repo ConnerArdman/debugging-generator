@@ -179,11 +179,22 @@ import type { RouteMap } from './route-map.js';
  * one instead.
  *
  * Typed `string` rather than left to infer its literal type, deliberately: a
- * consumer that narrowed against `'indexer/1.0.0'` would break on the very
- * bump this constant exists to make cheap, and nothing downstream should
- * compare an index's version against anything but this value.
+ * consumer that narrowed against whatever literal this happens to hold would
+ * break on the very bump the constant exists to make cheap, and nothing
+ * downstream should compare an index's version against anything but this
+ * value.
+ *
+ * History, so the obligation above is visible as having been met rather than
+ * merely stated: `indexer/1.1.0` is the bump for `./extractors/symbols.ts`
+ * recording named function-valued declarations *nested* inside another
+ * declaration (with their enclosing chain) and for `./extractors/event-handlers.ts`
+ * no longer recording a `symbol` on a handler whose reference resolves to a
+ * parameter or a destructured binding. Both change the answer over unchanged
+ * source, so every index written by `indexer/1.0.0` has to become unreachable —
+ * without the bump, a cached index would answer "this file declares no such
+ * symbol" for a declaration the patcher can now wrap.
  */
-export const INDEXER_VERSION: string = 'indexer/1.0.0';
+export const INDEXER_VERSION: string = 'indexer/1.1.0';
 
 /**
  * The extractors an index is built from, in the fixed order they run in.

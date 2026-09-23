@@ -26,23 +26,33 @@
  *      cart belongs to the browser's session and the server resolves it from the storefront's own
  *      cookie, which `credentials: 'same-origin'` in `@/lib/api-client` is what sends.
  *
- *   3. THE SUBMIT PATH IS AS THIN AS A SUBMIT PATH CAN BE. `submitOrder` validates once,
- *      awaits one call to `submitCheckout`, and stores what came back. It holds no timer, no
- *      retry, no second request and no measurement of its own: the request's duration is the
- *      server's to explain, and a client-side stopwatch would only describe the wait it cannot
- *      shorten. A failure keeps every value the buyer typed, so placing the order again is one
- *      click rather than a re-typed form.
+ *   3. THE SUBMIT PATH IS AS THIN AS A SUBMIT PATH CAN BE, AND WHAT IT ADDS IS ALL ABOUT THE
+ *      ORDER OUTLIVING THIS COMPONENT. `submitOrder` validates once, awaits one call to
+ *      `submitCheckout`, and stores what came back. It holds no timer, no retry, no second request
+ *      and no measurement of its own: the request's duration is the server's to explain, and a
+ *      client-side stopwatch would only describe the wait it cannot shorten. A failure keeps every
+ *      value the buyer typed, so placing the order again is one click rather than a re-typed form.
+ *      Three things ride alongside that single request, and each is there because this component
+ *      cannot promise to be here when the reply arrives: the request carries an `AbortSignal` this
+ *      form aborts when it unmounts, the attempt is written to session storage before it goes out
+ *      and replaced with the order's reference when it lands, and a placed order is given an
+ *      address of its own with `history.pushState`. `POST /api/checkout` stops for none of it - a
+ *      buyer who navigates away is still charged - so an abandoned attempt is treated as an
+ *      outcome nobody established rather than as a cancelled order.
  *
  *   4. THE FORM SAYS WHAT IT KNOWS AND NOT WHAT IT WOULD PREFER. Two of the things a buyer
  *      reads here are statements about their money, and neither may be guessed. A failure is
  *      described as "nothing was charged" only where the store said which reason applied and
- *      that reason means nothing was captured; a reason the store did not author - a reply that
- *      never arrived, one this page could not read, a status this page read a meaning into -
- *      leaves the order unconfirmed, and what the buyer is offered then is to check the order
- *      rather than to place it again. That check is the same submission with the same attempt
- *      name, which the endpoint answers with the order it already holds instead of a second one,
- *      so the safe action and the retry are one control. And the cart: a cart that could not be
- *      read is not an empty cart, so its totals are withheld rather than printed as zero.
+ *      that reason means nothing was captured, or where the browser itself established that the
+ *      request never left it - a submission made with no connection, which is the one unreported
+ *      failure whose effect on the order is a fact. Every other reason the store did not author -
+ *      a reply that could not be read, a status this page read a meaning into, a connection lost
+ *      after the request went out - leaves the order unconfirmed, and what the buyer is offered
+ *      then is to check the order rather than to place it again. That check is the same submission
+ *      with the same attempt name, which the endpoint answers with the order it already holds
+ *      instead of a second one, so the safe action and the retry are one control. And the cart: a
+ *      cart that could not be read is not an empty cart, so its totals are withheld rather than
+ *      printed as zero.
  *
  *   5. THE CHOSEN FREIGHT CHARGE IS OWNED HERE AND PUBLISHED FROM HERE. The buyer chooses a
  *      service in the group below, and the review column beside this form has to quote what that
@@ -53,44 +63,80 @@
  *      deliberate. The lookup names the shipment as well as the address - `cart.itemCount`, the
  *      same unit count `POST /api/checkout` rates the order's freight against - because freight is
  *      charged per piece and a lookup that named only the postal code would be answered for one
- *      unit. The published amount comes from that quote and never from the list rates this form
- *      was handed, so the review column either states the figure the order will be charged or
- *      states that the charge is not established yet. And there is still exactly one
- *      `GET /api/shipping/quote` per shipment, because the panel asks for nothing once the lookup
- *      is handed to it.
+ *      unit - and it names the country as well as the code, because the same code is a different
+ *      place in each country the store serves. The published amount comes from that quote and from
+ *      nowhere else, so the review column either states the figure the order will be charged or
+ *      states that the charge is not established yet; the transit time is published with it, so
+ *      the delivery estimate printed there is the chosen service's rather than a store-wide one.
+ *      And there is still exactly one `GET /api/shipping/quote` per destination, because the panel
+ *      asks for nothing once the lookup is handed to it and the lookup waits for the fields to
+ *      stand still before it asks.
  *
- *   6. THE LIVE QUOTE IS THE AUTHORITY ON WHAT MAY BE ORDERED, AND THE CART'S SIZE IS CHECKED
- *      BEFORE IT IS QUOTED. The services this form is handed are list rates for an unnamed
- *      destination; the quote is the store's answer for the destination and the shipment in the
- *      fields. So once a quote has settled, the service the order names is looked up in *it*: a
- *      service the quote omits, and every service of a quote that names none, is not something
- *      this order can be placed with, and the place-order control is unavailable until a quoted
- *      service is chosen. That is not this form second-guessing the endpoint - `POST /api/checkout`
- *      re-quotes and refuses an unoffered service outright - it is this form agreeing with it
- *      instead of showing a buyer a service that would be refused. The cart's size is the same
- *      kind of statement made earlier: freight is quoted per shipment and a shipment carries at
- *      most `MAX_SHIPMENT_UNITS` units, so a larger cart is named as the thing to change rather
- *      than sent to be refused twice - once by the quote and once by the order.
+ *   6. THE LIVE QUOTE IS THE ONLY AUTHORITY ON WHAT MAY BE ORDERED, AND THE CART'S SIZE AND THE
+ *      DESTINATION ARE CHECKED BEFORE IT IS ASKED FOR. A rate is a property of a destination, so
+ *      this form starts with no services at all and offers none until the store has quoted the
+ *      address in its fields: the service the order names is looked up in that quote, a service it
+ *      omits is not something this order can be placed with, and the place-order control is
+ *      unavailable until a quoted service is chosen. That is not this form second-guessing the
+ *      endpoint - `POST /api/checkout` re-quotes and refuses an unoffered service outright - it is
+ *      this form agreeing with it instead of showing a buyer a service that would be refused. Two
+ *      things are settled before a request is made at all, for the same reason: freight is quoted
+ *      per shipment and a shipment carries at most `MAX_SHIPMENT_UNITS` units, so a larger cart is
+ *      named as the thing to change rather than sent to be refused twice; and a destination is a
+ *      country and a complete postal code for it, judged by `@/lib/destination`, so a code
+ *      somebody is still typing is never rated - a rate taken on `443` prices a different place
+ *      from `44301`, and a buyer would be ordering at it.
+ *
+ *   7. VALIDATION IS DERIVED, SHOWN WHEN A FIELD IS FINISHED WITH, AND WHAT MAKES THE ORDER
+ *      PLACEABLE. What is wrong with a value is a fact about that value, so it is computed from the
+ *      fields on every render rather than stored when the order is submitted. Three things follow,
+ *      and each of them was a defect while it did not. A message cannot outlive the value it was
+ *      about, so a corrected field clears itself instead of standing accused until the next
+ *      submission. The pass runs whether or not the order can be submitted, so the form can say
+ *      what is missing in a state where the place-order control is unavailable - which is the state
+ *      an incomplete address puts it in, and therefore the one state the messages most needed to be
+ *      reachable in. And the control's availability *is* that pass: it is unavailable while the
+ *      request would be refused, for a missing city exactly as for an unquoted shipment, with the
+ *      line above it naming what is outstanding so an inert button is never the whole of the
+ *      answer. When a message is shown is the one part that is about the buyer rather than the
+ *      value: a field speaks once focus has left it, and a submission reveals all of them at once
+ *      and moves the reader to the first.
  *
  * Validation is a mirror of the server's bounds, not a second opinion about them: the lengths and
- * shapes below are the ones `checkoutBodySchema` enforces, so a value this form accepts is a value
- * that endpoint accepts, and the endpoint remains the authority on everything that depends on data
- * of the moment - whether the cart still holds anything, whether the stock is still there, whether
- * the chosen service is still offered.
+ * shapes below are the ones `checkoutBodySchema` enforces - the email check is literally the
+ * regular expression its `z.email()` applies, and the character class, the postal-code shape and
+ * the closed country list are the same rules stated again - so a value this form accepts is a value
+ * that endpoint accepts. No bound is spelled as a `maxLength` attribute, because that enforces a
+ * bound by silently discarding what was typed and leaves the message about it unreachable; each
+ * control takes the whole value, the pass reports it, and the counter beside the field warns before
+ * it happens. The endpoint remains the authority on everything that depends on data of the moment -
+ * whether the cart still holds anything, whether the stock is still there, whether the chosen
+ * service is still offered.
  */
 
 import clsx from 'clsx';
+import Link from 'next/link';
 
 import { useEffect, useRef, useState, type FormEvent, type ReactElement } from 'react';
+
+import { z } from 'zod';
 
 import { Alert } from '@/components/ui/Alert';
 import { Button } from '@/components/ui/Button';
 import { FormField } from '@/components/ui/FormField';
 import { Input } from '@/components/ui/Input';
 import { Select } from '@/components/ui/Select';
+import { Textarea } from '@/components/ui/Textarea';
 import { useCart } from '@/hooks/useCart';
 import { useFreightQuote, type FreightQuoteState } from '@/hooks/useShippingEta';
 import { StorefrontApiError, submitCheckout } from '@/lib/api-client';
+import {
+  DEFAULT_FREIGHT_DESTINATION_CODE,
+  FREIGHT_DESTINATIONS,
+  freightDestination,
+  freightDestinationProblem,
+  freightPostalCodeHint,
+} from '@/lib/destination';
 import { formatQuantityLabel } from '@/lib/format';
 import { MAX_SHIPMENT_UNITS } from '@/lib/types';
 import type {
@@ -103,7 +149,7 @@ import type {
 import { useToastCenter } from '@/providers/ToastProvider';
 
 import { CheckoutButton } from './CheckoutButton';
-import { usePublishSelectedFreight } from './CheckoutCharges';
+import { usePublishOrderPlaced, usePublishSelectedFreight } from './CheckoutCharges';
 import { OrderConfirmation } from './OrderConfirmation';
 import { ShippingOptionPicker } from './ShippingOptionPicker';
 
@@ -134,8 +180,21 @@ const DELIVERY_NOTES_ID = 'checkout-notes';
  *
  * Each of these is the bound `checkoutBodySchema` applies to the same field. They are stated here
  * as well so the form can say what is wrong beside the field rather than after a round trip, and
- * they are stated as constants so the `maxLength` attribute on a control and the message under it
- * can never disagree about the same number.
+ * they are stated as constants so the message under a field, the counter beside it and the bound
+ * they both describe can never disagree about the same number.
+ *
+ * None of them is spelled as a `maxLength` attribute on a control, deliberately. That attribute
+ * enforces a bound by discarding keystrokes: the value stops growing, nothing the application can
+ * observe happens - `validity.tooLong` stays `false`, because a value that cannot overflow is
+ * never too long - and the message written about the bound becomes unreachable. Worse, what is kept
+ * is a value the buyer never typed: 254 characters of a 312-character address is a string with no
+ * `@` in it. So each control takes the whole of what is typed, the pass below reports a value that
+ * is too long, and `FormField`'s counter shows the reader where they are before it gets there.
+ *
+ * The postal code has no minimum here, although the endpoint holds it to three characters. A code
+ * shorter than that is refused anyway - and refused by the destination rule below, which knows
+ * which country the code is for and can therefore say what a complete one looks like, where a
+ * bare minimum could only say the field was required about a value the buyer had plainly written.
  * ------------------------------------------------------------------------- */
 
 const MAX_NAME_LENGTH = 120;
@@ -144,30 +203,87 @@ const MAX_COMPANY_LENGTH = 120;
 const MAX_ADDRESS_LINE_LENGTH = 120;
 const MAX_CITY_LENGTH = 80;
 const MAX_REGION_LENGTH = 80;
-const MIN_POSTAL_CODE_LENGTH = 3;
 const MAX_POSTAL_CODE_LENGTH = 12;
 const MAX_NOTES_LENGTH = 500;
 
 /**
- * The coarsest useful test for an email address: something, one `@`, something, a dot, something.
+ * The heading of the cart notice when the cart itself published none.
  *
- * Deliberately not the server's check. `customerContactSchema` validates with Zod's own `email`
- * format, and re-implementing that here would produce a second, subtly different opinion about
- * which addresses exist - the failure mode where a form rejects an address the endpoint would have
- * accepted. This catches the typo a buyer can see and fix (a missing `@`, a missing domain) and
- * leaves the judgement to the endpoint.
+ * The cart publishes a heading beside its wording, naming the operation that failed, and that is
+ * what the notice is headed with; this covers the one state the notice is shown in without any -
+ * a first read that has not answered at all - and it says the same thing the cart's own read
+ * heading says, so the two readings never differ.
  */
-const EMAIL_SHAPE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const CART_UNREAD_TITLE = 'Your cart could not be read';
 
 /**
- * Alphanumeric groups joined by single spaces or hyphens, as a postal code is written in the
- * regions this store serves - and the shape `shippingAddressSchema` holds the same field to, so a
- * destination this form accepts is one the endpoint accepts and one the freight quote can rate.
+ * The test for an email address: Zod's own, which is the server's own.
+ *
+ * `customerContactSchema` validates this field with `z.email()`, and what that format check applies
+ * is exactly this regular expression - `z.regexes.email` is where the library keeps it. Naming it
+ * here is therefore not a second opinion about which addresses exist but the same one, which is the
+ * only arrangement in which a value this form accepts is a value that endpoint accepts. A pattern
+ * written by hand cannot make that claim however carefully it is written: a looser one admits
+ * addresses the endpoint refuses - `üñíçø∂é@exämple.com` passes "something, one `@`, something, a
+ * dot, something" and fails the format the store validates with - and a stricter one refuses
+ * addresses it would have taken.
+ *
+ * It carries no flags, so `.test` keeps no state between calls and this constant is safe to share
+ * across every validation pass.
  */
-const POSTAL_CODE_SHAPE = /^[A-Za-z0-9]+(?:[ -][A-Za-z0-9]+)*$/;
+const EMAIL_SHAPE = z.regexes.email;
 
-/** Two upper-case letters, the one canonical form the address DTO carries a country in. */
-const COUNTRY_CODE_SHAPE = /^[A-Z]{2}$/;
+/**
+ * What a complete destination looks like is not written here.
+ *
+ * It was, and as a single pattern of "alphanumeric groups joined by spaces or hyphens" - which
+ * accepts `443` as readily as `44301`, and accepts a Canadian code under a United States address.
+ * Neither is a destination: freight is rated to a place, a postal code names a place only within
+ * a country, and a rate taken on three characters of one prices somewhere else entirely. So the
+ * rule lives in `@/lib/destination`, where the browser, `GET /api/shipping/quote` and the shipping
+ * service all read the same judgement and the same wording - the field below shows the sentence
+ * that module returns, and the endpoint would answer with it too.
+ */
+
+/**
+ * The last code point below the printable range: the top of the C0 control block, `U+001F`.
+ *
+ * This constant and the two below it are the character class `checkoutBodySchema` holds every
+ * free-text field to, mirrored here for the same reason the lengths above are: a value this form
+ * accepts has to be a value that endpoint accepts. A control character occupies one character, so
+ * it fits inside every bound; it survives `trim()`, which removes whitespace and leaves `U+0000`
+ * exactly where it was; and it reaches the store as a value an order cannot be written with. A
+ * paste is how one arrives - a tab out of a spreadsheet, a line break out of a document - so the
+ * field a buyer pasted into is where it should be reported.
+ */
+const CONTROL = 0x1f;
+
+/** `DEL`, the one control character above the printable ASCII range. */
+const DEL = 0x7f;
+
+/** The line feed, `U+000A`: the one control character the delivery note carries. */
+const FEED = 0x0a;
+
+/** The wording every one-line free-text field uses when it holds a character it does not carry. */
+const TYPED =
+  'Use ordinary text characters here: tab, line break and other control characters are not accepted.';
+
+/** The same for the delivery note, the one field of this form a line break is ordinary text in. */
+const WRITTEN =
+  'Use ordinary text characters here: line breaks are fine, but tab and other control characters are not accepted.';
+
+/**
+ * The postal field's hint once freight has actually been quoted for the destination.
+ *
+ * This sentence is a statement about the store's answer, not about the value in the field, so it
+ * is shown only while a settled quote exists for that destination. It used to be the field's
+ * permanent hint, which meant a buyer correcting a code the store had just refused was reading an
+ * assurance that it had been priced.
+ */
+const QUOTED_DESTINATION_HINT = 'Freight is quoted for this destination.';
+
+/** The postal field's hint when the chosen country is not one the warehouses quote freight to. */
+const UNSERVED_DESTINATION_HINT = 'Choose a country the warehouses ship to.';
 
 /**
  * How many random bytes name one attempt to place an order.
@@ -178,22 +294,22 @@ const COUNTRY_CODE_SHAPE = /^[A-Z]{2}$/;
  */
 const ATTEMPT_BYTES = 16;
 
-/**
- * The destinations this catalog's warehouses quote freight for.
- *
- * A closed list rather than a text field, because the country is the one address field the
- * storefront reads itself: it picks the warehouses that can serve the order and it is sent as a
- * two-letter code. The values mirror the codes the address schema accepts; the labels are what the
- * dropdown shows.
+/*
+ * The destinations this catalog's warehouses quote freight for, and the one a form with no
+ * prefill starts on, are `FREIGHT_DESTINATIONS` and `DEFAULT_FREIGHT_DESTINATION_CODE` in
+ * `@/lib/destination`. The country control below is built from that list, because the country is
+ * not merely one more field of the address: it decides what a complete postal code is and it
+ * changes the rate, so the list of countries and the rule for their codes have to be one thing.
  */
-const DESTINATION_COUNTRIES: readonly { readonly code: string; readonly label: string }[] = [
-  { code: 'US', label: 'United States' },
-  { code: 'CA', label: 'Canada' },
-  { code: 'MX', label: 'Mexico' },
-];
 
-/** The country a form with no prefill starts on, matching the address schema's own default. */
-const DEFAULT_COUNTRY = 'US';
+/**
+ * How many lines of the delivery note are visible before it scrolls.
+ *
+ * Four: enough that the two or three instructions the hint asks for are all on screen at once,
+ * and short enough that the note does not push the place-order control off the page on a phone.
+ * The field can be dragged taller, and what is typed is never limited by what is visible.
+ */
+const NOTES_ROWS = 4;
 
 /* ---------------------------------------------------------------------------
  * Local shapes
@@ -247,6 +363,40 @@ type CheckoutFieldKey =
 type CheckoutFieldErrors = Partial<Record<CheckoutFieldKey, string>>;
 
 /**
+ * Every field of this form once, in the order it is read on screen: which key a message about it
+ * lands under, which control holds it, and what its label calls it.
+ *
+ * Three things need exactly this and would otherwise each invent their own version of it. The line
+ * beside the place-order control names what is still outstanding, and it has to name fields the way
+ * the labels above them do - "State or region", not `region`. A submission that cannot proceed
+ * moves the reader to the first field with something wrong, and "first" means first on screen
+ * rather than first in an object's key order. And both of them have to cover every field: a key
+ * this table omits would be a problem nobody is told about and a field nobody is sent to.
+ *
+ * `id` is absent for exactly one entry. The shipping service is a group of radios drawn by
+ * `./ShippingOptionPicker`, which mints their ids from the services the store quoted, so this form
+ * has no id of its own to move focus to - the group's own message is what speaks for it, and the
+ * entry is here for its label and its ordering.
+ */
+const FIELDS: readonly {
+  readonly key: CheckoutFieldKey;
+  readonly id?: string;
+  readonly label: string;
+}[] = [
+  { key: 'name', id: CONTACT_NAME_ID, label: 'Contact name' },
+  { key: 'company', id: CONTACT_COMPANY_ID, label: 'Company' },
+  { key: 'email', id: CONTACT_EMAIL_ID, label: 'Email' },
+  { key: 'line1', id: ADDRESS_LINE1_ID, label: 'Street address' },
+  { key: 'line2', id: ADDRESS_LINE2_ID, label: 'Suite, unit or floor' },
+  { key: 'city', id: ADDRESS_CITY_ID, label: 'City' },
+  { key: 'region', id: ADDRESS_REGION_ID, label: 'State or region' },
+  { key: 'postalCode', id: ADDRESS_POSTAL_CODE_ID, label: 'Postal code' },
+  { key: 'country', id: ADDRESS_COUNTRY_ID, label: 'Country' },
+  { key: 'shippingOptionId', label: 'Shipping method' },
+  { key: 'notes', id: DELIVERY_NOTES_ID, label: 'Notes for the warehouse' },
+];
+
+/**
  * Wording for a submission that failed, as the notice above the submit row prints it.
  *
  * Three fields, all written for a buyer: a headline they can scan, a sentence they can act on,
@@ -262,23 +412,33 @@ type CheckoutFieldErrors = Partial<Record<CheckoutFieldKey, string>>;
  * order twice.
  */
 interface OrderFailureCopy {
+  /**
+   * What this notice says about the order, as the rest of the form has to act on it rather than
+   * read it.
+   *
+   * The three values are the three things that can be true of a submission, and they are here
+   * because two decisions turn on them and neither can be made from the wording:
+   *
+   *   `connectivity`  Nothing was sent. The request never left this browser, so there is no order
+   *                   and no charge, and the notice describes the connection rather than the
+   *                   order. It is the one notice a recovered connection makes obsolete, which is
+   *                   what lets the effect below clear it - and only it - without hiding anything
+   *                   a buyer needs to know.
+   *   `unresolved`    The request left this browser and what became of it is not known here, so an
+   *                   order may exist and a payment may have been taken. Nothing clears this but
+   *                   resolving the attempt, and pressing the notice's control sends that same
+   *                   attempt rather than a new order.
+   *   `settled`       The store answered, and its answer was that no order was placed. Placing the
+   *                   order again is the thing to do, and the next submission supersedes the
+   *                   notice.
+   */
+  readonly kind: 'connectivity' | 'unresolved' | 'settled';
   readonly title: string;
   readonly body: string;
   readonly action: string;
 }
 
 interface Props {
-  /**
-   * The freight services on offer, in the order they should be read. Supplied by the checkout
-   * page, never fetched here, and `readonly` because this form only reads them: the picker refines
-   * their price and transit time against the destination on its own.
-   *
-   * The first option is what the form starts on, so a buyer who accepts the default service never
-   * has to touch the group. An empty list leaves nothing chosen, which the validation pass reports
-   * as a missing service rather than sending an order no carrier was named for.
-   */
-  shippingOptions: readonly ShippingOption[];
-
   /** Destination values to start the form on. Every field is optional and each one is prefilled independently. */
   initialAddress?: Partial<ShippingAddress>;
 
@@ -328,6 +488,82 @@ function trimmedOrNull(value: string): string | null {
 }
 
 /**
+ * Whether `value` is text a one-line field carries: no C0 control character and no `DEL`.
+ *
+ * The same rule `checkoutBodySchema` refines every one-line free-text field with, so this form
+ * reports a pasted tab beside the field it was pasted into rather than letting the round trip
+ * report it about the whole request. Only the control characters are refused: an accented letter,
+ * an ideograph and an emoji are all text a customer may legitimately type, and an allowlist of the
+ * letters a store expects would refuse customers rather than protect anything.
+ *
+ * Written as a code-point test rather than a pattern because a pattern for this class has to
+ * contain the very characters it excludes, which is neither readable nor something this
+ * repository's lint settings accept. The loop reads UTF-16 units, which is what makes it exact: a
+ * control character is always one unit, and a surrogate - half of an emoji - is numerically far
+ * above both bounds and therefore untouched.
+ *
+ * @param value The trimmed value a field holds.
+ */
+function plain(value: string): boolean {
+  for (let at = 0; at < value.length; at += 1) {
+    const code = value.charCodeAt(at);
+
+    if (code <= CONTROL || code === DEL) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+/**
+ * Whether `value` is text the delivery note carries: {@link plain}'s rule with the line feed
+ * allowed.
+ *
+ * The note is the one field of this form a buyer writes a paragraph into - dock hours on one line,
+ * a purchase-order reference on the next - so the break they typed is text here and everything
+ * else the class refuses is still refused. `checkoutBodySchema` parses the same field on the same
+ * terms, which is what makes a note this form accepts a note that endpoint accepts.
+ *
+ * @param value The trimmed value the note holds.
+ */
+function prose(value: string): boolean {
+  for (let at = 0; at < value.length; at += 1) {
+    const code = value.charCodeAt(at);
+
+    if (code !== FEED && (code <= CONTROL || code === DEL)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+/**
+ * `items` as a sentence fragment: `'Email'`, `'Email and Postal code'`, `'Email, City and Postal
+ * code'`.
+ *
+ * It exists for the one line that names what is still outstanding beside the place-order control,
+ * and it is written out rather than left as a `join(', ')` because that line is read by a buyer
+ * working out what to do next: a list that ends "City, Postal code" reads like a truncated string,
+ * and one that ends "City and Postal code" reads like a sentence.
+ *
+ * `at(-1)` rather than an index, so the empty case is a value this function can answer for instead
+ * of an access `noUncheckedIndexedAccess` makes it guess about.
+ */
+function listed(items: readonly string[]): string {
+  const last = items.at(-1);
+
+  if (last === undefined) {
+    return '';
+  }
+
+  const rest = items.slice(0, -1);
+
+  return rest.length === 0 ? last : `${rest.join(', ')} and ${last}`;
+}
+
+/**
  * A name for one attempt to place an order: {@link ATTEMPT_BYTES} random bytes in hexadecimal.
  *
  * It exists so that a submission and every retry of that submission arrive under one name, which
@@ -371,6 +607,25 @@ function checkoutDraftFrom(
   notes: string,
   key: string,
 ): CheckoutDraft {
+  return { ...entered(contact, address, shippingOptionId, notes), idempotencyKey: key };
+}
+
+/**
+ * The order the controls currently hold, as the draft carries it but without the attempt's name.
+ *
+ * It is the whole of {@link checkoutDraftFrom} except the one field that is not a value the buyer
+ * typed, and it is a function of its own because the two callers want different halves. The submit
+ * path wants a draft to send, which is this plus the name of the attempt it belongs to. Every
+ * render wants what the fields currently say, so it can be validated, counted and reported beside
+ * the controls - and it wants it without minting or reading an attempt name, because validating
+ * what is on screen is not an attempt to place an order.
+ */
+function entered(
+  contact: ContactFields,
+  address: AddressFields,
+  shippingOptionId: string | null,
+  notes: string,
+): Omit<CheckoutDraft, 'idempotencyKey'> {
   return {
     contact: {
       name: contact.name.trim(),
@@ -387,7 +642,6 @@ function checkoutDraftFrom(
     },
     shippingOptionId: shippingOptionId ?? '',
     notes: trimmedOrNull(notes),
-    idempotencyKey: key,
   };
 }
 
@@ -397,15 +651,21 @@ function checkoutDraftFrom(
  * One pass, and one message per field: the first thing wrong with a value is the thing to say
  * about it, because a field that reports a missing value and a too-long value at once is a field
  * nobody can act on. An empty object means the draft is worth sending, and it is the only thing
- * that lets the submit path continue.
+ * that lets the submit path continue - and, since the pass runs on every render, the only thing
+ * that makes the place-order control available.
  *
- * The bounds are the endpoint's own, restated as the constants above. Anything that depends on the
- * state of the store rather than on the shape of the request - whether the cart still holds what it
- * held, whether the stock is still there, whether the chosen service is still quoted - is
- * deliberately absent: those are decided by the checkout service against the data of the moment,
- * and a second opinion here would go stale the moment it was written.
+ * The bounds are the endpoint's own, restated as the constants above, and each field is judged in
+ * the order the endpoint judges it, so the message this form shows for a value is the message that
+ * value would have come back with. Anything that depends on the state of the store rather than on
+ * the shape of the request - whether the cart still holds what it held, whether the stock is still
+ * there, whether the chosen service is still quoted - is deliberately absent: those are decided by
+ * the checkout service against the data of the moment, and a second opinion here would go stale the
+ * moment it was written.
+ *
+ * It takes the order without the attempt's name, which is every field a buyer can be wrong about:
+ * the name is minted by the submit path, is never shown and is never invalid.
  */
-function collectFieldErrors(draft: CheckoutDraft): CheckoutFieldErrors {
+function collectFieldErrors(draft: Omit<CheckoutDraft, 'idempotencyKey'>): CheckoutFieldErrors {
   const problems: CheckoutFieldErrors = {};
   const { contact, shippingAddress: address, shippingOptionId, notes } = draft;
 
@@ -413,6 +673,8 @@ function collectFieldErrors(draft: CheckoutDraft): CheckoutFieldErrors {
     problems.name = 'A contact name is required.';
   } else if (contact.name.length > MAX_NAME_LENGTH) {
     problems.name = `Keep the contact name to ${MAX_NAME_LENGTH} characters.`;
+  } else if (!plain(contact.name)) {
+    problems.name = TYPED;
   }
 
   if (contact.email.length === 0) {
@@ -425,41 +687,65 @@ function collectFieldErrors(draft: CheckoutDraft): CheckoutFieldErrors {
 
   if (contact.company !== null && contact.company.length > MAX_COMPANY_LENGTH) {
     problems.company = `Keep the company name to ${MAX_COMPANY_LENGTH} characters.`;
+  } else if (contact.company !== null && !plain(contact.company)) {
+    problems.company = TYPED;
   }
 
   if (address.line1.length === 0) {
     problems.line1 = 'A street address is required.';
   } else if (address.line1.length > MAX_ADDRESS_LINE_LENGTH) {
     problems.line1 = `Keep the street address to ${MAX_ADDRESS_LINE_LENGTH} characters.`;
+  } else if (!plain(address.line1)) {
+    problems.line1 = TYPED;
   }
 
   if (address.line2 !== null && address.line2.length > MAX_ADDRESS_LINE_LENGTH) {
     problems.line2 = `Keep the second address line to ${MAX_ADDRESS_LINE_LENGTH} characters.`;
+  } else if (address.line2 !== null && !plain(address.line2)) {
+    problems.line2 = TYPED;
   }
 
   if (address.city.length === 0) {
     problems.city = 'A city is required.';
   } else if (address.city.length > MAX_CITY_LENGTH) {
     problems.city = `Keep the city to ${MAX_CITY_LENGTH} characters.`;
+  } else if (!plain(address.city)) {
+    problems.city = TYPED;
   }
 
   if (address.region.length === 0) {
     problems.region = 'A state or region is required.';
   } else if (address.region.length > MAX_REGION_LENGTH) {
     problems.region = `Keep the state or region to ${MAX_REGION_LENGTH} characters.`;
+  } else if (!plain(address.region)) {
+    problems.region = TYPED;
   }
 
-  if (address.postalCode.length < MIN_POSTAL_CODE_LENGTH) {
+  // The destination, judged as the one thing it is. The length bounds come first because they are
+  // this form's own - the field is bounded before it is read - and the shape is
+  // `@/lib/destination`'s, which is the judgement the freight lookup gates on and the endpoint
+  // applies, reported against whichever of the two controls is at fault. So a draft this pass
+  // accepts is a draft the store can quote, and a buyer is never told to correct the field that
+  // was right.
+  if (address.postalCode.length === 0) {
     problems.postalCode = 'A postal code is required.';
   } else if (address.postalCode.length > MAX_POSTAL_CODE_LENGTH) {
     problems.postalCode = `Keep the postal code to ${MAX_POSTAL_CODE_LENGTH} characters.`;
-  } else if (!POSTAL_CODE_SHAPE.test(address.postalCode)) {
-    problems.postalCode =
-      'A postal code holds letters and digits in groups separated by single spaces or hyphens.';
+  } else if (!plain(address.postalCode)) {
+    problems.postalCode = TYPED;
   }
 
-  if (!COUNTRY_CODE_SHAPE.test(address.country)) {
-    problems.country = 'Choose the country this order ships to.';
+  // The country is judged against the closed list the control offers, and the same closed list
+  // `shippingAddressSchema` holds the field to - not a two-letter shape, which would accept all 676
+  // of them on both sides. A value this form cannot offer therefore cannot be submitted, which is
+  // what matters when the visible control and the value behind it can be made to disagree: the
+  // buyer's screen saying one country while the order names another is a state this check refuses
+  // to let through. `@/lib/destination` is where that list lives, so the judgement is the one the
+  // freight lookup gates on and the endpoint applies.
+  const destinationProblem = freightDestinationProblem(address.country, address.postalCode);
+
+  if (destinationProblem !== null && problems[destinationProblem.field] === undefined) {
+    problems[destinationProblem.field] = destinationProblem.message;
   }
 
   if (shippingOptionId.length === 0) {
@@ -468,6 +754,8 @@ function collectFieldErrors(draft: CheckoutDraft): CheckoutFieldErrors {
 
   if (notes !== null && notes.length > MAX_NOTES_LENGTH) {
     problems.notes = `Keep delivery notes to ${MAX_NOTES_LENGTH} characters.`;
+  } else if (notes !== null && !prose(notes)) {
+    problems.notes = WRITTEN;
   }
 
   return problems;
@@ -541,8 +829,50 @@ const RESOLVE_ORDER = 'Check this order';
  * holds, and places the order only if it never received it.
  */
 const UNCONFIRMED: OrderFailureCopy = {
+  kind: 'unresolved',
   title: 'This order is not confirmed',
   body: 'Lumen Supply may already have this order, and a payment may already have been taken for it. Check the order rather than placing it again: checking cannot create a second order, and it completes this one if the store never received it.',
+  action: RESOLVE_ORDER,
+};
+
+/**
+ * Wording for a submission this browser never managed to send.
+ *
+ * It is the opposite statement to {@link UNCONFIRMED} and it may only be made where the browser
+ * itself established the fact - `StorefrontApiError.dispatched` being `false`, which the HTTP
+ * layer sets only when the machine reported no connection at the moment the request failed. A
+ * request that went out and lost its connection on the way back looks the same to this component
+ * and is not this notice: the honest answer there is that the outcome is unknown.
+ *
+ * Because nothing was sent, the notice says so plainly - no order, no charge, every typed value
+ * still in place - and offers to place the order, not to check one. It is also the one notice that
+ * a recovered connection makes obsolete on its own, which is why it carries `connectivity` and why
+ * the buyer is not left reading it after the store is reachable again.
+ */
+const OFFLINE: OrderFailureCopy = {
+  kind: 'connectivity',
+  title: 'Lumen Supply could not be reached',
+  body: 'Check your connection and try again. This order was not sent and nothing was charged: every value you entered is still here, so placing it again is one click once you are back online.',
+  action: RETRY_ORDER,
+};
+
+/**
+ * Wording for an attempt this page started and never saw the end of.
+ *
+ * It is {@link UNCONFIRMED}'s situation arrived at by a different route: the buyer left while the
+ * request was in flight, so the request was abandoned rather than answered - and because
+ * `POST /api/checkout` does not stop work when a browser stops waiting for it, the order may have
+ * been placed and paid for all the same. The attempt's name survives in session storage with it,
+ * so the control offered here sends that same attempt and the store answers with the order it
+ * already holds, if it holds one.
+ *
+ * The first sentence is what distinguishes it from a submission that failed on this page: the
+ * buyer did not see this attempt fail, so the notice starts by saying which attempt it is about.
+ */
+const INTERRUPTED: OrderFailureCopy = {
+  kind: 'unresolved',
+  title: 'This order is not confirmed',
+  body: 'An order was being placed when this page was left, and what became of it is not known here. Lumen Supply may already have it, and a payment may already have been taken for it. Check the order rather than placing it again: checking cannot create a second order, and it completes this one if the store never received it.',
   action: RESOLVE_ORDER,
 };
 
@@ -556,11 +886,19 @@ const UNCONFIRMED: OrderFailureCopy = {
  * than the HTTP vocabulary it arrived in.
  *
  * Two of those branches are reached only through a reason the store itself named, and that is
- * checked before any of them: a failure carrying a reason this page derived - because the request
- * never came back, because the reply could not be read, because only a status arrived - is a
- * failure about a submission that may well have been carried out, and describing it as one that
- * was not would be this page inventing the part it does not know. `PAYMENT_STATUS_UNKNOWN` is the
- * same situation named by the store, for the case where the store knows it too.
+ * checked before any of them: a failure carrying a reason this page derived - because the reply
+ * could not be read, because only a status arrived, because the request came back with nothing at
+ * all after leaving - is a failure about a submission that may well have been carried out, and
+ * describing it as one that was not would be this page inventing the part it does not know.
+ * `PAYMENT_STATUS_UNKNOWN` is the same situation named by the store, for the case where the store
+ * knows it too.
+ *
+ * One failure is checked before even that, because for it the part above is not unknown: a
+ * `NETWORK_FAILURE` the HTTP layer marked as never dispatched is a request this browser could not
+ * send at all, established from the machine reporting no connection at the moment it failed. There
+ * is no order and no payment behind such a failure, so {@link OFFLINE} says exactly that, and
+ * leaving it to the check below would tell a buyer who never reached the store that they might
+ * have been charged. Every other unreported failure keeps the cautious answer.
  *
  * Anything that is not a {@link StorefrontApiError} - a mistake in this page, a value the browser
  * threw - lands on the generic sentence: nothing left for the store at all, so nothing was
@@ -569,10 +907,18 @@ const UNCONFIRMED: OrderFailureCopy = {
 function checkoutFailureCopy(cause: unknown): OrderFailureCopy {
   if (!(cause instanceof StorefrontApiError)) {
     return {
+      kind: 'settled',
       title: 'The order was not placed',
       body: 'Something went wrong before this order reached Lumen Supply. Nothing was charged. Place the order again.',
       action: RETRY_ORDER,
     };
+  }
+
+  // The one unreported failure whose effect on the order IS known: nothing was sent, so there is
+  // nothing to check and nothing to be charged for. See the note above, and
+  // `StorefrontApiError.dispatched` for what establishes it.
+  if (cause.code === 'NETWORK_FAILURE' && !cause.dispatched) {
+    return OFFLINE;
   }
 
   if (!cause.reported) {
@@ -589,6 +935,7 @@ function checkoutFailureCopy(cause: unknown): OrderFailureCopy {
     // they are named in.
     case 'VALIDATION_FAILED':
       return {
+        kind: 'settled',
         title: 'Check these order details',
         body:
           'Lumen Supply could not accept these details. Review the contact and address fields, ' +
@@ -598,24 +945,28 @@ function checkoutFailureCopy(cause: unknown): OrderFailureCopy {
       };
     case 'NOT_FOUND':
       return {
+        kind: 'settled',
         title: 'Something in this order is no longer available',
         body: 'A product or a shipping service in this order is no longer offered. Review the cart and the shipping method, then place the order again.',
         action: RETRY_ORDER,
       };
     case 'OUT_OF_STOCK':
       return {
+        kind: 'settled',
         title: 'Stock changed while you were ordering',
         body: 'One or more items are no longer available in the quantity requested. Adjust the cart, then place the order again.',
         action: RETRY_ORDER,
       };
     case 'CART_CONFLICT':
       return {
+        kind: 'settled',
         title: 'This cart changed',
         body: 'The cart changed while this order was being placed. Review it, then place the order again.',
         action: RETRY_ORDER,
       };
     case 'PAYMENT_DECLINED':
       return {
+        kind: 'settled',
         title: 'Payment was declined',
         body: 'The payment was not authorized and nothing was charged. Use another payment method, then place the order again.',
         action: RETRY_ORDER,
@@ -623,19 +974,25 @@ function checkoutFailureCopy(cause: unknown): OrderFailureCopy {
     case 'PAYMENT_STATUS_UNKNOWN':
       return UNCONFIRMED;
     // Neither of the next two is ever reported by the store - both describe the reply rather than
-    // the order - so both are answered above. They are named here so that the reason for that is
-    // stated where a reader looks for it, and so that every member of the union has an answer.
+    // the order - so neither reaches this switch through the `reported` check above. They are
+    // named here so that the reason for that is stated where a reader looks for it, and so that
+    // every member of the union has an answer. `NETWORK_FAILURE` is the one code that can also be
+    // answered before that check, where the browser established that the request never went out;
+    // a dispatched one whose connection was then lost arrives here as an unknown outcome, which is
+    // what this answer says.
     case 'NETWORK_FAILURE':
     case 'MALFORMED_RESPONSE':
       return UNCONFIRMED;
     case 'INTERNAL_ERROR':
       return cause.status >= 500
         ? {
+            kind: 'settled',
             title: 'Lumen Supply could not complete the order',
             body: 'The store reported a problem on its side. Nothing was charged. Place the order again in a moment.',
             action: RETRY_ORDER,
           }
         : {
+            kind: 'settled',
             title: 'The order was not placed',
             body: 'Lumen Supply could not complete this order. Nothing was charged. Place the order again.',
             action: RETRY_ORDER,
@@ -659,17 +1016,235 @@ function orderSizeLabel(itemCount: number, subtotalLabel: string): string {
 }
 
 /* ---------------------------------------------------------------------------
+ * What outlives this render
+ *
+ * Everything above is a function of what is on screen. The functions below serve the two places an
+ * order has to survive longer than that - this tab's session storage and this page's address - and
+ * they are the only code in this module that touches the browser rather than React, which is why
+ * they live in their own section, away from the pure helpers, and why every one of them is called
+ * from an effect or from the submit handler and never while anything is rendering.
+ *
+ * The problem they solve is one situation: `POST /api/checkout` is not stopped by a browser that
+ * stops waiting for it. A buyer who leaves this page mid-request, or whose connection drops after
+ * the request went out, may have an order and a charge that this component never saw - and until
+ * this section existed, the only trace of it was a toast that dismissed itself. So an attempt
+ * writes itself down before it is sent and is read back on the next mount, and a placed order is
+ * given an address of its own that a buyer can return to, reload and bookmark.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * Where the attempt in flight is written down, in this tab's session storage.
+ *
+ * Session storage rather than local storage: the record is about what this tab was doing, it is
+ * of no use to another tab shopping with its own form, and it should not outlive the browsing
+ * session that produced it. The name is namespaced by the store so it cannot collide with anything
+ * else the same origin keeps.
+ */
+const ATTEMPT_STORAGE_KEY = 'lumen-supply.checkout-attempt';
+
+/** The path this form is placed at, which is also the path a placed order is addressed under. */
+const CHECKOUT_PATH = '/checkout';
+
+/**
+ * The query parameter that names a placed order in this page's address.
+ *
+ * `app/checkout/page.tsx` reads the same name to render the notice that makes the order durable,
+ * and the two are stated separately on purpose: a route file's query vocabulary is its contract
+ * with the browser, the same way `app/orders/page.tsx` declares its own, and a component importing
+ * a route module would be the wrong direction of dependency. Change one and change the other.
+ */
+const ORDER_PARAM = 'order';
+
+/**
+ * Where the storefront lists orders.
+ *
+ * Offered as somewhere to go rather than as a promise about what is there: `app/orders/page.tsx`
+ * lists the one demonstration account its own default names, while an order placed from this form
+ * is filed against the account the endpoint derives from the submitted contact email. So the
+ * notices below hand a buyer the reference and point at the history, and neither of them claims
+ * the order will be on its default page.
+ */
+const ORDERS_PATH = '/orders';
+
+/**
+ * One attempt to place an order, as it is written down while it is in flight.
+ *
+ * Three fields, each of which answers a question the next mount of this form will have. The name
+ * of the attempt is what lets a buyer resolve it rather than order twice - the endpoint answers a
+ * submission it has already seen with the order that attempt placed. The instant is when the
+ * request went out, which is what a diagnostic line needs to be worth reading. And the order
+ * number is `null` for exactly as long as the outcome is unknown: it is filled in when the store
+ * answers, so a record that still holds `null` is an attempt nobody ever got an answer to.
+ */
+interface CheckoutAttemptRecord {
+  readonly idempotencyKey: string;
+  readonly startedAt: number;
+  readonly orderNumber: string | null;
+}
+
+/**
+ * Whether `value` is a {@link CheckoutAttemptRecord} this form may act on.
+ *
+ * Storage is a string that anything with this origin could have written, and what is read back
+ * decides whether a buyer is told they may have been charged - so it is validated rather than
+ * cast. Every field is checked for its own type, the attempt's name is required to be non-empty,
+ * and the instant is required to be a finite number, because a record that fails any of those says
+ * nothing intelligible about an order and is dropped.
+ */
+function isAttemptRecord(value: unknown): value is CheckoutAttemptRecord {
+  if (typeof value !== 'object' || value === null) {
+    return false;
+  }
+
+  const { idempotencyKey, startedAt, orderNumber } = value as Partial<CheckoutAttemptRecord>;
+
+  return (
+    typeof idempotencyKey === 'string' &&
+    idempotencyKey.length > 0 &&
+    typeof startedAt === 'number' &&
+    Number.isFinite(startedAt) &&
+    (orderNumber === null || (typeof orderNumber === 'string' && orderNumber.length > 0))
+  );
+}
+
+/**
+ * The attempt this tab last wrote down, or `null` when there is none to act on.
+ *
+ * Every storage call in this section is wrapped, and this one parses as well, because a checkout
+ * that breaks over storage would be a worse defect than the one this record exists to report:
+ * `sessionStorage` throws outright where storage is denied or partitioned, and the value it holds
+ * may be anything. A failure of either kind is logged for whoever is debugging it and answered as
+ * "no record", which leaves the form exactly as it behaves for a first-time buyer.
+ */
+function readAttemptRecord(): CheckoutAttemptRecord | null {
+  let stored: string | null;
+
+  try {
+    stored = sessionStorage.getItem(ATTEMPT_STORAGE_KEY);
+  } catch (cause) {
+    console.warn(
+      'Lumen Supply: this browser would not let the checkout read its own session storage:',
+      cause instanceof Error ? cause.name : typeof cause,
+    );
+
+    return null;
+  }
+
+  if (stored === null) {
+    return null;
+  }
+
+  let parsed: unknown;
+
+  try {
+    parsed = JSON.parse(stored);
+  } catch {
+    parsed = undefined;
+  }
+
+  if (!isAttemptRecord(parsed)) {
+    console.warn('Lumen Supply: the stored checkout attempt could not be read and was dropped.');
+    forgetAttempt();
+
+    return null;
+  }
+
+  return parsed;
+}
+
+/**
+ * Writes down the attempt in hand, replacing whatever was there.
+ *
+ * Called twice per submission: once before the request goes out, with no order number, and once
+ * when the store has answered, with the order's own reference. The second call is what turns "an
+ * order may exist" into "this order exists", and it is the reference a buyer is shown if they come
+ * back to a form whose receipt they never saw.
+ *
+ * A storage that refuses the write is logged and otherwise ignored. The submission continues: an
+ * order the buyer can place is worth more than the note this page would have kept about it.
+ */
+function rememberAttempt(record: CheckoutAttemptRecord): void {
+  try {
+    sessionStorage.setItem(ATTEMPT_STORAGE_KEY, JSON.stringify(record));
+  } catch (cause) {
+    console.warn(
+      'Lumen Supply: this browser would not let the checkout record its attempt:',
+      cause instanceof Error ? cause.name : typeof cause,
+    );
+  }
+}
+
+/**
+ * Drops the record, for an attempt that provably placed no order.
+ *
+ * Only a failure the store named, or one this browser established it never sent, may do this: a
+ * record removed on an unknown outcome is the evidence of a possible charge thrown away, which is
+ * the whole thing this section exists to prevent.
+ */
+function forgetAttempt(): void {
+  try {
+    sessionStorage.removeItem(ATTEMPT_STORAGE_KEY);
+  } catch (cause) {
+    console.warn(
+      'Lumen Supply: this browser would not let the checkout clear its attempt record:',
+      cause instanceof Error ? cause.name : typeof cause,
+    );
+  }
+}
+
+/** The address a placed order is readable at: this page, naming the order. */
+function orderAddress(orderNumber: string): string {
+  return `${CHECKOUT_PATH}?${ORDER_PARAM}=${encodeURIComponent(orderNumber)}`;
+}
+
+/**
+ * Gives the order that was just placed an address of its own, without disturbing what is on
+ * screen.
+ *
+ * `window.history.pushState` rather than the router: the App Router keeps its own state in step
+ * with the native call, and because no navigation happens, this component is not remounted - which
+ * matters, because the receipt a buyer is reading is this component's state and a remount would
+ * destroy it. `router.push` would do exactly that.
+ *
+ * What it buys is everything a placed order was missing. Back returns to the checkout page instead
+ * of leaving the storefront, Forward and reload arrive at an address that still names the order,
+ * and the address bar holds something a buyer can copy or bookmark. The page at that address
+ * reads the parameter and says whose order it is.
+ *
+ * @param orderNumber The reference the store printed on the order.
+ */
+function pushOrderAddress(orderNumber: string): void {
+  window.history.pushState(null, '', orderAddress(orderNumber));
+}
+
+/**
+ * Whether this page's current address already names `orderNumber`.
+ *
+ * Asked before the form raises a notice about an order it found in storage: when the address names
+ * it, `app/checkout/page.tsx` has already said so at the top of the page, and a second notice
+ * saying the same thing would be this component and that page both answering for one order.
+ *
+ * @param orderNumber The reference read back from the attempt record.
+ */
+function addressNamesOrder(orderNumber: string): boolean {
+  return new URLSearchParams(window.location.search).get(ORDER_PARAM) === orderNumber;
+}
+
+/* ---------------------------------------------------------------------------
  * The form
  * ------------------------------------------------------------------------- */
 
 /**
  * Render the checkout form, or the receipt for the order it placed.
  *
- * State is eight plain `useState` values and nothing else - the contact group, the destination
+ * State is nine plain `useState` values and nothing else - the contact group, the destination
  * group, the delivery note, the chosen service, whether a submission is in flight, the validation
- * messages, the failure notice and the placed order. There is no reducer, no transition and no
- * derived copy of the cart: the cart is read from the provider that owns it, and the two composite
- * blocks below own their own presentation.
+ * messages, the failure notice, the placed order and the reference of an order an earlier attempt
+ * from this tab turned out to have placed. There is no reducer, no transition and no derived copy
+ * of the cart: the cart is read from the provider that owns it, and the two composite blocks below
+ * own their own presentation. Four refs sit beside them, each holding something that must survive a
+ * render without causing one: the attempt's name, the controller of the submission in flight, and
+ * the two regions focus is moved to.
  *
  * Two things are read from elsewhere and neither is state of this form's. The freight lookup for
  * the destination in the fields comes from `@/hooks/useShippingEta`, which owns the request and its
@@ -685,10 +1260,12 @@ function orderSizeLabel(itemCount: number, subtotalLabel: string): string {
  *
  * Once an order exists the fields are gone and the receipt takes their place, because there is
  * nothing left to edit: the order has an order number, the payment has resolved, and both are
- * printed by `./OrderConfirmation` from the result this form stored.
+ * printed by `./OrderConfirmation` from the result this form stored. Two things happen with it,
+ * neither of them the receipt's own doing: focus moves to the region it is rendered in, since the
+ * control that was pressed has left the document, and the page's address is rewritten to name the
+ * order, so the receipt has somewhere to be returned to after it is gone.
  */
 export function CheckoutForm({
-  shippingOptions,
   initialAddress,
   initialContact,
   onOrderPlaced,
@@ -697,6 +1274,7 @@ export function CheckoutForm({
   const cart = useCart();
   const { showToast } = useToastCenter();
   const publishFreight = usePublishSelectedFreight();
+  const publishPlacement = usePublishOrderPlaced();
 
   const [contact, setContact] = useState<ContactFields>(() => ({
     name: initialContact?.name ?? '',
@@ -709,26 +1287,60 @@ export function CheckoutForm({
     city: initialAddress?.city ?? '',
     region: initialAddress?.region ?? '',
     postalCode: initialAddress?.postalCode ?? '',
-    country: initialAddress?.country ?? DEFAULT_COUNTRY,
+    country: initialAddress?.country ?? DEFAULT_FREIGHT_DESTINATION_CODE,
   }));
   const [notes, setNotes] = useState<string>('');
-  const [shippingOptionId, setShippingOptionId] = useState<string | null>(
-    () => shippingOptions.at(0)?.id ?? null,
-  );
+  // Nothing is chosen until the store has quoted the destination, because until then there is
+  // nothing to choose: a service without a rate for this address is not an offer. The buyer's
+  // choice is remembered here once they make one, and is honoured by each later quote that still
+  // names it - see `quotedChoice` below.
+  const [shippingOptionId, setShippingOptionId] = useState<string | null>(null);
   const [pending, setPending] = useState<boolean>(false);
-  const [fieldErrors, setFieldErrors] = useState<CheckoutFieldErrors>({});
   const [failure, setFailure] = useState<OrderFailureCopy | null>(null);
   const [placed, setPlaced] = useState<CheckoutResult | null>(null);
 
   /*
+   * Which fields the buyer has finished with, and whether they have tried to place the order.
+   *
+   * These two are the whole of what this form stores about its validation, and storing this rather
+   * than the messages themselves is the point. What is wrong with a value is a fact about the
+   * value, so it is derived from the fields on every render and cannot survive the value being
+   * corrected; when a buyer is shown it is a fact about what they have done, which is what these
+   * two remember. A field enters `touched` when focus leaves it, because a message under a field
+   * somebody is still typing into is a form arguing with a half-typed value; `submitted` reveals
+   * every field at once, because somebody who has tried to place the order has finished with all of
+   * them.
+   */
+  const [touched, setTouched] = useState<Partial<Record<CheckoutFieldKey, true>>>({});
+  const [submitted, setSubmitted] = useState<boolean>(false);
+
+  /*
+   * An order this tab placed and then lost sight of, by its reference - and `null` in every other
+   * case, which is almost always.
+   *
+   * It is not this submission's order: that one is `placed`, and it is on screen as a receipt. This
+   * is the order an earlier attempt from this tab turned out to have placed after the form went
+   * away, read back from the attempt record by the mount effect below. Holding it in state is what
+   * lets a buyer who left mid-request and came back find their order number instead of nothing,
+   * which is the half of the problem that aborting the request cannot fix - the store completes the
+   * order either way.
+   */
+  const [recoveredOrder, setRecoveredOrder] = useState<string | null>(null);
+
+  /*
    * Where the order is going, as the freight lookup and the service group are both given it: the
-   * postal-code field trimmed, or `null` while there is nothing to quote for. One `const` rather
-   * than the same expression written at two call sites, because the lookup and the panel must
-   * describe one address - a panel priced for a destination the lookup was not asked about would
-   * put rates for the previous address beside the new one.
+   * postal-code field trimmed and the country beside it, or `null` while there is nothing to quote
+   * for. One `const` each rather than the same expression written at two call sites, because the
+   * lookup and the panel must describe one address - a panel priced for a destination the lookup
+   * was not asked about would put rates for the previous address beside the new one.
+   *
+   * The country travels with the code because it is half of the destination: the same five digits
+   * are a town in the United States and another in Mexico, quoted differently, and the store's
+   * idea of a complete postal code is the chosen country's. A change of either therefore re-quotes.
    */
   const typedPostalCode = address.postalCode.trim();
   const destination = typedPostalCode.length > 0 ? typedPostalCode : null;
+  const destinationCountry = address.country.trim().length > 0 ? address.country.trim() : null;
 
   /*
    * The freight lookup, held here rather than inside the service group, because the rate the buyer
@@ -736,7 +1348,7 @@ export function CheckoutForm({
    * The panel is handed this state, so it asks nothing itself and the page makes one request per
    * shipment.
    *
-   * Both halves of the question are passed, and the second one is not optional in practice.
+   * Every part of the question is passed, and the unit count is not optional in practice.
    * Freight is charged per piece as well as per destination, and `POST /api/checkout` rates the
    * order's freight against the units it reserved - so a lookup that named only the address would
    * be answered for a single unit and would show a buyer a fraction of what their order is about
@@ -748,17 +1360,22 @@ export function CheckoutForm({
    * then is answered for a single unit: a rate for a shipment nobody is sending, shown as
    * authoritative for the moment between the reply and the cart landing, and then replaced. So the
    * lookup waits for the cart, which is also what makes this page's one quote per shipment one
-   * rather than two, and the service group shows list rates until the answer arrives.
+   * rather than two, and the service group shows no services until the answer arrives.
    */
-  const freight = useFreightQuote(cart.itemCount > 0 ? destination : null, cart.itemCount);
+  const freight = useFreightQuote(
+    cart.itemCount > 0 ? destination : null,
+    destinationCountry,
+    cart.itemCount,
+  );
 
   /*
    * The chosen service as the store currently offers it - the one service this order may be placed
    * with, and the one amount this form is entitled to publish for it.
    *
-   * The services this form was handed are list rates for an unnamed destination. The quote is the
-   * store's answer for the destination and the shipment in the fields, so once it has settled it
-   * *is* the offer: the service is drawn from `freight.quote.options` and from nowhere else. The
+   * The quote is the store's answer for the destination and the shipment in the fields, and it is
+   * the whole of the offer: the service is drawn from `freight.quote.options` and from nowhere
+   * else, because a rate is a property of a destination and the store has priced no service for
+   * one it has not been given. The
    * buyer's own choice is taken when that offer names it; when the offer does not - it names other
    * services - the first service it does name is taken instead, which is a deliberate reselection
    * from the current offer rather than an unavailable choice left standing, and it is visible as
@@ -767,22 +1384,26 @@ export function CheckoutForm({
    * moment it is not. That is what keeps this form from placing an order on a service
    * `POST /api/checkout` would refuse, since that endpoint re-quotes and accepts only a service its
    * own quote lists. Before a quote has settled - no destination yet, a lookup in flight, a lookup
-   * that failed - there is no offer to draw from and therefore nothing chosen: the panel still
-   * shows the list rates so a buyer can see what the store sells, and the place-order control waits
-   * for the quote rather than committing the order to a figure nobody has been quoted. A quote that
-   * names no service at all leaves nothing chosen for the same reason, and the group says so.
+   * that failed - there is no offer to draw from and therefore nothing chosen: the group shows no
+   * services and says why, and the place-order control waits for the quote rather than committing
+   * the order to a figure nobody has been quoted. A quote that names no service at all leaves
+   * nothing chosen for the same reason, and the group says so.
    *
    * Which is also why the amount comes from here: it is the quote's price for the chosen service,
    * which is both what the panel prints beside the checked row and what the order will be charged.
    * `null` - nothing chosen, or a shipment with no quote - is what tells the review column to print
    * the freight row as a charge still to be confirmed rather than as a zero.
    *
-   * `chosenOptionId` is also what the group is told is selected once a quote has settled, so the
-   * row shown as chosen is a row the store is currently offering and nothing else. Before a quote
-   * settles there is no offer to check against and the buyer's own choice is what the baseline rows
-   * show as selected.
+   * `chosenOptionId` is also what the group is told is selected, so the row shown as chosen is a
+   * row the store is currently offering and nothing else; before a quote settles there are no rows,
+   * so nothing is checked.
    *
-   * Three primitives rather than an object, because they are what the publishing effect below
+   * The transit time is published with the rate for the same reason the rate is: the review column
+   * beside this form states when the order arrives, and the answer is a property of the service the
+   * buyer picked - a store-wide estimate printed there would contradict the very row it sits next
+   * to whenever a buyer chose anything but the middle service.
+   *
+   * Four primitives rather than an object, because they are what the publishing effect below
    * depends on: an object literal in a dependency array is a fresh identity on every render, and
    * this form re-renders several times a second (AAP 0.8.2 defect 2).
    */
@@ -795,17 +1416,29 @@ export function CheckoutForm({
   const chosenOptionId = quotedChoice?.id ?? null;
   const chosenOptionLabel = quotedChoice?.label ?? null;
   const chosenOptionAmountCents = quotedChoice?.priceCents ?? null;
+  const chosenOptionEstimatedDays = quotedChoice?.estimatedDays ?? null;
 
   /*
-   * What the service group is told is selected: the quoted choice once there is a quote to check
-   * against, and the buyer's own choice until then. Deriving it rather than reading the state
-   * directly is what keeps the group from showing a row as chosen on the strength of a selection
-   * the store has just said it cannot sell - and it is the same value the draft is assembled from,
-   * so what a buyer sees checked and what the order would name are one thing.
+   * What the service group is told is selected: the service drawn from the current quote, and
+   * nothing when there is no quote - which is also when the group has no rows to check. Deriving it
+   * rather than reading the state directly is what keeps the group from showing a row as chosen on
+   * the strength of a selection the store has just said it cannot sell - and it is the same value
+   * the draft is assembled from, so what a buyer sees checked and what the order would name are one
+   * thing.
    */
-  const effectiveOptionId = quotedOptions === null ? shippingOptionId : chosenOptionId;
+  const effectiveOptionId = chosenOptionId;
 
   const failureRegion = useRef<HTMLDivElement | null>(null);
+
+  /*
+   * The receipt's own container, which takes focus when the receipt replaces the fields.
+   *
+   * It is this component's business and not the receipt's: `./OrderConfirmation` renders on the
+   * server and holds no hook, so the element that can be focused is the wrapper here - and the
+   * wrapper is the right thing to focus in any case, because the receipt's heading is the first
+   * thing inside it and a reader lands above the whole order rather than part-way into it.
+   */
+  const confirmationRegion = useRef<HTMLDivElement | null>(null);
 
   // The name every submission of the order in front of the buyer travels under, drawn on the
   // first one and kept until an order exists. A ref rather than state because nothing renders it
@@ -813,6 +1446,23 @@ export function CheckoutForm({
   // failure causes, which is the render after which it matters most: the next submission is the
   // one the endpoint has to recognise as the same attempt.
   const attempt = useRef<string | null>(null);
+
+  /*
+   * The controller of the submission in flight, or `null` while none is.
+   *
+   * One controller per submission, held here so the unmount effect below can abort it: a buyer who
+   * navigates away is not waiting for this reply any more, and a connection held open for a
+   * component that no longer exists is a connection worth releasing. A ref rather than state for
+   * the same reason as `attempt` - nothing renders it, and replacing it must not re-render
+   * anything.
+   *
+   * What the abort does NOT do is stop the order, and that asymmetry is the whole reason the
+   * attempt record exists: `POST /api/checkout` reads no signal, so the stock reservation, the
+   * carrier and the payment all run to completion server-side. So the abort is treated as an
+   * unknown outcome rather than as a cancellation, both here and in `@/lib/api-client`, whose
+   * `submitCheckout` documentation says the same thing to every other caller.
+   */
+  const submission = useRef<AbortController | null>(null);
 
   // The notice announces itself - `Alert`'s `danger` tone renders `role="alert"` - and focus
   // follows it, so a reader using the keyboard lands on the sentence explaining why the order did
@@ -825,8 +1475,149 @@ export function CheckoutForm({
     }
   }, [failure]);
 
+  /*
+   * Take down the connectivity notice once the connection is back, and nothing else with it.
+   *
+   * A notice about a request that never left the browser stops describing anything the moment the
+   * browser can reach the store again, and leaving it up is how a buyer comes to believe a store
+   * is down while it is answering. Every other notice stays: `unresolved` may be the only record
+   * a buyer has that a payment might have been taken, and `settled` is the store's own answer
+   * about this order - a recovered connection says nothing about either, so clearing them would be
+   * hiding them. That is what `OrderFailureCopy.kind` is for, and the update is written as a
+   * function of the current notice so a failure arriving in the same tick is judged on what it is
+   * rather than on what was there when this ran.
+   *
+   * Two signals say the store is reachable, and both are already here. The browser's own `online`
+   * event is the first, listened for while this form is mounted and unlistened in the cleanup, so
+   * a form that goes away leaves no handler behind. A freight quote in hand is the second and the
+   * stronger of the two: `FreightQuoteState.quote` is non-null only for a settled
+   * `GET /api/shipping/quote` for the arguments in hand, which is a round trip to this store that
+   * completed - a fact, where `navigator.onLine` is a claim about the network interface. The
+   * effect therefore depends on that quote's presence rather than on the notice, which is what
+   * keeps a notice raised while a quote is already in hand - the ordinary case for an offline
+   * submit, since the quote settled before the connection went - from being cleared by the render
+   * that raised it.
+   */
+  const quoteInHand = freight.quote !== null;
+
+  useEffect(() => {
+    const clearConnectivityNotice = (): void => {
+      setFailure((current) => (current?.kind === 'connectivity' ? null : current));
+    };
+
+    if (quoteInHand) {
+      clearConnectivityNotice();
+    }
+
+    window.addEventListener('online', clearConnectivityNotice);
+
+    return () => {
+      window.removeEventListener('online', clearConnectivityNotice);
+    };
+  }, [quoteInHand]);
+
+  /*
+   * Let go of a submission this form is no longer here to receive.
+   *
+   * The cleanup runs when the buyer navigates away - the primary navigation is a client-side
+   * router, so leaving `/checkout` mid-request unmounts this component while the request is still
+   * outstanding. Aborting releases the connection and, more importantly, stops this handler
+   * deciding anything on the way out: nothing is stored, nothing is announced as a failure, and no
+   * address is pushed for a page the buyer has left.
+   *
+   * It deliberately does not clear the attempt record. The order may well have been placed - the
+   * endpoint does not stop for an abandoned browser - so the record is exactly what should survive
+   * this, and the mount effect below is what reads it back.
+   *
+   * Empty dependencies: this is a lifetime, not a value. The controller is read off the ref at
+   * cleanup time, so the submission aborted is whichever one was in flight at that moment.
+   */
+  useEffect(() => {
+    return () => {
+      submission.current?.abort();
+    };
+  }, []);
+
+  /*
+   * Pick up an attempt this tab started and never saw the end of.
+   *
+   * Read once, on mount, and from an effect rather than from the component body: this form is
+   * hydrated, so a storage read while rendering would produce markup the server could not have
+   * sent and React would report the mismatch. Nothing about the first paint depends on it, so the
+   * notice it may raise arrives a frame later, which is the right trade.
+   *
+   * Two records are worth acting on and they mean different things. One with no order number is an
+   * attempt whose outcome nobody established: the buyer is shown {@link INTERRUPTED}, and the
+   * attempt's own name is restored into `attempt` so that pressing the notice's control sends that
+   * same attempt - which the endpoint answers with the order it already holds, rather than placing
+   * a second one. One WITH an order number is an order that exists and that this tab lost sight
+   * of, so its reference is put in front of the buyer; if the address already names it, the page
+   * has said so and this stays quiet.
+   *
+   * Both kinds of record are logged where they report something, because a silent failure is the
+   * hardest kind to find in production and this one used to leave no trace at all: the line names
+   * the attempt and when it went out, which is what makes it worth reading in a bug report. An
+   * order the address already names is the exception and is logged by neither: the reference is on
+   * the page, so nothing was lost sight of, and a line saying a receipt was never shown would be
+   * untrue of the very page printing the order number.
+   *
+   * This is the one effect in the file that publishes state from its own body, and there is no
+   * alternative to it: what it publishes comes from session storage, storage cannot be read while
+   * rendering - the server has none, so the markup would not be the markup the server sent - and
+   * there is nothing to subscribe to, because the record only ever changes as a consequence of
+   * this same component submitting. `react-hooks/set-state-in-effect` is therefore suppressed by
+   * name where it applies, with that reason. The cost is one extra render per mount, on a page
+   * that has finished settling, and only for a buyer who has an unresolved attempt to be told
+   * about.
+   */
+  useEffect(() => {
+    const record = readAttemptRecord();
+
+    if (record === null) {
+      return;
+    }
+
+    const startedAt = new Date(record.startedAt).toISOString();
+
+    if (record.orderNumber === null) {
+      attempt.current = record.idempotencyKey;
+      // A hydration-safe read of session storage; see the note above this effect.
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- storage cannot be read in render
+      setFailure(INTERRUPTED);
+      console.warn(
+        'Lumen Supply: a checkout attempt was never answered and may have placed an order:',
+        { attempt: record.idempotencyKey, startedAt },
+      );
+
+      return;
+    }
+
+    if (!addressNamesOrder(record.orderNumber)) {
+      console.info('Lumen Supply: this tab placed an order it never showed a receipt for:', {
+        orderNumber: record.orderNumber,
+        startedAt,
+      });
+
+      // The same read, publishing the reference instead of the notice; see the note above.
+      setRecoveredOrder(record.orderNumber);
+    }
+  }, []);
+
+  // Focus follows the receipt, for the same reason it follows the failure notice: the control the
+  // buyer pressed is gone from the document in the frame the order appears, and a form that
+  // unmounts with focus on one of its fields leaves a keyboard or screen-reader user at the top of
+  // the document with no cue that anything happened. The wrapper is focusable only
+  // programmatically - `tabIndex={-1}` keeps it out of the tab order - so it is a landing point and
+  // never a stop on the way through the page. Like the notice's, this runs from an effect because
+  // the element exists only after the render this state causes.
+  useEffect(() => {
+    if (placed !== null) {
+      confirmationRegion.current?.focus();
+    }
+  }, [placed]);
+
   // The chosen freight charge, published for the review column beside this form. The dependencies
-  // are the three primitives the charge is made of and the publisher, which is stable for the life
+  // are the four primitives the charge is made of and the publisher, which is stable for the life
   // of its provider, so this runs when the chosen service or its quoted rate changes and not when
   // the cart or the dispatch countdown does - and the value itself is built inside the effect,
   // where a fresh object costs nothing. Nothing the current quote offers - no destination yet, a
@@ -836,30 +1627,170 @@ export function CheckoutForm({
   // The publisher ignores a value equal to the one already published, which is what keeps a form
   // re-rendering four times a second from writing state four times a second.
   useEffect(() => {
-    if (chosenOptionId === null || chosenOptionLabel === null || chosenOptionAmountCents === null) {
+    if (
+      chosenOptionId === null ||
+      chosenOptionLabel === null ||
+      chosenOptionAmountCents === null ||
+      chosenOptionEstimatedDays === null
+    ) {
       publishFreight(null);
     } else {
       publishFreight({
         optionId: chosenOptionId,
         label: chosenOptionLabel,
         amountCents: chosenOptionAmountCents,
+        estimatedDays: chosenOptionEstimatedDays,
       });
     }
 
     return () => {
       publishFreight(null);
     };
-  }, [chosenOptionId, chosenOptionLabel, chosenOptionAmountCents, publishFreight]);
+  }, [
+    chosenOptionId,
+    chosenOptionLabel,
+    chosenOptionAmountCents,
+    chosenOptionEstimatedDays,
+    publishFreight,
+  ]);
+
+  /*
+   * The order as the controls hold it, and everything wrong with it, recomputed on every render.
+   *
+   * This is where the form's validation lives, and it lives here rather than in the submit handler
+   * for two reasons that were both defects while it did. A pass that runs only on submit cannot
+   * report anything about a form whose submit control is unavailable - which is exactly the state
+   * an incomplete address puts it in - so the one case the messages exist for was the one case they
+   * could not be shown. And a pass that stores its result leaves that result standing against
+   * values that have since been corrected: "A contact name is required." beside a name. Derived,
+   * neither is possible: there is nothing to go stale, and the messages, the counters, the
+   * outstanding line and the availability of the place-order control are all read off the same
+   * single pass over the same fields.
+   *
+   * The freight message is merged in here for the same reason it was merged in there: it is the one
+   * thing wrong with the order that is settled outside the fields, and the shipping field takes the
+   * more specific of the two - "still being quoted" rather than "choose a shipping service".
+   */
+  //
+  // One submission can be two things, and the pass has to know which. Where the notice on screen
+  // reports an unresolved outcome, the next press is not a second order but the same attempt sent
+  // again, answered from the store's record of it rather than from a fresh quote - and a cart that
+  // has already become an order has no quote left to satisfy. So while resolving, the draft names
+  // the buyer's own choice and the freight check stands down; every other message still applies.
+  const resolving = failure?.kind === 'unresolved';
+  const fields = entered(
+    contact,
+    address,
+    resolving ? effectiveOptionId : (quotedChoice?.id ?? null),
+    notes,
+  );
+  const problems = collectFieldErrors(fields);
+  const freightProblem = resolving ? undefined : freightSelectionProblem(freight, quotedChoice);
+
+  if (freightProblem !== undefined) {
+    problems.shippingOptionId = freightProblem;
+  }
+
+  /*
+   * The messages the buyer is shown: the problems above, less the fields they have not finished
+   * with yet. `submitted` opens all of them at once; until then a field speaks when focus has left
+   * it, and once it has spoken it keeps speaking - and stops the moment the value is valid,
+   * because there is no longer a problem for it to report.
+   */
+  const revealed: CheckoutFieldErrors = {};
+
+  for (const field of FIELDS) {
+    const problem = problems[field.key];
+
+    if (problem !== undefined && (submitted || touched[field.key] === true)) {
+      revealed[field.key] = problem;
+    }
+  }
+
+  /*
+   * The postal field's hint.
+   *
+   * It is the field's one affirmative sentence, and it is earned rather than printed: only a
+   * settled quote means freight *has* been quoted for this destination. Without one the hint is
+   * the chosen country's own format, which is what a buyer needs in order to write a destination
+   * the store can quote - and never a promise about a value the store has just refused.
+   *
+   * And it stands down entirely while the field is showing a fault, because the fault already
+   * carries that format: `@/lib/destination` ends each postal-code message with the same sentence,
+   * so a hint printed beside one would set the identical words four pixels apart and read as a
+   * duplicated paragraph. One sentence, in the red text a buyer is being asked to act on. The
+   * destination judgement itself reaches the two controls through the pass above - it is part of
+   * `problems`, so it is revealed on the same terms as every other message - and the service group
+   * below captions its empty list with the same judgement while the buyer is still typing.
+   */
+  const selectedDestination = freightDestination(address.country);
+  const postalCodeHint =
+    revealed.postalCode !== undefined
+      ? undefined
+      : freight.quote !== null
+        ? QUOTED_DESTINATION_HINT
+        : selectedDestination === undefined
+          ? UNSERVED_DESTINATION_HINT
+          : freightPostalCodeHint(selectedDestination);
+
+  /*
+   * Whether the country the draft carries is one this store offers.
+   *
+   * A `<select>` can only display a value one of its options carries, so a country outside the
+   * offered list would leave the control showing the first destination while the draft carried the
+   * other value - the screen saying one thing and the request another. The field below therefore
+   * carries an option for whatever the state holds whenever that is not on the list, so what is on
+   * screen is always what would be sent, and the pass above says beside it that the store does not
+   * ship there. Only an in-page script can reach this, by adding an option and taking it away
+   * again, which is why the option is a fallback rather than part of the list.
+   */
+  const offered = FREIGHT_DESTINATIONS.some((destination) => destination.code === address.country);
 
   /**
-   * Place the order.
+   * Remember that the buyer has finished with `field`, so its message may be shown.
+   *
+   * Returns the same object when the field is already known, so a form that re-renders several
+   * times a second (AAP 0.8.2 defect 2) does not write state on every blur of an already-blurred
+   * field.
+   */
+  function touch(field: CheckoutFieldKey): void {
+    setTouched((current) => (current[field] === true ? current : { ...current, [field]: true }));
+  }
+
+  /**
+   * Place the order - or resolve the attempt that may already have placed it.
    *
    * The whole path, in order: stop the browser navigating; refuse a second submission while one is
    * running; name the attempt, once, and keep that name for every submission of this order;
-   * assemble the draft; validate it once; publish the messages that pass produced and drop any
-   * notice from an earlier attempt; stop there if anything is wrong; then one request, whose two
-   * outcomes are a stored order and a receipt, or a notice above the submit row with every typed
-   * value still in place.
+   * assemble the draft; reveal every message the validation pass above has already produced and
+   * drop any notice from an earlier attempt; stop there if anything is wrong, with the reader moved
+   * to the first field that is; then one request, whose two outcomes are a stored order and a
+   * receipt, or a notice above the submit row with every typed value still in place.
+   *
+   * It validates nothing itself, and that is deliberate rather than an omission: the pass runs on
+   * every render, so by the time this handler is reached its result is already the result for the
+   * values on screen. Running it again here would be the same pass over the same fields, and
+   * storing that result is what made a corrected field keep its old message.
+   *
+   * ONE SUBMISSION CAN BE TWO THINGS. Where the notice on screen reports an unresolved outcome,
+   * pressing its control is not a second order: it is the same attempt sent again, which the
+   * endpoint answers with the order it already holds. Two things follow, and both are deliberate.
+   * The store's current freight offer is not required for it - the answer comes from the store's
+   * record of the attempt, not from a fresh quote, and a cart that has already become an order
+   * has no quote left to satisfy - so the freight check is skipped and the service the draft names
+   * is the buyer's own choice rather than a quoted one. And the notice is not cleared until the
+   * request actually goes out: a submission the validation pass stopped has established nothing,
+   * so erasing the only record of a possible charge at that point would be the worst thing this
+   * handler could do.
+   *
+   * WHAT SURVIVES IT. The attempt is written to session storage before the request leaves and
+   * replaced with the order's own reference when the store answers, because this component cannot
+   * be relied on to still be here when it does - a buyer who navigates away mid-request has the
+   * abort in the unmount effect above release the connection, while `POST /api/checkout` carries
+   * the order out regardless. So an abort is reported to nobody as a failure (the buyer asked to
+   * leave; that is not a failure) and stores nothing, and the record it leaves behind is what the
+   * next mount reads. A failure that proves no order exists - the store's own refusal, or a
+   * request this browser never sent - drops the record instead.
    *
    * The request is classified on its own, and what follows a success is not. A consumer's
    * `onOrderPlaced` runs after the order has been stored and announced, outside anything that
@@ -890,47 +1821,148 @@ export function CheckoutForm({
     // message then replaces the generic "choose a shipping service" wording with the reason that
     // actually applies, in the same single validation pass: a group still being quoted, one that
     // could not be quoted, a destination with no service, or a cart too large to quote.
+    //
+    // A resolution is the exception to both, and for one reason: it is answered from the store's
+    // record of the attempt rather than from a quote, so requiring a current offer would leave the
+    // control dead in the one situation it exists for - a cart that has already become an order is
+    // no longer quotable. The draft therefore names the buyer's own choice, which is what the
+    // service group shows as selected while no quote is in hand.
     const draft = checkoutDraftFrom(
       contact,
       address,
-      quotedChoice?.id ?? null,
+      resolving ? effectiveOptionId : (quotedChoice?.id ?? null),
       notes,
       attempt.current,
     );
-    const problems = collectFieldErrors(draft);
-    const freightProblem = freightSelectionProblem(freight, quotedChoice);
 
-    if (freightProblem !== undefined) {
-      problems.shippingOptionId = freightProblem;
-    }
+    // Somebody who has pressed this has finished with every field, so every message the pass above
+    // produced is now theirs to see. The notice from an earlier attempt is NOT cleared here - see
+    // below: a submission the pass stops has sent nothing, and a notice about a possible charge
+    // has to outlive it.
+    setSubmitted(true);
 
-    setFieldErrors(problems);
-    setFailure(null);
+    // Nothing is sent while anything is wrong, and the reader is put where the work is: the first
+    // field on screen with something wrong, whose message is now rendered beside it and announced.
+    // Without this the press moves nothing - the messages appear above the fold, the caret stays on
+    // the control that appeared to do nothing, and a reader using the keyboard is told nothing at
+    // all.
+    const first = FIELDS.find((field) => problems[field.key] !== undefined);
 
-    if (Object.keys(problems).length > 0) {
+    if (first !== undefined) {
+      if (first.id !== undefined) {
+        document.getElementById(first.id)?.focus();
+      }
+
       return;
     }
 
+    // The notice from the previous attempt goes now and not before: a submission stopped by the
+    // validation pass above sent nothing, and a notice about a possible charge has to outlive a
+    // press that never left this page.
+    setFailure(null);
     setPending(true);
+
+    // The attempt, written down before it goes out, so a reply this component never receives still
+    // leaves a trail: the name to resolve it under and the instant it started.
+    const controller = new AbortController();
+    const requestStartedAt = Date.now();
+
+    // When the attempt began, which is not the same instant as this request. A submission
+    // resolving an earlier attempt carries that attempt's name, so it is the same attempt and the
+    // same possible charge; the record's instant is the one thing that says how long ago that
+    // charge could have been taken, and stamping it with a press made twenty minutes later would
+    // throw that away. A fresh attempt began now, and a record that cannot be read back is treated
+    // as one, which is the same answer `readAttemptRecord` gives a first-time buyer.
+    const earlier = resolving ? readAttemptRecord() : null;
+    const attemptStartedAt = earlier?.startedAt ?? requestStartedAt;
+
+    submission.current = controller;
+    rememberAttempt({
+      idempotencyKey: draft.idempotencyKey,
+      startedAt: attemptStartedAt,
+      orderNumber: null,
+    });
 
     let result: CheckoutResult;
 
     try {
-      result = await submitCheckout(draft);
+      result = await submitCheckout({ draft, signal: controller.signal });
     } catch (cause) {
+      // The abort this form raised as it went away. The buyer asked to leave, so there is nothing
+      // to report to them and no state of this component's left to report it in - but the order
+      // may exist, so the record stays where the next mount will find it, and the abandonment is
+      // logged rather than passed over in silence.
+      if (controller.signal.aborted) {
+        console.warn(
+          'Lumen Supply: a checkout request was abandoned when the form went away; it may still have placed an order:',
+          { attempt: draft.idempotencyKey, waitedMs: Date.now() - requestStartedAt },
+        );
+
+        return;
+      }
+
       const copy = checkoutFailureCopy(cause);
+
+      // A failure that establishes no order exists - the store's own refusal, or a request this
+      // browser never managed to send - takes the record with it, so the next mount does not raise
+      // a notice about an attempt that is settled. An unresolved outcome keeps it.
+      if (copy.kind !== 'unresolved') {
+        forgetAttempt();
+      }
 
       setFailure(copy);
       showToast({ tone: 'danger', title: copy.title });
 
       return;
     } finally {
+      if (submission.current === controller) {
+        submission.current = null;
+      }
+
       setPending(false);
     }
 
     const replayed = result.outcome === 'already_placed';
+    // The form went away while this was in flight, so the receipt has nobody to render it for and
+    // the address bar belongs to whatever page the buyer is on now. The order is real either way:
+    // the record below is how they find it, and the toast is announced from the provider above this
+    // component, which is still mounted.
+    const abandoned = controller.signal.aborted;
 
-    setPlaced(result);
+    rememberAttempt({
+      idempotencyKey: draft.idempotencyKey,
+      startedAt: attemptStartedAt,
+      orderNumber: result.order.orderNumber,
+    });
+
+    if (abandoned) {
+      console.warn('Lumen Supply: an order was placed after its checkout form went away:', {
+        orderNumber: result.order.orderNumber,
+        waitedMs: Date.now() - requestStartedAt,
+      });
+    } else {
+      // The order's own address, pushed before the receipt is stored so the two arrive together and
+      // the history entry the buyer can go Back from is the page they were filling in.
+      pushOrderAddress(result.order.orderNumber);
+      setPlaced(result);
+
+      // An order exists, which ends the review column beside this form: the cart it was reviewing
+      // has become that order, its lines were priced when the order was written and the receipt is
+      // where the figures that apply are printed, so a column still listing them would quote an
+      // estimate the buyer was charged something else for and offer quantity controls over a cart
+      // the store has closed. Told only while the form is still here, because the column is.
+      publishPlacement(true);
+    }
+
+    // The cart is read again whether or not this form is still on screen, because every surface of
+    // the storefront is still holding the one from before the order - the header badge, the drawer,
+    // and this page's own submit gate, which stays armed for as long as it is holding lines it
+    // believes in. The read is how that is settled: the store answers with the cart it holds now,
+    // or that it holds none, and each of those surfaces shows what it answered instead of the
+    // figures from before. It is fired and not awaited - the receipt does not wait on the cart -
+    // and it publishes its own outcome, which is why there is nothing to catch here.
+    void cart.refreshCart();
+
     showToast({
       tone: 'success',
       title: replayed ? 'This order was already placed' : 'Order placed',
@@ -947,7 +1979,7 @@ export function CheckoutForm({
   if (placed !== null) {
     return (
       <div className={clsx(styles.root, className)}>
-        <div className={styles.confirmation}>
+        <div className={styles.confirmation} ref={confirmationRegion} tabIndex={-1}>
           <OrderConfirmation
             order={placed}
             headline={
@@ -968,19 +2000,39 @@ export function CheckoutForm({
   // had been read leaves the lines it read in place, and those are still the figures to show.
   const cartUnknown = cart.syncStatus === 'error' && cart.lineCount === 0;
 
-  // An order needs something to ship, a shipment the store can quote, and a service it currently
-  // offers for it. Each is the buyer's to fix - the cart page for the first two, the group below
-  // for the third - so the control is unavailable rather than hidden, and the validation pass says
-  // which of them applies in words if the form is submitted with the keyboard. A cart that could
-  // not be read disables it too, on the strength of not knowing rather than of knowing the cart is
-  // empty. The service is required to be one the settled quote lists rather than merely chosen:
-  // that is the difference between a buyer being told now that their service is unavailable and
-  // being told after the order was refused.
+  // An order needs something to ship, a cart this form has read, and a request the endpoint would
+  // accept. The third is the whole of the validation pass rather than a chosen subset of it, which
+  // is the difference between a control that says whether the order can be placed and one that
+  // says whether the freight has been quoted: an address with no city is an order
+  // `POST /api/checkout` refuses, so the control is unavailable for it exactly as it is for a
+  // shipment nobody has quoted. Both of the freight obstacles are part of that pass - a shipment
+  // too large to quote and a service the settled quote does not offer are what
+  // `freightSelectionProblem` reports - so neither is repeated here.
+  //
+  // A cart that could not be read disables it too, on the strength of not knowing rather than of
+  // knowing the cart is empty.
+  //
+  // Unavailable, never hidden, and never silent: `outstanding` below names what is missing beside
+  // the control, and every field with something wrong says so itself once the buyer has finished
+  // with it.
   const readyToPlaceOrder =
-    !cartUnknown &&
-    cart.itemCount > 0 &&
-    freight.shipmentLimit === null &&
-    quotedChoice !== undefined;
+    !cartUnknown && cart.itemCount > 0 && Object.keys(problems).length === 0;
+
+  // What the place-order control is waiting for, named the way the labels above the fields name it
+  // and in the order they are read. A cart the storefront could not read is left out: its own
+  // notice is the explanation, and this line would only repeat it in weaker words.
+  const outstanding = FIELDS.filter((field) => problems[field.key] !== undefined).map(
+    (field) => field.label,
+  );
+
+  let blocked: string | null = null;
+
+  if (!readyToPlaceOrder && !cartUnknown) {
+    blocked =
+      cart.itemCount === 0
+        ? 'Place order becomes available once the cart holds something to ship.'
+        : `Place order becomes available once these are complete: ${listed(outstanding)}.`;
+  }
 
   return (
     <form
@@ -991,261 +2043,371 @@ export function CheckoutForm({
         void submitOrder(event);
       }}
     >
-      <section className={styles.section}>
-        <h2 className={styles.sectionTitle}>Contact details</h2>
-
-        <div className={styles.grid}>
-          <FormField id={CONTACT_NAME_ID} label="Contact name" required error={fieldErrors.name}>
-            {({ id, describedBy }) => (
-              <Input
-                id={id}
-                name="name"
-                autoComplete="name"
-                required
-                maxLength={MAX_NAME_LENGTH}
-                value={contact.name}
-                invalid={fieldErrors.name !== undefined}
-                aria-describedby={describedBy}
-                onChange={(event) => {
-                  setContact((current) => ({ ...current, name: event.target.value }));
-                }}
-              />
-            )}
-          </FormField>
-
-          <FormField id={CONTACT_COMPANY_ID} label="Company" error={fieldErrors.company}>
-            {({ id, describedBy }) => (
-              <Input
-                id={id}
-                name="company"
-                autoComplete="organization"
-                maxLength={MAX_COMPANY_LENGTH}
-                value={contact.company}
-                invalid={fieldErrors.company !== undefined}
-                aria-describedby={describedBy}
-                onChange={(event) => {
-                  setContact((current) => ({ ...current, company: event.target.value }));
-                }}
-              />
-            )}
-          </FormField>
-
-          <FormField
-            id={CONTACT_EMAIL_ID}
-            label="Email"
-            hint="The order confirmation and dispatch notice are sent here."
-            required
-            error={fieldErrors.email}
-            className={clsx(styles.fieldWide)}
+      {/* An order this tab placed and never showed a receipt for, named at the top of the form
+          because it is the first thing its buyer needs: the reference, and somewhere to go for the
+          rest of it. `success` rather than `danger` - the order exists and nothing went wrong with
+          it - which `Alert` announces politely, and the form below stays as it was, since the cart
+          it would order is already an order. It appears only where the address does not name the
+          order itself; there `app/checkout/page.tsx` has already said so. */}
+      {recoveredOrder === null ? null : (
+        <div className={styles.orderNotice}>
+          <Alert
+            tone="success"
+            title={`Order ${recoveredOrder} is placed`}
+            actions={
+              <Link className={styles.noticeLink} href={ORDERS_PATH}>
+                View your orders
+              </Link>
+            }
           >
-            {({ id, describedBy }) => (
-              <Input
-                id={id}
-                type="email"
-                name="email"
-                autoComplete="email"
-                required
-                maxLength={MAX_EMAIL_LENGTH}
-                value={contact.email}
-                invalid={fieldErrors.email !== undefined}
-                aria-describedby={describedBy}
-                onChange={(event) => {
-                  setContact((current) => ({ ...current, email: event.target.value }));
-                }}
-              />
-            )}
-          </FormField>
+            {'This order was placed from this browser while the confirmation was not on screen, ' +
+              'so it is named here instead. Keep the order number for your records and quote it ' +
+              'to Lumen Supply about anything to do with this order.'}
+          </Alert>
         </div>
-      </section>
+      )}
 
-      <section className={styles.section}>
-        <h2 className={styles.sectionTitle}>Shipping address</h2>
+      {/* Every field of the order in one group that locks while the order is in flight.
+          A submission carries the values the draft was assembled from, so an edit made after it
+          went out cannot reach the order it would appear to change - the buyer would be typing into
+          a request that has already left. `disabled` on the group is the whole of the lock: it is
+          the one attribute that makes every control inside it inert and announced as unavailable,
+          including the ones this form composes through `FormField`, and the primitives' own
+          `:disabled` treatments give it its appearance without this module restating any of them.
+          The freight group inside is also passed `pending` in its own right, so it reads as
+          unavailable whether it is read through this group or on its own.
 
-        <div className={styles.grid}>
-          <FormField
-            id={ADDRESS_LINE1_ID}
-            label="Street address"
-            required
-            error={fieldErrors.line1}
-            className={clsx(styles.fieldWide)}
-          >
-            {({ id, describedBy }) => (
-              <Input
-                id={id}
-                name="line1"
-                autoComplete="address-line1"
-                required
-                maxLength={MAX_ADDRESS_LINE_LENGTH}
-                value={address.line1}
-                invalid={fieldErrors.line1 !== undefined}
-                aria-describedby={describedBy}
-                onChange={(event) => {
-                  setAddress((current) => ({ ...current, line1: event.target.value }));
-                }}
-              />
+          `styles.fields` is a reset, and it exists because a fieldset arrives with a border, a
+          padding and a min-width of its own, and because the four groups below were direct
+          children of `.root`'s column before this element existed. It reproduces that column
+          exactly - same direction, same gap - so the rhythm, the hairline between consecutive
+          groups and the field grid's container query all resolve exactly as they did. */}
+      <fieldset className={styles.fields} disabled={pending}>
+        <section className={styles.section}>
+          <h2 className={styles.sectionTitle}>Contact details</h2>
+
+          <div className={styles.grid}>
+            <FormField
+              id={CONTACT_NAME_ID}
+              label="Contact name"
+              required
+              error={revealed.name}
+              count={{ length: fields.contact.name.length, max: MAX_NAME_LENGTH }}
+            >
+              {({ id, describedBy }) => (
+                <Input
+                  id={id}
+                  name="name"
+                  autoComplete="name"
+                  required
+                  value={contact.name}
+                  invalid={revealed.name !== undefined}
+                  aria-describedby={describedBy}
+                  onChange={(event) => {
+                    setContact((current) => ({ ...current, name: event.target.value }));
+                  }}
+                  onBlur={() => {
+                    touch('name');
+                  }}
+                />
+              )}
+            </FormField>
+
+            <FormField
+              id={CONTACT_COMPANY_ID}
+              label="Company"
+              error={revealed.company}
+              count={{ length: fields.contact.company?.length ?? 0, max: MAX_COMPANY_LENGTH }}
+            >
+              {({ id, describedBy }) => (
+                <Input
+                  id={id}
+                  name="company"
+                  autoComplete="organization"
+                  value={contact.company}
+                  invalid={revealed.company !== undefined}
+                  aria-describedby={describedBy}
+                  onChange={(event) => {
+                    setContact((current) => ({ ...current, company: event.target.value }));
+                  }}
+                  onBlur={() => {
+                    touch('company');
+                  }}
+                />
+              )}
+            </FormField>
+
+            <FormField
+              id={CONTACT_EMAIL_ID}
+              label="Email"
+              hint="The order confirmation and dispatch notice are sent here."
+              required
+              error={revealed.email}
+              count={{ length: fields.contact.email.length, max: MAX_EMAIL_LENGTH }}
+              className={clsx(styles.fieldWide)}
+            >
+              {({ id, describedBy }) => (
+                <Input
+                  id={id}
+                  type="email"
+                  name="email"
+                  autoComplete="email"
+                  required
+                  value={contact.email}
+                  invalid={revealed.email !== undefined}
+                  aria-describedby={describedBy}
+                  onChange={(event) => {
+                    setContact((current) => ({ ...current, email: event.target.value }));
+                  }}
+                  onBlur={() => {
+                    touch('email');
+                  }}
+                />
+              )}
+            </FormField>
+          </div>
+        </section>
+
+        <section className={styles.section}>
+          <h2 className={styles.sectionTitle}>Shipping address</h2>
+
+          <div className={styles.grid}>
+            <FormField
+              id={ADDRESS_LINE1_ID}
+              label="Street address"
+              required
+              error={revealed.line1}
+              count={{ length: fields.shippingAddress.line1.length, max: MAX_ADDRESS_LINE_LENGTH }}
+              className={clsx(styles.fieldWide)}
+            >
+              {({ id, describedBy }) => (
+                <Input
+                  id={id}
+                  name="line1"
+                  autoComplete="address-line1"
+                  required
+                  value={address.line1}
+                  invalid={revealed.line1 !== undefined}
+                  aria-describedby={describedBy}
+                  onChange={(event) => {
+                    setAddress((current) => ({ ...current, line1: event.target.value }));
+                  }}
+                  onBlur={() => {
+                    touch('line1');
+                  }}
+                />
+              )}
+            </FormField>
+
+            <FormField
+              id={ADDRESS_LINE2_ID}
+              label="Suite, unit or floor"
+              error={revealed.line2}
+              count={{
+                length: fields.shippingAddress.line2?.length ?? 0,
+                max: MAX_ADDRESS_LINE_LENGTH,
+              }}
+              className={clsx(styles.fieldWide)}
+            >
+              {({ id, describedBy }) => (
+                <Input
+                  id={id}
+                  name="line2"
+                  autoComplete="address-line2"
+                  value={address.line2}
+                  invalid={revealed.line2 !== undefined}
+                  aria-describedby={describedBy}
+                  onChange={(event) => {
+                    setAddress((current) => ({ ...current, line2: event.target.value }));
+                  }}
+                  onBlur={() => {
+                    touch('line2');
+                  }}
+                />
+              )}
+            </FormField>
+
+            <FormField
+              id={ADDRESS_CITY_ID}
+              label="City"
+              required
+              error={revealed.city}
+              count={{ length: fields.shippingAddress.city.length, max: MAX_CITY_LENGTH }}
+            >
+              {({ id, describedBy }) => (
+                <Input
+                  id={id}
+                  name="city"
+                  autoComplete="address-level2"
+                  required
+                  value={address.city}
+                  invalid={revealed.city !== undefined}
+                  aria-describedby={describedBy}
+                  onChange={(event) => {
+                    setAddress((current) => ({ ...current, city: event.target.value }));
+                  }}
+                  onBlur={() => {
+                    touch('city');
+                  }}
+                />
+              )}
+            </FormField>
+
+            <FormField
+              id={ADDRESS_REGION_ID}
+              label="State or region"
+              required
+              error={revealed.region}
+              count={{ length: fields.shippingAddress.region.length, max: MAX_REGION_LENGTH }}
+            >
+              {({ id, describedBy }) => (
+                <Input
+                  id={id}
+                  name="region"
+                  autoComplete="address-level1"
+                  required
+                  value={address.region}
+                  invalid={revealed.region !== undefined}
+                  aria-describedby={describedBy}
+                  onChange={(event) => {
+                    setAddress((current) => ({ ...current, region: event.target.value }));
+                  }}
+                  onBlur={() => {
+                    touch('region');
+                  }}
+                />
+              )}
+            </FormField>
+
+            {/*
+              The hint says what is true of the destination in the field rather than a single
+              sentence for every state of it. A quote in hand is the only state in which freight
+              *has* been quoted for this destination, so that is the only state that says so; a
+              field that has not been asked about carries the country's own format instead, which is
+              what a buyer needs in order to write one; and a field at fault carries no hint at all,
+              because the fault below it ends with that same format sentence. The error is the live
+              destination judgement, and it holds whatever the submit pass last wrote: a fault the
+              buyer can see as they type is worth more than one they are shown after pressing a
+              button, and the two agree because both read the same module.
+            */}
+            <FormField
+              id={ADDRESS_POSTAL_CODE_ID}
+              label="Postal code"
+              hint={postalCodeHint}
+              required
+              error={revealed.postalCode}
+              count={{
+                length: fields.shippingAddress.postalCode.length,
+                max: MAX_POSTAL_CODE_LENGTH,
+              }}
+            >
+              {({ id, describedBy }) => (
+                <Input
+                  id={id}
+                  name="postalCode"
+                  autoComplete="postal-code"
+                  required
+                  value={address.postalCode}
+                  invalid={revealed.postalCode !== undefined}
+                  aria-describedby={describedBy}
+                  onChange={(event) => {
+                    setAddress((current) => ({ ...current, postalCode: event.target.value }));
+                  }}
+                  onBlur={() => {
+                    touch('postalCode');
+                  }}
+                />
+              )}
+            </FormField>
+
+            <FormField id={ADDRESS_COUNTRY_ID} label="Country" required error={revealed.country}>
+              {({ id, describedBy }) => (
+                <Select
+                  id={id}
+                  name="country"
+                  autoComplete="country"
+                  required
+                  value={address.country}
+                  invalid={revealed.country !== undefined}
+                  aria-describedby={describedBy}
+                  onChange={(event) => {
+                    setAddress((current) => ({ ...current, country: event.target.value }));
+                  }}
+                  onBlur={() => {
+                    touch('country');
+                  }}
+                >
+                  {FREIGHT_DESTINATIONS.map((option) => (
+                    <option key={option.code} value={option.code}>
+                      {option.label}
+                    </option>
+                  ))}
+                  {offered ? null : <option value={address.country}>{address.country}</option>}
+                </Select>
+              )}
+            </FormField>
+          </div>
+        </section>
+
+        <section className={styles.section}>
+          <h2 className={styles.sectionTitle}>Delivery options</h2>
+
+          <div className={styles.shipping}>
+            <ShippingOptionPicker
+              selectedId={effectiveOptionId}
+              postalCode={destination}
+              country={destinationCountry}
+              quote={freight}
+              disabled={pending}
+              onSelect={(optionId) => {
+                setShippingOptionId(optionId);
+                touch('shippingOptionId');
+              }}
+            />
+
+            {revealed.shippingOptionId === undefined ? null : (
+              <Alert tone="warning">{revealed.shippingOptionId}</Alert>
             )}
-          </FormField>
+          </div>
+        </section>
 
-          <FormField
-            id={ADDRESS_LINE2_ID}
-            label="Suite, unit or floor"
-            error={fieldErrors.line2}
-            className={clsx(styles.fieldWide)}
-          >
-            {({ id, describedBy }) => (
-              <Input
-                id={id}
-                name="line2"
-                autoComplete="address-line2"
-                maxLength={MAX_ADDRESS_LINE_LENGTH}
-                value={address.line2}
-                invalid={fieldErrors.line2 !== undefined}
-                aria-describedby={describedBy}
-                onChange={(event) => {
-                  setAddress((current) => ({ ...current, line2: event.target.value }));
-                }}
-              />
-            )}
-          </FormField>
+        <section className={styles.section}>
+          <h2 className={styles.sectionTitle}>Delivery notes</h2>
 
-          <FormField id={ADDRESS_CITY_ID} label="City" required error={fieldErrors.city}>
-            {({ id, describedBy }) => (
-              <Input
-                id={id}
-                name="city"
-                autoComplete="address-level2"
-                required
-                maxLength={MAX_CITY_LENGTH}
-                value={address.city}
-                invalid={fieldErrors.city !== undefined}
-                aria-describedby={describedBy}
-                onChange={(event) => {
-                  setAddress((current) => ({ ...current, city: event.target.value }));
-                }}
-              />
-            )}
-          </FormField>
-
-          <FormField
-            id={ADDRESS_REGION_ID}
-            label="State or region"
-            required
-            error={fieldErrors.region}
-          >
-            {({ id, describedBy }) => (
-              <Input
-                id={id}
-                name="region"
-                autoComplete="address-level1"
-                required
-                maxLength={MAX_REGION_LENGTH}
-                value={address.region}
-                invalid={fieldErrors.region !== undefined}
-                aria-describedby={describedBy}
-                onChange={(event) => {
-                  setAddress((current) => ({ ...current, region: event.target.value }));
-                }}
-              />
-            )}
-          </FormField>
-
-          <FormField
-            id={ADDRESS_POSTAL_CODE_ID}
-            label="Postal code"
-            hint="Freight is quoted for this destination."
-            required
-            error={fieldErrors.postalCode}
-          >
-            {({ id, describedBy }) => (
-              <Input
-                id={id}
-                name="postalCode"
-                autoComplete="postal-code"
-                required
-                maxLength={MAX_POSTAL_CODE_LENGTH}
-                value={address.postalCode}
-                invalid={fieldErrors.postalCode !== undefined}
-                aria-describedby={describedBy}
-                onChange={(event) => {
-                  setAddress((current) => ({ ...current, postalCode: event.target.value }));
-                }}
-              />
-            )}
-          </FormField>
-
-          <FormField id={ADDRESS_COUNTRY_ID} label="Country" required error={fieldErrors.country}>
-            {({ id, describedBy }) => (
-              <Select
-                id={id}
-                name="country"
-                autoComplete="country"
-                required
-                value={address.country}
-                invalid={fieldErrors.country !== undefined}
-                aria-describedby={describedBy}
-                onChange={(event) => {
-                  setAddress((current) => ({ ...current, country: event.target.value }));
-                }}
-              >
-                {DESTINATION_COUNTRIES.map((destination) => (
-                  <option key={destination.code} value={destination.code}>
-                    {destination.label}
-                  </option>
-                ))}
-              </Select>
-            )}
-          </FormField>
-        </div>
-      </section>
-
-      <section className={styles.section}>
-        <h2 className={styles.sectionTitle}>Delivery options</h2>
-
-        <div className={styles.shipping}>
-          <ShippingOptionPicker
-            options={shippingOptions}
-            selectedId={effectiveOptionId}
-            postalCode={destination}
-            quote={freight}
-            disabled={pending}
-            onSelect={(optionId) => {
-              setShippingOptionId(optionId);
-            }}
-          />
-
-          {fieldErrors.shippingOptionId === undefined ? null : (
-            <Alert tone="warning">{fieldErrors.shippingOptionId}</Alert>
-          )}
-        </div>
-      </section>
-
-      <section className={styles.section}>
-        <h2 className={styles.sectionTitle}>Delivery notes</h2>
-
-        <div className={styles.grid}>
-          <FormField
-            id={DELIVERY_NOTES_ID}
-            label="Notes for the warehouse"
-            hint="Dock hours, a purchase-order reference, anything the packers should know."
-            error={fieldErrors.notes}
-            className={clsx(styles.fieldWide)}
-          >
-            {({ id, describedBy }) => (
-              <Input
-                id={id}
-                name="notes"
-                maxLength={MAX_NOTES_LENGTH}
-                value={notes}
-                invalid={fieldErrors.notes !== undefined}
-                aria-describedby={describedBy}
-                onChange={(event) => {
-                  setNotes(event.target.value);
-                }}
-              />
-            )}
-          </FormField>
-        </div>
-      </section>
+          <div className={styles.grid}>
+            {/* The one field of this form that is a paragraph rather than a line, so the control is
+                the one the hint invites: several hundred characters of dock hours and reference
+                numbers belong on several lines, and a single-line box shows a buyer four words of
+                what they wrote. `NOTES_ROWS` is what it opens at; the stylesheet lets it be dragged
+                taller and never wider. */}
+            <FormField
+              id={DELIVERY_NOTES_ID}
+              label="Notes for the warehouse"
+              hint="Dock hours, a purchase-order reference, anything the packers should know."
+              error={revealed.notes}
+              count={{ length: fields.notes?.length ?? 0, max: MAX_NOTES_LENGTH }}
+              className={clsx(styles.fieldWide)}
+            >
+              {({ id, describedBy }) => (
+                <Textarea
+                  rows={NOTES_ROWS}
+                  id={id}
+                  name="notes"
+                  value={notes}
+                  invalid={revealed.notes !== undefined}
+                  aria-describedby={describedBy}
+                  onChange={(event) => {
+                    setNotes(event.target.value);
+                  }}
+                  onBlur={() => {
+                    touch('notes');
+                  }}
+                />
+              )}
+            </FormField>
+          </div>
+        </section>
+      </fieldset>
 
       {failure === null ? null : (
         <div className={styles.failure} ref={failureRegion} tabIndex={-1}>
@@ -1282,9 +2444,14 @@ export function CheckoutForm({
 
       {cartUnknown ? (
         <div className={styles.cartNotice}>
+          {/* The heading comes from the cart rather than being fixed here, so it names the same
+              operation as the sentence under it: the cart publishes both together, and a notice
+              headed for one operation over wording about another tells a buyer to fix something
+              that is not broken. The fallback covers the one case the cart publishes no wording
+              for, which is a read that never answered at all. */}
           <Alert
             tone="danger"
-            title="Your cart could not be read"
+            title={cart.cartErrorTitle ?? CART_UNREAD_TITLE}
             actions={
               <Button
                 variant="secondary"
@@ -1303,6 +2470,18 @@ export function CheckoutForm({
         </div>
       ) : null}
 
+      {/* Why the place-order control is unavailable, in the words of the labels above the fields.
+          It is the answer to the question a disabled button asks and used not to answer: the
+          control is inert, so pressing it reports nothing, and a buyer who cannot see what is
+          missing has nowhere to go. `role="status"` rather than an alert, because this is guidance
+          and not a failure - and because its text changes only when a field's validity changes,
+          never on a keystroke, so it announces once per thing settled. */}
+      {blocked === null ? null : (
+        <p className={styles.outstanding} role="status">
+          {blocked}
+        </p>
+      )}
+
       <div className={styles.submitRow}>
         <CheckoutButton pending={pending} disabled={!readyToPlaceOrder} />
 
@@ -1311,7 +2490,9 @@ export function CheckoutForm({
             be read has figures, and printing a zero for either would be this form asserting an
             empty cart it has no grounds to assert. */}
         {cart.syncStatus === 'loading' || cartUnknown ? null : (
-          <p>{orderSizeLabel(cart.itemCount, cart.subtotalLabel)}</p>
+          <p className={styles.submitCaption}>
+            {orderSizeLabel(cart.itemCount, cart.subtotalLabel)}
+          </p>
         )}
       </div>
     </form>

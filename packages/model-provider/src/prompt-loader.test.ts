@@ -1692,6 +1692,122 @@ describe('renderPrompt', () => {
     expect(error.code).toBe('INTERNAL');
   });
 
+  for (const [label, values] of [
+    ['null', null],
+    ['undefined', undefined],
+  ] as const) {
+    it(`reports a ${label} values argument as a failure rather than throwing`, () => {
+      // The two ways a call arrives here with nothing: a context builder that
+      // returned no substitutions, and an untyped JavaScript call site that
+      // omitted the argument. Both reach `Object.hasOwn(values, key)` in the
+      // scan, which rejects a nullish receiver — so an unguarded renderer
+      // throws `TypeError: Cannot convert undefined or null to object` out of a
+      // function every caller invokes for its `Result`, and the stage around it
+      // loses its typed failure, its hint and its session status to an
+      // exception nothing on that path catches. `errorOf` would report the
+      // throw rather than swallow it, so this case cannot pass by accident.
+      const error = errorOf(renderPrompt('a {{b}}', values as unknown as Record<string, string>));
+
+      expect(error.code).toBe('CONFIG_INVALID');
+      expect(error.message).toContain('1 placeholder(s)');
+      expect(error.details?.missingPlaceholders).toEqual(['b']);
+      // Which of two different call-site mistakes this is: no object at all,
+      // rather than an object that happens to lack the key.
+      expect(error.details?.valuesSupplied).toBe(false);
+      expect(error.hint).toContain('Supply a value for every placeholder');
+    });
+  }
+
+  it('names every placeholder the template has when no values are supplied at all', () => {
+    // The same rule as a partially supplied record — all of them in one
+    // failure, a key named twice counted once — so the nullish case is not a
+    // second, thinner error path that reports less.
+    const error = errorOf(
+      renderPrompt(
+        '{{schema}} {{evidenceRule}} {{schema}}',
+        null as unknown as Record<string, string>,
+      ),
+    );
+
+    expect(error.code).toBe('CONFIG_INVALID');
+    expect(error.message).toContain('2 placeholder(s)');
+    expect(error.details?.missingPlaceholders).toEqual(['evidenceRule', 'schema']);
+  });
+
+  it('renders a template that names no placeholder even when no values are supplied', () => {
+    // The second reader of this argument, and the one a placeholder case never
+    // reaches: the unused-key diagnostic calls `Object.keys(values)` after a
+    // clean scan, so a placeholder-free template threw on the way out of a
+    // render that had already succeeded. There is nothing to substitute and
+    // nothing missing, so the template is the answer.
+    const template = 'A prompt that names no placeholder.';
+
+    expect(valueOf(renderPrompt(template, null as unknown as Record<string, string>))).toBe(
+      template,
+    );
+    expect(valueOf(renderPrompt(template, undefined as unknown as Record<string, string>))).toBe(
+      template,
+    );
+    expect(valueOf(renderPrompt('', null as unknown as Record<string, string>))).toBe('');
+  });
+
+  it('answers a one-argument call from untyped JavaScript with a Result', () => {
+    // The shape a bundled consumer or a REPL produces: the argument is not
+    // passed at all rather than passed as `undefined`. Typed away by the
+    // signature, reachable at runtime, and answered the same way.
+    const untypedCall = renderPrompt as unknown as (
+      template: string,
+    ) => Result<string, DebuggenError>;
+
+    const error = errorOf(untypedCall('a {{b}}'));
+
+    expect(error.code).toBe('CONFIG_INVALID');
+    expect(error.details?.valuesSupplied).toBe(false);
+  });
+
+  it('reports a non-string template before it reports absent values', () => {
+    // Both arguments malformed: the template is the primary input and the more
+    // specific failure, so it is the one reported. A guard order that reversed
+    // this would answer 'no values supplied' for a call that has no prompt.
+    const error = errorOf(
+      renderPrompt(undefined as unknown as string, undefined as unknown as Record<string, string>),
+    );
+
+    expect(error.code).toBe('INTERNAL');
+    expect(error.message).toBe('A prompt template must be a string.');
+  });
+
+  it('records that no values arrived, and nothing else about them', () => {
+    const { logger, records } = recordingLogger();
+
+    const result = renderPrompt(
+      'A prompt that names no placeholder.',
+      null as unknown as Record<string, string>,
+      logger,
+    );
+
+    expect(isOk(result)).toBe(true);
+    const debugLines = records.filter((entry) => entry.level === 'debug');
+    expect(debugLines).toHaveLength(1);
+    expect(debugLines[0]?.message).toContain('No placeholder values were supplied');
+    expect(debugLines[0]?.fields?.valuesType).toBe('null');
+  });
+
+  it('keeps the shared stand-in record from being mutated by a render', () => {
+    // The empty record every nullish call is read as is one frozen
+    // module-level instance. Freezing is what stops a caller from reaching it
+    // through a later render and seeding a value every subsequent nullish call
+    // would then see — so this asserts the render does not write to it, by
+    // asserting a second call is unaffected by a first.
+    expect(errorOf(renderPrompt('{{a}}', null as unknown as Record<string, string>)).code).toBe(
+      'CONFIG_INVALID',
+    );
+
+    const second = errorOf(renderPrompt('{{a}}', undefined as unknown as Record<string, string>));
+
+    expect(second.details?.missingPlaceholders).toEqual(['a']);
+  });
+
   it('renders a text that came from the loader, and reports its unfilled tokens', () => {
     // The seam the two halves of this module meet at: a stage loads its
     // versioned file and renders it. Both directions are asserted on the same

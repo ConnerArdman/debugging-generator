@@ -2,9 +2,10 @@
  * Lumen Supply - the cart at its own address (`/cart`).
  *
  * The route is the full-page reading of what a buyer has collected: the lines themselves, what
- * they come to, and the two ways on from here. `SiteHeader`'s slide-over quotes the same cart in
- * the same words, because both surfaces compose the same two components; this page is the version
- * a buyer can sit with, print, or leave open in a tab while they check a part number.
+ * they come to, and the ways on from here. `SiteHeader`'s slide-over quotes the same cart in the
+ * same words, and answers the same question about checking out, because both surfaces compose the
+ * same components and read the same published summary; this page is the version a buyer can sit
+ * with, print, or leave open in a tab while they check a part number.
  *
  * A SERVER COMPONENT THAT READS NOTHING
  * There is no `'use client'` directive and no data access of any kind: nothing from `@/server/**`,
@@ -17,22 +18,25 @@
  *
  * WHAT THE PAGE OWNS
  * Four things, and nothing else: the ancestry trail, the heading block, the arrangement of the two
- * columns, and the two destinations at the foot. Every piece of cart behaviour - a failure a
- * reader can act on and its retry control, the placeholders shown while the cart is first read,
- * the empty block, the lines with their quantity steppers and remove controls, the units, the
- * subtotal, the free-freight wording and the dispatch promise - belongs to `CartLineList` and
- * `CartTotalsPanel`. Restating any of it here would give the cart two descriptions in one
- * document and one file to forget when the other changed.
+ * columns, and the placing of the row of actions at the foot. Every piece of cart behaviour - a
+ * failure a reader can act on and its retry control, the placeholders shown while the cart is
+ * first read, the empty block, the lines with their quantity steppers and remove controls, the
+ * units, the subtotal, the free-freight wording and the dispatch promise - belongs to
+ * `CartLineList` and `CartTotalsPanel`; which way on the cart can offer, and how each one is
+ * painted, belongs to `CartPageActions`. Restating any of it here would give the cart two
+ * descriptions in one document and one file to forget when the other changed.
  *
  * That includes the state where the storefront has not established what the cart holds, which is
- * why both blocks are mounted unconditionally below. A server component cannot read the cart -
+ * why all three blocks are mounted unconditionally below. A server component cannot read the cart -
  * its contents belong to the client provider - so the decision cannot be taken here at all, and
  * it does not need to be: `@/hooks/useCartSummary` publishes either the cart's totals or the
  * reason there are none, and each block resolves that for itself. `CartTotalsPanel` withholds
- * every figure while the contents are unestablished, printing the state in their place rather
- * than a subtotal of nothing, and `CartLineList` carries the failure notice with its retry, or
- * the placeholders while the first read is in flight. Gating either of them from this file would
- * be this page deciding a question it has no way to answer.
+ * every figure while the contents are unestablished or the cart holds nothing, printing the state
+ * in their place rather than a subtotal of nothing; `CartLineList` carries the failure notice with
+ * its retry, or the placeholders while the first read is in flight; and `CartPageActions` offers
+ * checkout only for a cart that is known to hold a line, which is the condition the slide-over
+ * puts on its own footer. Gating any of them from this file would be this page deciding a question
+ * it has no way to answer.
  *
  * WHY EACH COMPONENT IS PASSED SO LITTLE
  * `variant="page"` is the whole of the configuration, and it is what selects the roomier of the two
@@ -68,10 +72,10 @@
  */
 
 import type { Metadata } from 'next';
-import Link from 'next/link';
 import type { ReactElement } from 'react';
 
 import { CartLineList } from '@/components/cart/CartLineList';
+import { CartPageActions } from '@/components/cart/CartPageActions';
 import { CartTotalsPanel } from '@/components/cart/CartTotalsPanel';
 import { BreadcrumbTrail, type BreadcrumbCrumb } from '@/components/layout/BreadcrumbTrail';
 
@@ -107,12 +111,6 @@ const PAGE_LEDE =
  */
 const CRUMBS: readonly BreadcrumbCrumb[] = [{ label: 'Catalog', href: '/' }, { label: PAGE_TITLE }];
 
-/** The way forward, in a buyer's words rather than the router's. */
-const CHECKOUT_LABEL = 'Proceed to checkout';
-
-/** The way back, for a buyer who is still adding to the cart rather than finishing with it. */
-const CATALOG_LABEL = 'Continue shopping';
-
 /**
  * Rendering mode for this segment: one pass per request, and nothing read at build time.
  *
@@ -134,7 +132,7 @@ export const dynamic = 'force-dynamic';
 export const metadata: Metadata = { title: PAGE_TITLE };
 
 /**
- * The cart page: the trail, the heading, the lines beside their totals, and the two ways on.
+ * The cart page: the trail, the heading, the lines beside their totals, and the row of actions.
  *
  * The two columns are a `.ls-split`, which is a single column until there is room for the second
  * one, so the page needs no breakpoint of its own. The lines come first in the document, and
@@ -142,11 +140,13 @@ export const metadata: Metadata = { title: PAGE_TITLE };
  * and beneath them on a narrow one. The row at the foot follows both, so a buyer reaches the cart
  * they are deciding about before the decision.
  *
- * Both destinations are plain anchors. A link that navigates is an anchor, and wrapping one in a
- * control would nest two interactive elements and announce the pair twice; the wording carries
- * where each one goes, so neither needs a label of its own. They are offered unconditionally,
- * because this file holds no cart to test - an empty cart still shows the way back to the catalog,
- * and the checkout route answers an empty cart itself.
+ * The destinations themselves are `CartPageActions`, which is one line here and everything there:
+ * both are plain anchors wearing the button stylesheet's own class, because a link that navigates
+ * is an anchor and wrapping one in a control would nest two interactive elements and announce the
+ * pair twice; the wording carries where each one goes, so neither needs a label of its own. Which
+ * of them a given cart can offer is that component's to answer, since it is the layer that can
+ * read the cart - checkout for a cart known to hold a line, the catalog in every state - and this
+ * file supplies only the row they sit in.
  *
  * @returns The page's content, which the layout places inside the document's single main region.
  */
@@ -171,8 +171,7 @@ export default function CartPage(): ReactElement {
       </div>
 
       <div className="ls-actions">
-        <Link href="/checkout">{CHECKOUT_LABEL}</Link>
-        <Link href="/">{CATALOG_LABEL}</Link>
+        <CartPageActions />
       </div>
     </div>
   );

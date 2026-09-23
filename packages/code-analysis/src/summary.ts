@@ -43,10 +43,15 @@
  * rather than a style preference (AAP 0.5.2):
  *
  * - **No environment values, ever.** This module reads no environment
- *   variable, and reads no `.env` file: the only file it opens is the target
- *   project's `package.json`, and every existence probe it makes runs through
- *   `./project.ts`'s {@link isEnvFilePath} and {@link shouldExcludePath} first,
- *   so an environment file cannot be probed, let alone read.
+ *   variable, and reads no `.env` file: the only file it opens is a
+ *   `package.json` — the target project's, and, when the target is a member of
+ *   a workspace, that workspace root's, for the one field
+ *   {@link detectPackageManager} falls back to — and every existence probe it
+ *   makes runs through `./project.ts`'s {@link isEnvFilePath} and
+ *   {@link shouldExcludePath} first, so an environment file cannot be probed,
+ *   let alone read. Locating the workspace root belongs to `./project.ts`
+ *   ({@link findWorkspaceRoot}), which applies the same environment-file
+ *   refusal to every file it reads.
  * - **No file contents.** Nothing here carries a source excerpt, a statement, a
  *   connection string or a configuration value. From the manifest it takes
  *   *names* and declared *version range strings* and nothing else — not
@@ -54,6 +59,9 @@
  * - **No host paths.** {@link ProjectSummary.projectRoot} is the single
  *   absolute path in the object; every other path is project-relative POSIX,
  *   and a path that fails `isSafeRelativePath` is dropped rather than repaired.
+ *   A workspace root found above the project is *not* a field of the summary:
+ *   it exists only as an argument to the package-manager detector and as a
+ *   `debug` log line.
  * - **No excluded tree is inspected.** `node_modules`, `.next`, `dist` and
  *   their siblings are refused by the same predicate the indexer uses, so an
  *   installed dependency's own layout can never appear here.
@@ -72,9 +80,11 @@
  * It does not index (`./indexer.ts`), it does not derive routes
  * (`./route-map.ts` owns that, and this module reports what it derived), it
  * does not cache (`./cache.ts`), and it holds no state: `summarizeProject` is a
- * pure function of its input plus two bounded filesystem reads, it mutates
- * nothing it is given, and calling it twice costs exactly twice as much as
- * calling it once.
+ * pure function of its input plus a bounded set of filesystem reads — the
+ * target's manifest, its existence probes, and the workspace-root lookup and
+ * that root's manifest behind {@link detectPackageManager}'s fallback — it
+ * mutates nothing it is given, and calling it twice costs exactly twice as much
+ * as calling it once.
  *
  * @packageDocumentation
  */
@@ -113,7 +123,7 @@ import type {
   RouterStyle,
   TypeScriptInfo,
 } from './graph/types.js';
-import { isEnvFilePath, shouldExcludePath } from './project.js';
+import { findWorkspaceRoot, isEnvFilePath, shouldExcludePath } from './project.js';
 import type { LoadedProject } from './project.js';
 import type { RouteMap } from './route-map.js';
 
@@ -848,6 +858,34 @@ export function detectRouterStyle(
 }
 
 /**
+ * The workspace root's manifest and probe, for
+ * {@link detectPackageManager}'s fallback.
+ *
+ * The pair rather than a root path, because this detector — like every other
+ * one in this module — performs no filesystem access of its own: a caller that
+ * has established a workspace root with `./project.ts`'s `findWorkspaceRoot`
+ * builds the same two inputs it already builds for the target
+ * ({@link readTargetManifest}, {@link createProjectProbe}) against that root
+ * and passes them here, and a test builds them from a literal object and a
+ * three-line fake probe.
+ */
+export interface WorkspacePackageManagerFallback {
+  /**
+   * The workspace root's parsed manifest, or `undefined` when it has none that
+   * could be read.
+   *
+   * **Only its `packageManager` field is consulted.** Nothing else from a
+   * workspace root may reach the summary: its dependencies are not the target's
+   * dependencies, its name is not the target's name, and neither is offered to
+   * {@link detectFramework}, `collectDependencies` or the project name.
+   */
+  readonly manifest?: TargetManifest | undefined;
+
+  /** An existence probe bound to the workspace root, for its lockfiles. */
+  readonly probe: ProjectProbe;
+}
+
+/**
  * Which package manager the project uses.
  *
  * **The target project's own declaration wins over everything else**, which is
@@ -868,33 +906,84 @@ export function detectRouterStyle(
  * that read this field *suggest a command line* to the developer. An honest
  * `'unknown'` costs a prompt; a wrong guess costs a failed command.
  *
+ * ## Resolution order
+ *
+ * 1. The **target's own** `packageManager` declaration.
+ * 2. The **target's own** lockfiles, under the counting rule above.
+ * 3. The **workspace root's** `packageManager` declaration, when `workspace` is
+ *    supplied.
+ * 4. The **workspace root's** lockfiles, under the same counting rule.
+ * 5. `'unknown'`.
+ *
+ * Steps 3 and 4 exist because a monorepo keeps its lockfile and its pin at the
+ * repository root: a target that is one workspace member — `apps/<name>`,
+ * which is the shape of this product's own demo target and of most projects a
+ * developer opens in a monorepo — declares neither of its own, and answering
+ * `'unknown'` for it leaves the dev-server launcher (AAP 0.7.1 Group 2) with no
+ * manager to form a relaunch command from and hands Stage 1 a project summary
+ * that knows less than the repository does.
+ *
+ * The target's own declaration still wins over its workspace root's, and the
+ * order is not a preference for the nearer file: a member that pins its own
+ * manager is stating something *about itself*, deliberately and against the
+ * root's default, and a tool that overrode it would break the one project that
+ * took the trouble to say so. The root is consulted only where the member is
+ * silent, which is what "fallback" means here.
+ *
+ * ## Why this cannot report an unrelated repository's manager
+ *
+ * The `workspace` pair is only ever built for a root that `findWorkspaceRoot`
+ * accepted, and that function accepts an ancestor **only when the project
+ * matches one of the member patterns that ancestor declares**. A project merely
+ * nested beneath a monorepo — a fixture application under
+ * `packages/<name>/test/fixtures/<app>`, or a developer's own project inside a
+ * checkout of this very repository — matches no pattern, so no pair is built
+ * and the answer stays `'unknown'`. That membership check is what keeps this
+ * fallback from becoming "the nearest lockfile upwards", which would report
+ * this tool's own pin for a project it has nothing to do with.
+ *
  * @param manifest The parsed manifest view, or `undefined` when there is none.
  * @param probe The project's existence probe.
+ * @param workspace The workspace root's manifest and probe, when the project is
+ * a member of one. Omitted — as every two-argument call omits it — detection
+ * stops at step 2 and behaves exactly as it always has.
  * @returns The manager, or `'unknown'` when nothing settles it.
+ *
+ * @example
+ * ```ts
+ * // A workspace member with no pin and no lockfile of its own.
+ * detectPackageManager(memberManifest, memberProbe); // 'unknown'
+ * detectPackageManager(memberManifest, memberProbe, {
+ *   manifest: rootManifest, // { packageManager: 'pnpm@12.4.2' }
+ *   probe: rootProbe,
+ * }); // 'pnpm'
+ * ```
  */
 export function detectPackageManager(
   manifest: TargetManifest | undefined,
   probe: ProjectProbe,
+  workspace?: WorkspacePackageManagerFallback,
 ): PackageManagerName {
   const declared = declaredPackageManager(manifest?.packageManager);
   if (declared !== undefined) {
     return declared;
   }
 
-  const found = new Set<PackageManagerName>();
-  for (const lockfile of LOCKFILES) {
-    if (probe.fileExists(lockfile.file)) {
-      found.add(lockfile.manager);
-    }
+  const ownLockfile = lockfileManager(probe);
+  if (ownLockfile !== undefined) {
+    return ownLockfile;
   }
 
-  if (found.size !== 1) {
+  if (workspace === undefined) {
     return 'unknown';
   }
 
-  // Exactly one member, so the iterator's first value exists; the fallback
-  // satisfies `noUncheckedIndexedAccess` without asserting anything.
-  return [...found][0] ?? 'unknown';
+  const declaredByWorkspace = declaredPackageManager(workspace.manifest?.packageManager);
+  if (declaredByWorkspace !== undefined) {
+    return declaredByWorkspace;
+  }
+
+  return lockfileManager(workspace.probe) ?? 'unknown';
 }
 
 /**
@@ -1067,9 +1156,14 @@ export interface SummarizeProjectInput {
  * ## What it does, in order
  *
  * 1. Resolves the caps, and builds the existence probe and the manifest view —
- *    the only two filesystem touches in the whole module.
+ *    the two filesystem touches every summary makes.
  * 2. Runs the four detectors over those two inputs plus the graph and the route
- *    map.
+ *    map. One of them, {@link detectPackageManager}, is additionally given the
+ *    project's workspace root when it has one (`./project.ts`'s
+ *    {@link findWorkspaceRoot}, then that root's own manifest and probe), which
+ *    is the only work in this function that looks *above* the project root and
+ *    the only reason it is done: a workspace member declares neither a
+ *    `packageManager` pin nor a lockfile of its own.
  * 3. Projects the four capped lists — entry points, routes, notable
  *    directories, recognised dependencies — each with a documented total order,
  *    each path validated as a safe project-relative path.
@@ -1113,7 +1207,11 @@ export function summarizeProject(input: SummarizeProjectInput): ProjectSummary {
 
   const framework = detectFramework(manifest, probe);
   const routerStyle = detectRouterStyle(routeMap, probe);
-  const packageManager = detectPackageManager(manifest, probe);
+  const packageManager = detectPackageManager(
+    manifest,
+    probe,
+    workspacePackageManagerFallback(projectRoot, logger),
+  );
   const databaseAccess = withinPathBudget(
     detectDatabaseAccess(graph, manifest, probe),
     limits.maxStringLength,
@@ -1829,6 +1927,83 @@ function declaredPackageManager(declaration: string | undefined): PackageManager
   const separator = trimmed.indexOf('@', 1);
   const named = (separator === -1 ? trimmed : trimmed.slice(0, separator)).toLowerCase();
   return DECLARABLE_MANAGERS[named];
+}
+
+/**
+ * The manager one directory's lockfiles identify, or `undefined` when they
+ * identify none.
+ *
+ * The counting rule of {@link detectPackageManager}, in one place because it is
+ * applied twice — to the target and to its workspace root — and the two must
+ * agree: exactly one manager's lockfiles present identifies it, none or two or
+ * more identifies nothing. Two lockfiles of the *same* manager
+ * (`package-lock.json` beside `npm-shrinkwrap.json`) are one answer, which is
+ * why the managers are collected into a set rather than counted as files.
+ *
+ * @param probe An existence probe bound to the directory being judged.
+ * @returns The manager, or `undefined` when the lockfiles settle nothing.
+ */
+function lockfileManager(probe: ProjectProbe): PackageManagerName | undefined {
+  const found = new Set<PackageManagerName>();
+  for (const lockfile of LOCKFILES) {
+    if (probe.fileExists(lockfile.file)) {
+      found.add(lockfile.manager);
+    }
+  }
+
+  if (found.size !== 1) {
+    return undefined;
+  }
+
+  // Exactly one member, so the iterator's first value exists; the `?? undefined`
+  // satisfies `noUncheckedIndexedAccess` without asserting anything.
+  return [...found][0] ?? undefined;
+}
+
+/**
+ * The workspace fallback for {@link detectPackageManager}, or `undefined` when
+ * the project is not a member of a workspace.
+ *
+ * Three steps, none of which reaches further than the workspace root's own
+ * manifest and lockfiles: locate the root (`./project.ts`'s
+ * {@link findWorkspaceRoot}, which accepts an ancestor only when the project
+ * matches one of its declared member patterns), then build against that root
+ * the same two inputs this module builds against the target —
+ * {@link readTargetManifest} and {@link createProjectProbe}, both already
+ * parameterised by root, so there is no second spelling of either read.
+ *
+ * The manifest that comes back is handed to the package-manager detector and to
+ * nothing else. That is the whole privacy constraint of this fallback: the
+ * workspace root's `dependencies` are not the target's, its `name` is not the
+ * target's, and neither may reach `collectDependencies`,
+ * {@link detectFramework} or `projectName`. The root path itself does not enter
+ * the summary either — it appears in one `debug` line, which is where a
+ * developer debugging detection needs it and where a prompt never sees it.
+ *
+ * @param projectRoot The target project's normalised absolute root.
+ * @param logger Where the one `debug` line goes, and the logger the lookup
+ * itself reports through.
+ * @returns The fallback pair, or `undefined` when there is no workspace root.
+ */
+function workspacePackageManagerFallback(
+  projectRoot: string,
+  logger: Logger,
+): WorkspacePackageManagerFallback | undefined {
+  const workspace = findWorkspaceRoot(projectRoot, { logger });
+  if (workspace === undefined) {
+    return undefined;
+  }
+
+  logger.debug('project summary consults its workspace root for the package manager', {
+    root: workspace.root,
+    declaredBy: workspace.declaredBy,
+    memberPattern: workspace.memberPattern,
+  });
+
+  return {
+    manifest: readTargetManifest(workspace.root, logger),
+    probe: createProjectProbe(workspace.root, logger),
+  };
 }
 
 /**

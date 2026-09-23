@@ -18,7 +18,8 @@
  *    `msg` is `[object Object]`; the compiler cannot catch it, so it is
  *    asserted against emitted JSON rather than against the call signature —
  *    by the integration suites, which run every session through this logger,
- *    and by the colocated suite when it lands at its assigned checkpoint.
+ *    and by the colocated suite in `./logging.test.ts`, which asserts the
+ *    emitted record for every level, binding and redaction class here.
  * 2. **Redact.** A log record is the third and last checkpoint between the
  *    developer's runtime data and a file on disk (the first two are
  *    `packages/telemetry/src/redaction/` at ingest and

@@ -23,9 +23,27 @@
  * second order can be written from a cart that has already become one. That
  * last property is what makes the third moment worth having:
  * {@link readCartOutcome} reads back what a session's cart became, so a
- * checkout that finds the session holding no open cart can tell an order that
- * was already placed from a cart an attempt is holding and from a session that
- * never had a cart at all.
+ * checkout that finds nothing to order can tell an order that was already
+ * placed from a cart an attempt is holding and from a session that never had a
+ * cart at all.
+ *
+ * The same transaction releases the session's open-cart pointer. A cart holds
+ * `carts.open_token` for as long as it is the cart its session shops with, and
+ * the conversion sets it to `NULL`, which is what lets `./cart.service` open
+ * the next cart for that session: the shopper who has just bought something
+ * carries on shopping instead of being left with a store that has no cart for
+ * them. The cart itself is not touched otherwise - its lines, its prices and
+ * its session token all stay - so it remains the readable record of what was
+ * ordered and of the session that ordered it.
+ *
+ * **The order is written against the session's own account.** The cart carries
+ * the account when it has one, and it is preferred over the contact's email
+ * address, so a session that has bought before keeps the account its history is
+ * filed under and the order it has just placed appears in that history. Only a
+ * cart with no account at all resolves one from the email - a first order is how
+ * a trade customer gets an account - and the contact the checkout collected is
+ * kept on the order either way, so the person who placed it is recorded even
+ * when the account was opened for somebody else at the same company.
  *
  * Everything returned is stated in the shapes of `@/lib/types` rather than in
  * database rows, so a page, a route handler and a client component all read an
@@ -43,10 +61,14 @@
  *   an order bore is exactly the remainder. A store that charges none reads
  *   back zero, which is the truthful answer rather than an assumed one.
  *
- * The destination is the one part of an order this application does not retain:
- * there is no address on the order, so `recordOrder` returns the address the
- * checkout handed it and a re-read order carries an empty one. That is stated
- * plainly at {@link blank} rather than filled in with a guess.
+ * **What the checkout collected is stored, not echoed.** The contact, the
+ * destination and the delivery note go into columns of the order in the same
+ * transaction as its lines, and every order this module answers with - the one
+ * just written as much as one read back weeks later - is built from those
+ * columns rather than from the request that carried them. An order placed
+ * before the store recorded them carries none, which reads back as the account's
+ * own contact and as the empty address {@link blank} describes, rather than as
+ * a guess.
  *
  * Importing this module opens no connection and reads no configuration - the
  * client in `@/server/db/prisma` connects on its first query - so a page that
@@ -96,10 +118,19 @@ const LINE_CEILING = 200;
  * has, and `taxCents` may be left out by a checkout that charges none.
  */
 export interface OrderDraft {
-  /** Who is buying. The email identifies the account the order is written against. */
+  /**
+   * Who is buying, as the checkout collected it. It is recorded on the order,
+   * and it identifies the account the order is written against only when the
+   * cart carries none of its own - see {@link recordOrder}.
+   */
   customer: CustomerContact;
   /** Where the goods are going, as the checkout collected it. */
   address: ShippingAddress;
+  /**
+   * What the buyer asked the packers to know, or `null` when they said nothing.
+   * It is stored with the order and returned with it; nothing acts on it.
+   */
+  notes: string | null;
   /** The lines to write, priced. */
   lines: readonly PricedLine[];
   /**
@@ -200,6 +231,31 @@ type Account = {
   email: string;
   companyName: string;
   contactName: string;
+};
+
+/**
+ * The columns an order keeps of what its checkout collected: who placed it,
+ * where it ships and what the packers were told.
+ *
+ * Every member is nullable because an order placed before the store recorded
+ * them carries none, and each of the two groups is written as a set or not at
+ * all - so `contactEmail` decides whether the order has a contact of its own
+ * and `shipLine1` decides whether it has a destination, rather than each field
+ * being interpreted on its own. {@link recorded} and {@link destination} are
+ * where those two decisions are made, and they are made in one place so that a
+ * freshly written order and one read back weeks later are described identically.
+ */
+type Collected = {
+  contactName: string | null;
+  contactEmail: string | null;
+  contactCompany: string | null;
+  shipLine1: string | null;
+  shipLine2: string | null;
+  shipCity: string | null;
+  shipRegion: string | null;
+  shipPostalCode: string | null;
+  shipCountry: string | null;
+  deliveryNotes: string | null;
 };
 
 /**
@@ -322,23 +378,43 @@ export function checkOrderDraft(input: UnpaidOrderDraft): void {
     );
   }
 
-  // The account the order is written against is the whole of the draft's text
-  // that reaches a column: `recordOrder` writes the email, the contact name and
-  // the company - or the contact name in the company's place - and nothing
-  // else. Those three are therefore what is asked about here. The destination
-  // is deliberately not among them: an order retains no address at all (see
-  // `blank`), so nothing in `input.address` is ever written, and refusing a
-  // draft over a value this module does not store would be a rule nobody could
-  // act on. The request surfaces hold their own fields to the same class, and
-  // this is the layer that has to hold, because a draft can be assembled in
-  // process - by a page or a script - and reach this function without having
-  // been through one of them.
-  for (const value of [input.customer.name, input.customer.email, input.customer.company]) {
+  // Everything the draft carries into a column is asked about here, which is
+  // the contact and the destination: `recordOrder` writes both, so a value one
+  // of them holds that no column can is a draft this store cannot record. The
+  // request surfaces hold their own fields to the same class, and this is the
+  // layer that has to hold, because a draft can be assembled in process - by a
+  // page or a script - and reach this function without having been through one
+  // of them.
+  for (const value of [
+    input.customer.name,
+    input.customer.email,
+    input.customer.company,
+    input.address.line1,
+    input.address.line2,
+    input.address.city,
+    input.address.region,
+    input.address.postalCode,
+    input.address.country,
+  ]) {
     if (value !== null && !plain(value)) {
       throw new StorefrontValidationError(
-        'The contact details on the order hold a character this store cannot record. Use ordinary text characters and place the order again.',
+        'The contact details or the delivery address on the order hold a character this store cannot record. Use ordinary text characters and place the order again.',
       );
     }
+  }
+
+  // The note is free text the packers read, and it is held to less than the
+  // fields above on purpose: a note written across several lines is an ordinary
+  // note, so the line breaks and tabs a form may collect are kept rather than
+  // refused. What is refused is the one character the column genuinely cannot
+  // hold - PostgreSQL's `UTF8` encoding has no representation for `U+0000`, so
+  // the driver rejects the parameter and the order's transaction fails partway
+  // through instead of the draft being turned away here, before anything has
+  // been spent on it.
+  if (input.notes !== null && input.notes.includes('\u0000')) {
+    throw new StorefrontValidationError(
+      'The delivery notes on the order hold a character this store cannot record. Use ordinary text characters and place the order again.',
+    );
   }
 
   if (input.lines.length === 0) {
@@ -529,13 +605,73 @@ function contact(account: Account): CustomerContact {
 }
 
 /**
- * The destination as an order retains it, which is nothing.
+ * Who placed the order, as the checkout collected it, or `null` for an order
+ * that recorded nobody.
  *
- * An order records its charges, its lines and the service it shipped by; where
- * the goods went is collected at checkout and not kept afterwards. A re-read
- * order therefore carries an address with no content rather than an invented
- * one, and the confirmation screen shows the address the checkout submitted,
- * which {@link recordOrder} returns from the draft it was handed.
+ * The three columns are written together by {@link recordOrder}, so the email -
+ * the one of them a contact cannot be described without - is what decides
+ * whether the order has a contact of its own. An order that has none is
+ * described by its account instead, which is what {@link contact} answers, and
+ * the two are read in that order everywhere an order is returned.
+ *
+ * @param row The order's collected columns, as every query below selects them.
+ */
+function recorded(row: Collected): CustomerContact | null {
+  const { contactName: name, contactEmail: email } = row;
+
+  if (name === null || email === null) {
+    return null;
+  }
+
+  return { name, email, company: row.contactCompany };
+}
+
+/**
+ * Where the order ships, as the checkout collected it, or {@link blank} for an
+ * order that recorded no destination.
+ *
+ * The six columns are written together by {@link recordOrder}, so an order
+ * either carries the whole address or carries none of it, and the five required
+ * ones are checked together rather than each being defaulted on its own: a
+ * half-known destination is not a destination, and printing one would be worse
+ * than admitting there is none. `line2` is genuinely optional - a customer with
+ * no dock or suite leaves it empty - so it passes through as the `null` the
+ * shape declares.
+ *
+ * @param row The order's collected columns, as every query below selects them.
+ */
+function destination(row: Collected): ShippingAddress {
+  const {
+    shipLine1: line1,
+    shipCity: city,
+    shipRegion: region,
+    shipPostalCode: postalCode,
+    shipCountry: country,
+  } = row;
+
+  if (
+    line1 === null ||
+    city === null ||
+    region === null ||
+    postalCode === null ||
+    country === null
+  ) {
+    return blank();
+  }
+
+  return { line1, line2: row.shipLine2, city, region, postalCode, country };
+}
+
+/**
+ * The destination of an order that recorded none, which is an address with no
+ * content.
+ *
+ * Every order placed through this store's checkout carries where it ships (see
+ * {@link recordOrder}), so this is what the orders that predate those columns
+ * read back as - the seeded history, which records charges and lines and never
+ * had an address to record. An empty address is the truthful answer for them:
+ * it says the store does not know where that order went, where an invented or
+ * partially defaulted one would say something false.
  */
 function blank(): ShippingAddress {
   return {
@@ -610,11 +746,24 @@ export async function unclaim(id: string): Promise<void> {
  * is what keeps writing a twelve-line order no more work than writing a
  * one-line order.
  *
- * The account the order is written against is resolved from the contact's email
- * address, and an address the store has not seen before opens an account: a
- * first order is how a trade customer gets one, and refusing the order instead
- * would refuse the customer. An account that already exists is left exactly as
- * it is.
+ * The account the order is written against is the cart's own, whenever the cart
+ * has one. A cart carries the account of the session that filled it - attached
+ * when an earlier order converted a cart of that session, or by the seed - so
+ * preferring it is what keeps a session's orders in one history: the order just
+ * placed appears in the same list as the ones before it, which is the list the
+ * storefront shows. Only a cart with no account resolves one from the contact's
+ * email address, and an address the store has not seen before opens an account
+ * there: a first order is how a trade customer gets one, and refusing the order
+ * instead would refuse the customer. An account that already exists is left
+ * exactly as it is, contact details included - a purchaser who types their own
+ * name into a colleague's account is recorded on the order rather than written
+ * over the account.
+ *
+ * What the checkout collected is written with the order: the contact, the six
+ * fields of the destination and the delivery note. They are columns of the
+ * order rather than a copy of the request, and the value returned is selected
+ * back out of the row that was written, so the confirmation screen shows what
+ * the store holds rather than what the browser sent.
  *
  * The status the order opens in follows the payment: an approved authorization
  * makes it `PAID`, and anything else leaves it `PENDING` for the store to
@@ -631,13 +780,17 @@ export async function unclaim(id: string): Promise<void> {
  *
  * Three writes share that transaction, and each of the other two is conditional
  * on something the order depends on still being true. The cart the order was
- * assembled from becomes `CONVERTED`, and a cart that has already become an
- * order is not converted again - so a second attempt at the same cart writes no
- * second order, whatever it was told earlier in the checkout. The quote the
- * freight was charged at becomes this order's, by identifier, and a quote
- * already belonging to another order is not taken from it. Either condition
- * failing rolls the order back with it: the cart, the quote and the order are
- * one fact.
+ * assembled from becomes `CONVERTED` and releases its session's open-cart
+ * pointer, and a cart that has already become an order is not converted again -
+ * so a second attempt at the same cart writes no second order, whatever it was
+ * told earlier in the checkout. Releasing the pointer in this write rather than
+ * afterwards is what makes "the cart is finished" and "the session may open
+ * another" one fact: there is no window in which the order exists and the
+ * session still has no cart it can shop with, and a rolled-back order leaves
+ * the pointer exactly where it was. The quote the freight was charged at
+ * becomes this order's, by identifier, and a quote already belonging to another
+ * order is not taken from it. Either condition failing rolls the order back
+ * with it: the cart, the quote and the order are one fact.
  *
  * @param input Everything the checkout assembled: the customer, the
  * destination, the priced lines, the cart they came from, the quote the freight
@@ -657,26 +810,43 @@ export async function recordOrder(input: OrderDraft): Promise<OrderDetail> {
   const status: OrderStatus = input.payment.authorized ? OrderStatus.PAID : OrderStatus.PENDING;
 
   const row = await prisma.$transaction(async (tx) => {
-    const account = await tx.customer.upsert({
-      where: { email: input.customer.email },
-      create: {
-        email: input.customer.email,
-        companyName: input.customer.company ?? input.customer.name,
-        contactName: input.customer.name,
-      },
-      update: {},
-      select: { id: true },
+    // The session's own account, when its cart carries one. It is read inside
+    // the transaction the order is written in, so the account the order is
+    // filed under is the one the cart held at the moment it was converted.
+    const shopper = await tx.cart.findUnique({
+      where: { id: input.cart },
+      select: { customerId: true },
     });
+
+    const account =
+      shopper?.customerId ??
+      (
+        await tx.customer.upsert({
+          where: { email: input.customer.email },
+          create: {
+            email: input.customer.email,
+            companyName: input.customer.company ?? input.customer.name,
+            contactName: input.customer.name,
+          },
+          update: {},
+          select: { id: true },
+        })
+      ).id;
 
     // The cart is finished here, and the condition is what makes writing this
     // order safe: a cart that has already become an order is not converted a
     // second time, the count says so, and the order this call was about to
-    // write is rolled back with it. The account it was checked out under goes
-    // on the cart at the same time, which is how a cart a visitor filled
-    // anonymously ends up attached to the customer who bought it.
+    // write is rolled back with it. Two more columns move in the same
+    // statement. The account it was checked out under goes on the cart, which
+    // is how a cart a visitor filled anonymously ends up attached to the
+    // customer who bought it and how the session that filled it keeps that
+    // account for the cart after this one. The open-cart pointer is released,
+    // which is what lets `./cart.service` open that next cart: the token stays
+    // on the cart as the session's history, and only the claim to be the cart
+    // that session shops with is given up.
     const converted = await tx.cart.updateMany({
       where: { id: input.cart, status: { not: CartStatus.CONVERTED } },
-      data: { status: CartStatus.CONVERTED, customerId: account.id },
+      data: { status: CartStatus.CONVERTED, customerId: account, openToken: null },
     });
 
     if (converted.count === 0) {
@@ -688,13 +858,28 @@ export async function recordOrder(input: OrderDraft): Promise<OrderDetail> {
     const order = await tx.order.create({
       data: {
         orderNumber: mint(at),
-        customerId: account.id,
+        customerId: account,
         status,
         subtotalCents: input.subtotalCents,
         discountCents: input.discountCents,
         shippingCents: input.freightCents,
         totalCents: input.totalCents,
         placedAt: at,
+        // What the checkout collected, written with the order rather than kept
+        // by the request: the contact as a set, the destination as a set, and
+        // the note the buyer may have left. This is what makes the order's own
+        // account of who placed it and where it ships readable afterwards, by
+        // the confirmation screen and by anything that reads the order later.
+        contactName: input.customer.name,
+        contactEmail: input.customer.email,
+        contactCompany: input.customer.company,
+        shipLine1: input.address.line1,
+        shipLine2: input.address.line2,
+        shipCity: input.address.city,
+        shipRegion: input.address.region,
+        shipPostalCode: input.address.postalCode,
+        shipCountry: input.address.country,
+        deliveryNotes: input.notes,
         items: {
           createMany: {
             data: input.lines.map((line) => ({
@@ -716,6 +901,22 @@ export async function recordOrder(input: OrderDraft): Promise<OrderDetail> {
         discountCents: true,
         shippingCents: true,
         totalCents: true,
+        contactName: true,
+        contactEmail: true,
+        contactCompany: true,
+        shipLine1: true,
+        shipLine2: true,
+        shipCity: true,
+        shipRegion: true,
+        shipPostalCode: true,
+        shipCountry: true,
+        deliveryNotes: true,
+        // Selected so that the contact this call answers with is read through
+        // the same two steps as a re-read order's: the order's own contact, and
+        // the account's when the order recorded none. One path, so a freshly
+        // placed order and the same order opened later cannot describe their
+        // buyer differently.
+        customer: { select: { email: true, companyName: true, contactName: true } },
         items: {
           select: {
             id: true,
@@ -748,12 +949,19 @@ export async function recordOrder(input: OrderDraft): Promise<OrderDetail> {
     return order;
   });
 
+  // Everything but the service comes out of the row that was just written, so
+  // the caller is answered with the order the store now holds rather than with
+  // the draft it submitted. The service is the draft's because the quote row
+  // this order was placed on is the very one the checkout chose and recorded -
+  // the transaction above attached it by identifier - and reading it back would
+  // be a second query for a value already in hand.
   return {
     ...summary(row, row.items),
     lines: lines(row.items),
     shippingOption: input.option,
-    contact: input.customer,
-    shippingAddress: input.address,
+    contact: recorded(row) ?? contact(row.customer),
+    shippingAddress: destination(row),
+    notes: row.deliveryNotes,
   };
 }
 
@@ -827,8 +1035,9 @@ export async function listCustomerOrders(
  *
  * The lookup is by the order's own identifier, so nothing has to be searched
  * for, and the lines are read in a fixed order so the same order reads the same
- * way on every visit. The destination is the one part that cannot be read back;
- * {@link blank} says why.
+ * way on every visit. The contact and the destination come from the order's own
+ * columns, falling back to the account's contact and to {@link blank} for an
+ * order placed before the store recorded them.
  *
  * @param id The order's identifier.
  * @returns The order's full detail payload.
@@ -849,6 +1058,16 @@ export async function readOrderDetail(id: string): Promise<OrderDetail> {
       discountCents: true,
       shippingCents: true,
       totalCents: true,
+      contactName: true,
+      contactEmail: true,
+      contactCompany: true,
+      shipLine1: true,
+      shipLine2: true,
+      shipCity: true,
+      shipRegion: true,
+      shipPostalCode: true,
+      shipCountry: true,
+      deliveryNotes: true,
       customer: { select: { email: true, companyName: true, contactName: true } },
       items: {
         select: {
@@ -882,8 +1101,9 @@ export async function readOrderDetail(id: string): Promise<OrderDetail> {
     ...summary(row, row.items),
     lines: lines(row.items),
     shippingOption: service(row.shippingQuotes),
-    contact: contact(row.customer),
-    shippingAddress: blank(),
+    contact: recorded(row) ?? contact(row.customer),
+    shippingAddress: destination(row),
+    notes: row.deliveryNotes,
   };
 }
 
@@ -904,19 +1124,25 @@ export interface CartOutcome {
 }
 
 /**
- * What became of the cart a session is shopping with: the order it became, or
- * the fact that it exists and became none.
+ * What became of the last cart of a session that a checkout took: the order it
+ * became, or the fact that it exists and became none.
  *
- * It answers the question a checkout asks when it finds the session holding no
- * open cart: did the cart this session had become an order, is it being held by
- * an attempt, or was there never a cart at all? Without an answer all three are
+ * It answers the question a checkout asks when it finds nothing to order: did a
+ * cart of this session become an order, is one being held by an attempt, or has
+ * this session never checked anything out? Without an answer all three are
  * indistinguishable, and a customer whose order was placed by a submission whose
- * reply was lost would be told their cart is gone and invited to order again.
+ * reply was lost would be told their cart is empty and invited to order again.
  * With one, each of the three has its own answer, and none of them is a
  * statement that nothing was charged.
  *
+ * The cart looked for is the session's most recent one that is no longer being
+ * shopped with, because a session accumulates a cart per order it places and the
+ * question is about the last one a checkout took. A cart the session is still
+ * shopping with is not an answer to it: it has become nothing, and the checkout
+ * that asked is looking past it.
+ *
  * The cart is addressed by the session's own token, so what this returns is only
- * ever the order of the cart the caller was already entitled to read; nothing
+ * ever the order of a cart the caller was already entitled to read; nothing
  * about which order to look for comes from a request. The link between the two
  * is the quote the freight was charged at - it is written against the cart when
  * the freight is rated and against the order when the order is placed, in the
@@ -927,13 +1153,18 @@ export interface CartOutcome {
  * @param token The session token the cart is addressed by, as `./cart.service`
  * addresses it.
  * @returns The cart and the order it became, the cart and `null` when it became
- * none, or `null` when this session has no cart at all. A quote that names an
- * order names one that exists: deleting an order deletes the quotes written
- * against it.
+ * none, or `null` when no cart of this session was ever checked out. A quote
+ * that names an order names one that exists: deleting an order deletes the
+ * quotes written against it.
  */
 export async function readCartOutcome(token: string): Promise<CartOutcome | null> {
-  const cart = await prisma.cart.findUnique({
-    where: { sessionToken: token },
+  const cart = await prisma.cart.findFirst({
+    where: { sessionToken: token, status: { not: CartStatus.ACTIVE } },
+    // The most recent one: a session accumulates a cart per order it places, and
+    // the question being asked is about the last one a checkout took. The
+    // identifier breaks a tie the timestamp cannot, so two carts finished in one
+    // instant are not free to change places between reads.
+    orderBy: [{ updatedAt: 'desc' }, { id: 'desc' }],
     select: { id: true },
   });
 

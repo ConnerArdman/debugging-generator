@@ -128,8 +128,17 @@
  * without a second geometry.
  *
  * `[data-size="md"]` needs no rule: the base above IS the medium control, so a medium select and a
- * select rendered without the attribute at all are the same size. */
+ * select rendered without the attribute at all are the same size.
+ *
+ * The height floor is the one metric of this variant that is NOT simply a step down: it is the
+ * shared `--ls-control-sm`, and `Input.module.css` declares the same floor on its own `sm` rule -
+ * the matching requirement at the head of this file applies to it like every other metric. Sized
+ * from padding alone this control and the field beside it both came out at 29.5px in the
+ * dashboard's filter row, next to a 23px `sm` Button. `min-block-size` raises the box without
+ * touching the padding pair, so the caret's reserved lane and its background positions below are
+ * unaffected. */
 .root[data-size='sm'] {
+  min-block-size: var(--ls-control-sm, 32px);
   padding-block: var(--ls-space-1, 4px);
   padding-inline-start: var(--ls-space-2, 8px);
   padding-inline-end: calc(var(--ls-space-2, 8px) * 2 + 0.5em);
@@ -181,13 +190,22 @@
 }
 
 /* Disabled, last of the state rules so it wins over the error and hover states: an unavailable
- * control should read as unavailable first. The caret dims with the rest of the control. */
+ * control should read as unavailable first. The caret dims with the rest of the control.
+ *
+ * The opacity is declared rather than left to the user agent. Chrome fades a disabled `<select>`
+ * to about 0.70 of its own accord, which is neither the 0.55 Button and Pill use nor the 1.0 this
+ * folder's Input used to pin, so the four primitives disagreed on what "unavailable" looks like
+ * while none of them had actually chosen 0.70. Reading `--ls-disabled-opacity` replaces the
+ * engine's number with the system's one and makes the set agree; an inactive control is exempt from
+ * the 4.5:1 text minimum (WCAG 1.4.3), and the recessed fill, the dimmed caret and the
+ * `not-allowed` cursor carry the state alongside the dimming. */
 .root:disabled {
   --select-caret-color: var(--ls-mist, #cbd5e1);
 
   border-color: var(--ls-border, #cbd5e1);
   background-color: var(--ls-surface-sunken, #f8fafc);
   color: var(--ls-text-muted, #475569);
+  opacity: var(--ls-disabled-opacity, 0.55);
   cursor: not-allowed;
 }
 

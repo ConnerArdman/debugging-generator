@@ -19,16 +19,28 @@
  * `var(--ls-NAME, <literal fallback>)` form, so the strip renders sensibly on its own - in a
  * component test or a static harness with no stylesheet - and renders the storefront's palette in
  * the application, where the `:root` declaration is what the browser paints. The three measures
- * the shared set does not name (the crumb truncation width, the focus ring and the hover
- * duration) are file-local custom properties declared on `.root` in exactly the same form, so a
- * page can override one from its own wrapper without this file changing.
+ * the shared set does not name (the crumb's width ceiling, the focus ring and the hover duration)
+ * are file-local custom properties declared on `.root` in exactly the same form, so a page can
+ * override one from its own wrapper without this file changing.
+ *
+ * HOW A CRUMB DECIDES ITS WIDTH
+ * Nothing here caps a crumb at a character count. `.list` wraps, `.item` shrinks and the
+ * separator does not, so the row itself decides: a crumb prints in full while its line can hold
+ * it, a line that runs out of room moves the next crumb down, and only a crumb longer than a
+ * whole line is squeezed - which is the one case the ellipsis is for.
  */
 
 .root {
-  /* How wide a single crumb may grow before it truncates. 18ch keeps a four-crumb trail with a
-   * long product name on one line across the page measure; the trail wraps rather than overflows
-   * when even the truncated crumbs no longer fit. */
-  --crumb-max: var(--ls-crumb-max, 18ch);
+  /* The widest a single crumb may paint, expressed as the room its own `.item` has rather than as
+   * a count of characters: `100%` of a flex item whose width the wrapping row already decided.
+   * While the line can hold the crumb the percentage clamps nothing, so the words appear in full;
+   * when a crumb is longer than an entire line the row shrinks its item, the percentage follows it
+   * down, and the `overflow`/`text-overflow` pair on `.link, .current` paints the ellipsis. A
+   * fixed measure cannot make that distinction - it truncates a long label at every viewport
+   * width, including the wide ones where most of the row is empty - which is why the ceiling is
+   * relative and no media query steps it. The `--ls-crumb-max` hook stays: a page that wants a
+   * hard ceiling states one on its own wrapper and this file does not change. */
+  --crumb-max: var(--ls-crumb-max, 100%);
   /* The keyboard focus indicator, held as a complete outline value: `--ls-focus` in globals.css
    * is the ring *colour*, not an outline shorthand, so the width and style are stated here and
    * the fallback alone is a valid `outline` on its own. */
@@ -64,8 +76,10 @@
   gap: var(--ls-space-1, 4px);
 }
 
-/* Both kinds of crumb hold to a single line and end in an ellipsis, so a long product title
- * shortens instead of pushing the trail - and the heading below it - off the measure. */
+/* Both kinds of crumb hold to a single line, and `--crumb-max` lets one take the width the row
+ * has for it. `min-width: 0` is what allows the row to squeeze a crumb no line can fit, and the
+ * `overflow`/`text-overflow` pair then ends it in an ellipsis rather than letting a long product
+ * title push the trail - and the heading below it - off the measure. */
 .link,
 .current {
   display: inline-block;

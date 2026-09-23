@@ -26,6 +26,26 @@
  * the cart drawer's `--ls-z-drawer` (40), so a notice is never hidden behind the drawer. The tier
  * numbers live in that one `:root` block and are never restated as literals here.
  *
+ * SHARING THE CORNER WITH THE CART DRAWER'S FOOTER - `--ls-toast-inset-block-end`
+ * Being one tier above the drawer is what keeps a notice visible, and on its own it is also what
+ * made a notice paint over the drawer's pinned footer and its primary Checkout link for the whole
+ * five seconds the notice lived. Both surfaces are fixed to the bottom-inline-end corner, so the
+ * corner is divided by reservation rather than by stacking - lowering this region behind the drawer
+ * would break the contract above, and is not the answer.
+ *
+ * `@/components/cart/CartDrawer` publishes its footer's measured height as
+ * `--ls-toast-inset-block-end` on `document.body` for as long as its sheet is open, and both
+ * `inset-block-end` declarations below add that reservation to their own inset: the column comes to
+ * rest one spacing step above the footer, with the Checkout link fully visible and clickable
+ * beneath it. The reservation is a height and never an inline offset - at 375px the sheet is the
+ * full width of the viewport, and moving the column sideways would push notices off screen.
+ *
+ * The `0px` fallback is the load-bearing half of the contract: the drawer removes the property when
+ * it closes, and every other surface in the storefront - a catalog page, the checkout form, an
+ * empty cart, which has no drawer footer at all - never declares it, so the column keeps exactly
+ * the inset it has always had. Any rule here that sets `inset-block-end` must add the reservation
+ * the same way, or a notice will cover the footer at that breakpoint alone.
+ *
  * Tokens: every colour, spacing step, radius, type size, shadow and stacking tier is read as
  * `var(--ls-NAME, <literal fallback>)`, so the module renders sensibly on its own and renders the
  * application's palette once `app/globals.css` is loaded. Hex spellings are lowercase because
@@ -39,12 +59,18 @@
 /* The region. Fixed, inset from the bottom-inline-end corner by one large spacing step, and
  * deliberately transparent to the pointer (see the header). The width cap is file-local because
  * the token scale models spacing and page measures, not this component's comfortable reading
- * width; `min()` keeps the column inside a narrow viewport without a media query. */
+ * width; `min()` keeps the column inside a narrow viewport without a media query.
+ *
+ * The block-end inset is that spacing step plus whatever a surface below has reserved: only the
+ * cart drawer reserves anything (its pinned footer's height, as `--ls-toast-inset-block-end` on
+ * `document.body`, and only while its sheet is open), and the `0px` fallback is what leaves every
+ * other surface's notices exactly where they have always been. See the header for the whole
+ * contract. */
 .root {
   --toast-width: 360px;
 
   position: fixed;
-  inset-block-end: var(--ls-space-5, 24px);
+  inset-block-end: calc(var(--ls-space-5, 24px) + var(--ls-toast-inset-block-end, 0px));
   inset-inline-end: var(--ls-space-5, 24px);
   z-index: var(--ls-z-toast, 60);
   display: flex;
@@ -148,10 +174,16 @@
  * margin on each side, the same step below - because a 360px card inset by 24px leaves too little
  * room for the message. `width: auto` releases the cap above so the two insets decide the width,
  * and the region stays transparent to the pointer, which matters more here than anywhere: on a
- * narrow screen it spans the full width of whatever it is floating over. */
+ * narrow screen it spans the full width of whatever it is floating over.
+ *
+ * The block-end inset restates the reservation with this breakpoint's smaller step, because this
+ * is where it matters most: at this width the cart drawer's sheet is the full width of the
+ * viewport, so its footer is directly under the column rather than beside it. `inset-inline` stays
+ * a plain step - the reservation is never applied to an inline edge, since moving the column
+ * sideways on a full-width sheet would carry notices off the screen. */
 @media (max-width: 480px) {
   .root {
-    inset-block-end: var(--ls-space-3, 12px);
+    inset-block-end: calc(var(--ls-space-3, 12px) + var(--ls-toast-inset-block-end, 0px));
     inset-inline: var(--ls-space-3, 12px);
     width: auto;
     pointer-events: none;

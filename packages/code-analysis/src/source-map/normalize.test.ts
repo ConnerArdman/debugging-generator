@@ -55,9 +55,11 @@ import { describe, expect, it } from 'vitest';
 
 import type { NormalizeSourcePathOptions } from './normalize.js';
 import {
+  hasEscapingTraversal,
   isWebpackInternalSource,
   normalizeSourcePath,
   REJECTED_PATH_SEGMENTS,
+  resolveSourceUnderRoot,
   SOURCE_URL_MARKERS,
   SOURCE_URL_SCHEMES,
 } from './normalize.js';
@@ -629,6 +631,202 @@ describe('normalizeSourcePath — the safety gate', () => {
     expect(normalizeSourcePath('turbopack:///[project]/src/lib/a%5Cb.ts', options())).toBe(
       'src/lib/a/b.ts',
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Derived spellings: the question a caller with two spellings has to ask.
+// ---------------------------------------------------------------------------
+
+/**
+ * Sources for which no derived spelling may be trusted, because the authored
+ * path steps above the root it is written against.
+ *
+ * Every row is a spelling URI resolution would *launder*: RFC 3986 dot-segment
+ * removal discards a `'..'` that leaves the root of an absolute path, so
+ * `@jridgewell/trace-mapping` reports these sources as ordinary bundler URLs
+ * naming `etc/passwd`, which normalises to a perfectly plausible
+ * project-relative path. The predicate is what lets `./resolver.ts` carry the
+ * authored entry's refusal over to the spelling it is handed.
+ */
+const ESCAPING_SOURCES: readonly (readonly [label: string, source: string])[] = [
+  ['a webpack namespace URL', 'webpack://_N_E/../../../../etc/passwd'],
+  ['a Turbopack `[project]` URL', 'turbopack:///[project]/../../../etc/passwd'],
+  ['a Turbopack bare `./` URL', 'turbopack:///./../../etc/passwd'],
+  ['a namespace URL escaping by one segment', 'webpack://_N_E/./src/../../secret.ts'],
+  ['a bare relative path', '../secret.ts'],
+  ['a rooted path', '/../../etc/passwd'],
+  ['a percent-encoded traversal', 'turbopack:///[project]/%2E%2E/%2E%2E/etc/passwd'],
+  ['a traversal behind a loader chain', 'webpack://_N_E/loader.js!../../../../etc/passwd'],
+  ['a traversal behind a query', 'webpack://_N_E/../../etc/passwd?v=2'],
+  ['a traversal spelled with backslashes', 'webpack://_N_E/..\\..\\..\\..\\etc\\passwd'],
+];
+
+/**
+ * Sources whose path cannot be read at all, and which the predicate therefore
+ * also reports as escaping.
+ *
+ * Fail-closed, and for the same reason the question is asked: a source this
+ * module cannot turn into a path cannot vouch for a spelling derived from it,
+ * and the derivation is a path-shaped string assembled from parts that were
+ * rejected — `'http://evil.example/x.ts'` under `sourceRoot: 'src/'` resolves
+ * to `'src/http:/evil.example/x.ts'`.
+ */
+const UNREADABLE_SOURCES: readonly (readonly [label: string, source: string])[] = [
+  ['an empty source', ''],
+  ['a whitespace-only source', '   \n'],
+  ['a foreign scheme', 'http://evil.example/x.ts'],
+  ['a data URL', 'data:application/json;base64,eyJ2ZXJzaW9uIjozfQ=='],
+  ['a malformed percent escape', 'webpack://_N_E/./src/%zz/thing.ts'],
+  ['a `file:` URL naming another host', 'file://build-server/home/dev/app/src/thing.ts'],
+  ['a URL carrying no path at all', 'webpack://_N_E/'],
+];
+
+/** Sources that name a path and step nowhere above its root. */
+const CONTAINED_SOURCES: readonly (readonly [label: string, source: string])[] = [
+  ['an ordinary webpack source', 'webpack://_N_E/./src/lib/http.ts'],
+  ['an ordinary Turbopack source', 'turbopack:///[project]/src/lib/station-service.ts'],
+  ['a percent-encoded dynamic segment', 'turbopack:///[project]/app/api/%5Bid%5D/route.ts'],
+  ['a route-group folder', 'webpack://_N_E/./app/(observatory)/basins/[id]/page.tsx'],
+  ['an interior traversal that cancels', 'webpack://_N_E/./src/widgets/../lib/http.ts'],
+  ['a scheme-less relative path', 'src/lib/http.ts'],
+  ['an absolute path with no traversal', '/outside-the-project/src/escaped.ts'],
+  ['a `file:` URL with an interior traversal that cancels', 'file:///home/dev/app/../app/x.ts'],
+];
+
+describe('hasEscapingTraversal', () => {
+  it.each(ESCAPING_SOURCES)('reports %s as escaping', (_label, source) => {
+    expect(hasEscapingTraversal(source)).toBe(true);
+  });
+
+  it.each(UNREADABLE_SOURCES)('reports %s as escaping, failing closed', (_label, source) => {
+    expect(hasEscapingTraversal(source)).toBe(true);
+  });
+
+  it.each(CONTAINED_SOURCES)('reports %s as contained', (_label, source) => {
+    expect(hasEscapingTraversal(source)).toBe(false);
+  });
+
+  it('never contradicts the normaliser about a source it calls escaping', () => {
+    // The predicate exists so a refusal can travel with the *source*; it would
+    // be worthless if it disagreed with the refusal it is standing in for. Every
+    // row above that it calls escaping must be a row the normaliser refuses.
+    for (const [, source] of [...ESCAPING_SOURCES, ...UNREADABLE_SOURCES]) {
+      expect(normalizeSourcePath(source, options())).toBeUndefined();
+    }
+  });
+
+  it('is not a containment check, and does not pretend to be one', () => {
+    // `/outside-the-project/...` steps nowhere above its own root, so this
+    // predicate has nothing to say about it — and the normaliser still refuses
+    // it, by containment. The two questions are separate and both are needed.
+    expect(hasEscapingTraversal('/outside-the-project/src/escaped.ts')).toBe(false);
+    expect(normalizeSourcePath('/outside-the-project/src/escaped.ts', options())).toBeUndefined();
+  });
+
+  it('answers without throwing for a value that is not a string', () => {
+    // Same defensiveness as the normaliser: the value comes from a parsed
+    // source-map document, which the type system does not vouch for at runtime.
+    const hostile: readonly unknown[] = [undefined, null, 42, {}, [], Symbol('s'), () => 'x'];
+
+    for (const value of hostile) {
+      expect(hasEscapingTraversal(value as string)).toBe(true);
+    }
+  });
+
+  it('answers without throwing for a pathological length', () => {
+    const deep = `webpack://_N_E/${'../'.repeat(5_000)}etc/passwd`;
+    const wide = `webpack://_N_E/./${'segment/'.repeat(5_000)}thing.ts`;
+
+    expect(hasEscapingTraversal(deep)).toBe(true);
+    expect(hasEscapingTraversal(wide)).toBe(false);
+  });
+});
+
+describe('resolveSourceUnderRoot', () => {
+  it('joins a relative entry beneath the root, as the tracer does', () => {
+    // `@jridgewell/trace-mapping` prefixes every entry with `sourceRoot + '/'`
+    // before resolving it, so this is the same string it starts from — and
+    // handing it to the normaliser is what keeps POSIX semantics, and an
+    // escaping `..` with them, instead of URI semantics.
+    expect(resolveSourceUnderRoot('webpack://_N_E/./src', 'lib/http.ts')).toBe(
+      'webpack://_N_E/./src/lib/http.ts',
+    );
+    expect(
+      normalizeSourcePath(resolveSourceUnderRoot('webpack://_N_E/./src', 'lib/http.ts'), options()),
+    ).toBe('src/lib/http.ts');
+  });
+
+  it('resolves identically whether the root carries a trailing separator', () => {
+    const withSlash = resolveSourceUnderRoot('webpack://_N_E/./src/', 'lib/http.ts');
+    const withoutSlash = resolveSourceUnderRoot('webpack://_N_E/./src', 'lib/http.ts');
+
+    expect(withSlash).not.toBe(withoutSlash);
+    expect(normalizeSourcePath(withSlash, options())).toBe('src/lib/http.ts');
+    expect(normalizeSourcePath(withoutSlash, options())).toBe('src/lib/http.ts');
+  });
+
+  it('resolves a traversal the root absorbs', () => {
+    const joined = resolveSourceUnderRoot(
+      'webpack://_N_E/./src/widgets/deeper/',
+      '../../lib/http.ts',
+    );
+
+    expect(hasEscapingTraversal(joined)).toBe(false);
+    expect(normalizeSourcePath(joined, options())).toBe('src/lib/http.ts');
+  });
+
+  it('refuses a traversal the root is too shallow to absorb', () => {
+    const joined = resolveSourceUnderRoot('webpack://_N_E/./src/', '../../../../etc/passwd');
+
+    expect(hasEscapingTraversal(joined)).toBe(true);
+    expect(normalizeSourcePath(joined, options())).toBeUndefined();
+  });
+
+  it('refuses a clean entry beneath a root that traverses', () => {
+    // The escape is entirely in the root, which a check on the entry alone
+    // would miss — `etc/passwd` carries no traversal and is a plausible
+    // project-relative path on its own.
+    const joined = resolveSourceUnderRoot('webpack://_N_E/../../..', 'etc/passwd');
+
+    expect(hasEscapingTraversal('etc/passwd')).toBe(false);
+    expect(hasEscapingTraversal(joined)).toBe(true);
+    expect(normalizeSourcePath(joined, options())).toBeUndefined();
+  });
+
+  it.each([
+    ['a bundler-scheme URL', 'webpack://_N_E/./app/page.tsx'],
+    ['a `file:` URL', 'file:///home/dev/app/src/thing.ts'],
+    ['a foreign scheme', 'http://evil.example/x.ts'],
+    ['a POSIX-rooted path', '/home/dev/app/src/thing.ts'],
+    ['a protocol-relative reference', '//evil.example/x.ts'],
+    ['a Windows drive path', 'C:/Users/dev/app/src/thing.ts'],
+  ])('leaves %s untouched, because an absolute reference ignores its base', (_label, source) => {
+    expect(resolveSourceUnderRoot('webpack://_N_E/./src/', source)).toBe(source);
+  });
+
+  it.each([
+    ['no root', undefined],
+    ['an empty root', ''],
+    ['a whitespace-only root', '  '],
+  ])('leaves the entry untouched for %s', (_label, root) => {
+    expect(resolveSourceUnderRoot(root, 'lib/http.ts')).toBe('lib/http.ts');
+  });
+
+  it('leaves an empty entry untouched, rather than naming the root as a file', () => {
+    // The tracer resolves this to the root directory itself, which reads as a
+    // file and is not one.
+    expect(resolveSourceUnderRoot('webpack://_N_E/./src/', '')).toBe('');
+    expect(hasEscapingTraversal(resolveSourceUnderRoot('webpack://_N_E/./src/', ''))).toBe(true);
+  });
+
+  it('answers without throwing for values that are not strings', () => {
+    const hostile: readonly unknown[] = [undefined, null, 42, {}];
+
+    for (const value of hostile) {
+      expect(resolveSourceUnderRoot(value as string, 'lib/http.ts')).toBe('lib/http.ts');
+      expect(resolveSourceUnderRoot('webpack://_N_E/./src/', value as string)).toBe(value);
+    }
   });
 });
 

@@ -207,8 +207,11 @@ export const inventorySummaryQuerySchema = z.object({
   state: z.preprocess(unset, z.enum(states).nullable().default(null)),
 
   /**
-   * Report only the recorded stock changes of one kind, named from {@link movements}. `null`
-   * applies no constraint and is what the dashboard opens on.
+   * Count only the recorded stock changes of one kind, named from {@link movements}, towards the
+   * units the ledger has moved. A kind of change is a question about the ledger, so it bounds that
+   * one figure alone: the physical-stock totals, the page of stock lines and the low-stock list
+   * answer with the same stock whether a kind is named or not. `null` counts every kind of change
+   * and is what the dashboard opens on.
    */
   movement: z.preprocess(unset, z.enum(movements).nullable().default(null)),
 });

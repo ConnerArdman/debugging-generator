@@ -36,11 +36,16 @@
  *   {@link CodeNodeBase.name}, which is why the name is the source spelling and
  *   never a prettified form.
  * - `packages/instrumentation`'s feasibility check asks whether a handler can
- *   carry function-level timing. {@link HandlerNodeData.inline} is the answer —
- *   an inline arrow has no named declaration to wrap — and for a named handler
- *   {@link CodeNodeBase.symbol} is the function to look for while
+ *   carry function-level timing. {@link HandlerNodeData.inline} is the first
+ *   part of the answer — an inline arrow has no named declaration to wrap — and
+ *   {@link CodeNodeBase.symbol} is the second: it is present **only** where
+ *   resolution reached a real declaration, so a handler that arrives as a
+ *   parameter or comes out of a destructuring pattern carries none, and
  *   `file`/`line`/`column`/`endLine` bound the declaration a patch would
- *   rewrite.
+ *   rewrite. A `handler` node is a record of a **binding**, never the
+ *   declaration inventory: `../graph/query.ts`'s `findSymbol`/`hasSymbol` are
+ *   answered by the `symbol` nodes `./symbols.ts` emits and by no handler node,
+ *   whatever it carries.
  * - Click-to-source takes the `code-graph` route of AAP 0.4.2. A node carries
  *   its position as the `file`/`line`/`column`/`endLine` fields
  *   {@link CodeNodeBase} declares and **not** as a `SourceLocation`: the node
@@ -69,16 +74,25 @@
  *
  * - **Named, bound by reference** (`onClick={handleSubmit}`,
  *   `onClick={this.onPress}`, `onClick={props.onSelect}`) — `inline` is
- *   `false`, the node's name and {@link CodeNodeBase.symbol} are the function's
- *   name, and the node is positioned at **the handler's own declaration**,
- *   resolved through the enclosing scopes of the use site and, for an imported
- *   binding, into the module it comes from. An editor opening this node lands on
- *   the function, which is what a developer asked for when they clicked an
- *   interaction. Where resolution reaches a declaration, the name is the
- *   **declaration's** identifier rather than the local one — an
- *   `import { onSubmit as submit }` alias is a fact about the importing module,
- *   and a node positioned in a file is named as that file names it, which is also
- *   what keeps one function to one node across every module that binds it.
+ *   `false`, the node's name is the function's name, and the node is positioned
+ *   at **the handler's own declaration**, resolved through the enclosing scopes
+ *   of the use site and, for an imported binding, into the module it comes
+ *   from. An editor opening this node lands on the function, which is what a
+ *   developer asked for when they clicked an interaction. Where resolution
+ *   reaches a declaration, the name is the **declaration's** identifier rather
+ *   than the local one — an `import { onSubmit as submit }` alias is a fact
+ *   about the importing module, and a node positioned in a file is named as
+ *   that file names it, which is also what keeps one function to one node
+ *   across every module that binds it.
+ *
+ *   {@link CodeNodeBase.symbol} carries that name too, with one exception:
+ *   where resolution reached a **parameter** (`function Row({ onPick })`) or a
+ *   name bound by a **destructuring pattern** (`const { onClose } = props`),
+ *   the field is **absent**. The function is declared in the caller or on the
+ *   right-hand side, so this file holds no body to name, and a `symbol` here
+ *   would assert one. A reference that syntax cannot resolve *at all* keeps its
+ *   `symbol` — "look for this name" is still the best available lead — and says
+ *   so with the diagnostic described below.
  * - **Inline** (`onClick={() => …}`, `onClick={function () {}}`) — `inline` is
  *   `true`, the node is positioned at the function expression itself, and its
  *   name is the property as written, which is the "derived label"
@@ -452,7 +466,32 @@ interface HandlerPlacement {
 }
 
 /**
- * A resolved declaration: where it is, and whether its module exports it.
+ * What kind of binding resolution reached, which decides whether the file holds
+ * a **declaration** of the handler at all.
+ *
+ * - `'declaration'` — a function, a class, a class member or a plain
+ *   `const`/`let`/`var` declarator. The body is written where the node points,
+ *   so {@link CodeNodeBase.symbol} can name a function an instrumentation
+ *   action may address.
+ * - `'parameter'` — a parameter binding, including a destructured prop
+ *   (`function Row({ onPick })`). The function itself is declared in the
+ *   *caller*; this file receives it.
+ * - `'binding-element'` — a name bound by a destructuring pattern
+ *   (`const { open, onClose } = props`, `const [q, setQ] = useState()`). The
+ *   value comes from the right-hand side; this file declares no body for it.
+ *
+ * The distinction is internal to this module — {@link HandlerNodeData} has no
+ * field for it — and exists because the last two must not be reported as
+ * symbols: a `symbol` on a handler node is read as "there is a function of this
+ * name here to wrap", and asserting one the file does not declare is what made
+ * `../graph/query.ts` affirm an instrumentable symbol that no patch could
+ * apply to.
+ */
+type HandlerDeclarationForm = 'declaration' | 'parameter' | 'binding-element';
+
+/**
+ * A resolved declaration: where it is, what form it takes, and whether its
+ * module exports it.
  *
  * `exported` is only knowable once the declaration itself has been found, which
  * is why it is not part of {@link HandlerPlacement}: an unresolved handler has
@@ -468,6 +507,16 @@ interface ResolvedDeclaration extends HandlerPlacement {
    * reason about a symbol another module can reach.
    */
   readonly exported: boolean;
+
+  /**
+   * Which of the three binding forms resolution reached. See
+   * {@link HandlerDeclarationForm}.
+   *
+   * Carried alongside the position rather than folded into it because the
+   * position is right either way — a parameter is exactly where a developer
+   * should be taken — while what may be *claimed* about the name differs.
+   */
+  readonly form: HandlerDeclarationForm;
 
   /**
    * The identifier the declaration itself is written under, when it has one.
@@ -853,7 +902,17 @@ function namedDraft(
     // however many modules bind it and under whatever local name.
     const name = resolved.declaredName ?? referenceName;
 
-    return { name, placement: resolved, symbol: name, exported: resolved.exported, data };
+    // A parameter and a destructured binding are **binding sites, not
+    // declarations**: the function arrives from the caller or from the
+    // right-hand side, and no file this index holds declares a body under this
+    // name. The node is still emitted and still points at the binding — that is
+    // the honest position — but it records no `symbol`, because a `symbol` is
+    // read downstream as "there is a function of this name here to wrap" and
+    // affirming one the file does not declare is what made the graph promise an
+    // instrumentation target the patcher then refused.
+    return resolved.form === 'declaration'
+      ? { name, placement: resolved, symbol: name, exported: resolved.exported, data }
+      : { name, placement: resolved, symbol: undefined, exported: resolved.exported, data };
   }
 
   diagnostics.push(unresolvedDeclaration(ctx.file, referenceName, safePositionOf(attribute)));
@@ -871,14 +930,18 @@ function namedDraft(
  * Builds a handler node from a draft.
  *
  * The single place a `handler` node is constructed, and therefore the single
- * place its id is derived. Three concrete shapes are returned rather than one
+ * place its id is derived. Four concrete shapes are returned rather than one
  * object assembled conditionally, because `exactOptionalPropertyTypes` makes
- * "absent" and "present and undefined" different types and the three
+ * "absent" and "present and undefined" different types and the four
  * combinations a draft can express are exactly these:
  *
  * - inline — no `symbol`, no `exported`;
  * - named but unresolved — a `symbol` to look for, no export status to report;
- * - named and resolved — both.
+ * - named and resolved to a **declaration** — both;
+ * - named and resolved to a **parameter or a destructured binding** — no
+ *   `symbol`, because this file declares no function of that name, but the
+ *   export status *is* known (it is `false`, observed rather than assumed), and
+ *   dropping it would discard a fact resolution established.
  *
  * `endLine` is clamped to at least `line` so a span is never inverted for a
  * declaration whose body was parsed from an unterminated construct.
@@ -893,7 +956,9 @@ function handlerNode(draft: HandlerNodeDraft): CodeNodeOf<'handler'> {
   const id = makeNodeId({ kind: 'handler', file, name, line, column });
 
   if (draft.symbol === undefined) {
-    return { id, kind: 'handler', name, file, line, column, endLine, data };
+    return draft.exported === undefined
+      ? { id, kind: 'handler', name, file, line, column, endLine, data }
+      : { id, kind: 'handler', name, file, line, column, endLine, exported: draft.exported, data };
   }
 
   if (draft.exported === undefined) {
@@ -1211,8 +1276,10 @@ function resolveDeclaration(
  * The walk is the language's own scoping order and it is what makes a handler
  * declared inside a component body — `const handleSubmit = useCallback(…)`, the
  * memoised shape every real component uses — resolve to *that* declaration
- * rather than to a module-level one of the same name. At each ancestor two
- * questions are asked, in this order:
+ * rather than to a module-level one of the same name. What it finds is reported
+ * with its {@link HandlerDeclarationForm}, because two of the three things a
+ * scope can bind a name to are not declarations this file holds a body for. At
+ * each ancestor two questions are asked, in this order:
  *
  * 1. does it hold **statements** that declare the name (a block, a case clause,
  *    a module block, the file itself)? and
@@ -1287,6 +1354,7 @@ function declarationInStatements(
         statement.getNameNode() ?? statement,
         statement,
         exportedFlag(statement),
+        'declaration',
       );
     }
 
@@ -1297,6 +1365,7 @@ function declarationInStatements(
         statement.getNameNode() ?? statement,
         statement,
         exportedFlag(statement),
+        'declaration',
       );
     }
 
@@ -1317,6 +1386,14 @@ function declarationInStatements(
 /**
  * The declaration of a name among one variable statement's declarators.
  *
+ * The declarator's own name node decides the form: a plain identifier
+ * (`const handleSubmit = …`) is a declaration whose right-hand side is written
+ * here, while a destructuring pattern (`const { open, onClose } = props`,
+ * `const [q, setQ] = useState()`) only *binds* a name to a value produced
+ * elsewhere — the position is still the bound identifier, which is where a
+ * developer should land, but there is no body in this file to time. See
+ * {@link HandlerDeclarationForm}.
+ *
  * @param file The project-relative POSIX path the declaration is in.
  * @param statement The variable statement to inspect.
  * @param name The name to look for.
@@ -1330,10 +1407,17 @@ function declarationInVariableStatement(
   const exported = exportedFlag(statement);
 
   for (const declaration of statement.getDeclarations()) {
-    const anchor = boundIdentifier(declaration.getNameNode(), name);
+    const nameNode = declaration.getNameNode();
+    const anchor = boundIdentifier(nameNode, name);
 
     if (anchor !== undefined) {
-      return declarationIn(file, anchor, declaration, exported);
+      return declarationIn(
+        file,
+        anchor,
+        declaration,
+        exported,
+        Node.isIdentifier(nameNode) ? 'declaration' : 'binding-element',
+      );
     }
   }
 
@@ -1347,7 +1431,10 @@ function declarationInVariableStatement(
  * (`function Row({ onPick }) { … <button onClick={onPick} /> }`), and pointing at
  * it is the honest answer: the function it holds is declared in the *caller*,
  * which no amount of syntax in this file can reach. A parameter is never
- * exported, so its export status is `false` rather than unknown.
+ * exported, so its export status is `false` rather than unknown — and its
+ * {@link HandlerDeclarationForm} is `'parameter'`, which is what keeps the name
+ * off the node as a `symbol`: the whole point of resolving to a parameter is
+ * that the body is somewhere else.
  *
  * @param ctx The file being visited and the project it belongs to.
  * @param parameters The parameters to inspect.
@@ -1363,7 +1450,7 @@ function declarationInParameters(
     const anchor = boundIdentifier(parameter.getNameNode(), name);
 
     if (anchor !== undefined) {
-      return declarationIn(ctx.file, anchor, parameter, false);
+      return declarationIn(ctx.file, anchor, parameter, false, 'parameter');
     }
   }
 
@@ -1440,7 +1527,7 @@ function resolveClassMember(
 
   const method = owner.getMethod(member);
   if (method !== undefined) {
-    return declarationIn(ctx.file, method.getNameNode(), method, false);
+    return declarationIn(ctx.file, method.getNameNode(), method, false, 'declaration');
   }
 
   const property = owner.getProperty(member);
@@ -1448,7 +1535,7 @@ function resolveClassMember(
   // A class member is not a module export, whatever the class's own status is.
   return property === undefined
     ? undefined
-    : declarationIn(ctx.file, property.getNameNode(), property, false);
+    : declarationIn(ctx.file, property.getNameNode(), property, false, 'declaration');
 }
 
 /**
@@ -1559,12 +1646,12 @@ function namedDeclarationIn(
 ): ResolvedDeclaration | undefined {
   const fn = moduleSourceFile.getFunction(name);
   if (fn !== undefined) {
-    return declarationIn(file, fn.getNameNode() ?? fn, fn, exportedFlag(fn));
+    return declarationIn(file, fn.getNameNode() ?? fn, fn, exportedFlag(fn), 'declaration');
   }
 
   const cls = moduleSourceFile.getClass(name);
   if (cls !== undefined) {
-    return declarationIn(file, cls.getNameNode() ?? cls, cls, exportedFlag(cls));
+    return declarationIn(file, cls.getNameNode() ?? cls, cls, exportedFlag(cls), 'declaration');
   }
 
   const variable = moduleSourceFile.getVariableDeclaration(name);
@@ -1579,6 +1666,9 @@ function namedDeclarationIn(
     variable.getNameNode(),
     variable,
     statement === undefined ? false : exportedFlag(statement),
+    // A module's exported binding is looked up by name, so the declarator's own
+    // name node is an identifier and never a destructuring pattern.
+    'declaration',
   );
 }
 
@@ -1608,7 +1698,13 @@ function defaultDeclarationIn(
       (Node.isFunctionDeclaration(statement) || Node.isClassDeclaration(statement)) &&
       statement.hasDefaultKeyword()
     ) {
-      return declarationIn(file, statement.getNameNode() ?? statement, statement, true);
+      return declarationIn(
+        file,
+        statement.getNameNode() ?? statement,
+        statement,
+        true,
+        'declaration',
+      );
     }
 
     // `export default handleSubmit;`
@@ -1708,6 +1804,9 @@ function placementOf(file: string, node: Node): HandlerPlacement {
  * @param anchor The identifier the position is taken from.
  * @param extent The declaration the end line is taken from.
  * @param exported Whether the declaration is exported from its module.
+ * @param form Which binding form was reached. See
+ * {@link HandlerDeclarationForm}; every caller states it explicitly, because a
+ * default would silently claim a declaration for the two forms that have none.
  * @returns The resolved declaration.
  */
 function declarationIn(
@@ -1715,6 +1814,7 @@ function declarationIn(
   anchor: Node,
   extent: Node,
   exported: boolean,
+  form: HandlerDeclarationForm,
 ): ResolvedDeclaration {
   const position = positionOf(anchor);
 
@@ -1724,6 +1824,7 @@ function declarationIn(
     column: position.column,
     endLine: Math.max(extent.getEndLineNumber(), position.line),
     exported,
+    form,
     // The anchor is the declaration's identifier wherever it has one, so this is
     // the declaration's own name rather than the name written at the binding
     // site; see {@link ResolvedDeclaration.declaredName}.

@@ -414,21 +414,44 @@ export async function readProductBySlug(slug: string): Promise<ProductDetail> {
  * one currently merchandises.
  *
  * The counts come from the same condition the listing runs under, so a chip
- * claiming a count and the page it leads to agree. Categories are returned
- * whether or not they hold products: the chips are a stable set that neither
- * reorders nor disappears as stock and listings change, and a count of zero
- * says so plainly. The order is by name, with the unique slug as its final key
- * so that two categories sharing a name could not swap places between requests.
+ * claiming a count and the page it leads to agree. The search term is part of
+ * that condition: a chip is offered *within* the listing a reader is looking
+ * at, so under `?search=wrench` it counts the wrench products in its category
+ * rather than everything the category holds - otherwise a chip advertising
+ * thirty-four products leads to another empty result, and the count line and
+ * the chip row contradict each other on the same screen.
  *
+ * The category filter is deliberately *not* part of it. Each chip counts within
+ * its own category, which is what {@link filters} applies no category for: a
+ * per-category count narrowed to the category already selected would leave
+ * every other chip at zero and make the row unable to say where else the term
+ * has matches.
+ *
+ * Categories are returned whether or not they hold products: the chips are a
+ * stable set that neither reorders nor disappears as stock, listings and search
+ * terms change, and a count of zero says so plainly. The order is by name, with
+ * the unique slug as its final key so that two categories sharing a name could
+ * not swap places between requests.
+ *
+ * @param search The term the listing is filtered by, or `undefined` for the
+ * unfiltered catalog. A blank term narrows nothing, exactly as it does for the
+ * listing.
  * @returns The categories in display order.
  */
-export async function listCategoryOptions(): Promise<CategoryOption[]> {
+export async function listCategoryOptions(search?: string): Promise<CategoryOption[]> {
+  // One condition, built by the listing's own helper rather than restated here,
+  // which is what keeps a chip's count and the page it leads to in agreement.
+  // The term is spread in only when it holds a value: this workspace compiles
+  // with `exactOptionalPropertyTypes`, under which an unconstrained filter is an
+  // absent key rather than a key holding `undefined`.
+  const counted = filters({ ...(search === undefined ? {} : { search }) });
+
   const rows = await prisma.category.findMany({
     select: {
       id: true,
       name: true,
       slug: true,
-      _count: { select: { products: { where: { active: true } } } },
+      _count: { select: { products: { where: counted } } },
     },
     orderBy: [{ name: 'asc' }, { slug: 'asc' }],
   });

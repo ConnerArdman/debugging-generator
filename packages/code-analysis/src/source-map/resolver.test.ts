@@ -276,6 +276,229 @@ const RELATIVE_CHUNK_JS = [
   '',
 ].join('\n');
 
+/**
+ * A third synthetic pair, whose map's first `sources` entry **traverses above
+ * its own root**.
+ *
+ * The committed corpus cannot express this case and must not: every fixture is
+ * a real producer's output, and no producer emits this. It is what a hostile or
+ * broken bundle served by the dev server emits, and it is the one input for
+ * which the authored spelling and the tracer's resolved spelling disagree about
+ * *safety* rather than about completeness — RFC 3986 dot-segment removal
+ * discards the `'..'` that leaves the root, so the resolved spelling reads as
+ * an ordinary project path (see "the laundered spelling" below). Its second
+ * source is an ordinary project source, so one stack asserts that the refused
+ * frame is dropped while its neighbour still resolves.
+ */
+const TRAVERSING_CHUNK = 'traversing-source-chunk.js';
+
+/** The map named by {@link TRAVERSING_CHUNK}'s directive. */
+const TRAVERSING_MAP = 'traversing-source.js.map';
+
+/**
+ * {@link TRAVERSING_MAP}'s first `sources` entry, as authored.
+ *
+ * A bundler-scheme URL whose path steps four levels above the namespace root.
+ * `normalizeSourcePath` refuses it, and no spelling of it may be trusted.
+ */
+const TRAVERSING_SOURCE = 'webpack://_N_E/../../../../etc/passwd';
+
+/**
+ * The same entry as `TraceMap.resolvedSources` reports it, and the whole reason
+ * the gate exists.
+ *
+ * Flattened, the traversal is gone and the string is a perfectly ordinary
+ * bundler URL naming `etc/passwd` — a path `normalizeSourcePath` accepts,
+ * because as a *string* there is nothing left to refuse.
+ */
+const LAUNDERED_TRAVERSING_SOURCE = 'webpack://_N_E/etc/passwd';
+
+/** The project-relative path {@link LAUNDERED_TRAVERSING_SOURCE} normalises to. */
+const LAUNDERED_TRAVERSING_FILE = 'etc/passwd';
+
+/**
+ * {@link TRAVERSING_MAP}, verbatim.
+ *
+ * Two mapped generated lines, one segment each and no `names`:
+ * `1:0 -> sources[0] 1:0` (the traversing entry) and
+ * `2:0 -> sources[1] 21:0` (`src/lib/http.ts`, a real project source). The
+ * `mappings` string is the VLQ encoding of exactly those two segments —
+ * `[[0,0,0,0]]` then `[[0,1,20,0]]`, all four fields 0-based.
+ */
+const TRAVERSING_MAP_JSON = JSON.stringify({
+  version: 3,
+  file: TRAVERSING_CHUNK,
+  sources: [TRAVERSING_SOURCE, 'webpack://_N_E/./src/lib/http.ts'],
+  names: [],
+  mappings: 'AAAA;ACoBA',
+});
+
+/** {@link TRAVERSING_CHUNK}, verbatim: the two mapped lines and the directive. */
+const TRAVERSING_CHUNK_JS = [
+  'const traversingModule = 1;',
+  'const projectModule = 2;',
+  `//# sourceMappingURL=${TRAVERSING_MAP}`,
+  '',
+].join('\n');
+
+/**
+ * A pair whose map declares a `sourceRoot` and reaches its source through a
+ * traversal the root **absorbs**.
+ *
+ * The legitimate counterpart of {@link TRAVERSING_CHUNK}, and the reason the
+ * gate above cannot simply be "refuse any source containing `'..'`":
+ * `sourceRoot: 'webpack://_N_E/./src/lib/deep/deeper/'` with `'../../http.ts'`
+ * names `src/lib/http.ts` and nothing above the root, so it must still resolve.
+ */
+const ROOTED_ABSORBED_CHUNK = 'rooted-absorbed-chunk.js';
+
+/** The map named by {@link ROOTED_ABSORBED_CHUNK}'s directive. */
+const ROOTED_ABSORBED_MAP = 'rooted-absorbed.js.map';
+
+/**
+ * {@link ROOTED_ABSORBED_MAP}, verbatim.
+ *
+ * One mapped generated line, `1:0 -> sources[0] 21:0`, whose source is
+ * `'../../http.ts'` beneath the root above: the same `src/lib/http.ts` line 21
+ * the other synthetic maps reach directly. `mappings` is the VLQ encoding of
+ * the single segment `[[0, 0, 20, 0]]`, all four fields 0-based.
+ */
+const ROOTED_ABSORBED_MAP_JSON = JSON.stringify({
+  version: 3,
+  file: ROOTED_ABSORBED_CHUNK,
+  sourceRoot: 'webpack://_N_E/./src/lib/deep/deeper/',
+  sources: ['../../http.ts'],
+  names: [],
+  mappings: 'AAoBA',
+});
+
+/** {@link ROOTED_ABSORBED_CHUNK}, verbatim: the one mapped line and the directive. */
+const ROOTED_ABSORBED_CHUNK_JS = [
+  'const rootedModule = 1;',
+  `//# sourceMappingURL=${ROOTED_ABSORBED_MAP}`,
+  '',
+].join('\n');
+
+/**
+ * A pair whose map declares a `sourceRoot` too shallow to absorb its source's
+ * traversal.
+ *
+ * Neither half of it is refusable on its own — `'webpack://_N_E/./src/'` is an
+ * ordinary root and `'../../../../etc/passwd'` is an ordinary relative entry —
+ * and the tracer resolves the two to the same laundered
+ * {@link LAUNDERED_TRAVERSING_SOURCE} as the absolute form. So this pair is the
+ * case that proves the question is asked of the *joined* spelling.
+ */
+const ROOTED_ESCAPING_CHUNK = 'rooted-escaping-chunk.js';
+
+/** The map named by {@link ROOTED_ESCAPING_CHUNK}'s directive. */
+const ROOTED_ESCAPING_MAP = 'rooted-escaping.js.map';
+
+/** {@link ROOTED_ESCAPING_MAP}, verbatim. One segment: `1:0 -> sources[0] 1:0`. */
+const ROOTED_ESCAPING_MAP_JSON = JSON.stringify({
+  version: 3,
+  file: ROOTED_ESCAPING_CHUNK,
+  sourceRoot: 'webpack://_N_E/./src/',
+  sources: ['../../../../etc/passwd'],
+  names: [],
+  mappings: 'AAAA',
+});
+
+/** {@link ROOTED_ESCAPING_CHUNK}, verbatim. */
+const ROOTED_ESCAPING_CHUNK_JS = [
+  'const escapingRootedModule = 1;',
+  `//# sourceMappingURL=${ROOTED_ESCAPING_MAP}`,
+  '',
+].join('\n');
+
+/**
+ * A pair whose **`sourceRoot` itself** traverses, over an entirely clean
+ * `sources` entry.
+ *
+ * `'etc/passwd'` carries no traversal at all, so a gate that looked only at the
+ * entry would admit the tracer's spelling — which is again
+ * {@link LAUNDERED_TRAVERSING_SOURCE}, the root's `'..'` segments having been
+ * removed on the way.
+ */
+const HOSTILE_ROOT_CHUNK = 'hostile-root-chunk.js';
+
+/** The map named by {@link HOSTILE_ROOT_CHUNK}'s directive. */
+const HOSTILE_ROOT_MAP = 'hostile-root.js.map';
+
+/** {@link HOSTILE_ROOT_MAP}, verbatim. One segment: `1:0 -> sources[0] 1:0`. */
+const HOSTILE_ROOT_MAP_JSON = JSON.stringify({
+  version: 3,
+  file: HOSTILE_ROOT_CHUNK,
+  sourceRoot: 'webpack://_N_E/../../..',
+  sources: ['etc/passwd'],
+  names: [],
+  mappings: 'AAAA',
+});
+
+/** {@link HOSTILE_ROOT_CHUNK}, verbatim. */
+const HOSTILE_ROOT_CHUNK_JS = [
+  'const hostileRootModule = 1;',
+  `//# sourceMappingURL=${HOSTILE_ROOT_MAP}`,
+  '',
+].join('\n');
+
+/**
+ * A **sectioned** pair, one section ordinary and one section traversing.
+ *
+ * Turbopack's real shape, so this is where the gate is proved to survive the
+ * flattening: `AnyMap` reports each section's *resolved* source, and the
+ * authored entry the gate judges comes from walking the document. The
+ * traversing section also declares its own `sourceRoot`, which the flattened
+ * tracer does not carry — the conservative case, and it must still be refused.
+ */
+const SECTIONED_TRAVERSING_CHUNK = 'sectioned-traversing-chunk.js';
+
+/** The map named by {@link SECTIONED_TRAVERSING_CHUNK}'s directive. */
+const SECTIONED_TRAVERSING_MAP = 'sectioned-traversing.js.map';
+
+/**
+ * {@link SECTIONED_TRAVERSING_MAP}, verbatim.
+ *
+ * Section 0 at offset `0:0` maps generated `1:0 -> src/lib/http.ts 21:0`;
+ * section 1 at offset `1:0` maps generated `2:0` to a source that traverses
+ * above its own root beneath a `sourceRoot` too shallow to absorb it.
+ */
+const SECTIONED_TRAVERSING_MAP_JSON = JSON.stringify({
+  version: 3,
+  file: SECTIONED_TRAVERSING_CHUNK,
+  sections: [
+    {
+      offset: { line: 0, column: 0 },
+      map: {
+        version: 3,
+        file: 'section-0.js',
+        sources: ['turbopack:///[project]/src/lib/http.ts'],
+        names: [],
+        mappings: 'AAoBA',
+      },
+    },
+    {
+      offset: { line: 1, column: 0 },
+      map: {
+        version: 3,
+        file: 'section-1.js',
+        sourceRoot: 'webpack://_N_E/./src/',
+        sources: ['../../../../etc/passwd'],
+        names: [],
+        mappings: 'AAAA',
+      },
+    },
+  ],
+});
+
+/** {@link SECTIONED_TRAVERSING_CHUNK}, verbatim: two mapped lines and the directive. */
+const SECTIONED_TRAVERSING_CHUNK_JS = [
+  'const sectionZeroModule = 1;',
+  'const sectionOneModule = 2;',
+  `//# sourceMappingURL=${SECTIONED_TRAVERSING_MAP}`,
+  '',
+].join('\n');
+
 // ---------------------------------------------------------------------------
 // The expectation tables, transcribed from the fixtures' README
 // ---------------------------------------------------------------------------
@@ -666,6 +889,16 @@ function buildRoutes(): ReadonlyMap<string, ServedArtifact> {
   serve(ESCAPING_MAP, Buffer.from(ESCAPING_MAP_JSON, 'utf8'));
   serve(RELATIVE_CHUNK, Buffer.from(RELATIVE_CHUNK_JS, 'utf8'));
   serve(RELATIVE_MAP, Buffer.from(RELATIVE_MAP_JSON, 'utf8'));
+  serve(TRAVERSING_CHUNK, Buffer.from(TRAVERSING_CHUNK_JS, 'utf8'));
+  serve(TRAVERSING_MAP, Buffer.from(TRAVERSING_MAP_JSON, 'utf8'));
+  serve(ROOTED_ABSORBED_CHUNK, Buffer.from(ROOTED_ABSORBED_CHUNK_JS, 'utf8'));
+  serve(ROOTED_ABSORBED_MAP, Buffer.from(ROOTED_ABSORBED_MAP_JSON, 'utf8'));
+  serve(ROOTED_ESCAPING_CHUNK, Buffer.from(ROOTED_ESCAPING_CHUNK_JS, 'utf8'));
+  serve(ROOTED_ESCAPING_MAP, Buffer.from(ROOTED_ESCAPING_MAP_JSON, 'utf8'));
+  serve(HOSTILE_ROOT_CHUNK, Buffer.from(HOSTILE_ROOT_CHUNK_JS, 'utf8'));
+  serve(HOSTILE_ROOT_MAP, Buffer.from(HOSTILE_ROOT_MAP_JSON, 'utf8'));
+  serve(SECTIONED_TRAVERSING_CHUNK, Buffer.from(SECTIONED_TRAVERSING_CHUNK_JS, 'utf8'));
+  serve(SECTIONED_TRAVERSING_MAP, Buffer.from(SECTIONED_TRAVERSING_MAP_JSON, 'utf8'));
 
   return routes;
 }
@@ -1533,6 +1766,175 @@ describe('resolveStack — a map whose one source is spelled relatively', () => 
         symbol: undefined,
       }),
     );
+    expectSchemaValid(onlyLocation(located));
+  });
+});
+
+describe('resolveStack — a source that traverses above its own root', () => {
+  it('is laundered by the tracer into a spelling normalisation accepts', () => {
+    // The mechanism, stated before the behaviour that guards against it, so a
+    // future reader can see that the gate in `sourceCandidatesFor` is guarding
+    // against something real rather than being defensive for its own sake.
+    // `resolvedSources` is built by RFC 3986 URI resolution, whose dot-segment
+    // removal discards a `..` that leaves the root of an absolute path.
+    const tracer = new TraceMap(JSON.parse(TRAVERSING_MAP_JSON) as SourceMapInput);
+
+    expect(tracer.sources).toStrictEqual([TRAVERSING_SOURCE, 'webpack://_N_E/./src/lib/http.ts']);
+    expect(tracer.resolvedSources).toStrictEqual([
+      LAUNDERED_TRAVERSING_SOURCE,
+      // The `./` collapsing that is the *harmless* half of the same
+      // normalisation, shown beside the harmful half.
+      'webpack://_N_E/src/lib/http.ts',
+    ]);
+
+    // Authored: refused. Laundered: accepted, and nothing about the string
+    // itself is refusable — which is why the refusal has to be carried from the
+    // authored entry rather than re-derived from the spelling in hand.
+    expect(normalizeSourcePath(TRAVERSING_SOURCE, { projectRoot: PROJECT_ROOT })).toBeUndefined();
+    expect(normalizeSourcePath(LAUNDERED_TRAVERSING_SOURCE, { projectRoot: PROJECT_ROOT })).toBe(
+      LAUNDERED_TRAVERSING_FILE,
+    );
+  });
+
+  it('yields no location, and never the laundered path', async () => {
+    const located = await resolveStack(
+      stackOf(frameLine(TRAVERSING_CHUNK, { line: 1, column: 0 }, 'traversingModule')),
+      resolveOptions(),
+    );
+
+    expect(located).toStrictEqual([]);
+  });
+
+  it('is dropped from a stack whose other frames still resolve', async () => {
+    const located = await resolveStack(
+      stackOf(
+        frameLine(TRAVERSING_CHUNK, { line: 1, column: 0 }, 'traversingModule'),
+        frameLine(TRAVERSING_CHUNK, { line: 2, column: 0 }, 'projectModule'),
+      ),
+      resolveOptions(),
+    );
+
+    // One rung of the chain is refused; the ordinary project source beside it in
+    // the same map is unaffected. The refusal is a skip, not a failure.
+    expect(located).toStrictEqual([
+      expectedSourceLocation({
+        generated: { line: 2, column: 0 },
+        file: 'src/lib/http.ts',
+        original: { line: 21, column: 0 },
+        symbol: undefined,
+      }),
+    ]);
+    expectSchemaValid(onlyLocation(located));
+  });
+
+  it('yields no location from `resolveStackFrame` either', async () => {
+    // The single-frame entry point shares the path, and the QA reproduction of
+    // this defect went through it: it answered
+    // `{ file: 'etc/passwd', line: 1, column: 1, resolvedBy: 'source-map',
+    // confidence: 0.75 }`.
+    await expect(
+      resolveStackFrame(stackFrameFor(TRAVERSING_CHUNK, { line: 1, column: 0 }), resolveOptions()),
+    ).resolves.toBeUndefined();
+  });
+
+  it('is refused whatever the project root is', async () => {
+    // Containment is not what refuses this source — the laundered path is
+    // relative and inside any root — so a different root must not change the
+    // answer.
+    await expect(
+      resolveStack(
+        stackOf(frameLine(TRAVERSING_CHUNK, { line: 1, column: 0 })),
+        resolveOptions({ projectRoot: createSandbox() }),
+      ),
+    ).resolves.toEqual([]);
+  });
+
+  it('explains the refusal at `debug` level and nowhere higher', async () => {
+    const { logger, records } = createRecordingLogger();
+
+    await expect(
+      resolveStack(
+        stackOf(frameLine(TRAVERSING_CHUNK, { line: 1, column: 0 })),
+        resolveOptions({ logger }),
+      ),
+    ).resolves.toEqual([]);
+
+    // A frame pointing somewhere unresolvable is ordinary operation, so it is
+    // recorded and not raised: a session is not failed over one frame.
+    expect(records).not.toStrictEqual([]);
+    expect(
+      records.filter((record) => record.level !== 'debug' && record.level !== 'trace'),
+    ).toEqual([]);
+  });
+
+  it('resolves a traversal its map’s `sourceRoot` absorbs', async () => {
+    const located = await resolveStack(
+      stackOf(frameLine(ROOTED_ABSORBED_CHUNK, { line: 1, column: 0 }, 'rootedModule')),
+      resolveOptions(),
+    );
+
+    // `webpack://_N_E/./src/lib/deep/deeper/` + `../../http.ts` names
+    // `src/lib/http.ts` and nothing above the root. The gate is about escaping,
+    // not about the presence of `..`, and this is the case that says so.
+    expect(onlyLocation(located)).toStrictEqual(
+      expectedSourceLocation({
+        generated: { line: 1, column: 0 },
+        file: 'src/lib/http.ts',
+        original: { line: 21, column: 0 },
+        symbol: undefined,
+      }),
+    );
+    expectSchemaValid(onlyLocation(located));
+  });
+
+  it('refuses a traversal its map’s `sourceRoot` is too shallow to absorb', async () => {
+    const tracer = new TraceMap(JSON.parse(ROOTED_ESCAPING_MAP_JSON) as SourceMapInput);
+    expect(tracer.resolvedSources).toStrictEqual([LAUNDERED_TRAVERSING_SOURCE]);
+
+    await expect(
+      resolveStack(
+        stackOf(frameLine(ROOTED_ESCAPING_CHUNK, { line: 1, column: 0 }, 'escapingRootedModule')),
+        resolveOptions(),
+      ),
+    ).resolves.toEqual([]);
+  });
+
+  it('refuses a clean source under a `sourceRoot` that traverses', async () => {
+    const tracer = new TraceMap(JSON.parse(HOSTILE_ROOT_MAP_JSON) as SourceMapInput);
+    expect(tracer.resolvedSources).toStrictEqual([LAUNDERED_TRAVERSING_SOURCE]);
+
+    // `etc/passwd` carries no traversal of its own: the escape is entirely in
+    // the root, which is why the question is asked of the joined spelling.
+    await expect(
+      resolveStack(
+        stackOf(frameLine(HOSTILE_ROOT_CHUNK, { line: 1, column: 0 }, 'hostileRootModule')),
+        resolveOptions(),
+      ),
+    ).resolves.toEqual([]);
+  });
+
+  it('refuses a traversing section of a sectioned map and keeps the other section', async () => {
+    const located = await resolveStack(
+      stackOf(
+        frameLine(SECTIONED_TRAVERSING_CHUNK, { line: 1, column: 0 }, 'sectionZeroModule'),
+        frameLine(SECTIONED_TRAVERSING_CHUNK, { line: 2, column: 0 }, 'sectionOneModule'),
+      ),
+      resolveOptions(),
+    );
+
+    // `AnyMap` reports each section's *resolved* source — already laundered —
+    // and the authored entry the gate judges comes from walking the document,
+    // so the refusal has to survive the flattening. Section 1 also carries its
+    // own `sourceRoot`, which the flattened tracer does not: the conservative
+    // case, refused rather than guessed at.
+    expect(located).toStrictEqual([
+      expectedSourceLocation({
+        generated: { line: 1, column: 0 },
+        file: 'src/lib/http.ts',
+        original: { line: 21, column: 0 },
+        symbol: undefined,
+      }),
+    ]);
     expectSchemaValid(onlyLocation(located));
   });
 });

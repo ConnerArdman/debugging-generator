@@ -1045,5 +1045,129 @@
     "sessionId": "ses_t3m8q1v5y9c2f6hk",
     "captureId": "cap_b7d1g4j8m2p5r9tw",
     "ingestSeq": 30
+  },
+  {
+    "id": "evt_v2c6f0j4m8q2s6tx",
+    "traceId": "7b1e4d92c0a53f86d24b9e017c35af68",
+    "spanId": "1c7e5b930d48f2a6",
+    "parentSpanId": "7f3c58e19d640ab2",
+    "kind": "db.query",
+    "name": "prisma:client:operation",
+    "startTime": 1789812900060.4,
+    "duration": 24.118,
+    "tier": "db",
+    "attributes": {
+      "db.system": "postgresql",
+      "db.operation": "operation",
+      "db.name": "appdb",
+      "db.client": "prisma"
+    },
+    "status": "ok",
+    "producerId": "prd_v5y9b3e7h1k4n8qs",
+    "seq": 10,
+    "sessionId": "ses_t3m8q1v5y9c2f6hk",
+    "captureId": "cap_b7d1g4j8m2p5r9tw",
+    "ingestSeq": 31
+  },
+  {
+    "id": "evt_w3d7g1k5n9r3t7vy",
+    "traceId": "7b1e4d92c0a53f86d24b9e017c35af68",
+    "spanId": "8d40a6f1e29b5c37",
+    "parentSpanId": "7f3c58e19d640ab2",
+    "kind": "db.query",
+    "name": "prisma:client:serialize",
+    "startTime": 1789812900090.2,
+    "duration": 2.884,
+    "tier": "db",
+    "attributes": {
+      "db.operation": "serialize",
+      "db.client": "prisma"
+    },
+    "status": "ok",
+    "producerId": "prd_v5y9b3e7h1k4n8qs",
+    "seq": 11,
+    "sessionId": "ses_t3m8q1v5y9c2f6hk",
+    "captureId": "cap_b7d1g4j8m2p5r9tw",
+    "ingestSeq": 32
+  },
+  {
+    "id": "evt_x4f8h2m6p0s4v8wz",
+    "traceId": "7b1e4d92c0a53f86d24b9e017c35af68",
+    "spanId": "5f92c48b07e3a1d6",
+    "parentSpanId": "7f3c58e19d640ab2",
+    "kind": "db.query",
+    "name": "pg-pool.connect",
+    "startTime": 1789812900096.5,
+    "duration": 5.612,
+    "tier": "db",
+    "attributes": {
+      "db.system": "postgresql",
+      "db.operation": "connect",
+      "db.name": "appdb",
+      "db.client": "pg"
+    },
+    "status": "ok",
+    "producerId": "prd_v5y9b3e7h1k4n8qs",
+    "seq": 12,
+    "sessionId": "ses_t3m8q1v5y9c2f6hk",
+    "captureId": "cap_b7d1g4j8m2p5r9tw",
+    "ingestSeq": 33
+  },
+  {
+    "id": "evt_y5g9j3n7q1t5w9xb",
+    "traceId": "7b1e4d92c0a53f86d24b9e017c35af68",
+    "spanId": "2b64e98d5a017f3c",
+    "parentSpanId": "7f3c58e19d640ab2",
+    "kind": "db.query",
+    "name": "prisma:client:db_query",
+    "startTime": 1789812900110.3,
+    "duration": 14.318,
+    "tier": "db",
+    "attributes": {
+      "db.system": "postgresql",
+      "db.statement": "SELECT count(*) AS total FROM items WHERE group_id = $1",
+      "db.rowCount": 1,
+      "db.operation": "db_query",
+      "db.client": "prisma"
+    },
+    "status": "ok",
+    "producerId": "prd_v5y9b3e7h1k4n8qs",
+    "seq": 13,
+    "source": {
+      "file": "src/server/services/items.service.ts",
+      "line": 72,
+      "column": 18,
+      "symbol": "loadItems",
+      "resolvedBy": "code-graph",
+      "confidence": 0.85
+    },
+    "sessionId": "ses_t3m8q1v5y9c2f6hk",
+    "captureId": "cap_b7d1g4j8m2p5r9tw",
+    "ingestSeq": 34
+  },
+  {
+    "id": "evt_z6h0k4p8r2v6x0yc",
+    "traceId": "7b1e4d92c0a53f86d24b9e017c35af68",
+    "spanId": "9e3f07c6b18d425a",
+    "parentSpanId": "2b64e98d5a017f3c",
+    "kind": "db.query",
+    "name": "pg.query:SELECT appdb",
+    "startTime": 1789812900112.9,
+    "duration": 9.442,
+    "tier": "db",
+    "attributes": {
+      "db.system": "postgresql",
+      "db.statement": "SELECT count(*) AS total FROM items WHERE group_id = $1",
+      "db.rowCount": 1,
+      "db.operation": "SELECT",
+      "db.name": "appdb",
+      "db.client": "pg"
+    },
+    "status": "ok",
+    "producerId": "prd_v5y9b3e7h1k4n8qs",
+    "seq": 14,
+    "sessionId": "ses_t3m8q1v5y9c2f6hk",
+    "captureId": "cap_b7d1g4j8m2p5r9tw",
+    "ingestSeq": 35
   }
 ]

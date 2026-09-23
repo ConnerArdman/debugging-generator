@@ -31,6 +31,14 @@
  * field, because a partially salvaged query would show figures under a filter the reader cannot see
  * in the address bar.
  *
+ * AND A FAILED READ IS STILL A DASHBOARD VISIT
+ * A query the schema accepts can still ask for something the feed cannot answer - a location
+ * identifier that no longer names one is the everyday case - and the answer to that is a notice in
+ * place of the figures, never in place of the page. The filter row stays mounted above it and the
+ * notice carries a link back to this route's own path, so the filter the notice is asking the
+ * reader to clear is a filter they can actually reach: with both, recovery is one control away by
+ * pointer or by keyboard, and with neither it was a URL to retype by hand.
+ *
  * WHAT THE PAGE DOES NOT OWN
  *   - The document, the main landmark and the site chrome: `app/layout.tsx` mounts `PageContainer`
  *     around every route, so this page renders its own breadcrumb trail and its own level-one
@@ -68,6 +76,7 @@
  */
 
 import type { Metadata } from 'next';
+import Link from 'next/link';
 import { Suspense, type ReactElement } from 'react';
 
 import {
@@ -82,6 +91,7 @@ import { LowStockList, LowStockListPlaceholder } from '@/components/dashboard/Lo
 import { WarehouseFilter } from '@/components/dashboard/WarehouseFilter';
 import { BreadcrumbTrail, type BreadcrumbCrumb } from '@/components/layout/BreadcrumbTrail';
 import { Alert } from '@/components/ui/Alert';
+import { Retry } from '@/components/ui/Retry';
 import { StorefrontApiError, loadInventorySummary } from '@/lib/api-client';
 import type { InventorySummary, StorefrontErrorCode } from '@/lib/types';
 import { storefrontOrigin } from '@/server/origin';
@@ -160,6 +170,60 @@ const NOTICES: Partial<Record<StorefrontErrorCode, string>> = {
     'returns to the figures the dashboard opens on.',
 };
 
+/**
+ * The wording of the notice's own way out: this route with nothing asked of it.
+ *
+ * It names the outcome rather than the mechanism - a reader who has arrived at
+ * a dashboard with no figures wants every location back, not to be told about a
+ * query string - and it is a link rather than a button because it is exactly
+ * that: a destination, reachable with no scripting, which the filter row's Clear
+ * then duplicates for a reader already holding the controls.
+ */
+const RECOVERY_LABEL = 'Report on every location';
+
+/* ---------------------------------------------------------------------------
+ * The query
+ * ------------------------------------------------------------------------- */
+
+/**
+ * The query a bare visit to this route parses to: every parameter at the value
+ * its absence means.
+ *
+ * Read from the schema rather than restated, so the figures this page opens on
+ * and the figures it falls back to cannot drift from the endpoint's own
+ * defaults, and so no default is written down twice. Parsing an empty object is
+ * exact because every value-bearing parameter of the schema is defaulted, and it
+ * is done once at module scope because the answer cannot differ between
+ * requests.
+ *
+ * Used for two things: the query a rejected one is answered with, and the
+ * comparison that decides whether a visit is filtered at all - which is what
+ * tells the notice below whether it has anything to offer a way out of.
+ */
+const DEFAULT_QUERY: InventorySummaryQueryInput = inventorySummaryQuerySchema.parse({});
+
+/**
+ * Whether `query` asks for anything other than the dashboard's opening state.
+ *
+ * The three filters are compared against "absent" and the headroom figure
+ * against the default the schema applies, which is precisely the set of
+ * parameters the filter row writes into the URL - so this answers the reader's
+ * question, "is there a filter here to get rid of", and not a narrower one about
+ * one parameter. `page` and `pageSize` are deliberately not read: a reader on
+ * page four of an unfiltered dashboard has nothing to clear.
+ *
+ * @param query The parsed query the page is answering.
+ * @returns `true` when at least one filter is in force.
+ */
+function filtered(query: InventorySummaryQueryInput): boolean {
+  return (
+    query.warehouseId !== null ||
+    query.state !== null ||
+    query.movement !== null ||
+    query.threshold !== DEFAULT_QUERY.threshold
+  );
+}
+
 /* ---------------------------------------------------------------------------
  * The read
  * ------------------------------------------------------------------------- */
@@ -197,20 +261,30 @@ function notice(error: unknown): string {
 }
 
 /**
- * Reads the dashboard's feed for `query`, and never rejects.
+ * Reads the dashboard's feed for `query`.
  *
  * The authority is established first, because a request cannot be addressed
- * without one, and both steps sit inside the same `catch`: an address this store
- * may not call itself on and an endpoint that answered with a failure are the
- * same thing to a reader, which is a dashboard that cannot show its figures.
+ * without one, and deliberately outside the `try`: the two failures it can
+ * raise are this deployment being configured with an address it cannot be
+ * reached at, and a process that cannot establish the address it answers on.
+ * Neither is a figure that could not be read, and neither is something a reader
+ * can do anything about by asking for the dashboard again, so neither is
+ * collapsed into this page's notice - they leave this function, and
+ * `app/error.tsx` is what says so, once, for every route in the store.
+ *
+ * A read that fails is a different matter and is what the `try` is for: it
+ * never rejects, because a dashboard that cannot show its figures is still a
+ * dashboard visit.
  *
  * @param query The parsed query, whose members are the endpoint's parameters.
  * @returns The payload, or the sentence to render in its place.
+ * @throws StorefrontError `INTERNAL_ERROR` when the address this store answers
+ * on cannot be established, which reaches the route's error boundary.
  */
 async function read(query: InventorySummaryQueryInput): Promise<Outcome> {
-  try {
-    const origin = storefrontOrigin();
+  const origin = storefrontOrigin();
 
+  try {
     const summary = await loadInventorySummary({
       warehouseId: query.warehouseId,
       threshold: query.threshold,
@@ -296,10 +370,10 @@ function DashboardPlaceholder({ rows }: { rows: number }): ReactElement {
 
 /**
  * The dashboard's data: one read of the feed, and either the four components it
- * fills or the notice that stands in for all of them.
+ * fills or the filter row over the notice that stands in for the other three.
  *
  * The failure is one notice rather than one per region, because one read
- * produced all four: three notices would announce a single failure three times,
+ * produced all three: three notices would announce a single failure three times,
  * and `ui/Alert` is announced politely here because the reader did not cause it.
  * An empty answer is not a failure and is not treated as one - the table and the
  * list each say what an empty page of their own means.
@@ -317,19 +391,66 @@ async function DashboardData({
 
   if (outcome.summary === null) {
     /*
-     * The whole payload is missing, so the filter row, the figures, the table
-     * and the list are all omitted: an empty table or a row of zeroes would
-     * read as "nothing in stock", which is a different and much worse statement
-     * than "the figures are missing". `warning` rather than `danger` because
-     * `ui/Alert` announces `danger` assertively, which belongs to a failure the
-     * reader just caused.
+     * The payload is missing, so the figures, the table and the list are all
+     * omitted: an empty table or a row of zeroes would read as "nothing in
+     * stock", which is a different and much worse statement than "the figures
+     * are missing". `warning` rather than `danger` because `ui/Alert` announces
+     * `danger` assertively, which belongs to a failure the reader just caused.
+     *
+     * The filter row is NOT omitted, and that is the difference between a
+     * notice and a dead end. The most likely reason this branch is reached is
+     * the filter itself - an identifier in the address bar that no longer names
+     * a location - and the notice's own advice is to clear it, which a reader
+     * can only follow if the controls are still there. Dropping them left the
+     * whole page holding one interactive element, a breadcrumb, under a sentence
+     * about a filter that was nowhere on screen; recovery meant editing the URL
+     * by hand. The row is given no locations, because the payload that lists
+     * them is the payload that did not arrive, and it is given the parsed query,
+     * so it shows what was asked for - naming an unlisted location as unlisted -
+     * rather than a filter nobody chose.
+     *
+     * It is passed no children either: there are no figures behind this notice
+     * to mark as updating, and the notice already announces itself.
+     *
+     * The copy says that asking again is what fetches the figures, so the
+     * control that asks is in the notice with it rather than left to the reader
+     * to find: `ui/Retry` requests this route again from the browser, which is
+     * the same recovery a reload performs without discarding the cart, the
+     * filter in the address bar or the reader's place on the page. It is the one
+     * control every in-notice action in this store uses, so nothing about its
+     * size or colour is decided here.
      */
-    return (
-      <div className="ls-notice">
-        <Alert tone="warning" title={NOTICE_TITLE}>
-          {outcome.failure}
-        </Alert>
+    const action = (
+      <div className="ls-actions">
+        <Retry />
+        {filtered(query) ? <Link href={PATH}>{RECOVERY_LABEL}</Link> : null}
       </div>
+    );
+
+    return (
+      <>
+        <WarehouseFilter
+          warehouses={[]}
+          selectedWarehouseId={query.warehouseId}
+          threshold={query.threshold}
+          stockState={query.state}
+          movementType={query.movement}
+        />
+
+        <div className="ls-notice">
+          {/*
+            Asking again is always offered. The way out of the filter is offered
+            only when there is something to leave: on an unfiltered visit this
+            branch means the read itself failed, and a link to the address
+            already being shown would be a control that changes nothing - the
+            same dead affordance this notice was missing, in the opposite
+            direction.
+          */}
+          <Alert tone="warning" title={NOTICE_TITLE} actions={action}>
+            {outcome.failure}
+          </Alert>
+        </div>
+      </>
     );
   }
 
@@ -342,6 +463,18 @@ async function DashboardData({
         rather than from a second request, and the applied values are the ones
         parsed above, so the controls open showing the filter the figures beside
         them were produced under.
+
+        The three regions the filter governs are its children, and that is an
+        accessibility decision rather than a layout one. A filter change is a
+        navigation the row performs inside a transition, so React keeps this
+        already-mounted subtree on screen while the server answers and the
+        boundary below never falls back to its placeholder: the figures a reader
+        is looking at mid-change are the previous filter's figures. The row is
+        the only component that knows a change is in flight, so it is the
+        component that marks them - see its `children` prop - and `bodyClassName`
+        hands it the rhythm these regions had as members of this page's own
+        stack, so the wrapper it renders takes that level's place rather than
+        adding one.
       */}
       <WarehouseFilter
         warehouses={summary.warehouses}
@@ -349,41 +482,42 @@ async function DashboardData({
         threshold={query.threshold}
         stockState={query.state}
         movementType={query.movement}
-      />
+        bodyClassName="ls-stack ls-stack-loose"
+      >
+        {/*
+          Every component below measures the payload's age against the instant it
+          was computed, which is the payload's own `generatedAt`: a reference read
+          from the clock would differ between the server's markup and the browser's
+          first render.
+        */}
+        <InventoryKpiCards summary={summary} referenceIso={summary.generatedAt} />
 
-      {/*
-        Every component below measures the payload's age against the instant it
-        was computed, which is the payload's own `generatedAt`: a reference read
-        from the clock would differ between the server's markup and the browser's
-        first render.
-      */}
-      <InventoryKpiCards summary={summary} referenceIso={summary.generatedAt} />
+        <div className="ls-split">
+          <div className="ls-split-main">
+            {/*
+              The page of stock lines exactly as the feed answered it - the rows,
+              the page they are on and the number of lines the filters matched -
+              together with the products naming them. The pager's links are this
+              route's own address carrying the filter now in force, so a page
+              change keeps the filter and changes only the page.
+            */}
+            <InventoryLevelsTable
+              levels={summary.levels}
+              products={summary.levelProducts}
+              threshold={query.threshold}
+              generatedAt={summary.generatedAt}
+              referenceIso={summary.generatedAt}
+              heading={<h2>{TABLE_TITLE}</h2>}
+              basePath={PATH}
+              query={carried(query)}
+            />
+          </div>
 
-      <div className="ls-split">
-        <div className="ls-split-main">
-          {/*
-            The page of stock lines exactly as the feed answered it - the rows,
-            the page they are on and the number of lines the filters matched -
-            together with the products naming them. The pager's links are this
-            route's own address carrying the filter now in force, so a page
-            change keeps the filter and changes only the page.
-          */}
-          <InventoryLevelsTable
-            levels={summary.levels}
-            products={summary.levelProducts}
-            threshold={query.threshold}
-            generatedAt={summary.generatedAt}
-            referenceIso={summary.generatedAt}
-            heading={<h2>{TABLE_TITLE}</h2>}
-            basePath={PATH}
-            query={carried(query)}
-          />
+          <div className="ls-split-side">
+            <LowStockList rows={summary.lowStock} threshold={query.threshold} />
+          </div>
         </div>
-
-        <div className="ls-split-side">
-          <LowStockList rows={summary.lowStock} threshold={query.threshold} />
-        </div>
-      </div>
+      </WarehouseFilter>
     </>
   );
 }
@@ -458,13 +592,13 @@ export default async function InventoryDashboardPage({
 
   /*
    * A rejected query is answered with the dashboard's own defaults rather than
-   * with an error: `safeParse` never throws, and re-parsing an empty object is
-   * exact because every value-bearing parameter of this schema is defaulted.
+   * with an error: `safeParse` never throws, and {@link DEFAULT_QUERY} is what
+   * an empty query parses to, which is exact because every value-bearing
+   * parameter of this schema is defaulted. Nothing below mutates the query, so
+   * the one parsed at module scope can be handed over as it is.
    */
   const parsed = inventorySummaryQuerySchema.safeParse(supplied);
-  const query: InventorySummaryQueryInput = parsed.success
-    ? parsed.data
-    : inventorySummaryQuerySchema.parse({});
+  const query: InventorySummaryQueryInput = parsed.success ? parsed.data : DEFAULT_QUERY;
 
   return (
     <div className="ls-stack ls-stack-loose">

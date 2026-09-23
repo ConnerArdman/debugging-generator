@@ -43,6 +43,17 @@
  * separately scrolling list beside a long checkout form would hide the very lines the column
  * exists to show.
  *
+ * AND ONLY UNTIL IT HAS BEEN PLACED
+ * Placing the order ends the review, and `./CheckoutCharges` is how this column learns it has been:
+ * `./CheckoutForm` beside it swaps its fields for the receipt and publishes the fact, and this
+ * column then shows that the order was placed instead of continuing to review it. Continuing would
+ * be worse than showing nothing, on two counts. The figures would be wrong - the order was priced
+ * when it was written, against the data of that moment, and the closing estimate assembled here
+ * from a cart, a quoted rate and two charges nobody had computed is not what the buyer was charged -
+ * and the lines carry quantity and remove controls, which would be offering changes to a cart that
+ * has become an order. The receipt beside this column is where the figures that apply are printed,
+ * so this column points at it rather than repeating them.
+ *
  * AN ORDER IS ONLY REVIEWED WHERE THERE IS A CART TO REVIEW
  * `@/hooks/useCartSummary` publishes either the cart's totals or the reason there are none, and
  * this column asks that question first. A cart whose contents were never established - the first
@@ -71,6 +82,25 @@
  * charge row. No rate is looked up here, no service is chosen here, and the cents are added up by
  * the component that prints the closing row.
  *
+ * THE DELIVERY ESTIMATE IS THE CHOSEN SERVICE'S, NOT THE STORE'S
+ * A cart's own reading carries the storefront's standing dispatch promise, which is one transit
+ * time for every shopper because a cart has no destination and no service. A review column does
+ * have both - they are in the form beside it - and the services quoted for one destination differ
+ * by days as much as by price, so printing the standing promise here states a delivery date for a
+ * service the buyer did not choose, directly beneath the charge for the one they did. So the
+ * estimate printed with these figures is always the one quoted for the chosen service: the column
+ * hands the totals block the cart's reading with that one member replaced. The wording is
+ * `@/lib/format`'s, the same function every other transit estimate in the storefront goes through,
+ * and the dispatch cut-off beside it is untouched - that is a statement about when the warehouse
+ * ships, which no choice of carrier service changes.
+ *
+ * The member is replaced even when no charge is published, and that case is the reason this is an
+ * override rather than a fallback. With no service chosen - or none quotable for the address in
+ * the fields - the cart's own reading still carries the standing promise, and printing it here
+ * would put "Arrives in 2 days" under a Freight row that says the charge is still to be
+ * established: a delivery date for an order with no carrier, in the one state where the page has
+ * least business promising one. So it says the same thing the charge rows say, in their words.
+ *
  * HEADINGS AND THE READING ORDER
  * The column is a `<section>` named by its own heading, so it is reachable as a landmark, and that
  * heading is an `<h2>` - the level `./CheckoutForm` uses for each of its own sections under the
@@ -90,10 +120,10 @@ import { CartLineList } from '@/components/cart/CartLineList';
 import { CartTotalsPanel, type CartCharge } from '@/components/cart/CartTotalsPanel';
 import { BlankSlate } from '@/components/ui/BlankSlate';
 import { VisuallyHidden } from '@/components/ui/VisuallyHidden';
-import { useCartSummary } from '@/hooks/useCartSummary';
-import { formatQuantityLabel } from '@/lib/format';
+import { useCartSummary, type CartSummary } from '@/hooks/useCartSummary';
+import { formatQuantityLabel, formatShippingEtaLabel } from '@/lib/format';
 
-import { useSelectedFreight } from './CheckoutCharges';
+import { useOrderPlaced, useSelectedFreight } from './CheckoutCharges';
 
 import styles from './CheckoutSummaryPanel.module.css';
 
@@ -149,9 +179,28 @@ const EMPTY_BODY =
   'Add items to your cart and they will be listed here before you place the order.';
 
 /**
+ * The opening reading once the order has been placed, where there is no longer an order to review.
+ *
+ * Distinct from every other reading in this file because it is the only one that is not about the
+ * cart: the lines have become an order, and what that order came to is on the receipt beside this
+ * column rather than estimated here.
+ */
+const PLACED_READING = 'This order has been placed, so there is nothing left to review.';
+
+/** The heading and sentence of the block this column shows in place of the review, for the same. */
+const PLACED_HEADING = 'Order placed';
+const PLACED_BODY =
+  'The items you ordered, what they came to and where they are going are on the confirmation ' +
+  'beside this column.';
+
+/**
  * Alternative text for that block's illustration, which `@/components/ui/BlankSlate` draws from
  * `public/illustrations/empty-cart.svg`. The caller chooses it because only the caller knows what
  * its own heading says.
+ *
+ * It serves the placed-order block below as well, because alternative text describes the drawing
+ * rather than the heading beside it, and both blocks draw the same one - a cart with nothing in it,
+ * which is what a cart that has become an order leaves behind.
  */
 const EMPTY_ART_ALT = 'An empty shopping cart';
 
@@ -166,6 +215,17 @@ const EMPTY_ART_ALT = 'An empty shopping cart';
 /** The freight row: the rate quoted for the service chosen in the form beside this column. */
 const FREIGHT_CHARGE_ID = 'freight';
 const FREIGHT_CHARGE_LABEL = 'Freight';
+
+/**
+ * The delivery estimate before a freight service has been quoted and chosen.
+ *
+ * Worded as the charge rows beside it are worded, and for the same reason: transit time is a
+ * property of the service the order ships by, so with no service there is no estimate to state -
+ * only the fact that there is not one yet. It reads after the row's visually-hidden "Delivery
+ * estimate:" prefix, so the sentence is a completion of that phrase rather than a sentence of its
+ * own.
+ */
+const UNQUOTED_DELIVERY_LABEL = 'Confirmed once a shipping service is quoted';
 
 /**
  * The discount row. Listed with no amount on purpose: contract prices and promotions are applied
@@ -254,9 +314,36 @@ export function CheckoutSummaryPanel({
 }: Props): ReactElement {
   const summary = useCartSummary();
   const freight = useSelectedFreight();
+  const placed = useOrderPlaced();
 
   const trimmed = heading.trim();
   const title = trimmed.length > 0 ? trimmed : DEFAULT_HEADING;
+
+  /*
+   * Once the order has been placed there is nothing here to review, and going on reviewing would
+   * be worse than showing nothing. The cart those lines came from is an order now: it was priced
+   * when the order was written, against the data of that moment, so the closing figure this column
+   * assembles is no longer the figure the buyer was charged - and the lines carry quantity controls,
+   * which would be offering changes to a cart that no longer exists. So the column says the order
+   * was placed and points at the receipt, which is where the figures that do apply are printed.
+   *
+   * It is returned before anything else is worked out, because none of it is about this state: the
+   * counts, the charge rows and the note all describe an order under review.
+   */
+  if (placed) {
+    return (
+      <section className={clsx(styles.root, className)} aria-label={title}>
+        <h2 className={styles.heading}>{title}</h2>
+        <VisuallyHidden>{PLACED_READING}</VisuallyHidden>
+
+        <div className={styles.empty}>
+          <BlankSlate art="empty-cart" alt={EMPTY_ART_ALT} heading={PLACED_HEADING}>
+            {PLACED_BODY}
+          </BlankSlate>
+        </div>
+      </section>
+    );
+  }
 
   /*
    * One sentence, read only to assistive technology, that says what the column covers before
@@ -330,6 +417,27 @@ export function CheckoutSummaryPanel({
     { id: TAX_CHARGE_ID, label: TAX_CHARGE_LABEL, amountCents: null },
   ];
 
+  /*
+   * The cart's reading as the figures are printed from, with the delivery estimate re-stated for
+   * the service the buyer chose; see the header.
+   *
+   * One member is replaced and every other is passed through untouched, including the dispatch
+   * countdown - so the line beneath the figures reads "Arrives in 5 days" for the five-day service
+   * chosen beside it while still carrying the store's own cut-off, and reads
+   * {@link UNQUOTED_DELIVERY_LABEL} beside that same cut-off when no service has been quoted.
+   *
+   * `CartSummary` is two different statements about a cart - its totals, or the reason there are
+   * none - and the annotation is what keeps them apart: the spread carries `contentsKnown` and
+   * every member of whichever reading this is straight through, so replacing the estimate cannot
+   * turn a cart nobody read into one that appears to have figures, and the compiler would refuse
+   * the assignment if it did.
+   */
+  const reviewedTotals: CartSummary = {
+    ...summary,
+    estimatedDeliveryLabel:
+      freight === null ? UNQUOTED_DELIVERY_LABEL : formatShippingEtaLabel(freight.estimatedDays),
+  };
+
   return (
     <section className={clsx(styles.root, className)} aria-label={title}>
       <h2 className={styles.heading}>{title}</h2>
@@ -347,7 +455,12 @@ export function CheckoutSummaryPanel({
 
       {totalsShown ? (
         <div className={styles.totals}>
-          <CartTotalsPanel variant="page" heading={SUPPRESSED_TOTALS_HEADING} charges={charges} />
+          <CartTotalsPanel
+            variant="page"
+            heading={SUPPRESSED_TOTALS_HEADING}
+            summary={reviewedTotals}
+            charges={charges}
+          />
         </div>
       ) : null}
 

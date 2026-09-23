@@ -23,12 +23,14 @@
  * and a collapsed dropdown hides three of the four while the buyer is making it. `Select` stays the
  * right primitive for the form's genuine dropdowns - country, region.
  *
- * TWO QUESTIONS, TWO HOOKS, AND WHY THE ARGUMENT IS A BARE STRING
+ * TWO QUESTIONS, TWO HOOKS, AND WHY THE ARGUMENTS ARE BARE STRINGS
  * `useShippingEta()` reads the dispatch promise the application's single clock publishes, which is
  * where the "ships today" half of each row's delivery line comes from. `useFreightQuote()` asks
- * what freight to the buyer's destination actually costs, and it keys that lookup on the postal
- * code itself: the code arrives here as a `string | null` and is handed on exactly as received, so
- * a re-render while the address field stands still asks nothing further. Both hooks are called
+ * what freight to the buyer's destination actually costs, and it keys that lookup on the
+ * destination itself - the postal code and the country it is in, because the same code names a
+ * different place in each country that writes codes that way, and the store quotes them
+ * differently. Both arrive here as `string | null` and are handed on exactly as received, so a
+ * re-render while the address fields stand still asks nothing further. Both hooks are called
  * unconditionally at the top of the component, and this module adds no effect, no state and no
  * request of its own - `GET /api/shipping/quote` is reached through that hook and nowhere else.
  *
@@ -40,22 +42,28 @@
  * nothing, and the caller's `useFreightQuote()` is the only lookup on the page. It is not a
  * conditional hook, which `react-hooks/rules-of-hooks` forbids and which would break the moment a
  * caller passed the prop on one render and omitted it on the next: the hook is still called on
- * every render, and what changes is its argument - `null`, which is that hook's documented
+ * every render, and what changes is its arguments - `null`, which is that hook's documented
  * "ask nothing" state. So exactly one `GET /api/shipping/quote` is in flight per destination
  * however this component is placed, and a panel placed with no `quote` behaves exactly as before.
+ * The destination props are passed either way: a hoisted lookup takes the address from its holder,
+ * and this panel still needs to know what the address is to caption an empty group.
  *
- * WHAT A QUOTE CHANGES: IT BECOMES THE LIST
- * Until a quote arrives the rows are the `options` prop - the store's services at their list rates,
- * which is the most that can honestly be shown for a destination nobody has named yet. Once a quote
- * settles it *replaces* that list: the services it names, at its prices and transit times, in the
- * order it named them. That is not a refinement of the prop, it is the answer to the question the
- * prop was standing in for, and treating it as anything less is how a service the store cannot sell
- * to this destination stays on screen as though it could. Three consequences follow, and all three
- * are deliberate: a quote that names no service renders no rows and says so; a service the quote
- * omits disappears rather than reverting to its list rate; and a selection the caller is holding for
- * an omitted service shows as nothing checked, which is the caller's cue that a choice has to be
- * made again. A shipment the lookup refused as larger than one consignment has no list at all, and
- * the caption says which figure has to change.
+ * THE QUOTE IS THE LIST, AND THERE IS NO LIST WITHOUT ONE
+ * The rows are the quote's services, at its prices and transit times, in the order it named them -
+ * and there are no rows at all until a quote has settled. This component takes no list of services
+ * to show in the meantime, and that is the point rather than an omission: freight is a property of
+ * a destination, so a price beside a service name before the store has quoted a destination is a
+ * figure nobody was quoted, and a *selectable, selected* one is an offer the order would never be
+ * charged at. An empty group with a caption saying why is the honest rendering of "we have not
+ * priced this yet"; three rows at list rates with the cheapest checked is not.
+ *
+ * Four consequences follow, and all four are deliberate: no destination, a lookup in flight, and a
+ * lookup that failed all render no rows and a caption; a quote that names no service renders no
+ * rows and says the store reaches that destination with nothing; a service the quote omits is not
+ * on offer, however plainly the store sells it elsewhere; and a selection the caller is holding for
+ * a service no current quote names shows as nothing checked, which is the caller's cue that a
+ * choice has to be made again. A shipment the lookup refused as larger than one consignment has no
+ * list either, and the caption says which figure has to change.
  *
  * RENDER BEHAVIOUR
  * A plain function component: no `memo`, no ref, no timer, nothing read from `window`, `Date.now()`
@@ -78,6 +86,7 @@ import {
   type FreightQuoteState,
   type FreightShipmentLimit,
 } from '@/hooks/useShippingEta';
+import { freightDestinationProblem, type FreightDestinationFault } from '@/lib/destination';
 import { formatQuantityLabel, formatShippingEtaLabel } from '@/lib/format';
 import type { ShippingOption } from '@/lib/types';
 
@@ -121,40 +130,74 @@ const QUOTING_CAPTION = 'Shipping services are being quoted for this destination
 const AWAITING_DESTINATION_CAPTION =
   'Shipping services appear once a destination postal code is entered.';
 
+/**
+ * Caption for a destination that could be quoted and has not been yet - the moment before the
+ * lookup starts, and a caller that is holding the lookup back for a reason of its own.
+ */
+const AWAITING_QUOTE_CAPTION = 'Shipping services appear once this destination has been quoted.';
+
+/**
+ * What this group says about each way a destination can fail to be quotable.
+ *
+ * One line per fault, and every line is about *this group* - why there is nothing here to choose
+ * from, and what will make services appear. That is deliberately not the sentence the destination
+ * field shows. `@/lib/destination` words each fault for the control at fault, in full and with the
+ * country's postal-code format; a group that printed that same sentence a hundred pixels below the
+ * field would put one 137-character diagnosis on screen twice, and a buyer would read two problems
+ * where there is one. So the field diagnoses the address and this group explains its own emptiness.
+ *
+ * The fault still decides which line it is, because the four are not interchangeable: an
+ * unfinished code becomes quotable by carrying on typing, a code that country does not use never
+ * will, and those are different things to tell somebody.
+ */
+const CAPTION_BY_DESTINATION_FAULT: Readonly<Record<FreightDestinationFault, string>> = {
+  country: 'Shipping services appear once a country the warehouses ship to is chosen.',
+  'postal-missing': AWAITING_DESTINATION_CAPTION,
+  'postal-incomplete': 'Shipping services appear once the destination postal code is complete.',
+  'postal-invalid': 'No shipping service can be quoted for this postal code.',
+};
+
 /** Caption when a destination was quoted and carried nothing the store can sell. */
 const NO_SERVICE_CAPTION = 'No shipping service is available for this destination.';
+
+/**
+ * The empty offer, as one frozen array rather than a fresh `[]` per render - so a render that has
+ * nothing to show gives a memoised child the same identity it had last time.
+ */
+const NO_SHIPPING_OPTIONS: readonly ShippingOption[] = [];
 
 /**
  * The services this group may offer, which is a question about what the store has said rather than
  * about what the caller passed.
  *
- * Three states, in the order they settle. A shipment larger than one consignment was never quoted
- * and cannot be: nothing is on offer for it, so the list is empty and the caption explains the
- * size. A settled quote is the store's answer for the destination and shipment asked about, so its
- * services *are* the services - including when it names none, which is a destination with nothing
- * on offer rather than a reason to show rates the store has not agreed to. Only before a quote has
- * settled - no destination yet, a lookup in flight, a lookup that failed - is the caller's list what
- * there is to show, and it is shown at its list rates because nothing better is known.
+ * There is one answer and it is short: the quote's services, and nothing when there is no quote. A
+ * rate is a property of a destination rather than of a service, so until the store has quoted the
+ * destination in the fields there is no honest price to put beside a service name - and a priced,
+ * selectable row the store has not agreed to is worse than an empty group, because it is an offer
+ * the order would never be charged at. That is also why a settled quote naming no service renders
+ * no rows: it is the store saying it reaches that destination with nothing, which the caption
+ * states in words.
  *
- * The returned array is one of the inputs rather than a copy of it: the rows are keyed and priced
+ * A shipment larger than one consignment was never quoted and cannot be, and is the same empty
+ * list for a different reason the caption gives.
+ *
+ * The returned array is the quote's own rather than a copy of it: the rows are keyed and priced
  * from whichever list this returns, and rebuilding it per render would give a memoised parent
  * nothing to hold on to for no gain.
  *
- * @param options The caller's list, offered until a quote settles.
- * @param quote The settled quote, or `null` when none has.
+ * @param quote The settled quote, or `null` when none has settled.
  * @param limit The shipment-size obstacle, or `null` when the shipment has none.
  * @returns The services to render, which may be empty.
  */
 function offeredShippingOptions(
-  options: readonly ShippingOption[],
   quote: FreightQuoteState['quote'],
   limit: FreightShipmentLimit | null,
 ): readonly ShippingOption[] {
-  if (limit !== null) {
-    return [];
+  if (limit !== null || quote === null) {
+    return NO_SHIPPING_OPTIONS;
   }
 
-  return quote === null ? options : quote.options;
+  return quote.options;
 }
 
 /**
@@ -180,25 +223,36 @@ function dispatchClause(eta: DispatchEta): string | null {
 /**
  * The group's single caption, or `null` when the rows speak for themselves.
  *
+ * The cases are ordered by what a reader has to do about them, and each one says what is actually
+ * the matter rather than a guess dressed as advice - a group that tells a buyer to finish a postal
+ * code they have already finished sends them to correct the one thing that was right.
+ *
  * The shipment's size is said first and without qualification: no lookup was made for a shipment
  * larger than one consignment, so neither a waiting state nor a silent list is what a reader needs
  * to hear about - the count is, beside the count that would fit. A lookup in flight comes next,
  * because it explains both a list that is about to change and a list that is empty for the moment.
- * With services on screen and nothing in flight there is nothing to caption. Without services the
- * caption says which of the two silences this is: no destination has been given, or one was and
- * nothing came back for it - which, after a settled quote, is the store saying it reaches that
- * destination with nothing.
+ * With services on screen and nothing in flight there is nothing to caption.
  *
+ * Without services, the caption says which silence this is. A destination that cannot be quoted at
+ * all reads from {@link CAPTION_BY_DESTINATION_FAULT}, keyed on the fault `@/lib/destination`
+ * found, so the four ways an address can fail to be quotable read as the four different things
+ * they are - while the address itself is diagnosed in full against the control at fault, by the
+ * surface that owns that control. A quotable destination with no quote is a lookup that has not
+ * run, which is a moment rather than a fault. And a settled quote with nothing in it is the store
+ * saying it reaches that destination with nothing.
+ *
+ * @param quote The settled quote, or `null` when none has settled.
  * @param isQuoting Whether a freight lookup is in flight.
  * @param hasServices Whether there is at least one row to choose from.
- * @param hasDestination Whether the caller has passed a destination at all.
+ * @param destinationFault Which way the destination cannot be quoted, or `null` when it can.
  * @param limit The shipment-size obstacle, or `null` when the shipment has none.
  * @returns The caption wording, or `null`.
  */
 function shippingCaption(
+  quote: FreightQuoteState['quote'],
   isQuoting: boolean,
   hasServices: boolean,
-  hasDestination: boolean,
+  destinationFault: FreightDestinationFault | null,
   limit: FreightShipmentLimit | null,
 ): string | null {
   if (limit !== null) {
@@ -216,7 +270,11 @@ function shippingCaption(
     return null;
   }
 
-  return hasDestination ? NO_SERVICE_CAPTION : AWAITING_DESTINATION_CAPTION;
+  if (destinationFault !== null) {
+    return CAPTION_BY_DESTINATION_FAULT[destinationFault];
+  }
+
+  return quote === null ? AWAITING_QUOTE_CAPTION : NO_SERVICE_CAPTION;
 }
 
 /**
@@ -227,18 +285,6 @@ function shippingCaption(
  * ShippingOptionPicker>` and stays correct whatever is added here.
  */
 interface Props {
-  /**
-   * The services to show until the store has quoted the destination, in the order they should be
-   * read. Supplied by the form or the page, never fetched here, and `readonly` because this
-   * component only reads them.
-   *
-   * They are a starting point rather than the offer: a settled quote replaces them entirely, since
-   * the store's answer for a destination is what can be sold to it (see the header). An empty list
-   * is a legitimate state - no destination yet, or none that can be served - and is captioned
-   * rather than rendered as an empty box.
-   */
-  options: readonly ShippingOption[];
-
   /**
    * The chosen service's id, or `null` while nothing is chosen.
    *
@@ -256,11 +302,27 @@ interface Props {
 
   /**
    * Where the order is going, passed straight to the freight lookup, or `null` when the address is
-   * still to be filled in. Nothing is asked for a `null` or half-typed code.
+   * still to be filled in. Nothing is asked for a `null`, unfinished or malformed code.
+   *
+   * It is also what this group says about itself when there is nothing to choose from: paired with
+   * `country` it is read through `@/lib/destination` for the caption, so the sentence under an
+   * empty group names what is actually the matter with the address rather than asserting that it
+   * is incomplete. A caller that hoists the lookup still passes it for that reason.
    *
    * @default null
    */
   postalCode?: string | null;
+
+  /**
+   * Which country that postal code is in, as its two-letter code, or `null` when nobody has said.
+   *
+   * The other half of the destination: it decides what a complete postal code looks like and it
+   * changes the rate, so a group handed a code without a country can neither judge the address nor
+   * be sure the rates beside it are the ones for it.
+   *
+   * @default null
+   */
+  country?: string | null;
 
   /**
    * How many units the shipment carries, passed straight to the freight lookup, or `null` when
@@ -301,8 +363,14 @@ interface Props {
   legend?: string;
 
   /**
-   * Locks every row - an order being placed, a cart with nothing in it. The native attribute, so
-   * the keyboard cannot reach a locked row and the stylesheet can paint it from `:has(:disabled)`.
+   * Locks every row - an order being placed, a cart with nothing in it.
+   *
+   * The native attribute, on the `<fieldset>` and on every control inside it, so the keyboard
+   * cannot reach a locked row, the stylesheet paints it from `:has(:disabled)`, and the group
+   * announces the state: `aria-disabled` rides along on the group for a reader that queries the
+   * container rather than the control it landed on. A locked group looks locked as well as being
+   * locked - the rows dim - because a control that is inert and indistinguishable from an
+   * interactive one is a control a buyer keeps clicking.
    *
    * @default false
    */
@@ -346,16 +414,16 @@ interface Props {
  * placement the alert cannot know about; the two agree on type size, and the alert paints its own
  * text colour.
  *
- * @example The ordinary case, where this panel performs the freight lookup itself. `services` is
- * what the rows show until that lookup settles; after it, the quote's own services are the rows,
- * and a selection this panel's caller is holding for a service the quote omits shows as nothing
- * checked - so a caller reads the chosen service back from the quote before it acts on it.
+ * @example The ordinary case, where this panel performs the freight lookup itself. The rows are the
+ * quote's services and there are none until it settles; a selection this panel's caller is holding
+ * for a service the quote omits shows as nothing checked - so a caller reads the chosen service
+ * back from the quote before it acts on it.
  * ```tsx
  * <ShippingOptionPicker
- *   options={services}
  *   selectedId={draft.shippingOptionId}
  *   onSelect={(optionId) => setDraft({ ...draft, shippingOptionId: optionId })}
  *   postalCode={draft.shippingAddress.postalCode}
+ *   country={draft.shippingAddress.country}
  *   itemCount={cart.itemCount}
  *   disabled={submitting}
  * />
@@ -365,22 +433,22 @@ interface Props {
  * the review column beside it. The shipment is described where the lookup is held, so this
  * placing passes no `itemCount`; the destination and the hoisted state describe one shipment.
  * ```tsx
- * const quote = useFreightQuote(destination, cart.itemCount);
+ * const quote = useFreightQuote(destination, address.country, cart.itemCount);
  *
  * <ShippingOptionPicker
- *   options={services}
  *   selectedId={shippingOptionId}
  *   onSelect={setShippingOptionId}
  *   postalCode={destination}
+ *   country={address.country}
  *   quote={quote}
  * />
  * ```
  */
 export function ShippingOptionPicker({
-  options,
   selectedId,
   onSelect,
   postalCode = null,
+  country = null,
   itemCount = null,
   quote: hoistedQuote,
   legend = DEFAULT_LEGEND,
@@ -393,25 +461,47 @@ export function ShippingOptionPicker({
   // lookups for one shipment. The unit count travels with the destination, because freight is
   // charged per piece and a lookup named for an address alone is answered for one unit. See the
   // header.
-  const ownLookup = useFreightQuote(hoistedQuote === undefined ? postalCode : null, itemCount);
+  const ownLookup = useFreightQuote(
+    hoistedQuote === undefined ? postalCode : null,
+    hoistedQuote === undefined ? country : null,
+    itemCount,
+  );
   const { quote, isQuoting, quoteError, shipmentLimit } = hoistedQuote ?? ownLookup;
 
   const dispatchNote = dispatchClause(eta);
-  // Whether the buyer has written a destination at all, which is a question about the field rather
-  // than about the address: what makes a postal code servable is the quote endpoint's to judge, and
-  // a second opinion here would go stale the first time the store shipped somewhere new.
-  const hasDestination = postalCode !== null && postalCode.trim().length > 0;
-  // What is on offer, and therefore what may be chosen - the store's answer once it has given one,
-  // and the caller's list only until then. See `offeredShippingOptions` and the header. A caller
-  // that resolved the same question for itself passes the list this returns, so the derivation is
-  // idempotent and the two surfaces cannot disagree about which services exist.
-  const services = offeredShippingOptions(options, quote, shipmentLimit);
-  const caption = shippingCaption(isQuoting, services.length > 0, hasDestination, shipmentLimit);
+  // Which way the address in the fields cannot be quoted, or `null` when it can - read from the
+  // two destination props rather than from the lookup, so a group whose caller is holding the
+  // lookup back still says the right thing about the address it was given. The judgement is
+  // `@/lib/destination`'s, which is the module the lookup gates on and the one the checkout form
+  // diagnoses the field with, so this group and that field cannot disagree about what is wrong;
+  // only the fault is taken, because the wording here is about the group rather than the address.
+  //
+  // An empty field is read as `postal-missing` ahead of everything else. The module reports the
+  // country first, which is right for a form - the country decides what a complete code is - but a
+  // group with nothing written in the field at all has to say that no destination has been given,
+  // not that no country has been chosen.
+  const writtenDestination = postalCode === null ? '' : postalCode.trim();
+  const destinationFault: FreightDestinationFault | null =
+    writtenDestination.length === 0
+      ? 'postal-missing'
+      : (freightDestinationProblem(country ?? '', writtenDestination)?.fault ?? null);
+  // What is on offer, and therefore what may be chosen: the store's answer, and nothing until it
+  // has given one. See `offeredShippingOptions` and the header.
+  const services = offeredShippingOptions(quote, shipmentLimit);
+  const caption = shippingCaption(
+    quote,
+    isQuoting,
+    services.length > 0,
+    destinationFault,
+    shipmentLimit,
+  );
 
   return (
     <fieldset
       className={clsx(styles.root, className)}
       role="radiogroup"
+      disabled={disabled}
+      aria-disabled={disabled || undefined}
       aria-describedby={caption === null ? undefined : CAPTION_ID}
     >
       <legend className={styles.legend}>{legend}</legend>
@@ -435,6 +525,16 @@ export function ShippingOptionPicker({
                     value={option.id}
                     checked={selectedId === option.id}
                     disabled={disabled}
+                    /*
+                      Redundant beside the native attribute above and stated anyway. `disabled`
+                      is what makes the control inert and is what a reader announces when it
+                      lands on this radio; `aria-disabled` is what answers the same question of
+                      the radio itself for anything inspecting the control rather than
+                      traversing to it - the group carries it too, and neither is a substitute
+                      for the other. `undefined` rather than `"false"` while interactive, so an
+                      enabled control says nothing about a state it is not in.
+                    */
+                    aria-disabled={disabled || undefined}
                     onChange={() => {
                       onSelect(option.id);
                     }}

@@ -148,18 +148,31 @@ model Customer {
 }
 
 model Cart {
-  id           String     @id @default(cuid())
-  customerId   String?    @map("customer_id")
-  sessionToken String     @unique @map("session_token")
-  status       CartStatus @default(ACTIVE)
-  createdAt    DateTime   @default(now()) @map("created_at")
-  updatedAt    DateTime   @updatedAt @map("updated_at")
+  id String @id @default(cuid())
+
+  customerId String? @map("customer_id")
+
+  /// The session this cart belongs to. Not unique: a session that checks a cart
+  /// out shops on with the next one, and every cart it ever held stays readable
+  /// under the same token as that session's history.
+  sessionToken String @map("session_token")
+
+  /// The session's open-cart pointer: this cart holds it for as long as it is
+  /// the cart the session shops with, and `NULL` once the cart has become an
+  /// order. Unique, so "at most one open cart per session" is a fact the
+  /// database keeps rather than a race two requests can both win.
+  openToken String? @unique @map("open_token")
+
+  status    CartStatus @default(ACTIVE)
+  createdAt DateTime   @default(now()) @map("created_at")
+  updatedAt DateTime   @updatedAt @map("updated_at")
 
   customer       Customer?       @relation(fields: [customerId], references: [id], onDelete: SetNull, onUpdate: Cascade)
   items          CartItem[]
   shippingQuotes ShippingQuote[]
 
   @@index([customerId])
+  @@index([sessionToken, updatedAt])
   @@map("carts")
 }
 
@@ -188,6 +201,27 @@ model Order {
   shippingCents Int         @map("shipping_cents")
   totalCents    Int         @map("total_cents")
   placedAt      DateTime    @default(now()) @map("placed_at")
+
+  /// Who placed this order, as the checkout collected it. The account the order
+  /// is written against is the session's, and may have been opened for an
+  /// earlier order by somebody else at the same company, so the contact on the
+  /// order is kept with the order. Written as a set or not at all; `NULL`
+  /// throughout on an order placed before the store recorded them.
+  contactName    String? @map("contact_name")
+  contactEmail   String? @map("contact_email")
+  contactCompany String? @map("contact_company")
+
+  /// Where the goods are going, as the checkout collected it. Written as a set
+  /// or not at all, so an order either carries a destination or carries none.
+  shipLine1      String? @map("ship_line1")
+  shipLine2      String? @map("ship_line2")
+  shipCity       String? @map("ship_city")
+  shipRegion     String? @map("ship_region")
+  shipPostalCode String? @map("ship_postal_code")
+  shipCountry    String? @map("ship_country")
+
+  /// What the buyer asked the packers to know, or `NULL` when they said nothing.
+  deliveryNotes String? @map("delivery_notes")
 
   customer       Customer        @relation(fields: [customerId], references: [id], onDelete: Restrict, onUpdate: Cascade)
   items          OrderItem[]

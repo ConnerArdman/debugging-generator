@@ -2,14 +2,17 @@
  * Lumen Supply - order confirmation.
  *
  * The stylesheet for `OrderConfirmation.tsx`: the receipt the storefront shows once an order has
- * been placed - a headline, the order reference, the order status, the ordered lines, the totals,
- * the shipping destination with its estimated arrival, and a link to the order history. The same
- * block is rendered by a server page and, after a successful submit, by `CheckoutForm`, so it has
- * to look identical in both places from a single stylesheet with no variant switch.
+ * been placed - a headline, the captioned order reference, the order status, the ordered lines
+ * with the arithmetic each one reconciles by, the totals, the order and payment identifiers, the
+ * shipping destination with its estimated arrival and the address the confirmation went to, and a
+ * link to the order history. The same block is rendered by a server page and, after a successful
+ * submit, by `CheckoutForm`, so it has to look identical in both places from a single stylesheet
+ * with no variant switch.
  *
  * WHAT THIS FILE OWNS
- *   The block's internal rhythm and alignment: the line grid, the totals grid, the monospace
- *   order-reference chip, the destination block and the trailing action row.
+ *   The block's internal rhythm and alignment: the line grid with its money column, the totals
+ *   grid, the identifiers grid, the order-reference chip, the destination block and the trailing
+ *   action row.
  *
  * WHAT IT DELIBERATELY DOES NOT OWN - none of it is restated here
  *   - The surface. The component renders inside `../ui/Card`, so `Card.module.css` owns the
@@ -20,8 +23,9 @@
  *     places it beside the order date, and the badge's own label always states the status in
  *     words, so colour is never the sole carrier of that meaning.
  *   - Money typography. `../ui/Price` owns the figure itself - the mono family, tabular
- *     numerals, weight and the size variants - so `.lineTotal` and `.totalsValue` position and
- *     align it and nothing more.
+ *     numerals, weight and the size variants - so `.lineAmounts`, `.lineTotal` and `.totalsValue`
+ *     position and align it and nothing more. The tone a figure recedes in is the component's
+ *     `tone` prop for the same reason: a `color` here would fight the primitive for it.
  *
  * TOKEN CONTRACT
  *   Every colour, space, radius and type size is read as `var(--ls-NAME, <literal fallback>)`.
@@ -36,16 +40,26 @@
  * CLASS CONTRACT - what `OrderConfirmation.tsx` composes with `clsx`
  *   .root           the block wrapper, rendered inside `Card`
  *   .headline       the receipt's heading element
- *   .orderNumber    the selectable order reference
+ *   .orderNumber    the order-reference chip, holding .orderNumberCaption (the visible caption a
+ *                   sighted reader needs) and .orderNumberValue (the selectable reference itself)
  *   .statusRow      the `Badge` beside the order date
  *   .lines .line    the ordered-lines list, and one line of it
  *   .lineBody       a line's description column, holding .lineName and .lineMeta
- *   .lineTotal      a line's money column
+ *   .lineAmounts    a line's money column, stacking .lineBasis, .lineAdjustment and .lineTotal in
+ *                   the order the arithmetic reads: the units at their captured price, what came
+ *                   off them, then what the line settled at
+ *   .lineBasis      the units and the price they were captured at
+ *   .lineAdjustment what the line's own discount took off it, or what it settled above its
+ *                   captured price by; absent when the two agree
+ *   .lineTotal      the line's settled figure, the one figure of the three at full strength
  *   .totals         the derived-totals block: .totalsRow, .totalsLabel, .totalsValue
  *   .grandTotal     added to the final .totalsRow to emphasise it - and because `Price` owns the
  *                   figure's size, the emphasis only reaches the money if that row's `Price`
  *                   is given the larger size; a `font-size` here cannot cross that boundary
- *   .shipping       the destination block, with .addressBlock for the postal address itself
+ *   .refs           the identifiers block: .refRow, .refLabel, .refValue, plus .refCode added
+ *                   alongside .refValue for a value that is a machine identifier rather than words
+ *   .shipping       the destination block, with .addressBlock for the postal address itself and
+ *                   .contactLine (with .contactValue) for the address the confirmation went to
  *   .actions        the trailing row, with .actionLink for the "View all orders" anchor
  */
 
@@ -69,16 +83,20 @@
   line-height: 1.25;
 }
 
-/* The reference a customer quotes back, so it is unambiguous and plain selectable text: a
- * monospace chip on the recessed surface, digits in tabular numerals so a zero cannot be read as
- * a letter, and `overflow-wrap: anywhere` so a long reference wraps inside a narrow card instead
- * of widening it. The inline-start edge carries the one restrained success accent in this file;
- * it is decoration only - the badge and its label state the order's status. Selection behaviour
- * is left at the browser default on purpose: nothing here may make the reference unselectable. */
+/* The chip that carries the reference a customer quotes back: a captioned value on the recessed
+ * surface, wrapping to a second row inside a narrow card rather than widening it. The inline-start
+ * edge carries the one restrained success accent in this file; it is decoration only - the badge
+ * and its label state the order's status.
+ *
+ * The chip itself sets no type treatment. The caption is words and the reference is a code, they
+ * are set differently, and a family or a size declared here would have to be undone by one of
+ * them. */
 .orderNumber {
   display: inline-flex;
-  align-items: center;
+  flex-wrap: wrap;
+  align-items: baseline;
   align-self: flex-start;
+  gap: var(--ls-space-2, 8px);
   max-width: 100%;
   border: 1px solid var(--ls-border, #cbd5e1);
   border-inline-start: 2px solid var(--ls-success, #0f766e);
@@ -86,6 +104,22 @@
   background-color: var(--ls-surface-sunken, #f8fafc);
   padding-block: var(--ls-space-1, 4px);
   padding-inline: var(--ls-space-2, 8px);
+}
+
+/* The caption that says what the code beside it is, in the muted small treatment every other
+ * label in this file uses, so it reads as the label and never competes with the reference. It is
+ * a separate element from the value rather than text prefixed to it, which is what keeps a
+ * double-click on the reference selecting the reference alone. */
+.orderNumberCaption {
+  color: var(--ls-text-muted, #475569);
+  font-size: var(--ls-text-sm, 13px);
+}
+
+/* The reference itself: monospace, digits in tabular numerals so a zero cannot be read as a
+ * letter, and `overflow-wrap: anywhere` so a long reference wraps inside the chip instead of
+ * widening it. Selection behaviour is left at the browser default on purpose: nothing here may
+ * make the reference harder to select or copy. */
+.orderNumberValue {
   color: var(--ls-text, #0f172a);
   font-family: var(--ls-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
   font-size: var(--ls-text-md, 15px);
@@ -121,7 +155,8 @@
 /* One line: description on the inline-start side, money on the inline-end side. `minmax(0, 1fr)`
  * is load-bearing - it lets the description track shrink below its content's intrinsic width, so
  * a long industrial product name is clamped by `.lineName` instead of pushing the money column
- * out of the card. Baseline alignment puts the figure on the name's first baseline. */
+ * out of the card. Baseline alignment puts the money column's first figure on the name's first
+ * baseline, so the row still reads as one line however many figures the column holds. */
 .line {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
@@ -159,27 +194,64 @@
   overflow-wrap: anywhere;
 }
 
-/* Placement for the line's figure. `Price` supplies the family and the weight; this only pins
- * the column to the inline-end edge and keeps the numerals tabular if the caller renders plain
- * text here instead. */
-.lineTotal {
-  justify-self: end;
-  font-family: var(--ls-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
-  font-variant-numeric: tabular-nums;
+/* The line's money column: the three figures of the line's arithmetic stacked against the
+ * inline-end edge, in the order they are checked. `min-width: 0` lets the column shrink rather
+ * than push the description track out of the card, and the alignment lives here - once, for all
+ * three - rather than being restated on each figure. */
+.lineAmounts {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: var(--ls-space-1, 4px);
   text-align: end;
 }
 
-/* Below roughly 22rem of container width - the point at which a two-line product name and a
- * figure stop fitting side by side inside the card's padding - the grid collapses to one track,
- * which puts the figure under the description. The threshold is written as a `calc()` over one
- * rem, which is 22 times the 16px step `--ls-space-4` names: a container query condition is
- * resolved before custom properties are, so a `var()` here would invalidate the whole block
- * rather than read the token.
+/* The two supporting figures of a line: the units at the price they were captured at, and what
+ * the line's own discount took off. Set at the small step rather than the smaller one the
+ * description's meta uses, because `Price` renders its `sm` figure at that step and a 12px word
+ * beside a 13px figure reads as a mistake. The words are muted here and the figures are muted by
+ * their own `tone`, so the whole phrase recedes from the settled amount below it. */
+.lineBasis,
+.lineAdjustment {
+  color: var(--ls-text-muted, #475569);
+  font-size: var(--ls-text-sm, 13px);
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+/* The line's settled figure. `Price` supplies the family, the size and the weight; this keeps the
+ * numerals tabular if the caller renders plain text here instead, and states the family for the
+ * same reason. The inline-end alignment is `.lineAmounts`' - a `justify-self` here would describe
+ * a grid item this element no longer is. */
+.lineTotal {
+  font-family: var(--ls-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Below roughly 26rem of container width the two-column rows collapse to one track, which puts
+ * each row's values under its description instead of crushing either. The threshold is written as
+ * a `calc()` over one rem, which is 26 times the 16px step `--ls-space-4` names: a container query
+ * condition is resolved before custom properties are, so a `var()` here would invalidate the whole
+ * block rather than read the token.
  *
- * Nothing here re-aligns the figure. `.lineTotal` keeps `justify-self: end`, so the money stays
- * on the inline-end edge once stacked and the column it forms with the totals below survives the
- * collapse - which is the one thing that makes a receipt readable at any width. */
-@container (max-width: calc(22 * 1rem)) {
+ * It answers the container rather than the viewport because this block is rendered both in a
+ * page's main column and in the narrower checkout column, and neither knows what the other is
+ * doing - `.root` is the size container that makes that possible.
+ *
+ * 26 rather than the 22 a single figure needed: a line's money column now carries the units at
+ * their captured price, the line's discount and its settled amount, so the widest thing it has to
+ * hold beside a two-line product name is a phrase rather than one figure, and the point at which
+ * the two stop fitting side by side moves out with it.
+ *
+ * Nothing here re-aligns the money. `.lineAmounts` keeps its own inline-end alignment, so the
+ * figures stay on the inline-end edge once stacked and the column they form with the totals below
+ * survives the collapse - which is the one thing that makes a receipt readable at any width.
+ *
+ * The identifiers block collapses at the same threshold, in its own `@container` further down:
+ * these rules and the base rules they override carry equal specificity, so each one has to be
+ * written after the rule it narrows rather than all of them together. */
+@container (max-width: calc(26 * 1rem)) {
   .line {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -229,9 +301,71 @@
   color: var(--ls-text, #0f172a);
 }
 
-/* Where the order is going and when it is expected. The block is muted, which makes its labels
- * muted whatever element the component reaches for, and `.addressBlock` lifts the address itself
- * back to full contrast. */
+/* The identifiers a customer quotes back over the telephone: the order's own id and, when the
+ * payload carries a payment, the processor's reference and the instant it settled. Tighter than
+ * the totals block because these are reference rows rather than figures being added up, and muted
+ * as a whole so the block sits below the money without competing with it. */
+.refs {
+  display: grid;
+  gap: var(--ls-space-1, 4px);
+  color: var(--ls-text-muted, #475569);
+  font-size: var(--ls-text-sm, 13px);
+}
+
+/* Same two-column rhythm as `.totalsRow`, so the two blocks read as one column of labelled
+ * values. */
+.refRow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: var(--ls-space-3, 12px);
+}
+
+.refLabel {
+  color: var(--ls-text-muted, #475569);
+  overflow-wrap: anywhere;
+}
+
+/* The value takes the full ink colour: a reference someone is about to read out is the last thing
+ * on a receipt that should be pale. `overflow-wrap: anywhere` is what keeps a long opaque
+ * identifier inside the card instead of widening it. */
+.refValue {
+  justify-self: end;
+  color: var(--ls-text, #0f172a);
+  text-align: end;
+  overflow-wrap: anywhere;
+}
+
+/* Carried alongside `.refValue` for a value that is a machine identifier rather than words: the
+ * monospace family and fixed digit advance that make a code readable character by character, which
+ * is how it gets copied into a support ticket or read down a telephone. Declared after `.refValue`
+ * so the narrower of the two is the one that wins on equal specificity, the way `.grandTotal` is
+ * declared after `.totalsRow`. */
+.refCode {
+  font-family: var(--ls-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
+}
+
+/* The narrow end of the identifiers block, at the same container width the line rows collapse at.
+ * The line rows' own `@container` further up states why the two cannot share one block: each
+ * override has to be written after the base rule it narrows, and `.refRow` is declared below that
+ * block. A machine reference has no reason to be read from the right, so once it sits under its
+ * own label it is aligned with it. */
+@container (max-width: calc(26 * 1rem)) {
+  .refRow {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .refValue {
+    justify-self: start;
+    text-align: start;
+  }
+}
+
+/* Where the order is going, when it is expected, and where the confirmation of it was sent. The
+ * block is muted, which makes its labels muted whatever element the component reaches for, and
+ * `.addressBlock` and `.contactValue` lift the two addresses themselves back to full contrast. */
 .shipping {
   display: grid;
   gap: var(--ls-space-1, 4px);
@@ -249,6 +383,19 @@
   font-style: normal;
   white-space: pre-line;
   overflow-wrap: anywhere;
+}
+
+/* "Confirmation sent to ..." - the wording stays in the block's muted treatment, because it is a
+ * statement about the order rather than part of the address. */
+.contactLine {
+  overflow-wrap: anywhere;
+}
+
+/* The address itself, lifted to full contrast exactly as `.addressBlock` lifts the postal address:
+ * it is the one part of that sentence a reader checks character by character, and a local part
+ * with no space in it is why the line above may break anywhere. */
+.contactValue {
+  color: var(--ls-text, #0f172a);
 }
 
 /* The trailing row. Spacing only; the anchor's own treatment is below. */

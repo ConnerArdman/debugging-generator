@@ -2,7 +2,8 @@
  * Lumen Supply - the receipt the storefront shows once an order has been placed.
  *
  * It answers the questions a buyer has the moment they stop being a shopper: did the order go
- * through, what is its reference, what was bought for how much, and where is it going. The surface
+ * through, what is its reference, what was bought at what price for how much, what settled the
+ * charge, who is carrying it and where is it going. The surface
  * it sits on is `@/components/ui/Card`, the status chip is `@/components/ui/Badge`, every figure is
  * `@/components/ui/Price` and every string is worded by `@/lib/format`. What is left - which of the
  * payload's fields earns a line, and in what order those lines read - is this file's only job.
@@ -24,9 +25,27 @@
  * THE PAYLOAD IT ACCEPTS
  * `order` is either an `OrderDetail` - what the order routes return - or the `CheckoutResult` a
  * submit resolves to, which wraps one. Both are accepted so that neither caller has to unwrap
- * anything, and the single `'order' in order` test below is the whole of the adaptation. The
- * payment half of a `CheckoutResult` is deliberately not printed here: this block is the order's
- * receipt, and how the payment resolved belongs to the form that performed it.
+ * anything, and the two `'order' in order` tests below are the whole of the adaptation: one takes
+ * the order, the other takes the payment that settled it.
+ *
+ * WHAT IS PRINTED OF THE PAYMENT, AND WHY IT MAY BE ABSENT
+ * `payment` exists only on the `CheckoutResult` branch, and is `null` even there for an
+ * `already_placed` result read back from the store - which retains the order but not the
+ * authorization that paid for it. So the payment rows print when the payload carries one and are
+ * absent entirely when it does not, leaving no empty row and no dangling label for the
+ * `OrderDetail` caller. What is printed is the processor's reference and the instant it settled,
+ * which are what a buyer quotes when they ring up about a charge. `authorized` and `declineReason`
+ * are not: a receipt exists because the payment went through, and the wording for one that did not
+ * belongs to the form that watched it fail. `amountCents` is not either - the amount that was
+ * charged is already the last row of the totals block, and printing it twice would invite the two
+ * to disagree.
+ *
+ * EVERY LINE RECONCILES ON ITS OWN FACE
+ * A line prints the price it was captured at, the units bought at it, what the line's own discount
+ * took off, and what it settled at, so `unit price x quantity - discount = line total` can be
+ * checked by eye rather than taken on trust. The discount is derived here because `OrderLine`
+ * publishes the two ends of that subtraction and not the difference; `adjustment` below states why
+ * the subtraction is exact and how a negative result is treated.
  *
  * HOW THE CARD IS DIVIDED
  * The headline takes the card's `head` slot and the orders link takes its `foot`, so both arrive
@@ -39,7 +58,9 @@
  * A CSS Module class is typed `string | undefined` under this repository's
  * `noUncheckedIndexedAccess`, while `Price` declares `className?: string` - and
  * `exactOptionalPropertyTypes` makes those two different types. `clsx` collapses the difference,
- * which keeps the call honest instead of asserting the class away with a non-null assertion.
+ * which keeps the call honest instead of asserting the class away with a non-null assertion. Its
+ * other calls here are the ordinary one: two module classes joined on one element, where the
+ * second narrows the first.
  */
 
 import clsx from 'clsx';
@@ -50,7 +71,6 @@ import type { ComponentProps, ReactElement } from 'react';
 import { Badge } from '@/components/ui/Badge';
 import { Card } from '@/components/ui/Card';
 import { Price } from '@/components/ui/Price';
-import { VisuallyHidden } from '@/components/ui/VisuallyHidden';
 import {
   formatOrderDateTime,
   formatOrderStatusLabel,
@@ -59,7 +79,14 @@ import {
   formatSkuLabel,
   formatTimeAgoLabel,
 } from '@/lib/format';
-import type { CheckoutResult, OrderDetail, OrderStatus } from '@/lib/types';
+import type {
+  CheckoutResult,
+  OrderDetail,
+  OrderLine,
+  OrderStatus,
+  PaymentAuthorization,
+  ShippingOption,
+} from '@/lib/types';
 
 import styles from './OrderConfirmation.module.css';
 
@@ -148,6 +175,62 @@ function joined(parts: readonly (string | null)[], separator: string): string {
 }
 
 /**
+ * How the consignment travels, as one phrase: the service the customer bought and the carrier that
+ * runs it.
+ *
+ * The carrier is named once, whichever payload the receipt was handed. An order read back from the
+ * store carries a label that is already the carrier code and the service level together - the
+ * order service composes it that way because neither half identifies the service on its own -
+ * while a quote taken at checkout labels the service in words, "Standard ground", and carries the
+ * carrier code beside it. Naming the carrier only when the label does not already contain it is
+ * what keeps "NLEX GROUND with NLEX" off a receipt, and the comparison is case-insensitive because
+ * the two sources spell the code differently.
+ *
+ * Either field can arrive blank, and neither is printed blank: a label with no carrier reads as
+ * the label, a carrier with no label reads as the carrier, and nothing at all returns the empty
+ * string that `joined` drops.
+ */
+function carriage(option: ShippingOption): string {
+  const label = option.label.trim();
+  const carrier = option.carrier.trim();
+
+  if (carrier.length === 0 || label.toUpperCase().includes(carrier.toUpperCase())) {
+    return label;
+  }
+
+  return label.length === 0 ? carrier : `${label} with ${carrier}`;
+}
+
+/**
+ * What a line's own discount took off it, in cents: `unitPriceCents * quantity - lineTotalCents`.
+ *
+ * WHY THE SUBTRACTION IS EXACT
+ * The figure is derived rather than read, because `OrderLine` publishes the price the line was
+ * captured at and the amount it settled at and nothing in between. The store's own order line does
+ * hold the difference, and the order service refuses to write a line whose three figures disagree -
+ * it requires `lineTotalCents === unitPriceCents * quantity - discountCents` - so this subtraction
+ * recovers precisely the discount that was recorded against the line. Deriving it here is also why
+ * no field has to be added to the DTO for a receipt to reconcile.
+ *
+ * HOW EACH SIGN IS TREATED
+ * A positive result is a discount, printed as the amount taken off. Zero is a line charged at the
+ * price it was captured at, which prints no adjustment row at all rather than a row reading
+ * nothing. A negative result would mean the line settled above its own captured price - a surcharge
+ * the payload does not model anywhere - and it is printed as an addition, in those words, rather
+ * than dressed up as a discount or quietly dropped: a receipt that hides an increase is worse than
+ * one that names an increase it cannot explain.
+ *
+ * A figure that is not a finite number yields `0`, so no adjustment is claimed on a line whose
+ * own figures are unusable. Nothing is concealed by that: `Price` renders a non-amount as the
+ * placeholder dash, so the unit price and the line total themselves say that the data is broken.
+ */
+function adjustment(line: OrderLine): number {
+  const cut = line.unitPriceCents * line.quantity - line.lineTotalCents;
+
+  return Number.isFinite(cut) ? cut : 0;
+}
+
+/**
  * Render the receipt for one placed order.
  *
  * @example
@@ -170,6 +253,12 @@ export function OrderConfirmation({
   // caller having to unwrap anything.
   const detail: OrderDetail = 'order' in order ? order.order : order;
 
+  // The authorization that settled the order, which only a checkout result carries - and which
+  // even a checkout result leaves `null` for an order it merely read back. The same `in` test is
+  // written again rather than derived from `detail`, because narrowing a union is what the test
+  // does and `detail` no longer holds the branch it came from.
+  const payment: PaymentAuthorization | null = 'order' in order ? order.payment : null;
+
   const address = detail.shippingAddress;
   // The one line of a postal address that is assembled from several fields rather than printed as
   // it stands, so it is built with the same blank-dropping join as the address around it.
@@ -186,13 +275,24 @@ export function OrderConfirmation({
     '\n',
   );
 
+  // The address the confirmation is sent to. A required string in the payload, so the only two
+  // things that can reach the line are an address and a blank one, and a blank one says nothing
+  // worth a row.
+  const email = detail.contact.email.trim();
+
+  // The order's own identifier, as distinct from the order number a customer reads out: the value
+  // a support tool looks the order up by. Blanks are filtered for the same reason they are
+  // everywhere else in this file - a label with nothing beside it is worse than no row.
+  const identifier = detail.id.trim();
+
   // The service an order shipped by is `null` for an order whose choice was never recorded, which
-  // is a line with nothing to say rather than a line saying nothing.
+  // is a line with nothing to say rather than a line saying nothing. When there is a service, the
+  // line names who is carrying the goods as well as what was bought and when it lands.
   const option = detail.shippingOption;
   const arrival =
     option === null
       ? ''
-      : joined([option.label, formatShippingEtaLabel(option.estimatedDays)], ' · ');
+      : joined([carriage(option), formatShippingEtaLabel(option.estimatedDays)], ' · ');
 
   // What the subtotal is a subtotal of. The count comes from the payload rather than from the
   // lines, so it still reads correctly for an order whose lines were not included.
@@ -212,11 +312,14 @@ export function OrderConfirmation({
       }
     >
       <div className={styles.root}>
-        {/* The reference a customer quotes back. Plain selectable text, and prefixed for a screen
-            reader with the words a sighted reader takes from the chip's position under the
-            heading. */}
+        {/* The reference a customer quotes back, captioned in words a sighted reader sees rather
+            than left to be inferred from the chip's position under the heading. The caption and
+            the reference are separate elements so the reference stays one selectable run of plain
+            text: a double-click still takes the reference alone, which is the gesture someone uses
+            to copy it into an email. */}
         <p className={styles.orderNumber}>
-          <VisuallyHidden>Order number</VisuallyHidden> {detail.orderNumber}
+          <span className={styles.orderNumberCaption}>Order number</span>
+          <span className={styles.orderNumberValue}>{detail.orderNumber}</span>
         </p>
 
         <div className={styles.statusRow}>
@@ -240,17 +343,40 @@ export function OrderConfirmation({
               <span className={styles.lineMeta}>No items were recorded on this order.</span>
             </li>
           ) : (
-            detail.lines.map((line) => (
-              <li className={styles.line} key={line.id}>
-                <div className={styles.lineBody}>
-                  <span className={styles.lineName}>{line.name}</span>
-                  <span className={styles.lineMeta}>
-                    Qty {formatQuantityLabel(line.quantity)} · {formatSkuLabel(line.sku)}
-                  </span>
-                </div>
-                <Price className={clsx(styles.lineTotal)} cents={line.lineTotalCents} />
-              </li>
-            ))
+            detail.lines.map((line) => {
+              // Positive is the discount the line carried, negative the surcharge the payload does
+              // not model, and zero a line charged at the price it was captured at.
+              const cut = adjustment(line);
+
+              return (
+                <li className={styles.line} key={line.id}>
+                  <div className={styles.lineBody}>
+                    <span className={styles.lineName}>{line.name}</span>
+                    <span className={styles.lineMeta}>
+                      Qty {formatQuantityLabel(line.quantity)} · {formatSkuLabel(line.sku)}
+                    </span>
+                  </div>
+                  {/* The money column, ordered downwards as the arithmetic a reader checks: the
+                      units at the price they were captured at, what came off them, then what the
+                      line settled at - the one figure of the three at full strength, so the column
+                      of line totals still scans against the totals block below. */}
+                  <div className={styles.lineAmounts}>
+                    <span className={styles.lineBasis}>
+                      {formatQuantityLabel(line.quantity)} at{' '}
+                      <Price cents={line.unitPriceCents} size="sm" tone="muted" /> each
+                    </span>
+                    {cut === 0 ? null : (
+                      <span className={styles.lineAdjustment}>
+                        {cut > 0 ? 'less' : 'plus'}{' '}
+                        <Price cents={Math.abs(cut)} size="sm" tone="muted" />{' '}
+                        {cut > 0 ? 'discount' : 'above the captured price'}
+                      </span>
+                    )}
+                    <Price className={clsx(styles.lineTotal)} cents={line.lineTotalCents} />
+                  </div>
+                </li>
+              );
+            })
           )}
         </ul>
 
@@ -295,9 +421,46 @@ export function OrderConfirmation({
           </div>
         </dl>
 
-        {/* Where the order is going and when it is expected. The block is skipped entirely when
-            the payload carries neither, so the column above it does not end on an empty row. */}
-        {destination.length === 0 && arrival.length === 0 ? null : (
+        {/* What a customer quotes when they ring up about this order: its own identifier, which is
+            not the order number above and is what a support tool looks the order up by, and - when
+            the payload carries a payment - the processor's reference for the charge and the instant
+            it settled. Each row is a label and a value together, so a row is either both or
+            neither and the block can never end on a label with nothing beside it; the block itself
+            is skipped when it would hold no row at all, which is what an `OrderDetail` with no
+            identifier would leave. The timestamp is printed absolutely by `formatOrderDateTime`,
+            inside a machine-readable `<time>`, exactly as the placement time above is - no clock is
+            read to word either of them. */}
+        {identifier.length === 0 && payment === null ? null : (
+          <dl className={styles.refs}>
+            {identifier.length === 0 ? null : (
+              <div className={styles.refRow}>
+                <dt className={styles.refLabel}>Order ID</dt>
+                <dd className={clsx(styles.refValue, styles.refCode)}>{identifier}</dd>
+              </div>
+            )}
+            {payment === null ? null : (
+              <>
+                <div className={styles.refRow}>
+                  <dt className={styles.refLabel}>Payment reference</dt>
+                  <dd className={clsx(styles.refValue, styles.refCode)}>{payment.reference}</dd>
+                </div>
+                <div className={styles.refRow}>
+                  <dt className={styles.refLabel}>Payment processed</dt>
+                  <dd className={styles.refValue}>
+                    <time dateTime={payment.processedAt}>
+                      {formatOrderDateTime(payment.processedAt)}
+                    </time>
+                  </dd>
+                </div>
+              </>
+            )}
+          </dl>
+        )}
+
+        {/* Where the order is going, when it is expected, and the address the confirmation of it
+            was sent to. The block is skipped entirely when the payload carries none of the three,
+            so the column above it does not end on an empty row. */}
+        {destination.length === 0 && arrival.length === 0 && email.length === 0 ? null : (
           <div className={styles.shipping}>
             {destination.length === 0 ? null : (
               <>
@@ -306,6 +469,11 @@ export function OrderConfirmation({
               </>
             )}
             {arrival.length === 0 ? null : <p>{arrival}</p>}
+            {email.length === 0 ? null : (
+              <p className={styles.contactLine}>
+                Confirmation sent to <span className={styles.contactValue}>{email}</span>
+              </p>
+            )}
           </div>
         )}
       </div>

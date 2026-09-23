@@ -1295,6 +1295,117 @@ describe('searchText: a query it refuses to run', () => {
   });
 });
 
+describe('searchText: arguments of unknown provenance', () => {
+  /*
+   * This module is the fallback retrieval route for a name the code graph does
+   * not hold (AAP 0.4.2), so a call reaching it is assembled from a model's
+   * output by `apps/local-service/src/pipeline/tools/code-tools.ts`. An
+   * `options` argument that is not an object at all is therefore an ordinary
+   * input rather than a programming error, and AAP 0.5.5 requires the stage to
+   * degrade: one refused query, not a crashed investigation.
+   *
+   * Both arguments are admitted before either is read, which is the whole
+   * property — `options.logger` off a `null` was the one way this function
+   * could raise a `TypeError` instead of returning a `Result`.
+   */
+  const hostile: readonly unknown[] = [undefined, null, 0, 42, 'query', [], true, () => 1];
+
+  /**
+   * The type description this module puts in `details.received`, restated here
+   * so a case can assert it without importing the module's private helper.
+   *
+   * @param value The refused argument.
+   * @returns Its type description.
+   */
+  function describeValue(value: unknown): string {
+    if (value === null) {
+      return 'null';
+    }
+
+    return Array.isArray(value) ? 'array' : typeof value;
+  }
+
+  it('refuses an options argument that is not an object, as a value', () => {
+    const loaded = corpusProject();
+
+    for (const value of hostile) {
+      const options = value as TextSearchOptions;
+
+      expect(() => searchText(loaded, options)).not.toThrow();
+
+      const found = searchText(loaded, options);
+
+      expect(isErr(found)).toBe(true);
+      expectModuleError(refusalFrom(options), 'options-invalid');
+    }
+  });
+
+  it('names the kind of value it refused, and never the value', () => {
+    const refusal = refusalFrom(null as unknown as TextSearchOptions);
+
+    expect(refusal.details?.received).toBe('null');
+    expect(reasonOf(refusalFrom([] as unknown as TextSearchOptions))).toBe('options-invalid');
+    expect(refusalFrom(['secret-value'] as unknown as TextSearchOptions).details?.received).toBe(
+      'array',
+    );
+    // An array is refused rather than read as an object with numeric keys,
+    // because a list of terms is a plausible thing for a tool call to send and
+    // it names no query.
+    expect(
+      JSON.stringify(refusalFrom(['secret-value'] as unknown as TextSearchOptions).details),
+    ).not.toContain('secret-value');
+  });
+
+  it('refuses a project argument that is not the handle openProject returns', () => {
+    const options: TextSearchOptions = { ...BUDGET, query: MARKER };
+
+    for (const value of hostile) {
+      const loaded = value as LoadedProject;
+
+      expect(() => searchText(loaded, options)).not.toThrow();
+
+      const found = searchText(loaded, options);
+
+      if (isOk(found)) {
+        expect.unreachable('a search without a project handle cannot succeed');
+      } else {
+        expectModuleError(found.error, 'project-invalid');
+        expect(found.error.details?.received).toBe(describeValue(value));
+      }
+    }
+  });
+
+  it('accepts any handle carrying the three members it reads, and searches through it', () => {
+    // Structural rather than nominal on purpose: the handle crosses a package
+    // boundary, so the guard asks for the members this module uses and nothing
+    // more. A handle reporting no files is a search of nothing, not a refusal.
+    const empty: LoadedProject = {
+      ...corpusProject(),
+      sourceFiles: () => [],
+    };
+
+    const found = searchOrFail(empty, { ...BUDGET, query: MARKER });
+
+    expect(found.hits).toEqual([]);
+    expect(found.filesSearched).toBe(0);
+    expect(found.bytesScanned).toBe(0);
+  });
+
+  it('refuses the options argument before the project argument', () => {
+    // Order is part of the contract: the message a developer sees for a call
+    // that is wrong in both places names the argument they control.
+    const found = searchText(
+      undefined as unknown as LoadedProject,
+      undefined as unknown as TextSearchOptions,
+    );
+
+    expect(isErr(found)).toBe(true);
+    if (isErr(found)) {
+      expectModuleError(found.error, 'options-invalid');
+    }
+  });
+});
+
 describe('searchText: regular-expression mode', () => {
   it('finds the marker through a pattern and agrees with the literal search', () => {
     const literal = findInCorpus({ ...BUDGET, query: MARKER });

@@ -4,8 +4,8 @@
  * A grid of card-shaped placeholders that stands in for the product grid while the catalog's data
  * resolves. Its job is to reserve the box the loaded grid will occupy - the same track sizing and
  * gutters, and the same order inside one card: media, title, meta, actions - so the page holds
- * still when the real cards arrive. `app/loading.tsx` renders it, and any catalog surface waiting
- * on data can.
+ * still when the real cards arrive. `app/(catalog)/loading.tsx` renders it, and any catalog surface
+ * waiting on data can.
  *
  * COMPOSITION
  * Geometry comes from `./ProductCardSkeleton.module.css` and from nowhere else. `.root`, `.grid`,

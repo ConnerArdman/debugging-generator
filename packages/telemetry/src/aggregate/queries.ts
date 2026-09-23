@@ -27,6 +27,54 @@
  * groups, because case is preserved and differently cased text is different
  * text.
  *
+ * ## What counts as one execution
+ *
+ * A `db.query` event is a database *span*, which is not the same thing as a
+ * statement execution, and this module's unit is the execution (AAP 0.6.2: a
+ * `queryTable` row is "parameterized statement, duration, caller, execution
+ * count"). Two kinds of database span are therefore not folded into a group:
+ *
+ * 1. **Lifecycle spans**, which carry no `db.statement` at all. Both
+ *    instrumentations span their own overhead — the ORM's
+ *    `prisma:client:serialize`, `prisma:client:operation`,
+ *    `prisma:client:compile` and transaction spans, the driver's `pg.connect`
+ *    and `pg-pool.connect` — and a real capture holds more of them than of
+ *    statements. Grouping them put every one in a single `(unknown statement)`
+ *    bucket, which then read as the busiest "statement" in the capture; see
+ *    {@link isDatabaseStatementEvent}.
+ * 2. **The inner observation of one execution two instrumentations both saw.**
+ *    With the ORM and the driver both armed — the combination this stack needs,
+ *    since the ORM runs over a shared driver pool that application code also
+ *    queries directly — one statement produces an ORM span with a driver span
+ *    nested inside it carrying the same text. That is one execution observed
+ *    twice, and the **outermost** observation is the one kept: it is the
+ *    interval that contains the whole execution, including the ORM's own
+ *    overhead, so a group's `totalDurationMs` stays the cost the caller paid.
+ *
+ * ### Nothing is hidden by either exclusion
+ *
+ * Every database span, statement-carrying or not, is still counted in
+ * `CaptureSummary.kindCounts['db.query']` and still contributes its interval to
+ * the `database_duration` metric, which is the union of the database tier's
+ * intervals (`./summary.ts`, `./timeline.ts`). Every one of them is also still
+ * a node in the trace tree, the waterfall and the flame view, and still an
+ * event the `spans` and `events` data sources return. The exclusions here stop
+ * lifecycle work and duplicate observations from being *counted as statement
+ * executions*; they remove no evidence from the capture.
+ *
+ * ### Why the duplicate is resolved here and not in the producer
+ *
+ * `../node/exporter.ts` sees each span in `onEnd`, where the only thing it
+ * knows about the span's ancestry is `parentSpanId`: a child span ends **before**
+ * its parent, so at the moment the driver's span is admitted the ORM span above
+ * it has not ended, is not reachable as an object, and has no attribute the
+ * processor can read. The comparison needs both statements at once, so it can
+ * only be made where the whole event set exists — which is this module. That is
+ * also the alternative the finding this rule answers offers ("or have the
+ * aggregates prefer the outermost db span per statement occurrence"), and it has
+ * the better failure mode: a producer-side drop would delete a span from the
+ * store, while a fold-time exclusion leaves every span queryable.
+ *
  * ## Privacy (AAP 0.5.2)
  *
  * Nothing in the shapes below can hold captured data, and that is structural
@@ -138,13 +186,22 @@ const CALLER_KIND_SET: ReadonlySet<TelemetryKind> = new Set<TelemetryKind>([
  */
 
 /**
- * The group key and representative statement used when a span's `db.statement`
- * cannot be read as text, or normalises to nothing.
+ * The group key and representative statement of an execution whose reported
+ * statement text normalises to nothing.
  *
- * Such a span is **grouped and surfaced, never dropped**: its duration is part
- * of the capture's database cost whether or not the producer labelled it, and
- * an aggregate that silently discarded it would understate exactly the thing a
- * developer is asking about.
+ * The one case that still reaches this label: the producer reported a non-empty
+ * `db.statement` — so the span *is* a statement execution
+ * ({@link isDatabaseStatementEvent}) — but `normalizeSqlStatement` reduced it to
+ * empty text, which a statement consisting only of a terminator or of
+ * whitespace does. Such an execution is **grouped and surfaced, never
+ * dropped**: its duration is part of the capture's database cost whether or not
+ * the text survived normalisation, and discarding it would understate exactly
+ * the thing a developer is asking about.
+ *
+ * A span that carries *no* statement at all is a different thing — lifecycle
+ * work rather than an execution — and is not grouped here at all; see the
+ * module overview. Before that distinction existed, every such span landed in
+ * this bucket and it routinely became the largest "statement" in a capture.
  *
  * One consequence is worth knowing: a statement whose normalised text happens
  * to be this exact label lands in the same group. That keeps one group per
@@ -663,13 +720,157 @@ function resolveBound(value: number | undefined, fallback: number): number {
 }
 
 /** The grouping key for a span's statement. Normalisation is not done here. */
-function statementKeyFor(rawStatement: string | undefined): string {
-  if (rawStatement === undefined) {
-    return UNKNOWN_STATEMENT_KEY;
-  }
-
+function statementKeyFor(rawStatement: string): string {
   const normalized = normalizeSqlStatement(rawStatement);
   return normalized.length > 0 ? normalized : UNKNOWN_STATEMENT_KEY;
+}
+
+/** The statement text an event reports, or `undefined` when it reports none. */
+function readStatement(event: TelemetryEvent): string | undefined {
+  return readNonEmptyString(readAttributeBag(event)[DB_STATEMENT_KEY]);
+}
+
+/**
+ * Whether an event is one statement execution: a database-kind event that
+ * reports the statement it ran.
+ *
+ * The selector this aggregate folds on, and the one place the distinction
+ * between a statement and the database tier's other work is drawn. Both halves
+ * matter:
+ *
+ * - **the kind** is a member of the database kind group of `../schema/kinds.ts`,
+ *   never a literal this module invented, so a capture's database vocabulary is
+ *   decided upstream;
+ * - **`db.statement` is a non-empty string**, which is what tells an execution
+ *   from the lifecycle spans both instrumentations emit — a connection
+ *   acquisition, an argument serialization, a transaction boundary. Those
+ *   report an operation (`../node/convert.ts` names one for every lifecycle
+ *   span) and no statement, because there is no statement to report.
+ *
+ * Exported because it is a semantic, not a detail: `./summary.ts` publishes
+ * `query_count` as the executions these groups account for, and a consumer
+ * filtering database events for a statement-level view must ask the same
+ * question rather than re-deriving it from an attribute key.
+ *
+ * Reads nothing else and never throws: an event with no attribute bag, or with
+ * a `db.statement` that is not a string, simply is not a statement execution.
+ *
+ * @param event Any telemetry event, of any kind.
+ * @returns `true` when the event is a database statement execution.
+ *
+ * @example
+ * ```ts
+ * // How many of a capture's database spans are statements rather than overhead
+ * const statements = events.filter(isDatabaseStatementEvent).length;
+ * ```
+ */
+export function isDatabaseStatementEvent(event: TelemetryEvent): boolean {
+  return QUERY_KIND_SET.has(event.kind) && readStatement(event) !== undefined;
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * Duplicate observations
+ *
+ * One execution, two instrumentations: the rule and its guards. See the module
+ * overview for why the comparison belongs here rather than in the producer.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * Indexes the normalised statement key of every statement execution by span
+ * id, so the ancestor walk compares keys instead of re-normalising text.
+ *
+ * Built from the span index rather than from the event list, so that "which
+ * event owns this span id" is answered identically in both — on a duplicate
+ * span id the first event wins in {@link indexSpans}, and this map has to agree
+ * or an ancestor would be compared against a statement its span never ran.
+ *
+ * Normalisation is the expensive step of this module (a scan of the statement
+ * text), and a chain of nested observations would otherwise re-run it once per
+ * hop per event; here each span's key is computed at most once per call.
+ */
+function indexStatementKeys(
+  spansBySpanId: ReadonlyMap<SpanId, TelemetryEvent>,
+): ReadonlyMap<SpanId, string> {
+  const keys = new Map<SpanId, string>();
+
+  for (const event of spansBySpanId.values()) {
+    const statement = readStatement(event);
+    if (statement !== undefined && QUERY_KIND_SET.has(event.kind)) {
+      keys.set(event.spanId, statementKeyFor(statement));
+    }
+  }
+
+  return keys;
+}
+
+/**
+ * Whether an ancestor of this span already observed the same statement — which
+ * makes this span the inner of two observations of one execution.
+ *
+ * Walks up from `parentSpanId` at most {@link MAX_CALLER_LOOKUP_HOPS} hops,
+ * with the same three guards as {@link resolveCaller}, and compares each
+ * ancestor's normalised statement key against this one's. The comparison is on
+ * the normalised key because that is the group's identity: two observations
+ * that would land in one group are one execution, and two that would not are
+ * not. It deliberately does **not** require the two spans to differ in
+ * `db.client` — the ORM's client and engine spans double-observe a statement
+ * under the *same* client, and requiring a difference would count those twice.
+ *
+ * ## Malformed ancestry keeps the span
+ *
+ * A chain that leads back to the span itself — a self-parent, or a cycle that
+ * includes it — answers `false` even if an equal-keyed ancestor was seen on the
+ * way, because in a cycle every member has an equal-keyed "ancestor" and
+ * dropping all of them would delete the statement from the result entirely.
+ * A parent that never arrived (the orphan case the correlator flags rather than
+ * drops) and a chain longer than the budget answer `false` too. Every one of
+ * those errs towards counting an execution twice rather than towards losing it:
+ * an inflated count is visible in the panel and a missing statement is not.
+ *
+ * @param event The statement execution being folded.
+ * @param statementKey Its own normalised statement key.
+ * @param spansBySpanId Every event by span id; see {@link indexSpans}.
+ * @param statementKeys Every statement key by span id; see
+ * {@link indexStatementKeys}.
+ */
+function hasDuplicateStatementAncestor(
+  event: TelemetryEvent,
+  statementKey: string,
+  spansBySpanId: ReadonlyMap<SpanId, TelemetryEvent>,
+  statementKeys: ReadonlyMap<SpanId, string>,
+): boolean {
+  const visited = new Set<SpanId>([event.spanId]);
+  let observed = false;
+  let nextSpanId = event.parentSpanId;
+
+  for (let hop = 0; hop < MAX_CALLER_LOOKUP_HOPS; hop += 1) {
+    if (nextSpanId === undefined) {
+      break;
+    }
+    if (nextSpanId === event.spanId) {
+      // The chain leads back to this span, so it has no outermost observation
+      // to be the inner of. Keep it, whatever was seen on the way up.
+      return false;
+    }
+    if (visited.has(nextSpanId)) {
+      break;
+    }
+    visited.add(nextSpanId);
+
+    const parent = spansBySpanId.get(nextSpanId);
+    if (parent === undefined) {
+      break;
+    }
+
+    // The first equal-keyed ancestor settles it, but the walk continues so
+    // that a cycle back to this span above that ancestor is still detected.
+    observed = observed || statementKeys.get(parent.spanId) === statementKey;
+    nextSpanId = parent.parentSpanId;
+  }
+
+  return observed;
 }
 
 /*
@@ -824,19 +1025,14 @@ function compareGroups(left: QueryGroup, right: QueryGroup): number {
  */
 
 /** A fresh accumulator for a statement seen for the first time. */
-function createGroup(
-  normalizedStatement: string,
-  rawStatement: string | undefined,
-): GroupAccumulator {
+function createGroup(normalizedStatement: string, rawStatement: string): GroupAccumulator {
   return {
     normalizedStatement,
     // The representative statement is the first occurrence's text exactly as
     // the producer sent it — already redacted and parameterized. A group keyed
-    // on the unknown label has no readable text to represent it.
-    statement:
-      normalizedStatement === UNKNOWN_STATEMENT_KEY
-        ? UNKNOWN_STATEMENT_KEY
-        : (rawStatement ?? UNKNOWN_STATEMENT_KEY),
+    // on the unknown label has no readable text to represent it: its reported
+    // text normalised to nothing, so there is nothing legible to show.
+    statement: normalizedStatement === UNKNOWN_STATEMENT_KEY ? UNKNOWN_STATEMENT_KEY : rawStatement,
     system: undefined,
     executionCount: 0,
     totalDuration: 0,
@@ -974,26 +1170,34 @@ function publishGroup(
  */
 
 /**
- * Groups a capture's database spans by normalised statement.
+ * Groups a capture's statement executions by normalised statement.
  *
  * Folds the events in one pass over the input (after one pass to index spans
- * for the caller walk), so the cost is linear in the capture and independent
- * of how the events are ordered. Nothing is inferred: the result says how
- * often each statement ran, how long it took and who ran it, and leaves every
- * conclusion to the analysis stage.
+ * for the two ancestor walks), so the cost is linear in the capture and
+ * independent of how the events are ordered. Nothing is inferred: the result
+ * says how often each statement ran, how long it took and who ran it, and
+ * leaves every conclusion to the analysis stage.
+ *
+ * Two database spans are deliberately not folded — a lifecycle span, which
+ * reports no statement, and the inner of two observations of one execution.
+ * The module overview states both rules, what each one is worth and why neither
+ * hides evidence: every database span still counts in
+ * `CaptureSummary.kindCounts['db.query']` and still contributes to
+ * `database_duration`.
  *
  * Bounds apply per group and cut sample lists only —
  * {@link QueryGroup.executionCount}, the durations, the error count and the row
  * total stay exact — and {@link QueryGroup.occurrencesTruncated} reports the
  * one cut a reader could otherwise mistake for the whole story.
  *
- * @param events Any slice of a capture's events, in any order. Non-database
- * kinds are ignored for grouping and still indexed, because they are the
- * ancestors the caller walk resolves against.
+ * @param events Any slice of a capture's events, in any order. Events that are
+ * not statement executions are ignored for grouping and still indexed, because
+ * they are the ancestors the caller walk resolves against and the spans the
+ * duplicate-observation walk compares.
  * @param options Per-group bounds; see {@link QueryAggregateOptions}.
  * @returns A new array in the base order documented on {@link compareGroups}.
- * Empty when the slice holds no database span. Never throws, and never mutates
- * the input.
+ * Empty when the slice holds no statement execution. Never throws, and never
+ * mutates the input.
  *
  * @example
  * ```ts
@@ -1016,16 +1220,27 @@ export function aggregateQueries(
   const maxCallers = resolveBound(options.maxCallersPerGroup, DEFAULT_MAX_CALLERS_PER_GROUP);
 
   const spansBySpanId = indexSpans(events);
+  const statementKeys = indexStatementKeys(spansBySpanId);
   const groups = new Map<string, GroupAccumulator>();
 
   for (const event of events) {
-    if (!QUERY_KIND_SET.has(event.kind)) {
+    const attributes = readAttributeBag(event);
+    const rawStatement = readNonEmptyString(attributes[DB_STATEMENT_KEY]);
+    // Lifecycle spans and non-database events alike: not executions, so not
+    // rows of this table. Their time is still the capture's database time —
+    // see the module overview.
+    if (rawStatement === undefined || !QUERY_KIND_SET.has(event.kind)) {
       continue;
     }
 
-    const attributes = readAttributeBag(event);
-    const rawStatement = readNonEmptyString(attributes[DB_STATEMENT_KEY]);
     const normalizedStatement = statementKeyFor(rawStatement);
+
+    // One execution two instrumentations both observed: keep the outermost
+    // observation, which is the one whose interval contains the whole
+    // execution, and skip this one before it can create a group.
+    if (hasDuplicateStatementAncestor(event, normalizedStatement, spansBySpanId, statementKeys)) {
+      continue;
+    }
 
     let group = groups.get(normalizedStatement);
     if (group === undefined) {

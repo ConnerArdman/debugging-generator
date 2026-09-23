@@ -10,17 +10,29 @@
  * EVERY FIGURE IS A FIELD, NEVER A CALCULATION
  * Each value printed here is one field of `InventorySummary` passed through
  * `formatQuantityLabel`, and nothing is added, subtracted or divided on the way to the screen.
- * The server computes every total under whichever location, selling state and movement filter
- * the reader chose, so a figure assembled here from two of them would be a second, quieter
- * answer to a question the database has already answered - and it would go wrong precisely when
- * a filter is applied. The one length taken in this file is `warehouses.length`, which counts
- * the very array it reports on.
+ * The server computes every total under whichever location and selling state the reader chose,
+ * and counts the units moved under whichever kind of recorded change they chose, so a figure
+ * assembled here from two of them would be a second, quieter answer to a question the database
+ * has already answered - and it would go wrong precisely when a filter is applied, because the
+ * filters do not all reach the same figures. The one length taken in this file is
+ * `warehouses.length`, which counts the very array it reports on. Two fields are read without
+ * being printed - `levels.total` and each figure's own value - and both are read as comparisons
+ * rather than as arithmetic: whether the filters matched any line at all, and whether a figure is
+ * nothing.
  *
  * WHAT THE COPY MAY CLAIM
  * The notes under the figures state what a figure *is*, never what it covers: the totals honour
  * an optional location filter this component is not told about, so a note promising a figure is
  * "across every location" would be false on a filtered dashboard. `lowStockCount` also counts
  * the lines inside the reader's own reorder cushion, which is why its note says "at or near".
+ * The stocking-locations figure is the one stated exception: it is the length of `warehouses`,
+ * the payload's unfiltered list of every location - the same list the page hands to its location
+ * filter - so a note calling it network-wide, and saying the filters leave it alone, states what
+ * the component can actually know, and is the only thing that explains a figure standing still
+ * beside four that moved.
+ * The same rule governs the status word beside the reorder figure: "Clear" is a claim about
+ * lines that were reported, so it is withheld when the filters matched none - a zero the reader
+ * filtered into existence is the absence of an answer, not a clean warehouse.
  *
  * WHAT IT DELIBERATELY DOES NOT OWN
  * Where the row sits and how wide it is, which arrive through `className` and are composed
@@ -39,7 +51,9 @@
  * values are what this row is, and five headings would insert a level into an outline this file
  * cannot see. `data-emphasis` on the figure's `<dd>` is what tints it, and it never carries
  * meaning alone: the `<dt>` states what the figure is, and the one card that is tinted also
- * carries a `Badge` whose word says the same thing in text.
+ * carries a `Badge` whose word says the same thing in text. `data-zero` sits on the same `<dd>`
+ * and prints a figure of nothing muted, so an empty result set cannot pass for a healthy one; the
+ * digit `0` is the fact, and the attribute only decides how loudly it is printed.
  *
  * THREE STATES, THREE COMPONENTS
  * The loaded row, the placeholder a route's `loading.tsx` reserves the same geometry with, and
@@ -120,6 +134,17 @@ interface InventoryKpiFigure {
    * only signal. Absent on a `neutral` card, because there is no state to name.
    */
   readonly status?: { readonly tone: 'success' | 'warning'; readonly label: string } | undefined;
+  /**
+   * Whether the figure is zero, which the stylesheet reads as `data-zero` to print it muted.
+   *
+   * A separate flag rather than a fourth `emphasis`, because it answers a different question: the
+   * emphasis says whether a figure is worth acting on, and this says whether there is a figure at
+   * all. Nothing counted and four and a half million counted are the same ink otherwise, which is
+   * how a filter that matched nothing comes to look like a healthy warehouse. It is derived from
+   * the payload's own number, not from the formatted string, so a locale that groups or signs
+   * digits differently cannot change what counts as nothing.
+   */
+  readonly zero: boolean;
   /** The optional note under the figure: what it counts, or how current it is. */
   readonly note?: string | undefined;
 }
@@ -207,12 +232,38 @@ export function InventoryKpiCards({ summary, referenceIso, className }: Props): 
    */
   const reorderNeeded = summary.lowStockCount > 0;
 
+  /*
+   * Whether the filters matched any stock line at all, which is what tells "nothing to reorder"
+   * apart from "nothing to report". The payload carries the page of lines these figures were
+   * computed over, and its `total` counts every line the filters matched, so the question is
+   * answered from the same answer the table below this row renders - never from a second read.
+   */
+  const matched = summary.levels.total > 0;
+
+  /*
+   * How the reorder figure reads, which is the one place in this row where the same number means
+   * different things. Lines to act on: attention, and the word beside it says so. No lines to act
+   * on, out of lines that were reported: that genuinely is all clear. No lines reported at all -
+   * the reader filtered to a selling state or a location nothing matched - and the figure is not
+   * good news, it is the absence of news: claiming "Clear" over an empty result set tells a
+   * warehouse everything is fine on the one screen that has nothing to say about it. That case
+   * takes the neutral tint and no status word, and the `zero` flag below prints it muted.
+   */
+  let reorder: Pick<InventoryKpiFigure, 'emphasis' | 'status'> = { emphasis: 'neutral' };
+
+  if (reorderNeeded) {
+    reorder = { emphasis: 'attention', status: { tone: 'warning', label: 'Attention' } };
+  } else if (matched) {
+    reorder = { emphasis: 'positive', status: { tone: 'success', label: 'Clear' } };
+  }
+
   const figures: readonly InventoryKpiFigure[] = [
     {
       id: 'on-hand',
       label: 'Units on hand',
       value: formatQuantityLabel(summary.totalOnHand),
       emphasis: 'neutral',
+      zero: summary.totalOnHand === 0,
       // The payload's own timestamp, which is what tells a reader whether they are looking at
       // this minute's figures or at a page left open over lunch.
       note: `Updated ${formatTimeAgoLabel(summary.generatedAt, referenceIso)}`,
@@ -222,16 +273,16 @@ export function InventoryKpiCards({ summary, referenceIso, className }: Props): 
       label: 'Units reserved',
       value: formatQuantityLabel(summary.totalReserved),
       emphasis: 'neutral',
+      zero: summary.totalReserved === 0,
       note: 'Already promised to open orders',
     },
     {
       id: 'low-stock',
       label: 'Lines to reorder',
       value: formatQuantityLabel(summary.lowStockCount),
-      emphasis: reorderNeeded ? 'attention' : 'positive',
-      status: reorderNeeded
-        ? { tone: 'warning', label: 'Attention' }
-        : { tone: 'success', label: 'Clear' },
+      emphasis: reorder.emphasis,
+      status: reorder.status,
+      zero: summary.lowStockCount === 0,
       note: 'Available units at or near the reorder point',
     },
     {
@@ -239,12 +290,21 @@ export function InventoryKpiCards({ summary, referenceIso, className }: Props): 
       label: 'Stocking locations',
       value: formatQuantityLabel(summary.warehouses.length),
       emphasis: 'neutral',
+      zero: summary.warehouses.length === 0,
+      // The one note here allowed to state its coverage, because this figure is the length of
+      // `warehouses` - the payload's list of every location, which the server fills whatever
+      // filter it was given, and which the page reuses to offer those locations as filters. It
+      // is therefore also the one figure the location filter does not move: it reads the same on
+      // a filtered dashboard as on an unfiltered one, beside totals that have narrowed, and
+      // without this line that stillness looks like a figure that failed to refresh.
+      note: 'Every location the network stocks from, whatever the filters',
     },
     {
       id: 'movement-volume',
       label: 'Units moved',
       value: formatQuantityLabel(summary.movementVolume),
       emphasis: 'neutral',
+      zero: summary.movementVolume === 0,
       // What the figure is, and nothing about what it covers: the payload is filtered by a
       // location, a selling state and a kind of change this component is not told about, so a
       // note naming the kinds counted - or calling them all - would be false on a filtered
@@ -259,7 +319,17 @@ export function InventoryKpiCards({ summary, referenceIso, className }: Props): 
         <Card key={figure.id} pad="sm" className={styles.card}>
           <dl className={styles.metric}>
             <dt className={styles.label}>{figure.label}</dt>
-            <dd className={styles.value} data-emphasis={figure.emphasis}>
+            {/*
+             * `data-zero` is written only when the figure is nothing, in the same form as the
+             * emphasis attribute beside it, so a card that reports a quantity carries no marker
+             * at all. The stylesheet mutes a zero that is merely current; a zero the row has
+             * something to say about keeps the tint its emphasis gives it.
+             */}
+            <dd
+              className={styles.value}
+              data-emphasis={figure.emphasis}
+              data-zero={figure.zero ? 'true' : undefined}
+            >
               {figure.value}
             </dd>
             {/*

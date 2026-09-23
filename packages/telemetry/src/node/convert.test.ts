@@ -108,6 +108,7 @@ import type { TelemetryKind, TelemetryStatus, TelemetryTier } from '../schema/ki
 import { PRODUCER_ID, TRACER_NAME } from './config.js';
 import {
   ATTRIBUTE_KEY_TRANSLATIONS,
+  classifyDatabaseSource,
   classifySpan,
   createSeqAllocator,
   DB_CLIENT_VALUES,
@@ -1944,6 +1945,95 @@ describe('spanToIngressEvent: attributes', () => {
     expect(Object.keys(event.attributes)).not.toContain('db.operation');
     expect(event.attributes['db.client']).toBe(DB_CLIENT_VALUES.orm);
   });
+
+  it.each([
+    {
+      label: "the driver's direct connection acquisition",
+      scope: DB_INSTRUMENTATION_SCOPES.driver,
+      name: DB_SPAN_NAME_PREFIXES.driverConnect,
+      client: DB_CLIENT_VALUES.driver,
+      operation: 'connect',
+    },
+    {
+      label: "the driver's pooled connection acquisition",
+      scope: DB_INSTRUMENTATION_SCOPES.driver,
+      name: DB_SPAN_NAME_PREFIXES.driverPoolConnect,
+      client: DB_CLIENT_VALUES.driver,
+      operation: 'connect',
+    },
+    {
+      label: "the ORM's serialize step",
+      scope: DB_INSTRUMENTATION_SCOPES.orm,
+      name: `${DB_SPAN_NAME_PREFIXES.orm}client:serialize`,
+      client: DB_CLIENT_VALUES.orm,
+      operation: 'serialize',
+    },
+    {
+      label: "the ORM engine's bare transaction span",
+      scope: DB_INSTRUMENTATION_SCOPES.orm,
+      name: 'start_transaction',
+      client: DB_CLIENT_VALUES.orm,
+      operation: 'start_transaction',
+    },
+  ])(
+    'names the operation of $label, which reports no statement',
+    ({
+      scope,
+      name,
+      client,
+      operation,
+    }: {
+      scope: string;
+      name: string;
+      client: string;
+      operation: string;
+    }) => {
+      // Both instrumentations span their own lifecycle work, and none of those
+      // spans carries a `db.statement`: the driver's two connection
+      // acquisitions carry no operation either, and the engine's transaction
+      // spans name one without a separator to parse it out of. Every one of
+      // them still has to say *what* it was, because a database span with
+      // neither a statement nor an operation is indistinguishable from a
+      // statement whose text the producer failed to report — and
+      // `../aggregate/queries.ts` counts statement executions, not database
+      // spans, on exactly that distinction.
+      const span = dbQuerySpan({
+        scope: { name: scope },
+        name,
+        attributes: { 'db.system': DB_SYSTEM, 'db.name': DB_NAME },
+      });
+      const event = convertOk(span);
+
+      // Still a database span on the database tier: the time was spent in the
+      // database tier and the waterfall needs the node, so nothing is dropped
+      // in the producer.
+      expect(classifySpan(span)).toEqual({ kind: 'db.query', tier: 'db' });
+      expect(event.kind).toBe('db.query');
+      expect(event.tier).toBe('db');
+      expect(event.attributes['db.client']).toBe(client);
+      expect(event.attributes['db.operation']).toBe(operation);
+      expect(Object.keys(event.attributes)).not.toContain('db.statement');
+    },
+  );
+
+  it.each(Object.values(DB_SPAN_NAME_PREFIXES))(
+    'attributes the %s span-name prefix to a producing client',
+    (prefix: string) => {
+      // The table is the module's whole vocabulary of database span names, and
+      // two functions read it: one decides the span is database work, the
+      // other which library reported it. Driving every value through both is
+      // what stops a prefix being added to the table and honoured by only one
+      // of them — which would classify a span as `db.query` and leave its
+      // `db.client` empty, the attribute the aggregates use to tell two
+      // observations of one statement apart.
+      const span = makeSpan({ name: `${prefix}sample` });
+      const source = classifyDatabaseSource(span);
+
+      expect(classifySpan(span)).toEqual({ kind: 'db.query', tier: 'db' });
+      expect(source).not.toBeNull();
+      expect(stringAttribute(convertOk(span), 'db.client')).toBe(source);
+    },
+  );
 
   it('describes a failure from the exception it recorded', () => {
     const event = convertOk(serverErrorSpan());

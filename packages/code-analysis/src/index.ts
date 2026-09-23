@@ -136,17 +136,29 @@
 
 // ---------------------------------------------------------------------------
 // project — the one construction site for the ts-morph `Project`, and the
-// module that guarantees the indexer never reads a developer's `.env*` file
+// module that guarantees the indexer never reads a developer's `.env*` file.
+// `findWorkspaceRoot` is published beside it because a consumer that wants a
+// fact about a monorepo member's root — the dev-server launcher deciding which
+// package manager to form a relaunch command with (AAP 0.7.1 Group 2) — needs
+// the same membership-checked lookup `summarizeProject` performs internally,
+// and must not re-derive it by walking upwards to the nearest lockfile.
 // ---------------------------------------------------------------------------
 export {
   EXCLUDED_DIRECTORY_NAMES,
   INDEXABLE_EXTENSIONS,
+  findWorkspaceRoot,
   isEnvFilePath,
   isIndexableFile,
   openProject,
   shouldExcludePath,
 } from './project.js';
-export type { LoadedProject, OpenProjectOptions } from './project.js';
+export type {
+  FindWorkspaceRootOptions,
+  LoadedProject,
+  OpenProjectOptions,
+  WorkspaceDeclarationKind,
+  WorkspaceRoot,
+} from './project.js';
 
 // ---------------------------------------------------------------------------
 // graph/types — the single vocabulary of the code graph: node and edge kinds,
@@ -346,6 +358,7 @@ export type {
   ProjectSummaryLimits,
   SummarizeProjectInput,
   TargetManifest,
+  WorkspacePackageManagerFallback,
 } from './summary.js';
 
 // ---------------------------------------------------------------------------

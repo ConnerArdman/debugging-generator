@@ -623,6 +623,28 @@ interface ResolvedTarget {
 }
 
 /**
+ * What one call site's `calls` edge points at: the node kind that stands for
+ * the callee, and enough to derive that node's id.
+ *
+ * Two variants, because two extractors inventory the declarations a call can
+ * reach and the edge has to name whichever one holds the callee:
+ *
+ * - `'server-function'` — an exported function of a qualifying server module,
+ *   which is the node *this* extractor emits, cross-file or same-file;
+ * - `'symbol'` — any other module-level declaration this module makes, which
+ *   is the node `./symbols.ts` emits for it. A module-private helper is the
+ *   ordinary case: an exported entry point that delegates its work to one has
+ *   no outgoing edge at all without this variant, and
+ *   `../graph/query.ts`'s `pathBetween` consequently cannot get from a route
+ *   handler to the database call the handler ultimately makes — the linkage
+ *   AAP 0.4.2 puts in front of the investigation stage. The edge kind table on
+ *   `CODE_EDGE_KINDS` sanctions it directly (`calls` may end at a `symbol`).
+ */
+type CallEdgeTarget =
+  | { readonly kind: 'server-function'; readonly target: ResolvedTarget }
+  | { readonly kind: 'symbol'; readonly nodeId: string };
+
+/**
  * The enclosing function of a call site, reduced to what the cascade asks about
  * it.
  *
@@ -2903,7 +2925,10 @@ function callsEdges(
     }
 
     const from = ownerNodeIdFor(scope, node);
-    const to = serverFunctionNodeId(target.file, target.fn);
+    const to =
+      target.kind === 'server-function'
+        ? serverFunctionNodeId(target.target.file, target.target.fn)
+        : target.nodeId;
     const site = positionOf(node);
     const id = makeEdgeId({ kind: 'calls', from, to, line: site.line, column: site.column });
 
@@ -2927,14 +2952,32 @@ function callsEdges(
 }
 
 /**
- * The `server-function` one call expression reaches, or `undefined` when it
- * reaches none this extractor emits a node for.
+ * The node one call expression reaches, or `undefined` when it reaches none any
+ * extractor emits a node for.
  *
  * The callee must be a plain identifier. A property-access callee
  * (`lib.load()`, `this.load()`) is a value question rather than a syntactic
  * one, and resolving it would need the type checker this package deliberately
  * does not run at index time; a database driver call is precisely that shape
  * and belongs to the data-access extractor anyway.
+ *
+ * Resolution order for an identifier any enclosing scope declares — which is
+ * never an imported binding, whatever this module imports under the same
+ * spelling:
+ *
+ * 1. an **exported function of this server module** → its `server-function`
+ *    node, the most specific answer and the one this extractor owns;
+ * 2. otherwise any **module-level declaration of this module** that holds a
+ *    function → its `symbol` node (see {@link localDeclarationTarget}). This is
+ *    the hop that makes a delegating entry point traversable: an exported
+ *    function whose whole body is `return attempt(input)`, or a route handler
+ *    that calls a helper declared beside it, would otherwise have no outgoing
+ *    edge at all and every path through it would stop dead;
+ * 3. otherwise nothing — a parameter, a local inside another function, a class,
+ *    a destructured binding or a non-function declaration. Each of those either
+ *    has no node to point at or is not a function call this module can vouch
+ *    for, and an edge into a node nobody emits is one `../graph/graph.ts` drops
+ *    as `dangling-edge`.
  *
  * @param ctx The file being visited and the project it belongs to.
  * @param cache The per-call memoisation.
@@ -2947,7 +2990,7 @@ function callTargetOf(
   cache: AnalysisCache,
   scope: OwnerScope,
   call: CallExpression,
-): ResolvedTarget | undefined {
+): CallEdgeTarget | undefined {
   const callee = call.getExpression();
   if (!Node.isIdentifier(callee)) {
     return undefined;
@@ -2958,14 +3001,14 @@ function callTargetOf(
     return undefined;
   }
 
-  // A name any enclosing scope declares is not an imported binding, whatever
-  // this module imports under the same spelling. Where that declaration is one
-  // of this server module's own exported functions, the call is a same-file
-  // hop worth an edge; where it is a local helper, a parameter or a
-  // non-function, it is not.
   const local = declarationInScopes(call, name);
   if (local !== undefined) {
-    return scope.isServerModule ? sameFileTarget(scope, local) : undefined;
+    const exportedTarget = scope.isServerModule ? sameFileTarget(scope, local) : undefined;
+    if (exportedTarget !== undefined) {
+      return Object.freeze({ kind: 'server-function' as const, target: exportedTarget });
+    }
+
+    return localDeclarationTarget(scope, local);
   }
 
   const binding = scope.imports.get(name);
@@ -2978,7 +3021,11 @@ function callTargetOf(
     return undefined;
   }
 
-  return findServerFunction(ctx, cache, module, binding.exportName, 0, new Set<string>());
+  const imported = findServerFunction(ctx, cache, module, binding.exportName, 0, new Set<string>());
+
+  return imported === undefined
+    ? undefined
+    : Object.freeze({ kind: 'server-function' as const, target: imported });
 }
 
 /**
@@ -2997,6 +3044,76 @@ function sameFileTarget(scope: OwnerScope, declaration: Node): ResolvedTarget | 
   }
 
   return undefined;
+}
+
+/**
+ * The `symbol` node of a module-level declaration of this module, when the
+ * declaration is one `./symbols.ts` records *and* holds a function.
+ *
+ * Both conditions are load-bearing, and both are refusals in the safe
+ * direction:
+ *
+ * - **module-level.** `./symbols.ts` inventories the module's own statements
+ *   and class members and nothing nested inside a function body, so a helper
+ *   declared inside another function has no node for an edge to point at. The
+ *   position this derives the id from is the **name identifier's**, which is
+ *   the anchor that module records — an overload signature therefore resolves
+ *   to its own node rather than to the implementation's, and either is a real
+ *   declaration site of the callee.
+ * - **function-valued.** A call reaches a function. A declaration initialised
+ *   from an object literal, a construction or another call is not one this
+ *   extractor claims a call edge into, because `attempt()` on such a binding is
+ *   either a different relationship or not a call at all. The check is
+ *   syntactic ({@link assignedFunctionOf} without wrapper-call unwrapping), so
+ *   no type information is needed and no value is evaluated.
+ *
+ * A class declaration and a destructured declarator are both refused: neither
+ * is a directly written function, and a bare `Klass()` call is not a shape a
+ * supported project runs.
+ *
+ * @param scope The file under extraction.
+ * @param declaration The declaration the callee resolved to.
+ * @returns The `symbol` target, or `undefined` when no such node exists.
+ */
+function localDeclarationTarget(scope: OwnerScope, declaration: Node): CallEdgeTarget | undefined {
+  if (Node.isFunctionDeclaration(declaration)) {
+    const nameNode = declaration.getNameNode();
+    const name = nameNode === undefined ? undefined : nonEmptyText(nameNode);
+
+    if (nameNode === undefined || name === undefined || !isModuleLevel(declaration)) {
+      return undefined;
+    }
+
+    return Object.freeze({
+      kind: 'symbol' as const,
+      nodeId: symbolNodeId(scope.file, name, positionOf(nameNode)),
+    });
+  }
+
+  if (!Node.isVariableDeclaration(declaration)) {
+    return undefined;
+  }
+
+  const statement = declaration.getVariableStatement();
+  const nameNode = declaration.getNameNode();
+  if (statement === undefined || !isModuleLevel(statement) || !Node.isIdentifier(nameNode)) {
+    return undefined;
+  }
+
+  const name = nonEmptyText(nameNode);
+  const initializer = declaration.getInitializer();
+  if (
+    name === undefined ||
+    initializer === undefined ||
+    assignedFunctionOf(initializer, false) === undefined
+  ) {
+    return undefined;
+  }
+
+  return Object.freeze({
+    kind: 'symbol' as const,
+    nodeId: symbolNodeId(scope.file, name, positionOf(nameNode)),
+  });
 }
 
 /* -------------------------------------------------------------------------------------------------

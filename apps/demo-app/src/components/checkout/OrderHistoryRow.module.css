@@ -7,29 +7,42 @@
  * belongs to `../ui/Price`. This file places those parts on one grid and owns the row's own
  * hover and focus affordance - nothing more.
  *
- * The orders page lists hundreds of rows, so the grid is deliberately rigid: four tracks, only
- * the first of them flexible, tabular numerals in every numeric cell and a monospace order
- * reference. The three trailing tracks are sized from the spacing scale rather than from their
- * contents, because every row is its own grid container: an `auto` track would resolve to that
- * row's own badge word, item count and money string, and the column edges would then wander by
- * tens of pixels from row to row and match no header strip. Fixed tracks are what make a column
- * edge drawn at the top of the page the same edge at the bottom.
+ * The orders page lists hundreds of rows, so the grid is deliberately uniform: four tracks whose
+ * widths are a function of the container and of nothing else, tabular numerals in every numeric
+ * cell and a monospace order reference. No track is sized from its contents, because every row is
+ * its own grid container: an `auto` or `max-content` track would resolve to that row's own badge
+ * word, item count and money string, and the column edges would then wander by tens of pixels
+ * from row to row and match no header strip. A track measured from the container is what makes a
+ * column edge drawn at the top of the page the same edge at the bottom.
+ *
+ * WHY THE FOUR TRACKS SHARE THE ROW RATHER THAN CROWDING ITS END
+ * Each track is `minmax(<floor>, <fraction>)`, so the four of them divide the row 2:1:1:1 and the
+ * floors below are minimums rather than widths. Three fixed trailing tracks were the arrangement
+ * before, and on a full-width page they left the whole surplus - some 680px of it at a 1136px
+ * row - inside the first track as an empty band between the order reference and its status, with
+ * the three values huddled against the right edge. Dividing the surplus instead spreads the four
+ * columns across the row, which is how the reader scans one order as a single line rather than as
+ * two distant clusters. The fractions still resolve identically for the header strip and for
+ * every row, because both are laid out in boxes of the same width, so the alignment contract
+ * below is untouched by the change.
  *
  * Alignment contract with `OrderHistoryList.module.css`, whose `.columns` header strip (order,
  * status, items, total) states the same template:
  *
  *     grid-template-columns:
- *       minmax(0, 1fr)
- *       var(--order-row-status-track, calc(var(--ls-space-6, 32px) * 3))
- *       var(--order-row-items-track, calc(var(--ls-space-6, 32px) * 2.5))
- *       var(--order-row-total-track, calc(var(--ls-space-6, 32px) * 4));
+ *       minmax(0, 2fr)
+ *       minmax(var(--order-row-status-track, calc(var(--ls-space-6, 32px) * 3)), 1fr)
+ *       minmax(var(--order-row-items-track, calc(var(--ls-space-6, 32px) * 2.5)), 1fr)
+ *       minmax(var(--order-row-total-track, calc(var(--ls-space-6, 32px) * 4)), 1fr);
  *     column-gap: var(--ls-space-3, 12px);
  *
  * The three custom properties are the seam: a container may declare them once - custom properties
  * inherit, and CSS Modules leaves their names untouched - and the strip and every row then read
- * the same widths without either file hardcoding them twice. The defaults above are 96px, 80px
+ * the same minimums without either file hardcoding them twice. The defaults above are 96px, 80px
  * and 128px, each comfortably wider than the content it holds (the longest status chip, a
- * two-digit item count, a seven-figure currency amount), so nothing spills into the gap.
+ * two-digit item count, a seven-figure currency amount), so nothing spills into the gap even in a
+ * container too narrow for the fractions to reach those figures - the grid freezes a track at its
+ * floor and divides what is left among the rest.
  *
  * The two numeric cells are end-aligned, so their header labels are end-aligned too, and the
  * strip hides itself in the same container query that collapses this row.
@@ -43,13 +56,14 @@
 .root {
   display: grid;
   grid-template-columns:
-    minmax(0, 1fr)
-    var(--order-row-status-track, calc(var(--ls-space-6, 32px) * 3))
-    var(--order-row-items-track, calc(var(--ls-space-6, 32px) * 2.5))
-    var(--order-row-total-track, calc(var(--ls-space-6, 32px) * 4));
+    minmax(0, 2fr)
+    minmax(var(--order-row-status-track, calc(var(--ls-space-6, 32px) * 3)), 1fr)
+    minmax(var(--order-row-items-track, calc(var(--ls-space-6, 32px) * 2.5)), 1fr)
+    minmax(var(--order-row-total-track, calc(var(--ls-space-6, 32px) * 4)), 1fr);
   align-items: center;
   /* The column gap is the half of the contract the header strip has to repeat. The row gap only
-   * ever applies when the anchor occupies a line of its own, so it is the tighter step. */
+   * ever applies in the stacked arrangement at the end of this file, where the cells occupy two
+   * lines, so it is the tighter step. */
   column-gap: var(--ls-space-3, 12px);
   row-gap: var(--ls-space-2, 8px);
   padding: var(--ls-space-2, 8px) var(--ls-space-3, 12px);
@@ -107,6 +121,16 @@
   text-align: end;
 }
 
+/*
+ * The word beside the item count - "7 items" - which exists only for the stacked arrangement at
+ * the end of this file. While the header strip is on screen the column is headed "Items" and the
+ * figure needs no unit of its own, so the span is removed from the layout entirely rather than
+ * merely hidden: a unit here would widen the narrowest of the four tracks for no reader.
+ */
+.itemsUnit {
+  display: none;
+}
+
 /* Alignment only: `../ui/Price` owns the money typography variants. The family and the figure
  * mode are restated here so the totals form a straight right edge even when a row renders the
  * amount as plain text. */
@@ -119,59 +143,20 @@
   text-align: end;
 }
 
-/* The row's anchor. It sits in the flexible first track on a line of its own when the component
- * renders it as a direct child of the row, and is inert grid placement when the component nests
- * it inside `.identity` instead - either way it stays out of the three trailing tracks, so the
- * anchor's label can never widen a column and break the alignment with the header strip.
+/*
+ * The whole-row tint under the pointer. It is a reading aid rather than an affordance, and that
+ * distinction is why it is the only state this row has: the row holds no control, so there is
+ * nothing here to focus and no `:focus-within` ring to draw. Four values spread across a
+ * page-wide row are read by travelling along it, and a tinted band is what keeps the eye on the
+ * order it started on - the same job the zebra tint does in a dense table.
  *
- * Colour: the link accent for this row is #0f766e, which `app/globals.css` declares as
- * `--ls-teal` and exposes semantically as `--ls-focus` (5.5:1 on the page surface). It is read
- * through that token rather than through `--ls-accent`, because `--ls-accent` is bound to the
- * brand amber there and that stylesheet reserves it for fills and decorative accents - never for
- * text on a light surface, where it measures 2.15:1. */
-.link {
-  grid-row: 2;
-  grid-column: 1;
-  justify-self: start;
-  max-width: 100%;
-  padding-block: var(--ls-space-1, 4px);
-  color: var(--ls-focus, #0f766e);
-  font-size: var(--ls-text-sm, 13px);
-  text-decoration: none;
-}
-
-/* BLITZY [A11Y]: the anchor is a compact inline target roughly 21px tall, below the 44x44px
- * touch-target recommendation, because the design for this view is a dense data row repeated
- * hundreds of times. It is implemented at the designed size rather than silently enlarged; the
- * padded row around it carries the visible hover affordance, and the row's focus ring below marks
- * the anchor when it is reached from the keyboard. Flagged for design review. */
-
-/* Hover lives behind a hover-capable-pointer query so a tap on a touch device does not leave a
- * row looking permanently active. */
+ * It lives behind a hover-capable-pointer query so a tap on a touch device does not leave a row
+ * looking permanently picked out.
+ */
 @media (hover: hover) {
   .root:hover {
     background-color: var(--ls-surface-sunken, #f8fafc);
   }
-
-  .link:hover {
-    text-decoration: underline;
-    text-underline-offset: calc(var(--ls-space-1, 4px) / 2);
-  }
-}
-
-/* One indicator for the whole row, drawn when its anchor takes focus. The outline is inset by
- * half its own width so it stays inside the row box instead of overlapping the hairline the list
- * draws between rows. */
-.root:focus-within {
-  outline: calc(var(--ls-space-1, 4px) / 2) solid var(--ls-focus, #0f766e);
-  outline-offset: calc(var(--ls-space-1, 4px) * -0.5);
-  background-color: var(--ls-surface-sunken, #f8fafc);
-}
-
-/* The anchor deliberately shows no ring of its own: `app/globals.css` gives every focusable
- * element one, and keeping it here would draw a second ring inside the row's. */
-.link:focus-visible {
-  outline: none;
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -192,10 +177,19 @@
  * token. The header strip hides itself at this same width, because a stacked row has no columns
  * left to label.
  *
- * Two columns: the order identity beside its status, then the item count beside the total, with
- * the anchor on its own line. The second track keeps the widest of the two fixed widths above, so
- * the chip and the amount stay on one straight right edge, and everything else lives in the
- * flexible first track - nothing overflows however narrow the container becomes. */
+ * Two columns and two lines: the order identity beside its status, then the item count beside the
+ * total. The second track is fixed at the widest of the three minimums above rather than divided
+ * as a fraction, because there are only two tracks left and no surplus to spread: a fixed width
+ * is what keeps the chip and the amount on one straight right edge down the whole list, while
+ * everything else lives in the flexible first track - nothing overflows however narrow the
+ * container becomes.
+ *
+ * The item count is the one cell that changes what it says here rather than only where it sits.
+ * It moves to the start of the second line, directly beneath the date, and the strip that headed
+ * it "Items" is gone - so it reveals its own unit and reads "7 items" instead of leaving a bare
+ * integer under a date, which is easily taken for part of it. `inline` rather than
+ * `inline-block`: the unit is a word in the middle of the cell's own line, and it wraps with the
+ * figure. */
 @container (max-width: calc(2rem * 16)) {
   .root {
     grid-template-columns:
@@ -214,12 +208,12 @@
     text-align: start;
   }
 
+  .itemsUnit {
+    display: inline;
+  }
+
   .totalCell {
     grid-row: 2;
     grid-column: 2;
-  }
-
-  .link {
-    grid-row: 3;
   }
 }

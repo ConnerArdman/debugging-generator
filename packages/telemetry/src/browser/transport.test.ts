@@ -31,12 +31,27 @@
  * - {@link MAX_CONTROL_TEXT_LENGTH} (2 048) — the per-field bound on the
  *   page-controlled text a control frame carries.
  *
+ * **And the inbound channel's authentication**, which is the other thing this
+ * module owns alone: the page↔bridge handshake. `describe('the bridge
+ * handshake')` covers the five properties the guard rests on — a frame with no
+ * `token` is not accepted, nor is one whose token is the right length and the
+ * wrong value, nor one at the previous {@link CHANNEL_VERSION}; the token the
+ * module discloses *is* accepted, and still is after a
+ * {@link resetTransport} and a fresh {@link subscribe} (the disarm→re-arm path
+ * of a second capture on one document); exactly one
+ * {@link HANDSHAKE_REQUEST_EVENT} is ever answered; a module instance whose
+ * disclosure nobody joined accepts nothing a caller can construct; and the
+ * token never reaches a subscriber. Without those cases a page script could
+ * arm, reconfigure or silently tear down a capture by posting a frame to its
+ * own window, which is what the five structural checks alone allowed.
+ *
  * No other suite in the repository reaches any of them: the sibling browser
  * suites drive producers (`./continuation.test.ts`, `./dom-target.test.ts`,
  * `./react.test.tsx`) and `../node/control.test.ts` drives the capture gate, so
  * a regression in the backpressure rules — a queue that shifts its whole array
- * per event, an inline drain on a click handler, a frame posted unmeasured —
- * would otherwise reach a developer's page before it reached a test.
+ * per event, an inline drain on a click handler, a frame posted unmeasured — or
+ * in the handshake would otherwise reach a developer's page before it reached a
+ * test.
  *
  * ## Techniques, and why each one is the way it is
  *
@@ -56,6 +71,20 @@
  * { …, source: window }))` — through the same listener the real bridge reaches,
  * with the same guard applied. The listener exists only while something is
  * subscribed, so every case subscribes first and unsubscribes in teardown.
+ *
+ * **The handshake token is captured once, at module scope.** Every inbound
+ * frame now has to carry it (see {@link announceBridge}), and the module
+ * discloses it at most twice per document: unsolicited, the instant the first
+ * {@link subscribe} mints it, and once in answer to the first request. This
+ * file takes the first of those, by registering a {@link HANDSHAKE_OFFER_EVENT}
+ * listener at module scope — before any `subscribe()` runs, which is the
+ * bridge-injected-first order — and latching what it hears. One capture serves
+ * the whole file, because the token is document-scoped and survives the
+ * {@link resetTransport} each case runs; the two cases that need a *fresh*
+ * handshake take a fresh module instance instead (`vi.resetModules()` and a
+ * dynamic `import()`, which this module supports because it has no import-time
+ * side effects), so neither of them consumes the single request-answer the
+ * rest of the file's token came from.
  *
  * **The scheduled drain is waited for, never assumed.** The module hands a
  * scheduled drain to a `MessageChannel` message, and in this host that is
@@ -102,6 +131,8 @@ import {
   emitMany,
   flush,
   getTransportStats,
+  HANDSHAKE_OFFER_EVENT,
+  HANDSHAKE_REQUEST_EVENT,
   MAX_BATCHES_PER_DRAIN,
   MAX_BUFFERED_EVENTS,
   MAX_CONTROL_TEXT_LENGTH,
@@ -111,7 +142,12 @@ import {
   resetTransport,
   subscribe,
 } from './transport.js';
-import type { AgentOutboundMessage, AgentOutboundType, EventDraft } from './transport.js';
+import type {
+  AgentOutboundMessage,
+  AgentOutboundType,
+  BridgeInboundMessage,
+  EventDraft,
+} from './transport.js';
 
 /*
  * ---------------------------------------------------------------------------
@@ -316,28 +352,116 @@ function refuseFrames(): void {
  */
 
 /**
- * Deliver one frame from the bridge, through the module's own guard.
+ * The token the module disclosed for this document, or `undefined` before the
+ * first {@link subscribe} has minted one.
+ *
+ * Latched rather than overwritten: two cases create a fresh module instance,
+ * whose own offer must not replace the token the rest of the file posts with.
+ */
+let offeredToken: string | undefined;
+
+/**
+ * The token a {@link HANDSHAKE_OFFER_EVENT} carries, or `undefined` when the
+ * event's `detail` is not the bare non-empty string the channel specifies.
+ *
+ * Read through `unknown` on purpose: `detail` is typed by whoever constructed
+ * the event, and a case that asserted on it without narrowing could not tell a
+ * missing disclosure from a malformed one.
+ *
+ * @param event The dispatched offer.
+ * @returns The token, or `undefined`.
+ */
+function offerDetail(event: Event): string | undefined {
+  const detail: unknown = (event as CustomEvent<unknown>).detail;
+  return typeof detail === 'string' && detail.length > 0 ? detail : undefined;
+}
+
+/*
+ * The one module-scope side effect in this file, and it is required rather than
+ * convenient: the module's unsolicited offer is dispatched inside the first
+ * `subscribe()`, which `beforeEach` performs, so a listener registered any
+ * later would have missed it. Registering here is also the order the real
+ * extension produces — the bridge's listener exists before it asks — which is
+ * what makes this file's token the one a bridge would hold.
+ */
+window.addEventListener(HANDSHAKE_OFFER_EVENT, (event: Event) => {
+  offeredToken ??= offerDetail(event);
+});
+
+/**
+ * The token every inbound frame must carry, failing loudly when there is none.
+ *
+ * A missing token is not something a case should be able to pass around as
+ * `undefined`: the frame would then be rejected for the very reason the case is
+ * trying to assert about, and the failure would read as a guard bug rather than
+ * as a handshake that never happened.
+ *
+ * @returns The disclosed token.
+ */
+function issuedToken(): string {
+  if (offeredToken === undefined) {
+    throw new Error('the transport disclosed no handshake token');
+  }
+  return offeredToken;
+}
+
+/**
+ * A token of exactly the issued token's length and a different value.
+ *
+ * The first character is flipped between two hex digits, so the result is the
+ * same width, the same alphabet and never equal — which is what makes the
+ * rejection attributable to the comparison rather than to the length check
+ * that precedes it.
+ *
+ * @param token The issued token.
+ * @returns A wrong token of the same length.
+ */
+function alteredToken(token: string): string {
+  return `${token.startsWith('0') ? '1' : '0'}${token.slice(1)}`;
+}
+
+/**
+ * Deliver one constructed `message` event to the module's listener.
  *
  * `source: window` is the load-bearing part: the guard drops any frame that did
  * not come from this window, and happy-dom's `window.postMessage` does not set
  * the field at all, so a constructed event is the only way to reach the
  * listener in this host.
  *
- * @param type The inbound frame type.
+ * The frame is passed as a whole record rather than assembled here, so the
+ * handshake cases can deliver one with a wrong `token`, with none at all, or at
+ * the wrong version — every shape a page script can post.
+ *
+ * @param data The frame, exactly as it will arrive.
  */
-function announceBridge(type: 'bridge.ready' | 'bridge.gone'): void {
+function deliverFrame(data: Record<string, unknown>): void {
   window.dispatchEvent(
     new MessageEvent('message', {
-      data: {
-        source: BRIDGE_SOURCE_TAG,
-        version: CHANNEL_VERSION,
-        type,
-        payload: {},
-      },
+      data,
       origin: window.location.origin,
       source: window,
     }),
   );
+}
+
+/**
+ * Deliver one well-formed frame from the bridge, through the module's own
+ * guard.
+ *
+ * Carries the handshake token, because that is what the bridge does: a frame
+ * without it is dropped, and the cases in this file that are about the queue
+ * and the bounds are entitled to a channel that works.
+ *
+ * @param type The inbound frame type.
+ */
+function announceBridge(type: 'bridge.ready' | 'bridge.gone'): void {
+  deliverFrame({
+    source: BRIDGE_SOURCE_TAG,
+    version: CHANNEL_VERSION,
+    type,
+    token: issuedToken(),
+    payload: {},
+  });
 }
 
 /*
@@ -1203,5 +1327,302 @@ describe('a capture change', () => {
     expect(batch.droppedCount).toBe(0);
     expect(deliveredSeqs()).toEqual([0, 1]);
     expect(getTransportStats().dropped).toBe(abandoned);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The handshake
+ *
+ * The inbound channel's authentication. Every case below posts a frame the way
+ * a page script would — to its own window, on its own origin, with the
+ * published source tag and a known frame type — and the only thing that
+ * separates an accepted frame from a dropped one is the token.
+ * ---------------------------------------------------------------------------
+ */
+
+/** Every {@link HANDSHAKE_OFFER_EVENT} dispatched while a collector is live. */
+interface OfferCollector {
+  /** The tokens disclosed so far, in dispatch order. */
+  readonly tokens: readonly string[];
+  /** Stop collecting. Idempotent, and called from a `finally`. */
+  readonly stop: () => void;
+}
+
+/**
+ * Collect the offers dispatched from now until {@link OfferCollector.stop}.
+ *
+ * Separate from the module-scope latch, which keeps only the first offer: a
+ * case that drives a fresh module instance needs that instance's disclosures,
+ * and needs them counted rather than latched.
+ *
+ * @returns The collector.
+ */
+function collectOffers(): OfferCollector {
+  const tokens: string[] = [];
+  const listener = (event: Event): void => {
+    const token = offerDetail(event);
+    if (token !== undefined) {
+      tokens.push(token);
+    }
+  };
+
+  window.addEventListener(HANDSHAKE_OFFER_EVENT, listener);
+  return {
+    tokens,
+    stop: (): void => {
+      window.removeEventListener(HANDSHAKE_OFFER_EVENT, listener);
+    },
+  };
+}
+
+/**
+ * A fresh evaluation of the module under test, with a handshake of its own.
+ *
+ * The token and the answered-a-request latch are document-scoped and cleared by
+ * nothing — that is the lifetime a second capture on one document depends
+ * on — so a case that needs an *unspent* handshake cannot get one by resetting.
+ * A fresh instance is the only way, and this module supports it because it has
+ * no import-time side effects: the new evaluation installs nothing until it is
+ * subscribed to.
+ *
+ * @returns The fresh module namespace.
+ */
+async function freshTransport(): Promise<typeof import('./transport.js')> {
+  vi.resetModules();
+  return import('./transport.js');
+}
+
+describe('the bridge handshake', () => {
+  /** Frames the module accepted in the current case, in order. */
+  let accepted: BridgeInboundMessage[] = [];
+
+  /** The case's recording subscription. */
+  let stopRecording: (() => void) | undefined;
+
+  beforeEach(() => {
+    accepted = [];
+    stopRecording = subscribe((message) => {
+      accepted.push(message);
+    });
+  });
+
+  afterEach(() => {
+    stopRecording?.();
+    stopRecording = undefined;
+  });
+
+  it('drops a frame that carries no token', () => {
+    interceptFrames();
+    emitRange(1);
+
+    deliverFrame({
+      source: BRIDGE_SOURCE_TAG,
+      version: CHANNEL_VERSION,
+      type: 'bridge.ready',
+      payload: {},
+    });
+
+    // Dropped in the same silence as any other malformed frame: no subscriber
+    // notified, the bridge still considered absent, and the queued event still
+    // queued — a page script cannot even make the agent flush.
+    expect(accepted).toEqual([]);
+    expect(frames).toEqual([]);
+    expect(getTransportStats()).toMatchObject({ buffered: 1, sent: 0, bridgeReady: false });
+  });
+
+  it('drops a frame whose token is the right length and the wrong value', () => {
+    interceptFrames();
+    const wrong = alteredToken(issuedToken());
+    // Self-checking fixture: a wrong token of a different length would be
+    // rejected by the length check, which is not the comparison under test.
+    expect(wrong).toHaveLength(issuedToken().length);
+    expect(wrong).not.toBe(issuedToken());
+
+    emitRange(1);
+    deliverFrame({
+      source: BRIDGE_SOURCE_TAG,
+      version: CHANNEL_VERSION,
+      type: 'bridge.ready',
+      token: wrong,
+      payload: {},
+    });
+
+    expect(accepted).toEqual([]);
+    expect(getTransportStats()).toMatchObject({ buffered: 1, sent: 0, bridgeReady: false });
+  });
+
+  it('drops a frame at the previous channel version even with the right token', () => {
+    interceptFrames();
+    emitRange(1);
+
+    deliverFrame({
+      source: BRIDGE_SOURCE_TAG,
+      version: CHANNEL_VERSION - 1,
+      type: 'bridge.ready',
+      token: issuedToken(),
+      payload: {},
+    });
+
+    // The version bump is what makes an un-hardened bridge legible enough to
+    // ignore: its frames are refused before the token is even considered.
+    expect(accepted).toEqual([]);
+    expect(getTransportStats()).toMatchObject({ buffered: 1, bridgeReady: false });
+  });
+
+  it('accepts a frame carrying the disclosed token and drains what was queued', () => {
+    interceptFrames();
+    emitRange(1);
+    expect(getTransportStats()).toMatchObject({ buffered: 1, bridgeReady: false });
+
+    announceBridge('bridge.ready');
+
+    expect(accepted.map((message) => message.type)).toEqual(['bridge.ready']);
+    expect(getTransportStats()).toMatchObject({ buffered: 0, sent: 1, bridgeReady: true });
+    expect(deliveredOrder()).toEqual([0]);
+  });
+
+  it('hands subscribers a frame with no token on it', () => {
+    interceptFrames();
+
+    announceBridge('bridge.ready');
+
+    const message = at(accepted, 0, 'the accepted frames');
+    // The secret is verified and dropped: a subscriber that echoed its whole
+    // frame into a diagnostic would otherwise publish it to the page.
+    expect(Object.keys(message).sort()).toEqual(['payload', 'source', 'type', 'version']);
+    expect(JSON.stringify(message)).not.toContain(issuedToken());
+  });
+
+  it('still accepts the same token after a reset and a fresh subscribe', () => {
+    interceptFrames();
+
+    // The disarm path, exactly as `./agent.ts` runs it at the end of every
+    // capture: configureTransport({enabled:false}), resetTransport(), then a
+    // new subscription. A token cleared there would leave the bridge holding a
+    // stale value and this document unable to start a second capture.
+    configureTransport({ enabled: false });
+    resetTransport();
+
+    const afterReset: BridgeInboundMessage[] = [];
+    const stop = subscribe((message) => {
+      afterReset.push(message);
+    });
+
+    try {
+      configureTransport({ sessionId: SESSION_ID, captureId: CAPTURE_B, enabled: true });
+      announceBridge('bridge.ready');
+
+      expect(afterReset.map((message) => message.type)).toEqual(['bridge.ready']);
+      expect(getTransportStats().bridgeReady).toBe(true);
+
+      emitRange(1);
+      flush();
+
+      expect(deliveredOrder()).toEqual([0]);
+      expect(at(batchViews(), 0, 'the posted batches').captureId).toBe(CAPTURE_B);
+    } finally {
+      stop();
+    }
+  });
+
+  it('answers exactly one handshake request, whatever asks afterwards', async () => {
+    // This file's own instance is detached first, so the requests dispatched
+    // below reach exactly one listener. Its token is already captured and
+    // survives the reset — every later case still posts with it — and leaving
+    // it subscribed would only make the offer count ambiguous, because two
+    // live instances answer one request twice.
+    resetTransport();
+
+    const offers = collectOffers();
+
+    try {
+      const fresh = await freshTransport();
+      const seen: BridgeInboundMessage[] = [];
+      const stop = fresh.subscribe((message) => {
+        seen.push(message);
+      });
+
+      try {
+        // One disclosure so far: the unsolicited offer the mint dispatches, for
+        // a bridge that was evaluated before this agent.
+        expect(offers.tokens).toHaveLength(1);
+
+        window.dispatchEvent(new CustomEvent(HANDSHAKE_REQUEST_EVENT));
+
+        expect(offers.tokens).toHaveLength(2);
+        expect(at(offers.tokens, 1, 'the disclosed tokens')).toBe(
+          at(offers.tokens, 0, 'the disclosed tokens'),
+        );
+
+        // Every later ask is unanswered for the life of the document — a bridge
+        // that discarded the token must wait for a reload, and a page script
+        // that spotted the exchange cannot replay it.
+        window.dispatchEvent(new CustomEvent(HANDSHAKE_REQUEST_EVENT));
+        window.dispatchEvent(new CustomEvent(HANDSHAKE_REQUEST_EVENT));
+
+        expect(offers.tokens).toHaveLength(2);
+
+        // And what the answer carried is what that instance accepts.
+        deliverFrame({
+          source: BRIDGE_SOURCE_TAG,
+          version: CHANNEL_VERSION,
+          type: 'bridge.ready',
+          token: at(offers.tokens, 1, 'the disclosed tokens'),
+          payload: {},
+        });
+
+        expect(seen.map((message) => message.type)).toEqual(['bridge.ready']);
+      } finally {
+        stop();
+        fresh.resetTransport();
+      }
+    } finally {
+      offers.stop();
+    }
+  });
+
+  it('accepts nothing on an instance whose disclosure nobody joined', async () => {
+    const fresh = await freshTransport();
+    const seen: BridgeInboundMessage[] = [];
+    const stop = fresh.subscribe((message) => {
+      seen.push(message);
+    });
+
+    try {
+      // Nothing here listened for that instance's offer and nothing asked it
+      // for one, which is the position a page script is in when the bridge got
+      // there first. An all-zero token is a value no instance can have issued:
+      // the mint refuses one, precisely so that a `getRandomValues` stub which
+      // fills nothing cannot pass for a secret.
+      const unissued = '0'.repeat(issuedToken().length);
+
+      deliverFrame({
+        source: BRIDGE_SOURCE_TAG,
+        version: CHANNEL_VERSION,
+        type: 'bridge.ready',
+        payload: {},
+      });
+      deliverFrame({
+        source: BRIDGE_SOURCE_TAG,
+        version: CHANNEL_VERSION,
+        type: 'bridge.ready',
+        token: unissued,
+        payload: {},
+      });
+      deliverFrame({
+        source: BRIDGE_SOURCE_TAG,
+        version: CHANNEL_VERSION,
+        type: 'agent.config',
+        token: unissued,
+        payload: { sessionId: SESSION_ID, captureId: CAPTURE_B },
+      });
+
+      expect(seen).toEqual([]);
+      expect(fresh.getTransportStats().bridgeReady).toBe(false);
+    } finally {
+      stop();
+      fresh.resetTransport();
+    }
   });
 });

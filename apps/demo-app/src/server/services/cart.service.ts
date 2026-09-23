@@ -20,10 +20,28 @@
  * **A cart is addressed by its session token.** The token is the caller's -
  * carried by the storefront's own cookie and resolved to a default by the route
  * handler's schema before it reaches this module - so no function here names a
- * cart, and no token literal appears in this file. A token identifies one cart,
- * and a cart is only shoppable while it is `ACTIVE`: a cart that has converted
- * into an order or been abandoned is history, and looking one up is a lookup
- * that found nothing rather than a cart to change.
+ * cart, and no token literal appears in this file. A token identifies the
+ * session rather than one row: a cart that has converted into an order is that
+ * session's history, and the session shops on with the next one.
+ *
+ * **A session always has a cart to shop with, and this module is what opens
+ * it.** Every function below resolves the session's open cart and opens one
+ * when there is none, so a visitor arriving for the first time, a visitor whose
+ * last cart became an order and a visitor returning to a store that has been
+ * reseeded are all answered with a cart rather than with a failure. Which cart
+ * is open is a fact the database keeps: `carts.open_token` is unique and holds
+ * the session's token for exactly as long as that cart is the one being shopped
+ * with, so two requests racing to open the first cart of a session cannot both
+ * succeed and the loser reads the winner's cart. `./order.service` releases the
+ * pointer in the same transaction that turns the cart into an order, which is
+ * what frees the token for the cart after it.
+ *
+ * The one state that is not a cart to shop with is a cart a checkout is
+ * holding. It keeps the pointer for as long as the attempt runs - so that a
+ * failed checkout can put the very cart the customer filled back in their
+ * hands, lines and prices intact - and while it does, this module reports
+ * {@link CART_HELD} rather than opening a second cart behind the checkout's
+ * back.
  *
  * **Money is recomputed here and multiplied nowhere else.** A line's unit price
  * is the price the line was captured at, its total is that price taken as many
@@ -87,10 +105,14 @@ const LINE_UNITS_CEILING = 99;
 /**
  * The code a rejected unique constraint arrives with.
  *
- * `cart_items` is unique on `(cart_id, product_id)`, so this is what the
- * database answers an attempt to open a second line for a product with - the one
- * outcome {@link addCartLine} expects to lose to a concurrent caller and
- * recovers from rather than reports.
+ * Two constraints in this module's path are races rather than faults, and both
+ * answer with this code. `cart_items` is unique on `(cart_id, product_id)`, so
+ * it is what the database answers an attempt to open a second line for a
+ * product with - the one outcome {@link addCartLine} expects to lose to a
+ * concurrent caller and recovers from rather than reports. `carts.open_token`
+ * is unique, so it is also what answers an attempt to open a second cart for
+ * one session, which is the race {@link mintCart} loses and recovers from by
+ * reading the cart the winner opened.
  *
  * It is matched as a string off the caught value, exactly as the mapper in
  * `@/server/errors` matches it: the generated Prisma client is produced by
@@ -101,14 +123,21 @@ const LINE_UNITS_CEILING = 99;
 const UNIQUE_VIOLATION = 'P2002';
 
 /**
- * What a caller is told when the token addresses no cart that can still be
- * shopped with.
+ * What a caller is told when the session's cart cannot be shopped with because
+ * a checkout is holding it.
  *
- * Every function in this module resolves its cart first and answers this one
- * sentence when there is none, so a read and any of the four writes report a
- * converted, abandoned or unknown cart identically.
+ * It is the one reason this module reports no cart: every other session -
+ * including one whose cart has just become an order - is answered with a cart
+ * that either already existed or was opened for it. The sentence therefore says
+ * what is happening and what to do about it rather than reporting a cart that
+ * could not be found, and a read and all four writes say it identically.
+ *
+ * The hold ends by itself: the checkout either writes the order, which converts
+ * the cart and frees the session to open the next one, or fails and puts this
+ * very cart back in the session's hands.
  */
-const NO_OPEN_CART = 'No open cart was found for this session.';
+const CART_HELD =
+  'This cart is being checked out. Wait for that order to finish, then open your cart again.';
 
 /**
  * What a caller is told when the line a change named is not in its cart.
@@ -207,8 +236,107 @@ function collides(error: unknown): boolean {
   return code === UNIQUE_VIOLATION;
 }
 
+/** A cart as it stands the moment it is opened, before it has any line. */
+type OpenedCart = Omit<Row, 'items'>;
+
 /**
- * The identifier of the cart a session is shopping with.
+ * The cart a session is shopping with, with everything a view is built from, or
+ * `null` when the session has no open cart.
+ *
+ * The session's open-cart pointer is what identifies it. `carts.open_token` is
+ * unique and is held by the cart being shopped with, so this is a single-row
+ * lookup rather than a search through the session's history, and the status term
+ * beside it is what excludes the one cart that carries the pointer without being
+ * shoppable: the cart a checkout is holding.
+ *
+ * It is read twice on the path through {@link readActiveCart} - once before
+ * opening a cart and once after losing the race to open one - so it is written
+ * once here rather than spelled out at both call sites, where the two copies
+ * could drift.
+ *
+ * @param token The cart's session token, as {@link readActiveCart} takes it.
+ * @returns The cart's row with its lines in a stable order, or `null`.
+ */
+async function openCart(token: string): Promise<Row | null> {
+  return prisma.cart.findFirst({
+    where: { openToken: token, status: CartStatus.ACTIVE },
+    select: {
+      id: true,
+      status: true,
+      updatedAt: true,
+      items: {
+        select: {
+          id: true,
+          productId: true,
+          quantity: true,
+          unitPriceCents: true,
+          product: { select: { sku: true, slug: true, name: true, imageUrl: true } },
+        },
+        orderBy: { id: 'asc' },
+      },
+    },
+  });
+}
+
+/**
+ * Opens a cart for a session that has none, and answers the cart it opened.
+ *
+ * The write is the decision. `carts.open_token` is unique, so the insert either
+ * takes the session's open-cart pointer or is refused, and no reading of the
+ * session's carts happens in between for a concurrent caller to invalidate:
+ * two tabs that both find no open cart and both try to open one produce exactly
+ * one cart, and the tab that lost reads the cart the other opened. The same
+ * refusal is what keeps a checkout's hold intact, because the cart it is
+ * holding still carries the pointer.
+ *
+ * The account carries over from the session's own history. A visitor who has
+ * bought before keeps the account their last cart was attached to, which is
+ * what lets `./order.service` write their next order against it instead of
+ * opening a second account for the same shopper - and what makes the order
+ * history a returning visitor sees include the order they have just placed. A
+ * session with no history opens an anonymous cart, and the account is attached
+ * when it is checked out.
+ *
+ * @param token The cart's session token, as {@link readActiveCart} takes it.
+ * @returns The cart this call opened - always empty, since nothing has been put
+ * in it yet - or `null` when the session's pointer is already held: by a
+ * concurrent caller that opened a cart first, or by a checkout still holding
+ * the cart it took.
+ */
+async function mintCart(token: string): Promise<OpenedCart | null> {
+  const previous = await prisma.cart.findFirst({
+    where: { sessionToken: token, customerId: { not: null } },
+    // The identifier breaks a tie the timestamp cannot: two carts touched in one
+    // instant would otherwise be free to change places between reads.
+    orderBy: [{ updatedAt: 'desc' }, { id: 'desc' }],
+    select: { customerId: true },
+  });
+
+  try {
+    return await prisma.cart.create({
+      data: {
+        sessionToken: token,
+        openToken: token,
+        customerId: previous?.customerId ?? null,
+      },
+      select: { id: true, status: true, updatedAt: true },
+    });
+  } catch (error) {
+    // Only the pointer's own constraint is recovered from: it means this
+    // session already has an open cart, which is the caller's answer rather
+    // than a failure. Everything else - a connection that dropped, an account
+    // that has since been deleted - is the caller's to see, unchanged.
+    if (!collides(error)) {
+      throw error;
+    }
+
+    return null;
+  }
+}
+
+/**
+ * The identifier of the cart a session is shopping with, opening one when the
+ * session has none.
  *
  * The four writes below each need the cart's own key before they can name a row
  * of it, and none of them needs its lines: the line each one changes is named by
@@ -216,22 +344,42 @@ function collides(error: unknown): boolean {
  * One lookup written once is therefore what all four share, and the columns it
  * selects are the one column they use.
  *
+ * Three steps at most, and the common one is the first: the session's open cart
+ * is found, or a cart is opened for it, or - when the open-cart pointer turns
+ * out to be held - the cart the winner of that race opened is read. A pointer
+ * held by a checkout leaves nothing to read, which is the one case that fails.
+ *
  * @param token The cart's session token, as {@link readActiveCart} takes it.
  * @returns The `carts.id` of the session's open cart.
- * @throws StorefrontNotFoundError with {@link NO_OPEN_CART}, the same failure
+ * @throws StorefrontNotFoundError with {@link CART_HELD}, the same failure
  * {@link readActiveCart} raises for the same reason.
  */
 async function activeCartId(token: string): Promise<string> {
   const cart = await prisma.cart.findFirst({
-    where: { sessionToken: token, status: CartStatus.ACTIVE },
+    where: { openToken: token, status: CartStatus.ACTIVE },
     select: { id: true },
   });
 
-  if (cart === null) {
-    throw new StorefrontNotFoundError(NO_OPEN_CART);
+  if (cart !== null) {
+    return cart.id;
   }
 
-  return cart.id;
+  const opened = await mintCart(token);
+
+  if (opened !== null) {
+    return opened.id;
+  }
+
+  const contended = await prisma.cart.findFirst({
+    where: { openToken: token, status: CartStatus.ACTIVE },
+    select: { id: true },
+  });
+
+  if (contended === null) {
+    throw new StorefrontNotFoundError(CART_HELD);
+  }
+
+  return contended.id;
 }
 
 /**
@@ -296,47 +444,59 @@ async function addUnits(cartId: string, draft: CartItemDraft): Promise<boolean> 
 }
 
 /**
- * The cart a session is shopping with, with its lines and its money.
+ * The cart a session is shopping with, with its lines and its money, opening
+ * one when the session has none.
  *
  * One statement answers the question: the lines and the product details each
  * line displays are selected with the cart rather than fetched per line, so a
- * cart costs one round trip whatever it holds.
+ * cart costs one round trip whatever it holds. A session with no open cart
+ * costs one more - the write that opens it - and the cart that comes back has
+ * no lines, so nothing has to be read again to describe it.
+ *
+ * A first visit, a cart that has just become an order and a store that has been
+ * reseeded are therefore all answered with an empty cart rather than with a
+ * failure. That is what keeps the storefront usable after a purchase: the
+ * browser is told the cart is empty, and the next thing put in it opens a line
+ * of the cart opened here.
  *
  * @param token The cart's session token, as the storefront's cookie carries it
  * and the request schema resolved it.
  * @returns The cart's view: its lines in a stable order, the units across them
  * and their subtotal in cents.
- * @throws StorefrontNotFoundError when the token belongs to no cart, or to a
- * cart that is no longer open - a converted or abandoned cart is a record of
- * what happened rather than a cart to shop with. The failure is an error rather
- * than an empty cart so that a browser is never shown somebody else's blank
- * slate as though it were their own.
+ * @throws StorefrontNotFoundError with {@link CART_HELD} when a checkout is
+ * holding this session's cart. It is the one state that is not a cart to shop
+ * with, and it is reported rather than worked around: opening a second cart
+ * would take the pointer the checkout needs to put this one back if it fails.
  */
 export async function readActiveCart(token: string): Promise<CartView> {
-  const row = await prisma.cart.findFirst({
-    where: { sessionToken: token, status: CartStatus.ACTIVE },
-    select: {
-      id: true,
-      status: true,
-      updatedAt: true,
-      items: {
-        select: {
-          id: true,
-          productId: true,
-          quantity: true,
-          unitPriceCents: true,
-          product: { select: { sku: true, slug: true, name: true, imageUrl: true } },
-        },
-        orderBy: { id: 'asc' },
-      },
-    },
-  });
+  const row = await openCart(token);
 
-  if (row === null) {
-    throw new StorefrontNotFoundError(NO_OPEN_CART);
+  if (row !== null) {
+    return buildCartView(row);
   }
 
-  return buildCartView(row);
+  const opened = await mintCart(token);
+
+  if (opened !== null) {
+    // Nothing has been put in it yet, so the view is complete without a second
+    // read: a cart opened by this call has no lines, no units and no subtotal.
+    return buildCartView({ ...opened, items: [] });
+  }
+
+  // The pointer is held, so exactly one more read decides which of the two
+  // holders has it. A concurrent caller that opened the session's cart between
+  // the read and the write leaves a cart to answer with - the one this request
+  // was asking for - and a checkout holding the cart it took leaves none. There
+  // is no third possibility and therefore no further attempt: the write above
+  // was refused because a row holds the pointer, and that row is either open or
+  // held.
+  const contended = await openCart(token);
+
+  if (contended === null) {
+    throw new StorefrontNotFoundError(CART_HELD);
+  }
+
+  return buildCartView(contended);
 }
 
 /**
@@ -382,8 +542,10 @@ export async function readActiveCart(token: string): Promise<CartView> {
  * @throws StorefrontValidationError when the quantity is not a whole number of
  * at least one unit. A parsed request body cannot carry one, but a server
  * component calls this function directly and with values of its own.
- * @throws StorefrontNotFoundError when the token belongs to no open cart, or
- * when no product owns the identifier the draft named.
+ * @throws StorefrontNotFoundError when a checkout is holding this session's
+ * cart, and when no product owns the identifier the draft named. A session
+ * with no cart at all is not a failure: one is opened for it and the product
+ * goes into it.
  * @throws StorefrontConflictError when the units asked for would take the line
  * past {@link LINE_UNITS_CEILING}, and when the request asks for more units than
  * a line may hold at all. It is a conflict rather than a rejected request: the
@@ -519,8 +681,9 @@ export async function addCartLine(token: string, draft: CartItemDraft): Promise<
  * {@link removeCartLine} performs.
  * @throws StorefrontConflictError when the quantity asked for is past
  * {@link LINE_UNITS_CEILING}, for the reason {@link addCartLine} gives.
- * @throws StorefrontNotFoundError when the token belongs to no open cart, or
- * when this cart holds no line with that identifier.
+ * @throws StorefrontNotFoundError when a checkout is holding this session's
+ * cart, and when this cart holds no line with that identifier - which is what
+ * a line identifier from a cart that has since been ordered now is.
  */
 export async function setCartLineQuantity(
   token: string,
@@ -578,8 +741,9 @@ export async function setCartLineQuantity(
  * for it.
  * @returns The cart's view after the line was deleted, with its money
  * recomputed.
- * @throws StorefrontNotFoundError when the token belongs to no open cart, or
- * when this cart holds no line with that identifier.
+ * @throws StorefrontNotFoundError when a checkout is holding this session's
+ * cart, and when this cart holds no line with that identifier - which is what
+ * a line identifier from a cart that has since been ordered now is.
  */
 export async function removeCartLine(token: string, lineId: string): Promise<CartView> {
   const cartId = await activeCartId(token);
@@ -616,7 +780,9 @@ export async function removeCartLine(token: string, lineId: string): Promise<Car
  * @param token The cart's session token, as {@link readActiveCart} takes it.
  * @returns The cart's view with no lines, an `itemCount` of zero and a subtotal
  * of zero cents.
- * @throws StorefrontNotFoundError when the token belongs to no open cart.
+ * @throws StorefrontNotFoundError when a checkout is holding this session's
+ * cart. A session with no cart at all is answered with the empty cart opened
+ * for it, which is the cart it asked for.
  */
 export async function clearCartLines(token: string): Promise<CartView> {
   const cartId = await activeCartId(token);

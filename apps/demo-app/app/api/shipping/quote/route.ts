@@ -20,7 +20,11 @@
  *    Every parameter this endpoint accepts is declared, bounded and defaulted
  *    once, in `shippingQuoteQuerySchema`, which is why a request naming a
  *    destination and nothing else - the only request the browser makes - parses
- *    to a complete shipment. The throwing `parse` is used deliberately: the
+ *    to a complete shipment. That schema is also where the destination's two
+ *    halves are paired: a postal code that is not a complete one for the
+ *    country given with it is rejected there, not rated, because a rate taken
+ *    on an unfinished code prices a different place from the buyer's. The
+ *    throwing `parse` is used deliberately: the
  *    `ZodError` it raises propagates to the single mapper in `@/server/errors`,
  *    which answers 400 in the one envelope every endpoint of this application
  *    uses and names the parameters it rejected without repeating what was
@@ -37,12 +41,17 @@
  *    the service, against `@/server/origin`, which is also the module that
  *    builds the address. This handler passes the value on and judges nothing
  *    about it.
- * 3. **Nothing is cached.** A rate is quoted for the shipment and the moment it
- *    was asked about, so the segment is dynamic, every response says `no-store`,
- *    and nothing is memoized at module scope or de-duplicated in flight: one
- *    request from the browser is one quote, and two identical requests are two.
- *    A destination the customer has since corrected is a different question, and
- *    a rate served again from a cache would answer the earlier one.
+ * 3. **Nothing is cached, and nothing is written.** A rate is quoted for the
+ *    shipment and the moment it was asked about, so the segment is dynamic,
+ *    every response says `no-store`, and nothing is memoized at module scope or
+ *    de-duplicated in flight: one request from the browser is one quote, and two
+ *    identical requests are two. A destination the customer has since corrected
+ *    is a different question, and a rate served again from a cache would answer
+ *    the earlier one. The other half of that is that asking costs nothing
+ *    permanent: the service records a quote only against the cart it was taken
+ *    for, and this endpoint quotes a destination, so a browser, a prefetcher or
+ *    a retry may repeat the request freely without accumulating rows nothing
+ *    will ever reference.
  * 4. **The payload is passed through untouched.** The service already stated the
  *    quote in the shapes of `@/lib/types` - money as an integer count of US
  *    cents in its `*Cents` fields, transit time as a whole number of business
@@ -68,21 +77,26 @@ export const dynamic = 'force-dynamic';
  * Quotes the shipping services offered to the destination a request names.
  *
  * @param request The incoming request. Its query string carries the destination
- * postal code and, optionally, what the shipment weighs, how many units travel
- * in it and which tier of service to quote around; `shippingQuoteQuerySchema`
- * owns which of those are required, what they are bounded to and what they
- * default to, so a request carrying a destination alone is a perfectly good one.
- * Its URL is also read for the origin the carrier is reached on.
- * @returns 200 with a `ShippingQuoteResult` - the quote the store recorded, the
- * services on offer, the destination they were quoted for and the instant they
- * were quoted at - and `no-store`, so neither the dev server nor the browser
- * serves the rates again. A destination with no service offered to it is
- * answered with no options, which is a result rather than a failure. Any failure
- * is answered by `storefrontErrorResponse` in the one envelope every endpoint of
- * this application uses: 400 for a query the schema rejected or a request that
- * was not addressed to this store, 502 when the carrier could not be reached,
- * refused the shipment or answered with nothing this storefront can read, and a
- * message that names no value the caller supplied for anything else.
+ * postal code and, optionally, the country that code is in, what the shipment
+ * weighs, how many units travel in it and which tier of service to quote
+ * around; `shippingQuoteQuerySchema` owns which of those are required, what
+ * they are bounded to and what they default to, so a request carrying a
+ * domestic destination alone is a perfectly good one. Its URL is also read for
+ * the origin the carrier is reached on.
+ * @returns 200 with a `ShippingQuoteResult` - the services on offer, the
+ * destination they were quoted for and the instant they were quoted at, with
+ * `id: null` because a quote taken for a destination rather than for a cart is
+ * not recorded - and `no-store`, so neither the dev server nor the browser
+ * serves the rates again. This endpoint is therefore safe to repeat: it writes
+ * nothing, which is what a `GET` a browser, a prefetch or a retry may replay has
+ * to be. A destination with no service offered to it is answered with no
+ * options, which is a result rather than a failure. Any failure is answered by
+ * `storefrontErrorResponse` in the one envelope every endpoint of this
+ * application uses: 400 for a query the schema rejected - including a postal
+ * code that is not a complete one for its country - or a request that was not
+ * addressed to this store, 502 when the carrier could not be reached, refused
+ * the shipment or answered with nothing this storefront can read, and a message
+ * that names no value the caller supplied for anything else.
  */
 export async function GET(request: Request): Promise<Response> {
   try {

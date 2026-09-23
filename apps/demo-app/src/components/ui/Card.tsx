@@ -66,14 +66,19 @@ interface Props {
    */
   pad?: 'sm' | 'md' | 'lg' | undefined;
   /**
-   * Marks the card as *looking* clickable: on hover its border takes the accent colour and its
-   * elevation lifts, and focus inside it draws a ring around the whole card.
+   * Marks the card as holding something to act on: on hover, and again while focus is anywhere
+   * inside it, its border takes the accent colour and its elevation lifts.
    *
    * Purely visual. The card adds no `onClick`, no `role`, no `tabIndex` and no key handling, so
-   * the real control stays the single link or button the caller places inside - which is what
-   * keeps the card from becoming a mouse-only target that a screen reader announces twice. The
-   * ring comes from the stylesheet's `:focus-within`, so that inner control's focus is visible
-   * at the card level without any JavaScript.
+   * the real control stays the link or button the caller places inside - which is what keeps the
+   * card from becoming a mouse-only target that a screen reader announces twice. It carries no
+   * pointer cue either, for the same reason: the surface is not a target, and the control inside
+   * it brings its own cursor.
+   *
+   * The card deliberately draws no focus *ring*. Every focusable element in this application has
+   * an indicator of its own, so a ring here would paint a second one around a box that cannot
+   * hold focus; the hover treatment, applied through the stylesheet's `:focus-within`, is how the
+   * card reports that focus has landed inside it without any JavaScript.
    */
   interactive?: boolean | undefined;
   /** The consuming module's own class, composed alongside `.root` for placement and sizing. */

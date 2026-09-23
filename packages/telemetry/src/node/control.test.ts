@@ -830,20 +830,27 @@ interface FetchRig {
   readonly calls: FetchCall[];
 }
 
+/** `204 No Content`: the honest shape of an ingest acknowledgement. */
+const INGEST_ACCEPTED_STATUS = 204;
+
+/** `401 Unauthorized`: the ingest endpoint refusing this process's credential. */
+const INGEST_UNAUTHORIZED_STATUS = 401;
+
 /**
- * Create a `fetch` that accepts everything and reaches nothing.
+ * Create a `fetch` that answers one status and reaches nothing.
  *
- * `204 No Content` rather than `200`: the exporter reads only the status and
- * releases the body, and an empty response is the honest shape of an ingest
- * acknowledgement.
+ * `204 No Content` rather than `200` by default: the exporter reads only the
+ * status and releases the body, and an empty response is the honest shape of an
+ * ingest acknowledgement.
  *
+ * @param status The status every call answers with.
  * @returns The rig.
  */
-function createFetchRig(): FetchRig {
+function createFetchRig(status: number = INGEST_ACCEPTED_STATUS): FetchRig {
   const calls: FetchCall[] = [];
   const impl: typeof fetch = (input, init) => {
     calls.push(init === undefined ? { input } : { input, init });
-    return Promise.resolve(new Response(null, { status: 204 }));
+    return Promise.resolve(new Response(null, { status }));
   };
   return { impl, calls };
 }
@@ -1398,10 +1405,15 @@ interface ProcessorRig {
  * the two together and drive `onEnd`.
  *
  * @param harness The harness whose control object gates the processor.
+ * @param ingestStatus The status the injected `fetch` answers every post with;
+ * accepted by default.
  * @returns The processor and the record of what it tried to post.
  */
-function createProcessorRig(harness: Harness): ProcessorRig {
-  const fetchRig = createFetchRig();
+function createProcessorRig(
+  harness: Harness,
+  ingestStatus: number = INGEST_ACCEPTED_STATUS,
+): ProcessorRig {
+  const fetchRig = createFetchRig(ingestStatus);
   const processor = new DebuggenSpanProcessor({
     gate: harness.control,
     config: harness.config,
@@ -3312,6 +3324,76 @@ describe('the ingest retry backoff', () => {
     // A source that cannot be sampled falls back to the unjittered delay rather
     // than producing `NaN` and a timer that never fires.
     expect(computeIngestBackoffMs(2, () => Number.NaN)).toBe(baseFor(2));
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The two refusals of one credential
+ *
+ * `ServerAgentControlStats` carries both, and they are different facts:
+ * `credentialRejected` is the control socket's 4401 close — no capture
+ * instruction will arrive — while `ingestCredentialRejected` is the HTTP ingest
+ * endpoint refusing a batch, which stops server-side telemetry for the life of
+ * the process (AAP §0.5.6). A session needs to be able to tell them apart, so
+ * these cases assert that neither implies the other.
+ * ---------------------------------------------------------------------------
+ */
+
+describe('the ingest endpoint refusing the credential', () => {
+  it("publishes the processor's ingest latch, and not as a socket refusal", async () => {
+    const harness = createHarness();
+    const rig = createProcessorRig(harness, INGEST_UNAUTHORIZED_STATUS);
+    // `register.ts` attaches the real `DebuggenSpanProcessor` as the flush
+    // target, which is what makes the latch it sets readable from here.
+    harness.control.attach({ processor: rig.processor });
+    await harness.arm(CAPTURE_A, ALL_SIGNALS);
+
+    expect(harness.control.stats().ingestCredentialRejected).toBe(false);
+
+    rig.processor.onEnd(serverRequestSpan());
+    await rig.processor.forceFlush();
+
+    expect(rig.fetches).toHaveLength(1);
+    expect(rig.processor.stats().credentialRejected).toBe(true);
+    // The value a session reads as "relaunch required".
+    expect(harness.control.stats().ingestCredentialRejected).toBe(true);
+    // The socket is still open and still the only channel a capture arrives on,
+    // so the socket-level latch must stay where it was.
+    expect(harness.control.stats().credentialRejected).toBe(false);
+
+    // And nothing posts again, whatever the capture does next.
+    rig.processor.onEnd(serverRequestSpan());
+    await rig.processor.forceFlush();
+
+    expect(rig.fetches).toHaveLength(1);
+  });
+
+  it('reads false for a flush target that does not implement the member', async () => {
+    const harness = createHarness();
+    await harness.arm(CAPTURE_A, ALL_SIGNALS);
+
+    // The flush-only fake, read through the interface that declares the member
+    // optional: a target with no ingest transport of its own cannot have had
+    // one refused, and `false` is the honest reading rather than a guess.
+    const target: ControlFlushTarget = harness.flush;
+    expect(target.credentialRejected).toBeUndefined();
+    expect(harness.control.stats().ingestCredentialRejected).toBe(false);
+  });
+
+  it('reports a 4401 socket close without claiming the ingest endpoint refused anything', () => {
+    const harness = createHarness();
+    harness.control.connect();
+    const socket = socketOf(harness);
+    socket.emitOpen();
+
+    socket.emitClose(CONTROL_CLOSE_UNAUTHORIZED, 'credential refused');
+
+    const stats = harness.control.stats();
+    expect(stats.credentialRejected).toBe(true);
+    // Nothing has posted a batch, so the ingest half of the pair is untouched:
+    // the socket is authenticated once at `client.hello`, ingest per request.
+    expect(stats.ingestCredentialRejected).toBe(false);
   });
 });
 

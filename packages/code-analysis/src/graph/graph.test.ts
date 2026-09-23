@@ -34,14 +34,29 @@
  *
  * ## Purity
  *
- * Fixture-free and side-effect-free by design: every case builds a small
- * hand-authored {@link CodeIndex} in memory. No filesystem, no ts-morph
- * project, no network, no timers — the one measurement in here is a loose
- * wall-clock budget on a lookup loop, sized so that it can only fail if a
- * pre-computed index was replaced by a scan. Corpus-backed assertions about
- * *what* an indexing run finds belong to the sibling `query.test.ts` and
- * `../indexer.test.ts`, which own the sample application under
- * `../../test/fixtures`.
+ * The container's own suites are fixture-free and side-effect-free by design:
+ * every case builds a small hand-authored {@link CodeIndex} in memory. No
+ * filesystem, no ts-morph project, no network, no timers — the one measurement
+ * in here is a loose wall-clock budget on a lookup loop, sized so that it can
+ * only fail if a pre-computed index was replaced by a scan.
+ *
+ * ## The two suites at the end, and why they are not fixture-free
+ *
+ * The last four suites are about the *queries* this container is read through,
+ * and two of them are about a property that does not exist in either half
+ * alone: an extractor records a relationship and a query answers with it, so an
+ * index nobody extracted cannot show that the two agree. Those two therefore
+ * write a **miniature project of their own** into an `os.tmpdir()` sandbox,
+ * index it through the real `openProject`/`indexProject` path, and query the
+ * graph that comes out. They never touch the committed corpus under
+ * `../../test/fixtures`, which is read-only input for other suites, and the
+ * sandbox is removed afterwards — `git status --porcelain packages/code-analysis`
+ * is empty after a run either way.
+ *
+ * The remaining two — the path-orientation suite and the argument-admission
+ * suite — stay hand-authored, because a graph spelled out here is the only way
+ * to state the exact adjacency an undirected traversal has to walk backwards
+ * through.
  *
  * ## Two habits worth stating
  *
@@ -62,15 +77,23 @@
  * a name borrowed from an application under test would say otherwise.
  */
 
-import { assertDefined } from '@debuggen/shared';
-import { describe, expect, it } from 'vitest';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
+import { assertDefined, isOk } from '@debuggen/shared';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+
+import { indexProject } from '../indexer.js';
 import { CodeGraph, makeEdgeId, makeNodeId } from './graph.js';
+import { createCodeQueries } from './query.js';
 import { CODE_EDGE_KINDS, CODE_INDEX_SCHEMA_VERSION, CODE_NODE_KINDS } from './types.js';
 
 import type { LogFields, Logger, LogLevel } from '@debuggen/shared';
 
 import type { EdgeIdInput, NodeIdInput } from './graph.js';
+import type { CodeMatch, CodePath, CodeQueries } from './query.js';
 
 import type {
   CodeEdge,
@@ -2349,5 +2372,1009 @@ describe('CodeGraph.toIndex', () => {
 
     expect(JSON.stringify(second)).not.toBe(JSON.stringify(first));
     expect({ ...second, generatedAt: GENERATED_AT }).toStrictEqual(first);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * The queries this container is read through
+ *
+ * `./query.ts` is the surface AAP 0.4.2 puts in front of a model, and three of
+ * its properties are contracts between it and the extractors rather than
+ * properties of either: whether a path can be read as a flow, whether a
+ * relationship an extractor declines to record leaves a query unable to answer,
+ * and whether an argument a model wrote can reach an implementation that
+ * assumed a well-typed one.
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * A node id for a hand-authored node, so a case can name an endpoint without
+ * holding the node.
+ *
+ * @param target The node.
+ * @returns Its id.
+ */
+function idOf(target: CodeNode): string {
+  return target.id;
+}
+
+/**
+ * The `(from → to)` pairs of a path's hops, each marked when the walk took it
+ * backwards.
+ *
+ * Reported as names rather than ids because an id is unreadable in a failure
+ * message and the names in these fixtures are unique.
+ *
+ * @param path The path to describe.
+ * @param graph The graph the path came from.
+ * @returns One string per hop.
+ */
+function hopsOf(path: CodePath, graph: CodeGraph): string[] {
+  return path.edges.map((hop) => {
+    const from = graph.nodeById(hop.from);
+    const to = graph.nodeById(hop.to);
+    const mark = hop.traversedAgainstDirection ? ' (against)' : '';
+
+    return `${hop.kind} ${from?.name ?? hop.from}→${to?.name ?? hop.to}${mark}`;
+  });
+}
+
+/**
+ * Whether every hop of a path joins the two nodes it sits between, in one
+ * orientation or the other.
+ *
+ * This is the invariant a consumer can rely on for *any* path, directed or not
+ * — the edge list is a walk of the node list — and it is what makes
+ * `traversedAgainstDirection` enough to read a path correctly.
+ *
+ * @param path The path to check.
+ * @returns `true` when the walk holds at every hop.
+ */
+function walksNodeList(path: CodePath): boolean {
+  return path.edges.every((hop, position) => {
+    const left = path.nodes[position];
+    const right = path.nodes[position + 1];
+    if (left === undefined || right === undefined) {
+      return false;
+    }
+
+    return hop.traversedAgainstDirection
+      ? hop.from === right.nodeId && hop.to === left.nodeId
+      : hop.from === left.nodeId && hop.to === right.nodeId;
+  });
+}
+
+describe('createCodeQueries.pathBetween — a path is only a flow when it is a directed one', () => {
+  /*
+   * Two routes that call one shared helper, and one of them also reaches a
+   * query through a function of its own:
+   *
+   *   /api/left  --calls-->  shared  <--calls--  /api/right --calls--> readRight --queries--> SQL
+   *
+   * Nothing downstream connects `/api/left` to the query, so the only way for
+   * an undirected search to get from one to the other is to walk the
+   * `/api/right → shared` edge **backwards**. That is the shape that used to
+   * come back looking exactly like a call chain: four hops, two of which did
+   * not join head to tail, asserting a flow the source does not contain.
+   */
+  const leftRoute = node('api-route', {
+    file: 'src/app/api/left/route.ts',
+    name: 'GET',
+    data: {
+      routePath: '/api/left',
+      router: 'app',
+      kind: 'route-handler',
+      methods: ['GET'],
+    },
+  });
+  const rightRoute = node('api-route', {
+    file: 'src/app/api/right/route.ts',
+    name: 'POST',
+    data: {
+      routePath: '/api/right',
+      router: 'app',
+      kind: 'route-handler',
+      methods: ['POST'],
+    },
+  });
+  const shared = node('server-function', { file: 'src/server/shared.ts', name: 'shared' });
+  const readRight = node('server-function', { file: 'src/server/right.ts', name: 'readRight' });
+  const query = node('db-call', {
+    file: 'src/server/right.ts',
+    name: 'pool.query',
+    line: 12,
+    data: { driver: 'pg', operation: 'query', dynamic: false },
+  });
+
+  const edges: readonly CodeEdge[] = [
+    edge({
+      kind: 'calls',
+      from: idOf(leftRoute),
+      to: idOf(shared),
+      file: 'src/app/api/left/route.ts',
+      line: 4,
+      column: 3,
+    }),
+    edge({
+      kind: 'calls',
+      from: idOf(rightRoute),
+      to: idOf(shared),
+      file: 'src/app/api/right/route.ts',
+      line: 6,
+      column: 3,
+    }),
+    edge({
+      kind: 'calls',
+      from: idOf(rightRoute),
+      to: idOf(readRight),
+      file: 'src/app/api/right/route.ts',
+      line: 7,
+      column: 3,
+    }),
+    edge({
+      kind: 'queries',
+      from: idOf(readRight),
+      to: idOf(query),
+      file: 'src/server/right.ts',
+      line: 12,
+      column: 9,
+    }),
+  ];
+
+  const graph = CodeGraph.fromIndex(
+    index({ nodes: [leftRoute, rightRoute, shared, readRight, query], edges }),
+  );
+  const queries = createCodeQueries(graph);
+
+  it('marks the hop an undirected search walked backwards, and marks the path undirected', () => {
+    const path = queries.pathBetween(idOf(leftRoute), idOf(query), { direction: 'both' });
+
+    assertDefined(path, 'the undirected search must find the shared helper');
+    expect(path.undirected).toBe(true);
+    expect(hopsOf(path, graph)).toStrictEqual([
+      'calls GET→shared',
+      'calls POST→shared (against)',
+      'calls POST→readRight',
+      'queries readRight→pool.query',
+    ]);
+  });
+
+  it('keeps every hop a walk of the node list, which the reversed hop alone would break', () => {
+    const path = queries.pathBetween(idOf(leftRoute), idOf(query), { direction: 'both' });
+
+    assertDefined(path, 'the undirected search must find the shared helper');
+    expect(walksNodeList(path)).toBe(true);
+
+    // The reading that used to be the only one available, kept as the control:
+    // chaining the hops by their own endpoints genuinely does not hold here, so
+    // a consumer needs the flag rather than the chain.
+    const chains = path.edges.every((hop, position) => {
+      const next = path.edges[position + 1];
+
+      return next === undefined || hop.to === next.from;
+    });
+    expect(chains).toBe(false);
+  });
+
+  it('reports a downstream path as directed, with no hop against the direction', () => {
+    const path = queries.pathBetween(idOf(rightRoute), idOf(query));
+
+    assertDefined(path, 'the route reaches the query downstream');
+    expect(path.undirected).toBe(false);
+    expect(path.edges.map((hop) => hop.traversedAgainstDirection)).toStrictEqual([false, false]);
+    expect(walksNodeList(path)).toBe(true);
+    expect(hopsOf(path, graph)).toStrictEqual([
+      'calls POST→readRight',
+      'queries readRight→pool.query',
+    ]);
+  });
+
+  it('answers a single-node path with no hops and the direction it was asked in', () => {
+    const directed = queries.pathBetween(idOf(shared), idOf(shared));
+    const undirected = queries.pathBetween(idOf(shared), idOf(shared), { direction: 'both' });
+
+    assertDefined(directed, 'a node reaches itself');
+    assertDefined(undirected, 'a node reaches itself');
+    expect(directed).toMatchObject({ depth: 0, undirected: false, edges: [] });
+    expect(undirected).toMatchObject({ depth: 0, undirected: true, edges: [] });
+  });
+
+  it('keeps the edge site on the edge’s own origin, whichever way the walk went', () => {
+    const path = queries.pathBetween(idOf(leftRoute), idOf(query), { direction: 'both' });
+
+    assertDefined(path, 'the undirected search must find the shared helper');
+    const reversed = path.edges[1];
+    assertDefined(reversed, 'the second hop is the reversed one');
+    expect(reversed.traversedAgainstDirection).toBe(true);
+    expect(reversed.location).toMatchObject({
+      file: 'src/app/api/right/route.ts',
+      line: 6,
+      column: 3,
+      resolvedBy: 'code-graph',
+    });
+  });
+});
+
+describe('createCodeQueries — arguments of unknown provenance', () => {
+  /*
+   * AAP 0.4.2 has a model propose these queries and
+   * `apps/local-service/src/pipeline/tools/code-tools.ts` execute them, so
+   * `{"name": null}` is an ordinary input and AAP 0.5.5 requires the stage to
+   * degrade instead of failing. Every entry point must therefore be total over
+   * *values*, not merely over the types it declares — which is what this suite
+   * pins, argument by argument, with the same nine values TypeScript would have
+   * rejected at a well-typed call site.
+   */
+  const hostile: readonly unknown[] = [undefined, null, '', 0, 123, {}, [], () => 1, Symbol('x')];
+
+  /**
+   * The queries under test, and the empty answer each one owes for an argument
+   * it cannot use.
+   *
+   * @param queries The surface to call.
+   * @returns One entry per probe.
+   */
+  function probes(queries: CodeQueries): readonly {
+    readonly label: string;
+    readonly run: (value: unknown) => unknown;
+    readonly empty: unknown;
+  }[] {
+    return [
+      {
+        label: 'findByName(name)',
+        run: (value) => queries.findByName(value as string),
+        empty: [],
+      },
+      {
+        label: 'findSymbol(file, symbol)',
+        run: (value) => queries.findSymbol('src/server/items.ts', value as string),
+        empty: undefined,
+      },
+      {
+        label: 'findSymbol(file)',
+        run: (value) => queries.findSymbol(value as string, 'loadItems'),
+        empty: undefined,
+      },
+      {
+        label: 'hasSymbol(file, symbol)',
+        run: (value) => queries.hasSymbol('src/server/items.ts', value as string),
+        empty: false,
+      },
+      {
+        label: 'hasSymbol(file)',
+        run: (value) => queries.hasSymbol(value as string, 'loadItems'),
+        empty: false,
+      },
+      {
+        label: 'whoCalls(target)',
+        run: (value) => queries.whoCalls(value as string),
+        empty: [],
+      },
+      {
+        label: 'routeForUrl(url)',
+        run: (value) => queries.routeForUrl(value as string),
+        empty: undefined,
+      },
+      {
+        label: 'handlersFor(url)',
+        run: (value) => queries.handlersFor(value as string),
+        empty: [],
+      },
+      {
+        label: 'componentsRendering(component)',
+        run: (value) => queries.componentsRendering(value as string),
+        empty: [],
+      },
+      {
+        label: 'pathBetween(from, to)',
+        run: (value) => queries.pathBetween(value as string, value as string),
+        empty: undefined,
+      },
+      {
+        label: 'excerpt(target)',
+        run: (value) => queries.excerpt(value as string),
+        empty: undefined,
+      },
+    ];
+  }
+
+  it('answers every entry point with its empty result instead of throwing', () => {
+    const queries = createCodeQueries(sampleGraph());
+    const thrown: string[] = [];
+    const wrong: string[] = [];
+
+    for (const probe of probes(queries)) {
+      for (const value of hostile) {
+        try {
+          expect(probe.run(value)).toStrictEqual(probe.empty);
+        } catch (error) {
+          // An assertion failure and a throw from the query are both failures,
+          // and the message has to say which: a wrong answer is a contract
+          // problem, a throw is the crash this suite exists to prevent.
+          const cause = error instanceof Error ? error.message : String(error);
+          (cause.startsWith('expected') ? wrong : thrown).push(
+            `${probe.label} with ${typeof value === 'symbol' ? 'Symbol()' : String(JSON.stringify(value) ?? value)}: ${cause.split('\n')[0] ?? ''}`,
+          );
+        }
+      }
+    }
+
+    expect({ thrown, wrong }).toStrictEqual({ thrown: [], wrong: [] });
+  });
+
+  it('records the refusal at debug level, naming the query and the argument by type only', () => {
+    const recorder = createRecordingLogger();
+    const queries = createCodeQueries(sampleGraph(), { logger: recorder.logger });
+
+    queries.findByName(null as unknown as string);
+
+    const refusal = recorder.lines.find(
+      (line) =>
+        line.message === 'refused a query argument that is not the shape the query declares',
+    );
+    assertDefined(refusal, 'a refused argument must be recorded');
+    expect(refusal.level).toBe('debug');
+    expect(refusal.fields).toStrictEqual({
+      query: 'findByName',
+      argument: 'name',
+      received: 'null',
+    });
+  });
+
+  it('reads one kind name where a list of kinds was declared', () => {
+    const queries = createCodeQueries(sampleGraph());
+
+    const repaired = queries.findByName('WidgetList', {
+      kinds: 'component' as unknown as readonly CodeNodeKind[],
+    });
+
+    expect(repaired.map((match: CodeMatch) => match.kind)).toStrictEqual(['component']);
+  });
+
+  it('narrows to nothing rather than widening when a kind filter cannot be honoured', () => {
+    const queries = createCodeQueries(sampleGraph());
+
+    expect(
+      queries.findByName('WidgetList', { kinds: 123 as unknown as readonly CodeNodeKind[] }),
+    ).toStrictEqual([]);
+    expect(
+      queries.findByName('WidgetList', {
+        kinds: ['nonsense'] as unknown as readonly CodeNodeKind[],
+      }),
+    ).toStrictEqual([]);
+    // The control: the same call with the filter absent does find the component,
+    // so the empty answers above are the filter's doing and not the name's.
+    expect(queries.findByName('WidgetList').length).toBeGreaterThan(0);
+  });
+
+  it('ignores an edge-kind filter that names nothing, without crashing the search', () => {
+    const queries = createCodeQueries(sampleGraph());
+
+    // A filter naming no known edge kind is an unhonourable narrowing, which is
+    // the documented "matches nothing" rather than an unfiltered search.
+    expect(
+      queries.pathBetween(API_ROUTE_NODE.id, SERVER_FUNCTION_NODE.id, {
+        edgeKinds: 'nonsense' as unknown as readonly CodeEdgeKind[],
+      }),
+    ).toBeUndefined();
+    // Spelled as a single valid kind, the same shape is repaired and answers.
+    expect(
+      queries.pathBetween(API_ROUTE_NODE.id, SERVER_FUNCTION_NODE.id, {
+        edgeKinds: 'calls' as unknown as readonly CodeEdgeKind[],
+      }),
+    ).toMatchObject({ depth: 1, undirected: false });
+  });
+
+  it('keeps refusing a selector that describes no node at all', () => {
+    const queries = createCodeQueries(sampleGraph());
+
+    expect(queries.pathBetween({}, { kind: 'db-call' })).toBeUndefined();
+    expect(
+      queries.pathBetween({ name: 123 as unknown as string }, { kind: 'db-call' }),
+    ).toBeUndefined();
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * A miniature project of this suite's own
+ *
+ * Two properties below belong to neither an extractor nor a query on its own:
+ * an extractor records a relationship and a query answers with it, so a graph
+ * hand-authored here could only restate whatever the query was given. Both are
+ * therefore asserted against a project written to disk and indexed through the
+ * real `openProject`/`indexProject` path.
+ *
+ * The project is deliberately tiny and entirely neutral — a trend chip, a
+ * ledger, a settle step — with a hand-written pooled-driver stand-in beside it
+ * so nothing is installed, built or executed. `react` is imported and never
+ * resolves, which is immaterial: every extractor reads syntax.
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The files of the miniature project, by project-relative POSIX path. */
+const MINIATURE_PROJECT: ReadonlyMap<string, string> = new Map<string, string>([
+  [
+    'tsconfig.json',
+    `${JSON.stringify(
+      {
+        compilerOptions: {
+          target: 'ES2022',
+          lib: ['dom', 'ES2022'],
+          jsx: 'preserve',
+          module: 'esnext',
+          moduleResolution: 'bundler',
+          strict: true,
+          noEmit: true,
+          skipLibCheck: true,
+          isolatedModules: true,
+        },
+        include: ['**/*.ts', '**/*.tsx'],
+        exclude: ['node_modules'],
+      },
+      undefined,
+      2,
+    )}\n`,
+  ],
+
+  // ---- The memoised-component half ----------------------------------------
+  //
+  // The exported binding is the wrapper call and the function is declared under
+  // another name, which is the shape a `memo(...)` export always has. A parent
+  // renders the exported binding, so the `renders` edge and the component node
+  // have to meet on it.
+  [
+    'src/widgets/TrendChip.tsx',
+    [
+      `'use client';`,
+      ``,
+      `import { memo } from 'react';`,
+      ``,
+      `interface TrendChipProps {`,
+      `  readonly label: string;`,
+      `}`,
+      ``,
+      `function TrendChipBody(props: TrendChipProps) {`,
+      `  return <span className="chip">{props.label}</span>;`,
+      `}`,
+      ``,
+      `export const TrendChip = memo(TrendChipBody);`,
+      ``,
+    ].join('\n'),
+  ],
+  [
+    // The same shape with an explicit runtime display name, which is a third
+    // name for one component and must not displace either of the other two.
+    'src/widgets/StampBadge.tsx',
+    [
+      `'use client';`,
+      ``,
+      `import { memo } from 'react';`,
+      ``,
+      `function StampBadgeBody() {`,
+      `  return <b>stamp</b>;`,
+      `}`,
+      ``,
+      `export const StampBadge = memo(StampBadgeBody);`,
+      ``,
+      `StampBadge.displayName = 'StampBadgeChip';`,
+      ``,
+    ].join('\n'),
+  ],
+  [
+    'src/widgets/TrendPanel.tsx',
+    [
+      `'use client';`,
+      ``,
+      `import { StampBadge } from './StampBadge';`,
+      `import { TrendChip } from './TrendChip';`,
+      ``,
+      `export function TrendPanel() {`,
+      `  return (`,
+      `    <div>`,
+      `      <TrendChip label="steady" />`,
+      `      <StampBadge />`,
+      `    </div>`,
+      `  );`,
+      `}`,
+      ``,
+    ].join('\n'),
+  ],
+
+  // ---- The module-private-callee half -------------------------------------
+  [
+    'src/lib/driver.ts',
+    [
+      `export interface QueryResult {`,
+      `  rows: Record<string, unknown>[];`,
+      `  rowCount: number;`,
+      `}`,
+      ``,
+      `export class Pool {`,
+      `  query(text: string, values?: unknown[]): Promise<QueryResult> {`,
+      `    void text;`,
+      `    void values;`,
+      `    return Promise.resolve({ rows: [], rowCount: 0 });`,
+      `  }`,
+      `}`,
+      ``,
+    ].join('\n'),
+  ],
+  [
+    'src/lib/store.ts',
+    [`import { Pool } from './driver';`, ``, `export const pool = new Pool();`, ``].join('\n'),
+  ],
+  [
+    'src/lib/ledger.ts',
+    [
+      `import { pool } from './store';`,
+      ``,
+      `export async function readLedger(key: string): Promise<number> {`,
+      `  const result = await pool.query('SELECT total FROM ledger WHERE key = $1', [key]);`,
+      `  return result.rowCount;`,
+      `}`,
+      ``,
+    ].join('\n'),
+  ],
+  [
+    // Three module-private bindings and one nested one, so that the edge this
+    // module is here to prove is asserted beside the three shapes that must
+    // *not* produce one.
+    'src/lib/settle.ts',
+    [
+      `import { readLedger } from './ledger';`,
+      ``,
+      `async function attempt(key: string): Promise<number> {`,
+      `  return readLedger(key);`,
+      `}`,
+      ``,
+      `const retry = async (key: string): Promise<number> => attempt(key);`,
+      ``,
+      `function makeBudget(): (value: number) => number {`,
+      `  return (value) => value + 1;`,
+      `}`,
+      ``,
+      `const budget = makeBudget();`,
+      ``,
+      `export async function settle(key: string): Promise<number> {`,
+      `  function normalise(value: string): string {`,
+      `    return value.trim();`,
+      `  }`,
+      ``,
+      `  const total = await retry(normalise(key));`,
+      `  return budget(total);`,
+      `}`,
+      ``,
+    ].join('\n'),
+  ],
+  [
+    'app/api/settle/route.ts',
+    [
+      `import { settle } from '../../../src/lib/settle';`,
+      ``,
+      `export async function POST(request: Request): Promise<Response> {`,
+      `  const key = new URL(request.url).searchParams.get('key') ?? 'none';`,
+      `  const total = await settle(key);`,
+      ``,
+      `  return Response.json({ total });`,
+      `}`,
+      ``,
+    ].join('\n'),
+  ],
+]);
+
+describe('indexing a miniature project — what an extractor records and a query answers with', () => {
+  /** The sandbox root, created in `beforeAll` and removed in `afterAll`. */
+  let root = '';
+
+  /** The graph of the miniature project. */
+  let graph: CodeGraph;
+
+  /** The queries over that graph. */
+  let queries: CodeQueries;
+
+  /** The diagnostics the index came back with. */
+  let diagnostics: readonly IndexDiagnostic[] = [];
+
+  beforeAll(async () => {
+    root = mkdtempSync(join(tmpdir(), 'debuggen-code-analysis-graph-'));
+
+    for (const [relative, contents] of MINIATURE_PROJECT) {
+      const absolute = join(root, relative);
+
+      mkdirSync(dirname(absolute), { recursive: true });
+      writeFileSync(absolute, contents, 'utf8');
+    }
+
+    const indexed = await indexProject({ projectRoot: root });
+
+    if (!isOk(indexed)) {
+      throw new Error(`indexing the miniature project failed: ${indexed.error.message}`);
+    }
+
+    graph = indexed.value.graph;
+    queries = createCodeQueries(graph);
+    diagnostics = indexed.value.index.diagnostics ?? [];
+  });
+
+  afterAll(() => {
+    if (root !== '') {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * The names of the nodes of one kind, sorted, so a case can state what a
+   * bucket holds without holding an id.
+   *
+   * @param kind The node kind to list.
+   * @returns The names, ascending.
+   */
+  function namesOfKind(kind: CodeNodeKind): string[] {
+    return graph
+      .nodesByKind(kind)
+      .map((entry) => entry.name)
+      .sort(byteCompare);
+  }
+
+  /**
+   * The one node of a kind with a given name.
+   *
+   * @param kind The kind to look in.
+   * @param name The source-spelled name.
+   * @returns The node.
+   */
+  function onlyNode(kind: CodeNodeKind, name: string): CodeNode {
+    const matched = graph.nodesByKind(kind).filter((entry) => entry.name === name);
+
+    expect(matched.map((entry) => entry.file)).toHaveLength(1);
+
+    const first = matched[0];
+
+    assertDefined(first, `expected one ${kind} named ${name}`);
+
+    return first;
+  }
+
+  it('indexes the project without a diagnostic', () => {
+    // Every assertion below reads the graph as authoritative, which it only is
+    // if nothing was dropped on the way in — a dangling edge above all, since
+    // the two fixes under test both add edge endpoints derived rather than
+    // looked up.
+    expect(codesOf(diagnostics)).toStrictEqual([]);
+  });
+
+  /**
+   * The names of the components that render a given one, ascending.
+   *
+   * @param component The rendered component's name.
+   * @returns The rendering components' names.
+   */
+  function parentsOf(component: string): string[] {
+    return queries
+      .componentsRendering(component)
+      .map((reference) => reference.component.name)
+      .sort(byteCompare);
+  }
+
+  describe('a component exported through memo()', () => {
+    it('declares the exported binding as the component, naming the function it wraps', () => {
+      // Five, not three: the function a wrapper is applied to is itself an
+      // uppercase declaration that produces JSX, so it stays a component node
+      // in its own right. The fix adds the *export* as a component; it does not
+      // take the inner declaration away.
+      expect(namesOfKind('component')).toStrictEqual([
+        'StampBadge',
+        'StampBadgeBody',
+        'TrendChip',
+        'TrendChipBody',
+        'TrendPanel',
+      ]);
+
+      const chip = onlyNode('component', 'TrendChip');
+
+      expect(chip.file).toBe('src/widgets/TrendChip.tsx');
+      expect(chip.data).toMatchObject({
+        isClient: true,
+        isDefaultExport: false,
+        // With no explicit override, the display name falls back to the name the
+        // function was declared under, which is what React reports at runtime.
+        displayName: 'TrendChipBody',
+        implementation: 'TrendChipBody',
+      });
+    });
+
+    it('lands the renders edge on the exported binding rather than nowhere', () => {
+      const panel = onlyNode('component', 'TrendPanel');
+      const chip = onlyNode('component', 'TrendChip');
+
+      const rendered = graph
+        .outgoing(panel.id, 'renders')
+        .map((relationship) => graph.nodeById(relationship.to)?.name ?? relationship.to)
+        .sort(byteCompare);
+
+      expect(rendered).toStrictEqual(['StampBadge', 'TrendChip']);
+      expect(graph.incoming(chip.id, 'renders')).toHaveLength(1);
+    });
+
+    it('answers componentsRendering for the exported name and for the wrapped one', () => {
+      // The two names are one rendered component, and a caller holding either
+      // of them — the export a developer reads, or the display name the runtime
+      // reported — has to reach the same parent.
+      const byExport = parentsOf('TrendChip');
+      const byImplementation = parentsOf('TrendChipBody');
+
+      expect(byExport).toStrictEqual(['TrendPanel']);
+      expect(byImplementation).toStrictEqual(byExport);
+    });
+
+    it('reports the one parent once, though two nodes answer to the wrapped name', () => {
+      // `TrendChipBody` names two component nodes: the inner declaration, which
+      // is a component in its own right, and the exported binding, which claims
+      // the name as its implementation. Only the export is rendered, and the
+      // union of the two lookups has to stay a set.
+      const named = graph
+        .nodesByKind('component')
+        .filter(
+          (entry) =>
+            entry.name === 'TrendChipBody' ||
+            (entry.data as { implementation?: string }).implementation === 'TrendChipBody',
+        )
+        .map((entry) => entry.name)
+        .sort(byteCompare);
+
+      expect(named).toStrictEqual(['TrendChip', 'TrendChipBody']);
+      expect(queries.componentsRendering('TrendChipBody')).toHaveLength(1);
+    });
+
+    it('answers for an explicit display name as well, alongside the other two', () => {
+      // Three names for one component: the export, the function it wraps, and
+      // the runtime name assigned at module level.
+      expect(['StampBadge', 'StampBadgeBody', 'StampBadgeChip'].map(parentsOf)).toStrictEqual([
+        ['TrendPanel'],
+        ['TrendPanel'],
+        ['TrendPanel'],
+      ]);
+      expect(onlyNode('component', 'StampBadge').data).toMatchObject({
+        displayName: 'StampBadgeChip',
+        implementation: 'StampBadgeBody',
+      });
+    });
+
+    it('leaves findByName a name search, which is where the two names differ', () => {
+      // `componentsRendering` resolves a component by any of its names because a
+      // render edge has exactly one target. `findByName` ranks resemblance
+      // instead, so it answers about the node that carries the name — stated
+      // here so that the alias is not mistaken for a second identity.
+      const byImplementation = queries.findByName('TrendChipBody', { kinds: ['component'] });
+
+      expect(byImplementation.map((match: CodeMatch) => [match.name, match.score])).toStrictEqual([
+        ['TrendChipBody', 1],
+      ]);
+      expect(byImplementation.map((match: CodeMatch) => match.nodeId)).toStrictEqual([
+        onlyNode('component', 'TrendChipBody').id,
+      ]);
+    });
+  });
+
+  describe('a call into a module-private function', () => {
+    it('declares the private callees as symbols, not as server functions', () => {
+      // Only the exported functions of the two service modules are server
+      // functions; the private hops between them are addressable as symbols and
+      // nothing else, which is why the `calls` edge has to be able to point at
+      // one. `normalise` is the nested declaration inside `settle`: the symbol
+      // extractor records nested named function-valued declarations too, with
+      // their enclosing chain, so the planner can name them (AAP 0.1.2's
+      // canonical plan targets exactly such a nested handler).
+      expect(namesOfKind('server-function')).toStrictEqual(['readLedger', 'settle']);
+      expect(
+        graph
+          .nodesByFile('src/lib/settle.ts')
+          .filter((entry) => entry.kind === 'symbol')
+          .map((entry) => entry.name)
+          .sort(byteCompare),
+      ).toStrictEqual(['attempt', 'budget', 'makeBudget', 'normalise', 'retry', 'settle']);
+      expect(onlyNode('symbol', 'attempt').data).toMatchObject({
+        declaration: 'function',
+        isDefaultExport: false,
+      });
+    });
+
+    it('records the calls edge into the private callee the exported function reaches', () => {
+      const settle = onlyNode('server-function', 'settle');
+      const retry = onlyNode('symbol', 'retry');
+      const attempt = onlyNode('symbol', 'attempt');
+
+      expect(
+        graph
+          .outgoing(settle.id, 'calls')
+          .map((relationship) => graph.nodeById(relationship.to)?.name),
+      ).toStrictEqual(['retry']);
+      expect(
+        graph
+          .outgoing(retry.id, 'calls')
+          .map((relationship) => graph.nodeById(relationship.to)?.name),
+      ).toStrictEqual(['attempt']);
+      expect(
+        graph
+          .outgoing(attempt.id, 'calls')
+          .map((relationship) => graph.nodeById(relationship.to)?.name),
+      ).toStrictEqual(['readLedger']);
+    });
+
+    it('walks a route handler to its query through the private hops', () => {
+      const route = onlyNode('api-route', '/api/settle');
+      const query = onlyNode('db-call', 'pool.query');
+
+      const path = queries.pathBetween(route.id, query.id);
+
+      assertDefined(path, 'the route reaches the query through its private helpers');
+      expect(path.undirected).toBe(false);
+      expect(path.nodes.map((step) => step.name)).toStrictEqual([
+        '/api/settle',
+        'settle',
+        'retry',
+        'attempt',
+        'readLedger',
+        'pool.query',
+      ]);
+      expect(hopsOf(path, graph)).toStrictEqual([
+        'calls /api/settle→settle',
+        'calls settle→retry',
+        'calls retry→attempt',
+        'calls attempt→readLedger',
+        'queries readLedger→pool.query',
+      ]);
+      expect(path.depth).toBe(5);
+      expect(path.truncated).toBe(false);
+      expect(walksNodeList(path)).toBe(true);
+    });
+
+    it('walks it from a name selector too, which is how a model asks', () => {
+      const path = queries.pathBetween({ name: 'settle' }, { kind: 'db-call' });
+
+      assertDefined(path, 'the exported entry point reaches the query');
+      expect(path.nodes.map((step) => step.name)).toStrictEqual([
+        'settle',
+        'retry',
+        'attempt',
+        'readLedger',
+        'pool.query',
+      ]);
+    });
+
+    it('names the private callers of an exported function', () => {
+      // The control for the case above, and the half that already worked: a
+      // private function has always been recognised as the *scope* a call is
+      // made from, so `whoCalls` on an exported callee named it. What was
+      // missing was the same function as a call's *target*, which is what turns
+      // these two edges into one chain.
+      expect(
+        queries
+          .whoCalls('readLedger')
+          .map((reference) => [reference.caller.kind, reference.caller.name]),
+      ).toStrictEqual([['symbol', 'attempt']]);
+    });
+
+    it('records a nested declaration with its enclosing chain, and derives no call into it', () => {
+      // `normalise` is declared inside `settle`. The symbol extractor records it
+      // as a nested symbol whose `enclosing` chain names `settle`, so the node
+      // exists and is addressable; the call-edge extractor still derives no
+      // `calls` edge into a nested callee, and an edge pointing at a derived id
+      // would be dropped on construction as dangling - which is why the
+      // diagnostics case above is part of this one's meaning. The only edge that
+      // reaches the node is the file's own `declares`.
+      const nested = graph.nodesByName('normalise');
+
+      expect(nested).toHaveLength(1);
+      expect(nested[0]).toMatchObject({
+        kind: 'symbol',
+        file: 'src/lib/settle.ts',
+        data: { declaration: 'function', enclosing: ['settle'] },
+      });
+      expect(
+        graph
+          .edges()
+          .filter((relationship) => relationship.to.includes('normalise'))
+          .map((relationship) => relationship.kind),
+      ).toStrictEqual(['declares']);
+      expect(graph.incoming(nested[0]!.id, 'calls')).toStrictEqual([]);
+    });
+
+    it('leaves a binding that is only function-valued at runtime out', () => {
+      // `budget` holds a function, but its initialiser is a call rather than a
+      // function, so nothing in the source says the call site reaches
+      // `makeBudget`'s body. Recording an edge here would assert a flow the
+      // syntax does not contain, so the conservative answer is no edge — and
+      // the symbol node still exists, so a later pass can improve on it.
+      const settle = onlyNode('server-function', 'settle');
+      const budget = onlyNode('symbol', 'budget');
+
+      expect(graph.incoming(budget.id, 'calls')).toStrictEqual([]);
+      expect(
+        graph
+          .outgoing(settle.id, 'calls')
+          .map((relationship) => graph.nodeById(relationship.to)?.name),
+      ).not.toContain('budget');
+    });
+  });
+});
+
+describe('indexing the committed corpus — the memoised specimen it carries', () => {
+  /*
+   * The suite above proves the property against a project it wrote itself. This
+   * one proves it against the corpus every other suite of the package reads, so
+   * that the shape stays in the shared fixture rather than only in a sandbox: a
+   * corpus edit that removed the wrapper would fail here, where the reason is
+   * stated, instead of silently thinning the extractor's coverage.
+   *
+   * Read-only: nothing under `../../test/fixtures` is written, and the index is
+   * built with the cache disabled so no state outlives the run.
+   */
+  const CORPUS_ROOT = fileURLToPath(
+    new URL('../../test/fixtures/sample-next-app', import.meta.url),
+  );
+
+  /** The corpus graph, and the queries over it. */
+  let corpus: { readonly graph: CodeGraph; readonly queries: CodeQueries } | undefined;
+
+  beforeAll(async () => {
+    const indexed = await indexProject({ projectRoot: CORPUS_ROOT, cache: false });
+
+    if (!isOk(indexed)) {
+      throw new Error(`indexing the corpus failed: ${indexed.error.message}`);
+    }
+
+    corpus = { graph: indexed.value.graph, queries: createCodeQueries(indexed.value.graph) };
+  });
+
+  /**
+   * The corpus graph, or a failure naming the missing `beforeAll`.
+   *
+   * @returns The graph and its queries.
+   */
+  function loaded(): { readonly graph: CodeGraph; readonly queries: CodeQueries } {
+    assertDefined(corpus, 'the corpus was not indexed: beforeAll did not run');
+
+    return corpus;
+  }
+
+  it('declares the wrapped export as a component, naming what it wraps', () => {
+    const { graph } = loaded();
+    const wrapped = graph
+      .nodesByKind('component')
+      .filter((entry) => entry.name === 'GaugeTrend')
+      .map((entry) => ({ file: entry.file, data: entry.data }));
+
+    expect(wrapped).toStrictEqual([
+      {
+        file: 'src/widgets/GaugeReadout.tsx',
+        data: {
+          isClient: true,
+          isDefaultExport: false,
+          // No display-name assignment on the wrapper, so the implementation's
+          // own name is what React would report.
+          displayName: 'GaugeTrendBody',
+          implementation: 'GaugeTrendBody',
+        },
+      },
+    ]);
+  });
+
+  it('answers componentsRendering for the corpus specimen under either name', () => {
+    const { queries } = loaded();
+    const parents = (component: string): string[] =>
+      queries
+        .componentsRendering(component)
+        .map((reference) => reference.component.name)
+        .sort(byteCompare);
+
+    expect(parents('GaugeTrend')).toStrictEqual(['GaugeTrendPanel']);
+    expect(parents('GaugeTrendBody')).toStrictEqual(['GaugeTrendPanel']);
+  });
+
+  it('keeps the corpus free of the findings that would make the above vacuous', () => {
+    // A dropped node or a dangling edge would make both cases above pass for
+    // the wrong reason, so the corpus' own cleanliness is asserted beside them.
+    const { graph } = loaded();
+
+    expect(codesOf(graph.diagnostics)).toStrictEqual([]);
   });
 });

@@ -40,11 +40,18 @@ import { ToastViewport } from '@/components/ui/ToastViewport';
  * adds no class of its own, no inline `<style>` and no `<script>`.
  *
  * THE DOCUMENT
- * `<html lang="en">` carries the document language and nothing more: there is no theme script to
- * run before paint, so there is no `suppressHydrationWarning` either, and any mismatch React
- * reports from this tree is a real one worth reading. No `<head>` element appears below - title,
- * description and icons are declared through the `metadata` export, which Next.js renders into
- * the head itself.
+ * `<html>` carries two attributes: the document language, and `data-scroll-behavior="smooth"`,
+ * which declares to the router that the smooth scrolling `globals.css` gives this element - to a
+ * reader who has not asked for less motion - is deliberate. Next.js reads that attribute before
+ * it scrolls a route transition: with it, the router neutralises the style for the length of its
+ * own scroll and restores it afterwards, so a navigation lands at the top of the new page at once
+ * while an in-page anchor still glides; without it, the transition scroll animates and Next.js
+ * reports the omission in development.
+ *
+ * There is no theme script to run before paint, so there is no `suppressHydrationWarning` either,
+ * and any mismatch React reports from this tree is a real one worth reading. No `<head>` element
+ * appears below - title, description and icons are declared through the `metadata` export, which
+ * Next.js renders into the head itself.
  */
 
 /**
@@ -123,7 +130,7 @@ interface Props {
  */
 export default function RootLayout({ children }: Props): ReactElement {
   return (
-    <html lang="en">
+    <html lang="en" data-scroll-behavior="smooth">
       <body>
         <ToastProvider>
           <ShippingEtaProvider>

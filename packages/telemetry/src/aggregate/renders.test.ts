@@ -72,7 +72,7 @@
  * this file state the same behaviour over the repository's own captures, read
  * from `packages/telemetry/test/fixtures/**` at run time:
  *
- * - `capture-batch.json` — one complete 30-event capture across all three
+ * - `capture-batch.json` — one complete 35-event capture across all three
  *   tiers, of which six are renders, two are commits and two are state
  *   changes. It is what the render grouping, the trigger histogram, the two
  *   headline counts of AAP 0.6.5' render panel and the commit-snapshot tree
@@ -3270,10 +3270,10 @@ describe('exported labels, prefixes and bounds', () => {
  * Two committed files are read here, and nothing else in the repository reads
  * them as executable input:
  *
- * - `test/fixtures/capture-batch.json` — a whole 30-event capture of one
+ * - `test/fixtures/capture-batch.json` — a whole 35-event capture of one
  *   interaction across the browser, server and database tiers, six of whose
  *   events are renders and two of whose events are commits. Every number the
- *   render panel shows is asserted against it exactly, and the twenty-two
+ *   render panel shows is asserted against it exactly, and the twenty-seven
  *   events of other kinds are the standing proof that nothing outside the
  *   render group can reach a row or a count.
  * - `test/fixtures/redaction-props-state.json` — the props/state corpus built
@@ -3483,7 +3483,7 @@ function propsStateEvents(phase: 'before' | 'after'): TelemetryEvent[] {
  */
 
 /** Events in `capture-batch.json`. */
-const CORPUS_EVENT_COUNT = 30;
+const CORPUS_EVENT_COUNT = 35;
 
 /** The one trace every event of the corpus belongs to. */
 const CORPUS_TRACE_ID = '7b1e4d92c0a53f86d24b9e017c35af68';

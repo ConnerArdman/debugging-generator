@@ -4,6 +4,7 @@ import {
   createContext,
   useContext,
   useEffect,
+  useRef,
   useState,
   type ReactElement,
   type ReactNode,
@@ -46,8 +47,22 @@ import { DispatchEtaContext } from './ShippingEtaProvider';
 /** Printed for the delivery estimate while the dispatch countdown has no reading yet. */
 const NO_DISPATCH_ETA_LABEL = '—';
 
-/** Wording for a cart failure the server did not describe in terms a buyer can act on. */
-const CART_FAILURE_LABEL = 'The cart could not be updated. Try again in a moment.';
+/** Wording for a failed read of the cart the server did not describe in terms a buyer can act on. */
+const CART_READ_FAILURE_LABEL = 'Your cart could not be read. Try again in a moment.';
+
+/** Wording for a refused change the server did not describe in terms a buyer can act on. */
+const CART_CHANGE_FAILURE_LABEL = 'That change could not be applied. Try again in a moment.';
+
+/**
+ * The heading a surface prints over a failure reading the cart.
+ *
+ * Published with the wording rather than fixed by each surface, so the heading and the sentence
+ * under it always describe the same operation; see {@link CartContextValue.cartErrorTitle}.
+ */
+const CART_READ_FAILURE_TITLE = 'Your cart could not be read';
+
+/** The heading a surface prints over a change the cart refused; see the one above. */
+const CART_CHANGE_FAILURE_TITLE = 'That change could not be applied';
 
 /**
  * Added to a failed addition the cart read back and found had put nothing in: the buyer is told
@@ -71,8 +86,10 @@ const CART_ADDITION_UNKNOWN_LABEL =
  *
  * `'loading'` covers both the first read and a later refresh, `'saving'` a change being written,
  * and `'error'` a read or write that came back unhappy - which leaves the previously published
- * cart in place so the buyer keeps seeing what they had, except where the failure was read back
- * from the server, in which case what that read found is published and the wording stays with it.
+ * cart in place so the buyer keeps seeing what they had, except in two cases: where the failure
+ * was read back from the server, in which case what that read found is published and the wording
+ * stays with it, and where a read of the cart was answered with there being no cart at all, in
+ * which case the contents go with the failure because they describe a cart that no longer exists.
  *
  * `'error'` states nothing about what the cart holds. Where the failure was the first read there
  * was never a cart to leave in place, so {@link CartContextValue.lines} is empty for want of ever
@@ -80,6 +97,25 @@ const CART_ADDITION_UNKNOWN_LABEL =
  * state while {@link CartContextValue.cartError} is non-null; see that member and `lines`.
  */
 export type CartSyncStatus = 'loading' | 'idle' | 'saving' | 'error';
+
+/**
+ * Which of the cart's two dealings with the server a failure belongs to.
+ *
+ * `'read'` is the cart being fetched - the first read, a refresh, or the read taken to find out
+ * what a refused change did - and `'change'` is a write the server refused. They are told apart
+ * because a buyer has to be told which one failed: a refused change leaves a cart that loaded
+ * perfectly, and reporting it as a cart that could not be read would send a buyer to fix something
+ * that is not broken.
+ */
+type CartFailureKind = 'read' | 'change';
+
+/** A published failure: the heading a surface prints, and the sentence under it. */
+interface CartFailureCopy {
+  /** The heading, which names the operation that failed. */
+  readonly title: string;
+  /** The sentence, which a surface may show a buyer as it stands. */
+  readonly message: string;
+}
 
 /**
  * What became of the units a failed addition asked for, as far as the cart could establish.
@@ -119,7 +155,9 @@ export interface CartContextValue {
    * An empty array is two different statements and {@link CartContextValue.cartError} is what
    * tells them apart: with no failure published it is a cart the server answered with nothing in,
    * and alongside a non-null `cartError` it is contents that could not be established - the read
-   * that would have filled this array is the one that failed. A surface must therefore not show an
+   * that would have filled this array is the one that failed, or the one that found the store has
+   * no cart for this browser at all, which takes away contents that had been read before. A
+   * surface must therefore not show an
    * empty state, "your cart is empty" or otherwise, while a failure is published: an array nobody
    * managed to fill is not a cart known to hold nothing, and the failure notice is what a buyer
    * has to act on there.
@@ -150,6 +188,18 @@ export interface CartContextValue {
    */
   readonly cartError: string | null;
   /**
+   * The heading for {@link CartContextValue.cartError}, or `null` when there is none.
+   *
+   * It names the operation that failed - reading the cart, or changing it - so a surface printing
+   * the sentence prints a heading that describes the same thing. A surface takes the heading from
+   * here rather than fixing one of its own: a notice headed for a read over wording about a
+   * refused change tells a buyer their cart is broken when a single change was turned down, and
+   * the cart in front of them is the evidence that it is not.
+   *
+   * It is `null` exactly when `cartError` is, so the two are read together.
+   */
+  readonly cartErrorTitle: string | null;
+  /**
    * Puts a quantity of one product into the cart, then publishes the cart the server answers.
    *
    * The units are added to whatever the line already holds, so a request that came back a failure
@@ -163,24 +213,44 @@ export interface CartContextValue {
   readonly addLine: (draft: CartItemDraft) => Promise<void>;
   /**
    * Sets one line's quantity on the server, then publishes the cart it answers. A quantity of zero
-   * or less takes the line out of the cart, which is the write `removeLine` performs. The promise
-   * rejects when the server refused the change, once the failure has been published on `cartError`.
+   * or less takes the line out of the cart, which is the write `removeLine` performs.
+   *
+   * A refused change is not reported until the cart has been read back from the server, for the
+   * same reason a refused addition is not: the answer to a request is not always the state of the
+   * cart. A cart found holding the quantity that was asked for - because another press had already
+   * applied it, or because the change landed and only its reply was lost - makes this the success
+   * it turned out to be, and the promise resolves with nothing said about a failure the buyer has
+   * no reason to hear about. Otherwise the contents that read found are published with wording on
+   * `cartError` and the promise rejects.
    */
   readonly setLineQuantity: (lineId: string, quantity: number) => Promise<void>;
   /**
-   * Takes one line out of the cart on the server, then publishes the cart it answers. A line this
-   * cart no longer holds is a change the server refuses, so the promise rejects - once the failure
-   * has been published on `cartError` - rather than reporting a removal that removed nothing.
+   * Takes one line out of the cart on the server, then publishes the cart it answers.
+   *
+   * A refusal is settled against a read of the cart, exactly as `setLineQuantity` describes: a
+   * line the cart no longer holds is the removal the buyer asked for, however the request was
+   * answered, so the promise resolves and no failure is published. The server refusing a line it
+   * has already taken out is the ordinary way that happens, and a buyer who saw the line go has no
+   * failure to act on. A line still in the cart is a refusal, published and rejected as one.
    */
   readonly removeLine: (lineId: string) => Promise<void>;
   /**
    * Takes every line out of the cart on the server, then publishes the cart it answers, for a
-   * buyer starting their order again. A cart that is already empty is emptied successfully; the
-   * promise rejects when the server refused the change, once the failure has been published on
-   * `cartError`.
+   * buyer starting their order again. A cart that is already empty is emptied successfully.
+   *
+   * A refusal is settled against a read of the cart, as with the two changes above: a cart found
+   * holding nothing is the emptying that was asked for, and the promise resolves.
    */
   readonly emptyCart: () => Promise<void>;
-  /** Reads the cart from the server again, replacing what is published. */
+  /**
+   * Reads the cart from the server again, replacing what is published.
+   *
+   * It is also how a surface that has learned the published cart is out of date - a page restored
+   * from the browser's back/forward cache, a tab brought back to the front, an order that has just
+   * turned this cart into one - asks for the current one. A read the store answers with there
+   * being no cart takes the published contents away with it, so a surface cannot go on quoting
+   * figures for a cart that no longer exists.
+   */
   readonly refreshCart: () => Promise<void>;
 }
 
@@ -208,16 +278,29 @@ function unitsOfProductHeld(lines: readonly CartLine[], productId: string): numb
 }
 
 /**
- * Wording for `cause` that a buyer may read as it stands.
+ * Wording for `cause` that a buyer may read as it stands, describing the operation that failed.
  *
  * A failure the server described - a rejected quantity, a product that went out of stock while the
- * page was open - carries wording written for a customer, and that wording is published. Anything
- * else is reported generically, with the status where there is one, so neither an internal message
- * nor a stack reaches the page.
+ * page was open, a cart it no longer holds - carries a sentence the store wrote for a customer,
+ * and that sentence is published. Everything else is reported in the store's own words for the
+ * operation that failed, so neither an internal message, nor a stack, nor an HTTP status reaches
+ * the page: a status is how this browser read a reply the store did not explain, which tells a
+ * buyer nothing they can act on and reads like a fault they caused.
+ *
+ * `kind` decides the generic wording, and it is what keeps that wording truthful. The same failure
+ * is a different sentence depending on what was being attempted: a page-load read that fails has
+ * not updated anything, so telling a buyer their cart could not be updated would describe an
+ * operation nobody asked for.
+ *
+ * @param cause The failure the request came back with.
+ * @param kind Which operation it belonged to; see {@link CartFailureKind}.
+ * @returns A sentence fit to show a buyer.
  */
-function cartFailureText(cause: unknown): string {
+function cartFailureText(cause: unknown, kind: CartFailureKind): string {
+  const generic = kind === 'read' ? CART_READ_FAILURE_LABEL : CART_CHANGE_FAILURE_LABEL;
+
   if (!(cause instanceof StorefrontApiError)) {
-    return CART_FAILURE_LABEL;
+    return generic;
   }
 
   switch (cause.code) {
@@ -228,10 +311,37 @@ function cartFailureText(cause: unknown): string {
     case 'MALFORMED_RESPONSE':
       return 'Lumen Supply sent a cart this page could not read. Refresh it to try again.';
     case 'INTERNAL_ERROR':
-      return `${CART_FAILURE_LABEL} (HTTP ${String(cause.status)})`;
+      // The store failing at something of its own is not a statement about this buyer's cart, so
+      // what it says about it goes in the log rather than on the page: the operation that failed
+      // and the fact that it is worth another try is the whole of what a buyer can use.
+      return generic;
     default:
-      return cause.message;
+      // Everything left is the store refusing the request and naming the condition itself - a
+      // quantity it will not hold, a line it no longer has, a cart it has closed - and those
+      // sentences are written for a customer, so they are published as they stand. A reason this
+      // browser derived from a status instead is not: its text quotes that status, which tells a
+      // buyer nothing, so the operation's own wording goes out in its place.
+      return cause.reported ? cause.message : generic;
   }
+}
+
+/** The heading published beside {@link cartFailureText} for the same operation. */
+function cartFailureHeading(kind: CartFailureKind): string {
+  return kind === 'read' ? CART_READ_FAILURE_TITLE : CART_CHANGE_FAILURE_TITLE;
+}
+
+/**
+ * Whether `cause` is the store answering that it holds no cart for this browser.
+ *
+ * It is the one failure that says something about the contents rather than about the request: a
+ * cart that is not there has no lines, so lines read from it before are no longer a reading of
+ * anything. Every other failure leaves what was last read standing.
+ *
+ * @param cause The failure a request came back with.
+ * @returns True when the store reported that there is no such cart.
+ */
+function isCartGone(cause: unknown): boolean {
+  return cause instanceof StorefrontApiError && cause.code === 'NOT_FOUND';
 }
 
 /**
@@ -270,25 +380,85 @@ export function useCartContext(): CartContextValue {
 export function CartProvider({ children }: CartProviderProps): ReactElement {
   const [cart, setCart] = useState<CartView | null>(null);
   const [syncStatus, setSyncStatus] = useState<CartSyncStatus>('loading');
-  const [cartError, setCartError] = useState<string | null>(null);
+  const [failure, setFailure] = useState<CartFailureCopy | null>(null);
+
+  /**
+   * The order the cart's requests were made in, and which of their outcomes has been published.
+   *
+   * A buyer can ask for two changes to one line faster than either can be answered - two presses
+   * of a remove button inside a single task will do it - and the two requests then come back in
+   * whatever order the store finishes them. Without this the last answer to arrive would win
+   * whatever it said, so a refusal belonging to a request the buyer has already seen superseded
+   * would replace a cart that is correct, and a slow success would put back contents a later
+   * change had taken out. `issued` hands out a ticket per request and `applied` remembers the
+   * newest one whose outcome reached the screen; see `claim`.
+   *
+   * The two agreeing is also how the cart knows nothing is outstanding, because every request
+   * publishes an outcome and the newest one always wins: a difference between them is a request
+   * still waiting to be answered. The revalidation below is the one thing that asks.
+   */
+  const sequence = useRef({ issued: 0, applied: 0 });
 
   // `null` when the layout mounted the cart outside the dispatch countdown: the totals then quote
   // no estimate, rather than taking the storefront down over a missing delivery line.
   const dispatchEta = useContext(DispatchEtaContext);
 
-  function publishServerCart(next: CartView): void {
-    setCart(next);
-    setSyncStatus('idle');
-    setCartError(null);
+  /**
+   * Claims the right to publish the outcome of the request that took `ticket`, or refuses it.
+   *
+   * An outcome arriving after a later request's outcome has already been published describes a
+   * cart that has since moved on, and the buyer is looking at the newer one. So it is dropped here
+   * rather than overwriting the screen, and the caller is told what became of its own request
+   * through the promise it is holding instead - which is the whole of what it asked for.
+   *
+   * @param ticket The ticket the request took when it was made.
+   * @returns True when this is the newest outcome so far, which is then recorded as published;
+   *   false when a later one has already been published and this one is stale.
+   */
+  function claim(ticket: number): boolean {
+    if (ticket < sequence.current.applied) {
+      return false;
+    }
+
+    sequence.current.applied = ticket;
+
+    return true;
   }
 
-  function reportCartFailure(cause: unknown): void {
-    setSyncStatus('error');
-    setCartError(cartFailureText(cause));
+  function publishServerCart(next: CartView, ticket: number): void {
+    if (!claim(ticket)) {
+      return;
+    }
+
+    setCart(next);
+    setSyncStatus('idle');
+    setFailure(null);
   }
 
   /**
-   * Publishes `contents` while leaving the cart reporting `message` as its failure.
+   * Publishes `cause` as the cart's failure, in the words of the operation it belonged to.
+   *
+   * A read the store answers with there being no cart is the one failure that also settles what
+   * the cart holds, so the published contents go with it: lines read from a cart that no longer
+   * exists are not a reading of anything, and a surface left holding them would go on listing
+   * them, offering controls over them and pricing an order against them. Every other failure
+   * leaves the last contents in place, so a buyer keeps seeing what they had.
+   */
+  function reportCartFailure(cause: unknown, kind: CartFailureKind, ticket: number): void {
+    if (!claim(ticket)) {
+      return;
+    }
+
+    if (kind === 'read' && isCartGone(cause)) {
+      setCart(null);
+    }
+
+    setSyncStatus('error');
+    setFailure({ title: cartFailureHeading(kind), message: cartFailureText(cause, kind) });
+  }
+
+  /**
+   * Publishes `contents` while leaving the cart reporting `copy` as its failure.
    *
    * For the one case that is both at once: a change the server refused, and a read of the cart
    * taken afterwards to find out what it actually holds. `publishServerCart` would clear the
@@ -296,34 +466,21 @@ export function CartProvider({ children }: CartProviderProps): ReactElement {
    * `null` is a read that did not answer either, which leaves the previously published contents
    * on screen - the same thing every other failure here does.
    */
-  function publishCartUnderFailure(contents: CartView | null, message: string): void {
+  function publishCartUnderFailure(
+    contents: CartView | null,
+    copy: CartFailureCopy,
+    ticket: number,
+  ): void {
+    if (!claim(ticket)) {
+      return;
+    }
+
     if (contents !== null) {
       setCart(contents);
     }
 
     setSyncStatus('error');
-    setCartError(message);
-  }
-
-  /**
-   * Publishes `cause` as the cart's failure and then hands it back to the caller that asked for the
-   * change.
-   *
-   * A refused change is reported in both directions on purpose. The cart publishes it, so every
-   * surface reading `cartError` shows wording a buyer can act on; and the promise the caller is
-   * holding rejects, so the control that asked - a quantity stepper, a remove button - learns that
-   * the line in front of it was not changed and can say so where the buyer is looking instead of
-   * confirming a change the server refused.
-   *
-   * `addLine` does not go through here, because a refused addition is not the same statement as a
-   * refused change: its units are added to whatever the line already held, so the request may have
-   * been carried out before it failed. It takes `settleAdditionFailure` instead, which reads the
-   * cart back first and publishes and rejects with what that read established.
-   */
-  function raiseCartFailure(cause: unknown): never {
-    reportCartFailure(cause);
-
-    throw cause;
+    setFailure(copy);
   }
 
   /**
@@ -349,11 +506,21 @@ export function CartProvider({ children }: CartProviderProps): ReactElement {
     draft: CartItemDraft,
     unitsBefore: number | null,
   ): Promise<void> {
+    const ticket = (sequence.current.issued += 1);
+
     let reconciled: CartView | null;
 
     try {
       reconciled = await loadCartContents();
-    } catch {
+    } catch (unread) {
+      if (isCartGone(unread)) {
+        // Not an outcome nobody established: the store has no cart for this browser, which is
+        // both why the addition failed and the end of the contents this page was holding.
+        reportCartFailure(unread, 'read', ticket);
+
+        throw new CartAdditionError(CART_ADDITION_UNKNOWN_LABEL, { outcome: 'unknown', cause });
+      }
+
       // The read is how the outcome would have been established, so its own failure is not a
       // second thing to tell the buyer about: it is what makes the outcome unknown below.
       reconciled = null;
@@ -364,29 +531,102 @@ export function CartProvider({ children }: CartProviderProps): ReactElement {
       const delta = unitsOfProductHeld(reconciled.lines, draft.productId) - unitsBefore;
 
       if (wanted > 0 && delta === wanted) {
-        publishServerCart(reconciled);
+        publishServerCart(reconciled, ticket);
 
         return;
       }
 
       if (delta === 0) {
-        const message = `${cartFailureText(cause)} ${CART_ADDITION_NOT_APPLIED_LABEL}`;
+        const message = `${cartFailureText(cause, 'change')} ${CART_ADDITION_NOT_APPLIED_LABEL}`;
 
-        publishCartUnderFailure(reconciled, message);
+        publishCartUnderFailure(
+          reconciled,
+          { title: cartFailureHeading('change'), message },
+          ticket,
+        );
 
         throw new CartAdditionError(message, { outcome: 'not-applied', cause });
       }
     }
 
-    publishCartUnderFailure(reconciled, CART_ADDITION_UNKNOWN_LABEL);
+    publishCartUnderFailure(
+      reconciled,
+      { title: cartFailureHeading('change'), message: CART_ADDITION_UNKNOWN_LABEL },
+      ticket,
+    );
 
     throw new CartAdditionError(CART_ADDITION_UNKNOWN_LABEL, { outcome: 'unknown', cause });
+  }
+
+  /**
+   * Works out what became of a refused change and reports it, having established it first.
+   *
+   * The cart is read from the server and `settled` asked whether the lines it came back with are
+   * what the change was asking for. They often are, and a refusal is then not something to put in
+   * front of a buyer: a second press arriving after the first has already taken a line out is
+   * refused because the line has gone, which is exactly what was wanted, and a change whose reply
+   * was lost on the way back may have been applied in full. In both cases the read is the evidence,
+   * the contents it found are published, the promise resolves, and nothing is said - which is what
+   * keeps a notice a buyer cannot act on, and a warning about a change that did happen, off the
+   * screen. A cart that still holds what it held is a refusal, published and rejected as one.
+   *
+   * A read that answers with there being no cart is neither: the cart is gone, so the contents go
+   * with it and the failure is reported as the read failure it is.
+   *
+   * `addLine` takes {@link settleAdditionFailure} instead, because an addition asks for units on
+   * top of whatever a line already holds and so has to be measured against the figure taken before
+   * the request rather than against what was asked for.
+   *
+   * @param cause The failure the change came back with.
+   * @param settled Whether the lines the cart now holds are what the change asked for.
+   * @throws The original `cause`, once the failure has been published, when they are not.
+   */
+  async function settleChangeFailure(
+    cause: unknown,
+    settled: (lines: readonly CartLine[]) => boolean,
+  ): Promise<void> {
+    const ticket = (sequence.current.issued += 1);
+
+    let reconciled: CartView;
+
+    try {
+      reconciled = await loadCartContents();
+    } catch (unread) {
+      // A read that says there is no cart is reported as itself, because it is the more important
+      // of the two failures and the only one that settles the contents. Any other read failure is
+      // what leaves the outcome unestablished, so the refusal the buyer asked about is what they
+      // are told about and the contents they had stay on screen.
+      if (isCartGone(unread)) {
+        reportCartFailure(unread, 'read', ticket);
+      } else {
+        reportCartFailure(cause, 'change', ticket);
+      }
+
+      throw cause;
+    }
+
+    if (settled(reconciled.lines)) {
+      publishServerCart(reconciled, ticket);
+
+      return;
+    }
+
+    publishCartUnderFailure(
+      reconciled,
+      { title: cartFailureHeading('change'), message: cartFailureText(cause, 'change') },
+      ticket,
+    );
+
+    throw cause;
   }
 
   // The cart lives on the server, so the browser reads it once, when the application starts. There
   // is no polling and no reading of it on a schedule: every operation below writes through to the
   // server and publishes the cart it answered with, which is the cart checkout will price the order
-  // from, and the only other read is the one a failed addition takes to find out what it did.
+  // from. The cart is read again only where something has happened that a read is the answer to -
+  // a refused change, whose outcome the read is what establishes; a document the browser restored
+  // or a tab brought back to the front, which is the effect below; and a surface calling
+  // `refreshCart` because it has learned the published cart is out of date.
   //
   // The read belongs to this mount, so it is carried out under a signal this effect owns. A cart
   // that unmounts while its first read is in flight aborts it rather than holding a connection open
@@ -394,17 +634,18 @@ export function CartProvider({ children }: CartProviderProps): ReactElement {
   // answer nor the rejection it produces is published.
   useEffect(() => {
     const controller = new AbortController();
+    const ticket = (sequence.current.issued += 1);
 
     void (async () => {
       try {
         const stored = await loadCartContents({ signal: controller.signal });
 
         if (!controller.signal.aborted) {
-          publishServerCart(stored);
+          publishServerCart(stored, ticket);
         }
       } catch (cause) {
         if (!controller.signal.aborted) {
-          reportCartFailure(cause);
+          reportCartFailure(cause, 'read', ticket);
         }
       }
     })();
@@ -414,42 +655,117 @@ export function CartProvider({ children }: CartProviderProps): ReactElement {
     };
   }, []);
 
+  // A document the browser froze and later restored - Back and Forward from a page in the same
+  // tab, which Chrome answers from its back/forward cache - comes back with the cart exactly as it
+  // was when the page was left, and no request of any kind is made for it. The cart itself lives
+  // on the server and one browser may be shopping in more than one tab, so figures from before the
+  // freeze are figures nobody can vouch for: they are what the cart held then, printed as what it
+  // holds now. The same goes for a tab brought back to the front after time spent elsewhere.
+  //
+  // So a restored or re-shown document asks the server what the cart holds, and what it answers
+  // replaces what is on screen. The status is deliberately left where it is rather than going back
+  // to 'loading': a buyer looking at their cart should see it change to the current figures when
+  // the answer lands, not watch it blank while the question is in flight.
+  //
+  // The listeners belong to this mount and are taken off with it, under a signal this effect owns,
+  // so a read still in flight when the provider goes away is abandoned rather than published.
+  useEffect(() => {
+    const controller = new AbortController();
+
+    const revalidate = (): void => {
+      // Only where nothing the cart asked for is still outstanding, which is what the two counters
+      // agreeing says: every request made so far has had its outcome published. A read started
+      // over a change still in flight would be answered by the store in either order, so it could
+      // come back with the cart as it was before that change and then be the newer of the two
+      // outcomes - which would take a change the store did apply back off the screen. The
+      // outstanding request is the better answer anyway: it publishes the cart the store returned
+      // for it, which is at least as current as this read would be.
+      if (sequence.current.issued !== sequence.current.applied) {
+        return;
+      }
+
+      const ticket = (sequence.current.issued += 1);
+
+      void (async () => {
+        try {
+          const stored = await loadCartContents({ signal: controller.signal });
+
+          if (!controller.signal.aborted) {
+            publishServerCart(stored, ticket);
+          }
+        } catch (cause) {
+          if (!controller.signal.aborted) {
+            reportCartFailure(cause, 'read', ticket);
+          }
+        }
+      })();
+    };
+
+    // `persisted` is the browser saying this document was restored rather than loaded. A first
+    // load answers `false`, and the read that belongs to it is the one above, so nothing is asked
+    // for twice.
+    const restored = (event: PageTransitionEvent): void => {
+      if (event.persisted) {
+        revalidate();
+      }
+    };
+
+    const shown = (): void => {
+      if (document.visibilityState === 'visible') {
+        revalidate();
+      }
+    };
+
+    window.addEventListener('pageshow', restored);
+    document.addEventListener('visibilitychange', shown);
+
+    return () => {
+      controller.abort();
+      window.removeEventListener('pageshow', restored);
+      document.removeEventListener('visibilitychange', shown);
+    };
+  }, []);
+
   async function addLine(draft: CartItemDraft): Promise<void> {
     // The units this cart holds of the product as the press is made, which is the figure a failed
     // addition is settled against. `null` while no cart has been published: there is no baseline
     // then, and an outcome measured against a figure that was never read would be invented.
     const unitsBefore = cart === null ? null : unitsOfProductHeld(cart.lines, draft.productId);
+    const ticket = (sequence.current.issued += 1);
 
     setSyncStatus('saving');
-    setCartError(null);
+    setFailure(null);
 
     try {
       const saved = await addCartItem(draft);
 
-      publishServerCart(saved);
+      publishServerCart(saved, ticket);
     } catch (cause) {
       await settleAdditionFailure(cause, draft, unitsBefore);
     }
   }
 
   async function refreshCart(): Promise<void> {
+    const ticket = (sequence.current.issued += 1);
+
     setSyncStatus('loading');
-    setCartError(null);
+    setFailure(null);
 
     try {
       const stored = await loadCartContents();
 
-      publishServerCart(stored);
+      publishServerCart(stored, ticket);
     } catch (cause) {
-      reportCartFailure(cause);
+      reportCartFailure(cause, 'read', ticket);
     }
   }
 
   async function setLineQuantity(lineId: string, quantity: number): Promise<void> {
     const wanted = requestedQuantity(quantity);
+    const ticket = (sequence.current.issued += 1);
 
     setSyncStatus('saving');
-    setCartError(null);
+    setFailure(null);
 
     try {
       // Asking for none of a product is the same as taking its line out of the cart, and the
@@ -459,35 +775,43 @@ export function CartProvider({ children }: CartProviderProps): ReactElement {
           ? await removeCartItem(lineId)
           : await setCartItemQuantity({ lineId, quantity: wanted });
 
-      publishServerCart(saved);
+      publishServerCart(saved, ticket);
     } catch (cause) {
-      raiseCartFailure(cause);
+      await settleChangeFailure(cause, (lines) => {
+        const held = lines.find((line) => line.id === lineId);
+
+        return wanted === 0 ? held === undefined : held?.quantity === wanted;
+      });
     }
   }
 
   async function removeLine(lineId: string): Promise<void> {
+    const ticket = (sequence.current.issued += 1);
+
     setSyncStatus('saving');
-    setCartError(null);
+    setFailure(null);
 
     try {
       const saved = await removeCartItem(lineId);
 
-      publishServerCart(saved);
+      publishServerCart(saved, ticket);
     } catch (cause) {
-      raiseCartFailure(cause);
+      await settleChangeFailure(cause, (lines) => !lines.some((line) => line.id === lineId));
     }
   }
 
   async function emptyCart(): Promise<void> {
+    const ticket = (sequence.current.issued += 1);
+
     setSyncStatus('saving');
-    setCartError(null);
+    setFailure(null);
 
     try {
       const saved = await clearCartContents();
 
-      publishServerCart(saved);
+      publishServerCart(saved, ticket);
     } catch (cause) {
-      raiseCartFailure(cause);
+      await settleChangeFailure(cause, (lines) => lines.length === 0);
     }
   }
 
@@ -503,7 +827,8 @@ export function CartProvider({ children }: CartProviderProps): ReactElement {
     estimatedDeliveryLabel: dispatchEta?.etaLabel ?? NO_DISPATCH_ETA_LABEL,
     dispatchCountdownMs: dispatchEta?.msUntilCutoff ?? null,
     syncStatus,
-    cartError,
+    cartError: failure === null ? null : failure.message,
+    cartErrorTitle: failure === null ? null : failure.title,
     addLine,
     setLineQuantity,
     removeLine,

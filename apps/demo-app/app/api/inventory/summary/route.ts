@@ -75,7 +75,12 @@ export const dynamic = 'force-dynamic';
  * string at all is a perfectly good one. `warehouseId` names one stocking
  * location by its identifier - `WarehouseSummary.id` as `@/lib/types` declares
  * it - while the short code a location is listed under is display wording only;
- * a request that carries no `warehouseId` reports on every location.
+ * a request that carries no `warehouseId` reports on every location. The two
+ * filters do not reach the same figures: the stock-state filter selects the
+ * stock lines every figure is computed over, while the movement filter is a
+ * question about the ledger and bounds the units-moved figure alone, so adding
+ * it to a request leaves the physical-stock totals, the page of lines and the
+ * low-stock list exactly as they were.
  * @returns 200 with an `InventorySummary` - the totals across the locations the
  * filters matched, those locations, the page of stock lines with the products
  * naming them, and the most urgent lines at or below their reorder point - and

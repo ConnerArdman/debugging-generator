@@ -2,12 +2,22 @@
  * Lumen Supply - one order in the order history.
  *
  * The scope of this file is exactly the `<li>`: the order reference and the date it was placed,
- * the status chip, the item count, the money total and the link to the order itself. The `<ul>`,
- * the hairline between rows, the visible column-header strip, the pager and the blank slate belong
- * to `./OrderHistoryList`, and the grid the four cells sit on belongs to
- * `./OrderHistoryRow.module.css`. This is the same split the cart group draws between a line row
- * and the list that holds it, and it is what lets the orders page render three hundred rows
- * through one component that knows nothing about how many there are.
+ * the status chip, the item count and the money total. The `<ul>`, the hairline between rows, the
+ * visible column-header strip, the pager and the blank slate belong to `./OrderHistoryList`, and
+ * the grid the four cells sit on belongs to `./OrderHistoryRow.module.css`. This is the same split
+ * the cart group draws between a line row and the list that holds it, and it is what lets the
+ * orders page render three hundred rows through one component that knows nothing about how many
+ * there are.
+ *
+ * THE ROW IS THE ORDER, AND IT LINKS NOWHERE
+ * A row carries every field this storefront records about an order in a listing - reference, date,
+ * state, units and sum - and it deliberately offers no "view order" destination, because this
+ * application serves no per-order route: its pages are the catalog, a product, the cart, checkout,
+ * this history and the inventory dashboard. A row that linked to `/orders/<id>` would be a link to
+ * a 404 on every one of the hundreds of rows a history holds, which is worse than no link at all -
+ * so the reference stays ordinary selectable text and the row holds nothing focusable. The day a
+ * per-order page exists, the anchor belongs here, wrapped around the reference, and
+ * `./OrderHistoryRow.module.css` grows the focus affordance back with it.
  *
  * A SERVER COMPONENT, AND WHY THAT IS THE WHOLE DESIGN
  * There is no client-component directive at the top of this file, no hook of any kind, no event
@@ -39,16 +49,16 @@
  *
  * ACCESSIBILITY
  * A row's cells have no headers of their own once the container is narrow enough for the strip
- * above them to hide, so each cell carries a screen-reader-only label and the anchor extends its
- * visible wording with the order reference: the link is announced as "View order" plus the order
- * it opens, never as a bare "View". The anchor is the row's only focusable element, and the
- * stylesheet draws one focus ring for the whole row from its `:focus-within`, so nothing here adds
- * a `tabIndex`. The reference itself stays ordinary selectable text rather than becoming a second
- * link to the same place.
+ * above them to hide, so each cell carries a screen-reader-only label and is announced as "Items
+ * 7" rather than as a bare "7". Below that same width the item count also prints a visible unit
+ * beside the figure, because a sighted reader loses the strip's "Items" heading exactly when the
+ * columns collapse and would otherwise be left with an unlabelled integer under the date; the unit
+ * is `aria-hidden`, so the cell is announced once rather than as "Items 7 items". The row holds
+ * nothing focusable and adds no `tabIndex`: it is data, and its four values are all read from the
+ * text.
  */
 
 import clsx from 'clsx';
-import Link from 'next/link';
 
 import type { ComponentProps, ReactElement } from 'react';
 
@@ -91,14 +101,17 @@ const ORDER_STATUS_TONES: Record<OrderStatus, OrderStatusTone> = {
   CANCELLED: 'danger',
 };
 
-/** Where an order's own page lives, for the common case of a row in the orders list. */
-const DEFAULT_HREF_BASE = '/orders';
-
 /**
- * Trailing separators on the base path, removed before the identifier is appended so that a base
- * written with or without one produces the same single-slash destination.
+ * The unit the item count is printed with when the row is narrow enough to have lost its column
+ * headings, singular and plural.
+ *
+ * Both forms are stated rather than a suffix appended to one, because the singular is what a
+ * one-line order reads with and "1 items" is the kind of wording a reader notices. The words are
+ * this file's because the figure is this file's: `@/lib/format` formats the number and takes no
+ * view on what it counts.
  */
-const TRAILING_SLASHES = /\/+$/;
+const ITEM_UNIT = 'item';
+const ITEMS_UNIT = 'items';
 
 /**
  * The row's inputs.
@@ -124,14 +137,6 @@ interface Props {
   referenceIso?: string | undefined;
 
   /**
-   * The path an order's own page hangs off; the destination is this plus the order's identifier.
-   * A caller that lists orders somewhere other than `/orders` overrides it.
-   *
-   * @default '/orders'
-   */
-  hrefBase?: string | undefined;
-
-  /**
    * The placing list's own class, composed after the module's `root` class for the margin or grid
    * position a single row cannot know about.
    */
@@ -145,12 +150,7 @@ interface Props {
  * // In the orders page, from the payload the route already resolved.
  * <OrderHistoryRow order={order} referenceIso={renderedAt} />
  */
-export function OrderHistoryRow({
-  order,
-  referenceIso,
-  hrefBase = DEFAULT_HREF_BASE,
-  className,
-}: Props): ReactElement {
+export function OrderHistoryRow({ order, referenceIso, className }: Props): ReactElement {
   const placed = formatOrderDate(order.placedAt);
 
   // Relative wording is the caller's decision, not this component's: with no reference instant
@@ -162,7 +162,16 @@ export function OrderHistoryRow({
   // fault rather than as a date this row does not have. One placeholder is the honest rendering.
   const elapsed = relative === null || relative === placed ? null : relative;
 
-  const href = `${hrefBase.replace(TRAILING_SLASHES, '')}/${encodeURIComponent(order.id)}`;
+  /*
+   * The word beside the item count in the narrow arrangement, and `null` for a count no formatter
+   * could read: `formatQuantityLabel` prints its own placeholder for a non-finite figure, and
+   * "- items" would dress a missing value up as a measured one.
+   */
+  const unit = !Number.isFinite(order.itemCount)
+    ? null
+    : order.itemCount === 1
+      ? ITEM_UNIT
+      : ITEMS_UNIT;
 
   return (
     <li className={clsx(styles.root, className)}>
@@ -189,23 +198,21 @@ export function OrderHistoryRow({
       <div className={styles.itemsCell}>
         <VisuallyHidden>{'Items '}</VisuallyHidden>
         {formatQuantityLabel(order.itemCount)}
+        {/*
+         * The unit the stylesheet reveals only once the column headings are gone, and hidden from
+         * assistive technology because the label above already names the figure. Rendered inside
+         * the cell so it inherits the cell's end alignment and tabular figures rather than
+         * becoming a second cell the header strip has no track for.
+         */}
+        {unit === null ? null : (
+          <span className={styles.itemsUnit} aria-hidden="true">{` ${unit}`}</span>
+        )}
       </div>
 
       <div className={styles.totalCell}>
         <VisuallyHidden>{'Total '}</VisuallyHidden>
         <Price cents={order.totalCents} />
       </div>
-
-      {/*
-       * `prefetch={false}` because the list this row belongs to is long: a page of orders holds
-       * dozens of rows and the history holds hundreds, and the default would fetch every visible
-       * destination in the background whether or not the reader ever opens one. Following the link
-       * still navigates on the client - only the speculative request is declined.
-       */}
-      <Link className={styles.link} href={href} prefetch={false}>
-        View order
-        <VisuallyHidden>{` ${order.orderNumber}`}</VisuallyHidden>
-      </Link>
     </li>
   );
 }

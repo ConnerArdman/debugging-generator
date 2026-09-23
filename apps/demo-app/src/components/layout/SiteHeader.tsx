@@ -44,7 +44,15 @@ import styles from './SiteHeader.module.css';
  * nothing to do with it. `PageContainer` owns the `<main id="main" tabIndex={-1}>` it points at -
  * the negative index is what lets a fragment move focus into a region that is not a control - and
  * `SiteHeader.module.css` keeps the link in the focus order while it is collapsed, so there is
- * always something to skip with.
+ * always something to skip with. While the link holds focus the stylesheet fades the brand beside
+ * it, which is the slot the revealed chip is pinned in; the lockup stays a tab stop throughout,
+ * because the bar is one fixed-height row and nothing may be shifted down to make room.
+ *
+ * That same landmark is where focus goes after a client-side route change, from the effect below:
+ * a soft navigation otherwise leaves focus on `<body>`, and the reader's next Tab re-walks this
+ * bar instead of continuing into the page they navigated to. It is the one place in the
+ * application that moves focus on a route change, and it declines to whenever focus is already
+ * somewhere that owns it.
  *
  * THE BRAND
  * A plain `<img>` with the file's intrinsic 200x40 stated as attributes, so the box is reserved
@@ -180,11 +188,13 @@ import styles from './SiteHeader.module.css';
  * closed one adds a pixel; and nothing in this file sets a height, an inline style or a second row.
  *
  * CLASS CONTRACT
- * `SiteHeader.module.css` defines thirteen classes and this file uses all thirteen - `skipLink`,
+ * `SiteHeader.module.css` defines fourteen classes and this file uses all fourteen - `skipLink`,
  * `root`, `inner`, `brand`, `logo`, `search`, `searchField`, `searchSubmit`, `searchToggle`,
- * `miniRail`, `actions`, `cartButton` and `cartBadge` - composed with `clsx` and never with an
- * inline `style`. The four wrappers exist because the primitives inside them own their own chrome
- * and the geometry around them has to live on an element of this file's own.
+ * `miniRail`, `actions`, `cartButton`, `cartControl` and `cartBadge` - composed with `clsx` and
+ * never with an inline `style`. The four wrappers exist because the primitives inside them own
+ * their own chrome and the geometry around them has to live on an element of this file's own;
+ * `cartControl` is the one exception and goes on a primitive's own element, because the room the
+ * count chip is offset into is that control's padding rather than space around it.
  */
 
 /** Where the skip link sends focus: the `id` on the `<main>` landmark `PageContainer` renders. */
@@ -425,6 +435,12 @@ export function SiteHeader(props: Props): ReactElement {
   // DOM types disagree about what a timer handle is, and this file needs neither name.
   const pending = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // The route the focus effect below has already accounted for, seeded with the route this bar
+  // mounted on. A ref rather than state: it records what that effect has done and is never read
+  // while markup is being produced, so writing it must not - and does not - schedule a render on a
+  // bar that already re-renders several times a second.
+  const previous = useRef(pathname);
+
   // The cart's figures, summed in one place for every surface that quotes them - or, where its
   // contents were never established, the reason there are no figures to quote. `contentsKnown` is
   // what tells the two apart, and the bar reads it rather than deriving the distinction from the
@@ -471,6 +487,54 @@ export function SiteHeader(props: Props): ReactElement {
     // and a field the stylesheet is not drawing cannot take focus anyway.
     field.current?.focus();
   }, [searchOpen]);
+
+  // Focus follows a soft navigation. Nothing else in the application moves it on a client-side
+  // route change, so a reader who activated a link arrives with focus on `<body>`: the page in
+  // front of them changed and their next Tab starts again at the skip link above, re-walking the
+  // whole bar before it reaches the content they navigated for.
+  //
+  // It lands on `SKIP_LINK_TARGET` - the same `#main` the skip link points at, read from the one
+  // constant, so the place a reader is sent by hand and the place they are sent on arrival are
+  // provably the same element. `PageContainer` renders that landmark with `tabIndex={-1}`, which
+  // is what lets a region that is not a control take focus at all, and its stylesheet suppresses
+  // the ring for exactly this programmatic case while leaving a genuine keyboard ring intact. It
+  // is queried from the document rather than held in a ref because the element belongs to a server
+  // component in another subtree entirely, and optional chaining rather than an assertion because
+  // a route that renders no shell - a prerendered error page - has no landmark to move to.
+  //
+  // Two guards decide whether the move happens, and they matter more than the move does. The
+  // first is the route: the ref is seeded at mount, so the effect's first run - the page the
+  // reader opened, where focus is already wherever the browser put it - moves nothing, and the
+  // ref is advanced before anything else so a run that declines to move is not retried. The
+  // second is what holds focus at that moment. `<body>`, or nothing at all, is a reader the
+  // navigation left behind; anything else is focus something owns, and taking it would be worse
+  // than the problem this fixes - an open dialog traps focus inside itself, so the cart sheet's
+  // trap keeps what it has, as does a control that survived the navigation.
+  //
+  // `preventScroll` because the router performs the route's own scroll, and a focus move that
+  // scrolled as well would compete with it for a destination - visibly so wherever the document is
+  // given smooth scrolling. The move is about where the next Tab starts, not about what is on
+  // screen, so it takes the focus and leaves the scrolling alone.
+  //
+  // The dependency is the pathname and nothing else, and the body closes over no value this
+  // component recreates, for the same reason the debounce below does: this bar re-renders several
+  // times a second on the cart provider's ticker, and an effect re-armed on those renders would
+  // pull focus out from under a reader who had put it somewhere themselves.
+  useEffect(() => {
+    if (previous.current === pathname) {
+      return;
+    }
+
+    previous.current = pathname;
+
+    const active = document.activeElement;
+
+    if (active !== null && active !== document.body) {
+      return;
+    }
+
+    document.querySelector<HTMLElement>(SKIP_LINK_TARGET)?.focus({ preventScroll: true });
+  }, [pathname]);
 
   // The debounced navigation: the same address a submit produces, sent a beat after the reader
   // stops typing, so a term reaches the catalog without one navigation per keystroke.
@@ -710,7 +774,13 @@ export function SiteHeader(props: Props): ReactElement {
           </div>
 
           <div className={styles.cartButton}>
+            {/* The one class this bar puts on a primitive's own element rather than on a wrapper:
+                the chip is positioned against this control, so the trailing room the chip needs
+                has to be the control's own padding and cannot be a box around it. The stylesheet's
+                rule is written to out-specify `Button.module.css`'s size padding - see the comment
+                there - and it travels through `clsx` for the reason the chip's own class does. */}
             <Button
+              className={clsx(styles.cartControl)}
               variant="ghost"
               size="md"
               aria-haspopup="dialog"

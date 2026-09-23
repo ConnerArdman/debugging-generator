@@ -9,7 +9,14 @@
  * - render counts and the unchanged/unknown split come from
  *   `summarizeRenderTriggers` in `./renders.js`;
  * - duplicate counting comes from `countDuplicateRequests` in `./requests.js`;
- * - statement grouping comes from `aggregateQueries` in `./queries.js`;
+ * - statement grouping comes from `aggregateQueries` in `./queries.js`, and so
+ *   does the count of statement executions: `query_count` is the sum of the
+ *   resolved groups' `executionCount`, so the metric card and the query table
+ *   beneath it are arithmetically identical by construction rather than by two
+ *   passes that happen to agree. That sibling owns which database spans are
+ *   executions at all — a lifecycle span that ran no statement and the inner of
+ *   two observations of one execution are neither — and this module does not
+ *   second-guess it;
  * - every per-tier duration is an **interval union** computed by
  *   `unionDurationMs` / `subtractIntervalsDurationMs` in `./timeline.js`;
  * - the metric **vocabulary** — the ids, their units and the semantic groups
@@ -101,7 +108,6 @@ import type { TelemetryEvent } from '../schema/event.js';
 import {
   ERROR_KINDS,
   PERF_KINDS,
-  QUERY_KINDS,
   REQUEST_KINDS,
   type TelemetryKind,
   type TelemetryTier,
@@ -372,7 +378,7 @@ export const METRIC_DEFINITIONS: Readonly<Record<MetricId, MetricDefinition>> = 
   query_count: metricDefinition(
     'query_count',
     'Queries',
-    'Database statements that ran, counted per execution.',
+    'Database statements that ran, counted per execution: the executions the query groups account for, so the card and the query table state one fact.',
   ),
   transferred_bytes: metricDefinition(
     'transferred_bytes',
@@ -666,10 +672,11 @@ export interface PrecomputedCaptureAggregates {
   /**
    * Query groups, as `aggregateQueries` returns them.
    *
-   * Consumed by {@link CaptureSummary.topQueries}. No metric is computed from
-   * it — `query_count` is counted per execution during the event scan, through
-   * the query kind group — so {@link computeMetrics} accepts it and does not
-   * need it.
+   * Consumed by {@link CaptureSummary.topQueries} **and** by `query_count`,
+   * which is the sum of these groups' `executionCount`. Supplying them is
+   * therefore what makes the card and the table one fact rather than two
+   * aggregations of one capture; omitting them has {@link computeMetrics}
+   * aggregate its own, counts-only.
    */
   readonly queries?: readonly QueryGroup[];
 }
@@ -700,9 +707,6 @@ export interface ComputeMetricsOptions {
 /** Requests the page issued: the request kind group, as a lookup. */
 const REQUEST_KIND_SET: ReadonlySet<TelemetryKind> = new Set(REQUEST_KINDS);
 
-/** Database work: the query kind group, as a lookup. */
-const QUERY_KIND_SET: ReadonlySet<TelemetryKind> = new Set(QUERY_KINDS);
-
 /** Performance-timeline entries: the perf kind group, as a lookup. */
 const PERF_KIND_SET: ReadonlySet<TelemetryKind> = new Set(PERF_KINDS);
 
@@ -722,11 +726,6 @@ const TRANSFER_SIZE_NOTE =
 /** Whether an event is one the page issued as a request. */
 function isRequestEvent(event: TelemetryEvent): boolean {
   return REQUEST_KIND_SET.has(event.kind);
-}
-
-/** Whether an event is a database statement. */
-function isQueryEvent(event: TelemetryEvent): boolean {
-  return QUERY_KIND_SET.has(event.kind);
 }
 
 /**
@@ -900,8 +899,6 @@ interface CaptureScan {
   readonly databaseIntervals: Interval[];
   /** Request occurrences. */
   requestCount: number;
-  /** Database statement executions. */
-  queryCount: number;
   /** Long tasks. */
   longTaskCount: number;
   /** Summed blocking time, in milliseconds. */
@@ -977,7 +974,6 @@ function createScan(): CaptureScan {
     serverIntervals: [],
     databaseIntervals: [],
     requestCount: 0,
-    queryCount: 0,
     longTaskCount: 0,
     blockingTimeMs: 0,
     errorCount: 0,
@@ -1077,9 +1073,6 @@ function scanEvents(events: readonly TelemetryEvent[]): CaptureScan {
 
     if (isRequestEvent(event)) {
       scan.requestCount += 1;
-    }
-    if (isQueryEvent(event)) {
-      scan.queryCount += 1;
     }
     if (isLongTaskEvent(event)) {
       scan.longTaskCount += 1;
@@ -1201,6 +1194,31 @@ function resolveQueryGroups(
   return precomputed?.queries ?? aggregateQueries(events, { maxOccurrencesPerGroup });
 }
 
+/**
+ * The statement executions a capture's query groups account for.
+ *
+ * `query_count` is this number and nothing else, the rule this module already
+ * follows for the request-group metrics (`duplicate_request_count` and
+ * `transferred_bytes` are both read off the groups rather than re-counted
+ * here): the metric card and the query table under it are then arithmetically
+ * identical **by construction**, and a reader can never be shown "24 queries"
+ * above a table whose rows sum to a different number.
+ *
+ * Counting database events instead would count the database tier's lifecycle
+ * spans — a connection acquisition, an argument serialization, a transaction
+ * boundary — and the inner of two observations of one execution, neither of
+ * which is a statement that ran. `./queries.ts` owns that judgement; this
+ * function only adds up what it decided, and every group's `executionCount` is
+ * exact whatever the occurrence bound cut.
+ */
+function countQueryExecutions(groups: readonly QueryGroup[]): number {
+  let executions = 0;
+  for (const group of groups) {
+    executions += group.executionCount;
+  }
+  return executions;
+}
+
 /*
  * ---------------------------------------------------------------------------
  * Internals: measurements
@@ -1316,8 +1334,13 @@ function toMetricValue(id: MetricId, measurement: Measurement): MetricValue {
  *   consumed context, and a render whose trigger could not be determined
  *   counts only into `render_trigger_unknown_count` — never as unchanged
  *   (AAP 0.2.3).
- * - `request_count` / `query_count` — occurrences, not groups, selected
- *   through the request and query kind groups.
+ * - `request_count` — occurrences, not groups, selected through the request
+ *   kind group.
+ * - `query_count` — statement executions, not groups: the sum of the query
+ *   groups' `executionCount`, so this card and a `queryTable` beside it cannot
+ *   disagree. `aggregateQueries` decides which database spans are executions,
+ *   and a database span that ran no statement is not one — its time is still in
+ *   `database_duration` and its event still in `kindCounts['db.query']`.
  * - `duplicate_request_count` — `countDuplicateRequests`, which sums the
  *   redundant occurrences per duplicate window.
  * - `transferred_bytes` — see {@link transferredBytesMeasurement}: the one
@@ -1357,8 +1380,9 @@ export function computeMetrics(
     options?.duplicateWindowMs,
     METRICS_ONLY_OCCURRENCE_BOUND,
   );
+  const queryGroups = resolveQueryGroups(events, precomputed, METRICS_ONLY_OCCURRENCE_BOUND);
 
-  return metricValuesFrom(scan, summarizeRenderTriggers(renderStats), requestGroups);
+  return metricValuesFrom(scan, summarizeRenderTriggers(renderStats), requestGroups, queryGroups);
 }
 
 /**
@@ -1367,18 +1391,20 @@ export function computeMetrics(
  *
  * Separated from {@link computeMetrics} so that
  * {@link computeCaptureSummary} — which has already scanned the events and
- * already aggregated for its sections — reuses both instead of scanning and
- * aggregating a second time. One scan and one aggregation per call is what
+ * already aggregated for its sections — reuses all three instead of scanning
+ * and aggregating a second time. One scan and one aggregation per call is what
  * keeps a metric card and the table beneath it arithmetically identical.
  *
  * @param scan The single pass over the events.
  * @param triggers Render totals from `summarizeRenderTriggers`.
  * @param requestGroups Request groups from `aggregateRequests`.
+ * @param queryGroups Query groups from `aggregateQueries`.
  */
 function metricValuesFrom(
   scan: CaptureScan,
   triggers: RenderTriggerSummary,
   requestGroups: readonly RequestGroup[],
+  queryGroups: readonly QueryGroup[],
 ): MetricValue[] {
   const measurements: Readonly<Record<MetricId, Measurement>> = {
     total_duration: durationMeasurement(scan.hasWindow ? scan.endTime - scan.startTime : 0),
@@ -1391,7 +1417,7 @@ function metricValuesFrom(
     unchanged_render_count: countMeasurement(triggers.unchangedRenderCount),
     render_trigger_unknown_count: countMeasurement(triggers.unknownTriggerCount),
     request_count: countMeasurement(scan.requestCount),
-    query_count: countMeasurement(scan.queryCount),
+    query_count: countMeasurement(countQueryExecutions(queryGroups)),
     transferred_bytes: transferredBytesMeasurement(scan, requestGroups),
     blocking_time: durationMeasurement(scan.blockingTimeMs),
     duplicate_request_count: countMeasurement(countDuplicateRequests(requestGroups)),
@@ -1641,7 +1667,14 @@ export function computeCaptureSummary(
   const requestGroups = resolveRequestGroups(events, undefined, options?.duplicateWindowMs, topN);
   const queryGroups = resolveQueryGroups(events, undefined, topN);
 
-  const metrics = metricValuesFrom(scan, summarizeRenderTriggers(renderStats), requestGroups);
+  // The same query groups the `topQueries` section publishes: one aggregation
+  // per call, so `query_count` and the rows below it are one fact.
+  const metrics = metricValuesFrom(
+    scan,
+    summarizeRenderTriggers(renderStats),
+    requestGroups,
+    queryGroups,
+  );
   const unavailableMetrics = metrics
     .filter((metric) => !metric.available)
     .map((metric) => metric.id);

@@ -101,9 +101,14 @@
  *   the bundler spellings (`webpack://_N_E/./src/x.ts`,
  *   `turbopack:///[project]/src/x.ts`), and rewriting them into
  *   `http://127.0.0.1:3000/...` URLs first would turn every source into an
- *   unrecognised absolute URL, which normalisation then rejects. The resolved
- *   sources this module reads therefore differ from the authored ones only by
- *   the `./` collapsing `TraceMap` always performs.
+ *   unrecognised absolute URL, which normalisation then rejects. What the
+ *   resolved sources this module reads *do* still differ from the authored ones
+ *   by is `sourceRoot` prefixing and RFC 3986 dot-segment removal — and the
+ *   second of those is not cosmetic: it discards a `'..'` that leaves the root
+ *   of an absolute path, so the resolved spelling of an escaping source reads
+ *   as an ordinary project path. Which spellings of a source may therefore be
+ *   trusted is decided in {@link sourceCandidatesFor}, and it is the one place
+ *   that decision is made.
  * - **`AnyMap` for a sectioned document, `TraceMap` otherwise.** Turbopack
  *   emits index maps, and in `@jridgewell/trace-mapping` 0.3.31 the plain
  *   `TraceMap` constructor *throws* on one (it reads `sources` before it checks
@@ -184,7 +189,7 @@ import type {
   SourceMapCache,
   SourceMapDocument,
 } from './fetch-map.js';
-import { normalizeSourcePath } from './normalize.js';
+import { hasEscapingTraversal, normalizeSourcePath, resolveSourceUnderRoot } from './normalize.js';
 
 /**
  * How many frames of one stack {@link resolveStack} will resolve by default.
@@ -1301,55 +1306,54 @@ function mappedPositionFor(
 }
 
 /**
- * A source that normalised to a path inside the project, with the spelling that
- * achieved it.
+ * A source that normalised to a path inside the project, with the spelling to
+ * query the map's own content by.
  */
 interface ProjectSource {
   /** The project-relative POSIX path. */
   readonly file: string;
 
   /**
-   * The `sources` spelling that normalised — the string to query the map's own
-   * `sourcesContent` with.
+   * The spelling to query the map's own `sourcesContent` with — the authored
+   * entry whenever the producer supplied one, because `sourceContentFor`
+   * indexes by `sources` before it falls back to `resolvedSources`.
    */
   readonly source: string;
 }
 
+/** The spellings of one source to try, and the key its content is stored under. */
+interface SourceCandidates {
+  /** The spellings, in the order they are tried. Deduplicated. */
+  readonly spellings: readonly string[];
+
+  /** What {@link ProjectSource.source} becomes when one of them normalises. */
+  readonly contentKey: string;
+}
+
 /**
- * Turns the source a mapping points at into a project-relative path, trying the
- * spelling the producer authored before the one the library resolved.
+ * Turns the source a mapping points at into a project-relative path, trying
+ * every spelling of it that may be trusted — see
+ * {@link sourceCandidatesFor} for which those are and why.
  *
- * `originalPositionFor` reports `resolvedSources[i]`, which is `sources[i]`
- * with `./` collapsed — and that collapsing loses information for one real
- * bundler form. Turbopack marks the project root of a source with a bare `./`
- * (`turbopack:///./app/(group)/page.tsx`); collapsed to
- * `turbopack:///app/(group)/page.tsx` the first path segment reads as a
- * namespace instead, and `./normalize.ts` refuses the source rather than
- * guessing. The authored entry is also the spelling that module documents
- * itself against, so it is tried first.
- *
- * The resolved spelling is still tried, second, because it is the *more*
- * complete form for a map that sets `sourceRoot` or spells its sources
- * relatively — there the authored entry alone may not say where the source
- * lives.
- *
- * @returns The path and the spelling that produced it, or `undefined` when
- * neither spelling is project source (a dependency, a bundler internal, or a
- * path escaping the project root — all already explained by
- * `normalizeSourcePath` at `debug` level).
+ * @returns The path and the content key, or `undefined` when no trustworthy
+ * spelling is project source (a dependency, a bundler internal, or a path
+ * escaping the project root — all already explained by `normalizeSourcePath`
+ * at `debug` level).
  */
 function projectFileFor(
   loaded: LoadedMap,
   resolvedSource: string,
   settings: ResolverSettings,
 ): ProjectSource | undefined {
-  for (const source of sourceSpellingsFor(loaded, resolvedSource)) {
-    const file = normalizeSourcePath(source, {
+  const { spellings, contentKey } = sourceCandidatesFor(loaded, resolvedSource);
+
+  for (const spelling of spellings) {
+    const file = normalizeSourcePath(spelling, {
       projectRoot: settings.projectRoot,
       logger: settings.logger,
     });
     if (file !== undefined) {
-      return { file, source };
+      return { file, source: contentKey };
     }
   }
 
@@ -1357,21 +1361,75 @@ function projectFileFor(
 }
 
 /**
- * The spellings of one source, authored first, deduplicated.
+ * The spellings of one source that may be trusted, authored first,
+ * deduplicated.
  *
  * {@link LoadedMap.authoredSources} and `TraceMap.resolvedSources` are parallel
  * arrays, so the authored entry is the one at the resolved entry's index. A
  * `null` entry means the producer withheld the name, and an index of `-1`
- * cannot happen for a source a mapping just reported — both fall back to the
- * resolved spelling rather than failing.
+ * cannot happen for a source a mapping just reported — both leave the resolved
+ * spelling as the only thing there is, and it is used.
+ *
+ * With an authored entry in hand there are two spellings to try, and which of
+ * them is admissible is a safety question rather than a preference:
+ *
+ * 1. **The authored entry, beneath its map's `sourceRoot` where one applies**
+ *    (`resolveSourceUnderRoot`; the entry unchanged where none does).
+ *    `originalPositionFor` reports `resolvedSources[i]`, which is `sources[i]`
+ *    with `./` collapsed — and that collapsing loses information for one real
+ *    bundler form. Turbopack marks the project root of a source with a bare
+ *    `./` (`turbopack:///./app/(group)/page.tsx`); collapsed to
+ *    `turbopack:///app/(group)/page.tsx` the first path segment reads as a
+ *    namespace instead, and `./normalize.ts` refuses the source rather than
+ *    guessing. The authored entry is also the spelling that module documents
+ *    itself against. Where a `sourceRoot` applies, the entry *under* it is what
+ *    is tried and the bare entry is not: the root is part of the source's
+ *    location, so the entry alone is an incomplete spelling — and an
+ *    incomplete spelling of `etc/passwd` beneath a root of `'../../..'` reads
+ *    as an ordinary project path. Joining here rather than reading the
+ *    library's joined form is what keeps an escaping `'..'` intact, which is
+ *    precisely what the resolved spelling does not do.
+ * 2. **The resolved spelling, only when the spelling from step 1 carries no
+ *    escaping traversal** (`hasEscapingTraversal`, asked of the joined form so
+ *    that a traversal in the `sourceRoot` counts as well). It remains worth
+ *    trying because it is the form the library actually reports mappings
+ *    against.
+ *
+ * That second gate is the one that has to be here. `resolvedSources` is built by
+ * RFC 3986 URI resolution, whose dot-segment removal silently discards a `'..'`
+ * that leaves the root of an absolute path. So a map whose `sources` reads
+ * `webpack://_N_E/../../../../etc/passwd` — which `normalizeSourcePath`
+ * refuses, correctly and at `debug` level — is reported by the tracer as
+ * `webpack://_N_E/etc/passwd`, which normalises to `etc/passwd` and is
+ * indistinguishable from a real project path. Trying that spelling would put a
+ * `SourceLocation` at `source-map` confidence on a file the project does not
+ * contain, and would do it from input nobody vouches for: a map's contents are
+ * served by the dev server on behalf of every bundle in the graph, including
+ * every third-party one. A source that cannot be read as a path at all is
+ * refused by the same rule, because resolution of such a source is a
+ * path-shaped string assembled from parts `./normalize.ts` rejected.
+ *
+ * A source with no trustworthy spelling yields no location, which is this
+ * module's ordinary skip: three other resolution routes remain (AAP 0.4.2), the
+ * cost of the refusal is one frame, and the cost of the opposite mistake is an
+ * editor opening a file the developer never wrote.
  */
-function sourceSpellingsFor(loaded: LoadedMap, resolvedSource: string): readonly string[] {
+function sourceCandidatesFor(loaded: LoadedMap, resolvedSource: string): SourceCandidates {
   const index = loaded.tracer.resolvedSources.indexOf(resolvedSource);
   const authored = index === -1 ? undefined : loaded.authoredSources[index];
 
-  return authored === undefined || authored === null || authored === resolvedSource
-    ? [resolvedSource]
-    : [authored, resolvedSource];
+  if (authored === undefined || authored === null) {
+    return { spellings: [resolvedSource], contentKey: resolvedSource };
+  }
+
+  const underRoot = resolveSourceUnderRoot(loaded.tracer.sourceRoot, authored);
+  const spellings: string[] = [underRoot];
+
+  if (underRoot !== resolvedSource && !hasEscapingTraversal(underRoot)) {
+    spellings.push(resolvedSource);
+  }
+
+  return { spellings, contentKey: authored };
 }
 
 /**

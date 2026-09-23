@@ -36,6 +36,14 @@
  * two show may be the same one, because the cart authors that wording and both places state what it
  * said rather than inventing a second account of it.
  *
+ * ONE PRESS, ONE ADDITION
+ * Two presses that reach this control before it has finished the first addition produce one
+ * request, and the thing that ensures it is the `adding` ref `addToCart` latches before its first
+ * `await` - not the button's `disabled`, which React writes at commit, and not `syncStatus`, which
+ * a handler reads as it was when that handler was created. The button's `disabled` and `busy` are
+ * what a buyer sees; the latch is what the cart relies on. `addToCart` spells out why, and it is
+ * released in a `finally` so no ending can leave the control inert.
+ *
  * THE CLOCK IS NOT READ HERE
  * The dispatch line is built from what `useShippingEta` published - the arrival wording and the
  * milliseconds left until the next collection - and never from `Date.now()` or a `new Date()`. One
@@ -59,7 +67,7 @@
  */
 
 import clsx from 'clsx';
-import { useId, useState, type ChangeEvent, type ReactElement } from 'react';
+import { useId, useRef, useState, type ChangeEvent, type ReactElement } from 'react';
 
 import { Alert } from '@/components/ui/Alert';
 import { Button } from '@/components/ui/Button';
@@ -247,6 +255,10 @@ export function AddToCartControl({
 
   const [quantity, setQuantity] = useState<number>(MIN_ORDER_QUANTITY);
 
+  // The in-flight latch of the one mutation this control performs. A ref, not state: it has to be
+  // true for the next press in the same task, and nothing renders from it (see `addToCart`).
+  const adding = useRef(false);
+
   const quantityLimit = quantityCeiling(maxQuantity);
   const orderedQuantity = clampQuantity(quantity, quantityLimit);
   const quantityChoices = Array.from(
@@ -261,14 +273,26 @@ export function AddToCartControl({
   /**
    * Ask the cart for the quantity on screen, and tell the buyer how it went.
    *
-   * The guard is the same condition the action is disabled by, so a press that arrives anyway -
-   * from a keyboard repeat, or from a click already in flight when the cart began saving - cannot
-   * start a second addition.
+   * Two guards, in the order that matters. `adding` is a synchronous latch: it is read and written
+   * before the first `await`, so a press that arrives while an addition is already on the wire is
+   * dropped whatever React has committed by then. `canAddToCart` is the state the control is
+   * disabled by, and it still answers the cases the latch says nothing about - an unorderable
+   * product, a cart that is loading, a cart saving something another part of the page started.
+   *
+   * The latch is what makes the guarantee, and it is a ref rather than state because state read
+   * inside a handler is the value from the render that created the handler: two presses dispatched
+   * in one JavaScript task - a double-click the browser delivers before React commits, a keyboard
+   * repeat, a script - both saw `syncStatus` as it was before the first one, both passed, and both
+   * posted, adding the quantity twice. Measured before this latch existed: two concurrent
+   * `POST /api/cart/items` 12 ms apart. `disabled` and `busy` on the button are presentation only;
+   * they are written at commit, 18-25 ms after the press, which is not soon enough to be a guard.
    */
   async function addToCart(): Promise<void> {
-    if (!canAddToCart) {
+    if (adding.current || !canAddToCart) {
       return;
     }
+
+    adding.current = true;
 
     const draft: CartItemDraft = { productId, quantity: orderedQuantity };
 
@@ -293,6 +317,11 @@ export function AddToCartControl({
           : `${productName} may not have been added to your cart`,
         body: customerFailureBody(cause),
       });
+    } finally {
+      // Released however the addition ended, including the endings the notice above cannot settle:
+      // a latch left closed by a failure would leave the control permanently inert while still
+      // looking pressable, which is a worse outcome than the double press it exists to prevent.
+      adding.current = false;
     }
   }
 

@@ -385,6 +385,12 @@ interface CandidateDraft {
 
   /** Whether the declaration is exported at all. */
   readonly exported: boolean;
+
+  /**
+   * The separate module-level declaration this component is a wrapper around,
+   * when it is one; becomes {@link ComponentNodeData.implementation}.
+   */
+  readonly implementation?: string | undefined;
 }
 
 /**
@@ -407,7 +413,7 @@ interface SyntaxErrorSummary {
  * with the name the runtime would report for it.
  */
 interface ComponentFunction {
-  /** The arrow function or function expression that produces the JSX. */
+  /** The arrow function, function expression or function declaration that produces the JSX. */
   readonly fn: Node;
 
   /**
@@ -419,6 +425,19 @@ interface ComponentFunction {
    * {@link ComponentNodeData.displayName}.
    */
   readonly innerName: string | undefined;
+
+  /**
+   * The name of the **separate module-level declaration** the wrapper resolved
+   * through, when it resolved through one.
+   *
+   * Set only for the referenced form — `const Widget = memo(WidgetBody)`, where
+   * `WidgetBody` is declared elsewhere in the same module and therefore has a
+   * node of its own — and absent for an inline function, whose body is inside
+   * the declaration being recorded and gets no separate node. It becomes
+   * {@link ComponentNodeData.implementation}, which is how a captured render
+   * event naming *either* half of the pair resolves to a declaration.
+   */
+  readonly implementation: string | undefined;
 }
 
 /**
@@ -771,6 +790,12 @@ function variableCandidate(
     displayName: componentDisplayName(scope, declaredName, fn.innerName) ?? declaredName,
     isDefaultExport: isDefaultExported(scope, declaredName, false),
     exported: isExported(scope, declaredName, statement.isExported()),
+    // Absent unless the wrapper resolved through a declaration of its own, and
+    // never the declarator's own name: `implementation` names a *different*
+    // declaration in this module, which is what makes it useful to a consumer.
+    ...(fn.implementation !== undefined && fn.implementation !== declaredName
+      ? { implementation: fn.implementation }
+      : {}),
   });
 }
 
@@ -811,6 +836,10 @@ function buildCandidate(scope: ModuleScope, draft: CandidateDraft): ComponentCan
       isClient: scope.isClient,
       isDefaultExport: draft.isDefaultExport,
       displayName: draft.displayName,
+      // Omitted rather than set to `undefined`: the package compiles under
+      // `exactOptionalPropertyTypes`, and an absent field is what an unwrapped
+      // component's payload has always looked like.
+      ...(draft.implementation !== undefined ? { implementation: draft.implementation } : {}),
     },
   };
 
@@ -1167,12 +1196,12 @@ function componentFunctionOf(expression: Node, depth: number): ComponentFunction
   // `() => …` — an arrow has no name of its own, so the declared identifier is
   // what the runtime reports.
   if (Node.isArrowFunction(expression)) {
-    return { fn: expression, innerName: undefined };
+    return { fn: expression, innerName: undefined, implementation: undefined };
   }
 
   // `function () { … }` and `function Inner() { … }`.
   if (Node.isFunctionExpression(expression)) {
-    return { fn: expression, innerName: expression.getName() };
+    return { fn: expression, innerName: expression.getName(), implementation: undefined };
   }
 
   // Transparent wrappers: `(fn)`, `fn as T`, `fn satisfies T`, `fn!`.
@@ -1196,7 +1225,88 @@ function componentFunctionOf(expression: Node, depth: number): ComponentFunction
     return first === undefined ? undefined : componentFunctionOf(first, depth + 1);
   }
 
+  // `memo(WidgetBody)` — the wrapped function is a *reference* to a declaration
+  // elsewhere in this module rather than an inline function. The hop counts
+  // against the same bound as a wrapper call, so a pair of declarations that
+  // reference each other terminates instead of recursing.
+  if (depth > 0 && depth < MAX_WRAPPER_DEPTH && Node.isIdentifier(expression)) {
+    return referencedComponentFunctionOf(expression, depth + 1);
+  }
+
   return undefined;
+}
+
+/**
+ * The function a module-level identifier names, when the identifier names a
+ * declaration this module makes and that declaration is a function.
+ *
+ * This is the half of the wrapper story that a purely inline reading misses.
+ * `export const Widget = memo(WidgetBody)` is one of the two ways every React
+ * codebase memoises a component, and the runtime knows the pair by *both*
+ * names — the exported binding is what other modules render, while the
+ * implementation is what a display name falls back to. Without this hop the
+ * exported binding earns no `component` node at all, so no `renders` edge can
+ * point at it from the module that renders `<Widget />` (an edge into a node
+ * nobody declares is dropped as `dangling-edge`), and the render evidence for a
+ * memoised component has no declaration to resolve against.
+ *
+ * Resolution is **syntactic and module-local**, like everything else here: the
+ * module's own function, variable and class declarations are consulted through
+ * ts-morph's name lookups, no type checker runs, and nothing is followed across
+ * a module boundary. An identifier bound by an import therefore resolves to
+ * nothing here, which is correct — the declaring module's own visit is what
+ * emits that component's node, and an edge into it resolves through
+ * {@link resolveExportedComponentId} instead.
+ *
+ * A class declaration is deliberately not resolved: `memo` takes a function
+ * component, and a class reference in that position is not a shape React
+ * renders.
+ *
+ * @param identifier The identifier written inside the wrapper call.
+ * @param depth How many hops have already been taken, for the shared bound.
+ * @returns The referenced function, its own name and the declaration's name, or
+ * `undefined` when the identifier names nothing this module declares as a
+ * function.
+ */
+function referencedComponentFunctionOf(
+  identifier: Node,
+  depth: number,
+): ComponentFunction | undefined {
+  const name = identifier.getText();
+  if (name.length === 0) {
+    return undefined;
+  }
+
+  const sourceFile = identifier.getSourceFile();
+
+  // `function WidgetBody() { … }` — the declaration *is* the function, and its
+  // own name is what the runtime reports for the wrapped pair.
+  const fn = sourceFile.getFunction(name);
+  if (fn !== undefined) {
+    return fn.isGenerator() ? undefined : { fn, innerName: name, implementation: name };
+  }
+
+  // `const WidgetBody = () => …` — one more initialiser to unwrap, which may
+  // itself be wrapped (`const Inner = memo(() => …); const Outer = memo(Inner)`).
+  const variable = sourceFile.getVariableDeclaration(name);
+  if (variable === undefined) {
+    return undefined;
+  }
+
+  const initializer = variable.getInitializer();
+  if (initializer === undefined) {
+    return undefined;
+  }
+
+  const resolved = componentFunctionOf(initializer, depth);
+  if (resolved === undefined) {
+    return undefined;
+  }
+
+  // The referenced declaration's own name wins over an anonymous inner
+  // function's absence of one, because that name is both what React reports and
+  // what the referenced declaration's own node is called.
+  return { fn: resolved.fn, innerName: resolved.innerName ?? name, implementation: name };
 }
 
 /**

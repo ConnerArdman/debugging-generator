@@ -37,13 +37,17 @@
  *     kept the typed text would be quietly lying about the cart's contents.
  *
  * WHAT IT HOLDS
- * Local `useState` is the only hook in the file, twice over: the draft the field displays, and the
- * `quantity` the reconciliation above compares against. No effect, no ref, no context read and no
- * DOM read, so everything this control renders is a function of its props and those two values.
+ * Local `useState`, twice over - the draft the field displays, and the `quantity` the
+ * reconciliation above compares against - plus one `useId`, whose only job is to keep this
+ * instance's DOM ids apart from those of every other instance (see `idFragment` below). No effect,
+ * no ref, no context read and no DOM read, so everything this control renders is a function of its
+ * props and those three values.
  *
  * Nothing here reads a clock, a random source, `window` or `document`, and nothing schedules a
  * timer, so the markup the server renders and the markup the browser first produces agree, and
- * editing a quantity raises no hydration warning to explain away.
+ * editing a quantity raises no hydration warning to explain away. `useId` is part of that
+ * guarantee rather than an exception to it: React issues the same value on the server and during
+ * hydration, so the `label`/`input` association is correct in the very first frame.
  *
  * APPEARANCE AND ACCESSIBILITY ARE BOTH SOMEONE ELSE'S
  * `./QuantityStepper.module.css` owns the layout and exports exactly four classes - `.root`,
@@ -60,7 +64,7 @@
 
 import clsx from 'clsx';
 import type { ReactElement } from 'react';
-import { useState } from 'react';
+import { useId, useState } from 'react';
 
 import { Button } from '@/components/ui/Button';
 import { Input } from '@/components/ui/Input';
@@ -104,6 +108,25 @@ function clampQuantity(value: number, max: number): number {
 }
 
 /**
+ * Everything in `value` that is safe to put in a DOM id and in a CSS or `querySelector` selector.
+ *
+ * The only caller is the `useId()` reading below. React's identifiers are delimited - this version
+ * issues `_R_<treeId>_` for a hydrated tree and `_r_<counter>_` for one mounted on the client, with
+ * a further `_` before the counter and an `H<n>` step for a nested `useId` - and while those
+ * characters are legal in an HTML id they have to be escaped in a selector, which makes the id
+ * awkward to use from the elements panel, from `document.querySelector` and from a stylesheet.
+ * Dropping them leaves `R2b` or `r1`, which is short, legible and selector-safe.
+ *
+ * Distinctness survives the transformation: the characters removed are the fixed underscores at the
+ * two ends and the one before the counter, so two identifiers that differ do so in the part that is
+ * kept. That is what makes the composed ids below unique per instance rather than merely
+ * unique-looking.
+ */
+function idFragment(value: string): string {
+  return value.replace(/[^A-Za-z0-9]/g, '');
+}
+
+/**
  * Props of `QuantityStepper`, intentionally local and unexported: `packages/panel-renderer`
  * publishes its own component catalog and this repository's hardcoding guard harvests this
  * workspace's multi-token identifiers into a policy no product file may then contain, so this
@@ -112,10 +135,21 @@ function clampQuantity(value: number, max: number): number {
  */
 interface Props {
   /**
-   * Identity of the cart line this control edits, used only to derive the field's DOM id. The row
-   * can derive the same id from the same line, which is why it is a prop rather than a `useId()`
-   * value: a caller that wants to move focus into this field, or point its own copy at it, needs
-   * the id to be predictable.
+   * Identity of the cart line this control edits. It is one half of the field's DOM id, and it is
+   * there to make that id legible - in the elements panel, in an accessibility audit and in
+   * telemetry, `cart-qty-<lineId>-<fragment>` says which line a control belongs to at a glance.
+   *
+   * It is NOT the whole id and the id is NOT reconstructable from it. The same line is rendered by
+   * more than one surface at a time - the drawer opens over `/cart` and over the checkout review,
+   * both of which already list that line - so an id derived from the line alone appeared twice in
+   * one document, `getElementById` answered whichever copy came first, and the other copy's
+   * `<label for>` bound to nothing and left its field with no accessible name at all. The second
+   * half of the id is therefore this instance's own `useId()` fragment, which makes both ids in
+   * this component unique by construction rather than by convention.
+   *
+   * A caller that needs the field - to move focus into it, or to point its own element at it -
+   * reads the id off the DOM (the `<label>` inside this component, or `.querySelector('input')`
+   * within the row) instead of composing it from a line id.
    */
   lineId: string;
 
@@ -186,6 +220,11 @@ export function QuantityStepper({
   // The `quantity` the draft above was built from. Its only purpose is the comparison below.
   const [syncedQuantity, setSyncedQuantity] = useState<number>(quantity);
 
+  // This instance's discriminator, read with the other hooks so every hook in the file is called
+  // in one place and before the reconciliation below can re-run this pass. It is used only to
+  // compose the two ids further down.
+  const instanceId = useId();
+
   // Prop -> state reconciliation, during render rather than in an effect (see the header). React
   // re-runs this component immediately and discards this pass without touching the DOM, so the
   // field never paints a stale value, and the guard makes it a no-op on the ~4 renders a second
@@ -195,7 +234,12 @@ export function QuantityStepper({
     setDraft(String(quantity));
   }
 
-  const quantityFieldId = `cart-qty-${lineId}`;
+  // One instance, two ids, both unique in the document however many surfaces render this line.
+  // `lineId` keeps them readable; the `useId()` fragment is what keeps them apart, and it has to be
+  // a render-time React value rather than a counter, a random number or something an effect writes,
+  // because the label association has to hold in the markup the server sends as well as in the
+  // markup the browser hydrates it into.
+  const quantityFieldId = `cart-qty-${lineId}-${idFragment(instanceId)}`;
   const quantityHintId = `${quantityFieldId}-status`;
 
   // `Number.parseInt` is the same reading the commit path takes, so what the field reports as

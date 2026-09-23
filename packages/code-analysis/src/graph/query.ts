@@ -96,6 +96,7 @@ import { matchRoute, routeMapFromIndex } from '../route-map.js';
 import type { RouteEntry, RouteEntryKind, RouteMatch } from '../route-map.js';
 
 import type { CodeGraph } from './graph.js';
+import { isCodeEdgeKind, isCodeNodeKind } from './types.js';
 import type {
   CodeEdge,
   CodeEdgeKind,
@@ -104,6 +105,7 @@ import type {
   HttpMethodName,
   ReferenceResolver,
   RouterKind,
+  SymbolDeclarationKind,
 } from './types.js';
 
 /* -------------------------------------------------------------------------------------------------
@@ -310,20 +312,27 @@ export interface CodeMatch {
 }
 
 /**
- * A node matched by file and symbol name, with the three facts an
+ * A **declaration** matched by file and symbol name, with the facts an
  * instrumentation plan needs about it.
  *
  * The result of {@link CodeQueries.findSymbol}, and the reason that query is a
  * public export rather than an internal helper:
  * `packages/instrumentation/src/feasibility.ts` rejects a plan action naming a
  * file or symbol the graph does not contain, and the patcher that would wrap
- * the function needs to know whether it is exported and whether it is `async`
- * before it can choose a template.
+ * the function needs to know whether it is exported, whether it is `async` and
+ * whether the declaration is nested before it can choose a template.
+ *
+ * Every match describes a node that **declares** the name in that file — a
+ * `symbol`, a `component` or a `server-function`. A node that merely *mentions*
+ * the name, which is what a `handler` node (a binding site) and an `api-call`
+ * or `db-call` node (a call site inside a function of that name) do, is not a
+ * declaration and never produces a match; see
+ * {@link CodeQueries.findSymbol} for why that equivalence is load-bearing.
  */
 export interface CodeSymbolMatch extends CodeMatch {
   /**
-   * The symbol name that matched — the value the caller passed, which is the
-   * node's `name` or its `symbol`.
+   * The symbol name that matched — the value the caller passed, which for a
+   * match is always the matched node's own `name`.
    */
   readonly symbol: string;
 
@@ -344,6 +353,28 @@ export interface CodeSymbolMatch extends CodeMatch {
    * or unanswered by the extractor that produced the node.
    */
   readonly isAsync?: boolean;
+
+  /**
+   * The named declarations this one is nested inside, outermost first, when it
+   * is nested at all.
+   *
+   * Forwarded from `SymbolNodeData.enclosing` — see that field for the exact
+   * semantics, including why `[]` differs from absence. Two consequences for a
+   * caller:
+   *
+   * - **Present means "not importable".** The declaration exists, a
+   *   function-timing action can address it, and no other module can reach it
+   *   whatever {@link CodeSymbolMatch.exported} says.
+   * - **It is how a plan disambiguates.** Two nested declarations in one file
+   *   can share a bare name, and the patcher refuses an ambiguous one rather
+   *   than guessing; a planner qualifies the spelling from this chain
+   *   (`CheckoutForm.submitOrder`).
+   *
+   * Absent for a module-level declaration, for a class member (whose owner is
+   * in {@link CodeMatch}'s location `symbol` instead) and for a `component` or
+   * `server-function` match, whose payloads record no chain.
+   */
+  readonly enclosing?: readonly string[];
 }
 
 /**
@@ -484,9 +515,10 @@ export interface ComponentRef {
  *
  * `from` and `to` are the **edge's own** endpoints — the direction the
  * relationship is written in — which for a hop taken by an undirected search
- * (`direction: 'both'`) is the reverse of the direction the path travels. The
- * traversal order is {@link CodePath.nodes}; this records what the relationship
- * actually says.
+ * (`direction: 'both'`) can be the reverse of the direction the path travels.
+ * The traversal order is {@link CodePath.nodes}; this records what the
+ * relationship actually says, and
+ * {@link CodePathEdge.traversedAgainstDirection} says which of the two applies.
  */
 export interface CodePathEdge {
   /** The relationship this hop followed. */
@@ -499,10 +531,33 @@ export interface CodePathEdge {
   readonly to: string;
 
   /**
+   * Whether the path travelled this relationship **backwards**: from its `to`
+   * endpoint to its `from` endpoint.
+   *
+   * Always `false` on a path found by the default downstream search, and
+   * possibly `true` on any hop of an undirected one (`direction: 'both'`),
+   * where "are these two things related at all" is answered by following an
+   * edge either way round.
+   *
+   * It exists because the alternative is a result that reads as something it is
+   * not. `edges[i]` always joins `nodes[i]` to `nodes[i + 1]`, so a consumer
+   * that chained the hops by `edges[i].to === edges[i + 1].from` — the natural
+   * reading of a call flow — saw that check fail at a reversed hop and had no
+   * way to tell a genuine flow from an undirected relation. A reversed hop
+   * means the relationship points *towards* the earlier node: two functions
+   * joined through a helper they both call are related without either calling
+   * the other, and a summary that presented that as a chain of calls would
+   * assert a flow the code does not contain. Walk {@link CodePath.nodes} for
+   * the traversal and read this field for what each hop actually states.
+   */
+  readonly traversedAgainstDirection: boolean;
+
+  /**
    * Where the relationship is written, when the edge recorded a site.
    *
    * Absent for a derived edge — one computed from two nodes rather than read
-   * off a line of source — and `resolvedBy: 'code-graph'` when present.
+   * off a line of source — and `resolvedBy: 'code-graph'` when present. The
+   * site belongs to the edge's own `from`, whichever way the path travelled it.
    */
   readonly location?: SourceLocation;
 }
@@ -524,12 +579,31 @@ export interface CodePath {
   /**
    * The hops between them, so `edges[i]` joins `nodes[i]` to `nodes[i + 1]`.
    *
-   * Exactly one shorter than {@link CodePath.nodes}.
+   * Exactly one shorter than {@link CodePath.nodes}, and ordered as a walk of
+   * that list rather than as a chain of the edges' own endpoints — which is the
+   * same thing for a downstream path and is not for an undirected one, where
+   * {@link CodePathEdge.traversedAgainstDirection} marks each hop the walk took
+   * backwards.
    */
   readonly edges: readonly CodePathEdge[];
 
   /** The number of hops: `edges.length`, and never more than `maxPathDepth`. */
   readonly depth: number;
+
+  /**
+   * Whether the search that found this path was undirected
+   * ({@link PathBetweenOptions.direction} `'both'`).
+   *
+   * The one field that answers "may I read this as a flow?" without inspecting
+   * every hop: `false` means every hop points downstream, so the node list is a
+   * genuine call/render/query chain; `true` means the path establishes that the
+   * endpoints are *connected*, and only
+   * {@link CodePathEdge.traversedAgainstDirection} per hop says how. A caller
+   * rendering evidence for a developer or a prompt should say "related to"
+   * rather than "calls" for an undirected path, and this is the field that
+   * decides which.
+   */
+  readonly undirected: boolean;
 
   /**
    * Whether a bound stopped the search before its frontier was exhausted.
@@ -802,10 +876,18 @@ export interface ExcerptOptions {
  * so `apps/local-service/src/pipeline/tools/code-tools.ts` depends on the
  * contract rather than on this implementation.
  *
- * Every method is total: an argument that is malformed, over-long or matches
- * nothing yields an empty list or `undefined`, never an exception. The
- * arguments come from a model, and a stage that crashes on a bad query has
- * turned a recoverable answer into a failed session.
+ * Every method is total, and total over *values* rather than over types: an
+ * argument that is malformed, over-long, of the wrong type altogether —
+ * `undefined`, `null`, a number, an object where a name was declared — or that
+ * simply matches nothing yields that query's empty answer (`[]`, `undefined`,
+ * `false`), never an exception. The arguments come from a model (AAP 0.4.2 has
+ * it propose the queries this surface executes), so a call that does not match
+ * the declared signature is an ordinary event, and a stage that crashed on one
+ * would have turned a recoverable answer into a failed session (AAP 0.5.5).
+ * Refusals are recorded at debug level, naming the query and the argument;
+ * see the *Argument admission* section of this module for the per-shape rules,
+ * including the one repair it makes (a single kind name where a list of kinds
+ * was declared).
  */
 export interface CodeQueries {
   /**
@@ -855,41 +937,68 @@ export interface CodeQueries {
   findByName(name: string, options?: FindByNameOptions): readonly CodeMatch[];
 
   /**
-   * Resolves one `(file, symbol)` pair to the declaration the graph holds for
-   * it.
+   * Resolves one `(file, symbol)` pair to the **declaration** the graph holds
+   * for it.
    *
    * The existence lookup the rest of the product asks before it acts on a name:
    * `packages/instrumentation/src/feasibility.ts` rejects a plan action whose
    * file or symbol is absent from the graph, and the patcher needs the
-   * `exported` and `isAsync` facts this returns before it can wrap the
-   * function.
+   * `exported`, `isAsync` and `enclosing` facts this returns before it can wrap
+   * the function. The question is therefore not "does this name occur in this
+   * file" but **"does this file declare a symbol an instrumentation action can
+   * address"**, and the two answers have to agree with the patcher's: a symbol
+   * this affirms is one `FunctionTimingPatcher` resolves to a declaration, and
+   * one it denies is one the patcher would refuse with
+   * `PATCH_TARGET_NOT_FOUND`.
+   *
+   * What follows from that, and what a caller can rely on:
+   *
+   * - **Only a node that declares the name answers.** The kinds that do are
+   *   `symbol`, `component` and `server-function`, matched on
+   *   {@link CodeNodeBase.name}. A match through {@link CodeNodeBase.symbol} is
+   *   deliberately impossible here, which excludes two whole classes of false
+   *   affirmation: a `handler` node, which is a record of a *binding* and
+   *   carries the referenced function's name even when the declaration lives in
+   *   the caller or in another file, and an `api-call` or `db-call` node, which
+   *   carries the name of the function it sits *inside*. Both remain matchable
+   *   by {@link CodeQueries.whoCalls} and {@link CodeQueries.findByName}, whose
+   *   question is the wider one.
+   * - **A type-level `symbol` node does not answer.** `type`, `interface` and
+   *   `enum` declarations vanish at runtime, and `unknown` (a namespace, an
+   *   unresolvable default export) says nothing about a body, so none of them
+   *   is a declaration to instrument.
+   * - **A nested declaration does answer**, with
+   *   {@link CodeSymbolMatch.enclosing} naming the declarations that contain it
+   *   — `submitOrder` inside `CheckoutForm` is addressable, and that is exactly
+   *   the shape AAP §6's canonical plan names.
    *
    * `file` is normalised to a POSIX project-relative path and rejected if it is
    * not one, so an absolute path, a traversal or a backslash path answers
-   * `undefined` rather than matching by accident. Among several nodes in the
-   * file bearing the symbol, the most specific wins: `server-function`, then
-   * `component`, then `handler`, then `symbol`, then anything else; ties break
-   * on position and then `id`.
+   * `undefined` rather than matching by accident. Among several declarations of
+   * the name in one file the most specific wins — `server-function`, then
+   * `component`, then `symbol` — with ties broken on position and then `id`.
    *
    * Bound: constant work per file, one index read and a scan of that file's
    * nodes.
    *
    * @param file The declaring file: project-relative, POSIX separators.
    * @param symbol The declared symbol name.
-   * @returns The declaration, or `undefined` when the file holds no such
-   * symbol.
+   * @returns The declaration, or `undefined` when the file declares no such
+   * addressable symbol.
    */
   findSymbol(file: string, symbol: string): CodeSymbolMatch | undefined;
 
   /**
-   * Whether the graph holds `symbol` in `file`.
+   * Whether `file` declares an addressable `symbol`.
    *
    * Exactly `findSymbol(file, symbol) !== undefined`, as a predicate for the
-   * many call sites that need the answer and not the facts.
+   * many call sites that need the answer and not the facts — so it carries the
+   * same semantics, including that a `handler` node never answers it and that a
+   * nested declaration does.
    *
    * @param file The declaring file: project-relative, POSIX separators.
    * @param symbol The declared symbol name.
-   * @returns `true` when the declaration exists.
+   * @returns `true` when the file declares the symbol.
    */
   hasSymbol(file: string, symbol: string): boolean;
 
@@ -1019,6 +1128,21 @@ export interface CodeQueries {
    * {@link CodeQueryLimits.maxPathNodes} expansions, both lowerable per call.
    * Unreachable within those bounds is `undefined`; reachable but with a bound
    * hit during the search sets {@link CodePath.truncated}.
+   *
+   * **A path is only a flow when it is a downstream one.** The default
+   * `direction: 'out'` answers "what does this reach", and every hop of the
+   * result then points the way the path travels. An undirected search
+   * (`direction: 'both'`) answers the weaker "are these related at all", and
+   * its result says so in two places rather than looking like the first:
+   * {@link CodePath.undirected} is `true`, and every hop the walk took
+   * backwards carries {@link CodePathEdge.traversedAgainstDirection}. Both
+   * kinds of result are read the same way — walk {@link CodePath.nodes}, where
+   * `edges[i]` is the hop from `nodes[i]` to `nodes[i + 1]`.
+   *
+   * An argument that is neither a `nodeId` string nor a selector naming at
+   * least one of `file`, `symbol`, `name` or `kind` resolves to nothing, which
+   * is `undefined` rather than a throw: these queries are executed on a model's
+   * behalf (AAP 0.4.2), so a malformed endpoint is an expected input.
    *
    * @param from The endpoint to start at.
    * @param to The endpoint to reach.
@@ -1160,6 +1284,56 @@ const SYMBOL_KIND_PREFERENCE: readonly CodeNodeKind[] = Object.freeze([
   'component',
   'handler',
   'symbol',
+]);
+
+/**
+ * The node kinds whose presence in a file asserts that the file **declares** a
+ * name, and the only kinds {@link CodeQueries.findSymbol} answers from.
+ *
+ * `symbol` is the declaration inventory itself (`../extractors/symbols.ts`
+ * emits one node per declaration, module-level, class member or nested);
+ * `component` and `server-function` describe declarations too, and are listed
+ * because a file whose component extraction succeeded while symbol extraction
+ * dropped a construct must still resolve its own component.
+ *
+ * Three kinds are pointedly **absent**, each a false affirmation the graph used
+ * to make: a `handler` node records a *binding* and carries the referenced
+ * function's name even when the declaration is a parameter, a destructured prop
+ * or another module's export; an `api-call` and a `db-call` node carry the name
+ * of the function they sit *inside*. None of the three says "this file declares
+ * this name", which is the question a feasibility check is asking.
+ *
+ * Frozen: a read-only vocabulary, and deliberately separate from
+ * {@link SYMBOL_KIND_PREFERENCE}, which orders candidates for *every* symbol
+ * lookup — including {@link CodeQueries.whoCalls}, whose wider question the
+ * excluded kinds are legitimate answers to.
+ */
+const DECLARING_NODE_KINDS: readonly CodeNodeKind[] = Object.freeze([
+  'symbol',
+  'component',
+  'server-function',
+]);
+
+/**
+ * The `symbol` declaration kinds that declare nothing an instrumentation action
+ * can address.
+ *
+ * `type`, `interface` and `enum` vanish at compilation, so no patch could wrap
+ * one and no span could ever be produced for one; `unknown` is what
+ * `../extractors/symbols.ts` records for a namespace or a default export it
+ * could not classify, which says nothing about a body being present. A
+ * `variable` is **not** here on purpose: a module-level `const` holding a
+ * non-function is a declaration the patcher resolves and then refuses on its
+ * shape, which is a different and more informative answer than "no such
+ * symbol".
+ *
+ * Frozen: a read-only vocabulary.
+ */
+const NON_ADDRESSABLE_DECLARATIONS: readonly SymbolDeclarationKind[] = Object.freeze([
+  'type',
+  'interface',
+  'enum',
+  'unknown',
 ]);
 
 /**
@@ -1708,6 +1882,109 @@ function nodeBearsSymbol(node: CodeNode, symbol: string): boolean {
 }
 
 /**
+ * Whether a node is a **declaration of** the given symbol name — the narrower
+ * test {@link CodeQueries.findSymbol} and {@link CodeQueries.hasSymbol} are
+ * built on.
+ *
+ * Three conditions, and each one closes a way the graph previously affirmed a
+ * symbol no patch could reach:
+ *
+ * 1. The name must be the node's own {@link CodeNodeBase.name}. A match through
+ *    {@link CodeNodeBase.symbol} is what let a `handler` node answer for a
+ *    function declared in a parent component, and an `api-call` or `db-call`
+ *    node answer for the function it sits inside.
+ * 2. The kind must be one of {@link DECLARING_NODE_KINDS}.
+ * 3. For a `symbol` node, the declaration kind must not be one of
+ *    {@link NON_ADDRESSABLE_DECLARATIONS}. A node with **no payload at all**
+ *    passes: the classification is unknown rather than known to be type-level,
+ *    and the honest answer for "this file declares this name" is still yes —
+ *    the patcher resolves it and refuses it on its shape if there is no body.
+ *
+ * Deliberately *not* used by {@link CodeQueries.whoCalls}, which asks the wider
+ * question "what does this name refer to here" and for which a call site
+ * bearing the name is a legitimate answer.
+ *
+ * @param node The node.
+ * @param symbol The symbol name.
+ * @returns `true` when the node declares the name.
+ */
+function nodeDeclaresSymbol(node: CodeNode, symbol: string): boolean {
+  if (node.name !== symbol || !DECLARING_NODE_KINDS.includes(node.kind)) {
+    return false;
+  }
+
+  if (node.kind !== 'symbol') {
+    return true;
+  }
+
+  const declaration = node.data?.declaration;
+
+  return declaration === undefined || !NON_ADDRESSABLE_DECLARATIONS.includes(declaration);
+}
+
+/**
+ * Orders two declarations of one name in one file for
+ * {@link CodeQueries.findSymbol}: module scope first, then
+ * {@link compareSymbolCandidates}'s kind, position and id.
+ *
+ * The extra tier exists so that this query and
+ * `packages/instrumentation/src/patch/function-timing.ts` name the **same**
+ * declaration when a file declares one name twice — a module-level
+ * `function apply()` and a nested one inside a component, say. That patcher
+ * resolves a bare name at module scope first and only descends into function
+ * bodies when module scope yields nothing, so the outer declaration is the one
+ * a bare `(file, symbol)` action patches; ordering by position alone would
+ * report the nested declaration whenever it happens to be written earlier in
+ * the file, and a planner would be told a location no patch would touch. A
+ * nested declaration stays reachable in its own right — `findByName` lists it,
+ * and its match carries the `enclosing` chain that qualifies the spelling.
+ *
+ * Applied to the `findSymbol`/`hasSymbol` candidate set only; every other query
+ * keeps `compareSymbolCandidates` unchanged.
+ *
+ * @param left The first declaration.
+ * @param right The second declaration.
+ * @returns A negative number, zero, or a positive number.
+ */
+function compareDeclarationCandidates(left: CodeNode, right: CodeNode): number {
+  const byScope = declarationScopeRank(left) - declarationScopeRank(right);
+
+  return byScope === 0 ? compareSymbolCandidates(left, right) : byScope;
+}
+
+/**
+ * `0` for a declaration at module scope or on a class, `1` for one nested
+ * inside another declaration.
+ *
+ * Read from `SymbolNodeData.enclosing`, whose presence is the graph's statement
+ * that the declaration is nested (see the field's own documentation); a kind
+ * that cannot be nested — `component`, `server-function` — is module scope by
+ * construction.
+ *
+ * @param node The declaration node.
+ * @returns Its scope rank.
+ */
+function declarationScopeRank(node: CodeNode): number {
+  return enclosingOf(node) === undefined ? 0 : 1;
+}
+
+/**
+ * The enclosing named declarations of a matched node, when its payload records
+ * them.
+ *
+ * Only a `symbol` node carries `SymbolNodeData.enclosing`, so every other kind
+ * answers `undefined` — absent rather than `[]`, which would assert "nested
+ * inside unnamed declarations", a claim no other extractor makes.
+ *
+ * @param node The node.
+ * @returns The chain, outermost first, or `undefined` when the node is not a
+ * nested declaration or does not record one.
+ */
+function enclosingOf(node: CodeNode): readonly string[] | undefined {
+  return node.kind === 'symbol' ? node.data?.enclosing : undefined;
+}
+
+/**
  * Whether a declaration is exported from its file.
  *
  * The base field when the extractor filled it, the per-kind payload when it
@@ -1857,6 +2134,245 @@ function resolveLimits(overrides: Partial<CodeQueryLimits> | undefined): CodeQue
 }
 
 /* -------------------------------------------------------------------------------------------------
+ * Argument admission
+ *
+ * Every function below turns an argument of unknown provenance into either the
+ * value this module can act on or `undefined`. They exist because this surface
+ * is executed on a **model's** behalf: AAP 0.4.2 has the model propose queries
+ * and `apps/local-service/src/pipeline/tools/code-tools.ts` execute them, so
+ * `{"name": null}` or `{"kinds": 123}` is an ordinary input rather than a
+ * programming error, and AAP 0.5.5 requires the stage to degrade rather than
+ * fail. TypeScript states the intended shapes and cannot enforce them at that
+ * boundary; these do, and the declared signatures stay exactly as they are so
+ * an in-process caller sees no difference.
+ *
+ * The rule they share: an argument that is not the shape it claims produces the
+ * query's **empty answer** — `[]`, `undefined`, `false` — never a throw and
+ * never a partial guess. The one place a shape is repaired rather than refused
+ * is a single kind name where a list was declared, which is unambiguous.
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * A value as a non-empty string, or `undefined`.
+ *
+ * Length is *not* bounded here: the internal length rule
+ * ({@link CodeQueryLimits.maxNameLength}, {@link CodeQueryLimits.maxUrlLength})
+ * stays where it is, so a too-long name keeps logging the reason it was
+ * refused.
+ *
+ * @param value Any value.
+ * @returns The string, or `undefined` when it is not a non-empty string.
+ */
+function asText(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+/**
+ * A value as a plain object whose members can be read, or `undefined`.
+ *
+ * An array is refused: every options and selector shape on this surface is a
+ * record, and an array reaching one of those positions is a caller error rather
+ * than an empty record. A function is refused for the same reason.
+ *
+ * @param value Any value.
+ * @returns The value as a readable record, or `undefined`.
+ */
+function asRecord(value: unknown): Readonly<Record<string, unknown>> | undefined {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? (value as Readonly<Record<string, unknown>>)
+    : undefined;
+}
+
+/**
+ * A value as a finite number, or `undefined`.
+ *
+ * Only finiteness is checked; the clamping the internal helpers apply
+ * ({@link clampCap}, {@link clampPosition}) is what brings a number into range,
+ * and it stays there so a caller's out-of-range hint keeps being clamped rather
+ * than refused.
+ *
+ * @param value Any value.
+ * @returns The number, or `undefined`.
+ */
+function asFiniteNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+/**
+ * A kind filter as a list of known node kinds.
+ *
+ * Three outcomes, and the middle one is the only repair on this surface:
+ *
+ * - **absent** → `undefined`, which is the documented "no filter";
+ * - **one kind name where a list was declared** (`kinds: 'component'`) → that
+ *   one kind, because the intent is unambiguous and a model writing JSON gets
+ *   this wrong routinely;
+ * - **anything else** → the known kinds it contains, which for a malformed
+ *   value is none. An empty list is the documented "matches nothing", so an
+ *   unhonourable narrowing fails **closed** rather than quietly widening the
+ *   answer to every kind.
+ *
+ * @param value The caller's `kinds` member.
+ * @returns The filter, or `undefined` for no filter.
+ */
+function asNodeKinds(value: unknown): readonly CodeNodeKind[] | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (isCodeNodeKind(value)) {
+    return Object.freeze([value]);
+  }
+
+  const candidates: readonly unknown[] = Array.isArray(value) ? value : [];
+
+  return Object.freeze(candidates.filter((candidate) => isCodeNodeKind(candidate)));
+}
+
+/**
+ * An edge-kind filter as a list of known edge kinds, with the node-kind rules
+ * of {@link asNodeKinds}.
+ *
+ * @param value The caller's `edgeKinds` member.
+ * @returns The filter, or `undefined` for no filter.
+ */
+function asEdgeKinds(value: unknown): readonly CodeEdgeKind[] | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (isCodeEdgeKind(value)) {
+    return Object.freeze([value]);
+  }
+
+  const candidates: readonly unknown[] = Array.isArray(value) ? value : [];
+
+  return Object.freeze(candidates.filter((candidate) => isCodeEdgeKind(candidate)));
+}
+
+/**
+ * A {@link CodeQueries.whoCalls} target as either a symbol name or a
+ * `(file, symbol)` pair.
+ *
+ * @param value The caller's target.
+ * @returns The target, or `undefined` when it names no symbol.
+ */
+function asCallTarget(value: unknown): string | WhoCallsTarget | undefined {
+  const name = asText(value);
+  if (name !== undefined) {
+    return name;
+  }
+
+  const record = asRecord(value);
+  if (record === undefined) {
+    return undefined;
+  }
+
+  const symbol = asText(record.symbol);
+  if (symbol === undefined) {
+    return undefined;
+  }
+
+  const file = asText(record.file);
+
+  return file === undefined ? { symbol } : { file, symbol };
+}
+
+/**
+ * A {@link CodePathEndpoint} as a `nodeId` or a selector with at least one
+ * usable member.
+ *
+ * A selector whose every member is absent or ill-typed is refused rather than
+ * widened: the internal resolver treats a fully empty selector as "no nodes",
+ * and an endpoint the caller cannot describe must not silently become "every
+ * node in the graph".
+ *
+ * @param value The caller's endpoint.
+ * @returns The endpoint, or `undefined`.
+ */
+function asEndpoint(value: unknown): CodePathEndpoint | undefined {
+  const nodeId = asText(value);
+  if (nodeId !== undefined) {
+    return nodeId;
+  }
+
+  const record = asRecord(value);
+  if (record === undefined) {
+    return undefined;
+  }
+
+  const file = asText(record.file);
+  const symbol = asText(record.symbol);
+  const name = asText(record.name);
+  const kind = isCodeNodeKind(record.kind) ? record.kind : undefined;
+
+  if (file === undefined && symbol === undefined && name === undefined && kind === undefined) {
+    return undefined;
+  }
+
+  return {
+    ...(file !== undefined ? { file } : {}),
+    ...(symbol !== undefined ? { symbol } : {}),
+    ...(name !== undefined ? { name } : {}),
+    ...(kind !== undefined ? { kind } : {}),
+  };
+}
+
+/**
+ * A {@link CodeExcerptTarget} as a `nodeId` or a file region.
+ *
+ * A region needs a file and nothing more: an absent or ill-typed `line` becomes
+ * line 1, which is what {@link clampPosition} has always done with one, so a
+ * caller that names a file without a position still gets the top of it.
+ *
+ * @param value The caller's target.
+ * @returns The target, or `undefined` when it names no file or node.
+ */
+function asExcerptTarget(value: unknown): CodeExcerptTarget | undefined {
+  const nodeId = asText(value);
+  if (nodeId !== undefined) {
+    return nodeId;
+  }
+
+  const record = asRecord(value);
+  if (record === undefined) {
+    return undefined;
+  }
+
+  const file = asText(record.file);
+  if (file === undefined) {
+    return undefined;
+  }
+
+  const endLine = asFiniteNumber(record.endLine);
+
+  return {
+    file,
+    line: asFiniteNumber(record.line) ?? 1,
+    ...(endLine !== undefined ? { endLine } : {}),
+  };
+}
+
+/**
+ * A description of a rejected argument that is safe to log: what kind of value
+ * arrived, never the value itself.
+ *
+ * Queries carry names a developer wrote and, in the excerpt case, paths — so a
+ * log line that echoed the argument would put caller data in a log this package
+ * does not own. The type is enough to debug a malformed call.
+ *
+ * @param value The rejected argument.
+ * @returns A short type description.
+ */
+function describeArgument(value: unknown): string {
+  if (value === null) {
+    return 'null';
+  }
+
+  return Array.isArray(value) ? 'array' : typeof value;
+}
+
+/* -------------------------------------------------------------------------------------------------
  * Factory
  * ---------------------------------------------------------------------------------------------- */
 
@@ -1948,6 +2464,36 @@ export function createCodeQueries(graph: CodeGraph, options?: CodeQueryOptions):
   };
 
   /**
+   * The nodes of one file that **declare** a symbol name, most specific first —
+   * the candidate set of {@link CodeQueries.findSymbol} and
+   * {@link CodeQueries.hasSymbol}, and of nothing else.
+   *
+   * Separate from `symbolCandidates` rather than a narrowing of it because the
+   * two answer different questions: this one asks "does this file declare a
+   * symbol an instrumentation action can address" (see
+   * {@link nodeDeclaresSymbol}), while `symbolCandidates` asks "which nodes of
+   * this file bear this name", which is what `callTargets` needs and must keep.
+   * The file guard, the normalisation and the ordering are the same, so a
+   * caller sees the same behaviour for an unusable path and the same
+   * "most specific kind, then position, then id" winner among the survivors —
+   * after {@link compareDeclarationCandidates} has put a module-scope
+   * declaration ahead of a nested one, so that a shadowed name resolves to the
+   * declaration the function-timing patcher wraps for it.
+   */
+  const declarationCandidates = (file: string, symbol: string): readonly CodeNode[] => {
+    const normalized = safeRelative(file);
+    if (normalized === undefined) {
+      logger.debug('rejected a file argument that is not a safe project-relative path', { file });
+      return EMPTY_NODES;
+    }
+
+    const matched = graph
+      .nodesByFile(normalized)
+      .filter((node) => nodeDeclaresSymbol(node, symbol));
+    return matched.length === 0 ? EMPTY_NODES : matched.sort(compareDeclarationCandidates);
+  };
+
+  /**
    * The ranked candidates for a name — see {@link CodeQueries.findByName} for
    * the contract.
    *
@@ -2015,7 +2561,7 @@ export function createCodeQueries(graph: CodeGraph, options?: CodeQueryOptions):
       return undefined;
     }
 
-    for (const node of symbolCandidates(file, symbol)) {
+    for (const node of declarationCandidates(file, symbol)) {
       const location = locationOf(node);
       if (location === undefined) {
         logger.debug('dropped a node whose file is not a safe project-relative path', {
@@ -2026,6 +2572,7 @@ export function createCodeQueries(graph: CodeGraph, options?: CodeQueryOptions):
       }
 
       const isAsync = asyncOf(node);
+      const enclosing = enclosingOf(node);
       return Object.freeze({
         nodeId: node.id,
         kind: node.kind,
@@ -2035,6 +2582,10 @@ export function createCodeQueries(graph: CodeGraph, options?: CodeQueryOptions):
         symbol,
         exported: exportedOf(node),
         ...(isAsync !== undefined ? { isAsync } : {}),
+        // Forwarded only when the node records it: absence is the statement
+        // "module scope or a class member", which a `[]` here would contradict
+        // (and `exactOptionalPropertyTypes` keeps the two apart).
+        ...(enclosing !== undefined ? { enclosing } : {}),
       });
     }
 
@@ -2329,14 +2880,43 @@ export function createCodeQueries(graph: CodeGraph, options?: CodeQueryOptions):
     return handlers.length === 0 ? EMPTY_HANDLERS : Object.freeze(handlers);
   };
 
-  /** The `component` nodes a name refers to, by name and then by display name. */
+  /**
+   * The `component` nodes a name refers to: the declaration named that, the
+   * declarations whose runtime display name is that, and the wrappers whose
+   * implementation is that — de-duplicated, in the graph's canonical node order.
+   *
+   * A **union** rather than a first-match cascade, because a wrapped component
+   * is known by two names and a captured render event carries only one of them.
+   * `const Widget = memo(WidgetBody)` puts the `renders` edges on `Widget`
+   * (that is the binding other modules render) while React may report either
+   * name depending on whether the wrapper carries an explicit display name — so
+   * a cascade that stopped at the first name match answered "nothing renders
+   * this" for whichever half the caller happened not to name. Both halves now
+   * lead to the same parents.
+   */
   const componentNodesNamed = (component: string): readonly CodeNode[] => {
-    const named = graph.nodesByName(component).filter((node) => node.kind === 'component');
-    if (named.length > 0) {
-      return named;
+    const collected = new Map<string, CodeNode>();
+
+    for (const node of graph.nodesByName(component)) {
+      if (node.kind === 'component') {
+        collected.set(node.id, node);
+      }
     }
 
-    return graph.nodesByKind('component').filter((node) => node.data.displayName === component);
+    for (const node of graph.nodesByKind('component')) {
+      if (node.data.displayName === component || node.data.implementation === component) {
+        collected.set(node.id, node);
+      }
+    }
+
+    if (collected.size === 0) {
+      return EMPTY_NODES;
+    }
+
+    // `nodesByKind` is already in canonical id order and `nodesByName` is a
+    // subset of the same set, so sorting by id restores one deterministic order
+    // over the union whichever tier contributed a node first.
+    return [...collected.values()].sort((left, right) => compareStrings(left.id, right.id));
   };
 
   const componentsRendering = (
@@ -2456,10 +3036,18 @@ export function createCodeQueries(graph: CodeGraph, options?: CodeQueryOptions):
     return filtered.sort((left, right) => compareStrings(left.id, right.id));
   };
 
-  /** A resolved node and edge sequence as a {@link CodePath}. */
+  /**
+   * A resolved node and edge sequence as a {@link CodePath}.
+   *
+   * `nodes` is the traversal and `edges[i]` is the hop from `nodes[i]` to
+   * `nodes[i + 1]`, so each hop's orientation is decided here — by comparing
+   * the edge's own `from` with the node the walk arrived from — rather than
+   * left for a consumer to infer from a chain that does not always chain.
+   */
   const buildPath = (
     nodes: readonly CodeNode[],
     edges: readonly CodeEdge[],
+    direction: CodePathDirection,
     truncated: boolean,
   ): CodePath | undefined => {
     const matches: CodeMatch[] = [];
@@ -2474,14 +3062,21 @@ export function createCodeQueries(graph: CodeGraph, options?: CodeQueryOptions):
     }
 
     const hops: CodePathEdge[] = [];
-    for (const edge of edges) {
+    for (const [position, edge] of edges.entries()) {
       const site = graph.nodeById(edge.from);
       const location = site === undefined ? undefined : edgeLocation(edge, site);
+      const travelledFrom = nodes[position];
       hops.push(
         Object.freeze({
           kind: edge.kind,
           from: edge.from,
           to: edge.to,
+          // A hop whose `from` is not the node the walk left is one the walk
+          // took backwards. The `undefined` case cannot arise — `edges` is
+          // always one shorter than `nodes` — and is answered `false` rather
+          // than asserted, because a fabricated orientation is worse than a
+          // conservative one.
+          traversedAgainstDirection: travelledFrom !== undefined && edge.from !== travelledFrom.id,
           ...(location !== undefined ? { location } : {}),
         }),
       );
@@ -2491,6 +3086,7 @@ export function createCodeQueries(graph: CodeGraph, options?: CodeQueryOptions):
       nodes: Object.freeze(matches),
       edges: Object.freeze(hops),
       depth: hops.length,
+      undirected: direction === 'both',
       truncated,
     });
   };
@@ -2500,6 +3096,7 @@ export function createCodeQueries(graph: CodeGraph, options?: CodeQueryOptions):
     target: CodeNode,
     links: ReadonlyMap<string, PathLink>,
     maxDepth: number,
+    direction: CodePathDirection,
     truncated: boolean,
   ): CodePath | undefined => {
     const nodes: CodeNode[] = [target];
@@ -2522,7 +3119,7 @@ export function createCodeQueries(graph: CodeGraph, options?: CodeQueryOptions):
 
     nodes.reverse();
     edges.reverse();
-    return buildPath(nodes, edges, truncated);
+    return buildPath(nodes, edges, direction, truncated);
   };
 
   const pathBetween = (
@@ -2553,7 +3150,7 @@ export function createCodeQueries(graph: CodeGraph, options?: CodeQueryOptions):
     for (const source of sources) {
       if (targetIds.has(source.id)) {
         // The endpoints name the same node: a path of one node and no hops.
-        return buildPath([source], [], false);
+        return buildPath([source], [], direction, false);
       }
       if (!visited.has(source.id)) {
         visited.add(source.id);
@@ -2592,7 +3189,7 @@ export function createCodeQueries(graph: CodeGraph, options?: CodeQueryOptions):
         links.set(nextId, { edge, from: step.node.id });
 
         if (targetIds.has(nextId)) {
-          return reconstructPath(next, links, maxDepth, truncated);
+          return reconstructPath(next, links, maxDepth, direction, truncated);
         }
         frontier.push({ node: next, depth: step.depth + 1 });
       }
@@ -2721,16 +3318,150 @@ export function createCodeQueries(graph: CodeGraph, options?: CodeQueryOptions):
     });
   };
 
+  /**
+   * Records a refused argument and answers with the query's empty result.
+   *
+   * The debug line names the query and the argument, which is what a developer
+   * debugging a malformed model-proposed call needs, and describes the value by
+   * type only (see {@link describeArgument}).
+   *
+   * @param query The query that was called.
+   * @param argument The parameter that was not usable.
+   * @param value The value that arrived.
+   * @param empty The empty answer for that query.
+   * @returns `empty`.
+   */
+  const refuse = <T>(query: string, argument: string, value: unknown, empty: T): T => {
+    logger.debug('refused a query argument that is not the shape the query declares', {
+      query,
+      argument,
+      received: describeArgument(value),
+    });
+
+    return empty;
+  };
+
+  /*
+   * The published surface. Each entry admits its arguments (see the *Argument
+   * admission* section) and then calls the implementation above, so the
+   * implementations stay written against the types they declare while the
+   * boundary stays total for the model-proposed calls of AAP 0.4.2.
+   */
   return Object.freeze({
     limits,
-    findByName,
-    findSymbol,
-    hasSymbol,
-    whoCalls,
-    routeForUrl,
-    handlersFor,
-    componentsRendering,
-    pathBetween,
-    excerpt,
+
+    findByName: (name: string, queryOptions?: FindByNameOptions): readonly CodeMatch[] => {
+      const wanted = asText(name);
+      if (wanted === undefined) {
+        return refuse('findByName', 'name', name, EMPTY_MATCHES);
+      }
+
+      const options = asRecord(queryOptions);
+      const kinds = asNodeKinds(options?.kinds);
+
+      return findByName(wanted, {
+        ...queryOptions,
+        ...(kinds !== undefined ? { kinds } : {}),
+      });
+    },
+
+    findSymbol: (file: string, symbol: string): CodeSymbolMatch | undefined => {
+      const wantedFile = asText(file);
+      const wantedSymbol = asText(symbol);
+      if (wantedFile === undefined) {
+        return refuse('findSymbol', 'file', file, undefined);
+      }
+      if (wantedSymbol === undefined) {
+        return refuse('findSymbol', 'symbol', symbol, undefined);
+      }
+
+      return findSymbol(wantedFile, wantedSymbol);
+    },
+
+    hasSymbol: (file: string, symbol: string): boolean => {
+      const wantedFile = asText(file);
+      const wantedSymbol = asText(symbol);
+      if (wantedFile === undefined) {
+        return refuse('hasSymbol', 'file', file, false);
+      }
+      if (wantedSymbol === undefined) {
+        return refuse('hasSymbol', 'symbol', symbol, false);
+      }
+
+      return hasSymbol(wantedFile, wantedSymbol);
+    },
+
+    whoCalls: (
+      target: string | WhoCallsTarget,
+      queryOptions?: WhoCallsOptions,
+    ): readonly CallerRef[] => {
+      const wanted = asCallTarget(target);
+      if (wanted === undefined) {
+        return refuse('whoCalls', 'target', target, EMPTY_CALLERS);
+      }
+
+      return whoCalls(wanted, queryOptions);
+    },
+
+    routeForUrl: (url: string): RouteQueryResult | undefined => {
+      const wanted = asText(url);
+
+      return wanted === undefined
+        ? refuse('routeForUrl', 'url', url, undefined)
+        : routeForUrl(wanted);
+    },
+
+    handlersFor: (url: string, queryOptions?: HandlersForOptions): readonly HandlerRef[] => {
+      const wanted = asText(url);
+
+      return wanted === undefined
+        ? refuse('handlersFor', 'url', url, EMPTY_HANDLERS)
+        : handlersFor(wanted, queryOptions);
+    },
+
+    componentsRendering: (
+      component: string,
+      queryOptions?: ComponentsRenderingOptions,
+    ): readonly ComponentRef[] => {
+      const wanted = asText(component);
+
+      return wanted === undefined
+        ? refuse('componentsRendering', 'component', component, EMPTY_COMPONENTS)
+        : componentsRendering(wanted, queryOptions);
+    },
+
+    pathBetween: (
+      from: CodePathEndpoint,
+      to: CodePathEndpoint,
+      queryOptions?: PathBetweenOptions,
+    ): CodePath | undefined => {
+      const source = asEndpoint(from);
+      const destination = asEndpoint(to);
+      if (source === undefined) {
+        return refuse('pathBetween', 'from', from, undefined);
+      }
+      if (destination === undefined) {
+        return refuse('pathBetween', 'to', to, undefined);
+      }
+
+      const options = asRecord(queryOptions);
+      const edgeKinds = asEdgeKinds(options?.edgeKinds);
+
+      return pathBetween(source, destination, {
+        ...queryOptions,
+        ...(edgeKinds !== undefined ? { edgeKinds } : {}),
+      });
+    },
+
+    excerpt: (
+      target: CodeExcerptTarget,
+      queryOptions?: ExcerptOptions,
+    ): CodeExcerpt | undefined => {
+      const wanted = asExcerptTarget(target);
+
+      return wanted === undefined
+        ? refuse('excerpt', 'target', target, undefined)
+        : excerpt(wanted, queryOptions);
+    },
   });
 }

@@ -32,8 +32,23 @@
  * its `busy` prop and holds the remove button with `disabled`, so those four states cannot drift
  * apart. It covers the request for the whole life of that request: it is set before the call goes
  * out and cleared in `finally` once the provider has settled, whether the cart came back changed
- * or the write was refused, so the same line cannot be committed twice while the server is still
- * deciding and no failure can strand the row in a busy state it has no way out of.
+ * or the write was refused, so no failure can strand the row in a busy state it has no way out of.
+ *
+ * WHAT ACTUALLY STOPS A SECOND WRITE IS THE LATCH, NOT `pending`
+ * "The same line cannot be committed twice while the server is still deciding" is `mutating`, a
+ * `useRef` boolean that both handlers check and set before they do anything else and clear in
+ * their `finally`. It has to be a ref: `pending` is state, and state a handler reads is the value
+ * from the render that created it, so two presses dispatched inside one JavaScript task both read
+ * `false` and both proceed - which is exactly what was measured here, two concurrent writes to one
+ * line 12 ms apart, the second of which the server answers 404 because the first one had already
+ * removed it. A ref is written the instant the first press is handled, so the second sees the
+ * latch whatever React has or has not committed by then.
+ *
+ * `pending` and the `disabled` it drives are presentation on top of that: they dim the row, hold
+ * the controls and say why, and they are the only thing a shopper can see. They are kept because a
+ * held control is the right feedback for a press that will do nothing, not because the guarantee
+ * rests on them - React writes `disabled` at commit, tens of milliseconds after the press, and a
+ * double-click inside that window is an ordinary thing for a mouse to produce.
  *
  * WHY THERE IS NO STOCK BADGE
  * `.meta` was drawn wide enough for an availability chip beside the unit price, and the cart's own
@@ -53,14 +68,27 @@
  * every time a quantity changes - so this row multiplies nothing and divides nothing: a total
  * assembled here would be a second opinion about the amount a shopper is about to be charged.
  *
- * WHAT IT HOLDS
- * Beyond the two context reads at the top of the component - the cart and the toast centre -
- * local `useState` for `pending` is the only hook in the file. No effect, no ref and no DOM read,
- * so everything else the row renders is a function of the `line` it is given.
+ * WHERE FOCUS GOES WHEN THE ROW GOES
+ * A removal unmounts this `<li>`, and the remove button inside it is usually the element holding
+ * focus when that happens - so unless focus is moved first it lands on `<body>`, outside the
+ * drawer's `aria-modal` dialog, and a keyboard shopper's next Tab starts from the top of the
+ * document. The row therefore resolves a landing place before the mutation goes out and focuses it
+ * once the removal has been applied: the next row's remove control, the previous row's, or the
+ * enclosing dialog when the list has emptied. `focusTargetForRemoval` below states the rule and
+ * the one case that must not move focus at all - a removal provoked while focus sits somewhere
+ * else entirely.
  *
- * Nothing here reads a clock, a random source, `window` or `document`, and nothing schedules a
- * timer, so the markup the server renders and the markup the browser first produces agree and the
- * cart raises no hydration warning to explain away.
+ * WHAT IT HOLDS
+ * Beyond the two context reads at the top of the component - the cart and the toast centre - the
+ * hooks are local `useState` for `pending` and two `useRef`s: the `<li>` element, which the focus
+ * recovery above needs, and the in-flight latch the section before it describes. No effect, so
+ * everything the row renders is a function of the `line` it is given and of `pending`.
+ *
+ * The two DOM readings this file does make - `document.activeElement` and the walk from the row to
+ * its siblings - happen inside the remove handler, after mount and in response to a press, never
+ * while rendering. Nothing here reads a clock, a random source or `window`, and nothing schedules
+ * a timer, so the markup the server renders and the markup the browser first produces agree and
+ * the cart raises no hydration warning to explain away.
  *
  * APPEARANCE AND NAMES
  * `./CartLineRow.module.css` owns every value: the five grid areas of the wide row, the two-line
@@ -77,7 +105,7 @@
 
 import clsx from 'clsx';
 import Link from 'next/link';
-import { useState, type ReactElement } from 'react';
+import { useRef, useState, type ReactElement } from 'react';
 
 import { Button } from '@/components/ui/Button';
 import { Price } from '@/components/ui/Price';
@@ -131,6 +159,30 @@ const LINE_TOTAL_LABEL = 'Line total';
 const REMOVE_GLYPH = '\u00d7';
 
 /**
+ * How a row's remove control is found again once its own row is about to disappear.
+ *
+ * A removal unmounts the `<li>` the pressed button lives in, and a button that is removed while it
+ * holds focus leaves focus on `<body>` - outside the drawer's `aria-modal` dialog, so a keyboard
+ * shopper loses their place and their next Tab starts from the top of the document. Recovering
+ * means focusing a neighbouring row's remove control, which means being able to identify one, and
+ * an attribute is the way to do that: the control is `../ui/Button`, whose class comes from that
+ * module's stylesheet and is a hashed CSS-Module name this file must not select on, and the
+ * accessible name is per-product text. The attribute is written on the element below and read back
+ * only through this selector, so the two cannot drift apart.
+ */
+const REMOVE_CONTROL_SELECTOR = '[data-line-remove]';
+
+/**
+ * The enclosing modal surface, when the row is being rendered inside one.
+ *
+ * The drawer's sheet carries `role="dialog"` and `tabIndex={-1}`, so it can hold focus itself; it
+ * is the right landing place when a removal empties the list and there is no neighbouring row to
+ * move to. On `/cart` and on the checkout review there is no such ancestor, and that is a state
+ * with a meaning of its own rather than a gap - see {@link focusTargetForRemoval}.
+ */
+const DIALOG_SELECTOR = '[role="dialog"]';
+
+/**
  * The thumbnail's intrinsic width and height in pixels, written as attributes so the browser
  * reserves the box before the file arrives and the cart does not jump as thumbnails decode. Every
  * drawing in `public/products/` is authored at this size, placeholder included; the stylesheet
@@ -154,6 +206,47 @@ function cartFailureNotice(title: string, cause: unknown): ToastInput {
   const detail = cause instanceof Error ? cause.message.trim() : '';
 
   return detail.length > 0 ? { tone: 'danger', title, body: detail } : { tone: 'danger', title };
+}
+
+/**
+ * Where focus should go when `row` is removed from the cart, or `null` for "leave focus alone".
+ *
+ * Module-level, and apart from the one `document.activeElement` reading it is built around it does
+ * nothing but walk the element it is handed, so the rule can be read in one place: a removal moves
+ * focus only when focus is inside the row being removed. A removal provoked from anywhere else -
+ * another surface writing to the same cart, a quantity commit elsewhere on the page - must not
+ * steal focus from whatever the shopper is actually using, and answering `null` for that case is
+ * how this says so.
+ *
+ * The order of preference is the one a list gives: the next row's remove control, so repeated
+ * removals walk down the list the way repeated presses of the same button would; the previous row's
+ * when the removed row was last; and the enclosing dialog when the row was the only one left. On a
+ * page there is no dialog to fall back to, and an emptied list has no control left to hold focus:
+ * the answer is `null`, because inventing a tab stop for a list that no longer exists is worse than
+ * letting the browser put focus where it puts it.
+ *
+ * It must be called BEFORE the mutation goes out, while the row and its siblings are still in the
+ * document. The element it answers is a surviving sibling (the list keys rows by line id, so the
+ * rows that stay keep their DOM identity) or an ancestor, never the row itself, which is why the
+ * answer is still usable once the removal has been applied. The caller re-checks `isConnected`
+ * anyway, because a cart republished from elsewhere may have taken that neighbour too.
+ */
+function focusTargetForRemoval(row: HTMLLIElement | null): HTMLElement | null {
+  if (row === null) {
+    return null;
+  }
+
+  const focused = document.activeElement;
+
+  if (!(focused instanceof HTMLElement) || !row.contains(focused)) {
+    return null;
+  }
+
+  return (
+    row.nextElementSibling?.querySelector<HTMLElement>(REMOVE_CONTROL_SELECTOR) ??
+    row.previousElementSibling?.querySelector<HTMLElement>(REMOVE_CONTROL_SELECTOR) ??
+    row.closest<HTMLElement>(DIALOG_SELECTOR)
+  );
 }
 
 /**
@@ -203,14 +296,36 @@ export function CartLineRow({ line, className }: Props): ReactElement {
   // `syncStatus`, which cannot say which line is changing, and it is not lifted anywhere either.
   const [pending, setPending] = useState(false);
 
+  // The `<li>` this component renders, needed by `focusTargetForRemoval` to find the neighbour that
+  // should hold focus once this row is gone. Read only from an event handler, never while
+  // rendering.
+  const rowRef = useRef<HTMLLIElement | null>(null);
+
+  // The in-flight latch (see the header). One latch for both mutations rather than one each: they
+  // write the same line through the same endpoint, and a quantity commit racing a removal of the
+  // row that quantity belongs to is the same lost race as two removals. It is deliberately not
+  // state - nothing renders from it, and a render is precisely what it cannot afford to wait for.
+  const mutating = useRef(false);
+
   /**
    * Accept the quantity the stepper asked for.
    *
    * The stepper has already clamped it to a whole number inside the line's permitted range and
    * never asks for 0 - emptying a line is the remove button's job - so there is nothing left to
    * validate here and the request goes straight to the cart.
+   *
+   * The latch is taken first, before the `setPending` that only makes it visible: a commit that
+   * arrives while this line is already being written - a second press of a stepper button inside
+   * one task, or a blur that commits as a button press is still in flight - is dropped rather than
+   * queued, because the quantity it carries was read from a cart the server is in the middle of
+   * replacing.
    */
   async function handleQuantityCommit(quantity: number): Promise<void> {
+    if (mutating.current) {
+      return;
+    }
+
+    mutating.current = true;
     setPending(true);
 
     try {
@@ -224,25 +339,54 @@ export function CartLineRow({ line, className }: Props): ReactElement {
       showToast(cartFailureNotice(QUANTITY_FAILED_TITLE, cause));
     } finally {
       setPending(false);
+      mutating.current = false;
     }
   }
 
-  /** Take this line out of the cart. */
+  /**
+   * Take this line out of the cart, and take focus somewhere it can still be used.
+   *
+   * The landing place is resolved first, while this row and its siblings are all still in the
+   * document (see {@link focusTargetForRemoval}), and focus is moved only once the removal has
+   * actually been applied: a refused removal leaves the row - and the button the shopper pressed -
+   * exactly where they were, and moving focus off a control that is still there would be a second
+   * surprise on top of the failure. `isConnected` is re-checked at that point because the cart is
+   * republished by the provider between those two moments and may have taken the neighbour as well.
+   *
+   * The latch is taken before anything else here too, and it is the same one the quantity commit
+   * takes: a double-click on this button used to send a second removal for a line the first had
+   * already taken out, which the server correctly answers 404 and which then surfaced as a failure
+   * notice for a removal the shopper had watched succeed.
+   */
   async function handleLineRemove(): Promise<void> {
+    if (mutating.current) {
+      return;
+    }
+
+    mutating.current = true;
     setPending(true);
+
+    const focusTarget = focusTargetForRemoval(rowRef.current);
 
     try {
       await removeLine(line.id);
+
+      if (focusTarget !== null && focusTarget.isConnected) {
+        focusTarget.focus();
+      }
+
       showToast({ tone: 'success', title: LINE_REMOVED_TITLE, body: line.name });
     } catch (cause) {
       showToast(cartFailureNotice(LINE_REMOVE_FAILED_TITLE, cause));
     } finally {
       setPending(false);
+      mutating.current = false;
     }
   }
 
   return (
     <li
+      ref={rowRef}
       className={clsx(styles.root, className)}
       data-busy={pending ? 'true' : undefined}
       aria-busy={pending}
@@ -296,10 +440,32 @@ export function CartLineRow({ line, className }: Props): ReactElement {
         <Button
           variant="ghost"
           size="sm"
+          // How a neighbouring row finds this control when its own row is removed. `Button`
+          // extends the native element's props, so the attribute reaches the `<button>` untouched
+          // and is never read as anything else; it carries no value because its presence is the
+          // whole of what `REMOVE_CONTROL_SELECTOR` asks about.
+          data-line-remove=""
           onClick={() => {
             void handleLineRemove();
           }}
-          disabled={pending}
+          // Unavailable while the removal is in flight, stated as ARIA rather than as the native
+          // attribute, because this control is the one the shopper is standing on when it becomes
+          // unavailable. A `disabled` element cannot hold focus, so writing the native attribute
+          // here moves focus to `<body>` the moment the request starts - outside the drawer's
+          // `aria-modal` dialog, which is the one place focus must never go. The success path hid
+          // that, because it moves focus to a neighbour anyway; the failure path did not, and left
+          // focus on `<body>` for good, since focus is deliberately not moved when a removal is
+          // refused. `aria-disabled` says exactly the same thing to assistive technology and picks
+          // up the same dimming and `not-allowed` cursor from the primitive's stylesheet, which
+          // declares `[aria-disabled='true']` beside `:disabled`, and it additionally takes
+          // `pointer-events` away, so a second mouse press cannot land. `Button` spreads `aria-*`
+          // through to the element as its documented escape hatch for finer ARIA than its boolean.
+          //
+          // What stops a second *keyboard* press - the one route still reaching this handler - is
+          // `mutating`, the synchronous latch the handler takes before anything else. That latch,
+          // not this attribute, is what makes the guard sound: the attribute is only ever written
+          // during a React commit, which is too late to stop two presses inside one task.
+          aria-disabled={pending ? 'true' : undefined}
         >
           <span aria-hidden="true">{REMOVE_GLYPH}</span>
           <VisuallyHidden>{`Remove ${line.name} from cart`}</VisuallyHidden>

@@ -10,10 +10,15 @@
  * It owns the request - the query string, the one service call, the failure path - together with
  * the page's ancestry trail, its heading block and the notice shown when the history cannot be
  * read. Everything below the heading belongs to `OrderHistoryList`: the result count, the column
- * strip, the rows, the pager and the blank slate a customer with no orders sees. That division is
- * why no row, no count and no page arithmetic appears in this file, and why it declares no
- * component of its own. The list has no error prop by design, so the notice is this page's own
- * surface rather than something passed into it.
+ * strip, the rows, the pager and the block that stands in for the rows when this page of the
+ * listing holds none. That division is why no row, no count and no page arithmetic appears in this
+ * file, and why it declares no component of its own. The list has no error prop by design, so the
+ * notice is this page's own surface rather than something passed into it.
+ *
+ * The one thing this file says about what the list *shows* is the filter, and only because the
+ * filter is a query parameter: the list is handed the status in the words `@/lib/format` gives it
+ * and the address that drops it, so a narrowed history can say why it is short and offer the way
+ * back without learning this store's status vocabulary for itself.
  *
  * THE HISTORY COMES FROM THE ENDPOINT
  * `GET /api/orders` answers this listing, and the page reads it over HTTP through
@@ -55,7 +60,9 @@ import type { ReactElement } from 'react';
 import { OrderHistoryList } from '@/components/checkout/OrderHistoryList';
 import { BreadcrumbTrail, type BreadcrumbCrumb } from '@/components/layout/BreadcrumbTrail';
 import { Alert } from '@/components/ui/Alert';
+import { Retry } from '@/components/ui/Retry';
 import { StorefrontApiError, loadOrderHistory } from '@/lib/api-client';
+import { formatOrderStatusLabel } from '@/lib/format';
 import type { OrderSummary, PagedList, StorefrontErrorCode } from '@/lib/types';
 import { storefrontOrigin } from '@/server/origin';
 import { ordersQuerySchema, type OrdersQueryInput } from '@/server/validation/orders';
@@ -212,10 +219,10 @@ function scalars(params: Record<string, string | string[] | undefined>): Record<
 }
 
 /**
- * The address `OrderHistoryList`'s pager rewrites the page number of.
+ * An address for this listing, carrying every parameter except the page number.
  *
- * It is built from the parsed query rather than from the address bar, so every destination the
- * pager offers is a request that parses: a value the schema coerced is carried forward in its
+ * It is built from the parsed query rather than from the address bar, so every destination offered
+ * on the page is a request that parses: a value the schema coerced is carried forward in its
  * canonical form, and a value it rejected is not carried forward at all - the reader is looking at
  * the fallback listing in that case, and a base still claiming the rejected filter would send them
  * back to it on every page turn.
@@ -224,19 +231,23 @@ function scalars(params: Record<string, string | string[] | undefined>): Record<
  * moving through the pages. The account is stated only when it is not this page's own default,
  * which keeps the address a reader can copy free of an identifier they never typed; the next
  * request resolves the same account for itself. The page number is deliberately absent - the pager
- * sets it, and a value here would only be one it overwrites.
+ * sets it, and a value here would only be one it overwrites, which is also what makes the
+ * status-less form below an address for the *first* page of the unfiltered history rather than for
+ * whichever page the filtered one had reached.
  *
  * @param query The parsed query the listing on screen was read with.
+ * @param status Whether to carry the status filter forward. `false` builds the address that clears
+ * it.
  * @returns A relative URL carrying every parameter except the page number.
  */
-function base(query: OrdersQueryInput): string {
+function base(query: OrdersQueryInput, status: boolean): string {
   const params = new URLSearchParams();
 
   if (query.customerId !== DEMO_ACCOUNT) {
     params.set(ACCOUNT_PARAM, query.customerId);
   }
 
-  if (query.status !== undefined) {
+  if (status && query.status !== undefined) {
     params.set(STATUS_PARAM, query.status);
   }
 
@@ -328,21 +339,28 @@ export default async function OrderHistoryPage({ searchParams }: Props): Promise
     : ordersQuerySchema.parse({ [ACCOUNT_PARAM]: DEMO_ACCOUNT });
 
   /*
-   * One read, and the only thing in this file that can fail - the authority the request is
-   * addressed to included, which is established inside the same `try` because an address this
-   * store may not call itself on and an endpoint that answered with a failure are the same thing
-   * to a reader. The notice starts out as the wording for a failure nobody can act on, so the page
-   * always has something to say; a caught value replaces it with the sentence its code earns and
-   * leaves the page of orders unset, which is what selects the notice below. The log line carries a
-   * fixed label and the failure's kind only - a message or a stack may hold a path, a statement or
-   * a connection string - and it goes to the server's own output, never to the page.
+   * The authority the read is addressed to, established before the read and deliberately outside
+   * the `try` below. The two failures it can raise are this deployment being configured with an
+   * address it cannot be reached at, and a process that cannot establish the address it answers on
+   * - neither is a history that could not be read, and neither is something a reader can do
+   * anything about by asking for the list again. So they are not collapsed into this page's notice:
+   * they leave this function, and `app/error.tsx` is what says so, once, for every route in the
+   * store rather than in wording invented here.
+   */
+  const origin = storefrontOrigin();
+
+  /*
+   * One read, and the only thing in this file that can fail. The notice starts out as the wording
+   * for a failure nobody can act on, so the page always has something to say; a caught value
+   * replaces it with the sentence its code earns and leaves the page of orders unset, which is what
+   * selects the notice below. The log line carries a fixed label and the failure's kind only - a
+   * message or a stack may hold a path, a statement or a connection string - and it goes to the
+   * server's own output, never to the page.
    */
   let orders: PagedList<OrderSummary> | null = null;
   let failure = GENERIC_NOTICE;
 
   try {
-    const origin = storefrontOrigin();
-
     orders = await loadOrderHistory({
       customerId: query.customerId,
       status: query.status,
@@ -374,9 +392,15 @@ export default async function OrderHistoryPage({ searchParams }: Props): Promise
          * `danger` assertively, which belongs to a failure the reader just caused. The element
          * carries no `role` and no `aria-live` of its own - the primitive pairs those with the tone
          * itself, and a second pairing here would have the message announced twice.
+         *
+         * The copy says that asking again is what fetches the list, so the control that asks is in
+         * the notice with it rather than left to the reader to find: `ui/Retry` requests this route
+         * again from the browser, which is the same recovery a reload performs without discarding
+         * the cart, the address bar or the reader's place on the page. It is the one control every
+         * in-notice action in this store uses, so nothing about its size or colour is decided here.
          */
         <div className="ls-notice">
-          <Alert tone="warning" title={NOTICE_TITLE}>
+          <Alert tone="warning" title={NOTICE_TITLE} actions={<Retry />}>
             {failure}
           </Alert>
         </div>
@@ -385,8 +409,23 @@ export default async function OrderHistoryPage({ searchParams }: Props): Promise
          * The page of orders is passed exactly as the service produced it - integer cents, an
          * ISO-8601 timestamp, no `Date` and no class instance - and the pager is given the address
          * the listing was read from, so the page it offers next is this same query one page on.
+         *
+         * The filter is handed over as the word a reader recognises rather than as the parameter's
+         * value, because this file is where the query vocabulary is known: `@/lib/format` names
+         * the statuses, and the list would otherwise have to learn them to say why a nine-order
+         * history is showing two. The address beside it is the same listing with the filter
+         * dropped, which is where both the filter line's control and an empty filtered listing's
+         * recovery control lead. Both are left out entirely when nothing is filtered, so the list
+         * renders exactly as it did before a filter existed.
          */
-        <OrderHistoryList orders={orders} pageHrefBase={base(query)} />
+        <OrderHistoryList
+          orders={orders}
+          pageHrefBase={base(query, true)}
+          filterLabel={
+            query.status === undefined ? undefined : formatOrderStatusLabel(query.status)
+          }
+          clearFilterHref={query.status === undefined ? undefined : base(query, false)}
+        />
       )}
     </div>
   );

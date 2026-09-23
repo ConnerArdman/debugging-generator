@@ -67,11 +67,28 @@
 }
 
 /* Identifier values - a SKU, a catalogue code - where digit alignment and an unambiguous 0/O
- * matter more than matching the surrounding prose. */
+ * matter more than matching the surrounding prose.
+ *
+ * This is the whole identifier treatment and not a family swap on top of `.detail`, because a
+ * product code is one thing across this storefront: the catalog tile
+ * (`catalog/ProductCard.module.css .sku`) and the cart row (`cart/CartLineRow.module.css .sku`)
+ * both print it monospaced, at the smallest type step, in the muted foreground, with figures on a
+ * fixed pitch and a 1.4 leading. Stating only the family here left the same code reading as 15px
+ * ink prose on this page and 12px muted mono on the other two - the same meaning in two voices.
+ * So every property those two modules set is set here as well, at the same tokens, and `.detail`'s
+ * size and colour are deliberately overridden rather than inherited. `.mono` is composed after
+ * `.detail` by the component and both are single-class selectors, so source order in this file is
+ * what settles the conflict: `.mono` is declared last and wins.
+ *
+ * `letter-spacing: 0` stays: it neutralises any tracking a parent has set, which a code read
+ * character by character should not carry. */
 .mono {
+  color: var(--ls-text-muted, #475569);
   font-family: var(--ls-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: var(--ls-text-xs, 12px);
   font-variant-numeric: tabular-nums;
   letter-spacing: 0;
+  line-height: 1.4;
 }
 
 /* One breakpoint, and the only literal length outside a `var()` fallback in this file: a media

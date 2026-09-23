@@ -13,19 +13,36 @@
  * and the figure printed under the lines is the same figure printed beside the radio button.
  *
  * WHAT TRAVELS, AND IN WHAT UNIT
- * One value: the service the buyer chose and the rate currently quoted for it, as
+ * Two things, and both for the same reason - the column that knows is not the column that prints.
+ *
+ * The first is the service the buyer chose and the rate currently quoted for it, as
  * {@link SelectedFreight}. `amountCents` is a whole number of cents, like every monetary field in
  * `@/lib/types`, because a major-unit amount or a formatted string would put a second monetary
  * convention into the storefront - and `@/components/ui/Price` is the one component that turns cents
- * into text. Nothing else is published here: the merchandise figures belong to `@/hooks/useCartSummary`,
- * and the discounts and tax an order attracts are settled by the endpoint that writes the order.
+ * into text. `estimatedDays` travels with it because the review column states a delivery estimate
+ * next to that charge, and the transit time is part of what the buyer chose rather than a property
+ * of the store: two services quoted for one destination differ by days as much as by price, so a
+ * review that read the estimate from anywhere else would print a figure for a service the buyer did
+ * not pick. The merchandise figures are not published here: they belong to
+ * `@/hooks/useCartSummary`, and the discounts and tax an order attracts are settled by the endpoint
+ * that writes the order.
  *
- * TWO CONTEXTS, NOT ONE OBJECT
- * The published value and the publisher travel on separate contexts. The publisher's context value is
- * a function that never changes identity, so a component that only publishes - the form - is not
- * re-rendered when the value it published comes back round; and the value's context is the bare
- * `SelectedFreight | null`, so there is no per-render object to keep stable. One combined
- * `{ value, publish }` object would have needed exactly that, for no gain to either side.
+ * The second is whether the order on this page has been placed, as a plain boolean. Placing it is
+ * the one event that ends the review: the cart those lines came from has become an order, priced as
+ * the order says rather than as the review estimated, so a column still listing them beside a
+ * receipt would offer controls over a cart that no longer exists and print an estimate the buyer
+ * has already been charged something else for. The form is what learns the order was placed, and
+ * the review is what has to stop, so the fact travels the same way the charge does.
+ *
+ * A VALUE AND ITS PUBLISHER TRAVEL SEPARATELY
+ * Each published fact and its publisher sit on their own contexts, so four in all. A publisher's
+ * context value is a function that never changes identity, so a component that only publishes - the
+ * form - is not re-rendered when the value it published comes back round; and each value's context
+ * carries the bare value, `SelectedFreight | null` or `boolean`, so there is no per-render object to
+ * keep stable. One combined `{ value, publish }` object would have needed exactly that, for no gain
+ * to either side. The two facts are kept apart for the same reason: the review reads the charge
+ * several times a second and the placed flag once, and a single value holding both would wake every
+ * reader of either whenever one of them moved.
  *
  * THE EQUALITY GUARD IS LOAD-BEARING
  * `<ShippingEtaProvider>` republishes the dispatch countdown every 250 ms and `<CartProvider>` builds
@@ -62,13 +79,14 @@ import {
 /**
  * The freight the buyer chose, as the form publishes it and the review prints it.
  *
- * The three fields are exactly what the review has to say about the charge - which service was
- * chosen, what it is called on screen, and what it costs - and nothing that would let the two columns
- * disagree: the label is the wording the shipping group prints for that service, and `amountCents` is
- * the rate that group prints beside it, so the freight row under the lines and the chosen radio row
- * always quote one figure.
+ * The four fields are exactly what the review has to say about the charge - which service was
+ * chosen, what it is called on screen, what it costs and how long it takes - and nothing that would
+ * let the two columns disagree: the label is the wording the shipping group prints for that service,
+ * and `amountCents` and `estimatedDays` are the rate and transit time that group prints beside it,
+ * so the freight row under the lines and the chosen radio row always quote one figure and one
+ * estimate.
  *
- * All three come from the same place, and it is the live quote for the destination and shipment in
+ * All four come from the same place, and it is the live quote for the destination and shipment in
  * the form's fields rather than the store's list rates. A charge is published only while the store
  * is currently offering that service at that price, so a quote that omits the chosen service - or a
  * shipment with no quote at all - publishes `null` instead, and the review column prints the row as
@@ -82,12 +100,26 @@ export interface SelectedFreight {
   readonly label: string;
   /** The rate quoted for that service and destination, as a whole number of cents. */
   readonly amountCents: number;
+  /**
+   * Transit days quoted for that service and destination, as `ShippingOption.estimatedDays`.
+   *
+   * Whole days, `0` meaning same-day, matching the field the quote carries; the review turns it
+   * into a sentence with `formatShippingEtaLabel`, which is the same function the cart drawer's
+   * dispatch countdown uses, so one number is worded one way across the storefront.
+   */
+  readonly estimatedDays: number;
 }
 
 /** What a publisher does where nothing is listening; see the header's note on the inert defaults. */
 function ignoreFreight(): void {
   // Intentionally empty: outside a `<CheckoutChargesProvider>` there is nothing to publish to, and
   // discarding the value is what lets the form render on such a surface unchanged.
+}
+
+/** The same, for the placed flag. See {@link ignoreFreight}. */
+function ignorePlacement(): void {
+  // Intentionally empty, for the same reason: a form on a surface with no review column has nobody
+  // to tell, and the review it would have told is not there to be left in the wrong state.
 }
 
 /**
@@ -110,7 +142,8 @@ function isSameFreight(current: SelectedFreight | null, next: SelectedFreight | 
   return (
     current.optionId === next.optionId &&
     current.label === next.label &&
-    current.amountCents === next.amountCents
+    current.amountCents === next.amountCents &&
+    current.estimatedDays === next.estimatedDays
   );
 }
 
@@ -126,6 +159,18 @@ const SelectedFreightContext = createContext<SelectedFreight | null>(null);
  */
 const PublishSelectedFreightContext =
   createContext<(freight: SelectedFreight | null) => void>(ignoreFreight);
+
+/**
+ * Whether the order this page is for has been placed - `false` until it is, and also the value read
+ * on a surface that mounts no provider, where there is no submission to have happened.
+ */
+const OrderPlacedContext = createContext<boolean>(false);
+
+/**
+ * The publisher for that flag. Its default discards what it is given, so publishing outside a
+ * provider is a no-op rather than a failure; see the header.
+ */
+const PublishOrderPlacedContext = createContext<(placed: boolean) => void>(ignorePlacement);
 
 /** What {@link CheckoutChargesProvider} takes: the subtree the channel is mounted around. */
 interface Props {
@@ -145,7 +190,7 @@ interface Props {
  * <CheckoutChargesProvider>
  *   <div className="ls-split">
  *     <div className="ls-split-main">
- *       <CheckoutForm shippingOptions={BASELINE_SHIPPING_OPTIONS} />
+ *       <CheckoutForm />
  *     </div>
  *     <div className="ls-split-side">
  *       <CheckoutSummaryPanel />
@@ -156,6 +201,7 @@ interface Props {
  */
 export function CheckoutChargesProvider({ children }: Props): ReactElement {
   const [freight, setFreight] = useState<SelectedFreight | null>(null);
+  const [placed, setPlaced] = useState<boolean>(false);
 
   /*
    * One stable publisher for the life of the provider. `useCallback` with no dependencies is what
@@ -168,9 +214,21 @@ export function CheckoutChargesProvider({ children }: Props): ReactElement {
     setFreight((current) => (isSameFreight(current, next) ? current : next));
   }, []);
 
+  /*
+   * The same, for the placed flag. A boolean needs no equality guard of its own - React ignores a
+   * write of the value already held - so the functional update is simply the value.
+   */
+  const publishPlacement = useCallback((next: boolean): void => {
+    setPlaced(next);
+  }, []);
+
   return (
     <PublishSelectedFreightContext.Provider value={publish}>
-      <SelectedFreightContext.Provider value={freight}>{children}</SelectedFreightContext.Provider>
+      <PublishOrderPlacedContext.Provider value={publishPlacement}>
+        <SelectedFreightContext.Provider value={freight}>
+          <OrderPlacedContext.Provider value={placed}>{children}</OrderPlacedContext.Provider>
+        </SelectedFreightContext.Provider>
+      </PublishOrderPlacedContext.Provider>
     </PublishSelectedFreightContext.Provider>
   );
 }
@@ -200,4 +258,32 @@ export function usePublishSelectedFreight(): (freight: SelectedFreight | null) =
  */
 export function useSelectedFreight(): SelectedFreight | null {
   return useContext(SelectedFreightContext);
+}
+
+/**
+ * Reads the publisher for whether the order has been placed.
+ *
+ * The returned function is stable for as long as the provider is mounted, so it is safe as an effect
+ * dependency. Publish `true` once the submission has come back with an order - including an order an
+ * earlier submission had already placed, which is the same fact about this cart - and `false` while
+ * there is none, so a column that is asked to stop stops exactly when there is a receipt to stop for.
+ *
+ * @returns The publisher, or an inert one outside a `<CheckoutChargesProvider>`.
+ */
+export function usePublishOrderPlaced(): (placed: boolean) => void {
+  return useContext(PublishOrderPlacedContext);
+}
+
+/**
+ * Reads whether the order this page is for has been placed.
+ *
+ * `false` means there is no order yet - or that the reading component is outside a
+ * `<CheckoutChargesProvider>`, where there is no submission to have happened. `true` is a receipt on
+ * the page, and a column reviewing the order it was placed from has nothing left to review: the
+ * cart those lines came from is now an order, and what that order came to is printed on the receipt.
+ *
+ * @returns Whether an order has been placed on this page.
+ */
+export function useOrderPlaced(): boolean {
+  return useContext(OrderPlacedContext);
 }

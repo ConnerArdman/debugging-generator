@@ -26,6 +26,12 @@
  *   one attempt and a `503` taking another.
  * - {@link SHUTDOWN_FLUSH_DEADLINE_MS} — the bound on the final flush, after
  *   which anything still queued is counted rather than held.
+ * - {@link AUTH_REJECTED_STATUSES} — the statuses that stop the transport for
+ *   the life of the process, driven from the module's own table so a status
+ *   added to it is covered here: one refusal, one post, one warning, and no
+ *   second request however many spans follow. Its negative control is
+ *   {@link RETRYABLE_CLIENT_STATUSES} plus a `5xx`, which must leave the
+ *   transport running so a service restart still recovers.
  *
  * ## Techniques, and why each one is the way it is
  *
@@ -83,9 +89,11 @@ import {
 import type { PreloadConfig } from './config.js';
 import { NEXT_SPAN_TYPE_ATTRIBUTE, NEXT_SPAN_TYPES } from './convert.js';
 import {
+  AUTH_REJECTED_STATUSES,
   DebuggenSpanProcessor,
   MAX_DRAIN_BATCHES,
   MAX_POST_ATTEMPTS,
+  RETRYABLE_CLIENT_STATUSES,
   SHUTDOWN_FLUSH_DEADLINE_MS,
 } from './exporter.js';
 import type { CaptureGate } from './exporter.js';
@@ -149,6 +157,9 @@ const REFUSED_STATUS = 400;
 
 /** `503 Service Unavailable`: a moment rather than an answer. */
 const UNAVAILABLE_STATUS = 503;
+
+/** `500 Internal Server Error`: the service is up and something went wrong. */
+const SERVER_ERROR_STATUS = 500;
 
 /*
  * ---------------------------------------------------------------------------
@@ -354,6 +365,27 @@ class RecordingLogger implements Logger {
   #record(level: LogLevel, message: string, fields?: LogFields): void {
     this.entries.push(fields === undefined ? { level, message } : { level, message, fields });
   }
+}
+
+/**
+ * Everything a logger recorded, as one searchable string.
+ *
+ * Field values are serialised too, because a credential that leaked into a
+ * field rather than into a message would be just as visible in a developer's
+ * terminal — and the credential-refusal hint is the one diagnostic in this
+ * module whose fields describe the very request that carried the credential.
+ *
+ * @param logger The recording logger.
+ * @returns Every message and every field, concatenated.
+ */
+function logText(logger: RecordingLogger): string {
+  return logger.entries
+    .map((entry) =>
+      entry.fields === undefined
+        ? `${entry.level} ${entry.message}`
+        : `${entry.level} ${entry.message} ${JSON.stringify(entry.fields)}`,
+    )
+    .join('\n');
 }
 
 /** One call the processor made to its injected `fetch`. */
@@ -949,5 +981,189 @@ describe('failing and partial sends', () => {
     expect(rig.calls).toHaveLength(postedBefore);
     expect(processor.bufferedCount).toBe(0);
     expect(processor.stats()).toMatchObject({ droppedAfterShutdown: 1, internalErrors: 0 });
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * A refused credential
+ *
+ * The guarantee under test is the one the module's own diagnostic makes:
+ * *server-side telemetry stops until the dev server is relaunched*. Stops means
+ * no further request — not "this batch is abandoned" — because the server-agent
+ * credential is minted per dev-server launch and scoped to one project root
+ * (AAP §0.5.6), so an endpoint that refused it never begins accepting it.
+ *
+ * Every case here is driven from {@link AUTH_REJECTED_STATUSES} or its negative
+ * control {@link RETRYABLE_CLIENT_STATUSES} rather than from a status spelled
+ * in the assertion, so a table this module changes changes these cases with it.
+ * ---------------------------------------------------------------------------
+ */
+
+describe('AUTH_REJECTED_STATUSES', () => {
+  it('posts once and never again, for every status that refuses the credential', async () => {
+    for (const status of AUTH_REJECTED_STATUSES) {
+      const label = `status ${String(status)}`;
+      const { processor, fetch: rig } = createHarness({ statuses: [status] });
+
+      feedSpans(processor, 1);
+      await processor.forceFlush();
+
+      expect(rig.calls, `${label} is attempted exactly once`).toHaveLength(1);
+      const refused = processor.stats();
+      expect(refused.credentialRejected, `${label} latches the refusal`).toBe(true);
+      expect(refused.convertedCount).toBe(1);
+
+      // Fresh spans and an explicit flush, which is what the finding measured:
+      // 12 further posts carrying 396 more events after exactly this point.
+      feedSpans(processor, BATCH_MAX_EVENTS, 1);
+      await processor.forceFlush();
+
+      expect(rig.calls, `${label} produces no second post`).toHaveLength(1);
+      const after = processor.stats();
+      // Nothing was converted and nothing was buffered: the spans were refused
+      // at admission, before any conversion work was done on them.
+      expect(after.convertedCount, `${label} converts nothing more`).toBe(refused.convertedCount);
+      expect(after.droppedCredentialRejected, `${label} accounts for every refused span`).toBe(
+        BATCH_MAX_EVENTS,
+      );
+      expect(processor.bufferedCount, `${label} buffers nothing`).toBe(0);
+      expect(after.postedBatches).toBe(0);
+      expect(after.internalErrors).toBe(0);
+    }
+  });
+
+  it('discards the evidence still buffered behind the batch that was refused', async () => {
+    const remainder = 40;
+    const { processor, fetch: rig, logger } = createHarness({ statuses: [UNAUTHORIZED_STATUS] });
+
+    feedSpans(processor, BATCH_MAX_EVENTS + remainder);
+    await processor.forceFlush();
+
+    // One post, not two. Without the latch the second batch of this very drain
+    // would go to the endpoint that had just refused the first.
+    expect(rig.calls).toHaveLength(1);
+    expect(processor.bufferedCount).toBe(0);
+    expect(processor.stats()).toMatchObject({
+      postedBatches: 0,
+      postedEvents: 0,
+      // The refused batch keeps the counters it had already earned; only what
+      // was behind it lands on the credential counter.
+      failedBatches: 1,
+      droppedFailedBatch: BATCH_MAX_EVENTS,
+      droppedCredentialRejected: remainder,
+      droppedAtShutdown: 0,
+      internalErrors: 0,
+    });
+    expect(logger.entriesAt('warn')).toHaveLength(1);
+  });
+
+  it('keeps forceFlush() and shutdown() resolving, with nothing left to abandon', async () => {
+    const laterSpans = 3;
+    const { processor, fetch: rig } = createHarness({ statuses: [UNAUTHORIZED_STATUS] });
+
+    feedSpans(processor, 1);
+    await processor.forceFlush();
+    expect(processor.stats().credentialRejected).toBe(true);
+
+    feedSpans(processor, laterSpans, 1);
+
+    // Both must settle rather than reject or hang: the provider's own shutdown
+    // path awaits them inside the developer's dev server.
+    await expect(processor.forceFlush()).resolves.toBeUndefined();
+    await expect(processor.shutdown()).resolves.toBeUndefined();
+
+    expect(rig.calls).toHaveLength(1);
+    expect(processor.isShutDown).toBe(true);
+    expect(processor.stats()).toMatchObject({
+      droppedCredentialRejected: laterSpans,
+      // Not an abandonment: `droppedAtShutdown` is for evidence a *reachable*
+      // service did not take in time, and counting these there would name the
+      // wrong failure.
+      droppedAtShutdown: 0,
+      buffered: 0,
+      internalErrors: 0,
+    });
+  });
+
+  it('is not cleared by reopen(), which a capture re-arm calls', async () => {
+    const laterSpans = 2;
+    const { processor, fetch: rig } = createHarness({ statuses: [UNAUTHORIZED_STATUS] });
+
+    feedSpans(processor, 1);
+    await processor.forceFlush();
+    await processor.shutdown();
+
+    // What `./control.ts` does when the next capture installs a replacement
+    // provider. The provider lifetime is repaired; the transport is not, and
+    // must not be — a second capture posting here would post to an endpoint
+    // that has already said no.
+    processor.reopen();
+
+    expect(processor.isShutDown).toBe(false);
+    expect(processor.stats().credentialRejected).toBe(true);
+
+    feedSpans(processor, laterSpans, 1);
+    await processor.forceFlush();
+
+    expect(rig.calls).toHaveLength(1);
+    expect(processor.bufferedCount).toBe(0);
+    expect(processor.stats()).toMatchObject({
+      convertedCount: 1,
+      droppedCredentialRejected: laterSpans,
+      droppedAfterShutdown: 0,
+      internalErrors: 0,
+    });
+  });
+
+  it('writes the hint once, without the credential, however many spans follow', async () => {
+    const { processor, config, logger } = createHarness({ statuses: [UNAUTHORIZED_STATUS] });
+
+    feedSpans(processor, BATCH_MAX_EVENTS * 2);
+    await processor.forceFlush();
+    feedSpans(processor, BATCH_MAX_EVENTS, BATCH_MAX_EVENTS * 2);
+    await processor.forceFlush();
+
+    // One line in someone else's dev-server terminal, carrying the one thing
+    // they can act on.
+    const warnings = logger.entriesAt('warn');
+    expect(warnings).toHaveLength(1);
+    const hint = at(warnings, 0, 'the warnings');
+    expect(hint.message).toContain('relaunched');
+    expect(hint.fields).toMatchObject({ status: UNAUTHORIZED_STATUS, url: config.ingestUrl });
+    // A credential printed into a terminal outlives the process it belonged to
+    // by as long as the scrollback does.
+    expect(logText(logger)).not.toContain(config.token);
+  });
+
+  it('does not latch on a failure that may pass, so a service restart still recovers', async () => {
+    vi.useFakeTimers();
+
+    // A `5xx` and every member of the retryable client table: each describes a
+    // moment rather than the credential, so the transport must survive it.
+    for (const status of [SERVER_ERROR_STATUS, ...RETRYABLE_CLIENT_STATUSES]) {
+      const label = `status ${String(status)}`;
+      const { processor, fetch: rig } = createHarness({ statuses: [status, ACCEPTED_STATUS] });
+
+      feedSpans(processor, 1);
+      const flushing = processor.forceFlush();
+      await vi.advanceTimersByTimeAsync(RECONNECT_MIN_MS * 2 ** MAX_POST_ATTEMPTS);
+      await flushing;
+
+      expect(rig.calls, `${label} is retried in place`).toHaveLength(2);
+      expect(processor.stats(), `${label} does not latch`).toMatchObject({
+        credentialRejected: false,
+        droppedCredentialRejected: 0,
+        postedBatches: 1,
+        postedEvents: 1,
+      });
+
+      // And the batch after it still travels, which is what "recovers" means.
+      feedSpans(processor, 1, 1);
+      await processor.forceFlush();
+
+      expect(rig.calls, `${label} keeps posting afterwards`).toHaveLength(3);
+      expect(processor.stats().postedBatches).toBe(2);
+    }
   });
 });

@@ -24,9 +24,17 @@
  *                    credential (see WHY THE CREDENTIAL MATTERS below).
  *   --spawn-local    spawn the project's own `dev` script from this terminal
  *                    with the preload attached and no credential, which is the
- *                    unauthenticated shape: the service rejects ingest, so no
- *                    server or database spans are recorded. Useful offline and
- *                    to demonstrate exactly that failure mode.
+ *                    unauthenticated shape. The preload needs a credential to
+ *                    install anything, so without one it stays inert — no
+ *                    tracer provider, no exporter, no ingest — and no server or
+ *                    database spans are recorded
+ *                    (`packages/telemetry/src/node/config.ts`). Nothing in this
+ *                    mode ever contacts the service, so the mode needs no
+ *                    running service: whether the address handed to the child
+ *                    answers is reported and the dev server starts either way.
+ *                    That is what makes it usable offline, and what makes it a
+ *                    demonstration of exactly what an unauthenticated run
+ *                    costs.
  *
  * `--detach` returns as soon as the service has reported the launch instead of
  * waiting for Ctrl-C, and `--stop` stops a dev server the service launched for
@@ -366,6 +374,21 @@ What it does (default mode)
   Every route it calls is defined by the protocol (AAP 0.4.2), and these three
   are all of them: ${SERVICE_ROUTES.join(', ')}.
 
+What it does (--spawn-local)
+  1. resolves the preload and the target project, as above
+  2. reports whether GET {service}${HEALTH_PATH} answers — and starts the dev
+     server whether it does or not, because this mode asks the service for
+     nothing
+  3. spawns the project's own "dev" script here, with the preload on
+     NODE_OPTIONS and DEBUGGEN_INGEST_URL set, and no credential
+  4. forwards SIGINT/SIGTERM to that child and exits with its status
+
+  It reads no credential and makes no authorised call, so it needs neither
+  ${AUTH_FILE_NAME} nor a running service. With no credential the preload stays
+  inert — it installs no tracer provider and posts nothing — so the dev server
+  serves normally and no server or database spans are recorded. Run without
+  --spawn-local for the authenticated path.
+
 Options
   --project <dir>   project to launch; relative paths resolve against the
                     current directory (default: ${DEFAULT_PROJECT_REL} inside this
@@ -380,10 +403,13 @@ Options
                     stop it with --stop, or from VS Code by ending the session.
   --spawn-local     spawn the project's own "dev" script from this terminal
                     with the preload and DEBUGGEN_INGEST_URL, and WITHOUT a
-                    credential: the service rejects unauthenticated ingest, so
-                    NO server or database spans are recorded. Useful offline
-                    and to demonstrate that failure mode. Signals and the exit
-                    code are forwarded.
+                    credential. The preload installs nothing without one, so it
+                    stays inert and NO server or database spans are recorded.
+                    Because nothing in this mode contacts the service, it does
+                    not require one: whether {service}${HEALTH_PATH} answers is
+                    reported and the dev server starts either way, so the mode
+                    runs offline and shows what an unauthenticated run costs.
+                    Signals and the exit code are forwarded.
   --stop            stop a dev server the service launched for this project
                     (POST ${STOP_PATH}) and exit.
   --help, -h        print this text
@@ -412,9 +438,12 @@ Environment it sets on the child (--spawn-local only)
 
 Exit codes
   0   --help, a reported launch, a stopped dev server, or a child that exited 0
-  2   a failure this command reports: usage error, missing preload, service not
-      answering, missing or invalid ${AUTH_FILE_NAME}, a launch or stop the
-      service refused, unusable project, or no package manager on PATH. The
+  2   a failure this command reports: usage error, missing preload, unusable
+      project, or no package manager on PATH — and, in the modes that ask the
+      service for something (the default mode and --stop), a service that is
+      not answering, a missing or invalid ${AUTH_FILE_NAME}, or a launch or stop
+      the service refused. In --spawn-local a service that is not answering is
+      a note rather than a failure, because that mode asks it for nothing. The
       message says whether anything was launched.
   n   whatever the --spawn-local child exited with; 128 + signal number when it
       was signalled`;
@@ -827,8 +856,8 @@ export async function readEditorCredential(home = resolveDebuggenHome()) {
           '',
           'Set DEBUGGEN_HOME if your session home is elsewhere, or pass',
           '--spawn-local to start the dev server from this terminal without a',
-          'credential (ingest is rejected, so no server or database spans will be',
-          'recorded).',
+          'credential and without needing the service at all (the preload stays',
+          'inert without one, so no server or database spans are recorded).',
         ].join('\n'),
       });
     }
@@ -894,8 +923,13 @@ function extractToken(value, keys) {
 
 /**
  * Pre-flight the service with its unauthenticated liveness route. A failure
- * here is reported before anything is spawned, because a dev server started
- * without a reachable service produces telemetry nobody collects.
+ * here is reported before anything happens, because every mode that calls this
+ * directly goes on to make an authorised request the service must answer: a
+ * launch, or a stop.
+ *
+ * `--spawn-local` is the one mode that does not, and it therefore does not
+ * call this as a precondition — it asks {@link probeServiceReachability} and
+ * carries on. See that function for why.
  *
  * @param {string} base service base URL
  * @returns {Promise<void>}
@@ -929,6 +963,51 @@ export async function checkServiceHealth(base) {
       `${url} answered ${response.status} ${response.statusText}`.trimEnd(),
       { hint: serviceStartHint(base) },
     );
+  }
+}
+
+/**
+ * @typedef {object} ServiceReachability
+ * @property {boolean} reachable whether {@link HEALTH_PATH} answered 2xx
+ * @property {string} [detail] why it did not, in the same words the fatal
+ *   pre-flight would have used
+ */
+
+/**
+ * Ask the same liveness question as {@link checkServiceHealth} and report the
+ * answer instead of failing on it.
+ *
+ * This exists for `--spawn-local`, and the reason it is not a precondition
+ * there is a property of the mode rather than a leniency: a local spawn carries
+ * no credential, and the preload installs nothing at all without one — no
+ * tracer provider, no exporter, no control socket, no timer
+ * (`packages/telemetry/src/node/config.ts`, `loadPreloadConfig` → `inert`). The
+ * child therefore never sends a request to the service, so a service that is
+ * down changes nothing about the run: the dev server starts, serves, and
+ * records no server or database spans, which is exactly what the mode is for.
+ * Gating it on the service would deny the developer the one mode that needs
+ * nothing running.
+ *
+ * The probe is still worth making, because "is the address the child was handed
+ * answering?" is the difference between a deliberate offline run and a mistyped
+ * `--service`, so the answer is reported in the banner
+ * ({@link buildBanner}) rather than discarded.
+ *
+ * @param {string} base service base URL
+ * @returns {Promise<ServiceReachability>} never rejects
+ */
+export async function probeServiceReachability(base) {
+  try {
+    await checkServiceHealth(base);
+    return { reachable: true };
+  } catch (error) {
+    // The message, not the error: the caller reports this as a note, and the
+    // hint that belongs to a fatal pre-flight would overstate it.
+    const detail =
+      error instanceof DevInstrumentedError
+        ? error.message
+        : `${HEALTH_PATH}: ${describeCause(error)}`;
+    return { reachable: false, detail };
   }
 }
 
@@ -1498,7 +1577,11 @@ export function buildChildEnv({ preloadUrl, base, projectRoot, token, env = proc
  */
 export function describeToken(token) {
   if (token === undefined) {
-    return '<not set (--spawn-local): the service rejects unauthenticated ingest, so no server or database spans will be recorded>';
+    // What the preload actually does without one: it reports itself inert and
+    // installs nothing, so no ingest is attempted at all. Saying "the service
+    // rejects it" would describe a request that is never made — and would
+    // imply, wrongly, that this mode needs the service to be running.
+    return '<not set (--spawn-local): the preload stays inert without one, so no server or database spans will be recorded>';
   }
   return `<set, ${Buffer.byteLength(token, 'utf8')} bytes>`;
 }
@@ -1517,14 +1600,18 @@ export function describeToken(token) {
  * @param {ResolvedPreload} request.preload
  * @param {string} request.base
  * @param {NodeJS.ProcessEnv} request.childEnv
+ * @param {ServiceReachability} [request.reachability] what the liveness probe
+ *   found; an unreachable service is reported here as a note, because in this
+ *   mode it costs the run nothing
  * @returns {string}
  */
-export function buildBanner({ root, project, command, preload, base, childEnv }) {
+export function buildBanner({ root, project, command, preload, base, childEnv, reachability }) {
+  const unreachable = reachability !== undefined && !reachability.reachable;
   const rows = [
     ['project', project.label],
     ['command', `${command.display}  (cwd ${display(root, command.cwd)})`],
     ['preload', preload.relative],
-    ['service', base],
+    ['service', unreachable ? `${base}  (not answering)` : base],
     ['NODE_OPTIONS', childEnv.NODE_OPTIONS ?? ''],
     ['DEBUGGEN_INGEST_URL', childEnv.DEBUGGEN_INGEST_URL ?? ''],
     ['DEBUGGEN_PROJECT_ROOT', childEnv.DEBUGGEN_PROJECT_ROOT ?? ''],
@@ -1539,11 +1626,23 @@ export function buildBanner({ root, project, command, preload, base, childEnv })
     '  Stop it with Ctrl-C. Nothing in the project was modified, and no file',
     '  was written: the server-tier tracer lives in this child process only.',
     '',
-    '  This run is UNAUTHENTICATED: the service accepts telemetry ingest only',
-    '  from a server-agent credential it minted for the process it launched, so',
-    '  no server or database spans will be recorded. Run this command without',
-    '  --spawn-local to have the service launch the project instead, which is',
-    '  the path that produces authenticated server telemetry.',
+    '  This run is UNAUTHENTICATED: only the service mints the server-agent',
+    '  credential the preload needs, and without one the preload stays inert —',
+    '  it installs no tracer provider and posts nothing — so no server or',
+    '  database spans will be recorded. Run this command without --spawn-local',
+    '  to have the service launch the project instead, which is the path that',
+    '  produces authenticated server telemetry.',
+    ...(unreachable
+      ? [
+          '',
+          `  Note: ${reachability?.detail ?? `${base}${HEALTH_PATH} is not answering`}.`,
+          '  That does not stop this mode and nothing was skipped because of it:',
+          '  the child asks the service for nothing, so the dev server below is',
+          '  exactly the one a reachable service would have given you here. The',
+          '  address is only worth checking if you expected to be online — it',
+          '  comes from --service, or DEBUGGEN_HOST and DEBUGGEN_PORT.',
+        ]
+      : []),
   ].join('\n');
 }
 
@@ -1750,6 +1849,11 @@ function reportFailure(error, stderr = process.stderr) {
  * the editor credential, confirm the service answers, and only then launch,
  * stop or spawn.
  *
+ * `--spawn-local` reads no credential and confirms nothing, because it asks
+ * the service for nothing: its liveness probe is a note on the banner rather
+ * than a precondition, which is what lets that mode run with no service
+ * running at all (see {@link probeServiceReachability}).
+ *
  * The context parameter exists so the whole command can be driven against a
  * temporary tree and a stub service in `scripts/dev-instrumented.test.mjs`;
  * the defaults are the production values and the CLI entry below passes none of
@@ -1803,7 +1907,14 @@ export async function main(argv = process.argv.slice(2), context = {}) {
     if (options.spawnLocal) {
       // No editor credential is read: this mode makes no authorised call, and
       // reading a credential it cannot use would be misleading.
-      await checkServiceHealth(base);
+      //
+      // The service is asked whether it is answering, but the answer does not
+      // gate the spawn: this mode hands the child no credential, and without
+      // one the preload installs nothing and posts nothing, so the child never
+      // contacts the service. A service that is down costs this run nothing,
+      // and refusing to start because of it would break the one mode a
+      // developer can use with nothing else running.
+      const reachability = await probeServiceReachability(base);
 
       const command = buildLaunchCommand({ project, root, env });
       const childEnv = buildChildEnv({
@@ -1814,7 +1925,10 @@ export async function main(argv = process.argv.slice(2), context = {}) {
         env,
       });
 
-      writeLine(stdout, buildBanner({ root, project, command, preload, base, childEnv }));
+      writeLine(
+        stdout,
+        buildBanner({ root, project, command, preload, base, childEnv, reachability }),
+      );
 
       return await runDevServer(command, childEnv);
     }

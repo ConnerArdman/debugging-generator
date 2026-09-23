@@ -47,7 +47,11 @@
  */
 
 import type { CheckoutDraft, CheckoutResult } from '@/lib/types';
-import { StorefrontValidationError, storefrontErrorResponse } from '@/server/errors';
+import {
+  StorefrontValidationError,
+  readStorefrontJsonBody,
+  storefrontErrorResponse,
+} from '@/server/errors';
 import { trusted } from '@/server/origin';
 import { placeOrder } from '@/server/services/checkout.service';
 import { checkoutBodySchema } from '@/server/validation/checkout';
@@ -82,27 +86,27 @@ const MISADDRESSED = 'This request was not addressed to this store.';
  * @returns `200` with the `CheckoutResult` - the order and the authorization
  * that paid for it, as `outcome: 'placed'`, or the order the named attempt had
  * already placed, as `outcome: 'already_placed'` - or the mapper's failure
- * envelope: `400` when the body is not readable JSON, does not match the schema,
- * or the request was not addressed to this store, `404` when the session has no
- * cart at all, `409` when the stock, another checkout of the same cart or the
- * chosen shipping service no longer supports the submission - or when an earlier
- * attempt is still holding this session's cart, `402` when the payment was
- * declined, `502` when a dependency did not answer, and a single generic `500`
- * for anything unaccounted for. Exactly one code says an amount may have been
- * taken - `PAYMENT_STATUS_UNKNOWN`, answered with `409`, `500` or `502` - and
- * every other failure from this endpoint means nothing was captured.
+ * envelope: `415` when the body was not declared as `application/json`, `413`
+ * when it carries more bytes than this store reads, `400` when the body is not
+ * readable JSON, does not match the schema, or the request was not addressed to
+ * this store, `404` when the session has no cart at all, `409` when the stock,
+ * another checkout of the same cart or the chosen shipping service no longer
+ * supports the submission - or when an earlier attempt is still holding this
+ * session's cart, `402` when the payment was declined, `502` when a dependency
+ * did not answer, and a single generic `500` for anything unaccounted for.
+ * Exactly one code says an amount may have been taken -
+ * `PAYMENT_STATUS_UNKNOWN`, answered with `409`, `500` or `502` - and every
+ * other failure from this endpoint means nothing was captured.
  */
 export async function POST(request: Request): Promise<Response> {
   try {
-    let payload: unknown;
-
-    try {
-      payload = await request.json();
-    } catch (cause) {
-      // An empty or malformed body is the caller's mistake, so it is reported as
-      // the validation failure it is rather than as a failure of this endpoint.
-      throw new StorefrontValidationError(UNREADABLE, { cause });
-    }
+    // Read through the one guarded reader in `@/server/errors` rather than with
+    // `request.json()`: a body that was not declared as JSON is refused with 415
+    // and one past the store's byte ceiling with 413, both before anything is
+    // parsed, and an empty or malformed body comes back as the validation
+    // failure it is - the caller's mistake rather than a failure of this
+    // endpoint.
+    const payload: unknown = await readStorefrontJsonBody(request, { unreadable: UNREADABLE });
 
     // Parsing throws, and the rejection names every field at fault: the single
     // mapper behind `storefrontErrorResponse` turns it into the same 400 every

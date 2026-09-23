@@ -97,6 +97,30 @@
   --ls-radius-md: 8px;
   --ls-radius-lg: 12px;
 
+  /* Controls. Two height floors and one dimming, shared by every interactive primitive so that a
+   * control of a given density is the same height whichever primitive draws it and an unavailable
+   * one is dimmed by the same amount everywhere.
+   *
+   * --ls-control-sm is the compact floor: `Button[data-size='sm']`, `Input` and `Select` at `sm`,
+   * and the chip all read it, which is what stops a filter row from mixing a 23px button with a
+   * 29.5px field and a 32px chip. It deliberately matches the top of the spacing scale, which is
+   * the value the chip already stood at.
+   *
+   * --ls-target-min is the pointer-target floor of WCAG 2.5.5 / 2.5.8. It is declared for the
+   * surfaces that can carry a 44px box without changing what they are - a list row's link, a pager
+   * chip, the label of a radio row - and not forced onto the dense controls whose designed height
+   * the size contract above fixes; those read --ls-control-sm and stay flagged for design review in
+   * their own modules.
+   *
+   * --ls-disabled-opacity is the one disabled treatment. The primitives had drifted to four values
+   * (Button and Pill 0.55, Select the user agent's own 0.70, Input a pinned 1.0) for one meaning,
+   * so the number Button and Pill already used is named here and the other two now read it. An
+   * inactive control is exempt from the 4.5:1 text-contrast minimum (WCAG 1.4.3), which is what
+   * makes a single dimming the right answer rather than a per-primitive compromise. */
+  --ls-control-sm: 32px;
+  --ls-target-min: 44px;
+  --ls-disabled-opacity: 0.55;
+
   /* Type. System stacks only: no web font is imported or generated, so a clean clone builds and
    * renders with no network access. */
   --ls-font-sans: system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
@@ -110,6 +134,14 @@
   --ls-text-md: 0.9375rem; /* 15px - the body size */
   --ls-text-lg: 1.125rem; /* 18px */
   --ls-text-xl: 1.5rem; /* 24px */
+
+  /* Leading for the heading role. Unitless, so one value holds at every step of the scale above
+   * and follows the reader's font size with it. Declared once because the role is painted in more
+   * than one place - the element baseline below, `.ls-page-title`, `.ls-section-title`, and the
+   * heading class of any component module that states its own - and those places had drifted to
+   * two values for one role: 1.25 and 1.3, which render 22.5px and 23.4px on an 18px `<h2>`. A
+   * module that styles a heading reads this token rather than restating a ratio. */
+  --ls-leading-heading: 1.25;
 
   /* Elevation. Soft and neutral, tinted with the ink colour rather than pure black. */
   --ls-shadow-1: 0 1px 2px rgba(15, 23, 42, 0.06);
@@ -199,7 +231,7 @@ h5,
 h6 {
   color: var(--ls-text);
   font-weight: 600;
-  line-height: 1.25;
+  line-height: var(--ls-leading-heading, 1.25);
 }
 
 h1 {
@@ -320,7 +352,7 @@ textarea {
   color: var(--ls-text);
   font-size: var(--ls-text-xl);
   font-weight: 600;
-  line-height: 1.25;
+  line-height: var(--ls-leading-heading, 1.25);
 }
 
 /* The sentence under a page title, held to a comfortable reading measure. */
@@ -368,12 +400,15 @@ textarea {
   gap: var(--ls-space-2);
 }
 
-/* A section's `<h2>`. */
+/* A section's `<h2>`. The leading is the shared heading token rather than a ratio of its own: this
+ * utility and the section-heading class of a component module dress the same role on different
+ * surfaces, and while the two carried 1.3 and 1.25 the same `<h2>` stood 23.4px tall on the
+ * checkout form and 22.5px on the dashboard. */
 .ls-section-title {
   color: var(--ls-text);
   font-size: var(--ls-text-lg);
   font-weight: 600;
-  line-height: 1.3;
+  line-height: var(--ls-leading-heading, 1.25);
 }
 
 /* The two-column page grid. It starts as one column and adopts the second track once there is

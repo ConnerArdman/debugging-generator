@@ -1,11 +1,11 @@
 /**
  * The failure contract for the Lumen Supply server layer.
  *
- * Everything that can go wrong behind a route handler is expressed here, in two
- * halves that belong together:
+ * Everything that can go wrong behind a route handler is expressed here, in
+ * three parts that belong together:
  *
  * 1. **A small hierarchy of thrown errors.** A service that cannot do what it
- *    was asked throws a {@link StorefrontError} - almost always one of the four
+ *    was asked throws a {@link StorefrontError} - almost always one of the six
  *    subclasses below - which carries the machine-readable
  *    `StorefrontErrorCode` the browser reads, the HTTP status the failure
  *    deserves and, when it helps, structured `details`. One failure is neither
@@ -17,6 +17,14 @@
  *    {@link storefrontErrorResponse}, so every endpoint answers with the same
  *    `StorefrontErrorBody` envelope and the browser client has exactly one shape
  *    to parse.
+ * 3. **One guarded reader for a JSON request body.** A state-changing endpoint
+ *    reads its body through {@link readStorefrontJsonBody} rather than through
+ *    `request.json()`, because two properties of a request have to be settled
+ *    before its bytes are parsed and neither is the caller's to decide: whether
+ *    the body was declared as JSON at all, and how many bytes of it this
+ *    process is willing to hold. Refusing either is a failure of the request,
+ *    which is why the reader lives beside the errors it raises and answers in
+ *    the same envelope as everything else here.
  *
  * ## What may appear in a response body
  *
@@ -83,6 +91,53 @@ const MAX_ISSUES = 20;
 
 /** How long a single reported validation message may be. */
 const MAX_LENGTH = 200;
+
+/**
+ * How many bytes of a request body {@link readStorefrontJsonBody} will hold:
+ * 65536, which is 64 KiB.
+ *
+ * No body this storefront sends comes near it. The largest of them is a
+ * checkout draft - a contact, an address, a chosen shipping service, a delivery
+ * note and the name of the attempt - which stays under two kilobytes with every
+ * field at the longest its schema allows, and a cart change or a rating request
+ * is a few hundred bytes. So the ceiling is not a limit a shopper can reach; it
+ * is the answer to a caller that is not the storefront.
+ *
+ * It has to be stated somewhere, because a route handler has no default: a body
+ * is otherwise bounded only by the memory of the machine serving it, which lets
+ * whoever sent the request decide how much of that memory to spend.
+ */
+const MAX_BYTES = 65536;
+
+/** What a caller is told when the body carries more bytes than are read. */
+const OVERSIZE_MESSAGE =
+  'The request body is larger than this storefront accepts; keep it under 64 kilobytes.';
+
+/** What a caller is told when the body was not declared as JSON. */
+const MEDIA_MESSAGE = 'This endpoint accepts a JSON request body, declared as application/json.';
+
+/** The one media type a body may be declared as. */
+const MEDIA_JSON = 'application/json';
+
+/**
+ * The encodings a `charset` parameter on that media type may name.
+ *
+ * A JSON body is UTF-8 (RFC 8259 §8.1) and is decoded as UTF-8 here, so a
+ * request declaring a different encoding is asking for bytes to be read as
+ * something they will not be read as. Refusing it is more honest than decoding
+ * it anyway and reporting whatever comes out as a malformed body, and it costs
+ * a caller nothing: US-ASCII is a subset of UTF-8 and is accepted, and both
+ * spellings of UTF-8 in the wild are listed. A body with no `charset` parameter
+ * at all - which is what every client of this store sends - is the normal case
+ * and is not affected.
+ */
+const MEDIA_CHARSET: readonly string[] = ['utf-8', 'utf8', 'us-ascii'];
+
+/** The only shape a `content-length` may have to be believed: digits alone. */
+const DIGITS = /^\d+$/;
+
+/** The optional quoting around a media-type parameter's value. */
+const QUOTES = /^"|"$/g;
 
 /**
  * A Prisma request error code: the letter `P` and four digits, as in `P2002`.
@@ -159,7 +214,7 @@ export interface StorefrontErrorOutcome {
 /**
  * A failure this application raised on purpose.
  *
- * Prefer one of the four subclasses; construct this class directly only for a
+ * Prefer one of the six subclasses; construct this class directly only for a
  * code they do not cover - `OUT_OF_STOCK` and `PAYMENT_DECLINED` are the two
  * that come up, both with a status of 409 and 402 respectively chosen by the
  * service that raises them. The third, `PAYMENT_STATUS_UNKNOWN`, has a
@@ -255,6 +310,62 @@ export class StorefrontValidationError extends StorefrontError {
   constructor(message: string, options?: StorefrontErrorOptions) {
     super('VALIDATION_FAILED', 400, message, options);
     this.name = 'StorefrontValidationError';
+  }
+}
+
+/**
+ * The request body carries more bytes than the endpoint will read, so none of
+ * it was parsed and nothing was written.
+ *
+ * It is a sibling of {@link StorefrontValidationError} rather than a variation
+ * on it: the request is unacceptable for the same reason - the caller sent
+ * something this endpoint does not take - and the only difference worth
+ * reporting is the status, 413, which is what tells anyone reading HTTP that
+ * the body's size is the problem and that shortening it is the remedy.
+ *
+ * The code stays `VALIDATION_FAILED`. `StorefrontErrorCode` in `@/lib/types` is
+ * a closed union that the browser client's recovery paths switch on and that
+ * every response body in this application is described by, so a new member
+ * would be a change to a published contract for a refusal the existing member
+ * already reports correctly: this request was not acceptable, and sending it
+ * again unchanged will not help.
+ */
+export class StorefrontPayloadTooLargeError extends StorefrontError {
+  /**
+   * @param message A sentence telling the caller the body is too large and
+   * roughly how large is acceptable. It names no limit internals.
+   * @param options Optional `details` and `cause`.
+   */
+  constructor(message: string, options?: StorefrontErrorOptions) {
+    super('VALIDATION_FAILED', 413, message, options);
+    this.name = 'StorefrontPayloadTooLargeError';
+  }
+}
+
+/**
+ * The request declared a body this endpoint does not read: no media type at
+ * all, or one that is not JSON.
+ *
+ * A state-changing endpoint that parses whatever it is handed, and answers on
+ * the strength of the bytes happening to be JSON, cannot tell a client of this
+ * store from anything else that reached the URL. So the declaration is checked,
+ * and a request that does not make one is refused with 415 before its body is
+ * read - which also keeps a genuinely wrong media type from being reported as a
+ * field-level validation failure, a diagnosis that would send the caller
+ * looking at its payload instead of at its headers.
+ *
+ * The code stays `VALIDATION_FAILED`, for the reason given on
+ * {@link StorefrontPayloadTooLargeError}: the union is a published contract and
+ * the status carries the distinction.
+ */
+export class StorefrontMediaTypeError extends StorefrontError {
+  /**
+   * @param message A sentence naming the media type the endpoint does accept.
+   * @param options Optional `details` and `cause`.
+   */
+  constructor(message: string, options?: StorefrontErrorOptions) {
+    super('VALIDATION_FAILED', 415, message, options);
+    this.name = 'StorefrontMediaTypeError';
   }
 }
 
@@ -673,4 +784,206 @@ export function storefrontErrorResponse(error: unknown): Response {
       'cache-control': 'no-store',
     },
   });
+}
+
+/* ---------------------------------------------------------------------------
+ * Reading a request body
+ * ------------------------------------------------------------------------- */
+
+/**
+ * What {@link readStorefrontJsonBody} accepts beyond the request itself.
+ *
+ * Both members are optional, and each omitted member is a decision rather than
+ * an oversight: the default ceiling is the one every endpoint wants, and a
+ * reader with no `unreadable` message hands unreadable bytes on as `undefined`
+ * instead of refusing them.
+ */
+export interface StorefrontJsonBodyOptions {
+  /**
+   * The sentence to refuse with when the bytes are not readable JSON - an empty
+   * body, a truncated object, text that is not JSON at all.
+   *
+   * Supply it, and unreadable bytes become a 400 through
+   * {@link StorefrontValidationError} with the caught parse failure as its
+   * `cause`, which is the answer three of this application's four POST
+   * endpoints give. Omit it, and the call resolves to `undefined` instead, so
+   * the schema behind the handler is the one that speaks: its rejection then
+   * names the fields a request of that kind needs, which is a more useful 400
+   * than "the body could not be read" for an endpoint whose callers are
+   * services rather than forms.
+   *
+   * `exactOptionalPropertyTypes` is on, so choose by including or omitting the
+   * property - passing it as `undefined` does not compile.
+   */
+  unreadable?: string;
+
+  /**
+   * A ceiling in bytes for this one call, in place of the module's
+   * {@link MAX_BYTES}.
+   *
+   * It is here for an endpoint whose largest legitimate body is materially
+   * different from the rest, so that such a case is a value at the call site
+   * rather than a raised ceiling for every route. No endpoint in this
+   * application needs it today; every one of them reads its body at the default.
+   */
+  limit?: number;
+}
+
+/**
+ * Reads and parses a JSON request body, refusing the two requests a
+ * state-changing endpoint must not read at all.
+ *
+ * This is what every POST handler in this application calls instead of
+ * `request.json()`, and what it refuses before parsing anything is the whole
+ * difference:
+ *
+ * 1. **A body that was not declared as JSON** - no `content-type` header, an
+ *    empty one, `text/plain`, a form encoding - is answered with 415 and never
+ *    read. Parameters on the media type are allowed and ignored, so the
+ *    `application/json; charset=utf-8` a browser or a proxy may send is
+ *    accepted; a `charset` naming an encoding other than
+ *    {@link MEDIA_CHARSET} is refused with the same 415, because the bytes are
+ *    decoded as UTF-8 whatever the request claims.
+ * 2. **A body past the ceiling** is answered with 413, and the bytes past it
+ *    are never held. A declared `content-length` above the ceiling is refused
+ *    without reading anything at all; a body that declares no length, or
+ *    declares one it then exceeds, is cut off by the count kept while it
+ *    streams. Both matter: the header is the cheap case and the stream is the
+ *    honest one, since a chunked request declares no length and a declared
+ *    length is a claim rather than a fact.
+ *
+ * The body is read through `request.body`'s own reader rather than with
+ * `request.json()`, `request.text()` or `request.arrayBuffer()`. Each of those
+ * buffers the entire body before anything can look at its size, which is
+ * precisely what has to be prevented: the size check has to happen while the
+ * bytes are arriving, not after they are all in memory. When the count passes
+ * the ceiling the reader is cancelled before the refusal is thrown, which
+ * releases the stream and lets the server discard the remainder of the request
+ * - without that, the refusal would race the caller's upload and the caller
+ * could lose the response it was answered with.
+ *
+ * Nothing here interprets the body: it is decoded as UTF-8, parsed, and handed
+ * back as `unknown` for the endpoint's own schema to validate. Nothing is
+ * logged either - a body is the caller's data, and the messages this module
+ * refuses with quote none of it.
+ *
+ * @param request The request whose body is read. It is consumed by this call,
+ * so call it once per request.
+ * @param options Optional `unreadable` message and `limit`; see
+ * {@link StorefrontJsonBodyOptions}.
+ * @returns The parsed body as `unknown`, or `undefined` when the bytes were not
+ * readable JSON and no `unreadable` message was given.
+ * @throws {StorefrontMediaTypeError} 415, when the body is not declared as JSON.
+ * @throws {StorefrontPayloadTooLargeError} 413, when the body is larger than
+ * the ceiling.
+ * @throws {StorefrontValidationError} 400, when the bytes are not readable JSON
+ * and an `unreadable` message was given.
+ *
+ * @example
+ * ```ts
+ * export async function POST(request: Request): Promise<Response> {
+ *   try {
+ *     const payload = await readStorefrontJsonBody(request, { unreadable: UNREADABLE });
+ *     return Response.json(await change(cartMutationBodySchema.parse(payload)));
+ *   } catch (error) {
+ *     return storefrontErrorResponse(error);
+ *   }
+ * }
+ * ```
+ */
+export async function readStorefrontJsonBody(
+  request: Request,
+  options?: StorefrontJsonBodyOptions,
+): Promise<unknown> {
+  const limit = options?.limit ?? MAX_BYTES;
+
+  // The media type is the first thing settled, because it is one header read
+  // and it decides whether the body is worth reading at all. Everything before
+  // the first `;` is the type; what follows are parameters.
+  const parts = (request.headers.get('content-type') ?? '').split(';');
+  const media = (parts[0] ?? '').trim().toLowerCase();
+
+  if (media !== MEDIA_JSON) {
+    throw new StorefrontMediaTypeError(MEDIA_MESSAGE);
+  }
+
+  for (const part of parts.slice(1)) {
+    const pair = part.split('=');
+
+    if ((pair[0] ?? '').trim().toLowerCase() !== 'charset') {
+      continue;
+    }
+
+    const encoding = (pair[1] ?? '').trim().toLowerCase().replace(QUOTES, '');
+
+    if (!MEDIA_CHARSET.includes(encoding)) {
+      throw new StorefrontMediaTypeError(MEDIA_MESSAGE);
+    }
+  }
+
+  // A `content-length` above the ceiling is refused here, before a single byte
+  // is read. A header that is absent or is not a plain count of bytes is not
+  // trusted and not used: the streaming count below holds either way.
+  const declared = request.headers.get('content-length');
+
+  if (declared !== null && DIGITS.test(declared.trim()) && Number(declared.trim()) > limit) {
+    throw new StorefrontPayloadTooLargeError(OVERSIZE_MESSAGE);
+  }
+
+  const stream = request.body;
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+
+  // A null body is a request that carries none; it is left to the unreadable
+  // branch below, which is what the endpoints already answer an empty body with.
+  if (stream !== null) {
+    const reader = stream.getReader();
+
+    for (;;) {
+      const chunk = await reader.read();
+
+      if (chunk.done) {
+        break;
+      }
+
+      total += chunk.value.byteLength;
+
+      if (total > limit) {
+        // Cancelled rather than merely abandoned: this releases the reader and
+        // lets the server drop what is still arriving, so the 413 below is
+        // deliverable instead of racing the rest of the upload.
+        await reader.cancel();
+
+        throw new StorefrontPayloadTooLargeError(OVERSIZE_MESSAGE);
+      }
+
+      chunks.push(chunk.value);
+    }
+  }
+
+  // One allocation of exactly the bytes that arrived - at most the ceiling, so
+  // this is bounded by the constant above and never by the request.
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+
+  try {
+    // `fatal` so that bytes which are not UTF-8 are a failure rather than a
+    // string full of replacement characters: a body that cannot be decoded is
+    // unreadable, and saying so is better than parsing something the caller did
+    // not send.
+    const value: unknown = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+
+    return value;
+  } catch (cause) {
+    if (options?.unreadable !== undefined) {
+      throw new StorefrontValidationError(options.unreadable, { cause });
+    }
+
+    return undefined;
+  }
 }

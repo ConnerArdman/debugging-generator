@@ -112,6 +112,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   EXCLUDED_DIRECTORY_NAMES,
   INDEXABLE_EXTENSIONS,
+  findWorkspaceRoot,
   isEnvFilePath,
   isIndexableFile,
   openProject,
@@ -475,7 +476,19 @@ function sourceFileAt(loaded: LoadedProject, relativePath: string): LoadedSource
  * cases exist to catch. The frozen vocabulary itself is asserted separately, at
  * the end of this file.
  */
-const NEVER_INDEXED_DIRECTORIES: readonly string[] = ['node_modules', '.next', 'dist', 'coverage'];
+const NEVER_INDEXED_DIRECTORIES: readonly string[] = [
+  'node_modules',
+  '.next',
+  'dist',
+  'coverage',
+  // A code generator's own output tree, under both prevailing conventions:
+  // `generated` (Prisma's `prisma-client` `output`, protobuf and OpenAPI
+  // clients) and `__generated__` (graphql-codegen, Relay). Named here as
+  // literally as the four above, so the privacy sweeps assert the rule rather
+  // than the vocabulary that implements it.
+  'generated',
+  '__generated__',
+];
 
 /** Whether a path names generated or vendored output rather than a developer's source. */
 function isGeneratedOrVendored(path: string): boolean {
@@ -1345,16 +1358,58 @@ describe('openProject: trees and files that are never indexed', () => {
   );
 
   it('honours extraExcludes as whole segments at any depth', () => {
+    // The subject is deliberately a directory name that is *not* one of the
+    // module's defaults: a case that excluded `src/generated` through
+    // `extraExcludes` would pass on the default rule alone and would stop
+    // proving that the caller's own entries are honoured at all.
     const root = copyCorpusInto('app');
-    plantFile(join(root, 'src', 'generated', 'client.ts'), moduleNaming(GENERATED_MARKER));
-    plantFile(join(root, 'src', 'generated-docs', 'index.ts'), 'export const DOCS = 1;\n');
+    plantFile(join(root, 'src', 'vendorlib', 'client.ts'), moduleNaming(GENERATED_MARKER));
+    plantFile(join(root, 'src', 'vendorlib-docs', 'index.ts'), 'export const DOCS = 1;\n');
 
-    const loaded = openOrFail({ projectRoot: root, extraExcludes: ['src/generated'] });
+    const loaded = openOrFail({ projectRoot: root, extraExcludes: ['src/vendorlib'] });
 
-    expect(relativePathsOf(loaded)).not.toContain('src/generated/client.ts');
+    expect(relativePathsOf(loaded)).not.toContain('src/vendorlib/client.ts');
     expect(loadedTextOf(loaded)).not.toContain(GENERATED_MARKER);
     // A partial segment is not a match: the neighbouring directory stays.
+    expect(relativePathsOf(loaded)).toContain('src/vendorlib-docs/index.ts');
+  });
+
+  it('loads no generated tree by default, under either naming convention', () => {
+    // The default rule, with no `extraExcludes` at all: a generated client
+    // written into the project's own source tree is code the developer did not
+    // write, and on this product's own demo target one such tree contributed
+    // half the index — every one of its symbols a domain word (`Cart`,
+    // `Order`, `Product`) that would crowd out authored code in the candidate
+    // set offered to the model. Both prevailing spellings are planted, and the
+    // partial-segment control proves the rule stayed a whole-segment one.
+    const root = copyCorpusInto('app');
+    plantFile(
+      join(root, 'src', 'generated', 'prisma', 'client.ts'),
+      moduleNaming(GENERATED_MARKER),
+    );
+    plantFile(join(root, 'src', '__generated__', 'graphql.ts'), moduleNaming(GENERATED_MARKER));
+    plantFile(join(root, 'src', 'generated-docs', 'index.ts'), 'export const DOCS = 1;\n');
+
+    const loaded = openOrFail({ projectRoot: root });
+
+    // Neither the judged set nor the compiler's own set, and not under any
+    // other spelling either: content that reached the compiler has reached
+    // memory, whatever the list says.
+    expectNeverLoaded(loaded, 'src/generated/prisma/client.ts', GENERATED_MARKER);
+    expectNeverLoaded(loaded, 'src/__generated__/graphql.ts', GENERATED_MARKER);
+    expectNothingForbiddenWasRead(loaded);
+
+    // A developer's own directory whose name merely begins with the excluded
+    // one is indexed normally — the only assertion here that would fail if the
+    // new names had been matched as substrings.
     expect(relativePathsOf(loaded)).toContain('src/generated-docs/index.ts');
+    // And nothing else came in or dropped out: the corpus plus that one
+    // control, in the module's byte-wise order. `sort()` compares UTF-16 code
+    // units, which is the order `comparePaths` implements, so the membership
+    // stays literal while the insertion point is not typed out by hand.
+    expect(relativePathsOf(loaded)).toEqual(
+      [...EXPECTED_FIXTURE_FILES, 'src/generated-docs/index.ts'].sort(),
+    );
   });
 });
 
@@ -1677,14 +1732,32 @@ describe('shouldExcludePath', () => {
   });
 
   it('matches an extraExcludes entry as whole segments at any depth', () => {
-    expect(shouldExcludePath('/p', '/p/src/generated/client.ts', ['src/generated'])).toBe(true);
+    // `vendorlib` rather than `generated`: the subject has to be a name the
+    // module does not already exclude by default, or every assertion below
+    // would hold with `extraExcludes` ignored entirely.
+    expect(shouldExcludePath('/p', '/p/src/vendorlib/client.ts', ['src/vendorlib'])).toBe(true);
     expect(
-      shouldExcludePath('/p', '/p/packages/api/src/generated/client.ts', ['src/generated']),
+      shouldExcludePath('/p', '/p/packages/api/src/vendorlib/client.ts', ['src/vendorlib']),
     ).toBe(true);
-    expect(shouldExcludePath('/p', '/p/src/generated-docs/index.ts', ['src/generated'])).toBe(
+    expect(shouldExcludePath('/p', '/p/src/vendorlib-docs/index.ts', ['src/vendorlib'])).toBe(
       false,
     );
-    expect(shouldExcludePath('/p', '/p/src/module.ts', ['generated'])).toBe(false);
+    expect(shouldExcludePath('/p', '/p/src/module.ts', ['vendorlib'])).toBe(false);
+  });
+
+  it('excludes a generated tree with no extraExcludes at all', () => {
+    // The default rule, stated at the predicate rather than through
+    // `openProject`: both conventional spellings at any depth, and neither a
+    // partial segment nor a project checked out beneath a directory of that
+    // name is affected.
+    expect(shouldExcludePath('/p', '/p/src/generated/prisma/client.ts')).toBe(true);
+    expect(shouldExcludePath('/p', '/p/src/__generated__/graphql.ts')).toBe(true);
+    expect(shouldExcludePath('/p', '/p/packages/api/src/generated/client.ts')).toBe(true);
+    expect(shouldExcludePath('/p', '/p/src/generated-docs/index.ts')).toBe(false);
+    expect(shouldExcludePath('/p', '/p/src/generated.ts')).toBe(false);
+    expect(shouldExcludePath('/home/dev/generated/p', '/home/dev/generated/p/src/module.ts')).toBe(
+      false,
+    );
   });
 
   it('ignores an extraExcludes entry that normalises to nothing meaningful', () => {
@@ -1693,10 +1766,298 @@ describe('shouldExcludePath', () => {
     // would exclude the entire project — an empty index from a caller's empty
     // string, with nothing to explain it.
     expect(shouldExcludePath('/p', '/p/src/module.ts', ['', '.', './'])).toBe(false);
-    // A real entry alongside the meaningless ones still matches.
-    expect(shouldExcludePath('/p', '/p/src/generated/client.ts', ['.', 'src/generated'])).toBe(
+    // A real entry alongside the meaningless ones still matches — and it is a
+    // name the defaults do not already cover, so the match is the entry's.
+    expect(shouldExcludePath('/p', '/p/src/vendorlib/client.ts', ['.', 'src/vendorlib'])).toBe(
       true,
     );
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * findWorkspaceRoot
+ *
+ * Every case below builds its own tree in the sandbox, and the ones whose
+ * expectation is `undefined` either stop at a declaration they plant or pass an
+ * explicit `maxDepth`. That is deliberate: the sandbox lives under the host's
+ * temporary directory, so a case that walked all the way to `/` would be
+ * answering about *this machine's* directories rather than about the fixture,
+ * and would fail on a host that happens to keep a manifest up there.
+ *
+ * The membership check is the subject of half of them. Without it the function
+ * would answer "the nearest lockfile upwards", which for any project checked
+ * out beneath a monorepo — including this repository's own committed corpus at
+ * `test/fixtures/sample-next-app` — reports a package manager that has nothing
+ * to do with the project.
+ * ---------------------------------------------------------------------------
+ */
+
+describe('findWorkspaceRoot', () => {
+  /** The POSIX spelling of a sandbox path, which is what the function returns. */
+  function posixIn(...segments: string[]): string {
+    return toPosix(join(sandbox, ...segments));
+  }
+
+  it('finds the pnpm workspace root a member project belongs to', () => {
+    plantFile(
+      join(sandbox, 'repo', 'pnpm-workspace.yaml'),
+      '# the shape every pnpm monorepo uses\npackages:\n  - "apps/*"\n  - "packages/*"\n',
+    );
+    const project = makeDir(join(sandbox, 'repo', 'apps', 'storefront'));
+
+    expect(findWorkspaceRoot(project)).toEqual({
+      root: posixIn('repo'),
+      declaredBy: 'pnpm-workspace',
+      memberPattern: 'apps/*',
+    });
+  });
+
+  it('reads the inline flow form of the packages sequence', () => {
+    plantFile(
+      join(sandbox, 'repo', 'pnpm-workspace.yaml'),
+      'packages: ["apps/*", packages/*] # bare and quoted, one line\n',
+    );
+    const project = makeDir(join(sandbox, 'repo', 'packages', 'analysis'));
+
+    expect(findWorkspaceRoot(project)?.memberPattern).toBe('packages/*');
+  });
+
+  it('refuses a project that merely sits beneath a workspace root', () => {
+    // The committed corpus' own shape: `test/fixtures/<app>` inside a member
+    // package. It matches neither `apps/*` nor `packages/*`, and reporting the
+    // surrounding repository's package manager for it would be the wrong
+    // answer for every project a developer keeps inside another checkout.
+    plantFile(
+      join(sandbox, 'repo', 'pnpm-workspace.yaml'),
+      'packages:\n  - "apps/*"\n  - "packages/*"\n',
+    );
+    const project = makeDir(
+      join(sandbox, 'repo', 'packages', 'analysis', 'test', 'fixtures', 'sample-app'),
+    );
+
+    expect(findWorkspaceRoot(project)).toBeUndefined();
+  });
+
+  it('walks past an ordinary package manifest to the workspace root above it', () => {
+    // A member package's own `package.json` declares no workspace, so it must
+    // not end the walk — otherwise no project nested inside a member (an
+    // example application, a fixture) could ever reach its root.
+    plantFile(join(sandbox, 'repo', 'pnpm-workspace.yaml'), 'packages:\n  - "packages/**"\n');
+    plantFile(
+      join(sandbox, 'repo', 'packages', 'analysis', 'package.json'),
+      `${JSON.stringify({ name: 'analysis', version: '0.0.0' })}\n`,
+    );
+    const project = makeDir(join(sandbox, 'repo', 'packages', 'analysis', 'examples', 'demo'));
+
+    expect(findWorkspaceRoot(project)).toEqual({
+      root: posixIn('repo'),
+      declaredBy: 'pnpm-workspace',
+      memberPattern: 'packages/**',
+    });
+  });
+
+  it("reads npm's workspaces array from the root manifest", () => {
+    plantFile(
+      join(sandbox, 'repo', 'package.json'),
+      `${JSON.stringify({ name: 'repo', private: true, workspaces: ['apps/*', 'tools/*'] })}\n`,
+    );
+    const project = makeDir(join(sandbox, 'repo', 'tools', 'codegen'));
+
+    expect(findWorkspaceRoot(project)).toEqual({
+      root: posixIn('repo'),
+      declaredBy: 'package-json',
+      memberPattern: 'tools/*',
+    });
+  });
+
+  it("reads yarn-classic's workspaces object form", () => {
+    plantFile(
+      join(sandbox, 'repo', 'package.json'),
+      `${JSON.stringify({
+        name: 'repo',
+        private: true,
+        workspaces: { packages: ['apps/*'], nohoist: ['**/react-native'] },
+      })}\n`,
+    );
+    const project = makeDir(join(sandbox, 'repo', 'apps', 'mobile'));
+
+    expect(findWorkspaceRoot(project)).toEqual({
+      root: posixIn('repo'),
+      declaredBy: 'package-json',
+      memberPattern: 'apps/*',
+    });
+  });
+
+  it('matches a ** pattern across any number of segments', () => {
+    plantFile(join(sandbox, 'repo', 'pnpm-workspace.yaml'), 'packages:\n  - "libs/**"\n');
+    const shallow = makeDir(join(sandbox, 'repo', 'libs', 'one'));
+    const deep = makeDir(join(sandbox, 'repo', 'libs', 'one', 'two', 'three'));
+    const outside = makeDir(join(sandbox, 'repo', 'other', 'thing'));
+
+    expect(findWorkspaceRoot(shallow)?.memberPattern).toBe('libs/**');
+    expect(findWorkspaceRoot(deep)?.memberPattern).toBe('libs/**');
+    expect(findWorkspaceRoot(outside)).toBeUndefined();
+  });
+
+  it('lets a negated pattern veto a membership another pattern granted', () => {
+    // Both orders of the two patterns are exercised, because a negation vetoes
+    // wherever it appears in the list — a matcher that stopped at the first
+    // positive match would accept the excluded project in one of the two.
+    plantFile(
+      join(sandbox, 'first', 'pnpm-workspace.yaml'),
+      'packages:\n  - "apps/*"\n  - "!apps/legacy"\n',
+    );
+    plantFile(
+      join(sandbox, 'second', 'pnpm-workspace.yaml'),
+      'packages:\n  - "!apps/legacy"\n  - "apps/*"\n',
+    );
+
+    for (const repo of ['first', 'second']) {
+      expect(findWorkspaceRoot(makeDir(join(sandbox, repo, 'apps', 'legacy')))).toBeUndefined();
+      expect(findWorkspaceRoot(makeDir(join(sandbox, repo, 'apps', 'current')))?.root).toBe(
+        posixIn(repo),
+      );
+    }
+  });
+
+  it('answers undefined when no ancestor declares a workspace', () => {
+    // `maxDepth` bounds this case to the two planted directories, so the answer
+    // is about the fixture and not about whatever sits above the host's
+    // temporary directory.
+    const project = makeDir(join(sandbox, 'plain', 'inner', 'app'));
+    plantFile(join(sandbox, 'plain', 'inner', 'notes.md'), '# not a declaration\n');
+
+    expect(findWorkspaceRoot(project, { maxDepth: 2 })).toBeUndefined();
+  });
+
+  it('answers undefined for a project that is itself the workspace root', () => {
+    // Its own manifest and its own lockfile already answer the package-manager
+    // question, so naming itself as its own workspace root would add nothing —
+    // and `maxDepth: 1` proves the declaration in the project *itself* is not
+    // what is being read.
+    const root = join(sandbox, 'repo');
+    plantFile(join(root, 'pnpm-workspace.yaml'), 'packages:\n  - "apps/*"\n');
+    plantFile(
+      join(root, 'package.json'),
+      `${JSON.stringify({ name: 'repo', private: true, workspaces: ['apps/*'] })}\n`,
+    );
+
+    expect(findWorkspaceRoot(root, { maxDepth: 1 })).toBeUndefined();
+  });
+
+  it('stops at a malformed pnpm declaration instead of walking past it', () => {
+    // A declaration it cannot read is a declaration with no usable patterns:
+    // the walk ends there. The valid outer declaration would match this project
+    // through `**`, so an answer of anything but `undefined` here would mean
+    // the malformed file had been skipped over.
+    plantFile(join(sandbox, 'outer', 'pnpm-workspace.yaml'), 'packages:\n  - "**"\n');
+    const project = makeDir(join(sandbox, 'outer', 'mid', 'app'));
+    plantFile(join(sandbox, 'outer', 'mid', 'pnpm-workspace.yaml'), 'packages: [unterminated\n');
+
+    expect(findWorkspaceRoot(project)).toBeUndefined();
+
+    // The control: with the malformed file gone, the outer declaration answers.
+    rmSync(join(sandbox, 'outer', 'mid', 'pnpm-workspace.yaml'));
+    expect(findWorkspaceRoot(project)).toEqual({
+      root: posixIn('outer'),
+      declaredBy: 'pnpm-workspace',
+      memberPattern: '**',
+    });
+  });
+
+  it('stops at a manifest whose JSON is malformed', () => {
+    // Same rule for the other declaration mechanism, and for the same reason:
+    // the file *may* have carried a `workspaces` field, nothing here can prove
+    // it did not, and walking past it could credit the project to a repository
+    // that does not contain it.
+    plantFile(join(sandbox, 'outer', 'pnpm-workspace.yaml'), 'packages:\n  - "**"\n');
+    const project = makeDir(join(sandbox, 'outer', 'mid', 'app'));
+    plantFile(join(sandbox, 'outer', 'mid', 'package.json'), '{ "name": "mid", \n');
+
+    expect(findWorkspaceRoot(project)).toBeUndefined();
+  });
+
+  it('ignores a packages key that is not a sequence, and reports no member', () => {
+    plantFile(join(sandbox, 'repo', 'pnpm-workspace.yaml'), 'packages: apps\nonlyBuilt: true\n');
+    const project = makeDir(join(sandbox, 'repo', 'apps', 'storefront'));
+
+    expect(findWorkspaceRoot(project)).toBeUndefined();
+  });
+
+  it('reads only the top-level packages key, and stops at the next key', () => {
+    // A nested `packages:` belongs to another mapping (pnpm's `catalogs:`
+    // blocks can hold one), and the sequence must not run on into the key that
+    // follows it.
+    plantFile(
+      join(sandbox, 'repo', 'pnpm-workspace.yaml'),
+      [
+        'catalogs:',
+        '  default:',
+        '    packages:',
+        '      - "not-a-member/*"',
+        'packages:',
+        '  - "apps/*"',
+        'allowBuilds:',
+        '  - "esbuild"',
+        '',
+      ].join('\n'),
+    );
+
+    expect(
+      findWorkspaceRoot(makeDir(join(sandbox, 'repo', 'apps', 'storefront')))?.memberPattern,
+    ).toBe('apps/*');
+    expect(findWorkspaceRoot(makeDir(join(sandbox, 'repo', 'esbuild')))).toBeUndefined();
+    expect(findWorkspaceRoot(makeDir(join(sandbox, 'repo', 'not-a-member', 'x')))).toBeUndefined();
+  });
+
+  it('honours the depth bound', () => {
+    plantFile(join(sandbox, 'repo', 'pnpm-workspace.yaml'), 'packages:\n  - "a/b/c/*"\n');
+    const project = makeDir(join(sandbox, 'repo', 'a', 'b', 'c', 'app'));
+
+    // Three ancestors examined — c, b, a — is one short of the root.
+    expect(findWorkspaceRoot(project, { maxDepth: 3 })).toBeUndefined();
+    expect(findWorkspaceRoot(project, { maxDepth: 4 })?.root).toBe(posixIn('repo'));
+    // Nothing is examined at all at zero, and an unusable bound falls back to
+    // the documented default rather than searching some third depth.
+    expect(findWorkspaceRoot(project, { maxDepth: 0 })).toBeUndefined();
+    expect(findWorkspaceRoot(project, { maxDepth: Number.NaN })?.root).toBe(posixIn('repo'));
+    expect(findWorkspaceRoot(project, { maxDepth: -1 })?.root).toBe(posixIn('repo'));
+  });
+
+  it('returns undefined rather than throwing for a root it cannot reason about', () => {
+    for (const input of ['', 'relative/project', '//server/share/project', '.']) {
+      expect(findWorkspaceRoot(input)).toBeUndefined();
+    }
+    // An absent directory is not an error either: the question is about paths,
+    // and the caller already holds an opened project when it matters.
+    expect(findWorkspaceRoot(join(sandbox, 'absent', 'app'), { maxDepth: 2 })).toBeUndefined();
+  });
+
+  it('refuses a project path that cannot be reduced against its workspace root', () => {
+    // A control character makes the project-relative form unusable, so
+    // membership cannot be established even though the declaration matches
+    // everything. The refusal is silent and is not a throw.
+    plantFile(join(sandbox, 'repo', 'pnpm-workspace.yaml'), 'packages:\n  - "**"\n');
+
+    expect(findWorkspaceRoot(`${posixIn('repo')}/app\u0001name`)).toBeUndefined();
+  });
+
+  it('logs its outcome at debug and never above it', () => {
+    plantFile(join(sandbox, 'repo', 'pnpm-workspace.yaml'), 'packages:\n  - "apps/*"\n');
+    const project = makeDir(join(sandbox, 'repo', 'apps', 'storefront'));
+
+    const recorder = createRecordingLogger();
+    expect(findWorkspaceRoot(project, { logger: recorder.logger })?.root).toBe(posixIn('repo'));
+
+    // A project that is or is not part of a workspace is the ordinary case:
+    // neither may produce a warning a developer has to interpret.
+    expect(
+      recorder.records.filter((record) => record.level !== 'debug' && record.level !== 'trace'),
+    ).toEqual([]);
+    expect(
+      recordsMatching(recorder.records, 'debug', 'project resolved to a workspace root'),
+    ).not.toHaveLength(0);
   });
 });
 
@@ -1712,5 +2073,17 @@ describe('the exported vocabularies', () => {
     expect(EXCLUDED_DIRECTORY_NAMES).toContain('node_modules');
     expect(EXCLUDED_DIRECTORY_NAMES).toContain('.next');
     expect(EXCLUDED_DIRECTORY_NAMES).toContain('dist');
+  });
+
+  it('name the generated-output directories of both conventions', () => {
+    // Membership asserted at the vocabulary as well as through the behaviour
+    // above, because this is the entry a future edit is most likely to drop:
+    // `generated` is what a developer's *own* source tree calls a generator's
+    // output, so it looks authored in a way `node_modules` never does.
+    expect(EXCLUDED_DIRECTORY_NAMES).toContain('generated');
+    expect(EXCLUDED_DIRECTORY_NAMES).toContain('__generated__');
+    // `.generated` needs no entry: the hidden-entry rule already skips every
+    // dot-prefixed entry at any depth.
+    expect(EXCLUDED_DIRECTORY_NAMES).not.toContain('.generated');
   });
 });

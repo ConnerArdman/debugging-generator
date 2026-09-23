@@ -66,6 +66,54 @@
  *   absolute path is ever emitted — a location that reaches a panel, a prompt
  *   or an editor must not carry a developer's directory layout.
  *
+ * ## Which origins a request may come from
+ *
+ * A request arrives at {@link matchRoute} either as a bare pathname or as an
+ * absolute URL, and an absolute URL carries an origin this map has no business
+ * answering for. A captured `fetch` or `http.client` span names whatever the
+ * page asked for — a payment provider, an analytics endpoint, a CDN — and a
+ * third-party path that happens to spell a local route path is not served by
+ * the developer's module. Answering it anyway would stamp a `route-map`
+ * `SourceLocation`, with this route's default confidence, onto somebody else's
+ * request, and click-to-source would open the wrong file with nothing to
+ * suggest it is the wrong file.
+ *
+ * An input that carries a scheme is therefore held to three rules, and each
+ * failure is the same deliberate `undefined` as every other refusal here:
+ *
+ * - **`http:` or `https:`, and nothing else.** This product addresses a dev
+ *   server over http(s) and only over http(s) — the Chrome extension declares
+ *   `host_permissions` of exactly `http://localhost/*` and
+ *   `http://127.0.0.1/*` (AAP 0.7.1) — so `javascript:`, `data:`, `file:`,
+ *   `ftp:` and any application scheme name nothing this map can serve.
+ *   `javascript:/api/ping` is the shape that makes the rule non-negotiable: it
+ *   is not a request at all, and it parses to a pathname that looks exactly
+ *   like one.
+ * - **No credentials.** A `user:password@` userinfo component is refused
+ *   rather than dropped. AAP 0.5.2 redacts a credentialed URL before it
+ *   reaches any consumer, so one arriving here is anomalous on its own; and
+ *   an authority of `localhost:3000@evil.test` behind an `http://` scheme is
+ *   the host-spoofing shape it usually is — the URL parser reads `localhost`
+ *   as the username, `3000` as the password and `evil.test` as the host.
+ * - **A host the project's dev server can be reached at.** By default that
+ *   means a loopback host, decided by `isLoopbackDevServerUrl` from
+ *   `./source-map/fetch-map.ts` — the same predicate that module screens a
+ *   chunk URL with, so "local" has one definition in this package rather than
+ *   two that can drift. A caller that knows the dev server is somewhere else
+ *   names the origins it will answer for ({@link MatchRouteOptions.origins}),
+ *   which **replaces** the loopback default and is compared by exact
+ *   `URL.origin` equality — scheme, host and port together, because a second
+ *   server on another port of the same host is another application. That is
+ *   the path a session whose `devServerUrl` (AAP 0.4.2) is not loopback takes.
+ *
+ * A bare pathname carries no origin and is subject to none of this: a captured
+ * `http.server` span records a path, which is the ordinary case, and the match
+ * it produces has no {@link RouteMatch.origin}. An accepted absolute URL
+ * records the origin that was accepted, because loopback alone is not an
+ * authorisation on a developer's machine — the stance
+ * `./source-map/fetch-map.ts` states at length — so a consumer can report
+ * which origin its answer was for rather than assume.
+ *
  * ## Purity, and the one impure half
  *
  * {@link deriveRouteFromFile} and {@link matchRoute} are pure string
@@ -122,6 +170,13 @@ import type {
   RouterKind,
 } from './graph/types.js';
 import type { LoadedProject } from './project.js';
+// The package's single definition of "this host is a dev server on this
+// machine". Imported rather than restated: a second loopback predicate in one
+// package is a second policy, and the two would disagree on the first
+// `127.0.0.2`, `app.localhost` or `[::1]` they met. `./source-map/fetch-map.ts`
+// imports nothing from this module, and nothing but `@debuggen/shared` at all,
+// so the edge is acyclic and adds no dependency.
+import { isLoopbackDevServerUrl } from './source-map/fetch-map.js';
 
 /**
  * The project-wide router reading, re-exported from the module that declares
@@ -282,8 +337,56 @@ export interface RouteEntry extends DerivedRoute {
 }
 
 /**
- * A resolved request: which route answered, what it captured, and the
- * normalised path it answered for.
+ * The origin of a request that named one, screened and accepted.
+ *
+ * Reported rather than merely approved: a consumer that resolved a captured
+ * span to a file can record *which* origin it answered for, which is what
+ * distinguishes "the dev server served this" from "a URL whose path coincided
+ * with a local route". Only an origin this module accepted is ever described
+ * here — a refused one produces no match at all — so every field of this value
+ * describes a permitted http(s) origin.
+ *
+ * The fields are the `URL` parser's own serialisations, not re-derived: the
+ * parser has already lower-cased the scheme and host, IDNA-encoded a
+ * non-ASCII host, canonicalised an IPv4 shorthand and dropped the scheme's
+ * default port, and repeating any of that by hand would be a second answer to
+ * a question the platform already answers.
+ */
+export interface RequestOrigin {
+  /** The scheme with its colon, as `URL.protocol` spells it: `'http:'` or `'https:'`. */
+  readonly protocol: string;
+
+  /**
+   * The host without its port, as `URL.hostname` spells it — lower-cased, and
+   * bracketed for an IPv6 literal (`'[::1]'`).
+   */
+  readonly hostname: string;
+
+  /**
+   * The port, or `''` when the URL used the scheme's default one — `URL.port`'s
+   * own convention, kept rather than normalised to a number so that "no port
+   * was written" stays distinguishable from port zero.
+   */
+  readonly port: string;
+
+  /**
+   * The origin as one comparable string (`'http://127.0.0.1:3000'`), which is
+   * what {@link MatchRouteOptions.origins} is matched against.
+   */
+  readonly origin: string;
+
+  /**
+   * Whether the host is a loopback host. Always `true` under the default
+   * policy, and `false` for a non-loopback origin a caller configured
+   * explicitly — which is the case worth knowing about, because such a request
+   * crossed a machine boundary to reach the dev server.
+   */
+  readonly loopback: boolean;
+}
+
+/**
+ * A resolved request: which route answered, what it captured, the normalised
+ * path it answered for, and the origin it came from when it named one.
  */
 export interface RouteMatch {
   /** The route that matched. */
@@ -302,6 +405,17 @@ export interface RouteMatch {
    * fragment, no trailing slash, always leading `/`.
    */
   readonly pathname: string;
+
+  /**
+   * The origin the request named, when it was an absolute URL.
+   *
+   * Absent — never present and empty — for a bare pathname, which carries no
+   * origin to report and is the ordinary shape of a captured `http.server`
+   * span. Present means an absolute URL passed the origin policy this module
+   * documents; a URL that failed it produced no match, so this field is never
+   * a refused origin.
+   */
+  readonly origin?: RequestOrigin | undefined;
 }
 
 /**
@@ -324,9 +438,17 @@ export interface RouteMap {
    * Resolves a request to the route that answers it, or `undefined` when
    * nothing does.
    *
+   * Applies the origin policy this module documents, with the origins
+   * configured when the map was built ({@link MatchRouteOptions.origins}) or
+   * the loopback default when none were: an absolute URL from an origin this
+   * map does not answer for resolves to `undefined` even when its path names a
+   * real route. Two parameters on purpose — the policy belongs to the map, not
+   * to the call, so every consumer of one map resolves under one policy.
+   *
    * @param urlOrPathname An absolute URL or a bare pathname, with or without a
-   * query string, a fragment or a trailing slash. A malformed URL resolves to
-   * `undefined` rather than throwing.
+   * query string, a fragment or a trailing slash. A malformed URL, a
+   * non-http(s) scheme, a credentialed URL and an origin outside the policy all
+   * resolve to `undefined` rather than throwing.
    * @param method The method to require, when the caller knows it. `ANY`, and
    * a route that declares no method at all, match everything.
    * @returns The match, or `undefined`.
@@ -361,15 +483,61 @@ export interface DeriveRouteOptions {
 }
 
 /**
+ * Which origins a resolver answers for.
+ *
+ * Separate from {@link DeriveRouteOptions} because it governs *matching*
+ * rather than derivation, and shared by {@link matchRoute},
+ * {@link buildRouteMap} and {@link routeMapFromIndex} so that a compiler-built
+ * map, an index-rebuilt map and a bare `matchRoute` call cannot be given three
+ * different policies by accident.
+ */
+export interface MatchRouteOptions {
+  /**
+   * The origins an absolute URL may name, as full URLs or bare origins
+   * (`'http://127.0.0.1:3000'`, `'https://dev.internal:8443/'`).
+   *
+   * Omitted — the normal case — a request URL is accepted only from a loopback
+   * host, which is what a dev server on the developer's own machine is reached
+   * at. Given, the list **replaces** that default: it is the complete set of
+   * origins this resolver answers for, so a loopback URL that is not in it is
+   * refused too. That is deliberate rather than additive. The value this list
+   * comes from is a session's `devServerUrl` (AAP 0.4.2), and a session that
+   * names one origin is a session whose captured spans belong to that origin;
+   * treating the list as an *extension* of loopback would keep authorising
+   * every other server listening on the developer's machine, which is the
+   * thing the default is narrow about in the first place.
+   *
+   * Each entry is reduced to its `URL.origin` once, and comparison is exact
+   * string equality on that serialisation: scheme, host and port must all
+   * agree, a path or query in an entry contributes nothing, and the scheme's
+   * default port is dropped on both sides (`'http://localhost:80'` and
+   * `'http://localhost'` are the same origin). An entry that is not a
+   * credential-free `http:`/`https:` URL is unusable and is skipped — reported
+   * at `warn` by {@link buildRouteMap}, which has a logger, and silently by the
+   * two entry points that do not. A list whose every entry is unusable leaves
+   * the loopback default in place rather than an empty policy that would refuse
+   * every URL, because a mistyped option must not silently turn every
+   * resolution into a miss.
+   *
+   * Spelled `| undefined` explicitly because the repository compiles with
+   * `exactOptionalPropertyTypes`: a caller forwarding a value it received as
+   * `readonly string[] | undefined` must be able to pass it through without
+   * branching.
+   */
+  readonly origins?: readonly string[] | undefined;
+}
+
+/**
  * How to build a route map from a loaded project.
  */
-export interface BuildRouteMapOptions extends DeriveRouteOptions {
+export interface BuildRouteMapOptions extends DeriveRouteOptions, MatchRouteOptions {
   /**
    * Where to report what was found and what collided.
    *
    * Defaults to `noopLogger`, so a library caller that has not chosen a
-   * logging backend gets silence rather than console output. Route paths and
-   * project-relative file paths are logged; file *contents* never are.
+   * logging backend gets silence rather than console output. Route paths,
+   * project-relative file paths and the origins named by
+   * {@link MatchRouteOptions.origins} are logged; file *contents* never are.
    */
   readonly logger?: Logger | undefined;
 }
@@ -519,11 +687,42 @@ const KIND_RANK: Readonly<Record<RouteEntryKind, number>> = Object.freeze({
  * A scheme prefix, which is what distinguishes an absolute URL from a bare
  * pathname.
  *
- * Deliberately not `startsWith('http')`: a dev server may be reached over any
- * scheme a browser reports, and the grammar here is the URL standard's own
- * (letter, then letters, digits, `+`, `-`, `.`, then `:`).
+ * Deliberately not `startsWith('http')`, and deliberately still generic after
+ * the origin policy narrowed what is *accepted*: this pattern answers whether
+ * the input carries a scheme at all, using the URL standard's own grammar
+ * (letter, then letters, digits, `+`, `-`, `.`, then `:`), and the scheme it
+ * found is then screened by {@link HTTP_PROTOCOLS}. Narrowing the pattern
+ * instead would send `javascript:/api/ping` down the bare-pathname branch,
+ * where it would be read as the ordinary path `/api/ping` and would match —
+ * recognising the scheme is precisely what makes refusing it possible.
  */
 const SCHEME_PREFIX = /^[a-zA-Z][a-zA-Z\d+\-.]*:/;
+
+/**
+ * The schemes a request URL may be written with, as `URL.protocol` spells
+ * them.
+ *
+ * The same two `./source-map/fetch-map.ts` admits, for the same reason: they
+ * are the only schemes a dev server is addressed over (AAP 0.7.1 declares
+ * `host_permissions` of `http://localhost/*` and `http://127.0.0.1/*`), so any
+ * other scheme names something this map cannot serve. Both consequences of
+ * admitting only these are relied on below: such a URL always has a non-empty
+ * host — the parser reads `http:///api/ping` as the host `api`, never as an
+ * empty one — and its `URL.origin` is always a scheme/host/port tuple rather
+ * than the opaque `'null'` that would make two unrelated origins compare equal.
+ */
+const HTTP_PROTOCOLS: readonly string[] = Object.freeze(['http:', 'https:']);
+
+/**
+ * What replaces the userinfo of a credentialed URL that has to be named in a
+ * log record.
+ *
+ * The product's redaction vocabulary (AAP 0.5.2) writes `[redacted]` in place
+ * of a value it removes, and this module uses the same word so one grep finds
+ * every removal. See {@link describeConfiguredOrigin} for the one place a URL
+ * is rendered for a log at all.
+ */
+const REDACTED_USERINFO = '[redacted]';
 
 /**
  * An intercepting-route marker at the start of a segment: `(.)`, `(..)`,
@@ -968,10 +1167,12 @@ function routePathOf(segments: readonly RouteSegment[]): string {
 /**
  * Resolves a request to the route that answers it.
  *
- * Pure, and the single implementation behind every {@link RouteMap.resolve} —
- * a map built from a loaded project and one rebuilt from a persisted index
- * share this function, which is what makes their behaviour identical rather
- * than merely similar.
+ * Pure, and the same matching every {@link RouteMap.resolve} performs — a map
+ * built from a loaded project, one rebuilt from a persisted index and a direct
+ * call here all reach one implementation ({@link resolveRequest}), which is
+ * what makes their behaviour identical rather than merely similar. The only
+ * difference is bookkeeping: a map screens its configured origins once when it
+ * is built, and this function screens them on every call.
  *
  * The input may be an absolute URL or a bare pathname, with a query string, a
  * fragment or a trailing slash. It is reduced to a list of segments:
@@ -980,8 +1181,17 @@ function routePathOf(segments: readonly RouteSegment[]): string {
  *   malformed one yields `undefined` rather than an exception — the caller is
  *   handling a captured span attribute or a value typed into a user interface,
  *   neither of which is trustworthy;
+ * - a parsed URL is then screened against the origin policy this module
+ *   documents: `http:`/`https:` only, no `user:password@` credentials, and an
+ *   origin this resolver answers for — loopback by default, or exactly the
+ *   origins `options.origins` names. A URL that fails any of the three yields
+ *   `undefined` however ordinary its path looks, which is what stops a
+ *   third-party request whose path coincides with a local route path from
+ *   acquiring a location inside the developer's project;
  * - a bare pathname is truncated at its first `?` or `#` and normalised
- *   lexically, so `.` and `..` are resolved exactly as a URL parser would;
+ *   lexically, so `.` and `..` are resolved exactly as a URL parser would. It
+ *   names no origin, so no origin rule applies to it — and `//evil.test/api`
+ *   is a pathname, not a URL, whose first segment is the literal `evil.test`;
  * - segments are split **before** they are percent-decoded, so an encoded
  *   separator (`%2F`) stays inside one segment instead of splitting it — the
  *   difference between one parameter holding `'a/b'` and a path of two
@@ -1002,18 +1212,54 @@ function routePathOf(segments: readonly RouteSegment[]): string {
  * @param pathname An absolute URL or a bare pathname.
  * @param method The method to require. `ANY`, and a route that declares no
  * method at all, match everything.
+ * @param options Which origins to answer for. Omitted, the loopback default
+ * applies — which is why every existing caller that passes three arguments
+ * inherits the safe policy rather than the previous unrestricted one. The list
+ * is screened on every call, so a caller resolving many URLs under one policy
+ * is better served by {@link buildRouteMap} or {@link routeMapFromIndex},
+ * which screen it once.
  * @returns The match, or `undefined` when nothing answers.
  */
 export function matchRoute(
   entries: readonly RouteEntry[],
   pathname: string,
   method?: HttpMethod,
+  options?: MatchRouteOptions,
 ): RouteMatch | undefined {
-  const requestSegments = parseRequestPath(pathname);
-  if (requestSegments === undefined) {
+  // No logger by design: this entry point takes values, not a session, so an
+  // unusable configured origin is skipped silently here and reported by
+  // `buildRouteMap`, which does have somewhere to report it.
+  return resolveRequest(entries, pathname, method, normalizeOrigins(options?.origins, noopLogger));
+}
+
+/**
+ * The matching implementation, over an already-screened origin policy.
+ *
+ * Separate from {@link matchRoute} so that a {@link RouteMap} screens its
+ * configured origins once at construction and spends nothing per resolution,
+ * while the exported function stays a pure call that takes its policy inline.
+ * Both reach the same code, which is what keeps `matchRoute(entries, url)` and
+ * `map.resolve(url)` the same answer rather than two similar ones.
+ *
+ * @param entries The routes to consider.
+ * @param pathname An absolute URL or a bare pathname.
+ * @param method The method to require, or `undefined`.
+ * @param origins The screened origins to answer for, or `undefined` for the
+ * loopback default.
+ * @returns The match, or `undefined` when nothing answers.
+ */
+function resolveRequest(
+  entries: readonly RouteEntry[],
+  pathname: string,
+  method: HttpMethod | undefined,
+  origins: readonly string[] | undefined,
+): RouteMatch | undefined {
+  const request = parseRequestPath(pathname, origins);
+  if (request === undefined) {
     return undefined;
   }
 
+  const requestSegments = request.segments;
   const normalizedPathname =
     requestSegments.length === 0
       ? ROOT_ROUTE_PATH
@@ -1040,7 +1286,15 @@ export function matchRoute(
     return undefined;
   }
 
-  return Object.freeze({ entry: best, params: bestParams, pathname: normalizedPathname });
+  // The origin is spread conditionally rather than assigned `undefined`:
+  // `exactOptionalPropertyTypes` distinguishes "absent" from "present and
+  // undefined", and a bare pathname must produce the former.
+  return Object.freeze({
+    entry: best,
+    params: bestParams,
+    pathname: normalizedPathname,
+    ...(request.origin === undefined ? {} : { origin: request.origin }),
+  });
 }
 
 /**
@@ -1051,21 +1305,32 @@ export function matchRoute(
  * every failure is the same `undefined`.
  *
  * @param input An absolute URL or a bare pathname.
- * @returns The decoded, non-empty segments, or `undefined` when the input
- * cannot be read as a path.
+ * @param origins The screened origins an absolute URL may name, or `undefined`
+ * for the loopback default.
+ * @returns The request's decoded segments and the origin it named, or
+ * `undefined` when the input cannot be read as a path or names an origin this
+ * resolver does not answer for.
  */
-function parseRequestPath(input: string): readonly string[] | undefined {
+function parseRequestPath(
+  input: string,
+  origins: readonly string[] | undefined,
+): ParsedRequest | undefined {
   const trimmed = input.trim();
   if (trimmed.length === 0) {
     return undefined;
   }
 
   let rawPath: string;
+  let origin: RequestOrigin | undefined;
   if (SCHEME_PREFIX.test(trimmed)) {
     let parsed: URL;
     try {
       parsed = new URL(trimmed);
     } catch {
+      return undefined;
+    }
+    origin = screenRequestOrigin(parsed, origins);
+    if (origin === undefined) {
       return undefined;
     }
     rawPath = parsed.pathname;
@@ -1079,8 +1344,9 @@ function parseRequestPath(input: string): readonly string[] | undefined {
   }
 
   // `normalizePosix` answers `'.'` for a path that reduces to nothing, which a
-  // URL with an empty pathname (a non-special scheme) and a bare `'.'` both
-  // do. Both mean the root, not a request for a segment literally named `'.'`.
+  // bare `'.'`, a `'/./'` and the `'/'` pathname an origin-only http(s) URL
+  // carries all do. All of them mean the root, not a request for a segment
+  // literally named `'.'`.
   const normalized = normalizePosix(rawPath);
   const rawSegments = normalized === '.' ? [] : splitSegments(normalized);
 
@@ -1095,7 +1361,218 @@ function parseRequestPath(input: string): readonly string[] | undefined {
     decoded.push(value);
   }
 
-  return decoded;
+  return { segments: decoded, origin };
+}
+
+/**
+ * What {@link parseRequestPath} reduced one request to.
+ *
+ * Internal, and not the shape {@link RouteMatch} exposes: `origin` is a
+ * required property that may hold `undefined` here, because a bare pathname
+ * genuinely has none and the caller has to be able to read the field to decide
+ * whether to spread it. {@link RouteMatch.origin} is the optional-property form
+ * of the same information.
+ */
+interface ParsedRequest {
+  /** The request's decoded path segments, in URL order; empty for the root. */
+  readonly segments: readonly string[];
+
+  /** The accepted origin, or `undefined` when the input was a bare pathname. */
+  readonly origin: RequestOrigin | undefined;
+}
+
+/**
+ * Screens the origin of a parsed request URL and describes it when it is
+ * permitted.
+ *
+ * The three rules of the origin policy, in the order that keeps the cheapest
+ * refusal first and never reports a credential:
+ *
+ * 1. the scheme must be one of {@link HTTP_PROTOCOLS}, which is what makes
+ *    `javascript:`, `data:`, `file:`, `ftp:` and every application scheme a
+ *    refusal rather than a path;
+ * 2. the URL must carry no `user:password@` userinfo, which is both an
+ *    anomaly (AAP 0.5.2 redacts such a URL long before it reaches here) and
+ *    the classic host-spoofing shape — behind an `http://` scheme, the
+ *    authority `localhost:3000@evil.test` has `evil.test` as its host;
+ * 3. the host must be one this resolver answers for: exactly one of `origins`
+ *    when a caller configured any, and otherwise a loopback host by
+ *    `isLoopbackDevServerUrl`.
+ *
+ * Nothing here throws, and every refusal is the same `undefined` the rest of
+ * the matching path uses (AAP 0.5.5): the input is a captured span attribute
+ * or a value a developer typed, so a refusal is an answer rather than an
+ * error.
+ *
+ * @param url The parsed request URL.
+ * @param origins The screened origins to answer for, or `undefined` for the
+ * loopback default.
+ * @returns The origin to report on the match, or `undefined` when the URL is
+ * refused.
+ */
+function screenRequestOrigin(
+  url: URL,
+  origins: readonly string[] | undefined,
+): RequestOrigin | undefined {
+  if (!HTTP_PROTOCOLS.includes(url.protocol)) {
+    return undefined;
+  }
+
+  if (url.username.length > 0 || url.password.length > 0) {
+    return undefined;
+  }
+
+  const loopback = isLoopbackDevServerUrl(url);
+  if (origins === undefined) {
+    if (!loopback) {
+      return undefined;
+    }
+  } else if (!origins.includes(url.origin)) {
+    // A configured list replaces the loopback default rather than extending
+    // it, so a loopback URL outside the list is refused here too. See
+    // {@link MatchRouteOptions.origins} for why that is the useful stance.
+    return undefined;
+  }
+
+  return Object.freeze({
+    protocol: url.protocol,
+    hostname: url.hostname,
+    port: url.port,
+    origin: url.origin,
+    loopback,
+  });
+}
+
+/**
+ * Screens a caller's configured origins and reduces them to comparable origin
+ * strings.
+ *
+ * Run once per map ({@link createRouteMap}) or once per call (the exported
+ * {@link matchRoute}), never per candidate URL: `URL.origin` performs exactly
+ * the canonicalisation both sides of the later comparison need — lower-cased
+ * scheme and host, IDNA- and IPv4-normalised host, default port dropped — so
+ * the comparison itself is a string equality with no further parsing. It is
+ * the same reduction `./source-map/fetch-map.ts` applies to its origin pin,
+ * and for the same reason: the value a session carries is a dev-server *URL*
+ * (`http://127.0.0.1:3000/`), not a bare origin.
+ *
+ * An entry that is not a credential-free `http:`/`https:` URL is unusable —
+ * it could only ever authorise a set of URLs it cannot legitimately name — and
+ * is skipped with a `warn`, rather than failing the build of a map whose other
+ * origins are fine. Unlike that module's pin, a configured origin here is
+ * **not** required to be loopback: naming a dev server the local service
+ * launched on another host is the whole purpose of the option, and this module
+ * only reads paths, so a wider list costs a wrong resolution rather than a
+ * request to a host of somebody else's choosing.
+ *
+ * @param origins The configured origins, or `undefined` when none were.
+ * @param logger Where to report an unusable entry. `noopLogger` for the entry
+ * points that take a value rather than a session.
+ * @returns The distinct canonical origins, frozen, or `undefined` when there
+ * are none to apply — which leaves the loopback default in place rather than a
+ * policy that refuses everything.
+ */
+function normalizeOrigins(
+  origins: readonly string[] | undefined,
+  logger: Logger,
+): readonly string[] | undefined {
+  if (origins === undefined) {
+    return undefined;
+  }
+
+  const normalized: string[] = [];
+  for (const candidate of origins) {
+    const origin = canonicalOrigin(candidate);
+    if (origin === undefined) {
+      logger.warn('configured route-map origin is unusable and was ignored', {
+        origin: describeConfiguredOrigin(candidate),
+      });
+      continue;
+    }
+    if (!normalized.includes(origin)) {
+      normalized.push(origin);
+    }
+  }
+
+  if (normalized.length === 0) {
+    logger.debug('no configured route-map origin was usable; loopback hosts only', {
+      configured: origins.length,
+    });
+    return undefined;
+  }
+
+  return Object.freeze(normalized);
+}
+
+/**
+ * Reduces one configured entry to its canonical origin, or refuses it.
+ *
+ * @param candidate The entry as the caller spelled it: a full URL or a bare
+ * origin, with or without a trailing slash.
+ * @returns The `URL.origin` serialisation, or `undefined` when the entry is
+ * not a credential-free `http:`/`https:` URL. A path, query or fragment in the
+ * entry is not an error and contributes nothing — only the origin is compared.
+ */
+function canonicalOrigin(candidate: string): string | undefined {
+  const trimmed = candidate.trim();
+  if (trimmed.length === 0) {
+    return undefined;
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return undefined;
+  }
+
+  if (!HTTP_PROTOCOLS.includes(parsed.protocol)) {
+    return undefined;
+  }
+
+  if (parsed.username.length > 0 || parsed.password.length > 0) {
+    return undefined;
+  }
+
+  // No further host check is needed, and none is written: an `http:`/`https:`
+  // URL always has a non-empty host and a tuple `URL.origin` — see
+  // {@link HTTP_PROTOCOLS} — so the value returned here can never be the
+  // opaque `'null'` that would compare equal to another opaque origin.
+  return parsed.origin;
+}
+
+/**
+ * Describes an unusable configured entry in a form that is safe to log.
+ *
+ * A configured origin is a value a developer put in a setting, so naming it is
+ * the whole diagnostic value of the warning — with one exception. An entry
+ * carrying a `user:password@` component would put a credential in a log sink,
+ * which AAP 0.5.2 forbids outright, so such an entry is reduced to its scheme
+ * and host with the userinfo replaced. That is the same choice
+ * `./source-map/fetch-map.ts` makes when it refuses a credentialed URL: the
+ * refusal is reported, the credential is not.
+ *
+ * @param candidate The entry as the caller spelled it.
+ * @returns The string to log: the trimmed entry, or a userinfo-free rendering
+ * of it.
+ */
+function describeConfiguredOrigin(candidate: string): string {
+  const trimmed = candidate.trim();
+
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    // Not a URL at all, so it holds no userinfo component to remove and the
+    // developer needs to see exactly what was configured.
+    return trimmed;
+  }
+
+  if (parsed.username.length > 0 || parsed.password.length > 0) {
+    return `${parsed.protocol}//${REDACTED_USERINFO}@${parsed.host}`;
+  }
+
+  return trimmed;
 }
 
 /**
@@ -1734,7 +2211,10 @@ function clampPosition(value: number): number {
  * wins, which is what the framework itself does.
  *
  * @param loaded The project, as opened by `./project.ts`.
- * @param options Where the route trees live, and where to report.
+ * @param options Where the route trees live, which origins the map answers for
+ * ({@link MatchRouteOptions.origins}, loopback when omitted), and where to
+ * report. This is the one entry point with a logger, so it is also the one that
+ * reports a configured origin it could not use.
  * @returns The map. A project with no route module yields an empty one rather
  * than an error: "this project has no routes" is an answer.
  */
@@ -1781,7 +2261,7 @@ export function buildRouteMap(loaded: LoadedProject, options?: BuildRouteMapOpti
     routes: entries.length,
   });
 
-  return createRouteMap(entries);
+  return createRouteMap(entries, options?.origins, logger);
 }
 
 /**
@@ -1806,10 +2286,19 @@ export function buildRouteMap(loaded: LoadedProject, options?: BuildRouteMapOpti
  * that would resolve wrongly. There is no logger here by design: this function
  * takes a value, not a session.
  *
+ * The origin policy is the same one {@link buildRouteMap} applies, with the
+ * same default: a reopened session must not resolve a cross-origin URL that a
+ * fresh session refuses, or the answer a developer gets would depend on
+ * whether the index came from disk. A caller that configured origins for the
+ * compiler-built map passes the same list here.
+ *
  * @param index The persisted index.
+ * @param options Which origins the map answers for
+ * ({@link MatchRouteOptions.origins}, loopback when omitted). An unusable entry
+ * is skipped silently, for the reason this function has no logger.
  * @returns The map.
  */
-export function routeMapFromIndex(index: CodeIndex): RouteMap {
+export function routeMapFromIndex(index: CodeIndex, options?: MatchRouteOptions): RouteMap {
   const entries: RouteEntry[] = [];
 
   for (const node of index.nodes) {
@@ -1822,7 +2311,7 @@ export function routeMapFromIndex(index: CodeIndex): RouteMap {
     }
   }
 
-  return createRouteMap(entries);
+  return createRouteMap(entries, options?.origins, noopLogger);
 }
 
 /**
@@ -1890,15 +2379,30 @@ function parseRoutePath(routePath: string): readonly RouteSegment[] | undefined 
  * candidates on their own merits ({@link compareCandidates}) rather than on
  * their position in this array.
  *
+ * The origin policy is screened here, once, and the resolver closes over the
+ * result: a map is resolved against many times — every captured span of a
+ * session — and re-parsing the same configured origins per call would be work
+ * whose answer cannot change. It is also the only place the two constructors
+ * meet, which is what makes the policy of an index-rebuilt map identical to
+ * that of a compiler-built one rather than merely similar.
+ *
  * @param entries The entries, in whatever order they were discovered.
+ * @param origins The caller's configured origins, unscreened, or `undefined`
+ * for the loopback default.
+ * @param logger Where to report a configured origin that could not be used.
  * @returns The frozen map.
  */
-function createRouteMap(entries: readonly RouteEntry[]): RouteMap {
+function createRouteMap(
+  entries: readonly RouteEntry[],
+  origins: readonly string[] | undefined,
+  logger: Logger,
+): RouteMap {
   const sorted = Object.freeze([...entries].sort(compareEntries));
+  const configuredOrigins = normalizeOrigins(origins, logger);
   return Object.freeze({
     entries: sorted,
     resolve: (urlOrPathname: string, method?: HttpMethod): RouteMatch | undefined =>
-      matchRoute(sorted, urlOrPathname, method),
+      resolveRequest(sorted, urlOrPathname, method, configuredOrigins),
   });
 }
 

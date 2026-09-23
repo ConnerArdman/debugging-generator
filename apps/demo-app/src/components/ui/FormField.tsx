@@ -7,7 +7,8 @@
  * one native control each and forward every attribute untouched; they deliberately do NOT own their
  * label association, and `aria-describedby` is an ordinary forwarded prop on both. This component
  * owns the other half: the `<label htmlFor>`, the optional hint, the optional validation message,
- * the ids that tie the two messages to the control, and the vertical rhythm between them.
+ * the optional character counter, the ids that tie those three messages to the control, and the
+ * vertical rhythm between them.
  *
  * THE CHILD IS A FUNCTION, AND THAT IS THE WHOLE DESIGN. The field hands the caller the control id
  * and the finished `aria-describedby` value and takes the control back:
@@ -47,7 +48,22 @@
 import clsx from 'clsx';
 import type { ReactNode } from 'react';
 
+import { formatQuantityLabel } from '@/lib/format';
+
 import styles from './FormField.module.css';
+
+/**
+ * How much of a field's allowance has to be spent before its counter appears.
+ *
+ * A capped field that shows `0/120` from the first keystroke turns a calm form
+ * into a row of meters, and the number is useless while the value is nowhere
+ * near the bound. It becomes useful as the bound approaches, which is what this
+ * fraction picks out: the counter is silent for the first four fifths of the
+ * allowance and visible - and then, past the bound, emphatic - for the last
+ * fifth, which is the only stretch where a writer needs to know how much room
+ * is left.
+ */
+const COUNTER_SHARE = 0.8;
 
 /**
  * The field's props.
@@ -84,8 +100,31 @@ interface Props {
    * first `aria-describedby` reference; the control's own red edge and `aria-invalid` come from the
    * `invalid` prop the caller passes to `Input` or `Select`, so a field in error states it in both
    * places from one piece of caller state.
+   *
+   * The paragraph it renders carries `role="alert"`, so a message that appears while the reader is
+   * working through the form is announced when it appears rather than only when the control is
+   * focused again. That is the whole reason the role is on this element and not on the wrapper: the
+   * paragraph exists only while there is something wrong, so the live region's content is never
+   * anything but the problem.
    */
   error?: ReactNode;
+
+  /**
+   * How much of a bounded field's allowance the current value spends, as `{ length, max }` in
+   * characters.
+   *
+   * Supplied by a caller that caps a field's length in its own validation - the checkout form is
+   * the one that does - and it exists because the alternative is worse. A `maxLength` attribute
+   * enforces the same bound by discarding keystrokes silently: the value stops growing, no event
+   * fires that the application can see, `validity.tooLong` stays `false`, and the message the
+   * caller wrote about the bound can never be reached. So the control takes the whole of what is
+   * typed, the caller's validation reports a value that is too long, and this counter shows the
+   * reader where they are before it happens.
+   *
+   * Omit it for a field with no bound: an absent counter renders nothing and adds no
+   * `aria-describedby` reference.
+   */
+  count?: { length: number; max: number };
 
   /**
    * Whether to draw the asterisk after the label text. Decoration only: the marker is hidden from
@@ -106,15 +145,23 @@ interface Props {
 }
 
 /**
- * Render the field: label, the caller's control, then the hint and the error message.
+ * Render the field: label, the caller's control, then the hint, the error message and the counter.
  *
- * The two message ids are derived only where their message is actually rendered, so
+ * The three message ids are derived only where their message is actually rendered, so
  * `aria-describedby` can never point at an element that is not in the document. They are listed
  * error first: a screen-reader user hears what is wrong before hearing the guidance that was
- * already there when the value was entered. The filter carries an inline type predicate, which is
- * what narrows the list to `string[]` under `strict` with no cast, no non-null assertion and no
- * array indexing, and the trailing `|| undefined` turns the empty join - a field with neither
- * message - into an omitted attribute rather than `aria-describedby=""`.
+ * already there when the value was entered, and the counter comes last because it is the least of
+ * the three - a number that only matters while the value is close to its bound. The filter carries
+ * an inline type predicate, which is what narrows the list to `string[]` under `strict` with no
+ * cast, no non-null assertion and no array indexing, and the trailing `|| undefined` turns the
+ * empty join - a field with none of the three - into an omitted attribute rather than
+ * `aria-describedby=""`.
+ *
+ * The counter's own two states are derived the same way. `shown` is what keeps it out of the way
+ * until the last fifth of the allowance (see {@link COUNTER_SHARE}); `over` is the value having
+ * passed the bound, which the stylesheet turns from a quiet number into a warning one. The count
+ * is rendered through `@/lib/format`, which pins the locale, so the figure the server sent and the
+ * figure this page hydrates are the same string.
  *
  * `clsx` composes the class list because Next.js types a CSS module as an index signature, which
  * `noUncheckedIndexedAccess` turns into `string | undefined`; `clsx` drops an absent value where a
@@ -125,14 +172,18 @@ export function FormField({
   label,
   hint,
   error,
+  count,
   required = false,
   className,
   children,
 }: Props) {
   const hintId = hint === undefined ? undefined : `${id}-hint`;
   const errorId = error === undefined ? undefined : `${id}-error`;
+  const shown = count !== undefined && count.length >= Math.ceil(count.max * COUNTER_SHARE);
+  const over = count !== undefined && count.length > count.max;
+  const counter = shown ? `${id}-count` : undefined;
   const describedBy =
-    [errorId, hintId].filter((value): value is string => value !== undefined).join(' ') ||
+    [errorId, hintId, counter].filter((value): value is string => value !== undefined).join(' ') ||
     undefined;
 
   return (
@@ -152,8 +203,13 @@ export function FormField({
         </p>
       )}
       {error === undefined ? null : (
-        <p className={styles.error} id={errorId}>
+        <p className={styles.error} id={errorId} role="alert">
           {error}
+        </p>
+      )}
+      {count === undefined || !shown ? null : (
+        <p className={styles.counter} id={counter} data-over={over ? 'true' : undefined}>
+          {`${formatQuantityLabel(count.length)}/${formatQuantityLabel(count.max)} characters`}
         </p>
       )}
     </div>

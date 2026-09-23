@@ -28,12 +28,28 @@
 //     what let the execution policy of the integration suites go missing from
 //     this path.
 //
+// Two behaviours below are COMPUTED at config load rather than declared, and
+// both are deliberately as narrow as the problem they solve:
+//   * `passWithNoTests` is enabled for exactly one shape of run - a run filtered
+//     to `local-service-integration` alone, at a position where no integration
+//     suite file exists on disk yet. See `passWithNoIntegrationSuites` below.
+//   * a preflight that warns, once and without failing, when a workspace
+//     package's built `exports` entry is missing. On an unbuilt tree most suites
+//     fail with `Failed to resolve entry for package "@debuggen/…"`, which names
+//     neither the cause nor the remedy; the preflight names both. See
+//     `warnAboutUnbuiltPackages` below.
+//
 // Deliberately NOT configured here, each for a stated reason:
 //   * `resolve.alias` for `@debuggen/*`. Cross-package imports must resolve
 //     through each package's `exports` map into `dist/`, which is why `pnpm build`
 //     precedes tests (AAP 0.2.2). An alias to `src/**` would let a test pass
 //     against a broken `exports` map and would bypass the acyclic package
 //     layering that eslint.config.js enforces.
+//   * a `pretest` build in the root `package.json`. AAP 0.8.5 fixes `pnpm test`
+//     as `vitest run --coverage`, and `pnpm verify` already runs `pnpm build`
+//     ahead of it, so a `pretest` would both redefine the gate and build the
+//     workspace twice in every verify run. The preflight above reports the
+//     missing build instead of performing it.
 //   * `plugins`. Vite 8's Oxc transform already compiles `.tsx` with the
 //     automatic React 19 JSX runtime, so `@testing-library/react` works without
 //     `@vitejs/plugin-react`. Adding plugins (or a per-project `root`) would also
@@ -47,16 +63,298 @@
 //     report, so no junit/json output is required.
 //   * `coverage.thresholds`. AAP 0.8.5 enumerates the quality gates and no
 //     coverage percentage is among them; a threshold here would invent a gate.
-//   * `passWithNoTests`. Measured behaviour of Vitest 5.0.1: a project with no
-//     matching files does not fail a run in which another project has files, and
-//     an empty run genuinely means the include globs stopped matching - which
-//     must fail rather than pass quietly.
+//   * a blanket `passWithNoTests: true`. Measured behaviour of Vitest 5.0.1: a
+//     project with no matching files does not fail a run in which another
+//     project has files, so `pnpm test` needs nothing; and an unfiltered empty
+//     run genuinely means the include globs stopped matching - which must fail
+//     rather than pass quietly. Only the one narrow case described above is
+//     admitted.
 //   * `jsdom`. Rejected by AAP 0.3.2 in favour of happy-dom 20.14.5, whose
 //     install is smaller and whose startup is faster across per-package projects;
 //     the component tests need DOM/layout semantics only, never canvas.
 // ---------------------------------------------------------------------------
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { defineConfig, defineProject } from 'vitest/config';
 import type { UserWorkspaceConfig } from 'vitest/config';
+
+/**
+ * The name of the integration project, declared once.
+ *
+ * It is a contract in three places at once - the project below, the
+ * `--project` filter of `pnpm test:integration` (AAP 0.8.5) and the argv
+ * inspection that scopes `passWithNoTests` - so the string exists once and all
+ * three read it from here. Renaming it would silently turn the gate into a
+ * no-op that exits 1, which is exactly what this constant makes impossible to
+ * do by halves.
+ */
+const INTEGRATION_PROJECT_NAME = 'local-service-integration';
+
+/**
+ * Filename suffixes the integration-suite probe below counts as a suite.
+ *
+ * Deliberately WIDER than the project's own `test/integration/**\/*.test.ts`
+ * include glob: a suite written as `.test.tsx` or `.test.mts` would not be
+ * collected by that glob, and the probe exists to answer "has anyone written an
+ * integration suite yet?", not "does the glob match?". Being wider is what
+ * makes a mismatch between the two fail the gate loudly instead of letting
+ * `pnpm test:integration` pass vacuously over a suite it silently ignores.
+ */
+const INTEGRATION_SUITE_SUFFIXES: readonly string[] = ['.test.ts', '.test.tsx', '.test.mts'];
+
+/**
+ * The `--project` filters of the command line that loaded this config.
+ *
+ * Vitest accepts the option repeatably and in both spellings
+ * (`--project a --project b`, `--project=a`), so both are parsed. `process.argv`
+ * is readable at config-load time - this module is evaluated in the Vitest main
+ * process, whose argv is the user's command line - which is what lets the
+ * `passWithNoTests` policy below depend on WHICH run this is, something no
+ * static option can express.
+ *
+ * A `--project` with no value after it (or another flag next) contributes
+ * nothing rather than swallowing the following argument, so a malformed command
+ * line cannot widen the policy by accident.
+ *
+ * @param argv The process argument vector to inspect.
+ * @returns Every project name named by a `--project` filter, in argv order.
+ */
+function projectFiltersFromArgv(argv: readonly string[]): string[] {
+  const names: string[] = [];
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
+    if (arg === undefined) {
+      continue;
+    }
+    if (arg === '--project') {
+      const value = argv[index + 1];
+      if (value !== undefined && !value.startsWith('-')) {
+        names.push(value);
+        index += 1;
+      }
+      continue;
+    }
+    if (arg.startsWith('--project=')) {
+      names.push(arg.slice('--project='.length));
+    }
+  }
+
+  return names;
+}
+
+/**
+ * How many integration suite files exist on disk, right now.
+ *
+ * `readdirSync(..., { recursive: true, withFileTypes: true })` is used rather
+ * than a glob library so the probe adds no dependency and no async work to
+ * config load. A missing directory is the expected state before the first suite
+ * of AAP 0.8.3 lands, so ENOENT (and any other read failure) answers zero
+ * instead of throwing: a config that throws would break every run, including
+ * the ones that do not care about this project at all.
+ *
+ * Recursion does not follow a symlinked directory - `isDirectory()` is false for
+ * a symlink - so the probe cannot loop, while a symlink that POINTS at a suite
+ * file still counts, keeping the count on the safe (wider) side.
+ *
+ * @param directory Absolute path of the integration suite directory.
+ * @returns The number of files whose name ends in an INTEGRATION_SUITE_SUFFIXES entry.
+ */
+function countIntegrationSuiteFiles(directory: string): number {
+  try {
+    return readdirSync(directory, { recursive: true, withFileTypes: true }).filter(
+      (entry) =>
+        !entry.isDirectory() &&
+        INTEGRATION_SUITE_SUFFIXES.some((suffix) => entry.name.endsWith(suffix)),
+    ).length;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Whether this invocation is restricted to the integration project alone.
+ *
+ * "At least one `--project` filter, and every one of them naming
+ * `local-service-integration`" - so `pnpm test:integration` and the workspace's
+ * own `vitest run --root ../.. --project local-service-integration` qualify,
+ * while an unfiltered `pnpm test` and any run that also names another project do
+ * not.
+ */
+const projectFilters: readonly string[] = projectFiltersFromArgv(process.argv);
+const filteredToIntegrationOnly =
+  projectFilters.length > 0 && projectFilters.every((name) => name === INTEGRATION_PROJECT_NAME);
+
+/**
+ * The integration suite directory of AAP 0.8.3, resolved from THIS file's URL
+ * rather than from `process.cwd()`.
+ *
+ * The same run is started from the repository root (`pnpm test:integration`) and
+ * from the workspace (`vitest run --root ../.. --project …`), so a cwd-relative
+ * path would give the two runs different answers and make the gate's behaviour
+ * depend on where it was typed.
+ */
+const integrationSuiteFilesOnDisk = countIntegrationSuiteFiles(
+  fileURLToPath(new URL('./apps/local-service/test/integration', import.meta.url)),
+);
+
+/**
+ * The narrow `passWithNoTests` policy (root-level, because Vitest 5.0.1 lists
+ * `passWithNoTests` in `NonProjectOptions`: `ProjectConfig` omits it, so setting
+ * it on a project has no effect at all).
+ *
+ * While the integration suites of AAP 0.8.3 are legitimately unwritten, a run
+ * filtered to `local-service-integration` alone collects nothing and Vitest
+ * exits 1 - which aborts the `&&` chain of `pnpm verify` (AAP 0.8.5) at
+ * `pnpm test:integration`, so `check:no-hardcoding`,
+ * `check:no-residual-instrumentation` and `check:secrets` never run. With this
+ * flag that one shape of run passes vacuously and the chain reaches the three
+ * guard checks.
+ *
+ * The flag is false again the moment the first integration suite file lands, so
+ * an include glob that stops matching a suite that exists still fails the gate
+ * loudly - and it is false for every other run, including `pnpm test`, so a
+ * repository-wide collection failure can never pass quietly.
+ */
+const passWithNoIntegrationSuites = filteredToIntegrationOnly && integrationSuiteFilesOnDisk === 0;
+
+/**
+ * Parses a JSON file into a plain object, or answers `undefined`.
+ *
+ * Used by the preflight below on workspace manifests. Every failure mode -
+ * absent file, unreadable file, malformed JSON, a top-level array or scalar -
+ * collapses to `undefined`, because a preflight whose job is to IMPROVE an error
+ * message must never become the error: a directory under `packages/` that is not
+ * a workspace package (a stray build output, a half-created folder) simply
+ * contributes nothing.
+ *
+ * @param fileUrl Absolute `file:` URL of the JSON document.
+ * @returns The parsed object, or `undefined` when it is not a readable JSON object.
+ */
+function readJsonObject(fileUrl: URL): Record<string, unknown> | undefined {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(fileUrl, 'utf8'));
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      return undefined;
+    }
+    return parsed as Record<string, unknown>;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The module file the `"."` entry of an `exports` map resolves to.
+ *
+ * Handles every shape an `exports` field may take here: the sugar form (a bare
+ * string, `"exports": "./dist/index.js"`), a subpath map whose `"."` is a
+ * string, and a subpath map whose `"."` is a conditions object - which is what
+ * all eight packages use today (`{ types, import }` in four,
+ * `{ types, default }` in two, `{ types, import, default }` in two). Conditions
+ * are read in the order an ESM-only workspace resolves them, so `import` wins
+ * over a CommonJS fallback that would not be what a suite loads.
+ *
+ * `types` is deliberately not a candidate: declaration output can exist without
+ * the runtime module, so checking it would report a package as built that no
+ * test can actually import.
+ *
+ * @param exportsField The raw `exports` field of a workspace manifest.
+ * @returns The relative target of the `"."` entry, or `undefined` when there is none.
+ */
+function dotExportTarget(exportsField: unknown): string | undefined {
+  if (typeof exportsField === 'string') {
+    return exportsField;
+  }
+  if (typeof exportsField !== 'object' || exportsField === null) {
+    return undefined;
+  }
+  const dot: unknown = (exportsField as Record<string, unknown>)['.'];
+  if (typeof dot === 'string') {
+    return dot;
+  }
+  if (typeof dot !== 'object' || dot === null) {
+    return undefined;
+  }
+  const conditions = dot as Record<string, unknown>;
+  for (const condition of ['import', 'module', 'default', 'require']) {
+    const target: unknown = conditions[condition];
+    if (typeof target === 'string') {
+      return target;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * The workspace packages whose `"."` export target does not exist on disk.
+ *
+ * Every path is resolved from this config file's own URL, never from
+ * `process.cwd()`, so the answer is the same for a repository-rooted run and a
+ * workspace-rooted one (`vitest run --root ../..`).
+ *
+ * @returns Package names (manifest `name`, falling back to the directory name), sorted.
+ */
+function packagesMissingTheirBuiltEntry(): string[] {
+  const packagesDir = new URL('./packages/', import.meta.url);
+
+  let directoryNames: string[];
+  try {
+    directoryNames = readdirSync(packagesDir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name)
+      .sort();
+  } catch {
+    return [];
+  }
+
+  const unbuilt: string[] = [];
+  for (const directoryName of directoryNames) {
+    const packageDir = new URL(`${directoryName}/`, packagesDir);
+    const manifest = readJsonObject(new URL('package.json', packageDir));
+    if (manifest === undefined) {
+      continue;
+    }
+    const target = dotExportTarget(manifest['exports']);
+    if (target === undefined || existsSync(new URL(target, packageDir))) {
+      continue;
+    }
+    const name = manifest['name'];
+    unbuilt.push(typeof name === 'string' ? name : directoryName);
+  }
+
+  return unbuilt;
+}
+
+/**
+ * Preflight: one actionable line when the workspace is not built.
+ *
+ * Most test files import a sibling `@debuggen/*` package - 57 of the 67 that
+ * exist as this is written - and those imports resolve through the package's
+ * `exports` map into `dist/` (AAP 0.2.2) -
+ * never through a `resolve.alias`, for the reason stated in the header. On an
+ * unbuilt tree Vite therefore fails each of them with
+ * `Failed to resolve entry for package "@debuggen/…"`, an error that names
+ * neither the cause nor the remedy. This prints the remedy once, before the
+ * suites start.
+ *
+ * It WARNS and never throws, for two reasons: a run that needs no `dist` at all
+ * (`--project tooling`, whose suites are plain-Node guard scripts) must keep
+ * working, and a config that throws would replace a bad error message with no
+ * run at all. Nothing is printed when every package is built, so a normal run's
+ * output is unchanged.
+ */
+function warnAboutUnbuiltPackages(): void {
+  const unbuilt = packagesMissingTheirBuiltEntry();
+  if (unbuilt.length === 0) {
+    return;
+  }
+
+  process.stderr.write(
+    `\nvitest preflight: ${String(unbuilt.length)} workspace package(s) are not built (${unbuilt.join(', ')}) - run \`pnpm build\` first, because most test files import a sibling package through its "exports" map into dist/ (AAP 0.2.2) and will otherwise fail with 'Failed to resolve entry for package'.\n\n`,
+  );
+}
+
+warnAboutUnbuiltPackages();
 
 /**
  * Paths no project may ever collect, applied to every project below.
@@ -95,12 +393,46 @@ const sharedExclude: string[] = [
 ];
 
 /**
+ * The source trees the coverage report must account for, whether or not a test
+ * ever loaded them.
+ *
+ * Without this list Vitest reports only the files some test touched ("By default
+ * only files covered by tests are included"), so a module no suite imports is
+ * absent from the report altogether rather than shown at 0% - which both hides
+ * the gap and inflates the headline percentages, because they are computed over
+ * a denominator that silently omits those files.
+ *
+ * Vitest 5.0.1 has no `coverage.all` option (it is not part of `CoverageOptions`
+ * at all); `coverage.include` is the option that does this, and `coverageExclude`
+ * below is applied on top of it.
+ *
+ * The three trees are exactly the code the Vitest projects own: the packages'
+ * sources, the service's sources, and the repository guard scripts of AAP 0.3.4
+ * and 0.5.4. Deliberately NOT widened to `apps/chrome-extension` or
+ * `apps/vscode-extension`: their projects hold no suite at this position, so
+ * including them would bury the real gaps under whole unmeasured applications.
+ * `apps/demo-app` stays out for the reason stated under `coverageExclude` - it
+ * is Playwright's subject, not Vitest's.
+ */
+const coverageInclude: string[] = [
+  'packages/*/src/**/*.{ts,tsx}',
+  'apps/local-service/src/**/*.ts',
+  'scripts/*.mjs',
+];
+
+/**
  * Files kept out of the coverage report (`pnpm test` = `vitest run --coverage`).
  *
- * Vitest 5 includes only files that tests actually touched, so this list trims
- * the noise that remains: the tests themselves, config and build tooling, the
- * declaration output of `tsc -b`, and the demo application, which is exercised
- * end to end through Playwright (AAP 0.8.3) rather than by any Vitest project.
+ * Applied AFTER `coverageInclude` above (Vitest 5.0.1: "Files are first checked
+ * against `coverage.include`"), so this list is what trims the tests themselves,
+ * config and build tooling, the declaration output of `tsc -b`, the guard
+ * scripts' own suites, and the demo application - which is exercised end to end
+ * through Playwright (AAP 0.8.3) rather than by any Vitest project - back out of
+ * the three source trees the include globs sweep in.
+ *
+ * No `*.d.ts` exclusion is needed: the `include` trees hold no hand-written
+ * declaration file, and generated declarations live in `dist/` and `.tsbuild/`,
+ * both excluded here.
  */
 const coverageExclude: string[] = [
   '**/node_modules/**',
@@ -312,7 +644,7 @@ export function localServiceProjects(options: {
      */
     defineProject({
       test: {
-        name: 'local-service-integration',
+        name: INTEGRATION_PROJECT_NAME,
         environment: 'node',
         globals: false,
         include: at('test/integration/**/*.test.ts'),
@@ -348,14 +680,32 @@ export default defineConfig({
     // a project added later without the helpers above.
     env: { ...hermeticEnv },
 
+    // Scoped vacuous pass, computed above: true only for a run filtered to
+    // `local-service-integration` alone while that project's suites are not yet
+    // written, which is what keeps `pnpm verify` (AAP 0.8.5) reaching
+    // `check:no-hardcoding`, `check:no-residual-instrumentation` and
+    // `check:secrets` instead of aborting its `&&` chain at
+    // `pnpm test:integration`. It is a root-level option by necessity - Vitest
+    // 5.0.1 omits `passWithNoTests` from `ProjectConfig` - and it is false for
+    // `pnpm test` and for every other filter, so an empty run of anything else
+    // still fails. See `passWithNoIntegrationSuites` for the full reasoning.
+    passWithNoTests: passWithNoIntegrationSuites,
+
     // Coverage is a root-only option - Vitest ignores it inside a project - so
     // one report covers every project of a `pnpm test` run. `text` prints the
     // table in the terminal, `lcov` writes the machine-readable report that CI
     // and editors consume. `coverage/` is git-ignored.
+    //
+    // `include` is what makes the report cover the source trees rather than only
+    // the files some suite happened to load: a module no test imports appears at
+    // 0% instead of vanishing from the report and from the denominator of the
+    // headline numbers. `exclude` is applied after it. Both lists and the
+    // reasoning behind their exact contents are above.
     coverage: {
       provider: 'v8',
       reportsDirectory: 'coverage',
       reporter: ['text', 'lcov'],
+      include: coverageInclude,
       exclude: coverageExclude,
     },
 

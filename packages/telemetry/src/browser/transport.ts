@@ -24,8 +24,8 @@
  * the bridge and the service worker are written against this file.
  *
  * ```text
- * page agent  --window.postMessage({source:'debuggen-agent',version:1,...},'/')-->  bridge
- * page agent  <--window.postMessage({source:'debuggen-bridge',version:1,...},'/')-- bridge
+ * page agent  --window.postMessage({source:'debuggen-agent',version:2,...},'/')-->  bridge
+ * page agent  <--window.postMessage({source:'debuggen-bridge',version:2,token,...},'/')-- bridge
  *                                                                                     |
  *                                             chrome.runtime port (the bridge's job)  v
  *                                                                          service worker
@@ -82,18 +82,121 @@
  * (or the empty/`"null"` origin an opaque-origin document reports),
  * `event.data` is a non-null object, `data.source` is exactly
  * {@link BRIDGE_SOURCE_TAG}, `data.version` is exactly
- * {@link CHANNEL_VERSION} and `data.type` is a member of the closed inbound
- * vocabulary. Everything else is dropped in silence — no logging, which would
- * itself be a channel — and no field of an accepted frame is ever called,
- * evaluated or trusted as a function.
+ * {@link CHANNEL_VERSION}, `data.type` is a member of the closed inbound
+ * vocabulary, **and `data.token` is this document's handshake token** — the
+ * one condition a page script cannot satisfy, described in the next section.
+ * Everything else is dropped in silence — no logging, which would itself be a
+ * channel — and no field of an accepted frame is ever called, evaluated or
+ * trusted as a function.
+ *
+ * ## The handshake, and why a tag and a version are not authentication
+ *
+ * Every condition in the paragraph above except the token is satisfiable by
+ * the page itself. Its own window is `event.source`, its own origin is
+ * `event.origin`, and the tag, the version and the frame types are published
+ * constants in a file that ships — minified, but perfectly readable — inside a
+ * public extension. A page script that posted
+ * `{source:'debuggen-bridge', version:…, type:'agent.config', payload:{…}}` to
+ * its own window was therefore indistinguishable from the bridge, and an
+ * `agent.config` arms hooks, patches `fetch` and `XMLHttpRequest`, names the
+ * session and capture of the attacker's choosing, and — with no capture id —
+ * tears a live capture down. The origin checks were correct about *where* a
+ * frame came from and silent about *who* sent it.
+ *
+ * What the two sides lack is a shared secret, and there is no channel that
+ * could hand them one which the page could not also read: the bridge and the
+ * agent share one window and one `message` loop, and a value posted over it is
+ * a value the page can observe. The secret is therefore **minted by the agent,
+ * in the page's own realm, and disclosed inside a window the page has no
+ * script running in.** The agent is declared with
+ * `run_at: "document_start"`, so its evaluation precedes every script the
+ * document loads; both disclosures below happen during that evaluation or
+ * during the bridge's, which is the same window.
+ *
+ * ```text
+ * document_start, MAIN world                 document_start, ISOLATED world
+ * ──────────────────────────                 ──────────────────────────────
+ * agent.iife.js evaluated                    (bridge.ts not evaluated yet)
+ *   subscribe() -> mint 32 CSPRNG bytes
+ *                  as 64 lowercase hex
+ *   dispatchEvent(new CustomEvent(
+ *     'debuggen-agent-handshake',
+ *     { detail: '‹token›' }))         ────>  nothing is listening: offer lost
+ *                                            bridge.ts evaluated
+ *                                              addEventListener(
+ *                                                'debuggen-agent-handshake')
+ *                                     <────    dispatchEvent(new CustomEvent(
+ *                                                'debuggen-bridge-handshake'))
+ *   the FIRST request, and only ever
+ *   that one, is answered:
+ *   dispatchEvent(new CustomEvent(
+ *     'debuggen-agent-handshake',
+ *     { detail: '‹token›' }))         ────>  token kept for the life of the
+ *   request listener removed,                 document
+ *   answered-flag latched
+ *                                     <────  every frame it posts carries
+ *                                              { source, version, type,
+ *                                                token: '‹token›', payload }
+ * ```
+ *
+ * **What the bridge author must do**, in this order and once per document:
+ *
+ * 1. Register a listener for {@link HANDSHAKE_OFFER_EVENT} on `window` *before*
+ *    dispatching anything, because the answer is dispatched synchronously
+ *    inside the request and a listener registered afterwards has already
+ *    missed it. `event.detail` is the token as a **bare string** — not an
+ *    object, because a string is the only `detail` shape whose structured
+ *    clone across Chrome's isolated/main world boundary cannot vary.
+ * 2. Dispatch one `new CustomEvent(HANDSHAKE_REQUEST_EVENT)` on `window`. It
+ *    carries no `detail`; the request is the whole message.
+ * 3. Keep the token in the content script's own closure for the life of the
+ *    document, and put it on the `token` field of **every** frame it posts to
+ *    the page — `bridge.ready` included, since that frame is what starts a
+ *    drain.
+ * 4. Ask once, and never again. Only the first request is answered, by design —
+ *    a page script that has spotted the exchange must not be able to replay
+ *    it — so a bridge that discards the token has no way to recover it and must
+ *    wait for the document to reload. A bridge injected *before* the agent
+ *    already holds the token from the unsolicited offer, and should send its
+ *    one request anyway — neither side can observe the relative injection
+ *    order, and the answer it receives is the same token again, which its
+ *    listener can ignore or store idempotently.
+ *
+ * **Why the token is not minted by the service worker**, which is the obvious
+ * alternative and the one the extension's other credentials use: the agent is
+ * the side that has to *verify* it, and a token the worker minted would have
+ * to travel worker → bridge → agent. The only path from the bridge to the
+ * agent is this channel, whose inbound direction is exactly what the token
+ * exists to authenticate; disclosing it over an unauthenticated `postMessage`
+ * would put it in front of the page and make the whole exchange decorative. A
+ * `CustomEvent` is different in kind: the agent is the *source* of the value,
+ * so it needs no delivery it must then trust, and the disclosure is bounded to
+ * the two dispatches above rather than repeated on every frame.
+ *
+ * **The residual, stated honestly.** On a page carrying this bundle with no
+ * extension bridge present, page script is the only party that can ask, so it
+ * can consume the single request-answer and forge frames from then on. What it
+ * gains is an armed agent with no bridge to deliver to, no session and no
+ * capture to interfere with, and an `agent.error` or `telemetry.batch` posted
+ * into a window nobody is listening on — the agent performs no network egress
+ * of its own in any configuration. With the extension present, the bridge's
+ * `document_start` request is necessarily the first, because
+ * `apps/chrome-extension/manifest.config.ts` declares both content scripts at
+ * `document_start` and Chrome injects them in declaration order (the MAIN-world
+ * agent first, the ISOLATED-world bridge second), and both precede every page
+ * script. The exchange is therefore complete and latched before the page's
+ * first statement runs.
  *
  * ## Invariants
  *
  * **1. No side effects at import time.** No listener, no timer, no
- * `postMessage` at module scope. The `message` listener is installed by the
- * first {@link subscribe} and removed by the last unsubscribe; the flush timer
- * starts on the first enqueue, the queue allocates its first slots with the
- * first event and the drain channel is created with the first scheduled drain.
+ * `postMessage` and no `dispatchEvent` at module scope. The `message` listener
+ * is installed by the first {@link subscribe} and removed by the last
+ * unsubscribe, and so is the handshake request listener; the token is minted —
+ * and the one unsolicited offer dispatched — by that same first
+ * {@link subscribe} and never before it; the flush timer starts on the first
+ * enqueue, the queue allocates its first slots with the first event and the
+ * drain channel is created with the first scheduled drain.
  * `./agent.ts` is the one module in this folder allowed to act when it is
  * evaluated.
  *
@@ -207,6 +310,38 @@ export const AGENT_SOURCE_TAG = 'debuggen-agent';
 export const BRIDGE_SOURCE_TAG = 'debuggen-bridge';
 
 /**
+ * The DOM event the isolated-world bridge dispatches on `window` to ask this
+ * module for the document's handshake token.
+ *
+ * A `CustomEvent` rather than a frame on the `message` channel, and that is the
+ * whole point: this is the one exchange that cannot travel over the channel it
+ * authenticates. It carries no `detail` — the request *is* the message — and
+ * exactly one of them is ever answered (see {@link subscribe} and the module
+ * overview's handshake section).
+ *
+ * Published like the source tags: the bridge dispatches this name literally,
+ * so it is part of the channel rather than an implementation detail.
+ */
+export const HANDSHAKE_REQUEST_EVENT = 'debuggen-bridge-handshake';
+
+/**
+ * The DOM event this module dispatches on `window` to disclose the document's
+ * handshake token.
+ *
+ * `event.detail` is the token as a **bare string**, deliberately not wrapped in
+ * an object: `CustomEvent.detail` is structure-cloned when it crosses Chrome's
+ * isolated/main world boundary, and a primitive string is the one shape whose
+ * clone cannot acquire or lose a property on the way. The bridge must have its
+ * listener registered before it asks, because the answer is dispatched
+ * synchronously inside the request.
+ *
+ * Dispatched at most twice per document: once unsolicited, immediately after
+ * the token is minted, for a bridge that was evaluated before this agent; and
+ * once in answer to the first {@link HANDSHAKE_REQUEST_EVENT}.
+ */
+export const HANDSHAKE_OFFER_EVENT = 'debuggen-agent-handshake';
+
+/**
  * The channel version, carried on every frame in both directions and checked
  * exactly.
  *
@@ -217,8 +352,15 @@ export const BRIDGE_SOURCE_TAG = 'debuggen-bridge';
  * instead of a stream of half-understood frames: a change to any payload shape
  * in this file is a version bump, and both sides then simply ignore each
  * other until the page reloads.
+ *
+ * **Version 2 is that rule being applied.** Inbound frames gained a required
+ * field — `token`, the handshake secret described in the module overview — and
+ * an un-hardened bridge's version-1 frames are consequently *legible enough to
+ * ignore* rather than half-processed: they fail the version check before the
+ * token check, which is the difference between a mismatched pair that sits
+ * quiet until the page reloads and one that arms hooks nobody authenticated.
  */
-export const CHANNEL_VERSION = 1;
+export const CHANNEL_VERSION = 2;
 
 /**
  * The most completed events held in memory while the bridge is away.
@@ -588,6 +730,11 @@ export interface AgentOutboundMessage {
  * `version` is typed as a plain `number` because the field arrives from
  * outside; the guard admits only {@link CHANNEL_VERSION}, so a handler reading
  * an accepted message is reading that value.
+ *
+ * The `token` the bridge puts on every frame it posts is deliberately **not** a
+ * member: {@link acceptFrame} verifies it and drops it, so the document's
+ * secret never reaches a subscriber or anything a subscriber builds from a
+ * frame.
  */
 export interface BridgeInboundMessage {
   /** Always {@link BRIDGE_SOURCE_TAG} on an accepted frame. */
@@ -748,6 +895,60 @@ let reportingControlLoss = false;
 
 /** The single installed `message` listener, or `undefined` when none is. */
 let messageListener: ((event: MessageEvent<unknown>) => void) | undefined;
+
+/**
+ * The secret every inbound frame must carry, or `undefined` when none could be
+ * minted (no CSPRNG in the realm — see {@link mintHandshakeToken}).
+ *
+ * **Document-scoped, and deliberately untouched by {@link resetTransport}.**
+ * That is the one lifetime decision in this module that would break production
+ * silently if it were the other way round. `./agent.ts`'s `disarm()` calls
+ * `resetTransport()` at the end of *every* capture and immediately
+ * re-subscribes, so a token cleared there would leave the bridge holding a
+ * value this module no longer recognises and the agent permanently deaf to the
+ * next `agent.config` — no second capture on that document, ever, and no error
+ * anywhere to say why. A token is a property of the document, like the producer
+ * id in `./ids.js`, not of a capture.
+ *
+ * Re-minting on a re-subscribe would be just as wrong in the opposite
+ * direction: a fresh token has to be disclosed, and a disclosure at disarm time
+ * happens long after `document_start`, in a document whose scripts are all
+ * running — which is precisely the window the exchange is designed to stay
+ * inside.
+ */
+let handshakeToken: string | undefined;
+
+/**
+ * Whether a mint has been attempted for this document.
+ *
+ * Separate from {@link handshakeToken} being set, because a realm with no
+ * CSPRNG leaves the token `undefined` and must not be retried: the retry would
+ * fail identically and would re-report a failure the service has already been
+ * told about. Never cleared, for the reasons on {@link handshakeToken}.
+ */
+let handshakeMintAttempted = false;
+
+/**
+ * Whether the one answerable {@link HANDSHAKE_REQUEST_EVENT} has been answered.
+ *
+ * The latch that bounds disclosure. Set before the answer is dispatched, so a
+ * listener that synchronously dispatches a second request from inside the
+ * offer — a page script's most natural move — finds the exchange already
+ * closed. Never cleared: not by {@link resetTransport}, not by a re-subscribe,
+ * not by anything, because "the first asker" is a fact about the document.
+ */
+let handshakeRequestAnswered = false;
+
+/**
+ * The installed {@link HANDSHAKE_REQUEST_EVENT} listener, or `undefined`.
+ *
+ * Follows the `message` listener's lifetime rather than the token's: installed
+ * by the first {@link subscribe}, removed by the last unsubscribe and by
+ * {@link resetTransport}, so the "a fully detached agent leaves no listener on
+ * the page's window" invariant keeps holding. It is also removed the moment the
+ * request is answered, since a latched exchange has nothing left to listen for.
+ */
+let handshakeRequestListener: (() => void) | undefined;
 
 /*
  * ---------------------------------------------------------------------------
@@ -2082,6 +2283,293 @@ function isOwnOrigin(origin: string): boolean {
   return origin === location.origin;
 }
 
+/*
+ * ---------------------------------------------------------------------------
+ * The handshake
+ *
+ * Everything below implements the exchange documented in the module
+ * overview's handshake section, which is where a bridge author reads it. Four
+ * properties are what make it worth having, and each one is a decision taken
+ * here rather than a consequence of the mechanism:
+ *
+ * 1. The token comes from a **CSPRNG or from nowhere at all**.
+ * 2. It is disclosed **at most twice**, both times inside the `document_start`
+ *    window, and never again for the life of the document.
+ * 3. It is compared with **fixed work**, so the comparison itself says nothing
+ *    about how close a guess was.
+ * 4. It is **stripped** from everything handed onward, so no subscriber and no
+ *    page-visible diagnostic can leak it.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * Bytes of entropy in a handshake token: 32, the same width as the local
+ * service's credentials (AAP 0.5.6).
+ *
+ * The value is not a tuning knob — a guess has to be right in one attempt,
+ * since a wrong token is dropped in silence and there is no oracle to iterate
+ * against — so the width is chosen to be uninteresting rather than marginal.
+ */
+const HANDSHAKE_TOKEN_BYTES = 32;
+
+/** Hex characters per byte, which is the `padStart` width {@link mintHandshakeToken} uses. */
+const HEX_DIGITS_PER_BYTE = 2;
+
+/** The exact length of a well-formed token: 64 lowercase hex characters. */
+const HANDSHAKE_TOKEN_CHARS = HANDSHAKE_TOKEN_BYTES * HEX_DIGITS_PER_BYTE;
+
+/**
+ * The parts of a random source this module reads, structurally.
+ *
+ * Read through a structural view rather than the `Crypto` type because this
+ * code runs in the page's own realm: `globalThis.crypto` may be absent, `null`,
+ * an application's own object, or a getter that throws. Nothing here assumes
+ * more than "a `getRandomValues` function is reachable", and the call is made
+ * with `.call(source, …)` so the method keeps its receiver — a detached
+ * reference raises an illegal-invocation `TypeError` in Chromium.
+ */
+interface HandshakeRandomSource {
+  /** `Crypto.prototype.getRandomValues`, when the realm has one. */
+  getRandomValues?: unknown;
+}
+
+/**
+ * Mint the document's handshake token: 32 CSPRNG bytes as 64 lowercase hex
+ * characters, or `undefined` when no CSPRNG is reachable.
+ *
+ * **`./ids.js`'s `randomHex` is deliberately not reused**, even though it
+ * renders exactly this shape. That function degrades to `Math.random` when the
+ * realm has no Web Crypto, which is the right trade for a trace id — ids are
+ * correlation keys, they authorise nothing, and refusing to capture would cost
+ * a real capability for no security benefit — and the wrong trade to the point
+ * of being worthless here. `Math.random`'s generator state belongs to the
+ * page's own realm, is advanced by the page's own calls, and is recoverable
+ * from a short run of observed output; a token drawn from it is a secret the
+ * page can compute. So this path does not degrade: **no CSPRNG means no
+ * token**, which means no inbound frame is ever accepted, which the caller
+ * reports once through {@link reportProducerFailure} (AAP 0.5.5 — a signal that
+ * cannot be enabled is reported, never silently dropped).
+ *
+ * An all-zero result is refused for the same reason. A realm whose
+ * `getRandomValues` is a stub that leaves the array untouched — a naive
+ * polyfill, or a page that replaced the global — returns success and no
+ * entropy, and 64 zeroes is a token anyone can type. Treating it as "no
+ * CSPRNG" is the honest reading.
+ *
+ * Every global access is `typeof`-guarded and the whole body is wrapped:
+ * nothing here may throw into the page, and this runs during the agent's
+ * opening sequence where an exception would cost the entire bundle.
+ *
+ * @returns The token, or `undefined` when one cannot be minted safely.
+ */
+function mintHandshakeToken(): string | undefined {
+  if (typeof globalThis === 'undefined') {
+    return undefined;
+  }
+
+  try {
+    const scope = globalThis as unknown as { crypto?: HandshakeRandomSource | null };
+    const source = scope.crypto;
+    if (source === undefined || source === null) {
+      return undefined;
+    }
+
+    const getRandomValues = source.getRandomValues;
+    if (typeof getRandomValues !== 'function') {
+      return undefined;
+    }
+
+    const bytes = new Uint8Array(HANDSHAKE_TOKEN_BYTES);
+    (getRandomValues as (array: Uint8Array) => unknown).call(source, bytes);
+
+    let allZero = true;
+    let token = '';
+    for (const byte of bytes) {
+      if (byte !== 0) {
+        allZero = false;
+      }
+      // Rendered inline rather than through a 256-entry lookup table: this runs
+      // once per document, so the table `./ids.js` maintains for its per-event
+      // hex would be an allocation with nothing to amortise it over.
+      token += byte.toString(16).padStart(HEX_DIGITS_PER_BYTE, '0');
+    }
+
+    if (allZero || token.length !== HANDSHAKE_TOKEN_CHARS) {
+      return undefined;
+    }
+    return token;
+  } catch {
+    // A realm that refuses the read, or a `getRandomValues` that throws, is a
+    // realm with no CSPRNG as far as this module is concerned.
+    return undefined;
+  }
+}
+
+/**
+ * Disclose the token in one {@link HANDSHAKE_OFFER_EVENT} on `window`.
+ *
+ * The `detail` is the bare string, for the structured-clone reason documented
+ * on that constant. Guarded end to end: a realm without `window` or without
+ * `CustomEvent` simply makes no offer, and a page that has replaced
+ * `dispatchEvent` with something that throws costs this disclosure and nothing
+ * else.
+ *
+ * @param token The token to disclose.
+ */
+function offerHandshakeToken(token: string): void {
+  if (typeof window === 'undefined' || typeof CustomEvent === 'undefined') {
+    return;
+  }
+
+  try {
+    window.dispatchEvent(new CustomEvent<string>(HANDSHAKE_OFFER_EVENT, { detail: token }));
+  } catch {
+    // A refused dispatch leaves the bridge to ask (or, if it already asked, to
+    // reload the page); it must never surface in the developer's application.
+  }
+}
+
+/**
+ * Answer the first — and only the first — handshake request.
+ *
+ * The order of the three statements is the security property: the latch is set
+ * and the listener removed *before* the offer is dispatched, so a handler that
+ * dispatches a second request from inside the first answer finds the exchange
+ * already closed. Doing it afterwards would make the bound "one request per
+ * synchronous turn" instead of "one request per document".
+ */
+function answerHandshakeRequest(): void {
+  const token = handshakeToken;
+  if (handshakeRequestAnswered || token === undefined) {
+    return;
+  }
+
+  handshakeRequestAnswered = true;
+  removeHandshakeRequestListener();
+  offerHandshakeToken(token);
+}
+
+/**
+ * Install the request listener, if this document still has an answer to give.
+ *
+ * Nothing is installed once the exchange is latched or when no token was
+ * minted: a listener that could only ignore what it hears is a listener on the
+ * developer's `window` for no reason, and this module's contract is that a
+ * detached agent leaves none.
+ */
+function installHandshakeRequestListener(): void {
+  if (
+    handshakeRequestListener !== undefined ||
+    handshakeRequestAnswered ||
+    handshakeToken === undefined ||
+    typeof window === 'undefined'
+  ) {
+    return;
+  }
+
+  const listener = (): void => {
+    answerHandshakeRequest();
+  };
+  window.addEventListener(HANDSHAKE_REQUEST_EVENT, listener);
+  handshakeRequestListener = listener;
+}
+
+/**
+ * Remove the request listener, if one is installed.
+ *
+ * The reference is cleared only after the removal returns, exactly as
+ * {@link removeMessageListener} does it: a listener the page refused to remove
+ * is still known, and the next call tries again.
+ */
+function removeHandshakeRequestListener(): void {
+  if (handshakeRequestListener === undefined) {
+    return;
+  }
+
+  if (typeof window !== 'undefined') {
+    window.removeEventListener(HANDSHAKE_REQUEST_EVENT, handshakeRequestListener);
+  }
+  handshakeRequestListener = undefined;
+}
+
+/**
+ * Open the authenticated half of the inbound channel: mint once, disclose
+ * once, then listen for the one request that will be answered.
+ *
+ * Called from {@link installMessageListener}, which is the module's "the
+ * inbound channel is now open" moment — the first {@link subscribe}, which
+ * `./agent.ts`'s bootstrap performs at `document_start`. Everything past the
+ * first call is idempotent: the token and the latch are document-scoped and
+ * never re-minted, so a re-subscribe after `resetTransport()` re-installs the
+ * listener (when there is still an answer to give) and discloses nothing.
+ *
+ * A realm with no CSPRNG is reported once, as an `agent.error` frame with
+ * `source: 'transport'`. That frame may well be lost — at `document_start` the
+ * bridge's own listener may not exist yet, and this module deliberately queues
+ * no control frames — which is why the outcome is also visible in
+ * {@link getProducerFailureStats} and, for the developer, in the agent being
+ * demonstrably unconfigurable. Saying it once is the AAP 0.5.5 requirement;
+ * saying it repeatedly would turn a diagnostic into a channel.
+ */
+function openHandshake(): void {
+  if (!handshakeMintAttempted) {
+    handshakeMintAttempted = true;
+
+    const token = mintHandshakeToken();
+    if (token === undefined) {
+      reportProducerFailure('transport', 'handshake-token-mint', undefined, {
+        reason: 'no-csprng',
+        // Stated so the frame is self-explanatory: this is not a degraded mode.
+        inboundAccepted: false,
+      });
+      return;
+    }
+
+    handshakeToken = token;
+    // The unsolicited half: a bridge evaluated before this agent is already
+    // listening, and a bridge evaluated after it hears nothing and asks.
+    offerHandshakeToken(token);
+  }
+
+  installHandshakeRequestListener();
+}
+
+/**
+ * Whether a frame's `token` field is this document's issued token.
+ *
+ * Fixed work by construction: the length is compared first (two strings of
+ * different lengths cannot be equal, and the length of a token is not a
+ * secret — it is 64 characters, stated in this file), and the character
+ * comparison then accumulates a difference over **every** code unit instead of
+ * returning at the first mismatch. A short-circuiting `===` on two strings is
+ * not a timing oracle worth much across a `postMessage` boundary, but "not
+ * worth much" is a measurement, not a guarantee, and this loop costs 64
+ * XOR-and-or operations once per inbound frame.
+ *
+ * `false` when no token was ever issued, which is the whole of the
+ * no-CSPRNG behaviour: a realm that could not mint one accepts nothing, rather
+ * than accepting anything.
+ *
+ * @param candidate The frame's `token` field, typed `unknown` because it comes
+ * from outside.
+ * @returns `true` only when `candidate` is the issued token.
+ */
+function isIssuedToken(candidate: unknown): boolean {
+  const issued = handshakeToken;
+  if (issued === undefined || typeof candidate !== 'string') {
+    return false;
+  }
+  if (candidate.length !== issued.length) {
+    return false;
+  }
+
+  let difference = 0;
+  for (let index = 0; index < issued.length; index += 1) {
+    difference |= issued.charCodeAt(index) ^ candidate.charCodeAt(index);
+  }
+  return difference === 0;
+}
+
 /**
  * Decide whether a `message` event is a frame from the bridge, and normalise
  * it if it is.
@@ -2091,10 +2579,23 @@ function isOwnOrigin(origin: string): boolean {
  * can post a message to `window`, and a subscriber acts on what it is handed:
  * `agent.config` arms hooks, `target.request` starts describing elements. So a
  * frame is accepted only when it came from this window, on this window's
- * origin, tagged as the bridge's and at exactly this channel version, and
- * carrying a known frame type. A frame that fails any condition is dropped in
- * silence — reporting it would hand a probing page a signal to iterate
- * against.
+ * origin, tagged as the bridge's and at exactly this channel version, carrying
+ * a known frame type, **and carrying this document's handshake token**. A frame
+ * that fails any condition is dropped in silence — reporting it would hand a
+ * probing page a signal to iterate against.
+ *
+ * Every condition before the token establishes *where* a frame came from, and
+ * a page script satisfies all of them about its own window; the token is what
+ * establishes *who* sent it (see {@link isIssuedToken} and the module
+ * overview). A frame with no token, with a wrong token, or with any token at
+ * all in a realm where none could be minted is dropped in exactly the same
+ * silence as a frame with the wrong source tag.
+ *
+ * The token is **not** carried onto the {@link BridgeInboundMessage} this
+ * returns. The message is built field by field, so the secret reaches no
+ * subscriber, no `agent.error` payload assembled from a frame and no
+ * diagnostic a page can read back: the only code that ever compares it is
+ * {@link isIssuedToken}.
  *
  * Nothing in an accepted frame is ever called or evaluated. `payload` is
  * passed through as data, and a non-object payload becomes `{}` so that a
@@ -2114,13 +2615,26 @@ function acceptFrame(event: MessageEvent<unknown>): BridgeInboundMessage | undef
     return undefined;
   }
 
-  const frame = data as { source?: unknown; version?: unknown; type?: unknown; payload?: unknown };
+  const frame = data as {
+    source?: unknown;
+    version?: unknown;
+    type?: unknown;
+    token?: unknown;
+    payload?: unknown;
+  };
   if (frame.source !== BRIDGE_SOURCE_TAG || frame.version !== CHANNEL_VERSION) {
     return undefined;
   }
 
   const { type } = frame;
   if (!isBridgeInboundType(type)) {
+    return undefined;
+  }
+
+  // Last of the guards, deliberately: the cheap structural checks have already
+  // discarded the page's unrelated `postMessage` traffic, so the only frames
+  // that reach the comparison are ones claiming to be the bridge's.
+  if (!isIssuedToken(frame.token)) {
     return undefined;
   }
 
@@ -2194,7 +2708,16 @@ function handleInbound(event: MessageEvent<unknown>): void {
   }
 }
 
-/** Install the one `message` listener, if it is not installed already. */
+/**
+ * Install the one `message` listener, if it is not installed already, and open
+ * the handshake that authenticates what arrives on it.
+ *
+ * The two are one operation on purpose: a listener installed without a token
+ * accepts nothing at all (see {@link isIssuedToken}), and a token disclosed
+ * with no listener behind it has nobody to answer. {@link openHandshake} is
+ * idempotent, so the re-subscribe `./agent.ts` performs after every disarm
+ * re-installs the request listener and mints nothing.
+ */
 function installMessageListener(): void {
   if (messageListener !== undefined || typeof window === 'undefined') {
     return;
@@ -2205,6 +2728,8 @@ function installMessageListener(): void {
   };
   window.addEventListener('message', listener);
   messageListener = listener;
+
+  openHandshake();
 }
 
 /** Remove the `message` listener, if one is installed. */
@@ -2562,10 +3087,16 @@ export function postControl(type: AgentOutboundType, payload: Record<string, unk
 /**
  * Subscribe to frames from the bridge.
  *
- * The first call installs the module's single `message` listener; the last
- * unsubscribe removes it, so a fully detached agent leaves no listener on the
- * page's window. The returned function is idempotent and safe to call after
+ * The first call installs the module's single `message` listener and opens the
+ * handshake that authenticates it (mint the token, disclose it once, listen for
+ * the one request that will be answered); the last unsubscribe removes both
+ * listeners, so a fully detached agent leaves no listener on the page's window.
+ * The returned function is idempotent and safe to call after
  * {@link resetTransport}.
+ *
+ * The token itself is **not** a subscription: it belongs to the document and
+ * survives every reset, so the bridge's copy stays valid across the disarm and
+ * re-arm of a second capture (see {@link handshakeToken}).
  *
  * @param handler Called with each accepted frame. It must not throw — one that
  * does is contained, but it forfeits its own notification.
@@ -2586,6 +3117,7 @@ export function subscribe(handler: (message: BridgeInboundMessage) => void): () 
       subscribers.delete(handler);
       if (subscribers.size === 0) {
         removeMessageListener();
+        removeHandshakeRequestListener();
       }
     } catch {
       // Nothing left to do: the handler is already unreachable.
@@ -2686,6 +3218,17 @@ export function flush(): void {
  * producer id inside one document would split one sequence into two
  * incomparable halves.
  *
+ * Neither is the handshake token, nor the latch that records that the one
+ * request was answered — and for a sharper reason, because this function runs
+ * at the end of *every* capture (`./agent.ts`'s `disarm()` calls it and then
+ * immediately re-subscribes). Clearing the token here would leave the bridge
+ * holding a value this module no longer recognises, with no way to be told and
+ * no second disclosure coming, so the next `agent.config` would never be
+ * accepted and the document would be finished after one capture. See
+ * {@link handshakeToken}. What *is* released is the request listener, because
+ * that follows the `message` listener: afterwards the module holds no listener
+ * on the page's window, and the next {@link subscribe} re-installs both.
+ *
  * Every step stands in its own guard (see {@link teardownStep}). The three
  * that touch the page — clearing the timer and removing the listener — are the
  * ones that can fail, because `clearTimeout` and `removeEventListener` belong
@@ -2715,6 +3258,12 @@ export function resetTransport(): void {
   });
   teardownStep('message-listener-remove', () => {
     removeMessageListener();
+  });
+  // Its own step rather than a second statement in the one above: the two
+  // removals are independent, and a `removeEventListener` the page refuses for
+  // one event type must not leave the other listener on the window.
+  teardownStep('handshake-listener-remove', () => {
+    removeHandshakeRequestListener();
   });
   teardownStep('subscribers-clear', () => {
     subscribers.clear();

@@ -15,7 +15,7 @@
  * installed on disk for this tree, which is what proves the extractors read it AST-first.
  */
 
-import { useState, useCallback } from 'react';
+import { useState, useCallback, memo } from 'react';
 
 import { fetchGaugeIndex } from '@/lib/http';
 
@@ -63,6 +63,66 @@ export function GaugeReadout({ gaugeId, stationLabel }: GaugeReadoutProps) {
       </button>
       <p>Latest reading: {latestReading ?? 'none yet'}</p>
       <p>Gauges indexed: {indexSize}</p>
+    </section>
+  );
+}
+
+/*
+ * The memoised specimen of the corpus, appended below everything above it: every line of this
+ * file up to here is referenced by generated-to-original coordinates in `test/fixtures/source-maps`
+ * and asserted by `src/source-map/resolver.test.ts`, so new shapes are added at the end and never
+ * inserted.
+ *
+ * Node shapes this pair guarantees, which no other file of the corpus supplies:
+ *   - a component declared through the *referenced* wrapper form, `memo(<identifier>)`, whose
+ *     implementation is a separate declaration of this same module. It is the one of the two
+ *     memoisation shapes that cannot be read off the initialiser alone, so the component node for
+ *     the exported binding exists only if the wrapper is resolved through the identifier;
+ *   - the render edge into that exported binding, written by the parent below rather than by
+ *     another module, so the pair stands on its own;
+ *   - no display-name assignment on the wrapper, which leaves the implementation's own name as the
+ *     display name React would report — the case where the declared name and the runtime name of
+ *     one component differ.
+ *
+ * `memo` stays unresolved like every other `react` specifier here: nothing is installed for this
+ * tree, which is what proves the wrapper is recognised by the name written at the call site.
+ */
+
+/**
+ * Props of {@link GaugeTrend} and of the panel that frames it. `readings` is the recent level
+ * series of one gauge, oldest first, and is read for display only.
+ */
+interface GaugeTrendProps {
+  readings: readonly number[];
+}
+
+/**
+ * The implementation behind {@link GaugeTrend}: the readings as an ordered list. Declared
+ * separately from the exported binding, which is what makes the wrapper below a reference rather
+ * than an inline function.
+ */
+function GaugeTrendBody({ readings }: GaugeTrendProps) {
+  return (
+    <ol>
+      {readings.map((reading, position) => (
+        <li key={position}>{reading}</li>
+      ))}
+    </ol>
+  );
+}
+
+/** The gauge trend list, memoised: re-rendered only when its readings change. */
+export const GaugeTrend = memo(GaugeTrendBody);
+
+/**
+ * Frames the memoised trend list with a heading. The corpus' only parent of a wrapped component,
+ * and a single element rather than a mapped list so the render edge counts unambiguously.
+ */
+export function GaugeTrendPanel({ readings }: GaugeTrendProps) {
+  return (
+    <section>
+      <h3>Recent levels</h3>
+      <GaugeTrend readings={readings} />
     </section>
   );
 }

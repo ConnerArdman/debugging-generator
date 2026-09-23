@@ -571,6 +571,66 @@ function searchError(
 }
 
 /**
+ * Whether an options argument is an object whose members can be read.
+ *
+ * An array and a function are refused along with every primitive: this module
+ * reads named members off the argument, and none of those shapes carries them.
+ * Refusing here is what lets the rest of the function read `options.query`,
+ * `options.logger` and the caps without a per-member existence check.
+ *
+ * @param value The `options` argument, as it arrived.
+ * @returns `true` when members can be read off it.
+ */
+function isReadableOptions(value: unknown): value is TextSearchOptions {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Whether a project argument is the handle `openProject` returns.
+ *
+ * Structural rather than nominal — the three members this module actually uses
+ * — because the handle crosses a package boundary and an `instanceof` check
+ * would tie this module to a class it does not own. It is a guard against a
+ * malformed call, not a validation of the project itself: a handle that has the
+ * three members is used, and whatever it reports is what gets searched.
+ *
+ * @param value The `loaded` argument, as it arrived.
+ * @returns `true` when the value can be searched through.
+ */
+function isProjectHandle(value: unknown): value is LoadedProject {
+  if (typeof value !== 'object' || value === null) {
+    return false;
+  }
+
+  const candidate = value as Partial<Record<keyof LoadedProject, unknown>>;
+
+  return (
+    typeof candidate.projectRoot === 'string' &&
+    typeof candidate.sourceFiles === 'function' &&
+    typeof candidate.projectRelative === 'function'
+  );
+}
+
+/**
+ * A description of a refused argument that is safe to put in `details`: what
+ * kind of value arrived, never the value itself.
+ *
+ * `details` reaches a log and a developer-facing message, and this module's
+ * error contract is that neither ever carries the query, an excerpt or a file's
+ * contents. A type name debugs a malformed call without breaking that.
+ *
+ * @param value The refused argument.
+ * @returns A short type description.
+ */
+function describeArgument(value: unknown): string {
+  if (value === null) {
+    return 'null';
+  }
+
+  return Array.isArray(value) ? 'array' : typeof value;
+}
+
+/**
  * Escapes every regular-expression metacharacter in a literal string.
  *
  * Applied to {@link TextSearchOptions.query} whenever
@@ -1394,6 +1454,15 @@ function abortError(details: Readonly<Record<string, unknown>>): DebuggenError {
  * `details.reason` to branch on and a `hint` naming the remedy. A cancelled
  * search is never reported as a partial success.
  *
+ * "Never throws" holds for *values* as well as for types, because this is the
+ * fallback retrieval route for a name a model asked about (AAP 0.4.2) and the
+ * call is assembled from that model's output: an `options` argument that is not
+ * an object at all — `null`, `undefined`, a number, an array — and a `loaded`
+ * argument that is not a project handle are refused as `Err` with
+ * `details.reason` `'options-invalid'` and `'project-invalid'`, in front of the
+ * first member read. Those two checks are why a malformed tool call costs the
+ * investigation one refused query rather than the whole stage (AAP 0.5.5).
+ *
  * @param loaded The project to search, as `openProject` returned it.
  * @param options What to search for and the budget to spend.
  * @returns `Ok` with the hits and the scan's accounting — including for a
@@ -1418,6 +1487,32 @@ export function searchText(
   loaded: LoadedProject,
   options: TextSearchOptions,
 ): Result<TextSearchResult> {
+  // Both arguments are admitted before either is read. The types below are
+  // what an in-process caller writes; the values are what a model-assembled
+  // tool call actually passes, and reading `options.logger` off a `null` is the
+  // one way this function could have thrown.
+  if (!isReadableOptions(options)) {
+    return err(
+      searchError(
+        'options-invalid',
+        'A text search needs an options object naming at least a query.',
+        'Pass an object such as `{ query: "pool.query(" }`; a missing, null or non-object argument names no search.',
+        { received: describeArgument(options) },
+      ),
+    );
+  }
+
+  if (!isProjectHandle(loaded)) {
+    return err(
+      searchError(
+        'project-invalid',
+        'A text search needs the project handle `openProject` returned.',
+        'Open the project with `openProject` and pass the handle it returns; this search reads source text only through that handle.',
+        { received: describeArgument(loaded) },
+      ),
+    );
+  }
+
   const logger = options.logger ?? noopLogger;
   const query = options.query;
 

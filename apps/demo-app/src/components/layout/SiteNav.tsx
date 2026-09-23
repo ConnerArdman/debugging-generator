@@ -133,23 +133,50 @@ const TOGGLE_SUFFIX = ' navigation';
 const CLOSE_KEY = 'Escape';
 
 /**
+ * The catalog section's second path: the grid is served at `/`, and a single item of that grid at
+ * `/products/<slug>`. The table above lists the section once, under the `/` it links to, so this
+ * is where the rest of the section is named.
+ */
+const CATALOG_SECTION = '/products';
+
+/**
+ * Whether `pathname` is `base` itself or a path beneath it.
+ *
+ * The separator is part of the comparison, and that is the whole point of writing the test here
+ * rather than as a bare `startsWith` at each call: `/orders/AB-1024` is beneath `/orders`, while
+ * `/orders-archive` - a different route that merely starts with the same letters - is not.
+ *
+ * A single-token name, like the locals further down: the guard described above `Props` harvests
+ * every multi-token name this workspace declares.
+ */
+function within(pathname: string, base: string): boolean {
+  return pathname === base || pathname.startsWith(`${base}/`);
+}
+
+/**
  * Whether `href` is the route `pathname` is currently on.
  *
  * Total and pure: the same two strings always give the same answer, no argument can make it
  * throw, and it reads nothing outside its parameters - which is why it lives here rather than
  * inside the component, and why it costs nothing to evaluate once per entry on every render.
  *
- * The catalog, at `/`, matches exactly. Every other route matches its own path and anything
- * beneath it, so `/orders/AB-1024` still marks Orders as the current page while `/orders-archive`
- * - a different route that merely starts with the same letters - does not, because the separator
- * is part of the comparison.
+ * Every route matches its own path and anything beneath it, so `/orders/AB-1024` still marks
+ * Orders as the current page.
+ *
+ * The catalog is the one entry standing for two paths rather than one. Its `href` is `/`, which
+ * every path in the application is beneath, so it is compared exactly - and then `/products`, the
+ * section it also owns, is compared as a section. A product page is a page of the catalog, so
+ * Catalog stays marked current while the reader is reading one; nothing beneath any other entry
+ * can match this branch, so exactly one link is still current at a time. `/products-archive`, a
+ * route this application does not serve, would not match: the comparison is `within`'s, and the
+ * separator is part of it.
  */
 function isActiveRoute(pathname: string, href: string): boolean {
   if (href === '/') {
-    return pathname === '/';
+    return pathname === '/' || within(pathname, CATALOG_SECTION);
   }
 
-  return pathname === href || pathname.startsWith(`${href}/`);
+  return within(pathname, href);
 }
 
 /**

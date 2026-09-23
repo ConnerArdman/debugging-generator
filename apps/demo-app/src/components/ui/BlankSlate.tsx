@@ -110,6 +110,20 @@ export function BlankSlate({
         attributes so the box is reserved before the file arrives and nothing below it shifts, and
         a plain img element needs no image configuration of any kind - the optimiser skips SVG
         regardless.
+
+        `loading="lazy"` is here for the document head rather than for the network. React's server
+        renderer hoists a `<link rel="preload" as="image">` into the head for every non-lazy image
+        it renders, and the App Router serialises the not-found slot - one of this component's
+        callers - into the payload of every route, so that a notFound() raised on the client can be
+        shown without a round trip. The artwork is decorative and branch-conditional, so without
+        this attribute a screen that merely carries an empty state it never displays still asks the
+        browser to preload the illustration, wastes the request that follows, and earns the "was
+        preloaded using link preload but not used" advisory. Declaring the image lazy is the
+        honest description of that artwork and it is also what both renderers check: the HTML
+        renderer and the Flight serialiser each skip the hint when the element says `loading="lazy"`.
+        Nothing changes where the block does render - a lazy image already in the viewport, which is
+        where this one sits whenever an empty state is on screen, is fetched immediately - and the
+        width and height above keep the box reserved either way.
       */}
       <img
         className={styles.art}
@@ -117,6 +131,7 @@ export function BlankSlate({
         width={240}
         height={180}
         alt={alt}
+        loading="lazy"
       />
       {/*
         A paragraph by default, styled as a heading, with `headingAs` as the opt-in for a real
