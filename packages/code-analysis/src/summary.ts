@@ -688,8 +688,12 @@ export interface ProjectProbe {
  * Four refusals are built in, and each is a boundary this module is not allowed
  * to cross:
  *
- * 1. A path that is not a safe project-relative path — absolute, a traversal, a
- *    backslash, a control character — is refused without a system call.
+ * 1. A path that is not a safe project-relative path — absolute (in either
+ *    slash direction), a traversal, a control character — is refused without a
+ *    system call. Separators are converted with `toPosix` first, exactly as
+ *    `@debuggen/shared`'s `isSafeRelativePath` requires of its callers, so a
+ *    path written with the other separator names the same file while a
+ *    traversal written that way is still a traversal and still refused.
  * 2. A path that does not resolve inside the project root is refused.
  * 3. An environment file is refused ({@link isEnvFilePath}), so `.env` and
  *    every qualified variant cannot even be probed for.

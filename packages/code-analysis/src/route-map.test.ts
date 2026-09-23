@@ -2,7 +2,7 @@
  * Tests for `./route-map.ts`: the module that answers "which file serves this
  * URL?" and "what is the URL of this file?".
  *
- * The suite is in four parts, and a failure in each means something different:
+ * The suite is in five parts, and a failure in each means something different:
  *
  * ## 1. The derivation, pinned by a table
  *
@@ -45,16 +45,28 @@
  *
  * ## 4. The corpus, opened where it lives
  *
- * The last group runs {@link buildRouteMap} over
+ * The fourth group runs {@link buildRouteMap} over
  * `test/fixtures/sample-next-app` through the real `openProject`, which is
  * what a consumer does with a developer's project. The corpus is deliberately
- * hybrid — an App Router tree with a Pages Router remnant — and it is read
- * **only**, never written, so a run leaves `git status` unchanged. This group
- * also proves the two constructors agree: a map rebuilt by
- * {@link routeMapFromIndex} from a persisted index resolves every corpus URL
- * exactly as the ts-morph-built map does — under the origin policy too, with
- * and without a configured `origins` list — which is the contract a reopened
- * session in the local service depends on.
+ * hybrid — an App Router tree with a Pages Router remnant — and it is opened
+ * **once**, read **only** and never written, so a run leaves `git status`
+ * unchanged. This group is also where the `SourceLocation` contract is pinned:
+ * every location the map emits is validated with `@debuggen/shared`'s own
+ * schema, since that schema is what the `SourceLink` chip and the editor's
+ * open-location handler validate it with at the far end.
+ *
+ * ## 5. The reopened-session path, over a real index
+ *
+ * The last group proves the two constructors agree where it counts. The corpus
+ * is indexed by `./indexer.ts` with the cache disabled, and the map
+ * {@link routeMapFromIndex} rebuilds from that index resolves every corpus URL
+ * to the same module, path, parameters and methods as the ts-morph-built map —
+ * including the origin policy, and including every URL both must refuse. That
+ * is the contract a reopened session in the local service depends on: the index
+ * came back from `$DEBUGGEN_HOME/index` as plain JSON, no compiler was started,
+ * and a captured span still has to resolve to the file a developer expects. The
+ * group before it covers the same parity from a *hand-built* index, which pins
+ * the node payload; this one pins the real extractor's.
  *
  * Fixture route names are fixture-invented test data. No route literal of
  * theirs appears in `./route-map.ts`, and none should: the module derives, it
@@ -64,14 +76,22 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
-import { DEFAULT_RESOLUTION_CONFIDENCE, joinPosix, relativePosix, toPosix } from '@debuggen/shared';
+import {
+  DEFAULT_RESOLUTION_CONFIDENCE,
+  isSourceLocation,
+  joinPosix,
+  parseSourceLocation,
+  relativePosix,
+  toPosix,
+} from '@debuggen/shared';
 import type { LogFields, LogLevel, Logger, SourceLocation } from '@debuggen/shared';
 import { Project } from 'ts-morph';
-import { describe, expect, it } from 'vitest';
+import { beforeAll, describe, expect, it } from 'vitest';
 
-import { CODE_INDEX_SCHEMA_VERSION } from './graph/types.js';
+import { CODE_INDEX_SCHEMA_VERSION, HTTP_METHOD_NAMES } from './graph/types.js';
 import type { CodeIndex, CodeNode, CodeNodeOf } from './graph/types.js';
-import { openProject } from './project.js';
+import { indexProject } from './indexer.js';
+import { INDEXABLE_EXTENSIONS, openProject } from './project.js';
 import type { LoadedProject } from './project.js';
 import {
   buildRouteEntry,
@@ -270,6 +290,54 @@ function segmentKinds(file: string): readonly RouteSegmentKind[] {
   return (deriveRouteFromFile(file)?.segments ?? []).map((segment) => segment.kind);
 }
 
+/**
+ * Asserts one location against the whole `route-map` source-location contract.
+ *
+ * Every location this module emits travels the same path — onto a
+ * `TelemetryEvent.source`, into a `source.open` message, into a `SourceLink`
+ * chip and finally into `showTextDocument` — and each of those consumers
+ * validates it with `@debuggen/shared`'s schema. So the schema is what this
+ * checks with, rather than a field list restated here that could drift from it:
+ * `parseSourceLocation` is the gate a location has to pass at every boundary,
+ * including its two refinements (a project-relative POSIX `file`, and
+ * `endLine >= line`) that a structural comparison would miss, and
+ * `isSourceLocation` is the boolean form a renderer decides with. A location
+ * that fails either is one no panel would show and no editor would open.
+ *
+ * `resolvedBy` and `confidence` are pinned on top of that because they are the
+ * claim rather than the shape: this module *is* the `'route-map'` resolution
+ * route (AAP 0.2.3), it is second in precedence behind a patch's own recorded
+ * position, and the number that expresses that ranking is read from
+ * `DEFAULT_RESOLUTION_CONFIDENCE` rather than written here — a literal would
+ * pass while silently disagreeing with the table every other route is ranked
+ * against.
+ *
+ * @param location The location to check.
+ * @param file The project-relative file the location must name.
+ */
+function expectRouteMapLocation(location: SourceLocation, file: string): void {
+  const parsed = parseSourceLocation(location);
+
+  expect(parsed.ok).toBe(true);
+  if (parsed.ok) {
+    expect(parsed.value).toEqual(location);
+  }
+  expect(isSourceLocation(location)).toBe(true);
+
+  expect(location.file).toBe(file);
+  expect(location.file.includes('\\')).toBe(false);
+  expect(Number.isInteger(location.line)).toBe(true);
+  expect(location.line).toBeGreaterThanOrEqual(1);
+  expect(Number.isInteger(location.column)).toBe(true);
+  expect(location.column).toBeGreaterThanOrEqual(1);
+  expect(location.resolvedBy).toBe('route-map');
+  expect(location.confidence).toBe(DEFAULT_RESOLUTION_CONFIDENCE['route-map']);
+
+  if (location.endLine !== undefined) {
+    expect(location.endLine).toBeGreaterThanOrEqual(location.line);
+  }
+}
+
 /*
  * ---------------------------------------------------------------------------
  * 1. The derivation, pinned by a table
@@ -292,6 +360,81 @@ interface DerivationCase {
 
   /** The expected kind, when the file is routable. */
   readonly kind?: 'route-handler' | 'page';
+
+  /**
+   * The parameters the route captures, in URL order. Defaults to none, which
+   * is what a wholly static route captures.
+   */
+  readonly dynamicParams?: readonly string[];
+
+  /** Defaults to `false`; `true` for a catch-all of either form. */
+  readonly isCatchAll?: boolean;
+
+  /** Defaults to `false`; `true` only for the `[[...param]]` form. */
+  readonly isOptionalCatchAll?: boolean;
+}
+
+/**
+ * Runs one row of a derivation table: the six fields it pins, plus the
+ * invariants every derived route holds whatever rule produced it.
+ *
+ * The invariants are asserted per row rather than once in a case of their own
+ * because each of them is a way for a *correct-looking* row to still be a
+ * wrong answer to "which file serves this URL?": a `routePath` that lost its
+ * leading separator or grew a trailing one does not compare equal to the path
+ * a captured `http.server` span carries; a `routePath` that disagrees with
+ * `segments` makes a map rebuilt from a persisted index resolve differently
+ * from the one built by the compiler, since `routeMapFromIndex` re-parses the
+ * path; and a `file` that came back in another spelling than it went in is a
+ * location no editor can open.
+ *
+ * The route-group and parallel-slot check is App Router only, and deliberately
+ * so. `(group)` and `@slot` are conventions of that router alone, so a
+ * directory spelled either way under `pages/` is an ordinary literal URL
+ * segment that `./route-map.ts` keeps — which the Pages Router table asserts
+ * directly, with its own row.
+ *
+ * @param testCase The row to run.
+ * @param router The router whose conventions apply to the row's segments.
+ */
+function expectDerivation(testCase: DerivationCase, router: 'app' | 'pages'): void {
+  const derived = deriveRouteFromFile(testCase.file);
+
+  if (testCase.routePath === undefined) {
+    expect(derived).toBeUndefined();
+    return;
+  }
+
+  expect(derived).toBeDefined();
+  if (derived === undefined) {
+    return;
+  }
+
+  expect(derived.routePath).toBe(testCase.routePath);
+  expect(derived.router).toBe(testCase.router);
+  expect(derived.kind).toBe(testCase.kind);
+  expect(derived.dynamicParams).toEqual(testCase.dynamicParams ?? []);
+  expect(derived.isCatchAll).toBe(testCase.isCatchAll ?? false);
+  expect(derived.isOptionalCatchAll).toBe(testCase.isOptionalCatchAll ?? false);
+
+  // The path is POSIX, rooted, unterminated, and exactly its own segments.
+  expect(derived.file).toBe(testCase.file);
+  expect(derived.routePath.startsWith('/')).toBe(true);
+  if (derived.routePath !== '/') {
+    expect(derived.routePath.endsWith('/')).toBe(false);
+  }
+  const rebuiltFromSegments =
+    derived.segments.length === 0
+      ? '/'
+      : `/${derived.segments.map((segment) => segment.raw).join('/')}`;
+  expect(derived.routePath).toBe(rebuiltFromSegments);
+
+  if (router === 'app') {
+    for (const segment of derived.segments) {
+      expect(segment.raw.startsWith('(')).toBe(false);
+      expect(segment.raw.startsWith('@')).toBe(false);
+    }
+  }
 }
 
 const APP_ROUTER_CASES: readonly DerivationCase[] = [
@@ -323,6 +466,15 @@ const APP_ROUTER_CASES: readonly DerivationCase[] = [
     routePath: '/api/reports/[id]',
     router: 'app',
     kind: 'route-handler',
+    dynamicParams: ['id'],
+  },
+  {
+    what: 'two dynamic segments, reported in URL order',
+    file: 'app/[region]/reports/[id]/page.tsx',
+    routePath: '/[region]/reports/[id]',
+    router: 'app',
+    kind: 'page',
+    dynamicParams: ['region', 'id'],
   },
   {
     what: 'a catch-all segment',
@@ -330,6 +482,8 @@ const APP_ROUTER_CASES: readonly DerivationCase[] = [
     routePath: '/api/reports/[...trail]',
     router: 'app',
     kind: 'route-handler',
+    dynamicParams: ['trail'],
+    isCatchAll: true,
   },
   {
     what: 'an optional catch-all segment',
@@ -337,6 +491,9 @@ const APP_ROUTER_CASES: readonly DerivationCase[] = [
     routePath: '/api/reports/[[...trail]]',
     router: 'app',
     kind: 'route-handler',
+    dynamicParams: ['trail'],
+    isCatchAll: true,
+    isOptionalCatchAll: true,
   },
   {
     what: 'a route group, which contributes nothing',
@@ -365,6 +522,7 @@ const APP_ROUTER_CASES: readonly DerivationCase[] = [
     routePath: '/reports/[id]',
     router: 'app',
     kind: 'page',
+    dynamicParams: ['id'],
   },
   {
     what: 'a JavaScript handler module',
@@ -447,6 +605,7 @@ const PAGES_ROUTER_CASES: readonly DerivationCase[] = [
     routePath: '/reports/[id]',
     router: 'pages',
     kind: 'page',
+    dynamicParams: ['id'],
   },
   {
     what: 'the api index, which collapses to its directory',
@@ -463,11 +622,29 @@ const PAGES_ROUTER_CASES: readonly DerivationCase[] = [
     kind: 'route-handler',
   },
   {
+    // The same collapsing rule one level down, which is the shape a legacy
+    // route grows into when a sibling `[id].ts` is added beside it: the
+    // directory becomes the URL and `index` contributes nothing.
+    what: 'a nested api index, which collapses to its own directory',
+    file: 'pages/api/reports/index.ts',
+    routePath: '/api/reports',
+    router: 'pages',
+    kind: 'route-handler',
+  },
+  {
+    what: 'a nested page index, which collapses to its own directory',
+    file: 'pages/reports/index.tsx',
+    routePath: '/reports',
+    router: 'pages',
+    kind: 'page',
+  },
+  {
     what: 'a dynamic api module',
     file: 'pages/api/reports/[id].ts',
     routePath: '/api/reports/[id]',
     router: 'pages',
     kind: 'route-handler',
+    dynamicParams: ['id'],
   },
   {
     what: 'a catch-all api module',
@@ -475,6 +652,8 @@ const PAGES_ROUTER_CASES: readonly DerivationCase[] = [
     routePath: '/api/reports/[...trail]',
     router: 'pages',
     kind: 'route-handler',
+    dynamicParams: ['trail'],
+    isCatchAll: true,
   },
   {
     what: 'an optional catch-all api module',
@@ -482,6 +661,9 @@ const PAGES_ROUTER_CASES: readonly DerivationCase[] = [
     routePath: '/api/reports/[[...trail]]',
     router: 'pages',
     kind: 'route-handler',
+    dynamicParams: ['trail'],
+    isCatchAll: true,
+    isOptionalCatchAll: true,
   },
   {
     what: 'a module named like the api directory, which is a page',
@@ -514,36 +696,61 @@ describe('deriveRouteFromFile', () => {
   describe('App Router', () => {
     for (const testCase of APP_ROUTER_CASES) {
       it(`derives ${testCase.what}`, () => {
-        const derived = deriveRouteFromFile(testCase.file);
-
-        if (testCase.routePath === undefined) {
-          expect(derived).toBeUndefined();
-          return;
-        }
-
-        expect(derived?.routePath).toBe(testCase.routePath);
-        expect(derived?.router).toBe(testCase.router);
-        expect(derived?.kind).toBe(testCase.kind);
-        expect(derived?.file).toBe(testCase.file);
+        expectDerivation(testCase, 'app');
       });
     }
+
+    it('serves a handler module written in every extension the indexer reads', () => {
+      // The set is imported from `./project.ts` rather than restated, because
+      // the rule is "whatever this product indexes, this module can route":
+      // a project mid-migration keeps `route.js` beside `route.ts`, and an
+      // extension the indexer loads but the derivation refuses would drop that
+      // route from the map silently. Adding an extension there must therefore
+      // either extend this module or fail here.
+      for (const extension of INDEXABLE_EXTENSIONS) {
+        const derived = deriveRouteFromFile(`app/api/reports/route${extension}`);
+
+        expect(derived?.routePath).toBe('/api/reports');
+        expect(derived?.kind).toBe('route-handler');
+        expect(derived?.file).toBe(`app/api/reports/route${extension}`);
+      }
+    });
+
+    it('renders a page module written in every extension the indexer reads', () => {
+      for (const extension of INDEXABLE_EXTENSIONS) {
+        const derived = deriveRouteFromFile(`app/reports/page${extension}`);
+
+        expect(derived?.routePath).toBe('/reports');
+        expect(derived?.kind).toBe('page');
+      }
+    });
   });
 
   describe('Pages Router', () => {
     for (const testCase of PAGES_ROUTER_CASES) {
       it(`derives ${testCase.what}`, () => {
-        const derived = deriveRouteFromFile(testCase.file);
-
-        if (testCase.routePath === undefined) {
-          expect(derived).toBeUndefined();
-          return;
-        }
-
-        expect(derived?.routePath).toBe(testCase.routePath);
-        expect(derived?.router).toBe(testCase.router);
-        expect(derived?.kind).toBe(testCase.kind);
+        expectDerivation(testCase, 'pages');
       });
     }
+
+    it('serves only the extensions that router serves, and refuses the rest', () => {
+      // Narrower than the App Router set on purpose: the framework's default
+      // page extensions are the four below, so a `.mjs`, `.cjs`, `.mts` or
+      // `.cts` module under `pages/` answers no URL and claiming one for it
+      // would attribute a captured request to a file that never served it.
+      const served = ['.ts', '.tsx', '.js', '.jsx'];
+
+      for (const extension of INDEXABLE_EXTENSIONS) {
+        const derived = deriveRouteFromFile(`pages/api/reports${extension}`);
+
+        if (served.includes(extension)) {
+          expect(derived?.routePath).toBe('/api/reports');
+          expect(derived?.router).toBe('pages');
+        } else {
+          expect(derived).toBeUndefined();
+        }
+      }
+    });
   });
 
   it('classifies every segment kind', () => {
@@ -1447,13 +1654,105 @@ describe('buildRouteMap: the origins the map answers for', () => {
  * ---------------------------------------------------------------------------
  */
 
-/** The corpus, opened read-only exactly as a consumer opens a developer's project. */
-function openCorpus(): LoadedProject {
+/**
+ * The corpus, and the two maps built over it.
+ *
+ * Both maps are held here rather than rebuilt per case because both are
+ * *derived values of one input*: the ts-morph map is what `buildRouteMap`
+ * answers for this project, the index-backed map is what a reopened session
+ * answers for the same project, and a case that rebuilt either would be
+ * asserting the same construction again rather than the behaviour it is about.
+ */
+interface Corpus {
+  /** The opened project: parsed once, read-only, never written to. */
+  readonly loaded: LoadedProject;
+
+  /** What `buildRouteMap` answers for it — the reference every case compares to. */
+  readonly map: RouteMap;
+
+  /**
+   * The index `./indexer.ts` produced for the same project, cache disabled.
+   *
+   * Held alongside the map it was rebuilt into so a case can assert what the
+   * *extractor* contributed — one `api-route` node per route module — rather
+   * than only what resolving through the rebuilt map happens to produce.
+   */
+  readonly index: CodeIndex;
+
+  /**
+   * The same map rebuilt by `routeMapFromIndex` from a **real** index of the
+   * same project, produced by `./indexer.ts` with the cache disabled.
+   *
+   * Built from a real index rather than from nodes assembled by hand in this
+   * file: the contract a reopened session depends on is that the *extractor's*
+   * node payload is enough to resolve with, and a hand-built node proves only
+   * that this suite and `./route-map.ts` agree on a shape.
+   */
+  readonly fromIndex: RouteMap;
+}
+
+/**
+ * The shared corpus, assigned once by the hook below.
+ *
+ * `undefined` until then, and read through {@link theCorpus} rather than
+ * directly, so a hook that did not run reports itself instead of surfacing as
+ * a `TypeError` inside an unrelated assertion.
+ */
+let corpus: Corpus | undefined;
+
+/**
+ * Opens the corpus once for the whole file, and builds both maps over it.
+ *
+ * Once rather than per case, for two reasons that both matter here.
+ * Constructing the ts-morph program is by far the most expensive thing this
+ * suite does — every other group is pure string work — and re-opening it for
+ * each of the cases below would pay for it once per case. And sharing is safe
+ * by construction: `openProject` parses and never writes, nothing in this file
+ * writes either, `sourceFiles()` is frozen, and both maps and every entry and
+ * location in them are frozen — so the fixture a run leaves behind is
+ * byte-identical to the one it started with, which is what keeps
+ * `git status packages/code-analysis` empty after a run.
+ *
+ * The explicit timeout replaces the 10 s default because this hook is the one
+ * thing in the file that parses a program and runs the extractor pipeline, and
+ * a busy machine timing it out would fail all of the cases below for a reason
+ * that is not a defect. It is a ceiling, not a budget: the work takes well
+ * under a second.
+ */
+beforeAll(async () => {
   const opened = openProject({ projectRoot: FIXTURE_ROOT });
   if (!opened.ok) {
     throw new Error(`the corpus did not open: ${opened.error.message}`);
   }
-  return opened.value;
+  const loaded = opened.value;
+
+  // `loaded` so the index describes this exact program rather than a second
+  // one opened behind our back, and `cache: false` because a cache write is a
+  // file this suite has no business creating — the read-only promise above is
+  // the whole reason the corpus can be shared.
+  const indexed = await indexProject({ projectRoot: FIXTURE_ROOT, loaded, cache: false });
+  if (!indexed.ok) {
+    throw new Error(`the corpus did not index: ${indexed.error.message}`);
+  }
+
+  corpus = {
+    loaded,
+    map: buildRouteMap(loaded),
+    index: indexed.value.index,
+    fromIndex: routeMapFromIndex(indexed.value.index),
+  };
+}, 30_000);
+
+/**
+ * The shared corpus.
+ *
+ * @returns The opened project and the two maps over it.
+ */
+function theCorpus(): Corpus {
+  if (corpus === undefined) {
+    throw new Error('the corpus was not opened: the beforeAll hook did not run');
+  }
+  return corpus;
 }
 
 /** Every route of the corpus, in the inventory order the map must report. */
@@ -1509,6 +1808,17 @@ interface CorpusRequest {
 
   /** The parameters that must be captured. */
   readonly params: Readonly<Record<string, string | readonly string[]>>;
+
+  /**
+   * The normalised pathname the match must report, when the row is about what
+   * the resolver strips or decodes.
+   *
+   * Stated only for those rows: it is how "the query was ignored", "the
+   * fragment was ignored", "the trailing slash was ignored" and "the segment
+   * was decoded" are asserted as *outcomes* rather than inferred from the fact
+   * that some route matched.
+   */
+  readonly pathname?: string;
 }
 
 const CORPUS_REQUESTS: readonly CorpusRequest[] = [
@@ -1533,6 +1843,42 @@ const CORPUS_REQUESTS: readonly CorpusRequest[] = [
     file: 'app/(observatory)/api/basins/[...segments]/route.ts',
     params: { segments: ['north', 'deep'] },
   },
+  {
+    // Three trailing segments, because a catch-all that only ever sees two
+    // could be a pair of dynamic segments and nothing here would notice.
+    url: '/api/basins/north/deep/alpha',
+    file: 'app/(observatory)/api/basins/[...segments]/route.ts',
+    params: { segments: ['north', 'deep', 'alpha'] },
+  },
+  {
+    url: '/api/gauges/north-01?window=7d#chart',
+    method: 'GET',
+    file: 'app/api/gauges/[id]/route.ts',
+    params: { id: 'north-01' },
+    pathname: '/api/gauges/north-01',
+  },
+  {
+    url: '/api/gauge-log#latest',
+    file: 'pages/api/gauge-log.ts',
+    params: {},
+    pathname: '/api/gauge-log',
+  },
+  {
+    // An encoded separator stays inside the segment it was written in: one
+    // parameter holding `north/01`, never a path of two segments — which is
+    // the difference between resolving this dynamic route and missing it.
+    url: '/api/gauges/north%2F01',
+    method: 'GET',
+    file: 'app/api/gauges/[id]/route.ts',
+    params: { id: 'north/01' },
+    pathname: '/api/gauges/north/01',
+  },
+  {
+    url: '/api/basins/nord-%C3%B8st',
+    file: 'app/(observatory)/api/basins/[...segments]/route.ts',
+    params: { segments: ['nord-øst'] },
+    pathname: '/api/basins/nord-øst',
+  },
   { url: '/api/gauge-log', method: 'POST', file: 'pages/api/gauge-log.ts', params: {} },
   { url: '/api/gauge-log', file: 'pages/api/gauge-log.ts', params: {} },
   {
@@ -1544,7 +1890,7 @@ const CORPUS_REQUESTS: readonly CorpusRequest[] = [
 
 describe('buildRouteMap over the sample application', () => {
   it('reports every route of the corpus, and nothing else', () => {
-    const map = buildRouteMap(openCorpus());
+    const { map } = theCorpus();
 
     expect(
       map.entries.map((entry) => ({
@@ -1561,16 +1907,92 @@ describe('buildRouteMap over the sample application', () => {
     const label = request.method === undefined ? request.url : `${request.method} ${request.url}`;
 
     it(`resolves ${label}`, () => {
-      const map = buildRouteMap(openCorpus());
+      const { map } = theCorpus();
       const match = map.resolve(request.url, request.method);
 
       expect(match?.entry.file).toBe(request.file);
       expect(match?.params).toEqual(request.params);
+
+      if (request.pathname !== undefined) {
+        expect(match?.pathname).toBe(request.pathname);
+      }
     });
   }
 
+  it('captures the segments a catch-all swallowed as an array', () => {
+    // `toEqual` above is satisfied by a string that merely looks right, and
+    // the panel's request and trace views index these values positionally, so
+    // the container type is asserted rather than assumed.
+    const { map } = theCorpus();
+    const captured = map.resolve('/api/basins/north/deep/alpha')?.params['segments'];
+
+    expect(Array.isArray(captured)).toBe(true);
+    expect(captured).toEqual(['north', 'deep', 'alpha']);
+  });
+
+  it('answers a full URL exactly as it answers the same pathname on its own', () => {
+    // A captured `http.server` span carries a path and a captured `fetch` span
+    // carries the whole URL; one interaction produces both, and a developer
+    // clicking either must land in the same module.
+    const { map } = theCorpus();
+
+    for (const pathname of ['/', '/api/gauges', '/api/gauges/north-01', '/api/basins/north/deep']) {
+      const viaPath = map.resolve(pathname);
+      const viaUrl = map.resolve(`http://127.0.0.1:3000${pathname}`);
+
+      expect(viaUrl?.entry.file).toBe(viaPath?.entry.file);
+      expect(viaUrl?.params).toEqual(viaPath?.params);
+      expect(viaUrl?.pathname).toBe(viaPath?.pathname);
+
+      // The one difference, and it is additive: an absolute URL reports the
+      // origin it was accepted for, a bare pathname has none to report.
+      expect(viaUrl?.origin?.origin).toBe('http://127.0.0.1:3000');
+      expect(viaPath?.origin).toBeUndefined();
+    }
+  });
+
+  it('refuses a malformed request rather than throwing', () => {
+    // These arrive from a captured span attribute or a field a developer typed,
+    // so the resolver is the wrong place for an exception: a session would fail
+    // at a stage whose input was merely unreadable.
+    const { map } = theCorpus();
+
+    for (const url of ['http://[bad/api/gauges', 'http://', '/api/gauges/%E0%A4%A', '', '   ']) {
+      expect(map.resolve(url)).toBeUndefined();
+    }
+  });
+
+  it('answers every method for the legacy handler that dispatches on its own', () => {
+    // `ANY` is what a single default-exported entry point reports, and the
+    // fixture's handler does branch on `req.method` itself, so every verb a
+    // consumer can ask about has to reach it — including the ones it answers
+    // with 405, which is its decision to make and not this map's.
+    const { map } = theCorpus();
+
+    for (const method of HTTP_METHOD_NAMES) {
+      expect(map.resolve('/api/gauge-log', method)?.entry.file).toBe('pages/api/gauge-log.ts');
+    }
+  });
+
+  it('answers only the two methods the multi-handler module exports', () => {
+    const { map } = theCorpus();
+    const declared: readonly HttpMethod[] = ['GET', 'POST'];
+
+    for (const method of HTTP_METHOD_NAMES) {
+      const match = map.resolve('/api/gauges', method);
+
+      // `ANY` as a *question* means "whatever answers this path", so it
+      // matches; every other undeclared verb does not.
+      if (declared.includes(method) || method === 'ANY') {
+        expect(match?.entry.file).toBe('app/api/gauges/route.ts');
+      } else {
+        expect(match).toBeUndefined();
+      }
+    }
+  });
+
   it('resolves nothing for a path no module serves', () => {
-    const map = buildRouteMap(openCorpus());
+    const { map } = theCorpus();
 
     // The catch-all needs at least one segment, the dynamic route exactly one,
     // and a route group never appears in a URL.
@@ -1581,14 +2003,14 @@ describe('buildRouteMap over the sample application', () => {
   });
 
   it('refuses a method the matched module does not export', () => {
-    const map = buildRouteMap(openCorpus());
+    const { map } = theCorpus();
 
     expect(map.resolve('/api/gauges', 'DELETE')).toBeUndefined();
     expect(map.resolve('/api/gauges/north-01', 'POST')).toBeUndefined();
   });
 
   it('locates each exported method of a multi-handler module at its declaration', () => {
-    const map = buildRouteMap(openCorpus());
+    const { map } = theCorpus();
     const entry = entryForFile(map, 'app/api/gauges/route.ts');
     const get = entry.methodLocations?.['GET'];
     const post = entry.methodLocations?.['POST'];
@@ -1603,7 +2025,7 @@ describe('buildRouteMap over the sample application', () => {
   });
 
   it('locates the handler of a dynamic module and of a grouped catch-all module', () => {
-    const map = buildRouteMap(openCorpus());
+    const { map } = theCorpus();
 
     for (const file of [
       'app/api/gauges/[id]/route.ts',
@@ -1619,7 +2041,7 @@ describe('buildRouteMap over the sample application', () => {
   });
 
   it('names the component of each page and the function of the legacy handler', () => {
-    const map = buildRouteMap(openCorpus());
+    const { map } = theCorpus();
     const legacy = entryForFile(map, 'pages/api/gauge-log.ts');
 
     expect(entryForFile(map, 'app/page.tsx').location.symbol).toBe('BasinIndexPage');
@@ -1633,13 +2055,23 @@ describe('buildRouteMap over the sample application', () => {
   });
 
   it('points every location at a project-relative path inside the project', () => {
-    const map = buildRouteMap(openCorpus());
+    const { map } = theCorpus();
+
+    expect(map.entries.length).toBeGreaterThan(0);
 
     for (const entry of map.entries) {
-      expect(entry.location.file).toBe(entry.file);
-      expect(entry.location.file.startsWith('/')).toBe(false);
-      expect(entry.location.line).toBeGreaterThanOrEqual(1);
-      expect(entry.location.column).toBeGreaterThanOrEqual(1);
+      expectRouteMapLocation(entry.location, entry.file);
+
+      // The line is real code in the file the location names, not a position
+      // past its end: a chip that opens an editor on line 40 of a 12-line
+      // module is a worse answer than no chip at all.
+      expect(corpusLine(entry.location.file, entry.location.line).length).toBeGreaterThan(0);
+
+      for (const [method, location] of Object.entries(entry.methodLocations ?? {})) {
+        expect(HTTP_METHOD_NAMES).toContain(method);
+        expectRouteMapLocation(location, entry.file);
+        expect(corpusLine(location.file, location.line)).toContain(method);
+      }
     }
   });
 });
@@ -1691,7 +2123,7 @@ function apiRouteNode(options: {
 
 describe('routeMapFromIndex', () => {
   it('resolves every corpus request exactly as the ts-morph-built map does', () => {
-    const fromProject = buildRouteMap(openCorpus());
+    const fromProject = theCorpus().map;
     const fromIndex = routeMapFromIndex(indexFromMap(fromProject, toPosix(FIXTURE_ROOT)));
 
     expect(fromIndex.entries.map((entry) => entry.routePath)).toEqual(
@@ -1717,7 +2149,7 @@ describe('routeMapFromIndex', () => {
   });
 
   it('carries the node location and no per-method locations', () => {
-    const fromProject = buildRouteMap(openCorpus());
+    const fromProject = theCorpus().map;
     const fromIndex = routeMapFromIndex(indexFromMap(fromProject, toPosix(FIXTURE_ROOT)));
     const entry = entryForFile(fromIndex, 'app/api/gauges/route.ts');
 
@@ -1820,7 +2252,7 @@ describe('routeMapFromIndex', () => {
     // The parity a reopened session depends on: the answer a developer gets
     // must not depend on whether the index came from a compiler or from disk,
     // and that includes every URL the policy refuses.
-    const fromProject = buildRouteMap(openCorpus());
+    const fromProject = theCorpus().map;
     const fromIndex = routeMapFromIndex(indexFromMap(fromProject, toPosix(FIXTURE_ROOT)));
 
     for (const url of [
@@ -1850,11 +2282,10 @@ describe('routeMapFromIndex', () => {
 
   it('answers for the origins it was rebuilt with, exactly as a built map does', () => {
     const origins = ['https://dev.internal:8443'];
-    const fromProject = buildRouteMap(openCorpus(), { origins });
-    const fromIndex = routeMapFromIndex(
-      indexFromMap(buildRouteMap(openCorpus()), toPosix(FIXTURE_ROOT)),
-      { origins },
-    );
+    const fromProject = buildRouteMap(theCorpus().loaded, { origins });
+    const fromIndex = routeMapFromIndex(indexFromMap(theCorpus().map, toPosix(FIXTURE_ROOT)), {
+      origins,
+    });
 
     for (const url of [
       'https://dev.internal:8443/api/gauges',
@@ -1873,5 +2304,106 @@ describe('routeMapFromIndex', () => {
       'app/api/gauges/route.ts',
     );
     expect(fromIndex.resolve('http://127.0.0.1:3000/api/gauges')).toBeUndefined();
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * 5. The reopened-session path, over a real index
+ * ---------------------------------------------------------------------------
+ */
+
+describe('routeMapFromIndex over a real index of the sample application', () => {
+  /**
+   * The fields resolution depends on, for one entry.
+   *
+   * Compared as one object rather than field by field so a divergence names
+   * every field that moved instead of failing on the first one.
+   *
+   * @param entry The entry to describe.
+   * @returns The comparable projection.
+   */
+  function resolutionFields(entry: RouteEntry): Record<string, unknown> {
+    return {
+      routePath: entry.routePath,
+      router: entry.router,
+      kind: entry.kind,
+      file: entry.file,
+      methods: [...entry.methods],
+      dynamicParams: [...entry.dynamicParams],
+      isCatchAll: entry.isCatchAll,
+      isOptionalCatchAll: entry.isOptionalCatchAll,
+    };
+  }
+
+  it('holds one api-route node per route module, and no more', () => {
+    // The extractor's contract, and the reason a single node is enough to
+    // rebuild an entry from: a second node for a two-method module would make
+    // this map report that route twice and disagree with the built one.
+    const { index, map } = theCorpus();
+    const routeNodes = index.nodes.filter((node) => node.kind === 'api-route');
+
+    expect(routeNodes).toHaveLength(map.entries.length);
+    expect(routeNodes.map((node) => node.name).sort()).toEqual(
+      map.entries.map((entry) => entry.routePath).sort(),
+    );
+  });
+
+  it('rebuilds the same inventory the compiler-built map reports', () => {
+    const { map, fromIndex } = theCorpus();
+
+    expect(fromIndex.entries.map(resolutionFields)).toEqual(map.entries.map(resolutionFields));
+  });
+
+  it('resolves every corpus request to the same module, path and methods', () => {
+    // This is the reopened session of AAP 0.4.2: the index came back from
+    // `$DEBUGGEN_HOME/index` as plain JSON, ts-morph was never started, and a
+    // captured span still has to resolve to a file. A divergence here is not a
+    // test detail — it is a developer clicking a span in a reopened session
+    // and landing somewhere else than they would have an hour earlier.
+    const { map, fromIndex } = theCorpus();
+
+    for (const request of CORPUS_REQUESTS) {
+      const expected = map.resolve(request.url, request.method);
+      const actual = fromIndex.resolve(request.url, request.method);
+
+      expect(actual?.entry.file).toBe(request.file);
+      expect(actual?.entry.file).toBe(expected?.entry.file);
+      expect(actual?.entry.routePath).toBe(expected?.entry.routePath);
+      expect(actual?.entry.router).toBe(expected?.entry.router);
+      expect(actual?.entry.methods).toEqual(expected?.entry.methods);
+      expect(actual?.params).toEqual(expected?.params);
+      expect(actual?.pathname).toBe(expected?.pathname);
+      expect(actual?.origin).toEqual(expected?.origin);
+    }
+  });
+
+  it('answers the same nothing for a request the corpus does not serve', () => {
+    const { map, fromIndex } = theCorpus();
+
+    for (const url of [
+      '/api/basins',
+      '/api/gauges/north-01/extra',
+      '/observatory/basins/7',
+      'http://[bad/api/gauges',
+      'https://api.example.test/api/gauges',
+    ]) {
+      expect(map.resolve(url)).toBeUndefined();
+      expect(fromIndex.resolve(url)).toBeUndefined();
+    }
+  });
+
+  it('carries a location the source-open path accepts, and no per-method ones', () => {
+    // `methodLocations` is not part of the node payload, so a rebuilt entry
+    // reports none — which is documented and harmless, because it plays no
+    // part in resolution. The entry's own location, on the other hand, is what
+    // the chip opens, so it holds the whole contract.
+    const { map, fromIndex } = theCorpus();
+
+    for (const entry of fromIndex.entries) {
+      expectRouteMapLocation(entry.location, entry.file);
+      expect(entry.location).toEqual(entryForFile(map, entry.file).location);
+      expect(entry.methodLocations).toBeUndefined();
+    }
   });
 });

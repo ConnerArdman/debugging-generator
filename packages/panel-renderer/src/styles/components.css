@@ -1759,95 +1759,130 @@
  * `layout/Split`, from `layout/Toolbar` or from a component's own internal
  * padding — never from a margin between siblings.
  *
- * The base gap is overridable inline through `--dgc-stack-gap`; the `--gap-n`
- * modifiers map one-to-one onto the eight space tokens and are declared after
- * the base, so a modifier wins over the inline default.
+ * Two flow contexts, because the component renders two parts: the BLOCK is a
+ * column holding an optional header above the items, and `__items` is the flow
+ * container the children sit in. Every modifier the component emits — axis,
+ * gap step, cross-axis alignment, main-axis distribution, wrapping — is
+ * declared on the block and resolved onto `__items` with a child selector, so
+ * a container's heading keeps its own spacing whatever its items do: a caller
+ * asking for the widest step between items does not thereby push the heading
+ * away from them. The child combinator also confines every rule to one level,
+ * so a nested container is arranged by its own modifiers and never by its
+ * parent's.
+ *
+ * The `--gap-n` modifiers map one-to-one onto the eight space tokens and are
+ * declared after the base, so a modifier wins over the default step.
  * ========================================================================== */
 
 .dg-stack {
   display: flex;
   flex-direction: column;
-  gap: var(--dgc-stack-gap, var(--dg-space-3));
+  gap: var(--dg-space-3);
   min-inline-size: 0;
 }
 
-.dg-stack--row {
-  flex-direction: row;
+/* The labelled-group header: the heading and its supporting line, tighter than
+ * the block gap so the two read as one unit above the items. */
+.dg-stack__header {
+  display: flex;
+  flex-direction: column;
+  gap: var(--dg-space-1);
+  min-inline-size: 0;
 }
 
-.dg-stack--column {
+/* The heading primitive owns its type role; this contributes shrinking only, so
+ * a long title clips inside the container instead of widening it. */
+.dg-stack__title {
+  min-inline-size: 0;
+}
+
+/* The flow container. Its own defaults mirror the component's — a vertical
+ * sequence at the ordinary interface step, stretched across the cross axis —
+ * so an unmodified container needs no modifier to be laid out correctly. */
+.dg-stack__items {
+  display: flex;
+  flex-direction: column;
+  gap: var(--dg-space-3);
+  min-inline-size: 0;
+}
+
+.dg-stack--vertical > .dg-stack__items {
   flex-direction: column;
 }
 
-.dg-stack--wrap {
+.dg-stack--horizontal > .dg-stack__items {
+  flex-direction: row;
+}
+
+.dg-stack--wrap > .dg-stack__items {
   flex-wrap: wrap;
 }
 
-.dg-stack--gap-0 {
+.dg-stack--gap-0 > .dg-stack__items {
   gap: var(--dg-space-0);
 }
 
-.dg-stack--gap-1 {
+.dg-stack--gap-1 > .dg-stack__items {
   gap: var(--dg-space-1);
 }
 
-.dg-stack--gap-2 {
+.dg-stack--gap-2 > .dg-stack__items {
   gap: var(--dg-space-2);
 }
 
-.dg-stack--gap-3 {
+.dg-stack--gap-3 > .dg-stack__items {
   gap: var(--dg-space-3);
 }
 
-.dg-stack--gap-4 {
+.dg-stack--gap-4 > .dg-stack__items {
   gap: var(--dg-space-4);
 }
 
-.dg-stack--gap-5 {
+.dg-stack--gap-5 > .dg-stack__items {
   gap: var(--dg-space-5);
 }
 
-.dg-stack--gap-6 {
+.dg-stack--gap-6 > .dg-stack__items {
   gap: var(--dg-space-6);
 }
 
-.dg-stack--gap-7 {
+.dg-stack--gap-7 > .dg-stack__items {
   gap: var(--dg-space-7);
 }
 
-.dg-stack--align-start {
+.dg-stack--align-start > .dg-stack__items {
   align-items: start;
 }
 
-.dg-stack--align-center {
+.dg-stack--align-center > .dg-stack__items {
   align-items: center;
 }
 
-.dg-stack--align-end {
+.dg-stack--align-end > .dg-stack__items {
   align-items: end;
 }
 
-.dg-stack--align-baseline {
+.dg-stack--align-baseline > .dg-stack__items {
   align-items: baseline;
 }
 
-.dg-stack--align-stretch {
+.dg-stack--align-stretch > .dg-stack__items {
   align-items: stretch;
 }
 
-.dg-stack--justify-start {
+.dg-stack--justify-start > .dg-stack__items {
   justify-content: start;
 }
 
-.dg-stack--justify-center {
+.dg-stack--justify-center > .dg-stack__items {
   justify-content: center;
 }
 
-.dg-stack--justify-end {
+.dg-stack--justify-end > .dg-stack__items {
   justify-content: end;
 }
 
-.dg-stack--justify-between {
+.dg-stack--justify-between > .dg-stack__items {
   justify-content: space-between;
 }
 

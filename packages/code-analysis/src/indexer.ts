@@ -22,6 +22,7 @@
  * this module         prepareFiles         → the indexable set, capped, with one fingerprint each
  * ./extractors/*.ts   extract(ctx)         → nodes, edges and diagnostics, per file
  * this module         assemble             → the CodeIndex envelope
+ * this module         link                 → the derived `routes-to` edges
  * ./graph/graph.ts    CodeGraph.fromIndex  → validation, de-duplication, canonical order
  * ./route-map.ts      buildRouteMap        → the URL→module map that rides along
  * ./cache.ts          save                 → best effort, never load-bearing
@@ -86,6 +87,29 @@
  * target project's dependencies are never installed: a specifier that resolves
  * to nothing must cost an edge, never a crash.
  *
+ * ## Linking: the one edge no extractor can emit
+ *
+ * `routes-to` joins a client `api-call` node to the `api-route` node it
+ * addresses, and `./graph/types.ts` fixes it as *"a call's URL matched against
+ * the route map … produced after both endpoints exist, which is why it is the
+ * one edge kind an extractor cannot emit on its own"*. An extractor sees one
+ * file, and the two endpoints of this edge are in different files by
+ * construction — the call site in a component or a client helper, the handler
+ * in a route module — so `./extractors/api-calls.ts`,
+ * `./extractors/server-functions.ts` and `./extractors/db-calls.ts` each state
+ * that they do not produce it and defer to graph assembly.
+ * {@link deriveRoutesToEdges} is that deferral discharged: it runs once, after
+ * extraction, over the assembled envelope, and delegates every URL decision to
+ * `./route-map.ts` so no second matching algorithm exists.
+ *
+ * It is the hop that makes a cross-tier flow a single traversal — a click, the
+ * handler it triggers, the request that handler issues, the route that answers
+ * it, the service function behind it, the query that function runs — which is
+ * what `./graph/query.ts`'s `pathBetween` walks for Stage 2 and what the
+ * dependency-graph panel node draws (AAP 0.4.2, 0.6.2). Without it the browser
+ * half and the server half of a project are two disconnected components of one
+ * graph and no path spans them.
+ *
  * ## Privacy
  *
  * **File contents never leave this module.** What crosses its boundary is
@@ -126,7 +150,7 @@ import { importsExtractor } from './extractors/imports.js';
 import { reactComponentsExtractor } from './extractors/react-components.js';
 import { serverFunctionsExtractor } from './extractors/server-functions.js';
 import { symbolsExtractor } from './extractors/symbols.js';
-import { CodeGraph } from './graph/graph.js';
+import { CodeGraph, makeEdgeId } from './graph/graph.js';
 import { CODE_INDEX_SCHEMA_VERSION } from './graph/types.js';
 import { discoverProjectFiles, openProject } from './project.js';
 import { buildRouteMap, routeMapFromIndex } from './route-map.js';
@@ -252,6 +276,12 @@ const EMPTY_DURATIONS: Readonly<Record<string, number>> = Object.freeze({});
 
 /** The answer to a reference lookup that found nothing. Shared, frozen. */
 const EMPTY_LOCATIONS: readonly SourceLocation[] = Object.freeze([]);
+
+/**
+ * The derived-edge list of a project whose call sites reached no route. Shared,
+ * frozen.
+ */
+const EMPTY_EDGES: readonly CodeEdge[] = Object.freeze([]);
 
 /**
  * How many declarations of one name {@link createReferenceResolver} will search
@@ -1247,9 +1277,21 @@ function extractAll(
     }
   }
 
-  const graph = CodeGraph.fromIndex(assembleIndex(loaded, prepared, collector), {
-    logger: options.logger,
-  });
+  // Linking runs between assembly and construction: it needs every node of the
+  // project, and the edges it derives have to pass through the graph's own
+  // validation and canonical ordering like any other.
+  const assembled = assembleIndex(loaded, prepared, collector);
+  const routesTo = deriveRoutesToEdges(assembled);
+  if (routesTo.length > 0) {
+    options.logger.debug('derived route edges from call sites with literal URLs', {
+      edges: routesTo.length,
+    });
+  }
+
+  const graph = CodeGraph.fromIndex(
+    routesTo.length === 0 ? assembled : { ...assembled, edges: [...assembled.edges, ...routesTo] },
+    { logger: options.logger },
+  );
 
   const extractorDurations: Record<string, number> = {};
   for (const extractor of options.extractors) {
@@ -1303,6 +1345,96 @@ function assembleIndex(
   }
 
   return { ...envelope, diagnostics: collector.diagnostics };
+}
+
+/**
+ * Derives the `routes-to` edges of an assembled envelope: one per call site
+ * whose literal URL a route of this project answers.
+ *
+ * The linking stage described on this module, and the only place in the package
+ * that produces this edge kind. Three properties make it safe to run over every
+ * index:
+ *
+ * - **It decides nothing about URLs.** Matching, percent-decoding, route
+ *   groups, dynamic and catch-all segments, specificity and the origin policy
+ *   all belong to `./route-map.ts`, which is asked through the same
+ *   {@link RouteMap.resolve} a query uses. A call to an absolute URL on another
+ *   origin therefore resolves to nothing and contributes no edge, rather than
+ *   being joined to a local route whose path happens to coincide.
+ * - **It only joins what was written.** Only an `api-call` node carrying a
+ *   literal, non-dynamic `url` is considered: `./extractors/api-calls.ts`
+ *   records a target *exactly as written or not at all*, and a template
+ *   literal whose interpolation is unknown must not acquire an edge to whatever
+ *   route its prefix resembles. The method is deliberately not part of the
+ *   match — the edge states that a call site addresses a route module, which is
+ *   a fact about the URL, and a route whose handler exports could not be
+ *   located reports no methods at all.
+ * - **It is derived, so it has no site.** `./graph/graph.ts` documents a
+ *   `routes-to` edge as the canonical example of an edge *"computed from two
+ *   nodes rather than read off a line of source"*, so it carries no
+ *   `file`/`line`/`column` and its id is position-free. The call site a
+ *   developer opens is the `api-call` node's own position, which
+ *   `./graph/query.ts` mints from the node.
+ *
+ * Deterministic: candidates are walked in the envelope's node order and the
+ * route node for a file is chosen by lowest `id`, so a module with more than
+ * one `api-route` node resolves to the same one on every run, and duplicate
+ * ids — two call sites of the same URL in one function, an id an extractor
+ * already claimed — are dropped here rather than reported by graph
+ * construction.
+ *
+ * @param index The assembled envelope, before graph construction.
+ * @returns The derived edges, or {@link EMPTY_EDGES} when nothing matched.
+ */
+function deriveRoutesToEdges(index: CodeIndex): readonly CodeEdge[] {
+  const routes = routeMapFromIndex(index);
+  if (routes.entries.length === 0) {
+    return EMPTY_EDGES;
+  }
+
+  // Lowest id per file, so the choice does not depend on extractor order.
+  const routeNodeByFile = new Map<string, CodeNode>();
+  for (const node of index.nodes) {
+    if (node.kind !== 'api-route') {
+      continue;
+    }
+    const held = routeNodeByFile.get(node.file);
+    if (held === undefined || node.id < held.id) {
+      routeNodeByFile.set(node.file, node);
+    }
+  }
+
+  if (routeNodeByFile.size === 0) {
+    return EMPTY_EDGES;
+  }
+
+  const claimed = new Set<string>(index.edges.map((edge) => edge.id));
+  const derived: CodeEdge[] = [];
+
+  for (const node of index.nodes) {
+    if (node.kind !== 'api-call' || node.data.dynamic || node.data.url === undefined) {
+      continue;
+    }
+
+    const match = routes.resolve(node.data.url);
+    if (match === undefined) {
+      continue;
+    }
+
+    const routeNode = routeNodeByFile.get(match.entry.file);
+    if (routeNode === undefined) {
+      continue;
+    }
+
+    const id = makeEdgeId({ kind: 'routes-to', from: node.id, to: routeNode.id });
+    if (claimed.has(id)) {
+      continue;
+    }
+    claimed.add(id);
+    derived.push({ id, kind: 'routes-to', from: node.id, to: routeNode.id });
+  }
+
+  return derived.length === 0 ? EMPTY_EDGES : derived;
 }
 
 /**
