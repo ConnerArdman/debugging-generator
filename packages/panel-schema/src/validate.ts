@@ -282,9 +282,11 @@ export function isPanelValidationIssueCode(value: unknown): value is PanelValida
 /**
  * The code raised for a node this module cannot classify.
  *
- * Named as a constant rather than written at its two call sites because a third
- * place *reads* it: {@link collectPanelSpecIssues} tests for it when the shared
- * traversal refuses to walk past such a node.
+ * Named as a constant rather than written at each of its call sites because both
+ * of them report the *same* condition about different evidence — a node position
+ * holding something that is not an object at all, and a node whose declared type
+ * the catalog does not carry — and a reader of a rejection must not have to
+ * discover that from two spellings.
  */
 const UNKNOWN_NODE_TYPE_CODE: PanelValidationIssueCode = 'panel_node_type_unknown';
 
@@ -930,9 +932,10 @@ function collectSummaryIssues(summary: unknown): PanelValidationIssue[] {
  * a rule depends on is read at runtime rather than trusted, a node type the
  * catalog does not know ends that node's per-type checks instead of reaching a
  * lookup, a `layout` that is not an array is left entirely to the schema that
- * owns the field's shape, and the one thing the shared traversal itself refuses
- * to walk — a node type outside the node union — is handled where it is caught
- * below.
+ * owns the field's shape, and the node shapes the shared traversal itself
+ * cannot walk past — a node type outside the node union, a container whose
+ * children are not an array — are handled where they are caught below, each
+ * after the node at fault has been reported.
  *
  * **Reports shape, never content.** Each issue carries a path, a code from
  * {@link PANEL_VALIDATION_ISSUE_CODES} and, where the issue is about a
@@ -980,19 +983,32 @@ export function collectPanelSpecIssues(spec: PanelSpec): readonly PanelValidatio
       issues.push(...collectNodeIssues(node, path, seenIds));
     });
   } catch (cause) {
-    // `./spec.ts`'s traversal ends its children lookup in `assertNever`, which
-    // throws for a node whose type is outside the node *union* — a document that
-    // never passed `panelSpecSchema`, since its discriminated union rejects one.
-    // The visitor runs before that lookup, so the offending node has already
-    // been reported by the time the traversal gives up, and the document is
-    // rejected either way; what the walk cannot do is carry on past it, so the
-    // nodes after it go unreported and the issue list is the prefix up to the
-    // node at fault.
+    // `./spec.ts`'s traversal reaches a node's children through a switch that
+    // ends in `assertNever` and then reads `length` off what that switch
+    // returned. Both steps hold for any document that passed `panelSpecSchema`,
+    // and both can fail for one a caller *asserted* rather than parsed — the
+    // case this function documents itself as safe for:
     //
-    // Only that case is absorbed. Anything else thrown from here is a defect in
-    // this module, and swallowing it would hide a bug inside the very function
-    // whose job is to report one.
-    if (!issues.some((issue) => issue.code === UNKNOWN_NODE_TYPE_CODE)) {
+    // - a node whose `type` is outside the node *union* reaches `assertNever`,
+    //   which throws;
+    // - a container whose `children` is not an array — absent, `null`, an
+    //   object — is returned as it stands and the length read throws a
+    //   `TypeError`.
+    //
+    // In both, the node at fault has already been reported by the visitor, as
+    // `panel_node_type_unknown` or as `panel_node_children_missing`, because the
+    // visitor runs before the children lookup. The document is therefore
+    // rejected either way; what the walk cannot do is carry on past that node,
+    // so the nodes after it go unreported and the issue list is the prefix up to
+    // the node at fault.
+    //
+    // A throw with **nothing** reported is explained by no rule here, so it is a
+    // defect in this module and is re-raised: swallowing it would hide a bug
+    // inside the very function whose job is to report one. Keeping the reported
+    // issues in that decision — rather than testing for one specific code — is
+    // what makes the non-throwing promise hold for every malformed node shape an
+    // unparsed document can carry, instead of for one of them.
+    if (issues.length === 0) {
       throw cause;
     }
   }
