@@ -1297,6 +1297,18 @@
   min-inline-size: 0;
 }
 
+/* The other half of the `min-inline-size: 0` above, and the half that actually
+ * keeps a wrapped trigger inside its box. An inline-flex wrapper with no maximum
+ * sizes to its content, so the container's width never reaches the trigger, and
+ * the trigger's own `overflow: hidden; text-overflow: ellipsis` has nothing to
+ * clip against: a described chip in a narrow table cell would push past the cell
+ * and paint over its neighbour instead of truncating. Relational, not a length —
+ * a trigger is simply never wider than the box it sits in. */
+.dg-tooltip,
+.dg-tooltip__trigger {
+  max-inline-size: 100%;
+}
+
 /* Paint only — see the note above about `dg-visually-hidden`. */
 .dg-tooltip__bubble {
   background: var(--dg-surface-overlay);
@@ -3390,6 +3402,85 @@
 .dg-source-link.dg-is-unresolved .dg-source-link__symbol,
 .dg-source-link.dg-is-unresolved .dg-source-link__file {
   color: var(--dg-text-muted);
+}
+
+/* The leading glyph. `dg-icon` from base.css already gives it its font-relative
+ * square, its inertness and `currentColor`; this rule only steps the colour back
+ * so the glyph reads as a marker beside the accent-coloured path rather than as
+ * part of it. It needs no longer selector: components.css is assembled after
+ * base.css, so a single class placed here wins. */
+.dg-source-link__icon {
+  color: var(--dg-text-muted);
+}
+
+/* The symbol and the path are the `Code` primitive, which paints a surface, a
+ * hairline and side padding of its own - right for a snippet quoted in prose,
+ * wrong inside a chip, where it draws a second pill inside the first and
+ * survives in the dense variant that just dropped the chip's own box. Cleared
+ * here through this component's OWN element classes, which are declared after
+ * the primitive's, so the chip reads as one pill and the dense variant really is
+ * chrome-free. The colours the rules above assign to these runs stand. */
+.dg-source-link__symbol,
+.dg-source-link__file {
+  padding-inline: 0;
+  background: transparent;
+  border: none;
+}
+
+/* The dense variant a table, timeline or tree row embeds. The row is the only
+ * box there, so the chip drops its own surface and side padding - and keeps them
+ * dropped on hover, where the underline is the whole affordance. */
+.dg-source-link--compact {
+  padding-inline: 0;
+  background: transparent;
+  border-color: transparent;
+}
+
+.dg-source-link--compact:hover {
+  background: transparent;
+  border-color: transparent;
+}
+
+/* The inert state: no handler could be resolved for the chip, so it is a label
+ * rather than a control. De-emphasis is `--dg-text-muted`, never `opacity`,
+ * which would invalidate the contrast ratios src/tokens/tokens.test.ts pins, and
+ * the hover response is removed outright - a chip that opens nothing must not
+ * invite a click. */
+.dg-source-link.dg-is-static {
+  color: var(--dg-text-muted);
+  cursor: default;
+}
+
+.dg-source-link.dg-is-static:hover {
+  background: var(--dg-surface-elevated);
+  border-color: var(--dg-border-subtle);
+  text-decoration: none;
+}
+
+/* An inert chip inside a row is both states at once, and the rule above would
+ * otherwise hand it back the surface the dense variant just dropped. Same
+ * specificity, declared later, so this is the one that applies. */
+.dg-source-link--compact.dg-is-static:hover {
+  background: transparent;
+  border-color: transparent;
+}
+
+.dg-source-link.dg-is-static .dg-source-link__symbol,
+.dg-source-link.dg-is-static .dg-source-link__file {
+  color: var(--dg-text-muted);
+}
+
+/* The interactive chip is the button primitive, so its runs sit inside that
+ * primitive's own label box - a class components/SourceLink.tsx cannot add to.
+ * The chip gap is therefore re-established there, or the glyph, the symbol and
+ * the path would touch in the interactive form while the inert form, whose root
+ * IS the chip, spaced them correctly. `min-inline-size: 0` is the half that
+ * matters inside the row: it lets the path truncate instead of widening it. */
+.dg-source-link .dg-button__label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--dg-space-1);
+  min-inline-size: 0;
 }
 
 /* ==========================================================================

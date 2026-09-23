@@ -47,7 +47,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { DEBUGGEN_ERROR_CODES, DebuggenError } from '@debuggen/shared';
-import { METRIC_IDS } from '@debuggen/telemetry';
+import { METRIC_IDS, computeCaptureSummary } from '@debuggen/telemetry';
 import type { MetricValue } from '@debuggen/telemetry';
 
 import {
@@ -65,6 +65,19 @@ import {
   parseErrorPayload,
   toErrorPayload,
 } from '../messages/error.js';
+import {
+  CLEANUP_STATUSES,
+  PROMPT_STAGE_KEYS,
+  PROVIDER_IDS,
+  SESSION_STATUSES,
+  isCleanupStatus,
+  isSessionStatus,
+  parseSessionRecord,
+  relevantFileSchema,
+  sessionRecordSchema,
+  touchSessionRecord,
+} from '../session-record.js';
+import type { SessionRecord } from '../session-record.js';
 
 /** A code from the `@debuggen/shared` vocabulary, used as a valid fixture. */
 const CODE = 'MODEL_UNAVAILABLE';
@@ -505,5 +518,602 @@ describe('createAnalysisResult — deterministic, and nobody else owns its array
     expect(result.likelyCauses).toHaveLength(1);
     expect(result.metrics).toHaveLength(2);
     expect(result).toEqual(validResult());
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The session record — `../session-record.ts`, the payload of
+// `session.created` / `session.updated` and the body every session route
+// returns.
+//
+// What the suites below are for is the same thing the analysis suites above are
+// for, one layer wider: this record embeds five shapes owned by
+// `@debuggen/instrumentation`, one owned by `./analysis.ts` and one type owned by
+// `@debuggen/telemetry`, and a local copy of any of them would compile,
+// type-check identically and differ only in what it refuses. So each case feeds
+// in the value only the imported schema rejects — a plan with no `adapter` on an
+// action, a modification whose digest is not 64 lowercase hex, a fact citing
+// nothing — and requires the rejection. `SessionRecordEmbeddedShapesPreserved`
+// is the compile-time half of the same guarantee.
+//
+// The two path fields carry deliberately **opposite** constraints (AAP §0.2.3):
+// `projectRoot` is the absolute boundary, and every `RelevantFile.file` is
+// relative and must be unable to escape it.
+// ---------------------------------------------------------------------------
+
+/** The session that owns every fixture below; the id `validResult()` already uses. */
+const SESSION_ID = 'ses_4k2p9dq7m1zx0c3v';
+
+/** The capture the fixture session recorded. */
+const CAPTURE_ID = 'cap_7f3q0m2zk1x8ab9c';
+
+/** The panel generated from it. */
+const PANEL_ID = 'pan_6h2j8k4l0z5x1c7v';
+
+/** A modification id of the shape `newModificationId()` mints. */
+const MODIFICATION_ID = 'mod_5b1n7m3q9w2e4r6t';
+
+/** An action id of the shape a normalised plan carries. */
+const ACTION_ID = 'act_2q7w1e9r4t6y8u3i';
+
+/** The developer's workspace folder: absolute, POSIX, on their own machine. */
+const PROJECT_ROOT = '/home/example/workspace/site';
+
+/** A project-relative source path, the only spelling `RelevantFile.file` accepts. */
+const SOURCE_FILE = 'src/lib/thing.ts';
+
+/**
+ * A 64-character lowercase hexadecimal digest, built from a repeating seed.
+ *
+ * Synthetic and low-entropy on purpose: the digests only have to satisfy the
+ * imported `sha256HexSchema`, and `scripts/check-secrets.mjs` scans every
+ * tracked file for high-entropy strings.
+ */
+function hashFixture(seed: string): string {
+  return seed.repeat(32).slice(0, 64);
+}
+
+/** A normalised instrumentation plan: the shape a session stores, never the authoring one. */
+function validPlan(): SessionRecord['plans'][number] {
+  return {
+    version: 1,
+    planVersion: 1,
+    sessionId: SESSION_ID,
+    objective: 'Determine where the time in the selected interaction is spent.',
+    hypotheses: ['The work happens on the server rather than in the browser.'],
+    capture: ['click event timing', 'fetch calls', 'server request spans'],
+    instrumentationTargets: [
+      {
+        id: ACTION_ID,
+        file: SOURCE_FILE,
+        symbol: 'runTask',
+        type: 'function-timing',
+        adapter: 'nextjs',
+        mode: 'patch',
+        rationale: 'The symbol the investigation identified as the entry point.',
+      },
+    ],
+  };
+}
+
+/** One applied modification record, with both digests and its diff. */
+function validModification(): SessionRecord['modifications'][number] {
+  return {
+    id: MODIFICATION_ID,
+    sessionId: SESSION_ID,
+    planVersion: 1,
+    file: SOURCE_FILE,
+    originalHash: hashFixture('1a'),
+    backupPath: `/home/example/.debuggen/backups/${SESSION_ID}/${hashFixture('1a')}`,
+    instrumentedHash: hashFixture('2b'),
+    appliedAt: 1_758_000_000_500,
+    status: 'reverted',
+    diff: '--- a/src/lib/thing.ts\n+++ b/src/lib/thing.ts\n',
+  };
+}
+
+/** A complete, realistic session record: every field populated, nothing invented. */
+function validSessionRecord(): SessionRecord {
+  return {
+    id: SESSION_ID,
+    projectRoot: PROJECT_ROOT,
+    projectName: 'site',
+    devServerUrl: 'http://localhost:3000',
+    boundTab: { tabId: 7, url: 'http://localhost:3000/list?filter=%3F' },
+    createdAt: 1_758_000_000_000,
+    updatedAt: 1_758_000_120_000,
+    status: 'generated',
+    question: 'Why does this action take so long?',
+    followUps: [
+      {
+        question: 'Why did that step run twice?',
+        askedAt: 1_758_000_100_000,
+        needsNewCapture: false,
+        captureId: CAPTURE_ID,
+        analysisId: ANALYSIS_ID,
+        panelId: PANEL_ID,
+      },
+    ],
+    target: {
+      selector: 'main > button.primary',
+      tagName: 'BUTTON',
+      text: 'Continue',
+      componentChain: ['PrimaryAction', 'ActionRow'],
+      url: 'http://localhost:3000/list',
+    },
+    understanding: {
+      category: 'performance',
+      signalsNeeded: ['interactions', 'fetch', 'http'],
+      entities: [{ kind: 'function', name: 'runTask', file: SOURCE_FILE }],
+      searchHints: ['slow interaction'],
+    },
+    relevantFiles: [
+      {
+        file: SOURCE_FILE,
+        symbol: 'runTask',
+        reason: 'The function the selected element’s handler calls.',
+        score: 0.9,
+      },
+      { file: 'src/lib/other.ts', reason: 'Imported by the file above.', score: 0.25 },
+    ],
+    plans: [validPlan()],
+    modifications: [validModification()],
+    captures: [
+      {
+        id: CAPTURE_ID,
+        planVersion: 1,
+        startedAt: 1_758_000_000_900,
+        stoppedAt: 1_758_000_010_900,
+        summary: computeCaptureSummary([], { captureId: CAPTURE_ID, sessionId: SESSION_ID }),
+        eventCount: 0,
+      },
+    ],
+    panelIds: [PANEL_ID],
+    analyses: [validResult()],
+    cleanup: { status: 'clean', completedAt: 1_758_000_119_000, conflicts: [] },
+    promptVersions: {
+      understand: 'v001',
+      investigate: 'v001',
+      plan: 'v001',
+      analyze: 'v001',
+      'generate-panel': 'v001',
+      followup: 'v001',
+    },
+    provider: { id: 'deterministic' },
+  };
+}
+
+describe('SESSION_STATUSES and CLEANUP_STATUSES — two closed vocabularies', () => {
+  it('holds exactly the eleven session statuses, in the AAP order, without duplicates', () => {
+    expect([...SESSION_STATUSES]).toEqual([
+      'created',
+      'understanding',
+      'investigating',
+      'planning',
+      'instrumenting',
+      'ready',
+      'capturing',
+      'analyzing',
+      'generated',
+      'ended',
+      'failed',
+    ]);
+    // The order is what a progress view renders in, so it is pinned as an order
+    // and not as a set — and the set has no duplicate hiding in it.
+    expect(SESSION_STATUSES).toHaveLength(11);
+    expect(new Set(SESSION_STATUSES).size).toBe(11);
+  });
+
+  it('holds exactly the four cleanup statuses, beginning with pending', () => {
+    expect([...CLEANUP_STATUSES]).toEqual(['pending', 'clean', 'partial', 'conflict']);
+    expect(new Set(CLEANUP_STATUSES).size).toBe(4);
+    // `pending` is the state a session is in before cleanup has run, which is
+    // why this vocabulary has one more member than a cleanup *pass*'s verdict.
+    expect(CLEANUP_STATUSES[0]).toBe('pending');
+  });
+
+  it('refuses an unknown status in either position', () => {
+    expect(
+      sessionRecordSchema.safeParse({ ...validSessionRecord(), status: 'complete' }).success,
+    ).toBe(false);
+    expect(
+      sessionRecordSchema.safeParse({
+        ...validSessionRecord(),
+        cleanup: { status: 'clean-ish', conflicts: [] },
+      }).success,
+    ).toBe(false);
+  });
+
+  it('narrows a value with its guards without allocating a result', () => {
+    expect(isSessionStatus('capturing')).toBe(true);
+    expect(isSessionStatus('Capturing')).toBe(false);
+    expect(isSessionStatus(undefined)).toBe(false);
+    expect(isCleanupStatus('conflict')).toBe(true);
+    expect(isCleanupStatus('clean-ish')).toBe(false);
+    expect(isCleanupStatus(7)).toBe(false);
+  });
+});
+
+describe('sessionRecordSchema — the single definition of a session’s state', () => {
+  it('accepts a complete record and survives a JSON round trip unchanged', () => {
+    const record = validSessionRecord();
+
+    expect(sessionRecordSchema.parse(record)).toEqual(record);
+    // A reopened session is rebuilt from this object alone (AAP §0.4.2): it
+    // crosses a WebSocket, an HTTP response and a SQLite text column, so the
+    // object a consumer parses must be the object the producer built.
+    const roundTripped: unknown = JSON.parse(JSON.stringify(record));
+    expect(roundTripped).toEqual(record);
+    expect(sessionRecordSchema.safeParse(roundTripped).success).toBe(true);
+  });
+
+  it('accepts a freshly created session, whose containers are empty rather than absent', () => {
+    const created: SessionRecord = {
+      id: SESSION_ID,
+      projectRoot: PROJECT_ROOT,
+      projectName: 'site',
+      devServerUrl: 'http://localhost:3000',
+      createdAt: 1_758_000_000_000,
+      updatedAt: 1_758_000_000_000,
+      status: 'created',
+      question: 'Why does this action take so long?',
+      followUps: [],
+      relevantFiles: [],
+      plans: [],
+      modifications: [],
+      captures: [],
+      panelIds: [],
+      analyses: [],
+      cleanup: { status: 'pending', conflicts: [] },
+      promptVersions: {},
+      provider: { id: 'deterministic' },
+    };
+
+    expect(sessionRecordSchema.safeParse(created).success).toBe(true);
+    // The three genuinely optional fields are absent keys, not nulls, so the
+    // record round-trips as itself.
+    expect('boundTab' in created).toBe(false);
+    expect('target' in created).toBe(false);
+    expect('understanding' in created).toBe(false);
+    expect(JSON.parse(JSON.stringify(created))).toEqual(created);
+  });
+
+  it('refuses an unknown top-level key, so no app can quietly extend the record', () => {
+    const refused = sessionRecordSchema.safeParse({
+      ...validSessionRecord(),
+      panelSpec: { title: 'x' },
+    });
+
+    expect(refused.success).toBe(false);
+    if (refused.success) {
+      return;
+    }
+    expect(refused.error.issues[0]?.code).toBe('unrecognized_keys');
+    expect(refused.error.issues[0]).toMatchObject({ keys: ['panelSpec'] });
+  });
+
+  it('refuses a null in place of an absent optional, and a missing required container', () => {
+    expect(sessionRecordSchema.safeParse({ ...validSessionRecord(), boundTab: null }).success).toBe(
+      false,
+    );
+    const withoutCleanup: Record<string, unknown> = { ...validSessionRecord() };
+    delete withoutCleanup['cleanup'];
+    expect(sessionRecordSchema.safeParse(withoutCleanup).success).toBe(false);
+  });
+
+  it('constrains its two path fields in deliberately opposite directions', () => {
+    // `projectRoot` is the boundary: absolute POSIX, nothing else.
+    for (const projectRoot of [
+      'workspace/site',
+      'C:/workspace/site',
+      '//server/share/site',
+      '/workspace/site\u0000',
+      '',
+    ]) {
+      expect(sessionRecordSchema.safeParse({ ...validSessionRecord(), projectRoot }).success).toBe(
+        false,
+      );
+    }
+    expect(
+      sessionRecordSchema.safeParse({ ...validSessionRecord(), projectRoot: '/workspace/site' })
+        .success,
+    ).toBe(true);
+
+    // `relevantFiles[].file` is measured against it: project-relative, and
+    // unable to escape. The refusals are the imported `isSafeRelativePath`'s,
+    // not a local regular expression's.
+    for (const file of [
+      '/home/example/workspace/site/src/lib/thing.ts',
+      '../../etc/shadow',
+      'src/../../secret.ts',
+      'C:\\workspace\\site\\src\\lib\\thing.ts',
+      'src/lib/thing.ts\u0000.bak',
+      '   ',
+    ]) {
+      expect(
+        relevantFileSchema.safeParse({ file, reason: 'Investigated.', score: 0.5 }).success,
+      ).toBe(false);
+      expect(
+        sessionRecordSchema.safeParse({
+          ...validSessionRecord(),
+          relevantFiles: [{ file, reason: 'Investigated.', score: 0.5 }],
+        }).success,
+      ).toBe(false);
+    }
+    // An interior `..` that resolves back inside is accepted, because
+    // normalisation has already removed it.
+    expect(
+      relevantFileSchema.safeParse({
+        file: 'src/../src/lib/thing.ts',
+        reason: 'Investigated.',
+        score: 0,
+      }).success,
+    ).toBe(true);
+  });
+
+  it('keeps a relevance score inside 0..1 and refuses a score that is not a number', () => {
+    for (const score of [-0.01, 1.01, Number.NaN, Number.POSITIVE_INFINITY, '0.5']) {
+      expect(
+        relevantFileSchema.safeParse({ file: SOURCE_FILE, reason: 'Investigated.', score }).success,
+      ).toBe(false);
+    }
+    expect(
+      relevantFileSchema.safeParse({ file: SOURCE_FILE, reason: 'Investigated.', score: 1 })
+        .success,
+    ).toBe(true);
+  });
+
+  it('embeds the NORMALIZED plan schema rather than a local copy of it', () => {
+    // Each of these is a plan a local restatement would have accepted, and only
+    // `instrumentationPlanSchema` refuses: the authoring shape (no `version`,
+    // no `planVersion`, no `sessionId`), and a normalised plan whose action is
+    // missing the `adapter` and `mode` that normalisation assigns (AAP §0.2.3).
+    const authoringShape = {
+      objective: 'Determine where the time in the selected interaction is spent.',
+      capture: ['click event timing'],
+      instrumentationTargets: [{ file: SOURCE_FILE, symbol: 'runTask', type: 'function-timing' }],
+    };
+    expect(
+      sessionRecordSchema.safeParse({ ...validSessionRecord(), plans: [authoringShape] }).success,
+    ).toBe(false);
+
+    // Built by deletion rather than by destructuring, so the assertion needs no
+    // discarded bindings: the point is the absent keys, whatever produced them.
+    const actionWithoutAdapter: Record<string, unknown> = {
+      ...validPlan().instrumentationTargets[0],
+    };
+    delete actionWithoutAdapter['adapter'];
+    delete actionWithoutAdapter['mode'];
+
+    const refused = sessionRecordSchema.safeParse({
+      ...validSessionRecord(),
+      plans: [{ ...validPlan(), instrumentationTargets: [actionWithoutAdapter] }],
+    });
+    expect(refused.success).toBe(false);
+    if (refused.success) {
+      return;
+    }
+    expect(refused.error.issues.map((issue) => issue.path.join('.'))).toContain(
+      'plans.0.instrumentationTargets.0.adapter',
+    );
+
+    // And a wrong `version` literal, which only the normalised schema pins.
+    expect(
+      sessionRecordSchema.safeParse({
+        ...validSessionRecord(),
+        plans: [{ ...validPlan(), version: 2 }],
+      }).success,
+    ).toBe(false);
+  });
+
+  it('embeds the modification-record schema, digests and all', () => {
+    for (const originalHash of [
+      hashFixture('1a').toUpperCase(),
+      hashFixture('1a').slice(1),
+      'not-a-digest',
+    ]) {
+      expect(
+        sessionRecordSchema.safeParse({
+          ...validSessionRecord(),
+          modifications: [{ ...validModification(), originalHash }],
+        }).success,
+      ).toBe(false);
+    }
+    // A status outside the journal's five is refused by the same imported schema.
+    expect(
+      sessionRecordSchema.safeParse({
+        ...validSessionRecord(),
+        modifications: [{ ...validModification(), status: 'undone' }],
+      }).success,
+    ).toBe(false);
+  });
+
+  it('embeds the analysis schema, so a stored fact cannot cite nothing', () => {
+    const refused = sessionRecordSchema.safeParse({
+      ...validSessionRecord(),
+      analyses: [
+        { ...validResult(), observed: [{ statement: 'Something happened.', evidence: [] }] },
+      ],
+    });
+
+    expect(refused.success).toBe(false);
+    if (refused.success) {
+      return;
+    }
+    // `./analysis.ts` → `@debuggen/panel-schema`'s `factSchema` `.min(1)` is the
+    // only rule that refuses this (AAP §0.8.4).
+    expect(refused.error.issues[0]?.code).toBe('too_small');
+    expect(refused.error.issues[0]?.path).toEqual(['analyses', 0, 'observed', 0, 'evidence']);
+  });
+
+  it('embeds the selected-target and problem-understanding schemas', () => {
+    expect(
+      sessionRecordSchema.safeParse({
+        ...validSessionRecord(),
+        target: { ...validSessionRecord().target, url: 'not-a-url' },
+      }).success,
+    ).toBe(false);
+    expect(
+      sessionRecordSchema.safeParse({
+        ...validSessionRecord(),
+        understanding: { ...validSessionRecord().understanding, signalsNeeded: [] },
+      }).success,
+    ).toBe(false);
+    expect(
+      sessionRecordSchema.safeParse({
+        ...validSessionRecord(),
+        understanding: { ...validSessionRecord().understanding, category: 'slowness' },
+      }).success,
+    ).toBe(false);
+  });
+
+  it('accepts an in-flight capture and refuses a summary that is not one', () => {
+    const inFlight = {
+      ...validSessionRecord(),
+      status: 'capturing',
+      captures: [{ id: CAPTURE_ID, planVersion: 1, startedAt: 1_758_000_000_900 }],
+    };
+    expect(sessionRecordSchema.safeParse(inFlight).success).toBe(true);
+
+    // The shallow guard behind the embedded `CaptureSummary` type: a plain
+    // object missing the capture's identity and measurements is refused, and so
+    // is a primitive where the aggregate belongs.
+    for (const summary of [{ eventCount: 0, metrics: [] }, 7, null, []]) {
+      expect(
+        sessionRecordSchema.safeParse({
+          ...validSessionRecord(),
+          captures: [{ id: CAPTURE_ID, planVersion: 1, startedAt: 1_758_000_000_900, summary }],
+        }).success,
+      ).toBe(false);
+    }
+  });
+
+  it('pins the prompt-version vocabulary and the version spelling', () => {
+    expect([...PROMPT_STAGE_KEYS]).toEqual([
+      'understand',
+      'investigate',
+      'plan',
+      'analyze',
+      'generate-panel',
+      'followup',
+    ]);
+    // A stage outside the six, and a version that is not `vNNN`.
+    expect(
+      sessionRecordSchema.safeParse({
+        ...validSessionRecord(),
+        promptVersions: { summarise: 'v001' },
+      }).success,
+    ).toBe(false);
+    for (const version of ['v1', '1.0.0', 'latest', 'V001']) {
+      expect(
+        sessionRecordSchema.safeParse({
+          ...validSessionRecord(),
+          promptVersions: { analyze: version },
+        }).success,
+      ).toBe(false);
+    }
+  });
+
+  it('records the provider that ran the session, over a closed pair', () => {
+    expect([...PROVIDER_IDS]).toEqual(['anthropic', 'deterministic']);
+    expect(
+      sessionRecordSchema.safeParse({ ...validSessionRecord(), provider: { id: 'openai' } })
+        .success,
+    ).toBe(false);
+    // A model id is recorded, never derived: the value comes from
+    // DEBUGGEN_MODEL, so the schema bounds its shape and nothing more.
+    expect(
+      sessionRecordSchema.safeParse({
+        ...validSessionRecord(),
+        provider: { id: 'anthropic', model: 'example-model-id' },
+      }).success,
+    ).toBe(true);
+  });
+
+  it('bounds every array, so one long session cannot grow a row without limit', () => {
+    expect(
+      sessionRecordSchema.safeParse({
+        ...validSessionRecord(),
+        panelIds: Array.from({ length: 129 }, () => PANEL_ID),
+      }).success,
+    ).toBe(false);
+    expect(
+      sessionRecordSchema.safeParse({
+        ...validSessionRecord(),
+        relevantFiles: Array.from({ length: 51 }, () => ({
+          file: SOURCE_FILE,
+          reason: 'Investigated.',
+          score: 0.5,
+        })),
+      }).success,
+    ).toBe(false);
+  });
+});
+
+describe('parseSessionRecord — a rejected session never leaks the developer’s data', () => {
+  it('returns the validated record', () => {
+    const parsed = parseSessionRecord(validSessionRecord());
+
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) {
+      expect(parsed.value.status).toBe('generated');
+      expect(parsed.value.cleanup.conflicts).toEqual([]);
+      expect(parsed.value.plans[0]?.instrumentationTargets[0]?.mode).toBe('patch');
+    }
+  });
+
+  it('names the offending fields without echoing the question or the project path', () => {
+    // Two sentinels rather than credential-shaped literals, for the reason the
+    // error-frame suite above states: the question and the project root are the
+    // two most sensitive fields this record carries (AAP §0.5.2).
+    const questionSentinel = 'sentinel-question-6ad920-must-not-be-echoed';
+    const rootSentinel = '/sentinel-root-31bc47-must-not-be-echoed/../escape';
+    const parsed = parseSessionRecord({
+      ...validSessionRecord(),
+      question: `${questionSentinel}\u0000`,
+      projectRoot: rootSentinel.replace('/sentinel', 'sentinel'),
+    });
+
+    expect(parsed.ok).toBe(false);
+    if (parsed.ok) {
+      return;
+    }
+    expect([...DEBUGGEN_ERROR_CODES]).toContain(parsed.error.code);
+    expect(parsed.error.code).toBe('PROTOCOL_INVALID_MESSAGE');
+    expect(parsed.error.message).toContain('question');
+    expect(parsed.error.message).toContain('projectRoot');
+    for (const leak of [questionSentinel, 'sentinel-root-31bc47']) {
+      expect(parsed.error.message).not.toContain(leak);
+      expect(parsed.error.hint ?? '').not.toContain(leak);
+      expect(JSON.stringify(parsed.error.details)).not.toContain(leak);
+      expect(JSON.stringify(parsed.error.toPayload())).not.toContain(leak);
+    }
+  });
+
+  it('reports a corrupted store row rather than throwing', () => {
+    // What `apps/local-service/src/store/sessions-repo.ts` does with a row an
+    // older build wrote: an `Err` it can log and skip while listing sessions.
+    for (const value of [undefined, null, '{}', 42, []]) {
+      const parsed = parseSessionRecord(value);
+      expect(parsed.ok).toBe(false);
+      if (!parsed.ok) {
+        expect(parsed.error.code).toBe('PROTOCOL_INVALID_MESSAGE');
+      }
+    }
+  });
+});
+
+describe('touchSessionRecord — a pure updatedAt bump, and nothing else', () => {
+  it('returns a new record with the new timestamp and leaves the original alone', () => {
+    const record = validSessionRecord();
+    const stamped = touchSessionRecord(record, 1_758_000_999_000);
+
+    expect(stamped).not.toBe(record);
+    expect(stamped.updatedAt).toBe(1_758_000_999_000);
+    expect(record.updatedAt).toBe(1_758_000_120_000);
+    expect(sessionRecordSchema.safeParse(stamped).success).toBe(true);
+    // Everything else is the same record, status included: the state machine
+    // lives in the service and this helper is not it.
+    expect({ ...stamped, updatedAt: record.updatedAt }).toEqual(record);
   });
 });

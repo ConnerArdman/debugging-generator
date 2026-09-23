@@ -33,7 +33,8 @@
     "checkedAt",
     "createdAt",
     "generatedAt",
-    "startedAt"
+    "startedAt",
+    "updatedAt"
   ],
   "routePaths": [],
   "notes": "Hand-reviewed generic vocabulary subtracted from scripts/no-hardcoding.policy.json by `node scripts/check-no-hardcoding.mjs --update`. Entries are literal, case-sensitive, whole-word strings; there is no pattern facility. Every entry must be defensible as generic vocabulary a product file could legitimately use with no knowledge of the demo application - product-owned primitive and layout component names, HTTP method names, and single-token words any application shares. Nothing demo-specific may be listed here: every addition widens the anti-hardcoding gate and needs a justification in review."

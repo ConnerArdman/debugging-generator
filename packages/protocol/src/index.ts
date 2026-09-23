@@ -85,10 +85,10 @@
  * ```
  *
  * That graph is the package's plan of record (AAP §0.7.1). What `src/` holds
- * today is `version.ts`, `analysis.ts` and the `messages/*` modules that have
- * landed, and the groups below re-export exactly those: tsup resolves every
- * specifier in this file when it builds `dist/index.js`, so a barrel can only
- * ever name a module that is there.
+ * today is `version.ts`, `analysis.ts`, `session-record.ts` and the `messages/*`
+ * modules that have landed, and the groups below re-export exactly those: tsup
+ * resolves every specifier in this file when it builds `dist/index.js`, so a
+ * barrel can only ever name a module that is there.
  *
  * `version.ts` is at the top because every other module imports it and none of
  * them may import anything from this package in return — the wire version the
@@ -147,6 +147,17 @@ export * from './version.js';
 // the first into the second.
 // ---------------------------------------------------------------------------
 export * from './analysis.js';
+
+// ---------------------------------------------------------------------------
+// session-record — the state of one debugging session, defined exactly once for
+// the whole product (AAP §0.9.1): the eleven-status and four-cleanup-status
+// vocabularies, the relevant-file, bound-tab, capture, follow-up, cleanup,
+// prompt-version and provider sub-records, and the `SessionRecord` the service
+// persists as its `sessions.record` JSON column, broadcasts on
+// `session.created`/`session.updated` and returns from every session route —
+// which both user interfaces render directly.
+// ---------------------------------------------------------------------------
+export * from './session-record.js';
 
 // ---------------------------------------------------------------------------
 // messages/error — the generic `error` frame (AAP §0.4.2): the failure reply any
