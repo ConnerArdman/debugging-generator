@@ -2,32 +2,35 @@
  * `@debuggen/protocol` — the single cross-process contract of the Debug
  * Generator, and the one door into it.
  *
+ * ## Who reads this file
+ *
  * Four processes cooperate in this product, and they agree on nothing except
  * what this package defines (AAP §0.4.2):
  *
  * - the **local service** on `127.0.0.1`, which owns every session, the store,
  *   the pipeline and cleanup;
  * - the **VS Code extension** — its host, which opens source locations and
- *   manages the service lifecycle, and its webview;
+ *   manages the service lifecycle, and its React webview, which asks the
+ *   question and renders progress, modifications and the analysis;
  * - the **Chrome MV3 extension** — its service worker, which owns tab binding,
- *   agent injection and transport, and its DevTools panel, which renders;
+ *   agent injection and transport, and its DevTools panel, which renders the
+ *   generated debugger;
  * - the **Node preload** inside the target project's dev server, which reports
  *   server and database spans.
  *
- * The service and both extensions import this package — and, to reach each
- * other, only this package: an extension never touches a service internal, and
- * the service never hand-writes a frame an extension will parse (AAP §0.4.2).
- * That rule is what makes a wire change a compile error in every process at
- * once instead of a mismatch discovered at runtime, and `eslint.config.js`
- * enforces the import edges that express it.
+ * Each of them imports this package — and, to reach one another, only this
+ * package: an extension never touches a service internal, and the service never
+ * hand-writes a frame an extension will parse (AAP §0.4.2). That rule is what
+ * makes a wire change a compile error in every process at once instead of a
+ * mismatch discovered at runtime, and `eslint.config.js` enforces the import
+ * edges that express it.
  *
- * The two telemetry producers are the deliberate exception, in one direction
- * only. Both sit *below* this package in the layering (AAP §0.2.2) and neither
- * imports it: the MAIN-world browser agent posts raw event batches that the
- * Chrome service worker wraps into the frames below, and the Node preload
- * reports its spans to the service over HTTP with `@debuggen/telemetry`'s own
- * ingress schema (AAP §0.2.3). What they send is still validated against the
- * schemas here, at the process that receives it.
+ * The MAIN-world browser agent is the deliberate exception, in one direction
+ * only. It sits *below* this package in the layering (AAP §0.2.2) and does not
+ * import it: it posts raw event batches that the Chrome service worker wraps
+ * into the frames below, using `@debuggen/telemetry`'s own ingress schema (AAP
+ * §0.2.3). What it sends is still validated against the schemas here, at the
+ * process that receives it.
  *
  * ## One door, and what that means for a symbol that is not below
  *
@@ -48,7 +51,8 @@
  * `./x.ts`, and the bundlers that consume this package on the browser side pass
  * such specifiers through unchanged, so the stricter flavour costs them nothing.
  *
- * ## Each cross-boundary shape is defined once, and not all of them here
+ * ## Each cross-boundary shape is defined once, and four of them are defined
+ * elsewhere
  *
  * AAP §0.2.3 and §0.9.1 place each shape that crosses a process boundary in
  * exactly one module, and name any second definition in an app a defect:
@@ -57,20 +61,51 @@
  * | --- | --- |
  * | `SourceLocation`, `Result`, `DebuggenError`, the error codes | `@debuggen/shared` |
  * | `TelemetryEventIngress`, `TelemetryEvent`, the aggregates | `@debuggen/telemetry` |
- * | `InstrumentationPlan`, `InstrumentationAction`, the records | `@debuggen/instrumentation` |
+ * | `InstrumentationPlan`, `InstrumentationAction`, the modification records | `@debuggen/instrumentation` |
  * | `PanelSpec`, `DataQuery`, the node catalog | `@debuggen/panel-schema` |
- * | the messages those shapes travel inside | **this package** |
+ * | the messages, the session record and the analysis result | **this package** |
  *
- * Which is why this barrel re-exports the message layer and nothing else. The
- * modules behind it *embed* the upstream schemas — `source.open` carries
- * `@debuggen/shared`'s `sourceLocationSchema`, `telemetry.event` and
- * `telemetry.tail` carry `@debuggen/telemetry`'s ingress and persisted event
- * schemas, `capture.stopped` carries its `CaptureSummary` — and a consumer that
- * needs one of those shapes, or the `Result`/`DebuggenError` pair every parse
- * helper below returns, imports it from its owner directly. Re-exporting a
- * borrowed shape from here would give it a second import path, which is how two
- * layers start disagreeing about what a valid event is; it would also make this
- * package's published surface grow whenever a package below it grows.
+ * The modules behind this barrel *embed* the upstream schemas rather than
+ * restating them — `source.open` carries `@debuggen/shared`'s
+ * `sourceLocationSchema`, `telemetry.event` and `telemetry.tail` carry
+ * `@debuggen/telemetry`'s ingress and persisted event schemas,
+ * `instrumentation.ready` carries `@debuggen/instrumentation`'s modification
+ * records, `panel.generated` carries `@debuggen/panel-schema`'s `panelSpecSchema`
+ * — so a message and the artifact inside it can never disagree about what a
+ * valid value is.
+ *
+ * Which is why the last two groups below exist, and why they are shaped the way
+ * they are. Two of the three consuming apps declare **no** dependency on the
+ * packages that own those embedded shapes: `apps/vscode-extension` depends on
+ * `@debuggen/protocol`, `@debuggen/panel-renderer` and `@debuggen/shared` alone,
+ * and `apps/chrome-extension` adds only `@debuggen/panel-schema` (AAP §0.2.2) —
+ * yet the editor's webview has to render a modification list, a plan, an
+ * analysis's facts and hypotheses, a capture's counts and a selected-element
+ * badge. Those **types** reach it only through this file, so this file names
+ * them, and the rule that keeps that honest has two halves:
+ *
+ * - a **type** is re-exported freely. `export type` is erased by the compiler,
+ *   so naming `ModificationRecord` here adds no runtime edge to any bundle and
+ *   no entry to any app's dependency list — it only lets a consumer spell the
+ *   shape it already receives on the wire.
+ * - a **function** is never re-exported. `normalizePlan`, `normalizePanel`,
+ *   `validatePanelSpec`, `validateAgainstCapture`, the correlator and the
+ *   aggregate builders stay behind their own packages' front doors, which the
+ *   local service (the one consumer that declares those dependencies) imports
+ *   directly. Re-exporting one would make this package a second front door to a
+ *   package it merely layers above, and would put that package's runtime —
+ *   including, for `@debuggen/instrumentation`, a ts-morph-backed patch layer —
+ *   inside three browser bundles. `src/__tests__/envelope.test.ts` asserts the
+ *   absence of those five names mechanically, so the rule outlives this comment.
+ *
+ * The one exception to "types only" is a closed `as const` vocabulary a user
+ * interface has to iterate or render — the telemetry kinds and tiers, the metric
+ * ids, the modification statuses, the data-query sources and sorts, the
+ * confidence levels and the query paging bounds. Each is a frozen tuple or a
+ * number with no behaviour to smuggle, and each is re-exported by name so that
+ * an unused one is dropped by the consumer's tree-shaker. They add no new edge
+ * either: the message schemas above already import Zod schemas from all four
+ * packages at runtime, which is what `tsup.config.ts` keeps external.
  *
  * ## The layering inside this package, of which this file is the bottom
  *
@@ -84,12 +119,6 @@
  *   → envelope.ts → http.ts → client/*.ts → index.ts
  * ```
  *
- * That graph is the package's plan of record (AAP §0.7.1). What `src/` holds
- * today is `version.ts`, `analysis.ts`, `session-record.ts` and the `messages/*`
- * modules that have landed, and the groups below re-export exactly those: tsup
- * resolves every specifier in this file when it builds `dist/index.js`, so a
- * barrel can only ever name a module that is there.
- *
  * `version.ts` is at the top because every other module imports it and none of
  * them may import anything from this package in return — the wire version the
  * handshake compares, the epoch-millisecond timestamp every message carries and
@@ -99,13 +128,20 @@
  * below are in that same order, so reading them top to bottom is reading the
  * package's dependency order.
  *
- * The direction that costs the most to get wrong is the one between the
- * messages and the envelope: a `messages/*` module never imports the envelope.
- * Each one exports its own frozen `type → payload schema` map instead, and
- * combining those maps into the single registry the envelope's discriminated
- * union dispatches on belongs to `messages/index.ts` one level up. **This
- * barrel assembles no registry and validates nothing** — it re-exports, so that
- * the surface stays reviewable in one file and so that no consumer can be
+ * Two directions cost the most to get wrong, and both are structural rather than
+ * advisory:
+ *
+ * - a `messages/*` module **never imports `envelope.ts`**. Each one exports its
+ *   own frozen `type → payload schema` map instead, and combining those maps
+ *   into the single registry the envelope's discriminated union dispatches on
+ *   belongs to `messages/index.ts` one level up.
+ * - **only this file imports `client/*`**. The two transport wrappers sit above
+ *   every schema module, so nothing in `src/**` may reach down into them; a
+ *   schema that needed a client would be a cycle, and a client that a schema
+ *   could call would be a way for validation to perform I/O.
+ *
+ * This barrel assembles no registry and validates nothing — it re-exports, so
+ * that the surface stays reviewable in one file and so that no consumer can be
  * broken by a change to how the registry is built.
  *
  * ## Environment-neutral, by construction rather than by care
@@ -120,6 +156,14 @@
  * `@debuggen/shared/node` entry and no `ws` import may enter the graph this file
  * roots; each would fail the build here rather than surface as an unresolved
  * builtin in the panel's Vite build.
+ *
+ * `ReconnectingWsClient` is the shape of that guarantee where it would otherwise
+ * be hardest to keep: it takes an **injected** WebSocket constructor, typed by
+ * this package's own minimal structural interface, so the service passes `ws`
+ * 8.21.3 while the service worker and the webview pass the platform global, and
+ * neither dependency is named here. `HttpClient` likewise uses web-standard
+ * `fetch`, `Headers` and `AbortController`, which exist in Node 24 and in every
+ * supported browser.
  *
  * Importing this module has no side effect. `package.json` declares
  * `sideEffects: false`, every export below is a declaration, and nothing reached
@@ -160,75 +204,232 @@ export * from './analysis.js';
 export * from './session-record.js';
 
 // ---------------------------------------------------------------------------
-// messages/error — the generic `error` frame (AAP §0.4.2): the failure reply any
-// request or subscription can receive, over the closed error-code vocabulary
-// `@debuggen/shared` defines, with the correlation reference this protocol adds
-// so a receiver can say which of its frames failed.
+// messages — every WebSocket payload of AAP §0.4.2 and the two HTTP-only
+// payload families, as one module. `messages/index.ts` re-exports all eleven
+// domain modules in full (`error`, `agent`, `binding`, `session`, `capture`,
+// `instrumentation`, `telemetry`, `panel`, `source`, `target`, `cleanup`), so
+// this single line carries every payload schema, every inferred payload type
+// and every parse helper, together with the registry they compose into —
+// `MESSAGE_PAYLOAD_SCHEMAS` and the `MESSAGE_TYPES` tuple the envelope below
+// dispatches on — and the transport constants the handshake needs,
+// `WS_CLOSE_UNAUTHORIZED` (4401) and `CLIENT_HELLO_TIMEOUT_MS` (3000).
 // ---------------------------------------------------------------------------
-export * from './messages/error.js';
+export * from './messages/index.js';
 
 // ---------------------------------------------------------------------------
-// messages/agent — the client handshake and the two runtime agents' lifecycle:
-// `client.hello`, the first frame every connection sends and the one that names
-// its kind and carries its credential, `agent.ready`, the browser agent's report
-// that it is installed in a document, and the two arming messages,
-// `agent.config` for the page agent and `server-agent.config` for the Node
-// preload, whose cleared form returns each of them to dormant.
+// envelope — the frame itself: the four shared fields (`id`, `type`, `ts`,
+// optional `sessionId`) declared once in `envelopeBaseShape`, the
+// `ProtocolMessage` discriminated union over the registry above, the schema
+// that validates it, and the four functions every transport uses —
+// `createEnvelope` to mint a routable frame, `encodeMessage` and
+// `decodeMessage` for the text hop, `parseMessage` for a value that arrived
+// some other way — plus the `isMessageOfType` narrowing guard and the
+// exhaustiveness helper a receiver's switch ends with.
 // ---------------------------------------------------------------------------
-export * from './messages/agent.js';
+export * from './envelope.js';
 
 // ---------------------------------------------------------------------------
-// messages/binding — the four messages that pair an inspected Chrome tab with a
-// session (`session.bind`, `session.bound`, `tab.navigated`, `session.unbind`),
-// which is what makes delivery of the agent config, the element-picker request,
-// the live tail and a generated panel a routable instruction.
+// http — the conventional-request half of the transport: the `HTTP_ROUTES`
+// table with a request and response schema per operation, the `HTTP_OPERATIONS`
+// tuple and the `HttpRequestBody`/`HttpResponseBody` lookups over it, the
+// `AUTH_EXEMPT_OPERATIONS` pair and the bearer-header helpers that express the
+// access boundary of AAP §0.5.6, `WS_PATH` for the upgrade, the typed path
+// builders a caller uses instead of concatenating a URL, the paged `DataResult`
+// union the panel-data route answers with, and the two parse helpers that
+// validate a body against the operation that received it.
 // ---------------------------------------------------------------------------
-export * from './messages/binding.js';
+export * from './http.js';
 
 // ---------------------------------------------------------------------------
-// messages/capture — the capture window: the `capture.started` / `capture.stopped`
-// broadcasts every client of a session receives, and the `capture.start` /
-// `capture.stop` HTTP request and response bodies the caller that pressed the
-// button gets its answer from.
+// client/ws-client — the reconnecting WebSocket SDK the VS Code extension host
+// and the Chrome service worker share: the `client.hello` handshake, bounded
+// exponential backoff, a send queue across a drop, and typed per-type
+// subscription. The WebSocket constructor and the timer API are injected, which
+// is what lets one implementation serve Node and both page contexts.
+//
+// This is the transport, and it belongs to the two background layers. A panel
+// or webview component receives data and callbacks from its host instead
+// (AAP §0.1.2, "avoid tightly coupling UI components directly to WebSocket
+// implementation details"), so no convenience wrapper is added here that would
+// invite a React component to open a socket.
 // ---------------------------------------------------------------------------
-export * from './messages/capture.js';
+export * from './client/ws-client.js';
 
 // ---------------------------------------------------------------------------
-// messages/instrumentation — what the tool is about to do to the developer's
-// working tree and what it managed to do: `instrumentation.plan` carrying the
-// normalised plan, `instrumentation.ready` carrying the applied modification
-// records, the runtime hooks that came up and the signals that did not, and
-// `instrumentation.failed` for the one case where nothing at all could be
-// enabled.
+// client/http-client — the request half of the same SDK: a small `fetch`
+// wrapper that attaches the bearer credential, validates each response against
+// the operation's schema and returns this repository's `Result` rather than
+// throwing, over an injected `fetch` and token provider.
 // ---------------------------------------------------------------------------
-export * from './messages/instrumentation.js';
+export * from './client/http-client.js';
 
-// ---------------------------------------------------------------------------
-// messages/panel — `panel.generated`, the frame that hands a validated panel
-// specification to the DevTools panel and the editor once analysis has produced
-// one, carrying the spec exactly as `@debuggen/panel-schema` defines it.
-// ---------------------------------------------------------------------------
-export * from './messages/panel.js';
+// ===========================================================================
+// The embedded upstream shapes, as types
+//
+// Everything above is this package's own. Everything below is borrowed, and
+// borrowed in one direction only: these are the shapes the message, route and
+// session schemas above already carry, named here so that a consumer can spell
+// what it receives.
+//
+// The reason is not convenience. Per AAP §0.2.2, `apps/vscode-extension`
+// declares `@debuggen/protocol`, `@debuggen/panel-renderer` and
+// `@debuggen/shared` and nothing else, and `apps/chrome-extension` adds only
+// `@debuggen/panel-schema` — neither can import `@debuggen/telemetry` or
+// `@debuggen/instrumentation` at all. Without the four groups below, the
+// editor's webview could receive an `instrumentation.ready` frame and be unable
+// to name the `ModificationRecord[]` inside it, and the DevTools panel could
+// receive a `telemetry.tail` frame and be unable to name a `TelemetryEvent`.
+//
+// Each group is `export type`, which the compiler erases: the declarations in
+// `dist/index.d.ts` point a type-checker at the owning package, while
+// `dist/index.js` gains nothing at all, so no app's bundle acquires a runtime
+// edge and no app's dependency list becomes a lie. That erasure is the whole
+// mechanism, and it is why this block must never be "tidied" into a wildcard or
+// promoted to value re-exports: a wildcard would re-export the owners' runtime
+// helpers (their normalisers, validators, correlator and aggregate builders)
+// and turn this package into a second front door to packages it merely layers
+// above — in `@debuggen/instrumentation`'s case dragging a ts-morph-backed
+// patch layer behind it. Only the local service declares those dependencies,
+// and it imports each owner directly.
+//
+// A shape reaches this list by appearing in a public signature above. Nothing
+// is listed speculatively, and a shape defined here instead of being borrowed
+// would be the duplicate definition AAP §0.2.3 calls a defect.
+// ===========================================================================
 
-// ---------------------------------------------------------------------------
-// messages/source — `source.open`, the hop that carries an already-resolved
-// project location from the DevTools panel to the editor and makes every
-// runtime item in a generated panel clickable.
-// ---------------------------------------------------------------------------
-export * from './messages/source.js';
+// The one source location, from `@debuggen/shared`: carried by `source.open`,
+// by `Hypothesis.suggestedLocation` inside an analysis and a panel summary, by
+// every located runtime item, and by the editor command that opens a file at a
+// line. `SourceResolvedBy` is the provenance of the four resolution routes
+// (patch metadata, code graph, source map, React owner chain, route map), which
+// a user interface renders as a confidence hint rather than hiding.
+export type { SourceLocation, SourceResolvedBy } from '@debuggen/shared';
 
-// ---------------------------------------------------------------------------
-// messages/target — the element-selection round trip: `target.request`, the
-// service asking the bound panel to enter picker mode, and `target.selected`,
-// the panel answering with the selected element's descriptor and component
-// chain.
-// ---------------------------------------------------------------------------
-export * from './messages/target.js';
+// The telemetry model, from `@debuggen/telemetry`. The two event schemas are
+// what `telemetry.event` (ingress, no session) and `telemetry.tail` (persisted,
+// redacted) carry; `CaptureSummary` and `MetricValue`/`MetricId` are what
+// `capture.stopped` and an analysis's metrics carry; the remaining eight are the
+// aggregate shapes the panel-data route answers with, one per `DataQuery`
+// source, plus the correlated trace tree a timeline and a flame view read.
+export type {
+  CaptureSummary,
+  ComponentTreeSnapshot,
+  DependencyGraphData,
+  MetricId,
+  MetricValue,
+  QueryGroup,
+  RenderStat,
+  RequestGroup,
+  StateTransition,
+  TelemetryEvent,
+  TelemetryEventIngress,
+  TelemetryKind,
+  TelemetryTier,
+  TraceNode,
+  TraceTree,
+} from '@debuggen/telemetry';
 
-// ---------------------------------------------------------------------------
-// messages/telemetry — the two directions of the event stream: `telemetry.event`,
-// the batch a producer sends inward carrying the ingress schema that cannot
-// claim a session, and `telemetry.tail`, the already-redacted replay the service
-// sends outward to the DevTools panel.
-// ---------------------------------------------------------------------------
-export * from './messages/telemetry.js';
+// The instrumentation model, from `@debuggen/instrumentation`. `instrumentation.plan`
+// carries the normalised plan and its actions; `instrumentation.ready` carries
+// the modification records, the runtime hooks that came up and the signals that
+// did not; `cleanup.completed` carries the conflicts; `target.selected` carries
+// the selected element; `agent.config` and `server-agent.config` carry the two
+// hook configurations; and `Readiness` is what gates the "Ready to capture"
+// state both user interfaces show. `ProblemUnderstanding` is the first
+// pipeline artifact a session record holds.
+export type {
+  AgentHookConfig,
+  CaptureSignal,
+  InstrumentationAction,
+  InstrumentationActionType,
+  InstrumentationPlan,
+  ModificationConflict,
+  ModificationRecord,
+  ModificationStatus,
+  ProblemUnderstanding,
+  Readiness,
+  SelectedTarget,
+  ServerAgentSignals,
+  UnavailableSignal,
+} from '@debuggen/instrumentation';
+
+// The panel model, from `@debuggen/panel-schema`. `panel.generated` carries the
+// validated specification and its layout nodes; the panel-data request body *is*
+// a `DataQuery`; and `Fact`, `Hypothesis`, `EventRef` and `ConfidenceLevel` are
+// the evidence-separated summary shapes an analysis and a panel share, which
+// both user interfaces render under their own "Observed" and "Likely cause"
+// headings (AAP §0.8.4).
+export type {
+  ConfidenceLevel,
+  DataQuery,
+  DataQueryFilter,
+  DataQuerySort,
+  DataQuerySource,
+  EventRef,
+  Fact,
+  Hypothesis,
+  PanelNode,
+  PanelNodeType,
+  PanelSpec,
+} from '@debuggen/panel-schema';
+
+// ===========================================================================
+// The embedded upstream vocabularies, as values
+//
+// The narrow, deliberate exception to "types only" above: a closed `as const`
+// tuple (or a bound derived from one) that a user interface has to iterate or
+// render rather than merely name — a filter row over the telemetry kinds, a
+// metric-card picker, a status badge legend, a data-source selector, a
+// confidence badge, a paging control that must agree with the service about its
+// limits. A type cannot be iterated, so for these the value is the contract.
+//
+// Every entry qualifies on three counts: it is frozen data with no behaviour,
+// it is named rather than wildcarded, so a consumer's tree-shaker drops the
+// statement for one it never touches, and it adds no edge this package does not
+// already have — the message and route schemas above import Zod schemas from
+// all four owners at run time (`selectedTargetSchema`,
+// `modificationConflictSchema`, `agentHookConfigSchema`,
+// `serverAgentSignalsSchema`, `modificationRecordSchema`,
+// `telemetryEventSchema`, `panelSpecSchema`, `sourceLocationSchema`), which is
+// exactly what `tsup.config.ts` keeps external.
+//
+// What the third count does *not* claim, because it was measured rather than
+// assumed: a consumer that actually imports `MODIFICATION_STATUSES` loads the
+// whole of `@debuggen/instrumentation`'s `dist/index.js`, which is one bundled
+// file fusing that package's schema layer with its ts-morph and `node:fs` patch
+// layer, so a browser build of it is megabytes rather than kilobytes. That is a
+// property of how the owner is built — a `./schema` subpath entry, or split
+// entries, would fix it there — and it is already reached through the message
+// schemas named above, so this one line neither causes it nor worsens it. The
+// telemetry and panel-schema vocabularies have no such cost: their owners'
+// bundles import nothing but `zod` and `@debuggen/shared`.
+//
+// Nothing else joins this block. A function, a Zod schema, a class or a mutable
+// object here would hand an upstream package's runtime to three browser bundles
+// through a package that is meant to be a contract, and the guard in
+// `src/__tests__/envelope.test.ts` fails the build if one appears.
+// ===========================================================================
+
+// The span kinds and the three tiers an event can belong to: the vocabulary a
+// live tail's filter, an event-log column and a timeline lane legend are built
+// from, and the metric ids a metric-card node may name.
+export { METRIC_IDS, TELEMETRY_KINDS, TELEMETRY_TIERS } from '@debuggen/telemetry';
+
+// The five states a recorded file modification moves through
+// (`pending → applied → reverted`, or `conflict`/`failed`): the legend the
+// editor's modification list and the panel's session summary render, and the
+// set a status badge must handle exhaustively.
+export { MODIFICATION_STATUSES } from '@debuggen/instrumentation';
+
+// The panel-data query vocabulary: the ten sources, the three sort orders, the
+// three confidence levels a hypothesis badge renders, and the paging bounds a
+// caller must respect so that a request the service would reject is a compile
+// error or a clamped value rather than a failed round trip.
+export {
+  CONFIDENCE_LEVELS,
+  DATA_QUERY_DEFAULT_LIMIT,
+  DATA_QUERY_DEFAULT_OFFSET,
+  DATA_QUERY_MAX_LIMIT,
+  DATA_QUERY_SORTS,
+  DATA_QUERY_SOURCES,
+} from '@debuggen/panel-schema';

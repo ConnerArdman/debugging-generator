@@ -39,9 +39,17 @@
  *   layer. The leak case plants a sentinel in a rejected payload and asserts it
  *   appears in no part of the resulting error — message, hint, details or the
  *   payload that crosses the wire.
+ * - **The barrel is the whole door.** `../index.ts` is the single `"."` entry of
+ *   this package, so a symbol it forgets is invisible to all three apps and a
+ *   symbol it adds carelessly is an upstream package's runtime inside three
+ *   bundles. The last group is this package's own boundary check — the
+ *   load-bearing exports are present, there is no default export, loading the
+ *   barrel does nothing observable, and no upstream *function* has leaked
+ *   through it — and it lives here, in the suite that already holds the union,
+ *   because AAP 0.8.3 fixes this package at three suites.
  */
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { DEBUGGEN_ERROR_CODES } from '@debuggen/shared';
 import { computeCaptureSummary } from '@debuggen/telemetry';
@@ -68,6 +76,10 @@ import type {
   ProtocolMessageSchema,
 } from '../envelope.js';
 import { HTTP_OPERATIONS } from '../http.js';
+// The namespace import is the assertion: it is how a consumer of the published
+// `"."` entry sees this package, so the barrel group below can only observe
+// what an app can observe.
+import * as protocol from '../index.js';
 import {
   HTTP_ONLY_PAYLOAD_NAMES,
   MESSAGE_PAYLOAD_SCHEMAS,
@@ -914,5 +926,120 @@ describe('type-level guarantees', () => {
 
     expect(schema.safeParse(frame).success).toBe(true);
     expect(frame.id).toBe(MESSAGE_ID);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The package barrel — `../index.ts`
+//
+// This package publishes exactly one export condition, `"."`, so the barrel is
+// not a convenience: it is the entire visible surface of the contract layer.
+// The four cases below are the properties an app depends on and that no
+// compiler checks on its behalf.
+// ---------------------------------------------------------------------------
+
+describe('the package barrel — the only door into @debuggen/protocol', () => {
+  it('exposes every load-bearing symbol the three apps are documented to consume', () => {
+    // One name per group of `../index.ts`, chosen from what the apps actually
+    // call: the handshake version, the envelope's schema and its four
+    // functions, the registry both transports dispatch on, the two stored
+    // artifacts, the route table with its auth exemptions and the upgrade path,
+    // the panel-data union, and the two transport clients. A missing name here
+    // is a consumer that cannot be written, however complete `src/**` is.
+    const required = [
+      'PROTOCOL_VERSION',
+      'protocolMessageSchema',
+      'parseMessage',
+      'createEnvelope',
+      'MESSAGE_TYPES',
+      'MESSAGE_PAYLOAD_SCHEMAS',
+      'sessionRecordSchema',
+      'analysisResultSchema',
+      'HTTP_ROUTES',
+      'HTTP_OPERATIONS',
+      'AUTH_EXEMPT_OPERATIONS',
+      'WS_PATH',
+      'dataResultSchema',
+      'ReconnectingWsClient',
+      'HttpClient',
+      // The borrowed vocabularies, which a user interface iterates rather than
+      // merely names: `apps/vscode-extension` and `apps/chrome-extension`
+      // declare no dependency on the packages that own them (AAP 0.2.2), so
+      // this barrel is the only way they arrive.
+      'METRIC_IDS',
+      'TELEMETRY_KINDS',
+      'MODIFICATION_STATUSES',
+      'DATA_QUERY_SOURCES',
+    ] as const;
+
+    const missing = required.filter((name) => !(name in protocol));
+
+    expect(missing).toEqual([]);
+    // Spot-check that a re-export is the value itself and not a placeholder:
+    // the registry the envelope dispatches on must be the same object the
+    // direct import gives, or two layers would validate against two registries.
+    expect(protocol.MESSAGE_PAYLOAD_SCHEMAS).toBe(MESSAGE_PAYLOAD_SCHEMAS);
+    expect(protocol.MESSAGE_TYPES).toBe(MESSAGE_TYPES);
+    expect(protocol.PROTOCOL_VERSION).toBe(PROTOCOL_VERSION);
+    expect(protocol.protocolMessageSchema).toBe(protocolMessageSchema);
+  });
+
+  it('has no default export, so every import is by name', () => {
+    // A default export would give the same symbol two spellings across four
+    // processes, and `export *` deliberately does not forward one.
+    expect('default' in protocol).toBe(false);
+  });
+
+  it('leaks no upstream function: each owner keeps its own front door', () => {
+    // `../index.ts` re-exports upstream *types* freely — they are erased, which
+    // is what lets the two extension apps name a `ModificationRecord` or a
+    // `TelemetryEvent` without declaring a dependency on its owner — but never
+    // an upstream *function*. One of these would make this package a second
+    // front door to a package it merely layers above and would put that
+    // package's runtime, including a ts-morph-backed patch layer, inside three
+    // browser bundles. Only the local service declares those dependencies, and
+    // it imports each owner directly.
+    const forbidden = [
+      'normalizePlan',
+      'normalizePanel',
+      'validatePanelSpec',
+      'validateAgainstCapture',
+      'correlateEvents',
+    ] as const;
+
+    const leaked = forbidden.filter((name) => name in protocol);
+
+    expect(leaked).toEqual([]);
+  });
+
+  it('loads with no observable side effect', async () => {
+    // `package.json` declares `sideEffects: false`, which lets every consumer's
+    // bundler drop the message modules it does not reach; a single statement
+    // that ran at load time would make that declaration false. The service
+    // imports this package during start-up and three browser bundles inline it,
+    // so a stray log line would also appear in a developer's console for
+    // reasons unrelated to their session.
+    //
+    // The static namespace above was evaluated before any spy existed, so the
+    // module registry is reset and the barrel is re-evaluated under the spies.
+    const methods = ['debug', 'error', 'info', 'log', 'trace', 'warn'] as const;
+    const spies = methods.map((method) =>
+      vi.spyOn(console, method).mockImplementation(() => undefined),
+    );
+
+    try {
+      vi.resetModules();
+
+      const reloaded = await import('../index.js');
+
+      // Re-evaluation succeeded — an import-time throw would have failed here —
+      // and produced the same contract.
+      expect(reloaded.PROTOCOL_VERSION).toBe(PROTOCOL_VERSION);
+      expect(spies.flatMap((spy) => spy.mock.calls)).toEqual([]);
+    } finally {
+      for (const spy of spies) {
+        spy.mockRestore();
+      }
+    }
   });
 });

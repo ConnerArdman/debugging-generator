@@ -46,8 +46,16 @@
  * issue paths and codes alone, no log record here takes a payload, and the
  * unauthorized hook reports a close code and a constant reason rather than what
  * was presented. `resolveWsUrl` refuses a URL with embedded credentials for the
- * same reason: a `ws://user:pass@host` would put a secret on a value both user
- * interfaces display.
+ * same reason: a `ws:` URL whose authority carried a `user:password@` userinfo
+ * component would put a secret on a value both user interfaces display.
+ *
+ * Note how that component is spelled, here and in every other module of this
+ * repository that has to describe it: on its own, never joined to a scheme.
+ * Spelling out a complete URI with a userinfo component inside it — even in a
+ * comment whose point is that such a URI is refused — is itself a
+ * `scripts/check-secrets.mjs` finding, because the scanner matches the shape
+ * and cannot tell prose from a committed credential, and that gate is part of
+ * `pnpm verify` (AAP §0.8.5).
  *
  * ## Reconnection is the normal case
  *
