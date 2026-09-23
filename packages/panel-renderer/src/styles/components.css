@@ -121,7 +121,7 @@
  *                             --dgc-severity-color  DurationCell, MetricCards
  *                             --dgc-depth           components/ComponentTree
  *                             --dgc-stack-gap       layout/Stack
- *                             --dgc-pane-grow       layout/Split
+ *                             --dgc-split-weight    layout/Split
  *                           Every colour handed in through one of these comes
  *                           from `src/utils/color.ts`, which answers only with
  *                           token references, so an inline value can never
@@ -183,7 +183,7 @@
  * The border is not decoration — the high-contrast theme resolves every shadow
  * to `none`, so the hairline is what keeps the card readable there. */
 .dg-surface-card,
-.dg-section,
+.dg-section--card,
 .dg-metric-card,
 .dg-summary-header {
   background: var(--dg-surface-elevated);
@@ -1638,8 +1638,19 @@
 /* ==========================================================================
  * layout/Section.tsx
  *
- * The grouping card every panel node sits in. Its surface, hairline and radius
- * come from the grouped `.dg-surface-card` rule near the top of this file.
+ * The titled grouping a panel's regions sit in, in the two variants the
+ * component emits and no third. `--card` is the framed grouping: its surface,
+ * hairline and radius come from the grouped `.dg-surface-card` rule near the
+ * top of this file, and the inset that belongs to a frame is declared against
+ * the same variant below. `--plain` is a heading over its content and is given
+ * no surface and no inset at all, so a region composed inside a framed one does
+ * not stack a second frame inside the first.
+ *
+ * The component declares no gap between the region's children: they sit in a
+ * `layout/Stack`, which is the one place this tier's spacing is spent
+ * (AAP 0.6.4). What is declared here is only what separates the header from the
+ * body — the frame's inset in one variant, a space step in the other — and the
+ * tighter step between the heading and its supporting line.
  * ========================================================================== */
 
 .dg-section {
@@ -1648,71 +1659,75 @@
   min-inline-size: 0;
 }
 
+/* No surface, so no inset either: a space step is what holds the header off the
+ * body when there is no frame to do it. */
+.dg-section--plain {
+  gap: var(--dg-space-2);
+}
+
+/* The labelled-region header: the heading and its supporting line, stacked and
+ * tighter than the region's own parts so the two read as one unit. */
 .dg-section__header {
   display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--dg-space-3);
-  padding-block: var(--dg-space-2);
+  flex-direction: column;
+  gap: var(--dg-space-1);
+  min-inline-size: 0;
+}
+
+/* The heading and text primitives own their type roles and tones; these
+ * contribute shrinking only, so a long title or a long supporting line clips
+ * inside the container instead of widening it. */
+.dg-section__title,
+.dg-section__description {
+  min-inline-size: 0;
+}
+
+/* The body wraps the flow container the children sit in. It sets no gap: the
+ * flow container's own step is the region's spacing. */
+.dg-section__body {
+  display: flex;
+  flex-direction: column;
+  min-inline-size: 0;
+}
+
+/* The frame's inset, and the hairline dividing its header from its body. Both
+ * belong to the frame, which is why neither is declared on the block. */
+.dg-section--card > .dg-section__header {
+  padding-block: var(--dg-space-3);
   padding-inline: var(--dg-space-4);
   border-block-end: thin solid var(--dg-border-subtle);
 }
 
-.dg-section__title {
-  min-inline-size: 0;
-  color: var(--dg-text-primary);
-  font: var(--dg-text-lg);
-}
-
-.dg-section__actions {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--dg-space-2);
-}
-
-.dg-section__body {
-  display: flex;
-  flex-direction: column;
-  gap: var(--dg-space-3);
-  min-inline-size: 0;
+.dg-section--card > .dg-section__body {
   padding: var(--dg-space-4);
 }
 
-.dg-section__footer {
-  padding-block: var(--dg-space-2);
-  padding-inline: var(--dg-space-4);
-  border-block-start: thin solid var(--dg-border-subtle);
-  color: var(--dg-text-muted);
-  font: var(--dg-text-xs);
-}
-
 /* Full-bleed: an SVG view fills the card and draws its own inset, so the body
- * must not add one. */
-.dg-section--flush .dg-section__body {
+ * must not add one. A caller asks for it by class, and it is declared after the
+ * framed variant's inset — equal specificity, so source order decides. */
+.dg-section--flush > .dg-section__body {
   padding: 0;
-}
-
-/* The header of a collapsible section separates from a collapsed body, so the
- * hairline goes away with it. The toggle itself is a `Button`, which owns its
- * own cursor and focus ring. */
-.dg-section--collapsible.dg-is-collapsed .dg-section__header {
-  border-block-end-color: transparent;
-}
-
-.dg-section.dg-is-collapsed .dg-section__body,
-.dg-section.dg-is-collapsed .dg-section__footer {
-  display: none;
 }
 
 /* ==========================================================================
  * layout/Split.tsx
  *
- * Two or more panes side by side, responsive intrinsically: the panes wrap when
- * the container cannot hold them, and each may shrink below its content because
- * of `min-inline-size: 0`. There is no breakpoint token and no media query, so
- * there is no viewport width at which this behaves differently.
+ * Two or more panes read AGAINST each other, responsive intrinsically: the
+ * panes wrap when the container cannot hold them, and each may shrink below its
+ * content because of `min-inline-size: 0`. There is no breakpoint token and no
+ * media query, so there is no viewport width at which this behaves differently
+ * — the threshold follows the container, which is what a division nested inside
+ * another division needs.
+ *
+ * Two flow contexts, because the component renders two parts, exactly as
+ * `layout/Stack` does: the BLOCK is a column holding an optional header above
+ * the panes, and `__panes` is the flex container the panes sit in. Every
+ * modifier the component emits — axis, gap step, cross-axis alignment, collapse
+ * — is declared on the block and resolved onto `__panes` with a child selector,
+ * so a division's heading keeps its own spacing whatever its panes do, and each
+ * rule is confined to one level so a nested division is arranged by its own
+ * modifiers and never by its parent's. `__panes` is rendered unconditionally,
+ * so these selectors have one stable target.
  *
  * Panes are EQUAL by default, and that takes an explicit flex basis. With
  * `flex-basis: auto` a pane is sized by its own content, so a pane holding a
@@ -1720,36 +1735,160 @@
  * observed in the browser, not theorised. Every pane therefore starts from the
  * same basis and grows by the same factor, which makes their widths equal
  * whatever they contain, and keeps shrinking so a narrow surface squeezes the
- * panes evenly instead of overflowing. Gap: no size token exists for a basis,
- * so it is ten units of the largest space token.
+ * panes evenly instead of overflowing. No size token exists for a basis, so it
+ * is ten units of the largest space token.
  *
- * A caller that needs a weighting sets `--dgc-pane-grow` inline on the pane;
+ * That basis is also the collapse threshold. `--collapse` — which the component
+ * emits for a horizontal division unless the caller opts out — is the whole of
+ * the responsive obligation AAP 0.6.4 places on this block: with wrapping
+ * allowed, two panes that can no longer both reach the basis fall onto separate
+ * lines, which IS the single column a docked DevTools panel needs at around
+ * four hundred pixels. Without it the panes stay on one line and shrink
+ * together. Neither case needs a width in a rule.
+ *
+ * A caller that needs a weighting sets `--dgc-split-weight` inline on the pane;
  * the declaration order inside the rule is what lets that override the `flex`
- * shorthand.
+ * shorthand, and the `1` fallback is what makes an unweighted pane equal. The
+ * property is always a positive unitless number — the component drops anything
+ * else — so the `calc()` it feeds can never resolve to an invalid length.
  * ========================================================================== */
 
 .dg-split {
   display: flex;
+  flex-direction: column;
+  gap: var(--dg-space-3);
+  min-inline-size: 0;
+}
+
+/* The labelled-group header: the heading and its supporting line, tighter than
+ * the block gap so the two read as one unit above the panes. Same treatment as
+ * `.dg-stack__header`, because the component renders the same markup. */
+.dg-split__header {
+  display: flex;
+  flex-direction: column;
+  gap: var(--dg-space-1);
+  min-inline-size: 0;
+}
+
+/* The panes container. Its own defaults mirror the component's — panes beside
+ * each other at the wider interface step, stretched across the cross axis, free
+ * to wrap — so an unmodified division is laid out correctly. */
+.dg-split__panes {
+  display: flex;
+  flex-direction: row;
   flex-wrap: wrap;
+  align-items: stretch;
   gap: var(--dg-space-4);
   min-inline-size: 0;
 }
 
-.dg-split--horizontal {
+.dg-split--horizontal > .dg-split__panes {
   flex-direction: row;
 }
 
 /* A vertical split stacks by intent, so wrapping would undo it. */
-.dg-split--vertical {
+.dg-split--vertical > .dg-split__panes {
   flex-direction: column;
   flex-wrap: nowrap;
 }
 
+/* Declared after the axis rules: a horizontal division that opted out of
+ * collapsing keeps its panes on one line and lets them shrink instead. */
+.dg-split--collapse > .dg-split__panes {
+  flex-wrap: wrap;
+}
+
+.dg-split:not(.dg-split--collapse) > .dg-split__panes {
+  flex-wrap: nowrap;
+}
+
+.dg-split--gap-0 > .dg-split__panes {
+  gap: var(--dg-space-0);
+}
+
+.dg-split--gap-1 > .dg-split__panes {
+  gap: var(--dg-space-1);
+}
+
+.dg-split--gap-2 > .dg-split__panes {
+  gap: var(--dg-space-2);
+}
+
+.dg-split--gap-3 > .dg-split__panes {
+  gap: var(--dg-space-3);
+}
+
+.dg-split--gap-4 > .dg-split__panes {
+  gap: var(--dg-space-4);
+}
+
+.dg-split--gap-5 > .dg-split__panes {
+  gap: var(--dg-space-5);
+}
+
+.dg-split--gap-6 > .dg-split__panes {
+  gap: var(--dg-space-6);
+}
+
+.dg-split--gap-7 > .dg-split__panes {
+  gap: var(--dg-space-7);
+}
+
+.dg-split--align-start > .dg-split__panes {
+  align-items: start;
+}
+
+.dg-split--align-center > .dg-split__panes {
+  align-items: center;
+}
+
+.dg-split--align-end > .dg-split__panes {
+  align-items: end;
+}
+
+.dg-split--align-stretch > .dg-split__panes {
+  align-items: stretch;
+}
+
+.dg-split--align-baseline > .dg-split__panes {
+  align-items: baseline;
+}
+
+/* The weight multiplies BOTH longhands, and that is what makes a weighted pane
+ * actually twice as wide rather than merely greedier. With a shared basis B, a
+ * weight w and free space F, a pane measures `B·w + (w/Σw)·F`, and since
+ * `F = container − gaps − B·Σw` that reduces to `w·(container − gaps)/Σw` — so
+ * every pane's size is exactly proportional to its weight, at every container
+ * width. Growing alone would divide only the free space, which at a realistic
+ * width gives `[2, 1]` a ratio near 1.5 instead of 2 (measured in the browser,
+ * not theorised). The unweighted case is unchanged: the fallback is 1, so the
+ * basis stays one unit and every pane grows equally.
+ *
+ * It also decides where a weighted division collapses, and the consequence is
+ * deliberate: because each pane's basis is its own share, every pane sits
+ * exactly at one basis unit at the moment the line stops fitting, so the panes
+ * fall into a column BEFORE any of them is squeezed below that unit. A weighted
+ * division therefore collapses at a wider container than an equal one — a 3:1:1
+ * split needs roughly `5 × 240px` plus its gaps to stay on one line (measured,
+ * not estimated) — which is the right trade for a surface as narrow as a docked
+ * DevTools panel: a readable column beats three unreadable strips. The lever for
+ * anyone who wants the panes to hold on longer is the basis unit below, never
+ * the weight multiplication, which is what makes the proportions exact. */
 .dg-split__pane {
   flex: 1 1 calc(var(--dg-space-7) * 10);
-  flex-grow: var(--dgc-pane-grow, 1);
+  flex-basis: calc(var(--dg-space-7) * 10 * var(--dgc-split-weight, 1));
+  flex-grow: var(--dgc-split-weight, 1);
   min-inline-size: 0;
   min-block-size: 0;
+}
+
+/* Along the block axis the basis would be a height, which no view here wants: a
+ * stacked pane is as tall as its content and only grows when a weight asks it
+ * to. The inline size stays unconstrained, so a stacked pane fills the
+ * division. */
+.dg-split--vertical > .dg-split__panes > .dg-split__pane {
+  flex: 0 1 auto;
+  flex-grow: var(--dgc-split-weight, 0);
 }
 
 /* ==========================================================================

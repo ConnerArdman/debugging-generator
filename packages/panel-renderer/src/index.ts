@@ -68,8 +68,10 @@
  *   the only module in the package that writes the theme attribute, `Stack`,
  *   the flow container that carries this tier's shared spacing and alignment
  *   vocabulary (`SPACE_STEPS`, `SpaceStep`, `StackDirection`, `StackAlign`,
- *   `StackJustify`), and `Toolbar`, the filter/sort/search row a panel composes
- *   instead of hand-rolling one.
+ *   `StackJustify`), `Section`, the titled and optionally framed container the
+ *   schema's `section` node renders to, `Split`, the side-by-side division the
+ *   `split` node renders to, and `Toolbar`, the filter/sort/search row a panel
+ *   composes instead of hand-rolling one.
  *
  * No name collides across the flat re-export: the exported names of these
  * modules are pairwise distinct, so each is re-exported with `export *` and no
@@ -123,8 +125,10 @@ export * from './primitives/Text';
 export * from './primitives/Tooltip';
 
 // ---------------------------------------------------------------------------
-// layout — the theme root, the flow container and the filter/sort/search bar
+// layout — the theme root, the titled/divided/flow containers and the toolbar
 // ---------------------------------------------------------------------------
 export * from './layout/PanelShell';
+export * from './layout/Section';
+export * from './layout/Split';
 export * from './layout/Stack';
 export * from './layout/Toolbar';
