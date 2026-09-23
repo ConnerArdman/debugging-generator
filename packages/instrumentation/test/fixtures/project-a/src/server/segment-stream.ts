@@ -1,10 +1,11 @@
 /**
- * Streaming views over a firing cycle's segments.
+ * Streaming views over a firing cycle and the readings a firing leaves behind.
  *
- * The schedule screens read a whole cycle at once, but the kiln log tails it: the log walks the
- * segments one at a time as the firing progresses, and the chamber probe is read a sample at a
- * time while a segment holds. Both are written as generators so a caller can stop part-way
- * through a long firing without the module having to know it did.
+ * The schedule sheet reads a whole cycle at once, but the kiln log tails it: the log walks the
+ * segments one at a time as the firing progresses, and it reads the stored chamber readings a page
+ * at a time so a week of firings never has to sit in memory all at once. Both are written as
+ * generators so a caller can stop part-way through a long firing without the module having to know
+ * it did.
  */
 
 /** One ramp-and-hold step of a firing cycle, as the studio schedule records it. */
@@ -15,6 +16,16 @@ export interface RampSegment {
   targetTemperatureC: number;
   /** How long the chamber is held at that temperature once it has been reached. */
   holdMinutes: number;
+}
+
+/** One chamber reading of a firing, as the kiln log stores it. */
+export interface KilnSampleRow {
+  /** The firing the reading belongs to. */
+  cycleId: string;
+  /** When the reading was taken, as an ISO 8601 instant. */
+  recordedAt: string;
+  /** What the chamber probe read, in degrees Celsius. */
+  temperatureC: number;
 }
 
 /**
@@ -39,27 +50,25 @@ export function* walkRampSegments(
 }
 
 /**
- * Yields chamber readings for one kiln, a sample at a time, as the probe reports them.
+ * Yields one firing's stored chamber readings a page at a time, in the order the log kept them.
  *
- * The probe is polled rather than pushed, so each sample is awaited before the next one is asked
- * for; a caller that stops reading stops the polling with it.
+ * Each page is handed on in its own turn, so tailing a long firing leaves room for the studio's
+ * other work between pages, and a caller that stops reading stops the walk with it. The controller
+ * keypad cannot enter a page shorter than a single reading, so anything shorter is read as one
+ * reading per page.
  *
- * @param kilnId The kiln whose probe is being read.
- * @param sampleCount How many samples to take before the stream ends.
- * @param readProbe Reads the probe once, in degrees Celsius.
+ * @param rows The readings of one firing, oldest first.
+ * @param pageSize How many readings a page carries.
  */
 export async function* streamKilnSamples(
-  kilnId: string,
-  sampleCount: number,
-  readProbe: (kilnId: string) => Promise<number>,
-): AsyncGenerator<number, void, undefined> {
-  for (let taken = 0; taken < sampleCount; taken += 1) {
-    const reading = await readProbe(kilnId);
+  rows: KilnSampleRow[],
+  pageSize = 25,
+): AsyncGenerator<KilnSampleRow[], void, undefined> {
+  const perPage = Number.isFinite(pageSize) && pageSize >= 1 ? Math.trunc(pageSize) : 1;
 
-    if (!Number.isFinite(reading)) {
-      return;
-    }
+  for (let start = 0; start < rows.length; start += perPage) {
+    await Promise.resolve();
 
-    yield reading;
+    yield rows.slice(start, start + perPage);
   }
 }

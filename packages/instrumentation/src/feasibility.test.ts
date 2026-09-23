@@ -120,8 +120,12 @@ const PLAN_VERSION = 3;
 const FILES = {
   /** Generators only: both symbols must be refused. */
   generators: 'src/server/segment-stream.ts',
-  /** Function declarations, an async function declaration and an arrow constant. */
+  /** Exactly two function declarations: a destructured parameter with defaults, then positional. */
   planner: 'src/server/cycle-planner.ts',
+  /** An async function declaration and a non-async declaration that returns a promise. */
+  log: 'src/server/firing-log.ts',
+  /** Async function declarations over a driver pool and a checked-out client. */
+  metrics: 'src/server/kiln-metrics.ts',
   /** Arrow constants at module scope. */
   glaze: 'src/server/glaze-rules.ts',
   /** A class with methods, a property, and a constructor. */
@@ -132,6 +136,8 @@ const FILES = {
   handles: 'src/server/db-handles.ts',
   /** Plain JavaScript: a function declaration and an arrow constant. */
   legacyJs: 'src/legacy/firing-log.js',
+  /** Plain JavaScript: arrow constants only, one of them block-bodied. */
+  legacyArrows: 'src/legacy/rack-tally.js',
   /** Plain JSX: a helper function beside a component. */
   legacyJsx: 'src/legacy/kiln-badge.jsx',
 } as const;
@@ -452,7 +458,7 @@ describe('the rejection vocabulary', () => {
 
   it('is asserted against actions the internal plan schema accepts', () => {
     const parsed = instrumentationActionSchema.safeParse(
-      action({ file: FILES.planner, symbol: 'planFiringCycle' }),
+      action({ file: FILES.planner, symbol: 'planCycleSegments' }),
     );
 
     expect(parsed.success).toBe(true);
@@ -466,7 +472,7 @@ describe('the rejection vocabulary', () => {
 describe('the adapter claim', () => {
   it('refuses an action whose type no registered adapter claims', () => {
     const report = checkFeasibility(
-      [action({ file: FILES.planner, symbol: 'planFiringCycle' })],
+      [action({ file: FILES.planner, symbol: 'planCycleSegments' })],
       makeContext(),
       { resolver: claimsNothing() },
     );
@@ -497,7 +503,7 @@ describe('the adapter claim', () => {
 
   it('is skipped when the caller supplies no resolver', () => {
     const report = checkFeasibility(
-      [action({ file: FILES.planner, symbol: 'planFiringCycle' })],
+      [action({ file: FILES.planner, symbol: 'planCycleSegments' })],
       makeContext(),
     );
 
@@ -603,7 +609,7 @@ describe('the code index', () => {
       ),
     });
     const refusal = refusalFor(
-      { file: FILES.planner, symbol: 'planFiringCycle' },
+      { file: FILES.planner, symbol: 'planCycleSegments' },
       { graph: withoutPlanner, queries: createCodeQueries(withoutPlanner) },
     );
 
@@ -640,7 +646,7 @@ describe('the symbol', () => {
   });
 
   it('names where the code index does declare the symbol, bounded to a few candidates', () => {
-    const refusal = refusalFor({ file: FILES.glaze, symbol: 'planFiringCycle' });
+    const refusal = refusalFor({ file: FILES.glaze, symbol: 'planCycleSegments' });
 
     expect(refusal.code).toBe('symbol-not-found');
     expect(refusal.hint).toContain(FILES.planner);
@@ -672,20 +678,32 @@ describe('the symbol', () => {
 describe('a supported declaration', () => {
   const supported: readonly { readonly what: string; readonly input: ActionInput }[] = [
     {
-      what: 'a function declaration',
-      input: { file: FILES.planner, symbol: 'planFiringCycle' },
+      what: 'a function declaration whose one parameter is a destructured object with defaults',
+      input: { file: FILES.planner, symbol: 'planCycleSegments' },
+    },
+    {
+      what: 'a function declaration with positional parameters',
+      input: { file: FILES.planner, symbol: 'estimateSoakMinutes' },
     },
     {
       what: 'an async function declaration',
-      input: { file: FILES.planner, symbol: 'loadCyclePreset' },
+      input: { file: FILES.log, symbol: 'logFiringCycle' },
+    },
+    {
+      what: 'a non-async function declaration that returns a promise',
+      input: { file: FILES.log, symbol: 'loadRecentFiringCycles' },
+    },
+    {
+      what: 'an async function declaration over a driver pool',
+      input: { file: FILES.metrics, symbol: 'readCycleTotals' },
+    },
+    {
+      what: 'an async function declaration over a checked-out client',
+      input: { file: FILES.metrics, symbol: 'collectCycleSamples' },
     },
     {
       what: 'a non-exported function declaration',
       input: { file: FILES.cones, symbol: 'findConeProfile' },
-    },
-    {
-      what: 'an arrow function held by a module-scope constant',
-      input: { file: FILES.planner, symbol: 'summariseCycleHold' },
     },
     {
       what: 'an exported arrow function',
@@ -714,6 +732,14 @@ describe('a supported declaration', () => {
     {
       what: 'an arrow constant in plain JavaScript',
       input: { file: FILES.legacyJs, symbol: 'describeFiringEntry' },
+    },
+    {
+      what: 'an expression-bodied arrow constant in plain JavaScript',
+      input: { file: FILES.legacyArrows, symbol: 'tallyRackSlots' },
+    },
+    {
+      what: 'a block-bodied arrow constant in plain JavaScript',
+      input: { file: FILES.legacyArrows, symbol: 'orderRacksByLoad' },
     },
     {
       what: 'a helper function in a JSX module',
@@ -811,12 +837,12 @@ describe('an unwrappable declaration', () => {
 describe('with no syntax tree loaded', () => {
   it('reports that the shape could not be checked rather than guessing', () => {
     const refusal = refusalFor(
-      { file: FILES.planner, symbol: 'planFiringCycle' },
+      { file: FILES.planner, symbol: 'planCycleSegments' },
       { loaded: undefined },
     );
 
     expect(refusal.code).toBe('ast-unavailable');
-    expect(refusal.reason).toContain('planFiringCycle');
+    expect(refusal.reason).toContain('planCycleSegments');
     expectReadableRefusal(refusal);
   });
 
@@ -836,8 +862,8 @@ describe('with no syntax tree loaded', () => {
 
 describe('duplicates within one call', () => {
   it('accepts the first request for an instrumentation and refuses the second', () => {
-    const first = action({ file: FILES.planner, symbol: 'planFiringCycle' });
-    const second = action({ file: FILES.planner, symbol: 'planFiringCycle' });
+    const first = action({ file: FILES.planner, symbol: 'planCycleSegments' });
+    const second = action({ file: FILES.planner, symbol: 'planCycleSegments' });
     const report = checkFeasibility([first, second], makeContext(), {
       resolver: claimsEverything(),
     });
@@ -846,7 +872,7 @@ describe('duplicates within one call', () => {
     expect(report.rejected).toHaveLength(1);
     expect(report.rejected[0]?.action).toBe(second);
     expect(report.rejected[0]?.code).toBe('duplicate-action');
-    expect(report.rejected[0]?.reason).toContain('planFiringCycle');
+    expect(report.rejected[0]?.reason).toContain('planCycleSegments');
   });
 
   it('refuses a second patch on one declaration even under a different action type', () => {
@@ -931,7 +957,7 @@ describe('the report', () => {
   function mixedActions(): readonly InstrumentationAction[] {
     return [
       action({ file: FILES.generators, symbol: 'walkRampSegments' }),
-      action({ file: FILES.planner, symbol: 'planFiringCycle' }),
+      action({ file: FILES.planner, symbol: 'planCycleSegments' }),
       action({ file: 'src/server/absent-module.ts', symbol: 'schedule' }),
       action({ file: FILES.glaze, symbol: 'scoreShelfSlot' }),
       action({ file: '../escape.ts', symbol: 'escape' }),
@@ -1015,7 +1041,7 @@ describe('checkPlanFeasibility', () => {
 
   it('judges a plan exactly as it judges its actions', () => {
     const targets = [
-      action({ file: FILES.planner, symbol: 'planFiringCycle' }),
+      action({ file: FILES.planner, symbol: 'planCycleSegments' }),
       action({ file: FILES.generators, symbol: 'streamKilnSamples' }),
     ];
     const plan = planOf(targets);
@@ -1038,7 +1064,7 @@ describe('checkPlanFeasibility', () => {
 
   it('refuses every target of a plan whose type nothing claims', () => {
     const plan = planOf([
-      action({ file: FILES.planner, symbol: 'planFiringCycle' }),
+      action({ file: FILES.planner, symbol: 'planCycleSegments' }),
       action({ file: FILES.glaze, symbol: 'scoreShelfSlot' }),
     ]);
     const report = checkPlanFeasibility(plan, makeContext(), { resolver: claimsNothing() });
@@ -1103,7 +1129,7 @@ describe('an unusable context', () => {
       { file: 'src/server/absent-module.ts', symbol: 'schedule' },
       { file: '../escape.ts', symbol: 'escape' },
       { file: FILES.cones, symbol: 'zzzAbsentSymbol' },
-      { file: FILES.planner, symbol: 'planFiringCycle' },
+      { file: FILES.planner, symbol: 'planCycleSegments' },
     ];
 
     expect(() =>
