@@ -316,9 +316,14 @@ export function isCompatibleProtocolVersion(
  * {@link PROTOCOL_VERSION_MAJOR}. The safe-integer check refuses a major with
  * more digits than a `number` can represent exactly, which the pattern alone
  * would admit.
+ *
+ * Takes `unknown` although every typed caller passes a string: the handshake
+ * predicate is documented as never throwing, and a version read out of an
+ * untyped frame by a JavaScript caller — `null`, `undefined`, a number — would
+ * otherwise throw on `.length` instead of being judged incompatible.
  */
-function majorComponentOf(version: string): number | undefined {
-  if (version.length > MAX_PROTOCOL_VERSION_LENGTH) {
+function majorComponentOf(version: unknown): number | undefined {
+  if (typeof version !== 'string' || version.length > MAX_PROTOCOL_VERSION_LENGTH) {
     return undefined;
   }
 

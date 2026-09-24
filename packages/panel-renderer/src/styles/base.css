@@ -148,6 +148,17 @@
   padding: 0;
 }
 
+/* An ordered list that keeps its numbering draws the numerals inside its own
+ * box. The reset above removes the user-agent inline-start padding an
+ * `outside` marker is drawn in, so an outside numeral would hang past the
+ * list's edge — over a card's hairline, or out of a scroll container's clip
+ * in a narrow panel. Inside, every numeral stays visible at any width with no
+ * length to choose. A list that opts out of markers with `list-style: none` is
+ * unaffected: the shorthand resets the position along with the type. */
+:where(ol) {
+  list-style-position: inside;
+}
+
 /* The user-agent fieldset border is a system colour no token can express, so it
  * is removed rather than recoloured; a bordered group is a component decision. */
 :where(fieldset) {

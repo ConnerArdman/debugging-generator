@@ -263,11 +263,18 @@ body {
  * chain stays on one wrapped row set rather than forcing the view wider.
  * ========================================================================== */
 
+/*
+ * The component's root in every state: a vertical `Stack` around the selected
+ * target, or the `EmptyState` / `LoadingState` / `ErrorState` primitive itself.
+ * Each of those already owns its direction, gap and stretch alignment, so this
+ * block deliberately sets none of them. It must not: a row or centring rule
+ * here would shrink the root's content to its intrinsic width, and the
+ * skeleton rows of `LoadingState` — sized in percentages of that width — would
+ * collapse to nothing, leaving a blank area where AAP 0.5.5 requires a state.
+ * What remains is the one guarantee every root needs in a narrow view: it may
+ * shrink below its content's width instead of widening the view.
+ */
 .dgv-target {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--dg-space-2);
   min-inline-size: 0;
 }
 
@@ -292,6 +299,14 @@ body {
   font: var(--dg-text-xs);
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* The `›` between two chain entries. Decorative (the list itself conveys the
+ * order to assistive technology), so it is muted and spaced from the name it
+ * precedes with a space token rather than with a literal space character. */
+.dgv-target__chain-separator {
+  padding-inline-end: var(--dg-space-1);
+  color: var(--dg-text-muted);
 }
 
 /* ==========================================================================
@@ -400,6 +415,13 @@ body {
  * File, symbol and the reason the investigation selected it; the row opens the
  * file. Paths render through the `Code` primitive, so nothing here touches
  * typography on the path — only its box, so it can ellipsise.
+ *
+ * Each row is a full-width `Button variant="ghost"` whose label box holds one
+ * `__row` column: path, then a `__meta` line (symbol and score chip), then the
+ * reason. The button is a centred, non-wrapping chip by default, which suits a
+ * control label but not a list row, so `__button` moves the label to the
+ * start edge and `__row` restores start-aligned, wrapping text for the reason
+ * while the path and the symbol keep their own single-line truncation.
  * ========================================================================== */
 
 .dgv-files {
@@ -410,12 +432,49 @@ body {
   list-style: none;
 }
 
+/* A flex item of the list, so it may shrink below its content and let the path
+ * ellipsise instead of widening the view. */
+.dgv-files__item {
+  min-inline-size: 0;
+}
+
+/* Placement of the label box only: the button's padding, colours, hover and
+ * focus ring stay the design system's. */
+.dgv-files__button {
+  justify-content: start;
+}
+
 .dgv-files__row {
   display: flex;
   flex-direction: column;
+  /* Parts take their own width, capped at the row's, rather than stretching:
+   * the button's label box is only as wide as its widest part, so a stretched
+   * path chip would be full-width in one row and content-width in the next. */
+  align-items: start;
   gap: var(--dg-space-0);
   min-inline-size: 0;
   padding-block: var(--dg-space-1);
+  /* The button centres and never wraps its label; a row reads from the start
+   * edge and its reason wraps. Both properties inherit into the parts. */
+  text-align: start;
+  white-space: normal;
+}
+
+/* The symbol and the score chip on one line. The symbol truncates through its
+ * own `Text truncate` box; the chip never shrinks, so the score stays legible.
+ * The cap is what makes the truncation happen at all: a start-aligned part is
+ * fit-content, and without it the line would size to the unshortened symbol
+ * and push the chip out of the row. */
+.dgv-files__meta {
+  display: flex;
+  align-items: center;
+  gap: var(--dg-space-2);
+  min-inline-size: 0;
+  max-inline-size: 100%;
+}
+
+.dgv-files__score {
+  flex: none;
 }
 
 .dgv-files__path {
@@ -512,6 +571,7 @@ body {
 .dgv-diff {
   display: flex;
   flex-direction: column;
+  gap: var(--dg-space-1);
   min-inline-size: 0;
   padding-block: var(--dg-space-1);
   background: var(--dg-surface-elevated);
@@ -519,11 +579,33 @@ body {
   border-radius: var(--dg-radius-sm);
 }
 
+/* The error state: `ErrorState` draws its own framed, danger-edged surface, so
+ * the diff frame steps aside instead of nesting a second border around it. */
+.dgv-diff--error {
+  padding-block: 0;
+  background: transparent;
+  border: none;
+}
+
+/* The optional file label above the lines, aligned with the line text and
+ * separated from it by the frame's own subtle rule. */
+.dgv-diff__file {
+  min-inline-size: 0;
+  padding-block-end: var(--dg-space-1);
+  padding-inline: var(--dg-space-3);
+  border-block-end: thin solid var(--dg-border-subtle);
+}
+
 .dgv-diff__scroll {
   /* Horizontal only: `.dg-scroll` (base.css) is deliberately not composed here
    * because it scrolls both axes, which is exactly the second viewport this
    * surface must not have. The scrollbar keeps the design system's own
-   * treatment, matched to the surface it sits on. */
+   * treatment, matched to the surface it sits on.
+   *
+   * A single-column grid, so every line stretches to the width of the longest
+   * one: a meta line's recessed surface then spans the whole scrolled width
+   * instead of stopping at the view's edge. */
+  display: grid;
   overflow-x: auto;
   overflow-y: hidden;
   overscroll-behavior-x: contain;
@@ -538,6 +620,10 @@ body {
   /* Each line is as wide as its content, which is what gives the scroll
    * container something to scroll; an intrinsic keyword, not a length. */
   min-inline-size: max-content;
+  /* One line of the row's own type role, so an empty line of the diff keeps
+   * its height instead of collapsing; `lh` is relative to the token's line
+   * height, not a design length. */
+  min-block-size: 1lh;
   padding-inline: var(--dg-space-3);
   color: var(--dg-text-primary);
   font: var(--dg-mono-sm);
@@ -565,6 +651,25 @@ body {
   color: var(--dg-text-secondary);
 }
 
+/* The marker and the line text both render through the `Code` primitive, whose
+ * inline form is a chip (surface, border, radius, padding, primary text). A
+ * diff line is one continuous run on the row's own surface, so these two
+ * classes — passed through `Code`'s `className` — flatten the chip; the row's
+ * kind colour and the marker's muted tone then apply. Whitespace is preserved
+ * in both: a context line's leading space is a real byte of the diff. Font
+ * ligatures are switched off so every character of the recorded bytes is drawn
+ * as itself — `=>`, `===` or `!=` must never read as a single joined glyph in
+ * a view whose whole job is to show exactly what changed. */
+.dgv-diff__marker,
+.dgv-diff__text {
+  padding: 0;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  font-variant-ligatures: none;
+  white-space: pre;
+}
+
 .dgv-diff__marker {
   flex: none;
   min-inline-size: 1em;
@@ -572,8 +677,9 @@ body {
 }
 
 .dgv-diff__text {
-  /* Diff payload: leading indentation and runs of spaces are meaningful. */
-  white-space: pre;
+  /* Diff payload: leading indentation and runs of spaces are meaningful, and
+   * the colour is the row's kind colour rather than the chip's. */
+  color: inherit;
 }
 
 /* ==========================================================================

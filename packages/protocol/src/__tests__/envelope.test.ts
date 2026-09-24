@@ -5,9 +5,10 @@
  *
  * Provenance: this suite covers `../envelope.ts`, the primitives it is built
  * from in `../version.ts`, the registry vocabulary of `../messages/index.ts`,
- * the HTTP-only operation names of `../http.ts` and the package barrel
- * `../index.ts`. It constructs no transport client: the WebSocket and HTTP
- * clients have their own suites.
+ * the HTTP-only operation names of `../http.ts`, the package barrel
+ * `../index.ts`, and the contract points of the two transport clients in
+ * `../client/`. Each client's exhaustive behaviour lives in its own suite; the
+ * last group here pins only what the AAP states outright about them.
  *
  * What is on trial here is the **frame**: the shape AAP 0.2.3 fixes
  * (`{ id, type, sessionId?, ts, payload }`), the completeness of the one
@@ -70,6 +71,14 @@
  *   export, and re-evaluating the barrel does nothing observable — and it lives
  *   here, in the suite that already holds the union, because AAP 0.8.3 fixes
  *   this package at three suites.
+ * - **The clients speak this frame and nothing else.** Driven through their
+ *   injection seams alone — a fake socket constructor, a manual timer pair, a
+ *   stub transport — the WebSocket client writes `client.hello` first on every
+ *   connection, reconnects along the 0.5 s → 10 s curve and resets it after a
+ *   hello, stops on a 4401, and hands an undecodable frame to its error hook
+ *   rather than to a typed handler; the HTTP client sends the bearer credential
+ *   everywhere but its two exempt operations, answers every failure as a
+ *   `Result` and never echoes a refused reply.
  */
 
 import { describe, expect, expectTypeOf, it, vi } from 'vitest';
@@ -106,7 +115,17 @@ import * as telemetryPackage from '@debuggen/telemetry';
 
 import type { AnalysisResult } from '../analysis.js';
 import * as analysisModule from '../analysis.js';
+import { HttpClient } from '../client/http-client.js';
+import type { FetchLike, HttpFetchInit, HttpResponseLike } from '../client/http-client.js';
 import * as httpClientModule from '../client/http-client.js';
+import { DEFAULT_WS_BACKOFF, ReconnectingWsClient } from '../client/ws-client.js';
+import type {
+  TimerApi,
+  WebSocketConstructorLike,
+  WebSocketLike,
+  WsEventMapLike,
+  WsUnauthorizedDetail,
+} from '../client/ws-client.js';
 import * as wsClientModule from '../client/ws-client.js';
 import {
   createEnvelope,
@@ -128,7 +147,13 @@ import type {
   ProtocolMessageSchema,
 } from '../envelope.js';
 import * as envelopeModule from '../envelope.js';
-import { HTTP_OPERATIONS, HTTP_ROUTES } from '../http.js';
+import {
+  AUTHORIZATION_HEADER,
+  AUTH_EXEMPT_OPERATIONS,
+  HTTP_OPERATIONS,
+  HTTP_ROUTES,
+  WS_PATH,
+} from '../http.js';
 import * as httpModule from '../http.js';
 // The namespace import is the assertion: it is how a consumer of the published
 // `"."` entry sees this package, so the barrel group below can only observe
@@ -139,6 +164,7 @@ import {
   HTTP_ONLY_PAYLOAD_SCHEMAS,
   MESSAGE_PAYLOAD_SCHEMAS,
   MESSAGE_TYPES,
+  WS_CLOSE_UNAUTHORIZED,
 } from '../messages/index.js';
 import type {
   MessageType,
@@ -764,6 +790,28 @@ describe('protocolMessageSchema — one member per declared message type', () =>
     }
   });
 
+  it('keeps telemetry.event in both vocabularies on purpose: a frame and the ingest route', () => {
+    // Not a collision. AAP 0.4.2 lists two rows under the one name: the browser
+    // agent's batches reach the service as a WebSocket frame (wrapped by the
+    // service worker), and the Node preload posts its spans to
+    // `POST /telemetry/ingest`. It is the only name the two vocabularies share,
+    // and it is not an HTTP-only name — the frame exists too.
+    const operations = new Set<string>(HTTP_OPERATIONS);
+
+    expect(MESSAGE_TYPES).toContain('telemetry.event');
+    expect(HTTP_OPERATIONS).toContain('telemetry.event');
+    expect(MESSAGE_TYPES.filter((type) => operations.has(type))).toEqual(['telemetry.event']);
+    expect(new Set<string>(HTTP_ONLY_PAYLOAD_NAMES).has('telemetry.event')).toBe(false);
+
+    const route = HTTP_ROUTES['telemetry.event'];
+    expect({ method: route.method, pattern: route.pattern, authExempt: route.authExempt }).toEqual({
+      method: 'POST',
+      pattern: '/telemetry/ingest',
+      authExempt: false,
+    });
+    expect(parseMessage(VALID_FRAMES['telemetry.event']).ok).toBe(true);
+  });
+
   it.each([...AAP_HTTP_ONLY_NAMES])('refuses %s sent as a frame rather than a request', (name) => {
     const parsed = parseMessage({ id: MESSAGE_ID, type: name, ts: SENT_AT, payload: {} });
 
@@ -949,10 +997,20 @@ describe('parseMessage — rejections are typed, total and silent about the valu
       { ...baseFrame(), ts: SENT_AT * 1000 },
       `ts (too_big origin=number max=${String(MAX_EPOCH_MS)})`,
     ],
+    [
+      'a negative ts',
+      { ...baseFrame(), ts: -SENT_AT },
+      `ts (too_small origin=number min=${String(MIN_EPOCH_MS)})`,
+    ],
     ['a NaN ts', { ...baseFrame(), ts: Number.NaN }, 'ts (invalid_type expected=number)'],
     [
       'an infinite ts',
       { ...baseFrame(), ts: Number.POSITIVE_INFINITY },
+      'ts (invalid_type expected=number)',
+    ],
+    [
+      'a negatively infinite ts',
+      { ...baseFrame(), ts: Number.NEGATIVE_INFINITY },
       'ts (invalid_type expected=number)',
     ],
     ['a string ts', { ...baseFrame(), ts: String(SENT_AT) }, 'ts (invalid_type expected=number)'],
@@ -1643,8 +1701,33 @@ describe('version.ts — the wire version and the handshake predicate', () => {
       false,
     ],
     ['a malformed current version', PROTOCOL_VERSION, 'garbage', false],
+    ['a bare major', `${String(PROTOCOL_VERSION_MAJOR)}`, undefined, false],
+    ['a two-part version', `${String(PROTOCOL_VERSION_MAJOR)}.2`, undefined, false],
+    ['non-numeric components', 'x.y.z', undefined, false],
   ])('answers %s with %s', (_label, claimed, current, expected) => {
     expect(isCompatibleProtocolVersion(claimed, current)).toBe(expected);
+  });
+
+  it.each([
+    ['null', null],
+    ['undefined', undefined],
+    ['a number', PROTOCOL_VERSION_MAJOR],
+    ['an object', { version: PROTOCOL_VERSION }],
+    ['an array', [PROTOCOL_VERSION]],
+  ])('answers false for %s smuggled past the type, without throwing', (_label, claimed) => {
+    // The parameter is typed `string`, but the handshake predicate is
+    // documented as total: a JavaScript caller reading `payload.version` out of
+    // an unvalidated frame must get "incompatible", never a TypeError.
+    const smuggled = claimed as unknown as string;
+    let answer: boolean | undefined;
+
+    expect(() => {
+      answer = isCompatibleProtocolVersion(smuggled);
+    }).not.toThrow();
+    expect(answer).toBe(false);
+    // As `current`, an `undefined` selects the default — this build's own
+    // version — so it alone is compatible there; every other non-string is not.
+    expect(isCompatibleProtocolVersion(PROTOCOL_VERSION, smuggled)).toBe(claimed === undefined);
   });
 });
 
@@ -1654,7 +1737,7 @@ describe('version.ts — the epoch-millisecond timestamp primitive', () => {
   });
 
   it('accepts both telemetry bounds inclusively and keeps a fraction exactly', () => {
-    for (const value of [MIN_EPOCH_MS, MAX_EPOCH_MS, SENT_AT + 0.375]) {
+    for (const value of [MIN_EPOCH_MS, MAX_EPOCH_MS, SENT_AT + 0.375, 1_750_000_000_000.25]) {
       const parsed = epochMsSchema.safeParse(value);
 
       expect(parsed.success).toBe(true);
@@ -1665,6 +1748,10 @@ describe('version.ts — the epoch-millisecond timestamp primitive', () => {
   it.each([
     ['one millisecond before the lower bound', MIN_EPOCH_MS - 1, 'too_small'],
     ['one millisecond after the upper bound', MAX_EPOCH_MS + 1, 'too_big'],
+    ['a negative value', -1, 'too_small'],
+    ['a relative performance.now()-scale value', 1234.5, 'too_small'],
+    ['a seconds-precision epoch value', 1_750_000_000, 'too_small'],
+    ['a microsecond-scale epoch value', 1_750_000_000_000_000, 'too_big'],
     ['NaN', Number.NaN, 'invalid_type'],
     ['positive infinity', Number.POSITIVE_INFINITY, 'invalid_type'],
     ['negative infinity', Number.NEGATIVE_INFINITY, 'invalid_type'],
@@ -1837,6 +1924,10 @@ describe('version.ts — embedding an upstream type that owns no schema', () => 
     for (const value of [undefined, null, [], 'text', 0, true]) {
       expect(schema.safeParse(value).success).toBe(false);
     }
+    // The default guard is `isPlainRecord`, so a plain record is admitted as is.
+    const accepted = { captureId: CAPTURE_ID };
+    expect(schema.safeParse(accepted).data).toBe(accepted);
+    expect(schema.safeParse({}).success).toBe(true);
     expectTypeOf<z.infer<typeof schema>>().toEqualTypeOf<SampleShape>();
   });
 
@@ -2000,9 +2091,13 @@ describe('the package barrel — the only door into @debuggen/protocol', () => {
       'PROTOCOL_VERSION',
       'protocolMessageSchema',
       'parseMessage',
+      'decodeMessage',
+      'encodeMessage',
       'createEnvelope',
+      'isMessageOfType',
       'MESSAGE_TYPES',
       'MESSAGE_PAYLOAD_SCHEMAS',
+      'SESSION_STATUSES',
       'sessionRecordSchema',
       'analysisResultSchema',
       'HTTP_ROUTES',
@@ -2176,5 +2271,618 @@ describe('the package barrel — the only door into @debuggen/protocol', () => {
         spy.mockRestore();
       }
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The transport clients — `../client/ws-client.ts` and `../client/http-client.ts`
+//
+// Each client's exhaustive behaviour — races, queue bounds, cancellation, the
+// loopback-only origin policy — is proved in `ws-client.test.ts` and
+// `http-client.test.ts`. The cases here pin the handful of contract points the
+// AAP states outright, against the frame vocabulary this suite owns: the
+// handshake is the first frame of every connection (0.5.6), the reconnect curve
+// runs from half a second to ten (0.5.5), a 4401 stops the loop, an invalid
+// inbound frame never reaches a typed handler, the bearer rule and its two
+// exemptions hold, and a refused reply is never echoed (0.5.2). Both clients
+// are driven through their injection seams only — a fake socket constructor, a
+// manual timer pair, a stub transport — so nothing here opens a socket, sleeps
+// or touches the network.
+// ---------------------------------------------------------------------------
+
+/** The loopback base URL both clients are configured with. */
+const SERVICE_URL = 'http://127.0.0.1:43117';
+
+/** A second credential, for the rotation case. Obviously fake, like the first. */
+const ROTATED_CREDENTIAL = 'devtools-credential-placeholder-rotated';
+
+/** The `readyState` both real socket implementations report while open. */
+const SOCKET_OPEN = 1;
+
+/** An abnormal closure: the code a dropped connection reports. */
+const ABNORMAL_CLOSURE = 1006;
+
+/** The nominal reconnect delays of {@link DEFAULT_WS_BACKOFF}, written out. */
+const NOMINAL_RECONNECT_DELAYS = [500, 1_000, 2_000, 4_000, 8_000, 10_000, 10_000, 10_000];
+
+/** One listener set per socket event, typed by the event it serves. */
+type SocketListenerSets = {
+  [K in keyof WsEventMapLike]: Set<(event: WsEventMapLike[K]) => void>;
+};
+
+/**
+ * A socket that records every frame the client writes and lets a case fire the
+ * four events the client listens for. `send` refuses a write unless the socket
+ * is open, as both real implementations do.
+ */
+class FakeSocket implements WebSocketLike {
+  /** Connecting until {@link FakeSocket.open} is called. */
+  readyState = 0;
+
+  /** Every frame written, in order. */
+  readonly sent: string[] = [];
+
+  /** The listeners currently attached. */
+  private readonly listeners: SocketListenerSets = {
+    open: new Set(),
+    message: new Set(),
+    close: new Set(),
+    error: new Set(),
+  };
+
+  /** @param url The URL the client opened this socket with. */
+  constructor(readonly url: string) {}
+
+  addEventListener<K extends keyof WsEventMapLike>(
+    type: K,
+    listener: (event: WsEventMapLike[K]) => void,
+  ): void {
+    this.listeners[type].add(listener);
+  }
+
+  removeEventListener<K extends keyof WsEventMapLike>(
+    type: K,
+    listener: (event: WsEventMapLike[K]) => void,
+  ): void {
+    this.listeners[type].delete(listener);
+  }
+
+  send(data: string): void {
+    if (this.readyState !== SOCKET_OPEN) {
+      throw new Error('the socket is not open');
+    }
+    this.sent.push(data);
+  }
+
+  close(): void {
+    this.readyState = 2;
+  }
+
+  /** The transport opened: the socket becomes writable and `open` fires. */
+  open(): void {
+    this.readyState = SOCKET_OPEN;
+    this.emit('open', { type: 'open' });
+  }
+
+  /** A frame arrived, exactly as a runtime would deliver it. */
+  receive(data: unknown): void {
+    this.emit('message', { data });
+  }
+
+  /** The connection closed with `code`. */
+  drop(code: number, reason = ''): void {
+    this.readyState = 3;
+    this.emit('close', { code, reason });
+  }
+
+  /** Fires one event to a snapshot of its listeners. */
+  private emit<K extends keyof WsEventMapLike>(type: K, event: WsEventMapLike[K]): void {
+    for (const listener of [...this.listeners[type]]) {
+      listener(event);
+    }
+  }
+}
+
+/** One timer the client scheduled through the injected {@link TimerApi}. */
+interface ManualTimer {
+  readonly handle: number;
+  readonly ms: number;
+  readonly handler: () => void;
+  status: 'pending' | 'fired' | 'cleared';
+}
+
+/** A {@link TimerApi} that records every delay and fires only when told to. */
+class ManualTimers implements TimerApi {
+  /** Every timer ever scheduled, in order. */
+  readonly scheduled: ManualTimer[] = [];
+
+  /** The next handle to mint. */
+  private nextHandle = 1;
+
+  setTimeout(handler: () => void, ms: number): number {
+    const handle = this.nextHandle;
+    this.nextHandle += 1;
+    this.scheduled.push({ handle, ms, handler, status: 'pending' });
+    return handle;
+  }
+
+  clearTimeout(handle: number): void {
+    const timer = this.scheduled.find((candidate) => candidate.handle === handle);
+    if (timer?.status === 'pending') {
+      timer.status = 'cleared';
+    }
+  }
+
+  /** The timers that have neither fired nor been cleared. */
+  pending(): ManualTimer[] {
+    return this.scheduled.filter((timer) => timer.status === 'pending');
+  }
+
+  /**
+   * Fires the one pending timer and answers its delay; fails the case unless
+   * exactly one is pending.
+   */
+  fireOnlyPending(): number {
+    const pending = this.pending();
+    expect(pending).toHaveLength(1);
+    const [timer] = pending;
+    if (timer === undefined) {
+      throw new Error('expected exactly one pending timer');
+    }
+    timer.status = 'fired';
+    timer.handler();
+    return timer.ms;
+  }
+}
+
+/** A client wired to fakes, with everything its hooks reported. */
+interface WsHarness {
+  readonly client: ReconnectingWsClient;
+  readonly sockets: FakeSocket[];
+  readonly timers: ManualTimers;
+  readonly protocolErrors: DebuggenError[];
+  readonly unauthorized: WsUnauthorizedDetail[];
+}
+
+/**
+ * Builds a DevTools client over a fresh fake transport.
+ *
+ * @param random The jitter source; `() => 1` reproduces the nominal curve.
+ */
+function createWsHarness(random: () => number = () => 1): WsHarness {
+  const sockets: FakeSocket[] = [];
+  const timers = new ManualTimers();
+  const protocolErrors: DebuggenError[] = [];
+  const unauthorized: WsUnauthorizedDetail[] = [];
+
+  class RecordedSocket extends FakeSocket {
+    constructor(url: string) {
+      super(url);
+      sockets.push(this);
+    }
+  }
+
+  const webSocketConstructor: WebSocketConstructorLike = RecordedSocket;
+  const client = new ReconnectingWsClient({
+    url: SERVICE_URL,
+    webSocketConstructor,
+    identity: { client: 'devtools', tabId: TAB_ID },
+    token: () => CREDENTIAL_PLACEHOLDER,
+    timers,
+    random,
+    onProtocolError: (error) => {
+      protocolErrors.push(error);
+    },
+    onUnauthorized: (detail) => {
+      unauthorized.push(detail);
+    },
+  });
+
+  return { client, sockets, timers, protocolErrors, unauthorized };
+}
+
+/** The most recently constructed socket; fails the case when there is none. */
+function latestSocket(harness: WsHarness): FakeSocket {
+  const socket = harness.sockets.at(-1);
+  if (socket === undefined) {
+    throw new Error('expected the client to have constructed a socket');
+  }
+  return socket;
+}
+
+/** Decodes every frame a socket was sent, failing the case on any invalid one. */
+function decodeAll(socket: FakeSocket): ProtocolMessage[] {
+  return socket.sent.map((text) => {
+    const decoded = decodeMessage(text);
+    if (!decoded.ok) {
+      throw new Error('the client wrote a frame that does not decode');
+    }
+    return decoded.value;
+  });
+}
+
+/** Drops the current socket abnormally and fires the reconnect it schedules. */
+function dropAndReconnect(harness: WsHarness): number {
+  latestSocket(harness).drop(ABNORMAL_CLOSURE);
+  return harness.timers.fireOnlyPending();
+}
+
+/** A valid `session.progress` frame, as the service would send it. */
+function progressText(message: string): string {
+  return encodeMessage(
+    createEnvelope(
+      'session.progress',
+      { ...VALID_PAYLOADS['session.progress'], message },
+      { id: MESSAGE_ID, ts: SENT_AT },
+    ),
+  );
+}
+
+describe('ReconnectingWsClient — the handshake and the reconnect loop', () => {
+  it('writes client.hello first on every connection, with the version, identity and credential', () => {
+    const harness = createWsHarness();
+
+    harness.client.connect();
+    // Handed over before the socket opened: it must wait behind the hello.
+    expect(harness.client.send('session.unbind', { tabId: TAB_ID })).toStrictEqual({
+      ok: true,
+      value: 'queued',
+    });
+    latestSocket(harness).open();
+
+    const first = decodeAll(latestSocket(harness));
+    expect(first.map((message) => message.type)).toEqual(['client.hello', 'session.unbind']);
+    expect(latestSocket(harness).url).toBe(`ws://127.0.0.1:43117${WS_PATH}`);
+
+    // A reconnect mints its own hello, again first, again current.
+    dropAndReconnect(harness);
+    latestSocket(harness).open();
+    const second = decodeAll(latestSocket(harness));
+
+    for (const frames of [first, second]) {
+      const [hello] = frames;
+      if (hello === undefined || !isMessageOfType(hello, 'client.hello')) {
+        expect.unreachable('the first frame of every connection must be client.hello');
+        return;
+      }
+      expect(hello.payload).toStrictEqual({
+        client: 'devtools',
+        tabId: TAB_ID,
+        version: PROTOCOL_VERSION,
+        token: CREDENTIAL_PLACEHOLDER,
+      });
+    }
+    expect(second.map((message) => message.type)).toEqual(['client.hello']);
+    expect(harness.sockets).toHaveLength(2);
+  });
+
+  it('backs off along the documented 0.5 s to 10 s curve, never above maxMs', () => {
+    const harness = createWsHarness(() => 1);
+
+    harness.client.connect();
+    const delays = NOMINAL_RECONNECT_DELAYS.map(() => dropAndReconnect(harness));
+
+    expect(DEFAULT_WS_BACKOFF).toStrictEqual({
+      initialMs: 500,
+      maxMs: 10_000,
+      factor: 2,
+      jitter: 0.5,
+    });
+    expect(Object.isFrozen(DEFAULT_WS_BACKOFF)).toBe(true);
+    // With the jitter drawing 1 the curve is the nominal one, exactly.
+    expect(delays).toEqual(NOMINAL_RECONNECT_DELAYS);
+    expect(delays[0]).toBe(DEFAULT_WS_BACKOFF.initialMs);
+    for (const [index, delay] of delays.entries()) {
+      expect(delay).toBeLessThanOrEqual(DEFAULT_WS_BACKOFF.maxMs);
+      expect(delay).toBeGreaterThanOrEqual(delays[index - 1] ?? 0);
+    }
+  });
+
+  it('keeps every jittered delay inside its declared band', () => {
+    // A fixed, repeating draw sequence: deterministic, and covering both ends.
+    const draws = [0, 0.25, 1, 0.5, 0.75, 0, 1, 0.1];
+    let next = 0;
+    const harness = createWsHarness(() => {
+      const draw = draws[next % draws.length] ?? 0;
+      next += 1;
+      return draw;
+    });
+    const { jitter, maxMs } = DEFAULT_WS_BACKOFF;
+
+    harness.client.connect();
+    const delays = NOMINAL_RECONNECT_DELAYS.map(() => dropAndReconnect(harness));
+
+    for (const [index, delay] of delays.entries()) {
+      const nominal = NOMINAL_RECONNECT_DELAYS[index] ?? maxMs;
+      expect(delay).toBeGreaterThanOrEqual(nominal * (1 - jitter));
+      expect(delay).toBeLessThanOrEqual(nominal);
+      expect(delay).toBeLessThanOrEqual(maxMs);
+    }
+    // The first delay starts at the initial value, allowing for the jitter.
+    expect(delays[0]).toBe(DEFAULT_WS_BACKOFF.initialMs * (1 - jitter));
+  });
+
+  it('resets the curve after a successful hello', () => {
+    const harness = createWsHarness(() => 1);
+
+    harness.client.connect();
+    // Three sockets die before their hello: the curve climbs.
+    const beforeHello = [
+      dropAndReconnect(harness),
+      dropAndReconnect(harness),
+      dropAndReconnect(harness),
+    ];
+    expect(beforeHello).toEqual([500, 1_000, 2_000]);
+
+    // The fourth completes its hello…
+    latestSocket(harness).open();
+    expect(decodeAll(latestSocket(harness)).map((message) => message.type)).toEqual([
+      'client.hello',
+    ]);
+    expect(harness.client.state).toBe('open');
+
+    // …so the next drop starts the curve again from its first delay.
+    expect(dropAndReconnect(harness)).toBe(DEFAULT_WS_BACKOFF.initialMs);
+    expect(harness.sockets).toHaveLength(5);
+  });
+
+  it('stops on a 4401 close: no new socket, no timer, and onUnauthorized fires', () => {
+    const harness = createWsHarness();
+
+    harness.client.connect();
+    latestSocket(harness).open();
+    const scheduledBefore = harness.timers.scheduled.length;
+
+    latestSocket(harness).drop(WS_CLOSE_UNAUTHORIZED, 'the service refused this credential');
+
+    expect(WS_CLOSE_UNAUTHORIZED).toBe(4401);
+    expect(harness.sockets).toHaveLength(1);
+    expect(harness.timers.scheduled).toHaveLength(scheduledBefore);
+    expect(harness.timers.pending()).toEqual([]);
+    expect(harness.client.state).toBe('closed');
+    expect(harness.unauthorized).toHaveLength(1);
+    expect(harness.unauthorized[0]?.code).toBe(WS_CLOSE_UNAUTHORIZED);
+    // The refusal is about the credential; the credential itself goes nowhere.
+    expect(JSON.stringify(harness.unauthorized)).not.toContain(CREDENTIAL_PLACEHOLDER);
+  });
+});
+
+describe('ReconnectingWsClient — inbound frames and typed dispatch', () => {
+  it('reports malformed JSON and an unknown type to onProtocolError, never to a handler', () => {
+    const harness = createWsHarness();
+    const handled: string[] = [];
+
+    harness.client.on('session.progress', (message) => {
+      handled.push(message.payload.message);
+    });
+    harness.client.connect();
+    const socket = latestSocket(harness);
+    socket.open();
+
+    socket.receive(`{"type":"session.progress","payload":{"message":"${SENTINEL}"`);
+    socket.receive(
+      JSON.stringify({ id: MESSAGE_ID, type: 'session.unknown', ts: SENT_AT, payload: {} }),
+    );
+
+    expect(handled).toEqual([]);
+    expect(harness.protocolErrors.map((error) => error.code)).toEqual([
+      'PROTOCOL_INVALID_MESSAGE',
+      'PROTOCOL_INVALID_MESSAGE',
+    ]);
+    for (const error of harness.protocolErrors) {
+      expectNoEchoInChain(error, SENTINEL);
+    }
+
+    // The same handler still receives a valid frame, so the silence above is
+    // the refusal and not a handler that was never wired.
+    socket.receive(progressText('Traced event handler'));
+    expect(handled).toEqual(['Traced event handler']);
+    expect(harness.protocolErrors).toHaveLength(2);
+  });
+
+  it('unsubscribes one handler without disturbing another for the same type', () => {
+    const harness = createWsHarness();
+    const first: string[] = [];
+    const second: string[] = [];
+
+    const stopFirst = harness.client.on('session.progress', (message) => {
+      first.push(message.payload.message);
+    });
+    harness.client.on('session.progress', (message) => {
+      second.push(message.payload.message);
+    });
+    harness.client.connect();
+    const socket = latestSocket(harness);
+    socket.open();
+
+    socket.receive(progressText('one'));
+    stopFirst();
+    stopFirst();
+    socket.receive(progressText('two'));
+
+    expect(first).toEqual(['one']);
+    expect(second).toEqual(['one', 'two']);
+    expect(harness.protocolErrors).toEqual([]);
+  });
+});
+
+/** One request the stub transport received. */
+interface RecordedRequest {
+  readonly url: string;
+  readonly init: HttpFetchInit | undefined;
+}
+
+/**
+ * A {@link FetchLike} that answers every call with one synthetic reply and
+ * records what it was asked.
+ *
+ * @param status The reply's status.
+ * @param body The reply's body: text as is, anything else as JSON.
+ */
+function stubFetch(
+  status: number,
+  body: unknown,
+): { readonly fetch: FetchLike; readonly requests: RecordedRequest[] } {
+  const requests: RecordedRequest[] = [];
+  const text = typeof body === 'string' ? body : JSON.stringify(body);
+  const fetch: FetchLike = (url, init) => {
+    requests.push({ url, init });
+    const reply: HttpResponseLike = {
+      ok: status >= 200 && status < 300,
+      status,
+      text: () => Promise.resolve(text),
+    };
+    return Promise.resolve(reply);
+  };
+  return { fetch, requests };
+}
+
+/** The headers of the one request a stub received; fails otherwise. */
+function onlyRequestHeaders(requests: readonly RecordedRequest[]): Record<string, string> {
+  expect(requests).toHaveLength(1);
+  return requests[0]?.init?.headers ?? {};
+}
+
+/**
+ * Asserts a planted value reached no surface of a rejection, nor of any error
+ * it carries as its cause — and that every cause is itself one of this
+ * product's leak-free errors rather than a `ZodError` or a `SyntaxError`, which
+ * would carry the rejected input with it.
+ */
+function expectNoEchoInChain(error: DebuggenError, planted: string): void {
+  let current: unknown = error;
+  while (current !== undefined) {
+    expect(current).toBeInstanceOf(DebuggenError);
+    if (!(current instanceof DebuggenError)) {
+      return;
+    }
+    expect(DEBUGGEN_ERROR_CODES).toContain(current.code);
+    for (const surface of errorSurfaces(current)) {
+      expect(surface).not.toContain(planted);
+    }
+    current = current.cause;
+  }
+}
+
+describe('HttpClient — the bearer rule, typed replies and typed failures', () => {
+  it('sends the bearer credential on a protected route and parses the reply', async () => {
+    const stub = stubFetch(200, { captureId: CAPTURE_ID });
+    const client = new HttpClient({
+      baseUrl: SERVICE_URL,
+      token: CREDENTIAL_PLACEHOLDER,
+      fetch: stub.fetch,
+    });
+
+    const result = await client.startCapture(SESSION_ID);
+
+    expect(result).toStrictEqual({ ok: true, value: { captureId: CAPTURE_ID } });
+    expect(stub.requests[0]?.url).toBe(`${SERVICE_URL}/sessions/${SESSION_ID}/capture/start`);
+    expect(stub.requests[0]?.init?.method).toBe('POST');
+    expect(onlyRequestHeaders(stub.requests)[AUTHORIZATION_HEADER]).toBe(
+      `Bearer ${CREDENTIAL_PLACEHOLDER}`,
+    );
+  });
+
+  it('sends no Authorization header on either auth-exempt operation', async () => {
+    expect([...AUTH_EXEMPT_OPERATIONS].sort()).toEqual(['health', 'pair.complete']);
+
+    const health = stubFetch(200, {
+      version: '0.1.0',
+      protocolVersion: PROTOCOL_VERSION,
+      pairingAvailable: true,
+    });
+    const pairing = stubFetch(200, { token: ROTATED_CREDENTIAL });
+    // A credential is configured on purpose: the exemption is that it is not
+    // sent, not that there was nothing to send.
+    const healthClient = new HttpClient({
+      baseUrl: SERVICE_URL,
+      token: CREDENTIAL_PLACEHOLDER,
+      fetch: health.fetch,
+    });
+    const pairingClient = new HttpClient({
+      baseUrl: SERVICE_URL,
+      token: CREDENTIAL_PLACEHOLDER,
+      fetch: pairing.fetch,
+    });
+
+    const healthResult = await healthClient.health();
+    const pairingResult = await pairingClient.pairComplete('PAIR2X7Q');
+
+    expect(healthResult).toStrictEqual({
+      ok: true,
+      value: { version: '0.1.0', protocolVersion: PROTOCOL_VERSION, pairingAvailable: true },
+    });
+    expect(pairingResult).toStrictEqual({ ok: true, value: { token: ROTATED_CREDENTIAL } });
+    expect(Object.hasOwn(onlyRequestHeaders(health.requests), AUTHORIZATION_HEADER)).toBe(false);
+    expect(Object.hasOwn(onlyRequestHeaders(pairing.requests), AUTHORIZATION_HEADER)).toBe(false);
+    expect(health.requests[0]?.url).toBe(`${SERVICE_URL}/health`);
+    expect(pairing.requests[0]?.url).toBe(`${SERVICE_URL}/pair/complete`);
+    expect(pairing.requests[0]?.init?.body).toBe(JSON.stringify({ code: 'PAIR2X7Q' }));
+  });
+
+  it('answers a 500 with a typed failure rather than a throw', async () => {
+    const stub = stubFetch(500, { code: 'INTERNAL', message: 'the store is unavailable' });
+    const client = new HttpClient({
+      baseUrl: SERVICE_URL,
+      token: CREDENTIAL_PLACEHOLDER,
+      fetch: stub.fetch,
+    });
+
+    const pending = client.startCapture(SESSION_ID);
+    await expect(pending).resolves.toMatchObject({ ok: false });
+
+    const result = await pending;
+    expect(result.ok).toBe(false);
+    if (result.ok) {
+      return;
+    }
+    expect(result.error).toBeInstanceOf(DebuggenError);
+    expect(DEBUGGEN_ERROR_CODES).toContain(result.error.code);
+    expect(result.error.details).toMatchObject({ operation: 'capture.start', status: 500 });
+  });
+
+  it('answers a schema-mismatched 200 with a typed failure that echoes nothing', async () => {
+    const stub = stubFetch(200, { captureId: SENTINEL, note: SENTINEL });
+    const client = new HttpClient({
+      baseUrl: SERVICE_URL,
+      token: CREDENTIAL_PLACEHOLDER,
+      fetch: stub.fetch,
+    });
+
+    const result = await client.startCapture(SESSION_ID);
+
+    expect(result.ok).toBe(false);
+    if (result.ok) {
+      return;
+    }
+    expect(result.error.code).toBe('PROTOCOL_INVALID_MESSAGE');
+    expect(result.error.details).toMatchObject({ operation: 'capture.start', status: 200 });
+    expectNoEchoInChain(result.error, SENTINEL);
+    expectNoEchoInChain(result.error, CREDENTIAL_PLACEHOLDER);
+  });
+
+  it('presents whatever setToken last set, from the next request onward', async () => {
+    const stub = stubFetch(200, { captureId: CAPTURE_ID });
+    const client = new HttpClient({ baseUrl: SERVICE_URL, fetch: stub.fetch });
+
+    // No credential: a protected call fails locally and nothing is sent.
+    const unauthenticated = await client.startCapture(SESSION_ID);
+    expect(unauthenticated.ok).toBe(false);
+    expect(unauthenticated.ok ? undefined : unauthenticated.error.code).toBe('UNAUTHORIZED');
+    expect(stub.requests).toHaveLength(0);
+
+    client.setToken(CREDENTIAL_PLACEHOLDER);
+    await client.startCapture(SESSION_ID);
+    client.setToken(() => ROTATED_CREDENTIAL);
+    await client.startCapture(SESSION_ID);
+    client.setToken(undefined);
+    const cleared = await client.startCapture(SESSION_ID);
+
+    expect(stub.requests.map((request) => request.init?.headers?.[AUTHORIZATION_HEADER])).toEqual([
+      `Bearer ${CREDENTIAL_PLACEHOLDER}`,
+      `Bearer ${ROTATED_CREDENTIAL}`,
+    ]);
+    expect(cleared.ok).toBe(false);
+    expect(stub.requests).toHaveLength(2);
   });
 });
