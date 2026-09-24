@@ -22,6 +22,13 @@
  *     case asserts the dashed edge, the row's flag and the alternative candidate
  *     span ids; the orphan case asserts that a re-attached node is drawn, flagged,
  *     and counted — the rendered row count equals the tree's own `nodeCount`.
+ *   - **Parent before child on a flat page.** A `spans` page is linked into a
+ *     parent/child forest before it is drawn (AAP 0.2.3): a child whose clock
+ *     reads earlier than its parent's still follows it, a subtree stays
+ *     contiguous, siblings fall back to `ingestSeq` last, a parent cycle drops
+ *     nothing and a row hanging beneath one still follows its parent, and a
+ *     span whose parent is not loaded is marked "Parent not loaded" — never
+ *     "Re-attached" — until a later page brings the parent.
  *   - **Partial results say so.** A `spans` page states how much of the result it
  *     holds and offers to load more; a `trace` the correlator truncated says that
  *     instead of implying completeness.
@@ -31,6 +38,10 @@
  *     page is in flight or after it failed, a next offset past 5,000 is still
  *     followed, a response naming none ends the walk whatever its total says,
  *     and a changed query starts again from its first page.
+ *   - **An empty page is not an empty capture.** A `limit: 0` query states its
+ *     total as a count and offers no paging; a page past the end, or short of
+ *     it, states its position and the total; only a zero total, an untotalled
+ *     first page or an empty trace says that nothing was captured.
  *   - **The canvas is not the only representation.** The SVG is `role="img"` with
  *     a text alternative, so its bars are deliberately outside the accessibility
  *     tree; the keyboard-reachable equivalent below it must therefore list every
@@ -114,6 +125,7 @@ import {
   formatOffset,
   formatTierLabel,
 } from '../utils/format';
+import { alignHairline } from '../utils/scale';
 import { Timeline } from './Timeline';
 
 /*
@@ -195,6 +207,9 @@ const REATTACHED_FLAG = 'Re-attached';
 
 /** The flag it carries when more than one parent was possible. */
 const AMBIGUOUS_FLAG = 'Ambiguous parent';
+
+/** The flag a flat-page row carries when the parent it names is not among the loaded rows. */
+const PARENT_NOT_LOADED_FLAG = 'Parent not loaded';
 
 /** The attribution mechanism a continuation window records, verbatim. */
 const ASYNC_CONTINUATION = 'async-continuation';
@@ -622,9 +637,12 @@ function crossTierTree(overrides: TreeOverrides = {}): TraceTree {
  * ---------------------------------------------------------------------------
  */
 
-/** One page a stub provider can answer with: a correlated tree, or a span page. */
+/**
+ * One page a stub provider can answer with: a correlated tree — or `null`, the
+ * service's answer when no trace in the capture matched — or a span page.
+ */
 type TimelinePage =
-  | { readonly source: 'trace'; readonly data: TraceTree }
+  | { readonly source: 'trace'; readonly data: TraceTree | null }
   | {
       readonly source: 'spans';
       readonly data: readonly TelemetryEvent[];
@@ -1002,6 +1020,28 @@ describe('Timeline states', () => {
     expect(screen.queryByRole('status')).toBeNull();
   });
 
+  it('renders its own empty message, not an error, when no trace matched the query', async () => {
+    const stub = pagingProvider([{ source: 'trace', data: null }]);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    // `null` is the service's answer for a capture that collected nothing
+    // correlated: an empty capture, drawn as the same absence an empty tree is.
+    const message = await screen.findByText(/no correlated spans were captured/i);
+    expect(message.classList.contains('dg-empty-state__message')).toBe(true);
+    expect(message.closest('.dg-timeline__empty')).not.toBeNull();
+
+    // No alert and so no retry, and nothing placed on an axis or in the table.
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.queryByRole('button', { name: RETRY_NAME })).toBeNull();
+    expect(screen.queryByRole('status')).toBeNull();
+    expect(screen.queryByRole('img')).toBeNull();
+    expect(screen.queryByRole('grid')).toBeNull();
+    expect(screen.queryAllByRole('row')).toHaveLength(0);
+    expect(stub.resolve).toHaveBeenCalledTimes(1);
+    expect(soleQuery(stub)).toEqual({ source: 'trace', filter: { traceId: TRACE_ID } });
+  });
+
   it('renders an alert carrying the failed query, and retries it on request', async () => {
     const stub = rejectingProvider(
       new DebuggenError('TRANSPORT_DISCONNECTED', 'The channel to the service is closed.'),
@@ -1178,8 +1218,8 @@ describe('Timeline cross-tier chain', () => {
     expect(barsOf(canvas)).toHaveLength(CHAIN_EVENTS.length);
     expect(laneLabelsOf(canvas)).toEqual([...CHAIN_LANE_LABELS]);
 
-    // Ordered canonically — start, then the producer's own sequence — whatever
-    // order the page arrived in.
+    // Ordered parent-first — each span after the span it names as its parent,
+    // siblings in canonical order — whatever order the page arrived in.
     expect(renderedNames()).toEqual([...CHAIN_NAMES]);
 
     const query = soleQuery(stub);
@@ -1737,6 +1777,259 @@ describe('Timeline paging', () => {
   });
 });
 
+/*
+ * ---------------------------------------------------------------------------
+ * Empty pages are not empty captures
+ *
+ * The query contract makes `limit: 0` an explicit request for a total without
+ * rows, and an offset past the end an empty page rather than an error; in both
+ * the service may report a positive total. The cases below hold the view to
+ * saying which of those it is looking at, and to saying "nothing was captured"
+ * only when the total is zero — or unreported on the first page — or the
+ * source is a correlated trace, which reports no total at all.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The empty state's title for a result that holds nothing to draw. */
+const NOTHING_CAPTURED_TITLE = 'Nothing to place on the axis';
+
+/** The empty state's message for a result that holds nothing to draw. */
+const NOTHING_CAPTURED_MESSAGE = 'No correlated spans were captured for this interaction.';
+
+/** The empty state's title for a page that holds nothing while the result may not. */
+const EMPTY_PAGE_TITLE = 'Nothing on this page';
+
+/** The empty state's title for a span query authored with `limit: 0`. */
+const COUNT_ONLY_TITLE = 'Count only';
+
+/**
+ * Waits for the view's empty state and asserts its title and message, and that
+ * nothing else is drawn in its place.
+ *
+ * @param title The title the empty state must carry.
+ * @param message The message the empty state must carry.
+ */
+async function expectEmptyState(title: string, message: string): Promise<void> {
+  const rendered = await screen.findByText(message);
+  expect(rendered.classList.contains('dg-empty-state__message')).toBe(true);
+
+  const slot = rendered.closest('.dg-timeline__empty');
+  expect(slot).not.toBeNull();
+  expect(slot?.querySelector('.dg-empty-state__title')?.textContent).toBe(title);
+
+  // An empty state is a success drawn as an absence: no canvas, no table, no
+  // failure and no loading indicator.
+  expect(screen.queryByRole('img')).toBeNull();
+  expect(screen.queryByRole('grid')).toBeNull();
+  expect(screen.queryByRole('alert')).toBeNull();
+  expect(screen.queryByRole('status')).toBeNull();
+}
+
+describe('Timeline empty pages', () => {
+  it.each([
+    ['echoes the offset it answered', 0],
+    ['names a forward offset', 5],
+  ])(
+    'states the total of a count-only query, and offers no page, when its response %s',
+    async (_description: string, nextOffset: number) => {
+      const stub = offsetPagedProvider(
+        pagesByOffset(new Map<number, SpanPageAnswer>([[0, { data: [], total: 42, nextOffset }]])),
+      );
+
+      renderComponent(pagedSpansNode(0), {
+        provider: stub.provider,
+        actions: makeActions().actions,
+      });
+
+      await expectEmptyState(
+        COUNT_ONLY_TITLE,
+        `This view requests a count without rows: ${formatCount(42)} spans matched its query.`,
+      );
+      expect(screen.queryByText(NOTHING_CAPTURED_MESSAGE)).toBeNull();
+
+      // Every page of a zero-size query is empty, so no paging is offered and
+      // nothing more is requested, whatever the response named.
+      expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+      expect(stub.resolve).toHaveBeenCalledTimes(1);
+
+      // The explicit zero is sent as written, never rounded up into a row.
+      const request = pageRequest(stub, 1);
+      expect(request.limit).toBe(0);
+      expect(request.offset).toBe(0);
+    },
+  );
+
+  it('names a single matched span in the singular under a count-only query', async () => {
+    const stub = offsetPagedProvider(
+      pagesByOffset(new Map<number, SpanPageAnswer>([[0, { data: [], total: 1 }]])),
+    );
+
+    renderComponent(pagedSpansNode(0), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    await expectEmptyState(
+      COUNT_ONLY_TITLE,
+      `This view requests a count without rows: ${formatCount(1)} span matched its query.`,
+    );
+  });
+
+  it('says no total was reported for a count-only query answered without one', async () => {
+    const stub = offsetPagedProvider(
+      pagesByOffset(new Map<number, SpanPageAnswer>([[0, { data: [] }]])),
+    );
+
+    renderComponent(pagedSpansNode(0), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    await expectEmptyState(
+      COUNT_ONLY_TITLE,
+      'This view requests a count without rows, and no total was reported for its query.',
+    );
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+  });
+
+  it('says an authored offset past the end starts past the result, and names its total', async () => {
+    const stub = offsetPagedProvider(
+      pagesByOffset(new Map<number, SpanPageAnswer>([[200, { data: [], total: 42 }]])),
+    );
+
+    renderComponent(pagedSpansNode(2, 200), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    await expectEmptyState(
+      EMPTY_PAGE_TITLE,
+      `This page starts at position ${formatCount(201)}, past the end of the ${formatCount(
+        42,
+      )} spans that matched this query.`,
+    );
+    expect(screen.queryByText(NOTHING_CAPTURED_MESSAGE)).toBeNull();
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+
+    const request = pageRequest(stub, 1);
+    expect(request.offset).toBe(200);
+    expect(request.limit).toBe(2);
+  });
+
+  it('places a later empty page at the offset the service named, not at the authored one', async () => {
+    const stub = offsetPagedProvider(
+      pagesByOffset(
+        new Map<number, SpanPageAnswer>([
+          [0, { data: [], total: 2, nextOffset: 2 }],
+          [2, { data: [], total: 2 }],
+        ]),
+      ),
+    );
+    const user = userEvent.setup();
+
+    renderComponent(pagedSpansNode(2), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    await screen.findByText(`Showing ${formatCount(0)} of ${formatCount(2)} spans.`);
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+
+    await expectEmptyState(
+      EMPTY_PAGE_TITLE,
+      `This page starts at position ${formatCount(3)}, past the end of the ${formatCount(
+        2,
+      )} spans that matched this query.`,
+    );
+    expect(pageRequest(stub, 2).offset).toBe(2);
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+    expect(stub.resolve).toHaveBeenCalledTimes(2);
+  });
+
+  it('names the total when an empty page falls short of the end of the result', async () => {
+    const stub = offsetPagedProvider(
+      pagesByOffset(new Map<number, SpanPageAnswer>([[10, { data: [], total: 42 }]])),
+    );
+
+    renderComponent(pagedSpansNode(2, 10), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    await expectEmptyState(
+      EMPTY_PAGE_TITLE,
+      `${formatCount(42)} spans matched this query, but none are shown on this page.`,
+    );
+    expect(screen.queryByText(NOTHING_CAPTURED_MESSAGE)).toBeNull();
+  });
+
+  it('states the position of an empty page past the first row when no total was reported', async () => {
+    const stub = offsetPagedProvider(
+      pagesByOffset(new Map<number, SpanPageAnswer>([[5, { data: [] }]])),
+    );
+
+    renderComponent(pagedSpansNode(2, 5), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    await expectEmptyState(
+      EMPTY_PAGE_TITLE,
+      `This page starts at position ${formatCount(
+        6,
+      )} and holds no spans; no total was reported for this query.`,
+    );
+    expect(screen.queryByText(NOTHING_CAPTURED_MESSAGE)).toBeNull();
+  });
+
+  it.each([
+    ['reports a total of zero on its first page', 0, { data: [], total: 0 }],
+    ['reports a total of zero past its first page', 200, { data: [], total: 0 }],
+    ['reports no total on its first page', 0, { data: [] }],
+  ])(
+    'says nothing was captured when a span result %s',
+    async (_description: string, offset: number, answer: SpanPageAnswer) => {
+      const stub = offsetPagedProvider(
+        pagesByOffset(new Map<number, SpanPageAnswer>([[offset, answer]])),
+      );
+
+      renderComponent(pagedSpansNode(2, offset), {
+        provider: stub.provider,
+        actions: makeActions().actions,
+      });
+
+      await expectEmptyState(NOTHING_CAPTURED_TITLE, NOTHING_CAPTURED_MESSAGE);
+      expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+    },
+  );
+
+  it.each([
+    ['with no limit', undefined],
+    ['authored with a limit of zero', 0],
+  ])(
+    'keeps the empty-capture copy for a correlated trace that holds nothing, %s',
+    async (_description: string, limit: number | undefined) => {
+      const stub = resolvingTrace(makeTree([]));
+
+      renderComponent(
+        makeNode({
+          query: {
+            source: 'trace',
+            filter: { traceId: TRACE_ID },
+            ...(limit === undefined ? {} : { limit }),
+          },
+        }),
+        { provider: stub.provider, actions: makeActions().actions },
+      );
+
+      // A trace reports no total, so its absence is the capture's.
+      await expectEmptyState(NOTHING_CAPTURED_TITLE, NOTHING_CAPTURED_MESSAGE);
+      expect(screen.queryByText(COUNT_ONLY_TITLE)).toBeNull();
+      expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+    },
+  );
+});
+
 describe('Timeline partial results', () => {
   it('says how much of a span result is on screen and asks for the next page', async () => {
     // A page of one record out of twenty-five, then the next page the component
@@ -2004,6 +2297,460 @@ describe('Timeline correlation honesty', () => {
 
     // The rows that were placed carry no re-attachment mark.
     expect(within(rowNamed(INTERACTION_EVENT.name)).queryByText(REATTACHED_FLAG)).toBeNull();
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Span order on a flat page
+ *
+ * AAP 0.2.3 fixes the order within a trace as parent-before-child, then
+ * `startTime`, then `(producerId, seq)`, then `ingestSeq`. A `spans` page has no
+ * tree to walk, so the component links the loaded rows into one before drawing
+ * them. Every fixture below is built so that a pure time order would draw it
+ * differently, and each is served out of order, so a case can only pass when
+ * the structure — not the arrival order and not the clock — decided the rows.
+ * ---------------------------------------------------------------------------
+ */
+
+/** A `spans` node over the fixture trace, with the published default page size. */
+function spansNode(): TimelineNode {
+  return makeNode({ query: { source: 'spans', filter: { traceId: TRACE_ID } } });
+}
+
+/** A second fixture trace, for a page with no trace filter: 32 lower-case hex digits. */
+const SECOND_TRACE_ID = 'c8d2e3f405162738495a6b7c8d9e0f1a';
+
+describe('Timeline span order', () => {
+  it('draws a parent before a child whose clock reads earlier, and joins the two', async () => {
+    // Two producers read two clocks and no alignment is applied, so a server
+    // child can start a millisecond "before" the browser span that caused it.
+    const parent = makeEvent({
+      id: 'event-example-0101',
+      spanId: spanIdFor(0x11),
+      kind: 'fetch',
+      name: 'example.parent',
+      tier: 'browser',
+      startTime: BASE_START_MS + 1000,
+      duration: 40,
+      producerId: BROWSER_PRODUCER_ID,
+      seq: 0,
+      ingestSeq: 1,
+    });
+    const child = makeEvent({
+      id: 'event-example-0102',
+      spanId: spanIdFor(0x12),
+      parentSpanId: parent.spanId,
+      kind: 'http.server',
+      name: 'example.child',
+      tier: 'server',
+      startTime: BASE_START_MS + 999,
+      duration: 30,
+      producerId: SERVER_PRODUCER_ID,
+      seq: 0,
+      ingestSeq: 2,
+    });
+    const stub = resolvingSpans([child, parent]);
+
+    renderComponent(spansNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    const canvas = await findCanvas();
+
+    // The parent first in the equivalent table and on the canvas alike.
+    expect(renderedNames()).toEqual([parent.name, child.name]);
+
+    const [firstBar, secondBar] = barsOf(canvas);
+    expect(barsOf(canvas)).toHaveLength(2);
+    expect(firstBar).toBe(barTitled(canvas, parent.name));
+    expect(secondBar).toBe(barTitled(canvas, child.name));
+
+    // The relationship is drawn, and the child's parent is loaded, so it is not
+    // flagged as missing one.
+    expect(edgesOf(canvas)).toHaveLength(1);
+    expect(within(rowNamed(child.name)).queryByText(PARENT_NOT_LOADED_FLAG)).toBeNull();
+    expect(within(rowNamed(parent.name)).queryByText(PARENT_NOT_LOADED_FLAG)).toBeNull();
+  });
+
+  it('breaks a tie on start, producer and sequence by arrival order, not by id', async () => {
+    const arrivedFirst = makeEvent({
+      id: 'event-example-0202',
+      spanId: spanIdFor(0x21),
+      name: 'example.arrived-first',
+      startTime: BASE_START_MS,
+      producerId: BROWSER_PRODUCER_ID,
+      seq: 3,
+      ingestSeq: 1,
+    });
+    const arrivedSecond = makeEvent({
+      id: 'event-example-0201',
+      spanId: spanIdFor(0x22),
+      name: 'example.arrived-second',
+      startTime: BASE_START_MS,
+      producerId: BROWSER_PRODUCER_ID,
+      seq: 3,
+      ingestSeq: 2,
+    });
+
+    // The ids order the two the other way round, so an id tie-break reached
+    // before `ingestSeq` would reverse the rows.
+    expect(arrivedSecond.id < arrivedFirst.id).toBe(true);
+
+    const stub = resolvingSpans([arrivedSecond, arrivedFirst]);
+
+    renderComponent(spansNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await findCanvas();
+
+    expect(renderedNames()).toEqual([arrivedFirst.name, arrivedSecond.name]);
+  });
+
+  it('keeps a subtree contiguous: a later root follows every descendant of an earlier one', async () => {
+    const firstRoot = makeEvent({
+      id: 'event-example-0301',
+      spanId: spanIdFor(0x31),
+      name: 'example.first-root',
+      startTime: BASE_START_MS,
+      duration: 80,
+      seq: 0,
+      ingestSeq: 1,
+    });
+    const earlyChild = makeEvent({
+      id: 'event-example-0302',
+      spanId: spanIdFor(0x32),
+      parentSpanId: firstRoot.spanId,
+      kind: 'fetch',
+      name: 'example.early-child',
+      startTime: BASE_START_MS + 10,
+      duration: 20,
+      seq: 1,
+      ingestSeq: 2,
+    });
+    const secondRoot = makeEvent({
+      id: 'event-example-0303',
+      spanId: spanIdFor(0x33),
+      name: 'example.second-root',
+      startTime: BASE_START_MS + 20,
+      duration: 10,
+      seq: 2,
+      ingestSeq: 3,
+    });
+    const lateChild = makeEvent({
+      id: 'event-example-0304',
+      spanId: spanIdFor(0x34),
+      parentSpanId: firstRoot.spanId,
+      kind: 'fetch',
+      name: 'example.late-child',
+      startTime: BASE_START_MS + 50,
+      duration: 20,
+      seq: 3,
+      ingestSeq: 4,
+    });
+    const stub = resolvingSpans([secondRoot, lateChild, firstRoot, earlyChild]);
+
+    renderComponent(spansNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    const canvas = await findCanvas();
+
+    // Time order would put the second root between the two children; the
+    // children are siblings, so they are ordered by their own start instead.
+    expect(renderedNames()).toEqual([
+      firstRoot.name,
+      earlyChild.name,
+      lateChild.name,
+      secondRoot.name,
+    ]);
+    expect(edgesOf(canvas)).toHaveLength(2);
+  });
+
+  it('marks a span whose parent is on a page not loaded yet, and re-links it when that page arrives', async () => {
+    // The server half of the chain arrives first; the browser half that caused
+    // it is on the next page.
+    const stub = offsetPagedProvider(
+      pagesByOffset(
+        new Map<number, SpanPageAnswer>([
+          [0, { data: [SERVER_EVENT, QUERY_EVENT], total: 4, nextOffset: 2 }],
+          [2, { data: [INTERACTION_EVENT, FETCH_EVENT], total: 4 }],
+        ]),
+      ),
+    );
+    const user = userEvent.setup();
+
+    renderComponent(pagedSpansNode(2), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    await screen.findByText(`Showing ${formatCount(2)} of ${formatCount(4)} spans.`);
+    expect(renderedNames()).toEqual([SERVER_EVENT.name, QUERY_EVENT.name]);
+
+    // The server span names a parent this view does not hold: it says so, names
+    // the span it is waiting for, and does not claim the parent never arrived.
+    const server = rowNamed(SERVER_EVENT.name);
+    expect(within(server).getByText(PARENT_NOT_LOADED_FLAG)).toBeDefined();
+    expect(within(server).queryByText(REATTACHED_FLAG)).toBeNull();
+
+    const description = descriptionOf(server);
+    expect(description).toContain(spanIdFor(2));
+    expect(description).not.toContain(REATTACHED_FLAG);
+
+    // Not an orphan in the drawing either: that state belongs to the correlator.
+    const canvas = screen.getByRole('img');
+    for (const bar of barsOf(canvas)) {
+      expect(bar.classList.contains('dg-is-orphan')).toBe(false);
+      expect(bar.classList.contains('dg-is-orphaned')).toBe(false);
+    }
+
+    // The datastore call's parent IS loaded: no flag, and its connector is drawn.
+    expect(within(rowNamed(QUERY_EVENT.name)).queryByText(PARENT_NOT_LOADED_FLAG)).toBeNull();
+    expect(edgesOf(canvas)).toHaveLength(1);
+
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+
+    // The page that brought the parent re-links the rows already on screen
+    // beneath it, and the mark goes with the gap it described.
+    await screen.findByText(`Showing ${formatCount(4)} of ${formatCount(4)} spans.`);
+    expect(renderedNames()).toEqual([...CHAIN_NAMES]);
+    expect(screen.queryAllByText(PARENT_NOT_LOADED_FLAG)).toHaveLength(0);
+    expect(edgesOf(screen.getByRole('img'))).toHaveLength(CHAIN_EVENTS.length - 1);
+  });
+
+  it('expands a duplicated span id under its first record, and joins the child to that record', async () => {
+    // Two records carry one span id; the child that names it starts after both.
+    const firstCarrier = makeEvent({
+      id: 'event-example-0401',
+      spanId: spanIdFor(0x41),
+      name: 'example.first-carrier',
+      startTime: BASE_START_MS,
+      duration: 50,
+      seq: 0,
+      ingestSeq: 1,
+    });
+    const secondCarrier = makeEvent({
+      id: 'event-example-0402',
+      spanId: spanIdFor(0x41),
+      name: 'example.second-carrier',
+      startTime: BASE_START_MS + 100,
+      duration: 50,
+      seq: 1,
+      ingestSeq: 2,
+    });
+    const sharedChild = makeEvent({
+      id: 'event-example-0403',
+      spanId: spanIdFor(0x42),
+      parentSpanId: spanIdFor(0x41),
+      kind: 'fetch',
+      name: 'example.shared-child',
+      startTime: BASE_START_MS + 200,
+      duration: 10,
+      seq: 2,
+      ingestSeq: 3,
+    });
+    const stub = resolvingSpans([secondCarrier, sharedChild, firstCarrier]);
+
+    renderComponent(spansNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    const canvas = await findCanvas();
+
+    expect(renderedNames()).toEqual([firstCarrier.name, sharedChild.name, secondCarrier.name]);
+
+    // One connector, and it leaves the record the child is drawn beneath.
+    const edges = edgesOf(canvas);
+    expect(edges).toHaveLength(1);
+
+    const parentX = alignHairline(Number(barTitled(canvas, firstCarrier.name).getAttribute('x')));
+    const otherX = alignHairline(Number(barTitled(canvas, secondCarrier.name).getAttribute('x')));
+    expect(parentX).not.toBe(otherX);
+    expect((edges[0]?.getAttribute('d') ?? '').startsWith(`M ${String(parentX)} `)).toBe(true);
+  });
+
+  it('looks for a parent only inside its own trace when an unfiltered page holds several', async () => {
+    // Span ids are unique only within a trace, and a page with no trace filter
+    // mixes traces: a root of the fixture trace carries the very span id that a
+    // row of the second trace names as its parent. That row's real parent — the
+    // same span id, in its own trace — is on the next page, and its clock reads
+    // later than the child's, so neither time order nor a bare span id lookup
+    // draws the rows the way their traces do.
+    const collidingRoot = makeEvent({
+      id: 'event-example-0701',
+      spanId: spanIdFor(0x71),
+      name: 'example.colliding-root',
+      startTime: BASE_START_MS,
+      duration: 60,
+      seq: 0,
+      ingestSeq: 1,
+    });
+    const secondTraceChild = makeEvent({
+      id: 'event-example-0702',
+      traceId: SECOND_TRACE_ID,
+      spanId: spanIdFor(0x72),
+      parentSpanId: spanIdFor(0x71),
+      kind: 'fetch',
+      name: 'example.second-trace-child',
+      startTime: BASE_START_MS + 3,
+      duration: 20,
+      seq: 1,
+      ingestSeq: 2,
+    });
+    const secondTraceRoot = makeEvent({
+      id: 'event-example-0703',
+      traceId: SECOND_TRACE_ID,
+      spanId: spanIdFor(0x71),
+      name: 'example.second-trace-root',
+      startTime: BASE_START_MS + 5,
+      duration: 40,
+      seq: 2,
+      ingestSeq: 3,
+    });
+    const stub = offsetPagedProvider(
+      pagesByOffset(
+        new Map<number, SpanPageAnswer>([
+          [0, { data: [secondTraceChild, collidingRoot], total: 3, nextOffset: 2 }],
+          [2, { data: [secondTraceRoot], total: 3 }],
+        ]),
+      ),
+    );
+    const user = userEvent.setup();
+
+    renderComponent(makeNode({ query: { source: 'spans', limit: 2 } }), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    await screen.findByText(`Showing ${formatCount(2)} of ${formatCount(3)} spans.`);
+
+    // The colliding span id in the other trace is not the child's parent: the
+    // child is a root, marked as waiting for its parent, and no connector joins
+    // the two traces.
+    expect(renderedNames()).toEqual([collidingRoot.name, secondTraceChild.name]);
+    const child = rowNamed(secondTraceChild.name);
+    expect(within(child).getByText(PARENT_NOT_LOADED_FLAG)).toBeDefined();
+    expect(descriptionOf(child)).toContain(spanIdFor(0x71));
+    expect(within(rowNamed(collidingRoot.name)).queryByText(PARENT_NOT_LOADED_FLAG)).toBeNull();
+    expect(edgesOf(screen.getByRole('img'))).toHaveLength(0);
+
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+
+    // The parent in the child's own trace arrives and the child is re-linked
+    // beneath it — not beneath the earlier root that shares the span id.
+    await screen.findByText(`Showing ${formatCount(3)} of ${formatCount(3)} spans.`);
+    expect(renderedNames()).toEqual([
+      collidingRoot.name,
+      secondTraceRoot.name,
+      secondTraceChild.name,
+    ]);
+    expect(screen.queryAllByText(PARENT_NOT_LOADED_FLAG)).toHaveLength(0);
+    expect(stub.queries.map((query) => query.offset)).toEqual([0, 2]);
+
+    const canvas = screen.getByRole('img');
+    const edges = edgesOf(canvas);
+    expect(edges).toHaveLength(1);
+
+    const parentX = alignHairline(
+      Number(barTitled(canvas, secondTraceRoot.name).getAttribute('x')),
+    );
+    const collidingX = alignHairline(
+      Number(barTitled(canvas, collidingRoot.name).getAttribute('x')),
+    );
+    expect(parentX).not.toBe(collidingX);
+    expect((edges[0]?.getAttribute('d') ?? '').startsWith(`M ${String(parentX)} `)).toBe(true);
+  });
+
+  it('draws every row of a parent cycle, and a span naming itself, without throwing', async () => {
+    // A well-formed capture holds neither; a corrupted store could hold both.
+    const cycleFirst = makeEvent({
+      id: 'event-example-0501',
+      spanId: spanIdFor(0x51),
+      parentSpanId: spanIdFor(0x52),
+      name: 'example.cycle-first',
+      startTime: BASE_START_MS,
+      seq: 0,
+      ingestSeq: 1,
+    });
+    const cycleSecond = makeEvent({
+      id: 'event-example-0502',
+      spanId: spanIdFor(0x52),
+      parentSpanId: spanIdFor(0x51),
+      kind: 'fetch',
+      name: 'example.cycle-second',
+      startTime: BASE_START_MS + 5,
+      seq: 1,
+      ingestSeq: 2,
+    });
+    const selfParent = makeEvent({
+      id: 'event-example-0503',
+      spanId: spanIdFor(0x53),
+      parentSpanId: spanIdFor(0x53),
+      name: 'example.self-parent',
+      startTime: BASE_START_MS + 10,
+      seq: 2,
+      ingestSeq: 3,
+    });
+    const stub = resolvingSpans([cycleSecond, selfParent, cycleFirst]);
+
+    renderComponent(spansNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    const canvas = await findCanvas();
+
+    // Nothing dropped and nothing failed. A span naming itself is a root; the
+    // cycle has none, so once the roots are drawn it is entered at its
+    // canonically first row, and its other row follows beneath it.
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(barsOf(canvas)).toHaveLength(3);
+    expect(renderedNames()).toEqual([selfParent.name, cycleFirst.name, cycleSecond.name]);
+
+    // Every parent named here is loaded, so nothing is flagged as missing one.
+    expect(screen.queryAllByText(PARENT_NOT_LOADED_FLAG)).toHaveLength(0);
+  });
+
+  it('draws a row hanging beneath a parent cycle after its parent, even when it starts first', async () => {
+    // The cycle's two members name each other; the third row names the second
+    // member as its parent and reads the earliest clock of the three, so a walk
+    // entered at the canonically first unreached row would draw it before the
+    // parent it names.
+    const cycleFirst = makeEvent({
+      id: 'event-example-0601',
+      spanId: spanIdFor(0x61),
+      parentSpanId: spanIdFor(0x62),
+      name: 'example.loop-first',
+      startTime: BASE_START_MS + 10,
+      seq: 1,
+      ingestSeq: 1,
+    });
+    const cycleSecond = makeEvent({
+      id: 'event-example-0602',
+      spanId: spanIdFor(0x62),
+      parentSpanId: spanIdFor(0x61),
+      kind: 'fetch',
+      name: 'example.loop-second',
+      startTime: BASE_START_MS + 20,
+      seq: 2,
+      ingestSeq: 2,
+    });
+    const hanging = makeEvent({
+      id: 'event-example-0603',
+      spanId: spanIdFor(0x63),
+      parentSpanId: cycleSecond.spanId,
+      kind: 'fetch',
+      name: 'example.below-loop',
+      startTime: BASE_START_MS,
+      seq: 0,
+      ingestSeq: 3,
+    });
+    const stub = resolvingSpans([cycleFirst, hanging, cycleSecond]);
+
+    renderComponent(spansNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    const canvas = await findCanvas();
+
+    // The component is entered ON the cycle — the row the climb from the
+    // earliest unreached row returns to — so the hanging row follows its
+    // parent, and the two rows beneath that entry are ordered as siblings.
+    expect(barsOf(canvas)).toHaveLength(3);
+    expect(renderedNames()).toEqual([cycleSecond.name, hanging.name, cycleFirst.name]);
+
+    const names = renderedNames();
+    expect(names.indexOf(hanging.name)).toBeGreaterThan(names.indexOf(cycleSecond.name));
+    expect(screen.queryAllByText(PARENT_NOT_LOADED_FLAG)).toHaveLength(0);
   });
 });
 

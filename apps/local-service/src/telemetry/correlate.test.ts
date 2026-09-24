@@ -24,11 +24,17 @@
  *    remove nothing.
  * 3. **The cache tells the truth.** A rebuilt trace replaces the cached one, a
  *    purged trace stops being served, the bound is respected, and invalidation
- *    is scoped to the session (and optionally the trace) it names.
+ *    is scoped to the session (and optionally the trace) it names. A read that
+ *    names a capture is built from that capture's events alone and cached
+ *    under that capture, so a trace id recurring in another capture never
+ *    mixes the two windows.
  * 4. **Nothing throws, and nothing leaks.** Every method answers with a
  *    `Result` whose error carries a code from the closed vocabulary, a store
- *    that throws or rejects is reported rather than propagated, and no log
- *    record or error payload carries a captured span name or attribute value
+ *    that throws or rejects is reported rather than propagated, a trace whose
+ *    rows cannot all be read or correlated — cut off by paging, reported
+ *    unreadable by the store, or not every one a node of the tree — is an
+ *    error rather than a partial tree and is never cached, and no log record
+ *    or error payload carries a captured span name or attribute value
  *    (AAP §0.5.2).
  *
  * ## Fixture conventions
@@ -461,7 +467,10 @@ interface RecordedTraceLoad {
   readonly limit: number | undefined;
   /** The order it asked for; correlation always reads canonically. */
   readonly sort: string | undefined;
-  /** The capture narrowing, which a trace load must never carry. */
+  /**
+   * The capture narrowing: present exactly when the read was capture-scoped,
+   * absent for the session-wide join.
+   */
   readonly captureId: CaptureId | undefined;
 }
 
@@ -480,13 +489,22 @@ interface RecordedIdListing {
  * its `try`/`catch` exists for — a double that throws, and a future
  * asynchronous store whose promise rejects — and `stalls` is the repository that
  * does not honour its own paging contract.
+ *
+ * The last two answer with rows and still cannot yield the whole trace:
+ * `skips` is the store reporting, on every page, rows it could not reconstruct
+ * (the real store's `TelemetryPage.skipped`), and `strays` is a store whose
+ * trace predicate let rows of another trace into the first page — rows the
+ * correlator legitimately does not consider, so the tree holds fewer nodes than
+ * the rows loaded.
  */
 type LoadOutcome =
   | { readonly kind: 'rows' }
   | { readonly kind: 'throws'; readonly thrown: Error }
   | { readonly kind: 'rejects'; readonly thrown: Error }
   | { readonly kind: 'refuses'; readonly error: DebuggenError }
-  | { readonly kind: 'stalls' };
+  | { readonly kind: 'stalls' }
+  | { readonly kind: 'skips'; readonly skipped: number }
+  | { readonly kind: 'strays'; readonly strays: readonly TelemetryEvent[] };
 
 /** How the fake repository answers. */
 interface FakeRepoOptions {
@@ -575,15 +593,33 @@ function fakeTelemetryRepo(
 
   put(seed);
 
-  /** One page of a trace, with the paging fields the walk reads. */
-  function pageOf(sessionId: string, traceId: string, offset: number): TelemetryPage {
-    const all = rows.get(rowKey(sessionId, traceId)) ?? [];
+  /**
+   * One page of a trace, with the paging fields the walk reads.
+   *
+   * A capture narrowing filters the trace's rows before the page is cut, so
+   * `total` and `nextOffset` describe the narrowed rows alone — what the real
+   * store's `capture_id = ?` predicate does.
+   *
+   * A `skips` outcome for the trace overrides {@link FakeRepoOptions.skippedPerPage},
+   * and a `strays` outcome appends its rows to the page read at offset zero
+   * without counting them in `total` or `nextOffset`.
+   */
+  function pageOf(
+    sessionId: string,
+    traceId: string,
+    offset: number,
+    captureId: CaptureId | undefined,
+  ): TelemetryPage {
+    const bucket = rows.get(rowKey(sessionId, traceId)) ?? [];
+    const all =
+      captureId === undefined ? bucket : bucket.filter((event) => event.captureId === captureId);
     const size = options.pageSize ?? Math.max(all.length, 1);
     const page = all.slice(offset, offset + size);
     const readTo = offset + page.length;
+    const outcome = outcomes.get(traceId);
 
     let nextOffset: number | undefined;
-    if (outcomes.get(traceId)?.kind === 'stalls') {
+    if (outcome?.kind === 'stalls') {
       // A repository that does not advance its own offset: following it would
       // re-read the same rows forever.
       nextOffset = offset;
@@ -591,11 +627,14 @@ function fakeTelemetryRepo(
       nextOffset = readTo;
     }
 
+    const skipped = outcome?.kind === 'skips' ? outcome.skipped : options.skippedPerPage;
+    const strays = outcome?.kind === 'strays' && offset === 0 ? outcome.strays : [];
+
     return {
-      rows: page,
+      rows: [...page, ...strays],
       total: all.length,
       ...(nextOffset !== undefined ? { nextOffset } : {}),
-      ...(options.skippedPerPage !== undefined ? { skipped: options.skippedPerPage } : {}),
+      ...(skipped !== undefined ? { skipped } : {}),
     };
   }
 
@@ -648,7 +687,9 @@ function fakeTelemetryRepo(
         return answer(err(outcome.error));
       }
 
-      return answer(ok(pageOf(sessionId, traceId, readOptions?.offset ?? 0)));
+      return answer(
+        ok(pageOf(sessionId, traceId, readOptions?.offset ?? 0, readOptions?.captureId)),
+      );
     },
 
     listTraceIds(sessionId, captureId) {
@@ -1059,8 +1100,8 @@ describe('rebuilding the traces a persisted batch touched', () => {
       // order is total, so no row is read twice or missed at a boundary.
       expect(load.sort).toBe('start_asc');
       expect(load.limit).toBeGreaterThan(0);
-      // A trace is the join between the two producers' spans, so a trace load
-      // is never narrowed to one capture.
+      // A read that named no capture is the session-wide join, so its trace
+      // loads carry no capture narrowing.
       expect(load.captureId).toBeUndefined();
     }
   });
@@ -1703,12 +1744,12 @@ describe('the trace cache', () => {
     expect(trees.map((tree) => tree.traceId)).toEqual([earliest, middle, latest]);
     expect(trees.map((tree) => tree.startTime)).toEqual([at(10.25), at(50.125), at(90.5)]);
     expect(repo.idListings).toHaveLength(2);
-    // The capture narrows the enumeration only; each enumerated trace is then
-    // loaded in full.
+    // The capture narrows the enumeration and each enumerated trace's events
+    // alike: every trace load carries it.
     expect(repo.traceLoads.map((load) => load.captureId)).toEqual([
-      undefined,
-      undefined,
-      undefined,
+      CAPTURE_A1,
+      CAPTURE_A1,
+      CAPTURE_A1,
     ]);
     expect(correlator.stats().cachedTraces).toBe(3);
 
@@ -1718,6 +1759,216 @@ describe('the trace cache', () => {
     );
     expect(unnarrowed).toHaveLength(4);
     expect(repo.idListings.at(-1)).toEqual({ sessionId: SESSION_A, captureId: undefined });
+  });
+
+  it('builds a trace id shared by two captures from the events of the capture a read names', async () => {
+    // One trace id under two captures of one session — a producer mints trace
+    // ids, so nothing keys one to a single capture. Each window is a whole
+    // cross-tier interaction of its own.
+    const shared = newTraceId();
+    const firstWindow = canonicalChain({ captureId: CAPTURE_A1, traceId: shared });
+    const secondWindow = chainOf(CANONICAL_CHAIN_STEPS.slice(0, 3), {
+      captureId: CAPTURE_A2,
+      traceId: shared,
+    });
+    const repo = fakeTelemetryRepo([...firstWindow, ...secondWindow]);
+    const correlator = correlatorOver(repo, recordingLogger().logger);
+
+    const firstTrees = valueOf(
+      await correlator.getTraces(SESSION_A, CAPTURE_A1),
+      'getTraces narrowed to the first capture',
+    );
+
+    expect(firstTrees.map((tree) => tree.nodeCount)).toEqual([firstWindow.length]);
+    expect(firstTrees.map((tree) => spanIdsOfTree(tree))).toEqual([spanIdsOfEvents(firstWindow)]);
+
+    const secondTrees = valueOf(
+      await correlator.getTraces(SESSION_A, CAPTURE_A2),
+      'getTraces narrowed to the second capture',
+    );
+
+    expect(secondTrees.map((tree) => tree.nodeCount)).toEqual([secondWindow.length]);
+    expect(secondTrees.map((tree) => spanIdsOfTree(tree))).toEqual([spanIdsOfEvents(secondWindow)]);
+
+    // Naming no capture is the session-wide join over both windows.
+    const joined = treeOf(await correlator.getTrace(SESSION_A, shared), 'the session-wide read');
+
+    expect(joined.nodeCount).toBe(firstWindow.length + secondWindow.length);
+    expect(spanIdsOfTree(joined).sort()).toEqual(
+      spanIdsOfEvents([...firstWindow, ...secondWindow]).sort(),
+    );
+    expect(repo.traceLoads.map((load) => load.captureId)).toEqual([
+      CAPTURE_A1,
+      CAPTURE_A2,
+      undefined,
+    ]);
+
+    // Three scopes, three entries, none standing in for another.
+    expect(correlator.stats()).toEqual({ cachedTraces: 3, hits: 0, misses: 3, rebuilds: 3 });
+
+    // A second capture-scoped read is a hit on its own entry.
+    const again = treeOf(
+      await correlator.getTrace(SESSION_A, shared, CAPTURE_A1),
+      'the second read of the first capture',
+    );
+
+    expect(again).toBe(firstTrees[0]);
+    expect(correlator.stats()).toEqual({ cachedTraces: 3, hits: 1, misses: 3, rebuilds: 3 });
+    expect(repo.loadsOf(shared)).toBe(3);
+
+    // A capture that holds none of the trace answers with an absence, never
+    // with the session-wide tree, and caches nothing.
+    expect(
+      valueOf(
+        await correlator.getTrace(SESSION_A, shared, newCaptureId()),
+        'the read of a capture holding none of the trace',
+      ),
+    ).toBeUndefined();
+    expect(correlator.stats().cachedTraces).toBe(3);
+  });
+
+  it('drops the capture-scoped tree of a capture a batch touched and keeps the other capture\u2019s', async () => {
+    const shared = newTraceId();
+    const firstWindow = canonicalChain({ captureId: CAPTURE_A1, traceId: shared });
+    const secondWindow = chainOf(CANONICAL_CHAIN_STEPS.slice(0, 3), {
+      captureId: CAPTURE_A2,
+      traceId: shared,
+    });
+    const repo = fakeTelemetryRepo([...firstWindow, ...secondWindow]);
+    const correlator = correlatorOver(repo, recordingLogger().logger);
+
+    const staleFirst = treeOf(
+      await correlator.getTrace(SESSION_A, shared, CAPTURE_A1),
+      'the first capture before the batch',
+    );
+    const cachedSecond = treeOf(
+      await correlator.getTrace(SESSION_A, shared, CAPTURE_A2),
+      'the second capture before the batch',
+    );
+
+    expect(correlator.stats().cachedTraces).toBe(2);
+
+    // A late span of the first capture lands for the same trace.
+    const late = makeEvent({
+      captureId: CAPTURE_A1,
+      traceId: shared,
+      parentSpanId: eventAt(firstWindow, 4).spanId,
+      kind: 'db.query',
+      name: 'query rows',
+      startTime: at(700.5),
+      duration: 3.25,
+      producerId: PRODUCER_SERVER,
+    });
+
+    repo.put([late]);
+
+    const update = valueOf(
+      await correlator.onEventsPersisted([late]),
+      'onEventsPersisted with a late span of the first capture',
+    );
+
+    expect(update.tracesTouched).toEqual([shared]);
+    expect(update.rebuilt).toBe(1);
+    // The rebuild on ingest is the session-wide tree.
+    expect(repo.traceLoads.at(-1)?.captureId).toBeUndefined();
+
+    // The session-wide tree was cached, the first capture's stale tree was
+    // dropped, and the second capture's tree was left alone.
+    expect(correlator.stats().cachedTraces).toBe(2);
+
+    const loadsAfterBatch = repo.loadsOf(shared);
+    const freshFirst = treeOf(
+      await correlator.getTrace(SESSION_A, shared, CAPTURE_A1),
+      'the first capture after the batch',
+    );
+
+    expect(freshFirst).not.toBe(staleFirst);
+    expect(freshFirst.nodeCount).toBe(firstWindow.length + 1);
+    expect(nodeFor(freshFirst, late.spanId).event.captureId).toBe(CAPTURE_A1);
+    expect(repo.loadsOf(shared)).toBe(loadsAfterBatch + 1);
+
+    const stillSecond = treeOf(
+      await correlator.getTrace(SESSION_A, shared, CAPTURE_A2),
+      'the second capture after the batch',
+    );
+
+    expect(stillSecond).toBe(cachedSecond);
+
+    const joined = treeOf(
+      await correlator.getTrace(SESSION_A, shared),
+      'the session-wide read after the batch',
+    );
+
+    expect(joined.nodeCount).toBe(firstWindow.length + secondWindow.length + 1);
+    // Both reads above were served from the cache.
+    expect(repo.loadsOf(shared)).toBe(loadsAfterBatch + 1);
+  });
+
+  it('invalidates a trace, or a whole session, under every scope and leaves another session alone', async () => {
+    const shared = newTraceId();
+    const other = newTraceId();
+    const otherSessionCapture = newCaptureId();
+    const click = { kind: 'interaction', name: 'click control' } as const;
+
+    const repo = fakeTelemetryRepo([
+      makeEvent({ ...click, captureId: CAPTURE_A1, traceId: shared }),
+      makeEvent({ ...click, captureId: CAPTURE_A2, traceId: shared }),
+      makeEvent({ ...click, captureId: CAPTURE_A1, traceId: other }),
+      makeEvent({
+        ...click,
+        sessionId: SESSION_B,
+        captureId: otherSessionCapture,
+        traceId: shared,
+      }),
+    ]);
+    const correlator = correlatorOver(repo, recordingLogger().logger);
+
+    const reads: readonly (readonly [SessionId, TraceId, CaptureId | undefined])[] = [
+      [SESSION_A, shared, undefined],
+      [SESSION_A, shared, CAPTURE_A1],
+      [SESSION_A, shared, CAPTURE_A2],
+      [SESSION_A, other, undefined],
+      [SESSION_A, other, CAPTURE_A1],
+      [SESSION_B, shared, undefined],
+      [SESSION_B, shared, otherSessionCapture],
+    ];
+
+    for (const [sessionId, traceId, captureId] of reads) {
+      treeOf(await correlator.getTrace(sessionId, traceId, captureId), 'a read filling the cache');
+    }
+
+    expect(correlator.stats()).toEqual({ cachedTraces: 7, hits: 0, misses: 7, rebuilds: 7 });
+
+    // One trace goes under all three of its scopes, and nothing else does.
+    correlator.invalidate(SESSION_A, shared);
+    expect(correlator.stats().cachedTraces).toBe(4);
+
+    treeOf(await correlator.getTrace(SESSION_A, other), 'the untouched trace, session-wide');
+    treeOf(await correlator.getTrace(SESSION_A, other, CAPTURE_A1), 'the untouched trace, scoped');
+    treeOf(
+      await correlator.getTrace(SESSION_B, shared, otherSessionCapture),
+      'the same trace id in the other session',
+    );
+    expect(correlator.stats()).toEqual({ cachedTraces: 4, hits: 3, misses: 7, rebuilds: 7 });
+
+    treeOf(
+      await correlator.getTrace(SESSION_A, shared, CAPTURE_A2),
+      'a scope of the invalidated trace',
+    );
+    expect(correlator.stats()).toEqual({ cachedTraces: 5, hits: 3, misses: 8, rebuilds: 8 });
+
+    // The whole session goes under every scope; the other session stays.
+    correlator.invalidate(SESSION_A);
+    expect(correlator.stats().cachedTraces).toBe(2);
+
+    treeOf(await correlator.getTrace(SESSION_B, shared), 'the other session, session-wide');
+    expect(correlator.stats().hits).toBe(4);
+
+    treeOf(
+      await correlator.getTrace(SESSION_A, other, CAPTURE_A1),
+      'a scope of the invalidated session',
+    );
+    expect(correlator.stats().misses).toBe(9);
   });
 
   it('releases the cache on close and stays usable afterwards', async () => {
@@ -1907,41 +2158,56 @@ describe('failure discipline and privacy', () => {
     ).toBe(failingRows.length);
   });
 
-  it('stops paging when the store does not advance its offset and answers with what it read', async () => {
+  it('refuses a trace whose store does not advance its offset, and caches nothing', async () => {
     const chain = linearChain(6);
     const repo = fakeTelemetryRepo(chain, { pageSize: 2 });
     repo.behaveFor(DEFAULT_TRACE_ID, { kind: 'stalls' });
     const logs = recordingLogger();
     const correlator = correlatorOver(repo, logs.logger);
 
-    const tree = treeOf(
+    const error = failureOf(
       await correlator.getTrace(SESSION_A, DEFAULT_TRACE_ID),
       'getTrace over a stalling store',
     );
 
     // One page, then a stop: following an offset that does not advance would
-    // re-read the same rows forever. A partial trace is still evidence, and it
-    // is reported rather than passed off as complete.
+    // re-read the same rows forever. The two rows read are not the trace, so
+    // no tree is built from them and none is cached to be served later.
     expect(repo.loadsOf(DEFAULT_TRACE_ID)).toBe(1);
-    expect(tree.nodeCount).toBe(2);
-    expect(spanIdsOfTree(tree)).toEqual(spanIdsOfEvents(chain.slice(0, 2)));
+    expect(error.code).toBe('STORE_ERROR');
+    expect(DEBUGGEN_ERROR_CODES).toContain(error.code);
+    expect(error.hint).toBeDefined();
+    expect(error.details?.['reason']).toBe('trace-page-stalled');
+    expect(error.details?.['traceId']).toBe(DEFAULT_TRACE_ID);
+    expect(error.details?.['pages']).toBe(1);
+    expect(error.details?.['rows']).toBe(2);
+    expect(error.details?.['maxPages']).toBeUndefined();
+    expect(correlator.stats()).toEqual({ cachedTraces: 0, hits: 0, misses: 1, rebuilds: 0 });
+
     // Reported, and identified by its fields rather than by its prose: one page
-    // read, two rows kept, and no page-bound involved.
+    // read, two rows held, and no page bound involved.
     const warned = logs.at('warn');
     expect(warned.map((record) => record.fields['pages'])).toEqual([1]);
     expect(warned.map((record) => record.fields['rows'])).toEqual([2]);
     expect(warned.map((record) => record.fields['maxPages'])).toEqual([undefined]);
-    expect(logs.text()).not.toContain(eventAt(chain, 0).name);
+    for (const name of [eventAt(chain, 0).name, eventAt(chain, 1).name]) {
+      expect(logs.text()).not.toContain(name);
+      expect(errorText(error)).not.toContain(name);
+    }
+
+    // Nothing was cached, so the next read asks the store again.
+    failureOf(await correlator.getTrace(SESSION_A, DEFAULT_TRACE_ID), 'the retried read');
+    expect(repo.loadsOf(DEFAULT_TRACE_ID)).toBe(2);
   });
 
-  it('stops paging at the page bound instead of walking forever', async () => {
+  it('refuses a trace with pages left at the page bound instead of correlating a prefix of it', async () => {
     const rows = 500;
     const chain = linearChain(rows);
     const repo = fakeTelemetryRepo(chain, { pageSize: 1 });
     const logs = recordingLogger();
     const correlator = correlatorOver(repo, logs.logger);
 
-    const tree = treeOf(
+    const error = failureOf(
       await correlator.getTrace(SESSION_A, DEFAULT_TRACE_ID),
       'getTrace over a store that pages one row at a time',
     );
@@ -1949,32 +2215,291 @@ describe('failure discipline and privacy', () => {
     const loads = repo.loadsOf(DEFAULT_TRACE_ID);
     // The bound is an internal constant, so what is asserted is the property it
     // exists for: the walk is finite, it stopped well short of the trace, and
-    // it correlated exactly the rows it read.
+    // it produced no tree at all rather than one built from the rows it read.
     expect(loads).toBeGreaterThan(0);
     expect(loads).toBeLessThan(rows);
-    expect(tree.nodeCount).toBe(loads);
+    expect(error.code).toBe('STORE_ERROR');
+    expect(error.details?.['reason']).toBe('trace-too-large');
+    expect(error.details?.['pages']).toBe(loads);
+    expect(error.details?.['rows']).toBe(loads);
+    expect(error.details?.['maxPages']).toBe(loads);
+    expect(correlator.stats()).toEqual({ cachedTraces: 0, hits: 0, misses: 1, rebuilds: 0 });
 
     // The one warning is the page bound itself: it is the only record that
     // carries the bound it stopped at, and it stopped where the walk did.
     const warned = logs.at('warn');
     expect(warned.map((record) => record.fields['pages'])).toEqual([loads]);
     expect(warned.map((record) => record.fields['maxPages'])).toEqual([loads]);
+    expect(logs.text()).not.toContain(eventAt(chain, 1).name);
+
+    // Exactly at the bound is not over it: a trace the walk reads to its end in
+    // that many pages is correlated whole.
+    const bounded = newTraceId();
+    const fits = linearChain(loads, { traceId: bounded });
+    const fitting = fakeTelemetryRepo(fits, { pageSize: 1 });
+    const whole = treeOf(
+      await correlatorOver(fitting, recordingLogger().logger).getTrace(SESSION_A, bounded),
+      'getTrace over a trace exactly at the page bound',
+    );
+
+    expect(whole.nodeCount).toBe(loads);
+    expect(fitting.loadsOf(bounded)).toBe(loads);
   });
 
-  it('reports rows the store could not reconstruct without inventing any', async () => {
+  it('drops the trees a failed rebuild leaves stale and keeps a capture the batch did not touch', async () => {
+    const laterTrace = newTraceId();
+    const chain = linearChain(6);
+    const otherWindow = makeEvent({
+      captureId: CAPTURE_A2,
+      kind: 'interaction',
+      name: 'click control',
+      startTime: at(40.5),
+    });
+    const laterRow = makeEvent({ traceId: laterTrace, kind: 'interaction', name: 'click control' });
+    const repo = fakeTelemetryRepo([...chain.slice(0, 4), otherWindow, laterRow], { pageSize: 2 });
+    const correlator = correlatorOver(repo, recordingLogger().logger);
+
+    // Cached before the batch: the failing trace under all three scopes, and a
+    // second trace the batch will also touch.
+    for (const captureId of [undefined, CAPTURE_A1, CAPTURE_A2]) {
+      treeOf(
+        await correlator.getTrace(SESSION_A, DEFAULT_TRACE_ID, captureId),
+        'a read before the batch',
+      );
+    }
+    treeOf(await correlator.getTrace(SESSION_A, laterTrace), 'the later trace before the batch');
+    expect(correlator.stats().cachedTraces).toBe(4);
+
+    // The rest of the first capture's trace lands with a span of the later
+    // trace, and the store's paging then stalls for the first trace.
+    const arriving = chain.slice(4);
+    const laterArrival = makeEvent({
+      traceId: laterTrace,
+      parentSpanId: laterRow.spanId,
+      startTime: at(2.5),
+    });
+    repo.put([...arriving, laterArrival]);
+    repo.behaveFor(DEFAULT_TRACE_ID, { kind: 'stalls' });
+
+    const error = failureOf(
+      await correlator.onEventsPersisted([...arriving, laterArrival]),
+      'onEventsPersisted over a stalling store',
+    );
+
+    expect(error.code).toBe('STORE_ERROR');
+    expect(error.details?.['reason']).toBe('trace-page-stalled');
+    // The batch failed fast: the later trace was never reloaded.
+    expect(repo.loadsOf(laterTrace)).toBe(1);
+
+    // No pre-batch tree the batch made stale survives to be served as current —
+    // neither the failing trace's session-wide and first-capture trees nor the
+    // later trace's. The second capture's tree, whose events the batch did not
+    // change, is still cached and still served.
+    expect(correlator.stats().cachedTraces).toBe(1);
+    const hitsBefore = correlator.stats().hits;
+    treeOf(
+      await correlator.getTrace(SESSION_A, DEFAULT_TRACE_ID, CAPTURE_A2),
+      'the untouched capture after the failure',
+    );
+    expect(correlator.stats().hits).toBe(hitsBefore + 1);
+
+    // Once the store pages again, every dropped tree rebuilds whole.
+    repo.behaveFor(DEFAULT_TRACE_ID, { kind: 'rows' });
+    expect(
+      treeOf(await correlator.getTrace(SESSION_A, DEFAULT_TRACE_ID), 'session-wide after recovery')
+        .nodeCount,
+    ).toBe(chain.length + 1);
+    expect(
+      treeOf(
+        await correlator.getTrace(SESSION_A, DEFAULT_TRACE_ID, CAPTURE_A1),
+        'the first capture after recovery',
+      ).nodeCount,
+    ).toBe(chain.length);
+    expect(
+      treeOf(await correlator.getTrace(SESSION_A, laterTrace), 'the later trace after recovery')
+        .nodeCount,
+    ).toBe(2);
+  });
+
+  it('refuses a trace whose store reports rows it could not reconstruct, and caches nothing', async () => {
     const chain = canonicalChain();
     const repo = fakeTelemetryRepo(chain, { skippedPerPage: 2 });
     const logs = recordingLogger();
     const correlator = correlatorOver(repo, logs.logger);
 
-    const tree = treeOf(
+    const error = failureOf(
       await correlator.getTrace(SESSION_A, DEFAULT_TRACE_ID),
       'getTrace over a store reporting unreadable rows',
     );
 
-    expect(tree.nodeCount).toBe(chain.length);
-    expect(logs.at('warn').map((record) => record.fields['unreadable'])).toEqual([2]);
-    expect(logs.at('warn').map((record) => record.fields['rows'])).toEqual([chain.length]);
+    // Every readable row came back, and still no tree: the two the store could
+    // not reconstruct may be any parent in the chain, and a tree without them
+    // would reparent their children as orphans and shorten every duration.
+    expect(error.code).toBe('STORE_ERROR');
+    expect(DEBUGGEN_ERROR_CODES).toContain(error.code);
+    expect(error.hint).toBeDefined();
+    expect(error.details?.['reason']).toBe('trace-rows-unreadable');
+    expect(error.details?.['traceId']).toBe(DEFAULT_TRACE_ID);
+    expect(error.details?.['unreadable']).toBe(2);
+    expect(error.details?.['rows']).toBe(chain.length);
+    expect(error.details?.['pages']).toBe(1);
+    expect(correlator.stats()).toEqual({ cachedTraces: 0, hits: 0, misses: 1, rebuilds: 0 });
+
+    // Reported by its counts: the one warning names the unreadable rows, the
+    // rows that were readable and the pages walked.
+    const warned = logs.at('warn');
+    expect(warned.map((record) => record.fields['unreadable'])).toEqual([2]);
+    expect(warned.map((record) => record.fields['rows'])).toEqual([chain.length]);
+    expect(warned.map((record) => record.fields['pages'])).toEqual([1]);
+
+    // No partial tree was cached, so the next read goes back to the store and
+    // is refused again rather than served the remainder.
+    expect(repo.loadsOf(DEFAULT_TRACE_ID)).toBe(1);
+    const retried = failureOf(
+      await correlator.getTrace(SESSION_A, DEFAULT_TRACE_ID),
+      'the retried read over unreadable rows',
+    );
+    expect(retried.details?.['reason']).toBe('trace-rows-unreadable');
+    expect(repo.loadsOf(DEFAULT_TRACE_ID)).toBe(2);
+    expect(correlator.stats().cachedTraces).toBe(0);
+
+    for (const event of chain) {
+      expect(logs.text()).not.toContain(event.name);
+      expect(errorText(error)).not.toContain(event.name);
+    }
+  });
+
+  it('drops the cached trees of a trace whose ingest reload reports unreadable rows', async () => {
+    const chain = canonicalChain();
+    const repo = fakeTelemetryRepo(chain.slice(0, 4));
+    const logs = recordingLogger();
+    const correlator = correlatorOver(repo, logs.logger);
+
+    // Cached before the batch, session-wide and for the capture the batch will
+    // name, while every stored row still read back cleanly.
+    treeOf(await correlator.getTrace(SESSION_A, DEFAULT_TRACE_ID), 'the session-wide read');
+    treeOf(
+      await correlator.getTrace(SESSION_A, DEFAULT_TRACE_ID, CAPTURE_A1),
+      'the capture-scoped read',
+    );
+    expect(correlator.stats()).toEqual({ cachedTraces: 2, hits: 0, misses: 2, rebuilds: 2 });
+
+    // The rest of the chain lands, and the reload the batch triggers now finds
+    // a stored row of the trace it cannot reconstruct.
+    const arriving = chain.slice(4);
+    repo.put(arriving);
+    repo.behaveFor(DEFAULT_TRACE_ID, { kind: 'skips', skipped: 1 });
+
+    const error = failureOf(
+      await correlator.onEventsPersisted(arriving),
+      'onEventsPersisted over a reload reporting unreadable rows',
+    );
+
+    expect(error.code).toBe('STORE_ERROR');
+    expect(error.details?.['reason']).toBe('trace-rows-unreadable');
+    expect(error.details?.['unreadable']).toBe(1);
+    expect(error.details?.['rows']).toBe(chain.length);
+    expect(logs.at('warn').map((record) => record.fields['unreadable'])).toEqual([1]);
+
+    // Neither pre-batch tree survives to be served as the current interaction,
+    // and the failed reload was not counted as a build.
+    expect(correlator.stats()).toEqual({ cachedTraces: 0, hits: 0, misses: 2, rebuilds: 2 });
+    const loads = repo.loadsOf(DEFAULT_TRACE_ID);
+    failureOf(
+      await correlator.getTrace(SESSION_A, DEFAULT_TRACE_ID),
+      'the session-wide read after the failed batch',
+    );
+    expect(repo.loadsOf(DEFAULT_TRACE_ID)).toBe(loads + 1);
+    expect(correlator.stats().hits).toBe(0);
+
+    // Once every row reads back again, the trace rebuilds whole.
+    repo.behaveFor(DEFAULT_TRACE_ID, { kind: 'rows' });
+    expect(
+      treeOf(await correlator.getTrace(SESSION_A, DEFAULT_TRACE_ID), 'the read after recovery')
+        .nodeCount,
+    ).toBe(chain.length);
+
+    for (const event of chain) {
+      expect(logs.text()).not.toContain(event.name);
+      expect(errorText(error)).not.toContain(event.name);
+    }
+  });
+
+  it('refuses a tree that does not hold every loaded row, and neither caches nor counts it', async () => {
+    const chain = canonicalChain();
+    const hollowTrace = newTraceId();
+    const stray = makeEvent({
+      traceId: newTraceId(),
+      kind: 'interaction',
+      name: `stray ${SENTINEL}`,
+      startTime: at(3.5),
+    });
+    const repo = fakeTelemetryRepo(chain);
+    repo.behaveFor(DEFAULT_TRACE_ID, { kind: 'strays', strays: [stray] });
+    const logs = recordingLogger();
+    const correlator = correlatorOver(repo, logs.logger);
+
+    // The store answered with one row of another trace. The correlator
+    // considers only the rows carrying the requested id, so the tree holds one
+    // node fewer than the rows loaded, and that tree is not the interaction.
+    const error = failureOf(
+      await correlator.getTrace(SESSION_A, DEFAULT_TRACE_ID),
+      'getTrace over a page carrying a row of another trace',
+    );
+
+    expect(error.code).toBe('INTERNAL');
+    expect(DEBUGGEN_ERROR_CODES).toContain(error.code);
+    expect(error.hint).toBeDefined();
+    expect(error.details?.['reason']).toBe('trace-nodes-dropped');
+    expect(error.details?.['traceId']).toBe(DEFAULT_TRACE_ID);
+    expect(error.details?.['nodeCount']).toBe(chain.length);
+    expect(error.details?.['rows']).toBe(chain.length + 1);
+    expect(correlator.stats()).toEqual({ cachedTraces: 0, hits: 0, misses: 1, rebuilds: 0 });
+
+    const warned = logs.at('warn');
+    expect(warned.map((record) => record.fields['nodeCount'])).toEqual([chain.length]);
+    expect(warned.map((record) => record.fields['rows'])).toEqual([chain.length + 1]);
+
+    // The ingest path refuses the same tree and caches nothing either.
+    const ingest = failureOf(
+      await correlator.onEventsPersisted([eventAt(chain, 0)]),
+      'onEventsPersisted over a page carrying a row of another trace',
+    );
+    expect(ingest.details?.['reason']).toBe('trace-nodes-dropped');
+    expect(correlator.stats()).toEqual({ cachedTraces: 0, hits: 0, misses: 1, rebuilds: 0 });
+
+    // Rows loaded with none of them this trace's is a shortfall of every row,
+    // not an absent trace: an absence would let `getTraces` leave the trace out
+    // of a successful answer.
+    repo.behaveFor(hollowTrace, { kind: 'strays', strays: [stray] });
+    const hollow = failureOf(
+      await correlator.getTrace(SESSION_A, hollowTrace),
+      'getTrace over a page holding only a row of another trace',
+    );
+    expect(hollow.code).toBe('INTERNAL');
+    expect(hollow.details?.['reason']).toBe('trace-nodes-dropped');
+    expect(hollow.details?.['nodeCount']).toBe(0);
+    expect(hollow.details?.['rows']).toBe(1);
+    expect(correlator.stats()).toEqual({ cachedTraces: 0, hits: 0, misses: 2, rebuilds: 0 });
+
+    // Nothing was cached, so a read after the store answers correctly again
+    // reloads and builds the whole trace — the first build counted.
+    repo.behaveFor(DEFAULT_TRACE_ID, { kind: 'rows' });
+    const loads = repo.loadsOf(DEFAULT_TRACE_ID);
+    const whole = treeOf(
+      await correlator.getTrace(SESSION_A, DEFAULT_TRACE_ID),
+      'the read after the store recovers',
+    );
+    expect(whole.nodeCount).toBe(chain.length);
+    expect(repo.loadsOf(DEFAULT_TRACE_ID)).toBe(loads + 1);
+    expect(correlator.stats()).toEqual({ cachedTraces: 1, hits: 0, misses: 3, rebuilds: 1 });
+
+    for (const segment of SENTINEL_SEGMENTS) {
+      expect(logs.text()).not.toContain(segment);
+      expect(errorText(error)).not.toContain(segment);
+      expect(errorText(ingest)).not.toContain(segment);
+      expect(errorText(hollow)).not.toContain(segment);
+    }
   });
 
   it('logs counts and identifiers only, never a captured name or attribute value', async () => {

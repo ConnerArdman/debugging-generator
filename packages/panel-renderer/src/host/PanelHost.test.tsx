@@ -39,9 +39,16 @@
  * specifies no views" (a state) and "this panel failed" (an error), which the
  * fallback case pins from the other side.
  *
- * Five host contracts that are not visible in a single settled render have
+ * Seven host contracts that are not visible in a single settled render have
  * their own cases, because each is lost silently rather than loudly:
  *
+ *   - **Both forms of the action contract are served.** The suite's surface
+ *     supplies the host form a real surface implements — `selectEvent` and
+ *     `openSource` — and an evidence chip reports the citation's `eventId`
+ *     with exactly the coordinates it recorded, while every source chip hands
+ *     `openSource` the document's own location object. A surface that supplies
+ *     the view form (`onSelectEvent`/`onOpenSource`) is served identically
+ *     through the compatibility adapter.
  *   - **The query lifecycle, composed.** Through the real host, contexts and node
  *     renderer, a query the provider has not answered draws the loading state;
  *     the answer replaces it with the view; a rejection draws the error state,
@@ -57,6 +64,12 @@
  *     runs, and the query hook hands a view the wire's `null` "last page"
  *     marker as the one end-of-data value, `undefined` — are pinned here too,
  *     because the host tier's two suites are this one and the registry's.
+ *   - **No view outlives its session or its panel.** A document for another
+ *     session, another panel or another generation — even one carrying the very
+ *     same node objects — replaces every mounted view with a fresh one that asks
+ *     for its first page under the new session, and while that page is pending
+ *     or has failed, nothing the previous session answered is on screen. The
+ *     same panel re-delivered keeps every view mounted.
  *   - **Unrelated host changes re-render no view.** A surface that rebuilds its
  *     actions object from the same callbacks, or re-delivers a document whose
  *     layout nodes did not change, re-renders none of the visualizations; a
@@ -164,16 +177,35 @@ import {
   panelThemeAttributeValue,
 } from '../tokens/theme';
 import type { PanelTheme } from '../tokens/theme';
-import { DataProviderContext, PanelSessionContext, createDataProvider } from './DataProvider';
+import {
+  DATA_QUERY_DEFAULT_LIMIT,
+  DATA_QUERY_MAX_LIMIT,
+  DataProviderContext,
+  PanelSessionContext,
+  checkDataQueryResponse,
+  createDataProvider,
+  createPanelDataProvider,
+  mapPanelDataResult,
+} from './DataProvider';
 import type {
   DataProvider,
   DataQueryResolver,
   DataQueryResolverContext,
   DataQueryResponse,
   DataResultFor,
+  PanelDataPage,
+  PanelDataResolver,
+  PanelDataResult,
 } from './DataProvider';
 import { PanelHost } from './PanelHost';
-import type { PanelActions, PanelEventRef } from './PanelActions';
+import { isPanelHostActions, toPanelHostActions, toPanelViewActions } from './PanelActions';
+import type {
+  PanelActions,
+  PanelEventCoordinates,
+  PanelEventRef,
+  PanelHostActions,
+  PanelViewActions,
+} from './PanelActions';
 import { useQuery } from './useQuery';
 
 /*
@@ -217,6 +249,12 @@ vi.mock(import('../components/SourceLink'), async (importOriginal) => {
 
 /** The panel's own id. A single token, which is all the schema asks of an id. */
 const PANEL_ID = 'panel-under-test';
+
+/**
+ * A second panel of the same session, for the isolation cases that swap one
+ * panel for another with an identical layout.
+ */
+const OTHER_PANEL_ID = 'panel-under-test-other';
 
 /** The session the panel claims to belong to. */
 const SESSION_ID = 'session-under-test';
@@ -876,16 +914,22 @@ function resolverQueryAt(resolve: Mock<DataQueryResolver>, index: number): DataQ
   return call[0];
 }
 
-/** A host's `PanelActions`, with every member a panel could raise spied on. */
+/** The host form's selection callback, as a spy's type. */
+type SelectEventHandler = (eventId: string, coordinates?: PanelEventCoordinates) => void;
+
+/**
+ * A surface's `PanelHostActions` — the form the DevTools panel and the editor
+ * webview implement — with every member a panel could raise spied on.
+ */
 interface ActionSpies {
   /** The object to hand to the host. */
-  readonly actions: PanelActions;
+  readonly actions: PanelHostActions;
 
   /** The event-selection spy, which the evidence chips report through. */
-  readonly onSelectEvent: Mock<(ref: PanelEventRef) => void>;
+  readonly selectEvent: Mock<SelectEventHandler>;
 
   /** The open-source spy, which every source chip reports through. */
-  readonly onOpenSource: Mock<(location: SourceLocation) => void>;
+  readonly openSource: Mock<(location: SourceLocation) => void>;
 
   /** The disclosure spy, supplied so a case can assert it was not reached. */
   readonly onExpand: Mock<(nodeId: string, itemId: string, expanded: boolean) => void>;
@@ -895,7 +939,7 @@ interface ActionSpies {
 }
 
 /**
- * Fresh action spies.
+ * Fresh host-form action spies.
  *
  * All four members are supplied, the two optional ones included: a case that
  * asserts what a gesture reported is only as strong as its ability to assert
@@ -904,18 +948,60 @@ interface ActionSpies {
  * @returns The actions object and its four spies.
  */
 function makeActions(): ActionSpies {
-  const onSelectEvent = vi.fn<(ref: PanelEventRef) => void>();
-  const onOpenSource = vi.fn<(location: SourceLocation) => void>();
+  const selectEvent = vi.fn<SelectEventHandler>();
+  const openSource = vi.fn<(location: SourceLocation) => void>();
   const onExpand = vi.fn<(nodeId: string, itemId: string, expanded: boolean) => void>();
   const onFilterChange = vi.fn<(nodeId: string, filter: Record<string, string>) => void>();
 
   return {
-    actions: { onSelectEvent, onOpenSource, onExpand, onFilterChange },
-    onSelectEvent,
-    onOpenSource,
+    actions: { selectEvent, openSource, onExpand, onFilterChange },
+    selectEvent,
+    openSource,
     onExpand,
     onFilterChange,
   };
+}
+
+/**
+ * The one selection a host-form spy recorded, as its two arguments.
+ *
+ * @param spy The selection spy, which must have been called exactly once.
+ * @returns The event id and the coordinates of that call.
+ */
+function soleSelection(
+  spy: Mock<SelectEventHandler>,
+): readonly [string, PanelEventCoordinates | undefined] {
+  expect(spy).toHaveBeenCalledTimes(1);
+
+  const [call] = spy.mock.calls;
+  if (call === undefined) {
+    throw new Error('the event-selection handler recorded no call');
+  }
+
+  return [call[0], call[1]];
+}
+
+/**
+ * The location object the first `sourceLink` node of a document carries — the
+ * very object its chip must hand the host.
+ *
+ * @param spec The specification to read.
+ * @returns That node's location.
+ */
+function firstSourceLinkLocation(spec: PanelSpec): SourceLocation {
+  let found: SourceLocation | undefined;
+
+  walkPanelNodes(spec.layout, (node) => {
+    if (found === undefined && node.type === 'sourceLink') {
+      found = node.location;
+    }
+  });
+
+  if (found === undefined) {
+    throw new Error('the specification under test carries no source-link node');
+  }
+
+  return found;
 }
 
 /*
@@ -1406,7 +1492,7 @@ describe('PanelHost summary registers', () => {
  */
 
 describe('PanelHost interaction reporting', () => {
-  it('reports the whole citation when an evidence chip is activated', async () => {
+  it("selects the citation's event id, with the coordinates it recorded", async () => {
     const spec = makeSpec();
     const { actions } = await renderPanel(spec);
 
@@ -1422,27 +1508,49 @@ describe('PanelHost interaction reporting', () => {
 
     await clickByName(FIRST_CITATION_LABEL, observedRegion());
 
-    const reported = soleArgument(actions.onSelectEvent, 'event selection');
+    // The host form: the schema's `EventRef.eventId`, and beside it the trace
+    // and span the citation recorded — the coordinates that let a host scope a
+    // trace-filtered view without a lookup, so a selection stripped of them
+    // would still pass a count.
+    expect(actions.selectEvent).toHaveBeenCalledWith(FIRST_EVENT_ID, {
+      traceId: CITATION_TRACE_ID,
+      spanId: CITATION_SPAN_ID,
+    });
 
-    // The payload, not the call count: the optional trace and span coordinates
-    // are what let a host scope a trace-filtered view without a lookup, so a
-    // reference that arrived stripped of them would still pass a count.
-    expect(reported).toEqual(citation);
-    expect(Object.keys(reported).sort()).toEqual(Object.keys(citation).sort());
-    expect(reported.eventId).toBe(FIRST_EVENT_ID);
-    expect(reported.traceId).toBe(CITATION_TRACE_ID);
-    expect(reported.spanId).toBe(CITATION_SPAN_ID);
+    const [eventId, coordinates] = soleSelection(actions.selectEvent);
+    expect(eventId).toBe(citation.eventId);
+    expect(Object.keys(coordinates ?? {}).sort()).toEqual(['spanId', 'traceId']);
 
     // Selecting evidence is not navigation.
-    expect(actions.onOpenSource).not.toHaveBeenCalled();
+    expect(actions.openSource).not.toHaveBeenCalled();
+  });
+
+  it('invents no coordinate for a citation that recorded none', async () => {
+    const spec = makeSpec();
+    const { actions } = await renderPanel(spec);
+
+    await clickByName(SECOND_CITATION_LABEL, observedRegion());
+
+    // The coordinate set is present and empty — never a key written as
+    // `undefined`, and never the chip's caption or kind passed off as one.
+    const [eventId, coordinates] = soleSelection(actions.selectEvent);
+    expect(eventId).toBe(SECOND_EVENT_ID);
+    expect(coordinates).toEqual({});
+    expect(Object.keys(coordinates ?? {})).toEqual([]);
+    expect(actions.openSource).not.toHaveBeenCalled();
   });
 
   it("forwards a source-link node's location unmodified, field for field", async () => {
-    const { actions } = await renderPanel(makeSpec());
+    const spec = makeSpec();
+    const { actions } = await renderPanel(spec);
 
     await clickByName(chipName(NODE_LOCATION));
 
-    const reported = soleArgument(actions.onOpenSource, 'open source');
+    const reported = soleArgument(actions.openSource, 'open source');
+
+    // The very object the document carried, through the view form's
+    // `onOpenSource` and into the host form's `openSource` without a copy.
+    expect(reported).toBe(firstSourceLinkLocation(spec));
 
     // Hop 1 of the click-to-source chain. Every field is named individually as
     // well as compared as a whole, because each one is a way the chain has gone
@@ -1459,7 +1567,7 @@ describe('PanelHost interaction reporting', () => {
     expect(reported.resolvedBy).toBe(NODE_LOCATION.resolvedBy);
     expect(reported.confidence).toBe(NODE_LOCATION.confidence);
 
-    expect(actions.onSelectEvent).not.toHaveBeenCalled();
+    expect(actions.selectEvent).not.toHaveBeenCalled();
   });
 
   it("forwards a likely cause's suggested location unmodified, field for field", async () => {
@@ -1476,9 +1584,10 @@ describe('PanelHost interaction reporting', () => {
     // the hypothesis, never the standalone node's chip elsewhere in the panel.
     await clickByName(chipName(suggested), causesRegion());
 
-    const reported = soleArgument(actions.onOpenSource, 'open source');
+    const reported = soleArgument(actions.openSource, 'open source');
 
-    expect(reported).toEqual(suggested);
+    // The very object the analysis suggested, straight into `openSource`.
+    expect(reported).toBe(suggested);
     expect(reported).toEqual(CAUSE_LOCATION);
     expect(Object.keys(reported).sort()).toEqual(Object.keys(CAUSE_LOCATION).sort());
     expect(reported.symbol).toBe(CAUSE_LOCATION.symbol);
@@ -1489,6 +1598,125 @@ describe('PanelHost interaction reporting', () => {
     // The two chips of one panel point at two different places, and the one
     // that was activated is the one that was reported.
     expect(reported.file).not.toBe(NODE_LOCATION.file);
+    expect(actions.selectEvent).not.toHaveBeenCalled();
+  });
+});
+
+describe('PanelHost served view-form actions', () => {
+  it('reports through onSelectEvent and onOpenSource when a surface supplies them', async () => {
+    const spec = makeSpec();
+    const onSelectEvent = vi.fn<(ref: PanelEventRef) => void>();
+    const onOpenSource = vi.fn<(location: SourceLocation) => void>();
+
+    // The compatibility path: a surface written against the view names hands
+    // the host `{ onSelectEvent, onOpenSource }` rather than the host form.
+    render(
+      <PanelHost
+        spec={spec}
+        dataProvider={makeDataProvider().provider}
+        actions={{ onSelectEvent, onOpenSource }}
+      />,
+    );
+    await screen.findAllByRole('list', { name: METRIC_VIEW_NAME });
+
+    // The head reports through the host form, and the adapter hands the view
+    // form the pointer: the id and the coordinates the citation recorded,
+    // nothing more.
+    await clickByName(FIRST_CITATION_LABEL, observedRegion());
+    const reported = soleArgument(onSelectEvent, 'event selection');
+    expect(reported).toEqual({
+      eventId: FIRST_EVENT_ID,
+      traceId: CITATION_TRACE_ID,
+      spanId: CITATION_SPAN_ID,
+    });
+    expect(Object.keys(reported).sort()).toEqual(['eventId', 'spanId', 'traceId']);
+
+    // A source-link node's chip reaches the surface's own `onOpenSource` with
+    // the document's location object.
+    await clickByName(chipName(NODE_LOCATION));
+    expect(soleArgument(onOpenSource, 'open source')).toBe(firstSourceLinkLocation(spec));
+    expect(onSelectEvent).toHaveBeenCalledTimes(1);
+  });
+
+  it('reports a citation without coordinates as its event id alone', async () => {
+    const onSelectEvent = vi.fn<(ref: PanelEventRef) => void>();
+    const onOpenSource = vi.fn<(location: SourceLocation) => void>();
+
+    render(
+      <PanelHost
+        spec={makeSpec()}
+        dataProvider={makeDataProvider().provider}
+        actions={{ onSelectEvent, onOpenSource }}
+      />,
+    );
+    await screen.findAllByRole('list', { name: METRIC_VIEW_NAME });
+
+    await clickByName(SECOND_CITATION_LABEL, observedRegion());
+
+    const reported = soleArgument(onSelectEvent, 'event selection');
+    expect(reported).toEqual({ eventId: SECOND_EVENT_ID });
+    expect(Object.keys(reported)).toEqual(['eventId']);
+    expect(onOpenSource).not.toHaveBeenCalled();
+  });
+});
+
+describe('the action-form adapters the host relies on', () => {
+  it('tells the host form from the view form', () => {
+    const { actions } = makeActions();
+
+    expect(isPanelHostActions(actions)).toBe(true);
+    expect(isPanelHostActions({ onSelectEvent: vi.fn(), onOpenSource: vi.fn() })).toBe(false);
+  });
+
+  it('returns a value already in the asked-for form as the same object', () => {
+    const { actions: host } = makeActions();
+    const view: PanelViewActions = { onSelectEvent: vi.fn(), onOpenSource: vi.fn() };
+
+    expect(toPanelHostActions(host)).toBe(host);
+    expect(toPanelViewActions(view)).toBe(view);
+  });
+
+  it('adapts the host form for views without inventing a key or wrapping openSource', () => {
+    const selectEvent = vi.fn<SelectEventHandler>();
+    const openSource = vi.fn<(location: SourceLocation) => void>();
+    const view = toPanelViewActions({ selectEvent, openSource });
+
+    // The navigation member is the host's function itself, so a location
+    // reaches it by reference with nothing in between.
+    expect(view.onOpenSource).toBe(openSource);
+
+    // A coordinate the view passed as `undefined` is not written as a key.
+    view.onSelectEvent({ eventId: FIRST_EVENT_ID, traceId: CITATION_TRACE_ID, spanId: undefined });
+    const [eventId, coordinates] = soleSelection(selectEvent);
+    expect(eventId).toBe(FIRST_EVENT_ID);
+    expect(coordinates).toEqual({ traceId: CITATION_TRACE_ID });
+    expect(Object.keys(coordinates ?? {})).toEqual(['traceId']);
+
+    // The optional members appear only where the host supplied them.
+    expect(Object.keys(view).sort()).toEqual(['onOpenSource', 'onSelectEvent']);
+  });
+
+  it('adapts the view form for hosts without inventing a key or wrapping onOpenSource', () => {
+    const onSelectEvent = vi.fn<(ref: PanelEventRef) => void>();
+    const onOpenSource = vi.fn<(location: SourceLocation) => void>();
+    const onExpand = vi.fn<(nodeId: string, itemId: string, expanded: boolean) => void>();
+    const host = toPanelHostActions({ onSelectEvent, onOpenSource, onExpand });
+
+    expect(host.openSource).toBe(onOpenSource);
+    expect(host.onExpand).toBe(onExpand);
+    expect(Object.keys(host).sort()).toEqual(['onExpand', 'openSource', 'selectEvent']);
+
+    host.selectEvent(SECOND_EVENT_ID);
+    host.selectEvent(FIRST_EVENT_ID, { spanId: CITATION_SPAN_ID });
+
+    expect(onSelectEvent.mock.calls.map(([ref]) => ref)).toEqual([
+      { eventId: SECOND_EVENT_ID },
+      { eventId: FIRST_EVENT_ID, spanId: CITATION_SPAN_ID },
+    ]);
+    expect(onSelectEvent.mock.calls.map(([ref]) => Object.keys(ref).sort())).toEqual([
+      ['eventId'],
+      ['eventId', 'spanId'],
+    ]);
   });
 });
 
@@ -1794,6 +2022,171 @@ describe('PanelHost session routing', () => {
   });
 });
 
+/*
+ * ---------------------------------------------------------------------------
+ * Session and panel isolation: no view outlives the document it was drawn for
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * Every node wrapper the node renderer drew, in document order.
+ *
+ * The wrapper is the element each mounted view lives in, so its identity is
+ * what tells a remounted view from a reused one: a reused view keeps its
+ * wrapper element, and a remounted one is drawn into a new element while the
+ * old one leaves the document.
+ *
+ * @param container The render's container.
+ * @returns The wrappers currently in the document.
+ */
+function nodeWrappers(container: HTMLElement): HTMLElement[] {
+  return Array.from(container.querySelectorAll<HTMLElement>('.dg-panel__node'));
+}
+
+/**
+ * The label of the one metric the stub provider answers with: text that only a
+ * view drawn from an answered query can put on screen.
+ *
+ * @returns The label.
+ */
+function answeredMetricLabel(): string {
+  const [metric] = METRIC_VALUES;
+  if (metric === undefined) {
+    throw new Error('the suite answers metrics queries with no value');
+  }
+
+  return metric.label;
+}
+
+describe('PanelHost session and panel isolation', () => {
+  it('remounts every view when the same layout arrives for another session', async () => {
+    const spec = makeSpec();
+    const { container, provider, rerender } = await renderPanel(spec);
+
+    const before = nodeWrappers(container);
+    expect(before).toHaveLength(countNodes(spec));
+
+    // The very same node objects, so node ids and queries are identical and
+    // only the session differs — the shape in which a view keyed on its node
+    // and query alone would carry the previous capture's rows across.
+    rerender(makeSpec({ sessionId: OTHER_SESSION_ID, summary: spec.summary, layout: spec.layout }));
+
+    const after = nodeWrappers(container);
+    expect(after).toHaveLength(before.length);
+    for (const wrapper of before) {
+      expect(wrapper.isConnected).toBe(false);
+      expect(after).not.toContain(wrapper);
+    }
+
+    // A fresh view, asked afresh: under the new session, with the node's own
+    // authored query rather than a continuation of the previous page.
+    await waitFor(() => {
+      expect(provider.resolve).toHaveBeenCalledTimes(2);
+    });
+    await screen.findByRole('list', { name: METRIC_VIEW_NAME });
+    expect(resolverContextAt(provider.resolve, 1).sessionId).toBe(OTHER_SESSION_ID);
+    expect(resolverQueryAt(provider.resolve, 1)).toEqual(firstNodeQuery(spec));
+  });
+
+  it.each([
+    { what: 'another panel', id: OTHER_PANEL_ID, panelVersion: 1 },
+    { what: 'another generation of the panel', id: PANEL_ID, panelVersion: 2 },
+  ])('remounts every view when $what of the same session arrives', async ({ id, panelVersion }) => {
+    const spec = makeSpec();
+    const { container, provider, rerender } = await renderPanel(spec);
+
+    const before = nodeWrappers(container);
+    expect(before).toHaveLength(countNodes(spec));
+
+    // Same session, same node objects; only the document's identity moved.
+    rerender({ ...makeSpec({ summary: spec.summary, layout: spec.layout }), id, panelVersion });
+
+    const after = nodeWrappers(container);
+    expect(after).toHaveLength(before.length);
+    for (const wrapper of before) {
+      expect(wrapper.isConnected).toBe(false);
+      expect(after).not.toContain(wrapper);
+    }
+
+    await waitFor(() => {
+      expect(provider.resolve).toHaveBeenCalledTimes(2);
+    });
+    await screen.findByRole('list', { name: METRIC_VIEW_NAME });
+    expect(resolverContextAt(provider.resolve, 1).sessionId).toBe(SESSION_ID);
+    expect(resolverQueryAt(provider.resolve, 1)).toEqual(firstNodeQuery(spec));
+  });
+
+  it('keeps every view mounted when the same panel is re-delivered', async () => {
+    const spec = makeSpec();
+    const { container, provider, rerender } = await renderPanel(spec);
+
+    const before = nodeWrappers(container);
+
+    // A new document object for the same session, id and generation: what a
+    // store hands back when nothing about the panel's identity changed.
+    rerender(makeSpec({ summary: spec.summary, layout: spec.layout }));
+
+    const after = nodeWrappers(container);
+    expect(after).toHaveLength(before.length);
+    after.forEach((wrapper, index) => {
+      expect(wrapper).toBe(before[index]);
+      expect(wrapper.isConnected).toBe(true);
+    });
+    expect(provider.resolve).toHaveBeenCalledTimes(1);
+  });
+
+  it("never shows a previous session's data while the next session loads or fails", async () => {
+    const spec = makeSpec();
+    const provider = makeControllableProvider();
+    const { actions } = makeActions();
+    const metricLabel = answeredMetricLabel();
+
+    const view = render(
+      <PanelHost spec={spec} dataProvider={provider.provider} actions={actions} />,
+    );
+
+    // Session A answers, and its data is on screen.
+    const first = provider.takeNext();
+    expect(first.context.sessionId).toBe(SESSION_ID);
+    first.answer(metricsResponse());
+    await screen.findByRole('list', { name: METRIC_VIEW_NAME });
+    expect(screen.getByRole('region', { name: STACK_TITLE }).textContent).toContain(metricLabel);
+
+    // Session B, with the very same node objects, and not answered yet.
+    view.rerender(
+      <PanelHost
+        spec={makeSpec({ sessionId: OTHER_SESSION_ID, summary: spec.summary, layout: spec.layout })}
+        dataProvider={provider.provider}
+        actions={actions}
+      />,
+    );
+
+    const second = provider.takeNext();
+    expect(second.context.sessionId).toBe(OTHER_SESSION_ID);
+    expect(second.query).toEqual(firstNodeQuery(spec));
+
+    // Pending: the loading state, and nothing session A answered with.
+    const pendingStack = screen.getByRole('region', { name: STACK_TITLE });
+    expect(within(pendingStack).getByRole('status').getAttribute('aria-busy')).toBe('true');
+    expect(within(pendingStack).queryByRole('list', { name: METRIC_VIEW_NAME })).toBeNull();
+    expect(pendingStack.textContent).not.toContain(metricLabel);
+
+    second.fail(
+      new DebuggenError(PROVIDER_FAILURE_CODE, 'The transport closed before the page arrived.', {
+        hint: 'Reconnect, then retry.',
+      }),
+    );
+
+    // Failed: the error state for session B, and still nothing from session A.
+    const failedStack = screen.getByRole('region', { name: STACK_TITLE });
+    const alert = await within(failedStack).findByRole('alert');
+    expect(alert.textContent).toContain(PROVIDER_FAILURE_CODE);
+    expect(within(failedStack).queryByRole('list', { name: METRIC_VIEW_NAME })).toBeNull();
+    expect(failedStack.textContent).not.toContain(metricLabel);
+    expect(view.container.textContent).not.toContain(metricLabel);
+  });
+});
+
 describe('the session-addressed data seam the host relies on', () => {
   it('hands the resolver the session it was asked for, beside the abort signal', async () => {
     const resolve = vi.fn<DataQueryResolver>(() => Promise.resolve(metricsResponse()));
@@ -1860,6 +2253,722 @@ describe('the session-addressed data seam the host relies on', () => {
 
 /*
  * ---------------------------------------------------------------------------
+ * The host data contract: the service's body becomes the view a component
+ * reads, and nothing malformed reaches a component as data (AAP 0.4.2, 0.5.5)
+ * ---------------------------------------------------------------------------
+ */
+
+describe('the host data contract: wire-to-view mapping and the response check', () => {
+  /** The code a response that breaks the panel-data contract is refused with. */
+  const MALFORMED_RESPONSE_CODE = 'PROTOCOL_INVALID_MESSAGE';
+
+  /** The paging echo of a one-item last page, exactly as the service sends it. */
+  const LAST_PAGE: PanelDataPage = {
+    total: 1,
+    limit: DATA_QUERY_DEFAULT_LIMIT,
+    offset: 0,
+    nextOffset: null,
+  };
+
+  /** The paging echo of a middle page, so a real next offset is seen to cross. */
+  const MIDDLE_PAGE: PanelDataPage = {
+    total: 3 * DATA_QUERY_DEFAULT_LIMIT,
+    limit: DATA_QUERY_DEFAULT_LIMIT,
+    offset: DATA_QUERY_DEFAULT_LIMIT,
+    nextOffset: 2 * DATA_QUERY_DEFAULT_LIMIT,
+  };
+
+  /** A span-shaped record carrying the identifying fields the event guards read. */
+  const WIRE_EVENT = {
+    id: 'evt-wire-boundary',
+    traceId: CITATION_TRACE_ID,
+    spanId: CITATION_SPAN_ID,
+    kind: 'fetch',
+    tier: 'browser',
+  };
+
+  /** A render statistic carrying the fields the render guard reads. */
+  const WIRE_RENDER_STAT = {
+    id: 'render:ExampleWidget',
+    component: 'ExampleWidget',
+    renderCount: 3,
+  };
+
+  /** A request group: well formed for `requests`, and the wrong element for `renders`. */
+  const WIRE_REQUEST_GROUP = {
+    id: 'request-group-example',
+    method: 'GET',
+    url: '/example/resource',
+    count: 2,
+  };
+
+  /**
+   * One well-formed payload per source, keyed exhaustively by the source
+   * vocabulary: a source added to the contract fails to compile here until its
+   * mapping is exercised. The array-valued payloads are the paged sources.
+   */
+  const WIRE_PAYLOADS = {
+    trace: { traceId: CITATION_TRACE_ID, roots: [] },
+    spans: [WIRE_EVENT],
+    events: [WIRE_EVENT],
+    renders: [WIRE_RENDER_STAT],
+    componentTree: { capturedAt: 0, roots: [] },
+    requests: [WIRE_REQUEST_GROUP],
+    queries: [{ id: 'query-group-example', normalizedStatement: 'SELECT $1', executionCount: 2 }],
+    stateTransitions: [{ id: 'evt-state-example', eventId: 'evt-state-example' }],
+    graph: { nodes: [], edges: [] },
+    metrics: METRIC_VALUES,
+  } satisfies { readonly [Source in DataQuery['source']]: unknown };
+
+  /** Every source, in the order the table above lists them. */
+  const WIRE_SOURCES = Object.keys(WIRE_PAYLOADS) as readonly (keyof typeof WIRE_PAYLOADS)[];
+
+  /**
+   * A service body: the payload under the source-named key and, for a paged
+   * source, the paging echo beside it.
+   *
+   * @param source The source the body answers for.
+   * @param payload The payload, under `source`.
+   * @param page The paging echo; omitted for a single-value source.
+   * @returns The body, as the transport would decode it.
+   */
+  function wireBody(
+    source: DataQuery['source'],
+    payload: unknown,
+    page?: object,
+  ): Record<string, unknown> {
+    return page === undefined
+      ? { source, [source]: payload }
+      : { source, [source]: payload, ...page };
+  }
+
+  /**
+   * The last-page echo with one counter left out, as a producer that dropped it
+   * would send it.
+   *
+   * @param counter The counter to omit.
+   * @returns The remaining counters.
+   */
+  function pageWithout(counter: keyof PanelDataPage): Record<string, unknown> {
+    return Object.fromEntries(Object.entries(LAST_PAGE).filter(([name]) => name !== counter));
+  }
+
+  /**
+   * The body every metrics query in these cases is answered with by a host
+   * resolver: the suite's metric values as the service sends them.
+   *
+   * @returns A fresh wire-form result for the `metrics` source.
+   */
+  function metricsBody(): PanelDataResult {
+    return { source: 'metrics', metrics: METRIC_VALUES, ...LAST_PAGE };
+  }
+
+  /**
+   * A value a transport forwarded without decoding it, typed as the result it
+   * claims to be. How a body built here from the minimal fixtures above — or a
+   * malformed one, which the mapping must refuse — reaches a host resolver's
+   * return type: only the mapping's runtime check stands between it and a view.
+   *
+   * @param value The body as it arrived.
+   * @returns The same value, claimed to be a wire-form result.
+   */
+  function undecodedBody(value: unknown): PanelDataResult {
+    return value as PanelDataResult;
+  }
+
+  it.each(WIRE_SOURCES)(
+    'maps a "%s" body onto the view a component reads, payload and counters untouched',
+    (source) => {
+      const payload = WIRE_PAYLOADS[source];
+      const paged = Array.isArray(payload);
+
+      const mapped = mapPanelDataResult(
+        { source },
+        wireBody(source, payload, paged ? LAST_PAGE : undefined),
+      );
+      if (!mapped.ok) {
+        throw mapped.error;
+      }
+
+      // The very payload the service sent, under `data` — not a copy, and not
+      // re-ordered — with the four counters for a paged source (the last-page
+      // `null` included) and none at all for a single-value one.
+      expect(mapped.value.data).toBe(payload);
+      expect(mapped.value).toStrictEqual(
+        paged ? { source, data: payload, ...LAST_PAGE } : { source, data: payload },
+      );
+    },
+  );
+
+  it("carries a middle page's counters across exactly as the service stated them", () => {
+    const mapped = mapPanelDataResult(
+      { source: 'renders', offset: MIDDLE_PAGE.offset },
+      wireBody('renders', [WIRE_RENDER_STAT], MIDDLE_PAGE),
+    );
+    if (!mapped.ok) {
+      throw mapped.error;
+    }
+
+    expect(mapped.value).toStrictEqual({
+      source: 'renders',
+      data: [WIRE_RENDER_STAT],
+      ...MIDDLE_PAGE,
+    });
+  });
+
+  it.each(['trace', 'componentTree'] as const)(
+    'maps a "%s" body of null, the wire\'s "nothing matched", to a successful view of null',
+    (source) => {
+      expect(mapPanelDataResult({ source }, wireBody(source, null))).toStrictEqual({
+        ok: true,
+        value: { source, data: null },
+      });
+    },
+  );
+
+  /** One malformed body, and the field its refusal must name. */
+  interface WireRefusal {
+    /** What is wrong, for the case title. */
+    readonly name: string;
+    /** The query the body claims to answer. */
+    readonly query: DataQuery;
+    /** The body as it arrived. */
+    readonly body: unknown;
+    /** The field path the refusal names. */
+    readonly field: string;
+  }
+
+  const WIRE_REFUSALS: readonly WireRefusal[] = [
+    { name: 'a null body', query: { source: 'renders' }, body: null, field: 'the response' },
+    {
+      name: 'an array body',
+      query: { source: 'renders' },
+      body: [WIRE_RENDER_STAT],
+      field: 'the response',
+    },
+    { name: 'a string body', query: { source: 'renders' }, body: 'renders', field: 'the response' },
+    {
+      name: 'a body without its source-named member',
+      query: { source: 'renders' },
+      body: { source: 'renders', ...LAST_PAGE },
+      field: 'renders',
+    },
+    {
+      name: 'a view-form response handed over as a body',
+      query: { source: 'spans' },
+      body: { source: 'spans', data: [WIRE_EVENT], ...LAST_PAGE },
+      field: 'spans',
+    },
+    {
+      name: 'a single element where a list belongs',
+      query: { source: 'renders' },
+      body: wireBody('renders', WIRE_RENDER_STAT, LAST_PAGE),
+      field: 'renders',
+    },
+    {
+      name: 'an element that is not an object',
+      query: { source: 'renders' },
+      body: wireBody('renders', ['ExampleWidget'], LAST_PAGE),
+      field: 'renders[0]',
+    },
+    {
+      name: 'an element missing an identifying field',
+      query: { source: 'events' },
+      body: wireBody(
+        'events',
+        [
+          {
+            id: WIRE_EVENT.id,
+            traceId: WIRE_EVENT.traceId,
+            kind: WIRE_EVENT.kind,
+            tier: 'browser',
+          },
+        ],
+        LAST_PAGE,
+      ),
+      field: 'events[0].spanId',
+    },
+    {
+      name: "another source's elements under the requested key",
+      query: { source: 'renders' },
+      body: wireBody('renders', [WIRE_REQUEST_GROUP], LAST_PAGE),
+      field: 'renders[0].component',
+    },
+    {
+      name: 'a page longer than any query may ask for',
+      query: { source: 'spans' },
+      body: wireBody(
+        'spans',
+        Array.from({ length: DATA_QUERY_MAX_LIMIT + 1 }, () => WIRE_EVENT),
+        { ...LAST_PAGE, total: DATA_QUERY_MAX_LIMIT + 1, limit: DATA_QUERY_MAX_LIMIT },
+      ),
+      field: 'spans',
+    },
+    {
+      name: 'a trace without its roots',
+      query: { source: 'trace' },
+      body: wireBody('trace', { traceId: CITATION_TRACE_ID }),
+      field: 'trace.roots',
+    },
+    {
+      name: 'a component tree without its capture time',
+      query: { source: 'componentTree' },
+      body: wireBody('componentTree', { roots: [] }),
+      field: 'componentTree.capturedAt',
+    },
+    {
+      name: 'a graph of null, which a graph never is',
+      query: { source: 'graph' },
+      body: wireBody('graph', null),
+      field: 'graph',
+    },
+    ...(['total', 'limit', 'offset', 'nextOffset'] as const).map((counter): WireRefusal => ({
+      name: `a paged body without ${counter}`,
+      query: { source: 'renders' },
+      body: wireBody('renders', [WIRE_RENDER_STAT], pageWithout(counter)),
+      field: counter,
+    })),
+    ...(
+      [
+        ['total', -1],
+        ['total', 1.5],
+        ['limit', 0.5],
+        ['limit', DATA_QUERY_MAX_LIMIT + 1],
+        ['offset', -DATA_QUERY_DEFAULT_LIMIT],
+        ['offset', 2.25],
+        ['nextOffset', 400.5],
+        ['nextOffset', -1],
+        ['nextOffset', '400'],
+      ] as const
+    ).map(([counter, value]): WireRefusal => ({
+      name: `${counter} of ${JSON.stringify(value)}`,
+      query: { source: 'renders' },
+      body: wireBody('renders', [WIRE_RENDER_STAT], { ...LAST_PAGE, [counter]: value }),
+      field: counter,
+    })),
+  ];
+
+  it.each(WIRE_REFUSALS)('refuses $name, naming the field at fault', ({ query, body, field }) => {
+    const mapped = mapPanelDataResult(query, body);
+    if (mapped.ok) {
+      throw new Error('a malformed body was mapped onto a view');
+    }
+
+    expect(mapped.error).toBeInstanceOf(DebuggenError);
+    expect(mapped.error.code).toBe(MALFORMED_RESPONSE_CODE);
+    expect(mapped.error.details).toMatchObject({ source: query.source, form: 'wire', field });
+    expect(mapped.error.message).toContain(field);
+    expect(mapped.error.hint ?? '').not.toBe('');
+  });
+
+  it('refuses a body answering for another source, naming both sources', () => {
+    const mapped = mapPanelDataResult(
+      { source: 'renders' },
+      wireBody('requests', [WIRE_REQUEST_GROUP], LAST_PAGE),
+    );
+    if (mapped.ok) {
+      throw new Error('a misrouted body was mapped onto a view');
+    }
+
+    expect(mapped.error.code).toBe(MALFORMED_RESPONSE_CODE);
+    expect(mapped.error.details).toEqual({
+      requested: 'renders',
+      received: 'requests',
+      form: 'wire',
+    });
+  });
+
+  it('never quotes a refused value in the message, the hint or the details', () => {
+    const sentinel = 'sentinel-value-a-refusal-must-never-echo';
+    const bodies: readonly unknown[] = [
+      sentinel,
+      { source: sentinel, renders: [WIRE_RENDER_STAT], ...LAST_PAGE },
+      wireBody('renders', [sentinel], LAST_PAGE),
+      wireBody('renders', { [sentinel]: sentinel }, LAST_PAGE),
+      wireBody('renders', [WIRE_RENDER_STAT], { ...LAST_PAGE, nextOffset: sentinel }),
+    ];
+
+    for (const body of bodies) {
+      const mapped = mapPanelDataResult({ source: 'renders' }, body);
+      if (mapped.ok) {
+        throw new Error('a malformed body was mapped onto a view');
+      }
+
+      const reported = JSON.stringify({
+        message: mapped.error.message,
+        hint: mapped.error.hint,
+        details: mapped.error.details,
+      });
+      expect(reported).not.toContain(sentinel);
+    }
+  });
+
+  it('draws a view from the service body a host resolver returns, where the body once left no data', async () => {
+    const resolve = vi.fn<PanelDataResolver>((query) =>
+      query.source === 'metrics'
+        ? Promise.resolve(metricsBody())
+        : Promise.reject(
+            new DebuggenError('NOT_IMPLEMENTED', `No "${query.source}" body is served here.`),
+          ),
+    );
+    const spec = makeSpec();
+
+    render(
+      <PanelHost
+        spec={spec}
+        dataProvider={createPanelDataProvider(resolve)}
+        actions={makeActions().actions}
+      />,
+    );
+
+    // The settled view with the metric in it: under the old contract the body's
+    // `metrics` member never reached `data`, and the view drew its empty state.
+    const stack = screen.getByRole('region', { name: STACK_TITLE });
+    const view = await within(stack).findByRole('list', { name: METRIC_VIEW_NAME });
+    expect(within(view).getAllByRole('listitem')).toHaveLength(METRIC_VALUES.length);
+    expect(within(stack).queryByRole('alert')).toBeNull();
+
+    expect(resolve).toHaveBeenCalledTimes(1);
+    const [call] = resolve.mock.calls;
+    if (call === undefined) {
+      throw new Error('the host resolver recorded no call');
+    }
+    expect(call[0]).toEqual(firstNodeQuery(spec));
+    expect(call[1].sessionId).toBe(SESSION_ID);
+    expect(call[1].signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it.each(['', BLANK_SESSION_ID])(
+    'refuses a query addressed to %j before the host resolver runs',
+    async (sessionId) => {
+      const resolve = vi.fn<PanelDataResolver>(() => Promise.resolve(metricsBody()));
+
+      const refused = createPanelDataProvider(resolve).query(sessionId, { source: 'metrics' });
+
+      await expect(refused).rejects.toBeInstanceOf(DebuggenError);
+      await expect(refused).rejects.toMatchObject({ code: UNADDRESSED_QUERY_CODE });
+      expect(resolve).not.toHaveBeenCalled();
+    },
+  );
+
+  it("turns a host resolver's synchronous throw into a rejection", async () => {
+    const resolve = vi.fn<PanelDataResolver>(() => {
+      throw new DebuggenError(PROVIDER_FAILURE_CODE, 'The channel is not open.');
+    });
+
+    const pending = createPanelDataProvider(resolve).query(SESSION_ID, { source: 'metrics' });
+
+    await expect(pending).rejects.toMatchObject({ code: PROVIDER_FAILURE_CODE });
+    expect(resolve).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects a body the mapping refuses, rather than resolving a view without data', async () => {
+    const resolve = vi.fn<PanelDataResolver>(() =>
+      Promise.resolve(undecodedBody({ source: 'metrics', data: METRIC_VALUES, ...LAST_PAGE })),
+    );
+
+    const refused = createPanelDataProvider(resolve).query(SESSION_ID, { source: 'metrics' });
+
+    await expect(refused).rejects.toBeInstanceOf(DebuggenError);
+    await expect(refused).rejects.toMatchObject({
+      code: MALFORMED_RESPONSE_CODE,
+      details: { source: 'metrics', form: 'wire', field: 'metrics' },
+    });
+  });
+
+  it.each(WIRE_SOURCES)(
+    'accepts, in the view check, the "%s" view the mapping produced',
+    (source) => {
+      const payload = WIRE_PAYLOADS[source];
+      const mapped = mapPanelDataResult(
+        { source },
+        wireBody(source, payload, Array.isArray(payload) ? LAST_PAGE : undefined),
+      );
+      if (!mapped.ok) {
+        throw mapped.error;
+      }
+
+      // The two paths share one set of guards, so what one produces the other
+      // accepts — with the wire's counters, and without any.
+      expect(checkDataQueryResponse({ source }, mapped.value)).toBeUndefined();
+      expect(checkDataQueryResponse({ source }, { source, data: payload })).toBeUndefined();
+    },
+  );
+
+  /** The accessible names of {@link QueryStateProbe}'s four outputs. */
+  const PROBE_STATUS_LABEL = 'query status';
+  const PROBE_ERROR_LABEL = 'query error code';
+  const PROBE_DATA_LABEL = 'query data';
+  const PROBE_PAGE_LABEL = 'query paging counters';
+
+  /** What {@link QueryStateProbe} is asked to resolve. */
+  interface QueryStateProbeProps {
+    /** The query the probe hands the hook, unmodified. */
+    readonly query: DataQuery;
+  }
+
+  /**
+   * The smallest view over the query hook that prints everything it reports:
+   * the status, the error's code, the data and the four paging counters, with
+   * the retry it offers as a button.
+   *
+   * @param props See {@link QueryStateProbeProps}.
+   * @returns The printed result.
+   */
+  function QueryStateProbe(props: QueryStateProbeProps): ReactElement {
+    const { status, error, data, total, limit, offset, nextOffset, retry } = useQuery(props.query);
+
+    return (
+      <>
+        <output aria-label={PROBE_STATUS_LABEL}>{status}</output>
+        <output aria-label={PROBE_ERROR_LABEL}>{error?.code ?? ''}</output>
+        <output aria-label={PROBE_DATA_LABEL}>
+          {data === undefined ? 'undefined' : JSON.stringify(data)}
+        </output>
+        <output aria-label={PROBE_PAGE_LABEL}>
+          {JSON.stringify({ total, limit, offset, nextOffset })}
+        </output>
+        <button type="button" onClick={retry}>
+          Retry
+        </button>
+      </>
+    );
+  }
+
+  /** A provider written by hand against the interface, and the calls it received. */
+  interface HandWrittenProvider {
+    /** The provider: a plain object, built by no library factory. */
+    readonly provider: DataProvider;
+    /** Every call, as the session and the query it was addressed with. */
+    readonly calls: Mock<(sessionId: string, query: DataQuery) => void>;
+  }
+
+  /**
+   * A provider implementing `DataProvider` directly, answering its calls with
+   * the scripted responses in order — whatever they are.
+   *
+   * No factory checks anything on its way out, which is the point: the query
+   * hook is the only thing between these answers and a component.
+   *
+   * @param answers The responses to resolve with, one per call.
+   * @returns The provider and its call recorder.
+   */
+  function makeHandWrittenProvider(answers: readonly unknown[]): HandWrittenProvider {
+    const queue = [...answers];
+    const calls = vi.fn<(sessionId: string, query: DataQuery) => void>();
+
+    const provider: DataProvider = {
+      query<Source extends DataQuery['source']>(
+        sessionId: string,
+        query: DataQuery & { source: Source },
+      ): Promise<DataQueryResponse<Source>> {
+        calls(sessionId, query);
+
+        // What a hand-written implementation does with whatever its transport
+        // decoded: asserts it is the promised response. Nothing checks it here.
+        return Promise.resolve(queue.shift() as DataQueryResponse<Source>);
+      },
+    };
+
+    return { provider, calls };
+  }
+
+  /**
+   * Mounts {@link QueryStateProbe} under a provider and the suite's session.
+   *
+   * @param provider The provider to resolve through.
+   * @param query The query to resolve.
+   */
+  function renderProbe(provider: DataProvider, query: DataQuery): void {
+    render(
+      <DataProviderContext.Provider value={provider}>
+        <PanelSessionContext.Provider value={SESSION_ID}>
+          <QueryStateProbe query={query} />
+        </PanelSessionContext.Provider>
+      </DataProviderContext.Provider>,
+    );
+  }
+
+  /**
+   * The text of one of the probe's outputs.
+   *
+   * @param label The output's accessible name.
+   * @returns Its text.
+   */
+  function probeText(label: string): string {
+    return screen.getByLabelText(label).textContent ?? '';
+  }
+
+  /**
+   * Waits for the probe's query to leave the loading state.
+   *
+   * @returns The status it settled in.
+   */
+  async function settledProbeStatus(): Promise<string> {
+    await waitFor(() => {
+      expect(probeText(PROBE_STATUS_LABEL)).not.toBe('loading');
+    });
+
+    return probeText(PROBE_STATUS_LABEL);
+  }
+
+  /** One answer a hand-written provider gives that the hook must refuse. */
+  interface ViewRefusal {
+    /** What is wrong, for the case title. */
+    readonly name: string;
+    /** The query the probe resolves. */
+    readonly query: DataQuery;
+    /** The provider's answer. */
+    readonly answer: unknown;
+  }
+
+  const VIEW_REFUSALS: readonly ViewRefusal[] = [
+    {
+      name: 'an answer for another source',
+      query: { source: 'renders' },
+      answer: { source: 'requests', data: [WIRE_REQUEST_GROUP], total: 1 },
+    },
+    {
+      name: "another source's payload under the requested source",
+      query: { source: 'renders' },
+      answer: { source: 'renders', data: [WIRE_REQUEST_GROUP], total: 1 },
+    },
+    {
+      name: "the service's body, untranslated",
+      query: { source: 'spans' },
+      answer: { source: 'spans', spans: [WIRE_EVENT], ...LAST_PAGE },
+    },
+    {
+      name: 'a list where a trace belongs',
+      query: { source: 'trace' },
+      answer: { source: 'trace', data: [WIRE_EVENT] },
+    },
+    { name: 'no answer at all', query: { source: 'events' }, answer: undefined },
+    {
+      name: 'a negative total',
+      query: { source: 'events' },
+      answer: { source: 'events', data: [], total: -1 },
+    },
+    {
+      name: 'a fractional limit',
+      query: { source: 'events' },
+      answer: { source: 'events', data: [], limit: 0.5 },
+    },
+    {
+      name: 'a limit beyond the page ceiling',
+      query: { source: 'events' },
+      answer: { source: 'events', data: [], limit: DATA_QUERY_MAX_LIMIT + 1 },
+    },
+    {
+      name: 'an offset that is not a number',
+      query: { source: 'events' },
+      answer: { source: 'events', data: [], offset: '0' },
+    },
+    {
+      name: 'a fractional next offset',
+      query: { source: 'events' },
+      answer: { source: 'events', data: [], nextOffset: 1.5 },
+    },
+  ];
+
+  it.each(VIEW_REFUSALS)(
+    'reports $name from a hand-written provider as an error with no data, not a success',
+    async ({ query, answer }) => {
+      const { provider, calls } = makeHandWrittenProvider([answer]);
+
+      renderProbe(provider, query);
+
+      expect(await settledProbeStatus()).toBe('error');
+      expect(probeText(PROBE_ERROR_LABEL)).toBe(MALFORMED_RESPONSE_CODE);
+      expect(probeText(PROBE_DATA_LABEL)).toBe('undefined');
+      expect(JSON.parse(probeText(PROBE_PAGE_LABEL))).toEqual({});
+      expect(calls).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('retries a refused answer with the very same query, and draws the corrected answer', async () => {
+    const { provider, calls } = makeHandWrittenProvider([
+      { source: 'requests', data: [WIRE_REQUEST_GROUP], total: 1 },
+      { source: 'renders', data: [WIRE_RENDER_STAT], total: 1 },
+    ]);
+    const query: DataQuery = { source: 'renders', limit: DATA_QUERY_DEFAULT_LIMIT };
+
+    renderProbe(provider, query);
+    expect(await settledProbeStatus()).toBe('error');
+
+    const user = userEvent.setup();
+    await user.click(screen.getByRole('button', { name: RETRY_PATTERN }));
+
+    expect(await settledProbeStatus()).toBe('success');
+    expect(probeText(PROBE_ERROR_LABEL)).toBe('');
+    expect(JSON.parse(probeText(PROBE_DATA_LABEL))).toEqual([WIRE_RENDER_STAT]);
+    expect(JSON.parse(probeText(PROBE_PAGE_LABEL))).toEqual({ total: 1 });
+
+    // The retry re-issued the failed request itself: same session, same query.
+    expect(calls).toHaveBeenCalledTimes(2);
+    expect(calls.mock.calls[1]).toEqual(calls.mock.calls[0]);
+    expect(calls.mock.calls[0]).toEqual([SESSION_ID, query]);
+  });
+
+  it('reports a null trace from a hand-written provider as a success whose data is null', async () => {
+    const { provider } = makeHandWrittenProvider([{ source: 'trace', data: null }]);
+
+    renderProbe(provider, { source: 'trace', filter: { traceId: CITATION_TRACE_ID } });
+
+    expect(await settledProbeStatus()).toBe('success');
+    expect(probeText(PROBE_DATA_LABEL)).toBe('null');
+    expect(probeText(PROBE_ERROR_LABEL)).toBe('');
+  });
+
+  it.each([
+    { name: 'a middle page', page: MIDDLE_PAGE, reported: MIDDLE_PAGE },
+    {
+      name: 'the last page',
+      page: LAST_PAGE,
+      reported: { total: LAST_PAGE.total, limit: LAST_PAGE.limit, offset: LAST_PAGE.offset },
+    },
+  ])(
+    "hands a view all four counters of the service's body for $name",
+    async ({ page, reported }) => {
+      const resolve = vi.fn<PanelDataResolver>(() =>
+        Promise.resolve(undecodedBody(wireBody('events', [WIRE_EVENT], page))),
+      );
+
+      renderProbe(createPanelDataProvider(resolve), { source: 'events' });
+
+      // The wire's `null` next offset is the one counter the hook folds, into
+      // the absent value a view reads as end-of-data.
+      expect(await settledProbeStatus()).toBe('success');
+      expect(JSON.parse(probeText(PROBE_PAGE_LABEL))).toEqual(reported);
+      expect(JSON.parse(probeText(PROBE_DATA_LABEL))).toEqual([WIRE_EVENT]);
+    },
+  );
+
+  it("draws a real view's error state for a misrouted answer, and the view once a retry is answered", async () => {
+    const { provider, calls } = makeHandWrittenProvider([
+      { source: 'renders', data: [WIRE_RENDER_STAT], total: 1 },
+      metricsResponse(),
+    ]);
+
+    render(<PanelHost spec={makeSpec()} dataProvider={provider} actions={makeActions().actions} />);
+
+    const stack = screen.getByRole('region', { name: STACK_TITLE });
+    const alert = await within(stack).findByRole('alert');
+    expect(alert.textContent).toContain(MALFORMED_RESPONSE_CODE);
+    expect(within(stack).queryByRole('list', { name: METRIC_VIEW_NAME })).toBeNull();
+
+    const user = userEvent.setup();
+    await user.click(within(alert).getByRole('button', { name: RETRY_PATTERN }));
+
+    await within(stack).findByRole('list', { name: METRIC_VIEW_NAME });
+    expect(within(stack).queryByRole('alert')).toBeNull();
+    expect(calls).toHaveBeenCalledTimes(2);
+    expect(calls.mock.calls[1]).toEqual(calls.mock.calls[0]);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
  * Re-rendering and keys: unrelated host changes leave the views alone
  * ---------------------------------------------------------------------------
  */
@@ -1872,6 +2981,23 @@ describe('PanelHost re-rendering', () => {
     // A fresh object literal, as a surface writes one inline in its JSX.
     const renders = countRenders(() => {
       rerender(spec, { ...actions.actions });
+    });
+
+    expect(renders).toEqual({ metricViews: 0, sourceLinks: 0 });
+    expect(provider.resolve).toHaveBeenCalledTimes(1);
+  });
+
+  it('re-renders no view when view-form actions are rebuilt from the same callbacks', async () => {
+    const spec = makeSpec();
+    const onSelectEvent = vi.fn<(ref: PanelEventRef) => void>();
+    const onOpenSource = vi.fn<(location: SourceLocation) => void>();
+    const { provider, rerender } = await renderPanel(spec);
+
+    // Settle on the view form first, then rebuild it: only the second render
+    // is counted, so the adaptation itself must be what stays stable.
+    rerender(spec, { onSelectEvent, onOpenSource });
+    const renders = countRenders(() => {
+      rerender(spec, { onSelectEvent, onOpenSource });
     });
 
     expect(renders).toEqual({ metricViews: 0, sourceLinks: 0 });
@@ -1993,11 +3119,9 @@ describe('PanelHost document outline', () => {
 
 describe('SummaryHeader citations without a selection handler', () => {
   it('renders every citation as inert text, never as a control that does nothing', async () => {
-    const onOpenSource = vi.fn<(location: SourceLocation) => void>();
+    const openSource = vi.fn<(location: SourceLocation) => void>();
 
-    render(
-      <SummaryHeader title={PANEL_TITLE} summary={makeSummary()} onOpenSource={onOpenSource} />,
-    );
+    render(<SummaryHeader title={PANEL_TITLE} summary={makeSummary()} openSource={openSource} />);
 
     const citations: readonly (readonly [string, string, HTMLElement])[] = [
       [FIRST_CITATION_LABEL, FIRST_EVENT_ID, observedRegion()],
@@ -2026,18 +3150,45 @@ describe('SummaryHeader citations without a selection handler', () => {
   });
 
   it('renders every citation as a selectable chip once a handler is supplied', async () => {
-    const onSelectEvent = vi.fn<(ref: PanelEventRef) => void>();
+    const selectEvent = vi.fn<SelectEventHandler>();
 
-    render(
-      <SummaryHeader title={PANEL_TITLE} summary={makeSummary()} onSelectEvent={onSelectEvent} />,
-    );
+    render(<SummaryHeader title={PANEL_TITLE} summary={makeSummary()} selectEvent={selectEvent} />);
 
     for (const label of [FIRST_CITATION_LABEL, SECOND_CITATION_LABEL, CAUSE_CITATION_LABEL]) {
       screen.getByRole('button', { name: label });
     }
 
     await clickByName(CAUSE_CITATION_LABEL, causesRegion());
-    expect(soleArgument(onSelectEvent, 'event selection').eventId).toBe(CAUSE_EVENT_ID);
+
+    // The citation's event id, and the coordinates it recorded — none.
+    const [eventId, coordinates] = soleSelection(selectEvent);
+    expect(eventId).toBe(CAUSE_EVENT_ID);
+    expect(coordinates).toEqual({});
+  });
+
+  it("hands its source chip the head's openSource, with the suggested location", async () => {
+    const summary = makeSummary();
+    const openSource = vi.fn<(location: SourceLocation) => void>();
+    const selectEvent = vi.fn<SelectEventHandler>();
+
+    render(
+      <SummaryHeader
+        title={PANEL_TITLE}
+        summary={summary}
+        selectEvent={selectEvent}
+        openSource={openSource}
+      />,
+    );
+
+    const suggested = summary.likelyCauses[0]?.suggestedLocation;
+    if (suggested === undefined) {
+      throw new Error('the summary under test suggests no location');
+    }
+
+    await clickByName(chipName(suggested), causesRegion());
+
+    expect(soleArgument(openSource, 'open source')).toBe(suggested);
+    expect(selectEvent).not.toHaveBeenCalled();
   });
 });
 
@@ -2066,8 +3217,8 @@ describe('PanelHost treatment of the specification', () => {
     await clickByName(FIRST_CITATION_LABEL, observedRegion());
     await clickByName(chipName(NODE_LOCATION));
 
-    expect(actions.onSelectEvent).toHaveBeenCalledTimes(1);
-    expect(actions.onOpenSource).toHaveBeenCalledTimes(1);
+    expect(actions.selectEvent).toHaveBeenCalledTimes(1);
+    expect(actions.openSource).toHaveBeenCalledTimes(1);
 
     // And after the interactions, which is the half a clone taken before the
     // render would otherwise miss: a handler that recorded a selection onto the

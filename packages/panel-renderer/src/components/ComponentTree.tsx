@@ -236,7 +236,13 @@ const ERROR_MESSAGE =
 const ERROR_SOURCE_MESSAGE =
   'This view was configured with a data source it cannot draw. The panel that produced it is at fault, not the capture.';
 
-/** Error state for a provider that answered with a payload of the wrong shape. */
+/**
+ * Error state for a provider that answered with a non-null payload of the wrong
+ * shape.
+ *
+ * Never shown for `null`: that is the service's own answer for a capture that
+ * holds no render evidence to build a tree from, and it renders the empty state.
+ */
 const ERROR_SHAPE_MESSAGE =
   'The data provider answered with a payload this view cannot read. The provider that produced it is at fault, not the capture.';
 
@@ -1120,6 +1126,12 @@ export function ComponentTree(props: ComponentTreeProps): ReactElement {
   const supported = isComponentTreeQuery(query);
   const result = useQuery<'componentTree'>(supported ? query : undefined);
 
+  // `null` is how the service answers for a capture that holds no render
+  // evidence to build a tree from — the wire's spelling of "no tree", because an
+  // absent value does not survive a JSON round trip. That is an empty capture,
+  // drawn as this view's empty state; only a NON-null payload that fails the
+  // shape check below is a provider fault.
+  const emptyCapture = result.status === 'success' && result.data === null;
   const payload: unknown = result.status === 'success' ? result.data : undefined;
   const snapshot = isComponentTreeSnapshot(payload) ? payload : undefined;
 
@@ -1572,6 +1584,19 @@ export function ComponentTree(props: ComponentTreeProps): ReactElement {
     );
   };
 
+  // One empty state for both ways a capture can hold no structure to draw: the
+  // service's `null` and a snapshot with no nodes. The two are the same fact
+  // about the capture, so they render the same markup.
+  const renderEmpty = (): ReactElement => (
+    <div className="dg-component-tree__empty">
+      <EmptyState
+        title={EMPTY_TITLE}
+        message={EMPTY_MESSAGE}
+        icon={<ListTree className="dg-icon" aria-hidden="true" />}
+      />
+    </div>
+  );
+
   const renderBody = (): ReactElement => {
     if (!supported) {
       return (
@@ -1612,6 +1637,12 @@ export function ComponentTree(props: ComponentTreeProps): ReactElement {
       );
     }
 
+    // Checked before the shape guard, which a `null` would otherwise fail: the
+    // service's "no tree" is an answer about the capture, not a malformed one.
+    if (emptyCapture) {
+      return renderEmpty();
+    }
+
     if (snapshot === undefined) {
       return (
         <div className="dg-component-tree__error">
@@ -1626,15 +1657,7 @@ export function ComponentTree(props: ComponentTreeProps): ReactElement {
     }
 
     if (snapshot.nodeCount === 0 || rows.length === 0) {
-      return (
-        <div className="dg-component-tree__empty">
-          <EmptyState
-            title={EMPTY_TITLE}
-            message={EMPTY_MESSAGE}
-            icon={<ListTree className="dg-icon" aria-hidden="true" />}
-          />
-        </div>
-      );
+      return renderEmpty();
     }
 
     const origin = describeOrigin(snapshot.origin);

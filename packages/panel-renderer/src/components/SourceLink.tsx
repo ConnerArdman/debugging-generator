@@ -9,9 +9,10 @@
  * ## THE LOCATION IS FORWARDED UNMODIFIED
  *
  * A chip is hop 1 of the product's click-to-source chain (AAP 0.4.2): the chip
- * raises `onOpenSource`, the host carries it to the coordination service, the
- * service validates the path against the session's project root, and the editor
- * opens the document with a selection. **The object this component hands to the
+ * raises `onOpenSource` — the host's `PanelActions.openSource` itself — the
+ * host carries the location to the coordination service, the service validates
+ * the path against the session's project root, and the editor opens the
+ * document with a selection. **The object this component hands to the
  * handler is the very object it was given** — not a copy, not a spread, not a
  * normalised path, not a rounded line, and never with `symbol`, `endLine`,
  * `resolvedBy` or `confidence` dropped.
@@ -30,7 +31,9 @@
  * ## THREE FORMS, ONE OF THEM INERT
  *
  * A handler is resolved in a fixed order — the `onOpenSource` prop, then the
- * nearest host's `PanelActions`, then nothing:
+ * nearest host's actions (read through `usePanelActions`, which always yields
+ * the view form, so its `onOpenSource` is the host's `openSource` whichever
+ * form the host supplied), then nothing:
  *
  *   1. **Interactive.** A real `<button>` (the `Button` primitive, `ghost`
  *      variant, `sm` size), so activation, focus order, Enter and Space are the
@@ -256,7 +259,9 @@ export function SourceLink(props: SourceLinkProps): ReactElement {
 
   // The prop wins; the host is the fallback; `undefined` is a normal value that
   // selects the inert form. Reading the context is unconditional, as a hook must
-  // be, and safe outside a provider by that module's documented contract.
+  // be, and safe outside a provider by that module's documented contract. The
+  // hook answers in the view form, so a host that supplied `openSource` is
+  // reached through `onOpenSource` here with the same location object.
   const actions = usePanelActions();
   const openSource = onOpenSource ?? actions?.onOpenSource;
 

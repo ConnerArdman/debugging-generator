@@ -49,9 +49,11 @@
  * ## Which fields are read, and where that list comes from
  *
  * The catalog entry is the authority:
- * `catalogEntryFor('stateTransitions').reads` composes the span identity,
- * timing, taxonomy, label and source field groups with the attribute keys of
- * the `state` kind — `component`, `hookIndex`, `hookLabel`, `previousValue`,
+ * `catalogEntryFor('stateTransitions').reads` requires the span identity
+ * fields, `kind`, `name`, `startTime` and the canonical-order fields
+ * (`producerId`, `seq`, `ingestSeq`), and reads when present `parentSpanId`,
+ * `source`, the lineage keys and the attribute keys of the `state` kind — no
+ * duration or tier — `component`, `hookIndex`, `hookLabel`, `previousValue`,
  * `nextValue`, `triggerEventId`, `triggerSpanId`, `transitionSource`,
  * `renderSpanId`, `fiberId`, `truncated`, `droppedTransitions`. Every field
  * this component displays is drawn from that list or is one of the aggregate's
@@ -64,12 +66,33 @@
  * next page at exactly the offset the previous response reported as its
  * `nextOffset` — never an offset counted from a page's length and never one
  * inferred from `total` — with the same `limit` on every request of the
- * sequence: the authored page size, clamped into `[1, DATA_QUERY_MAX_LIMIT]`.
- * That constant bounds **one request**, not how far a reader can go: nothing
- * here caps the rows a sequence can reach, so a capture of any size is
- * traversable page by page, including every offset past 5 000. A response that
- * reports no `nextOffset`, or one that does not move past the page it answered,
- * is the end of the data, and the footer then offers no control.
+ * sequence: the authored page size, clamped into `[0, DATA_QUERY_MAX_LIMIT]`,
+ * or `DATA_QUERY_DEFAULT_LIMIT` when the node authored none. That constant
+ * bounds **one request**, not how far a reader can go: nothing here caps the
+ * rows a sequence can reach, so a capture of any size is traversable page by
+ * page, including every offset past 5 000. A response that reports no
+ * `nextOffset`, or one that does not move past the page it answered, is the end
+ * of the data, and the footer then offers no control.
+ *
+ * An authored `limit` of `0` is kept as `0`. The query schema makes it an
+ * explicit request for a total without rows, so it is sent exactly as authored,
+ * answered by a **count-only** empty state that states the reported total, and
+ * never paged: a zero-row page cannot move a sequence forward, so no "Load more"
+ * is offered for it whatever `nextOffset` the provider echoes, and no second
+ * request is made.
+ *
+ * ## An empty page is not always an empty capture
+ *
+ * A page with no rows says different things depending on what was asked and
+ * what the provider reported, and the empty state says the one that is true
+ * (see {@link emptyPageCopy}): a count-only request states its total; a
+ * reported total of zero — or no total, on a first page with no page after it
+ * — is the nothing-captured answer; a page that starts past the end of a
+ * positive total says where it starts and how many matched; a positive total
+ * with nothing on this page says so; and any other page with no total says
+ * where it starts and claims nothing about the rest. When rows were loaded and
+ * the reader's own "changed only" narrowing hid all of them, the empty state
+ * says that instead.
  *
  * Pages already received are kept exactly as they arrived and the next one is
  * appended after them, de-duplicated by the grid's row key (first occurrence
@@ -310,6 +333,22 @@ const EMPTY_MESSAGE = 'No state transitions were captured for this interaction.'
 const EMPTY_FILTERED_MESSAGE =
   'No transitions in this page match the current filters. Clear them to see the rest of the page.';
 
+/** The empty state's title for a count-only request, whose answer is a number and no rows. */
+const COUNT_ONLY_TITLE = 'Count only';
+
+/** What a count-only request's empty state says when the provider reported no total. */
+const COUNT_ONLY_UNKNOWN_MESSAGE =
+  'This view requests a count without rows, and no total was reported for its query.';
+
+/** The empty state's title for a page that holds no rows while the result may hold some. */
+const EMPTY_PAGE_TITLE = 'Nothing on this page';
+
+/** What this view counts, once, for the sentences that state a number of them. */
+const NOUN_SINGULAR = 'state transition';
+
+/** The same, for any count other than one. */
+const NOUN_PLURAL = 'state transitions';
+
 /** The loading state's accessible label. */
 const LOADING_LABEL = 'Loading state transitions…';
 
@@ -485,23 +524,37 @@ function inRowTabIndex(tabbable: boolean): 0 | undefined {
 /**
  * Clamp an authored page size into the contract's per-request bounds.
  *
- * AAP 0.4.2 bounds one request's `limit` at `[1, DATA_QUERY_MAX_LIMIT]`. That is
- * a bound on a single page and never on how many rows "Load more" can reach:
- * the result is sent unchanged with every page of a sequence, and the sequence
- * itself goes as far as the provider's `nextOffset` does. A stored panel can
- * carry a `limit` of `0` — legal in the schema, and an explicit request for no
- * rows — which would page through nothing, since an empty page can never move
- * the sequence on. One row is the smallest page that can.
+ * The query schema bounds one request's `limit` at `[0, DATA_QUERY_MAX_LIMIT]`,
+ * and AAP 0.4.2 defaults an omitted one to `DATA_QUERY_DEFAULT_LIMIT`. The
+ * maximum is a bound on a single page and never on how many rows "Load more"
+ * can reach: the result is sent unchanged with every page of a sequence, and
+ * the sequence itself goes as far as the provider's `nextOffset` does.
  *
- * @param limit The `limit` the node authored, or the reader's default.
- * @returns A page size within the contract's bounds.
+ * Zero is preserved exactly. It is an explicit request for a total without
+ * rows, which a node may legitimately make, and the absence of the field is the
+ * only thing that means "unset" — so `0` is sent as `limit: 0` and answered by
+ * the count-only empty state, and {@link advancedOffset} never pages it, since
+ * a zero-row page cannot move a sequence forward. A value that is not finite
+ * (which a validated node cannot carry, but a stored one read without
+ * validation could) falls back to the default; a fractional one is truncated
+ * toward zero; anything outside the bounds is pulled to the nearer bound.
+ *
+ * @example
+ * ```ts
+ * clampPageLimit(undefined); // DATA_QUERY_DEFAULT_LIMIT (200)
+ * clampPageLimit(0); //         0 — count only, never paged
+ * clampPageLimit(9000); //      DATA_QUERY_MAX_LIMIT (5 000)
+ * ```
+ *
+ * @param limit The `limit` the node authored, or `undefined` when it authored none.
+ * @returns A page size within `[0, DATA_QUERY_MAX_LIMIT]`.
  */
-function clampPageLimit(limit: number): number {
-  if (!Number.isFinite(limit)) {
+function clampPageLimit(limit: number | undefined): number {
+  if (limit === undefined || !Number.isFinite(limit)) {
     return DATA_QUERY_DEFAULT_LIMIT;
   }
 
-  return Math.min(Math.max(Math.trunc(limit), 1), DATA_QUERY_MAX_LIMIT);
+  return Math.min(Math.max(Math.trunc(limit), 0), DATA_QUERY_MAX_LIMIT);
 }
 
 /**
@@ -511,8 +564,11 @@ function clampPageLimit(limit: number): number {
  * The provider's `nextOffset` is the only thing that moves a sequence on:
  * `../host/useQuery` documents that an offset counted from a page's length
  * drifts the moment a limit is clamped, and a `total` says how much exists, not
- * where the next page starts. Three answers therefore end the sequence:
+ * where the next page starts. Four answers therefore end the sequence:
  *
+ * - a page size of `0` — a count-only request asks for no rows on any page, so
+ *   a next page would be another request for nothing, whatever `nextOffset`
+ *   the provider echoes for it;
  * - no `nextOffset` at all (`undefined`, or a transport's `null`) — the provider
  *   said this page is the last one;
  * - one that is not a non-negative safe integer — no query could carry it, since
@@ -526,14 +582,136 @@ function clampPageLimit(limit: number): number {
  *
  * @param nextOffset What the resolved page reported.
  * @param offset The offset that page was requested at.
+ * @param limit The page size every request of the sequence carries.
  * @returns The next page's offset, or `undefined` when there is none.
  */
-function advancedOffset(nextOffset: number | undefined, offset: number): number | undefined {
-  if (nextOffset === undefined || !Number.isSafeInteger(nextOffset) || nextOffset <= offset) {
+function advancedOffset(
+  nextOffset: number | undefined,
+  offset: number,
+  limit: number,
+): number | undefined {
+  if (
+    limit <= 0 ||
+    nextOffset === undefined ||
+    !Number.isSafeInteger(nextOffset) ||
+    nextOffset <= offset
+  ) {
     return undefined;
   }
 
   return nextOffset;
+}
+
+/**
+ * What an empty page's request and response establish, which decides the
+ * sentence its empty state may truthfully say (see {@link emptyPageCopy}).
+ */
+interface EmptyPageContext {
+  /** The page size every request of the sequence carries; `0` is count-only. */
+  readonly limit: number;
+  /** The offset the empty page was requested at. */
+  readonly offset: number;
+  /** The total the provider reported for the query, or `undefined` when it reported none. */
+  readonly total: number | undefined;
+  /** Whether the reader's narrowing — the component choice or "changed only" — is in force. */
+  readonly narrowed: boolean;
+  /** Whether the provider reported a next page past this one, so "Load more" is offered. */
+  readonly morePages: boolean;
+}
+
+/** The title and sentence of one empty state. */
+interface EmptyPageCopy {
+  /** A short label above the sentence, or `undefined` when the sentence stands alone. */
+  readonly title: string | undefined;
+  /** The sentence itself. */
+  readonly message: string;
+}
+
+/**
+ * The noun for a count of state transitions: singular for exactly one.
+ *
+ * @param count The count the noun follows.
+ * @returns The noun, in the number the count takes.
+ */
+function transitionNounFor(count: number): string {
+  return count === 1 ? NOUN_SINGULAR : NOUN_PLURAL;
+}
+
+/**
+ * The empty state of a page that resolved with no rows and carried none.
+ *
+ * An empty page is only an empty capture when the evidence says so. The query
+ * schema makes `limit: 0` an explicit request for a total without rows, and an
+ * offset past the end an empty page rather than an error, so a page with no
+ * rows can arrive beside a positive `total`; saying "nothing was captured" then
+ * would contradict the provider's own count. The cases, in the order they are
+ * decided:
+ *
+ * 1. **Count only** — the page size is `0`, so no rows were asked for. The total
+ *    is the answer and is stated; without one, the sentence says none was
+ *    reported instead of implying zero.
+ * 2. **Nothing captured** — a reported total of `0`, or no total on the first
+ *    page with no page after it. The node's own copy, or the narrowing copy
+ *    while the reader's narrowing is in force: this is the one case where "no
+ *    state transitions" is the provider's answer.
+ * 3. **Past the end** — a positive total and an offset at or beyond it: where the
+ *    page starts, one-based, and how many matched.
+ * 4. **Not on this page** — a positive total and an offset inside it: how many
+ *    matched, and that this page shows none of them.
+ * 5. **A page with no total** — a later page, or a first page followed by
+ *    another, with no total reported: where the page starts, and nothing claimed
+ *    about the rest.
+ *
+ * Positions are one-based because a reader counts that way; offsets are how
+ * many items were skipped, so the first item of a page at offset `n` is item
+ * `n + 1`. Generic product wording only: no sentence names anything of the
+ * application under investigation (AAP 0.5.4).
+ *
+ * @example
+ * ```ts
+ * emptyPageCopy({ limit: 0, offset: 0, total: 42, narrowed: false, morePages: false });
+ * // { title: 'Count only',
+ * //   message: 'This view requests a count without rows: 42 state transitions matched its query.' }
+ * ```
+ *
+ * @param context What the empty page's request and response establish.
+ * @returns The title and sentence its empty state shows.
+ */
+function emptyPageCopy(context: EmptyPageContext): EmptyPageCopy {
+  const { limit, offset, total, narrowed, morePages } = context;
+
+  if (limit === 0) {
+    return {
+      title: COUNT_ONLY_TITLE,
+      message:
+        total === undefined
+          ? COUNT_ONLY_UNKNOWN_MESSAGE
+          : `This view requests a count without rows: ${formatCount(total)} ${transitionNounFor(total)} matched its query.`,
+    };
+  }
+
+  if (total === 0 || (total === undefined && offset === 0 && !morePages)) {
+    return { title: undefined, message: narrowed ? EMPTY_FILTERED_MESSAGE : EMPTY_MESSAGE };
+  }
+
+  const position = formatCount(offset + 1);
+
+  if (total === undefined) {
+    return {
+      title: EMPTY_PAGE_TITLE,
+      message: `This page starts at position ${position} and holds no ${NOUN_PLURAL}; no total was reported for this query.`,
+    };
+  }
+
+  const matched = `${formatCount(total)} ${transitionNounFor(total)}`;
+
+  return {
+    title: EMPTY_PAGE_TITLE,
+    message:
+      offset >= total
+        ? `This page starts at position ${position}, past the end of the ${matched} that matched this query.`
+        : `${matched} matched this query, but none are shown on this page.`,
+  };
 }
 
 /**
@@ -1057,8 +1235,9 @@ function StateTransitionViewerView(props: StateTransitionViewerProps): ReactElem
 
   const sourceSupported = node.query.source === STATE_TRANSITIONS_SOURCE;
   // One page size for every request of a sequence, and the offset its first
-  // page starts at. Neither grows: later pages move by `nextOffset` alone.
-  const pageLimit = clampPageLimit(node.query.limit ?? DATA_QUERY_DEFAULT_LIMIT);
+  // page starts at. Neither grows: later pages move by `nextOffset` alone. An
+  // authored `0` stays `0` — a count-only request, never paged.
+  const pageLimit = clampPageLimit(node.query.limit);
   const firstOffset = node.query.offset ?? DATA_QUERY_DEFAULT_OFFSET;
   const sort = view.sort ?? node.query.sort ?? DEFAULT_SORT;
 
@@ -1123,9 +1302,11 @@ function StateTransitionViewerView(props: StateTransitionViewerProps): ReactElem
   const loaded = useMemo(() => appendPage(carried, page), [carried, page]);
 
   // What the footer states and offers. The total survives a page in flight;
-  // the next offset exists only for a page that resolved and moved forward.
+  // the next offset exists only for a page that resolved, asked for rows and
+  // was answered with a `nextOffset` past its own offset.
   const knownTotal = total ?? activePages?.total;
-  const nextPageOffset = status === 'success' ? advancedOffset(nextOffset, offset) : undefined;
+  const nextPageOffset =
+    status === 'success' ? advancedOffset(nextOffset, offset, pageLimit) : undefined;
 
   /** The rows drawn: the reader's local narrowing, then the presentational grouping. */
   const rows = useMemo<readonly StateTransition[]>(() => {
@@ -1426,6 +1607,23 @@ function StateTransitionViewerView(props: StateTransitionViewerProps): ReactElem
           ? { state: 'end' }
           : { state: 'available', onLoadMore: handleLoadMore };
 
+  // What an empty body says. Rows were loaded and every one is hidden: only the
+  // reader's local "changed only" narrowing can do that (grouping reorders and
+  // drops nothing), so that narrowing's copy is the true one. Nothing loaded:
+  // the body reaches this branch only for a page that resolved, and what it may
+  // claim depends on what was asked and what the provider reported — see
+  // `emptyPageCopy`. An empty page with a next page keeps its "Load more" in
+  // the footer either way.
+  const emptyCopy: EmptyPageCopy = anyLoaded
+    ? { title: undefined, message: EMPTY_FILTERED_MESSAGE }
+    : emptyPageCopy({
+        limit: pageLimit,
+        offset,
+        total: knownTotal,
+        narrowed: narrowingActive,
+        morePages: nextPageOffset !== undefined,
+      });
+
   return (
     <div className={clsx('dg-state-transitions', className)} onFocus={handleFocusWithin}>
       <Toolbar
@@ -1455,7 +1653,8 @@ function StateTransitionViewerView(props: StateTransitionViewerProps): ReactElem
       ) : rows.length === 0 ? (
         <EmptyState
           className="dg-state-transitions__empty"
-          message={narrowingActive ? EMPTY_FILTERED_MESSAGE : EMPTY_MESSAGE}
+          title={emptyCopy.title}
+          message={emptyCopy.message}
         />
       ) : (
         <DataTable

@@ -78,8 +78,10 @@
  * every request carries the node's `limit`, which defaults to 200 and is clamped
  * to the contract's 5 000 ceiling — so the footer states how many rows are
  * loaded against the reported total and offers "load more" only while the
- * provider's `nextOffset` says another page exists. Separately, each row's
- * per-render list is bounded by the producer, and a row that says so
+ * provider's `nextOffset` says another page exists. An explicit `limit: 0` is
+ * sent as zero: the schema's request for a total without rows. It never pages,
+ * and it resolves to a count-only state that reports that total. Separately,
+ * each row's per-render list is bounded by the producer, and a row that says so
  * (`occurrencesTruncated`) renders an explicit note instead of letting the
  * expansion read as complete.
  *
@@ -120,7 +122,11 @@
  * Loading (a row silhouette), error (generic copy, the failing query verbatim
  * and a working retry) and empty (a node-specific sentence in generic product
  * vocabulary) — never a blank area, and never a failure dressed as a result
- * (AAP 0.5.5).
+ * (AAP 0.5.5). The node's empty sentence is reserved for an empty result. A
+ * count-only query, a page at or past the end of a counted result, an empty
+ * page below a positive total and a later page with no total each get their
+ * own sentence, stating the total when one was reported. None of them says the
+ * capture holds nothing.
  *
  * ## APPEARANCE IS A CLASS CONTRACT, NEVER AN INLINE STYLE (AAP 0.6.4)
  *
@@ -262,6 +268,26 @@ const EMPTY_MESSAGE = 'No renders were captured for this interaction.';
  */
 const EMPTY_PAGE_MESSAGE =
   'This page of render statistics held no components. More of the result remains to be loaded.';
+
+/**
+ * The first line of the empty state of a count-only query — one whose node
+ * authored `limit: 0`, which the query schema defines as a request for a total
+ * without rows. Its sentence is built by {@link emptyStateCopy}, around the total.
+ */
+const COUNT_ONLY_TITLE = 'Count only';
+
+/** The count-only sentence when the provider reported no total to state. */
+const COUNT_ONLY_NO_TOTAL_MESSAGE =
+  'This view requests a count without rows, and no total was reported for its query.';
+
+/**
+ * The first line of the empty state of a page that held no rows while the
+ * result itself is not known to be empty: a page at or past the end of a
+ * counted result, a page the provider left empty below its total, or a later
+ * page of a result it did not count. Its sentence is built by
+ * {@link emptyStateCopy}, so it can state the position and the total it knows.
+ */
+const EMPTY_PAGE_TITLE = 'Nothing on this page';
 
 /** The row-level note when the producer bounded a component's per-render list. */
 const OCCURRENCES_TRUNCATED_NOTE =
@@ -620,23 +646,35 @@ const DATA_ROW_SELECTOR = `[role="row"][${ROW_INDEX_ATTRIBUTE}]`;
  * more" appends. It never changes within a page sequence: paging moves the
  * `offset`, never the `limit`.
  *
- * The node's authored `limit` when it is usable, the contract's default
- * otherwise, clamped into `[1, DATA_QUERY_MAX_LIMIT]` and floored to whole rows.
- * The lower bound is deliberate: `limit: 0` is a legal query meaning "no items",
- * but a table drawn from it is indistinguishable from a capture that observed no
- * renders, so the smallest page this view requests is one row — the empty state
- * then means what it says. The upper bound is the contract's per-request ceiling
- * and nothing more: it bounds one page, not how far the sequence may reach.
+ * An omitted or non-finite `limit` takes the contract's default page size. Any
+ * other value is floored to whole rows and clamped into
+ * `[0, DATA_QUERY_MAX_LIMIT]`.
+ *
+ * Zero is preserved exactly and sent as `limit: 0`. The query schema accepts it
+ * as an explicit request for a total without rows, so raising it to one row
+ * would fetch evidence the node never asked for and would turn a count into a
+ * one-row table. A count-only sequence never pages (see {@link RenderTableView})
+ * and resolves to its own empty state, which reports the total. That state is
+ * never the "nothing was captured" sentence. The upper bound is the contract's
+ * per-request ceiling and nothing more: it bounds one page, not how far the
+ * sequence may reach.
  *
  * @param limit The node's authored limit, if any.
- * @returns A whole row count between one and the contract's maximum.
+ * @returns A whole row count from zero to the contract's maximum.
+ *
+ * @example
+ * ```ts
+ * resolvePageLimit(undefined); // 200 — DATA_QUERY_DEFAULT_LIMIT
+ * resolvePageLimit(0); // 0 — count only
+ * resolvePageLimit(9_000); // 5000 — DATA_QUERY_MAX_LIMIT
+ * ```
  */
 function resolvePageLimit(limit: number | undefined): number {
   if (limit === undefined || !Number.isFinite(limit)) {
     return DATA_QUERY_DEFAULT_LIMIT;
   }
 
-  return Math.min(Math.max(Math.floor(limit), 1), DATA_QUERY_MAX_LIMIT);
+  return Math.min(Math.max(Math.floor(limit), 0), DATA_QUERY_MAX_LIMIT);
 }
 
 /**
@@ -686,6 +724,105 @@ function advanceOffset(
   }
 
   return nextOffset;
+}
+
+/** What an empty state says: an optional first line, then its sentence. */
+interface EmptyCopy {
+  /** The first line above the sentence, or `undefined` when the sentence stands alone. */
+  readonly title: string | undefined;
+
+  /** The sentence itself. */
+  readonly message: string;
+}
+
+/**
+ * The noun a count of rows takes in an empty-state sentence.
+ *
+ * @param count The number of components the sentence states.
+ * @returns `component` for exactly one, `components` otherwise — zero included.
+ */
+function componentNoun(count: number): string {
+  return count === 1 ? 'component' : 'components';
+}
+
+/**
+ * What the empty state says for a resolved sequence that holds no rows at all
+ * — nothing carried from an earlier page, nothing on this one — and names no
+ * further page to load.
+ *
+ * An empty page and an empty capture are different answers. The "nothing was
+ * captured" sentence is only true when the provider counted the result as empty,
+ * or when it reported no count at all for the sequence's first position. In
+ * every other case something did match the query. Saying the capture holds
+ * nothing would then contradict the total on the same response. So the choice
+ * is made in this order, and every branch that knows a positive total states
+ * it:
+ *
+ *   1. `limit: 0` — a count-only query. No rows were requested, so none are
+ *      missing. The sentence reports the total, or says no total was reported.
+ *   2. A total of zero, or no total with the page at position zero — the result
+ *      really is empty, and the node's own sentence says so unchanged.
+ *   3. A total, with the page at or past its end — the authored offset (or a
+ *      followed one) skipped every row there is.
+ *   4. A total, with the page inside it — the provider counted rows it did not
+ *      put on this page.
+ *   5. No total, with the page past position zero — nothing is known about the
+ *      result beyond this page, so only the page is described.
+ *
+ * A total the contract would reject (negative, fractional or non-finite) is
+ * treated as unreported rather than printed, so no branch states a count that
+ * nothing measured. Positions are shown 1-based: offset 200 is position 201.
+ *
+ * @param limit The page size every request of the sequence carries.
+ * @param offset The offset the empty page was requested at — the node's
+ *        authored base offset for the first page.
+ * @param total The provider's reported total, or `undefined` when it gave none.
+ * @returns The first line and the sentence to hand `EmptyState`.
+ *
+ * @example
+ * ```ts
+ * emptyStateCopy(0, 0, 42).message;
+ * // 'This view requests a count without rows: 42 components matched its query.'
+ * emptyStateCopy(200, 300, 120).message;
+ * // 'This page starts at position 301, past the end of the 120 components that matched this query.'
+ * ```
+ */
+function emptyStateCopy(limit: number, offset: number, total: number | undefined): EmptyCopy {
+  const known =
+    total !== undefined && Number.isSafeInteger(total) && total >= 0 ? total : undefined;
+
+  if (limit === 0) {
+    return {
+      title: COUNT_ONLY_TITLE,
+      message:
+        known === undefined
+          ? COUNT_ONLY_NO_TOTAL_MESSAGE
+          : `This view requests a count without rows: ${formatCount(known)} ${componentNoun(known)} matched its query.`,
+    };
+  }
+
+  if (known === 0 || (known === undefined && offset <= 0)) {
+    return { title: undefined, message: EMPTY_MESSAGE };
+  }
+
+  if (known === undefined) {
+    return {
+      title: EMPTY_PAGE_TITLE,
+      message: `This page starts at position ${formatCount(offset + 1)} and holds no ${componentNoun(0)}; no total was reported for this query.`,
+    };
+  }
+
+  if (offset >= known) {
+    return {
+      title: EMPTY_PAGE_TITLE,
+      message: `This page starts at position ${formatCount(offset + 1)}, past the end of the ${formatCount(known)} ${componentNoun(known)} that matched this query.`,
+    };
+  }
+
+  return {
+    title: EMPTY_PAGE_TITLE,
+    message: `${formatCount(known)} ${componentNoun(known)} matched this query, but none are shown on this page.`,
+  };
 }
 
 /**
@@ -1304,8 +1441,10 @@ interface ColumnContext {
  * The columns of this table, left to right.
  *
  * Every field read below is one the node catalog declares for this node type
- * (`catalogEntryFor('renderTable').reads`, which composes span identity, timing,
- * taxonomy and source fields with the render kinds' own attribute keys), and the
+ * (`catalogEntryFor('renderTable').reads`: span identity, timing and taxonomy
+ * fields, `parentSpanId` and `source` when present, and six render attribute
+ * keys — `component`, `phase`, `renderCount`, `changedProps`, `trigger` and
+ * `actualDuration`), and the
  * aggregate that answers the `renders` source is where those fields are already
  * folded into per-component rows.
  *
@@ -1798,8 +1937,21 @@ function RenderTableView(props: RenderTableProps): ReactElement {
 
   // Where "load more" would go, read off the provider's `nextOffset` alone and
   // only once the current page has resolved. `undefined` is the end of the data.
+  // A count-only sequence (`limit: 0`) never advances: every page of it holds
+  // no rows by request, so a next page could only repeat the count, and a
+  // provider that echoes the offset it was asked at would otherwise offer a
+  // control that re-requests the same empty page forever.
   const followingOffset =
-    status === 'success' ? advanceOffset(nextOffset, currentOffset) : undefined;
+    status === 'success' && pageLimit > 0 ? advanceOffset(nextOffset, currentOffset) : undefined;
+
+  // What the empty state would say, drawn only when the sequence resolves with
+  // no rows and no next page (see the end of this function). Computed here,
+  // before the memoized callbacks, on purpose: the React Compiler cannot see
+  // that the helper only reads its arguments, and a call placed after them
+  // would extend the mutable range of the page size — and of the sequence
+  // identity built from it — past the callbacks that depend on them, costing
+  // those callbacks their memoization.
+  const emptyCopy = emptyStateCopy(pageLimit, currentOffset, knownTotal);
 
   const handleGridSort = useCallback(
     (next: DataTableSort): void => {
@@ -1962,9 +2114,12 @@ function RenderTableView(props: RenderTableProps): ReactElement {
 
   if (rows.length === 0 && followingOffset !== undefined) {
     // A resolved page with no rows that still names where the next page
-    // starts. The provider's offset is the whole of the paging contract, so the
-    // rows after it stay reachable: the page is reported as empty — never the
-    // capture — and the paging control is offered exactly as under a full page.
+    // starts, past the offset this page was requested at — `followingOffset` is
+    // never set for a count-only sequence or for a `nextOffset` that does not
+    // move forward. The provider's offset is the whole of the paging contract,
+    // so the rows after it stay reachable: the page is reported as empty — never
+    // the capture — and the paging control is offered exactly as under a full
+    // page.
     return (
       <RenderTableShell className={className}>
         <EmptyState message={EMPTY_PAGE_MESSAGE} className="dg-render-table__empty" />
@@ -1990,13 +2145,18 @@ function RenderTableView(props: RenderTableProps): ReactElement {
   }
 
   if (rows.length === 0) {
-    // A resolved page with no rows and no next page. The sentence names the
-    // class of evidence this node draws and says the capture holds none of it;
-    // the order control is not rendered, because reordering nothing is a
-    // control that cannot act.
+    // A resolved sequence with no rows and no next page. Only an empty result
+    // is an empty capture: a count-only query, and an empty page of a result
+    // the provider counted as non-empty, each say what they are and state the
+    // total they know (see `emptyStateCopy`). The order control is not
+    // rendered, because reordering nothing is a control that cannot act.
     return (
       <RenderTableShell className={className}>
-        <EmptyState message={EMPTY_MESSAGE} className="dg-render-table__empty" />
+        <EmptyState
+          title={emptyCopy.title}
+          message={emptyCopy.message}
+          className="dg-render-table__empty"
+        />
       </RenderTableShell>
     );
   }

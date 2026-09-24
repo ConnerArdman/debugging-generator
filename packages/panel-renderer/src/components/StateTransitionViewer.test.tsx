@@ -48,7 +48,13 @@
  *      and de-duplicated by key, loaded rows kept while the next page is in
  *      flight or has failed, a chain of offsets past 5 000, no control when no
  *      usable `nextOffset` is reported, and a restart from the first page when
- *      the order or the component narrowing changes.
+ *      the order or the component narrowing changes. An authored `limit: 0` is
+ *      a count-only request: sent as `0`, answered by a count-only empty state
+ *      that states the total, and never paged, whatever `nextOffset` the
+ *      provider echoes. An empty page is an empty capture only for a total of
+ *      zero or an unreported total on a first page with nothing after it; a
+ *      page past the end, inside a positive total, or later with no total says
+ *      so instead.
  *   2. **`changed: false` is labelled "No values reported", not "unchanged".**
  *      The flag records whether the producer could describe the transition, and
  *      it is never computed by comparing two previews — two values differing
@@ -247,6 +253,18 @@ const LOADING_MORE_NAME = 'Loading more…';
 
 /** What the footer's alert says when a next page failed. */
 const PAGE_ERROR_TEXT = 'The next page of state transitions could not be loaded.';
+
+/** The node's own empty-capture sentence, shown only when nothing was captured. */
+const EMPTY_CAPTURE_MESSAGE = 'No state transitions were captured for this interaction.';
+
+/** The empty state's title for a count-only request. */
+const COUNT_ONLY_TITLE = 'Count only';
+
+/** The empty state's title for a page that holds no rows while the result may hold some. */
+const EMPTY_PAGE_TITLE = 'Nothing on this page';
+
+/** Either of those titles, for asserting that neither is shown. */
+const ANY_EMPTY_PAGE_TITLE = /^(Count only|Nothing on this page)$/u;
 
 /** The row-level disclosure control, in both of its states. */
 const SHOW_DETAILS_NAME = 'Show details';
@@ -721,6 +739,30 @@ function elementWithClass(scope: HTMLElement, className: string): HTMLElement {
 }
 
 /**
+ * The empty state a rendered sentence belongs to, found from the sentence.
+ *
+ * The sentence is obtained by its text first, so the class checks below read
+ * off an element already reached semantically: the sentence is the primitive's
+ * message, and the block around it is this component's empty state.
+ *
+ * @param message The empty state's sentence, as found by its text.
+ * @returns The empty-state block, for reading its title.
+ */
+function emptyStateOf(message: HTMLElement): HTMLElement {
+  expect(message.classList.contains('dg-empty-state__message')).toBe(true);
+
+  const block = message.parentElement;
+
+  if (block === null) {
+    throw new Error('the empty-state sentence was rendered outside any block');
+  }
+
+  expect(block.classList.contains('dg-state-transitions__empty')).toBe(true);
+
+  return block;
+}
+
+/**
  * The text of a value cell: the summary run when the producer reported one, and
  * the cell's own text otherwise.
  *
@@ -1039,7 +1081,12 @@ describe('StateTransitionViewer states', () => {
     // be exactly that: product vocabulary, naming no inspected project
     // (AAP 0.5.4).
     const message = await screen.findByText(/no state transitions were captured/i);
-    expect(message.classList.contains('dg-empty-state__message')).toBe(true);
+    expect(message.textContent).toBe(EMPTY_CAPTURE_MESSAGE);
+
+    // The first page with no total and no page after it is the one empty page
+    // that is an empty capture, so it carries neither empty-page title.
+    const block = emptyStateOf(message);
+    expect(within(block).queryByText(ANY_EMPTY_PAGE_TITLE)).toBeNull();
 
     for (const value of PROVIDER_ORDER_VALUES) {
       expect(message.textContent).not.toContain(value);
@@ -2330,6 +2377,207 @@ describe('StateTransitionViewer paging', () => {
 
     await screen.findByText(countsText(1, 1, 14));
     expect(soleQuery(stub).offset).toBe(3);
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+  });
+
+  it('sends an authored limit of 0 exactly, and never pages a count-only request', async () => {
+    // The provider echoes a next offset equal to the page it answered, as a
+    // resolver that computes `offset + limit` for a zero-row page would.
+    const stub = resolvingProvider([], { total: 42, nextOffset: 0 });
+
+    renderComponent(pagedNode(0), { provider: stub.provider, actions: makeActions().actions });
+
+    // Zero is a request for a total without rows, not an unset field: it is
+    // neither raised to one row nor replaced by the default page size.
+    await screen.findByText(countsText(0, 0, 42));
+    const query = soleQuery(stub);
+    expect(query.limit).toBe(0);
+    expect(query.offset).toBe(DATA_QUERY_DEFAULT_OFFSET);
+
+    // The answer is the count, said as one, and never the empty-capture copy:
+    // forty-two transitions matched, and none were asked for.
+    const message = screen.getByText(
+      `This view requests a count without rows: ${formatCount(42)} state transitions matched its query.`,
+    );
+    const block = emptyStateOf(message);
+    expect(within(block).getByText(COUNT_ONLY_TITLE)).toBeDefined();
+    expect(screen.queryByText(EMPTY_CAPTURE_MESSAGE)).toBeNull();
+
+    // Nothing to page: no control, and no second request.
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+    expect(screen.queryByRole('button', { name: LOADING_MORE_NAME })).toBeNull();
+    expect(screen.queryAllByRole('row')).toHaveLength(0);
+    expect(stub.resolve).toHaveBeenCalledTimes(1);
+  });
+
+  it('offers no Load more for a count-only request even when the provider reports a forward offset', async () => {
+    // A zero-row page cannot move a sequence forward, so a forward-looking
+    // `nextOffset` on one is a request for nothing again, not a next page.
+    const stub = resolvingProvider([], { total: 42, nextOffset: 200 });
+
+    renderComponent(pagedNode(0), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByText(countsText(0, 0, 42));
+    expect(soleQuery(stub).limit).toBe(0);
+    expect(screen.getByText(COUNT_ONLY_TITLE)).toBeDefined();
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+    expect(stub.resolve).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    {
+      total: 1,
+      reading: 'one reported transition',
+      message: `This view requests a count without rows: ${formatCount(1)} state transition matched its query.`,
+    },
+    {
+      total: undefined,
+      reading: 'no reported total',
+      message: 'This view requests a count without rows, and no total was reported for its query.',
+    },
+  ])('states a count-only answer truthfully for $reading', async ({ total, message }) => {
+    const stub = resolvingProvider([], total === undefined ? {} : { total });
+
+    renderComponent(pagedNode(0), { provider: stub.provider, actions: makeActions().actions });
+
+    // Without a total the view says none was reported rather than implying a
+    // count of zero, and its footer claims no total either.
+    const block = emptyStateOf(await screen.findByText(message));
+    expect(within(block).getByText(COUNT_ONLY_TITLE)).toBeDefined();
+    expect(screen.getByText(countsText(0, 0, total))).toBeDefined();
+    expect(screen.queryByText(EMPTY_CAPTURE_MESSAGE)).toBeNull();
+    expect(soleQuery(stub).limit).toBe(0);
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+  });
+
+  it.each([
+    { authored: undefined, sent: DATA_QUERY_DEFAULT_LIMIT, reading: 'an omitted limit' },
+    { authored: 9000, sent: DATA_QUERY_MAX_LIMIT, reading: 'a limit above the maximum' },
+    { authored: 12.9, sent: 12, reading: 'a fractional limit' },
+    { authored: Number.NaN, sent: DATA_QUERY_DEFAULT_LIMIT, reading: 'a non-finite limit' },
+  ])('sends $sent as the page size for $reading', async ({ authored, sent }) => {
+    const stub = resolvingProvider([WIDGET_VALUE_TRANSITION], { total: 1 });
+
+    renderComponent(
+      makeNode({
+        query: {
+          source: 'stateTransitions',
+          sort: CHRONOLOGICAL,
+          ...(authored === undefined ? {} : { limit: authored }),
+        },
+      }),
+      { provider: stub.provider, actions: makeActions().actions },
+    );
+
+    await screen.findByText(countsText(1, 1, 1));
+    expect(soleQuery(stub).limit).toBe(sent);
+  });
+
+  it.each([
+    {
+      reading: 'a page past the end of a positive total',
+      offset: 200,
+      total: 42,
+      title: EMPTY_PAGE_TITLE,
+      message: `This page starts at position ${formatCount(201)}, past the end of the ${formatCount(42)} state transitions that matched this query.`,
+    },
+    {
+      reading: 'a page starting exactly at the end',
+      offset: 42,
+      total: 42,
+      title: EMPTY_PAGE_TITLE,
+      message: `This page starts at position ${formatCount(43)}, past the end of the ${formatCount(42)} state transitions that matched this query.`,
+    },
+    {
+      reading: 'a page past the end of a single transition',
+      offset: 5000,
+      total: 1,
+      title: EMPTY_PAGE_TITLE,
+      message: `This page starts at position ${formatCount(5001)}, past the end of the ${formatCount(1)} state transition that matched this query.`,
+    },
+    {
+      reading: 'an empty page inside a positive total',
+      offset: 10,
+      total: 42,
+      title: EMPTY_PAGE_TITLE,
+      message: `${formatCount(42)} state transitions matched this query, but none are shown on this page.`,
+    },
+    {
+      reading: 'a later page with no reported total',
+      offset: 200,
+      total: undefined,
+      title: EMPTY_PAGE_TITLE,
+      message: `This page starts at position ${formatCount(201)} and holds no state transitions; no total was reported for this query.`,
+    },
+    {
+      reading: 'a later page of a total of zero',
+      offset: 400,
+      total: 0,
+      title: undefined,
+      message: EMPTY_CAPTURE_MESSAGE,
+    },
+  ])('says what $reading holds, and nothing more', async ({ offset, total, title, message }) => {
+    const stub = resolvingProvider([], total === undefined ? {} : { total });
+
+    renderComponent(pagedNode(DATA_QUERY_DEFAULT_LIMIT, offset), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    const block = emptyStateOf(await screen.findByText(message));
+
+    if (title === undefined) {
+      // A reported total of zero is an empty capture wherever the page starts.
+      expect(within(block).queryByText(ANY_EMPTY_PAGE_TITLE)).toBeNull();
+    } else {
+      // Anything else with a positive or unknown total is an empty page, and
+      // the empty-capture copy would contradict the provider's own count.
+      expect(within(block).getByText(title)).toBeDefined();
+      expect(screen.queryByText(EMPTY_CAPTURE_MESSAGE)).toBeNull();
+    }
+
+    // The authored offset was requested as authored, the footer states the
+    // same counts, and no page past the provider's last one is offered.
+    expect(soleQuery(stub).offset).toBe(offset);
+    expect(screen.getByText(countsText(0, 0, total))).toBeDefined();
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+    expect(screen.queryAllByRole('row')).toHaveLength(0);
+  });
+
+  it('keeps Load more on an empty page the provider says is followed by another, and follows it', async () => {
+    const stub = recordingProvider((query) =>
+      query.offset === DATA_QUERY_DEFAULT_LIMIT
+        ? transitionsResponse([WIDGET_VALUE_TRANSITION])
+        : transitionsResponse([], { nextOffset: DATA_QUERY_DEFAULT_LIMIT }),
+    );
+    const user = userEvent.setup();
+
+    renderComponent(pagedNode(DATA_QUERY_DEFAULT_LIMIT), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    // More exists, so this first page is not an empty capture: it says where it
+    // starts and claims nothing about the rest.
+    const block = emptyStateOf(
+      await screen.findByText(
+        `This page starts at position ${formatCount(1)} and holds no state transitions; no total was reported for this query.`,
+      ),
+    );
+    expect(within(block).getByText(EMPTY_PAGE_TITLE)).toBeDefined();
+    expect(screen.queryByText(EMPTY_CAPTURE_MESSAGE)).toBeNull();
+
+    // The next page is requested at exactly the reported offset.
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+
+    await screen.findByRole('grid');
+    expect(stub.queries.map((query) => query.offset)).toEqual([
+      DATA_QUERY_DEFAULT_OFFSET,
+      DATA_QUERY_DEFAULT_LIMIT,
+    ]);
+    expect(renderedValuesBefore()).toEqual([NUMBER_BEFORE]);
+    expect(screen.getByText(countsText(1, 1))).toBeDefined();
+    expect(screen.queryByText(EMPTY_PAGE_TITLE)).toBeNull();
     expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
   });
 

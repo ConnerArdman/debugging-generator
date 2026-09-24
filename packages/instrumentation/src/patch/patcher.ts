@@ -599,6 +599,13 @@ export interface PatcherOptions extends PatchContext {
    * additive actions (AAP §0.4.2), and a patcher is built per version: the
    * value is recorded on every record this instance journals, and the
    * duplicate-target guard is scoped to it.
+   *
+   * Taken as given, never cross-checked against a plan document, because this
+   * module sees actions and not plans. The value an adapter passes is the
+   * install context's `planVersion`, and `../installer.ts` refuses an install
+   * whose plan document names a different revision — or whose delta names a
+   * predecessor the journal contradicts — before any adapter builds a patcher,
+   * so the revision stamped here is the revision the session installed.
    */
   readonly planVersion: number;
 

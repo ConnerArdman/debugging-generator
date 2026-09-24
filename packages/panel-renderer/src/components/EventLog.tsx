@@ -46,8 +46,13 @@
  *   - **loaded against total**, in the footer, beside a "load more" control
  *     that advances the offset and appends the next page to what is already on
  *     screen. The next offset is copied from the response, never computed from
- *     the length of a page, which would drift the moment the resolver clamped a
- *     limit.
+ *     the length of a page or from `total`, which would drift the moment the
+ *     resolver clamped a limit; and it is followed only when it moves forward,
+ *     so a response that points back at the page just drawn cannot loop.
+ *     The page sequence starts at the node's own authored `offset`, and when
+ *     that is past the first record the footer counts from there — "of N" is
+ *     how many records the source holds from that position on, and the
+ *     position itself is stated.
  *   - **matching against loaded**, in the toolbar, whenever the text filter is
  *     active — plus an explicit note that the text filter reaches the loaded
  *     records only, because `DataQueryFilter` has no free-text field and this
@@ -92,11 +97,24 @@
  * Loading, then error, then empty, then the table — the precedence AAP 0.6.2
  * requires of a query-backed view, each in its own `__loading`, `__error` and
  * `__empty` box. An empty page and a failed request are kept apart:
- * `useQuery`'s `"success"` with no rows is a capture that genuinely holds
- * nothing for this query and reads as an empty state, while a rejection carries
- * the failure, its code and the serialised query into an error state with a
- * working retry (AAP 0.5.5 — a failure is never presented as a result). A third
- * absence is distinguished from both: a text filter that matches none of the
+ * `useQuery`'s `"success"` with no rows reads as an empty state, while a
+ * rejection carries the failure, its code and the serialised query into an
+ * error state with a working retry (AAP 0.5.5 — a failure is never presented as
+ * a result). An empty page is not always an empty capture, and the empty state
+ * says which one it is, from the counters the same response carried:
+ *
+ *   - a count-only query (`limit: 0`) asked for a total and no rows, and states
+ *     that total — or that none was reported;
+ *   - a total of zero, or no total for a sequence that started at the first
+ *     record, is a capture that holds nothing for this query;
+ *   - a positive total with nothing on the page is a page past the end of the
+ *     matches (an authored offset beyond them) or one the service left empty,
+ *     and states the total, and the page's position when it is past the end;
+ *   - no total for a page past the first record states that page's position.
+ *
+ * An empty page the service still reports a forward `nextOffset` for keeps its
+ * paging footer, so the next page stays reachable. A further absence is
+ * distinguished from all of these: a text filter that matches none of the
  * loaded records is the filter's doing, not the capture's, and says so in the
  * table's own empty slot.
  *
@@ -221,15 +239,6 @@ const EVENT_LOG_SOURCE = 'events' as const satisfies DataQuerySource;
  */
 
 /**
- * The smallest page this view will request.
- *
- * The query schema accepts `limit: 0` — an explicit request for a total with no
- * rows, which some nodes legitimately make — but a log with no rows is not a
- * log, so an authored zero is raised to one rather than honoured.
- */
-const MIN_PAGE_LIMIT = 1;
-
-/**
  * How many attribute pairs one row shows before the rest are counted instead.
  *
  * A count of pairs, not a width: the column is compact because a row is one
@@ -278,6 +287,25 @@ const LOADING_LABEL = 'Loading captured records…';
 /** What a capture that holds no record for this query says. */
 const EMPTY_MESSAGE =
   'No records were captured for this query. Start a capture, reproduce the behaviour, then look again.';
+
+/** The heading of the state a count-only (`limit: 0`) query resolves to. */
+const COUNT_ONLY_TITLE = 'Count only';
+
+/** What a count-only query says when the service reported no total for it. */
+const COUNT_ONLY_UNKNOWN_TOTAL_MESSAGE =
+  'This view requests a count without rows, and no total was reported for its query.';
+
+/**
+ * The heading of an empty page that is not an empty capture: records matched
+ * the query, or may have, and none of them are on this page.
+ */
+const EMPTY_PAGE_TITLE = 'Nothing on this page';
+
+/** The record noun of the empty-page copy, for a count of exactly one. */
+const EVENT_NOUN_SINGULAR = 'event';
+
+/** The record noun of the empty-page copy, for any other count. */
+const EVENT_NOUN_PLURAL = 'events';
 
 /** What a text filter that matches none of the loaded records says. */
 const FILTERED_EMPTY_MESSAGE =
@@ -366,15 +394,20 @@ interface AttributeSummary {
  *
  * `identity` stamps the request those records answered. A paging state whose
  * stamp no longer matches the derived query is simply not read — which is how
- * the accumulator resets when the kind filter, the authored filter, the sort or
- * the page size changes, with no state written during a render and none written
- * from an effect.
+ * the accumulator resets when the kind filter, the authored filter, the sort,
+ * the page size or the authored starting offset changes, with no state written
+ * during a render and none written from an effect.
  */
 interface EventLogPageState {
   /** The base query these records were loaded for; see {@link baseQueryIdentity}. */
   readonly identity: string;
 
-  /** The offset of the page currently being requested. */
+  /**
+   * The offset of the page currently being requested: a `nextOffset` the
+   * service reported, and never less than the authored starting offset the
+   * sequence began at. The authored offset itself is not stored here — it is
+   * part of `identity`, and an unmatched state reads it from the node.
+   */
   readonly offset: number;
 
   /** Every record loaded by the earlier pages of that same request. */
@@ -385,8 +418,9 @@ interface EventLogPageState {
  * The paging state before anything has been paged.
  *
  * Its identity matches no derived query — a serialised query always begins with
- * its source — so the first render reads the defaults through the same path
- * every reset does, and there is no separate initialisation branch.
+ * its source — so the first render reads the node's authored starting offset
+ * through the same path every reset does, and there is no separate
+ * initialisation branch. Its own `offset` is therefore never read.
  */
 const INITIAL_PAGE_STATE: EventLogPageState = Object.freeze({
   identity: '',
@@ -404,6 +438,14 @@ const INITIAL_PAGE_STATE: EventLogPageState = Object.freeze({
  * The page size to request: the authored limit clamped into the contract's
  * range, or the contract's default when none was authored.
  *
+ * An explicit `limit: 0` is preserved and sent as zero. The query schema
+ * accepts it as a deliberate request for a total with no rows, and the page
+ * echo reports it back (`nodes/query.ts`, `protocol/src/http.ts`); raising it
+ * would fetch a row the node never asked for and misstate what it asked. This
+ * view answers such a node with a count-only state, and never pages it — a page
+ * of zero rows cannot advance a sequence. Only the absence of the field means
+ * "unset", and only that takes the default.
+ *
  * Total over the shape rather than over the schema: a validated query carries
  * an integer within range, and this also holds for the objects that reach a
  * renderer without passing that schema — a fixture, a value cast in a consumer
@@ -411,14 +453,83 @@ const INITIAL_PAGE_STATE: EventLogPageState = Object.freeze({
  * produce a request the resolver can answer.
  *
  * @param limit The authored `limit`, or `undefined` when the node omitted one.
- * @returns A whole number in `[MIN_PAGE_LIMIT, DATA_QUERY_MAX_LIMIT]`.
+ * @returns A whole number in `[0, DATA_QUERY_MAX_LIMIT]`, or
+ * `DATA_QUERY_DEFAULT_LIMIT` for an omitted or non-finite limit.
  */
 function clampPageLimit(limit: number | undefined): number {
   if (limit === undefined || !Number.isFinite(limit)) {
     return DATA_QUERY_DEFAULT_LIMIT;
   }
 
-  return Math.min(Math.max(Math.trunc(limit), MIN_PAGE_LIMIT), DATA_QUERY_MAX_LIMIT);
+  return Math.min(Math.max(Math.trunc(limit), 0), DATA_QUERY_MAX_LIMIT);
+}
+
+/**
+ * The offset the page sequence starts at: the authored offset as a whole,
+ * non-negative number, or the contract's default when none was authored.
+ *
+ * The authored offset is honoured exactly (AAP 0.4.2): a node that asks for the
+ * records from position 201 onwards must be shown those, not the first page,
+ * and an offset past the end of the source is an empty page the service
+ * answers, never an error this view invents. It has no upper bound in the
+ * schema — only the service knows how many records exist — so the only ceiling
+ * applied is the largest integer a number represents exactly, which keeps an
+ * unvalidated, enormous value from turning into a request the resolver cannot
+ * echo back. Like {@link clampPageLimit}, total over the shape: a fractional,
+ * negative or non-finite value still yields a request that can be answered.
+ *
+ * @param offset The authored `offset`, or `undefined` when the node omitted one.
+ * @returns A whole number in `[DATA_QUERY_DEFAULT_OFFSET, Number.MAX_SAFE_INTEGER]`.
+ */
+function clampPageOffset(offset: number | undefined): number {
+  if (offset === undefined || !Number.isFinite(offset)) {
+    return DATA_QUERY_DEFAULT_OFFSET;
+  }
+
+  return Math.min(Math.max(Math.trunc(offset), DATA_QUERY_DEFAULT_OFFSET), Number.MAX_SAFE_INTEGER);
+}
+
+/**
+ * The offset "load more" may request next, or `undefined` when there is none.
+ *
+ * Only the service's own `nextOffset` qualifies, and only when it moves forward
+ * from the page it answered: a value equal to or behind that page's offset
+ * would re-request records already on screen and append them twice, and a
+ * value that is not an exact integer is not an offset at all. Nothing is ever
+ * derived from the page's length or from `total` — `nextOffset` absent (the
+ * wire's `null`) is the end of the data even when a total suggests otherwise,
+ * because the service applied the paging and this view did not.
+ *
+ * @param nextOffset The `nextOffset` of the page that just resolved, if any.
+ * @param resolvedOffset The `offset` that page was requested at.
+ * @returns The offset to request next, or `undefined` when paging is over.
+ */
+function forwardNextOffset(
+  nextOffset: number | undefined,
+  resolvedOffset: number,
+): number | undefined {
+  if (nextOffset === undefined || !Number.isSafeInteger(nextOffset)) {
+    return undefined;
+  }
+
+  return nextOffset > resolvedOffset ? nextOffset : undefined;
+}
+
+/**
+ * The service's `total` when it is a count this view can state, otherwise
+ * `undefined`.
+ *
+ * The contract reports a non-negative whole number, and `useQuery` passes it
+ * through verbatim. Anything else — a fraction, a negative, a non-finite value
+ * from a provider that did not validate its answer — is treated as no total at
+ * all, so the footer and the empty state say "no total was reported" rather
+ * than printing a number that is not a count.
+ *
+ * @param total The reported total, if any.
+ * @returns That total, or `undefined` when it is absent or not a count.
+ */
+function reportedTotal(total: number | undefined): number | undefined {
+  return total !== undefined && Number.isSafeInteger(total) && total >= 0 ? total : undefined;
 }
 
 /**
@@ -445,13 +556,17 @@ function mergeKindFilter(
 }
 
 /**
- * A string that is equal for two requests differing only in their offset.
+ * A string that is equal for two requests of one page sequence, whatever page
+ * of it they ask for.
  *
  * It is the accumulator's reset key, and deliberately not the whole query: the
- * offset is what "load more" advances, so including it would discard the
- * earlier pages on every advance. Everything else — the source, the filter, the
- * ordering and the page size — changes what the pages mean, and any change to
- * one of them must start the accumulation again.
+ * current offset is what "load more" advances, so including it would discard
+ * the earlier pages on every advance. The offset the sequence STARTED at is
+ * included, because it is authored rather than advanced: a node that asks for
+ * the records from another position is a different sequence, and pages carried
+ * from the old one would be shown under the new one's counts. Everything else
+ * — the source, the filter, the ordering and the page size — changes what the
+ * pages mean, and any change to one of them must start the accumulation again.
  *
  * `JSON.stringify` is sound here because a `DataQuery` holds JSON values only
  * (strings, finite numbers, arrays of strings, plain objects) and because both
@@ -462,14 +577,145 @@ function mergeKindFilter(
  * @param filter The merged filter being sent.
  * @param sort The authored ordering, or `undefined` for the source's own.
  * @param limit The clamped page size.
- * @returns The identity of that request, ignoring its offset.
+ * @param baseOffset The clamped authored offset the sequence starts at.
+ * @returns The identity of that sequence, ignoring the offset it has reached.
  */
 function baseQueryIdentity(
   filter: DataQueryFilter | undefined,
   sort: DataQuery['sort'],
   limit: number,
+  baseOffset: number,
 ): string {
-  return JSON.stringify({ source: EVENT_LOG_SOURCE, filter, sort, limit });
+  return JSON.stringify({ source: EVENT_LOG_SOURCE, filter, sort, limit, baseOffset });
+}
+
+/**
+ * The paging footer's coverage statement.
+ *
+ * From the first record it reads as it always has — "3 of 40 records loaded",
+ * or "3 records loaded" when no total was reported. From an authored starting
+ * offset it is relative to that position, because the records before it were
+ * never asked for: "of N" counts the records from the starting position to the
+ * end of the source (never below zero), and the position is stated as the
+ * 1-based ordinal of the first record requested, so the ratio cannot be read as
+ * coverage of the whole capture.
+ *
+ * @param loadedCount How many records are on screen.
+ * @param total The reported total, already vetted by {@link reportedTotal}.
+ * @param baseOffset The offset the page sequence started at.
+ * @returns The footer's text.
+ */
+function coverageLabel(loadedCount: number, total: number | undefined, baseOffset: number): string {
+  const loaded = formatCount(loadedCount);
+
+  if (baseOffset === DATA_QUERY_DEFAULT_OFFSET) {
+    return total === undefined
+      ? `${loaded} records loaded`
+      : `${loaded} of ${formatCount(total)} records loaded`;
+  }
+
+  const position = formatCount(baseOffset + 1);
+
+  return total === undefined
+    ? `${loaded} records loaded, from position ${position}`
+    : `${loaded} of ${formatCount(Math.max(total - baseOffset, 0))} records loaded, from position ${position}`;
+}
+
+/** The copy of the empty state a settled page with no records resolves to. */
+interface EmptyPageCopy {
+  /** The state's heading, or `undefined` for the plain empty-capture message. */
+  readonly title: string | undefined;
+
+  /** The state's sentence. */
+  readonly message: string;
+}
+
+/**
+ * The record noun for a count: singular for exactly one, plural otherwise.
+ *
+ * @param count The count the noun follows.
+ * @returns `"event"` or `"events"`.
+ */
+function eventNoun(count: number): string {
+  return count === 1 ? EVENT_NOUN_SINGULAR : EVENT_NOUN_PLURAL;
+}
+
+/**
+ * What an empty page says, chosen from the counters the response carried so
+ * that an empty page is never presented as an empty capture it may not be.
+ *
+ * Called only for a settled success that loaded no record at all — nothing on
+ * this page and nothing carried from an earlier one. The cases, in order:
+ *
+ *   1. **count-only** — the node asked for `limit: 0`, a total without rows,
+ *      so the state reports that total, or that none was reported;
+ *   2. **empty capture** — the total is zero, or no total was reported for a
+ *      sequence that started at the first record and has no further page: the
+ *      capture holds nothing for this query, which is the one case the
+ *      node's plain empty message describes;
+ *   3. **past the end** — records matched, and this page starts at or beyond
+ *      the last of them (an authored offset past the end is an empty page, not
+ *      an error), so the state gives the page's 1-based position and the total;
+ *   4. **empty within range** — records matched and this page starts before
+ *      the last of them, yet the service returned none; the total is stated
+ *      and nothing is invented to fill the page;
+ *   5. **no total, past the first record** — the page's position is all that
+ *      is known, and the state says so rather than guessing at a count.
+ *
+ * A page the service reports a forward `nextOffset` for never takes case 2
+ * without a total of zero: more records may follow, so "nothing was captured"
+ * would be a claim this page cannot make, and case 5 states its position
+ * instead.
+ *
+ * @param limit The clamped page size that was requested.
+ * @param total The reported total, already vetted by {@link reportedTotal}.
+ * @param baseOffset The offset the page sequence started at.
+ * @param offset The offset of the page that just resolved.
+ * @param hasForwardPage Whether the service reported a forward `nextOffset`.
+ * @returns The empty state's heading and sentence.
+ */
+function describeEmptyPage(
+  limit: number,
+  total: number | undefined,
+  baseOffset: number,
+  offset: number,
+  hasForwardPage: boolean,
+): EmptyPageCopy {
+  if (limit === 0) {
+    return {
+      title: COUNT_ONLY_TITLE,
+      message:
+        total === undefined
+          ? COUNT_ONLY_UNKNOWN_TOTAL_MESSAGE
+          : `This view requests a count without rows: ${formatCount(total)} ${eventNoun(total)} matched its query.`,
+    };
+  }
+
+  if (
+    total === 0 ||
+    (total === undefined && baseOffset === DATA_QUERY_DEFAULT_OFFSET && !hasForwardPage)
+  ) {
+    return { title: undefined, message: EMPTY_MESSAGE };
+  }
+
+  const position = formatCount(offset + 1);
+
+  if (total === undefined) {
+    return {
+      title: EMPTY_PAGE_TITLE,
+      message: `This page starts at position ${position} and holds no ${EVENT_NOUN_PLURAL}; no total was reported for this query.`,
+    };
+  }
+
+  const matched = `${formatCount(total)} ${eventNoun(total)}`;
+
+  return {
+    title: EMPTY_PAGE_TITLE,
+    message:
+      offset >= total
+        ? `This page starts at position ${position}, past the end of the ${matched} that matched this query.`
+        : `${matched} matched this query, but none are shown on this page.`,
+  };
 }
 
 /**
@@ -957,7 +1203,8 @@ export interface EventLogProps {
  *
  * @param props The props, as documented on {@link EventLogProps}.
  * @returns The block: a filter row, one of the four bodies (busy, failed,
- * empty, or the grid) and — once anything has loaded — the paging footer.
+ * empty, or the grid) and — once anything has loaded, or while the service
+ * reports a further page — the paging footer.
  *
  * @example A node straight from a validated panel specification.
  * ```tsx
@@ -982,17 +1229,19 @@ export function EventLog(props: EventLogProps): ReactElement {
   const authoredQuery = node.query;
   const authoredKinds = authoredQuery.filter?.kinds;
   const limit = clampPageLimit(authoredQuery.limit);
+  const baseOffset = clampPageOffset(authoredQuery.offset);
   const filter = mergeKindFilter(authoredQuery.filter, selectedKind);
-  const identity = baseQueryIdentity(filter, authoredQuery.sort, limit);
+  const identity = baseQueryIdentity(filter, authoredQuery.sort, limit, baseOffset);
 
   // A paging state whose stamp no longer matches the request is not read, which
   // is the whole of the accumulator's reset: no state is written during this
-  // render and none is written from an effect, so a changed filter, ordering or
-  // page size returns the view to its first page in the very render that
+  // render and none is written from an effect, so a changed filter, ordering,
+  // page size or authored starting offset returns the view to the first page
+  // of its sequence — the node's own `offset` — in the very render that
   // changed it.
   const paging = page.identity === identity ? page : undefined;
   const carried = paging?.carried ?? EMPTY_EVENTS;
-  const offset = paging?.offset ?? DATA_QUERY_DEFAULT_OFFSET;
+  const offset = paging?.offset ?? baseOffset;
 
   // Rebuilt every render on purpose: `useQuery` compares a query's CONTENTS and
   // not its identity, so memoizing this would need the very key that hook
@@ -1048,15 +1297,47 @@ export function EventLog(props: EventLogProps): ReactElement {
     [actions, availableKinds, node.id],
   );
 
+  // What the page that just resolved says about the sequence. Derived here,
+  // BEFORE the callbacks below, on purpose: every helper that reads the
+  // sequence's numbers (`offset`, `baseOffset`, `limit`) is called ahead of the
+  // `useCallback` that closes over `identity`, which is derived from those same
+  // numbers. The React Compiler cannot see that they are primitives, so a
+  // helper call after that callback would read to it as a later mutation of a
+  // memoized dependency and make it skip this component.
+  const loadedCount = rows.length;
+  const knownTotal = reportedTotal(total);
+
   // The next offset is the response's own, copied rather than derived from the
-  // length of a page, which would drift the moment the resolver clamped a limit.
+  // length of a page or from the total, which would drift the moment the
+  // resolver clamped a limit — and followed only when it moves past the page it
+  // answered, so a response pointing back at that page cannot re-append it.
+  // Read only off a settled success: `data` belongs to the request at `offset`
+  // exactly when `useQuery` reports it. A count-only request (`limit: 0`) is
+  // never paged, whatever `nextOffset` it is answered with: a page of zero rows
+  // cannot advance, so a second request would only repeat the first.
+  const loadMoreOffset =
+    status === 'success' && data !== undefined && limit > 0
+      ? forwardNextOffset(nextOffset, offset)
+      : undefined;
+  const hasMore = loadMoreOffset !== undefined;
+
+  const footerLabel = coverageLabel(loadedCount, knownTotal, baseOffset);
+
+  // Present exactly when a settled success loaded no record at all — nothing on
+  // this page and nothing carried from an earlier one — which is when the empty
+  // body is drawn, and phrased from that response's own counters.
+  const emptyPage =
+    status === 'success' && loadedCount === 0
+      ? describeEmptyPage(limit, knownTotal, baseOffset, offset, hasMore)
+      : undefined;
+
   const handleLoadMore = useCallback((): void => {
-    if (nextOffset === undefined || data === undefined) {
+    if (loadMoreOffset === undefined || data === undefined) {
       return;
     }
 
-    setPage({ identity, offset: nextOffset, carried: carried.concat(data) });
-  }, [carried, data, identity, nextOffset]);
+    setPage({ identity, offset: loadMoreOffset, carried: carried.concat(data) });
+  }, [carried, data, identity, loadMoreOffset]);
 
   const selectEvent = actions?.onSelectEvent;
   const handleRowActivate = useCallback(
@@ -1066,11 +1347,11 @@ export function EventLog(props: EventLogProps): ReactElement {
     [selectEvent],
   );
 
-  const loadedCount = rows.length;
   const visibleCount = visibleRows.length;
   const filtering = needle !== '';
-  const hasMore = nextOffset !== undefined;
-  const partialSource = total === undefined || loadedCount < total;
+  // Measured against the WHOLE source, not the part after the authored offset:
+  // the text filter never reached the records before that position either.
+  const partialSource = knownTotal === undefined || loadedCount < knownTotal;
 
   // Two statements, both about what the reader is looking at rather than what
   // exists: how much of the loaded page the text filter kept, and — while that
@@ -1104,15 +1385,11 @@ export function EventLog(props: EventLogProps): ReactElement {
         ]
       : EMPTY_SELECTS;
 
-  const footerLabel =
-    total === undefined
-      ? `${formatCount(loadedCount)} records loaded`
-      : `${formatCount(loadedCount)} of ${formatCount(total)} records loaded`;
-
   // The four bodies, in the order AAP 0.6.2 fixes: busy, failed, absent, then
   // the grid. An empty page and a failed request are different answers and are
-  // never merged - `"success"` with no rows is a capture that holds nothing for
-  // this query, while a rejection is a failure with a retry (AAP 0.5.5).
+  // never merged - `"success"` with no rows is an absence phrased from the
+  // response's own counters (see `describeEmptyPage`), while a rejection is a
+  // failure with a retry (AAP 0.5.5).
   let body: ReactNode;
 
   if (status === 'loading') {
@@ -1133,10 +1410,14 @@ export function EventLog(props: EventLogProps): ReactElement {
         />
       </div>
     );
-  } else if (loadedCount === 0) {
+  } else if (emptyPage !== undefined) {
     body = (
       <div className="dg-event-log__empty">
-        <EmptyState message={EMPTY_MESSAGE} icon={<ScrollText className="dg-icon" />} />
+        <EmptyState
+          title={emptyPage.title}
+          message={emptyPage.message}
+          icon={<ScrollText className="dg-icon" />}
+        />
       </div>
     );
   } else {
@@ -1170,7 +1451,10 @@ export function EventLog(props: EventLogProps): ReactElement {
         wrap
       />
       {body}
-      {loadedCount > 0 ? (
+      {/* The footer follows what has loaded, and also an empty page the service
+          reports a forward `nextOffset` for: that page ends nothing, and the
+          next one must stay reachable. */}
+      {loadedCount > 0 || hasMore ? (
         <Stack
           direction="horizontal"
           align="center"

@@ -40,10 +40,13 @@
  * order". A submission names the attempt it belongs to, and repeating that name
  * is how a caller whose reply was lost asks what became of its attempt: the
  * service answers such a repeat with the order the attempt already placed,
- * marked as such in the result's `outcome`, and writes no second one. The
- * decision is the service's because it is a decision about the cart and the
- * order, not about HTTP; this handler neither remembers a submission nor
- * compares two.
+ * marked as such in the result's `outcome`, and writes no second one. It answers
+ * from the store's own record of the name - the cart the attempt claimed carries
+ * it - so a repeat is answered the same way after a restart as before one, and a
+ * name that holds a cart with no order is an unresolved payment rather than a
+ * new attempt. The decision is the service's because it is a decision about the
+ * cart and the order, not about HTTP; this handler neither remembers a
+ * submission nor compares two.
  */
 
 import type { CheckoutDraft, CheckoutResult } from '@/lib/types';
@@ -88,15 +91,16 @@ const MISADDRESSED = 'This request was not addressed to this store.';
  * already placed, as `outcome: 'already_placed'` - or the mapper's failure
  * envelope: `415` when the body was not declared as `application/json`, `413`
  * when it carries more bytes than this store reads, `400` when the body is not
- * readable JSON, does not match the schema, or the request was not addressed to
- * this store, `404` when the session has no cart at all, `409` when the stock,
- * another checkout of the same cart or the chosen shipping service no longer
- * supports the submission - or when an earlier attempt is still holding this
- * session's cart, `402` when the payment was declined, `502` when a dependency
- * did not answer, and a single generic `500` for anything unaccounted for.
- * Exactly one code says an amount may have been taken -
- * `PAYMENT_STATUS_UNKNOWN`, answered with `409`, `500` or `502` - and every
- * other failure from this endpoint means nothing was captured.
+ * readable JSON, does not match the schema, the request was not addressed to
+ * this store, or the session's cart is empty, `409` when the stock, another
+ * checkout of the same cart or the chosen shipping service no longer supports
+ * the submission - or, as `PAYMENT_STATUS_UNKNOWN`, when the named attempt holds
+ * a cart with no order or an earlier attempt is still holding this session's
+ * cart, `402` when the payment was declined, `502` when a dependency did not
+ * answer, and a single generic `500` for anything unaccounted for. Exactly one
+ * code says an amount may have been taken - `PAYMENT_STATUS_UNKNOWN`, answered
+ * with `409`, `500` or `502` - and every other failure from this endpoint means
+ * nothing was captured.
  */
 export async function POST(request: Request): Promise<Response> {
   try {

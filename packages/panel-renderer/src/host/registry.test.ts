@@ -31,8 +31,10 @@
  * Alongside them, the two failure and wiring properties that the registry's own
  * contract rests on: a node type the registry has no component for renders an
  * error state and never a blank area (AAP 0.6.2, 0.5.5), and an interaction
- * inside a dispatched component reaches the ambient `PanelActions` — proving the
- * registry's *prop wiring*, not merely its keys. The depth of each component's
+ * inside a dispatched component reaches the ambient `PanelActions` in either of
+ * its forms — the view form's `onSelectEvent`/`onOpenSource`, and the host
+ * form's `selectEvent`/`openSource` through the compatibility adapter — proving
+ * the registry's *prop wiring*, not merely its keys. The depth of each component's
  * own interactions stays in `../components/*.test.tsx`; this file proves the
  * wiring exists. The third piece of wiring is the outline: each container
  * adapter draws its heading at the `headingLevel` it is handed rather than at
@@ -122,7 +124,12 @@ import { DataProviderContext, PanelSessionContext, createDataProvider } from './
 import type { DataProvider, DataQueryResolver, DataQueryResponse } from './DataProvider';
 import { NodeRenderer } from './NodeRenderer';
 import { PanelActionsContext } from './PanelActions';
-import type { PanelActions, PanelEventRef } from './PanelActions';
+import type {
+  PanelActions,
+  PanelEventCoordinates,
+  PanelEventRef,
+  PanelHostActions,
+} from './PanelActions';
 import { PANEL_COMPONENT_REGISTRY, componentForNodeType } from './registry';
 import type { PanelNodeComponent } from './registry';
 
@@ -872,6 +879,48 @@ function makeActions(): ActionSpies {
 }
 
 /**
+ * The host form of the action contract — what the DevTools panel and the
+ * editor webview implement — with a spy behind each member.
+ */
+interface HostActionSpies {
+  /** The object to provide through {@link PanelActionsContext}. */
+  readonly actions: PanelHostActions;
+
+  /** Raised with the id of the record a rendered item stands for. */
+  readonly selectEvent: Mock<(eventId: string, coordinates?: PanelEventCoordinates) => void>;
+
+  /** Raised when a chip or row asks the editor to open a place in the project. */
+  readonly openSource: Mock<(location: SourceLocation) => void>;
+
+  /** Raised when a row, group or tree node is expanded or collapsed. */
+  readonly onExpand: Mock<(nodeId: string, itemId: string, expanded: boolean) => void>;
+
+  /** Raised when a component-local filter, sort or search value changes. */
+  readonly onFilterChange: Mock<(nodeId: string, filter: Record<string, string>) => void>;
+}
+
+/**
+ * A complete host-form host, including the two optional members, for the cases
+ * that prove a dispatched component reaches it through the view-form adapter.
+ *
+ * @returns The actions object and its four spies.
+ */
+function makeHostActions(): HostActionSpies {
+  const selectEvent = vi.fn<(eventId: string, coordinates?: PanelEventCoordinates) => void>();
+  const openSource = vi.fn<(location: SourceLocation) => void>();
+  const onExpand = vi.fn<(nodeId: string, itemId: string, expanded: boolean) => void>();
+  const onFilterChange = vi.fn<(nodeId: string, filter: Record<string, string>) => void>();
+
+  return {
+    actions: { selectEvent, openSource, onExpand, onFilterChange },
+    selectEvent,
+    openSource,
+    onExpand,
+    onFilterChange,
+  };
+}
+
+/**
  * One node under the three ambient contexts, dispatched exactly as a panel
  * dispatches it.
  *
@@ -1533,6 +1582,76 @@ describe('a dispatched component reaches the ambient host actions', () => {
     // rather than an order.
     expect(RECORDED_EVENTS.map((event) => event.id)).toContain(ref.eventId);
     expect(spies.onOpenSource).not.toHaveBeenCalled();
+  });
+});
+
+describe('a dispatched component reaches host-form actions through the adapter', () => {
+  it('forwards a source chip activation to openSource with the location unchanged', async () => {
+    const stub = recordingProvider();
+    const spies = makeHostActions();
+    const user = userEvent.setup();
+
+    // The host form, provided directly: the component reads the view form
+    // through `usePanelActions`, and the adapter is what reaches the host.
+    const scope = render(
+      panelTree(RENDER_CASES.sourceLink.node, stub.provider, spies.actions),
+    ).container;
+
+    const chip = await within(scope).findByRole('button', {
+      name: `Open ${formatSourceLocation(COMPONENT_SOURCE)}`,
+    });
+
+    await user.click(chip);
+
+    expect(spies.openSource).toHaveBeenCalledTimes(1);
+
+    // By reference through the adapter as well: the host's `openSource` is
+    // the function the chip calls, so the object that leaves is the object
+    // the node carried.
+    expect(spies.openSource.mock.calls[0]?.[0]).toBe(COMPONENT_SOURCE);
+    expect(spies.selectEvent).not.toHaveBeenCalled();
+  });
+
+  it('announces an activated row by the id of the record it stands for', async () => {
+    const stub = recordingProvider();
+    const spies = makeHostActions();
+    const user = userEvent.setup();
+
+    const scope = render(
+      panelTree(RENDER_CASES.table.node, stub.provider, spies.actions),
+    ).container;
+
+    const grid = await findGridWithRows(scope);
+    const [row] = dataRowsIn(grid);
+
+    if (row === undefined) {
+      throw new Error('the grid rendered no data row');
+    }
+
+    await user.click(row);
+
+    expect(spies.selectEvent).toHaveBeenCalledTimes(1);
+
+    const call = spies.selectEvent.mock.calls[0];
+
+    if (call === undefined) {
+      throw new Error('the selection handler recorded no call');
+    }
+
+    const [eventId, coordinates] = call;
+
+    // The id is one of the page's records, and the coordinates beside it are
+    // that record's own trace and span — carried over key for key, never
+    // invented and never written as `undefined`.
+    const event = RECORDED_EVENTS.find((candidate) => candidate.id === eventId);
+
+    if (event === undefined) {
+      throw new Error(`the selection named "${eventId}", which is no record of the page`);
+    }
+
+    expect(coordinates).toEqual({ traceId: event.traceId, spanId: event.spanId });
+    expect(Object.keys(coordinates ?? {}).sort()).toEqual(['spanId', 'traceId']);
+    expect(spies.openSource).not.toHaveBeenCalled();
   });
 });
 

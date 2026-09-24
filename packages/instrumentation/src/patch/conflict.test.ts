@@ -74,6 +74,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  renameSync,
   rmSync,
   symlinkSync,
   unlinkSync,
@@ -476,11 +477,14 @@ function recordingFileReader(): RecordingFileReader {
 
 /** Every call the backup store received, by operation. */
 interface BackupStoreLog {
-  /** Digests handed to `locate`. */
+  /** Digests handed to `locate` or `locateRecorded`. */
   readonly locates: string[];
 
-  /** Digests handed to `read`. */
+  /** Digests handed to `read` or `readRecorded`. */
   readonly reads: string[];
+
+  /** Recorded paths handed to `locateRecorded` or `readRecorded`, in call order. */
+  readonly recordedPaths: string[];
 
   /** Digests handed to `verify`. */
   readonly verifies: string[];
@@ -491,7 +495,10 @@ interface BackupStoreLog {
   /** Digests handed to `put`: a write, which detection must never perform. */
   readonly puts: string[];
 
-  /** Digests handed to `remove`: a delete, which detection must never perform. */
+  /**
+   * Digests handed to `remove` or `removeRecorded`: a delete, which detection
+   * must never perform.
+   */
   readonly removes: string[];
 
   /** One entry per `removeSessionDirectory` call, for the same reason. */
@@ -512,13 +519,16 @@ interface RecordingBackupStore {
  *
  * The store is what makes "the original must remain recoverable by hand" and
  * "detection never wrote" both checkable: the first by reading the backup back
- * through it, the second by observing that `put`, `remove` and
- * `removeSessionDirectory` were never reached.
+ * through it, the second by observing that `put`, `remove`, `removeRecorded`
+ * and `removeSessionDirectory` were never reached. The record-path operations
+ * log into the same digest lists as their digest-keyed counterparts, so an
+ * assertion that detection located or read nothing covers both routes.
  */
 function recordingBackupStore(real: BackupStore): RecordingBackupStore {
   const log: BackupStoreLog = {
     locates: [],
     reads: [],
+    recordedPaths: [],
     verifies: [],
     existenceChecks: [],
     puts: [],
@@ -536,6 +546,12 @@ function recordingBackupStore(real: BackupStore): RecordingBackupStore {
 
         return real.locate(originalHash);
       },
+      locateRecorded: (recordedPath: string, originalHash: string) => {
+        log.locates.push(originalHash);
+        log.recordedPaths.push(recordedPath);
+
+        return real.locateRecorded(recordedPath, originalHash);
+      },
       put: (originalHash: string, content: Uint8Array) => {
         log.puts.push(originalHash);
 
@@ -545,6 +561,12 @@ function recordingBackupStore(real: BackupStore): RecordingBackupStore {
         log.reads.push(originalHash);
 
         return real.read(originalHash);
+      },
+      readRecorded: (recordedPath: string, originalHash: string) => {
+        log.reads.push(originalHash);
+        log.recordedPaths.push(recordedPath);
+
+        return real.readRecorded(recordedPath, originalHash);
       },
       has: (originalHash: string) => {
         log.existenceChecks.push(originalHash);
@@ -560,6 +582,15 @@ function recordingBackupStore(real: BackupStore): RecordingBackupStore {
         log.removes.push(originalHash);
 
         return real.remove(originalHash, options);
+      },
+      removeRecorded: (
+        recordedPath: string,
+        originalHash: string,
+        options?: RemoveBackupOptions,
+      ) => {
+        log.removes.push(originalHash);
+
+        return real.removeRecorded(recordedPath, originalHash, options);
       },
       removeSessionDirectory: () => {
         log.directoryRemovals.push(real.sessionDirectory);
@@ -765,6 +796,7 @@ function makeWorld(name = 'world'): World {
       files.log.hashedByteLengths.length = 0;
       backups.log.locates.length = 0;
       backups.log.reads.length = 0;
+      backups.log.recordedPaths.length = 0;
       backups.log.verifies.length = 0;
       backups.log.existenceChecks.length = 0;
       backups.log.puts.length = 0;
@@ -1475,6 +1507,149 @@ describe('a recorded original that cannot be read back', () => {
     // Neither copy was touched: the corrupt backup is still the only copy of
     // whatever it holds, and the project file is still instrumented.
     expectFileBytes(backupPath, corrupted);
+    expectFileBytes(patched.path, patched.instrumentedBytes);
+    expectDetectionWroteNothing(world);
+  });
+});
+
+describe('a recorded original the journal says was moved', () => {
+  /** The warning a record whose path the store would not open produces. */
+  const SUBSTITUTED_WARNING = 'a record names a backup path this store would not compose';
+
+  /**
+   * `<debuggenHome>/backups/<sessionId>/quarantine`, private like the rest of
+   * the tree: a subdirectory of the session's own directory, the one place a
+   * relocation is honoured.
+   */
+  function quarantineOf(world: World): string {
+    const quarantine = join(world.debuggenHome, 'backups', world.sessionId, 'quarantine');
+
+    mkdirSync(quarantine, { recursive: true, mode: 0o700 });
+    chmodSync(quarantine, 0o700);
+
+    return quarantine;
+  }
+
+  it('is read from where the record says it is, and authorises the restore', async () => {
+    const world = makeWorld();
+    const patched = await world.patch({ file: TARGET_FILE, symbol: FIRST_SYMBOL });
+    const relocated = join(quarantineOf(world), patched.record.originalHash);
+
+    renameSync(world.backupPathOf(patched.record.originalHash), relocated);
+    const record: ModificationRecord = { ...patched.record, backupPath: relocated };
+    world.resetLogs();
+
+    const verdict = restorableVerdictOf(verdictOf(await detectConflict(record, contextOf(world))));
+
+    // Nothing is at the composed path, so a read by digest would have called
+    // this backup missing and turned a restorable record into a conflict.
+    expect(existsSync(world.backupPathOf(patched.record.originalHash))).toBe(false);
+    expect(verdict.backup.available).toBe(true);
+    expect(verdict.backup.path).toBe(relocated);
+    expect(verdict.backup.byteLength).toBe(patched.originalBytes.byteLength);
+    expect(world.backups.log.recordedPaths).toContain(relocated);
+    expect(world.logs.records.some((entry) => entry.message === SUBSTITUTED_WARNING)).toBe(false);
+
+    expectFileBytes(relocated, patched.originalBytes);
+    expectDetectionWroteNothing(world);
+  });
+
+  it('is not trusted when a directory above it is a symbolic link', async () => {
+    const world = makeWorld();
+    const patched = await world.patch({ file: TARGET_FILE, symbol: FIRST_SYMBOL });
+    const elsewhere = join(world.root, 'elsewhere');
+
+    mkdirSync(elsewhere, { mode: 0o700 });
+    chmodSync(elsewhere, 0o700);
+    renameSync(
+      world.backupPathOf(patched.record.originalHash),
+      join(elsewhere, patched.record.originalHash),
+    );
+
+    const linked = join(world.debuggenHome, 'backups', world.sessionId, 'quarantine');
+    symlinkSync(elsewhere, linked, 'dir');
+
+    const relocated = join(linked, patched.record.originalHash);
+    const record: ModificationRecord = { ...patched.record, backupPath: relocated };
+    world.resetLogs();
+
+    const verdict = backupUnavailableVerdictOf(
+      verdictOf(await detectConflict(record, contextOf(world))),
+    );
+
+    // The walk from the state root down refused the linked directory before
+    // anything below it was opened.
+    expect(verdict.backup.available).toBe(false);
+    expect(verdict.backup.reason).toBe('unreadable');
+    expect(verdict.backup.detail).toBe('symlink-component');
+    expect(verdict.backup.path).toBe(relocated);
+    expect(verdict.conflict.reason).toBe('backup-missing');
+    expectSchemaValidConflict(verdict);
+    expectFileBytes(patched.path, patched.instrumentedBytes);
+    expectDetectionWroteNothing(world);
+  });
+
+  it('falls back to the store’s own location for a path outside the backup tree, and says so', async () => {
+    const world = makeWorld();
+    const patched = await world.patch({ file: TARGET_FILE, symbol: FIRST_SYMBOL });
+    const foreign = join(world.root, 'another-home', 'backups', 'ses_other', 'original');
+    const decoy = Buffer.from('export const decoy = true;\n', 'utf8');
+
+    mkdirSync(dirname(foreign), { recursive: true });
+    writeFileSync(foreign, decoy);
+    const record: ModificationRecord = { ...patched.record, backupPath: foreign };
+    world.resetLogs();
+
+    const verdict = restorableVerdictOf(verdictOf(await detectConflict(record, contextOf(world))));
+
+    // The composed backup was read and verified; the foreign path was never
+    // opened, so its bytes could not have been mistaken for the original.
+    expect(verdict.backup.available).toBe(true);
+    expect(verdict.backup.byteLength).toBe(patched.originalBytes.byteLength);
+    expect(verdict.backup.path).toBe(foreign);
+
+    const warnings = world.logs.records.filter((entry) => entry.message === SUBSTITUTED_WARNING);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]?.fields['recordedPath']).toBe(foreign);
+    expect(warnings[0]?.fields['storePath']).toBe(world.backupPathOf(patched.record.originalHash));
+
+    expectFileBytes(foreign, decoy);
+    expectDetectionWroteNothing(world);
+  });
+
+  it('does not read a backup moved into another session’s directory, and says so', async () => {
+    const world = makeWorld();
+    const patched = await world.patch({ file: TARGET_FILE, symbol: FIRST_SYMBOL });
+    const digest = patched.record.originalHash;
+
+    // Moved into a neighbour session's quarantine under the same state root:
+    // inside the backup tree, named by the digest, and still not this
+    // session's to read — one session's record never reaches another's backups.
+    const neighbour = join(world.debuggenHome, 'backups', 'ses_neighbour', 'quarantine');
+    mkdirSync(neighbour, { recursive: true, mode: 0o700 });
+    chmodSync(neighbour, 0o700);
+
+    const moved = join(neighbour, digest);
+    renameSync(world.backupPathOf(digest), moved);
+    const record: ModificationRecord = { ...patched.record, backupPath: moved };
+    world.resetLogs();
+
+    const verdict = backupUnavailableVerdictOf(
+      verdictOf(await detectConflict(record, contextOf(world))),
+    );
+
+    // The store's own location was consulted instead, and it is empty.
+    expect(verdict.backup.available).toBe(false);
+    expect(verdict.backup.reason).toBe('missing');
+    expect(verdict.conflict.reason).toBe('backup-missing');
+    expectSchemaValidConflict(verdict);
+
+    const warnings = world.logs.records.filter((entry) => entry.message === SUBSTITUTED_WARNING);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]?.fields['recordedPath']).toBe(moved);
+    expect(warnings[0]?.fields['storePath']).toBe(world.backupPathOf(digest));
+
+    expectFileBytes(moved, patched.originalBytes);
     expectFileBytes(patched.path, patched.instrumentedBytes);
     expectDetectionWroteNothing(world);
   });

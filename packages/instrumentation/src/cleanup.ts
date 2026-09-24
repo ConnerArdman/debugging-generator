@@ -101,8 +101,18 @@
  *
  * **It reads no environment variable.** `$DEBUGGEN_HOME` is resolved once by
  * the service and reaches this module only as the backup store's own rooted
- * paths; a backup is located by asking the store for its digest, never by
- * composing a path from strings here.
+ * paths. A backup is read and deleted by handing the store the record's
+ * journaled `backupPath` with its digest — the journal may have been updated to
+ * say where a backup was moved — and the store alone decides whether that path
+ * is one it may act on — a relocation only inside the record's own session
+ * directory, under the record's digest — so no path is ever composed from
+ * strings here and no journal string reaches a filesystem call outside that
+ * session's own backup directory.
+ *
+ * **It never creates a file over one it did not observe.** A target that was
+ * gone is recreated with a no-clobber create that fails if anything appeared at
+ * the path in the meantime, and that race is reported as a conflict with the
+ * backup retained rather than resolved by overwriting what the developer wrote.
  *
  * ## Failure policy
  *
@@ -151,13 +161,14 @@ import {
 } from '@debuggen/shared';
 import type { Logger, Result } from '@debuggen/shared';
 import {
-  atomicReplaceFile,
+  atomicCreateFileNoClobber,
   atomicReplaceFileIfUnchanged,
   readFileNoFollow,
   readFileSnapshotNoFollow,
   sha256Hex,
 } from '@debuggen/shared/node';
 import type {
+  AtomicCreateVerdict,
   AtomicReplaceExpectation,
   AtomicReplaceVerdict,
   FileSnapshot,
@@ -170,7 +181,7 @@ import type {
   ModificationRecord,
   ModificationStatus,
 } from './schema/modification.js';
-import type { BackupStore } from './patch/backup-store.js';
+import type { BackupStore, RecordedBackup } from './patch/backup-store.js';
 import { buildConflictReport, detectConflict, isConflictVerdict } from './patch/conflict.js';
 import type {
   ConflictDetectionContext,
@@ -311,6 +322,18 @@ export interface ChainFork {
  * message says which fork shape was found.
  */
 const CHAIN_FORK_CONFLICT_REASON: ModificationConflictReason = RECORD_CHAIN_FORK_REASON;
+
+/**
+ * Why nothing was written over a target that had been observed missing: the
+ * no-clobber create found something at the path, because a developer (or a
+ * tool acting for them) recreated the file between the observation and the
+ * write.
+ *
+ * The counterpart of the conditional replacement's `target-missing` stale
+ * reason, in the same kebab-case vocabulary, so the logs and the conflict
+ * message name the race the same way whichever write refused.
+ */
+const TARGET_APPEARED = 'target-appeared';
 
 /**
  * What a pass is allowed to do with a record, decided by the record's status
@@ -469,23 +492,30 @@ export interface CleanupFileSystem extends ConflictFileReader {
   ) => AtomicReplaceVerdict;
 
   /**
-   * Writes bytes over a path atomically, creating the file when it is absent,
-   * preserving an existing target's mode.
+   * Creates a file that was observed to be absent, atomically, **only while it
+   * is still absent**.
    *
-   * The contract is `atomicReplaceFile`'s, and it is used for exactly one case:
-   * a target that is **no longer there**. There is no content to make the write
-   * conditional on, and a deleted file with an intact backup is recoverable —
-   * AAP §0.5.1's guarantee is about the bytes, not about the inode — so the
-   * file is recreated from the backup and the outcome says so
-   * ({@link RestoreOutcome.recreated}). Every other case goes through
+   * The contract is `atomicCreateFileNoClobber`'s, and it is used for exactly
+   * one case: a target that is **no longer there**. A deleted file with an
+   * intact backup is recoverable — AAP §0.5.1's guarantee is about the bytes,
+   * not about the inode — so the file is recreated from the backup and the
+   * outcome says so ({@link RestoreOutcome.recreated}). But "absent" is an
+   * observation, and a developer can recreate the file between it and the
+   * write; an unconditional create-or-rename would then discard what they wrote
+   * with no trace (CWE-367). The bytes are therefore staged in a sibling and
+   * installed with `link()`, which the kernel refuses when anything — a file, a
+   * directory, a symbolic link — occupies the path. An `exists` verdict is a
+   * guarantee that nothing was written. Every other case goes through
    * {@link CleanupFileSystem.replaceFileIfUnchanged}.
    *
-   * @param absolutePath The file to write. Created when absent.
+   * @param absolutePath The file to create.
    * @param content The bytes to write, verbatim.
+   * @returns `created`, or `exists` when something occupied the path and
+   * nothing was written.
    * @throws The runtime's own filesystem error, with its `code` intact —
    * `ENOENT` when the containing directory is gone too.
    */
-  readonly replaceFile: (absolutePath: string, content: Uint8Array) => void;
+  readonly createFileIfAbsent: (absolutePath: string, content: Uint8Array) => AtomicCreateVerdict;
 }
 
 /**
@@ -503,9 +533,8 @@ export const defaultCleanupFileSystem: CleanupFileSystem = Object.freeze({
   realPath: (absolutePath: string): string => realpathSync(absolutePath),
   readFileSnapshot: readFileSnapshotNoFollow,
   replaceFileIfUnchanged: atomicReplaceFileIfUnchanged,
-  replaceFile: (absolutePath: string, content: Uint8Array): void => {
-    atomicReplaceFile(absolutePath, content);
-  },
+  createFileIfAbsent: (absolutePath: string, content: Uint8Array): AtomicCreateVerdict =>
+    atomicCreateFileNoClobber(absolutePath, content),
 });
 
 /**
@@ -679,7 +708,9 @@ export interface RestoreOutcome {
    * A deleted, renamed or moved file is not a conflict as long as the recorded
    * original is still readable: the guarantee is about the bytes. It is
    * surfaced so the developer can be told a file reappeared, which is not what
-   * they would otherwise expect from a cleanup.
+   * they would otherwise expect from a cleanup. `true` only when the no-clobber
+   * create installed the original into an empty path; a file that appeared
+   * there first is kept and reported as a conflict instead.
    */
   readonly recreated: boolean;
 
@@ -2142,13 +2173,26 @@ async function restoreOne(
  * Three refusals live inside it, and each one leaves the developer's bytes
  * exactly where they are:
  *
- * - the backup cannot be read back, or does not hash to the digest it is filed
- *   under, so there are no verified original bytes to write;
+ * - the backup cannot be read back from where the record says it is, or does
+ *   not hash to the digest it is filed under, so there are no verified original
+ *   bytes to write;
  * - the file changed between the verdict and the write, which the conditional
- *   replacement detects and refuses (CWE-367);
+ *   replacement detects and refuses — or, for a target that was gone, something
+ *   appeared at the path before the no-clobber create could install the
+ *   original (CWE-367 both ways);
  * - the restored content does not hash to `originalHash`, which is the one case
  *   where bytes *were* written and the backup is therefore **kept** rather than
  *   deleted.
+ *
+ * The backup is read through the record's journaled `backupPath`, not
+ * recomposed from its digest: the journal may have been updated to say the
+ * backup was moved, and a read by digest would then declare an intact original
+ * missing and strand the patched file. The store resolves that path under its
+ * own policy — a relocation is honoured only inside the record's own session
+ * directory, in a subdirectory of it, under the record's digest; every
+ * directory above it is pinned from the state root and proven private through
+ * the descriptor it opened, and the file is read through that pin without
+ * following a link. Any other recorded path is never opened.
  *
  * @param targetMissing Whether the verdict already found the file gone, in
  * which case it is recreated from the backup instead of conditionally
@@ -2164,7 +2208,40 @@ async function writeRestoration(
 ): Promise<Result<RestoreOutcome>> {
   const { files, logger } = settings;
 
-  const backup = await settings.scope.backups.read(record.originalHash);
+  // Annotated rather than inferred: an unannotated `let` assigned inside a
+  // `try` evolves from an implicit `any`.
+  let backup: Result<RecordedBackup>;
+
+  try {
+    backup = await settings.scope.backups.readRecorded(record.backupPath, record.originalHash);
+  } catch (error) {
+    // A condition the store has no opinion about — a link planted at a
+    // relocated backup (`ELOOP`), a directory in its place, a permission
+    // change since the verdict. It is still "the original cannot be read
+    // back", so it is reported exactly as a refusal would be, with the errno,
+    // and nothing is written.
+    const reason = DebuggenError.is(error)
+      ? (detailsReasonOf(error) ?? error.code)
+      : (errnoCodeOf(error) ?? 'unknown');
+
+    logger.warn('a backup could not be read back; nothing was written', {
+      recordId: record.id,
+      sessionId: record.sessionId,
+      file: record.file,
+      backupPath: record.backupPath,
+      reason,
+    });
+
+    return await reportSynthesizedConflict(
+      record,
+      path,
+      'backup-missing',
+      undefined,
+      backupUnreadableMessage(record, reason),
+      context,
+      settings,
+    );
+  }
 
   if (isErr(backup)) {
     return await reportSynthesizedConflict(
@@ -2178,7 +2255,7 @@ async function writeRestoration(
     );
   }
 
-  const originalBytes = backup.value;
+  const originalBytes = backup.value.bytes;
   const backupDigest = files.hashBytes(originalBytes);
 
   if (backupDigest !== record.originalHash) {
@@ -2258,7 +2335,14 @@ async function writeRestoration(
   }
 
   if (recreated) {
-    const written = tryCatch(() => files.replaceFile(path, originalBytes), 'CLEANUP_PARTIAL');
+    // "Missing" is an observation, and the developer can recreate the file
+    // between it and this write. The create is no-clobber: it installs the
+    // original only if the path is still empty at that instant, and otherwise
+    // writes nothing — so a file that appeared is kept, not replaced (CWE-367).
+    const written = tryCatch(
+      () => files.createFileIfAbsent(path, originalBytes),
+      'CLEANUP_PARTIAL',
+    );
 
     if (isErr(written)) {
       if (errnoCodeOf(written.error.cause) === 'ENOENT') {
@@ -2276,6 +2360,20 @@ async function writeRestoration(
       }
 
       return err(filesystemFailure(record, path, 'restore-create', written.error));
+    }
+
+    if (written.value.kind === 'exists') {
+      logger.warn('a missing file reappeared while it was being restored; nothing was written', {
+        recordId: record.id,
+        sessionId: record.sessionId,
+        file: record.file,
+        staleReason: TARGET_APPEARED,
+      });
+
+      // The same route a stale conditional replacement takes: the detector is
+      // asked again, so the report describes whatever now occupies the path,
+      // and the record moves to `conflict` with its backup retained.
+      return await reportRaceConflict(record, path, undefined, TARGET_APPEARED, context, settings);
     }
   }
 
@@ -2560,8 +2658,12 @@ async function recordConflict(
  * pass is filed under — the store is content-addressed, so records that saw
  * identical original bytes share one file — is retained here and swept by
  * {@link BackupLedger.sweep} once its last holder is done. A delete that fails
- * is a warning, not a failure of the restore: the developer's file is already
- * back.
+ * — refused by the store, or thrown by the filesystem — is a warning, not a
+ * failure of the restore: the developer's file is already back.
+ *
+ * The backup deleted is the one the record's journaled `backupPath` names, the
+ * same one {@link writeRestoration} read, so a relocated backup is removed from
+ * where it was moved to rather than looked for where it no longer is.
  */
 async function disposeBackup(
   record: ModificationRecord,
@@ -2577,9 +2679,16 @@ async function disposeBackup(
     return 'retained';
   }
 
-  const removed = await settings.scope.backups.remove(record.originalHash, {
-    restoredContentHash: verifiedHash,
-  });
+  const removed = await removeRecordedBackup(
+    settings.scope.backups,
+    record,
+    verifiedHash,
+    settings.logger,
+  );
+
+  if (removed === undefined) {
+    return 'retained';
+  }
 
   if (isErr(removed)) {
     settings.logger.warn('the backup of a restored file could not be deleted; it was kept', {
@@ -2593,6 +2702,42 @@ async function disposeBackup(
   }
 
   return removed.value ? 'deleted' : 'absent';
+}
+
+/**
+ * Asks the store to delete the backup a record names, conditional on a
+ * verified restoration, and turns a thrown filesystem error into a logged
+ * "kept".
+ *
+ * Shared by {@link disposeBackup} and {@link BackupLedger.sweep}, the only two
+ * places a backup is ever deleted, so both delete from the record's journaled
+ * `backupPath` under the store's policy and both treat a throw the same way.
+ *
+ * @param verifiedHash The digest the restored content hashed to, which the
+ * store checks against `originalHash` before it deletes anything.
+ * @returns The store's answer, or `undefined` when the delete threw — logged
+ * here, with the errno, and meaning the backup was kept.
+ */
+async function removeRecordedBackup(
+  store: BackupStore,
+  record: ModificationRecord,
+  verifiedHash: string,
+  logger: Logger,
+): Promise<Result<boolean> | undefined> {
+  try {
+    return await store.removeRecorded(record.backupPath, record.originalHash, {
+      restoredContentHash: verifiedHash,
+    });
+  } catch (error) {
+    logger.warn('the backup of a restored file could not be deleted; it was kept', {
+      recordId: record.id,
+      originalHash: record.originalHash,
+      backupPath: record.backupPath,
+      errno: errnoCodeOf(error) ?? 'unknown',
+    });
+
+    return undefined;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -2969,101 +3114,137 @@ async function removeSessionBackups(
  * restore from, turning a perfectly reversible edit into a `backup-missing`
  * conflict.
  *
- * So the pass counts holders. A record whose digest still has another holder —
- * or whose digest is pinned, because a record filed under it conflicted or was
+ * So the pass counts holders. A record whose backup still has another holder —
+ * or whose backup is pinned, because a record sharing it conflicted or was
  * skipped and its backup is what the developer was pointed at — keeps its
  * backup, and {@link BackupLedger.sweep} deletes it once the last holder has
- * been restored and nothing pinned it. Keys are `(sessionId, originalHash)`
- * pairs, because each session has its own backup directory and two sessions'
- * identical digests are two different files.
+ * been restored and nothing pinned it.
+ *
+ * A record identifies its backup two ways, and the ledger honours both: the
+ * `(sessionId, originalHash)` pair the store composes a path from — each
+ * session has its own backup directory, so two sessions' identical digests are
+ * two different files — and the journaled `backupPath` that cleanup actually
+ * reads and deletes, which may have been updated to say the backup was moved.
+ * Every record is counted under both keys, and a backup is deletable only when
+ * **neither** key is still held or pinned. That is conservative on purpose: two
+ * records that share a digest but name different paths hold each other's
+ * deletion until both are done, which costs a deferral; two records that name
+ * one relocated file under different digests still cannot delete it out from
+ * under each other, which is what matters.
  *
  * Private to this module: a caller of {@link restoreChain} gets a ledger built
  * from the records it passed, and {@link cleanupSession} and
  * {@link reconcileModifications} share one across every file they visit.
  */
 class BackupLedger {
-  /** How many records of this pass are still to be answered for, per digest. */
+  /** How many records of this pass are still to be answered for, per key. */
   private readonly holders = new Map<string, number>();
 
-  /** Digests whose backup this pass must not delete at all. */
+  /** Keys whose backup this pass must not delete at all. */
   private readonly pinned = new Set<string>();
 
-  /** Digests whose deletion was deferred, with the store that owns them. */
+  /**
+   * Deferred deletions, one per distinct `(session, digest, recorded path)`,
+   * with the store that owns them. Keyed that finely so two records that share
+   * a digest but name different files each get their own deletion; two that
+   * resolve to the same file delete it once and find it absent the second time,
+   * which the store answers idempotently.
+   */
   private readonly deferred = new Map<
     string,
     { readonly store: BackupStore; readonly record: ModificationRecord }
   >();
 
   /**
-   * Counts the records a pass is about to process, and pins the digests of the
+   * Counts the records a pass is about to process, and pins the backups of the
    * ones that arrive already in conflict — their backups are retained by
    * definition.
    */
   register(records: readonly ModificationRecord[]): void {
     for (const record of records) {
-      const key = ledgerKey(record);
+      for (const key of ledgerKeys(record)) {
+        this.holders.set(key, (this.holders.get(key) ?? 0) + 1);
 
-      this.holders.set(key, (this.holders.get(key) ?? 0) + 1);
-
-      if (record.status === 'conflict') {
-        this.pinned.add(key);
+        if (record.status === 'conflict') {
+          this.pinned.add(key);
+        }
       }
     }
   }
 
   /** Whether this record's backup must survive its own restoration. */
   holds(record: ModificationRecord): boolean {
-    const key = ledgerKey(record);
-
-    return this.pinned.has(key) || (this.holders.get(key) ?? 0) > 1;
+    return ledgerKeys(record).some(
+      (key) => this.pinned.has(key) || (this.holders.get(key) ?? 0) > 1,
+    );
   }
 
   /**
    * Accounts for a record that was restored or closed.
    *
-   * @param deferredDelete Whether its backup was kept, in which case the digest
+   * @param deferredDelete Whether its backup was kept, in which case the record
    * is remembered for {@link BackupLedger.sweep}.
    */
   release(record: ModificationRecord, store: BackupStore, deferredDelete: boolean): void {
-    const key = ledgerKey(record);
-
-    this.holders.set(key, Math.max(0, (this.holders.get(key) ?? 0) - 1));
+    for (const key of ledgerKeys(record)) {
+      this.holders.set(key, Math.max(0, (this.holders.get(key) ?? 0) - 1));
+    }
 
     if (deferredDelete) {
-      this.deferred.set(key, { store, record });
+      this.deferred.set(deferredKey(record), { store, record });
     }
   }
 
   /**
    * Accounts for a record that was not reverted, and forbids the deletion of
-   * its digest for the rest of the pass — including a deletion an earlier
-   * record had deferred.
+   * its backup for the rest of the pass — including a deletion an earlier
+   * record had deferred under either of its keys.
    */
   pin(record: ModificationRecord): void {
-    const key = ledgerKey(record);
+    const keys = ledgerKeys(record);
 
-    this.holders.set(key, Math.max(0, (this.holders.get(key) ?? 0) - 1));
-    this.pinned.add(key);
-    this.deferred.delete(key);
+    for (const key of keys) {
+      this.holders.set(key, Math.max(0, (this.holders.get(key) ?? 0) - 1));
+      this.pinned.add(key);
+    }
+
+    for (const [key, entry] of this.deferred) {
+      if (ledgerKeys(entry.record).some((candidate) => keys.includes(candidate))) {
+        this.deferred.delete(key);
+      }
+    }
   }
 
   /**
-   * Deletes every deferred backup whose last holder has been restored and whose
-   * digest nothing pinned.
+   * Deletes every deferred backup whose last holder has been restored and that
+   * nothing pinned, under either of its keys.
    *
-   * A failure is logged and left: a retained backup costs a few kilobytes under
-   * the product's own state directory, and every file it belongs to is already
-   * back.
+   * Each deletion goes to the record's journaled `backupPath`, through the same
+   * store-policy route {@link disposeBackup} takes, and stays conditional on the
+   * verified restoration. A failure — refused or thrown — is logged and left: a
+   * retained backup costs a few kilobytes under the product's own state
+   * directory, and every file it belongs to is already back.
    */
   async sweep(logger: Logger): Promise<void> {
-    for (const [key, entry] of this.deferred) {
-      if (this.pinned.has(key) || (this.holders.get(key) ?? 0) > 0) {
+    for (const entry of this.deferred.values()) {
+      const blocked = ledgerKeys(entry.record).some(
+        (key) => this.pinned.has(key) || (this.holders.get(key) ?? 0) > 0,
+      );
+
+      if (blocked) {
         continue;
       }
 
-      const removed = await entry.store.remove(entry.record.originalHash, {
-        restoredContentHash: entry.record.originalHash,
-      });
+      const removed = await removeRecordedBackup(
+        entry.store,
+        entry.record,
+        entry.record.originalHash,
+        logger,
+      );
+
+      if (removed === undefined) {
+        continue;
+      }
 
       if (isErr(removed)) {
         logger.warn('a shared backup could not be deleted after its last holder was restored', {
@@ -3085,9 +3266,25 @@ class BackupLedger {
   }
 }
 
-/** The ledger's key: one digest inside one session's backup directory. */
-function ledgerKey(record: ModificationRecord): string {
-  return `${record.sessionId}\u0000${record.originalHash}`;
+/**
+ * The ledger's keys for one record's backup: the digest inside its session's
+ * backup directory, and the journaled path cleanup reads and deletes.
+ *
+ * Tagged so the two kinds can never collide, and the path is compared in its
+ * lexical normal form so two spellings of one path count as one holder.
+ */
+function ledgerKeys(record: ModificationRecord): readonly [string, string] {
+  return [
+    `digest\u0000${record.sessionId}\u0000${record.originalHash}`,
+    `path\u0000${normalizePosix(toPosix(record.backupPath))}`,
+  ];
+}
+
+/** The key a deferred deletion is remembered under: both of a record's keys at once. */
+function deferredKey(record: ModificationRecord): string {
+  const [digestKey, pathKey] = ledgerKeys(record);
+
+  return `${digestKey}\u0000${pathKey}`;
 }
 
 // ---------------------------------------------------------------------------

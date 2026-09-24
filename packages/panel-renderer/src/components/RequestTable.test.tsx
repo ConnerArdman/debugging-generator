@@ -38,7 +38,15 @@
  *     A zero here would read as a response that carried nothing.
  *   - **The paging contract** (AAP 0.4.2): the footer states how much of the
  *     result is on screen, and "Load more" asks for the `offset` the *service*
- *     reported rather than one derived from the rows in hand.
+ *     reported rather than one derived from the rows in hand — and only when
+ *     that offset moves forward from the page it answered.
+ *   - **The page size as authored**: an explicit `limit: 0` reaches the
+ *     provider as zero and is never paged, an omitted limit stays omitted, and
+ *     an over-sized one is held to the contract ceiling.
+ *   - **An empty page is not an empty capture**: a count-only query, a page
+ *     past the end, a page inside a positive total and a later page without a
+ *     total each say which absence they are, and only a zero total — or an
+ *     unreported one for the whole result — says nothing was captured.
  *   - **Ordering is a re-query, never a local sort**: a sortable header
  *     activation issues a new provider call carrying the mapped
  *     `DataQuerySort`, and the rows then follow the second response.
@@ -87,6 +95,7 @@
 import {
   DATA_QUERY_DEFAULT_LIMIT,
   DATA_QUERY_DEFAULT_OFFSET,
+  DATA_QUERY_MAX_LIMIT,
   catalogEntryFor,
 } from '@debuggen/panel-schema';
 import type { DataQuery, DataQuerySort, RequestTableNode } from '@debuggen/panel-schema';
@@ -1930,6 +1939,55 @@ describe('RequestTable ordering', () => {
   });
 });
 
+/**
+ * An authored offset past the first page, so a case can tell the page's own
+ * offset from the contract default and a position from an index.
+ */
+const AUTHORED_OFFSET = 5;
+
+/** A node query that asks for the total of its source and no rows. */
+const COUNT_ONLY_QUERY: DataQuery = { source: 'requests', sort: MOST_OCCURRENCES_FIRST, limit: 0 };
+
+/** The empty-state titles of a count-only page and of an empty page within a result. */
+const COUNT_ONLY_TITLE = 'Count only';
+const EMPTY_PAGE_TITLE = 'Nothing on this page';
+
+/** The view's own empty state, for a capture that held no requests at all. */
+const NOTHING_CAPTURED_TITLE = 'No requests';
+const NOTHING_CAPTURED_MESSAGE = 'No network requests were captured for this interaction.';
+
+/**
+ * Wait for the empty state and assert its exact title and message.
+ *
+ * Both are found by their text, then checked to be the `EmptyState` parts
+ * placed inside this view's empty container, so a sentence that happened to
+ * appear elsewhere could not satisfy the case. The capture-wide copy is
+ * asserted absent whenever another absence is expected: the two are different
+ * claims, and only one of them may be made.
+ *
+ * @param title The expected title.
+ * @param message The expected message.
+ */
+async function expectEmptyPage(title: string, message: string): Promise<void> {
+  const shownTitle = await screen.findByText(title);
+  expect(shownTitle.classList.contains('dg-empty-state__title')).toBe(true);
+  expect(shownTitle.closest('.dg-request-table__empty')).not.toBeNull();
+
+  const shownMessage = screen.getByText(message);
+  expect(shownMessage.classList.contains('dg-empty-state__message')).toBe(true);
+  expect(shownMessage.closest('.dg-request-table__empty')).toBe(
+    shownTitle.closest('.dg-request-table__empty'),
+  );
+
+  if (title !== NOTHING_CAPTURED_TITLE) {
+    expect(screen.queryByText(NOTHING_CAPTURED_MESSAGE)).toBeNull();
+  }
+
+  // An empty page is a success: no failure is drawn and no rows are invented.
+  expect(screen.queryByRole('alert')).toBeNull();
+  expect(screen.queryAllByRole('row')).toHaveLength(0);
+}
+
 describe('RequestTable paging', () => {
   it('says how much of the result is on screen and appends the next page', async () => {
     // `nextOffset` deliberately differs from the length of the page: the
@@ -1993,6 +2051,247 @@ describe('RequestTable paging', () => {
 
     // And with no next offset reported, no paging control is offered.
     expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+  });
+
+  it('offers no paging control for a next offset that does not move forward', async () => {
+    // Two answers a paging loop must never follow: an echo of the page's own
+    // offset, which would re-request the page on screen, and an offset behind
+    // it, which would step back into one already read.
+    for (const nextOffset of [AUTHORED_OFFSET, AUTHORED_OFFSET - 1]) {
+      const stub = resolvingProvider([REPEATED_GROUP], { total: 18, nextOffset });
+      const view = renderComponent(
+        makeNode({
+          query: { source: 'requests', sort: MOST_OCCURRENCES_FIRST, offset: AUTHORED_OFFSET },
+        }),
+        { provider: stub.provider, actions: makeActions().actions },
+      );
+
+      await screen.findByRole('grid');
+      expect(soleQuery(stub).offset).toBe(AUTHORED_OFFSET);
+      expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+      expect(stub.resolve).toHaveBeenCalledTimes(1);
+
+      view.unmount();
+    }
+  });
+});
+
+describe('RequestTable page size', () => {
+  it('sends an authored limit of zero as zero and never pages a count-only query', async () => {
+    // The provider echoes the page's own offset as its next one — the shape a
+    // count-only answer can take, since skipping zero rows lands where it began.
+    // Following it would re-request the same empty page for ever.
+    const stub = resolvingProvider([], { total: 42, nextOffset: DATA_QUERY_DEFAULT_OFFSET });
+
+    renderComponent(makeNode({ query: COUNT_ONLY_QUERY }), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    // Said as the count it is, with the total the service reported, and never
+    // as a capture that held nothing.
+    await expectEmptyPage(
+      COUNT_ONLY_TITLE,
+      `This view requests a count without rows: ${formatCount(42)} request groups matched its query.`,
+    );
+
+    // Zero on the wire, exactly: never raised to one row nobody asked for.
+    const query = soleQuery(stub);
+    expect(query.limit).toBe(0);
+    expect(query.offset).toBe(DATA_QUERY_DEFAULT_OFFSET);
+
+    // No rows were drawn and no paging control is offered, so nothing can ask
+    // for a second page of a query whose every page is empty by request.
+    expect(screen.queryByRole('grid')).toBeNull();
+    expect(screen.queryAllByRole('row')).toHaveLength(0);
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+    expect(stub.resolve).toHaveBeenCalledTimes(1);
+  });
+
+  it('never pages a count-only query, even past a forward next offset', async () => {
+    // A forward offset on a zero-row page could only lead to another zero-row
+    // page, so the count-only request itself — not the offset's direction — is
+    // what withholds the paging control.
+    const stub = resolvingProvider([], { total: 42, nextOffset: AUTHORED_OFFSET });
+
+    renderComponent(makeNode({ query: COUNT_ONLY_QUERY }), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    await screen.findByText(COUNT_ONLY_TITLE);
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+    expect(stub.resolve).toHaveBeenCalledTimes(1);
+  });
+
+  it('leaves an omitted limit off the query so the resolver applies its default', async () => {
+    const stub = resolvingProvider([REPEATED_GROUP]);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+
+    // Absent, not filled in: the default page size belongs to the side that
+    // resolves the query, so the page it applies and the page asked for agree.
+    expect(Object.hasOwn(soleQuery(stub), 'limit')).toBe(false);
+  });
+
+  it('holds an over-sized authored limit to the contract ceiling', async () => {
+    const stub = resolvingProvider([REPEATED_GROUP]);
+
+    renderComponent(
+      makeNode({ query: { source: 'requests', sort: MOST_OCCURRENCES_FIRST, limit: 9000 } }),
+      { provider: stub.provider, actions: makeActions().actions },
+    );
+
+    await screen.findByRole('grid');
+    expect(soleQuery(stub).limit).toBe(DATA_QUERY_MAX_LIMIT);
+  });
+});
+
+describe('RequestTable empty pages', () => {
+  it('says a count-only query found one group, in the singular', async () => {
+    const stub = resolvingProvider([], { total: 1 });
+
+    renderComponent(makeNode({ query: COUNT_ONLY_QUERY }), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    await expectEmptyPage(
+      COUNT_ONLY_TITLE,
+      `This view requests a count without rows: ${formatCount(1)} request group matched its query.`,
+    );
+  });
+
+  it('says a count-only query reported no total rather than inventing one', async () => {
+    const stub = resolvingProvider([]);
+
+    renderComponent(makeNode({ query: COUNT_ONLY_QUERY }), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    await expectEmptyPage(
+      COUNT_ONLY_TITLE,
+      'This view requests a count without rows, and no total was reported for its query.',
+    );
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+  });
+
+  it('keeps the capture-wide empty copy when the reported total is zero', async () => {
+    const stub = resolvingProvider([], { total: 0 });
+
+    renderComponent(
+      makeNode({
+        query: { source: 'requests', sort: MOST_OCCURRENCES_FIRST, offset: AUTHORED_OFFSET },
+      }),
+      { provider: stub.provider, actions: makeActions().actions },
+    );
+
+    // Zero matched, so the capture really held nothing for this query, whatever
+    // offset the page started at.
+    await expectEmptyPage(NOTHING_CAPTURED_TITLE, NOTHING_CAPTURED_MESSAGE);
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+  });
+
+  it('says a page starting past the end of a positive total is past the end', async () => {
+    const offset = 25;
+    const stub = resolvingProvider([], { total: 18 });
+
+    renderComponent(
+      makeNode({ query: { source: 'requests', sort: MOST_OCCURRENCES_FIRST, offset } }),
+      { provider: stub.provider, actions: makeActions().actions },
+    );
+
+    // One-based, as a reader counts: skipping 25 groups starts at the 26th.
+    await expectEmptyPage(
+      EMPTY_PAGE_TITLE,
+      `This page starts at position ${formatCount(offset + 1)}, past the end of the ${formatCount(
+        18,
+      )} request groups that matched this query.`,
+    );
+    expect(soleQuery(stub).offset).toBe(offset);
+  });
+
+  it('states the total when a page inside it came back empty', async () => {
+    const stub = resolvingProvider([], { total: 18 });
+
+    renderComponent(
+      makeNode({
+        query: { source: 'requests', sort: MOST_OCCURRENCES_FIRST, offset: AUTHORED_OFFSET },
+      }),
+      { provider: stub.provider, actions: makeActions().actions },
+    );
+
+    await expectEmptyPage(
+      EMPTY_PAGE_TITLE,
+      `${formatCount(18)} request groups matched this query, but none are shown on this page.`,
+    );
+  });
+
+  it('names where a later page starts when the service reported no total', async () => {
+    const stub = resolvingProvider([]);
+
+    renderComponent(
+      makeNode({
+        query: { source: 'requests', sort: MOST_OCCURRENCES_FIRST, offset: AUTHORED_OFFSET },
+      }),
+      { provider: stub.provider, actions: makeActions().actions },
+    );
+
+    await expectEmptyPage(
+      EMPTY_PAGE_TITLE,
+      `This page starts at position ${formatCount(
+        AUTHORED_OFFSET + 1,
+      )} and holds no request groups; no total was reported for this query.`,
+    );
+  });
+
+  it('keeps an empty page followed by more pageable, at exactly the reported offset', async () => {
+    const reportedNextOffset = 7;
+    const stub = pagingProvider([
+      { data: [], total: 18, nextOffset: reportedNextOffset },
+      { data: [REPEATED_GROUP], total: 18 },
+    ]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    // Positive total, first page, nothing on it: an empty page, not an empty
+    // capture, and the service says more follows.
+    await expectEmptyPage(
+      EMPTY_PAGE_TITLE,
+      `${formatCount(18)} request groups matched this query, but none are shown on this page.`,
+    );
+
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+
+    expect(stub.resolve).toHaveBeenCalledTimes(2);
+    expect(queryOfCall(stub, 2).offset).toBe(reportedNextOffset);
+
+    await waitFor(() => {
+      expect(renderedUrls()).toEqual([REPEATED_GROUP.url]);
+    });
+    expect(screen.queryByText(EMPTY_PAGE_TITLE)).toBeNull();
+  });
+
+  it('never calls a first page followed by more an empty capture, even without a total', async () => {
+    const stub = resolvingProvider([], { nextOffset: AUTHORED_OFFSET });
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    // The service reported no total but did report a next page, so this page
+    // is not the whole result and "nothing was captured" would be false.
+    await expectEmptyPage(
+      EMPTY_PAGE_TITLE,
+      `This page starts at position ${formatCount(
+        DATA_QUERY_DEFAULT_OFFSET + 1,
+      )} and holds no request groups; no total was reported for this query.`,
+    );
+    expect(screen.getByRole('button', { name: LOAD_MORE_NAME }).hasAttribute('disabled')).toBe(
+      false,
+    );
   });
 });
 

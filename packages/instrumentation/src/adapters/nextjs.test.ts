@@ -740,11 +740,14 @@ function forbiddenBackups(sessionDirectory: string): InstrumentationContext['bac
     sessionId: SESSION_ID,
     sessionDirectory,
     locate: () => refuse('locate'),
+    locateRecorded: () => refuse('locate the recorded path of'),
     put: () => refuse('write'),
     read: () => refuse('read'),
+    readRecorded: () => refuse('read the recorded path of'),
     has: () => refuse('query'),
     verify: () => refuse('verify'),
     remove: () => refuse('remove'),
+    removeRecorded: () => refuse('remove the recorded path of'),
     removeSessionDirectory: () => refuse('remove the directory of'),
   };
 }

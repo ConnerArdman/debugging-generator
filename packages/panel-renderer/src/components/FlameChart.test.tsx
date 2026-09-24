@@ -34,7 +34,8 @@
  * Alongside those, AAP 0.8.3 asks every component suite in this folder for the
  * three states of a query-backed view — loading, empty and error — and for the
  * click-to-source payload. Each state is driven through a stub `DataProvider`
- * that respectively never settles, resolves an empty trace and rejects; the
+ * that respectively never settles, resolves an empty trace — or `null`, the
+ * service's answer when no trace matched — and rejects; the
  * payload cases assert what the host actually receives, because every hop after
  * this one acts blind on the object it is handed (AAP 0.4.2, hop 1 of five).
  *
@@ -524,15 +525,36 @@ function resolvingProvider(tree: TraceTree): StubProvider {
  * A provider that answers a `trace` query with something that is not a trace.
  *
  * The response is well formed at the transport's level — it echoes the source
- * it was asked about, so the factory's own check passes — and wrong at the
- * payload's, which is the one failure mode `useQuery` cannot catch: it writes a
- * provider's answer through verbatim. The component's own shape guard is what
- * keeps that from throwing inside a render.
+ * it was asked about, so the factory's own check passes — and it carries the
+ * envelope of a trace: an own `traceId` and an array `roots`, which is all a
+ * host-side response check can confirm of a tree without walking it. What it
+ * lacks is `nodeCount`, a field this view dereferences before drawing, so only
+ * the component's own shape guard can catch it — and that guard is what keeps
+ * it from throwing inside a render.
  *
  * @returns The stub provider.
  */
 function wrongShapeProvider(): StubProvider {
-  return recordingProvider(() => Promise.resolve<DataQueryResponse>({ source: 'trace', data: [] }));
+  // Asserted through `unknown` because the case under test is precisely a
+  // payload that breaks the `TraceTree` type: the compiler refuses it here, but
+  // nothing refuses it in a provider that decoded it from a transport.
+  const partialTree = { traceId: TRACE_ID, roots: [] } as unknown as TraceTree;
+
+  return recordingProvider(() =>
+    Promise.resolve<DataQueryResponse>({ source: 'trace', data: partialTree }),
+  );
+}
+
+/**
+ * A provider that answers a `trace` query with `null` — the service's own
+ * answer when no trace in the capture matched the query.
+ *
+ * @returns The stub provider.
+ */
+function noTraceProvider(): StubProvider {
+  return recordingProvider(() =>
+    Promise.resolve<DataQueryResponse>({ source: 'trace', data: null }),
+  );
 }
 
 /**
@@ -1109,11 +1131,31 @@ describe('FlameChart states', () => {
 
     renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
 
-    // The hook writes a provider's answer through verbatim, so this shape would
-    // otherwise be read as a tree and throw inside a render.
+    // The payload carries a trace's envelope but not the fields this view reads,
+    // so it would otherwise be read as a tree and throw inside a render.
     const alert = await screen.findByRole('alert');
     expect(alert.textContent).toContain('needs regenerating');
     expect(screen.queryByRole('list')).toBeNull();
+    expect(stub.resolve).toHaveBeenCalledTimes(1);
+  });
+
+  it('renders its own empty message, not an error, when no trace matched the query', async () => {
+    const stub = noTraceProvider();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    // `null` is the service's answer for a capture holding no matching trace:
+    // an empty capture, drawn as the same absence an empty trace is.
+    const message = await screen.findByText(/no trace was captured/i);
+    expect(message.classList.contains('dg-empty-state__message')).toBe(true);
+    expect(message.closest('.dg-flame__empty')).not.toBeNull();
+
+    // Not the malformed-payload path: no alert, so no retry, and nothing drawn.
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.queryByRole('button', { name: RETRY_NAME })).toBeNull();
+    expect(screen.queryByRole('img')).toBeNull();
+    expect(screen.queryByRole('list')).toBeNull();
+    expect(screen.queryByRole('status')).toBeNull();
     expect(stub.resolve).toHaveBeenCalledTimes(1);
   });
 });

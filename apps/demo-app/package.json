@@ -15,7 +15,7 @@
     "premigrate": "pnpm run check:migration",
     "migrate": "prisma migrate deploy",
     "migrate:dev": "prisma migrate dev",
-    "check:migration": "DATABASE_URL= prisma migrate diff --from-empty --to-schema prisma/schema.prisma --script | diff --ignore-blank-lines - prisma/migrations/0001_init/migration.sql",
+    "check:migration": "DATABASE_URL= prisma migrate diff --from-empty --to-schema prisma/schema.prisma --script | tsx prisma/check-migrations.ts",
     "seed": "prisma db seed"
   },
   "dependencies": {

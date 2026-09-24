@@ -18,11 +18,25 @@
  * package publishes (`DATA_QUERY_DEFAULT_LIMIT`, `DATA_QUERY_DEFAULT_OFFSET`,
  * `DATA_QUERY_MAX_LIMIT`) — applied by whoever resolves the query, never here.
  *
- * Nothing below re-sorts, merges, concatenates, de-duplicates, truncates or
- * validates a page. A view that wants the next page raises `offset` on the query
- * it passes in and receives a new page; the previous one is replaced rather than
- * appended, because a renderer that stitched pages together would be showing
- * something no single response ever said.
+ * Nothing below re-sorts, merges, concatenates, de-duplicates, truncates,
+ * filters or otherwise transforms a page. A view that wants the next page raises
+ * `offset` on the query it passes in and receives a new page; the previous one
+ * is replaced rather than appended, because a renderer that stitched pages
+ * together would be showing something no single response ever said.
+ *
+ * ## The response is checked before it is drawn
+ *
+ * The one thing done to an answer before it is reported is a structural check,
+ * `checkDataQueryResponse` from `./DataProvider`, applied to **every**
+ * provider's answer, whether or not a library factory built that provider: the
+ * response must answer for the query's own `source`, its `data` must be the
+ * right kind of container for that source (with the identifying fields of each
+ * element or tree, and no more than one page of items), and its paging counters
+ * must be absent or non-negative whole numbers. An answer that fails is
+ * reported as `status: "error"` with the check's `PROTOCOL_INVALID_MESSAGE`
+ * error — retryable like any other failure — rather than as a success a
+ * component would read the wrong fields of. The check reads; it never alters
+ * what it reads, and a page that passes is reported exactly as it arrived.
  *
  * ## A failure is never dressed as data
  *
@@ -77,7 +91,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { DataQuery, DataQuerySource } from '@debuggen/panel-schema';
 import { DebuggenError } from '@debuggen/shared';
 
-import { isAddressableSessionId, useDataProvider, usePanelSessionId } from './DataProvider';
+import {
+  checkDataQueryResponse,
+  isAddressableSessionId,
+  useDataProvider,
+  usePanelSessionId,
+} from './DataProvider';
 import type { DataProvider, DataQueryResponse, DataResultFor } from './DataProvider';
 
 /*
@@ -223,16 +242,19 @@ function isUnknownArray(value: object): value is readonly unknown[] {
  * `"error"` can never arrive with rows attached (see {@link useQuery} for the
  * state design that guarantees it):
  *
- * - `"loading"` — nothing is settled yet. `data`, `error`, `total` and
- *   `nextOffset` are all `undefined`. This is also the status of a query that is
+ * - `"loading"` — nothing is settled yet. `data`, `error` and the four paging
+ *   counters are all `undefined`. This is also the status of a query that is
  *   disabled or absent; see the note on {@link UseQueryOptions.enabled}.
  * - `"success"` — `data` holds the page, exactly as the provider ordered and
  *   paged it, and `error` is `undefined`. An **empty** page is a success: the
  *   capture legitimately holds nothing for this query, which a component renders
- *   as its empty state.
+ *   as its empty state. So is a `null` trace or component tree, the wire's
+ *   "nothing matched".
  * - `"error"` — `error` holds the failure and `data` is `undefined`, so no
  *   component can draw a stale page beneath an error banner. The component
- *   renders its error state and offers {@link UseQueryResult.retry}.
+ *   renders its error state and offers {@link UseQueryResult.retry}. A provider
+ *   whose answer failed the response check (see the module documentation) lands
+ *   here too, with a `PROTOCOL_INVALID_MESSAGE` error.
  *
  * @typeParam T - The result type of the query's source.
  */
@@ -270,6 +292,22 @@ export interface UseQueryResult<T> {
    * reads it; nothing here computes it.
    */
   total: number | undefined;
+
+  /**
+   * The page size the provider reports the service applied — the query's own
+   * `limit` or the default filled in for an omitted one — or `undefined` unless
+   * the provider reported it.
+   *
+   * An echo for a footer that states the page size; a view never uses it to
+   * compute an offset (see {@link UseQueryResult.nextOffset}).
+   */
+  limit: number | undefined;
+
+  /**
+   * How many items the provider reports the service skipped before this page,
+   * or `undefined` unless the provider reported it.
+   */
+  offset: number | undefined;
 
   /**
    * The offset that would return the next page, or `undefined` when this page is
@@ -384,6 +422,12 @@ interface QuerySettlement<Data> {
 
   /** The provider's reported total, when it reported one. */
   readonly total: number | undefined;
+
+  /** The provider's reported applied page size, when it reported one. */
+  readonly limit: number | undefined;
+
+  /** The provider's reported applied offset, when it reported one. */
+  readonly offset: number | undefined;
 
   /** The provider's reported next offset, when it reported one. */
   readonly nextOffset: number | undefined;
@@ -508,7 +552,12 @@ function missingSessionError(source: DataQuerySource): DebuggenError {
  *    the query is disabled or a retry supersedes it — and the settlement of an
  *    abandoned request is discarded rather than written, which is what keeps a
  *    slow first answer from overwriting a fast second one.
- * 4. Reports the outcome as one of the three states of {@link UseQueryResult},
+ * 4. Checks an answer with `checkDataQueryResponse` before reporting it: an
+ *    answer for another source, a payload that is not this source's container,
+ *    or an unusable paging counter settles as an error stamped with the very
+ *    request it answered, so {@link UseQueryResult.retry} asks the provider the
+ *    same query again.
+ * 5. Reports the outcome as one of the three states of {@link UseQueryResult},
  *    with the provider's `null` end-of-data marker folded into `undefined`.
  *
  * ## States
@@ -521,7 +570,7 @@ function missingSessionError(source: DataQuerySource): DebuggenError {
  *
  * @example
  * ```ts
- * const { status, data, error, total, nextOffset, retry } = useQuery(
+ * const { status, data, error, total, limit, nextOffset, retry } = useQuery(
  *   { source: 'spans', sort: 'duration_desc', limit: pageSize, offset },
  * );
  * ```
@@ -602,6 +651,8 @@ export function useQuery<S extends DataQuerySource>(
         data: undefined,
         error: missingProviderError(pending.source),
         total: undefined,
+        limit: undefined,
+        offset: undefined,
         nextOffset: undefined,
       });
       return undefined;
@@ -622,6 +673,8 @@ export function useQuery<S extends DataQuerySource>(
         data: undefined,
         error: missingSessionError(pending.source),
         total: undefined,
+        limit: undefined,
+        offset: undefined,
         nextOffset: undefined,
       });
       return undefined;
@@ -648,7 +701,34 @@ export function useQuery<S extends DataQuerySource>(
           return;
         }
 
-        // Written through verbatim: no validation, no transformation, no
+        // Checked before anything reads it, whichever provider answered: the
+        // generic signature promised this source's response, but nothing at
+        // runtime made a hand-written provider keep that promise. An answer
+        // for another source, a payload that is not this source's container,
+        // or an unusable counter is a failure, never a success a component
+        // would draw the wrong evidence from or throw on. It settles as an
+        // error stamped with this very request — provider, session, key and
+        // attempt — so the retry the error state offers re-issues the same
+        // query, and a later correct answer supersedes it like any other.
+        const problem = checkDataQueryResponse(pending, response);
+        if (problem !== undefined) {
+          setSettlement({
+            provider,
+            sessionId,
+            key,
+            attempt,
+            status: 'error',
+            data: undefined,
+            error: problem,
+            total: undefined,
+            limit: undefined,
+            offset: undefined,
+            nextOffset: undefined,
+          });
+          return;
+        }
+
+        // A checked answer is written through verbatim: no transformation, no
         // re-ordering, no merging with a previous page (AAP 0.4.2). An empty
         // page is a success, and the component's empty state is how it shows.
         // The one normalisation is of spelling, not of meaning: the wire's
@@ -663,6 +743,8 @@ export function useQuery<S extends DataQuerySource>(
           data: response.data,
           error: undefined,
           total: response.total,
+          limit: response.limit,
+          offset: response.offset,
           nextOffset: response.nextOffset ?? undefined,
         });
       },
@@ -687,6 +769,8 @@ export function useQuery<S extends DataQuerySource>(
           data: undefined,
           error: DebuggenError.from(cause),
           total: undefined,
+          limit: undefined,
+          offset: undefined,
           nextOffset: undefined,
         });
       },
@@ -722,6 +806,8 @@ export function useQuery<S extends DataQuerySource>(
       data: settled?.data,
       error: settled?.error,
       total: settled?.total,
+      limit: settled?.limit,
+      offset: settled?.offset,
       nextOffset: settled?.nextOffset,
       retry,
     }),

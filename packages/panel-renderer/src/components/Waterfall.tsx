@@ -28,33 +28,70 @@
  * arrived, or its parent links were malformed — is a different statement from a
  * parent that is merely off this page, and it is drawn flagged rather than as an
  * ordinary top-level row: a "Re-attached" badge, the `dg-is-orphan` state, and a
- * sentence in its description naming the correlator's reason and the parent that
- * could not be resolved (AAP 0.4.2: orphans are evidence, never dropped and never
- * disguised). On the `trace` path the verdict is the tree node's own; on the flat
- * path it is the flag the service persisted on the record, honoured only while
- * the parent the record names is absent from what is loaded, because a parent
- * that resolves proves the flag stale. A call lifted to the top level through an
- * undrawn re-attached call carries that call's verdict, stated as inherited.
+ * sentence in its description naming the parent that could not be resolved
+ * (AAP 0.4.2: orphans are evidence, never dropped and never disguised). The
+ * verdict is the flag the service persisted on the flat record, honoured only
+ * while the parent the record names is absent from what is loaded, because a
+ * parent that resolves proves the flag stale. A call lifted to the top level
+ * through an undrawn re-attached call carries that call's verdict, stated as
+ * inherited. The grouped `requests` result carries no correlation verdict, so
+ * none of its rows is ever flagged.
  *
  * ## The sources it draws
  *
- * The catalog entry for this node type accepts `spans` and `requests`
- * (`PANEL_NODE_CATALOG.waterfall.sources`), and validation rejects a node whose
- * query names anything else before this component is ever mounted. Both are
- * implemented here, plus the correlated `trace` payload — which costs a few
- * lines, cannot arrive through a validated specification, and means a host that
- * hands one over still renders a correct waterfall instead of an empty box:
+ * The authority is the node catalog, not this file: the catalog entry for this
+ * node type (`catalogEntryFor('waterfall')`, held in
+ * {@link WATERFALL_CATALOG_ENTRY}) accepts `spans` and `requests`, and states
+ * that `trace` is deliberately absent — the whole tree is the timeline's and
+ * the hierarchical view's shape. Validation rejects a node whose query names
+ * anything else before this component is mounted, and this component checks
+ * the same entry again before it builds a query, so a host that renders an
+ * unvalidated node naming `events`, `trace` or any other source gets a stated
+ * failure and issues NO query, rather than a branch the specification could
+ * never legally select:
  *
- *   - `spans` / `events` — the flat records and their parent links. The primary
- *     path: a page of records is filtered to the kinds this view draws, nested by
+ *   - `spans` — the flat records and their parent links. The primary path: a
+ *     page of records is filtered to the kinds this view draws, nested by
  *     ancestry, and ordered by start time.
  *   - `requests` — the grouped network result. Each group becomes one row; a
  *     group with more than one occurrence becomes a parent row spanning the
  *     occurrences, expandable into them. Grouping is **not** recomputed here:
  *     duplicate detection already happened in the service, on the pre-redaction
  *     request key (AAP 0.5.2), and this view only draws what it grouped.
- *   - `trace` — the ordered tree, walked directly, with calls of other kinds
- *     collapsed through so their included descendants keep their place.
+ *
+ * ## Paging a source it filters
+ *
+ * The kind filter is applied HERE, to the pages as they arrive, and the node's
+ * query goes to the service exactly as authored. That is deliberate: the flat
+ * path needs the records it does not draw — the function and route-handler
+ * spans between a server request and the statement it ran — to nest the
+ * statement under the request, so asking the service for drawable kinds only
+ * would cut the very chain the view exists to show, and rewriting the authored
+ * filter would make the query this view reports differ from the one the
+ * specification states.
+ *
+ * The cost is that a page can hold nothing drawable while a later one holds
+ * the calls, and such a page is not "nothing was captured". While the service
+ * reports another page — or the next page is in flight, or failed, behind pages
+ * already searched — the view says how many records it has searched and that
+ * more remain, and keeps "Load more" (or the failed page's retry) in reach.
+ * Only a result searched to its end states that no call was captured. A node
+ * whose own kind filter shares no kind with the ones drawn here issues no query
+ * at all, because no page could ever hold a row.
+ *
+ * ## Calls still in flight
+ *
+ * A request that had started and not settled when the capture ended arrives as
+ * an in-flight snapshot: a `requests` occurrence marked `pending` (its group
+ * counting it in `pendingCount`), or a flat `fetch`/`xhr` record carrying the
+ * `inFlight` marker. Its duration is the time it had been outstanding when
+ * observed — a lower bound, not a measurement of a completed call — and no
+ * response had arrived. So it is drawn as exactly that: a "Pending" badge, the
+ * duration printed and described as "at least" that long, and no status code,
+ * no failure and no transfer figure claimed for a response that never came.
+ * A group row holding such a call is flagged the same way, with the count when
+ * more than one was in flight, and judges its own outcome over its settled
+ * calls only — the rules the request aggregate itself applies.
  *
  * ## Privacy: render what arrived, and nothing more (AAP 0.5.2)
  *
@@ -117,8 +154,9 @@
  * prefers where the duration is printed as text, and the time axis is a
  * `role="img"` graphic whose label states the window it spans. A row's states
  * are never colour alone: a failed call shows its failing status code or an
- * "Error" badge beside the `dg-is-error` edge, and a re-attached call a
- * "Re-attached" badge beside the `dg-is-orphan` edge.
+ * "Error" badge beside the `dg-is-error` edge, a re-attached call a
+ * "Re-attached" badge beside the `dg-is-orphan` edge, and a call still in
+ * flight a "Pending" badge and the words "at least" before its duration.
  *
  * The tree is ONE composite widget, so it is ONE stop in the page's Tab order —
  * a roving tab index: exactly one visible row carries `tabIndex={0}` and every
@@ -156,25 +194,26 @@
  */
 
 import type { DataQuery, WaterfallNode } from '@debuggen/panel-schema';
-import { DATA_QUERY_DEFAULT_OFFSET } from '@debuggen/panel-schema';
+import {
+  DATA_QUERY_DEFAULT_LIMIT,
+  DATA_QUERY_DEFAULT_OFFSET,
+  catalogEntryFor,
+} from '@debuggen/panel-schema';
 import type { SourceLocation } from '@debuggen/shared';
 import { clampNonNegative, roundMs } from '@debuggen/shared';
 import type {
   DB_QUERY_ATTRIBUTE_KEYS,
   FETCH_ATTRIBUTE_KEYS,
   HTTP_SERVER_ATTRIBUTE_KEYS,
-  OrphanReason,
   RequestGroup,
   RequestOccurrence,
   TelemetryEvent,
   TelemetryKind,
   TelemetryStatus,
   TelemetryTier,
-  TraceNode,
-  TraceTree,
 } from '@debuggen/telemetry';
 import clsx from 'clsx';
-import { ChevronDown, ChevronRight } from 'lucide-react';
+import { ChevronDown, ChevronRight, Hourglass } from 'lucide-react';
 import { useCallback, useId, useMemo, useRef, useState } from 'react';
 import type {
   CSSProperties,
@@ -186,6 +225,7 @@ import type {
 } from 'react';
 
 import { Stack } from '../layout/Stack';
+import { usePanelSessionId } from '../host/DataProvider';
 import { usePanelActions } from '../host/PanelActions';
 import { useQuery } from '../host/useQuery';
 import type { UseQueryResult } from '../host/useQuery';
@@ -255,6 +295,14 @@ const HTTP_STATUS_CODE_KEY: FetchAttributeKey = 'http.status_code';
 
 /** Bytes transferred, where the runtime could observe them. */
 const TRANSFER_SIZE_KEY: FetchAttributeKey = 'transferSize';
+
+/**
+ * The in-flight marker: written, only as the boolean `true`, on the one
+ * snapshot the page's request patch emits for a request that had started and
+ * not settled when the capture ended. The same key `xhr` records carry; the
+ * telemetry package's request aggregate reads it — and only it — as *pending*.
+ */
+const IN_FLIGHT_KEY: FetchAttributeKey = 'inFlight';
 
 /** The matched server route, which labels a server span better than its name. */
 const HTTP_ROUTE_KEY: HttpServerAttributeKey = 'http.route';
@@ -336,32 +384,73 @@ const LABEL_PREVIEW_LENGTH = 120;
 const TOOLTIP_PREVIEW_LENGTH = 400;
 
 /* ---------------------------------------------------------------------------
+ * The catalog entry, and everything taken from it
+ * ------------------------------------------------------------------------- */
+
+/**
+ * `PANEL_NODE_CATALOG.waterfall` — the single registry entry for the node type
+ * this component renders (AAP 0.6.2: "the renderer depends on the schema, never
+ * the reverse").
+ *
+ * Read once at module scope because it is frozen data. The sources a waterfall
+ * node may query (see {@link narrowSpanListQuery}) and the record kinds it
+ * draws (see {@link WATERFALL_KINDS}) both come from here rather than from a
+ * list retyped in this file, so changing the catalog changes this component
+ * instead of leaving it reading a source, or dropping a kind, that the schema
+ * says otherwise about. `@debuggen/panel-schema` is a runtime dependency of
+ * this package; `@debuggen/telemetry` is not, and stays a types-only import
+ * here.
+ */
+const WATERFALL_CATALOG_ENTRY = catalogEntryFor('waterfall');
+
+/**
+ * Whether the catalog entry permits a waterfall node to read `source`.
+ *
+ * @param source The source named by the node's query.
+ * @returns `true` while the entry's `sources` list names it.
+ */
+function isCataloguedSource(source: DataQuery['source']): boolean {
+  return WATERFALL_CATALOG_ENTRY.sources.includes(source);
+}
+
+/* ---------------------------------------------------------------------------
  * The kinds this view draws
  * ------------------------------------------------------------------------- */
 
 /**
- * The record kinds a waterfall draws: the two browser-side request kinds, the
- * server request, the database statement and the outgoing server-side call.
+ * The record kinds a waterfall draws — today the two browser-side request
+ * kinds, the server request, the database statement and the outgoing
+ * server-side call.
  *
- * Declared here rather than imported, because the telemetry package's
- * `WATERFALL_KINDS` is a runtime value and this file imports that package for
- * types only. It is deliberately typed as a set of {@link TelemetryKind} and
- * populated with literals: a kind renamed or removed upstream becomes a compile
- * error here, which is the opposite of what a `string[]` would do — silently
- * match nothing and leave an empty waterfall with no explanation.
+ * Taken from the catalog entry's `telemetryKinds`, which is the single
+ * registry of what this node type draws: the entry itself takes the list from
+ * `@debuggen/telemetry`'s own `WATERFALL_KINDS` kind group, and no second
+ * spelling of it exists here. A kind added there is drawn here automatically,
+ * and a kind withdrawn there stops being drawn, instead of this view silently
+ * disagreeing with what validation accepts for a `filter.kinds` narrowing.
+ * The telemetry package itself stays a types-only import in this file: the
+ * list arrives through `@debuggen/panel-schema`, which is a runtime dependency.
+ *
+ * Membership of this set is the ONLY thing that decides whether a record is
+ * drawn. The two sets below it are presentation subsets that decide how a
+ * drawn row is labelled and what it is expected to report, never whether it
+ * appears.
  */
-const WATERFALL_KINDS: ReadonlySet<TelemetryKind> = new Set<TelemetryKind>([
-  'fetch',
-  'xhr',
-  'http.server',
-  'db.query',
-  'http.client',
-]);
+const WATERFALL_KINDS: ReadonlySet<TelemetryKind> = new Set<TelemetryKind>(
+  WATERFALL_CATALOG_ENTRY.telemetryKinds,
+);
 
 /**
- * The kinds whose label is a URL or a route rather than a statement. Used only
- * to choose which field labels a row; membership of {@link WATERFALL_KINDS} is
- * what decides whether a record is drawn at all.
+ * PRESENTATION ONLY: the kinds whose label is a URL or a route rather than a
+ * statement or a record name — the calls that are requests.
+ *
+ * Used only to choose which field labels a drawn row (see {@link rowLabel}),
+ * where the kind check keeps a stray `url` attribute on a non-request record
+ * from hijacking its label. It decides nothing about whether a record is drawn:
+ * that is {@link WATERFALL_KINDS} alone, so a kind the catalog adds later is
+ * drawn at once and labelled by its own name until it is listed here. Typed as
+ * a set of {@link TelemetryKind} and populated with literals on purpose, so a
+ * kind renamed or removed upstream is a compile error in this file.
  */
 const REQUEST_LIKE_KINDS: ReadonlySet<TelemetryKind> = new Set<TelemetryKind>([
   'fetch',
@@ -371,10 +460,17 @@ const REQUEST_LIKE_KINDS: ReadonlySet<TelemetryKind> = new Set<TelemetryKind>([
 ]);
 
 /**
- * The kinds for which a transferred-byte figure is meaningful, so that its
- * absence can be reported as unavailable rather than passed over. A server-side
- * span has no resource timing behind it, so the figure is not expected there and
- * is not claimed to be missing either (AAP 0.6.6).
+ * PRESENTATION ONLY: the kinds for which a transferred-byte figure is
+ * meaningful, so that its absence can be reported as unavailable rather than
+ * passed over. A server-side span has no resource timing behind it, so the
+ * figure is not expected there and is not claimed to be missing either
+ * (AAP 0.6.6).
+ *
+ * The same two browser request kinds are the ones whose producer — the page's
+ * patched `fetch` and `XMLHttpRequest` — writes the in-flight marker, so
+ * {@link isInFlightRecord} reads the marker on these kinds only. Like
+ * {@link REQUEST_LIKE_KINDS}, this set decides only what a drawn row states,
+ * never whether it is drawn.
  */
 const TRANSFER_BEARING_KINDS: ReadonlySet<TelemetryKind> = new Set<TelemetryKind>(['fetch', 'xhr']);
 
@@ -383,8 +479,10 @@ const TRANSFER_BEARING_KINDS: ReadonlySet<TelemetryKind> = new Set<TelemetryKind
  * draws and what the node's own query asked for.
  *
  * The intersection is never widened: a specification that filtered to kinds this
- * view cannot draw yields an empty set, and an empty set yields the empty state
- * — which is the honest outcome, not a silently broadened query.
+ * view cannot draw yields an empty set, and an empty set means no query is
+ * issued at all and the view states that the node's kind filter selects no kind
+ * it draws — which is the honest outcome, not a silently broadened query, and
+ * not a "Load more" through pages that could never hold a row.
  */
 function resolveIncludedKinds(
   filterKinds: readonly TelemetryKind[] | undefined,
@@ -420,14 +518,12 @@ function resolveIncludedKinds(
  * resolved. Real captured work with real timings, drawn and flagged rather than
  * dropped, so the structure around it is never mistaken for the shape the
  * application had (AAP 0.4.2).
+ *
+ * The provenance is the flag the service persisted on a flat record, which
+ * records only THAT the parent was unresolvable — never which of the
+ * correlator's cases applied — so no reason is carried or claimed here.
  */
 interface WaterfallOrphan {
-  /**
-   * The correlator's reason, when the payload carries one. A tree node does; a
-   * flag persisted on a flat record records only that the parent was
-   * unresolvable, never which way, so it is `undefined` there.
-   */
-  readonly reason: OrphanReason | undefined;
   /** The parent id that could not be resolved, when one was recorded. */
   readonly missingParentSpanId: string | undefined;
   /**
@@ -478,6 +574,19 @@ interface WaterfallRow {
   readonly expectsTransfer: boolean;
   /** How many grouped occurrences this row stands for, for a grouped payload. */
   readonly occurrenceCount: number | undefined;
+  /**
+   * Set when this call — or, on a group row, at least one of its calls — was
+   * still in flight when the capture ended. Its duration is then the time it
+   * had been outstanding when observed, a LOWER BOUND on how long it took, and
+   * a pending call has no response: no status code, no transfer figure, and no
+   * outcome, so it is never drawn as a failure either.
+   */
+  readonly pending: boolean;
+  /**
+   * How many calls of a group row were still in flight, when that is known and
+   * above zero; `undefined` on every single-call row and on a group with none.
+   */
+  readonly pendingCount: number | undefined;
   /** Epoch milliseconds, kept so tooltips can state an offset from the window. */
   readonly startTime: number;
   /** Milliseconds from the window's start to this call's start. */
@@ -657,7 +766,7 @@ function compareRows(left: WaterfallRow, right: WaterfallRow): number {
 }
 
 /* ---------------------------------------------------------------------------
- * Building the model from a flat page of records (`spans` / `events`)
+ * Building the model from a flat page of records (`spans`)
  * ------------------------------------------------------------------------- */
 
 /** Mutable counters threaded through a build, so a cut is always reported. */
@@ -749,13 +858,37 @@ function persistedOrphan(
     return undefined;
   }
   return {
-    reason: undefined,
     missingParentSpanId: stringAttribute(attributes, ORPHANED_PARENT_SPAN_ID_KEY),
     viaAncestor,
   };
 }
 
-/** One row from one record, with its children already materialised. */
+/**
+ * Whether a flat record is an in-flight snapshot: a browser request whose
+ * {@link IN_FLIGHT_KEY} marker is the boolean `true`.
+ *
+ * Strictly the boolean, exactly as the request aggregate reads it: the string
+ * `"true"`, a `1` and `false` all read as settled, and a missing status code
+ * never makes a request pending — a network error, an abort and a refused
+ * cross-origin response all settle without one. The kind check keeps a stray
+ * marker on a record the request patch never writes it on from turning that
+ * record into a request that has not answered.
+ */
+function isInFlightRecord(event: TelemetryEvent): boolean {
+  const attributes: AttributeBag = event.attributes;
+  return TRANSFER_BEARING_KINDS.has(event.kind) && attributes[IN_FLIGHT_KEY] === true;
+}
+
+/**
+ * One row from one record, with its children already materialised.
+ *
+ * An in-flight snapshot ({@link isInFlightRecord}) is drawn as the request it
+ * is — started, and not yet answered: its status code and transfer size are
+ * not read even when present, because no response had arrived for them to
+ * describe, and its outcome is `unset`, because nothing had failed or
+ * succeeded when it was observed. The same rules the request aggregate applies
+ * to a pending occurrence, so the two sources draw one request the same way.
+ */
 function rowFromEvent(
   event: TelemetryEvent,
   viewStart: number,
@@ -765,6 +898,7 @@ function rowFromEvent(
 ): WaterfallRow {
   const attributes: AttributeBag = event.attributes;
   const isQuery = event.kind === 'db.query';
+  const pending = isInFlightRecord(event);
   return {
     eventId: event.id,
     spanId: event.spanId,
@@ -773,16 +907,18 @@ function rowFromEvent(
     name: event.name,
     kind: event.kind,
     tier: event.tier,
-    status: event.status,
+    status: pending ? 'unset' : event.status,
     method: stringAttribute(attributes, HTTP_METHOD_KEY),
     url: stringAttribute(attributes, URL_KEY),
     route: stringAttribute(attributes, HTTP_ROUTE_KEY),
-    statusCode: numberAttribute(attributes, HTTP_STATUS_CODE_KEY),
+    statusCode: pending ? undefined : numberAttribute(attributes, HTTP_STATUS_CODE_KEY),
     statement: isQuery ? stringAttribute(attributes, DB_STATEMENT_KEY) : undefined,
     rowCount: isQuery ? numberAttribute(attributes, DB_ROW_COUNT_KEY) : undefined,
-    transferredBytes: numberAttribute(attributes, TRANSFER_SIZE_KEY),
-    expectsTransfer: TRANSFER_BEARING_KINDS.has(event.kind),
+    transferredBytes: pending ? undefined : numberAttribute(attributes, TRANSFER_SIZE_KEY),
+    expectsTransfer: !pending && TRANSFER_BEARING_KINDS.has(event.kind),
     occurrenceCount: undefined,
+    pending,
+    pendingCount: undefined,
     startTime: asFiniteNumber(event.startTime, viewStart),
     offsetMs: offsetFrom(viewStart, event.startTime),
     durationMs: drawableDuration(event.duration),
@@ -874,7 +1010,8 @@ function buildFromEvents(
     if (ancestor === undefined) {
       roots.push(event);
       // The record's own flag wins; otherwise a flag on the undrawn call it was
-      // lifted through is inherited, as the tree path does for a collapsed node.
+      // lifted through is inherited: the row sits at the top level only because
+      // that enclosing call was re-attached, and must not launder its verdict.
       const orphan =
         persistedOrphan(event, bySpanId, false) ??
         (liftedThrough === undefined ? undefined : persistedOrphan(liftedThrough, bySpanId, true));
@@ -913,129 +1050,6 @@ function buildFromEvents(
 }
 
 /* ---------------------------------------------------------------------------
- * Building the model from the correlated tree (`trace`)
- *
- * Not a source the catalog accepts for this node type, so a validated
- * specification cannot reach this path. It exists because a host that hands a
- * tree over should see a correct waterfall rather than an empty box, and because
- * the tree carries two things a flat page does not: the interaction's own start,
- * which is the origin every offset in the AAP's example is measured from, and a
- * resolved lineage record per node.
- * ------------------------------------------------------------------------- */
-
-/**
- * The orphan provenance the correlator recorded on a tree node, or `undefined`
- * for a node it placed where its record said it belonged.
- *
- * The node's own `orphaned` is authoritative on this path: it is the verdict of
- * the correlation that built this very tree, so a flag persisted in the
- * record's attribute bag — an earlier pass's verdict — is never consulted here.
- */
-function traceOrphan(node: TraceNode, viaAncestor: boolean): WaterfallOrphan | undefined {
-  if (!node.orphaned) {
-    return undefined;
-  }
-  return {
-    reason: node.orphanReason,
-    missingParentSpanId: node.missingParentSpanId,
-    viaAncestor,
-  };
-}
-
-/**
- * One row from one tree node, with its children already materialised.
- *
- * @param inherited The provenance of an undrawn orphaned node this one was
- * lifted through, which the node's own verdict overrides.
- */
-function rowFromTraceNode(
-  node: TraceNode,
-  viewStart: number,
-  children: readonly WaterfallRow[],
-  childrenTruncated: boolean,
-  inherited: WaterfallOrphan | undefined,
-): WaterfallRow {
-  const orphan = traceOrphan(node, false) ?? inherited;
-  const base = rowFromEvent(node.event, viewStart, children, childrenTruncated, orphan);
-  const lineage = node.lineage;
-  if (lineage === undefined) {
-    return base;
-  }
-  return {
-    ...base,
-    lineageAmbiguous: lineage.ambiguous,
-    lineageCandidates: lineage.candidateSpanIds,
-  };
-}
-
-/**
- * Collect the drawable rows of a level of the tree.
- *
- * A node of a kind this view does not draw is *collapsed through*: its drawable
- * descendants are lifted to the level it occupied, at the same depth, so nothing
- * disappears because an intermediate call was of another kind.
- *
- * Collapsing through an ORPHANED node must not launder its verdict: the rows it
- * lifts to its level carry its provenance (`viaAncestor`), because they sit
- * there only because it was re-attached. The provenance stops at the first
- * drawn row — rows nested under a drawn row are placed correctly relative to
- * it — and a lifted node's own verdict overrides the inherited one.
- *
- * @param inherited The provenance of the nearest undrawn orphaned node this
- * level was lifted through, or `undefined`.
- */
-function collectTraceRows(
-  nodes: readonly TraceNode[],
-  depth: number,
-  kinds: ReadonlySet<TelemetryKind>,
-  viewStart: number,
-  state: BuildState,
-  inherited: WaterfallOrphan | undefined,
-): readonly WaterfallRow[] {
-  const rows: WaterfallRow[] = [];
-  for (const node of nodes) {
-    if (!kinds.has(node.event.kind)) {
-      const lifted = traceOrphan(node, true) ?? inherited;
-      rows.push(...collectTraceRows(node.children, depth, kinds, viewStart, state, lifted));
-      continue;
-    }
-    state.rowCount += 1;
-    if (node.children.length === 0) {
-      rows.push(rowFromTraceNode(node, viewStart, EMPTY_ROWS, false, inherited));
-      continue;
-    }
-    if (depth + 1 >= MAX_ROW_DEPTH) {
-      state.truncated = true;
-      rows.push(rowFromTraceNode(node, viewStart, EMPTY_ROWS, true, inherited));
-      continue;
-    }
-    const children = collectTraceRows(node.children, depth + 1, kinds, viewStart, state, undefined);
-    rows.push(rowFromTraceNode(node, viewStart, children, false, inherited));
-  }
-  rows.sort(compareRows);
-  return rows;
-}
-
-function buildFromTrace(tree: TraceTree, kinds: ReadonlySet<TelemetryKind>): WaterfallModel {
-  const viewStart = asFiniteNumber(tree.startTime, 0);
-  const viewEnd = Math.max(asFiniteNumber(tree.endTime, viewStart), viewStart);
-  const state: BuildState = { rowCount: 0, truncated: tree.truncated };
-  const rows = collectTraceRows(tree.roots, 0, kinds, viewStart, state, undefined);
-  if (rows.length === 0) {
-    return EMPTY_MODEL;
-  }
-  return {
-    rows,
-    viewStart,
-    viewEnd,
-    windowMs: clampNonNegative(roundMs(viewEnd - viewStart)),
-    rowCount: state.rowCount,
-    topLevelCount: rows.length,
-    truncated: state.truncated,
-  };
-}
-
-/* ---------------------------------------------------------------------------
  * Building the model from grouped network calls (`requests`)
  *
  * The grouped result keeps each occurrence's own start and duration, so the same
@@ -1046,12 +1060,22 @@ function buildFromTrace(tree: TraceTree, kinds: ReadonlySet<TelemetryKind>): Wat
  * wrong (AAP 0.5.2).
  * ------------------------------------------------------------------------- */
 
-/** One row from one occurrence, labelled from the group it belongs to. */
+/**
+ * One row from one occurrence, labelled from the group it belongs to.
+ *
+ * A pending occurrence (`RequestOccurrence.pending`) is drawn as the request
+ * it is — started, and not yet answered. The aggregate already publishes it
+ * without a status code or a transfer figure, and neither is read here even if
+ * one were present; its outcome is `unset`, because the aggregate never counts
+ * a pending occurrence as a failure, whatever span status its producer
+ * reported.
+ */
 function rowFromOccurrence(
   group: RequestGroup,
   occurrence: RequestOccurrence,
   viewStart: number,
 ): WaterfallRow {
+  const pending = occurrence.pending === true;
   return {
     eventId: occurrence.eventId,
     spanId: occurrence.spanId,
@@ -1060,16 +1084,18 @@ function rowFromOccurrence(
     name: group.path,
     kind: occurrence.kind,
     tier: occurrence.tier,
-    status: occurrence.status,
+    status: pending ? 'unset' : occurrence.status,
     method: group.method,
     url: group.url,
     route: undefined,
-    statusCode: occurrence.statusCode,
+    statusCode: pending ? undefined : occurrence.statusCode,
     statement: undefined,
     rowCount: undefined,
-    transferredBytes: occurrence.transferredBytes,
-    expectsTransfer: TRANSFER_BEARING_KINDS.has(occurrence.kind),
+    transferredBytes: pending ? undefined : occurrence.transferredBytes,
+    expectsTransfer: !pending && TRANSFER_BEARING_KINDS.has(occurrence.kind),
     occurrenceCount: undefined,
+    pending,
+    pendingCount: undefined,
     startTime: asFiniteNumber(occurrence.startTime, viewStart),
     offsetMs: offsetFrom(viewStart, occurrence.startTime),
     durationMs: drawableDuration(occurrence.durationMs),
@@ -1084,12 +1110,39 @@ function rowFromOccurrence(
 }
 
 /**
+ * How many calls of a group were still in flight when the capture ended, or
+ * `undefined` when none was.
+ *
+ * The service's own `pendingCount` wins when it is a positive whole number: it
+ * counts every occurrence, including any the group's occurrence list was
+ * truncated past. Absent — which is how the aggregate says "none" — or
+ * unusable, the pending occurrences drawn here are counted instead, so a group
+ * never loses the flag of a call it visibly holds.
+ */
+function groupPendingCount(
+  group: RequestGroup,
+  occurrences: readonly RequestOccurrence[],
+): number | undefined {
+  const reported = group.pendingCount;
+  if (reported !== undefined && Number.isInteger(reported) && reported > 0) {
+    return reported;
+  }
+  const counted = occurrences.filter((occurrence) => occurrence.pending === true).length;
+  return counted > 0 ? counted : undefined;
+}
+
+/**
  * The row for a group that holds more than one occurrence.
  *
  * Its bar spans from the first occurrence's start to the last one's end, and its
  * duration cell prints that same extent — bar length and printed duration are
  * the same measured quantity, never two different ones — while the per-call
  * timings stay exact on the occurrence rows nested beneath it.
+ *
+ * A group holding a call that was still in flight is flagged pending, and its
+ * extent is then a lower bound like that call's own duration. Its outcome is
+ * judged over the SETTLED occurrences only, as the aggregate judges
+ * `errorCount`: a call that had not answered neither failed nor succeeded.
  */
 function rowFromGroup(
   group: RequestGroup,
@@ -1104,6 +1157,9 @@ function rowFromGroup(
     const start = asFiniteNumber(occurrence.startTime, viewStart);
     first = Math.min(first, start);
     last = Math.max(last, start + drawableDuration(occurrence.durationMs));
+    if (occurrence.pending === true) {
+      continue;
+    }
     if (occurrence.status === 'error') {
       worstStatus = 'error';
     } else if (worstStatus === 'unset' && occurrence.status === 'ok') {
@@ -1113,6 +1169,7 @@ function rowFromGroup(
   const start = Number.isFinite(first) ? first : viewStart;
   const end = Number.isFinite(last) ? Math.max(last, start) : start;
   const [firstOccurrence] = occurrences;
+  const pendingCount = groupPendingCount(group, occurrences);
   return {
     eventId: firstOccurrence === undefined ? group.id : firstOccurrence.eventId,
     spanId: firstOccurrence?.spanId,
@@ -1129,8 +1186,14 @@ function rowFromGroup(
     statement: undefined,
     rowCount: undefined,
     transferredBytes: group.transferredBytes,
-    expectsTransfer: occurrences.some((occurrence) => TRANSFER_BEARING_KINDS.has(occurrence.kind)),
+    // Only a settled call could have reported a transfer figure, so only one
+    // makes the figure's absence worth stating.
+    expectsTransfer: occurrences.some(
+      (occurrence) => occurrence.pending !== true && TRANSFER_BEARING_KINDS.has(occurrence.kind),
+    ),
     occurrenceCount: occurrences.length,
+    pending: pendingCount !== undefined,
+    pendingCount,
     startTime: start,
     offsetMs: offsetFrom(viewStart, start),
     durationMs: clampNonNegative(roundMs(end - start)),
@@ -1213,56 +1276,94 @@ function buildFromRequests(
  * sources can answer with structurally similar data, and a branch that sniffed
  * it would draw the wrong thing without ever failing.
  *
- * Three hooks are called unconditionally, and at most one of them is handed a
- * query: the other two receive `undefined`, which `useQuery` treats as "nothing
- * to resolve" — no request is made and no provider is touched.
+ * Two hooks are called unconditionally, and at most one of them is handed a
+ * query: the other receives `undefined`, which `useQuery` treats as "nothing to
+ * resolve" — no request is made and no provider is touched. A node naming a
+ * source the catalog entry does not list hands neither of them one, so the
+ * unsupported-source state is the whole answer and the provider is never asked.
+ *
+ * Each narrowing makes two checks, deliberately, as `./SpanTable` does: the
+ * catalog entry decides which sources the node type is permitted to read, and
+ * the literal comparison is what lets TypeScript see which result shape the
+ * query resolves to (`DataResultFor<'spans'>`, `DataResultFor<'requests'>`).
+ * The two agree today and the catalog is the one a reviewer should change; the
+ * literals exist because a type cannot be narrowed by a runtime array lookup.
  * ------------------------------------------------------------------------- */
 
-type SpanListSource = 'spans' | 'events';
+type SpanListSource = 'spans';
 type SpanListQuery = DataQuery & { source: SpanListSource };
 type RequestsQuery = DataQuery & { source: 'requests' };
-type TraceQuery = DataQuery & { source: 'trace' };
 
 /** The flat-record query, at the offset this render is paged to. */
 function narrowSpanListQuery(query: DataQuery, offset: number): SpanListQuery | undefined {
   const source = query.source;
-  if (source !== 'spans' && source !== 'events') {
+  if (!isCataloguedSource(source)) {
     return undefined;
   }
-  return { ...query, source, offset };
+  return source === 'spans' ? { ...query, source, offset } : undefined;
 }
 
 /** The grouped-network query, at the offset this render is paged to. */
 function narrowRequestsQuery(query: DataQuery, offset: number): RequestsQuery | undefined {
   const source = query.source;
+  if (!isCataloguedSource(source)) {
+    return undefined;
+  }
   return source === 'requests' ? { ...query, source, offset } : undefined;
 }
 
 /**
- * The correlated-tree query. Not paged: the tree is a scalar result, so it
- * carries no total and no next offset, and it reports its own truncation
- * instead.
+ * The offset the node's first page starts at: the one its query AUTHORED, or
+ * the schema's default base when it authored none.
+ *
+ * @param query The node's query as authored.
+ * @returns The offset of the first page of the node's page sequence.
  */
-function narrowTraceQuery(query: DataQuery): TraceQuery | undefined {
-  const source = query.source;
-  return source === 'trace' ? { ...query, source } : undefined;
+function authoredBaseOffset(query: DataQuery): number {
+  return query.offset ?? DATA_QUERY_DEFAULT_OFFSET;
 }
 
 /**
- * A stable identity for everything about the query *except* its offset.
+ * A stable identity for the page sequence the accumulated pages belong to: the
+ * session they were read from, and everything about the node's query as it was
+ * AUTHORED — the offset it starts from included.
  *
- * Paging changes the offset deliberately, so the offset must not be part of the
- * identity that decides whether the accumulated pages still belong to the query
- * on screen. Written field by field rather than with a generic serializer so
- * that a new query field cannot silently join the identity — or silently stay
- * out of it — when the schema grows.
+ * Two offsets are in play, and only one of them is identity:
+ *
+ *   - The **authored** base offset ({@link authoredBaseOffset}) says which
+ *     slice of the result this node draws. A node whose query is otherwise
+ *     identical but starts elsewhere is a different sequence, and must neither
+ *     inherit the pages another slice accumulated nor carry on from where that
+ *     slice had paged to.
+ *   - The **advanced** offset — the `nextOffset` "Load more" copied into
+ *     {@link PagingState.offset} — is how far the sequence has got. It stays
+ *     OUT of the identity, or every page turn would discard the very pages it
+ *     was meant to append to.
+ *
+ * The session is identity too. The same query addressed to another session is
+ * another capture's evidence, and `useQuery` re-issues it on a session change;
+ * without the session here, the re-issued first page would be drawn beneath
+ * pages the previous session answered, at an offset that session had advanced
+ * to.
+ *
+ * An absent authored offset is spelled as the schema's default base, so
+ * `offset: 0` and no offset — the same first page — are the same sequence.
+ * Written field by field rather than with a generic serializer so that a new
+ * query field cannot silently join the identity — or silently stay out of it —
+ * when the schema grows.
+ *
+ * @param query The node's query as authored.
+ * @param sessionId The session the panel is drawing, from `PanelSessionContext`.
+ * @returns The identity, as a string compared by value.
  */
-function queryIdentity(query: DataQuery): string {
+function queryIdentity(query: DataQuery, sessionId: string | undefined): string {
   const filter = query.filter;
   return JSON.stringify([
+    sessionId ?? null,
     query.source,
     query.sort ?? null,
     query.limit ?? null,
+    authoredBaseOffset(query),
     filter === undefined
       ? null
       : [
@@ -1288,13 +1389,15 @@ function describeQuery(query: DataQuery, offset: number): string {
  * reported — never to a figure computed from the length of what arrived, which
  * would drift the moment the service clamped a limit.
  *
- * The accumulated pages are held beside the identity of the query they came
- * from, and a render whose identity no longer matches simply derives the initial
- * page instead of using them. That is deliberate: resetting the state would mean
- * either setting state during a render or setting it from an effect, and both are
+ * The accumulated pages are held beside the identity of the page sequence they
+ * came from — the session and the query as authored, its base offset included
+ * (see {@link queryIdentity}) — and a render whose identity no longer matches
+ * simply derives the initial page, at the new node's authored offset, instead
+ * of using them. That is deliberate: resetting the state would mean either
+ * setting state during a render or setting it from an effect, and both are
  * errors under this repository's React rules — while a derivation is correct on
  * the very first render after the change, with no intermediate frame showing
- * another query's rows.
+ * another query's, another slice's or another session's rows.
  * ------------------------------------------------------------------------- */
 
 type LoadedPages =
@@ -1307,14 +1410,22 @@ const NO_PAGES: LoadedPages = { kind: 'none' };
 interface PagingState {
   /** The {@link queryIdentity} the accumulated pages belong to. */
   readonly identity: string;
-  /** The offset the current request is made at. */
+  /**
+   * The offset the current request is made at: the authored base offset on
+   * the first page, and the service's `nextOffset` after each "Load more".
+   * Never part of {@link identity}.
+   */
   readonly offset: number;
   /** Every page resolved before the current one. */
   readonly loaded: LoadedPages;
 }
 
-function initialPaging(identity: string, offset: number | undefined): PagingState {
-  return { identity, offset: offset ?? DATA_QUERY_DEFAULT_OFFSET, loaded: NO_PAGES };
+/**
+ * The paging state a page sequence starts in: nothing carried, and the first
+ * request made at the sequence's authored base offset.
+ */
+function initialPaging(identity: string, baseOffset: number): PagingState {
+  return { identity, offset: baseOffset, loaded: NO_PAGES };
 }
 
 /* ---------------------------------------------------------------------------
@@ -1427,37 +1538,58 @@ function rowLabel(row: WaterfallRow): string {
 }
 
 /**
- * Why the parent of `subject` could not be resolved, in the correlator's own
- * four cases. A persisted flag records no reason, and is the missing-parent
- * case by what the service writes it for.
+ * Why the parent of `subject` could not be resolved. A persisted flag records
+ * no reason of the correlator's, and is the missing-parent case by what the
+ * service writes it for: the parent it names never arrived — named by id when
+ * the service recorded the id, and without one otherwise.
  */
 function orphanCause(orphan: WaterfallOrphan, subject: string): string {
-  switch (orphan.reason) {
-    case 'self-parent':
-      return `${subject} names itself as its parent`;
-    case 'cycle':
-      return `the parent chain of ${subject} loops back on itself`;
-    case 'max-depth':
-      return `${subject} sat deeper than the correlator's depth limit`;
-    case 'missing-parent':
-    case undefined:
-      return orphan.missingParentSpanId === undefined
-        ? `the parent ${subject} names never arrived`
-        : `the parent ${orphan.missingParentSpanId} of ${subject} never arrived`;
-  }
+  return orphan.missingParentSpanId === undefined
+    ? `the parent ${subject} names never arrived`
+    : `the parent ${orphan.missingParentSpanId} of ${subject} never arrived`;
 }
 
 /**
  * The sentence a re-attached row adds to its description: that it was lifted
  * to the top level, whether itself or with an enclosing call this view does not
- * draw, the correlator's reason when there is one, and the parent that could
- * not be resolved.
+ * draw, and the parent that could not be resolved.
  */
 function describeOrphan(orphan: WaterfallOrphan): string {
-  const reason = orphan.reason === undefined ? '' : ` (${orphan.reason})`;
   return orphan.viaAncestor
-    ? `re-attached to the top level with an enclosing call not drawn here${reason}: ${orphanCause(orphan, 'that call')}`
-    : `re-attached to the top level${reason}: ${orphanCause(orphan, 'this call')}`;
+    ? `re-attached to the top level with an enclosing call not drawn here: ${orphanCause(orphan, 'that call')}`
+    : `re-attached to the top level: ${orphanCause(orphan, 'this call')}`;
+}
+
+/**
+ * The word a pending row's badge carries — the word the request table uses
+ * for the same state, so one request reads the same in both views.
+ */
+const PENDING_LABEL = 'Pending';
+
+/** The words that mark a pending row's duration as a lower bound. */
+const LOWER_BOUND_LABEL = 'at least';
+
+/**
+ * The Pending badge's text: the word alone on a single call, and the word with
+ * the count on a group row holding more than one call still in flight.
+ */
+function pendingBadgeLabel(row: WaterfallRow): string {
+  return row.pendingCount !== undefined && row.pendingCount > 1
+    ? `${PENDING_LABEL} ${formatCount(row.pendingCount)}`
+    : PENDING_LABEL;
+}
+
+/**
+ * The sentence a pending row adds to its description: for a single call, that
+ * it was still in flight and nothing had come back; for a group row, how many
+ * of its calls were.
+ */
+function describePending(row: WaterfallRow): string {
+  if (row.pendingCount === undefined) {
+    return 'still in flight when the capture ended; no response had arrived';
+  }
+  const noun = row.pendingCount === 1 ? 'call' : 'calls';
+  return `${formatCount(row.pendingCount)} ${noun} still in flight when the capture ended`;
 }
 
 /**
@@ -1467,14 +1599,20 @@ function describeOrphan(orphan: WaterfallOrphan): string {
  * bubble held open, and by assistive technology as the row's accessible name.
  * A byte figure that the runtime could not observe for a call that
  * would normally carry one is stated as unavailable rather than omitted or
- * shown as a zero.
+ * shown as a zero. A call still in flight when the capture ended states its
+ * duration as the lower bound it is ("took at least …") and says that no
+ * response had arrived, rather than reading as a request that completed.
  */
 function rowDescription(row: WaterfallRow): string {
   const parts: string[] = [oneLinePreview(rowLabel(row), TOOLTIP_PREVIEW_LENGTH)];
   parts.push(`${formatKindLabel(row.kind)} · ${formatTierLabel(row.tier)}`);
-  parts.push(
-    `starts ${formatDuration(row.offsetMs)} into the window · took ${formatDuration(row.durationMs)}`,
-  );
+  const took = row.pending
+    ? `took ${LOWER_BOUND_LABEL} ${formatDuration(row.durationMs)}`
+    : `took ${formatDuration(row.durationMs)}`;
+  parts.push(`starts ${formatDuration(row.offsetMs)} into the window · ${took}`);
+  if (row.pending) {
+    parts.push(describePending(row));
+  }
   if (row.statusCode !== undefined) {
     parts.push(`status ${String(row.statusCode)}`);
   } else if (row.status !== 'unset') {
@@ -2177,14 +2315,29 @@ function WaterfallRowItem(props: WaterfallRowItemProps): ReactElement {
               {formatStatusLabel('error')}
             </Badge>
           ) : null}
+          {row.pending ? (
+            // The state in a word, never in the icon or the tone alone — the
+            // request table's own Pending chip, whose icon `Badge` hides from
+            // assistive technology. Not a tooltip trigger: the row is the tree's
+            // only stop, and the lower bound and the missing response are in the
+            // row's description.
+            <Badge
+              tone="info"
+              variant="outline"
+              icon={<Hourglass className="dg-icon" />}
+              className="dg-waterfall__status"
+            >
+              {pendingBadgeLabel(row)}
+            </Badge>
+          ) : null}
           {row.rowCount === undefined ? null : (
             <Badge tone="neutral" variant="outline">
               {`${formatCount(row.rowCount)} rows`}
             </Badge>
           )}
           {row.orphan === undefined ? null : (
-            // The word Timeline uses for the same verdict; the reason and the
-            // unresolved parent are in the row's description.
+            // The word Timeline uses for the same verdict; the unresolved parent
+            // is named in the row's description.
             <Badge tone="warning" variant="outline">
               Re-attached
             </Badge>
@@ -2212,12 +2365,25 @@ function WaterfallRowItem(props: WaterfallRowItemProps): ReactElement {
             aria-hidden="true"
           />
         </div>
-        <DurationCell
-          ms={row.durationMs}
-          severity="auto"
-          size="sm"
-          className="dg-waterfall__duration"
-        />
+        {row.pending ? (
+          // A lower bound, said in words beside the figure: the call had been
+          // outstanding this long when the capture ended, and was still going.
+          // The pair is the row's third grid cell, so it takes the duration
+          // column's class and placement.
+          <Stack direction="horizontal" gap={1} align="center" className="dg-waterfall__duration">
+            <Text as="span" size="xs" tone="muted">
+              {LOWER_BOUND_LABEL}
+            </Text>
+            <DurationCell ms={row.durationMs} severity="auto" size="sm" />
+          </Stack>
+        ) : (
+          <DurationCell
+            ms={row.durationMs}
+            severity="auto"
+            size="sm"
+            className="dg-waterfall__duration"
+          />
+        )}
       </div>
       {expanded ? (
         <div id={groupId} role="group" className="dg-waterfall__children dg-waterfall__child-rows">
@@ -2243,6 +2409,216 @@ function WaterfallRowItem(props: WaterfallRowItemProps): ReactElement {
       ) : null}
     </>
   );
+}
+
+/* ---------------------------------------------------------------------------
+ * The states that are not a chart
+ *
+ * Product vocabulary only (AAP 0.5.4): the kinds are named through the shared
+ * formatter, and nothing below names anything from an inspected project.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * The message for a node whose kind filter shares no kind with the ones this
+ * view draws: why nothing was requested, and which kinds a waterfall does draw,
+ * listed from {@link WATERFALL_KINDS} so the sentence follows the catalog.
+ *
+ * @returns The message, as one plain-text sentence pair.
+ */
+function describeDisjointKindFilter(): string {
+  const drawable = Array.from(WATERFALL_KINDS, formatKindLabel).join(', ');
+  return `This node's kind filter selects no kind this view draws, so no captured records were requested. A waterfall draws these kinds: ${drawable}.`;
+}
+
+/**
+ * The message for pages that were searched, held nothing this view draws, and
+ * are not the end of the result: how much was searched, stated against the
+ * total when the service reported one, and that more remains.
+ *
+ * The count is of the SOURCE records resolved so far — the figure the footer's
+ * "loaded … of …" uses — never of drawn rows, of which there are none.
+ *
+ * @param loaded How many records the pages resolved so far hold.
+ * @param total The total the service reported for the query, if it reported one.
+ * @returns The message.
+ */
+function describeUndrawnPages(loaded: number, total: number | undefined): string {
+  const counted =
+    total === undefined
+      ? `${formatCount(loaded)} captured ${loaded === 1 ? 'record' : 'records'}`
+      : `${formatCount(loaded)} of ${formatCount(total)} captured ${total === 1 ? 'record' : 'records'}`;
+  const verdict =
+    loaded === 1
+      ? 'it is not a network or database call'
+      : 'none of them is a network or database call';
+  return `Loaded ${counted} so far, and ${verdict}. More records remain to be searched.`;
+}
+
+/* ---------------------------------------------------------------------------
+ * The empty state
+ *
+ * A successful result with no row to draw is not one situation but several,
+ * and only one of them means "the capture holds no calls". An explicit
+ * `limit: 0` is a count-only request (`nodes/query.ts`), an authored offset past
+ * the end is an empty page rather than an error, and a page whose records were
+ * all removed by this view's kind filter still holds captured evidence. Each is
+ * stated as what it is, with the total the service reported, so an empty page
+ * never reads as an empty capture (AAP 0.5.5). The copy is chosen by a pure
+ * function of the paging counters, outside the component, so every branch is a
+ * plain value a test can name.
+ * ------------------------------------------------------------------------- */
+
+/** The empty-capture sentence: nothing matched the query at all. */
+const EMPTY_CAPTURE_MESSAGE = 'No network or database calls were captured for this interaction.';
+
+/** The heading of the state for an explicit `limit: 0` request. */
+const COUNT_ONLY_TITLE = 'Count only';
+
+/** The heading of the state for a page that is empty while its query is not. */
+const EMPTY_PAGE_TITLE = 'Nothing on this page';
+
+/** A noun with its singular and plural forms, chosen by the count it follows. */
+interface CountedNoun {
+  readonly one: string;
+  readonly other: string;
+}
+
+const SPAN_NOUN: CountedNoun = { one: 'span', other: 'spans' };
+const EVENT_NOUN: CountedNoun = { one: 'event', other: 'events' };
+const REQUEST_GROUP_NOUN: CountedNoun = { one: 'request group', other: 'request groups' };
+
+/** What the empty state says: an optional heading and the sentence under it. */
+interface EmptyPageCopy {
+  readonly title: string | undefined;
+  readonly message: string;
+}
+
+/** The copy for a query that matched nothing, and for the unpaged tree. */
+const EMPTY_CAPTURE_COPY: EmptyPageCopy = { title: undefined, message: EMPTY_CAPTURE_MESSAGE };
+
+/** The paging facts the empty state is chosen from. */
+interface EmptyPageFacts {
+  /** The source the node's query reads. */
+  readonly source: DataQuery['source'];
+  /** The total the service reported for the whole query, or `undefined` for none. */
+  readonly total: number | undefined;
+  /** The offset the resolved page was requested at. */
+  readonly offset: number;
+  /** The page size in force: the node's own limit, or the default for an omitted one. */
+  readonly limit: number;
+  /** How many source items every loaded page holds together, before the kind filter. */
+  readonly loadedItemCount: number;
+}
+
+/**
+ * The noun a paged source counts its items in, or `undefined` for a source that
+ * is not paged — the `trace` tree carries no total, so there is nothing to count.
+ */
+function pagedNounFor(source: DataQuery['source']): CountedNoun | undefined {
+  switch (source) {
+    case 'spans':
+      return SPAN_NOUN;
+    case 'events':
+      return EVENT_NOUN;
+    case 'requests':
+      return REQUEST_GROUP_NOUN;
+    default:
+      return undefined;
+  }
+}
+
+/** `noun` in the form that agrees with `count`. */
+function nounForCount(noun: CountedNoun, count: number): string {
+  return count === 1 ? noun.one : noun.other;
+}
+
+/**
+ * The sentence for loaded items that the kind filter removed in full, with the
+ * reported total when there is one.
+ */
+function filteredPageMessage(
+  noun: CountedNoun,
+  loadedItemCount: number,
+  total: number | undefined,
+): string {
+  const verb = loadedItemCount === 1 ? 'is' : 'are';
+  const outcome =
+    loadedItemCount === 1
+      ? 'it is not a network or database call'
+      : 'none of them is a network or database call';
+  if (total === undefined) {
+    return `${formatCount(loadedItemCount)} ${nounForCount(noun, loadedItemCount)} ${verb} loaded, and ${outcome}; no total was reported for this query.`;
+  }
+  return `${formatCount(loadedItemCount)} of the ${formatCount(total)} ${nounForCount(noun, total)} that matched this query ${verb} loaded, and ${outcome}.`;
+}
+
+/**
+ * The empty state for a successful result that drew no row.
+ *
+ * In order: a count-only request (`limit: 0`) is named as one, with its total
+ * when reported; a total of zero — or no total at all, at the first offset,
+ * with nothing loaded — is the empty capture. With no total reported, loaded
+ * items the kind filter removed are counted, and otherwise the state says where
+ * the page starts. With a positive total, a page starting at or past it says
+ * where it starts and how many items matched; inside it, loaded items the kind
+ * filter removed are counted against the total, and a page with nothing on it
+ * says how many items matched. A reported total that is not a whole,
+ * non-negative number is treated as not reported, so a malformed counter can
+ * never produce a figure.
+ *
+ * @example
+ * describeEmptyPage({ source: 'spans', total: 42, offset: 0, limit: 0, loadedItemCount: 0 });
+ * // → { title: 'Count only',
+ * //     message: 'This view requests a count without rows: 42 spans matched its query.' }
+ *
+ * @param facts The result's source, total, offset, page size and loaded item count.
+ * @returns The heading, when the state has one, and the message.
+ */
+function describeEmptyPage(facts: EmptyPageFacts): EmptyPageCopy {
+  const noun = pagedNounFor(facts.source);
+  if (noun === undefined) {
+    return EMPTY_CAPTURE_COPY;
+  }
+  const { offset, limit, loadedItemCount } = facts;
+  const total =
+    facts.total !== undefined && Number.isSafeInteger(facts.total) && facts.total >= 0
+      ? facts.total
+      : undefined;
+
+  if (limit === 0) {
+    return {
+      title: COUNT_ONLY_TITLE,
+      message:
+        total === undefined
+          ? 'This view requests a count without rows, and no total was reported for its query.'
+          : `This view requests a count without rows: ${formatCount(total)} ${nounForCount(noun, total)} matched its query.`,
+    };
+  }
+  if (total === 0 || (total === undefined && offset === 0 && loadedItemCount === 0)) {
+    return EMPTY_CAPTURE_COPY;
+  }
+  if (total === undefined) {
+    return {
+      title: EMPTY_PAGE_TITLE,
+      message:
+        loadedItemCount > 0
+          ? filteredPageMessage(noun, loadedItemCount, undefined)
+          : `This page starts at position ${formatCount(offset + 1)} and holds no ${noun.other}; no total was reported for this query.`,
+    };
+  }
+  if (offset >= total) {
+    return {
+      title: EMPTY_PAGE_TITLE,
+      message: `This page starts at position ${formatCount(offset + 1)}, past the end of the ${formatCount(total)} ${nounForCount(noun, total)} that matched this query.`,
+    };
+  }
+  return {
+    title: EMPTY_PAGE_TITLE,
+    message:
+      loadedItemCount > 0
+        ? filteredPageMessage(noun, loadedItemCount, total)
+        : `${formatCount(total)} ${nounForCount(noun, total)} matched this query, but none are shown on this page.`,
+  };
 }
 
 /* ---------------------------------------------------------------------------
@@ -2272,11 +2648,14 @@ type AnyQueryResult = UseQueryResult<unknown>;
  *
  * Resolves the node's query through the ambient `DataProvider`, normalises the
  * payload into rows nested by ancestry and positioned by their offset from the
- * first call, and renders the loading, error and empty states in that
- * precedence. A page that arrived while rows are already on screen degrades to
- * a footer notice rather than replacing the view, so paging never blanks a chart
- * the developer is reading — and a failure is still reported as a failure, with
- * a retry, never as a successful empty result (AAP 0.5.5).
+ * first call, and renders its states in this precedence: an unsupported source
+ * (no query issued), a kind filter that selects nothing drawable (no query
+ * issued), loading and error while nothing has been loaded yet, pages searched
+ * with nothing drawable while more remain (with "Load more"), the empty result,
+ * and the chart. A page that arrived while rows are already on screen degrades
+ * to a footer notice rather than replacing the view, so paging never blanks a
+ * chart the developer is reading — and a failure is still reported as a
+ * failure, with a retry, never as a successful empty result (AAP 0.5.5).
  *
  * @param props The node to draw and an optional class name.
  */
@@ -2287,9 +2666,12 @@ export function Waterfall(props: WaterfallProps): ReactElement {
   const baseQuery = node.query;
   const domIdSeed = useId();
 
-  const identity = useMemo(() => queryIdentity(baseQuery), [baseQuery]);
+  // The session is part of the page sequence's identity: pages another session
+  // answered are another capture's evidence (see `queryIdentity`).
+  const sessionId = usePanelSessionId();
+  const identity = useMemo(() => queryIdentity(baseQuery, sessionId), [baseQuery, sessionId]);
   const [paging, setPaging] = useState<PagingState>(() =>
-    initialPaging(identity, baseQuery.offset),
+    initialPaging(identity, authoredBaseOffset(baseQuery)),
   );
   const [expandedIds, setExpandedIds] = useState<ReadonlySet<string>>(NO_EXPANDED_IDS);
   const [selectedId, setSelectedId] = useState<string | undefined>(undefined);
@@ -2298,11 +2680,14 @@ export function Waterfall(props: WaterfallProps): ReactElement {
   // a new page can never leave the tree without one.
   const [activeRowKey, setActiveRowKey] = useState<string | undefined>(undefined);
 
-  // Accumulated pages belong to one query identity. When the node's query
-  // changes, the pages held in state are simply not used — derived here rather
-  // than reset in an effect, so the first render after the change already draws
-  // the new query's first page.
-  const paged = paging.identity === identity ? paging : initialPaging(identity, baseQuery.offset);
+  // Accumulated pages belong to one page-sequence identity. When the node's
+  // query — its authored offset included — or the panel's session changes, the
+  // pages held in state are simply not used and the request returns to the
+  // authored base offset: derived here rather than reset in an effect, so the
+  // first render after the change already asks for the new sequence's first
+  // page and draws nothing the old one accumulated.
+  const paged =
+    paging.identity === identity ? paging : initialPaging(identity, authoredBaseOffset(baseQuery));
   const carried = paged.loaded;
   const offset = paged.offset;
 
@@ -2311,16 +2696,20 @@ export function Waterfall(props: WaterfallProps): ReactElement {
 
   const spanQuery = useMemo(() => narrowSpanListQuery(baseQuery, offset), [baseQuery, offset]);
   const requestsQuery = useMemo(() => narrowRequestsQuery(baseQuery, offset), [baseQuery, offset]);
-  const traceQuery = useMemo(() => narrowTraceQuery(baseQuery), [baseQuery]);
 
-  // At most one of the three carries a query; the other two resolve nothing.
-  const spanResult = useQuery(spanQuery);
-  const requestsResult = useQuery(requestsQuery);
-  const traceResult = useQuery(traceQuery);
+  // A kind filter that shares no kind with what this view draws can never
+  // yield a row — not on this page and not on any later one — so the query is
+  // held back rather than issued and paged through to an empty answer; the
+  // body states why instead (see `resolveIncludedKinds`).
+  const kindsSelectable = includedKinds.size > 0;
+
+  // At most one of the two carries a query; the other resolves nothing, and a
+  // source the catalog entry does not list leaves both without one.
+  const spanResult = useQuery(spanQuery, { enabled: kindsSelectable });
+  const requestsResult = useQuery(requestsQuery, { enabled: kindsSelectable });
 
   const spanPage = spanResult.data;
   const requestsPage = requestsResult.data;
-  const tracePayload = traceResult.data;
 
   const model = useMemo<WaterfallModel>(() => {
     if (spanQuery !== undefined) {
@@ -2336,20 +2725,8 @@ export function Waterfall(props: WaterfallProps): ReactElement {
         includedKinds,
       );
     }
-    if (traceQuery !== undefined && tracePayload !== undefined) {
-      return buildFromTrace(tracePayload, includedKinds);
-    }
     return EMPTY_MODEL;
-  }, [
-    spanQuery,
-    spanPage,
-    requestsQuery,
-    requestsPage,
-    traceQuery,
-    tracePayload,
-    carried,
-    includedKinds,
-  ]);
+  }, [spanQuery, spanPage, requestsQuery, requestsPage, carried, includedKinds]);
 
   // How many source items have been resolved so far, which is what "loaded of
   // total" compares against — the drawn row count is a different figure,
@@ -2364,18 +2741,20 @@ export function Waterfall(props: WaterfallProps): ReactElement {
       const previous = carried.kind === 'requests' ? carried.items.length : 0;
       return previous + (requestsPage?.length ?? 0);
     }
-    return model.rowCount;
-  }, [spanQuery, requestsQuery, carried, spanPage, requestsPage, model.rowCount]);
+    return 0;
+  }, [spanQuery, requestsQuery, carried, spanPage, requestsPage]);
 
   const result: AnyQueryResult | undefined =
-    spanQuery !== undefined
-      ? spanResult
-      : requestsQuery !== undefined
-        ? requestsResult
-        : traceQuery !== undefined
-          ? traceResult
-          : undefined;
-  const nextOffset = result?.nextOffset;
+    spanQuery !== undefined ? spanResult : requestsQuery !== undefined ? requestsResult : undefined;
+  // Only a cursor past the page it answered is a next page, and a count-only
+  // request (`limit: 0`) never has one — the rule every paged view follows. A
+  // count-only or stalled answer therefore reaches the empty-page copy below,
+  // never a "Load more" that would re-request the page already searched.
+  const reportedNextOffset = result?.nextOffset;
+  const nextOffset =
+    reportedNextOffset !== undefined && reportedNextOffset > offset && baseQuery.limit !== 0
+      ? reportedNextOffset
+      : undefined;
 
   const scale = useMemo(
     () => createTimeScale([model.viewStart, model.viewEnd], [0, PERCENT_RANGE]),
@@ -2445,13 +2824,20 @@ export function Waterfall(props: WaterfallProps): ReactElement {
 
   const queryDescription = describeQuery(baseQuery, offset);
   const hasRows = model.rowCount > 0;
+  // Whether earlier pages of this sequence were resolved and are held in
+  // state. The full-view loading and error states describe a sequence that
+  // has produced nothing yet; once a page is carried, a page in flight or a
+  // page that failed is the NEXT page, and is reported as such.
+  const hasCarried = carried.kind !== 'none';
 
   let body: ReactNode;
   if (result === undefined) {
     // A validated specification cannot reach this state: the node catalog
-    // constrains a waterfall node to the sources handled above. A host that
-    // rendered an unvalidated node still gets a stated failure rather than an
-    // empty chart that would read as "nothing was captured".
+    // constrains a waterfall node to the sources handled above, and the same
+    // entry was consulted before any query was built, so none was issued. A
+    // host that rendered an unvalidated node — one naming `events`, `trace` or
+    // any other source — still gets a stated failure rather than an empty
+    // chart that would read as "nothing was captured".
     body = (
       <div className="dg-waterfall__error">
         <ErrorState
@@ -2461,13 +2847,22 @@ export function Waterfall(props: WaterfallProps): ReactElement {
         />
       </div>
     );
-  } else if (result.status === 'loading' && !hasRows) {
+  } else if (!kindsSelectable) {
+    // The node's own kind filter excludes every kind this view draws, so no
+    // page could ever hold a row: nothing was requested, and no "Load more" is
+    // offered for a search that cannot find anything.
+    body = (
+      <div className="dg-waterfall__empty">
+        <EmptyState title="No call kind selected" message={describeDisjointKindFilter()} />
+      </div>
+    );
+  } else if (result.status === 'loading' && !hasRows && !hasCarried) {
     body = (
       <div className="dg-waterfall__loading">
         <LoadingState variant="chart" label="Loading captured calls" />
       </div>
     );
-  } else if (result.status === 'error' && !hasRows) {
+  } else if (result.status === 'error' && !hasRows && !hasCarried) {
     body = (
       <div className="dg-waterfall__error">
         <ErrorState
@@ -2478,10 +2873,61 @@ export function Waterfall(props: WaterfallProps): ReactElement {
         />
       </div>
     );
+  } else if (
+    !hasRows &&
+    (nextOffset !== undefined || (hasCarried && result.status !== 'success'))
+  ) {
+    // Every record loaded so far is of a kind this view does not draw, and
+    // the search is not over: the service reported another page, or the next
+    // page is in flight or failed behind pages already searched (`useQuery`
+    // reports no `nextOffset` while a page is loading). Saying "nothing was
+    // captured" here would be a conclusion the evidence does not support, and
+    // withholding "Load more" would hide the page that holds the calls.
+    const loadingMore = result.status === 'loading';
+    const failedMore = result.status === 'error';
+    body = (
+      <>
+        <div className="dg-waterfall__empty">
+          <EmptyState
+            title="No network or database calls loaded yet"
+            message={describeUndrawnPages(loadedItemCount, result.total)}
+            action={
+              failedMore ? undefined : (
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  disabled={loadingMore}
+                  onClick={handleLoadMore}
+                >
+                  {loadingMore ? 'Loading…' : 'Load more'}
+                </Button>
+              )
+            }
+          />
+        </div>
+        {failedMore ? (
+          <div className="dg-waterfall__error">
+            <ErrorState
+              message="The next page of captured calls could not be loaded."
+              code={result.error?.code}
+              query={queryDescription}
+              onRetry={result.retry}
+            />
+          </div>
+        ) : null}
+      </>
+    );
   } else if (!hasRows) {
+    const emptyCopy = describeEmptyPage({
+      source: baseQuery.source,
+      total: result.total,
+      offset,
+      limit: baseQuery.limit ?? DATA_QUERY_DEFAULT_LIMIT,
+      loadedItemCount,
+    });
     body = (
       <div className="dg-waterfall__empty">
-        <EmptyState message="No network or database calls were captured for this interaction." />
+        <EmptyState title={emptyCopy.title} message={emptyCopy.message} />
       </div>
     );
   } else {
@@ -2530,7 +2976,11 @@ export function Waterfall(props: WaterfallProps): ReactElement {
           <Text size="xs" tone="muted">
             {model.truncated ? `${countText} · some nested calls were not drawn` : countText}
           </Text>
-          {nextOffset === undefined ? null : (
+          {/* Kept on screen while the next page is in flight, disabled and
+              saying so: `useQuery` reports no `nextOffset` while a page loads,
+              and rows on screen with a page loading can only mean that page is
+              the NEXT one — so the control must not vanish mid-request. */}
+          {nextOffset === undefined && !loadingMore ? null : (
             <Button variant="secondary" size="sm" disabled={loadingMore} onClick={handleLoadMore}>
               {loadingMore ? 'Loading…' : 'Load more'}
             </Button>

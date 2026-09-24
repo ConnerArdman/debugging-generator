@@ -264,7 +264,10 @@ const EMPTY_MESSAGE = 'No trace was captured for this interaction.';
 /** The error state's message for a failed query. */
 const ERROR_MESSAGE = 'The nested timing for this view could not be loaded.';
 
-/** The error state's message for a payload this node cannot draw. */
+/**
+ * The error state's message for a node or a non-null payload this view cannot
+ * draw. A `null` trace is never one: it is the empty state's case.
+ */
 const MISMATCH_MESSAGE =
   'This view reads a correlated trace and received something else, so it was not drawn. The panel it belongs to needs regenerating.';
 
@@ -457,12 +460,17 @@ function isTraceQuery(query: DataQuery): query is DataQuery & { source: typeof T
 /**
  * Whether a resolved page is shaped like a correlated trace.
  *
- * `../host/useQuery` writes a provider's answer through verbatim and does not
- * re-validate it, so a provider that echoed the wrong source would hand this
- * component a payload typed as a trace and shaped like something else. Reading
- * `roots` off it would then throw inside a render and take down the panel, which
- * is exactly the silent failure AAP 0.5.5 rules out — so the shape is checked
- * once, here, and a payload that fails becomes an error state.
+ * This view dereferences `traceId`, `roots` and `nodeCount` before it can draw
+ * anything, and no check upstream of it promises all three: whatever the host
+ * verifies before handing a page over, a provider that decoded something else
+ * could still hand this component a payload typed as a trace and shaped like
+ * something else. Reading it would then throw inside a render and take down the
+ * panel, which is exactly the silent failure AAP 0.5.5 rules out — so the shape
+ * is checked once, here, and a payload that fails becomes an error state.
+ *
+ * `null` fails this check and is not a failure: it is the service's own answer
+ * for a capture in which no trace matched the query, which the caller renders
+ * as the empty state before it consults this guard.
  */
 function looksLikeTraceTree(value: unknown): value is TraceTree {
   if (typeof value !== 'object' || value === null) {
@@ -1017,7 +1025,10 @@ export function FlameChart(props: FlameChartProps): ReactElement {
   // The shape check is what separates "the provider answered for another
   // source" from "the trace is empty": both would otherwise read as a blank
   // chart, and one of them is a bug in the host rather than a fact about the
-  // capture.
+  // capture. A `null` payload is the service's own answer for a capture in
+  // which no trace matched the query — an empty capture, never a malformed one
+  // — so it is told apart from a failed shape check before either is drawn.
+  const emptyCapture = status === 'success' && data === null;
   const tree = looksLikeTraceTree(data) ? data : undefined;
 
   const model = useMemo(() => buildModel(tree, folds), [tree, folds]);
@@ -1090,7 +1101,9 @@ export function FlameChart(props: FlameChartProps): ReactElement {
     );
   }
 
-  if (tree === undefined) {
+  // Only a non-null payload can be malformed; the service's `null` falls
+  // through to the empty state below.
+  if (tree === undefined && !emptyCapture) {
     return (
       <div className={clsx('dg-flame', className)}>
         <div className="dg-flame__error">
@@ -1100,7 +1113,9 @@ export function FlameChart(props: FlameChartProps): ReactElement {
     );
   }
 
-  if (model.frames.length === 0) {
+  // One empty state for both ways a capture can hold nothing to draw: no trace
+  // matched (`null`), or the trace that matched holds no frames.
+  if (emptyCapture || model.frames.length === 0) {
     return (
       <div className={clsx('dg-flame', className)}>
         <div className="dg-flame__empty">

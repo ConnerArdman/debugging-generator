@@ -10,7 +10,7 @@
  * renders what comes back; where the answer came from is the host surface's
  * business and nothing the library may depend on (AAP 0.1.2, 0.6.2).
  *
- * ## What it mirrors
+ * ## What it mirrors: the wire form and the view form
  *
  * The shape below is the client-side face of the service's panel-data contract,
  * `POST /sessions/:id/panel-data` (AAP 0.4.2): the route is addressed by a
@@ -22,6 +22,29 @@
  * contract are described once, in `@debuggen/panel-schema` (the query) and
  * `@debuggen/telemetry` (the results), nothing here restates a data shape: every
  * result type below is an `import type` from the package that owns it.
+ *
+ * The contract has two spellings, and this module owns the one translation
+ * between them:
+ *
+ * - **The wire form** ({@link PanelDataResult}) is what the service sends: one
+ *   member per source, carrying its payload under a key named after the source
+ *   (`{ source: 'trace', trace }`, `{ source: 'spans', spans, total, limit,
+ *   offset, nextOffset }`, …), with all four paging fields required on the
+ *   array-valued sources. It is structurally identical to the protocol
+ *   package's `DataResult` union (`dataResultSchema` in
+ *   `packages/protocol/src/http.ts`), so a host can return the value
+ *   `parseDataResult` produced without a cast — but it is derived here from the
+ *   telemetry result shapes rather than imported, because the renderer sits
+ *   below the protocol in the package graph and may never import it.
+ * - **The view form** ({@link DataQueryResponse}) is what `./useQuery` and every
+ *   component read: the payload always under `data`, whatever the source, so a
+ *   component is written once against `data` and switches on `source` alone.
+ *
+ * {@link createPanelDataProvider} and {@link mapPanelDataResult} convert the
+ * first into the second, validating as they go; `./useQuery` validates the
+ * second for every provider through {@link checkDataQueryResponse}. The two
+ * forms can therefore never be confused silently: a service body handed to a
+ * component as if it were a view is refused, never read as `data: undefined`.
  *
  * ## Which session a query belongs to
  *
@@ -37,12 +60,14 @@
  * ## Paging counters, as the wire carries them
  *
  * The service's response marks the last page with `nextOffset: null` and always
- * reports `total` for the array-valued sources (the protocol's `DataPage`
- * echo). {@link DataQueryResponse} accepts exactly that form — `null` and an
- * absent key both mean "no further page" — so a host surface forwards the
- * decoded counters as they arrived instead of translating them.
- * `./useQuery` then reports end-of-data to components one way only, as an
- * `undefined` `nextOffset`.
+ * reports `total`, `limit` and `offset` for the array-valued sources (the
+ * protocol's `DataPage` echo, mirrored here as {@link PanelDataPage}).
+ * {@link DataQueryResponse} carries the same four counters, optional because a
+ * view-form provider that cannot know them may omit them, and accepts the
+ * wire's `null` as it stands — `null` and an absent key both mean "no further
+ * page" — so the mapping forwards the decoded counters as they arrived instead
+ * of translating them. `./useQuery` then reports end-of-data to components one
+ * way only, as an `undefined` `nextOffset`.
  *
  * ## What it deliberately does not do
  *
@@ -56,12 +81,19 @@
  *
  * ## What is exported here
  *
- * The result mapping ({@link DataResultMap}, {@link DataResultFor}), the
- * response shapes ({@link DataQueryResponse}, {@link AnyDataQueryResponse}), the
- * interface and its options ({@link DataProvider}, {@link DataQueryOptions}),
- * one factory for implementing it from a source-agnostic resolver
- * ({@link createDataProvider}, {@link DataQueryResolver},
- * {@link DataQueryResolverContext}), the two React contexts `PanelHost` provides
+ * The result mapping ({@link DataResultMap}, {@link DataResultFor}), the view
+ * form of a response ({@link DataQueryResponse}, {@link AnyDataQueryResponse}),
+ * the wire form of one ({@link PanelDataResult}, {@link PanelDataResultFor},
+ * {@link PanelDataPage}), the interface and its options ({@link DataProvider},
+ * {@link DataQueryOptions}), two factories for implementing it — from a
+ * resolver that returns the service's body ({@link createPanelDataProvider},
+ * {@link PanelDataResolver}), which is what a host surface over a transport
+ * uses, and from one that already speaks the view form
+ * ({@link createDataProvider}, {@link DataQueryResolver}), which is what an
+ * in-process stub or a recorded fixture uses — with the context both hand a
+ * resolver ({@link DataQueryResolverContext}), the two checks those factories
+ * and `./useQuery` apply ({@link mapPanelDataResult},
+ * {@link checkDataQueryResponse}), the two React contexts `PanelHost` provides
  * ({@link DataProviderContext}, {@link PanelSessionContext}) and the hooks that
  * read them ({@link useDataProvider}, {@link usePanelSessionId}). The paging
  * constants of the contract are re-exported from `@debuggen/panel-schema` so
@@ -70,8 +102,10 @@
 
 import { createContext, useContext } from 'react';
 
+import { DATA_QUERY_MAX_LIMIT, isDataQuerySource } from '@debuggen/panel-schema';
 import type { DataQuery, DataQuerySource } from '@debuggen/panel-schema';
-import { DebuggenError } from '@debuggen/shared';
+import { DebuggenError, err, ok } from '@debuggen/shared';
+import type { Result } from '@debuggen/shared';
 import type {
   ComponentTreeSnapshot,
   DependencyGraphData,
@@ -128,8 +162,13 @@ interface DataResultShapes {
   /**
    * One correlated interaction as an ordered tree spanning every tier. A capture
    * holds many, so the query names one with a `traceId` filter.
+   *
+   * `null` when no trace in the capture matched the query — the service's own
+   * answer for a session whose capture collected nothing correlated, and an
+   * ordinary result rather than a failure: a view renders its empty state for it,
+   * never an error.
    */
-  trace: TraceTree;
+  trace: TraceTree | null;
   /**
    * The span-shaped records of the capture, flat — the view for ranking work by
    * duration across tiers.
@@ -142,8 +181,13 @@ interface DataResultShapes {
   /**
    * The component structure as of the last commit of the capture, annotated with
    * cumulative render counts.
+   *
+   * `null` when the capture holds no render evidence to build a tree from — the
+   * wire's spelling of "no tree", since an absent value does not survive a JSON
+   * round trip. Like a `null` trace, it is an empty capture and renders as the
+   * view's empty state, never as a malformed payload.
    */
-  componentTree: ComponentTreeSnapshot;
+  componentTree: ComponentTreeSnapshot | null;
   /**
    * Network calls grouped so that byte-identical requests collide and
    * differently parameterized ones do not — the view duplicate detection reads.
@@ -221,6 +265,26 @@ export interface DataQueryResponse<Source extends DataQuerySource = DataQuerySou
    */
   readonly total?: number | undefined;
   /**
+   * The page size the service actually applied — the query's own `limit`, or
+   * the default it filled in for an omitted one — as a non-negative whole
+   * number no larger than `DATA_QUERY_MAX_LIMIT`.
+   *
+   * An echo, not an instruction: a view that wants to say "showing 200 per
+   * page" reads it here rather than assuming the default, which the service may
+   * have clamped. Present for the array-valued sources when the answer came off
+   * the wire, and absent for the unpaged sources and for any view-form provider
+   * that does not report it.
+   */
+  readonly limit?: number | undefined;
+  /**
+   * How many items the service skipped before this page — the query's own
+   * `offset`, or the default it filled in — as a non-negative whole number.
+   *
+   * Present and absent under exactly the same conditions as
+   * {@link DataQueryResponse.limit}.
+   */
+  readonly offset?: number | undefined;
+  /**
    * The `offset` that would return the next page; `null` or absent when this
    * page is the last one.
    *
@@ -251,6 +315,99 @@ export interface DataQueryResponse<Source extends DataQuerySource = DataQuerySou
  */
 export type AnyDataQueryResponse = {
   [Source in DataQuerySource]: DataQueryResponse<Source>;
+}[DataQuerySource];
+
+/**
+ * Which sources the service pages, and the single runtime statement of it.
+ *
+ * A total record rather than a list, and checked twice by the compiler: the
+ * mapped type makes it exhaustive (a source added to `DATA_QUERY_SOURCES`
+ * without an entry here fails to compile), and the conditional in it pins each
+ * entry to its result shape — a source is `'paged'` exactly when its result is
+ * an array — so a source cannot be marked paged while answering with one tree,
+ * or single while answering with a list. The protocol draws the same line: its
+ * array-valued `DataResult` members carry the `DataPage` echo and its three
+ * single-value members do not.
+ */
+const DATA_QUERY_PAGING = {
+  trace: 'single',
+  spans: 'paged',
+  events: 'paged',
+  renders: 'paged',
+  componentTree: 'single',
+  requests: 'paged',
+  queries: 'paged',
+  stateTransitions: 'paged',
+  graph: 'single',
+  metrics: 'paged',
+} as const satisfies {
+  readonly [Source in DataQuerySource]: DataResultShapes[Source] extends readonly unknown[]
+    ? 'paged'
+    : 'single';
+};
+
+/** The array-valued sources: the ones whose wire member carries {@link PanelDataPage}. */
+type PagedDataQuerySource = {
+  [Source in DataQuerySource]: (typeof DATA_QUERY_PAGING)[Source] extends 'paged' ? Source : never;
+}[DataQuerySource];
+
+/**
+ * The paging echo every array-valued wire member carries, all four fields
+ * required.
+ *
+ * Mirrors the protocol's `DataPage` field for field, and must stay structurally
+ * identical to it: `total` is how many items the filtered source holds, `limit`
+ * and `offset` are what the service applied (defaults included), and
+ * `nextOffset` is the offset of the following page or `null` on the last one.
+ * All four are non-negative whole numbers, and `limit` is bounded by
+ * `DATA_QUERY_MAX_LIMIT`; {@link mapPanelDataResult} enforces exactly that.
+ */
+export interface PanelDataPage {
+  /** How many items the filtered source holds in total, before limit and offset. */
+  readonly total: number;
+  /** The page size the service applied. */
+  readonly limit: number;
+  /** How many items the service skipped before this page. */
+  readonly offset: number;
+  /** The offset of the following page, or `null` when this page is the last one. */
+  readonly nextOffset: number | null;
+}
+
+/**
+ * The wire form of the answer to one source's query: the service's
+ * `POST /sessions/:id/panel-data` body for that source.
+ *
+ * The payload sits under a key named after the source, and the array-valued
+ * sources carry the {@link PanelDataPage} echo beside it:
+ *
+ * - `PanelDataResultFor<'trace'>` is `{ source: 'trace'; trace: TraceTree | null }`;
+ * - `PanelDataResultFor<'renders'>` is
+ *   `{ source: 'renders'; renders: readonly RenderStat[] } & PanelDataPage`.
+ *
+ * Derived from the same result table as the view form, so the two can never
+ * disagree about what a source's payload is, and structurally identical to the
+ * protocol's `DataResultFor<S>` — which is what lets a host hand
+ * `parseDataResult(body).value` to {@link createPanelDataProvider} with no cast.
+ * A change to the protocol's `dataResultSchema` member names or page fields must
+ * be mirrored here in the same change.
+ *
+ * @typeParam Source - The source this result answers for.
+ */
+export type PanelDataResultFor<Source extends DataQuerySource> = {
+  readonly source: Source;
+} & { readonly [Member in Source]: DataResultShapes[Member] } & (Source extends PagedDataQuerySource
+    ? PanelDataPage
+    : unknown);
+
+/**
+ * The wire form of a panel-data answer for any source, as a discriminated union
+ * on `source` — the renderer-side mirror of the protocol's `DataResult`.
+ *
+ * What a {@link PanelDataResolver} returns and what {@link mapPanelDataResult}
+ * translates into the {@link DataQueryResponse} a component reads.
+ */
+export type PanelDataResult = {
+  [Source in DataQuerySource]: PanelDataResultFor<Source>;
 }[DataQuerySource];
 
 /**
@@ -309,11 +466,18 @@ export interface DataQueryOptions {
  *    other rejection is wrapped by the caller, losing that detail.
  * 4. **Honour `options.signal`.** Stop the work and reject with an abort-shaped
  *    error; do not resolve an aborted call.
- * 5. **Resolve one page, as given.** Pass `filter`, `sort`, `limit` and `offset`
- *    through to the side that owns the capture and return its answer untouched —
- *    no client-side re-ordering, no merging of pages, no de-duplication — along
- *    with its `total` and `nextOffset` for the array-valued sources, `null`
- *    included where the service sent one.
+ * 5. **Resolve one page, as given, in the view form.** Pass `filter`, `sort`,
+ *    `limit` and `offset` through to the side that owns the capture and return
+ *    its answer untouched — no client-side re-ordering, no merging of pages, no
+ *    de-duplication — with the payload under `data` and the service's `total`,
+ *    `limit`, `offset` and `nextOffset` beside it for the array-valued sources,
+ *    `null` included where the service sent one. The service itself answers in
+ *    the wire form ({@link PanelDataResult}), whose payload sits under a
+ *    source-named key; an implementation over a transport converts it with
+ *    {@link createPanelDataProvider} (or {@link mapPanelDataResult}) rather
+ *    than by hand, because returning the body as it arrived would reach every
+ *    component as a response with no `data` — which `./useQuery` refuses as a
+ *    malformed response rather than drawing.
  * 6. **Preserve redaction.** Attribute values, URLs and statements arrive
  *    already redacted and truncated (AAP 0.5.2). An implementation must never
  *    enrich, expand or reconstruct them.
@@ -331,9 +495,12 @@ export interface DataQueryOptions {
  * ## Implementing it
  *
  * An implementation that answers every source through one channel — which both
- * host surfaces and every test stub do — is easiest to write as a
- * {@link DataQueryResolver} passed to {@link createDataProvider}, and that is
- * the recommended route. The reason is a property of the generic signature
+ * host surfaces and every test stub do — is easiest to write through one of the
+ * two factories, and that is the recommended route: a host surface whose
+ * channel returns the service's body passes a {@link PanelDataResolver} to
+ * {@link createPanelDataProvider}, and an in-process stub or fixture that
+ * already builds the view form passes a {@link DataQueryResolver} to
+ * {@link createDataProvider}. The reason is a property of the generic signature
  * rather than a matter of taste: inside a generic `query`, `Source` is an
  * unresolved type parameter, so a value that satisfies one source (an empty
  * list, or whatever a transport decoded) is not statically a
@@ -379,26 +546,31 @@ export interface DataQueryResolverContext extends DataQueryOptions {
 }
 
 /**
- * A source-agnostic resolver: one function that answers any query with the
- * response for whichever source it was asked about.
+ * A source-agnostic resolver that answers in the view form: one function that
+ * answers any query with the `{ source, data, … }` response for whichever
+ * source it was asked about.
  *
- * This is the shape a host surface naturally has — one channel carrying every
- * query, one decoded response back — and the shape a test stub naturally has.
+ * This is the shape an in-process answer naturally has — a test stub, a
+ * recorded fixture, a surface that computes a view without a round trip.
  * {@link createDataProvider} turns it into a {@link DataProvider}, moving the
- * provider's positional `sessionId` onto {@link DataQueryResolverContext}.
+ * provider's positional `sessionId` onto {@link DataQueryResolverContext}. A
+ * channel that returns the service's own body answers in the wire form instead,
+ * and belongs behind {@link PanelDataResolver} and
+ * {@link createPanelDataProvider}, which translate it.
  *
  * The same obligations listed on {@link DataProvider} apply to a resolver —
  * route by `context.sessionId`, honour `context.signal` — with one relaxation:
  * it need not thread the request's source into its return type, because the
- * factory checks at runtime that the two agree. The return type is therefore
+ * factory checks at runtime that the two agree (with
+ * {@link checkDataQueryResponse}, payload and counters included). The return type is therefore
  * the uncorrelated `DataQueryResponse<DataQuerySource>`, which accepts both a
  * value built from the request (`{ source: query.source, data: … }`) and a
  * precisely discriminated {@link AnyDataQueryResponse} that a transport decoded.
  *
- * @example A host surface forwarding every query over its own channel.
+ * @example A stub answering every query from a view already held in memory.
  * ```ts
- * const provider = createDataProvider((query, { sessionId, signal }) =>
- *   channel.request({ sessionId, query }, signal),
+ * const provider = createDataProvider((query, { sessionId }) =>
+ *   recordedViews.answer(sessionId, query),
  * );
  * ```
  *
@@ -414,17 +586,610 @@ export type DataQueryResolver = (
 /**
  * Whether a value can address a session: a string with a visible character.
  *
- * The one runtime check on the session argument: {@link createDataProvider}
- * applies it before the resolver runs, and `./useQuery` applies it before it
- * calls a provider at all, reporting a failure as the node's error state. A
- * blank id would address `/sessions//panel-data`, which no service answers
- * meaningfully, so it is refused before any transport runs.
+ * The one runtime check on the session argument: {@link createDataProvider} and
+ * {@link createPanelDataProvider} apply it before their resolver runs, and
+ * `./useQuery` applies it before it calls a provider at all, reporting a
+ * failure as the node's error state. A blank id would address
+ * `/sessions//panel-data`, which no service answers meaningfully, so it is
+ * refused before any transport runs.
  *
  * @param sessionId - The candidate session id.
  * @returns `true` when the id is usable as a route segment's value.
  */
 export function isAddressableSessionId(sessionId: unknown): sessionId is string {
   return typeof sessionId === 'string' && sessionId.trim() !== '';
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * Response checking
+ *
+ * One set of shallow, per-source payload guards, shared by the wire-to-view
+ * mapping ({@link mapPanelDataResult}) and by the view check `./useQuery` runs
+ * for every provider ({@link checkDataQueryResponse}), so the two paths cannot
+ * disagree about what a well-formed payload is.
+ *
+ * Shallow on purpose, and mirroring the protocol's own guards for the same
+ * members: a container of the right kind, a page no longer than the largest a
+ * query may ask for, and — for each element or tree — the identifying fields
+ * the views index by. That is the failure a transport boundary actually
+ * produces (a missing field, a payload under the wrong key, a JSON round trip
+ * that dropped a value); a deep re-validation of shapes computed by the
+ * package that defines them would be a second definition of those shapes.
+ *
+ * Every diagnostic names sources, field paths and value *kinds* only. A payload
+ * holds redacted URLs, parameterized statements and prop-name summaries, and
+ * none of it may reach an error message or its details (AAP 0.5.2).
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * The keys of `Shape` that every value of it carries: its required members.
+ *
+ * What lets each guard below name the fields it checks for *as* members of the
+ * element type it guards. A key that is optional on the shape — one a
+ * well-formed value may legitimately omit — is not a member of this union, so
+ * a guard that demanded it would fail to compile instead of refusing valid
+ * data; a key renamed upstream fails to compile here too.
+ *
+ * @typeParam Shape - The result or element type a guard is written for.
+ */
+type RequiredKeyOf<Shape> = {
+  [Key in keyof Shape]-?: Shape extends Readonly<Record<Key, unknown>> ? Key : never;
+}[keyof Shape] &
+  string;
+
+/**
+ * The required keys of `Shape` whose value is a list — the collections a tree
+ * or graph guard checks are arrays.
+ *
+ * @typeParam Shape - The tree or graph type a guard is written for.
+ */
+type RequiredListKeyOf<Shape> = {
+  [Key in keyof Shape]-?: Shape extends Readonly<Record<Key, readonly unknown[]>> ? Key : never;
+}[keyof Shape] &
+  string;
+
+/**
+ * What one check found wrong, described without the value that was wrong.
+ *
+ * Phrased so that "`path` should be `expected`, but is `received`" reads as a
+ * sentence, which is how {@link malformedResponseError} renders it.
+ */
+interface ResponseDefect {
+  /**
+   * Where, relative to the object that was checked: `spans`, `spans[3]`,
+   * `spans[3].spanId`, `trace.roots`, `limit`.
+   */
+  readonly path: string;
+  /** What that position should hold, in words: `"an array"`, `"present"`. */
+  readonly expected: string;
+  /**
+   * What it held, as a kind — `"missing"`, `"null"`, `"a string"`,
+   * `"a negative number"` — never the value itself.
+   */
+  readonly received: string;
+}
+
+/**
+ * A shallow check of one source's payload.
+ *
+ * @param payload - The payload, read from the response as `unknown`.
+ * @param path - The payload's own path, prefixed to every defect's path.
+ * @returns The first defect found, or `undefined` for a well-formed payload.
+ */
+type PayloadGuard = (payload: unknown, path: string) => ResponseDefect | undefined;
+
+/** A plain, non-array object read field by field; every field stays `unknown`. */
+type UnknownRecord = Readonly<Record<string, unknown>>;
+
+/**
+ * Whether a value is a plain, non-array object, narrowing it to a record whose
+ * every field is `unknown` — the same test as the protocol's `isPlainRecord`.
+ *
+ * @param value - Any value.
+ * @returns `true` for a non-null, non-array object.
+ */
+function isUnknownRecord(value: unknown): value is UnknownRecord {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Whether a value is an array, narrowing it to a readonly list of `unknown`
+ * rather than to the `any[]` that `Array.isArray` alone would leave.
+ *
+ * @param value - Any value.
+ * @returns `true` for an array.
+ */
+function isUnknownList(value: unknown): value is readonly unknown[] {
+  return Array.isArray(value);
+}
+
+/**
+ * Whether a value is a non-negative whole number in the safe-integer range — the
+ * protocol's `z.int().min(0)` for every paging counter.
+ *
+ * @param value - Any value.
+ * @returns `true` for `0`, `1`, `2`, … up to `Number.MAX_SAFE_INTEGER`.
+ */
+function isNonNegativeInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+/**
+ * The kind of a value, in words, for a diagnostic that must not quote it.
+ *
+ * Numbers are described by the property that disqualified them rather than by
+ * their digits, which says why a counter was refused without echoing it.
+ *
+ * @param value - The value that was found where something else was expected.
+ * @returns A short noun phrase: `"null"`, `"an array"`, `"a fractional number"`.
+ */
+function describeKind(value: unknown): string {
+  if (value === null) {
+    return 'null';
+  }
+
+  if (isUnknownList(value)) {
+    return 'an array';
+  }
+
+  switch (typeof value) {
+    case 'number':
+      if (!Number.isFinite(value)) {
+        return 'a non-finite number';
+      }
+      if (!Number.isInteger(value)) {
+        return 'a fractional number';
+      }
+      if (value < 0) {
+        return 'a negative number';
+      }
+      return Number.isSafeInteger(value) ? 'a number' : 'an integer beyond the safe range';
+    case 'string':
+      return 'a string';
+    case 'boolean':
+      return 'a boolean';
+    case 'bigint':
+      return 'a bigint';
+    case 'symbol':
+      return 'a symbol';
+    case 'function':
+      return 'a function';
+    case 'undefined':
+      return 'undefined';
+    default:
+      return 'an object';
+  }
+}
+
+/**
+ * The kind of a record's field, distinguishing an absent key from one that is
+ * present and holds something unusable.
+ *
+ * @param record - The object the field was read from.
+ * @param key - The field's name.
+ * @returns `"missing"` for a key the record does not own, else its kind.
+ */
+function describeField(record: UnknownRecord, key: string): string {
+  return Object.hasOwn(record, key) ? describeKind(record[key]) : 'missing';
+}
+
+/**
+ * A guard for an array-valued payload: a list of at most one page of plain
+ * objects, each owning every named identifying key.
+ *
+ * @typeParam List - The source's result type, e.g. `DataResultFor<'renders'>`;
+ * its element type is what the keys are checked against.
+ * @param keys - Required members of the element type every element must own.
+ * @returns The guard.
+ */
+function listGuard<List extends readonly object[]>(
+  keys: readonly RequiredKeyOf<List[number]>[],
+): PayloadGuard {
+  return (payload, path) => {
+    if (!isUnknownList(payload)) {
+      return { path, expected: 'an array', received: describeKind(payload) };
+    }
+
+    // The page ceiling a query's own `limit` carries: a longer list is not a
+    // page any request could have asked for, and bounding it keeps one
+    // malformed answer from becoming unbounded work on the render path.
+    if (payload.length > DATA_QUERY_MAX_LIMIT) {
+      return {
+        path,
+        expected: `an array of at most ${String(DATA_QUERY_MAX_LIMIT)} items`,
+        received: `an array of ${String(payload.length)} items`,
+      };
+    }
+
+    for (let index = 0; index < payload.length; index += 1) {
+      const element = payload[index];
+      const at = `${path}[${String(index)}]`;
+
+      if (!isUnknownRecord(element)) {
+        return { path: at, expected: 'an object', received: describeKind(element) };
+      }
+
+      const absent = keys.find((key) => !Object.hasOwn(element, key));
+      if (absent !== undefined) {
+        return { path: `${at}.${absent}`, expected: 'present', received: 'missing' };
+      }
+    }
+
+    return undefined;
+  };
+}
+
+/**
+ * What {@link recordGuard} checks on a single-value payload.
+ *
+ * @typeParam Shape - The source's result type, `null` included where the wire
+ * permits it.
+ */
+interface RecordGuardSpec<Shape> {
+  /**
+   * Whether `null` is an ordinary answer. Typed by the result shape itself, so
+   * a nullable source cannot be declared non-nullable here or the reverse.
+   */
+  readonly nullable: null extends Shape ? true : false;
+  /** Required members the object must own. */
+  readonly keys: readonly RequiredKeyOf<NonNullable<Shape>>[];
+  /** Required list members the object must own as arrays. */
+  readonly lists: readonly RequiredListKeyOf<NonNullable<Shape>>[];
+}
+
+/**
+ * A guard for a single-value payload — a tree or a graph: a plain object owning
+ * its identifying keys and its top-level collections as arrays, or `null`
+ * where the source permits "nothing matched".
+ *
+ * @typeParam Shape - The source's result type, e.g. `DataResultFor<'trace'>`.
+ * @param spec - See {@link RecordGuardSpec}.
+ * @returns The guard.
+ */
+function recordGuard<Shape>(spec: RecordGuardSpec<Shape>): PayloadGuard {
+  const expected = spec.nullable ? 'an object or null' : 'an object';
+
+  return (payload, path) => {
+    if (payload === null && spec.nullable) {
+      return undefined;
+    }
+
+    if (!isUnknownRecord(payload)) {
+      return { path, expected, received: describeKind(payload) };
+    }
+
+    const absent = spec.keys.find((key) => !Object.hasOwn(payload, key));
+    if (absent !== undefined) {
+      return { path: `${path}.${absent}`, expected: 'present', received: 'missing' };
+    }
+
+    const notAList = spec.lists.find((key) => !isUnknownList(payload[key]));
+    if (notAList !== undefined) {
+      return {
+        path: `${path}.${notAList}`,
+        expected: 'an array',
+        received: describeField(payload, notAList),
+      };
+    }
+
+    return undefined;
+  };
+}
+
+/**
+ * The payload guard of every source, keyed exhaustively by the source
+ * vocabulary.
+ *
+ * The identifying keys are the ones the protocol's `dataResultSchema` checks for
+ * the same member — the event identity and its correlation coordinates for the
+ * two event lists, each aggregate's id and headline fields, the tree and graph
+ * collections — so an answer the service's own schema accepts is accepted here,
+ * and every key is proved by the compiler to be a required member of the type
+ * the source resolves to. `trace` and `componentTree` accept `null`, the
+ * wire's "nothing matched" (a view renders its empty state for it); `graph`
+ * does not, because an empty graph is `{ nodes: [], edges: [] }`.
+ */
+const DATA_PAYLOAD_GUARDS: { readonly [Source in DataQuerySource]: PayloadGuard } = {
+  trace: recordGuard<DataResultFor<'trace'>>({
+    nullable: true,
+    keys: ['traceId'],
+    lists: ['roots'],
+  }),
+  spans: listGuard<DataResultFor<'spans'>>(['id', 'traceId', 'spanId', 'kind', 'tier']),
+  events: listGuard<DataResultFor<'events'>>(['id', 'traceId', 'spanId', 'kind', 'tier']),
+  renders: listGuard<DataResultFor<'renders'>>(['id', 'component', 'renderCount']),
+  componentTree: recordGuard<DataResultFor<'componentTree'>>({
+    nullable: true,
+    keys: ['capturedAt'],
+    lists: ['roots'],
+  }),
+  requests: listGuard<DataResultFor<'requests'>>(['id', 'method', 'url', 'count']),
+  queries: listGuard<DataResultFor<'queries'>>(['id', 'normalizedStatement', 'executionCount']),
+  stateTransitions: listGuard<DataResultFor<'stateTransitions'>>(['id', 'eventId']),
+  graph: recordGuard<DataResultFor<'graph'>>({
+    nullable: false,
+    keys: [],
+    lists: ['nodes', 'edges'],
+  }),
+  metrics: listGuard<DataResultFor<'metrics'>>(['id', 'available']),
+};
+
+/** Whether a response's paging counters must all be present (the wire) or may be absent (the view). */
+type CounterPresence = 'required' | 'optional';
+
+/** The three whole-number counters of the paging echo. */
+type PageCounter = 'total' | 'limit' | 'offset';
+
+/** The paging counters as read off a checked response; any may be absent in the view form. */
+interface PageEcho {
+  readonly total: number | undefined;
+  readonly limit: number | undefined;
+  readonly offset: number | undefined;
+  readonly nextOffset: number | null | undefined;
+}
+
+/**
+ * Read one whole-number paging counter off a response.
+ *
+ * @param record - The response.
+ * @param counter - Which counter.
+ * @param presence - Whether an absent counter is a defect.
+ * @returns The counter (or `undefined` where absence is allowed), or the defect.
+ */
+function readCounter(
+  record: UnknownRecord,
+  counter: PageCounter,
+  presence: CounterPresence,
+): Result<number | undefined, ResponseDefect> {
+  const value = record[counter];
+  const expected =
+    counter === 'limit'
+      ? `a non-negative integer no larger than ${String(DATA_QUERY_MAX_LIMIT)}`
+      : 'a non-negative integer';
+
+  if (value === undefined) {
+    return presence === 'optional'
+      ? ok(undefined)
+      : err({ path: counter, expected, received: describeField(record, counter) });
+  }
+
+  if (!isNonNegativeInteger(value)) {
+    return err({ path: counter, expected, received: describeKind(value) });
+  }
+
+  if (counter === 'limit' && value > DATA_QUERY_MAX_LIMIT) {
+    return err({ path: counter, expected, received: 'a larger number' });
+  }
+
+  return ok(value);
+}
+
+/**
+ * Read the next-page offset off a response: a non-negative whole number, or
+ * the wire's `null` for "this is the last page".
+ *
+ * @param record - The response.
+ * @param presence - Whether an absent key is a defect. The wire always states
+ * it, `null` included, so absence there is a producer that dropped it.
+ * @returns The offset, `null`, or `undefined` where absence is allowed; or the defect.
+ */
+function readNextOffset(
+  record: UnknownRecord,
+  presence: CounterPresence,
+): Result<number | null | undefined, ResponseDefect> {
+  const value = record['nextOffset'];
+  const expected = 'a non-negative integer or null';
+
+  if (value === undefined) {
+    return presence === 'optional'
+      ? ok(undefined)
+      : err({ path: 'nextOffset', expected, received: describeField(record, 'nextOffset') });
+  }
+
+  if (value !== null && !isNonNegativeInteger(value)) {
+    return err({ path: 'nextOffset', expected, received: describeKind(value) });
+  }
+
+  return ok(value);
+}
+
+/**
+ * Read and check all four paging counters of a response.
+ *
+ * @param record - The response.
+ * @param presence - `'required'` for a paged wire member, `'optional'` for the view form.
+ * @returns The counters, or the first defect among them.
+ */
+function readPageEcho(
+  record: UnknownRecord,
+  presence: CounterPresence,
+): Result<PageEcho, ResponseDefect> {
+  const total = readCounter(record, 'total', presence);
+  if (!total.ok) {
+    return total;
+  }
+
+  const limit = readCounter(record, 'limit', presence);
+  if (!limit.ok) {
+    return limit;
+  }
+
+  const offset = readCounter(record, 'offset', presence);
+  if (!offset.ok) {
+    return offset;
+  }
+
+  const nextOffset = readNextOffset(record, presence);
+  if (!nextOffset.ok) {
+    return nextOffset;
+  }
+
+  return ok({
+    total: total.value,
+    limit: limit.value,
+    offset: offset.value,
+    nextOffset: nextOffset.value,
+  });
+}
+
+/**
+ * The response form a check was applied to, which decides the hint a refusal
+ * carries: each names the factory that produces the form the check expected.
+ */
+type ResponseForm = 'wire' | 'view';
+
+/** The recovery hint of a refused response, per the form it was checked as. */
+const RESPONSE_FORM_HINTS: { readonly [Form in ResponseForm]: string } = {
+  wire: "Return the service's panel-data body for the requested source unchanged: its payload under the source-named key and, for a paged source, all four of total, limit, offset and nextOffset.",
+  view: 'Return the view form for the requested source: its payload under data, with any paging counters as non-negative integers. A service body belongs behind createPanelDataProvider, which maps it.',
+};
+
+/**
+ * The error a response that fails a structural check is refused with.
+ *
+ * `PROTOCOL_INVALID_MESSAGE`, like the protocol's own parse failures: the
+ * response broke the panel-data contract. The details repeat the defect in
+ * machine-readable form and hold only the source, a field path and two kind
+ * phrases — nothing read out of the payload.
+ *
+ * @param source - The source that was requested.
+ * @param defect - What was wrong, and where.
+ * @param form - The form the response was checked as.
+ * @returns A fresh error.
+ */
+function malformedResponseError(
+  source: DataQuerySource,
+  defect: ResponseDefect,
+  form: ResponseForm,
+): DebuggenError {
+  return new DebuggenError(
+    'PROTOCOL_INVALID_MESSAGE',
+    `The data provider's "${source}" response is malformed: ${defect.path} should be ${defect.expected}, but is ${defect.received}.`,
+    {
+      hint: RESPONSE_FORM_HINTS[form],
+      details: {
+        source,
+        form,
+        field: defect.path,
+        expected: defect.expected,
+        received: defect.received,
+      },
+    },
+  );
+}
+
+/**
+ * The error a response answering for another source is refused with.
+ *
+ * The received source is named only when it is a member of the source
+ * vocabulary. Anything else in that position is not a source at all, may be
+ * any value a producer put there, and is reported by its kind instead.
+ *
+ * @param requested - The source that was requested.
+ * @param received - The value the response carried as its `source`.
+ * @param form - The form the response was checked as.
+ * @returns A fresh error.
+ */
+function sourceMismatchError(
+  requested: DataQuerySource,
+  received: unknown,
+  form: ResponseForm,
+): DebuggenError {
+  if (isDataQuerySource(received)) {
+    return new DebuggenError(
+      'PROTOCOL_INVALID_MESSAGE',
+      `The data provider answered a "${requested}" query with a "${received}" response.`,
+      {
+        hint: 'Return the response for the source that was requested; a view reads the payload according to it.',
+        details: { requested, received, form },
+      },
+    );
+  }
+
+  const receivedKind = received === undefined ? 'missing' : describeKind(received);
+
+  return new DebuggenError(
+    'PROTOCOL_INVALID_MESSAGE',
+    `The data provider answered a "${requested}" query with a response naming no known source (its source is ${receivedKind}).`,
+    {
+      hint: 'Echo the requested source on the response; a view reads the payload according to it.',
+      details: { requested, receivedKind, form },
+    },
+  );
+}
+
+/**
+ * Check a response's envelope — a plain object whose `source` is the one that
+ * was requested — before anything inside it is read.
+ *
+ * @param requested - The source that was requested.
+ * @param response - The response, as `unknown`.
+ * @param form - The form the response is being checked as.
+ * @returns The response as a record, or the error it is refused with.
+ */
+function checkEnvelope(
+  requested: DataQuerySource,
+  response: unknown,
+  form: ResponseForm,
+): Result<UnknownRecord, DebuggenError> {
+  if (!isUnknownRecord(response)) {
+    return err(
+      malformedResponseError(
+        requested,
+        { path: 'the response', expected: 'an object', received: describeKind(response) },
+        form,
+      ),
+    );
+  }
+
+  if (response['source'] !== requested) {
+    return err(sourceMismatchError(requested, response['source'], form));
+  }
+
+  return ok(response);
+}
+
+/**
+ * Check the payload a response carries under `member` against the requested
+ * source's guard.
+ *
+ * @param requested - The source that was requested, which selects the guard.
+ * @param record - The response whose envelope has already been checked.
+ * @param member - Where the payload sits: the source's own name on the wire,
+ * `data` in the view form.
+ * @returns The first defect found, or `undefined`.
+ */
+function payloadDefect(
+  requested: DataQuerySource,
+  record: UnknownRecord,
+  member: string,
+): ResponseDefect | undefined {
+  if (!Object.hasOwn(record, member)) {
+    return { path: member, expected: 'present', received: 'missing' };
+  }
+
+  return DATA_PAYLOAD_GUARDS[requested](record[member], member);
+}
+
+/**
+ * The error both factories refuse a call naming no usable session with, before
+ * their resolver runs.
+ *
+ * @param source - The source of the query that could not be addressed. The
+ * unusable session value itself is not echoed.
+ * @returns A fresh error.
+ */
+function unaddressedQueryError(source: DataQuerySource): DebuggenError {
+  return new DebuggenError(
+    'PROTOCOL_INVALID_MESSAGE',
+    `The data provider was asked for a "${source}" query without a session to address it to.`,
+    {
+      hint: 'Pass the sessionId of the panel being rendered; PanelHost provides it through PanelSessionContext.',
+      details: { source },
+    },
+  );
 }
 
 /**
@@ -435,11 +1200,16 @@ export function isAddressableSessionId(sessionId: unknown): sessionId is string 
  * signature forces on any uniform implementation: it lives on one line below,
  * guarded, instead of once per host surface and once per test stub. The second
  * is enforcement of the first obligation on {@link DataProvider} — a response
- * must answer for the source it was asked about. A resolver that answers a
- * request for one source with another source's payload is a defect that would
- * otherwise surface far away, inside a component that had already switched on
- * `source` and started reading fields the data does not have; here it becomes a
- * rejection with a code and a hint, which a node renders as its error state.
+ * must answer for the source it was asked about — through
+ * {@link checkDataQueryResponse}, which also checks the payload container and
+ * the paging counters. A resolver that answers a request for one source with
+ * another source's payload is a defect that would otherwise surface far away,
+ * inside a component that had already switched on `source` and started
+ * reading fields the data does not have; here it becomes a rejection with a
+ * code and a hint, which a node renders as its error state. (`./useQuery`
+ * applies the same check to every provider, so a hand-written one is held to
+ * it too; running it here as well keeps the factory's own promise true for a
+ * caller that reads a provider without the hook.)
  *
  * A third is the session hand-over: the provider's positional `sessionId` is
  * checked with {@link isAddressableSessionId} and passed to the resolver on
@@ -466,36 +1236,239 @@ export function createDataProvider(resolve: DataQueryResolver): DataProvider {
       options?: DataQueryOptions,
     ): Promise<DataQueryResponse<Source>> {
       if (!isAddressableSessionId(sessionId)) {
-        throw new DebuggenError(
-          'PROTOCOL_INVALID_MESSAGE',
-          `The data provider was asked for a "${query.source}" query without a session to address it to.`,
-          {
-            hint: 'Pass the sessionId of the panel being rendered; PanelHost provides it through PanelSessionContext.',
-            details: { source: query.source },
-          },
-        );
+        throw unaddressedQueryError(query.source);
       }
 
       const response = await resolve(query, { sessionId, signal: options?.signal });
 
-      if (response.source !== query.source) {
-        throw new DebuggenError(
-          'PROTOCOL_INVALID_MESSAGE',
-          `The data provider answered a "${query.source}" query with a "${response.source}" response.`,
-          {
-            hint: 'Return the response for the source that was requested; a view reads the payload according to it.',
-            details: { requested: query.source, received: response.source },
-          },
-        );
+      const problem = checkDataQueryResponse(query, response);
+      if (problem !== undefined) {
+        throw problem;
       }
 
-      // The single assertion this module exists to contain. It is sound because
-      // of the guard above: `response.source` equals `query.source`, and the
-      // union's members pair each source with its own result type, so the
-      // member that survived that comparison is the one this signature promises.
-      // Nothing is trusted about `data` beyond that pairing, which is precisely
-      // what the resolver's return type already established.
+      // The assertion this factory exists to contain. It is sound because of
+      // the check above: `response.source` equals `query.source`, and `data`
+      // passed that source's payload guard, so the member of the union that
+      // survived is the one this signature promises. What the compiler cannot
+      // see is only the correlation between a generic `Source` and the
+      // resolver's uncorrelated return type.
       return response as DataQueryResponse<Source>;
+    },
+  };
+}
+
+/**
+ * Translate the service's answer to one query — the wire form — into the view
+ * form every component reads, validating it on the way.
+ *
+ * The host-boundary half of the panel-data contract, for all ten sources: the
+ * payload the service sent under the source-named key (`result.trace`,
+ * `result.spans`, …) becomes `data`, and for the array-valued sources the four
+ * paging counters are carried across as they arrived — `nextOffset: null`
+ * included, which `./useQuery` folds into its one end-of-data value.
+ *
+ * The result is accepted only when it is a plain object answering for the
+ * requested source, its source-named payload passes that source's shallow
+ * guard (the same guards {@link checkDataQueryResponse} applies to the view
+ * form), and, for a paged source, `total`, `limit` and `offset` are
+ * non-negative integers with `limit` no larger than `DATA_QUERY_MAX_LIMIT` and
+ * `nextOffset` is a non-negative integer or `null` — all four present, as the
+ * service always sends them. Anything else is returned as a
+ * `PROTOCOL_INVALID_MESSAGE` error whose message and details name the source,
+ * the field and the kind of value found, never the value. That includes a
+ * response already in the view form (`{ source: 'spans', data: […] }`): it
+ * carries no `spans` member, and accepting it would confuse the two forms in
+ * the direction opposite to the one this mapping exists to rule out.
+ *
+ * Total, like the protocol's parse helpers: a refusal is a returned value, so a
+ * caller outside a promise chain need not catch. {@link createPanelDataProvider}
+ * is the usual caller; call this directly only where a response arrives outside
+ * a {@link DataProvider} call — a recorded body replayed into a fixture, say.
+ *
+ * @example
+ * ```ts
+ * const mapped = mapPanelDataResult({ source: 'renders' }, JSON.parse(body));
+ * if (mapped.ok) {
+ *   mapped.value.data; // readonly RenderStat[]
+ * }
+ * ```
+ *
+ * @typeParam Source - The requested source, inferred from `query.source`.
+ * @param query - The query the result answers; only its `source` is read.
+ * @param result - The service's answer, as `unknown`: a parsed JSON body, or a
+ * {@link PanelDataResult} a transport already decoded.
+ * @returns `ok(response)` in the view form, or `err(error)`.
+ */
+export function mapPanelDataResult<Source extends DataQuerySource>(
+  query: DataQuery & { source: Source },
+  result: unknown,
+): Result<DataQueryResponse<Source>, DebuggenError> {
+  const requested = query.source;
+
+  const envelope = checkEnvelope(requested, result, 'wire');
+  if (!envelope.ok) {
+    return envelope;
+  }
+
+  const record = envelope.value;
+  const defect = payloadDefect(requested, record, requested);
+  if (defect !== undefined) {
+    return err(malformedResponseError(requested, defect, 'wire'));
+  }
+
+  // The one assertion of the mapping, and it is sound: `record[requested]` is
+  // the payload the service keyed by the requested source, and it has just
+  // passed that source's guard. What the compiler cannot see is only the
+  // correlation between a generic `Source` and the guard table's entry for it.
+  const data = record[requested] as DataResultFor<Source>;
+
+  if (DATA_QUERY_PAGING[requested] === 'single') {
+    return ok({ source: requested, data });
+  }
+
+  const page = readPageEcho(record, 'required');
+  if (!page.ok) {
+    return err(malformedResponseError(requested, page.error, 'wire'));
+  }
+
+  return ok({ source: requested, data, ...page.value });
+}
+
+/**
+ * Check that a view-form response really answers the query it was returned for
+ * — the check `./useQuery` applies to every provider's answer before a
+ * component may read it.
+ *
+ * A {@link DataProvider} is an interface any host may implement by hand, and
+ * its generic signature promises a `DataQueryResponse<Source>` that nothing at
+ * runtime enforces: a provider can answer a `renders` query with a `requests`
+ * response, put the payload under the wrong key, or hand over the service's
+ * wire-form body untranslated. Any of those reaching a component would draw
+ * the wrong evidence under the node's title, or throw mid-render, instead of
+ * showing a retryable error state. This is where each is caught, whichever
+ * factory — or none — built the provider.
+ *
+ * The response is accepted only when it is a plain object whose `source` equals
+ * `query.source`, whose `data` passes that source's shallow payload guard (the
+ * same guards {@link mapPanelDataResult} applies on the wire: the right kind of
+ * container, at most `DATA_QUERY_MAX_LIMIT` items, the identifying fields of
+ * each element or tree, `null` only for `trace` and `componentTree`), whose
+ * `total`, `limit` and `offset` are each absent or a non-negative integer —
+ * `limit` no larger than `DATA_QUERY_MAX_LIMIT` — and whose `nextOffset` is
+ * absent, `null` or a non-negative integer. It reads nothing else and changes
+ * nothing: no element is re-sorted, filtered or copied.
+ *
+ * @param query - The query the response was returned for; only its `source` is read.
+ * @param response - The provider's answer, as `unknown`.
+ * @returns `undefined` when the response may be drawn, or the
+ * `PROTOCOL_INVALID_MESSAGE` error to report instead — its message and details
+ * name the sources, the field and the kind of value found, never the value.
+ */
+export function checkDataQueryResponse(
+  query: DataQuery,
+  response: unknown,
+): DebuggenError | undefined {
+  const requested = query.source;
+
+  const envelope = checkEnvelope(requested, response, 'view');
+  if (!envelope.ok) {
+    return envelope.error;
+  }
+
+  const record = envelope.value;
+  const defect = payloadDefect(requested, record, 'data');
+  if (defect !== undefined) {
+    return malformedResponseError(requested, defect, 'view');
+  }
+
+  const page = readPageEcho(record, 'optional');
+  if (!page.ok) {
+    return malformedResponseError(requested, page.error, 'view');
+  }
+
+  return undefined;
+}
+
+/**
+ * A source-agnostic resolver that answers in the wire form: one function that
+ * forwards any query over a host surface's channel and returns the service's
+ * `POST /sessions/:id/panel-data` body for it.
+ *
+ * The shape the DevTools panel and the editor webview have — their channel
+ * returns the body the service sent, which the protocol's `parseDataResult`
+ * turns into a typed `DataResult` that is assignable to {@link PanelDataResult}
+ * as it stands. {@link createPanelDataProvider} turns it into a
+ * {@link DataProvider} that maps each answer into the view form.
+ *
+ * The obligations on {@link DataProvider} apply — route by `context.sessionId`,
+ * honour `context.signal`, reject rather than resolve on failure — except the
+ * view-form ones, which the factory discharges: the resolver returns the body
+ * untouched and never builds `data` itself. Like {@link DataQueryResolver}, its
+ * return type is uncorrelated with the request's source, because the factory
+ * checks at runtime that the two agree.
+ *
+ * @param query - The query to resolve, exactly as the node carried it.
+ * @param context - The session to address and the per-call options.
+ * @returns The service's answer for the query's own source, in the wire form.
+ */
+export type PanelDataResolver = (
+  query: DataQuery,
+  context: DataQueryResolverContext,
+) => Promise<PanelDataResult>;
+
+/**
+ * Build a {@link DataProvider} from a {@link PanelDataResolver} — the factory a
+ * host surface whose transport returns the service's body uses.
+ *
+ * Everything {@link createDataProvider} guarantees holds here too: a call that
+ * names no usable session is refused before the resolver runs, the session is
+ * handed to the resolver unchanged beside the abort signal, and a resolver
+ * that throws synchronously still produces a rejected promise because it is
+ * invoked inside an `async` method. The difference is the answer: each result
+ * is translated into the view form by {@link mapPanelDataResult}, and a result
+ * that fails that mapping — a misrouted source, a payload under the wrong key,
+ * a missing or malformed paging counter — rejects with its
+ * `PROTOCOL_INVALID_MESSAGE` error, which a node renders as its error state
+ * with a retry, instead of reaching a component as a response with no `data`.
+ *
+ * Create it once per host surface and keep the reference (obligation 7 on
+ * {@link DataProvider}): the session travels on every call, so one provider
+ * serves every panel that surface shows.
+ *
+ * @example The DevTools panel over its port to the service worker.
+ * ```ts
+ * const provider = createPanelDataProvider(async (query, { sessionId, signal }) => {
+ *   const body = await port.request({ sessionId, query }, signal);
+ *   const parsed = parseDataResult(body); // from @debuggen/protocol, in the host
+ *   if (!parsed.ok) {
+ *     throw parsed.error;
+ *   }
+ *   return parsed.value;
+ * });
+ * ```
+ *
+ * @param resolve - The resolver to adapt. Called once per query.
+ * @returns A provider that delegates every query to `resolve` and maps its answer.
+ */
+export function createPanelDataProvider(resolve: PanelDataResolver): DataProvider {
+  return {
+    async query<Source extends DataQuerySource>(
+      sessionId: string,
+      query: DataQuery & { source: Source },
+      options?: DataQueryOptions,
+    ): Promise<DataQueryResponse<Source>> {
+      if (!isAddressableSessionId(sessionId)) {
+        throw unaddressedQueryError(query.source);
+      }
+
+      const result = await resolve(query, { sessionId, signal: options?.signal });
+      const mapped = mapPanelDataResult(query, result);
+
+      if (!mapped.ok) {
+        throw mapped.error;
+      }
+
+      return mapped.value;
     },
   };
 }

@@ -14,18 +14,21 @@
  * cart out of the session's hands before a checkout starts spending money
  * against it, and it is the reason two checkouts of one cart cannot both reach
  * a carrier or a processor: exactly one of them takes it, because taking it is
- * a single conditional write that one caller wins. {@link unclaim} puts it back
- * when the checkout it was taken for did not finish, so a customer whose
- * payment was declined still has their cart. The cart's last transition, to
- * `CONVERTED`, happens inside the transaction that writes the order, which is
- * what makes a cart and the order it became one fact rather than two: there is
- * no moment at which an order exists and its cart is still orderable, and no
- * second order can be written from a cart that has already become one. That
- * last property is what makes the third moment worth having:
- * {@link readCartOutcome} reads back what a session's cart became, so a
- * checkout that finds nothing to order can tell an order that was already
- * placed from a cart an attempt is holding and from a session that never had a
- * cart at all.
+ * a single conditional write that one caller wins. The same write puts the name
+ * of the attempt that took it on the cart - `CheckoutDraft.idempotencyKey`, in
+ * `carts.checkout_key` - so which attempt holds which cart is a fact the store
+ * keeps rather than one a process remembers. {@link unclaim} puts it back, name
+ * and all, when the checkout it was taken for did not finish, so a customer
+ * whose payment was declined still has their cart and the name holds nothing.
+ * The cart's last transition, to `CONVERTED`, happens inside the transaction
+ * that writes the order, which is what makes a cart and the order it became one
+ * fact rather than two: there is no moment at which an order exists and its
+ * cart is still orderable, and no second order can be written from a cart that
+ * has already become one. The name stays on the converted cart, and that is
+ * what {@link readAttempt} reads back: what the attempt of a given name did -
+ * the order its cart became, or the cart it is still holding - so a repeat of a
+ * submission is answered with that attempt's own outcome by any process, after
+ * any restart, and never with the outcome of another attempt.
  *
  * The same transaction releases the session's open-cart pointer. A cart holds
  * `carts.open_token` for as long as it is the cart its session shops with, and
@@ -103,6 +106,17 @@ const PAGE_SIZE_CEILING = 100;
 
 /** How many lines one order may carry, which is well beyond any cart this store takes. */
 const LINE_CEILING = 200;
+
+/**
+ * The code a rejected unique constraint arrives with.
+ *
+ * `carts.checkout_key` is unique, so it is what the database answers a claim
+ * with when the attempt name it carries is already on another cart. It is
+ * matched as a string off the caught value, as `./cart.service` and the mapper
+ * in `@/server/errors` match it, because the generated client's error classes
+ * are a build product this module's types do not otherwise depend on.
+ */
+const DUPLICATE = 'P2002';
 
 /**
  * Everything needed to write an order, as the checkout assembles it.
@@ -701,15 +715,44 @@ function blank(): ShippingAddress {
  * which is what it reads as afterwards. {@link unclaim} is how a checkout that
  * failed puts it back.
  *
+ * The same statement writes the name of the attempt that took the cart, so the
+ * hold and the name it is held under are one fact: there is no moment at which
+ * a cart is held by nobody in particular, and {@link readAttempt} can answer a
+ * repeat of that name from this row after the process that took it is gone. The
+ * column is unique, so a name already on another cart makes the whole write
+ * fail and the cart is not taken. That is answered as the collision it is
+ * rather than as the database's own wording: nothing has been spent, and the
+ * submission that carried the name is not the attempt that holds it.
+ *
  * @param id The cart to take.
+ * @param key The name of the attempt taking it, as the submission carried it.
  * @throws StorefrontConflictError When the cart is not open to be taken -
- * another checkout holds it, or it has already become an order.
+ * another checkout holds it, or it has already become an order - or when `key`
+ * already holds another cart.
  */
-export async function claim(id: string): Promise<void> {
-  const taken = await prisma.cart.updateMany({
-    where: { id, status: CartStatus.ACTIVE },
-    data: { status: CartStatus.ABANDONED },
-  });
+export async function claim(id: string, key: string): Promise<void> {
+  let taken: { count: number };
+
+  try {
+    taken = await prisma.cart.updateMany({
+      where: { id, status: CartStatus.ACTIVE },
+      data: { status: CartStatus.ABANDONED, checkoutKey: key },
+    });
+  } catch (cause) {
+    if (
+      typeof cause === 'object' &&
+      cause !== null &&
+      'code' in cause &&
+      cause.code === DUPLICATE
+    ) {
+      throw new StorefrontConflictError(
+        'This order was already started from another cart, so nothing was taken from this one. Check your orders before placing it again.',
+        { cause },
+      );
+    }
+
+    throw cause;
+  }
 
   if (taken.count === 0) {
     throw new StorefrontConflictError(
@@ -727,12 +770,17 @@ export async function claim(id: string): Promise<void> {
  * happened. A cart that was never taken, or has since been converted, is left
  * exactly as it is.
  *
+ * The attempt's name comes off the cart in the same statement. A checkout puts
+ * a cart back only when it took nothing against it, so the name no longer holds
+ * anything, and a repeat of it is a submission like any other rather than one
+ * answered with a cart the customer is shopping with again.
+ *
  * @param id The cart to put back.
  */
 export async function unclaim(id: string): Promise<void> {
   await prisma.cart.updateMany({
     where: { id, status: CartStatus.ABANDONED },
-    data: { status: CartStatus.ACTIVE },
+    data: { status: CartStatus.ACTIVE, checkoutKey: null },
   });
 }
 
@@ -1108,68 +1156,62 @@ export async function readOrderDetail(id: string): Promise<OrderDetail> {
 }
 
 /**
- * What the store's records say about the cart a session is shopping with, for a
- * caller that has already established the session is holding no open one.
- */
-export interface CartOutcome {
-  /** The cart the session's token names. */
-  cart: string;
-
-  /**
-   * The order it became, or `null` when it has not become one - which, for a
-   * cart that is no longer open, means an attempt is holding it rather than
-   * that nothing happened to it.
-   */
-  order: OrderDetail | null;
-}
-
-/**
- * What became of the last cart of a session that a checkout took: the order it
- * became, or the fact that it exists and became none.
+ * What the attempt of a given name did, as the store's records say: the cart it
+ * claimed, and the order that cart became.
  *
- * It answers the question a checkout asks when it finds nothing to order: did a
- * cart of this session become an order, is one being held by an attempt, or has
- * this session never checked anything out? Without an answer all three are
- * indistinguishable, and a customer whose order was placed by a submission whose
- * reply was lost would be told their cart is empty and invited to order again.
- * With one, each of the three has its own answer, and none of them is a
- * statement that nothing was charged.
+ * It answers the question a checkout asks of a submission before it takes
+ * anything: has this very attempt already been made? The name is written on the
+ * cart by {@link claim}, kept when the cart becomes an order and taken off by
+ * {@link unclaim}, so the row that carries it is the whole record, and the
+ * answer is the same from any process and after any restart. Each state the
+ * cart can be in has exactly one reading:
  *
- * The cart looked for is the session's most recent one that is no longer being
- * shopped with, because a session accumulates a cart per order it places and the
- * question is about the last one a checkout took. A cart the session is still
- * shopping with is not an answer to it: it has become nothing, and the checkout
- * that asked is looking past it.
+ * * **`CONVERTED`.** The attempt placed an order, and that order is the answer.
+ * * **`ABANDONED`.** The attempt is holding the cart - running now, or ended
+ *   with an authorization that may stand against it - and no order was written.
+ *   The cart comes back with `order: null`, which is never a statement that
+ *   nothing was charged.
+ * * **`ACTIVE`, or no cart at all.** The name holds nothing: the attempt never
+ *   claimed a cart, or the cart it held has been reopened by hand for the
+ *   customer to shop with again. That is `null`, the same answer a name nobody
+ *   has used gets.
  *
- * The cart is addressed by the session's own token, so what this returns is only
- * ever the order of a cart the caller was already entitled to read; nothing
- * about which order to look for comes from a request. The link between the two
- * is the quote the freight was charged at - it is written against the cart when
- * the freight is rated and against the order when the order is placed, in the
- * transaction that writes it - so an order with a quote for this cart is an
- * order that was placed from it. The most recently quoted one wins, which is
- * the order a repeated checkout of one cart would have placed.
+ * The cart is addressed by the session's own token as well as by the name, so
+ * what this returns is only ever the order of a cart the caller was already
+ * entitled to read: a name from a request can find this session's attempt and
+ * nothing else. The link from the cart to its order is the quote the freight
+ * was charged at - it is written against the cart when the freight is rated and
+ * against the order when the order is placed, in the transaction that writes it
+ * - so an order with a quote for this cart is an order that was placed from it.
+ * The most recently quoted one wins, which is the order a repeated checkout of
+ * one cart would have placed.
  *
  * @param token The session token the cart is addressed by, as `./cart.service`
  * addresses it.
- * @returns The cart and the order it became, the cart and `null` when it became
- * none, or `null` when no cart of this session was ever checked out. A quote
- * that names an order names one that exists: deleting an order deletes the
- * quotes written against it.
+ * @param key The attempt's name, as the submission carried it.
+ * @returns `cart`, the cart the attempt claimed, with `order`, the order it
+ * became - or `null` in `order` for a cart still held, and for a converted cart
+ * whose order cannot be found through its quotes - or `null` when the name holds
+ * no cart of this session. A quote that names an order names one that exists:
+ * deleting an order deletes the quotes written against it.
  */
-export async function readCartOutcome(token: string): Promise<CartOutcome | null> {
-  const cart = await prisma.cart.findFirst({
-    where: { sessionToken: token, status: { not: CartStatus.ACTIVE } },
-    // The most recent one: a session accumulates a cart per order it places, and
-    // the question being asked is about the last one a checkout took. The
-    // identifier breaks a tie the timestamp cannot, so two carts finished in one
-    // instant are not free to change places between reads.
-    orderBy: [{ updatedAt: 'desc' }, { id: 'desc' }],
-    select: { id: true },
+export async function readAttempt(
+  token: string,
+  key: string,
+): Promise<{ cart: string; order: OrderDetail | null } | null> {
+  // One row at most: the name is unique across carts, and the token keeps the
+  // lookup inside the session asking.
+  const cart = await prisma.cart.findUnique({
+    where: { checkoutKey: key, sessionToken: token },
+    select: { id: true, status: true },
   });
 
-  if (cart === null) {
+  if (cart === null || cart.status === CartStatus.ACTIVE) {
     return null;
+  }
+
+  if (cart.status === CartStatus.ABANDONED) {
+    return { cart: cart.id, order: null };
   }
 
   const quoted = await prisma.shippingQuote.findFirst({

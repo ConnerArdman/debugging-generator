@@ -18,6 +18,50 @@
  * truncated, re-encoded or silently replaced, the original cannot be restored
  * and the promise is broken. Every decision below is made in that light.
  *
+ * ## The journaled path is where a backup is, within its own session
+ *
+ * The journal lets a record's `backupPath` change after it was written
+ * (`ModificationStatusPatch.backupPath`): a conflict backup can be moved aside,
+ * into a quarantine directory, and the record then says where it went so the
+ * developer is pointed at the right file. A restore that recomposed the path
+ * from the digest would miss a relocated backup, report it missing and strand
+ * the patched file. So the operations that act *for a record* —
+ * {@link BackupStore.locateRecorded}, {@link BackupStore.readRecorded} and
+ * {@link BackupStore.removeRecorded} — take the recorded path and resolve it
+ * under one policy:
+ *
+ * | The recorded path is | It resolves to | Source |
+ * | --- | --- | --- |
+ * | the path this store composes for the digest | that path | `composed` |
+ * | an absolute, normalised path **inside this session's own directory**, in a subdirectory of it, whose file name is the record's digest | the recorded path | `relocated` |
+ * | anything else — another session's directory, another state root, a traversal, a path outside the tree | the path this store composes | `substituted` |
+ *
+ * A relocation is bound to the record twice over: to its **session**, because
+ * a store acts only inside its own session's directory — so one session's
+ * record can never read, or delete, a backup another session still holds —
+ * and to its **digest**, because every backup is filed under the digest of its
+ * content and a relocated one keeps that name. It must sit in a subdirectory,
+ * never directly in the session directory: that level is where the composed
+ * backups live, and it is the only level
+ * {@link BackupStore.removeSessionDirectory}'s non-recursive sweep touches, so a
+ * relocated backup is never swept with them.
+ *
+ * A relocated backup is reached through `pinPrivateFileWithinRoot` from
+ * `@debuggen/shared/node`: every directory from the state root down is opened
+ * relative to the one above it without following a link and held to the
+ * store's ownership and permission policy **through the descriptor it opened**,
+ * and the read and the unlink then go through that descriptor. A directory
+ * swapped for a link after the check therefore cannot redirect either one out
+ * of the tree (CWE-367). Before a relocated backup is deleted its bytes are
+ * read through the same handle and must hash to the record's digest, and the
+ * entry must still be the one that was read. A recorded path outside those
+ * bounds is never opened at all: the store reads its own content-addressed
+ * location for the digest instead, which is what a record written against a
+ * state directory that has since moved needs, and which can only ever yield
+ * bytes the caller then checks against `originalHash`. In no case does a string
+ * from the journal reach a filesystem call outside this session's own backup
+ * directory.
+ *
  * ## Guarantees
  *
  * 1. **Byte fidelity.** Bytes in, the same bytes out. Content is accepted as a
@@ -112,7 +156,11 @@
  * unlinking, listing and removing the session directory — it uses
  * `node:fs/promises` directly, which is genuinely asynchronous; where it uses a
  * synchronous primitive it runs it through {@link onPromiseBoundary}, so a
- * blocking read or write never happens in the caller's own turn.
+ * blocking read or write never happens in the caller's own turn. The one
+ * deliberate exception is the deletion of a relocated backup, which pins its
+ * directory, reads and hashes the backup and unlinks it in **one** synchronous
+ * step: an `await` between the check and the unlink is exactly the window a
+ * swapped directory needs.
  *
  * ## What is deliberately not here
  *
@@ -124,8 +172,9 @@
  *   `mkdtemp`.
  * - **Project paths.** This store owns the backup tree and nothing else. It
  *   never reads, writes or hashes a file inside a developer's project; the
- *   patcher and cleanup do that through `atomicReplaceFile` and the digest
- *   helpers. The one place the two meet is
+ *   patcher and cleanup do that through the conditional, no-clobber writers
+ *   of `@debuggen/shared/node` and the digest helpers. The one place the two
+ *   meet is
  *   {@link RemoveBackupOptions.restoredContentHash}, where a caller hands over
  *   the digest it computed of the content it restored and this store refuses
  *   the delete unless it matches — "delete only after verification", enforced
@@ -142,11 +191,14 @@
  *   reads no global.
  */
 
+import { lstatSync, unlinkSync } from 'node:fs';
 import type { Dirent } from 'node:fs';
 import { lstat, readdir, rmdir, unlink } from 'node:fs/promises';
 
 import {
   DebuggenError,
+  basenamePosix,
+  dirnamePosix,
   err,
   isAbsolutePosix,
   isErr,
@@ -156,6 +208,7 @@ import {
   noopLogger,
   normalizePosix,
   ok,
+  relativePosix,
   toPosix,
 } from '@debuggen/shared';
 import type { Logger, Result } from '@debuggen/shared';
@@ -164,9 +217,13 @@ import {
   assertSecureDir,
   createFileExclusive,
   ensureSecureDir,
+  isSameFileIdentity,
+  pinPrivateFileWithinRoot,
   readFileNoFollow,
+  readFileSnapshotNoFollow,
   sha256Hex,
 } from '@debuggen/shared/node';
+import type { PinnedFile } from '@debuggen/shared/node';
 
 import { SHA256_HEX_PATTERN, sha256HexSchema } from '../schema/modification.js';
 
@@ -193,6 +250,17 @@ const BACKUPS_DIRECTORY_NAME = 'backups';
  * invented by a fixture, still passes.
  */
 const MAX_PATH_SEGMENT_LENGTH = 128;
+
+/**
+ * The longest recorded `backupPath` this store will treat as a relocation.
+ *
+ * The same bound the modification schema puts on the field — the conventional
+ * `PATH_MAX` on Linux — so a record that bypassed the schema cannot hand a
+ * syscall a path it would refuse with `ENAMETOOLONG` halfway through a restore.
+ * A longer string is not an error: it is simply not a relocation, and the
+ * store's own location for the digest is used instead.
+ */
+const MAX_RECORDED_PATH_LENGTH = 4096;
 
 /**
  * How many retained entry names a failed {@link BackupStore.removeSessionDirectory}
@@ -222,10 +290,15 @@ const MAX_REPORTED_RETAINED_ENTRIES = 20;
  *   not hash to the `originalHash` they were to be filed under. Refused at the
  *   door: a mislabelled backup would be trusted at restore time and would
  *   overwrite a developer's file with foreign content.
- * - `stored-digest-mismatch` — the file already at the composed path does not
- *   hash to its own name, so the store's invariant is broken. The file is kept
- *   and never overwritten.
+ * - `stored-digest-mismatch` — a stored backup (at the composed path, or a
+ *   relocated one about to be deleted) does not hash to its own name, so the
+ *   store's invariant is broken. The file is kept and never overwritten.
  * - `backup-missing` — an operation that required a backup found none.
+ * - `backup-replaced` — a relocated backup's directory entry changed between
+ *   the read that verified it and the unlink that would have deleted it, or —
+ *   on a platform that cannot address a directory descriptor as a path — the
+ *   directory that was judged no longer sits at its path. Nothing is read from
+ *   or deleted at that path: what is there now is not what was verified.
  * - `restored-content-digest-mismatch` — a caller asked to delete a backup and
  *   declared the digest of the content it restored, and the two disagree. The
  *   backup is retained, because it is still the only copy of the original.
@@ -239,6 +312,7 @@ export type BackupStoreFailureReason =
   | 'content-digest-mismatch'
   | 'stored-digest-mismatch'
   | 'backup-missing'
+  | 'backup-replaced'
   | 'restored-content-digest-mismatch'
   | 'session-directory-not-emptied';
 
@@ -477,16 +551,69 @@ export interface RemoveBackupOptions {
 }
 
 /**
+ * How a record's recorded `backupPath` was resolved by
+ * {@link BackupStore.locateRecorded}.
+ *
+ * - `composed` — the recorded path is exactly the one this store composes for
+ *   the digest: the ordinary case, and the only one a patcher ever writes.
+ * - `relocated` — the recorded path differs, and is an absolute, normalised
+ *   path in a subdirectory of this session's own backup directory whose file
+ *   name is the record's digest: the backup was moved aside within the
+ *   session's own tree and the record says where. It is used as recorded.
+ * - `substituted` — the recorded path is not one this store will open (another
+ *   session's directory, another state root, a traversal, a file not named by
+ *   its digest, a relative or control-character path). It is never touched;
+ *   the store's own composed location for the digest is used in its place.
+ *
+ * Frozen because it is a module-level table consumers may switch over.
+ */
+export const RECORDED_BACKUP_SOURCES = Object.freeze([
+  'composed',
+  'relocated',
+  'substituted',
+] as const);
+
+/** One of {@link RECORDED_BACKUP_SOURCES}. */
+export type RecordedBackupSource = (typeof RECORDED_BACKUP_SOURCES)[number];
+
+/** Where the backup a record names is, as {@link BackupStore.locateRecorded} resolved it. */
+export interface RecordedBackupLocation {
+  /**
+   * The absolute path the store acts on, POSIX separators: always inside
+   * `<debuggenHome>/backups`.
+   */
+  readonly path: string;
+
+  /** Why this path and not another. See {@link RecordedBackupSource}. */
+  readonly source: RecordedBackupSource;
+}
+
+/** The outcome of {@link BackupStore.readRecorded}. */
+export interface RecordedBackup extends RecordedBackupLocation {
+  /**
+   * The backup's bytes, exactly as stored. **Not** checked against the digest
+   * here, for the reason given on {@link BackupStore.read}; the caller hashes
+   * them before it trusts them.
+   */
+  readonly bytes: Buffer;
+}
+
+/**
  * The port every consumer of the backup tree talks to: the patcher when it
  * records a file's original bytes, the conflict detector and cleanup when they
  * restore or discard them, and the suites that substitute it.
  *
  * ## Shape of the contract
  *
- * Small and explicit on purpose. Six operations and two read-only properties —
- * locate, put, read, has, verify, remove, plus the session's own directory —
- * are enough for the whole reversibility sequence, and each one names the
- * guarantee it makes rather than the syscall it performs.
+ * Small and explicit on purpose. Six digest-keyed operations — locate, put,
+ * read, has, verify, remove — three that act for a journal record through its
+ * recorded path — locateRecorded, readRecorded, removeRecorded — the removal
+ * of the session directory, and two read-only properties are enough for the
+ * whole reversibility sequence, and each one names the guarantee it makes
+ * rather than the syscall it performs. The patcher files a backup by digest;
+ * everything that restores or discards one on a record's behalf goes through
+ * the record's path, because that is what the journal says and what it may
+ * have been updated to say.
  *
  * Every filesystem operation returns a `Promise`; {@link BackupStore.locate} is
  * synchronous because it is pure string work and touches nothing. Expected
@@ -538,6 +665,26 @@ export interface BackupStore {
   locate(originalHash: string): Result<string>;
 
   /**
+   * Where the backup a journal record names is, under the policy in this
+   * module's overview.
+   *
+   * Pure, like {@link BackupStore.locate}: it validates and composes and asks
+   * the filesystem nothing. The recorded path is accepted as a relocation only
+   * when it is an absolute, normalised path with no control character, inside
+   * a subdirectory of this store's own session directory, whose file name is
+   * `originalHash`; any other recorded path is replaced by the store's own
+   * composed location for the digest and reported as `substituted`, so the
+   * answer is always a path inside this session's own backup directory.
+   *
+   * @param recordedPath The record's `backupPath`, as the journal holds it.
+   * @param originalHash The record's `originalHash`.
+   * @returns The resolved location, or `FS_UNSAFE_PATH` when the digest is not
+   * a safe path component or not a digest, exactly as
+   * {@link BackupStore.locate} reports it.
+   */
+  locateRecorded(recordedPath: string, originalHash: string): Result<RecordedBackupLocation>;
+
+  /**
    * Stores `content` as the backup for `originalHash`, creating the session
    * directory if it is not there yet.
    *
@@ -579,6 +726,39 @@ export interface BackupStore {
    * `ELOOP`, `EISDIR`, `EACCES`.
    */
   read(originalHash: string): Promise<Result<Buffer>>;
+
+  /**
+   * The bytes of the backup a journal record names, read from where the record
+   * says it is.
+   *
+   * The read restoration and conflict detection perform, because a record's
+   * `backupPath` may have been updated since the patcher wrote it and a read by
+   * digest alone would report a relocated backup as missing. A `composed` or
+   * `substituted` location is read exactly as {@link BackupStore.read} reads
+   * it. A `relocated` one is read through a pinned handle: every directory from
+   * the state root down to its parent is opened relative to the one above it
+   * without following a link and held to the state-directory policy of
+   * `@debuggen/shared/node` — real directories, owned by this account, no group
+   * or other permissions — through the descriptor that was opened, and the
+   * final component is then read through that descriptor without following a
+   * link, so no directory swapped after the check can redirect the read. The
+   * digest is not re-checked here, for the reason given on
+   * {@link BackupStore.read}.
+   *
+   * @param recordedPath The record's `backupPath`.
+   * @param originalHash The record's `originalHash`.
+   * @returns The bytes and where they came from. `STORE_ERROR` with
+   * `backup-missing` when nothing is there (or the relocated backup's directory
+   * is gone), or with `backup-replaced` when the judged directory of a
+   * relocated backup has moved on a platform whose pin detects rather than
+   * prevents a swap; `FS_UNSAFE_PATH` for a refused digest or when a directory
+   * above a relocated backup fails the state-directory policy. In each of those
+   * cases the backup is not opened.
+   * @throws The runtime's own filesystem error for any other condition:
+   * `ELOOP` for a symbolic link at the final component, `EISDIR`, `EACCES`,
+   * `ENOTDIR`.
+   */
+  readRecorded(recordedPath: string, originalHash: string): Promise<Result<RecordedBackup>>;
 
   /**
    * Whether a usable backup file is filed under `originalHash`.
@@ -632,6 +812,43 @@ export interface BackupStore {
    * reason other than the backup's absence: `EACCES`, `EPERM`, `EISDIR`.
    */
   remove(originalHash: string, options?: RemoveBackupOptions): Promise<Result<boolean>>;
+
+  /**
+   * Deletes the backup a journal record names, from where the record says it
+   * is, and only when asked.
+   *
+   * The deletion counterpart of {@link BackupStore.readRecorded}, under the same
+   * resolution: a `composed` or `substituted` location is deleted exactly as
+   * {@link BackupStore.remove} deletes it. A `relocated` one is deleted through
+   * the same pinned handle its read uses, in one synchronous step: the backup
+   * is read through the handle, must hash to `originalHash` — so a file that is
+   * not this record's original is never deleted in its name — and must still
+   * be the entry that was read when it is unlinked. Idempotent, and
+   * conditional on {@link RemoveBackupOptions.restoredContentHash} exactly as
+   * {@link BackupStore.remove} is, so "delete only after verification" holds
+   * for a relocated backup too.
+   *
+   * @param recordedPath The record's `backupPath`.
+   * @param originalHash The record's `originalHash`.
+   * @param options `restoredContentHash` to require a verified restoration
+   * first.
+   * @returns `true` when a backup was deleted, `false` when there was none.
+   * `FS_UNSAFE_PATH` for a refused digest or a relocated backup whose
+   * directories fail the policy; `STORE_ERROR` with `stored-digest-mismatch`
+   * when a relocated backup's bytes do not hash to `originalHash`, or with
+   * `backup-replaced` when its entry, or its judged directory, changed while it
+   * was being deleted;
+   * `CLEANUP_PARTIAL` with `restored-content-digest-mismatch` when a declared
+   * restoration digest does not match. The backup is retained in every one of
+   * those cases.
+   * @throws The runtime's own filesystem error when the delete fails for a
+   * reason other than the backup's absence.
+   */
+  removeRecorded(
+    recordedPath: string,
+    originalHash: string,
+    options?: RemoveBackupOptions,
+  ): Promise<Result<boolean>>;
 
   /**
    * Removes this session's whole backup directory, and only when asked.
@@ -708,6 +925,43 @@ function storedDigestMismatch(path: string, expected: string, actual: string): D
     {
       hint: 'The backup was kept, not overwritten. Inspect it before deleting it, and treat the instrumented file as a conflict.',
       details: { reason: 'stored-digest-mismatch', path, expected, actual },
+    },
+  );
+}
+
+/**
+ * Whether a pin on a relocated backup's directory still reaches the directory
+ * that was judged.
+ *
+ * Always true where the platform enforces the pin: the path goes through the
+ * held descriptor, so a swap of the directory tree cannot redirect it. Where it
+ * cannot (no `/proc/self/fd`), the path is the ordinary one and this is the
+ * detection the shared pin offers instead — checked immediately before each
+ * use, so a directory moved away since the walk is refused rather than
+ * followed.
+ */
+function pinHolds(pinned: PinnedFile): boolean {
+  return pinned.enforced || pinned.verifyDirectory();
+}
+
+/**
+ * The error for a relocated backup that changed under this store while it was
+ * being used — its entry replaced between the verifying read and the unlink,
+ * or its judged directory moved away from its path on a platform where the pin
+ * detects a swap rather than prevents it: code `STORE_ERROR`, reason
+ * `backup-replaced`.
+ *
+ * Nothing is read or deleted: what is at the path now is not what was judged,
+ * and acting on it in the record's name is the one mistake a verified,
+ * pinned access exists to rule out.
+ */
+function backupReplaced(path: string, originalHash: string): DebuggenError {
+  return new DebuggenError(
+    'STORE_ERROR',
+    'A relocated backup changed while it was being used, so it was left alone.',
+    {
+      hint: 'Something else is writing inside the backup directory. Inspect the entry before deleting it by hand.',
+      details: { reason: 'backup-replaced', path, originalHash },
     },
   );
 }
@@ -844,6 +1098,20 @@ export interface BackupStoreOptions {
    * content, which is the same rule the failure details above follow.
    */
   readonly logger?: Logger | undefined;
+
+  /**
+   * Invoked with the recorded path once a relocated backup's directory has been
+   * pinned and judged, immediately before the backup is read or unlinked
+   * through that pin.
+   *
+   * The same kind of seam `@debuggen/shared/node`'s writers offer at their
+   * install boundary, for the same reason: the instant after a check and before
+   * a use is the one a directory swap would exploit, and a suite passes a
+   * callback that swaps the directory for a link there to prove the read and
+   * the unlink still reach the directory that was judged. Production callers
+   * pass nothing. A throw from it propagates, after the pin is released.
+   */
+  readonly onRelocatedBackupPinned?: ((recordedPath: string) => void) | undefined;
 }
 
 /**
@@ -900,6 +1168,7 @@ export function createBackupStore(options: BackupStoreOptions): BackupStore {
     normalizePosix(homePosix),
     options.sessionId,
     options.logger ?? noopLogger,
+    options.onRelocatedBackupPinned,
   );
 }
 
@@ -935,12 +1204,21 @@ class FileSystemBackupStore implements BackupStore {
   /** Where diagnostics go; `noopLogger` when the consumer asked for none. */
   readonly #logger: Logger;
 
-  constructor(debuggenHomePosix: string, sessionId: string, logger: Logger) {
+  /** The suite seam of {@link BackupStoreOptions.onRelocatedBackupPinned}. */
+  readonly #onRelocatedBackupPinned: ((recordedPath: string) => void) | undefined;
+
+  constructor(
+    debuggenHomePosix: string,
+    sessionId: string,
+    logger: Logger,
+    onRelocatedBackupPinned: ((recordedPath: string) => void) | undefined,
+  ) {
     this.#debuggenHome = debuggenHomePosix;
     this.#backupsRoot = joinPosix(debuggenHomePosix, BACKUPS_DIRECTORY_NAME);
     this.sessionId = sessionId;
     this.sessionDirectory = resolveSessionDirectory(debuggenHomePosix, sessionId);
     this.#logger = logger;
+    this.#onRelocatedBackupPinned = onRelocatedBackupPinned;
   }
 
   /** The contract is {@link BackupStore.locate}; this is its filesystem implementation. */
@@ -960,6 +1238,29 @@ class FileSystemBackupStore implements BackupStore {
     }
 
     return ok(resolveBackupPath(this.sessionDirectory, originalHash));
+  }
+
+  /** The contract is {@link BackupStore.locateRecorded}; this is its filesystem implementation. */
+  locateRecorded(recordedPath: string, originalHash: string): Result<RecordedBackupLocation> {
+    // The digest is validated first and in every case: a record whose digest is
+    // not one this store files under has no backup anywhere, whatever its path
+    // says, and the composed path is also the substitute below.
+    const composed = this.locate(originalHash);
+    if (isErr(composed)) {
+      return composed;
+    }
+
+    const recorded = toPosix(recordedPath);
+
+    if (recorded === composed.value) {
+      return ok({ path: composed.value, source: 'composed' });
+    }
+
+    if (this.#isRelocationTarget(recorded, originalHash)) {
+      return ok({ path: recorded, source: 'relocated' });
+    }
+
+    return ok({ path: composed.value, source: 'substituted' });
   }
 
   /** The contract is {@link BackupStore.put}; this is its filesystem implementation. */
@@ -1033,6 +1334,25 @@ class FileSystemBackupStore implements BackupStore {
     }
   }
 
+  /** The contract is {@link BackupStore.readRecorded}; this is its filesystem implementation. */
+  async readRecorded(recordedPath: string, originalHash: string): Promise<Result<RecordedBackup>> {
+    const located = this.locateRecorded(recordedPath, originalHash);
+    if (isErr(located)) {
+      return located;
+    }
+
+    const { path, source } = located.value;
+
+    if (source !== 'relocated') {
+      // The store's own location, read exactly as a digest read reads it.
+      const bytes = await this.read(originalHash);
+
+      return isErr(bytes) ? bytes : ok({ path, source, bytes: bytes.value });
+    }
+
+    return await onPromiseBoundary(() => this.#readRelocated(path, originalHash));
+  }
+
   /** The contract is {@link BackupStore.has}; this is its filesystem implementation. */
   async has(originalHash: string): Promise<Result<boolean>> {
     const located = this.locate(originalHash);
@@ -1089,28 +1409,9 @@ class FileSystemBackupStore implements BackupStore {
     }
 
     const path = located.value;
-    const restoredContentHash = options?.restoredContentHash;
-
-    if (restoredContentHash !== undefined) {
-      // The declared digest never becomes a path, so only its shape is checked
-      // — with the shared pattern rather than a local regular expression, so
-      // the store and the modification schema agree on what a digest is.
-      if (!SHA256_HEX_PATTERN.test(restoredContentHash)) {
-        return err(notADigest('restoredContentHash'));
-      }
-
-      if (restoredContentHash !== originalHash) {
-        this.#logger.warn(
-          'keeping a backup: restored content does not match the recorded original',
-          {
-            backupPath: path,
-            originalHash,
-            restoredContentHash,
-          },
-        );
-
-        return err(restoredContentMismatch(path, originalHash, restoredContentHash));
-      }
+    const verified = this.#refuseUnverifiedDelete(path, originalHash, options);
+    if (isErr(verified)) {
+      return verified;
     }
 
     try {
@@ -1131,6 +1432,39 @@ class FileSystemBackupStore implements BackupStore {
     this.#logger.debug('backup deleted', { backupPath: path, originalHash });
 
     return ok(true);
+  }
+
+  /** The contract is {@link BackupStore.removeRecorded}; this is its filesystem implementation. */
+  async removeRecorded(
+    recordedPath: string,
+    originalHash: string,
+    options?: RemoveBackupOptions,
+  ): Promise<Result<boolean>> {
+    const located = this.locateRecorded(recordedPath, originalHash);
+    if (isErr(located)) {
+      return located;
+    }
+
+    const { path, source } = located.value;
+
+    if (source !== 'relocated') {
+      return await this.remove(originalHash, options);
+    }
+
+    const verified = this.#refuseUnverifiedDelete(path, originalHash, options);
+    if (isErr(verified)) {
+      return verified;
+    }
+
+    // One synchronous step from pin to unlink: no `await` may sit between the
+    // judgement of the directory and the deletion made through it.
+    const removed = await onPromiseBoundary(() => this.#removeRelocated(path, originalHash));
+
+    if (!isErr(removed) && removed.value) {
+      this.#logger.debug('relocated backup deleted', { backupPath: path, originalHash });
+    }
+
+    return removed;
   }
 
   /** The contract is {@link BackupStore.removeSessionDirectory}; this is its filesystem implementation. */
@@ -1207,6 +1541,247 @@ class FileSystemBackupStore implements BackupStore {
     });
 
     return ok(removed);
+  }
+
+  /**
+   * Refuses a delete whose declared restoration does not match the digest the
+   * backup is filed under — the precondition {@link BackupStore.remove} and
+   * {@link BackupStore.removeRecorded} both enforce.
+   *
+   * @param path The backup that would be deleted, for the report.
+   * @param originalHash The digest it is filed under.
+   * @param options The caller's declared restoration, if any.
+   * @returns `ok` when the delete may proceed: no restoration was declared, or
+   * the declared digest matches.
+   */
+  #refuseUnverifiedDelete(
+    path: string,
+    originalHash: string,
+    options: RemoveBackupOptions | undefined,
+  ): Result<void> {
+    const restoredContentHash = options?.restoredContentHash;
+
+    if (restoredContentHash === undefined) {
+      return ok(undefined);
+    }
+
+    // The declared digest never becomes a path, so only its shape is checked —
+    // with the shared pattern rather than a local regular expression, so the
+    // store and the modification schema agree on what a digest is.
+    if (!SHA256_HEX_PATTERN.test(restoredContentHash)) {
+      return err(notADigest('restoredContentHash'));
+    }
+
+    if (restoredContentHash !== originalHash) {
+      this.#logger.warn('keeping a backup: restored content does not match the recorded original', {
+        backupPath: path,
+        originalHash,
+        restoredContentHash,
+      });
+
+      return err(restoredContentMismatch(path, originalHash, restoredContentHash));
+    }
+
+    return ok(undefined);
+  }
+
+  /**
+   * Whether a recorded path this store did not compose is one it will act on
+   * as a relocated backup.
+   *
+   * Lexical, and deliberately strict: an absolute path — POSIX, or a Windows
+   * drive path on the platform whose state root is one — no longer than
+   * {@link MAX_RECORDED_PATH_LENGTH}, with no control character, already in
+   * normal form (so no `.` or `..` segment and no doubled separator can move it
+   * after it was judged), not a network share, and bound to the record:
+   *
+   * - inside **this store's own session directory**, so one session's record
+   *   can never reach a backup another session holds;
+   * - in a **subdirectory** of it, never directly in it, which is where the
+   *   composed backups live and the only level the non-recursive
+   *   {@link BackupStore.removeSessionDirectory} sweep touches;
+   * - **named by the record's digest**, as every backup is.
+   *
+   * What this cannot see — a directory inside the tree that has become a link,
+   * or been opened up to other accounts — is what the pinned walk that runs
+   * before every relocated read or delete establishes.
+   */
+  #isRelocationTarget(candidate: string, originalHash: string): boolean {
+    if (candidate.length === 0 || candidate.length > MAX_RECORDED_PATH_LENGTH) {
+      return false;
+    }
+
+    if (hasControlCharacter(candidate) || candidate.startsWith('//')) {
+      return false;
+    }
+
+    if (!isAbsolutePosix(candidate) && !isWindowsAbsolute(candidate)) {
+      return false;
+    }
+
+    if (normalizePosix(candidate) !== candidate) {
+      return false;
+    }
+
+    return (
+      isWithin(this.sessionDirectory, candidate) &&
+      dirnamePosix(candidate) !== this.sessionDirectory &&
+      basenamePosix(candidate) === originalHash
+    );
+  }
+
+  /**
+   * Pins the directory holding a relocated backup: every component from the
+   * state root down opened relative to the one above it without following a
+   * link, and held to the state-directory policy through the descriptor it
+   * opened.
+   *
+   * Synchronous, and only ever called from inside a synchronous read or delete
+   * step, so nothing runs between the pin and the use made of it.
+   *
+   * @returns The pin, `undefined` when a directory on the way is not there, or
+   * the policy failure of a directory that is.
+   * @throws Any other filesystem error, with its errno intact.
+   */
+  #pinRelocated(path: string): Result<PinnedFile | undefined> {
+    // `#isRelocationTarget` has already placed the path inside this session's
+    // directory, which is inside the state root, so this is a downward path
+    // from the root the pinned walk descends from.
+    const relativeToHome = relativePosix(this.#debuggenHome, path);
+
+    try {
+      return ok(pinPrivateFileWithinRoot(this.#debuggenHome, relativeToHome));
+    } catch (error) {
+      // Checked before the errno test: a `DebuggenError` carries a `code` of
+      // its own, so reading it as an errno would misclassify it.
+      if (DebuggenError.is(error)) {
+        return err(error);
+      }
+
+      if (errnoCodeOf(error) === 'ENOENT') {
+        return ok(undefined);
+      }
+
+      throw error;
+    }
+  }
+
+  /**
+   * Reads a relocated backup through a pinned handle on its directory, the
+   * final component without following a link.
+   *
+   * Synchronous, and called through {@link onPromiseBoundary}.
+   *
+   * @returns The bytes, `backup-missing` when the file or its directory is not
+   * there, or the policy failure of a directory above it.
+   * @throws Any other filesystem error, with its errno intact.
+   */
+  #readRelocated(path: string, originalHash: string): Result<RecordedBackup> {
+    const pinned = this.#pinRelocated(path);
+    if (isErr(pinned)) {
+      return pinned;
+    }
+
+    const handle = pinned.value;
+    if (handle === undefined) {
+      return err(backupMissing(path, originalHash));
+    }
+
+    try {
+      this.#onRelocatedBackupPinned?.(path);
+
+      if (!pinHolds(handle)) {
+        return err(backupReplaced(path, originalHash));
+      }
+
+      return ok({ path, source: 'relocated', bytes: readFileNoFollow(handle.path) });
+    } catch (error) {
+      if (errnoCodeOf(error) === 'ENOENT') {
+        return err(backupMissing(path, originalHash));
+      }
+
+      throw error;
+    } finally {
+      handle.release();
+    }
+  }
+
+  /**
+   * Deletes a relocated backup through a pinned handle on its directory, only
+   * once its own bytes prove it is the record's original.
+   *
+   * Synchronous from pin to unlink, and called through
+   * {@link onPromiseBoundary}. The backup is read through the handle and must
+   * hash to `originalHash`, so no file is ever deleted in the name of a digest
+   * it does not carry; the entry must then still be the inode that was read,
+   * so a file swapped in beside the verified one is kept. `unlink` through the
+   * handle removes an entry of the directory that was judged, and never
+   * follows a link.
+   *
+   * @returns `true` when the backup was deleted, `false` when it or its
+   * directory was already gone, or the refusal that kept it.
+   * @throws Any other filesystem error, with its errno intact.
+   */
+  #removeRelocated(path: string, originalHash: string): Result<boolean> {
+    const pinned = this.#pinRelocated(path);
+    if (isErr(pinned)) {
+      return pinned;
+    }
+
+    const handle = pinned.value;
+    if (handle === undefined) {
+      // Its directory is gone, so the backup is too: the idempotent no-op.
+      return ok(false);
+    }
+
+    try {
+      this.#onRelocatedBackupPinned?.(path);
+
+      if (!pinHolds(handle)) {
+        return err(backupReplaced(path, originalHash));
+      }
+
+      const snapshot = readFileSnapshotNoFollow(handle.path);
+      const storedDigest = sha256Hex(snapshot.bytes);
+
+      if (storedDigest !== originalHash) {
+        this.#logger.warn('keeping a relocated backup: it does not hash to the record digest', {
+          backupPath: path,
+          originalHash,
+          storedDigest,
+        });
+
+        return err(storedDigestMismatch(path, originalHash, storedDigest));
+      }
+
+      const current = lstatSync(handle.path, { bigint: true });
+
+      if (
+        !pinHolds(handle) ||
+        !isSameFileIdentity({ dev: current.dev, ino: current.ino }, snapshot.identity)
+      ) {
+        this.#logger.warn('keeping a relocated backup: its entry changed after it was verified', {
+          backupPath: path,
+          originalHash,
+        });
+
+        return err(backupReplaced(path, originalHash));
+      }
+
+      unlinkSync(handle.path);
+
+      return ok(true);
+    } catch (error) {
+      // Idempotent by contract: the backup, or its entry, already being gone is
+      // the retried pass finding its own earlier success.
+      if (errnoCodeOf(error) === 'ENOENT') {
+        return ok(false);
+      }
+
+      throw error;
+    } finally {
+      handle.release();
+    }
   }
 
   /**

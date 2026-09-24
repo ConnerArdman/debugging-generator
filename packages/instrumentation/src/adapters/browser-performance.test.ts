@@ -1024,11 +1024,17 @@ const forbiddenBackups: InstrumentationContext['backups'] = {
   locate: () => {
     throw new Error('the browser-performance adapter must never locate a backup');
   },
+  locateRecorded: () => {
+    throw new Error('the browser-performance adapter must never locate a recorded backup');
+  },
   put: () => {
     throw new Error('the browser-performance adapter must never write a backup');
   },
   read: () => {
     throw new Error('the browser-performance adapter must never read a backup');
+  },
+  readRecorded: () => {
+    throw new Error('the browser-performance adapter must never read a recorded backup');
   },
   has: () => {
     throw new Error('the browser-performance adapter must never query a backup');
@@ -1038,6 +1044,9 @@ const forbiddenBackups: InstrumentationContext['backups'] = {
   },
   remove: () => {
     throw new Error('the browser-performance adapter must never remove a backup');
+  },
+  removeRecorded: () => {
+    throw new Error('the browser-performance adapter must never remove a recorded backup');
   },
   removeSessionDirectory: () => {
     throw new Error('the browser-performance adapter must never remove a backup directory');

@@ -210,13 +210,15 @@ const DIFF_LABELS = Object.freeze({
  * is no longer there *from its backup*, so a missing target with an intact
  * backup is recoverable while a matching target with no backup is not.
  *
- * - `missing` — nothing is filed under the record's `originalHash`.
+ * - `missing` — nothing is at the record's backup path (or, for a recorded path
+ *   the store will not open, at the location it composes for `originalHash`).
  * - `digest-mismatch` — a file is there but its bytes do not hash to the digest
  *   it is filed under, so it cannot be trusted as the original. The backup
  *   store keeps it rather than overwriting it, and so must every caller.
  * - `unreadable` — the backup exists but the read failed (permissions, a
- *   symbolic link planted at the path, a directory in its place). The errno is
- *   recorded in `detail`.
+ *   symbolic link planted at the path, a directory in its place), or a
+ *   directory above a relocated backup failed the state-directory policy. The
+ *   errno, or the policy's own reason, is recorded in `detail`.
  * - `unusable-path` — the record's `originalHash` is not a value the backup
  *   store will turn into a path, so no backup could even be located. A
  *   malformed record, surfaced rather than silently treated as "no backup".
@@ -1113,9 +1115,22 @@ interface BackupInspection {
 }
 
 /**
- * Reads the recorded original back and confirms it is the original.
+ * Reads the recorded original back, from where the record says it is, and
+ * confirms it is the original.
  *
- * Deliberately `read` plus a hash rather than `BackupStore.verify`, which
+ * Through `BackupStore.readRecorded` rather than a read by digest: a record's
+ * `backupPath` may have been updated since the patcher wrote it — a conflict
+ * backup moved aside into a quarantine directory is the case the journal's
+ * status patch exists for — and a read that recomposed the path from the digest
+ * would report such a backup as missing, turn a restorable record into a
+ * conflict and strand the patched file. The store decides where the recorded
+ * path may be read from (a relocation only inside the record's own session
+ * directory, in a subdirectory of it and under the record's digest; every
+ * directory above it pinned from the state root and proven private through the
+ * descriptor it opened; the file read through that pin without following a
+ * link), so no journal string reaches a filesystem call from here.
+ *
+ * Deliberately a read plus a hash rather than `BackupStore.verify`, which
  * performs the identical check: this module needs the bytes anyway to compose
  * the three-way view, and one read that both verifies and yields the content is
  * better than two reads of the same file. The comparison is the same one
@@ -1132,7 +1147,7 @@ async function inspectBackup(
   files: ConflictFileReader,
   logger: Logger,
 ): Promise<BackupInspection> {
-  const located = backups.locate(record.originalHash);
+  const located = backups.locateRecorded(record.backupPath, record.originalHash);
 
   if (isErr(located)) {
     return {
@@ -1145,26 +1160,30 @@ async function inspectBackup(
     };
   }
 
-  if (located.value !== record.backupPath) {
-    // Not fatal: the read below goes through the store, so the located path is
-    // the one that is actually used. Worth saying out loud, because it means
-    // the record was written against a different state directory and the path
-    // the developer is shown is not where this process looked.
+  if (located.value.source === 'substituted') {
+    // Not fatal: the store never opens a recorded path outside its own backup
+    // tree, and reads its composed location for the digest instead — the bytes
+    // are then held to `originalHash` below like any others. Worth saying out
+    // loud, because it means the record was written against a different state
+    // directory and the path the developer is shown is not where this process
+    // looked.
     logger.warn('a record names a backup path this store would not compose', {
       recordId: record.id,
       sessionId: record.sessionId,
       recordedPath: record.backupPath,
-      storePath: located.value,
+      storePath: located.value.path,
     });
   }
 
   // Annotated rather than inferred: an unannotated `let` assigned inside a
   // `try` evolves from an implicit `any`, and the bytes below would then be
-  // read off an unchecked value. `Result<Buffer>` satisfies `Result<Uint8Array>`.
+  // read off an unchecked value. The store's `Buffer` satisfies `Uint8Array`.
   let read: Result<Uint8Array>;
 
   try {
-    read = await backups.read(record.originalHash);
+    const recorded = await backups.readRecorded(record.backupPath, record.originalHash);
+
+    read = isErr(recorded) ? recorded : ok(recorded.value.bytes);
   } catch (error) {
     return {
       state: {

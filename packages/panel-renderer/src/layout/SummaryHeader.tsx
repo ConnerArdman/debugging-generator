@@ -42,10 +42,17 @@
  *
  * Nothing from the host tier (`src/host`) is imported: not the panel actions,
  * not the data provider, not the query hook, and no React context is created or
- * consumed here. Both interactions leave through plain props — `onSelectEvent` and
- * `onOpenSource` — which keeps the module graph acyclic (the host renders this
+ * consumed here. Both interactions leave through plain props — `selectEvent` and
+ * `openSource` — which keeps the module graph acyclic (the host renders this
  * component, never the other way round) and lets the editor webview reuse this
  * component with no provider and no transport in scope (AAP 0.4.2, 0.7.3).
+ *
+ * The two props are spelled, and typed, as the host form of the panel action
+ * contract: `selectEvent(eventId, coordinates?)` over the schema's own
+ * `EventRef.eventId` and its `traceId`/`spanId` coordinates, and
+ * `openSource(location)` over the shared `SourceLocation`. They are declared
+ * structurally rather than imported, so a surface's host actions satisfy them
+ * member for member without this module knowing that tier exists.
  *
  * ## Class-name contract implemented by `../styles/components.css`
  *
@@ -75,8 +82,8 @@
  * <SummaryHeader
  *   title={spec.title}
  *   summary={spec.summary}
- *   onSelectEvent={actions.onSelectEvent}
- *   onOpenSource={actions.onOpenSource}
+ *   selectEvent={hostActions.selectEvent}
+ *   openSource={hostActions.openSource}
  * />
  * ```
  *
@@ -86,7 +93,7 @@
  *   title={analysisTitle}
  *   summary={summary}
  *   headingLevel={3}
- *   onOpenSource={(location) => { postToExtensionHost(location); }}
+ *   openSource={(location) => { postToExtensionHost(location); }}
  * />
  * ```
  *
@@ -221,6 +228,33 @@ function evidenceChipLabel(ref: EventRef): string {
   return ref.eventId;
 }
 
+/**
+ * The optional coordinates a citation carries beside its id: its trace and its
+ * span. Picked from the schema's own {@link EventRef}, so the head declares the
+ * selection callback's second argument without restating the citation shape.
+ */
+type CitationCoordinates = Pick<EventRef, 'traceId' | 'spanId'>;
+
+/**
+ * The coordinates of one citation, holding only the keys it recorded.
+ *
+ * A key is never written with an `undefined` value, so a receiver sees exactly
+ * the hints the analysis cited — no more, and none invented — and `kind` and
+ * `label`, which are display sugar for this chip, are not coordinates and do
+ * not travel.
+ *
+ * @param ref The activated citation.
+ * @returns A fresh object with the citation's present coordinates, possibly empty.
+ */
+function citationCoordinates(ref: EventRef): CitationCoordinates {
+  const { traceId, spanId } = ref;
+
+  return {
+    ...(traceId === undefined ? {} : { traceId }),
+    ...(spanId === undefined ? {} : { spanId }),
+  };
+}
+
 /** Props of {@link EvidenceChips}. */
 interface EvidenceChipsProps {
   /**
@@ -231,11 +265,12 @@ interface EvidenceChipsProps {
   evidence: readonly EventRef[];
 
   /**
-   * Invoked with the whole {@link EventRef} when a chip is activated. Absent,
-   * every citation renders as inert text instead of a control — see
-   * {@link EvidenceChips} for why.
+   * Invoked with the citation's `eventId` and its recorded coordinates when a
+   * chip is activated. Absent, every citation renders as inert text instead of
+   * a control — see {@link EvidenceChips} for why. The head's own
+   * {@link SummaryHeaderProps.selectEvent}, handed down unchanged.
    */
-  onSelectEvent?: ((ref: EventRef) => void) | undefined;
+  selectEvent?: SummaryHeaderProps['selectEvent'];
 }
 
 /**
@@ -268,7 +303,7 @@ interface EvidenceChipsProps {
  * @returns The chip list.
  */
 function EvidenceChips(props: EvidenceChipsProps): ReactElement {
-  const { evidence, onSelectEvent } = props;
+  const { evidence, selectEvent } = props;
 
   return (
     <ul className="dg-summary-header__evidence">
@@ -277,7 +312,7 @@ function EvidenceChips(props: EvidenceChipsProps): ReactElement {
         // may legitimately cite the same event twice through two coordinates —
         // so the index joins the key rather than standing in for it.
         <li key={`${ref.eventId}#${String(index)}`}>
-          {onSelectEvent === undefined ? (
+          {selectEvent === undefined ? (
             <Badge tone="accent" variant="outline" data-event-id={ref.eventId}>
               {evidenceChipLabel(ref)}
             </Badge>
@@ -288,10 +323,10 @@ function EvidenceChips(props: EvidenceChipsProps): ReactElement {
               className="dg-summary-header__chip"
               data-event-id={ref.eventId}
               onClick={() => {
-                // The whole reference travels, not just its id: the caller
-                // reads `ref.eventId`, and the optional trace, span and kind
-                // coordinates are what let it select without a lookup.
-                onSelectEvent(ref);
+                // The schema's `eventId` is what the host resolves; the trace
+                // and span the citation recorded travel beside it, so the host
+                // can scope a trace-filtered view without a lookup.
+                selectEvent(ref.eventId, citationCoordinates(ref));
               }}
             >
               {evidenceChipLabel(ref)}
@@ -308,7 +343,7 @@ function EvidenceChips(props: EvidenceChipsProps): ReactElement {
  *
  * Every optional property spells `| undefined`: `exactOptionalPropertyTypes` is
  * in force repository-wide, so a caller forwarding a value it may not have —
- * `onOpenSource={actions.onOpenSource}` — must remain legal.
+ * `openSource={hostActions?.openSource}` — must remain legal.
  */
 export interface SummaryHeaderProps {
   /** The panel's title. Rendered verbatim as the head's heading. */
@@ -333,19 +368,25 @@ export interface SummaryHeaderProps {
   headingLevel?: HeadingLevel | undefined;
 
   /**
-   * Called with the whole {@link EventRef} when an evidence chip is activated.
+   * Called when an evidence chip is activated, with the citation's
+   * `EventRef.eventId` and, as the second argument, the `traceId`/`spanId`
+   * coordinates it recorded — only the keys it holds, possibly none. The host
+   * form's `selectEvent`, so a surface passes its own member straight in.
    * Omitted, every citation still renders, as inert text rather than as a
    * control, so no focusable element does nothing when activated.
    */
-  onSelectEvent?: ((ref: EventRef) => void) | undefined;
+  selectEvent?:
+    | ((eventId: EventRef['eventId'], coordinates?: Pick<EventRef, 'traceId' | 'spanId'>) => void)
+    | undefined;
 
   /**
    * Called with the exact {@link SourceLocation} a hypothesis suggested when
-   * its source chip is activated. Passed explicitly to `SourceLink` rather
-   * than left to that component's host fallback, so this head works unchanged
-   * in a surface with no panel actions in scope.
+   * its source chip is activated — the host form's `openSource`. Passed
+   * explicitly to `SourceLink`'s `onOpenSource` rather than left to that
+   * component's host fallback, so this head works unchanged in a surface with
+   * no panel actions in scope.
    */
-  onOpenSource?: ((location: SourceLocation) => void) | undefined;
+  openSource?: ((location: SourceLocation) => void) | undefined;
 
   /**
    * Render the likely causes most-confident-first instead of in the order the
@@ -378,8 +419,8 @@ export function SummaryHeader(props: SummaryHeaderProps): ReactElement {
     title,
     summary,
     headingLevel = DEFAULT_HEADING_LEVEL,
-    onSelectEvent,
-    onOpenSource,
+    selectEvent,
+    openSource,
     sortByConfidence = false,
     className,
     id,
@@ -453,7 +494,7 @@ export function SummaryHeader(props: SummaryHeaderProps): ReactElement {
                 {/* `Fact.evidence` holds at least one reference by schema
                     construction, so there is no empty-evidence branch to write
                     and no reference to filter. */}
-                <EvidenceChips evidence={fact.evidence} onSelectEvent={onSelectEvent} />
+                <EvidenceChips evidence={fact.evidence} selectEvent={selectEvent} />
               </li>
             ))}
           </ul>
@@ -494,14 +535,14 @@ export function SummaryHeader(props: SummaryHeaderProps): ReactElement {
                 <Text as="p" className="dg-summary-header__statement">
                   {hypothesis.statement}
                 </Text>
-                <EvidenceChips evidence={hypothesis.evidence} onSelectEvent={onSelectEvent} />
+                <EvidenceChips evidence={hypothesis.evidence} selectEvent={selectEvent} />
                 {hypothesis.suggestedLocation === undefined ? null : (
                   // The location object is handed on by reference, never
                   // rebuilt field by field, so activation emits exactly what
                   // the analysis suggested. Formatting belongs to `SourceLink`.
                   <SourceLink
                     location={hypothesis.suggestedLocation}
-                    onOpenSource={onOpenSource}
+                    onOpenSource={openSource}
                     showSymbol
                     compact
                     className="dg-summary-header__location"

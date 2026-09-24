@@ -133,7 +133,12 @@ import type {
 import type { InstrumentationAction } from '../schema/plan.js';
 
 import { createBackupStore } from './backup-store.js';
-import type { BackupStore, RemoveBackupOptions, StoredBackup } from './backup-store.js';
+import type {
+  BackupStore,
+  RecordedBackup,
+  RemoveBackupOptions,
+  StoredBackup,
+} from './backup-store.js';
 import { FunctionTimingPatcher } from './function-timing.js';
 import { SPAN_HELPER_GLOBAL, SPAN_HELPER_TYPE_NAME } from './wrap-template.js';
 import { PATCH_STAGES, createPatcher, defaultPatchFileSystem } from './patcher.js';
@@ -1175,6 +1180,9 @@ interface BackupEvent {
  * state cannot prove the ordering: this records what the target file held at
  * the instant `remove` was called, and `remove`'s own
  * `restoredContentHash` argument, which is the verification being demanded.
+ * The record-path operations (`readRecorded`, `removeRecorded`) — the route
+ * cleanup takes, since it reads and deletes the backup the journal names —
+ * record the same events as their digest-keyed counterparts.
  */
 function recordingBackupStore(
   store: BackupStore,
@@ -1188,6 +1196,8 @@ function recordingBackupStore(
     sessionId: store.sessionId,
     sessionDirectory: store.sessionDirectory,
     locate: (originalHash: string) => store.locate(originalHash),
+    locateRecorded: (recordedPath: string, originalHash: string) =>
+      store.locateRecorded(recordedPath, originalHash),
     put: (originalHash: string, content: Uint8Array): Promise<Result<StoredBackup>> =>
       store.put(originalHash, content),
     read: (originalHash: string): Promise<Result<Buffer>> => {
@@ -1200,6 +1210,16 @@ function recordingBackupStore(
 
       return store.read(originalHash);
     },
+    readRecorded: (recordedPath: string, originalHash: string): Promise<Result<RecordedBackup>> => {
+      events.push({
+        op: 'read',
+        originalHash,
+        restoredContentHash: undefined,
+        targetDigest: digest(),
+      });
+
+      return store.readRecorded(recordedPath, originalHash);
+    },
     has: (originalHash: string) => store.has(originalHash),
     verify: (originalHash: string) => store.verify(originalHash),
     remove: (originalHash: string, options?: RemoveBackupOptions): Promise<Result<boolean>> => {
@@ -1211,6 +1231,20 @@ function recordingBackupStore(
       });
 
       return store.remove(originalHash, options);
+    },
+    removeRecorded: (
+      recordedPath: string,
+      originalHash: string,
+      options?: RemoveBackupOptions,
+    ): Promise<Result<boolean>> => {
+      events.push({
+        op: 'remove',
+        originalHash,
+        restoredContentHash: options?.restoredContentHash,
+        targetDigest: digest(),
+      });
+
+      return store.removeRecorded(recordedPath, originalHash, options);
     },
     removeSessionDirectory: () => store.removeSessionDirectory(),
   };

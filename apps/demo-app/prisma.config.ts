@@ -21,13 +21,15 @@
 //                    the `premigrate` regression check)
 //                                       ->  `schema` + `datasource`
 //
-// That check compares the SQL rendered from the schema against
-// prisma/migrations/0001_init/migration.sql because that one migration is the
-// whole committed history, so rendering from an empty database reproduces it.
-// A second migration would end that equivalence — `migrate:dev` writes
-// incremental steps, not a new baseline — so adding one means reworking the
-// comparison (against a live database through `--from-config-datasource`, or
-// against `--from-migrations` with a shadow database) rather than deleting it.
+// That check pipes the SQL rendered from the schema into
+// prisma/check-migrations.ts, which replays every committed migration in order
+// and requires the two to create exactly the same schema objects. The history
+// is incremental — 0001_init is the applied baseline and later migrations add
+// to it, as `migrate:dev` writes them — so an applied migration is never edited
+// and `prisma migrate deploy` brings an existing database forward. The replay
+// needs no database and covers the additive statements Prisma writes; a
+// migration that drops or alters something is refused by it and verified
+// against a live database through `--from-config-datasource` instead.
 // ---------------------------------------------------------------------------
 
 import { defineConfig, env } from 'prisma/config';

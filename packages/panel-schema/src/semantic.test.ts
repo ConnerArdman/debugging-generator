@@ -71,7 +71,9 @@ import {
   RENDER_KINDS,
   REQUEST_KINDS,
   STATE_KINDS,
+  TELEMETRY_KINDS,
   allowedTiersFor,
+  attributeKeysFor,
   computeCaptureSummary,
   isMetricId,
   type CaptureSummary,
@@ -87,6 +89,7 @@ import {
   type TelemetryTier,
 } from '@debuggen/telemetry';
 
+import { catalogEntryFor } from './catalog.js';
 import {
   SEMANTIC_ISSUE_CODES,
   SEMANTIC_ISSUE_CODE_BY_REASON,
@@ -96,8 +99,10 @@ import {
   SEMANTIC_VALIDATION_STATUSES,
   collectSemanticIssues,
   isSemanticIssueReason,
+  tallyFieldPresence,
   toResult,
   validateAgainstCapture,
+  type CaptureFieldPresence,
   type IdResolution,
   type SemanticIssue,
   type SemanticIssueSets,
@@ -607,6 +612,46 @@ const KIND_BACKED_NODES: readonly {
   },
 ]);
 
+/**
+ * The attributes a record of `kind` must carry for a node of `type` to draw it:
+ * a fixture value for every attribute key in the node's catalog `requiredReads`
+ * that the kind declares.
+ *
+ * Derived from the catalog rather than written here, so a key the catalog comes
+ * to require is supplied by every "evidence present" fixture without an edit,
+ * and a case about *kinds* keeps testing kinds rather than tripping over a
+ * field.
+ */
+function requiredAttributesFor(type: PanelNodeType, kind: TelemetryKind): Record<string, unknown> {
+  const declared: readonly string[] = attributeKeysFor(kind);
+
+  return Object.fromEntries(
+    catalogEntryFor(type)
+      .requiredReads.filter((key) => declared.includes(key))
+      .map((key) => [key, `fixture ${key}`]),
+  );
+}
+
+/** A query table, whose aggregate forms no group for a record without a statement. */
+function queryTableNode(id = 'layout.0'): PanelNode {
+  return { type: 'queryTable', id, query: { source: 'queries' } };
+}
+
+/**
+ * Views over requests, queries, spans and events, for the case that a record
+ * lacking only *optional* reads raises nothing: each of these still draws a
+ * record with no status, size, resource timing, source location or parent.
+ */
+function optionalReadsLayout(): readonly PanelNode[] {
+  return [
+    { type: 'requestTable', id: 'layout.0', query: { source: 'requests' } },
+    { type: 'waterfall', id: 'layout.1', query: { source: 'requests' } },
+    queryTableNode('layout.2'),
+    { type: 'timeline', id: 'layout.3', query: { source: 'spans' } },
+    { type: 'table', id: 'layout.4', query: { source: 'events' } },
+  ];
+}
+
 /** What a specification fixture may override. */
 interface SpecOverrides {
   readonly observed?: readonly Fact[];
@@ -743,6 +788,11 @@ describe('the fixture builders', () => {
     expect(isOk(validatePanelSpec(makeSpec({ fallback: true })))).toBe(true);
   });
 
+  it('builds valid specifications for the field-availability cases', () => {
+    expect(isOk(validatePanelSpec(makeSpec({ layout: [queryTableNode()] })))).toBe(true);
+    expect(isOk(validatePanelSpec(makeSpec({ layout: optionalReadsLayout() })))).toBe(true);
+  });
+
   it('summarises an empty capture without throwing, which AAP 0.5.5 relies on', () => {
     // The "capture yielded nothing" flow reaches this module with exactly this
     // object, so it is a fixture rather than an edge case.
@@ -827,8 +877,20 @@ describe('the issue vocabulary', () => {
   it('keeps the availability reasons out of the failing severities', () => {
     expect(SEMANTIC_ISSUE_SEVERITY_BY_REASON['unavailable-metric']).toBe('informational');
     expect(SEMANTIC_ISSUE_SEVERITY_BY_REASON['unavailable-source']).toBe('advisory');
+    expect(SEMANTIC_ISSUE_SEVERITY_BY_REASON['unavailable-field']).toBe('advisory');
     expect(SEMANTIC_ISSUE_SEVERITY_BY_REASON['unknown-event-id']).toBe('fatal');
     expect(SEMANTIC_ISSUE_SEVERITY_BY_REASON['unverifiable-event-id']).toBe('unverifiable');
+  });
+
+  it('places the field-availability reason beside the source one, under its own code', () => {
+    // Records first, then the fields those records carry: the two advisories
+    // are one question asked at two depths, so they sit together in the
+    // vocabulary and a log reader can tell them apart by code.
+    const sourceIndex = SEMANTIC_ISSUE_REASONS.indexOf('unavailable-source');
+
+    expect(SEMANTIC_ISSUE_REASONS[sourceIndex + 1]).toBe('unavailable-field');
+    expect(SEMANTIC_ISSUE_CODE_BY_REASON['unavailable-field']).toBe('panel_node_field_unavailable');
+    expect(SEMANTIC_ISSUE_CODES).toContain('panel_node_field_unavailable');
   });
 
   it('declares the three statuses the outcome is discriminated by', () => {
@@ -1373,13 +1435,17 @@ describe('node evidence availability', () => {
      * was added to a group while the product stopped drawing it.
      *
      * Each pass builds a capture holding exactly one event of the node's own
-     * first kind — so its evidence is present — and asserts that every *other*
-     * node type, whose groups that kind is not in, reports the advisory
-     * instead. That crossing is what proves the decision follows the group and
-     * not merely "the capture has some events".
+     * first kind, carrying the attributes the node's catalog entry requires —
+     * so its evidence is present — and asserts that every *other* node type,
+     * whose groups that kind is not in, reports the advisory instead. That
+     * crossing is what proves the decision follows the group and not merely
+     * "the capture has some events".
      */
     for (const entry of KIND_BACKED_NODES) {
-      const summary = summarize([makeEvent({ kind: firstKind(entry.kinds) })]);
+      const kind = firstKind(entry.kinds);
+      const summary = summarize([
+        makeEvent({ kind, attributes: requiredAttributesFor(entry.type, kind) }),
+      ]);
       const populated = collectSemanticIssues(makeSpec({ layout: [entry.node] }), summary);
 
       expect(populated.advisory, entry.type).toEqual([]);
@@ -1453,6 +1519,524 @@ describe('node evidence availability', () => {
 
     expect(sets.advisory).toEqual([]);
     expect(sets.issues).toEqual([]);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Required field availability
+ *
+ * A node's kinds can all be present while the view is still empty: the query
+ * aggregate forms no group for a record without a statement, so a capture of
+ * statement-less queries holds `db.query` records and draws no query table.
+ * These cases hold the check to the catalog's `requiredReads`, by both routes
+ * — the caller's presence tally and the summary's bounded sections — and hold
+ * it *away* from everything else: optional reads, clipped or unreadable
+ * summaries, and a capture with no records at all.
+ * ---------------------------------------------------------------------------
+ */
+
+/** A kind-valid query record carrying everything a query table reads except the statement. */
+function statementlessQuery(): TelemetryEvent {
+  return makeEvent({
+    kind: QUERY_KIND,
+    attributes: { 'db.system': 'postgresql', 'db.rowCount': 1 },
+  });
+}
+
+/** A query record whose statement the query aggregate can group by. */
+function statementQuery(): TelemetryEvent {
+  return makeEvent({
+    kind: QUERY_KIND,
+    attributes: { 'db.statement': 'SELECT id FROM fixture_rows WHERE id = $1' },
+  });
+}
+
+describe('required field availability', () => {
+  it('reports a query table over statement-less records from the summary alone, without failing the panel', () => {
+    const summary = summarize([statementlessQuery()]);
+
+    // The inference's preconditions, measured on the computed rollup rather
+    // than staged: the capture holds a record of the node's kind, the
+    // aggregate formed no group from it, and nothing was clipped.
+    expect(summary.kindCounts[QUERY_KIND]).toBe(1);
+    expect(summary.topQueries).toEqual([]);
+    expect(summary.truncated).toBe(false);
+
+    const spec = makeSpec({ layout: [queryTableNode()] });
+    const sets = collectSemanticIssues(spec, summary);
+
+    // Exactly the four structural fields, and the node's source as the place:
+    // a missing field is a property of the records the source serves.
+    expect(sets.advisory).toEqual([
+      {
+        path: ['layout', 0, 'query', 'source'],
+        code: 'panel_node_field_unavailable',
+        reason: 'unavailable-field',
+        nodeType: 'queryTable',
+      },
+    ]);
+    expect(sets.issues).toEqual([]);
+    expect(sets.unverifiable).toEqual([]);
+    expect(validateAgainstCapture(spec, summary).status).toBe('valid');
+  });
+
+  it('escalates a missing required field only under requireVerifiable', () => {
+    const summary = summarize([statementlessQuery()]);
+    const spec = makeSpec({ layout: [queryTableNode()] });
+
+    const outcome = validateAgainstCapture(spec, summary, { requireVerifiable: true });
+
+    expect(outcome.status).toBe('invalid');
+    expect(reasonsOf(issuesOf(outcome))).toEqual(['unavailable-field']);
+  });
+
+  it('reports statement-less queries in a capture whose clipped span section sets the global truncation flag', () => {
+    // More spans than the section bound: the slowest-span section is clipped,
+    // which sets the summary's global `truncated` flag although no query
+    // group exists. The execution count is computed over the whole capture,
+    // and it is what decides.
+    const events = Array.from({ length: 11 }, () => statementlessQuery());
+    const summary = summarize(events);
+    const queryCount = summary.metrics.find((metric) => metric.id === 'query_count');
+
+    expect(summary.kindCounts[QUERY_KIND]).toBe(events.length);
+    expect(summary.topSpans.length).toBeLessThan(events.length);
+    expect(summary.truncated).toBe(true);
+    expect(summary.topQueries).toEqual([]);
+    expect(queryCount?.available).toBe(true);
+    expect(queryCount?.value).toBe(0);
+
+    const spec = makeSpec({ layout: [queryTableNode()] });
+
+    expect(collectSemanticIssues(spec, summary).advisory).toEqual([
+      {
+        path: ['layout', 0, 'query', 'source'],
+        code: 'panel_node_field_unavailable',
+        reason: 'unavailable-field',
+        nodeType: 'queryTable',
+      },
+    ]);
+    expect(validateAgainstCapture(spec, summary).status).toBe('valid');
+    expect(validateAgainstCapture(spec, summary, { requireVerifiable: true }).status).toBe(
+      'invalid',
+    );
+  });
+
+  it('accepts a clipped capture whose queries carry statements', () => {
+    const events = Array.from({ length: 11 }, () => statementQuery());
+    const summary = summarize(events);
+    const spec = makeSpec({ layout: [queryTableNode()] });
+
+    expect(summary.truncated).toBe(true);
+    expect(collectSemanticIssues(spec, summary).advisory).toEqual([]);
+    expect(validateAgainstCapture(spec, summary, { requireVerifiable: true }).status).toBe('valid');
+  });
+
+  it('decides from a field-presence tally only where the summary publishes no decisive aggregate result', () => {
+    const events = [statementlessQuery()];
+    // Clipped, and with its metric set withheld: no section, no execution
+    // count and no clip-free emptiness speaks for the query aggregate.
+    const undecided = makeCaptureSummary({ events, truncated: true, metrics: [] });
+    const spec = makeSpec({ layout: [queryTableNode()] });
+    const fieldPresence = tallyFieldPresence(events);
+
+    // Such a rollup leaves the question open on its own…
+    expect(collectSemanticIssues(spec, undecided).advisory).toEqual([]);
+
+    // …and the tally over the records themselves settles it.
+    const sets = collectSemanticIssues(spec, undecided, { fieldPresence });
+
+    expect(reasonsOf(sets.advisory)).toEqual(['unavailable-field']);
+    expect(sets.advisory[0]?.path).toEqual(['layout', 0, 'query', 'source']);
+    expect(sets.advisory[0]?.nodeType).toBe('queryTable');
+    expect(validateAgainstCapture(spec, undecided, { fieldPresence }).status).toBe('valid');
+    expect(
+      validateAgainstCapture(spec, undecided, { fieldPresence, requireVerifiable: true }).status,
+    ).toBe('invalid');
+  });
+
+  it('accepts a query table whose records carry a statement, by either route', () => {
+    const interaction = makeInteraction();
+    const summary = summarize(interaction.events);
+    const spec = makeSpec({ layout: [queryTableNode()] });
+
+    expect(collectSemanticIssues(spec, summary).advisory).toEqual([]);
+    expect(
+      collectSemanticIssues(spec, summary, {
+        fieldPresence: tallyFieldPresence(interaction.events),
+      }).advisory,
+    ).toEqual([]);
+  });
+
+  it('needs one carrier: a statement on any record of the kind is enough', () => {
+    const events = [statementlessQuery(), statementQuery()];
+    const summary = summarize(events);
+    const spec = makeSpec({ layout: [queryTableNode()] });
+
+    expect(collectSemanticIssues(spec, summary).advisory).toEqual([]);
+    expect(
+      collectSemanticIssues(spec, summary, { fieldPresence: tallyFieldPresence(events) }).advisory,
+    ).toEqual([]);
+  });
+
+  it('reads the unbounded execution count before the bounded section', () => {
+    // An emptied section beside an execution count of one: the count is
+    // computed over every record, so the aggregate did form a group.
+    const events = [statementQuery()];
+    const emptied = makeCaptureSummary({ events, topQueries: [] });
+    const spec = makeSpec({ layout: [queryTableNode()] });
+
+    expect(emptied.truncated).toBe(false);
+    expect(collectSemanticIssues(spec, emptied).advisory).toEqual([]);
+
+    // With the count withheld, the clip-free empty section is what is left, and
+    // it says no group formed.
+    const withoutCount = makeCaptureSummary({ events, topQueries: [], metrics: [] });
+
+    expect(reasonsOf(collectSemanticIssues(spec, withoutCount).advisory)).toEqual([
+      'unavailable-field',
+    ]);
+  });
+
+  it('never lets a tally overrule the verdict the summary publishes', () => {
+    const spec = makeSpec({ layout: [queryTableNode()] });
+
+    // The aggregate formed no group: a tally claiming a statement carrier does
+    // not put a row back into the table.
+    const contraryCarrier: CaptureFieldPresence = {
+      [QUERY_KIND]: { events: 1, attributes: { 'db.statement': 1 }, text: { 'db.statement': 1 } },
+    };
+
+    expect(
+      reasonsOf(
+        collectSemanticIssues(spec, summarize([statementlessQuery()]), {
+          fieldPresence: contraryCarrier,
+        }).advisory,
+      ),
+    ).toEqual(['unavailable-field']);
+
+    // The aggregate formed a group: a tally claiming no carrier does not empty
+    // the table either.
+    const contraryAbsence: CaptureFieldPresence = {
+      [QUERY_KIND]: { events: 1, attributes: {}, text: {} },
+    };
+
+    expect(
+      collectSemanticIssues(spec, summarize([statementQuery()]), {
+        fieldPresence: contraryAbsence,
+      }).advisory,
+    ).toEqual([]);
+  });
+
+  it('agrees with the query aggregate on what counts as a statement', () => {
+    const spec = makeSpec({ layout: [queryTableNode()] });
+
+    // A number under the key is a carried value, but the aggregate groups only
+    // by statement text, so it forms no row — by the summary and by the tally.
+    const numeric = [makeEvent({ kind: QUERY_KIND, attributes: { 'db.statement': 42 } })];
+    const numericPresence = tallyFieldPresence(numeric);
+
+    expect(summarize(numeric).topQueries).toEqual([]);
+    expect(numericPresence[QUERY_KIND]).toEqual({
+      events: 1,
+      attributes: { 'db.statement': 1 },
+      text: {},
+    });
+
+    for (const options of [{}, { fieldPresence: numericPresence }]) {
+      expect(reasonsOf(collectSemanticIssues(spec, summarize(numeric), options).advisory)).toEqual([
+        'unavailable-field',
+      ]);
+      expect(
+        validateAgainstCapture(spec, summarize(numeric), { ...options, requireVerifiable: true })
+          .status,
+      ).toBe('invalid');
+    }
+
+    const numericUndecided = makeCaptureSummary({ events: numeric, truncated: true, metrics: [] });
+
+    expect(
+      reasonsOf(
+        collectSemanticIssues(spec, numericUndecided, { fieldPresence: numericPresence }).advisory,
+      ),
+    ).toEqual(['unavailable-field']);
+
+    // A whitespace-only string is text of positive length, which the aggregate
+    // does group, so nothing is missing — by the summary and by the tally.
+    const blank = [makeEvent({ kind: QUERY_KIND, attributes: { 'db.statement': '  ' } })];
+    const blankPresence = tallyFieldPresence(blank);
+
+    expect(summarize(blank).topQueries).toHaveLength(1);
+    expect(blankPresence[QUERY_KIND]?.text).toEqual({ 'db.statement': 1 });
+
+    for (const options of [{}, { fieldPresence: blankPresence }]) {
+      expect(collectSemanticIssues(spec, summarize(blank), options).advisory).toEqual([]);
+      expect(
+        validateAgainstCapture(spec, summarize(blank), { ...options, requireVerifiable: true })
+          .status,
+      ).toBe('valid');
+    }
+
+    const blankUndecided = makeCaptureSummary({ events: blank, truncated: true, metrics: [] });
+
+    expect(
+      collectSemanticIssues(spec, blankUndecided, { fieldPresence: blankPresence }).advisory,
+    ).toEqual([]);
+  });
+
+  it('never reports a missing optional read', () => {
+    // A request with no status, no size, no resource timing, no source location
+    // and no parent, and a query with a statement and nothing else: every view
+    // below still draws, and renders what is missing as unavailable.
+    const events = [makeEvent({ kind: FETCH_KIND, attributes: {} }), statementQuery()];
+    const summary = summarize(events);
+    const fieldPresence = tallyFieldPresence(events);
+    const spec = makeSpec({ layout: optionalReadsLayout() });
+
+    // Measured, not assumed: the request record really carries no key at all.
+    expect(fieldPresence[FETCH_KIND]).toEqual({ events: 1, attributes: {}, text: {} });
+    expect(collectSemanticIssues(spec, summary).advisory).toEqual([]);
+    expect(collectSemanticIssues(spec, summary, { fieldPresence }).advisory).toEqual([]);
+  });
+
+  it('leaves the question open when the summary cannot answer it', () => {
+    const events = [statementlessQuery()];
+    const summary = summarize(events);
+    const spec = makeSpec({ layout: [queryTableNode()] });
+    // Each is a rollup that did not publish something, which is not evidence
+    // that it is absent: a clipped summary without its execution count, a
+    // section that is not a list beside no count, an unreported clip beside no
+    // count, an execution count the summary could not measure beside a clipped
+    // section, and per-kind tallies that do not say.
+    const unmeasuredCount = summary.metrics.map((metric) =>
+      metric.id === 'query_count' ? { id: metric.id, available: false } : metric,
+    );
+    const undecidable: readonly CaptureSummary[] = [
+      makeCaptureSummary({ events, truncated: true, metrics: [] }),
+      { ...summary, topQueries: undefined, metrics: undefined } as unknown as CaptureSummary,
+      { ...summary, truncated: undefined, metrics: [] } as unknown as CaptureSummary,
+      { ...summary, truncated: true, metrics: unmeasuredCount } as unknown as CaptureSummary,
+      { ...summary, kindCounts: {} } as unknown as CaptureSummary,
+    ];
+
+    for (const [position, candidate] of undecidable.entries()) {
+      expect(collectSemanticIssues(spec, candidate).advisory, String(position)).toEqual([]);
+    }
+  });
+
+  it('reports an empty capture as an unavailable source only, never also as a missing field', () => {
+    const spec = makeSpec({ layout: [queryTableNode()] });
+
+    for (const events of [[], [makeEvent({ kind: INTERACTION_KIND })]]) {
+      const summary = summarize(events);
+
+      expect(reasonsOf(collectSemanticIssues(spec, summary).advisory)).toEqual([
+        'unavailable-source',
+      ]);
+      expect(
+        reasonsOf(
+          collectSemanticIssues(spec, summary, { fieldPresence: tallyFieldPresence(events) })
+            .advisory,
+        ),
+      ).toEqual(['unavailable-source']);
+    }
+  });
+
+  it('asks nothing of a node whose catalog entry requires no attribute key', () => {
+    // A render record with no component, phase, trigger or count: the render
+    // table labels it rather than dropping it, so nothing is reported even
+    // from a tally that shows every render key missing.
+    const events = [makeEvent({ kind: RENDER_KIND, attributes: {} })];
+    const summary = summarize(events);
+    const spec = makeSpec({ layout: [renderTableNode()] });
+
+    expect(
+      collectSemanticIssues(spec, summary, { fieldPresence: tallyFieldPresence(events) }).advisory,
+    ).toEqual([]);
+  });
+
+  it('never throws on a malformed tally, and leaves the summary to decide', () => {
+    const events = [statementlessQuery()];
+    const summary = summarize(events);
+    const undecided = makeCaptureSummary({ events, truncated: true, metrics: [] });
+    const spec = makeSpec({ layout: [queryTableNode()] });
+    const { proxy: revoked, revoke } = Proxy.revocable({}, {});
+    revoke();
+    const malformed: readonly unknown[] = [
+      'not a tally',
+      42,
+      null,
+      [],
+      revoked,
+      new Proxy(
+        {},
+        {
+          getOwnPropertyDescriptor: () => {
+            throw new Error('trap');
+          },
+        },
+      ),
+      { [QUERY_KIND]: 'not a tally' },
+      { [QUERY_KIND]: { events: -1, attributes: {}, text: {} } },
+      { [QUERY_KIND]: { events: Number.NaN, attributes: {}, text: {} } },
+      { [QUERY_KIND]: { events: 1 } },
+      { [QUERY_KIND]: { events: 1, attributes: {} } },
+      { [QUERY_KIND]: { events: 1, attributes: {}, text: [] } },
+      { [QUERY_KIND]: { events: 1, attributes: {}, text: { 'db.statement': 'not a count' } } },
+      { [QUERY_KIND]: { events: 1, attributes: {}, text: { 'db.statement': -1 } } },
+    ];
+
+    for (const [position, candidate] of malformed.entries()) {
+      const fieldPresence = candidate as CaptureFieldPresence;
+
+      // The summary publishes the aggregate's verdict, so it decides…
+      expect(
+        reasonsOf(collectSemanticIssues(spec, summary, { fieldPresence }).advisory),
+        String(position),
+      ).toEqual(['unavailable-field']);
+      // …and where it cannot, a tally that cannot be read leaves it open.
+      expect(
+        collectSemanticIssues(spec, undecided, { fieldPresence }).advisory,
+        String(position),
+      ).toEqual([]);
+    }
+  });
+});
+
+describe('tallyFieldPresence', () => {
+  it('counts, per kind, the records and the records carrying each key with a value', () => {
+    const events = [
+      makeEvent({
+        kind: QUERY_KIND,
+        attributes: { 'db.statement': 'SELECT 1', 'db.system': 'postgresql' },
+      }),
+      makeEvent({
+        kind: QUERY_KIND,
+        attributes: { 'db.statement': '   ', 'db.system': 'postgresql', 'db.rowCount': null },
+      }),
+      makeEvent({ kind: QUERY_KIND, attributes: { 'db.statement': '', 'db.rowCount': 0 } }),
+      makeEvent({
+        kind: FETCH_KIND,
+        attributes: { 'http.method': 'GET', inFlight: false, transferSize: undefined },
+      }),
+    ];
+
+    const presence = tallyFieldPresence(events);
+
+    // The empty string, `null` and `undefined` are absent; `0`, `false` and a
+    // whitespace-only string are values. Text counts strings of positive
+    // length only — the predicate the query aggregate groups a statement by.
+    expect(presence).toEqual({
+      [QUERY_KIND]: {
+        events: 3,
+        attributes: { 'db.rowCount': 1, 'db.statement': 2, 'db.system': 2 },
+        text: { 'db.statement': 2, 'db.system': 2 },
+      },
+      [FETCH_KIND]: {
+        events: 1,
+        attributes: { 'http.method': 1, inFlight: 1 },
+        text: { 'http.method': 1 },
+      },
+    });
+  });
+
+  it('orders kinds by the vocabulary and keys by code unit, and freezes throughout', () => {
+    const events = [
+      makeEvent({ kind: QUERY_KIND, attributes: { 'db.system': 'postgresql', 'db.rowCount': 1 } }),
+      makeEvent({ kind: FETCH_KIND, attributes: { url: '/fixture', 'http.method': 'GET' } }),
+    ];
+
+    const presence = tallyFieldPresence(events);
+    const queries = presence[QUERY_KIND];
+
+    expect(Object.keys(presence)).toEqual(
+      TELEMETRY_KINDS.filter((kind) => kind === QUERY_KIND || kind === FETCH_KIND),
+    );
+    expect(Object.keys(queries?.attributes ?? {})).toEqual(['db.rowCount', 'db.system']);
+    expect(Object.keys(queries?.text ?? {})).toEqual(['db.system']);
+    expect(Object.isFrozen(presence)).toBe(true);
+    expect(Object.isFrozen(queries)).toBe(true);
+    expect(Object.isFrozen(queries?.attributes)).toBe(true);
+    expect(Object.isFrozen(queries?.text)).toBe(true);
+
+    // The same records in another order tally to the same bytes.
+    expect(JSON.stringify(tallyFieldPresence([...events].reverse()))).toBe(
+      JSON.stringify(presence),
+    );
+  });
+
+  it('holds counts only: no attribute value, id or name reaches the tally', () => {
+    const sentinel = 'SENTINEL-VALUE-THAT-MUST-NOT-LEAK';
+    const event = makeEvent({
+      kind: QUERY_KIND,
+      name: 'SENTINEL-NAME-THAT-MUST-NOT-LEAK',
+      attributes: { 'db.statement': sentinel },
+    });
+
+    const serialised = JSON.stringify(tallyFieldPresence([event]));
+
+    expect(serialised).not.toContain(sentinel);
+    expect(serialised).not.toContain('SENTINEL-NAME-THAT-MUST-NOT-LEAK');
+    expect(serialised).not.toContain(event.id);
+    expect(serialised).not.toContain(event.traceId);
+  });
+
+  it('tallies an empty or a non-array input to an empty record', () => {
+    expect(tallyFieldPresence([])).toEqual({});
+
+    for (const candidate of [undefined, null, 'events', 42, { length: 2 }]) {
+      expect(tallyFieldPresence(candidate as unknown as readonly TelemetryEvent[])).toEqual({});
+    }
+  });
+
+  it('skips what it cannot attribute and survives what throws', () => {
+    const { proxy: revoked, revoke } = Proxy.revocable({}, {});
+    revoke();
+    const candidates: readonly unknown[] = [
+      null,
+      42,
+      'text',
+      [],
+      { kind: 'not-a-kind', attributes: { 'db.statement': 'SELECT 1' } },
+      revoked,
+      new Proxy(
+        {},
+        {
+          getOwnPropertyDescriptor: () => {
+            throw new Error('trap');
+          },
+        },
+      ),
+      // A known kind whose bag throws while its keys are listed contributes
+      // nothing, not even its record.
+      {
+        kind: QUERY_KIND,
+        attributes: new Proxy(
+          {},
+          {
+            ownKeys: () => {
+              throw new Error('trap');
+            },
+          },
+        ),
+      },
+      // A known kind with no bag, or with something that is not one, is a
+      // record carrying no key.
+      { kind: QUERY_KIND },
+      { kind: QUERY_KIND, attributes: ['db.statement'] },
+      { kind: QUERY_KIND, attributes: 'db.statement' },
+      statementQuery(),
+    ];
+
+    let presence: CaptureFieldPresence = {};
+
+    expect(() => {
+      presence = tallyFieldPresence(candidates as readonly TelemetryEvent[]);
+    }).not.toThrow();
+    expect(presence).toEqual({
+      [QUERY_KIND]: { events: 4, attributes: { 'db.statement': 1 }, text: { 'db.statement': 1 } },
+    });
   });
 });
 

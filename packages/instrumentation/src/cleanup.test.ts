@@ -53,12 +53,15 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
+  renameSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -67,6 +70,7 @@ import { DebuggenError, err, isErr, ok } from '@debuggen/shared';
 import type { Result } from '@debuggen/shared';
 import { sha256Hex } from '@debuggen/shared/node';
 import type {
+  AtomicCreateVerdict,
   AtomicReplaceExpectation,
   AtomicReplaceVerdict,
   FileSnapshot,
@@ -419,8 +423,9 @@ interface WriteAttempt {
    *
    * For a conditional replacement this is the digest of the content the pass
    * had just read, which must equal that record's `instrumentedHash` — the
-   * authority for "this file is still ours". `undefined` for the unconditional
-   * write that recreates a target that is no longer there.
+   * authority for "this file is still ours". `undefined` for the no-clobber
+   * create that recreates a target that is no longer there, whose only
+   * condition is that the path is still empty.
    */
   readonly expectedHash: string | undefined;
 
@@ -442,8 +447,17 @@ interface FileSystemLog {
   /** Conditional replacements, in order. */
   readonly writes: WriteAttempt[];
 
-  /** Unconditional writes — a target that was gone and had to be recreated. */
-  readonly creates: WriteAttempt[];
+  /**
+   * No-clobber creates — a target that was gone and had to be recreated — each
+   * with the verdict the production primitive returned.
+   */
+  readonly creates: CreateAttempt[];
+}
+
+/** One no-clobber create a pass asked for, and what the filesystem answered. */
+interface CreateAttempt extends WriteAttempt {
+  /** `created` when the original was installed, `exists` when nothing was written. */
+  readonly verdict: AtomicCreateVerdict['kind'];
 }
 
 /** What a case asks the recording port to do beyond recording. */
@@ -467,6 +481,16 @@ interface RecordingFileSystemOptions {
    * saving the file between two restores.
    */
   readonly afterWrite?: ((attempt: number, path: string) => void) | undefined;
+
+  /**
+   * Runs immediately before a no-clobber create is delegated, after the pass
+   * decided the target was missing.
+   *
+   * How the recreate race becomes a case: a callback that writes the path here
+   * is precisely a developer recreating the file between cleanup's observation
+   * that it was gone and the write that would have put the original back.
+   */
+  readonly beforeCreate?: ((path: string) => void) | undefined;
 }
 
 /**
@@ -477,7 +501,7 @@ interface RecordingFileSystemOptions {
  * happened outside the project at all" are claims about the *real* primitives;
  * a fake port could only make them about itself.
  *
- * @param options Corruption and race hooks, both off by default.
+ * @param options Corruption and race hooks, all off by default.
  * @returns The port, its log, and a reset for a case that measures two passes
  * separately.
  */
@@ -531,10 +555,19 @@ function recordingFileSystem(options: RecordingFileSystemOptions = {}): {
 
       return verdict;
     },
-    replaceFile: (path: string, content: Uint8Array): void => {
-      log.creates.push({ path, expectedHash: undefined, contentHash: sha256Hex(content) });
+    createFileIfAbsent: (path: string, content: Uint8Array): AtomicCreateVerdict => {
+      options.beforeCreate?.(path);
 
-      defaultCleanupFileSystem.replaceFile(path, content);
+      const verdict = defaultCleanupFileSystem.createFileIfAbsent(path, content);
+
+      log.creates.push({
+        path,
+        expectedHash: undefined,
+        contentHash: sha256Hex(content),
+        verdict: verdict.kind,
+      });
+
+      return verdict;
     },
   };
 
@@ -576,12 +609,15 @@ interface BackupRemoval {
  * Every other operation is delegated untouched, so a backup is still written,
  * read back and digest-checked by the production store: only the moment of a
  * deletion is reported, and it is reported *before* it happens, which is what
- * lets a case sample the filesystem as the store saw it.
+ * lets a case sample the filesystem as the store saw it. Both deletion routes
+ * are observed — the digest-keyed `remove` and the record-path
+ * `removeRecorded` cleanup takes for the backup a journal row names — so a
+ * case's removal count does not depend on which one a pass used.
  *
  * @param store The store to delegate to.
  * @param onRemove Called before each deletion is delegated, with the digest and
  * the restored-content digest the caller declared.
- * @returns A store with the same behaviour and an observed `remove`.
+ * @returns A store with the same behaviour and observed deletions.
  */
 function spyBackupStore(
   store: BackupStore,
@@ -591,14 +627,23 @@ function spyBackupStore(
     sessionId: store.sessionId,
     sessionDirectory: store.sessionDirectory,
     locate: (digest: string) => store.locate(digest),
+    locateRecorded: (recordedPath: string, digest: string) =>
+      store.locateRecorded(recordedPath, digest),
     put: (digest: string, content: Uint8Array) => store.put(digest, content),
     read: (digest: string) => store.read(digest),
+    readRecorded: (recordedPath: string, digest: string) =>
+      store.readRecorded(recordedPath, digest),
     has: (digest: string) => store.has(digest),
     verify: (digest: string) => store.verify(digest),
     remove: (digest, removeOptions) => {
       onRemove(digest, removeOptions?.restoredContentHash);
 
       return store.remove(digest, removeOptions);
+    },
+    removeRecorded: (recordedPath, digest, removeOptions) => {
+      onRemove(digest, removeOptions?.restoredContentHash);
+
+      return store.removeRecorded(recordedPath, digest, removeOptions);
     },
     removeSessionDirectory: () => store.removeSessionDirectory(),
   };
@@ -697,6 +742,13 @@ let caseRoot = '';
 
 /** The session ids handed out so far, so each is unique and readable in a failure. */
 let sessionCounter = 0;
+
+// Every case here runs the real patcher and the real filesystem primitives —
+// ts-morph parses, `fsync`s, renames — several times over, and a chain case
+// does it once per link. On a shared, loaded runner that legitimately takes
+// longer than Vitest's 5 s default, so the budget is the one the installer
+// suite gives the same work; a case that hangs still fails.
+vi.setConfig({ testTimeout: 30_000, hookTimeout: 30_000 });
 
 beforeEach(() => {
   caseRoot = mkdtempSync(join(tmpdir(), 'debuggen-cleanup-'));
@@ -2512,15 +2564,118 @@ describe('a target that is no longer there', () => {
     expect(outcome.backup).toBe('deleted');
     expect(outcome.conflict).toBeUndefined();
 
-    // Recreated through the unconditional write, since an absent target has no
-    // content to make a conditional one out of.
+    // Recreated through the no-clobber create, since an absent target has no
+    // content to make a conditional replacement out of — and the create is the
+    // one that installed it.
     expect(world.log.writes).toEqual([]);
-    expect(only(world.log.creates, 'unconditional write').contentHash).toBe(
-      patched.record.originalHash,
-    );
+
+    const create = only(world.log.creates, 'no-clobber create');
+    expect(create.contentHash).toBe(patched.record.originalHash);
+    expect(create.verdict).toBe('created');
 
     expectFileBytes(patched.path, patched.originalBytes);
     expect(world.journal.row(patched.record.id).status).toBe('reverted');
+  });
+
+  it('keeps a file the developer recreates before the original lands, and conflicts with the backup kept', async () => {
+    const recreated = Buffer.from(
+      'export const draftPlan = [];\n// Recreated by the developer while cleanup was running.\n',
+      'utf8',
+    );
+    const world = makeWorld({
+      files: {
+        // The race at the only instant it matters: after the pass decided the
+        // target was gone, before the create that would put the original back.
+        beforeCreate: (path: string): void => {
+          writeFileSync(path, recreated);
+        },
+      },
+    });
+    const patched = await patchSymbol(world, { file: TARGET_FILE, symbol: TARGET_SYMBOL });
+    const backupPath = world.backupPathOf(patched.record.originalHash);
+
+    rmSync(patched.path);
+    const siblingsBefore = readdirSync(dirname(patched.path));
+
+    world.resetLog();
+    const mark = world.mark();
+
+    const outcome = expectOk(
+      await restoreModification(patched.record, world.context),
+      'a restore outcome',
+    );
+
+    expect(outcome.kind).toBe('conflict');
+    expect(outcome.wrote).toBe(false);
+    expect(outcome.recreated).toBe(false);
+    expect(outcome.backup).toBe('retained');
+    // Re-detected against what now occupies the path, so the report describes
+    // the developer's file rather than the absence the pass first saw.
+    expect(outcome.conflict?.reason).toBe('content-changed');
+    expect(outcome.conflict?.actualHash).toBe(sha256Hex(recreated));
+
+    // One create was asked for, and the filesystem refused it: nothing of the
+    // original was written over the developer's file, and no conditional
+    // replacement was attempted either.
+    expect(world.log.writes).toEqual([]);
+
+    const create = only(world.log.creates, 'no-clobber create');
+    expect(create.contentHash).toBe(patched.record.originalHash);
+    expect(create.verdict).toBe('exists');
+
+    // Their file is exactly what they wrote, and no staged copy of the original
+    // was left beside it.
+    expectFileBytes(patched.path, recreated);
+    expect([...readdirSync(dirname(patched.path))].sort()).toEqual(
+      [...siblingsBefore, basename(patched.path)].sort(),
+    );
+
+    // The record is in conflict, and the original is still where it was.
+    expect(world.journal.transitions(mark)).toEqual([
+      { recordId: patched.record.id, status: 'conflict' },
+    ]);
+    expect(world.removals).toEqual([]);
+    expectFileBytes(backupPath, patched.originalBytes);
+  });
+
+  it('names the race when what reappeared would not have been a conflict on its own', async () => {
+    // An editor re-saving the buffer it still had open puts the instrumented
+    // bytes back. The detector alone would call that restorable, but the pass
+    // had already committed to a create, which refused to write over it — so
+    // the report says why nothing happened instead of claiming an edit.
+    const reappearing: { bytes: Buffer | undefined } = { bytes: undefined };
+    const world = makeWorld({
+      files: {
+        beforeCreate: (path: string): void => {
+          if (reappearing.bytes !== undefined) {
+            writeFileSync(path, reappearing.bytes);
+          }
+        },
+      },
+    });
+    const patched = await patchSymbol(world, { file: TARGET_FILE, symbol: TARGET_SYMBOL });
+
+    reappearing.bytes = patched.instrumentedBytes;
+    rmSync(patched.path);
+    world.resetLog();
+
+    const outcome = expectOk(
+      await restoreModification(patched.record, world.context),
+      'a restore outcome',
+    );
+
+    expect(outcome.kind).toBe('conflict');
+    expect(outcome.wrote).toBe(false);
+    expect(outcome.backup).toBe('retained');
+    expect(outcome.conflict?.reason).toBe('content-changed');
+    expect(outcome.conflict?.message).toContain('target-appeared');
+    expect(outcome.conflict?.message).toContain(patched.record.backupPath);
+
+    expect(only(world.log.creates, 'no-clobber create').verdict).toBe('exists');
+    expectFileBytes(patched.path, patched.instrumentedBytes);
+    expect(world.journal.row(patched.record.id).status).toBe('conflict');
+    expect(world.removals).toEqual([]);
+    expectFileBytes(world.backupPathOf(patched.record.originalHash), patched.originalBytes);
   });
 });
 
@@ -2553,6 +2708,539 @@ describe('a backup that cannot be read back', () => {
 
     expect(world.journal.row(patched.record.id).status).toBe('conflict');
     expectFileBytes(patched.path, patched.instrumentedBytes);
+  });
+});
+
+describe('a backup the journal says was moved', () => {
+  /** A copy of the fixture's target file, so two records are filed under one digest. */
+  const TWIN_FILE = 'src/server/cycle-planner-twin.ts';
+
+  /** A neighbouring session's directory name under the same state root. */
+  const NEIGHBOUR_SESSION = 'ses_neighbour';
+
+  /** `<debuggenHome>/backups/<sessionId>/quarantine`, for any session. */
+  function quarantinePathOf(world: World, sessionId = world.sessionId): string {
+    return join(world.debuggenHome, 'backups', sessionId, 'quarantine');
+  }
+
+  /**
+   * The world session's quarantine directory, created private like the rest of
+   * the backup tree: a subdirectory of the session's own directory the store
+   * did not compose, which is the one place a relocation is honoured.
+   */
+  function quarantineOf(world: World): string {
+    const quarantine = quarantinePathOf(world);
+
+    mkdirSync(quarantine, { recursive: true, mode: 0o700 });
+    chmodSync(quarantine, 0o700);
+
+    return quarantine;
+  }
+
+  /**
+   * Moves a record's backup into the quarantine directory and journals where it
+   * went, the way `ModificationStatusPatch.backupPath` lets the service do.
+   *
+   * @returns The new, journaled backup path.
+   */
+  function relocateBackup(world: World, patched: PatchedFile): string {
+    const relocated = join(quarantineOf(world), patched.record.originalHash);
+
+    renameSync(world.backupPathOf(patched.record.originalHash), relocated);
+    world.journal.arrange({ ...world.journal.row(patched.record.id), backupPath: relocated });
+
+    return relocated;
+  }
+
+  it('restores from where the record says the backup is, then deletes it from there', async () => {
+    const world = makeWorld();
+    const patched = await patchSymbol(world, { file: TARGET_FILE, symbol: TARGET_SYMBOL });
+    const relocated = relocateBackup(world, patched);
+
+    expect(existsSync(world.backupPathOf(patched.record.originalHash))).toBe(false);
+
+    world.watch(TARGET_FILE);
+    world.resetLog();
+
+    const outcome = await cleanupSession(world.sessionId, world.context);
+
+    // A read by digest would have found nothing at the composed path and
+    // stranded the patched file behind a `backup-missing` conflict.
+    expect(outcome.status).toBe('clean');
+    expect(outcome.conflicts).toEqual([]);
+    expect(outcome.failures).toEqual([]);
+    expectFileBytes(patched.path, patched.originalBytes);
+    expect(world.journal.row(patched.record.id).status).toBe('reverted');
+
+    // Deleted from where it was moved to, only once the restore verified.
+    const removal = only(world.removals, 'backup deletion');
+    expect(removal.restoredContentHash).toBe(patched.record.originalHash);
+    expect(removal.watchedDigest).toBe(patched.record.originalHash);
+    expect(existsSync(relocated)).toBe(false);
+  });
+
+  it('restores a single relocated record for the installer unwinding a failed delta', async () => {
+    const world = makeWorld();
+    const patched = await patchSymbol(world, { file: TARGET_FILE, symbol: TARGET_SYMBOL });
+    const relocated = relocateBackup(world, patched);
+
+    world.resetLog();
+
+    const outcome = expectOk(
+      await restoreModification(world.journal.row(patched.record.id), world.context),
+      'a restore outcome',
+    );
+
+    expect(outcome.kind).toBe('restored');
+    expect(outcome.backup).toBe('deleted');
+    expectFileBytes(patched.path, patched.originalBytes);
+    expect(existsSync(relocated)).toBe(false);
+  });
+
+  it('refuses a relocated backup reached through a symbolic link, writing and deleting nothing', async () => {
+    const world = makeWorld();
+    const patched = await patchSymbol(world, { file: TARGET_FILE, symbol: TARGET_SYMBOL });
+
+    // The quarantine directory is a link out of the state root. Lexically the
+    // recorded path is inside the session's own directory; only the pinned
+    // walk the store performs before opening it can see that it is not.
+    const elsewhere = join(world.root, 'elsewhere');
+    mkdirSync(elsewhere, { mode: 0o700 });
+    chmodSync(elsewhere, 0o700);
+
+    const outsideCopy = join(elsewhere, patched.record.originalHash);
+    renameSync(world.backupPathOf(patched.record.originalHash), outsideCopy);
+
+    const linked = quarantinePathOf(world);
+    symlinkSync(elsewhere, linked, 'dir');
+
+    const relocated = join(linked, patched.record.originalHash);
+    world.journal.arrange({ ...world.journal.row(patched.record.id), backupPath: relocated });
+
+    world.resetLog();
+    const mark = world.mark();
+
+    const outcome = await cleanupSession(world.sessionId, world.context);
+
+    expect(outcome.status).toBe('conflict');
+    expect(outcome.restored).toEqual([]);
+    expectNothingWritten(world.log);
+
+    const conflict = only(outcome.conflicts, 'conflict report');
+    expect(conflict.recordId).toBe(patched.record.id);
+    expect(conflict.reason).toBe('backup-missing');
+    expect(conflict.backupPath).toBe(relocated);
+
+    expect(world.journal.transitions(mark)).toEqual([
+      { recordId: patched.record.id, status: 'conflict' },
+    ]);
+    expect(world.removals).toEqual([]);
+    expectFileBytes(patched.path, patched.instrumentedBytes);
+    // What the link pointed at was neither trusted nor touched.
+    expectFileBytes(outsideCopy, patched.originalBytes);
+  });
+
+  /**
+   * Recorded paths the store will not open: they are replaced by its own
+   * composed location for the digest, so the planted decoy at each one is never
+   * read, never deleted and never written into the project.
+   */
+  const FOREIGN_PATHS: readonly {
+    readonly name: string;
+    readonly recorded: (world: World, digest: string) => string;
+    readonly decoy: (world: World, digest: string) => string;
+  }[] = Object.freeze([
+    {
+      name: 'a path under another state root',
+      recorded: (world: World, digest: string): string =>
+        join(world.root, 'another-home', 'backups', world.sessionId, digest),
+      decoy: (world: World, digest: string): string =>
+        join(world.root, 'another-home', 'backups', world.sessionId, digest),
+    },
+    {
+      name: 'a path in another session’s directory',
+      recorded: (world: World, digest: string): string =>
+        join(world.debuggenHome, 'backups', NEIGHBOUR_SESSION, digest),
+      decoy: (world: World, digest: string): string =>
+        join(world.debuggenHome, 'backups', NEIGHBOUR_SESSION, digest),
+    },
+    {
+      name: 'a path in another session’s quarantine',
+      recorded: (world: World, digest: string): string =>
+        join(quarantinePathOf(world, NEIGHBOUR_SESSION), digest),
+      decoy: (world: World, digest: string): string =>
+        join(quarantinePathOf(world, NEIGHBOUR_SESSION), digest),
+    },
+    {
+      name: 'a quarantine outside every session',
+      recorded: (world: World, digest: string): string =>
+        join(world.debuggenHome, 'backups', 'quarantine', digest),
+      decoy: (world: World, digest: string): string =>
+        join(world.debuggenHome, 'backups', 'quarantine', digest),
+    },
+    {
+      name: 'a file in the session’s own quarantine not named by the digest',
+      recorded: (world: World): string => join(quarantinePathOf(world), 'original.ts'),
+      decoy: (world: World): string => join(quarantinePathOf(world), 'original.ts'),
+    },
+    {
+      name: 'a traversal out of the backup tree',
+      recorded: (world: World, digest: string): string =>
+        `${quarantinePathOf(world)}/../../../../escaped/${digest}`,
+      decoy: (world: World, digest: string): string => join(world.root, 'escaped', digest),
+    },
+  ]);
+
+  for (const foreign of FOREIGN_PATHS) {
+    it(`never opens ${foreign.name}, and restores from the store's own location`, async () => {
+      const world = makeWorld();
+      const patched = await patchSymbol(world, { file: TARGET_FILE, symbol: TARGET_SYMBOL });
+      const decoyPath = foreign.decoy(world, patched.record.originalHash);
+      const decoyBytes = Buffer.from('export const decoy = true;\n', 'utf8');
+
+      mkdirSync(dirname(decoyPath), { recursive: true, mode: 0o700 });
+      writeFileSync(decoyPath, decoyBytes);
+      world.journal.arrange({
+        ...world.journal.row(patched.record.id),
+        backupPath: foreign.recorded(world, patched.record.originalHash),
+      });
+
+      world.resetLog();
+
+      const outcome = await cleanupSession(world.sessionId, world.context);
+
+      expect(outcome.status).toBe('clean');
+      expectFileBytes(patched.path, patched.originalBytes);
+      expect(only(world.removals, 'backup deletion').restoredContentHash).toBe(
+        patched.record.originalHash,
+      );
+      // The composed backup was the one read and deleted; the decoy is intact.
+      expect(existsSync(world.backupPathOf(patched.record.originalHash))).toBe(false);
+      expectFileBytes(decoyPath, decoyBytes);
+    });
+  }
+
+  it('deletes two backups filed under one digest from their own paths, each after its restore', async () => {
+    const world = makeWorld();
+    cpSync(world.pathOf(TARGET_FILE), world.pathOf(TWIN_FILE));
+
+    const first = await patchSymbol(world, { file: TARGET_FILE, symbol: TARGET_SYMBOL });
+    const twin = await patchSymbol(world, { file: TWIN_FILE, symbol: TARGET_SYMBOL });
+    const digest = first.record.originalHash;
+
+    // Identical originals share one content-addressed backup; the first
+    // record's copy is then moved aside, so the two records name two files.
+    expect(twin.record.originalHash).toBe(digest);
+    expect(twin.outcome.backup.reused).toBe(true);
+
+    const relocated = join(quarantineOf(world), digest);
+    cpSync(world.backupPathOf(digest), relocated);
+    chmodSync(relocated, 0o600);
+    world.journal.arrange({ ...world.journal.row(first.record.id), backupPath: relocated });
+
+    world.watch(TARGET_FILE);
+    world.resetLog();
+
+    const outcome = await cleanupSession(world.sessionId, world.context);
+
+    expect(outcome.status).toBe('clean');
+    expectFileBytes(first.path, first.originalBytes);
+    expectFileBytes(twin.path, twin.originalBytes);
+
+    // Both files are gone, each deleted from the path its own record names —
+    // and never before both restores had verified, because the digest they
+    // share kept either deletion waiting until its last holder was done.
+    expect(world.removals).toHaveLength(2);
+    for (const removal of world.removals) {
+      expect(removal.restoredContentHash).toBe(digest);
+      expect(removal.watchedDigest).toBe(digest);
+    }
+    expect(existsSync(relocated)).toBe(false);
+    expect(existsSync(world.backupPathOf(digest))).toBe(false);
+  });
+
+  /*
+   * One session's record never reaches another session's backups (N1).
+   */
+
+  it('never deletes another session’s retained original for a record that already holds its own', async () => {
+    const world = makeWorld();
+    const holder = nextSessionId('holder');
+    world.journal.noteSessionStatus(holder, 'generated');
+
+    // Session B: an unresolved conflict whose backup is the only copy of its
+    // original.
+    const retained = await patchSymbol(world, {
+      file: OTHER_FILE,
+      symbol: OTHER_SYMBOL,
+      sessionId: holder,
+    });
+    const retainedBackup = join(
+      world.debuggenHome,
+      'backups',
+      holder,
+      retained.record.originalHash,
+    );
+    world.journal.arrange({ ...world.journal.row(retained.record.id), status: 'conflict' });
+
+    // Session A: a record whose file already holds its original — the crash
+    // between the journal append and the rename — journaled as though its
+    // backup were B's. That record closes without a byte written, and its
+    // backup is then deleted as verified.
+    const closing = await patchSymbol(world, { file: TARGET_FILE, symbol: TARGET_SYMBOL });
+    writeFileSync(closing.path, closing.originalBytes);
+    world.journal.arrange({
+      ...world.journal.row(closing.record.id),
+      status: 'pending',
+      backupPath: retainedBackup,
+    });
+
+    world.resetLog();
+
+    const outcome = await cleanupSession(world.sessionId, world.context);
+
+    expect(outcome.status).toBe('clean');
+    expect(world.journal.row(closing.record.id).status).toBe('reverted');
+    expectFileBytes(closing.path, closing.originalBytes);
+
+    // Only A's own backup was deleted, from the location A's store composes.
+    expect(only(world.removals, 'backup deletion').digest).toBe(closing.record.originalHash);
+    expect(existsSync(world.backupPathOf(closing.record.originalHash))).toBe(false);
+
+    // B's original is exactly where B's record says it is, and B is untouched.
+    expectFileBytes(retainedBackup, retained.originalBytes);
+    expect(world.journal.row(retained.record.id).status).toBe('conflict');
+    expectFileBytes(retained.path, retained.instrumentedBytes);
+  });
+
+  for (const placement of [
+    { name: 'the top level of another session’s directory', inQuarantine: false },
+    { name: 'another session’s quarantine', inQuarantine: true },
+  ] as const) {
+    it(`does not honour a backup moved into ${placement.name}`, async () => {
+      const world = makeWorld();
+      const patched = await patchSymbol(world, { file: TARGET_FILE, symbol: TARGET_SYMBOL });
+      const digest = patched.record.originalHash;
+
+      const directory = placement.inQuarantine
+        ? quarantinePathOf(world, NEIGHBOUR_SESSION)
+        : join(world.debuggenHome, 'backups', NEIGHBOUR_SESSION);
+      mkdirSync(directory, { recursive: true, mode: 0o700 });
+      chmodSync(directory, 0o700);
+
+      const moved = join(directory, digest);
+      renameSync(world.backupPathOf(digest), moved);
+      world.journal.arrange({ ...world.journal.row(patched.record.id), backupPath: moved });
+
+      world.resetLog();
+      const mark = world.mark();
+
+      const outcome = await cleanupSession(world.sessionId, world.context);
+
+      // Where a neighbour's sweep could delete it, the file is not this
+      // session's to trust: the store's own location was read instead and is
+      // empty, so the record is reported rather than restored from it.
+      expect(outcome.status).toBe('conflict');
+      expect(outcome.restored).toEqual([]);
+      expectNothingWritten(world.log);
+
+      const conflict = only(outcome.conflicts, 'conflict report');
+      expect(conflict.recordId).toBe(patched.record.id);
+      expect(conflict.reason).toBe('backup-missing');
+
+      expect(world.journal.transitions(mark)).toEqual([
+        { recordId: patched.record.id, status: 'conflict' },
+      ]);
+      expect(world.removals).toEqual([]);
+      expectFileBytes(patched.path, patched.instrumentedBytes);
+      expectFileBytes(moved, patched.originalBytes);
+    });
+  }
+
+  it('keeps a relocated file that does not hash to the record digest', async () => {
+    const world = makeWorld();
+    const closing = await patchSymbol(world, { file: TARGET_FILE, symbol: TARGET_SYMBOL });
+    const digest = closing.record.originalHash;
+
+    // Named by the digest, inside the session's own quarantine, and not the
+    // original: a file the store would delete in the record's name if it
+    // trusted the name alone.
+    const relocated = join(quarantineOf(world), digest);
+    const foreignBytes = Buffer.from('export const notTheOriginal = true;\n', 'utf8');
+    writeFileSync(relocated, foreignBytes, { mode: 0o600 });
+
+    writeFileSync(closing.path, closing.originalBytes);
+    world.journal.arrange({
+      ...world.journal.row(closing.record.id),
+      status: 'pending',
+      backupPath: relocated,
+    });
+
+    world.resetLog();
+
+    const outcome = expectOk(
+      await restoreModification(world.journal.row(closing.record.id), world.context),
+      'a restore outcome',
+    );
+
+    expect(outcome.kind).toBe('already-original');
+    expect(outcome.backup).toBe('retained');
+    expectFileBytes(closing.path, closing.originalBytes);
+    expectFileBytes(relocated, foreignBytes);
+    // The composed backup was never a candidate for this deletion either.
+    expectFileBytes(world.backupPathOf(digest), closing.originalBytes);
+  });
+
+  it('keeps a relocated backup out of the session directory’s sweep, and restores from it after', async () => {
+    const world = makeWorld();
+    const patched = await patchSymbol(world, { file: TARGET_FILE, symbol: TARGET_SYMBOL });
+    const relocated = relocateBackup(world, patched);
+
+    // The sweep deletes only digest-named files at the session directory's own
+    // level, and reports the quarantine subdirectory it will not enter.
+    const swept = await world.backups.removeSessionDirectory();
+    expect(isErr(swept)).toBe(true);
+    expectFileBytes(relocated, patched.originalBytes);
+
+    world.resetLog();
+
+    const outcome = await cleanupSession(world.sessionId, world.context);
+
+    expect(outcome.status).toBe('clean');
+    expectFileBytes(patched.path, patched.originalBytes);
+    expect(existsSync(relocated)).toBe(false);
+  });
+
+  /*
+   * A directory swapped for a link after it was judged redirects nothing (N2).
+   */
+
+  /**
+   * A store over the world's state root and session whose relocated-backup
+   * seam runs `swap` on its `on`-th call: the instant after a pin was judged
+   * and before the read or the unlink goes through it.
+   *
+   * A restore of a relocated record reaches the seam in a fixed order: the
+   * conflict detector's read of the backup (1), the restoration's own read (2)
+   * and the verified delete (3).
+   */
+  function storeSwappingAt(
+    world: World,
+    on: number,
+    swap: () => void,
+  ): { readonly store: BackupStore; readonly calls: () => number } {
+    let calls = 0;
+
+    const store = createBackupStore({
+      debuggenHome: world.debuggenHome,
+      sessionId: world.sessionId,
+      onRelocatedBackupPinned: (): void => {
+        calls += 1;
+
+        if (calls === on) {
+          swap();
+        }
+      },
+    });
+
+    return { store, calls: (): number => calls };
+  }
+
+  /**
+   * Moves the world session's judged quarantine aside and puts a link to
+   * `elsewhere` at its path.
+   *
+   * @returns Where the judged directory now is.
+   */
+  function swapQuarantineForLink(world: World, elsewhere: string): string {
+    const quarantine = quarantinePathOf(world);
+    const judged = `${quarantine}-judged`;
+
+    renameSync(quarantine, judged);
+    symlinkSync(elsewhere, quarantine, 'dir');
+
+    return judged;
+  }
+
+  /** A developer's own file named by `digest`, outside the backup tree. */
+  function plantExternalFile(world: World, digest: string): { path: string; bytes: Buffer } {
+    const elsewhere = join(world.root, 'developer-files');
+    mkdirSync(elsewhere, { recursive: true, mode: 0o700 });
+
+    const path = join(elsewhere, digest);
+    const bytes = Buffer.from('export const developerOwned = true;\n', 'utf8');
+    writeFileSync(path, bytes);
+
+    return { path, bytes };
+  }
+
+  it('reads the backup from the directory it judged when that directory is swapped for a link before the read', async () => {
+    const world = makeWorld();
+    const patched = await patchSymbol(world, { file: TARGET_FILE, symbol: TARGET_SYMBOL });
+    const digest = patched.record.originalHash;
+    relocateBackup(world, patched);
+
+    const external = plantExternalFile(world, digest);
+    let judged = '';
+    const swapping = storeSwappingAt(world, 2, () => {
+      judged = swapQuarantineForLink(world, dirname(external.path));
+    });
+
+    world.resetLog();
+
+    const outcome = expectOk(
+      await restoreModification(world.journal.row(patched.record.id), {
+        ...world.context,
+        backups: swapping.store,
+      }),
+      'a restore outcome',
+    );
+
+    // A read that re-resolved the path would have followed the link, found the
+    // developer's file, and refused it as a digest mismatch; the pinned read
+    // reached the judged directory and restored the real original.
+    expect(outcome.kind).toBe('restored');
+    expectFileBytes(patched.path, patched.originalBytes);
+
+    // The delete pinned the path afresh, met the link before reaching the seam,
+    // and kept the backup.
+    expect(swapping.calls()).toBe(2);
+    expect(outcome.backup).toBe('retained');
+    expectFileBytes(join(judged, digest), patched.originalBytes);
+    expectFileBytes(external.path, external.bytes);
+  });
+
+  it('deletes the backup from the directory it judged when that directory is swapped for a link before the unlink', async () => {
+    const world = makeWorld();
+    const patched = await patchSymbol(world, { file: TARGET_FILE, symbol: TARGET_SYMBOL });
+    const digest = patched.record.originalHash;
+    relocateBackup(world, patched);
+
+    const external = plantExternalFile(world, digest);
+    let judged = '';
+    const swapping = storeSwappingAt(world, 3, () => {
+      judged = swapQuarantineForLink(world, dirname(external.path));
+    });
+
+    world.resetLog();
+
+    const outcome = expectOk(
+      await restoreModification(world.journal.row(patched.record.id), {
+        ...world.context,
+        backups: swapping.store,
+      }),
+      'a restore outcome',
+    );
+
+    expect(outcome.kind).toBe('restored');
+    expectFileBytes(patched.path, patched.originalBytes);
+
+    // The third call was the delete, which unlinked the verified backup inside
+    // the judged directory — never the developer's file the link now leads to.
+    expect(swapping.calls()).toBe(3);
+    expect(outcome.backup).toBe('deleted');
+    expect(existsSync(join(judged, digest))).toBe(false);
+    expectFileBytes(external.path, external.bytes);
   });
 });
 

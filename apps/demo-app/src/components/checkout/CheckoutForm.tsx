@@ -27,32 +27,34 @@
  *      cookie, which `credentials: 'same-origin'` in `@/lib/api-client` is what sends.
  *
  *   3. THE SUBMIT PATH IS AS THIN AS A SUBMIT PATH CAN BE, AND WHAT IT ADDS IS ALL ABOUT THE
- *      ORDER OUTLIVING THIS COMPONENT. `submitOrder` validates once, awaits one call to
- *      `submitCheckout`, and stores what came back. It holds no timer, no retry, no second request
- *      and no measurement of its own: the request's duration is the server's to explain, and a
- *      client-side stopwatch would only describe the wait it cannot shorten. A failure keeps every
- *      value the buyer typed, so placing the order again is one click rather than a re-typed form.
- *      Three things ride alongside that single request, and each is there because this component
- *      cannot promise to be here when the reply arrives: the request carries an `AbortSignal` this
- *      form aborts when it unmounts, the attempt is written to session storage before it goes out
- *      and replaced with the order's reference when it lands, and a placed order is given an
- *      address of its own with `history.pushState`. `POST /api/checkout` stops for none of it - a
- *      buyer who navigates away is still charged - so an abandoned attempt is treated as an
+ *      ORDER OUTLIVING THIS COMPONENT. `submitOrder` validates once - or, resolving an attempt,
+ *      takes the draft that attempt recorded - awaits one call to `submitCheckout`, and stores what
+ *      came back. It holds no timer, no retry, no second request and no measurement of its own:
+ *      the request's duration is the server's to explain, and a client-side stopwatch would only
+ *      describe the wait it cannot shorten. A failure keeps every value the buyer typed, so placing
+ *      the order again is one click rather than a re-typed form. Three things ride alongside that
+ *      single request, and each is there because this component cannot promise to be here when the
+ *      reply arrives: the request carries an `AbortSignal` this form aborts when it unmounts, the
+ *      attempt - its name and the exact draft sent - is written to session storage before it goes
+ *      out and replaced with the order's reference alone when it lands, and a placed order is given
+ *      an address of its own with `history.pushState`. `POST /api/checkout` stops for none of it -
+ *      a buyer who navigates away is still charged - so an abandoned attempt is treated as an
  *      outcome nobody established rather than as a cancelled order.
  *
  *   4. THE FORM SAYS WHAT IT KNOWS AND NOT WHAT IT WOULD PREFER. Two of the things a buyer
  *      reads here are statements about their money, and neither may be guessed. A failure is
  *      described as "nothing was charged" only where the store said which reason applied and
- *      that reason means nothing was captured, or where the browser itself established that the
- *      request never left it - a submission made with no connection, which is the one unreported
- *      failure whose effect on the order is a fact. Every other reason the store did not author -
- *      a reply that could not be read, a status this page read a meaning into, a connection lost
- *      after the request went out - leaves the order unconfirmed, and what the buyer is offered
- *      then is to check the order rather than to place it again. That check is the same submission
- *      with the same attempt name, which the endpoint answers with the order it already holds
- *      instead of a second one, so the safe action and the retry are one control. And the cart: a
- *      cart that could not be read is not an empty cart, so its totals are withheld rather than
- *      printed as zero.
+ *      that reason means nothing was captured, or where nothing was sent at all: the form asks
+ *      the browser for a connection before it sends, and a submission made with none is held
+ *      back rather than sent to fail. Every reason the store did not author - a reply that could
+ *      not be read, a status this page read a meaning into, a request that came back with no reply
+ *      at all - leaves the order unconfirmed, because a rejected request cannot say whether it
+ *      arrived, and what the buyer is offered then is to check the order rather than to place it
+ *      again. That check is the very draft the attempt recorded, sent again under the same attempt
+ *      name, which the endpoint answers with the order it already holds instead of a second one -
+ *      so the safe action and the retry are one control, and it works after a reload exactly as it
+ *      does before one. And the cart: a cart that could not be read is not an empty cart, so its
+ *      totals are withheld rather than printed as zero.
  *
  *   5. THE CHOSEN FREIGHT CHARGE IS OWNED HERE AND PUBLISHED FROM HERE. The buyer chooses a
  *      service in the group below, and the review column beside this form has to quote what that
@@ -419,15 +421,15 @@ interface OrderFailureCopy {
    * The three values are the three things that can be true of a submission, and they are here
    * because two decisions turn on them and neither can be made from the wording:
    *
-   *   `connectivity`  Nothing was sent. The request never left this browser, so there is no order
-   *                   and no charge, and the notice describes the connection rather than the
-   *                   order. It is the one notice a recovered connection makes obsolete, which is
-   *                   what lets the effect below clear it - and only it - without hiding anything
-   *                   a buyer needs to know.
-   *   `unresolved`    The request left this browser and what became of it is not known here, so an
-   *                   order may exist and a payment may have been taken. Nothing clears this but
-   *                   resolving the attempt, and pressing the notice's control sends that same
-   *                   attempt rather than a new order.
+   *   `connectivity`  Nothing was sent. The browser had no connection when the order was placed,
+   *                   so this form sent nothing, there is no order and no charge from that press,
+   *                   and the notice describes the connection rather than the order. It is the one
+   *                   notice a recovered connection makes obsolete, which is what lets the effect
+   *                   below clear it - and only it - without hiding anything a buyer needs to know.
+   *   `unresolved`    A request went out and no answer from the store came back, so an order may
+   *                   exist and a payment may have been taken. Nothing clears this but the store's
+   *                   own answer to resolving the attempt, and pressing the notice's control
+   *                   resends that same attempt rather than a new order.
    *   `settled`       The store answered, and its answer was that no order was placed. Placing the
    *                   order again is the thing to do, and the next submission supersedes the
    *                   notice.
@@ -823,10 +825,11 @@ const RESOLVE_ORDER = 'Check this order';
  * Wording for an attempt whose outcome this page cannot establish.
  *
  * It is the one notice that does not say whether the buyer has been charged, because that is the
- * situation: the request left this page and what became of it is not known here. So it says so,
- * it does not invite a second order, and it explains why the control in front of the buyer is
- * safe to press - the endpoint recognises the attempt and answers with the order it already
- * holds, and places the order only if it never received it.
+ * situation: a request was sent, no answer from the store came back, and what became of it is not
+ * known here. So it says so, it does not invite a second order, and it explains why the control in
+ * front of the buyer is safe to press - it resends the draft the attempt recorded under the same
+ * name, the endpoint recognises the attempt and answers with the order it already holds, and it
+ * places the order only if it never received it.
  */
 const UNCONFIRMED: OrderFailureCopy = {
   kind: 'unresolved',
@@ -836,13 +839,15 @@ const UNCONFIRMED: OrderFailureCopy = {
 };
 
 /**
- * Wording for a submission this browser never managed to send.
+ * Wording for a submission this form did not send, because the browser had no connection when the
+ * order was placed.
  *
- * It is the opposite statement to {@link UNCONFIRMED} and it may only be made where the browser
- * itself established the fact - `StorefrontApiError.dispatched` being `false`, which the HTTP
- * layer sets only when the machine reported no connection at the moment the request failed. A
- * request that went out and lost its connection on the way back looks the same to this component
- * and is not this notice: the honest answer there is that the outcome is unknown.
+ * It is the opposite statement to {@link UNCONFIRMED}, and it is made only where the fact is this
+ * form's own: the connection is asked about before anything is sent, and a submission made
+ * without one is held back rather than sent. It is never derived from a rejected request. A request
+ * that went out and lost its connection on the way back is rejected exactly like one that never
+ * left, and the browser's connection state afterwards is not its state when the bytes left - so
+ * the honest answer there is that the outcome is unknown, and that is {@link UNCONFIRMED}.
  *
  * Because nothing was sent, the notice says so plainly - no order, no charge, every typed value
  * still in place - and offers to place the order, not to check one. It is also the one notice that
@@ -862,9 +867,10 @@ const OFFLINE: OrderFailureCopy = {
  * It is {@link UNCONFIRMED}'s situation arrived at by a different route: the buyer left while the
  * request was in flight, so the request was abandoned rather than answered - and because
  * `POST /api/checkout` does not stop work when a browser stops waiting for it, the order may have
- * been placed and paid for all the same. The attempt's name survives in session storage with it,
- * so the control offered here sends that same attempt and the store answers with the order it
- * already holds, if it holds one.
+ * been placed and paid for all the same. The attempt's name and the exact draft it sent survive in
+ * session storage, so the control offered here resends that same attempt - with the contact, the
+ * destination and the service it was placed with, whatever the fields and the cart hold now - and
+ * the store answers with the order it already holds, if it holds one.
  *
  * The first sentence is what distinguishes it from a submission that failed on this page: the
  * buyer did not see this attempt fail, so the notice starts by saying which attempt it is about.
@@ -893,12 +899,12 @@ const INTERRUPTED: OrderFailureCopy = {
  * `PAYMENT_STATUS_UNKNOWN` is the same situation named by the store, for the case where the store
  * knows it too.
  *
- * One failure is checked before even that, because for it the part above is not unknown: a
- * `NETWORK_FAILURE` the HTTP layer marked as never dispatched is a request this browser could not
- * send at all, established from the machine reporting no connection at the moment it failed. There
- * is no order and no payment behind such a failure, so {@link OFFLINE} says exactly that, and
- * leaving it to the check below would tell a buyer who never reached the store that they might
- * have been charged. Every other unreported failure keeps the cautious answer.
+ * `NETWORK_FAILURE` is one of those unreported failures and gets the same cautious answer, with no
+ * exception for a browser that says it is offline: a rejected request cannot say whether it
+ * arrived, and the connection this browser reports once it has failed is not the connection it had
+ * when the request left. A submission this form knew it could not send never reaches this
+ * function - the submit path asks for a connection before it sends and shows {@link OFFLINE} then,
+ * which is the one place "nothing was sent" is a fact.
  *
  * Anything that is not a {@link StorefrontApiError} - a mistake in this page, a value the browser
  * threw - lands on the generic sentence: nothing left for the store at all, so nothing was
@@ -912,13 +918,6 @@ function checkoutFailureCopy(cause: unknown): OrderFailureCopy {
       body: 'Something went wrong before this order reached Lumen Supply. Nothing was charged. Place the order again.',
       action: RETRY_ORDER,
     };
-  }
-
-  // The one unreported failure whose effect on the order IS known: nothing was sent, so there is
-  // nothing to check and nothing to be charged for. See the note above, and
-  // `StorefrontApiError.dispatched` for what establishes it.
-  if (cause.code === 'NETWORK_FAILURE' && !cause.dispatched) {
-    return OFFLINE;
   }
 
   if (!cause.reported) {
@@ -976,10 +975,9 @@ function checkoutFailureCopy(cause: unknown): OrderFailureCopy {
     // Neither of the next two is ever reported by the store - both describe the reply rather than
     // the order - so neither reaches this switch through the `reported` check above. They are
     // named here so that the reason for that is stated where a reader looks for it, and so that
-    // every member of the union has an answer. `NETWORK_FAILURE` is the one code that can also be
-    // answered before that check, where the browser established that the request never went out;
-    // a dispatched one whose connection was then lost arrives here as an unknown outcome, which is
-    // what this answer says.
+    // every member of the union has an answer. For `NETWORK_FAILURE` that answer is an unknown
+    // outcome whatever the browser says about its connection afterwards: the request may have
+    // arrived and been carried out, and only the reply was lost.
     case 'NETWORK_FAILURE':
     case 'MALFORMED_RESPONSE':
       return UNCONFIRMED;
@@ -1069,17 +1067,26 @@ const ORDERS_PATH = '/orders';
 /**
  * One attempt to place an order, as it is written down while it is in flight.
  *
- * Three fields, each of which answers a question the next mount of this form will have. The name
+ * Four fields, each of which answers a question the next mount of this form will have. The name
  * of the attempt is what lets a buyer resolve it rather than order twice - the endpoint answers a
  * submission it has already seen with the order that attempt placed. The instant is when the
- * request went out, which is what a diagnostic line needs to be worth reading. And the order
- * number is `null` for exactly as long as the outcome is unknown: it is filled in when the store
- * answers, so a record that still holds `null` is an attempt nobody ever got an answer to.
+ * request went out, which is what a diagnostic line needs to be worth reading. The order number is
+ * `null` for exactly as long as the outcome is unknown: it is filled in when the store answers, so
+ * a record that still holds `null` is an attempt nobody ever got an answer to.
+ *
+ * And the draft is the exact body that was sent, written before it goes out, because resolving
+ * the attempt means sending that body again. The endpoint checks a repeat as it checked the first
+ * submission, and after a reload nothing else in this form still holds it: the fields may be
+ * empty, the cart the attempt ordered may already be an order, and the freight quote that named
+ * the service is gone with the page. It is `null` once the store has answered with an order - the
+ * contact and the address it carries are the store's to keep then, not this tab's - and in a
+ * record that could not keep one (see {@link readAttemptRecord}).
  */
 interface CheckoutAttemptRecord {
   readonly idempotencyKey: string;
   readonly startedAt: number;
   readonly orderNumber: string | null;
+  readonly draft: CheckoutDraft | null;
 }
 
 /**
@@ -1088,22 +1095,77 @@ interface CheckoutAttemptRecord {
  * Storage is a string that anything with this origin could have written, and what is read back
  * decides whether a buyer is told they may have been charged - so it is validated rather than
  * cast. Every field is checked for its own type, the attempt's name is required to be non-empty,
- * and the instant is required to be a finite number, because a record that fails any of those says
- * nothing intelligible about an order and is dropped.
+ * the instant is required to be a finite number, and the draft is required to be `null` or a
+ * draft {@link intact} judges to be one this attempt sent. A record that fails the first three
+ * says nothing intelligible about an order; one that fails only the last is still the record of
+ * an attempt, which {@link readAttemptRecord} keeps without its draft.
  */
 function isAttemptRecord(value: unknown): value is CheckoutAttemptRecord {
   if (typeof value !== 'object' || value === null) {
     return false;
   }
 
-  const { idempotencyKey, startedAt, orderNumber } = value as Partial<CheckoutAttemptRecord>;
+  const { idempotencyKey, startedAt, orderNumber, draft } = value as Partial<CheckoutAttemptRecord>;
 
   return (
     typeof idempotencyKey === 'string' &&
     idempotencyKey.length > 0 &&
     typeof startedAt === 'number' &&
     Number.isFinite(startedAt) &&
-    (orderNumber === null || (typeof orderNumber === 'string' && orderNumber.length > 0))
+    (orderNumber === null || (typeof orderNumber === 'string' && orderNumber.length > 0)) &&
+    (draft === null || intact(draft, idempotencyKey))
+  );
+}
+
+/**
+ * Whether `value` is a {@link CheckoutDraft} the attempt named `key` could have sent.
+ *
+ * A structural check, field by field, against the DTO: every string is a string, every optional
+ * value is a string or `null`, and the draft's own attempt name is `key` - a draft recorded under
+ * one attempt and read back under another would resolve the wrong one. It does not judge the
+ * values, because the draft was judged before it was first sent and the endpoint judges it again
+ * when it is sent again; what this rules out is a body this form did not write, which would be
+ * refused as a malformed request instead of being answered about the attempt.
+ *
+ * @param value What the record holds under `draft`.
+ * @param key The name of the attempt the record is about.
+ */
+function intact(value: unknown, key: string): value is CheckoutDraft {
+  if (typeof value !== 'object' || value === null) {
+    return false;
+  }
+
+  const { contact, shippingAddress, shippingOptionId, notes, idempotencyKey } = value as Partial<
+    Record<keyof CheckoutDraft, unknown>
+  >;
+
+  if (
+    typeof contact !== 'object' ||
+    contact === null ||
+    typeof shippingAddress !== 'object' ||
+    shippingAddress === null
+  ) {
+    return false;
+  }
+
+  const { name, email, company } = contact as Partial<Record<keyof CustomerContact, unknown>>;
+  const { line1, line2, city, region, postalCode, country } = shippingAddress as Partial<
+    Record<keyof ShippingAddress, unknown>
+  >;
+
+  return (
+    typeof name === 'string' &&
+    typeof email === 'string' &&
+    (company === null || typeof company === 'string') &&
+    typeof line1 === 'string' &&
+    (line2 === null || typeof line2 === 'string') &&
+    typeof city === 'string' &&
+    typeof region === 'string' &&
+    typeof postalCode === 'string' &&
+    typeof country === 'string' &&
+    typeof shippingOptionId === 'string' &&
+    (notes === null || typeof notes === 'string') &&
+    idempotencyKey === key
   );
 }
 
@@ -1115,6 +1177,12 @@ function isAttemptRecord(value: unknown): value is CheckoutAttemptRecord {
  * `sessionStorage` throws outright where storage is denied or partitioned, and the value it holds
  * may be anything. A failure of either kind is logged for whoever is debugging it and answered as
  * "no record", which leaves the form exactly as it behaves for a first-time buyer.
+ *
+ * A record whose name and instant are intact is kept even when its draft is not - one written
+ * before records carried a draft, or one whose draft is not a draft this attempt sent. It is kept
+ * with `draft: null` rather than dropped: it is still the evidence that an attempt went out and may
+ * have been charged, and dropping it would let the next submission mint a new name for what may be
+ * the same order. Only the draft is lost, and the form falls back to the fields for it.
  */
 function readAttemptRecord(): CheckoutAttemptRecord | null {
   let stored: string | null;
@@ -1142,23 +1210,41 @@ function readAttemptRecord(): CheckoutAttemptRecord | null {
     parsed = undefined;
   }
 
-  if (!isAttemptRecord(parsed)) {
+  if (isAttemptRecord(parsed)) {
+    return parsed;
+  }
+
+  // The same record without its draft: what is left when only the draft was unreadable, or when
+  // the record predates drafts altogether.
+  const kept: unknown =
+    typeof parsed === 'object' && parsed !== null ? { ...parsed, draft: null } : undefined;
+
+  if (!isAttemptRecord(kept)) {
     console.warn('Lumen Supply: the stored checkout attempt could not be read and was dropped.');
     forgetAttempt();
 
     return null;
   }
 
-  return parsed;
+  // Worth a line only where the draft would have been used: an attempt nobody has an answer to. A
+  // record that already names its order has no use for one.
+  if (kept.orderNumber === null) {
+    console.warn(
+      'Lumen Supply: the stored checkout attempt holds no readable draft and is kept without one.',
+    );
+  }
+
+  return kept;
 }
 
 /**
  * Writes down the attempt in hand, replacing whatever was there.
  *
- * Called twice per submission: once before the request goes out, with no order number, and once
- * when the store has answered, with the order's own reference. The second call is what turns "an
- * order may exist" into "this order exists", and it is the reference a buyer is shown if they come
- * back to a form whose receipt they never saw.
+ * Called twice per submission: once before the request goes out, with no order number and the
+ * exact draft being sent, and once when the store has answered with an order, with the order's
+ * own reference and no draft. The second call is what turns "an order may exist" into "this order
+ * exists", and it is the reference a buyer is shown if they come back to a form whose receipt they
+ * never saw.
  *
  * A storage that refuses the write is logged and otherwise ignored. The submission continues: an
  * order the buyer can place is worth more than the note this page would have kept about it.
@@ -1177,9 +1263,13 @@ function rememberAttempt(record: CheckoutAttemptRecord): void {
 /**
  * Drops the record, for an attempt that provably placed no order.
  *
- * Only a failure the store named, or one this browser established it never sent, may do this: a
- * record removed on an unknown outcome is the evidence of a possible charge thrown away, which is
- * the whole thing this section exists to prevent.
+ * Only an established outcome may do this: the store's own answer that no order was placed - a
+ * failure it named, carrying a reason that means nothing was captured - or a failure of this page
+ * raised before a fresh submission's request left it. A record removed on an unknown outcome is the
+ * evidence of a possible charge thrown away, which is the whole thing this section exists to
+ * prevent, so nothing else does it - no rejected request, whatever the browser says about its
+ * connection. A record that cannot be read at all is the one other case, and
+ * {@link readAttemptRecord} says why.
  */
 function forgetAttempt(): void {
   try {
@@ -1242,9 +1332,9 @@ function addressNamesOrder(orderNumber: string): boolean {
  * messages, the failure notice, the placed order and the reference of an order an earlier attempt
  * from this tab turned out to have placed. There is no reducer, no transition and no derived copy
  * of the cart: the cart is read from the provider that owns it, and the two composite blocks below
- * own their own presentation. Four refs sit beside them, each holding something that must survive a
- * render without causing one: the attempt's name, the controller of the submission in flight, and
- * the two regions focus is moved to.
+ * own their own presentation. Five refs sit beside them, each holding something that must survive a
+ * render without causing one: the attempt's name, the exact draft that attempt was sent with, the
+ * controller of the submission in flight, and the two regions focus is moved to.
  *
  * Two things are read from elsewhere and neither is state of this form's. The freight lookup for
  * the destination in the fields comes from `@/hooks/useShippingEta`, which owns the request and its
@@ -1448,6 +1538,17 @@ export function CheckoutForm({
   const attempt = useRef<string | null>(null);
 
   /*
+   * The exact draft the attempt in `attempt` was last sent with, or `null` before it has been sent.
+   *
+   * Set as each request goes out, and restored from the attempt record on mount, so that resolving
+   * an unconfirmed attempt resends precisely what that attempt sent - not what the fields hold now,
+   * which the buyer may have changed and a reload will have emptied, and not a service drawn from a
+   * quote the cart may no longer be able to get. A ref for the same reasons as `attempt`, and read,
+   * like it, only in the submit handler and the effects.
+   */
+  const sent = useRef<CheckoutDraft | null>(null);
+
+  /*
    * The controller of the submission in flight, or `null` while none is.
    *
    * One controller per submission, held here so the unmount effect below can abort it: a buyer who
@@ -1478,10 +1579,11 @@ export function CheckoutForm({
   /*
    * Take down the connectivity notice once the connection is back, and nothing else with it.
    *
-   * A notice about a request that never left the browser stops describing anything the moment the
-   * browser can reach the store again, and leaving it up is how a buyer comes to believe a store
-   * is down while it is answering. Every other notice stays: `unresolved` may be the only record
-   * a buyer has that a payment might have been taken, and `settled` is the store's own answer
+   * A notice about a submission this form held back for want of a connection stops describing
+   * anything the moment the browser can reach the store again, and leaving it up is how a buyer
+   * comes to believe a store is down while it is answering. Every other notice stays: `unresolved`
+   * may be the only record a buyer has that a payment might have been taken, and `settled` is the
+   * store's own answer
    * about this order - a recovered connection says nothing about either, so clearing them would be
    * hiding them. That is what `OrderFailureCopy.kind` is for, and the update is written as a
    * function of the current notice so a failure arriving in the same tick is judged on what it is
@@ -1547,12 +1649,13 @@ export function CheckoutForm({
    * notice it may raise arrives a frame later, which is the right trade.
    *
    * Two records are worth acting on and they mean different things. One with no order number is an
-   * attempt whose outcome nobody established: the buyer is shown {@link INTERRUPTED}, and the
-   * attempt's own name is restored into `attempt` so that pressing the notice's control sends that
-   * same attempt - which the endpoint answers with the order it already holds, rather than placing
-   * a second one. One WITH an order number is an order that exists and that this tab lost sight
-   * of, so its reference is put in front of the buyer; if the address already names it, the page
-   * has said so and this stays quiet.
+   * attempt whose outcome nobody established: the buyer is shown {@link INTERRUPTED}, the
+   * attempt's own name is restored into `attempt` and the draft it recorded into `sent`, so that
+   * pressing the notice's control resends that same attempt exactly as it went out - which the
+   * endpoint answers with the order it already holds, rather than placing a second one, however
+   * empty the fields and the cart are by now. One WITH an order number is an order that exists and
+   * that this tab lost sight of, so its reference is put in front of the buyer; if the address
+   * already names it, the page has said so and this stays quiet.
    *
    * Both kinds of record are logged where they report something, because a silent failure is the
    * hardest kind to find in production and this one used to leave no trace at all: the line names
@@ -1581,12 +1684,15 @@ export function CheckoutForm({
 
     if (record.orderNumber === null) {
       attempt.current = record.idempotencyKey;
+      sent.current = record.draft;
       // A hydration-safe read of session storage; see the note above this effect.
       // eslint-disable-next-line react-hooks/set-state-in-effect -- storage cannot be read in render
       setFailure(INTERRUPTED);
+      // Whether a draft came back is logged and the draft is not: it holds the buyer's contact
+      // and address, which have no place in a console.
       console.warn(
         'Lumen Supply: a checkout attempt was never answered and may have placed an order:',
-        { attempt: record.idempotencyKey, startedAt },
+        { attempt: record.idempotencyKey, startedAt, recorded: record.draft !== null },
       );
 
       return;
@@ -1675,15 +1781,14 @@ export function CheckoutForm({
   // One submission can be two things, and the pass has to know which. Where the notice on screen
   // reports an unresolved outcome, the next press is not a second order but the same attempt sent
   // again, answered from the store's record of it rather than from a fresh quote - and a cart that
-  // has already become an order has no quote left to satisfy. So while resolving, the draft names
-  // the buyer's own choice and the freight check stands down; every other message still applies.
+  // has already become an order has no quote left to satisfy. What is sent then is the draft the
+  // attempt recorded, which this pass does not judge at all (see `submitOrder`); the fields are
+  // sent only where no draft was recorded, and for that case the pass judges them with the
+  // buyer's own choice of service - the quoted one if a quote is in hand, the one they picked
+  // otherwise - and the freight check stands down. Every other message still applies.
   const resolving = failure?.kind === 'unresolved';
-  const fields = entered(
-    contact,
-    address,
-    resolving ? effectiveOptionId : (quotedChoice?.id ?? null),
-    notes,
-  );
+  const choice = resolving ? (quotedChoice?.id ?? shippingOptionId) : chosenOptionId;
+  const fields = entered(contact, address, choice, notes);
   const problems = collectFieldErrors(fields);
   const freightProblem = resolving ? undefined : freightSelectionProblem(freight, quotedChoice);
 
@@ -1761,11 +1866,13 @@ export function CheckoutForm({
    * Place the order - or resolve the attempt that may already have placed it.
    *
    * The whole path, in order: stop the browser navigating; refuse a second submission while one is
-   * running; name the attempt, once, and keep that name for every submission of this order;
-   * assemble the draft; reveal every message the validation pass above has already produced and
-   * drop any notice from an earlier attempt; stop there if anything is wrong, with the reader moved
-   * to the first field that is; then one request, whose two outcomes are a stored order and a
-   * receipt, or a notice above the submit row with every typed value still in place.
+   * running; name the attempt, once, and keep that name for every submission of this order; take
+   * the draft - the one the attempt recorded when this press resolves it, the fields otherwise -
+   * and, for the fields, reveal every message the validation pass above has already produced and
+   * stop there if anything is wrong, with the reader moved to the first field that is; hold the
+   * submission back if the browser has no connection; drop any notice a new order supersedes; then
+   * one request, whose two outcomes are a stored order and a receipt, or a notice above the submit
+   * row with every typed value still in place.
    *
    * It validates nothing itself, and that is deliberate rather than an omission: the pass runs on
    * every render, so by the time this handler is reached its result is already the result for the
@@ -1774,23 +1881,36 @@ export function CheckoutForm({
    *
    * ONE SUBMISSION CAN BE TWO THINGS. Where the notice on screen reports an unresolved outcome,
    * pressing its control is not a second order: it is the same attempt sent again, which the
-   * endpoint answers with the order it already holds. Two things follow, and both are deliberate.
-   * The store's current freight offer is not required for it - the answer comes from the store's
-   * record of the attempt, not from a fresh quote, and a cart that has already become an order
-   * has no quote left to satisfy - so the freight check is skipped and the service the draft names
-   * is the buyer's own choice rather than a quoted one. And the notice is not cleared until the
-   * request actually goes out: a submission the validation pass stopped has established nothing,
-   * so erasing the only record of a possible charge at that point would be the worst thing this
-   * handler could do.
+   * endpoint answers with the order it already holds - or completes, if the store never received
+   * it. So what is sent is what the attempt sent: the draft this mount last sent under its name, or
+   * the one its record kept across a reload, verbatim. None of this form's gates stands in front of
+   * it - the fields may have been edited or emptied since, a cart that has already become an order
+   * holds nothing and has no quote left to satisfy, and the endpoint checks the draft again
+   * regardless - and none of them is needed to prevent a second order, because the name is the
+   * attempt's and the endpoint answers it from its own record. Only a record with no draft - one
+   * written before records kept one - falls back to the fields, judged by the pass above with the
+   * buyer's own choice of service and without the freight check. And the notice stays up while
+   * the check runs: it leaves the screen when the store establishes the outcome - a receipt, or the
+   * store's own answer that no order was placed - and on nothing less, because erasing the only
+   * record of a possible charge before then would be the worst thing this handler could do.
    *
-   * WHAT SURVIVES IT. The attempt is written to session storage before the request leaves and
-   * replaced with the order's own reference when the store answers, because this component cannot
-   * be relied on to still be here when it does - a buyer who navigates away mid-request has the
-   * abort in the unmount effect above release the connection, while `POST /api/checkout` carries
-   * the order out regardless. So an abort is reported to nobody as a failure (the buyer asked to
-   * leave; that is not a failure) and stores nothing, and the record it leaves behind is what the
-   * next mount reads. A failure that proves no order exists - the store's own refusal, or a
-   * request this browser never sent - drops the record instead.
+   * CONNECTIVITY IS ASKED BEFORE ANYTHING IS SENT. A browser that reports no connection has the
+   * submission held back: nothing is recorded and nothing is sent. A new order is answered with
+   * {@link OFFLINE}, the one notice that may say nothing was sent, because here that is this form's
+   * own fact; a check of an unresolved attempt leaves that attempt's notice exactly as it was and
+   * says in a toast that checking needs a connection. The answer is never read off a rejected
+   * request, which cannot say whether it arrived.
+   *
+   * WHAT SURVIVES IT. The attempt - its name, the instant it began and the exact draft sent - is
+   * written to session storage before the request leaves and replaced with the order's own
+   * reference alone when the store answers with one, because this component cannot be relied on
+   * to still be here when it does - a buyer who navigates away mid-request has the abort in the
+   * unmount effect above release the connection, while `POST /api/checkout` carries the order out
+   * regardless. So an abort is reported to nobody as a failure (the buyer asked to leave; that is
+   * not a failure) and stores nothing, and the record it leaves behind is what the next mount
+   * reads. A failure that establishes no order exists - the store's own refusal, or a failure of
+   * this page before a new order's request left it - drops the record instead; every other failure
+   * keeps it.
    *
    * The request is classified on its own, and what follows a success is not. A consumer's
    * `onOrderPlaced` runs after the order has been stored and announced, outside anything that
@@ -1815,55 +1935,90 @@ export function CheckoutForm({
     // order.
     attempt.current ??= attemptKey();
 
-    // The service the draft names is the chosen service *as the current quote offers it*, so an
-    // order is never sent naming a service the store has not just quoted - an id the quote omits
-    // reaches the draft as the empty string, exactly as no choice at all does. The freight
-    // message then replaces the generic "choose a shipping service" wording with the reason that
-    // actually applies, in the same single validation pass: a group still being quoted, one that
-    // could not be quoted, a destination with no service, or a cart too large to quote.
-    //
-    // A resolution is the exception to both, and for one reason: it is answered from the store's
-    // record of the attempt rather than from a quote, so requiring a current offer would leave the
-    // control dead in the one situation it exists for - a cart that has already become an order is
-    // no longer quotable. The draft therefore names the buyer's own choice, which is what the
-    // service group shows as selected while no quote is in hand.
-    const draft = checkoutDraftFrom(
-      contact,
-      address,
-      resolving ? effectiveOptionId : (quotedChoice?.id ?? null),
-      notes,
-      attempt.current,
-    );
+    const key = attempt.current;
 
-    // Somebody who has pressed this has finished with every field, so every message the pass above
-    // produced is now theirs to see. The notice from an earlier attempt is NOT cleared here - see
-    // below: a submission the pass stops has sent nothing, and a notice about a possible charge
-    // has to outlive it.
-    setSubmitted(true);
+    // The record of the attempt being resolved, read once for the two things it may still hold:
+    // the draft to send again, and the instant the attempt began. Its draft is taken only when it
+    // was recorded under this very name, so a resolution can never travel under another attempt's.
+    const earlier = resolving ? readAttemptRecord() : null;
+    const recorded = resolving
+      ? (sent.current ?? (earlier?.idempotencyKey === key ? earlier.draft : null))
+      : null;
 
-    // Nothing is sent while anything is wrong, and the reader is put where the work is: the first
-    // field on screen with something wrong, whose message is now rendered beside it and announced.
-    // Without this the press moves nothing - the messages appear above the fold, the caret stays on
-    // the control that appeared to do nothing, and a reader using the keyboard is told nothing at
-    // all.
-    const first = FIELDS.find((field) => problems[field.key] !== undefined);
+    let draft: CheckoutDraft;
 
-    if (first !== undefined) {
-      if (first.id !== undefined) {
-        document.getElementById(first.id)?.focus();
+    if (recorded !== null) {
+      // The attempt's own body, exactly as it went out: see ONE SUBMISSION CAN BE TWO THINGS above.
+      draft = recorded;
+    } else {
+      // The service the draft names is the chosen service *as the current quote offers it*, so an
+      // order is never sent naming a service the store has not just quoted - an id the quote omits
+      // reaches the draft as the empty string, exactly as no choice at all does. The freight
+      // message then replaces the generic "choose a shipping service" wording with the reason that
+      // actually applies, in the same single validation pass: a group still being quoted, one that
+      // could not be quoted, a destination with no service, or a cart too large to quote.
+      //
+      // A resolution with no recorded draft is the exception to both, and for one reason: it is
+      // answered from the store's record of the attempt rather than from a quote, so requiring a
+      // current offer would leave the control dead in the one situation it exists for - a cart
+      // that has already become an order is no longer quotable. The draft therefore names the
+      // buyer's own choice, the quoted one where a quote is in hand and the one they picked
+      // otherwise, which is `choice` above.
+      draft = checkoutDraftFrom(contact, address, choice, notes, key);
+
+      // Somebody who has pressed this has finished with every field, so every message the pass
+      // above produced is now theirs to see. The notice from an earlier attempt is NOT cleared
+      // here - see below: a submission the pass stops has sent nothing, and a notice about a
+      // possible charge has to outlive it.
+      setSubmitted(true);
+
+      // Nothing is sent while anything is wrong, and the reader is put where the work is: the
+      // first field on screen with something wrong, whose message is now rendered beside it and
+      // announced. Without this the press moves nothing - the messages appear above the fold, the
+      // caret stays on the control that appeared to do nothing, and a reader using the keyboard is
+      // told nothing at all.
+      const first = FIELDS.find((field) => problems[field.key] !== undefined);
+
+      if (first !== undefined) {
+        if (first.id !== undefined) {
+          document.getElementById(first.id)?.focus();
+        }
+
+        return;
+      }
+    }
+
+    // Asked of the browser before anything is written down or sent, which is the only moment the
+    // answer establishes something: a submission held back here provably reached nobody. See
+    // CONNECTIVITY above. `navigator` is read defensively: where there is none, nothing is known
+    // about the connection and the submission goes ahead.
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+      if (resolving) {
+        showToast({
+          tone: 'warning',
+          title: 'Checking this order needs a connection',
+          body: 'Nothing was sent. Reconnect, then check the order again.',
+        });
+      } else {
+        setFailure(OFFLINE);
+        showToast({ tone: 'danger', title: OFFLINE.title });
       }
 
       return;
     }
 
-    // The notice from the previous attempt goes now and not before: a submission stopped by the
-    // validation pass above sent nothing, and a notice about a possible charge has to outlive a
-    // press that never left this page.
-    setFailure(null);
+    // A new order supersedes the notice from the previous one now and not before: a submission
+    // stopped above sent nothing, and a notice about a possible charge has to outlive a press that
+    // never left this page. A check of an unresolved attempt clears nothing - its notice leaves
+    // only when the store answers.
+    if (!resolving) {
+      setFailure(null);
+    }
+
     setPending(true);
 
     // The attempt, written down before it goes out, so a reply this component never receives still
-    // leaves a trail: the name to resolve it under and the instant it started.
+    // leaves a trail: the name to resolve it under, the instant it started and the draft to resend.
     const controller = new AbortController();
     const requestStartedAt = Date.now();
 
@@ -1873,14 +2028,15 @@ export function CheckoutForm({
     // charge could have been taken, and stamping it with a press made twenty minutes later would
     // throw that away. A fresh attempt began now, and a record that cannot be read back is treated
     // as one, which is the same answer `readAttemptRecord` gives a first-time buyer.
-    const earlier = resolving ? readAttemptRecord() : null;
     const attemptStartedAt = earlier?.startedAt ?? requestStartedAt;
 
     submission.current = controller;
+    sent.current = draft;
     rememberAttempt({
       idempotencyKey: draft.idempotencyKey,
       startedAt: attemptStartedAt,
       orderNumber: null,
+      draft,
     });
 
     let result: CheckoutResult;
@@ -1901,12 +2057,20 @@ export function CheckoutForm({
         return;
       }
 
-      const copy = checkoutFailureCopy(cause);
+      // While resolving, only the store's own answer can settle the attempt. A failure this page
+      // raised says nothing about an attempt that went out earlier, so it leaves that attempt as
+      // unconfirmed as it was rather than reading as "nothing was charged". The store's answer can
+      // be trusted here even when it is about the cart - empty, held, taken by another checkout:
+      // the endpoint asks its own record of this attempt's name again before it gives any such
+      // refusal, so a refusal it does give means the name holds no order and no charge.
+      const answered = cause instanceof StorefrontApiError && cause.reported;
+      const copy = resolving && !answered ? UNCONFIRMED : checkoutFailureCopy(cause);
 
-      // A failure that establishes no order exists - the store's own refusal, or a request this
-      // browser never managed to send - takes the record with it, so the next mount does not raise
-      // a notice about an attempt that is settled. An unresolved outcome keeps it.
-      if (copy.kind !== 'unresolved') {
+      // Only a failure that establishes no order exists - the store's own refusal, or a failure of
+      // this page before a new order's request left it - takes the record with it, so the next
+      // mount does not raise a notice about an attempt that is settled. Every unresolved outcome,
+      // a rejected request included, keeps it.
+      if (copy.kind === 'settled') {
         forgetAttempt();
       }
 
@@ -1929,10 +2093,13 @@ export function CheckoutForm({
     // component, which is still mounted.
     const abandoned = controller.signal.aborted;
 
+    // The order's reference replaces the draft: the store holds the contact and the address now,
+    // and this tab has no further use for its own copy of them.
     rememberAttempt({
       idempotencyKey: draft.idempotencyKey,
       startedAt: attemptStartedAt,
       orderNumber: result.order.orderNumber,
+      draft: null,
     });
 
     if (abandoned) {
@@ -1942,8 +2109,10 @@ export function CheckoutForm({
       });
     } else {
       // The order's own address, pushed before the receipt is stored so the two arrive together and
-      // the history entry the buyer can go Back from is the page they were filling in.
+      // the history entry the buyer can go Back from is the page they were filling in. The receipt
+      // is the store establishing the outcome, so an unresolved notice ends with it.
       pushOrderAddress(result.order.orderNumber);
+      setFailure(null);
       setPlaced(result);
 
       // An order exists, which ends the review column beside this form: the cart it was reviewing
@@ -2415,7 +2584,10 @@ export function CheckoutForm({
             tone="danger"
             title={failure.title}
             actions={
-              <Button type="submit" variant="secondary" size="sm">
+              // Unavailable while a submission is in flight, because an unresolved notice stays on
+              // screen while its attempt is being checked and pressing it again would only be
+              // refused by the handler.
+              <Button type="submit" variant="secondary" size="sm" disabled={pending}>
                 {failure.action}
               </Button>
             }

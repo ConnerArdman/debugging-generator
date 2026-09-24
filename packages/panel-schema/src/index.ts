@@ -152,7 +152,9 @@
  *   `validateAgainstCapture` with its three-way outcome, and `toResult` for a
  *   caller that wants the same answer as a `Result`. Its options carry the id
  *   resolvers, so a spec can be checked against a capture whose event ids are
- *   known only to the store.
+ *   known only to the store, and the field-presence tally `tallyFieldPresence`
+ *   computes from the capture's events, so a node whose records lack a field
+ *   its catalog entry requires is reported rather than rendered empty.
  * - `json-schema` — `panelSpecInputJsonSchema` and its text form, the schema id
  *   and the dialect, for the prompt that asks a model for an authored panel.
  *
@@ -485,12 +487,15 @@ export {
   SEMANTIC_VALIDATION_STATUSES,
   collectSemanticIssues,
   isSemanticIssueReason,
+  tallyFieldPresence,
   toResult,
   validateAgainstCapture,
 } from './semantic.js';
 export type {
+  CaptureFieldPresence,
   EventIdResolver,
   IdResolution,
+  KindFieldPresence,
   SemanticIssue,
   SemanticIssueReason,
   SemanticIssueSets,

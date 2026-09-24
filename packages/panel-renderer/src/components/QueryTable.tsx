@@ -38,9 +38,10 @@
  * `packages/panel-schema/src/catalog.ts`, which is also what the semantic
  * validator checks a generated panel against — resolved into the `queries`
  * result shape by `packages/telemetry/src/aggregate/queries.ts`:
- * span identity, timing, taxonomy, label, status and source, plus the
- * `db.system` / `db.statement` / `db.rowCount` attributes and the function and
- * route-handler keys the caller walk resolves a call site through.
+ * span identity, timing, taxonomy, label and status, with `db.statement`
+ * required (a span without one forms no group), and `parentSpanId`, `source`,
+ * `db.system` and `db.rowCount` read when present. The caller walk resolves a
+ * call site through `parentSpanId`, not through function or route-handler keys.
  *
  * ## The click that ends the acceptance flow
  *
@@ -75,13 +76,18 @@
  *
  * ## States
  *
- * All three, in precedence, for the first page: loading → an `EmptyState` for a
- * capture that legitimately holds no statements → an `ErrorState` with the
- * serialised query and a working retry. Once a page has been loaded and frozen,
- * a further page resolves *underneath* the rows already on screen: blanking a
- * table the reader is using in order to re-show a spinner would lose their
- * place, so the incremental loading and failure states live in the footer beside
- * the control that asked for them.
+ * All three, in precedence, for the first page: loading → an `ErrorState` with
+ * the serialised query and a working retry → an `EmptyState` whose copy says
+ * what the empty page actually means (see {@link describeEmptyPage}): a capture
+ * that holds no statements, a count-only query (`limit: 0`), or a page that
+ * starts past the end of — or simply holds none of — a positive total. Once a
+ * page has been loaded and frozen, a further page resolves *underneath* the rows
+ * already on screen: blanking a table the reader is using in order to re-show a
+ * spinner would lose their place, so the incremental loading state lives in the
+ * footer beside the control that asked for it, and a failed further page raises
+ * the same `ErrorState` — message, code, the failing query with its `offset`,
+ * and a retry of exactly that request — below the footer, with the earlier rows
+ * still on screen.
  *
  * @see packages/panel-schema/src/catalog.ts — the `queryTable` catalog entry
  * @see packages/telemetry/src/aggregate/queries.ts — the `queries` result shape
@@ -196,6 +202,24 @@ const DEFAULT_CAPTION = 'Database statements captured during this interaction';
 /** Shown for a capture that genuinely holds no database statements. */
 const EMPTY_MESSAGE = 'No database queries were captured for this interaction.';
 
+/**
+ * Title of the empty state for a count-only query (`limit: 0`): the node asked
+ * for a total and no rows, so an empty grid is the answer it requested rather
+ * than an absence in the capture.
+ */
+const COUNT_ONLY_TITLE = 'Count only';
+
+/** A count-only query whose provider reported no total, so there is no number to show. */
+const COUNT_ONLY_UNKNOWN_TOTAL_MESSAGE =
+  'This view requests a count without rows, and no total was reported for its query.';
+
+/**
+ * Title of the empty state for a page that holds no rows although the capture
+ * is not known to be empty: an offset past the end, a page the provider left
+ * empty beneath a positive total, or a later page with no reported total.
+ */
+const EMPTY_PAGE_TITLE = 'Nothing on this page';
+
 /** The accessible name of the busy region while the first page resolves. */
 const LOADING_LABEL = 'Loading captured database queries';
 
@@ -219,6 +243,13 @@ const LOAD_MORE_LABEL = 'Load more';
 
 /** Label of the control that re-asks for a page whose request failed. */
 const RETRY_PAGE_LABEL = 'Try again';
+
+/**
+ * Title of the error state raised when a further page fails beneath rows that
+ * are already on screen. It says which request failed — the next page, not the
+ * view — because the statements above it are still the ones that loaded.
+ */
+const PAGE_ERROR_TITLE = 'Could not load the next page';
 
 /** Shown in the footer while a further page is in flight. */
 const LOADING_MORE_MESSAGE = 'Loading more statements…';
@@ -301,6 +332,59 @@ function loadedText(loaded: number, total: number | undefined): string {
   return total === undefined
     ? `Showing ${formatCount(loaded)} statements`
     : `Showing ${formatCount(loaded)} of ${formatCount(total)} statements`;
+}
+
+/**
+ * The noun the empty-page copy counts in, agreeing with its count.
+ *
+ * @param count How many statement groups the sentence counts.
+ * @returns `"query"` for exactly one, `"queries"` otherwise (zero included).
+ */
+function queryNoun(count: number): string {
+  return count === 1 ? 'query' : 'queries';
+}
+
+/**
+ * The count-only message when the provider reported the total the node asked for.
+ *
+ * @param total The reported total.
+ * @returns The message text.
+ */
+function countOnlyMessage(total: number): string {
+  return `This view requests a count without rows: ${formatCount(total)} ${queryNoun(total)} matched its query.`;
+}
+
+/**
+ * The message for a page that starts at or beyond the reported total.
+ *
+ * Positions are 1-based for the reader, so an `offset` of 200 is position 201.
+ *
+ * @param offset The page's 0-based offset.
+ * @param total The reported, positive total.
+ * @returns The message text.
+ */
+function pastEndMessage(offset: number, total: number): string {
+  return `This page starts at position ${formatCount(offset + 1)}, past the end of the ${formatCount(total)} ${queryNoun(total)} that matched this query.`;
+}
+
+/**
+ * The message for a page inside a positive total that nonetheless holds no rows.
+ *
+ * @param total The reported, positive total.
+ * @returns The message text.
+ */
+function emptyWithinTotalMessage(total: number): string {
+  return `${formatCount(total)} ${queryNoun(total)} matched this query, but none are shown on this page.`;
+}
+
+/**
+ * The message for a page with no reported total that holds no rows.
+ *
+ * @param offset The page's 0-based offset.
+ * @returns The message text.
+ */
+function emptyWithoutTotalMessage(offset: number): string {
+  return `This page starts at position ${formatCount(offset + 1)} and holds no ${queryNoun(0)}; no total was reported for this query.`;
 }
 
 /*
@@ -481,25 +565,148 @@ interface PagingState {
  */
 
 /**
- * The page size a query is resolved with: the authored `limit`, the contract's
- * default when none was authored, and never outside `[1, DATA_QUERY_MAX_LIMIT]`.
+ * The page size a query is resolved with: the contract's default when no
+ * `limit` was authored, and otherwise the authored value, preserved, within
+ * `[0, DATA_QUERY_MAX_LIMIT]`.
  *
- * The schema admits a `limit` of `0` as an explicit request for no items, which
- * is meaningful for a node that wants a total without rows; a *table* has
- * nothing to draw and no way to page with a page size of zero, so this view
- * raises it to one row rather than rendering an empty grid that can never
- * advance. A malformed value — fractional, negative, non-finite — is treated as
- * unauthored rather than trusted.
+ * Zero is kept exactly. The schema admits `limit: 0` as an explicit request for
+ * a total without rows (`packages/panel-schema/src/nodes/query.ts`), the page
+ * echo reports it back unchanged, and only the *absence* of the field means
+ * "unset" — so this view sends `limit: 0`, renders the count-only state and
+ * never pages (see {@link canAdvance}). Raising it to one row would draw a
+ * statement the node never asked for.
+ *
+ * A value a validated node cannot carry is still bounded rather than trusted:
+ * a non-finite one is treated as unauthored, a fractional one is truncated, a
+ * negative one is floored at zero and an oversized one is capped at the
+ * contract's ceiling.
  *
  * @param limit The node's authored `limit`, if any.
- * @returns A page size in `[1, DATA_QUERY_MAX_LIMIT]`.
+ * @returns A page size in `[0, DATA_QUERY_MAX_LIMIT]`; `0` only when authored.
  */
 function resolvePageLimit(limit: number | undefined): number {
-  if (limit === undefined || !Number.isInteger(limit) || limit < 0) {
+  if (limit === undefined || !Number.isFinite(limit)) {
     return DATA_QUERY_DEFAULT_LIMIT;
   }
 
-  return Math.min(Math.max(limit, 1), DATA_QUERY_MAX_LIMIT);
+  return Math.min(Math.max(Math.trunc(limit), 0), DATA_QUERY_MAX_LIMIT);
+}
+
+/**
+ * Whether the provider's `nextOffset` names a page this view may request next.
+ *
+ * Paging only ever moves forward, and only along the offsets the service
+ * reports (`packages/protocol/src/http.ts`, `nextOffset`): the response has to
+ * have settled, the page size has to be positive — a count-only query has no
+ * next page by definition — and the reported offset has to be a safe integer
+ * strictly beyond the one this page was requested at. Anything else — end of
+ * data, a value that repeats or rewinds the current offset — offers no Load
+ * More, because following it would re-request, and re-append, rows already on
+ * screen. The offset is never derived from the length of the page.
+ *
+ * @param status The hook's status for the current page.
+ * @param pageLimit The resolved page size of the request.
+ * @param pageOffset The `offset` the current page was requested with.
+ * @param nextOffset The provider's reported next offset, if any.
+ * @returns `true` when `nextOffset` may be requested next, and is then a number.
+ */
+function canAdvance(
+  status: 'loading' | 'error' | 'success',
+  pageLimit: number,
+  pageOffset: number,
+  nextOffset: number | undefined,
+): nextOffset is number {
+  return (
+    status === 'success' &&
+    pageLimit > 0 &&
+    nextOffset !== undefined &&
+    Number.isSafeInteger(nextOffset) &&
+    nextOffset > pageOffset
+  );
+}
+
+/** The copy of an empty state: an optional first line and the required message. */
+interface EmptyPageCopy {
+  /** The first line, when the absence needs a label of its own. */
+  readonly title: string | undefined;
+
+  /** The explanation. */
+  readonly message: string;
+}
+
+/** The paging facts {@link describeEmptyPage} chooses between. */
+interface EmptyPageFacts {
+  /** The resolved page size; `0` is a count-only query. */
+  readonly pageLimit: number;
+
+  /** Where the node asked paging to begin. */
+  readonly baseOffset: number;
+
+  /** The `offset` the empty page was requested with. */
+  readonly pageOffset: number;
+
+  /** The provider's reported total for the query, if it reported one. */
+  readonly total: number | undefined;
+
+  /** Whether the provider reported a forward next page (see {@link canAdvance}). */
+  readonly hasNextPage: boolean;
+}
+
+/**
+ * What a successful request that put no rows on screen actually means.
+ *
+ * An empty page is not an empty capture. In precedence:
+ *
+ * 1. **Count only** — `limit: 0` asked for a total and no rows, so the total is
+ *    the whole answer and is shown when reported.
+ * 2. **Nothing captured** — the provider reported a total of zero, or reported
+ *    no total for a walk that began at the first item and found no further
+ *    page: {@link EMPTY_MESSAGE}, unchanged.
+ * 3. **Past the end** — a positive total and a page starting at or beyond it
+ *    (an authored offset past the end is an empty page, never an error).
+ * 4. **Empty within the total** — a positive total and a page inside it that
+ *    the provider nonetheless left empty.
+ * 5. **No total** — a page past the first item with no reported total.
+ *
+ * A forward page (which the empty state then offers through Load More) changes
+ * one thing: "no total, from the first item" can no longer claim that nothing
+ * was captured — the provider says more pages exist — so it reads as case 5 at
+ * the page's own position instead. A reported total of zero keeps case 2 even
+ * then, because that sentence is the provider's own count, not an inference.
+ *
+ * @param facts The paging facts of the empty page.
+ * @returns The title and message of its empty state.
+ */
+function describeEmptyPage(facts: EmptyPageFacts): EmptyPageCopy {
+  const { pageLimit, baseOffset, pageOffset, hasNextPage } = facts;
+
+  // A total the page echo could not carry — negative, fractional, non-finite —
+  // is not a number anyone can be told, so it reads as "not reported".
+  const total =
+    facts.total !== undefined && Number.isSafeInteger(facts.total) && facts.total >= 0
+      ? facts.total
+      : undefined;
+
+  if (pageLimit === 0) {
+    return {
+      title: COUNT_ONLY_TITLE,
+      message: total === undefined ? COUNT_ONLY_UNKNOWN_TOTAL_MESSAGE : countOnlyMessage(total),
+    };
+  }
+
+  if (total === 0 || (total === undefined && baseOffset === 0 && !hasNextPage)) {
+    return { title: undefined, message: EMPTY_MESSAGE };
+  }
+
+  if (total === undefined) {
+    return { title: EMPTY_PAGE_TITLE, message: emptyWithoutTotalMessage(pageOffset) };
+  }
+
+  return {
+    title: EMPTY_PAGE_TITLE,
+    message:
+      pageOffset >= total ? pastEndMessage(pageOffset, total) : emptyWithinTotalMessage(total),
+  };
 }
 
 /**
@@ -1208,6 +1415,13 @@ export function QueryTable(props: QueryTableProps): ReactElement {
   const page = status === 'success' ? data : undefined;
 
   /**
+   * Whether a forward page exists to offer. `position.offset` is the offset the
+   * settled page was requested at: the hook reports a settlement only while it
+   * answers the current query, so the two can never belong to different pages.
+   */
+  const hasNextPage = canAdvance(status, pageLimit, position.offset, nextOffset);
+
+  /**
    * What is on screen: the pages already frozen, then the current one. Appended
    * in the order the data layer paged them and never re-ordered, re-sorted or
    * de-duplicated here.
@@ -1281,14 +1495,17 @@ export function QueryTable(props: QueryTableProps): ReactElement {
   );
 
   const handleLoadMore = useCallback((): void => {
-    if (nextOffset === undefined || page === undefined) {
+    // The same gate that decides whether the control is rendered, re-checked
+    // here so the handler can never follow a counter that repeats or rewinds
+    // the current page, or page a count-only query.
+    if (page === undefined || !canAdvance(status, pageLimit, position.offset, nextOffset)) {
       return;
     }
 
-    // The offset comes from the response, never from the length of what
-    // arrived: a clamped limit would make the arithmetic drift.
+    // Exactly the offset the response reported, never one derived from the
+    // length of what arrived: a clamped limit would make the arithmetic drift.
     setPaging({ identity, offset: nextOffset, frozen: [...position.frozen, ...page] });
-  }, [identity, nextOffset, page, position.frozen]);
+  }, [identity, nextOffset, page, pageLimit, position.frozen, position.offset, status]);
 
   const columns = useMemo<readonly DataTableColumn<QueryGroup>[]>(
     () => buildColumns(expandedKeys, handleToggle),
@@ -1305,6 +1522,17 @@ export function QueryTable(props: QueryTableProps): ReactElement {
   /** The block, in every state, so the node keeps its geometry. */
   const shell = (content: ReactNode): ReactElement => (
     <div className={clsx(BLOCK_CLASS, className)}>{content}</div>
+  );
+
+  /**
+   * The control that asks for the next page, rendered only while
+   * {@link hasNextPage} holds — in the footer beneath loaded rows, or as the
+   * action of an empty page that the provider says is followed by another.
+   */
+  const loadMoreControl = (
+    <Button variant="secondary" size="sm" onClick={handleLoadMore}>
+      {LOAD_MORE_LABEL}
+    </Button>
   );
 
   if (!readableSource) {
@@ -1345,7 +1573,28 @@ export function QueryTable(props: QueryTableProps): ReactElement {
       );
     }
 
-    return shell(<EmptyState className={EMPTY_CLASS} message={EMPTY_MESSAGE} />);
+    // A successful request with no rows on screen. What that means depends on
+    // what was asked and what the provider counted — a count-only query, an
+    // empty capture, a page past the end of a positive total — and only the
+    // empty capture may say that nothing was captured. A page the provider says
+    // is followed by another keeps its Load More, so an empty page is never a
+    // dead end the service did not declare.
+    const emptyCopy = describeEmptyPage({
+      pageLimit,
+      baseOffset,
+      pageOffset: position.offset,
+      total,
+      hasNextPage,
+    });
+
+    return shell(
+      <EmptyState
+        className={EMPTY_CLASS}
+        title={emptyCopy.title}
+        message={emptyCopy.message}
+        action={hasNextPage ? loadMoreControl : undefined}
+      />,
+    );
   }
 
   return shell(
@@ -1389,29 +1638,34 @@ export function QueryTable(props: QueryTableProps): ReactElement {
           {loadedText(rows.length, total)}
         </Text>
 
-        {status === 'error' ? (
-          <Stack direction="horizontal" gap={2} align="center">
-            <Text size="xs" tone="danger">
-              {describeError(error)}
-            </Text>
-            <Button variant="secondary" size="sm" onClick={retry}>
-              {RETRY_PAGE_LABEL}
-            </Button>
-          </Stack>
-        ) : null}
-
         {status === 'loading' ? (
           <Text size="xs" tone="muted">
             {LOADING_MORE_MESSAGE}
           </Text>
         ) : null}
 
-        {status === 'success' && nextOffset !== undefined ? (
-          <Button variant="secondary" size="sm" onClick={handleLoadMore}>
-            {LOAD_MORE_LABEL}
-          </Button>
-        ) : null}
+        {hasNextPage ? loadMoreControl : null}
       </Stack>
+
+      {/*
+       * A further page that failed gets the same error contract as a first page
+       * that did (AAP 0.6.2): the rejection's message and code, the failing
+       * query as it was sent — its `offset` is the page that failed — and a
+       * retry that re-issues exactly that request. It sits below the footer
+       * rather than in place of the grid, so the statements already read stay
+       * on screen and the reader keeps their place.
+       */}
+      {status === 'error' ? (
+        <ErrorState
+          className={ERROR_CLASS}
+          title={PAGE_ERROR_TITLE}
+          message={describeError(error)}
+          code={error?.code}
+          query={query === undefined ? undefined : serializeQuery(query)}
+          onRetry={retry}
+          retryLabel={RETRY_PAGE_LABEL}
+        />
+      ) : null}
     </>,
   );
 }

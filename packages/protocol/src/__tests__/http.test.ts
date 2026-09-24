@@ -50,7 +50,9 @@
  *   is checked from both sides: the echo is required on all seven array-valued
  *   ones and refused on the three that answer with a single value, and the two
  *   lists are proved to cover the vocabulary so a new source cannot slip in
- *   unclassified.
+ *   unclassified. Metrics page by the same rule as the rest: a walk that follows
+ *   `nextOffset` reassembles the complete set, and a page that ignores its
+ *   window — every value whatever the limit — is refused.
  * - **The shared error body.** A non-2xx reply carries `./messages/error.ts`'s
  *   payload unchanged — a code from the closed vocabulary, a message, an
  *   optional `ref`, and no `hint` — so one renderer serves a failed request and
@@ -544,7 +546,7 @@ const VALID_DATA_RESULTS: { readonly [S in DataQuerySource]: DataResultFor<S> } 
   metrics: {
     source: 'metrics',
     metrics: [...CAPTURE_SUMMARY.metrics],
-    total: METRIC_IDS.length,
+    total: CAPTURE_SUMMARY.metrics.length,
     limit: 200,
     offset: 0,
     nextOffset: null,
@@ -1547,6 +1549,232 @@ describe('dataPageSchema — the paging echo', () => {
   });
 });
 
+describe('the metrics result — paged by the same rule as every array-valued source', () => {
+  /** The capture's complete metric set, computed by its owner: one value per id. */
+  const ALL_METRICS = [...CAPTURE_SUMMARY.metrics];
+
+  /** How many values the complete set holds. */
+  const TOTAL = ALL_METRICS.length;
+
+  /**
+   * The window `[offset, offset + limit)` of the complete set, as a conforming
+   * producer answers it.
+   *
+   * @param offset The offset the producer applied.
+   * @param limit The page size the producer applied.
+   * @param nextOffset The `nextOffset` the page carries, supplied by the case
+   * so that a refusal case can state a wrong one.
+   * @returns The metrics result for that window.
+   */
+  function metricsPage(
+    offset: number,
+    limit: number,
+    nextOffset: number | null,
+  ): DataResultFor<'metrics'> {
+    return {
+      source: 'metrics',
+      metrics: ALL_METRICS.slice(offset, offset + limit),
+      total: TOTAL,
+      limit,
+      offset,
+      nextOffset,
+    };
+  }
+
+  /**
+   * The paths of the paging-rule issues a metrics result is refused with.
+   *
+   * @param value The candidate result.
+   * @returns Each custom issue's path, in the order the check reported them;
+   * empty when the result is accepted.
+   */
+  function pagingIssuePaths(value: unknown): PropertyKey[][] {
+    const parsed = dataResultSchema.safeParse(value);
+
+    return parsed.success
+      ? []
+      : parsed.error.issues.filter((issue) => issue.code === 'custom').map((issue) => issue.path);
+  }
+
+  it('builds its pages from the complete set, one value per metric id', () => {
+    // Every case below slices this set, so it has to be the whole vocabulary:
+    // a shorter fixture would let a case pass without ever paging past it.
+    expect(TOTAL).toBe(METRIC_IDS.length);
+    expect(TOTAL).toBe(14);
+    expect(ALL_METRICS.map((metric) => metric.id)).toEqual([...METRIC_IDS]);
+  });
+
+  it('accepts the first, a middle and the last page of a small limit', () => {
+    for (const [offset, nextOffset] of [
+      [0, 5],
+      [5, 10],
+      [10, null],
+    ] as const) {
+      const page = metricsPage(offset, 5, nextOffset);
+
+      expect(pagingIssuePaths(page)).toEqual([]);
+      expect(parseDataResult(page).ok).toBe(true);
+      expect(parseDataResult(throughJson(page)).ok).toBe(true);
+    }
+
+    // The last page is short, and still the last one.
+    expect(metricsPage(10, 5, null).metrics).toHaveLength(4);
+  });
+
+  it('accepts a count-only page as the last page, with nextOffset: null', () => {
+    // `limit: 0` asks for the total without values. The page is empty and the
+    // total is real; a page that returned nothing is the last page, so its
+    // `nextOffset` is null even while values remain from its offset.
+    for (const offset of [0, 7, TOTAL - 1]) {
+      const page = metricsPage(offset, 0, null);
+
+      expect(page.metrics).toEqual([]);
+      expect(pagingIssuePaths(page)).toEqual([]);
+      expect(parseDataResult(page).ok).toBe(true);
+    }
+
+    // At or past the end, nothing remains to point at.
+    expect(parseDataResult(metricsPage(TOTAL, 0, null)).ok).toBe(true);
+    expect(parseDataResult(metricsPage(TOTAL + 6, 0, null)).ok).toBe(true);
+  });
+
+  it('accepts an offset at or past the total as an empty last page', () => {
+    for (const offset of [TOTAL, TOTAL + 10]) {
+      const page = metricsPage(offset, 5, null);
+
+      expect(page.metrics).toEqual([]);
+      expect(pagingIssuePaths(page)).toEqual([]);
+    }
+  });
+
+  it('reassembles exactly the complete set by following nextOffset', () => {
+    const collected: DataResultFor<'metrics'>['metrics'] = [];
+    let offset: number | null = 0;
+    let pages = 0;
+
+    while (offset !== null) {
+      // What arrives over the wire, sliced from the real set by a conforming
+      // producer: the page carries the offset of the next one.
+      const end = Math.min(offset + 3, TOTAL);
+      const parsed = parseDataResult(throughJson(metricsPage(offset, 3, end < TOTAL ? end : null)));
+
+      expect(parsed.ok).toBe(true);
+      if (!parsed.ok || parsed.value.source !== 'metrics') {
+        break;
+      }
+
+      // A page that returned nothing is never followed, so every page walked
+      // here advances the offset.
+      expect(parsed.value.metrics.length).toBeGreaterThan(0);
+      collected.push(...parsed.value.metrics);
+      offset = parsed.value.nextOffset;
+      pages += 1;
+
+      // A walk over fourteen values in pages of three ends after five pages.
+      expect(pages).toBeLessThanOrEqual(5);
+    }
+
+    expect(pages).toBe(5);
+    expect(collected).toEqual(ALL_METRICS);
+    expect(new Set(collected.map((metric) => metric.id)).size).toBe(METRIC_IDS.length);
+  });
+
+  it('refuses the complete set echoed with a smaller limit, whatever the offset', () => {
+    // The producer behaviour this schema used to document: every value,
+    // whatever window the request asked for. A card reading the page as the
+    // window it asked for would double-count or misplace every value.
+    expect(pagingIssuePaths({ ...metricsPage(0, 5, null), metrics: [...ALL_METRICS] })).toEqual([
+      ['metrics'],
+    ]);
+    expect(pagingIssuePaths({ ...metricsPage(0, 0, null), metrics: [...ALL_METRICS] })).toEqual([
+      ['metrics'],
+    ]);
+    // From offset 5, fourteen values exceed both the limit and what remains.
+    expect(pagingIssuePaths({ ...metricsPage(5, 5, null), metrics: [...ALL_METRICS] })).toEqual([
+      ['metrics'],
+      ['metrics'],
+    ]);
+  });
+
+  it('refuses nextOffset: null while values remain', () => {
+    expect(pagingIssuePaths(metricsPage(0, 5, null))).toEqual([['nextOffset']]);
+    expect(pagingIssuePaths(metricsPage(5, 5, null))).toEqual([['nextOffset']]);
+  });
+
+  it('refuses a count-only page whose nextOffset does not advance', () => {
+    // A cursor equal to the page's own offset would send a paging loop back to
+    // the same empty page forever, so a page that returned nothing names none.
+    for (const offset of [0, 7, TOTAL - 1]) {
+      expect(pagingIssuePaths(metricsPage(offset, 0, offset))).toEqual([['nextOffset']]);
+    }
+  });
+
+  it('refuses a nextOffset that skips, overlaps or points past the end', () => {
+    expect(pagingIssuePaths(metricsPage(0, 5, 6))).toEqual([['nextOffset']]);
+    expect(pagingIssuePaths(metricsPage(0, 5, 4))).toEqual([['nextOffset']]);
+    expect(pagingIssuePaths(metricsPage(10, 5, TOTAL))).toEqual([['nextOffset']]);
+    // Past the end, even a count-only page has nothing to point at.
+    expect(pagingIssuePaths(metricsPage(TOTAL + 6, 0, TOTAL + 6))).toEqual([['nextOffset']]);
+  });
+
+  it('refuses a total above the closed metric vocabulary', () => {
+    expect(pagingIssuePaths({ ...metricsPage(0, 5, 5), total: METRIC_IDS.length + 1 })).toEqual([
+      ['total'],
+    ]);
+  });
+
+  it('refuses a page that repeats a metric id, at the repeating index', () => {
+    expect(
+      pagingIssuePaths({
+        ...metricsPage(0, 5, 3),
+        metrics: [...ALL_METRICS.slice(0, 2), ...ALL_METRICS.slice(0, 1)],
+      }),
+    ).toEqual([['metrics', 2]]);
+  });
+
+  it('refuses a page longer than what remains from its offset', () => {
+    // Three values from a source that holds two.
+    expect(
+      pagingIssuePaths({
+        ...metricsPage(0, 5, null),
+        metrics: ALL_METRICS.slice(0, 3),
+        total: 2,
+      }),
+    ).toEqual([['metrics']]);
+    // A value at an offset where none remain.
+    expect(
+      pagingIssuePaths({ ...metricsPage(TOTAL, 5, null), metrics: ALL_METRICS.slice(0, 1) }),
+    ).toEqual([['metrics']]);
+  });
+
+  it('reports a paging breach without carrying the rejected input', () => {
+    // `reportInput` asks zod to keep each issue's input; the paging checks
+    // never attach one, so even a caller that asks gets none (AAP §0.5.2).
+    const secret = 'do-not-echo-this-metric-note';
+    const parsed = dataResultSchema.safeParse(
+      {
+        ...metricsPage(0, 5, null),
+        metrics: [
+          ...ALL_METRICS.slice(0, 1),
+          ...ALL_METRICS.slice(0, 1).map((metric) => ({ ...metric, note: secret })),
+        ],
+      },
+      { reportInput: true },
+    );
+
+    expect(parsed.success).toBe(false);
+    if (!parsed.success) {
+      const custom = parsed.error.issues.filter((issue) => issue.code === 'custom');
+
+      expect(custom.map((issue) => issue.path)).toEqual([['metrics', 1], ['nextOffset']]);
+      for (const issue of custom) {
+        expect(issue.input).toBeUndefined();
+      }
+      expect(JSON.stringify(parsed.error.issues)).not.toContain(secret);
+    }
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Path construction
 // ---------------------------------------------------------------------------
@@ -1758,6 +1986,29 @@ describe('a rejected body never becomes a leak', () => {
       expect(exposedText(rejected.error)).not.toContain(SENTINEL);
       expect(rejected.error.code).toBe('PROTOCOL_INVALID_MESSAGE');
       expect(DEBUGGEN_ERROR_CODES).toContain(rejected.error.code);
+    }
+  });
+
+  it('reports a metrics page that breaks the paging rule without echoing its values', () => {
+    // Every value is well formed; only the page is inconsistent — one id twice
+    // and a last-page marker while values remain. The rejection names the two
+    // fields, never the metric carrying the sentinel.
+    const [metric] = CAPTURE_SUMMARY.metrics;
+    const rejected = parseDataResult({
+      source: 'metrics',
+      metrics: [metric, { ...metric, note: SENTINEL }],
+      total: CAPTURE_SUMMARY.metrics.length,
+      limit: 5,
+      offset: 0,
+      nextOffset: null,
+    });
+
+    expect(rejected.ok).toBe(false);
+    if (!rejected.ok) {
+      expect(exposedText(rejected.error)).not.toContain(SENTINEL);
+      expect(rejected.error.message).toContain('metrics[1]');
+      expect(rejected.error.message).toContain('nextOffset');
+      expect(rejected.error.code).toBe('PROTOCOL_INVALID_MESSAGE');
     }
   });
 

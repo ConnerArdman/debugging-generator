@@ -163,6 +163,14 @@ model Cart {
   /// database keeps rather than a race two requests can both win.
   openToken String? @unique @map("open_token")
 
+  /// The attempt that claimed this cart, by the name its checkout submission
+  /// carried. Written when a checkout claims the cart, kept when the cart
+  /// becomes an order, and cleared when a checkout that took nothing puts the
+  /// cart back, so a repeat of the same name is answered from this row after
+  /// the process that ran the attempt is gone. Unique, so one attempt name
+  /// holds at most one cart.
+  checkoutKey String? @unique @map("checkout_key")
+
   status    CartStatus @default(ACTIVE)
   createdAt DateTime   @default(now()) @map("created_at")
   updatedAt DateTime   @updatedAt @map("updated_at")

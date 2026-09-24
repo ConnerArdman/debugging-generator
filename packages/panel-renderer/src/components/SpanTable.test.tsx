@@ -21,7 +21,15 @@
  * The paging case holds the other half of the same contract: a page is a page,
  * the footer says how much of the result is on screen, and "Load more" advances
  * `offset` on the query the provider receives instead of guessing from the
- * length of what arrived.
+ * length of what arrived. The service's `nextOffset` is the only authority on
+ * whether another page exists: `null`, an omitted counter, or an offset that
+ * does not move forward offers no further page even when `total` counts more
+ * rows, and the footer says so instead of inventing one.
+ *
+ * The empty-page cases hold the rule that an empty page is not an empty
+ * capture: an explicit `limit: 0` is sent as zero and drawn as a count, and a
+ * page past the end, or one the total says should hold rows, names that total
+ * rather than claiming nothing matched.
  *
  * Alongside those, AAP 0.8.3 asks every component suite here for the three
  * states of a query-backed view — loading, empty and error — and for the
@@ -75,7 +83,9 @@ import { DebuggenError } from '@debuggen/shared';
 import type { SourceLocation } from '@debuggen/shared';
 import type { TelemetryEvent } from '@debuggen/telemetry';
 import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
+import type { RenderResult } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import type { ReactElement } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Mock } from 'vitest';
 
@@ -173,6 +183,21 @@ const START_SORT_NAME = 'Start, relative to the earliest listed operation';
 
 /** The footer control that asks for the next page. */
 const LOAD_MORE_NAME = 'Load more';
+
+/** The same control while the page it requested is still in flight. */
+const LOADING_MORE_NAME = 'Loading…';
+
+/**
+ * The first line of the state a count-only query (`limit: 0`) resolves to.
+ * Spelled out, like the header names above, so this suite pins the copy.
+ */
+const COUNT_ONLY_TITLE = 'Count only';
+
+/** The first line of an empty page that is not an empty capture. */
+const EMPTY_PAGE_TITLE = 'Nothing on this page';
+
+/** The sentence reserved for a query that matched nothing at all. */
+const EMPTY_CAPTURE_MESSAGE = 'No spans matched this query.';
 
 /** The error state's retry control. */
 const RETRY_NAME = 'Retry';
@@ -321,8 +346,14 @@ interface SpanPage {
   /** The total the service reports for the whole query, when it reports one. */
   readonly total?: number | undefined;
 
-  /** The offset of the next page, when one exists. */
-  readonly nextOffset?: number | undefined;
+  /**
+   * The offset of the next page, when one exists.
+   *
+   * `null` is the wire's own spelling of "this is the last page", and is passed
+   * through to the response verbatim so a case can prove the component reads it
+   * as the end of the data; `undefined` omits the counter altogether.
+   */
+  readonly nextOffset?: number | null | undefined;
 }
 
 /** A stub provider, the queries it has received and the resolver behind it. */
@@ -407,6 +438,48 @@ function resolvingProvider(
 }
 
 /**
+ * A provider that answers each query with the page its SESSION and OFFSET
+ * select, and rejects any query no page was built for.
+ *
+ * The builder the page-identity cases use: what they prove is which slice of
+ * which session's result the table asked for after its node or its session
+ * changed, so the answer has to depend on exactly those two coordinates rather
+ * than on how many calls came before.
+ *
+ * @param source The source the responses answer for.
+ * @param pageFor The page for a session and a requested offset, or `undefined`
+ * when the case built none for them.
+ * @returns The stub provider.
+ */
+function slicingProvider(
+  source: SpanSource,
+  pageFor: (sessionId: string, offset: number) => SpanPage | undefined,
+): StubProvider {
+  const queries: DataQuery[] = [];
+  const resolve = vi.fn<DataQueryResolver>((query, context) => {
+    queries.push(query);
+
+    const offset = query.offset ?? DATA_QUERY_DEFAULT_OFFSET;
+    const page = pageFor(context.sessionId, offset);
+
+    if (page === undefined) {
+      return Promise.reject(
+        new Error(`no page was built for ${context.sessionId} at offset ${String(offset)}`),
+      );
+    }
+
+    return Promise.resolve<DataQueryResponse>({
+      source,
+      data: page.data,
+      ...(page.total === undefined ? {} : { total: page.total }),
+      ...(page.nextOffset === undefined ? {} : { nextOffset: page.nextOffset }),
+    });
+  });
+
+  return { provider: createDataProvider(resolve), queries, resolve };
+}
+
+/**
  * A provider whose promise never settles — the loading state, with no timer.
  *
  * @returns The stub provider.
@@ -474,25 +547,59 @@ function makeActions(): ActionSpies {
   };
 }
 
+/** What the component is rendered inside: the host's provider, actions and session. */
+interface HostContext {
+  /** The provider that resolves the node's query. */
+  readonly provider: DataProvider;
+
+  /** The actions the component reports to. */
+  readonly actions: PanelActions;
+
+  /** The session `PanelSessionContext` carries; the fixture session when omitted. */
+  readonly sessionId?: string | undefined;
+}
+
+/**
+ * The component inside all three host contexts, as `PanelHost` nests them.
+ *
+ * @param node The node to draw.
+ * @param context The provider, actions and session to render it inside.
+ * @returns The element tree.
+ */
+function hostTree(node: TableNode, context: HostContext): ReactElement {
+  return (
+    <DataProviderContext.Provider value={context.provider}>
+      <PanelSessionContext.Provider value={context.sessionId ?? SESSION_ID}>
+        <PanelActionsContext.Provider value={context.actions}>
+          <SpanTable node={node} />
+        </PanelActionsContext.Provider>
+      </PanelSessionContext.Provider>
+    </DataProviderContext.Provider>
+  );
+}
+
 /**
  * Renders the component inside both host contexts.
  *
  * @param node The node to draw.
  * @param context The provider to resolve its query and the actions to report to.
+ * @returns The render result, for a case that re-renders the same mounted table.
  */
-function renderComponent(
-  node: TableNode,
-  context: { readonly provider: DataProvider; readonly actions: PanelActions },
-): void {
-  render(
-    <DataProviderContext.Provider value={context.provider}>
-      <PanelSessionContext.Provider value={SESSION_ID}>
-        <PanelActionsContext.Provider value={context.actions}>
-          <SpanTable node={node} />
-        </PanelActionsContext.Provider>
-      </PanelSessionContext.Provider>
-    </DataProviderContext.Provider>,
-  );
+function renderComponent(node: TableNode, context: HostContext): RenderResult {
+  return render(hostTree(node, context));
+}
+
+/**
+ * Re-renders an already mounted table with a new node or a new host context —
+ * the same component instance, so its paging state survives unless the
+ * component itself decides it no longer applies.
+ *
+ * @param view What {@link renderComponent} returned.
+ * @param node The node to draw now.
+ * @param context The provider, actions and session to render it inside now.
+ */
+function rerenderComponent(view: RenderResult, node: TableNode, context: HostContext): void {
+  view.rerender(hostTree(node, context));
 }
 
 /**
@@ -635,6 +742,34 @@ const REQUEST_ROW = makeEvent({
 
 /** The three rows in the order the provider returns them below. */
 const PROVIDER_ORDER: readonly TelemetryEvent[] = [FUNCTION_ROW, QUERY_ROW, REQUEST_ROW];
+
+/**
+ * A page of `count` distinct server-tier function spans, for the paging cases
+ * whose assertion depends on how many rows arrived rather than on which.
+ *
+ * Ids, span ids, sequence numbers and names are all derived from the ordinal,
+ * so no two rows of a page — or of two pages built from different ordinal bases
+ * — share an identity.
+ *
+ * @param count How many rows the page holds.
+ * @param first The ordinal of the first row; later rows count up from it.
+ * @returns A fresh page.
+ */
+function makePage(count: number, first = 1): TelemetryEvent[] {
+  return Array.from({ length: count }, (_unused, index) => {
+    const ordinal = first + index;
+
+    return makeEvent({
+      id: `event-example-page-${String(ordinal).padStart(4, '0')}`,
+      spanId: spanIdFor(ordinal),
+      name: `example.page.operation.${String(ordinal)}`,
+      startTime: BASE_START_MS + ordinal,
+      duration: ordinal,
+      seq: ordinal,
+      ingestSeq: ordinal,
+    });
+  });
+}
 
 /** Their names, in that same order. */
 const PROVIDER_ORDER_NAMES: readonly string[] = PROVIDER_ORDER.map((event) => event.name);
@@ -1102,6 +1237,411 @@ describe('SpanTable paging', () => {
     );
     expect(soleQuery(stub).offset).toBe(20);
   });
+
+  it('requests exactly the next offset the service reported, not one counted from the page', async () => {
+    // Five rows arrive and the service names 7 as the next offset. A view that
+    // counted what arrived would ask for 5; the contract is to copy the 7.
+    const firstPage = makePage(5);
+    const secondPage = makePage(2, 8);
+    const stub = pagingProvider('spans', [
+      { data: firstPage, total: 42, nextOffset: 7 },
+      { data: secondPage, total: 42, nextOffset: 9 },
+    ]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByText(`Showing ${formatCount(5)} of ${formatCount(42)} spans.`);
+    expect(soleQuery(stub).offset).toBe(DATA_QUERY_DEFAULT_OFFSET);
+
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+
+    expect(stub.resolve).toHaveBeenCalledTimes(2);
+    expect(queryOfCall(stub, 2).offset).toBe(7);
+
+    await waitFor(() => {
+      expect(renderedNames()).toEqual([...firstPage, ...secondPage].map((event) => event.name));
+    });
+  });
+
+  it.each([
+    { label: 'reports the last page with null', nextOffset: null },
+    { label: 'omits the next offset', nextOffset: undefined },
+  ])(
+    'offers no further page when the service $label, and says why the total disagrees',
+    async ({ nextOffset }) => {
+      // The total counts forty-one rows beyond the one on screen, but the
+      // service is the authority on paging: no page is invented to reach them.
+      const stub = resolvingProvider('spans', [FUNCTION_ROW], { total: 42, nextOffset });
+
+      renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+      await screen.findByText(
+        `Showing ${formatCount(1)} of ${formatCount(42)} spans. The service reported no further page past this one, so the remaining ${formatCount(41)} spans cannot be loaded here.`,
+      );
+      expect(dataRows()).toHaveLength(1);
+      expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+      expect(stub.resolve).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each([
+    { label: 'stands still at the page offset', nextOffset: 20 },
+    { label: 'steps back before the page offset', nextOffset: 10 },
+  ])('offers no further page when the reported next offset $label', async ({ nextOffset }) => {
+    const stub = resolvingProvider('spans', [FUNCTION_ROW], { total: 42, nextOffset });
+
+    renderComponent(
+      makeNode({
+        query: {
+          source: 'spans',
+          sort: SLOWEST_FIRST,
+          limit: DATA_QUERY_DEFAULT_LIMIT,
+          offset: 20,
+        },
+      }),
+      { provider: stub.provider, actions: makeActions().actions },
+    );
+
+    // Following that offset would re-request the page on screen, or one the
+    // service never named, so it is read as the end of the data.
+    await screen.findByText(
+      `Showing ${formatCount(1)} of ${formatCount(42)} spans, from position ${formatCount(21)}. The service reported no further page past this one, so the remaining ${formatCount(21)} spans cannot be loaded here.`,
+    );
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+    expect(stub.resolve).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses an answer whose next offset is not a whole number, and offers no further page', async () => {
+    // The host's response check rejects a counter that is not a non-negative
+    // integer before the view sees the page, so no row of that answer is drawn
+    // and no page is offered past it: the failure is stated, with its code.
+    const stub = resolvingProvider('spans', [FUNCTION_ROW], { total: 42, nextOffset: 20.5 });
+
+    renderComponent(
+      makeNode({
+        query: {
+          source: 'spans',
+          sort: SLOWEST_FIRST,
+          limit: DATA_QUERY_DEFAULT_LIMIT,
+          offset: 20,
+        },
+      }),
+      { provider: stub.provider, actions: makeActions().actions },
+    );
+
+    const alert = await screen.findByRole('alert');
+    expect(within(alert).getByText('PROTOCOL_INVALID_MESSAGE')).toBeDefined();
+    expect(screen.queryAllByRole('row')).toHaveLength(0);
+    expect(screen.queryByText(FUNCTION_ROW.name)).toBeNull();
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+    expect(stub.resolve).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the rows on screen and shows the page in flight after a forward request', async () => {
+    // The first call answers with a forward page; the second never settles, so
+    // the in-flight state can be observed without a timer.
+    const stub = recordingProvider((_query, call) =>
+      call === 1
+        ? Promise.resolve<DataQueryResponse>({
+            source: 'spans',
+            data: [FUNCTION_ROW],
+            total: 42,
+            nextOffset: 5,
+          })
+        : new Promise<DataQueryResponse>(() => undefined),
+    );
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await user.click(await screen.findByRole('button', { name: LOAD_MORE_NAME }));
+
+    expect(queryOfCall(stub, 2).offset).toBe(5);
+
+    // The control reports the page in flight and cannot be pressed twice, and
+    // the page the reader was already reading stays where it was.
+    const inFlight = await screen.findByRole('button', { name: LOADING_MORE_NAME });
+    expect(inFlight.hasAttribute('disabled')).toBe(true);
+    expect(renderedNames()).toEqual([FUNCTION_ROW.name]);
+    expect(
+      screen.getByText(`Showing ${formatCount(1)} of ${formatCount(42)} spans.`),
+    ).toBeDefined();
+    expect(screen.queryByRole('status')).toBeNull();
+  });
+});
+
+describe('SpanTable empty pages', () => {
+  /**
+   * Renders a node paging from `offset`, answered by one empty page.
+   *
+   * @param offset The node's authored offset, or `undefined` to author none.
+   * @param extra The paging counters the empty page reports.
+   * @returns The stub provider.
+   */
+  function renderEmptyPage(
+    offset: number | undefined,
+    extra: Omit<SpanPage, 'data'>,
+  ): StubProvider {
+    const stub = resolvingProvider('spans', [], extra);
+
+    renderComponent(
+      makeNode({
+        query: {
+          source: 'spans',
+          sort: SLOWEST_FIRST,
+          limit: DATA_QUERY_DEFAULT_LIMIT,
+          ...(offset === undefined ? {} : { offset }),
+        },
+      }),
+      { provider: stub.provider, actions: makeActions().actions },
+    );
+
+    return stub;
+  }
+
+  /**
+   * Asserts the empty state carries exactly this title and message, as the
+   * component's own empty element, with no grid, no alert and no busy region.
+   *
+   * @param title The expected first line, or `undefined` for none.
+   * @param message The expected sentence.
+   */
+  async function expectEmptyState(title: string | undefined, message: string): Promise<void> {
+    const shown = await screen.findByText(message);
+    expect(shown.classList.contains('dg-empty-state__message')).toBe(true);
+
+    const block = shown.closest('.dg-span-table__empty');
+    expect(block).not.toBeNull();
+    expect(block?.querySelector('.dg-empty-state__title')?.textContent).toBe(title);
+
+    expect(screen.queryByRole('grid')).toBeNull();
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.queryByRole('status')).toBeNull();
+  }
+
+  it.each([
+    { label: 'a zero total from the first item', offset: undefined, total: 0 },
+    { label: 'a zero total part-way through', offset: 20, total: 0 },
+    { label: 'no total from the first item', offset: 0, total: undefined },
+  ])('keeps the empty-capture sentence for $label', async ({ offset, total }) => {
+    const stub = renderEmptyPage(offset, { total, nextOffset: null });
+
+    await expectEmptyState(undefined, EMPTY_CAPTURE_MESSAGE);
+    expect(screen.queryAllByRole('button')).toHaveLength(0);
+    expect(stub.resolve).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    { label: 'past the end', offset: 50, position: 51 },
+    { label: 'exactly at the end', offset: 42, position: 43 },
+  ])('says a page starting $label lies past the rows that matched', async (row) => {
+    const stub = renderEmptyPage(row.offset, { total: 42, nextOffset: null });
+
+    await expectEmptyState(
+      EMPTY_PAGE_TITLE,
+      `This page starts at position ${formatCount(row.position)}, past the end of the ${formatCount(42)} spans that matched this query.`,
+    );
+    expect(screen.queryByText(EMPTY_CAPTURE_MESSAGE)).toBeNull();
+    expect(screen.queryAllByRole('button')).toHaveLength(0);
+    expect(soleQuery(stub).offset).toBe(row.offset);
+  });
+
+  // The total counts rows at or after this page's position, yet the service
+  // declared the end of the data: the state names the total, explains that the
+  // service's paging ends here, and says how many matched rows past this
+  // position cannot be loaded - without offering a page the service never named.
+  it.each([
+    {
+      label: 'from the first item',
+      offset: undefined,
+      total: 42,
+      noun: 'spans',
+      remaining: 42,
+      remainingNoun: 'spans',
+    },
+    {
+      label: 'part-way through',
+      offset: 20,
+      total: 42,
+      noun: 'spans',
+      remaining: 22,
+      remainingNoun: 'spans',
+    },
+    {
+      label: 'for a single match',
+      offset: undefined,
+      total: 1,
+      noun: 'span',
+      remaining: 1,
+      remainingNoun: 'span',
+    },
+  ])(
+    'names the total and explains the end-of-data disagreement, $label',
+    async ({ offset, total, noun, remaining, remainingNoun }) => {
+      const stub = renderEmptyPage(offset, { total, nextOffset: null });
+
+      await expectEmptyState(
+        EMPTY_PAGE_TITLE,
+        `${formatCount(total)} ${noun} matched this query, but none are shown on this page. The service reported no further page past this one, so the remaining ${formatCount(remaining)} ${remainingNoun} cannot be loaded here.`,
+      );
+      expect(screen.queryAllByRole('button')).toHaveLength(0);
+      expect(stub.resolve).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('says where the page starts when no total was reported part-way through', async () => {
+    renderEmptyPage(20, { nextOffset: null });
+
+    await expectEmptyState(
+      EMPTY_PAGE_TITLE,
+      `This page starts at position ${formatCount(21)} and holds no spans; no total was reported for this query.`,
+    );
+    expect(screen.queryAllByRole('button')).toHaveLength(0);
+  });
+
+  it.each([
+    {
+      label: 'naming the total',
+      total: 42,
+      message: `This page holds none of the ${formatCount(42)} spans that matched this query, and the service reported a further page.`,
+    },
+    {
+      label: 'with no total',
+      total: undefined,
+      message: 'This page holds no spans, and the service reported a further page.',
+    },
+  ])(
+    'keeps the next page reachable from an empty page the service says is not the last, $label',
+    async ({ total, message }) => {
+      const stub = pagingProvider('spans', [
+        { data: [], total, nextOffset: 200 },
+        { data: [FUNCTION_ROW], total, nextOffset: null },
+      ]);
+      const user = userEvent.setup();
+
+      renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+      await expectEmptyState(EMPTY_PAGE_TITLE, message);
+
+      // The control sits inside the empty state, and requests exactly the
+      // offset the service named.
+      const loadMore = screen.getByRole('button', { name: LOAD_MORE_NAME });
+      expect(loadMore.closest('.dg-span-table__empty')).not.toBeNull();
+
+      await user.click(loadMore);
+
+      expect(stub.resolve).toHaveBeenCalledTimes(2);
+      expect(queryOfCall(stub, 2).offset).toBe(200);
+
+      await screen.findByRole('grid');
+      expect(renderedNames()).toEqual([FUNCTION_ROW.name]);
+    },
+  );
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Which page sequence the accumulated pages belong to
+ *
+ * "Load more" keeps earlier pages in state and advances the offset. Those
+ * pages belong to ONE sequence — this session, this query as authored, the
+ * offset it starts from included — and the cases below re-render the SAME
+ * mounted table with that sequence changed, which is how a host swaps a
+ * regenerated panel in or reopens another session in the same view. The rows
+ * carried from the old sequence must be dropped and the request must return to
+ * the authored base offset; the advanced offset is where the OLD sequence had
+ * got to, and means nothing in the new one.
+ * ---------------------------------------------------------------------------
+ */
+
+/** A second fixture session, for the case that switches the panel to it. */
+const OTHER_SESSION_ID = 'session-example-0002';
+
+describe('SpanTable page identity', () => {
+  it('starts over at a newly authored offset and draws nothing the previous slice accumulated', async () => {
+    const stub = slicingProvider('spans', (_sessionId, offset) => {
+      switch (offset) {
+        case 0:
+          return { data: [FUNCTION_ROW], total: 60, nextOffset: 5 };
+        case 5:
+          return { data: [QUERY_ROW], total: 60, nextOffset: 6 };
+        case 40:
+          return { data: [REQUEST_ROW], total: 60, nextOffset: 41 };
+        default:
+          return undefined;
+      }
+    });
+    const context: HostContext = { provider: stub.provider, actions: makeActions().actions };
+    const user = userEvent.setup();
+    const authored = {
+      source: 'spans',
+      sort: SLOWEST_FIRST,
+      limit: DATA_QUERY_DEFAULT_LIMIT,
+    } as const;
+
+    const view = renderComponent(makeNode({ query: { ...authored, offset: 0 } }), context);
+
+    await screen.findByRole('grid');
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+    await waitFor(() => {
+      expect(renderedNames()).toEqual([FUNCTION_ROW.name, QUERY_ROW.name]);
+    });
+    expect(queryOfCall(stub, 2).offset).toBe(5);
+
+    // The same node, with a query identical in every respect but the offset it
+    // was authored to start from: another slice of the result.
+    rerenderComponent(view, makeNode({ query: { ...authored, offset: 40 } }), context);
+
+    await waitFor(() => {
+      expect(renderedNames()).toEqual([REQUEST_ROW.name]);
+    });
+    expect(stub.resolve).toHaveBeenCalledTimes(3);
+    expect(queryOfCall(stub, 3)).toEqual({ ...authored, offset: 40 });
+    expect(dataRows()).toHaveLength(1);
+  });
+
+  it('starts over at the authored offset in a new session and draws nothing the earlier session answered', async () => {
+    const stub = slicingProvider('spans', (sessionId, offset) => {
+      if (sessionId === SESSION_ID && offset === 0) {
+        return { data: [FUNCTION_ROW], total: 20, nextOffset: 5 };
+      }
+      if (sessionId === SESSION_ID && offset === 5) {
+        return { data: [QUERY_ROW], total: 20, nextOffset: 6 };
+      }
+      if (sessionId === OTHER_SESSION_ID && offset === 0) {
+        return { data: [REQUEST_ROW], total: 5, nextOffset: 1 };
+      }
+      return undefined;
+    });
+    const actions = makeActions().actions;
+    const node = makeNode();
+    const user = userEvent.setup();
+
+    const view = renderComponent(node, { provider: stub.provider, actions });
+
+    await screen.findByRole('grid');
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+    await waitFor(() => {
+      expect(renderedNames()).toEqual([FUNCTION_ROW.name, QUERY_ROW.name]);
+    });
+    expect(queryOfCall(stub, 2).offset).toBe(5);
+
+    // The very same node, drawn for another session.
+    rerenderComponent(view, node, {
+      provider: stub.provider,
+      actions,
+      sessionId: OTHER_SESSION_ID,
+    });
+
+    await waitFor(() => {
+      expect(renderedNames()).toEqual([REQUEST_ROW.name]);
+    });
+    expect(stub.resolve).toHaveBeenCalledTimes(3);
+    expect(stub.resolve.mock.calls[2]?.[1].sessionId).toBe(OTHER_SESSION_ID);
+    expect(queryOfCall(stub, 3).offset).toBe(DATA_QUERY_DEFAULT_OFFSET);
+    expect(dataRows()).toHaveLength(1);
+  });
 });
 
 describe('SpanTable query bounds', () => {
@@ -1120,6 +1660,95 @@ describe('SpanTable query bounds', () => {
     const limit = soleQuery(stub).limit ?? Number.POSITIVE_INFINITY;
     expect(limit).toBeLessThanOrEqual(DATA_QUERY_MAX_LIMIT);
     expect(limit).toBe(DATA_QUERY_MAX_LIMIT);
+  });
+
+  it.each([
+    { label: 'a fractional page size down to a whole one', authored: 2.7, sent: 2 },
+    { label: 'a negative page size up to zero', authored: -3, sent: 0 },
+  ])('clamps $label before asking for it', async ({ authored, sent }) => {
+    const stub = resolvingProvider('spans', [], { total: 0, nextOffset: null });
+
+    renderComponent(makeNode({ query: { source: 'spans', limit: authored } }), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    await waitFor(() => {
+      expect(stub.resolve).toHaveBeenCalledTimes(1);
+    });
+    expect(soleQuery(stub).limit).toBe(sent);
+  });
+
+  it.each([
+    { label: 'echoes the page offset as the next one', nextOffset: 0 },
+    { label: 'names a forward next offset', nextOffset: 5 },
+    { label: 'reports the last page', nextOffset: null },
+  ])(
+    'sends an explicit zero page size unchanged and never pages it when the service $label',
+    async ({ nextOffset }) => {
+      const stub = resolvingProvider('spans', [], { total: 42, nextOffset });
+
+      renderComponent(makeNode({ query: { source: 'spans', limit: 0 } }), {
+        provider: stub.provider,
+        actions: makeActions().actions,
+      });
+
+      // A count, stated as one: the total the service reported, and a title that
+      // says no rows were asked for, rather than a claim that nothing matched.
+      const title = await screen.findByText(COUNT_ONLY_TITLE);
+      expect(title.classList.contains('dg-empty-state__title')).toBe(true);
+      expect(title.closest('.dg-span-table__empty')).not.toBeNull();
+      expect(
+        screen.getByText(
+          `This view requests a count without rows: ${formatCount(42)} spans matched its query.`,
+        ),
+      ).toBeDefined();
+      expect(screen.queryByText(/no spans matched/i)).toBeNull();
+
+      // Zero is a legitimate request for a total without rows: it reaches the
+      // provider as zero, not raised to a one-row page.
+      const query = soleQuery(stub);
+      expect(query.limit).toBe(0);
+      expect(query.offset).toBe(DATA_QUERY_DEFAULT_OFFSET);
+
+      // A page of nothing cannot advance, so no control offers another one, and
+      // no second request is made however the service answered.
+      expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+      expect(screen.queryAllByRole('button')).toHaveLength(0);
+      expect(screen.queryByRole('grid')).toBeNull();
+      expect(stub.resolve).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('says a count-only query reported no total when the service gave none', async () => {
+    const stub = resolvingProvider('spans', []);
+
+    renderComponent(makeNode({ query: { source: 'spans', limit: 0 } }), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    await screen.findByText(COUNT_ONLY_TITLE);
+    expect(
+      screen.getByText(
+        'This view requests a count without rows, and no total was reported for its query.',
+      ),
+    ).toBeDefined();
+    expect(soleQuery(stub).limit).toBe(0);
+    expect(screen.queryAllByRole('button')).toHaveLength(0);
+  });
+
+  it('says a count of one in the singular', async () => {
+    const stub = resolvingProvider('spans', [], { total: 1, nextOffset: null });
+
+    renderComponent(makeNode({ query: { source: 'spans', limit: 0 } }), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    await screen.findByText(
+      `This view requests a count without rows: ${formatCount(1)} span matched its query.`,
+    );
   });
 
   it('asks for the published default page from the first item when the node names neither', async () => {

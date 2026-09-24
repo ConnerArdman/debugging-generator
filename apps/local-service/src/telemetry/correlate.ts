@@ -57,7 +57,8 @@
  *   clears a flag and never re-parents anything; the invariant it checks
  *   instead is `tree.nodeCount === rows.length`, which is the mechanical proof
  *   that nothing was dropped — a missing span would silently remove all the
- *   work underneath it from every duration in the capture (AAP 0.4.2).
+ *   work underneath it from every duration in the capture (AAP 0.4.2) — and a
+ *   tree that fails it is refused, never returned or cached.
  * - **Lineage is untouched.** The `lineage`, `lineageAmbiguous` and
  *   `lineageCandidates` attributes are written by the browser agent's
  *   continuation tracker and read only by `lineageOf` inside the correlator.
@@ -65,21 +66,35 @@
  *   dashed edge from an ambiguous attribution, and a guess dressed up as a
  *   certainty is the one thing that display exists to prevent.
  *
- * ## The cache, and what `captureId` does not do
+ * ## The cache, and what `captureId` scopes
  *
- * A bounded, insertion-ordered `Map` keyed `` `${sessionId}::${traceId}` ``
- * holds the last tree built for a trace, so the panel's repeated reads of one
+ * A bounded, insertion-ordered `Map` holds the last tree built for each
+ * `(sessionId, scope, traceId)` triple, so the panel's repeated reads of one
  * interaction cost nothing after the capture that produced it. Recency is by
  * last **write**, not by read (see {@link TRACE_CACHE_LIMIT}).
  *
- * `captureId` narrows which trace **ids** are enumerated
+ * The scope is the `captureId` a read named, or the whole session when it named
+ * none. When given, `captureId` narrows **both** the enumeration of trace ids
  * ({@link TraceCorrelator.listTraceIds}, {@link TraceCorrelator.getTraces}) and
- * never which events are loaded for a trace. That is deliberate on two counts:
- * the correlator groups by `traceId` alone because a trace is precisely the
- * join between the browser agent's spans and the preload's spans (AAP 0.4.2),
- * and a capture survives a page reload with its `captureId` intact (AAP 0.5.5);
- * and the cache key carries no capture, so a capture-narrowed load would put
- * two different trees behind one key.
+ * the events loaded for each trace ({@link TraceCorrelator.getTrace}), and it is
+ * part of the cache key, so the capture-scoped tree and the session-wide tree of
+ * one trace id are two entries that never stand in for each other. That is
+ * required rather than tidy: a trace id is minted by a producer and is not
+ * guaranteed unique across the captures of a session, so a capture-narrowed
+ * read that loaded its traces session-wide would mix another capture's events
+ * into the interaction it was asked about. Narrowing loses nothing of the join
+ * the correlator exists for — a trace is precisely the join between the browser
+ * agent's spans and the preload's spans (AAP 0.4.2) — because attribution
+ * stamps both producers' spans with the session's **active** capture, and a
+ * capture survives a page reload with its `captureId` intact (AAP 0.5.5): a
+ * capture-scoped tree is the complete interaction as that capture recorded it.
+ * Omitting `captureId` gives the session-wide join, over every capture.
+ *
+ * {@link TraceCorrelator.onEventsPersisted} rebuilds the session-wide tree of
+ * every trace a batch touches and drops that trace's capture-scoped trees for
+ * exactly the captures the batch named, which the next capture-scoped read
+ * rebuilds. The trees of the captures the batch did not name stay cached: their
+ * event sets did not change.
  *
  * ## Failure, privacy and what this module is not
  *
@@ -87,7 +102,13 @@
  * store failure, and even a throw from a supplied test double, arrives as an
  * `Err` carrying a code from the closed vocabulary. An unknown `traceId` is
  * `ok(undefined)` rather than an error: a trace purged by retention, or one
- * whose events have not arrived yet, is an ordinary outcome. Logging goes
+ * whose events have not arrived yet, is an ordinary outcome. A trace whose
+ * rows cannot all be read or correlated — larger than one correlation reads,
+ * served by a store whose paging does not advance, holding stored rows this
+ * build cannot reconstruct, or yielding a tree with fewer nodes than the rows
+ * it was built from — is an error and never a partial tree, and no tree is
+ * cached for it: a partial tree would pass for the whole interaction on every
+ * later read. Logging goes
  * through the injected `Logger` and carries **counts and identifiers only** —
  * never an event name, an attribute value, a SQL statement or a URL (AAP
  * 0.5.2) — and no caught value is ever echoed into a log record or an error
@@ -106,7 +127,8 @@
  * if (isOk(stored)) {
  *   await correlator.onEventsPersisted(stored.value.events);
  * }
- * const trace = await correlator.getTrace(sessionId, traceId);
+ * const trace = await correlator.getTrace(sessionId, traceId); // every capture
+ * const window = await correlator.getTraces(sessionId, captureId); // that capture's events only
  * ```
  */
 
@@ -168,17 +190,6 @@ export const CORRELATOR_MAX_DEPTH: number = DEFAULT_MAX_DEPTH;
 export const TRACE_CACHE_LIMIT = 256;
 
 /**
- * The separator between the two halves of a cache key.
- *
- * Two colons, which no generated identifier contains — session ids are a
- * prefix plus a nanoid alphabet, trace ids are 32 hexadecimal characters — so
- * `${sessionId}::${traceId}` is unambiguous and the session prefix can be
- * matched with `startsWith` when {@link TraceCorrelator.invalidate} clears a
- * whole session.
- */
-const CACHE_KEY_SEPARATOR = '::';
-
-/**
  * How many rows one page of a trace load asks for: the store's ceiling.
  *
  * Reading at the maximum makes the common trace — tens to a few hundred
@@ -191,14 +202,30 @@ const TRACE_PAGE_SIZE = TELEMETRY_QUERY_MAX_LIMIT;
 /**
  * How many pages one trace load will read before it stops: `20`.
  *
- * At {@link TRACE_PAGE_SIZE} that is 100 000 events in a single trace, orders
- * of magnitude beyond any real interaction. The bound exists to make the paging
- * loop provably finite even if a supplied repository answers with a
- * `nextOffset` that never reaches the end; reaching it is reported at `warn`
- * with counts, and correlation proceeds on what was read rather than failing
- * the capture.
+ * At {@link TRACE_PAGE_SIZE} that is {@link MAX_TRACE_EVENTS} — 100 000 events
+ * in a single trace, orders of magnitude beyond any real interaction. The bound
+ * exists to make the paging loop provably finite even if a supplied repository
+ * answers with a `nextOffset` that never reaches the end.
+ *
+ * Reaching it with pages still unread is a **failure**, not a truncation: the
+ * load is reported at `warn` with counts and answers `STORE_ERROR` with reason
+ * `trace-too-large`, and nothing is correlated or cached. A tree built from the
+ * first 100 000 rows would omit whatever the unread pages held — a late server
+ * span, the query under it, the parent of an orphan — and would be
+ * indistinguishable from the whole interaction to every duration derived from
+ * it.
  */
 const MAX_TRACE_PAGES = 20;
+
+/**
+ * The most events one trace load will correlate: {@link MAX_TRACE_PAGES}
+ * pages of {@link TRACE_PAGE_SIZE} rows, stated once so the refusal's hint and
+ * the bound cannot drift apart.
+ */
+const MAX_TRACE_EVENTS = MAX_TRACE_PAGES * TRACE_PAGE_SIZE;
+
+/** The operation phrase every trace-load failure reports. */
+const TRACE_LOAD_OPERATION = 'reading a trace for correlation';
 
 /** The recovery instruction a store failure carries to the user interface. */
 const STORE_FAILURE_HINT =
@@ -207,6 +234,17 @@ const STORE_FAILURE_HINT =
 /** The recovery instruction an unexpected correlation failure carries. */
 const CORRELATE_FAILURE_HINT =
   'Reload the panel to request the trace again; the captured events are stored and unaffected.';
+
+/**
+ * The recovery instruction a refused tree carries when correlation did not keep
+ * every loaded event.
+ *
+ * Not {@link CORRELATE_FAILURE_HINT}: the same rows correlate the same way on
+ * every read, so reloading the panel cannot help, and what the user can act on
+ * is the report.
+ */
+const TRACE_NODES_DROPPED_HINT =
+  'Report the trace id with the service log; the captured events are stored and unaffected.';
 
 /* -------------------------------------------------------------------------------------------------
  * Public surface
@@ -252,7 +290,10 @@ export interface TelemetryRepoLike {
    *
    * @param sessionId The session that owns the evidence.
    * @param traceId The correlation id shared by every event of the interaction.
-   * @param options Ordering and paging; this module reads in canonical order.
+   * @param options Ordering and paging, and — for a capture-scoped read — the
+   * `captureId` that must narrow the trace to that capture's events, with
+   * `total` and `nextOffset` computed over them alone. This module reads in
+   * canonical order and names a capture only when its caller did.
    * @returns The page, or the store's refusal.
    */
   listByTrace(
@@ -336,13 +377,19 @@ export interface CorrelateUpdate {
  * while `cachedTraces` describes what it currently holds.
  */
 export interface CorrelatorStats {
-  /** How many trees are cached right now. */
+  /**
+   * How many trees are cached right now — one per `(session, scope, trace)`, so
+   * a trace cached session-wide and for two of its captures counts three times.
+   */
   readonly cachedTraces: number;
   /** How many reads were served from the cache. */
   readonly hits: number;
   /** How many reads had to load and build. */
   readonly misses: number;
-  /** How many trees have been built, by ingest and by cache misses alike. */
+  /**
+   * How many trees have been built, by ingest and by cache misses alike. A
+   * tree refused because it did not hold every loaded row is not counted.
+   */
   readonly rebuilds: number;
 }
 
@@ -368,10 +415,18 @@ export interface TraceCorrelator {
    * makes the call idempotent: running it twice on the same batch, or retrying
    * it after a store failure, converges on the same trees.
    *
+   * What is rebuilt is each touched trace's **session-wide** tree. Its
+   * capture-scoped trees are dropped for exactly the captures the batch named
+   * for it — their event sets changed — and rebuilt by the next capture-scoped
+   * read; the trees of captures the batch did not name are left cached.
+   *
    * @param events The batch as the store now holds it, in any order. An empty
    * batch is a successful no-op that touches neither the store nor the cache.
    * @returns What was rebuilt, or the first failure encountered — in which case
-   * the traces already rebuilt keep their fresh trees and a retry is safe.
+   * the traces already rebuilt keep their fresh trees, the failing trace and
+   * every touched trace after it lose the trees cached before the batch
+   * (session-wide and for the captures the batch named) so none is served
+   * stale, and a retry is safe.
    */
   onEventsPersisted(
     events: readonly TelemetryEvent[],
@@ -382,22 +437,33 @@ export interface TraceCorrelator {
    *
    * @param sessionId The session that owns the evidence.
    * @param traceId The interaction to resolve.
-   * @returns The tree, or `ok(undefined)` when the session holds no event with
+   * @param captureId Narrow the trace to one capture window: only that
+   * capture's events are loaded and correlated, and the tree is cached under
+   * that capture. Absent means the session-wide join over every capture (see
+   * the module notes).
+   * @returns The tree, or `ok(undefined)` when the scope holds no event with
    * that trace id — an ordinary outcome for a trace that retention has purged
-   * or whose events have not arrived yet, and therefore not an error.
+   * or whose events have not arrived yet, and therefore not an error. A trace
+   * whose rows cannot all be read or correlated is an `Err` instead of a
+   * partial tree, and nothing is cached for it (see the module notes).
    */
   getTrace(
     sessionId: SessionId,
     traceId: TraceId,
+    captureId?: CaptureId,
   ): Promise<Result<TraceTree | undefined, DebuggenError>>;
 
   /**
    * Every correlated trace of a session, or of one capture window.
    *
    * @param sessionId The session to read.
-   * @param captureId Narrow the *enumeration* to one capture; the events of
-   * each enumerated trace are always loaded in full (see the module notes).
-   * @returns The trees, in the store's trace order (earliest event first).
+   * @param captureId Narrow to one capture: both the enumeration of trace ids
+   * and the events loaded for each trace, so every tree is built from that
+   * capture's events alone even when a trace id recurs in another capture.
+   * Absent means every trace of the session, each joined across every capture.
+   * @returns The trees, in the store's trace order (earliest event first), or
+   * the failure of the first trace that could not be read or correlated: a set
+   * missing one of its traces is not the capture.
    */
   getTraces(
     sessionId: SessionId,
@@ -422,9 +488,13 @@ export interface TraceCorrelator {
   /**
    * Drops cached trees so the next read rebuilds from the store.
    *
+   * Every scope is dropped: the session-wide tree and each capture-scoped tree
+   * alike.
+   *
    * @param sessionId The session whose entries to drop.
-   * @param traceId One trace, or every trace of the session when absent — what
-   * a retention purge or a session end calls.
+   * @param traceId One trace, under every scope it is cached in, or every
+   * trace of the session when absent — what a retention purge or a session end
+   * calls.
    */
   invalidate(sessionId: SessionId, traceId?: TraceId): void;
 
@@ -446,14 +516,41 @@ export interface TraceCorrelator {
  * Internal helpers
  * ---------------------------------------------------------------------------------------------- */
 
-/** One `(sessionId, traceId)` pair a persisted batch mentioned, with its cache key. */
+/**
+ * One `(sessionId, traceId)` pair a persisted batch mentioned, with the
+ * session-wide cache key and the captures the batch named for it.
+ */
 interface TouchedTrace {
   /** The session that owns the trace. */
   readonly sessionId: SessionId;
   /** The trace to rebuild. */
   readonly traceId: TraceId;
-  /** The cache key for the pair, computed once. */
+  /** The session-wide cache key for the pair, computed once. */
   readonly key: string;
+  /**
+   * The distinct captures the batch named for the pair, in first-seen order:
+   * the capture-scoped trees of the trace whose event sets the batch changed.
+   */
+  readonly captureIds: ReadonlySet<CaptureId>;
+}
+
+/**
+ * One cached tree, with the scope it was built for.
+ *
+ * The scope travels with the tree rather than being parsed back out of the key,
+ * so deciding which entries belong to a session or to a trace is a comparison
+ * of the fields below and never depends on what characters an identifier
+ * contains.
+ */
+interface CachedTrace {
+  /** The session that owns the evidence. */
+  readonly sessionId: SessionId;
+  /** The capture the tree is narrowed to; `undefined` for the session-wide tree. */
+  readonly captureId: CaptureId | undefined;
+  /** The trace the tree correlates. */
+  readonly traceId: TraceId;
+  /** The tree itself, exactly as the correlator built it. */
+  readonly tree: TraceTree;
 }
 
 /** What one batch scan found. */
@@ -478,6 +575,54 @@ interface TouchedBatch {
  */
 function isUsableId(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0;
+}
+
+/**
+ * The cache key of one `(session, scope, trace)` triple.
+ *
+ * The key is the JSON text of the triple, with `null` standing for the
+ * session-wide scope. JSON quoting makes the key injective over any three
+ * strings — no character inside one part can move the boundary to the next,
+ * which a separator would only promise for identifiers that happen not to
+ * contain it — and `null` is not a string, so no capture id, whatever its
+ * format, can collide with the session-wide scope. The key is only ever
+ * compared for equality: which entries belong to a session or a trace is read
+ * off the {@link CachedTrace} itself.
+ *
+ * @param sessionId The session that owns the evidence.
+ * @param traceId The trace.
+ * @param captureId The capture the tree is narrowed to, or `undefined` for the
+ * session-wide tree.
+ * @returns The key.
+ */
+function cacheKey(
+  sessionId: SessionId,
+  traceId: TraceId,
+  captureId: CaptureId | undefined,
+): string {
+  return JSON.stringify([sessionId, captureId ?? null, traceId]);
+}
+
+/**
+ * The identifying fields of a record about one trace read: the standard
+ * session binding, the standard capture binding when the read was
+ * capture-scoped, and the trace id — identifiers only (AAP 0.5.2).
+ *
+ * @param sessionId The session that owns the evidence.
+ * @param traceId The trace.
+ * @param captureId The capture the read was narrowed to, if any.
+ * @returns The fields, ready to spread into a log record or error details.
+ */
+function traceScopeFields(
+  sessionId: SessionId,
+  traceId: TraceId,
+  captureId: CaptureId | undefined,
+): Record<string, string> {
+  return {
+    [LOG_BINDING_KEYS.sessionId]: sessionId,
+    ...(captureId !== undefined ? { [LOG_BINDING_KEYS.captureId]: captureId } : {}),
+    traceId,
+  };
 }
 
 /**
@@ -524,6 +669,75 @@ function asReportableError(
   return new DebuggenError(code, message, { hint, details, cause: thrown });
 }
 
+/**
+ * The error for a trace load that could not supply every row of its trace, and
+ * therefore must not produce a tree of it.
+ *
+ * Three loads end that way, and each has its own reason:
+ *
+ * - `trace-too-large` — {@link MAX_TRACE_PAGES} pages were read and the store
+ *   still reports more.
+ * - `trace-page-stalled` — the store answered with a `nextOffset` that does not
+ *   advance, which only a repository breaking its own paging contract produces.
+ * - `trace-rows-unreadable` — the walk reached its end, but the store reported
+ *   rows of the trace it could not reconstruct (`TelemetryPage.skipped`): a
+ *   database written by another build, or an altered file.
+ *
+ * All three are `STORE_ERROR` because in each the store cannot hand over the
+ * trace's rows in full, and all three are refusals rather than truncations: a
+ * tree built from the rows that were read would pass for the whole interaction
+ * while omitting the rest, and a cached one would keep doing so on every later
+ * read. The unreadable case is refused although a flat panel page is not — the
+ * repository still serves the readable rows of such a page, counted in
+ * `skipped`, because a list with one row missing is still the rest of the list.
+ * A tree is not: one missing row reparents its children to the trace root as
+ * orphans and removes its whole subtree's work from every duration derived
+ * from it, so correlation cannot proceed on the remainder.
+ *
+ * @param reason Which load failed.
+ * @param details The scope and the counts of the walk — identifiers and
+ * numbers only (AAP 0.5.2).
+ * @returns The coded error.
+ */
+function incompleteTraceError(
+  reason: 'trace-too-large' | 'trace-page-stalled' | 'trace-rows-unreadable',
+  details: Readonly<Record<string, unknown>>,
+): DebuggenError {
+  const coded = { operation: TRACE_LOAD_OPERATION, ...details, reason };
+
+  switch (reason) {
+    case 'trace-too-large':
+      return new DebuggenError(
+        'STORE_ERROR',
+        'A trace holds more events than one correlation reads, so its tree would be incomplete and was not built.',
+        {
+          hint: `Correlation reads at most ${MAX_TRACE_EVENTS} events of one trace. Reproduce the interaction in a shorter capture and read the trace narrowed to that capture; the captured events are stored and unaffected.`,
+          details: coded,
+        },
+      );
+
+    case 'trace-page-stalled':
+      return new DebuggenError(
+        'STORE_ERROR',
+        'The telemetry store did not advance while paging a trace, so its tree would be incomplete and was not built.',
+        {
+          hint: 'Retry the read, and report the trace id with the service log if it persists; the captured events are stored and unaffected.',
+          details: coded,
+        },
+      );
+
+    case 'trace-rows-unreadable':
+      return new DebuggenError(
+        'STORE_ERROR',
+        'The telemetry store holds rows of this trace that this build cannot reconstruct, so its tree would be incomplete and was not built.',
+        {
+          hint: "The unreadable rows were written by another build or altered on disk; the readable events remain available to the panel's event views. Report the trace id with the service log.",
+          details: coded,
+        },
+      );
+  }
+}
+
 /* -------------------------------------------------------------------------------------------------
  * Factory
  * ---------------------------------------------------------------------------------------------- */
@@ -550,16 +764,11 @@ export function createTraceCorrelator(deps: TraceCorrelatorDeps): TraceCorrelato
    * A `Map` preserves that order, which is what makes eviction a single
    * `keys().next()` — no timestamps, no heap, no bookkeeping on the read path.
    */
-  const cache = new Map<string, TraceTree>();
+  const cache = new Map<string, CachedTrace>();
 
   let hits = 0;
   let misses = 0;
   let rebuilds = 0;
-
-  /** The cache key for one `(session, trace)` pair. */
-  function cacheKey(sessionId: SessionId, traceId: TraceId): string {
-    return `${sessionId}${CACHE_KEY_SEPARATOR}${traceId}`;
-  }
 
   /**
    * Caches a freshly built tree and evicts down to {@link cacheLimit}.
@@ -569,13 +778,13 @@ export function createTraceCorrelator(deps: TraceCorrelatorDeps): TraceCorrelato
    * is rebuilt on every batch would keep aging towards eviction while newer,
    * untouched traces stayed.
    */
-  function remember(key: string, tree: TraceTree): void {
+  function remember(key: string, entry: CachedTrace): void {
     if (cacheLimit === 0) {
       return;
     }
 
     cache.delete(key);
-    cache.set(key, tree);
+    cache.set(key, entry);
 
     while (cache.size > cacheLimit) {
       const oldest = cache.keys().next();
@@ -584,6 +793,71 @@ export function createTraceCorrelator(deps: TraceCorrelatorDeps): TraceCorrelato
       }
       cache.delete(oldest.value);
     }
+  }
+
+  /**
+   * Drops every cached tree of one session, or of one of its traces, under
+   * every scope — session-wide and per capture alike.
+   *
+   * The keys are snapshotted before the deletions: a `Map` tolerates removal
+   * during iteration, but a snapshot makes the intent — "every entry that
+   * matched when the call was made" — explicit. The walk is bounded by
+   * {@link cacheLimit}, so it costs at most a few hundred comparisons.
+   *
+   * @param sessionId The session whose entries to drop.
+   * @param traceId One trace of it, or every trace when absent.
+   * @returns How many entries were dropped.
+   */
+  function forget(sessionId: SessionId, traceId?: TraceId): number {
+    let removed = 0;
+
+    for (const [key, entry] of [...cache.entries()]) {
+      const matches =
+        entry.sessionId === sessionId && (traceId === undefined || entry.traceId === traceId);
+
+      if (matches && cache.delete(key)) {
+        removed += 1;
+      }
+    }
+
+    return removed;
+  }
+
+  /**
+   * Drops the capture-scoped trees of one touched trace for exactly the
+   * captures the batch named for it: their event sets changed, so the next
+   * capture-scoped read has to rebuild them.
+   *
+   * @param touched The pair, with the captures the batch named.
+   * @returns How many entries were dropped.
+   */
+  function forgetTouchedCaptures(touched: TouchedTrace): number {
+    let removed = 0;
+
+    for (const captureId of touched.captureIds) {
+      if (cache.delete(cacheKey(touched.sessionId, touched.traceId, captureId))) {
+        removed += 1;
+      }
+    }
+
+    return removed;
+  }
+
+  /**
+   * Drops every entry one touched trace made stale: its session-wide tree and
+   * its trees for the captures the batch named.
+   *
+   * What a failed rebuild leaves behind for a trace it could not refresh. The
+   * trees of captures the batch did not name are kept, because their events
+   * did not change.
+   *
+   * @param touched The pair, with the captures the batch named.
+   * @returns How many entries were dropped.
+   */
+  function forgetTouched(touched: TouchedTrace): number {
+    const sessionWide = cache.delete(touched.key) ? 1 : 0;
+
+    return sessionWide + forgetTouchedCaptures(touched);
   }
 
   /**
@@ -623,30 +897,46 @@ export function createTraceCorrelator(deps: TraceCorrelatorDeps): TraceCorrelato
    * invariant, so the tree would be identical from any permutation of these
    * rows.
    *
-   * The session is the scope, and the capture deliberately is not: a trace is
-   * the join between the browser agent's spans and the preload's spans, and
-   * narrowing to one capture would hide the half of an interaction that
-   * continued past a page reload.
+   * The scope is the session, narrowed to one capture when `captureId` is
+   * given: the store is then asked for that capture's events of the trace and
+   * no other, so a trace id that recurs in another capture of the session
+   * contributes nothing to the tree (see the module notes). Absent, the load is
+   * the session-wide join over every capture.
+   *
+   * The load answers with **every** row of that scope or with an error, never
+   * with a subset of them. A store whose `nextOffset` does not advance, and a
+   * trace that still has pages unread after {@link MAX_TRACE_PAGES}, both end
+   * the walk with `STORE_ERROR` (reasons `trace-page-stalled` and
+   * `trace-too-large`). So does a walk that reaches its end with rows the
+   * store reported as unreadable (reason `trace-rows-unreadable`): no read can
+   * ever return those rows, and the tree of the remainder would be missing
+   * whatever they were. Each is logged at `warn` with counts, so no caller can
+   * correlate or cache a partial trace as if it were the interaction.
    */
   async function loadTraceEvents(
     sessionId: SessionId,
     traceId: TraceId,
+    captureId: CaptureId | undefined,
   ): Promise<Result<TelemetryEvent[], DebuggenError>> {
     const rows: TelemetryEvent[] = [];
-    const options: TelemetryReadOptions = { sort: 'start_asc', limit: TRACE_PAGE_SIZE };
+    const options: TelemetryReadOptions = {
+      sort: 'start_asc',
+      limit: TRACE_PAGE_SIZE,
+      ...(captureId !== undefined ? { captureId } : {}),
+    };
+    const scope = traceScopeFields(sessionId, traceId, captureId);
     let offset = 0;
     let pages = 0;
     let unreadable = 0;
 
     for (;;) {
-      const page = await readStore('reading a trace for correlation', () =>
+      const page = await readStore(TRACE_LOAD_OPERATION, () =>
         repo.listByTrace(sessionId, traceId, { ...options, offset }),
       );
 
       if (isErr(page)) {
         log.warn('reading a trace for correlation failed', {
-          [LOG_BINDING_KEYS.sessionId]: sessionId,
-          traceId,
+          ...scope,
           code: page.error.code,
           pages,
           rows: rows.length,
@@ -672,43 +962,48 @@ export function createTraceCorrelator(deps: TraceCorrelatorDeps): TraceCorrelato
 
       // An offset that does not advance cannot be followed — doing so would
       // re-read the same rows forever — and only a repository that does not
-      // honour its own paging contract produces one. The walk therefore ends
-      // with what it has, which is the graceful reading: a partial trace is
-      // still evidence, and it is reported rather than passed off as complete.
+      // honour its own paging contract produces one. The rows read so far are
+      // not the trace, so the load fails rather than hand them on: a tree built
+      // from them would be cached and served as the whole interaction.
       if (nextOffset <= offset) {
-        log.warn('a trace page did not advance its offset; the correlated tree may be partial', {
-          [LOG_BINDING_KEYS.sessionId]: sessionId,
-          traceId,
-          pages,
-          rows: rows.length,
+        const counts = { pages, rows: rows.length };
+
+        log.warn('a trace page did not advance its offset; the trace was not correlated', {
+          ...scope,
+          ...counts,
         });
-        break;
+        return err(incompleteTraceError('trace-page-stalled', { ...scope, ...counts }));
       }
 
+      // The page bound, with pages still unread: the same refusal, for the
+      // same reason — the unread pages may hold any span of the interaction.
       if (pages >= MAX_TRACE_PAGES) {
-        log.warn('stopped paging a trace at the page bound; the correlated tree may be partial', {
-          [LOG_BINDING_KEYS.sessionId]: sessionId,
-          traceId,
-          pages,
-          rows: rows.length,
-          maxPages: MAX_TRACE_PAGES,
+        const counts = { pages, rows: rows.length, maxPages: MAX_TRACE_PAGES };
+
+        log.warn('stopped paging a trace at the page bound; the trace was not correlated', {
+          ...scope,
+          ...counts,
         });
-        break;
+        return err(incompleteTraceError('trace-too-large', { ...scope, ...counts }));
       }
 
       offset = nextOffset;
     }
 
+    // Every page was read, but the store reported rows of this trace it could
+    // not reconstruct; it has already logged them with their arrival numbers.
+    // The rows it did return are not the trace: the missing ones may be any
+    // parent in it, and correlating without them would reparent their children
+    // as orphans and drop their subtrees' work from every duration. So the load
+    // fails, and nothing is correlated or cached from the remainder.
     if (unreadable > 0) {
-      // The store reports rows it could not reconstruct; they are already
-      // logged there with their arrival numbers. Repeating the count here is
-      // what explains a tree that is smaller than the capture suggests.
-      log.warn('stored telemetry rows could not be reconstructed and are absent from the trace', {
-        [LOG_BINDING_KEYS.sessionId]: sessionId,
-        traceId,
-        unreadable,
-        rows: rows.length,
+      const counts = { pages, rows: rows.length, unreadable };
+
+      log.warn('stored rows of a trace could not be reconstructed; the trace was not correlated', {
+        ...scope,
+        ...counts,
       });
+      return err(incompleteTraceError('trace-rows-unreadable', { ...scope, ...counts }));
     }
 
     return ok(rows);
@@ -722,10 +1017,16 @@ export function createTraceCorrelator(deps: TraceCorrelatorDeps): TraceCorrelato
    * which only a supplied double or a database written by another build can
    * produce. That is an internal invariant failure rather than a store failure,
    * and it is reported as one instead of crashing an ingest batch.
+   *
+   * A tree that does not hold every loaded row is refused the same way, as
+   * `INTERNAL` with reason `trace-nodes-dropped`: it is neither returned nor
+   * counted as a rebuild, so no caller can cache it. Only an empty row set is
+   * an absent trace.
    */
   function correlate(
     sessionId: SessionId,
     traceId: TraceId,
+    captureId: CaptureId | undefined,
     rows: readonly TelemetryEvent[],
   ): Result<TraceTree | undefined, DebuggenError> {
     let tree: TraceTree | undefined;
@@ -739,7 +1040,42 @@ export function createTraceCorrelator(deps: TraceCorrelatorDeps): TraceCorrelato
           'INTERNAL',
           'Correlating a trace failed.',
           CORRELATE_FAILURE_HINT,
-          { sessionId, traceId, rows: rows.length },
+          { ...traceScopeFields(sessionId, traceId, captureId), rows: rows.length },
+        ),
+      );
+    }
+
+    // The "nothing is dropped" invariant, checked rather than assumed: the
+    // correlator repairs unresolvable parentage by attaching the node to the
+    // trace root, so every loaded row must be present at some depth. A
+    // shortfall means a loaded row did not become a node — the store answered
+    // with a row of another trace, which `correlateTrace` does not consider, or
+    // the correlator has a defect. Either way the tree is not the interaction:
+    // a missing span removes all the work underneath it from every duration in
+    // the capture. So it is refused rather than returned, and the one check
+    // also covers rows that produced no tree at all, which would otherwise pass
+    // for a trace the store does not hold.
+    const nodeCount = tree?.nodeCount ?? 0;
+
+    if (nodeCount !== rows.length) {
+      const fields = {
+        ...traceScopeFields(sessionId, traceId, captureId),
+        nodeCount,
+        rows: rows.length,
+      };
+
+      log.warn(
+        'correlated node count does not match the loaded row count; the tree was not used',
+        fields,
+      );
+      return err(
+        new DebuggenError(
+          'INTERNAL',
+          'The correlated tree of a trace does not hold every loaded event, so it was not used.',
+          {
+            hint: TRACE_NODES_DROPPED_HINT,
+            details: { ...fields, reason: 'trace-nodes-dropped' },
+          },
         ),
       );
     }
@@ -748,63 +1084,66 @@ export function createTraceCorrelator(deps: TraceCorrelatorDeps): TraceCorrelato
       return ok(undefined);
     }
 
+    // Counted only here, once the tree has passed the invariant: a refused tree
+    // was never built as far as any caller or cache is concerned.
     rebuilds += 1;
-
-    // The "nothing is dropped" invariant, checked rather than assumed: the
-    // correlator repairs unresolvable parentage by attaching the node to the
-    // trace root, so every loaded row must be present at some depth. A
-    // mismatch is a defect in the correlator, and one that would otherwise be
-    // invisible — a missing span removes all the work underneath it from every
-    // duration in the capture — so it is reported with counts and the tree is
-    // still returned, because partial evidence beats none.
-    if (tree.nodeCount !== rows.length) {
-      log.warn('correlated node count does not match the loaded row count', {
-        [LOG_BINDING_KEYS.sessionId]: sessionId,
-        traceId,
-        nodeCount: tree.nodeCount,
-        rows: rows.length,
-      });
-    }
 
     return ok(tree);
   }
 
-  /** Loads and correlates one trace, bypassing the cache on the way in. */
+  /**
+   * Loads and correlates one trace, bypassing the cache on the way in.
+   *
+   * `captureId` scopes the load exactly as {@link loadTraceEvents} describes;
+   * `undefined` rebuilds the session-wide tree.
+   */
   async function rebuild(
     sessionId: SessionId,
     traceId: TraceId,
+    captureId: CaptureId | undefined,
   ): Promise<Result<TraceTree | undefined, DebuggenError>> {
-    const loaded = await loadTraceEvents(sessionId, traceId);
+    const loaded = await loadTraceEvents(sessionId, traceId, captureId);
     if (isErr(loaded)) {
       return loaded;
     }
-    return correlate(sessionId, traceId, loaded.value);
+    return correlate(sessionId, traceId, captureId, loaded.value);
   }
 
   /**
-   * Collects the distinct `(sessionId, traceId)` pairs a batch mentions.
+   * Collects the distinct `(sessionId, traceId)` pairs a batch mentions, each
+   * with the distinct captures the batch named for it.
    *
    * First-seen order, so the rebuild order — and therefore
    * {@link CorrelateUpdate.tracesTouched} — is a function of the batch rather
-   * than of a hash iteration. An event whose ids are unusable is counted and
-   * skipped: nothing here re-validates a persisted event, and keying a cache
-   * entry on an empty string is the one thing that would corrupt the cache.
+   * than of a hash iteration. An event whose session or trace id is unusable is
+   * counted and skipped: nothing here re-validates a persisted event, and
+   * keying a cache entry on an empty string is the one thing that would corrupt
+   * the cache. An unusable capture id alone does not skip the event — the pair
+   * is still rebuilt session-wide — it only names no capture-scoped entry,
+   * because no read could have cached one under it.
    */
   function collectTouched(events: readonly TelemetryEvent[]): TouchedBatch {
-    const traces = new Map<string, TouchedTrace>();
+    const traces = new Map<string, TouchedTrace & { readonly captureIds: Set<CaptureId> }>();
     let ignored = 0;
 
     for (const event of events) {
-      const { sessionId, traceId } = event;
+      const { sessionId, traceId, captureId } = event;
 
       if (!isUsableId(sessionId) || !isUsableId(traceId)) {
         ignored += 1;
         continue;
       }
 
-      const key = cacheKey(sessionId, traceId);
-      if (!traces.has(key)) {
-        traces.set(key, { sessionId, traceId, key });
+      const key = cacheKey(sessionId, traceId, undefined);
+      let touched = traces.get(key);
+
+      if (touched === undefined) {
+        touched = { sessionId, traceId, key, captureIds: new Set<CaptureId>() };
+        traces.set(key, touched);
+      }
+
+      if (isUsableId(captureId)) {
+        touched.captureIds.add(captureId);
       }
     }
 
@@ -819,18 +1158,37 @@ export function createTraceCorrelator(deps: TraceCorrelatorDeps): TraceCorrelato
     let rebuilt = 0;
     let orphanCount = 0;
     let absent = 0;
+    let dropped = 0;
 
     // Sequential by design. The production store is synchronous, so there is
     // no latency to hide, and rebuilding several traces at once would hold
     // several full event sets in memory during a capture that is already
     // producing them as fast as the page can.
-    for (const touched of batch.traces) {
-      const built = await rebuild(touched.sessionId, touched.traceId);
+    for (const [position, touched] of batch.traces.entries()) {
+      const built = await rebuild(touched.sessionId, touched.traceId, undefined);
 
       if (isErr(built)) {
-        // Fail fast, and safely: the traces rebuilt before this point are
-        // cached with fresh trees, and because a rebuild reloads the whole
-        // trace, retrying the same batch converges on the same result.
+        // Fail fast, and safely. The traces rebuilt before this point are
+        // cached with fresh trees. This trace and every touched trace after it
+        // lose the trees cached before the batch: those predate events the
+        // store now holds, and serving one would present a stale interaction
+        // as current. A rebuild reloads the whole trace, so retrying the same
+        // batch converges on the same result.
+        const pending = batch.traces.slice(position);
+        let staleDropped = 0;
+
+        for (const stale of pending) {
+          staleDropped += forgetTouched(stale);
+        }
+
+        log.debug('dropped the cached trees a failed rebuild left stale', {
+          batchSize: events.length,
+          rebuilt,
+          pending: pending.length,
+          dropped: staleDropped,
+          code: built.error.code,
+          cachedTraces: cache.size,
+        });
         return built;
       }
 
@@ -839,16 +1197,26 @@ export function createTraceCorrelator(deps: TraceCorrelatorDeps): TraceCorrelato
       if (built.value === undefined) {
         // The batch named a trace the store holds no rows for — retention
         // purged it, or the rows were deleted between the insert and this
-        // call. Drop any stale tree rather than serve one that no longer
-        // reflects the store.
-        cache.delete(touched.key);
+        // call. No capture of the session holds any either, so every scope of
+        // the trace is dropped rather than served when it no longer reflects
+        // the store.
+        dropped += forget(touched.sessionId, touched.traceId);
         absent += 1;
         continue;
       }
 
+      // The batch changed the event set of every capture it named for this
+      // trace, so those captures' trees are stale; the next capture-scoped read
+      // rebuilds them. Captures the batch did not name keep theirs.
+      dropped += forgetTouchedCaptures(touched);
       rebuilt += 1;
       orphanCount += built.value.orphanCount;
-      remember(touched.key, built.value);
+      remember(touched.key, {
+        sessionId: touched.sessionId,
+        captureId: undefined,
+        traceId: touched.traceId,
+        tree: built.value,
+      });
     }
 
     if (batch.ignored > 0) {
@@ -868,6 +1236,7 @@ export function createTraceCorrelator(deps: TraceCorrelatorDeps): TraceCorrelato
         tracesTouched: tracesTouched.length,
         rebuilt,
         absent,
+        dropped,
         orphanCount,
         cachedTraces: cache.size,
       });
@@ -879,18 +1248,22 @@ export function createTraceCorrelator(deps: TraceCorrelatorDeps): TraceCorrelato
   async function getTrace(
     sessionId: SessionId,
     traceId: TraceId,
+    captureId?: CaptureId,
   ): Promise<Result<TraceTree | undefined, DebuggenError>> {
-    const key = cacheKey(sessionId, traceId);
+    // The scope is part of the key, so a capture-scoped read can never be
+    // answered with the session-wide tree of the same trace id, nor the
+    // reverse.
+    const key = cacheKey(sessionId, traceId, captureId);
     const cached = cache.get(key);
 
     if (cached !== undefined) {
       hits += 1;
-      return ok(cached);
+      return ok(cached.tree);
     }
 
     misses += 1;
 
-    const built = await rebuild(sessionId, traceId);
+    const built = await rebuild(sessionId, traceId, captureId);
     if (isErr(built)) {
       return built;
     }
@@ -900,14 +1273,14 @@ export function createTraceCorrelator(deps: TraceCorrelatorDeps): TraceCorrelato
       // events have not arrived yet is the ordinary state of a capture in
       // flight. The absence is not cached, so the next read sees the events
       // the moment they land.
-      log.debug('no persisted events for the requested trace', {
-        [LOG_BINDING_KEYS.sessionId]: sessionId,
-        traceId,
-      });
+      log.debug(
+        'no persisted events for the requested trace',
+        traceScopeFields(sessionId, traceId, captureId),
+      );
       return ok(undefined);
     }
 
-    remember(key, built.value);
+    remember(key, { sessionId, captureId, traceId, tree: built.value });
     return ok(built.value);
   }
 
@@ -943,7 +1316,10 @@ export function createTraceCorrelator(deps: TraceCorrelatorDeps): TraceCorrelato
     const trees: TraceTree[] = [];
 
     for (const traceId of ids.value) {
-      const trace = await getTrace(sessionId, traceId);
+      // The same capture narrows each trace's events as it narrowed the
+      // enumeration: a trace id recurring in another capture of the session
+      // must not bring that capture's events into this one's tree.
+      const trace = await getTrace(sessionId, traceId, captureId);
       if (isErr(trace)) {
         return trace;
       }
@@ -966,8 +1342,11 @@ export function createTraceCorrelator(deps: TraceCorrelatorDeps): TraceCorrelato
   }
 
   function invalidate(sessionId: SessionId, traceId?: TraceId): void {
+    // Every scope goes: the session-wide tree and each capture-scoped tree of
+    // the trace — or of the whole session — alike.
+    const removed = forget(sessionId, traceId);
+
     if (traceId !== undefined) {
-      const removed = cache.delete(cacheKey(sessionId, traceId)) ? 1 : 0;
       log.debug('invalidated a cached trace', {
         [LOG_BINDING_KEYS.sessionId]: sessionId,
         traceId,
@@ -975,18 +1354,6 @@ export function createTraceCorrelator(deps: TraceCorrelatorDeps): TraceCorrelato
         cachedTraces: cache.size,
       });
       return;
-    }
-
-    // The keys are snapshotted before the deletions: a `Map` tolerates removal
-    // during iteration, but a snapshot makes the intent — "every key that
-    // belonged to this session when the call was made" — explicit.
-    const prefix = `${sessionId}${CACHE_KEY_SEPARATOR}`;
-    let removed = 0;
-
-    for (const key of [...cache.keys()]) {
-      if (key.startsWith(prefix) && cache.delete(key)) {
-        removed += 1;
-      }
     }
 
     log.debug("invalidated a session's cached traces", {

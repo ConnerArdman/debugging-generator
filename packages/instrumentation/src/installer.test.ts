@@ -1,7 +1,7 @@
 /**
  * Unit suite for `./installer.ts` — the ordered installation driver.
  *
- * Seven of its promises cannot be read off the type system, and each one is a
+ * Nine of its promises cannot be read off the type system, and each one is a
  * product guarantee rather than an implementation detail:
  *
  * 1. **Runtime hooks are armed before the first byte is written.** A capture
@@ -38,6 +38,23 @@
  *    strict reverse append order. A malformed `failure` is an invalid result,
  *    and an explicit `failure: undefined` is still an ordinary success, which
  *    is what keeps the channel additive for adapters written before it.
+ * 8. **The journal, not an adapter's report, decides what a rollback unwinds.**
+ *    An adapter that journals a patch and then rejects, returns something that
+ *    is not an install result, reports a failure without its attempt's record,
+ *    or returns an ordinary result — empty, or with hooks — that leaves the
+ *    record out still has its edit reversed. The record is found by the
+ *    install's ledger, which saw every append through the journal the adapters
+ *    were handed, and by comparing the journal with the baseline taken before
+ *    the first adapter was asked, which also finds an append made past it — so
+ *    an edit is reversed in the same call even when the second listing fails,
+ *    and the nothing-enabled error never claims no file was modified while one
+ *    stands.
+ * 9. **An install never stamps a revision it is not.** A plan document whose
+ *    revision differs from the context's, a delta whose predecessor is not the
+ *    revision immediately before the one being installed, a journal that
+ *    contradicts the revision, and a journal that cannot be read are each
+ *    refused before any adapter is asked — asserted as zero journal writes, no
+ *    new backup and a project tree byte-identical to what it was.
  *
  * Three habits here are deliberate.
  *
@@ -472,6 +489,78 @@ function transitionedIds(journal: FakeJournal, status: ModificationStatus): stri
         entry.op === 'updateStatus' && entry.status === status,
     )
     .map((entry) => entry.recordId);
+}
+
+/**
+ * The calls that changed the journal — appends and status transitions — in
+ * call order.
+ *
+ * Reads are not writes: the installer lists the session's records for its
+ * rollback baseline, and "journals no record" is a statement about what the
+ * journal ends up holding, which only these two operations can change.
+ *
+ * @param journal The journal to read.
+ * @returns Every append and status transition it received.
+ */
+function journalWrites(journal: FakeJournal): JournalCall[] {
+  return journal.calls().filter((entry) => entry.op === 'append' || entry.op === 'updateStatus');
+}
+
+/** A journal whose session listing can be made to fail, and the fake behind it. */
+interface BreakableJournal {
+  /** The journal a context is given. */
+  readonly journal: ModificationJournal;
+
+  /** The in-memory journal behind it, for assertions. */
+  readonly fake: FakeJournal;
+
+  /**
+   * From now on, every session listing answers `err('STORE_ERROR')` — how the
+   * service's store reports a failed read. Appends and transitions keep working.
+   */
+  readonly breakListings: () => void;
+}
+
+/**
+ * A journal that behaves exactly like {@link fakeJournal} until its session
+ * listing is broken.
+ *
+ * A switch rather than a call count, because more than the installer lists the
+ * journal: the production patcher reads it to find a chain parent. Breaking it
+ * before the install makes the rollback baseline unreadable; breaking it from
+ * inside an adapter, after its patches have run, fails only the re-read a
+ * failed install performs.
+ *
+ * @returns The journal, the fake behind it and the switch.
+ */
+function breakableJournal(): BreakableJournal {
+  const fake = fakeJournal();
+  let broken = false;
+
+  return {
+    fake,
+    breakListings: (): void => {
+      broken = true;
+    },
+    journal: {
+      append: fake.append,
+      updateStatus: fake.updateStatus,
+      listOpen: fake.listOpen,
+      listBySession: (sessionId: string): Promise<Result<ModificationRecord[]>> => {
+        if (broken) {
+          return Promise.resolve(
+            err(
+              new DebuggenError('STORE_ERROR', 'The suite journal could not be read.', {
+                details: { sessionId },
+              }),
+            ),
+          );
+        }
+
+        return fake.listBySession(sessionId);
+      },
+    },
+  };
 }
 
 /**
@@ -1455,7 +1544,9 @@ describe('a plan every signal of which a runtime hook satisfies', () => {
     );
 
     expect(installed.applied).toEqual([]);
-    expect(journal.calls()).toEqual([]);
+    // One read — the rollback baseline — and not a single write.
+    expect(journal.calls()).toEqual([{ op: 'listBySession', sessionId: SESSION_ID }]);
+    expect(journalWrites(journal)).toEqual([]);
     expect(journal.append).not.toHaveBeenCalled();
     expect(journal.rows()).toEqual([]);
     // AAP §0.5.1's preferred outcome: nothing was written, so nothing has to be
@@ -1472,7 +1563,12 @@ describe('a plan every signal of which a runtime hook satisfies', () => {
       }),
     );
 
-    expect(journal.calls()).toEqual([]);
+    expect(journal.calls()).toEqual([
+      { op: 'listBySession', sessionId: SESSION_ID },
+      { op: 'listBySession', sessionId: SESSION_ID },
+    ]);
+    expect(journalWrites(journal)).toEqual([]);
+    expect(journal.rows()).toEqual([]);
     expect(treeDigests(workspace.projectRoot)).toEqual(before);
   }, 30_000);
 });
@@ -2108,15 +2204,18 @@ describe('a patch failing part-way', () => {
     const journal = fakeJournal();
     const before = treeDigests(workspace.projectRoot);
     const calls: string[] = [];
-    const plan = planWith([
-      action({
-        adapter: 'writer',
-        id: 'act_0000000000000431',
-        type: 'function-timing',
-        mode: 'patch',
-        ...TARGETS.cones,
-      }),
-    ]);
+    const plan = planWith(
+      [
+        action({
+          adapter: 'writer',
+          id: 'act_0000000000000431',
+          type: 'function-timing',
+          mode: 'patch',
+          ...TARGETS.cones,
+        }),
+      ],
+      4,
+    );
 
     const error = expectErr(
       await installPlan(
@@ -2131,9 +2230,11 @@ describe('a patch failing part-way', () => {
     expect(error.details?.['reason']).toBe('aborted');
     expect(error.details?.['attempted']).toBe(0);
     expect(error.details?.['planVersion']).toBe(4);
+    expect(error.details?.['journalReread']).toBe('not-needed');
     expect(error.message).toContain('nothing had to be restored');
     // Nothing was applied, so nothing had to come back — and the project is
-    // untouched rather than merely restored.
+    // untouched rather than merely restored. Not even the rollback baseline is
+    // read: no adapter was asked, so nothing of this call's can be journaled.
     expect(journal.calls()).toEqual([]);
     expect(treeDigests(workspace.projectRoot)).toEqual(before);
   }, 30_000);
@@ -2593,24 +2694,1099 @@ describe('caller invariants', () => {
     ).rejects.toMatchObject({ code: 'INTERNAL' });
   });
 
-  it('warns, but installs, when the plan document and the context disagree about the version', async () => {
+  it('throws for a journal that cannot list a session\u2019s records, which the rollback baseline needs', async () => {
     const calls: string[] = [];
-    const recording = recordingLogger();
+    const journal = fakeJournal();
+    const withoutListing = {
+      append: journal.append,
+      updateStatus: journal.updateStatus,
+      listOpen: journal.listOpen,
+    };
+
+    await expect(
+      installPlan(
+        planWith([action({ adapter: 'renders' })]),
+        makeContext({ journal: withoutListing as unknown as ModificationJournal }),
+        { adapters: [runtimeAdapter('renders', calls)], skipFeasibility: true },
+      ),
+    ).rejects.toMatchObject({ code: 'INTERNAL' });
+    expect(calls).toEqual([]);
+    expect(journal.calls()).toEqual([]);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * The revision: refused before anything is armed, read or written
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * Every backup file under a workspace's `$DEBUGGEN_HOME`, by content.
+ *
+ * @param workspace The workspace to read.
+ * @returns One digest per backup file, or an empty record when no backup
+ * directory exists.
+ */
+function backupDigests(workspace: Workspace): Record<string, string> {
+  const root = join(workspace.debuggenHome, 'backups');
+
+  return existsSync(root) ? treeDigests(root) : {};
+}
+
+/**
+ * Asserts that an install was refused without leaving a trace: no adapter was
+ * asked, the journal received no write, the project tree is byte-identical and
+ * no backup was written — no backup directory at all for a fresh session, and
+ * exactly the backups taken before the refused call otherwise.
+ *
+ * @param input What the case observed.
+ */
+function expectNothingInstalled(input: {
+  readonly calls: readonly string[];
+  readonly journal: FakeJournal;
+  readonly workspace: Workspace;
+  readonly before: Record<string, string>;
+  readonly appendsBefore?: number;
+  readonly transitionsBefore?: number;
+  readonly backupsBefore?: Record<string, string>;
+}): void {
+  const writes = journalWrites(input.journal);
+
+  expect(input.calls).toEqual([]);
+  expect(writes.filter((entry) => entry.op === 'append')).toHaveLength(input.appendsBefore ?? 0);
+  expect(writes.filter((entry) => entry.op === 'updateStatus')).toHaveLength(
+    input.transitionsBefore ?? 0,
+  );
+  expect(treeDigests(input.workspace.projectRoot)).toEqual(input.before);
+
+  if (input.appendsBefore === undefined) {
+    expect(existsSync(join(input.workspace.debuggenHome, 'backups'))).toBe(false);
+  }
+
+  if (input.backupsBefore !== undefined) {
+    expect(backupDigests(input.workspace)).toEqual(input.backupsBefore);
+  }
+}
+
+describe('a revision the context does not stamp', () => {
+  it('refuses a plan document whose planVersion differs from the context, before anything is armed, read or written', async () => {
+    const workspace = makeWorkspace();
+    const journal = fakeJournal();
+    const before = treeDigests(workspace.projectRoot);
+    const calls: string[] = [];
+    const plan = planWith(
+      [
+        action({ adapter: 'renders', id: 'act_0000000000000701' }),
+        action({
+          adapter: 'framework',
+          id: 'act_0000000000000702',
+          type: 'function-timing',
+          mode: 'patch',
+          ...TARGETS.cones,
+        }),
+      ],
+      9,
+    );
+
+    await expect(
+      installPlan(plan, makeContext({ workspace, journal, planVersion: 3 }), {
+        adapters: [runtimeAdapter('renders', calls), patchingAdapter('framework', calls)],
+        skipFeasibility: true,
+      }),
+    ).rejects.toMatchObject({
+      code: 'INTERNAL',
+      details: { planDocumentVersion: 9, contextPlanVersion: 3 },
+    });
+
+    // Neither the hook nor the patch ran, and the journal was not even read:
+    // a record stamped 3 for a plan that says 9 is exactly what is refused.
+    expectNothingInstalled({ calls, journal, workspace, before });
+    expect(journal.calls()).toEqual([]);
+  }, 30_000);
+
+  it.each([
+    ['equal to the revision being installed', 3],
+    ['later than the revision being installed', 5],
+    ['two below the revision being installed, skipping the one immediately before it', 1],
+    ['zero', 0],
+    ['negative', -1],
+    ['fractional', 1.5],
+    ['not a number at all', Number.NaN],
+  ])(
+    'refuses a delta whose previous plan version is %s',
+    async (_label: string, previousPlanVersion: number) => {
+      const workspace = makeWorkspace();
+      const journal = fakeJournal();
+      const before = treeDigests(workspace.projectRoot);
+      const calls: string[] = [];
+      const added = action({
+        adapter: 'framework',
+        id: 'act_0000000000000711',
+        type: 'function-timing',
+        mode: 'patch',
+        ...TARGETS.cones,
+      });
+
+      await expect(
+        installPlan(planWith([added], 3), makeContext({ workspace, journal, planVersion: 3 }), {
+          adapters: [patchingAdapter('framework', calls)],
+          delta: { previousPlanVersion, actionIds: [added.id] },
+          skipFeasibility: true,
+        }),
+      ).rejects.toMatchObject({
+        code: 'INTERNAL',
+        details: { planVersion: 3, previousPlanVersion },
+      });
+
+      expectNothingInstalled({ calls, journal, workspace, before });
+      expect(journal.calls()).toEqual([]);
+    },
+    30_000,
+  );
+
+  it('refuses a delta at plan version 1, which has no revision before it to build on', async () => {
+    const workspace = makeWorkspace();
+    const journal = fakeJournal();
+    const before = treeDigests(workspace.projectRoot);
+    const calls: string[] = [];
+    const added = action({
+      adapter: 'framework',
+      id: 'act_0000000000000715',
+      type: 'function-timing',
+      mode: 'patch',
+      ...TARGETS.cones,
+    });
+
+    // 0 is "planVersion minus one" arithmetically, but revisions count from 1.
+    await expect(
+      installPlan(planWith([added], 1), makeContext({ workspace, journal, planVersion: 1 }), {
+        adapters: [patchingAdapter('framework', calls)],
+        delta: { previousPlanVersion: 0, actionIds: [added.id] },
+        skipFeasibility: true,
+      }),
+    ).rejects.toMatchObject({
+      code: 'INTERNAL',
+      details: { planVersion: 1, previousPlanVersion: 0 },
+    });
+
+    expectNothingInstalled({ calls, journal, workspace, before });
+    expect(journal.calls()).toEqual([]);
+  }, 30_000);
+
+  it('refuses a delta whose actionIds is not an array', async () => {
+    const workspace = makeWorkspace();
+    const journal = fakeJournal();
+    const before = treeDigests(workspace.projectRoot);
+    const calls: string[] = [];
+    const added = action({ adapter: 'renders', id: 'act_0000000000000721' });
+
+    await expect(
+      installPlan(planWith([added], 3), makeContext({ workspace, journal, planVersion: 3 }), {
+        adapters: [runtimeAdapter('renders', calls)],
+        delta: {
+          previousPlanVersion: 2,
+          actionIds: added.id as unknown as readonly string[],
+        },
+        skipFeasibility: true,
+      }),
+    ).rejects.toMatchObject({ code: 'INTERNAL' });
+
+    expectNothingInstalled({ calls, journal, workspace, before });
+    expect(journal.calls()).toEqual([]);
+  });
+});
+
+describe('a revision the journal contradicts', () => {
+  /**
+   * Installs one patch-mode action for real at a given revision, so the
+   * journal holds an `applied` record of it and its file carries the patch.
+   *
+   * @param workspace The project copy.
+   * @param journal The journal the record lands in.
+   * @param planVersion The revision to install at.
+   * @param target The declaration to patch.
+   * @param delta The delta, when this install is a follow-up.
+   * @returns The applied record.
+   */
+  async function installForReal(
+    workspace: Workspace,
+    journal: FakeJournal,
+    planVersion: number,
+    target: { readonly file: string; readonly symbol: string },
+    delta?: { readonly previousPlanVersion: number; readonly action: InstrumentationAction },
+  ): Promise<ModificationRecord> {
+    const planned =
+      delta?.action ??
+      action({ adapter: 'framework', type: 'function-timing', mode: 'patch', ...target });
+    const installed = expectOk(
+      await installPlan(
+        planWith([planned], planVersion),
+        makeContext({ workspace, journal, planVersion }),
+        {
+          adapters: [patchingAdapter('framework', [])],
+          skipFeasibility: true,
+          ...(delta === undefined
+            ? {}
+            : {
+                delta: {
+                  previousPlanVersion: delta.previousPlanVersion,
+                  actionIds: [planned.id],
+                },
+              }),
+        },
+      ),
+    );
+
+    return onlyRecord(installed.applied);
+  }
+
+  /**
+   * Brings a session to plan version 2 with a follow-up that armed only
+   * runtime hooks — a revision the journal holds no record of.
+   *
+   * @param workspace The project copy.
+   * @param journal The session's journal.
+   */
+  async function installRuntimeOnlyFollowUp(
+    workspace: Workspace,
+    journal: FakeJournal,
+  ): Promise<void> {
+    const added = action({ adapter: 'renders', id: 'act_0000000000000732' });
 
     expectOk(
+      await installPlan(planWith([added], 2), makeContext({ workspace, journal, planVersion: 2 }), {
+        adapters: [runtimeAdapter('renders', [])],
+        delta: { previousPlanVersion: 1, actionIds: [added.id] },
+        skipFeasibility: true,
+      }),
+    );
+  }
+
+  it.each<[string, (workspace: Workspace, journal: FakeJournal) => Promise<void>]>([
+    [
+      'holds only plan version 1',
+      async (workspace, journal): Promise<void> => {
+        await installForReal(workspace, journal, 1, TARGETS.plannerSegments);
+      },
+    ],
+    [
+      'holds plan version 1, and plan version 2 armed only runtime hooks so it journaled nothing',
+      async (workspace, journal): Promise<void> => {
+        await installForReal(workspace, journal, 1, TARGETS.plannerSegments);
+        await installRuntimeOnlyFollowUp(workspace, journal);
+      },
+    ],
+    [
+      'holds plan versions 1 and 2',
+      async (workspace, journal): Promise<void> => {
+        await installForReal(workspace, journal, 1, TARGETS.plannerSegments);
+        await installForReal(workspace, journal, 2, TARGETS.cones, {
+          previousPlanVersion: 1,
+          action: action({
+            adapter: 'framework',
+            type: 'function-timing',
+            mode: 'patch',
+            ...TARGETS.cones,
+          }),
+        });
+      },
+    ],
+  ])(
+    'refuses plan version 3 as a delta over plan version 1 when the journal %s, before it is even read',
+    async (_label, history) => {
+      const workspace = makeWorkspace();
+      const journal = fakeJournal();
+
+      await history(workspace, journal);
+
+      const before = treeDigests(workspace.projectRoot);
+      const backupsBefore = backupDigests(workspace);
+      const rowsBefore = journal.rows().map((row) => [row.id, row.status]);
+      const callsBefore = journal.calls().length;
+      const appendsBefore = appendedIds(journal).length;
+      const transitionsBefore = journalWrites(journal).filter(
+        (entry) => entry.op === 'updateStatus',
+      ).length;
+      const calls: string[] = [];
+      const added = action({
+        adapter: 'framework',
+        id: 'act_0000000000000731',
+        type: 'function-timing',
+        mode: 'patch',
+        ...TARGETS.route,
+      });
+
+      // A follow-up builds plan version n + 1 on plan version n: skipping 2 is
+      // refused whatever the journal can or cannot show about revision 2.
+      await expect(
+        installPlan(planWith([added], 3), makeContext({ workspace, journal, planVersion: 3 }), {
+          adapters: [patchingAdapter('framework', calls)],
+          delta: { previousPlanVersion: 1, actionIds: [added.id] },
+          skipFeasibility: true,
+        }),
+      ).rejects.toMatchObject({
+        code: 'INTERNAL',
+        details: { previousPlanVersion: 1, planVersion: 3 },
+      });
+
+      expectNothingInstalled({
+        calls,
+        journal,
+        workspace,
+        before,
+        appendsBefore,
+        transitionsBefore,
+        backupsBefore,
+      });
+      expect(journal.calls()).toHaveLength(callsBefore);
+      expect(journal.rows().map((row) => [row.id, row.status])).toEqual(rowsBefore);
+      expect(readFileSync(pathIn(workspace, TARGETS.route.file), 'utf8')).not.toContain(
+        PATCH_MARKER,
+      );
+    },
+    60_000,
+  );
+
+  it('refuses a delta whose predecessor is right but whose session already holds a later revision', async () => {
+    const workspace = makeWorkspace();
+    const journal = fakeJournal();
+    const later = await installForReal(workspace, journal, 3, TARGETS.plannerSegments);
+    const before = treeDigests(workspace.projectRoot);
+    const backupsBefore = backupDigests(workspace);
+    const calls: string[] = [];
+    const added = action({
+      adapter: 'framework',
+      id: 'act_0000000000000735',
+      type: 'function-timing',
+      mode: 'patch',
+      ...TARGETS.route,
+    });
+
+    const error = expectErr(
+      await installPlan(planWith([added], 2), makeContext({ workspace, journal, planVersion: 2 }), {
+        adapters: [patchingAdapter('framework', calls)],
+        delta: { previousPlanVersion: 1, actionIds: [added.id] },
+        skipFeasibility: true,
+      }),
+    );
+
+    expect(error.code).toBe('SESSION_INVALID_STATE');
+    expect(DEBUGGEN_ERROR_CODES).toContain(error.code);
+    expect(error.details?.['reason']).toBe('plan-version-conflict');
+    expect(error.details?.['previousPlanVersion']).toBe(1);
+    expect(error.details?.['installedPlanVersions']).toEqual([3]);
+    expect(error.details?.['conflictingRecords']).toEqual([later.id]);
+    expect(error.message).toContain('which is later');
+
+    expectNothingInstalled({
+      calls,
+      journal,
+      workspace,
+      before,
+      appendsBefore: 1,
+      transitionsBefore: 1,
+      backupsBefore,
+    });
+    expect(journal.rows().map((row) => [row.id, row.status])).toEqual([[later.id, 'applied']]);
+  }, 30_000);
+
+  it('refuses a whole-plan install over a revision the journal still holds, because it would patch over it', async () => {
+    const workspace = makeWorkspace();
+    const journal = fakeJournal();
+    const carried = await installForReal(workspace, journal, 1, TARGETS.plannerSegments);
+    const before = treeDigests(workspace.projectRoot);
+    const calls: string[] = [];
+
+    // A follow-up's plan version 2 installed without a delta would re-apply
+    // the carried action as well as the added one.
+    const error = expectErr(
       await installPlan(
-        planWith([action({ adapter: 'renders' })], 9),
-        makeContext({ planVersion: 3, logger: recording.logger }),
+        planWith(
+          [
+            action({
+              adapter: 'framework',
+              id: 'act_0000000000000741',
+              type: 'function-timing',
+              mode: 'patch',
+              ...TARGETS.plannerSegments,
+            }),
+            action({
+              adapter: 'framework',
+              id: 'act_0000000000000742',
+              type: 'function-timing',
+              mode: 'patch',
+              ...TARGETS.cones,
+            }),
+          ],
+          2,
+        ),
+        makeContext({ workspace, journal, planVersion: 2 }),
+        { adapters: [patchingAdapter('framework', calls)], skipFeasibility: true },
+      ),
+    );
+
+    expect(error.code).toBe('SESSION_INVALID_STATE');
+    expect(error.details?.['reason']).toBe('plan-version-conflict');
+    expect(error.details?.['previousPlanVersion']).toBeUndefined();
+    expect(error.details?.['conflictingRecords']).toEqual([carried.id]);
+    expect(error.hint).toContain('delta');
+
+    expectNothingInstalled({
+      calls,
+      journal,
+      workspace,
+      before,
+      appendsBefore: 1,
+      transitionsBefore: 1,
+    });
+    expect(recordsFor(journal, TARGETS.plannerSegments.file)).toHaveLength(1);
+    expect(digestIn(workspace, TARGETS.plannerSegments.file)).toBe(carried.instrumentedHash);
+  }, 30_000);
+
+  it('refuses to install an earlier revision over a later one', async () => {
+    const workspace = makeWorkspace();
+    const journal = fakeJournal();
+    const later = await installForReal(workspace, journal, 2, TARGETS.plannerSegments);
+    const before = treeDigests(workspace.projectRoot);
+    const calls: string[] = [];
+
+    const error = expectErr(
+      await installPlan(
+        planWith([action({ adapter: 'renders', id: 'act_0000000000000751' })], 1),
+        makeContext({ workspace, journal, planVersion: 1 }),
         { adapters: [runtimeAdapter('renders', calls)], skipFeasibility: true },
       ),
     );
 
-    expect(
-      recording.records.some(
-        (entry) => entry.level === 'warn' && entry.message.includes('planVersion'),
+    expect(error.code).toBe('SESSION_INVALID_STATE');
+    expect(error.details?.['conflictingRecords']).toEqual([later.id]);
+    expect(error.message).toContain('which is later');
+    expectNothingInstalled({
+      calls,
+      journal,
+      workspace,
+      before,
+      appendsBefore: 1,
+      transitionsBefore: 1,
+    });
+  }, 30_000);
+
+  it('accepts a retried install of the revision the journal already holds', async () => {
+    const workspace = makeWorkspace();
+    const journal = fakeJournal();
+    const standing = await installForReal(workspace, journal, 2, TARGETS.plannerSegments);
+    const calls: string[] = [];
+
+    // Re-arming the same revision is consistent: its records are this
+    // revision's, and an adapter treats them as already applied.
+    const installed = expectOk(
+      await installPlan(
+        planWith([action({ adapter: 'renders', id: 'act_0000000000000761' })], 2),
+        makeContext({ workspace, journal, planVersion: 2 }),
+        { adapters: [runtimeAdapter('renders', calls)], skipFeasibility: true },
       ),
-    ).toBe(true);
+    );
+
+    expect(calls).toEqual(['renders']);
+    expect(installed.planVersion).toBe(2);
+    expect(journal.rows().find((row) => row.id === standing.id)?.status).toBe('applied');
+  }, 30_000);
+
+  it('ignores records a rollback already closed or a developer now owns', async () => {
+    const workspace = makeWorkspace();
+    const journal = fakeJournal();
+    const reverted = await installForReal(workspace, journal, 2, TARGETS.plannerSegments);
+    const conflicted = await installForReal(workspace, journal, 3, TARGETS.cones, {
+      previousPlanVersion: 2,
+      action: action({
+        adapter: 'framework',
+        type: 'function-timing',
+        mode: 'patch',
+        ...TARGETS.cones,
+      }),
+    });
+
+    // Neither record stands in the project any more on the journal's account.
+    expect(isOk(await journal.updateStatus(reverted.id, 'reverted'))).toBe(true);
+    expect(isOk(await journal.updateStatus(conflicted.id, 'conflict'))).toBe(true);
+
+    const calls: string[] = [];
+    const installed = expectOk(
+      await installPlan(
+        planWith([action({ adapter: 'renders', id: 'act_0000000000000771' })], 1),
+        makeContext({ workspace, journal, planVersion: 1 }),
+        { adapters: [runtimeAdapter('renders', calls)], skipFeasibility: true },
+      ),
+    );
+
+    expect(calls).toEqual(['renders']);
+    expect(installed.planVersion).toBe(1);
+  }, 30_000);
+
+  it('refuses when the journal cannot be read for the baseline, before any adapter is asked', async () => {
+    const workspace = makeWorkspace();
+    const { journal, fake, breakListings } = breakableJournal();
+    const before = treeDigests(workspace.projectRoot);
+    const calls: string[] = [];
+
+    breakListings();
+
+    const error = expectErr(
+      await installPlan(
+        planWith([
+          action({ adapter: 'renders', id: 'act_0000000000000781' }),
+          action({
+            adapter: 'framework',
+            id: 'act_0000000000000782',
+            type: 'function-timing',
+            mode: 'patch',
+            ...TARGETS.cones,
+          }),
+        ]),
+        makeContext({ workspace, journal }),
+        {
+          adapters: [runtimeAdapter('renders', calls), patchingAdapter('framework', calls)],
+          skipFeasibility: true,
+        },
+      ),
+    );
+
+    expect(error.code).toBe('STORE_ERROR');
+    expect(error.details?.['reason']).toBe('journal-unreadable');
+    expect(error.hint).toContain('No hook was armed and no file was modified');
+    expect(DebuggenError.is(error.cause)).toBe(true);
+    expectNothingInstalled({ calls, journal: fake, workspace, before });
+  }, 30_000);
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * Rollback decided by the journal: records no adapter reported
+ * ---------------------------------------------------------------------------------------------- */
+
+describe('records the journal holds that no adapter reported', () => {
+  /**
+   * A patch-mode adapter that really patches every action it is handed and then
+   * reports none of it: it rejects, or returns something that is not an install
+   * result. The edit is on disk and in the journal, and only the journal — as
+   * the install's ledger saw it appended, or as a second listing shows it — can
+   * tell the installer so.
+   *
+   * @param id The adapter's id.
+   * @param calls The shared call log.
+   * @param ending How it ends after patching.
+   * @param afterPatching Something to do once its patches are on disk, before
+   * it ends — for the case where the journal becomes unreadable right then.
+   * @returns The adapter.
+   */
+  function silentPatchAdapter(
+    id: string,
+    calls: string[],
+    ending: 'reject' | 'invalid-result',
+    afterPatching?: () => void,
+  ): InstrumentationAdapter {
+    return fakeAdapter(id, async (actions, context): Promise<InstallResult> => {
+      calls.push(id);
+      await patchThrough(actions, context);
+      afterPatching?.();
+
+      if (ending === 'reject') {
+        throw new DebuggenError('INSTRUMENTATION_INSTALL_FAILED', 'The adapter lost its way.');
+      }
+
+      return undefined as unknown as InstallResult;
+    });
+  }
+
+  it('reverse-restores a patch an adapter journaled and then rejected without reporting, after the earlier group\u2019s', async () => {
+    const workspace = makeWorkspace();
+    const journal = fakeJournal();
+    const calls: string[] = [];
+    const plan = planWith([
+      action({
+        adapter: 'writer',
+        id: 'act_0000000000000801',
+        type: 'function-timing',
+        mode: 'patch',
+        ...TARGETS.cones,
+      }),
+      action({
+        adapter: 'silent',
+        id: 'act_0000000000000802',
+        type: 'function-timing',
+        mode: 'patch',
+        ...TARGETS.planner,
+      }),
+    ]);
+
+    const error = expectErr(
+      await installPlan(plan, makeContext({ workspace, journal }), {
+        adapters: [patchingAdapter('writer', calls), silentPatchAdapter('silent', calls, 'reject')],
+        skipFeasibility: true,
+      }),
+    );
+    const appended = appendedIds(journal);
+    const silentRecord = recordsFor(journal, TARGETS.planner.file)[0];
+
+    expect(calls).toEqual(['writer', 'silent']);
+    expect(appended).toHaveLength(2);
+    expect(error.code).toBe('INSTRUMENTATION_INSTALL_FAILED');
+    expect(error.details?.['reason']).toBe('adapter-failed');
+    expect(error.details?.['journalReread']).toBe('listed');
+    expect(error.details?.['attempted']).toBe(2);
+    expect(error.details?.['restoredCount']).toBe(2);
+    expect(error.details?.['discovered']).toEqual([silentRecord?.id]);
+    expect(error.details?.['discoveredCount']).toBe(1);
+    expect(error.message).toContain('this install left no instrumentation in the project');
+
+    // Both files are back to their pristine bytes, the unreported one included,
+    // and they were restored last-journaled-first.
+    for (const file of [TARGETS.cones.file, TARGETS.planner.file]) {
+      expect(digestIn(workspace, file)).toBe(FIXTURE_DIGESTS[file]);
+      expect(readFileSync(pathIn(workspace, file), 'utf8')).not.toContain(PATCH_MARKER);
+    }
+
+    expect(transitionedIds(journal, 'reverted')).toEqual([...appended].reverse());
+    expect(journal.rows().map((row) => row.status)).toEqual(['reverted', 'reverted']);
+  }, 30_000);
+
+  it('reverse-restores a patch an adapter journaled before returning something that is not an install result', async () => {
+    const workspace = makeWorkspace();
+    const journal = fakeJournal();
+    const calls: string[] = [];
+
+    const error = expectErr(
+      await installPlan(
+        planWith([
+          action({
+            adapter: 'silent',
+            id: 'act_0000000000000811',
+            type: 'function-timing',
+            mode: 'patch',
+            ...TARGETS.coneProfile,
+          }),
+        ]),
+        makeContext({ workspace, journal }),
+        {
+          adapters: [silentPatchAdapter('silent', calls, 'invalid-result')],
+          skipFeasibility: true,
+        },
+      ),
+    );
+
+    expect(calls).toEqual(['silent']);
+    expect(error.details?.['reason']).toBe('invalid-result');
+    expect(error.details?.['attempted']).toBe(1);
+    expect(error.details?.['restoredCount']).toBe(1);
+    expect(error.details?.['discoveredCount']).toBe(1);
+    expect(digestIn(workspace, TARGETS.coneProfile.file)).toBe(
+      FIXTURE_DIGESTS[TARGETS.coneProfile.file],
+    );
+    expect(journal.rows().map((row) => row.status)).toEqual(['reverted']);
+  }, 30_000);
+
+  it('reverse-restores a failed attempt\u2019s record that the adapter left out of its failure', async () => {
+    const workspace = makeWorkspace();
+    const journal = fakeJournal();
+    const calls: string[] = [];
+    const cones = action({
+      adapter: 'forgetful',
+      id: 'act_0000000000000821',
+      type: 'function-timing',
+      mode: 'patch',
+      ...TARGETS.cones,
+    });
+    const planner = action({
+      adapter: 'forgetful',
+      id: 'act_0000000000000822',
+      type: 'function-timing',
+      mode: 'patch',
+      ...TARGETS.planner,
+    });
+
+    // It reports the completed record and the failure, but not the record the
+    // patcher journaled for the attempt whose rename landed before it failed.
+    const forgetful = fakeAdapter('forgetful', async (actions, context): Promise<InstallResult> => {
+      calls.push('forgetful');
+
+      const batch = await patcherFor(context, failAfterRenameOf(planner.file)).patchActions(
+        actions,
+      );
+      const applied = batch.applied.map((outcome) => outcome.record);
+
+      if (batch.failure === undefined) {
+        throw new Error('the injected failure did not fire');
+      }
+
+      return {
+        adapterId: 'forgetful',
+        applied,
+        runtimeHooks: [],
+        unavailable: [],
+        failure: {
+          error: batch.failure.error,
+          signal: 'functions',
+          file: batch.failure.file,
+          symbol: batch.failure.symbol,
+        },
+      };
+    });
+
+    const error = expectErr(
+      await installPlan(planWith([cones, planner]), makeContext({ workspace, journal }), {
+        adapters: [forgetful],
+        skipFeasibility: true,
+      }),
+    );
+    const appended = appendedIds(journal);
+    const failedAttempt = recordsFor(journal, planner.file)[0];
+
+    expect(calls).toEqual(['forgetful']);
+    expect(appended).toHaveLength(2);
+    expect(error.details?.['reason']).toBe('action-failed');
+    expect(error.details?.['attempted']).toBe(2);
+    expect(error.details?.['restoredCount']).toBe(2);
+    expect(error.details?.['discovered']).toEqual([failedAttempt?.id]);
+    expect(error.details?.['failedAction']).toMatchObject({
+      file: planner.file,
+      recordId: undefined,
+    });
+
+    // The file whose rename landed is back to its original bytes, as is the one
+    // that completed, and the failed attempt went first.
+    expect(digestIn(workspace, planner.file)).toBe(FIXTURE_DIGESTS[planner.file]);
+    expect(digestIn(workspace, cones.file)).toBe(FIXTURE_DIGESTS[cones.file]);
+    expect(transitionedIds(journal, 'reverted')).toEqual([...appended].reverse());
+  }, 30_000);
+
+  it('reverse-restores an unreported patch from the install ledger when the journal cannot be re-read', async () => {
+    const workspace = makeWorkspace();
+    const { journal, fake, breakListings } = breakableJournal();
+    const calls: string[] = [];
+
+    const error = expectErr(
+      await installPlan(
+        planWith([
+          action({
+            adapter: 'writer',
+            id: 'act_0000000000000831',
+            type: 'function-timing',
+            mode: 'patch',
+            ...TARGETS.cones,
+          }),
+          action({
+            adapter: 'silent',
+            id: 'act_0000000000000832',
+            type: 'function-timing',
+            mode: 'patch',
+            ...TARGETS.planner,
+          }),
+        ]),
+        makeContext({ workspace, journal }),
+        {
+          adapters: [
+            patchingAdapter('writer', calls),
+            // The store becomes unreadable once the silent patch has landed, so
+            // the baseline was taken but the rollback's re-read fails.
+            silentPatchAdapter('silent', calls, 'reject', breakListings),
+          ],
+          skipFeasibility: true,
+        },
+      ),
+    );
+
+    const appended = appendedIds(fake);
+    const silentRecord = recordsFor(fake, TARGETS.planner.file)[0];
+
+    expect(calls).toEqual(['writer', 'silent']);
+    expect(appended).toHaveLength(2);
+    expect(error.code).toBe('INSTRUMENTATION_INSTALL_FAILED');
+    expect(error.details?.['reason']).toBe('adapter-failed');
+    expect(error.details?.['journalReread']).toBe('failed');
+    // The ledger saw the silent adapter's append, so the failed listing hides
+    // nothing that went through the journal the adapters were handed.
+    expect(error.details?.['attempted']).toBe(2);
+    expect(error.details?.['restoredCount']).toBe(2);
+    expect(error.details?.['discovered']).toEqual([silentRecord?.id]);
+    expect(error.details?.['discoveredCount']).toBe(1);
+    expect(error.details?.['conflictCount']).toBe(0);
+    expect(error.details?.['failureCount']).toBe(0);
+    // Honest about the one thing it could not confirm, without claiming a
+    // clean project or promising what a listing would have shown.
+    expect(error.message).toContain(
+      'All 2 file modification(s) journaled through the adapters were restored.',
+    );
+    expect(error.message).toContain('could not be re-read');
+    expect(error.message).not.toContain('left no instrumentation');
+    expect(error.hint).toContain('journal store');
+
+    // Both patches came back in this call, last journaled first — no restart
+    // and no start-up reconciliation needed.
+    for (const file of [TARGETS.cones.file, TARGETS.planner.file]) {
+      expect(digestIn(workspace, file)).toBe(FIXTURE_DIGESTS[file]);
+      expect(readFileSync(pathIn(workspace, file), 'utf8')).not.toContain(PATCH_MARKER);
+    }
+
+    expect(transitionedIds(fake, 'reverted')).toEqual([...appended].reverse());
+    expect(fake.rows().map((row) => row.status)).toEqual(['reverted', 'reverted']);
+  }, 30_000);
+
+  it('reverse-restores a patch an adapter journaled and then left out of an otherwise empty result', async () => {
+    const workspace = makeWorkspace();
+    const journal = fakeJournal();
+    const calls: string[] = [];
+    const quiet = fakeAdapter('quiet', async (actions, context): Promise<InstallResult> => {
+      calls.push('quiet');
+      await patchThrough(actions, context);
+
+      // A structurally valid result that describes nothing it did.
+      return { adapterId: 'quiet', applied: [], runtimeHooks: [], unavailable: [] };
+    });
+
+    const error = expectErr(
+      await installPlan(
+        planWith([
+          action({
+            adapter: 'quiet',
+            id: 'act_0000000000000841',
+            type: 'function-timing',
+            mode: 'patch',
+            ...TARGETS.coneCeiling,
+          }),
+        ]),
+        makeContext({ workspace, journal }),
+        { adapters: [quiet], skipFeasibility: true },
+      ),
+    );
+    const record = recordsFor(journal, TARGETS.coneCeiling.file)[0];
+
+    expect(calls).toEqual(['quiet']);
+    // Not the nothing-enabled error, which would say no file was modified.
+    expect(error.code).toBe('INSTRUMENTATION_INSTALL_FAILED');
+    expect(error.details?.['reason']).toBe('unreported-modification');
+    expect(error.details?.['adapter']).toBe('quiet');
+    expect(error.details?.['unreported']).toBe(1);
+    expect(error.details?.['journalReread']).toBe('listed');
+    expect(error.details?.['discovered']).toEqual([record?.id]);
+    expect(error.details?.['attempted']).toBe(1);
+    expect(error.details?.['restoredCount']).toBe(1);
+    expect(error.message).toContain(
+      'The adapter "quiet" returned an install result that leaves out',
+    );
+    expect(error.message).toContain('this install left no instrumentation in the project');
+    expect(error.message).not.toContain('no file was modified');
+    expect(error.hint).toContain('defect in the adapter');
+
+    expect(digestIn(workspace, TARGETS.coneCeiling.file)).toBe(
+      FIXTURE_DIGESTS[TARGETS.coneCeiling.file],
+    );
+    expect(journal.rows().map((row) => row.status)).toEqual(['reverted']);
+  }, 30_000);
+
+  it('reverse-restores a patch an adapter left out of a result that armed hooks, with the earlier group\u2019s', async () => {
+    const workspace = makeWorkspace();
+    const journal = fakeJournal();
+    const calls: string[] = [];
+    const hooky = fakeAdapter('hooky', async (actions, context): Promise<InstallResult> => {
+      calls.push('hooky');
+      await patchThrough(actions, context);
+
+      // Reports a hook as its whole contribution, and omits the patch.
+      return { adapterId: 'hooky', applied: [], runtimeHooks: ['hooky hook'], unavailable: [] };
+    });
+
+    const error = expectErr(
+      await installPlan(
+        planWith([
+          action({
+            adapter: 'writer',
+            id: 'act_0000000000000851',
+            type: 'function-timing',
+            mode: 'patch',
+            ...TARGETS.cones,
+          }),
+          action({
+            adapter: 'hooky',
+            id: 'act_0000000000000852',
+            type: 'function-timing',
+            mode: 'patch',
+            ...TARGETS.planner,
+          }),
+        ]),
+        makeContext({ workspace, journal }),
+        { adapters: [patchingAdapter('writer', calls), hooky], skipFeasibility: true },
+      ),
+    );
+    const appended = appendedIds(journal);
+    const hookyRecord = recordsFor(journal, TARGETS.planner.file)[0];
+
+    expect(calls).toEqual(['writer', 'hooky']);
+    expect(appended).toHaveLength(2);
+    expect(error.details?.['reason']).toBe('unreported-modification');
+    expect(error.details?.['adapter']).toBe('hooky');
+    expect(error.details?.['unreported']).toBe(1);
+    expect(error.details?.['discovered']).toEqual([hookyRecord?.id]);
+    expect(error.details?.['attempted']).toBe(2);
+    expect(error.details?.['restoredCount']).toBe(2);
+
+    for (const file of [TARGETS.cones.file, TARGETS.planner.file]) {
+      expect(digestIn(workspace, file)).toBe(FIXTURE_DIGESTS[file]);
+    }
+
+    expect(transitionedIds(journal, 'reverted')).toEqual([...appended].reverse());
+  }, 30_000);
+
+  it('unwinds a patch journaled past the adapters\u2019 journal before reporting that nothing was enabled', async () => {
+    const workspace = makeWorkspace();
+    const journal = fakeJournal();
+    const calls: string[] = [];
+    // Journals through the session's store directly rather than the journal it
+    // was handed, so only the installer's listing can find the record.
+    const bypassing = fakeAdapter('bypassing', async (actions, context): Promise<InstallResult> => {
+      calls.push('bypassing');
+
+      const batch = await patcherFor({ ...context, journal }).patchActions(actions);
+
+      if (batch.failure !== undefined) {
+        throw batch.failure.error;
+      }
+
+      return {
+        adapterId: 'bypassing',
+        applied: [],
+        runtimeHooks: [],
+        unavailable: [
+          {
+            signal: 'functions',
+            reason: 'the adapter chose not to say',
+            hint: 'Ask the question again.',
+          },
+        ],
+      };
+    });
+
+    const error = expectErr(
+      await installPlan(
+        planWith([
+          action({
+            adapter: 'bypassing',
+            id: 'act_0000000000000861',
+            type: 'function-timing',
+            mode: 'patch',
+            ...TARGETS.coneProfile,
+          }),
+        ]),
+        makeContext({ workspace, journal }),
+        { adapters: [bypassing], skipFeasibility: true },
+      ),
+    );
+    const record = recordsFor(journal, TARGETS.coneProfile.file)[0];
+
+    expect(calls).toEqual(['bypassing']);
+    expect(error.code).toBe('INSTRUMENTATION_INSTALL_FAILED');
+    expect(error.details?.['reason']).toBe('unreported-modification');
+    expect(error.details?.['adapter']).toBeUndefined();
+    expect(error.details?.['unreported']).toBe(1);
+    expect(error.details?.['journalReread']).toBe('listed');
+    expect(error.details?.['discovered']).toEqual([record?.id]);
+    expect(error.details?.['restoredCount']).toBe(1);
+    expect(error.message).toContain('No adapter reported enabling any instrumentation');
+    expect(error.message).not.toContain('no file was modified');
+
+    expect(digestIn(workspace, TARGETS.coneProfile.file)).toBe(
+      FIXTURE_DIGESTS[TARGETS.coneProfile.file],
+    );
+    expect(journal.rows().map((row) => row.status)).toEqual(['reverted']);
+  }, 30_000);
+
+  it('says which listing stands behind "no file was modified" when nothing was enabled', async () => {
+    const { journal, breakListings } = breakableJournal();
+    const calls: string[] = [];
+    // Enables nothing, and the store stops answering listings right then.
+    const idle = fakeAdapter('idle', (): Promise<InstallResult> => {
+      calls.push('idle');
+      breakListings();
+
+      return Promise.resolve({
+        adapterId: 'idle',
+        applied: [],
+        runtimeHooks: [],
+        unavailable: [
+          {
+            signal: 'renders',
+            reason: 'React was not detected',
+            hint: 'Reload the page once the agent is ready.',
+          },
+        ],
+      });
+    });
+
+    const error = expectErr(
+      await installPlan(
+        planWith([action({ adapter: 'idle', id: 'act_0000000000000871' })]),
+        makeContext({ journal }),
+        { adapters: [idle], skipFeasibility: true },
+      ),
+    );
+
+    expect(calls).toEqual(['idle']);
+    // Nothing was journaled through the adapters, so the ledger alone supports
+    // the §0.5.5 message, and the details say that it did.
+    expect(error.code).toBe('INSTRUMENTATION_UNAVAILABLE');
+    expect(error.details?.['journalReread']).toBe('failed');
   });
+
+  it('hands adapters a journal that forwards every call to the session\u2019s own as a method call', async () => {
+    const workspace = makeWorkspace();
+    const inner = fakeJournal();
+
+    /** A store whose methods need `this`, as a class-based journal does. */
+    class StoreJournal implements ModificationJournal {
+      private readonly rows = inner;
+
+      append(record: ModificationRecord): Promise<Result<ModificationRecord>> {
+        return this.rows.append(record);
+      }
+
+      updateStatus(
+        id: string,
+        status: ModificationStatus,
+        patch?: ModificationStatusPatch,
+      ): Promise<Result<ModificationRecord>> {
+        return this.rows.updateStatus(id, status, patch);
+      }
+
+      listBySession(sessionId: string): Promise<Result<ModificationRecord[]>> {
+        return this.rows.listBySession(sessionId);
+      }
+
+      listOpen(): Promise<Result<ModificationRecord[]>> {
+        return this.rows.listOpen();
+      }
+    }
+
+    const installed = expectOk(
+      await installPlan(
+        planWith([
+          action({
+            adapter: 'framework',
+            id: 'act_0000000000000881',
+            type: 'function-timing',
+            mode: 'patch',
+            ...TARGETS.cones,
+          }),
+        ]),
+        makeContext({ workspace, journal: new StoreJournal() }),
+        { adapters: [patchingAdapter('framework', [])], skipFeasibility: true },
+      ),
+    );
+
+    expect(installed.applied).toHaveLength(1);
+    expect(inner.rows().map((row) => [row.id, row.status])).toEqual([
+      [onlyRecord(installed.applied).id, 'applied'],
+    ]);
+    expect(digestIn(workspace, TARGETS.cones.file)).toBe(
+      onlyRecord(installed.applied).instrumentedHash,
+    );
+  }, 30_000);
 });
 
 /* -------------------------------------------------------------------------------------------------

@@ -43,8 +43,21 @@
  *   reverse-restores the records *this call* applied, including the record
  *   journaled for the failed attempt, and leaves the earlier plan versions'
  *   records exactly as they are — which is what "the session stays at its
- *   previous plan version" means in bytes. See {@link installPlan}'s rollback
- *   section.
+ *   previous plan version" means in bytes. What an adapter *reported* is not
+ *   the authority on what this call applied: every append made through the
+ *   journal the adapters are handed is remembered as it happens, the session's
+ *   journal is read before the first adapter is asked and again when the
+ *   install fails, and every record appended in between is unwound whether or
+ *   not an adapter mentioned it — an adapter that reports success while having
+ *   journaled a record it did not report fails the install for that reason.
+ *   See {@link installPlan}'s rollback section.
+ * - **Which revision an install may stamp.** Every record this call journals
+ *   is stamped with {@link InstrumentationContext.planVersion}, so the plan
+ *   document, the context, a delta's named predecessor and the revisions the
+ *   journal says are standing in the project must all agree. An install on
+ *   which they disagree is refused before any hook is armed or any byte is
+ *   written, because proceeding would file its patches under a revision the
+ *   session does not hold and break the follow-up chain cleanup unwinds.
  *
  * ## What it deliberately does not know
  *
@@ -98,7 +111,13 @@ import type { CleanupFailure, RestoreOutcome } from './cleanup.js';
 import { checkFeasibility } from './feasibility.js';
 import type { InfeasibleAction } from './feasibility.js';
 import type { AdapterRegistry } from './registry.js';
-import type { ModificationConflict, ModificationRecord } from './schema/modification.js';
+import type {
+  ModificationConflict,
+  ModificationJournal,
+  ModificationRecord,
+  ModificationStatus,
+  ModificationStatusPatch,
+} from './schema/modification.js';
 import type {
   InstrumentationAction,
   InstrumentationActionType,
@@ -236,10 +255,14 @@ export interface InstallDelta {
   /**
    * The plan version whose instrumentation is already installed.
    *
-   * Recorded on the failure path rather than consulted during the install: it
-   * is the version the session returns to when a delta fails part-way, and
-   * naming it in the error is what makes "left at its previous plan version"
-   * checkable rather than a claim.
+   * Exactly {@link InstrumentationContext.planVersion} minus one — AAP §0.4.2
+   * builds plan version *n + 1* from plan version *n* — checked before
+   * anything is installed, and checked again against the journal: no record
+   * that may still stand in the project — `applied`, `pending` or `failed` —
+   * may carry a revision above the one being installed. It is also the version
+   * the session returns to when the delta fails part-way, and naming it in the
+   * error is what makes "left at its previous plan version" checkable rather
+   * than a claim.
    */
   readonly previousPlanVersion: number;
 
@@ -381,9 +404,10 @@ export interface AggregateInstallResult {
    * The plan revision this install stamped, from
    * {@link InstrumentationContext.planVersion}.
    *
-   * The context is authoritative, not the plan document: which revision is
-   * being installed is the caller's statement, and every record of this round is
-   * stamped from it.
+   * Equal to the plan document's own `planVersion` by construction: the patch
+   * layer stamps every record of this round from the context, so an install
+   * whose plan document names a different revision is refused before anything
+   * is armed or written rather than recorded under a revision it is not.
    */
   readonly planVersion: number;
 }
@@ -453,6 +477,11 @@ interface AdapterLookup {
  *
  * ## The sequence
  *
+ * 0. **The revision.** The plan document's `planVersion` must equal the
+ *    context's — the revision every record of this round is stamped with — and
+ *    a delta's `previousPlanVersion` must be the revision immediately before
+ *    it. Both are checked before anything else happens and throw when they
+ *    fail, because they are the caller's wiring (see `@throws`).
  * 1. **The action set.** The whole plan, or — when {@link InstallPlanOptions.delta}
  *    is present — only the actions the delta names, matched by id. An action an
  *    earlier plan version already applied is therefore never installed twice.
@@ -467,10 +496,22 @@ interface AdapterLookup {
  *    rather than thrown — a stored plan read back after an upgrade may name an
  *    adapter that has since been removed, and that is a narrower capture, not a
  *    corrupt session.
- * 4. **Runtime groups, then patch groups.** Within each phase, groups install
+ * 4. **The journal baseline.** The session's records are listed once, before
+ *    the first adapter is asked. The listing is what a rollback compares
+ *    against, and it is where the revision is checked against what is actually
+ *    installed: a record that may still stand in the project — `applied`,
+ *    `pending` or `failed` — may not carry a revision above the one being
+ *    installed, and for a whole-plan install it may not carry an earlier one
+ *    either (installing every action again would patch over it — that is a
+ *    delta's job). An install that is already cancelled stops before this step
+ *    and reads nothing. From here on, adapters are handed the context with its
+ *    journal wrapped in an install-scoped ledger that remembers every record
+ *    appended through it, in append order and in the latest state the journal
+ *    returned.
+ * 5. **Runtime groups, then patch groups.** Within each phase, groups install
  *    in the adapters' registration order and each group's actions are ordered
  *    by id, so two installs of the same plan install identically.
- * 5. **Aggregation.** `applied` is concatenated in application order,
+ * 6. **Aggregation.** `applied` is concatenated in application order,
  *    `runtimeHooks` is de-duplicated with first-occurrence order kept,
  *    `unavailable` is concatenated, and the two producer configurations are
  *    computed by `./schema/readiness.ts`'s derivations from the actions of the
@@ -479,22 +520,39 @@ interface AdapterLookup {
  *
  * ## What counts as failure
  *
- * `Err` is returned in exactly two situations, and neither is "a signal turned
- * out to be unavailable":
+ * `Err` is returned in exactly four situations, and none is "a signal turned
+ * out to be unavailable". The first two are refusals: they return before any
+ * adapter is asked, so no hook is armed, no record is journaled and no byte is
+ * written.
  *
+ * - **The journal could not be read** for the baseline. The error carries
+ *   `'STORE_ERROR'` with `details.reason` `'journal-unreadable'`: without the
+ *   baseline a failed install could not be unwound completely, so none is
+ *   started.
+ * - **The journal contradicts the revision** — step 4 found a standing record
+ *   the install's revision cannot account for. The error carries
+ *   `'SESSION_INVALID_STATE'` with `details.reason` `'plan-version-conflict'`
+ *   and the revisions the journal holds.
  * - **Nothing at all could be enabled** — no modification applied and no
  *   runtime hook armed. The error carries `'INSTRUMENTATION_UNAVAILABLE'` and a
  *   `hint` naming the most actionable blocked signal, because the service turns
- *   it into `instrumentation.failed`.
+ *   it into `instrumentation.failed`. Before it is returned the journal is
+ *   listed once more: should it hold a record this call appended — which only
+ *   an adapter writing past its context's journal could leave unnoticed until
+ *   here — the install is unwound as an unreported modification instead, so
+ *   the sentence "no file was modified" is never said over a patched file.
  * - **An adapter failed part-way** — it rejected, returned something that is
- *   not an install result, or returned a result carrying
- *   {@link InstallResult.failure}: an action it accepted for install could not
- *   be completed (a patch refused or failed after the feasibility gate
- *   admitted it, a write-path failure, a cancellation mid-sequence). The error
- *   carries `'INSTRUMENTATION_INSTALL_FAILED'`, its `details.reason` is
- *   `'adapter-failed'`, `'invalid-result'` or `'action-failed'` respectively
- *   (`'aborted'` whenever the context's signal is aborted), and nothing that
- *   adapter armed or contributed is aggregated.
+ *   not an install result, returned a result carrying
+ *   {@link InstallResult.failure} because an action it accepted for install
+ *   could not be completed (a patch refused or failed after the feasibility
+ *   gate admitted it, a write-path failure, a cancellation mid-sequence), or
+ *   returned an otherwise ordinary result while the ledger shows it appended a
+ *   record it did not report. The error carries
+ *   `'INSTRUMENTATION_INSTALL_FAILED'`, its `details.reason` is
+ *   `'adapter-failed'`, `'invalid-result'`, `'action-failed'` or
+ *   `'unreported-modification'` respectively (`'aborted'` whenever the
+ *   context's signal is aborted), and nothing that adapter armed or contributed
+ *   is aggregated.
  *
  * Everything else returns `Ok`, including an install with a long `unavailable`
  * list: partial capability is the graceful-degradation path of AAP §0.5.5, and
@@ -509,34 +567,53 @@ interface AdapterLookup {
  * reverse-restored, latest first, through `./cleanup.ts`'s
  * `restoreModification`, which verifies each file against the record's
  * `instrumentedHash` before writing its backup back and never overwrites a file
- * a developer has edited. The set is every record the earlier groups applied,
- * then the failing adapter's own {@link InstallResult.applied}, then the record
- * it journaled for the failed attempt ({@link InstallFailure.record}) — last,
- * so it is the first restored — de-duplicated by record id. That last record
- * is settled by the reconciliation table of AAP §0.5.1: closed without a write
- * when its file still holds the original, restored when the file holds the
- * patch, reported as a conflict otherwise. Records from earlier plan versions
- * are left applied, so a failed delta leaves the project holding exactly the
- * instrumentation the previous plan version installed: a chained record's
- * backup is the *previous* instrumented content, so restoring the delta's
- * record returns the file to that state rather than to its pristine bytes.
+ * a developer has edited.
+ *
+ * The set is decided by the journal, not by what the adapters said. Two
+ * independent sources name the records this call appended: the install's
+ * ledger, which saw every append made through the journal the adapters were
+ * handed, and a second listing of the session's journal compared with the
+ * baseline, which also sees an append made past it. The set is every record
+ * either source names — whether an adapter reported it or not: an adapter that
+ * journaled a patch and then rejected, returned something that is not an
+ * install result, reported a failure without its attempt's record, or reported
+ * success without the record still has its edit unwound — together with every
+ * record an adapter reported (the earlier groups' {@link InstallResult.applied},
+ * the failing adapter's own, and the record it journaled for the failed
+ * attempt, {@link InstallFailure.record}). Each is taken in the latest state
+ * the journal holds or returned, a record already `reverted` is left out, and
+ * the set is ordered by the journal's append order (the ledger's, when the
+ * listing is unavailable), so the last write is the first restored. A record
+ * an adapter reported that neither source holds goes last, in reported order,
+ * and is attempted first. Each record is settled by the reconciliation table
+ * of AAP §0.5.1: closed without a write when its file still holds the
+ * original, restored when the file holds the patch, re-reported when it is
+ * already a conflict, and reported as a conflict otherwise. A second listing
+ * that fails therefore costs the rollback nothing it could reach through the
+ * adapters' journal: the ledger still names every record appended through it,
+ * and the error records that the listing failed. Records from earlier plan
+ * versions are left applied, so a failed delta leaves the project holding
+ * exactly the instrumentation the previous plan version installed: a chained
+ * record's backup is the *previous* instrumented content, so restoring the
+ * delta's record returns the file to that state rather than to its pristine
+ * bytes.
  * Reverse application order is what keeps a chain over one file unwound
  * strictly last-applied-first.
  *
  * Rollback outcomes are collected, never swallowed and never retried in a
  * loop: each record is attempted once, a file that may not be restored is
  * reported as a conflict with its backup retained, and every restore failure is
- * summarised in the returned error's `details` and logged. A record a failing
- * adapter journaled but reported neither in `applied` nor as its failure's
- * `record` — a rejecting adapter's, typically — is outside this call's view; it
- * is an open journal entry, which is what `./cleanup.ts`'s
- * `reconcileModifications` acts on at the next service start.
+ * summarised in the returned error's `details` and logged. `details.discovered`
+ * names the records no adapter reported, and `details.journalReread` says
+ * whether the second listing was taken (`'listed'`), could not be
+ * (`'failed'`), or was not needed because no adapter had been asked
+ * (`'not-needed'`).
  *
  * {@link InstrumentationContext.signal} is honoured between groups: an abort
  * unwinds this call's records the same way and returns the same error code.
  *
  * @param plan The normalised plan to install. Its `instrumentationTargets` are
- * the action set; its `planVersion` is *not* what the install stamps — see
+ * the action set; its `planVersion` must equal the context's — see
  * {@link AggregateInstallResult.planVersion}.
  * @param context The session's context: the project root, the state directory,
  * the code graph and queries the gate reads, the journal and backup store the
@@ -545,13 +622,17 @@ interface AdapterLookup {
  * @param options The adapters to ask, the delta to apply, and whether the gate
  * has already run.
  * @returns `ok(result)` describing everything that was enabled — even where
- * some signals were not — or `err(error)` for the two failures above.
+ * some signals were not — or `err(error)` for the four failures above.
  * @throws {DebuggenError} `'INTERNAL'` when the caller's own wiring is wrong: a
- * context with no logger, project root, plan version, journal or backup store; a
- * plan whose `instrumentationTargets` is not an array; a plan belonging to a
- * different session than the context; or no adapters at all. These say nothing
- * about the developer's project, so they are not reported as unavailable
- * signals.
+ * context with no logger, project root, plan version, journal (one that cannot
+ * append, update and list a session's records) or backup store; a plan whose
+ * `instrumentationTargets` is not an array; a plan belonging to a different
+ * session than the context; a plan whose `planVersion` differs from the
+ * context's; a delta that is not an object, whose `previousPlanVersion` is not
+ * the revision immediately before the context's, or whose `actionIds` is not
+ * an array; or no adapters at all. These say nothing about the developer's
+ * project, so they are not reported as unavailable signals — and each is
+ * thrown before any adapter is asked or the journal is touched.
  *
  * @example A session's first install
  * ```ts
@@ -582,11 +663,12 @@ export async function installPlan(
 ): Promise<Result<AggregateInstallResult>> {
   const logger = requireUsableContext(context);
   const lookup = requireAdapters(options);
-  const targets = requireInstallablePlan(plan, context, logger);
+  const targets = requireInstallablePlan(plan, context);
+  const delta = requireValidDelta(options.delta, context);
   const planVersion = context.planVersion;
-  const previousPlanVersion = options.delta?.previousPlanVersion;
+  const previousPlanVersion = delta?.previousPlanVersion;
 
-  const selected = selectActions(targets, options.delta, context, logger);
+  const selected = selectActions(targets, delta, context, logger);
   const unavailable: UnavailableSignal[] = [];
   let candidates: readonly InstrumentationAction[] = selected;
 
@@ -607,8 +689,50 @@ export async function installPlan(
     feasible: candidates.length,
     groups: grouping.groups.length,
     adapters: lookup.count,
-    delta: options.delta !== undefined,
+    delta: delta !== undefined,
   });
+
+  // Already cancelled: no adapter has been asked, so there is nothing of this
+  // call's to unwind and no reason to read the journal at all.
+  if (isAborted(context)) {
+    return err(
+      await unwind([], context, {
+        reason: 'aborted',
+        planVersion,
+        previousPlanVersion,
+        tracking: undefined,
+      }),
+    );
+  }
+
+  // The journal as it stood before this call, which is both what a rollback is
+  // measured against and the evidence the revision is checked against. Either
+  // failing refuses the install before any hook is armed or byte written.
+  const journaled = await takeJournalBaseline(context, previousPlanVersion);
+
+  if (isErr(journaled)) {
+    return err(journaled.error);
+  }
+
+  const baseline = journaled.value;
+  const contradiction = checkInstalledRevisions(baseline, context, delta);
+
+  if (contradiction !== undefined) {
+    logger.error(contradiction.message, {
+      sessionId: context.sessionId,
+      ...contradiction.details,
+    });
+
+    return err(contradiction);
+  }
+
+  // Every adapter is handed the context with its journal wrapped in this
+  // install's ledger, so each record appended through it is known the moment
+  // the journal accepts it — independently of what the adapter reports and of
+  // whether the journal can be listed again later.
+  const ledger = createInstallLedger(context.journal);
+  const tracking: InstallTracking = { baseline, ledger };
+  const adapterContext: InstrumentationContext = { ...context, journal: ledger.journal };
 
   const applied: ModificationRecord[] = [];
   const perAdapter: InstallResult[] = [];
@@ -631,15 +755,20 @@ export async function installPlan(
             adapterId: group.adapter.id,
             planVersion,
             previousPlanVersion,
+            tracking,
           }),
         );
       }
 
+      const appendsBefore = ledger.count();
       let raw: InstallResult;
 
       try {
-        raw = await group.adapter.install(group.actions, context);
+        raw = await group.adapter.install(group.actions, adapterContext);
       } catch (caught) {
+        // A rejection carries no records, but the adapter may have journaled
+        // — and written — before it rejected: `unwind` recovers those from the
+        // ledger and the journal, so its edit is reversed too.
         return err(
           await unwind(applied, context, {
             reason: 'adapter-failed',
@@ -647,6 +776,7 @@ export async function installPlan(
             planVersion,
             previousPlanVersion,
             cause: caught,
+            tracking,
           }),
         );
       }
@@ -654,12 +784,15 @@ export async function installPlan(
       const reported = readInstallResult(raw);
 
       if (reported === undefined) {
+        // Likewise: a value that is not an install result says nothing about
+        // what was written, so the ledger and the journal say it instead.
         return err(
           await unwind(applied, context, {
             reason: 'invalid-result',
             adapterId: group.adapter.id,
             planVersion,
             previousPlanVersion,
+            tracking,
           }),
         );
       }
@@ -670,8 +803,9 @@ export async function installPlan(
         // The fatal channel: an action this adapter accepted could not be
         // completed. Nothing it armed or contributed is aggregated, and every
         // record this call applied — the earlier groups', this adapter's own,
-        // and the one it journaled for the failed attempt, which goes last so
-        // it is restored first — is reverse-restored before the error returns.
+        // the one it journaled for the failed attempt, and any the journal
+        // holds that it did not mention — is reverse-restored, last write
+        // first, before the error returns.
         return err(
           await unwind(rollbackSetOf(applied, reported.applied, failure.record), context, {
             reason: isAborted(context) ? 'aborted' : 'action-failed',
@@ -680,6 +814,27 @@ export async function installPlan(
             previousPlanVersion,
             cause: failure.error,
             failure,
+            tracking,
+          }),
+        );
+      }
+
+      // An ordinary result is only as good as its `applied` list: a record this
+      // adapter appended and did not report would be missing from what the
+      // service watches and shows, and — on the nothing-enabled path — from
+      // what a failure unwinds. The ledger saw every append, so a mismatch is
+      // caught here, before anything this adapter armed is aggregated.
+      const unreported = unreportedAppends(ledger.appendedSince(appendsBefore), reported.applied);
+
+      if (unreported.length > 0) {
+        return err(
+          await unwind(rollbackSetOf(applied, reported.applied, undefined), context, {
+            reason: isAborted(context) ? 'aborted' : 'unreported-modification',
+            adapterId: group.adapter.id,
+            planVersion,
+            previousPlanVersion,
+            unreported: unreported.length,
+            tracking,
           }),
         );
       }
@@ -731,6 +886,7 @@ export async function installPlan(
         reason: 'aborted',
         planVersion,
         previousPlanVersion,
+        tracking,
       }),
     );
   }
@@ -749,12 +905,31 @@ export async function installPlan(
   const runtimeHooks = [...hooks];
 
   if (applied.length === 0 && runtimeHooks.length === 0) {
+    // A failed install, so the journal is consulted before the error is
+    // composed: a record this call appended past the adapters' journal would
+    // otherwise stay in the project under an error that says no file was
+    // modified. Nothing found — the ordinary case — costs one read.
+    const leftovers = await collectRollbackSet([], context, tracking);
+
+    if (leftovers.records.length > 0) {
+      return err(
+        await unwindCollected(leftovers, context, {
+          reason: 'unreported-modification',
+          planVersion,
+          previousPlanVersion,
+          unreported: leftovers.discovered.length,
+          tracking,
+        }),
+      );
+    }
+
     const error = nothingEnabledError(unavailable, {
       sessionId: context.sessionId,
       planVersion,
       selected: selected.length,
       feasible: candidates.length,
       adapters: lookup.count,
+      journalReread: leftovers.reread,
     });
 
     logger.error(error.message, {
@@ -872,12 +1047,16 @@ function requireUsableContext(context: InstrumentationContext): Logger {
     );
   }
 
-  if (!hasMethod(context.journal, 'append') || !hasMethod(context.journal, 'updateStatus')) {
+  if (
+    !hasMethod(context.journal, 'append') ||
+    !hasMethod(context.journal, 'updateStatus') ||
+    !hasMethod(context.journal, 'listBySession')
+  ) {
     throw new DebuggenError(
       'INTERNAL',
       'An install was given a context with no modification journal.',
       {
-        hint: "Pass the service's modification journal, which records an edit before it is written and is what a rollback transitions.",
+        hint: "Pass the service's modification journal, which records an edit before it is written, lists a session's records for the rollback baseline, and is what a rollback transitions.",
       },
     );
   }
@@ -928,25 +1107,32 @@ function requireAdapters(options: InstallPlanOptions): AdapterLookup {
  * Checks the plan can be installed against this context, and returns its
  * actions.
  *
- * A plan version that disagrees with the context's is a warning rather than a
- * refusal: the context is authoritative about which revision is being stamped
- * (see {@link AggregateInstallResult.planVersion}), and a re-install of an
- * earlier plan document under a new revision is legitimate. A *session*
- * mismatch is not: the records this install produces would be filed under the
- * context's session while the plan named another, and nothing downstream could
- * reconcile the two.
+ * Two mismatches are refused, and for the same reason: the records this
+ * install produces are stamped from the context, so a plan that names another
+ * session or another revision would have its patches filed under an identity
+ * it does not have.
+ *
+ * - A *session* mismatch would file the records under the context's session
+ *   while the plan named another, and nothing downstream could reconcile the
+ *   two.
+ * - A *revision* mismatch would do the same to the revision: the patch layer
+ *   stamps {@link InstrumentationContext.planVersion} on every record it
+ *   journals, so the journal would say revision *n* was installed while the
+ *   session holds the plan document of revision *m*, and the follow-up chain —
+ *   which cleanup unwinds by revision, and which the next delta names as its
+ *   predecessor — would describe a plan that was never installed. The caller
+ *   builds the context from the plan it installs; there is no legitimate
+ *   reason for the two to differ.
  *
  * @param plan The plan to install.
  * @param context The session's context.
- * @param logger The context's logger.
  * @returns The plan's actions.
- * @throws {DebuggenError} `'INTERNAL'` for a non-array action list or a session
- * mismatch.
+ * @throws {DebuggenError} `'INTERNAL'` for a non-array action list, a session
+ * mismatch or a revision mismatch — before anything is armed, read or written.
  */
 function requireInstallablePlan(
   plan: InstrumentationPlan,
   context: InstrumentationContext,
-  logger: Logger,
 ): readonly InstrumentationAction[] {
   const targets: unknown = plan.instrumentationTargets;
 
@@ -972,14 +1158,89 @@ function requireInstallablePlan(
   }
 
   if (plan.planVersion !== context.planVersion) {
-    logger.warn('installing a plan document whose planVersion differs from the context', {
-      sessionId: context.sessionId,
-      planVersion: context.planVersion,
-      planDocumentVersion: plan.planVersion,
-    });
+    throw new DebuggenError(
+      'INTERNAL',
+      'An install was given a plan document whose planVersion differs from the revision the context stamps on every record.',
+      {
+        hint: 'Build the install context from the plan being installed — { ...context, planVersion: plan.planVersion } — so every modification record is stamped with the revision it belongs to.',
+        details: {
+          planDocumentVersion: plan.planVersion,
+          contextPlanVersion: context.planVersion,
+        },
+      },
+    );
   }
 
   return plan.instrumentationTargets;
+}
+
+/**
+ * Checks a follow-up's delta names a usable predecessor, and returns it.
+ *
+ * A delta says "revision *previous* is installed; apply these additions as
+ * revision *n*". AAP §0.4.2 defines a follow-up that needs more evidence as
+ * plan version *n + 1* built from plan version *n*, so the predecessor must be
+ * exactly {@link InstrumentationContext.planVersion} minus one. Anything else
+ * is refused: a predecessor at or above the revision would have the rollback
+ * return the session to a revision after the one it failed to install, and one
+ * further below would skip a revision the session holds — which the journal
+ * cannot always reveal, because a revision whose signals were all runtime hooks
+ * journals nothing. That no *later* revision stands in the project is checked
+ * separately, against the baseline, by {@link checkInstalledRevisions}.
+ *
+ * @param delta The delta the caller passed, if any.
+ * @param context The session's context, whose revision was already validated.
+ * @returns The delta, or `undefined` for a whole-plan install.
+ * @throws {DebuggenError} `'INTERNAL'` for a delta that is not an object, a
+ * predecessor that is not the revision immediately before the context's, or an
+ * `actionIds` that is not an array — before anything is armed, read or
+ * written.
+ */
+function requireValidDelta(
+  delta: InstallDelta | undefined,
+  context: InstrumentationContext,
+): InstallDelta | undefined {
+  const candidate: unknown = delta;
+
+  if (candidate === undefined) {
+    return undefined;
+  }
+
+  if (typeof candidate !== 'object' || candidate === null || Array.isArray(candidate)) {
+    throw new DebuggenError('INTERNAL', 'An install was given a delta that is not an object.', {
+      hint: 'Pass options.delta as { previousPlanVersion, actionIds } for a follow-up, or omit it to install the whole plan.',
+    });
+  }
+
+  const { previousPlanVersion, actionIds } = candidate as {
+    previousPlanVersion?: unknown;
+    actionIds?: unknown;
+  };
+
+  // Revisions count from 1, so plan version 1 has no predecessor to build on.
+  if (context.planVersion < 2 || previousPlanVersion !== context.planVersion - 1) {
+    throw new DebuggenError(
+      'INTERNAL',
+      'An install was given a delta whose previous plan version is not the revision immediately before the one being installed.',
+      {
+        hint: "A follow-up's delta installs plan version n + 1 over plan version n: set previousPlanVersion to the context's planVersion minus one.",
+        details: { previousPlanVersion, planVersion: context.planVersion },
+      },
+    );
+  }
+
+  if (!Array.isArray(actionIds)) {
+    throw new DebuggenError(
+      'INTERNAL',
+      'An install was given a delta whose actionIds is not an array.',
+      {
+        hint: 'List the ids of the actions the follow-up added, drawn from the plan being installed.',
+        details: { planVersion: context.planVersion, previousPlanVersion },
+      },
+    );
+  }
+
+  return delta;
 }
 
 // ---------------------------------------------------------------------------
@@ -1009,14 +1270,6 @@ function selectActions(
   const selected = targets.filter((action) => wanted.has(action.id));
   const found = new Set(selected.map((action) => action.id));
   const missing = [...wanted].filter((id) => !found.has(id));
-
-  if (delta.previousPlanVersion >= context.planVersion) {
-    logger.warn('a delta install names a previous plan version that is not earlier', {
-      sessionId: context.sessionId,
-      planVersion: context.planVersion,
-      previousPlanVersion: delta.previousPlanVersion,
-    });
-  }
 
   if (missing.length > 0) {
     logger.warn('a delta install named actions this plan does not carry; they were ignored', {
@@ -1711,6 +1964,542 @@ function mergeServerSignals(
 }
 
 // ---------------------------------------------------------------------------
+// The journal baseline
+//
+// The session's journal is read once before the first adapter is asked and
+// once more if the install fails. The first reading is the evidence the
+// revision is checked against; the difference between the two readings is the
+// set of records this call journaled, which is what a rollback must unwind
+// whether or not an adapter reported them. Both readings go through the port,
+// and neither changes anything in it.
+// ---------------------------------------------------------------------------
+
+/**
+ * The statuses in which a record's instrumentation may still stand in the
+ * project on the journal's own account.
+ *
+ * `applied` is on disk; `pending` and `failed` are a write sequence that did
+ * not finish, whose file may hold the patch until reconciliation decides. A
+ * `conflict` is left out — the developer owns that file now, and the record is
+ * kept only so it is reported — and `reverted` is closed.
+ */
+const STANDING_STATUSES: ReadonlySet<ModificationStatus> = new Set<ModificationStatus>([
+  'applied',
+  'pending',
+  'failed',
+]);
+
+/** What the journal held for this session before the first adapter was asked. */
+interface JournalBaseline {
+  /** The id of every record the session's journal held. */
+  readonly ids: ReadonlySet<string>;
+
+  /**
+   * The records whose instrumentation may stand in the project — see
+   * {@link STANDING_STATUSES} — in append order.
+   */
+  readonly standing: readonly ModificationRecord[];
+}
+
+/**
+ * Lists this session's records through the journal port, defensively.
+ *
+ * The port promises `err` rather than an exception, and a list of the
+ * session's own records; both promises are checked rather than trusted,
+ * because the journal is caller-supplied and a rollback that believed a
+ * malformed listing would unwind the wrong set. A record of another session is
+ * dropped, and so is anything that cannot be addressed as a record.
+ *
+ * @param context The session's context.
+ * @returns The session's records in append order, or `err` with
+ * `'STORE_ERROR'`.
+ */
+async function readSessionJournal(
+  context: InstrumentationContext,
+): Promise<Result<ModificationRecord[]>> {
+  let listed: unknown;
+
+  try {
+    listed = await context.journal.listBySession(context.sessionId);
+  } catch (caught) {
+    return err(DebuggenError.from(caught, 'STORE_ERROR'));
+  }
+
+  if (typeof listed !== 'object' || listed === null || !('ok' in listed)) {
+    return err(
+      new DebuggenError(
+        'STORE_ERROR',
+        'The modification journal answered a session listing with something that is not a result.',
+        {
+          hint: "Pass a journal whose listBySession resolves to ok(records) or err(error), as the service's store does.",
+        },
+      ),
+    );
+  }
+
+  const answer = listed as Result<unknown>;
+
+  if (isErr(answer)) {
+    return err(DebuggenError.from(answer.error, 'STORE_ERROR'));
+  }
+
+  const rows = asList(answer.value);
+
+  if (rows === undefined) {
+    return err(
+      new DebuggenError(
+        'STORE_ERROR',
+        'The modification journal answered a session listing with something that is not a list.',
+        {
+          hint: "Pass a journal whose listBySession resolves to the session's records in append order.",
+        },
+      ),
+    );
+  }
+
+  return ok(rows.filter(isRecordLike).filter((record) => record.sessionId === context.sessionId));
+}
+
+/**
+ * Takes the baseline, or refuses the install because it cannot be taken.
+ *
+ * Refusing is the only safe answer to an unreadable journal: the baseline is
+ * what lets a failed install find the records an adapter journaled without
+ * reporting them, and an install started without it could leave such an edit
+ * in the project. The refusal happens before any adapter is asked, so nothing
+ * is armed and nothing is written.
+ *
+ * @param context The session's context.
+ * @param previousPlanVersion The delta's predecessor, for the error's details.
+ * @returns The baseline, or `err` with `'STORE_ERROR'` and `details.reason`
+ * `'journal-unreadable'`.
+ */
+async function takeJournalBaseline(
+  context: InstrumentationContext,
+  previousPlanVersion: number | undefined,
+): Promise<Result<JournalBaseline>> {
+  const listed = await readSessionJournal(context);
+
+  if (isErr(listed)) {
+    const details = {
+      reason: 'journal-unreadable',
+      sessionId: context.sessionId,
+      planVersion: context.planVersion,
+      previousPlanVersion,
+      code: listed.error.code,
+    };
+    const error = new DebuggenError(
+      'STORE_ERROR',
+      'The modification journal could not be read, so no instrumentation was installed: without it a failed install could not be unwound completely.',
+      {
+        hint: 'Check that the Debug Generator state directory is readable and writable, then start the session\u2019s instrumentation again. No hook was armed and no file was modified.',
+        details,
+        cause: listed.error,
+      },
+    );
+
+    context.logger.error(error.message, details);
+
+    return err(error);
+  }
+
+  return ok({
+    ids: new Set(listed.value.map((record) => record.id)),
+    standing: listed.value.filter((record) => STANDING_STATUSES.has(record.status)),
+  });
+}
+
+/**
+ * Names one or more plan versions for a sentence.
+ *
+ * @param versions The versions, ascending and de-duplicated.
+ * @returns `"plan version 2"`, `"plan versions 1 and 2"` or
+ * `"plan versions 1, 2 and 3"`.
+ */
+function planVersionsPhrase(versions: readonly number[]): string {
+  const spelled = versions.map((version) => String(version));
+  const last = spelled.at(-1) ?? '';
+
+  if (spelled.length <= 1) {
+    return `plan version ${last}`;
+  }
+
+  return `plan versions ${spelled.slice(0, -1).join(', ')} and ${last}`;
+}
+
+/**
+ * The distinct plan versions a set of records carries, ascending.
+ *
+ * @param records The records.
+ * @returns Each version once, smallest first.
+ */
+function planVersionsOf(records: readonly ModificationRecord[]): number[] {
+  return [...new Set(records.map((record) => record.planVersion))].sort(
+    (left, right) => left - right,
+  );
+}
+
+/**
+ * Checks the revision being installed against the revisions the journal says
+ * stand in the project.
+ *
+ * Two contradictions, each of which would mislabel what the session holds if
+ * the install went ahead:
+ *
+ * - **A later revision stands** — for a whole plan and a delta alike.
+ *   Installing revision *n* over records of a revision *m > n* would stamp the
+ *   older revision's patches on top of the newer ones and leave the session
+ *   claiming the older plan; for a delta it would also make the rollback's
+ *   promise — "left at plan version *n − 1*" — false.
+ * - **A whole-plan install over an earlier revision.** A whole plan re-applies
+ *   every action and the patch layer stamps each with this revision, so the
+ *   actions the earlier revision already instrumented would be patched a
+ *   second time, chained over their own instrumentation. Additions to an
+ *   installed plan are a delta's job.
+ *
+ * A delta's records below its predecessor are the earlier links of the chain
+ * it extends and are consistent; {@link requireValidDelta} has already made
+ * the predecessor the revision immediately before this one, so no revision
+ * lies between the two. Records at this very revision are consistent in every
+ * case: they are what a retried install of the same revision finds, and an
+ * adapter treats them as already applied.
+ *
+ * @param baseline The journal as it stood before this call.
+ * @param context The session's context.
+ * @param delta The delta, for a follow-up install.
+ * @returns `undefined` when the journal agrees, or the
+ * `'SESSION_INVALID_STATE'` error to refuse the install with.
+ */
+function checkInstalledRevisions(
+  baseline: JournalBaseline,
+  context: InstrumentationContext,
+  delta: InstallDelta | undefined,
+): DebuggenError | undefined {
+  const planVersion = context.planVersion;
+  const later = baseline.standing.filter((record) => record.planVersion > planVersion);
+  const earlier =
+    delta === undefined
+      ? baseline.standing.filter((record) => record.planVersion < planVersion)
+      : [];
+
+  if (later.length === 0 && earlier.length === 0) {
+    return undefined;
+  }
+
+  const conflicting = later.length > 0 ? later : earlier;
+  const named = planVersionsPhrase(planVersionsOf(conflicting));
+  let message: string;
+  let hint: string;
+
+  if (later.length > 0) {
+    message = `Plan version ${String(planVersion)} cannot be installed: this session's journal records instrumentation of ${named} standing in the project, which is later.`;
+    hint =
+      "Install the session's latest plan version, or end the session so its instrumentation is removed before an earlier plan is installed.";
+  } else {
+    message = `Plan version ${String(planVersion)} cannot be installed as a whole plan: this session's journal records instrumentation of ${named} standing in the project, and installing every action again would patch over it.`;
+    hint =
+      'Install the follow-up as a delta \u2014 options.delta naming the installed plan version and the ids of the added actions \u2014 so only the additions are applied.';
+  }
+
+  return new DebuggenError('SESSION_INVALID_STATE', message, {
+    hint,
+    details: {
+      reason: 'plan-version-conflict',
+      planVersion,
+      previousPlanVersion: delta?.previousPlanVersion,
+      installedPlanVersions: planVersionsOf(baseline.standing),
+      conflictingRecords: conflicting.map((record) => record.id).slice(0, MAX_REPORTED_ITEMS),
+      conflictingRecordCount: conflicting.length,
+    },
+  });
+}
+
+/**
+ * Every record appended through the journal an install hands its adapters.
+ *
+ * The adapters are handed the context with {@link InstallLedger.journal} in
+ * place of the session's journal. It forwards every call unchanged and
+ * remembers each record the journal accepts on `append` — in append order —
+ * together with the latest state the journal returned for it on
+ * `updateStatus`. "Which records did this call append" is therefore a fact the
+ * installer observed as it happened, not something it must reconstruct from a
+ * listing that may itself fail at the moment a rollback needs it.
+ */
+interface InstallLedger {
+  /** The journal adapters are handed: the session's, recording what it accepts. */
+  readonly journal: ModificationJournal;
+
+  /** How many records have been appended through it so far. */
+  readonly count: () => number;
+
+  /**
+   * The records appended through it from the `start`-th append onwards, in
+   * append order, each in the latest state the journal returned for it.
+   *
+   * @param start How many appends to skip; `0` for every one.
+   */
+  readonly appendedSince: (start: number) => ModificationRecord[];
+}
+
+/** What a failed install's rollback is measured against. */
+interface InstallTracking {
+  /** The session's journal as it stood before the first adapter was asked. */
+  readonly baseline: JournalBaseline;
+
+  /** Every record appended through the adapters' journal during this call. */
+  readonly ledger: InstallLedger;
+}
+
+/**
+ * The record a journal call answered with, when it answered `ok` with one.
+ *
+ * Read structurally, because the journal is caller-supplied: an answer that is
+ * not a result, or whose value cannot be addressed as a record, teaches the
+ * ledger nothing.
+ *
+ * @param answer What the journal returned.
+ * @returns The record, or `undefined`.
+ */
+function recordOfAnswer(answer: unknown): ModificationRecord | undefined {
+  if (typeof answer !== 'object' || answer === null || !('ok' in answer)) {
+    return undefined;
+  }
+
+  const result = answer as Result<unknown>;
+
+  return isErr(result) || !isRecordLike(result.value) ? undefined : result.value;
+}
+
+/**
+ * Wraps a journal in an install-scoped ledger.
+ *
+ * Every method forwards to the wrapped journal as a method call, so an
+ * implementation that relies on `this` — the service's store — behaves exactly
+ * as it would unwrapped, and every answer, rejection and exception reaches the
+ * caller untouched. Only an `ok` answer is remembered: an `append` the journal
+ * refused does not authorise the write that follows it in the patch sequence,
+ * and a record the journal persisted despite refusing is still found by the
+ * second listing.
+ *
+ * @param journal The session's journal.
+ * @returns The ledger.
+ */
+function createInstallLedger(journal: ModificationJournal): InstallLedger {
+  const order: string[] = [];
+  const latest = new Map<string, ModificationRecord>();
+
+  return {
+    journal: {
+      append: async (record: ModificationRecord): Promise<Result<ModificationRecord>> => {
+        const answer = await journal.append(record);
+        const stored = recordOfAnswer(answer);
+
+        if (stored !== undefined) {
+          if (!latest.has(stored.id)) {
+            order.push(stored.id);
+          }
+
+          latest.set(stored.id, stored);
+        }
+
+        return answer;
+      },
+      updateStatus: async (
+        id: string,
+        status: ModificationStatus,
+        patch?: ModificationStatusPatch,
+      ): Promise<Result<ModificationRecord>> => {
+        const answer = await journal.updateStatus(id, status, patch);
+        const stored = recordOfAnswer(answer);
+
+        if (stored !== undefined && latest.has(stored.id)) {
+          latest.set(stored.id, stored);
+        }
+
+        return answer;
+      },
+      listBySession: (sessionId: string): Promise<Result<ModificationRecord[]>> =>
+        journal.listBySession(sessionId),
+      listOpen: (): Promise<Result<ModificationRecord[]>> => journal.listOpen(),
+    },
+    count: (): number => order.length,
+    appendedSince: (start: number): ModificationRecord[] =>
+      order.slice(start).flatMap((id) => {
+        const record = latest.get(id);
+
+        return record === undefined ? [] : [record];
+      }),
+  };
+}
+
+/**
+ * The records an adapter appended and left out of an ordinary result.
+ *
+ * A record the adapter itself took back to `reverted` is not counted: nothing
+ * of it stands. Anything else — `applied`, or a `pending` or `failed` attempt
+ * the adapter stepped past — is a modification its result does not describe,
+ * which the adapter contract rules out.
+ *
+ * @param appended What the ledger saw the adapter append, in append order.
+ * @param reported The records the adapter reported as applied.
+ * @returns The unreported records, in append order.
+ */
+function unreportedAppends(
+  appended: readonly ModificationRecord[],
+  reported: readonly ModificationRecord[],
+): ModificationRecord[] {
+  const reportedIds = new Set(reported.map((record) => record.id));
+
+  return appended.filter((record) => record.status !== 'reverted' && !reportedIds.has(record.id));
+}
+
+/** How the second journal listing of a failed install went. */
+type JournalReread = 'listed' | 'failed' | 'not-needed';
+
+/** The records a failed install unwinds, and how they were found. */
+interface RollbackSet {
+  /** The records to reverse-restore, in application order. */
+  readonly records: ModificationRecord[];
+
+  /**
+   * The ids of the records in the set that no adapter reported — appended
+   * during this call and named by the ledger or by the second listing.
+   */
+  readonly discovered: string[];
+
+  /** Whether, and how successfully, the journal was listed again. */
+  readonly reread: JournalReread;
+}
+
+/**
+ * The records a failed install must reverse-restore, decided by what was
+ * journaled rather than by what was reported.
+ *
+ * Taken into the set:
+ *
+ * - every record this call appended, as either of two independent sources
+ *   names it — the install's ledger, which saw every append made through the
+ *   adapters' journal, and a second listing of the session's journal compared
+ *   with the baseline, which also sees an append made past it. That includes
+ *   every record no adapter mentioned: the edit of an adapter that journaled a
+ *   patch and then rejected, returned something that is not an install result,
+ *   reported a failure without its attempt's record, or reported an ordinary
+ *   result without it;
+ * - every record an adapter reported, even one that predates the baseline — an
+ *   adapter reports a record it found already applied at this revision as part
+ *   of its state, and a failed install returns the session to the revision
+ *   before this one, which that record does not belong to.
+ *
+ * Each record is taken in the latest state known for it — the listing's, then
+ * the ledger's, then the reported copy — and one already `reverted` is left
+ * out: nothing of it remains to restore.
+ *
+ * The order is application order, so that {@link rollbackApplied}, which walks
+ * it backwards, restores the last write first. With a listing: the listing's
+ * append order, then any record only the ledger holds in the ledger's order,
+ * then any reported record neither holds. When the listing fails the ledger
+ * stands in for it: reported records that predate the baseline come first —
+ * they were journaled before anything this call appended — then the ledger's
+ * records in append order, then any reported record neither the baseline nor
+ * the ledger holds. A failed listing therefore costs the rollback nothing it
+ * could reach through the adapters' journal; only an append made past that
+ * journal, which only a listing can see, is out of its reach.
+ *
+ * With no tracking — the install was cancelled before any adapter was asked —
+ * nothing of this call's can have been journaled, and nothing is read.
+ *
+ * @param reported The records the adapters reported, in application order.
+ * @param context The session's context, with the session's own journal.
+ * @param tracking The baseline and the ledger, or `undefined` when no adapter
+ * was asked.
+ * @returns The set, the unreported ids and how the listing went.
+ */
+async function collectRollbackSet(
+  reported: readonly ModificationRecord[],
+  context: InstrumentationContext,
+  tracking: InstallTracking | undefined,
+): Promise<RollbackSet> {
+  if (tracking === undefined) {
+    return { records: [...reported], discovered: [], reread: 'not-needed' };
+  }
+
+  const listed = await readSessionJournal(context);
+  const ledgered = tracking.ledger.appendedSince(0);
+  const ledgeredById = new Map(ledgered.map((record) => [record.id, record] as const));
+  const reportedIds = new Set(reported.map((record) => record.id));
+  const taken = new Set<string>();
+  const records: ModificationRecord[] = [];
+  const discovered: string[] = [];
+
+  // `appendedByThisCall` admits a record no adapter reported; a reported one
+  // is admitted either way, and a reverted one never is.
+  const take = (record: ModificationRecord, appendedByThisCall: boolean): void => {
+    if (taken.has(record.id)) {
+      return;
+    }
+
+    taken.add(record.id);
+
+    const wasReported = reportedIds.has(record.id);
+
+    if ((!appendedByThisCall && !wasReported) || record.status === 'reverted') {
+      return;
+    }
+
+    records.push(record);
+
+    if (!wasReported) {
+      discovered.push(record.id);
+    }
+  };
+
+  if (isErr(listed)) {
+    context.logger.error(
+      'the modification journal could not be re-read for a rollback; the install ledger names the records this call appended through the adapters',
+      {
+        sessionId: context.sessionId,
+        planVersion: context.planVersion,
+        reported: reported.length,
+        ledgered: ledgered.length,
+        code: listed.error.code,
+      },
+    );
+
+    for (const record of reported) {
+      if (tracking.baseline.ids.has(record.id) && !ledgeredById.has(record.id)) {
+        take(record, false);
+      }
+    }
+  } else {
+    for (const record of listed.value) {
+      take(record, !tracking.baseline.ids.has(record.id) || ledgeredById.has(record.id));
+    }
+  }
+
+  for (const record of ledgered) {
+    take(record, true);
+  }
+
+  for (const record of reported) {
+    take(ledgeredById.get(record.id) ?? record, true);
+  }
+
+  const reread: JournalReread = isErr(listed) ? 'failed' : 'listed';
+
+  if (discovered.length > 0) {
+    context.logger.warn('records of this install that no adapter reported are unwound too', {
+      sessionId: context.sessionId,
+      planVersion: context.planVersion,
+      discovered: discovered.slice(0, MAX_REPORTED_ITEMS),
+      discoveredCount: discovered.length,
+      reread,
+    });
+  }
+
+  return { records, discovered, reread };
+}
+
+// ---------------------------------------------------------------------------
 // Failure: rollback and the two errors
 // ---------------------------------------------------------------------------
 
@@ -1728,13 +2517,24 @@ function isAborted(context: InstrumentationContext): boolean {
 interface UnwindInput {
   /**
    * The condition that stopped the install: a cancellation, an adapter that
-   * rejected, a value that is not an install result, or a result that carried
-   * a failure through the fatal channel.
+   * rejected, a value that is not an install result, a result that carried a
+   * failure through the fatal channel, or a journal holding a record this call
+   * appended that no adapter's result reported.
    */
-  readonly reason: 'aborted' | 'adapter-failed' | 'invalid-result' | 'action-failed';
+  readonly reason:
+    'aborted' | 'adapter-failed' | 'invalid-result' | 'action-failed' | 'unreported-modification';
 
-  /** The adapter that was installing, when one was. */
+  /**
+   * The adapter that was installing, when one was — absent for an
+   * `'unreported-modification'` found after every adapter had answered.
+   */
   readonly adapterId?: string | undefined;
+
+  /**
+   * For `'unreported-modification'`: how many records this call appended that
+   * no adapter reported.
+   */
+  readonly unreported?: number | undefined;
 
   /** The plan revision this install was stamping. */
   readonly planVersion: number;
@@ -1752,18 +2552,31 @@ interface UnwindInput {
    * and hint are quoted; its conflict report, which holds diffs, is not copied.
    */
   readonly failure?: ReportedFailure | undefined;
+
+  /**
+   * The journal baseline and the install's ledger, which the rollback set is
+   * completed from — or `undefined` when the install stopped before any
+   * adapter was asked, so nothing of this call's can be in the journal.
+   * Required rather than optional so that no failure path can forget to state
+   * it.
+   */
+  readonly tracking: InstallTracking | undefined;
 }
 
 /**
- * The records a failed install must reverse-restore, in application order.
+ * The records the adapters reported for a failed install, in application
+ * order — the reported half of the rollback set, which
+ * {@link collectRollbackSet} completes from the install's ledger and the
+ * journal.
  *
  * The earlier groups' records, then the failing adapter's own, then the record
  * it journaled for the failed attempt — which is therefore the first one
- * {@link rollbackApplied} restores, because it is the last write that may have
- * touched the project. De-duplicated by record id with the first occurrence's
- * position kept, so an adapter that listed its failed record in both places
- * does not have it restored twice (the second attempt would find the file
- * already restored and report a conflict that is not one).
+ * {@link rollbackApplied} restores when the journal cannot place it, because
+ * it is the last write that may have touched the project. De-duplicated by
+ * record id with the first occurrence's position kept, so an adapter that
+ * listed its failed record in both places does not have it restored twice (the
+ * second attempt would find the file already restored and report a conflict
+ * that is not one).
  *
  * @param earlier The records the groups before the failing one applied.
  * @param reported The failing adapter's {@link InstallResult.applied}.
@@ -1860,17 +2673,41 @@ async function rollbackApplied(
 /**
  * The sentence describing what an unwound install left behind.
  *
+ * When the second journal listing failed, the set came from the install's
+ * ledger, which saw every record appended through the journal the adapters
+ * were handed. The sentence says exactly that — what was restored, counted
+ * over those records — and that the listing which would also have seen a
+ * record written past that journal could not be taken, instead of claiming
+ * the project is back where it was.
+ *
  * @param report What the rollback achieved.
  * @param attempted How many records it had to reverse.
  * @param previousPlanVersion The revision the session returns to, when this was
  * a delta install.
- * @returns One sentence for the error message.
+ * @param reread How the journal re-read went.
+ * @returns One or two sentences for the error message.
  */
 function describeRollback(
   report: RollbackReport,
   attempted: number,
   previousPlanVersion: number | undefined,
+  reread: JournalReread,
 ): string {
+  const settled = report.conflicts.length === 0 && report.failures.length === 0;
+
+  if (reread === 'failed') {
+    const unconfirmed =
+      'The modification journal could not be re-read to confirm that no record was written past the journal the adapters were handed.';
+
+    if (attempted === 0) {
+      return `No file modification was journaled through the adapters, so nothing had to be restored. ${unconfirmed}`;
+    }
+
+    return settled
+      ? `All ${String(attempted)} file modification(s) journaled through the adapters were restored. ${unconfirmed}`
+      : `${String(report.restored.length)} of ${String(attempted)} file modification(s) journaled through the adapters were restored; ${String(report.conflicts.length)} file(s) were left exactly as they stand and ${String(report.failures.length)} could not be restored. ${unconfirmed}`;
+  }
+
   if (attempted === 0) {
     return 'No file had been modified, so nothing had to be restored.';
   }
@@ -1880,7 +2717,7 @@ function describeRollback(
       ? 'so this install left no instrumentation in the project'
       : `so the project holds exactly the instrumentation plan version ${String(previousPlanVersion)} installed`;
 
-  if (report.conflicts.length === 0 && report.failures.length === 0) {
+  if (settled) {
     return `All ${String(attempted)} file modification(s) this install applied were restored, ${destination}.`;
   }
 
@@ -1948,28 +2785,76 @@ function failedActionFacts(failure: ReportedFailure): Record<string, unknown> {
 }
 
 /**
+ * The headline for an install stopped by a record no adapter reported.
+ *
+ * @param adapterId The adapter whose ordinary result left the record out, or
+ * `undefined` when the record was found only after every adapter had answered.
+ * @param unreported How many such records there were.
+ * @returns One sentence for the error message.
+ */
+function unreportedHeadline(adapterId: string | undefined, unreported: number): string {
+  const count = `${String(unreported)} file modification(s)`;
+
+  return adapterId === undefined
+    ? `No adapter reported enabling any instrumentation, yet this install journaled ${count} that no adapter reported.`
+    : `The adapter "${adapterId}" returned an install result that leaves out ${count} it journaled.`;
+}
+
+/**
  * Unwinds a failed or cancelled install and builds the error that reports it.
+ *
+ * The records unwound are {@link collectRollbackSet}'s: what the adapters
+ * reported, completed from the install's ledger and from the journal against
+ * the baseline, so an edit an adapter journaled without reporting is unwound
+ * too.
+ *
+ * @param reported The records the adapters reported, in application order,
+ * including a failed attempt's record last. The length of the completed set is
+ * reported as `details.attempted`.
+ * @param context The session's context, with the session's own journal.
+ * @param input Why the install stopped, and what to measure the rollback
+ * against.
+ * @returns The error to return in the failure channel.
+ */
+async function unwind(
+  reported: readonly ModificationRecord[],
+  context: InstrumentationContext,
+  input: UnwindInput,
+): Promise<DebuggenError> {
+  return unwindCollected(
+    await collectRollbackSet(reported, context, input.tracking),
+    context,
+    input,
+  );
+}
+
+/**
+ * Reverse-restores an already collected rollback set and builds the error that
+ * reports it.
  *
  * For an `'action-failed'` stop the headline names the adapter and the target
  * and quotes the failure's own message, and the hint is the failure's own hint
  * whenever the rollback left the project intact — it names the recovery for
- * the cause — falling back to the generic re-ask otherwise; a rollback that
- * left conflicts always points at them instead.
+ * the cause — falling back to the generic re-ask otherwise. An
+ * `'unreported-modification'` stop names the adapter whose result left records
+ * out, or says that none reported them, and its hint names the defect. A
+ * rollback that left conflicts always points at them instead, and one whose
+ * second journal listing failed points at the journal store, whose start-up
+ * reconciliation settles any record the ledger could not have seen.
  *
- * @param applied The rollback set: every record this install applied, in
- * application order, including a failed attempt's record last. Its length is
- * reported as `details.attempted`.
- * @param context The session's context.
+ * @param set The records to reverse-restore, from {@link collectRollbackSet}.
+ * @param context The session's context, with the session's own journal.
  * @param input Why the install stopped.
  * @returns The error to return in the failure channel.
  */
-async function unwind(
-  applied: readonly ModificationRecord[],
+async function unwindCollected(
+  set: RollbackSet,
   context: InstrumentationContext,
   input: UnwindInput,
 ): Promise<DebuggenError> {
-  const report = await rollbackApplied(applied, context);
-  const intact = report.conflicts.length === 0 && report.failures.length === 0;
+  const report = await rollbackApplied(set.records, context);
+  const settled = report.conflicts.length === 0 && report.failures.length === 0;
+  const intact = settled && set.reread !== 'failed';
   const adapter = input.adapterId ?? 'unknown';
   const headline =
     input.reason === 'aborted'
@@ -1978,22 +2863,34 @@ async function unwind(
         ? `The adapter "${adapter}" did not return an install result.`
         : input.reason === 'action-failed'
           ? failedActionHeadline(adapter, input.failure)
-          : `The adapter "${adapter}" failed while installing its share of the plan.`;
+          : input.reason === 'unreported-modification'
+            ? unreportedHeadline(input.adapterId, input.unreported ?? set.discovered.length)
+            : `The adapter "${adapter}" failed while installing its share of the plan.`;
   const failureHint = input.failure?.error.hint;
   const hint = intact
     ? input.reason === 'aborted'
       ? "Start the session's instrumentation again when you are ready to capture."
       : input.reason === 'action-failed' && isNonEmptyString(failureHint)
         ? failureHint
-        : 'Nothing from this attempt remains in the project; ask the question again to install instrumentation afresh.'
-    : 'Review the reported conflicts before installing again: the original bytes are kept in this session\u2019s backup directory and no file was overwritten.';
+        : input.reason === 'unreported-modification'
+          ? 'Nothing from this attempt remains in the project. An adapter must report every file modification it journals, so this is a defect in the adapter: report it with the service log.'
+          : 'Nothing from this attempt remains in the project; ask the question again to install instrumentation afresh.'
+    : !settled
+      ? 'Review the reported conflicts before installing again: the original bytes are kept in this session\u2019s backup directory and no file was overwritten.'
+      : "Every modification journaled through the adapters was restored, but the journal store did not answer a listing: check it before installing again. Restarting the Debug Generator service reconciles any record of this session's that is still open.";
   const details: Record<string, unknown> = {
     reason: input.reason,
     planVersion: input.planVersion,
     previousPlanVersion: input.previousPlanVersion,
     adapter: input.adapterId,
     ...(input.failure === undefined ? {} : { failedAction: failedActionFacts(input.failure) }),
-    attempted: applied.length,
+    ...(input.reason === 'unreported-modification'
+      ? { unreported: input.unreported ?? set.discovered.length }
+      : {}),
+    journalReread: set.reread,
+    discovered: set.discovered.slice(0, MAX_REPORTED_ITEMS),
+    discoveredCount: set.discovered.length,
+    attempted: set.records.length,
     restored: report.restored.map((record) => record.id).slice(0, MAX_REPORTED_ITEMS),
     restoredCount: report.restored.length,
     conflicts: report.conflicts.map((conflict) => conflict.recordId).slice(0, MAX_REPORTED_ITEMS),
@@ -2008,7 +2905,7 @@ async function unwind(
   };
   const error = new DebuggenError(
     'INSTRUMENTATION_INSTALL_FAILED',
-    `${headline} ${describeRollback(report, applied.length, input.previousPlanVersion)}`,
+    `${headline} ${describeRollback(report, set.records.length, input.previousPlanVersion, set.reread)}`,
     input.cause === undefined ? { hint, details } : { hint, details, cause: input.cause },
   );
 
@@ -2033,6 +2930,14 @@ interface NothingEnabledFacts {
 
   /** How many adapters were available to ask. */
   readonly adapters: number;
+
+  /**
+   * How the journal listing that looked for records no adapter reported went:
+   * `'listed'` when it confirmed there were none, `'failed'` when only the
+   * install's ledger — which saw nothing appended through the adapters'
+   * journal — stands behind "no file was modified".
+   */
+  readonly journalReread: JournalReread;
 }
 
 /**
@@ -2089,6 +2994,7 @@ function nothingEnabledError(
       selected: facts.selected,
       feasible: facts.feasible,
       adapters: facts.adapters,
+      journalReread: facts.journalReread,
       blockedSignal: blocked?.signal,
       unavailable: unavailable.slice(0, MAX_REPORTED_ITEMS).map((gap) => ({
         signal: gap.signal,

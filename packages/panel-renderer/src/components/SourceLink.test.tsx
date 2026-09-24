@@ -23,7 +23,10 @@
  * renders them inside one. Both paths have to work — an inert chip in the first
  * case, an interactive control in the second — so the provider-less case is
  * asserted here rather than left to an integration test that only exercises the
- * panel.
+ * panel. Inside a provider, both forms of the action contract are exercised:
+ * the view form's `onOpenSource` and the host form's `openSource`, which the
+ * chip reaches through `usePanelActions`' adapter with the same location
+ * object.
  *
  * ## No empty / loading / error state, deliberately
  *
@@ -72,7 +75,12 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Mock } from 'vitest';
 
 import { PanelActionsContext } from '../host/PanelActions';
-import type { PanelActions, PanelEventRef } from '../host/PanelActions';
+import type {
+  PanelActions,
+  PanelEventCoordinates,
+  PanelEventRef,
+  PanelHostActions,
+} from '../host/PanelActions';
 import { NOT_AVAILABLE_LABEL } from '../utils/format';
 import { SourceLink } from './SourceLink';
 
@@ -226,7 +234,7 @@ function makeOpenSourceSpy(): OpenSourceSpy {
 }
 
 /**
- * A complete host `PanelActions` whose `onOpenSource` is the given spy.
+ * A complete view-form `PanelActions` whose `onOpenSource` is the given spy.
  *
  * Both required members are supplied — a host missing either is not a host —
  * and `onSelectEvent` is a spy too, so a case can assert that activating a
@@ -386,6 +394,31 @@ describe('SourceLink activation payload', () => {
 
     // Opening source is not selecting an event; the two intents stay separate.
     expect(onSelectEvent).toHaveBeenCalledTimes(0);
+  });
+
+  it("reaches a host-form provider's openSource with the very location", async () => {
+    const location = makeLocation();
+    const openSource = makeOpenSourceSpy();
+    const selectEvent = vi.fn<(eventId: string, coordinates?: PanelEventCoordinates) => void>();
+
+    // The form the DevTools panel and the editor webview implement, provided
+    // directly: the chip reads the view form through the hook's adapter.
+    const hostActions: PanelHostActions = { selectEvent, openSource };
+
+    render(
+      <PanelActionsContext.Provider value={hostActions}>
+        <SourceLink location={location} />
+      </PanelActionsContext.Provider>,
+    );
+
+    const chip = screen.getByRole('button', { name: ACCESSIBLE_NAME });
+    expect(chip.classList.contains('dg-is-static')).toBe(false);
+
+    await clickChip(ACCESSIBLE_NAME);
+
+    // Exactly once, and the same object: the adapter forwards by reference.
+    expect(soleLocation(openSource)).toBe(location);
+    expect(selectEvent).toHaveBeenCalledTimes(0);
   });
 
   it('prefers the handler prop over the host actions', async () => {

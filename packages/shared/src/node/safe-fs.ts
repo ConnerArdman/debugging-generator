@@ -83,6 +83,18 @@
  * overwrite. No entry at the target path is destroyed without first being
  * retained and inspected, at any interleaving.
  *
+ * ## No-clobber creation, for a file that was observed to be absent
+ *
+ * {@link atomicCreateFileNoClobber} is the same guarantee for the one case the
+ * conditional writer cannot express: a target that is **not there**. There are
+ * no bytes to make the write conditional on, so the condition is absence itself,
+ * and the install is `link`, which refuses an occupied destination. A developer
+ * who recreates a deleted file between the moment it was seen missing and the
+ * moment it is restored therefore keeps their file — the restore reports that
+ * the path is occupied instead of renaming over it — and a reader never sees a
+ * half-written file either, because the content is complete and flushed under a
+ * temporary name before it is given the target's.
+ *
  * ## Pinned paths, for a path that must not be re-resolved
  *
  * {@link pinFileWithinRoot} holds the containing directory open and hands back
@@ -93,6 +105,14 @@
  * path's final component only, so a directory component replaced after the
  * check redirects everything that follows. Pinning removes the re-resolution
  * rather than repeating the check.
+ *
+ * {@link pinPrivateFileWithinRoot} is the same pin for a file inside the
+ * product's own private state tree. It starts at the state root rather than at
+ * the filesystem root, and holds every directory it descends into to the
+ * state-directory policy of {@link assertSecureDir} — real directory, owned by
+ * this account, no group or other permissions — **by inspecting the descriptor
+ * it opened** rather than the path, so the directory that was judged is the
+ * directory the following read or unlink reaches.
  *
  * ## Inspected files, for a state file another writer opens
  *
@@ -141,7 +161,8 @@ import {
   unlinkSync,
   writeSync,
 } from 'node:fs';
-import { basename, dirname, join, resolve } from 'node:path';
+import type { Stats } from 'node:fs';
+import { basename, dirname, join, relative, resolve } from 'node:path';
 
 import { DebuggenError } from '../errors.js';
 import { isWithin, toPosix } from '../paths.js';
@@ -525,11 +546,26 @@ function assertComponentSecure(componentAbs: string, requireOwner: boolean): voi
     );
   }
 
+  assertOwnershipAndMode(componentAbs, stats, requireOwner);
+}
+
+/**
+ * The owner and permission-bit half of the state-directory policy, applied to
+ * stats already read — by `lstat` of a path in {@link assertComponentSecure},
+ * or by `fstat` of an open descriptor in {@link pinPrivateFileWithinRoot}, which
+ * is what lets the second judge the very directory it will act through.
+ *
+ * Off POSIX, where there is no user id, both tests are skipped.
+ *
+ * @throws {DebuggenError} With code `FS_UNSAFE_PATH` when the directory is owned
+ * by another account (when `requireOwner`) or grants group or other access.
+ */
+function assertOwnershipAndMode(componentAbs: string, stats: Stats, requireOwner: boolean): void {
   const uid = currentUid();
   if (uid === undefined) {
     // No user id on this platform: the ownership and permission model the two
     // tests below rely on does not exist, and inventing an answer would be
-    // worse than saying so. The link and directory tests above still applied.
+    // worse than saying so. The link and directory tests still applied.
     return;
   }
 
@@ -1913,8 +1949,97 @@ export interface PinnedFile {
 export function pinFileWithinRoot(rootAbs: string, relativeFile: string): PinnedFile {
   const targetAbs = resolve(rootAbs, relativeFile);
   const directoryAbs = dirname(targetAbs);
-  const name = basename(targetAbs);
-  const descriptor = openDirectoryChain(directoryAbs);
+
+  return pinnedFileFrom(openDirectoryChain(directoryAbs), directoryAbs, basename(targetAbs));
+}
+
+/**
+ * Pins the directory holding a file inside the product's **private** state
+ * tree, verifying every directory from the state root down through the
+ * descriptor that was opened, and returns a handle whose operations cannot be
+ * redirected afterwards.
+ *
+ * The private-tree counterpart of {@link pinFileWithinRoot}, for a caller that
+ * must read or delete a file below `$DEBUGGEN_HOME` at a path it did not
+ * compose itself — a backup the journal says was moved. {@link assertSecureDir}
+ * followed by an operation *by path* would judge the directories at one instant
+ * and resolve them again at the next, so a directory swapped for a link in
+ * between would redirect the read or the unlink out of the tree (CWE-367). Here
+ * nothing is resolved twice:
+ *
+ * 1. The boundary itself is opened by its path with `O_DIRECTORY | O_NOFOLLOW`
+ *    — what lies above it is out of scope, exactly as for
+ *    {@link assertSecureDir}, but the boundary must not be a link.
+ * 2. Each component below it is opened relative to the descriptor of the one
+ *    above (through `/proc/self/fd` where the platform offers it), again with
+ *    `O_NOFOLLOW`, so a link anywhere in the chain is refused.
+ * 3. Every descriptor, the boundary's included, is held to the state-directory
+ *    policy with `fstat`: a directory, owned by this account, with no group or
+ *    other permission bits. The inode judged is the inode held.
+ *
+ * {@link PinnedFile.path} then addresses the file through the final
+ * descriptor. Where descriptors cannot be addressed as paths the walk still
+ * refuses a link at every step and judges each directory it opened, and the
+ * handle reports {@link PinnedFile.enforced} as `false`, as
+ * {@link pinFileWithinRoot} does.
+ *
+ * @param rootAbs The state root, the outermost directory held to the policy.
+ * @param relativeFile The path of the file relative to `rootAbs`. Its final
+ * component is **not** opened — it is left for the caller's own no-follow read
+ * or unlink.
+ * @returns The pinned file. The caller must `release()` it.
+ * @throws {DebuggenError} With code `INTERNAL` when `relativeFile` does not name
+ * a file below `rootAbs` (`boundary-not-an-ancestor`), which is a caller
+ * mistake; with code `FS_UNSAFE_PATH` when a directory in the chain is a
+ * symbolic link or not a directory (`symlink-component`, `not-a-directory`), is
+ * owned by another account (`foreign-owner`) or grants group or other access
+ * (`group-or-other-permissions`).
+ * @throws The runtime's own filesystem error, with its `code` intact, when a
+ * component cannot be opened: `ENOENT`, `EACCES`.
+ *
+ * @example
+ * ```ts
+ * const pinned = pinPrivateFileWithinRoot(stateRoot, 'backups/ses_1/moved/<digest>');
+ * try {
+ *   const bytes = readFileNoFollow(pinned.path);
+ * } finally {
+ *   pinned.release();
+ * }
+ * ```
+ */
+export function pinPrivateFileWithinRoot(rootAbs: string, relativeFile: string): PinnedFile {
+  const boundaryAbs = resolve(rootAbs);
+  const targetAbs = resolve(boundaryAbs, relativeFile);
+  const directoryAbs = dirname(targetAbs);
+
+  if (targetAbs === boundaryAbs || !isWithin(toPosix(boundaryAbs), toPosix(directoryAbs))) {
+    throw new DebuggenError(
+      'INTERNAL',
+      `'${relativeFile}' does not name a file below the boundary directory '${boundaryAbs}', so there is no chain of directories to pin.`,
+      {
+        hint: 'Pass the path of a file inside the boundary, relative to it.',
+        details: { path: targetAbs, upTo: boundaryAbs, reason: 'boundary-not-an-ancestor' },
+      },
+    );
+  }
+
+  return pinnedFileFrom(
+    openPrivateDirectoryChain(boundaryAbs, directoryAbs),
+    directoryAbs,
+    basename(targetAbs),
+  );
+}
+
+/**
+ * The {@link PinnedFile} over a directory descriptor that one of the pinned
+ * walks returned: the path through the descriptor, the identity check and an
+ * idempotent release. Shared so both pins hand out the same contract.
+ */
+function pinnedFileFrom(
+  descriptor: PinnedDirectoryDescriptor,
+  directoryAbs: string,
+  name: string,
+): PinnedFile {
   let released = false;
 
   const release = (): void => {
@@ -2020,6 +2145,75 @@ function openDirectoryChain(directoryAbs: string): PinnedDirectoryDescriptor {
     closeSync(fd);
     throw error;
   }
+}
+
+/**
+ * The walk behind {@link pinPrivateFileWithinRoot}: from the boundary down to
+ * `directoryAbs`, each component opened relative to the one above it with
+ * `O_NOFOLLOW`, and each descriptor — the boundary's first — held to the
+ * state-directory policy with `fstat`.
+ *
+ * Judging the descriptor rather than the path is the point: the stats come from
+ * the inode this walk is holding, so no later change to any path can make the
+ * directory that was judged differ from the directory that is used.
+ */
+function openPrivateDirectoryChain(
+  boundaryAbs: string,
+  directoryAbs: string,
+): PinnedDirectoryDescriptor {
+  const enforced = canAddressDescriptorsAsPaths();
+  const parts = relative(boundaryAbs, directoryAbs)
+    .split(/[\\/]+/u)
+    .filter((part) => part.length > 0);
+
+  // The boundary is opened by its own path — nothing above it is this walk's
+  // business — but without following a link at it.
+  let fd = openComponent(boundaryAbs, directoryAbs);
+  let walked = boundaryAbs;
+
+  try {
+    assertDescriptorSecure(fd, walked);
+
+    for (const part of parts) {
+      walked = join(walked, part);
+
+      const next = openComponent(enforced ? join(descriptorPath(fd), part) : walked, directoryAbs);
+
+      closeSync(fd);
+      fd = next;
+      assertDescriptorSecure(fd, walked);
+    }
+
+    const stats = fstatSync(fd, { bigint: true });
+
+    return { fd, identity: { dev: stats.dev, ino: stats.ino }, enforced };
+  } catch (error) {
+    // The descriptor in hand is always the one this frame owns: the previous
+    // one is closed only after its successor has been opened.
+    closeSync(fd);
+    throw error;
+  }
+}
+
+/**
+ * Holds one open directory descriptor of a private walk to the state-directory
+ * policy: a directory, owned by this account, with no group or other bits.
+ *
+ * @throws {DebuggenError} With code `FS_UNSAFE_PATH` when it fails a test.
+ */
+function assertDescriptorSecure(fd: number, componentAbs: string): void {
+  const stats = fstatSync(fd);
+
+  if (!stats.isDirectory()) {
+    throw unsafePath(
+      `'${componentAbs}' exists but is not a directory.`,
+      'not-a-directory',
+      componentAbs,
+      'Move or remove that entry so a directory can take its place.',
+    );
+  }
+
+  assertOwnershipAndMode(componentAbs, stats, true);
 }
 
 /**
@@ -2409,6 +2603,169 @@ function restoreRetained(
   }
 
   return { ...verdict, retainedAt: retainedAbs };
+}
+
+/** The outcome of {@link atomicCreateFileNoClobber}. */
+export type AtomicCreateVerdict =
+  | {
+      /** Nothing was at the path, and it now holds the new bytes in full. */
+      readonly kind: 'created';
+    }
+  | {
+      /**
+       * Something already occupied the path — a regular file, a directory, a
+       * symbolic link, even a dangling one — and **nothing was written**: the
+       * entry that is there is exactly as it was found.
+       */
+      readonly kind: 'exists';
+    };
+
+/** Options for {@link atomicCreateFileNoClobber}. */
+export interface AtomicCreateOptions {
+  /**
+   * The mode the created file is given. Defaults to `0o644`, the mode
+   * {@link atomicReplaceFile} gives a file it creates.
+   *
+   * Applied with `fchmod` as well as `open`, as {@link createFileExclusive}
+   * does, so the result does not depend on the process umask.
+   */
+  readonly mode?: number | undefined;
+
+  /**
+   * Invoked once the new content is complete and flushed under its temporary
+   * name, immediately before it is installed at the target.
+   *
+   * The same seam {@link AtomicReplaceOptions.onBeforeInstall} provides, for
+   * the same reason: the window between "the target was absent" and "the new
+   * entry is installed" is the one this function exists to make safe, and a
+   * suite passes a callback that creates a file at the target to prove the
+   * install then refuses rather than discards it. Production callers pass
+   * nothing. A throw from it propagates, after the temporary file is removed.
+   */
+  readonly onBeforeInstall?: (() => void) | undefined;
+}
+
+/**
+ * Creates a file atomically **only if nothing is at the path**, and reports
+ * rather than overwrites an entry that is.
+ *
+ * The creation counterpart of {@link atomicReplaceFileIfUnchanged}, for the one
+ * case that function refuses: a target that is absent. A restore that finds a
+ * developer's file deleted recreates it from the recorded original, and a
+ * developer can recreate the same file — from version control, from their
+ * editor's undo — between the moment it was observed missing and the moment
+ * the restore writes. {@link atomicReplaceFile} would rename over that new file
+ * and discard it with no trace (CWE-367). This function cannot: the install is
+ * a `link`, which fails when the destination exists, so the developer's file
+ * wins and the caller is told the path is occupied.
+ *
+ * ## Sequence
+ *
+ * 1. `lstat` the target. Anything there → `exists`, and no temporary file is
+ *    written for a creation already known to be refused.
+ * 2. An unpredictably named temporary sibling is created exclusively in the
+ *    same directory at the requested mode, written in full and flushed — so the
+ *    content is durable before it has the target's name.
+ * 3. The temporary file is installed at the target with `link`. `EEXIST` means
+ *    something appeared at the target since step 1: nothing is overwritten and
+ *    the verdict is `exists`.
+ * 4. The temporary name is dropped and the directory entry is flushed best
+ *    effort.
+ *
+ * Why not `open(O_CREAT | O_EXCL)` on the target itself: that is no-clobber,
+ * but the file would be visible — to a dev server's watcher, to an editor —
+ * while its bytes are still being written, and a crash part-way through would
+ * leave a truncated file at the developer's path. Creating under a temporary
+ * name and linking gives both properties at once: the target either does not
+ * exist or holds the complete content, and an occupied target is never touched.
+ *
+ * ## Crash behaviour
+ *
+ * A crash before step 3 leaves the target absent and a temporary file behind; a
+ * crash after it leaves the complete target and, at worst, a second name for it
+ * under the temporary one. Neither leaves a partial file at the target. Any
+ * failure this function can observe removes the temporary file it created and
+ * rethrows the original error.
+ *
+ * ## Symlinks
+ *
+ * A symbolic link at the target — dangling or not — is an occupied target:
+ * `lstat` reports it in step 1, and `link` refuses it in step 3 without
+ * following it. Nothing is ever written through a link. As with every project
+ * writer in this module, no directory policy is asserted: the parent is a
+ * developer's ordinary `0755` directory, and the caller has already decided it
+ * is the right one.
+ *
+ * @param path The file to create. It must not exist.
+ * @param data Text, encoded as UTF-8, or bytes written verbatim.
+ * @param opts `mode` for the new file, and the install-boundary seam.
+ * @returns `created` when the file now holds `data`, or `exists` when the path
+ * was occupied — in which case **nothing was written**.
+ * @throws The runtime's own filesystem error, with its `code` intact: `ENOENT`
+ * when the parent directory does not exist, `EACCES` when it cannot be written,
+ * `ENOSPC` when the write cannot complete, and `EPERM`/`ENOTSUP` on a
+ * filesystem that does not support hard links — in every one of those cases
+ * nothing is left at the target.
+ *
+ * @example
+ * ```ts
+ * const verdict = atomicCreateFileNoClobber(absoluteSourcePath, originalBytes);
+ * if (verdict.kind === 'exists') {
+ *   return reportConflict(); // the developer's new file is untouched
+ * }
+ * ```
+ */
+export function atomicCreateFileNoClobber(
+  path: string,
+  data: string | Uint8Array,
+  opts?: AtomicCreateOptions,
+): AtomicCreateVerdict {
+  const targetAbs = resolve(path);
+
+  if (isKnownToExist(targetAbs)) {
+    return { kind: 'exists' };
+  }
+
+  const tempAbs = temporarySiblingPath(targetAbs);
+  let installed: boolean;
+
+  try {
+    // The parent's suitability is the caller's decision, exactly as it is for
+    // the other project writers, so the temporary sibling does not re-ask.
+    createFileExclusive(tempAbs, data, {
+      mode: opts?.mode ?? DEFAULT_REPLACEMENT_FILE_MODE,
+      requireSecureParents: false,
+    });
+
+    opts?.onBeforeInstall?.();
+
+    // `link` refuses an occupied destination, so a file created at the target
+    // since the check above is reported rather than discarded.
+    installed = installByLink(tempAbs, targetAbs);
+  } catch (error) {
+    // `EEXIST` can only come from the exclusive create — `installByLink` turns
+    // its own into `false` — and only when something already occupied the
+    // temporary path, so removing it would delete a file this process never
+    // created. See `writeThenRename` for the same reasoning.
+    if (errnoCodeOf(error) !== 'EEXIST') {
+      removeQuietly(tempAbs);
+    }
+
+    throw error;
+  }
+
+  // Installed or refused, the temporary name has served its purpose: after a
+  // successful link it is a second name for the new target, and after a refusal
+  // it is the only name of content nobody will use.
+  removeQuietly(tempAbs);
+
+  if (!installed) {
+    return { kind: 'exists' };
+  }
+
+  syncDirectoryQuietly(dirname(targetAbs));
+
+  return { kind: 'created' };
 }
 
 /** What {@link existingEntryFor} found: a usable regular file, or a refusal. */

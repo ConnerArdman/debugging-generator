@@ -24,8 +24,8 @@
  *    `credentials: 'same-origin'` carries. A cart field here would be a way for
  *    a caller to check out somebody else's cart, so there is none — not even an
  *    optional one. The one identifier the body does carry names the caller's own
- *    attempt and nothing in this store, which is why it is bounded and shaped
- *    here and given no meaning at all.
+ *    attempt rather than anything this store issued, which is why it is bounded
+ *    and shaped here and given no meaning at all.
  * 3. **A JSON body carries typed values, so nothing is coerced.** Coercion
  *    belongs to the query-string surfaces, where every value arrives as text; a
  *    number or a boolean that arrives here as a string is a caller that did not
@@ -445,10 +445,11 @@ export const checkoutBodySchema = z.object({
    * already placed rather than placing a second one.
    *
    * It is accepted as the bounded opaque token it is, on the same terms as the
-   * shipping service above: the value is the caller's, it names nothing in this
-   * store, and the checkout service reads no meaning from its content - so the
-   * only requirements are that it is long enough to be a caller's own value
-   * rather than a guess, short enough to be worth remembering, and made of
+   * shipping service above: the value is the caller's, the checkout service
+   * stores it with the cart the attempt claims and looks it up only within the
+   * caller's own session, and nothing reads any meaning from its content - so
+   * the only requirements are that it is long enough to be a caller's own value
+   * rather than a guess, short enough to be worth storing, and made of
    * characters that are safe to log and to compare. A body that omits it is
    * refused here rather than treated as an unrepeatable request, because a
    * submission nobody can name is one nobody can retry safely.

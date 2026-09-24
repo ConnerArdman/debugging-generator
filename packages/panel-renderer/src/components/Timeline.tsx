@@ -24,12 +24,24 @@
  *   decided. It is walked children-only, from the roots, by
  *   `../utils/scale`'s `flattenTraceRows` — a trace node carries no parent
  *   pointer by design (a cycle is not JSON, and the tree crosses an HTTP
- *   response), so every algorithm here works top-down.
+ *   response), so every algorithm here works top-down. It resolves to `null`
+ *   when no trace in the capture matched the query, which is an empty capture
+ *   and renders the empty state rather than an error.
  * - `spans` resolves to a flat event list, one PAGE per request, and every
- *   page loaded so far is drawn together (see "Paging" below). Order is
- *   canonical (`startTime`, then the producer's own sequence) and depth is
- *   derived from the `parentSpanId` chains that are present AMONG THE LOADED
- *   ROWS. A span whose parent is simply not loaded is drawn at depth 0 and is
+ *   page loaded so far is drawn together (see "Paging" below). The loaded
+ *   rows are linked into a parent/child forest through the `parentSpanId`
+ *   each one names — looked up inside the row's own trace, since a span id is
+ *   unique only within its trace and an unfiltered page can hold several —
+ *   and the forest is flattened depth-first, so a parent is
+ *   always drawn before its children and a subtree stays contiguous — the
+ *   parent-before-child order AAP 0.2.3 fixes, which a child whose clock reads
+ *   earlier than its parent's cannot reorder. Siblings, and the roots, follow
+ *   the canonical keys: `startTime`, then `producerId`, then the producer's
+ *   own `seq`, then the store's `ingestSeq` as the final tie-break. Depth is
+ *   the walk's depth. The forest is rebuilt from every loaded row whenever a
+ *   page settles, so when a later page brings a parent, the children already
+ *   on screen move beneath it. A span whose parent is not among the loaded
+ *   rows is drawn at the top level and marked "Parent not loaded"; it is
  *   **not** called an orphan: the correlator's `orphaned` flag means "the
  *   parent never arrived at all", which is a different statement, and
  *   conflating the two would invent evidence.
@@ -335,6 +347,17 @@ interface TimelineBar {
   readonly orphaned: boolean;
   /** Why it had to, when the correlator recorded a reason. */
   readonly orphanReason?: string | undefined;
+  /**
+   * Whether this span names a parent that no loaded row carries, which is why
+   * it is drawn at the top level.
+   *
+   * A statement about THIS VIEW'S rows and never about the capture: the parent
+   * may sit on a page not loaded yet or outside the query, so this is not the
+   * correlator's {@link orphaned} flag and never sets it. Only a `spans` page
+   * can raise it — a trace's structure is the correlator's, and its orphans are
+   * already marked as such.
+   */
+  readonly parentNotLoaded: boolean;
 }
 
 /** The rows of one payload, the window they occupy and what was left out. */
@@ -523,11 +546,24 @@ function barFromTraceRow(row: FlatTraceRow): UnassignedBar {
       readStringListAttribute(attributes, LINEAGE_CANDIDATES_ATTRIBUTE),
     orphaned: row.orphaned,
     orphanReason: row.node.orphanReason,
+    // A trace's nesting is the correlator's, drawn as it stands: a parent it
+    // could not resolve is already stated through `orphaned` above.
+    parentNotLoaded: false,
   };
 }
 
-/** One flat event as a bar, at the depth the page's own parent chains imply. */
-function barFromEvent(event: TelemetryEvent, depth: number): UnassignedBar {
+/**
+ * One flat event as a bar, at the depth the parent-first walk drew it at.
+ *
+ * @param event The loaded record.
+ * @param depth Its depth in the walk of the loaded forest; `0` at a root.
+ * @param parentNotLoaded Whether it names a parent no loaded row carries.
+ */
+function barFromEvent(
+  event: TelemetryEvent,
+  depth: number,
+  parentNotLoaded: boolean,
+): UnassignedBar {
   const attributes = event.attributes;
 
   return {
@@ -550,97 +586,275 @@ function barFromEvent(event: TelemetryEvent, depth: number): UnassignedBar {
     // absent from THE LOADED ROWS is not an orphan (see this module's header).
     orphaned: readBooleanAttribute(attributes, ORPHANED_ATTRIBUTE),
     orphanReason: undefined,
+    parentNotLoaded,
   };
 }
 
 /**
- * The canonical order of a flat page: start, then the producer's own sequence.
+ * Orders two strings by UTF-16 code unit, with no locale.
  *
- * The same order the correlator establishes (AAP 0.2.3) — two producers can
- * share a millisecond, so the producer and its monotonic counter are what make
- * the order total — with the event id as a final tie-break so that a page
- * containing two records of one instant from one producer still sorts the same
- * way on every render.
+ * `localeCompare` would make the order depend on the host's locale data, so two
+ * machines could draw one capture in two orders; plain `<`/`>` is the whole of
+ * the comparison.
  */
-function compareSpans(left: TelemetryEvent, right: TelemetryEvent): number {
-  if (left.startTime !== right.startTime) {
-    return left.startTime - right.startTime;
-  }
-  if (left.producerId !== right.producerId) {
-    return left.producerId < right.producerId ? -1 : 1;
-  }
-  if (left.seq !== right.seq) {
-    return left.seq - right.seq;
-  }
-  if (left.id === right.id) {
-    return 0;
+function compareCodeUnits(left: string, right: string): number {
+  if (left < right) {
+    return -1;
   }
 
-  return left.id < right.id ? -1 : 1;
+  return left > right ? 1 : 0;
 }
 
 /**
- * The depth of one span, from the parent chains present in the page.
+ * The SIBLING order of a flat page: the canonical keys AAP 0.2.3 fixes, each
+ * reached only when every earlier key ties — `startTime`, then `producerId`,
+ * then the producer's own `seq`, then the store's `ingestSeq` — with the event
+ * id as defence in depth.
  *
- * Iterative and memoized: the chain is walked upwards collecting the spans
- * whose depth is not known yet, and the depths are then written back down it,
- * so a page of five thousand spans costs one pass rather than one pass per row.
+ * It orders siblings, and the roots of the loaded forest, and nothing else.
+ * Parent-before-child outranks every one of these keys and is established by
+ * the walk in {@link flattenParentFirst}, never by a timestamp: the browser and
+ * the server read two clocks and no alignment is applied, so a child's start
+ * can legitimately read earlier than its parent's.
  *
- * Two cases end the walk at depth `0`: a parent that is not in the page — which
- * says nothing about whether the parent ever existed, only that this page does
- * not hold it — and a chain that returns to a span already on the walk, which a
- * well-formed page cannot contain but a corrupted one could. Neither throws,
- * and neither drops a row.
+ * A local mirror of `@debuggen/telemetry`'s `compareEventsCanonical`, key for
+ * key and comparison for comparison. It is mirrored rather than imported
+ * because this package depends on telemetry for types only (AAP 0.2.2), and
+ * importing the function would add a runtime edge the layering forbids. Like
+ * that function it compares with `<`/`>` alone, so a non-finite number — which
+ * the event schema rejects, but which a store an older build wrote could still
+ * hand over — falls through to the next key instead of returning `NaN` into the
+ * sort. `ingestSeq` is distinct for every stored row, which is what makes the
+ * order total; the id only separates hand-built or replayed records that reuse
+ * an arrival number, so the order still never depends on the sort algorithm.
+ *
+ * @param left The first record.
+ * @param right The second record.
+ * @returns Negative when `left` sorts first, positive when `right` does, and `0`
+ * only for two records that tie on every key.
  */
-function resolveDepth(
-  spanId: string,
-  eventsBySpanId: ReadonlyMap<string, TelemetryEvent>,
-  depths: Map<string, number>,
-): number {
-  const known = depths.get(spanId);
-  if (known !== undefined) {
-    return known;
+function compareSpans(left: TelemetryEvent, right: TelemetryEvent): number {
+  if (left.startTime < right.startTime) {
+    return -1;
+  }
+  if (left.startTime > right.startTime) {
+    return 1;
+  }
+  if (left.producerId !== right.producerId) {
+    return compareCodeUnits(left.producerId, right.producerId);
+  }
+  if (left.seq < right.seq) {
+    return -1;
+  }
+  if (left.seq > right.seq) {
+    return 1;
+  }
+  if (left.ingestSeq < right.ingestSeq) {
+    return -1;
+  }
+  if (left.ingestSeq > right.ingestSeq) {
+    return 1;
   }
 
-  const pending: string[] = [];
-  const visiting = new Set<string>();
-  // The depth of whatever sits above the last pending span. `-1` means "nothing
-  // sits above it", which makes that last span a root at depth `0`.
-  let anchorDepth = -1;
-  let cursor: string | undefined = spanId;
+  return compareCodeUnits(left.id, right.id);
+}
 
-  while (cursor !== undefined) {
-    const cached = depths.get(cursor);
-    if (cached !== undefined) {
-      anchorDepth = cached;
-      break;
+/**
+ * The identity a parent lookup resolves: a span id WITHIN its trace.
+ *
+ * W3C Trace Context makes a span id unique only inside the trace that carries
+ * it, and a `spans` query with no `traceId` filter returns rows from several
+ * traces at once. Keying a lookup by the bare span id would let a colliding id
+ * in another trace pose as a row's parent — suppressing the "Parent not
+ * loaded" mark and drawing a connector across two traces — so every parent,
+ * carrier, child, claim and connector lookup in this file goes through this
+ * key. The trace id is length-prefixed, which keeps the key unambiguous
+ * whatever characters a stored id holds.
+ *
+ * @param traceId The trace the span belongs to.
+ * @param spanId The span id, inside that trace.
+ * @returns A key equal for two spans exactly when both ids are.
+ */
+function traceSpanKey(traceId: string, spanId: string): string {
+  return `${String(traceId.length)}:${traceId}:${spanId}`;
+}
+
+/** One pending step of the parent-first walk: a record and the depth it is drawn at. */
+interface SpanWalkStep {
+  /** The record to emit. */
+  readonly event: TelemetryEvent;
+  /** Its distance from the root the walk started at. */
+  readonly depth: number;
+}
+
+/**
+ * The loaded rows of a flat span list, linked into a parent/child forest and
+ * flattened parent-first.
+ *
+ * The rows are sorted by {@link compareSpans} and every row is then filed under
+ * the span id it names as its parent, in that order, so each span's children
+ * are already its siblings in canonical order. A row is a ROOT when it names no
+ * parent, or when no loaded record other than itself carries the span id it
+ * names. A record naming its own span id with no duplicate is therefore a root;
+ * one naming a span id that no loaded record carries at all is a root marked
+ * {@link TimelineBar.parentNotLoaded}, because its parent may sit on a page not
+ * loaded yet or outside the query. Neither is the correlator's `orphaned`.
+ *
+ * A parent is always looked for in the row's OWN trace: every carrier, child,
+ * claim and climb below is keyed by {@link traceSpanKey}, never by the bare
+ * span id, so on a page holding several traces a colliding span id in another
+ * trace can neither supply a missing parent nor draw a connector, and each
+ * trace keeps its own parent-before-child order.
+ *
+ * The roots are walked in canonical order, depth-first and pre-order, and a
+ * row's depth is the walk's depth. The walk is iterative, on an explicit stack,
+ * because a result is paged at up to `DATA_QUERY_MAX_LIMIT` rows per page with
+ * no bound on the number of pages, and a parent chain that long would overflow
+ * the call stack of a recursive walk.
+ *
+ * Two records of one trace can carry one span id (a trace reports them as
+ * `duplicateSpanIds`). That span's children expand under the FIRST-VISITED
+ * record carrying it — it claims the span, and a later record of the same span
+ * expands nothing — which is exactly the record `buildGeometry`'s
+ * first-bar-per-span lookup resolves, so every connector joins the record its
+ * child is drawn beneath. A set of visited event ids — the identity the pages
+ * were de-duplicated on — emits each record once.
+ *
+ * A parent cycle among the loaded rows (`A` names `B`, `B` names `A`), which a
+ * well-formed capture cannot contain but a corrupted store could, leaves rows
+ * that no root reaches: the cycle's members and every row hanging beneath
+ * them. Once the roots are exhausted, each such component is entered at a row
+ * ON its cycle — found by climbing the named parents from the canonically
+ * first unreached row until the climb returns to a row it already passed — and
+ * walked the same way, until every row has been emitted. A row hanging beneath
+ * a cycle is therefore still drawn after its parent; only the one connector
+ * that closes the cycle points backwards, since no order can place every
+ * member of a cycle after its own parent. Nothing is dropped and nothing
+ * throws.
+ *
+ * @param events Every row loaded so far, de-duplicated by event id, in any order.
+ * @returns One bar per row, parents before their children.
+ */
+function flattenParentFirst(events: readonly TelemetryEvent[]): readonly UnassignedBar[] {
+  const ordered = [...events].sort(compareSpans);
+
+  // The key of the span a row names as its parent, inside the row's own trace,
+  // or `undefined` for a row that names none.
+  const parentKeyOf = (event: TelemetryEvent): string | undefined =>
+    event.parentSpanId === undefined ? undefined : traceSpanKey(event.traceId, event.parentSpanId);
+
+  // How many loaded records carry each span (trace and span id): the question
+  // "is this parent loaded?" and, with the row itself subtracted, "is it loaded
+  // as anything other than this row?".
+  const carriers = new Map<string, number>();
+  // The canonically first record carrying each span: the parent a climb toward
+  // a cycle follows (see `cycleEntryFrom` below).
+  const firstCarrierByKey = new Map<string, TelemetryEvent>();
+  for (const event of ordered) {
+    const key = traceSpanKey(event.traceId, event.spanId);
+    carriers.set(key, (carriers.get(key) ?? 0) + 1);
+    if (!firstCarrierByKey.has(key)) {
+      firstCarrierByKey.set(key, event);
     }
-    if (visiting.has(cursor)) {
-      break;
-    }
-
-    visiting.add(cursor);
-    pending.push(cursor);
-
-    // Annotated, because the loop's assignment below makes the two variables
-    // mutually dependent and an inferred type here would be circular (TS7022).
-    const parentSpanId: string | undefined = eventsBySpanId.get(cursor)?.parentSpanId;
-    cursor =
-      parentSpanId !== undefined && parentSpanId !== cursor && eventsBySpanId.has(parentSpanId)
-        ? parentSpanId
-        : undefined;
   }
 
-  for (let index = pending.length - 1; index >= 0; index -= 1) {
-    const entry = pending[index];
-    if (entry === undefined) {
+  const roots: TelemetryEvent[] = [];
+  const childrenByParentKey = new Map<string, TelemetryEvent[]>();
+  for (const event of ordered) {
+    const parentKey = parentKeyOf(event);
+    const otherCarriers =
+      parentKey === undefined
+        ? 0
+        : (carriers.get(parentKey) ?? 0) - (event.parentSpanId === event.spanId ? 1 : 0);
+
+    if (parentKey === undefined || otherCarriers <= 0) {
+      roots.push(event);
       continue;
     }
-    anchorDepth += 1;
-    depths.set(entry, anchorDepth);
+
+    const siblings = childrenByParentKey.get(parentKey);
+    if (siblings === undefined) {
+      childrenByParentKey.set(parentKey, [event]);
+    } else {
+      siblings.push(event);
+    }
   }
 
-  return depths.get(spanId) ?? 0;
+  const bars: UnassignedBar[] = [];
+  const visitedEventIds = new Set<string>();
+  const claimedKeys = new Set<string>();
+  const stack: SpanWalkStep[] = [];
+
+  const walkFrom = (start: TelemetryEvent): void => {
+    stack.push({ event: start, depth: 0 });
+
+    while (stack.length > 0) {
+      const step = stack.pop();
+      if (step === undefined || visitedEventIds.has(step.event.id)) {
+        continue;
+      }
+
+      const { event, depth } = step;
+      visitedEventIds.add(event.id);
+      const parentKey = parentKeyOf(event);
+      bars.push(barFromEvent(event, depth, parentKey !== undefined && !carriers.has(parentKey)));
+
+      const key = traceSpanKey(event.traceId, event.spanId);
+      if (claimedKeys.has(key)) {
+        continue;
+      }
+      claimedKeys.add(key);
+
+      // Pushed last-first, so the canonically first child is popped — and
+      // emitted, with its whole subtree — before its next sibling.
+      const children = childrenByParentKey.get(key) ?? [];
+      for (let index = children.length - 1; index >= 0; index -= 1) {
+        const child = children[index];
+        if (child !== undefined && !visitedEventIds.has(child.id)) {
+          stack.push({ event: child, depth: depth + 1 });
+        }
+      }
+    }
+  };
+
+  // The row a component no root reached is entered at: climb the named parents
+  // from `from` until the climb returns to a row it already passed, which is a
+  // row on the component's cycle. Every row a root did not reach names a parent
+  // that no reached record carries (a reached carrier would have claimed that
+  // span and expanded the row), so the climb stays among unreached rows of the
+  // same trace; the visited check only makes that explicit. Each climb is
+  // bounded by the rows it passes, and the walk that follows reaches every one
+  // of them.
+  const cycleEntryFrom = (from: TelemetryEvent): TelemetryEvent => {
+    const climbed = new Set<string>();
+    let cursor = from;
+
+    while (!climbed.has(cursor.id)) {
+      climbed.add(cursor.id);
+
+      const parentKey = parentKeyOf(cursor);
+      const parent = parentKey === undefined ? undefined : firstCarrierByKey.get(parentKey);
+      if (parent === undefined || visitedEventIds.has(parent.id)) {
+        return cursor;
+      }
+      cursor = parent;
+    }
+
+    return cursor;
+  };
+
+  for (const root of roots) {
+    if (!visitedEventIds.has(root.id)) {
+      walkFrom(root);
+    }
+  }
+  for (const event of ordered) {
+    if (!visitedEventIds.has(event.id)) {
+      walkFrom(cycleEntryFrom(event));
+    }
+  }
+
+  return bars;
 }
 
 /** The bound the trace walk runs under. */
@@ -696,25 +910,16 @@ function modelFromTrace(tree: TraceTree): TimelineModel {
 
 /**
  * The loaded rows of a flat span list — every page loaded so far, already
- * de-duplicated — as rows, ordered canonically and depth-derived.
+ * de-duplicated — as rows, parent before child.
+ *
+ * The order is {@link flattenParentFirst}'s: the loaded rows linked into a
+ * parent/child forest and walked depth-first, with {@link compareSpans}
+ * ordering siblings. It is recomputed from every loaded row each time a page
+ * settles, so a page that brings a parent re-links the children already on
+ * screen beneath it, and clears their "Parent not loaded" mark.
  */
 function modelFromSpans(events: readonly TelemetryEvent[]): TimelineModel {
-  const ordered = [...events].sort(compareSpans);
-
-  const eventsBySpanId = new Map<string, TelemetryEvent>();
-  for (const event of ordered) {
-    // First occurrence wins. A capture can legitimately hold two records under
-    // one span id (a trace reports them as `duplicateSpanIds`), and a parent
-    // lookup has to resolve to one of them deterministically.
-    if (!eventsBySpanId.has(event.spanId)) {
-      eventsBySpanId.set(event.spanId, event);
-    }
-  }
-
-  const depths = new Map<string, number>();
-  const bars = ordered.map((event) =>
-    barFromEvent(event, resolveDepth(event.spanId, eventsBySpanId, depths)),
-  );
+  const bars = flattenParentFirst(events);
   const { rows, tiers } = assignLanes(bars);
   const window = boundsOfBars(bars);
 
@@ -914,13 +1119,19 @@ function buildGeometry(model: TimelineModel): TimelineGeometry {
     };
   });
 
-  // The first bar carrying a span id answers a parent lookup, matching the
-  // first-occurrence rule the flat payload resolves parents under, so a capture
-  // holding two records of one span id cannot make a connector ambiguous.
-  const barsBySpanId = new Map<string, BarGeometry>();
+  // The first bar carrying a span — a span id inside its own trace, the key
+  // `traceSpanKey` builds — answers a parent lookup, so a colliding span id in
+  // another trace on the same page never receives a connector. The bars are in
+  // the model's row order, and on a flat page that is the parent-first walk's
+  // order, in which the first record carrying a span is the one that claimed it
+  // and had that span's children expanded beneath it. So every connector joins
+  // the record its child is drawn under, and a capture holding two records of
+  // one span cannot make a connector ambiguous.
+  const barsBySpan = new Map<string, BarGeometry>();
   for (const bar of bars) {
-    if (!barsBySpanId.has(bar.row.spanId)) {
-      barsBySpanId.set(bar.row.spanId, bar);
+    const key = traceSpanKey(bar.row.traceId, bar.row.spanId);
+    if (!barsBySpan.has(key)) {
+      barsBySpan.set(key, bar);
     }
   }
 
@@ -931,7 +1142,7 @@ function buildGeometry(model: TimelineModel): TimelineGeometry {
       continue;
     }
 
-    const parent = barsBySpanId.get(parentSpanId);
+    const parent = barsBySpan.get(traceSpanKey(bar.row.traceId, parentSpanId));
     if (parent === undefined || parent === bar) {
       // The parent is not on screen — not on this page, or above the walk's
       // bound. The row is still drawn; only the connector is absent, because a
@@ -989,12 +1200,13 @@ function statusToneFor(status: TelemetryStatus): BadgeTone {
 }
 
 /**
- * What the pipeline recorded about how this row joined its trace, as a
- * sentence — or nothing, when it joined the ordinary way.
+ * What the pipeline recorded about how this row joined its trace, and where
+ * this view could not place it under its parent, as a sentence — or nothing,
+ * when it joined the ordinary way and is drawn under its parent.
  *
- * The dashed edge and the orphan mark are visual signals, and a visual signal
- * is never the only signal: everything they mean is also stated here, in the
- * row's description and its detail strip.
+ * The dashed edge, the orphan mark and the "Parent not loaded" flag are visual
+ * signals, and a visual signal is never the only signal: everything they mean
+ * is also stated here, in the row's description and its detail strip.
  */
 function lineageNoteFor(row: TimelineBar): string | undefined {
   const notes: string[] = [];
@@ -1004,6 +1216,11 @@ function lineageNoteFor(row: TimelineBar): string | undefined {
       row.orphanReason === undefined
         ? 'Re-attached to the root: this span names a parent that never arrived.'
         : `Re-attached to the root (${row.orphanReason}): the parent this span names never arrived.`,
+    );
+  }
+  if (row.parentNotLoaded && row.parentSpanId !== undefined) {
+    notes.push(
+      `Its parent span ${row.parentSpanId} is not among the spans loaded here — it may be on a page not yet loaded or outside this query — so this span is drawn at the top level.`,
     );
   }
   if (row.lineage !== undefined) {
@@ -1352,6 +1569,13 @@ function timelineColumns(
               Ambiguous parent
             </Badge>
           ) : null}
+          {row.parentNotLoaded ? (
+            // Informational rather than a warning: nothing was lost, this view
+            // just does not hold the parent (see the module header).
+            <Badge variant="outline" tone="info">
+              Parent not loaded
+            </Badge>
+          ) : null}
         </Stack>
       ),
     },
@@ -1502,12 +1726,14 @@ function rowWithId(
  * query changes returns to its first page with no reset write anywhere, and no
  * frame ever mixes the rows of two queries.
  *
- * The rows on screen are the accumulated rows followed by the page that
- * settled, each event once, first occurrence kept, in the order the service
- * delivered them. The service's stable ordering means a page does not repeat a
- * row, so the de-duplication is a guard rather than a correction: a capture
- * that grew between two requests can push a row across a page boundary, and
- * drawing it twice would double-count real work.
+ * The rows loaded are the accumulated rows followed by the page that settled,
+ * each event once, first occurrence kept, in the order the service delivered
+ * them; the model then draws them parent-first (see this module's header), so a
+ * page that brings a parent moves its loaded children beneath it. The service's
+ * stable ordering means a page does not repeat a row, so the de-duplication is
+ * a guard rather than a correction: a capture that grew between two requests
+ * can push a row across a page boundary, and drawing it twice would
+ * double-count real work.
  * ---------------------------------------------------------------------------
  */
 
@@ -1548,7 +1774,11 @@ const LOAD_MORE_LABEL = 'Load more spans';
 /** The same control while that page is in flight: the appending indicator. */
 const LOADING_MORE_LABEL = 'Loading more spans…';
 
-/** The title shown for a resolved span page that held nothing but named a next page. */
+/**
+ * The title shown for a resolved span page that held nothing while the result
+ * may not: one that named a next page, one short of or past the end of a
+ * positive total, and one past the first row of a result with no total.
+ */
 const EMPTY_PAGE_TITLE = 'Nothing on this page';
 
 /**
@@ -1564,6 +1794,118 @@ const PAGE_ERROR_TITLE = 'The next page of spans could not be loaded';
 /** The footer failure's message when the provider's error carried none. */
 const PAGE_ERROR_MESSAGE =
   'The spans already shown are unaffected; retry to request the page again.';
+
+/** What one empty state says: its short label and the sentence beneath it. */
+interface EmptyCopy {
+  /** The label above the message. */
+  readonly title: string;
+  /** The sentence that explains the absence. */
+  readonly message: string;
+}
+
+/**
+ * The empty state for a result that holds nothing this view can draw: an empty
+ * correlated trace, or a span result whose total is zero (or unreported, on its
+ * first page). Only here does the view say that nothing was captured.
+ */
+const NOTHING_CAPTURED_COPY: EmptyCopy = Object.freeze({
+  title: 'Nothing to place on the axis',
+  message: 'No correlated spans were captured for this interaction.',
+});
+
+/** The title for a span query authored with `limit: 0`: a total without rows. */
+const COUNT_ONLY_TITLE = 'Count only';
+
+/** The noun for `count` spans, singular exactly when there is one. */
+function spanNoun(count: number): string {
+  return count === 1 ? 'span' : 'spans';
+}
+
+/**
+ * The empty state of a resolved span page that put nothing on the axis, with
+ * nothing carried from earlier pages and no next page to offer.
+ *
+ * An empty PAGE is not an empty CAPTURE. The query contract makes `limit: 0`
+ * an explicit request for a total without rows, and an offset past the end an
+ * empty page rather than an error; in both the service may report a positive
+ * total. Saying "nothing was captured" there would contradict the total it
+ * just reported, so the cases are told apart, most specific first:
+ *
+ * 1. `limit: 0` — the count-only view the panel asked for, stating the total
+ *    when one was reported. No row is ever expected, so nothing is missing.
+ * 2. A total of zero, or no total on the first page — the capture holds no
+ *    matching span, and only this case says so.
+ * 3. A positive total no greater than the page's offset — the page starts
+ *    past the end of the result, and its position and the total are stated.
+ * 4. A positive total greater than the page's offset — the rows exist but
+ *    none are on this page, and the total is stated.
+ * 5. No total, past the first row — the page's position is stated and nothing
+ *    is claimed about the rest of the result.
+ *
+ * A reported total that is not a safe non-negative integer is treated as
+ * unreported rather than printed: the seam does not validate it, and a count
+ * the reader cannot trust is worse than none.
+ *
+ * @param limit The page size the request carried, already inside the
+ * contract's bounds.
+ * @param offset The offset of the page that resolved: the authored offset, or
+ * the forward-moving `nextOffset` a previous page named — a non-negative safe
+ * integer either way.
+ * @param total The total the service reported for the whole span result.
+ * @returns The title and message of the empty state to render.
+ *
+ * @example A `limit: 0` query answered with `total: 42`.
+ * ```ts
+ * emptySpanPageCopy(0, 0, 42);
+ * // { title: 'Count only',
+ * //   message: 'This view requests a count without rows: 42 spans matched its query.' }
+ * ```
+ */
+function emptySpanPageCopy(limit: number, offset: number, total: number | undefined): EmptyCopy {
+  const reported =
+    total !== undefined && Number.isSafeInteger(total) && total >= 0 ? total : undefined;
+
+  if (limit === 0) {
+    return {
+      title: COUNT_ONLY_TITLE,
+      message:
+        reported === undefined
+          ? 'This view requests a count without rows, and no total was reported for its query.'
+          : `This view requests a count without rows: ${formatCount(reported)} ${spanNoun(
+              reported,
+            )} matched its query.`,
+    };
+  }
+
+  if (reported === 0 || (reported === undefined && offset === 0)) {
+    return NOTHING_CAPTURED_COPY;
+  }
+
+  if (reported === undefined) {
+    return {
+      title: EMPTY_PAGE_TITLE,
+      message: `This page starts at position ${formatCount(
+        offset + 1,
+      )} and holds no spans; no total was reported for this query.`,
+    };
+  }
+
+  if (offset >= reported) {
+    return {
+      title: EMPTY_PAGE_TITLE,
+      message: `This page starts at position ${formatCount(offset + 1)}, past the end of the ${formatCount(
+        reported,
+      )} ${spanNoun(reported)} that matched this query.`,
+    };
+  }
+
+  return {
+    title: EMPTY_PAGE_TITLE,
+    message: `${formatCount(reported)} ${spanNoun(
+      reported,
+    )} matched this query, but none are shown on this page.`,
+  };
+}
 
 /**
  * The offset of the page after the one requested at `offset`, or `undefined`
@@ -1785,8 +2127,13 @@ function TimelineView(props: TimelineProps): ReactElement {
   );
 
   const model = useMemo<TimelineModel | undefined>(() => {
+    // `undefined` while the trace query is unsettled, failed or inactive, and
+    // `null` when it settled with no matching trace — the service's own answer
+    // for a capture that collected nothing correlated. Neither is a tree to
+    // walk: the model stays undefined, and a settled `null` renders the empty
+    // state below, never an error.
     const tree = traceResult.data;
-    if (tree !== undefined) {
+    if (tree !== undefined && tree !== null) {
       return modelFromTrace(tree);
     }
 
@@ -1923,12 +2270,16 @@ function TimelineView(props: TimelineProps): ReactElement {
     );
   } else if (
     (model === undefined || geometry === undefined || model.rows.length === 0) &&
-    nextPageOffset !== undefined
+    nextPageOffset !== undefined &&
+    pageLimit > 0
   ) {
     // A resolved span page with nothing on it that still names where the next
     // page starts. The provider's offset is the whole of the paging contract,
     // so the rows after it stay reachable: the page is reported as empty —
     // never the capture — and the paging control is offered as under a full page.
+    // A count-only query (`limit: 0`) is excluded: every page it could reach is
+    // requested at the same zero size and holds no rows, so a paging control
+    // would advance through nothing. It falls through to its count-only state.
     content = (
       <>
         <div className="dg-timeline__empty">
@@ -1947,12 +2298,19 @@ function TimelineView(props: TimelineProps): ReactElement {
       </>
     );
   } else if (model === undefined || geometry === undefined || model.rows.length === 0) {
+    // Nothing on the axis and no next page to offer. A trace reports no total,
+    // so an empty one is an empty capture. A resolved span page is told apart
+    // by the size and position it was requested at and the total the service
+    // reported (see `emptySpanPageCopy`): a count-only query, a page past the
+    // end or a page short of it is never reported as an empty capture.
+    const empty =
+      source === 'spans' && spansResult.status === 'success'
+        ? emptySpanPageCopy(pageLimit, pageOffset, knownTotal)
+        : NOTHING_CAPTURED_COPY;
+
     content = (
       <div className="dg-timeline__empty">
-        <EmptyState
-          title="Nothing to place on the axis"
-          message="No correlated spans were captured for this interaction."
-        />
+        <EmptyState title={empty.title} message={empty.message} />
       </div>
     );
   } else {

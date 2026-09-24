@@ -110,6 +110,7 @@ import {
   rmSync,
   statSync,
   symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -124,6 +125,7 @@ import {
   SECURE_DIR_MODE,
   SECURE_FILE_MODE,
   assertSecureDir,
+  atomicCreateFileNoClobber,
   atomicReplaceFile,
   atomicReplaceFileIfUnchanged,
   createFileExclusive,
@@ -131,6 +133,7 @@ import {
   inspectPrivateFileNoFollow,
   isSameFileIdentity,
   pinFileWithinRoot,
+  pinPrivateFileWithinRoot,
   readFileNoFollow,
   readFileSnapshotNoFollow,
   writeSecureFileAtomic,
@@ -2312,6 +2315,158 @@ describe('atomicReplaceFileIfUnchanged', () => {
 
 /*
  * ---------------------------------------------------------------------------
+ * atomicCreateFileNoClobber
+ * ---------------------------------------------------------------------------
+ *
+ * The creation half of "a developer's file is never overwritten": a target that
+ * was observed missing is recreated only while it is still missing, and a file
+ * that appears in between — at any instant, including the last one before the
+ * install — is reported and left exactly as it was.
+ */
+
+describe('atomicCreateFileNoClobber', () => {
+  /** The bytes a caller recreates a missing file with. */
+  const RECREATED = 'export function work(): void {}\n';
+
+  /** What a developer writes at the same path in the meantime. */
+  const DEVELOPER_FILE = 'export function work(): number {\n  return 1;\n}\n';
+
+  it('creates an absent file with exactly the given bytes and leaves nothing behind', () => {
+    const target = join(sandbox, 'source.ts');
+
+    expect(atomicCreateFileNoClobber(target, RECREATED)).toEqual({ kind: 'created' });
+
+    expectFileBytes(target, RECREATED);
+    expect(lstatSync(target).isFile()).toBe(true);
+    // One name only: the temporary one the content was written under is gone.
+    expect(lstatSync(target).nlink).toBe(1);
+    expect(temporaryLeftoversIn(sandbox)).toEqual([]);
+  });
+
+  it.skipIf(NO_POSIX_IDS)(
+    'gives the created file 0644 by default and an explicit mode exactly (POSIX permission bits)',
+    () => {
+      const defaulted = join(sandbox, 'defaulted.ts');
+      const explicit = join(sandbox, 'explicit.ts');
+
+      atomicCreateFileNoClobber(defaulted, RECREATED);
+      // A group bit the common `umask 022` masks: this is the assertion that
+      // fails if the mode stops being re-applied after the temporary is opened.
+      atomicCreateFileNoClobber(explicit, RECREATED, { mode: GROUP_WRITABLE_FILE_MODE });
+
+      expect(octal(permissionsOf(defaulted))).toBe(octal(PROJECT_FILE_MODE));
+      expect(octal(permissionsOf(explicit))).toBe(octal(GROUP_WRITABLE_FILE_MODE));
+    },
+  );
+
+  it('writes bytes verbatim, including content that is not valid UTF-8', () => {
+    const target = join(sandbox, 'source.bin');
+
+    expect(atomicCreateFileNoClobber(target, NON_UTF8_BYTES).kind).toBe('created');
+    expectFileBytes(target, NON_UTF8_BYTES);
+  });
+
+  it('refuses and writes nothing when a file is already at the path', () => {
+    const target = makeFile(join(sandbox, 'source.ts'), DEVELOPER_FILE, PROJECT_FILE_MODE);
+
+    expect(atomicCreateFileNoClobber(target, RECREATED)).toEqual({ kind: 'exists' });
+
+    expectFileBytes(target, DEVELOPER_FILE);
+    expect(temporaryLeftoversIn(sandbox)).toEqual([]);
+  });
+
+  it('refuses when a file appears after the absence check, immediately before the install', () => {
+    // The CWE-367 window itself: the target was absent when it was checked,
+    // and a developer recreates it before the new content is installed. A
+    // rename would discard their file; the install must refuse instead.
+    const target = join(sandbox, 'source.ts');
+
+    const verdict = atomicCreateFileNoClobber(target, RECREATED, {
+      onBeforeInstall: () => {
+        makeFile(target, DEVELOPER_FILE);
+      },
+    });
+
+    expect(verdict).toEqual({ kind: 'exists' });
+    expectFileBytes(target, DEVELOPER_FILE);
+    expect(temporaryLeftoversIn(sandbox)).toEqual([]);
+  });
+
+  it('refuses a directory at the path', () => {
+    const target = makeDir(join(sandbox, 'source.ts'), PROJECT_DIR_MODE);
+
+    expect(atomicCreateFileNoClobber(target, RECREATED)).toEqual({ kind: 'exists' });
+    expect(lstatSync(target).isDirectory()).toBe(true);
+    expect(temporaryLeftoversIn(sandbox)).toEqual([]);
+  });
+
+  it.skipIf(!CAN_CREATE_SYMLINKS)(
+    'refuses a symbolic link at the path, dangling or not, and never writes through it',
+    () => {
+      const victim = makeFile(join(sandbox, 'victim.ts'), DEVELOPER_FILE);
+      const live = join(sandbox, 'live.ts');
+      const dangling = join(sandbox, 'dangling.ts');
+      symlinkSync(victim, live);
+      symlinkSync(join(sandbox, 'absent.ts'), dangling);
+
+      expect(atomicCreateFileNoClobber(live, RECREATED)).toEqual({ kind: 'exists' });
+      expect(atomicCreateFileNoClobber(dangling, RECREATED)).toEqual({ kind: 'exists' });
+
+      expect(lstatSync(live).isSymbolicLink()).toBe(true);
+      expect(lstatSync(dangling).isSymbolicLink()).toBe(true);
+      expect(existsSync(join(sandbox, 'absent.ts'))).toBe(false);
+      expectFileBytes(victim, DEVELOPER_FILE);
+      expect(temporaryLeftoversIn(sandbox)).toEqual([]);
+    },
+  );
+
+  it('lets ENOENT through when the parent directory is gone, creating nothing', () => {
+    const target = join(sandbox, 'gone', 'source.ts');
+
+    expect(runtimeErrnoFrom(() => atomicCreateFileNoClobber(target, RECREATED))).toBe('ENOENT');
+    expect(existsSync(join(sandbox, 'gone'))).toBe(false);
+  });
+
+  it('removes the temporary file and rethrows when the install seam throws', () => {
+    const target = join(sandbox, 'source.ts');
+    const failure = new Error('injected failure before the install');
+
+    expect(
+      thrownBy(() =>
+        atomicCreateFileNoClobber(target, RECREATED, {
+          onBeforeInstall: () => {
+            throw failure;
+          },
+        }),
+      ),
+    ).toBe(failure);
+    expect(existsSync(target)).toBe(false);
+    expect(temporaryLeftoversIn(sandbox)).toEqual([]);
+  });
+
+  it('passes a failed temporary write through with its errno and leaves nothing at the target', async () => {
+    const target = join(sandbox, 'source.ts');
+
+    for (const expected of ['EACCES', 'ENOSPC'] as const) {
+      await withInjectedFs(
+        (real) => ({ openSync: openSyncFailingTemporaries(real, expected) }),
+        (injected) => {
+          const code = runtimeErrnoFrom(() => {
+            injected.atomicCreateFileNoClobber(target, RECREATED);
+          });
+
+          expect(code).toBe(expected);
+        },
+      );
+    }
+
+    expect(existsSync(target)).toBe(false);
+    expect(temporaryLeftoversIn(sandbox)).toEqual([]);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
  * pinFileWithinRoot
  * ---------------------------------------------------------------------------
  *
@@ -2475,6 +2630,177 @@ describe('pinFileWithinRoot', () => {
       pinned.release();
     }
   });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * pinPrivateFileWithinRoot
+ * ---------------------------------------------------------------------------
+ *
+ * The same pin inside the product's private state tree, where every directory
+ * from the state root down must also be private. What these cases add to the
+ * ones above: the policy is applied to the descriptors the walk holds, so the
+ * directory that was judged is the one a later read or unlink reaches — even
+ * when the path is swapped for a link immediately after the pin.
+ */
+
+describe('pinPrivateFileWithinRoot', () => {
+  /** Builds `<sandbox>/state/backups/ses_1/moved/<name>`, every directory `0700`. */
+  function makePrivateTree(): {
+    readonly root: string;
+    readonly directory: string;
+    readonly target: string;
+    readonly relative: string;
+  } {
+    const root = makeDir(join(sandbox, 'state'), SECURE_DIR_MODE);
+    makeDir(join(root, 'backups'), SECURE_DIR_MODE);
+    makeDir(join(root, 'backups', 'ses_1'), SECURE_DIR_MODE);
+    const directory = makeDir(join(root, 'backups', 'ses_1', 'moved'), SECURE_DIR_MODE);
+    const target = makeFile(join(directory, 'original'), 'original bytes\n', SECURE_FILE_MODE);
+
+    return { root, directory, target, relative: 'backups/ses_1/moved/original' };
+  }
+
+  it('reaches the same file as the plain path, with the directory identity from the descriptor', () => {
+    const { root, directory, target, relative } = makePrivateTree();
+    const pinned = pinPrivateFileWithinRoot(root, relative);
+
+    try {
+      const stats = lstatSync(directory, { bigint: true });
+
+      expect(pinned.name).toBe('original');
+      expect(pinned.directory).toBe(directory);
+      expect(pinned.directoryIdentity.dev).toBe(stats.dev);
+      expect(pinned.directoryIdentity.ino).toBe(stats.ino);
+      expect(Buffer.compare(readFileNoFollow(pinned.path), readFileSync(target))).toBe(0);
+      expect(pinned.verifyDirectory()).toBe(true);
+    } finally {
+      pinned.release();
+    }
+  });
+
+  it.skipIf(!CAN_CREATE_SYMLINKS)(
+    'refuses a symbolic link anywhere below the boundary (requires symlink creation)',
+    () => {
+      const { root, relative } = makePrivateTree();
+      const elsewhere = makeDir(join(sandbox, 'elsewhere'), SECURE_DIR_MODE);
+
+      rmSync(join(root, 'backups', 'ses_1'), { recursive: true });
+      symlinkSync(elsewhere, join(root, 'backups', 'ses_1'));
+
+      const error = unsafePathErrorFrom(() => {
+        pinPrivateFileWithinRoot(root, relative).release();
+      });
+
+      expect(error.details?.reason).toBe('symlink-component');
+      expect(entriesIn(elsewhere)).toEqual([]);
+    },
+  );
+
+  it.skipIf(!CAN_CREATE_SYMLINKS)(
+    'refuses a boundary that is itself a symbolic link (requires symlink creation)',
+    () => {
+      const { root, relative } = makePrivateTree();
+      const linkedRoot = join(sandbox, 'linked-state');
+
+      symlinkSync(root, linkedRoot);
+
+      const error = unsafePathErrorFrom(() => {
+        pinPrivateFileWithinRoot(linkedRoot, relative).release();
+      });
+
+      expect(error.details?.reason).toBe('symlink-component');
+    },
+  );
+
+  it.skipIf(NO_POSIX_IDS)(
+    'refuses a directory in the chain that grants group or other access (POSIX permission bits)',
+    () => {
+      const { root, relative } = makePrivateTree();
+
+      chmodSync(join(root, 'backups', 'ses_1'), PROJECT_DIR_MODE);
+
+      const error = unsafePathErrorFrom(() => {
+        pinPrivateFileWithinRoot(root, relative).release();
+      });
+
+      expect(error.details?.reason).toBe('group-or-other-permissions');
+    },
+  );
+
+  it.skipIf(NO_POSIX_IDS)(
+    'holds the boundary itself to the same policy (POSIX permission bits)',
+    () => {
+      const { root, relative } = makePrivateTree();
+
+      chmodSync(root, PROJECT_DIR_MODE);
+
+      const error = unsafePathErrorFrom(() => {
+        pinPrivateFileWithinRoot(root, relative).release();
+      });
+
+      expect(error.details?.reason).toBe('group-or-other-permissions');
+    },
+  );
+
+  it('refuses a path that does not name a file below the boundary, as a caller mistake', () => {
+    const { root } = makePrivateTree();
+
+    for (const relative of ['', '.', '../outside', 'backups/../../outside']) {
+      const error = debuggenErrorFrom(() => {
+        pinPrivateFileWithinRoot(root, relative).release();
+      });
+
+      expect(error.code).toBe('INTERNAL');
+      expect(error.details?.reason).toBe('boundary-not-an-ancestor');
+    }
+  });
+
+  it('lets ENOENT through for a directory that does not exist', () => {
+    const { root } = makePrivateTree();
+
+    const code = runtimeErrnoFrom(() => {
+      pinPrivateFileWithinRoot(root, 'backups/ses_1/absent/original').release();
+    });
+
+    expect(code).toBe('ENOENT');
+  });
+
+  it.skipIf(!CAN_CREATE_SYMLINKS)(
+    'keeps reading and unlinking in the directory it judged after that directory is swapped for a link (requires symlink creation)',
+    () => {
+      // The attack a check-then-use sequence loses to: the judged directory is
+      // moved away and a link to a DECOY holding a file of the same name is
+      // planted at its path. A path-based read would return the decoy's bytes
+      // and a path-based unlink would delete the decoy — a file outside the
+      // private tree that nobody validated.
+      const { root, directory, target, relative } = makePrivateTree();
+      const pinned = pinPrivateFileWithinRoot(root, relative);
+
+      try {
+        const moved = join(root, 'backups', 'ses_1', 'moved-away');
+        const decoy = makeDir(join(sandbox, 'decoy'), SECURE_DIR_MODE);
+        const decoyFile = makeFile(join(decoy, 'original'), 'decoy bytes\n');
+
+        renameSync(directory, moved);
+        symlinkSync(decoy, directory);
+
+        // The plain path now leads to the decoy; the pinned path does not.
+        expect(readFileSync(target).toString('utf8')).toBe('decoy bytes\n');
+        expect(readFileNoFollow(pinned.path).toString('utf8')).toBe('original bytes\n');
+
+        unlinkSync(pinned.path);
+
+        // The unlink removed the judged file, wherever its directory now is,
+        // and the decoy is exactly as it was.
+        expect(entriesIn(moved)).toEqual([]);
+        expectFileBytes(decoyFile, 'decoy bytes\n');
+        expect(pinned.verifyDirectory()).toBe(false);
+      } finally {
+        pinned.release();
+      }
+    },
+  );
 });
 
 /*

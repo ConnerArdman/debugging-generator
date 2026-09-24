@@ -75,7 +75,13 @@ import type {
  * rejection as something to show.
  */
 export class StorefrontApiError extends Error {
-  /** HTTP status of the failed response, or `0` when the request never reached the server. */
+  /**
+   * HTTP status of the failed response, or `0` when no response arrived at all.
+   *
+   * `0` says nothing about whether the request reached the server: a request
+   * that never left this browser and one the server carried out before the
+   * connection dropped both end without a response.
+   */
   readonly status: number;
 
   /** Machine-readable reason, as {@link StorefrontErrorCode} enumerates them. */
@@ -91,30 +97,16 @@ export class StorefrontApiError extends Error {
    * a guess cannot rule out that the request was carried out and only its reply
    * was lost. A caller whose recovery advice depends on that reads this before
    * it treats `code` as a fact.
+   *
+   * `NETWORK_FAILURE` is always unreported, and it is the plainest case of a
+   * guess: `fetch` rejects alike for a request that never went out and for one
+   * the server received and carried out before the connection was lost, and
+   * nothing this browser can observe afterwards - its connection state included,
+   * which may have changed in between - tells the two apart. A caller that needs
+   * to know nothing was sent decides that before it sends, not from the
+   * rejection.
    */
   readonly reported: boolean;
-
-  /**
-   * Whether the request provably left this browser.
-   *
-   * `reported` says whether the reason is the server's own; this says whether
-   * the server was ever addressed, and the two are independent questions about
-   * the same failure. `fetch` rejects for a request that never went out - the
-   * machine is offline, so nothing was sent and nothing can have been carried
-   * out - and it rejects for a request that went out and whose connection was
-   * then lost, where the server may well have carried it out and only the reply
-   * was lost. Both arrive here as `NETWORK_FAILURE` with no reason from the
-   * server, which is why a caller placing an order cannot distinguish them from
-   * `code` and `reported` alone.
-   *
-   * `false` is therefore a statement and not a guess: it is set only where the
-   * browser itself says it had no connection at the moment the request failed,
-   * which is the one case in which "nothing was sent" is a fact. Every other
-   * failure - including every reply the server did send - leaves this `true`,
-   * so a caller that reads it is told "this never went out" only when that is
-   * established, and is left with the cautious answer otherwise.
-   */
-  readonly dispatched: boolean;
 
   constructor(
     message: string,
@@ -122,7 +114,6 @@ export class StorefrontApiError extends Error {
       status: number;
       code: StorefrontErrorCode;
       reported?: boolean;
-      dispatched?: boolean;
     },
   ) {
     super(message);
@@ -130,7 +121,6 @@ export class StorefrontApiError extends Error {
     this.status = options.status;
     this.code = options.code;
     this.reported = options.reported ?? false;
-    this.dispatched = options.dispatched ?? true;
   }
 }
 
@@ -225,8 +215,8 @@ function storefrontCodeForStatus(status: number): StorefrontErrorCode {
  *   answers with, which is configuration and this process's own port rather
  *   than anything a request carried. Nothing about the authority is decided in
  *   this module.
- * @throws StorefrontApiError when the request fails to reach the server, the
- *   response is not successful, or its body is not the JSON the caller expects.
+ * @throws StorefrontApiError when no response arrives, the response is not
+ *   successful, or its body is not the JSON the caller expects.
  * @throws The abort reason of `options.signal` when that signal is aborted,
  *   which is how a caller tells its own cancellation apart from a failure.
  */
@@ -267,19 +257,14 @@ export async function storefrontRequest<T>(
     // A caller that has stopped waiting gets its own abort reason back, before
     // anything decides this was a connection the customer should hear about.
     signal?.throwIfAborted();
-    // Whether this request ever went out, asked of the browser at the moment it
-    // failed rather than inferred afterwards. A machine that reports itself
-    // offline sent nothing, which is the one case a caller may treat as "the
-    // store never heard this"; a connection lost after the bytes left looks
-    // identical from here, reports itself online, and is left as dispatched -
-    // see `StorefrontApiError.dispatched`. `navigator` is read defensively
-    // because this module also runs during a server render, where there is
-    // none, and an absent navigator establishes nothing either way.
-    const offline = typeof navigator !== 'undefined' && navigator.onLine === false;
-
+    // Unreported, and deliberately silent about whether the request went out:
+    // a rejection looks the same whether nothing was sent or the server carried
+    // the request out and only the reply was lost, and the browser's connection
+    // state now is not its state when the bytes left. See
+    // `StorefrontApiError.reported`.
     throw new StorefrontApiError(
       'Lumen Supply could not be reached. Check your connection and try again.',
-      { status: 0, code: 'NETWORK_FAILURE', dispatched: !offline },
+      { status: 0, code: 'NETWORK_FAILURE' },
     );
   }
 
@@ -544,9 +529,17 @@ export function clearCartContents(): Promise<CartView> {
  * `input.draft.idempotencyKey` is what makes sending this twice safe: the
  * endpoint answers a submission whose name it has already seen with the order
  * that attempt placed - `result.outcome` says which of the two it is - so a
- * caller whose reply was lost resolves the attempt by sending the same draft
- * again rather than by deciding for itself whether an order exists. A caller
- * that mints a new name is asking for a new order.
+ * caller whose reply was lost resolves the attempt by sending the exact draft it
+ * recorded, under the same key, rather than by deciding for itself whether an
+ * order exists. That holds after a reload too: the endpoint answers from the
+ * store's own record of the key, and the draft the caller kept is what lets the
+ * repeat pass the same checks the first submission passed, and complete the
+ * order under that key if the store never received it. A caller that mints a
+ * new name is asking for a new order.
+ *
+ * A rejection with `NETWORK_FAILURE` is no exception: it does not say the
+ * request never arrived - see `StorefrontApiError.reported` - so it leaves the
+ * attempt exactly as unresolved as a lost reply does.
  *
  * `input.signal` is the caller's, on the same terms as every other wrapper
  * here - a component that goes away releases the connection rather than

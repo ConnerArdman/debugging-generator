@@ -23,6 +23,25 @@
  *     node's own, unmodified (AAP 0.2.3 — "`metrics` kept as the node's
  *     option").
  *
+ * The `metrics` source is paged by the same `DataPage` rule as every
+ * array-valued source, so a further group pins how the tiles read it:
+ *
+ *   - **pages are followed by the service's counter**: the first request is the
+ *     node's query unmodified, and each later one differs from it only in
+ *     `offset`, set to the `nextOffset` the service reported. A page is
+ *     followed only while a requested id is still missing, the counter
+ *     advances and the page added an id, so a count-only `limit: 0` page, a
+ *     stalled counter and a page that repeats itself each end the read.
+ *   - **not on the pages read is not "not computed"**: a requested id that a
+ *     partial read — count-only, an authored offset, a stopped follow — did not
+ *     reach is drawn as not on the page, never as the absent label, which would
+ *     state that the capture lacks it. Only a complete read from the first item
+ *     earns the absent label, and only a zero total or a complete read earns
+ *     the "nothing was computed" empty state.
+ *   - **states span the whole read**: the loading state holds until the last
+ *     page needed settles, and a failed later page is reported with its own
+ *     query and a retry that re-requests exactly that page.
+ *
  * Alongside those, AAP 0.8.3 asks every component suite in this folder for the
  * three states of a query-backed view — loading, empty and error — and for the
  * click-to-source payload. The first three are driven through a stub
@@ -65,7 +84,11 @@
  *     so these cases exercise the very seam the DevTools panel and the editor
  *     webview implement — including its guarantee that a response answers for
  *     the source it was asked about. The resolver is a `vi.fn`, and every query
- *     it receives is recorded in an array the cases assert on.
+ *     it receives is recorded in an array the cases assert on. The paging
+ *     cases state their pages as data: {@link pagedProvider} answers each
+ *     query from a table keyed by its offset, with the `total` and `nextOffset`
+ *     echo the service attaches (`null` on the last page, as the wire spells
+ *     it), and rejects an offset the case did not declare.
  *   - **In-file synthetic builders, no fixture files**: {@link makeMetric} and
  *     {@link makeNode}, both taking overrides.
  *   - **Generic fixture vocabulary only** (AAP 0.5.4). Metric ids are the
@@ -92,10 +115,11 @@
  */
 
 import type { DataQuery, MetricCardsNode } from '@debuggen/panel-schema';
+import { DATA_QUERY_DEFAULT_OFFSET } from '@debuggen/panel-schema';
 import { DebuggenError } from '@debuggen/shared';
 import type { SourceLocation } from '@debuggen/shared';
 import type { MetricId, MetricUnit, MetricValue } from '@debuggen/telemetry';
-import { cleanup, render, screen, within } from '@testing-library/react';
+import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Mock } from 'vitest';
@@ -187,6 +211,30 @@ const TOTAL_DURATION_LABEL = 'Total duration';
 const RENDER_COUNT_LABEL = 'Renders';
 const UNCHANGED_RENDERS_LABEL = 'Renders with stable inputs';
 const UNKNOWN_TRIGGER_LABEL = 'Renders with an undetermined trigger';
+
+/** A heading a later page repeats an id under, which the tiles must not show. */
+const REPEATED_LABEL = 'Repeated value';
+
+/**
+ * The component's module-private copy, recognised by generic substrings rather
+ * than restated sentences — the way the empty-state case reads its message —
+ * so each case pins which statement a tile makes, not its exact wording.
+ *
+ *   - {@link NOT_ON_PAGE_FIGURE} and {@link NOT_ON_PAGE_NOTE}: the figure and
+ *     note of a requested id that lies outside the page or pages read.
+ *   - {@link NOT_COMPUTED_NOTE}: the note of one a complete read did not find.
+ *   - {@link NOTHING_COMPUTED}: the empty state of a capture that computed none.
+ *   - {@link OUTSIDE_THE_PAGE}: the empty state of a read that holds no values
+ *     although the capture may hold some.
+ */
+const NOT_ON_PAGE_FIGURE = /not on page/iu;
+const NOT_ON_PAGE_NOTE = /outside the page/iu;
+const NOT_COMPUTED_NOTE = /not part of the computed set/iu;
+const NOTHING_COMPUTED = /no metrics were computed/iu;
+const OUTSIDE_THE_PAGE = /outside the page/iu;
+
+/** The failure the paging error case rejects its second request with. */
+const DISCONNECTED_CODE = 'TRANSPORT_DISCONNECTED';
 
 /*
  * ---------------------------------------------------------------------------
@@ -359,6 +407,60 @@ function pendingProvider(): StubProvider {
  */
 function rejectingProvider(error: DebuggenError): StubProvider {
   return recordingProvider(() => Promise.reject(error));
+}
+
+/**
+ * One page a paged stub serves: its values and the paging echo the service
+ * attaches to every array-valued page.
+ *
+ * `nextOffset` admits the wire's own `null` for "this is the last page", which
+ * is how the paging cases spell the end, so the fold into `undefined` that
+ * `../host/useQuery` performs is exercised rather than bypassed.
+ */
+interface StubPage {
+  /** The values of the page, in the order the service returned them. */
+  readonly data: readonly MetricValue[];
+  /** How many values the source holds before `limit` and `offset`. */
+  readonly total?: number | undefined;
+  /** The offset of the next page, or `null` on the last one. */
+  readonly nextOffset?: number | null | undefined;
+}
+
+/** A page table: each page keyed by the offset whose request it answers. */
+type StubPages = ReadonlyMap<number, StubPage>;
+
+/**
+ * Answers one query from a page table, by the query's offset.
+ *
+ * An offset the table does not hold rejects with a code rather than resolving
+ * empty, so a case that requested a page it did not declare fails on an error
+ * state instead of quietly drawing an empty read.
+ *
+ * @param pages The table to serve from.
+ * @param query The query to answer.
+ * @returns The page's response, echoing the source it was asked about.
+ */
+function servePage(pages: StubPages, query: DataQuery): Promise<DataQueryResponse> {
+  const offset = query.offset ?? DATA_QUERY_DEFAULT_OFFSET;
+  const page = pages.get(offset);
+
+  if (page === undefined) {
+    return Promise.reject(
+      new DebuggenError('INTERNAL', `No page is recorded at offset ${String(offset)}.`),
+    );
+  }
+
+  return Promise.resolve<DataQueryResponse>({ source: METRICS_SOURCE, ...page });
+}
+
+/**
+ * A provider that serves a page table, recording every query it receives.
+ *
+ * @param pages The pages, keyed by offset.
+ * @returns The stub provider.
+ */
+function pagedProvider(pages: StubPages): StubProvider {
+  return recordingProvider((query) => servePage(pages, query));
 }
 
 /*
@@ -554,6 +656,53 @@ function queryOfCall(stub: StubProvider, call: number): DataQuery {
   }
 
   return query;
+}
+
+/** The text of a tile's advisory note, read off the tooltip that describes it. */
+function noteOf(card: HTMLElement): string {
+  return within(card).getByRole('tooltip').textContent ?? '';
+}
+
+/**
+ * Asserts that a tile is the not-on-page tile for `id`.
+ *
+ * Muted and unmeasured, like the absent-label tile, but saying less: the
+ * component's own off-page figure — never the absent label, a digit or a dash —
+ * under the humanized heading, with no unit and no severity colour, a note that
+ * the value lies outside the page or pages requested, and an accessible name
+ * that carries the figure so the distinction is heard as well as seen.
+ *
+ * @param card The tile, obtained semantically.
+ * @param id The metric id the tile stands for.
+ */
+function expectNotOnPage(card: HTMLElement, id: MetricId): void {
+  const figure = textOf(card, 'value') ?? '';
+
+  expect(isUnavailable(card)).toBe(true);
+  expect(figure).toMatch(NOT_ON_PAGE_FIGURE);
+  expect(figure).not.toBe(NOT_AVAILABLE_LABEL);
+  expect(figure).not.toMatch(/[\d\u2012-\u2015-]/u);
+  expect(textOf(card, 'label')).toBe(humanizeLabel(id));
+  expect(partOf(card, 'unit')).toBeNull();
+  expect(severityStyleOf(card)).toBeNull();
+  expect(noteOf(card)).toMatch(NOT_ON_PAGE_NOTE);
+  expect(noteOf(card)).not.toMatch(NOT_COMPUTED_NOTE);
+  expect(card.getAttribute('aria-label')).toBe(`${humanizeLabel(id)}: ${figure}`);
+}
+
+/**
+ * Asserts that a tile is the absent-label tile for `id`: a complete read did
+ * not find it, so the tile says the value is not part of this capture.
+ *
+ * @param card The tile, obtained semantically.
+ * @param id The metric id the tile stands for.
+ */
+function expectNotComputed(card: HTMLElement, id: MetricId): void {
+  expect(isUnavailable(card)).toBe(true);
+  expect(textOf(card, 'value')).toBe(NOT_AVAILABLE_LABEL);
+  expect(textOf(card, 'label')).toBe(humanizeLabel(id));
+  expect(noteOf(card)).toMatch(NOT_COMPUTED_NOTE);
+  expect(noteOf(card)).not.toMatch(NOT_ON_PAGE_NOTE);
 }
 
 // Explicit, per the harness note above: automatic cleanup belongs to the
@@ -771,10 +920,434 @@ describe('MetricCards selection and order', () => {
     await findCards(2);
 
     // Unmodified: no filter, no sort, no limit and no offset are added, because
-    // a scalar view of the whole capture has no page to narrow, and a renderer
-    // that narrowed the request would be choosing evidence.
+    // a renderer that narrowed the request would be choosing evidence. Every
+    // requested id was on that first page, so no further page is asked for.
     expect(soleQuery(stub)).toEqual({ source: METRICS_SOURCE });
     expect('metrics' in soleQuery(stub)).toBe(false);
+  });
+});
+
+describe('MetricCards paging', () => {
+  it('follows nextOffset to the next page, changing only the offset, and draws tiles from both', async () => {
+    // The authored limit leaves the second requested id off the first page.
+    // The follow-up keeps that limit and advances only the offset, to the
+    // counter the service reported — never to one derived from the page length.
+    const nodeQuery: DataQuery = { source: METRICS_SOURCE, limit: 2 };
+    const stub = pagedProvider(
+      new Map<number, StubPage>([
+        [
+          0,
+          {
+            data: [
+              makeDuration('total_duration', CRITICAL_MS, TOTAL_DURATION_LABEL),
+              makeMetric('request_count'),
+            ],
+            total: 3,
+            nextOffset: 2,
+          },
+        ],
+        [
+          2,
+          {
+            data: [makeMetric('render_count', { label: RENDER_COUNT_LABEL, value: RENDER_COUNT })],
+            total: 3,
+            nextOffset: null,
+          },
+        ],
+      ]),
+    );
+
+    renderCards(
+      makeNode(['render_count', 'total_duration', 'database_duration'], { query: nodeQuery }),
+      { provider: stub.provider },
+    );
+
+    const cards = await findCards(3);
+
+    // One tile from each page, in the node's order, each showing exactly what
+    // its own page said about its id.
+    expect(labelsOf(cards).slice(0, 2)).toEqual([RENDER_COUNT_LABEL, TOTAL_DURATION_LABEL]);
+    expect(figuresOf(cards).slice(0, 2)).toEqual([
+      formatCount(RENDER_COUNT),
+      durationFigure(CRITICAL_MS).value,
+    ]);
+    expect(isUnavailable(cardAt(cards, 0))).toBe(false);
+    expect(isUnavailable(cardAt(cards, 1))).toBe(false);
+
+    // The read started at the first item and ran to the service's end with
+    // every item accounted for, so the id no page carried is not computed.
+    expectNotComputed(cardAt(cards, 2), 'database_duration');
+
+    expect(stub.queries).toEqual([nodeQuery, { ...nodeQuery, offset: 2 }]);
+  });
+
+  it('stops requesting once every requested id is found, though a further page is reported', async () => {
+    // Any further request would be answered by the stub's undeclared-page
+    // rejection, so reaching the tiles at all proves none was made.
+    const stub = pagedProvider(
+      new Map<number, StubPage>([
+        [
+          0,
+          {
+            data: [
+              makeDuration('total_duration', CRITICAL_MS, TOTAL_DURATION_LABEL),
+              makeMetric('render_count', { label: RENDER_COUNT_LABEL, value: RENDER_COUNT }),
+            ],
+            total: 5,
+            nextOffset: 2,
+          },
+        ],
+      ]),
+    );
+
+    renderCards(makeNode(['render_count']), { provider: stub.provider });
+
+    const card = cardAt(await findCards(1), 0);
+
+    expect(isUnavailable(card)).toBe(false);
+    expect(textOf(card, 'value')).toBe(formatCount(RENDER_COUNT));
+    expect(soleQuery(stub)).toEqual({ source: METRICS_SOURCE });
+  });
+
+  it('answers a count-only query with one request and not-on-page tiles, never "not computed"', async () => {
+    // `limit: 0` asks for the total and no values. A page that returned
+    // nothing is the last page, so the service reports no further one and
+    // exactly one request is made — and since the total says values exist that
+    // no page carried, none is called absent.
+    const nodeQuery: DataQuery = { source: METRICS_SOURCE, limit: 0 };
+    const stub = pagedProvider(
+      new Map<number, StubPage>([[0, { data: [], total: 3, nextOffset: null }]]),
+    );
+
+    renderCards(makeNode(['total_duration', 'render_count'], { query: nodeQuery }), {
+      provider: stub.provider,
+    });
+
+    const cards = await findCards(2);
+
+    expectNotOnPage(cardAt(cards, 0), 'total_duration');
+    expectNotOnPage(cardAt(cards, 1), 'render_count');
+
+    // A positive total is not an empty capture, so no empty state is drawn.
+    expect(screen.queryByText(NOTHING_COMPUTED)).toBeNull();
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(soleQuery(stub)).toEqual(nodeQuery);
+  });
+
+  it('draws the nothing-computed empty state for a count-only query whose total is zero', async () => {
+    const nodeQuery: DataQuery = { source: METRICS_SOURCE, limit: 0 };
+    const stub = pagedProvider(
+      new Map<number, StubPage>([[0, { data: [], total: 0, nextOffset: null }]]),
+    );
+
+    renderCards(makeNode(['total_duration'], { query: nodeQuery }), { provider: stub.provider });
+
+    const message = await screen.findByText(NOTHING_COMPUTED);
+
+    expect(message.classList.contains('dg-empty-state__message')).toBe(true);
+    expect(screen.queryAllByRole('listitem')).toHaveLength(0);
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(soleQuery(stub)).toEqual(nodeQuery);
+  });
+
+  it('tells a node naming no ids that its values lie outside the requested page, with the total', async () => {
+    // With no ids named there is no tile to mark, so the absence is an empty
+    // state — but one that says where the values are, not that there are none.
+    const reportedTotal = 3;
+    const stub = pagedProvider(
+      new Map<number, StubPage>([[0, { data: [], total: reportedTotal, nextOffset: null }]]),
+    );
+
+    renderCards(makeNode([], { query: { source: METRICS_SOURCE, limit: 0 } }), {
+      provider: stub.provider,
+    });
+
+    const message = await screen.findByText(OUTSIDE_THE_PAGE);
+
+    expect(message.classList.contains('dg-empty-state__message')).toBe(true);
+    expect(message.parentElement?.parentElement?.classList.contains('dg-metric-cards__empty')).toBe(
+      true,
+    );
+    expect(message.textContent).toContain(formatCount(reportedTotal));
+    expect(message.textContent).not.toMatch(NOTHING_COMPUTED);
+    expect(screen.queryAllByRole('listitem')).toHaveLength(0);
+    expect(stub.resolve).toHaveBeenCalledTimes(1);
+  });
+
+  it('draws a requested id an authored offset did not reach as not on the page', async () => {
+    // A read that starts past the first item cannot have seen the items before
+    // it, so an id it did not find may well be one of them.
+    const nodeQuery: DataQuery = { source: METRICS_SOURCE, offset: 2 };
+    const stub = pagedProvider(
+      new Map<number, StubPage>([
+        [
+          2,
+          {
+            data: [makeDuration('total_duration', CRITICAL_MS, TOTAL_DURATION_LABEL)],
+            total: 3,
+            nextOffset: null,
+          },
+        ],
+      ]),
+    );
+
+    renderCards(makeNode(['total_duration', 'database_duration'], { query: nodeQuery }), {
+      provider: stub.provider,
+    });
+
+    const cards = await findCards(2);
+
+    expect(isUnavailable(cardAt(cards, 0))).toBe(false);
+    expectNotOnPage(cardAt(cards, 1), 'database_duration');
+    expect(soleQuery(stub)).toEqual(nodeQuery);
+  });
+
+  it('draws a requested id a complete read from the first item did not find as not computed', async () => {
+    // The control case for the one above: the same page contents, read from
+    // offset zero to the service's end, do support the absent label.
+    const stub = pagedProvider(
+      new Map<number, StubPage>([
+        [
+          0,
+          {
+            data: [makeDuration('total_duration', CRITICAL_MS, TOTAL_DURATION_LABEL)],
+            total: 1,
+            nextOffset: null,
+          },
+        ],
+      ]),
+    );
+
+    renderCards(makeNode(['total_duration', 'database_duration']), { provider: stub.provider });
+
+    const cards = await findCards(2);
+
+    expect(isUnavailable(cardAt(cards, 0))).toBe(false);
+    expectNotComputed(cardAt(cards, 1), 'database_duration');
+    expect(textOf(cardAt(cards, 1), 'value')).not.toMatch(NOT_ON_PAGE_FIGURE);
+    expect(soleQuery(stub)).toEqual({ source: METRICS_SOURCE });
+  });
+
+  it('never calls a value not computed when the reported total exceeds what the pages held', async () => {
+    // A self-contradicting last page — an empty first page of a query that asked
+    // for values, no further page, yet a total the read does not account for —
+    // cannot support "not computed": the service's own count says values exist
+    // that no page carried.
+    const nodeQuery: DataQuery = { source: METRICS_SOURCE };
+    const stub = pagedProvider(
+      new Map<number, StubPage>([[0, { data: [], total: 3, nextOffset: null }]]),
+    );
+
+    renderCards(makeNode(['render_count'], { query: nodeQuery }), { provider: stub.provider });
+
+    expectNotOnPage(cardAt(await findCards(1), 0), 'render_count');
+    expect(screen.queryByText(NOTHING_COMPUTED)).toBeNull();
+    expect(soleQuery(stub)).toEqual(nodeQuery);
+  });
+
+  it('stops after one request when the reported next offset does not advance past the page', async () => {
+    // A counter equal to the page's own offset would only repeat the request.
+    const stub = pagedProvider(
+      new Map<number, StubPage>([
+        [
+          0,
+          {
+            data: [makeDuration('total_duration', CRITICAL_MS, TOTAL_DURATION_LABEL)],
+            total: 4,
+            nextOffset: 0,
+          },
+        ],
+      ]),
+    );
+
+    renderCards(makeNode(['total_duration', 'render_count']), { provider: stub.provider });
+
+    const cards = await findCards(2);
+
+    expect(isUnavailable(cardAt(cards, 0))).toBe(false);
+    expectNotOnPage(cardAt(cards, 1), 'render_count');
+    expect(soleQuery(stub)).toEqual({ source: METRICS_SOURCE });
+  });
+
+  it('stops when an advancing page repeats only ids already collected', async () => {
+    // The second page advances the counter but adds nothing new, so the read
+    // is making no progress and the third page is never asked for. The repeat
+    // is dropped: the first page's value for the id is the one drawn.
+    const stub = pagedProvider(
+      new Map<number, StubPage>([
+        [
+          0,
+          {
+            data: [makeDuration('total_duration', CRITICAL_MS, TOTAL_DURATION_LABEL)],
+            total: 3,
+            nextOffset: 1,
+          },
+        ],
+        [
+          1,
+          {
+            data: [makeDuration('total_duration', FAST_MS, REPEATED_LABEL)],
+            total: 3,
+            nextOffset: 2,
+          },
+        ],
+        [
+          2,
+          {
+            data: [makeMetric('render_count', { label: RENDER_COUNT_LABEL, value: RENDER_COUNT })],
+            total: 3,
+            nextOffset: null,
+          },
+        ],
+      ]),
+    );
+
+    renderCards(makeNode(['total_duration', 'render_count']), { provider: stub.provider });
+
+    const cards = await findCards(2);
+
+    expect(textOf(cardAt(cards, 0), 'label')).toBe(TOTAL_DURATION_LABEL);
+    expect(textOf(cardAt(cards, 0), 'value')).toBe(durationFigure(CRITICAL_MS).value);
+    expectNotOnPage(cardAt(cards, 1), 'render_count');
+    expect(stub.queries).toEqual([
+      { source: METRICS_SOURCE },
+      { source: METRICS_SOURCE, offset: 1 },
+    ]);
+  });
+
+  it('draws every computed value across pages when the node names no ids, first occurrence winning', async () => {
+    const stub = pagedProvider(
+      new Map<number, StubPage>([
+        [
+          0,
+          {
+            data: [makeDuration('total_duration', CRITICAL_MS, TOTAL_DURATION_LABEL)],
+            total: 3,
+            nextOffset: 1,
+          },
+        ],
+        [
+          1,
+          {
+            data: [
+              makeDuration('total_duration', FAST_MS, REPEATED_LABEL),
+              makeMetric('render_count', { label: RENDER_COUNT_LABEL, value: RENDER_COUNT }),
+            ],
+            total: 3,
+            nextOffset: null,
+          },
+        ],
+      ]),
+    );
+
+    renderCards(makeNode([]), { provider: stub.provider });
+
+    const cards = await findCards(2);
+
+    // Arrival order, one tile per id, and the repeated id keeps the heading and
+    // figure its first page gave it.
+    expect(labelsOf(cards)).toEqual([TOTAL_DURATION_LABEL, RENDER_COUNT_LABEL]);
+    expect(figuresOf(cards)).toEqual([
+      durationFigure(CRITICAL_MS).value,
+      formatCount(RENDER_COUNT),
+    ]);
+    expect(screen.queryByText(REPEATED_LABEL)).toBeNull();
+    expect(stub.queries).toEqual([
+      { source: METRICS_SOURCE },
+      { source: METRICS_SOURCE, offset: 1 },
+    ]);
+  });
+
+  it('keeps the loading state until the follow-up page settles, drawing no partial tiles', async () => {
+    // The follow-up never settles, so the first page's value must not be drawn
+    // on its own — a partial read shown as tiles would mislabel the rest.
+    const firstPage: DataQueryResponse = {
+      source: METRICS_SOURCE,
+      data: [makeDuration('total_duration', CRITICAL_MS, TOTAL_DURATION_LABEL)],
+      total: 2,
+      nextOffset: 1,
+    };
+    const stub = recordingProvider((query) =>
+      (query.offset ?? DATA_QUERY_DEFAULT_OFFSET) === DATA_QUERY_DEFAULT_OFFSET
+        ? Promise.resolve(firstPage)
+        : new Promise<DataQueryResponse>(() => undefined),
+    );
+
+    renderCards(makeNode(['total_duration', 'render_count']), { provider: stub.provider });
+
+    await waitFor(() => {
+      expect(stub.resolve).toHaveBeenCalledTimes(2);
+    });
+
+    expect(queryOfCall(stub, 2)).toEqual({ source: METRICS_SOURCE, offset: 1 });
+
+    const busy = screen.getByRole('status');
+
+    expect(busy.getAttribute('aria-busy')).toBe('true');
+    expect(busy.parentElement?.classList.contains('dg-metric-cards__loading')).toBe(true);
+    expect(screen.queryByRole('list')).toBeNull();
+    expect(screen.queryAllByRole('listitem')).toHaveLength(0);
+    expect(screen.queryByText(NOTHING_COMPUTED)).toBeNull();
+  });
+
+  it('reports a failed follow-up page with its own query, and its retry re-requests that page', async () => {
+    const pages = new Map<number, StubPage>([
+      [
+        0,
+        {
+          data: [makeDuration('total_duration', CRITICAL_MS, TOTAL_DURATION_LABEL)],
+          total: 2,
+          nextOffset: 1,
+        },
+      ],
+      [
+        1,
+        {
+          data: [makeMetric('render_count', { label: RENDER_COUNT_LABEL, value: RENDER_COUNT })],
+          total: 2,
+          nextOffset: null,
+        },
+      ],
+    ]);
+    const stub = recordingProvider((query, call) =>
+      call === 2
+        ? Promise.reject(
+            new DebuggenError(DISCONNECTED_CODE, 'The channel to the service is closed.'),
+          )
+        : servePage(pages, query),
+    );
+    const user = userEvent.setup();
+
+    renderCards(makeNode(['total_duration', 'render_count']), { provider: stub.provider });
+
+    const alert = await screen.findByRole('alert');
+
+    expect(alert.parentElement?.classList.contains('dg-metric-cards__error')).toBe(true);
+    expect(alert.textContent).toContain(DISCONNECTED_CODE);
+
+    // The query shown is the page that failed — the node's own with the
+    // service's counter as its offset — not the first page that succeeded.
+    const shown = within(alert).getByRole('group', { name: FAILING_QUERY_NAME });
+
+    expect(JSON.parse(shown.textContent ?? '')).toEqual({ source: METRICS_SOURCE, offset: 1 });
+
+    // No tile from the page that did arrive is drawn beneath the failure.
+    expect(screen.queryAllByRole('listitem')).toHaveLength(0);
+
+    await user.click(within(alert).getByRole('button', { name: RETRY_NAME }));
+
+    const cards = await findCards(2);
+
+    expect(labelsOf(cards)).toEqual([TOTAL_DURATION_LABEL, RENDER_COUNT_LABEL]);
+    expect(isUnavailable(cardAt(cards, 0))).toBe(false);
+    expect(isUnavailable(cardAt(cards, 1))).toBe(false);
+
+    // The retry re-requested the failed page alone; the first page stood.
+    expect(stub.queries).toEqual([
+      { source: METRICS_SOURCE },
+      { source: METRICS_SOURCE, offset: 1 },
+      { source: METRICS_SOURCE, offset: 1 },
+    ]);
   });
 });
 

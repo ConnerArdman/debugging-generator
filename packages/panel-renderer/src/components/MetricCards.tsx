@@ -50,6 +50,32 @@
  * that the value is not part of this capture — dropping it silently would leave
  * the reader to notice that a tile they asked for is missing.
  *
+ * ## NOT ON THE PAGES READ IS NOT THE SAME AS NOT COMPUTED
+ *
+ * A requested id that no page carried is one of two different things, and the
+ * tile says which, because only one of them is a finding:
+ *
+ *   - **The read was complete.** It started at the source's first item, its
+ *     last page reported no further page, and it holds at least as many values
+ *     as the service's `total` (when one was reported). Every value the capture
+ *     computed was therefore on a page read, so the id is not part of this
+ *     capture and the tile is the unavailable one described above.
+ *   - **The read was partial.** A count-only `limit: 0` query, an authored
+ *     `offset` past the start, or a follow that stopped because the service's
+ *     counter did not advance or its page added nothing new. The value lies
+ *     outside the page or pages this query requested and may well exist, so the
+ *     tile reads {@link NOT_ON_PAGE_LABEL} with a note saying exactly that.
+ *     Calling it "not computed" would state an observation the evidence does
+ *     not support.
+ *
+ * Both tiles carry the muted `dg-is-unavailable` state — neither shows a
+ * measurement — and neither is ever `0`, a dash or blank. The same split governs
+ * a read that holds no value at all: it is the "nothing was computed" empty state
+ * only when the service reported a `total` of zero or the read was complete.
+ * Otherwise the requested tiles are drawn as not on the page, and a node that
+ * names no ids gets its own empty message saying the computed values lie outside
+ * the requested page, with the service's `total` when it reported one.
+ *
  * ## THE TILES ARE NOT CONTROLS
  *
  * A metric is an aggregate of the whole capture, so it references no single
@@ -62,19 +88,56 @@
  * a reference to the records behind it, that is a change to the data contract
  * first and to this component second.
  *
- * ## NO QUERY IS BUILT HERE, AND NO TRANSPORT IS TOUCHED
+ * ## THE NODE'S QUERY, PAGE BY PAGE, AND NO TRANSPORT IS TOUCHED
  *
- * The node's own `query` is resolved through `../host/useQuery`, untouched: no
- * filter, sort, limit or offset is added, because `metrics` is a scalar view of
- * the whole capture rather than a paged list, and a renderer that narrowed the
- * request would be choosing evidence. The provider behind the hook is the host
- * surface's (AAP 0.1.2) — there is no `fetch`, no socket and no message port in
- * this file, and `@debuggen/telemetry` is imported for **types only**.
+ * The first request is the node's own `query`, resolved through `../host/useQuery`
+ * exactly as authored: no filter, sort, limit or offset is added, because a
+ * renderer that narrowed the request would be choosing evidence. The `metrics`
+ * source is paged by the same `DataPage` rule as every array-valued source —
+ * `limit` and `offset` are honoured, `total` and `nextOffset` come back — so one
+ * page need not hold every id the node names. When it does not, the next page is
+ * requested as `{ ...query, offset: nextOffset }`: the authored filter, sort and
+ * limit kept, and only the offset advanced, to the value the service reported
+ * rather than to one derived from the length of what arrived (which drifts the
+ * moment a limit is clamped).
+ *
+ * The next page is followed only while all four of these hold:
+ *
+ *   1. the page reported a `nextOffset`, so the service says more exists;
+ *   2. that offset lies beyond the page it came from — a counter that does not
+ *      advance would only repeat the same request (the protocol refuses one,
+ *      and a count-only `limit: 0` page reports `null`, being the last page);
+ *   3. the page contributed an id not already collected, so the read is making
+ *      progress; and
+ *   4. an id the node names is still missing — or the node names none, which
+ *      means every computed value is drawn.
+ *
+ * Conditions 3 and 4 are what bound the chain. Every page that is followed has
+ * added at least one new id from a closed, finite vocabulary, so a read requests
+ * at most one page more than that vocabulary has ids — without this file
+ * knowing, or importing, how large the vocabulary is.
+ *
+ * Pages are stitched **by id**: the first occurrence of an id wins and arrival
+ * order is preserved. `../host/useQuery` itself never merges pages; the merge is
+ * this component's, made after each page has settled, and it is sound here for a
+ * reason specific to tiles: a tile is addressed by its id and shows exactly what
+ * one response said about that id — its label, unit, value, availability and
+ * note — so no tile combines, reorders or re-derives anything across responses.
+ *
+ * Each page is resolved by its own module-private level ({@link MetricCardsPage}),
+ * which calls the hook exactly once and then renders either the next level or the
+ * settled read, so no component's hook count ever varies between renders. The
+ * provider behind the hook is the host surface's (AAP 0.1.2) — there is no
+ * `fetch`, no socket and no message port in this file, and `@debuggen/telemetry`
+ * is imported for **types only**.
  *
  * All three states AAP 0.6.2 requires are rendered, in this precedence: a node
  * whose query names a source these tiles cannot draw (an error, reported rather
- * than silently mis-drawn), then loading, then a failed query, then a capture
- * that computed nothing, then the tiles.
+ * than silently mis-drawn), then loading — held until the last page the tiles
+ * need has settled, so a partial read is never drawn as tiles and mislabelled —
+ * then a failed query, reported with the query of the page that failed and a
+ * retry that re-requests that page alone, then a capture that computed nothing,
+ * then the tiles.
  *
  * The node's optional `title` and `description` are deliberately **not** drawn
  * here. Every query-backed node carries those two fields identically, and the
@@ -108,7 +171,11 @@
  *                                rather than a suffix inside the number.
  *   `dg-metric-card__hint`       the advisory-note affordance.
  *   `dg-is-unavailable`          the state, on the tile, which is where the
- *                                stylesheet's rule expects it.
+ *                                stylesheet's rule expects it. It marks both
+ *                                the unavailable tile and the not-on-page
+ *                                tile: each is muted for the same reason, and
+ *                                their figure and note are what tell them
+ *                                apart, so no further state class is needed.
  *
  * The `dg-metric-cards__card`, `__label`, `__value`, `__unit` and `__note`
  * names are emitted alongside the tile's own block names because the component
@@ -124,10 +191,13 @@
  * list semantics in WebKit-derived engines. Every tile carries an accessible
  * name pairing its heading with its figure and unit, because a list item takes
  * its name from the author rather than from its contents, and a figure
- * announced without its heading is a number with no subject. The advisory note
- * is a focusable affordance so that its description is reachable without a
- * pointer, and the tooltip keeps that description in the accessibility tree
- * even while the bubble is closed.
+ * announced without its heading is a number with no subject. That name carries
+ * the tile's own figure, so a not-on-page tile is announced as not on the page
+ * and an unavailable one as the absent label: a screen-reader user hears the
+ * same distinction a sighted one sees. The advisory note is a focusable
+ * affordance so that its description is reachable without a pointer, and the
+ * tooltip keeps that description in the accessibility tree even while the
+ * bubble is closed.
  *
  * @see ../host/useQuery for the state machine behind the three states.
  * @see ../utils/format for the metric, duration and label formatting.
@@ -136,7 +206,7 @@
  */
 
 import type { DataQuery, DataQuerySource, MetricCardsNode } from '@debuggen/panel-schema';
-import { PANEL_NODE_CATALOG } from '@debuggen/panel-schema';
+import { DATA_QUERY_DEFAULT_OFFSET, PANEL_NODE_CATALOG } from '@debuggen/panel-schema';
 import type { MetricId, MetricValue } from '@debuggen/telemetry';
 import clsx from 'clsx';
 import { Info } from 'lucide-react';
@@ -152,6 +222,7 @@ import { Tooltip } from '../primitives/Tooltip';
 import { durationColorVar } from '../utils/color';
 import {
   NOT_AVAILABLE_LABEL,
+  formatCount,
   formatDurationParts,
   formatMetric,
   humanizeLabel,
@@ -178,6 +249,31 @@ type CssVariableStyle = CSSProperties & Record<`--${string}`, string>;
  */
 const METRICS_SOURCE = 'metrics' satisfies DataQuerySource;
 
+/**
+ * A query narrowed to the one source these tiles draw — the node's own, or it
+ * with `offset` advanced to a page the service reported.
+ */
+type MetricsQuery = DataQuery & { source: typeof METRICS_SOURCE };
+
+/**
+ * The offset of a source's first item.
+ *
+ * A read that began anywhere else cannot have seen the items before it, so it
+ * can never be complete however many pages follow. Named rather than written
+ * as a bare `0` at the comparison, because it is a statement about the start of
+ * the source and not about the offset a query receives when it omits one
+ * (`DATA_QUERY_DEFAULT_OFFSET`), even though the two are the same number.
+ */
+const SOURCE_START_OFFSET = 0;
+
+/**
+ * The collection a read starts from: no values yet.
+ *
+ * One frozen module-level array, so the first page level receives the same
+ * identity on every render instead of a fresh literal.
+ */
+const NO_VALUES: readonly MetricValue[] = Object.freeze([]);
+
 /** This node type's catalog entry — the single registry of what it is. */
 const CATALOG_ENTRY = PANEL_NODE_CATALOG.metricCards;
 
@@ -199,6 +295,30 @@ const SOURCE_MISMATCH_MESSAGE = `These tiles can only draw the "${METRICS_SOURCE
 /** The note a tile carries when the capture computed no value for its id. */
 const MISSING_METRIC_NOTE = 'This value is not part of the computed set of this capture.';
 
+/**
+ * The figure of a tile whose value lies outside the page or pages this query
+ * requested.
+ *
+ * Deliberately not {@link NOT_AVAILABLE_LABEL}: that spelling says the capture
+ * holds no value, and this one says only that the read did not reach it. Not a
+ * `0` and not a dash either, for the same reason the absent label is neither —
+ * each would read as an observation. Module-private, because the distinction it
+ * draws belongs to this view's paging and to no other formatter's vocabulary.
+ */
+const NOT_ON_PAGE_LABEL = 'not on page';
+
+/** The note a tile carries when its value lies outside the page or pages read. */
+const NOT_ON_PAGE_NOTE =
+  'This value lies outside the page or pages this query requested; the capture may still hold it.';
+
+/**
+ * Copy for a read that holds no values although the capture may have computed
+ * some — a node naming no ids, answered by a count-only or offset page.
+ * {@link offPageEmptyMessage} appends the service's total when it reported one.
+ */
+const OFF_PAGE_EMPTY_MESSAGE =
+  'The computed values of this capture lie outside the page this query requested.';
+
 /** The accessible name of the advisory-note affordance; its description is the note. */
 const NOTE_AFFORDANCE_LABEL = 'Coverage note';
 
@@ -209,18 +329,22 @@ const LOADING_LABEL = 'Loading the computed values of this capture';
  * One tile, fully resolved: what to show, in what unit, and whether the figure
  * is a measurement.
  *
- * Built by {@link describeMetric} from a metric value, or by
- * {@link describeMissingMetric} for a requested id the capture did not compute.
- * Deliberately flat and string-valued: every judgement — availability, the
- * unit's split from the figure, the severity token — is made once, before any
- * markup, so the rendering below is a single pass with no arithmetic in it.
+ * Built by {@link describeMetric} from a metric value, by
+ * {@link describeMissingMetric} for a requested id a complete read did not
+ * find, or by {@link describeOffPageMetric} for one a partial read did not
+ * reach. Deliberately flat and string-valued: every judgement — availability,
+ * the unit's split from the figure, the severity token — is made once, before
+ * any markup, so the rendering below is a single pass with no arithmetic in it.
  */
 interface MetricCard {
   /** Which metric this tile is, used for its React key. */
   readonly id: MetricId;
   /** The tile's heading, as the aggregate layer labelled it. */
   readonly label: string;
-  /** The figure, already formatted — or {@link NOT_AVAILABLE_LABEL}. */
+  /**
+   * The figure, already formatted — or {@link NOT_AVAILABLE_LABEL}, or
+   * {@link NOT_ON_PAGE_LABEL}.
+   */
   readonly figure: string;
   /** The unit symbol, when the figure has one to show beside it. */
   readonly unit: string | undefined;
@@ -228,8 +352,21 @@ interface MetricCard {
   readonly severityColor: string | undefined;
   /** The metric's coverage caveat, shown as an advisory note. */
   readonly note: string | undefined;
-  /** Whether {@link figure} is a measurement rather than the absent label. */
+  /** Whether {@link figure} is a measurement rather than either absent spelling. */
   readonly available: boolean;
+}
+
+/**
+ * What one read — the pages followed so far — has collected.
+ *
+ * Built by {@link collectPage} once per settled page, so the decision to follow
+ * another page and the tiles drawn when none is followed read the same values.
+ */
+interface CollectedValues {
+  /** Every distinct id's value, first occurrence first, in arrival order. */
+  readonly values: readonly MetricValue[];
+  /** Whether the latest page added an id no earlier page carried. */
+  readonly contributed: boolean;
 }
 
 /**
@@ -242,7 +379,7 @@ interface MetricCard {
  * being coerced, because coercing it would draw metric tiles from whatever the
  * other source resolved to.
  */
-function isMetricsQuery(query: DataQuery): query is DataQuery & { source: typeof METRICS_SOURCE } {
+function isMetricsQuery(query: DataQuery): query is MetricsQuery {
   return query.source === METRICS_SOURCE;
 }
 
@@ -302,7 +439,8 @@ function describeMetric(metric: MetricValue): MetricCard {
 }
 
 /**
- * The tile for a requested id the capture holds no value for.
+ * The tile for a requested id the capture holds no value for — an id a
+ * complete read did not find.
  *
  * Still drawn, still in the author's position, and explicitly unavailable: the
  * author asked for this number, and a silently dropped tile would leave them
@@ -323,28 +461,155 @@ function describeMissingMetric(id: MetricId): MetricCard {
 }
 
 /**
+ * The tile for a requested id a partial read did not reach.
+ *
+ * Shaped like {@link describeMissingMetric} — still drawn, in the author's
+ * position, muted, with the humanized heading — but it claims less: its figure
+ * is {@link NOT_ON_PAGE_LABEL} and its note says the value lies outside the page
+ * or pages requested, because nothing the read saw says the capture lacks it.
+ */
+function describeOffPageMetric(id: MetricId): MetricCard {
+  return {
+    id,
+    label: humanizeLabel(id),
+    figure: NOT_ON_PAGE_LABEL,
+    unit: undefined,
+    severityColor: undefined,
+    note: NOT_ON_PAGE_NOTE,
+    available: false,
+  };
+}
+
+/**
  * Chooses which tiles to draw, and in which order.
  *
  * The node's `metrics` option is the author's emphasis — first id, first tile —
  * so it drives both the selection and the order, with every requested id
- * drawn whether or not the capture computed it. A node with no ids (which the
+ * drawn whether or not the read found it. A node with no ids (which the
  * schema does not permit, but a hand-built object can express) falls back to the
- * order the response arrived in, which is the vocabulary's own order.
+ * order the values arrived in, which is the vocabulary's own order.
+ *
+ * @param node The node, for its `metrics` option.
+ * @param values The values the read collected, one per id.
+ * @param complete Whether the read covered every computed value, which decides
+ *   whether a missing id is unavailable or merely not on the pages read.
  */
-function selectCards(node: MetricCardsNode, values: readonly MetricValue[]): MetricCard[] {
+function selectCards(
+  node: MetricCardsNode,
+  values: readonly MetricValue[],
+  complete: boolean,
+): MetricCard[] {
   if (node.metrics.length === 0) {
     return values.map(describeMetric);
   }
 
   const byId = new Map<MetricId, MetricValue>(values.map((value) => [value.id, value]));
+  const describeAbsent = complete ? describeMissingMetric : describeOffPageMetric;
 
   return node.metrics.map((id) => {
     // `noUncheckedIndexedAccess` makes the miss explicit, and the miss is the
-    // requested-but-not-computed case rather than an error.
+    // requested-but-not-found case rather than an error.
     const value = byId.get(id);
 
-    return value === undefined ? describeMissingMetric(id) : describeMetric(value);
+    return value === undefined ? describeAbsent(id) : describeMetric(value);
   });
+}
+
+/**
+ * Adds one page's values to what earlier pages collected, by id.
+ *
+ * The first occurrence of an id wins — an earlier page's, or the earlier entry
+ * within this page — and arrival order is preserved, so a tile always shows
+ * exactly what one response said about its id and the vocabulary's order
+ * survives the stitch. Nothing is compared, combined or re-derived across
+ * entries: a later value for an id already collected is not "newer", it is a
+ * producer repeating itself, and it is dropped.
+ *
+ * @param collected The values of the pages before this one.
+ * @param page The page that just settled.
+ * @returns The values so far, and whether this page added an id.
+ */
+function collectPage(
+  collected: readonly MetricValue[],
+  page: readonly MetricValue[],
+): CollectedValues {
+  const seen = new Set<MetricId>(collected.map((value) => value.id));
+  const added: MetricValue[] = [];
+
+  for (const value of page) {
+    if (!seen.has(value.id)) {
+      seen.add(value.id);
+      added.push(value);
+    }
+  }
+
+  // The earlier collection is returned as-is when nothing was added, so a page
+  // that made no progress hands on the very array it received.
+  return added.length === 0
+    ? { values: collected, contributed: false }
+    : { values: [...collected, ...added], contributed: true };
+}
+
+/**
+ * Whether the tiles still need a value no page read so far carried.
+ *
+ * A node naming no ids draws every computed value, so for it the answer is
+ * always yes: only the service's end-of-data, a stalled counter or a page that
+ * adds nothing stops that read.
+ */
+function needsMoreValues(node: MetricCardsNode, values: readonly MetricValue[]): boolean {
+  if (node.metrics.length === 0) {
+    return true;
+  }
+
+  const present = new Set<MetricId>(values.map((value) => value.id));
+
+  return node.metrics.some((id) => !present.has(id));
+}
+
+/**
+ * Whether a finished read covered every value the capture computed.
+ *
+ * Three facts, each read off the query or the service's counters rather than
+ * guessed: the read started at the source's first item; its last page reported
+ * no further page; and, when the service reported a `total`, the read holds at
+ * least that many values. The third only matters for a response that contradicts itself —
+ * a last page whose counters say items exist that none of the pages carried —
+ * and there the honest reading is that the values lie outside what was read,
+ * never that the capture lacks them.
+ *
+ * @param firstOffset The offset the read's first page started at.
+ * @param nextOffset The last settled page's next offset, `undefined` at the end.
+ * @param collectedCount How many distinct values the read holds.
+ * @param total The service's reported total, if it reported one.
+ */
+function isCompleteRead(
+  firstOffset: number,
+  nextOffset: number | undefined,
+  collectedCount: number,
+  total: number | undefined,
+): boolean {
+  return (
+    firstOffset === SOURCE_START_OFFSET &&
+    nextOffset === undefined &&
+    (total === undefined || collectedCount >= total)
+  );
+}
+
+/**
+ * The empty message for a node naming no ids whose read holds no values while
+ * the capture may hold some: {@link OFF_PAGE_EMPTY_MESSAGE}, with the service's
+ * `total` when it reported one. The count is the service's, formatted and
+ * never computed here.
+ */
+function offPageEmptyMessage(total: number | undefined): string {
+  if (total === undefined) {
+    return OFF_PAGE_EMPTY_MESSAGE;
+  }
+
+  const noun = total === 1 ? 'value' : 'values';
+
+  return `${OFF_PAGE_EMPTY_MESSAGE} The capture reports ${formatCount(total)} computed ${noun} in total.`;
 }
 
 /** A tile's accessible name: its heading, its figure and its unit, in that order. */
@@ -392,88 +657,56 @@ function stateFrame(
 }
 
 /**
- * The props of {@link MetricCards}.
+ * The finished read, drawn: the tiles, or the empty state when there is nothing
+ * to tile.
  *
- * Every optional prop spells `| undefined`, as everything else in this package
- * does: `exactOptionalPropertyTypes` is in force repository-wide, so a parent
- * forwarding a value it may not have has to remain legal.
+ * Called by the last page level once no further page is needed, with every
+ * value the read collected. The empty state follows the coverage rule in the
+ * module note: "nothing was computed" only when the service reported a `total`
+ * of zero or the read was complete. Otherwise the named ids are drawn as not on
+ * the page, and a node naming none gets the off-page empty message.
+ *
+ * @param node The node, for its `metrics` option.
+ * @param className The caller's class names, composed on the root.
+ * @param values The values the read collected, one per id, in arrival order.
+ * @param complete Whether the read covered every computed value.
+ * @param total The service's reported total, if it reported one.
+ * @returns The tile grid, or an empty state.
  */
-export interface MetricCardsProps {
-  /**
-   * The validated `metricCards` node to draw.
-   *
-   * Its `query` is resolved as given, and its `metrics` option — which is a
-   * node option and never a query field — chooses the tiles and their order.
-   */
-  node: MetricCardsNode;
+function renderRead(
+  node: MetricCardsNode,
+  className: string | undefined,
+  values: readonly MetricValue[],
+  complete: boolean,
+  total: number | undefined,
+): ReactElement {
+  if (values.length === 0) {
+    // A capture that computed nothing is an empty state rather than a row of
+    // absent tiles: there is no value to report the absence of. A requested id
+    // missing from a non-empty read is the other case, and it is a tile.
+    if (complete || total === 0) {
+      return stateFrame(
+        'dg-metric-cards__empty',
+        className,
+        <EmptyState message={EMPTY_MESSAGE} />,
+      );
+    }
 
-  /** Extra class names, composed after this component's own, on the root. */
-  className?: string | undefined;
-}
-
-/**
- * The capture's computed values as a row of tiles.
- *
- * @param props The props, as documented on {@link MetricCardsProps}.
- * @returns The tile grid, or the loading, empty or error state of its query.
- *
- * @example A panel's headline numbers, resolved through the host's provider.
- * ```tsx
- * <MetricCards node={node} />
- * ```
- */
-export function MetricCards(props: MetricCardsProps): ReactElement {
-  const { node, className } = props;
-
-  // The node's query, unmodified, and `undefined` when it names a source these
-  // tiles cannot draw - in which case the hook resolves nothing and the error
-  // state below reports it. Called unconditionally, as a hook must be.
-  const query = isMetricsQuery(node.query) ? node.query : undefined;
-  const { status, data, error, retry } = useQuery(query);
-
-  if (query === undefined) {
-    return stateFrame(
-      'dg-metric-cards__error',
-      className,
-      <ErrorState message={SOURCE_MISMATCH_MESSAGE} query={describeQuery(node.query)} />,
-    );
+    // Values may lie beyond the page read. With ids named, each is a tile that
+    // says so, below; with none named there is no tile to draw, and the empty
+    // state says where the values are rather than that they are absent.
+    if (node.metrics.length === 0) {
+      return stateFrame(
+        'dg-metric-cards__empty',
+        className,
+        <EmptyState message={offPageEmptyMessage(total)} />,
+      );
+    }
   }
 
-  if (status === 'loading') {
-    // `block` is the skeleton shaped like a group of tiles rather than like a
-    // list of rows or a chart canvas.
-    return stateFrame(
-      'dg-metric-cards__loading',
-      className,
-      <LoadingState variant="block" label={LOADING_LABEL} />,
-    );
-  }
-
-  if (status === 'error') {
-    // Generic copy plus the machine detail: the failure's own code and the
-    // query that produced it, with a retry. A failure is never dressed up as a
-    // finding (AAP 0.5.5), so no part of the error text is presented as data.
-    return stateFrame(
-      'dg-metric-cards__error',
-      className,
-      <ErrorState
-        message={ERROR_MESSAGE}
-        code={error?.code}
-        query={describeQuery(node.query)}
-        onRetry={retry}
-      />,
-    );
-  }
-
-  const values = data ?? [];
-  const cards = selectCards(node, values);
-
-  // A capture that computed nothing is an empty state rather than a row of
-  // absent tiles: there is no value to report the absence of. A requested id
-  // missing from a non-empty response is the other case, and it is a tile.
-  if (values.length === 0 || cards.length === 0) {
-    return stateFrame('dg-metric-cards__empty', className, <EmptyState message={EMPTY_MESSAGE} />);
-  }
+  // Never empty past this point: an empty read naming no ids returned above,
+  // and otherwise there is one tile per named id or one per collected value.
+  const cards = selectCards(node, values, complete);
 
   return (
     <ul className={clsx('dg-metric-cards', className)} role="list" aria-label={CATALOG_ENTRY.label}>
@@ -544,5 +777,172 @@ export function MetricCards(props: MetricCardsProps): ReactElement {
         </li>
       ))}
     </ul>
+  );
+}
+
+/**
+ * The props of one {@link MetricCardsPage} level.
+ *
+ * Every member is required, with `| undefined` spelled where a value may be
+ * absent: a level is only ever created by {@link MetricCards} or by the level
+ * above it, and each of those knows every value it passes.
+ */
+interface MetricCardsPageProps {
+  /** The node being drawn, for its `metrics` option. */
+  readonly node: MetricCardsNode;
+  /** The caller's class names, composed on whichever root this level renders. */
+  readonly className: string | undefined;
+  /** This level's page: the node's own query, or it with `offset` advanced. */
+  readonly query: MetricsQuery;
+  /** The offset the read's first page started at, for {@link isCompleteRead}. */
+  readonly firstOffset: number;
+  /** What the pages before this one collected, by id, in arrival order. */
+  readonly collected: readonly MetricValue[];
+  /** The latest `total` an earlier page reported, if any did. */
+  readonly knownTotal: number | undefined;
+}
+
+/**
+ * One page of the read: resolves its query, then renders either the next page's
+ * level or the finished read.
+ *
+ * Recursive by design, because that is what keeps the rules of hooks: each
+ * level calls {@link useQuery} exactly once and unconditionally, and how many
+ * levels there are is decided by the data rather than by a loop of hook calls.
+ * A level stays mounted only while it is needed. A level whose own query
+ * changes or fails renders a state instead of its child, which unmounts the
+ * child and aborts that child's request through the hook's own cleanup, so no
+ * level ever draws a page for a read that has since moved on.
+ *
+ * @param props The props, as documented on {@link MetricCardsPageProps}.
+ * @returns This page's loading or error state, the next level, or the tiles.
+ */
+function MetricCardsPage(props: MetricCardsPageProps): ReactElement {
+  const { node, className, query, firstOffset, collected, knownTotal } = props;
+  const { status, data, error, total, nextOffset, retry } = useQuery(query);
+
+  if (status === 'loading') {
+    // `block` is the skeleton shaped like a group of tiles rather than like a
+    // list of rows or a chart canvas. A follow-up page shows the same skeleton
+    // as the first: the tiles are drawn once, from the finished read, never
+    // from the part of it that has arrived so far.
+    return stateFrame(
+      'dg-metric-cards__loading',
+      className,
+      <LoadingState variant="block" label={LOADING_LABEL} />,
+    );
+  }
+
+  if (status === 'error') {
+    // Generic copy plus the machine detail: the failure's own code and the
+    // query of the page that failed, with a retry that re-requests that page
+    // alone. A failure is never dressed up as a finding (AAP 0.5.5), so no part
+    // of the error text is presented as data — and neither are the pages that
+    // did arrive before it.
+    return stateFrame(
+      'dg-metric-cards__error',
+      className,
+      <ErrorState
+        message={ERROR_MESSAGE}
+        code={error?.code}
+        query={describeQuery(query)}
+        onRetry={retry}
+      />,
+    );
+  }
+
+  const read = collectPage(collected, data ?? NO_VALUES);
+  const reportedTotal = total ?? knownTotal;
+  const pageOffset = query.offset ?? DATA_QUERY_DEFAULT_OFFSET;
+
+  // The four conditions of the module note, in order: the service reported a
+  // further page, its counter advanced past this page, this page made progress,
+  // and the tiles still need a value. A `NaN` counter fails the comparison and
+  // so ends the read rather than looping on it.
+  if (
+    nextOffset !== undefined &&
+    nextOffset > pageOffset &&
+    read.contributed &&
+    needsMoreValues(node, read.values)
+  ) {
+    // The authored filter, sort and limit are kept; only the offset changes,
+    // and it changes to the service's own counter.
+    return (
+      <MetricCardsPage
+        node={node}
+        className={className}
+        query={{ ...query, offset: nextOffset }}
+        firstOffset={firstOffset}
+        collected={read.values}
+        knownTotal={reportedTotal}
+      />
+    );
+  }
+
+  const complete = isCompleteRead(firstOffset, nextOffset, read.values.length, reportedTotal);
+
+  return renderRead(node, className, read.values, complete, reportedTotal);
+}
+
+/**
+ * The props of {@link MetricCards}.
+ *
+ * Every optional prop spells `| undefined`, as everything else in this package
+ * does: `exactOptionalPropertyTypes` is in force repository-wide, so a parent
+ * forwarding a value it may not have has to remain legal.
+ */
+export interface MetricCardsProps {
+  /**
+   * The validated `metricCards` node to draw.
+   *
+   * Its `query` is resolved exactly as given for the first page, and with only
+   * its `offset` advanced for any page after it. Its `metrics` option — which
+   * is a node option and never a query field — chooses the tiles and their
+   * order, and decides whether a further page is needed at all.
+   */
+  node: MetricCardsNode;
+
+  /** Extra class names, composed after this component's own, on the root. */
+  className?: string | undefined;
+}
+
+/**
+ * The capture's computed values as a row of tiles.
+ *
+ * @param props The props, as documented on {@link MetricCardsProps}.
+ * @returns The tile grid, or the loading, empty or error state of its query.
+ *
+ * @example A panel's headline numbers, resolved through the host's provider.
+ * ```tsx
+ * <MetricCards node={node} />
+ * ```
+ */
+export function MetricCards(props: MetricCardsProps): ReactElement {
+  const { node, className } = props;
+  const { query } = node;
+
+  // A node naming a source these tiles cannot draw asks the provider for
+  // nothing, and its error state shows the node's own query with no retry,
+  // since re-issuing it cannot change the answer. This component calls no hook
+  // itself — each page level calls its own — so returning early is legal.
+  if (!isMetricsQuery(query)) {
+    return stateFrame(
+      'dg-metric-cards__error',
+      className,
+      <ErrorState message={SOURCE_MISMATCH_MESSAGE} query={describeQuery(query)} />,
+    );
+  }
+
+  // The first page is the node's query exactly as authored; the read starts at
+  // the offset it names, or at the service's default when it names none.
+  return (
+    <MetricCardsPage
+      node={node}
+      className={className}
+      query={query}
+      firstOffset={query.offset ?? DATA_QUERY_DEFAULT_OFFSET}
+      collected={NO_VALUES}
+      knownTotal={undefined}
+    />
   );
 }

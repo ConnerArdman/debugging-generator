@@ -7,7 +7,7 @@
  * coordination service has already filtered, ordered and paged
  * (`POST /sessions/:id/panel-data` applies `filter`, `sort`, `limit` and
  * `offset` and answers with `total` and `nextOffset`, AAP 0.4.2), and it says
- * out loud how much of the capture that page covers. Four properties of that
+ * out loud how much of the capture that page covers. Six properties of that
  * contract are mechanical rather than cosmetic, and each has a case below:
  *
  *   - **the page is drawn as it arrived** — the rows appear in the provider's
@@ -22,7 +22,15 @@
  *     toolbar states both the matching/loaded ratio and that limitation rather
  *     than implying the whole capture was searched;
  *   - **paging advances by the offset the service reported** — never by the
- *     length of what arrived, which drifts the moment a limit is clamped.
+ *     length of what arrived, which drifts the moment a limit is clamped, and
+ *     only forward, so a `nextOffset` that does not move offers no control;
+ *   - **the authored page is the one requested** — the sequence starts at the
+ *     node's own `offset`, restarts when that offset changes, and the footer
+ *     counts from it; an explicit `limit: 0` is sent as zero and never paged;
+ *   - **an empty page is not always an empty capture** — a count-only query,
+ *     an offset past the end and a page the service left empty each state the
+ *     total or position they know, and only a total of zero (or no total from
+ *     the first record) reads as "nothing was captured".
  *
  * Two further properties belong to the privacy model (AAP 0.5.2). Attribute
  * values arrive already redacted and already bounded to
@@ -90,13 +98,18 @@
  * @see ../host/useQuery for the loading/error/success machine they drive.
  */
 
-import { DATA_QUERY_DEFAULT_LIMIT, DATA_QUERY_DEFAULT_OFFSET } from '@debuggen/panel-schema';
+import {
+  DATA_QUERY_DEFAULT_LIMIT,
+  DATA_QUERY_DEFAULT_OFFSET,
+  DATA_QUERY_MAX_LIMIT,
+} from '@debuggen/panel-schema';
 import type { DataQuery, EventLogNode } from '@debuggen/panel-schema';
 import { DebuggenError } from '@debuggen/shared';
 import type { SourceLocation } from '@debuggen/shared';
 import type { TelemetryEvent } from '@debuggen/telemetry';
 import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import type { ReactElement } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Mock } from 'vitest';
 
@@ -194,6 +207,15 @@ const COLUMN_HEADERS: readonly string[] = ['Seq', 'Offset', 'Kind', 'Name', 'Att
 
 /** The note that keeps the text filter honest, as the toolbar states it. */
 const PARTIAL_SEARCH_NOTE = 'Text filter applies to loaded records only';
+
+/** The heading of the state a count-only (`limit: 0`) query resolves to. */
+const COUNT_ONLY_TITLE = 'Count only';
+
+/** The heading of an empty page that is not an empty capture. */
+const EMPTY_PAGE_TITLE = 'Nothing on this page';
+
+/** The generic substring of the product's own empty-capture copy. */
+const EMPTY_CAPTURE_PATTERN = /no records were captured/i;
 
 /*
  * ---------------------------------------------------------------------------
@@ -502,20 +524,28 @@ function makeActions(): ActionSpies {
  *
  * @param node The node to draw.
  * @param context The provider to resolve its query and the actions to report to.
+ * @returns A function that re-renders the same mounted component, inside the
+ * same contexts, with another node — how a host hands an existing panel slot a
+ * changed specification, and what the page-sequence reset cases drive.
  */
 function renderComponent(
   node: EventLogNode,
   context: { readonly provider: DataProvider; readonly actions: PanelActions },
-): void {
-  render(
+): (next: EventLogNode) => void {
+  const tree = (current: EventLogNode): ReactElement => (
     <DataProviderContext.Provider value={context.provider}>
       <PanelSessionContext.Provider value={SESSION_ID}>
         <PanelActionsContext.Provider value={context.actions}>
-          <EventLog node={node} />
+          <EventLog node={current} />
         </PanelActionsContext.Provider>
       </PanelSessionContext.Provider>
-    </DataProviderContext.Provider>,
+    </DataProviderContext.Provider>
   );
+  const { rerender } = render(tree(node));
+
+  return (next: EventLogNode): void => {
+    rerender(tree(next));
+  };
 }
 
 /**
@@ -705,6 +735,19 @@ function orderedNode(): EventLogNode {
   return makeNode({
     query: { source: 'events', sort: 'start_asc', limit: DATA_QUERY_DEFAULT_LIMIT },
   });
+}
+
+/**
+ * A node whose query starts at an authored offset, as a validated panel may
+ * write one.
+ *
+ * @param offset The authored `offset`: a whole number, at least zero.
+ * @param limit The authored `limit`, the default page size unless a case needs
+ * another — zero included, which the schema accepts as "a total without rows".
+ * @returns A fresh node.
+ */
+function nodeFrom(offset: number, limit: number = DATA_QUERY_DEFAULT_LIMIT): EventLogNode {
+  return makeNode({ query: { source: 'events', limit, offset } });
 }
 
 describe('EventLog states', () => {
@@ -1367,5 +1410,378 @@ describe('EventLog paging', () => {
     const coverage = await screen.findByText(`${formatCount(1)} records loaded`);
     expect(coverage.textContent).not.toContain(' of ');
     expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+  });
+});
+
+describe('EventLog authored offset', () => {
+  it('starts at the authored offset and counts the footer from that position', async () => {
+    // Two hundred and forty records match; the node asks for those from
+    // position 201 on, so forty remain from where it starts. `nextOffset` is
+    // deliberately not 200 + the page length: the next request must carry the
+    // service's own value.
+    const stub = pagingProvider('events', [
+      { data: [RENDER_RECORD, FETCH_RECORD], total: 240, nextOffset: 250 },
+      { data: [INTERACTION_RECORD], total: 240 },
+    ]);
+    const user = userEvent.setup();
+
+    renderComponent(nodeFrom(200), { provider: stub.provider, actions: makeActions().actions });
+
+    // Relative to the authored start, and the start is stated: "2 of 240"
+    // would read as coverage of the whole capture from its first record.
+    await screen.findByText(
+      `${formatCount(2)} of ${formatCount(40)} records loaded, from position ${formatCount(201)}`,
+    );
+    expect(screen.queryByText(new RegExp(`of ${formatCount(240)} records loaded`))).toBeNull();
+    expect(renderedNames()).toEqual([RENDER_RECORD.name, FETCH_RECORD.name]);
+
+    // The very first request honours the authored offset.
+    const first = soleQuery(stub);
+    expect(first.offset).toBe(200);
+    expect(first.limit).toBe(DATA_QUERY_DEFAULT_LIMIT);
+
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+
+    // Exactly the service's `nextOffset`, not one derived from what arrived.
+    expect(stub.resolve).toHaveBeenCalledTimes(2);
+    expect(queryOfCall(stub, 2).offset).toBe(250);
+
+    await waitFor(() => {
+      expect(renderedNames()).toEqual([
+        RENDER_RECORD.name,
+        FETCH_RECORD.name,
+        INTERACTION_RECORD.name,
+      ]);
+    });
+    expect(
+      screen.getByText(
+        `${formatCount(3)} of ${formatCount(40)} records loaded, from position ${formatCount(201)}`,
+      ),
+    ).toBeDefined();
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+  });
+
+  it('states the starting position alone when the service reported no total', async () => {
+    const stub = resolvingProvider('events', [INTERACTION_RECORD]);
+
+    renderComponent(nodeFrom(200), { provider: stub.provider, actions: makeActions().actions });
+
+    const coverage = await screen.findByText(
+      `${formatCount(1)} records loaded, from position ${formatCount(201)}`,
+    );
+    expect(coverage.textContent).not.toContain(' of ');
+    expect(soleQuery(stub).offset).toBe(200);
+  });
+
+  it('starts a fresh page sequence when the authored offset changes', async () => {
+    const stub = pagingProvider('events', [
+      { data: [RENDER_RECORD], total: 240, nextOffset: 201 },
+      { data: [FETCH_RECORD], total: 240, nextOffset: 202 },
+      { data: [INTERACTION_RECORD], total: 240, nextOffset: 101 },
+    ]);
+    const user = userEvent.setup();
+
+    const rerenderWith = renderComponent(nodeFrom(200), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    await screen.findByRole('grid');
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+    await waitFor(() => {
+      expect(renderedNames()).toEqual([RENDER_RECORD.name, FETCH_RECORD.name]);
+    });
+    expect(queryOfCall(stub, 2).offset).toBe(201);
+
+    // The same slot now carries a node that starts elsewhere: that is another
+    // sequence, so its first request is at the new authored offset — not at
+    // the offset the old sequence had reached — and nothing loaded for the old
+    // one is carried under the new one's counts.
+    rerenderWith(nodeFrom(100));
+
+    await waitFor(() => {
+      expect(stub.resolve).toHaveBeenCalledTimes(3);
+    });
+    expect(queryOfCall(stub, 3).offset).toBe(100);
+
+    await waitFor(() => {
+      expect(renderedNames()).toEqual([INTERACTION_RECORD.name]);
+    });
+    expect(
+      screen.getByText(
+        `${formatCount(1)} of ${formatCount(140)} records loaded, from position ${formatCount(101)}`,
+      ),
+    ).toBeDefined();
+  });
+
+  it.each([
+    ['equal to the offset of the page it answered', 200],
+    ['behind the offset of the page it answered', 150],
+  ])('offers no Load More for a nextOffset %s', async (_label, nextOffset) => {
+    // A `nextOffset` that does not move forward would re-request the page on
+    // screen and append it twice; the control is withheld rather than offered.
+    const stub = resolvingProvider('events', [RENDER_RECORD], { total: 240, nextOffset });
+
+    renderComponent(nodeFrom(200), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByText(
+      `${formatCount(1)} of ${formatCount(40)} records loaded, from position ${formatCount(201)}`,
+    );
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+    expect(stub.resolve).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses an answer whose nextOffset is not a whole number, and offers no Load More', async () => {
+    // The host's response check rejects a counter that is not a non-negative
+    // integer before the view sees the page, so no row of that answer is drawn
+    // and no page is offered past it: the failure is stated, with its code.
+    const stub = resolvingProvider('events', [RENDER_RECORD], { total: 240, nextOffset: 200.5 });
+
+    renderComponent(nodeFrom(200), { provider: stub.provider, actions: makeActions().actions });
+
+    const alert = await screen.findByRole('alert');
+    expect(within(alert).getByText('PROTOCOL_INVALID_MESSAGE')).toBeDefined();
+    expect(screen.queryAllByRole('row')).toHaveLength(0);
+    expect(screen.queryByText(RENDER_RECORD.name)).toBeNull();
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+    expect(stub.resolve).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('EventLog page size', () => {
+  it.each([
+    ['an explicit zero as zero', 0, 0],
+    ['a fractional limit truncated', 7.9, 7],
+    ['a negative limit as zero', -3, 0],
+    ['a limit above the ceiling at the ceiling', DATA_QUERY_MAX_LIMIT + 1, DATA_QUERY_MAX_LIMIT],
+    ['a non-finite limit at the default', Number.NaN, DATA_QUERY_DEFAULT_LIMIT],
+  ])('requests %s', (_label, authored, expected) => {
+    // Zero is a legitimate authored value — a total without rows — and only
+    // the absence of the field means "unset", so it is never raised to a row.
+    const stub = pendingProvider();
+
+    renderComponent(nodeFrom(0, authored), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    expect(soleQuery(stub).limit).toBe(expected);
+  });
+
+  it('requests the default page size when the node omits a limit', () => {
+    const stub = pendingProvider();
+
+    renderComponent(makeNode({ query: { source: 'events' } }), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    const query = soleQuery(stub);
+    expect(query.limit).toBe(DATA_QUERY_DEFAULT_LIMIT);
+    expect(query.offset).toBe(DATA_QUERY_DEFAULT_OFFSET);
+  });
+
+  it('never pages a count-only query, whatever nextOffset answers it', async () => {
+    // A provider that answers `limit: 0` with a row and a forward `nextOffset`
+    // anyway: the row is the service's business and is drawn, but a page
+    // sequence of zero-row pages cannot advance, so nothing offers to ask again.
+    const stub = resolvingProvider('events', [RENDER_RECORD], { total: 42, nextOffset: 1 });
+
+    renderComponent(nodeFrom(0, 0), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByText(`${formatCount(1)} of ${formatCount(42)} records loaded`);
+    expect(soleQuery(stub).limit).toBe(0);
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+    expect(stub.resolve).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('EventLog empty pages', () => {
+  /**
+   * The empty state's heading, obtained by its text, and checked to be the
+   * heading of the component's own absence box rather than any other text.
+   *
+   * @param title The heading expected.
+   * @returns That heading element.
+   */
+  async function emptyStateTitle(title: string): Promise<HTMLElement> {
+    const heading = await screen.findByText(title);
+    expect(heading.classList.contains('dg-empty-state__title')).toBe(true);
+    expect(heading.closest('.dg-event-log__empty')).not.toBeNull();
+
+    return heading;
+  }
+
+  /**
+   * Asserts the empty state's sentence, exactly, and that it is the state's
+   * message element.
+   *
+   * @param message The sentence expected.
+   */
+  function expectEmptyStateMessage(message: string): void {
+    const element = screen.getByText(message);
+    expect(element.classList.contains('dg-empty-state__message')).toBe(true);
+  }
+
+  it('states the total of a count-only query and never asks for a page', async () => {
+    // The service points `nextOffset` at the very offset it answered: a
+    // count-only query must neither offer nor make a second request for it.
+    const stub = resolvingProvider('events', [], { total: 42, nextOffset: 0 });
+
+    renderComponent(nodeFrom(0, 0), { provider: stub.provider, actions: makeActions().actions });
+
+    await emptyStateTitle(COUNT_ONLY_TITLE);
+    expectEmptyStateMessage(
+      `This view requests a count without rows: ${formatCount(42)} events matched its query.`,
+    );
+
+    // Not an empty capture: forty-two records matched.
+    expect(screen.queryByText(EMPTY_CAPTURE_PATTERN)).toBeNull();
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.queryAllByRole('row')).toHaveLength(0);
+
+    // Zero was sent as zero, once, and nothing offers to page it.
+    const query = soleQuery(stub);
+    expect(query.limit).toBe(0);
+    expect(query.offset).toBe(DATA_QUERY_DEFAULT_OFFSET);
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+    expect(screen.queryByText(/records loaded/)).toBeNull();
+    expect(stub.resolve).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['a total of one', 1, 'This view requests a count without rows: 1 event matched its query.'],
+    ['a total of zero', 0, 'This view requests a count without rows: 0 events matched its query.'],
+    [
+      'no total',
+      undefined,
+      'This view requests a count without rows, and no total was reported for its query.',
+    ],
+  ])('phrases a count-only query answered with %s', async (_label, total, message) => {
+    const stub = resolvingProvider('events', [], { total });
+
+    renderComponent(nodeFrom(0, 0), { provider: stub.provider, actions: makeActions().actions });
+
+    await emptyStateTitle(COUNT_ONLY_TITLE);
+    expectEmptyStateMessage(message);
+    expect(screen.queryByText(EMPTY_CAPTURE_PATTERN)).toBeNull();
+  });
+
+  it.each([
+    ['well past the end', 500, 42, `${formatCount(501)}, past the end of the 42 events`],
+    ['exactly at the end', 42, 42, `${formatCount(43)}, past the end of the 42 events`],
+    ['past a single match', 5, 1, `${formatCount(6)}, past the end of the 1 event`],
+  ])(
+    'states the position and the total of an authored offset %s',
+    async (_label, offset, total, expected) => {
+      const stub = resolvingProvider('events', [], { total });
+
+      renderComponent(nodeFrom(offset), {
+        provider: stub.provider,
+        actions: makeActions().actions,
+      });
+
+      await emptyStateTitle(EMPTY_PAGE_TITLE);
+      expectEmptyStateMessage(`This page starts at position ${expected} that matched this query.`);
+
+      // An offset past the end is an empty page, not an empty capture and not
+      // an error, and it was requested exactly as authored.
+      expect(screen.queryByText(EMPTY_CAPTURE_PATTERN)).toBeNull();
+      expect(screen.queryByRole('alert')).toBeNull();
+      expect(soleQuery(stub).offset).toBe(offset);
+      expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+    },
+  );
+
+  it.each([
+    ['the first record', 0],
+    ['an authored offset inside the matches', 10],
+  ])('states the total when a page from %s holds nothing', async (_label, offset) => {
+    const stub = resolvingProvider('events', [], { total: 42 });
+
+    renderComponent(nodeFrom(offset), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    await emptyStateTitle(EMPTY_PAGE_TITLE);
+    expectEmptyStateMessage(
+      `${formatCount(42)} events matched this query, but none are shown on this page.`,
+    );
+    expect(screen.queryByText(EMPTY_CAPTURE_PATTERN)).toBeNull();
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+  });
+
+  it('states only the position of an empty page past the first record with no total', async () => {
+    const stub = resolvingProvider('events', []);
+
+    renderComponent(nodeFrom(300), { provider: stub.provider, actions: makeActions().actions });
+
+    await emptyStateTitle(EMPTY_PAGE_TITLE);
+    expectEmptyStateMessage(
+      `This page starts at position ${formatCount(301)} and holds no events; no total was reported for this query.`,
+    );
+    expect(screen.queryByText(EMPTY_CAPTURE_PATTERN)).toBeNull();
+  });
+
+  it.each([
+    ['from the first record', 0],
+    ['from an authored offset', 300],
+  ])('keeps the empty-capture message for a total of zero %s', async (_label, offset) => {
+    const stub = resolvingProvider('events', [], { total: 0 });
+
+    renderComponent(nodeFrom(offset), { provider: stub.provider, actions: makeActions().actions });
+
+    const message = await screen.findByText(EMPTY_CAPTURE_PATTERN);
+    expect(message.classList.contains('dg-empty-state__message')).toBe(true);
+    expect(message.closest('.dg-event-log__empty')).not.toBeNull();
+
+    // The plain message, with no heading claiming anything else.
+    expect(screen.queryByText(EMPTY_PAGE_TITLE)).toBeNull();
+    expect(screen.queryByText(COUNT_ONLY_TITLE)).toBeNull();
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+  });
+
+  it('keeps the next page reachable from an empty page with a forward nextOffset', async () => {
+    const stub = pagingProvider('events', [
+      { data: [], total: 42, nextOffset: 200 },
+      { data: [FETCH_RECORD], total: 42 },
+    ]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await emptyStateTitle(EMPTY_PAGE_TITLE);
+    expectEmptyStateMessage(
+      `${formatCount(42)} events matched this query, but none are shown on this page.`,
+    );
+    expect(
+      screen.getByText(`${formatCount(0)} of ${formatCount(42)} records loaded`),
+    ).toBeDefined();
+
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+
+    // Exactly the reported offset, and the rows follow its answer.
+    expect(queryOfCall(stub, 2).offset).toBe(200);
+    await waitFor(() => {
+      expect(renderedNames()).toEqual([FETCH_RECORD.name]);
+    });
+    expect(
+      screen.getByText(`${formatCount(1)} of ${formatCount(42)} records loaded`),
+    ).toBeDefined();
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+  });
+
+  it('does not call an empty first page with a forward nextOffset and no total an empty capture', async () => {
+    const stub = resolvingProvider('events', [], { nextOffset: 200 });
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await emptyStateTitle(EMPTY_PAGE_TITLE);
+    expectEmptyStateMessage(
+      `This page starts at position ${formatCount(1)} and holds no events; no total was reported for this query.`,
+    );
+    expect(screen.queryByText(EMPTY_CAPTURE_PATTERN)).toBeNull();
+    expect(screen.getByRole('button', { name: LOAD_MORE_NAME })).toBeDefined();
   });
 });

@@ -1,0 +1,309 @@
+/**
+ * The migration-consistency gate behind `pnpm check:migration` (and `premigrate`):
+ * the committed migrations, replayed in order, must build exactly the database
+ * `prisma/schema.prisma` describes.
+ *
+ * It needs no database. The schema side is Prisma's own rendering of the schema
+ * from nothing - `prisma migrate diff --from-empty --to-schema ... --script`,
+ * piped in on standard input - and the migrations side is the `migration.sql`
+ * of every directory under `prisma/migrations`, read in the order Prisma
+ * applies them. Neither side is executed: each is reduced to the set of schema
+ * objects it creates, and the two sets must be equal.
+ *
+ * **Why a reduction rather than a text comparison.** While the history was one
+ * initial migration, that migration and the rendering were the same text, and
+ * a line-by-line `diff` was the whole check. A later migration ends that: it
+ * adds a column with `ALTER TABLE ... ADD COLUMN`, while the rendering from
+ * nothing states the same column inside `CREATE TABLE`. So both sides are read
+ * as facts - one per enum, per index, per foreign key, and one per column or
+ * table constraint, filed under its table - and a column added later is the
+ * same fact as the column created with its table. Column order is deliberately
+ * not compared: Prisma addresses columns by name, and a column added by a later
+ * migration sits last in the table whatever its place in the model.
+ *
+ * **What it replays, and what it refuses.** The statements Prisma writes when a
+ * schema grows: `CREATE TYPE`, `CREATE TABLE`, `CREATE [UNIQUE] INDEX`, and
+ * `ALTER TABLE` adding columns or constraints. A migration holding anything
+ * else - a dropped or altered column, a renamed index, a data statement - is
+ * refused with the statement named, because replaying it without a database
+ * would mean reimplementing PostgreSQL's DDL here; the check fails closed rather
+ * than passing a history it did not understand. Such a migration is verified
+ * against a live database instead, with `prisma migrate diff
+ * --from-config-datasource --to-schema prisma/schema.prisma --exit-code` after
+ * `pnpm migrate`.
+ *
+ * Exits `0` when the migrations reproduce the schema, `1` when they do not (the
+ * differing facts are printed on both sides), and `2` when nothing was rendered
+ * or a statement could not be replayed.
+ */
+
+import { Buffer } from 'node:buffer';
+import { readFileSync, readdirSync } from 'node:fs';
+import process from 'node:process';
+
+/** Where the committed history lives, beside this file. */
+const MIGRATIONS = new URL('./migrations/', import.meta.url);
+
+/** The file every migration directory holds. */
+const SCRIPT = 'migration.sql';
+
+/** Exit code for a history that does not reproduce the schema. */
+const DRIFT = 1;
+
+/**
+ * Exit code for input this check cannot judge: nothing rendered, a statement it
+ * cannot replay, or a history it could not read.
+ */
+const UNUSABLE = 2;
+
+/**
+ * `text` cut at every `separator` that stands outside quotes and parentheses,
+ * each piece trimmed, empty pieces dropped.
+ *
+ * DDL nests both: a column type carries its precision in parentheses -
+ * `DECIMAL(10,2)`, `TIMESTAMP(3)` - and a default or an enum value is quoted, so
+ * a separator inside either is part of the piece it appears in.
+ *
+ * @param text The statement text, or the body of one.
+ * @param separator The one character to cut at: `;` between statements, `,`
+ * between the elements of a table or of an `ALTER TABLE`.
+ */
+function split(text: string, separator: string): string[] {
+  const pieces: string[] = [];
+  let depth = 0;
+  let quote: string | null = null;
+  let start = 0;
+
+  for (let index = 0; index < text.length; index += 1) {
+    const character = text.charAt(index);
+
+    if (quote !== null) {
+      if (character === quote) {
+        quote = null;
+      }
+    } else if (character === "'" || character === '"') {
+      quote = character;
+    } else if (character === '(') {
+      depth += 1;
+    } else if (character === ')') {
+      depth -= 1;
+    } else if (character === separator && depth === 0) {
+      pieces.push(text.slice(start, index));
+      start = index + 1;
+    }
+  }
+
+  pieces.push(text.slice(start));
+
+  return pieces.map((piece) => piece.trim()).filter((piece) => piece.length > 0);
+}
+
+/**
+ * The statements of a SQL script, comment lines removed and each statement's
+ * whitespace collapsed to single spaces, so that the same statement written by
+ * two renderings compares equal however it was indented.
+ *
+ * @param sql A script as Prisma writes one.
+ */
+function statements(sql: string): string[] {
+  const code = sql
+    .split('\n')
+    .filter((line) => !line.trimStart().startsWith('--'))
+    .join('\n');
+
+  return split(code, ';').map((statement) => statement.replace(/\s+/g, ' '));
+}
+
+/**
+ * Records one occurrence of `fact`.
+ *
+ * A multiset rather than a set, so that a statement a history applies twice
+ * is a difference rather than something the comparison absorbs.
+ */
+function add(facts: Map<string, number>, fact: string): void {
+  facts.set(fact, (facts.get(fact) ?? 0) + 1);
+}
+
+/**
+ * Folds one statement into `facts`, or refuses it.
+ *
+ * @param facts The schema objects created so far.
+ * @param statement One statement, as {@link statements} returns it.
+ * @param origin Where the statement came from, for a refusal to name.
+ * @throws Error For a statement outside the additive forms this check replays.
+ */
+function apply(facts: Map<string, number>, statement: string, origin: string): void {
+  const table = /^CREATE TABLE ("[^"]+") \((.*)\)$/s.exec(statement);
+
+  if (table !== null) {
+    const [, name = '', body = ''] = table;
+
+    for (const element of split(body, ',')) {
+      add(facts, `${name} ${element}`);
+    }
+
+    return;
+  }
+
+  const altered = /^ALTER TABLE ("[^"]+") (.*)$/s.exec(statement);
+
+  if (altered !== null) {
+    const [, name = '', rest = ''] = altered;
+
+    // A constraint added after its table exists is rendered the same way from
+    // nothing, so the statement itself is the fact.
+    if (/^ADD CONSTRAINT /.test(rest)) {
+      add(facts, statement);
+
+      return;
+    }
+
+    for (const change of split(rest, ',')) {
+      const column = /^ADD COLUMN (.*)$/s.exec(change);
+
+      if (column === null) {
+        throw new Error(`${origin}: cannot replay "${statement}" without a database`);
+      }
+
+      add(facts, `${name} ${column[1] ?? ''}`);
+    }
+
+    return;
+  }
+
+  if (/^CREATE (SCHEMA|TYPE|(UNIQUE )?INDEX) /.test(statement)) {
+    add(facts, statement);
+
+    return;
+  }
+
+  throw new Error(`${origin}: cannot replay "${statement}" without a database`);
+}
+
+/**
+ * The schema objects a script creates, as a multiset of facts.
+ *
+ * @param sql The script.
+ * @param origin Where it came from, for a refusal to name.
+ * @param facts The facts to add to, when the script continues a history.
+ */
+function reduce(
+  sql: string,
+  origin: string,
+  facts = new Map<string, number>(),
+): Map<string, number> {
+  for (const statement of statements(sql)) {
+    apply(facts, statement, origin);
+  }
+
+  return facts;
+}
+
+/**
+ * What the committed history creates, every migration folded in the order
+ * Prisma applies them: the directory names, compared as strings.
+ */
+function replay(): { facts: Map<string, number>; count: number } {
+  const directories = readdirSync(MIGRATIONS, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name)
+    .sort((left, right) => (left < right ? -1 : left > right ? 1 : 0));
+
+  const facts = new Map<string, number>();
+
+  for (const directory of directories) {
+    const script = readFileSync(new URL(`${directory}/${SCRIPT}`, MIGRATIONS), 'utf8');
+
+    reduce(script, `prisma/migrations/${directory}/${SCRIPT}`, facts);
+  }
+
+  return { facts, count: directories.length };
+}
+
+/**
+ * The facts `from` holds more of than `to`, each repeated once per surplus
+ * occurrence, in a stable order for the report.
+ */
+function surplus(from: Map<string, number>, to: Map<string, number>): string[] {
+  const extra: string[] = [];
+
+  for (const [fact, count] of from) {
+    for (let left = count - (to.get(fact) ?? 0); left > 0; left -= 1) {
+      extra.push(fact);
+    }
+  }
+
+  return extra.sort();
+}
+
+/**
+ * Everything written to standard input, once the writer has closed it.
+ *
+ * Read as a stream rather than with a synchronous read of descriptor `0`: the
+ * rendering arrives through a pipe from a process that is still starting, and a
+ * synchronous read of a pipe with nothing in it yet fails instead of waiting.
+ */
+async function input(): Promise<string> {
+  const chunks: Buffer[] = [];
+
+  for await (const chunk of process.stdin) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)));
+  }
+
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+/**
+ * Runs the check over the rendering on standard input.
+ *
+ * @returns The process exit code.
+ */
+async function main(): Promise<number> {
+  try {
+    const rendered = await input();
+
+    if (statements(rendered).length === 0) {
+      throw new Error(
+        'no SQL arrived on standard input; pipe `prisma migrate diff --from-empty --to-schema prisma/schema.prisma --script` into this check',
+      );
+    }
+
+    const schema = reduce(rendered, 'the schema rendering');
+    const history = replay();
+    const missing = surplus(schema, history.facts);
+    const unexpected = surplus(history.facts, schema);
+
+    if (missing.length === 0 && unexpected.length === 0) {
+      console.log(
+        `check-migrations: ${String(history.count)} migrations reproduce prisma/schema.prisma (${String(schema.size)} schema objects)`,
+      );
+
+      return 0;
+    }
+
+    for (const fact of missing) {
+      console.error(`check-migrations: the schema has, the migrations lack: ${fact}`);
+    }
+
+    for (const fact of unexpected) {
+      console.error(`check-migrations: the migrations have, the schema lacks: ${fact}`);
+    }
+
+    console.error(
+      'check-migrations: prisma/migrations does not reproduce prisma/schema.prisma; add the migration the schema change needs (`pnpm migrate:dev`) rather than editing one that has been applied',
+    );
+
+    return DRIFT;
+  } catch (failure) {
+    // Every failure here is one this check cannot judge past - a statement it
+    // cannot replay, a history it could not read - and is reported as that
+    // rather than as drift, which would claim a comparison that never happened.
+    console.error(
+      `check-migrations: ${failure instanceof Error ? failure.message : String(failure)}`,
+    );
+
+    return UNUSABLE;
+  }
+}
+
+process.exitCode = await main();

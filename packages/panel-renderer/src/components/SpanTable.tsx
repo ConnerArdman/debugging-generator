@@ -26,15 +26,23 @@
  *    back ordered.
  * 3. **A page is a page, and the footer says so.** A response carries `total`
  *    and `nextOffset`; this component renders the loaded count against the
- *    total and offers "Load more" while more rows exist. It never truncates in
- *    silence, and when the service reported no total it says the total is
- *    unknown instead of implying the table is complete.
+ *    total and offers "Load more" only while the service reports a next offset
+ *    that moves past the page on screen, requesting exactly that offset. The
+ *    service is the one authority on whether another page exists: no offset is
+ *    derived from the length of a page or from `total`, and when the total
+ *    counts rows the service offered no page for, the footer says so instead of
+ *    inventing one. It never truncates in silence, and when the service reported
+ *    no total it says the total is unknown instead of implying the table is
+ *    complete.
  * 4. **Three states, one precedence.** A query in flight with nothing to show
  *    renders `LoadingState`; a failure with nothing to show renders
- *    `ErrorState` with the serialised query and a retry; a successful empty
- *    result renders `EmptyState`. Once rows are on screen they stay on screen:
- *    a page that fails or is still loading is reported in the footer rather
- *    than by replacing rows the reader is already reading.
+ *    `ErrorState` with the serialised query and a retry; a successful result
+ *    with no rows renders `EmptyState`, whose copy tells an empty capture
+ *    (nothing matched) apart from a count-only query (`limit: 0`) and from a
+ *    page that holds none of the rows the reported total counts, and names that
+ *    total instead of claiming nothing was captured. Once rows are on screen
+ *    they stay on screen: a page that fails or is still loading is reported in
+ *    the footer rather than by replacing rows the reader is already reading.
  *
  * ## What this component is not allowed to do, and therefore does not
  *
@@ -108,6 +116,7 @@ import clsx from 'clsx';
 import { useCallback, useMemo, useState } from 'react';
 import type { MouseEvent as ReactMouseEvent, ReactElement } from 'react';
 
+import { usePanelSessionId } from '../host/DataProvider';
 import { usePanelActions } from '../host/PanelActions';
 import { useQuery } from '../host/useQuery';
 import { Stack } from '../layout/Stack';
@@ -201,8 +210,11 @@ function spanSourceOf(source: DataQuery['source']): SpanSource | undefined {
  * ---------------------------------------------------------------------------
  */
 
-/** The smallest page this table will ask for; see {@link clampLimit}. */
-const MIN_PAGE_SIZE = 1;
+/**
+ * The page size of a count-only query: an explicit request for the total and no
+ * rows, and the smallest page size {@link clampLimit} returns.
+ */
+const COUNT_ONLY_LIMIT = 0;
 
 /**
  * The page size to request, inside the bounds the schema publishes.
@@ -212,21 +224,23 @@ const MIN_PAGE_SIZE = 1;
  * would reject a larger page anyway, and asking for one would turn a bounded
  * table into a failed query.
  *
- * A page size of zero is raised to one row rather than honoured: zero is legal
- * in the schema as "return no items", but it is not a page, and a table that
- * pages a page of nothing can never advance. One row is the smallest request
- * that can still report a total and a next offset, which is what the footer
- * needs to tell the reader the truth about coverage.
+ * An explicit zero is preserved exactly and sent as `limit: 0`. The schema
+ * accepts it as a request for a total without rows (`panel-schema`'s
+ * `nodes/query`: only the absence of the field means "unset"), and the service
+ * echoes it on the page it returns, so raising it to one row would draw a row
+ * the panel specification never asked for. Such a query is never paged — see
+ * {@link forwardOffsetOf} — and its successful answer is drawn as a count-only
+ * state that names the total instead of as an empty capture.
  *
  * @param limit The `limit` the node's query carried, if any.
- * @returns A whole page size within `[1, DATA_QUERY_MAX_LIMIT]`.
+ * @returns A whole page size within `[0, DATA_QUERY_MAX_LIMIT]`.
  */
 function clampLimit(limit: number | undefined): number {
   if (limit === undefined || !Number.isFinite(limit)) {
     return DATA_QUERY_DEFAULT_LIMIT;
   }
 
-  return Math.min(Math.max(Math.floor(limit), MIN_PAGE_SIZE), DATA_QUERY_MAX_LIMIT);
+  return Math.min(Math.max(Math.floor(limit), COUNT_ONLY_LIMIT), DATA_QUERY_MAX_LIMIT);
 }
 
 /**
@@ -393,6 +407,10 @@ const START_HEADER_LABEL = 'Start, relative to the earliest listed operation';
 const DURATION_HEADER_LABEL = 'Duration, longest first';
 
 const EMPTY_MESSAGE = 'No spans matched this query.';
+const COUNT_ONLY_TITLE = 'Count only';
+const COUNT_ONLY_UNKNOWN_TOTAL_MESSAGE =
+  'This view requests a count without rows, and no total was reported for its query.';
+const EMPTY_PAGE_TITLE = 'Nothing on this page';
 const ERROR_MESSAGE = 'The spans for this view could not be loaded.';
 const UNSUPPORTED_SOURCE_MESSAGE =
   'This view reads span records, and its query names a source that does not provide them.';
@@ -620,6 +638,187 @@ function describeCoverage(loaded: number, total: number | undefined, baseOffset:
   )}.`;
 }
 
+/**
+ * The sentence the footer adds when the reported total and the service's paging
+ * disagree: the total counts rows beyond those on screen, yet the service
+ * reported no page that moves past the one that resolved.
+ *
+ * The service is the authority on paging — `nextOffset: null` means the end of
+ * the data even when `total` is stale or surprising (`DataPage.nextOffset`) — so
+ * no page is invented to reach the rows the total counts. The reader is told how
+ * many remain and why they cannot be loaded from this view, rather than being
+ * offered a control that would request a page the service never offered.
+ *
+ * @param remaining How many rows the total counts beyond those on screen; positive.
+ * @returns The footer's explanatory sentence.
+ */
+function describeUnreachable(remaining: number): string {
+  return `The service reported no further page past this one, so the remaining ${formatCount(
+    remaining,
+  )} ${spanNoun(remaining)} cannot be loaded here.`;
+}
+
+/** What the empty state says: an optional first line, and the sentence under it. */
+interface EmptyPageCopy {
+  /** The short label above the sentence, or `undefined` for none. */
+  readonly title: string | undefined;
+
+  /** The sentence itself. */
+  readonly message: string;
+}
+
+/**
+ * The copy for a successful query that left no row on screen.
+ *
+ * An empty page is not the same thing as an empty capture: a page can hold
+ * nothing while the query matched plenty, because it asked for no rows or
+ * because it starts past the rows that matched (`nodes/query`: an offset past
+ * the end is an empty page, not an error). Saying "nothing matched" for those
+ * would contradict the total the service reported, so the cases are told apart,
+ * first match wins:
+ *
+ * 1. **Count only** — the query asked for no rows ({@link COUNT_ONLY_LIMIT}). Its
+ *    empty page is its answer: titled as a count, naming the total, or saying
+ *    that none was reported.
+ * 2. **A further page exists** — the service named a forward next offset
+ *    (`hasFollowingPage`). The state says so, and the caller places the
+ *    "Load more" control that reaches it.
+ * 3. **Nothing matched** — the total is zero, or no total was reported for a
+ *    page starting at the first item. The only case that reads as an empty
+ *    capture, and the product's original sentence.
+ * 4. **Past the end** — the page starts at or beyond the total.
+ * 5. **Matched, not on this page** — the total counts rows at or after this
+ *    page's position, none arrived, and the service named no further page. The
+ *    total and the paging disagree, and the service's paging wins, so the state
+ *    adds {@link describeUnreachable}'s sentence: how many matched rows remain
+ *    past this position and that this view cannot load them. No page is
+ *    invented to reach them.
+ * 6. **No total, part-way through** — the page starts after the first item and
+ *    the service reported no total, so whether earlier rows exist is unknown.
+ *
+ * `pageOffset` is the offset the resolved page was requested at: the node's own
+ * base offset for the first page, and the service's next offset for a page
+ * reached through "Load more" from an earlier empty one.
+ *
+ * @param limit The page size the query was requested with.
+ * @param total The total the service reported for the whole query, if any.
+ * @param pageOffset The offset the resolved page was requested at.
+ * @param hasFollowingPage Whether the service named a forward next page.
+ * @returns The empty state's title and message.
+ */
+function describeEmptyPage(
+  limit: number,
+  total: number | undefined,
+  pageOffset: number,
+  hasFollowingPage: boolean,
+): EmptyPageCopy {
+  // A count of none takes the plural: "holds no spans".
+  const noneNoun = spanNoun(0);
+
+  if (limit === COUNT_ONLY_LIMIT) {
+    return {
+      title: COUNT_ONLY_TITLE,
+      message:
+        total === undefined
+          ? COUNT_ONLY_UNKNOWN_TOTAL_MESSAGE
+          : `This view requests a count without rows: ${formatCount(total)} ${spanNoun(
+              total,
+            )} matched its query.`,
+    };
+  }
+
+  if (hasFollowingPage) {
+    return {
+      title: EMPTY_PAGE_TITLE,
+      message:
+        total === undefined
+          ? `This page holds no ${noneNoun}, and the service reported a further page.`
+          : `This page holds none of the ${formatCount(total)} ${spanNoun(
+              total,
+            )} that matched this query, and the service reported a further page.`,
+    };
+  }
+
+  if (total === 0 || (total === undefined && pageOffset === DATA_QUERY_DEFAULT_OFFSET)) {
+    return { title: undefined, message: EMPTY_MESSAGE };
+  }
+
+  const position = formatCount(pageOffset + FIRST_POSITION_OFFSET);
+
+  if (total === undefined) {
+    return {
+      title: EMPTY_PAGE_TITLE,
+      message: `This page starts at position ${position} and holds no ${noneNoun}; no total was reported for this query.`,
+    };
+  }
+
+  const matched = `${formatCount(total)} ${spanNoun(total)}`;
+
+  if (pageOffset >= total) {
+    return {
+      title: EMPTY_PAGE_TITLE,
+      message: `This page starts at position ${position}, past the end of the ${matched} that matched this query.`,
+    };
+  }
+
+  // Reached only without a forward page and with rows requested, so the total
+  // counts rows the service's paging will never deliver: say so, as the footer
+  // does for a populated page, rather than leave the disagreement unexplained.
+  return {
+    title: EMPTY_PAGE_TITLE,
+    message: `${matched} matched this query, but none are shown on this page. ${describeUnreachable(
+      total - pageOffset,
+    )}`,
+  };
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * Paging: where the next page starts, and who decides
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * The offset of the following page, when the service reported one this table
+ * may request.
+ *
+ * The service's `nextOffset` is the only authority on whether another page
+ * exists: it is `null` on the last page, which `host/useQuery` folds into
+ * `undefined`. This table never computes an offset of its own — not from the
+ * length of the page that arrived, which drifts the moment a limit is clamped,
+ * and not from `total`, which can disagree with the paging the service applied.
+ *
+ * A reported offset is honoured only when it is a safe whole number strictly
+ * past the offset the resolved page was requested at. One at or before that
+ * offset would re-request rows already on screen, so a table that followed it
+ * would page in place forever; it is treated as the end of the data instead.
+ *
+ * A count-only query ({@link COUNT_ONLY_LIMIT}) is never paged, whatever the
+ * service reported: every page of it is a page of nothing, so following a next
+ * offset could only issue a second request that draws nothing more.
+ *
+ * @param nextOffset The next offset the resolved page reported, if any.
+ * @param pageOffset The offset the resolved page was requested at.
+ * @param limit The page size the resolved page was requested with.
+ * @returns The offset to request next, or `undefined` when there is no forward page.
+ */
+function forwardOffsetOf(
+  nextOffset: number | undefined,
+  pageOffset: number,
+  limit: number,
+): number | undefined {
+  if (
+    limit === COUNT_ONLY_LIMIT ||
+    nextOffset === undefined ||
+    !Number.isSafeInteger(nextOffset) ||
+    nextOffset <= pageOffset
+  ) {
+    return undefined;
+  }
+
+  return nextOffset;
+}
+
 /*
  * ---------------------------------------------------------------------------
  * Paging state
@@ -635,13 +834,18 @@ function describeCoverage(loaded: number, total: number | undefined, baseOffset:
  * reported are all in hand, so the accumulator is complete before the next page
  * is even requested. Nothing here is derived after the fact.
  *
- * `identity` is the query's identity apart from its offset. A different source,
- * filter, ordering or page size is a different sequence, and comparing it during
- * render is how the accumulator is discarded — again with no effect, and no
- * chance of one render showing rows from two different orderings.
+ * `identity` is the page sequence's identity: the session and the query as
+ * authored, its base offset included, apart from the offset paging advanced
+ * to. A different session, source, filter, ordering, page size or authored
+ * starting position is a different sequence, and comparing it during render is
+ * how the accumulator is discarded — again with no effect, and no chance of one
+ * render showing rows from two different sequences.
  */
 interface PageAccumulator {
-  /** The identity of the query these pages belong to, offset excluded. */
+  /**
+   * The identity of the sequence these pages belong to: authored base offset
+   * and session included, advanced offset excluded.
+   */
   readonly identity: string;
 
   /** Every row loaded before the page currently in flight, in arrival order. */
@@ -736,14 +940,34 @@ export function SpanTable(props: SpanTableProps): ReactElement {
   const limit = clampLimit(node.query.limit);
   const baseOffset = clampOffset(node.query.offset);
 
+  // The session this panel reads from. `useQuery` re-issues the query when it
+  // changes, and the pages another session answered are another capture's
+  // evidence, so the session is part of the page sequence's identity.
+  const sessionId = usePanelSessionId();
+
+  // The identity of the page sequence: the session and the query as AUTHORED,
+  // its base offset included — a node that starts from another position is
+  // another slice of the result and must not inherit this one's pages. The
+  // ADVANCED offset (`PageAccumulator.offset`) is deliberately left out, or
+  // every "Load more" would discard the pages it was meant to append to.
   const pagingIdentity = useMemo(
-    () => stableJson({ source: node.query.source, filter, sort: appliedSort, limit }),
-    [node.query.source, filter, appliedSort, limit],
+    () =>
+      stableJson({
+        sessionId,
+        source: node.query.source,
+        filter,
+        sort: appliedSort,
+        limit,
+        offset: baseOffset,
+      }),
+    [sessionId, node.query.source, filter, appliedSort, limit, baseOffset],
   );
 
   // Discarding a stale accumulator during render rather than in an effect: the
-  // comparison is pure, and it means a re-ordered table can never paint rows
-  // from the previous ordering, not even for one frame.
+  // comparison is pure, and it means a re-ordered table, a node paged from
+  // another position or a panel switched to another session can never paint
+  // rows from the previous sequence, not even for one frame — and the request
+  // returns to the authored base offset at once.
   const activePages = pages !== undefined && pages.identity === pagingIdentity ? pages : undefined;
   const offset = activePages?.offset ?? baseOffset;
 
@@ -851,36 +1075,56 @@ export function SpanTable(props: SpanTableProps): ReactElement {
     [actions, appliedSort, identity],
   );
 
+  // The page the service says follows the one that resolved, when it named one
+  // that moves forward. Read only off a settled page: `offset` is then the
+  // offset that page was requested at, because `useQuery` reports a settlement
+  // only while it answers the current query. While a page is in flight or has
+  // failed there is no answer to follow, so there is no next page either.
+  const followingOffset =
+    status === 'success' ? forwardOffsetOf(nextOffset, offset, limit) : undefined;
+
   const handleLoadMore = useCallback((): void => {
-    if (status !== 'success' || pageRows === undefined) {
+    // Exactly the offset the service reported, and nothing else: no page is
+    // derived from the length of what arrived or from the total, so this table
+    // can never request a page the service did not offer.
+    if (followingOffset === undefined) {
       return;
     }
 
-    // The service's own next offset when it gave one; otherwise the page that
-    // just arrived, counted. Never a step backwards and never a standstill,
-    // either of which would re-request the page already on screen.
-    const advanced = nextOffset ?? offset + pageRows.length;
-
-    if (advanced <= offset) {
-      return;
-    }
-
-    setPages({ identity: pagingIdentity, rows, offset: advanced, total });
-  }, [status, pageRows, nextOffset, offset, rows, pagingIdentity, total]);
+    setPages({ identity: pagingIdentity, rows, offset: followingOffset, total });
+  }, [followingOffset, rows, pagingIdentity, total]);
 
   const loadedCount = rows.length;
   const knownTotal = total ?? activePages?.total;
   const remaining = knownTotal === undefined ? undefined : knownTotal - (baseOffset + loadedCount);
-  const canLoadMore =
+  const canLoadMore = followingOffset !== undefined;
+  // The total counts rows beyond those on screen, yet the settled page named no
+  // forward page. The service is the authority on paging, so the footer says how
+  // many rows remain and why they cannot be loaded, rather than offering a
+  // control that would request a page nobody offered. A count-only query is
+  // excluded: it is never paged by its own request, so blaming the service for
+  // the rows it did not return would be untrue.
+  const unreachable =
     status === 'success' &&
-    (nextOffset !== undefined || (remaining !== undefined && remaining > 0));
+    limit !== COUNT_ONLY_LIMIT &&
+    !canLoadMore &&
+    remaining !== undefined &&
+    remaining > 0
+      ? remaining
+      : undefined;
   // A page arriving behind rows that are already on screen, and a page that
   // failed behind them: reported in the footer, never by replacing what the
   // reader is reading.
   const appending = status === 'loading' && loadedCount > 0;
   const pageFailed = status === 'error' && loadedCount > 0;
   const showLoadMore = canLoadMore || appending;
-  const showFooter = showLoadMore || pageFailed || knownTotal === undefined;
+  const showFooter =
+    showLoadMore || pageFailed || knownTotal === undefined || unreachable !== undefined;
+  const coverageText = describeCoverage(loadedCount, knownTotal, baseOffset);
+  const footerText =
+    unreachable === undefined
+      ? coverageText
+      : `${coverageText} ${describeUnreachable(unreachable)}`;
 
   const blockClassName = clsx('dg-span-table', className);
   // The grid's accessible name. The node's title when it has one, and otherwise
@@ -926,11 +1170,28 @@ export function SpanTable(props: SpanTableProps): ReactElement {
   }
 
   // Nothing loaded, nothing in flight and nothing failed: the query succeeded
-  // and selected no records.
+  // and left no row on screen. That is an empty capture only when nothing
+  // matched; a count-only query, a page past the end and a page the total says
+  // should hold rows are each described as what they are. When the service
+  // still named a forward page, the state carries the control that reaches it,
+  // so an empty page never strands the rows after it.
   if (loadedCount === 0) {
+    const emptyCopy = describeEmptyPage(limit, knownTotal, offset, canLoadMore);
+
     return (
       <Stack className={blockClassName} gap={2}>
-        <EmptyState className="dg-span-table__empty" message={EMPTY_MESSAGE} />
+        <EmptyState
+          className="dg-span-table__empty"
+          title={emptyCopy.title}
+          message={emptyCopy.message}
+          action={
+            canLoadMore ? (
+              <Button variant="secondary" size="sm" onClick={handleLoadMore}>
+                {LOAD_MORE_LABEL}
+              </Button>
+            ) : undefined
+          }
+        />
       </Stack>
     );
   }
@@ -957,7 +1218,7 @@ export function SpanTable(props: SpanTableProps): ReactElement {
           wrap
         >
           <Text as="p" size="xs" tone="muted">
-            {describeCoverage(loadedCount, knownTotal, baseOffset)}
+            {footerText}
           </Text>
           {showLoadMore ? (
             <Button variant="secondary" size="sm" disabled={!canLoadMore} onClick={handleLoadMore}>

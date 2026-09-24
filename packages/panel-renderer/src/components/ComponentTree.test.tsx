@@ -835,8 +835,17 @@ function rejectingProvider(error: DebuggenError): StubProvider {
  * The resolver's return type promises a snapshot, and the case being tested is
  * precisely a provider that broke that promise — a transport that decoded
  * something else, or a route that answered from the wrong aggregate.
+ *
+ * It carries a snapshot's envelope — an own `capturedAt` and an array `roots`,
+ * which is all a host-side response check can confirm without walking the
+ * structure — and lacks `origin`, `degraded` and `nodeCount`, which this view
+ * reads before it draws. So it is the component's own guard that refuses it,
+ * whatever the host checks upstream.
  */
-const MALFORMED_PAYLOAD = { roots: [] } as unknown as ComponentTreeSnapshot;
+const MALFORMED_PAYLOAD = {
+  capturedAt: CAPTURED_AT,
+  roots: [],
+} as unknown as ComponentTreeSnapshot;
 
 /**
  * A node carrying fields the datum has no place for.
@@ -1193,6 +1202,31 @@ describe('ComponentTree states', () => {
     expect(screen.queryByRole('tree')).toBeNull();
     expect(screen.queryAllByRole('treeitem')).toHaveLength(0);
     expect(screen.queryByRole('group', { name: TOOLBAR_NAME })).toBeNull();
+  });
+
+  it('renders its own empty message, not an error, when the capture holds no tree', async () => {
+    // `null` is the service's answer for a capture with no render evidence to
+    // build a tree from — a valid answer of the contract, so no type assertion.
+    const stub = recordingProvider(() =>
+      Promise.resolve<DataQueryResponse>({ source: 'componentTree', data: null }),
+    );
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    const message = await screen.findByText(EMPTY_MESSAGE_PATTERN);
+    expect(message.classList.contains('dg-empty-state__message')).toBe(true);
+    expect(message.closest(`.${EMPTY_CLASS}`)).not.toBeNull();
+
+    // An empty capture, not a malformed payload: no alert and so no retry, and
+    // no tree, rows, list or toolbar drawn as if a structure had arrived.
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.queryByRole('button', { name: RETRY_NAME })).toBeNull();
+    expect(screen.queryByRole('status')).toBeNull();
+    expect(screen.queryByRole('tree')).toBeNull();
+    expect(screen.queryByRole('list')).toBeNull();
+    expect(screen.queryAllByRole('treeitem')).toHaveLength(0);
+    expect(screen.queryByRole('group', { name: TOOLBAR_NAME })).toBeNull();
+    expect(stub.resolve).toHaveBeenCalledTimes(1);
   });
 
   it('renders an alert carrying the failed query, and retries it on request', async () => {

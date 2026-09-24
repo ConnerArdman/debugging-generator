@@ -67,6 +67,16 @@
  * what it replaced: every memo below is keyed on the document's own objects,
  * never on an id that a regenerated panel could share with its predecessor.
  *
+ * **It does not let a view outlive the panel it was drawn for.** Re-rendering
+ * less is only safe while the mounted views belong to the document on screen.
+ * The panel column is therefore keyed on the document's session, id and
+ * generation, so a specification for another session — or another panel, or a
+ * regenerated one — unmounts every view of the previous panel and mounts fresh
+ * ones, instead of reusing views whose paged rows, next-page offsets and
+ * filters were accumulated against a different capture. A re-delivery of the
+ * same panel keeps the key, and with it every mounted view (see
+ * `panelIdentityKey` below).
+ *
  * ## Class names
  *
  * `dg-panel` is the block, with `dg-panel__banner`/`--fallback` for the notice,
@@ -96,8 +106,13 @@ import type { PanelTheme } from '../tokens/theme';
 import { DataProviderContext, PanelSessionContext } from './DataProvider';
 import type { DataProvider } from './DataProvider';
 import { renderPanelNodes } from './NodeRenderer';
-import { PanelActionsContext } from './PanelActions';
-import type { PanelActions } from './PanelActions';
+import {
+  PanelActionsContext,
+  isPanelHostActions,
+  toPanelHostActions,
+  toPanelViewActions,
+} from './PanelActions';
+import type { PanelActions, PanelHostActions, PanelViewActions } from './PanelActions';
 
 /*
  * ---------------------------------------------------------------------------
@@ -224,6 +239,146 @@ function renderFallbackBanner(): ReactElement {
 
 /*
  * ---------------------------------------------------------------------------
+ * Panel identity
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * The React key of the panel column: which capture, which panel and which
+ * generation of that panel the mounted views belong to.
+ *
+ * **Why the column is keyed at all — cross-session isolation.** Several views
+ * hold component-local state that outlives a render: the rows they have paged
+ * in so far and the offset of the next page (the event log, the span, render,
+ * request and query tables, the state-transition viewer, the timeline, the
+ * waterfall), a filter or sort chosen in their toolbar, an expanded row. That
+ * state is keyed by what the *view* can see — its node, its query, the
+ * provider — and none of those name a session. Without this key, a host that
+ * swaps in a panel for another session whose layout happens to carry the same
+ * node ids and queries (a reopened session of another project, a regenerated
+ * panel of the same shape) would keep every view mounted, so a table could
+ * keep drawing the previous capture's rows under the new session's title and
+ * ask for *its* next page at the previous capture's offset. Keying the column
+ * on the document's identity makes React unmount every view of the old panel —
+ * aborting its in-flight requests through the query hook's cleanup — and mount
+ * fresh ones that start from their first page, under the new session.
+ *
+ * **What is in the key, and what is deliberately not.**
+ *
+ * - `sessionId` — the capture every query beneath is addressed to. Another
+ *   session is another project's evidence, and nothing a view accumulated may
+ *   cross into it.
+ * - `id` — another panel of the same session is another document; its views
+ *   answer another question and inherit nothing from this one's.
+ * - `panelVersion` — a regenerated panel is a new generation of the document,
+ *   validated against the capture afresh, so its views start clean as well.
+ *
+ * Nothing else. A re-delivery of the same panel — a new specification object, a
+ * retitled head, a reordered layout, a fresh `actions` object — keeps the same
+ * key, so mounted views, their pages and their open disclosures survive it,
+ * which is what the render memos below and the node renderer's id keys exist
+ * to preserve.
+ *
+ * Built with `JSON.stringify` over a tuple rather than by joining with a
+ * separator, so no identifier can collide with another by containing the
+ * separator (`"a|b" + "c"` against `"a" + "b|c"`): an ambiguous key would be a
+ * way for two sessions to share a mounted view.
+ *
+ * @param spec The panel being rendered.
+ * @returns A string equal for, and only for, the same session, panel and
+ * generation.
+ */
+function panelIdentityKey(spec: PanelSpec): string {
+  return JSON.stringify([spec.sessionId, spec.id, spec.panelVersion]);
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * The two action forms
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * The callbacks a surface supplied, flattened out of whichever form it used.
+ *
+ * Exactly one of the two required pairs is set — `selectEvent`/`openSource`
+ * for the host form, `onSelectEvent`/`onOpenSource` for the view form — and the
+ * other is `undefined`. Flattened so the host can memoize on the callbacks'
+ * own identities rather than on the object that carried them.
+ */
+interface SuppliedActionMembers {
+  /** The host form's selection callback, or `undefined` for a view-form value. */
+  readonly selectEvent: PanelHostActions['selectEvent'] | undefined;
+
+  /** The host form's navigation callback, or `undefined` for a view-form value. */
+  readonly openSource: PanelHostActions['openSource'] | undefined;
+
+  /** The view form's selection callback, or `undefined` for a host-form value. */
+  readonly onSelectEvent: PanelViewActions['onSelectEvent'] | undefined;
+
+  /** The view form's navigation callback, or `undefined` for a host-form value. */
+  readonly onOpenSource: PanelViewActions['onOpenSource'] | undefined;
+
+  /** The optional disclosure report, shared by both forms. */
+  readonly onExpand: PanelHostActions['onExpand'];
+
+  /** The optional filter report, shared by both forms. */
+  readonly onFilterChange: PanelHostActions['onFilterChange'];
+}
+
+/** Both forms of one surface's actions, as the host hands them on. */
+interface PanelActionForms {
+  /** What the summary head reports through: `selectEvent` and `openSource`. */
+  readonly host: PanelHostActions | undefined;
+
+  /** What the action context carries for the views: `onSelectEvent` and `onOpenSource`. */
+  readonly view: PanelViewActions | undefined;
+}
+
+/**
+ * Rebuilds the supplied actions from their callbacks and derives the other form
+ * through the compatibility adapters of `./PanelActions`.
+ *
+ * The form the surface supplied is rebuilt as a plain object holding the very
+ * same callbacks (optional members only where present); the other form is its
+ * adaptation. So a host-form surface's `openSource` is the function the views'
+ * `onOpenSource` calls, and a view-form surface's `onOpenSource` is the
+ * function the head's `openSource` calls — the location reaches the surface by
+ * reference either way.
+ *
+ * A value that carries neither complete pair — impossible for a type-checked
+ * surface, reachable only from an untyped caller — yields no actions at all,
+ * which renders every affordance in its inert form: a chip that is plainly not
+ * a link, never a control that throws when pressed.
+ *
+ * @param members The supplied callbacks, flattened.
+ * @returns The host and view forms, both absent only for an incomplete value.
+ */
+function panelActionForms(members: SuppliedActionMembers): PanelActionForms {
+  const { selectEvent, openSource, onSelectEvent, onOpenSource, onExpand, onFilterChange } =
+    members;
+  const optional = {
+    ...(onExpand === undefined ? {} : { onExpand }),
+    ...(onFilterChange === undefined ? {} : { onFilterChange }),
+  };
+
+  if (selectEvent !== undefined && openSource !== undefined) {
+    const host: PanelHostActions = { selectEvent, openSource, ...optional };
+
+    return { host, view: toPanelViewActions(host) };
+  }
+
+  if (onSelectEvent !== undefined && onOpenSource !== undefined) {
+    const view: PanelViewActions = { onSelectEvent, onOpenSource, ...optional };
+
+    return { host: toPanelHostActions(view), view };
+  }
+
+  return { host: undefined, view: undefined };
+}
+
+/*
+ * ---------------------------------------------------------------------------
  * The host
  * ---------------------------------------------------------------------------
  */
@@ -273,11 +428,17 @@ export interface PanelHostProps {
    * What this panel's interactions do — selecting an event, opening a place in
    * the project, and the two optional disclosure and filter reports.
    *
-   * Provided as context for the views, and wired directly into the head's two
-   * plain callbacks (see {@link PanelHost}). The context value is keyed on the
-   * four callbacks' identities rather than on this object's, so a host may pass
-   * a freshly built object on every render without re-rendering a view — as
-   * long as the callbacks inside it are stable.
+   * Host surfaces supply the host form, `PanelHostActions` —
+   * `selectEvent(eventId, coordinates?)` and `openSource(location)`, the
+   * contract the DevTools panel and the editor webview implement. The view
+   * form (`onSelectEvent`/`onOpenSource`) is accepted as well and behaves
+   * identically.
+   *
+   * The views receive the view form through the action context, and the head's
+   * two plain callbacks are wired to the host form (see {@link PanelHost}).
+   * Both are keyed on the callbacks' own identities rather than on this
+   * object's, so a host may pass a freshly built object on every render without
+   * re-rendering a view — as long as the callbacks inside it are stable.
    */
   actions: PanelActions;
 
@@ -311,23 +472,33 @@ export interface PanelHostProps {
  * document carries one, the head, and the layout — in that order and nothing
  * else. Presentational: no state, no effect, no write to the specification.
  * Its only hooks are the three memos described in this module's header, which
- * keep an unrelated host render from reaching the views.
+ * keep an unrelated host render from reaching the views, and the one key on
+ * the panel column, which keeps a view from outliving its session or panel.
  *
- * Four details are decisions rather than mechanics:
+ * Five details are decisions rather than mechanics:
  *
  * - **Queries are addressed to the document's own session.** The session
  *   context carries `spec.sessionId` and nothing else: not a session the host
  *   surface happens to have selected, and not one remembered by the provider.
  *   A reopened session's panel therefore reads its own capture even while the
- *   surface is bound to a newer one, and a panel for another session re-resolves
- *   every view the moment it is swapped in.
+ *   surface is bound to a newer one, and a panel for another session — or
+ *   another panel, or another generation of this one — remounts every view the
+ *   moment it is swapped in, so each starts from its first page under the new
+ *   session and nothing it drew for the previous capture is shown or paged on.
  * - **The head's callbacks are wired, not re-implemented.** `../layout/SummaryHeader`
  *   imports nothing from this folder by design, so it declares two plain
- *   callbacks over the schema's own citation and location types; they are
- *   satisfied straight from the injected actions. Passing the members through
- *   rather than wrapping them keeps the guarantee that matters at the far end
- *   of the click-to-source chain: what a hypothesis suggested is what the host
- *   receives, field for field (AAP 0.4.2).
+ *   callbacks over the schema's own citation and location types — the host
+ *   form's `selectEvent(eventId, coordinates)` and `openSource(location)`.
+ *   For a surface that supplied the host form they are its own members, passed
+ *   through; for one that supplied the view form they are the compatibility
+ *   adapter's, whose `openSource` is the surface's `onOpenSource` itself.
+ *   Either way the guarantee that matters at the far end of the click-to-source
+ *   chain holds: what a hypothesis suggested is what the host receives, the
+ *   same object (AAP 0.4.2).
+ * - **The views read the view form.** The action context carries
+ *   `onSelectEvent`/`onOpenSource` — the names the components call — adapted
+ *   from the host form when that is what the surface supplied, so no component
+ *   knows which surface it is in.
  * - **The outline is stated once, here.** The title renders at
  *   {@link PANEL_TITLE_HEADING_LEVEL} and the layout's top-level nodes one level
  *   below it, at {@link LAYOUT_HEADING_LEVEL}; `./NodeRenderer` carries the level
@@ -354,33 +525,63 @@ export interface PanelHostProps {
 export function PanelHost(props: PanelHostProps): ReactElement {
   const { spec, dataProvider, actions, theme, className, id } = props;
   const { sessionId, title, summary, layout } = spec;
-  const { onSelectEvent, onOpenSource, onExpand, onFilterChange } = actions;
 
-  // The action context, keyed on the four callbacks rather than on the object
-  // that carried them. A host that rebuilds `actions` on every render from
-  // stable callbacks — the natural way to write it — then changes nothing any
-  // view reads, and a host that genuinely swaps a callback still reaches every
-  // consumer. Members are copied, never wrapped, so what a view reports is what
-  // the host receives (AAP 0.4.2).
-  const actionsValue = useMemo<PanelActions>(
-    () => ({ onSelectEvent, onOpenSource, onExpand, onFilterChange }),
-    [onSelectEvent, onOpenSource, onExpand, onFilterChange],
+  // The supplied callbacks, flattened out of whichever form the surface used:
+  // one required pair is set and the other is `undefined`, and the optional
+  // pair is shared by both forms.
+  const hostForm = isPanelHostActions(actions);
+  const suppliedSelectEvent = hostForm ? actions.selectEvent : undefined;
+  const suppliedOpenSource = hostForm ? actions.openSource : undefined;
+  const suppliedOnSelectEvent = hostForm ? undefined : actions.onSelectEvent;
+  const suppliedOnOpenSource = hostForm ? undefined : actions.onOpenSource;
+  const { onExpand, onFilterChange } = actions;
+
+  // Both action forms, keyed on the callbacks rather than on the object that
+  // carried them. A host that rebuilds `actions` on every render from stable
+  // callbacks — the natural way to write it — then changes nothing any view
+  // reads, and a host that genuinely swaps a callback still reaches every
+  // consumer. The supplied form keeps its callbacks as they are and the other
+  // is its adaptation, so what a view or the head reports is what the host
+  // receives, location by reference (AAP 0.4.2).
+  const forms = useMemo(
+    () =>
+      panelActionForms({
+        selectEvent: suppliedSelectEvent,
+        openSource: suppliedOpenSource,
+        onSelectEvent: suppliedOnSelectEvent,
+        onOpenSource: suppliedOnOpenSource,
+        onExpand,
+        onFilterChange,
+      }),
+    [
+      suppliedSelectEvent,
+      suppliedOpenSource,
+      suppliedOnSelectEvent,
+      suppliedOnOpenSource,
+      onExpand,
+      onFilterChange,
+    ],
   );
+  const viewActions = forms.view;
+  const selectEvent = forms.host?.selectEvent;
+  const openSource = forms.host?.openSource;
 
   // The head, re-rendered only when what it draws or what it reports to has
-  // changed. Its two callbacks are the same members the action context holds.
+  // changed. It reports through the host form — `selectEvent(eventId,
+  // coordinates)` and `openSource(location)` — whose members are stable for as
+  // long as the supplied callbacks are.
   const head = useMemo<ReactElement>(
     () => (
       <SummaryHeader
         title={title}
         summary={summary}
         headingLevel={PANEL_TITLE_HEADING_LEVEL}
-        onSelectEvent={onSelectEvent}
-        onOpenSource={onOpenSource}
+        selectEvent={selectEvent}
+        openSource={openSource}
         className={SUMMARY_CLASS}
       />
     ),
-    [title, summary, onSelectEvent, onOpenSource],
+    [title, summary, selectEvent, openSource],
   );
 
   // The layout, rendered once per `spec.layout` value. Handing React the very
@@ -409,11 +610,16 @@ export function PanelHost(props: PanelHostProps): ReactElement {
           contracts — and a tree where only part of the panel can reach the host
           is the harder failure to notice. Each value is stable for as long as
           what it stands for is: the injected provider, the document's session
-          string, and the memoized action members. */}
+          string, and the memoized view form of the actions. */}
       <DataProviderContext.Provider value={dataProvider}>
         <PanelSessionContext.Provider value={sessionId}>
-          <PanelActionsContext.Provider value={actionsValue}>
-            <div className={PANEL_CLASS}>
+          <PanelActionsContext.Provider value={viewActions}>
+            {/* Keyed on the document's session, id and generation (see
+                `panelIdentityKey`): a panel for another session, or another
+                panel, remounts every view beneath, so no page, offset or
+                filter a view accumulated survives into a capture it was not
+                drawn from. The shell and the three providers stay mounted. */}
+            <div key={panelIdentityKey(spec)} className={PANEL_CLASS}>
               {/* Above the summary, so the provenance of what follows is read
                   first. The explicit `=== true` is the reading `PanelMeta`
                   prescribes: the flag is absent on an ordinary generated panel

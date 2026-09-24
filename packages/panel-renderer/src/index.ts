@@ -80,7 +80,12 @@
  *    each catalogued node type with the component that draws it, so nothing a
  *    specification says can put an uncatalogued thing on screen (AAP 0.6.4);
  *    `DataProvider` and `PanelActions` are the two seams a host implements —
- *    evidence in, interactions out — and `useQuery` is the only module in the
+ *    evidence in, interactions out. A surface implements the actions' host
+ *    form, `PanelHostActions` (`selectEvent(eventId)`, `openSource(location)`);
+ *    the views call the view form, `PanelViewActions` (`onSelectEvent`,
+ *    `onOpenSource`); `isPanelHostActions`, `toPanelHostActions` and
+ *    `toPanelViewActions` are the published compatibility adapters between
+ *    the two. `useQuery` is the only module in the
  *    library that calls a provider at all, addressing every query to the
  *    session the host places in `PanelSessionContext`. No component here opens
  *    a socket, calls `fetch` or knows a message name (AAP 0.4.2).
@@ -98,9 +103,9 @@
  *   module directly; `DESIGN_TOKENS` is the one name every consumer imports, so
  *   the table has exactly one spelling here.
  * - The compile-time exhaustiveness proofs a few modules export so that their
- *   assertion is observable (in `./tokens/theme`, `./components/RenderTable`
- *   and `./host/PanelActions`). Each resolves to `never` and asserts something
- *   about its own module's internals, so it has nothing to say to a consumer.
+ *   assertion is observable (in `./tokens/theme` and `./components/RenderTable`).
+ *   Each resolves to `never` and asserts something about its own module's
+ *   internals, so it has nothing to say to a consumer.
  * - Anything owned by `@debuggen/panel-schema`, `@debuggen/telemetry` or
  *   `@debuggen/shared`. Panel specifications, the node catalogue and data
  *   queries; telemetry events and the aggregate result shapes the views render;
@@ -310,11 +315,14 @@ export type {
 } from './host/registry';
 
 export {
+  checkDataQueryResponse,
   createDataProvider,
+  createPanelDataProvider,
   DATA_QUERY_DEFAULT_LIMIT,
   DATA_QUERY_DEFAULT_OFFSET,
   DATA_QUERY_MAX_LIMIT,
   DataProviderContext,
+  mapPanelDataResult,
   PanelSessionContext,
   useDataProvider,
   usePanelSessionId,
@@ -328,10 +336,26 @@ export type {
   DataQueryResponse,
   DataResultFor,
   DataResultMap,
+  PanelDataPage,
+  PanelDataResolver,
+  PanelDataResult,
+  PanelDataResultFor,
 } from './host/DataProvider';
 
-export { PanelActionsContext, usePanelActions } from './host/PanelActions';
-export type { PanelActions, PanelEventRef } from './host/PanelActions';
+export {
+  isPanelHostActions,
+  PanelActionsContext,
+  toPanelHostActions,
+  toPanelViewActions,
+  usePanelActions,
+} from './host/PanelActions';
+export type {
+  PanelActions,
+  PanelEventCoordinates,
+  PanelEventRef,
+  PanelHostActions,
+  PanelViewActions,
+} from './host/PanelActions';
 
 export { useQuery } from './host/useQuery';
 export type { UseQueryOptions, UseQueryResult } from './host/useQuery';

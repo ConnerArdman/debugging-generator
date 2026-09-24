@@ -62,8 +62,12 @@
  *
  * Ordering and paging belong to the side that owns the capture (AAP 0.4.2): a
  * sort change is a **re-query** in the closed `DataQuerySort` vocabulary, never
- * a local re-order, and "load more" advances `offset` to the `nextOffset` the
- * response reported, keeping the pages already received. Two things are local
+ * a local re-order, and "load more" advances `offset` to exactly the
+ * `nextOffset` the response reported, keeping the pages already received. It is
+ * offered only when that offset moves forward from the page it answered, and
+ * never for a count-only `limit: 0` query, whose every page is empty by
+ * request. An authored `limit: 0` is sent as zero, never raised to one row, so
+ * the view states the query's total without drawing a group. Two things are local
  * and are labelled as such wherever they are visible: the disclosure state of a
  * row, and the "duplicates only" toggle, which can only filter the groups
  * loaded so far because the query contract cannot express "duplicates only".
@@ -194,8 +198,15 @@ const REQUESTS_SOURCE = 'requests' satisfies DataQuerySource;
  */
 const DEFAULT_SORT: DataQuerySort = 'count_desc';
 
-/** Smallest `limit` the paging contract accepts (AAP 0.4.2). */
-const MIN_QUERY_LIMIT = 1;
+/**
+ * The smallest `limit` the paging contract accepts, and the one value of it
+ * that asks for a count without rows (AAP 0.4.2).
+ *
+ * Zero is a legitimate request, never "unset": the query schema preserves it
+ * exactly and the page echo reports it, so a node that authored it receives the
+ * total of its query and no groups. Only an absent `limit` means unset.
+ */
+const COUNT_ONLY_LIMIT = 0;
 
 /**
  * How many distinct status codes a row shows individually before the rest are
@@ -430,6 +441,12 @@ const EMPTY_STATUSES: readonly ToolbarStatus[] = Object.freeze([]);
 
 const EMPTY_MESSAGE = 'No network requests were captured for this interaction.';
 const EMPTY_TITLE = 'No requests';
+const COUNT_ONLY_TITLE = 'Count only';
+const COUNT_ONLY_UNKNOWN_TOTAL_MESSAGE =
+  'This view requests a count without rows, and no total was reported for its query.';
+const EMPTY_PAGE_TITLE = 'Nothing on this page';
+const GROUP_NOUN_SINGULAR = 'request group';
+const GROUP_NOUN_PLURAL = 'request groups';
 const FILTERED_EMPTY_MESSAGE = 'None of the groups loaded so far has a duplicate occurrence.';
 const LOADING_LABEL = 'Loading requests…';
 const ERROR_TITLE = 'Requests could not be loaded';
@@ -641,21 +658,194 @@ function locationForInitiator(group: RequestGroup, initiator: string): SourceLoc
  * Clamp an authored `limit` into the range the paging contract accepts.
  *
  * An omitted limit stays omitted: the query is replayed as it was authored and
- * the side that resolves it applies the contract's default, which is the only
- * way the page size the service uses and the page size a panel asked for stay
- * the same number. A non-finite value cannot survive the schema, and is also
- * treated as omitted rather than forwarded as arithmetic that would reach the
- * wire.
+ * the side that resolves it applies the contract's default page size, which is
+ * the only way the page size the service uses and the page size a panel asked
+ * for stay the same number. A non-finite value cannot survive the schema, and is
+ * also treated as omitted rather than forwarded as arithmetic that would reach
+ * the wire.
+ *
+ * Every other value is truncated to a whole number and held within
+ * `[COUNT_ONLY_LIMIT, DATA_QUERY_MAX_LIMIT]`. The floor is zero, not one: an
+ * explicit `limit: 0` is a count-only request and is sent as exactly that, so
+ * the service answers with the query's total and no groups rather than with a
+ * single group nobody asked for. The ceiling keeps an over-sized authored value
+ * inside the page bound the service enforces.
+ *
+ * @example
+ * clampAuthoredLimit(undefined); // undefined — the resolver's default applies
+ * clampAuthoredLimit(0); // 0 — a count without rows
+ * clampAuthoredLimit(9000); // DATA_QUERY_MAX_LIMIT
  *
  * @param limit - The node's authored limit, if any.
- * @returns A limit within `[1, DATA_QUERY_MAX_LIMIT]`, or `undefined`.
+ * @returns A whole-number limit within `[0, DATA_QUERY_MAX_LIMIT]`, or `undefined`.
  */
 function clampAuthoredLimit(limit: number | undefined): number | undefined {
   if (limit === undefined || !Number.isFinite(limit)) {
     return undefined;
   }
 
-  return Math.min(Math.max(Math.trunc(limit), MIN_QUERY_LIMIT), DATA_QUERY_MAX_LIMIT);
+  return Math.min(Math.max(Math.trunc(limit), COUNT_ONLY_LIMIT), DATA_QUERY_MAX_LIMIT);
+}
+
+/**
+ * The offset "load more" may request next, or `undefined` when no further page
+ * can be asked for.
+ *
+ * Paging only ever moves forward, and only on the service's word (AAP 0.4.2).
+ * A next page exists when all of the following hold:
+ *
+ *   - the page settled successfully — a page still resolving or a failure
+ *     reports no counters worth following;
+ *   - the effective limit asks for rows — an omitted limit does, since the
+ *     resolver applies its default page size, while a count-only `limit: 0`
+ *     never does: every page of it is empty, so a second request could only
+ *     return the same answer;
+ *   - the service reported a `nextOffset` that is a safe whole number strictly
+ *     past the offset of the page it answered. An echo of that same offset, or
+ *     one behind it, would re-request a page already on screen or step back
+ *     into one, and neither is a next page.
+ *
+ * The value is returned as reported and never derived from the rows in hand,
+ * which would drift the moment a limit was clamped.
+ *
+ * @param status - The settled status of the current page.
+ * @param limit - The effective limit sent with the query, `undefined` when omitted.
+ * @param offset - The offset of the page the service answered.
+ * @param nextOffset - The next offset the service reported, if any.
+ * @returns The offset to request next, or `undefined` when there is no next page.
+ */
+function forwardNextOffsetOf(
+  status: 'loading' | 'error' | 'success',
+  limit: number | undefined,
+  offset: number,
+  nextOffset: number | undefined,
+): number | undefined {
+  if (status !== 'success' || limit === COUNT_ONLY_LIMIT || nextOffset === undefined) {
+    return undefined;
+  }
+
+  return Number.isSafeInteger(nextOffset) && nextOffset > offset ? nextOffset : undefined;
+}
+
+/** The title and message an empty settled page is described with. */
+interface EmptyPageCopy {
+  readonly title: string;
+  readonly message: string;
+}
+
+/** The facts that decide which kind of absence an empty settled page is. */
+interface EmptyPageFacts {
+  /** The effective limit sent with the query, `undefined` when omitted. */
+  readonly limit: number | undefined;
+
+  /** The offset of the page the service answered. */
+  readonly offset: number;
+
+  /** The total the service reported for the query, if any. */
+  readonly total: number | undefined;
+
+  /** Whether the service reported a forward next page (see {@link forwardNextOffsetOf}). */
+  readonly hasNextPage: boolean;
+}
+
+/**
+ * The noun for a number of request groups, agreeing with that number.
+ *
+ * @param count - How many groups the sentence is about.
+ * @returns `request group` for exactly one, `request groups` otherwise.
+ */
+function groupNounFor(count: number): string {
+  return count === 1 ? GROUP_NOUN_SINGULAR : GROUP_NOUN_PLURAL;
+}
+
+/**
+ * Describe a settled page that holds no groups, saying which absence it is.
+ *
+ * An empty page is not always an empty capture, and only one of the answers
+ * below may say that nothing was captured. The contract admits four other ways
+ * for a successful page to hold no rows — a count-only `limit: 0` query, an
+ * authored offset past the end of the result, a page inside a positive total
+ * that still came back empty, and a later page of a source that reported no
+ * total — and each of them has rows or a count the reader should not be told
+ * are absent (AAP 0.4.2). So the copy is chosen, first match wins:
+ *
+ *   1. **Count only** — the query asked for no rows. It states the total when
+ *      one was reported and says that none was otherwise.
+ *   2. **Nothing captured** — the reported total is zero, or no total was
+ *      reported for a page at the start of the result with no page after it.
+ *      The view's own empty message, unchanged.
+ *   3. **Past the end** — a positive total and an offset at or beyond it. It
+ *      names where the page starts and how many groups matched.
+ *   4. **Empty within the total** — a positive total and an offset inside it.
+ *      It states the total and that this page shows none of it.
+ *   5. **No total** — any other page without a reported total: one that
+ *      starts later than the first item, or one with a next page after it. It
+ *      names where the page starts and that no total was reported.
+ *
+ * Positions are one-based, as a reader counts, while the offset is the number
+ * of items skipped. A total that is not a non-negative safe whole number cannot
+ * come from the page contract and is read as unreported rather than printed.
+ * Every count goes through `formatCount`, and no wording names a route, a
+ * component or a framework (AAP 0.5.4).
+ *
+ * @example
+ * describeEmptyPage({ limit: 0, offset: 0, total: 42, hasNextPage: false });
+ * // { title: 'Count only',
+ * //   message: 'This view requests a count without rows: 42 request groups matched its query.' }
+ *
+ * @param facts - The page's limit, offset, reported total and paging state.
+ * @returns The empty state's title and message.
+ */
+function describeEmptyPage(facts: EmptyPageFacts): EmptyPageCopy {
+  const { limit, offset, hasNextPage } = facts;
+  const total =
+    facts.total !== undefined && Number.isSafeInteger(facts.total) && facts.total >= 0
+      ? facts.total
+      : undefined;
+
+  if (limit === COUNT_ONLY_LIMIT) {
+    return {
+      title: COUNT_ONLY_TITLE,
+      message:
+        total === undefined
+          ? COUNT_ONLY_UNKNOWN_TOTAL_MESSAGE
+          : `This view requests a count without rows: ${formatCount(total)} ${groupNounFor(
+              total,
+            )} matched its query.`,
+    };
+  }
+
+  // A page at the start of the result with nothing after it is the whole
+  // result, so an unreported total there still means nothing was captured.
+  if (
+    total === 0 ||
+    (total === undefined && offset === DATA_QUERY_DEFAULT_OFFSET && !hasNextPage)
+  ) {
+    return { title: EMPTY_TITLE, message: EMPTY_MESSAGE };
+  }
+
+  const position = formatCount(offset + 1);
+
+  if (total !== undefined && offset >= total) {
+    return {
+      title: EMPTY_PAGE_TITLE,
+      message: `This page starts at position ${position}, past the end of the ${formatCount(
+        total,
+      )} ${groupNounFor(total)} that matched this query.`,
+    };
+  }
+
+  if (total !== undefined) {
+    return {
+      title: EMPTY_PAGE_TITLE,
+      message: `${formatCount(total)} ${groupNounFor(total)} matched this query, but none are shown on this page.`,
+    };
+  }
+
+  return {
+    title: EMPTY_PAGE_TITLE,
+    message: `This page starts at position ${position} and holds no ${GROUP_NOUN_PLURAL}; no total was reported for this query.`,
+  };
 }
 
 /*
@@ -1139,10 +1329,14 @@ export interface RequestTableProps {
  * Three states, in the precedence the library fixes: a first page that has not
  * settled renders the loading skeleton; a failure renders the error state with
  * the serialised query and a working retry, and never rows beneath a banner; a
- * settled page with no groups renders the empty state. A later page that is
- * still resolving keeps the groups already received on screen and disables the
- * paging control, which is neither a stale page nor an invented one — those
- * rows were received, and the footer says how many of the source they cover.
+ * settled page with no groups renders the empty state, worded for the absence
+ * it is — a count-only query, a page past the end or inside a positive total, or
+ * a capture that really held nothing — and keeps "load more" reachable when the
+ * service reported a forward next page (see {@link describeEmptyPage}). A later
+ * page that is still resolving keeps the groups already received on screen and
+ * disables the paging control, which is neither a stale page nor an invented
+ * one — those rows were received, and the footer says how many of the source
+ * they cover.
  *
  * @param props - See {@link RequestTableProps}.
  * @returns The node's rendering.
@@ -1188,6 +1382,12 @@ export function RequestTable(props: RequestTableProps): ReactElement {
   };
 
   const { status, data, error, total, nextOffset, retry } = useQuery(query);
+
+  // The only offset "load more" may ever request: the service's own next
+  // offset, and only when it moves forward from the page it answered. A
+  // count-only query and a non-advancing echo both leave it `undefined`, so no
+  // paging control is offered that could only re-request the same page.
+  const forwardNextOffset = forwardNextOffsetOf(status, limit, active.offset, nextOffset);
 
   const page = data ?? EMPTY_GROUPS;
 
@@ -1260,15 +1460,15 @@ export function RequestTable(props: RequestTableProps): ReactElement {
   }, [active, node.id, reportFilter]);
 
   const handleLoadMore = useCallback((): void => {
-    // Only the offset the service reported is ever requested; an offset derived
-    // from the number of rows on screen would drift the moment a limit was
-    // clamped (AAP 0.4.2).
-    if (nextOffset === undefined) {
+    // Only the forward offset the service reported is ever requested, exactly
+    // as reported; an offset derived from the number of rows on screen would
+    // drift the moment a limit was clamped (AAP 0.4.2).
+    if (forwardNextOffset === undefined) {
       return;
     }
 
-    setView({ ...active, carried: loaded, offset: nextOffset });
-  }, [active, loaded, nextOffset]);
+    setView({ ...active, carried: loaded, offset: forwardNextOffset });
+  }, [active, forwardNextOffset, loaded]);
 
   const handleRowToggle = useCallback(
     (group: RequestGroup): void => {
@@ -1524,6 +1724,48 @@ export function RequestTable(props: RequestTableProps): ReactElement {
       : loadedNote;
   }, [active.duplicatesOnly, loaded.length, rows.length, total]);
 
+  // What an empty settled page says. An empty page is not necessarily an empty
+  // capture, so the copy names the absence the query and the reported counters
+  // describe; it is drawn only when no group was loaded.
+  const emptyCopy = useMemo(
+    () =>
+      describeEmptyPage({
+        limit,
+        offset: active.offset,
+        total,
+        hasNextPage: forwardNextOffset !== undefined,
+      }),
+    [active.offset, forwardNextOffset, limit, total],
+  );
+
+  // The coverage note and, for a forward next page the service reported, the
+  // paging control. Built once so a populated page and an empty page that the
+  // service says is followed by more draw the same control.
+  const footer = (
+    <Stack
+      direction="horizontal"
+      gap={2}
+      align="center"
+      justify="between"
+      wrap
+      className="dg-request-table__footer"
+    >
+      <Text size="xs" tone="muted">
+        {footerNote}
+      </Text>
+      {forwardNextOffset === undefined ? null : (
+        <Button
+          variant="secondary"
+          size="sm"
+          disabled={status === 'loading'}
+          onClick={handleLoadMore}
+        >
+          {status === 'loading' ? LOAD_MORE_BUSY_LABEL : LOAD_MORE_LABEL}
+        </Button>
+      )}
+    </Stack>
+  );
+
   let body: ReactNode;
 
   if (status === 'loading' && loaded.length === 0) {
@@ -1542,8 +1784,18 @@ export function RequestTable(props: RequestTableProps): ReactElement {
       />
     );
   } else if (loaded.length === 0) {
+    // Reached only for a page that settled successfully with nothing carried
+    // before it. A forward next page keeps its control reachable instead of
+    // stranding the reader on a page the service says is followed by more.
     body = (
-      <EmptyState title={EMPTY_TITLE} message={EMPTY_MESSAGE} className="dg-request-table__empty" />
+      <>
+        <EmptyState
+          title={emptyCopy.title}
+          message={emptyCopy.message}
+          className="dg-request-table__empty"
+        />
+        {forwardNextOffset === undefined ? null : footer}
+      </>
     );
   } else {
     body = (
@@ -1569,28 +1821,7 @@ export function RequestTable(props: RequestTableProps): ReactElement {
           // held no requests.
           empty={<EmptyState message={FILTERED_EMPTY_MESSAGE} />}
         />
-        <Stack
-          direction="horizontal"
-          gap={2}
-          align="center"
-          justify="between"
-          wrap
-          className="dg-request-table__footer"
-        >
-          <Text size="xs" tone="muted">
-            {footerNote}
-          </Text>
-          {nextOffset === undefined ? null : (
-            <Button
-              variant="secondary"
-              size="sm"
-              disabled={status === 'loading'}
-              onClick={handleLoadMore}
-            >
-              {status === 'loading' ? LOAD_MORE_BUSY_LABEL : LOAD_MORE_LABEL}
-            </Button>
-          )}
-        </Stack>
+        {footer}
       </>
     );
   }

@@ -46,17 +46,35 @@
  * because `parseTelemetryEvent` reduces a rejection to field paths and issue
  * codes before it returns.
  *
- * ## The ordering contract, and the half of it this module owns
+ * ## The ordering contracts, and the half of each this module owns
  *
- * AAP 0.2.3 fixes the canonical order of a capture as **parent before child,
- * then `startTime`, then `(producerId, seq)`, then `ingestSeq`**. The work is
- * split, deliberately:
+ * Two orders are specified, for two different readers, and this module serves
+ * both, from two row-ordering tables and one group ordering:
  *
- * - **This module guarantees a deterministic total order** over rows —
- *   {@link CANONICAL_ORDER_BY} — whose last key, the store-assigned
- *   `ingest_seq`, can never tie. That is what makes a page of results
- *   reproducible between two requests, and what makes `limit`/`offset` paging
- *   coherent rather than a lottery over equal timestamps.
+ * - **The canonical order, for the correlator.** AAP 0.2.3 fixes the order of
+ *   a capture as **parent before child, then `startTime`, then
+ *   `(producerId, seq)`, then `ingestSeq`**. Every convenience reader —
+ *   {@link TelemetryRepo.listByTrace}, which `../telemetry/correlate.ts` pages
+ *   through to build a trace tree, and `listByCapture`, `listByRequestKey`,
+ *   `listChildren` and `getBySpanId` — orders by {@link CANONICAL_ORDER_BY}
+ *   (behind `duration DESC`, or behind the group count, under the other two
+ *   sorts), whose last key, the store-assigned `ingest_seq`, can never tie.
+ * - **The panel-data order, for generated panels.** AAP 0.4.2 fixes that a
+ *   panel query's `sort` orders "with a stable secondary key (`id`)".
+ *   {@link TelemetryRepo.query} — the surface `../panels/data.ts` forwards a
+ *   panel node's `DataQuery` onto — orders by the key its sort names and then
+ *   by the event id, {@link PANEL_SECONDARY_ORDER_BY}; the group orderings of
+ *   {@link TelemetryRepo.queryGroups} likewise end in the group key and then
+ *   the id of the group's first event. No panel ordering reads an arrival
+ *   number, so a panel's order is a property of the evidence rather than of
+ *   which batch reached the store first.
+ *
+ * Both are **total** — `ingest_seq` and `id` are each unique — which is what
+ * makes a page of results reproducible between two requests, and what makes
+ * `limit`/`offset` paging coherent rather than a lottery over equal
+ * timestamps. Of the canonical order the work is split, deliberately:
+ *
+ * - **This module orders rows**, by the flat-column chain above.
  * - **Parent-before-child is a property of the tree**, established by
  *   `packages/telemetry/src/correlation/correlator.ts` when it nests events by
  *   `(traceId, parentSpanId)` and walks the result depth-first. It is not
@@ -106,7 +124,7 @@
  * {@link TelemetryRepo.queryGroups} returns one entry per distinct value of a
  * key drawn from a closed vocabulary ({@link TELEMETRY_GROUP_KEYS}) with its
  * count, first event and timing over the **readable** events of the filter,
- * ordered `count DESC, key ASC, first ingest_seq ASC`;
+ * ordered `count DESC, key ASC, first event id ASC`;
  * {@link TelemetryRepo.query} under `count_desc` ranks rows by the count of the
  * group each belongs to, through a window function over the stored rows — the
  * basis `total` uses. Neither is an alias for a row ordering, and neither
@@ -238,13 +256,17 @@ const COMPONENT_JSON_PATH = `$.attributes.${COMPONENT_ATTRIBUTE}`;
  * ---------------------------------------------------------------------------------------------- */
 
 /**
- * The store's total order over telemetry rows: `startTime`, then the emitting
- * producer, then that producer's own sequence number, then the arrival number
- * that can never tie.
+ * The store's canonical total order over telemetry rows: `startTime`, then the
+ * emitting producer, then that producer's own sequence number, then the
+ * arrival number that can never tie.
  *
- * Exported so there is exactly one definition of it — every ordered read below
- * ends in this chain, and a suite asserts the order against
- * `compareEventsCanonical` rather than restating the keys.
+ * Exported so there is exactly one definition of it — every ordering of the
+ * convenience readers ends in this chain ({@link TelemetryRepo.listByTrace},
+ * the read the correlator pages through, among them), and a suite asserts
+ * their order against `compareEventsCanonical` rather than restating the keys.
+ * {@link TelemetryRepo.query} does **not** use it: the panel-data surface
+ * orders by {@link PANEL_START_ASC_ORDER_BY} and its siblings, whose secondary
+ * key is the event id AAP 0.4.2 names.
  *
  * Why each key, in order (AAP 0.2.3):
  *
@@ -267,23 +289,65 @@ const COMPONENT_JSON_PATH = `$.attributes.${COMPONENT_ATTRIBUTE}`;
 export const CANONICAL_ORDER_BY = 'start_time ASC, producer_id ASC, seq ASC, ingest_seq ASC';
 
 /**
- * The slowest-first ordering, with the canonical chain as its tie-break.
+ * The slowest-first ordering of the convenience readers, with the canonical
+ * chain as its tie-break.
  *
- * The chain is not decoration: a latency panel pages through "slowest
- * operations", and two spans of identical duration are common (a zero-duration
- * `state` transition, a cached request). Without a total order behind
- * `duration DESC`, the same row could appear on two pages or on none.
+ * The chain is not decoration: a reader paging through "slowest operations"
+ * meets two spans of identical duration all the time (a zero-duration `state`
+ * transition, a cached request). Without a total order behind `duration DESC`,
+ * the same row could appear on two pages or on none.
  */
 export const DURATION_DESC_ORDER_BY = `duration DESC, ${CANONICAL_ORDER_BY}`;
+
+/**
+ * The stable secondary key every panel-data ordering ends in: the event `id`,
+ * ascending.
+ *
+ * AAP 0.4.2 fixes it for `POST /sessions/:id/panel-data` — `sort` orders "with
+ * a stable secondary key (`id`) per source" — and {@link TelemetryRepo.query}
+ * is the repository half of that route. Two properties make it the right key:
+ *
+ * - **It is unique.** `telemetry_events.id` is `TEXT NOT NULL UNIQUE`, so
+ *   an ordering that ends in it never compares two rows as equal: the order is
+ *   total, and a multi-page walk visits every row exactly once.
+ * - **It belongs to the event, not to its arrival.** The producer assigns it
+ *   (`newEventId` in `@debuggen/shared`) and a replay cannot change it, so,
+ *   unlike `ingest_seq`, it does not depend on which of two batches reached the
+ *   store first — and it is the same value a panel fact cites as evidence.
+ *
+ * Compared under SQLite's default `BINARY` collation, byte by byte. The ids the
+ * producers mint are `evt_` plus sixteen characters of `[0-9a-z]`, which
+ * JavaScript's code-unit comparison orders identically.
+ */
+export const PANEL_SECONDARY_ORDER_BY = 'id ASC';
+
+/**
+ * The panel-data `start_asc` ordering: earliest first, the event id breaking
+ * ties.
+ *
+ * Deliberately not {@link CANONICAL_ORDER_BY}. A panel source is a flat list of
+ * events ordered by the key its sort names; `(producerId, seq)` and
+ * parent-before-child are how the correlator lays out one trace tree, and that
+ * order stays with {@link TelemetryRepo.listByTrace}.
+ */
+export const PANEL_START_ASC_ORDER_BY = `start_time ASC, ${PANEL_SECONDARY_ORDER_BY}`;
+
+/**
+ * The panel-data `duration_desc` ordering: slowest first, the event id breaking
+ * ties — which, for spans of identical duration, is what keeps a latency
+ * panel's pages from repeating or skipping a row.
+ */
+export const PANEL_DURATION_DESC_ORDER_BY = `duration DESC, ${PANEL_SECONDARY_ORDER_BY}`;
 
 /**
  * How a page of telemetry rows, or of occurrence groups, may be ordered.
  *
  * **Exactly** `DataQuerySort` from `@debuggen/panel-schema`, not a subset of
  * it: `../panels/data.ts` forwards a panel node's `sort` field unchanged, and
- * the two ordering tables below are typed `Record<TelemetrySort, …>`, so a
- * member added to that vocabulary fails this module's compilation until both
- * tables say what it means.
+ * the three ordering tables below — canonical rows, panel-data rows and
+ * groups — are typed `Record<TelemetrySort, …>`, so a member added to that
+ * vocabulary fails this module's compilation until every table says what it
+ * means.
  */
 export type TelemetrySort = DataQuerySort;
 
@@ -391,8 +455,8 @@ export function isTelemetryGroupKey(value: unknown): value is TelemetryGroupKey 
 
 /**
  * The `count_desc` row ordering for one group key: rows of the most frequent
- * group first, a group's rows kept together, and each group's rows in
- * canonical order.
+ * group first, a group's rows kept together, and each group's rows in the
+ * order `withinGroup` gives.
  *
  * `COUNT(key) OVER (PARTITION BY key)` is the occurrence count of the row's own
  * group, evaluated over exactly the filtered stored rows — the same set, and
@@ -401,39 +465,66 @@ export function isTelemetryGroupKey(value: unknown): value is TelemetryGroupKey 
  * it in {@link TelemetryPage.skipped}. A document that is not valid JSON has no
  * component, so under that key it ranks with the rows that belong to no group.
  * `COUNT(key)` rather than `COUNT(*)` counts only non-`NULL` keys, so a
- * row that belongs to no group ranks with a count of zero: after every group,
- * in canonical order. The key itself separates two groups of equal size, and
- * the canonical chain orders rows inside a group and makes the whole order
+ * row that belongs to no group ranks with a count of zero: after every group.
+ * The key itself separates two groups of equal size, and `withinGroup` orders
+ * rows inside a group — and the ungrouped tail — and makes the whole order
  * total, which is what keeps a multi-page walk from repeating or skipping a
- * row.
+ * row. Both values it is given end in a unique column.
  *
  * @param groupBy The group key.
+ * @param withinGroup The total order inside a group: {@link CANONICAL_ORDER_BY}
+ * for the convenience readers, {@link PANEL_SECONDARY_ORDER_BY} for
+ * {@link TelemetryRepo.query}.
  * @returns The `ORDER BY` clause.
  */
-function countDescOrderBy(groupBy: TelemetryGroupKey): string {
+function countDescOrderBy(groupBy: TelemetryGroupKey, withinGroup: string): string {
   const key = GROUP_KEY_SQL[groupBy];
 
-  return `COUNT(${key}) OVER (PARTITION BY ${key}) DESC, ${key} ASC, ${CANONICAL_ORDER_BY}`;
+  return `COUNT(${key}) OVER (PARTITION BY ${key}) DESC, ${key} ASC, ${withinGroup}`;
 }
 
 /**
- * The row orderings a caller may ask for, and the `ORDER BY` clause each maps
- * to — one entry per `DataQuerySort` member, enforced by the type.
+ * A row-ordering table: the `ORDER BY` clause each sort a caller may ask for
+ * maps to, given the effective group key — one entry per `DataQuerySort`
+ * member, enforced by the type.
  *
- * `start_asc` is the canonical chain and `duration_desc` puts the chain behind
- * `duration DESC`. `count_desc` is **not** an alias for either: it ranks each
- * row by the occurrence count of the group it belongs to under
+ * In both tables `count_desc` is **not** an alias for another sort: it ranks
+ * each row by the occurrence count of the group it belongs to under
  * {@link TelemetryQuery.groupBy} (see {@link countDescOrderBy}), which is what
  * "largest group first" means for a list of rows. A page of the groups
  * themselves — one entry per group, with its count — is
  * {@link TelemetryRepo.queryGroups}.
  */
-const ORDERING_BY_SORT: Readonly<Record<TelemetrySort, (groupBy: TelemetryGroupKey) => string>> =
-  Object.freeze({
-    start_asc: () => CANONICAL_ORDER_BY,
-    duration_desc: () => DURATION_DESC_ORDER_BY,
-    count_desc: countDescOrderBy,
-  });
+type RowOrderings = Readonly<Record<TelemetrySort, (groupBy: TelemetryGroupKey) => string>>;
+
+/**
+ * The canonical row orderings, which every convenience reader pages in.
+ *
+ * `start_asc` is the canonical chain, `duration_desc` puts the chain behind
+ * `duration DESC`, and `count_desc` orders each group's rows by it. This is
+ * the table behind {@link TelemetryRepo.listByTrace}, whose `start_asc` pages
+ * `../telemetry/correlate.ts` walks, so its clauses change only together with
+ * `compareEventsCanonical`.
+ */
+const CANONICAL_ORDERING_BY_SORT: RowOrderings = Object.freeze({
+  start_asc: () => CANONICAL_ORDER_BY,
+  duration_desc: () => DURATION_DESC_ORDER_BY,
+  count_desc: (groupBy: TelemetryGroupKey) => countDescOrderBy(groupBy, CANONICAL_ORDER_BY),
+});
+
+/**
+ * The panel-data row orderings, which {@link TelemetryRepo.query} pages in:
+ * the key each sort names, then the event id (AAP 0.4.2).
+ *
+ * `start_asc` is {@link PANEL_START_ASC_ORDER_BY}, `duration_desc` is
+ * {@link PANEL_DURATION_DESC_ORDER_BY}, and `count_desc` orders each group's
+ * rows, and the ungrouped tail, by {@link PANEL_SECONDARY_ORDER_BY}.
+ */
+const PANEL_ORDERING_BY_SORT: RowOrderings = Object.freeze({
+  start_asc: () => PANEL_START_ASC_ORDER_BY,
+  duration_desc: () => PANEL_DURATION_DESC_ORDER_BY,
+  count_desc: (groupBy: TelemetryGroupKey) => countDescOrderBy(groupBy, PANEL_SECONDARY_ORDER_BY),
+});
 
 /**
  * Compares two group keys the way SQLite's default `BINARY` collation does: by
@@ -455,19 +546,26 @@ function compareKeysBinary(left: string, right: string): number {
 
 /**
  * The tie-break every group ordering ends in: the group key, which is unique
- * per group, then the group's first arrival number.
+ * per group, then the id of the group's first event.
  *
  * The key alone already makes the order total — one group per distinct key —
- * and the arrival number states the second, always-distinct key explicitly, so
- * the order stays total even if a future key were to compare two distinct
- * values as equal.
+ * and the event id states a second, always-distinct key explicitly: every row
+ * belongs to one group under a key, so two groups never share a first event,
+ * and the order stays total even if a future key were to compare two distinct
+ * values as equal. It is the event id rather than the arrival number because a
+ * page of groups is panel data, whose stable secondary key AAP 0.4.2 fixes as
+ * the `id` (see {@link PANEL_SECONDARY_ORDER_BY}); both are compared as
+ * SQLite's `BINARY` collation would.
  *
  * @param left One group.
  * @param right The other.
  * @returns Negative, zero or positive, as for `Array.prototype.sort`.
  */
 function groupTieBreak(left: TelemetryGroup, right: TelemetryGroup): number {
-  return compareKeysBinary(left.key, right.key) || left.firstIngestSeq - right.firstIngestSeq;
+  return (
+    compareKeysBinary(left.key, right.key) ||
+    compareKeysBinary(left.firstEventId, right.firstEventId)
+  );
 }
 
 /**
@@ -652,6 +750,22 @@ RETURNING ingest_seq`;
  */
 const SELECT_STORED_BY_ID_SQL = `SELECT ingest_seq, session_id, event FROM ${TABLE}
 WHERE id = ?`;
+
+/**
+ * Reads which session owns one capture: the attribution ownership check of
+ * {@link TelemetryRepo.insertMany}.
+ *
+ * The schema's two foreign keys are independent — `session_id` references
+ * `sessions` and `capture_id` references `captures` — so neither of them can
+ * refuse an event that names session A and a capture of session B, and such a
+ * row would then be deleted by B's capture cascade while A still owned it. This
+ * read is what closes that gap, and it runs inside the batch transaction, so
+ * the answer and the write it guards are one atomic unit. `captures.id` is the
+ * table's primary key, so it is an indexed point read, and the insert path
+ * memoises it per batch: a batch almost always names one capture, which makes
+ * the check one read per batch rather than one per event.
+ */
+const SELECT_CAPTURE_OWNER_SQL = `SELECT session_id FROM captures WHERE id = ?`;
 
 /** The two columns every read below needs: the arrival number and the document. */
 const SELECTED = 'ingest_seq, event';
@@ -878,6 +992,22 @@ export interface TelemetryQuery {
   readonly tiers?: readonly TelemetryTier[] | undefined;
 
   /**
+   * Keep only events of this one producer tier.
+   *
+   * Mirrors `DataQuery.filter.tier` of `@debuggen/panel-schema`, which is
+   * singular, so a parsed panel filter can be spread onto this shape unchanged
+   * and still narrow: were only {@link TelemetryQuery.tiers} accepted, the
+   * forwarded `tier` would be an unknown key that narrows nothing, and a
+   * database-only panel would be answered with browser and server spans too.
+   *
+   * Composes with `tiers` by **AND**, like every other field: both present
+   * means the event's tier must equal `tier` *and* be listed in `tiers`, so a
+   * `tier` outside the list matches nothing. An unknown value is refused with
+   * reason `unknown-tier`, as an unknown member of `tiers` is.
+   */
+  readonly tier?: TelemetryTier | undefined;
+
+  /**
    * Keep only spans lasting at least this many milliseconds.
    *
    * Fractional values are meaningful — durations are doubles — and must be
@@ -906,11 +1036,16 @@ export interface TelemetryQuery {
   readonly requestKey?: string | undefined;
 
   /**
-   * How to order the page. Defaults to `'start_asc'`, the canonical order.
+   * How to order the page. Defaults to `'start_asc'`.
    *
-   * Every `DataQuerySort` member is accepted. `'count_desc'` ranks rows by the
-   * size of the group each belongs to under {@link TelemetryQuery.groupBy} —
-   * see {@link TelemetryRepo.query} — and a page of the groups themselves is
+   * Every `DataQuerySort` member is accepted, and what a sort ends in depends
+   * on the reader: through {@link TelemetryRepo.query}, the panel-data surface,
+   * each sort's key is followed by the event id
+   * ({@link PANEL_SECONDARY_ORDER_BY}); through a convenience reader, which
+   * takes this field by way of {@link TelemetryReadOptions}, it is followed by
+   * the canonical chain ({@link CANONICAL_ORDER_BY}). `'count_desc'` ranks rows
+   * by the size of the group each belongs to under
+   * {@link TelemetryQuery.groupBy}, and a page of the groups themselves is
    * {@link TelemetryRepo.queryGroups}.
    */
   readonly sort?: TelemetrySort | undefined;
@@ -977,6 +1112,15 @@ export interface TelemetryPage {
    * paging loop asking for the same offset forever the moment one row stopped
    * validating.
    *
+   * **A page that read no row is terminal**, and carries no `nextOffset` even
+   * when `offset` is short of `total`. The ordinary way to get such a page with
+   * rows still ahead is the count-only request, `limit: 0`: its "next" offset would
+   * be the offset it was asked for, and a pager that followed it would request
+   * the same empty page forever. Present, therefore, `nextOffset` is always
+   * strictly greater than the page's own offset — the property a page walk such
+   * as `../telemetry/correlate.ts` relies on to terminate — and a caller that
+   * wants rows after a count-only answer asks again with a positive `limit`.
+   *
    * `../panels/data.ts` maps the absence onto the `nextOffset: null` that
    * protocol's `DataPage` echo requires, because after a JSON round trip an
    * absent key and "no more pages" would otherwise be indistinguishable.
@@ -1040,11 +1184,16 @@ export interface TelemetryGroup {
   /**
    * The id of the group's first readable event — the smallest `ingest_seq`
    * among the events counted — so a panel fact about the group cites an event
-   * every read of the store can show.
+   * every read of the store can show. Also the final tie-break of every group
+   * ordering, after the key.
    */
   readonly firstEventId: string;
 
-  /** That event's arrival number, the group order's final tie-break. */
+  /**
+   * That event's arrival number: what chose it as the group's representative.
+   * No group ordering reads it — a page of groups ends in the event id, the
+   * panel-data secondary key.
+   */
   readonly firstIngestSeq: number;
 
   /** The earliest `startTime` among the group's counted events, unrounded. */
@@ -1069,6 +1218,12 @@ export interface TelemetryGroupPage {
   /**
    * The offset to ask for next, or **absent** when this page is the last one —
    * the same contract as {@link TelemetryPage.nextOffset}, in groups.
+   *
+   * That includes the terminal rule: a page that returned no group — the
+   * count-only `limit: 0`, or an offset at or past the end — carries no
+   * `nextOffset` even when groups remain after its offset, because its "next"
+   * offset would be its own. Present, it is always strictly greater than the
+   * page's offset.
    */
   readonly nextOffset?: number;
 
@@ -1156,6 +1311,18 @@ export interface TelemetryRepo {
    * never have been ingested (AAP 0.5.1, 0.7.1). The refusal names the field
    * paths that failed and never a value.
    *
+   * Refuses the whole batch, too, when an element's `captureId` names a
+   * capture that belongs to a **different** session than its `sessionId` —
+   * `STORE_ERROR` with reason `capture-session-mismatch`, the element's
+   * `index`, and its own `sessionId` and `captureId` (never the capture's
+   * owning session). The schema's foreign keys check each id on its own and
+   * cannot catch the pair, and a row stored with one would be deleted by the
+   * other session's capture cascade. The owner is read inside the same
+   * transaction as the writes, before each element is written, so the check
+   * and the write are atomic and the refusal rolls back every element written
+   * before it. A capture the store does not hold at all is refused by the
+   * foreign key as `unknown-attribution`.
+   *
    * A conflict on `id` is an idempotent replay only when the stored event and
    * the candidate are the same event. The stored row is read in full, validated
    * and compared canonically with the candidate — key order inside objects is
@@ -1164,7 +1331,8 @@ export interface TelemetryRepo {
    * cannot tell those apart. An exact replay is skipped and reported as the
    * **stored** event. Anything else rolls the whole batch back — including the
    * rows written earlier in it, and including two differing copies of one id
-   * inside the same batch — with `STORE_ERROR` and one of three reasons:
+   * inside the same batch — with `STORE_ERROR` and one of three reasons, beside
+   * the `capture-session-mismatch` and `unknown-attribution` refusals above:
    *
    * - `event-id-reused` — the id belongs to another session's row;
    * - `event-id-conflict` — same session, different content; `details.fields`
@@ -1182,16 +1350,21 @@ export interface TelemetryRepo {
   ): Result<InsertTelemetryResult, DebuggenError>;
 
   /**
-   * Reads one page of a session's events.
+   * Reads one page of a session's events — the panel-data surface.
    *
+   * Ordered by the panel-data orderings (AAP 0.4.2): the key the sort names,
+   * then the event id as the stable secondary key — `start_time ASC, id ASC`
+   * under `'start_asc'`, `duration DESC, id ASC` under `'duration_desc'`.
    * Under `'count_desc'` the rows of the largest group under `groupBy` come
-   * first, each group's rows together and in canonical order, groups of equal
-   * size in ascending key order, and rows belonging to no group last — a total
-   * order, so paging is as stable as under the other two sorts.
+   * first, each group's rows together and in ascending id order, groups of
+   * equal size in ascending key order, and rows belonging to no group last, in
+   * ascending id order too. Every one of these is a total order, so paging is
+   * stable under all three. The canonical order the correlator needs is the
+   * convenience readers' ({@link TelemetryRepo.listByTrace}).
    *
    * @param filter What to match, how to order it and which page to return.
    * @returns The page, or the refusal for an argument this repository will not
-   * accept (an unknown sort, group key or kind, a negative or fractional
+   * accept (an unknown sort, group key, kind or tier, a negative or fractional
    * `limit` or `offset`, a non-finite `minDuration`).
    */
   query(filter: TelemetryQuery): Result<TelemetryPage, DebuggenError>;
@@ -1210,9 +1383,9 @@ export interface TelemetryRepo {
    * out of every group and reported in {@link TelemetryGroupPage.skipped} and
    * at `warn`, the same skip-and-report rule a row page follows, so no count
    * and no representative event rests on evidence a read cannot show. Every
-   * ordering ends in the group key (compared as SQLite's `BINARY` collation
-   * does) and then the first arrival number, so groups of equal count page
-   * deterministically.
+   * ordering ends in the group key and then the id of the group's first event
+   * (both compared as SQLite's `BINARY` collation does), so groups of equal
+   * count page deterministically and no group order reads an arrival number.
    *
    * The whole filtered set is read to form the groups, so the cost grows with
    * the rows matched rather than with the page; narrow by capture, kind or
@@ -1229,7 +1402,24 @@ export interface TelemetryRepo {
    * Every event of one correlated interaction, in canonical order by default.
    *
    * What the correlator is handed to build a trace tree, and what the
-   * `timeline`, `flame` and `waterfall` nodes are served from.
+   * `timeline`, `flame` and `waterfall` nodes are served from. Like every
+   * convenience reader it orders by the canonical chain
+   * ({@link CANONICAL_ORDER_BY}) under each sort, never by the panel-data
+   * orderings of {@link TelemetryRepo.query}: the correlator's page walk relies
+   * on it.
+   *
+   * A trace id is not guaranteed unique across the captures of a session — it
+   * is minted by a producer, and nothing in the schema keys it to one capture —
+   * so `options.captureId` narrows the trace to one capture window: only that
+   * capture's events are returned, and `total` counts only them. Absent, every
+   * capture's events of the trace are returned together.
+   *
+   * @param sessionId The session that owns the evidence.
+   * @param traceId The correlation id shared by every event of the interaction.
+   * @param options The capture narrowing, the remaining filters, ordering and
+   * paging.
+   * @returns The page, or the refusal for an argument this repository will not
+   * accept — the refusals of {@link TelemetryRepo.query}.
    */
   listByTrace(
     sessionId: SessionId,
@@ -2043,6 +2233,26 @@ function buildFilter(filter: InternalFilter, operation: string): Result<FilterPl
     values.push(...tiers);
   }
 
+  if (filter.tier !== undefined) {
+    // The singular `DataQuery.filter.tier`, checked against the same
+    // vocabulary and ANDed with any `tiers` list above; see TelemetryQuery.tier.
+    const tier: unknown = filter.tier;
+
+    if (!isTelemetryTier(tier)) {
+      return err(
+        argumentError(
+          operation,
+          'A telemetry query named a tier the store does not know.',
+          `Use one of: ${TELEMETRY_TIERS.join(', ')}.`,
+          'unknown-tier',
+        ),
+      );
+    }
+
+    clauses.push('tier = ?');
+    values.push(tier);
+  }
+
   if (filter.minDuration !== undefined) {
     if (!Number.isFinite(filter.minDuration) || filter.minDuration < 0) {
       return err(
@@ -2399,6 +2609,50 @@ function reusedEventIdError(eventId: string): DebuggenError {
 }
 
 /**
+ * The error for an event whose `captureId` names a capture that belongs to a
+ * **different** session than the event's `sessionId`.
+ *
+ * Attribution assigns both ids together from the bound session's active
+ * capture (AAP 0.4.2), so a pair that disagrees is not a partial attribution but a
+ * wrong one: stored, the row would claim one session's evidence while living
+ * under another session's capture, and deleting that capture would cascade it
+ * away from the session that owns it. The whole batch is rolled back instead.
+ *
+ * Only the event's **own** identifiers are reported. The session that actually
+ * owns the capture is deliberately left out of the message and the details:
+ * an error raised here is logged and may be shown in both user interfaces, and
+ * naming another session there would disclose that session to whoever sees the
+ * refusal.
+ *
+ * @param index The offending element's position in the batch.
+ * @param batchSize How many events the batch held.
+ * @param sessionId The session the element claims.
+ * @param captureId The capture the element names, which that session does not own.
+ * @returns The coded error.
+ */
+function captureOwnershipError(
+  index: number,
+  batchSize: number,
+  sessionId: string,
+  captureId: string,
+): DebuggenError {
+  return new DebuggenError(
+    'STORE_ERROR',
+    'A telemetry event is attributed to a capture that belongs to a different session.',
+    {
+      hint: "An event's capture must be a capture of the event's own session, so attribution must take both from the same active capture window. Nothing of this batch was written; start a new capture and reproduce the issue again.",
+      details: context('insertMany', {
+        index,
+        batchSize,
+        sessionId,
+        captureId,
+        reason: 'capture-session-mismatch',
+      }),
+    },
+  );
+}
+
+/**
  * The error for an event id the session already holds as a **different**
  * event.
  *
@@ -2643,12 +2897,24 @@ export function createTelemetryRepo(deps: TelemetryRepoDeps): TelemetryRepo {
    *
    * Every reader below routes through this, which is what makes their behaviour
    * identical by construction — the same refusals, the same defaults, the same
-   * total order and the same skip-and-count policy — rather than by seven call
+   * paging rules and the same skip-and-count policy — rather than by seven call
    * sites remembering to agree.
+   *
+   * The ordering table is the one thing that differs, and it is chosen by the
+   * reader rather than by the caller's filter: {@link TelemetryRepo.query}, the
+   * panel-data surface, passes {@link PANEL_ORDERING_BY_SORT}; every
+   * convenience reader takes the default, {@link CANONICAL_ORDERING_BY_SORT},
+   * the order the correlator's page walk depends on (see the module overview).
+   *
+   * @param filter What to match, how to order it and which page to return.
+   * @param operation The calling method, for a refusal's `details` and logs.
+   * @param orderings The row-ordering table the page is ordered by.
+   * @returns The page, or the refusal for an argument the read will not accept.
    */
   function readPage(
     filter: InternalFilter,
     operation: string,
+    orderings: RowOrderings = CANONICAL_ORDERING_BY_SORT,
   ): Result<TelemetryPage, DebuggenError> {
     return attempt<TelemetryPage>(operation, () => {
       const plan = buildFilter(filter, operation);
@@ -2672,7 +2938,7 @@ export function createTelemetryRepo(deps: TelemetryRepoDeps): TelemetryRepo {
 
       const { clause, values } = plan.value;
       const { sort, groupBy, limit, offset } = paging.value;
-      const ordering = ORDERING_BY_SORT[sort](groupBy);
+      const ordering = orderings[sort](groupBy);
 
       // One count over the identical WHERE clause, so `total` and `rows` can
       // never describe different filters.
@@ -2714,12 +2980,18 @@ ORDER BY ${ordering} LIMIT ? OFFSET ?`,
         });
       }
 
+      // Advanced by the rows the statement read, unreadable ones included, so
+      // a skipped row cannot stall a walk. A page that read nothing — the
+      // count-only `limit: 0`, or an offset at or past the end — is terminal:
+      // its "next" offset would be its own, and a pager following it would
+      // never advance (see TelemetryPage.nextOffset).
       const nextOffset = offset + rows.length;
+      const hasNextPage = rows.length > 0 && nextOffset < total;
 
       return ok({
         rows: read.value.events,
         total,
-        ...(nextOffset < total ? { nextOffset } : {}),
+        ...(hasNextPage ? { nextOffset } : {}),
         ...(read.value.skipped.length > 0 ? { skipped: read.value.skipped.length } : {}),
       });
     });
@@ -2924,6 +3196,7 @@ ORDER BY ${ordering} LIMIT ? OFFSET ?`,
         () => {
           const insert = store.statement(INSERT_SQL);
           const lookup = store.statement(SELECT_STORED_BY_ID_SQL);
+          const ownerLookup = store.statement(SELECT_CAPTURE_OWNER_SQL);
 
           // One transaction for the whole batch, and one prepared statement
           // reused per row: an ingest batch is the hot path of a running
@@ -2933,7 +3206,51 @@ ORDER BY ${ordering} LIMIT ? OFFSET ?`,
             let inserted = 0;
             let skipped = 0;
 
-            for (const event of validated) {
+            // The owning session of each capture this batch names, read once
+            // per capture: `null` records a capture the store does not hold.
+            // Local to this transaction on purpose — a capture's owner is
+            // only known to be current inside the transaction that read it.
+            const owners = new Map<string, string | null>();
+
+            const ownerOf = (captureId: string): string | null => {
+              const known = owners.get(captureId);
+
+              if (known !== undefined) {
+                return known;
+              }
+
+              const row = ownerLookup.get(captureId);
+              let owner: string | null = null;
+
+              if (row !== undefined) {
+                const column = row['session_id'];
+
+                if (typeof column !== 'string') {
+                  throw corruptColumnError(operation, 'session_id');
+                }
+
+                owner = column;
+              }
+
+              owners.set(captureId, owner);
+
+              return owner;
+            };
+
+            for (const [index, event] of validated.entries()) {
+              // Checked before the element is written, inside the transaction
+              // that writes it, so the check and the write are atomic. A
+              // capture of another session throws, and the throw rolls back
+              // every element written before it. A capture the store does not
+              // hold at all is left to the `capture_id` foreign key, which
+              // refuses it as `unknown-attribution` — one classification for
+              // one condition, whichever path meets it first.
+              const owner = ownerOf(event.captureId);
+
+              if (owner !== null && owner !== event.sessionId) {
+                throw captureOwnershipError(index, batchSize, event.sessionId, event.captureId);
+              }
+
               const written = insert.get(...insertValues(event, toStoredDocument(event)));
 
               if (written === undefined) {
@@ -2975,7 +3292,8 @@ ORDER BY ${ordering} LIMIT ? OFFSET ?`,
     },
 
     query(filter) {
-      return readPage(filter, 'query');
+      // The panel-data surface: ordered by the sort's key, then the event id.
+      return readPage(filter, 'query', PANEL_ORDERING_BY_SORT);
     },
 
     queryGroups(query) {
@@ -3048,12 +3366,16 @@ ORDER BY ${ordering} LIMIT ? OFFSET ?`,
         const ordered = collected.value.groups.sort(GROUP_ORDERING_BY_SORT[sort]);
         const total = ordered.length;
         const groups = ordered.slice(offset, offset + limit);
+        // The same terminal rule as a row page, applied here independently: a
+        // page of no groups — the count-only `limit: 0` included — would
+        // otherwise point at its own offset (see TelemetryGroupPage.nextOffset).
         const nextOffset = offset + groups.length;
+        const hasNextPage = groups.length > 0 && nextOffset < total;
 
         return ok({
           groups,
           total,
-          ...(nextOffset < total ? { nextOffset } : {}),
+          ...(hasNextPage ? { nextOffset } : {}),
           ...(skipped.length > 0 ? { skipped: skipped.length } : {}),
         });
       });

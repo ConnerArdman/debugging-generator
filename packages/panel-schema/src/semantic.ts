@@ -77,10 +77,15 @@
  * - `fatal` — a citation or filter the capture refutes. The panel must not be
  *   shown as an answer.
  * - `unverifiable` — a reference that could not be checked (above).
- * - `advisory` — the capture holds no evidence of the kind a node draws. **Not
- *   fatal by default**: the node renders its `EmptyState` with a node-specific
- *   message, which is the designed behaviour for "No renders were captured for
- *   this interaction" (AAP 0.6.2). Escalated only under `requireVerifiable`.
+ * - `advisory` — the capture holds no evidence of the kind a node draws, or
+ *   holds records of that kind none of which carries a field the node cannot
+ *   draw a record without (its catalog `requiredReads`). **Not fatal by
+ *   default**: the node renders its `EmptyState` with a node-specific message,
+ *   which is the designed behaviour for "No renders were captured for this
+ *   interaction" (AAP 0.6.2). Escalated only under `requireVerifiable`. A
+ *   missing *optional* read — a resolved source location, resource timing
+ *   behind a request's size — raises nothing at all: the view still draws, and
+ *   renders that value as unavailable.
  * - `informational` — a metric the capture could not measure. **Never fatal,
  *   under any option**: `MetricValue.available === false` exists so that an
  *   unobservable metric such as `transferred_bytes` renders as "n/a"
@@ -133,10 +138,18 @@
 
 import { DebuggenError, err, ok } from '@debuggen/shared';
 import type { EventId, Result, SpanId, TraceId } from '@debuggen/shared';
-import { METRIC_IDS, isMetricId, isTelemetryKind, isTelemetryTier } from '@debuggen/telemetry';
+import {
+  METRIC_IDS,
+  TELEMETRY_KINDS,
+  attributeKeysFor,
+  isMetricId,
+  isTelemetryKind,
+  isTelemetryTier,
+} from '@debuggen/telemetry';
 import type {
   CaptureSummary,
   ErrorSummary,
+  MetricId,
   MetricValue,
   QueryGroup,
   QueryOccurrence,
@@ -145,6 +158,7 @@ import type {
   RequestGroup,
   RequestOccurrence,
   SpanSummary,
+  TelemetryEvent,
   TelemetryKind,
   TelemetryTier,
 } from '@debuggen/telemetry';
@@ -269,7 +283,8 @@ const PATH_SEPARATOR = '.';
  *
  * Ordered by what each says about the panel: the citations first, then the trace
  * a view is scoped to, then the computed values a tile row asks for, then the
- * evidence a node needs to draw anything, then the two defensive checks on the
+ * evidence a node needs to draw anything — the records of its kinds, then the
+ * fields those records must carry — then the two defensive checks on the
  * summary's own lists.
  */
 export const SEMANTIC_ISSUE_REASONS = Object.freeze([
@@ -302,6 +317,15 @@ export const SEMANTIC_ISSUE_REASONS = Object.freeze([
    * node renders its empty state (AAP 0.6.2).
    */
   'unavailable-source',
+  /**
+   * The capture holds records of the kind this node draws, but none of them
+   * carries an attribute the node cannot draw a record without — the node's
+   * catalog `requiredReads` (`./catalog.ts`) — so the view will be empty
+   * although its source is not. **Advisory**, like an unavailable source: the
+   * node renders its empty state. Never raised for an *optional* read, whose
+   * absence renders as unavailable inside a view that still draws.
+   */
+  'unavailable-field',
   /**
    * A fact or hypothesis with no citation at all. Defensive: `factSchema` bounds
    * `evidence` below by one, so this is unreachable for a specification that
@@ -373,6 +397,7 @@ export const SEMANTIC_ISSUE_SEVERITY_BY_REASON: Readonly<
   'absent-metric': 'fatal',
   'unavailable-metric': 'informational',
   'unavailable-source': 'advisory',
+  'unavailable-field': 'advisory',
   'unevidenced-fact': 'fatal',
   'empty-observed': 'fatal',
 });
@@ -405,6 +430,7 @@ export const SEMANTIC_ISSUE_CODE_BY_REASON: Readonly<Record<SemanticIssueReason,
     'absent-metric': 'panel_node_metric_absent',
     'unavailable-metric': 'panel_node_metric_unavailable',
     'unavailable-source': 'panel_node_source_unavailable',
+    'unavailable-field': 'panel_node_field_unavailable',
     'unevidenced-fact': EVIDENCE_EMPTY_CODE,
     'empty-observed': 'panel_summary_observed_empty',
   });
@@ -527,6 +553,55 @@ export type EventIdResolver = (ids: readonly string[]) => IdResolution;
 export type TraceIdResolver = (ids: readonly string[]) => IdResolution;
 
 /**
+ * How the capture's records of one kind carry their attribute keys: how many
+ * records of the kind there are, and how many of them carry each key with a
+ * value.
+ *
+ * Counts only. A key names a field the telemetry vocabulary declares and a
+ * count is a number, so a tally holds the *shape* of a capture and none of its
+ * content — the same bound this module's issues are held to.
+ */
+export interface KindFieldPresence {
+  /** How many records of this kind the capture holds. */
+  readonly events: number;
+  /**
+   * For each attribute key carried by at least one record of this kind, how
+   * many records carry it with a value — one that is not `undefined`, not
+   * `null` and not the empty string. A key absent from this record is carried
+   * by none of them.
+   */
+  readonly attributes: Readonly<Record<string, number>>;
+  /**
+   * For each attribute key carried *as text* by at least one record of this
+   * kind, how many records carry it as a string of at least one character.
+   *
+   * This is the count a required attribute key is checked against, because it
+   * is the predicate the aggregates that refuse a record apply: the query
+   * aggregate groups a database span only by a `db.statement` that is a string
+   * of positive length, so a numeric value under that key is carried in
+   * {@link attributes} and still forms no row, while a whitespace-only string
+   * does form one. A key absent from this record is carried as text by none of
+   * them.
+   */
+  readonly text: Readonly<Record<string, number>>;
+}
+
+/**
+ * Per-kind attribute presence over a capture's records, as
+ * {@link tallyFieldPresence} computes it. A kind absent from the record is one
+ * the capture holds no record of.
+ *
+ * This is what a {@link CaptureSummary} does not publish: the rollup counts
+ * records per kind but not which of their attributes are populated, so only a
+ * caller that holds the records — the coordination service, over its stored
+ * events — can supply it. The field-availability check consults it only where
+ * the summary's own aggregate results leave the question open: an aggregate's
+ * published verdict on the records it formed rows from is the more direct
+ * answer, and a tally never overrides it.
+ */
+export type CaptureFieldPresence = Readonly<Partial<Record<TelemetryKind, KindFieldPresence>>>;
+
+/**
  * How an outcome is mapped onto a {@link Result}.
  *
  * Declared separately from {@link SemanticValidationOptions}, which extends it,
@@ -586,6 +661,20 @@ export interface SemanticValidationOptions extends SemanticResultOptions {
    * when nothing else could be.
    */
   readonly allowEmptyObserved?: boolean;
+
+  /**
+   * Which attribute keys the capture's records actually carry, per kind.
+   * Optional; build it with {@link tallyFieldPresence} over the capture's
+   * events.
+   *
+   * The summary answers the field-availability question first, from the
+   * aggregate results it publishes (see {@link collectSemanticIssues}); where
+   * those leave it open, a supplied tally decides it: a node whose kinds are
+   * present but none of whose records carries a key in the node's catalog
+   * `requiredReads` as text is reported as `unavailable-field`. Omitted, a
+   * question the summary leaves open stays open.
+   */
+  readonly fieldPresence?: CaptureFieldPresence;
 }
 
 /*
@@ -897,11 +986,81 @@ const SUMMARY_TOP_REQUESTS_FIELD: keyof CaptureSummary = 'topRequests';
 /** See {@link SUMMARY_TOP_SPANS_FIELD}. */
 const SUMMARY_TOP_QUERIES_FIELD: keyof CaptureSummary = 'topQueries';
 
+/**
+ * `truncated` on the summary: whether any bounded section — or the published
+ * trace list — was clipped. `false` is what lets an empty section be read as
+ * "the aggregate formed no group at all" rather than as "none made the cut".
+ */
+const SUMMARY_TRUNCATED_FIELD: keyof CaptureSummary = 'truncated';
+
+/**
+ * What a summary publishes about the result of the aggregate behind one
+ * record-grouping source.
+ *
+ * Both halves are that aggregate's own output, computed over **every** record
+ * of the capture, which is what makes them the authoritative answer to "did the
+ * aggregate form a row from any record": the aggregate applies its own
+ * usable-record predicate — the query aggregate forms no group for a database
+ * span without a statement string — and the summary publishes what it formed.
+ */
+interface SummaryAggregateEvidence {
+  /**
+   * The bounded section holding the aggregate's leading groups. Non-empty
+   * proves a group formed; empty proves none did only while the summary reports
+   * that nothing it published was clipped.
+   */
+  readonly section: keyof CaptureSummary;
+  /**
+   * The metric that counts what the aggregate's groups account for, over the
+   * whole capture and whatever the sections clipped. Present only where the
+   * metric is defined as exactly that sum — `query_count` is the executions the
+   * query groups account for (`packages/telemetry/src/aggregate/summary.ts`), so
+   * an available `0` beside a non-zero `db.query` tally says the aggregate
+   * formed no group at all, in a capture whose clipped `topSpans` set the
+   * summary's global `truncated` flag. Typed as the telemetry package's metric
+   * vocabulary, so a renamed id fails the build here.
+   */
+  readonly groupCountMetric?: MetricId;
+}
+
+/**
+ * The summary evidence each record-grouping source is summarised into, as data.
+ *
+ * A source absent here has no summary section, and the field-availability
+ * question for it is left to {@link SemanticValidationOptions.fieldPresence}.
+ * `renders` and `requests` carry no group-count metric: their metrics count
+ * records or occurrences rather than exactly what their groups account for, and
+ * neither node requires an attribute key today, so their sections alone are
+ * recorded.
+ */
+const SUMMARY_EVIDENCE_BY_SOURCE: Readonly<
+  Partial<Record<DataQuerySource, SummaryAggregateEvidence>>
+> = Object.freeze({
+  renders: Object.freeze({ section: SUMMARY_TOP_RENDERS_FIELD }),
+  requests: Object.freeze({ section: SUMMARY_TOP_REQUESTS_FIELD }),
+  queries: Object.freeze({ section: SUMMARY_TOP_QUERIES_FIELD, groupCountMetric: 'query_count' }),
+});
+
+/** `kind` on a telemetry event, the key a presence tally is grouped by. */
+const EVENT_KIND_FIELD: keyof TelemetryEvent = 'kind';
+
+/** `attributes` on a telemetry event, the bag a presence tally counts keys in. */
+const EVENT_ATTRIBUTES_FIELD: keyof TelemetryEvent = 'attributes';
+
+/** `events` on one kind's presence tally. */
+const PRESENCE_EVENTS_FIELD: keyof KindFieldPresence = 'events';
+
+/** `text` on one kind's presence tally: the carriers a required key is checked against. */
+const PRESENCE_TEXT_FIELD: keyof KindFieldPresence = 'text';
+
 /** `id` on a metric value, matched against a tile row's requested ids. */
 const METRIC_VALUE_ID_FIELD: keyof MetricValue = 'id';
 
 /** `available` on a metric value: whether the capture could measure it at all. */
 const METRIC_VALUE_AVAILABLE_FIELD: keyof MetricValue = 'available';
+
+/** `value` on a metric value: the measurement, present when it is available. */
+const METRIC_VALUE_VALUE_FIELD: keyof MetricValue = 'value';
 
 /**
  * `id` on a summarised span or failure — which *is* the event's id, and
@@ -1392,21 +1551,36 @@ function holdsAnyKind(
 }
 
 /**
- * Checks that the capture plausibly holds the evidence a node needs, and that
- * its filter does not narrow to nothing.
+ * Checks that the capture holds the evidence a node needs — records of its
+ * kinds, carrying the fields it cannot draw a record without — and that its
+ * filter does not narrow to nothing.
  *
- * This is AAP 0.7.1's "catalog `reads` fields available", implemented against
- * what a rollup can actually answer. `reads` names event *fields*, and a bounded
- * summary reports no per-field presence — so the enforceable half of the rule is
- * the *kinds* the same catalog entry declares, which that module documents as
- * "the set a capture-aware validator checks a capture's per-kind tallies
- * against". The entry's `reads` is what identifies the nodes this question does
- * not apply to at all: a container or a source-link leaf reads no captured data,
- * so its list is empty and there is nothing to be unavailable.
+ * This is AAP 0.7.1's "catalog `reads` fields available", answered in two
+ * steps against the catalog entry for the node's type:
  *
- * The kind groups themselves are never spelled here. They arrive through the
- * catalog entry, which imports them from `@debuggen/telemetry` — the module that
- * owns every kind list and states that no other module may write one out
+ * 1. **Records.** The *kinds* the entry declares, which that module documents
+ *    as the set a capture-aware validator checks a capture's per-kind tallies
+ *    against. A capture holding none of them is `unavailable-source`, and that
+ *    is the whole finding: an empty capture is reported once, never also as a
+ *    missing field.
+ * 2. **Required fields.** The attribute keys in the entry's `requiredReads` —
+ *    the keys the aggregate behind the node refuses a record without, the query
+ *    table's statement being the one the catalog holds today. Records of the
+ *    node's kinds that all lack such a key make a view as empty as no records
+ *    at all, so that is `unavailable-field`, at the same `query.source` path.
+ *    Answered first from what the summary publishes about the aggregate behind
+ *    the node's source — its unbounded group-count metric, then its bounded
+ *    section — because that is the aggregate's own verdict, reached with its
+ *    own usable-record predicate over every record; then, where the summary
+ *    leaves it open, from {@link SemanticValidationOptions.fieldPresence}.
+ *    Every other case is left open rather than guessed. The entry's *optional*
+ *    reads are never checked: a missing source location or resource-timing
+ *    entry renders as unavailable inside a view that still draws.
+ *
+ * Only a node that requires a query is asked either question: a container or a
+ * source-link leaf reads no captured data, so there is nothing to be
+ * unavailable. The kind groups and field names are never spelled here — they
+ * arrive through the catalog entry, which takes them from `@debuggen/telemetry`
  * (AAP 0.2.3).
  *
  * **Advisory, not fatal.** A node whose evidence the capture lacks renders its
@@ -1420,10 +1594,11 @@ function collectAvailabilityIssues(
   type: PanelNodeType,
   summary: CaptureSummary,
   index: CaptureIndex,
+  fieldPresence: unknown,
 ): readonly SemanticIssue[] {
   const entry = catalogEntryFor(type);
 
-  if (!entry.requiresQuery || entry.reads.length === 0) {
+  if (!entry.requiresQuery) {
     return [];
   }
 
@@ -1444,7 +1619,239 @@ function collectAvailabilityIssues(
     return [issueAt('unavailable-source', sourcePath, type)];
   }
 
-  return collectFilterAvailabilityIssues(query, path, type, summary);
+  const filterIssues = collectFilterAvailabilityIssues(query, path, type, summary);
+
+  if (
+    requiredFieldsMissing(entry.telemetryKinds, entry.requiredReads, source, summary, fieldPresence)
+  ) {
+    return [issueAt('unavailable-field', sourcePath, type), ...filterIssues];
+  }
+
+  return filterIssues;
+}
+
+/**
+ * The required reads of a node that are attribute keys, each with the node's
+ * kinds that declare it.
+ *
+ * A required read no declared kind carries is an event field — every stored
+ * record has one, so there is nothing to check — and is skipped; `catalog.test.ts`
+ * pins that no required *attribute* key sits outside the entry's own kinds, so
+ * nothing checkable is lost that way.
+ */
+function requiredAttributeKeysByKind(
+  telemetryKinds: readonly TelemetryKind[],
+  requiredReads: readonly string[],
+): readonly { readonly key: string; readonly kinds: readonly TelemetryKind[] }[] {
+  const required: { readonly key: string; readonly kinds: readonly TelemetryKind[] }[] = [];
+
+  for (const key of requiredReads) {
+    const kinds = telemetryKinds.filter((kind) => attributeKeysFor(kind).includes(key));
+
+    if (kinds.length > 0) {
+      required.push({ key, kinds });
+    }
+  }
+
+  return required;
+}
+
+/**
+ * Whether the capture's records of a node's kinds lack a key the node cannot
+ * draw a record without.
+ *
+ * Each required attribute key is decided on its own, first from the summary's
+ * published aggregate result and then, where that leaves it open, from the
+ * caller's presence tally; a key both leave open contributes nothing.
+ *
+ * The order is the point. The aggregate that serves the node decides what it
+ * draws, with its own predicate for a usable record, and the summary publishes
+ * that decision; a tally counts key presence, which can only approximate the
+ * predicate. So a tally never overrides a verdict the summary already reached —
+ * in either direction — and is consulted only for a summary that published no
+ * decisive aggregate result.
+ */
+function requiredFieldsMissing(
+  telemetryKinds: readonly TelemetryKind[],
+  requiredReads: readonly string[],
+  source: DataQuerySource,
+  summary: CaptureSummary,
+  fieldPresence: unknown,
+): boolean {
+  for (const { key, kinds } of requiredAttributeKeysByKind(telemetryKinds, requiredReads)) {
+    const verdict =
+      requiredKeyMissingFromSummary(summary, source, kinds) ??
+      requiredKeyMissingFromPresence(fieldPresence, kinds, key);
+
+    if (verdict === true) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Whether a presence tally shows records of these kinds, none of which carries
+ * `key` as text.
+ *
+ * Read from the tally's {@link KindFieldPresence.text} counts rather than its
+ * generic `attributes` counts, because a required attribute key is one its
+ * aggregate refuses a record without, and the refusal is a text predicate: the
+ * query aggregate keys a group on a `db.statement` string of positive length,
+ * so a number under that key forms no row and a whitespace-only string forms
+ * one.
+ *
+ * `true` when the readable tallies hold at least one record and not one
+ * carrier; `false` when any record carries the key; `undefined` when no tally
+ * for these kinds is readable — absent, malformed or negative — so the question
+ * stays open rather than being answered from bad input. A readable tally whose
+ * `text` record lacks the key is a count of zero carriers, exactly as
+ * {@link tallyFieldPresence} writes it.
+ */
+function requiredKeyMissingFromPresence(
+  fieldPresence: unknown,
+  kinds: readonly TelemetryKind[],
+  key: string,
+): boolean | undefined {
+  if (!isObjectLike(fieldPresence)) {
+    return undefined;
+  }
+
+  try {
+    return readPresenceVerdict(fieldPresence, kinds, key);
+  } catch {
+    // A tally whose fields throw on read — a revoked proxy, a throwing trap —
+    // is treated as a tally that declined to answer, exactly as a throwing
+    // resolver is: the question stays open, and the walk over the remaining
+    // nodes is not cut short by it.
+    return undefined;
+  }
+}
+
+/** The body of {@link requiredKeyMissingFromPresence}, over a tally known to be an object. */
+function readPresenceVerdict(
+  fieldPresence: object,
+  kinds: readonly TelemetryKind[],
+  key: string,
+): boolean | undefined {
+  let records = 0;
+  let carriers = 0;
+  let readable = false;
+
+  for (const kind of kinds) {
+    const tally = ownField(fieldPresence, kind);
+    const events = numberFieldOf(tally, PRESENCE_EVENTS_FIELD);
+    const textCarriers = fieldOf(tally, PRESENCE_TEXT_FIELD);
+
+    if (
+      events === undefined ||
+      events < 0 ||
+      !isObjectLike(textCarriers) ||
+      isUnknownArray(textCarriers)
+    ) {
+      continue;
+    }
+
+    const carried = ownField(textCarriers, key);
+    const count = carried === undefined ? 0 : carried;
+
+    if (typeof count !== 'number' || !Number.isFinite(count) || count < 0) {
+      continue;
+    }
+
+    readable = true;
+    records += events;
+    carriers += count;
+  }
+
+  if (!readable) {
+    return undefined;
+  }
+
+  return records > 0 && carriers === 0;
+}
+
+/**
+ * Reads one metric's measured count off a summary, or `undefined` when the
+ * summary does not publish it as an available, finite, non-negative number.
+ *
+ * An unavailable metric, a missing value or a malformed entry is "the summary
+ * does not say", never a zero: reading a zero into a metric that was not
+ * measured would manufacture the very refutation this module refuses to guess.
+ */
+function availableMetricCountOf(summary: CaptureSummary, metricId: MetricId): number | undefined {
+  const published = fieldOf(summary, SUMMARY_METRICS_FIELD);
+
+  if (!isUnknownArray(published)) {
+    return undefined;
+  }
+
+  const metric = published.find(
+    (candidate) => stringFieldOf(candidate, METRIC_VALUE_ID_FIELD) === metricId,
+  );
+
+  if (metric === undefined || fieldOf(metric, METRIC_VALUE_AVAILABLE_FIELD) !== true) {
+    return undefined;
+  }
+
+  const count = numberFieldOf(metric, METRIC_VALUE_VALUE_FIELD);
+
+  return count !== undefined && count >= 0 ? count : undefined;
+}
+
+/**
+ * Whether the summary shows records of these kinds that the node's aggregate
+ * formed no group from — the aggregate's own verdict, as the summary publishes
+ * it.
+ *
+ * Decided only where the capture holds records of the kinds, by the strongest
+ * evidence the summary carries, in this order:
+ *
+ * 1. a **non-empty section** proves the aggregate formed a group: `false`;
+ * 2. an available **group-count metric**, computed over the whole capture
+ *    whatever the sections clipped, answers exactly: `0` is `true`, anything
+ *    more is `false`. This is what decides an ordinary capture, whose slowest
+ *    spans outnumber the section bound and so set the summary's global
+ *    `truncated` flag although no query group exists at all;
+ * 3. an **empty section** in a summary that reports nothing clipped: `true`.
+ *
+ * Every other case — an unreadable section, an unavailable metric beside a
+ * clipped summary, per-kind tallies that do not say, a source the summary has
+ * no section for — is `undefined`, left open, because a rollup that did not
+ * publish something is not evidence that it is absent.
+ */
+function requiredKeyMissingFromSummary(
+  summary: CaptureSummary,
+  source: DataQuerySource,
+  kinds: readonly TelemetryKind[],
+): boolean | undefined {
+  const evidence = SUMMARY_EVIDENCE_BY_SOURCE[source];
+
+  if (evidence === undefined || holdsAnyKind(summary, kinds) !== true) {
+    return undefined;
+  }
+
+  const section = fieldOf(summary, evidence.section);
+
+  if (isUnknownArray(section) && section.length > 0) {
+    return false;
+  }
+
+  const groupCount =
+    evidence.groupCountMetric === undefined
+      ? undefined
+      : availableMetricCountOf(summary, evidence.groupCountMetric);
+
+  if (groupCount !== undefined) {
+    return groupCount === 0;
+  }
+
+  if (isUnknownArray(section) && fieldOf(summary, SUMMARY_TRUNCATED_FIELD) === false) {
+    return true;
+  }
+
+  return undefined;
 }
 
 /**
@@ -1597,6 +2004,7 @@ function gatherFromNode(
   path: PanelNodePath,
   summary: CaptureSummary,
   index: CaptureIndex,
+  fieldPresence: unknown,
   traceFilters: TraceFilterUse[],
   fatal: SemanticIssue[],
   advisory: SemanticIssue[],
@@ -1623,7 +2031,7 @@ function gatherFromNode(
 
   fatal.push(...metrics.fatal);
   informational.push(...metrics.informational);
-  advisory.push(...collectAvailabilityIssues(node, path, type, summary, index));
+  advisory.push(...collectAvailabilityIssues(node, path, type, summary, index, fieldPresence));
 }
 
 /**
@@ -1637,7 +2045,8 @@ function gatherFromNode(
  * @param spec The specification to read.
  * @param summary The capture, for the checks that need no resolver.
  * @param index The capture's index, for per-node availability.
- * @param options The caller's strictness, for the empty-observed decision.
+ * @param options The caller's strictness, for the empty-observed decision, and
+ *   its field-presence tally, for per-node field availability.
  * @returns The citations and trace filters to decide, plus what was decided.
  */
 function gatherClaims(
@@ -1683,9 +2092,23 @@ function gatherClaims(
   }
 
   if (isUnknownArray(fieldOf(spec, PANEL_LAYOUT_FIELD))) {
+    // Read once, as `unknown`: the tally is caller-supplied input, and every
+    // field of it is classified at runtime where it is used.
+    const fieldPresence: unknown = options?.fieldPresence;
+
     try {
       walkPanelNodes(spec.layout, (node, path) => {
-        gatherFromNode(node, path, summary, index, traceFilters, fatal, advisory, informational);
+        gatherFromNode(
+          node,
+          path,
+          summary,
+          index,
+          fieldPresence,
+          traceFilters,
+          fatal,
+          advisory,
+          informational,
+        );
       });
     } catch {
       // `./spec.ts`'s traversal ends its children lookup in `assertNever`, which
@@ -1883,6 +2306,183 @@ function distinct(values: Iterable<string | undefined>): readonly string[] {
   return [...seen];
 }
 
+/*
+ * ---------------------------------------------------------------------------
+ * Field presence: what the records themselves carry
+ * ---------------------------------------------------------------------------
+ */
+
+/** One kind's tally while it is being counted, before it is frozen. */
+interface PresenceCounter {
+  events: number;
+  readonly attributes: Map<string, number>;
+  readonly text: Map<string, number>;
+}
+
+/**
+ * Whether an attribute value counts as carried text: a string of at least one
+ * character.
+ *
+ * Exactly the predicate the telemetry aggregates apply to the attribute they
+ * key a record on — `aggregateQueries` reads `db.statement` through
+ * `readNonEmptyString`, `typeof value === 'string' && value.length > 0` — and
+ * deliberately not a trimmed test: a whitespace-only statement still forms a
+ * query group there, so counting it as absent here would report a field missing
+ * from a table that draws a row for it.
+ */
+function isCarriedText(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0;
+}
+
+/**
+ * Whether an attribute value counts as carried at all: anything but
+ * `undefined`, `null` and the empty string.
+ *
+ * A `false` flag or a `0` count *is* a value, and so is a string of whitespace,
+ * by the same rule {@link isCarriedText} applies to text.
+ */
+function isCarriedValue(value: unknown): boolean {
+  if (value === undefined || value === null) {
+    return false;
+  }
+
+  return typeof value !== 'string' || isCarriedText(value);
+}
+
+/**
+ * Counts one event into the per-kind counters, or leaves them untouched.
+ *
+ * The event is read as `unknown`. A record whose kind is outside the telemetry
+ * vocabulary cannot be attributed to a kind's vocabulary and is not counted; a
+ * record of a known kind whose `attributes` is missing or is not a bag is
+ * counted as a record of that kind carrying no key — which is exactly what it
+ * is to a view that reads one. The keys are gathered before anything is
+ * committed, so an event whose attribute bag throws while being read
+ * contributes nothing rather than half a record.
+ */
+function countEventPresence(event: unknown, counters: Map<TelemetryKind, PresenceCounter>): void {
+  const kind = fieldOf(event, EVENT_KIND_FIELD);
+
+  if (!isTelemetryKind(kind)) {
+    return;
+  }
+
+  const attributes = fieldOf(event, EVENT_ATTRIBUTES_FIELD);
+  const carried: string[] = [];
+  const carriedAsText: string[] = [];
+
+  if (isObjectLike(attributes) && !isUnknownArray(attributes)) {
+    for (const key of Object.keys(attributes)) {
+      const value = ownField(attributes, key);
+
+      if (isCarriedValue(value)) {
+        carried.push(key);
+      }
+
+      if (isCarriedText(value)) {
+        carriedAsText.push(key);
+      }
+    }
+  }
+
+  const counter = counters.get(kind) ?? {
+    events: 0,
+    attributes: new Map<string, number>(),
+    text: new Map<string, number>(),
+  };
+
+  counter.events += 1;
+
+  for (const key of carried) {
+    counter.attributes.set(key, (counter.attributes.get(key) ?? 0) + 1);
+  }
+
+  for (const key of carriedAsText) {
+    counter.text.set(key, (counter.text.get(key) ?? 0) + 1);
+  }
+
+  counters.set(kind, counter);
+}
+
+/**
+ * Freezes one counter map into the sorted, plain record a tally publishes.
+ *
+ * Keys in code-unit order, so two tallies of the same records serialise to the
+ * same bytes whatever order the records arrived in.
+ */
+function freezeCounts(counts: ReadonlyMap<string, number>): Readonly<Record<string, number>> {
+  const keys = [...counts.keys()].sort(compareKeys);
+
+  return Object.freeze(Object.fromEntries(keys.map((key) => [key, counts.get(key) ?? 0])));
+}
+
+/** Orders two attribute keys by code unit, so a tally serialises identically everywhere. */
+function compareKeys(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+/**
+ * Tallies which attribute keys a capture's records carry, per kind — the input
+ * {@link SemanticValidationOptions.fieldPresence} expects.
+ *
+ * One pass over the events: for each kind, how many records there are and, for
+ * each attribute key, how many of them carry it with a value and how many carry
+ * it as text (see {@link KindFieldPresence}). The result is frozen throughout, lists kinds in
+ * the telemetry vocabulary's order and keys in code-unit order, and holds counts
+ * only — no attribute value, no id and no name leaves the events.
+ *
+ * **Pure and never throws.** A value that is not an array tallies to an empty
+ * record; an element that is not a record of a known kind is skipped; and an
+ * element whose fields throw while being read — a revoked proxy, a throwing
+ * trap — is skipped as well, so one malformed record costs its own count and
+ * nothing more.
+ *
+ * @example
+ * ```ts
+ * // `captureEvents` are the stored events `summary` was computed from.
+ * const outcome = validateAgainstCapture(spec, summary, {
+ *   fieldPresence: tallyFieldPresence(captureEvents),
+ * });
+ * ```
+ *
+ * @param events The capture's stored events.
+ * @returns Per-kind record and carrier counts.
+ */
+export function tallyFieldPresence(events: readonly TelemetryEvent[]): CaptureFieldPresence {
+  const counters = new Map<TelemetryKind, PresenceCounter>();
+  const candidates: unknown = events;
+
+  if (isUnknownArray(candidates)) {
+    for (const event of candidates) {
+      try {
+        countEventPresence(event, counters);
+      } catch {
+        // An element whose fields throw on read is not a record this tally can
+        // attribute to a kind. `countEventPresence` commits nothing until every
+        // read has succeeded, so skipping it leaves the other counts exact.
+      }
+    }
+  }
+
+  const presence: Partial<Record<TelemetryKind, KindFieldPresence>> = {};
+
+  for (const kind of TELEMETRY_KINDS) {
+    const counter = counters.get(kind);
+
+    if (counter === undefined) {
+      continue;
+    }
+
+    presence[kind] = Object.freeze({
+      events: counter.events,
+      attributes: freezeCounts(counter.attributes),
+      text: freezeCounts(counter.text),
+    });
+  }
+
+  return Object.freeze(presence);
+}
+
 /**
  * Collects **every** way `spec` is unsupported by `summary`, partitioned by
  * severity.
@@ -1899,7 +2499,19 @@ function distinct(values: Iterable<string | undefined>): readonly string[] {
  * 2. the summary's two statement lists are gathered into citations, and any
  *    statement with no citation at all is recorded;
  * 3. every node is walked once — trace filters are gathered, metric ids and
- *    per-node evidence availability are decided on the spot;
+ *    per-node evidence availability are decided on the spot. Availability asks
+ *    first whether the capture holds records of the kinds the node's catalog
+ *    entry declares (`unavailable-source` if not), then whether those records
+ *    carry the attribute keys in the entry's `requiredReads`
+ *    (`unavailable-field` if none does). The second question is answered first
+ *    from what the summary publishes about the aggregate behind the node's
+ *    source (renders, requests, queries): a non-empty section proves a group
+ *    formed; an available group-count metric — `query_count`, the executions
+ *    the query groups account for over the whole capture — decides exactly,
+ *    however the sections were clipped; an empty section decides only in a
+ *    summary that clipped nothing. Where the summary leaves it open,
+ *    {@link SemanticValidationOptions.fieldPresence} decides it when supplied,
+ *    counting only carriers of the key as text. Every other case is left open;
  * 4. the two resolvers are each called **once** with every distinct id gathered;
  * 5. citations and trace filters are decided against index and resolutions;
  * 6. each array is sorted into a deterministic order, so two runs over the same
@@ -1915,7 +2527,8 @@ function distinct(values: Iterable<string | undefined>): readonly string[] {
  * passed `./validate.ts`; a document that has not is checked as far as it can
  * be, and its structural problems are that module's to report.
  * @param summary The capture the specification claims to describe.
- * @param options Resolvers and strictness; see {@link SemanticValidationOptions}.
+ * @param options Resolvers, strictness and the field-presence tally; see
+ *   {@link SemanticValidationOptions}.
  * @returns Every issue found, partitioned by severity and sorted by path.
  */
 export function collectSemanticIssues(

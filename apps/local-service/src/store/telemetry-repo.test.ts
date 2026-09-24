@@ -6,13 +6,17 @@
  * each block below exists because breaking one of them turns a debugging
  * session's answer into a plausible fiction:
  *
- * 1. **The order is total, and it is the one the correlator uses.** A page of
- *    rows must come back in `start_time`, then `(producer_id, seq)`, then
- *    `ingest_seq` order — and identical timestamps across two producers are the
- *    ordinary case, not the exotic one, because a page document and a
- *    dev-server process read the same millisecond. The suite pins the SQL order
- *    against `compareEventsCanonical`, the in-memory twin, rather than against
- *    a hand-written expectation.
+ * 1. **The order is total, and it is the one each reader is owed.** A
+ *    convenience reader — `listByTrace` above all, which the correlator pages
+ *    through — must return rows in `start_time`, then `(producer_id, seq)`,
+ *    then `ingest_seq` order, and identical timestamps across two producers are
+ *    the ordinary case, not the exotic one, because a page document and a
+ *    dev-server process read the same millisecond. The suite pins that SQL
+ *    order against `compareEventsCanonical`, the in-memory twin, rather than
+ *    against a hand-written expectation. `query`, the panel-data surface, owes
+ *    the order AAP 0.4.2 specifies instead — the sort's key, then the event
+ *    `id` — and the suite pins it with ids chosen so that id order and
+ *    canonical order disagree on every tie.
  * 2. **Precision survives.** `start_time` and `duration` are `REAL` because the
  *    producers emit sub-millisecond doubles, and a cross-tier timeline is only
  *    correct if the value that comes back is the value that went in — to the
@@ -48,7 +52,10 @@ import {
   DATA_QUERY_DEFAULT_LIMIT,
   DATA_QUERY_MAX_LIMIT,
   DATA_QUERY_SORTS,
+  dataQueryFilterSchema,
+  parseDataQuery,
 } from '@debuggen/panel-schema';
+import type { DataQueryFilter } from '@debuggen/panel-schema';
 import {
   createConsoleLogger,
   isErr,
@@ -81,6 +88,9 @@ import {
   DURATION_DESC_ORDER_BY,
   EXISTENCE_LOOKUP_CHUNK_SIZE,
   MAX_PURGE_BATCH_SIZE,
+  PANEL_DURATION_DESC_ORDER_BY,
+  PANEL_SECONDARY_ORDER_BY,
+  PANEL_START_ASC_ORDER_BY,
   TELEMETRY_DEFAULT_GROUP_KEY,
   TELEMETRY_GROUP_KEYS,
   TELEMETRY_QUERY_DEFAULT_LIMIT,
@@ -93,6 +103,7 @@ import type {
   PersistableTelemetryEvent,
   TelemetryGroupPage,
   TelemetryPage,
+  TelemetryQuery,
   TelemetryRepo,
 } from './telemetry-repo.js';
 
@@ -292,6 +303,32 @@ function queryPlan(sql: string): string[] {
     .map((row) => String(row['detail']));
 }
 
+/**
+ * The {@link TelemetryQuery} fields a panel's `DataQueryFilter` lands on when
+ * `../panels/data.ts` spreads it onto a query.
+ *
+ * `Pick` is the compile-time half of the seam proof: it fails the typecheck
+ * gate the moment the panel schema carries a filter key the repository does
+ * not declare — the drift that let a singular `tier` be spread onto a query
+ * that ignored it. A spread alone proves nothing, because properties arriving
+ * through a spread are never checked as excess.
+ */
+type ForwardedFilter = Pick<TelemetryQuery, keyof DataQueryFilter>;
+
+/**
+ * Forwards a parsed panel filter unchanged, as the panel-data resolver does.
+ *
+ * The declared return type is the other half of the proof: every shared key's
+ * type must stay assignable under `exactOptionalPropertyTypes`, or this line
+ * stops compiling.
+ *
+ * @param filter The filter of a parsed `DataQuery`, absent when it named none.
+ * @returns The same filter, typed as the query fields it narrows.
+ */
+function forwardFilter(filter: DataQueryFilter | undefined): ForwardedFilter {
+  return filter ?? {};
+}
+
 beforeEach(() => {
   directory = mkdtempSync(join(tmpdir(), 'debuggen-telemetry-'));
   logs = [];
@@ -363,9 +400,22 @@ describe('the contract', () => {
     expect(listed).toEqual([...TELEMETRY_TIERS]);
   });
 
-  it('defines the canonical order once, and ends every ordering with it', () => {
+  it('defines the canonical order once, and ends every convenience-reader ordering with it', () => {
     expect(CANONICAL_ORDER_BY).toBe('start_time ASC, producer_id ASC, seq ASC, ingest_seq ASC');
     expect(DURATION_DESC_ORDER_BY).toBe(`duration DESC, ${CANONICAL_ORDER_BY}`);
+  });
+
+  it('ends every panel-data ordering in the event id, and never in an arrival number', () => {
+    // AAP 0.4.2: `sort` orders with a stable secondary key (`id`) per source.
+    expect(PANEL_SECONDARY_ORDER_BY).toBe('id ASC');
+    expect(PANEL_START_ASC_ORDER_BY).toBe(`start_time ASC, ${PANEL_SECONDARY_ORDER_BY}`);
+    expect(PANEL_DURATION_DESC_ORDER_BY).toBe(`duration DESC, ${PANEL_SECONDARY_ORDER_BY}`);
+
+    for (const ordering of [PANEL_START_ASC_ORDER_BY, PANEL_DURATION_DESC_ORDER_BY]) {
+      expect(ordering.endsWith(PANEL_SECONDARY_ORDER_BY)).toBe(true);
+      expect(ordering).not.toContain('ingest_seq');
+      expect(ordering).not.toContain('producer_id');
+    }
   });
 
   it('accepts exactly the panel-data sort vocabulary, and a closed set of group keys', () => {
@@ -625,6 +675,115 @@ describe('insertMany', () => {
     expect(unwrap(repo.countBySession(SESSION_A))).toBe(1);
   });
 
+  it.each<readonly [string, string, string, string, string]>([
+    ['session A naming a capture of session B', SESSION_A, CAPTURE_A1, CAPTURE_B1, SESSION_B],
+    ['session B naming a capture of session A', SESSION_B, CAPTURE_B1, CAPTURE_A1, SESSION_A],
+  ])(
+    'refuses an event of %s, and rolls the whole batch back',
+    (_direction, sessionId, ownCapture, foreignCapture, owningSession) => {
+      // Stored by an earlier, correctly attributed batch: the refusal below must
+      // leave it exactly as it is.
+      const earlier = buildEvent({ sessionId, captureId: ownCapture });
+
+      insertOk([earlier]);
+
+      const earlierDocument = readRow(earlier.id)?.['event'];
+
+      // The valid element comes first, so it is written inside the batch
+      // transaction before the misattributed one is reached: the rollback is
+      // observable rather than assumed.
+      const valid = buildEvent({ sessionId, captureId: ownCapture });
+      const misattributed = buildEvent({
+        sessionId,
+        captureId: foreignCapture,
+        attributes: { note: SENTINEL },
+      });
+      const written = repo.insertMany([valid, misattributed]);
+
+      expect(isErr(written)).toBe(true);
+
+      if (!isErr(written)) {
+        return;
+      }
+
+      expect(written.error.code).toBe('STORE_ERROR');
+      expect(written.error.details?.['reason']).toBe('capture-session-mismatch');
+      expect(written.error.details?.['index']).toBe(1);
+      expect(written.error.details?.['batchSize']).toBe(2);
+      expect(written.error.details?.['sessionId']).toBe(sessionId);
+      expect(written.error.details?.['captureId']).toBe(foreignCapture);
+      expect(written.error.hint).toBeDefined();
+
+      // The event's own identifiers only: the session that owns the capture is
+      // not disclosed, and no captured value is echoed.
+      expect(errorText(written.error)).not.toContain(owningSession);
+      expect(errorText(written.error)).not.toContain(SENTINEL);
+      expect(loggedText()).not.toContain(owningSession);
+      expect(loggedText()).not.toContain(SENTINEL);
+
+      // Nothing of the batch survived, and the earlier batch is untouched.
+      expect(readRow(valid.id)).toBeUndefined();
+      expect(readRow(misattributed.id)).toBeUndefined();
+      expect(unwrap(repo.countBySession(sessionId))).toBe(1);
+      expect(unwrap(repo.countBySession(owningSession))).toBe(0);
+      expect(readRow(earlier.id)?.['event']).toBe(earlierDocument);
+    },
+  );
+
+  it('keeps a session\u2019s events when another session\u2019s capture is deleted after a refused misattribution', () => {
+    const own = buildEvent();
+
+    insertOk([own]);
+
+    const refused = repo.insertMany([buildEvent({ captureId: CAPTURE_B1 })]);
+
+    expect(isErr(refused)).toBe(true);
+
+    if (isErr(refused)) {
+      expect(refused.error.details?.['reason']).toBe('capture-session-mismatch');
+    }
+
+    // The cascade the ownership check exists for: had the misattributed row
+    // been stored, deleting session B's capture would have taken an event of
+    // session A with it.
+    store.statement('DELETE FROM captures WHERE id = ?').run(CAPTURE_B1);
+
+    expect(unwrap(repo.countBySession(SESSION_A))).toBe(1);
+    expect(unwrap(repo.query({ sessionId: SESSION_A })).rows.map((event) => event.id)).toEqual([
+      own.id,
+    ]);
+    expect(readRow(own.id)?.['capture_id']).toBe(CAPTURE_A1);
+  });
+
+  it('accepts a batch spanning sessions when every capture is its own session\u2019s, and replays it', () => {
+    // Several captures in one batch, interleaved: the per-batch owner memo must
+    // answer for each capture separately rather than for the first it read.
+    const batch = [
+      buildEvent(),
+      buildEvent({ sessionId: SESSION_B, captureId: CAPTURE_B1 }),
+      buildEvent({ captureId: CAPTURE_A2 }),
+      buildEvent({ sessionId: SESSION_B, captureId: CAPTURE_B1 }),
+      buildEvent(),
+    ];
+
+    const first = unwrap(repo.insertMany(batch));
+
+    expect(first.inserted).toBe(5);
+    expect(first.skipped).toBe(0);
+
+    // A clean replay of the same, correctly attributed batch is still skipped
+    // row for row, with the arrival numbers the store already holds.
+    const replay = unwrap(repo.insertMany(batch));
+
+    expect(replay.inserted).toBe(0);
+    expect(replay.skipped).toBe(5);
+    expect(replay.events.map((event) => event.ingestSeq)).toEqual(
+      first.events.map((event) => event.ingestSeq),
+    );
+    expect(unwrap(repo.countBySession(SESSION_A))).toBe(3);
+    expect(unwrap(repo.countBySession(SESSION_B))).toBe(2);
+  });
+
   it('answers an exact replay with the stored event, not the candidate', () => {
     const event = buildEvent({
       startTime: BASE_TIME + 0.125,
@@ -839,10 +998,10 @@ describe('insertMany', () => {
 });
 
 /* -------------------------------------------------------------------------------------------------
- * The canonical order
+ * The canonical order of the convenience readers
  * ---------------------------------------------------------------------------------------------- */
 
-describe('the canonical order', () => {
+describe('the canonical order of the convenience readers', () => {
   it('orders equal start times across two producers exactly as the correlator does', () => {
     // Two producers reporting the same millisecond, offered out of order, with
     // the server producer's second event deliberately sharing its first
@@ -861,10 +1020,15 @@ describe('the canonical order', () => {
     });
 
     const stored = insertOk([serverSecond, browserSecond, serverFirst, browserFirst]);
-    const page = unwrap(repo.query({ sessionId: SESSION_A }));
+    const canonical = [...stored].sort(compareEventsCanonical).map((event) => event.id);
 
-    expect(page.rows.map((event) => event.id)).toEqual(
-      [...stored].sort(compareEventsCanonical).map((event) => event.id),
+    // The read the correlator pages through, and the capture-wide reader: both
+    // follow the in-memory twin key for key.
+    const page = unwrap(repo.listByTrace(SESSION_A, TRACE_A, { sort: 'start_asc' }));
+
+    expect(page.rows.map((event) => event.id)).toEqual(canonical);
+    expect(unwrap(repo.listByCapture(SESSION_A, CAPTURE_A1)).rows.map((event) => event.id)).toEqual(
+      canonical,
     );
 
     // And the tie-break really is producer then sequence: the four events share
@@ -883,10 +1047,13 @@ describe('the canonical order', () => {
 
     insertOk([first, second]);
 
-    const page = unwrap(repo.query({ sessionId: SESSION_A }));
-
-    expect(page.rows.map((event) => event.id)).toEqual([first.id, second.id]);
-    expect(page.rows.map((event) => event.ingestSeq)).toEqual([1, 2]);
+    for (const page of [
+      unwrap(repo.listByTrace(SESSION_A, TRACE_A)),
+      unwrap(repo.listByCapture(SESSION_A, CAPTURE_A1)),
+    ]) {
+      expect(page.rows.map((event) => event.id)).toEqual([first.id, second.id]);
+      expect(page.rows.map((event) => event.ingestSeq)).toEqual([1, 2]);
+    }
   });
 
   it('keeps duration_desc stable across pages when durations repeat', () => {
@@ -899,24 +1066,233 @@ describe('the canonical order', () => {
       buildEvent({ duration: 1 }),
     ];
 
-    insertOk(events);
-
-    const whole = unwrap(repo.query({ sessionId: SESSION_A, sort: 'duration_desc' }));
+    const stored = insertOk(events);
+    const whole = unwrap(repo.listByCapture(SESSION_A, CAPTURE_A1, { sort: 'duration_desc' }));
     const walked: string[] = [];
 
     for (let offset = 0; offset < whole.total; offset += 2) {
       const page = unwrap(
-        repo.query({ sessionId: SESSION_A, sort: 'duration_desc', limit: 2, offset }),
+        repo.listByCapture(SESSION_A, CAPTURE_A1, { sort: 'duration_desc', limit: 2, offset }),
       );
 
       walked.push(...page.rows.map((event) => event.id));
     }
 
     // Every row exactly once, in the same order the single-page read gave: the
-    // tie-break chain behind `duration DESC` is what makes that true.
+    // canonical chain behind `duration DESC` is what makes that true, and it is
+    // what decides among equal durations.
     expect(walked).toEqual(whole.rows.map((event) => event.id));
     expect(new Set(walked).size).toBe(events.length);
     expect(whole.rows.map((event) => event.duration)).toEqual([9, 5, 5, 5, 1, 1]);
+    expect(whole.rows.filter((event) => event.duration === 5).map((event) => event.id)).toEqual(
+      stored
+        .filter((event) => event.duration === 5)
+        .sort(compareEventsCanonical)
+        .map((event) => event.id),
+    );
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * The panel-data orderings
+ * ---------------------------------------------------------------------------------------------- */
+
+describe('the panel-data orderings of query', () => {
+  /**
+   * An event id whose first character after the prefix is `rank`, so the
+   * suite decides where it sorts.
+   *
+   * The rest is a fresh id's own random tail, cut so the result keeps the
+   * shape `newEventId` produces: `evt_` plus sixteen characters of `[0-9a-z]`.
+   */
+  function rankedEventId(rank: string): string {
+    const prefix = 'evt_';
+
+    return `${prefix}${rank}${newEventId().slice(prefix.length + rank.length)}`;
+  }
+
+  /** The ids of a page, in page order. */
+  function idsOf(page: TelemetryPage): string[] {
+    return page.rows.map((event) => event.id);
+  }
+
+  it('builds ranked ids in the shape newEventId produces', () => {
+    const pattern = /^evt_[0-9a-z]{16}$/;
+
+    expect(newEventId()).toMatch(pattern);
+    expect(rankedEventId('a')).toMatch(pattern);
+    expect(rankedEventId('a').startsWith('evt_a')).toBe(true);
+  });
+
+  it('breaks a start_asc tie on the event id, not on the canonical chain', () => {
+    // One producer, one timestamp, four sequence numbers: the canonical chain
+    // orders them by `seq`, and their ids are ranked the opposite way, so id
+    // order and canonical order disagree on every pair. Offered shuffled, so
+    // arrival order matches neither.
+    const d = buildEvent({ id: rankedEventId('d'), seq: 0 });
+    const c = buildEvent({ id: rankedEventId('c'), seq: 1 });
+    const b = buildEvent({ id: rankedEventId('b'), seq: 2 });
+    const a = buildEvent({ id: rankedEventId('a'), seq: 3 });
+    // Earlier than every tied row but with the largest id: the start time is
+    // still the primary key.
+    const earliest = buildEvent({ id: rankedEventId('z'), startTime: BASE_TIME - 1, seq: 4 });
+
+    const stored = insertOk([b, earliest, d, a, c]);
+    const panel = unwrap(repo.query({ sessionId: SESSION_A, sort: 'start_asc' }));
+
+    expect(idsOf(panel)).toEqual([earliest.id, a.id, b.id, c.id, d.id]);
+    expect(idsOf(unwrap(repo.query({ sessionId: SESSION_A })))).toEqual(idsOf(panel));
+
+    // The canonical readers keep the correlator's order for the same rows.
+    const canonical = [...stored].sort(compareEventsCanonical).map((event) => event.id);
+
+    expect(canonical).toEqual([earliest.id, d.id, c.id, b.id, a.id]);
+    expect(idsOf(unwrap(repo.listByCapture(SESSION_A, CAPTURE_A1)))).toEqual(canonical);
+    expect(idsOf(panel)).not.toEqual(canonical);
+
+    // A two-row walk visits every row once, in the single-page order.
+    const walked: string[] = [];
+    let offset: number | undefined = 0;
+
+    while (offset !== undefined) {
+      const page: TelemetryPage = unwrap(repo.query({ sessionId: SESSION_A, limit: 2, offset }));
+
+      walked.push(...idsOf(page));
+      offset = page.nextOffset;
+    }
+
+    expect(walked).toEqual(idsOf(panel));
+  });
+
+  it('breaks a duration_desc tie on the event id, and pages every row once', () => {
+    // One timestamp and one producer throughout, so among equal durations the
+    // canonical chain decides by `seq` — and the ids are ranked against it.
+    const slowest = buildEvent({ id: rankedEventId('m'), duration: 9, seq: 0 });
+    const fiveC = buildEvent({ id: rankedEventId('c'), duration: 5, seq: 1 });
+    const fiveB = buildEvent({ id: rankedEventId('b'), duration: 5, seq: 2 });
+    const fiveA = buildEvent({ id: rankedEventId('a'), duration: 5, seq: 3 });
+    const oneY = buildEvent({ id: rankedEventId('y'), duration: 1, seq: 4 });
+    const oneX = buildEvent({ id: rankedEventId('x'), duration: 1, seq: 5 });
+    const events = [oneY, fiveB, slowest, oneX, fiveA, fiveC];
+
+    const stored = insertOk(events);
+    const whole = unwrap(repo.query({ sessionId: SESSION_A, sort: 'duration_desc' }));
+
+    expect(whole.rows.map((event) => event.duration)).toEqual([9, 5, 5, 5, 1, 1]);
+    expect(idsOf(whole)).toEqual([slowest.id, fiveA.id, fiveB.id, fiveC.id, oneX.id, oneY.id]);
+
+    // The canonical reader breaks the same ties on `seq`: the opposite order.
+    const canonical = unwrap(repo.listByCapture(SESSION_A, CAPTURE_A1, { sort: 'duration_desc' }));
+
+    expect(canonical.rows.filter((event) => event.duration === 5).map((event) => event.id)).toEqual(
+      stored
+        .filter((event) => event.duration === 5)
+        .sort(compareEventsCanonical)
+        .map((event) => event.id),
+    );
+    expect(idsOf(canonical)).not.toEqual(idsOf(whole));
+
+    const walked: string[] = [];
+    let offset: number | undefined = 0;
+
+    while (offset !== undefined) {
+      const page: TelemetryPage = unwrap(
+        repo.query({ sessionId: SESSION_A, sort: 'duration_desc', limit: 2, offset }),
+      );
+
+      walked.push(...idsOf(page));
+      offset = page.nextOffset;
+    }
+
+    expect(walked).toEqual(idsOf(whole));
+    expect(new Set(walked).size).toBe(events.length);
+  });
+
+  it('orders count_desc rows by id inside each group and in the ungrouped tail', () => {
+    // Inside each group start times ascend while ids descend, so the canonical
+    // chain and the id disagree on every pair.
+    const named = (id: string, name: string, offset: number, requestKey?: string) =>
+      buildEvent({
+        id,
+        name,
+        startTime: BASE_TIME + offset,
+        ...(requestKey !== undefined ? { attributes: { request_key: requestKey } } : {}),
+      });
+    const requestKey = 'f6'.repeat(32);
+    const alphaF = named(rankedEventId('f'), 'alpha', 1);
+    const alphaE = named(rankedEventId('e'), 'alpha', 2);
+    const alphaD = named(rankedEventId('d'), 'alpha', 3);
+    const betaC = named(rankedEventId('c'), 'beta', 4);
+    const betaB = named(rankedEventId('b'), 'beta', 5);
+    // Grouped by request key, these and the two groups above belong to no
+    // group and form the tail.
+    const gamma9 = named(rankedEventId('9'), 'gamma', 6);
+    const gamma8 = named(rankedEventId('8'), 'gamma', 7);
+    const gamma7 = named(rankedEventId('7'), 'gamma', 8);
+    const deltaW = named(rankedEventId('w'), 'delta', 9, requestKey);
+    const deltaV = named(rankedEventId('v'), 'delta', 10, requestKey);
+
+    const alpha = [alphaF, alphaE, alphaD];
+    const beta = [betaC, betaB];
+    const keyless = [gamma9, gamma8, gamma7];
+    const keyed = [deltaW, deltaV];
+
+    // Offered in an order that, inside each three-row group, matches neither
+    // the id order nor the canonical one, so neither could pass by arrival.
+    insertOk([alphaE, betaB, gamma8, deltaW, alphaF, gamma9, betaC, alphaD, gamma7, deltaV]);
+
+    const sortedIds = (events: readonly PersistableTelemetryEvent[]): string[] =>
+      events.map((event) => event.id).sort();
+
+    // By name: alpha and gamma (3 each) tie on count and the key puts alpha
+    // first, then beta and delta (2 each) likewise; inside every group,
+    // ascending id.
+    const byName = unwrap(repo.query({ sessionId: SESSION_A, sort: 'count_desc', limit: 50 }));
+
+    expect(idsOf(byName)).toEqual([
+      ...sortedIds(alpha),
+      ...sortedIds(keyless),
+      ...sortedIds(beta),
+      ...sortedIds(keyed),
+    ]);
+
+    // The canonical reader keeps canonical order inside each group instead.
+    const canonical = unwrap(
+      repo.listByCapture(SESSION_A, CAPTURE_A1, { sort: 'count_desc', limit: 50 }),
+    );
+
+    expect(idsOf(canonical)).toEqual([
+      ...alpha.map((event) => event.id),
+      ...keyless.map((event) => event.id),
+      ...beta.map((event) => event.id),
+      ...keyed.map((event) => event.id),
+    ]);
+
+    // By request key: the one group first, then every keyless row by id.
+    const byRequestKey = unwrap(
+      repo.query({ sessionId: SESSION_A, sort: 'count_desc', groupBy: 'requestKey', limit: 50 }),
+    );
+
+    expect(idsOf(byRequestKey)).toEqual([
+      ...sortedIds(keyed),
+      ...sortedIds([...alpha, ...beta, ...keyless]),
+    ]);
+
+    // A three-row walk visits every row once, in the single-page order.
+    const walked: string[] = [];
+    let offset: number | undefined = 0;
+
+    while (offset !== undefined) {
+      const page: TelemetryPage = unwrap(
+        repo.query({ sessionId: SESSION_A, sort: 'count_desc', limit: 3, offset }),
+      );
+
+      walked.push(...idsOf(page));
+      offset = page.nextOffset;
+    }
+
+    expect(walked).toEqual(idsOf(byName));
+    expect(new Set(walked).size).toBe(byName.total);
   });
 });
 
@@ -925,7 +1301,7 @@ describe('the canonical order', () => {
  * ---------------------------------------------------------------------------------------------- */
 
 describe('query', () => {
-  it('defaults to the first 200 rows in canonical order', () => {
+  it('defaults to the first 200 rows, earliest first', () => {
     const events = Array.from({ length: TELEMETRY_QUERY_DEFAULT_LIMIT + 5 }, (_unused, index) =>
       buildEvent({ startTime: BASE_TIME + index }),
     );
@@ -952,14 +1328,52 @@ describe('query', () => {
     expect(page.nextOffset).toBeUndefined();
   });
 
-  it('answers a page size of zero with the count alone', () => {
+  it('answers a page size of zero with the count alone, as a terminal page', () => {
     insertOk([buildEvent(), buildEvent(), buildEvent()]);
 
     const page = unwrap(repo.query({ sessionId: SESSION_A, limit: 0 }));
 
-    expect(page.rows).toEqual([]);
-    expect(page.total).toBe(3);
-    expect(page.nextOffset).toBe(0);
+    // No `nextOffset`: the page read nothing, so its "next" offset would be its
+    // own and a pager following it would request the same empty page forever.
+    expect(page).toEqual({ rows: [], total: 3 });
+    expect(page.nextOffset).toBeUndefined();
+
+    // The same at an offset inside the result, where rows remain ahead: the
+    // count is still the whole filter's, and the page is still terminal.
+    const inside = unwrap(repo.query({ sessionId: SESSION_A, limit: 0, offset: 2 }));
+
+    expect(inside).toEqual({ rows: [], total: 3 });
+    expect(inside.nextOffset).toBeUndefined();
+
+    // Every convenience reader shares the read path, and with it the rule.
+    const byCapture = unwrap(repo.listByCapture(SESSION_A, CAPTURE_A1, { limit: 0, offset: 1 }));
+
+    expect(byCapture).toEqual({ rows: [], total: 3 });
+  });
+
+  it('keeps an advancing nextOffset for every page that read a row', () => {
+    insertOk([
+      buildEvent({ startTime: BASE_TIME }),
+      buildEvent({ startTime: BASE_TIME + 1 }),
+      buildEvent({ startTime: BASE_TIME + 2 }),
+    ]);
+
+    // A page that read one row still points past it, for query and for the
+    // canonical reader the correlator walks.
+    const first = unwrap(repo.query({ sessionId: SESSION_A, limit: 1, offset: 1 }));
+    const traced = unwrap(repo.listByTrace(SESSION_A, TRACE_A, { limit: 1, offset: 1 }));
+
+    expect(first.rows).toHaveLength(1);
+    expect(first.nextOffset).toBe(2);
+    expect(traced.rows).toHaveLength(1);
+    expect(traced.nextOffset).toBe(2);
+
+    // An offset at or past the end reads nothing and ends the walk.
+    for (const offset of [3, 10]) {
+      const past = unwrap(repo.query({ sessionId: SESSION_A, limit: 5, offset }));
+
+      expect(past).toEqual({ rows: [], total: 3 });
+    }
   });
 
   it('reports total and nextOffset correctly across a multi-page walk', () => {
@@ -1028,6 +1442,119 @@ describe('query', () => {
     expect(byRequestKey.rows.map((event) => event.id)).toEqual([keyed.id]);
   });
 
+  /**
+   * One event per tier, plus a second database span and a `function` span in
+   * each of the two tiers that kind may be reported in, each at its own start
+   * time and with a tier the kind rules allow.
+   */
+  function insertTieredEvents(): {
+    readonly browserSpan: PersistableTelemetryEvent;
+    readonly serverSpan: PersistableTelemetryEvent;
+    readonly serverFunction: PersistableTelemetryEvent;
+    readonly dbSpan: PersistableTelemetryEvent;
+    readonly slowDbSpan: PersistableTelemetryEvent;
+    readonly browserFunction: PersistableTelemetryEvent;
+  } {
+    const events = {
+      browserSpan: buildEvent({ kind: 'fetch', startTime: BASE_TIME }),
+      serverSpan: buildEvent({
+        kind: 'http.server',
+        producerId: PRODUCER_SERVER,
+        startTime: BASE_TIME + 1,
+      }),
+      serverFunction: buildEvent({
+        kind: 'function',
+        tier: 'server',
+        producerId: PRODUCER_SERVER,
+        startTime: BASE_TIME + 2,
+      }),
+      dbSpan: buildEvent({
+        kind: 'db.query',
+        producerId: PRODUCER_SERVER,
+        startTime: BASE_TIME + 3,
+        duration: 2,
+      }),
+      slowDbSpan: buildEvent({
+        kind: 'db.query',
+        producerId: PRODUCER_SERVER,
+        startTime: BASE_TIME + 4,
+        duration: 40,
+      }),
+      browserFunction: buildEvent({ kind: 'function', tier: 'browser', startTime: BASE_TIME + 5 }),
+    };
+
+    insertOk(Object.values(events));
+
+    return events;
+  }
+
+  it('narrows by the singular tier a panel filter carries, excluding every other tier', () => {
+    const { dbSpan, slowDbSpan } = insertTieredEvents();
+
+    const dbOnly = unwrap(repo.query({ sessionId: SESSION_A, tier: 'db' }));
+
+    expect(dbOnly.rows.map((event) => event.id)).toEqual([dbSpan.id, slowDbSpan.id]);
+    expect(dbOnly.rows.every((event) => event.tier === 'db')).toBe(true);
+    expect(dbOnly.total).toBe(2);
+
+    // The convenience readers take the same narrowing through their options.
+    const byCapture = unwrap(repo.listByCapture(SESSION_A, CAPTURE_A1, { tier: 'db' }));
+
+    expect(byCapture.rows.map((event) => event.id)).toEqual([dbSpan.id, slowDbSpan.id]);
+  });
+
+  it('narrows by a filter parsed from a DataQuery and spread onto the query unchanged', () => {
+    const { serverFunction, slowDbSpan } = insertTieredEvents();
+
+    // The seam `../panels/data.ts` crosses: a panel node's query, parsed by the
+    // panel-schema's own parser, its filter forwarded without an adapter.
+    const parsed = unwrap(
+      parseDataQuery({ source: 'spans', filter: { tier: 'db', minDuration: 10 } }),
+    );
+    const page = unwrap(repo.query({ sessionId: SESSION_A, ...forwardFilter(parsed.filter) }));
+
+    expect(page.rows.map((event) => event.id)).toEqual([slowDbSpan.id]);
+    expect(page.total).toBe(1);
+
+    // The strict filter schema itself, for the same seam without the query. A
+    // `function` span may be reported by either runtime, so only the tier
+    // separates the two stored here.
+    const filter = dataQueryFilterSchema.parse({ tier: 'server', kinds: ['function'] });
+    const narrowed = unwrap(repo.query({ sessionId: SESSION_A, ...forwardFilter(filter) }));
+
+    expect(narrowed.rows.map((event) => event.id)).toEqual([serverFunction.id]);
+    expect(narrowed.total).toBe(1);
+  });
+
+  it('composes tier with tiers by AND, for rows and for groups', () => {
+    const { serverSpan, serverFunction, dbSpan, slowDbSpan } = insertTieredEvents();
+
+    const both = unwrap(
+      repo.query({ sessionId: SESSION_A, tier: 'server', tiers: ['server', 'db'] }),
+    );
+
+    expect(both.rows.map((event) => event.id)).toEqual([serverSpan.id, serverFunction.id]);
+
+    // A tier outside the list can match nothing.
+    const disjoint = unwrap(repo.query({ sessionId: SESSION_A, tier: 'db', tiers: ['browser'] }));
+
+    expect(disjoint).toEqual({ rows: [], total: 0 });
+
+    // The grouped read shares the filter planner, and with it the narrowing.
+    const groups = unwrap(repo.queryGroups({ sessionId: SESSION_A, groupBy: 'kind', tier: 'db' }));
+
+    expect(groups.groups.map((group) => [group.key, group.count])).toEqual([['db.query', 2]]);
+    expect(groups.groups[0]?.firstEventId).toBe(dbSpan.id);
+    expect(groups.groups[0]?.totalDuration).toBe(dbSpan.duration + slowDbSpan.duration);
+    expect(groups.total).toBe(1);
+
+    const noGroups = unwrap(
+      repo.queryGroups({ sessionId: SESSION_A, groupBy: 'kind', tier: 'db', tiers: ['browser'] }),
+    );
+
+    expect(noGroups).toEqual({ groups: [], total: 0 });
+  });
+
   it('never reaches across sessions', () => {
     const mine = buildEvent();
 
@@ -1071,6 +1598,8 @@ describe('query', () => {
       [{ sessionId: SESSION_A, groupBy: 'constructor' }, 'unknown-group-key'],
       [{ sessionId: SESSION_A, kinds: ['not-a-kind'] }, 'unknown-kind'],
       [{ sessionId: SESSION_A, tiers: ['not-a-tier'] }, 'unknown-tier'],
+      [{ sessionId: SESSION_A, tier: 'not-a-tier' }, 'unknown-tier'],
+      [{ sessionId: SESSION_A, tier: 'constructor', tiers: ['db'] }, 'unknown-tier'],
     ] as const;
 
     for (const [filter, reason] of cases) {
@@ -1272,7 +1801,7 @@ describe('count_desc and grouped reads', () => {
     expect(new Set(walked).size).toBe(6);
   });
 
-  it('orders rows by their group\u2019s count, keeping each group together in canonical order', () => {
+  it('orders rows by their group\u2019s count, keeping each group together in id order', () => {
     const stored = insertNamedGroups();
     const whole = unwrap(repo.query({ sessionId: SESSION_A, sort: 'count_desc', limit: 50 }));
 
@@ -1290,11 +1819,29 @@ describe('count_desc and grouped reads', () => {
       'zeta',
     ]);
 
-    // Inside a group the canonical chain decides, exactly as the correlator
-    // orders events.
+    // Inside a group the panel-data secondary key decides: ascending event id
+    // (AAP 0.4.2), whatever order the rows started or arrived in.
     const alpha = whole.rows.filter((event) => event.name === 'alpha');
 
     expect(alpha.map((event) => event.id)).toEqual(
+      stored
+        .filter((event) => event.name === 'alpha')
+        .map((event) => event.id)
+        .sort(),
+    );
+
+    // The convenience readers rank the same groups the same way but keep the
+    // canonical chain inside each, exactly as the correlator orders events.
+    const canonical = unwrap(
+      repo.listByCapture(SESSION_A, CAPTURE_A1, { sort: 'count_desc', limit: 50 }),
+    );
+
+    expect(canonical.rows.map((event) => event.name)).toEqual(
+      whole.rows.map((event) => event.name),
+    );
+    expect(
+      canonical.rows.filter((event) => event.name === 'alpha').map((event) => event.id),
+    ).toEqual(
       stored
         .filter((event) => event.name === 'alpha')
         .sort(compareEventsCanonical)
@@ -1468,9 +2015,11 @@ describe('count_desc and grouped reads', () => {
     ]);
     expect(byComponent.skipped).toBeUndefined();
 
+    // The two Alpha renders share a start time, so the event id orders them.
+    const alphaIds = alpha.map((event) => event.id).sort();
     const filtered = unwrap(repo.query({ sessionId: SESSION_A, component: 'Alpha' }));
 
-    expect(filtered.rows.map((event) => event.id)).toEqual(alpha.map((event) => event.id));
+    expect(filtered.rows.map((event) => event.id)).toEqual(alphaIds);
 
     const ranked = unwrap(
       repo.query({ sessionId: SESSION_A, sort: 'count_desc', groupBy: 'component' }),
@@ -1479,7 +2028,7 @@ describe('count_desc and grouped reads', () => {
     // The unreadable row ranks with the rows that have no component and is
     // then skipped and reported, as any row page does.
     expect(ranked.rows.map((event) => event.id)).toEqual([
-      ...alpha.map((event) => event.id),
+      ...alphaIds,
       ...beta.map((event) => event.id),
     ]);
     expect(ranked.total).toBe(4);
@@ -1574,12 +2123,31 @@ describe('count_desc and grouped reads', () => {
     ]);
   });
 
-  it('pages groups with the row-page bounds', () => {
+  it('pages groups with the row-page bounds, ending the walk at a count-only page', () => {
     insertNamedGroups();
 
     const countOnly = unwrap(repo.queryGroups({ sessionId: SESSION_A, groupBy: 'name', limit: 0 }));
 
-    expect(countOnly).toEqual({ groups: [], total: 6, nextOffset: 0 });
+    // A count-only page returns no group, so it is terminal: its "next" offset
+    // would be its own, and a group pager following it would never advance.
+    expect(countOnly).toEqual({ groups: [], total: 6 });
+    expect(countOnly.nextOffset).toBeUndefined();
+
+    // Likewise at an offset inside the result, with groups still ahead.
+    const countInside = unwrap(
+      repo.queryGroups({ sessionId: SESSION_A, groupBy: 'name', limit: 0, offset: 3 }),
+    );
+
+    expect(countInside).toEqual({ groups: [], total: 6 });
+    expect(countInside.nextOffset).toBeUndefined();
+
+    // A page that returned a group still advances past it.
+    const oneGroup = unwrap(
+      repo.queryGroups({ sessionId: SESSION_A, groupBy: 'name', limit: 1, offset: 3 }),
+    );
+
+    expect(oneGroup.groups).toHaveLength(1);
+    expect(oneGroup.nextOffset).toBe(4);
 
     const clamped = unwrap(
       repo.queryGroups({
@@ -1607,6 +2175,7 @@ describe('count_desc and grouped reads', () => {
       [{ sessionId: SESSION_A, groupBy: 'name', offset: 1.5 }, 'invalid-offset'],
       [{ sessionId: '', groupBy: 'name' }, 'blank-session-id'],
       [{ sessionId: SESSION_A, groupBy: 'name', kinds: ['not-a-kind'] }, 'unknown-kind'],
+      [{ sessionId: SESSION_A, groupBy: 'name', tier: 'not-a-tier' }, 'unknown-tier'],
     ] as const;
 
     for (const [query, reason] of cases) {
@@ -1693,6 +2262,56 @@ describe('the convenience readers', () => {
 
     expect(page.rows.map((event) => event.id)).toEqual([render.id]);
     expect(page.total).toBe(1);
+  });
+
+  it('narrows a trace shared by two captures to one capture window when asked', () => {
+    // One trace id under two captures of the same session: a producer mints
+    // trace ids, so nothing keys one to a single capture.
+    const firstWindow = [
+      buildEvent({ kind: 'interaction', startTime: BASE_TIME }),
+      buildEvent({ startTime: BASE_TIME + 3 }),
+    ];
+    const secondWindow = [
+      buildEvent({ captureId: CAPTURE_A2, kind: 'interaction', startTime: BASE_TIME + 1 }),
+      buildEvent({ captureId: CAPTURE_A2, startTime: BASE_TIME + 2 }),
+      buildEvent({ captureId: CAPTURE_A2, startTime: BASE_TIME + 4 }),
+    ];
+
+    insertOk([...secondWindow, ...firstWindow]);
+
+    const everyCapture = unwrap(repo.listByTrace(SESSION_A, TRACE_A));
+
+    expect(everyCapture.total).toBe(5);
+    expect(everyCapture.rows.map((event) => event.captureId)).toEqual([
+      CAPTURE_A1,
+      CAPTURE_A2,
+      CAPTURE_A2,
+      CAPTURE_A1,
+      CAPTURE_A2,
+    ]);
+
+    const first = unwrap(repo.listByTrace(SESSION_A, TRACE_A, { captureId: CAPTURE_A1 }));
+
+    expect(first.rows.map((event) => event.id)).toEqual(firstWindow.map((event) => event.id));
+    expect(first.total).toBe(firstWindow.length);
+
+    const second = unwrap(repo.listByTrace(SESSION_A, TRACE_A, { captureId: CAPTURE_A2 }));
+
+    expect(second.rows.map((event) => event.id)).toEqual(secondWindow.map((event) => event.id));
+    expect(second.total).toBe(secondWindow.length);
+
+    // Narrowed and paged: the page walk is over the capture's rows alone.
+    const paged = unwrap(
+      repo.listByTrace(SESSION_A, TRACE_A, { captureId: CAPTURE_A2, limit: 2, offset: 0 }),
+    );
+
+    expect(paged.rows.map((event) => event.id)).toEqual(
+      secondWindow.slice(0, 2).map((event) => event.id),
+    );
+    expect(paged.total).toBe(secondWindow.length);
+
+    // A capture of another session narrows to nothing rather than reaching it.
+    expect(unwrap(repo.listByTrace(SESSION_A, TRACE_A, { captureId: CAPTURE_B1 })).total).toBe(0);
   });
 
   it('reads one span by id, and answers undefined for one it does not hold', () => {
@@ -2015,6 +2634,7 @@ describe('retention', () => {
     }
   });
 
+  // 5 001 rows written then purged overruns Vitest's 5 s default on a loaded shared host.
   it('clamps a batch size above MAX_PURGE_BATCH_SIZE instead of refusing it', async () => {
     const events = Array.from({ length: MAX_PURGE_BATCH_SIZE + 1 }, (_unused, index) =>
       buildEvent({ startTime: BASE_TIME + index / 8, seq: index }),
@@ -2042,7 +2662,7 @@ describe('retention', () => {
       deleted: events.length,
     });
     expect(MAX_PURGE_BATCH_SIZE).toBe(DEFAULT_PURGE_BATCH_SIZE);
-  });
+  }, 60_000);
 
   it('yields between batches, so an ingest batch scheduled mid-purge runs before it ends', async () => {
     const cutoff = BASE_TIME + 100;
@@ -2242,6 +2862,7 @@ describe('privacy', () => {
  * ---------------------------------------------------------------------------------------------- */
 
 describe('bulk insertion and index use', () => {
+  // Timeout above the 15 s bound asserted below, so that bound, not Vitest's 5 s default, decides.
   it('stores twenty thousand events in one transaction, numbered without a gap', () => {
     const events = Array.from({ length: 20_000 }, (_unused, index) =>
       buildEvent({ startTime: BASE_TIME + index / 8, seq: index }),
@@ -2269,17 +2890,19 @@ describe('bulk insertion and index use', () => {
     // guarding is the order of magnitude — a per-row transaction would fsync
     // twenty thousand times and take minutes.
     expect(elapsed).toBeLessThan(15_000);
-  });
+  }, 60_000);
 
   it('answers the default page and a trace read from an index, never a table scan', () => {
     insertOk([buildEvent(), buildEvent({ traceId: TRACE_B })]);
 
     // The statement texts mirror what the read path assembles, including the
-    // exported ordering constant, so a change to either shape fails here.
+    // exported ordering constants, so a change to either shape fails here: the
+    // default page is `query`'s, in the panel-data order, and the trace read is
+    // `listByTrace`'s, in the canonical order the correlator pages through.
     const defaultPage = queryPlan(
       `SELECT ingest_seq, event FROM telemetry_events
        WHERE session_id = ? AND capture_id = ?
-       ORDER BY ${CANONICAL_ORDER_BY} LIMIT ? OFFSET ?`,
+       ORDER BY ${PANEL_START_ASC_ORDER_BY} LIMIT ? OFFSET ?`,
     );
     const byTrace = queryPlan(
       `SELECT ingest_seq, event FROM telemetry_events

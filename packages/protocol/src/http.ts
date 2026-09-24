@@ -1383,25 +1383,155 @@ const graphDataResultSchema = z.strictObject({
 });
 
 /**
- * `source: 'metrics'` — the capture's computed metric values.
+ * The vocabulary bound on a metrics `total`.
  *
- * Carries the paging echo for uniformity, so one resolver and one client path
- * serve every array-valued source, but the service always returns the complete
- * set: `total` is the number of `METRIC_IDS` and `nextOffset` is `null`, because
- * the metric vocabulary is closed at fourteen ids and a metric card addresses a
- * value by id rather than by position. The array is bounded by that same count —
- * a longer one is a producer repeating itself — while a shorter one is accepted,
- * since the fallback path and a partially observed capture legitimately carry a
- * subset, each unmeasured metric reporting `available: false`.
+ * Like every `METRICS_*_RULE` statement below, it names fields and no value,
+ * which is the failure policy of this package (AAP §0.5.2).
  */
-const metricsDataResultSchema = z.strictObject({
-  source: z.literal('metrics'),
-  metrics: opaqueArraySchema<MetricValue>('MetricValue', recordWithKeys('id', 'available')).max(
-    METRIC_IDS.length,
-    { error: `expected at most ${String(METRIC_IDS.length)} metric values` },
-  ),
-  ...dataPageShape,
-});
+const METRICS_TOTAL_RULE = `total must not exceed ${String(
+  METRIC_IDS.length,
+)}: the metric vocabulary is closed and holds one value per id.`;
+
+/** A page is never longer than the page size it echoes. */
+const METRICS_PAGE_LIMIT_RULE =
+  'metrics must hold at most limit values: a page never exceeds the page size it echoes.';
+
+/** A page is never longer than what remains from its offset. */
+const METRICS_PAGE_REMAINDER_RULE =
+  'metrics must hold at most total minus offset values: a page cannot carry more than remains from its offset.';
+
+/** A page never carries one metric twice. */
+const METRICS_UNIQUE_ID_RULE =
+  'metrics must not repeat an id within one page: each metric has exactly one value.';
+
+/** `nextOffset` is derived from the window, never chosen. */
+const METRICS_NEXT_OFFSET_RULE =
+  'nextOffset must be offset plus the page length while the page holds a value and that is below total, and null otherwise.';
+
+/**
+ * Records one breach of the metrics paging rule on `payload`.
+ *
+ * @param payload The parse payload of the metrics result being checked.
+ * @param path The field a producer has to change, as a Zod issue path.
+ * @param message One of the `METRICS_*_RULE` statements above.
+ */
+function reportMetricsPageIssue(
+  payload: z.core.ParsePayload<unknown>,
+  path: (string | number)[],
+  message: string,
+): void {
+  payload.issues.push({
+    code: 'custom',
+    path,
+    message,
+    // Left empty on purpose: zod strips a finalized issue's `input` unless a
+    // parse context asks for it, and a failure here never carries the value
+    // that caused it (AAP §0.5.2).
+    input: undefined,
+  });
+}
+
+/**
+ * Rejects a metrics page that breaks the paging rule stated on
+ * {@link metricsDataResultSchema}.
+ *
+ * Five checks, each on the path a producer has to change:
+ *
+ * - `total` is at most the number of `METRIC_IDS`, because the vocabulary is
+ *   closed and holds one value per id;
+ * - the page holds at most `limit` values — the check that refuses a producer
+ *   returning the complete set whatever window the request asked for;
+ * - the page holds at most `total - offset` values, so a page cannot claim more
+ *   than remains from where it starts;
+ * - no id repeats within the page, reported at the repeating index;
+ * - `nextOffset` is `offset + metrics.length` while the page holds at least one
+ *   value and that is below `total`, and `null` otherwise — the producer rule
+ *   of `apps/local-service/src/store/telemetry-repo.ts`, under which a page
+ *   that returned nothing is the last one.
+ *
+ * Every breach is reported rather than the first, since each names a different
+ * field. Zod runs an object's checks only once its fields have parsed, and an
+ * element that is not a `MetricValue` record aborts that parse, so every element
+ * here is a record carrying `id`. A bound issue — a negative `total`, an array
+ * past its `.max` — does not abort, which is why the arithmetic below is written
+ * to hold for any integer rather than only for in-range ones.
+ */
+function checkMetricsPage(
+  payload: z.core.ParsePayload<DataPage & { metrics: readonly MetricValue[] }>,
+): void {
+  const { metrics, total, limit, offset, nextOffset } = payload.value;
+
+  if (total > METRIC_IDS.length) {
+    reportMetricsPageIssue(payload, ['total'], METRICS_TOTAL_RULE);
+  }
+
+  if (metrics.length > limit) {
+    reportMetricsPageIssue(payload, ['metrics'], METRICS_PAGE_LIMIT_RULE);
+  }
+
+  if (metrics.length > Math.max(0, total - offset)) {
+    reportMetricsPageIssue(payload, ['metrics'], METRICS_PAGE_REMAINDER_RULE);
+  }
+
+  const seen = new Set<MetricValue['id']>();
+
+  for (const [index, metric] of metrics.entries()) {
+    if (seen.has(metric.id)) {
+      reportMetricsPageIssue(payload, ['metrics', index], METRICS_UNIQUE_ID_RULE);
+    }
+
+    seen.add(metric.id);
+  }
+
+  const following = offset + metrics.length;
+  const expectedNextOffset = metrics.length > 0 && following < total ? following : null;
+
+  if (nextOffset !== expectedNextOffset) {
+    reportMetricsPageIssue(payload, ['nextOffset'], METRICS_NEXT_OFFSET_RULE);
+  }
+}
+
+/**
+ * `source: 'metrics'` — the capture's computed metric values, paged.
+ *
+ * Paged by exactly the rule every array-valued source follows (AAP §0.4.2), with
+ * no exception. `total` is how many metric values the filtered source holds: at
+ * most the number of `METRIC_IDS`, one value per id, and fewer when the fallback
+ * path or a partially observed capture computed a subset, a present but
+ * unmeasured metric reporting `available: false`. The page is the window
+ * `[offset, offset + limit)` of those values in one stable order, so consecutive
+ * pages neither overlap nor skip a value; which order is
+ * `apps/local-service/src/panels/data.ts`'s to choose. `nextOffset` is `offset`
+ * plus the page's length while the page holds a value and that is below
+ * `total`, and `null` otherwise, so a `nextOffset` that is present always lies
+ * past the page it came from.
+ *
+ * Two edge cases follow from the rule rather than from exceptions to it.
+ * `limit: 0` is a count-only request: an empty page, the real `total`, and
+ * `nextOffset: null` — a page that returned nothing is the last page, so a
+ * paging loop that follows `nextOffset` always advances. An `offset` at or past
+ * `total` is likewise an empty page with `nextOffset: null`.
+ *
+ * A metric card addresses a value by id rather than by position, so a value
+ * absent from one page is only *not on this page*; it is *not computed* only
+ * when a complete read — from offset 0 until `nextOffset` is `null` — did not
+ * carry it. `MetricCards` follows `nextOffset` for that reason.
+ *
+ * {@link checkMetricsPage} enforces the rule on the parsed object. The array
+ * keeps its bound at the vocabulary's size as a cheap pre-bound ahead of that
+ * check. `.check()` preserves `.shape`, so the discriminated union below still
+ * reads this member's `source` literal.
+ */
+const metricsDataResultSchema = z
+  .strictObject({
+    source: z.literal('metrics'),
+    metrics: opaqueArraySchema<MetricValue>('MetricValue', recordWithKeys('id', 'available')).max(
+      METRIC_IDS.length,
+      { error: `expected at most ${String(METRIC_IDS.length)} metric values` },
+    ),
+    ...dataPageShape,
+  })
+  .check(checkMetricsPage);
 
 /**
  * The `POST /sessions/:id/panel-data` response: one member per query source.

@@ -56,9 +56,13 @@
  *     the component issues is recorded: what it *asked for* is as much of its
  *     contract as what it drew.
  *   - **In-file synthetic builders, no fixture files.** {@link makeEvent} and
- *     {@link makeNode} take overrides, and the telemetry shapes are imported as
- *     types only — nothing here calls a telemetry runtime helper to build a
- *     record, and nothing is read from disk.
+ *     {@link makeNode} take overrides, and nothing here calls a telemetry
+ *     runtime helper to build a record. The one telemetry runtime value read is
+ *     `KIND_ALLOWED_TIERS`, the event schema's own kind-to-tier rule, so the
+ *     case that draws every catalogued kind gives each record a tier the schema
+ *     permits instead of a table retyped here; the node catalog's entry is read
+ *     the same way, through `catalogEntryFor`. Nothing but the component
+ *     stylesheet is read from disk.
  *   - **No layout stubbing.** `getBoundingClientRect` and `ResizeObserver` are
  *     left alone on purpose: the time scale's range is a percentage interval, so
  *     the view must be correct from data alone under happy-dom, where every
@@ -80,13 +84,16 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { DATA_QUERY_DEFAULT_OFFSET } from '@debuggen/panel-schema';
+import { DATA_QUERY_DEFAULT_OFFSET, catalogEntryFor } from '@debuggen/panel-schema';
 import type { DataQuery, WaterfallNode } from '@debuggen/panel-schema';
 import { DebuggenError } from '@debuggen/shared';
 import type { SourceLocation } from '@debuggen/shared';
-import type { OrphanReason, TelemetryEvent, TraceNode, TraceTree } from '@debuggen/telemetry';
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { KIND_ALLOWED_TIERS } from '@debuggen/telemetry';
+import type { RequestGroup, RequestOccurrence, TelemetryEvent } from '@debuggen/telemetry';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import type { RenderResult } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import type { ReactElement } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Mock } from 'vitest';
 
@@ -218,6 +225,13 @@ const FAILING_QUERY_NAME = 'Failing query';
 
 /** A generic substring of the component's own empty copy. */
 const EMPTY_MESSAGE = /no network or database calls were captured/i;
+
+/**
+ * The headings of the two empty states that are not an empty capture: an
+ * explicit count-only request, and a page that is empty while its query is not.
+ */
+const COUNT_ONLY_TITLE = 'Count only';
+const EMPTY_PAGE_TITLE = 'Nothing on this page';
 
 /**
  * Anything that would offer to reveal a captured body, a raw value or a result
@@ -449,6 +463,46 @@ function resolvingProvider(
 }
 
 /**
+ * A provider that answers each query with the page its SESSION and OFFSET
+ * select, and rejects any query no page was built for.
+ *
+ * The builder the page-identity cases use: what they prove is which slice of
+ * which session's result the component asked for after its node or its session
+ * changed, so the answer has to depend on exactly those two coordinates rather
+ * than on how many calls came before.
+ *
+ * @param pageFor The page for a session and a requested offset, or `undefined`
+ * when the case built none for them.
+ * @returns The stub provider.
+ */
+function slicingProvider(
+  pageFor: (sessionId: string, offset: number) => SpanPage | undefined,
+): StubProvider {
+  const queries: DataQuery[] = [];
+  const resolve = vi.fn<DataQueryResolver>((query, context) => {
+    queries.push(query);
+
+    const offset = query.offset ?? DATA_QUERY_DEFAULT_OFFSET;
+    const page = pageFor(context.sessionId, offset);
+
+    if (page === undefined) {
+      return Promise.reject(
+        new Error(`no page was built for ${context.sessionId} at offset ${String(offset)}`),
+      );
+    }
+
+    return Promise.resolve<DataQueryResponse>({
+      source: 'spans',
+      data: page.data,
+      ...(page.total === undefined ? {} : { total: page.total }),
+      ...(page.nextOffset === undefined ? {} : { nextOffset: page.nextOffset }),
+    });
+  });
+
+  return { provider: createDataProvider(resolve), queries, resolve };
+}
+
+/**
  * A provider whose promise never settles — the loading state, with no timer.
  *
  * @returns The stub provider.
@@ -516,25 +570,59 @@ function makeActions(): ActionSpies {
   };
 }
 
+/** What the component is rendered inside: the host's provider, actions and session. */
+interface HostContext {
+  /** The provider that resolves the node's query. */
+  readonly provider: DataProvider;
+
+  /** The actions the component reports to. */
+  readonly actions: PanelActions;
+
+  /** The session `PanelSessionContext` carries; the fixture session when omitted. */
+  readonly sessionId?: string | undefined;
+}
+
+/**
+ * The component inside all three host contexts, as `PanelHost` nests them.
+ *
+ * @param node The node to draw.
+ * @param context The provider, actions and session to render it inside.
+ * @returns The element tree.
+ */
+function hostTree(node: WaterfallNode, context: HostContext): ReactElement {
+  return (
+    <DataProviderContext.Provider value={context.provider}>
+      <PanelSessionContext.Provider value={context.sessionId ?? SESSION_ID}>
+        <PanelActionsContext.Provider value={context.actions}>
+          <Waterfall node={node} />
+        </PanelActionsContext.Provider>
+      </PanelSessionContext.Provider>
+    </DataProviderContext.Provider>
+  );
+}
+
 /**
  * Renders the component inside both host contexts.
  *
  * @param node The node to draw.
  * @param context The provider to resolve its query and the actions to report to.
+ * @returns The render result, for a case that re-renders the same mounted view.
  */
-function renderComponent(
-  node: WaterfallNode,
-  context: { readonly provider: DataProvider; readonly actions: PanelActions },
-): void {
-  render(
-    <DataProviderContext.Provider value={context.provider}>
-      <PanelSessionContext.Provider value={SESSION_ID}>
-        <PanelActionsContext.Provider value={context.actions}>
-          <Waterfall node={node} />
-        </PanelActionsContext.Provider>
-      </PanelSessionContext.Provider>
-    </DataProviderContext.Provider>,
-  );
+function renderComponent(node: WaterfallNode, context: HostContext): RenderResult {
+  return render(hostTree(node, context));
+}
+
+/**
+ * Re-renders an already mounted view with a new node or a new host context —
+ * the same component instance, so its paging state survives unless the
+ * component itself decides it no longer applies.
+ *
+ * @param view What {@link renderComponent} returned.
+ * @param node The node to draw now.
+ * @param context The provider, actions and session to render it inside now.
+ */
+function rerenderComponent(view: RenderResult, node: WaterfallNode, context: HostContext): void {
+  view.rerender(hostTree(node, context));
 }
 
 /**
@@ -797,10 +885,18 @@ describe('Waterfall states', () => {
 
     // The page is a success and it is not empty — it simply holds no call — so
     // the kind filter is what has to produce the absence. A view that drew a
-    // record of any kind would render an axis and one bar here instead.
-    const message = await screen.findByText(EMPTY_MESSAGE);
+    // record of any kind would render an axis and one bar here instead. The
+    // record it filtered out is captured evidence, so the state counts it
+    // rather than claiming the capture held nothing.
+    const message = await screen.findByText(
+      `${formatCount(1)} span is loaded, and it is not a network or database call; no total was reported for this query.`,
+    );
     expect(message.classList.contains('dg-empty-state__message')).toBe(true);
     expect(message.closest('.dg-waterfall__empty')).not.toBeNull();
+    expect(screen.getByText(EMPTY_PAGE_TITLE).classList.contains('dg-empty-state__title')).toBe(
+      true,
+    );
+    expect(screen.queryByText(EMPTY_MESSAGE)).toBeNull();
 
     expect(screen.queryByRole('tree')).toBeNull();
     expect(drawnRows()).toHaveLength(0);
@@ -846,84 +942,321 @@ describe('Waterfall states', () => {
     expect(screen.queryByRole('tree')).toBeNull();
     expect(screen.queryByRole('img')).toBeNull();
   });
+
+  // The catalog entry for this node type lists `spans` and `requests` only, and
+  // says `trace` is deliberately absent. A node naming either of these — which
+  // validation rejects, so only an unvalidated host can mount one — must be
+  // reported as unsupported and must not reach the provider at all: a branch
+  // that queried them would be one no valid specification could ever select.
+  it.each(['events', 'trace'] as const)(
+    'reports a node whose query names the uncatalogued %s source, and asks for nothing',
+    async (source) => {
+      const stub = resolvingProvider(CHAIN);
+
+      renderComponent(makeNode({ query: { source } }), {
+        provider: stub.provider,
+        actions: makeActions().actions,
+      });
+
+      const alert = await screen.findByRole('alert');
+      expect(alert.closest('.dg-waterfall__error')).not.toBeNull();
+      expect(alert.textContent).toContain('This view cannot draw that data source');
+
+      // The node's own query is what the reader is shown, and no retry is
+      // offered: re-issuing it cannot change the answer.
+      const shown = within(alert).getByRole('group', { name: FAILING_QUERY_NAME });
+      expect(JSON.parse(shown.textContent ?? '')).toEqual({
+        source,
+        offset: DATA_QUERY_DEFAULT_OFFSET,
+      });
+      expect(within(alert).queryByRole('button', { name: RETRY_NAME })).toBeNull();
+
+      // Nothing was asked of the provider, and nothing drawn as if it had been.
+      expect(stub.resolve).not.toHaveBeenCalled();
+      expect(stub.queries).toHaveLength(0);
+      expect(screen.queryByRole('tree')).toBeNull();
+      expect(drawnRows()).toHaveLength(0);
+    },
+  );
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Empty pages are not empty captures
+ *
+ * A successful result that draws no row says which situation it is in, from
+ * the counters the service reported: an explicit `limit: 0` asks for a total
+ * without rows, an authored offset past the end is an empty page rather than
+ * an error, and a page whose records are all of kinds this view does not draw
+ * still holds captured evidence. Only a total of zero — or no total at all, at
+ * the first offset, with nothing loaded — is the empty capture.
+ * ---------------------------------------------------------------------------
+ */
+
+/** A browser interaction: captured evidence, of a kind this view does not draw. */
+const INTERACTION_EVENT = makeEvent({
+  id: eventIdFor(10),
+  spanId: spanIdFor(10),
+  kind: 'interaction',
+  tier: 'browser',
+  name: 'example.interaction',
+  startTime: BASE_START_MS + 4,
+  duration: 9,
+  seq: 10,
+  ingestSeq: 10,
+});
+
+/**
+ * Waits for the empty state and asserts what it says — its heading, or the
+ * absence of one, and its message — and that no chart, row, failure or next
+ * page is offered beside it.
+ *
+ * @param title The heading the state carries, or `undefined` for none.
+ * @param message The state's message, in full.
+ */
+async function expectEmptyState(title: string | undefined, message: string): Promise<void> {
+  const shown = await screen.findByText(message);
+  expect(shown.classList.contains('dg-empty-state__message')).toBe(true);
+  expect(shown.closest('.dg-waterfall__empty')).not.toBeNull();
+
+  for (const heading of [COUNT_ONLY_TITLE, EMPTY_PAGE_TITLE]) {
+    const found = screen.queryByText(heading);
+    if (heading === title) {
+      expect(found?.classList.contains('dg-empty-state__title')).toBe(true);
+    } else {
+      expect(found).toBeNull();
+    }
+  }
+
+  expect(screen.queryByRole('tree')).toBeNull();
+  expect(drawnRows()).toHaveLength(0);
+  expect(screen.queryByRole('alert')).toBeNull();
+  expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+}
+
+describe('Waterfall empty pages', () => {
+  it('states a count-only request as one, naming the total the service reported', async () => {
+    const stub = resolvingProvider([], { total: 42 });
+
+    renderComponent(makeNode({ query: { source: 'spans', limit: 0 } }), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    await expectEmptyState(
+      COUNT_ONLY_TITLE,
+      `This view requests a count without rows: ${formatCount(42)} spans matched its query.`,
+    );
+    expect(screen.queryByText(EMPTY_MESSAGE)).toBeNull();
+
+    // The explicit zero reached the provider exactly as the node asked for it.
+    expect(soleQuery(stub).limit).toBe(0);
+  });
+
+  it('states a count-only request as one even when the answer echoes its own offset', async () => {
+    // A count-only answer names no next page; one that echoes its own offset
+    // would only re-request the page already searched, so it is not a next page.
+    const stub = resolvingProvider([], { total: 42, nextOffset: 0 });
+
+    renderComponent(makeNode({ query: { source: 'spans', limit: 0 } }), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    await expectEmptyState(
+      COUNT_ONLY_TITLE,
+      `This view requests a count without rows: ${formatCount(42)} spans matched its query.`,
+    );
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+    expect(stub.resolve).toHaveBeenCalledTimes(1);
+  });
+
+  it('offers no Load more for an undrawn page whose next offset does not advance', async () => {
+    const stub = resolvingProvider([RENDER_EVENT], { total: 42, nextOffset: 0 });
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await expectEmptyState(
+      EMPTY_PAGE_TITLE,
+      `${formatCount(1)} of the ${formatCount(42)} spans that matched this query is loaded, and it is not a network or database call.`,
+    );
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+    expect(stub.resolve).toHaveBeenCalledTimes(1);
+  });
+
+  it('states a count-only request with no reported total as unreported, not as empty', async () => {
+    const stub = resolvingProvider([]);
+
+    renderComponent(makeNode({ query: { source: 'spans', limit: 0 } }), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    await expectEmptyState(
+      COUNT_ONLY_TITLE,
+      'This view requests a count without rows, and no total was reported for its query.',
+    );
+    expect(screen.queryByText(EMPTY_MESSAGE)).toBeNull();
+  });
+
+  it('says where a page past the end starts, and how many spans matched', async () => {
+    const stub = resolvingProvider([], { total: 150 });
+
+    renderComponent(makeNode({ query: { source: 'spans', offset: 200 } }), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    await expectEmptyState(
+      EMPTY_PAGE_TITLE,
+      `This page starts at position ${formatCount(201)}, past the end of the ${formatCount(150)} spans that matched this query.`,
+    );
+    expect(screen.queryByText(EMPTY_MESSAGE)).toBeNull();
+    expect(soleQuery(stub).offset).toBe(200);
+  });
+
+  it.each([
+    [
+      'several records',
+      [RENDER_EVENT, INTERACTION_EVENT],
+      `${formatCount(2)} of the ${formatCount(42)} spans that matched this query are loaded, and none of them is a network or database call.`,
+    ],
+    [
+      'one record',
+      [RENDER_EVENT],
+      `${formatCount(1)} of the ${formatCount(42)} spans that matched this query is loaded, and it is not a network or database call.`,
+    ],
+  ])(
+    'counts %s the kind filter removed against the reported total',
+    async (_description: string, page: readonly TelemetryEvent[], message: string) => {
+      const stub = resolvingProvider(page, { total: 42 });
+
+      renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+      await expectEmptyState(EMPTY_PAGE_TITLE, message);
+      expect(screen.queryByText(EMPTY_MESSAGE)).toBeNull();
+
+      // Counted, never drawn: the records themselves stay off screen.
+      const text = document.body.textContent ?? '';
+      for (const event of page) {
+        expect(text).not.toContain(event.name);
+      }
+    },
+  );
+
+  it('says how many spans matched when a page inside the result arrives empty', async () => {
+    const stub = resolvingProvider([], { total: 42 });
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await expectEmptyState(
+      EMPTY_PAGE_TITLE,
+      `${formatCount(42)} spans matched this query, but none are shown on this page.`,
+    );
+    expect(screen.queryByText(EMPTY_MESSAGE)).toBeNull();
+  });
+
+  it('says where a later page starts when no total was reported', async () => {
+    const stub = resolvingProvider([]);
+
+    renderComponent(makeNode({ query: { source: 'spans', offset: 200 } }), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    await expectEmptyState(
+      EMPTY_PAGE_TITLE,
+      `This page starts at position ${formatCount(201)} and holds no spans; no total was reported for this query.`,
+    );
+    expect(screen.queryByText(EMPTY_MESSAGE)).toBeNull();
+  });
+
+  it('counts request groups, not spans, for a grouped network result', async () => {
+    const stub = recordingProvider(() =>
+      Promise.resolve<DataQueryResponse>({ source: 'requests', data: [], total: 3 }),
+    );
+
+    renderComponent(makeNode({ query: { source: 'requests', offset: 10 } }), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    await expectEmptyState(
+      EMPTY_PAGE_TITLE,
+      `This page starts at position ${formatCount(11)}, past the end of the ${formatCount(3)} request groups that matched this query.`,
+    );
+    expect(soleQuery(stub).source).toBe('requests');
+  });
+
+  it('keeps the empty-capture message for a total of zero', async () => {
+    const stub = resolvingProvider([], { total: 0 });
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    const message = await screen.findByText(EMPTY_MESSAGE);
+    await expectEmptyState(undefined, message.textContent ?? '');
+  });
+
+  it('keeps the empty-capture message for a first page with no total and nothing on it', async () => {
+    const stub = resolvingProvider([]);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    const message = await screen.findByText(EMPTY_MESSAGE);
+    await expectEmptyState(undefined, message.textContent ?? '');
+  });
 });
 
 describe('Waterfall rows', () => {
-  it('draws a row for each call kind it reads, and none for any other record', async () => {
-    // One top-level record of each kind a waterfall draws — the two browser
-    // request kinds, the server request, the statement and the outgoing
-    // server-side call — mixed with two records it does not.
-    const drawn: readonly TelemetryEvent[] = [
-      makeEvent({
-        id: eventIdFor(21),
-        spanId: spanIdFor(21),
-        kind: 'fetch',
-        tier: 'browser',
-        name: 'example.fetch',
-        startTime: BASE_START_MS,
-        duration: 300,
-        seq: 0,
-        ingestSeq: 1,
-      }),
-      makeEvent({
-        id: eventIdFor(22),
-        spanId: spanIdFor(22),
-        kind: 'xhr',
-        tier: 'browser',
-        name: 'example.xhr',
-        startTime: BASE_START_MS + 10,
-        duration: 80,
-        seq: 1,
-        ingestSeq: 2,
-      }),
-      makeEvent({
-        id: eventIdFor(23),
-        spanId: spanIdFor(23),
-        kind: 'http.server',
-        tier: 'server',
-        name: 'example.incoming',
-        startTime: BASE_START_MS + 20,
-        duration: 250,
-        seq: 2,
-        ingestSeq: 3,
-      }),
-      makeEvent({
-        id: eventIdFor(24),
-        spanId: spanIdFor(24),
-        kind: 'db.query',
-        tier: 'db',
-        name: 'example.statement',
-        startTime: BASE_START_MS + 30,
-        duration: 180,
-        seq: 3,
-        ingestSeq: 4,
-      }),
-      makeEvent({
-        id: eventIdFor(25),
-        spanId: spanIdFor(25),
-        kind: 'http.client',
-        tier: 'server',
-        name: 'example.outgoing',
-        startTime: BASE_START_MS + 40,
-        duration: 120,
-        seq: 4,
-        ingestSeq: 5,
-      }),
-    ];
+  it('draws a row for each call kind its catalog entry lists, and none for any other record', async () => {
+    // One top-level record of EVERY kind the node catalog says a waterfall
+    // draws, read from the catalog entry itself rather than retyped here, so a
+    // kind the catalog adds later is covered by this case the moment it lands —
+    // and a component that kept a narrower list of its own fails it. Each
+    // record takes the first tier the event schema's cross-field rule permits
+    // for its kind, and they are mixed with two records the view does not draw.
+    const kinds = catalogEntryFor('waterfall').telemetryKinds;
+    expect(kinds.length).toBeGreaterThan(0);
+    const drawn: readonly TelemetryEvent[] = kinds.map((kind, index) => {
+      const [tier] = KIND_ALLOWED_TIERS[kind];
+      if (tier === undefined) {
+        throw new Error(`the event schema permits no tier for the ${kind} kind`);
+      }
+      return makeEvent({
+        id: eventIdFor(21 + index),
+        spanId: spanIdFor(21 + index),
+        kind,
+        tier,
+        name: `example.${kind}-call`,
+        startTime: BASE_START_MS + index * 10,
+        // Distinct per record, so a per-row duration assertion cannot pass by
+        // matching another row's figure.
+        duration: 60 + (kinds.length - index) * 40,
+        seq: index,
+        ingestSeq: index + 1,
+      });
+    });
+    // Ids below the drawn range, so a catalog that grows cannot collide with
+    // them.
     const undrawn: readonly TelemetryEvent[] = [
       RENDER_EVENT,
       makeEvent({
-        id: eventIdFor(26),
-        spanId: spanIdFor(26),
+        id: eventIdFor(20),
+        spanId: spanIdFor(20),
         kind: 'interaction',
         tier: 'browser',
         name: 'example.interaction',
         startTime: BASE_START_MS,
         duration: 1200,
-        seq: 5,
-        ingestSeq: 6,
+        seq: kinds.length,
+        ingestSeq: kinds.length + 1,
       }),
     ];
+    // The absence asserted below is only a statement about the view while
+    // these kinds are genuinely outside the catalog's list.
+    for (const event of undrawn) {
+      expect(kinds).not.toContain(event.kind);
+    }
     const stub = resolvingProvider([...undrawn, ...drawn]);
 
     renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
@@ -934,7 +1267,7 @@ describe('Waterfall rows', () => {
     for (const event of drawn) {
       // Each of these records carries neither a URL nor a route, so its own
       // name is the label — which is what lets one assertion loop name every
-      // kind without five different label rules.
+      // kind without a label rule per kind.
       const row = rowLabelled(event.name);
       expect(row.getAttribute('aria-label') ?? '').toContain(
         `${formatKindLabel(event.kind)} · ${formatTierLabel(event.tier)}`,
@@ -1535,6 +1868,373 @@ describe('Waterfall paging', () => {
 
 /*
  * ---------------------------------------------------------------------------
+ * Pages that hold nothing this view draws
+ *
+ * The node's query goes to the service as authored, and the kind filter is
+ * applied to each page here — the flat path needs the undrawn records to nest
+ * a statement under its request. So a page can hold only records of other
+ * kinds while a later page holds the calls, and that page is NOT an empty
+ * capture: the view must say what it searched, that more remains, and keep the
+ * way to the next page in reach.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The title of the state for pages searched with nothing drawable yet. */
+const UNDRAWN_PAGES_TITLE = 'No network or database calls loaded yet';
+
+/** The accessible name of the "Load more" control while its page is in flight. */
+const LOADING_MORE_NAME = 'Loading…';
+
+/** The title of the state for a kind filter that selects nothing drawable. */
+const DISJOINT_FILTER_TITLE = 'No call kind selected';
+
+/** A browser request on the first page of the in-flight footer case. */
+const LONE_PAGE_CALL = makeEvent({
+  id: eventIdFor(120),
+  spanId: spanIdFor(120),
+  name: 'example.first-page-call',
+  startTime: BASE_START_MS,
+  duration: 40,
+});
+
+/** A browser request on the second page of the paged-filter cases. */
+const SECOND_PAGE_CALL = makeEvent({
+  id: eventIdFor(121),
+  spanId: spanIdFor(121),
+  name: 'example.second-page-call',
+  startTime: BASE_START_MS + 60,
+  duration: 90,
+});
+
+describe('Waterfall pages with nothing to draw yet', () => {
+  it('keeps "Load more" when a page holds only undrawn kinds, and draws the call a later page holds', async () => {
+    // The second page is settled by hand, so the in-flight state between the
+    // two pages is observable rather than raced.
+    let settleSecondPage: (response: DataQueryResponse) => void = () => undefined;
+    const secondPage = new Promise<DataQueryResponse>((resolve) => {
+      settleSecondPage = resolve;
+    });
+    const stub = recordingProvider((_query, call) =>
+      call === 1
+        ? Promise.resolve<DataQueryResponse>({
+            source: 'spans',
+            data: [RENDER_EVENT],
+            total: 2,
+            nextOffset: 1,
+          })
+        : secondPage,
+    );
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    // What was searched, against the total, and that more remains — and not
+    // the verdict that nothing was captured.
+    const title = await screen.findByText(UNDRAWN_PAGES_TITLE);
+    const state = title.closest<HTMLElement>('.dg-waterfall__empty');
+    expect(state).not.toBeNull();
+    expect(state?.textContent ?? '').toContain(
+      `Loaded ${formatCount(1)} of ${formatCount(2)} captured records so far`,
+    );
+    expect(state?.textContent ?? '').toContain('More records remain to be searched.');
+    expect(screen.queryByText(EMPTY_MESSAGE)).toBeNull();
+    expect(screen.queryByRole('tree')).toBeNull();
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(document.body.textContent ?? '').not.toContain(RENDER_EVENT.name);
+
+    // The way to the next page is right there, inside the state.
+    const loadMore = within(state ?? document.body).getByRole('button', { name: LOAD_MORE_NAME });
+    expect(loadMore.hasAttribute('disabled')).toBe(false);
+
+    await user.click(loadMore);
+
+    // Asked at the offset the service reported, the query otherwise as authored.
+    expect(stub.resolve).toHaveBeenCalledTimes(2);
+    expect(queryOfCall(stub, 2)).toEqual({ source: 'spans', offset: 1 });
+
+    // While it is in flight, the searched pages are still stated — not replaced
+    // by the full-view loading skeleton — and the control says it is busy.
+    const busy = await screen.findByRole('button', { name: LOADING_MORE_NAME });
+    expect(busy.hasAttribute('disabled')).toBe(true);
+    expect(screen.getByText(UNDRAWN_PAGES_TITLE)).toBeTruthy();
+    expect(screen.queryByText('Loading captured calls')).toBeNull();
+
+    await act(async () => {
+      settleSecondPage({ source: 'spans', data: [SECOND_PAGE_CALL], total: 2 });
+      await Promise.resolve();
+    });
+
+    // The call the second page held is drawn, and the footer counts both pages.
+    await screen.findByRole('tree', { name: TREE_NAME });
+    expect(drawnRows()).toHaveLength(1);
+    expect(rowLabelled(SECOND_PAGE_CALL.name)).toBeTruthy();
+    expect(
+      screen.getByText(`${formatCount(1)} calls · loaded ${formatCount(2)} of ${formatCount(2)}`),
+    ).toBeTruthy();
+    expect(screen.queryByText(UNDRAWN_PAGES_TITLE)).toBeNull();
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+  });
+
+  it('reports a failed next page behind pages with nothing drawable as that page, with a retry', async () => {
+    const stub = recordingProvider((_query, call) =>
+      call === 1
+        ? Promise.resolve<DataQueryResponse>({
+            source: 'spans',
+            data: [RENDER_EVENT],
+            total: 2,
+            nextOffset: 1,
+          })
+        : Promise.reject(
+            new DebuggenError('TRANSPORT_DISCONNECTED', 'The channel to the service is closed.'),
+          ),
+    );
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await user.click(await screen.findByRole('button', { name: LOAD_MORE_NAME }));
+
+    // The NEXT page failed: that is what the alert says, beside the statement
+    // of what was already searched — not the full-view "could not be loaded".
+    const alert = await screen.findByRole('alert');
+    expect(alert.closest('.dg-waterfall__error')).not.toBeNull();
+    expect(alert.textContent).toContain('The next page of captured calls could not be loaded.');
+    expect(alert.textContent).toContain('TRANSPORT_DISCONNECTED');
+    expect(screen.queryByText('The captured calls could not be loaded.')).toBeNull();
+    expect(screen.getByText(UNDRAWN_PAGES_TITLE)).toBeTruthy();
+    expect(screen.queryByText(EMPTY_MESSAGE)).toBeNull();
+
+    // The retry re-asks for the page that failed, at the offset it failed at.
+    await user.click(within(alert).getByRole('button', { name: RETRY_NAME }));
+    expect(stub.resolve).toHaveBeenCalledTimes(3);
+    expect(queryOfCall(stub, 3)).toEqual(queryOfCall(stub, 2));
+    expect(queryOfCall(stub, 3).offset).toBe(1);
+  });
+
+  it('asks for nothing, and offers no next page, when the kind filter selects no kind it draws', () => {
+    const stub = resolvingProvider([RENDER_EVENT], { total: 1, nextOffset: 1 });
+
+    renderComponent(
+      makeNode({ query: { source: 'spans', filter: { kinds: ['render', 'interaction'] } } }),
+      { provider: stub.provider, actions: makeActions().actions },
+    );
+
+    // Why nothing is drawn, and which kinds this view would draw.
+    const title = screen.getByText(DISJOINT_FILTER_TITLE);
+    const state = title.closest<HTMLElement>('.dg-waterfall__empty');
+    expect(state).not.toBeNull();
+    expect(state?.textContent ?? '').toContain(
+      "This node's kind filter selects no kind this view draws",
+    );
+    for (const kind of catalogEntryFor('waterfall').telemetryKinds) {
+      expect(state?.textContent ?? '').toContain(formatKindLabel(kind));
+    }
+
+    // No page could ever hold a row, so none was requested and none is offered.
+    expect(stub.resolve).not.toHaveBeenCalled();
+    expect(screen.queryByRole('button')).toBeNull();
+    expect(screen.queryByRole('status')).toBeNull();
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.queryByText(EMPTY_MESSAGE)).toBeNull();
+  });
+
+  it('keeps "Load more" on screen, disabled and busy, while the next page behind drawn rows is in flight', async () => {
+    // The counterpart of the first case, with rows already drawn: `useQuery`
+    // reports no `nextOffset` while a page loads, and a footer that keyed the
+    // control on `nextOffset` alone would withdraw it mid-request.
+    let settleSecondPage: (response: DataQueryResponse) => void = () => undefined;
+    const secondPage = new Promise<DataQueryResponse>((resolve) => {
+      settleSecondPage = resolve;
+    });
+    const stub = recordingProvider((_query, call) =>
+      call === 1
+        ? Promise.resolve<DataQueryResponse>({
+            source: 'spans',
+            data: [LONE_PAGE_CALL],
+            total: 2,
+            nextOffset: 1,
+          })
+        : secondPage,
+    );
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await user.click(await screen.findByRole('button', { name: LOAD_MORE_NAME }));
+    expect(queryOfCall(stub, 2)).toEqual({ source: 'spans', offset: 1 });
+
+    // The page in flight is the NEXT one: the drawn call stays, and the control
+    // stays too — disabled, and saying why.
+    const busy = await screen.findByRole('button', { name: LOADING_MORE_NAME });
+    expect(busy.hasAttribute('disabled')).toBe(true);
+    expect(busy.closest('.dg-waterfall__footer')).not.toBeNull();
+    expect(rowLabelled(LONE_PAGE_CALL.name)).toBeTruthy();
+    expect(screen.queryByText('Loading captured calls')).toBeNull();
+
+    await act(async () => {
+      settleSecondPage({ source: 'spans', data: [SECOND_PAGE_CALL], total: 2 });
+      await Promise.resolve();
+    });
+
+    // Both pages drawn, the result searched to its end, and no control left.
+    await waitFor(() => {
+      expect(drawnRows()).toHaveLength(2);
+    });
+    expect(screen.queryByRole('button', { name: LOADING_MORE_NAME })).toBeNull();
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Which page sequence the accumulated pages belong to
+ *
+ * "Load more" keeps earlier pages in state and advances the offset. Those
+ * pages belong to ONE sequence — this session, this query as authored, the
+ * offset it starts from included — and the cases below re-render the SAME
+ * mounted view with that sequence changed, which is how a host swaps a
+ * regenerated panel in or reopens another session in the same view. The pages
+ * carried from the old sequence must be dropped and the request must return to
+ * the authored base offset; the advanced offset is where the OLD sequence had
+ * got to, and means nothing in the new one.
+ * ---------------------------------------------------------------------------
+ */
+
+/** A second fixture session, for the case that switches the panel to it. */
+const OTHER_SESSION_ID = 'session-example-0002';
+
+describe('Waterfall page identity', () => {
+  it('starts over at a newly authored offset and draws nothing the previous slice accumulated', async () => {
+    const firstSliceCall = makeEvent({
+      id: eventIdFor(101),
+      spanId: spanIdFor(101),
+      name: 'example.first-slice-call',
+      startTime: BASE_START_MS,
+      duration: 50,
+    });
+    const firstSliceNextCall = makeEvent({
+      id: eventIdFor(102),
+      spanId: spanIdFor(102),
+      name: 'example.first-slice-next-call',
+      startTime: BASE_START_MS + 100,
+      duration: 40,
+    });
+    const laterSliceCall = makeEvent({
+      id: eventIdFor(103),
+      spanId: spanIdFor(103),
+      name: 'example.later-slice-call',
+      startTime: BASE_START_MS + 300,
+      duration: 30,
+    });
+    const stub = slicingProvider((_sessionId, offset) => {
+      switch (offset) {
+        case 0:
+          return { data: [firstSliceCall], total: 60, nextOffset: 1 };
+        case 1:
+          return { data: [firstSliceNextCall], total: 60, nextOffset: 2 };
+        case 40:
+          return { data: [laterSliceCall], total: 60, nextOffset: 41 };
+        default:
+          return undefined;
+      }
+    });
+    const context: HostContext = { provider: stub.provider, actions: makeActions().actions };
+    const user = userEvent.setup();
+
+    const view = renderComponent(makeNode({ query: { source: 'spans', offset: 0 } }), context);
+
+    await screen.findByText(firstSliceCall.name);
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+    await screen.findByText(firstSliceNextCall.name);
+    expect(drawnRows()).toHaveLength(2);
+    expect(queryOfCall(stub, 2).offset).toBe(1);
+
+    // The same node, with a query identical in every respect but the offset it
+    // was authored to start from: another slice of the result.
+    rerenderComponent(view, makeNode({ query: { source: 'spans', offset: 40 } }), context);
+
+    await screen.findByText(laterSliceCall.name);
+    expect(stub.resolve).toHaveBeenCalledTimes(3);
+    expect(queryOfCall(stub, 3)).toEqual({ source: 'spans', offset: 40 });
+
+    // Nothing the first slice accumulated is drawn or counted.
+    expect(drawnRows()).toHaveLength(1);
+    expect(screen.queryByText(firstSliceCall.name)).toBeNull();
+    expect(screen.queryByText(firstSliceNextCall.name)).toBeNull();
+    expect(
+      screen.getByText(`${formatCount(1)} calls · loaded ${formatCount(1)} of ${formatCount(60)}`),
+    ).toBeTruthy();
+  });
+
+  it('starts over at the authored offset in a new session and draws nothing the earlier session answered', async () => {
+    const earlierSessionCall = makeEvent({
+      id: eventIdFor(111),
+      spanId: spanIdFor(111),
+      name: 'example.earlier-session-call',
+      startTime: BASE_START_MS,
+      duration: 50,
+    });
+    const earlierSessionNextCall = makeEvent({
+      id: eventIdFor(112),
+      spanId: spanIdFor(112),
+      name: 'example.earlier-session-next-call',
+      startTime: BASE_START_MS + 100,
+      duration: 40,
+    });
+    const laterSessionCall = makeEvent({
+      id: eventIdFor(113),
+      spanId: spanIdFor(113),
+      name: 'example.later-session-call',
+      startTime: BASE_START_MS + 300,
+      duration: 30,
+    });
+    const stub = slicingProvider((sessionId, offset) => {
+      if (sessionId === SESSION_ID && offset === 0) {
+        return { data: [earlierSessionCall], total: 20, nextOffset: 1 };
+      }
+      if (sessionId === SESSION_ID && offset === 1) {
+        return { data: [earlierSessionNextCall], total: 20, nextOffset: 2 };
+      }
+      if (sessionId === OTHER_SESSION_ID && offset === 0) {
+        return { data: [laterSessionCall], total: 5, nextOffset: 1 };
+      }
+      return undefined;
+    });
+    const actions = makeActions().actions;
+    const node = makeNode();
+    const user = userEvent.setup();
+
+    const view = renderComponent(node, { provider: stub.provider, actions });
+
+    await screen.findByText(earlierSessionCall.name);
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+    await screen.findByText(earlierSessionNextCall.name);
+    expect(queryOfCall(stub, 2).offset).toBe(1);
+
+    // The very same node, drawn for another session.
+    rerenderComponent(view, node, {
+      provider: stub.provider,
+      actions,
+      sessionId: OTHER_SESSION_ID,
+    });
+
+    await screen.findByText(laterSessionCall.name);
+    expect(stub.resolve).toHaveBeenCalledTimes(3);
+    expect(stub.resolve.mock.calls[2]?.[1].sessionId).toBe(OTHER_SESSION_ID);
+    expect(queryOfCall(stub, 3).offset).toBe(DATA_QUERY_DEFAULT_OFFSET);
+
+    // The earlier session's evidence is gone from the rows and the count.
+    expect(drawnRows()).toHaveLength(1);
+    expect(screen.queryByText(earlierSessionCall.name)).toBeNull();
+    expect(screen.queryByText(earlierSessionNextCall.name)).toBeNull();
+    expect(
+      screen.getByText(`${formatCount(1)} calls · loaded ${formatCount(1)} of ${formatCount(5)}`),
+    ).toBeTruthy();
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
  * The tree as one composite widget
  *
  * A `role="tree"` is ONE stop in the page's Tab order (a roving tab index):
@@ -1899,9 +2599,10 @@ describe('Waterfall description for the keyboard', () => {
  *
  * A call the correlator re-attached to the top level because the parent it
  * named could not be resolved is evidence, drawn and FLAGGED — never dropped and
- * never disguised as an ordinary top-level row (AAP 0.4.2). The tree path takes
- * the verdict from the node; the flat path from the flag the service persisted
- * on the record, which a parent present in the page proves stale.
+ * never disguised as an ordinary top-level row (AAP 0.4.2). The verdict is the
+ * flag the service persisted on the flat record, which a parent present in the
+ * page proves stale. The correlated `trace` tree is not a source this node type
+ * reads (its catalog entry excludes it), so no case here draws one.
  * ---------------------------------------------------------------------------
  */
 
@@ -1910,65 +2611,6 @@ const REATTACHED_BADGE = 'Re-attached';
 
 /** The phrase every re-attached row's description starts its sentence with. */
 const REATTACHED_PHRASE = 're-attached to the top level';
-
-/**
- * One node of a correlated tree, shaped as the correlator shapes one: the two
- * orphan keys exist only on an orphan, and no parent pointer exists at all.
- *
- * @param event The record the node stands for.
- * @param depth Its distance from the trace root.
- * @param children The nodes it caused, in canonical order.
- * @param orphan The correlator's verdict, for a re-attached node.
- * @returns The node.
- */
-function traceNodeOf(
-  event: TelemetryEvent,
-  depth: number,
-  children: readonly TraceNode[],
-  orphan?: { readonly reason: OrphanReason; readonly missingParentSpanId: string },
-): TraceNode {
-  return {
-    event,
-    children,
-    depth,
-    orphaned: orphan !== undefined,
-    ...(orphan === undefined
-      ? {}
-      : { orphanReason: orphan.reason, missingParentSpanId: orphan.missingParentSpanId }),
-  };
-}
-
-/**
- * A correlated tree over `events`, with the aggregates computed from them the
- * way the builder derives them.
- *
- * @param roots The root nodes, in canonical order.
- * @param events Every record the nodes hold.
- * @returns The tree.
- */
-function traceTreeOf(roots: readonly TraceNode[], events: readonly TelemetryEvent[]): TraceTree {
-  const startTime = Math.min(...events.map((event) => event.startTime));
-  const endTime = Math.max(...events.map((event) => event.startTime + event.duration));
-  const orphanCount = roots.filter((root) => root.orphaned).length;
-  return {
-    traceId: TRACE_ID,
-    roots,
-    nodeCount: events.length,
-    maxDepth: 2,
-    startTime,
-    endTime,
-    totalDuration: endTime - startTime,
-    orphanCount,
-    tiers: ['browser', 'server', 'db'],
-    kinds: ['fetch', 'http.server', 'db.query', 'http.client', 'function'],
-    producerIds: [PRODUCER_ID],
-    duplicateSpanIds: [],
-    truncated: false,
-  };
-}
-
-/** The node a trace-backed case draws, and the provider answering it. */
-const TRACE_NODE = makeNode({ query: { source: 'trace' } });
 
 /** Whether a row carries the re-attached flag in all three of its forms. */
 function isFlaggedReattached(row: HTMLElement): boolean {
@@ -1986,140 +2628,6 @@ function isFlaggedReattached(row: HTMLElement): boolean {
 }
 
 describe('Waterfall re-attached calls', () => {
-  it('flags a re-attached tree node, and the call lifted through an undrawn one, and nothing nested beneath', async () => {
-    const orphanServer = makeEvent({
-      id: eventIdFor(61),
-      spanId: spanIdFor(61),
-      parentSpanId: spanIdFor(60),
-      kind: 'http.server',
-      tier: 'server',
-      name: 'example.orphan-server',
-      startTime: BASE_START_MS,
-      duration: 200,
-    });
-    const orphanServerQuery = makeEvent({
-      id: eventIdFor(62),
-      spanId: spanIdFor(62),
-      parentSpanId: spanIdFor(61),
-      kind: 'db.query',
-      tier: 'db',
-      name: 'example.orphan-server-statement',
-      startTime: BASE_START_MS + 10,
-      duration: 50,
-    });
-    // A function span — a kind this view does not draw — that the correlator
-    // re-attached, with a drawn call beneath it and a statement beneath that.
-    const bridge = makeEvent({
-      id: eventIdFor(63),
-      spanId: spanIdFor(63),
-      parentSpanId: spanIdFor(64),
-      kind: 'function',
-      tier: 'server',
-      name: 'example.undrawn-step',
-      startTime: BASE_START_MS + 300,
-      duration: 300,
-    });
-    const lifted = makeEvent({
-      id: eventIdFor(65),
-      spanId: spanIdFor(65),
-      parentSpanId: spanIdFor(63),
-      kind: 'http.client',
-      tier: 'server',
-      name: 'example.lifted-outgoing',
-      startTime: BASE_START_MS + 310,
-      duration: 100,
-    });
-    const liftedQuery = makeEvent({
-      id: eventIdFor(66),
-      spanId: spanIdFor(66),
-      parentSpanId: spanIdFor(65),
-      kind: 'db.query',
-      tier: 'db',
-      name: 'example.lifted-statement',
-      startTime: BASE_START_MS + 320,
-      duration: 40,
-    });
-    const selfParented = makeEvent({
-      id: eventIdFor(68),
-      spanId: spanIdFor(68),
-      parentSpanId: spanIdFor(68),
-      kind: 'fetch',
-      tier: 'browser',
-      name: 'example.self-parented',
-      startTime: BASE_START_MS + 500,
-      duration: 20,
-    });
-    const placed = makeEvent({
-      id: eventIdFor(67),
-      spanId: spanIdFor(67),
-      kind: 'fetch',
-      tier: 'browser',
-      name: 'example.placed-call',
-      startTime: BASE_START_MS + 700,
-      duration: 20,
-    });
-    const tree = traceTreeOf(
-      [
-        traceNodeOf(orphanServer, 0, [traceNodeOf(orphanServerQuery, 1, [])], {
-          reason: 'missing-parent',
-          missingParentSpanId: spanIdFor(60),
-        }),
-        traceNodeOf(bridge, 0, [traceNodeOf(lifted, 1, [traceNodeOf(liftedQuery, 2, [])])], {
-          reason: 'missing-parent',
-          missingParentSpanId: spanIdFor(64),
-        }),
-        traceNodeOf(selfParented, 0, [], {
-          reason: 'self-parent',
-          missingParentSpanId: spanIdFor(68),
-        }),
-        traceNodeOf(placed, 0, []),
-      ],
-      [orphanServer, orphanServerQuery, bridge, lifted, liftedQuery, selfParented, placed],
-    );
-    const stub = recordingProvider(() => Promise.resolve({ source: 'trace', data: tree }));
-    const user = userEvent.setup();
-
-    renderComponent(TRACE_NODE, { provider: stub.provider, actions: makeActions().actions });
-
-    await screen.findByRole('tree', { name: TREE_NAME });
-    expect(drawnRows()).toHaveLength(4);
-
-    // Its own verdict: the reason and the parent that never arrived.
-    const orphanRow = rowLabelled(orphanServer.name);
-    expect(isFlaggedReattached(orphanRow)).toBe(true);
-    expect(orphanRow.getAttribute('aria-label') ?? '').toContain(
-      `${REATTACHED_PHRASE} (missing-parent): the parent ${spanIdFor(60)} of this call never arrived`,
-    );
-
-    // Lifted to the top level through the undrawn re-attached step, so it
-    // carries that step's verdict — stated as the enclosing call's.
-    const liftedRow = rowLabelled(lifted.name);
-    expect(isFlaggedReattached(liftedRow)).toBe(true);
-    expect(liftedRow.getAttribute('aria-label') ?? '').toContain(
-      `${REATTACHED_PHRASE} with an enclosing call not drawn here (missing-parent): the parent ${spanIdFor(64)} of that call never arrived`,
-    );
-    expect(screen.queryByText(bridge.name)).toBeNull();
-
-    // A malformed link is named as what it was, not as a parent that is late.
-    const selfRow = rowLabelled(selfParented.name);
-    expect(isFlaggedReattached(selfRow)).toBe(true);
-    expect(selfRow.getAttribute('aria-label') ?? '').toContain(
-      `${REATTACHED_PHRASE} (self-parent): this call names itself as its parent`,
-    );
-
-    // A node the correlator placed is an ordinary row.
-    expect(isFlaggedReattached(rowLabelled(placed.name))).toBe(false);
-
-    // And the verdict stops at the first drawn row: what ran inside a
-    // re-attached call is placed correctly relative to it.
-    await user.click(
-      within(rowLabelled(orphanServer.name)).getByRole('button', { name: EXPAND_NAME }),
-    );
-    expect(isFlaggedReattached(rowLabelled(orphanServerQuery.name))).toBe(false);
-    await user.click(within(rowLabelled(lifted.name)).getByRole('button', { name: EXPAND_NAME }));
-    expect(isFlaggedReattached(rowLabelled(liftedQuery.name))).toBe(false);
-  });
-
   it('flags a flat record from its persisted flag, and ignores a flag its loaded parent proves stale', async () => {
     const ownFlag = makeEvent({
       id: eventIdFor(71),
@@ -2390,5 +2898,333 @@ describe('Waterfall failure and state styling', () => {
     expect(orphan.start).toBeLessThan(selected.start);
     expect(failed.start).toBeLessThan(selected.start);
     expect(selected.body).toContain('border-inline-start-color: var(--dg-accent);');
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Calls still in flight when the capture ended
+ *
+ * A request that had started and not settled when the capture ended arrives as
+ * an in-flight snapshot: a `requests` occurrence marked `pending` (counted by
+ * its group's `pendingCount`), or a flat `fetch`/`xhr` record carrying the
+ * boolean `inFlight` marker. Its duration is how long it had been outstanding —
+ * a LOWER BOUND — and no response had arrived. Drawing it as a request that
+ * "took" that long, with a status or a transfer figure, would present an
+ * unfinished call as a completed one.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The badge word a pending row shows — the one the request table uses too. */
+const PENDING_BADGE = 'Pending';
+
+/** The whole text of a Pending badge: the word, and a count on a group row. */
+const PENDING_BADGE_TEXT = /^Pending(?: \d+)?$/;
+
+/** The words a pending row prints before its duration. */
+const LOWER_BOUND_WORDS = 'at least';
+
+/** What a pending single call's description says about the missing response. */
+const IN_FLIGHT_SENTENCE = 'still in flight when the capture ended; no response had arrived';
+
+/** The redacted URL of the grouped request the pending cases draw. */
+const PENDING_URL = 'http://127.0.0.1:3000/example/outstanding?cursor=?';
+
+/** Its path, as the request aggregate derives it. */
+const PENDING_PATH = '/example/outstanding';
+
+/**
+ * One settled occurrence of a grouped request, typed against the aggregate's
+ * own `RequestOccurrence`: a status code, an `ok` status and a transfer figure.
+ *
+ * @param ordinal The ordinal its ids derive from.
+ * @param startOffsetMs Its start, relative to the fixture base time.
+ * @param durationMs How long it took.
+ * @returns A fresh occurrence.
+ */
+function settledOccurrence(
+  ordinal: number,
+  startOffsetMs: number,
+  durationMs: number,
+): RequestOccurrence {
+  const startTime = BASE_START_MS + startOffsetMs;
+  return {
+    id: eventIdFor(ordinal),
+    eventId: eventIdFor(ordinal),
+    spanId: spanIdFor(ordinal),
+    traceId: TRACE_ID,
+    startTime,
+    durationMs,
+    endTime: startTime + durationMs,
+    statusCode: 200,
+    status: 'ok',
+    transferredBytes: TRANSFERRED_BYTES,
+    transferSource: 'request',
+    tier: 'browser',
+    kind: 'fetch',
+  };
+}
+
+/**
+ * One pending occurrence, exactly as the aggregate publishes an in-flight
+ * snapshot: `pending: true`, span status `unset`, and neither a status code nor
+ * a transfer figure, because no response had arrived.
+ *
+ * @param ordinal The ordinal its ids derive from.
+ * @param startOffsetMs Its start, relative to the fixture base time.
+ * @param durationMs How long it had been outstanding when observed.
+ * @returns A fresh occurrence.
+ */
+function pendingOccurrence(
+  ordinal: number,
+  startOffsetMs: number,
+  durationMs: number,
+): RequestOccurrence {
+  const startTime = BASE_START_MS + startOffsetMs;
+  return {
+    id: eventIdFor(ordinal),
+    eventId: eventIdFor(ordinal),
+    spanId: spanIdFor(ordinal),
+    traceId: TRACE_ID,
+    startTime,
+    durationMs,
+    endTime: startTime + durationMs,
+    status: 'unset',
+    pending: true,
+    tier: 'browser',
+    kind: 'fetch',
+  };
+}
+
+/**
+ * A `method-path` group over `occurrences`, with the figures the aggregate
+ * derives from them: durations over every occurrence, status codes and the
+ * transfer sum over the settled ones only, and `pendingCount` present only
+ * when at least one occurrence is pending.
+ *
+ * @param occurrences The group's occurrences, in canonical order.
+ * @returns A fresh group.
+ */
+function makeRequestGroup(occurrences: readonly RequestOccurrence[]): RequestGroup {
+  const durations = occurrences.map((occurrence) => occurrence.durationMs);
+  const starts = occurrences.map((occurrence) => occurrence.startTime);
+  const settled = occurrences.filter((occurrence) => occurrence.pending !== true);
+  const pendingCount = occurrences.length - settled.length;
+  const statusCodes = [
+    ...new Set(settled.flatMap((occurrence) => occurrence.statusCode ?? [])),
+  ].sort((left, right) => left - right);
+  const transfers = settled.flatMap((occurrence) => occurrence.transferredBytes ?? []);
+  const totalDurationMs = durations.reduce((sum, duration) => sum + duration, 0);
+  return {
+    id: 'request-group-example-0101',
+    groupedBy: 'method-path',
+    method: 'GET',
+    url: PENDING_URL,
+    path: PENDING_PATH,
+    count: occurrences.length,
+    duplicateCount: 0,
+    hasDuplicates: false,
+    duplicateWindows: [],
+    firstStartTime: Math.min(...starts),
+    lastStartTime: Math.max(...starts),
+    totalDurationMs,
+    averageDurationMs: Math.round(totalDurationMs / occurrences.length),
+    maxDurationMs: Math.max(...durations),
+    minDurationMs: Math.min(...durations),
+    statusCodes,
+    errorCount: 0,
+    ...(pendingCount > 0 ? { pendingCount } : {}),
+    initiators: [],
+    ...(transfers.length === 0
+      ? {}
+      : { transferredBytes: transfers.reduce((sum, bytes) => sum + bytes, 0) }),
+    occurrences,
+    occurrencesTruncated: false,
+  };
+}
+
+/**
+ * A provider answering every query with one page of grouped requests, for a
+ * node whose query names the `requests` source.
+ *
+ * @param groups The groups of the page.
+ * @returns The stub provider.
+ */
+function groupsProvider(groups: readonly RequestGroup[]): StubProvider {
+  return recordingProvider(() =>
+    Promise.resolve<DataQueryResponse>({ source: 'requests', data: groups, total: groups.length }),
+  );
+}
+
+/** A `waterfall` node reading the grouped request result. */
+const REQUESTS_NODE = makeNode({ query: { source: 'requests' } });
+
+/**
+ * Whether a row states itself as pending in every form it must: the badge
+ * word, the lower-bound words beside the duration it prints, and "took at
+ * least" in its description — or in none of them.
+ *
+ * @param row The row.
+ * @param durationMs The duration the row prints.
+ * @returns Whether the row is drawn as pending.
+ */
+function isDrawnPending(row: HTMLElement, durationMs: number): boolean {
+  const badge = within(row).queryByText(PENDING_BADGE_TEXT);
+  const lowerBound = within(row).queryByText(LOWER_BOUND_WORDS);
+  const description = row.getAttribute('aria-label') ?? '';
+  const described = description.includes(`took ${LOWER_BOUND_WORDS} ${formatDuration(durationMs)}`);
+  // All three or none: a badge over a duration read as complete, or the words
+  // with no state, is the half-signal this view must never emit.
+  expect([lowerBound !== null, described]).toEqual([badge !== null, badge !== null]);
+  if (badge !== null) {
+    expect(badge.classList.contains('dg-badge--info')).toBe(true);
+    expect(badge.classList.contains('dg-badge--outline')).toBe(true);
+    expect(badge.classList.contains('dg-waterfall__status')).toBe(true);
+    // The lower-bound words and the figure share the row's duration cell.
+    const cell = lowerBound?.closest<HTMLElement>('.dg-waterfall__duration');
+    expect(cell?.textContent ?? '').toContain(formatDuration(durationMs));
+    expect(description).not.toContain(`took ${formatDuration(durationMs)}`);
+  } else {
+    expect(description).toContain(`took ${formatDuration(durationMs)}`);
+  }
+  return badge !== null;
+}
+
+describe('Waterfall calls still in flight', () => {
+  it('draws a grouped request still in flight as pending, with no response and a lower-bound duration', async () => {
+    const group = makeRequestGroup([pendingOccurrence(131, 0, 180)]);
+    const stub = groupsProvider([group]);
+
+    renderComponent(REQUESTS_NODE, { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+    expect(soleQuery(stub).source).toBe('requests');
+    expect(drawnRows()).toHaveLength(1);
+
+    const row = rowLabelled(PENDING_URL);
+    expect(isDrawnPending(row, 180)).toBe(true);
+    expect(within(row).getByText(PENDING_BADGE).textContent).toBe(PENDING_BADGE);
+
+    const description = row.getAttribute('aria-label') ?? '';
+    expect(description).toContain(IN_FLIGHT_SENTENCE);
+
+    // No response arrived, so nothing a response would have carried is claimed:
+    // no status code or "Error" chip, no failure state, no status sentence, and
+    // not even an "unavailable" transfer figure.
+    expect(row.querySelectorAll('.dg-waterfall__status')).toHaveLength(1);
+    expect(within(row).queryByText(ERROR_BADGE)).toBeNull();
+    expect(row.classList.contains('dg-is-error')).toBe(false);
+    expect(description).not.toContain('status ');
+    expect(description).not.toContain('transferred');
+  });
+
+  it('flags a group holding a call still in flight, and each of its calls as what it was', async () => {
+    const settled = settledOccurrence(132, 0, 120);
+    const pending = pendingOccurrence(133, 200, 300);
+    const group = makeRequestGroup([settled, pending]);
+    expect(group.pendingCount).toBe(1);
+    const stub = groupsProvider([group]);
+    const user = userEvent.setup();
+
+    renderComponent(REQUESTS_NODE, { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+    expect(drawnRows()).toHaveLength(1);
+
+    // The group row spans both calls — 0 to 500 ms — and since one of them had
+    // not finished, that extent is a lower bound too. One call pending: the
+    // word alone, and the count in the description.
+    const [groupRow] = drawnRows();
+    if (groupRow === undefined) {
+      throw new Error('the group row was not drawn');
+    }
+    expect(isDrawnPending(groupRow, 500)).toBe(true);
+    expect(within(groupRow).getByText(PENDING_BADGE).textContent).toBe(PENDING_BADGE);
+    const groupDescription = groupRow.getAttribute('aria-label') ?? '';
+    expect(groupDescription).toContain('1 call still in flight when the capture ended');
+    expect(groupDescription).toContain(`${formatCount(2)} calls in this group`);
+    // Its outcome is the settled call's, and the settled call's bytes are real.
+    expect(groupRow.classList.contains('dg-is-error')).toBe(false);
+    expect(groupDescription).toContain(`transferred ${formatBytes(TRANSFERRED_BYTES)}`);
+
+    await user.click(within(groupRow).getByRole('button', { name: EXPAND_NAME }));
+    expect(drawnRows()).toHaveLength(3);
+    const [, settledRow, pendingRow] = drawnRows();
+    if (settledRow === undefined || pendingRow === undefined) {
+      throw new Error('the occurrence rows were not drawn');
+    }
+
+    // The settled call completed: its status, and a duration it really took.
+    expect(isDrawnPending(settledRow, 120)).toBe(false);
+    expect(within(settledRow).getByText('200').classList.contains('dg-waterfall__status')).toBe(
+      true,
+    );
+
+    // The pending one did not: no status, a lower bound, and why.
+    expect(isDrawnPending(pendingRow, 300)).toBe(true);
+    expect(within(pendingRow).queryByText('200')).toBeNull();
+    expect(pendingRow.getAttribute('aria-label') ?? '').toContain(IN_FLIGHT_SENTENCE);
+    expect(pendingRow.getAttribute('aria-label') ?? '').not.toContain('transferred');
+  });
+
+  it('reads the in-flight marker on a flat request record, strictly as the boolean', async () => {
+    const inFlightUrl = 'http://127.0.0.1:3000/example/in-flight?page=?';
+    const settledUrl = 'http://127.0.0.1:3000/example/settled?page=?';
+    // A snapshot carrying the marker — and, as a producer must not but a bag
+    // might, a status code, a transfer size and an error status: none of them
+    // describes a response, because none had arrived.
+    const inFlight = makeEvent({
+      id: eventIdFor(141),
+      spanId: spanIdFor(141),
+      kind: 'fetch',
+      tier: 'browser',
+      name: 'example.in-flight-call',
+      startTime: BASE_START_MS,
+      duration: 250,
+      status: 'error',
+      attributes: {
+        'http.method': 'GET',
+        url: inFlightUrl,
+        'http.status_code': 200,
+        transferSize: TRANSFERRED_BYTES,
+        inFlight: true,
+      },
+    });
+    // The string form is NOT the marker: this request settled.
+    const settledCall = makeEvent({
+      id: eventIdFor(142),
+      spanId: spanIdFor(142),
+      kind: 'xhr',
+      tier: 'browser',
+      name: 'example.settled-call',
+      startTime: BASE_START_MS + 300,
+      duration: 70,
+      attributes: {
+        'http.method': 'GET',
+        url: settledUrl,
+        'http.status_code': 200,
+        inFlight: 'true',
+      },
+    });
+    const stub = resolvingProvider([inFlight, settledCall]);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+
+    const inFlightRow = rowLabelled(inFlightUrl);
+    expect(isDrawnPending(inFlightRow, 250)).toBe(true);
+    const inFlightDescription = inFlightRow.getAttribute('aria-label') ?? '';
+    expect(inFlightDescription).toContain(IN_FLIGHT_SENTENCE);
+    expect(within(inFlightRow).queryByText('200')).toBeNull();
+    expect(within(inFlightRow).queryByText(ERROR_BADGE)).toBeNull();
+    expect(inFlightRow.classList.contains('dg-is-error')).toBe(false);
+    expect(inFlightDescription).not.toContain('status ');
+    expect(inFlightDescription).not.toContain('transferred');
+
+    const settledRow = rowLabelled(settledUrl);
+    expect(isDrawnPending(settledRow, 70)).toBe(false);
+    expect(within(settledRow).getByText('200')).toBeTruthy();
+    expect(settledRow.getAttribute('aria-label') ?? '').toContain('status 200');
   });
 });

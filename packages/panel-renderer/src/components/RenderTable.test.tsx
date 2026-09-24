@@ -46,8 +46,11 @@
  *     exactly the provider's `nextOffset` with an unchanged `limit` and appends
  *     it, de-duplicated, beneath the rows already loaded — past the 5 000-row
  *     page ceiling too, and never without a `nextOffset`; a page beyond the
- *     contract's ceiling is clamped before it is requested; and a row whose
- *     per-render list the producer truncated says so when it is expanded.
+ *     contract's ceiling is clamped before it is requested; an explicit
+ *     `limit: 0` is sent as zero, never pages and states its count; an empty
+ *     page of a non-empty result says so with its position and total instead
+ *     of claiming an empty capture; and a row whose per-render list the
+ *     producer truncated says so when it is expanded.
  *  5. **The interaction contract**: the very `SourceLocation` a row carries
  *     reaches `onOpenSource` field for field; an individual render selects
  *     itself through `onSelectEvent`; and an **aggregate row selects nothing**,
@@ -1812,6 +1815,252 @@ describe('RenderTable paging', () => {
   });
 });
 
+describe('RenderTable page size', () => {
+  /*
+   * The page size every request carries: an omitted limit takes the published
+   * default, an explicit zero stays zero — the schema's count-only request, never
+   * raised to one row — and anything else is floored to whole rows and capped at
+   * the per-request ceiling. The provider answers a zero-limit query with no
+   * rows, as the contract requires, so every case settles on the state its
+   * request produces.
+   */
+
+  /** One case: its description, the node's authored limit and the limit sent. */
+  type PageSizeCase = readonly [description: string, authored: number | undefined, sent: number];
+
+  const PAGE_SIZE_CASES: readonly PageSizeCase[] = [
+    [
+      'sends the published default when the node authored no limit',
+      undefined,
+      DATA_QUERY_DEFAULT_LIMIT,
+    ],
+    ['sends an explicit zero limit as zero rather than one row', 0, 0],
+    ['floors a fractional limit to whole rows', 2.9, 2],
+    ['caps a limit above the ceiling at the published maximum', 9_000, DATA_QUERY_MAX_LIMIT],
+  ];
+
+  it.each(PAGE_SIZE_CASES)('%s', async (_description, authored, sent) => {
+    const stub = recordingProvider((query) =>
+      Promise.resolve<DataQueryResponse>({
+        source: 'renders',
+        data: query.limit === 0 ? [] : [WIDGET_ROW],
+        total: 1,
+      }),
+    );
+
+    renderComponent(
+      makeNode({
+        query: {
+          source: 'renders',
+          sort: MOST_RENDERS_FIRST,
+          ...(authored === undefined ? {} : { limit: authored }),
+        },
+      }),
+      { provider: stub.provider, actions: makeActions().actions },
+    );
+
+    await waitFor(() => {
+      expect(screen.queryByRole('status')).toBeNull();
+    });
+
+    expect(soleQuery(stub).limit).toBe(sent);
+  });
+
+  it('never pages a count-only query, even when the provider echoes the offset it was asked at', async () => {
+    // A zero-limit page holds no rows by request, and a service that computes
+    // `nextOffset` as `offset + limit` answers with the offset it was given. A
+    // control following it would re-request the same empty page forever.
+    const stub = resolvingProvider([], { total: 42, nextOffset: DATA_QUERY_DEFAULT_OFFSET });
+
+    renderComponent(
+      makeNode({ query: { source: 'renders', sort: MOST_RENDERS_FIRST, limit: 0 } }),
+      { provider: stub.provider, actions: makeActions().actions },
+    );
+
+    // The count the query asked for, stated as a count — not as a capture that
+    // observed no renders.
+    await screen.findByText(
+      `This view requests a count without rows: ${formatCount(42)} components matched its query.`,
+    );
+    expect(screen.queryByText(EMPTY_MESSAGE)).toBeNull();
+
+    expect(soleQuery(stub).limit).toBe(0);
+    expect(screen.queryByRole('button', { name: /^Load/ })).toBeNull();
+    expect(screen.queryByRole('grid')).toBeNull();
+    expect(stub.resolve).toHaveBeenCalledTimes(1);
+  });
+
+  it('never pages a count-only query, even when the provider names a later offset', async () => {
+    // Every page of a count-only sequence repeats the same count, so a forward
+    // `nextOffset` still leads nowhere a zero-row request could show.
+    const stub = resolvingProvider([], { total: 42, nextOffset: 10 });
+
+    renderComponent(
+      makeNode({ query: { source: 'renders', sort: MOST_RENDERS_FIRST, limit: 0 } }),
+      { provider: stub.provider, actions: makeActions().actions },
+    );
+
+    await screen.findByText(
+      `This view requests a count without rows: ${formatCount(42)} components matched its query.`,
+    );
+
+    expect(soleQuery(stub).limit).toBe(0);
+    expect(screen.queryByRole('button', { name: /^Load/ })).toBeNull();
+    expect(stub.resolve).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('RenderTable empty results', () => {
+  /*
+   * An empty page is not an empty capture. The "nothing was captured" sentence
+   * is pinned to a result the provider counted as empty, or left uncounted at
+   * position zero. A count-only query, a page at or past the end of a counted
+   * result, an empty page below a positive total and a later page with no total
+   * each get their own sentence, stating the total that is known. Figures go
+   * through the package's own `formatCount`, so no digit grouping is restated.
+   */
+
+  /** The first line of a count-only state. */
+  const COUNT_ONLY_TITLE = 'Count only';
+
+  /** The first line of an empty page of a result that is not known to be empty. */
+  const EMPTY_PAGE_TITLE = 'Nothing on this page';
+
+  /** One empty answer: what the node asked for, what the provider reported, what is said. */
+  interface EmptyCase {
+    /** The case's name. */
+    readonly description: string;
+
+    /** The node's authored limit, when it authored one. */
+    readonly limit?: number | undefined;
+
+    /** The node's authored offset, when it authored one. */
+    readonly offset?: number | undefined;
+
+    /** The provider's reported total, when it reported one. */
+    readonly total?: number | undefined;
+
+    /** The provider's reported next offset, when it reported one. */
+    readonly nextOffset?: number | undefined;
+
+    /** The expected first line, or `undefined` when the sentence stands alone. */
+    readonly title: string | undefined;
+
+    /** The expected sentence. */
+    readonly message: string;
+  }
+
+  const EMPTY_CASES: readonly EmptyCase[] = [
+    {
+      description: 'reports the total of a count-only query rather than an empty capture',
+      limit: 0,
+      total: 42,
+      nextOffset: DATA_QUERY_DEFAULT_OFFSET,
+      title: COUNT_ONLY_TITLE,
+      message: `This view requests a count without rows: ${formatCount(42)} components matched its query.`,
+    },
+    {
+      description: 'names a single matching component of a count-only query in the singular',
+      limit: 0,
+      total: 1,
+      title: COUNT_ONLY_TITLE,
+      message: `This view requests a count without rows: ${formatCount(1)} component matched its query.`,
+    },
+    {
+      description: 'says a count-only query reported no total rather than inventing one',
+      limit: 0,
+      title: COUNT_ONLY_TITLE,
+      message: 'This view requests a count without rows, and no total was reported for its query.',
+    },
+    {
+      description: 'keeps the empty-capture sentence for a result counted as empty',
+      total: 0,
+      title: undefined,
+      message: EMPTY_MESSAGE,
+    },
+    {
+      description: 'keeps the empty-capture sentence for a result counted as empty, at any offset',
+      offset: 200,
+      total: 0,
+      title: undefined,
+      message: EMPTY_MESSAGE,
+    },
+    {
+      description: 'says a page past the end of a counted result starts beyond it',
+      offset: 300,
+      total: 120,
+      title: EMPTY_PAGE_TITLE,
+      message: `This page starts at position ${formatCount(301)}, past the end of the ${formatCount(120)} components that matched this query.`,
+    },
+    {
+      description: 'treats a page that starts exactly at the total as past the end',
+      offset: 120,
+      total: 120,
+      title: EMPTY_PAGE_TITLE,
+      message: `This page starts at position ${formatCount(121)}, past the end of the ${formatCount(120)} components that matched this query.`,
+    },
+    {
+      description: 'groups the digits of a large position and total',
+      offset: 12_345,
+      total: 10_000,
+      title: EMPTY_PAGE_TITLE,
+      message: `This page starts at position ${formatCount(12_346)}, past the end of the ${formatCount(10_000)} components that matched this query.`,
+    },
+    {
+      description: 'says components matched when the provider left a page empty below its total',
+      total: 42,
+      nextOffset: DATA_QUERY_DEFAULT_OFFSET,
+      title: EMPTY_PAGE_TITLE,
+      message: `${formatCount(42)} components matched this query, but none are shown on this page.`,
+    },
+    {
+      description: 'describes only the page when a later page is empty and no total was reported',
+      offset: 200,
+      title: EMPTY_PAGE_TITLE,
+      message: `This page starts at position ${formatCount(201)} and holds no components; no total was reported for this query.`,
+    },
+  ];
+
+  it.each(EMPTY_CASES)('$description', async (emptyCase) => {
+    const { limit, offset, total, nextOffset, title, message } = emptyCase;
+    const stub = resolvingProvider([], { total, nextOffset });
+
+    renderComponent(
+      makeNode({
+        query: {
+          source: 'renders',
+          sort: MOST_RENDERS_FIRST,
+          ...(limit === undefined ? {} : { limit }),
+          ...(offset === undefined ? {} : { offset }),
+        },
+      }),
+      { provider: stub.provider, actions: makeActions().actions },
+    );
+
+    // The sentence, in the empty box this component places, under the first
+    // line the case expects — or none.
+    const shown = await screen.findByText(message);
+    expect(shown.classList.contains('dg-empty-state__message')).toBe(true);
+
+    const box = shown.closest('.dg-render-table__empty');
+    expect(box).not.toBeNull();
+    expect(box?.querySelector('.dg-empty-state__title')?.textContent ?? undefined).toBe(title);
+
+    // The empty-capture sentence appears only for the cases that are one.
+    expect(screen.queryAllByText(EMPTY_MESSAGE)).toHaveLength(message === EMPTY_MESSAGE ? 1 : 0);
+
+    // An answer, not a failure or a table, with nothing further to load: one
+    // request, carrying the authored page exactly.
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.queryByRole('grid')).toBeNull();
+    expect(screen.queryByRole('button', { name: /^Load/ })).toBeNull();
+
+    const sent = soleQuery(stub);
+    expect(sent.limit).toBe(limit ?? DATA_QUERY_DEFAULT_LIMIT);
+    expect(sent.offset).toBe(offset);
+  });
+});
+
 describe('RenderTable page sequence', () => {
   /*
    * An offset-aware stub, local to these cases: each request is answered by
@@ -2252,6 +2501,33 @@ describe('RenderTable page sequence', () => {
     expect(requestOf(stub, 2)).toEqual({ ...requestOf(stub, 1), offset: 2 });
     expect(renderedNames()).toEqual([WIDGET_COMPONENT, LIST_COMPONENT]);
     expect(screen.queryByRole('button', { name: ANY_PAGING_CONTROL })).toBeNull();
+  });
+
+  it('describes an empty followed page by the position it was requested at', async () => {
+    // The first page is empty and names a next one; that page is empty too and
+    // names none. The sequence holds no rows, yet the provider counted two, so
+    // the page is described — at the offset it was followed to — and the
+    // capture is never said to be empty.
+    const stub = sequenceProvider((query) =>
+      offsetOf(query) === 0 ? { data: [], total: 2, nextOffset: 2 } : { data: [], total: 2 },
+    );
+    const user = userEvent.setup();
+
+    renderComponent(
+      makeNode({ query: { source: 'renders', sort: MOST_RENDERS_FIRST, limit: 2 } }),
+      { provider: stub.provider, actions: makeActions().actions },
+    );
+
+    await screen.findByText(`Showing ${formatCount(0)} of ${formatCount(2)} components.`);
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+
+    await screen.findByText(
+      `This page starts at position ${formatCount(3)}, past the end of the ${formatCount(2)} components that matched this query.`,
+    );
+    expect(screen.queryByText(EMPTY_MESSAGE)).toBeNull();
+    expect(screen.queryByRole('button', { name: ANY_PAGING_CONTROL })).toBeNull();
+    expect(stub.queries).toHaveLength(2);
+    expect(requestOf(stub, 2)).toEqual({ ...requestOf(stub, 1), offset: 2 });
   });
 
   it('starts over from the authored first page, painting none of the old rows, when the data provider is replaced', async () => {

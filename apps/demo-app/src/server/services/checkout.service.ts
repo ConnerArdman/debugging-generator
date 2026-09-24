@@ -44,12 +44,13 @@
  * failed checkout leaves the cart in is the store's business; what may have
  * been charged is the customer's, and the two are answered separately for
  * exactly that reason. So every failure this module lets through means no
- * amount was captured, and the one situation that cannot promise that - a
- * payment sent without a readable answer, or an approval this module could not
- * write an order against - is reported as `PAYMENT_STATUS_UNKNOWN` through
+ * amount was captured, and the situations that cannot promise that - a payment
+ * sent without a readable answer, an approval this module could not write an
+ * order against, and an earlier attempt that still holds a cart or whose record
+ * could not be read - are reported as `PAYMENT_STATUS_UNKNOWN` through
  * `paymentStatusUnknown`. Nothing else is rewrapped: a declined card, a short
- * line, a withdrawn service and a cart that is not there all reach the caller
- * exactly as they were raised.
+ * line and a withdrawn service all reach the caller exactly as they were
+ * raised.
  *
  * **An attempt can be retried without being repeated.** Placing an order is one
  * request whose reply may be lost on the way back, and a caller that cannot tell
@@ -62,18 +63,22 @@
  * this process the attempt is remembered, so a repeat is answered with the very
  * result of the first, authorization included. Beyond it - a restarted server, a
  * second worker, a name this process has since forgotten - the store's own
- * records answer, because a cart is finished by the order it became and held by
- * the checkout that took it. A submission with nothing to order is where those
- * records are consulted - the session's cart is empty, or is being held - and
- * {@link settled} gives each case its own answer. A cart of this session that
- * became an order is `outcome: 'already_placed'`, whenever it was placed, which
- * is what a repeat finds after the cart it ordered was converted and the
- * storefront opened the next one in its place. A cart still held by an attempt
- * is `PAYMENT_STATUS_UNKNOWN`, because an authorization may stand against it.
- * A session that has checked nothing out is a customer with an empty cart and
- * is told exactly that. So the safe answer does not depend on which process
- * receives the submission or on how long ago the attempt ran, and the cart's own
- * conversion is what makes a second order impossible regardless.
+ * records answer, because the claim that takes a cart writes the attempt's name
+ * on it and the name stays there when the cart becomes an order. So an attempt
+ * this process is not already holding asks the records about its own name first,
+ * before the session's cart is read, and {@link recall} gives each thing they
+ * can say its own answer. A name whose cart became an order is
+ * `outcome: 'already_placed'` with that order, whenever it was placed and
+ * whatever the session's cart holds now. A name whose cart is still held, or
+ * whose order cannot be found, is `PAYMENT_STATUS_UNKNOWN`, because an
+ * authorization may stand against it. A name that holds nothing is a new
+ * attempt. What the records say is only ever said about the attempt that name
+ * identifies: a session's empty cart is an empty cart, and a cart some other
+ * attempt is holding is that attempt's unresolved payment - neither is ever
+ * answered with an order some earlier attempt placed. So the answer does not
+ * depend on which process receives the submission, on how long ago the attempt
+ * ran or on what the session has ordered since, and the cart's own conversion
+ * is what makes a second order impossible regardless.
  *
  * **Retrying is safe because the cart decides.** The claim below and the
  * conversion inside the order's transaction are single conditional writes, so of
@@ -99,10 +104,12 @@
  * browser and into a client component.
  *
  * **A failure stays a failure.** The services raise the typed errors of
- * `@/server/errors` - a cart that is not there, stock that cannot be promised,
- * a carrier or a processor that did not answer, figures that no longer
- * reconcile - and every one of them leaves here untouched for the single mapper
- * in that module to classify. Three conditions are this module's own to raise,
+ * `@/server/errors` - stock that cannot be promised, a carrier or a processor
+ * that did not answer, figures that no longer reconcile - and every one of them
+ * leaves here untouched for the single mapper in that module to classify. The
+ * one exception is the cart service reporting that a checkout is holding the
+ * session's cart, which to a customer is an unresolved payment and is answered
+ * as one. Three conditions are this module's own to raise,
  * because only a checkout can see them: a cart with nothing in it, a shipping
  * service that is no longer on offer, and a declined authorization. An order is
  * written only once a payment has been approved for its total, so a caller
@@ -117,6 +124,7 @@ import type {
   CartView,
   CheckoutDraft,
   CheckoutResult,
+  OrderDetail,
   PaymentAuthorization,
   ShippingOption,
   ShippingQuoteResult,
@@ -124,6 +132,7 @@ import type {
 import {
   StorefrontConflictError,
   StorefrontError,
+  StorefrontNotFoundError,
   StorefrontUpstreamError,
   StorefrontValidationError,
   paymentStatusUnknown,
@@ -131,8 +140,8 @@ import {
 
 import { readActiveCart } from './cart.service';
 import { release, reserveStock } from './inventory.service';
-import type { CartOutcome, UnpaidOrderDraft } from './order.service';
-import { checkOrderDraft, claim, readCartOutcome, recordOrder, unclaim } from './order.service';
+import type { UnpaidOrderDraft } from './order.service';
+import { checkOrderDraft, claim, readAttempt, recordOrder, unclaim } from './order.service';
 import { authorize } from './payment.service';
 import { applyPromotions } from './pricing.service';
 import { quote } from './shipping.service';
@@ -173,7 +182,8 @@ const UNSETTLED =
 
 /**
  * What a customer is told when an earlier attempt at this order has not
- * settled: the cart is held by it and no order was written against it.
+ * settled: the cart is held by it and no order was written against it, or the
+ * cart it took became an order this store cannot find.
  *
  * It is what a held cart means, and it is deliberately not an invitation to
  * order again - the attempt holding the cart may carry an authorization, and a
@@ -194,7 +204,7 @@ const UNREADABLE =
  *
  * It bounds what this process holds and nothing else: what the memory answers
  * quickly - the result of the attempt, the failure it ended in - the store's own
- * records answer afterwards through {@link settled}, so an evicted name is
+ * records answer afterwards through {@link recall}, so an evicted name is
  * answered no less safely than a remembered one, just with less detail.
  */
 const REMEMBER = 900_000;
@@ -207,10 +217,13 @@ const CEILING = 200;
  *
  * `running` holds the very promise the first caller is awaiting, so a repeat
  * joins that attempt instead of starting a second one. `placed` holds its
- * result. `unsettled` holds the unresolved-payment failure it ended in, which a
- * repeat is given again rather than being allowed to authorize the same order a
- * second time. A definite failure is remembered as nothing at all: it wrote no
- * order and took no money, so the name is free to be used again.
+ * result. `unsettled` holds the unresolved-payment failure this process's own
+ * attempt ended in, which a repeat is given again rather than being allowed to
+ * authorize the same order a second time. A definite failure is remembered as
+ * nothing at all: it wrote no order and took no money, so the name is free to be
+ * used again. So is an unresolved payment that is the records' answer rather
+ * than this process's outcome - see {@link answers}: the records are asked
+ * again on the next repeat, and may by then say more.
  */
 type Attempt = { readonly at: number } & (
   | { readonly state: 'running'; readonly pending: Promise<CheckoutResult> }
@@ -237,6 +250,24 @@ declare global {
 const attempts: Map<string, Attempt> = globalThis.__lumencheckout ?? new Map<string, Attempt>();
 
 globalThis.__lumencheckout = attempts;
+
+/**
+ * The unresolved-payment failures that report what the store's records say
+ * about an attempt, as opposed to what an attempt this process ran ended in.
+ *
+ * Both reach {@link placeOrder} as `PAYMENT_STATUS_UNKNOWN`, and only the
+ * second is a fact this process established and may repeat: a cart it left held
+ * after sending an amount stays that way until the store settles it by hand. The
+ * first is a reading of rows somebody else may change - the attempt holding the
+ * cart finishes in another worker, the store settles the authorization and
+ * reopens or converts the cart, a database that did not answer answers - so it
+ * is not remembered, and the next repeat reads the records again. Each failure
+ * is marked here as it is raised, by {@link answer}; a set of the failures
+ * themselves rather than a flag on them keeps the error the route handler maps
+ * exactly the one `paymentStatusUnknown` built. Weakly held, because a failure
+ * is of no interest once its request has been answered.
+ */
+const answers = new WeakSet<StorefrontError>();
 
 /**
  * The service the customer chose, as the carrier offers it now.
@@ -309,16 +340,18 @@ function offered(
  * authorization waiting to happen.
  *
  * Holding it is also what makes the answer survive this process. `claim` parked
- * the cart at `ABANDONED` in the database while it still carries the session's
- * open-cart pointer, so `readActiveCart` reports a cart being checked out
- * rather than opening another behind it, and {@link settled} answers the cart
- * that exists and became no order with `PAYMENT_STATUS_UNKNOWN` - from any
+ * the cart at `ABANDONED` in the database, under the attempt's name, while it
+ * still carries the session's open-cart pointer. So a repeat of that name finds
+ * the held cart through {@link recall}, and any other submission finds
+ * `readActiveCart` reporting a cart being checked out rather than opening
+ * another behind it - both answered with `PAYMENT_STATUS_UNKNOWN`, from any
  * process, however long afterwards, and without this module persisting anything
  * of its own. The customer is told the outcome of their payment is unresolved
  * and asked to check their orders rather than place them again, and recovery is
  * the store's: settle the authorization, then reopen or convert the cart by
  * hand. Reopening it is enough to put the session back in business, because the
- * cart never gave the pointer up.
+ * cart never gave the pointer up, and a reopened cart is one the name no longer
+ * holds.
  *
  * Neither step is allowed to become the error reported. A cart that could not
  * be put back is a matter for whoever runs the store, and the reason the
@@ -411,65 +444,116 @@ function again(result: CheckoutResult): CheckoutResult {
 }
 
 /**
- * What the store's own records say about a session with nothing to order, as an
- * answer or as a failure.
+ * An unresolved-payment failure that is the store's records' answer about an
+ * attempt, marked as such in {@link answers}.
+ *
+ * @param message The customer's sentence: {@link HELD} or {@link UNREADABLE}.
+ * @param status `409` where the submission collides with a held attempt, `500`
+ * where the records could not be read.
+ * @param cause What made the records unreadable, or the refusal that reported
+ * the held cart, for the server log.
+ */
+function answer(message: string, status: number, cause?: unknown): StorefrontError {
+  const failure = paymentStatusUnknown(message, { upstream: 'payment', status, cause });
+
+  answers.add(failure);
+
+  return failure;
+}
+
+/**
+ * What the store's own records say the attempt of this name already did, as an
+ * answer, as a failure, or as nothing.
  *
  * This is the durable half of not repeating an attempt, and it is what answers
  * once the process that ran the attempt has forgotten it or was never the
- * process that ran it. It is reached from the two states in which a submission
- * has nothing to place: the session's cart is empty, which is what the cart
- * opened after the last one was ordered looks like, or the cart is being held by
- * a checkout, which is what a cart taken by an attempt looks like from outside
- * it. Either way the last cart this session checked out is the record that
- * decides, and each of the three things it can say has exactly one safe answer:
+ * process that ran it. The name is on the cart the attempt claimed, so the one
+ * record that decides is that cart, and each of the things it can say has
+ * exactly one safe answer:
  *
  * * **It became an order.** That order is the answer, whenever it was placed. A
  *   cutoff here would be a promise that expires without the customer being told,
  *   and the order is no less theirs an hour later.
- * * **It exists and became no order.** An attempt is holding it - running now,
- *   or ended without settling - so an authorization may stand against it and
- *   the outcome is unresolved. It is never reported as a cart that is merely
- *   gone.
- * * **No cart of this session was ever checked out.** The session has nothing to
- *   order, which is what the caller's own failure already said, so that failure
- *   stands.
+ * * **It is held and became no order**, or it became an order that cannot be
+ *   found. An attempt is holding it - running now, or ended without settling -
+ *   so an authorization may stand against it and the outcome is unresolved. It
+ *   is never reported as a cart that is merely gone.
+ * * **The name holds no cart.** The attempt never took one, or took one and put
+ *   it back having spent nothing, so there is nothing to answer with and this
+ *   submission is an attempt like any other.
  *
- * A read that fails is the fourth case and is treated as the third-worst rather
- * than the best: the records could not be consulted, so nothing is ruled out.
+ * A read that fails is the fourth case and is treated as the second rather than
+ * the third: the records could not be consulted, so nothing is ruled out.
  *
  * The authorization is not part of an answer built here: the store keeps the
  * order and the status the payment left it in, not the processor's record of the
  * attempt, and inventing one would be describing a charge this module did not
  * see.
  *
- * @param cause The failure that established this submission has nothing to
- * place: an empty cart, or a cart a checkout is holding.
- * @returns The order that cart became, as an already-placed result.
- * @throws StorefrontError `PAYMENT_STATUS_UNKNOWN` when a cart is being held
- * with no order against it, or when the records could not be read.
- * @throws The caller's own `cause` when no cart of this session was ever
- * checked out.
+ * @param key The attempt's name, as the submission carried it.
+ * @returns The order the name's cart became, as an already-placed result, or
+ * `null` when the name holds no cart of this session.
+ * @throws StorefrontError `PAYMENT_STATUS_UNKNOWN` when the name's cart is held
+ * with no order against it, when its order cannot be found, or when the records
+ * could not be read.
  */
-async function settled(cause: unknown): Promise<CheckoutResult> {
-  let outcome: CartOutcome | null;
+async function recall(key: string): Promise<CheckoutResult | null> {
+  let record: { cart: string; order: OrderDetail | null } | null;
 
   try {
-    outcome = await readCartOutcome(CART_TOKEN);
-  } catch (failure) {
-    throw paymentStatusUnknown(UNREADABLE, { upstream: 'payment', status: 500, cause: failure });
+    record = await readAttempt(CART_TOKEN, key);
+  } catch (cause) {
+    throw answer(UNREADABLE, 500, cause);
   }
 
-  if (outcome === null) {
-    throw cause;
+  if (record === null) {
+    return null;
   }
 
-  if (outcome.order !== null) {
-    return { order: outcome.order, payment: null, outcome: 'already_placed' };
+  if (record.order !== null) {
+    return { order: record.order, payment: null, outcome: 'already_placed' };
   }
 
   // 409: the submission collides with the attempt holding the cart. The code is
   // what carries the meaning to a customer; the status is what this is to HTTP.
-  throw paymentStatusUnknown(HELD, { upstream: 'payment', status: 409 });
+  throw answer(HELD, 409);
+}
+
+/**
+ * Asks the records about this attempt's name once more before a refusal about
+ * the session's cart is given, and answers with what they say instead when the
+ * name has meanwhile taken a cart.
+ *
+ * {@link recall} runs before the cart is read, and the cart can change between
+ * the two - most importantly under a repeat of this very attempt. A submission
+ * whose reply was lost and its repeat can both find the name holding nothing
+ * and both read the same open cart; exactly one of them wins the claim, and the
+ * other would then report "this cart is already being checked out" - a
+ * collision that reads as "nothing was charged" to a caller resolving that
+ * attempt, while the winner, which is that same attempt, goes on to charge for
+ * it and place the order. The same holds for a cart the winner has already
+ * converted, which the storefront replaces with an empty one, and for a cart
+ * the winner is holding, which the cart service reports as held. So every
+ * refusal about the cart is checked against the name first: a name that now
+ * holds a cart is answered from it - its order, or the unresolved payment of
+ * the attempt holding it - and only a name that still holds nothing gets the
+ * refusal, which is then a true statement about this attempt.
+ *
+ * @param key The attempt's name, as the submission carried it.
+ * @param refusal What this submission would otherwise be told about the cart.
+ * @returns The order the name's cart became, as an already-placed result.
+ * @throws StorefrontError `PAYMENT_STATUS_UNKNOWN` when the name's cart is held
+ * with no order against it, or when the records could not be read.
+ * @throws `refusal` when the name still holds no cart of this session.
+ */
+async function recheck(key: string, refusal: unknown): Promise<CheckoutResult> {
+  const later = await recall(key);
+
+  if (later !== null) {
+    return later;
+  }
+
+  throw refusal;
 }
 
 /**
@@ -477,40 +561,58 @@ async function settled(cause: unknown): Promise<CheckoutResult> {
  *
  * Everything an order involves happens here and in the order it is written;
  * {@link placeOrder} is the door in front of it that decides whether an attempt
- * should run at all.
+ * should run at all. The first thing asked is whether this attempt has already
+ * been made - {@link recall} - and only a name that holds nothing goes on to the
+ * session's cart. Every refusal the session's cart leads to - an empty cart, a
+ * held cart, a claim that lost - is put to {@link recheck} before it is given,
+ * so a repeat racing the very attempt it repeats is answered with that
+ * attempt's outcome rather than with a statement that nothing was charged.
  *
  * @param draft The submitted checkout: who is buying, where the goods are
  * going, which shipping service was chosen and whatever the buyer asked the
- * packers to know. All four are handed to `./order.service`, which stores the
- * contact, the destination and the note with the order.
+ * packers to know, under the name of the attempt it belongs to. The first four
+ * are handed to `./order.service`, which stores the contact, the destination and
+ * the note with the order; the name goes on the cart the attempt claims.
  * @param origin The scheme and authority this application is answering on, as
  * the route handler read it from its own request. The carrier and the payment
  * processor are reached against it, so nothing here names a host.
  * @returns The order as it was written - its lines, the service it ships by and
  * the destination and note stored with it - together with the authorization
- * that paid for it.
- * @throws StorefrontValidationError When there is nothing to order and no cart
- * of this session was ever checked out, and when the assembled order is not one
- * the order service can record - the latter refused by `checkOrderDraft` before
- * any amount is sent to the processor, so a submission that cannot become an
- * order is never charged for.
- * @throws StorefrontConflictError When another checkout is already holding the
- * cart, when the cart has already become an order, when the chosen shipping
- * service is not among those now offered to the destination, or when the
- * assembled order's figures do not reconcile with one another - the last of
- * those, like a non-recordable draft, before any amount is sent.
+ * that paid for it, or the order this attempt's name had already placed, as
+ * `outcome: 'already_placed'` with no authorization.
+ * @throws StorefrontValidationError When the session's cart is empty, and when
+ * the assembled order is not one the order service can record - the latter
+ * refused by `checkOrderDraft` before any amount is sent to the processor, so a
+ * submission that cannot become an order is never charged for.
+ * @throws StorefrontConflictError When a checkout under another name took the
+ * cart, or made it an order, between the read and the claim, when the attempt's
+ * name is already on a cart it no longer holds, when the chosen shipping service
+ * is not among those now offered to the destination, or when the assembled
+ * order's figures do not reconcile with one another - the last of those, like a
+ * non-recordable draft, before any amount is sent.
  * @throws StorefrontError `PAYMENT_DECLINED` when the processor declined the
  * authorization. No order is written for a payment nobody approved.
  * @throws StorefrontError `PAYMENT_STATUS_UNKNOWN` when an amount was sent to
  * the processor and its outcome cannot be established, when an approved amount
- * could not be turned into an order, or when the session's cart is held by an
- * attempt that has not settled. It is the only failure from here that does not
- * mean nothing was captured.
+ * could not be turned into an order, when the attempt's name holds a cart with
+ * no order that can be found, when the records of it could not be read, or when
+ * the session's cart is held by an attempt that has not settled. It is the only
+ * failure from here that does not mean nothing was captured.
  * Everything else the services raise - stock that cannot be promised, a carrier
  * that did not answer, figures that no longer reconcile - propagates as it was
  * raised.
  */
 async function attempt(draft: CheckoutDraft, origin: string): Promise<CheckoutResult> {
+  // Asked before the session's cart is read, because a repeat is about the cart
+  // its attempt took and not about the one the session has now: after an order
+  // the storefront opens the next cart, and the customer may already have put
+  // something in it.
+  const earlier = await recall(draft.idempotencyKey);
+
+  if (earlier !== null) {
+    return earlier;
+  }
+
   let cart: CartView;
 
   try {
@@ -518,20 +620,27 @@ async function attempt(draft: CheckoutDraft, origin: string): Promise<CheckoutRe
   } catch (cause) {
     // The cart service opens a cart for a session that has none, so the one
     // state it reports instead of a cart is a cart a checkout is holding - and
-    // an attempt holding a cart may carry an authorization against it. The
-    // records decide what that means for this submission.
-    return settled(cause);
+    // an attempt holding a cart may carry an authorization against it. It is not
+    // this submission's attempt, whose name was asked about above, so it is
+    // answered as the unresolved payment it is and never with an order some
+    // other attempt placed - unless the attempt holding it turns out to be this
+    // one, taken since the name was asked about, which `recheck` settles.
+    // Anything else the read raised is not about an attempt at all and
+    // propagates as it was raised.
+    if (cause instanceof StorefrontNotFoundError) {
+      return recheck(draft.idempotencyKey, answer(HELD, 409, cause));
+    }
+
+    throw cause;
   }
 
   if (cart.lines.length === 0) {
-    // Nothing to order, which is two situations wearing one face. It is an
-    // ordinary empty cart, and it is also exactly what the submission of an
-    // attempt whose reply was lost finds: that attempt's cart became an order
-    // and the storefront opened this empty one in its place. Telling the second
-    // of those "your cart is empty" would hide an order the customer has
-    // already paid for, so the records decide and the plain failure below is
-    // what stands when they show no checkout of this session at all.
-    return settled(
+    // Nothing to order. A repeat of an attempt that placed an order was answered
+    // above from that attempt's own cart, so an empty cart here is exactly what
+    // it looks like, whatever this session ordered before - once `recheck` has
+    // ruled out that this very attempt converted the cart in the meantime.
+    return recheck(
+      draft.idempotencyKey,
       new StorefrontValidationError(
         'There is nothing in your cart to order. Add an item and place the order again.',
       ),
@@ -540,8 +649,16 @@ async function attempt(draft: CheckoutDraft, origin: string): Promise<CheckoutRe
 
   // The cart is taken before anything is spent against it, so a second checkout
   // of the same cart is turned away here rather than at the end - after it too
-  // has held stock, rated a shipment and had an amount approved.
-  await claim(cart.id);
+  // has held stock, rated a shipment and had an amount approved. The attempt's
+  // name is written with the claim, which is what lets a repeat of it be
+  // answered from this cart by any process from here on. A claim that fails is
+  // put to `recheck` before it is reported: the checkout that won the cart may
+  // be this same attempt, and then its outcome is the answer, not a collision.
+  try {
+    await claim(cart.id, draft.idempotencyKey);
+  } catch (cause) {
+    return recheck(draft.idempotencyKey, cause);
+  }
 
   let reference: string | null = null;
   let charged = false;
@@ -672,14 +789,21 @@ async function attempt(draft: CheckoutDraft, origin: string): Promise<CheckoutRe
  * how a caller asks about the attempt it already made rather than making
  * another. A name this process is holding is answered from what it knows: the
  * order the attempt placed, the unresolved payment it left, or - while it is
- * still running - the very result the first caller is waiting for. A name it has
- * never seen runs an attempt of its own.
+ * still running - the very result the first caller is waiting for. A name it is
+ * not holding runs {@link attempt}, which asks the store's records about that
+ * name before it does anything else, so a name this process has never seen is
+ * still answered with what the attempt of that name did elsewhere or earlier.
  *
  * A definite failure is remembered as nothing: it wrote no order and took no
  * money, so the same name may be used to try again once the customer has fixed
- * what was wrong. An unresolved payment is remembered precisely so that it
- * cannot be, because a second attempt at an order that may already carry an
- * authorization is the failure this whole arrangement exists to prevent.
+ * what was wrong. An unresolved payment this process's own attempt ended in is
+ * remembered precisely so that it cannot be, because a second attempt at an
+ * order that may already carry an authorization is the failure this whole
+ * arrangement exists to prevent. An unresolved payment that is the records'
+ * answer - a cart still held, records that could not be read - is not
+ * remembered: it is marked in {@link answers} as it is raised, the records are
+ * what repeat it safely, and the next repeat reads them again and hears
+ * whatever they say by then.
  *
  * @param draft The submitted checkout, including the name of the attempt it
  * belongs to.
@@ -689,8 +813,8 @@ async function attempt(draft: CheckoutDraft, origin: string): Promise<CheckoutRe
  * `outcome: 'placed'`, or the order the attempt had already placed, as
  * `outcome: 'already_placed'`.
  * @throws Whatever the attempt raised - see {@link attempt} - or, for a repeat
- * of an attempt that ended with a payment whose outcome is unresolved, that same
- * failure again.
+ * of an attempt of this process's that ended with a payment whose outcome is
+ * unresolved, that same failure again.
  */
 export async function placeOrder(draft: CheckoutDraft, origin: string): Promise<CheckoutResult> {
   const now = Date.now();
@@ -726,7 +850,13 @@ export async function placeOrder(draft: CheckoutDraft, origin: string): Promise<
 
     return result;
   } catch (cause) {
-    if (cause instanceof StorefrontError && cause.code === 'PAYMENT_STATUS_UNKNOWN') {
+    // Only this process's own unresolved outcome is kept; the records' answer is
+    // asked for again on the next repeat - see `answers`.
+    if (
+      cause instanceof StorefrontError &&
+      cause.code === 'PAYMENT_STATUS_UNKNOWN' &&
+      !answers.has(cause)
+    ) {
       attempts.set(key, { state: 'unsettled', at: Date.now(), failure: cause });
     } else {
       attempts.delete(key);
