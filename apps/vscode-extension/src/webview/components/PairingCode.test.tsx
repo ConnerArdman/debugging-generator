@@ -20,6 +20,17 @@
  * imported explicitly, `cleanup` is registered explicitly, elements are found
  * by role and accessible name, and — with no `jest-dom` here — state is read
  * from DOM properties. The code values are obviously synthetic (AAP 0.5.4).
+ *
+ * The clock is pinned for every test. `beforeEach` fakes `Date` alone and sets
+ * it to {@link PINNED_NOW}, so every `expiresAt` comparison — the component's
+ * and the suite's — reads one fixed epoch-millisecond instant and never the
+ * wall clock. Timers stay real there on purpose: Testing Library's async
+ * wrapper, which every `userEvent` interaction runs through, drains with a
+ * `setTimeout(0)` that only a Jest clock is advanced past, so a `userEvent`
+ * call under Vitest's fake `setTimeout` never settles — even with
+ * `advanceTimers`. Tests that must move time through the component's single
+ * expiry timer call {@link fakeAllTimers}, which keeps the pinned instant and
+ * fakes the timers as well, and they interact through `fireEvent`.
  */
 import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -42,10 +53,28 @@ const RETRY_NAME = 'Try again';
 /** The same local wall-clock rendering the component uses for the expiry. */
 const TIME_FORMAT = new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' });
 
+/** The instant every test runs at, in Unix epoch milliseconds (AAP 0.2.3). */
+const PINNED_NOW = Date.UTC(2030, 0, 1, 12, 0, 0);
+
+beforeEach(() => {
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(PINNED_NOW);
+});
+
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
+  vi.restoreAllMocks();
 });
+
+/**
+ * Fakes the timers as well as `Date`, still at {@link PINNED_NOW}, for a test
+ * that advances time through the component's expiry timer. Interactions in
+ * such a test go through `fireEvent` (see the module note).
+ */
+function fakeAllTimers(): void {
+  vi.useFakeTimers({ now: PINNED_NOW });
+}
 
 /** A button by accessible name, narrowed to its element type. */
 function getButton(name: string): HTMLButtonElement {
@@ -291,7 +320,7 @@ describe('PairingCode — expiry', () => {
   });
 
   it('treats a code expiring exactly now as expired', () => {
-    vi.useFakeTimers({ now: new Date('2030-01-01T12:00:00Z') });
+    fakeAllTimers();
     const { container } = render(
       <PairingCode
         code={SAMPLE_CODE}
@@ -306,7 +335,10 @@ describe('PairingCode — expiry', () => {
   });
 
   it('switches to the expired notice in place when the code expires on screen', () => {
-    vi.useFakeTimers({ now: new Date('2030-01-01T12:00:00Z') });
+    fakeAllTimers();
+    // React reports an update it could not attribute to `act` on
+    // `console.error`; the timer-driven switch must raise no such warning.
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
     const onPair = vi.fn<() => void>();
     const expiresAt = Date.now() + CODE_LIFETIME_MS;
     const { container } = render(
@@ -336,10 +368,11 @@ describe('PairingCode — expiry', () => {
     fireEvent.click(getButton(RENEW_NAME));
     expect(onPair).toHaveBeenCalledTimes(1);
     expect(onPair).toHaveBeenCalledWith();
+    expect(consoleError).not.toHaveBeenCalled();
   });
 
   it('shows a fresh code again when a new one replaces the expired one', () => {
-    vi.useFakeTimers({ now: new Date('2030-01-01T12:00:00Z') });
+    fakeAllTimers();
     const { container, rerender } = render(
       <PairingCode
         code={SAMPLE_CODE}
@@ -363,7 +396,7 @@ describe('PairingCode — expiry', () => {
   });
 
   it('waits out an expiry beyond the setTimeout range in bounded hops', () => {
-    vi.useFakeTimers({ now: new Date('2030-01-01T12:00:00Z') });
+    fakeAllTimers();
     const thirtyDaysMs = 30 * 24 * 60 * MINUTE_MS;
     const { container } = render(
       <PairingCode
@@ -388,7 +421,7 @@ describe('PairingCode — expiry', () => {
   });
 
   it('releases its timer when the code goes away and when the component unmounts', () => {
-    vi.useFakeTimers({ now: new Date('2030-01-01T12:00:00Z') });
+    fakeAllTimers();
     const expiresAt = Date.now() + CODE_LIFETIME_MS;
     const { rerender, unmount } = render(
       <PairingCode code={SAMPLE_CODE} expiresAt={expiresAt} onPair={vi.fn()} onDismiss={vi.fn()} />,
@@ -409,7 +442,7 @@ describe('PairingCode — expiry', () => {
   });
 
   it('arms no timer for an unknown expiry', () => {
-    vi.useFakeTimers({ now: new Date('2030-01-01T12:00:00Z') });
+    fakeAllTimers();
     render(<PairingCode code={SAMPLE_CODE} onPair={vi.fn()} onDismiss={vi.fn()} />);
 
     expect(vi.getTimerCount()).toBe(0);
@@ -462,6 +495,28 @@ describe('PairingCode — loading and error states', () => {
     expect(onPair).toHaveBeenCalledWith();
   });
 
+  it('renders only the alert when an error, a pending request and no code coincide', () => {
+    const { container } = render(
+      <PairingCode pending error="Pairing is unavailable." onPair={vi.fn()} onDismiss={vi.fn()} />,
+    );
+
+    const alerts = screen.getAllByRole('alert');
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]?.classList.contains('dg-error-state')).toBe(true);
+    // Neither the busy placeholder nor the request state renders beside it.
+    expect(screen.queryByRole('status')).toBeNull();
+    expect(container.querySelector('.dg-loading-state, .dg-empty-state')).toBeNull();
+    expect(container.querySelector('[aria-busy]')).toBeNull();
+    expect(codeElements(container)).toHaveLength(0);
+
+    // The alert is the root block's only content, and retry its only control.
+    const root = container.firstElementChild;
+    expect(root?.classList.contains('dgv-pairing')).toBe(true);
+    expect(alerts[0] !== undefined && root?.contains(alerts[0])).toBe(true);
+    expect(root?.textContent).toBe(alerts[0]?.textContent);
+    expect(screen.getAllByRole('button').map((button) => button.textContent)).toEqual([RETRY_NAME]);
+  });
+
   it('ignores a blank error', () => {
     const { container } = render(
       <PairingCode
@@ -482,18 +537,13 @@ describe('PairingCode — privacy', () => {
   const methods = ['log', 'info', 'warn', 'error', 'debug'] as const;
   let spies: MockInstance[] = [];
 
+  // Restored by the suite-wide `vi.restoreAllMocks()` in the root `afterEach`.
   beforeEach(() => {
     spies = methods.map((method) => vi.spyOn(console, method).mockImplementation(() => undefined));
   });
 
-  afterEach(() => {
-    for (const spy of spies) {
-      spy.mockRestore();
-    }
-  });
-
   it('logs nothing in any state or interaction', () => {
-    vi.useFakeTimers({ now: new Date('2030-01-01T12:00:00Z') });
+    fakeAllTimers();
     const onPair = vi.fn<() => void>();
     const onDismiss = vi.fn<() => void>();
     const expiresAt = Date.now() + CODE_LIFETIME_MS;

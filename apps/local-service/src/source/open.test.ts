@@ -18,23 +18,72 @@
  * real `realpath` and `lstat`, and against an injected table-based resolver,
  * which is how the edge cases a real filesystem cannot stage on demand (a
  * resolver answering with a relative or Windows path, an `ELOOP`) are reached.
+ *
+ * Every on-disk case gets a fresh `mkdtemp` sandbox of its own under the system
+ * temporary directory — `project/` (the session's root), `outside/` (the escape
+ * target) and `project-evil/` (the prefix sibling of the root) — which is
+ * removed, and proven removed, after the case. Every case that touches the
+ * sandbox also proves that the handler left it byte-for-byte as it found it:
+ * the only filesystem operations the gate may perform are `realpath` and
+ * `lstat`. Nothing is written inside the repository or under `~/.debuggen`.
+ *
+ * Expected error codes are taken from {@link CODES}, whose every member is
+ * checked against `DEBUGGEN_ERROR_CODES`, and the editor client kind from
+ * `CLIENT_KINDS`, so neither vocabulary is restated here as a bare string.
+ * Cases that need a symbolic link are skipped, by capability, on a host that
+ * cannot create one — the convention of `packages/shared/src/node/safe-fs.test.ts`.
  */
 
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  readlinkSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import { realpath as realpathAsync } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
+  CLIENT_KINDS,
   createEnvelope,
   encodeMessage,
+  isMessageOfType,
+  parseMessage,
   parseSessionRecord,
+  parseSourceOpenPayload,
   toErrorPayload,
 } from '@debuggen/protocol';
-import type { ProtocolMessage, SessionRecord, SourceOpenPayload } from '@debuggen/protocol';
-import { DebuggenError, err, ok } from '@debuggen/shared';
-import type { LogFields, Logger, Result, SourceLocation } from '@debuggen/shared';
+import type {
+  ClientKind,
+  ProtocolMessage,
+  SessionRecord,
+  SourceOpenPayload,
+} from '@debuggen/protocol';
+import {
+  DEBUGGEN_ERROR_CODES,
+  DEFAULT_RESOLUTION_CONFIDENCE,
+  DebuggenError,
+  err,
+  isSafeRelativePath,
+  ok,
+} from '@debuggen/shared';
+import type {
+  DebuggenErrorCode,
+  LogFields,
+  Logger,
+  Result,
+  SourceLocation,
+} from '@debuggen/shared';
 
 import {
   SOURCE_OPEN_REJECTIONS,
@@ -65,6 +114,81 @@ const OUTSIDE_CONTENT_MARKER = 'OUTSIDE-CONTENT-MARKER';
 
 /** A fixed clock for the outbound envelope. */
 const FIXED_NOW = 1_760_000_000_000;
+
+/**
+ * The error codes this suite expects, by role. Each is a `DebuggenErrorCode`
+ * at compile time, and the first case of the suite proves each is a member of
+ * `DEBUGGEN_ERROR_CODES` at run time, so an assertion against one of these is
+ * an assertion against the shared vocabulary itself.
+ */
+const CODES = Object.freeze({
+  outsideProject: 'PATH_OUTSIDE_PROJECT',
+  unsafePath: 'FS_UNSAFE_PATH',
+  fileMissing: 'PROJECT_NOT_FOUND',
+  invalidMessage: 'PROTOCOL_INVALID_MESSAGE',
+  sessionNotFound: 'SESSION_NOT_FOUND',
+  unauthorized: 'UNAUTHORIZED',
+  tabNotBound: 'TAB_NOT_BOUND',
+  store: 'STORE_ERROR',
+  transport: 'TRANSPORT_DISCONNECTED',
+  internal: 'INTERNAL',
+} as const satisfies Readonly<Record<string, DebuggenErrorCode>>);
+
+/** One member of the protocol's client-kind vocabulary, proven present at run time. */
+function clientKindFromVocabulary(kind: ClientKind): ClientKind {
+  const found = CLIENT_KINDS.find((candidate) => candidate === kind);
+  if (found === undefined) {
+    throw new Error('the protocol client-kind vocabulary lost a member this suite relies on');
+  }
+  return found;
+}
+
+/** The only client kind a location may ever be forwarded to. */
+const EDITOR_KIND = clientKindFromVocabulary('vscode');
+
+/**
+ * Whether this host can plant a symbolic link. Probed by capability, never by
+ * platform name, in a directory of its own that is removed straight away.
+ */
+const CAN_CREATE_SYMLINKS = ((): boolean => {
+  const probeRoot = mkdtempSync(join(tmpdir(), 'debuggen-source-open-probe-'));
+  try {
+    symlinkSync(join(probeRoot, 'absent'), join(probeRoot, 'link'));
+    return lstatSync(join(probeRoot, 'link')).isSymbolicLink();
+  } catch {
+    return false;
+  } finally {
+    rmSync(probeRoot, { recursive: true, force: true });
+  }
+})();
+
+/** Neutral, invented names for the sandbox's files. */
+const LEGIT_FILE = 'src/app.ts';
+const FOREIGN_NAME = 'foreign.ts';
+
+/**
+ * The path corpus every containment layer is driven over, relative to a
+ * project root whose directory is named `project` and whose prefix sibling is
+ * `project-evil`. Each entry escapes the root, is not a project-relative POSIX
+ * path, or both; none may be accepted by any layer.
+ */
+const ESCAPING_FILES: readonly (readonly [label: string, file: string])[] = Object.freeze([
+  ['parent traversal', `../outside/${FOREIGN_NAME}`],
+  ['deeper parent traversal', `../../outside/${FOREIGN_NAME}`],
+  [
+    'interior traversal that climbs out and re-enters elsewhere',
+    `src/../../outside/${FOREIGN_NAME}`,
+  ],
+  ['an absolute POSIX path', `/opt/elsewhere/${FOREIGN_NAME}`],
+  ['a Windows drive path with backslashes', `C:\\elsewhere\\${FOREIGN_NAME}`],
+  ['a Windows drive path with forward slashes', `C:/elsewhere/${FOREIGN_NAME}`],
+  ['a UNC path', `\\\\server\\share\\${FOREIGN_NAME}`],
+  ['a forward-slash network share', `//server/share/${FOREIGN_NAME}`],
+  ['a prefix sibling of the root', `../project-evil/${FOREIGN_NAME}`],
+  ['a NUL character', 'src/app.ts\u0000.png'],
+  ['a C0 control character', 'src/\u0007app.ts'],
+  ['a backslash segment', `src\\..\\..\\${FOREIGN_NAME}`],
+]);
 
 /** A hostile value, typed as whatever the call under test declares. */
 function hostile<T>(value: unknown): T {
@@ -107,7 +231,7 @@ function sessionRecordFor(projectRoot: string, boundTabId?: number): SessionReco
     provider: { id: 'deterministic' },
   };
   if (boundTabId !== undefined) {
-    candidate['boundTab'] = { tabId: boundTabId, url: 'http://127.0.0.1:3000/catalog' };
+    candidate['boundTab'] = { tabId: boundTabId, url: 'http://127.0.0.1:3000/page' };
   }
   const parsed = parseSessionRecord(candidate);
   if (!parsed.ok) {
@@ -278,11 +402,81 @@ function tableRealpath(
   };
 }
 
+/**
+ * Every entry under a directory, without following a link: a file by its bytes
+ * and modification time, a link by its target, a directory by its presence. Two
+ * equal snapshots mean nothing was written, created, removed, retargeted or
+ * even re-saved in between.
+ */
+function sandboxState(root: string): Record<string, string> {
+  const state: Record<string, string> = {};
+  const walk = (directory: string, prefix: string): void => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name);
+      const key = `${prefix}${entry.name}`;
+      if (entry.isSymbolicLink()) {
+        state[key] = `link -> ${readlinkSync(path)}`;
+      } else if (entry.isDirectory()) {
+        state[key] = 'directory';
+        walk(path, `${key}/`);
+      } else {
+        const stats = lstatSync(path);
+        state[key] = `file ${String(stats.mtimeMs)} ${readFileSync(path).toString('base64')}`;
+      }
+    }
+  };
+  walk(root, '');
+  return state;
+}
+
+/**
+ * The only log field names a record of this handler may carry: the standard
+ * bindings, codes and enumerated reasons, the project-relative file, the
+ * position, the resolver and the delivery count.
+ */
+const ALLOWED_LOG_FIELDS: ReadonlySet<string> = new Set([
+  'subsystem',
+  'sessionId',
+  'client',
+  'code',
+  'causeCode',
+  'detail',
+  'rejection',
+  'reason',
+  'pathReason',
+  'errno',
+  'file',
+  'line',
+  'column',
+  'resolvedBy',
+  'delivered',
+]);
+
 /* -------------------------------------------------------------------------------------------------
  * The public vocabulary
  * ---------------------------------------------------------------------------------------------- */
 
-describe('the rejection vocabulary', () => {
+describe('the harness contract', () => {
+  it('expects only codes of the shared DEBUGGEN_ERROR_CODES vocabulary', () => {
+    for (const code of Object.values(CODES)) {
+      expect(DEBUGGEN_ERROR_CODES).toContain(code);
+    }
+  });
+
+  it('forwards to a client kind of the protocol CLIENT_KINDS vocabulary', () => {
+    expect(CLIENT_KINDS).toContain(EDITOR_KIND);
+  });
+
+  it('builds a stored-session fixture the protocol SessionRecord schema accepts', () => {
+    const record = sessionRecordFor('/work/project', 7);
+    const reparsed = parseSessionRecord(JSON.parse(JSON.stringify(record)));
+    expect(reparsed.ok).toBe(true);
+    expect(record.projectRoot).toBe('/work/project');
+    expect(record.boundTab?.tabId).toBe(7);
+  });
+});
+
+describe('SOURCE_OPEN_REJECTIONS — the rejection vocabulary', () => {
   it('is closed and frozen', () => {
     expect([...SOURCE_OPEN_REJECTIONS]).toEqual([
       'invalid-payload',
@@ -296,15 +490,15 @@ describe('the rejection vocabulary', () => {
   });
 
   it('reads a rejection back only from an error that carries a known one', () => {
-    const refused = new DebuggenError('PATH_OUTSIDE_PROJECT', 'refused', {
+    const refused = new DebuggenError(CODES.outsideProject, 'refused', {
       details: { rejection: 'outside-project' },
     });
-    const foreign = new DebuggenError('PATH_OUTSIDE_PROJECT', 'refused', {
+    const foreign = new DebuggenError(CODES.outsideProject, 'refused', {
       details: { rejection: 'made-up' },
     });
     expect(sourceOpenRejectionOf(refused)).toBe('outside-project');
     expect(sourceOpenRejectionOf(foreign)).toBeUndefined();
-    expect(sourceOpenRejectionOf(new DebuggenError('INTERNAL', 'x'))).toBeUndefined();
+    expect(sourceOpenRejectionOf(new DebuggenError(CODES.internal, 'x'))).toBeUndefined();
   });
 });
 
@@ -313,50 +507,53 @@ describe('the rejection vocabulary', () => {
  * ---------------------------------------------------------------------------------------------- */
 
 describe('assertLocationWithinProject — the lexical half', () => {
-  const root = '/work/app';
+  const root = '/work/project';
 
-  it('places a project-relative file under the root', () => {
+  it('places a project-relative file under the root (the corpus sanity guard)', () => {
+    expect(valueOf(assertLocationWithinProject(root, locationOf(LEGIT_FILE)))).toEqual({
+      absolutePath: `/work/project/${LEGIT_FILE}`,
+    });
     expect(valueOf(assertLocationWithinProject(root, locationOf('src/lib/a.ts')))).toEqual({
-      absolutePath: '/work/app/src/lib/a.ts',
+      absolutePath: '/work/project/src/lib/a.ts',
     });
   });
 
   it('normalises an interior segment that stays inside', () => {
     expect(valueOf(assertLocationWithinProject(root, locationOf('src/./lib/../lib/a.ts')))).toEqual(
-      { absolutePath: '/work/app/src/lib/a.ts' },
+      { absolutePath: '/work/project/src/lib/a.ts' },
     );
   });
 
-  it.each([
-    ['parent traversal', '../secret.ts'],
-    ['interior traversal that climbs out', 'src/../../secret.ts'],
-    ['an absolute POSIX path', '/etc/passwd'],
-    ['a Windows drive path with backslashes', 'C:\\Windows\\win.ini'],
-    ['a Windows drive path with forward slashes', 'C:/Windows/win.ini'],
-    ['a UNC path', '\\\\server\\share\\secret.ts'],
-    ['a forward-slash network share', '//server/share/secret.ts'],
-    ['a prefix sibling of the root', '../app-evil/secret.ts'],
-    ['a NUL character', 'src/a.ts\u0000.png'],
-    ['a backslash segment', 'src\\..\\..\\secret.ts'],
+  const lexicalCases: [label: string, file: string][] = [
+    ...ESCAPING_FILES.map(([label, file]): [string, string] => [label, file]),
     ['an empty path', ''],
     ['a whitespace-only path', '   '],
-  ])('refuses %s without quoting it', (_label, file) => {
+  ];
+
+  it.each(lexicalCases)('refuses %s without quoting it', (_label, file) => {
     const error = refusalOf(assertLocationWithinProject(root, locationOf(file)));
-    expect(error.code).toBe('PATH_OUTSIDE_PROJECT');
+    expect(error.code).toBe(CODES.outsideProject);
     expect(sourceOpenRejectionOf(error)).toBe('outside-project');
     const forbidden = file.trim().length === 0 ? [root] : [root, file];
     expectPrivate(error, forbidden);
   });
 
+  it('refuses the prefix sibling even though the root is a string prefix of it', () => {
+    const sibling = `../project-evil/${FOREIGN_NAME}`;
+    expect(`/work/project-evil/${FOREIGN_NAME}`.startsWith(root)).toBe(true);
+    const error = refusalOf(assertLocationWithinProject(root, locationOf(sibling)));
+    expect(error.code).toBe(CODES.outsideProject);
+  });
+
   it('refuses a relative project root', () => {
-    const error = refusalOf(assertLocationWithinProject('work/app', locationOf('src/a.ts')));
-    expect(error.code).toBe('PATH_OUTSIDE_PROJECT');
+    const error = refusalOf(assertLocationWithinProject('work/project', locationOf('src/a.ts')));
+    expect(error.code).toBe(CODES.outsideProject);
   });
 
   it('refuses, rather than throws on, a location that never passed the schema', () => {
     for (const value of [null, undefined, 42, 'src/a.ts', { file: 7 }, []]) {
       const error = refusalOf(assertLocationWithinProject(root, hostile<SourceLocation>(value)));
-      expect(error.code).toBe('PATH_OUTSIDE_PROJECT');
+      expect(error.code).toBe(CODES.outsideProject);
     }
   });
 });
@@ -396,14 +593,14 @@ describe('resolveRealPathWithinProject — the filesystem half', () => {
       await resolveRealPathWithinProject(
         root,
         '/work/app/src/leak.ts',
-        tableRealpath({ '/work/app/src/leak.ts': '/elsewhere/secret.ts' }),
+        tableRealpath({ '/work/app/src/leak.ts': '/elsewhere/foreign.ts' }),
       ),
     );
-    expect(error.code).toBe('FS_UNSAFE_PATH');
+    expect(error.code).toBe(CODES.unsafePath);
     expect(sourceOpenRejectionOf(error)).toBe('unsafe-path');
     expect(error.details?.['reason']).toBe('symlink-escapes-project-root');
     expect(error.message).toContain('src/leak.ts');
-    expectPrivate(error, ['/elsewhere', 'secret.ts', root]);
+    expectPrivate(error, ['/elsewhere', FOREIGN_NAME, root]);
   });
 
   it('refuses a link that leads to a prefix sibling of the root', async () => {
@@ -411,20 +608,29 @@ describe('resolveRealPathWithinProject — the filesystem half', () => {
       await resolveRealPathWithinProject(
         root,
         '/work/app/src/leak.ts',
-        tableRealpath({ '/work/app/src/leak.ts': '/work/app-evil/secret.ts' }),
+        tableRealpath({ '/work/app/src/leak.ts': '/work/app-evil/foreign.ts' }),
       ),
     );
-    expect(error.code).toBe('FS_UNSAFE_PATH');
+    expect(error.code).toBe(CODES.unsafePath);
+    expect(sourceOpenRejectionOf(error)).toBe('unsafe-path');
+    // Refused by the canonical containment check itself, not by a later guard:
+    // a bare string-prefix test would have let this target through that check.
+    expect(error.details?.['reason']).toBe('symlink-escapes-project-root');
     expectPrivate(error, ['app-evil', root]);
   });
 
   it('refuses a candidate that is not inside the root as text, before resolving anything', async () => {
     const calls: string[] = [];
-    for (const candidate of ['/work/app-evil/secret.ts', '/etc/passwd', '/work', 'work/app/a.ts']) {
+    for (const candidate of [
+      '/work/app-evil/foreign.ts',
+      '/opt/elsewhere/foreign.ts',
+      '/work',
+      'work/app/a.ts',
+    ]) {
       const error = refusalOf(
         await resolveRealPathWithinProject(root, candidate, tableRealpath({}, {}, calls)),
       );
-      expect(error.code).toBe('PATH_OUTSIDE_PROJECT');
+      expect(error.code).toBe(CODES.outsideProject);
       expect(sourceOpenRejectionOf(error)).toBe('outside-project');
       expectPrivate(error, [candidate, root]);
     }
@@ -436,7 +642,7 @@ describe('resolveRealPathWithinProject — the filesystem half', () => {
     const error = refusalOf(
       await resolveRealPathWithinProject('work/app', 'work/app/a.ts', tableRealpath({}, {}, calls)),
     );
-    expect(error.code).toBe('PATH_OUTSIDE_PROJECT');
+    expect(error.code).toBe(CODES.outsideProject);
     expect(calls).toEqual([]);
   });
 
@@ -448,7 +654,7 @@ describe('resolveRealPathWithinProject — the filesystem half', () => {
         tableRealpath({}, { '/work/app/src/missing.ts': 'ENOENT' }),
       ),
     );
-    expect(missing.code).toBe('PROJECT_NOT_FOUND');
+    expect(missing.code).toBe(CODES.fileMissing);
     expect(sourceOpenRejectionOf(missing)).toBe('file-missing');
     expect(missing.message).toContain('src/missing.ts');
     expectPrivate(missing, [root]);
@@ -469,7 +675,7 @@ describe('resolveRealPathWithinProject — the filesystem half', () => {
         tableRealpath({}, { '/work/app/src/loop.ts': 'ELOOP' }),
       ),
     );
-    expect(looped.code).toBe('FS_UNSAFE_PATH');
+    expect(looped.code).toBe(CODES.unsafePath);
     expect(looped.details?.['errno']).toBe('ELOOP');
     expectPrivate(looped, [root]);
   });
@@ -510,7 +716,7 @@ describe('resolveRealPathWithinProject — the filesystem half', () => {
         tableRealpath({ '/work/app/src/a.ts': 'C:\\elsewhere\\a.ts' }),
       ),
     );
-    expect(windows.code).toBe('FS_UNSAFE_PATH');
+    expect(windows.code).toBe(CODES.unsafePath);
     expectPrivate(windows, ['elsewhere']);
 
     // A resolver that throws something other than an Error: typed as one only
@@ -520,12 +726,12 @@ describe('resolveRealPathWithinProject — the filesystem half', () => {
         throw hostile<Error>('not an error object');
       }),
     );
-    expect(throwsNonError.code).toBe('FS_UNSAFE_PATH');
+    expect(throwsNonError.code).toBe(CODES.unsafePath);
 
     const nonString = refusalOf(
       await resolveRealPathWithinProject(root, '/work/app/src/a.ts', () => hostile<string>(42)),
     );
-    expect(nonString.code).toBe('FS_UNSAFE_PATH');
+    expect(nonString.code).toBe(CODES.unsafePath);
   });
 
   it('accepts an asynchronous resolver and a rejection from it', async () => {
@@ -541,68 +747,140 @@ describe('resolveRealPathWithinProject — the filesystem half', () => {
     );
     expect(sourceOpenRejectionOf(rejected)).toBe('file-missing');
   });
+
+  it.skipIf(!CAN_CREATE_SYMLINKS)(
+    'judges a genuinely planted link with the real node:fs/promises realpath',
+    async () => {
+      const sandbox = realpathSync(mkdtempSync(join(tmpdir(), 'debuggen-source-open-real-')));
+      try {
+        const projectRoot = join(sandbox, 'project');
+        mkdirSync(join(projectRoot, 'src'), { recursive: true });
+        mkdirSync(join(sandbox, 'outside'), { recursive: true });
+        writeFileSync(join(projectRoot, LEGIT_FILE), 'export const inside = 1;\n');
+        writeFileSync(join(sandbox, 'outside', FOREIGN_NAME), `// ${OUTSIDE_CONTENT_MARKER}\n`);
+        symlinkSync(join(sandbox, 'outside', FOREIGN_NAME), join(projectRoot, 'src', 'link.ts'));
+        symlinkSync(join(projectRoot, LEGIT_FILE), join(projectRoot, 'src', 'inner-link.ts'));
+        const before = sandboxState(sandbox);
+
+        const escaping = refusalOf(
+          await resolveRealPathWithinProject(
+            projectRoot,
+            join(projectRoot, 'src', 'link.ts'),
+            realpathAsync,
+          ),
+        );
+        expect(escaping.code).toBe(CODES.unsafePath);
+        expect(escaping.details?.['reason']).toBe('symlink-escapes-project-root');
+        expectPrivate(escaping, [sandbox, FOREIGN_NAME, OUTSIDE_CONTENT_MARKER]);
+
+        const inner = await resolveRealPathWithinProject(
+          projectRoot,
+          join(projectRoot, 'src', 'inner-link.ts'),
+          realpathAsync,
+        );
+        expect(valueOf(inner).relativePath).toBe(LEGIT_FILE);
+
+        expect(sandboxState(sandbox)).toEqual(before);
+      } finally {
+        rmSync(sandbox, { recursive: true, force: true });
+      }
+      expect(existsSync(sandbox)).toBe(false);
+    },
+  );
 });
 
 /* -------------------------------------------------------------------------------------------------
  * The handler, over a real project on disk
  * ---------------------------------------------------------------------------------------------- */
 
-describe('createSourceOpenHandler', () => {
+describe('createSourceOpenHandler → SourceOpenHandler.handle', () => {
   let base = '';
   let project = '';
   let outside = '';
+  let sibling = '';
   let editor: SourceOpenPrincipal = { client: 'vscode' };
+  let initialState: Record<string, string> = {};
 
   /** Everything that must never surface in an error or a log record. */
-  const forbidden = (): string[] => [base, outside, OUTSIDE_CONTENT_MARKER, CREDENTIAL_MARKER];
+  const forbidden = (): string[] => [
+    base,
+    outside,
+    sibling,
+    OUTSIDE_CONTENT_MARKER,
+    CREDENTIAL_MARKER,
+  ];
 
-  /** Asserts that no captured log record carries a forbidden string. */
+  /**
+   * Asserts that no captured log record carries a forbidden string, a field
+   * outside the allowed set, or a `file` that is not project-relative.
+   */
   const expectPrivateLogs = (entries: readonly LogEntry[]): void => {
     const serialised = JSON.stringify(entries);
     for (const value of forbidden()) {
       expect(serialised).not.toContain(value);
     }
+    for (const entry of entries) {
+      for (const key of Object.keys(entry.fields)) {
+        expect(ALLOWED_LOG_FIELDS.has(key), `unexpected log field ${key}`).toBe(true);
+      }
+      const file = entry.fields['file'];
+      if (file !== undefined) {
+        expect(typeof file === 'string' && isSafeRelativePath(file)).toBe(true);
+      }
+    }
   };
 
-  beforeAll(() => {
+  /** Asserts that the sandbox is exactly as `beforeEach` left it. */
+  const expectSandboxUntouched = (): void => {
+    expect(sandboxState(base)).toEqual(initialState);
+  };
+
+  beforeEach(() => {
     base = realpathSync(mkdtempSync(join(tmpdir(), 'debuggen-source-open-')));
-    project = join(base, 'proj');
+    project = join(base, 'project');
     outside = join(base, 'outside');
-    const sibling = join(base, 'proj-evil');
+    sibling = join(base, 'project-evil');
 
     mkdirSync(join(project, 'src', 'folder'), { recursive: true });
     mkdirSync(outside, { recursive: true });
     mkdirSync(sibling, { recursive: true });
 
-    writeFileSync(join(project, 'src', 'app.ts'), 'export const answer = 42;\n');
+    writeFileSync(join(project, LEGIT_FILE), 'export const answer = 42;\n');
     const leaked = `export const leaked = '${OUTSIDE_CONTENT_MARKER}';\n`;
-    writeFileSync(join(outside, 'secret.ts'), leaked);
-    writeFileSync(join(sibling, 'secret.ts'), leaked);
+    writeFileSync(join(outside, FOREIGN_NAME), leaked);
+    writeFileSync(join(sibling, FOREIGN_NAME), leaked);
 
     // Links planted inside the project: two that escape by file, one that
     // escapes by directory, one that stays inside, and one that dangles.
-    symlinkSync(join(outside, 'secret.ts'), join(project, 'src', 'leak.ts'));
-    symlinkSync(join(sibling, 'secret.ts'), join(project, 'src', 'sibling-leak.ts'));
-    symlinkSync(outside, join(project, 'vendor'), 'dir');
-    symlinkSync(join(project, 'src', 'app.ts'), join(project, 'src', 'alias.ts'));
-    symlinkSync(join(outside, 'gone.ts'), join(project, 'src', 'dangling.ts'));
+    if (CAN_CREATE_SYMLINKS) {
+      symlinkSync(join(outside, FOREIGN_NAME), join(project, 'src', 'leak.ts'));
+      symlinkSync(join(sibling, FOREIGN_NAME), join(project, 'src', 'sibling-leak.ts'));
+      symlinkSync(outside, join(project, 'vendor'), 'dir');
+      symlinkSync(join(project, LEGIT_FILE), join(project, 'src', 'alias.ts'));
+      symlinkSync(join(outside, 'gone.ts'), join(project, 'src', 'dangling.ts'));
+    }
 
     editor = { client: 'vscode', projectRoots: [project], scope: CREDENTIAL_MARKER };
+    initialState = sandboxState(base);
   });
 
-  afterAll(() => {
+  afterEach(() => {
     if (base !== '') {
       rmSync(base, { recursive: true, force: true });
+      expect(existsSync(base)).toBe(false);
     }
   });
 
-  describe('forwarding', () => {
+  describe('SourceOpenOutcome — forwarding and delivery outcomes', () => {
     it('sends exactly one source.open envelope to the editor, with the location unchanged', async () => {
       const h = harness({ session: sessionRecordFor(project) });
+      // A confidence that differs from the resolver's default, so a handler
+      // that re-stamped the location would be caught.
       const input: SourceOpenPayload = {
         sessionId: SESSION_ID,
-        location: locationOf('src/app.ts'),
+        location: locationOf(LEGIT_FILE, { resolvedBy: 'source-map', confidence: 0.42 }),
       };
+      expect(input.location.confidence).not.toBe(DEFAULT_RESOLUTION_CONFIDENCE['source-map']);
 
       const outcome = valueOf(await h.handle(input, editor));
 
@@ -610,7 +888,7 @@ describe('createSourceOpenHandler', () => {
         delivered: true,
         clients: 1,
         location: input.location,
-        file: 'src/app.ts',
+        file: LEGIT_FILE,
       });
       expect(h.sent).toHaveLength(1);
       const [sent] = h.sent;
@@ -618,24 +896,57 @@ describe('createSourceOpenHandler', () => {
         throw new Error('expected one message');
       }
       expect(sent.sessionId).toBe(SESSION_ID);
-      expect(sent.clientKind).toBe('vscode');
+      expect(sent.clientKind).toBe(EDITOR_KIND);
+
+      // The frame is one the receiving editor's own parser accepts.
+      const reparsed = valueOf(parseMessage(JSON.parse(JSON.stringify(sent.message))));
+      expect(isMessageOfType(reparsed, 'source.open')).toBe(true);
       const { message } = sent;
-      if (message.type !== 'source.open') {
+      if (!isMessageOfType(message, 'source.open')) {
         throw new Error(`expected a source.open message, received ${message.type}`);
       }
+      expect(valueOf(parseSourceOpenPayload(message.payload))).toEqual(input);
       expect(message.sessionId).toBe(SESSION_ID);
       expect(message.ts).toBe(FIXED_NOW);
+      expect(Number.isSafeInteger(message.ts) && message.ts > 0).toBe(true);
       expect(typeof message.id).toBe('string');
+      expect(message.id.length).toBeGreaterThan(0);
       expect(message.payload).toEqual(input);
+      expect(message.payload.location.resolvedBy).toBe('source-map');
+      expect(message.payload.location.confidence).toBe(0.42);
       expect(JSON.stringify(message.payload.location)).toBe(JSON.stringify(input.location));
       expectPrivateLogs(h.entries);
+      expectSandboxUntouched();
+    });
+
+    it('stamps the envelope with the protocol clock when none is injected', async () => {
+      const sent: ProtocolMessage[] = [];
+      const handler = createSourceOpenHandler({
+        sessions: { get: () => ok(sessionRecordFor(project)) },
+        clients: {
+          sendToSessionClients: (_sessionId, _kind, message) => {
+            sent.push(message);
+            return 1;
+          },
+        },
+      });
+      const before = Date.now();
+
+      valueOf(
+        await handler.handle({ sessionId: SESSION_ID, location: locationOf(LEGIT_FILE) }, editor),
+      );
+
+      const after = Date.now();
+      const [message] = sent;
+      expect(message?.ts).toBeGreaterThanOrEqual(before);
+      expect(message?.ts).toBeLessThanOrEqual(after);
     });
 
     it('accepts a parsed envelope and a raw JSON frame as well as a bare payload', async () => {
       const h = harness({ session: sessionRecordFor(project) });
       const payload: SourceOpenPayload = {
         sessionId: SESSION_ID,
-        location: locationOf('src/app.ts'),
+        location: locationOf(LEGIT_FILE),
       };
       const envelope = createEnvelope('source.open', payload);
 
@@ -646,19 +957,23 @@ describe('createSourceOpenHandler', () => {
 
     it('answers delivered: false when no editor client is connected', async () => {
       const h = harness({ session: sessionRecordFor(project), deliverTo: 0 });
-      const location = locationOf('src/app.ts');
+      const location = locationOf(LEGIT_FILE);
 
       const outcome = valueOf(await h.handle({ sessionId: SESSION_ID, location }, editor));
 
       expect(outcome).toEqual({ delivered: false, reason: 'no-editor-client', location });
+      // The frame was offered to the editor kind only, and reached nobody.
+      expect(h.sent.map((entry) => entry.clientKind)).toEqual([EDITOR_KIND]);
       const entry = h.entries.find((candidate) => candidate.message.startsWith('No editor client'));
       expect(entry?.fields['delivered']).toBe(0);
+      expectPrivateLogs(h.entries);
+      expectSandboxUntouched();
     });
 
     it('reports how many editor clients received the frame', async () => {
       const h = harness({ session: sessionRecordFor(project), deliverTo: 3 });
       const outcome = valueOf(
-        await h.handle({ sessionId: SESSION_ID, location: locationOf('src/app.ts') }, editor),
+        await h.handle({ sessionId: SESSION_ID, location: locationOf(LEGIT_FILE) }, editor),
       );
       expect(outcome.delivered && outcome.clients).toBe(3);
     });
@@ -666,7 +981,7 @@ describe('createSourceOpenHandler', () => {
     it('works with asynchronous ports', async () => {
       const h = harness({ session: sessionRecordFor(project), asyncPorts: true });
       const outcome = valueOf(
-        await h.handle({ sessionId: SESSION_ID, location: locationOf('src/app.ts') }, editor),
+        await h.handle({ sessionId: SESSION_ID, location: locationOf(LEGIT_FILE) }, editor),
       );
       expect(outcome.delivered).toBe(true);
     });
@@ -675,85 +990,182 @@ describe('createSourceOpenHandler', () => {
       const h = harness({ session: sessionRecordFor(project) });
       const outcome = valueOf(
         await h.handle(
-          { sessionId: SESSION_ID, location: locationOf('src/app.ts') },
+          { sessionId: SESSION_ID, location: locationOf(LEGIT_FILE) },
           { client: 'vscode', projectRoots: [base] },
         ),
       );
       expect(outcome.delivered).toBe(true);
     });
 
-    it('opens a file reached through a link that stays inside the project, forwarding the location as sent', async () => {
+    it.skipIf(!CAN_CREATE_SYMLINKS)(
+      'opens a file reached through a link that stays inside the project, forwarding the location as sent',
+      async () => {
+        const h = harness({ session: sessionRecordFor(project) });
+        const location = locationOf('src/alias.ts');
+
+        const outcome = valueOf(await h.handle({ sessionId: SESSION_ID, location }, editor));
+
+        expect(outcome).toEqual({ delivered: true, clients: 1, location, file: LEGIT_FILE });
+        const message = h.sent[0]?.message;
+        expect(message?.type === 'source.open' && message.payload.location.file).toBe(
+          'src/alias.ts',
+        );
+        expectSandboxUntouched();
+      },
+    );
+
+    it('is deterministic: the same request twice yields the same answer and one frame each', async () => {
       const h = harness({ session: sessionRecordFor(project) });
-      const location = locationOf('src/alias.ts');
+      const input: SourceOpenPayload = { sessionId: SESSION_ID, location: locationOf(LEGIT_FILE) };
 
-      const outcome = valueOf(await h.handle({ sessionId: SESSION_ID, location }, editor));
+      const first = await h.handle(input, editor);
+      const second = await h.handle(input, editor);
 
-      expect(outcome).toEqual({ delivered: true, clients: 1, location, file: 'src/app.ts' });
-      const message = h.sent[0]?.message;
-      expect(message?.type === 'source.open' && message.payload.location.file).toBe('src/alias.ts');
+      expect(second).toEqual(first);
+      expect(h.sent).toHaveLength(2);
+
+      const refusing = harness({ session: sessionRecordFor(project) });
+      const escaping = { sessionId: SESSION_ID, location: locationOf('src/missing.ts') };
+      const refusedOnce = refusalOf(await refusing.handle(escaping, editor));
+      const refusedTwice = refusalOf(await refusing.handle(escaping, editor));
+      expect(refusedTwice.toPayload()).toEqual(refusedOnce.toPayload());
+      expect(refusing.sent).toEqual([]);
+      expectSandboxUntouched();
     });
   });
 
   describe('containment through the handler', () => {
-    it.each([
+    /** One on-disk refusal: label, file, expected code, rejection and reason. */
+    type DiskRefusal = readonly [
+      label: string,
+      file: string,
+      code: DebuggenErrorCode,
+      rejection: string,
+      reason: string,
+    ];
+
+    /** Asserts all four properties of a refusal: typed, coded, nothing sent, nothing touched. */
+    const expectRefusedWithoutEffect = async ([, file, code, rejection, reason]: DiskRefusal) => {
+      const h = harness({ session: sessionRecordFor(project) });
+
+      const error = refusalOf(
+        await h.handle({ sessionId: SESSION_ID, location: locationOf(file) }, editor),
+      );
+
+      expect(DEBUGGEN_ERROR_CODES).toContain(error.code);
+      expect(error.code).toBe(code);
+      expect(sourceOpenRejectionOf(error)).toBe(rejection);
+      expect(error.details?.['reason']).toBe(reason);
+      expect(h.sent).toEqual([]);
+      expectSandboxUntouched();
+      expectPrivate(error, forbidden());
+      expectPrivateLogs(h.entries);
+    };
+
+    const LINK_REFUSALS: readonly DiskRefusal[] = [
       [
         'a link to a file outside the project',
         'src/leak.ts',
-        'FS_UNSAFE_PATH',
+        CODES.unsafePath,
         'unsafe-path',
         'symlink-escapes-project-root',
       ],
       [
         'a link to a file in a prefix-sibling directory',
         'src/sibling-leak.ts',
-        'FS_UNSAFE_PATH',
+        CODES.unsafePath,
         'unsafe-path',
         'symlink-escapes-project-root',
       ],
       [
         'a file under a directory link that leads outside',
-        'vendor/secret.ts',
-        'FS_UNSAFE_PATH',
+        `vendor/${FOREIGN_NAME}`,
+        CODES.unsafePath,
         'unsafe-path',
         'symlink-escapes-project-root',
       ],
-      ['a dangling link', 'src/dangling.ts', 'PROJECT_NOT_FOUND', 'file-missing', 'not-found'],
+      ['a dangling link', 'src/dangling.ts', CODES.fileMissing, 'file-missing', 'not-found'],
+    ];
+
+    const PLAIN_REFUSALS: readonly DiskRefusal[] = [
       [
         'a file that does not exist',
         'src/missing.ts',
-        'PROJECT_NOT_FOUND',
+        CODES.fileMissing,
         'file-missing',
         'not-found',
       ],
-      ['a directory', 'src/folder', 'PROJECT_NOT_FOUND', 'file-missing', 'not-a-file'],
-      ['the project root itself', '.', 'PROJECT_NOT_FOUND', 'file-missing', 'not-a-file'],
-    ])(
-      'refuses %s, sends nothing and leaks nothing',
-      async (_label, file, code, rejection, reason) => {
-        const h = harness({ session: sessionRecordFor(project) });
+      ['a directory', 'src/folder', CODES.fileMissing, 'file-missing', 'not-a-file'],
+      ['the project root itself', '.', CODES.fileMissing, 'file-missing', 'not-a-file'],
+    ];
 
-        const error = refusalOf(
-          await h.handle({ sessionId: SESSION_ID, location: locationOf(file) }, editor),
-        );
-
-        expect(error.code).toBe(code);
-        expect(sourceOpenRejectionOf(error)).toBe(rejection);
-        expect(error.details?.['reason']).toBe(reason);
-        expect(h.sent).toEqual([]);
-        expectPrivate(error, forbidden());
-        expectPrivateLogs(h.entries);
+    it.skipIf(!CAN_CREATE_SYMLINKS).each(LINK_REFUSALS)(
+      'refuses %s, sends nothing, touches nothing and leaks nothing',
+      async (...row) => {
+        await expectRefusedWithoutEffect(row);
       },
     );
 
-    it('refuses traversal, absolute, Windows and prefix-sibling paths before anything else', async () => {
+    it.each(PLAIN_REFUSALS)(
+      'refuses %s, sends nothing, touches nothing and leaks nothing',
+      async (...row) => {
+        await expectRefusedWithoutEffect(row);
+      },
+    );
+
+    it.skipIf(!CAN_CREATE_SYMLINKS)(
+      'refuses a planted link out of the project although the lexical gate passes it',
+      async () => {
+        const location = locationOf('src/leak.ts');
+        const linkTarget = readlinkSync(join(project, 'src', 'leak.ts'));
+        const outsideBytes = readFileSync(join(outside, FOREIGN_NAME));
+        // The lexical half alone accepts it: only the filesystem half can see the link.
+        expect(assertLocationWithinProject(project, location).ok).toBe(true);
+        const h = harness({ session: sessionRecordFor(project) });
+
+        const error = refusalOf(await h.handle({ sessionId: SESSION_ID, location }, editor));
+
+        expect(error.code).toBe(CODES.unsafePath);
+        expect(h.sent).toEqual([]);
+        expect(readFileSync(join(outside, FOREIGN_NAME)).equals(outsideBytes)).toBe(true);
+        expectSandboxUntouched();
+        const serialised = JSON.stringify(error.toPayload());
+        expect(serialised).not.toContain(linkTarget);
+        expect(serialised).not.toContain(join(outside, FOREIGN_NAME));
+        expect(serialised).not.toContain(OUTSIDE_CONTENT_MARKER);
+        expectPrivate(error, [...forbidden(), linkTarget]);
+      },
+    );
+
+    it('tells a missing file apart from a containment failure', async () => {
+      const h = harness({ session: sessionRecordFor(project) });
+
+      const missing = refusalOf(
+        await h.handle({ sessionId: SESSION_ID, location: locationOf('src/missing.ts') }, editor),
+      );
+      const escaping = refusalOf(
+        await h.handle(
+          { sessionId: SESSION_ID, location: locationOf(`../outside/${FOREIGN_NAME}`) },
+          editor,
+        ),
+      );
+
+      expect(missing.code).toBe(CODES.fileMissing);
+      expect(sourceOpenRejectionOf(missing)).toBe('file-missing');
+      expect(missing.code).not.toBe(escaping.code);
+      expect(sourceOpenRejectionOf(missing)).not.toBe(sourceOpenRejectionOf(escaping));
+      expect(h.sent).toEqual([]);
+      expectSandboxUntouched();
+    });
+
+    it('refuses every escaping path of the corpus at shape validation, before anything else', async () => {
+      // open.ts documents that the embedded source-location schema refuses
+      // obvious escapes first, so through the handler they are malformed
+      // frames; the lexical and filesystem halves are pinned directly above.
       const files = [
-        '../outside/secret.ts',
-        'src/../../outside/secret.ts',
-        join(outside, 'secret.ts'),
-        'C:\\Windows\\win.ini',
-        'C:/Windows/win.ini',
-        '\\\\server\\share\\secret.ts',
-        '../proj-evil/secret.ts',
+        ...ESCAPING_FILES.map(([, file]) => file),
+        join(outside, FOREIGN_NAME),
+        join(sibling, FOREIGN_NAME),
       ];
       for (const file of files) {
         const h = harness({ session: sessionRecordFor(project) });
@@ -762,43 +1174,50 @@ describe('createSourceOpenHandler', () => {
           await h.handle({ sessionId: SESSION_ID, location: locationOf(file) }, editor),
         );
 
-        expect(error.code).toBe('PROTOCOL_INVALID_MESSAGE');
+        expect(error.code).toBe(CODES.invalidMessage);
         expect(sourceOpenRejectionOf(error)).toBe('invalid-payload');
         expect(h.sent).toEqual([]);
         expect(h.lookups).toEqual([]);
         expectPrivate(error, [...forbidden(), file]);
         expectPrivateLogs(h.entries);
       }
+      expectSandboxUntouched();
     });
 
-    it('still refuses an escaping link when shape validation passes, with the warning logged', async () => {
-      const h = harness({ session: sessionRecordFor(project) });
+    it.skipIf(!CAN_CREATE_SYMLINKS)(
+      'still refuses an escaping link when shape validation passes, with the warning logged',
+      async () => {
+        const h = harness({ session: sessionRecordFor(project) });
 
-      refusalOf(
-        await h.handle({ sessionId: SESSION_ID, location: locationOf('src/leak.ts') }, editor),
-      );
+        refusalOf(
+          await h.handle({ sessionId: SESSION_ID, location: locationOf('src/leak.ts') }, editor),
+        );
 
-      const warning = h.entries.find((entry) => entry.level === 'warn');
-      expect(warning?.fields['rejection']).toBe('unsafe-path');
-      expect(warning?.fields['subsystem']).toBe('source');
-      expect(warning?.fields['file']).toBe('src/leak.ts');
-      expectPrivateLogs(h.entries);
-    });
+        const warning = h.entries.find((entry) => entry.level === 'warn');
+        expect(warning?.fields['rejection']).toBe('unsafe-path');
+        expect(warning?.fields['subsystem']).toBe('source');
+        expect(warning?.fields['file']).toBe('src/leak.ts');
+        expectPrivateLogs(h.entries);
+      },
+    );
 
-    it('refuses a link at the final component even when the canonicaliser misses it', async () => {
-      // An identity resolver "resolves" nothing, so the link survives to the
-      // non-following lstat, which must refuse it.
-      const h = harness({ session: sessionRecordFor(project), realpath: tableRealpath({}) });
+    it.skipIf(!CAN_CREATE_SYMLINKS)(
+      'refuses a link at the final component even when the canonicaliser misses it',
+      async () => {
+        // An identity resolver "resolves" nothing, so the link survives to the
+        // non-following lstat, which must refuse it.
+        const h = harness({ session: sessionRecordFor(project), realpath: tableRealpath({}) });
 
-      const error = refusalOf(
-        await h.handle({ sessionId: SESSION_ID, location: locationOf('src/leak.ts') }, editor),
-      );
+        const error = refusalOf(
+          await h.handle({ sessionId: SESSION_ID, location: locationOf('src/leak.ts') }, editor),
+        );
 
-      expect(error.code).toBe('FS_UNSAFE_PATH');
-      expect(error.details?.['reason']).toBe('changed-after-resolution');
-      expect(h.sent).toEqual([]);
-      expectPrivate(error, forbidden());
-    });
+        expect(error.code).toBe(CODES.unsafePath);
+        expect(error.details?.['reason']).toBe('changed-after-resolution');
+        expect(h.sent).toEqual([]);
+        expectPrivate(error, forbidden());
+      },
+    );
 
     it('checks existence only when asked to, and never skips containment', async () => {
       const virtualRoot = '/virtual/app';
@@ -826,7 +1245,7 @@ describe('createSourceOpenHandler', () => {
       const refused = refusalOf(
         await escaping.handle({ sessionId: SESSION_ID, location }, principal),
       );
-      expect(refused.code).toBe('FS_UNSAFE_PATH');
+      expect(refused.code).toBe(CODES.unsafePath);
       expect(escaping.sent).toEqual([]);
     });
   });
@@ -837,7 +1256,7 @@ describe('createSourceOpenHandler', () => {
       const contradicting = {
         ...createEnvelope('source.open', {
           sessionId: SESSION_ID,
-          location: locationOf('src/app.ts'),
+          location: locationOf(LEGIT_FILE),
         }),
         sessionId: 'ses_someone_else',
       };
@@ -847,13 +1266,20 @@ describe('createSourceOpenHandler', () => {
         42,
         '{not json',
         `{"type":"source.open","payload":"${marker}"}`,
+        true,
+        [],
         { sessionId: SESSION_ID },
-        { sessionId: SESSION_ID, location: locationOf('src/app.ts'), extra: marker },
-        { sessionId: '', location: locationOf('src/app.ts') },
+        { location: locationOf(LEGIT_FILE) },
+        { sessionId: SESSION_ID, location: locationOf(LEGIT_FILE), extra: marker },
+        { sessionId: '', location: locationOf(LEGIT_FILE) },
+        { sessionId: SESSION_ID, location: locationOf(LEGIT_FILE, { line: 0 }) },
         { sessionId: SESSION_ID, location: { ...locationOf(`../../${marker}/x.ts`), line: 0 } },
-        { sessionId: SESSION_ID, location: locationOf('src/app.ts', { confidence: 7 }) },
-        { sessionId: SESSION_ID, location: locationOf('src/app.ts', { endLine: 3 }) },
-        createEnvelope('error', { code: 'INTERNAL', message: 'not a source.open' }),
+        { sessionId: SESSION_ID, location: locationOf(LEGIT_FILE, { column: 2.5 }) },
+        { sessionId: SESSION_ID, location: { ...locationOf(LEGIT_FILE), resolvedBy: marker } },
+        { sessionId: SESSION_ID, location: locationOf(LEGIT_FILE, { confidence: 7 }) },
+        { sessionId: SESSION_ID, location: locationOf(LEGIT_FILE, { confidence: -0.1 }) },
+        { sessionId: SESSION_ID, location: locationOf(LEGIT_FILE, { endLine: 3 }) },
+        createEnvelope('error', { code: CODES.internal, message: 'not a source.open' }),
         contradicting,
       ];
 
@@ -862,7 +1288,7 @@ describe('createSourceOpenHandler', () => {
 
         const error = refusalOf(await h.handle(input, editor));
 
-        expect(error.code).toBe('PROTOCOL_INVALID_MESSAGE');
+        expect(error.code).toBe(CODES.invalidMessage);
         expect(sourceOpenRejectionOf(error)).toBe('invalid-payload');
         expect(h.lookups).toEqual([]);
         expect(h.sent).toEqual([]);
@@ -872,20 +1298,34 @@ describe('createSourceOpenHandler', () => {
   });
 
   describe('session lookup', () => {
-    const location = locationOf('src/app.ts');
+    const location = locationOf(LEGIT_FILE);
 
     it('refuses a session that does not exist', async () => {
       const h = harness({ session: undefined });
 
       const error = refusalOf(await h.handle({ sessionId: SESSION_ID, location }, editor));
 
-      expect(error.code).toBe('SESSION_NOT_FOUND');
+      expect(error.code).toBe(CODES.sessionNotFound);
       expect(sourceOpenRejectionOf(error)).toBe('session-not-found');
       expect(h.sent).toEqual([]);
     });
 
+    it('refuses an unknown session id while another session exists', async () => {
+      const h = harness({ session: sessionRecordFor(project) });
+      const unknownId = 'ses_unknown_0002';
+
+      const error = refusalOf(await h.handle({ sessionId: unknownId, location }, editor));
+
+      expect(error.code).toBe(CODES.sessionNotFound);
+      expect(h.lookups).toEqual([unknownId]);
+      expect(h.sent).toEqual([]);
+      expectPrivate(error, forbidden());
+      expectPrivateLogs(h.entries);
+      expectSandboxUntouched();
+    });
+
     it('reports a store failure — returned, thrown or rejected — as an operational error', async () => {
-      const storeError = new DebuggenError('STORE_ERROR', `corrupt row under ${base}`);
+      const storeError = new DebuggenError(CODES.store, `corrupt row under ${base}`);
       const getters: SourceOpenDeps['sessions']['get'][] = [
         () => err(storeError),
         () => {
@@ -899,7 +1339,7 @@ describe('createSourceOpenHandler', () => {
 
         const error = refusalOf(await h.handle({ sessionId: SESSION_ID, location }, editor));
 
-        expect(error.code).toBe('STORE_ERROR');
+        expect(error.code).toBe(CODES.store);
         expect(sourceOpenRejectionOf(error)).toBeUndefined();
         expect(h.sent).toEqual([]);
         expectPrivate(error, forbidden());
@@ -914,13 +1354,13 @@ describe('createSourceOpenHandler', () => {
 
       const error = refusalOf(await h.handle({ sessionId: SESSION_ID, location }, editor));
 
-      expect(error.code).toBe('STORE_ERROR');
+      expect(error.code).toBe(CODES.store);
       expect(h.sent).toEqual([]);
     });
   });
 
   describe('authorization', () => {
-    const location = locationOf('src/app.ts');
+    const location = locationOf(LEGIT_FILE);
 
     it.each<[string, unknown]>([
       ['the page agent', { client: 'agent', tabId: 7 }],
@@ -942,7 +1382,7 @@ describe('createSourceOpenHandler', () => {
         ),
       );
 
-      expect(error.code).toBe('UNAUTHORIZED');
+      expect(error.code).toBe(CODES.unauthorized);
       expect(sourceOpenRejectionOf(error)).toBe('not-authorized');
       expect(error.details?.['reason']).toBe('role-not-permitted');
       expect(h.sent).toEqual([]);
@@ -956,8 +1396,8 @@ describe('createSourceOpenHandler', () => {
         [`${project}-evil`],
         [join(base, 'pro')],
         [join(project, 'src')],
-        ['proj'],
-        ['C:\\work\\proj'],
+        ['project'],
+        ['C:\\work\\project'],
         [42],
         'not-an-array',
       ];
@@ -971,7 +1411,7 @@ describe('createSourceOpenHandler', () => {
           ),
         );
 
-        expect(error.code).toBe('UNAUTHORIZED');
+        expect(error.code).toBe(CODES.unauthorized);
         expect(error.details?.['reason']).toBe('project-out-of-scope');
         expect(h.sent).toEqual([]);
         expectPrivate(error, forbidden());
@@ -1004,7 +1444,7 @@ describe('createSourceOpenHandler', () => {
           ),
         );
 
-        expect(error.code).toBe('TAB_NOT_BOUND');
+        expect(error.code).toBe(CODES.tabNotBound);
         expect(sourceOpenRejectionOf(error)).toBe('not-authorized');
         expect(error.details?.['reason']).toBe('session-not-bound');
         expect(h.sent).toEqual([]);
@@ -1014,7 +1454,7 @@ describe('createSourceOpenHandler', () => {
       const error = refusalOf(
         await unbound.handle({ sessionId: SESSION_ID, location }, { client: 'devtools', tabId: 7 }),
       );
-      expect(error.code).toBe('TAB_NOT_BOUND');
+      expect(error.code).toBe(CODES.tabNotBound);
     });
 
     it('treats the bindings table as authoritative when the store offers it', async () => {
@@ -1026,7 +1466,7 @@ describe('createSourceOpenHandler', () => {
         refusalOf(
           await stale.handle({ sessionId: SESSION_ID, location }, { client: 'devtools', tabId: 7 }),
         ).code,
-      ).toBe('TAB_NOT_BOUND');
+      ).toBe(CODES.tabNotBound);
 
       const current = harness({ session, binding, useBindingPort: true, asyncPorts: true });
       expect(
@@ -1044,14 +1484,14 @@ describe('createSourceOpenHandler', () => {
         refusalOf(
           await none.handle({ sessionId: SESSION_ID, location }, { client: 'devtools', tabId: 7 }),
         ).code,
-      ).toBe('TAB_NOT_BOUND');
+      ).toBe(CODES.tabNotBound);
     });
 
     it('reports a bindings-table failure as a store error', async () => {
       const handler = createSourceOpenHandler({
         sessions: {
           get: () => ok(sessionRecordFor(project, 7)),
-          getBindingBySession: () => err(new DebuggenError('STORE_ERROR', 'corrupt binding')),
+          getBindingBySession: () => err(new DebuggenError(CODES.store, 'corrupt binding')),
         },
         clients: { sendToSessionClients: () => 1 },
       });
@@ -1060,7 +1500,7 @@ describe('createSourceOpenHandler', () => {
         await handler.handle({ sessionId: SESSION_ID, location }, { client: 'devtools', tabId: 7 }),
       );
 
-      expect(error.code).toBe('STORE_ERROR');
+      expect(error.code).toBe(CODES.store);
     });
 
     it('decides authorization before any filesystem work', async () => {
@@ -1080,10 +1520,92 @@ describe('createSourceOpenHandler', () => {
       expect(sourceOpenRejectionOf(error)).toBe('not-authorized');
       expect(calls).toEqual([]);
     });
+
+    it('never lets a telemetry producer kind open source, whatever scope it carries', async () => {
+      const producerKinds = CLIENT_KINDS.filter(
+        (kind) => kind !== EDITOR_KIND && kind !== clientKindFromVocabulary('devtools'),
+      );
+      expect(producerKinds).toEqual(['agent', 'server-agent']);
+
+      for (const client of producerKinds) {
+        const h = harness({ session: sessionRecordFor(project, 7) });
+
+        const error = refusalOf(
+          await h.handle(
+            { sessionId: SESSION_ID, location },
+            { client, projectRoots: [project], tabId: 7, sessionId: SESSION_ID },
+          ),
+        );
+
+        expect(error.code).toBe(CODES.unauthorized);
+        expect(error.details?.['reason']).toBe('role-not-permitted');
+        expect(h.sent).toEqual([]);
+      }
+    });
+
+    it('decides from the resolved principal only, never from carriers of another role', async () => {
+      // A DevTools connection that also carries an editor's workspace folders
+      // is still judged by its tab.
+      const devtools = harness({ session: sessionRecordFor(project, 7) });
+      const devtoolsError = refusalOf(
+        await devtools.handle(
+          { sessionId: SESSION_ID, location },
+          { client: 'devtools', tabId: 8, projectRoots: [project] },
+        ),
+      );
+      expect(devtoolsError.code).toBe(CODES.tabNotBound);
+      expect(devtools.sent).toEqual([]);
+
+      // An editor connection that also carries the bound tab is still judged
+      // by its announced workspace folders.
+      const vscode = harness({ session: sessionRecordFor(project, 7) });
+      const vscodeError = refusalOf(
+        await vscode.handle({ sessionId: SESSION_ID, location }, { client: 'vscode', tabId: 7 }),
+      );
+      expect(vscodeError.code).toBe(CODES.unauthorized);
+      expect(vscodeError.details?.['reason']).toBe('project-out-of-scope');
+      expect(vscode.sent).toEqual([]);
+    });
+
+    it('refuses a frame that names its own project root, and never looks the session up', async () => {
+      const h = harness({ session: sessionRecordFor(project) });
+      const selfDescribing = {
+        sessionId: SESSION_ID,
+        location,
+        projectRoot: outside,
+        client: 'vscode',
+      };
+
+      const error = refusalOf(await h.handle(selfDescribing, editor));
+
+      expect(error.code).toBe(CODES.invalidMessage);
+      expect(h.lookups).toEqual([]);
+      expect(h.sent).toEqual([]);
+      expectPrivate(error, forbidden());
+    });
+
+    it('contains against the stored SessionRecord.projectRoot, not anything the request names', async () => {
+      const calls: string[] = [];
+      const recording: SourceOpenRealPath = async (path) => {
+        calls.push(path);
+        return realpathAsync(path);
+      };
+      const h = harness({ session: sessionRecordFor(project), realpath: recording });
+
+      valueOf(
+        await h.handle(
+          { sessionId: SESSION_ID, location },
+          { client: 'vscode', projectRoots: [base, outside] },
+        ),
+      );
+
+      expect(calls).toEqual([project, join(project, LEGIT_FILE)]);
+      expect(calls.some((path) => path.startsWith(outside))).toBe(false);
+    });
   });
 
   describe('delivery', () => {
-    const location = locationOf('src/app.ts');
+    const location = locationOf(LEGIT_FILE);
 
     it('reports a client registry that throws or rejects as a transport failure', async () => {
       const senders: SourceOpenDeps['clients']['sendToSessionClients'][] = [
@@ -1097,7 +1619,7 @@ describe('createSourceOpenHandler', () => {
 
         const error = refusalOf(await h.handle({ sessionId: SESSION_ID, location }, editor));
 
-        expect(error.code).toBe('TRANSPORT_DISCONNECTED');
+        expect(error.code).toBe(CODES.transport);
         expect(sourceOpenRejectionOf(error)).toBeUndefined();
       }
     });
@@ -1108,7 +1630,7 @@ describe('createSourceOpenHandler', () => {
 
         const error = refusalOf(await h.handle({ sessionId: SESSION_ID, location }, editor));
 
-        expect(error.code).toBe('INTERNAL');
+        expect(error.code).toBe(CODES.internal);
       }
     });
 
@@ -1127,13 +1649,13 @@ describe('createSourceOpenHandler', () => {
 
       const error = refusalOf(await handler.handle({ sessionId: SESSION_ID, location }, editor));
 
-      expect(error.code).toBe('INTERNAL');
+      expect(error.code).toBe(CODES.internal);
       expect(sent).toEqual([]);
     });
   });
 
   describe('logging', () => {
-    const location = locationOf('src/app.ts');
+    const location = locationOf(LEGIT_FILE);
 
     it('records a forward at debug with the standard bindings and project-relative fields only', async () => {
       const h = harness({ session: sessionRecordFor(project) });
@@ -1145,8 +1667,8 @@ describe('createSourceOpenHandler', () => {
       expect(entry?.fields).toMatchObject({
         subsystem: 'source',
         sessionId: SESSION_ID,
-        client: 'vscode',
-        file: 'src/app.ts',
+        client: EDITOR_KIND,
+        file: LEGIT_FILE,
         line: 12,
         column: 5,
         resolvedBy: 'code-graph',
@@ -1177,16 +1699,40 @@ describe('createSourceOpenHandler', () => {
           valueOf(await delivered.handle({ sessionId: SESSION_ID, location }, editor)).delivered,
         ).toBe(true);
 
+        // A probing refusal is recorded at warn; a stale link at debug.
         const refused = harness({ session: sessionRecordFor(project), logger });
+        expect(
+          refusalOf(await refused.handle({ sessionId: SESSION_ID, location }, { client: 'agent' }))
+            .code,
+        ).toBe(CODES.unauthorized);
         expect(
           refusalOf(
             await refused.handle(
-              { sessionId: SESSION_ID, location: locationOf('src/leak.ts') },
+              { sessionId: SESSION_ID, location: locationOf('src/missing.ts') },
               editor,
             ),
           ).code,
-        ).toBe('FS_UNSAFE_PATH');
+        ).toBe(CODES.fileMissing);
       }
+    });
+
+    it('records refusals with enumerated fields only, never the rejected value', async () => {
+      const h = harness({ session: sessionRecordFor(project) });
+
+      refusalOf(
+        await h.handle(
+          { sessionId: SESSION_ID, location: locationOf(`../outside/${FOREIGN_NAME}`) },
+          editor,
+        ),
+      );
+      refusalOf(await h.handle({ sessionId: SESSION_ID, location }, { client: 'server-agent' }));
+      refusalOf(
+        await h.handle({ sessionId: SESSION_ID, location: locationOf('src/missing.ts') }, editor),
+      );
+
+      expect(h.entries.length).toBeGreaterThanOrEqual(3);
+      expect(JSON.stringify(h.entries)).not.toContain(`../outside/${FOREIGN_NAME}`);
+      expectPrivateLogs(h.entries);
     });
   });
 
@@ -1198,7 +1744,7 @@ describe('createSourceOpenHandler', () => {
       });
       const inputs: unknown[] = [
         undefined,
-        { sessionId: SESSION_ID, location: locationOf('src/app.ts') },
+        { sessionId: SESSION_ID, location: locationOf(LEGIT_FILE) },
       ];
       for (const input of inputs) {
         const result = await handler.handle(input, hostile<SourceOpenPrincipal>(undefined));
@@ -1206,7 +1752,7 @@ describe('createSourceOpenHandler', () => {
       }
     });
 
-    it('uses the real filesystem by default', async () => {
+    it.skipIf(!CAN_CREATE_SYMLINKS)('uses the real filesystem by default', async () => {
       const handler = createSourceOpenHandler({
         sessions: { get: () => ok(sessionRecordFor(project)) },
         clients: { sendToSessionClients: () => 1 },
@@ -1214,10 +1760,7 @@ describe('createSourceOpenHandler', () => {
 
       expect(
         valueOf(
-          await handler.handle(
-            { sessionId: SESSION_ID, location: locationOf('src/app.ts') },
-            editor,
-          ),
+          await handler.handle({ sessionId: SESSION_ID, location: locationOf(LEGIT_FILE) }, editor),
         ).delivered,
       ).toBe(true);
       expect(
@@ -1227,7 +1770,8 @@ describe('createSourceOpenHandler', () => {
             editor,
           ),
         ).code,
-      ).toBe('FS_UNSAFE_PATH');
+      ).toBe(CODES.unsafePath);
+      expectSandboxUntouched();
     });
   });
 });

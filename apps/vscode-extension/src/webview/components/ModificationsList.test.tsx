@@ -18,29 +18,56 @@
  *     a callback is supplied.
  *   - **A conflict is never reported as a revert**, and only a conflict row
  *     shows where its original is preserved.
+ *   - **The grid is the design system's**: `DataTable` owns `role="grid"` and
+ *     the component adds no competing table role of its own.
  *   - **The three states** and their precedence: error > pending > empty > table.
+ *     The empty state is a neutral outcome — a runtime-only plan modifies no
+ *     file — so it is never presented as an alert.
+ *   - **Nothing reaches the console** in any state, with a diff open included:
+ *     diffs carry source code, and the hashes and backup path are local
+ *     file-system details (AAP 0.5.2).
+ *
+ * `DataTable` is rendered for real, never mocked: under happy-dom the
+ * virtualizer measures zero-sized rects and reports no items, and the
+ * primitive's measurement-unavailable fallback then renders every row, which
+ * is what makes the row and ARIA assertions below meaningful.
  *
  * The fixture paths, hashes and diffs are generic vocabulary written for this
  * suite; no inspected project's names appear in it (AAP 0.5.4).
  */
 
-import { act, render, screen, within } from '@testing-library/react';
+import { act, cleanup, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { ModificationRecord } from '@debuggen/protocol';
+import { createEnvelope, MODIFICATION_STATUSES, parseMessage } from '@debuggen/protocol';
+import type { ModificationRecord, ModificationStatus } from '@debuggen/protocol';
 
 import { ModificationsList } from './ModificationsList';
 
-/** A small, well-formed unified diff for one file. */
-function diffFor(file: string, added: string): string {
+// `@testing-library/react` registers its automatic cleanup only on a global
+// `afterEach`; registering it explicitly keeps this suite correct whether or not
+// the Vitest project exposes globals. Spies are restored in the same hook so a
+// failing assertion can never leak a patched `console` into the next case.
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
+
+/**
+ * A small, well-formed unified diff for one file: one removed and one added
+ * line inside a hunk whose counts are exact (three lines on each side), so
+ * `DiffView` classifies both content lines rather than treating the hunk as
+ * over.
+ */
+function diffFor(file: string, removed: string, added: string): string {
   return [
     `--- a/${file}`,
     `+++ b/${file}`,
-    '@@ -1,3 +1,4 @@',
+    '@@ -1,3 +1,3 @@',
     ' export function run() {',
+    `-  ${removed}`,
     `+  ${added}`,
-    '   return 1;',
     ' }',
     '',
   ].join('\n');
@@ -51,15 +78,19 @@ function digest(digit: string): string {
   return digit.repeat(64);
 }
 
-/** Builds one record; every field is a value the schema accepts. */
-function record(
-  suffix: string,
-  file: string,
-  status: ModificationRecord['status'],
-  extra: Partial<ModificationRecord> = {},
-): ModificationRecord {
+/** The file a record names when an override does not name one. */
+const DEFAULT_FILE = 'src/lib/sample/module.ts';
+
+/**
+ * Builds one record against the real protocol type; every default is a value
+ * the schema accepts. The default diff is derived from the record's (possibly
+ * overridden) file, so a record's diff headers always name its own path.
+ */
+function makeRecord(overrides?: Partial<ModificationRecord>): ModificationRecord {
+  const file = overrides?.file ?? DEFAULT_FILE;
+
   return {
-    id: `mod_${suffix.padStart(16, '0')}`,
+    id: 'mod_0000000000000000',
     sessionId: 'ses_fixture',
     planVersion: 1,
     file,
@@ -67,10 +98,31 @@ function record(
     backupPath: `/home/dev/.debuggen/backups/ses_fixture/${digest('a')}`,
     instrumentedHash: digest('b'),
     appliedAt: Date.UTC(2026, 0, 15, 9, 30, 0),
-    status,
-    diff: diffFor(file, `const marker${suffix} = true;`),
-    ...extra,
+    status: 'applied',
+    diff: diffFor(file, 'return 0;', 'return 1;'),
+    ...overrides,
   };
+}
+
+/**
+ * A record numbered `n`: a distinct id and a diff whose two content lines are
+ * unique to it, so a diff routed into the wrong row is detectable.
+ */
+function numberedRecord(
+  n: number,
+  file: string,
+  status: ModificationStatus,
+  extra?: Partial<ModificationRecord>,
+): ModificationRecord {
+  const marker = `marker${String(n)}`;
+
+  return makeRecord({
+    id: `mod_${String(n).padStart(16, '0')}`,
+    file,
+    status,
+    diff: diffFor(file, `const ${marker} = false;`, `const ${marker} = true;`),
+    ...extra,
+  });
 }
 
 /**
@@ -78,17 +130,54 @@ function record(
  * status, so an accidental sort would be visible.
  */
 const RECORDS: readonly ModificationRecord[] = [
-  record('1', 'src/server/zeta/handler.ts', 'applied'),
-  record('2', 'src/features/alpha/Widget.tsx', 'conflict'),
-  record('3', 'src/lib/mid/loader.ts', 'reverted', {
+  numberedRecord(1, 'src/server/zeta/handler.ts', 'applied'),
+  numberedRecord(2, 'src/features/alpha/Widget.tsx', 'conflict'),
+  numberedRecord(3, 'src/lib/mid/loader.ts', 'reverted', {
     planVersion: 2,
     previousRecordId: 'mod_0000000000000001',
     originalHash: digest('b'),
     instrumentedHash: digest('c'),
   }),
-  record('4', 'src/lib/beta/queue.ts', 'pending'),
-  record('5', 'src/server/eta/jobs.ts', 'failed'),
+  numberedRecord(4, 'src/lib/beta/queue.ts', 'pending'),
+  numberedRecord(5, 'src/server/eta/jobs.ts', 'failed'),
 ];
+
+/**
+ * The record at `index` of {@link RECORDS}, failing the test when it is absent
+ * (`noUncheckedIndexedAccess` types every index read as possibly undefined).
+ */
+function fixture(index: number): ModificationRecord {
+  const entry = RECORDS[index];
+  if (entry === undefined) {
+    throw new Error(`expected a fixture record at index ${String(index)}`);
+  }
+  return entry;
+}
+
+/**
+ * The expected presentation of every status: its badge label and tone class.
+ * A `Record` over the union, so a status added to the protocol is a compile
+ * error here until the suite states what it must look like.
+ */
+const STATUS_PRESENTATION: Readonly<
+  Record<ModificationStatus, { readonly label: string; readonly toneClass: string }>
+> = {
+  pending: { label: 'Pending', toneClass: 'dg-badge--neutral' },
+  applied: { label: 'Applied', toneClass: 'dg-badge--info' },
+  reverted: { label: 'Reverted', toneClass: 'dg-badge--success' },
+  conflict: { label: 'Conflict', toneClass: 'dg-badge--danger' },
+  failed: { label: 'Failed', toneClass: 'dg-badge--danger' },
+};
+
+/** The five console methods the privacy cases watch. */
+const CONSOLE_METHODS = ['log', 'info', 'warn', 'error', 'debug'] as const;
+
+/** The diff lines of one kind inside `root`, as their text. */
+function diffLineTexts(root: ParentNode, kind: 'added' | 'removed'): string[] {
+  return Array.from(root.querySelectorAll(`.dgv-diff__line--${kind}`)).map(
+    (line) => line.textContent ?? '',
+  );
+}
 
 /** The design system's data rows (never the header or a detail row). */
 function dataRows(container: HTMLElement): HTMLElement[] {
@@ -119,7 +208,34 @@ function detailRows(container: HTMLElement): HTMLElement[] {
   return Array.from(container.querySelectorAll<HTMLElement>('.dg-data-table__expanded'));
 }
 
+describe('ModificationsList fixtures', () => {
+  it('are records the protocol itself accepts on an instrumentation.ready frame', () => {
+    // A fixture the service could never send would make every case below test
+    // a shape that does not occur, so the records go through the real schema.
+    const parsed = parseMessage(
+      createEnvelope('instrumentation.ready', {
+        sessionId: 'ses_fixture',
+        applied: [...RECORDS, makeRecord()],
+        runtimeHooks: [],
+        unavailable: [],
+      }),
+    );
+
+    expect(parsed.ok).toBe(true);
+  });
+});
+
 describe('ModificationsList table', () => {
+  it('renders the design system grid and adds no competing table role', () => {
+    const { container } = render(<ModificationsList modifications={RECORDS} />);
+
+    const grids = screen.queryAllByRole('grid');
+    expect(grids).toHaveLength(1);
+    expect(grids[0]?.closest('.dg-data-table')).not.toBeNull();
+    expect(container.querySelector('[role="table"]')).toBeNull();
+    expect(container.querySelector('table')).toBeNull();
+  });
+
   it('renders one row per record, in the given order, named by its file', () => {
     const { container } = render(<ModificationsList modifications={RECORDS} />);
 
@@ -139,8 +255,8 @@ describe('ModificationsList table', () => {
   });
 
   it('splits the path so the file name survives truncation, without altering its text', () => {
-    const bare = record('8', 'README.md', 'applied');
-    const { container } = render(<ModificationsList modifications={[RECORDS[1] ?? bare, bare]} />);
+    const bare = numberedRecord(8, 'README.md', 'applied');
+    const { container } = render(<ModificationsList modifications={[fixture(1), bare]} />);
 
     const nested = rowAt(container, 0).querySelector('.dgv-modifications__file');
     expect(nested?.querySelector('.dgv-modifications__directory')?.textContent).toBe(
@@ -157,19 +273,53 @@ describe('ModificationsList table', () => {
   it('labels every status with text on a toned badge', () => {
     const { container } = render(<ModificationsList modifications={RECORDS} />);
 
-    const expected: readonly [string, string][] = [
-      ['Applied', 'dg-badge--info'],
-      ['Conflict', 'dg-badge--danger'],
-      ['Reverted', 'dg-badge--success'],
-      ['Pending', 'dg-badge--neutral'],
-      ['Failed', 'dg-badge--danger'],
-    ];
-
-    expected.forEach(([label, toneClass], index) => {
+    RECORDS.forEach((entry, index) => {
+      const { label, toneClass } = STATUS_PRESENTATION[entry.status];
       const badge = rowAt(container, index).querySelector('.dg-badge');
       expect(badge?.textContent).toBe(label);
       expect(badge?.classList.contains(toneClass)).toBe(true);
     });
+  });
+
+  it.each(MODIFICATION_STATUSES.map((status) => [status]))(
+    'renders a %s record with its own non-empty text label',
+    (status) => {
+      const { container } = render(
+        <ModificationsList modifications={[numberedRecord(6, 'src/lib/solo/entry.ts', status)]} />,
+      );
+
+      const badges = rowAt(container, 0).querySelectorAll('.dg-badge');
+      expect(badges).toHaveLength(1);
+      const text = badges[0]?.textContent ?? '';
+      expect(text.trim()).not.toBe('');
+      expect(text).toBe(STATUS_PRESENTATION[status].label);
+    },
+  );
+
+  it('gives the five statuses five distinct, non-blank labels', () => {
+    const { container } = render(<ModificationsList modifications={RECORDS} />);
+
+    // The fixture must cover the whole vocabulary for this case to mean anything.
+    expect(new Set(RECORDS.map((entry) => entry.status))).toEqual(new Set(MODIFICATION_STATUSES));
+
+    const labels = dataRows(container).map(
+      (row) => row.querySelector('.dg-badge')?.textContent?.trim() ?? '',
+    );
+    expect(labels).toHaveLength(MODIFICATION_STATUSES.length);
+    expect(labels.every((label) => label !== '')).toBe(true);
+    expect(new Set(labels).size).toBe(labels.length);
+  });
+
+  it('never labels a conflict the way it labels a revert', () => {
+    const { container } = render(<ModificationsList modifications={RECORDS} />);
+
+    const conflictBadge = rowAt(container, 1).querySelector('.dg-badge')?.textContent ?? '';
+    const revertedBadge = rowAt(container, 2).querySelector('.dg-badge')?.textContent ?? '';
+    expect(fixture(1).status).toBe('conflict');
+    expect(fixture(2).status).toBe('reverted');
+    expect(conflictBadge).not.toBe('');
+    expect(conflictBadge).not.toBe(revertedBadge);
+    expect(conflictBadge).not.toMatch(/revert/iu);
   });
 
   it('says a conflicting file was left untouched with its original preserved, never reverted', () => {
@@ -205,7 +355,7 @@ describe('ModificationsList table', () => {
   });
 
   it('renders no time for a timestamp no Date can represent', () => {
-    const odd = record('9', 'src/lib/odd.ts', 'applied', { appliedAt: Number.MAX_VALUE });
+    const odd = numberedRecord(9, 'src/lib/odd.ts', 'applied', { appliedAt: Number.MAX_VALUE });
     const { container } = render(<ModificationsList modifications={[odd]} />);
 
     expect(rowAt(container, 0).querySelector('time')).toBeNull();
@@ -272,10 +422,9 @@ describe('ModificationsList "View diff"', () => {
     const lines = Array.from(region.querySelectorAll('.dgv-diff__line')).map(
       (line) => line.textContent ?? '',
     );
-    expect(lines.join('\n') + '\n').toBe(RECORDS[1]?.diff);
-    expect(region.querySelector('.dgv-diff__line--added')?.textContent).toBe(
-      '+  const marker2 = true;',
-    );
+    expect(lines.join('\n') + '\n').toBe(fixture(1).diff);
+    expect(diffLineTexts(region, 'removed')).toEqual(['-  const marker2 = false;']);
+    expect(diffLineTexts(region, 'added')).toEqual(['+  const marker2 = true;']);
 
     await user.click(opened);
 
@@ -283,6 +432,35 @@ describe('ModificationsList "View diff"', () => {
     expect(toggle.getAttribute('aria-expanded')).toBe('false');
     expect(toggle.hasAttribute('aria-controls')).toBe(false);
     expect(toggle.textContent).toBe('View diff');
+  });
+
+  it('renders the expanded record’s own diff and never another record’s', async () => {
+    const user = userEvent.setup();
+    const first = numberedRecord(11, 'src/lib/first/source.ts', 'applied', {
+      diff: diffFor('src/lib/first/source.ts', 'const firstValue = 1;', 'const firstValue = 2;'),
+    });
+    const second = numberedRecord(12, 'src/lib/second/source.ts', 'applied', {
+      diff: diffFor('src/lib/second/source.ts', 'const secondValue = 3;', 'const secondValue = 4;'),
+    });
+    const { container } = render(<ModificationsList modifications={[first, second]} />);
+
+    // The second row is opened deliberately: a list that routes the first
+    // record's diff into every detail row fails here.
+    await user.click(screen.getByRole('button', { name: 'View diff of src/lib/second/source.ts' }));
+
+    let detail = detailRows(container)[0];
+    expect(detail).toBeDefined();
+    expect(diffLineTexts(detail ?? container, 'removed')).toEqual(['-  const secondValue = 3;']);
+    expect(diffLineTexts(detail ?? container, 'added')).toEqual(['+  const secondValue = 4;']);
+    expect(container.textContent ?? '').not.toContain('firstValue');
+
+    await user.click(screen.getByRole('button', { name: 'View diff of src/lib/first/source.ts' }));
+
+    detail = detailRows(container)[0];
+    expect(detailRows(container)).toHaveLength(1);
+    expect(diffLineTexts(detail ?? container, 'removed')).toEqual(['-  const firstValue = 1;']);
+    expect(diffLineTexts(detail ?? container, 'added')).toEqual(['+  const firstValue = 2;']);
+    expect(container.textContent ?? '').not.toContain('secondValue');
   });
 
   it('keeps one diff open at a time, moving the disclosure to the row activated last', async () => {
@@ -315,7 +493,7 @@ describe('ModificationsList "View diff"', () => {
     );
     let detail = detailRows(container)[0];
     const preserved = detail?.querySelector('.dgv-modifications__preserved');
-    expect(preserved?.textContent).toBe(`Original preserved at ${RECORDS[1]?.backupPath ?? ''}`);
+    expect(preserved?.textContent).toBe(`Original preserved at ${fixture(1).backupPath}`);
 
     const hashes = detail?.querySelector('.dgv-modifications__hashes');
     expect(hashes?.textContent ?? '').toContain(`Original SHA-256 ${digest('a').slice(0, 12)}`);
@@ -351,7 +529,7 @@ describe('ModificationsList "View diff"', () => {
 
   it('renders the diff’s own empty state for a record whose diff is blank', async () => {
     const user = userEvent.setup();
-    const blank = record('7', 'src/lib/blank.ts', 'applied', { diff: '' });
+    const blank = numberedRecord(7, 'src/lib/blank.ts', 'applied', { diff: '' });
     const { container } = render(<ModificationsList modifications={[blank]} />);
 
     await user.click(screen.getByRole('button', { name: 'View diff of src/lib/blank.ts' }));
@@ -377,6 +555,22 @@ describe('ModificationsList open file', () => {
     expect(onOpenFile).toHaveBeenCalledWith('src/lib/beta/queue.ts');
   });
 
+  it('passes a path with spaces and dotted segments through byte for byte', async () => {
+    const user = userEvent.setup();
+    const onOpenFile = vi.fn<(file: string) => void>();
+    const file = '.config/some dir/entry.test-helper.ts';
+    render(
+      <ModificationsList
+        modifications={[numberedRecord(10, file, 'reverted')]}
+        onOpenFile={onOpenFile}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: `Open file ${file}` }));
+
+    expect(onOpenFile.mock.calls).toEqual([[file]]);
+  });
+
   it('renders no open control when no callback is supplied', () => {
     render(<ModificationsList modifications={RECORDS} />);
 
@@ -389,11 +583,14 @@ describe('ModificationsList states', () => {
   it('renders the neutral empty state, and no grid, when nothing was modified', () => {
     const { container } = render(<ModificationsList modifications={[]} className="extra" />);
 
-    expect(screen.getByRole('status').textContent).toContain(
-      'No files were modified for this session.',
-    );
-    expect(screen.queryByRole('grid')).toBeNull();
+    const status = screen.getByRole('status');
+    expect(status.textContent).toContain('No files were modified for this session.');
+    // A runtime-only plan modifies nothing, which is the good outcome: the
+    // empty state is neither an alert nor a load in progress.
+    expect(status.getAttribute('aria-busy')).not.toBe('true');
     expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.queryByRole('grid')).toBeNull();
+    expect(container.querySelector('.dg-badge')).toBeNull();
     expect(container.firstElementChild?.className).toBe('dgv-modifications extra');
   });
 
@@ -403,7 +600,23 @@ describe('ModificationsList states', () => {
     const status = screen.getByRole('status');
     expect(status.getAttribute('aria-busy')).toBe('true');
     expect(screen.queryByRole('grid')).toBeNull();
+    expect(dataRows(container)).toHaveLength(0);
+    expect(container.textContent ?? '').not.toContain('src/server/zeta/handler.ts');
     expect(container.firstElementChild?.classList.contains('dgv-modifications')).toBe(true);
+  });
+
+  it('renders only the alert when error, pending and an empty list coincide', () => {
+    const { container } = render(
+      <ModificationsList modifications={[]} pending error="The service did not answer." />,
+    );
+
+    const alerts = screen.queryAllByRole('alert');
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]?.textContent ?? '').toContain('The service did not answer.');
+    expect(screen.queryByRole('status')).toBeNull();
+    expect(screen.queryByRole('grid')).toBeNull();
+    expect(container.querySelector('[aria-busy="true"]')).toBeNull();
+    expect(container.textContent ?? '').not.toContain('No files were modified for this session.');
   });
 
   it('renders the error state above every other state, with retry when supplied', async () => {
@@ -445,5 +658,82 @@ describe('ModificationsList states', () => {
     const { container } = render(<ModificationsList modifications={RECORDS} className="  " />);
 
     expect(container.firstElementChild?.className).toBe('dgv-modifications');
+  });
+});
+
+describe('ModificationsList privacy', () => {
+  /** One silenced console method and the calls it recorded. */
+  interface ConsoleSpy {
+    readonly method: (typeof CONSOLE_METHODS)[number];
+    readonly calls: () => number;
+  }
+
+  let spies: ConsoleSpy[] = [];
+
+  // Installed per test and removed by the file-wide `vi.restoreAllMocks()`.
+  beforeEach(() => {
+    spies = CONSOLE_METHODS.map((method) => {
+      const spy = vi.spyOn(console, method).mockImplementation(() => undefined);
+      return { method, calls: () => spy.mock.calls.length };
+    });
+  });
+
+  /** Asserts that no console method was called, naming the one that was. */
+  function expectConsoleSilent(): void {
+    expect(spies).toHaveLength(CONSOLE_METHODS.length);
+    for (const { method, calls } of spies) {
+      expect({ method, calls: calls() }).toEqual({ method, calls: 0 });
+    }
+  }
+
+  it('writes nothing to the console while rendering rows and opening a conflict’s diff', async () => {
+    const user = userEvent.setup();
+    const onOpenFile = vi.fn<(file: string) => void>();
+    const { container } = render(
+      <ModificationsList modifications={RECORDS} onOpenFile={onOpenFile} />,
+    );
+
+    // The conflict row's detail carries all three sensitive values at once: the
+    // source diff, both hashes and the local backup path.
+    await user.click(
+      screen.getByRole('button', { name: 'View diff of src/features/alpha/Widget.tsx' }),
+    );
+    expect(detailRows(container)[0]?.querySelector('.dgv-modifications__preserved')).not.toBeNull();
+    expect(diffLineTexts(container, 'added')).toEqual(['+  const marker2 = true;']);
+
+    await user.click(
+      screen.getByRole('button', { name: 'Open file src/features/alpha/Widget.tsx' }),
+    );
+    await user.click(
+      screen.getByRole('button', { name: 'Hide diff of src/features/alpha/Widget.tsx' }),
+    );
+
+    expect(onOpenFile).toHaveBeenCalledTimes(1);
+    expectConsoleSilent();
+  });
+
+  it('writes nothing to the console in the loading state', () => {
+    render(<ModificationsList modifications={RECORDS} pending />);
+
+    expect(screen.queryByRole('status')).not.toBeNull();
+    expectConsoleSilent();
+  });
+
+  it('writes nothing to the console in the empty state', () => {
+    render(<ModificationsList modifications={[]} />);
+
+    expect(screen.queryByRole('status')).not.toBeNull();
+    expectConsoleSilent();
+  });
+
+  it('writes nothing to the console in the error state, retry included', async () => {
+    const user = userEvent.setup();
+    const onRetry = vi.fn<() => void>();
+    render(<ModificationsList modifications={RECORDS} error="Unavailable." onRetry={onRetry} />);
+
+    await user.click(within(screen.getByRole('alert')).getByRole('button', { name: /retry/iu }));
+
+    expect(onRetry).toHaveBeenCalledTimes(1);
+    expectConsoleSilent();
   });
 });
