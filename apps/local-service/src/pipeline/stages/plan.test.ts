@@ -26,19 +26,30 @@
  * instrumentation service, a recording progress emitter and a capturing logger.
  * The real `normalizePlan` and `checkPlanFeasibility` run, wrapped in spies so
  * their call order is observable. No store, no prompt file, no network and no
- * filesystem. Fixtures use invented, generic vocabulary only. End-to-end
+ * filesystem write: the only filesystem access is the read-only static scan of
+ * `./plan.ts` at the end of the file, which pins that the stage itself imports
+ * no Node built-in, names no adapter id and no application route, and spells
+ * every relative specifier with `.js`. Vocabulary — modes, rejection codes,
+ * progress stages, placeholder keys — is taken from its owning module rather
+ * than restated. Fixtures use invented, generic vocabulary only. End-to-end
  * behaviour against an indexed fixture project belongs to
  * `test/integration/pipeline-deterministic.test.ts`, and the repair loop's
  * internals to `packages/model-provider/src/structured.test.ts`.
  */
 
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
 
 import {
   ACTION_ID_PATTERN,
+  ADAPTER_IDS,
   AGENT_HOOK_KEYS,
   CAPTURE_SIGNALS,
+  FEASIBILITY_REJECTION_CODES,
   INSTRUMENTATION_ACTION_TYPES,
+  INSTRUMENTATION_MODES,
   PROBLEM_CATEGORIES,
   PROBLEM_ENTITY_KINDS,
   SERVER_AGENT_SIGNAL_KEYS,
@@ -58,6 +69,7 @@ import {
   type AdapterRegistry,
   type CaptureSignal,
   type ClaimingAdapter,
+  type FeasibilityRejectionCode,
   type FeasibilityReport,
   type InstrumentationAction,
   type InstrumentationActionType,
@@ -104,12 +116,17 @@ import {
   type InstrumentationOutcome,
 } from '../../instrumentation/service.js';
 import type { RecordPlanInput, RecordedPlan } from '../../sessions/manager.js';
-import { CAPTURE_SIGNAL_LABELS, type ProgressRow } from '../../sessions/progress.js';
-import type {
-  PipelineCodeHandles,
-  PipelineStageContext,
-  PlanRequestInput,
-  StageRequestBuild,
+import {
+  CAPTURE_SIGNAL_LABELS,
+  type ProgressRow,
+  type SessionProgress,
+} from '../../sessions/progress.js';
+import {
+  STAGE_PLACEHOLDERS,
+  type PipelineCodeHandles,
+  type PipelineStageContext,
+  type PlanRequestInput,
+  type StageRequestBuild,
 } from '../context-builder.js';
 import type { CodeInvestigation } from './investigate.js';
 import {
@@ -148,11 +165,29 @@ const INSTRUMENT = PROGRESS_STAGES[3];
 /** The three progress statuses, in protocol's order. */
 const [RUNNING, DONE, FAILED] = PROGRESS_STATUSES;
 
-/** The runtime install mode, which touches no file. */
-const RUNTIME: InstrumentationMode = 'runtime';
+/** The runtime install mode, which touches no file — the imported vocabulary's first member. */
+const RUNTIME: InstrumentationMode = INSTRUMENTATION_MODES[0];
 
-/** The patch install mode, which edits a file. */
-const PATCH: InstrumentationMode = 'patch';
+/** The patch install mode, which edits a file — the imported vocabulary's second member. */
+const PATCH: InstrumentationMode = INSTRUMENTATION_MODES[1];
+
+/**
+ * A member of the imported feasibility rejection vocabulary, looked up so a
+ * rename there fails here instead of being restated as a string literal.
+ */
+function rejectionCode(member: FeasibilityRejectionCode): FeasibilityRejectionCode {
+  const found = FEASIBILITY_REJECTION_CODES.find((code) => code === member);
+  if (found === undefined) {
+    throw new Error(`Expected ${member} to be a feasibility rejection code.`);
+  }
+  return found;
+}
+
+/** The refusal of an action whose file the code index does not hold. */
+const FILE_NOT_INDEXED = rejectionCode('file-not-indexed');
+
+/** The refusal of an action repeated within one plan. */
+const DUPLICATE_ACTION = rejectionCode('duplicate-action');
 
 /** The schema argument a provider's `generateStructured` receives. */
 type StructuredSchema = Parameters<ModelProvider['generateStructured']>[0];
@@ -733,9 +768,26 @@ interface ProgressCall {
 /** Whether every progress method succeeds, answers `Err`, or throws. */
 type ProgressBehaviour = 'ok' | 'err' | 'throw';
 
-/** A progress emitter that records every call and answers per its behaviour. */
-class RecordingProgress implements ProgressApi {
+/**
+ * A progress emitter that records every call and answers per its behaviour.
+ *
+ * It also carries the members of `SessionProgress` the plan stage is **not**
+ * given — the instrument group's `reportInstrumentation` and
+ * `readyToCapture`, and the finding rows — so a run that reached for any of
+ * them is recorded in {@link foreign}. The instrumentation service reports the
+ * installed signals through `reportInstrumentation`; this stage never does.
+ */
+class RecordingProgress
+  implements
+    ProgressApi,
+    Pick<
+      SessionProgress,
+      'reportInstrumentation' | 'reportInvestigation' | 'readyToCapture' | 'finding'
+    >
+{
   readonly calls: ProgressCall[] = [];
+  /** Every call to a member outside the plan stage's `Pick`, by name. */
+  readonly foreign: string[] = [];
   readonly #behaviour: ProgressBehaviour;
 
   constructor(behaviour: ProgressBehaviour = 'ok') {
@@ -774,6 +826,26 @@ class RecordingProgress implements ProgressApi {
   ): Result<SessionProgressPayload, DebuggenError> {
     this.calls.push({ method: 'stageFailed', stage: failure.stage, failure });
     return this.#answer(sessionId, failure.stage, FAILED);
+  }
+
+  reportInstrumentation(): Result<readonly SessionProgressPayload[], DebuggenError> {
+    this.foreign.push('reportInstrumentation');
+    return ok([]);
+  }
+
+  reportInvestigation(): Result<readonly SessionProgressPayload[], DebuggenError> {
+    this.foreign.push('reportInvestigation');
+    return ok([]);
+  }
+
+  readyToCapture(sessionId: string): Result<SessionProgressPayload, DebuggenError> {
+    this.foreign.push('readyToCapture');
+    return this.#answer(sessionId, INSTRUMENT, DONE);
+  }
+
+  finding(sessionId: string, stage: ProgressStage): Result<SessionProgressPayload, DebuggenError> {
+    this.foreign.push('finding');
+    return this.#answer(sessionId, stage, DONE);
   }
 
   #answer(
@@ -895,6 +967,20 @@ function sessionRecord(plans: readonly InstrumentationPlan[] = []): SessionRecor
   };
 }
 
+/**
+ * The same object behind a proxy that records the name of every member read,
+ * so a test can prove a collaborator was reached only through the members the
+ * stage is given (no status transition, no second store write).
+ */
+function accessRecorded<T extends object>(target: T, accessed: string[]): T {
+  return new Proxy(target, {
+    get: (object, key, receiver) => {
+      accessed.push(String(key));
+      return Reflect.get(object, key, receiver) as unknown;
+    },
+  });
+}
+
 /** A session manager whose `recordPlan` stamps the plan the way the real one does. */
 function fakeSessionManager(): {
   readonly manager: PlanStageDeps['sessionManager'];
@@ -959,6 +1045,8 @@ interface HarnessOptions {
   readonly maxRepairs?: number | undefined;
   readonly nextPlanVersion?: number | undefined;
   readonly registry?: FakeRegistry | undefined;
+  /** A registry to hand the stage instead of `registry`'s; the fakes are still built. */
+  readonly adapterRegistry?: AdapterRegistry | undefined;
   readonly signal?: AbortSignal | undefined;
   readonly installAnswer?:
     ((request: InstallRequest) => Result<InstrumentationOutcome, DebuggenError>) | undefined;
@@ -975,6 +1063,8 @@ interface Harness {
   readonly instrumentation: FakeInstrumentation;
   readonly recordPlan: Mock<PlanStageDeps['sessionManager']['recordPlan']>;
   readonly nextPlanVersion: Mock<PlanStageDeps['sessions']['nextPlanVersion']>;
+  /** Every member the stage read on the session manager and the session store. */
+  readonly storeAccess: { readonly manager: string[]; readonly sessions: string[] };
   readonly fakes: FakeRegistry;
   readonly fixture: ContextFixture;
 }
@@ -990,13 +1080,14 @@ function harness(options: HarnessOptions = {}): Harness {
   const nextPlanVersion = vi.fn<PlanStageDeps['sessions']['nextPlanVersion']>(() =>
     ok(options.nextPlanVersion ?? 3),
   );
+  const storeAccess = { manager: [] as string[], sessions: [] as string[] };
   const stage = createPlanStage({
     contextBuilder: builder,
     provider,
-    registry: fakes.registry,
+    registry: options.adapterRegistry ?? fakes.registry,
     instrumentation: instrumentation.service,
-    sessions: { nextPlanVersion },
-    sessionManager: manager,
+    sessions: accessRecorded({ nextPlanVersion }, storeAccess.sessions),
+    sessionManager: accessRecorded(manager, storeAccess.manager),
     progress,
     ...(options.maxRepairs !== undefined ? { maxRepairs: options.maxRepairs } : {}),
   });
@@ -1013,9 +1104,26 @@ function harness(options: HarnessOptions = {}): Harness {
     instrumentation,
     recordPlan,
     nextPlanVersion,
+    storeAccess,
     fakes,
     fixture,
   };
+}
+
+/** Every provider request of a run that carried repair turns (`buildRepairRequest` appends `messages`). */
+function repairRequestsOf(h: Harness): ModelRequest[] {
+  return h.provider.structured.mock.calls
+    .map((call) => call[0])
+    .filter((request) => request.messages !== undefined && request.messages.length > 0);
+}
+
+/**
+ * Every string a run left behind for a person or a machine to read: each log
+ * record of the context logger and, when given, the run's error — one string.
+ */
+function everythingSurfaced(h: Harness, error?: DebuggenError): string {
+  const logged = h.fixture.contextLog.records.map(serializeRecord);
+  return [...logged, ...(error !== undefined ? [serializeError(error)] : [])].join('\n');
 }
 
 /** The plan the session manager was asked to record, or a test failure. */
@@ -1290,9 +1398,7 @@ describe('gateInstrumentationPlan', () => {
     expect(actions[1]?.rationale).toBe('Time the totals request.');
     // The duplicate survives normalisation and is refused by feasibility, as data.
     expect(outcome.feasibility.feasible).toHaveLength(2);
-    expect(outcome.feasibility.rejected.map((refusal) => refusal.code)).toEqual([
-      'duplicate-action',
-    ]);
+    expect(outcome.feasibility.rejected.map((refusal) => refusal.code)).toEqual([DUPLICATE_ACTION]);
   });
 
   it('rejects a plan the normaliser refuses as a logged product defect, without checking feasibility', () => {
@@ -1368,11 +1474,11 @@ describe('gateInstrumentationPlan', () => {
     }
     expect(outcome.reason).toBe('infeasible');
     expect(outcome.error.code).toBe('INSTRUMENTATION_UNAVAILABLE');
-    expect(outcome.error.details?.['codes']).toEqual(['file-not-indexed']);
+    expect(outcome.error.details?.['codes']).toEqual([FILE_NOT_INDEXED]);
     expect(outcome.plan?.instrumentationTargets).toHaveLength(1);
     expect(outcome.feasibility?.feasible).toEqual([]);
     expect(outcome.feasibility?.rejected.map((refusal) => refusal.code)).toEqual([
-      'file-not-indexed',
+      FILE_NOT_INDEXED,
     ]);
     expect(outcome.error.hint).toBe(outcome.feasibility?.rejected[0]?.hint);
   });
@@ -1396,9 +1502,7 @@ describe('gateInstrumentationPlan', () => {
     }
     expect(outcome.plan.instrumentationTargets).toHaveLength(3);
     expect(outcome.feasibility.feasible).toHaveLength(2);
-    expect(outcome.feasibility.rejected.map((refusal) => refusal.code)).toEqual([
-      'file-not-indexed',
-    ]);
+    expect(outcome.feasibility.rejected.map((refusal) => refusal.code)).toEqual([FILE_NOT_INDEXED]);
   });
 
   it('reports a context the feasibility gate cannot use as a failure, not a rejection', () => {
@@ -2059,6 +2163,9 @@ describe('createPlanStage', () => {
     expect(h.builder.calls).toEqual([]);
     expect(h.provider.structured).not.toHaveBeenCalled();
     expect(h.progress.calls).toEqual([]);
+    expect(h.nextPlanVersion).not.toHaveBeenCalled();
+    expect(h.recordPlan).not.toHaveBeenCalled();
+    expect(h.instrumentation.install).not.toHaveBeenCalled();
   });
 
   it('writes nothing to the project and keeps model output out of its log records', async () => {
@@ -2085,5 +2192,614 @@ describe('createPlanStage', () => {
       expect(fake.install).not.toHaveBeenCalled();
       expect(fake.remove).not.toHaveBeenCalled();
     }
+  });
+});
+
+// ===========================================================================
+// The gate's rejections, observed through a whole run
+// ===========================================================================
+
+/**
+ * A normaliser output that fails the internal schema (an id that is not of
+ * the product's opaque shape), carrying the planted sentinel in its objective.
+ */
+function defectivePlan(planVersion: number): InstrumentationPlan {
+  return {
+    version: 1,
+    planVersion,
+    sessionId: SESSION_ID,
+    objective: MODEL_PLAN.objective,
+    hypotheses: [],
+    capture: [],
+    instrumentationTargets: [
+      { ...proposal(PAGE_PROBE, 1, 'interaction-tracking', RUNTIME), id: 'not-an-opaque-id' },
+    ],
+  };
+}
+
+/** A registry holding only the file-changing adapter: no runtime fallback can be built from it. */
+function patchOnlyRegistry(): AdapterRegistry {
+  return createAdapterRegistry({ adapters: [fakeRegistry().source.adapter] });
+}
+
+/** The error-level product-defect records of a run, for one gate step. */
+function defectRecords(h: Harness, step: 'normalize' | 'internal-validation'): LogRecord[] {
+  return h.fixture.contextLog.records.filter(
+    (record) => record.level === 'error' && record.fields['step'] === step,
+  );
+}
+
+describe('createPlanStage — the gate’s rejections, observed through a run', () => {
+  it('proves each fixture is on the intended side of the authoring schema', () => {
+    for (const valid of [MODEL_PLAN, UNCLAIMED_PLAN, INFEASIBLE_PLAN]) {
+      expect(instrumentationPlanInputSchema.safeParse(valid).success).toBe(true);
+    }
+    const invalid: unknown = INVALID_PLAN;
+    expect(instrumentationPlanInputSchema.safeParse(invalid).success).toBe(false);
+  });
+
+  it('rejects a normaliser failure with exactly one provider call and, with no viable fallback, fails the stage', async () => {
+    // Two valid answers are queued behind the one that fails normalisation:
+    // consuming either would be a re-prompt this stage must never make.
+    const h = harness({
+      outcomes: [answer(UNCLAIMED_PLAN), answer(MODEL_PLAN), answer(MODEL_PLAN)],
+      adapterRegistry: patchOnlyRegistry(),
+    });
+
+    const error = expectErr(await h.run());
+
+    expect(h.provider.structured).toHaveBeenCalledTimes(1);
+    expect(repairRequestsOf(h)).toEqual([]);
+    expect(h.provider.other).toEqual([]);
+    expect(error.details?.['stage']).toBe(PLAN);
+    expect(error.details?.['planRejection']).toBe('normalization-failed');
+    expect(reasonOf(error)).toBe('fallback-empty');
+
+    // The product defect is on record at error level, once, and feasibility never ran.
+    expect(defectRecords(h, 'normalize')).toHaveLength(1);
+    expect(vi.mocked(normalizePlan)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(checkPlanFeasibility)).not.toHaveBeenCalled();
+
+    // Nothing was recorded or installed, and the plan group closed as failed.
+    expect(h.recordPlan).not.toHaveBeenCalled();
+    expect(h.instrumentation.install).not.toHaveBeenCalled();
+    expect(h.progress.trail).toEqual([`stageStarted:${PLAN}`, `stageFailed:${PLAN}`]);
+  });
+
+  it('rejects an internal-schema failure without a re-prompt and falls back', async () => {
+    vi.mocked(normalizePlan).mockReturnValueOnce(ok(defectivePlan(3)));
+    const h = harness({ outcomes: [answer(MODEL_PLAN), answer(MODEL_PLAN)] });
+
+    const value = expectOk(await h.run());
+
+    expect(h.provider.structured).toHaveBeenCalledTimes(1);
+    expect(repairRequestsOf(h)).toEqual([]);
+    expect(value.fallback).toBe(true);
+    expect(value.fallbackCause?.reason).toBe('internal-validation-failed');
+    expect(value.fallbackCause?.code).toBe('PLAN_INVALID');
+    expect(defectRecords(h, 'internal-validation')).toHaveLength(1);
+
+    // The defective plan never reached feasibility; the fallback did, once.
+    expect(vi.mocked(checkPlanFeasibility)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(checkPlanFeasibility).mock.calls[0]?.[0]).toStrictEqual(value.plan);
+    expect(value.plan.instrumentationTargets.every((action) => action.mode === RUNTIME)).toBe(true);
+    expect(recordedPlanOf(h)).toEqual(value.plan);
+  });
+
+  it('proceeds with the feasible remainder of a partially infeasible plan, carrying the report to the result', async () => {
+    const partial: InstrumentationPlanInput = {
+      ...MODEL_PLAN,
+      instrumentationTargets: [
+        ...MODEL_PLAN.instrumentationTargets,
+        ...INFEASIBLE_PLAN.instrumentationTargets,
+      ],
+    };
+    const h = harness({ outcomes: [answer(partial)] });
+
+    const value = expectOk(await h.run());
+
+    expect(value.fallback).toBe(false);
+    expect(h.provider.structured).toHaveBeenCalledTimes(1);
+    // The very report the gate produced reaches the result, with its refusal as data.
+    expect(value.feasibility).toBe(firstFeasibilityReport());
+    expect(value.feasibility.feasible.map((action) => action.type)).toEqual([
+      'interaction-tracking',
+      'fetch-tracking',
+    ]);
+    expect(value.feasibility.rejected.map((refusal) => refusal.code)).toEqual([FILE_NOT_INDEXED]);
+    for (const refusal of value.feasibility.rejected) {
+      expect(FEASIBILITY_REJECTION_CODES).toContain(refusal.code);
+    }
+
+    // The plan is recorded and installed as validated; the installer reports the refusal.
+    expect(value.plan.instrumentationTargets).toHaveLength(3);
+    expect(installRequestOf(h).plan).toBe(value.plan);
+
+    // The completion record carries the rejection code, never the refused file.
+    const completed = recordsWith(
+      h.fixture.contextLog.records,
+      'Plan stage recorded a validated instrumentation plan.',
+    );
+    expect(completed).toHaveLength(1);
+    expect(completed[0]?.fields['rejectionCodes']).toEqual([FILE_NOT_INDEXED]);
+    expect(everythingSurfaced(h)).not.toContain(UNINDEXED_FILE);
+    expect(everythingSurfaced(h)).not.toContain(UNINDEXED_SYMBOL);
+  });
+
+  it('fails a wholly infeasible plan when no runtime fallback can be built', async () => {
+    const h = harness({
+      outcomes: [answer(INFEASIBLE_PLAN)],
+      adapterRegistry: patchOnlyRegistry(),
+    });
+
+    const error = expectErr(await h.run());
+
+    expect(error.details?.['planRejection']).toBe('infeasible');
+    expect(reasonOf(error)).toBe('fallback-empty');
+    expect(vi.mocked(checkPlanFeasibility)).toHaveBeenCalledTimes(1);
+    const report = firstFeasibilityReport();
+    expect(report.feasible).toEqual([]);
+    expect(report.rejected.map((refusal) => refusal.code)).toEqual([FILE_NOT_INDEXED]);
+    expect(h.provider.structured).toHaveBeenCalledTimes(1);
+    expect(h.recordPlan).not.toHaveBeenCalled();
+    expect(h.instrumentation.install).not.toHaveBeenCalled();
+  });
+
+  it('never lets the model choose an adapter or a mode: the authoring schema refuses them and the registry assigns both', async () => {
+    const smuggled: unknown = {
+      ...MODEL_PLAN,
+      instrumentationTargets: MODEL_PLAN.instrumentationTargets.map((target) => ({
+        ...target,
+        adapter: 'model-chosen-adapter',
+        mode: PATCH,
+      })),
+    };
+    expect(instrumentationPlanInputSchema.safeParse(smuggled).success).toBe(false);
+    const h = harness({ outcomes: [answer(smuggled), answer(MODEL_PLAN)] });
+
+    const value = expectOk(await h.run());
+
+    // The smuggled fields earned a repair, not a place in the plan.
+    expect(h.provider.structured).toHaveBeenCalledTimes(2);
+    expect(repairRequestsOf(h)).toHaveLength(1);
+    expect(value.repairs).toBe(1);
+    const context = instrumentationContext();
+    for (const action of value.plan.instrumentationTargets) {
+      expect(action.adapter).not.toBe('model-chosen-adapter');
+      expect({ adapter: action.adapter, mode: action.mode }).toEqual(
+        h.fakes.registry.resolveActionType(action.type, context),
+      );
+    }
+    expect(value.plan.instrumentationTargets.some((action) => action.mode === PATCH)).toBe(false);
+  });
+});
+
+// ===========================================================================
+// The runtime-only fallback, observed through a whole run
+// ===========================================================================
+
+/** The actions a set of fake adapters proposed during a run, in call order. */
+async function proposalsOf(fakes: readonly FakeAdapter[]): Promise<InstrumentationAction[]> {
+  const pending = fakes
+    .flatMap((fake) => fake.createPlan.mock.results)
+    .flatMap((result) => (result.type === 'return' ? [result.value] : []));
+  return (await Promise.all(pending)).flat();
+}
+
+/** A second schema-valid understanding, differing from {@link UNDERSTANDING} only in category. */
+const OTHER_UNDERSTANDING: ProblemUnderstanding = problemUnderstandingSchema.parse({
+  ...UNDERSTANDING,
+  category: PROBLEM_CATEGORIES[1],
+});
+
+describe('createPlanStage — the runtime-only fallback, observed through a run', () => {
+  it('returns ok with the fallback when the model’s plan is rejected, never an Err while one is viable', async () => {
+    const h = harness({ outcomes: [answer(UNCLAIMED_PLAN)] });
+
+    const value = expectOk(await h.run());
+
+    expect(value.fallback).toBe(true);
+    expect(value.fallbackCause?.reason).toBe('normalization-failed');
+    expect(value.plan.instrumentationTargets.length).toBeGreaterThan(0);
+    // Held to the same gate as a model's plan: internal schema and feasibility.
+    expect(instrumentationPlanSchema.safeParse(value.plan).success).toBe(true);
+    expect(vi.mocked(checkPlanFeasibility).mock.calls[0]?.[0]).toStrictEqual(value.plan);
+    expect(value.feasibility).toBe(firstFeasibilityReport());
+    expect(value.feasibility.feasible.length).toBeGreaterThan(0);
+    // Recorded and installed like any other plan.
+    expect(recordedPlanOf(h)).toEqual(value.plan);
+    expect(installRequestOf(h).plan).toBe(value.plan);
+  });
+
+  it('includes an adapter registered at test time, with no change to the stage', async () => {
+    const baseline = expectOk(await harness({ outcomes: [answer(UNCLAIMED_PLAN)] }).run());
+    expect(baseline.plan.instrumentationTargets.map((action) => action.adapter)).not.toContain(
+      LATE_PROBE,
+    );
+
+    // Rebuild the stage over a registry that gained one invented adapter.
+    const fakes = fakeRegistry();
+    const late = fakeAdapter({
+      id: LATE_PROBE,
+      claims: { 'db-query-tracking': RUNTIME },
+      proposals: [proposal(LATE_PROBE, 11, 'db-query-tracking', RUNTIME)],
+      signals: [{ signal: 'pg', status: 'available' }],
+    });
+    expectOk(fakes.registry.register(late.adapter));
+    const h = harness({ registry: fakes, outcomes: [answer(UNCLAIMED_PLAN)] });
+
+    const value = expectOk(await h.run());
+
+    expect(value.fallback).toBe(true);
+    expect(late.createPlan).toHaveBeenCalledTimes(1);
+    expect(late.createPlan.mock.calls[0]?.[1]).toBe(UNDERSTANDING);
+    const added = value.plan.instrumentationTargets.filter(
+      (action) => action.adapter === LATE_PROBE,
+    );
+    expect(added.map((action) => [action.type, action.mode, action.rationale])).toEqual([
+      ['db-query-tracking', RUNTIME, `${LATE_PROBE} proposes db-query-tracking for this project.`],
+    ]);
+    // The model was told about it too: the catalog the builder received names it.
+    expect(JSON.stringify(h.builder.calls[0]?.adapterCatalog)).toContain(LATE_PROBE);
+  });
+
+  it('holds only runtime actions, dropping every patch-mode proposal an adapter made', async () => {
+    const h = harness({ outcomes: [answer(UNCLAIMED_PLAN)] });
+
+    const value = expectOk(await h.run());
+
+    const proposed = await proposalsOf([h.fakes.page, h.fakes.wire, h.fakes.source]);
+    expect(proposed.some((action) => action.mode === PATCH)).toBe(true);
+    expect(value.plan.instrumentationTargets.every((action) => action.mode === RUNTIME)).toBe(true);
+    const patchIds = new Set(
+      proposed.filter((action) => action.mode === PATCH).map((action) => actionIdentityKey(action)),
+    );
+    for (const action of value.plan.instrumentationTargets) {
+      expect(patchIds.has(actionIdentityKey(action))).toBe(false);
+    }
+  });
+
+  it('carries no pre-authored value: targets trace to proposals and prose to the understanding', async () => {
+    const first = harness({ outcomes: [answer(UNCLAIMED_PLAN)] });
+    const value = expectOk(await first.run());
+
+    // Every target field is an adapter's own proposal, field for field.
+    const proposed = await proposalsOf([first.fakes.page, first.fakes.wire, first.fakes.source]);
+    for (const action of value.plan.instrumentationTargets) {
+      const origin = proposed.find(
+        (candidate) =>
+          candidate.mode === RUNTIME && actionIdentityKey(candidate) === actionIdentityKey(action),
+      );
+      expect(origin).toBeDefined();
+      expect([action.file, action.symbol, action.type, action.rationale]).toEqual([
+        origin?.file,
+        origin?.symbol,
+        origin?.type,
+        origin?.rationale,
+      ]);
+    }
+    // The capture phrases are the product's own labels; the objective names the category.
+    const labels = new Set<string>(Object.values(CAPTURE_SIGNAL_LABELS));
+    for (const phrase of value.plan.capture) {
+      expect(labels.has(phrase)).toBe(true);
+    }
+    expect(value.plan.objective).toContain(UNDERSTANDING.category);
+    expect(value.plan.hypotheses).toEqual([]);
+
+    // A different understanding yields a different objective over the same adapters.
+    const second = harness({ outcomes: [answer(UNCLAIMED_PLAN)] });
+    const other = expectOk(await second.run({ understanding: OTHER_UNDERSTANDING }));
+    expect(other.plan.objective).toContain(OTHER_UNDERSTANDING.category);
+    expect(other.plan.objective).not.toBe(value.plan.objective);
+  });
+
+  it('fails rather than presenting an empty plan as success when the registry is empty', async () => {
+    const h = harness({ adapterRegistry: createAdapterRegistry({ adapters: [] }) });
+
+    const error = expectErr(await h.run());
+
+    expect(error.code).toBe('INSTRUMENTATION_UNAVAILABLE');
+    expect(reasonOf(error)).toBe('fallback-empty');
+    expect(error.details?.['planRejection']).toBe('normalization-failed');
+    expect(h.builder.calls[0]?.adapterCatalog).toEqual([]);
+    expect(h.provider.structured).toHaveBeenCalledTimes(1);
+    expect(h.recordPlan).not.toHaveBeenCalled();
+    expect(h.instrumentation.install).not.toHaveBeenCalled();
+  });
+
+  it('builds no fallback from an empty registry when called directly', async () => {
+    const error = expectErr(
+      await buildRuntimeOnlyFallbackPlan(
+        createAdapterRegistry({ adapters: [] }),
+        instrumentationContext(),
+        UNDERSTANDING,
+      ),
+    );
+
+    expect(error.code).toBe('INSTRUMENTATION_UNAVAILABLE');
+    expect(reasonOf(error)).toBe('fallback-empty');
+    expect(vi.mocked(normalizePlan)).not.toHaveBeenCalled();
+  });
+});
+
+// ===========================================================================
+// Boundaries: placeholders, progress, status and the store
+// ===========================================================================
+
+/** The members of `StageBuildOptions` every build request carries besides its placeholder values. */
+const BUILD_OPTION_KEYS: readonly string[] = ['context', 'promptVersion', 'signal'];
+
+/** The placeholder the builder renders itself, from the authoring schema. */
+const BUILDER_RENDERED_PLACEHOLDER = 'outputSchema';
+
+describe('createPlanStage — boundaries', () => {
+  it('supplies exactly the plan prompt’s four placeholders, and never {{question}}', async () => {
+    const placeholders = STAGE_PLACEHOLDERS.plan.map((key) => `{{${key}}}`);
+    expect(placeholders).toEqual([
+      '{{understanding}}',
+      '{{investigation}}',
+      '{{adapterCatalog}}',
+      '{{outputSchema}}',
+    ]);
+    expect(placeholders).not.toContain('{{question}}');
+
+    const h = harness();
+    expectOk(await h.run());
+
+    expect(h.builder.calls).toHaveLength(1);
+    const call = h.builder.calls[0];
+    const supplied = Object.keys(call ?? {}).filter((key) => !BUILD_OPTION_KEYS.includes(key));
+    expect([...supplied, BUILDER_RENDERED_PLACEHOLDER].sort()).toEqual(
+      [...STAGE_PLACEHOLDERS.plan].sort(),
+    );
+    expect(supplied).not.toContain('question');
+    expect(h.fixture.questionReads).toEqual([]);
+  });
+
+  it('reports only under the plan stage and leaves the instrument group, reportInstrumentation included, to the service', async () => {
+    const h = harness();
+
+    expectOk(await h.run());
+
+    expect(h.progress.calls.length).toBeGreaterThan(0);
+    for (const call of h.progress.calls) {
+      expect(PROGRESS_STAGES).toContain(call.stage);
+      expect(call.stage).toBe(PLAN);
+    }
+    // The installed signals are reported by the instrumentation service through
+    // `reportInstrumentation`; the stage reached for no member it is not given.
+    expect(h.progress.foreign).toEqual([]);
+    expect(h.instrumentation.install).toHaveBeenCalledTimes(1);
+  });
+
+  it('files an install failure under the instrument stage of protocol’s vocabulary', async () => {
+    const failure = new DebuggenError('INSTRUMENTATION_INSTALL_FAILED', 'Could not install.');
+    const h = harness({ installAnswer: () => err(failure) });
+
+    const error = expectErr(await h.run());
+
+    expect(error.details?.['stage']).toBe(INSTRUMENT);
+    expect(PROGRESS_STAGES).toContain(error.details?.['stage']);
+    expect(h.progress.foreign).toEqual([]);
+  });
+
+  it('writes no session status: the manager and the store are reached only through their plan members', async () => {
+    const h = harness({ nextPlanVersion: 4 });
+
+    const value = expectOk(await h.run());
+
+    expect([...new Set(h.storeAccess.manager)]).toEqual(['recordPlan']);
+    expect([...new Set(h.storeAccess.sessions)]).toEqual(['nextPlanVersion']);
+    expect(h.nextPlanVersion).toHaveBeenCalledTimes(1);
+    expect(h.recordPlan).toHaveBeenCalledTimes(1);
+    // The store's version, not a locally assumed first one, is on every artifact.
+    expect(value.planVersion).toBe(4);
+    expect(recordedPlanOf(h).planVersion).toBe(4);
+    expect(installRequestOf(h).plan.planVersion).toBe(4);
+    expect(h.instrumentation.buildContext.mock.calls[0]?.[0].plan).toEqual({ planVersion: 4 });
+  });
+
+  it('stops before the provider and the installer when the context builder refuses', async () => {
+    const refusal = outboundRefusal();
+    const h = harness({ build: { kind: 'fail', error: refusal } });
+
+    const error = expectErr(await h.run());
+
+    expect(error.code).toBe(refusal.code);
+    expect(h.provider.structured).not.toHaveBeenCalled();
+    expect(h.provider.other).toEqual([]);
+    expect(h.instrumentation.install).not.toHaveBeenCalled();
+    expect(h.recordPlan).not.toHaveBeenCalled();
+  });
+});
+
+// ===========================================================================
+// Privacy
+// ===========================================================================
+
+/**
+ * Everything a run surfaced, with the one value AAP §0.5.3 sanctions removed:
+ * the parsed authoring input on an error-level product-defect record, which is
+ * what whoever fixes the normaliser needs.
+ */
+function surfacedOutsideSanctionedInput(h: Harness, error?: DebuggenError): string {
+  const logged = h.fixture.contextLog.records.map((record) => {
+    const defect =
+      record.level === 'error' &&
+      (record.fields['step'] === 'normalize' || record.fields['step'] === 'internal-validation');
+    if (!defect) {
+      return serializeRecord(record);
+    }
+    const fields = Object.fromEntries(
+      Object.entries(record.fields).filter(([key]) => key !== 'input'),
+    );
+    return JSON.stringify({ message: record.message, fields });
+  });
+  return [...logged, ...(error !== undefined ? [serializeError(error)] : [])].join('\n');
+}
+
+/** A model answer the authoring schema refuses, carrying the sentinel in a valid field. */
+const INVALID_WITH_SENTINEL: unknown = {
+  capture: [`capture ${SENTINEL}`],
+  instrumentationTargets: [{ file: TARGETLESS_FILE, symbol: TARGETLESS_SYMBOL, type: 'x-ray' }],
+};
+
+describe('createPlanStage — privacy', () => {
+  it('plants the sentinel in the question, the objective and the model output', () => {
+    expect(sessionRecord().question).toContain(SENTINEL);
+    expect(MODEL_PLAN.objective).toContain(SENTINEL);
+    expect(UNCLAIMED_PLAN.objective).toContain(SENTINEL);
+    expect(JSON.stringify(INVALID_WITH_SENTINEL)).toContain(SENTINEL);
+  });
+
+  it('keeps the sentinel out of every record and error of an exhausted-repair run', async () => {
+    const invalid = Array.from({ length: DEFAULT_MAX_REPAIRS + 1 }, () =>
+      answer(INVALID_WITH_SENTINEL),
+    );
+    const h = harness({ outcomes: invalid });
+
+    const value = expectOk(await h.run());
+
+    expect(value.fallback).toBe(true);
+    expect(everythingSurfaced(h)).not.toContain(SENTINEL);
+    const cause = value.fallbackCause;
+    expect(JSON.stringify(cause ?? null)).not.toContain(SENTINEL);
+    // Repair feedback names paths and rules, never the rejected value.
+    for (const request of repairRequestsOf(h)) {
+      expect(JSON.stringify(request.messages)).not.toContain(SENTINEL);
+    }
+  });
+
+  it('keeps the sentinel out of the error and records of a provider outage and a builder refusal', async () => {
+    const outage = harness({ outcomes: [{ kind: 'error', error: unavailableError() }] });
+    const outageError = expectErr(await outage.run());
+    expect(everythingSurfaced(outage, outageError)).not.toContain(SENTINEL);
+
+    const refused = harness({ build: { kind: 'fail', error: outboundRefusal() } });
+    const refusedError = expectErr(await refused.run());
+    expect(everythingSurfaced(refused, refusedError)).not.toContain(SENTINEL);
+  });
+
+  it('confines the sentinel to the sanctioned input field of the product-defect record', async () => {
+    const h = harness({ outcomes: [answer(UNCLAIMED_PLAN)], adapterRegistry: patchOnlyRegistry() });
+
+    const error = expectErr(await h.run());
+
+    const defects = defectRecords(h, 'normalize');
+    expect(defects).toHaveLength(1);
+    expect(defects[0]?.fields['input']).toEqual(UNCLAIMED_PLAN);
+    expect(surfacedOutsideSanctionedInput(h, error)).not.toContain(SENTINEL);
+  });
+
+  it('confines the sentinel likewise on an internal-validation defect', async () => {
+    vi.mocked(normalizePlan).mockReturnValueOnce(ok(defectivePlan(3)));
+    const h = harness({ outcomes: [answer(MODEL_PLAN)] });
+
+    const value = expectOk(await h.run());
+
+    expect(value.fallback).toBe(true);
+    expect(defectRecords(h, 'internal-validation')).toHaveLength(1);
+    expect(surfacedOutsideSanctionedInput(h)).not.toContain(SENTINEL);
+    expect(surfacedOutsideSanctionedInput(h)).not.toContain('not-an-opaque-id');
+  });
+
+  it('logs no URL, statement, token, source body or prompt from model output', async () => {
+    // Assembled at run time so this tracked file holds no contiguous secret-shaped literal.
+    const url = ['https:', '', 'ledger.example.test', 'totals?account=77'].join('/');
+    const statement = ['SELECT', 'balance', 'FROM', 'ledger_rows', 'WHERE', 'id = 42'].join(' ');
+    const token = ['tok', 'en_'].join('') + 'Qm7Rv2Lp'.repeat(4);
+    const body = `function ${INDEXED_SYMBOL}() { return rows.reduce(sum, 0); }`;
+    const planted: InstrumentationPlanInput = {
+      objective: `Explain ${url} and ${statement}.`,
+      capture: ['interaction timing'],
+      instrumentationTargets: [
+        {
+          file: TARGETLESS_FILE,
+          symbol: TARGETLESS_SYMBOL,
+          type: 'interaction-tracking',
+          rationale: `Carries ${token} beside ${body}.`,
+        },
+      ],
+      hypotheses: [`The body ${body} is slow.`],
+    };
+    expect(instrumentationPlanInputSchema.safeParse(planted).success).toBe(true);
+    const h = harness({ outcomes: [answer(planted)] });
+
+    const value = expectOk(await h.run());
+
+    expect(value.plan.objective).toContain(url);
+    const surfaced = everythingSurfaced(h);
+    for (const fragment of [url, statement, token, body, PROMPT_MARKER, SENTINEL]) {
+      expect(surfaced).not.toContain(fragment);
+    }
+    // The completion record's fields are counts, codes, versions and flags only.
+    const completed = recordsWith(
+      h.fixture.contextLog.records,
+      'Plan stage recorded a validated instrumentation plan.',
+    );
+    expect(completed).toHaveLength(1);
+    const fields = completed[0]?.fields ?? {};
+    expect(fields['actions']).toEqual({ [`interaction-tracking/${RUNTIME}`]: 1 });
+    for (const forbidden of ['input', 'objective', 'plan', 'prompt', 'question', 'request']) {
+      expect(Object.keys(fields)).not.toContain(forbidden);
+    }
+  });
+});
+
+// ===========================================================================
+// Static self-scan of plan.ts (read-only)
+// ===========================================================================
+
+describe('static self-scan of plan.ts', () => {
+  const source = readFileSync(fileURLToPath(new URL('./plan.ts', import.meta.url)), 'utf8');
+  const lines = source.split('\n');
+
+  /** The source's lines matching a pattern, as `plan.ts:<line>: <text>`. */
+  const offendingLines = (pattern: RegExp): string[] =>
+    lines
+      .map((line, index) => ({ line, number: index + 1 }))
+      .filter(({ line }) => pattern.test(line))
+      .map(({ line, number }) => `plan.ts:${String(number)}: ${line.trim()}`);
+
+  const FORBIDDEN: readonly (readonly [string, RegExp])[] = [
+    ['a node:fs import', /node:fs/u],
+    ['a child_process import', /child_process/u],
+    ['a require call', /\brequire\(/u],
+    ['a dynamic import', /\bimport\(/u],
+    ['an eval call', /\beval\(/u],
+    ['a Function constructor', /\bnew Function\b/u],
+    ['any mention of zod', /\bzod\b/u],
+    ['a renderer import', /@debuggen\/panel-renderer/u],
+    ['a demo-app reference', /apps\/demo-app/u],
+    ['an application route path', /\/api\//u],
+    ['a built-in adapter factory', /\bcreate[A-Z][A-Za-z]*Adapter\(/u],
+    ['a built-in adapter id constant', /\b[A-Z_]+_ADAPTER_ID\b/u],
+  ];
+
+  it.each(FORBIDDEN)('contains no %s', (label, pattern) => {
+    expect(offendingLines(pattern), `plan.ts must contain no ${label}`).toStrictEqual([]);
+  });
+
+  it.each(ADAPTER_IDS.map((id) => [id]))('names no adapter id %s as a string literal', (id) => {
+    const escaped = id.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
+    const quoted = new RegExp(`['"\`]${escaped}['"\`]`, 'u');
+    expect(offendingLines(quoted)).toStrictEqual([]);
+  });
+
+  it('spells every relative module specifier with a .js extension', () => {
+    const specifiers = [...source.matchAll(/(?:from|import)\s+['"](\.{1,2}\/[^'"]*)['"]/gu)].map(
+      (match) => match[1] ?? '',
+    );
+    expect(specifiers.length).toBeGreaterThan(0);
+    expect(specifiers.filter((specifier) => !specifier.endsWith('.js'))).toStrictEqual([]);
+  });
+
+  it('imports no Node built-in: installation is the instrumentation service’s alone', () => {
+    const specifiers = [...source.matchAll(/from\s+['"]([^'"]+)['"]/gu)].map(
+      (match) => match[1] ?? '',
+    );
+    expect(specifiers.length).toBeGreaterThan(0);
+    expect(specifiers.filter((specifier) => specifier.startsWith('node:'))).toStrictEqual([]);
+    expect(specifiers).toContain('../../instrumentation/service.js');
   });
 });
