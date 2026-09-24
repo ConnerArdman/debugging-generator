@@ -1,0 +1,32 @@
+{
+  "title": "Trail report latency",
+  "summary": "Most of the interaction time is unaccounted for.",
+  "layout": [
+    {
+      "type": "heatmap",
+      "source": "spans"
+    },
+    {
+      "id": "slowest",
+      "type": "table",
+      "source": "logs",
+      "sort": "duration_desc"
+    },
+    {
+      "type": "metricCards",
+      "metrics": ["time_to_first_byte"]
+    },
+    {
+      "type": "sourceLink",
+      "source": "spans",
+      "location": {
+        "file": "src/server/services/trail-report.service.ts",
+        "line": 88,
+        "column": 23,
+        "symbol": "loadTrailReport",
+        "resolvedBy": "patch",
+        "confidence": 1
+      }
+    }
+  ]
+}

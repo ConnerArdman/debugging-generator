@@ -334,8 +334,14 @@ export interface BuildContextInput {
   readonly sessionId: string;
   /** The project root: absolute, POSIX or Windows-style; normalised here. */
   readonly projectRoot: string;
-  /** The plan version the context is for; its `planVersion` is stamped on the context. */
-  readonly plan: InstrumentationPlan;
+  /**
+   * The plan version the context is for; its `planVersion` is stamped on the
+   * context and is the only member read. Typed as the one field so the planning
+   * stage can build the context of the version it is about to author — the
+   * catalog, the fallback plan and the feasibility gate all need it before a
+   * normalised plan exists — while an install passes its whole plan unchanged.
+   */
+  readonly plan: Pick<InstrumentationPlan, 'planVersion'>;
   /** The code-analysis handles. */
   readonly code: CodeAnalysisHandles;
   /** The readiness facts the service observed (`collectObservedReadiness`). */

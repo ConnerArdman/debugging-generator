@@ -1,0 +1,80 @@
+{
+  "title": "Trail report latency",
+  "summary": {
+    "headline": "Most of the interaction time is spent in one database query.",
+    "observed": [
+      {
+        "statement": "The database query accounted for most of the interaction.",
+        "evidence": [{ "eventId": "evt_zz00000000000001" }]
+      },
+      {
+        "statement": "The route handler waited on a single query.",
+        "evidence": [{ "eventId": "evt_zz00000000000002" }]
+      }
+    ],
+    "likelyCauses": [
+      {
+        "statement": "The trail conditions lookup is missing a supporting index.",
+        "evidence": [{ "eventId": "evt_zz00000000000003" }],
+        "confidence": "high",
+        "suggestedLocation": {
+          "file": "src/server/db/pool.ts",
+          "line": 80,
+          "column": 24,
+          "symbol": "queryTrailConditionReports",
+          "resolvedBy": "code-graph",
+          "confidence": 0.85
+        }
+      }
+    ]
+  },
+  "layout": [
+    {
+      "type": "metricCards",
+      "metrics": ["total_duration", "frontend_duration", "backend_duration", "database_duration"]
+    },
+    {
+      "type": "timeline",
+      "source": "trace",
+      "filter": {
+        "traceId": "9d8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a"
+      }
+    },
+    {
+      "type": "section",
+      "title": "Where the time went",
+      "children": [
+        {
+          "type": "table",
+          "title": "Slowest operations",
+          "source": "spans",
+          "sort": "duration_desc",
+          "limit": 10
+        },
+        {
+          "type": "flame",
+          "source": "trace",
+          "filter": {
+            "traceId": "9d8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a"
+          }
+        },
+        {
+          "type": "queryTable",
+          "source": "queries",
+          "sort": "duration_desc"
+        }
+      ]
+    },
+    {
+      "type": "sourceLink",
+      "location": {
+        "file": "src/server/services/trail-report.service.ts",
+        "line": 88,
+        "column": 23,
+        "symbol": "loadTrailReport",
+        "resolvedBy": "patch",
+        "confidence": 1
+      }
+    }
+  ]
+}
