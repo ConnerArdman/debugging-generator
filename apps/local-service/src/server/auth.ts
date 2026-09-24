@@ -1003,6 +1003,34 @@ const presentedCredentialSchema = clientHelloPayloadSchema.shape.token;
 const projectRootFieldSchema = clientHelloPayloadSchema.shape.projectRoot.unwrap();
 
 /**
+ * What an unrecognised key of a rejected `client.hello` is described as.
+ *
+ * Deliberately not a safe identifier, so protocol's `describeZodIssues` renders
+ * it as its own redaction marker rather than as a name.
+ */
+const WITHHELD_KEY_NAME = '<withheld>';
+
+/**
+ * The issues of a rejected `client.hello` with every unrecognised key name
+ * withheld.
+ *
+ * `describeZodIssues` renders the names of unrecognised keys, because a
+ * misspelled field is otherwise indistinguishable from a schema mismatch. In
+ * every other frame that is a sound trade; in the one frame that carries a
+ * credential, a key *is* payload data and can be the credential itself — a
+ * base64url token is a valid identifier and would be echoed, truncated but
+ * nearly whole, into the refusal. The path and the issue code still say that an
+ * unknown key was sent.
+ */
+function withholdKeyNames(issues: readonly z.core.$ZodIssue[]): z.core.$ZodIssue[] {
+  return issues.map((issue) =>
+    issue.code === 'unrecognized_keys'
+      ? { ...issue, keys: issue.keys.map(() => WITHHELD_KEY_NAME) }
+      : issue,
+  );
+}
+
+/**
  * Extracts the credential from an `Authorization` header value, or `undefined`
  * when the value is not exactly one bearer credential.
  *
@@ -1998,12 +2026,13 @@ class CredentialAuthority implements AuthService {
     }
 
     // The failure text is built from issue paths and codes only, never from the
-    // rejected value, so a malformed hello cannot echo the credential it carried.
+    // rejected value — nor from the names of unknown keys, which are payload
+    // data too — so a malformed hello cannot echo the credential it carried.
     const parsed = clientHelloPayloadSchema.safeParse(request.payload);
     if (!parsed.success) {
       return refuse(
         'hello-invalid',
-        `The first frame was not a well-formed client.hello: ${describeZodIssues(parsed.error.issues)}.`,
+        `The first frame was not a well-formed client.hello: ${describeZodIssues(withholdKeyNames(parsed.error.issues))}.`,
       );
     }
     const hello = parsed.data;

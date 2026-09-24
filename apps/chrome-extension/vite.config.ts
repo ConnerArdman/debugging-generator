@@ -386,6 +386,11 @@ function assertPrebuiltFilesAreVerbatim(
 function prebuiltContentScriptsPlugin(partition: ContentScriptPartition): CrxPlugin {
   let publicDir = path.resolve(workspaceRoot, PUBLIC_DIR);
   let outDir = path.resolve(workspaceRoot, OUT_DIR);
+  // `closeBundle` also runs when bundling failed, before anything was emitted.
+  // Verifying the copy then would throw a misleading "not emitted" error that
+  // replaces the real one (an unresolved entry, say), so a failed build skips
+  // the check. Reset per build, because `vite build --watch` rebuilds.
+  let bundleFailed = false;
 
   return {
     name: 'debuggen:prebuilt-content-scripts',
@@ -395,13 +400,21 @@ function prebuiltContentScriptsPlugin(partition: ContentScriptPartition): CrxPlu
       publicDir = config.publicDir;
       outDir = path.resolve(config.root, config.build.outDir);
     },
+    buildStart() {
+      bundleFailed = false;
+    },
+    buildEnd(error) {
+      if (error !== undefined) bundleFailed = true;
+    },
     renderCrxManifest(manifest) {
       return {
         ...manifest,
         content_scripts: mergeContentScripts(partition, manifest.content_scripts ?? []),
       };
     },
-    closeBundle() {
+    closeBundle(error) {
+      if (error !== undefined) bundleFailed = true;
+      if (bundleFailed) return;
       assertPrebuiltFilesAreVerbatim(partition, publicDir, outDir);
     },
   };
@@ -430,6 +443,18 @@ export default defineConfig(async (env): Promise<UserConfig> => {
   const crxManifest =
     env.command === 'build' ? { ...manifest, content_scripts: contentScripts.bundled } : manifest;
 
+  // Every bundled content script is built as a standalone, self-contained IIFE
+  // (crxjs `contentScripts.standaloneFiles`) - measured, not assumed. A content
+  // script chunk with any import or export is otherwise emitted as an async
+  // loader that `import()`s a web-accessible module, and src/content/bridge.ts
+  // both exports its test surface and shares src/shared/messages.ts with the
+  // other surfaces. As a loader the bridge would start after page scripts, so
+  // the handshake's "the bridge asks first, at document_start" guarantee
+  // (packages/telemetry/src/browser/transport.ts) would not hold, and every
+  // localhost page could fetch the extension's chunks. Derived from the
+  // manifest, so no content-script path is written twice.
+  const standaloneFiles = contentScripts.bundled.flatMap((entry) => entry.js ?? []);
+
   return {
     // Pinned so every emitted path is independent of the caller's directory.
     root: workspaceRoot,
@@ -442,7 +467,7 @@ export default defineConfig(async (env): Promise<UserConfig> => {
       // manifest.config.ts remains the only manifest source; the sole edit is
       // the removal of the pre-built entries isPrebuiltEntry() identified, which
       // prebuiltContentScriptsPlugin puts back at their authored index.
-      crx({ manifest: crxManifest }),
+      crx({ manifest: crxManifest, contentScripts: { standaloneFiles } }),
       prebuiltContentScriptsPlugin(contentScripts),
     ],
 

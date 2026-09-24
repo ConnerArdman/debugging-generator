@@ -36,16 +36,18 @@
  * The store is the real one: `openStore` against an `mkdtemp` sandbox **on
  * disk** rather than in memory, because two of the guarantees above are
  * properties of a file — `AUTOINCREMENT` never reusing an arrival number after
- * a purge, and a bulk insert committing inside one transaction. Nothing under
- * `$DEBUGGEN_HOME` is touched and no socket is opened, which is the contract of
- * the `local-service` Vitest project.
+ * a purge, and a bulk insert committing inside one transaction. The parent
+ * session and capture rows are written through `./sessions-repo.ts`, as the
+ * service writes them, and every fixture event is validated by the telemetry
+ * package's own `parseTelemetryEvent` before a test sees it. Nothing under
+ * `$DEBUGGEN_HOME` is touched, no environment variable is read and no socket
+ * is opened, which is the contract of the `local-service` Vitest project.
  */
 
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { fileURLToPath } from 'node:url';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -57,7 +59,9 @@ import {
   parseDataQuery,
 } from '@debuggen/panel-schema';
 import type { DataQueryFilter } from '@debuggen/panel-schema';
+import type { SessionRecord } from '@debuggen/protocol';
 import {
+  DEBUGGEN_ERROR_CODES,
   createConsoleLogger,
   isErr,
   newCaptureId,
@@ -69,8 +73,15 @@ import {
   unwrap,
 } from '@debuggen/shared';
 import type { DebuggenError, LogRecord, Result } from '@debuggen/shared';
-import { TELEMETRY_KINDS, TELEMETRY_TIERS, allowedTiersFor } from '@debuggen/telemetry';
-import { compareEventsCanonical } from '@debuggen/telemetry';
+import {
+  FETCH_ATTRIBUTE_KEYS,
+  SERVICE_ASSIGNED_ATTRIBUTE_KEYS,
+  TELEMETRY_KINDS,
+  TELEMETRY_TIERS,
+  allowedTiersFor,
+  compareEventsCanonical,
+  parseTelemetryEvent,
+} from '@debuggen/telemetry';
 import type {
   TelemetryEvent,
   TelemetryKind,
@@ -81,6 +92,8 @@ import type {
 import { openStore } from './db.js';
 import type { Store } from './db.js';
 import { STORE_SCHEMA_VERSION } from './migrations.js';
+import { createSessionsRepo } from './sessions-repo.js';
+import type { SessionsRepo } from './sessions-repo.js';
 import {
   CANONICAL_ORDER_BY,
   DEFAULT_PURGE_BATCH_SIZE,
@@ -178,35 +191,98 @@ function nextSeq(producerId: string): number {
   return next;
 }
 
-/** Inserts the `sessions` row every telemetry foreign key requires. */
-function insertSession(sessionId: string): void {
-  store
-    .statement(
-      `INSERT INTO sessions (
-         id, project_root, project_name, status, question, dev_server_url, created_at, updated_at, record
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    )
-    .run(
-      sessionId,
-      '/home/dev/projects/example',
-      'example',
-      'capturing',
-      'Why is this interaction slow?',
-      'http://127.0.0.1:20171',
-      BASE_TIME,
-      BASE_TIME,
-      '{}',
-    );
+/**
+ * The attribute key the service writes the request grouping hash under, read
+ * from `@debuggen/telemetry`'s own catalogs rather than typed here: the one key
+ * that is both a request (`fetch`) attribute and service-assigned.
+ *
+ * Deriving it is what makes a rename upstream fail this suite loudly instead of
+ * leaving every fixture writing a key the repository no longer denormalises —
+ * which would pass every assertion that only checks for `NULL`.
+ */
+const REQUEST_KEY_ATTRIBUTE: string = ((): string => {
+  const requestAttributes: readonly string[] = FETCH_ATTRIBUTE_KEYS;
+  const assigned = SERVICE_ASSIGNED_ATTRIBUTE_KEYS.find((candidate) =>
+    requestAttributes.includes(candidate),
+  );
+
+  if (assigned === undefined) {
+    throw new Error('@debuggen/telemetry no longer declares a service-assigned request attribute');
+  }
+
+  return assigned;
+})();
+
+/** A request grouping key of the shape the ingest path computes: 64 lowercase hex characters. */
+function requestKeyOf(seed: string): string {
+  return seed.repeat(Math.ceil(64 / seed.length)).slice(0, 64);
 }
 
-/** Inserts the `captures` row every telemetry foreign key requires. */
-function insertCapture(captureId: string, sessionId: string): void {
-  store
-    .statement(
-      `INSERT INTO captures (id, session_id, plan_version, started_at, stopped_at, summary)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-    )
-    .run(captureId, sessionId, 1, BASE_TIME, null, null);
+/**
+ * A new session's record, minimal and valid: every container empty, cleanup
+ * pending, the deterministic provider — exactly what the session manager
+ * persists before the first stage runs.
+ */
+function sessionRecord(sessionId: string): SessionRecord {
+  return {
+    id: sessionId,
+    projectRoot: '/home/dev/projects/example',
+    projectName: 'example',
+    devServerUrl: 'http://127.0.0.1:20231',
+    createdAt: BASE_TIME,
+    updatedAt: BASE_TIME,
+    status: 'capturing',
+    question: 'Why is this interaction slow?',
+    followUps: [],
+    relevantFiles: [],
+    plans: [],
+    modifications: [],
+    captures: [],
+    panelIds: [],
+    analyses: [],
+    cleanup: { status: 'pending', conflicts: [] },
+    promptVersions: {},
+    provider: { id: 'deterministic' },
+  };
+}
+
+/**
+ * Seeds the parent rows every telemetry foreign key requires, through the
+ * sessions repository rather than hand-written SQL, so the rows this suite
+ * writes against are the rows the service itself would have written.
+ *
+ * `CAPTURE_A1` is closed before `CAPTURE_A2` opens because the store refuses a
+ * second open capture per session (AAP 0.4.2); telemetry attribution does not
+ * care whether a capture is still open, so both remain valid targets.
+ */
+function seedParents(sessions: SessionsRepo): void {
+  unwrap(sessions.insert(sessionRecord(SESSION_A)));
+  unwrap(sessions.insert(sessionRecord(SESSION_B)));
+  unwrap(
+    sessions.startCapture({
+      sessionId: SESSION_A,
+      planVersion: 1,
+      captureId: CAPTURE_A1,
+      startedAt: BASE_TIME,
+    }),
+  );
+  unwrap(sessions.stopCapture({ captureId: CAPTURE_A1, stoppedAt: BASE_TIME }));
+  unwrap(
+    sessions.startCapture({
+      sessionId: SESSION_A,
+      planVersion: 1,
+      captureId: CAPTURE_A2,
+      startedAt: BASE_TIME,
+    }),
+  );
+  unwrap(
+    sessions.startCapture({
+      sessionId: SESSION_B,
+      planVersion: 1,
+      captureId: CAPTURE_B1,
+      startedAt: BASE_TIME,
+    }),
+  );
 }
 
 /** What {@link buildEvent} may override. */
@@ -229,14 +305,42 @@ interface EventOverrides {
 }
 
 /**
- * Builds a storable event.
+ * The arrival number {@link buildEvent} validates a candidate with. Any positive
+ * integer does: the schema bounds the field's shape, and the store assigns the
+ * real value. The probe is discarded after validation.
+ */
+const VALIDATION_INGEST_SEQ = 1;
+
+/**
+ * Builds a storable event and proves it is one.
  *
- * The tier defaults to the first one the kind is *allowed* in, read from the
- * telemetry package's own rule, so the suite cannot accidentally build an event
- * the schema's cross-field check would reject for a reason unrelated to what is
- * being tested.
+ * Every event is validated through `@debuggen/telemetry`'s own
+ * `parseTelemetryEvent` — the persisted schema, strict and with no coercion —
+ * so a drifting schema fails loudly here, at the fixture, rather than as a
+ * puzzling refusal inside whichever test first meets the drift. A test that
+ * needs an event the schema refuses builds it with {@link draftEvent} instead,
+ * which makes the intent visible at the call site.
  */
 function buildEvent(overrides: EventOverrides = {}): PersistableTelemetryEvent {
+  const draft = draftEvent(overrides);
+  const parsed = parseTelemetryEvent({ ...draft, ingestSeq: VALIDATION_INGEST_SEQ });
+
+  if (isErr(parsed)) {
+    throw new Error(`the fixture builder produced an invalid event: ${parsed.error.message}`);
+  }
+
+  return draft;
+}
+
+/**
+ * Builds a candidate event **without** validating it.
+ *
+ * The tier defaults to the first one the kind is *allowed* in, read from the
+ * telemetry package's own rule, so a candidate is only invalid in the way its
+ * overrides make it. Reserved for the refusal paths; everything else goes
+ * through {@link buildEvent}.
+ */
+function draftEvent(overrides: EventOverrides = {}): PersistableTelemetryEvent {
   const kind = overrides.kind ?? 'fetch';
   const producerId = overrides.producerId ?? PRODUCER_BROWSER;
   const allowed = allowedTiersFor(kind);
@@ -346,11 +450,9 @@ beforeEach(() => {
   store = unwrap(openStore({ databasePath: join(directory, 'sessions.sqlite'), logger }));
   repo = createTelemetryRepo({ store, logger });
 
-  insertSession(SESSION_A);
-  insertSession(SESSION_B);
-  insertCapture(CAPTURE_A1, SESSION_A);
-  insertCapture(CAPTURE_A2, SESSION_A);
-  insertCapture(CAPTURE_B1, SESSION_B);
+  // The sessions repository keeps the default no-op logger: the log assertions
+  // below are about what the telemetry repository and the store say.
+  seedParents(createSessionsRepo({ store, now: () => BASE_TIME }));
 });
 
 afterEach(() => {
@@ -390,8 +492,17 @@ describe('the contract', () => {
   });
 
   it('keeps the SQL tier vocabulary equal to TELEMETRY_TIERS, in order', () => {
-    const ddl = readFileSync(fileURLToPath(new URL('./schema.sql', import.meta.url)), 'utf8');
-    const match = /CHECK\s*\(tier IN \(([^)]*)\)\)/.exec(ddl);
+    // The DDL of the table the live store actually created — after every
+    // migration ran — rather than the file it was created from: a migration
+    // that rebuilt the table without the constraint would pass a check of the
+    // file and still accept any tier.
+    const ddl = store
+      .statement(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?`)
+      .get('telemetry_events')?.['sql'];
+
+    expect(typeof ddl).toBe('string');
+
+    const match = /CHECK\s*\(\s*tier\s+IN\s*\(([^)]*)\)\s*\)/i.exec(String(ddl));
 
     expect(match).not.toBeNull();
 
@@ -400,6 +511,37 @@ describe('the contract', () => {
       .map((value) => value.trim().replace(/^'/, '').replace(/'$/, ''));
 
     expect(listed).toEqual([...TELEMETRY_TIERS]);
+  });
+
+  it('has the database itself refuse a tier outside the vocabulary', () => {
+    // Past the repository's validation on purpose: the constraint is the last
+    // line of defence for a row written by any other path.
+    expect(() =>
+      store
+        .statement(
+          `INSERT INTO telemetry_events (
+             id, session_id, capture_id, trace_id, span_id, kind, tier,
+             name, start_time, duration, producer_id, seq, event
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          newEventId(),
+          SESSION_A,
+          CAPTURE_A1,
+          TRACE_A,
+          newSpanId(),
+          'fetch',
+          'edge',
+          'operation',
+          BASE_TIME,
+          1,
+          PRODUCER_BROWSER,
+          0,
+          '{}',
+        ),
+    ).toThrow(/CHECK constraint failed/);
+
+    expect(unwrap(repo.countBySession(SESSION_A))).toBe(0);
   });
 
   it('defines the canonical order once, and ends every convenience-reader ordering with it', () => {
@@ -506,6 +648,45 @@ describe('insertMany', () => {
     expect(unwrap(repo.countBySession(SESSION_A))).toBe(0);
   });
 
+  it('answers an exact replay of a stored batch by writing nothing and keeping every number', () => {
+    // The reconnecting agent's case (AAP 0.5.5): the whole buffer arrives a
+    // second time, unchanged.
+    const batch = Array.from({ length: 5 }, (_unused, index) =>
+      buildEvent({ startTime: BASE_TIME + index }),
+    );
+    const first = repo.insertMany(batch);
+
+    expect(isErr(first)).toBe(false);
+
+    if (isErr(first)) {
+      return;
+    }
+
+    expect(first.value.inserted).toBe(batch.length);
+    expect(first.value.skipped).toBe(0);
+
+    const numbers = first.value.events.map((event) => event.ingestSeq);
+
+    // Strictly increasing in the order the batch was offered.
+    expect(numbers.every((value, index) => index === 0 || value > (numbers[index - 1] ?? 0))).toBe(
+      true,
+    );
+
+    const replay = repo.insertMany(batch);
+
+    expect(isErr(replay)).toBe(false);
+
+    if (isErr(replay)) {
+      return;
+    }
+
+    expect(replay.value.inserted).toBe(0);
+    expect(replay.value.skipped).toBe(batch.length);
+    expect(replay.value.events.map((event) => event.id)).toEqual(batch.map((event) => event.id));
+    expect(replay.value.events.map((event) => event.ingestSeq)).toEqual(numbers);
+    expect(unwrap(repo.countBySession(SESSION_A))).toBe(batch.length);
+  });
+
   it('replays a buffered batch without duplicating or renumbering rows', () => {
     const batch = [buildEvent(), buildEvent(), buildEvent()];
     const first = insertOk(batch);
@@ -597,43 +778,119 @@ describe('insertMany', () => {
   });
 
   it('denormalises the service-assigned request key out of the attributes', () => {
-    const requestKey = 'a1'.repeat(32);
+    const requestKey = requestKeyOf('a1');
     const [stored] = insertOk([
-      buildEvent({ attributes: { request_key: requestKey, 'http.method': 'GET' } }),
+      buildEvent({ attributes: { [REQUEST_KEY_ATTRIBUTE]: requestKey, 'http.method': 'GET' } }),
     ]);
 
+    // Mirrored, never recomputed: the key is a hash of the unredacted URL that
+    // no stored row still holds, so the column can only be a copy.
     expect(readRow(stored?.id ?? '')?.['request_key']).toBe(requestKey);
+    expect(stored?.attributes[REQUEST_KEY_ATTRIBUTE]).toBe(requestKey);
   });
 
-  it('refuses a batch whose element is missing its attribution, and writes nothing', () => {
-    const valid = buildEvent();
+  it('keeps every flat column equal to the document it was projected from', () => {
+    const parent = newSpanId();
+    const requestKey = requestKeyOf('7e');
+    const [stored] = insertOk([
+      buildEvent({
+        kind: 'fetch',
+        name: 'alpha-endpoint',
+        parentSpanId: parent,
+        producerId: PRODUCER_BROWSER,
+        seq: 41,
+        startTime: BASE_TIME + 3.25,
+        duration: 17.5,
+        attributes: { [REQUEST_KEY_ATTRIBUTE]: requestKey, 'http.method': 'POST' },
+      }),
+    ]);
 
-    // The attribution the service assigns, absent — which is what an event that
-    // reached the store without passing through attribution looks like.
-    const unattributed: Record<string, unknown> = { ...buildEvent() };
+    // Raw SQL is justified here and nowhere else in the suite: what is on trial
+    // is the projection itself, which no repository read exposes.
+    const row = store
+      .statement(
+        `SELECT kind, tier, trace_id, span_id, parent_span_id, producer_id, seq, request_key,
+                start_time, duration, event
+           FROM telemetry_events WHERE id = ?`,
+      )
+      .get(stored?.id ?? '');
+    const document = JSON.parse(String(row?.['event'])) as Record<string, unknown>;
+    const attributes = document['attributes'] as Record<string, unknown>;
 
-    delete unattributed['captureId'];
+    expect(row?.['kind']).toBe(document['kind']);
+    expect(row?.['tier']).toBe(document['tier']);
+    expect(row?.['trace_id']).toBe(document['traceId']);
+    expect(row?.['span_id']).toBe(document['spanId']);
+    expect(row?.['parent_span_id']).toBe(document['parentSpanId']);
+    expect(row?.['producer_id']).toBe(document['producerId']);
+    expect(row?.['seq']).toBe(document['seq']);
+    expect(row?.['request_key']).toBe(attributes[REQUEST_KEY_ATTRIBUTE]);
+    expect(row?.['start_time']).toBe(document['startTime']);
+    expect(row?.['duration']).toBe(document['duration']);
 
-    const written = repo.insertMany([valid, unattributed as unknown as PersistableTelemetryEvent]);
+    // And the document is the event that was offered, field for field.
+    expect(document['parentSpanId']).toBe(parent);
+    expect(document['seq']).toBe(41);
+  });
+
+  it.each(['sessionId', 'captureId'] as const)(
+    'refuses a batch whose element is missing its %s, and writes nothing',
+    (field) => {
+      const valid = buildEvent();
+
+      // The attribution the service assigns, absent — which is what an event
+      // that reached the store without passing through attribution looks like.
+      const unattributed: Record<string, unknown> = { ...buildEvent() };
+
+      delete unattributed[field];
+
+      const written = repo.insertMany([
+        valid,
+        unattributed as unknown as PersistableTelemetryEvent,
+      ]);
+
+      expect(isErr(written)).toBe(true);
+
+      if (!isErr(written)) {
+        return;
+      }
+
+      expect(written.error.code).toBe('PROTOCOL_INVALID_MESSAGE');
+      expect(written.error.message).toContain(field);
+      expect(written.error.details?.['index']).toBe(1);
+      expect(written.error.details?.['batchSize']).toBe(2);
+
+      // Refused before the transaction opened, so the valid element is not
+      // stored either: a batch is all or nothing.
+      expect(unwrap(repo.countBySession(SESSION_A))).toBe(0);
+    },
+  );
+
+  it('rolls a mixed batch back whole when one element names an unknown capture', () => {
+    const earlier = insertOk([buildEvent()]);
+    const written = repo.insertMany([
+      buildEvent({ startTime: BASE_TIME + 1 }),
+      buildEvent({ startTime: BASE_TIME + 2 }),
+      buildEvent({ captureId: newCaptureId(), startTime: BASE_TIME + 3 }),
+    ]);
 
     expect(isErr(written)).toBe(true);
 
-    if (!isErr(written)) {
-      return;
+    if (isErr(written)) {
+      expect(written.error.code).toBe('STORE_ERROR');
+      expect(written.error.details?.['reason']).toBe('unknown-attribution');
     }
 
-    expect(written.error.code).toBe('PROTOCOL_INVALID_MESSAGE');
-    expect(written.error.message).toContain('captureId');
-    expect(written.error.details?.['index']).toBe(1);
-    expect(written.error.details?.['batchSize']).toBe(2);
+    // The two valid elements were written inside the batch transaction and
+    // rolled back with it; the earlier batch is untouched.
+    const page = unwrap(repo.query({ sessionId: SESSION_A }));
 
-    // Refused before the transaction opened, so the valid element is not
-    // stored either: a batch is all or nothing.
-    expect(unwrap(repo.countBySession(SESSION_A))).toBe(0);
+    expect(page.total).toBe(1);
+    expect(page.rows.map((event) => event.id)).toEqual(earlier.map((event) => event.id));
   });
 
   it('refuses an event whose kind and tier disagree', () => {
-    const written = repo.insertMany([buildEvent({ kind: 'render', tier: 'db' })]);
+    const written = repo.insertMany([draftEvent({ kind: 'render', tier: 'db' })]);
 
     expect(isErr(written)).toBe(true);
 
@@ -1003,7 +1260,61 @@ describe('insertMany', () => {
  * The canonical order of the convenience readers
  * ---------------------------------------------------------------------------------------------- */
 
+/*
+ * What this block asserts is the **total row order** only: `start_time`, then
+ * `(producer_id, seq)`, then `ingest_seq`, as `CANONICAL_ORDER_BY` spells it.
+ * The first key of the full canonical order, parent before child, is a property
+ * of the trace *tree* and is the correlator's responsibility
+ * (`packages/telemetry/src/correlation/correlator.ts` nests by
+ * `(traceId, parentSpanId)` and walks depth-first); a repository ordering rows
+ * by it would duplicate that logic in SQL and get it wrong whenever a server
+ * clock reads earlier than the browser span that caused it.
+ */
 describe('the canonical order of the convenience readers', () => {
+  it('orders a producer’s interleaved sequence numbers by seq, not by arrival', () => {
+    // One producer, one millisecond, the counter offered out of order: only
+    // `seq` can decide, and it must beat the arrival number.
+    const third = buildEvent({ producerId: PRODUCER_BROWSER, seq: 3 });
+    const first = buildEvent({ producerId: PRODUCER_BROWSER, seq: 1 });
+    const fourth = buildEvent({ producerId: PRODUCER_BROWSER, seq: 4 });
+    const second = buildEvent({ producerId: PRODUCER_BROWSER, seq: 2 });
+
+    const stored = insertOk([third, first, fourth, second]);
+
+    // Arrival order is the offered order…
+    expect(stored.map((event) => event.seq)).toEqual([3, 1, 4, 2]);
+
+    // …and the canonical readers ignore it wherever `seq` differs.
+    const expected = [first.id, second.id, third.id, fourth.id];
+
+    expect(unwrap(repo.listByTrace(SESSION_A, TRACE_A)).rows.map((event) => event.id)).toEqual(
+      expected,
+    );
+    expect(unwrap(repo.listByCapture(SESSION_A, CAPTURE_A1)).rows.map((event) => event.id)).toEqual(
+      expected,
+    );
+  });
+
+  it('returns the identical sequence on every repetition of the same read', () => {
+    const events = [
+      buildEvent({ producerId: PRODUCER_SERVER, kind: 'http.server' }),
+      buildEvent({ producerId: PRODUCER_BROWSER }),
+      buildEvent({ producerId: PRODUCER_SERVER, kind: 'http.server' }),
+      buildEvent({ producerId: PRODUCER_BROWSER }),
+      buildEvent({ producerId: PRODUCER_BROWSER, startTime: BASE_TIME - 1 }),
+    ];
+
+    insertOk(events);
+
+    const reads = Array.from({ length: 3 }, () =>
+      unwrap(repo.listByTrace(SESSION_A, TRACE_A)).rows.map((event) => event.id),
+    );
+
+    expect(reads[1]).toEqual(reads[0]);
+    expect(reads[2]).toEqual(reads[0]);
+    expect(new Set(reads[0]).size).toBe(events.length);
+  });
+
   it('orders equal start times across two producers exactly as the correlator does', () => {
     // Two producers reporting the same millisecond, offered out of order, with
     // the server producer's second event deliberately sharing its first
@@ -1072,9 +1383,11 @@ describe('the canonical order of the convenience readers', () => {
     const whole = unwrap(repo.listByCapture(SESSION_A, CAPTURE_A1, { sort: 'duration_desc' }));
     const walked: string[] = [];
 
-    for (let offset = 0; offset < whole.total; offset += 2) {
+    // Pages of three: the boundary falls between the three equal durations, so
+    // a tie-break that was not total would repeat or drop a row right there.
+    for (let offset = 0; offset < whole.total; offset += 3) {
       const page = unwrap(
-        repo.listByCapture(SESSION_A, CAPTURE_A1, { sort: 'duration_desc', limit: 2, offset }),
+        repo.listByCapture(SESSION_A, CAPTURE_A1, { sort: 'duration_desc', limit: 3, offset }),
       );
 
       walked.push(...page.rows.map((event) => event.id));
@@ -1218,7 +1531,9 @@ describe('the panel-data orderings of query', () => {
         id,
         name,
         startTime: BASE_TIME + offset,
-        ...(requestKey !== undefined ? { attributes: { request_key: requestKey } } : {}),
+        ...(requestKey !== undefined
+          ? { attributes: { [REQUEST_KEY_ATTRIBUTE]: requestKey } }
+          : {}),
       });
     const requestKey = 'f6'.repeat(32);
     const alphaF = named(rankedEventId('f'), 'alpha', 1);
@@ -1411,7 +1726,7 @@ describe('query', () => {
     const otherRender = buildEvent({ kind: 'render', attributes: { component: 'OtherComponent' } });
     const serverSpan = buildEvent({ kind: 'http.server', producerId: PRODUCER_SERVER });
     const slow = buildEvent({ duration: 640 });
-    const keyed = buildEvent({ attributes: { request_key: requestKey } });
+    const keyed = buildEvent({ attributes: { [REQUEST_KEY_ATTRIBUTE]: requestKey } });
 
     insertOk([inCaptureTwo, inTraceB, render, otherRender, serverSpan, slow, keyed]);
 
@@ -1664,6 +1979,37 @@ describe('query', () => {
     expect(loggedText()).not.toContain(SENTINEL);
   });
 
+  it('degrades a stored row overwritten with invalid JSON to one counted skip and one warning', () => {
+    const stored = insertOk([
+      buildEvent({ startTime: BASE_TIME }),
+      buildEvent({ startTime: BASE_TIME + 1 }),
+      buildEvent({ startTime: BASE_TIME + 2 }),
+    ]);
+    const [before, poisoned, after] = stored;
+
+    // The document of a row the store already holds is cut short mid-value,
+    // with a captured value inside what remains: the file was altered after
+    // the row was written.
+    store
+      .statement('UPDATE telemetry_events SET event = ? WHERE id = ?')
+      .run(`{"name":"${SENTINEL}","attributes":{"note":"${SENTINEL}"`, poisoned?.id ?? '');
+
+    logs.length = 0;
+
+    // A throw here would fail the test outright; the read must answer `ok`.
+    const read = unwrap(repo.query({ sessionId: SESSION_A }));
+
+    expect(read.rows.map((event) => event.id)).toEqual([before?.id, after?.id]);
+    expect(read.total).toBe(3);
+    expect(read.skipped).toBe(1);
+
+    const warnings = logs.filter((record) => record.level === 'warn');
+
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]?.fields).toMatchObject({ skipped: 1, ingestSeqs: [poisoned?.ingestSeq] });
+    expect(loggedText()).not.toContain(SENTINEL);
+  });
+
   it('advances past an unreadable row so a paging loop cannot stall', () => {
     insertOk([buildEvent({ startTime: BASE_TIME })]);
 
@@ -1879,12 +2225,12 @@ describe('count_desc and grouped reads', () => {
     const keyTwo = 'e5'.repeat(32);
 
     insertOk([
-      buildEvent({ attributes: { request_key: keyTwo }, startTime: BASE_TIME + 1 }),
-      buildEvent({ attributes: { request_key: keyOne }, startTime: BASE_TIME + 2 }),
-      buildEvent({ attributes: { request_key: keyOne }, startTime: BASE_TIME + 3 }),
-      buildEvent({ attributes: { request_key: keyOne }, startTime: BASE_TIME + 4 }),
+      buildEvent({ attributes: { [REQUEST_KEY_ATTRIBUTE]: keyTwo }, startTime: BASE_TIME + 1 }),
+      buildEvent({ attributes: { [REQUEST_KEY_ATTRIBUTE]: keyOne }, startTime: BASE_TIME + 2 }),
+      buildEvent({ attributes: { [REQUEST_KEY_ATTRIBUTE]: keyOne }, startTime: BASE_TIME + 3 }),
+      buildEvent({ attributes: { [REQUEST_KEY_ATTRIBUTE]: keyOne }, startTime: BASE_TIME + 4 }),
       buildEvent({
-        attributes: { request_key: keyTwo },
+        attributes: { [REQUEST_KEY_ATTRIBUTE]: keyTwo },
         captureId: CAPTURE_A2,
         startTime: BASE_TIME + 5,
       }),
@@ -1895,7 +2241,7 @@ describe('count_desc and grouped reads', () => {
       buildEvent({
         sessionId: SESSION_B,
         captureId: CAPTURE_B1,
-        attributes: { request_key: keyOne },
+        attributes: { [REQUEST_KEY_ATTRIBUTE]: keyOne },
       }),
     ]);
 
@@ -1935,15 +2281,9 @@ describe('count_desc and grouped reads', () => {
     );
 
     expect(rows.total).toBe(7);
-    expect(rows.rows.map((event) => event.attributes['request_key'] ?? event.kind)).toEqual([
-      keyOne,
-      keyOne,
-      keyOne,
-      keyTwo,
-      keyTwo,
-      'interaction',
-      'interaction',
-    ]);
+    expect(rows.rows.map((event) => event.attributes[REQUEST_KEY_ATTRIBUTE] ?? event.kind)).toEqual(
+      [keyOne, keyOne, keyOne, keyTwo, keyTwo, 'interaction', 'interaction'],
+    );
   });
 
   it('groups by component only where the attribute is a string', () => {
@@ -2217,11 +2557,11 @@ describe('the convenience readers', () => {
     });
     const requestKey = 'c3'.repeat(32);
     const keyedOne = buildEvent({
-      attributes: { request_key: requestKey },
+      attributes: { [REQUEST_KEY_ATTRIBUTE]: requestKey },
       startTime: BASE_TIME + 4,
     });
     const keyedTwo = buildEvent({
-      attributes: { request_key: requestKey },
+      attributes: { [REQUEST_KEY_ATTRIBUTE]: requestKey },
       startTime: BASE_TIME + 6,
     });
     const otherTrace = buildEvent({ traceId: TRACE_B, startTime: BASE_TIME + 8 });
@@ -2251,6 +2591,77 @@ describe('the convenience readers', () => {
     expect(unwrap(repo.listChildren(SESSION_A, root.spanId)).rows.map((event) => event.id)).toEqual(
       [child.id],
     );
+  });
+
+  it('agrees with the equivalent query call, reader for reader', () => {
+    // Distinct start times throughout, so the canonical order of the readers
+    // and the panel-data order of `query` coincide and the comparison can be
+    // of whole ordered pages rather than of sets.
+    const requestKey = requestKeyOf('c4');
+    const root = buildEvent({ kind: 'interaction', startTime: BASE_TIME + 1 });
+    const events = [
+      root,
+      buildEvent({
+        parentSpanId: root.spanId,
+        startTime: BASE_TIME + 2,
+        attributes: { [REQUEST_KEY_ATTRIBUTE]: requestKey },
+      }),
+      buildEvent({
+        parentSpanId: root.spanId,
+        startTime: BASE_TIME + 3,
+        attributes: { [REQUEST_KEY_ATTRIBUTE]: requestKey },
+      }),
+      buildEvent({ kind: 'render', startTime: BASE_TIME + 4, captureId: CAPTURE_A2 }),
+      buildEvent({ traceId: TRACE_B, startTime: BASE_TIME, kind: 'db.query' }),
+      buildEvent({ traceId: TRACE_B, startTime: BASE_TIME + 5, captureId: CAPTURE_A2 }),
+      buildEvent({ sessionId: SESSION_B, captureId: CAPTURE_B1, startTime: BASE_TIME + 6 }),
+    ];
+
+    insertOk(events);
+
+    function pageOf(page: TelemetryPage): readonly [string[], number] {
+      return [page.rows.map((event) => event.id), page.total];
+    }
+
+    expect(pageOf(unwrap(repo.listByTrace(SESSION_A, TRACE_A)))).toEqual(
+      pageOf(unwrap(repo.query({ sessionId: SESSION_A, traceId: TRACE_A }))),
+    );
+    expect(pageOf(unwrap(repo.listByCapture(SESSION_A, CAPTURE_A2)))).toEqual(
+      pageOf(unwrap(repo.query({ sessionId: SESSION_A, captureId: CAPTURE_A2 }))),
+    );
+    expect(pageOf(unwrap(repo.listByRequestKey(SESSION_A, requestKey)))).toEqual(
+      pageOf(unwrap(repo.query({ sessionId: SESSION_A, requestKey }))),
+    );
+
+    // `query` has no parent filter, so the children are the rows of the whole
+    // session page that name the parent — in the same order.
+    const whole = unwrap(repo.query({ sessionId: SESSION_A }));
+
+    expect(unwrap(repo.listChildren(SESSION_A, root.spanId)).rows.map((event) => event.id)).toEqual(
+      whole.rows.filter((event) => event.parentSpanId === root.spanId).map((event) => event.id),
+    );
+    expect(unwrap(repo.getBySpanId(SESSION_A, root.spanId))).toEqual(
+      whole.rows.find((event) => event.spanId === root.spanId),
+    );
+
+    // Distinct trace ids, ordered by each trace's earliest start: TRACE_B
+    // starts at BASE_TIME, TRACE_A one millisecond later.
+    const firstSeen = [...new Set(whole.rows.map((event) => event.traceId))];
+
+    expect(unwrap(repo.listTraceIds(SESSION_A))).toEqual(firstSeen);
+    expect(firstSeen).toEqual([TRACE_B, TRACE_A]);
+
+    // Zero-filled over the whole vocabulary, and equal kind for kind to a
+    // count-only query narrowed to that kind.
+    const counts = unwrap(repo.countByKind(SESSION_A));
+
+    expect(Object.keys(counts).sort()).toEqual([...TELEMETRY_KINDS].sort());
+
+    for (const kind of TELEMETRY_KINDS) {
+      expect(counts[kind]).toBe(
+        unwrap(repo.query({ sessionId: SESSION_A, kinds: [kind], limit: 0 })).total,
+      );
+    }
   });
 
   it('accepts the same narrowing through a convenience reader as through query', () => {
@@ -2402,6 +2813,15 @@ describe('the convenience readers', () => {
  * The existence lookups
  * ---------------------------------------------------------------------------------------------- */
 
+/*
+ * Why these lookups exist: `src/panels/validate.ts` passes them as the
+ * `resolveEventIds` / `resolveTraceIds` options of `validateAgainstCapture`
+ * (`packages/panel-schema/src/semantic.ts`). The bounded capture summary alone
+ * can only answer `unverifiable` for a citation outside its top-N sections;
+ * with the store behind it every citation gets a real verdict, which is this
+ * table's contribution to AAP 0.8.4's rule that an observed fact cites
+ * evidence the capture actually holds.
+ */
 describe('the existence lookups', () => {
   it('answers with the subset that exists, scoped to the session and capture', () => {
     const mine = buildEvent();
@@ -2460,6 +2880,35 @@ describe('the existence lookups', () => {
     for (const id of fabricated) {
       expect(found.has(id)).toBe(false);
     }
+  });
+
+  it('mirrors every property for trace ids: scope, chunking and de-duplication', () => {
+    const traceOfA2 = newTraceId();
+    const traceOfB = newTraceId();
+    const manyTraces = Array.from({ length: 40 }, () => newTraceId());
+
+    insertOk([
+      ...manyTraces.map((traceId, index) => buildEvent({ traceId, startTime: BASE_TIME + index })),
+      buildEvent({ traceId: traceOfA2, captureId: CAPTURE_A2 }),
+      buildEvent({ traceId: traceOfB, sessionId: SESSION_B, captureId: CAPTURE_B1 }),
+    ]);
+
+    // 1 200 cited ids, most of them absent and some cited twice: three
+    // statements at the 500-parameter bound, never one over SQLite's limit.
+    const absent = Array.from({ length: 1_200 - manyTraces.length * 2 - 2 }, () => newTraceId());
+    const cited = [...manyTraces, ...absent, ...manyTraces, traceOfA2, traceOfB];
+
+    expect(cited).toHaveLength(1_200);
+
+    const found = unwrap(repo.existingTraceIds(SESSION_A, cited));
+
+    expect([...found].sort()).toEqual([...manyTraces, traceOfA2].sort());
+
+    // Another session's trace is absent from this session's answer, and a
+    // capture narrowing keeps only that capture's traces.
+    expect(found.has(traceOfB)).toBe(false);
+    expect([...unwrap(repo.existingTraceIds(SESSION_A, cited, CAPTURE_A2))]).toEqual([traceOfA2]);
+    expect([...unwrap(repo.existingTraceIds(SESSION_B, cited))]).toEqual([traceOfB]);
   });
 
   it('de-duplicates the input rather than binding a citation twice', () => {
@@ -2857,6 +3306,36 @@ describe('privacy', () => {
 
     expect(loggedText()).not.toContain(SENTINEL);
   });
+
+  it('refuses on every path with a code from the closed vocabulary, and no captured value', async () => {
+    const carrying = buildEvent({ name: SENTINEL, attributes: { note: SENTINEL } });
+
+    insertOk([carrying]);
+
+    // One refusal per failure family the repository has: schema, attribution,
+    // replay conflict, query argument, lookup argument and purge argument.
+    const refusals: Result<unknown, DebuggenError>[] = [
+      repo.insertMany([{ ...draftEvent({ attributes: { note: SENTINEL } }), duration: -1 }]),
+      repo.insertMany([buildEvent({ name: SENTINEL, captureId: newCaptureId() })]),
+      repo.insertMany([{ ...carrying, attributes: { note: `${SENTINEL}-changed` } }]),
+      repo.query({ sessionId: SESSION_A, sort: SENTINEL as unknown as 'start_asc' }),
+      repo.query({ sessionId: SESSION_A, component: SENTINEL, limit: -1 }),
+      repo.existingEventIds('', [carrying.id]),
+      await repo.deleteOlderThan(Number.NaN),
+    ];
+    const vocabulary: readonly string[] = DEBUGGEN_ERROR_CODES;
+
+    for (const refusal of refusals) {
+      expect(isErr(refusal)).toBe(true);
+
+      if (isErr(refusal)) {
+        expect(vocabulary).toContain(refusal.error.code);
+        expect(errorText(refusal.error)).not.toContain(SENTINEL);
+      }
+    }
+
+    expect(loggedText()).not.toContain(SENTINEL);
+  });
 });
 
 /* -------------------------------------------------------------------------------------------------
@@ -2893,6 +3372,35 @@ describe('bulk insertion and index use', () => {
     // twenty thousand times and take minutes.
     expect(elapsed).toBeLessThan(15_000);
   }, 60_000);
+
+  it('clamps a request for more than the ceiling to 5 000 rows over a larger capture', () => {
+    const count = TELEMETRY_QUERY_MAX_LIMIT + 50;
+    const events = Array.from({ length: count }, (_unused, index) =>
+      buildEvent({ startTime: BASE_TIME + index / 4, seq: index }),
+    );
+
+    const started = performance.now();
+    const written = unwrap(repo.insertMany(events));
+
+    // One batch, one transaction: well inside the suite's default timeout even
+    // on a shared host, where a per-row commit would not be.
+    expect(performance.now() - started).toBeLessThan(5_000);
+    expect(written.inserted).toBe(count);
+
+    const clamped = unwrap(repo.query({ sessionId: SESSION_A, limit: 10_000 }));
+
+    expect(clamped.rows).toHaveLength(TELEMETRY_QUERY_MAX_LIMIT);
+    expect(clamped.total).toBe(count);
+    expect(clamped.nextOffset).toBe(TELEMETRY_QUERY_MAX_LIMIT);
+
+    const rest = unwrap(
+      repo.query({ sessionId: SESSION_A, limit: 10_000, offset: clamped.nextOffset }),
+    );
+
+    expect(rest.rows).toHaveLength(count - TELEMETRY_QUERY_MAX_LIMIT);
+    expect(rest.nextOffset).toBeUndefined();
+    expect(new Set([...clamped.rows, ...rest.rows].map((event) => event.id)).size).toBe(count);
+  }, 30_000);
 
   it('takes every purge batch from a covering purge index, with no sort and no table scan', () => {
     insertOk([
@@ -3079,7 +3587,7 @@ function seedPlanFixture(): PlanFixture {
         kind,
         startTime: BASE_TIME + index,
         duration: 1 + (index % 7),
-        attributes: kind === 'fetch' ? { request_key: cycle(requestKeys, family) } : {},
+        attributes: kind === 'fetch' ? { [REQUEST_KEY_ATTRIBUTE]: cycle(requestKeys, family) } : {},
       }),
     );
   }
@@ -3387,7 +3895,7 @@ describe('the index each reader is answered from', () => {
   it('keeps a request-group read inside its capture when the capture is a residual filter', () => {
     const requestKey = 'c4'.repeat(32);
     const occurrence = (captureId: string, startTime: number): PersistableTelemetryEvent =>
-      buildEvent({ captureId, startTime, attributes: { request_key: requestKey } });
+      buildEvent({ captureId, startTime, attributes: { [REQUEST_KEY_ATTRIBUTE]: requestKey } });
 
     // The same request in both captures of one session, the second capture's
     // occurrence first, so a read that dropped the capture narrowing would

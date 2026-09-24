@@ -184,27 +184,35 @@ body {
 /* ==========================================================================
  * StatusBar — components/StatusBar.tsx
  *
- * The header strip: service connection on one side, provider on the other, and
- * nothing that wraps mid-item. Metadata density, so the smallest type role.
+ * The header strip: service connection on one side, session status and
+ * provider on the other, and nothing that wraps mid-item. Metadata density, so
+ * the smallest type role. Every row, group and gap is a `Stack` (AAP 0.6.4), so
+ * these rules add only what the design system cannot know: that the bar fills
+ * the header, that its parts may shrink, and the type role its loose text
+ * inherits. They deliberately set no `display`, direction, alignment or gap —
+ * on a `Stack` block any of those would override `.dg-stack` and shrink its
+ * items container to its content.
  * ========================================================================== */
 
+/* The root `Stack`: a flex item of `.dgv-view__header` that takes the strip's
+ * free space, above an optional `ErrorState` for a hard failure. */
 .dgv-status-bar {
-  display: flex;
   flex: 1 1 auto;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--dg-space-2);
   min-inline-size: 0;
   color: var(--dg-text-secondary);
   font: var(--dg-text-xs);
 }
 
+/* The polite live region around the row. A plain block, because `Stack` takes
+ * no `role`; the row `Stack` inside it fills its width. */
+.dgv-status-bar__status {
+  min-inline-size: 0;
+}
+
+/* One side of the row. It may shrink below its content's width so a long
+ * service URL truncates instead of widening the view. */
 .dgv-status-bar__group {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--dg-space-2);
+  flex: 0 1 auto;
   min-inline-size: 0;
 }
 
@@ -212,7 +220,8 @@ body {
  * An item is a truncating TEXT box, not a flex row: `text-overflow` has no
  * effect on a flex container, so an item that laid its content out with `flex`
  * would hard-clip a long project path with no ellipsis (measured in Chromium).
- * It is a flex item of `__group`, so it blockifies there either way. An item
+ * It is a flex item of the group `Stack`'s items row, so it blockifies there
+ * either way, and it is applied to a `Text` or `Code` run directly. An item
  * that pairs a glyph with a label composes `Badge` or `Text`, each of which
  * brings its own inline row.
  */
@@ -330,7 +339,28 @@ body {
   min-inline-size: 0;
 }
 
+/* The ordered list of stage groups, and the one polite live region of the
+ * block. The state primitives and the call to action are its siblings, never
+ * its items, so nothing inside it announces twice. Markers are opted out here
+ * because each row draws its own status marker; the order stays semantic. */
+.dgv-progress__groups {
+  display: flex;
+  flex-direction: column;
+  gap: var(--dg-space-4);
+  min-inline-size: 0;
+  list-style: none;
+}
+
 .dgv-progress__group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--dg-space-1);
+  min-inline-size: 0;
+  list-style: none;
+}
+
+/* The ordered list of one stage's rows, named by the group title. */
+.dgv-progress__rows {
   display: flex;
   flex-direction: column;
   gap: var(--dg-space-1);
@@ -364,6 +394,14 @@ body {
 
 .dgv-progress__marker--running {
   color: var(--dg-text-secondary);
+}
+
+/* The running marker's `dg-spinner` is an empty inline-block, so on the
+ * baseline it would sit a little above the label it marks; `middle` centres
+ * it on the text line like the check and cross glyphs. Alignment only — the
+ * ring, its size and its motion stay the design system's. */
+.dgv-progress__spinner {
+  vertical-align: middle;
 }
 
 .dgv-progress__marker--done {
@@ -495,61 +533,106 @@ body {
 /* ==========================================================================
  * ModificationsList — components/ModificationsList.tsx
  *
- * One card per `ModificationRecord`: the instrumented file, an applied /
- * reverted / conflict `Badge` with the hash and timestamp metadata, and the
- * "View diff" control. Every modification the tool made is visible here, which
- * is a product guarantee (AAP 0.5.1), so the row is a card rather than a line:
- * it has to read as a record, not as a log entry.
+ * One `DataTable` row per `ModificationRecord`: the instrumented file with its
+ * plan version and time, an applied / reverted / conflict `Badge`, and the
+ * "View diff" disclosure whose detail row holds the hashes and the `DiffView`.
+ * Every modification the tool made is visible here, which is a product
+ * guarantee (AAP 0.5.1).
+ *
+ * The grid, its rows, cells, header, detail row and density all belong to the
+ * design system (`.dg-data-table*`) and are never restyled from here; every
+ * gap inside a cell comes from a `Stack`. What is left for this block is the
+ * sizing a flex item inside a table cell needs so a long path truncates
+ * instead of widening its column, and the truncation of the path itself.
  * ========================================================================== */
 
 .dgv-modifications {
-  display: flex;
-  flex-direction: column;
-  gap: var(--dg-space-2);
   min-inline-size: 0;
-  list-style: none;
 }
 
-.dgv-modifications__row {
-  display: flex;
-  flex-direction: column;
-  gap: var(--dg-space-1);
+/* The identity cell's column (path, meta line, note). A table cell is a flex
+ * row, so this stack is a flex item of it: it takes the cell's whole width and
+ * may shrink below its content, which is what lets the path ellipsize. */
+.dgv-modifications__identity {
+  flex: 1 1 auto;
   min-inline-size: 0;
-  padding-block: var(--dg-space-2);
-  padding-inline: var(--dg-space-3);
-  background: var(--dg-surface-elevated);
-  border: thin solid var(--dg-border-subtle);
-  border-radius: var(--dg-radius-sm);
 }
 
-/* `display: block` for the same reason as `.dgv-cleanup__conflict-file` below:
- * the path renders through the `Code` primitive, and an inline box ignores the
- * truncation declarations. Being a flex item would blockify it anyway, so this
- * only removes the dependency on what the component wraps it in. */
+/* The path, rendered through the `Code` primitive as two spans: the directory
+ * and the file name. A flex row rather than `display: block` (compare
+ * `.dgv-cleanup__conflict-file` below) because the two parts truncate in a
+ * fixed order: in a narrow sidebar the directory ellipsizes first and the file
+ * name — what tells one row from the next — stays visible. The element's text
+ * is still the whole path, byte for byte. */
 .dgv-modifications__file {
-  display: block;
+  display: flex;
   min-inline-size: 0;
   max-inline-size: 100%;
   overflow: hidden;
-  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.dgv-modifications__meta {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--dg-space-2);
-  min-inline-size: 0;
-  color: var(--dg-text-secondary);
-  font: var(--dg-text-xs);
+/* Shrinks before the file name gives up a single character, but never below
+ * the room its own ellipsis needs. Text overflow never replaces a line's first
+ * character, so `…` only appears once the box fits one character plus the
+ * glyph — two `ch` of the `--dg-mono-sm` face, about 13px; any narrower and it
+ * paints a bare or clipped leading character that reads as part of the file
+ * name. The token table has no size family, so that floor is the smallest
+ * space token wider than two characters (measured in Chromium). */
+.dgv-modifications__directory {
+  flex: 0 1 auto;
+  min-inline-size: var(--dg-space-5);
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
+/* Never shrinks for the directory's sake. A file name wider than the whole
+ * column is capped at it — less the directory's floor when a directory
+ * precedes it — and ellipsizes on its own. */
+.dgv-modifications__name {
+  flex: none;
+  max-inline-size: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dgv-modifications__directory + .dgv-modifications__name {
+  max-inline-size: calc(100% - var(--dg-space-5));
+}
+
+/* Plan version, layering and time on one wrapping line (a horizontal Stack). */
+.dgv-modifications__meta {
+  min-inline-size: 0;
+}
+
+/* The status explanation under the path. Wraps at any point so a narrow view
+ * never clips the sentence that says what the product did with the file. */
+.dgv-modifications__note {
+  min-inline-size: 0;
+  overflow-wrap: anywhere;
+}
+
+/* The disclosure and open-file buttons (a horizontal, wrapping Stack): they
+ * sit side by side when the track allows and stack when it does not. */
 .dgv-modifications__actions {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--dg-space-2);
+  flex: 1 1 auto;
+  min-inline-size: 0;
+}
+
+/* The expanded detail: preserved original, hashes, then the diff. It fills the
+ * single full-width cell of the design system's detail row. */
+.dgv-modifications__detail {
+  min-inline-size: 0;
+}
+
+/* A conflicting file's preserved original. The path inside wraps through
+ * `Code wrap`; the sentence keeps the reading colour of the note above. */
+.dgv-modifications__preserved {
+  margin: 0;
+  min-inline-size: 0;
+}
+
+.dgv-modifications__hashes {
   min-inline-size: 0;
 }
 
@@ -720,6 +803,15 @@ body {
 
 .dgv-capture__indicator--capturing {
   background: var(--dg-danger);
+}
+
+/* The error, busy and unavailable states replace the whole row of controls,
+ * so each placeholder takes the full line. As the lone item of this wrapping
+ * row it would otherwise shrink to its own padding, and the busy skeleton bar,
+ * sized as a share of its box, would collapse to nothing. */
+.dgv-capture__placeholder {
+  flex: 1 1 auto;
+  min-inline-size: 0;
 }
 
 /* ==========================================================================

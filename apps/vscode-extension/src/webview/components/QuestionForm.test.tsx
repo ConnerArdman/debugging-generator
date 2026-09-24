@@ -12,13 +12,19 @@
  *     and never as a blank area;
  *   - the inert form while `disabled`, and the draft surviving a round trip
  *     through `disabled`, `pending` and `error`;
- *   - the design-system shape: a labelled multi-line field, no `<form>`, and
- *     the root block class composed with the caller's.
+ *   - the design-system shape: a labelled multi-line field, no `<form>`, every
+ *     button `type="button"`, and the root block class composed with the
+ *     caller's;
+ *   - the no-hardcoding guarantee at component level (AAP 0.5.4): two
+ *     questions that differ only in wording behave and render identically;
+ *   - privacy (AAP 0.5.2): typing and submitting a question writes nothing to
+ *     the console.
  *
  * Harness conventions follow the rest of the repository: the Vitest API is
- * imported explicitly, `cleanup` is registered explicitly, elements are found
- * by role and accessible name, and — with no `jest-dom` in this repository —
- * state is read from DOM properties. Fixture wording is generic (AAP 0.5.4).
+ * imported explicitly, `cleanup` and `vi.restoreAllMocks` are registered
+ * explicitly, elements are found by role, label and accessible name, and —
+ * with no `jest-dom` in this repository — state is read from DOM properties.
+ * Fixture wording is neutral and synthetic (AAP 0.5.4).
  */
 import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -28,8 +34,15 @@ import { QuestionForm } from './QuestionForm';
 
 const FIELD_NAME = 'What do you want to debug?';
 const SUBMIT_NAME = 'Ask question';
+const UNAVAILABLE_TEXT = 'Start the local service to begin a session.';
+
+/** The console methods a question must never reach (AAP 0.5.2). */
+const CONSOLE_METHODS = ['log', 'warn', 'error', 'info', 'debug'] as const;
 
 afterEach(cleanup);
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 /** The text area, narrowed to its element type. */
 function getField(): HTMLTextAreaElement {
@@ -80,6 +93,33 @@ describe('QuestionForm — default state', () => {
     expect(container.querySelector('form')).toBeNull();
   });
 
+  it('names the field through its visible label', () => {
+    render(<QuestionForm onSubmit={vi.fn()} />);
+
+    // `Input` renders a real `<label htmlFor>`, so the label query resolves to
+    // the very element the role query finds.
+    const byLabel = screen.getByLabelText(FIELD_NAME);
+    expect(byLabel).toBe(getField());
+  });
+
+  it('renders every button as type="button", in the data and the error state', () => {
+    const { rerender } = render(<QuestionForm onSubmit={vi.fn()} />);
+
+    const dataButtons = screen.getAllByRole('button');
+    expect(dataButtons.length).toBeGreaterThan(0);
+    for (const button of dataButtons) {
+      expect((button as HTMLButtonElement).type).toBe('button');
+    }
+
+    rerender(<QuestionForm onSubmit={vi.fn()} error="Stage failed." onRetry={vi.fn()} />);
+
+    const errorButtons = screen.getAllByRole('button');
+    expect(errorButtons.length).toBeGreaterThan(0);
+    for (const button of errorButtons) {
+      expect((button as HTMLButtonElement).type).toBe('button');
+    }
+  });
+
   it('describes the field with the DevTools hint and the keyboard shortcut', () => {
     render(<QuestionForm onSubmit={vi.fn()} />);
 
@@ -121,6 +161,50 @@ describe('QuestionForm — submission', () => {
     expect(onSubmit).toHaveBeenCalledWith('Why does this list take so long to appear?');
     expect(getField().value).toBe('');
     expect(getSubmit().disabled).toBe(true);
+  });
+
+  it('hands up the trimmed draft when typed and clicked through user-event', async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn<(question: string) => void>();
+    render(<QuestionForm onSubmit={onSubmit} />);
+
+    await user.type(getField(), '   Where does the time go after the first click?   ');
+    await user.click(getSubmit());
+
+    expect(onSubmit).toHaveBeenCalledTimes(1);
+    expect(onSubmit).toHaveBeenCalledWith('Where does the time go after the first click?');
+    expect(getField().value).toBe('');
+  });
+
+  it('refuses an untouched field by the button and by the keyboard chord', async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn<(question: string) => void>();
+    render(<QuestionForm onSubmit={onSubmit} />);
+
+    expect(getField().value).toBe('');
+    expect(getSubmit().disabled).toBe(true);
+
+    await user.click(getSubmit());
+    fireEvent.click(getSubmit());
+    fireEvent.keyDown(getField(), { key: 'Enter', ctrlKey: true });
+    fireEvent.keyDown(getField(), { key: 'Enter', metaKey: true });
+
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
+
+  it('refuses a draft of three spaces', async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn<(question: string) => void>();
+    render(<QuestionForm onSubmit={onSubmit} />);
+
+    await user.type(getField(), '   ');
+    expect(getField().value).toBe('   ');
+    expect(getSubmit().disabled).toBe(true);
+
+    await user.click(getSubmit());
+    await user.keyboard('{Control>}{Enter}{/Control}');
+
+    expect(onSubmit).not.toHaveBeenCalled();
   });
 
   it('keeps inner line breaks of a multi-line question', () => {
@@ -184,29 +268,44 @@ describe('QuestionForm — submission', () => {
     render(<QuestionForm onSubmit={onSubmit} />);
 
     await user.click(getField());
-    await user.keyboard('Why is this slow?{Enter}More context');
+    await user.keyboard('What happens after this step?{Enter}More context');
     // Plain Enter inserted a newline rather than submitting.
     expect(onSubmit).not.toHaveBeenCalled();
-    expect(getField().value).toBe('Why is this slow?\nMore context');
+    expect(getField().value).toBe('What happens after this step?\nMore context');
 
     await user.keyboard('{Control>}{Enter}{/Control}');
     expect(onSubmit).toHaveBeenCalledTimes(1);
-    expect(onSubmit).toHaveBeenCalledWith('Why is this slow?\nMore context');
+    expect(onSubmit).toHaveBeenCalledWith('What happens after this step?\nMore context');
   });
 
   it('forwards two different wordings verbatim, with identical behaviour', () => {
     const onSubmit = vi.fn<(question: string) => void>();
-    render(<QuestionForm onSubmit={onSubmit} />);
+    const { container } = render(<QuestionForm onSubmit={onSubmit} />);
 
-    typeDraft('Why is this view slow?');
-    fireEvent.click(getSubmit());
-    typeDraft('What makes this view slow?');
-    fireEvent.click(getSubmit());
+    // The component-level counterpart of AAP 0.5.4: the text is data, so two
+    // wordings of one question must meet the same controls, reach the callback
+    // untransformed and leave the same markup behind. Markup is compared
+    // between the two rounds rather than against the first render, because
+    // toggling `disabled` legitimately reorders the button's attributes.
+    const wordings = ['Why is this view slow?', 'What makes this view slow?'] as const;
+    const markupAfterSubmit: string[] = [];
 
-    expect(onSubmit.mock.calls).toEqual([
-      ['Why is this view slow?'],
-      ['What makes this view slow?'],
-    ]);
+    for (const wording of wordings) {
+      typeDraft(`  ${wording}  `);
+      expect(getSubmit().disabled).toBe(false);
+      expect(screen.queryByRole('alert')).toBeNull();
+      expect(screen.queryByRole('status')).toBeNull();
+
+      fireEvent.click(getSubmit());
+
+      expect(onSubmit).toHaveBeenLastCalledWith(wording);
+      expect(getField().value).toBe('');
+      expect(getSubmit().disabled).toBe(true);
+      markupAfterSubmit.push(container.innerHTML);
+    }
+
+    expect(onSubmit.mock.calls).toEqual([[wordings[0]], [wordings[1]]]);
+    expect(markupAfterSubmit[1]).toBe(markupAfterSubmit[0]);
   });
 
   it('keeps the draft when the callback throws', () => {
@@ -285,7 +384,7 @@ describe('QuestionForm — unavailable', () => {
 
     const status = screen.getByRole('status');
     expect(status.getAttribute('aria-busy')).toBeNull();
-    expect(status.textContent).toContain('Start the local service to begin a session.');
+    expect(status.textContent).toContain(UNAVAILABLE_TEXT);
     expect(screen.queryByRole('textbox')).toBeNull();
     expect(screen.queryByRole('button')).toBeNull();
   });
@@ -322,7 +421,12 @@ describe('QuestionForm — error', () => {
     render(<QuestionForm onSubmit={vi.fn()} error="Stage failed." pending unavailable />);
 
     expect(screen.getByRole('alert').textContent).toContain('Stage failed.');
+    // Only the alert: no loading state, no empty state, no field.
     expect(screen.queryByRole('status')).toBeNull();
+    expect(screen.queryByText('Submitting your question')).toBeNull();
+    expect(screen.queryByText(UNAVAILABLE_TEXT)).toBeNull();
+    expect(screen.queryByRole('textbox')).toBeNull();
+    expect(screen.queryByRole('button', { name: SUBMIT_NAME })).toBeNull();
   });
 
   it('treats a blank message as no error', () => {
@@ -349,6 +453,32 @@ describe('QuestionForm — state precedence', () => {
     render(<QuestionForm onSubmit={vi.fn()} pending unavailable />);
 
     expect(screen.getByRole('status').getAttribute('aria-busy')).toBe('true');
-    expect(screen.queryByText('Start the local service to begin a session.')).toBeNull();
+    expect(screen.queryByText(UNAVAILABLE_TEXT)).toBeNull();
+  });
+});
+
+describe('QuestionForm — privacy', () => {
+  it('writes nothing to the console while a question is typed and submitted', async () => {
+    const spies = CONSOLE_METHODS.map((method) =>
+      vi.spyOn(console, method).mockImplementation(() => undefined),
+    );
+    const user = userEvent.setup();
+    const onSubmit = vi.fn<(question: string) => void>();
+    const { rerender } = render(<QuestionForm onSubmit={onSubmit} />);
+
+    await user.type(getField(), 'Which step of this flow waits the longest?');
+    await user.click(getSubmit());
+    await user.type(getField(), 'And what happens right after it?');
+    await user.keyboard('{Meta>}{Enter}{/Meta}');
+    rerender(<QuestionForm onSubmit={onSubmit} pending />);
+    rerender(<QuestionForm onSubmit={onSubmit} error="Stage failed." onRetry={vi.fn()} />);
+
+    expect(onSubmit.mock.calls).toEqual([
+      ['Which step of this flow waits the longest?'],
+      ['And what happens right after it?'],
+    ]);
+    for (const spy of spies) {
+      expect(spy).not.toHaveBeenCalled();
+    }
   });
 });

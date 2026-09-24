@@ -1,0 +1,678 @@
+/**
+ * `ModificationsList` — every file the session instrumented, its journal status
+ * and the exact diff that was applied (AAP 0.7.3: "file, status badge
+ * applied/reverted/conflict, 'View diff' → `DiffView`").
+ *
+ * This is the editor-side half of a product guarantee: every modification the
+ * tool makes to the developer's working tree is recorded before it is written
+ * and stays visible while the session runs and after it ends (AAP 0.5.1). A
+ * change the developer cannot see here is a change they cannot trust, so the
+ * component renders one row for every record it is given — none is hidden,
+ * grouped away or collapsed into a count.
+ *
+ * ## Data in, one callback out
+ *
+ * `props.modifications` is `WebviewState.modifications`: the session's
+ * `ModificationRecord[]`, which the host keeps from the session record and from
+ * `instrumentation.ready` / `cleanup.completed` (AAP 0.4.2). The rows appear in
+ * exactly that order — the order the installer applied the plan in, which is
+ * meaningful when a follow-up layers a second record onto the same file — and
+ * are never re-sorted. `DataTable` is controlled and never re-orders rows
+ * itself, so passing the array through is both the simplest and the faithful
+ * choice.
+ *
+ * The only interaction that leaves this component is `onOpenFile(file)`, raised
+ * with the record's `file` **exactly as received**: a project-relative POSIX
+ * path, with no workspace root prepended and no line appended. `App.tsx` owns
+ * the host bridge and turns it into the open request; containment is enforced
+ * downstream, where a file-system decision belongs. Nothing here fetches, posts
+ * a host message or opens a socket: the diff arrives on the record.
+ *
+ * ## The one piece of local state
+ *
+ * Which row's diff is open — a single record id, or none. It is transient
+ * presentation, so it lives here rather than in the host's snapshot. "View diff"
+ * toggles it through a functional update, so activating the same row twice
+ * always ends collapsed and activating another row moves the disclosure there.
+ * The grid's own keyboard toggle (Arrow Right / Arrow Left on a row) drives the
+ * same state through `onRowToggle`.
+ *
+ * ## Structure and the design system (AAP 0.6.2, 0.6.4)
+ *
+ * ```text
+ * div.dgv-modifications                     root, in every state
+ *   DataTable (compact, caption hidden)     role=grid, owned by the primitive
+ *     File   (rowheader)                    Stack .dgv-modifications__identity
+ *       Code sm                             .dgv-modifications__file — the path, as
+ *         span, span                        __directory (ellipsizes first) + __name
+ *       Stack horizontal                    .dgv-modifications__meta — plan version, time
+ *       Text xs                             .dgv-modifications__note — status explanation
+ *     Status                                Badge soft — tone AND text label
+ *     Actions                               Stack .dgv-modifications__actions
+ *       Button ghost sm                     View diff / Hide diff (disclosure)
+ *       Button ghost sm                     Open file (only with onOpenFile)
+ *     detail row (aria-colspan)             Stack .dgv-modifications__detail
+ *       Text + Code                         preserved original (conflict only)
+ *       Stack horizontal                    .dgv-modifications__hashes
+ *       DiffView                            the recorded unified diff, verbatim
+ * ```
+ *
+ * `DataTable` owns the whole ARIA grid — `role="grid"`, exact
+ * `aria-rowcount`/`aria-colcount`, `rowheader`/`gridcell`, the roving tab stop
+ * and the `aria-colspan` detail row — so this component adds no role of its
+ * own. It meets the primitive's two caller obligations: every control rendered
+ * in a cell or in the detail row is `tabIndex={-1}` (the grid is one Tab stop,
+ * and its arrow keys reach the controls), and the disclosure button carries
+ * `aria-expanded={meta.expanded}` and `aria-controls={meta.detailRowId}`,
+ * because `aria-expanded` is not valid on a `grid` row. Each button's accessible
+ * name starts with its visible text and ends with the record's file, so a
+ * screen-reader user hears which row it acts on.
+ *
+ * Geometry is expressed only as relational grid tracks in the columns' `width`
+ * (`ch` minimums, `fr` shares), never as a length literal; every other value
+ * resolves through the `dgv-modifications` block of `../styles.css` to a
+ * `--dg-*` token. `clsx` is not a dependency of this workspace, so class names
+ * are joined by a local helper.
+ *
+ * ## Status vocabulary (AAP 0.5.1)
+ *
+ * The five journal statuses — `pending`, `applied`, `reverted`, `conflict`,
+ * `failed` — are a closed vocabulary. Their tones sit in an exhaustive `Record`
+ * and their words in a `switch` closed by `assertNever`, so a status added to
+ * the schema is a compile error here rather than an unstyled, unexplained pill.
+ * Colour is never the only carrier: every badge has its text label.
+ *
+ * A `conflict` row says what the product did — the file changed after it was
+ * instrumented, so it was left untouched and its original is preserved — and
+ * never that it was reverted. That keeps each row consistent with the session's
+ * cleanup outcome, which `App.tsx` shows on its own and this component does not
+ * restate (AAP 0.5.1, 0.5.5).
+ *
+ * ## States (AAP 0.5.5 — never a blank area)
+ *
+ * Fixed precedence, highest first: `error` > `pending` > empty > the table. A
+ * failure is never shown as an empty list and a load never flashes the empty
+ * message. `ErrorState`, `LoadingState` and `EmptyState` own their live-region
+ * roles (`alert`, `status` with `aria-busy`, `status`). The empty state is the
+ * component's own `EmptyState` rather than `DataTable`'s: a runtime-only plan
+ * modifies no file, which is the good outcome, so it is worded neutrally and
+ * renders without an empty grid header above it.
+ *
+ * ## Privacy and neutrality (AAP 0.5.2, 0.5.4)
+ *
+ * Diffs contain source code; hashes and the backup path are local file-system
+ * details. They are rendered from the record as received and are never logged —
+ * this module writes nothing to any console — and nothing is constructed that
+ * the record does not carry. Every project-specific string comes from the
+ * records; the only copy this file owns is generic product vocabulary.
+ *
+ * @module apps/vscode-extension/src/webview/components/ModificationsList
+ */
+
+import { useCallback, useMemo, useState } from 'react';
+import type { ReactElement } from 'react';
+
+import {
+  Badge,
+  Button,
+  Code,
+  DataTable,
+  EmptyState,
+  ErrorState,
+  LoadingState,
+  Stack,
+  Text,
+} from '@debuggen/panel-renderer';
+import type { BadgeTone, DataTableColumn } from '@debuggen/panel-renderer';
+import type { ModificationRecord } from '@debuggen/protocol';
+import { assertNever } from '@debuggen/shared';
+
+import { DiffView } from './DiffView';
+
+/**
+ * The props of {@link ModificationsList}.
+ *
+ * Every optional member spells `| undefined` because `exactOptionalPropertyTypes`
+ * is in force repository-wide, and `App.tsx` forwards values it may not have —
+ * `error={state.modificationsError}` — straight through.
+ */
+export interface ModificationsListProps {
+  /**
+   * The session's modification records, in the order they were applied.
+   * Rendered one row per record, in exactly this order.
+   */
+  modifications: readonly ModificationRecord[];
+
+  /**
+   * Raised by a row's "Open file" control with that record's `file` unchanged —
+   * the project-relative POSIX path the host resolves and opens. The control is
+   * rendered only when this is supplied.
+   */
+  onOpenFile?: ((file: string) => void) | undefined;
+
+  /**
+   * The records are still being resolved: renders the loading silhouette in
+   * place of the table. Outranked only by {@link ModificationsListProps.error}.
+   */
+  pending?: boolean | undefined;
+
+  /**
+   * Why the records could not be shown, as the layer that observed the failure
+   * worded it. A non-blank value renders the error state, which outranks every
+   * other state.
+   */
+  error?: string | undefined;
+
+  /**
+   * Asks for the failed step to be tried again. The error state renders its
+   * retry control only when this is supplied.
+   */
+  onRetry?: (() => void) | undefined;
+
+  /**
+   * Extra classes for the root element, applied in every state and composed
+   * after this component's own `dgv-modifications`.
+   */
+  className?: string | undefined;
+}
+
+/** A record's journal status — the closed vocabulary of AAP 0.5.1. */
+type Status = ModificationRecord['status'];
+
+/**
+ * The badge tone of each status. Total over the union, so a new status is a
+ * compile error here as well as in {@link describeStatus}.
+ *
+ * `applied` is informational (instrumentation is present, as intended),
+ * `reverted` is the successful end state, `pending` is neutral, and both
+ * `conflict` and `failed` need the developer's attention.
+ */
+const STATUS_TONE: Readonly<Record<Status, BadgeTone>> = {
+  pending: 'neutral',
+  applied: 'info',
+  reverted: 'success',
+  conflict: 'danger',
+  failed: 'danger',
+};
+
+/** The words that accompany a status: its badge label and an optional note. */
+interface StatusWords {
+  /** The badge's text label; colour never carries the status alone. */
+  readonly label: string;
+
+  /**
+   * One sentence explaining a status that needs it, shown under the file path.
+   * Absent for `applied` and `reverted`, whose labels say everything.
+   */
+  readonly note?: string | undefined;
+}
+
+/**
+ * Resolves the words for a status.
+ *
+ * Closed by {@link assertNever}: the compiler proves every member handled, and
+ * a value outside the union — a record from a newer service that the protocol
+ * boundary somehow let through — fails loudly here instead of rendering as a
+ * blank badge.
+ *
+ * @param status The record's status.
+ * @returns The badge label and, where one is warranted, the explanatory note.
+ */
+function describeStatus(status: Status): StatusWords {
+  switch (status) {
+    case 'pending':
+      return {
+        label: 'Pending',
+        note: 'Recorded before writing; the change has not been confirmed as applied yet.',
+      };
+    case 'applied':
+      return { label: 'Applied' };
+    case 'reverted':
+      return { label: 'Reverted' };
+    case 'conflict':
+      return {
+        label: 'Conflict',
+        note: 'Edited after instrumentation, so Debug Generator left it untouched. The original is preserved.',
+      };
+    case 'failed':
+      return {
+        label: 'Failed',
+        note: 'This change could not be completed.',
+      };
+    default:
+      return assertNever(status, 'Unhandled modification status');
+  }
+}
+
+/** The root class, present in every state. */
+const ROOT_CLASS = 'dgv-modifications';
+
+/**
+ * The grid's accessible name. Hidden on the surface: the section around this
+ * component carries the visible heading, and a second line would repeat it.
+ */
+const CAPTION = 'Modified files';
+
+/**
+ * The empty-state sentence. Neutral by design — a plan that relies on runtime
+ * hooks alone modifies nothing, which is the good outcome — and generic, since
+ * `EmptyState` ships no default copy precisely so no project vocabulary can
+ * leak into it.
+ */
+const EMPTY_MESSAGE = 'No files were modified for this session.';
+
+/** The error-state title; the caller's message beneath it says why. */
+const ERROR_TITLE = 'Could not show the modified files';
+
+/** Announced, never painted, while the records are resolving. */
+const LOADING_LABEL = 'Loading modified files';
+
+/** How many skeleton rows the loading silhouette draws. */
+const LOADING_ROWS = 3;
+
+/** Column headers. Plain text, so each is also its column's accessible name. */
+const HEADER_FILE = 'File';
+const HEADER_STATUS = 'Status';
+const HEADER_ACTIONS = 'Actions';
+
+/** The disclosure control's visible text in each state. */
+const VIEW_DIFF_LABEL = 'View diff';
+const HIDE_DIFF_LABEL = 'Hide diff';
+
+/** The open-file control's visible text. */
+const OPEN_FILE_LABEL = 'Open file';
+
+/** Leads the backup path of a conflicting record in its detail row. */
+const PRESERVED_LABEL = 'Original preserved at';
+
+/** Shown in the meta line of a record layered on an earlier record's result. */
+const LAYERED_LABEL = 'Layered on an earlier change';
+
+/** Leads the formatted time in the meta line. */
+const RECORDED_LABEL = 'Recorded';
+
+/** Labels of the two content hashes in the detail row. */
+const ORIGINAL_HASH_LABEL = 'Original SHA-256';
+const INSTRUMENTED_HASH_LABEL = 'Instrumented SHA-256';
+
+/**
+ * How many leading hexadecimal digits of a hash are shown, the convention
+ * version-control tools use for an abbreviated digest. The full value stays in
+ * the element's tooltip.
+ */
+const SHORT_HASH_LENGTH = 12;
+
+/**
+ * The columns' grid tracks — relational forms only (AAP 0.6.4), each with a
+ * non-zero `ch` minimum so a narrow view scrolls the table horizontally rather
+ * than painting one cell over the next (see `DataTableColumn.width`).
+ *
+ * The file column takes the larger share of spare width, since the path is the
+ * row's identity, and its minimum is small because the path truncates from the
+ * directory end and keeps the file name. The status column is fixed: its badge
+ * labels are all of one short width, and the widest ("Reverted") fits with the
+ * cell's padding to spare. The actions column shares the rest; its two buttons
+ * wrap onto a second line when the track is narrower than both, so its minimum
+ * is one button plus the cell's padding. The three minimums together are the
+ * width below which the table scrolls horizontally instead of squeezing.
+ */
+const FILE_TRACK = 'minmax(12ch, 2fr)';
+const STATUS_TRACK = '11ch';
+const ACTIONS_TRACK = 'minmax(11ch, 1fr)';
+
+/**
+ * Formats a record's time for the meta line in the reader's own locale and
+ * time zone — the webview's, which is the editor's.
+ */
+const RECORDED_FORMAT = new Intl.DateTimeFormat(undefined, {
+  dateStyle: 'medium',
+  timeStyle: 'short',
+});
+
+/**
+ * Joins class names, dropping absent and blank parts, so a caller's empty
+ * `className` never leaves a stray space in the attribute.
+ *
+ * @param parts The class names, in cascade order.
+ * @returns The space-separated class attribute value.
+ */
+function joinClassNames(...parts: readonly (string | undefined)[]): string {
+  return parts.filter((part): part is string => part !== undefined && part.trim() !== '').join(' ');
+}
+
+/**
+ * Whether an optional string carries anything to render.
+ *
+ * @param value The value as received.
+ * @returns `true` for a string with at least one non-whitespace character.
+ */
+function hasText(value: string | undefined): value is string {
+  return value !== undefined && value.trim() !== '';
+}
+
+/** A record's time, ready for a `<time>` element. */
+interface RecordedTime {
+  /** The machine-readable instant, for the `dateTime` attribute. */
+  readonly iso: string;
+  /** The localized display text. */
+  readonly text: string;
+}
+
+/**
+ * Formats a record's epoch-millisecond timestamp.
+ *
+ * @param epochMs The record's `appliedAt`.
+ * @returns The instant in both forms, or `undefined` for a value no `Date` can
+ *   represent — which then renders nothing rather than "Invalid Date" or a
+ *   thrown `RangeError`.
+ */
+function formatRecordedAt(epochMs: number): RecordedTime | undefined {
+  if (!Number.isFinite(epochMs)) {
+    return undefined;
+  }
+
+  const date = new Date(epochMs);
+  if (Number.isNaN(date.getTime())) {
+    return undefined;
+  }
+
+  return { iso: date.toISOString(), text: RECORDED_FORMAT.format(date) };
+}
+
+/**
+ * Abbreviates a content hash for display. Presentation only: the full value is
+ * never altered, and it stays available as the element's tooltip.
+ *
+ * @param hash The record's SHA-256 digest.
+ * @returns Its first {@link SHORT_HASH_LENGTH} characters.
+ */
+function shortHash(hash: string): string {
+  return hash.slice(0, SHORT_HASH_LENGTH);
+}
+
+/** A project-relative path split for display at its last separator. */
+interface PathParts {
+  /** Everything up to and including the last `/`; empty for a bare name. */
+  readonly directory: string;
+  /** The file name after the last `/`. */
+  readonly name: string;
+}
+
+/**
+ * Splits a path into its directory and file name, for display only.
+ *
+ * Joining the two parts always gives back the path exactly, so the rendered
+ * text stays byte-faithful; the split exists so the stylesheet can ellipsize
+ * the directory first and keep the file name — the part that tells rows apart
+ * in a narrow view — visible.
+ *
+ * @param file The record's project-relative POSIX path.
+ * @returns The two parts.
+ */
+function splitPath(file: string): PathParts {
+  const cut = file.lastIndexOf('/') + 1;
+  return { directory: file.slice(0, cut), name: file.slice(cut) };
+}
+
+/**
+ * The identity cell: the path, the meta line and — for a status that needs it —
+ * the explanatory note.
+ *
+ * The path renders through `Code`, which is byte-faithful: its text is the
+ * record's `file` exactly, in two spans so a long directory is shortened
+ * visually by the stylesheet's ellipsis before the file name is, never by
+ * slicing the string. The full value stays in the accessibility tree and the
+ * tooltip.
+ */
+function RecordIdentity(props: { readonly record: ModificationRecord }): ReactElement {
+  const { record } = props;
+  const { note } = describeStatus(record.status);
+  const recorded = formatRecordedAt(record.appliedAt);
+  const path = splitPath(record.file);
+
+  return (
+    <Stack gap={0} className="dgv-modifications__identity">
+      <Code size="sm" className="dgv-modifications__file" title={record.file}>
+        {path.directory === '' ? null : (
+          <span className="dgv-modifications__directory">{path.directory}</span>
+        )}
+        <span className="dgv-modifications__name">{path.name}</span>
+      </Code>
+      <Stack direction="horizontal" gap={2} wrap align="center" className="dgv-modifications__meta">
+        <Text size="xs" tone="secondary">
+          Plan v{String(record.planVersion)}
+        </Text>
+        {record.previousRecordId === undefined ? null : (
+          <Text size="xs" tone="secondary">
+            {LAYERED_LABEL}
+          </Text>
+        )}
+        {recorded === undefined ? null : (
+          <Text size="xs" tone="secondary">
+            {RECORDED_LABEL} <time dateTime={recorded.iso}>{recorded.text}</time>
+          </Text>
+        )}
+      </Stack>
+      {note === undefined ? null : (
+        <Text size="xs" tone="secondary" className="dgv-modifications__note">
+          {note}
+        </Text>
+      )}
+    </Stack>
+  );
+}
+
+/**
+ * The status cell: a soft badge whose tone and text label both carry the
+ * status, so colour is never its only signal.
+ */
+function RecordStatus(props: { readonly status: Status }): ReactElement {
+  const { label } = describeStatus(props.status);
+
+  return (
+    <Badge tone={STATUS_TONE[props.status]} variant="soft">
+      {label}
+    </Badge>
+  );
+}
+
+/**
+ * One labelled, abbreviated hash in the detail row, or nothing for a blank
+ * value.
+ */
+function HashItem(props: { readonly label: string; readonly hash: string }): ReactElement | null {
+  if (!hasText(props.hash)) {
+    return null;
+  }
+
+  return (
+    <Text size="xs" tone="secondary">
+      {props.label}{' '}
+      <Code size="sm" title={props.hash}>
+        {shortHash(props.hash)}
+      </Code>
+    </Text>
+  );
+}
+
+/**
+ * The detail row of an expanded record: where a conflicting file's original
+ * is preserved, the two content hashes the journal recorded, and the diff.
+ *
+ * The backup path is rendered only for a `conflict`, the one status whose
+ * backup is kept for the developer to act on (a verified restore deletes it),
+ * and only when the record carries one; nothing here constructs a path.
+ *
+ * The diff's scroll region is `tabIndex={-1}`, like every control inside the
+ * grid: it stays focusable, and the grid's arrow keys reach it from the row.
+ */
+function RecordDetail(props: { readonly record: ModificationRecord }): ReactElement {
+  const { record } = props;
+
+  return (
+    <Stack gap={2} className="dgv-modifications__detail">
+      {record.status === 'conflict' && hasText(record.backupPath) ? (
+        <Text as="p" size="sm" tone="secondary" className="dgv-modifications__preserved">
+          {PRESERVED_LABEL}{' '}
+          <Code size="sm" wrap>
+            {record.backupPath}
+          </Code>
+        </Text>
+      ) : null}
+      <Stack direction="horizontal" gap={3} wrap className="dgv-modifications__hashes">
+        <HashItem label={ORIGINAL_HASH_LABEL} hash={record.originalHash} />
+        <HashItem label={INSTRUMENTED_HASH_LABEL} hash={record.instrumentedHash} />
+      </Stack>
+      <DiffView diff={record.diff} fileLabel={record.file} scrollTabIndex={-1} />
+    </Stack>
+  );
+}
+
+/**
+ * The detail renderer handed to `DataTable`. Module-level, so its identity is
+ * stable across renders.
+ */
+function renderRecordDetail(record: ModificationRecord): ReactElement {
+  return <RecordDetail record={record} />;
+}
+
+/**
+ * A record's row identity: its journal id, which is unique and derived from the
+ * record itself, so the expansion survives any re-render of the list.
+ */
+function recordKey(record: ModificationRecord): string {
+  return record.id;
+}
+
+/**
+ * Builds the three columns.
+ *
+ * @param toggle Opens or closes a record's diff by id.
+ * @param onOpenFile The caller's open-file callback; the open control renders
+ *   only when it is supplied.
+ * @returns The columns, left to right.
+ */
+function buildColumns(
+  toggle: (id: string) => void,
+  onOpenFile: ((file: string) => void) | undefined,
+): readonly DataTableColumn<ModificationRecord>[] {
+  return [
+    {
+      key: 'file',
+      header: HEADER_FILE,
+      rowHeader: true,
+      width: FILE_TRACK,
+      cell: (record) => <RecordIdentity record={record} />,
+    },
+    {
+      key: 'status',
+      header: HEADER_STATUS,
+      width: STATUS_TRACK,
+      cell: (record) => <RecordStatus status={record.status} />,
+    },
+    {
+      key: 'actions',
+      header: HEADER_ACTIONS,
+      width: ACTIONS_TRACK,
+      cell: (record, _rowIndex, meta) => {
+        const diffLabel = meta.expanded ? HIDE_DIFF_LABEL : VIEW_DIFF_LABEL;
+
+        return (
+          <Stack
+            direction="horizontal"
+            gap={1}
+            wrap
+            align="center"
+            className="dgv-modifications__actions"
+          >
+            <Button
+              variant="ghost"
+              size="sm"
+              tabIndex={-1}
+              aria-label={`${diffLabel} of ${record.file}`}
+              aria-expanded={meta.expanded}
+              aria-controls={meta.detailRowId}
+              onClick={() => {
+                toggle(record.id);
+              }}
+            >
+              {diffLabel}
+            </Button>
+            {onOpenFile === undefined ? null : (
+              <Button
+                variant="ghost"
+                size="sm"
+                tabIndex={-1}
+                aria-label={`${OPEN_FILE_LABEL} ${record.file}`}
+                onClick={() => {
+                  onOpenFile(record.file);
+                }}
+              >
+                {OPEN_FILE_LABEL}
+              </Button>
+            )}
+          </Stack>
+        );
+      },
+    },
+  ];
+}
+
+/**
+ * Renders the session's modification records as a grid with one row per
+ * record and an expandable diff, or the error, loading or empty state in its
+ * place.
+ *
+ * @param props See {@link ModificationsListProps}.
+ * @returns One root element carrying `dgv-modifications` and `props.className`,
+ *   holding the table or the state primitive that stands in for it.
+ */
+export function ModificationsList(props: ModificationsListProps): ReactElement {
+  const { modifications, onOpenFile, pending = false, error, onRetry, className } = props;
+
+  // Hooks run before any branch, as they must. The expanded id is the only
+  // local state: which record's diff is open, or none.
+  const [expandedId, setExpandedId] = useState<string | undefined>(undefined);
+
+  const toggle = useCallback((id: string): void => {
+    setExpandedId((current) => (current === id ? undefined : id));
+  }, []);
+
+  const handleRowToggle = useCallback(
+    (record: ModificationRecord): void => {
+      toggle(record.id);
+    },
+    [toggle],
+  );
+
+  const expandedRowKeys = useMemo<readonly string[]>(
+    () => (expandedId === undefined ? [] : [expandedId]),
+    [expandedId],
+  );
+
+  const columns = useMemo(() => buildColumns(toggle, onOpenFile), [toggle, onOpenFile]);
+
+  let body: ReactElement;
+  if (hasText(error)) {
+    body = <ErrorState message={error} title={ERROR_TITLE} onRetry={onRetry} />;
+  } else if (pending) {
+    body = <LoadingState variant="rows" rows={LOADING_ROWS} label={LOADING_LABEL} />;
+  } else if (modifications.length === 0) {
+    body = <EmptyState message={EMPTY_MESSAGE} />;
+  } else {
+    body = (
+      <DataTable
+        rows={modifications}
+        columns={columns}
+        rowKey={recordKey}
+        caption={CAPTION}
+        compact
+        expandedRowKeys={expandedRowKeys}
+        onRowToggle={handleRowToggle}
+        renderExpandedRow={renderRecordDetail}
+      />
+    );
+  }
+
+  return <div className={joinClassNames(ROOT_CLASS, className)}>{body}</div>;
+}

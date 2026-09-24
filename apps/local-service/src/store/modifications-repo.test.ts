@@ -33,75 +33,113 @@
  *    error payload, on the success path and on a refusal path — the two places
  *    a value escapes.
  *
- * The store is the real one: `openStore` against an `mkdtemp` sandbox, so the
- * real DDL, the real pragmas (`foreign_keys = ON` is what makes the cascade
- * assertion meaningful) and the real migration ladder are exercised. Nothing
- * under `$DEBUGGEN_HOME` is touched and no socket is opened, which is the
- * contract of the `local-service` Vitest project.
+ * The store is the real one: `openStore` against a file in an `mkdtemp`
+ * sandbox — never `:memory:` — so the real DDL, the real pragmas
+ * (`foreign_keys = ON` is what makes the cascade assertion meaningful, WAL is
+ * what the second-connection durability check reads through) and the real
+ * migration ladder are exercised. Parent sessions are written through the real
+ * `sessions-repo`, because `modifications.session_id` is a foreign key and a
+ * session row forged with raw SQL would test a shape the service never writes.
+ * Records are built with the upstream `createModificationRecord`, so the suite
+ * never hand-rolls the shape the journal is supposed to accept.
+ *
+ * Every fixture is neutral (`src/moduleOne.ts`, `handlerAlpha`) and every
+ * digest is an obviously synthetic 64-character lowercase hex string, so
+ * neither `pnpm check:no-hardcoding` nor `pnpm check:secrets` has anything to
+ * find here. Nothing under `$DEBUGGEN_HOME` is touched, no environment variable
+ * is read and no socket is opened, which is the contract of the
+ * `local-service` Vitest project; each test owns its sandbox, store and clock,
+ * so no test depends on another having run.
  */
 
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { fileURLToPath } from 'node:url';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
   MODIFICATION_STATUSES,
   OPEN_MODIFICATION_STATUSES,
+  SHA256_HEX_PATTERN,
   createModificationRecord,
+  parseModificationRecord,
 } from '@debuggen/instrumentation';
 import type {
   ModificationJournal,
   ModificationRecord,
   ModificationStatus,
 } from '@debuggen/instrumentation';
-import { createConsoleLogger, isErr, newSessionId, unwrap } from '@debuggen/shared';
-import type { LogRecord } from '@debuggen/shared';
-import { sha256Hex } from '@debuggen/shared/node';
+import { parseSessionRecord } from '@debuggen/protocol';
+import type { SessionRecord, SessionStatus } from '@debuggen/protocol';
+import { DEBUGGEN_ERROR_CODES, isErr, newSessionId, unwrap } from '@debuggen/shared';
+import type {
+  DebuggenError,
+  LogFields,
+  LogLevel,
+  Logger,
+  Result,
+  SessionId,
+} from '@debuggen/shared';
 
-import { openStore } from './db.js';
+import { loadSchemaSql, openStore } from './db.js';
 import type { Store } from './db.js';
-import { STORE_SCHEMA_VERSION } from './migrations.js';
 import {
   MODIFICATION_STATUS_TRANSITIONS,
   canTransitionModificationStatus,
   createModificationsRepo,
 } from './modifications-repo.js';
 import type { ModificationsRepo } from './modifications-repo.js';
+import { createSessionsRepo } from './sessions-repo.js';
+import type { SessionsRepo } from './sessions-repo.js';
 
 /* -------------------------------------------------------------------------------------------------
  * Fixtures
  * ---------------------------------------------------------------------------------------------- */
 
-/** The session most records below belong to. Left in a mid-pipeline status. */
-const SESSION_A = newSessionId();
+/** The session most records below belong to, left mid-capture. */
+const SESSION_A: SessionId = newSessionId();
 
 /**
  * A second session, deliberately in `failed`.
  *
  * AAP §0.5.1 requires start-up reconciliation to act on an open record
  * *regardless of the owning session's status*, so the `listAllOpen` assertions
- * need a session that a status-aware query would have excluded.
+ * need sessions that a status-aware query would have excluded.
  */
-const SESSION_B = newSessionId();
+const SESSION_B: SessionId = newSessionId();
 
 /** A third session, `ended`, for the same reason. */
-const SESSION_C = newSessionId();
+const SESSION_C: SessionId = newSessionId();
 
-/** Where backups live: outside every checkout, as AAP §0.2.3 requires. */
-const BACKUPS = '/tmp/debuggen-home/backups';
+/** A fourth session, `generated`: finished its pipeline, files still patched. */
+const SESSION_D: SessionId = newSessionId();
+
+/** Every parent session and the status it is seeded in. */
+const SESSIONS: ReadonlyArray<readonly [SessionId, SessionStatus]> = Object.freeze([
+  [SESSION_A, 'capturing'],
+  [SESSION_B, 'failed'],
+  [SESSION_C, 'ended'],
+  [SESSION_D, 'generated'],
+] as const);
+
+/** The file most records patch: neutral fixture vocabulary only. */
+const FILE_ONE = 'src/moduleOne.ts';
+
+/** A second file, for the chain rules that name "a different file". */
+const FILE_TWO = 'src/moduleTwo.ts';
 
 /** A unified diff of the shape the patcher produces. */
 const DIFF = [
-  '--- a/src/server/report.ts',
-  '+++ b/src/server/report.ts',
-  '@@ -12,7 +12,11 @@',
-  '-export async function buildReport(input: Input): Promise<Report> {',
-  '+export async function buildReport(input: Input): Promise<Report> {',
-  '+  const __dbg = (globalThis as { __DEBUGGEN__?: __DebuggenSpanHelper }).__DEBUGGEN__;',
+  `--- a/${FILE_ONE}`,
+  `+++ b/${FILE_ONE}`,
+  '@@ -3,3 +3,6 @@',
+  ' export function handlerAlpha(input: number): number {',
+  '+  const __dbg = globalThis.__dbgHelper;',
+  '+  if (__dbg) return __dbg.span("handlerAlpha", {}, () => __orig(input));',
+  '   return input * 2;',
+  ' }',
   '',
 ].join('\n');
 
@@ -113,48 +151,137 @@ const DIFF = [
  */
 const SENTINEL = 'DIFF-SENTINEL-c7f1a4e2-never-log-me';
 
-/** The clock the repository and the record builder read. Advanced by tests. */
-let clock = 1_767_225_600_000;
+/** A diff carrying the sentinel: file content a log line or a refusal must never echo. */
+const SENTINEL_DIFF = `${DIFF}+// ${SENTINEL}\n`;
 
-/** The sandbox directory holding the database for one test. */
+/** The epoch-millisecond reading every test's clock starts from. */
+const CLOCK_START = 1_767_225_600_000;
+
+/** The clock the repositories and the record builder read. Advanced by tests. */
+let clock = CLOCK_START;
+
+/** The sandbox directory holding the database — and nothing else — for one test. */
 let directory: string;
 
-/** The store under the repository. */
+/** The store under the repositories. */
 let store: Store;
 
-/** Every log record either the store or the repository emitted. */
-let logs: LogRecord[];
+/** Every call the store and the repositories made on the capturing logger. */
+let logs: CapturedLog[];
+
+/** The session repository that writes the parent rows the foreign key needs. */
+let sessions: SessionsRepo;
 
 /** The repository under test. */
 let repo: ModificationsRepo;
 
-/** A digest of the shape `sha256Hex` produces: 64 lowercase hex characters. */
-function hashOf(content: string): string {
-  return sha256Hex(content);
+/** The synthetic digest handed out for each label in the current test. */
+let digests: Map<string, string>;
+
+/** One call on the capturing logger. */
+interface CapturedLog {
+  readonly level: LogLevel;
+  readonly message: string;
+  readonly fields: LogFields;
 }
 
-/** Inserts the `sessions` row a modification's foreign key requires. */
-function insertSession(sessionId: string, status: string): void {
-  store
-    .statement(
-      `INSERT INTO sessions (
-         id, project_root, project_name, status, question, dev_server_url, created_at, updated_at, record
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    )
-    .run(
-      sessionId,
-      '/home/dev/projects/storefront',
-      'storefront',
+/**
+ * A {@link Logger} that records every call as `{ level, message, fields }`.
+ *
+ * Deliberately a hand-written object rather than the console logger with a
+ * sink: the privacy assertions must see exactly what the repository handed to
+ * the logging interface — message and fields, bindings merged in the order a
+ * child applies them — with no formatting layer in between that could drop or
+ * rewrite a value before the assertion looks at it.
+ *
+ * @param sink Where every call is recorded.
+ * @param bindings The fields a {@link Logger.child} added, merged under each
+ * call's own fields.
+ * @returns The logger.
+ */
+function createCapturingLogger(sink: CapturedLog[], bindings: LogFields = {}): Logger {
+  const at =
+    (level: LogLevel) =>
+    (message: string, fields?: LogFields): void => {
+      sink.push({ level, message, fields: { ...bindings, ...(fields ?? {}) } });
+    };
+
+  return {
+    level: 'trace',
+    trace: at('trace'),
+    debug: at('debug'),
+    info: at('info'),
+    warn: at('warn'),
+    error: at('error'),
+    fatal: at('fatal'),
+    child: (childBindings: LogFields): Logger =>
+      createCapturingLogger(sink, { ...bindings, ...childBindings }),
+  };
+}
+
+/**
+ * An obviously synthetic SHA-256-shaped digest for a label: 56 `a`s followed
+ * by the label's ordinal in eight hex digits, e.g. `aaaa…aa00000003`.
+ *
+ * The same label answers the same digest for the whole test and distinct
+ * labels answer distinct digests, which is all the journal can observe about a
+ * hash. It satisfies the upstream `SHA256_HEX_PATTERN` while carrying no
+ * entropy, so no secret scanner can mistake it for a credential and no reader
+ * can mistake it for a real file's digest.
+ *
+ * @param label What the digest stands for, e.g. `original:src/moduleOne.ts`.
+ * @returns The digest.
+ */
+function hashOf(label: string): string {
+  const known = digests.get(label);
+
+  if (known !== undefined) {
+    return known;
+  }
+
+  const digest = `${'a'.repeat(56)}${(digests.size + 1).toString(16).padStart(8, '0')}`;
+
+  digests.set(label, digest);
+
+  return digest;
+}
+
+/** Where a backup of `hash` for `sessionId` would live: inside the sandbox. */
+function backupPathOf(sessionId: string, hash: string): string {
+  return join(directory, 'backups', sessionId, hash);
+}
+
+/**
+ * A parent session in `status`, built through the protocol's own validator so
+ * `sessions-repo` receives exactly the record shape the session manager
+ * writes.
+ */
+function makeSession(id: SessionId, status: SessionStatus): SessionRecord {
+  return unwrap(
+    parseSessionRecord({
+      id,
+      projectRoot: '/workspace/project-one',
+      projectName: 'project-one',
+      devServerUrl: 'http://127.0.0.1:3100/',
+      createdAt: clock,
+      updatedAt: clock,
       status,
-      'Why is this button slow?',
-      'http://127.0.0.1:20531',
-      clock,
-      clock,
-      '{}',
-    );
+      question: 'Why is handlerAlpha slow?',
+      followUps: [],
+      relevantFiles: [],
+      plans: [],
+      modifications: [],
+      captures: [],
+      panelIds: [],
+      analyses: [],
+      cleanup: { status: 'pending', conflicts: [] },
+      promptVersions: {},
+      provider: { id: 'deterministic' },
+    }),
+  );
 }
 
-/** What {@link buildRecord} may override. */
+/** What {@link makeRecord} may override. */
 interface RecordOverrides {
   readonly sessionId?: string;
   readonly planVersion?: number;
@@ -169,13 +296,15 @@ interface RecordOverrides {
 }
 
 /**
- * Builds a record through the real constructor, so the suite never hand-rolls
- * the shape the journal is supposed to accept.
+ * Builds a record through the real constructor — `mod_` id, `pending` default,
+ * the injected clock — so the suite never hand-rolls the shape the journal is
+ * supposed to accept.
  */
-function buildRecord(overrides: RecordOverrides = {}): ModificationRecord {
-  const file = overrides.file ?? 'src/server/report.ts';
+function makeRecord(overrides: RecordOverrides = {}): ModificationRecord {
+  const file = overrides.file ?? FILE_ONE;
   const sessionId = overrides.sessionId ?? SESSION_A;
   const appliedAt = overrides.appliedAt ?? clock;
+  const originalHash = overrides.originalHash ?? hashOf(`original:${file}`);
 
   return unwrap(
     createModificationRecord(
@@ -183,8 +312,8 @@ function buildRecord(overrides: RecordOverrides = {}): ModificationRecord {
         sessionId,
         planVersion: overrides.planVersion ?? 1,
         file,
-        originalHash: overrides.originalHash ?? hashOf(`original:${file}`),
-        backupPath: overrides.backupPath ?? `${BACKUPS}/${sessionId}/${hashOf(`original:${file}`)}`,
+        originalHash,
+        backupPath: overrides.backupPath ?? backupPathOf(sessionId, originalHash),
         instrumentedHash: overrides.instrumentedHash ?? hashOf(`instrumented:${file}`),
         diff: overrides.diff ?? DIFF,
         ...(overrides.status !== undefined ? { status: overrides.status } : {}),
@@ -213,34 +342,109 @@ function readRow(id: string): Record<string, unknown> | undefined {
   return store.statement('SELECT * FROM modifications WHERE id = ?').get(id);
 }
 
-/** Everything the store and the repository said, as one searchable string. */
+/** Everything the store and the repositories said, as one searchable string. */
 function loggedText(): string {
   return JSON.stringify(logs);
 }
 
+/**
+ * Everything a refusal can carry out of the repository — `message`, `hint`,
+ * `details` and the wire payload — as one searchable string.
+ */
+function errorText(error: DebuggenError): string {
+  return JSON.stringify({
+    message: error.message,
+    hint: error.hint ?? '',
+    details: error.details ?? {},
+    payload: error.toPayload(),
+  });
+}
+
+/** The closed error vocabulary, widened once for membership checks. */
+const ERROR_CODES: readonly string[] = DEBUGGEN_ERROR_CODES;
+
+/**
+ * Asserts that `result` is a refusal with `code` — a code of the closed
+ * `DEBUGGEN_ERROR_CODES` tuple — and returns the error for further checks.
+ *
+ * Throws rather than returning `undefined` on success, so a test that expected
+ * a refusal cannot continue past this line with nothing to inspect.
+ */
+function expectRefusal<T>(result: Result<T>, code: DebuggenError['code']): DebuggenError {
+  if (!isErr(result)) {
+    throw new Error(`expected a ${code} refusal, but the journal accepted the call`);
+  }
+
+  expect(ERROR_CODES).toContain(result.error.code);
+  expect(result.error.code).toBe(code);
+
+  return result.error;
+}
+
+/**
+ * The lifecycle AAP §0.5.1 documents, restated independently of the module
+ * under test so the matrix below is judged against the specification rather
+ * than against the table it is testing. Same-status writes are not edges; they
+ * are idempotent no-ops and are handled separately.
+ */
+const DOCUMENTED_EDGES: Readonly<Record<ModificationStatus, readonly ModificationStatus[]>> = {
+  pending: ['applied', 'reverted', 'conflict', 'failed'],
+  applied: ['reverted', 'conflict', 'failed'],
+  conflict: ['reverted', 'failed'],
+  failed: ['reverted', 'conflict'],
+  reverted: [],
+};
+
+/**
+ * Appends a `pending` record and moves it to `status` through the public API.
+ *
+ * Every status is one legal step from `pending`, so no start state is ever
+ * forged with raw SQL: the matrix is proven with the calls the patcher and
+ * cleanup actually make.
+ */
+async function seedInStatus(
+  status: ModificationStatus,
+  overrides: RecordOverrides = {},
+): Promise<ModificationRecord> {
+  const record = await appendOk(makeRecord(overrides));
+
+  expect(record.status).toBe('pending');
+
+  if (status === 'pending') {
+    return record;
+  }
+
+  clock += 1_000;
+
+  return unwrap(await repo.updateStatus(record.id, status));
+}
+
 beforeEach(() => {
-  clock = 1_767_225_600_000;
+  clock = CLOCK_START;
+  digests = new Map();
   directory = mkdtempSync(join(tmpdir(), 'debuggen-modifications-'));
   logs = [];
 
-  const logger = createConsoleLogger({
-    level: 'trace',
-    sink: (record) => {
-      logs.push(record);
-    },
-  });
+  const logger = createCapturingLogger(logs);
 
   store = unwrap(openStore({ databasePath: join(directory, 'sessions.sqlite'), logger }));
+  sessions = createSessionsRepo({ store, logger, now: () => clock });
   repo = createModificationsRepo({ store, logger, now: () => clock });
 
-  insertSession(SESSION_A, 'instrumenting');
-  insertSession(SESSION_B, 'failed');
-  insertSession(SESSION_C, 'ended');
+  for (const [id, status] of SESSIONS) {
+    unwrap(sessions.insert(makeSession(id, status)));
+  }
 });
 
 afterEach(() => {
-  store.close();
+  if (!store.isClosed) {
+    store.close();
+  }
+
   rmSync(directory, { recursive: true, force: true });
+
+  // Nothing survives a test: the next one starts from an empty sandbox.
+  expect(existsSync(directory)).toBe(false);
 });
 
 /* -------------------------------------------------------------------------------------------------
@@ -254,6 +458,12 @@ describe('port conformance', () => {
     // drifted on either side fails to compile here.
     const journal: ModificationJournal = repo;
 
+    // The factory too, so a change to its return type that stops satisfying
+    // the port fails `pnpm typecheck` here as well as in the port's package.
+    const factory: (...args: Parameters<typeof createModificationsRepo>) => ModificationJournal =
+      createModificationsRepo;
+
+    expect(factory).toBe(createModificationsRepo);
     expect(typeof journal.append).toBe('function');
     expect(typeof journal.updateStatus).toBe('function');
     expect(typeof journal.listBySession).toBe('function');
@@ -282,17 +492,29 @@ describe('port conformance', () => {
     }
   });
 
-  it('keeps the SQL status vocabulary equal to MODIFICATION_STATUSES, in order', () => {
-    const ddl = readFileSync(fileURLToPath(new URL('./schema.sql', import.meta.url)), 'utf8');
-    const match = /CHECK\s*\(status IN \(([^)]*)\)\)/.exec(ddl);
+  it('keeps the live CHECK list of the modifications table equal to MODIFICATION_STATUSES, in order', () => {
+    // Read from the database the store actually opened — after every migration
+    // step — rather than from the DDL file, so the assertion is about the table
+    // a write meets, not about a file that might not be what was applied.
+    const row = store
+      .statement(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?`)
+      .get('modifications');
+    const ddl = typeof row?.['sql'] === 'string' ? row['sql'] : '';
+    const lists = [...ddl.matchAll(/CHECK\s*\(\s*status\s+IN\s*\(([^)]*)\)\s*\)/giu)];
 
-    expect(match).not.toBeNull();
+    expect(ddl).toContain('CREATE TABLE');
+    expect(lists).toHaveLength(1);
 
-    const listed = (match?.[1] ?? '')
+    const listed = (lists[0]?.[1] ?? '')
       .split(',')
-      .map((value) => value.trim().replace(/^'/, '').replace(/'$/, ''));
+      .map((value) => value.trim().replace(/^'/u, '').replace(/'$/u, ''));
 
-    expect(listed).toEqual([...MODIFICATION_STATUSES]);
+    expect(
+      listed,
+      'The status CHECK of the modifications table must list MODIFICATION_STATUSES from ' +
+        '@debuggen/instrumentation exactly and in order: edit apps/local-service/src/store/schema.sql ' +
+        '(and add a migration step in ./migrations.ts) when the upstream vocabulary changes.',
+    ).toEqual([...MODIFICATION_STATUSES]);
   });
 });
 
@@ -302,10 +524,24 @@ describe('port conformance', () => {
 
 describe('append', () => {
   it('persists both hashes, the backup path and the diff, and round-trips the record', async () => {
-    const record = buildRecord();
+    const record = makeRecord({ planVersion: 3 });
+
+    // The upstream constructor's own guarantees, which the journal relies on.
+    expect(record.id).toMatch(/^mod_[0-9a-z]{16}$/u);
+    expect(record.status).toBe('pending');
+    expect(record.appliedAt).toBe(clock);
+    expect(record.originalHash).toMatch(SHA256_HEX_PATTERN);
+    expect(record.instrumentedHash).toMatch(SHA256_HEX_PATTERN);
+
     const stored = await appendOk(record);
 
-    expect(stored).toEqual(record);
+    // The stored record is a valid record in its own right and equals the
+    // input exactly: both hashes, the backup path, the diff, the plan version,
+    // the timestamp and the `pending` status all survive.
+    expect(parseModificationRecord(stored)).toStrictEqual({ ok: true, value: record });
+    expect(stored).toStrictEqual(record);
+    expect(stored.planVersion).toBe(3);
+    expect(stored.status).toBe('pending');
 
     const row = readRow(record.id);
 
@@ -328,7 +564,7 @@ describe('append', () => {
   });
 
   it('is durable when it resolves: a second connection sees the committed row', async () => {
-    const record = await appendOk(buildRecord());
+    const record = await appendOk(makeRecord());
 
     // The patcher writes the project file only after this promise settles, so
     // "committed" has to be true here rather than eventually.
@@ -351,7 +587,7 @@ describe('append', () => {
   });
 
   it('canonicalises a sub-millisecond timestamp and returns the stored record', async () => {
-    const record = buildRecord({ appliedAt: 1_767_225_600_123.456 });
+    const record = makeRecord({ appliedAt: 1_767_225_600_123.456 });
     const stored = await appendOk(record);
 
     expect(stored.appliedAt).toBe(1_767_225_600_123);
@@ -369,83 +605,120 @@ describe('append', () => {
     // refuses a blank path itself: the assertion here is that the *journal*
     // refuses one, whichever of its two checks catches it, because a record
     // with no backup could never restore the file.
-    const valid = buildRecord();
+    const valid = makeRecord();
     const record: ModificationRecord = { ...valid, backupPath: '   ' };
-    const appended = await repo.append(record);
 
-    expect(isErr(appended)).toBe(true);
-    expect(isErr(appended) ? appended.error.code : undefined).toBe(
-      'INSTRUMENTATION_INSTALL_FAILED',
-    );
+    expectRefusal(await repo.append(record), 'INSTRUMENTATION_INSTALL_FAILED');
+    expect(readRow(record.id)).toBeUndefined();
+  });
+
+  it('refuses a record whose backup path is empty', async () => {
+    const valid = makeRecord();
+    const record: ModificationRecord = { ...valid, backupPath: '' };
+
+    expectRefusal(await repo.append(record), 'INSTRUMENTATION_INSTALL_FAILED');
     expect(readRow(record.id)).toBeUndefined();
   });
 
   it('refuses a record with no diff', async () => {
-    const record = buildRecord({ diff: '' });
-    const appended = await repo.append(record);
+    const record = makeRecord({ diff: '' });
 
-    expect(isErr(appended)).toBe(true);
-    expect(isErr(appended) ? appended.error.code : undefined).toBe(
-      'INSTRUMENTATION_INSTALL_FAILED',
-    );
+    expectRefusal(await repo.append(record), 'INSTRUMENTATION_INSTALL_FAILED');
     expect(readRow(record.id)).toBeUndefined();
   });
 
   it('refuses a no-op patch, whose two hashes are identical', async () => {
     const hash = hashOf('unchanged');
-    const record = buildRecord({ originalHash: hash, instrumentedHash: hash });
-    const appended = await repo.append(record);
+    const record = makeRecord({ originalHash: hash, instrumentedHash: hash });
 
-    expect(isErr(appended)).toBe(true);
-    expect(isErr(appended) ? appended.error.code : undefined).toBe(
-      'INSTRUMENTATION_INSTALL_FAILED',
-    );
+    expectRefusal(await repo.append(record), 'INSTRUMENTATION_INSTALL_FAILED');
     expect(readRow(record.id)).toBeUndefined();
   });
 
-  it('refuses a record that does not satisfy the record schema', async () => {
-    const valid = buildRecord();
-    const malformed: ModificationRecord = {
-      ...valid,
-      originalHash: valid.originalHash.toUpperCase(),
-    };
-    const appended = await repo.append(malformed);
+  it.each([
+    ['uppercase hex', (hash: string): string => hash.toUpperCase()],
+    ['63 characters', (hash: string): string => hash.slice(1)],
+    ['65 characters', (hash: string): string => `${hash}a`],
+    ['a non-hex character', (hash: string): string => `${hash.slice(1)}g`],
+  ])('refuses an original hash that is not 64 lowercase hex characters (%s)', async (_, mangle) => {
+    const valid = makeRecord();
+    const malformed: ModificationRecord = { ...valid, originalHash: mangle(valid.originalHash) };
 
-    expect(isErr(appended)).toBe(true);
-    expect(isErr(appended) ? appended.error.code : undefined).toBe(
-      'INSTRUMENTATION_INSTALL_FAILED',
-    );
+    expect(malformed.originalHash).not.toMatch(SHA256_HEX_PATTERN);
+    expectRefusal(await repo.append(malformed), 'INSTRUMENTATION_INSTALL_FAILED');
     expect(readRow(valid.id)).toBeUndefined();
   });
 
-  it('refuses a duplicate record id', async () => {
-    const record = await appendOk(buildRecord());
-    const again = await repo.append(record);
+  it('refuses an instrumented hash that is not 64 lowercase hex characters', async () => {
+    const valid = makeRecord();
+    const malformed: ModificationRecord = { ...valid, instrumentedHash: 'f'.repeat(40) };
 
-    expect(isErr(again)).toBe(true);
-    expect(isErr(again) ? again.error.code : undefined).toBe('STORE_ERROR');
-    expect(isErr(again) ? again.error.details?.['reason'] : undefined).toBe('duplicate-record-id');
+    expectRefusal(await repo.append(malformed), 'INSTRUMENTATION_INSTALL_FAILED');
+    expect(readRow(valid.id)).toBeUndefined();
+  });
+
+  it.each([
+    ['an absolute POSIX path', '/workspace/project-one/src/moduleOne.ts'],
+    ['a leading parent segment', '../outside/moduleOne.ts'],
+    ['an embedded parent segment', 'src/../../outside/moduleOne.ts'],
+    ['a Windows drive path', 'C:/workspace/src/moduleOne.ts'],
+  ])('refuses a file that is not project-relative (%s)', async (_, file) => {
+    // Spread rather than built: the constructor normalises and refuses these
+    // itself, and the assertion here is that the *journal* never stores a path
+    // that could resolve outside the project it will later be restored into.
+    const valid = makeRecord();
+    const escaping: ModificationRecord = { ...valid, file };
+
+    expectRefusal(await repo.append(escaping), 'INSTRUMENTATION_INSTALL_FAILED');
+    expect(readRow(valid.id)).toBeUndefined();
+    expect(await repo.countBySession(SESSION_A)).toStrictEqual({ ok: true, value: 0 });
+  });
+
+  it('refuses a duplicate record id', async () => {
+    const record = await appendOk(makeRecord());
+    const error = expectRefusal(await repo.append(record), 'STORE_ERROR');
+
+    expect(error.details?.['reason']).toBe('duplicate-record-id');
 
     const listed = await repo.listBySession(SESSION_A);
 
     expect(listed.ok && listed.value).toHaveLength(1);
   });
 
-  it('refuses a record naming a session the store does not hold', async () => {
-    const record = buildRecord({ sessionId: newSessionId() });
-    const appended = await repo.append(record);
+  it('refuses a record naming a session the store does not hold, writing nothing', async () => {
+    const orphanSession = newSessionId();
+    const record = makeRecord({ sessionId: orphanSession });
+    const error = expectRefusal(await repo.append(record), 'STORE_ERROR');
 
-    expect(isErr(appended)).toBe(true);
-    expect(isErr(appended) ? appended.error.code : undefined).toBe('STORE_ERROR');
-    expect(isErr(appended) ? appended.error.details?.['reason'] : undefined).toBe(
-      'unknown-session',
-    );
+    expect(error.details?.['reason']).toBe('unknown-session');
+    expect(readRow(record.id)).toBeUndefined();
+    expect(await repo.countBySession(orphanSession)).toStrictEqual({ ok: true, value: 0 });
+  });
+
+  it('answers every refusal as a settled Err, never as a thrown exception', async () => {
+    const valid = makeRecord();
+    const refusals: ReadonlyArray<() => Promise<Result<ModificationRecord>>> = [
+      () => repo.append({ ...valid, backupPath: '' }),
+      () => repo.append({ ...valid, diff: '' }),
+      () => repo.append({ ...valid, instrumentedHash: valid.originalHash }),
+      () => repo.append({ ...valid, file: '/abs/moduleOne.ts' }),
+      () => repo.append({ ...valid, sessionId: newSessionId() }),
+      () => repo.updateStatus('mod_0000000000000000', 'applied'),
+    ];
+
+    for (const refuse of refusals) {
+      // `resolves` fails the test if the promise rejects, so a throw anywhere
+      // on these paths is a failure rather than a pass.
+      await expect(refuse()).resolves.toMatchObject({ ok: false });
+    }
+
+    expect(await repo.countBySession(SESSION_A)).toStrictEqual({ ok: true, value: 0 });
   });
 
   it('keeps append order for records that share a millisecond', async () => {
-    const first = await appendOk(buildRecord({ file: 'src/a.ts' }));
-    const second = await appendOk(buildRecord({ file: 'src/b.ts' }));
-    const third = await appendOk(buildRecord({ file: 'src/c.ts' }));
+    const first = await appendOk(makeRecord({ file: 'src/moduleA.ts' }));
+    const second = await appendOk(makeRecord({ file: 'src/moduleB.ts' }));
+    const third = await appendOk(makeRecord({ file: 'src/moduleC.ts' }));
 
     expect(first.appliedAt).toBe(second.appliedAt);
     expect(second.appliedAt).toBe(third.appliedAt);
@@ -453,9 +726,9 @@ describe('append', () => {
     const listed = await repo.listBySession(SESSION_A);
 
     expect(listed.ok && listed.value.map((entry) => entry.file)).toEqual([
-      'src/a.ts',
-      'src/b.ts',
-      'src/c.ts',
+      'src/moduleA.ts',
+      'src/moduleB.ts',
+      'src/moduleC.ts',
     ]);
   });
 });
@@ -466,13 +739,13 @@ describe('append', () => {
 
 describe('follow-up chains', () => {
   /** Appends the first record for a file and returns it. */
-  async function appendRoot(file = 'src/server/report.ts'): Promise<ModificationRecord> {
-    return appendOk(buildRecord({ file }));
+  async function appendRoot(file = FILE_ONE): Promise<ModificationRecord> {
+    return appendOk(makeRecord({ file }));
   }
 
   it('accepts a delta whose original hash is the parent’s instrumented hash', async () => {
     const root = await appendRoot();
-    const delta = buildRecord({
+    const delta = makeRecord({
       planVersion: 2,
       originalHash: root.instrumentedHash,
       instrumentedHash: hashOf('instrumented:plan-2'),
@@ -485,99 +758,116 @@ describe('follow-up chains', () => {
     expect(readRow(delta.id)?.['previous_record_id']).toBe(root.id);
   });
 
+  /**
+   * Asserts a chain refusal tells the caller what to do and carries nothing of
+   * the file: no diff line, no digest, no backup path.
+   */
+  function expectActionableHint(error: DebuggenError, refused: ModificationRecord): string {
+    const hint = error.hint ?? '';
+
+    expect(hint.trim().length).toBeGreaterThan(20);
+    expect(hint).not.toContain(SENTINEL);
+    expect(hint).not.toContain('handlerAlpha');
+    expect(hint).not.toContain(refused.originalHash);
+    expect(hint).not.toContain(refused.instrumentedHash);
+    expect(hint).not.toContain(refused.backupPath);
+    expect(errorText(error)).not.toContain(SENTINEL);
+
+    return hint;
+  }
+
   it('refuses a delta that does not continue from the parent’s written bytes', async () => {
     const root = await appendRoot();
-    const delta = buildRecord({
+    const delta = makeRecord({
       planVersion: 2,
       originalHash: hashOf('somebody else edited the file'),
       instrumentedHash: hashOf('instrumented:plan-2'),
       previousRecordId: root.id,
+      diff: SENTINEL_DIFF,
     });
 
-    const appended = await repo.append(delta);
+    const error = expectRefusal(await repo.append(delta), 'MODIFICATION_CONFLICT');
+    const hint = expectActionableHint(error, delta);
 
-    expect(isErr(appended)).toBe(true);
-    expect(isErr(appended) ? appended.error.code : undefined).toBe('MODIFICATION_CONFLICT');
-    expect(isErr(appended) ? appended.error.hint : undefined).toContain('between plan versions');
+    // The remedy is named: revert the earlier patch and instrument again.
+    expect(hint).toContain('between plan versions');
+    expect(hint).toMatch(/Revert the earlier modification/u);
     expect(readRow(delta.id)).toBeUndefined();
+    expect(readRow(root.id)?.['status']).toBe('pending');
   });
 
   it('refuses a delta that repeats the parent’s original hash', async () => {
     const root = await appendRoot();
-    const delta = buildRecord({
+    const delta = makeRecord({
       planVersion: 2,
       originalHash: root.originalHash,
       instrumentedHash: hashOf('instrumented:plan-2'),
       previousRecordId: root.id,
+      diff: SENTINEL_DIFF,
     });
 
-    const appended = await repo.append(delta);
+    const error = expectRefusal(await repo.append(delta), 'INSTRUMENTATION_INSTALL_FAILED');
 
-    expect(isErr(appended)).toBe(true);
-    expect(isErr(appended) ? appended.error.code : undefined).toBe(
-      'INSTRUMENTATION_INSTALL_FAILED',
-    );
+    expect(expectActionableHint(error, delta)).toContain('instrumentedHash');
     expect(readRow(delta.id)).toBeUndefined();
   });
 
   it('refuses a delta whose parent belongs to another session', async () => {
     const root = await appendRoot();
-    const delta = buildRecord({
+    const delta = makeRecord({
       sessionId: SESSION_B,
       planVersion: 2,
       originalHash: root.instrumentedHash,
       instrumentedHash: hashOf('instrumented:plan-2'),
       previousRecordId: root.id,
+      diff: SENTINEL_DIFF,
     });
 
-    const appended = await repo.append(delta);
+    const error = expectRefusal(await repo.append(delta), 'INSTRUMENTATION_INSTALL_FAILED');
 
-    expect(isErr(appended)).toBe(true);
-    expect(isErr(appended) ? appended.error.code : undefined).toBe(
-      'INSTRUMENTATION_INSTALL_FAILED',
-    );
+    expect(expectActionableHint(error, delta)).toContain('one session');
+    expect(error.details?.['previousRecordId']).toBe(root.id);
     expect(readRow(delta.id)).toBeUndefined();
+    expect(await repo.countBySession(SESSION_B)).toStrictEqual({ ok: true, value: 0 });
   });
 
   it('refuses a delta whose parent describes a different file', async () => {
-    const root = await appendRoot('src/server/report.ts');
-    const delta = buildRecord({
-      file: 'src/server/other.ts',
+    const root = await appendRoot(FILE_ONE);
+    const delta = makeRecord({
+      file: FILE_TWO,
       planVersion: 2,
       originalHash: root.instrumentedHash,
       instrumentedHash: hashOf('instrumented:plan-2'),
       previousRecordId: root.id,
+      diff: SENTINEL_DIFF,
     });
 
-    const appended = await repo.append(delta);
+    const error = expectRefusal(await repo.append(delta), 'INSTRUMENTATION_INSTALL_FAILED');
 
-    expect(isErr(appended)).toBe(true);
-    expect(isErr(appended) ? appended.error.code : undefined).toBe(
-      'INSTRUMENTATION_INSTALL_FAILED',
-    );
+    expect(expectActionableHint(error, delta)).toContain('one file');
+    // The project-relative path is an identifier and may be named; the content may not.
+    expect(error.details?.['file']).toBe(FILE_TWO);
     expect(readRow(delta.id)).toBeUndefined();
   });
 
   it('refuses a delta whose parent is not journalled', async () => {
-    const delta = buildRecord({
+    const delta = makeRecord({
       planVersion: 2,
       previousRecordId: 'mod_0000000000000000',
       originalHash: hashOf('instrumented:plan-1'),
+      diff: SENTINEL_DIFF,
     });
 
-    const appended = await repo.append(delta);
+    const error = expectRefusal(await repo.append(delta), 'INSTRUMENTATION_INSTALL_FAILED');
 
-    expect(isErr(appended)).toBe(true);
-    expect(isErr(appended) ? appended.error.code : undefined).toBe(
-      'INSTRUMENTATION_INSTALL_FAILED',
-    );
+    expect(expectActionableHint(error, delta)).toContain('without a previous record');
     expect(readRow(delta.id)).toBeUndefined();
   });
 
   it('walks a chain oldest → newest, so a restore can reverse it', async () => {
     const root = await appendRoot();
     const second = await appendOk(
-      buildRecord({
+      makeRecord({
         planVersion: 2,
         originalHash: root.instrumentedHash,
         instrumentedHash: hashOf('instrumented:plan-2'),
@@ -585,7 +875,7 @@ describe('follow-up chains', () => {
       }),
     );
     const third = await appendOk(
-      buildRecord({
+      makeRecord({
         planVersion: 3,
         originalHash: second.instrumentedHash,
         instrumentedHash: hashOf('instrumented:plan-3'),
@@ -601,6 +891,23 @@ describe('follow-up chains', () => {
       third.id,
     ]);
 
+    // Every link of the walk lines up hash by hash, oldest first: exactly the
+    // property a newest-first restore verifies at each step.
+    const links = chain.ok ? chain.value : [];
+
+    for (let index = 1; index < links.length; index += 1) {
+      expect(links[index]?.originalHash).toBe(links[index - 1]?.instrumentedHash);
+      expect(links[index]?.previousRecordId).toBe(links[index - 1]?.id);
+    }
+
+    // Walked from a middle member or from the root, the answer is still oldest
+    // → newest: the chain that member descends from, ending at that member.
+    expect(unwrap(await repo.listChain(second.id)).map((entry) => entry.id)).toEqual([
+      root.id,
+      second.id,
+    ]);
+    expect(unwrap(await repo.listChain(root.id)).map((entry) => entry.id)).toEqual([root.id]);
+
     // The head is what a restore starts from, and it is the record nothing else
     // is layered on.
     const head = await repo.latestRecordForFile(SESSION_A, root.file);
@@ -609,7 +916,36 @@ describe('follow-up chains', () => {
 
     const byFile = await repo.listByFile(SESSION_A, root.file);
 
+    expect(byFile.ok && byFile.value.map((entry) => entry.id)).toEqual([
+      root.id,
+      second.id,
+      third.id,
+    ]);
     expect(byFile.ok && byFile.value.map((entry) => entry.planVersion)).toEqual([1, 2, 3]);
+
+    // Another session's records for the same path are not part of this chain.
+    expect(await repo.listByFile(SESSION_B, root.file)).toStrictEqual({ ok: true, value: [] });
+  });
+
+  it('orders a chain by its links even when every link shares one millisecond', async () => {
+    // No clock advance between appends: `applied_at` cannot order these, so the
+    // head and the walk must come from the links and the append order.
+    const root = await appendRoot();
+    const second = await appendOk(
+      makeRecord({
+        planVersion: 2,
+        originalHash: root.instrumentedHash,
+        instrumentedHash: hashOf('instrumented:plan-2'),
+        previousRecordId: root.id,
+      }),
+    );
+
+    expect(second.appliedAt).toBe(root.appliedAt);
+    expect(unwrap(await repo.latestRecordForFile(SESSION_A, FILE_ONE))?.id).toBe(second.id);
+    expect(unwrap(await repo.listByFile(SESSION_A, FILE_ONE)).map((entry) => entry.id)).toEqual([
+      root.id,
+      second.id,
+    ]);
   });
 
   it('answers a single-record chain with that record alone', async () => {
@@ -622,7 +958,7 @@ describe('follow-up chains', () => {
   it('refuses to walk a cycle', async () => {
     const root = await appendRoot();
     const second = await appendOk(
-      buildRecord({
+      makeRecord({
         planVersion: 2,
         originalHash: root.instrumentedHash,
         instrumentedHash: hashOf('instrumented:plan-2'),
@@ -630,23 +966,36 @@ describe('follow-up chains', () => {
       }),
     );
 
-    // Only reachable by corrupting the table directly: `append` refuses a
-    // forward link, and the record schema refuses a self-link.
+    const third = await appendOk(
+      makeRecord({
+        planVersion: 3,
+        originalHash: second.instrumentedHash,
+        instrumentedHash: hashOf('instrumented:plan-3'),
+        previousRecordId: second.id,
+      }),
+    );
+
+    // Only reachable by corrupting the table directly — the one place raw SQL
+    // is justified here: `append` refuses a forward link, and the record schema
+    // refuses a self-link. Pointing the root at the head closes the loop.
     store
       .statement('UPDATE modifications SET previous_record_id = ? WHERE id = ?')
-      .run(second.id, root.id);
+      .run(third.id, root.id);
 
-    const chain = await repo.listChain(second.id);
+    // From every member the walk terminates with a refusal instead of looping,
+    // which is what keeps start-up reconciliation from hanging on it.
+    for (const member of [root, second, third]) {
+      const error = expectRefusal(await repo.listChain(member.id), 'STORE_ERROR');
 
-    expect(isErr(chain)).toBe(true);
-    expect(isErr(chain) ? chain.error.code : undefined).toBe('STORE_ERROR');
-    expect(isErr(chain) ? chain.error.details?.['reason'] : undefined).toBe('chain-cycle');
+      expect(error.details?.['reason']).toBe('chain-cycle');
+      expect(error.hint).toContain('Report the record ids');
+    }
   });
 
   it('refuses to walk a chain whose link is missing', async () => {
     const root = await appendRoot();
     const second = await appendOk(
-      buildRecord({
+      makeRecord({
         planVersion: 2,
         originalHash: root.instrumentedHash,
         instrumentedHash: hashOf('instrumented:plan-2'),
@@ -681,7 +1030,7 @@ describe('follow-up chains', () => {
 describe('one chain per file', () => {
   /** A delta layered on `parent`, continuing from the bytes it wrote. */
   function deltaOf(parent: ModificationRecord, planVersion: number): ModificationRecord {
-    return buildRecord({
+    return makeRecord({
       file: parent.file,
       sessionId: parent.sessionId,
       planVersion,
@@ -711,7 +1060,7 @@ describe('one chain per file', () => {
   }
 
   it('refuses a second child of one parent and leaves the row set unchanged', async () => {
-    const root = await appendOk(buildRecord());
+    const root = await appendOk(makeRecord());
     const first = await appendOk(deltaOf(root, 2));
     const before = await idsOf(SESSION_A);
     const sibling = deltaOf(root, 3);
@@ -758,7 +1107,7 @@ describe('one chain per file', () => {
     // restored — the file holds the root's instrumented bytes again and the
     // session stays at plan version 1. The next follow-up must be able to layer
     // plan version 3 on the same root.
-    const root = await appendOk(buildRecord({ status: 'applied' }));
+    const root = await appendOk(makeRecord({ status: 'applied' }));
     const rolledBack = await appendOk(deltaOf(root, 2));
 
     await revert(rolledBack);
@@ -794,7 +1143,7 @@ describe('one chain per file', () => {
   });
 
   it('keeps a fully reverted file at its newest record as the head', async () => {
-    const root = await appendOk(buildRecord({ status: 'applied' }));
+    const root = await appendOk(makeRecord({ status: 'applied' }));
     const delta = await appendOk(deltaOf(root, 2));
 
     await revert(delta);
@@ -807,7 +1156,7 @@ describe('one chain per file', () => {
   });
 
   it('lets the database index ignore a reverted layer but not a second live one', async () => {
-    const root = await appendOk(buildRecord({ status: 'applied' }));
+    const root = await appendOk(makeRecord({ status: 'applied' }));
     const rolledBack = await appendOk(deltaOf(root, 2));
 
     await revert(rolledBack);
@@ -834,7 +1183,7 @@ describe('one chain per file', () => {
   });
 
   it('refuses a child of a reverted record, which is no longer the file’s current head', async () => {
-    const root = await appendOk(buildRecord());
+    const root = await appendOk(makeRecord());
 
     await revert(root);
 
@@ -851,10 +1200,10 @@ describe('one chain per file', () => {
   });
 
   it('refuses a child of a record that is not the sole open head of its file', async () => {
-    const root = await appendOk(buildRecord());
+    const root = await appendOk(makeRecord());
     // A second open root, planted the way a writer that bypassed the repository
     // would have left it — a root has no parent, so no index can refuse it.
-    const stray = buildRecord({ instrumentedHash: hashOf('instrumented:stray-root') });
+    const stray = makeRecord({ instrumentedHash: hashOf('instrumented:stray-root') });
 
     insertRawRecord(store.db, stray);
 
@@ -873,7 +1222,7 @@ describe('one chain per file', () => {
   });
 
   it('accepts a child of the head of a chain whose ancestors are all on its line', async () => {
-    const root = await appendOk(buildRecord({ status: 'applied' }));
+    const root = await appendOk(makeRecord({ status: 'applied' }));
     const second = await appendOk(deltaOf(root, 2));
     const third = await appendOk(deltaOf(second, 3));
 
@@ -885,8 +1234,8 @@ describe('one chain per file', () => {
   });
 
   it('refuses a second open root for one file', async () => {
-    const root = await appendOk(buildRecord());
-    const second = buildRecord({ instrumentedHash: hashOf('instrumented:second-root') });
+    const root = await appendOk(makeRecord());
+    const second = makeRecord({ instrumentedHash: hashOf('instrumented:second-root') });
 
     const appended = await repo.append(second);
 
@@ -904,11 +1253,11 @@ describe('one chain per file', () => {
   });
 
   it('accepts a new root once every earlier record of the file is reverted', async () => {
-    const root = await appendOk(buildRecord({ status: 'applied' }));
+    const root = await appendOk(makeRecord({ status: 'applied' }));
     const delta = await appendOk(deltaOf(root, 2));
 
     // Still open: a new root is a second chain.
-    const early = await repo.append(buildRecord({ planVersion: 3 }));
+    const early = await repo.append(makeRecord({ planVersion: 3 }));
 
     expect(isErr(early) ? early.error.details?.['reason'] : undefined).toBe(
       'chain-root-while-open',
@@ -919,7 +1268,7 @@ describe('one chain per file', () => {
     clock += 1_000;
     unwrap(await repo.updateStatus(root.id, 'reverted'));
 
-    const fresh = await appendOk(buildRecord({ planVersion: 3 }));
+    const fresh = await appendOk(makeRecord({ planVersion: 3 }));
 
     expect(fresh.previousRecordId).toBeUndefined();
 
@@ -932,17 +1281,17 @@ describe('one chain per file', () => {
   });
 
   it('judges each session’s chain on its own', async () => {
-    await appendOk(buildRecord({ sessionId: SESSION_A }));
+    await appendOk(makeRecord({ sessionId: SESSION_A }));
 
     // Another session's open record for the same path is not this session's
     // history: a chain describes one file within one session.
-    const other = await appendOk(buildRecord({ sessionId: SESSION_B }));
+    const other = await appendOk(makeRecord({ sessionId: SESSION_B }));
 
     expect(other.sessionId).toBe(SESSION_B);
   });
 
   it('reports a duplicate id as a duplicate, not as a second chain', async () => {
-    const record = await appendOk(buildRecord());
+    const record = await appendOk(makeRecord());
     const again = await repo.append(record);
 
     expect(isErr(again) ? again.error.code : undefined).toBe('STORE_ERROR');
@@ -950,7 +1299,7 @@ describe('one chain per file', () => {
   });
 
   it('enforces the single-child rule in the database for a writer that bypasses the repository', async () => {
-    const root = await appendOk(buildRecord());
+    const root = await appendOk(makeRecord());
 
     await appendOk(deltaOf(root, 2));
 
@@ -972,7 +1321,7 @@ describe('one chain per file', () => {
   });
 
   it('reports a second child the index refused as the same typed chain-fork conflict', async () => {
-    const root = await appendOk(buildRecord());
+    const root = await appendOk(makeRecord());
     const racer = deltaOf(root, 2);
     const loser = deltaOf(root, 3);
     const racing = createModificationsRepo({
@@ -1002,11 +1351,11 @@ describe('one chain per file', () => {
   });
 
   it('migrates a version-1 store holding a pre-existing fork, keeps every row and refuses to extend the fork', async () => {
-    const legacyDirectory = mkdtempSync(join(tmpdir(), 'debuggen-modifications-v1-'));
+    const legacyDirectory = mkdtempSync(join(directory, 'legacy-v1-'));
     const legacyPath = join(legacyDirectory, 'sessions.sqlite');
-    const parent = buildRecord({ status: 'applied' });
+    const parent = makeRecord({ status: 'applied' });
     const left = deltaOf(parent, 2);
-    const right = buildRecord({
+    const right = makeRecord({
       planVersion: 2,
       originalHash: parent.instrumentedHash,
       instrumentedHash: hashOf('instrumented:right-branch'),
@@ -1018,7 +1367,7 @@ describe('one chain per file', () => {
     const legacy = new DatabaseSync(legacyPath);
 
     try {
-      legacy.exec(readFileSync(fileURLToPath(new URL('./schema.sql', import.meta.url)), 'utf8'));
+      legacy.exec(unwrap(loadSchemaSql()));
       legacy.exec('PRAGMA user_version = 1');
       insertRawSession(legacy, SESSION_A);
 
@@ -1032,18 +1381,15 @@ describe('one chain per file', () => {
     const migrated = unwrap(
       openStore({
         databasePath: legacyPath,
-        logger: createConsoleLogger({
-          level: 'trace',
-          sink: (entry) => {
-            logs.push(entry);
-          },
-        }),
+        logger: createCapturingLogger(logs),
       }),
     );
 
     try {
-      expect(migrated.schemaVersion).toBe(STORE_SCHEMA_VERSION);
-      expect(STORE_SCHEMA_VERSION).toBeGreaterThanOrEqual(2);
+      // The fresh store of `beforeEach` is at the current version, which is
+      // the version the ladder must bring a legacy file to.
+      expect(migrated.schemaVersion).toBe(store.schemaVersion);
+      expect(store.schemaVersion).toBeGreaterThanOrEqual(2);
 
       // No row lost, none rewritten beyond the flag: every sibling of the fork
       // is marked, the parent is not.
@@ -1104,7 +1450,7 @@ describe('one chain per file', () => {
       ]);
 
       // And a fresh root over the forked file: refused while it is open.
-      const root = await journal.append(buildRecord({ planVersion: 3 }));
+      const root = await journal.append(makeRecord({ planVersion: 3 }));
 
       expect(isErr(root) ? root.error.details?.['reason'] : undefined).toBe(
         'chain-root-while-open',
@@ -1117,17 +1463,17 @@ describe('one chain per file', () => {
   });
 
   it('migrates a version-1 rollback-then-retry chain without flagging it as a fork', async () => {
-    const legacyDirectory = mkdtempSync(join(tmpdir(), 'debuggen-modifications-v1-retry-'));
+    const legacyDirectory = mkdtempSync(join(directory, 'legacy-v1-retry-'));
     const legacyPath = join(legacyDirectory, 'sessions.sqlite');
-    const parent = buildRecord({ status: 'applied' });
-    const rolledBack = buildRecord({
+    const parent = makeRecord({ status: 'applied' });
+    const rolledBack = makeRecord({
       planVersion: 2,
       status: 'reverted',
       originalHash: parent.instrumentedHash,
       instrumentedHash: hashOf('instrumented:rolled-back-delta'),
       previousRecordId: parent.id,
     });
-    const retry = buildRecord({
+    const retry = makeRecord({
       planVersion: 3,
       status: 'applied',
       originalHash: parent.instrumentedHash,
@@ -1141,7 +1487,7 @@ describe('one chain per file', () => {
     const legacy = new DatabaseSync(legacyPath);
 
     try {
-      legacy.exec(readFileSync(fileURLToPath(new URL('./schema.sql', import.meta.url)), 'utf8'));
+      legacy.exec(unwrap(loadSchemaSql()));
       legacy.exec('PRAGMA user_version = 1');
       insertRawSession(legacy, SESSION_A);
 
@@ -1155,17 +1501,12 @@ describe('one chain per file', () => {
     const migrated = unwrap(
       openStore({
         databasePath: legacyPath,
-        logger: createConsoleLogger({
-          level: 'trace',
-          sink: (entry) => {
-            logs.push(entry);
-          },
-        }),
+        logger: createCapturingLogger(logs),
       }),
     );
 
     try {
-      expect(migrated.schemaVersion).toBe(STORE_SCHEMA_VERSION);
+      expect(migrated.schemaVersion).toBe(store.schemaVersion);
 
       const flags = migrated
         .statement('SELECT id, chain_fork FROM modifications ORDER BY rowid ASC')
@@ -1233,43 +1574,140 @@ describe('the transition matrix', () => {
 });
 
 describe('updateStatus', () => {
+  it('agrees with the documented lifecycle on every ordered pair', () => {
+    let legalEdges = 0;
+
+    for (const from of MODIFICATION_STATUSES) {
+      for (const to of MODIFICATION_STATUSES) {
+        const documented = from === to || DOCUMENTED_EDGES[from].includes(to);
+
+        expect(canTransitionModificationStatus(from, to), `${from} → ${to}`).toBe(documented);
+
+        if (from !== to && documented) {
+          legalEdges += 1;
+        }
+      }
+    }
+
+    // 4 + 3 + 2 + 2 + 0: the edge count of AAP §0.5.1's lifecycle.
+    expect(legalEdges).toBe(11);
+  });
+
   for (const from of MODIFICATION_STATUSES) {
     for (const to of MODIFICATION_STATUSES) {
-      const legal = canTransitionModificationStatus(from, to);
+      const same = from === to;
+      const legal = same || DOCUMENTED_EDGES[from].includes(to);
+      const verb = same ? 'accepts as a no-op' : legal ? 'applies' : 'refuses';
 
-      it(`${legal ? 'applies' : 'refuses'} ${from} → ${to}`, async () => {
-        const record = await appendOk(buildRecord({ status: from, file: `src/${from}-${to}.ts` }));
+      it(`${verb} ${from} → ${to}`, async () => {
+        // Seeded through legal steps from `pending`, never with raw SQL, so the
+        // matrix is proven with the calls the patcher and cleanup make.
+        const seeded = await seedInStatus(from, { file: `src/${from}To${to}.ts` });
+        const before = readRow(seeded.id);
+
+        expect(before?.['status']).toBe(from);
 
         clock += 1_000;
 
-        const updated = await repo.updateStatus(record.id, to);
+        const updated = await repo.updateStatus(seeded.id, to);
+        const reread = unwrap(await repo.get(seeded.id));
 
-        if (legal) {
-          expect(updated.ok && updated.value.status).toBe(to);
-          expect(readRow(record.id)?.['status']).toBe(to);
+        if (same) {
+          // An idempotent retry: accepted, and nothing is written.
+          expect(updated).toStrictEqual({ ok: true, value: seeded });
+          expect(reread).toStrictEqual(seeded);
+          expect(readRow(seeded.id)?.['updated_at']).toBe(before?.['updated_at']);
 
           return;
         }
 
-        expect(isErr(updated)).toBe(true);
-        expect(isErr(updated) ? updated.error.code : undefined).toBe('SESSION_INVALID_STATE');
-        expect(isErr(updated) ? updated.error.details?.['reason'] : undefined).toBe(
-          'illegal-status-transition',
-        );
+        if (legal) {
+          // The returned record is what the store now holds, so a caller can
+          // broadcast it without a second read.
+          expect(updated.ok && updated.value.status).toBe(to);
+          expect(updated.ok ? updated.value : undefined).toStrictEqual(reread);
+          expect(readRow(seeded.id)?.['status']).toBe(to);
+          expect(readRow(seeded.id)?.['updated_at']).toBe(clock);
+          expect(readRow(seeded.id)?.['applied_at']).toBe(seeded.appliedAt);
 
-        // The refusal changed nothing: the row still describes the file exactly
-        // as it did, which is what keeps a caller that lost track from
-        // overwriting a developer's edit.
-        const row = readRow(record.id);
+          return;
+        }
 
-        expect(row?.['status']).toBe(from);
-        expect(row?.['updated_at']).toBe(record.appliedAt);
+        const error = expectRefusal(updated, 'SESSION_INVALID_STATE');
+
+        expect(error.details?.['reason']).toBe('illegal-status-transition');
+        expect(error.details?.['from']).toBe(from);
+        expect(error.details?.['to']).toBe(to);
+        expect(error.hint).toContain('Re-read the record');
+
+        // The refusal changed nothing: re-read, the row still describes the
+        // file exactly as it did, which is what keeps a caller that lost track
+        // from overwriting a developer's edit.
+        expect(reread).toStrictEqual(seeded);
+        expect(readRow(seeded.id)).toStrictEqual(before);
       });
     }
   }
 
+  it('refuses a transition decided on a stale read, leaving the newer status in place', async () => {
+    const record = await appendOk(makeRecord());
+
+    // Caller one reads the record and decides, from `pending`, to mark it
+    // applied once its rename lands…
+    const stale = unwrap(await repo.get(record.id));
+
+    expect(stale?.status).toBe('pending');
+
+    // …while reconciliation, seeing the file still hold the original bytes,
+    // closes the record first.
+    clock += 1_000;
+    unwrap(await repo.updateStatus(record.id, 'reverted'));
+
+    clock += 1_000;
+
+    const error = expectRefusal(
+      await repo.updateStatus(record.id, 'applied'),
+      'SESSION_INVALID_STATE',
+    );
+
+    // The refusal names the status the record really holds, and says what to
+    // do: re-read before deciding again.
+    expect(error.details?.['from']).toBe('reverted');
+    expect(error.hint).toContain('Re-read the record');
+    expect(unwrap(await repo.get(record.id))?.status).toBe('reverted');
+    expect(readRow(record.id)?.['updated_at']).toBe(CLOCK_START + 1_000);
+  });
+
+  it('advances updated_at on every accepted transition and never moves applied_at', async () => {
+    const record = await appendOk(makeRecord());
+
+    expect(readRow(record.id)?.['updated_at']).toBe(CLOCK_START);
+
+    const path: readonly ModificationStatus[] = ['applied', 'conflict', 'failed', 'reverted'];
+    const stamps: number[] = [];
+
+    for (const status of path) {
+      clock += 1_500;
+
+      const moved = unwrap(await repo.updateStatus(record.id, status));
+      const row = readRow(record.id);
+
+      expect(moved.status).toBe(status);
+      expect(moved.appliedAt).toBe(record.appliedAt);
+      expect(row?.['status']).toBe(status);
+      expect(row?.['updated_at']).toBe(clock);
+      expect(row?.['applied_at']).toBe(record.appliedAt);
+
+      stamps.push(clock);
+    }
+
+    // Strictly increasing: each transition can be audited after the fact.
+    expect(stamps).toStrictEqual([...stamps].sort((left, right) => left - right));
+    expect(new Set(stamps).size).toBe(path.length);
+  });
+
   it('returns the stored record without a second read', async () => {
-    const record = await appendOk(buildRecord());
+    const record = await appendOk(makeRecord());
 
     clock += 2_500;
 
@@ -1281,7 +1719,7 @@ describe('updateStatus', () => {
   });
 
   it('writes only the columns the patch names', async () => {
-    const record = await appendOk(buildRecord());
+    const record = await appendOk(makeRecord());
     const before = readRow(record.id);
 
     clock += 4_000;
@@ -1307,8 +1745,8 @@ describe('updateStatus', () => {
   });
 
   it('relocates a backup path for a conflicting record', async () => {
-    const record = await appendOk(buildRecord({ status: 'applied' }));
-    const relocated = `${BACKUPS}/quarantine/${record.originalHash}`;
+    const record = await appendOk(makeRecord({ status: 'applied' }));
+    const relocated = join(directory, 'backups', 'quarantine', record.originalHash);
     const updated = await repo.updateStatus(record.id, 'conflict', { backupPath: relocated });
 
     expect(updated.ok && updated.value.backupPath).toBe(relocated);
@@ -1316,7 +1754,7 @@ describe('updateStatus', () => {
   });
 
   it('accepts an idempotent retry without writing', async () => {
-    const record = await appendOk(buildRecord({ status: 'conflict' }));
+    const record = await appendOk(makeRecord({ status: 'conflict' }));
     const before = readRow(record.id);
 
     clock += 9_000;
@@ -1328,7 +1766,7 @@ describe('updateStatus', () => {
   });
 
   it('refuses a patch that would store a record a later read could not parse', async () => {
-    const record = await appendOk(buildRecord());
+    const record = await appendOk(makeRecord());
     const updated = await repo.updateStatus(record.id, 'applied', {
       instrumentedHash: 'not-a-hash',
     });
@@ -1343,7 +1781,7 @@ describe('updateStatus', () => {
   });
 
   it('refuses a patch that would make the two hashes identical', async () => {
-    const record = await appendOk(buildRecord());
+    const record = await appendOk(makeRecord());
     const updated = await repo.updateStatus(record.id, 'applied', {
       instrumentedHash: record.originalHash,
     });
@@ -1353,7 +1791,7 @@ describe('updateStatus', () => {
   });
 
   it('refuses a patch that would empty the diff', async () => {
-    const record = await appendOk(buildRecord());
+    const record = await appendOk(makeRecord());
     const updated = await repo.updateStatus(record.id, 'applied', { diff: '   ' });
 
     expect(isErr(updated)).toBe(true);
@@ -1369,7 +1807,7 @@ describe('updateStatus', () => {
   });
 
   it('refuses the write when the record moved underneath it', async () => {
-    const record = await appendOk(buildRecord());
+    const record = await appendOk(makeRecord());
 
     // A store that lets another writer move the row between the read and the
     // guarded write, which is the race the optimistic guard exists for.
@@ -1378,15 +1816,22 @@ describe('updateStatus', () => {
       now: () => clock,
     });
 
-    const updated = await racing.updateStatus(record.id, 'applied');
+    clock += 1_000;
 
-    expect(isErr(updated)).toBe(true);
-    expect(isErr(updated) ? updated.error.code : undefined).toBe('STORE_ERROR');
-    expect(isErr(updated) ? updated.error.details?.['reason'] : undefined).toBe('status-moved');
-    expect(isErr(updated) ? updated.error.hint : undefined).toContain('re-read');
+    // The repository reads `pending` and binds it as the expected status of
+    // its guarded `UPDATE … WHERE id = ? AND status = ?`; the other writer's
+    // move to `failed` lands in between, so the expectation is stale by the
+    // time the write runs.
+    const error = expectRefusal(await racing.updateStatus(record.id, 'applied'), 'STORE_ERROR');
+
+    expect(error.details?.['reason']).toBe('status-moved');
+    expect(error.details?.['expected']).toBe('pending');
+    expect(error.hint).toContain('re-read');
 
     // The other writer's value stands; this call wrote nothing.
     expect(readRow(record.id)?.['status']).toBe('failed');
+    expect(unwrap(await repo.get(record.id))?.status).toBe('failed');
+    expect(readRow(record.id)?.['updated_at']).toBe(CLOCK_START);
   });
 });
 
@@ -1395,7 +1840,11 @@ describe('updateStatus', () => {
  * ---------------------------------------------------------------------------------------------- */
 
 describe('queries', () => {
-  /** One record per status across three sessions in three different statuses. */
+  /**
+   * Records across four sessions in four different session statuses —
+   * `capturing` (A), `failed` (B), `ended` (C) and `generated` (D) — every one
+   * brought to its status through legal steps, plus a three-link chain in D.
+   */
   interface Seeded {
     readonly pendingA: ModificationRecord;
     readonly appliedA: ModificationRecord;
@@ -1404,34 +1853,186 @@ describe('queries', () => {
     readonly failedB: ModificationRecord;
     readonly revertedB: ModificationRecord;
     readonly conflictC: ModificationRecord;
+    readonly chainD: readonly [ModificationRecord, ModificationRecord, ModificationRecord];
   }
+
+  /** The file the seeded chain in session D patches three times. */
+  const CHAIN_FILE = 'src/moduleChain.ts';
 
   let seeded: Seeded;
 
+  /** Every seeded record, in the order it was appended. */
+  function allSeeded(): readonly ModificationRecord[] {
+    return [
+      seeded.pendingA,
+      seeded.appliedA,
+      seeded.revertedA,
+      seeded.conflictA,
+      seeded.failedB,
+      seeded.revertedB,
+      seeded.conflictC,
+      ...seeded.chainD,
+    ];
+  }
+
+  /** The ids of `records` whose status is one of the upstream open statuses. */
+  function openIdsOf(records: readonly ModificationRecord[]): string[] {
+    const open: readonly ModificationStatus[] = OPEN_MODIFICATION_STATUSES;
+
+    return records.filter((record) => open.includes(record.status)).map((record) => record.id);
+  }
+
+  /** Whether each session's records form one contiguous run in `records`. */
+  function sessionsAreContiguous(records: readonly ModificationRecord[]): boolean {
+    const finished = new Set<string>();
+    let current: string | undefined;
+
+    for (const record of records) {
+      if (record.sessionId !== current) {
+        if (finished.has(record.sessionId)) {
+          return false;
+        }
+
+        if (current !== undefined) {
+          finished.add(current);
+        }
+
+        current = record.sessionId;
+      }
+    }
+
+    return true;
+  }
+
   beforeEach(async () => {
+    const pendingA = await seedInStatus('pending', { file: 'src/moduleA1.ts' });
+    const appliedA = await seedInStatus('applied', { file: 'src/moduleA2.ts' });
+    const revertedA = await seedInStatus('reverted', { file: 'src/moduleA3.ts' });
+    const conflictA = await seedInStatus('conflict', { file: 'src/moduleA4.ts' });
+    const failedB = await seedInStatus('failed', { sessionId: SESSION_B, file: 'src/moduleB1.ts' });
+    const revertedB = await seedInStatus('reverted', {
+      sessionId: SESSION_B,
+      file: 'src/moduleB2.ts',
+    });
+    const conflictC = await seedInStatus('conflict', {
+      sessionId: SESSION_C,
+      file: 'src/moduleC1.ts',
+    });
+
+    // A follow-up chain in the `generated` session: plan version 1 applied,
+    // plan version 2 layered on it and applied, plan version 3 journalled but
+    // not yet written.
+    const rootD = await seedInStatus('applied', { sessionId: SESSION_D, file: CHAIN_FILE });
+    const middleD = await appendOk(
+      makeRecord({
+        sessionId: SESSION_D,
+        file: CHAIN_FILE,
+        planVersion: 2,
+        originalHash: rootD.instrumentedHash,
+        instrumentedHash: hashOf('instrumented:chain:plan-2'),
+        previousRecordId: rootD.id,
+      }),
+    );
+
+    clock += 1_000;
+
+    const appliedMiddleD = unwrap(await repo.updateStatus(middleD.id, 'applied'));
+    const headD = await appendOk(
+      makeRecord({
+        sessionId: SESSION_D,
+        file: CHAIN_FILE,
+        planVersion: 3,
+        originalHash: appliedMiddleD.instrumentedHash,
+        instrumentedHash: hashOf('instrumented:chain:plan-3'),
+        previousRecordId: appliedMiddleD.id,
+      }),
+    );
+
     seeded = {
-      pendingA: await appendOk(buildRecord({ status: 'pending', file: 'src/a-pending.ts' })),
-      appliedA: await appendOk(buildRecord({ status: 'applied', file: 'src/a-applied.ts' })),
-      revertedA: await appendOk(buildRecord({ status: 'reverted', file: 'src/a-reverted.ts' })),
-      conflictA: await appendOk(buildRecord({ status: 'conflict', file: 'src/a-conflict.ts' })),
-      failedB: await appendOk(
-        buildRecord({ sessionId: SESSION_B, status: 'failed', file: 'src/b-failed.ts' }),
-      ),
-      revertedB: await appendOk(
-        buildRecord({ sessionId: SESSION_B, status: 'reverted', file: 'src/b-reverted.ts' }),
-      ),
-      conflictC: await appendOk(
-        buildRecord({ sessionId: SESSION_C, status: 'conflict', file: 'src/c-conflict.ts' }),
-      ),
+      pendingA,
+      appliedA,
+      revertedA,
+      conflictA,
+      failedB,
+      revertedB,
+      conflictC,
+      chainD: [rootD, appliedMiddleD, headD],
     };
   });
 
-  it('lists one session and nobody else', async () => {
-    const listed = await repo.listBySession(SESSION_A);
+  it('lists one session and nobody else, in append order', async () => {
+    const listed = unwrap(await repo.listBySession(SESSION_A));
 
-    expect(listed.ok && listed.value.map((entry) => entry.id).sort()).toEqual(
-      [seeded.pendingA.id, seeded.appliedA.id, seeded.revertedA.id, seeded.conflictA.id].sort(),
+    expect(listed.map((entry) => entry.id)).toEqual([
+      seeded.pendingA.id,
+      seeded.appliedA.id,
+      seeded.revertedA.id,
+      seeded.conflictA.id,
+    ]);
+    expect(listed.every((entry) => entry.sessionId === SESSION_A)).toBe(true);
+  });
+
+  it('orders a session by applied_at, breaking ties by append order, and filters by status', async () => {
+    // Appended out of timestamp order, with a tie, so the order the listing
+    // gives can only come from `applied_at` first and insertion second.
+    const later = await appendOk(
+      makeRecord({ sessionId: SESSION_B, file: 'src/moduleB3.ts', appliedAt: clock + 50_000 }),
     );
+    const earlier = await appendOk(
+      makeRecord({ sessionId: SESSION_B, file: 'src/moduleB4.ts', appliedAt: clock + 10_000 }),
+    );
+    const tie = await appendOk(
+      makeRecord({ sessionId: SESSION_B, file: 'src/moduleB5.ts', appliedAt: clock + 10_000 }),
+    );
+    const expected = [seeded.failedB.id, seeded.revertedB.id, earlier.id, tie.id, later.id];
+
+    // Read twice: the order is a property of the data, not of a read.
+    for (let read = 0; read < 2; read += 1) {
+      const listed = unwrap(await repo.listBySession(SESSION_B));
+
+      expect(listed.map((entry) => entry.id)).toEqual(expected);
+    }
+
+    const pending = unwrap(await repo.listBySession(SESSION_B, { statuses: ['pending'] }));
+
+    expect(pending.map((entry) => entry.id)).toEqual([earlier.id, tie.id, later.id]);
+
+    const failed = unwrap(await repo.listBySession(SESSION_B, { statuses: ['failed'] }));
+
+    expect(failed.map((entry) => entry.id)).toEqual([seeded.failedB.id]);
+
+    // A repeated status in the filter changes nothing.
+    const repeated = unwrap(
+      await repo.listBySession(SESSION_B, { statuses: ['failed', 'failed', 'reverted'] }),
+    );
+
+    expect(repeated.map((entry) => entry.id)).toEqual([seeded.failedB.id, seeded.revertedB.id]);
+  });
+
+  it('answers listOpen(session) with exactly the records in OPEN_MODIFICATION_STATUSES', async () => {
+    // One record of every status in a single session, each reached legally.
+    const perStatus: ModificationRecord[] = [];
+
+    for (const status of MODIFICATION_STATUSES) {
+      perStatus.push(
+        await seedInStatus(status, { sessionId: SESSION_C, file: `src/moduleOf${status}.ts` }),
+      );
+    }
+
+    const open = unwrap(await repo.listOpen(SESSION_C));
+    const everyC = [seeded.conflictC, ...perStatus];
+
+    // Derived from the imported constant, never from a list spelled here.
+    expect(open.map((entry) => entry.id).sort()).toEqual(openIdsOf(everyC).sort());
+    const listedPerStatus = perStatus.filter((entry) =>
+      open.some((listed) => listed.id === entry.id),
+    );
+
+    expect(new Set(listedPerStatus.map((entry) => entry.status))).toEqual(
+      new Set(OPEN_MODIFICATION_STATUSES),
+    );
+    expect(open.some((entry) => entry.status === 'reverted')).toBe(false);
+    expect(open.every((entry) => entry.sessionId === SESSION_C)).toBe(true);
   });
 
   it('narrows a session listing by status', async () => {
@@ -1451,25 +2052,68 @@ describe('queries', () => {
   });
 
   it('reconciles every session, whatever status the session is in', async () => {
-    const open = await repo.listAllOpen();
-    const ids = open.ok ? open.value.map((entry) => entry.id) : [];
+    const open = unwrap(await repo.listAllOpen());
+    const ids = open.map((entry) => entry.id);
 
-    // SESSION_B is `failed` and SESSION_C is `ended`; their open records are
+    // The parent sessions really are in four different statuses.
+    expect(SESSIONS.map(([id]) => unwrap(sessions.get(id))?.status)).toEqual([
+      'capturing',
+      'failed',
+      'ended',
+      'generated',
+    ]);
+
+    // B is `failed`, C is `ended` and D is `generated`; their open records are
     // still on the list, because the files they describe are still patched.
+    expect([...ids].sort()).toEqual(openIdsOf(allSeeded()).sort());
     expect(ids).toContain(seeded.failedB.id);
     expect(ids).toContain(seeded.conflictC.id);
-    expect(ids).toContain(seeded.pendingA.id);
-    expect(ids).toContain(seeded.appliedA.id);
-    expect(ids).toContain(seeded.conflictA.id);
+
+    for (const link of seeded.chainD) {
+      expect(ids).toContain(link.id);
+    }
 
     // `reverted` is the one status with nothing left to do.
     expect(ids).not.toContain(seeded.revertedA.id);
     expect(ids).not.toContain(seeded.revertedB.id);
-    expect(ids).toHaveLength(5);
+    expect(ids).toHaveLength(8);
 
-    for (const record of open.ok ? open.value : []) {
+    for (const record of open) {
       expect(OPEN_MODIFICATION_STATUSES).toContain(record.status);
     }
+  });
+
+  it('orders the reconciliation set by session, with a chain in application order', async () => {
+    const open = unwrap(await repo.listAllOpen());
+
+    // Each session's records are one contiguous run…
+    expect(sessionsAreContiguous(open)).toBe(true);
+
+    // …and within session D the chain comes root → middle → head, the order it
+    // was applied in and the order a newest-first restore reverses.
+    const chainIds = seeded.chainD.map((link) => link.id);
+
+    expect(open.filter((entry) => chainIds.includes(entry.id)).map((entry) => entry.id)).toEqual(
+      chainIds,
+    );
+
+    const inD = open.filter((entry) => entry.sessionId === SESSION_D);
+
+    expect(inD.map((entry) => entry.planVersion)).toEqual([1, 2, 3]);
+  });
+
+  it('never consults sessions.status: moving every session leaves the set unchanged', async () => {
+    const before = unwrap(await repo.listAllOpen());
+
+    // Every session driven to a terminal status — the states a status-aware
+    // query would be most tempted to skip.
+    for (const [id] of SESSIONS) {
+      clock += 1_000;
+      unwrap(sessions.setStatus(id, id === SESSION_B ? 'ended' : 'failed'));
+    }
+
+    expect(unwrap(await repo.listAllOpen())).toStrictEqual(before);
+    expect(unwrap(await repo.listOpen())).toStrictEqual(before);
   });
 
   it('answers listOpen() exactly as listAllOpen(), and listOpen(session) for one session', async () => {
@@ -1497,10 +2141,32 @@ describe('queries', () => {
     expect(one.ok && one.value.map((entry) => entry.id)).toEqual([seeded.conflictA.id]);
   });
 
+  it('names exactly the conflict-backed paths retention must never delete', async () => {
+    // The exemption rule of the retention sweep reads both queries; they must
+    // agree with each other and with the conflicting records themselves.
+    const conflicts = unwrap(await repo.listConflicts());
+    const exempt = unwrap(await repo.listBackupPaths({ statuses: ['conflict'] }));
+
+    expect(conflicts.every((entry) => entry.status === 'conflict')).toBe(true);
+    expect(exempt).toEqual([...new Set(conflicts.map((entry) => entry.backupPath))].sort());
+    expect(exempt).toEqual([seeded.conflictA.backupPath, seeded.conflictC.backupPath].sort());
+
+    // Resolving one conflict (a verified restore) takes its path off the list.
+    clock += 1_000;
+    unwrap(await repo.updateStatus(seeded.conflictA.id, 'reverted'));
+
+    expect(unwrap(await repo.listBackupPaths({ statuses: ['conflict'] }))).toEqual([
+      seeded.conflictC.backupPath,
+    ]);
+    expect(unwrap(await repo.listConflicts()).map((entry) => entry.id)).toEqual([
+      seeded.conflictC.id,
+    ]);
+  });
+
   it('lists the distinct backup paths retention needs', async () => {
     const all = await repo.listBackupPaths();
 
-    expect(all.ok && all.value).toHaveLength(7);
+    expect(all.ok && all.value).toHaveLength(allSeeded().length);
     expect(all.ok && all.value).toStrictEqual([...(all.ok ? all.value : [])].sort());
 
     const conflicts = await repo.listBackupPaths({ statuses: ['conflict'] });
@@ -1525,10 +2191,10 @@ describe('queries', () => {
   });
 
   it('deduplicates a backup path two records share', async () => {
-    const shared = `${BACKUPS}/${SESSION_A}/${hashOf('shared original')}`;
+    const shared = backupPathOf(SESSION_A, hashOf('shared original'));
 
-    await appendOk(buildRecord({ file: 'src/share-1.ts', backupPath: shared }));
-    await appendOk(buildRecord({ file: 'src/share-2.ts', backupPath: shared }));
+    await appendOk(makeRecord({ file: 'src/share-1.ts', backupPath: shared }));
+    await appendOk(makeRecord({ file: 'src/share-2.ts', backupPath: shared }));
 
     const paths = await repo.listBackupPaths({ sessionId: SESSION_A });
 
@@ -1554,15 +2220,31 @@ describe('queries', () => {
   });
 
   it('goes with the session it belongs to', async () => {
-    store.statement('DELETE FROM sessions WHERE id = ?').run(SESSION_A);
+    /** Counts rows straight from the table, bypassing the repository. */
+    const rowsOf = (sessionId: SessionId): unknown =>
+      store
+        .statement('SELECT COUNT(*) AS total FROM modifications WHERE session_id = ?')
+        .get(sessionId)?.['total'];
 
-    const remaining = await repo.countBySession(SESSION_A);
+    // Accurate beforehand, and in agreement with the table itself.
+    expect(await repo.countBySession(SESSION_A)).toStrictEqual({ ok: true, value: 4 });
+    expect(rowsOf(SESSION_A)).toBe(4);
+    expect(await repo.countBySession(SESSION_D)).toStrictEqual({ ok: true, value: 3 });
 
-    expect(remaining).toStrictEqual({ ok: true, value: 0 });
+    // The session repository's delete: the `ON DELETE CASCADE` edge takes the
+    // journal rows with it, which is why retention must check first.
+    expect(sessions.delete(SESSION_A)).toStrictEqual({ ok: true, value: 1 });
 
-    const elsewhere = await repo.countBySession(SESSION_B);
+    expect(rowsOf(SESSION_A)).toBe(0);
+    expect(await repo.countBySession(SESSION_A)).toStrictEqual({ ok: true, value: 0 });
+    expect(await repo.listBySession(SESSION_A)).toStrictEqual({ ok: true, value: [] });
 
-    expect(elsewhere).toStrictEqual({ ok: true, value: 2 });
+    // Nobody else's records moved.
+    expect(rowsOf(SESSION_B)).toBe(2);
+    expect(await repo.countBySession(SESSION_B)).toStrictEqual({ ok: true, value: 2 });
+    expect(unwrap(await repo.listAllOpen()).some((entry) => entry.sessionId === SESSION_A)).toBe(
+      false,
+    );
   });
 
   it('reports absence rather than failure for a record and a file it does not hold', async () => {
@@ -1611,7 +2293,7 @@ describe('queries', () => {
 describe('privacy', () => {
   it('journals a diff without ever logging it', async () => {
     const diff = `${DIFF}\n+// ${SENTINEL}`;
-    const record = await appendOk(buildRecord({ diff }));
+    const record = await appendOk(makeRecord({ diff }));
 
     clock += 1_000;
     await repo.updateStatus(record.id, 'applied', { appliedAt: clock });
@@ -1636,28 +2318,116 @@ describe('privacy', () => {
   });
 
   it('keeps a refused record out of the error it answers with', async () => {
-    const diff = `${DIFF}\n+// ${SENTINEL}`;
     const hash = hashOf('unchanged content');
-    const refused = await repo.append(
-      buildRecord({ diff, originalHash: hash, instrumentedHash: hash }),
+    const error = expectRefusal(
+      await repo.append(
+        makeRecord({ diff: SENTINEL_DIFF, originalHash: hash, instrumentedHash: hash }),
+      ),
+      'INSTRUMENTATION_INSTALL_FAILED',
     );
 
-    expect(isErr(refused)).toBe(true);
+    expect(errorText(error)).not.toContain(SENTINEL);
+    expect(errorText(error)).not.toContain(hash);
+    expect(loggedText()).not.toContain(SENTINEL);
+  });
 
-    if (isErr(refused)) {
-      const error = refused.error;
-      const serialised = JSON.stringify({
-        payload: error.toPayload(),
-        details: error.details ?? {},
-        message: error.message,
-        hint: error.hint ?? '',
-      });
+  it('carries no diff content in any log line or refusal, on every path', async () => {
+    // The success path first: a sentinel-bearing record journalled, moved and
+    // read back through every query.
+    const kept = await appendOk(makeRecord({ diff: SENTINEL_DIFF }));
 
-      expect(serialised).not.toContain(SENTINEL);
-      expect(serialised).not.toContain(hash);
+    clock += 1_000;
+    unwrap(await repo.updateStatus(kept.id, 'applied', { appliedAt: clock }));
+
+    unwrap(await repo.listBySession(SESSION_A));
+    unwrap(await repo.listOpen(SESSION_A));
+    unwrap(await repo.listAllOpen());
+    unwrap(await repo.listByFile(SESSION_A, FILE_ONE));
+    unwrap(await repo.latestRecordForFile(SESSION_A, FILE_ONE));
+    unwrap(await repo.listChain(kept.id));
+    unwrap(await repo.listConflicts());
+    unwrap(await repo.listBackupPaths());
+
+    // Then every refusal path, each offered the same sentinel-bearing diff.
+    const fresh = (overrides: RecordOverrides = {}): ModificationRecord =>
+      makeRecord({ file: FILE_TWO, diff: SENTINEL_DIFF, ...overrides });
+    const template = fresh();
+    const racing = createModificationsRepo({
+      store: storeThatMovesTheRow(store, kept.id, 'conflict'),
+      logger: createCapturingLogger(logs),
+      now: () => clock,
+    });
+
+    const refusals: ReadonlyArray<readonly [DebuggenError['code'], Result<unknown>]> = [
+      ['INSTRUMENTATION_INSTALL_FAILED', await repo.append({ ...template, backupPath: ' ' })],
+      [
+        'INSTRUMENTATION_INSTALL_FAILED',
+        await repo.append({ ...template, instrumentedHash: template.originalHash }),
+      ],
+      [
+        'INSTRUMENTATION_INSTALL_FAILED',
+        await repo.append({ ...template, originalHash: 'e'.repeat(63) }),
+      ],
+      [
+        'INSTRUMENTATION_INSTALL_FAILED',
+        await repo.append({ ...template, file: '../outside/moduleTwo.ts' }),
+      ],
+      ['STORE_ERROR', await repo.append({ ...template, sessionId: newSessionId() })],
+      ['STORE_ERROR', await repo.append(kept)],
+      [
+        'MODIFICATION_CONFLICT',
+        await repo.append(
+          fresh({
+            file: FILE_ONE,
+            planVersion: 2,
+            originalHash: hashOf('drifted content'),
+            previousRecordId: kept.id,
+          }),
+        ),
+      ],
+      [
+        'INSTRUMENTATION_INSTALL_FAILED',
+        await repo.append(
+          fresh({
+            sessionId: SESSION_B,
+            file: FILE_ONE,
+            planVersion: 2,
+            originalHash: kept.instrumentedHash,
+            instrumentedHash: hashOf('instrumented:other-session'),
+            previousRecordId: kept.id,
+          }),
+        ),
+      ],
+      ['MODIFICATION_CONFLICT', await repo.append(fresh({ file: FILE_ONE, planVersion: 2 }))],
+      [
+        'INSTRUMENTATION_INSTALL_FAILED',
+        await repo.updateStatus(kept.id, 'applied', { instrumentedHash: 'not-a-digest' }),
+      ],
+      ['SESSION_INVALID_STATE', await repo.updateStatus(kept.id, 'pending')],
+      ['STORE_ERROR', await racing.updateStatus(kept.id, 'reverted')],
+      ['STORE_ERROR', await repo.listChain('mod_0000000000000000')],
+    ];
+
+    for (const [code, result] of refusals) {
+      const error = expectRefusal(result, code);
+
+      expect(errorText(error)).not.toContain(SENTINEL);
+      expect(errorText(error)).not.toContain(kept.backupPath);
     }
 
-    expect(loggedText()).not.toContain(SENTINEL);
+    // Nothing the store, the sessions repository or the journal logged — on
+    // any of the paths above — carries the diff, a digest or a backup path.
+    const text = loggedText();
+
+    expect(logs.length).toBeGreaterThan(refusals.length);
+    expect(text).not.toContain(SENTINEL);
+    expect(text).not.toContain(kept.originalHash);
+    expect(text).not.toContain(kept.instrumentedHash);
+    expect(text).not.toContain(kept.backupPath);
+
+    for (const entry of logs) {
+      expect(`${entry.message} ${JSON.stringify(entry.fields)}`).not.toContain(SENTINEL);
+    }
   });
 });
 
@@ -1796,11 +2566,11 @@ function insertRawSession(db: DatabaseSync, sessionId: string): void {
      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     sessionId,
-    '/home/dev/projects/storefront',
-    'storefront',
-    'instrumenting',
-    'Why is this button slow?',
-    'http://127.0.0.1:20531',
+    '/workspace/project-one',
+    'project-one',
+    'capturing',
+    'Why is handlerAlpha slow?',
+    'http://127.0.0.1:3100/',
     clock,
     clock,
     '{}',
@@ -1835,7 +2605,7 @@ function insertCorruptRow(id: string, file: string, diff: string): void {
       1,
       file,
       'NOT-A-SHA256-DIGEST',
-      `${BACKUPS}/${SESSION_A}/original`,
+      backupPathOf(SESSION_A, 'original'),
       'ALSO-NOT-A-SHA256-DIGEST',
       clock,
       clock,

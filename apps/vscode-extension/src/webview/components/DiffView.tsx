@@ -49,10 +49,12 @@
  * every value there a `--dg-*` token (AAP 0.6.4); no inline style. The marker
  * column is what keeps colour from being the only carrier of meaning: `+` and
  * `-` stay visible beside the success/danger text. The scroll container is a
- * named, focusable group so a keyboard user can scroll a wide line into view;
- * the focus ring is the design system's own `:focus-visible` rule. The line
- * list is prose-like content, not a grid, so it carries no table roles, and no
- * heading is emitted - the surrounding outline belongs to `ModificationsList`.
+ * named, focusable group so a keyboard user can scroll a wide line into view -
+ * a Tab stop by default, or `tabIndex={-1}` through `scrollTabIndex` when the
+ * owner's composite widget reaches it by other keys; the focus ring is the
+ * design system's own `:focus-visible` rule. The line list is prose-like
+ * content, not a grid, so it carries no table roles, and no heading is emitted
+ * - the surrounding outline belongs to `ModificationsList`.
  *
  * ## Privacy
  *
@@ -106,6 +108,15 @@ export interface DiffViewProps {
    * state, so a failure is never presented as a result.
    */
   error?: string | undefined;
+
+  /**
+   * The `tabIndex` of the focusable scroll region. Defaults to `0`, a Tab stop
+   * of its own. An owner that renders the diff inside a composite widget which
+   * manages focus itself passes `-1`: `ModificationsList` does, because its
+   * `DataTable` is a single Tab stop whose arrow keys reach every control in
+   * an open detail row, and the region stays focusable that way.
+   */
+  scrollTabIndex?: 0 | -1 | undefined;
 
   /** Extra class names for the root element, applied in every state. */
   className?: string | undefined;
@@ -307,11 +318,20 @@ function toRows(diff: string): DiffRow[] {
 }
 
 /** The scroll region holding one row per diff line. */
-function DiffLines(props: { readonly diff: string; readonly name: string }): ReactElement {
+function DiffLines(props: {
+  readonly diff: string;
+  readonly name: string;
+  readonly tabIndex: 0 | -1;
+}): ReactElement {
   const rows = toRows(props.diff);
 
   return (
-    <div className="dgv-diff__scroll" role="group" aria-label={props.name} tabIndex={0}>
+    <div
+      className="dgv-diff__scroll"
+      role="group"
+      aria-label={props.name}
+      tabIndex={props.tabIndex}
+    >
       {rows.map((row, index) => (
         // Lines repeat and never reorder within one diff, so the position is
         // the stable identity; a different diff remounts the whole list.
@@ -346,7 +366,7 @@ function DiffLines(props: { readonly diff: string; readonly name: string }): Rea
  *   diff's lines.
  */
 export function DiffView(props: DiffViewProps): ReactElement {
-  const { diff, fileLabel, pending = false, error, className } = props;
+  const { diff, fileLabel, pending = false, error, scrollTabIndex = 0, className } = props;
   const label = hasText(fileLabel) ? fileLabel : undefined;
   const failed = hasText(error);
 
@@ -375,7 +395,13 @@ export function DiffView(props: DiffViewProps): ReactElement {
   } else if (diff.trim() === '') {
     body = <EmptyState message={EMPTY_MESSAGE} />;
   } else {
-    body = <DiffLines diff={diff} name={label === undefined ? REGION_NAME : `Diff of ${label}`} />;
+    body = (
+      <DiffLines
+        diff={diff}
+        name={label === undefined ? REGION_NAME : `Diff of ${label}`}
+        tabIndex={scrollTabIndex}
+      />
+    );
   }
 
   return (

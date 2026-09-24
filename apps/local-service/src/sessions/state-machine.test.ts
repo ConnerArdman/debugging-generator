@@ -9,12 +9,17 @@
  * combination of the evidence they read, and the two follow-up paths are walked
  * end to end.
  *
- * Fixtures are synthetic and generic: the analysis and panel are the smallest
- * artifacts the owning schemas accept, built through their real validators so
- * that "validated" means what the service means by it. Nothing here names a
- * symbol or route of any real project (AAP §0.5.4), reads a clock or touches
- * the filesystem; statuses, stages and codes are taken from the imported
- * vocabularies rather than restated wherever the test is not the oracle.
+ * The two headline guarantees of AAP §0.5.5 each have a test named after them:
+ * "generated requires a validated analysis and panel" and "failed can never
+ * reach generated".
+ *
+ * Fixtures are synthetic and generic. The module under test is pure — it reads
+ * no clock, performs no I/O and holds no state — so the suite needs no mock, no
+ * setup and no teardown, and it touches no filesystem, network, database,
+ * timer or random source. Nothing here names a symbol or route of any real
+ * project, and nothing branches on question text (AAP §0.5.4): statuses,
+ * stages and codes only, taken from the imported vocabularies rather than
+ * restated wherever the test is not the oracle.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -22,22 +27,12 @@ import { describe, expect, it } from 'vitest';
 import {
   PROGRESS_STAGES,
   SESSION_STATUSES,
-  createAnalysisResult,
-  parseAnalysisResult,
   type AnalysisResult,
   type PanelSpec,
   type ProgressStage,
   type SessionStatus,
 } from '@debuggen/protocol';
-import { PANEL_SPEC_VERSION, validatePanelSpec } from '@debuggen/panel-schema';
-import {
-  DEBUGGEN_ERROR_CODES,
-  DebuggenError,
-  newCaptureId,
-  newPanelId,
-  newSessionId,
-  type Result,
-} from '@debuggen/shared';
+import { DEBUGGEN_ERROR_CODES, DebuggenError, isErr, isOk, type Result } from '@debuggen/shared';
 
 import {
   SESSION_TRANSITIONS,
@@ -52,6 +47,11 @@ import {
   retryTargetFor,
   statusForStage,
   transition,
+  type EndedIsTerminalAndUniversallyReachable,
+  type EveryStageStatusIsARetryTarget,
+  type FailedNeverReachesGenerated,
+  type GeneratedOnlyFromAnalyzing,
+  type GuardedEdgesCoverGeneratedAndFailed,
   type SessionFailure,
   type SessionTransitionContext,
 } from './state-machine.js';
@@ -112,50 +112,38 @@ const EXPECTED_GUARDED_EDGES: readonly string[] = [
 // Fixtures
 // ---------------------------------------------------------------------------
 
-const SESSION_ID = newSessionId();
+// The artifacts below are deliberately minimal cast test doubles, not real
+// documents. The state machine asserts the *presence* of an already-validated
+// `AnalysisResult` and `PanelSpec` (guard A); validating their internals is the
+// job of the producers — `packages/protocol/src/analysis.ts` for the analysis,
+// `packages/panel-schema/src/{validate,semantic}.ts` for the panel — and a
+// second copy of those checks here would only be a place for the two to
+// disagree. A double is therefore exactly as good as a real artifact for this
+// suite, and it keeps the suite free of randomness and of any dependency the
+// module under test does not have.
 
-/** The smallest analysis the protocol accepts, validated by its own parser. */
-function validatedAnalysis(): AnalysisResult {
-  const parsed = parseAnalysisResult(
-    createAnalysisResult(
-      { observed: [], likelyCauses: [] },
-      {
-        sessionId: SESSION_ID,
-        captureId: newCaptureId(),
-        analysisVersion: 1,
-        createdAt: 1_700_000_000_000,
-        metrics: [],
-      },
-    ),
-  );
-  if (!parsed.ok) {
-    throw parsed.error;
-  }
-  return parsed.value;
+/** Stands in for a validated analysis: guard A only asks whether one exists. */
+function analysisDouble(): AnalysisResult {
+  return {} as AnalysisResult;
 }
 
-/** The smallest panel the panel schema accepts, optionally marked as a fallback. */
-function validatedPanel(fallback = false): PanelSpec {
-  const candidate = {
-    version: PANEL_SPEC_VERSION,
-    id: newPanelId(),
-    sessionId: SESSION_ID,
-    panelVersion: 1,
-    title: 'Interaction overview',
-    summary: { observed: [], likelyCauses: [] },
-    layout: [],
-    ...(fallback ? { meta: { fallback: true } } : {}),
-  };
-  const validated = validatePanelSpec(candidate);
-  if (!validated.ok) {
-    throw validated.error;
-  }
-  return validated.value;
+/** Stands in for a validated, ordinary (model-authored) panel. */
+function panelDouble(): PanelSpec {
+  return {} as PanelSpec;
 }
 
-const ANALYSIS = validatedAnalysis();
-const PANEL = validatedPanel();
-const FALLBACK_PANEL = validatedPanel(true);
+/**
+ * Stands in for the deterministic fallback panel of AAP §0.5.3: the one double
+ * whose content matters, because `meta.fallback === true` must still count as a
+ * validated panel.
+ */
+function fallbackPanelDouble(): PanelSpec {
+  return { meta: { fallback: true } } as PanelSpec;
+}
+
+const ANALYSIS = analysisDouble();
+const PANEL = panelDouble();
+const FALLBACK_PANEL = fallbackPanelDouble();
 
 /** A well-formed failure for guard C. */
 function failureAt(stage: ProgressStage): SessionFailure {
@@ -184,29 +172,60 @@ const ALL_PAIRS: readonly (readonly [SessionStatus, SessionStatus])[] = SESSION_
   (from) => SESSION_STATUSES.map((to) => [from, to] as const),
 );
 
-/** Narrows a result to its error, failing the test when it succeeded. */
+/** The edges the table itself lists, spelled `"from->to"`, read from the module under test. */
+const TABLE_EDGES: readonly string[] = SESSION_STATUSES.flatMap((from) =>
+  allowedTransitions(from).map((to) => edgeOf(from, to)),
+);
+
+/** The edges the guard registry covers, read from the module under test. */
+const GUARDED_EDGES: ReadonlySet<string> = new Set(Object.keys(SESSION_TRANSITION_GUARDS));
+
+/**
+ * Narrows a result to its error, failing the test when it succeeded, and
+ * asserts the refusal is a genuine `DebuggenError` carrying a code from the
+ * closed vocabulary — checked with `DebuggenError.is`, the supported guard,
+ * rather than `instanceof`.
+ */
 function expectRefusal(result: Result<SessionStatus, DebuggenError>): DebuggenError {
-  expect(result.ok).toBe(false);
-  if (result.ok) {
+  expect(isErr(result)).toBe(true);
+  if (isOk(result)) {
     throw new Error(`expected a refusal, got ok(${result.value})`);
   }
+  expect(DebuggenError.is(result.error)).toBe(true);
+  expect(DEBUGGEN_ERROR_CODES).toContain(result.error.code);
   return result.error;
 }
 
-/** Walks a path of statuses, asserting every step succeeds with its context. */
-function walk(
+/**
+ * Walks a path of statuses, asserting every step succeeds with its context and
+ * threading the returned status into the next call. Returns every status
+ * visited, starting with `start`.
+ */
+function walkPath(
   start: SessionStatus,
   steps: readonly (readonly [SessionStatus, SessionTransitionContext?])[],
-): SessionStatus {
+): readonly SessionStatus[] {
+  const visited: SessionStatus[] = [start];
   let current = start;
   for (const [to, context] of steps) {
     const result = transition(current, to, context);
-    expect(result).toEqual({ ok: true, value: to });
-    if (result.ok) {
-      current = result.value;
+    expect(isOk(result), `${edgeOf(current, to)} should be admitted`).toBe(true);
+    if (!isOk(result)) {
+      break;
     }
+    expect(result.value).toBe(to);
+    current = result.value;
+    visited.push(current);
   }
-  return current;
+  return visited;
+}
+
+/** {@link walkPath}, returning only the status the walk ends in. */
+function walk(
+  start: SessionStatus,
+  steps: readonly (readonly [SessionStatus, SessionTransitionContext?])[],
+): SessionStatus | undefined {
+  return walkPath(start, steps).at(-1);
 }
 
 // ---------------------------------------------------------------------------
@@ -214,9 +233,18 @@ function walk(
 // ---------------------------------------------------------------------------
 
 describe('SESSION_TRANSITIONS', () => {
-  it('is keyed by exactly the protocol status vocabulary', () => {
-    expect([...Object.keys(SESSION_TRANSITIONS)].sort()).toEqual([...SESSION_STATUSES].sort());
-    expect(Object.keys(SESSION_TRANSITIONS)).toHaveLength(SESSION_STATUSES.length);
+  it('is keyed by exactly the protocol status vocabulary — no extras, no omissions', () => {
+    const keys = Object.keys(SESSION_TRANSITIONS);
+    expect(keys).toHaveLength(SESSION_STATUSES.length);
+    // Every status has a row …
+    for (const status of SESSION_STATUSES) {
+      expect(keys, status).toContain(status);
+    }
+    // … and every row is a status.
+    for (const key of keys) {
+      expect(SESSION_STATUSES, key).toContain(key);
+    }
+    expect([...keys].sort()).toEqual([...SESSION_STATUSES].sort());
   });
 
   it('lists only statuses from the vocabulary as targets, without duplicates', () => {
@@ -243,10 +271,38 @@ describe('SESSION_TRANSITIONS', () => {
     }
   });
 
+  it('cannot be widened by mutating an edge list a caller was handed', () => {
+    for (const from of SESSION_STATUSES) {
+      const before = [...allowedTransitions(from)];
+      const handed = allowedTransitions(from) as SessionStatus[];
+      // ES modules run in strict mode, so writing to a frozen array throws.
+      expect(() => handed.push('generated')).toThrow(TypeError);
+      expect(allowedTransitions(from)).toEqual(before);
+      expect(SESSION_TRANSITIONS[from]).toEqual(before);
+    }
+  });
+
   it('never permits a status to transition to itself', () => {
     for (const status of SESSION_STATUSES) {
+      expect(SESSION_TRANSITIONS[status]).not.toContain(status);
       expect(allowedTransitions(status)).not.toContain(status);
     }
+  });
+
+  it('lets failed retry into exactly the stage-owning statuses, or end — never generated', () => {
+    expect(new Set(SESSION_TRANSITIONS.failed)).toEqual(
+      new Set<SessionStatus>([
+        'understanding',
+        'investigating',
+        'planning',
+        'instrumenting',
+        'ready',
+        'capturing',
+        'analyzing',
+        'ended',
+      ]),
+    );
+    expect(SESSION_TRANSITIONS.failed).toHaveLength(8);
   });
 });
 
@@ -254,6 +310,14 @@ describe('allowedTransitions', () => {
   it('returns the table row for every status', () => {
     for (const from of SESSION_STATUSES) {
       expect(allowedTransitions(from)).toEqual(SESSION_TRANSITIONS[from]);
+    }
+  });
+
+  it('is total over the vocabulary: always an array, never undefined', () => {
+    for (const from of SESSION_STATUSES) {
+      const allowed = allowedTransitions(from);
+      expect(allowed, from).toBeDefined();
+      expect(Array.isArray(allowed), from).toBe(true);
     }
   });
 
@@ -274,10 +338,23 @@ describe('terminal statuses', () => {
     expect(Object.isFrozen(TERMINAL_SESSION_STATUSES)).toBe(true);
   });
 
-  it('isTerminalSessionStatus agrees with the table for every status', () => {
+  it('isTerminalSessionStatus agrees with the table and the terminal list for every status', () => {
     for (const status of SESSION_STATUSES) {
-      expect(isTerminalSessionStatus(status)).toBe(allowedTransitions(status).length === 0);
+      expect(isTerminalSessionStatus(status), status).toBe(allowedTransitions(status).length === 0);
+      expect(isTerminalSessionStatus(status), status).toBe(
+        TERMINAL_SESSION_STATUSES.includes(status),
+      );
     }
+  });
+
+  it('ended is terminal: no edge out of it, not even ended → ended', () => {
+    expect(allowedTransitions('ended')).toEqual([]);
+    // The machine itself refuses a repeated end. What makes a second
+    // `POST /sessions/:id/end` safe is the session manager's idempotent
+    // short-circuit for an already-ended session, which runs before this module
+    // is consulted — not a self-edge here.
+    const error = expectRefusal(transition('ended', 'ended'));
+    expect(error.details).toMatchObject({ from: 'ended', to: 'ended', allowed: [] });
   });
 
   it('ended has no way out, even with a context that satisfies every guard', () => {
@@ -297,8 +374,10 @@ describe('terminal statuses', () => {
       if (from === 'ended') {
         continue;
       }
-      expect(transition(from, 'ended')).toEqual({ ok: true, value: 'ended' });
-      expect(canTransition(from, 'ended')).toBe(true);
+      const result = transition(from, 'ended');
+      expect(isOk(result), from).toBe(true);
+      expect(result).toEqual({ ok: true, value: 'ended' });
+      expect(canTransition(from, 'ended'), from).toBe(true);
     }
   });
 });
@@ -307,22 +386,98 @@ describe('terminal statuses', () => {
 // Every pair, and the shape of every refusal
 // ---------------------------------------------------------------------------
 
+/**
+ * Calls `transition` for one pair, asserting it neither throws nor returns
+ * anything but a well-formed `Result`: an `Ok` holding the requested status, or
+ * an `Err` holding a genuine `DebuggenError`. Returns the result.
+ */
+function transitionWithoutThrowing(
+  from: SessionStatus,
+  to: SessionStatus,
+  context?: SessionTransitionContext,
+): Result<SessionStatus, DebuggenError> {
+  expect(() => transition(from, to, context), edgeOf(from, to)).not.toThrow();
+  // The module is pure, so calling it a second time to keep the value is
+  // exactly equivalent to keeping the first call's result.
+  const result = transition(from, to, context);
+  expect(result, edgeOf(from, to)).toBeTypeOf('object');
+  expect(typeof result.ok, edgeOf(from, to)).toBe('boolean');
+  if (isOk(result)) {
+    expect(result.value, edgeOf(from, to)).toBe(to);
+  } else {
+    expect(DebuggenError.is(result.error), edgeOf(from, to)).toBe(true);
+  }
+  return result;
+}
+
+/** The pairs that `transition` admits under `context`, spelled `"from->to"`, sorted. */
+function admittedEdges(context?: SessionTransitionContext): string[] {
+  return ALL_PAIRS.filter(([from, to]) => isOk(transitionWithoutThrowing(from, to, context)))
+    .map(([from, to]) => edgeOf(from, to))
+    .sort();
+}
+
 describe('transition over every ordered pair', () => {
-  it('succeeds exactly on the specified edges when every guard is satisfied', () => {
-    for (const [from, to] of ALL_PAIRS) {
-      const result = transition(from, to, FULL_CONTEXT);
-      expect(result.ok, edgeOf(from, to)).toBe(EXPECTED_EDGES.includes(edgeOf(from, to)));
-      expect(canTransition(from, to, FULL_CONTEXT)).toBe(result.ok);
+  it('never throws, and with every guard satisfied admits exactly the table edges — no silent no-op', () => {
+    const admitted = admittedEdges(FULL_CONTEXT);
+    expect(admitted).toEqual([...TABLE_EDGES].sort());
+    expect(admitted).toEqual([...EXPECTED_EDGES].sort());
+  });
+
+  it('never throws, and with no evidence admits exactly the unguarded table edges', () => {
+    const unguarded = TABLE_EDGES.filter((edge) => !GUARDED_EDGES.has(edge)).sort();
+    expect(admittedEdges()).toEqual(unguarded);
+    expect(admittedEdges({})).toEqual(unguarded);
+  });
+
+  it('canTransition agrees with transition for every pair and every kind of context', () => {
+    const contexts: readonly (SessionTransitionContext | undefined)[] = [
+      undefined,
+      {},
+      FULL_CONTEXT,
+      { analysis: ANALYSIS },
+      { panel: FALLBACK_PANEL },
+      { analysis: ANALYSIS, panel: FALLBACK_PANEL },
+      { readinessSatisfied: false },
+      { readinessSatisfied: true },
+      { failure: failureAt('instrument') },
+    ];
+    for (const context of contexts) {
+      for (const [from, to] of ALL_PAIRS) {
+        expect(canTransition(from, to, context), edgeOf(from, to)).toBe(
+          isOk(transition(from, to, context)),
+        );
+      }
     }
   });
 
-  it('refuses every illegal pair with a typed, coded, fully described error and never throws', () => {
+  it('refuses structurally different illegal edges with a typed, coded, described error', () => {
+    const illegal: readonly (readonly [SessionStatus, SessionStatus, string])[] = [
+      ['created', 'capturing', 'a skip forward past the pipeline'],
+      ['generated', 'understanding', 'a backward jump'],
+      ['ended', 'created', 'an edge out of a terminal status'],
+      ['failed', 'generated', 'a failure promoted straight to success'],
+    ];
+    for (const [from, to, label] of illegal) {
+      const error = expectRefusal(transition(from, to, FULL_CONTEXT));
+      expect(DebuggenError.is(error), label).toBe(true);
+      expect(DEBUGGEN_ERROR_CODES, label).toContain(error.code);
+      expect(error.code, label).toBe(SESSION_TRANSITION_ERROR_CODE);
+      expect(error.details, label).toMatchObject({
+        from,
+        to,
+        allowed: [...allowedTransitions(from)],
+      });
+    }
+  });
+
+  it('refuses every illegal pair with a typed, coded, fully described error', () => {
     for (const [from, to] of ALL_PAIRS) {
       if (EXPECTED_EDGES.includes(edgeOf(from, to))) {
         continue;
       }
       const error = expectRefusal(transition(from, to, FULL_CONTEXT));
-      expect(error).toBeInstanceOf(DebuggenError);
+      expect(DebuggenError.is(error)).toBe(true);
       expect(DEBUGGEN_ERROR_CODES).toContain(error.code);
       expect(error.code).toBe(SESSION_TRANSITION_ERROR_CODE);
       expect(error.message).toContain(`"${from}"`);
@@ -342,18 +497,28 @@ describe('transition over every ordered pair', () => {
     expect(SESSION_TRANSITION_ERROR_CODE).toBe('SESSION_INVALID_STATE');
   });
 
-  it('never mutates the context it is given', () => {
-    const context: SessionTransitionContext = {
-      analysis: ANALYSIS,
-      panel: PANEL,
-      readinessSatisfied: false,
-      failure: failureAt('plan'),
-    };
-    const snapshot = structuredClone(context);
-    for (const [from, to] of ALL_PAIRS) {
-      transition(from, to, context);
+  it('never mutates the context it is given, whether it admits or refuses', () => {
+    const contexts: readonly SessionTransitionContext[] = [
+      {
+        analysis: ANALYSIS,
+        panel: FALLBACK_PANEL,
+        readinessSatisfied: false,
+        failure: failureAt('plan'),
+      },
+      { analysis: ANALYSIS, panel: PANEL, readinessSatisfied: true, failure: failureAt('cleanup') },
+      { panel: PANEL },
+      {},
+    ];
+    for (const context of contexts) {
+      const snapshot = structuredClone(context);
+      const keys = Object.keys(context);
+      for (const [from, to] of ALL_PAIRS) {
+        transition(from, to, context);
+        canTransition(from, to, context);
+      }
+      expect(context).toEqual(snapshot);
+      expect(Object.keys(context)).toEqual(keys);
     }
-    expect(context).toEqual(snapshot);
   });
 
   it('refuses values outside the vocabulary without throwing or echoing them', () => {
@@ -376,7 +541,7 @@ describe('transition over every ordered pair', () => {
     for (const [from, to] of ALL_PAIRS) {
       for (const context of contexts) {
         const result = transition(from, to, context);
-        if (!result.ok) {
+        if (isErr(result)) {
           expect(SESSION_TRANSITION_REFUSAL_REASONS).toContain(result.error.details?.['reason']);
         }
       }
@@ -398,6 +563,15 @@ describe('SESSION_TRANSITION_GUARDS', () => {
   it('guards only edges the table has', () => {
     for (const edge of Object.keys(SESSION_TRANSITION_GUARDS)) {
       expect(EXPECTED_EDGES).toContain(edge);
+      expect(TABLE_EDGES).toContain(edge);
+    }
+  });
+
+  it('guards every edge into generated and every edge into failed', () => {
+    for (const edge of TABLE_EDGES) {
+      if (edge.endsWith('->generated') || edge.endsWith('->failed')) {
+        expect(GUARDED_EDGES.has(edge), edge).toBe(true);
+      }
     }
   });
 
@@ -420,33 +594,51 @@ describe('SESSION_TRANSITION_GUARDS', () => {
 // Guard A — generated
 // ---------------------------------------------------------------------------
 
-describe('guard A: analyzing → generated', () => {
-  it('admits the transition only when both validated artifacts are present', () => {
-    const cases: readonly [SessionTransitionContext, readonly string[] | null][] = [
-      [{}, ['analysis', 'panel']],
+describe('guard A: generated requires a validated analysis and panel (AAP §0.5.5)', () => {
+  it('generated requires a validated analysis and panel: the full truth table from analyzing', () => {
+    const artifacts = ['analysis', 'panel'] as const;
+    const cases: readonly [SessionTransitionContext, readonly (typeof artifacts)[number][]][] = [
+      [{ analysis: ANALYSIS, panel: PANEL }, []],
       [{ analysis: ANALYSIS }, ['panel']],
       [{ panel: PANEL }, ['analysis']],
-      [{ analysis: ANALYSIS, panel: PANEL }, null],
+      [{}, ['analysis', 'panel']],
     ];
     for (const [context, missing] of cases) {
+      const label = missing.length === 0 ? 'both present' : `missing ${missing.join(' and ')}`;
       const result = transition('analyzing', 'generated', context);
-      if (missing === null) {
+      if (missing.length === 0) {
+        expect(isOk(result), label).toBe(true);
         expect(result).toEqual({ ok: true, value: 'generated' });
         continue;
       }
+      expect(isErr(result), label).toBe(true);
       const error = expectRefusal(result);
-      expect(error.code).toBe(SESSION_TRANSITION_ERROR_CODE);
-      expect(error.details).toMatchObject({
+      expect(error.code, label).toBe(SESSION_TRANSITION_ERROR_CODE);
+      expect(error.details, label).toMatchObject({
         from: 'analyzing',
         to: 'generated',
         allowed: [...allowedTransitions('analyzing')],
         reason: 'artifacts-missing',
         missing,
       });
-      for (const artifact of missing) {
-        expect(error.message).toContain(`validated ${artifact}`);
+      // The message names exactly what is missing, and nothing that is present.
+      for (const artifact of artifacts) {
+        if (missing.includes(artifact)) {
+          expect(error.message, label).toContain(`validated ${artifact}`);
+        } else {
+          expect(error.message, label).not.toContain(`validated ${artifact}`);
+        }
       }
     }
+  });
+
+  it('generated is refused when no context is supplied at all — absence is never satisfaction', () => {
+    expect(canTransition('analyzing', 'generated')).toBe(false);
+    const error = expectRefusal(transition('analyzing', 'generated'));
+    expect(error.details).toMatchObject({
+      reason: 'artifacts-missing',
+      missing: ['analysis', 'panel'],
+    });
   });
 
   it('treats explicitly undefined or null artifacts as missing', () => {
@@ -460,32 +652,55 @@ describe('guard A: analyzing → generated', () => {
 
   it('accepts a validated fallback panel as a legitimate success (AAP §0.5.3)', () => {
     expect(FALLBACK_PANEL.meta?.fallback).toBe(true);
-    expect(
-      transition('analyzing', 'generated', { analysis: ANALYSIS, panel: FALLBACK_PANEL }),
-    ).toEqual({ ok: true, value: 'generated' });
+    const result = transition('analyzing', 'generated', {
+      analysis: ANALYSIS,
+      panel: FALLBACK_PANEL,
+    });
+    expect(isOk(result)).toBe(true);
+    expect(result).toEqual({ ok: true, value: 'generated' });
   });
 
-  it('is reachable from analyzing and from no other status, whatever the evidence', () => {
+  it('generated is reachable from analyzing and from no other status, even with both artifacts', () => {
     for (const from of SESSION_STATUSES) {
-      const result = transition(from, 'generated', FULL_CONTEXT);
-      expect(result.ok, from).toBe(from === 'analyzing');
-      if (!result.ok) {
-        expect(result.error.details).toMatchObject({ reason: 'not-permitted' });
+      if (from === 'analyzing') {
+        continue;
       }
+      for (const panel of [PANEL, FALLBACK_PANEL]) {
+        expect(canTransition(from, 'generated', { analysis: ANALYSIS, panel }), from).toBe(false);
+      }
+      const error = expectRefusal(transition(from, 'generated', FULL_CONTEXT));
+      expect(error.details, from).toMatchObject({ reason: 'not-permitted' });
     }
+    expect(canTransition('analyzing', 'generated', { analysis: ANALYSIS, panel: PANEL })).toBe(
+      true,
+    );
   });
+});
 
-  it('has no failed → generated edge: a failure is never dressed up as success (AAP §0.5.5)', () => {
+describe('failed can never reach generated (AAP §0.5.5)', () => {
+  it('failed can never reach generated: no edge, no guard, and a refusal even with both artifacts', () => {
+    expect(SESSION_TRANSITIONS.failed).not.toContain('generated');
     expect(allowedTransitions('failed')).not.toContain('generated');
     expect(Object.keys(SESSION_TRANSITION_GUARDS)).not.toContain('failed->generated');
-    const error = expectRefusal(
-      transition('failed', 'generated', { analysis: ANALYSIS, panel: FALLBACK_PANEL }),
+    for (const panel of [PANEL, FALLBACK_PANEL]) {
+      expect(canTransition('failed', 'generated', { analysis: ANALYSIS, panel })).toBe(false);
+      const error = expectRefusal(transition('failed', 'generated', { analysis: ANALYSIS, panel }));
+      expect(error.details).toMatchObject({
+        from: 'failed',
+        to: 'generated',
+        allowed: [...allowedTransitions('failed')],
+        reason: 'not-permitted',
+      });
+    }
+    expect(canTransition('failed', 'generated', FULL_CONTEXT)).toBe(false);
+  });
+
+  it('a failed session reaches generated only by re-entering analyzing and passing guard A again', () => {
+    expect(isOk(transition('failed', 'analyzing'))).toBe(true);
+    expect(isErr(transition('analyzing', 'generated', { analysis: ANALYSIS }))).toBe(true);
+    expect(isOk(transition('analyzing', 'generated', { analysis: ANALYSIS, panel: PANEL }))).toBe(
+      true,
     );
-    expect(error.details).toMatchObject({
-      from: 'failed',
-      to: 'generated',
-      reason: 'not-permitted',
-    });
   });
 });
 
@@ -493,20 +708,28 @@ describe('guard A: analyzing → generated', () => {
 // Guard B — readiness
 // ---------------------------------------------------------------------------
 
-describe('guard B: instrumenting → ready', () => {
+describe('guard B: "Ready to capture" requires confirmed readiness', () => {
   it('requires the readiness verdict to be exactly true', () => {
-    for (const context of [{}, { readinessSatisfied: false }, { readinessSatisfied: undefined }]) {
-      const error = expectRefusal(transition('instrumenting', 'ready', context));
+    const refusedContexts: readonly (SessionTransitionContext | undefined)[] = [
+      undefined,
+      {},
+      { readinessSatisfied: false },
+      { readinessSatisfied: undefined },
+    ];
+    for (const context of refusedContexts) {
+      const result = transition('instrumenting', 'ready', context);
+      expect(isErr(result)).toBe(true);
+      const error = expectRefusal(result);
       expect(error.details).toMatchObject({
         from: 'instrumenting',
         to: 'ready',
         reason: 'readiness-unsatisfied',
       });
+      expect(canTransition('instrumenting', 'ready', context)).toBe(false);
     }
-    expect(transition('instrumenting', 'ready', { readinessSatisfied: true })).toEqual({
-      ok: true,
-      value: 'ready',
-    });
+    const admitted = transition('instrumenting', 'ready', { readinessSatisfied: true });
+    expect(isOk(admitted)).toBe(true);
+    expect(admitted).toEqual({ ok: true, value: 'ready' });
   });
 
   it('does not guard the empty-capture edge capturing → ready (AAP §0.5.5)', () => {
@@ -515,6 +738,12 @@ describe('guard B: instrumenting → ready', () => {
       ok: true,
       value: 'ready',
     });
+  });
+
+  it('an empty capture returns to ready without ever entering analyzing (AAP §0.5.5)', () => {
+    const visited = walkPath('ready', [['capturing'], ['ready']]);
+    expect(visited).toEqual(['ready', 'capturing', 'ready']);
+    expect(visited).not.toContain('analyzing');
   });
 
   it('lets a re-armed session capture again after an empty capture', () => {
@@ -527,30 +756,50 @@ describe('guard B: instrumenting → ready', () => {
 // Guard C — failed
 // ---------------------------------------------------------------------------
 
-describe('guard C: * → failed', () => {
+describe('guard C: failed is a distinct status that always names the failing stage', () => {
   const sources = SESSION_STATUSES.filter((from) => allowedTransitions(from).includes('failed'));
 
-  it('applies to every status that can fail — every status except ended and failed', () => {
-    expect([...sources].sort()).toEqual(
-      SESSION_STATUSES.filter((status) => status !== 'ended' && status !== 'failed').sort(),
-    );
+  // Every non-terminal status may fail, except `failed` itself: the table has
+  // no self-edges, so an already-failed session stays failed rather than
+  // "failing again".
+  const nonTerminalSources = SESSION_STATUSES.filter(
+    (status) => !isTerminalSessionStatus(status) && status !== 'failed',
+  );
+
+  it('applies to every non-terminal status other than failed itself', () => {
+    expect([...sources].sort()).toEqual([...nonTerminalSources].sort());
+    expect(sources).not.toContain('ended');
+    expect(sources).not.toContain('failed');
   });
 
-  it('refuses a transition that names no failure', () => {
-    for (const from of sources) {
-      const error = expectRefusal(transition(from, 'failed', {}));
-      expect(error.details).toMatchObject({ from, to: 'failed', reason: 'failure-missing' });
+  it('refuses a transition into failed that does not name the failing stage', () => {
+    for (const from of nonTerminalSources) {
+      for (const context of [undefined, {}] as const) {
+        const result = transition(from, 'failed', context);
+        expect(isErr(result), from).toBe(true);
+        const error = expectRefusal(result);
+        expect(error.details).toMatchObject({ from, to: 'failed', reason: 'failure-missing' });
+        expect(canTransition(from, 'failed', context), from).toBe(false);
+      }
     }
   });
 
-  it('admits a failure at every known stage', () => {
-    for (const from of sources) {
+  it('admits a failure at every known stage from every non-terminal status', () => {
+    for (const from of nonTerminalSources) {
       for (const stage of PROGRESS_STAGES) {
-        expect(transition(from, 'failed', { failure: failureAt(stage) })).toEqual({
-          ok: true,
-          value: 'failed',
-        });
+        const result = transition(from, 'failed', { failure: failureAt(stage) });
+        expect(isOk(result), `${from} at ${stage}`).toBe(true);
+        expect(result).toEqual({ ok: true, value: 'failed' });
       }
+    }
+  });
+
+  it('never lets artifacts or readiness stand in for a named failure', () => {
+    for (const from of nonTerminalSources) {
+      const error = expectRefusal(
+        transition(from, 'failed', { analysis: ANALYSIS, panel: PANEL, readinessSatisfied: true }),
+      );
+      expect(error.details).toMatchObject({ reason: 'failure-missing' });
     }
   });
 
@@ -587,8 +836,8 @@ describe('guard C: * → failed', () => {
 // ---------------------------------------------------------------------------
 
 describe('paths', () => {
-  it('walks the first pass from created to generated', () => {
-    const end = walk('created', [
+  it('walks the first pass from created to generated, one admitted step at a time', () => {
+    const visited = walkPath('created', [
       ['understanding'],
       ['investigating'],
       ['planning'],
@@ -598,33 +847,54 @@ describe('paths', () => {
       ['analyzing'],
       ['generated', { analysis: ANALYSIS, panel: PANEL }],
     ]);
-    expect(end).toBe('generated');
+    expect(visited).toEqual([
+      'created',
+      'understanding',
+      'investigating',
+      'planning',
+      'instrumenting',
+      'ready',
+      'capturing',
+      'analyzing',
+      'generated',
+    ]);
   });
 
   it('walks the follow-up existing-evidence path: generated → analyzing → generated', () => {
-    const next = validatedAnalysis();
+    // Fresh artifacts: the regenerated analysis and panel versions n+1.
+    const nextAnalysis = analysisDouble();
+    const nextPanel = panelDouble();
     const end = walk('generated', [
       ['analyzing'],
-      ['generated', { analysis: next, panel: validatedPanel() }],
+      ['generated', { analysis: nextAnalysis, panel: nextPanel }],
     ]);
     expect(end).toBe('generated');
+    // The follow-up returns to generated only through the same guarded edge.
     expect(
-      expectRefusal(transition('analyzing', 'generated', { analysis: next })).details,
+      expectRefusal(transition('analyzing', 'generated', { analysis: nextAnalysis })).details,
     ).toMatchObject({
       missing: ['panel'],
     });
   });
 
   it('walks the follow-up new-capture path: generated → planning → … → generated', () => {
-    const end = walk('generated', [
+    const visited = walkPath('generated', [
       ['planning'],
       ['instrumenting'],
       ['ready', { readinessSatisfied: true }],
       ['capturing'],
       ['analyzing'],
-      ['generated', { analysis: validatedAnalysis(), panel: validatedPanel() }],
+      ['generated', { analysis: analysisDouble(), panel: panelDouble() }],
     ]);
-    expect(end).toBe('generated');
+    expect(visited).toEqual([
+      'generated',
+      'planning',
+      'instrumenting',
+      'ready',
+      'capturing',
+      'analyzing',
+      'generated',
+    ]);
   });
 
   it('does not let a follow-up skip straight from generated to capturing or ready', () => {
@@ -656,8 +926,11 @@ describe('paths', () => {
 // ---------------------------------------------------------------------------
 
 describe('statusForStage', () => {
-  it('maps all nine stages explicitly', () => {
+  it('maps every progress stage explicitly to the status it runs under', () => {
     expect(Object.keys(STAGE_STATUS).sort()).toEqual([...PROGRESS_STAGES].sort());
+    for (const stage of PROGRESS_STAGES) {
+      expect(Object.hasOwn(STAGE_STATUS, stage), stage).toBe(true);
+    }
     const expected: Readonly<Record<ProgressStage, SessionStatus | undefined>> = {
       understand: 'understanding',
       investigate: 'investigating',
@@ -699,5 +972,26 @@ describe('statusForStage', () => {
 
   it('is frozen', () => {
     expect(Object.isFrozen(STAGE_STATUS)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The compile-time half
+// ---------------------------------------------------------------------------
+
+describe('compile-time guarantees', () => {
+  it('are exported as types that only `true` inhabits, so pnpm typecheck proves them too', () => {
+    // Each alias is `true` when its guarantee holds and a compile error in the
+    // module under test when it does not; binding them here also makes this
+    // suite stop compiling if one is removed. The runtime assertions above
+    // remain the primary guard, because Vitest strips types without checking.
+    const proofs: readonly [
+      FailedNeverReachesGenerated,
+      GeneratedOnlyFromAnalyzing,
+      EndedIsTerminalAndUniversallyReachable,
+      GuardedEdgesCoverGeneratedAndFailed,
+      EveryStageStatusIsARetryTarget,
+    ] = [true, true, true, true, true];
+    expect(proofs.every((proof) => proof)).toBe(true);
   });
 });
