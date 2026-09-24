@@ -886,9 +886,12 @@ export const PANEL_NODE_CATALOG: Readonly<Record<PanelNodeType, PanelNodeCatalog
  * Derived from that tuple rather than from `Object.keys`, and that is the whole
  * reason it exists: property enumeration order is an implementation detail of
  * how the record above happened to be written, while the vocabulary's order is
- * a declared contract. Every consumer that iterates the catalog — the prompt
- * renderer below, the renderer's registry and its coverage test — iterates this
- * list, so all of them meet the entries in the same order, run after run.
+ * a declared contract. The prompt renderer below ({@link describeCatalogForPrompt})
+ * iterates this list, and the package exports it for any other consumer that
+ * needs the entries in order, so each meets them in the same order, run after
+ * run. The renderer's component registry does not need it: that registry is a
+ * literal record checked against the catalog's key type, and its coverage test
+ * iterates `PANEL_NODE_TYPES` and the catalog's keys directly.
  *
  * Built once at module load and frozen; the entries are the very objects the
  * record holds, not copies.

@@ -35,21 +35,28 @@
  * - **Vocabulary** — the frozen code tuple and its predicate.
  * - **Adapter claim** — check 1, that it is skipped when no resolver is
  *   supplied, and that the resolver is asked exactly one question per action.
- * - **Runtime mode** — checks 2 to 5 are skipped for an action that writes
- *   nothing.
- * - **Containment** — check 2, for a traversal, an absolute path and a
+ * - **Runtime mode** — checks 3 to 5 apply to a runtime action's target too,
+ *   so a hallucinated subject is refused; only check 6 is patch-only.
+ * - **Targetless actions** — check 2: the marker is accepted for a runtime
+ *   signal without a single graph lookup, and refused for a patch or a type
+ *   that wraps one declaration.
+ * - **Containment** — check 3, for a traversal, an absolute path and a
  *   backslash path.
- * - **The index** — check 3, for a file the graph has never seen.
- * - **The symbol** — check 4, including the qualified spelling the patcher
- *   accepts and the bounded near-miss hint.
- * - **The declaration's shape** — check 5: every supported shape in the
+ * - **The index** — check 4, for a file the graph has never seen.
+ * - **The symbol** — check 5, including the qualified spelling the patcher
+ *   accepts, its owner corroborated from the graph, and the bounded near-miss
+ *   hint.
+ * - **The declaration's shape** — check 6: every supported shape in the
  *   fixture accepted, both generators refused with their own codes, and every
  *   unwrappable form refused as `unsupported-declaration`.
  * - **The route handler** — the fixture's exported request-handler method,
  *   accepted as a server span and as a function timing, and refused for a
  *   method the module does not export.
- * - **No syntax tree** — check 5's honest answer when no project is loaded.
- * - **Duplicates** — check 6, for an identical action and for two patches on
+ * - **No syntax tree** — check 6's honest answer when no project is loaded.
+ * - **Shared target resolution** — over a temporary corpus of nested,
+ *   duplicated, object-literal and static-block declarations: the gate's
+ *   verdict on every spelling equals the function-timing patcher's.
+ * - **Duplicates** — check 7, for an identical action and for two patches on
  *   one declaration, and its absence for two runtime signals on one component.
  * - **Determinism and bounds** — ordering, repeatability, serialisability, one
  *   log line, and the truncation every reported value goes through.
@@ -58,9 +65,17 @@
  * - **Invariants** — the only conditions this module throws for.
  */
 
-import { readdirSync, statSync } from 'node:fs';
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
@@ -74,7 +89,7 @@ import {
 import type { CodeQueries, LoadedProject, ProjectSummary, RouteMap } from '@debuggen/code-analysis';
 import { DebuggenError, isErr, ok, toPosix } from '@debuggen/shared';
 import type { LogFields, Logger, Result } from '@debuggen/shared';
-import { beforeAll, describe, expect, it, vi } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import type { InstrumentationContext } from './adapter.js';
 import {
@@ -85,9 +100,12 @@ import {
 } from './feasibility.js';
 import type { InfeasibleAction } from './feasibility.js';
 import { createBackupStore } from './patch/backup-store.js';
+import { FunctionTimingPatcher } from './patch/function-timing.js';
 import type { ModificationJournal, ModificationRecord } from './schema/modification.js';
 import {
   INSTRUMENTATION_PLAN_VERSION,
+  TARGETLESS_FILE,
+  TARGETLESS_SYMBOL,
   instrumentationActionSchema,
   parseInstrumentationPlan,
 } from './schema/plan.js';
@@ -452,9 +470,11 @@ describe('the rejection vocabulary', () => {
     expect(Object.isFrozen(FEASIBILITY_REJECTION_CODES)).toBe(true);
     expect([...FEASIBILITY_REJECTION_CODES]).toEqual([
       'no-adapter',
+      'target-required',
       'path-outside-project',
       'file-not-indexed',
       'symbol-not-found',
+      'ambiguous-symbol',
       'unsupported-generator',
       'unsupported-async-generator',
       'unsupported-declaration',
@@ -566,26 +586,61 @@ describe('the adapter claim', () => {
 });
 
 /* -------------------------------------------------------------------------------------------------
- * Runtime mode — the project-side checks do not apply
+ * Runtime mode — a target is a target, whatever installs it
  * ---------------------------------------------------------------------------------------------- */
 
 describe('a runtime-mode action', () => {
-  it('is accepted although its file and symbol are absent from the project', () => {
-    const built = action({
+  it('is refused when its file is absent from the project, rather than validated', () => {
+    const refusal = refusalFor({
       file: 'src/components/NoSuchWidget.tsx',
       symbol: 'NoSuchWidget',
       type: 'react-render-tracking',
       mode: 'runtime',
     });
-    const report = checkFeasibility([built], makeContext(), {
-      resolver: claimsEverything('runtime'),
-    });
 
-    expect(report.rejected).toEqual([]);
-    expect(report.feasible).toEqual([built]);
+    expect(refusal.code).toBe('file-not-indexed');
+    expect(refusal.reason).toContain('src/components/NoSuchWidget.tsx');
+    expectReadableRefusal(refusal);
   });
 
-  it('is accepted with no syntax tree loaded, because it needs none', () => {
+  it('is refused when the file exists but declares no such symbol', () => {
+    const refusal = refusalFor({
+      file: FILES.form,
+      symbol: 'zzzInventedComponent',
+      type: 'state-tracking',
+      mode: 'runtime',
+    });
+
+    expect(refusal.code).toBe('symbol-not-found');
+    expect(refusal.reason).toContain('zzzInventedComponent');
+    expectReadableRefusal(refusal);
+  });
+
+  it('offers the targetless marker when no near miss exists, instead of an invented subject', () => {
+    const refusal = refusalFor({
+      file: FILES.form,
+      symbol: 'qqqzzzNothingLikeThisAnywhere',
+      type: 'fetch-tracking',
+      mode: 'runtime',
+    });
+
+    expect(refusal.code).toBe('symbol-not-found');
+    expect(refusal.hint).toContain('targetless marker');
+    expect(refusal.hint).toContain(`'${TARGETLESS_FILE}', '${TARGETLESS_SYMBOL}'`);
+  });
+
+  it('is refused when its path leaves the project', () => {
+    expect(
+      refusalFor({
+        file: '../outside/Widget.tsx',
+        symbol: 'Widget',
+        type: 'react-render-tracking',
+        mode: 'runtime',
+      }).code,
+    ).toBe('path-outside-project');
+  });
+
+  it('is accepted with no syntax tree loaded, because only a patch needs one', () => {
     const report = checkFeasibility(
       [
         action({
@@ -602,10 +657,233 @@ describe('a runtime-mode action', () => {
     expect(report.rejected).toEqual([]);
     expect(report.feasible).toHaveLength(1);
   });
+
+  it('is accepted for a real declaration whose shape no patch could wrap, since it edits nothing', () => {
+    // A class is refused as a patch target (see "an unwrappable declaration"),
+    // but as the subject of a runtime signal it only has to exist.
+    const report = checkFeasibility(
+      [
+        action({
+          file: FILES.controller,
+          symbol: 'KilnController',
+          type: 'state-tracking',
+          mode: 'runtime',
+        }),
+        action({
+          file: FILES.generators,
+          symbol: 'walkRampSegments',
+          type: 'interaction-tracking',
+          mode: 'runtime',
+        }),
+      ],
+      makeContext(),
+      { resolver: claimsEverything('runtime') },
+    );
+
+    expect(report.rejected).toEqual([]);
+    expect(report.feasible).toHaveLength(2);
+  });
+
+  it('accepts the qualified spelling a patch would accept', () => {
+    expectFeasible({
+      file: FILES.controller,
+      symbol: 'KilnController.normalizeRampRate',
+      type: 'state-tracking',
+      mode: 'runtime',
+    });
+  });
+
+  it('refuses an invented qualifier on a real member name, with no syntax tree needed', () => {
+    // The bare name `normalizeRampRate` is real; `GlazeSheet` is not its owner,
+    // and a runtime action's shape is never checked, so the qualifier is the
+    // part of the subject that has to be corroborated from the graph.
+    for (const symbol of [
+      'GlazeSheet.normalizeRampRate',
+      'GlazeSheet#normalizeRampRate',
+      'GlazeSheet.prototype.normalizeRampRate',
+    ]) {
+      const refusal = refusalFor(
+        { file: FILES.controller, symbol, type: 'state-tracking', mode: 'runtime' },
+        { loaded: undefined },
+      );
+
+      expect(refusal.code).toBe('symbol-not-found');
+      expect(refusal.hint).toContain('KilnController');
+      expectReadableRefusal(refusal);
+    }
+  });
+
+  it('accepts every real qualifier of a member without a syntax tree', () => {
+    for (const symbol of [
+      'KilnController.normalizeRampRate',
+      'KilnController#normalizeRampRate',
+      'KilnController.prototype.normalizeRampRate',
+    ]) {
+      const built = action({
+        file: FILES.controller,
+        symbol,
+        type: 'state-tracking',
+        mode: 'runtime',
+      });
+      const report = checkFeasibility([built], makeContext({ loaded: undefined }), {
+        resolver: claimsEverything('runtime'),
+      });
+
+      expect(report.rejected).toEqual([]);
+      expect(report.feasible).toEqual([built]);
+    }
+  });
+
+  it('refuses a qualifier on a module-scope name, which has no owner', () => {
+    const refusal = refusalFor(
+      {
+        file: FILES.planner,
+        symbol: 'Invented.planCycleSegments',
+        type: 'perf-tracking',
+        mode: 'runtime',
+      },
+      { loaded: undefined },
+    );
+
+    expect(refusal.code).toBe('symbol-not-found');
+    expect(refusal.hint).toContain("bare name 'planCycleSegments'");
+  });
 });
 
 /* -------------------------------------------------------------------------------------------------
- * Check 2 — containment
+ * Check 2 — targetless actions
+ * ---------------------------------------------------------------------------------------------- */
+
+describe('a targetless action', () => {
+  /**
+   * A context whose graph and queries fail loudly if they are consulted, so a
+   * case can prove the marker is accepted without a single lookup.
+   */
+  function contextThatMayNotBeQueried(): InstrumentationContext {
+    const forbidden = (): never => {
+      throw new Error('a targetless action consulted the code graph');
+    };
+
+    return makeContext({
+      graph: { nodesByFile: forbidden, files: [] } as unknown as CodeGraph,
+      queries: { hasSymbol: forbidden, findByName: forbidden } as unknown as CodeQueries,
+      loaded: undefined,
+    });
+  }
+
+  it.each([
+    'react-render-tracking',
+    'fetch-tracking',
+    'db-query-tracking',
+    'state-tracking',
+    'interaction-tracking',
+    'perf-tracking',
+  ] as const)('is accepted as a runtime %s action without consulting the graph', (type) => {
+    const built = action({
+      file: TARGETLESS_FILE,
+      symbol: TARGETLESS_SYMBOL,
+      type,
+      mode: 'runtime',
+    });
+    const report = checkFeasibility([built], contextThatMayNotBeQueried(), {
+      resolver: claimsEverything('runtime'),
+    });
+
+    expect(report.rejected).toEqual([]);
+    expect(report.feasible).toEqual([built]);
+    expect(instrumentationActionSchema.safeParse(built).success).toBe(true);
+  });
+
+  it.each([
+    ['a patch-mode render action', 'react-render-tracking', 'patch'],
+    ['a runtime function-timing action', 'function-timing', 'runtime'],
+    ['a runtime server-span action', 'server-span', 'runtime'],
+    ['a patch-mode function-timing action', 'function-timing', 'patch'],
+  ] as const)('is refused as %s, which has no declaration to act on', (_label, type, mode) => {
+    const report = checkFeasibility(
+      [action({ file: TARGETLESS_FILE, symbol: TARGETLESS_SYMBOL, type, mode })],
+      contextThatMayNotBeQueried(),
+      { resolver: claimsEverything(mode) },
+    );
+    const [refusal] = report.rejected;
+
+    expect(report.feasible).toEqual([]);
+    expect(refusal?.code).toBe('target-required');
+    expect(refusal?.reason).toContain(type);
+
+    if (refusal !== undefined) {
+      expectReadableRefusal(refusal);
+    }
+  });
+
+  it('is still refused for a type no adapter claims, before the marker is considered', () => {
+    const report = checkFeasibility(
+      [
+        action({
+          file: TARGETLESS_FILE,
+          symbol: TARGETLESS_SYMBOL,
+          type: 'perf-tracking',
+          mode: 'runtime',
+        }),
+      ],
+      contextThatMayNotBeQueried(),
+      { resolver: claimsNothing() },
+    );
+
+    expect(report.rejected.map((refusal) => refusal.code)).toEqual(['no-adapter']);
+  });
+
+  it('refuses half of the marker as the missing target it is', () => {
+    const report = checkFeasibility(
+      [
+        action({
+          file: TARGETLESS_FILE,
+          symbol: 'Widget',
+          type: 'state-tracking',
+          mode: 'runtime',
+        }),
+        action({
+          file: FILES.form,
+          symbol: TARGETLESS_SYMBOL,
+          type: 'state-tracking',
+          mode: 'runtime',
+        }),
+      ],
+      makeContext(),
+      { resolver: claimsEverything('runtime') },
+    );
+
+    expect(report.feasible).toEqual([]);
+    expect(report.rejected.map((refusal) => refusal.code)).toEqual([
+      'file-not-indexed',
+      'symbol-not-found',
+    ]);
+  });
+
+  it('counts two identical targetless actions as one request', () => {
+    const first = action({
+      file: TARGETLESS_FILE,
+      symbol: TARGETLESS_SYMBOL,
+      type: 'react-render-tracking',
+      mode: 'runtime',
+    });
+    const second = action({
+      file: TARGETLESS_FILE,
+      symbol: TARGETLESS_SYMBOL,
+      type: 'react-render-tracking',
+      mode: 'runtime',
+    });
+    const report = checkFeasibility([first, second], contextThatMayNotBeQueried(), {
+      resolver: claimsEverything('runtime'),
+    });
+
+    expect(report.feasible).toEqual([first]);
+    expect(report.rejected.map((refusal) => refusal.code)).toEqual(['duplicate-action']);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * Check 3 — containment
  * ---------------------------------------------------------------------------------------------- */
 
 describe('containment', () => {
@@ -638,7 +916,7 @@ describe('containment', () => {
 });
 
 /* -------------------------------------------------------------------------------------------------
- * Check 3 — the file has to be indexed
+ * Check 4 — the file has to be indexed
  * ---------------------------------------------------------------------------------------------- */
 
 describe('the code index', () => {
@@ -685,7 +963,7 @@ describe('the code index', () => {
 });
 
 /* -------------------------------------------------------------------------------------------------
- * Check 4 — the file has to declare the symbol
+ * Check 5 — the file has to declare the symbol
  * ---------------------------------------------------------------------------------------------- */
 
 describe('the symbol', () => {
@@ -719,13 +997,18 @@ describe('the symbol', () => {
   it('refuses a spelling qualified by a container the file does not declare', () => {
     const refusal = refusalFor({ file: FILES.controller, symbol: 'GlazeSheet.normalizeRampRate' });
 
-    expect(refusal.code).toBe('unsupported-declaration');
+    // The bare name exists, but nothing of that name is declared on or inside
+    // the spelled owner — so the qualified symbol does not exist, and the hint
+    // names the owner that does declare it.
+    expect(refusal.code).toBe('symbol-not-found');
+    expect(refusal.reason).toContain('GlazeSheet');
+    expect(refusal.hint).toContain('KilnController.normalizeRampRate');
     expectReadableRefusal(refusal);
   });
 });
 
 /* -------------------------------------------------------------------------------------------------
- * Check 5 — the declaration's shape
+ * Check 6 — the declaration's shape
  * ---------------------------------------------------------------------------------------------- */
 
 describe('a supported declaration', () => {
@@ -952,7 +1235,7 @@ describe('an unwrappable declaration', () => {
 });
 
 /* -------------------------------------------------------------------------------------------------
- * Check 5 — and the honest answer when there is no syntax tree
+ * Check 6 — and the honest answer when there is no syntax tree
  * ---------------------------------------------------------------------------------------------- */
 
 describe('with no syntax tree loaded', () => {
@@ -978,7 +1261,361 @@ describe('with no syntax tree loaded', () => {
 });
 
 /* -------------------------------------------------------------------------------------------------
- * Check 6 — duplicates
+ * Check 6 — one target resolver, shared with the patcher
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * A corpus of the declaration positions the gate and the function-timing
+ * patcher used to disagree about, written to a temporary directory because the
+ * committed fixture is read-only and holds none of them.
+ *
+ * Every file is strict TypeScript with no React, `super`, `new.target` or
+ * `arguments`, so the patcher's wrapper-dependent support checks cannot fire:
+ * whatever the patcher refuses here, it refuses while *resolving* the target,
+ * which is exactly the half the gate shares with it.
+ */
+const RESOLUTION_CORPUS: Readonly<Record<string, string>> = {
+  'tsconfig.json': JSON.stringify({
+    compilerOptions: {
+      target: 'ES2023',
+      module: 'esnext',
+      moduleResolution: 'bundler',
+      strict: true,
+    },
+    include: ['src/**/*.ts'],
+  }),
+  // One name, nested in two scopes: a bare spelling cannot choose.
+  'src/nested-duplicates.ts': [
+    'export function alphaStage(): number {',
+    '  function settle(): number {',
+    '    return 1;',
+    '  }',
+    '',
+    '  return settle();',
+    '}',
+    '',
+    'export function betaStage(): number {',
+    '  function settle(): number {',
+    '    return 2;',
+    '  }',
+    '',
+    '  return settle();',
+    '}',
+    '',
+  ].join('\n'),
+  // A named function expression is its nested declaration's owner, not the
+  // variable that holds it.
+  'src/nested-owner.ts': [
+    'export const pick = function onPick(): number {',
+    '  function inner(): number {',
+    '    return 1;',
+    '  }',
+    '',
+    '  return inner();',
+    '};',
+    '',
+  ].join('\n'),
+  // An object-literal member is a position no wrapper addresses.
+  'src/object-literal.ts': [
+    'export const handlers = {',
+    '  onSelect: (): number => {',
+    '    function inner(): number {',
+    '      return 2;',
+    '    }',
+    '',
+    '    return inner();',
+    '  },',
+    '  inner(): number {',
+    '    return 3;',
+    '  },',
+    '};',
+    '',
+  ].join('\n'),
+  // A function declared in a class static block is a nested declaration.
+  'src/static-block.ts': [
+    'export class Registry {',
+    '  static count = 0;',
+    '',
+    '  static {',
+    '    function boot(): number {',
+    '      return 4;',
+    '    }',
+    '',
+    '    Registry.count = boot();',
+    '  }',
+    '}',
+    '',
+  ].join('\n'),
+  // Module scope wins a bare name; the nested twin needs its owner's name.
+  'src/module-first.ts': [
+    'export function tally(): number {',
+    '  return 5;',
+    '}',
+    '',
+    'export function report(): number {',
+    '  function tally(): number {',
+    '    return 6;',
+    '  }',
+    '',
+    '  return tally();',
+    '}',
+    '',
+  ].join('\n'),
+  // Members of a module-scope class, in every shape the resolver classifies.
+  'src/members.ts': [
+    'export class Gauge {',
+    '  private reading = 0;',
+    '',
+    '  constructor(start: number) {',
+    '    this.reading = start;',
+    '  }',
+    '',
+    '  get level(): number {',
+    '    return this.reading;',
+    '  }',
+    '',
+    '  sample(delta: number): number {',
+    '    this.reading += delta;',
+    '    return this.reading;',
+    '  }',
+    '',
+    '  *steps(): Generator<number> {',
+    '    yield this.reading;',
+    '  }',
+    '}',
+    '',
+  ].join('\n'),
+};
+
+/**
+ * Every `(file, symbol)` spelling the equivalence case compares, chosen to
+ * cover each resolution rule: ambiguity, qualification by an enclosing
+ * function, by a function expression's own name, by a holder that does not
+ * own the declaration, object-literal positions, static blocks, module scope
+ * before nested scope, and each member shape.
+ */
+const RESOLUTION_SPELLINGS: readonly (readonly [file: string, symbol: string])[] = [
+  ['src/nested-duplicates.ts', 'settle'],
+  ['src/nested-duplicates.ts', 'alphaStage.settle'],
+  ['src/nested-duplicates.ts', 'betaStage.settle'],
+  ['src/nested-duplicates.ts', 'alphaStage'],
+  ['src/nested-owner.ts', 'inner'],
+  ['src/nested-owner.ts', 'onPick.inner'],
+  ['src/nested-owner.ts', 'pick.inner'],
+  ['src/nested-owner.ts', 'pick'],
+  ['src/object-literal.ts', 'handlers.inner'],
+  ['src/object-literal.ts', 'onSelect.inner'],
+  ['src/object-literal.ts', 'inner'],
+  ['src/static-block.ts', 'boot'],
+  ['src/static-block.ts', 'Registry.boot'],
+  ['src/module-first.ts', 'tally'],
+  ['src/module-first.ts', 'report.tally'],
+  ['src/module-first.ts', 'report'],
+  ['src/members.ts', 'sample'],
+  ['src/members.ts', 'Gauge.sample'],
+  ['src/members.ts', 'Gauge#sample'],
+  ['src/members.ts', 'Gauge.prototype.sample'],
+  ['src/members.ts', 'level'],
+  ['src/members.ts', 'constructor'],
+  ['src/members.ts', 'steps'],
+  ['src/members.ts', 'Gauge'],
+];
+
+/** Where the resolution corpus was written for this run. */
+let corpusRoot: string;
+
+/** The one indexing of the resolution corpus every case shares. */
+let corpus: IndexedFixture;
+
+beforeAll(async () => {
+  corpusRoot = toPosix(mkdtempSync(join(tmpdir(), 'debuggen-feasibility-resolution-')));
+
+  for (const [relative, text] of Object.entries(RESOLUTION_CORPUS)) {
+    const target = join(corpusRoot, relative);
+
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(target, text);
+  }
+
+  const opened = openProject({ projectRoot: corpusRoot });
+
+  if (isErr(opened)) {
+    throw new Error(`the resolution corpus did not open: ${opened.error.message}`);
+  }
+
+  const built = await buildIndex(opened.value);
+
+  if (isErr(built)) {
+    throw new Error(`the resolution corpus did not index: ${built.error.message}`);
+  }
+
+  const graph = CodeGraph.fromIndex(built.value);
+  const routeMap = routeMapFromIndex(built.value);
+
+  corpus = {
+    loaded: opened.value,
+    graph,
+    queries: createCodeQueries(graph, { loaded: opened.value }),
+    routeMap,
+    projectSummary: summarizeProject({ loaded: opened.value, graph, routeMap }),
+  };
+}, 120_000);
+
+afterAll(() => {
+  rmSync(corpusRoot, { recursive: true, force: true });
+});
+
+/** A context over the resolution corpus. */
+function corpusContext(): InstrumentationContext {
+  return makeContext({
+    projectRoot: corpusRoot,
+    graph: corpus.graph,
+    queries: corpus.queries,
+    routeMap: corpus.routeMap,
+    projectSummary: corpus.projectSummary,
+    loaded: corpus.loaded,
+  });
+}
+
+describe('target resolution shared with the function-timing patcher', () => {
+  /** The gate's verdict on one patch-mode spelling: `'feasible'` or the code. */
+  function gateVerdict(file: string, symbol: string): string {
+    const report = checkFeasibility([action({ file, symbol })], corpusContext(), {
+      resolver: claimsEverything(),
+    });
+
+    return report.feasible.length === 1 ? 'feasible' : (report.rejected[0]?.code ?? 'missing');
+  }
+
+  /** The patcher's verdict on the same spelling: `'patchable'` or its reason. */
+  function patcherVerdict(file: string, symbol: string): string {
+    const patcher = new FunctionTimingPatcher({
+      projectRoot: corpusRoot,
+      verifyPatchedTypes: false,
+    });
+    const outcome = patcher.patch({
+      file,
+      symbol,
+      text: readFileSync(join(corpusRoot, file), 'utf8'),
+    });
+
+    return outcome.ok ? 'patchable' : String(outcome.error.details?.['reason']);
+  }
+
+  it('refuses a bare name two nested declarations share, as the patcher does', () => {
+    expect(gateVerdict('src/nested-duplicates.ts', 'settle')).toBe('ambiguous-symbol');
+    expect(patcherVerdict('src/nested-duplicates.ts', 'settle')).toBe('ambiguous-symbol');
+
+    const refusal = checkFeasibility(
+      [action({ file: 'src/nested-duplicates.ts', symbol: 'settle' })],
+      corpusContext(),
+      { resolver: claimsEverything() },
+    ).rejected[0];
+
+    // The hint is the resolver's own: the spellings that do name one of them.
+    expect(refusal?.hint).toContain('alphaStage.settle');
+    expect(refusal?.hint).toContain('betaStage.settle');
+
+    if (refusal !== undefined) {
+      expectReadableRefusal(refusal);
+    }
+  });
+
+  it('accepts either duplicate once it is qualified by the function that owns it', () => {
+    expect(gateVerdict('src/nested-duplicates.ts', 'alphaStage.settle')).toBe('feasible');
+    expect(gateVerdict('src/nested-duplicates.ts', 'betaStage.settle')).toBe('feasible');
+  });
+
+  it('names a nested declaration by the function expression that owns it, as the patcher does', () => {
+    expect(gateVerdict('src/nested-owner.ts', 'onPick.inner')).toBe('feasible');
+    expect(patcherVerdict('src/nested-owner.ts', 'onPick.inner')).toBe('patchable');
+  });
+
+  it('refuses an object-literal member the patcher cannot address', () => {
+    // The graph records the only addressable `inner` under `onSelect`, so the
+    // `handlers` qualifier is refused before a tree is read, and the hint gives
+    // the spelling that does address it.
+    expect(gateVerdict('src/object-literal.ts', 'handlers.inner')).toBe('symbol-not-found');
+    expect(patcherVerdict('src/object-literal.ts', 'handlers.inner')).toBe(
+      'symbol-not-addressable',
+    );
+
+    const refusal = checkFeasibility(
+      [action({ file: 'src/object-literal.ts', symbol: 'handlers.inner' })],
+      corpusContext(),
+      { resolver: claimsEverything() },
+    ).rejected[0];
+
+    expect(refusal?.hint).toContain('onSelect.inner');
+  });
+
+  it('accepts a function declared in a class static block, which the graph now records', () => {
+    expect(corpus.queries.hasSymbol('src/static-block.ts', 'boot')).toBe(true);
+    expect(gateVerdict('src/static-block.ts', 'boot')).toBe('feasible');
+    expect(patcherVerdict('src/static-block.ts', 'boot')).toBe('patchable');
+  });
+
+  it('keeps a bare module-scope name on the module-scope declaration', () => {
+    expect(gateVerdict('src/module-first.ts', 'tally')).toBe('feasible');
+    expect(gateVerdict('src/module-first.ts', 'report.tally')).toBe('feasible');
+  });
+
+  it('corroborates the owner of a nested runtime subject from the graph alone', () => {
+    const runtimeVerdict = (file: string, symbol: string): string => {
+      const report = checkFeasibility(
+        [action({ file, symbol, type: 'state-tracking', mode: 'runtime' })],
+        makeContext({
+          projectRoot: corpusRoot,
+          graph: corpus.graph,
+          queries: corpus.queries,
+          loaded: undefined,
+        }),
+        { resolver: claimsEverything('runtime') },
+      );
+
+      return report.feasible.length === 1 ? 'feasible' : (report.rejected[0]?.code ?? 'missing');
+    };
+
+    expect(runtimeVerdict('src/nested-duplicates.ts', 'alphaStage.settle')).toBe('feasible');
+    expect(runtimeVerdict('src/nested-duplicates.ts', 'gammaStage.settle')).toBe(
+      'symbol-not-found',
+    );
+    expect(runtimeVerdict('src/nested-owner.ts', 'onPick.inner')).toBe('feasible');
+    expect(runtimeVerdict('src/nested-owner.ts', 'pick.inner')).toBe('symbol-not-found');
+    expect(runtimeVerdict('src/object-literal.ts', 'onSelect.inner')).toBe('feasible');
+    expect(runtimeVerdict('src/object-literal.ts', 'handlers.inner')).toBe('symbol-not-found');
+    expect(runtimeVerdict('src/module-first.ts', 'report.tally')).toBe('feasible');
+    expect(runtimeVerdict('src/module-first.ts', 'summary.tally')).toBe('symbol-not-found');
+  });
+
+  it('agrees with the patcher on every spelling in the corpus', () => {
+    const disagreements = RESOLUTION_SPELLINGS.flatMap(([file, symbol]) => {
+      const gate = gateVerdict(file, symbol);
+      const patcher = patcherVerdict(file, symbol);
+
+      return (gate === 'feasible') === (patcher === 'patchable')
+        ? []
+        : [`${file} ${symbol}: gate=${gate} patcher=${patcher}`];
+    });
+
+    expect(disagreements).toEqual([]);
+  });
+
+  it('reports every refusal in the corpus in readable, bounded sentences', () => {
+    for (const [file, symbol] of RESOLUTION_SPELLINGS) {
+      for (const refusal of checkFeasibility([action({ file, symbol })], corpusContext(), {
+        resolver: claimsEverything(),
+      }).rejected) {
+        expectReadableRefusal(refusal);
+        expect(refusal.reason).not.toContain(corpusRoot);
+        expect(refusal.hint).not.toContain(corpusRoot);
+      }
+    }
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * Check 7 — duplicates
  * ---------------------------------------------------------------------------------------------- */
 
 describe('duplicates within one call', () => {
@@ -1178,10 +1815,12 @@ describe('every refusal this gate can produce', () => {
    * One refusal of every code in the vocabulary, collected over the few calls
    * it takes to reach them all.
    *
-   * Several calls rather than one because two of the codes are properties of a
-   * call rather than of an action: `no-adapter` needs a resolver that claims
-   * nothing, which would then refuse every other action too, and
-   * `ast-unavailable` needs a context with no loaded project.
+   * Several calls rather than one because three of the codes are properties of
+   * a call rather than of an action: `no-adapter` needs a resolver that claims
+   * nothing, which would then refuse every other action too,
+   * `ast-unavailable` needs a context with no loaded project, and
+   * `ambiguous-symbol` needs a file declaring one name twice, which only the
+   * resolution corpus holds.
    *
    * @returns Every refusal, in the order the calls produced them.
    */
@@ -1202,8 +1841,14 @@ describe('every refusal this gate can produce', () => {
         action({ file: FILES.controller, symbol: 'KilnController' }),
         action({ file: FILES.glaze, symbol: 'scoreShelfSlot' }),
         action({ file: FILES.glaze, symbol: 'scoreShelfSlot' }),
+        action({ file: TARGETLESS_FILE, symbol: TARGETLESS_SYMBOL }),
       ],
       makeContext(),
+      { resolver: claimsEverything() },
+    );
+    const ambiguous = checkFeasibility(
+      [action({ file: 'src/nested-duplicates.ts', symbol: 'settle' })],
+      corpusContext(),
       { resolver: claimsEverything() },
     );
     const noTree = checkFeasibility(
@@ -1212,7 +1857,12 @@ describe('every refusal this gate can produce', () => {
       { resolver: claimsEverything() },
     );
 
-    return [...unclaimed.rejected, ...projectSide.rejected, ...noTree.rejected];
+    return [
+      ...unclaimed.rejected,
+      ...projectSide.rejected,
+      ...ambiguous.rejected,
+      ...noTree.rejected,
+    ];
   }
 
   it('reaches every code in the vocabulary, and only codes in it', () => {

@@ -121,8 +121,8 @@ import { DebuggenError, err, isErr, isOk, newActionId, newSessionId, ok } from '
 import type { Result } from '@debuggen/shared';
 import { atomicReplaceFileIfUnchanged, sha256Hex } from '@debuggen/shared/node';
 
-import { reconcileModifications } from '../cleanup.js';
-import type { ReconcileOutcome } from '../cleanup.js';
+import { reconcileModifications, restoreModification } from '../cleanup.js';
+import type { ReconcileOutcome, RestoreOutcome } from '../cleanup.js';
 import { MODIFICATION_ID_PATTERN, parseModificationRecord } from '../schema/modification.js';
 import type {
   ModificationJournal,
@@ -134,6 +134,7 @@ import type { InstrumentationAction } from '../schema/plan.js';
 
 import { createBackupStore } from './backup-store.js';
 import type { BackupStore, RemoveBackupOptions, StoredBackup } from './backup-store.js';
+import { FunctionTimingPatcher } from './function-timing.js';
 import { SPAN_HELPER_GLOBAL, SPAN_HELPER_TYPE_NAME } from './wrap-template.js';
 import { PATCH_STAGES, createPatcher, defaultPatchFileSystem } from './patcher.js';
 import type {
@@ -2959,7 +2960,161 @@ describe('an install cancelled between stages', () => {
  * sequence that normalised line endings anywhere would hand back a file that is
  * *equivalent* to the developer's and not identical to it, and their next
  * `git diff` would show every line of it.
+ *
+ * A UTF-8 byte-order mark is the other encoding detail an editor leaves at the
+ * front of a file, and `./patcher.ts` promises it is preserved **exactly once,
+ * at byte 0** — never stripped, moved or duplicated — through the patch, the
+ * journaled diff, a crash and the restore. The mark is planted in each case's
+ * own sandbox copy, never in the committed fixture, and every marked file is
+ * judged three ways: against the bytes the same sequence installs in an
+ * unmarked copy (the mark is the *only* difference), against its pre-session
+ * snapshot after the real `../cleanup.ts` has restored it (`Buffer.compare`
+ * and SHA-256), and by counting the marks it holds (one, first).
  */
+
+/** The three bytes a UTF-8 byte-order mark is written as. */
+const UTF8_BYTE_ORDER_MARK = Buffer.from([0xef, 0xbb, 0xbf]);
+
+/** The mark as a decoder that keeps it yields it: one U+FEFF code unit. */
+const BYTE_ORDER_MARK_CHARACTER = '\uFEFF';
+
+/**
+ * Decodes bytes the way `./patcher.ts` reads them — strictly, and keeping a
+ * leading byte-order mark as U+FEFF — so a comparison of texts is a comparison
+ * of what the sequence itself read and wrote. The `TextDecoder` default would
+ * strip the mark and make every assertion below blind to it.
+ */
+function decodeKeepingMark(bytes: Uint8Array): string {
+  return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+}
+
+/** Asserts `bytes` start with one UTF-8 byte-order mark and hold no other. */
+function expectSingleLeadingMark(bytes: Buffer): void {
+  expect(bytes.indexOf(UTF8_BYTE_ORDER_MARK)).toBe(0);
+  expect(bytes.indexOf(UTF8_BYTE_ORDER_MARK, UTF8_BYTE_ORDER_MARK.length)).toBe(-1);
+}
+
+/**
+ * Rewrites a sandbox file as an editor that writes a BOM saves it, then
+ * snapshots it.
+ *
+ * The sandbox copy only, never the committed fixture — the last case in this
+ * file digests that tree. The fixture file is asserted not to carry a mark of
+ * its own, so the case is exercising the mark it planted rather than one it
+ * happened to find.
+ *
+ * @param leading What to put in front of the file: one mark by default, or a
+ * longer run of U+FEFF code units for the case that needs one.
+ */
+function plantByteOrderMark(
+  sandbox: Sandbox,
+  file: string,
+  leading: Buffer = UTF8_BYTE_ORDER_MARK,
+): Pristine {
+  const path = join(sandbox.projectRoot, file);
+  const unmarked = readFileSync(path);
+
+  expect(unmarked.includes(UTF8_BYTE_ORDER_MARK)).toBe(false);
+
+  writeFileSync(path, Buffer.concat([leading, unmarked]));
+  chmodSync(path, PROJECT_FILE_MODE);
+
+  const pristine = pristineFile(sandbox, file);
+
+  expect(pristine.bytes.subarray(0, leading.length).equals(leading)).toBe(true);
+  expect(pristine.bytes.indexOf(UTF8_BYTE_ORDER_MARK, leading.length)).toBe(-1);
+  expect(pristine.hash).not.toBe(sha256Hex(unmarked));
+
+  return pristine;
+}
+
+/**
+ * What the real sequence installs for the same target in a second, unmarked
+ * copy of the fixture.
+ *
+ * The yardstick for "the mark is the only difference": the transform addresses
+ * positions in source text, so a marked file patched correctly is exactly the
+ * mark followed by these bytes. A skew of even one code unit — a brace pulled
+ * against the parameter list, a character dropped at the end of the wrapped
+ * body — makes the comparison fail even where the result still parses.
+ */
+async function installedWithoutMark(file: string, symbol: string): Promise<Buffer> {
+  const twin = makeSandbox('unmarked-twin');
+  const { patcher } = buildPatcher(twin);
+
+  appliedOutcome(await patcher.patchTarget({ file, symbol }));
+
+  return readFileSync(join(twin.projectRoot, file));
+}
+
+/**
+ * The lines a unified diff adds or removes, without their `+`/`-` prefix.
+ *
+ * Read from the first hunk header onwards, so the `---`/`+++` file headers are
+ * never mistaken for changes and a changed line whose own text starts with `++`
+ * or `--` is never mistaken for a header.
+ */
+function changedLinesOf(diff: string): string[] {
+  const lines = diff.split('\n');
+  const firstHunk = lines.findIndex((line) => line.startsWith('@@'));
+
+  if (firstHunk < 0) {
+    return [];
+  }
+
+  return lines
+    .slice(firstHunk)
+    .filter((line) => line.startsWith('+') || line.startsWith('-'))
+    .map((line) => line.slice(1));
+}
+
+/**
+ * Asserts the journaled diff describes exactly the marked bytes the two hashes
+ * were taken over.
+ *
+ * Applied, not merely inspected — both user interfaces render it as "what the
+ * tool did to my file" — and with the mark on both sides: the diff is rendered
+ * from the full texts, so it must turn the marked original into the marked
+ * patched text, and it must never add or remove the mark itself. Only line 1
+ * carries it, so a changed line containing it would mean the patch moved,
+ * dropped or doubled it.
+ */
+function expectDiffKeepsMark(diff: string, original: Buffer, installed: Buffer): void {
+  expect(applyPatch(decodeKeepingMark(original), diff)).toBe(decodeKeepingMark(installed));
+
+  const changed = changedLinesOf(diff);
+
+  expect(changed.length).toBeGreaterThan(0);
+  expect(changed.filter((line) => line.includes(BYTE_ORDER_MARK_CHARACTER))).toEqual([]);
+}
+
+/** The outcome of a successful restore, or a failed test naming the refusal. */
+function restoredOutcome(result: Result<RestoreOutcome>): RestoreOutcome {
+  if (isErr(result)) {
+    throw new Error(
+      `Expected the restore to succeed, received ${result.error.code}: ${result.error.message} ${JSON.stringify(result.error.details)}`,
+    );
+  }
+  return result.value;
+}
+
+/**
+ * Asserts a marked file holds exactly its pre-session bytes, mark first, after
+ * a restore: by raw comparison and by digest, so a mistake in hashing cannot
+ * hide a mistake in content, and with the mode the developer's file had.
+ */
+function expectMarkedFileRestored(pristine: Pristine): void {
+  const restored = readFileSync(pristine.path);
+
+  expectFileBytes(pristine.path, pristine.bytes);
+  expect(Buffer.compare(restored, pristine.bytes)).toBe(0);
+  expect(sha256Hex(restored)).toBe(pristine.hash);
+  expect(restored.subarray(0, UTF8_BYTE_ORDER_MARK.length).equals(UTF8_BYTE_ORDER_MARK)).toBe(true);
+  expectSingleLeadingMark(restored);
+  expect(decodeKeepingMark(restored)).not.toContain(SPAN_HELPER_GLOBAL);
+  expect(permissionsOf(pristine.path)).toBe(PROJECT_FILE_MODE);
+  expect(temporaryLeftoversIn(dirname(pristine.path))).toEqual([]);
+}
 
 describe('byte fidelity across file kinds', () => {
   it('patches a plain JavaScript target without emitting TypeScript syntax', async () => {
@@ -3059,6 +3214,254 @@ describe('byte fidelity across file kinds', () => {
     },
     CRASH_CASE_TIMEOUT_MS,
   );
+
+  it('patches a TypeScript target that starts with a byte-order mark and restores it byte for byte', async () => {
+    const sandbox = makeSandbox();
+    const pristine = plantByteOrderMark(sandbox, CHAIN_FILE);
+    const { patcher, journal, backups } = buildPatcher(sandbox);
+
+    // Applied at all: TypeScript tooling reads the mark as an encoding mark
+    // rather than source text, and a sequence that handed it to the transform
+    // had every marked TypeScript file refused as an introduced diagnostic.
+    const outcome = appliedOutcome(
+      await patcher.patchTarget({ file: CHAIN_FILE, symbol: CHAIN_FIRST_SYMBOL }),
+    );
+    const installed = readFileSync(pristine.path);
+
+    expect(decodeKeepingMark(installed)).toContain(SPAN_HELPER_GLOBAL);
+    expect(decodeKeepingMark(installed)).toContain(SPAN_HELPER_TYPE_NAME);
+
+    // One mark, first, and nothing else different from the same patch of an
+    // unmarked copy — so it was neither moved nor doubled, and no offset of
+    // the patch was skewed by it.
+    expectSingleLeadingMark(installed);
+    expect(
+      Buffer.compare(
+        installed,
+        Buffer.concat([
+          UTF8_BYTE_ORDER_MARK,
+          await installedWithoutMark(CHAIN_FILE, CHAIN_FIRST_SYMBOL),
+        ]),
+      ),
+    ).toBe(0);
+
+    // Both digests are over the marked bytes, and the backup holds them.
+    expect(outcome.record.originalHash).toBe(pristine.hash);
+    expect(outcome.originalHash).toBe(pristine.hash);
+    expect(sha256Hex(installed)).toBe(outcome.instrumentedHash);
+    expect(outcome.record.instrumentedHash).toBe(outcome.instrumentedHash);
+
+    const backup = readFileSync(outcome.record.backupPath);
+
+    expect(Buffer.compare(backup, pristine.bytes)).toBe(0);
+    expect(sha256Hex(backup)).toBe(pristine.hash);
+
+    // The transform's own result is relative to the text without the mark, as
+    // `PatchOutcome.patch` documents, and the file is that result behind it.
+    expect(outcome.patch.originalText).toBe(
+      decodeKeepingMark(pristine.bytes).slice(BYTE_ORDER_MARK_CHARACTER.length),
+    );
+    expect(
+      Buffer.compare(
+        installed.subarray(UTF8_BYTE_ORDER_MARK.length),
+        Buffer.from(outcome.patch.patchedText, 'utf8'),
+      ),
+    ).toBe(0);
+
+    expectDiffKeepsMark(outcome.record.diff, pristine.bytes, installed);
+
+    // The real restore, through the cleanup API the service calls.
+    const restored = restoredOutcome(
+      await restoreModification(outcome.record, {
+        projectRoot: sandbox.projectRoot,
+        backups,
+        journal,
+      }),
+    );
+
+    expect(restored.kind).toBe('restored');
+    expect(restored.wrote).toBe(true);
+    expect(restored.backup).toBe('deleted');
+    expect(restored.conflict).toBeUndefined();
+    expect(restored.record.status).toBe('reverted');
+    expect(journal.rows[0]?.status).toBe('reverted');
+    expectMarkedFileRestored(pristine);
+    expect(existsSync(outcome.record.backupPath)).toBe(false);
+  });
+
+  it('patches a plain JavaScript target that starts with a byte-order mark and restores it byte for byte', async () => {
+    // The kind a skewed transform does not refuse: plain JavaScript has no
+    // type check to trip, so one code unit of skew is written out as a file
+    // that still parses. The unmarked twin is what catches it.
+    const sandbox = makeSandbox();
+    const pristine = plantByteOrderMark(sandbox, JS_FILE);
+    const { patcher, journal, backups } = buildPatcher(sandbox);
+
+    const outcome = appliedOutcome(await patcher.patchTarget({ file: JS_FILE, symbol: JS_SYMBOL }));
+    const installed = readFileSync(pristine.path);
+
+    expect(decodeKeepingMark(installed)).toContain(SPAN_HELPER_GLOBAL);
+    expect(decodeKeepingMark(installed)).not.toContain(SPAN_HELPER_TYPE_NAME);
+    expectSingleLeadingMark(installed);
+    expect(
+      Buffer.compare(
+        installed,
+        Buffer.concat([UTF8_BYTE_ORDER_MARK, await installedWithoutMark(JS_FILE, JS_SYMBOL)]),
+      ),
+    ).toBe(0);
+
+    expect(outcome.record.originalHash).toBe(pristine.hash);
+    expect(sha256Hex(installed)).toBe(outcome.instrumentedHash);
+    expect(Buffer.compare(readFileSync(outcome.record.backupPath), pristine.bytes)).toBe(0);
+    expectDiffKeepsMark(outcome.record.diff, pristine.bytes, installed);
+
+    const restored = restoredOutcome(
+      await restoreModification(outcome.record, {
+        projectRoot: sandbox.projectRoot,
+        backups,
+        journal,
+      }),
+    );
+
+    expect(restored.kind).toBe('restored');
+    expect(restored.wrote).toBe(true);
+    expect(restored.backup).toBe('deleted');
+    expect(journal.rows[0]?.status).toBe('reverted');
+    expectMarkedFileRestored(pristine);
+  });
+
+  it(
+    'restores a TypeScript target that starts with a byte-order mark after a crash between the rename and the mark',
+    async () => {
+      // The worker imports `./patcher.ts` by file URL, so this is the same
+      // mark-preserving sequence in a process that is killed with the patch on
+      // disk and the record still `pending`.
+      const sandbox = makeSandbox();
+      const pristine = plantByteOrderMark(sandbox, CHAIN_FILE);
+
+      await killDuringPatch(sandbox, {
+        file: CHAIN_FILE,
+        symbol: CHAIN_FIRST_SYMBOL,
+        crashAt: 'after-rename',
+      });
+
+      const before = openFileJournal(journalPathFor(sandbox));
+      const pending = onlyRow(before);
+      const onDisk = readFileSync(pristine.path);
+
+      expect(before.crashPoint()).toBe('after-rename');
+      expect(pending.status).toBe('pending');
+      expect(pending.originalHash).toBe(pristine.hash);
+      expect(digestOnDisk(pristine.path)).toBe(pending.instrumentedHash);
+      expect(decodeKeepingMark(onDisk)).toContain(SPAN_HELPER_GLOBAL);
+      expectSingleLeadingMark(onDisk);
+      expect(sha256Hex(readFileSync(pending.backupPath))).toBe(pristine.hash);
+      // The diff that outlived the process describes the marked bytes on disk.
+      expectDiffKeepsMark(pending.diff, pristine.bytes, onDisk);
+
+      const pass = await reconcileSandbox(sandbox, pristine.path);
+
+      expect(pass.outcome.status).toBe('clean');
+      expect(pass.outcome.restored.map((record) => record.id)).toEqual([pending.id]);
+      expect(pass.outcome.closed).toEqual([]);
+      expect(pass.outcome.conflicts).toEqual([]);
+      expect(pass.outcome.failures).toEqual([]);
+      expect(onlyRow(pass.journal).status).toBe('reverted');
+      expectMarkedFileRestored(pristine);
+      expectBackupDeletedAfterVerification(pass.backupEvents, pristine.hash);
+      expect(backupExists(pending)).toBe(false);
+    },
+    CRASH_CASE_TIMEOUT_MS,
+  );
+
+  it('keeps a mark followed by a zero-width no-break space exactly as the file held them', async () => {
+    // ts-morph drops one leading U+FEFF per parse, so a sequence that set
+    // aside only the first of two would hand the transform text that still
+    // began with one and reintroduce the skew one code unit later. The whole
+    // leading run is set aside and put back, so the file keeps both.
+    const leadingRun = Buffer.concat([UTF8_BYTE_ORDER_MARK, UTF8_BYTE_ORDER_MARK]);
+    const sandbox = makeSandbox();
+    const pristine = plantByteOrderMark(sandbox, JS_FILE, leadingRun);
+    const { patcher, journal, backups } = buildPatcher(sandbox);
+
+    const outcome = appliedOutcome(await patcher.patchTarget({ file: JS_FILE, symbol: JS_SYMBOL }));
+    const installed = readFileSync(pristine.path);
+
+    expect(
+      Buffer.compare(
+        installed,
+        Buffer.concat([leadingRun, await installedWithoutMark(JS_FILE, JS_SYMBOL)]),
+      ),
+    ).toBe(0);
+    expect(installed.indexOf(UTF8_BYTE_ORDER_MARK, leadingRun.length)).toBe(-1);
+    expect(sha256Hex(installed)).toBe(outcome.instrumentedHash);
+    expect(applyPatch(decodeKeepingMark(pristine.bytes), outcome.record.diff)).toBe(
+      decodeKeepingMark(installed),
+    );
+
+    const restored = restoredOutcome(
+      await restoreModification(outcome.record, {
+        projectRoot: sandbox.projectRoot,
+        backups,
+        journal,
+      }),
+    );
+
+    expect(restored.kind).toBe('restored');
+    expect(Buffer.compare(readFileSync(pristine.path), pristine.bytes)).toBe(0);
+    expect(digestOnDisk(pristine.path)).toBe(pristine.hash);
+  });
+
+  it('drops a mark the transform itself emits, so the file never carries two', async () => {
+    // The real transform never emits one; this is the guard that keeps a
+    // transform which did from writing the mark twice. It is handed text with
+    // no mark, and whatever mark leads its output is replaced by the file's own.
+    const sandbox = makeSandbox();
+    const pristine = plantByteOrderMark(sandbox, CHAIN_FILE);
+    const real = new FunctionTimingPatcher({ projectRoot: sandbox.projectRoot });
+    const handed: (string | undefined)[] = [];
+
+    const outcome = appliedOutcome(
+      await createPatcher({
+        projectRoot: sandbox.projectRoot,
+        sessionId: sandbox.sessionId,
+        planVersion: 1,
+        backups: createBackupStore({
+          debuggenHome: sandbox.debuggenHome,
+          sessionId: sandbox.sessionId,
+        }),
+        journal: createTestJournal(),
+        transform: (request) => {
+          handed.push(request.text);
+
+          const patched = real.patch(request);
+
+          return isErr(patched)
+            ? patched
+            : ok({
+                ...patched.value,
+                patchedText: `${BYTE_ORDER_MARK_CHARACTER}${patched.value.patchedText}`,
+              });
+        },
+      }).patchTarget({ file: CHAIN_FILE, symbol: CHAIN_FIRST_SYMBOL }),
+    );
+    const installed = readFileSync(pristine.path);
+
+    expect(handed).toHaveLength(1);
+    expect(handed[0]?.startsWith(BYTE_ORDER_MARK_CHARACTER)).toBe(false);
+    expectSingleLeadingMark(installed);
+    expect(
+      Buffer.compare(
+        installed,
+        Buffer.concat([
+          UTF8_BYTE_ORDER_MARK,
+          await installedWithoutMark(CHAIN_FILE, CHAIN_FIRST_SYMBOL),
+        ]),
+      ),
+    ).toBe(0);
+    expect(sha256Hex(installed)).toBe(outcome.instrumentedHash);
+    expectDiffKeepsMark(outcome.record.diff, pristine.bytes, installed);
+  });
 });
 
 /*

@@ -1319,7 +1319,11 @@ describe('MODIFICATION_CONFLICT_REASONS', () => {
     //                                 rather than closed;
     //   'restore-verification-failed' the write completed but the restored
     //                                 content did not hash to `originalHash`,
-    //                                 so the backup is kept.
+    //                                 so the backup is kept;
+    //   'record-chain-fork'           the file's open records do not form one
+    //                                 chain (two live layers on one parent, or
+    //                                 two open chains), so no reverse order
+    //                                 exists and nothing is written.
     // Every one of them means the same thing operationally: no write is
     // authorised, the backup is retained, and the record stays open so the next
     // service start reports it again.
@@ -1328,6 +1332,7 @@ describe('MODIFICATION_CONFLICT_REASONS', () => {
       'file-missing',
       'backup-missing',
       'restore-verification-failed',
+      'record-chain-fork',
     ]);
   });
 

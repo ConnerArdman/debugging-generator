@@ -75,10 +75,18 @@
  * rules committed in `../styles/components.css`; duration emphasis is
  * `DurationCell`'s `severity="auto"`; every gap comes from `Stack` or
  * `Toolbar`; and there is no inline `style` at all (AAP 0.6.4).
+ *
+ * The pending state adds no class name of its own. A request still in flight
+ * when the capture ended is drawn as the base status chip with the `Badge`'s
+ * own token-backed `info` tone and `outline` fill (`dg-badge--info`,
+ * `dg-badge--outline`), an hourglass icon and the visible word "Pending" — the
+ * same way a code of the `unknown` class has no stylesheet modifier and is
+ * carried by the chip and its tone alone. So the stylesheet needs no rule for
+ * it, and every class this file emits is still one the stylesheet defines.
  */
 
 import clsx from 'clsx';
-import { ChevronDown, ChevronRight, Copy } from 'lucide-react';
+import { ChevronDown, ChevronRight, Copy, Hourglass } from 'lucide-react';
 import { useCallback, useMemo, useState } from 'react';
 import type { ReactElement, ReactNode } from 'react';
 
@@ -110,7 +118,7 @@ import { Stack } from '../layout/Stack';
 import { Toolbar } from '../layout/Toolbar';
 import type { ToolbarAction, ToolbarSelect, ToolbarStatus } from '../layout/Toolbar';
 import { Badge } from '../primitives/Badge';
-import type { BadgeTone } from '../primitives/Badge';
+import type { BadgeTone, BadgeVariant } from '../primitives/Badge';
 import { Button } from '../primitives/Button';
 import { Code } from '../primitives/Code';
 import { DataTable } from '../primitives/DataTable';
@@ -149,7 +157,9 @@ import { SourceLink } from './SourceLink';
  *
  * Every column maps onto that list, field for field, through the aggregate that
  * projects it: the method badge to `http.method`; the row header to `url` and
- * `path`; the status badges to `http.status_code` and `status`; the occurrence,
+ * `path`; the status badges to `http.status_code` and `status`; the Pending
+ * badges to `inFlight`, which the aggregate projects as the occurrence's
+ * `pending` flag and the group's `pendingCount`; the occurrence,
  * duplicate and cluster counts to the `request_key` grouping over `startTime`;
  * the three duration cells to `duration`; the transfer cell to `transferSize`;
  * the caller chips to `initiator` and `source`; and an occurrence's selection to
@@ -238,7 +248,23 @@ const MIXED_GROUPING_LABEL = 'Mixed grouping';
 /** Toolbar note when the loaded rows are all fallback-grouped. */
 const FALLBACK_GROUPING_LABEL = 'Fallback grouping';
 
-/** The classes of HTTP response status this view distinguishes. */
+/**
+ * The classes of HTTP response status this view distinguishes.
+ *
+ * A class describes a status code that was **reported**; it never stands for
+ * the absence of one. An occurrence without a code is one of two different
+ * things, and they are kept apart because only one of them is still waiting:
+ *
+ *   - **Pending** — the producer marked the request as an in-flight snapshot
+ *     (`RequestOccurrence.pending`, counted per group as `pendingCount`): it
+ *     had started and had not settled when the capture ended. It is drawn as
+ *     the textual "Pending" badge of {@link PENDING_TONE} and
+ *     {@link PENDING_VARIANT}, at group and occurrence level alike.
+ *   - **Settled without a code** — a network error, an abort or a refused
+ *     cross-origin response. It is drawn as the unavailable label at group
+ *     level and as its span status at occurrence level, and is never read as
+ *     pending: only the producer's flag makes a request pending.
+ */
 type StatusClass = 'ok' | 'redirect' | 'client-error' | 'server-error' | 'unknown';
 
 /** Lowest status code of each class, and the ceiling of the last one. */
@@ -273,7 +299,9 @@ const STATUS_CLASS_TONES: Readonly<Record<StatusClass, BadgeTone>> = {
  * name this component can emit is greppable in this file.
  *
  * `unknown` has no modifier: the stylesheet defines none for it, and the base
- * chip class plus the neutral tone is the correct rendering.
+ * chip class plus the neutral tone is the correct rendering. The pending state
+ * is not a status class and has no modifier either, for the same reason: see
+ * {@link PENDING_TONE}.
  */
 const STATUS_CLASS_MODIFIERS: Readonly<Record<StatusClass, string | undefined>> = {
   ok: 'dg-request-table__status--ok',
@@ -283,12 +311,32 @@ const STATUS_CLASS_MODIFIERS: Readonly<Record<StatusClass, string | undefined>> 
   unknown: undefined,
 };
 
-/** Badge tone per span status, for an occurrence that reported no status code. */
+/**
+ * Badge tone per span status, for a **settled** occurrence that reported no
+ * status code. A pending occurrence also reports span status `unset`, but it is
+ * drawn as the Pending badge instead, so `unset` here always means a request
+ * that settled without the producer observing a code.
+ */
 const SPAN_STATUS_TONES: Readonly<Record<TelemetryStatus, BadgeTone>> = {
   unset: 'neutral',
   ok: 'success',
   error: 'danger',
 };
+
+/**
+ * The tone of the Pending badge: informational, because an in-flight request
+ * is neither a success nor a failure — the capture simply ended first.
+ *
+ * Tone, fill, the hourglass icon and the visible word are the whole modifier.
+ * No `dg-request-table__status--pending` class exists or is emitted: the
+ * `Badge`'s own `dg-badge--info` and `dg-badge--outline` classes are backed by
+ * the design tokens already, and a class of this file's own would need a rule
+ * in `../styles/components.css` that nothing else requires.
+ */
+const PENDING_TONE: BadgeTone = 'info';
+
+/** The fill of the Pending badge; see {@link PENDING_TONE}. */
+const PENDING_VARIANT: BadgeVariant = 'outline';
 
 /**
  * The label of each ordering the query contract offers, in the vocabulary's own
@@ -392,7 +440,18 @@ const DUPLICATES_ONLY_SCOPE_NOTE =
   'The duplicates filter applies to the groups loaded so far, not to the whole capture.';
 const TRANSFER_UNAVAILABLE_NOTE =
   'No transfer size was exposed for this request, so none is shown rather than a misleading zero.';
-const ERROR_COUNT_NOTE = 'Occurrences that failed.';
+const ERROR_COUNT_LABEL = 'Occurrences that failed:';
+const ALL_STATUS_CODES_LABEL = 'All status codes observed:';
+const PENDING_LABEL = 'Pending';
+const PENDING_SINGLE_GROUP_NOTE =
+  'This request was still in flight when the capture ended. No response had arrived, so it reports no status code, and the durations in this row are the time elapsed until then, so each is a lower bound.';
+const PENDING_GROUP_LABEL = 'Still in flight when the capture ended:';
+const PENDING_GROUP_NOTE =
+  'No response had arrived for these, so they report no status code. The durations in this row include their elapsed time, so each is a lower bound.';
+const PENDING_SETTLED_ONLY_NOTE =
+  'The status codes and failures shown describe the settled occurrences only.';
+const PENDING_OCCURRENCE_NOTE =
+  'This request was still in flight when the capture ended, so no response and no status code were observed. The duration shown is the time elapsed until then, a lower bound on how long it took.';
 const LOAD_MORE_LABEL = 'Load more';
 const LOAD_MORE_BUSY_LABEL = 'Loading…';
 const EXPAND_LABEL = 'Show occurrences';
@@ -500,6 +559,57 @@ function describeDuplicates(group: RequestGroup): string {
 }
 
 /**
+ * How many of a group's occurrences were still in flight when the capture
+ * ended, as a count safe to print and compare.
+ *
+ * `pendingCount` is present only when at least one occurrence was pending, so
+ * its absence reads as zero. A value that is not a positive integer cannot come
+ * from the aggregate and is also read as zero rather than printed: a row says a
+ * request is pending only when the producer's own count says so, never because
+ * a status code happens to be missing.
+ *
+ * @param group - The group whose pending occurrences are counted.
+ * @returns The pending count, or `0` when none was reported.
+ */
+function pendingCountOf(group: RequestGroup): number {
+  const { pendingCount } = group;
+
+  return pendingCount !== undefined && Number.isInteger(pendingCount) && pendingCount > 0
+    ? pendingCount
+    : 0;
+}
+
+/**
+ * Describe a group's pending occurrences for the Pending badge's tooltip,
+ * entirely from the group's own numbers.
+ *
+ * Three facts, each of which the contract fixes: how many occurrences had not
+ * settled, that they therefore carry no status code, and that the row's
+ * durations include their elapsed time and are lower bounds. When the row also
+ * shows codes or a failure count, a last sentence says those describe the
+ * settled occurrences only.
+ *
+ * @param group - The group whose pending occurrences are described.
+ * @param pendingCount - Its {@link pendingCountOf}, already computed and above zero.
+ * @returns One or more sentences, safe to show as plain text.
+ */
+function describePending(group: RequestGroup, pendingCount: number): string {
+  const sentences: string[] =
+    group.count > 1
+      ? [
+          `${PENDING_GROUP_LABEL} ${formatCount(pendingCount)} of ${formatCount(group.count)} occurrences.`,
+          PENDING_GROUP_NOTE,
+        ]
+      : [PENDING_SINGLE_GROUP_NOTE];
+
+  if (group.statusCodes.length > 0 || group.errorCount > 0) {
+    sentences.push(PENDING_SETTLED_ONLY_NOTE);
+  }
+
+  return sentences.join(' ');
+}
+
+/**
  * The source location observed for one of a group's own initiator labels.
  *
  * A presentational lookup inside a single group, and explicitly **not** a
@@ -560,12 +670,70 @@ function clampAuthoredLimit(limit: number | undefined): number | undefined {
  */
 
 /**
+ * The tab index every tooltip-only trigger in this file carries.
+ *
+ * A `Tooltip` opens on keyboard focus, and a badge, a text run or an inline
+ * code element cannot receive focus by itself — so without this a keyboard
+ * reader could never reach the full URL, the complete status list, the failure
+ * and duplicate explanations, the grouping note, the unavailable-size reason or
+ * what "Pending" means (AAP 0.6.2). The stop is a plain tab stop and nothing
+ * more: no `role="button"` and no click handler, because nothing happens on
+ * activation, and no `aria-label`, because the visible text is the name and the
+ * tooltip merges its bubble into the trigger's `aria-describedby`. The focus
+ * indicator is the global `:focus-visible` ring from `../styles/base.css`.
+ *
+ * These stops sit inside `DataTable` rows. The grid's roving focus reads the row
+ * index off the focused element itself, so focus on a descendant is never taken
+ * for a row, arrow keys pressed there are not consumed, and Escape reaches the
+ * tooltip first.
+ */
+const TOOLTIP_TRIGGER_TAB_INDEX = 0;
+
+/**
+ * The Pending badge, shared by the group row and the occurrence row so the two
+ * levels cannot drift apart.
+ *
+ * The state is carried by the visible word — never by colour or the icon
+ * alone — on the base status chip with {@link PENDING_TONE} and
+ * {@link PENDING_VARIANT}; the icon is decorative (`Badge` hides its icon slot
+ * from assistive technology). The tooltip says what "pending" means for the
+ * figures beside it.
+ *
+ * @param label - The visible text: the word "Pending", with a count when useful.
+ * @param note - The tooltip's explanation, safe to show as plain text.
+ * @returns The badge in its tooltip.
+ */
+function renderPendingBadge(label: string, note: string): ReactNode {
+  return (
+    <Tooltip content={note}>
+      <Badge
+        tone={PENDING_TONE}
+        variant={PENDING_VARIANT}
+        className="dg-request-table__status"
+        icon={<Hourglass className="dg-icon" />}
+        tabIndex={TOOLTIP_TRIGGER_TAB_INDEX}
+      >
+        {label}
+      </Badge>
+    </Tooltip>
+  );
+}
+
+/**
  * The status cell: one badge per distinct code the group observed, with the
- * remainder summarised, and a failure count when any occurrence failed.
+ * remainder summarised, a Pending badge when any occurrence was still in
+ * flight, and a failure count when any occurrence failed.
  *
  * The codes arrive distinct and ascending; nothing here re-derives them. An
  * absent code list is rendered as the unavailable label on a neutral badge,
- * never as a zero or a blank cell.
+ * never as a zero or a blank cell — except when every occurrence is pending,
+ * where the Pending badge alone explains the missing codes and the unavailable
+ * label beside it would claim a settled occurrence that reported none. When
+ * only some occurrences are pending and no settled one reported a code either,
+ * both badges are shown, because both things were observed.
+ *
+ * The Pending badge shows the pending count when the group holds more than one
+ * occurrence, so "Pending 2" on a row of five reads without the tooltip.
  *
  * @param group - The group whose statuses are shown.
  * @returns The cell's content.
@@ -573,39 +741,68 @@ function clampAuthoredLimit(limit: number | undefined): number | undefined {
 function renderStatusCell(group: RequestGroup): ReactNode {
   const shown = group.statusCodes.slice(0, MAX_STATUS_BADGES);
   const overflow = group.statusCodes.length - shown.length;
+  const pendingCount = pendingCountOf(group);
+  const everyOccurrencePending = pendingCount > 0 && pendingCount >= group.count;
+
+  let codeBadges: ReactNode;
+
+  if (group.statusCodes.length > 0) {
+    codeBadges = shown.map((code) => {
+      const statusClass = classifyStatusCode(code);
+
+      return (
+        <Badge
+          key={code}
+          tone={STATUS_CLASS_TONES[statusClass]}
+          variant="outline"
+          className={clsx('dg-request-table__status', STATUS_CLASS_MODIFIERS[statusClass])}
+        >
+          {String(code)}
+        </Badge>
+      );
+    });
+  } else if (everyOccurrencePending) {
+    codeBadges = null;
+  } else {
+    codeBadges = (
+      <Badge tone="neutral" variant="outline" className="dg-request-table__status">
+        {NOT_AVAILABLE_LABEL}
+      </Badge>
+    );
+  }
 
   return (
     <Stack direction="horizontal" gap={1} align="center" wrap>
-      {group.statusCodes.length === 0 ? (
-        <Badge tone="neutral" variant="outline" className="dg-request-table__status">
-          {NOT_AVAILABLE_LABEL}
-        </Badge>
-      ) : (
-        shown.map((code) => {
-          const statusClass = classifyStatusCode(code);
-
-          return (
-            <Badge
-              key={code}
-              tone={STATUS_CLASS_TONES[statusClass]}
-              variant="outline"
-              className={clsx('dg-request-table__status', STATUS_CLASS_MODIFIERS[statusClass])}
-            >
-              {String(code)}
-            </Badge>
-          );
-        })
-      )}
+      {codeBadges}
       {overflow > 0 ? (
-        <Tooltip content={group.statusCodes.map((code) => String(code)).join(', ')}>
-          <Badge tone="neutral" variant="soft" className="dg-request-table__status">
+        <Tooltip
+          content={`${ALL_STATUS_CODES_LABEL} ${group.statusCodes
+            .map((code) => String(code))
+            .join(', ')}.`}
+        >
+          <Badge
+            tone="neutral"
+            variant="soft"
+            className="dg-request-table__status"
+            tabIndex={TOOLTIP_TRIGGER_TAB_INDEX}
+          >
             {`+${formatCount(overflow)}`}
           </Badge>
         </Tooltip>
       ) : null}
+      {pendingCount > 0
+        ? renderPendingBadge(
+            group.count > 1 ? `${PENDING_LABEL} ${formatCount(pendingCount)}` : PENDING_LABEL,
+            describePending(group, pendingCount),
+          )
+        : null}
       {group.errorCount > 0 ? (
-        <Tooltip content={ERROR_COUNT_NOTE}>
-          <Badge tone="danger" variant="soft">
+        <Tooltip
+          content={`${ERROR_COUNT_LABEL} ${formatCount(group.errorCount)} of ${formatCount(
+            group.count,
+          )}.`}
+        >
+          <Badge tone="danger" variant="soft" tabIndex={TOOLTIP_TRIGGER_TAB_INDEX}>
             {formatCount(group.errorCount)}
           </Badge>
         </Tooltip>
@@ -640,6 +837,7 @@ function renderDuplicatesCell(group: RequestGroup): ReactNode {
             variant="outline"
             className="dg-request-table__duplicate-badge"
             icon={<Copy className="dg-icon" />}
+            tabIndex={TOOLTIP_TRIGGER_TAB_INDEX}
           >
             {formatCount(group.duplicateCount)}
           </Badge>
@@ -667,7 +865,7 @@ function renderDuplicatesCell(group: RequestGroup): ReactNode {
 function renderTransferredCell(group: RequestGroup): ReactNode {
   return group.transferredBytes === undefined ? (
     <Tooltip content={TRANSFER_UNAVAILABLE_NOTE}>
-      <Text size="sm" tone="muted">
+      <Text size="sm" tone="muted" tabIndex={TOOLTIP_TRIGGER_TAB_INDEX}>
         {NOT_AVAILABLE_LABEL}
       </Text>
     </Tooltip>
@@ -739,6 +937,14 @@ function renderInitiatorsCell(group: RequestGroup): ReactNode {
  * When no host is available to receive a selection the time renders as text
  * rather than as a control that would do nothing.
  *
+ * The status slot has three forms. An occurrence the producer flagged as
+ * pending shows the Pending badge — the flag is the producer's explicit
+ * statement that no response had arrived, so it wins over every other field —
+ * and its duration is the elapsed time until the capture ended, which the
+ * badge's tooltip says. A settled occurrence with a code shows the code; one
+ * without a code keeps its span status (`Unreported`, `OK` or `Error`), which is
+ * never presented as pending.
+ *
  * @param group - The group the occurrence belongs to, for its time origin.
  * @param occurrence - The occurrence to render.
  * @param onSelect - Selection handler, or `undefined` for the inert form.
@@ -752,6 +958,28 @@ function renderOccurrence(
   const offsetText = formatOffset(occurrence.startTime, group.firstStartTime);
   const statusClass =
     occurrence.statusCode === undefined ? undefined : classifyStatusCode(occurrence.statusCode);
+
+  let statusBadge: ReactNode;
+
+  if (occurrence.pending === true) {
+    statusBadge = renderPendingBadge(PENDING_LABEL, PENDING_OCCURRENCE_NOTE);
+  } else if (statusClass === undefined || occurrence.statusCode === undefined) {
+    statusBadge = (
+      <Badge tone={SPAN_STATUS_TONES[occurrence.status]} variant="soft">
+        {formatStatusLabel(occurrence.status)}
+      </Badge>
+    );
+  } else {
+    statusBadge = (
+      <Badge
+        tone={STATUS_CLASS_TONES[statusClass]}
+        variant="outline"
+        className={clsx('dg-request-table__status', STATUS_CLASS_MODIFIERS[statusClass])}
+      >
+        {String(occurrence.statusCode)}
+      </Badge>
+    );
+  }
 
   return (
     <Stack
@@ -779,19 +1007,7 @@ function renderOccurrence(
         </Button>
       )}
       <DurationCell ms={occurrence.durationMs} severity="auto" size="sm" />
-      {statusClass === undefined || occurrence.statusCode === undefined ? (
-        <Badge tone={SPAN_STATUS_TONES[occurrence.status]} variant="soft">
-          {formatStatusLabel(occurrence.status)}
-        </Badge>
-      ) : (
-        <Badge
-          tone={STATUS_CLASS_TONES[statusClass]}
-          variant="outline"
-          className={clsx('dg-request-table__status', STATUS_CLASS_MODIFIERS[statusClass])}
-        >
-          {String(occurrence.statusCode)}
-        </Badge>
-      )}
+      {statusBadge}
       {occurrence.initiator === undefined ? null : (
         <Code size="sm">{oneLinePreview(occurrence.initiator)}</Code>
       )}
@@ -1098,6 +1314,10 @@ export function RequestTable(props: RequestTableProps): ReactElement {
           // row with the full redacted value in the tooltip. Nothing here
           // parses, rewrites or reconstructs it.
           const displayUrl = oneLinePreview(group.url);
+          // The URL is a tooltip trigger only when the row shortened it; a URL
+          // shown in full has nothing more to disclose, so it stays out of the
+          // tab order rather than adding a stop that opens nothing.
+          const urlAbbreviated = displayUrl !== group.url;
 
           return (
             <Stack
@@ -1129,11 +1349,20 @@ export function RequestTable(props: RequestTableProps): ReactElement {
               <Badge tone="neutral" variant="outline" className="dg-request-table__method">
                 {group.method}
               </Badge>
-              <Tooltip content={group.url} disabled={displayUrl === group.url}>
-                <Code className="dg-request-table__url">{displayUrl}</Code>
+              <Tooltip content={group.url} disabled={!urlAbbreviated}>
+                <Code
+                  className="dg-request-table__url"
+                  tabIndex={urlAbbreviated ? TOOLTIP_TRIGGER_TAB_INDEX : undefined}
+                >
+                  {displayUrl}
+                </Code>
               </Tooltip>
               <Tooltip content={GROUPING_NOTES[group.groupedBy]}>
-                <Badge tone={GROUPING_TONES[group.groupedBy]} variant="soft">
+                <Badge
+                  tone={GROUPING_TONES[group.groupedBy]}
+                  variant="soft"
+                  tabIndex={TOOLTIP_TRIGGER_TAB_INDEX}
+                >
                   {humanizeLabel(group.groupedBy)}
                 </Badge>
               </Tooltip>

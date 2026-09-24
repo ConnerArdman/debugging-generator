@@ -54,6 +54,10 @@
  * `__chip`, `__confidence`, `__location`; variants `__region--observed` and
  * `__region--causes`.
  *
+ * `__chip` marks a *selectable* evidence chip only. A citation rendered with no
+ * selection handler is a plain outline `Badge` and carries no element class of
+ * this block, so no rule here can give it a control's hover feedback.
+ *
  * `__headline` must read as summary prose and must stay visually
  * distinguishable from `__statement`: that visual separation is the on-screen
  * half of the guarantee above, and a headline that looks like a fact is a
@@ -228,8 +232,8 @@ interface EvidenceChipsProps {
 
   /**
    * Invoked with the whole {@link EventRef} when a chip is activated. Absent,
-   * the chips still render and still take focus, and activating one does
-   * nothing.
+   * every citation renders as inert text instead of a control — see
+   * {@link EvidenceChips} for why.
    */
   onSelectEvent?: ((ref: EventRef) => void) | undefined;
 }
@@ -238,17 +242,24 @@ interface EvidenceChipsProps {
  * The evidence chips of one fact or hypothesis.
  *
  * A real list, so assistive technology announces how many citations a statement
- * carries, and one `Button` per chip: the design system requires its own
- * control primitive in place of a raw element (AAP 0.6.4), and a `span` with a
- * click handler would lose keyboard operation and the focus ring that
- * `../styles/base.css` applies to every `:focus-visible` element.
+ * carries. What each item holds depends on whether anything can act on it:
  *
- * The chips are left **enabled** when no handler was supplied rather than
- * rendered `disabled`: the caption is information whether or not it can be
- * selected, and a disabled control is skipped by keyboard navigation and
- * dimmed, which would make a fact's citations unreadable in the editor webview
- * whenever that surface chooses not to handle selection. Activation then
- * no-ops.
+ * - **With a selection handler**, one `Button` per chip: the design system
+ *   requires its own control primitive in place of a raw element (AAP 0.6.4),
+ *   and a `span` with a click handler would lose keyboard operation and the
+ *   focus ring that `../styles/base.css` applies to every `:focus-visible`
+ *   element.
+ * - **Without one**, one outline `Badge` per citation: the caption is still
+ *   information — which event substantiates the statement — so it is still
+ *   rendered, and still carries `data-event-id`, but as a citation rather than
+ *   a control. It is not focusable, has no button role and takes neither the
+ *   chip's hover feedback nor its pointer, because a control whose activation
+ *   does nothing tells a keyboard or screen-reader user that something happened
+ *   when nothing did. `disabled` would be the wrong fix too: a disabled control
+ *   is dimmed and announced as unavailable, which misreports a citation that
+ *   was never meant to be operable in that surface (the editor webview renders
+ *   this head with no event selection at all). The outline variant keeps it
+ *   visually apart from the soft confidence badge beside it.
  *
  * `../components/SourceLink.tsx` is the only sibling rendered by this module's
  * exported component, and this internal one renders nothing but primitives.
@@ -266,20 +277,26 @@ function EvidenceChips(props: EvidenceChipsProps): ReactElement {
         // may legitimately cite the same event twice through two coordinates —
         // so the index joins the key rather than standing in for it.
         <li key={`${ref.eventId}#${String(index)}`}>
-          <Button
-            variant="ghost"
-            size="sm"
-            className="dg-summary-header__chip"
-            data-event-id={ref.eventId}
-            onClick={() => {
-              // The whole reference travels, not just its id: the caller reads
-              // `ref.eventId`, and the optional trace, span and kind
-              // coordinates are what let it select without a lookup.
-              onSelectEvent?.(ref);
-            }}
-          >
-            {evidenceChipLabel(ref)}
-          </Button>
+          {onSelectEvent === undefined ? (
+            <Badge tone="accent" variant="outline" data-event-id={ref.eventId}>
+              {evidenceChipLabel(ref)}
+            </Badge>
+          ) : (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="dg-summary-header__chip"
+              data-event-id={ref.eventId}
+              onClick={() => {
+                // The whole reference travels, not just its id: the caller
+                // reads `ref.eventId`, and the optional trace, span and kind
+                // coordinates are what let it select without a lookup.
+                onSelectEvent(ref);
+              }}
+            >
+              {evidenceChipLabel(ref)}
+            </Button>
+          )}
         </li>
       ))}
     </ul>
@@ -317,7 +334,8 @@ export interface SummaryHeaderProps {
 
   /**
    * Called with the whole {@link EventRef} when an evidence chip is activated.
-   * Omitted, the chips render and no-op.
+   * Omitted, every citation still renders, as inert text rather than as a
+   * control, so no focusable element does nothing when activated.
    */
   onSelectEvent?: ((ref: EventRef) => void) | undefined;
 

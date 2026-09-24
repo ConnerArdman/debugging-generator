@@ -54,12 +54,30 @@
  *
  * ## Failure is reported, not thrown
  *
- * AAP §0.5.5 draws the line this contract encodes: **an adapter that cannot
- * enable a signal still returns a successful {@link InstallResult}** describing
- * the gap in {@link InstallResult.unavailable}, and the capture proceeds with
- * what is available. Only "nothing could be enabled at all" is an
- * installer-level failure, and that judgement belongs to `./installer.ts`,
- * which is the only party that can see every adapter's answer.
+ * An {@link InstallResult} has two channels for what did not work, and the line
+ * between them is the one AAP §0.5.5 and AAP §0.4.2 draw together:
+ *
+ * - **A gap is data.** An adapter that cannot enable a signal still returns a
+ *   successful result describing the gap in {@link InstallResult.unavailable},
+ *   and the capture proceeds with what is available — a dev-server preload
+ *   that is absent or silent, a React hook installed after React loaded. Only
+ *   "nothing could be enabled at all" turns gaps into an installer-level
+ *   failure, and that judgement belongs to `./installer.ts`, which is the only
+ *   party that can see every adapter's answer.
+ * - **A failed action is fatal.** An action accepted for install that could
+ *   not be completed — a patch refused or failed after the feasibility gate
+ *   admitted it, a write-path failure, a cancellation part-way through the
+ *   sequence — is reported in {@link InstallResult.failure}, beside the records
+ *   that did land in {@link InstallResult.applied}. `./installer.ts` then
+ *   reverse-restores every record the current install applied and fails the
+ *   install, so a follow-up's delta is all-or-nothing and the session stays at
+ *   its previous plan version. It is *returned* rather than thrown because a
+ *   rejected promise cannot carry the records the rollback has to restore.
+ *
+ * A rejected promise remains the channel for an outcome that is unknowable,
+ * such as a journal that could not be written: the installer still unwinds
+ * what earlier adapters applied, but only a returned failure lets it restore
+ * the failing adapter's own records.
  *
  * ## This is a type-only module
  *
@@ -80,7 +98,7 @@ import type {
   ProjectSummary,
   RouteMap,
 } from '@debuggen/code-analysis';
-import type { Logger } from '@debuggen/shared';
+import type { DebuggenError, Logger } from '@debuggen/shared';
 
 import type { BackupStore } from './patch/backup-store.js';
 import type {
@@ -497,10 +515,13 @@ export interface InstrumentationContext {
 // ---------------------------------------------------------------------------
 // What an install and a removal report back
 //
-// Three shapes, and the graceful-degradation channel of AAP §0.5.5 is one of
-// them. `applied`, `runtimeHooks` and `unavailable` are exactly the three
-// fields AAP §0.2.3 requires of an install result, and exactly what
-// `instrumentation.ready` carries to both user interfaces.
+// Four shapes: the graceful-degradation channel of AAP §0.5.5, the fatal
+// channel that keeps a follow-up's delta atomic (AAP §0.4.2), and the two
+// results they travel in. `applied`, `runtimeHooks` and `unavailable` are
+// exactly the three fields AAP §0.2.3 requires of an install result, and
+// exactly what `instrumentation.ready` carries to both user interfaces;
+// `failure` never reaches that message, because an install carrying one is
+// unwound and reported as `instrumentation.failed` instead.
 // ---------------------------------------------------------------------------
 
 /**
@@ -557,14 +578,113 @@ export interface UnavailableSignal {
 }
 
 /**
+ * An action this adapter accepted for install and could not complete — the
+ * payload of {@link InstallResult.failure}, the contract's fatal channel.
+ *
+ * The counterpart of {@link UnavailableSignal}, and the difference is whether
+ * the capture can proceed without it. A gap the capture survives — no preload
+ * attached, a silent preload, a hook installed after React — is an
+ * {@link UnavailableSignal} and the install still succeeds. A patch the target
+ * refused or that failed after the feasibility gate admitted it, a write-path
+ * failure, and a cancellation part-way through the sequence are this: the
+ * install as planned did not happen, so `./installer.ts` reverse-restores every
+ * record the current `installPlan` call applied — the earlier adapters', this
+ * adapter's {@link InstallResult.applied}, and {@link record} — and returns
+ * `INSTRUMENTATION_INSTALL_FAILED`. A failed follow-up therefore leaves the
+ * session at its previous plan version, byte for byte (AAP §0.4.2).
+ *
+ * Identifiers, a project-relative path and a coded error — never a byte of
+ * file content — except {@link conflict}, which holds diffs and is therefore
+ * never copied into an error's details or a log line (AAP §0.5.2).
+ *
+ * @example
+ * A patch-mode adapter forwarding the batch `./patch/patcher.ts` stopped on:
+ *
+ * ```ts
+ * const batch = await patcher.patchActions(ordered);
+ * const applied = batch.applied.map((outcome) => outcome.record);
+ *
+ * if (batch.failure !== undefined) {
+ *   const { error, actionId, file, symbol, record, conflict } = batch.failure;
+ *
+ *   return {
+ *     adapterId: this.id,
+ *     applied,
+ *     runtimeHooks: [],
+ *     unavailable: [],
+ *     failure: { error, signal: 'functions', actionId, file, symbol, record, conflict },
+ *   };
+ * }
+ * ```
+ */
+export interface InstallFailure {
+  /**
+   * Why the action could not be completed, coded.
+   *
+   * Its `message` and `hint` are written for the developer — an unsupported
+   * declaration, a baseline conflict naming where the original is kept, a
+   * cancelled install — and the installer quotes both rather than paraphrasing
+   * them. It becomes the `cause` of the installer's own error.
+   */
+  readonly error: DebuggenError;
+
+  /**
+   * The signal the failed action would have supplied, named as
+   * {@link UnavailableSignal.signal} names one and widened for the same reason.
+   */
+  readonly signal: CaptureSignal | (string & {});
+
+  /** The failed action's id, when the failure is attributable to one action. */
+  readonly actionId?: string | undefined;
+
+  /** The failed target's file, project-relative POSIX, when there is one. */
+  readonly file?: string | undefined;
+
+  /** The symbol the failed action addressed, when there is one. */
+  readonly symbol?: string | undefined;
+
+  /**
+   * The record journaled for the failed attempt, in its `pending` or `failed`
+   * state, when the sequence got as far as journaling one.
+   *
+   * **Never also listed in {@link InstallResult.applied}.** The installer adds
+   * it to the rollback set last, so it is the first record restored, and
+   * `restoreModification` in `./cleanup.ts` settles it by the reconciliation
+   * table of AAP §0.5.1: a file that still holds the original closes the record
+   * without a write, a file that holds the patch is restored from the backup,
+   * and anything else is a conflict the developer is shown. Omitting it would
+   * leave an open journal row that blocks the next patch of that file and a
+   * file that may hold bytes nobody restores.
+   */
+  readonly record?: ModificationRecord | undefined;
+
+  /**
+   * The conflict report, when the failure was a baseline conflict.
+   *
+   * Carried beside the error rather than inside its details because a report
+   * holds three-way diffs — file content — and an error's details may be
+   * logged and persisted. The installer records only that one exists.
+   */
+  readonly conflict?: ModificationConflict | undefined;
+}
+
+/**
  * What one adapter did when asked to install a set of actions.
  *
- * Always returned for a call that ran to completion, **including a call that
- * enabled nothing**: a gap is data (see {@link unavailable}), and only
- * `./installer.ts` — the one party that can see every adapter's answer — turns
- * "nothing at all could be enabled" into the `instrumentation.failed` of
- * AAP §0.5.5. An adapter rejects its promise only for a condition that makes
- * the question unanswerable, such as a journal that could not be written.
+ * Returned for every call that reached an answer, **including a call that
+ * enabled nothing and a call that failed part-way**, and the two are told apart
+ * by {@link failure}:
+ *
+ * - **Without `failure`, the install is what it says.** A gap is data (see
+ *   {@link unavailable}), and only `./installer.ts` — the one party that can
+ *   see every adapter's answer — turns "nothing at all could be enabled" into
+ *   the `instrumentation.failed` of AAP §0.5.5.
+ * - **With `failure`, the install did not happen as planned.** {@link applied}
+ *   lists the records that completed before it, and every other member is
+ *   ignored; see {@link failure} for what the installer does next.
+ *
+ * An adapter rejects its promise only for a condition that makes the question
+ * unanswerable, such as a journal that could not be written.
  *
  * The three array members are owned by the caller once returned: the installer
  * concatenates them across adapters, so an adapter must not retain and later
@@ -596,6 +716,10 @@ export interface InstallResult {
    * The order is the order cleanup must reverse, and
    * `apps/local-service/src/instrumentation/watcher.ts` watches exactly these
    * files for a developer's own edits.
+   *
+   * Beside a {@link failure}, the records that completed before it — this
+   * adapter's share of the rollback set — and never the failed attempt's own
+   * record, which travels as {@link InstallFailure.record}.
    */
   readonly applied: ModificationRecord[];
 
@@ -653,6 +777,28 @@ export interface InstallResult {
    * process.
    */
   readonly serverSignals?: Partial<ServerAgentSignals> | undefined;
+
+  /**
+   * The fatal channel: present when an action accepted for install could not
+   * be completed.
+   *
+   * That covers a patch the target refused or that failed after the
+   * feasibility gate admitted it, a failure anywhere on the write path, and a
+   * cancellation that stopped the sequence part-way. {@link applied} then lists
+   * the records that completed before it, which is this adapter's share of the
+   * rollback set, and `./installer.ts` reverse-restores every record the
+   * current `installPlan` call applied — earlier adapters', {@link applied} and
+   * {@link InstallFailure.record}, latest first — and returns
+   * `INSTRUMENTATION_INSTALL_FAILED`. Every other member of a result carrying
+   * a failure is ignored: nothing it armed or contributed is aggregated,
+   * because the install it describes is being unwound.
+   *
+   * Omitted, or `undefined`, for an install that ran as planned — which is
+   * what keeps this member additive for an adapter written before it existed.
+   * A gap the capture can proceed without is never reported here; it belongs
+   * in {@link unavailable}, which never fails an install (AAP §0.5.5).
+   */
+  readonly failure?: InstallFailure | undefined;
 }
 
 /**
@@ -808,6 +954,12 @@ export interface AdapterRemoveRequest {
  *   `scripts/check-no-hardcoding.mjs` reads this package with ts-morph to say
  *   so.
  * - **Gaps are reported, not thrown.** See {@link InstallResult.unavailable}.
+ * - **Failed actions are reported, not thrown — and not stepped over.** An
+ *   action accepted for install that cannot be completed stops this adapter's
+ *   install at that action and is returned in {@link InstallResult.failure}
+ *   beside the records that did complete, so `./installer.ts` can
+ *   reverse-restore all of them. Continuing past it would turn a failed
+ *   follow-up into a partial one the session cannot be returned from.
  * - **Idempotence.** {@link install} and {@link remove} may be called again
  *   after a crash, a reconnect or a retry, and must converge rather than
  *   duplicate.
@@ -1016,9 +1168,12 @@ export interface InstrumentationAdapter {
    * @param context The session's context.
    * @returns What was applied, which hooks were armed, which claimed signals
    * could not be enabled, and this adapter's contribution to the two producer
-   * configurations. Rejects **only** where the outcome is unknowable — a journal
-   * that could not be written, an aborted signal — never for a signal that
-   * merely turned out to be unavailable.
+   * configurations — or, when an accepted action could not be completed, the
+   * records applied before it with the reason in {@link InstallResult.failure},
+   * which the installer unwinds. A signal that merely turned out to be
+   * unavailable is a gap in {@link InstallResult.unavailable}, never a failure.
+   * Rejects **only** where the outcome is unknowable — a journal that could not
+   * be written — because a rejection carries no records to restore.
    */
   install(
     actions: readonly InstrumentationAction[],

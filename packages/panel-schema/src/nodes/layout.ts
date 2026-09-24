@@ -83,9 +83,11 @@
  *   rejects an authored one. Uniqueness across a panel is the syntactic
  *   validator's check; a schema can only see one node at a time.
  * - **Nesting depth.** The excessive-depth rule belongs to the syntactic
- *   validator, which sees the whole document. A depth limit restated here would
- *   be a second rule tuned separately from the first, and the two would
- *   disagree the moment either moved.
+ *   validator, which sees the whole document and owns the one depth constant;
+ *   the authoring schema in `../input.ts` builds its node chain from that same
+ *   constant. A depth limit restated here would be a second rule tuned
+ *   separately from the first, and the two would disagree the moment either
+ *   moved.
  *
  * ## Constraints every declaration below works under
  *
@@ -301,7 +303,10 @@ export const LAYOUT_NODE_MIN_CHILDREN = Object.freeze({
  * generated panel, and a rejected panel is not a smaller panel but a fallback
  * one, which is a materially worse answer to the developer's question than a
  * slightly crowded section. Nesting depth is bounded separately, by the
- * syntactic validator, which is the only layer that can see a whole document.
+ * syntactic validator's `PANEL_MAX_NODE_DEPTH`: the validator checks it on a
+ * whole internal document, which no one-node schema here can see, and the
+ * authoring schema enforces the same constant by construction, as a chain of
+ * that many node levels.
  */
 export const LAYOUT_NODE_MAX_CHILDREN = 64;
 

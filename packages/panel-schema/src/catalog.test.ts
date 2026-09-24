@@ -3,21 +3,30 @@
  * generated panel may contain.
  *
  * **Why this suite carries more weight than a typical unit test.** The catalog
- * has three consumers and two of them cannot check themselves. The syntactic
- * and semantic validators (`./validate.ts`, `./semantic.ts`) read it and are
- * covered by their own suites; the generate-panel prompt
- * (`apps/local-service/prompts/generate-panel/vNNN.md`) is a versioned text
- * file that no compiler reads; and the renderer's component registry
- * (`packages/panel-renderer/src/host/registry.ts`) — whose `registry.test.ts`
- * is what AAP §0.8.3 means by "every catalog type must have a renderer
- * component" — does not exist yet, because that host directory is still empty.
- * Until it does, this file is the only live guard on the catalog's completeness
- * and accuracy, so it asserts the enforceable half of that requirement:
- * **the catalog's key set equals the node-type union exactly**. That equality
- * is what keeps the validator, the prompt and the future registry in step, and
- * a drift in it is silent in every direction — a node type with no entry
- * renders as a blank region, an entry with no node type puts a node in the
- * prompt that nothing can produce.
+ * has three consumers, and each is held to it differently. The syntactic and
+ * semantic validators (`./validate.ts`, `./semantic.ts`) read it and are
+ * covered by their own suites. The renderer's component registry
+ * (`packages/panel-renderer/src/host/registry.ts`) is keyed by the catalog's
+ * node-type vocabulary, and its record's `satisfies` clause makes a missing or
+ * an extra entry a compile error; its colocated `registry.test.ts` is what AAP
+ * §0.8.3 means by "every catalog type must have a renderer component" — it
+ * pairs every catalogued node type with a component in both directions, finds
+ * no component for a type outside the catalog, and renders every catalogued
+ * component against a recorded panel-data response. The generate-panel prompt
+ * (`apps/local-service/prompts/generate-panel/vNNN.md`), however, is a
+ * versioned text file that no compiler reads.
+ *
+ * The invariant is therefore enforced from two sides. The renderer's suite
+ * holds the registry to the catalog, so it is only as sound as the catalog is,
+ * and the schema side lives here: **the catalog's key set equals the node-type
+ * union exactly**, alongside the structure, provenance and prompt safety of
+ * every entry. `./validate.test.ts` completes that side by proving the
+ * validator accepts every catalogued node type with its declared sources and
+ * rejects an unknown one before rendering. The key-set equality is what keeps
+ * the validator, the prompt and the renderer's registry in step, and a drift in
+ * it is silent in every direction — a node type with no entry renders as a
+ * blank region, an entry with no node type puts a node in the prompt that
+ * nothing can produce.
  *
  * ## What the compiler already guarantees, and is therefore not re-asserted
  *
@@ -415,10 +424,11 @@ describe('PANEL_NODE_CATALOG completeness', () => {
   });
 
   it('lists the entries in vocabulary order, sharing the record’s own objects', () => {
-    // The ordered list is what the prompt renderer and the renderer's registry
-    // iterate, so its order must come from the declared vocabulary rather than
-    // from property enumeration, and its members must be the very entries the
-    // record holds rather than copies a consumer could compare unequal.
+    // The ordered list is what the prompt renderer iterates, and the package
+    // exports it for any consumer that walks the catalog in order, so its order
+    // must come from the declared vocabulary rather than from property
+    // enumeration, and its members must be the very entries the record holds
+    // rather than copies a consumer could compare unequal.
     //
     // Widened before it is read: the list is built by mapping the vocabulary
     // through the record, so a node type with no entry leaves a hole here, and

@@ -43,25 +43,49 @@
  * missing the graph queries every check is made against, which is a
  * programming error in the caller and not a statement about the project.
  *
+ * ## Every target is checked, whatever installs it
+ *
+ * An action either names a target — one file and one symbol — or names the
+ * **targetless marker** (`TARGETLESS_FILE` with `TARGETLESS_SYMBOL`, from
+ * `./schema/plan.ts`), which is how a page-wide or process-wide runtime signal
+ * says it is about no single declaration. A target is checked against the
+ * project and the code graph in **both** install modes: a runtime action that
+ * names a component the project does not have would otherwise be reported as
+ * validated while its hook armed over the whole document, and the plan the
+ * developer reads would describe a subject that does not exist. The marker is
+ * accepted without a lookup, because there is nothing to look up — and refused
+ * for the action types that wrap one declaration, which have no meaning without
+ * a target.
+ *
+ * ## One resolver, shared with the patcher
+ *
+ * For a patch-mode action, *which declaration* the spelling names is decided by
+ * `./patch/target-resolver.ts` — the resolver `./patch/function-timing.ts` runs
+ * immediately before it writes. The two therefore agree by construction on the
+ * qualified spellings, on module scope before nested scope, on refusing a bare
+ * name two nested declarations share, on a nested declaration's owner and on
+ * the positions no wrapper can reach: a target this gate accepts resolves to
+ * the declaration the patcher will rewrite, and one it refuses is one the
+ * patcher would refuse.
+ *
  * ## Necessary, deliberately not sufficient
  *
- * This gate is cheap on purpose. It answers four questions — is the path inside
- * the project, is the file indexed, does the file declare the symbol, and is
- * the declaration a shape a timing wrapper can replace the body of — and it
- * answers them from the code graph and one parsed file. It does **not**
- * re-implement `./patch/function-timing.ts`, which is the final authority on a
- * patch target and additionally refuses an already-instrumented target, a React
- * component or hook, a body that reaches for `super` or `new.target`, and a
- * sloppy-mode body whose `arguments` object is observable. Those refusals need
- * the whole transform; reaching for it here would make every planning round pay
- * for the patch layer, and would put two modules in the position of having to
- * agree about a judgement only one of them can make.
+ * The gate stays cheap on purpose: the code graph, and at most one parsed file
+ * per patch-mode action, read and never edited. It does **not** run the support
+ * checks that depend on the emitted wrapper, which `./patch/function-timing.ts`
+ * keeps beside its template: an already-instrumented target, a React component
+ * or hook, a body that reaches for `super` or `new.target`, and a sloppy-mode
+ * body whose `arguments` object is observable. Those need the whole transform;
+ * reaching for it here would make every planning round pay for the patch layer.
+ * The one wrapper constraint AAP §0.5.1 states outright — a generator cannot be
+ * wrapped — is checked here, on the declaration the shared resolver returned.
  *
  * What this module guarantees is the half the planner needs: a plan that passes
- * it names files and symbols that exist, so the patcher's remaining refusals are
- * about the *shape* of real code rather than about a target the model invented.
- * A rejection is therefore always actionable, and never "re-index and try
- * again" for a project whose index is perfectly correct.
+ * it names files and symbols that exist, and patch targets that resolve to one
+ * declaration, so the patcher's remaining refusals are about the *body* of real
+ * code rather than about a target the model invented. A rejection is therefore
+ * always actionable, and never "re-index and try again" for a project whose
+ * index is perfectly correct.
  *
  * ## No side effects, and none available
  *
@@ -74,18 +98,37 @@
  */
 
 import { Node } from 'ts-morph';
-import type {
-  FunctionDeclaration,
-  FunctionExpression,
-  MethodDeclaration,
-  SourceFile,
-} from 'ts-morph';
+import type { SourceFile } from 'ts-morph';
 
 import { DebuggenError, isErr, normalizePosix, resolveWithinProject } from '@debuggen/shared';
-import type { CodeGraph, CodeQueries, LoadedProject } from '@debuggen/code-analysis';
+import type {
+  CodeGraph,
+  CodeNode,
+  CodeNodeKind,
+  CodeQueries,
+  LoadedProject,
+  SymbolDeclarationKind,
+} from '@debuggen/code-analysis';
 
 import type { InstrumentationContext } from './adapter.js';
-import { actionIdentityKey } from './schema/plan.js';
+import {
+  NON_ADDRESSABLE_CLAUSES,
+  PATCH_NON_ADDRESSABLE_POSITIONS,
+  parseSymbolSpelling,
+  resolvePatchTarget,
+} from './patch/target-resolver.js';
+import type {
+  PatchNonAddressablePosition,
+  PatchableFunctionNode,
+  SymbolSpelling,
+} from './patch/target-resolver.js';
+import {
+  TARGETLESS_FILE,
+  TARGETLESS_SYMBOL,
+  actionIdentityKey,
+  isTargetRequiredActionType,
+  isTargetlessAction,
+} from './schema/plan.js';
 import type {
   InstrumentationAction,
   InstrumentationPlan,
@@ -124,28 +167,43 @@ const MAX_REPORTED_TEXT_LENGTH = 120;
 const MAX_NEAR_MISS_CANDIDATES = 3;
 
 /**
- * Most declarations of one name collected from one file before the walk stops.
+ * Longest hint taken over from the shared target resolver, in Unicode code
+ * points.
  *
- * A file can legitimately declare a name several times — a module-scope
- * function and a nested one, a class member and a local — and only the first in
- * the resolution order is classified. The cap exists so that a pathological
- * file cannot turn a feasibility check into an unbounded traversal; it is far
- * above anything ordinary code produces, and the ordering below means raising
- * or lowering it cannot change which candidate is chosen in a realistic file.
+ * The resolver's hints are built from vocabulary and declaration names only —
+ * the spellings that would disambiguate a target, the enclosing declaration to
+ * time instead — so they are safe to show, and they are the most specific next
+ * step available. They are still bounded here, because each name in them came
+ * from a developer's file and this module promises single-line rows of a
+ * predictable length.
  */
-const MAX_DECLARATION_CANDIDATES = 32;
+const MAX_REPORTED_HINT_LENGTH = 360;
 
 /**
- * The segment a qualified spelling may carry between a class and its member,
- * as `Class.prototype.member`.
+ * The graph node kinds that *declare* a name, as opposed to mentioning it.
  *
- * Recognised so that the three spellings the function-timing patcher accepts
- * for a class member — `member`, `Class.member`, `Class#member`,
- * `Class.prototype.member` — all resolve to the same declaration here. A gate
- * that rejected a spelling the patcher accepts would be worse than no gate: it
- * would refuse a target that could have been instrumented.
+ * The same three `hasSymbol` treats as declarations: a `handler` node is a
+ * binding site and an `api-call` or `db-call` node is a call site, and neither
+ * may corroborate the owner a qualified spelling names.
  */
-const PROTOTYPE_SEGMENT = 'prototype';
+const DECLARING_NODE_KINDS: readonly CodeNodeKind[] = Object.freeze([
+  'symbol',
+  'component',
+  'server-function',
+]);
+
+/**
+ * The `symbol` declaration kinds that declare nothing an action can address —
+ * types vanish before anything runs, and `unknown` says nothing about a body —
+ * so they cannot corroborate an owner either, exactly as they cannot satisfy
+ * `hasSymbol`.
+ */
+const NON_ADDRESSABLE_DECLARATION_KINDS: readonly SymbolDeclarationKind[] = Object.freeze([
+  'type',
+  'interface',
+  'enum',
+  'unknown',
+]);
 
 // ---------------------------------------------------------------------------
 // The rejection vocabulary
@@ -166,13 +224,22 @@ const PROTOTYPE_SEGMENT = 'prototype';
  * - `'no-adapter'` — no registered adapter claims the action's type, so nothing
  *   would install it whatever its file says. Only reported when a resolver was
  *   supplied; see {@link FeasibilityOptions.resolver}.
+ * - `'target-required'` — the action names the targetless marker, but it is a
+ *   patch-mode action or of a type that wraps one named declaration
+ *   (`TARGET_REQUIRED_ACTION_TYPES` in `./schema/plan.ts`), so there is nothing
+ *   for it to install on.
  * - `'path-outside-project'` — the action's `file` is not a safe
  *   project-relative POSIX path, or resolves outside the project root. The one
  *   rejection that is a containment decision rather than a capability one.
  * - `'file-not-indexed'` — the code graph holds no entry for the file, so
  *   nothing is known about what it declares.
  * - `'symbol-not-found'` — the file is indexed and declares no addressable
- *   symbol of that name.
+ *   symbol of that name, or — for a qualified spelling — none under the class
+ *   or enclosing declaration the spelling names.
+ * - `'ambiguous-symbol'` — the file declares the name more than once where the
+ *   spelling cannot tell the declarations apart (two nested functions of one
+ *   name, say), so the patcher would refuse to guess which one to wrap. The
+ *   hint names the qualified spellings that do address one of them.
  * - `'unsupported-generator'` — the declaration is a generator function. A
  *   wrapper that calls the body as a function cannot preserve `yield`: the
  *   consumer would receive the wrapper's return value instead of an iterator
@@ -183,7 +250,9 @@ const PROTOTYPE_SEGMENT = 'prototype';
  * - `'unsupported-declaration'` — the file declares the name, but not as
  *   something a timing wrapper can replace the body of: a class, a type, an
  *   enum, a namespace, a constructor, an accessor, a variable holding a
- *   non-function, or a signature with no body.
+ *   non-function, a signature with no body, or a declaration in a position no
+ *   wrapper can address — an object-literal member, a parameter, a binding
+ *   pattern, or under a qualification that does not contain it.
  * - `'ast-unavailable'` — the declaration's shape could not be checked because
  *   no syntax tree was available: the context carries no loaded project, or the
  *   loaded program holds no parsed source for the file. Reported rather than
@@ -197,9 +266,11 @@ const PROTOTYPE_SEGMENT = 'prototype';
  */
 export const FEASIBILITY_REJECTION_CODES = Object.freeze([
   'no-adapter',
+  'target-required',
   'path-outside-project',
   'file-not-indexed',
   'symbol-not-found',
+  'ambiguous-symbol',
   'unsupported-generator',
   'unsupported-async-generator',
   'unsupported-declaration',
@@ -376,35 +447,6 @@ interface DuplicateRegistry {
   readonly patchSites: Map<string, InstrumentationAction>;
 }
 
-/**
- * A symbol spelling split into the name and the class that qualifies it.
- *
- * `container` is `undefined` for a bare name, which is also what a plan
- * normally carries.
- */
-interface SymbolSpelling {
-  readonly name: string;
-  readonly container: string | undefined;
-}
-
-/**
- * One declaration of the requested name found in the parsed file, with the two
- * facts that order the candidates.
- */
-interface DeclarationCandidate {
-  /** The declaration node itself. */
-  readonly node: Node;
-
-  /**
-   * Whether it sits at module scope — inside no function body and no namespace
-   * — including as a member of a class declared at module scope.
-   */
-  readonly moduleScope: boolean;
-
-  /** Its start offset in the file, which breaks ties in source order. */
-  readonly start: number;
-}
-
 // ---------------------------------------------------------------------------
 // Composing the two sentences
 //
@@ -433,11 +475,34 @@ interface DeclarationCandidate {
  * @returns The safe, bounded form.
  */
 function reportable(value: string): string {
+  return bounded(value, MAX_REPORTED_TEXT_LENGTH);
+}
+
+/**
+ * A hint the shared target resolver composed, made safe and bounded exactly as
+ * {@link reportable} makes a value, at {@link MAX_REPORTED_HINT_LENGTH}.
+ *
+ * @param hint The resolver's hint sentence.
+ * @returns The safe, bounded form.
+ */
+function reportableHint(hint: string): string {
+  return bounded(hint, MAX_REPORTED_HINT_LENGTH);
+}
+
+/**
+ * Replaces every character that could break a single rendered line with `'?'`
+ * and truncates to `limit` code points, marking a cut with an ellipsis.
+ *
+ * @param value The text to render.
+ * @param limit The most code points to keep.
+ * @returns The safe, bounded form.
+ */
+function bounded(value: string, limit: number): string {
   let rendered = '';
   let counted = 0;
 
   for (const character of value) {
-    if (counted === MAX_REPORTED_TEXT_LENGTH) {
+    if (counted === limit) {
       return `${rendered}…`;
     }
 
@@ -466,19 +531,6 @@ function reportable(value: string): string {
  * like a dead end.
  */
 const RUNTIME_ALTERNATIVE = 'A runtime signal needs no file edit at all.';
-
-/**
- * The name a constructor is addressed by, for the one case where naming it
- * produces a better rejection than not recognising it.
- *
- * A constructor has no name node of its own, so it would otherwise be invisible
- * to {@link declaredNameOf} and a plan naming it would be told the file
- * declares no such symbol — while the code index, which records a constructor
- * as a method, says it does. Recognising the spelling here makes the two agree
- * and turns the answer into the accurate one: the declaration exists, and its
- * shape is what no wrapper fits.
- */
-const CONSTRUCTOR_MEMBER_NAME = 'constructor';
 
 // ---------------------------------------------------------------------------
 // The checks
@@ -518,7 +570,36 @@ function checkAdapterClaim(
 }
 
 /**
- * Check 2 — does the path stay inside the project?
+ * Check 2 — for a targetless action, can it be installed without a target?
+ *
+ * Only a runtime hook can: the marker says "this signal is about the whole page
+ * or process", which is exactly what a listener in the page agent or an
+ * instrumentation inside the dev-server preload observes. A patch edits one
+ * declaration's body, and a function-timing or server-span action names the
+ * declaration it wraps, so neither means anything with the marker in place of a
+ * target. The internal plan schema already refuses both; this check holds for
+ * an action built without it, which is the case the gate exists to catch.
+ *
+ * Called only for an action {@link isTargetlessAction} recognised; every other
+ * action goes on to checks 3 to 6.
+ *
+ * @param action The targetless action under test.
+ * @returns The rejection, or `undefined` when a runtime hook installs it.
+ */
+function checkTargetlessAction(action: InstrumentationAction): Rejection | undefined {
+  if (action.mode !== 'patch' && !isTargetRequiredActionType(action.type)) {
+    return undefined;
+  }
+
+  return {
+    code: 'target-required',
+    reason: `a '${reportable(action.type)}' action installed as a ${action.mode === 'patch' ? 'patch' : 'runtime hook'} wraps one named declaration, and this one names the targetless marker ('${TARGETLESS_FILE}', '${TARGETLESS_SYMBOL}') instead of a file and a symbol`,
+    hint: 'Name the project file and the function to time, or plan a runtime signal, which is the one kind of action that can observe the whole page without a target.',
+  };
+}
+
+/**
+ * Check 3 — does the path stay inside the project?
  *
  * `resolveWithinProject` is the product's containment gate: it requires a safe
  * project-relative POSIX path (no absolute path, no drive letter, no
@@ -551,7 +632,7 @@ function checkContainedPath(
 }
 
 /**
- * Check 3 — is the file one the product actually knows about?
+ * Check 4 — is the file one the product actually knows about?
  *
  * The code graph is the authority, because it is the record of what was
  * indexed: `nodesByFile` is an O(1) read keyed by the exact project-relative
@@ -601,13 +682,16 @@ function checkFileIndexed(
 }
 
 /**
- * Check 4 — does the file declare the symbol?
+ * Check 5 — does the file declare the symbol?
  *
  * `hasSymbol` is the code-analysis API written for exactly this: it resolves
  * `(file, symbol)` from the graph without loading references, so the gate stays
- * cheap, and it is documented to agree with the patcher — a symbol it affirms
- * is one the function-timing transform resolves to a declaration, and one it
- * denies is one the transform would refuse.
+ * cheap. It establishes that the file declares the name at all — which is the
+ * whole question for a runtime-mode action, whose symbol is the *subject* of
+ * the signal (the component whose renders are counted, the handler whose
+ * requests are traced) rather than an edit site, and must still be real for
+ * the plan to describe the project truthfully. *Which* declaration a patch
+ * would rewrite, and whether a wrapper can reach it, is check 6's question.
  *
  * The spelling is asked about twice when it is qualified. `hasSymbol` matches a
  * declaration's own name, so `Class.member` — a spelling the patcher accepts,
@@ -615,9 +699,18 @@ function checkFileIndexed(
  * would be denied on its qualified form alone. Asking again with the bare name
  * keeps this gate from refusing a target the patcher would have instrumented.
  *
+ * **The qualifier is corroborated too.** A bare name that exists says nothing
+ * about the owner a qualified spelling claims, and accepting
+ * `Invented.member` because some `member` exists would present an invented
+ * target as validated — for a runtime action, whose shape is never checked,
+ * this is the last check its subject meets. So a qualified spelling is
+ * accepted only when the graph records a declaration of that name *under*
+ * that owner ({@link checkQualifiedOwner}), which needs no syntax tree.
+ *
  * @param file The normalised project-relative path.
  * @param action The action under test.
  * @param spelling The parsed spelling, whose `name` is the bare member name.
+ * @param graph The indexed code graph, for the owner of a qualified spelling.
  * @param queries The bounded query surface over the graph.
  * @returns The rejection, or `undefined` when the file declares the symbol.
  */
@@ -625,6 +718,7 @@ function checkSymbolDeclared(
   file: string,
   action: InstrumentationAction,
   spelling: SymbolSpelling,
+  graph: CodeGraph,
   queries: CodeQueries,
 ): Rejection | undefined {
   if (queries.hasSymbol(file, action.symbol)) {
@@ -632,13 +726,15 @@ function checkSymbolDeclared(
   }
 
   if (spelling.name !== action.symbol && queries.hasSymbol(file, spelling.name)) {
-    return undefined;
+    return spelling.container === undefined
+      ? undefined
+      : checkQualifiedOwner(file, spelling.name, spelling.container, graph);
   }
 
   return {
     code: 'symbol-not-found',
     reason: `'${reportable(file)}' declares no addressable symbol named '${reportable(action.symbol)}'`,
-    hint: nearMissHint(spelling.name, file, queries),
+    hint: nearMissHint(spelling.name, file, action, queries),
   };
 }
 
@@ -654,12 +750,23 @@ function checkSymbolDeclared(
  * than a declaration is precisely the confusion that produced the plan, and
  * naming its line is what resolves it.
  *
+ * With no candidate to name, the hint offers the alternative that fits the
+ * action: a patch can become a runtime signal, and a runtime signal that is
+ * about the whole page rather than one declaration can name the targetless
+ * marker instead of inventing a subject.
+ *
  * @param name The bare symbol name that was not found.
  * @param file The file it was looked for in.
+ * @param action The action under test, whose mode picks the alternative.
  * @param queries The bounded query surface over the graph.
  * @returns A single-line hint.
  */
-function nearMissHint(name: string, file: string, queries: CodeQueries): string {
+function nearMissHint(
+  name: string,
+  file: string,
+  action: InstrumentationAction,
+  queries: CodeQueries,
+): string {
   const rendered: string[] = [];
   const seen = new Set<string>();
 
@@ -679,22 +786,123 @@ function nearMissHint(name: string, file: string, queries: CodeQueries): string 
   }
 
   if (rendered.length === 0) {
-    return `Name a symbol '${reportable(file)}' declares, or plan a runtime signal instead. ${RUNTIME_ALTERNATIVE}`;
+    return action.mode === 'patch'
+      ? `Name a symbol '${reportable(file)}' declares, or plan a runtime signal instead. ${RUNTIME_ALTERNATIVE}`
+      : `Name a symbol '${reportable(file)}' declares or, for a signal about the whole page rather than one declaration, the targetless marker ('${TARGETLESS_FILE}', '${TARGETLESS_SYMBOL}').`;
   }
 
   return `The code index declares ${rendered.join(', ')} — name the file that declares the symbol, or a symbol this file declares.`;
 }
 
 /**
- * Check 5 — is the declaration a shape a timing wrapper can replace the body
- * of?
+ * Whether the graph records a declaration of `name` in `file` under `owner`,
+ * and the rejection naming the owners it does record when it does not.
  *
- * The one check that needs a syntax tree, and the one the AAP §0.5.1 template
- * constraint lives in: the wrapper moves the original body into an inner
- * function and calls it, which a generator's `yield` cannot survive — the
- * consumer would receive the wrapper's return value instead of an iterator —
- * and which a class, a type, an enum or a variable holding a plain value has no
- * body to participate in at all.
+ * A declaration's owner, in the graph's own terms, is the class a member
+ * belongs to (`CodeNodeBase.symbol`) or, for a nested declaration, the
+ * innermost named declaration around it — the last entry of
+ * `SymbolNodeData.enclosing`. That is the qualifier the function-timing patcher
+ * accepts for the same declaration: `Class.member` for a class member and
+ * `Enclosing.name` for a declaration nested in a named function, so a
+ * spelling corroborated here is one the patcher would resolve by the same
+ * owner, and one refused here names an owner the patcher would refuse too.
+ *
+ * `symbol-not-found`, because that is the fact: the file declares nothing
+ * under the spelled qualification. The hint names the owners it does record,
+ * bounded, because re-spelling the target is the one-edit fix.
+ *
+ * @param file The normalised project-relative path.
+ * @param name The bare declared name, which `hasSymbol` already affirmed.
+ * @param owner The qualifier the spelling claims.
+ * @param graph The indexed code graph.
+ * @returns The rejection, or `undefined` when the owner is corroborated.
+ */
+function checkQualifiedOwner(
+  file: string,
+  name: string,
+  owner: string,
+  graph: CodeGraph,
+): Rejection | undefined {
+  const owners = declaredOwnersOf(graph.nodesByFile(file), name);
+
+  if (owners.includes(owner)) {
+    return undefined;
+  }
+
+  const named = [...new Set(owners.filter((candidate) => candidate !== undefined))].slice(
+    0,
+    MAX_NEAR_MISS_CANDIDATES,
+  );
+  const [first] = named;
+
+  return {
+    code: 'symbol-not-found',
+    reason: `'${reportable(file)}' declares '${reportable(name)}', but not on or inside '${reportable(owner)}'`,
+    hint:
+      first === undefined
+        ? `Name it by its bare name '${reportable(name)}', which is how '${reportable(file)}' declares it.`
+        : `'${reportable(file)}' declares it under ${named.map((candidate) => `'${reportable(candidate)}'`).join(', ')} — spell it '${reportable(first)}.${reportable(name)}', or by its bare name where the file declares it once.`,
+  };
+}
+
+/**
+ * The owner of every declaration of `name` among one file's graph nodes:
+ * the class for a member, the innermost named enclosing declaration for a
+ * nested one, and `undefined` for a module-scope declaration or one nested
+ * only in anonymous scopes.
+ *
+ * @param nodes The file's graph nodes.
+ * @param name The bare declared name.
+ * @returns One owner per declaring node, in graph order.
+ */
+function declaredOwnersOf(nodes: readonly CodeNode[], name: string): (string | undefined)[] {
+  const owners: (string | undefined)[] = [];
+
+  for (const node of nodes) {
+    if (node.name !== name || !DECLARING_NODE_KINDS.includes(node.kind)) {
+      continue;
+    }
+
+    if (node.kind === 'symbol') {
+      if (
+        node.data !== undefined &&
+        NON_ADDRESSABLE_DECLARATION_KINDS.includes(node.data.declaration)
+      ) {
+        continue;
+      }
+
+      const chain = node.data?.enclosing;
+
+      if (chain !== undefined) {
+        owners.push(chain.at(-1));
+        continue;
+      }
+    }
+
+    owners.push(node.symbol);
+  }
+
+  return owners;
+}
+
+/**
+ * Check 6 — `patch`-mode only: is the declaration one a timing wrapper can
+ * replace the body of?
+ *
+ * The one check that needs a syntax tree. *Which* declaration the spelling
+ * names is decided by `resolvePatchTarget` from `./patch/target-resolver.ts` —
+ * the resolver the function-timing patcher runs immediately before it writes —
+ * so the declaration classified here is the one the patch would rewrite: a bare
+ * name two nested declarations share is refused as ambiguous rather than
+ * silently resolved to the first, a nested declaration's owner is its nearest
+ * named function-like scope exactly as the patcher computes it, and a
+ * declaration in a position no wrapper can address is refused here rather than
+ * at install time.
+ *
+ * On the declaration the resolver returns, the AAP §0.5.1 template constraint
+ * is applied: the wrapper moves the original body into an inner function and
+ * calls it, which a generator's `yield` cannot survive — the consumer would
+ * receive the wrapper's return value instead of an iterator.
  *
  * **Absence of a tree is reported, never guessed.** A context with no loaded
  * project is a legitimate state — the service withholds it when no patch-mode
@@ -703,10 +911,13 @@ function nearMissHint(name: string, file: string, queries: CodeQueries): string 
  * generator through to the patcher, where the wrapper builder throws rather
  * than refuses.
  *
+ * The tree is the code index's own, shared with every other reader of the
+ * loaded project; the resolver only reads it.
+ *
  * @param file The normalised project-relative path.
  * @param absolutePath The same path, absolute, for the program lookup.
  * @param action The action under test.
- * @param spelling The parsed spelling.
+ * @param spelling The parsed spelling, for the wording of a refusal.
  * @param loaded The loaded project, when the context carries one.
  * @returns The rejection, or `undefined` when the declaration can be wrapped.
  */
@@ -735,17 +946,13 @@ function checkDeclarationShape(
     };
   }
 
-  const candidate = resolveCandidate(sourceFile, spelling);
+  const resolved = resolvePatchTarget(sourceFile, action.symbol, file);
 
-  if (candidate === undefined) {
-    return {
-      code: 'unsupported-declaration',
-      reason: `'${reportable(file)}' holds '${reportable(action.symbol)}' in a position no timing wrapper can address`,
-      hint: `Time a function declaration, a function-valued variable or a class method the file declares — or the function that contains this one. ${RUNTIME_ALTERNATIVE}`,
-    };
+  if (!resolved.ok) {
+    return resolutionRejection(resolved.error, action, file, spelling);
   }
 
-  return classifyDeclaration(candidate.node, action, file);
+  return generatorRejection(resolved.value.fn, action, file);
 }
 
 /**
@@ -782,343 +989,134 @@ function findSourceFile(
 }
 
 /**
- * Splits a symbol spelling into the member name and the class qualifying it.
+ * Splits a symbol spelling into the member name and the class or enclosing
+ * declaration qualifying it, for the graph lookup of check 5.
  *
- * The accepted forms are the function-timing patcher's: `member`,
- * `Class.member`, `Class#member` and `Class.prototype.member`. A spelling that
- * is none of them — empty, an empty segment, three or more meaningful segments
- * — yields the trimmed original as the name and no container, which then fails
- * the symbol check with a rejection that names what was asked for. That is the
- * honest answer: this module does not own the spelling vocabulary, and turning
- * an unparseable spelling into a different rejection code would report a
- * malformed plan as a missing declaration.
+ * The accepted forms are the shared resolver's own — `member`, `Class.member`,
+ * `Class#member` and `Class.prototype.member` — parsed by the same
+ * `parseSymbolSpelling` the patcher uses, so the bare name asked about here is
+ * the name the patcher would resolve. A spelling the resolver refuses as
+ * malformed yields the trimmed original as the name and no container, which
+ * then fails check 5 with a rejection that names what was asked for: the graph
+ * declares nothing of that spelling, and saying so is more useful to a planner
+ * than a report about the spelling rules.
  *
  * @param symbol The `symbol` field of an action.
  * @returns The name, and the container when one was spelled.
  */
-function parseSpelling(symbol: string): SymbolSpelling {
-  const trimmed = symbol.trim();
-  const segments = trimmed.split(/[.#]/u);
-  const meaningful = segments.filter(
-    (segment, index) => !(segments.length === 3 && index === 1 && segment === PROTOTYPE_SEGMENT),
-  );
-  const name = meaningful.at(-1);
+function spellingOf(symbol: string): SymbolSpelling {
+  const parsed = parseSymbolSpelling(symbol);
 
-  if (
-    trimmed.length === 0 ||
-    name === undefined ||
-    meaningful.length > 2 ||
-    meaningful.some((segment) => segment.length === 0)
-  ) {
-    return { name: trimmed, container: undefined };
-  }
-
-  return { name, container: meaningful.length === 2 ? meaningful[0] : undefined };
+  return parsed.ok ? parsed.value : { name: symbol.trim(), container: undefined };
 }
 
 /**
- * The declaration a spelling resolves to, in the patcher's resolution order.
+ * The rejection for a target the shared resolver declined to resolve.
  *
- * Module scope first, then source order. Both tiers matter: the function-timing
- * transform resolves a bare name at module scope and descends into function
- * bodies only when module scope yields nothing, and the code graph's
- * `findSymbol` ranks its candidates the same way for the same reason — so a
- * file that declares one name twice is classified here on the declaration the
- * patch would actually rewrite, rather than on whichever one happens to be
- * written first.
+ * The resolver speaks the patcher's `details.reason` vocabulary; this maps it
+ * onto this gate's codes, keeping the finding the developer has to act on:
  *
- * @param sourceFile The parsed target file.
- * @param spelling The parsed spelling.
- * @returns The chosen candidate, or `undefined` when the file declares nothing
- * of that name in a shape this module classifies.
- */
-function resolveCandidate(
-  sourceFile: SourceFile,
-  spelling: SymbolSpelling,
-): DeclarationCandidate | undefined {
-  let best: DeclarationCandidate | undefined;
-
-  for (const candidate of collectCandidates(sourceFile, spelling)) {
-    if (best === undefined || precedes(candidate, best)) {
-      best = candidate;
-    }
-  }
-
-  return best;
-}
-
-/**
- * Whether one candidate resolves before another: module scope wins, then the
- * earlier position.
+ * - `'ambiguous-symbol'` stays itself, with the resolver's hint — the qualified
+ *   spellings that name one of the declarations.
+ * - `'malformed-symbol'` is `'symbol-not-found'`: nothing is declared under a
+ *   spelling no resolver can parse.
+ * - `'symbol-not-addressable'` is `'unsupported-declaration'`, worded from the
+ *   position the resolver reported and carrying its next step.
+ * - `'symbol-not-found'` is `'unsupported-declaration'` too, because check 5
+ *   has already established that the file declares the name: what the resolver
+ *   found none of is a *function* of that name under that qualification.
+ * - Every other reason — an accessor, a constructor, a signature with no body,
+ *   a variable holding a non-function — is `'unsupported-declaration'` for the
+ *   declaration's shape.
  *
- * @param left The candidate under consideration.
- * @param right The best candidate so far.
- * @returns `true` when `left` should replace `right`.
- */
-function precedes(left: DeclarationCandidate, right: DeclarationCandidate): boolean {
-  if (left.moduleScope !== right.moduleScope) {
-    return left.moduleScope;
-  }
-
-  return left.start < right.start;
-}
-
-/**
- * Every declaration of the spelled name the file holds, capped at
- * {@link MAX_DECLARATION_CANDIDATES}.
+ * The resolver's message is never forwarded: it is a sentence about the patch
+ * transform, and this rejection is shown to a developer as a fragment after a
+ * colon. Its hint is forwarded, bounded, because it is built from vocabulary
+ * and declaration names only and is the most specific next step available.
  *
- * One depth-first walk of one file, which is the whole cost of check 5. A
- * qualified spelling additionally requires the candidate's nearest named owner
- * to be the spelled container, so `Class.member` does not match a module-scope
- * function of the same name and vice versa.
- *
- * @param sourceFile The parsed target file.
- * @param spelling The parsed spelling.
- * @returns The candidates, in source order.
- */
-function collectCandidates(
-  sourceFile: SourceFile,
-  spelling: SymbolSpelling,
-): readonly DeclarationCandidate[] {
-  const candidates: DeclarationCandidate[] = [];
-
-  sourceFile.forEachDescendant((node, traversal): undefined => {
-    if (candidates.length >= MAX_DECLARATION_CANDIDATES) {
-      traversal.stop();
-      return undefined;
-    }
-
-    if (declaredNameOf(node) !== spelling.name) {
-      return undefined;
-    }
-
-    if (spelling.container !== undefined && ownerName(node) !== spelling.container) {
-      return undefined;
-    }
-
-    candidates.push({
-      node,
-      moduleScope: isModuleScope(node),
-      start: node.getStart(),
-    });
-
-    return undefined;
-  });
-
-  return candidates;
-}
-
-/**
- * The name a node declares, when it is one of the declaration forms this module
- * classifies.
- *
- * Deliberately wider than the set of *supported* shapes: a class, a type, an
- * enum, a namespace, an accessor and a constructor all answer here, so that a
- * plan naming one of them is refused as `'unsupported-declaration'` — the
- * declaration exists and its shape is the problem — rather than as a missing
- * symbol, which would send the developer to re-index a correct index.
- *
- * The name is read through `Node.hasName`, so a form whose name is a binding
- * pattern rather than an identifier simply does not match a plain name.
- *
- * @param node The node under consideration.
- * @returns The declared name, or `undefined`.
- */
-function declaredNameOf(node: Node): string | undefined {
-  if (Node.isConstructorDeclaration(node)) {
-    return CONSTRUCTOR_MEMBER_NAME;
-  }
-
-  if (!isClassifiedDeclaration(node)) {
-    return undefined;
-  }
-
-  return Node.hasName(node) ? node.getName() : undefined;
-}
-
-/**
- * Whether a node is one of the declaration forms {@link classifyDeclaration}
- * has an answer for.
- *
- * @param node The node under consideration.
- * @returns `true` when the node is a classified declaration form.
- */
-function isClassifiedDeclaration(node: Node): boolean {
-  return (
-    Node.isFunctionDeclaration(node) ||
-    Node.isMethodDeclaration(node) ||
-    Node.isVariableDeclaration(node) ||
-    Node.isPropertyDeclaration(node) ||
-    Node.isGetAccessorDeclaration(node) ||
-    Node.isSetAccessorDeclaration(node) ||
-    Node.isClassDeclaration(node) ||
-    Node.isInterfaceDeclaration(node) ||
-    Node.isTypeAliasDeclaration(node) ||
-    Node.isEnumDeclaration(node) ||
-    Node.isModuleDeclaration(node)
-  );
-}
-
-/**
- * The qualifier a candidate would be spelled with: its class, or the nearest
- * named function or variable it is nested in.
- *
- * @param node The candidate declaration.
- * @returns The owner's name, or `undefined` at module scope.
- */
-function ownerName(node: Node): string | undefined {
-  let parent = node.getParent();
-
-  while (parent !== undefined) {
-    if (
-      Node.isClassDeclaration(parent) ||
-      Node.isFunctionDeclaration(parent) ||
-      Node.isMethodDeclaration(parent) ||
-      Node.isVariableDeclaration(parent)
-    ) {
-      const name = Node.hasName(parent) ? parent.getName() : undefined;
-
-      if (name !== undefined) {
-        return name;
-      }
-    }
-
-    parent = parent.getParent();
-  }
-
-  return undefined;
-}
-
-/**
- * Whether a declaration sits at module scope.
- *
- * A member of a class declared at module scope counts as module scope, which is
- * what the patcher's first pass covers; anything inside a function body or a
- * namespace body does not.
- *
- * @param node The candidate declaration.
- * @returns `true` when no function or namespace body encloses it.
- */
-function isModuleScope(node: Node): boolean {
-  let parent = node.getParent();
-
-  while (parent !== undefined) {
-    if (Node.isSourceFile(parent)) {
-      return true;
-    }
-
-    if (isFunctionLike(parent) || Node.isModuleDeclaration(parent)) {
-      return false;
-    }
-
-    parent = parent.getParent();
-  }
-
-  return true;
-}
-
-/**
- * Whether a node introduces a function scope.
- *
- * @param node The node under consideration.
- * @returns `true` for every function form, including accessors and
- * constructors.
- */
-function isFunctionLike(node: Node): boolean {
-  return (
-    Node.isFunctionDeclaration(node) ||
-    Node.isFunctionExpression(node) ||
-    Node.isArrowFunction(node) ||
-    Node.isMethodDeclaration(node) ||
-    Node.isConstructorDeclaration(node) ||
-    Node.isGetAccessorDeclaration(node) ||
-    Node.isSetAccessorDeclaration(node)
-  );
-}
-
-/**
- * The verdict on one resolved declaration: `undefined` when a timing wrapper
- * can replace its body, a rejection otherwise.
- *
- * The supported set is exactly the one the function-timing template has a form
- * for — a function declaration, a function-valued variable or class property
- * (arrow or function expression), and a class method — and an exported route
- * handler is a function declaration like any other, recognised structurally
- * rather than by matching a route path (AAP §0.5.4).
- *
- * @param node The resolved declaration.
+ * @param error The resolver's refusal.
  * @param action The action under test.
  * @param file The normalised project-relative path.
- * @returns The rejection, or `undefined` when the declaration is supported.
+ * @param spelling The parsed spelling, for the wording of a qualified refusal.
+ * @returns The rejection.
  */
-function classifyDeclaration(
-  node: Node,
+function resolutionRejection(
+  error: DebuggenError,
   action: InstrumentationAction,
   file: string,
-): Rejection | undefined {
-  if (Node.isFunctionDeclaration(node)) {
-    return node.getBody() === undefined
-      ? unsupportedShape(action, file, 'a function signature with no body')
-      : generatorRejection(node, action, file);
+  spelling: SymbolSpelling,
+): Rejection {
+  const details = error.details ?? {};
+  const reason = details['reason'];
+  const resolverHint = error.hint === undefined ? undefined : reportableHint(error.hint);
+
+  switch (reason) {
+    case 'ambiguous-symbol':
+      return {
+        code: 'ambiguous-symbol',
+        reason: `'${reportable(file)}' declares '${reportable(action.symbol)}' more than once, and the spelling does not say which declaration to time`,
+        hint:
+          resolverHint ??
+          'Qualify the symbol as Class.member or Enclosing.name to name one of them.',
+      };
+    case 'malformed-symbol':
+      return {
+        code: 'symbol-not-found',
+        reason: `'${reportable(action.symbol)}' is not a spelling that names a declaration in '${reportable(file)}'`,
+        hint: 'Name the declaration as member, Class.member, Class#member or Class.prototype.member.',
+      };
+    case 'symbol-not-addressable':
+      return {
+        code: 'unsupported-declaration',
+        reason: `'${reportable(file)}' declares '${reportable(action.symbol)}' only as ${nonAddressableClause(details['position'])}, whose body no timing wrapper can replace`,
+        hint:
+          resolverHint ??
+          `Time the function that contains this declaration instead. ${RUNTIME_ALTERNATIVE}`,
+      };
+    case 'symbol-not-found':
+      return spelling.container === undefined
+        ? unsupportedShape(action, file, 'something other than a function this project can time')
+        : {
+            code: 'unsupported-declaration',
+            reason: `'${reportable(file)}' declares '${reportable(spelling.name)}', but not as a function on or inside '${reportable(spelling.container)}' whose body a timing wrapper can replace`,
+            hint: `Name the declaration by the class or the function that contains it, or by its bare name where the file declares it once. ${RUNTIME_ALTERNATIVE}`,
+          };
+    case 'unsupported-accessor':
+      return unsupportedShape(action, file, 'a property accessor');
+    case 'unsupported-constructor':
+      return unsupportedShape(action, file, 'a constructor');
+    default:
+      return unsupportedShape(action, file, 'a declaration with no function body to wrap');
   }
+}
 
-  if (Node.isMethodDeclaration(node)) {
-    return node.getBody() === undefined
-      ? unsupportedShape(action, file, 'a method signature with no body')
-      : generatorRejection(node, action, file);
-  }
+/**
+ * The clause that says what a non-addressable declaration *is*, in the words
+ * the patcher's own refusal uses.
+ *
+ * The position arrives in a refusal's details, so it is checked against the
+ * vocabulary before it is used as a key; an unrecognised one — a resolver newer
+ * than this gate — still produces a truthful sentence.
+ *
+ * @param position The `details.position` of a `'symbol-not-addressable'` refusal.
+ * @returns The clause.
+ */
+function nonAddressableClause(position: unknown): string {
+  return isNonAddressablePosition(position)
+    ? NON_ADDRESSABLE_CLAUSES[position]
+    : 'a declaration in a position no timing wrapper can address';
+}
 
-  if (Node.isVariableDeclaration(node) || Node.isPropertyDeclaration(node)) {
-    const initializer = node.getInitializer();
+/**
+ * Whether a value is one of the resolver's non-addressable positions.
+ *
+ * @param value Any value.
+ * @returns `true` for a member of `PATCH_NON_ADDRESSABLE_POSITIONS`.
+ */
+function isNonAddressablePosition(value: unknown): value is PatchNonAddressablePosition {
+  const positions: readonly string[] = PATCH_NON_ADDRESSABLE_POSITIONS;
 
-    if (initializer === undefined) {
-      return unsupportedShape(
-        action,
-        file,
-        'a declaration with no initialiser, so it holds no function',
-      );
-    }
-
-    if (Node.isArrowFunction(initializer)) {
-      return undefined;
-    }
-
-    if (Node.isFunctionExpression(initializer)) {
-      return generatorRejection(initializer, action, file);
-    }
-
-    return unsupportedShape(action, file, 'a value that is not a function expression');
-  }
-
-  if (Node.isGetAccessorDeclaration(node) || Node.isSetAccessorDeclaration(node)) {
-    return unsupportedShape(action, file, 'a property accessor');
-  }
-
-  if (Node.isConstructorDeclaration(node)) {
-    return unsupportedShape(action, file, 'a constructor');
-  }
-
-  if (Node.isClassDeclaration(node)) {
-    return unsupportedShape(action, file, 'a class');
-  }
-
-  if (Node.isInterfaceDeclaration(node) || Node.isTypeAliasDeclaration(node)) {
-    return unsupportedShape(
-      action,
-      file,
-      'a type declaration, which is gone by the time the code runs',
-    );
-  }
-
-  if (Node.isEnumDeclaration(node)) {
-    return unsupportedShape(action, file, 'an enum');
-  }
-
-  if (Node.isModuleDeclaration(node)) {
-    return unsupportedShape(action, file, 'a namespace');
-  }
-
-  return unsupportedShape(action, file, 'a declaration that is not a function');
+  return typeof value === 'string' && positions.includes(value);
 }
 
 /**
@@ -1126,19 +1124,20 @@ function classifyDeclaration(
  *
  * Separate codes for the plain and the `async` form, because they are different
  * facts about the declaration and a caller may word them differently; the
- * consequence is the same, and it is the one AAP §0.5.1 states.
+ * consequence is the same, and it is the one AAP §0.5.1 states. An arrow
+ * function is never a generator.
  *
- * @param fn The resolved function node.
+ * @param fn The function-like node the shared resolver returned.
  * @param action The action under test.
  * @param file The normalised project-relative path.
  * @returns The rejection, or `undefined`.
  */
 function generatorRejection(
-  fn: FunctionDeclaration | FunctionExpression | MethodDeclaration,
+  fn: PatchableFunctionNode,
   action: InstrumentationAction,
   file: string,
 ): Rejection | undefined {
-  if (!fn.isGenerator()) {
+  if (Node.isArrowFunction(fn) || !fn.isGenerator()) {
     return undefined;
   }
 
@@ -1168,7 +1167,7 @@ function unsupportedShape(action: InstrumentationAction, file: string, clause: s
 }
 
 /**
- * Check 6 — has this call already accepted the same work?
+ * Check 7 — has this call already accepted the same work?
  *
  * Last, and deliberately so: an action that is both a duplicate and impossible
  * is reported as impossible, because that is the finding the developer has to
@@ -1268,20 +1267,26 @@ function patchSiteKey(file: string, symbol: string): string {
  * a progress row unreadable:
  *
  * 1. An adapter claims the action's type, when a resolver was supplied.
- * 2. `patch`-mode only: the file is a safe project-relative path inside the
- *    project root.
- * 3. `patch`-mode only: the code index holds the file.
- * 4. `patch`-mode only: the file declares the symbol.
- * 5. `patch`-mode only: the declaration is a shape a timing wrapper fits —
- *    generators and anything without a wrappable body are refused here.
- * 6. No earlier action in this same call already asked for the work.
+ * 2. A targetless action — the marker `{ file: '.', symbol: '*' }` from
+ *    `./schema/plan.ts` — is installable only as a runtime hook of a type that
+ *    needs no declaration; it is accepted here, with nothing to look up.
+ * 3. The file is a safe project-relative path inside the project root.
+ * 4. The code index holds the file.
+ * 5. The file declares the symbol — under the class or enclosing declaration
+ *    a qualified spelling names, corroborated from the graph.
+ * 6. `patch`-mode only: the shared target resolver resolves the spelling to
+ *    exactly one declaration a timing wrapper can reach, and it is not a
+ *    generator.
+ * 7. No earlier action in this same call already asked for the work.
  *
- * `runtime`-mode actions skip checks 2 to 5, and that is not a shortcut: a
- * runtime action arms a hook the product already owns — a listener in the page
- * agent, an instrumentation inside the dev-server preload — so it writes
- * nothing to a file, and the file and symbol it carries are the *subject* of the
- * signal rather than an edit site. Refusing one for a symbol the index has not
- * got would withdraw a whole tier of telemetry over a stale index.
+ * Checks 3 to 5 apply to **every** action that names a target, runtime or
+ * patch. A runtime action writes nothing to a file, but the file and symbol it
+ * carries are the *subject* of its signal — the component whose renders are
+ * counted, the handler whose requests are attributed — and they are what the
+ * editor and the panel show the developer as validated. A subject the project
+ * does not have would present a hallucinated target as checked while the hook
+ * armed over the whole document; a signal that genuinely has no subject says so
+ * with the targetless marker instead.
  *
  * **Nothing is thrown for a rejection.** Every refusal is an
  * {@link InfeasibleAction} on the report, carrying the two sentences a
@@ -1416,9 +1421,13 @@ export function checkPlanFeasibility(
 }
 
 /**
- * Runs checks 1 to 5 for one action, stopping at the first failure.
+ * Runs checks 1 to 6 for one action, stopping at the first failure.
  *
- * Check 6 is the caller's, because it is the only check whose answer depends on
+ * A targetless action stops after check 2, because checks 3 to 6 are questions
+ * about a target it deliberately does not have. Every other action — runtime
+ * or patch — takes checks 3 to 5, and a patch-mode action also takes check 6.
+ *
+ * Check 7 is the caller's, because it is the only check whose answer depends on
  * what has already been *accepted* — and an action that fails an earlier check
  * must not occupy a duplicate slot that would then explain away its twin.
  *
@@ -1440,8 +1449,12 @@ function evaluateAction(
     }
   }
 
-  if (action.mode !== 'patch') {
-    return { feasible: true, file: normalizePosix(action.file) };
+  if (isTargetlessAction(action)) {
+    const targetRequired = checkTargetlessAction(action);
+
+    return targetRequired === undefined
+      ? { feasible: true, file: TARGETLESS_FILE }
+      : { feasible: false, rejection: targetRequired };
   }
 
   const contained = checkContainedPath(action, context.projectRoot);
@@ -1451,7 +1464,7 @@ function evaluateAction(
   }
 
   const file = normalizePosix(action.file);
-  const spelling = parseSpelling(action.symbol);
+  const spelling = spellingOf(action.symbol);
 
   const unindexed = checkFileIndexed(file, contained.absolutePath, context.graph, context.loaded);
 
@@ -1459,10 +1472,14 @@ function evaluateAction(
     return { feasible: false, rejection: unindexed };
   }
 
-  const undeclared = checkSymbolDeclared(file, action, spelling, context.queries);
+  const undeclared = checkSymbolDeclared(file, action, spelling, context.graph, context.queries);
 
   if (undeclared !== undefined) {
     return { feasible: false, rejection: undeclared };
+  }
+
+  if (action.mode !== 'patch') {
+    return { feasible: true, file };
   }
 
   const unsupported = checkDeclarationShape(

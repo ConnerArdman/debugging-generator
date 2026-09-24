@@ -39,6 +39,38 @@
  * specifies no views" (a state) and "this panel failed" (an error), which the
  * fallback case pins from the other side.
  *
+ * Five host contracts that are not visible in a single settled render have
+ * their own cases, because each is lost silently rather than loudly:
+ *
+ *   - **The query lifecycle, composed.** Through the real host, contexts and node
+ *     renderer, a query the provider has not answered draws the loading state;
+ *     the answer replaces it with the view; a rejection draws the error state,
+ *     and its retry asks the provider the *same* query again. A controllable
+ *     provider holds each answer until the case releases it, so every
+ *     intermediate state is observed rather than raced past.
+ *   - **Every query names its panel's session.** The resolver is handed the
+ *     specification's `sessionId` with each query, a document that moves to
+ *     another session re-asks under the new one, and a document with no usable
+ *     session is an error rather than a request the service cannot route
+ *     (`POST /sessions/:id/panel-data`, AAP 0.4.2). The two seam rules the host
+ *     relies on — the provider refuses a blank session before its resolver
+ *     runs, and the query hook hands a view the wire's `null` "last page"
+ *     marker as the one end-of-data value, `undefined` — are pinned here too,
+ *     because the host tier's two suites are this one and the registry's.
+ *   - **Unrelated host changes re-render no view.** A surface that rebuilds its
+ *     actions object from the same callbacks, or re-delivers a document whose
+ *     layout nodes did not change, re-renders none of the visualizations; a
+ *     callback that did change does re-render them, which is what proves the
+ *     render counter is watching the right thing.
+ *   - **Siblings are keyed by node id.** Reordering two sibling nodes moves the
+ *     mounted view rather than remounting it, so it keeps its state and asks
+ *     for nothing again — which a position-derived key cannot do.
+ *   - **The outline is stated once and stepped once.** The title is an `h2`,
+ *     the top-level nodes `h3`, and each titled container puts its children
+ *     exactly one level deeper; an untitled container adds no level. Without a
+ *     selection handler, the head's citations are inert text rather than
+ *     focusable controls that do nothing.
+ *
  * ## What this suite deliberately does not do
  *
  * **It never validates a specification before rendering it.** No parser and no
@@ -53,9 +85,12 @@
  * **It does not re-test the components.** The stub provider answers with the
  * smallest response that lets a query-backed node settle, because what is under
  * test here is the host: the contexts it provides, the order it draws in, the
- * recursion it drives and the callbacks it wires. Each view's own states —
- * loading, empty, error — belong to its colocated suite, and the one-to-one
- * coverage of the node catalog belongs to the registry's own colocated suite.
+ * recursion it drives and the callbacks it wires. The lifecycle cases above
+ * drive one view through its states only to prove the *composition* carries
+ * them — that the provider, session and retry the host provides reach a view
+ * three containers deep. How each view draws its own loading, empty and error
+ * states belongs to its colocated suite, and the one-to-one coverage of the
+ * node catalog belongs to the registry's own colocated suite.
  *
  * ## Harness conventions
  *
@@ -82,7 +117,13 @@
  *   - **No timers and no fake clocks.** A query-backed node settles through
  *     `await screen.findAllByRole(…)` inside {@link renderPanel}, which is also
  *     what keeps React state updates inside the test's own await and out of the
- *     console.
+ *     console. A controllable provider's answer is released immediately before
+ *     the `findBy…` query that waits for it, for the same reason.
+ *   - **Renders are counted, not inferred.** The metric view and source chip
+ *     modules are wrapped by pass-through spies (see the `vi.mock` calls
+ *     below), so "this view did not re-render" is a call count rather than a
+ *     guess from unchanged markup. Each wrapper calls the real component, so
+ *     every other case renders exactly what it would unwrapped.
  *
  * @see ./PanelHost for the component, its four responsibilities and the four it
  * refuses.
@@ -107,11 +148,15 @@ import type {
 } from '@debuggen/panel-schema';
 import { DebuggenError, formatSourceLocation } from '@debuggen/shared';
 import type { SourceLocation } from '@debuggen/shared';
-import { cleanup, render, screen, within } from '@testing-library/react';
+import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import type { ReactElement } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Mock } from 'vitest';
 
+import { MetricCards } from '../components/MetricCards';
+import { SourceLink } from '../components/SourceLink';
+import { SummaryHeader } from '../layout/SummaryHeader';
 import {
   DEFAULT_PANEL_THEME,
   PANEL_THEMES,
@@ -119,15 +164,45 @@ import {
   panelThemeAttributeValue,
 } from '../tokens/theme';
 import type { PanelTheme } from '../tokens/theme';
-import { createDataProvider } from './DataProvider';
+import { DataProviderContext, PanelSessionContext, createDataProvider } from './DataProvider';
 import type {
   DataProvider,
   DataQueryResolver,
+  DataQueryResolverContext,
   DataQueryResponse,
   DataResultFor,
 } from './DataProvider';
 import { PanelHost } from './PanelHost';
 import type { PanelActions, PanelEventRef } from './PanelActions';
+import { useQuery } from './useQuery';
+
+/*
+ * Two views, each wrapped by a pass-through spy so its renders can be counted.
+ *
+ * The registry (and, for the source chip, the summary head) imports each view
+ * from these modules, so the spy is what every such node in this suite renders
+ * — and it calls the real component with the arguments React passed, so what
+ * is drawn is unchanged. Hoisted by Vitest above the imports, as a module mock
+ * must be. Two views, because they answer different questions: the metric view
+ * reads data and no actions, so its count isolates the layout's own
+ * memoization; the source chip reads the actions context, so its count is what
+ * a changed — or needlessly rebuilt — context value shows up in.
+ *
+ * Counts are read as a difference across one gesture ({@link countRenders}),
+ * never as an absolute: the suite's `afterEach` restores `vi.spyOn` spies only,
+ * so these counts accumulate across cases by design.
+ */
+vi.mock(import('../components/MetricCards'), async (importOriginal) => {
+  const actual = await importOriginal();
+
+  return { ...actual, MetricCards: vi.fn(actual.MetricCards) };
+});
+
+vi.mock(import('../components/SourceLink'), async (importOriginal) => {
+  const actual = await importOriginal();
+
+  return { ...actual, SourceLink: vi.fn(actual.SourceLink) };
+});
 
 /*
  * ---------------------------------------------------------------------------
@@ -145,6 +220,47 @@ const PANEL_ID = 'panel-under-test';
 
 /** The session the panel claims to belong to. */
 const SESSION_ID = 'session-under-test';
+
+/** A second session, for the case that moves a panel from one session to another. */
+const OTHER_SESSION_ID = 'session-under-test-other';
+
+/**
+ * A session id that names nothing: present, a string, and blank.
+ *
+ * The schema would reject it, and this renderer validates nothing, so a
+ * document carrying it is exactly how a host bug reaches the views.
+ */
+const BLANK_SESSION_ID = '   ';
+
+/** The machine code the controllable provider rejects a first attempt with. */
+const PROVIDER_FAILURE_CODE = 'TRANSPORT_DISCONNECTED';
+
+/**
+ * The code the query hook reports when a view is mounted with a provider but
+ * no usable session: a wiring defect in the host, not a transport failure.
+ */
+const MISSING_SESSION_CODE = 'INTERNAL';
+
+/**
+ * The code the provider rejects a query addressed to no session with, before
+ * its resolver can put it on the wire.
+ */
+const UNADDRESSED_QUERY_CODE = 'PROTOCOL_INVALID_MESSAGE';
+
+/**
+ * The error state's retry control, matched by pattern: the case is about the
+ * control being offered and doing the right thing, not about one wording.
+ */
+const RETRY_PATTERN = /retry/i;
+
+/** The accessible name of {@link NextOffsetProbe}'s output. */
+const NEXT_OFFSET_LABEL = 'next offset';
+
+/** The title of the titled container of {@link makeUntitledMiddleLayout}. */
+const OUTER_TITLE = 'Titled outer section';
+
+/** The title of the titled container nested under an untitled one. */
+const INNER_TITLE = 'Titled inner split';
 
 /** The panel's title, rendered as the head's heading. */
 const PANEL_TITLE = 'Panel under test';
@@ -480,10 +596,88 @@ function makeNestedLayout(): readonly PanelNode[] {
   ];
 }
 
+/**
+ * A titled section holding an **untitled** stack, which holds a titled split.
+ *
+ * The shape that separates "one level per titled container" from "one level
+ * per container": the stack draws no heading, so the split must sit exactly
+ * one level below the section rather than two.
+ *
+ * @returns The layout, as a fresh forest.
+ */
+function makeUntitledMiddleLayout(): readonly PanelNode[] {
+  return [
+    {
+      type: 'section',
+      id: 'layout.0',
+      title: OUTER_TITLE,
+      children: [
+        {
+          type: 'stack',
+          id: 'layout.0.children.0',
+          children: [
+            {
+              type: 'split',
+              id: 'layout.0.children.0.children.0',
+              title: INNER_TITLE,
+              children: [
+                {
+                  type: 'sourceLink',
+                  id: 'layout.0.children.0.children.0.children.0',
+                  location: { ...NODE_LOCATION },
+                },
+                {
+                  type: 'sourceLink',
+                  id: 'layout.0.children.0.children.0.children.1',
+                  location: { ...CAUSE_LOCATION },
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    },
+  ];
+}
+
+/**
+ * Two top-level siblings of different types: the query-backed view first, the
+ * source link second.
+ *
+ * Different types on purpose. A position-derived key would hand the first slot
+ * to whichever node arrives first, and React remounts a slot whose component
+ * type changed — so reordering these two is the gesture that tells an id key
+ * from a position key.
+ *
+ * @returns The two nodes, as fresh objects, in that order.
+ */
+function makeSiblingLayout(): readonly [PanelNode, PanelNode] {
+  return [
+    {
+      type: 'metricCards',
+      id: 'layout.0',
+      query: { source: 'metrics' },
+      metrics: [NODE_METRIC_ID],
+    },
+    {
+      type: 'sourceLink',
+      id: 'layout.1',
+      location: { ...NODE_LOCATION },
+    },
+  ];
+}
+
 /** What a case may replace in {@link makeSpec}. */
 interface SpecOverrides {
   /** The panel's title. */
   readonly title?: string | undefined;
+
+  /**
+   * The session the panel belongs to, {@link SESSION_ID} by default. Replaced
+   * only by the routing cases, which move a panel between sessions or hand the
+   * host one that names nothing.
+   */
+  readonly sessionId?: string | undefined;
 
   /** The summary; a case that is about the head replaces this. */
   readonly summary?: PanelSummary | undefined;
@@ -516,6 +710,7 @@ interface SpecOverrides {
 function makeSpec(overrides: SpecOverrides = {}): PanelSpec {
   const {
     title = PANEL_TITLE,
+    sessionId = SESSION_ID,
     summary = makeSummary(),
     layout = makeNestedLayout(),
     meta,
@@ -524,7 +719,7 @@ function makeSpec(overrides: SpecOverrides = {}): PanelSpec {
   return {
     version: PANEL_SPEC_VERSION,
     id: PANEL_ID,
-    sessionId: SESSION_ID,
+    sessionId,
     panelVersion: 1,
     title,
     summary,
@@ -564,11 +759,7 @@ interface StubProvider {
 function makeDataProvider(): StubProvider {
   const resolve = vi.fn<DataQueryResolver>((query) => {
     if (query.source === 'metrics') {
-      return Promise.resolve<DataQueryResponse>({
-        source: 'metrics',
-        data: METRIC_VALUES,
-        total: METRIC_VALUES.length,
-      });
+      return Promise.resolve(metricsResponse());
     }
 
     return Promise.reject(
@@ -581,6 +772,108 @@ function makeDataProvider(): StubProvider {
   });
 
   return { provider: createDataProvider(resolve), resolve };
+}
+
+/**
+ * The response every metrics query in this suite is answered with.
+ *
+ * @returns A fresh response for the `metrics` source.
+ */
+function metricsResponse(): DataQueryResponse {
+  return { source: 'metrics', data: METRIC_VALUES, total: METRIC_VALUES.length };
+}
+
+/** One query a {@link ControllableProvider} was asked and has not yet answered. */
+interface PendingQuery {
+  /** The query exactly as the resolver received it. */
+  readonly query: DataQuery;
+
+  /** The resolver context it arrived with: the session, and the abort signal. */
+  readonly context: DataQueryResolverContext;
+
+  /** Settles the call with a response. */
+  readonly answer: (response: DataQueryResponse) => void;
+
+  /** Settles the call with a rejection. */
+  readonly fail: (error: Error) => void;
+}
+
+/** A provider whose every answer is held until the case releases it. */
+interface ControllableProvider extends StubProvider {
+  /**
+   * The oldest query not yet taken, removed from the queue. Throws when the
+   * provider has been asked nothing new, so a case that expected a request
+   * fails at the line that expected it.
+   */
+  readonly takeNext: () => PendingQuery;
+}
+
+/**
+ * A provider that answers nothing on its own.
+ *
+ * Each call parks a {@link PendingQuery} and returns a promise only the case can
+ * settle, which is what makes the loading state observable at all: a provider
+ * that answers on the next microtask settles before a case can look. Built
+ * through `createDataProvider`, like the answering stub, so the seam under test
+ * is the library's own — source check and session hand-over included.
+ *
+ * @returns The provider, its recorded resolver, and the queue of open calls.
+ */
+function makeControllableProvider(): ControllableProvider {
+  const pending: PendingQuery[] = [];
+
+  const resolve = vi.fn<DataQueryResolver>(
+    (query, context) =>
+      new Promise<DataQueryResponse>((answer, fail) => {
+        pending.push({ query, context, answer, fail });
+      }),
+  );
+
+  const takeNext = (): PendingQuery => {
+    const next = pending.shift();
+    if (next === undefined) {
+      throw new Error('the controllable provider has no unanswered query');
+    }
+
+    return next;
+  };
+
+  return { provider: createDataProvider(resolve), resolve, takeNext };
+}
+
+/**
+ * The resolver context of the `index`-th call a recorded resolver received.
+ *
+ * @param resolve The recorded resolver.
+ * @param index The zero-based call index.
+ * @returns The context of that call.
+ */
+function resolverContextAt(
+  resolve: Mock<DataQueryResolver>,
+  index: number,
+): DataQueryResolverContext {
+  const call = resolve.mock.calls[index];
+  if (call === undefined) {
+    throw new Error(`the data provider recorded no call at index ${String(index)}`);
+  }
+
+  return call[1];
+}
+
+/**
+ * The query of the `index`-th call a recorded resolver received.
+ *
+ * @param resolve The recorded resolver.
+ * @param index The zero-based call index.
+ * @returns The query of that call.
+ */
+function resolverQueryAt(resolve: Mock<DataQueryResolver>, index: number): DataQuery {
+  const call = resolve.mock.calls[index];
+  if (call === undefined) {
+    throw new Error(`the data provider recorded no call at index ${String(index)}`);
+  }
+
+  return call[0];
 }
 
 /** A host's `PanelActions`, with every member a panel could raise spied on. */
@@ -653,6 +946,13 @@ interface RenderedPanel {
 
   /** The provider stub in scope for this render. */
   readonly provider: StubProvider;
+
+  /**
+   * Re-renders the same host with another document and, optionally, another
+   * actions object — the provider and theme stay what they were, which is how
+   * a surface re-delivers a panel. Does not wait for anything to settle.
+   */
+  readonly rerender: (spec: PanelSpec, actions?: PanelActions) => void;
 }
 
 /**
@@ -740,7 +1040,7 @@ async function renderPanel(
 ): Promise<RenderedPanel> {
   const { actions = makeActions(), provider = makeDataProvider(), theme } = options;
 
-  const { container } = render(
+  const view = render(
     <PanelHost
       spec={spec}
       dataProvider={provider.provider}
@@ -755,7 +1055,74 @@ async function renderPanel(
     expect(views).toHaveLength(expected);
   }
 
-  return { container, actions, provider };
+  const rerender = (next: PanelSpec, nextActions: PanelActions = actions.actions): void => {
+    view.rerender(
+      <PanelHost
+        spec={next}
+        dataProvider={provider.provider}
+        actions={nextActions}
+        theme={theme}
+      />,
+    );
+  };
+
+  return { container: view.container, actions, provider, rerender };
+}
+
+/** How many times each counted view rendered during one gesture. */
+interface RenderCounts {
+  /** Renders of the metric view, which reads data and no actions. */
+  readonly metricViews: number;
+
+  /** Renders of every source chip — layout node and head alike — which read the actions. */
+  readonly sourceLinks: number;
+}
+
+/**
+ * How many times each counted view renders while `gesture` runs.
+ *
+ * Differences rather than absolutes, because the spies' counts accumulate
+ * across the whole suite (see the module mocks above).
+ *
+ * @param gesture What the case does to the mounted panel.
+ * @returns The renders the gesture caused, per view.
+ */
+function countRenders(gesture: () => void): RenderCounts {
+  const metricViews = vi.mocked(MetricCards).mock.calls.length;
+  const sourceLinks = vi.mocked(SourceLink).mock.calls.length;
+
+  gesture();
+
+  return {
+    metricViews: vi.mocked(MetricCards).mock.calls.length - metricViews,
+    sourceLinks: vi.mocked(SourceLink).mock.calls.length - sourceLinks,
+  };
+}
+
+/** What {@link NextOffsetProbe} is asked to read. */
+interface NextOffsetProbeProps {
+  /** The query the probe hands the hook, unmodified. */
+  readonly query: DataQuery;
+}
+
+/**
+ * The smallest view over the query hook: it prints what the hook reports as the
+ * next page's offset once the query settles, and the status until then.
+ *
+ * Rendered only by the paging-marker case, which is about the one value no
+ * catalogued view prints directly.
+ *
+ * @param props See {@link NextOffsetProbeProps}.
+ * @returns The printed value, in a live output element.
+ */
+function NextOffsetProbe(props: NextOffsetProbeProps): ReactElement {
+  const { status, nextOffset } = useQuery(props.query);
+
+  return (
+    <output aria-label={NEXT_OFFSET_LABEL}>
+      {status === 'success' ? String(nextOffset) : status}
+    </output>
+  );
 }
 
 /*
@@ -1276,6 +1643,401 @@ describe('PanelHost layout rendering', () => {
     expect(container.querySelectorAll('[role="alert"]')).toHaveLength(0);
     expect(container.querySelectorAll('.dg-panel__node')).toHaveLength(0);
     expect(fallbackBanner()).toBeNull();
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The query lifecycle, through the host (AAP 0.6.2, 0.5.5)
+ * ---------------------------------------------------------------------------
+ */
+
+describe('PanelHost query lifecycle', () => {
+  it('draws the loading state until the provider answers, then the resolved view', async () => {
+    const spec = makeSpec();
+    const provider = makeControllableProvider();
+
+    render(
+      <PanelHost spec={spec} dataProvider={provider.provider} actions={makeActions().actions} />,
+    );
+
+    const stack = screen.getByRole('region', { name: STACK_TITLE });
+
+    // Asked once, with the document's own query, and not answered yet.
+    expect(provider.resolve).toHaveBeenCalledTimes(1);
+    const request = provider.takeNext();
+    expect(request.query).toEqual(firstNodeQuery(spec));
+
+    // Loading, announced as such, and nothing drawn in the view's place: no
+    // resolved view, and no error for a request that has not failed.
+    const loading = within(stack).getByRole('status');
+    expect(loading.getAttribute('aria-busy')).toBe('true');
+    expect(within(stack).queryByRole('list', { name: METRIC_VIEW_NAME })).toBeNull();
+    expect(within(stack).queryByRole('alert')).toBeNull();
+
+    request.answer(metricsResponse());
+
+    // The answer replaces the loading state with the view it describes.
+    await within(stack).findByRole('list', { name: METRIC_VIEW_NAME });
+    expect(within(stack).queryByRole('status')).toBeNull();
+    expect(within(stack).queryByRole('alert')).toBeNull();
+    expect(provider.resolve).toHaveBeenCalledTimes(1);
+  });
+
+  it('maps a provider rejection to the error state, and retries the very same query', async () => {
+    const spec = makeSpec();
+    const provider = makeControllableProvider();
+
+    render(
+      <PanelHost spec={spec} dataProvider={provider.provider} actions={makeActions().actions} />,
+    );
+
+    const stack = screen.getByRole('region', { name: STACK_TITLE });
+    const first = provider.takeNext();
+
+    first.fail(
+      new DebuggenError(PROVIDER_FAILURE_CODE, 'The transport closed before the page arrived.', {
+        hint: 'Reconnect, then retry.',
+      }),
+    );
+
+    // The rejection is an error state carrying the failure's own code — never
+    // a view drawn over no data, and never still loading (AAP 0.5.5).
+    const alert = await within(stack).findByRole('alert');
+    expect(alert.textContent).toContain(PROVIDER_FAILURE_CODE);
+    expect(within(stack).queryByRole('list', { name: METRIC_VIEW_NAME })).toBeNull();
+    expect(within(stack).queryByRole('status')).toBeNull();
+
+    const user = userEvent.setup();
+    await user.click(within(alert).getByRole('button', { name: RETRY_PATTERN }));
+
+    // The retry asks again — the same query, for the same session — and the
+    // superseded attempt's request is aborted rather than left to land late.
+    expect(provider.resolve).toHaveBeenCalledTimes(2);
+    const second = provider.takeNext();
+    expect(second.query).toEqual(first.query);
+    expect(second.query).toEqual(firstNodeQuery(spec));
+    expect(second.context.sessionId).toBe(first.context.sessionId);
+    expect(first.context.signal?.aborted).toBe(true);
+    expect(second.context.signal?.aborted).toBe(false);
+
+    // While it is in flight the view is loading again, not still in error.
+    expect(within(stack).getByRole('status').getAttribute('aria-busy')).toBe('true');
+    expect(within(stack).queryByRole('alert')).toBeNull();
+
+    second.answer(metricsResponse());
+
+    await within(stack).findByRole('list', { name: METRIC_VIEW_NAME });
+    expect(within(stack).queryByRole('alert')).toBeNull();
+    expect(provider.resolve).toHaveBeenCalledTimes(2);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Session routing: every query names its panel's session (AAP 0.4.2)
+ * ---------------------------------------------------------------------------
+ */
+
+describe('PanelHost session routing', () => {
+  it('addresses every query to the session its specification names', async () => {
+    const spec = makeSpec();
+    const { provider } = await renderPanel(spec);
+
+    expect(provider.resolve).toHaveBeenCalledTimes(1);
+
+    // The session travels beside the query rather than inside it: the query is
+    // the document's own, and the session is what the route is addressed by.
+    const context = resolverContextAt(provider.resolve, 0);
+    expect(context.sessionId).toBe(spec.sessionId);
+    expect(context.sessionId).toBe(SESSION_ID);
+    expect(context.signal).toBeInstanceOf(AbortSignal);
+    expect(resolverQueryAt(provider.resolve, 0)).toEqual(firstNodeQuery(spec));
+  });
+
+  it('asks again, under the new session, when a panel moves to another session', async () => {
+    const spec = makeSpec();
+    const { provider, rerender } = await renderPanel(spec);
+
+    // The same node objects, so the only thing that changed is the session:
+    // an answer for the old session must not stand in for the new one.
+    rerender(makeSpec({ sessionId: OTHER_SESSION_ID, summary: spec.summary, layout: spec.layout }));
+
+    await waitFor(() => {
+      expect(provider.resolve).toHaveBeenCalledTimes(2);
+    });
+    await screen.findByRole('list', { name: METRIC_VIEW_NAME });
+
+    expect(resolverContextAt(provider.resolve, 1).sessionId).toBe(OTHER_SESSION_ID);
+    expect(resolverQueryAt(provider.resolve, 1)).toEqual(resolverQueryAt(provider.resolve, 0));
+  });
+
+  it('draws an error, and asks the provider nothing, for a document naming no session', async () => {
+    const provider = makeDataProvider();
+
+    render(
+      <PanelHost
+        spec={makeSpec({ sessionId: BLANK_SESSION_ID })}
+        dataProvider={provider.provider}
+        actions={makeActions().actions}
+      />,
+    );
+
+    const stack = screen.getByRole('region', { name: STACK_TITLE });
+
+    // A request the service cannot route is not made at all, and the view says
+    // why instead of loading forever.
+    const alert = await within(stack).findByRole('alert');
+    expect(alert.textContent).toContain(MISSING_SESSION_CODE);
+    expect(provider.resolve).not.toHaveBeenCalled();
+    expect(within(stack).queryByRole('list', { name: METRIC_VIEW_NAME })).toBeNull();
+  });
+});
+
+describe('the session-addressed data seam the host relies on', () => {
+  it('hands the resolver the session it was asked for, beside the abort signal', async () => {
+    const resolve = vi.fn<DataQueryResolver>(() => Promise.resolve(metricsResponse()));
+    const provider = createDataProvider(resolve);
+    const controller = new AbortController();
+
+    const response = await provider.query(
+      SESSION_ID,
+      { source: 'metrics' },
+      { signal: controller.signal },
+    );
+
+    expect(response.source).toBe('metrics');
+    expect(resolve).toHaveBeenCalledTimes(1);
+    expect(resolverQueryAt(resolve, 0)).toEqual({ source: 'metrics' });
+
+    const context = resolverContextAt(resolve, 0);
+    expect(context.sessionId).toBe(SESSION_ID);
+    expect(context.signal).toBe(controller.signal);
+  });
+
+  it.each(['', BLANK_SESSION_ID])(
+    'refuses a query addressed to %j before its resolver runs',
+    async (sessionId) => {
+      const resolve = vi.fn<DataQueryResolver>(() => Promise.resolve(metricsResponse()));
+      const provider = createDataProvider(resolve);
+
+      const refused = provider.query(sessionId, { source: 'metrics' });
+
+      await expect(refused).rejects.toBeInstanceOf(DebuggenError);
+      await expect(refused).rejects.toMatchObject({ code: UNADDRESSED_QUERY_CODE });
+      expect(resolve).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    { wire: null, total: 0, printed: 'undefined' },
+    { wire: 200, total: 400, printed: '200' },
+  ])(
+    'hands a view the next page offset $printed when the wire reports $wire',
+    async ({ wire, total, printed }) => {
+      // `null` is the wire's "this is the last page"; a view reads exactly one
+      // end-of-data value, `undefined`, so the hook folds one into the other
+      // and passes every real offset through unchanged.
+      const resolve = vi.fn<DataQueryResolver>(() =>
+        Promise.resolve<DataQueryResponse>({ source: 'events', data: [], total, nextOffset: wire }),
+      );
+
+      render(
+        <DataProviderContext.Provider value={createDataProvider(resolve)}>
+          <PanelSessionContext.Provider value={SESSION_ID}>
+            <NextOffsetProbe query={{ source: 'events' }} />
+          </PanelSessionContext.Provider>
+        </DataProviderContext.Provider>,
+      );
+
+      await waitFor(() => {
+        expect(screen.getByLabelText(NEXT_OFFSET_LABEL).textContent).toBe(printed);
+      });
+      expect(resolverContextAt(resolve, 0).sessionId).toBe(SESSION_ID);
+    },
+  );
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Re-rendering and keys: unrelated host changes leave the views alone
+ * ---------------------------------------------------------------------------
+ */
+
+describe('PanelHost re-rendering', () => {
+  it('re-renders no view when a surface rebuilds its actions from the same callbacks', async () => {
+    const spec = makeSpec();
+    const { actions, provider, rerender } = await renderPanel(spec);
+
+    // A fresh object literal, as a surface writes one inline in its JSX.
+    const renders = countRenders(() => {
+      rerender(spec, { ...actions.actions });
+    });
+
+    expect(renders).toEqual({ metricViews: 0, sourceLinks: 0 });
+    expect(provider.resolve).toHaveBeenCalledTimes(1);
+  });
+
+  it('re-renders the views that read the actions when a callback did change', async () => {
+    const spec = makeSpec();
+    const { actions, provider, rerender } = await renderPanel(spec);
+    const onExpand = vi.fn<(nodeId: string, itemId: string, expanded: boolean) => void>();
+
+    // The control case for the one above: a changed handler is a real change,
+    // and the views that could call it must see it.
+    const renders = countRenders(() => {
+      rerender(spec, { ...actions.actions, onExpand });
+    });
+
+    expect(renders.sourceLinks).toBeGreaterThan(0);
+
+    // The metric view reads no actions, and its layout did not change.
+    expect(renders.metricViews).toBe(0);
+    expect(provider.resolve).toHaveBeenCalledTimes(1);
+  });
+
+  it('re-renders no view when a re-delivered document keeps its layout nodes', async () => {
+    const spec = makeSpec();
+    const { provider, rerender } = await renderPanel(spec);
+    const retitled = 'A retitled panel under test';
+
+    // A new document object and a new layout array, holding the very same node
+    // objects: what a store hands back when only the head changed.
+    const renders = countRenders(() => {
+      rerender(makeSpec({ title: retitled, summary: spec.summary, layout: spec.layout }));
+    });
+
+    screen.getByRole('heading', { name: retitled });
+    expect(renders.metricViews).toBe(0);
+    expect(provider.resolve).toHaveBeenCalledTimes(1);
+  });
+
+  it('moves a mounted view, rather than remounting it, when siblings are reordered', async () => {
+    const [metrics, link] = makeSiblingLayout();
+    const spec = makeSpec({ layout: [metrics, link] });
+    const { provider, rerender } = await renderPanel(spec);
+
+    const viewBefore = screen.getByRole('list', { name: METRIC_VIEW_NAME });
+    const pathBefore = viewBefore.closest('[data-node-path]')?.getAttribute('data-node-path');
+
+    rerender(makeSpec({ summary: spec.summary, layout: [link, metrics] }));
+
+    // The same element, still in the document: keyed by node id, the view
+    // moved with its node. A position key would have handed its slot to the
+    // source link and mounted a fresh view — and a fresh query — in the other.
+    const viewAfter = screen.getByRole('list', { name: METRIC_VIEW_NAME });
+    expect(viewAfter).toBe(viewBefore);
+    expect(viewAfter.isConnected).toBe(true);
+    expect(provider.resolve).toHaveBeenCalledTimes(1);
+
+    // The document order did change, and the diagnostic path followed it.
+    const chip = screen.getByRole('button', { name: chipName(NODE_LOCATION) });
+    expect(chip.compareDocumentPosition(viewAfter) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+    const pathAfter = viewAfter.closest('[data-node-path]')?.getAttribute('data-node-path');
+    expect(pathBefore).toBeDefined();
+    expect(pathAfter).toBeDefined();
+    expect(pathAfter).not.toBe(pathBefore);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The document outline, and inert citations (AAP 0.6.4)
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * The level of every heading on screen, in document order.
+ *
+ * Read off the element's tag, which is what the heading primitive chooses by
+ * level, so a level that is stated but not rendered cannot pass.
+ *
+ * @returns One level per heading.
+ */
+function headingLevels(): number[] {
+  return screen.getAllByRole('heading').map((heading) => Number(heading.tagName.slice(1)));
+}
+
+describe('PanelHost document outline', () => {
+  it('draws the title at level 2 and steps one level per titled container', async () => {
+    await renderPanel(makeSpec());
+
+    screen.getByRole('heading', { level: 2, name: PANEL_TITLE });
+    screen.getByRole('heading', { level: 3, name: OBSERVED_REGION_NAME });
+    screen.getByRole('heading', { level: 3, name: LIKELY_CAUSE_REGION_NAME });
+    screen.getByRole('heading', { level: 3, name: SECTION_TITLE });
+    screen.getByRole('heading', { level: 4, name: SPLIT_TITLE });
+    screen.getByRole('heading', { level: 5, name: STACK_TITLE });
+
+    // And, whatever the layout, the outline starts at the title and never
+    // skips a level on the way down.
+    const levels = headingLevels();
+    expect(levels[0]).toBe(2);
+    levels.forEach((level, index) => {
+      const previous = levels[index - 1];
+      if (previous !== undefined) {
+        expect(level).toBeLessThanOrEqual(previous + 1);
+      }
+    });
+  });
+
+  it('adds no level under a container that draws no heading', async () => {
+    await renderPanel(makeSpec({ layout: makeUntitledMiddleLayout() }));
+
+    screen.getByRole('heading', { level: 3, name: OUTER_TITLE });
+    screen.getByRole('heading', { level: 4, name: INNER_TITLE });
+  });
+});
+
+describe('SummaryHeader citations without a selection handler', () => {
+  it('renders every citation as inert text, never as a control that does nothing', async () => {
+    const onOpenSource = vi.fn<(location: SourceLocation) => void>();
+
+    render(
+      <SummaryHeader title={PANEL_TITLE} summary={makeSummary()} onOpenSource={onOpenSource} />,
+    );
+
+    const citations: readonly (readonly [string, string, HTMLElement])[] = [
+      [FIRST_CITATION_LABEL, FIRST_EVENT_ID, observedRegion()],
+      [SECOND_CITATION_LABEL, SECOND_EVENT_ID, observedRegion()],
+      [CAUSE_CITATION_LABEL, CAUSE_EVENT_ID, causesRegion()],
+    ];
+
+    for (const [label, eventId, region] of citations) {
+      // Still there, still in its register, still naming its event…
+      const citation = within(region).getByText(label);
+      expect(citation.getAttribute('data-event-id')).toBe(eventId);
+
+      // …but not a control: nothing to press, nothing to focus.
+      expect(screen.queryByRole('button', { name: label })).toBeNull();
+      expect(citation.closest('button')).toBeNull();
+      expect(citation.hasAttribute('tabindex')).toBe(false);
+    }
+
+    // The one control left is the source chip, which has a handler to reach.
+    const chip = screen.getByRole('button', { name: chipName(CAUSE_LOCATION) });
+    expect(screen.getAllByRole('button')).toEqual([chip]);
+
+    const user = userEvent.setup();
+    await user.tab();
+    expect(document.activeElement).toBe(chip);
+  });
+
+  it('renders every citation as a selectable chip once a handler is supplied', async () => {
+    const onSelectEvent = vi.fn<(ref: PanelEventRef) => void>();
+
+    render(
+      <SummaryHeader title={PANEL_TITLE} summary={makeSummary()} onSelectEvent={onSelectEvent} />,
+    );
+
+    for (const label of [FIRST_CITATION_LABEL, SECOND_CITATION_LABEL, CAUSE_CITATION_LABEL]) {
+      screen.getByRole('button', { name: label });
+    }
+
+    await clickByName(CAUSE_CITATION_LABEL, causesRegion());
+    expect(soleArgument(onSelectEvent, 'event selection').eventId).toBe(CAUSE_EVENT_ID);
   });
 });
 

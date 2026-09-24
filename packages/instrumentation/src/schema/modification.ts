@@ -964,6 +964,9 @@ export function createModificationRecord(
  *   (restoration is impossible, so the record is surfaced rather than closed)
  * the restored content did not hash to originalHash   → 'restore-verification-failed'
  *   (the write completed but produced the wrong bytes; the backup is kept)
+ * the file's open records do not form one chain      → 'record-chain-fork'
+ *   (two live records layered on one parent, or two open chains over one file,
+ *   so no reverse order exists and cleanup refuses the file before reading it)
  * ```
  *
  * Every one of them means the same thing operationally: **no write is
@@ -979,6 +982,7 @@ export const MODIFICATION_CONFLICT_REASONS = Object.freeze([
   'file-missing',
   'backup-missing',
   'restore-verification-failed',
+  'record-chain-fork',
 ] as const);
 
 /**

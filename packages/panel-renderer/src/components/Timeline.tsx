@@ -25,13 +25,14 @@
  *   `../utils/scale`'s `flattenTraceRows` — a trace node carries no parent
  *   pointer by design (a cycle is not JSON, and the tree crosses an HTTP
  *   response), so every algorithm here works top-down.
- * - `spans` resolves to one PAGE of a flat event list. Order is canonical
- *   (`startTime`, then the producer's own sequence) and depth is derived from
- *   the `parentSpanId` chains that are present IN THAT PAGE. A span whose
- *   parent is simply not on the page is drawn at depth 0 and is **not** called
- *   an orphan: the correlator's `orphaned` flag means "the parent never
- *   arrived at all", which is a different statement, and conflating the two
- *   would invent evidence.
+ * - `spans` resolves to a flat event list, one PAGE per request, and every
+ *   page loaded so far is drawn together (see "Paging" below). Order is
+ *   canonical (`startTime`, then the producer's own sequence) and depth is
+ *   derived from the `parentSpanId` chains that are present AMONG THE LOADED
+ *   ROWS. A span whose parent is simply not loaded is drawn at depth 0 and is
+ *   **not** called an orphan: the correlator's `orphaned` flag means "the
+ *   parent never arrived at all", which is a different statement, and
+ *   conflating the two would invent evidence.
  *
  * ## Nothing here is measured
  *
@@ -62,6 +63,17 @@
  * already excludes clicks that originate inside an interactive descendant, so
  * opening a file never also selects a span.
  *
+ * A row's full description — the sentence a bar carries as its SVG title — is
+ * keyboard-reachable too, because a tooltip opens on focus and an unfocusable
+ * trigger would make it hover-only. Two routes lead to it, and neither adds a
+ * tab stop to every row. The row that holds focus drives the detail strip above
+ * the table, whose name is a focusable tooltip trigger reached by Shift+Tab
+ * from the row (past the strip's source chip, when the row has one). And
+ * the name in that row's own Operation cell becomes a tab stop — in that row
+ * only, one Tab from the row itself — while the name in every other row stays
+ * out of the tab order, so the body remains the single roving stop the table
+ * primitive makes it plus the one trigger of the row being read.
+ *
  * ## Evidence is rendered as it arrives
  *
  * - An **ambiguous** async continuation — more than one settled request had an
@@ -72,9 +84,11 @@
  * - An **orphan** — a span whose parent never arrived, re-attached to the
  *   trace root — is marked and kept. Dropping it would silently remove real
  *   work from the picture.
- * - A **partial** result says so: the `spans` page reports how much of the
- *   result it holds and offers to load more; a `trace` reports the
- *   correlator's own truncation and the walk's.
+ * - A **partial** result says so: a `spans` result reports how much of it is
+ *   on screen and, for as long as the service names a next offset, offers the
+ *   next page — appended after the rows already drawn, which stay on screen
+ *   while it loads and if it fails; a `trace` reports the correlator's own
+ *   truncation and the walk's.
  * - URLs, statements and attribute values arrive redacted and truncated
  *   (AAP 0.5.2). They are rendered exactly as given: nothing here reconstructs
  *   a URL, expands a statement or dumps an attribute bag.
@@ -128,7 +142,7 @@ import type {
 } from '@debuggen/telemetry';
 import clsx from 'clsx';
 import { useCallback, useMemo, useState } from 'react';
-import type { CSSProperties, ReactElement, ReactNode } from 'react';
+import type { CSSProperties, FocusEvent as ReactFocusEvent, ReactElement, ReactNode } from 'react';
 
 import { Stack } from '../layout/Stack';
 import { Toolbar } from '../layout/Toolbar';
@@ -143,7 +157,13 @@ import { ErrorState } from '../primitives/ErrorState';
 import { LoadingState } from '../primitives/LoadingState';
 import { Text } from '../primitives/Text';
 import { Tooltip } from '../primitives/Tooltip';
-import { DATA_QUERY_DEFAULT_LIMIT, DATA_QUERY_MAX_LIMIT } from '../host/DataProvider';
+import {
+  DATA_QUERY_DEFAULT_LIMIT,
+  DATA_QUERY_DEFAULT_OFFSET,
+  DATA_QUERY_MAX_LIMIT,
+  useDataProvider,
+} from '../host/DataProvider';
+import type { DataProvider } from '../host/DataProvider';
 import { usePanelActions } from '../host/PanelActions';
 import { useQuery } from '../host/useQuery';
 import { kindColorVar, tierColorVar } from '../utils/color';
@@ -527,7 +547,7 @@ function barFromEvent(event: TelemetryEvent, depth: number): UnassignedBar {
     lineageAmbiguous: readBooleanAttribute(attributes, LINEAGE_AMBIGUOUS_ATTRIBUTE),
     lineageCandidates: readStringListAttribute(attributes, LINEAGE_CANDIDATES_ATTRIBUTE),
     // The correlator's own flag, and nothing else. A parent that is merely
-    // absent from THIS PAGE is not an orphan (see this module's header).
+    // absent from THE LOADED ROWS is not an orphan (see this module's header).
     orphaned: readBooleanAttribute(attributes, ORPHANED_ATTRIBUTE),
     orphanReason: undefined,
   };
@@ -674,7 +694,10 @@ function modelFromTrace(tree: TraceTree): TimelineModel {
   };
 }
 
-/** One page of a flat span list as rows, ordered canonically and depth-derived. */
+/**
+ * The loaded rows of a flat span list — every page loaded so far, already
+ * de-duplicated — as rows, ordered canonically and depth-derived.
+ */
 function modelFromSpans(events: readonly TelemetryEvent[]): TimelineModel {
   const ordered = [...events].sort(compareSpans);
 
@@ -1215,14 +1238,17 @@ function TimelineCanvas(props: TimelineCanvasProps): ReactElement {
 
 /** What {@link TimelineDetail} shows. */
 interface TimelineDetailProps {
-  /** The row under the pointer, or the selected one when the pointer is away. */
+  /**
+   * The row under the pointer; when the pointer is away, the row in the table
+   * that holds keyboard focus; and otherwise the selected one.
+   */
   readonly row: TimelineBar;
   /** The window start every offset is measured from. */
   readonly origin: number;
 }
 
 /**
- * The hovered or selected row, spelled out beside the canvas.
+ * The hovered, focused or selected row, spelled out beside the canvas.
  *
  * This is where a bar's description is readable: the `Tooltip` primitive wraps
  * an HTML element and cannot wrap an SVG shape, so the stylesheet gives this
@@ -1230,6 +1256,11 @@ interface TimelineDetailProps {
  * same sentence as its SVG title. Everything the tooltip contract asks for is
  * here — the name, the kind, the tier, the duration, the offset, the status and
  * the lineage notes — and the chip, where the row resolved to a location.
+ *
+ * The name is the tooltip's trigger, and it is focusable on purpose: the
+ * primitive opens on focus, so an unfocusable trigger would leave the full
+ * description to pointer users alone. It is named by its own text, and the
+ * global `:focus-visible` rule in `../styles/base.css` draws its ring.
  */
 function TimelineDetail(props: TimelineDetailProps): ReactElement {
   const { row, origin } = props;
@@ -1245,7 +1276,7 @@ function TimelineDetail(props: TimelineDetailProps): ReactElement {
       </Badge>
       <div className="dg-timeline__tooltip">
         <Tooltip content={describeBar(row, origin)}>
-          <Text size="sm" truncate>
+          <Text size="sm" truncate tabIndex={0}>
             {row.name}
           </Text>
         </Tooltip>
@@ -1283,9 +1314,21 @@ function TimelineDetail(props: TimelineDetailProps): ReactElement {
  * and the table primitive does not treat a click inside one as a row
  * activation, so opening a file never also selects the span.
  *
+ * The name in the Operation cell is the trigger of the row's description, and
+ * it is a tab stop in exactly one row: the one that holds keyboard focus, one
+ * Tab from the row itself. Every other row's name carries no `tabIndex` at all
+ * — not `-1`, which would make a click on the name focus the text instead of
+ * its row and strand the arrow keys the table answers only on a row — so the
+ * table body gains one tab stop, not one per rendered row (see this module's
+ * header).
+ *
  * @param origin The window start every offset in the table is measured from.
+ * @param focusedEventId The row that holds keyboard focus, if any.
  */
-function timelineColumns(origin: number): readonly DataTableColumn<TimelineBar>[] {
+function timelineColumns(
+  origin: number,
+  focusedEventId: string | undefined,
+): readonly DataTableColumn<TimelineBar>[] {
   return [
     {
       key: 'name',
@@ -1295,7 +1338,7 @@ function timelineColumns(origin: number): readonly DataTableColumn<TimelineBar>[
       cell: (row) => (
         <Stack direction="horizontal" gap={1} align="center" wrap>
           <Tooltip content={describeBar(row, origin)}>
-            <Text size="sm" truncate>
+            <Text size="sm" truncate tabIndex={row.eventId === focusedEventId ? 0 : undefined}>
               {row.name}
             </Text>
           </Tooltip>
@@ -1381,34 +1424,205 @@ function rowKeyOf(row: TimelineBar): string {
   return row.eventId;
 }
 
+/**
+ * The attribute `DataTable` writes on each data row: the row's index into the
+ * `rows` it was given. The header row is `role="row"` too and never carries it,
+ * which is what keeps it out of {@link DATA_ROW_SELECTOR}.
+ */
+const ROW_INDEX_ATTRIBUTE = 'data-row-index';
+
+/** A data row of the equivalent table, as `DataTable` renders one. */
+const DATA_ROW_SELECTOR = `[role="row"][${ROW_INDEX_ATTRIBUTE}]`;
+
+/**
+ * The row whose data row, in the equivalent table, contains `target`.
+ *
+ * Focus can land on the row itself (the table's roving stop) or on a control
+ * inside it (the name trigger, a source chip); both belong to that row. The row
+ * element is resolved inside `container` only, so a table nesting this view can
+ * never lend it a row of its own.
+ *
+ * @param target Where focus landed.
+ * @param container The element that holds the equivalent table.
+ * @param rows The rows that table was given, in its order.
+ * @returns The row, or `undefined` when focus is not inside a data row.
+ */
+function rowHoldingFocus(
+  target: EventTarget,
+  container: Element,
+  rows: readonly TimelineBar[],
+): TimelineBar | undefined {
+  if (!(target instanceof Element)) {
+    return undefined;
+  }
+
+  const rowElement = target.closest(DATA_ROW_SELECTOR);
+  if (rowElement === null || !container.contains(rowElement)) {
+    return undefined;
+  }
+
+  const index = Number.parseInt(rowElement.getAttribute(ROW_INDEX_ATTRIBUTE) ?? '', 10);
+
+  return Number.isInteger(index) ? rows[index] : undefined;
+}
+
+/** The row carrying `eventId`, or `undefined` for none or an id not on screen. */
+function rowWithId(
+  rows: readonly TimelineBar[],
+  eventId: string | undefined,
+): TimelineBar | undefined {
+  return eventId === undefined ? undefined : rows.find((row) => row.eventId === eventId);
+}
+
 /*
  * ---------------------------------------------------------------------------
  * Paging
  *
- * A page is grown rather than accumulated: "load more" raises the REQUESTED
- * WINDOW (`limit`) from the query's own offset instead of appending a second
- * page to a list held in state. Two reasons, and the first is decisive:
- * appending would mean writing state when a page settles — that is, from an
- * effect — which this package does not do, and the service orders every paged
- * source under a stable secondary key, so a wider window is a superset of a
- * narrower one and never a reshuffle of it.
+ * Only the `spans` source is paged. A `trace` is one correlated tree, drawn
+ * whole, and reports its own truncation instead of offering more.
  *
- * The page count is held ALONGSIDE the identity of the query it belongs to, so
- * a node whose query changes returns to its first page by derivation during
- * render, with no reset write anywhere.
+ * A span result is walked page by page, exactly as the service pages it. Every
+ * request asks for the SAME page size — the authored limit, held inside the
+ * contract's bounds. The first request starts at the authored offset (the
+ * contract's default when none was authored), and each further request starts
+ * at the `nextOffset` the previous response named. Nothing else advances the
+ * walk: an offset is never derived from the length of a page (that drifts the
+ * moment the service clamps a limit), a `total` never implies that another page
+ * exists, and a response that names no next offset is the service saying the
+ * result is exhausted. No ceiling on the rows loaded so far stops the walk
+ * either, so a result longer than `DATA_QUERY_MAX_LIMIT` is reachable to its
+ * last page, and a page already on screen is never requested a second time.
+ *
+ * The pages already loaded live in a {@link PageAccumulator} written ONLY by
+ * the "Load more" handler. At the click the rows on screen, the offset to
+ * advance to and the total are all in hand, so the accumulator is complete
+ * before the next page is requested and no state is ever written from an
+ * effect. It is stamped with the identity of the query it belongs to, and a
+ * render whose query identity differs discards it by comparison — a node whose
+ * query changes returns to its first page with no reset write anywhere, and no
+ * frame ever mixes the rows of two queries.
+ *
+ * The rows on screen are the accumulated rows followed by the page that
+ * settled, each event once, first occurrence kept, in the order the service
+ * delivered them. The service's stable ordering means a page does not repeat a
+ * row, so the de-duplication is a guard rather than a correction: a capture
+ * that grew between two requests can push a row across a page boundary, and
+ * drawing it twice would double-count real work.
  * ---------------------------------------------------------------------------
  */
 
-/** How many pages of the current query the reader has asked for. */
-interface PageState {
-  /** The identity of the query those pages belong to. */
-  readonly key: string;
-  /** How many pages' worth of rows to request; at least one. */
-  readonly pages: number;
+/**
+ * The pages of one span query loaded before the page now in flight.
+ *
+ * Immutable once written: loading a further page writes a new accumulator
+ * whose `rows` already include every earlier page, so a page is never
+ * re-requested and never re-merged into the rows before it.
+ */
+interface PageAccumulator {
+  /**
+   * The identity of the query these pages belong to: the node and its
+   * authored query. The offset of the page in flight is not part of it — that
+   * is {@link offset} — so advancing never discards the pages it advanced past.
+   */
+  readonly identity: string;
+
+  /** Every row loaded before the page in flight, de-duplicated, in arrival order. */
+  readonly rows: readonly TelemetryEvent[];
+
+  /** The offset of the page in flight: the `nextOffset` the previous page named. */
+  readonly offset: number;
+
+  /**
+   * The total the service last reported, carried across the request so the
+   * footer keeps stating it while the next page is in flight or has failed.
+   */
+  readonly total: number | undefined;
 }
 
-/** The first page of whatever query arrives first. */
-const INITIAL_PAGE: PageState = Object.freeze({ key: '', pages: 1 });
+/** No rows: the carried list before any page has been accumulated. */
+const NO_EVENTS: readonly TelemetryEvent[] = Object.freeze([]);
+
+/** The footer control that asks for the next page. */
+const LOAD_MORE_LABEL = 'Load more spans';
+
+/** The same control while that page is in flight: the appending indicator. */
+const LOADING_MORE_LABEL = 'Loading more spans…';
+
+/** The title shown for a resolved span page that held nothing but named a next page. */
+const EMPTY_PAGE_TITLE = 'Nothing on this page';
+
+/**
+ * The sentence for that page. It speaks only of the page: saying the capture
+ * holds no spans would contradict the offset the provider just returned.
+ */
+const EMPTY_PAGE_MESSAGE =
+  'This page of spans held nothing to place on the axis. More of the result remains to be loaded.';
+
+/** The title of the footer's failure, when the rows above it are still good. */
+const PAGE_ERROR_TITLE = 'The next page of spans could not be loaded';
+
+/** The footer failure's message when the provider's error carried none. */
+const PAGE_ERROR_MESSAGE =
+  'The spans already shown are unaffected; retry to request the page again.';
+
+/**
+ * The offset of the page after the one requested at `offset`, or `undefined`
+ * when there is none.
+ *
+ * Only the service's own `nextOffset` advances the walk (see "Paging" above).
+ * An absent value is the end of the result. So is a value that is not a safe
+ * integer, or one that does not move past the page it follows: requesting it
+ * would re-request rows already on screen — or loop on them forever — rather
+ * than reach new ones.
+ *
+ * @param nextOffset The `nextOffset` the settled page reported.
+ * @param offset The offset that page was requested at.
+ * @returns The offset to request next, or `undefined` at the end of the result.
+ */
+function offsetAfterPage(nextOffset: number | undefined, offset: number): number | undefined {
+  if (nextOffset === undefined || !Number.isSafeInteger(nextOffset) || nextOffset <= offset) {
+    return undefined;
+  }
+
+  return nextOffset;
+}
+
+/**
+ * The rows already loaded followed by the page that settled, each event once.
+ *
+ * Keyed by event id, which is unique per record even across duplicate span ids.
+ * The first occurrence wins and arrival order is kept, so a row already on
+ * screen never moves or changes because a later page repeated it. A page that
+ * adds nothing returns `loaded` itself, which keeps every memo downstream of it
+ * from recomputing.
+ *
+ * @param loaded The rows of every earlier page, already de-duplicated.
+ * @param page The page that just settled, in the service's order.
+ * @returns The rows to draw.
+ */
+function appendPage(
+  loaded: readonly TelemetryEvent[],
+  page: readonly TelemetryEvent[],
+): readonly TelemetryEvent[] {
+  const seen = new Set<string>();
+  for (const event of loaded) {
+    seen.add(event.id);
+  }
+
+  const appended: TelemetryEvent[] = [];
+  for (const event of page) {
+    if (!seen.has(event.id)) {
+      seen.add(event.id);
+      appended.push(event);
+    }
+  }
+
+  if (appended.length === 0) {
+    return loaded;
+  }
+
+  return loaded.length === 0 ? appended : [...loaded, ...appended];
+}
 
 /*
  * ---------------------------------------------------------------------------
@@ -1440,6 +1654,15 @@ export interface TimelineProps {
  * @returns The chart and its tabular equivalent, or whichever of the three
  * states — loading, empty or failed — the node's query is currently in.
  *
+ * The stateful view is rendered under a `key` that changes exactly when the
+ * ambient `DataProvider` is replaced (see {@link useProviderGeneration}). A
+ * host that rebinds a mounted panel to another session swaps the provider
+ * without remounting the node, and the same node id and query can recur in
+ * that session's panel; the accumulated pages, the next offset and the
+ * selected, hovered and focused rows of the previous provider must not
+ * survive into it, so a new provider is a new instance that paints none of
+ * them and starts from the authored first page.
+ *
  * @example The node a panel carries, rendered inside a host that provides a
  * data provider and the panel actions.
  * ```tsx
@@ -1447,15 +1670,65 @@ export interface TimelineProps {
  * ```
  */
 export function Timeline(props: TimelineProps): ReactElement {
+  const providerGeneration = useProviderGeneration();
+
+  return <TimelineView key={providerGeneration} {...props} />;
+}
+
+/** The provider a view was last rendered under, and how many it has seen. */
+interface ProviderBinding {
+  /** The ambient `DataProvider` of the latest render. */
+  readonly provider: DataProvider | undefined;
+
+  /** Incremented each time that provider is replaced by a different one. */
+  readonly generation: number;
+}
+
+/**
+ * A number that changes exactly when the ambient `DataProvider` is replaced.
+ *
+ * The binding is adjusted during render, React's documented pattern for state
+ * that follows a changed input: the replaced render is discarded before
+ * commit, so nothing loaded from the previous provider is ever painted under
+ * the new one. Compared by reference, which is what a provider's identity is:
+ * a host creates one per session.
+ *
+ * @returns The current provider's generation.
+ */
+function useProviderGeneration(): number {
+  const provider = useDataProvider();
+  const [binding, setBinding] = useState<ProviderBinding>(() => ({ provider, generation: 0 }));
+
+  if (binding.provider !== provider) {
+    const next: ProviderBinding = { provider, generation: binding.generation + 1 };
+    setBinding(next);
+    return next.generation;
+  }
+
+  return binding.generation;
+}
+
+/**
+ * The stateful body of {@link Timeline}: one provider's pages, selection and
+ * focus for one node.
+ *
+ * @param props The props, as documented on {@link TimelineProps}.
+ * @returns The chart and its tabular equivalent, or one of the three states.
+ */
+function TimelineView(props: TimelineProps): ReactElement {
   const { node, className } = props;
 
   // Read unconditionally, as a hook must be, and `undefined` outside a host by
   // that module's documented contract: a surface with no actions still renders.
   const actions = usePanelActions();
 
-  const [page, setPage] = useState<PageState>(INITIAL_PAGE);
+  const [pages, setPages] = useState<PageAccumulator | undefined>(undefined);
   const [selectedEventId, setSelectedEventId] = useState<string | undefined>(undefined);
   const [hoveredEventId, setHoveredEventId] = useState<string | undefined>(undefined);
+  // The row of the equivalent table that holds keyboard focus, while focus is
+  // anywhere inside this view: it drives the detail strip and makes that row's
+  // name a tab stop (see this module's header).
+  const [focusedEventId, setFocusedEventId] = useState<string | undefined>(undefined);
 
   const source = node.query.source;
 
@@ -1465,13 +1738,26 @@ export function Timeline(props: TimelineProps): ReactElement {
   // shared axis, so there is nothing honest to draw from it.
   const supported = CATALOG_ENTRY.sources.includes(source);
 
-  // The identity of the request, for the page counter above. It is compared and
-  // never parsed, and it includes the node's id so two nodes carrying the same
-  // query page independently.
+  // The identity of the page sequence, for the accumulator above: the node's id
+  // and its AUTHORED query, and never the offset of the page in flight, which
+  // lives on the accumulator. It is compared and never parsed; the node's id is
+  // in it so two nodes carrying the same query page independently, and a change
+  // to anything the panel authored — the authored offset included, since that
+  // is where the sequence starts — is a different sequence.
   const queryIdentity = `${node.id}|${JSON.stringify(node.query)}`;
-  const pages = page.key === queryIdentity ? page.pages : 1;
-  const authoredLimit = node.query.limit ?? DATA_QUERY_DEFAULT_LIMIT;
-  const requestedLimit = clamp(authoredLimit * pages, authoredLimit, DATA_QUERY_MAX_LIMIT);
+
+  // Discarded during render rather than reset from an effect: the comparison is
+  // pure, so a node whose query changed can never paint the old query's rows,
+  // not even for one frame, and it returns to its first page by derivation.
+  const activePages = pages !== undefined && pages.identity === queryIdentity ? pages : undefined;
+  const carriedRows = activePages?.rows ?? NO_EVENTS;
+
+  // One page size for every request, held inside the contract's bounds and
+  // never grown; the walk advances by offset instead (see "Paging"). The floor
+  // is the schema's own: an authored `0` is an explicit request for a total
+  // without rows and is sent as written, never rounded up into a row.
+  const pageLimit = clamp(node.query.limit ?? DATA_QUERY_DEFAULT_LIMIT, 0, DATA_QUERY_MAX_LIMIT);
+  const pageOffset = activePages?.offset ?? node.query.offset ?? DATA_QUERY_DEFAULT_OFFSET;
 
   // The query's source is the discriminant, so the narrowed request is BUILT
   // from it rather than asserted about the payload: each branch hands the hook a
@@ -1483,11 +1769,20 @@ export function Timeline(props: TimelineProps): ReactElement {
     supported && source === 'trace' ? { ...node.query, source: 'trace' } : undefined;
   const spansQuery: (DataQuery & { source: 'spans' }) | undefined =
     supported && source === 'spans'
-      ? { ...node.query, source: 'spans', limit: requestedLimit }
+      ? { ...node.query, source: 'spans', limit: pageLimit, offset: pageOffset }
       : undefined;
 
   const traceResult = useQuery(traceQuery);
   const spansResult = useQuery(spansQuery);
+
+  // The span page that settled, or `undefined` while one is in flight or after
+  // it failed — in which case the carried rows alone are what is on screen.
+  const spansPage = spansResult.status === 'success' ? (spansResult.data ?? NO_EVENTS) : undefined;
+
+  const spanRows = useMemo<readonly TelemetryEvent[]>(
+    () => (spansPage === undefined ? carriedRows : appendPage(carriedRows, spansPage)),
+    [carriedRows, spansPage],
+  );
 
   const model = useMemo<TimelineModel | undefined>(() => {
     const tree = traceResult.data;
@@ -1495,13 +1790,15 @@ export function Timeline(props: TimelineProps): ReactElement {
       return modelFromTrace(tree);
     }
 
-    const spans = spansResult.data;
-    if (spans !== undefined) {
-      return modelFromSpans(spans);
+    // Every row loaded so far. While a further page is in flight, or after it
+    // failed, that is the rows already on screen, which stay there; before the
+    // first page settles there is nothing to model and the loading state shows.
+    if (spansPage !== undefined || spanRows.length > 0) {
+      return modelFromSpans(spanRows);
     }
 
     return undefined;
-  }, [traceResult.data, spansResult.data]);
+  }, [traceResult.data, spansPage, spanRows]);
 
   const geometry = useMemo<TimelineGeometry | undefined>(
     () => (model === undefined ? undefined : buildGeometry(model)),
@@ -1524,12 +1821,74 @@ export function Timeline(props: TimelineProps): ReactElement {
     setHoveredEventId(eventId);
   }, []);
 
+  // Follows focus into the equivalent table, wherever in a row it lands. React's
+  // `onFocus` bubbles, so one handler on the table's wrapper sees the roving row
+  // and every control inside it; focus that lands outside a data row changes
+  // nothing.
+  const modelRows = model?.rows;
+  const handleEquivalentFocus = useCallback(
+    (event: ReactFocusEvent<HTMLDivElement>): void => {
+      if (modelRows === undefined) {
+        return;
+      }
+
+      const row = rowHoldingFocus(event.target, event.currentTarget, modelRows);
+      if (row !== undefined) {
+        setFocusedEventId(row.eventId);
+      }
+    },
+    [modelRows],
+  );
+
+  // Forgets the focused row only when focus leaves this view altogether. Moving
+  // from a row to the detail strip above the table — which shows that row — or
+  // to the footer keeps it, so the strip does not change under the reader.
+  const handleBlockBlur = useCallback((event: ReactFocusEvent<HTMLDivElement>): void => {
+    const next = event.relatedTarget;
+    if (next instanceof Node && event.currentTarget.contains(next)) {
+      return;
+    }
+
+    setFocusedEventId(undefined);
+  }, []);
+
+  // Where the next page starts, read off the page that settled; `undefined`
+  // whenever there is no next page to offer — a trace, a page still in flight or
+  // failed, or a response that named no usable next offset.
+  const nextPageOffset =
+    source === 'spans' && spansResult.status === 'success'
+      ? offsetAfterPage(spansResult.nextOffset, pageOffset)
+      : undefined;
+
+  // The total the service reported for the whole span result, kept from the
+  // last page that reported one while the next is in flight or has failed.
+  const knownTotal = spansResult.total ?? activePages?.total;
+
+  // The ONLY writer of the accumulator. Every row on screen — the carried rows
+  // and the page that just settled — becomes the carried rows of the next page,
+  // so nothing already loaded is ever requested again.
   const handleLoadMore = useCallback((): void => {
-    setPage({ key: queryIdentity, pages: pages + 1 });
-  }, [pages, queryIdentity]);
+    if (nextPageOffset === undefined) {
+      return;
+    }
+
+    setPages({
+      identity: queryIdentity,
+      rows: spanRows,
+      offset: nextPageOffset,
+      total: knownTotal,
+    });
+  }, [nextPageOffset, queryIdentity, spanRows, knownTotal]);
 
   const activeResult = source === 'trace' ? traceResult : spansResult;
   const serializedQuery = JSON.stringify(node.query, null, 2);
+
+  // A further span page in flight behind rows already on screen, and one that
+  // failed behind them. Both are reported in the footer; neither replaces the
+  // chart and table the reader is already reading.
+  const appending =
+    source === 'spans' && spansResult.status === 'loading' && carriedRows.length > 0;
+  const pageFailed = source === 'spans' && spansResult.status === 'error' && carriedRows.length > 0;
 
   let content: ReactNode;
 
@@ -1545,13 +1904,13 @@ export function Timeline(props: TimelineProps): ReactElement {
         />
       </div>
     );
-  } else if (activeResult.status === 'loading') {
+  } else if (activeResult.status === 'loading' && !appending) {
     content = (
       <div className="dg-timeline__loading">
         <LoadingState variant="chart" label="Loading the correlated timeline…" />
       </div>
     );
-  } else if (activeResult.status === 'error') {
+  } else if (activeResult.status === 'error' && !pageFailed) {
     content = (
       <div className="dg-timeline__error">
         <ErrorState
@@ -1561,6 +1920,31 @@ export function Timeline(props: TimelineProps): ReactElement {
           onRetry={activeResult.retry}
         />
       </div>
+    );
+  } else if (
+    (model === undefined || geometry === undefined || model.rows.length === 0) &&
+    nextPageOffset !== undefined
+  ) {
+    // A resolved span page with nothing on it that still names where the next
+    // page starts. The provider's offset is the whole of the paging contract,
+    // so the rows after it stay reachable: the page is reported as empty —
+    // never the capture — and the paging control is offered as under a full page.
+    content = (
+      <>
+        <div className="dg-timeline__empty">
+          <EmptyState title={EMPTY_PAGE_TITLE} message={EMPTY_PAGE_MESSAGE} />
+        </div>
+        <Stack direction="horizontal" gap={2} align="center" justify="between" wrap>
+          <Text size="xs" tone="muted">
+            {knownTotal === undefined
+              ? `${formatCount(0)} spans shown.`
+              : `Showing ${formatCount(0)} of ${formatCount(knownTotal)} spans.`}
+          </Text>
+          <Button variant="secondary" size="sm" onClick={handleLoadMore}>
+            {LOAD_MORE_LABEL}
+          </Button>
+        </Stack>
+      </>
     );
   } else if (model === undefined || geometry === undefined || model.rows.length === 0) {
     content = (
@@ -1574,13 +1958,26 @@ export function Timeline(props: TimelineProps): ReactElement {
   } else {
     const windowMs = model.endTime - model.startTime;
     const loaded = model.rows.length;
-    const total = activeResult.total;
-    const morePages =
-      activeResult.nextOffset !== undefined || (total !== undefined && loaded < total);
-    const canLoadMore = source === 'spans' && morePages && requestedLimit < DATA_QUERY_MAX_LIMIT;
-    const partial = model.truncated || morePages;
+    // Only a span result reports a total; a trace states its own truncation.
+    const total = source === 'spans' ? knownTotal : undefined;
+    // Offered only while the service names a next page. A total larger than
+    // what is loaded is stated in the footer and marked as partial, but never
+    // taken to mean that a further page exists.
+    const canLoadMore = nextPageOffset !== undefined;
+    const partial =
+      model.truncated ||
+      canLoadMore ||
+      appending ||
+      pageFailed ||
+      (total !== undefined && loaded < total);
 
-    const detailRow = model.rows.find((row) => row.eventId === (hoveredEventId ?? selectedEventId));
+    // The pointer first, then keyboard focus, then the selection: each is
+    // resolved against the rows on screen on its own, so an id that no longer
+    // names a row falls through to the next rather than blanking the strip.
+    const detailRow =
+      rowWithId(model.rows, hoveredEventId) ??
+      rowWithId(model.rows, focusedEventId) ??
+      rowWithId(model.rows, selectedEventId);
 
     const canvasLabel = `${CATALOG_ENTRY.label}: ${formatCount(
       loaded,
@@ -1627,12 +2024,12 @@ export function Timeline(props: TimelineProps): ReactElement {
           <TimelineDetail row={detailRow} origin={model.startTime} />
         )}
 
-        <div className="dg-timeline__equivalent">
+        <div className="dg-timeline__equivalent" onFocus={handleEquivalentFocus}>
           <DataTable<TimelineBar>
             id={`${node.id}-rows`}
             caption={`${node.title ?? CATALOG_ENTRY.label}: every captured span of this interaction, with its kind, tier, offset and duration.`}
             rows={model.rows}
-            columns={timelineColumns(model.startTime)}
+            columns={timelineColumns(model.startTime, focusedEventId)}
             rowKey={rowKeyOf}
             selectedRowKey={selectedEventId ?? null}
             onRowActivate={handleSelect}
@@ -1644,15 +2041,42 @@ export function Timeline(props: TimelineProps): ReactElement {
           <Text size="xs" tone="muted">
             {footerText}
           </Text>
-          {canLoadMore ? (
-            <Button variant="secondary" size="sm" onClick={handleLoadMore}>
-              Load more spans
+          {canLoadMore || appending ? (
+            // Kept in place while the page it asked for is in flight — disabled
+            // and busy, its label the appending indicator — so the control
+            // does not vanish from under the reader's pointer or focus.
+            <Button
+              variant="secondary"
+              size="sm"
+              disabled={!canLoadMore}
+              aria-busy={appending}
+              onClick={handleLoadMore}
+            >
+              {appending ? LOADING_MORE_LABEL : LOAD_MORE_LABEL}
             </Button>
           ) : null}
         </Stack>
+
+        {pageFailed ? (
+          // The next page failed, the rows above it did not: the failure and
+          // its retry sit below them, and the retry re-requests that same page.
+          <div className="dg-timeline__error">
+            <ErrorState
+              title={PAGE_ERROR_TITLE}
+              message={spansResult.error?.message ?? PAGE_ERROR_MESSAGE}
+              code={spansResult.error?.code}
+              query={JSON.stringify(spansQuery ?? node.query, null, 2)}
+              onRetry={spansResult.retry}
+            />
+          </div>
+        ) : null}
       </>
     );
   }
 
-  return <div className={clsx('dg-timeline', className)}>{content}</div>;
+  return (
+    <div className={clsx('dg-timeline', className)} onBlur={handleBlockBlur}>
+      {content}
+    </div>
+  );
 }

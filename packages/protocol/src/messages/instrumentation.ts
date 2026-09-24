@@ -110,7 +110,8 @@
  *   appears anywhere in this package, which is loaded by a Node process and by
  *   three page-side bundles alike.
  * - **One folder edge.** The import block is `zod`, `@debuggen/shared`,
- *   `@debuggen/instrumentation`, `../version.js` and `./error.js` — the last
+ *   `@debuggen/instrumentation/schema` (the browser-safe entry of that
+ *   package, never its root), `../version.js` and `./error.js` — the last
  *   being this folder's single permitted intra-folder edge and the reason
  *   `./error.ts` imports no sibling of its own. Nothing here imports
  *   `../envelope.js`, `../http.js` or `../client/**`: those modules sit *above*
@@ -140,8 +141,8 @@ import {
   captureSignalSchema,
   instrumentationPlanSchema,
   modificationRecordSchema,
-} from '@debuggen/instrumentation';
-import type { UnavailableSignal } from '@debuggen/instrumentation';
+} from '@debuggen/instrumentation/schema';
+import type { UnavailableSignal } from '@debuggen/instrumentation/schema';
 
 import { protocolParseError } from '../version.js';
 import { errorPayloadSchema } from './error.js';

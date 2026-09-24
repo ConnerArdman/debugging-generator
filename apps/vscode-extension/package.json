@@ -163,7 +163,7 @@
         "debuggen.serviceUrl": {
           "type": "string",
           "default": "http://127.0.0.1:43117",
-          "scope": "machine-overridable",
+          "scope": "machine",
           "markdownDescription": "Base URL of the local coordination service. It must match the `DEBUGGEN_HOST` and `DEBUGGEN_PORT` values the service listens on."
         },
         "debuggen.autoStartService": {
@@ -202,7 +202,7 @@
     "watch": "node esbuild.mjs --watch",
     "watch:webview": "vite build --watch",
     "typecheck": "tsc -b tsconfig.json tsconfig.webview.json",
-    "test": "vitest run --root ../.. --project vscode-extension-webview",
+    "test": "vitest run --root ../.. --project vscode-extension-webview --project vscode-extension-host",
     "pretest:vscode": "node esbuild.mjs --production --tests && vite build",
     "test:vscode": "vscode-test",
     "package": "vsce package --no-dependencies",

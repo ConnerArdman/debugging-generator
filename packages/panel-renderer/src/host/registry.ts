@@ -64,8 +64,9 @@
  *   set (AAP 0.6.4).
  * - **A node's heading belongs to its container.** The query-backed components
  *   deliberately do not render `node.title`; the node renderer wraps a titled
- *   node in `../layout/Section`. The adapters below therefore forward a title
- *   only for the three containers, whose title *is* their own heading.
+ *   node in `../layout/Section`. The adapters below therefore forward a title —
+ *   and the outline level the node renderer assigned it — only for the three
+ *   containers, whose title *is* their own heading.
  * - **No back edge.** The dependency runs one way — `PanelHost` →
  *   `NodeRenderer` → this registry → the components — so this module imports
  *   neither of the first two, and it reaches no transport: the components read
@@ -96,6 +97,7 @@ import { Waterfall } from '../components/Waterfall';
 import { Section } from '../layout/Section';
 import { Split } from '../layout/Split';
 import { Stack } from '../layout/Stack';
+import type { HeadingLevel } from '../primitives/Heading';
 
 /*
  * ---------------------------------------------------------------------------
@@ -136,6 +138,23 @@ export interface PanelNodeComponentProps {
    * is the same value in the ordinary case.
    */
   nodeId: string;
+
+  /**
+   * The outline level of this node's own heading, supplied by the node renderer
+   * for a container type and absent for a leaf.
+   *
+   * A container's title *is* its heading, drawn by the layout primitive its
+   * adapter selects, so the level the node renderer is tracking has to reach
+   * that primitive — without it, every container would sit at its primitive's
+   * own default depth whatever it was nested in, and a section inside a split
+   * inside a section would repeat or skip a level. The three container adapters
+   * forward it; the leaf adapters ignore it, because a labelled leaf's heading
+   * is the wrapper the node renderer draws around the leaf, not the leaf's own.
+   *
+   * Absent, the primitive's documented default applies, which is what a caller
+   * dispatching one node outside any outline gets.
+   */
+  headingLevel?: HeadingLevel | undefined;
 
   /**
    * The node's already-rendered children, supplied by the node renderer for a
@@ -210,9 +229,12 @@ function unexpectedNodeType(node: PanelNode, expected: PanelNodeType): never {
  * Container adapters
  *
  * The three types whose catalogue entries set `supportsChildren`. Each forwards
- * the node's own labels and the children the node renderer rendered, and leaves
- * every other prop of the layout primitive at that primitive's default: a field
- * the schema does not carry is not a value this file may invent (AAP 0.6.4).
+ * the node's own labels, the outline level the node renderer assigned its
+ * heading, and the children the node renderer rendered, and leaves every other
+ * prop of the layout primitive at that primitive's default: a field the schema
+ * does not carry is not a value this file may invent (AAP 0.6.4). The level is
+ * not such a field — it is the node's position in the rendered outline, which
+ * only the node renderer knows.
  * ---------------------------------------------------------------------------
  */
 
@@ -222,7 +244,11 @@ function unexpectedNodeType(node: PanelNode, expected: PanelNodeType): never {
  * @param props The uniform contract; `children` are the rendered child nodes.
  * @returns The section, wrapping its children.
  */
-function SectionNodeAdapter({ node, children }: PanelNodeComponentProps): ReactElement {
+function SectionNodeAdapter({
+  node,
+  headingLevel,
+  children,
+}: PanelNodeComponentProps): ReactElement {
   if (node.type !== 'section') {
     return unexpectedNodeType(node, 'section');
   }
@@ -230,6 +256,7 @@ function SectionNodeAdapter({ node, children }: PanelNodeComponentProps): ReactE
   return createElement(Section, {
     title: node.title,
     description: node.description,
+    headingLevel,
     children,
   });
 }
@@ -246,7 +273,7 @@ SectionNodeAdapter.displayName = 'SectionNodeAdapter';
  * @param props The uniform contract; `children` are the rendered panes.
  * @returns The division, with its panes.
  */
-function SplitNodeAdapter({ node, children }: PanelNodeComponentProps): ReactElement {
+function SplitNodeAdapter({ node, headingLevel, children }: PanelNodeComponentProps): ReactElement {
   if (node.type !== 'split') {
     return unexpectedNodeType(node, 'split');
   }
@@ -255,6 +282,7 @@ function SplitNodeAdapter({ node, children }: PanelNodeComponentProps): ReactEle
     direction: node.direction,
     title: node.title,
     description: node.description,
+    headingLevel,
     children,
   });
 }
@@ -266,7 +294,7 @@ SplitNodeAdapter.displayName = 'SplitNodeAdapter';
  * @param props The uniform contract; `children` are the rendered child nodes.
  * @returns The flow container, with its children.
  */
-function StackNodeAdapter({ node, children }: PanelNodeComponentProps): ReactElement {
+function StackNodeAdapter({ node, headingLevel, children }: PanelNodeComponentProps): ReactElement {
   if (node.type !== 'stack') {
     return unexpectedNodeType(node, 'stack');
   }
@@ -274,6 +302,7 @@ function StackNodeAdapter({ node, children }: PanelNodeComponentProps): ReactEle
   return createElement(Stack, {
     title: node.title,
     description: node.description,
+    headingLevel,
     children,
   });
 }

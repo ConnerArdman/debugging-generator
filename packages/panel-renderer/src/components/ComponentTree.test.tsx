@@ -9,8 +9,10 @@
  *   - **Accessibility is the substance, not a garnish.** AAP 0.6.4 names this
  *     component's shape explicitly: ARIA roles on the tree, full keyboard
  *     navigation, and a highlight that is never colour alone. So the tree's
- *     roles, its single roving tab stop, each of the seven keys it owns, and the
- *     word beside the highlight's icon are all asserted mechanically rather than
+ *     roles, its single roving tab stop — with the toggles and source chips kept
+ *     out of the Tab order —, each of the seven navigation and activation keys
+ *     it owns, the Shift+Enter command that opens a row's source, and the word
+ *     beside the highlight's icon are all asserted mechanically rather than
  *     described in a comment.
  *   - **A snapshot states its own limits (AAP 0.6.6).** The structure is taken
  *     at the last commit of a capture and cannot always be reconstructed, so
@@ -96,12 +98,12 @@ import type {
   ComponentTreeSnapshot,
   RenderTrigger,
 } from '@debuggen/telemetry';
-import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Mock } from 'vitest';
 
-import { DataProviderContext, createDataProvider } from '../host/DataProvider';
+import { DataProviderContext, PanelSessionContext, createDataProvider } from '../host/DataProvider';
 import type { DataProvider, DataQueryResolver, DataQueryResponse } from '../host/DataProvider';
 import { PanelActionsContext } from '../host/PanelActions';
 import type { PanelActions, PanelEventRef } from '../host/PanelActions';
@@ -168,6 +170,39 @@ const LEAF_SOURCE: SourceLocation = Object.freeze({
 /** The accessible name the source chip announces (`SourceLink`'s own shape). */
 const SOURCE_CHIP_NAME = `Open ${SOURCE_FILE}:${String(SOURCE_LINE)}:${String(SOURCE_COLUMN)}`;
 
+/**
+ * A second resolved location, for a **branch** row.
+ *
+ * On a branch Enter toggles rather than opening anything, so this is where the
+ * Shift+Enter command is the only keyboard route to the source. Frozen for the
+ * same identity assertions as {@link LEAF_SOURCE}.
+ */
+const BRANCH_SOURCE_FILE = 'src/example/section.tsx';
+const BRANCH_SOURCE_LINE = 12;
+const BRANCH_SOURCE_COLUMN = 3;
+const BRANCH_SOURCE: SourceLocation = Object.freeze({
+  file: BRANCH_SOURCE_FILE,
+  line: BRANCH_SOURCE_LINE,
+  column: BRANCH_SOURCE_COLUMN,
+  symbol: 'ExampleBranch',
+  resolvedBy: 'react-owner',
+  confidence: 0.8,
+});
+
+/** The branch chip's accessible name. */
+const BRANCH_SOURCE_CHIP_NAME = `Open ${BRANCH_SOURCE_FILE}:${String(BRANCH_SOURCE_LINE)}:${String(
+  BRANCH_SOURCE_COLUMN,
+)}`;
+
+/** The row command that opens a row's source, as `aria-keyshortcuts` spells it. */
+const OPEN_SOURCE_SHORTCUT = 'Shift+Enter';
+
+/**
+ * The one-line hint in the note, as its text content reads: the `Kbd` chord
+ * contributes its keys and the separator between them.
+ */
+const OPEN_SOURCE_HINT = 'Press Shift+Enter on a row to open its source.';
+
 /*
  * The product copy these cases pin.
  *
@@ -206,6 +241,8 @@ const LOADING_LABEL = 'Loading the component tree…';
 const CAPTURED_ORIGIN_LABEL = 'Captured structure';
 const RECONSTRUCTED_ORIGIN_LABEL = 'Reconstructed structure';
 const FLAT_ORIGIN_LABEL = 'Flat listing';
+const CAPTURED_ORIGIN_DETAIL =
+  'The runtime serialized this structure itself, at the last commit of the capture.';
 const RECONSTRUCTED_ORIGIN_DETAIL =
   'Rebuilt from the components that rendered during the capture, so anything that did not render is missing from it.';
 const FLAT_ORIGIN_DETAIL =
@@ -604,6 +641,54 @@ const UNEVEN_STRUCTURE: readonly ComponentTreeNode[] = [
 /** The threshold the uneven structure derives, and the marks it produces. */
 const UNEVEN_DERIVED_THRESHOLD = 6;
 
+/**
+ * The uniform shape again, with the location on the **branch** instead of the
+ * leaf.
+ *
+ * Every node reports three renders, so nothing is marked and only the root
+ * opens: the branch that carries the location is on screen and closed, which is
+ * what the Shift+Enter cases need to prove the command opens the source without
+ * toggling the row.
+ */
+const SOURCED_BRANCH_STRUCTURE: readonly ComponentTreeNode[] = [
+  makeTreeNode({
+    id: `${COMPONENT_TREE_NODE_ID_PREFIX}0`,
+    component: 'ExampleRoot',
+    depth: 0,
+    renderCount: 3,
+    totalDurationMs: 24,
+    children: [
+      makeTreeNode({
+        id: `${COMPONENT_TREE_NODE_ID_PREFIX}0/0`,
+        component: 'ExampleBranch',
+        depth: 1,
+        renderCount: 3,
+        totalDurationMs: 9,
+        source: BRANCH_SOURCE,
+        children: [
+          makeTreeNode({
+            id: `${COMPONENT_TREE_NODE_ID_PREFIX}0/0/0`,
+            component: 'ExampleLeaf',
+            depth: 2,
+            renderCount: 3,
+            totalDurationMs: 6,
+          }),
+        ],
+      }),
+      makeTreeNode({
+        id: `${COMPONENT_TREE_NODE_ID_PREFIX}0/1`,
+        component: 'ExampleAside',
+        depth: 1,
+        renderCount: 3,
+        totalDurationMs: 3,
+      }),
+    ],
+  }),
+];
+
+/** The branch's own id, as the host hears it in a disclosure report. */
+const SOURCED_BRANCH_ID = `${COMPONENT_TREE_NODE_ID_PREFIX}0/0`;
+
 /** Nodes in each chain of {@link DEEP_STRUCTURE}, and how many chains it has. */
 const DEEP_CHAIN_LENGTH = 12;
 const DEEP_CHAIN_COUNT = 3;
@@ -839,6 +924,13 @@ function makeActions(): ActionSpies {
 }
 
 /**
+ * The session the rendered view's queries are addressed to, provided the way
+ * `PanelHost` provides a specification's `sessionId`. Nothing below asserts on
+ * it: the routing contract is pinned by `../host/PanelHost.test.tsx`.
+ */
+const PANEL_SESSION_ID = 'session-under-test';
+
+/**
  * Renders the component inside both host contexts.
  *
  * @param node The node to draw.
@@ -850,9 +942,11 @@ function renderComponent(
 ): void {
   render(
     <DataProviderContext.Provider value={context.provider}>
-      <PanelActionsContext.Provider value={context.actions}>
-        <ComponentTree node={node} />
-      </PanelActionsContext.Provider>
+      <PanelSessionContext.Provider value={PANEL_SESSION_ID}>
+        <PanelActionsContext.Provider value={context.actions}>
+          <ComponentTree node={node} />
+        </PanelActionsContext.Provider>
+      </PanelSessionContext.Provider>
     </DataProviderContext.Provider>,
   );
 }
@@ -970,6 +1064,79 @@ async function renderUniformTree(): Promise<{
   await screen.findByRole('tree');
 
   return { spies, stub, user };
+}
+
+/**
+ * The element a widget names as its description with `aria-describedby`.
+ *
+ * The note above the tree is that element, which is how its lines reach a
+ * screen reader the moment the tree takes focus — so "announced with the tree"
+ * is asserted as containment in this element rather than assumed.
+ *
+ * @param widget The tree or list.
+ * @returns The describing element.
+ */
+function describedBy(widget: HTMLElement): HTMLElement {
+  const id = widget.getAttribute('aria-describedby') ?? '';
+  const description = id === '' ? null : document.getElementById(id);
+
+  if (description === null) {
+    throw new Error('the widget names no description element');
+  }
+
+  return description;
+}
+
+/**
+ * Asserts that a sentence is on screen as ordinary visible text inside a
+ * widget's description.
+ *
+ * "Visible" is checked against the three ways this package hides text: a
+ * tooltip bubble (which is `role="tooltip"` and, while closed, also
+ * `dg-visually-hidden`), and the screen-reader-only utility on its own. A
+ * sentence that passes is readable without hovering anything and is announced
+ * the moment the widget takes focus.
+ *
+ * @param widget The tree or list whose `aria-describedby` must hold it.
+ * @param text The exact sentence.
+ */
+function expectVisibleInDescription(widget: HTMLElement, text: string): void {
+  const element = screen.getByText(text);
+
+  expect(element.getAttribute('role')).not.toBe('tooltip');
+  expect(element.closest('[role="tooltip"]')).toBeNull();
+  expect(element.closest('.dg-tooltip__bubble')).toBeNull();
+  expect(element.closest('.dg-visually-hidden')).toBeNull();
+  expect(describedBy(widget).contains(element)).toBe(true);
+}
+
+/**
+ * The open-source keyboard hint in the note, or `null` when it is not shown.
+ *
+ * Matched on the whole line's text, which only the hint's own element carries
+ * exactly: the note around it holds more text, and the chord inside it less.
+ *
+ * @returns The hint's element.
+ */
+function sourceHint(): HTMLElement | null {
+  return screen.queryByText(
+    (_content, element) => element !== null && element.textContent === OPEN_SOURCE_HINT,
+  );
+}
+
+/**
+ * Presses Shift+Enter on a row as a bare `keydown`, and reports whether the
+ * component consumed it.
+ *
+ * `fireEvent` answers with `dispatchEvent`'s own result, which is `false`
+ * exactly when a handler called `preventDefault` — the observable difference
+ * between a key the widget took and a key it left to the page.
+ *
+ * @param target The element holding focus.
+ * @returns Whether the key was consumed.
+ */
+function shiftEnterConsumed(target: HTMLElement): boolean {
+  return !fireEvent.keyDown(target, { key: 'Enter', shiftKey: true });
 }
 
 // Explicit, per the harness note above: automatic cleanup belongs to the
@@ -1226,9 +1393,10 @@ describe('ComponentTree honesty about its snapshot', () => {
     );
 
     renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
-    await screen.findByRole('tree');
+    const tree = await screen.findByRole('tree');
 
     expect(screen.getByText(CAPTURED_ORIGIN_LABEL).classList.contains('dg-badge')).toBe(true);
+    expectVisibleInDescription(tree, CAPTURED_ORIGIN_DETAIL);
     expect(screen.queryByText(RECONSTRUCTED_ORIGIN_LABEL)).toBeNull();
     expect(screen.queryByText(FLAT_ORIGIN_LABEL)).toBeNull();
     expect(screen.queryByText(DEGRADED_NOTE)).toBeNull();
@@ -1245,12 +1413,18 @@ describe('ComponentTree honesty about its snapshot', () => {
     );
 
     renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
-    await screen.findByRole('tree');
+    const tree = await screen.findByRole('tree');
 
     // The origin is a visible badge with a plain-language explanation, never a
-    // tooltip-only footnote: the explanation is in the document either way.
+    // tooltip-only footnote: the badge is no focus target, so a tooltip on it
+    // could not be opened from the keyboard. The explanation is ordinary text
+    // in the note the tree names as its description, so focusing the tree
+    // announces it and no hover is needed to read it.
     expect(screen.getByText(RECONSTRUCTED_ORIGIN_LABEL).classList.contains('dg-badge')).toBe(true);
-    expect(screen.getByText(RECONSTRUCTED_ORIGIN_DETAIL).getAttribute('role')).toBe('tooltip');
+    expectVisibleInDescription(tree, RECONSTRUCTED_ORIGIN_DETAIL);
+    for (const bubble of screen.queryAllByRole('tooltip', { hidden: true })) {
+      expect(bubble.textContent).not.toContain(RECONSTRUCTED_ORIGIN_DETAIL);
+    }
     expect(screen.queryByText(CAPTURED_ORIGIN_LABEL)).toBeNull();
 
     // Both flags the snapshot raised are stated, in words, above the tree.
@@ -1290,9 +1464,10 @@ describe('ComponentTree honesty about its snapshot', () => {
     expect(screen.queryByRole('button', { name: COLLAPSE_ALL_NAME })).toBeNull();
     expect(screen.queryByRole('button', { name: /^Expand Example/ })).toBeNull();
 
-    // And the reader is told what they are looking at, and why it is caveated.
+    // And the reader is told what they are looking at, and why it is caveated —
+    // in visible text the listing carries as its description, not in a tooltip.
     expect(screen.getByText(FLAT_ORIGIN_LABEL)).toBeDefined();
-    expect(screen.getByText(FLAT_ORIGIN_DETAIL).getAttribute('role')).toBe('tooltip');
+    expectVisibleInDescription(list, FLAT_ORIGIN_DETAIL);
     expect(screen.getByText(DEGRADED_NOTE)).toBeDefined();
     expect(screen.getByText(statisticsLine(snapshot, EXPANDED_ROW_NAMES.length))).toBeDefined();
   });
@@ -1319,6 +1494,39 @@ describe('ComponentTree keyboard navigation', () => {
         .getByRole('button', { name: 'Expand ExampleBranch' })
         .getAttribute('tabindex'),
     ).toBe('-1');
+  });
+
+  it('keeps every control inside the rows out of the tab order, source chips included', async () => {
+    const { user } = await renderUniformTree();
+
+    await user.click(screen.getByRole('button', { name: EXPAND_ALL_NAME }));
+    await waitFor(() => {
+      expect(rowNames()).toEqual([...EXPANDED_ROW_NAMES]);
+    });
+
+    const tree = screen.getByRole('tree');
+
+    // The chip is still a real button a pointer can press, just not a Tab stop.
+    const chip = within(rowNamed('ExampleLeaf')).getByRole('button', { name: SOURCE_CHIP_NAME });
+    expect(chip.getAttribute('tabindex')).toBe('-1');
+
+    // With every row open — so every toggle and every chip is in the DOM — the
+    // single active row is the only element anywhere inside the tree that Tab
+    // can reach. `tabIndex` is the browser's own reading, so a button with no
+    // attribute at all would count here as the `0` it is.
+    expect(tabStops()).toEqual([rowNamed('ExampleRoot')]);
+    const reachable = Array.from(tree.querySelectorAll<HTMLElement>('*')).filter(
+      (element) => element.tabIndex >= 0,
+    );
+    expect(reachable).toEqual([rowNamed('ExampleRoot')]);
+
+    // So one Tab from the active row leaves the widget: no chip or toggle is
+    // visited on the way out.
+    focusRow(rowNamed('ExampleRoot'));
+    await user.keyboard('{Tab}');
+
+    expect(document.activeElement).not.toBeNull();
+    expect(tree.contains(document.activeElement)).toBe(false);
   });
 
   it('expands a closed branch with ArrowRight, then descends into it', async () => {
@@ -1476,6 +1684,167 @@ describe('ComponentTree keyboard navigation', () => {
     expect(rowNamed('ExampleBranch').getAttribute('aria-expanded')).toBe('false');
     expect(spies.onExpand).not.toHaveBeenCalled();
     expect(spies.onSelectEvent).not.toHaveBeenCalled();
+  });
+});
+
+describe('ComponentTree open-source command', () => {
+  it('opens a branch’s source with Shift+Enter, without toggling or selecting it', async () => {
+    const stub = resolvingProvider(makeSnapshot({ roots: SOURCED_BRANCH_STRUCTURE }));
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+    await screen.findByRole('tree');
+
+    // Closed on first paint: Enter would toggle it, so this is the row whose
+    // source only the command can reach from the keyboard.
+    expect(rowNamed('ExampleBranch').getAttribute('aria-expanded')).toBe('false');
+
+    focusRow(rowNamed('ExampleBranch'));
+    await user.keyboard('{Shift>}{Enter}{/Shift}');
+
+    // The very object the datum holds, once.
+    expect(spies.onOpenSource).toHaveBeenCalledTimes(1);
+    expect(spies.onOpenSource.mock.calls[0]?.[0]).toBe(BRANCH_SOURCE);
+
+    // And nothing else: not toggled, not selected, not reported, focus kept.
+    expect(rowNamed('ExampleBranch').getAttribute('aria-expanded')).toBe('false');
+    expect(rowNamed('ExampleBranch').getAttribute('aria-selected')).toBe('false');
+    expect(rowNames()).toEqual([...INITIAL_ROW_NAMES]);
+    expect(spies.onExpand).not.toHaveBeenCalled();
+    expect(spies.onSelectEvent).not.toHaveBeenCalled();
+    expect(spies.onFilterChange).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(rowNamed('ExampleBranch'));
+
+    // The key is consumed, so nothing behind the widget acts on it as well.
+    expect(shiftEnterConsumed(rowNamed('ExampleBranch'))).toBe(true);
+    expect(spies.onOpenSource).toHaveBeenCalledTimes(2);
+    expect(spies.onOpenSource.mock.calls[1]?.[0]).toBe(BRANCH_SOURCE);
+
+    // Plain Enter keeps its meaning on the same row: it toggles, and opens nothing.
+    await user.keyboard('{Enter}');
+    await waitFor(() => {
+      expect(rowNamed('ExampleBranch').getAttribute('aria-expanded')).toBe('true');
+    });
+    expect(spies.onExpand.mock.calls).toEqual([[NODE_ID, SOURCED_BRANCH_ID, true]]);
+    expect(spies.onOpenSource).toHaveBeenCalledTimes(2);
+  });
+
+  it('opens a leaf’s source with Shift+Enter, exactly as its Enter does', async () => {
+    const { spies, user } = await renderUniformTree();
+
+    await user.click(screen.getByRole('button', { name: EXPAND_ALL_NAME }));
+    await waitFor(() => {
+      expect(rowNames()).toEqual([...EXPANDED_ROW_NAMES]);
+    });
+
+    focusRow(rowNamed('ExampleLeaf'));
+    await user.keyboard('{Shift>}{Enter}{/Shift}');
+
+    expect(spies.onOpenSource).toHaveBeenCalledTimes(1);
+    expect(spies.onOpenSource.mock.calls[0]?.[0]).toBe(LEAF_SOURCE);
+    // A command, not an activation: the row is not selected by it.
+    expect(rowNamed('ExampleLeaf').getAttribute('aria-selected')).toBe('false');
+    expect(spies.onSelectEvent).not.toHaveBeenCalled();
+  });
+
+  it('leaves Shift+Enter to the page on a row that has no source to open', async () => {
+    const { spies, user } = await renderUniformTree();
+
+    // A leaf with no location: nothing opens, nothing is selected.
+    focusRow(rowNamed('ExampleAside'));
+    await user.keyboard('{Shift>}{Enter}{/Shift}');
+
+    expect(spies.onOpenSource).not.toHaveBeenCalled();
+    expect(rowNamed('ExampleAside').getAttribute('aria-selected')).toBe('false');
+    expect(shiftEnterConsumed(rowNamed('ExampleAside'))).toBe(false);
+
+    // A branch with no location: and, above all, not toggled either — the
+    // command is never a second spelling of Enter.
+    focusRow(rowNamed('ExampleBranch'));
+    await user.keyboard('{Shift>}{Enter}{/Shift}');
+
+    expect(rowNamed('ExampleBranch').getAttribute('aria-expanded')).toBe('false');
+    expect(rowNamed('ExampleBranch').getAttribute('aria-selected')).toBe('false');
+    expect(shiftEnterConsumed(rowNamed('ExampleBranch'))).toBe(false);
+    expect(rowNames()).toEqual([...INITIAL_ROW_NAMES]);
+
+    expect(spies.onOpenSource).not.toHaveBeenCalled();
+    expect(spies.onExpand).not.toHaveBeenCalled();
+    expect(spies.onSelectEvent).not.toHaveBeenCalled();
+  });
+
+  it('advertises the command only on rows that can open a source, and once above the tree', async () => {
+    const { user } = await renderUniformTree();
+
+    // The hint is about the structure, not the rows that happen to be open: the
+    // one located node is still inside a closed branch here.
+    expect(rowNames()).toEqual([...INITIAL_ROW_NAMES]);
+    const hint = sourceHint();
+    expect(hint).not.toBeNull();
+
+    // Printed as a chord, one key per chip, and part of the note the tree names
+    // as its description — so focusing the tree announces it too.
+    expect(
+      Array.from(hint?.querySelectorAll('kbd kbd') ?? []).map((key) => key.textContent),
+    ).toEqual(['Shift', 'Enter']);
+    expect(describedBy(screen.getByRole('tree')).contains(hint)).toBe(true);
+
+    await user.click(screen.getByRole('button', { name: EXPAND_ALL_NAME }));
+    await waitFor(() => {
+      expect(rowNames()).toEqual([...EXPANDED_ROW_NAMES]);
+    });
+
+    // Exactly the row that resolved to source announces the shortcut.
+    for (const row of rows()) {
+      const name = row.querySelector(`.${LABEL_CLASS}`)?.textContent;
+
+      expect(row.getAttribute('aria-keyshortcuts')).toBe(
+        name === 'ExampleLeaf' ? OPEN_SOURCE_SHORTCUT : null,
+      );
+    }
+  });
+
+  it('offers neither the hint nor the shortcut where no node resolved to source', async () => {
+    const stub = resolvingProvider(makeSnapshot({ roots: UNEVEN_STRUCTURE }));
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+    await screen.findByRole('tree');
+
+    expect(sourceHint()).toBeNull();
+    expect(screen.queryByText(/open its source/i)).toBeNull();
+
+    for (const row of rows()) {
+      expect(row.hasAttribute('aria-keyshortcuts')).toBe(false);
+    }
+  });
+
+  it('offers neither the hint nor the shortcut when no host can open a file', async () => {
+    const stub = resolvingProvider(makeSnapshot({ roots: UNIFORM_STRUCTURE }));
+    const user = userEvent.setup();
+
+    // No `PanelActions` in scope, which is how the view renders outside a host:
+    // a location exists, but nothing could open it.
+    render(
+      <DataProviderContext.Provider value={stub.provider}>
+        <PanelSessionContext.Provider value={PANEL_SESSION_ID}>
+          <ComponentTree node={makeNode()} />
+        </PanelSessionContext.Provider>
+      </DataProviderContext.Provider>,
+    );
+    await screen.findByRole('tree');
+
+    await user.click(screen.getByRole('button', { name: EXPAND_ALL_NAME }));
+    await waitFor(() => {
+      expect(rowNames()).toEqual([...EXPANDED_ROW_NAMES]);
+    });
+
+    expect(sourceHint()).toBeNull();
+    expect(rowNamed('ExampleLeaf').hasAttribute('aria-keyshortcuts')).toBe(false);
+    expect(
+      within(rowNamed('ExampleLeaf')).queryByRole('button', { name: SOURCE_CHIP_NAME }),
+    ).toBeNull();
+    expect(shiftEnterConsumed(rowNamed('ExampleLeaf'))).toBe(false);
   });
 });
 
@@ -1652,7 +2021,11 @@ describe('ComponentTree host reporting', () => {
     });
 
     const leaf = rowNamed('ExampleLeaf');
-    await user.click(within(leaf).getByRole('button', { name: SOURCE_CHIP_NAME }));
+    const chip = within(leaf).getByRole('button', { name: SOURCE_CHIP_NAME });
+
+    // Out of the Tab order, and still pressable by a pointer.
+    expect(chip.getAttribute('tabindex')).toBe('-1');
+    await user.click(chip);
 
     expect(spies.onOpenSource).toHaveBeenCalledTimes(1);
 
@@ -1668,6 +2041,51 @@ describe('ComponentTree host reporting', () => {
     // selects anything behind the navigation.
     expect(spies.onSelectEvent).not.toHaveBeenCalled();
     expect(spies.onExpand).toHaveBeenCalledTimes(1);
+  });
+
+  it('lets a pressed chip keep its own keys, without toggling the branch that holds it', async () => {
+    const stub = resolvingProvider(makeSnapshot({ roots: SOURCED_BRANCH_STRUCTURE }));
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+    await screen.findByRole('tree');
+
+    const chip = within(rowNamed('ExampleBranch')).getByRole('button', {
+      name: BRANCH_SOURCE_CHIP_NAME,
+    });
+    await user.click(chip);
+
+    // The pointer press opened the source once, left focus on the chip, and
+    // handed the widget's one tab stop to the row that holds it.
+    expect(spies.onOpenSource.mock.calls).toEqual([[BRANCH_SOURCE]]);
+    expect(spies.onOpenSource.mock.calls[0]?.[0]).toBe(BRANCH_SOURCE);
+    expect(document.activeElement).toBe(chip);
+    expect(tabStops()).toEqual([rowNamed('ExampleBranch')]);
+
+    // Enter on the focused chip is the chip's: one more open, and the branch it
+    // sits on is not toggled — which a row activation would have done.
+    await user.keyboard('{Enter}');
+
+    expect(spies.onOpenSource).toHaveBeenCalledTimes(2);
+    expect(spies.onOpenSource.mock.calls[1]?.[0]).toBe(BRANCH_SOURCE);
+    expect(rowNamed('ExampleBranch').getAttribute('aria-expanded')).toBe('false');
+    expect(spies.onExpand).not.toHaveBeenCalled();
+
+    // Shift+Enter from the chip is still one open, not the command plus the
+    // chip's own activation.
+    await user.keyboard('{Shift>}{Enter}{/Shift}');
+
+    expect(spies.onOpenSource).toHaveBeenCalledTimes(3);
+    expect(rowNamed('ExampleBranch').getAttribute('aria-expanded')).toBe('false');
+
+    // And the arrow keys still navigate the tree from there.
+    await user.keyboard('{ArrowDown}');
+
+    expect(document.activeElement).toBe(rowNamed('ExampleAside'));
+    expect(tabStops()).toEqual([rowNamed('ExampleAside')]);
+    expect(spies.onExpand).not.toHaveBeenCalled();
+    expect(spies.onSelectEvent).not.toHaveBeenCalled();
   });
 
   it('never reports a selected event for a node, which stands for none', async () => {

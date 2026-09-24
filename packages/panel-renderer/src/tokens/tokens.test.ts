@@ -21,20 +21,25 @@
  *      value, the high-contrast set differs from the default set in exactly the
  *      documented deltas, the duration steps stay aliases rather than copies,
  *      the medium weight stays in step with the type role that carries it, each
- *      motion token stays a value of its own kind, and the theme-invariant
- *      families stay invariant. A theme that silently inherits the default
- *      block's values is the failure this prevents.
+ *      motion token stays a value of its own kind, the glyph and control sizes
+ *      stay font-relative, and the theme-invariant families stay invariant. A
+ *      theme that silently inherits the default block's values is the failure
+ *      this prevents.
  *   3. **Reach.** The two authored stylesheets consume the table and extend it
  *      nowhere: neither declares a custom property, every property a rule reads
- *      is either a catalogued token or a component-scoped `--dgc-*` value, and
- *      no retired constant namespace is named in a rule or a comment. A value
- *      declared beside the tokens is covered by none of the checks here, which
- *      would leave this suite describing less of the product than it appears to.
+ *      is either a catalogued token or a component-scoped `--dgc-*` value, no
+ *      length is written as a literal outside the one unit-bridge form and one
+ *      documented clip box, and no retired constant namespace is named in a
+ *      rule or a comment. A value declared beside the tokens is covered by none
+ *      of the checks here, which would leave this suite describing less of the
+ *      product than it appears to.
  *   4. **Contrast.** Every text/surface and status/surface pair of every theme
  *      is measured and held to the text minimum, and the span-kind scale — used
- *      as fills that carry their own text labels — to the non-text minimum,
- *      with the figures AAP 0.6.3 publishes pinned so a change in the
- *      arithmetic stays distinguishable from a change in the palette. The two
+ *      as fills that carry their own text labels — and the relationship-edge
+ *      stroke to the non-text minimum, with the rules that draw a connector
+ *      pinned to that stroke and the figures AAP 0.6.3 publishes pinned so a
+ *      change in the arithmetic stays distinguishable from a change in the
+ *      palette. The two
  *      minimums are stated here as literals rather than imported from the code
  *      under test, tied to the product's exported constants by one deliberate
  *      assertion, and exercised at their inclusive and immediately-below
@@ -264,14 +269,18 @@ const TOKEN_KEYS = Object.keys(DESIGN_TOKENS.dark) as TokenKey[];
  * `--dg-shadow-1` — which a naive camel-to-kebab conversion renders as
  * `--dg-space0` and `--dg-shadow1`, matching nothing in the stylesheet.
  *
- * The families AAP 0.6.3 tabulates are here verbatim. Four of these names are
+ * The families AAP 0.6.3 tabulates are here verbatim. Eight of these names are
  * not in that table and belong to it all the same: `--dg-font-weight-medium`,
  * `--dg-motion-duration`, `--dg-motion-easing` and `--dg-shimmer-duration`
- * carry a weight, two durations and an easing function that the stylesheets
- * need and 0.6.3 does not enumerate. AAP 0.6.4 permits no literal for any of
- * them and 0.6.6 records no exception, so the only lawful place for them is
- * this table — which is also what puts them under every check below, the
- * property a parallel "internal constant" namespace could never have.
+ * carry a weight, two durations and an easing function; `--dg-graph-edge` is
+ * the stroke of a relationship connector, which neither border colour can
+ * carry at the 3:1 non-text bar; and `--dg-icon-size`, `--dg-spinner-size` and
+ * `--dg-icon-button-size` are the glyph, spinner and icon-only control boxes.
+ * The stylesheets need every one of them and 0.6.3 does not enumerate them.
+ * AAP 0.6.4 permits no literal for any of them and 0.6.6 records no exception,
+ * so the only lawful place for them is this table — which is also what puts
+ * them under every check below, the property a parallel "internal constant"
+ * namespace could never have.
  */
 const EXPECTED_CSS_PROPERTY_NAMES: readonly string[] = [
   '--dg-accent',
@@ -287,7 +296,10 @@ const EXPECTED_CSS_PROPERTY_NAMES: readonly string[] = [
   '--dg-font-mono',
   '--dg-font-ui',
   '--dg-font-weight-medium',
+  '--dg-graph-edge',
   '--dg-heading',
+  '--dg-icon-button-size',
+  '--dg-icon-size',
   '--dg-info',
   '--dg-kind-db',
   '--dg-kind-error',
@@ -315,6 +327,7 @@ const EXPECTED_CSS_PROPERTY_NAMES: readonly string[] = [
   '--dg-space-5',
   '--dg-space-6',
   '--dg-space-7',
+  '--dg-spinner-size',
   '--dg-success',
   '--dg-surface-base',
   '--dg-surface-elevated',
@@ -373,6 +386,80 @@ const KIND_FILL_KEYS = [
   'kindDb',
   'kindError',
 ] as const satisfies readonly TokenKey[];
+
+/**
+ * The relationship connectors: the stroke of a dependency-graph edge and of a
+ * timeline parent-to-child edge. A connector is an essential non-text graphic
+ * — without it the structure it draws cannot be read — so WCAG 2.2 success
+ * criterion 1.4.11 holds it to the non-text minimum against every surface a
+ * chart can sit on.
+ */
+const GRAPH_EDGE_KEYS = ['graphEdge'] as const satisfies readonly TokenKey[];
+
+/**
+ * The stylesheet rules that draw a relationship connector, each of which must
+ * stroke with the connector token and nothing else. Pinned here, beside the
+ * contrast suite that measures the token, because a rule reverting to a border
+ * colour would pass every ratio below while rendering below the bar.
+ */
+const GRAPH_EDGE_RULES = ['.dg-dependency-graph__edge', '.dg-timeline__edge'] as const;
+
+/**
+ * The glyph and control size tokens, with the one form each value must keep.
+ *
+ * They are font-relative by design (see the token source), so each is pinned
+ * to its exact expression: `1em` for the glyph square, an alias of the glyph
+ * square for the spinner, and a sum of the glyph square and two space tokens
+ * for the icon-only control. A value in an absolute unit would still render,
+ * which is exactly why it has to fail here instead — a fixed square next to
+ * scaling type is the defect these tokens exist to prevent.
+ */
+const SIZE_TOKENS = [
+  { key: 'iconSize', value: '1em' },
+  { key: 'spinnerSize', value: 'var(--dg-icon-size)' },
+  {
+    key: 'iconButtonSize',
+    value: 'calc(var(--dg-icon-size) + var(--dg-space-1) * 2 + var(--dg-space-0))',
+  },
+] as const satisfies readonly { readonly key: TokenKey; readonly value: string }[];
+
+/**
+ * A CSS length written as a literal: a number followed by an absolute,
+ * font-relative or viewport-relative length unit.
+ *
+ * The number may not follow a word character, a hyphen or a dot, so a token
+ * name such as `--dg-space-1` and a percentage never match, and a unitless
+ * number (SVG geometry, a flex factor, a multiplier) never matches either.
+ */
+const LENGTH_LITERAL_PATTERN =
+  /(?<![\w.-])\d*\.?\d+(?:px|em|rem|ex|ch|cap|ic|lh|rlh|vw|vh|vi|vb|vmin|vmax|svw|svh|lvw|lvh|dvw|dvh|cqw|cqh|cqi|cqb|cqmin|cqmax|pt|pc|in|cm|mm|q)(?![\w-])/giu;
+
+/**
+ * The one length a declaration may still carry: the unit given to a UNITLESS
+ * number a component supplies through a `--dgc-*` property, in the exact
+ * consumption form `src/primitives/DataTable.tsx` declares. The number is the
+ * value; `1px` is only the unit it is given, so this encodes no design value.
+ */
+const UNIT_BRIDGE_PATTERN = /calc\(var\(--dgc-[a-z][a-z-]*, 0\) \* 1px\)/gu;
+
+/**
+ * The declarations that may carry a length literal although they are not a
+ * unit bridge, each stated exactly and with the rule it belongs to.
+ *
+ * One exists: the visually hidden utility of `base.css` bounds its clip box
+ * with a font-relative square. That box paints nothing — `clip-path` removes
+ * it from the visual surface entirely — so its size is not a visual dimension
+ * and has no token to resolve to; it exists only so the out-of-flow box can
+ * never extend a scrollable area.
+ */
+const STRUCTURAL_LENGTH_DECLARATIONS = [
+  { rel: 'src/styles/base.css', selector: '.dg-visually-hidden', declaration: 'inline-size: 1em' },
+  { rel: 'src/styles/base.css', selector: '.dg-visually-hidden', declaration: 'block-size: 1em' },
+] as const satisfies readonly {
+  readonly rel: string;
+  readonly selector: string;
+  readonly declaration: string;
+}[];
 
 /**
  * The contrast minimum normal-size text must reach, stated here as a literal.
@@ -477,6 +564,7 @@ const THEME_INVARIANT_FAMILIES = [
     keys: ['textXs', 'textSm', 'textMd', 'textLg', 'heading', 'monoSm', 'monoMd'],
   },
   { family: 'radii', keys: ['radiusSm', 'radiusMd', 'radiusLg'] },
+  { family: 'glyph and control sizes', keys: ['iconSize', 'spinnerSize', 'iconButtonSize'] },
   // Reducing motion is a user preference expressed through a media query, not a
   // theme, so a theme never shortens or removes a duration.
   { family: 'motion constants', keys: ['motionDuration', 'motionEasing', 'shimmerDuration'] },
@@ -757,6 +845,37 @@ function describeInput(value: string | readonly string[] | null | undefined): st
   return JSON.stringify(value) ?? 'undefined';
 }
 
+/** One style rule of an authored stylesheet: its selector list and its declarations. */
+interface StyleRule {
+  readonly selector: string;
+  readonly declarations: readonly string[];
+}
+
+/**
+ * The innermost style rules of comment-free stylesheet text.
+ *
+ * Every rule body in this package is flat, so the innermost `{ … }` pairs are
+ * exactly the style rules; a grouping at-rule such as the reduced-motion
+ * `@media` block only wraps them, and a `@keyframes` step (`from`, `to`) is
+ * returned like a rule, which is harmless because a length in a keyframe is as
+ * much a visual value as one in a rule. Declarations are split on `;` and
+ * whitespace-normalised, so an assertion can name one exactly.
+ */
+function styleRules(rules: string): StyleRule[] {
+  const found: StyleRule[] = [];
+  for (const match of rules.matchAll(/([^{}]+)\{([^{}]*)\}/gu)) {
+    const [, selector = '', body = ''] = match;
+    found.push({
+      selector: selector.replace(/\s+/gu, ' ').trim(),
+      declarations: body
+        .split(';')
+        .map((declaration) => declaration.replace(/\s+/gu, ' ').trim())
+        .filter((declaration) => declaration !== ''),
+    });
+  }
+  return found;
+}
+
 /* -------------------------------------------------------------------------- */
 /* 1. Drift and naming agreement (AAP 0.6.1)                                  */
 /* -------------------------------------------------------------------------- */
@@ -830,7 +949,7 @@ describe('generated token stylesheet', () => {
   });
 
   it('declares exactly the catalogued custom properties', () => {
-    expect(EXPECTED_CSS_PROPERTY_NAMES).toHaveLength(56);
+    expect(EXPECTED_CSS_PROPERTY_NAMES).toHaveLength(60);
     expect(
       new Set(EXPECTED_CSS_PROPERTY_NAMES).size,
       'the catalogue lists a custom property twice',
@@ -1026,6 +1145,42 @@ describe('design token completeness', () => {
       }
     });
   }
+
+  for (const { key, value } of SIZE_TOKENS) {
+    it(`keeps ${String(key)} font-relative in every theme`, () => {
+      for (const theme of PANEL_THEMES) {
+        expect(
+          DESIGN_TOKENS[theme][key],
+          `${theme}.${String(key)} must be exactly "${value}": a glyph or control box in an ` +
+            'absolute unit stops scaling with the type role around it',
+        ).toBe(value);
+      }
+    });
+  }
+
+  it('builds the icon-only control size from tokens alone', () => {
+    // Every var() the calc() reads must name a real token, and nothing else in
+    // it may be a length: the expression is the control's recipe, stated in
+    // the design scale's own units.
+    const expression = DESIGN_TOKENS.dark.iconButtonSize;
+    const catalogued = new Set(EXPECTED_CSS_PROPERTY_NAMES);
+    const referenced = [...expression.matchAll(/var\((--[a-z0-9-]+)\)/gu)].map((m) => m[1] ?? '');
+
+    expect(referenced, 'the expression reads no token at all').not.toHaveLength(0);
+    expect(referenced.filter((name) => !catalogued.has(name))).toEqual([]);
+    expect(expression.replace(/var\(--[a-z0-9-]+\)/gu, '').match(LENGTH_LITERAL_PATTERN)).toBe(
+      null,
+    );
+  });
+
+  it('keeps the relationship edge in step with the muted text tone', () => {
+    // An alias, so the edge follows the tone of the count label printed on it
+    // in every theme, and so the high-contrast set — which raises borders, not
+    // connectors — carries the dark value by construction.
+    for (const theme of PANEL_THEMES) {
+      expect(DESIGN_TOKENS[theme].graphEdge, `${theme}.graphEdge`).toBe(cssVar('textMuted'));
+    }
+  });
 });
 
 /* -------------------------------------------------------------------------- */
@@ -1093,6 +1248,52 @@ describe('authored stylesheets', () => {
           ).toEqual([]);
         });
       }
+
+      it('states every length through a token', () => {
+        // A length literal is a visual dimension decided outside the token
+        // table — the shape a hardcoded glyph box or a hardcoded inset takes.
+        // Two forms are not: the unit a unitless component value is given, and
+        // the documented clip box of content that paints nothing.
+        const exempt = STRUCTURAL_LENGTH_DECLARATIONS.filter((entry) => entry.rel === rel);
+        const offenders: string[] = [];
+
+        for (const { selector, declarations } of styleRules(rules)) {
+          for (const declaration of declarations) {
+            const withoutBridges = declaration.replace(UNIT_BRIDGE_PATTERN, '');
+            if (withoutBridges.match(LENGTH_LITERAL_PATTERN) === null) {
+              continue;
+            }
+            const sanctioned = exempt.some(
+              (entry) => entry.selector === selector && entry.declaration === declaration,
+            );
+            if (!sanctioned) {
+              offenders.push(`${selector} { ${declaration} }`);
+            }
+          }
+        }
+
+        expect(
+          offenders,
+          'a length written as a literal is a visual value outside the token table (AAP 0.6.4). ' +
+            'Resolve it to a --dg-* token — add one to src/tokens/tokens.ts if none fits',
+        ).toEqual([]);
+      });
+
+      it('keeps every structural length exemption pointing at a real declaration', () => {
+        // An exemption whose declaration no longer exists would silently widen
+        // the rule above the next time a declaration of that shape appears.
+        const present = styleRules(rules);
+
+        for (const entry of STRUCTURAL_LENGTH_DECLARATIONS.filter((item) => item.rel === rel)) {
+          expect(
+            present.some(
+              (rule) =>
+                rule.selector === entry.selector && rule.declarations.includes(entry.declaration),
+            ),
+            `${entry.selector} { ${entry.declaration} } is exempted but no longer declared`,
+          ).toBe(true);
+        }
+      });
 
       it('names no retired constant namespace, in a rule or in a comment', () => {
         // The `--dgx-` prefix was a parallel motion namespace declared beside
@@ -1229,6 +1430,49 @@ describe('design token contrast', () => {
     });
   }
 
+  for (const theme of PANEL_THEMES) {
+    for (const background of SURFACE_KEYS) {
+      for (const foreground of GRAPH_EDGE_KEYS) {
+        it(`strokes ${foreground} on ${background} at the non-text minimum in ${theme}`, () => {
+          const ratio = measureContrast(theme, foreground, background);
+
+          expect(
+            meetsContrast(ratio, REQUIRED_NON_TEXT_CONTRAST),
+            describePair({ theme, foreground, background, ratio }, REQUIRED_NON_TEXT_CONTRAST),
+          ).toBe(true);
+        });
+      }
+    }
+  }
+
+  it('draws every relationship connector with the connector token', () => {
+    // The ratio suite above measures the token; this pins the rules that must
+    // spend it. Each connector rule is found by its exact, single-selector
+    // form, so a state rule layered on top (a dashed or orphaned edge) is not
+    // mistaken for it.
+    const stylesheetFile = AUTHORED_STYLESHEETS.find((entry) =>
+      entry.rel.endsWith('components.css'),
+    )?.file;
+    if (stylesheetFile === undefined) {
+      throw new Error('src/styles/components.css is missing from the authored stylesheet list.');
+    }
+    const rules = styleRules(
+      readFileSync(stylesheetFile, 'utf8').replace(/\/\*[\s\S]*?\*\//gu, ''),
+    );
+
+    for (const selector of GRAPH_EDGE_RULES) {
+      const strokes = rules
+        .filter((rule) => rule.selector.split(',').some((part) => part.trim() === selector))
+        .flatMap((rule) => rule.declarations.filter((d) => d.startsWith('stroke:')));
+
+      expect(
+        strokes,
+        `${selector} must stroke with --dg-graph-edge: a border colour measures below the 3:1 ` +
+          'non-text minimum on every surface of the dark and light themes',
+      ).toEqual([`stroke: ${cssVar('graphEdge')}`]);
+    }
+  });
+
   it('states the high-contrast border colour as an identity rather than a ratio', () => {
     // A border carries no text, so it belongs to no ratio suite above. The
     // guarantee it carries instead is the delta AAP 0.6.1 states: both border
@@ -1302,11 +1546,35 @@ describe('published contrast reference figures', () => {
     expect(worst.ratio).toBeCloseTo(3.21, 2);
   });
 
+  it('reproduces the worst relationship-edge ratio', () => {
+    // The connector token aliases the muted text colour, so its worst pair is
+    // the worst text pair: the light overlay surface, 4.82:1 against the 3:1
+    // non-text bar. The borders it replaced measured 1.58:1 there.
+    const worst = worstPairOf(measurePairs(PANEL_THEMES, GRAPH_EDGE_KEYS));
+
+    expect(worst.theme).toBe('light');
+    expect(worst.background).toBe('surfaceOverlay');
+    expect(
+      meetsContrast(worst.ratio, REQUIRED_NON_TEXT_CONTRAST),
+      describePair(worst, REQUIRED_NON_TEXT_CONTRAST),
+    ).toBe(true);
+    expect(worst.ratio).toBeCloseTo(4.82, 2);
+    expect(
+      worstPairOf(measurePairs(['dark'], GRAPH_EDGE_KEYS)).ratio,
+      "the dark palette's worst relationship-edge pair",
+    ).toBeCloseTo(5.09, 2);
+  });
+
   it('measures the high-contrast palette exactly as the dark palette', () => {
     // Its colours *are* the dark colours (only borders, the focus ring and the
     // elevation shadows differ), so the two must measure identically. This is
     // the assertion that keeps that claim from quietly becoming untrue.
-    for (const foreground of [...TEXT_KEYS, ...STATUS_TEXT_KEYS, ...KIND_FILL_KEYS]) {
+    for (const foreground of [
+      ...TEXT_KEYS,
+      ...STATUS_TEXT_KEYS,
+      ...KIND_FILL_KEYS,
+      ...GRAPH_EDGE_KEYS,
+    ]) {
       for (const background of SURFACE_KEYS) {
         expect(
           measureContrast('highContrast', foreground, background),

@@ -30,6 +30,16 @@
  *    `./continuation.ts` when it starts and settled when it finishes, which is
  *    what lets the React commit that renders the response stay in the
  *    interaction's trace after the interaction window has closed (AAP 0.4.2).
+ * 5. **Reports what is still on the wire when a capture ends.** A request
+ *    that has not settled by a capture boundary would otherwise leave no
+ *    evidence at all, because its later settle belongs to a generation that
+ *    has ended and emits nothing. {@link reportInFlightRequests} emits one
+ *    in-flight snapshot per such request — the same span, no status code,
+ *    span status `unset`, the elapsed time as its duration and
+ *    {@link KEY_IN_FLIGHT} set — and `./agent.ts` calls it while the ending
+ *    capture is still the one the transport stamps. That is what lets
+ *    `../aggregate/requests.ts` show a request as *pending* rather than guess
+ *    it from a missing status code.
  *
  * ## The rules this module will not break
  *
@@ -269,6 +279,35 @@ const KEY_TRACEPARENT_SKIP_REASON = 'traceparentSkipReason';
 const KEY_ABORTED = 'aborted';
 
 /**
+ * Present and `true` on an **in-flight snapshot**: the one event
+ * {@link reportInFlightRequests} emits for a request that had started and not
+ * settled when its capture ended.
+ *
+ * **Declared** in the `fetch` and `xhr` tuples of `../schema/attributes.ts`,
+ * which is why it is typed as a {@link DeclaredRequestKey} like the keys above.
+ * Like {@link KEY_ABORTED}, and for the reason that constant states, it is
+ * written only as `true`, never as `false`. It is the only thing that makes a
+ * request *pending* to a consumer; an absent status code is not, because a
+ * network error, an abort and an opaque response all settle without one.
+ *
+ * `../aggregate/requests.ts` reads it through `REQUEST_IN_FLIGHT_ATTRIBUTE`,
+ * typed against the same declaration. This module cannot import that constant
+ * — the page bundle must not pull in an aggregate, and
+ * `packages/telemetry/esbuild.agent.mjs` audits what the bundle reaches — so
+ * `./in-flight-requests.test.ts` additionally pins the emitted key to it.
+ */
+const KEY_IN_FLIGHT: DeclaredRequestKey = 'inFlight';
+
+/**
+ * The span status of an in-flight snapshot.
+ *
+ * `unset` rather than `ok` or `error`, because neither has happened yet: the
+ * request is observed outstanding, and the status a consumer reads must say no
+ * more than that.
+ */
+const IN_FLIGHT_STATUS: TelemetryStatus = 'unset';
+
+/**
  * `Response.type` for a `fetch` that fulfilled: `basic`, `cors`, `opaque`,
  * `opaqueredirect` or `error`.
  *
@@ -436,7 +475,10 @@ export interface FetchStats {
    * past {@link MAX_IN_FLIGHT}.
    */
   skipped: number;
-  /** Request events handed to `./transport.ts`, cumulative. */
+  /**
+   * Request events handed to `./transport.ts`, cumulative — settled requests
+   * and the in-flight snapshots of {@link reportInFlightRequests} alike.
+   */
   emitted: number;
   /**
    * Internal failures, cumulative: an instrumentation step that threw (and
@@ -558,11 +600,21 @@ interface RequestRecord {
   terminal: XhrTerminal | undefined;
 }
 
-/** What was learned when a request settled. */
+/**
+ * What was learned when a request settled — or, for the in-flight snapshot of
+ * {@link reportInFlightRequests}, what was known when it was observed still
+ * outstanding.
+ */
 interface RequestOutcome {
-  /** When it settled, in epoch milliseconds. */
+  /**
+   * When it settled, in epoch milliseconds; for an in-flight snapshot, the
+   * instant it was observed unsettled.
+   */
   readonly settledAt: number;
-  /** `ok` for a completed request, including 4xx and 5xx; `error` otherwise. */
+  /**
+   * `ok` for a completed request, including 4xx and 5xx; `error` for one that
+   * failed; `unset` for an in-flight snapshot, which has done neither yet.
+   */
   readonly status: TelemetryStatus;
   /** The response status code, when there was one. */
   readonly statusCode: number | undefined;
@@ -860,6 +912,26 @@ let xhrStates: WeakMap<XMLHttpRequest, XhrState> | undefined;
 
 /** Instrumented requests in flight; see {@link FetchStats.inFlight}. */
 let inFlightCount = 0;
+
+/**
+ * The instrumented requests of the current generation that have started and
+ * not yet settled, been abandoned or been reported by
+ * {@link reportInFlightRequests}.
+ *
+ * The list a capture boundary walks: without it, a request still on the wire
+ * when its capture ends leaves no evidence, because its settle arrives in a
+ * later generation and emits nothing. Its lifecycle follows
+ * {@link inFlightCount} exactly — a record joins where it is counted, leaves
+ * where it is settled or abandoned, and the list is cleared wherever the count
+ * is zeroed — so it holds at most {@link MAX_IN_FLIGHT} records and never
+ * outlives the generation its records belong to. A snapshot removes its record
+ * without releasing the count, which is the boundary's job.
+ *
+ * A `Set` of the records themselves rather than of span ids, so a snapshot
+ * reads exactly the identity and decisions the eventual settle would have
+ * reported, and removal is O(1) on every settle.
+ */
+const outstandingRequests = new Set<RequestRecord>();
 
 /** Requests a header was injected on; see {@link FetchStats.injected}. */
 let injectedTotal = 0;
@@ -1520,6 +1592,9 @@ function beginRequest(input: {
     skippedTotal += 1;
   }
   inFlightCount += 1;
+  // Registered where it is counted, so the two can never disagree about what
+  // is outstanding; see `outstandingRequests`.
+  outstandingRequests.add(record);
 
   if (isTracedContext(input.context)) {
     registerPendingContinuation({
@@ -1621,6 +1696,48 @@ function emitRequestEvent(record: RequestRecord, outcome: RequestOutcome): void 
 }
 
 /**
+ * Hand one in-flight snapshot to the transport: the event a request would
+ * have reported, as far as it is known before a response.
+ *
+ * The same span as the settled event — trace, span, parent, kind, name and
+ * start are the record's, exactly as {@link emitRequestEvent} writes them — so
+ * `../aggregate/requests.ts` can recognise the two as one request should both
+ * ever reach it. The attribute bag is {@link buildAttributes}'s over an
+ * outcome that observed nothing — no status code, no abort, no response type —
+ * plus {@link KEY_IN_FLIGHT}; the status is {@link IN_FLIGHT_STATUS}; and the
+ * duration is the time the request had been outstanding at `observedAt`,
+ * which is a lower bound on its real duration.
+ *
+ * @param record A current-generation record that has not settled.
+ * @param observedAt The instant the snapshot describes, in epoch milliseconds.
+ */
+function emitInFlightSnapshot(record: RequestRecord, observedAt: number): void {
+  const outcome: RequestOutcome = {
+    settledAt: observedAt,
+    status: IN_FLIGHT_STATUS,
+    statusCode: undefined,
+    aborted: false,
+    responseType: undefined,
+  };
+  const attributes = buildAttributes(record, outcome);
+  attributes[KEY_IN_FLIGHT] = true;
+
+  const draft: EventDraft = {
+    traceId: record.traceId,
+    spanId: record.spanId,
+    parentSpanId: record.parentSpanId,
+    kind: record.kind,
+    name: record.name,
+    startTime: record.startedAt,
+    duration: measureDuration(record.startedAt, outcome.settledAt),
+    attributes,
+    status: outcome.status,
+  };
+  emit(draft);
+  emittedTotal += 1;
+}
+
+/**
  * Account for a settled request: emit its event and close its continuation
  * window.
  *
@@ -1649,6 +1766,9 @@ function settleRequest(record: RequestRecord, outcome: RequestOutcome): void {
       return;
     }
     record.settled = true;
+    // Before the generation test: a settled record is never outstanding,
+    // whichever generation it belongs to.
+    outstandingRequests.delete(record);
 
     if (!isCurrentGeneration(record)) {
       return;
@@ -1691,6 +1811,11 @@ function abandonRequest(record: RequestRecord): void {
       return;
     }
     record.settled = true;
+    // An abandoned request is one this module has stopped observing — refused
+    // by the host before it started, or an XHR whose settle cannot be seen —
+    // so whether it is still outstanding at a capture boundary is unknown, and
+    // reporting it as in flight would state something nobody observed.
+    outstandingRequests.delete(record);
 
     if (isCurrentGeneration(record)) {
       inFlightCount = inFlightCount > 0 ? inFlightCount - 1 : 0;
@@ -3174,7 +3299,10 @@ export function attachFetch(): void {
  * producer generation they were planned in is no longer current, so their
  * settle handlers emit no event and settle no continuation. An event that
  * arrived after the developer stopped the capture would be an observation of a
- * capture that had ended.
+ * capture that had ended. That they *were* outstanding is reported before this
+ * call, while the capture is still live: `./agent.ts` calls
+ * {@link reportInFlightRequests} first, and this call then discards the list
+ * of outstanding records with the generation it belonged to.
  *
  * **A property that will not come back out is retried, not forgotten.** Each
  * of the four is restored in its own guard, and one that fails keeps its saved
@@ -3208,6 +3336,10 @@ export function detachFetch(): void {
     reportProducerFailure('fetch', 'detach', error);
   } finally {
     inFlightCount = 0;
+    // Cleared with the count it mirrors: every record in it belongs to the
+    // generation that just ended, and a detached module holds no reference to
+    // any request the developer made.
+    outstandingRequests.clear();
     agentScriptUrl = undefined;
     attached = false;
   }
@@ -3242,21 +3374,115 @@ export function detachFetch(): void {
  * lose its requests. The number therefore describes the current generation and
  * not the document, which is what {@link FetchStats.inFlight} says.
  *
+ * The list of outstanding records is cleared with the count, for the same
+ * reason: every record in it has just become stale, and a stale record can
+ * never again be reported. What those records were is reported *before* this
+ * call — `./agent.ts`'s `arm()` calls {@link reportInFlightRequests} first,
+ * while the transport still stamps the outgoing capture — so clearing the list
+ * here loses no evidence.
+ *
  * What this deliberately does **not** do is cancel the stale records' pending
  * continuations. `./agent.ts`'s `arm()` calls `resetContinuations()` in the
  * same capture-changed branch, which clears `./continuation.ts`'s maps
- * wholesale; withdrawing each span here would be the same work done twice, and
- * this module holds no list of outstanding spans to walk.
+ * wholesale; walking the outstanding records to withdraw each span here would
+ * be the same work done twice.
  *
  * Idempotent in the sense that matters — a second call starts a second
  * generation and leaves the same nothing in flight — safe to call while
  * detached, where there is nothing to invalidate and the module stays
- * detached, and it cannot throw: two counter writes have no failure mode, and
- * arming must never fail on a counter.
+ * detached, and it cannot throw: two counter writes and the clearing of a
+ * module-owned `Set` have no failure mode, and arming must never fail on a
+ * counter.
  */
 export function advanceFetchGeneration(): void {
   generation += 1;
   inFlightCount = 0;
+  outstandingRequests.clear();
+}
+
+/**
+ * Report every request still on the wire, as one in-flight snapshot each.
+ *
+ * Called by `./agent.ts` at the two boundaries that end a capture while
+ * requests may be outstanding — `disarm()`, before its flush, and `arm()` when
+ * the capture changes, before {@link advanceFetchGeneration} — so each snapshot
+ * is stamped with the capture the request belongs to. After either boundary
+ * the request's own settle emits nothing (see {@link generation}), so without
+ * this call a request that outlived its capture would leave no evidence at
+ * all, and a consumer could only guess at it from a missing status code.
+ *
+ * For each current-generation record that has not settled, one event is
+ * emitted through the same transport path a settle uses, with the record's own
+ * span identity, the attributes decided when it started, no status code, span
+ * status `unset`, {@link KEY_IN_FLIGHT} set to `true`, and the time it had
+ * been outstanding as its duration. Every snapshot of one call describes the
+ * same instant, read once, which is the capture boundary.
+ *
+ * What it deliberately leaves alone:
+ *
+ * - **The record is not settled** and its continuation is not touched. The
+ *   request is still running in the application, and the boundary that follows
+ *   this call is what makes its eventual settle report nothing and what resets
+ *   continuations.
+ * - **The in-flight count is not released.** That, too, is the boundary's job
+ *   — it zeroes the count for the whole generation — and releasing it here
+ *   would let a page's later requests be instrumented past
+ *   {@link MAX_IN_FLIGHT} before the boundary had happened.
+ *
+ * The record is removed from the outstanding list, so a second call emits
+ * nothing more. Should a request nevertheless settle in the same generation —
+ * a caller that reports without a boundary following — its settled event
+ * shares the snapshot's span, and `../aggregate/requests.ts` lets the settled
+ * event supersede the snapshot rather than count the request twice.
+ *
+ * Never throws: each record is reported inside its own guard, and a failure
+ * costs that record's snapshot, is counted in {@link getFetchStats}' `failures`
+ * and is stated through `reportProducerFailure` (AAP 0.5.5). Safe to call while
+ * detached, where the list is empty.
+ *
+ * @returns How many snapshots were handed to the transport.
+ *
+ * @example
+ * ```ts
+ * // At a capture boundary, before anything invalidates the generation:
+ * reportInFlightRequests();
+ * advanceFetchGeneration();
+ * ```
+ */
+export function reportInFlightRequests(): number {
+  let reported = 0;
+  try {
+    if (outstandingRequests.size === 0) {
+      return 0;
+    }
+
+    // A copy, because each record is removed as it is visited; one clock read,
+    // so every snapshot describes the same boundary.
+    const records = [...outstandingRequests];
+    const observedAt = nowEpochMs();
+
+    for (const record of records) {
+      try {
+        // Removed first, so a record whose snapshot fails is not retried by a
+        // later call and can never be reported twice.
+        outstandingRequests.delete(record);
+        if (record.settled || !isCurrentGeneration(record)) {
+          continue;
+        }
+        emitInFlightSnapshot(record, observedAt);
+        reported += 1;
+      } catch (error: unknown) {
+        failureTotal += 1;
+        reportProducerFailure('fetch', 'in-flight-snapshot', error);
+      }
+    }
+  } catch (error: unknown) {
+    // Structural: every step above is guarded or cannot fail, and this is the
+    // guarantee that a capture boundary never throws into the agent.
+    failureTotal += 1;
+    reportProducerFailure('fetch', 'in-flight-snapshot', error);
+  }
+  return reported;
 }
 
 /**

@@ -102,6 +102,47 @@
  * the binding itself throws `ERR_INVALID_STATE` on a second close, and a signal
  * handler racing a test teardown must not turn a clean stop into a crash.
  *
+ * ## The files, and what protects them
+ *
+ * AAP 0.4.2 requires the `$DEBUGGEN_HOME` tree to be `0700` and every file in
+ * it `0600`, and `DatabaseSync` helps with neither: it opens a path — and its
+ * `-wal`, `-shm` and `-journal` sidecars — by name, **following** a symbolic
+ * link at the final component and creating under the process umask. A private
+ * parent directory alone would still let an existing link at `sessions.sqlite`
+ * send the migration and every session's telemetry to a file outside the state
+ * tree (CWE-59). So {@link openStore} holds the final entries themselves to a
+ * policy, on every file-backed open:
+ *
+ * - the database and each existing sidecar must be a regular, single-link file
+ *   this account owns — never a link, a directory or a hard link — and must
+ *   end at mode `0600`: any other mode (`0644`, `0400`, `0700`) is set to
+ *   `0600` in place, and on a POSIX host a file that still grants group or
+ *   other access afterwards — the filesystem refused the `chmod` or ignored it
+ *   — fails the open, which for the database and every sidecar already present
+ *   happens before SQLite has opened anything;
+ * - a missing database is created by this process as an empty `0600`
+ *   placeholder with `O_CREAT | O_EXCL | O_NOFOLLOW`, so the file SQLite opens
+ *   cannot have been a link;
+ * - the database's canonical path must be its own lexical path, inside the
+ *   declared state root;
+ * - its device and inode are recorded before SQLite opens it and re-checked
+ *   right after the open, after the pragmas and after the migration, alongside
+ *   a fresh judgement of every sidecar SQLite has created by then.
+ *
+ * Every check is an `lstat` and every repair a path-based `chmod` between two
+ * `lstat`s that must agree on the inode, because closing any descriptor this
+ * process holds on a store inode would release the POSIX locks the connection
+ * depends on. {@link openStore} states the sequence and the residual window.
+ *
+ * The mode requirement has two deliberate limits. A file the `chmod` leaves
+ * owner-only but not exactly `0600` — a filesystem that reports `0700` for
+ * every file, or a refused `chmod` on a `0400` file — is private in every sense
+ * that matters and is accepted with a `debug` note. And off POSIX (no
+ * `process.getuid`), where a mode is synthesised from a read-only attribute
+ * rather than recorded, a mode is never a reason to refuse, the convention
+ * `@debuggen/shared/node` follows; there the link, type, link-count and
+ * identity checks are the whole policy.
+ *
  * ## Values, injection and privacy
  *
  * Values reach SQLite through bound parameters only. That is simultaneously the
@@ -127,8 +168,8 @@
  * @packageDocumentation
  */
 
-import { chmodSync, readFileSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { chmodSync, readFileSync, realpathSync } from 'node:fs';
+import { basename, dirname, join, resolve } from 'node:path';
 import { DatabaseSync, type StatementSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 
@@ -139,11 +180,20 @@ import {
   isWithin,
   noopLogger,
   ok,
+  toPosix,
   type LogFields,
   type Logger,
   type Result,
 } from '@debuggen/shared';
-import { SECURE_FILE_MODE, ensureSecureDir } from '@debuggen/shared/node';
+import {
+  SECURE_FILE_MODE,
+  createFileExclusive,
+  ensureSecureDir,
+  inspectPrivateFileNoFollow,
+  isSameFileIdentity,
+  type FileIdentity,
+  type PrivateFileState,
+} from '@debuggen/shared/node';
 
 import type { ServiceConfig } from '../config.js';
 import { applyMigrations, readSchemaVersion } from './migrations.js';
@@ -164,9 +214,10 @@ const SUBSYSTEM = 'store';
  * by no file".
  *
  * Recognised explicitly rather than pattern-matched, because every behaviour
- * that is skipped for it — creating and tightening a directory, tightening the
- * database file and its sidecars, expecting WAL mode — is skipped because there
- * *is* no file, and a path that merely looks like this one would still have one.
+ * that is skipped for it — creating and tightening a directory, securing and
+ * re-verifying the database file and its sidecars, expecting WAL mode — is
+ * skipped because there *is* no file, and a path that merely looks like this
+ * one would still have one.
  */
 const MEMORY_DATABASE_PATH = ':memory:';
 
@@ -269,6 +320,50 @@ const STATE_DIRECTORY_HINT =
  */
 const PACKAGING_HINT =
   'This is a packaging fault rather than a setting: rebuild the service with `pnpm --filter @debuggen/local-service build`, which copies src/store/schema.sql to dist/store/schema.sql, or reinstall Debug Generator.';
+
+/**
+ * The companions SQLite keeps beside the database file, by suffix: the
+ * write-ahead log, its shared-memory index, and the rollback journal a store
+ * uses when WAL is unavailable (and a crashed rollback-mode writer leaves
+ * behind as a hot journal SQLite replays on open).
+ *
+ * Each holds the same session data the database does, and SQLite opens each by
+ * path with `O_CREAT` and **without** `O_NOFOLLOW`, so a link planted at any of
+ * them redirects those bytes exactly as a link at the database itself would.
+ * Every one is therefore held to the database file's policy.
+ */
+const SIDECAR_SUFFIXES: readonly string[] = Object.freeze(['-wal', '-shm', '-journal']);
+
+/**
+ * Permission bits belonging to group and other. On a POSIX host, a store file
+ * still carrying any of them after the store has tried to set
+ * {@link SECURE_FILE_MODE} is refused, because SQLite would otherwise write
+ * captured telemetry into a file another account can read. Every mode other
+ * than exactly {@link SECURE_FILE_MODE} is set to it first, so a reopen of a
+ * `0600` store performs no `chmod` at all.
+ */
+const GROUP_AND_OTHER_BITS = 0o077;
+
+/** The permission bits of a mode, for a log line a developer compares with `ls -l`. */
+const PERMISSION_BITS = 0o777;
+
+/**
+ * The reason half of the hint on every refusal of the database file or a
+ * sidecar. The entry is something the store cannot safely open, so the hint
+ * always begins by naming it and telling the developer to take it out of the
+ * way; this is what it goes on to explain.
+ */
+const STORE_FILE_POLICY =
+  'the session store and its -wal, -shm and -journal sidecars must be regular files owned by this account with a single link — not symbolic links, directories or hard links — and must resolve inside the state directory, because they hold captured telemetry and the journal that restores patched files. A missing store is created again, privately, on the next start.';
+
+/**
+ * The reason half of the hint on a store file whose mode could not be made
+ * owner-only. Nothing about the entry needs moving aside, so its action clause
+ * is a repair of the mode or of where the state directory lives; this explains
+ * why the store will not open until one of them is made.
+ */
+const STORE_FILE_MODE_POLICY =
+  'the session store and its -wal, -shm and -journal sidecars must be readable and writable by this account alone (mode 600), because they hold captured telemetry and the journal that restores patched files, so the store does not open while another account could read them.';
 
 /* -------------------------------------------------------------------------------------------------
  * Small helpers
@@ -928,8 +1023,9 @@ export interface OpenStoreOptions {
    * assemble a whole {@link ServiceConfig} to open a database:
    * `databasePath` is `<debuggenHome>/sessions.sqlite`, and `debuggenHome` is
    * the state root — the boundary whose whole chain is verified and tightened to
-   * `0700` before the file is created. Mutually exclusive with
-   * {@link OpenStoreOptions.databasePath}.
+   * `0700` before the file is created, and the tree the database file's
+   * canonical path must resolve inside before SQLite opens it. Mutually
+   * exclusive with {@link OpenStoreOptions.databasePath}.
    */
   readonly config?: Pick<ServiceConfig, 'databasePath' | 'debuggenHome'> | undefined;
 
@@ -971,6 +1067,11 @@ export interface OpenStoreOptions {
    * a database it does not own the tree of. It is never skipped for the service
    * itself: `$DEBUGGEN_HOME` must be `0700` before a session's telemetry,
    * questions and file paths land inside it.
+   *
+   * It governs the **directory** policy only. The database file and its
+   * sidecars are inspected, secured and re-verified on every file-backed open
+   * whatever this says, because a link planted at `sessions.sqlite` redirects
+   * the store just as surely inside a trusted directory as inside any other.
    */
   readonly ensureDirectory?: boolean | undefined;
 }
@@ -989,41 +1090,94 @@ interface StoreTarget {
 }
 
 /**
- * Opens the session store: the connection, its pragmas, its file modes and its
- * schema, in that order, or a typed failure describing which step refused.
+ * Opens the session store: its directory, its files, the connection, its
+ * pragmas and its schema, in that order, or a typed failure describing which
+ * step refused.
  *
  * This is the only way a {@link Store} comes into existence, which is what
- * guarantees that no connection in this service is missing the pragmas or the
- * migration ladder. `src/main.ts` calls it once, between creating
- * `$DEBUGGEN_HOME` with the editor credential and running the modification
- * reconciliation and retention purge that need a migrated database; the suites
- * call it per test with a sandbox path.
+ * guarantees that no connection in this service is missing the pragmas, the
+ * file policy or the migration ladder. `src/main.ts` calls it once, between
+ * creating `$DEBUGGEN_HOME` with the editor credential and running the
+ * modification reconciliation and retention purge that need a migrated
+ * database; the suites call it per test with a sandbox path.
  *
  * ## The sequence, and why it is this one
  *
  * 1. Resolve the target and require **exactly one** of
  *    {@link OpenStoreOptions.databasePath} and {@link OpenStoreOptions.config}.
- * 2. Create and verify the parent directory (`0700`) — before the file exists,
- *    because `DatabaseSync` creates a missing database under the process umask
- *    and a private directory is what keeps the window harmless.
- * 3. Open the connection with no constructor options, so nothing depends on an
- *    option's availability across Node patch releases, and set every behaviour
- *    through the explicit {@link STORE_PRAGMAS} instead.
- * 4. Restrict the database file and its `-wal`/`-shm` sidecars to `0600`,
- *    non-fatally: a host that does not record POSIX modes must not fail to start.
- * 5. Resolve the DDL.
- * 6. Run the migration ladder, closing the connection before returning any
- *    failure so a refused start leaks no handle.
- * 7. Read the stamped schema version back and build the handle.
+ * 2. Create and verify the parent directory (`0700`) — skipped only when
+ *    {@link OpenStoreOptions.ensureDirectory} is `false`. The directory being
+ *    private and owned is what stops another account from swapping an entry
+ *    inside it between the checks below and the uses they guard.
+ * 3. Secure the database file **before SQLite sees it**, because
+ *    `DatabaseSync` follows a symbolic link at the final component and takes no
+ *    mode. The directory's canonical path must lie inside the state root, so a
+ *    redirected directory receives nothing. The path is then inspected with
+ *    `lstat` alone: a missing file is created as an empty `0600` placeholder
+ *    with `O_CREAT | O_EXCL | O_NOFOLLOW`; an existing one must be a regular,
+ *    single-link file this account owns, and is set to `0600` when it carries
+ *    any other mode — refused, on a POSIX host, when group or other access
+ *    survives that attempt; its inode identity is recorded. Its canonical path
+ *    must equal its lexical one, and every existing `-wal`, `-shm` and
+ *    `-journal` sidecar is held to the same file policy.
+ * 4. Open the connection with no constructor options, so nothing depends on an
+ *    option's availability across Node patch releases, and require the path to
+ *    still name the recorded inode — the proof that SQLite opened the file that
+ *    was judged rather than one swapped in after the judgement.
+ * 5. Set every behaviour through the explicit {@link STORE_PRAGMAS}.
+ * 6. Re-verify the store's files (the database's identity; every sidecar,
+ *    validated and tightened). WAL mode is on from here, and SQLite creates its
+ *    sidecars by path without `O_NOFOLLOW`.
+ * 7. Resolve the DDL.
+ * 8. Run the migration ladder, then re-verify the store's files again on both
+ *    outcomes — the first write is what creates the `-wal` and `-shm` sidecars —
+ *    closing the connection before returning any failure so a refused start
+ *    leaks no handle.
+ * 9. Read the stamped schema version back and build the handle.
+ *
+ * ## Why no step opens a descriptor on an existing store file
+ *
+ * Closing *any* descriptor this process holds on the database or a sidecar
+ * inode silently releases every POSIX lock the connection holds on it (SQLite,
+ * "How To Corrupt An SQLite Database File", §2.2), and a WAL connection keeps a
+ * shared lock on `-shm` for its whole lifetime. So every inspection here is
+ * `lstat`, every tightening is a path-based `chmod` bracketed by two `lstat`s
+ * that must report the same device and inode, and the only descriptor ever
+ * opened is the one that creates a brand-new placeholder — an inode no
+ * connection can hold yet.
+ *
+ * The residual window is stated rather than hidden: between an `lstat` and the
+ * step it guards, a process running **as this same account** could swap an
+ * entry and swap it back. That is outside the threat model — such a process can
+ * already read and write the store directly — while every other account is
+ * shut out by the private directory of step 2.
+ *
+ * The mode policy fails closed. On a POSIX host, whether the `chmod` threw
+ * (`EPERM`, `ENOTSUP`, `EROFS`) or returned without effect, the mode the second
+ * `lstat` reports is the verdict: one still granting group or other access is
+ * refused as `group-or-other-permissions`, so SQLite never writes captured
+ * telemetry into a file another account can read, and one that is owner-only
+ * but not exactly `0600` is accepted and noted at `debug`. A filesystem that
+ * records no POSIX modes at all has normally been refused already, by the
+ * directory policy of step 2. Off POSIX a mode is never a reason to refuse.
+ * Every other file-policy outcome is fatal.
  *
  * @param options Exactly one of `databasePath` and `config`, plus the optional
  * logger, DDL source and directory switch.
  * @returns `Ok` with an open, migrated {@link Store}, or `Err` with a
  * {@link DebuggenError}: `CONFIG_INVALID` when the options do not name exactly
- * one target, `FS_UNSAFE_PATH` when the state directory is not private or is
- * reached through a symbolic link, and `STORE_ERROR` for every other refusal —
- * the file cannot be opened, the DDL is missing or truncated, the ladder
- * refused.
+ * one target; `FS_UNSAFE_PATH` when the state directory is not private or is
+ * reached through a symbolic link, or when the database file or a sidecar is a
+ * symbolic link, not a regular file, owned by another account or hard-linked
+ * (`details.reason` `symlink-component`, `not-a-regular-file`, `foreign-owner`,
+ * `multiply-linked`), still grants group or other access after the store tried
+ * to set `0600` (`group-or-other-permissions`, with `details.mode`,
+ * `details.expectedMode` `'600'` and, when the `chmod` threw, `details.errno`),
+ * resolves somewhere other than its own directory or outside the state root
+ * (`canonical-path-mismatch`, `outside-state-root`), or is replaced while the
+ * store is being opened (`identity-changed`); and
+ * `STORE_ERROR` for every other refusal — the file cannot be created, inspected
+ * or opened, the DDL is missing or truncated, the ladder refused.
  *
  * @example The service
  * ```ts
@@ -1063,7 +1217,19 @@ export function openStore(options: OpenStoreOptions): Result<Store, DebuggenErro
     }
   }
 
-  // Step 3.
+  // Step 3. Applies to every file-backed store whatever `ensureDirectory` says:
+  // that switch vouches for the directory, never for the entry at the path.
+  // `undefined` for the in-memory store, which has no file to secure.
+  let identity: FileIdentity | undefined;
+  if (!isInMemory(path)) {
+    const secured = secureStoreFiles(path, stateRoot, logger);
+    if (isErr(secured)) {
+      return secured;
+    }
+    identity = secured.value;
+  }
+
+  // Step 4.
   let db: DatabaseSync;
   try {
     db = new DatabaseSync(path);
@@ -1081,39 +1247,70 @@ export function openStore(options: OpenStoreOptions): Result<Store, DebuggenErro
     );
   }
 
+  // Immediately, before a single statement runs: the path must still name the
+  // inode that step 3 judged, or the connection is to something else.
+  if (identity !== undefined) {
+    const opened = enforceStoreFilePolicy(
+      { databasePath: path, file: path, role: 'database', expected: identity },
+      logger,
+    );
+    if (isErr(opened)) {
+      closeQuietly(db, logger);
+      return opened;
+    }
+  }
+
+  // Step 5.
   const configured = configureConnection(db, path, logger);
   if (isErr(configured)) {
     closeQuietly(db, logger);
     return configured;
   }
 
-  // Step 4, first pass: the database file exists from the open above, so this is
-  // what narrows the window in which it is readable by other accounts. The
-  // sidecars do not exist yet — they are created by the first write, which is
-  // the migration transaction below — hence the second pass after it.
-  tightenStoreFiles(path, logger);
+  // Step 6, first pass: WAL mode is now set, and SQLite creates its sidecars by
+  // path without `O_NOFOLLOW`, so anything that has appeared beside the database
+  // is judged before the migration writes session data into it.
+  const configuredFiles = verifyStoreFiles(path, identity, logger);
+  if (isErr(configuredFiles)) {
+    closeQuietly(db, logger);
+    return configuredFiles;
+  }
 
-  // Step 5.
+  // Step 7.
   const ddl = resolveDdl(options);
   if (isErr(ddl)) {
     closeQuietly(db, logger);
     return ddl;
   }
 
-  // Step 6.
+  // Step 8.
   const outcome = applyMigrations(db, { ddl: ddl.value, logger });
 
-  // Runs on both paths and before either return: a refused ladder rolls its
-  // transaction back but still leaves the sidecars behind, and they hold the
-  // same session data the database does.
-  tightenStoreFiles(path, logger);
+  // Runs on both paths and before either return: the migration transaction is
+  // the first write, so it is what creates the `-wal` and `-shm` sidecars, and a
+  // refused ladder rolls its transaction back but still leaves them behind with
+  // the same session data the database holds.
+  const migratedFiles = verifyStoreFiles(path, identity, logger);
+  if (isErr(migratedFiles)) {
+    if (isErr(outcome)) {
+      // The file refusal is the one returned, because it is the one a developer
+      // has to act on before any retry can succeed; the ladder's own failure is
+      // still reported rather than lost.
+      logger.warn(
+        'the session store migration also failed while its files were being refused',
+        errorFields(outcome.error),
+      );
+    }
+    closeQuietly(db, logger);
+    return migratedFiles;
+  }
 
   if (isErr(outcome)) {
     closeQuietly(db, logger);
     return outcome;
   }
 
-  // Step 7. Read back rather than taken from the outcome: the stamp in the file
+  // Step 9. Read back rather than taken from the outcome: the stamp in the file
   // header is the authority on the version, and a handle that reports it is one
   // a repository can check its own expectations against.
   let schemaVersion: number;
@@ -1352,46 +1549,675 @@ function configureConnection(
   return ok(undefined);
 }
 
+/* -------------------------------------------------------------------------------------------------
+ * The store's files
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The paths of the database's sidecars, in {@link SIDECAR_SUFFIXES} order. */
+function sidecarPaths(path: string): readonly string[] {
+  return SIDECAR_SUFFIXES.map((suffix) => `${path}${suffix}`);
+}
+
+/** A mode's permission bits the way a developer types them into `chmod`. */
+function octal(mode: number): string {
+  return (mode & PERMISSION_BITS).toString(8).padStart(3, '0');
+}
+
 /**
- * Restricts the database file and its write-ahead sidecars to
- * {@link SECURE_FILE_MODE}.
+ * The single refusal every file-policy failure of the store is reported as.
  *
- * The state tree is `0700`, but the database is not created by this product's
- * own file writers: `DatabaseSync` opens the path itself and takes no mode, so
- * the file — and the `-wal`/`-shm` companions WAL mode creates beside it — land
- * with whatever the process umask allows. A private directory hides them from a
- * listing; the modes are what decide who may read a session's captured
- * telemetry if the tree is ever copied or archived.
+ * `FS_UNSAFE_PATH`, with the offending entry named in the hint — the developer's
+ * next action is almost always to move that exact entry aside — and in
+ * `details.file` beside the database it belongs to, so a sidecar refusal still
+ * says which store it blocked. Only paths, the reason, the owner or link count
+ * and the mode travel: nothing from inside a file can reach an error.
  *
- * Every failure is non-fatal and reported at `debug`. A host whose filesystem
- * does not record POSIX permissions cannot satisfy this and must still be able
- * to run the tool, and a missing sidecar is the normal state of a database that
- * has not been written to yet.
- *
- * @param path The database path; the sidecars are derived from it.
- * @param logger Where a refusal is noted.
+ * @param message What was refused, without the path.
+ * @param databasePath The store being opened.
+ * @param file The entry that was refused: the database itself or a sidecar.
+ * @param reason The finer diagnosis, for `details.reason`.
+ * @param options Diagnostic fields that are the point of the refusal, the
+ * policy error this one was translated from, the developer's action when it is
+ * not "move the entry aside" (a redirected directory is fixed above it, a mode
+ * in place), and the policy that action serves when it is not
+ * {@link STORE_FILE_POLICY}.
+ * @returns The error to return.
  */
-function tightenStoreFiles(path: string, logger: Logger): void {
-  if (isInMemory(path)) {
-    return;
+function unsafeStoreFile(
+  message: string,
+  databasePath: string,
+  file: string,
+  reason: string,
+  options: UnsafeStoreFileOptions = {},
+): DebuggenError {
+  const {
+    action = `Move ${file} aside or remove it`,
+    cause,
+    extra = {},
+    policy = STORE_FILE_POLICY,
+  } = options;
+  return new DebuggenError('FS_UNSAFE_PATH', message, {
+    hint: `${action}: ${policy}`,
+    details: { subsystem: SUBSYSTEM, databasePath, file, reason, ...extra },
+    ...(cause === undefined ? {} : { cause }),
+  });
+}
+
+/** The optional parts of {@link unsafeStoreFile}. */
+interface UnsafeStoreFileOptions {
+  /** Diagnostic fields that are the point of the refusal. */
+  readonly extra?: Readonly<Record<string, unknown>> | undefined;
+
+  /** The policy error this refusal was translated from. */
+  readonly cause?: unknown;
+
+  /** The developer's next action, as the hint's opening clause. */
+  readonly action?: string | undefined;
+
+  /**
+   * Why the action is needed, as the hint's closing clause;
+   * {@link STORE_FILE_POLICY} unless the refusal is about something else.
+   */
+  readonly policy?: string | undefined;
+}
+
+/**
+ * The fields of a shared file-policy refusal worth carrying onto the store's
+ * own: the ownership pair and the link count, when the refusal was about one
+ * of them.
+ */
+const CARRIED_POLICY_DETAILS: readonly string[] = Object.freeze([
+  'owner',
+  'expectedOwner',
+  'links',
+]);
+
+/**
+ * Inspects one store file with `lstat` alone, translating the outcome.
+ *
+ * `@debuggen/shared/node` raises its refusals as `FS_UNSAFE_PATH` with the
+ * reason underneath; they are re-raised here in the store's own shape — the
+ * database named beside the entry, the store's hint — with the reason kept, so
+ * a caller branching on `details.reason` sees the shared vocabulary. Any other
+ * failure (`EACCES`, `ENOTDIR`) is a `STORE_ERROR` carrying its errno.
+ *
+ * @param databasePath The store being opened.
+ * @param file The entry to inspect.
+ * @returns `Ok` with the entry's identity and mode, `Ok(undefined)` when
+ * nothing is there, or the translated refusal.
+ */
+function inspectStoreFile(
+  databasePath: string,
+  file: string,
+): Result<PrivateFileState | undefined, DebuggenError> {
+  try {
+    return ok(inspectPrivateFileNoFollow(file));
+  } catch (cause) {
+    if (DebuggenError.is(cause) && cause.code === 'FS_UNSAFE_PATH') {
+      const details = cause.details ?? {};
+      const reason = typeof details.reason === 'string' ? details.reason : 'unsafe-entry';
+      const extra: Record<string, unknown> = {};
+      for (const key of CARRIED_POLICY_DETAILS) {
+        if (details[key] !== undefined) {
+          extra[key] = details[key];
+        }
+      }
+      return err(
+        unsafeStoreFile(
+          'A Debug Generator session store file is not a private regular file this account owns.',
+          databasePath,
+          file,
+          reason,
+          { extra, cause },
+        ),
+      );
+    }
+
+    return err(
+      new DebuggenError('STORE_ERROR', 'Could not inspect a Debug Generator session store file.', {
+        hint: `Check that ${file} can be reached by this account. ${STATE_DIRECTORY_HINT}`,
+        details: {
+          subsystem: SUBSYSTEM,
+          databasePath,
+          file,
+          errno: errnoCodeOf(cause) ?? 'unknown',
+        },
+        cause,
+      }),
+    );
+  }
+}
+
+/** What {@link enforceStoreFilePolicy} is asked to judge. */
+interface StoreFileCheck {
+  /** The store being opened. */
+  readonly databasePath: string;
+
+  /** The entry to judge: the database itself or one of its sidecars. */
+  readonly file: string;
+
+  /**
+   * `database` for the database file, which must never disappear once judged;
+   * `sidecar` for a companion SQLite may legitimately remove, whose absence is
+   * simply nothing left to protect.
+   */
+  readonly role: 'database' | 'sidecar';
+
+  /**
+   * The inode the entry must still be, when it has been judged before. Checked
+   * before anything is tightened, so a swapped-in entry is refused untouched.
+   */
+  readonly expected?: FileIdentity | undefined;
+}
+
+/**
+ * Whether this host has the POSIX owner and permission-bit model the store's
+ * mode policy is stated in.
+ *
+ * Selected by capability rather than by platform name, the convention
+ * `@debuggen/shared/node` follows: where `process.getuid` is absent (Windows) a
+ * file's reported mode is synthesised from its read-only attribute rather than
+ * recorded, so no exact mode can be required of it and none is a reason to
+ * refuse. Evaluated per call, as the shared module's own uid lookup is, so the
+ * answer is the running process's rather than a value frozen at import.
+ *
+ * @returns `true` where file modes are recorded and enforced.
+ */
+function enforcesFileModes(): boolean {
+  return typeof process.getuid === 'function';
+}
+
+/**
+ * Whether a store file's mode calls for a `chmod` to {@link SECURE_FILE_MODE}.
+ *
+ * On a POSIX host every mode other than exactly `0600` does — a `0644` file is
+ * readable by other accounts, a `0400` one leaves SQLite unable to write, a
+ * `0700` one carries a meaningless execute bit — because AAP 0.4.2 requires
+ * every file of the state tree to be `0600`. Off POSIX the store keeps the rule
+ * it has always applied there: only a mode reporting group or other access is
+ * worth an attempt, and the outcome is never fatal.
+ *
+ * @param mode The permission bits `lstat` reported.
+ * @returns `true` when the file should be set to {@link SECURE_FILE_MODE}.
+ */
+function needsModeRepair(mode: number): boolean {
+  return enforcesFileModes() ? mode !== SECURE_FILE_MODE : (mode & GROUP_AND_OTHER_BITS) !== 0;
+}
+
+/**
+ * Holds one store file to the file policy: judged by `lstat`, set by path to
+ * exactly {@link SECURE_FILE_MODE} when it carries any other mode, proven to be
+ * the same inode afterwards, and refused when group or other access survives.
+ *
+ * The sequence is the whole of the policy, and every step avoids a descriptor
+ * (see {@link openStore} on why closing one would drop SQLite's locks):
+ *
+ * 1. Inspect. A link, a non-regular entry, a foreign owner or a second hard
+ *    link is refused; an absent entry is an answer, not a failure.
+ * 2. When an identity is expected, the entry must be present and be that inode,
+ *    before anything touches it.
+ * 3. When the mode is not exactly `0600` ({@link needsModeRepair}), `chmod` it
+ *    by path — safe because step 1 has just proven the path a regular, owned,
+ *    single-link file in a directory no other account can write — and inspect
+ *    again, whether the `chmod` returned or threw. The second `lstat` must
+ *    report the same device and inode, or the `chmod` may have landed on
+ *    something else and the open is refused; a sidecar that has gone is
+ *    nothing left to protect, a database that has gone is a replacement.
+ * 4. Judge the mode the second `lstat` reports. Exactly `0600` is the repair
+ *    and is noted at `info`. On a POSIX host, a mode still granting group or
+ *    other access — the filesystem refused the `chmod` (`EPERM`, `ENOTSUP`,
+ *    `EROFS`) or accepted it without effect — is refused as
+ *    `group-or-other-permissions`: failing closed here is what keeps SQLite
+ *    from writing captured telemetry into a file another account can read, and
+ *    every caller closes its connection before returning the refusal. A mode
+ *    that is owner-only but not `0600` — a filesystem that reports `0700` for
+ *    every file, or a refused `chmod` on a `0400` file — is effectively private
+ *    and is accepted with a `debug` note. Off POSIX nothing about a mode is
+ *    fatal, and a mode left as it was is noted at `debug`.
+ *
+ * @param check The entry, its role and the identity it must still have.
+ * @param logger Where a repair, or a mode accepted without one, is noted.
+ * @returns `Ok` with the entry's final state, `Ok(undefined)` for an absent
+ * entry that may be absent, or `Err` with `FS_UNSAFE_PATH` (the inspection's
+ * reasons, `identity-changed`, `group-or-other-permissions`) or `STORE_ERROR`.
+ */
+function enforceStoreFilePolicy(
+  check: StoreFileCheck,
+  logger: Logger,
+): Result<PrivateFileState | undefined, DebuggenError> {
+  const { databasePath, file, role, expected } = check;
+
+  const inspected = inspectStoreFile(databasePath, file);
+  if (isErr(inspected)) {
+    return inspected;
+  }
+  const state = inspected.value;
+
+  if (
+    expected !== undefined &&
+    (state === undefined || !isSameFileIdentity(expected, state.identity))
+  ) {
+    return err(
+      unsafeStoreFile(
+        'A Debug Generator session store file was replaced while the store was being opened.',
+        databasePath,
+        file,
+        'identity-changed',
+      ),
+    );
   }
 
-  for (const file of [path, `${path}-wal`, `${path}-shm`]) {
-    try {
-      chmodSync(file, SECURE_FILE_MODE);
-    } catch (cause) {
-      const errno = errnoCodeOf(cause);
-      if (errno === 'ENOENT') {
-        continue;
-      }
-      logger.debug('could not restrict a session store file to owner-only access', {
+  if (state === undefined || !needsModeRepair(state.mode)) {
+    return ok(state);
+  }
+
+  // A refused `chmod` is kept rather than returned: the mode the entry is left
+  // with, read back below, is what decides whether the open may continue, and
+  // the errno is what tells the developer why the repair did not take.
+  let refusal: { readonly errno: string; readonly cause: unknown } | undefined;
+  try {
+    chmodSync(file, SECURE_FILE_MODE);
+  } catch (cause) {
+    const errno = errnoCodeOf(cause);
+    if (errno !== 'ENOENT') {
+      refusal = { errno: errno ?? 'unknown', cause };
+    }
+    // `ENOENT` is no verdict on the mode: the entry went away between the two
+    // lookups, and the inspection below decides whether that is harmless or a
+    // replacement.
+  }
+
+  const tightened = inspectStoreFile(databasePath, file);
+  if (isErr(tightened)) {
+    return tightened;
+  }
+  const after = tightened.value;
+
+  if (after === undefined) {
+    if (role === 'sidecar') {
+      return ok(undefined);
+    }
+    return err(
+      unsafeStoreFile(
+        'The Debug Generator session store disappeared while its permissions were being restricted.',
+        databasePath,
+        file,
+        'identity-changed',
+      ),
+    );
+  }
+
+  if (!isSameFileIdentity(state.identity, after.identity)) {
+    return err(
+      unsafeStoreFile(
+        'A Debug Generator session store file was replaced while its permissions were being restricted.',
+        databasePath,
+        file,
+        'identity-changed',
+      ),
+    );
+  }
+
+  const fields: LogFields = {
+    subsystem: SUBSYSTEM,
+    path: file,
+    previousMode: octal(state.mode),
+    mode: octal(after.mode),
+    ...(refusal === undefined ? {} : { errno: refusal.errno }),
+  };
+
+  if (after.mode === SECURE_FILE_MODE) {
+    logger.info('restricted a session store file to owner-only access', fields);
+    return ok(after);
+  }
+
+  if (!enforcesFileModes()) {
+    // The reported mode is synthesised on this platform, so it is noted and
+    // never held against the file.
+    logger.debug(
+      'left a session store file at the mode reported by a platform that records no POSIX modes',
+      fields,
+    );
+    return ok(after);
+  }
+
+  if ((after.mode & GROUP_AND_OTHER_BITS) !== 0) {
+    // Fail closed. The `chmod` threw or took no effect, and the file still
+    // grants another account access to what SQLite is about to write into it.
+    // Before the open nothing has been written; after it, the caller closes the
+    // connection before returning this.
+    return err(
+      unsafeStoreFile(
+        'A Debug Generator session store file could not be restricted to owner-only access.',
+        databasePath,
+        file,
+        'group-or-other-permissions',
+        {
+          extra: {
+            mode: octal(after.mode),
+            expectedMode: octal(SECURE_FILE_MODE),
+            ...(refusal === undefined ? {} : { errno: refusal.errno }),
+          },
+          cause: refusal?.cause,
+          action: `Run \`chmod ${octal(SECURE_FILE_MODE)} ${file}\`, or set DEBUGGEN_HOME to a state directory on a filesystem that records POSIX permissions, and start the service again`,
+          policy: STORE_FILE_MODE_POLICY,
+        },
+      ),
+    );
+  }
+
+  // Owner-only but not exactly `0600`: a filesystem that reports one fixed
+  // owner-only mode for every file, or a refused `chmod` on a `0400` file. No
+  // other account can reach it, so it is accepted as private.
+  logger.debug('accepted a session store file at an owner-only mode other than 600', fields);
+  return ok(after);
+}
+
+/**
+ * Creates a missing database file as an empty, owner-only placeholder that
+ * SQLite then opens as a new database.
+ *
+ * `createFileExclusive` opens with `O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW`,
+ * applies `0600` with `fchmod` whatever the umask, and `fsync`s — so the file
+ * SQLite opens was created by this process, at this mode, and cannot have been
+ * a link. That is the one descriptor this module opens on a store file, and it
+ * is safe to close: the inode is brand new and no connection can hold a lock on
+ * it. The directory policy is not re-asked, because step 2 of {@link openStore}
+ * has either verified it or the caller has vouched for it.
+ *
+ * `EEXIST` is a lost race rather than a failure — something appeared at the path
+ * after it was inspected, and `O_EXCL` reports even a planted link that way —
+ * so it is answered with `false` and the caller judges whatever is there now.
+ *
+ * @param databasePath The database path.
+ * @param logger Where the creation is noted.
+ * @returns `Ok(true)` when this call created the file, `Ok(false)` when the path
+ * was taken first, or `Err` with `STORE_ERROR`.
+ */
+function createDatabasePlaceholder(
+  databasePath: string,
+  logger: Logger,
+): Result<boolean, DebuggenError> {
+  try {
+    createFileExclusive(databasePath, new Uint8Array(0), { requireSecureParents: false });
+  } catch (cause) {
+    const errno = errnoCodeOf(cause);
+    if (errno === 'EEXIST') {
+      return ok(false);
+    }
+    return err(
+      new DebuggenError('STORE_ERROR', 'Could not create the Debug Generator session store.', {
+        hint: `Check that the directory of ${databasePath} exists and is writable by this account. ${STATE_DIRECTORY_HINT}`,
+        details: { subsystem: SUBSYSTEM, databasePath, errno: errno ?? 'unknown' },
+        cause,
+      }),
+    );
+  }
+
+  logger.debug('created the session store file as an owner-only placeholder', {
+    subsystem: SUBSYSTEM,
+    path: databasePath,
+    mode: octal(SECURE_FILE_MODE),
+  });
+  return ok(true);
+}
+
+/**
+ * The canonical form of a path the store is about to rely on, or the
+ * `STORE_ERROR` explaining why it has none.
+ *
+ * @param databasePath The store being opened, for the error's details.
+ * @param target The path to resolve.
+ * @returns `Ok` with the canonical path, or `Err` with `STORE_ERROR` and the
+ * errno (`ENOENT` for a directory that does not exist, `EACCES`, `ELOOP`).
+ */
+function canonicalPathOf(databasePath: string, target: string): Result<string, DebuggenError> {
+  try {
+    return ok(realpathSync(target));
+  } catch (cause) {
+    return err(
+      new DebuggenError(
+        'STORE_ERROR',
+        'Could not resolve the canonical path of the Debug Generator session store.',
+        {
+          hint: `Check that ${target} exists and can be reached by this account. ${STATE_DIRECTORY_HINT}`,
+          details: {
+            subsystem: SUBSYSTEM,
+            databasePath,
+            file: target,
+            errno: errnoCodeOf(cause) ?? 'unknown',
+          },
+          cause,
+        },
+      ),
+    );
+  }
+}
+
+/**
+ * Proves that the database's directory resolves inside the declared state root,
+ * before anything is created or tightened in it.
+ *
+ * The `lstat` policy sees only the final component, and `ensureDirectory: false`
+ * skips the directory walk entirely, so an interior link — a subdirectory of the
+ * state root replaced by a link out of it — is caught here regardless. It runs
+ * first so that a redirected directory receives neither a placeholder nor a
+ * `chmod`. Containment is the same POSIX gate the rest of the product uses,
+ * applied to canonical paths on both sides.
+ *
+ * @param path The database path.
+ * @param stateRoot The declared state root, when there is one.
+ * @returns `Ok` with the directory's canonical path, `Err` with
+ * `FS_UNSAFE_PATH` (`outside-state-root`) when it escapes the root, or
+ * `STORE_ERROR` when a path cannot be resolved.
+ */
+function verifyCanonicalDirectory(
+  path: string,
+  stateRoot: string | undefined,
+): Result<string, DebuggenError> {
+  const directory = canonicalPathOf(path, dirname(path));
+  if (isErr(directory) || stateRoot === undefined) {
+    return directory;
+  }
+
+  const root = canonicalPathOf(path, stateRoot);
+  if (isErr(root)) {
+    return root;
+  }
+
+  if (!isWithin(toPosix(root.value), toPosix(directory.value))) {
+    return err(
+      unsafeStoreFile(
+        'The Debug Generator session store resolves outside the Debug Generator state directory.',
+        path,
+        path,
+        'outside-state-root',
+        {
+          extra: { canonicalPath: join(directory.value, basename(path)), stateRoot: root.value },
+          action: `Replace the symbolic link on the way from ${stateRoot} to ${dirname(path)} with a real directory, or point DEBUGGEN_HOME at the directory the store should really live in`,
+        },
+      ),
+    );
+  }
+
+  return directory;
+}
+
+/**
+ * Proves that the database path names itself: its canonical path is its
+ * canonical directory joined with its own name, so no link at the final
+ * component resolves it elsewhere.
+ *
+ * The `lstat` policy has already refused a link there; this is the second,
+ * independent statement of the same fact from the resolver's side, made after
+ * the file exists because only an existing path has a canonical form.
+ *
+ * @param path The database path, which exists.
+ * @param canonicalDirectory Its directory's canonical path, from
+ * {@link verifyCanonicalDirectory}.
+ * @returns `Ok` when it holds, `Err` with `FS_UNSAFE_PATH`
+ * (`canonical-path-mismatch`) when it does not, or `STORE_ERROR` when the path
+ * cannot be resolved.
+ */
+function verifyCanonicalFile(
+  path: string,
+  canonicalDirectory: string,
+): Result<void, DebuggenError> {
+  const file = canonicalPathOf(path, path);
+  if (isErr(file)) {
+    return file;
+  }
+
+  if (file.value !== join(canonicalDirectory, basename(path))) {
+    return err(
+      unsafeStoreFile(
+        'The Debug Generator session store resolves to a different file than the path it was opened at.',
+        path,
+        path,
+        'canonical-path-mismatch',
+        { extra: { canonicalPath: file.value } },
+      ),
+    );
+  }
+
+  return ok(undefined);
+}
+
+/**
+ * Step 3 of {@link openStore}: secures the database file and its existing
+ * sidecars before SQLite opens anything, and records the database's identity.
+ *
+ * In order: the directory's canonical path must lie inside the state root
+ * ({@link verifyCanonicalDirectory}); the database is judged by
+ * {@link enforceStoreFilePolicy}, and a missing one is created by
+ * {@link createDatabasePlaceholder} and then judged exactly as an existing one
+ * would be — whether this call created it or lost the exclusive create to
+ * something else; the file's canonical path must be its own
+ * ({@link verifyCanonicalFile}); and each sidecar SQLite would open is held to
+ * the same policy, where absence is the normal state.
+ *
+ * @param path The database path.
+ * @param stateRoot The declared state root, when there is one.
+ * @param logger Where repairs are noted.
+ * @returns `Ok` with the database's identity, or the first refusal.
+ */
+function secureStoreFiles(
+  path: string,
+  stateRoot: string | undefined,
+  logger: Logger,
+): Result<FileIdentity, DebuggenError> {
+  const canonicalDirectory = verifyCanonicalDirectory(path, stateRoot);
+  if (isErr(canonicalDirectory)) {
+    return canonicalDirectory;
+  }
+
+  const database: StoreFileCheck = { databasePath: path, file: path, role: 'database' };
+
+  const existing = enforceStoreFilePolicy(database, logger);
+  if (isErr(existing)) {
+    return existing;
+  }
+
+  let state = existing.value;
+  if (state === undefined) {
+    const created = createDatabasePlaceholder(path, logger);
+    if (isErr(created)) {
+      return created;
+    }
+    if (!created.value) {
+      logger.debug('the session store path was taken while it was being created', {
         subsystem: SUBSYSTEM,
-        path: file,
-        mode: SECURE_FILE_MODE.toString(8),
-        errno: errno ?? 'unknown',
+        path,
       });
     }
+
+    const judged = enforceStoreFilePolicy(database, logger);
+    if (isErr(judged)) {
+      return judged;
+    }
+    if (judged.value === undefined) {
+      return err(
+        unsafeStoreFile(
+          'The Debug Generator session store disappeared as soon as it was created.',
+          path,
+          path,
+          'identity-changed',
+        ),
+      );
+    }
+    state = judged.value;
   }
+
+  const named = verifyCanonicalFile(path, canonicalDirectory.value);
+  if (isErr(named)) {
+    return named;
+  }
+
+  const sidecars = enforceSidecarPolicy(path, logger);
+  if (isErr(sidecars)) {
+    return sidecars;
+  }
+
+  return ok(state.identity);
+}
+
+/**
+ * Holds every existing sidecar of the database to the file policy, in
+ * {@link SIDECAR_SUFFIXES} order; an absent sidecar is the normal state.
+ *
+ * @param path The database path; the sidecars are derived from it.
+ * @param logger Where repairs are noted.
+ * @returns `Ok` when every sidecar present holds to the policy, or the first
+ * refusal.
+ */
+function enforceSidecarPolicy(path: string, logger: Logger): Result<void, DebuggenError> {
+  for (const sidecar of sidecarPaths(path)) {
+    const judged = enforceStoreFilePolicy(
+      { databasePath: path, file: sidecar, role: 'sidecar' },
+      logger,
+    );
+    if (isErr(judged)) {
+      return judged;
+    }
+  }
+
+  return ok(undefined);
+}
+
+/**
+ * Steps 6 and 8 of {@link openStore}: re-verifies the store's files while the
+ * connection holds them.
+ *
+ * The database must still be the inode step 3 recorded, and every sidecar that
+ * now exists — SQLite creates them by path, without `O_NOFOLLOW` — is judged and
+ * tightened. `lstat` and path-based `chmod` only: the connection holds POSIX
+ * locks on these inodes, and a descriptor opened and closed here would release
+ * them.
+ *
+ * @param path The database path.
+ * @param identity The identity step 3 recorded, or `undefined` for the
+ * in-memory store, which has no files and passes trivially.
+ * @param logger Where repairs are noted.
+ * @returns `Ok` when every file holds to the policy, or the first refusal.
+ */
+function verifyStoreFiles(
+  path: string,
+  identity: FileIdentity | undefined,
+  logger: Logger,
+): Result<void, DebuggenError> {
+  if (identity === undefined) {
+    return ok(undefined);
+  }
+
+  const database = enforceStoreFilePolicy(
+    { databasePath: path, file: path, role: 'database', expected: identity },
+    logger,
+  );
+  if (isErr(database)) {
+    return database;
+  }
+
+  return enforceSidecarPolicy(path, logger);
 }
 
 /**

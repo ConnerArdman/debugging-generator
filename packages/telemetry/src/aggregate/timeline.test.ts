@@ -19,6 +19,12 @@
  *   producer-controlled node ids. If the join is ambiguous, two distinct
  *   relationships collapse into one row whose count and duration are the sum of
  *   two unrelated things.
+ * - **Event coordinates and lineage in the dependency graph.** A participant
+ *   that collapsed one record is the one event a host can select, and a
+ *   collapse of several is not; an edge whose callee joined through an
+ *   asynchronous-continuation attribution is an inference, sometimes an
+ *   ambiguous one (AAP 0.4.2). If either fact is lost here, the graph view can
+ *   neither select an event nor tell a guessed relationship from a measured one.
  *
  * Plus the determinism the panel-data contract needs: a location chosen from a
  * *set* of candidates rather than from the order they arrived in, since two
@@ -39,6 +45,7 @@ import {
   aggregateStateTransitions,
   buildDependencyGraph,
 } from './timeline.js';
+import type { DependencyGraphData, DependencyGraphEdge, DependencyGraphNode } from './timeline.js';
 import type { TelemetryEvent } from '../schema/event.js';
 
 /** The trace every event in this suite belongs to. */
@@ -310,6 +317,142 @@ describe('dependency-graph edge identity', () => {
     const nodeIds = graph.nodes.map((node) => node.id);
     expect(nodeIds).toContain(edge?.from);
     expect(nodeIds).toContain(edge?.to);
+  });
+});
+
+describe('dependency-graph event coordinates and lineage', () => {
+  /** A server function span whose participant identity is its own name. */
+  function call(name: string, over: Partial<TelemetryEvent> = {}): TelemetryEvent {
+    return event({ kind: 'function', tier: 'server', name, duration: 4, attributes: {}, ...over });
+  }
+
+  /** The lineage attributes an asynchronous continuation is written with (AAP 0.4.2). */
+  const CONTINUATION = { lineage: 'async-continuation' } as const;
+
+  /** The participant a graph built from these events gives the label, failing when absent. */
+  function nodeLabelled(graph: DependencyGraphData, label: string): DependencyGraphNode {
+    const node = graph.nodes.find((candidate) => candidate.label === label);
+    if (node === undefined) {
+      throw new Error(`the graph carries no participant labelled "${label}"`);
+    }
+    return node;
+  }
+
+  /** The graph's one edge, failing when it has another count. */
+  function soleEdge(graph: DependencyGraphData): DependencyGraphEdge {
+    expect(graph.edges).toHaveLength(1);
+    const [edge] = graph.edges;
+    if (edge === undefined) {
+      throw new Error('the graph carries no edge');
+    }
+    return edge;
+  }
+
+  it('gives a single-record participant the id and trace of its one event', () => {
+    const only = call('example.single');
+
+    const node = nodeLabelled(buildDependencyGraph([only]), 'example.single');
+
+    expect(node.count).toBe(1);
+    expect(node.eventId).toBe(only.id);
+    expect(node.traceId).toBe(only.traceId);
+  });
+
+  it('gives a participant that collapsed several records no event coordinate at all', () => {
+    const first = call('example.repeated');
+    const second = call('example.repeated');
+
+    const node = nodeLabelled(buildDependencyGraph([first, second]), 'example.repeated');
+
+    // Two records are not one event: neither id is chosen to stand for the
+    // group, and the keys are absent rather than present with no value.
+    expect(node.count).toBe(2);
+    expect('eventId' in node).toBe(false);
+    expect('traceId' in node).toBe(false);
+  });
+
+  it('counts a callee attributed through an asynchronous continuation as inferred', () => {
+    const caller = call('example.caller');
+    const callee = call('example.callee', {
+      parentSpanId: caller.spanId,
+      attributes: { ...CONTINUATION },
+    });
+
+    const edge = soleEdge(buildDependencyGraph([caller, callee]));
+
+    expect(edge.count).toBe(1);
+    expect(edge.inferredCount).toBe(1);
+    expect('ambiguousCount' in edge).toBe(false);
+  });
+
+  it('counts an attribution chosen among several open candidates as ambiguous', () => {
+    const caller = call('example.caller');
+    const callee = call('example.callee', {
+      parentSpanId: caller.spanId,
+      attributes: {
+        ...CONTINUATION,
+        lineageAmbiguous: true,
+        lineageCandidates: ['e'.repeat(16)],
+      },
+    });
+
+    const edge = soleEdge(buildDependencyGraph([caller, callee]));
+
+    expect(edge.inferredCount).toBe(1);
+    expect(edge.ambiguousCount).toBe(1);
+  });
+
+  it('counts only the attributed share of an edge whose callees joined both ways', () => {
+    const caller = call('example.caller');
+    const nested = call('example.callee', { parentSpanId: caller.spanId });
+    const continued = call('example.callee', {
+      parentSpanId: caller.spanId,
+      attributes: { ...CONTINUATION },
+    });
+
+    const edge = soleEdge(buildDependencyGraph([caller, nested, continued]));
+
+    expect(edge.count).toBe(2);
+    expect(edge.inferredCount).toBe(1);
+    expect('ambiguousCount' in edge).toBe(false);
+  });
+
+  it('marks nothing on an edge whose callees were all nested inside their caller', () => {
+    const caller = call('example.caller');
+    const callee = call('example.callee', { parentSpanId: caller.spanId });
+
+    const edge = soleEdge(buildDependencyGraph([caller, callee]));
+
+    expect('inferredCount' in edge).toBe(false);
+    expect('ambiguousCount' in edge).toBe(false);
+  });
+
+  it('reads an ambiguity flag without a claimed mechanism as no attribution', () => {
+    // `lineageOf` reports no lineage for a qualifier that qualifies nothing, and
+    // the edge follows it rather than re-reading the attribute keys itself.
+    const caller = call('example.caller');
+    const callee = call('example.callee', {
+      parentSpanId: caller.spanId,
+      attributes: { lineageAmbiguous: true },
+    });
+
+    const edge = soleEdge(buildDependencyGraph([caller, callee]));
+
+    expect('inferredCount' in edge).toBe(false);
+    expect('ambiguousCount' in edge).toBe(false);
+  });
+
+  it('survives a JSON round trip unchanged, as the panel-data response carries it', () => {
+    const caller = call('example.caller');
+    const nested = call('example.callee', { parentSpanId: caller.spanId });
+    const continued = call('example.callee', {
+      parentSpanId: caller.spanId,
+      attributes: { ...CONTINUATION, lineageAmbiguous: true },
+    });
+
+    const graph = buildDependencyGraph([caller, nested, continued]);
+
+    expect(JSON.parse(JSON.stringify(graph))).toStrictEqual(graph);
   });
 });
 

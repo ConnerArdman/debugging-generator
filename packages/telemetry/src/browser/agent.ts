@@ -173,6 +173,7 @@ import {
   detachFetch,
   hasFetchResidue,
   isFetchAttached,
+  reportInFlightRequests,
 } from './fetch.js';
 import { getDocumentId, getProducerId, newSpanId } from './ids.js';
 import {
@@ -2189,6 +2190,16 @@ function maybeEmitComponentTreeSnapshot(trigger: string, bounds: TreeBounds): bo
  *    request on the wire from capture A would otherwise settle inside capture B
  *    and be reported there, carrying B's `captureId` and a number from B's
  *    restarted sequence (AAP 0.2.3 scopes `seq` to `(producerId, captureId)`).
+ *
+ *    Those requests are **reported to capture A first**, as in-flight
+ *    snapshots, and only then is the generation advanced. The order is the
+ *    point: `./transport.js` stamps an event with the capture it holds when the
+ *    event is emitted, which is still A until step 3 publishes B, and the
+ *    `configureTransport` of step 3 flushes A's queue under A before it
+ *    switches. Advancing first would make every outstanding record stale and
+ *    the snapshot would have nothing to report. When the agent was dormant
+ *    there is no outstanding request and no configured capture, so the call
+ *    reports nothing.
  * 2. **The span helper, with the capture's identity.** Armed before the
  *    producers, so a patched application function that runs mid-attach is
  *    recorded rather than passed through — and armed *for a named capture*,
@@ -2245,7 +2256,11 @@ function arm(config: ParsedAgentConfig): void {
     failedHooks.clear();
     reportedUnreleasedHooks.clear();
     componentTreeRefusalReported = false;
-    // Requests already on the wire belong to the capture that has just ended.
+    // Requests already on the wire belong to the capture that has just ended,
+    // so they are reported to it first — as in-flight snapshots, while the
+    // transport still stamps the outgoing capture (see step 1 of this
+    // function's documentation). `reportInFlightRequests` never throws.
+    reportInFlightRequests();
     // Nothing detaches here — the developer is still capturing requests, and
     // `./fetch.js` keeps both patches installed — so the producer generation is
     // advanced instead, which makes every in-flight record stale: no event, no
@@ -2347,9 +2362,16 @@ function arm(config: ParsedAgentConfig): void {
  *    React is still attached and the transport still carries the ending
  *    capture — after either, the structure is gone and the event would be
  *    dropped. {@link maybeEmitComponentTreeSnapshot} is the gate.
- * 2. **A flush**, so what the capture already recorded leaves before the
+ * 2. **The in-flight request snapshots**, for the same reason: a request still
+ *    on the wire reports nothing once the fetch family detaches, so
+ *    `./fetch.js`'s `reportInFlightRequests()` emits one snapshot per
+ *    outstanding request while the ending capture is still the one the
+ *    transport stamps. Before the flush, because the reset in step 5 discards
+ *    whatever the flush did not take. Nothing is emitted when the network hook
+ *    was not armed, since nothing was outstanding.
+ * 3. **A flush**, so what the capture already recorded leaves before the
  *    transport stops accepting anything.
- * 3. **Detach every capture-scoped family in reverse attach order**, so
+ * 4. **Detach every capture-scoped family in reverse attach order**, so
  *    interaction context outlives the producers that resolve against it and
  *    nothing resolves a trace from a half-released window. Unconditionally,
  *    not only the families whose predicate says they are attached: every
@@ -2361,10 +2383,10 @@ function arm(config: ParsedAgentConfig): void {
  *    {@link reportUnreleasedHooks}). Document-scoped families survive — they
  *    belong to the document, and the panel still selects elements between
  *    captures.
- * 4. **Reset the shared state and the transport.** `resetTransport()` also
+ * 5. **Reset the shared state and the transport.** `resetTransport()` also
  *    drops this module's subscription, so the inbound channel is immediately
  *    re-made (see {@link resubscribeToBridge}).
- * 5. **Leave the span helper installed.** Disabled, not removed: patched code
+ * 6. **Leave the span helper installed.** Disabled, not removed: patched code
  *    may still be loaded in the page, and AAP 0.5.1 requires the helper to
  *    remain an inert pass-through. Only `uninstallSpanHelper()` removes it,
  *    and nothing in this lifecycle calls it.
@@ -2380,6 +2402,11 @@ function disarm(): void {
   const wasArmed = armedCaptureId !== undefined;
 
   maybeEmitComponentTreeSnapshot('capture-stop', treeBounds);
+
+  // Requests still on the wire, reported to the capture that is ending before
+  // anything detaches or resets: see step 2 of this function's documentation.
+  // `reportInFlightRequests` never throws.
+  reportInFlightRequests();
 
   try {
     flush();

@@ -3,6 +3,12 @@
  * directory `packages/protocol/tsconfig.json` names for this package's suites
  * (AAP 0.8.3).
  *
+ * Provenance: this suite covers `../envelope.ts`, the primitives it is built
+ * from in `../version.ts`, the registry vocabulary of `../messages/index.ts`,
+ * the HTTP-only operation names of `../http.ts` and the package barrel
+ * `../index.ts`. It constructs no transport client: the WebSocket and HTTP
+ * clients have their own suites.
+ *
  * What is on trial here is the **frame**: the shape AAP 0.2.3 fixes
  * (`{ id, type, sessionId?, ts, payload }`), the completeness of the one
  * discriminated union built over it, and the four properties a boundary between
@@ -16,7 +22,9 @@
  *   port, so a payload that only works in memory — a `Date`, a `Map`, a class
  *   instance, a `NaN` — is a defect that shows up on one transport and not the
  *   others. The round-trip case builds a real frame for each of the twenty-five
- *   types and proves the bytes come back unchanged.
+ *   types and proves the decoded value is deep-equal to the frame that was
+ *   sent — no key dropped, added or retyped. Byte equality is not the claim:
+ *   a validated frame comes back in the schema's key order.
  * - **The union covers the vocabulary exactly.** `../messages/index.ts` proves
  *   at compile time that its registry and its tuple agree; this suite proves at
  *   run time that the union has one member per name, no duplicate and no extra,
@@ -36,26 +44,63 @@
  *   telemetry attributes, a database statement, a URL or a bearer credential.
  *   The service logs every parse failure, both user interfaces show it and a
  *   session may persist it, and none of those paths passes through the redaction
- *   layer. The leak case plants a sentinel in a rejected payload and asserts it
- *   appears in no part of the resulting error — message, hint, details or the
- *   payload that crosses the wire.
+ *   layer. The leak cases plant a sentinel — in a rejected payload, in an
+ *   unknown `type`, in a `client.hello` credential, in text that is not JSON —
+ *   and assert it appears in no part of the resulting error: message, hint,
+ *   details, stack, serialised form or the payload that crosses the wire.
+ * - **The primitives underneath are what the envelope claims they are.**
+ *   `../version.ts` supplies the wire version and its handshake predicate, the
+ *   epoch-millisecond timestamp every frame carries, the leak-free issue
+ *   renderer every rejection is built by, and `opaqueSchema`, whose one job is
+ *   to refuse the `undefined` a bare `z.custom<T>()` accepts. Each is exercised
+ *   directly, because every guarantee above rests on it.
  * - **The barrel is the whole door.** `../index.ts` is the single `"."` entry of
  *   this package, so a symbol it forgets is invisible to all three apps and a
  *   symbol it adds carelessly is an upstream package's runtime inside three
- *   bundles. The last group is this package's own boundary check — the
- *   load-bearing exports are present, there is no default export, loading the
- *   barrel does nothing observable, and no upstream *function* has leaked
- *   through it — and it lives here, in the suite that already holds the union,
- *   because AAP 0.8.3 fixes this package at three suites.
+ *   bundles. The last group is this package's own boundary check — every value
+ *   the package's own modules export reaches the barrel unchanged, the only
+ *   borrowed values are the named closed vocabularies, there is no default
+ *   export, and re-evaluating the barrel does nothing observable — and it lives
+ *   here, in the suite that already holds the union, because AAP 0.8.3 fixes
+ *   this package at three suites.
  */
 
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, expectTypeOf, it, vi } from 'vitest';
+import { z } from 'zod';
+import * as zodPackage from 'zod';
 
-import { DEBUGGEN_ERROR_CODES } from '@debuggen/shared';
-import { computeCaptureSummary } from '@debuggen/telemetry';
+// The owning packages as namespaces, next to the named imports from each: the
+// barrel group below decides whether a barrel value is borrowed by asking which
+// package publishes it, so a module this package adds behind its barrel can
+// never be mistaken for an upstream leak.
+import * as instrumentationPackage from '@debuggen/instrumentation';
+import {
+  CONFIDENCE_LEVELS,
+  DATA_QUERY_DEFAULT_LIMIT,
+  DATA_QUERY_DEFAULT_OFFSET,
+  DATA_QUERY_MAX_LIMIT,
+  DATA_QUERY_SORTS,
+  DATA_QUERY_SOURCES,
+} from '@debuggen/panel-schema';
+import type { PanelSpec } from '@debuggen/panel-schema';
+import * as panelSchemaPackage from '@debuggen/panel-schema';
+import { DEBUGGEN_ERROR_CODES, DebuggenError, ID_PREFIXES } from '@debuggen/shared';
+import * as sharedPackage from '@debuggen/shared';
+import {
+  MAX_EPOCH_MS,
+  METRIC_IDS,
+  MIN_EPOCH_MS,
+  TELEMETRY_KINDS,
+  TELEMETRY_TIERS,
+  computeCaptureSummary,
+} from '@debuggen/telemetry';
 import type { TelemetryEvent, TelemetryEventIngress } from '@debuggen/telemetry';
+import * as telemetryPackage from '@debuggen/telemetry';
 
 import type { AnalysisResult } from '../analysis.js';
+import * as analysisModule from '../analysis.js';
+import * as httpClientModule from '../client/http-client.js';
+import * as wsClientModule from '../client/ws-client.js';
 import {
   createEnvelope,
   decodeMessage,
@@ -75,19 +120,43 @@ import type {
   ProtocolMessageMap,
   ProtocolMessageSchema,
 } from '../envelope.js';
-import { HTTP_OPERATIONS } from '../http.js';
+import * as envelopeModule from '../envelope.js';
+import { HTTP_OPERATIONS, HTTP_ROUTES } from '../http.js';
+import * as httpModule from '../http.js';
 // The namespace import is the assertion: it is how a consumer of the published
 // `"."` entry sees this package, so the barrel group below can only observe
 // what an app can observe.
 import * as protocol from '../index.js';
 import {
   HTTP_ONLY_PAYLOAD_NAMES,
+  HTTP_ONLY_PAYLOAD_SCHEMAS,
   MESSAGE_PAYLOAD_SCHEMAS,
   MESSAGE_TYPES,
 } from '../messages/index.js';
-import type { MessageType } from '../messages/index.js';
+import type {
+  MessageType,
+  PanelGeneratedPayload,
+  SessionProgressPayload,
+} from '../messages/index.js';
+import * as messagesModule from '../messages/index.js';
 import type { SessionRecord } from '../session-record.js';
-import { PROTOCOL_VERSION } from '../version.js';
+import * as sessionRecordModule from '../session-record.js';
+import {
+  PROTOCOL_VERSION,
+  PROTOCOL_VERSION_MAJOR,
+  PROTOCOL_VERSION_PATTERN,
+  describeZodIssues,
+  epochMsSchema,
+  isCompatibleProtocolVersion,
+  isPlainRecord,
+  opaqueArraySchema,
+  opaqueSchema,
+  parseProtocolVersion,
+  protocolParseError,
+  protocolVersionSchema,
+  recordWithKeys,
+} from '../version.js';
+import * as versionModule from '../version.js';
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -106,8 +175,8 @@ const SESSION_ID = 'ses_4k2p9dq7m1zx0c3v';
 /** The capture the telemetry fixtures were recorded during. */
 const CAPTURE_ID = 'cap_7f3q0m2zk1x8ab9c';
 
-/** The generated panel the panel fixture carries. */
-const PANEL_ID = 'pan_6h2j8k4l0z5x1c7v';
+/** The generated panel the panel fixture carries, in the `pnl_` id grammar. */
+const PANEL_ID = 'pnl_6h2j8k4l0z5x1c7v';
 
 /** The analysis the `analysis.completed` fixture carries. */
 const ANALYSIS_ID = 'ana_3g7j1k5m9p2r6t0v';
@@ -477,8 +546,8 @@ const AAP_WEBSOCKET_MESSAGE_NAMES = [
   'client.hello',
   'session.bind',
   'session.bound',
-  'session.unbind',
   'tab.navigated',
+  'session.unbind',
   'session.created',
   'session.updated',
   'session.progress',
@@ -517,6 +586,30 @@ const AAP_HTTP_ONLY_NAMES = [
   'capture.stop',
 ] as const;
 
+/**
+ * The method and path AAP 0.4.2 gives each of those five operations, written
+ * out for the same reason as the list above: the route table is the value
+ * under test, so the expectation cannot be read from it.
+ */
+const AAP_HTTP_ONLY_ROUTES: {
+  readonly [K in (typeof AAP_HTTP_ONLY_NAMES)[number]]: {
+    readonly method: 'POST';
+    readonly pattern: string;
+  };
+} = {
+  'session.create': { method: 'POST', pattern: '/sessions' },
+  'session.question': { method: 'POST', pattern: '/sessions/:id/question' },
+  'session.end': { method: 'POST', pattern: '/sessions/:id/end' },
+  'capture.start': { method: 'POST', pattern: '/sessions/:id/capture/start' },
+  'capture.stop': { method: 'POST', pattern: '/sessions/:id/capture/stop' },
+};
+
+/**
+ * The shape `newMessageId()` from `@debuggen/shared` mints: the message prefix,
+ * one underscore and sixteen characters of `[0-9a-z]`.
+ */
+const MINTED_MESSAGE_ID_PATTERN = new RegExp(`^${ID_PREFIXES.message}_[0-9a-z]{16}$`);
+
 /** A valid frame as a plain record, for the strictness cases to mutate. */
 function baseFrame(): Record<string, unknown> {
   return {
@@ -525,6 +618,76 @@ function baseFrame(): Record<string, unknown> {
     ts: SENT_AT,
     payload: { tabId: TAB_ID },
   };
+}
+
+/**
+ * Every place a rejection's content can surface once it leaves this package:
+ * the message and hint a user interface shows, the structured details a log
+ * line carries, the payload an `error` frame sends, the error's own serialised
+ * and string forms, and its stack.
+ *
+ * @param error The rejection to inspect.
+ * @returns Each surface as text, so a planted value can be searched for.
+ */
+function errorSurfaces(error: DebuggenError): readonly string[] {
+  return [
+    error.message,
+    error.hint ?? '',
+    JSON.stringify(error.details ?? {}),
+    JSON.stringify(error.toPayload()),
+    JSON.stringify(error),
+    String(error),
+    error.stack ?? '',
+  ];
+}
+
+/**
+ * Asserts that a planted value reached no surface of a rejection and that no
+ * underlying error rides along as a `cause` (a `SyntaxError` or a `ZodError`
+ * would carry the rejected input with it).
+ *
+ * @param error The rejection to inspect.
+ * @param planted The value that must not be echoed.
+ */
+function expectNoEcho(error: DebuggenError, planted: string): void {
+  for (const surface of errorSurfaces(error)) {
+    expect(surface).not.toContain(planted);
+  }
+  expect(error.cause).toBeUndefined();
+}
+
+/**
+ * Freezes a value and everything reachable from it, so a function handed it
+ * throws on any write instead of mutating it quietly.
+ *
+ * @param value The value to freeze in place.
+ * @returns The same value, frozen.
+ */
+function deepFreeze<T>(value: T): T {
+  if (typeof value === 'object' && value !== null) {
+    const container: object = value;
+    const children: unknown[] = Object.values(container);
+    for (const child of children) {
+      deepFreeze(child);
+    }
+    Object.freeze(container);
+  }
+  return value;
+}
+
+/**
+ * The issues a schema reports for a value it must reject.
+ *
+ * @param schema The schema under test.
+ * @param value A value that schema refuses.
+ * @returns The Zod issues, or an empty list after a failed expectation if the
+ * value was unexpectedly accepted.
+ */
+function issuesOf(schema: z.ZodType, value: unknown): z.core.$ZodIssue[] {
+  const result = schema.safeParse(value);
+
+  expect(result.success).toBe(false);
+  return result.success ? [] : result.error.issues;
 }
 
 describe('protocolMessageSchema — one member per declared message type', () => {
@@ -545,6 +708,9 @@ describe('protocolMessageSchema — one member per declared message type', () =>
   });
 
   it('names exactly the WebSocket messages AAP 0.4.2 specifies', () => {
+    // The literal list is checked first, so a typo in the expectation cannot
+    // pass by being mirrored in the tuple.
+    expect(new Set(AAP_WEBSOCKET_MESSAGE_NAMES).size).toBe(25);
     expect([...MESSAGE_TYPES].sort()).toEqual([...AAP_WEBSOCKET_MESSAGE_NAMES].sort());
     expect(Object.keys(MESSAGE_PAYLOAD_SCHEMAS).sort()).toEqual(
       [...AAP_WEBSOCKET_MESSAGE_NAMES].sort(),
@@ -552,14 +718,35 @@ describe('protocolMessageSchema — one member per declared message type', () =>
   });
 
   it('keeps the five HTTP operation names out of the union and in the route table', () => {
+    // Exactly these five, in both HTTP-only registries: a sixth name there —
+    // `telemetry.event`, say — would be a request body posing as a frame.
+    expect([...HTTP_ONLY_PAYLOAD_NAMES].sort()).toEqual([...AAP_HTTP_ONLY_NAMES].sort());
+    expect(Object.keys(HTTP_ONLY_PAYLOAD_SCHEMAS).sort()).toEqual([...AAP_HTTP_ONLY_NAMES].sort());
+
     for (const name of AAP_HTTP_ONLY_NAMES) {
       expect(MESSAGE_TYPES).not.toContain(name);
-      expect(HTTP_ONLY_PAYLOAD_NAMES).toContain(name);
       expect(HTTP_OPERATIONS).toContain(name);
+
+      const route = HTTP_ROUTES[name];
+      expect({ operation: route.operation, method: route.method, pattern: route.pattern }).toEqual({
+        operation: name,
+        ...AAP_HTTP_ONLY_ROUTES[name],
+      });
     }
   });
 
-  it('declares the four shared envelope fields once, in envelopeBaseShape', () => {
+  it.each([...AAP_HTTP_ONLY_NAMES])('refuses %s sent as a frame rather than a request', (name) => {
+    const parsed = parseMessage({ id: MESSAGE_ID, type: name, ts: SENT_AT, payload: {} });
+
+    expect(parsed.ok).toBe(false);
+    if (parsed.ok) {
+      return;
+    }
+    expect(parsed.error.code).toBe('PROTOCOL_INVALID_MESSAGE');
+    expect(parsed.error.message).toContain('type (invalid_union');
+  });
+
+  it('declares the three shared envelope fields once, in envelopeBaseShape', () => {
     expect(Object.keys(envelopeBaseShape)).toEqual(['id', 'sessionId', 'ts']);
     expect(Object.isFrozen(envelopeBaseShape)).toBe(true);
 
@@ -567,6 +754,13 @@ describe('protocolMessageSchema — one member per declared message type', () =>
       expect(Object.keys(option.shape).sort()).toEqual(
         ['id', 'payload', 'sessionId', 'ts', 'type'].sort(),
       );
+      // Written once and spread, not re-declared per member: every member's
+      // envelope fields are the base shape's own schema objects, and each
+      // member's payload is the registry's schema for its type.
+      expect(option.shape.id).toBe(envelopeBaseShape.id);
+      expect(option.shape.sessionId).toBe(envelopeBaseShape.sessionId);
+      expect(option.shape.ts).toBe(envelopeBaseShape.ts);
+      expect(option.shape.payload).toBe(MESSAGE_PAYLOAD_SCHEMAS[option.shape.type.value]);
     }
   });
 });
@@ -613,15 +807,33 @@ describe('round trip — every message survives encode, decode and re-encode', (
     if (!parsed.ok) {
       return;
     }
-    expect(parsed.value).toEqual(frame);
+    expect(parsed.value).toStrictEqual(frame);
+  });
+});
+
+describe('strictness — every member of the union, not just one', () => {
+  it.each([...MESSAGE_TYPES])('%s refuses a stray top-level key and a null sessionId', (type) => {
+    const valid: Record<string, unknown> = { ...VALID_FRAMES[type] };
+
+    const withStrayKey = parseMessage({ ...valid, extra: true });
+    const withNullSession = parseMessage({ ...valid, sessionId: null });
+
+    expect(parseMessage(valid).ok).toBe(true);
+    expect(withStrayKey.ok).toBe(false);
+    expect(withNullSession.ok).toBe(false);
+    if (withStrayKey.ok || withNullSession.ok) {
+      return;
+    }
+    expect(withStrayKey.error.message).toContain('<root> (unrecognized_keys keys=extra)');
+    expect(withNullSession.error.message).toContain('sessionId (invalid_type expected=string)');
   });
 });
 
 describe('parseMessage — rejections are typed, total and silent about the value', () => {
-  it('rejects an unknown message type', () => {
+  it('rejects an unknown message type without naming it', () => {
     const parsed = parseMessage({
       id: MESSAGE_ID,
-      type: 'does.not.exist',
+      type: SENTINEL,
       ts: SENT_AT,
       payload: {},
     });
@@ -630,28 +842,95 @@ describe('parseMessage — rejections are typed, total and silent about the valu
     if (parsed.ok) {
       return;
     }
+    expect(parsed.error).toBeInstanceOf(DebuggenError);
     expect(parsed.error.code).toBe('PROTOCOL_INVALID_MESSAGE');
-    expect(parsed.error.message).toContain('Invalid protocol message');
+    expect(parsed.error.message).toBe(
+      'Invalid protocol message: type (invalid_union branches=0 discriminator=type)',
+    );
+    expectNoEcho(parsed.error, SENTINEL);
   });
 
+  // Each case names the issue it must be rejected *for*: a frame refused for
+  // some other reason — a fixture that stopped being valid, say — would
+  // otherwise satisfy every row of this table at once.
   it.each([
-    ['a stray top-level key', { ...baseFrame(), extra: true }],
-    ['a missing id', { type: 'session.unbind', ts: SENT_AT, payload: { tabId: TAB_ID } }],
-    ['an empty id', { ...baseFrame(), id: '' }],
-    ['a missing ts', { id: MESSAGE_ID, type: 'session.unbind', payload: { tabId: TAB_ID } }],
-    ['a missing payload', { id: MESSAGE_ID, type: 'session.unbind', ts: SENT_AT }],
-    ['a missing type', { id: MESSAGE_ID, ts: SENT_AT, payload: { tabId: TAB_ID } }],
-    ['a null sessionId', { ...baseFrame(), sessionId: null }],
-    ['a payload of the wrong shape', { ...baseFrame(), payload: { tabId: -1 } }],
-    ['a payload with a stray key', { ...baseFrame(), payload: { tabId: TAB_ID, extra: 1 } }],
-    ['a seconds-precision ts', { ...baseFrame(), ts: Math.trunc(SENT_AT / 1000) }],
-    ['a relative performance ts', { ...baseFrame(), ts: 1234.5 }],
-    ['a microsecond-scale ts', { ...baseFrame(), ts: SENT_AT * 1000 }],
-    ['a NaN ts', { ...baseFrame(), ts: Number.NaN }],
-    ['a non-object frame', 'session.unbind'],
-    ['null', null],
-    ['an array', []],
-  ])('rejects %s', (_label, value) => {
+    [
+      'a stray top-level key',
+      { ...baseFrame(), extra: true },
+      '<root> (unrecognized_keys keys=extra)',
+    ],
+    [
+      'a missing id',
+      { type: 'session.unbind', ts: SENT_AT, payload: { tabId: TAB_ID } },
+      'id (invalid_type expected=string)',
+    ],
+    ['an empty id', { ...baseFrame(), id: '' }, 'id (too_small origin=string min=1)'],
+    [
+      'an over-long id',
+      { ...baseFrame(), id: 'x'.repeat(129) },
+      'id (too_big origin=string max=128)',
+    ],
+    [
+      'a missing ts',
+      { id: MESSAGE_ID, type: 'session.unbind', payload: { tabId: TAB_ID } },
+      'ts (invalid_type expected=number)',
+    ],
+    [
+      'a missing payload',
+      { id: MESSAGE_ID, type: 'session.unbind', ts: SENT_AT },
+      'payload (invalid_type expected=object)',
+    ],
+    [
+      'a missing type',
+      { id: MESSAGE_ID, ts: SENT_AT, payload: { tabId: TAB_ID } },
+      'type (invalid_union',
+    ],
+    [
+      'a null sessionId',
+      { ...baseFrame(), sessionId: null },
+      'sessionId (invalid_type expected=string)',
+    ],
+    [
+      'an empty sessionId',
+      { ...baseFrame(), sessionId: '' },
+      'sessionId (too_small origin=string min=1)',
+    ],
+    [
+      'a payload of the wrong shape',
+      { ...baseFrame(), payload: { tabId: -1 } },
+      'payload.tabId (too_small origin=number min=0)',
+    ],
+    [
+      'a payload with a stray key',
+      { ...baseFrame(), payload: { tabId: TAB_ID, extra: 1 } },
+      'payload (unrecognized_keys keys=extra)',
+    ],
+    [
+      'a seconds-precision ts',
+      { ...baseFrame(), ts: Math.trunc(SENT_AT / 1000) },
+      `ts (too_small origin=number min=${String(MIN_EPOCH_MS)})`,
+    ],
+    [
+      'a relative performance ts',
+      { ...baseFrame(), ts: 1234.5 },
+      `ts (too_small origin=number min=${String(MIN_EPOCH_MS)})`,
+    ],
+    [
+      'a microsecond-scale ts',
+      { ...baseFrame(), ts: SENT_AT * 1000 },
+      `ts (too_big origin=number max=${String(MAX_EPOCH_MS)})`,
+    ],
+    ['a NaN ts', { ...baseFrame(), ts: Number.NaN }, 'ts (invalid_type expected=number)'],
+    [
+      'an infinite ts',
+      { ...baseFrame(), ts: Number.POSITIVE_INFINITY },
+      'ts (invalid_type expected=number)',
+    ],
+    ['a string ts', { ...baseFrame(), ts: String(SENT_AT) }, 'ts (invalid_type expected=number)'],
+    ['a non-object frame', 'session.unbind', '<root> (invalid_type expected=object)'],
+    ['null', null, '<root> (invalid_type expected=object)'],
+    ['an array', [], '<root> (invalid_type expected=object)'],
+  ])('rejects %s', (_label, value, issue) => {
     const parsed = parseMessage(value);
 
     expect(parsed.ok).toBe(false);
@@ -659,6 +938,7 @@ describe('parseMessage — rejections are typed, total and silent about the valu
       return;
     }
     expect(parsed.error.code).toBe('PROTOCOL_INVALID_MESSAGE');
+    expect(parsed.error.message).toContain(`Invalid protocol message: ${issue}`);
   });
 
   it('accepts a frame with no sessionId key at all', () => {
@@ -668,7 +948,24 @@ describe('parseMessage — rejections are typed, total and silent about the valu
     if (!parsed.ok) {
       return;
     }
-    expect(parsed.value.sessionId).toBeUndefined();
+    expect('sessionId' in parsed.value).toBe(false);
+  });
+
+  it('keeps sub-millisecond precision, and accepts both telemetry bounds inclusively', () => {
+    // Every other fixture timestamp is a whole millisecond, so without this case
+    // an integer-only `ts` schema would pass the whole suite (AAP 0.2.3).
+    for (const ts of [SENT_AT + 0.375, MIN_EPOCH_MS, MAX_EPOCH_MS]) {
+      const parsed = parseMessage({ ...baseFrame(), ts });
+
+      expect(parsed.ok).toBe(true);
+      if (!parsed.ok) {
+        return;
+      }
+      expect(parsed.value.ts).toBe(ts);
+    }
+
+    expect(parseMessage({ ...baseFrame(), ts: MIN_EPOCH_MS - 1 }).ok).toBe(false);
+    expect(parseMessage({ ...baseFrame(), ts: MAX_EPOCH_MS + 1 }).ok).toBe(false);
   });
 
   it('never echoes a rejected value, in any part of the error (AAP 0.5.2)', () => {
@@ -690,27 +987,77 @@ describe('parseMessage — rejections are typed, total and silent about the valu
     }
 
     const { error } = parsed;
-    const surfaces = [
-      error.message,
-      error.hint ?? '',
-      JSON.stringify(error.details ?? {}),
-      JSON.stringify(error.toPayload()),
-    ];
 
-    for (const surface of surfaces) {
-      expect(surface).not.toContain(SENTINEL);
-    }
+    expectNoEcho(error, SENTINEL);
 
     // The code stays in the shared vocabulary, and the message still says which
     // field failed — a leak-free error is not a useless one.
     expect(DEBUGGEN_ERROR_CODES).toContain(error.code);
     expect(error.message).toContain('payload.events[0].kind');
   });
+
+  // `client.hello` is the one frame that carries a live bearer credential
+  // (AAP 0.5.6), so each way it can be refused is checked separately: the
+  // credential itself failing, and another field failing beside a valid one.
+  it.each([
+    [
+      'an over-long credential',
+      {
+        client: 'devtools',
+        tabId: TAB_ID,
+        version: PROTOCOL_VERSION,
+        token: CREDENTIAL_PLACEHOLDER.repeat(20),
+      },
+      'payload.token (too_big origin=string max=512)',
+    ],
+    [
+      'a malformed version beside a valid credential',
+      { client: 'devtools', tabId: TAB_ID, version: '1.0', token: CREDENTIAL_PLACEHOLDER },
+      'payload.version (invalid_format format=regex)',
+    ],
+    [
+      'an unknown client kind beside a valid credential',
+      { client: 'editor', tabId: TAB_ID, version: PROTOCOL_VERSION, token: CREDENTIAL_PLACEHOLDER },
+      'payload.client (invalid_value',
+    ],
+    [
+      'a stray key beside a valid credential',
+      { ...VALID_PAYLOADS['client.hello'], extra: CREDENTIAL_PLACEHOLDER },
+      'payload (unrecognized_keys keys=extra)',
+    ],
+  ])('never echoes the client.hello credential: %s', (_label, payload, issue) => {
+    const parsed = parseMessage({ id: MESSAGE_ID, type: 'client.hello', ts: SENT_AT, payload });
+
+    expect(parsed.ok).toBe(false);
+    if (parsed.ok) {
+      return;
+    }
+    expect(parsed.error.code).toBe('PROTOCOL_INVALID_MESSAGE');
+    expect(parsed.error.message).toContain(issue);
+    expectNoEcho(parsed.error, CREDENTIAL_PLACEHOLDER);
+  });
+
+  it('names a stray key but never its value, and redacts a key that is not a field name', () => {
+    const strayValue = parseMessage({ ...baseFrame(), extra: SENTINEL });
+    const strayName = parseMessage({ ...baseFrame(), [`Bearer ${CREDENTIAL_PLACEHOLDER}`]: 1 });
+
+    expect(strayValue.ok).toBe(false);
+    expect(strayName.ok).toBe(false);
+    if (strayValue.ok || strayName.ok) {
+      return;
+    }
+    expect(strayValue.error.message).toContain('<root> (unrecognized_keys keys=extra)');
+    expectNoEcho(strayValue.error, SENTINEL);
+    expect(strayName.error.message).toContain('<root> (unrecognized_keys keys=<name>…)');
+    expectNoEcho(strayName.error, CREDENTIAL_PLACEHOLDER);
+  });
 });
 
 describe('decodeMessage — text that is not JSON', () => {
   it('rejects malformed JSON without quoting it', () => {
-    const malformed = `{"id":"${MESSAGE_ID}","type":"session.unbind","ts":${String(SENT_AT)},`;
+    // V8's SyntaxError quotes the text around the fault, which here is the
+    // sentinel, so the constant message is what keeps it out.
+    const malformed = `{"id":"${MESSAGE_ID}","type":"session.unbind","ts":${SENTINEL},`;
 
     const parsed = decodeMessage(malformed);
 
@@ -720,12 +1067,24 @@ describe('decodeMessage — text that is not JSON', () => {
     }
     expect(parsed.error.code).toBe('PROTOCOL_INVALID_MESSAGE');
     expect(parsed.error.message).toBe('Invalid protocol message: the frame is not valid JSON');
-    expect(parsed.error.message).not.toContain(MESSAGE_ID);
-    expect(JSON.stringify(parsed.error.toPayload())).not.toContain(MESSAGE_ID);
+    expectNoEcho(parsed.error, SENTINEL);
+    expectNoEcho(parsed.error, MESSAGE_ID);
   });
 
   it('rejects valid JSON that is not a frame', () => {
     const parsed = decodeMessage('{"hello":"world"}');
+
+    expect(parsed.ok).toBe(false);
+    if (parsed.ok) {
+      return;
+    }
+    expect(parsed.error.code).toBe('PROTOCOL_INVALID_MESSAGE');
+    expect(parsed.error.message).toContain('type (invalid_union');
+  });
+
+  it('rejects a binary frame rather than decoding it', () => {
+    // `{}` as bytes: a text transport is the only one this protocol defines.
+    const parsed = decodeMessage(new Uint8Array([0x7b, 0x7d]));
 
     expect(parsed.ok).toBe(false);
     if (parsed.ok) {
@@ -746,6 +1105,8 @@ describe('decodeMessage — text that is not JSON', () => {
       return;
     }
     expect(parsed.error.code).toBe('PROTOCOL_INVALID_MESSAGE');
+    expect(parsed.error.message).toContain('<root> (unrecognized_keys keys=__proto__)');
+    expect(Object.prototype).not.toHaveProperty('polluted');
     expect({}).not.toHaveProperty('polluted');
   });
 });
@@ -774,15 +1135,27 @@ describe('createEnvelope — deterministic, non-mutating, routable', () => {
     expect(first.ts).toBe(SENT_AT);
   });
 
-  it('mints an id and a timestamp when none is injected', () => {
-    const before = Date.now();
-    const frame = createEnvelope('session.unbind', { tabId: TAB_ID });
-    const after = Date.now();
+  it('mints a fresh id and stamps the current time when none is injected', () => {
+    // Only `Date` is faked, and to a fixed instant, so the stamped time is an
+    // exact value rather than a window around the wall clock.
+    const now = SENT_AT + 42;
+    vi.useFakeTimers({ now, toFake: ['Date'] });
 
-    expect(frame.id).not.toBe('');
-    expect(frame.ts).toBeGreaterThanOrEqual(before);
-    expect(frame.ts).toBeLessThanOrEqual(after);
-    expect(parseMessage(frame).ok).toBe(true);
+    try {
+      const first = createEnvelope('session.unbind', { tabId: TAB_ID });
+      const second = createEnvelope('session.unbind', { tabId: TAB_ID });
+
+      expect(first.ts).toBe(now);
+      expect(second.ts).toBe(now);
+      expect(first.id).toMatch(MINTED_MESSAGE_ID_PATTERN);
+      expect(second.id).toMatch(MINTED_MESSAGE_ID_PATTERN);
+      // One id per frame: a receiver correlates replies and drops duplicates by
+      // it, so a reused id would silently discard a real frame.
+      expect(second.id).not.toBe(first.id);
+      expect(parseMessage(first).ok).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('lifts a sessionId off the payload so a call site cannot break routing', () => {
@@ -790,6 +1163,29 @@ describe('createEnvelope — deterministic, non-mutating, routable', () => {
 
     expect(frame.sessionId).toBe(SESSION_ID);
     expect(frame.payload.sessionId).toBe(SESSION_ID);
+  });
+
+  it('treats an explicitly undefined sessionId option as absent, and still lifts', () => {
+    const frame = createEnvelope('session.progress', VALID_PAYLOADS['session.progress'], {
+      sessionId: undefined,
+      id: MESSAGE_ID,
+      ts: SENT_AT,
+    });
+
+    expect(frame.sessionId).toBe(SESSION_ID);
+  });
+
+  it('routes a payload with no sessionId of its own by the supplied option alone', () => {
+    const payload = VALID_PAYLOADS['tab.navigated'];
+
+    const frame = createEnvelope('tab.navigated', payload, {
+      sessionId: SESSION_ID,
+      id: MESSAGE_ID,
+      ts: SENT_AT,
+    });
+
+    expect(frame.sessionId).toBe(SESSION_ID);
+    expect(frame.payload).toStrictEqual({ tabId: TAB_ID, url: PAGE_URL });
   });
 
   it('prefers an explicitly supplied sessionId over the payload’s', () => {
@@ -814,13 +1210,17 @@ describe('createEnvelope — deterministic, non-mutating, routable', () => {
   });
 
   it('does not mutate or copy the payload it was given', () => {
-    const payload = VALID_PAYLOADS['telemetry.event'];
-    const snapshot: unknown = JSON.parse(JSON.stringify(payload));
+    // Deep-frozen, so a write anywhere inside the payload — or to the options —
+    // throws in this strict-mode module instead of passing unnoticed.
+    const payload = deepFreeze(structuredClone(VALID_PAYLOADS['session.progress']));
+    const options = deepFreeze({ id: MESSAGE_ID, ts: SENT_AT });
+    const snapshot = structuredClone(payload);
 
-    const frame = createEnvelope('telemetry.event', payload, { id: MESSAGE_ID, ts: SENT_AT });
+    const frame = createEnvelope('session.progress', payload, options);
 
     expect(frame.payload).toBe(payload);
-    expect(JSON.parse(JSON.stringify(payload))).toEqual(snapshot);
+    expect(payload).toStrictEqual(snapshot);
+    expect(options).toStrictEqual({ id: MESSAGE_ID, ts: SENT_AT });
   });
 
   it('serialises the envelope fields in the documented order', () => {
@@ -831,6 +1231,7 @@ describe('createEnvelope — deterministic, non-mutating, routable', () => {
       'ts',
       'payload',
     ]);
+    expect(Object.keys(frameFor('client.hello'))).toEqual(['id', 'type', 'ts', 'payload']);
   });
 });
 
@@ -846,70 +1247,58 @@ describe('isMessageOfType and assertExhaustiveMessage — narrowing and exhausti
       return;
     }
 
-    // Reading these fields without a cast is the assertion: they exist only on
-    // the `session.progress` payload, so this line fails `tsc -b` if the guard
-    // stops narrowing.
-    const stage: string = frame.payload.stage;
-    const status: string = frame.payload.status;
-    expect([stage, status]).toEqual(['investigate', 'done']);
+    // Exact type equality, checked by `tsc -b` over this file: the narrowed
+    // frame is that one member of the union, and its payload is the session
+    // module's own payload type — neither `any` nor the union of all payloads.
+    expectTypeOf(frame).toEqualTypeOf<MessageByType<'session.progress'>>();
+    expectTypeOf(frame.payload).toEqualTypeOf<SessionProgressPayload>();
+    expect([frame.payload.stage, frame.payload.status]).toEqual(['investigate', 'done']);
   });
 
-  it('throws for a message type a switch did not handle', () => {
-    const rogue = { ...baseFrame(), type: 'not.a.message' } as unknown as never;
+  it('throws for a message type a switch did not handle, without echoing the frame', () => {
+    const rogue = {
+      ...baseFrame(),
+      type: SENTINEL,
+      payload: { note: SENTINEL },
+    } as unknown as never;
 
-    expect(() => assertExhaustiveMessage(rogue)).toThrow(/Unhandled protocol message type/);
+    let thrown: unknown;
+    try {
+      assertExhaustiveMessage(rogue);
+    } catch (error: unknown) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(DebuggenError);
+    if (!(thrown instanceof DebuggenError)) {
+      return;
+    }
+    expect(thrown.code).toBe('INTERNAL');
+    expect(thrown.message).toMatch(/^Unhandled protocol message type: /);
+    expectNoEcho(thrown, SENTINEL);
   });
 });
 
 describe('type-level guarantees', () => {
-  /** Accepts `true` and nothing else, so a comparison becomes an assertion. */
-  type AssertTrue<T extends true> = T;
-
-  /**
-   * The payload of `panel.generated` carries the fields AAP 0.4.2 specifies,
-   * resolved through the registry rather than restated.
-   */
-  type PanelPayloadIsResolved = AssertTrue<
-    MessageByType<'panel.generated'>['payload'] extends {
-      sessionId: string;
-      panelId: string;
-      panel: { id: string; layout: readonly unknown[] };
-    }
-      ? true
-      : false
-  >;
-
-  /** A frame's `type` is the literal it was built for, not the whole union. */
-  type PanelTypeIsLiteral = AssertTrue<
-    MessageByType<'panel.generated'>['type'] extends 'panel.generated' ? true : false
-  >;
-
-  /** The map form and the union form describe the same frames. */
-  type MapAgreesWithUnion = AssertTrue<
-    ProtocolMessageMap['source.open'] extends MessageByType<'source.open'>
-      ? MessageByType<'source.open'> extends ProtocolMessageMap['source.open']
-        ? true
-        : false
-      : false
-  >;
-
-  /** `MessageTypeOf` recovers the literal discriminant of a single frame type. */
-  type TypeOfRecoversLiteral = AssertTrue<
-    MessageTypeOf<MessageByType<'cleanup.completed'>> extends 'cleanup.completed' ? true : false
-  >;
-
+  // `expectTypeOf(…).toEqualTypeOf<…>()` is exact equality and is enforced by
+  // `tsc -b` over this file (`pnpm --filter @debuggen/protocol typecheck`). An
+  // `extends` check is not enough here: `never` and `any` satisfy it, so a
+  // registry that resolved a payload to either would pass one.
   it('resolves a payload type from the registry and keeps the discriminant literal', () => {
-    const payloadResolved: PanelPayloadIsResolved = true;
-    const typeIsLiteral: PanelTypeIsLiteral = true;
-    const mapAgrees: MapAgreesWithUnion = true;
-    const typeOfWorks: TypeOfRecoversLiteral = true;
-
-    expect([payloadResolved, typeIsLiteral, mapAgrees, typeOfWorks]).toEqual([
-      true,
-      true,
-      true,
-      true,
-    ]);
+    expectTypeOf<MessagePayload<'panel.generated'>>().not.toBeAny();
+    expectTypeOf<MessagePayload<'panel.generated'>>().toEqualTypeOf<PanelGeneratedPayload>();
+    // One direction by design: the parsed panel is the schema's output, which
+    // satisfies the owner's `readonly` `PanelSpec` interface without being
+    // identical to it (see `PanelSpecTypePreserved` in `../messages/panel.ts`).
+    expectTypeOf<MessagePayload<'panel.generated'>['panel']>().not.toBeAny();
+    expectTypeOf<MessagePayload<'panel.generated'>['panel']>().not.toBeUnknown();
+    expectTypeOf<MessagePayload<'panel.generated'>['panel']>().toExtend<PanelSpec>();
+    expectTypeOf<MessageByType<'panel.generated'>['type']>().toEqualTypeOf<'panel.generated'>();
+    expectTypeOf<ProtocolMessageMap['source.open']>().toEqualTypeOf<MessageByType<'source.open'>>();
+    expectTypeOf<
+      MessageTypeOf<MessageByType<'cleanup.completed'>>
+    >().toEqualTypeOf<'cleanup.completed'>();
+    expectTypeOf<ProtocolMessage['type']>().toEqualTypeOf<MessageType>();
 
     const frame = frameFor('panel.generated');
     expect(frame.payload.panel.id).toBe(PANEL_ID);
@@ -930,13 +1319,468 @@ describe('type-level guarantees', () => {
 });
 
 // ---------------------------------------------------------------------------
+// The primitives underneath — `../version.ts`
+//
+// Every frame's `ts`, every rejection's text and every embedded upstream shape
+// passes through this module, so each export is exercised directly here rather
+// than only through the envelope.
+// ---------------------------------------------------------------------------
+
+/** An upstream-owned shape with no Zod schema, as `opaqueSchema` embeds one. */
+interface SampleShape {
+  readonly captureId: string;
+}
+
+describe('version.ts — the wire version and the handshake predicate', () => {
+  it('states a pattern-valid version whose major PROTOCOL_VERSION_MAJOR repeats', () => {
+    const [major] = PROTOCOL_VERSION.split('.');
+
+    expect(PROTOCOL_VERSION_PATTERN.test(PROTOCOL_VERSION)).toBe(true);
+    expect(PROTOCOL_VERSION_MAJOR).toBe(Number.parseInt(major ?? '', 10));
+
+    const parsed = parseProtocolVersion(PROTOCOL_VERSION);
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+    expect(parsed.value).toBe(PROTOCOL_VERSION);
+  });
+
+  it.each(['0.0.0', '1.0.0', '10.20.30'])('accepts %s', (version) => {
+    expect(PROTOCOL_VERSION_PATTERN.test(version)).toBe(true);
+    expect(protocolVersionSchema.safeParse(version).success).toBe(true);
+  });
+
+  it.each([
+    '1.0',
+    '1.0.0.0',
+    '01.0.0',
+    '1.00.0',
+    '1.0.01',
+    '1.0.0-beta.1',
+    '1.0.0+build',
+    'v1.0.0',
+    ' 1.0.0',
+    '1.0.0 ',
+    '1..0',
+    '',
+  ])('refuses %j', (version) => {
+    expect(PROTOCOL_VERSION_PATTERN.test(version)).toBe(false);
+    expect(protocolVersionSchema.safeParse(version).success).toBe(false);
+  });
+
+  it('matches statelessly, so a shared pattern answers the same on every call', () => {
+    expect(PROTOCOL_VERSION_PATTERN.global).toBe(false);
+    expect(PROTOCOL_VERSION_PATTERN.sticky).toBe(false);
+    expect([1, 2, 3].map(() => PROTOCOL_VERSION_PATTERN.test(PROTOCOL_VERSION))).toEqual([
+      true,
+      true,
+      true,
+    ]);
+  });
+
+  it('bounds a version at 32 characters before matching it', () => {
+    const longest = `1.0.${'1'.repeat(28)}`;
+    const tooLong = `1.0.${'1'.repeat(29)}`;
+
+    expect(longest).toHaveLength(32);
+    expect(protocolVersionSchema.safeParse(longest).success).toBe(true);
+    expect(PROTOCOL_VERSION_PATTERN.test(tooLong)).toBe(true);
+    expect(describeZodIssues(issuesOf(protocolVersionSchema, tooLong))).toBe(
+      '<root> (too_big origin=string max=32)',
+    );
+  });
+
+  it('rejects a claimed version without echoing it', () => {
+    const parsed = parseProtocolVersion(`9.9.9-${SENTINEL}`);
+    const notAString = parseProtocolVersion(42);
+
+    expect(parsed.ok).toBe(false);
+    expect(notAString.ok).toBe(false);
+    if (parsed.ok || notAString.ok) {
+      return;
+    }
+    expect(parsed.error.code).toBe('PROTOCOL_INVALID_MESSAGE');
+    expect(parsed.error.message).toBe(
+      'Invalid protocol version: <root> (invalid_format format=regex)',
+    );
+    expectNoEcho(parsed.error, SENTINEL);
+    expect(notAString.error.message).toBe(
+      'Invalid protocol version: <root> (invalid_type expected=string)',
+    );
+  });
+
+  it.each([
+    ['the same version', PROTOCOL_VERSION, undefined, true],
+    [
+      'a later minor and patch of the same major',
+      `${String(PROTOCOL_VERSION_MAJOR)}.99.7`,
+      undefined,
+      true,
+    ],
+    ['the next major', `${String(PROTOCOL_VERSION_MAJOR + 1)}.0.0`, undefined, false],
+    ['a supplied current version of the same major', '2.3.4', '2.0.0', true],
+    ['a supplied current version of another major', '0.9.9', '1.0.0', false],
+    ['a string that is no version', 'nope', undefined, false],
+    ['an empty string', '', undefined, false],
+    ['a zero-padded major', `0${String(PROTOCOL_VERSION_MAJOR)}.0.0`, undefined, false],
+    [
+      'an over-long but well-formed version',
+      `${String(PROTOCOL_VERSION_MAJOR)}.0.${'1'.repeat(40)}`,
+      undefined,
+      false,
+    ],
+    [
+      'a major beyond safe-integer range',
+      '99999999999999999999.0.0',
+      '99999999999999999999.0.0',
+      false,
+    ],
+    ['a malformed current version', PROTOCOL_VERSION, 'garbage', false],
+  ])('answers %s with %s', (_label, claimed, current, expected) => {
+    expect(isCompatibleProtocolVersion(claimed, current)).toBe(expected);
+  });
+});
+
+describe('version.ts — the epoch-millisecond timestamp primitive', () => {
+  it('is the very schema the envelope stamps every frame with', () => {
+    expect(envelopeBaseShape.ts).toBe(epochMsSchema);
+  });
+
+  it('accepts both telemetry bounds inclusively and keeps a fraction exactly', () => {
+    for (const value of [MIN_EPOCH_MS, MAX_EPOCH_MS, SENT_AT + 0.375]) {
+      const parsed = epochMsSchema.safeParse(value);
+
+      expect(parsed.success).toBe(true);
+      expect(parsed.data).toBe(value);
+    }
+  });
+
+  it.each([
+    ['one millisecond before the lower bound', MIN_EPOCH_MS - 1, 'too_small'],
+    ['one millisecond after the upper bound', MAX_EPOCH_MS + 1, 'too_big'],
+    ['NaN', Number.NaN, 'invalid_type'],
+    ['positive infinity', Number.POSITIVE_INFINITY, 'invalid_type'],
+    ['negative infinity', Number.NEGATIVE_INFINITY, 'invalid_type'],
+    ['a numeric string', String(SENT_AT), 'invalid_type'],
+    ['undefined', undefined, 'invalid_type'],
+  ])('refuses %s', (_label, value, code) => {
+    const [issue] = issuesOf(epochMsSchema, value);
+
+    expect(issue?.code).toBe(code);
+  });
+});
+
+describe('version.ts — leak-free issue rendering', () => {
+  it('answers a constant for an empty issue list', () => {
+    expect(describeZodIssues([])).toBe('no issues reported');
+  });
+
+  it('renders field paths with indices, and the schema-declared bound', () => {
+    const schema = z.strictObject({
+      events: z.array(z.strictObject({ startTime: epochMsSchema })),
+    });
+
+    expect(
+      describeZodIssues(issuesOf(schema, { events: [{ startTime: SENT_AT }, { startTime: 5 }] })),
+    ).toBe(`events[1].startTime (too_small origin=number min=${String(MIN_EPOCH_MS)})`);
+  });
+
+  it('never renders an issue message or input, whatever they hold', () => {
+    const planted: z.core.$ZodIssue = {
+      code: 'invalid_type',
+      expected: 'string',
+      path: ['token'],
+      message: SENTINEL,
+      input: SENTINEL,
+    };
+
+    expect(describeZodIssues([planted])).toBe('token (invalid_type expected=string)');
+  });
+
+  it('renders a symbol path segment by kind and redacts a label that is not a name', () => {
+    const planted: z.core.$ZodIssue = {
+      code: 'custom',
+      path: [Symbol(SENTINEL)],
+      message: SENTINEL,
+      params: { label: `${SENTINEL} value` },
+    };
+
+    expect(describeZodIssues([planted])).toBe('[symbol] (custom label=<name>…)');
+  });
+
+  it('renders at most ten issues and counts the rest', () => {
+    const issues = issuesOf(
+      z.array(z.string()),
+      Array.from({ length: 12 }, (_, index) => index),
+    );
+    const rendered = Array.from(
+      { length: 10 },
+      (_, index) => `[${String(index)}] (invalid_type expected=string)`,
+    ).join('; ');
+
+    expect(issues).toHaveLength(12);
+    expect(describeZodIssues(issues)).toBe(`${rendered}; …and 2 more`);
+  });
+
+  it('renders at most eight path segments and marks the elision', () => {
+    const depth = 9;
+    const keys = Array.from({ length: depth }, (_, index) => `level${String(index)}`);
+    let schema: z.ZodType = z.string();
+    let value: unknown = 0;
+    for (const key of [...keys].reverse()) {
+      schema = z.strictObject({ [key]: schema });
+      value = { [key]: value };
+    }
+
+    expect(describeZodIssues(issuesOf(schema, value))).toBe(
+      `${keys.slice(0, 8).join('.')}… (invalid_type expected=string)`,
+    );
+  });
+
+  it('replaces a record key that is not a field name and shortens a long one', () => {
+    const schema = z.record(z.string(), z.number());
+    const longName = 'k'.repeat(50);
+    const overlongName = 'k'.repeat(65);
+
+    expect(describeZodIssues(issuesOf(schema, { [`Bearer ${CREDENTIAL_PLACEHOLDER}`]: 'x' }))).toBe(
+      '<name>… (invalid_type expected=number)',
+    );
+    expect(describeZodIssues(issuesOf(schema, { [longName]: 'x' }))).toBe(
+      `${'k'.repeat(40)}… (invalid_type expected=number)`,
+    );
+    expect(describeZodIssues(issuesOf(schema, { [overlongName]: 'x' }))).toBe(
+      '<name>… (invalid_type expected=number)',
+    );
+  });
+
+  it('builds a DebuggenError whose details repeat the rendering in structured form', () => {
+    const planted: z.core.$ZodIssue = {
+      code: 'invalid_type',
+      expected: 'string',
+      path: ['payload', 'token'],
+      message: SENTINEL,
+      input: SENTINEL,
+    };
+
+    const bare = protocolParseError('PROTOCOL_INVALID_MESSAGE', 'Invalid sample', [planted]);
+    const hinted = protocolParseError('STORE_ERROR', 'Invalid row', [planted], 'Constant hint.');
+
+    expect(bare).toBeInstanceOf(DebuggenError);
+    expect(bare.code).toBe('PROTOCOL_INVALID_MESSAGE');
+    expect(bare.message).toBe('Invalid sample: payload.token (invalid_type expected=string)');
+    expect(bare.details).toStrictEqual({
+      issueCount: 1,
+      issues: [{ path: 'payload.token', code: 'invalid_type' }],
+    });
+    expect('hint' in bare).toBe(false);
+    expect(bare.toPayload()).toStrictEqual({ code: bare.code, message: bare.message });
+    expectNoEcho(bare, SENTINEL);
+
+    expect(hinted.code).toBe('STORE_ERROR');
+    expect(hinted.toPayload()).toStrictEqual({
+      code: 'STORE_ERROR',
+      message: 'Invalid row: payload.token (invalid_type expected=string)',
+      hint: 'Constant hint.',
+    });
+  });
+
+  it('caps structured details at ten issues while counting all of them', () => {
+    const issues = issuesOf(
+      z.array(z.string()),
+      Array.from({ length: 12 }, (_, index) => index),
+    );
+
+    const error = protocolParseError('PROTOCOL_INVALID_MESSAGE', 'Invalid sample', issues);
+
+    expect(error.details).toMatchObject({ issueCount: 12 });
+    expect(error.details?.['issues']).toHaveLength(10);
+  });
+});
+
+describe('version.ts — embedding an upstream type that owns no schema', () => {
+  it('isPlainRecord admits objects and refuses null, arrays and primitives', () => {
+    const nullPrototype: unknown = Object.create(null);
+
+    expect(isPlainRecord({})).toBe(true);
+    expect(isPlainRecord(nullPrototype)).toBe(true);
+    for (const value of [null, undefined, [], 'text', 0, true]) {
+      expect(isPlainRecord(value)).toBe(false);
+    }
+  });
+
+  it('recordWithKeys requires every named key as an own property', () => {
+    const guard = recordWithKeys('captureId', 'available');
+    const inherited: unknown = Object.create({ captureId: CAPTURE_ID, available: true });
+
+    expect(guard({ captureId: CAPTURE_ID, available: true, extra: 1 })).toBe(true);
+    expect(guard({ captureId: CAPTURE_ID })).toBe(false);
+    expect(guard(inherited)).toBe(false);
+    expect(guard([])).toBe(false);
+    expect(guard(null)).toBe(false);
+    expect(guard(undefined)).toBe(false);
+  });
+
+  it('opaqueSchema refuses the undefined a bare z.custom accepts', () => {
+    // The control: in this Zod, `z.custom<T>()` with no check lets an absent
+    // value through as a valid `T`. That is the trap `opaqueSchema` closes.
+    expect(z.custom<SampleShape>().safeParse(undefined).success).toBe(true);
+
+    const schema = opaqueSchema<SampleShape>('SampleShape');
+
+    for (const value of [undefined, null, [], 'text', 0, true]) {
+      expect(schema.safeParse(value).success).toBe(false);
+    }
+    expectTypeOf<z.infer<typeof schema>>().toEqualTypeOf<SampleShape>();
+  });
+
+  it('opaqueSchema validates without rewriting, and names the shape on refusal', () => {
+    const schema = opaqueSchema<SampleShape>('SampleShape', recordWithKeys('captureId'));
+    const accepted: SampleShape = { captureId: CAPTURE_ID };
+
+    const parsed = schema.safeParse(accepted);
+    const [issue] = issuesOf(schema, { note: SENTINEL });
+
+    expect(parsed.success).toBe(true);
+    expect(parsed.data).toBe(accepted);
+    expect(issue?.code).toBe('custom');
+    expect(issue?.message).toBe('expected SampleShape');
+    expect(describeZodIssues(issuesOf(schema, { note: SENTINEL }))).toBe(
+      '<root> (custom label=SampleShape)',
+    );
+  });
+
+  it('refuses an absent embedded summary inside a real frame', () => {
+    // `capture.stopped` embeds `CaptureSummary` through `opaqueSchema`; this is
+    // the trap at the boundary where it would have mattered.
+    const missing = parseMessage({
+      id: MESSAGE_ID,
+      type: 'capture.stopped',
+      ts: SENT_AT,
+      payload: { sessionId: SESSION_ID, captureId: CAPTURE_ID },
+    });
+    const undefinedSummary = parseMessage({
+      id: MESSAGE_ID,
+      type: 'capture.stopped',
+      ts: SENT_AT,
+      payload: { sessionId: SESSION_ID, captureId: CAPTURE_ID, summary: undefined },
+    });
+
+    expect(missing.ok).toBe(false);
+    expect(undefinedSummary.ok).toBe(false);
+    if (missing.ok || undefinedSummary.ok) {
+      return;
+    }
+    expect(missing.error.message).toContain('payload.summary (custom label=CaptureSummary)');
+    expect(undefinedSummary.error.message).toContain(
+      'payload.summary (custom label=CaptureSummary)',
+    );
+  });
+
+  it('opaqueArraySchema reports the failing element by index', () => {
+    const schema = opaqueArraySchema<SampleShape>('SampleShape', recordWithKeys('captureId'));
+
+    expect(schema.safeParse([]).success).toBe(true);
+    expect(schema.safeParse([{ captureId: CAPTURE_ID }]).success).toBe(true);
+    expect(describeZodIssues(issuesOf(schema, [{ captureId: CAPTURE_ID }, {}]))).toBe(
+      '[1] (custom label=SampleShape)',
+    );
+    expect(describeZodIssues(issuesOf(schema, [undefined]))).toBe('[0] (custom label=SampleShape)');
+    expect(describeZodIssues(issuesOf(schema, {}))).toBe('<root> (invalid_type expected=array)');
+    expectTypeOf<z.infer<typeof schema>>().toEqualTypeOf<SampleShape[]>();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // The package barrel — `../index.ts`
 //
 // This package publishes exactly one export condition, `"."`, so the barrel is
 // not a convenience: it is the entire visible surface of the contract layer.
-// The four cases below are the properties an app depends on and that no
-// compiler checks on its behalf.
+// The cases below are the properties an app depends on and that no compiler
+// checks on its behalf.
 // ---------------------------------------------------------------------------
+
+/**
+ * The package's own modules, each as the namespace a direct import gives.
+ *
+ * The forwarding case below holds every value these export to reaching the
+ * barrel unchanged. A module added behind `../index.ts` joins this table so that
+ * its values are held to the same rule; whether a barrel value is borrowed from
+ * upstream is decided against {@link UPSTREAM_PACKAGES} instead, so that verdict
+ * never depends on this list being complete.
+ */
+const OWN_MODULES = {
+  'version.ts': versionModule,
+  'analysis.ts': analysisModule,
+  'session-record.ts': sessionRecordModule,
+  'messages/index.ts': messagesModule,
+  'envelope.ts': envelopeModule,
+  'http.ts': httpModule,
+  'client/ws-client.ts': wsClientModule,
+  'client/http-client.ts': httpClientModule,
+} as const;
+
+/**
+ * The only upstream **values** `../index.ts` may forward: closed, frozen
+ * vocabularies and paging bounds a user interface iterates or enforces, which
+ * the two extension apps can reach no other way (AAP 0.2.2).
+ */
+const SANCTIONED_UPSTREAM_VALUES = [
+  'CONFIDENCE_LEVELS',
+  'DATA_QUERY_DEFAULT_LIMIT',
+  'DATA_QUERY_DEFAULT_OFFSET',
+  'DATA_QUERY_MAX_LIMIT',
+  'DATA_QUERY_SORTS',
+  'DATA_QUERY_SOURCES',
+  'METRIC_IDS',
+  'MODIFICATION_STATUSES',
+  'TELEMETRY_KINDS',
+  'TELEMETRY_TIERS',
+] as const;
+
+/**
+ * Every package `../index.ts` is layered above, as the namespace its public
+ * entry gives — the four `@debuggen` owners of the embedded shapes, and `zod`.
+ *
+ * `@debuggen/instrumentation` is read through its root, which re-exports the
+ * `./schema` entry the protocol imports (one module, so one set of values), and
+ * adds the adapter, installer and patch layer whose leak would matter most.
+ */
+const UPSTREAM_PACKAGES: Readonly<Record<string, Readonly<Record<string, unknown>>>> = {
+  '@debuggen/shared': sharedPackage,
+  '@debuggen/telemetry': telemetryPackage,
+  '@debuggen/instrumentation': instrumentationPackage,
+  '@debuggen/panel-schema': panelSchemaPackage,
+  zod: zodPackage,
+};
+
+/**
+ * Whether the barrel forwards an upstream export as it is: an owner publishes
+ * the same name bound to the same value.
+ *
+ * Name *and* identity, because each alone misjudges a legitimate case. Identity
+ * alone would flag a protocol-owned name deliberately bound to an upstream
+ * object — `panelDataRequestSchema` *is* panel-schema's `dataQuerySchema`, by
+ * contract — and could not tell a borrowed primitive from an equal own
+ * constant. A name alone would flag an own export that merely shares a
+ * spelling with something upstream.
+ *
+ * @param name The barrel export's name.
+ * @param value The barrel export's value.
+ * @returns The owning package, or `undefined` when no upstream package
+ * publishes that name with that value.
+ */
+function upstreamOwnerOf(name: string, value: unknown): string | undefined {
+  for (const [owner, namespace] of Object.entries(UPSTREAM_PACKAGES)) {
+    if (Object.hasOwn(namespace, name) && namespace[name] === value) {
+      return owner;
+    }
+  }
+  return undefined;
+}
+
+/** The barrel's runtime exports, by name, as a consumer's import sees them. */
+const BARREL_EXPORTS: ReadonlyMap<string, unknown> = new Map(Object.entries(protocol));
 
 describe('the package barrel — the only door into @debuggen/protocol', () => {
   it('exposes every load-bearing symbol the three apps are documented to consume', () => {
@@ -972,16 +1816,95 @@ describe('the package barrel — the only door into @debuggen/protocol', () => {
       'DATA_QUERY_SOURCES',
     ] as const;
 
-    const missing = required.filter((name) => !(name in protocol));
+    // Present *and defined*: `name in` alone is satisfied by an export bound to
+    // `undefined`, which is a consumer that compiles and then crashes.
+    const missing = required.filter((name) => BARREL_EXPORTS.get(name) === undefined);
 
     expect(missing).toEqual([]);
-    // Spot-check that a re-export is the value itself and not a placeholder:
-    // the registry the envelope dispatches on must be the same object the
-    // direct import gives, or two layers would validate against two registries.
-    expect(protocol.MESSAGE_PAYLOAD_SCHEMAS).toBe(MESSAGE_PAYLOAD_SCHEMAS);
-    expect(protocol.MESSAGE_TYPES).toBe(MESSAGE_TYPES);
-    expect(protocol.PROTOCOL_VERSION).toBe(PROTOCOL_VERSION);
-    expect(protocol.protocolMessageSchema).toBe(protocolMessageSchema);
+    expect(typeof protocol.ReconnectingWsClient).toBe('function');
+    expect(typeof protocol.HttpClient).toBe('function');
+  });
+
+  it('forwards every value its own modules export, as that same value', () => {
+    // The registry the envelope dispatches on must be the object a direct
+    // import gives, or two layers would validate against two registries; and a
+    // value two modules both export would be silently dropped by `export *`.
+    const mismatched = Object.entries(OWN_MODULES).flatMap(([module, namespace]) =>
+      Object.entries(namespace)
+        .filter(([name, value]) => BARREL_EXPORTS.get(name) !== value)
+        .map(([name]) => `${module}: ${name}`),
+    );
+
+    expect(mismatched).toEqual([]);
+  });
+
+  it('borrows no upstream value beyond the sanctioned closed vocabularies', () => {
+    // `../index.ts` re-exports upstream *types* freely — they are erased — but
+    // a borrowed function, Zod schema, class or mutable object would hand an
+    // upstream package's runtime to three browser bundles through a package
+    // that is meant to be a contract. Each barrel value is traced to the package
+    // that publishes it, so the verdict holds for every module behind the
+    // barrel, including one added after this suite was written.
+    const borrowed = [...BARREL_EXPORTS]
+      .map(([name, value]) => ({ name, owner: upstreamOwnerOf(name, value) }))
+      .filter((entry) => entry.owner !== undefined)
+      .map((entry) => entry.name)
+      .sort();
+
+    expect(borrowed).toEqual([...SANCTIONED_UPSTREAM_VALUES].sort());
+
+    // The detector is not vacuous: each sanctioned vocabulary is traced to the
+    // package that owns it, and a known upstream function would be caught.
+    expect(upstreamOwnerOf('MODIFICATION_STATUSES', protocol.MODIFICATION_STATUSES)).toBe(
+      '@debuggen/instrumentation',
+    );
+    expect(upstreamOwnerOf('METRIC_IDS', protocol.METRIC_IDS)).toBe('@debuggen/telemetry');
+    expect(upstreamOwnerOf('DATA_QUERY_SOURCES', protocol.DATA_QUERY_SOURCES)).toBe(
+      '@debuggen/panel-schema',
+    );
+    expect(upstreamOwnerOf('normalizePlan', instrumentationPackage.normalizePlan)).toBe(
+      '@debuggen/instrumentation',
+    );
+
+    for (const name of SANCTIONED_UPSTREAM_VALUES) {
+      const value = BARREL_EXPORTS.get(name);
+
+      if (typeof value === 'number') {
+        expect(Number.isSafeInteger(value), name).toBe(true);
+        continue;
+      }
+      expect(Array.isArray(value), name).toBe(true);
+      expect(Object.isFrozen(value), name).toBe(true);
+      expect(Array.isArray(value) && value.every((entry) => typeof entry === 'string'), name).toBe(
+        true,
+      );
+    }
+
+    // Each is its owner's own value, not a copy that could drift from it.
+    expect(protocol.METRIC_IDS).toBe(METRIC_IDS);
+    expect(protocol.TELEMETRY_KINDS).toBe(TELEMETRY_KINDS);
+    expect(protocol.TELEMETRY_TIERS).toBe(TELEMETRY_TIERS);
+    expect(protocol.CONFIDENCE_LEVELS).toBe(CONFIDENCE_LEVELS);
+    expect(protocol.DATA_QUERY_SORTS).toBe(DATA_QUERY_SORTS);
+    expect(protocol.DATA_QUERY_SOURCES).toBe(DATA_QUERY_SOURCES);
+    expect(protocol.DATA_QUERY_DEFAULT_LIMIT).toBe(DATA_QUERY_DEFAULT_LIMIT);
+    expect(protocol.DATA_QUERY_DEFAULT_OFFSET).toBe(DATA_QUERY_DEFAULT_OFFSET);
+    expect(protocol.DATA_QUERY_MAX_LIMIT).toBe(DATA_QUERY_MAX_LIMIT);
+
+    // And the values AAP 0.4.2 states outright: the five modification states
+    // and the panel-data paging bounds (default 200, maximum 5 000, offset 0).
+    expect(protocol.MODIFICATION_STATUSES).toEqual([
+      'pending',
+      'applied',
+      'reverted',
+      'conflict',
+      'failed',
+    ]);
+    expect([
+      protocol.DATA_QUERY_DEFAULT_LIMIT,
+      protocol.DATA_QUERY_MAX_LIMIT,
+      protocol.DATA_QUERY_DEFAULT_OFFSET,
+    ]).toEqual([200, 5000, 0]);
   });
 
   it('has no default export, so every import is by name', () => {
@@ -1007,7 +1930,7 @@ describe('the package barrel — the only door into @debuggen/protocol', () => {
       'correlateEvents',
     ] as const;
 
-    const leaked = forbidden.filter((name) => name in protocol);
+    const leaked = forbidden.filter((name) => BARREL_EXPORTS.has(name));
 
     expect(leaked).toEqual([]);
   });
@@ -1026,16 +1949,22 @@ describe('the package barrel — the only door into @debuggen/protocol', () => {
     const spies = methods.map((method) =>
       vi.spyOn(console, method).mockImplementation(() => undefined),
     );
+    const globalsBefore = Object.getOwnPropertyNames(globalThis).sort();
 
     try {
       vi.resetModules();
 
       const reloaded = await import('../index.js');
 
-      // Re-evaluation succeeded — an import-time throw would have failed here —
-      // and produced the same contract.
+      // The reload really re-evaluated the package — a cached module would make
+      // every spy assertion below vacuous — and produced the same contract
+      // without throwing.
+      expect(reloaded.protocolMessageSchema).not.toBe(protocolMessageSchema);
+      expect(reloaded.MESSAGE_TYPES).toEqual(MESSAGE_TYPES);
       expect(reloaded.PROTOCOL_VERSION).toBe(PROTOCOL_VERSION);
       expect(spies.flatMap((spy) => spy.mock.calls)).toEqual([]);
+      // Nothing was installed on the global object.
+      expect(Object.getOwnPropertyNames(globalThis).sort()).toEqual(globalsBefore);
     } finally {
       for (const spy of spies) {
         spy.mockRestore();

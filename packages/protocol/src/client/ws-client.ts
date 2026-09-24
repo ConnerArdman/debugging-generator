@@ -49,6 +49,15 @@
  * same reason: a `ws:` URL whose authority carried a `user:password@` userinfo
  * component would put a secret on a value both user interfaces display.
  *
+ * Where the credential may go is decided before it is resolved. The hello frame
+ * carries the bearer credential and the project root to whichever host the
+ * configured URL names, so both the constructor and `resolveWsUrl` hold that URL
+ * to the loopback-only service-origin policy of `./http-client.ts`
+ * (`parseServiceOrigin`): a value naming any other host — or carrying userinfo,
+ * a path other than `/ws`, a query or a fragment — leaves the client with a
+ * `configurationError`, and `connect()` then opens no socket and never asks the
+ * credential provider for anything (CWE-200, CWE-918).
+ *
  * Note how that component is spelled, here and in every other module of this
  * repository that has to describe it: on its own, never joined to a scheme.
  * Spelling out a complete URI with a userinfo component inside it — even in a
@@ -72,18 +81,27 @@
  * What this file deliberately does not do is keep a suspended worker awake.
  * The `chrome.alarms` keepalive of AAP §0.5.5 belongs to
  * `apps/chrome-extension/src/background/ws-bridge.ts`, which is the only
- * consumer that has an alarms API; nothing here starts a repeating timer, and
- * the only timer it starts at all is the one-shot reconnect delay.
+ * consumer that has an alarms API; nothing here starts a repeating timer. The
+ * only timers it starts at all are one-shot and owned by the attempt they
+ * serve — the reconnect delay, and the deadline on an asynchronous credential
+ * read — and every path that ends an attempt clears both.
  *
- * ## Consumed through the barrel, and coupled to nothing
+ * ## Consumed through the barrel, and coupled to one thing
  *
  * `../index.ts` is this package's single entry (`tsup.config.ts`), so a symbol
  * it does not re-export does not exist for a consumer. Nothing inside `src/**`
  * imports this module — not `../envelope.ts`, not `../http.ts`, not any
  * `../messages/*.ts`, each of which states the same rule from its own end — and
- * this module imports neither its sibling `./http-client.ts` (the two SDKs are
- * siblings, not layers) nor anything outside the four `@debuggen` packages this
- * package is allowed to know about (`eslint.config.js`).
+ * this module imports nothing outside the four `@debuggen` packages this package
+ * is allowed to know about (`eslint.config.js`).
+ *
+ * The two SDKs are siblings, not layers, with a single one-way exception: this
+ * module imports `parseServiceOrigin` from `./http-client.ts`, and that module
+ * imports nothing from this one. The exception exists because both transports
+ * send the same credential to the same configured service, so there has to be
+ * exactly one host policy: two copies of the loopback check would drift, and
+ * the transport whose copy fell behind would be the one that leaked. Only the
+ * validator crosses the edge — no HTTP client type, state or behaviour does.
  *
  * The state a user interface renders reaches it as {@link ConnectionState}
  * through {@link ReconnectingWsClientOptions.onStateChange}, never as a socket:
@@ -107,6 +125,10 @@ import {
 } from '../messages/index.js';
 import type { ClientKind, MessageType } from '../messages/index.js';
 import { PROTOCOL_VERSION, protocolParseError } from '../version.js';
+
+// The one import from the sibling SDK, and the edge runs this way only: see
+// "Consumed through the barrel, and coupled to one thing" above.
+import { parseServiceOrigin } from './http-client.js';
 
 // ---------------------------------------------------------------------------
 // Section A — transport constants and the constant failure texts
@@ -180,6 +202,34 @@ const HELLO_WRITE_FAILED_REASON = 'the connection closed before the handshake wa
 
 /** The reason a client with an unusable identity reports as it closes. */
 const INVALID_HELLO_REASON = 'this client could not assemble a valid handshake';
+
+/**
+ * The reason reported, as the client stays `closed`, when `connect()` was called
+ * on a client whose configured URL was refused by the loopback-only
+ * service-origin policy.
+ *
+ * Constant, and never a function of the refused value: that value is exactly
+ * what might carry a pasted credential or name a host the credential must not
+ * reach, and this sentence is shown by both user interfaces. The rule that was
+ * broken travels separately, in {@link ReconnectingWsClient.configurationError}.
+ */
+const CONFIGURATION_REFUSED_REASON =
+  'the configured service URL is not a loopback address of the local service';
+
+/**
+ * The failure reported when a credential provider threw.
+ *
+ * Constant, and deliberately **not** the provider's own error: a credential
+ * store's exception may name a storage key or quote the very value it failed to
+ * read, and this error reaches `onProtocolError`, which a user interface renders
+ * (AAP §0.5.2). The thrown value is dropped rather than kept as a `cause` for the
+ * same reason.
+ */
+const CREDENTIAL_PROVIDER_FAILED_MESSAGE = 'The credential provider failed';
+
+/** Its hint: the remedy is the same one as for a missing credential. */
+const CREDENTIAL_PROVIDER_FAILED_HINT =
+  'Pair this client again or rotate the service token, then call connect().';
 
 /** The prefix of the one schema rejection this client can raise on its own. */
 const INVALID_HELLO_PREFIX = 'Invalid client.hello payload';
@@ -694,12 +744,25 @@ export type Unsubscribe = () => void;
  */
 export interface ReconnectingWsClientOptions {
   /**
-   * The socket URL, for example `ws://127.0.0.1:43117/ws`.
+   * Where the local service listens: either the base URL the HTTP client uses
+   * (`http://127.0.0.1:43117`) or the socket URL itself
+   * (`ws://127.0.0.1:43117/ws`).
    *
-   * Absolute and complete: build it with {@link resolveWsUrl} from the same base
-   * URL the HTTP client uses, so the path and the scheme mapping are decided in
-   * one place (AAP §0.3.4 puts the host and port in the environment, which is
-   * what lets a second service instance run on another port).
+   * Validated and canonicalised at construction by {@link resolveWsUrl}, so
+   * both spellings — and the output of `resolveWsUrl` itself — end up as the
+   * same `ws(s)://<loopback host[:port]>/ws` in
+   * {@link ReconnectingWsClient.url}, and the path and the scheme mapping are
+   * decided in one place (AAP §0.3.4 puts the host and port in the environment,
+   * which is what lets a second service instance run on another port).
+   *
+   * ⚠️ Loopback only. The first frame on this socket carries the bearer
+   * credential and the project root, so a value naming any host other than this
+   * machine's loopback interface — or carrying userinfo, a path other than
+   * `/ws`, a query or a fragment — is refused: the constructor does not throw,
+   * but it records {@link ReconnectingWsClient.configurationError}, leaves
+   * {@link ReconnectingWsClient.url} `undefined`, and
+   * {@link ReconnectingWsClient.connect} then opens no socket and never calls
+   * the credential provider.
    */
   readonly url: string;
 
@@ -789,8 +852,11 @@ export interface ReconnectingWsClientOptions {
    * Always a {@link DebuggenError} with a code from the closed vocabulary of
    * `@debuggen/shared`: `PROTOCOL_INVALID_MESSAGE` for a frame this client
    * refused, `TRANSPORT_DISCONNECTED` for a socket that could not be opened or
-   * written, `INTERNAL` for a handler that threw. None of them carries the
-   * rejected frame, a payload or a credential.
+   * written, `UNAUTHORIZED` for a credential provider that threw, `INTERNAL` for
+   * a handler that threw, and `CONFIG_INVALID` — the
+   * {@link ReconnectingWsClient.configurationError} itself — when `connect()`
+   * is called on a client whose configured URL was refused. None of them
+   * carries the rejected frame, a payload, the configured URL or a credential.
    */
   readonly onProtocolError?: ((error: DebuggenError) => void) | undefined;
 
@@ -824,28 +890,41 @@ export interface ReconnectingWsClientOptions {
 // ---------------------------------------------------------------------------
 
 /**
- * The scheme map {@link resolveWsUrl} applies, as a frozen record.
+ * The scheme prefix every canonical service origin begins with.
  *
- * A table rather than a chain of conditionals so the accepted set is readable in
- * one line, and `Record<string, string | undefined>` rather than a mapped type
- * over four literals because the key is `URL.protocol`, which is any string.
+ * `parseServiceOrigin` answers `http:` or `https:` and nothing else, so
+ * replacing this leading `http` with `ws` is the whole scheme map — `http:`
+ * becomes `ws:` and `https:` becomes `wss:` — without a second table of schemes
+ * that could disagree with the policy's own.
  */
-const WS_SCHEME_BY_BASE_SCHEME: Readonly<Record<string, string | undefined>> = Object.freeze({
-  'http:': 'ws:',
-  'https:': 'wss:',
-  'ws:': 'ws:',
-  'wss:': 'wss:',
-});
+const CANONICAL_ORIGIN_SCHEME_PREFIX = /^http/u;
+
+/** What {@link CANONICAL_ORIGIN_SCHEME_PREFIX} is replaced with. */
+const WEBSOCKET_SCHEME_PREFIX = 'ws';
 
 /**
- * Turns the service's base URL into the socket URL this client opens.
+ * Turns the service's base URL — or a socket URL — into the socket URL this
+ * client opens.
  *
- * `http:` becomes `ws:`, `https:` becomes `wss:`, an already-WebSocket scheme is
- * kept, and {@link WS_PATH} — the path `../http.ts` owns — is appended to the
- * authority. Any path, query or fragment in the base URL is dropped, exactly as
- * the HTTP client reduces its own base URL to an origin, so one configured value
- * (`debuggen.serviceUrl`, or `DEBUGGEN_HOST` and `DEBUGGEN_PORT`) can drive both
+ * Every check is delegated to `parseServiceOrigin`, the loopback-only
+ * service-origin policy both transports share (`./http-client.ts`,
+ * Section A.1), with {@link WS_PATH} as the one path it may carry besides the
+ * root. The canonical origin it answers is then mapped back to a socket URL:
+ * `http:` becomes `ws:`, `https:` becomes `wss:` (so an input already spelled
+ * `ws:` or `wss:` keeps its scheme), and {@link WS_PATH} — the path `../http.ts`
+ * owns — is appended to the authority. The mapping is therefore idempotent: a
+ * socket URL this function produced resolves to itself. One configured value
+ * (`debuggen.serviceUrl`, or `DEBUGGEN_HOST` and `DEBUGGEN_PORT`) drives both
  * transports without either re-deriving the other's rules.
+ *
+ * **Only this machine's loopback interface is accepted** — `localhost`,
+ * `127.0.0.0/8`, `[::1]` or an IPv4-mapped loopback address. The first frame
+ * on the resulting socket is `client.hello`, which carries the bearer
+ * credential and the project root, so a URL naming any other host would hand
+ * both to that host before the service's own authentication could say anything
+ * (CWE-200, CWE-918). A path other than the root or `/ws`, and any `?` query or
+ * `#` fragment, are refused rather than dropped, because a value carrying them
+ * is not the service's origin and silently rewriting it would hide the mistake.
  *
  * It exists so that the three consumers — `apps/local-service/src/server/`,
  * `apps/vscode-extension/src/service/client.ts` and
@@ -856,78 +935,43 @@ const WS_SCHEME_BY_BASE_SCHEME: Readonly<Record<string, string | undefined>> = O
  * **A failure is returned, not thrown.** A misconfigured service URL is a
  * developer-facing state the editor renders (AAP §0.5.5), not an exception an
  * extension activation has to guard, so every rejection is an `Err` carrying
- * `CONFIG_INVALID`. None of those messages quotes the URL: a base URL is
- * configuration, but it can carry embedded credentials, and AAP §0.5.2 keeps a
- * basic-auth URL out of logs and user interfaces. Credentials in the URL are
- * refused outright for the same reason — this service authenticates with a
+ * `CONFIG_INVALID` with a constant message, a constant hint and
+ * `details: { rule }` naming the rule that was broken. None of it quotes the
+ * URL, even in part: a refused value can carry a pasted credential, and
+ * AAP §0.5.2 keeps it out of logs and user interfaces. Credentials in the URL
+ * are refused outright for the same reason — this service authenticates with a
  * bearer credential in the hello frame, so there is nothing for them to do
  * except leak.
  *
- * @param baseUrl The service's base URL, for example `http://127.0.0.1:43117`.
- * @returns `ok(url)` with the socket URL, or `err(error)` with
+ * @param baseUrl The service's base URL, for example `http://127.0.0.1:43117`,
+ * or its socket URL, for example `ws://127.0.0.1:43117/ws`. Surrounding
+ * whitespace is ignored.
+ * @returns `ok(url)` with the canonical socket URL, or `err(error)` with
  * `CONFIG_INVALID`.
  *
  * @example
  * ```ts
  * const resolved = resolveWsUrl(config.serviceUrl);
  * if (!resolved.ok) {
- *   return view.showConfigurationError(resolved.error);
+ *   return view.showConfigurationError(resolved.error); // never quotes the value
  * }
- * const client = new ReconnectingWsClient({ url: resolved.value, … });
+ * statusBar.render(resolved.value); // "ws://127.0.0.1:43117/ws"
  * ```
  */
 export function resolveWsUrl(baseUrl: string): Result<string, DebuggenError> {
-  const trimmed = baseUrl.trim();
+  // Total, including for a value that is not a string at all — a service worker
+  // forwarding an unset `chrome.storage.local` key hands over `undefined` —
+  // because the shared policy refuses that as `unparseable` itself, so both
+  // transports report it alike and this constructor still never throws.
+  const origin = parseServiceOrigin(baseUrl, { allowedPath: WS_PATH });
 
-  if (trimmed.length === 0) {
-    return err(
-      new DebuggenError('CONFIG_INVALID', 'The service base URL is empty', {
-        hint: 'Set the service URL to the host and port the local service listens on, for example http://127.0.0.1:43117.',
-      }),
-    );
+  if (isErr(origin)) {
+    return origin;
   }
 
-  // `new URL` throws a `TypeError` whose message quotes the input, which is the
-  // one thing that must not be forwarded — hence `tryCatch` and a constant
-  // sentence rather than the caught error's own text.
-  const parsed = tryCatch(() => new URL(trimmed), 'CONFIG_INVALID');
-
-  if (isErr(parsed)) {
-    return err(
-      new DebuggenError('CONFIG_INVALID', 'The service base URL is not a valid absolute URL', {
-        hint: 'Write the URL with a scheme, host and port, for example http://127.0.0.1:43117.',
-      }),
-    );
-  }
-
-  const url = parsed.value;
-  const scheme = WS_SCHEME_BY_BASE_SCHEME[url.protocol];
-
-  if (scheme === undefined) {
-    return err(
-      new DebuggenError('CONFIG_INVALID', 'The service base URL has an unsupported scheme', {
-        hint: 'Use http, https, ws or wss; the local service listens over plain HTTP on a loopback address.',
-      }),
-    );
-  }
-
-  if (url.username.length > 0 || url.password.length > 0) {
-    return err(
-      new DebuggenError('CONFIG_INVALID', 'The service base URL carries embedded credentials', {
-        hint: 'Remove the user information from the URL: this client authenticates with a bearer credential in its first frame.',
-      }),
-    );
-  }
-
-  if (url.host.length === 0) {
-    return err(
-      new DebuggenError('CONFIG_INVALID', 'The service base URL names no host', {
-        hint: 'Include the host and port, for example http://127.0.0.1:43117.',
-      }),
-    );
-  }
-
-  return ok(`${scheme}//${url.host}${WS_PATH}`);
+  return ok(
+    `${origin.value.replace(CANONICAL_ORIGIN_SCHEME_PREFIX, WEBSOCKET_SCHEME_PREFIX)}${WS_PATH}`,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -981,18 +1025,44 @@ type OpeningState = Extract<ConnectionState, 'connecting' | 'reconnecting'>;
 /**
  * What resolving a credential produced.
  *
- * Three outcomes rather than `string | undefined`, because the two failures lead
+ * Four outcomes rather than `string | undefined`, because the two failures lead
  * to different words in the same user-interface state: a provider that answered
  * nothing is "not paired", and a provider that did not answer within
  * {@link CLIENT_HELLO_TIMEOUT_MS} is a slow credential store. Neither carries
  * what was resolved, or why the provider rejected — a rejection reason from a
  * credential store is exactly the kind of value AAP §0.5.2 keeps out of a
  * message.
+ *
+ * The fourth, `cancelled`, is not a failure at all: the attempt the credential
+ * was being read for ended first — `close()`, a replacement socket, a refusal,
+ * or the socket's own close event — so there is nothing to send and nothing to
+ * report, and the late answer of the provider is simply ignored.
  */
 type TokenOutcome =
   | { readonly kind: 'resolved'; readonly token: string | undefined }
   | { readonly kind: 'timeout' }
-  | { readonly kind: 'failed' };
+  | { readonly kind: 'failed' }
+  | { readonly kind: 'cancelled' };
+
+/**
+ * The deadline of the one asynchronous credential read in flight.
+ *
+ * Held on the instance rather than inside the method that awaits the read,
+ * because the paths that end an attempt — `close()`, a replacement socket, a
+ * refusal, the socket's close event — are elsewhere, and a timer they cannot
+ * reach is a timer that outlives the attempt it was started for (a pending
+ * {@link CLIENT_HELLO_TIMEOUT_MS} timer surviving `close()`, and a service
+ * worker kept busy by it).
+ */
+interface CredentialDeadline {
+  /** The timer that turns a stalled read into a `timeout` outcome. */
+  readonly handle: number;
+  /**
+   * Settles the read with an outcome — first call wins — clearing the timer and
+   * releasing this record.
+   */
+  readonly settle: (outcome: TokenOutcome) => void;
+}
 
 // ---------------------------------------------------------------------------
 // Section G — the client
@@ -1003,16 +1073,14 @@ type TokenOutcome =
  * itself connected, and dispatches validated frames to typed subscribers.
  *
  * ```ts
- * const resolved = resolveWsUrl('http://127.0.0.1:43117');
- * if (!resolved.ok) return report(resolved.error);
- *
  * const client = new ReconnectingWsClient({
- *   url: resolved.value,
+ *   url: 'http://127.0.0.1:43117', // validated here: loopback only
  *   webSocketConstructor: WebSocket,
  *   identity: { client: 'devtools', tabId },
  *   token: () => readPairedCredential(),
  *   onStateChange: (state) => pill.render(state),
  * });
+ * if (client.configurationError !== undefined) return report(client.configurationError);
  *
  * const stop = client.on('panel.generated', (message) => host.render(message.payload.panel));
  * client.connect();
@@ -1049,6 +1117,16 @@ type TokenOutcome =
  * through the provider, which is how pairing again or rotating a token takes
  * effect without rebuilding the client.
  *
+ * A configured URL that the loopback-only service-origin policy refused is the
+ * one state `connect()` cannot resume from, because the URL is fixed at
+ * construction: every `connect()` on such a client reports
+ * {@link ReconnectingWsClient.configurationError} through
+ * {@link ReconnectingWsClientOptions.onProtocolError}, stays `closed`, opens no
+ * socket, schedules nothing and never calls the credential provider. It is not
+ * reported as unauthorized — nothing was refused by the service, and pairing
+ * again would not help — so the remedy is a new client built from a corrected
+ * URL.
+ *
  * The outbound queue is kept across a {@link WS_CLOSE_UNAUTHORIZED} refusal and
  * cleared by an explicit `close()`. That asymmetry is deliberate: a refused credential is a problem the
  * developer is about to fix — pair, rotate, `connect()` — and the frames their
@@ -1075,15 +1153,17 @@ type TokenOutcome =
  */
 export class ReconnectingWsClient {
   /**
-   * The socket URL this client opens, exactly as it was configured.
+   * The configured URL, validated once at construction by {@link resolveWsUrl}:
+   * the canonical socket URL, or the refusal of the loopback-only
+   * service-origin policy.
    *
-   * Public because both user interfaces show which service they are talking to,
-   * and neither should re-derive it. It is used verbatim: {@link resolveWsUrl} is
-   * where a base URL becomes this value, so nothing is normalised here and a
-   * consumer that passes an unusable URL learns it from the first attempt's
-   * transport failure rather than from a constructor that threw.
+   * One field rather than a URL and an error side by side, so the two public
+   * views of it — {@link ReconnectingWsClient.url} and
+   * {@link ReconnectingWsClient.configurationError} — cannot disagree, and so
+   * {@link ReconnectingWsClient.openSocket} cannot reach a socket constructor
+   * without the type system having seen the check pass.
    */
-  readonly url: string;
+  private readonly endpoint: Result<string, DebuggenError>;
 
   /** The injected socket implementation. */
   private readonly webSocketConstructor: WebSocketConstructorLike;
@@ -1167,6 +1247,16 @@ export class ReconnectingWsClient {
   /** The pending reconnect timer: also the "one attempt in flight" flag. */
   private reconnectHandle: number | undefined;
 
+  /**
+   * The deadline of the asynchronous credential read in flight, if one is.
+   *
+   * At most one at a time, because at most one attempt is. Every path that ends
+   * an attempt cancels it through {@link cancelCredentialDeadline}, and every
+   * way the read itself ends releases it, so no deadline timer outlives its
+   * attempt.
+   */
+  private credentialDeadline: CredentialDeadline | undefined;
+
   /** Whether the next close must not be retried. */
   private terminal = false;
 
@@ -1177,12 +1267,20 @@ export class ReconnectingWsClient {
   private closeCode: number | undefined;
 
   /**
-   * @param options The socket URL, the socket implementation, this client's
+   * Never throws. A configured URL the loopback-only service-origin policy
+   * refuses is recorded as {@link ReconnectingWsClient.configurationError}
+   * rather than raised, because a misconfigured service URL is a state a user
+   * interface renders (AAP §0.5.5), not an exception an extension activation
+   * has to guard.
+   *
+   * @param options The service URL, the socket implementation, this client's
    * identity and its credential, plus the optional curve, bounds, logger,
    * injected timers, randomness and hooks.
    */
   constructor(options: ReconnectingWsClientOptions) {
-    this.url = options.url;
+    // Validated before anything else is stored, and before any credential could
+    // be resolved: the credential goes only where this check says it may.
+    this.endpoint = resolveWsUrl(options.url);
     this.webSocketConstructor = options.webSocketConstructor;
     this.identity = options.identity;
     this.tokenSource = options.token;
@@ -1200,6 +1298,36 @@ export class ReconnectingWsClient {
     this.onProtocolError = options.onProtocolError;
     this.onUnauthorized = options.onUnauthorized;
     this.onQueueDrop = options.onQueueDrop;
+  }
+
+  /**
+   * The socket URL this client opens — always the canonical
+   * `ws(s)://<loopback host[:port]>/ws` — or `undefined` when the configured
+   * URL was refused.
+   *
+   * Public because both user interfaces show which service they are talking to,
+   * and neither should re-derive it. It is {@link resolveWsUrl}'s answer for
+   * {@link ReconnectingWsClientOptions.url}, so a base URL, a socket URL and
+   * `resolveWsUrl`'s own output all display the same way. When it is
+   * `undefined`, {@link ReconnectingWsClient.configurationError} says why; the
+   * refused value itself is never kept, so it cannot be displayed by accident.
+   */
+  get url(): string | undefined {
+    return isErr(this.endpoint) ? undefined : this.endpoint.value;
+  }
+
+  /**
+   * Why the configured URL was refused, or `undefined` when it was accepted.
+   *
+   * Always `CONFIG_INVALID` with a constant message and hint and
+   * `details: { rule }` naming the service-origin rule the value broke —
+   * `not-loopback`, `userinfo`, `path` and the rest of that closed vocabulary —
+   * and never any part of the value itself (AAP §0.5.2). While it is set,
+   * {@link ReconnectingWsClient.connect} opens nothing and reports this error
+   * instead; see "What is terminal and what is not" above.
+   */
+  get configurationError(): DebuggenError | undefined {
+    return isErr(this.endpoint) ? this.endpoint.error : undefined;
   }
 
   /** The current connection state, as a user interface renders it. */
@@ -1237,6 +1365,11 @@ export class ReconnectingWsClient {
    * It also clears the terminal state a refusal left behind and re-resolves the
    * credential through the configured provider, so it is the resume path after
    * pairing again or rotating the service token (AAP §0.5.6).
+   *
+   * On a client whose configured URL was refused it does none of that: it
+   * reports {@link ReconnectingWsClient.configurationError} through
+   * {@link ReconnectingWsClientOptions.onProtocolError} and stays `closed`, with
+   * no socket, no timer and no call to the credential provider.
    */
   connect(): void {
     if (this.connectionState === 'connecting' || this.connectionState === 'open') {
@@ -1275,6 +1408,10 @@ export class ReconnectingWsClient {
     this.terminal = true;
     this.draining = false;
     this.clearReconnectTimer();
+    // A credential still being read belongs to the attempt this call ends: its
+    // deadline timer is cleared now rather than left to fire into a closed
+    // client, and the read's eventual answer is ignored.
+    this.cancelCredentialDeadline();
     this.queue.length = 0;
     // Invalidate anything still in flight — a pending asynchronous handshake in
     // particular — before the socket goes away.
@@ -1444,11 +1581,34 @@ export class ReconnectingWsClient {
    * scheme — is an attempt that failed rather than an exception a consumer has
    * to catch, so it is reported and retried on the curve like any other failure.
    *
+   * The configured URL is checked here, on the one path that reaches the socket
+   * constructor, rather than only in {@link connect}: a refused endpoint is
+   * therefore turned away before the generation, the state or any timer is
+   * touched, whichever caller got here, and the constructor is only ever handed
+   * a URL the loopback-only policy accepted.
+   *
    * @param nextState `'connecting'` for an explicit connect, `'reconnecting'`
    * for an attempt on the curve. Notifying is left to {@link setState}, which
    * stays silent when the state has not actually changed.
    */
   private openSocket(nextState: OpeningState): void {
+    const endpoint = this.endpoint;
+
+    if (isErr(endpoint)) {
+      this.refuseConfiguration(endpoint.error);
+      return;
+    }
+
+    const url = endpoint.value;
+
+    // Whatever the previous attempt still holds is retired before its
+    // replacement exists: a credential read's deadline timer is cleared, and a
+    // socket still in flight — a reconnect attempt that `connect()` is
+    // overtaking — loses its listeners and is closed, so no two sockets of this
+    // client ever coexist and nothing of the old attempt outlives it.
+    this.cancelCredentialDeadline();
+    this.retireSocket();
+
     this.generation += 1;
     const generation = this.generation;
 
@@ -1457,8 +1617,8 @@ export class ReconnectingWsClient {
     const created = tryCatch(
       () =>
         this.protocols === undefined
-          ? new this.webSocketConstructor(this.url)
-          : new this.webSocketConstructor(this.url, this.protocols),
+          ? new this.webSocketConstructor(url)
+          : new this.webSocketConstructor(url, this.protocols),
       'TRANSPORT_DISCONNECTED',
     );
 
@@ -1530,6 +1690,35 @@ export class ReconnectingWsClient {
     }
   }
 
+  /**
+   * Retires the current socket, if there is one, before a replacement is
+   * opened: its listeners are removed and it is closed with a normal-closure
+   * code.
+   *
+   * Reached only from {@link openSocket}, and only when `connect()` overtakes a
+   * reconnect attempt whose socket is still opening. Without it the overtaken
+   * socket would keep its listeners and stay open with no hello on it until the
+   * service's own {@link CLIENT_HELLO_TIMEOUT_MS} deadline closed it.
+   */
+  private retireSocket(): void {
+    const previous = this.socket;
+
+    if (previous === undefined) {
+      return;
+    }
+
+    this.detachListeners();
+    this.socket = undefined;
+
+    const closed = tryCatch(() => {
+      previous.close(NORMAL_CLOSURE_CODE);
+    }, 'TRANSPORT_DISCONNECTED');
+
+    if (isErr(closed)) {
+      this.logger.debug('websocket close failed');
+    }
+  }
+
   // -------------------------------------------------------------------------
   // The `client.hello` handshake
   // -------------------------------------------------------------------------
@@ -1558,9 +1747,14 @@ export class ReconnectingWsClient {
 
     if (isErr(produced)) {
       // A provider that throws is a credential that cannot be read. Its own
-      // message may name a storage key or quote a value, so it is logged at
-      // debug by the reporter and never forwarded to the refusal.
-      this.reportProtocolError(produced.error);
+      // message may name a storage key or quote a value, so it is replaced by a
+      // constant error — a fixed message and no cause — before anything is
+      // reported, and never forwarded to the refusal.
+      this.reportProtocolError(
+        new DebuggenError('UNAUTHORIZED', CREDENTIAL_PROVIDER_FAILED_MESSAGE, {
+          hint: CREDENTIAL_PROVIDER_FAILED_HINT,
+        }),
+      );
       this.refuseUnauthorized(socket, NO_CREDENTIAL_REASON);
       return;
     }
@@ -1592,9 +1786,10 @@ export class ReconnectingWsClient {
   ): Promise<void> {
     const outcome = await this.resolveTokenWithDeadline(pending);
 
-    if (generation !== this.generation) {
-      // The socket was replaced or the client was closed while the credential
-      // was being read. Nothing to send, and nothing to report.
+    if (outcome.kind === 'cancelled' || generation !== this.generation || socket !== this.socket) {
+      // The attempt ended while the credential was being read — `close()`, a
+      // replacement socket, a refusal or the socket's own close event. Nothing
+      // to send, and nothing to report.
       return;
     }
 
@@ -1610,35 +1805,90 @@ export class ReconnectingWsClient {
   }
 
   /**
-   * Races a credential promise against the handshake deadline.
+   * Races a credential promise against the handshake deadline, as a
+   * cancellable per-attempt record.
    *
-   * The timer comes from the injected {@link TimerApi}, so a test controls this
-   * deadline exactly as it controls the backoff curve, and it is cleared on
-   * every path so a resolved attempt leaves no timer behind.
+   * The deadline is stored in {@link credentialDeadline} rather than in a local,
+   * so the paths that end an attempt can reach it: each of them calls
+   * {@link cancelCredentialDeadline}, which clears the timer and settles the
+   * read as `cancelled`. Whichever settles first — the provider, the timer or a
+   * cancellation — wins, and settling always clears the timer and releases the
+   * record, so no outcome leaves a timer behind. The timer comes from the
+   * injected {@link TimerApi}, so a test controls this deadline exactly as it
+   * controls the backoff curve.
+   *
+   * The returned promise never rejects: a provider's rejection is the `failed`
+   * outcome, and `Promise.resolve` adopts whatever the provider answered, so a
+   * thenable from a foreign bundle is awaited rather than trusted to be a
+   * native promise.
    */
-  private async resolveTokenWithDeadline(
-    pending: Promise<string | undefined>,
-  ): Promise<TokenOutcome> {
-    let handle: number | undefined;
+  private resolveTokenWithDeadline(pending: Promise<string | undefined>): Promise<TokenOutcome> {
+    // One attempt, one read: a read still pending from an earlier `open` event
+    // on this attempt is superseded rather than left racing this one.
+    this.cancelCredentialDeadline();
 
-    const deadline = new Promise<TokenOutcome>((resolve) => {
-      handle = this.timers.setTimeout(() => {
-        resolve({ kind: 'timeout' });
-      }, CLIENT_HELLO_TIMEOUT_MS);
+    return new Promise<TokenOutcome>((resolve) => {
+      let settled = false;
+
+      const settle = (outcome: TokenOutcome): void => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+        this.releaseCredentialDeadline(deadline);
+        resolve(outcome);
+      };
+
+      const deadline: CredentialDeadline = {
+        handle: this.timers.setTimeout(() => {
+          settle({ kind: 'timeout' });
+        }, CLIENT_HELLO_TIMEOUT_MS),
+        settle,
+      };
+
+      this.credentialDeadline = deadline;
+
+      Promise.resolve(pending).then(
+        (token) => {
+          settle({ kind: 'resolved', token });
+        },
+        () => {
+          settle({ kind: 'failed' });
+        },
+      );
     });
+  }
 
-    const settled = pending.then(
-      (token): TokenOutcome => ({ kind: 'resolved', token }),
-      (): TokenOutcome => ({ kind: 'failed' }),
-    );
+  /**
+   * Cancels the credential read in flight, if there is one: its deadline timer
+   * is cleared and the read settles as `cancelled`, so its eventual answer is
+   * ignored.
+   *
+   * Called by every path that ends an attempt — {@link close},
+   * {@link openSocket} (a replacement), {@link terminate} (every local refusal)
+   * and {@link handleClose} (the socket closed while the credential was being
+   * read). Idempotent: with nothing in flight it does nothing.
+   */
+  private cancelCredentialDeadline(): void {
+    this.credentialDeadline?.settle({ kind: 'cancelled' });
+  }
 
-    const outcome = await Promise.race([settled, deadline]);
-
-    if (handle !== undefined) {
-      this.timers.clearTimeout(handle);
+  /**
+   * Clears a deadline's timer and forgets the record, if it is still the one in
+   * flight.
+   *
+   * The identity check is what makes a late settlement harmless: a read that
+   * was superseded no longer owns {@link credentialDeadline} and must not clear
+   * its successor's timer.
+   */
+  private releaseCredentialDeadline(deadline: CredentialDeadline): void {
+    if (this.credentialDeadline !== deadline) {
+      return;
     }
 
-    return outcome;
+    this.credentialDeadline = undefined;
+    this.timers.clearTimeout(deadline.handle);
   }
 
   /**
@@ -1656,7 +1906,12 @@ export class ReconnectingWsClient {
     generation: number,
     token: string | undefined,
   ): void {
-    if (generation !== this.generation) {
+    // Both, because they fail independently: the generation goes stale when a
+    // replacement opens or `close()` runs, while a socket whose own close event
+    // arrived is dropped without a new generation until the reconnect delay
+    // elapses. Either way this socket is no longer the one to authenticate, and
+    // a hello written to it would put the credential on a dead connection.
+    if (generation !== this.generation || socket !== this.socket) {
       return;
     }
 
@@ -1806,6 +2061,11 @@ export class ReconnectingWsClient {
       return;
     }
 
+    // A credential still being read was being read for this socket, which is
+    // now gone: its deadline is cancelled here, so neither a hello nor a
+    // refusal can follow onto the dead connection, and no deadline timer runs
+    // alongside the reconnect delay.
+    this.cancelCredentialDeadline();
     this.closeCode = event.code;
     this.detachListeners();
     this.socket = undefined;
@@ -1862,6 +2122,27 @@ export class ReconnectingWsClient {
   }
 
   /**
+   * Refuses to connect at all, because the configured URL is not a loopback
+   * origin of the local service.
+   *
+   * Nothing has been opened and nothing may be: no socket is constructed, the
+   * credential provider is never called, no timer is scheduled, and the client
+   * stays `closed` and terminal. The refusal is reported through
+   * {@link ReconnectingWsClientOptions.onProtocolError} — the stored
+   * `CONFIG_INVALID`, which quotes nothing of the value — and deliberately not
+   * through {@link ReconnectingWsClientOptions.onUnauthorized}: the service
+   * refused nothing, and a "Not paired" prompt would send the developer to fix
+   * the wrong thing.
+   */
+  private refuseConfiguration(error: DebuggenError): void {
+    this.terminal = true;
+    this.draining = false;
+    this.clearReconnectTimer();
+    this.reportProtocolError(error);
+    this.setState('closed', { reason: CONFIGURATION_REFUSED_REASON });
+  }
+
+  /**
    * Ends the attempt without scheduling another: the socket is closed, the
    * client is `closed`, and only {@link connect} revives it.
    */
@@ -1869,6 +2150,9 @@ export class ReconnectingWsClient {
     this.terminal = true;
     this.draining = false;
     this.clearReconnectTimer();
+    // Every local refusal ends here, including the one a timed-out credential
+    // read causes, so this is where a read still in flight is cancelled.
+    this.cancelCredentialDeadline();
     this.detachListeners();
     this.socket = undefined;
 

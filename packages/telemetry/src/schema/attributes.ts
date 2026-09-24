@@ -211,8 +211,19 @@ export const COMMIT_ATTRIBUTE_KEYS = Object.freeze(['phase', 'renderCount', 'roo
  * request to its `perf.entry` resource entry on (AAP 0.6.6). It is masked by
  * the same URL rule as `url`, so both sides of the join see the same spelling.
  *
- * Read by `../aggregate/requests.ts` (grouping and duplicate detection) and
- * the `requestTable`, `waterfall` and `timeline` panel nodes.
+ * `inFlight` marks an **in-flight snapshot**: the one event the producer emits
+ * at a capture boundary for a request that had started and not yet settled.
+ * It is written only as the boolean `true` — never `false`, and absent on every
+ * settled request — on an event that carries span status `unset`, no
+ * `http.status_code` and the time elapsed until the boundary as its duration.
+ * `../aggregate/requests.ts` reads it, and only it, as a *pending* request
+ * (`RequestOccurrence.pending`, `RequestGroup.pendingCount`): a missing status
+ * code never is, because a network error, an abort and a refused cross-origin
+ * response all settle without one.
+ *
+ * Read by `../aggregate/requests.ts` (grouping, duplicate detection and the
+ * pending state) and the `requestTable`, `waterfall` and `timeline` panel
+ * nodes.
  */
 export const FETCH_ATTRIBUTE_KEYS = Object.freeze([
   'http.method',
@@ -224,6 +235,7 @@ export const FETCH_ATTRIBUTE_KEYS = Object.freeze([
   'traceparentInjected',
   'transferSize',
   'resourceTimingUrl',
+  'inFlight',
 ] as const);
 
 /**
@@ -249,6 +261,7 @@ export const XHR_ATTRIBUTE_KEYS = Object.freeze([
   'traceparentInjected',
   'transferSize',
   'resourceTimingUrl',
+  'inFlight',
 ] as const);
 
 /**

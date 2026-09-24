@@ -40,20 +40,23 @@
  *
  * ## Zero hardcoded values, and the structural-value policy
  *
- * Every colour, spacing, radius, shadow, font, focus ring and stacking level
- * resolves to a `var(--dg-*)` token (AAP 0.6.3, 0.6.4). The only literals
- * permitted are `0`, `none`, `auto`, `inherit`, `currentColor` and
- * `transparent`. There is no hexadecimal or functional colour notation, no
- * absolute or root-relative length and no bare line-height anywhere below.
+ * Every colour, spacing, radius, glyph and control size, shadow, font, focus
+ * ring and stacking level resolves to a `var(--dg-*)` token (AAP 0.6.3,
+ * 0.6.4). The only literals permitted are `0`, `none`, `auto`, `inherit`,
+ * `currentColor` and `transparent`. There is no hexadecimal or functional
+ * colour notation, no length literal of any unit — absolute, root-relative or
+ * font-relative — and no bare line-height anywhere below. A glyph box, a
+ * spinner and an icon-only control's box are the font-relative size tokens
+ * (`--dg-icon-size`, `--dg-spinner-size`, `--dg-icon-button-size`), and
+ * `src/tokens/tokens.test.ts` fails on any length written as a literal.
  *
  * `base.css` records the structural forms that encode no design decision and
  * are therefore permitted, and this file uses exactly those: percentages
  * (`100%`, `50%`), grid and flex ratios (`1fr`, `minmax(0, 1fr)`,
- * `flex: 1 1 auto`), `aspect-ratio: 1`, font-relative squares (`1em`),
- * intrinsic sizes (`max-content`), unitless SVG geometry (`stroke-width`,
- * `stroke-dasharray`), and the border-width keywords `thin` and `medium` —
- * which is how every hairline and every emphasis edge below is expressed,
- * never as a length.
+ * `flex: 1 1 auto`), `aspect-ratio: 1`, intrinsic sizes (`max-content`),
+ * unitless SVG geometry (`stroke-width`, `stroke-dasharray`), and the
+ * border-width keywords `thin` and `medium` — which is how every hairline and
+ * every emphasis edge below is expressed, never as a length.
  *
  * Two derived forms appear, each annotated where it occurs:
  *
@@ -93,11 +96,12 @@
  *   dg-<block>--<variant>   a variant of that block
  *   dg-is-<state>           a state, ALWAYS written coupled to a block or
  *                           element (`.dg-data-table__row.dg-is-selected`) and
- *                           never styled on its own. The canonical set:
- *                           selected, active, disabled, expanded, collapsed,
- *                           loading, sortable, duplicate, ambiguous, orphan,
- *                           outlier, highlighted, unavailable, unresolved,
- *                           truncated, invalid, open, hovered.
+ *                           never styled on its own. The set the components
+ *                           emit and this file styles: selected, active,
+ *                           disabled, expanded, open, hovered, highlighted,
+ *                           duplicate, outlier, ambiguous, orphan (and its
+ *                           alias orphaned), error, invalid, truncated,
+ *                           unavailable, static, changed and unchanged.
  *                           Two states deliberately have NO class: a column's
  *                           sort direction and a node's expansion are carried
  *                           by `aria-sort` and `aria-expanded`, and the
@@ -114,14 +118,12 @@
  *                             --dgc-virtual-total   DataTable, components/EventLog
  *                             --dgc-virtual-start   DataTable, components/EventLog
  *                             --dgc-bar-color       components/Timeline, Waterfall
- *                             --dgc-kind-color      components/EventLog and chips
  *                             --dgc-lane-color      components/Timeline
  *                             --dgc-frame-color     components/FlameChart
  *                             --dgc-node-color      components/DependencyGraph
  *                             --dgc-severity-color  DurationCell, MetricCards
  *                             --dgc-depth           components/ComponentTree,
  *                                                   components/FlameChart
- *                             --dgc-stack-gap       layout/Stack
  *                             --dgc-split-weight    layout/Split
  *                           Every colour handed in through one of these comes
  *                           from `src/utils/color.ts`, which answers only with
@@ -139,15 +141,30 @@
  * given the same four declarations in the grouped rule under "Scroll
  * containers", which is the one place this file repeats that helper.
  *
+ * ## The class inventory is checked, in both directions
+ *
+ * Every class a module under `src/` emits has a selector here or in
+ * `base.css`, and every class a selector names is emitted by a module — with
+ * exactly three exceptions, published for the host surfaces to apply
+ * themselves: `dg-scroll`, `dg-spinner` and `dg-toolbar__spacer`.
+ * `scripts/check-css-classes.mjs` enforces both directions from the TypeScript
+ * syntax tree on every build (`prebuild`) and in `pnpm test`, so a class a
+ * component relies on can never go unstyled and a selector a refactor
+ * orphaned can never linger. Where a component writes two names for one part
+ * — a contract name beside the stylesheet's name, on the same element — the
+ * rule below groups the pair, so either name alone selects the treatment.
+ *
  * ## Composition without a preprocessor
  *
  * This is plain CSS: a rule cannot inherit another rule. Where a primitive's
  * TSX writes only its own class (`clsx('dg-badge', …)`) but the design calls
  * for a shared treatment, the shared rule GROUPS the selectors that need it
- * rather than duplicating declarations. `.dg-chip`, `.dg-truncate`,
- * `.dg-mono`, `.dg-numeric` and `.dg-surface-card` are each declared once that
+ * rather than duplicating declarations. The elevated card, the chip, the
+ * single-line ellipsis (whose head, `.dg-truncate`, is also a class a
+ * component may write) and the scroll container are each declared once that
  * way, and the grouped selector list is the authoritative record of which
- * components compose them.
+ * components compose them. A treatment has no head class of its own unless a
+ * component writes one, so no selector here names a class nothing renders.
  *
  * ## Accessibility outranks appearance
  *
@@ -165,7 +182,11 @@
  * The kind scale (`--dg-kind-*`) is held to 3:1 because it is used as a FILL
  * behind or beside a text label. Consequently a kind colour is spent on a
  * fill, a hairline or a dot, and a label drawn on top of one is painted in
- * `--dg-surface-base` — never the reverse.
+ * `--dg-surface-base` — never the reverse. A relationship connector is an
+ * essential non-text graphic too, so every edge strokes with
+ * `--dg-graph-edge`, which clears 3:1 on every surface of every theme; the
+ * border colours are for separation only and measure below it in the dark and
+ * light themes.
  *
  * @see src/styles/base.css for the reset, the global utilities and the
  *      structural-value policy this file follows.
@@ -183,22 +204,20 @@
 /* An elevated card: the surface every grouping box in the product sits on.
  * The border is not decoration — the high-contrast theme resolves every shadow
  * to `none`, so the hairline is what keeps the card readable there. */
-.dg-surface-card,
 .dg-section--card,
 .dg-metric-card,
+.dg-metric-cards__card,
 .dg-summary-header {
   background: var(--dg-surface-elevated);
   border: thin solid var(--dg-border-subtle);
   border-radius: var(--dg-radius-md);
 }
 
-/* The chip: the shared pill behind badges, evidence chips, source links,
- * trigger markers and status markers. `white-space: nowrap` is safe on every
- * selector listed — none of them is ever composed with `dg-visually-hidden`. */
-.dg-chip,
+/* The chip: the shared pill behind badges, source links, trigger markers and
+ * status markers. `white-space: nowrap` is safe on every selector listed —
+ * none of them is ever composed with `dg-visually-hidden`. */
 .dg-badge,
 .dg-source-link,
-.dg-summary-header__evidence-chip,
 .dg-render-table__trigger,
 .dg-request-table__status,
 .dg-request-table__duplicate-badge {
@@ -220,7 +239,6 @@
  * below its content and pushes its container wider instead of truncating. */
 .dg-truncate,
 .dg-text--truncate,
-.dg-data-table__cell--truncate,
 .dg-waterfall__label,
 .dg-event-log__name,
 .dg-event-log__attrs,
@@ -237,27 +255,10 @@
   white-space: nowrap;
 }
 
-/* Monospace with tabular figures: identifiers, paths, statements and times.
- * The type-role tokens are complete `font` shorthands and the shorthand resets
- * `font-variant`, so the tabular declaration must follow it — ordering that is
- * required, not stylistic (see base.css). */
-.dg-mono {
-  font: var(--dg-mono-md);
-  font-variant-numeric: tabular-nums;
-}
-
-/* A numeric column: monospace, tabular and aligned to the inline end, because
- * figures compare down a column only when their last digits line up. */
-.dg-numeric {
-  font: var(--dg-mono-md);
-  font-variant-numeric: tabular-nums;
-  text-align: end;
-}
-
 /* Scroll containers whose component writes no `dg-scroll` class of its own.
  * These four declarations mirror `.dg-scroll` in base.css — the one place this
  * file repeats that helper, because plain CSS cannot compose a class. */
-.dg-panel-shell,
+.dg-panel-shell__viewport,
 .dg-virtual-viewport,
 .dg-flame__viewport,
 .dg-timeline__viewport,
@@ -644,10 +645,11 @@
   appearance: none;
   padding-block: var(--dg-space-2);
   /* Reserves room for the chevron overlay: its own inline-end inset plus the
-   * font-relative square the glyph occupies. Select.tsx requires this padding
+   * glyph square (`--dg-icon-size`, font-relative, so it resolves against the
+   * same type role the chevron is drawn in). Select.tsx requires this padding
    * to be at least as wide as the chevron so a long option label can never run
    * underneath it. */
-  padding-inline-end: calc(var(--dg-space-4) + 1em);
+  padding-inline-end: calc(var(--dg-space-4) + var(--dg-icon-size));
   background: transparent;
   border: 0;
   color: var(--dg-text-primary);
@@ -691,8 +693,8 @@
  *
  * A label, never a control. Exactly one tone class and one fill class are
  * always present, so no default has to be encoded in the bare block rule and a
- * chip cannot render un-toned. The chip base comes from the grouped
- * `.dg-chip` rule above.
+ * chip cannot render un-toned. The chip base comes from the grouped chip rule
+ * under "Shared helpers" above.
  *
  * `--dgc-badge-color` is set inline only when the caller passes a colour, and
  * it always arrives as a token reference from `src/utils/color.ts`. It is
@@ -954,11 +956,6 @@
   content: '↓';
 }
 
-/* A column a caller marked sortable, before it has been sorted. */
-.dg-data-table__header-cell.dg-is-sortable {
-  cursor: pointer;
-}
-
 /* --- rows ----------------------------------------------------------------- */
 
 /* The inline-start edge is declared transparent on every row so that marking
@@ -1023,15 +1020,6 @@
   text-align: var(--dgc-align, start);
 }
 
-.dg-data-table__cell--numeric {
-  font: var(--dg-mono-md);
-  font-variant-numeric: tabular-nums;
-}
-
-.dg-data-table__cell--mono {
-  font: var(--dg-mono-md);
-}
-
 /* The expand toggle a column's cell renderer places in the identity column. */
 .dg-data-table__expand-button {
   flex: none;
@@ -1039,8 +1027,7 @@
 
 /* The detail row a caller's `renderExpandedRow` fills. One cell spanning every
  * column, so it takes a single full-width track rather than the grid's. */
-.dg-data-table__expanded,
-.dg-data-table__detail-row {
+.dg-data-table__expanded {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   padding-block: var(--dg-space-2);
@@ -1050,8 +1037,16 @@
 }
 
 /* Totals and paging counts, below the viewport rather than inside the grid, so
- * they are never announced as a row of data. */
-.dg-data-table__footer {
+ * they are never announced as a row of data. The visualizations that page
+ * their own rows write a footer class of their own; they are grouped here so
+ * every footer in the product reads as the same strip. Each of them is a
+ * `layout/Stack`, whose modifiers are declared later in this file and so keep
+ * the axis, gap and alignment the component asked for. */
+.dg-data-table__footer,
+.dg-span-table__footer,
+.dg-request-table__footer,
+.dg-state-transitions__footer,
+.dg-waterfall__footer {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
@@ -1062,13 +1057,6 @@
   border-block-start: thin solid var(--dg-border-subtle);
   color: var(--dg-text-muted);
   font: var(--dg-text-xs);
-}
-
-/* The box a table puts its `EmptyState` in. It renders outside the grid's
- * rowgroup on purpose, so it is never announced as data. */
-.dg-data-table__empty {
-  display: flex;
-  min-inline-size: 0;
 }
 
 /* --- density -------------------------------------------------------------- */
@@ -1438,7 +1426,8 @@
 }
 
 /* The glyph takes its size from the type role around it (the `dg-icon`
- * utility is a `1em` square), so a larger role is how it is enlarged. */
+ * utility is a `--dg-icon-size` square, font-relative by definition), so a
+ * larger role is how it is enlarged. */
 .dg-empty-state__icon {
   display: inline-flex;
   align-items: center;
@@ -1530,10 +1519,14 @@
 }
 
 /* A free-standing spinner for a surface that shows progress inline rather than
- * as a silhouette — a connection pill, a control acting on a request. The ring
- * is a `medium` border with one accent-coloured side; `100%` makes it round.
- * Gap: no rotation-duration token exists, so the shared motion constant is
- * multiplied to a speed that reads as continuous rather than frantic.
+ * as a silhouette — a connection pill, a control acting on a request. No
+ * primitive renders it: it is published for the host surfaces, and
+ * `scripts/check-css-classes.mjs` lists it as such. Its square is
+ * `--dg-spinner-size`, the glyph square it stands in for, so it scales with
+ * the type role beside it. The ring is a `medium` border with one
+ * accent-coloured side; `100%` makes it round. Gap: no rotation-duration token
+ * exists, so the shared motion constant is multiplied to a speed that reads as
+ * continuous rather than frantic.
  *
  * Geometry a host needs to know, measured in the browser rather than reasoned
  * about: rotating a square grows its axis-aligned bounding box by up to a
@@ -1553,8 +1546,8 @@
   display: inline-block;
   /* Never stretched or shrunk by the row or column it sits in. */
   flex: none;
-  inline-size: 1em;
-  block-size: 1em;
+  inline-size: var(--dg-spinner-size);
+  block-size: var(--dg-spinner-size);
   border: medium solid var(--dg-border-subtle);
   border-block-start-color: var(--dg-accent);
   border-radius: 100%;
@@ -1632,7 +1625,12 @@
  * The theme root: it carries the `data-theme` attribute the token stylesheet
  * selects on, so everything inside it — including a tooltip bubble, which
  * renders in place rather than through a portal — resolves the same token set.
- * It is also the panel's scroll container and its stacking base.
+ * It is also the panel's stacking base, and it fills the host frame exactly,
+ * so that its one child, `__viewport`, is the panel's scroll container: the
+ * element PanelShell.tsx makes focusable precisely because it is the one that
+ * scrolls, and the one a keyboard user moves through the panel with. Where
+ * the host frame has no definite height the block simply grows with its
+ * content and the host document scrolls instead.
  * ========================================================================== */
 
 .dg-panel-shell {
@@ -1642,10 +1640,31 @@
   flex-direction: column;
   inline-size: 100%;
   min-inline-size: 0;
-  min-block-size: 100%;
+  block-size: 100%;
   background: var(--dg-surface-base);
   color: var(--dg-text-primary);
   font: var(--dg-text-md);
+}
+
+/* Takes the whole block and may shrink below its content on both axes, which
+ * is what lets it overflow into a scroll range instead of stretching the
+ * block. Its scroll declarations are in the grouped "Scroll containers" rule
+ * near the top of this file. It is also the containing block for everything
+ * absolutely positioned inside the panel — visually hidden text, table
+ * captions, in-place tooltips — because a scroll container clips and scrolls
+ * only the descendants it contains: were the block above their containing
+ * block instead, they would escape this scroll range and grow the host
+ * document's. The focus ring is drawn inward: an outward ring on an element
+ * that fills the frame would be clipped by the frame's edge. */
+.dg-panel-shell__viewport {
+  position: relative;
+  flex: 1 1 auto;
+  min-inline-size: 0;
+  min-block-size: 0;
+}
+
+.dg-panel-shell__viewport:focus-visible {
+  outline-offset: calc(var(--dg-space-0) * -1);
 }
 
 /* ==========================================================================
@@ -1653,8 +1672,8 @@
  *
  * The titled grouping a panel's regions sit in, in the two variants the
  * component emits and no third. `--card` is the framed grouping: its surface,
- * hairline and radius come from the grouped `.dg-surface-card` rule near the
- * top of this file, and the inset that belongs to a frame is declared against
+ * hairline and radius come from the grouped elevated-card rule near the top
+ * of this file, and the inset that belongs to a frame is declared against
  * the same variant below. `--plain` is a heading over its content and is given
  * no surface and no inset at all, so a region composed inside a framed one does
  * not stack a second frame inside the first.
@@ -1713,13 +1732,6 @@
 
 .dg-section--card > .dg-section__body {
   padding: var(--dg-space-4);
-}
-
-/* Full-bleed: an SVG view fills the card and draws its own inset, so the body
- * must not add one. A caller asks for it by class, and it is declared after the
- * framed variant's inset — equal specificity, so source order decides. */
-.dg-section--flush > .dg-section__body {
-  padding: 0;
 }
 
 /* ==========================================================================
@@ -2072,7 +2084,10 @@
   min-inline-size: 0;
 }
 
-/* Pushes what follows it to the inline end without a margin. */
+/* Pushes what follows it to the inline end without a margin. Toolbar.tsx
+ * never emits it — its search section is the part that grows — and documents
+ * it for a bar a host composes by hand, which is why
+ * `scripts/check-css-classes.mjs` lists it as a published class. */
 .dg-toolbar__spacer {
   flex: 1 1 auto;
 }
@@ -2084,11 +2099,6 @@
   flex: 1 1 auto;
   min-inline-size: 0;
   max-inline-size: calc(var(--dg-space-7) * 12);
-}
-
-.dg-toolbar__label {
-  color: var(--dg-text-muted);
-  font: var(--dg-text-xs);
 }
 
 /* The three typed control sections of `layout/Toolbar.tsx` — the option
@@ -2178,84 +2188,11 @@
   font-style: italic;
 }
 
-/* "Observed" and "Likely cause". Letter-spacing is not tokenised, so the label
- * is distinguished by its type role and colour alone. */
-.dg-summary-header__section-label {
-  color: var(--dg-text-muted);
-  font: var(--dg-text-xs);
-  font-weight: var(--dg-font-weight-medium);
-}
-
-.dg-summary-header__observed,
-.dg-summary-header__causes {
-  display: flex;
-  flex-direction: column;
-  gap: var(--dg-space-2);
-  min-inline-size: 0;
-  /* These render as lists; base.css deliberately keeps user-agent markers, so
-   * a marker-free list opts out here. */
-  list-style: none;
-}
-
-/* Measured facts: a neutral edge, because the block makes no claim beyond what
- * the capture holds. */
-.dg-summary-header__observed {
-  padding-inline-start: var(--dg-space-3);
-  border-inline-start: medium solid var(--dg-border-strong);
-}
-
-/* Inference: a warning-toned edge, and every item carries a confidence chip,
- * so the distinction is never colour alone. */
-.dg-summary-header__causes {
-  padding-inline-start: var(--dg-space-3);
-  border-inline-start: medium solid var(--dg-warning);
-}
-
-.dg-summary-header__observed-item,
-.dg-summary-header__cause-item {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  gap: var(--dg-space-2);
-  min-inline-size: 0;
-  color: var(--dg-text-primary);
-  font: var(--dg-text-md);
-}
-
-/* An evidence chip selects the events that substantiate the fact beside it, so
- * it is rendered as a control and styled as one: the chip base, the muted
- * accent surface, and the pointer and hover feedback of something clickable.
- * The focus ring comes from base.css. */
-.dg-summary-header__evidence-chip {
-  background: var(--dg-accent-muted);
-  border-color: var(--dg-accent);
-  color: var(--dg-text-primary);
-  font: var(--dg-mono-sm);
-  cursor: pointer;
-  transition-property: background-color, border-color;
-  transition-duration: var(--dg-motion-duration);
-  transition-timing-function: var(--dg-motion-easing);
-}
-
-.dg-summary-header__evidence-chip:hover {
-  background: var(--dg-surface-overlay);
-  border-color: var(--dg-border-strong);
-}
-
+/* The level word of a likely cause. The component renders it as a `Badge`
+ * whose tone names the level, so the tone — never this rule — carries the
+ * colour, and the word carries the meaning. */
 .dg-summary-header__confidence {
   font: var(--dg-text-xs);
-}
-
-.dg-summary-header__confidence--high {
-  color: var(--dg-success);
-}
-
-.dg-summary-header__confidence--medium {
-  color: var(--dg-warning);
-}
-
-.dg-summary-header__confidence--low {
-  color: var(--dg-danger);
 }
 
 /* The slot a suggested location's `SourceLink` sits in. */
@@ -2266,12 +2203,10 @@
 
 /* The class contract layout/SummaryHeader.tsx declares: the region wrapper and
  * its heading, one list shape for both registers, and the statement, evidence
- * and chip elements. Same intent as the rules above — a neutral edge on what
- * was measured, a warning-toned edge on what is inferred, a chip that reads as
- * the control it is — expressed against the element names the component
- * renders, with the observed/inferred difference carried by the region variant
- * rather than by two parallel list classes. Later in source order, so where a
- * rule above names the same element this one wins at equal specificity. */
+ * and chip elements — a neutral edge on what was measured, a warning-toned
+ * edge on what is inferred, and a chip that reads as the control it is, with
+ * the observed/inferred difference carried by the region variant rather than
+ * by two parallel list classes. */
 .dg-summary-header__region {
   display: flex;
   flex-direction: column;
@@ -2444,13 +2379,34 @@
 /* The row a component composes its `Toolbar` into. It never stretches: the
  * visualization below it takes the free space. */
 .dg-timeline__toolbar,
-.dg-waterfall__toolbar,
 .dg-event-log__toolbar,
-.dg-flame__toolbar,
 .dg-render-table__toolbar,
+.dg-component-tree__toolbar,
 .dg-request-table__toolbar,
-.dg-query-table__toolbar {
+.dg-query-table__toolbar,
+.dg-state-transitions__toolbar {
   flex: none;
+}
+
+/* A provenance or honesty note beside a visualization: what its marks mean,
+ * where its data came from, and what it is not showing. Muted and in the
+ * smallest role, so it reads as a caption to the view rather than as a
+ * finding of its own. */
+.dg-flame__note,
+.dg-component-tree__note,
+.dg-dependency-graph__note {
+  color: var(--dg-text-muted);
+  font: var(--dg-text-xs);
+}
+
+/* The keyboard-reachable text equivalent of an SVG canvas: the canvas is
+ * `role="img"` and cannot be entered, so the same records are listed in a
+ * `DataTable` beneath it. It may shrink below its content like the view it
+ * describes, so a long identifier truncates in its cell instead of widening
+ * the panel. */
+.dg-timeline__equivalent,
+.dg-dependency-graph__equivalent {
+  min-inline-size: 0;
 }
 
 /* The block of every visualization: a column that may shrink below its content
@@ -2603,9 +2559,13 @@
   pointer-events: none;
 }
 
+/* A connector is an essential non-text graphic, so it strokes with the
+ * relationship-edge token, which clears the 3:1 non-text bar on every surface
+ * of every theme; neither border colour does in the dark or light theme
+ * (src/tokens/tokens.test.ts). */
 .dg-timeline__edge {
   fill: none;
-  stroke: var(--dg-border-strong);
+  stroke: var(--dg-graph-edge);
   stroke-width: 1;
   stroke-linecap: round;
   pointer-events: none;
@@ -2619,13 +2579,17 @@
 }
 
 /* A span whose parent never arrived, attached to the trace root and flagged
- * rather than dropped. */
-.dg-timeline__edge.dg-is-orphan {
+ * rather than dropped. Timeline.tsx writes the state under both of its names —
+ * `dg-is-orphan`, the canonical state, and `dg-is-orphaned`, the name its own
+ * contract uses — so both select the same treatment. */
+.dg-timeline__edge.dg-is-orphan,
+.dg-timeline__edge.dg-is-orphaned {
   stroke: var(--dg-warning);
   stroke-dasharray: 1 3;
 }
 
-.dg-timeline__bar.dg-is-orphan {
+.dg-timeline__bar.dg-is-orphan,
+.dg-timeline__bar.dg-is-orphaned {
   stroke: var(--dg-warning);
   stroke-width: 1;
 }
@@ -2664,6 +2628,25 @@
   background: var(--dg-surface-elevated);
 }
 
+/* A call the correlator re-attached to the top level because its parent could
+ * not be resolved: a dashed warning edge, so the structure around it does not
+ * read as measured. Colour and dash are never the only signal — the row's
+ * "Re-attached" badge and its description carry the words. Declared before the
+ * selected state so selection's accent edge still wins. */
+.dg-waterfall__row.dg-is-orphan {
+  border-inline-start-color: var(--dg-warning);
+  border-inline-start-style: dashed;
+}
+
+/* A call whose telemetry reported failure: a danger edge. The row always shows
+ * the word as well — its status-code chip, or an "Error" badge where no code
+ * conveys the failure — so colour is never the only signal. Declared after the
+ * orphan state (a failed re-attached call keeps the dash and takes the danger
+ * colour) and before the selected state, whose accent edge still wins. */
+.dg-waterfall__row.dg-is-error {
+  border-inline-start-color: var(--dg-danger);
+}
+
 .dg-waterfall__row.dg-is-selected {
   background: var(--dg-accent-muted);
   border-inline-start-color: var(--dg-accent);
@@ -2693,11 +2676,6 @@
   border-radius: var(--dg-radius-sm);
 }
 
-/* Queued or blocked time before the operation started. */
-.dg-waterfall__bar--wait {
-  background: var(--dgc-bar-color, var(--dg-border-strong));
-}
-
 /* Time the operation was actually doing work. */
 .dg-waterfall__bar--active {
   background: var(--dgc-bar-color, var(--dg-kind-http));
@@ -2712,8 +2690,11 @@
 }
 
 /* The child spans of an expanded row, indented on the elevated surface so the
- * nesting is visible without a second grid. */
-.dg-waterfall__child-rows {
+ * nesting is visible without a second grid. The component writes both names
+ * on the one `role="group"` element, and it renders the group only while its
+ * row is expanded, so the `display` here never fights a `hidden` attribute. */
+.dg-waterfall__child-rows,
+.dg-waterfall__children {
   display: flex;
   flex-direction: column;
   min-inline-size: 0;
@@ -2721,46 +2702,60 @@
   background: var(--dg-surface-elevated);
 }
 
+/* The `role="tree"` of top-level rows below the axis. */
+.dg-waterfall__rows {
+  display: flex;
+  flex-direction: column;
+  min-inline-size: 0;
+}
+
+/* The identity column: the expand toggle, the method badge and the label
+ * slot. It may shrink below its content so the label truncates in place. */
+.dg-waterfall__name {
+  min-inline-size: 0;
+}
+
+/* The slot the label and its tooltip sit in. The component gives it its flex
+ * basis; this makes it a row of its own, so the tooltip trigger inside is a
+ * flex item that can shrink and the label's ellipsis engages. */
+.dg-waterfall__label-slot {
+  display: flex;
+  align-items: center;
+  min-inline-size: 0;
+}
+
+/* The time axis is the header of the rows beneath it, composed from the row's
+ * own grid so its strip lines up with every track. It separates the way a
+ * table header does — with the emphasised rule — and it is not a record, so
+ * it gives no hover feedback. */
+.dg-waterfall__axis {
+  border-block-end-color: var(--dg-border-strong);
+}
+
+.dg-waterfall__axis:hover {
+  background: transparent;
+}
+
+/* The axis strip occupies the track column; it shrinks with it. */
+.dg-waterfall__axis-strip {
+  min-inline-size: 0;
+}
+
 /* ==========================================================================
  * components/EventLog.tsx
  *
- * Every captured event in sequence, virtualized through the shared
- * `dg-virtual-*` helpers — the same contract `primitives/DataTable` declares,
- * including the unvirtualized fallback when no viewport can be measured.
+ * Every captured event in sequence, rendered through `primitives/DataTable`
+ * and therefore virtualized through the shared `dg-virtual-*` helpers — rows,
+ * selection and focus included, with the unvirtualized fallback when no
+ * viewport can be measured.
  *
- * The kind is a dot in the kind colour beside the kind's NAME, so the colour
- * reinforces a label rather than carrying the meaning alone.
+ * The kind is a `Badge` in the kind colour that carries the kind's NAME, so
+ * the colour reinforces a label rather than carrying the meaning alone.
  * ========================================================================== */
 
 .dg-event-log .dg-virtual-viewport {
   /* Gap: no size token exists for a log's scroll cap. */
   max-block-size: calc(var(--dg-space-7) * 14);
-}
-
-.dg-event-log__row {
-  display: grid;
-  grid-template-columns: max-content max-content max-content minmax(0, 1fr) minmax(0, 2fr);
-  align-items: center;
-  gap: var(--dg-space-2);
-  padding-block: var(--dg-space-0);
-  padding-inline: var(--dg-space-2);
-  border-block-end: thin solid var(--dg-border-subtle);
-  border-inline-start: medium solid transparent;
-  font: var(--dg-mono-sm);
-  cursor: pointer;
-}
-
-.dg-event-log__row:hover {
-  background: var(--dg-surface-elevated);
-}
-
-.dg-event-log__row:focus-visible {
-  outline-offset: calc(var(--dg-space-0) * -1);
-}
-
-.dg-event-log__row.dg-is-selected {
-  background: var(--dg-accent-muted);
-  border-inline-start-color: var(--dg-accent);
 }
 
 .dg-event-log__seq {
@@ -2771,24 +2766,6 @@
 .dg-event-log__time {
   color: var(--dg-text-secondary);
   font-variant-numeric: tabular-nums;
-}
-
-.dg-event-log__kind {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--dg-space-1);
-  color: var(--dg-text-secondary);
-}
-
-/* The dot. A square space token on each axis and a full radius, so it needs no
- * length of its own. */
-.dg-event-log__kind::before {
-  content: '';
-  flex: none;
-  inline-size: var(--dg-space-1);
-  block-size: var(--dg-space-1);
-  background: var(--dgc-kind-color, var(--dg-text-muted));
-  border-radius: 100%;
 }
 
 .dg-event-log__name {
@@ -2821,7 +2798,12 @@
   min-inline-size: 0;
 }
 
-.dg-metric-card {
+/* MetricCards.tsx writes each tile part under two names — the tile's own
+ * `dg-metric-card*` block and the `dg-metric-cards__*` element names its
+ * component contract states — on the same element, so every rule below groups
+ * the pair and either name alone selects the whole treatment. */
+.dg-metric-card,
+.dg-metric-cards__card {
   display: flex;
   flex-direction: column;
   gap: var(--dg-space-0);
@@ -2829,7 +2811,8 @@
   padding: var(--dg-space-3);
 }
 
-.dg-metric-card__label {
+.dg-metric-card__label,
+.dg-metric-cards__label {
   color: var(--dg-text-muted);
   font: var(--dg-text-xs);
 }
@@ -2837,33 +2820,29 @@
 /* The prominent numeric role. `--dg-text-lg` is the one role whose own
  * shorthand already carries the medium weight, so the weight needs no restating
  * here and the rule stays tied to the role; the shorthand does reset figures,
- * which is why tabular numerals follow it. */
-.dg-metric-card__value {
+ * which is why tabular numerals follow it. The severity arrives as
+ * `--dgc-severity-color`, a duration token, whenever the metric has one. */
+.dg-metric-card__value,
+.dg-metric-cards__value {
   color: var(--dgc-severity-color, var(--dg-text-primary));
   font: var(--dg-text-lg);
   font-variant-numeric: tabular-nums;
 }
 
-.dg-metric-card__unit {
+.dg-metric-card__unit,
+.dg-metric-cards__unit {
   color: var(--dg-text-muted);
   font: var(--dg-text-xs);
 }
 
-.dg-metric-card__hint {
+.dg-metric-card__hint,
+.dg-metric-cards__note {
   color: var(--dg-text-muted);
   font: var(--dg-text-xs);
-}
-
-.dg-metric-card--warning .dg-metric-card__value {
-  color: var(--dgc-severity-color, var(--dg-warning));
-}
-
-.dg-metric-card--danger .dg-metric-card__value {
-  color: var(--dgc-severity-color, var(--dg-danger));
 }
 
 /* Declared last, and at two classes, so an unobservable metric is muted
- * whatever severity variant the card carries. */
+ * whatever severity the value would otherwise carry. */
 .dg-metric-card.dg-is-unavailable .dg-metric-card__value {
   color: var(--dg-text-muted);
 }
@@ -2928,12 +2907,8 @@
   pointer-events: none;
 }
 
-/* A provenance or honesty note above the chart: what the widths mean, and what
- * the chart is not showing. */
-.dg-flame__note {
-  color: var(--dg-text-muted);
-  font: var(--dg-text-xs);
-}
+/* The provenance note above the chart — what the widths mean, and what the
+ * chart is not showing — is the grouped note rule of the shared section. */
 
 /* The chart's text equivalent. The canvas is `role="img"` and cannot be entered
  * with a keyboard, so the same frames are listed beneath it, one row each, in
@@ -3126,17 +3101,16 @@
 /* The leaf's placeholder — the empty box the note above describes. `:empty`
  * addresses exactly the case that needs a rule: a span with no toggle inside
  * it, which would otherwise collapse to nothing and pull a leaf's label out of
- * line with its siblings'. It reserves the icon-only toggle's box, and it does
- * so by restating that control's own recipe rather than a length: the small
- * type role (`--dg-text-sm`, which is also what `.dg-button--sm` sets, so `1em`
- * here is the glyph the toggle draws), that control's inline padding
- * (`--dg-space-1` a side) and its hairline border a side (`--dg-space-0` is the
- * scale's smallest step and the width `thin` resolves to). The three terms
- * therefore track the toggle through a token change instead of drifting from
- * it, and `aspect-ratio` keeps the box square without a second length. */
+ * line with its siblings'. It reserves the icon-only toggle's box through the
+ * `--dg-icon-button-size` token — that control's glyph square, its inline
+ * padding and its hairlines, stated once in the token table — resolved in the
+ * small type role (`--dg-text-sm`, which is also what `.dg-button--sm` sets,
+ * so the token's font-relative glyph term is the glyph the toggle draws). The
+ * box therefore tracks the toggle through a token change instead of drifting
+ * from it, and `aspect-ratio` keeps it square without a second length. */
 .dg-component-tree__toggle:empty {
   font: var(--dg-text-sm);
-  inline-size: calc(1em + var(--dg-space-1) * 2 + var(--dg-space-0));
+  inline-size: var(--dg-icon-button-size);
   aspect-ratio: 1;
 }
 
@@ -3157,12 +3131,14 @@
   font-variant-numeric: tabular-nums;
 }
 
-/* The indent guide: one hairline per level, drawn by the node's own box rather
- * than by a nested container. */
-.dg-component-tree__guide {
-  flex: none;
-  align-self: stretch;
-  border-inline-start: thin solid var(--dg-border-subtle);
+/* The `role="group"` holding an expanded node's children. Indentation is the
+ * nodes' own (`--dgc-depth`), so the group adds no inset; it only shrinks with
+ * the tree. It deliberately declares no `display`: the component collapses it
+ * with the `hidden` attribute, and base.css's `[hidden]` rule is a single
+ * attribute selector that a `display` declared here, later and at equal
+ * specificity, would override — reopening every collapsed branch. */
+.dg-component-tree__children {
+  min-inline-size: 0;
 }
 
 /* ==========================================================================
@@ -3243,6 +3219,16 @@
   min-inline-size: 0;
 }
 
+/* The composite cells — the duplicate badge beside its count, the initiating
+ * components' chips — and the expanded list of occurrences. Each is a
+ * `layout/Stack`, which owns its axis and gap; these only let it shrink with
+ * its column so a long chip truncates instead of widening the table. */
+.dg-request-table__duplicates,
+.dg-request-table__initiators,
+.dg-request-table__occurrences {
+  min-inline-size: 0;
+}
+
 /* ==========================================================================
  * components/QueryTable.tsx
  *
@@ -3319,21 +3305,6 @@
  * length — only clipped to its box.
  * ========================================================================== */
 
-.dg-state-transitions__row {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  gap: var(--dg-space-2);
-  min-inline-size: 0;
-  padding-block: var(--dg-space-1);
-  padding-inline: var(--dg-space-2);
-  border-block-end: thin solid var(--dg-border-subtle);
-}
-
-.dg-state-transitions__row:hover {
-  background: var(--dg-surface-elevated);
-}
-
 .dg-state-transitions__component {
   color: var(--dg-text-primary);
   font: var(--dg-mono-md);
@@ -3344,11 +3315,41 @@
   font: var(--dg-mono-sm);
 }
 
+/* The value-before and value-after cells. The component writes each under its
+ * contract name (`__previous`, `__next`) and its stylesheet name (`__from`,
+ * `__to`) on the same element, so the rule groups all four. */
 .dg-state-transitions__from,
-.dg-state-transitions__to {
+.dg-state-transitions__to,
+.dg-state-transitions__previous,
+.dg-state-transitions__next {
   display: inline-flex;
   align-items: baseline;
   gap: var(--dg-space-1);
+  min-inline-size: 0;
+}
+
+/* The reported-state cell, and whether the producer reported values at all.
+ * An unreported record makes no claim that the value stayed the same, so its
+ * chip is drawn with a dashed hairline — the same "nothing is claimed"
+ * treatment as an unknown render trigger — and a reported change keeps the
+ * solid one. The chip's word and glyph say the same, so the hairline is never
+ * the only signal. */
+.dg-state-transitions__changed {
+  min-inline-size: 0;
+}
+
+.dg-state-transitions__changed.dg-is-changed .dg-badge {
+  border-style: solid;
+}
+
+.dg-state-transitions__changed.dg-is-unchanged .dg-badge {
+  border-style: dashed;
+}
+
+/* One expanded row's detail: its fields sit in `layout/Stack`s of their own,
+ * and the detail row of `primitives/DataTable` supplies the inset, so this
+ * only lets the block shrink with the table. */
+.dg-state-transitions__detail {
   min-inline-size: 0;
 }
 
@@ -3405,6 +3406,21 @@
   min-inline-size: 0;
   /* Gap: no size token exists for a graph's scroll cap. */
   max-block-size: calc(var(--dg-space-7) * 16);
+}
+
+/* The two paint groups the component draws, in paint order: every
+ * relationship, then one group of participant boxes per layer. Curves and
+ * rounded boxes are rendered for geometric precision — snapped to device
+ * pixels they read as jagged — and the relationship group is inert as a
+ * whole, so no edge or count label can take a pointer event from the box
+ * drawn over it. */
+.dg-dependency-graph__edges,
+.dg-dependency-graph__column {
+  shape-rendering: geometricPrecision;
+}
+
+.dg-dependency-graph__edges {
+  pointer-events: none;
 }
 
 .dg-dependency-graph__node {
@@ -3465,9 +3481,13 @@
   pointer-events: none;
 }
 
+/* The relationship-edge token, for the timeline edge's reason: a connector is
+ * an essential non-text graphic held to the 3:1 non-text bar on every surface
+ * of every theme, which the border colours do not reach in the dark or light
+ * theme. */
 .dg-dependency-graph__edge {
   fill: none;
-  stroke: var(--dg-border-strong);
+  stroke: var(--dg-graph-edge);
   stroke-width: 1;
   stroke-linecap: round;
   pointer-events: none;
@@ -3475,7 +3495,6 @@
 
 /* The same ambiguous-lineage treatment as the timeline's edge, for the same
  * reason: an inferred relationship must not be drawn like a measured one. */
-.dg-dependency-graph__edge--dashed,
 .dg-dependency-graph__edge.dg-is-ambiguous {
   stroke-dasharray: 4 3;
 }
@@ -3512,9 +3531,10 @@
  * likely causes. It is the leaf panel node with a location of its own and no
  * data query.
  *
- * An item whose location could not be resolved carries `dg-is-unresolved` and
- * is muted and non-interactive — a chip that cannot open anything must not
- * invite a click.
+ * A chip with no handler to open its location carries `dg-is-static` and is
+ * muted and non-interactive — a chip that cannot open anything must not
+ * invite a click. A coordinate that did not resolve is omitted from the chip
+ * by the component rather than styled here.
  * ========================================================================== */
 
 .dg-source-link {
@@ -3544,43 +3564,6 @@
 
 .dg-source-link__file {
   color: var(--dg-accent);
-}
-
-.dg-source-link__line {
-  flex: none;
-  color: var(--dg-text-muted);
-  font-variant-numeric: tabular-nums;
-}
-
-/* Inside a dense table or timeline row the chip drops its own surface so the
- * row stays the only box. */
-.dg-source-link--inline {
-  padding-inline: 0;
-  background: transparent;
-  border-color: transparent;
-}
-
-.dg-source-link--inline:hover {
-  background: transparent;
-  border-color: transparent;
-}
-
-.dg-source-link.dg-is-unresolved {
-  background: var(--dg-surface-elevated);
-  border-color: var(--dg-border-subtle);
-  color: var(--dg-text-muted);
-  cursor: not-allowed;
-}
-
-.dg-source-link.dg-is-unresolved:hover {
-  background: var(--dg-surface-elevated);
-  border-color: var(--dg-border-subtle);
-  text-decoration: none;
-}
-
-.dg-source-link.dg-is-unresolved .dg-source-link__symbol,
-.dg-source-link.dg-is-unresolved .dg-source-link__file {
-  color: var(--dg-text-muted);
 }
 
 /* The leading glyph. `dg-icon` from base.css already gives it its font-relative
@@ -3691,14 +3674,6 @@
   padding: var(--dg-space-4);
 }
 
-.dg-panel__header {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  gap: var(--dg-space-3);
-  min-inline-size: 0;
-}
-
 .dg-panel__summary {
   min-inline-size: 0;
 }
@@ -3728,16 +3703,6 @@
   min-block-size: calc(var(--dg-space-7) * 4);
 }
 
-/* A node whose query is in flight while the previous result is still on
- * screen. `LoadingState` carries `aria-busy` for a reader; this is the
- * pointer's half of the same fact. The stale content is never dimmed with
- * `opacity`, which would change the effective contrast of everything in it. */
-.dg-panel__node.dg-is-loading,
-.dg-data-table.dg-is-loading,
-.dg-event-log.dg-is-loading {
-  cursor: progress;
-}
-
 .dg-panel__banner {
   display: flex;
   flex-wrap: wrap;
@@ -3763,14 +3728,4 @@
 
 .dg-panel__banner--fallback .dg-icon {
   color: var(--dg-warning);
-}
-
-/* A hard failure the host reports at panel level rather than per node. */
-.dg-panel__banner--error {
-  border-color: var(--dg-danger);
-  border-inline-start: medium solid var(--dg-danger);
-}
-
-.dg-panel__banner--error .dg-icon {
-  color: var(--dg-danger);
 }

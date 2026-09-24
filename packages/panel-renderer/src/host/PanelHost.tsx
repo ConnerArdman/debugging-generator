@@ -13,10 +13,13 @@
  * 1. Mounts the theme root (`../layout/PanelShell`), which is the one module in
  *    the package that writes the theme attribute and the one scroll region a
  *    panel has.
- * 2. Provides the two ambient contracts — the data provider and the action
- *    contract — around the whole subtree, so that every view beneath it reaches
- *    its evidence and reports its interactions without either being threaded
- *    through each intervening layer (AAP 0.6.2).
+ * 2. Provides the ambient contracts — the data provider, the session the
+ *    specification belongs to, and the action contract — around the whole
+ *    subtree, so that every view beneath it reaches its evidence and reports its
+ *    interactions without any of them being threaded through each intervening
+ *    layer (AAP 0.6.2). The session is `spec.sessionId`, the document's own
+ *    statement of which capture it describes; every query a view makes is
+ *    addressed to it (`POST /sessions/:id/panel-data`, AAP 0.4.2).
  * 3. Renders the head (`../layout/SummaryHeader`), which is where the
  *    observed/inferred separation lives.
  * 4. Renders the layout, node by node, through `./NodeRenderer`.
@@ -52,6 +55,18 @@
  * rendering every view beneath it, because a deterministic summary of a real
  * capture is worth reading (AAP 0.5.5).
  *
+ * **It does not re-render what did not change.** A host surface re-renders this
+ * component for reasons that have nothing to do with the panel — a selection in
+ * its details drawer, a connection pill, a fresh `actions` object built from the
+ * same callbacks — and a panel is a dozen tables and SVG views deep. So the
+ * action context is rebuilt only when one of its callbacks changes identity,
+ * the head only when the title, the summary or its two callbacks change, and
+ * the rendered layout only when `spec.layout` itself is a different value. The
+ * data and session contexts carry values that are already stable (the injected
+ * provider, and a string). A replaced specification still re-renders exactly
+ * what it replaced: every memo below is keyed on the document's own objects,
+ * never on an id that a regenerated panel could share with its predecessor.
+ *
  * ## Class names
  *
  * `dg-panel` is the block, with `dg-panel__banner`/`--fallback` for the notice,
@@ -69,14 +84,16 @@
 
 import type { PanelSpec } from '@debuggen/panel-schema';
 import { LayoutTemplate, TriangleAlert } from 'lucide-react';
-import type { ReactElement } from 'react';
+import { useMemo } from 'react';
+import type { ReactElement, ReactNode } from 'react';
 
 import { PanelShell } from '../layout/PanelShell';
 import { SummaryHeader } from '../layout/SummaryHeader';
 import { EmptyState } from '../primitives/EmptyState';
+import type { HeadingLevel } from '../primitives/Heading';
 import { Text } from '../primitives/Text';
 import type { PanelTheme } from '../tokens/theme';
-import { DataProviderContext } from './DataProvider';
+import { DataProviderContext, PanelSessionContext } from './DataProvider';
 import type { DataProvider } from './DataProvider';
 import { renderPanelNodes } from './NodeRenderer';
 import { PanelActionsContext } from './PanelActions';
@@ -142,6 +159,33 @@ const EMPTY_LAYOUT_MESSAGE = 'This panel specifies no views, so the summary abov
 
 /*
  * ---------------------------------------------------------------------------
+ * Outline levels
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * The level of the panel's own title: **2**, the summary head's documented
+ * default, stated here so the relationship with the layout below is written in
+ * one file rather than inferred across two. A surface's own chrome — a product
+ * wordmark, an editor view title — sits above it.
+ */
+const PANEL_TITLE_HEADING_LEVEL: HeadingLevel = 2;
+
+/**
+ * The level the layout's top-level nodes render their headings at: **3**, one
+ * below {@link PANEL_TITLE_HEADING_LEVEL}.
+ *
+ * A panel's sections are parts of the panel, so their headings belong under its
+ * title — beside the head's own "Observed" and "Likely cause" regions, which sit
+ * at the same depth — and never beside it. `./NodeRenderer` hands this level to
+ * every top-level node, container or labelled leaf, and one level deeper to the
+ * children of each container whose title it renders, so the whole outline below
+ * the title follows from this one value without a skipped or repeated level.
+ */
+const LAYOUT_HEADING_LEVEL: HeadingLevel = 3;
+
+/*
+ * ---------------------------------------------------------------------------
  * The fallback notice
  * ---------------------------------------------------------------------------
  */
@@ -187,10 +231,11 @@ function renderFallbackBanner(): ReactElement {
 /**
  * The inputs of one rendered panel.
  *
- * Three required members and three conveniences. The document, the data
- * contract and the action contract are the whole of what a panel needs: the
- * provider and the actions are *injected* rather than constructed here, which
- * is the boundary that keeps this tier free of any transport (AAP 0.1.2).
+ * Three required members and three conveniences. The document (which names its
+ * own session), the data contract and the action contract are the whole of what
+ * a panel needs: the provider and the actions are *injected* rather than
+ * constructed here, which is the boundary that keeps this tier free of any
+ * transport (AAP 0.1.2).
  *
  * Every optional member spells `| undefined` explicitly, because
  * `exactOptionalPropertyTypes` is in force repository-wide and a host
@@ -207,18 +252,20 @@ export interface PanelHostProps {
    * The validated, normalized panel to draw.
    *
    * Read only — see this module's header on what this component does not do
-   * with it. `spec.meta?.fallback === true` is the one field it branches on.
+   * with it. `spec.meta?.fallback === true` is the one field it branches on,
+   * and `spec.sessionId` is the session every query beneath it is addressed to.
    */
   spec: PanelSpec;
 
   /**
    * How every view beneath this panel resolves the `DataQuery` its node
-   * carries.
+   * carries, for the session named by `spec.sessionId`.
    *
    * Provided as context, so the reference must be **stable** across renders:
    * it is part of the query effect's dependencies in `./useQuery`, and a
-   * provider rebuilt per render would refetch every node forever. Create one
-   * per session and keep it.
+   * provider rebuilt per render would refetch every node forever. The session
+   * travels on each call rather than inside the provider, so one provider per
+   * host surface serves every session it shows.
    */
   dataProvider: DataProvider;
 
@@ -227,8 +274,10 @@ export interface PanelHostProps {
    * the project, and the two optional disclosure and filter reports.
    *
    * Provided as context for the views, and wired directly into the head's two
-   * plain callbacks (see {@link PanelHost}). Stable for the same reason as
-   * {@link PanelHostProps.dataProvider}.
+   * plain callbacks (see {@link PanelHost}). The context value is keyed on the
+   * four callbacks' identities rather than on this object's, so a host may pass
+   * a freshly built object on every render without re-rendering a view — as
+   * long as the callbacks inside it are stable.
    */
   actions: PanelActions;
 
@@ -258,14 +307,20 @@ export interface PanelHostProps {
 /**
  * Renders a validated panel specification.
  *
- * The theme root, the two ambient contracts, the fallback notice when the
+ * The theme root, the three ambient contracts, the fallback notice when the
  * document carries one, the head, and the layout — in that order and nothing
- * else. Pure and presentational: no state, no effect, no hook, no memoization,
- * nothing read from the document while rendering, and no write to the
- * specification.
+ * else. Presentational: no state, no effect, no write to the specification.
+ * Its only hooks are the three memos described in this module's header, which
+ * keep an unrelated host render from reaching the views.
  *
- * Three details are decisions rather than mechanics:
+ * Four details are decisions rather than mechanics:
  *
+ * - **Queries are addressed to the document's own session.** The session
+ *   context carries `spec.sessionId` and nothing else: not a session the host
+ *   surface happens to have selected, and not one remembered by the provider.
+ *   A reopened session's panel therefore reads its own capture even while the
+ *   surface is bound to a newer one, and a panel for another session re-resolves
+ *   every view the moment it is swapped in.
  * - **The head's callbacks are wired, not re-implemented.** `../layout/SummaryHeader`
  *   imports nothing from this folder by design, so it declares two plain
  *   callbacks over the schema's own citation and location types; they are
@@ -273,13 +328,11 @@ export interface PanelHostProps {
  *   rather than wrapping them keeps the guarantee that matters at the far end
  *   of the click-to-source chain: what a hypothesis suggested is what the host
  *   receives, field for field (AAP 0.4.2).
- * - **The layout renders at the node tier's own outline level.** No
- *   `headingLevel` is passed to `./NodeRenderer`: a container node's heading
- *   comes from the layout primitive the registry selects, at that primitive's
- *   own level, and the recursion steps one level deeper per labelled container
- *   from there. Overriding the top level here would leave a container's title
- *   where it is and push its children one level further, which is how an
- *   outline acquires a skipped heading level.
+ * - **The outline is stated once, here.** The title renders at
+ *   {@link PANEL_TITLE_HEADING_LEVEL} and the layout's top-level nodes one level
+ *   below it, at {@link LAYOUT_HEADING_LEVEL}; `./NodeRenderer` carries the level
+ *   down, one step per titled container, into every container's own heading as
+ *   well as every labelled leaf's.
  * - **An empty layout is a state, not a gap.** A validated specification may
  *   carry no views, so the body renders the library's empty state with a
  *   neutral sentence — never a blank area, and never an error, which is what a
@@ -292,7 +345,7 @@ export interface PanelHostProps {
  * ```tsx
  * <PanelHost
  *   spec={currentPanel}
- *   dataProvider={sessionDataProvider}
+ *   dataProvider={surfaceDataProvider}
  *   actions={hostActions}
  *   theme={resolvedTheme}
  * />
@@ -300,45 +353,79 @@ export interface PanelHostProps {
  */
 export function PanelHost(props: PanelHostProps): ReactElement {
   const { spec, dataProvider, actions, theme, className, id } = props;
+  const { sessionId, title, summary, layout } = spec;
+  const { onSelectEvent, onOpenSource, onExpand, onFilterChange } = actions;
+
+  // The action context, keyed on the four callbacks rather than on the object
+  // that carried them. A host that rebuilds `actions` on every render from
+  // stable callbacks — the natural way to write it — then changes nothing any
+  // view reads, and a host that genuinely swaps a callback still reaches every
+  // consumer. Members are copied, never wrapped, so what a view reports is what
+  // the host receives (AAP 0.4.2).
+  const actionsValue = useMemo<PanelActions>(
+    () => ({ onSelectEvent, onOpenSource, onExpand, onFilterChange }),
+    [onSelectEvent, onOpenSource, onExpand, onFilterChange],
+  );
+
+  // The head, re-rendered only when what it draws or what it reports to has
+  // changed. Its two callbacks are the same members the action context holds.
+  const head = useMemo<ReactElement>(
+    () => (
+      <SummaryHeader
+        title={title}
+        summary={summary}
+        headingLevel={PANEL_TITLE_HEADING_LEVEL}
+        onSelectEvent={onSelectEvent}
+        onOpenSource={onOpenSource}
+        className={SUMMARY_CLASS}
+      />
+    ),
+    [title, summary, onSelectEvent, onOpenSource],
+  );
+
+  // The layout, rendered once per `spec.layout` value. Handing React the very
+  // same element objects on a later render is what lets it skip every node
+  // beneath: nothing a host render changes reaches a table or an SVG view
+  // unless it changed a context that view reads. A new specification brings a
+  // new `layout` array, so a replaced panel is always re-rendered in full.
+  const body = useMemo<ReactNode>(
+    () =>
+      layout.length > 0 ? (
+        renderPanelNodes(layout, { headingLevel: LAYOUT_HEADING_LEVEL })
+      ) : (
+        <EmptyState
+          message={EMPTY_LAYOUT_MESSAGE}
+          icon={<LayoutTemplate className={ICON_CLASS} />}
+        />
+      ),
+    [layout],
+  );
 
   return (
     <PanelShell theme={theme} className={className} id={id}>
-      {/* Both contracts wrap the head as well as the layout. The head is handed
-          its two callbacks directly, because it imports nothing from this
-          folder, but a component it composes still reads the ambient pair — and
-          a tree where only part of the panel can reach the host is the harder
-          failure to notice. The values are the props themselves: no object is
-          built here, so nothing beneath re-renders for an identity this
-          component invented. */}
+      {/* All three contracts wrap the head as well as the layout. The head is
+          handed its two callbacks directly, because it imports nothing from
+          this folder, but a component it composes still reads the ambient
+          contracts — and a tree where only part of the panel can reach the host
+          is the harder failure to notice. Each value is stable for as long as
+          what it stands for is: the injected provider, the document's session
+          string, and the memoized action members. */}
       <DataProviderContext.Provider value={dataProvider}>
-        <PanelActionsContext.Provider value={actions}>
-          <div className={PANEL_CLASS}>
-            {/* Above the summary, so the provenance of what follows is read
-                first. The explicit `=== true` is the reading `PanelMeta`
-                prescribes: the flag is absent on an ordinary generated panel
-                and is never defaulted on parse. */}
-            {spec.meta?.fallback === true ? renderFallbackBanner() : null}
+        <PanelSessionContext.Provider value={sessionId}>
+          <PanelActionsContext.Provider value={actionsValue}>
+            <div className={PANEL_CLASS}>
+              {/* Above the summary, so the provenance of what follows is read
+                  first. The explicit `=== true` is the reading `PanelMeta`
+                  prescribes: the flag is absent on an ordinary generated panel
+                  and is never defaulted on parse. */}
+              {spec.meta?.fallback === true ? renderFallbackBanner() : null}
 
-            <SummaryHeader
-              title={spec.title}
-              summary={spec.summary}
-              onSelectEvent={actions.onSelectEvent}
-              onOpenSource={actions.onOpenSource}
-              className={SUMMARY_CLASS}
-            />
+              {head}
 
-            <div className={BODY_CLASS}>
-              {spec.layout.length > 0 ? (
-                renderPanelNodes(spec.layout)
-              ) : (
-                <EmptyState
-                  message={EMPTY_LAYOUT_MESSAGE}
-                  icon={<LayoutTemplate className={ICON_CLASS} />}
-                />
-              )}
+              <div className={BODY_CLASS}>{body}</div>
             </div>
-          </div>
-        </PanelActionsContext.Provider>
+          </PanelActionsContext.Provider>
+        </PanelSessionContext.Provider>
       </DataProviderContext.Provider>
     </PanelShell>
   );

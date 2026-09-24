@@ -1615,15 +1615,6 @@ export const DEFAULT_GRAPH_COLUMN_GAP = 56;
 export const DEFAULT_GRAPH_ROW_GAP = 16;
 
 /**
- * The hard cap on layering passes: 256.
- *
- * {@link assignGraphLayers} relaxes layer indices until they stop changing,
- * which terminates on its own for a graph without cycles. This cap is what
- * makes it terminate for a graph *with* one.
- */
-export const MAX_GRAPH_LAYERING_PASSES = 256;
-
-/**
  * The coordinate range this module will serialise into path data: ±1 000 000.
  *
  * A guard on {@link edgePathData}: a coordinate beyond this would be written in
@@ -1756,8 +1747,8 @@ export interface DependencyGraphLayout {
   /** The tallest column's participant count — what sets the canvas height. */
   readonly maxNodesPerLayer: number;
   /**
-   * Whether the layer indices were computed here rather than read from the
-   * input.
+   * Whether the layer indices were computed rather than read from the input:
+   * the {@link GraphLayering.computed} flag of the layering the layout used.
    *
    * `true` means at least one participant carried no usable layer, so the whole
    * layering was recomputed by {@link assignGraphLayers} to keep the columns
@@ -1960,12 +1951,126 @@ export function edgePathData(curve: EdgeCurve): string {
   return `${move} C ${control} ${inbound} ${destination}`;
 }
 
+/** The discovery order of a participant the component search has not reached yet. */
+const UNVISITED = -1;
+
+/**
+ * One group of participants that call one another in a cycle — a strongly
+ * connected component — as a vertex of the acyclic graph the components form.
+ */
+interface LayeringComponent {
+  /** The components this one calls; a repeated relationship is listed again. */
+  readonly successors: LayeringComponent[];
+  /** How many listed relationships into this component are not yet placed. */
+  inDegree: number;
+  /** Its column: the longest path to it from a component nothing calls. */
+  layer: number;
+}
+
+/** One participant's bookkeeping in {@link assignGraphLayers}. */
+interface LayeringVertex {
+  /** The participant id this vertex stands for. */
+  readonly id: string;
+  /** The participants it calls, self-references and unknown endpoints excluded. */
+  readonly successors: LayeringVertex[];
+  /** Its depth-first discovery order; {@link UNVISITED} until reached. */
+  order: number;
+  /** The smallest discovery order reachable from it while its component is open. */
+  lowLink: number;
+  /** Whether it is on the open-component stack. */
+  onStack: boolean;
+  /** The component it closed into; `undefined` until the search closes it. */
+  component: LayeringComponent | undefined;
+}
+
+/** One frame of the explicit depth-first call stack: a vertex and its next successor. */
+interface LayeringFrame {
+  /** The vertex being expanded. */
+  readonly vertex: LayeringVertex;
+  /** The index of the next successor to examine. */
+  next: number;
+}
+
+/**
+ * Tarjan's strongly-connected-component search, iteratively.
+ *
+ * The call stack is an array rather than the JavaScript stack, so a chain of
+ * any length — a pathological payload of a hundred thousand participants, say —
+ * costs memory proportional to its length and never a `RangeError`. Each vertex
+ * is entered once and each successor examined once, so the search is O(V+E).
+ * Every vertex leaves with its {@link LayeringVertex.component} set; the
+ * components are returned in the order they closed, which the caller does not
+ * rely on.
+ */
+function closeComponents(vertices: readonly LayeringVertex[]): LayeringComponent[] {
+  const components: LayeringComponent[] = [];
+  const open: LayeringVertex[] = [];
+  const callStack: LayeringFrame[] = [];
+  let discovered = 0;
+
+  const enter = (vertex: LayeringVertex): void => {
+    vertex.order = discovered;
+    vertex.lowLink = discovered;
+    discovered += 1;
+    vertex.onStack = true;
+    open.push(vertex);
+    callStack.push({ vertex, next: 0 });
+  };
+
+  for (const root of vertices) {
+    if (root.order !== UNVISITED) {
+      continue;
+    }
+    enter(root);
+
+    for (let frame = callStack.at(-1); frame !== undefined; frame = callStack.at(-1)) {
+      const { vertex } = frame;
+      const successor = vertex.successors[frame.next];
+
+      if (successor !== undefined) {
+        frame.next += 1;
+        if (successor.order === UNVISITED) {
+          enter(successor);
+        } else if (successor.onStack) {
+          vertex.lowLink = Math.min(vertex.lowLink, successor.order);
+        }
+        continue;
+      }
+
+      // Every successor examined: the frame returns to its caller, carrying
+      // the lowest order it reached, exactly as the recursive form would.
+      callStack.pop();
+      const caller = callStack.at(-1);
+      if (caller !== undefined) {
+        caller.vertex.lowLink = Math.min(caller.vertex.lowLink, vertex.lowLink);
+      }
+
+      if (vertex.lowLink !== vertex.order) {
+        continue;
+      }
+
+      // A component root: it and everything opened after it form one component.
+      const component: LayeringComponent = { successors: [], inDegree: 0, layer: 0 };
+      components.push(component);
+      for (let member = open.pop(); member !== undefined; member = open.pop()) {
+        member.onStack = false;
+        member.component = component;
+        if (member === vertex) {
+          break;
+        }
+      }
+    }
+  }
+
+  return components;
+}
+
 /**
  * Computes a column for every participant: the longest path from a participant
- * nothing calls.
+ * nothing calls, with the members of a cycle sharing one column.
  *
  * The **fallback** layering. A graph built upstream already carries a layer per
- * participant, and {@link layoutDependencyGraph} uses those when it can; this
+ * participant, and {@link resolveGraphLayering} uses those when it can; this
  * exists for the case the shape allows — a participant contributed by static
  * analysis, with no layer of its own — and is exported so a caller assembling a
  * graph by hand has the same rule available.
@@ -1974,64 +2079,178 @@ export function edgePathData(curve: EdgeCurve): string {
  * and nothing else. It reads `id`, `from` and `to`, and ignores every other
  * field.
  *
- * ## Termination, and what a cycle does
+ * ## One linear pass, and what a cycle does
  *
- * Layers start at `0` and relax — a callee sits at least one column right of
- * its caller — until nothing changes. Two bounds make that terminate for any
- * input: a layer index never exceeds `nodes.length - 1` (no acyclic path can be
- * longer than that, so the cap costs a well-formed graph nothing), and the
- * relaxation runs at most {@link MAX_GRAPH_LAYERING_PASSES} times. A cyclic
- * dependency therefore pushes its members rightward until the cap stops them
- * and the layout stays finite and drawable, with the cycle's edges reported as
- * `backward` by {@link edgeAnchors}. A self-referential edge is ignored, since
- * no participant can sit to the right of itself.
+ * O(V+E) for any input, in three steps that each visit every participant and
+ * every relationship once:
  *
- * An edge naming a participant the graph does not contain is ignored here and
- * counted by {@link layoutDependencyGraph}.
+ *   1. **Components.** An iterative Tarjan search ({@link closeComponents})
+ *      groups the participants that reach one another — the members of a cycle
+ *      — into one strongly connected component. A cycle has no longest path, so
+ *      its members cannot be ordered against each other, and they share a
+ *      column rather than being pushed apart by a guess. The cycle's edges then
+ *      stay legible as `vertical` connectors from {@link edgeAnchors}.
+ *   2. **Condensation.** The components form an acyclic graph: one relationship
+ *      per relationship between two different components.
+ *   3. **Longest path.** Kahn's topological order over that acyclic graph, with
+ *      each component placed one column right of the furthest component that
+ *      calls it (`layer = max(caller layer + 1)`), so a participant always sits
+ *      to the right of everything that calls it from outside its own cycle.
+ *
+ * No step iterates to a fixed point, so nothing needs a pass cap, and a chain
+ * of any length is laid out in full: participant `i` of a chain lands in
+ * column `i` whatever order its relationships arrived in.
+ *
+ * ## Deterministic for any permutation
+ *
+ * Both the partition into components and each component's longest path are
+ * properties of the graph, not of the order the arrays list it in, so the same
+ * participants and relationships in any order produce the same column for
+ * every id. A repeated participant id is one participant — the first
+ * occurrence stands for it — a self-referential edge is ignored, since no
+ * participant can sit to the right of itself, and an edge naming a participant
+ * the graph does not contain is ignored here and counted by
+ * {@link layoutDependencyGraph}.
  *
  * @param nodes The participants; only their `id` is read.
  * @param edges The relationships; only `from` and `to` are read.
- * @returns A layer index per participant id, `0` or more.
+ * @returns A layer index per participant id, `0` or more and at most one less
+ * than the number of distinct ids.
  */
 export function assignGraphLayers(
   nodes: readonly DependencyGraphNode[],
   edges: readonly DependencyGraphEdge[],
 ): ReadonlyMap<string, number> {
-  const layers = new Map<string, number>();
+  const vertices: LayeringVertex[] = [];
+  const vertexById = new Map<string, LayeringVertex>();
+
   for (const node of nodes) {
-    layers.set(node.id, 0);
+    if (vertexById.has(node.id)) {
+      continue;
+    }
+    const vertex: LayeringVertex = {
+      id: node.id,
+      successors: [],
+      order: UNVISITED,
+      lowLink: UNVISITED,
+      onStack: false,
+      component: undefined,
+    };
+    vertices.push(vertex);
+    vertexById.set(node.id, vertex);
   }
 
-  const maxLayer = Math.max(layers.size - 1, 0);
-  const passes = Math.min(Math.max(layers.size, 1), MAX_GRAPH_LAYERING_PASSES);
+  for (const edge of edges) {
+    const from = vertexById.get(edge.from);
+    const to = vertexById.get(edge.to);
+    if (from === undefined || to === undefined || from === to) {
+      continue;
+    }
+    from.successors.push(to);
+  }
 
-  for (let pass = 0; pass < passes; pass += 1) {
-    let changed = false;
+  const components = closeComponents(vertices);
 
-    for (const edge of edges) {
-      if (edge.from === edge.to) {
+  for (const vertex of vertices) {
+    const from = vertex.component;
+    for (const successor of vertex.successors) {
+      const to = successor.component;
+      if (from === undefined || to === undefined || from === to) {
         continue;
       }
+      from.successors.push(to);
+      to.inDegree += 1;
+    }
+  }
 
-      const fromLayer = layers.get(edge.from);
-      const toLayer = layers.get(edge.to);
-      if (fromLayer === undefined || toLayer === undefined) {
-        continue;
-      }
-
-      const candidate = Math.min(fromLayer + 1, maxLayer);
-      if (candidate > toLayer) {
-        layers.set(edge.to, candidate);
-        changed = true;
+  // Kahn's order: a component is placed only once every component calling it
+  // has been, so its longest path is final when its callees are relaxed.
+  const ready = components.filter((component) => component.inDegree === 0);
+  for (let cursor = 0; cursor < ready.length; cursor += 1) {
+    const component = ready[cursor];
+    if (component === undefined) {
+      continue;
+    }
+    for (const successor of component.successors) {
+      successor.layer = Math.max(successor.layer, component.layer + 1);
+      successor.inDegree -= 1;
+      if (successor.inDegree === 0) {
+        ready.push(successor);
       }
     }
+  }
 
-    if (!changed) {
-      break;
-    }
+  const layers = new Map<string, number>();
+  for (const vertex of vertices) {
+    layers.set(vertex.id, vertex.component?.layer ?? 0);
   }
 
   return layers;
+}
+
+/**
+ * The columns of a layered graph, and where they came from.
+ *
+ * The one layering a view computes for a payload and then hands to everything
+ * that needs it — the view's own canonical ordering and
+ * {@link layoutDependencyGraph} — so the expensive half of the layout runs once
+ * per payload and the ordering and the geometry can never disagree.
+ */
+export interface GraphLayering {
+  /** A column per participant id, `0` or more. */
+  readonly layers: ReadonlyMap<string, number>;
+  /**
+   * `true` when the columns were computed from the relationships by
+   * {@link assignGraphLayers}; `false` when they were read from the payload's
+   * own `layer` indices.
+   */
+  readonly computed: boolean;
+}
+
+/** Whether a payload's layer index can be used as a column. */
+function isPlacedLayer(layer: number | undefined): layer is number {
+  return typeof layer === 'number' && Number.isInteger(layer) && layer >= 0;
+}
+
+/**
+ * The layering of a graph: the payload's own when it is complete, a computed
+ * one otherwise.
+ *
+ * The payload's layer indices are used when **every** participant carries a
+ * usable one — a non-negative integer — because they are the upstream
+ * longest-path assignment and nothing here improves on them. When any
+ * participant does not, the whole layering is computed with
+ * {@link assignGraphLayers}. It is all or nothing on purpose: mixing a provided
+ * index with a computed one would place two participants in one column by
+ * coincidence rather than by a rule. A repeated participant id takes the column
+ * of its first occurrence on either route, which is also the box its
+ * relationships anchor on.
+ *
+ * Call it once per payload and pass the result to
+ * {@link layoutDependencyGraph}; that is what keeps the layering from running
+ * twice.
+ *
+ * @param nodes The participants; only `id` and `layer` are read.
+ * @param edges The relationships; only `from` and `to` are read, and only when
+ * the layering has to be computed.
+ * @returns The columns, and whether they were computed.
+ */
+export function resolveGraphLayering(
+  nodes: readonly DependencyGraphNode[],
+  edges: readonly DependencyGraphEdge[],
+): GraphLayering {
+  if (!nodes.every((node) => isPlacedLayer(node.layer))) {
+    return { layers: assignGraphLayers(nodes, edges), computed: true };
+  }
+
+  const layers = new Map<string, number>();
+  for (const node of nodes) {
+    if (!layers.has(node.id) && isPlacedLayer(node.layer)) {
+      layers.set(node.id, node.layer);
+    }
+  }
+
+  return { layers, computed: false };
 }
 
 /**
@@ -2044,13 +2263,19 @@ export function assignGraphLayers(
  *
  * ## Where the columns come from
  *
- * The input's own layer indices, when **every** participant carries a usable
- * one: they are the upstream longest-path assignment and nothing here improves
- * on them. When any participant does not, the whole layering is recomputed with
- * {@link assignGraphLayers} and {@link DependencyGraphLayout.layersComputed} says
- * so. It is all or nothing on purpose — mixing a provided index with a computed
- * one would place two participants in one column by coincidence rather than by
- * a rule.
+ * From `layering` when the caller supplies one, verbatim and without a second
+ * look: a view that already resolved the layering to order its participants
+ * passes that same object here, so the layering runs once per payload rather
+ * than once for the ordering and again for the geometry.
+ * {@link DependencyGraphLayout.layersComputed} is then that layering's
+ * `computed` flag. A supplied layering **must** have been computed from the
+ * same participants and relationships as `data` — in any order, since
+ * {@link resolveGraphLayering} is permutation-independent — or the columns
+ * describe some other graph.
+ *
+ * Without one, this calls {@link resolveGraphLayering} itself: the input's own
+ * layer indices when **every** participant carries a usable one, and otherwise a
+ * layering computed from the relationships for all of them.
  *
  * ## Degenerate inputs
  *
@@ -2059,19 +2284,21 @@ export function assignGraphLayers(
  * omitted and counted in
  * {@link DependencyGraphLayout.droppedEdgeCount}. A negative, fractional or
  * non-finite layer index is treated as absent, which triggers the recomputation
- * rather than placing a box off-canvas.
+ * rather than placing a box off-canvas, and a participant a supplied layering
+ * has no usable column for is placed in column `0`.
  *
  * @param data The graph, read and never mutated.
  * @param options Rhythm overrides.
+ * @param layering The layering already resolved for `data`, when the caller has
+ * one; see above.
  */
 export function layoutDependencyGraph(
   data: DependencyGraphData,
   options?: GraphLayoutOptions,
+  layering?: GraphLayering,
 ): DependencyGraphLayout {
-  const layersComputed = data.nodes.some(
-    (node) => !(typeof node.layer === 'number' && Number.isInteger(node.layer) && node.layer >= 0),
-  );
-  const computedLayers = layersComputed ? assignGraphLayers(data.nodes, data.edges) : undefined;
+  const { layers, computed: layersComputed } =
+    layering ?? resolveGraphLayering(data.nodes, data.edges);
 
   const nodes: PositionedGraphNode[] = [];
   const boxes = new Map<string, GraphNodeBox>();
@@ -2080,7 +2307,7 @@ export function layoutDependencyGraph(
   let maxNodesPerLayer = 0;
 
   for (const node of data.nodes) {
-    const layer = asNonNegativeInt(computedLayers?.get(node.id) ?? node.layer, 0);
+    const layer = asNonNegativeInt(layers.get(node.id), 0);
     const indexInLayer = filled.get(layer) ?? 0;
     filled.set(layer, indexInLayer + 1);
     maxLayerSeen = Math.max(maxLayerSeen, layer);

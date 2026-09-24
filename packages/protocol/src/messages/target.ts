@@ -140,7 +140,7 @@
 
 import { z } from 'zod';
 
-import { selectedTargetSchema } from '@debuggen/instrumentation';
+import { selectedTargetSchema } from '@debuggen/instrumentation/schema';
 import { err, ok } from '@debuggen/shared';
 import type { DebuggenError, Result } from '@debuggen/shared';
 

@@ -94,6 +94,16 @@
  * check redirects everything that follows. Pinning removes the re-resolution
  * rather than repeating the check.
  *
+ * ## Inspected files, for a state file another writer opens
+ *
+ * {@link inspectPrivateFileNoFollow} judges a state file this module does not
+ * write — the session store, which `node:sqlite` opens by path — with `lstat`
+ * alone: a link, a non-regular entry, a foreign owner or a second hard link is
+ * refused, and the inode identity is returned so the caller can prove with
+ * {@link isSameFileIdentity} that what it opened is what was judged. It never
+ * opens a descriptor, because closing one would release the POSIX locks a live
+ * database connection in the same process holds on that inode.
+ *
  * ## POSIX scope
  *
  * `O_NOFOLLOW` and the owner and permission-bit checks are POSIX concepts.
@@ -235,22 +245,35 @@ const MAX_ECHOED_NAME_LENGTH = 64;
  * Why this module refused a path, recorded as `details.reason` on the error so
  * a caller can branch or report without parsing a message.
  *
- * Module-internal: the public surface is the eight exports above and below, and
- * every refusal they raise carries the single error code `FS_UNSAFE_PATH`. The
+ * Module-internal: the public surface is the exports above and below, and every
+ * refusal they raise carries the single error code `FS_UNSAFE_PATH`. The
  * reason is the finer diagnosis underneath it.
  *
- * - `symlink-component` — a component of the chain is a symbolic link. It is
- *   refused instead of resolved, because what it points at today is not what it
- *   will point at between the check and the write.
+ * - `symlink-component` — a component of the chain, or the state file itself,
+ *   is a symbolic link. It is refused instead of resolved, because what it
+ *   points at today is not what it will point at between the check and the
+ *   write.
  * - `not-a-directory` — a component exists but is not a directory, so the
  *   chain it is supposed to anchor cannot exist as described.
- * - `foreign-owner` — a component is owned by another account, which can
- *   therefore replace anything inside it.
+ * - `not-a-regular-file` — a state file's path holds something other than a
+ *   regular file (a directory, a FIFO, a device, a socket), which no writer of
+ *   state can use and which opening could block on or trigger side effects of.
+ * - `foreign-owner` — a component or a state file is owned by another account,
+ *   which can therefore replace or read it whatever its mode says.
  * - `group-or-other-permissions` — a component grants group or other access, so
  *   another account can read the credential or backup written beneath it.
+ * - `multiply-linked` — a state file has more than one hard link, so the same
+ *   inode is also reachable through a path outside the private tree. The
+ *   product never hard-links its own state files, so a second link was made by
+ *   something else.
  */
 type UnsafePathReason =
-  'symlink-component' | 'not-a-directory' | 'foreign-owner' | 'group-or-other-permissions';
+  | 'symlink-component'
+  | 'not-a-directory'
+  | 'not-a-regular-file'
+  | 'foreign-owner'
+  | 'group-or-other-permissions'
+  | 'multiply-linked';
 
 /**
  * The `O_NOFOLLOW` flag, or `0` where the platform has no such flag.
@@ -354,18 +377,22 @@ function refuseSymlinkComponent(componentAbs: string, consequence: string): neve
  * @param componentAbs The component being judged.
  * @param ownerUid The uid `lstat` reported for it.
  * @param expectedUid This process's own uid.
+ * @param hint The developer's next action. Defaults to the directory wording
+ * every chain refusal uses; {@link inspectPrivateFileNoFollow} passes the
+ * file wording, so the same refusal names the right kind of entry to replace.
  */
 function assertOwnedByThisAccount(
   componentAbs: string,
   ownerUid: number,
   expectedUid: number,
+  hint = 'Use a directory owned by the account running this tool.',
 ): void {
   if (ownerUid !== expectedUid) {
     throw unsafePath(
       `'${componentAbs}' is owned by another account, so its contents cannot be kept private.`,
       'foreign-owner',
       componentAbs,
-      'Use a directory owned by the account running this tool.',
+      hint,
       { owner: ownerUid, expectedOwner: expectedUid },
     );
   }
@@ -1589,6 +1616,183 @@ function refuseAsLoop(pathAbs: string): Error & { code: string } {
     new Error(`ELOOP: not a regular file, or a symbolic link, at '${pathAbs}'`),
     { code: 'ELOOP' },
   );
+}
+
+/**
+ * What {@link inspectPrivateFileNoFollow} established about an existing state
+ * file: which inode the path named, and the permission bits it carried.
+ */
+export interface PrivateFileState {
+  /**
+   * The device and inode the path named at the instant it was inspected. Compare
+   * a later inspection with {@link isSameFileIdentity} to prove that the entry
+   * acted on in between is still the one that was judged.
+   */
+  readonly identity: FileIdentity;
+
+  /**
+   * The permission bits (`mode & 0o777`), with the file-type and set-id bits
+   * masked off.
+   *
+   * Reported rather than judged: a mode is the one property of a state file a
+   * caller can *repair*, so deciding whether to tighten it is the caller's
+   * policy. Everything this function refuses is a property no repair can fix.
+   */
+  readonly mode: number;
+}
+
+/**
+ * Inspects an existing file in the product's own state directory without ever
+ * following, opening or modifying it, and refuses anything that is not a
+ * regular, single-link file owned by this account.
+ *
+ * This is the counterpart of {@link createFileExclusive} for a state file that
+ * some *other* writer opens by path — the session store is the case in point:
+ * `node:sqlite` opens `sessions.sqlite` and its `-wal`, `-shm` and `-journal`
+ * sidecars itself, following a symbolic link at the final component, so the
+ * only defence is to prove what each path names before that writer reaches it,
+ * and again afterwards.
+ *
+ * ## Refusals, in the order they are tested
+ *
+ * All are `FS_UNSAFE_PATH`, with the reason in `details.reason`:
+ *
+ * 1. `symlink-component` — the path itself is a symbolic link, dangling or not.
+ *    Tested first, so a link to a perfectly private file is reported as a link.
+ * 2. `not-a-regular-file` — a directory, FIFO, socket or device.
+ * 3. `foreign-owner` — owned by another account, which can read or replace it
+ *    whatever its mode says. Skipped where `process.getuid` is absent.
+ * 4. `multiply-linked` — more than one hard link: the inode is shared with a
+ *    path that may lie outside the private tree, so whatever is written here is
+ *    readable there. The product never hard-links a state file of its own.
+ *
+ * ## Why no descriptor is ever opened
+ *
+ * `lstat` answers every question above and takes nothing out of the file, and
+ * that is a requirement rather than a preference:
+ *
+ * - **POSIX advisory locks.** Closing *any* descriptor a process holds on an
+ *   inode releases every `fcntl` lock that process holds on it. SQLite keeps its
+ *   database and `-shm` locks for the connection's lifetime, so a verifying
+ *   `open`/`close` pair in the same process silently drops them and invites
+ *   exactly the corruption SQLite documents ("How To Corrupt An SQLite Database
+ *   File", §2.2). An inspector that never opens is safe to call on a file a live
+ *   connection holds.
+ * - **Opening has side effects.** Opening a FIFO blocks until a writer appears,
+ *   and opening a device can act on it; `lstat` does neither.
+ *
+ * ## What a successful return means
+ *
+ * A statement about an instant. The parent directory is expected to have been
+ * verified private and owned already ({@link ensureSecureDir}), which is what
+ * stops another account from replacing the entry between this inspection and
+ * the caller's next step; a caller that must act on the *same* file inspects
+ * again afterwards and compares identities with {@link isSameFileIdentity}.
+ *
+ * Off POSIX the owner test is skipped, as it is everywhere in this module; the
+ * link, type and link-count tests apply on every platform.
+ *
+ * @param path The state file to inspect. Resolved against the process's working
+ * directory when relative.
+ * @returns Its identity and permission bits, or `undefined` when nothing is at
+ * that path.
+ * @throws {DebuggenError} With code `FS_UNSAFE_PATH` for any refusal above;
+ * `details` carries the absolute path and the reason, plus the owner or link
+ * count when that is the point of the refusal.
+ * @throws The runtime's own filesystem error, with its `code` intact, for any
+ * failure other than `ENOENT`: `ENOTDIR` when a parent is a file, `EACCES` when
+ * the path cannot be reached.
+ *
+ * @example
+ * ```ts
+ * const before = inspectPrivateFileNoFollow(databasePath);
+ * if (before !== undefined && (before.mode & 0o077) !== 0) {
+ *   chmodSync(databasePath, SECURE_FILE_MODE); // a regular, owned, single-link file
+ *   const after = inspectPrivateFileNoFollow(databasePath);
+ *   if (after === undefined || !isSameFileIdentity(before.identity, after.identity)) {
+ *     throw new Error('the entry changed while it was being tightened');
+ *   }
+ * }
+ * ```
+ */
+export function inspectPrivateFileNoFollow(path: string): PrivateFileState | undefined {
+  const targetAbs = resolve(path);
+
+  let stats;
+  try {
+    // `{ bigint: true }`, so the identity returned is exact: see
+    // {@link FileIdentity} for why a rounded inode number is the dangerous
+    // direction of a later comparison.
+    stats = lstatSync(targetAbs, { bigint: true });
+  } catch (error) {
+    if (errnoCodeOf(error) === 'ENOENT') {
+      return undefined;
+    }
+    throw error;
+  }
+
+  if (stats.isSymbolicLink()) {
+    throw unsafePath(
+      `'${targetAbs}' is a symbolic link, and this path must be a regular file.`,
+      'symlink-component',
+      targetAbs,
+      'Remove the link so the file can be created in its place, or replace it with a regular file owned by this account.',
+    );
+  }
+
+  if (!stats.isFile()) {
+    throw unsafePath(
+      `'${targetAbs}' exists but is not a regular file.`,
+      'not-a-regular-file',
+      targetAbs,
+      'Move or remove that entry so a regular file can take its place.',
+    );
+  }
+
+  const uid = currentUid();
+  if (uid !== undefined) {
+    // A uid always fits a double exactly, so the narrowing loses nothing.
+    assertOwnedByThisAccount(
+      targetAbs,
+      Number(stats.uid),
+      uid,
+      'Remove the file, or replace it with a copy owned by the account running this tool.',
+    );
+  }
+
+  if (stats.nlink > 1n) {
+    const links = Number(stats.nlink);
+    throw unsafePath(
+      `'${targetAbs}' has ${String(links)} hard links, so the same file is also reachable through a path outside this directory.`,
+      'multiply-linked',
+      targetAbs,
+      'Remove the other links, or replace the file with a copy of it that has a single link.',
+      { links },
+    );
+  }
+
+  return {
+    identity: { dev: stats.dev, ino: stats.ino },
+    mode: Number(stats.mode) & PERMISSION_BITS,
+  };
+}
+
+/**
+ * Whether two observations name the same inode on the same device.
+ *
+ * The comparison behind every "is this still the file I judged" question: a
+ * file replaced by a `rename` keeps its path and gets a new inode, and a link
+ * swapped in and resolved gets the target's, so only the identity pair can
+ * tell them apart. Both members are compared as `bigint`, which is exact — see
+ * {@link FileIdentity}.
+ *
+ * @param a An identity from {@link inspectPrivateFileNoFollow},
+ * {@link readFileSnapshotNoFollow} or any other source of a {@link FileIdentity}.
+ * @param b The identity to compare it with.
+ * @returns `true` only when both the device and the inode are equal.
+ */
+export function isSameFileIdentity(a: FileIdentity, b: FileIdentity): boolean {
+  return sameIdentity(a, b);
 }
 
 /**

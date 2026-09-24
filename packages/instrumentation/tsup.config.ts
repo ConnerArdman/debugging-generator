@@ -24,20 +24,32 @@
  * `cleanup/cleanup.ts`. Every option below is therefore stated explicitly rather
  * than left to a tsup default that a future version could change, and the whole
  * job of this file is to emit — on a clean clone, deterministically — exactly
- * the two paths `exports`, `main` and `types` advertise:
+ * the four paths `exports`, `main` and `types` advertise, plus the shared chunk
+ * both entries import (see `splitting` below):
  *
- *   dist/index.js        dist/index.d.ts        (the `.` entry)
+ *   dist/index.js         dist/index.d.ts          (the `.` entry)
+ *   dist/schema/index.js  dist/schema/index.d.ts   (the `./schema` entry)
  *
- * ## Why one entry
+ * ## Why two entries
  *
- * Unlike `@debuggen/shared`, which splits a browser-safe root entry from a
- * `./node` entry, this package has a single public surface because every part
- * of it is Node-only: ts-morph loads a target project from a real filesystem,
- * the patcher backs originals up under `$DEBUGGEN_HOME/backups` and replaces
- * files atomically through `@debuggen/shared/node`, and cleanup re-reads and
- * re-hashes those files. Nothing here can run in a page, and `package.json`
- * offers exactly one export condition, so a second entry would be a change to
- * the `exports` map and to AAP 0.2.5 rather than an edit here.
+ * Most of this package is Node-only: ts-morph loads a target project from a
+ * real filesystem, the patcher backs originals up under
+ * `$DEBUGGEN_HOME/backups` and replaces files atomically through
+ * `@debuggen/shared/node`, and cleanup re-reads and re-hashes those files. None
+ * of that can run in a page. The schema layer can, and has to: `src/schema/**`
+ * imports only `zod`, the browser-safe root of `@debuggen/shared` and erased
+ * types, and `@debuggen/protocol` embeds those schemas in the messages the
+ * Chrome service worker, the DevTools panel and the VS Code webview validate.
+ * With one entry the schema layer was fused into the same `dist/index.js` as the
+ * patch layer, and a browser build of the protocol failed on the `node:*`
+ * builtins that bundle reaches through `@debuggen/code-analysis` and
+ * `@debuggen/shared/node`. So the schema layer gets its own entry, the way
+ * `@debuggen/shared` splits a browser-safe root from its `./node` entry — here
+ * the full surface stays at `"."` for the local service, and the browser-safe
+ * subset is `"./schema"`, which is the only specifier the protocol imports.
+ * AAP 0.7.1 names secondary entries for `shared` and `telemetry` only; this one
+ * is required by AAP 0.2.2, which makes the protocol a dependency of the two
+ * browser-hosted apps, and it changes no layering edge.
  *
  * ## Relationship to `tsc -b`
  *
@@ -60,16 +72,19 @@ import { defineConfig } from 'tsup';
 export default defineConfig({
   /**
    * The object form is load-bearing. tsup derives an output path for each entry
-   * from the key, so this key *is* `dist/index.js` (with `dist/index.d.ts`
-   * beside it), which is what the `exports` map names. The array form would
-   * instead infer the path by stripping the longest common directory of the
-   * inputs, which happens to give the same answer for a single entry and would
-   * silently give a different one the moment a second entry changed the common
-   * base. The `exports` map cannot tolerate that.
+   * from the key, so `index` *is* `dist/index.js` and `schema/index` *is*
+   * `dist/schema/index.js` (each with its `.d.ts` beside it) — exactly what the
+   * `"."` and `"./schema"` conditions of the `exports` map name. The array form
+   * would instead infer each path by stripping the longest common directory of
+   * the inputs, which for these two inputs (`src/index.ts`,
+   * `src/schema/index.ts`) would still happen to agree and would silently
+   * disagree the moment a third entry moved the common base. The `exports` map
+   * cannot tolerate that.
    *
-   * `src/index.ts` is the package's only public barrel and it re-exports only
-   * production modules, so the import graph seeded here is the whole of what
-   * reaches `dist/`. Two categories stay out of it by construction:
+   * `src/index.ts` is the full barrel and `src/schema/index.ts` the browser-safe
+   * one it re-exports in full; both re-export only production modules, so the
+   * two import graphs seeded here are the whole of what reaches `dist/`. Two
+   * categories stay out of them by construction:
    *
    * - the `*.test.ts` suites colocated under `src/` (the schema, feasibility,
    *   cleanup, patcher, conflict and adapter tests), which the `instrumentation`
@@ -83,6 +98,7 @@ export default defineConfig({
    */
   entry: {
     index: 'src/index.ts',
+    'schema/index': 'src/schema/index.ts',
   },
 
   outDir: 'dist',
@@ -108,25 +124,36 @@ export default defineConfig({
    * The same deliberate choice `packages/code-analysis` makes, and the opposite
    * of `@debuggen/telemetry` (`neutral`, so an accidental Node builtin fails its
    * build) and `@debuggen/panel-schema` (`neutral`, because the DevTools panel
-   * and the VS Code webview bundle it). This package is Node-only by
+   * and the VS Code webview bundle it). The `"."` entry is Node-only by
    * construction: it drives ts-morph over a real filesystem, records backups and
    * performs atomic replacements through `node:fs` and the `./node` entry of
    * `@debuggen/shared`, and hashes file contents with `node:crypto`. It is
-   * imported only by `@debuggen/protocol` (for types) and `apps/local-service`,
-   * never by the MAIN-world telemetry agent, the DevTools panel, the VS Code
-   * webview or `packages/panel-renderer`, so Node builtins are expected here and
-   * stating `node` makes the one supported runtime explicit: builtins stay
-   * external, and the `node`/`require` export conditions of any dependency are
-   * the ones that get resolved.
+   * imported only by `apps/local-service`, never by the MAIN-world telemetry
+   * agent, the DevTools panel, the VS Code webview or `packages/panel-renderer`,
+   * so Node builtins are expected there and stating `node` makes the one
+   * supported runtime explicit: builtins stay external, and the `node`/`require`
+   * export conditions of any dependency are the ones that get resolved.
+   *
+   * The same option applies to the `./schema` entry, and is harmless there
+   * rather than a hole in its browser-safety: every dependency is external (see
+   * `external` below), so this build resolves nothing but relative paths inside
+   * `src/`, and the schema graph names no builtin to externalise. What proves
+   * that graph browser-safe is not this option but the consumer that needs it:
+   * `@debuggen/protocol` imports only `@debuggen/instrumentation/schema`, and its
+   * build bundles the result for `platform: 'browser'` and fails on any
+   * unresolvable import, so a `node:*` specifier that reached `src/schema/**`
+   * would stop the protocol build with the importer named.
    */
   platform: 'node',
 
   /**
-   * Declarations are non-negotiable: `dist/index.d.ts` is the `types` condition
-   * of the `exports` map and therefore what both consumers compile against, so
-   * a broken declaration step here fails their typecheck rather than this
-   * build. `@debuggen/protocol` in particular re-exports these types inside its
-   * message schemas, which every process in the product parses against.
+   * Declarations are non-negotiable: `dist/index.d.ts` and
+   * `dist/schema/index.d.ts` are the `types` conditions of the `exports` map and
+   * therefore what the local service and `@debuggen/protocol` respectively
+   * compile against, so a broken declaration step here fails their typecheck
+   * rather than this build. `@debuggen/protocol` in particular re-exports the
+   * schema entry's types inside its message schemas, which every process in the
+   * product parses against.
    *
    * The three overrides below are each required, not defensive, and they are the
    * same block `packages/shared`, `packages/telemetry`, `packages/code-analysis`
@@ -140,7 +167,7 @@ export default defineConfig({
    * - `composite` / `incremental` come from `tsconfig.json` and
    *   `tsconfig.base.json`, because the root solution file references this
    *   project for `tsc -b`. A composite program must list every input file,
-   *   while tsup's program is seeded with one entry file and follows imports
+   *   while tsup's program is seeded with the entry files and follows imports
    *   from there, so `src/index.ts`'s own re-exports are reported as "not listed
    *   within the file list of project" (TS6307). The two options also tie a
    *   program to a build stamp and a declaration directory that belong to the
@@ -219,12 +246,33 @@ export default defineConfig({
   clean: true,
 
   /**
-   * No shared chunks. Chunk names are content-addressed, so splitting would put
-   * files in `dist/` whose names are not stated in the `exports` map; with a
-   * single entry there is nothing to share them with in any case. Keeping it off
-   * is what makes `dist/` provably the two paths documented above.
+   * Required, not an optimisation: this is what keeps one instance of every Zod
+   * schema per process.
+   *
+   * The local service loads both entries at once — `@debuggen/instrumentation`
+   * directly, and `@debuggen/instrumentation/schema` through
+   * `@debuggen/protocol`, whose message and route schemas embed
+   * `modificationRecordSchema`, `instrumentationPlanSchema` and the rest. With
+   * splitting off, esbuild would inline a private copy of `src/schema/**` into
+   * each entry, and the process would hold two `modificationRecordSchema`
+   * objects: identical in shape, different in identity, so an identity check
+   * between a schema the service validated with and the one a protocol message
+   * embeds would fail, and every schema would be constructed twice at start-up.
+   * With splitting on, the modules both entries reach are emitted once into a
+   * shared `dist/chunk-*.js` that `dist/index.js` and `dist/schema/index.js`
+   * both import, so Node's module cache — and any bundler downstream — sees one
+   * module, and `===` holds between the two entries' exports.
+   * `packages/protocol/src/__tests__/http.test.ts` asserts exactly that (the
+   * journal route's element schema is `toBe` the `modificationRecordSchema` of
+   * both entries), and that case fails when this option is switched off.
+   *
+   * The chunk's content-addressed name is not in the `exports` map, and need
+   * not be: it is reached only through the relative imports tsup writes into
+   * the two entry files, which a resolver follows without consulting `exports`.
+   * Only the four entry paths documented above are public; `clean` above keeps
+   * a chunk from an earlier build from lingering beside the current one.
    */
-  splitting: false,
+  splitting: true,
 
   /**
    * Unminified on purpose. This is a locally installed developer tool, not a

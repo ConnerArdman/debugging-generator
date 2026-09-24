@@ -128,7 +128,7 @@ import { z } from 'zod';
 
 import { err, ok } from '@debuggen/shared';
 import type { DebuggenError, Result } from '@debuggen/shared';
-import { agentHookConfigSchema, serverAgentSignalsSchema } from '@debuggen/instrumentation';
+import { agentHookConfigSchema, serverAgentSignalsSchema } from '@debuggen/instrumentation/schema';
 
 import { protocolParseError, protocolVersionSchema } from '../version.js';
 

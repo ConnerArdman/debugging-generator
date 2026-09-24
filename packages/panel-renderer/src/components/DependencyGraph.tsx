@@ -37,20 +37,25 @@
  * reproducible for any permutation of the payload:
  *
  *   1. Layers come from the payload's own `layer` indices when **every**
- *      participant carries a usable one, and are otherwise recomputed for all
- *      of them by `assignGraphLayers` — the same all-or-nothing rule
- *      `layoutDependencyGraph` applies, so the ordering below and the geometry
- *      it feeds can never disagree. Both routes are edge-derived or
- *      payload-derived and neither depends on array order.
+ *      participant carries a usable one, and are otherwise computed for all of
+ *      them from the relationships — the all-or-nothing rule of
+ *      `resolveGraphLayering` in `../utils/scale`. That layering is resolved
+ *      **once** per payload and the same object feeds both the ordering below
+ *      and `layoutDependencyGraph`, so the ordering and the geometry can never
+ *      disagree and the layering never runs twice. Both routes are
+ *      edge-derived or payload-derived and neither depends on array order.
  *   2. Participants are then put in the canonical order the aggregate itself
  *      documents — by layer, then by descending total duration, then by id —
  *      which is a no-op for a canonical payload (the sort is stable and the
  *      rule is the same one) and restores that order for a shuffled one. The id
  *      tie-break is total, so the result is permutation-independent down to the
  *      last row.
- *   3. A cycle cannot hang or explode the layout: the relaxation in
- *      `assignGraphLayers` is capped, and the anchors of an edge that runs
- *      backwards or stays in one column are computed for that case explicitly.
+ *   3. A cycle cannot hang or explode the layout: the computed layering is one
+ *      linear, non-recursive pass (strongly connected components, then the
+ *      longest path over the acyclic graph they form), so the members of a
+ *      cycle share one column instead of being pushed apart, and the anchors of
+ *      an edge that runs backwards or stays in one column are computed for that
+ *      case explicitly.
  *
  * ## TWO REPRESENTATIONS OF ONE GRAPH, AND WHY BOTH ARE MANDATORY
  *
@@ -67,7 +72,11 @@
  *     chip. It is the library's own keyboard-navigable grid (a roving tab stop,
  *     arrow keys, Enter and Space), it is rendered unvirtualized so that it
  *     covers **every** participant rather than a window, and it is what makes
- *     the view operable without a pointer. A raw `<ul>` was the alternative and
+ *     the view operable without a pointer. The row that holds keyboard focus
+ *     shows its participant's full label, tier and metrics inline — what a
+ *     pointer user reads in the label's tooltip — so nothing is reachable by
+ *     hover alone, and no tab stop is added to get there (see
+ *     {@link ParticipantCell}). A raw `<ul>` was the alternative and
  *     is not used: AAP 0.6.4 permits no raw `<table>` or bespoke list chrome
  *     above the primitives layer, `../styles/components.css` declares no rule
  *     for a list in this block, and `../styles/base.css` deliberately keeps
@@ -77,17 +86,32 @@
  *
  * `PanelActions.onSelectEvent` needs an `eventId`, and `eventId` is the
  * coordinate a host resolves against the capture. A participant of this graph
- * is a **collapse** of many records: the aggregate gives it `spanIds` — a
- * bounded sample of span ids — and no event id at all. Passing a span id as an
- * event id would resolve to nothing in the details drawer, and
+ * is a **collapse** of records, and the aggregate declares the coordinate it may
+ * carry: `eventId` and `traceId`, which `buildDependencyGraph` sets only for a
+ * participant that collapsed exactly one record — the one case where the
+ * participant and an event are the same thing. A collapse of several records
+ * carries neither, and its `spanIds` sample is never passed off as an event id:
+ * that would resolve to nothing in the details drawer, and
  * `../host/PanelActions` is explicit that a fabricated coordinate is worse than
  * an absent one. So activation selects locally (the row and the shape both take
  * `dg-is-selected`) and reports to the host **only** when the participant
- * actually carries an event coordinate — the same enrichment seam the datum's
- * `source` field documents, read here through {@link ParticipantEventCoordinate}
- * without a cast and without requiring it. A participant with neither an event
- * coordinate nor a source location still reads fully — label, class, timing,
- * relationships — and offers no control that would do nothing.
+ * declares a coordinate that passes validation: a single record, one
+ * well-formed span id, an opaque event id and a well-formed trace id (see
+ * `eventCoordinateOf`). The payload crosses a shallow protocol guard, so a
+ * coordinate that breaks those rules — an event id on a multi-record
+ * participant, say — is not reported at all, and the view says under the grid
+ * how many participants declared one. Nothing is invented. A participant with
+ * neither an event coordinate nor a source location still reads fully — label,
+ * class, timing, relationships — and offers no control that would do nothing.
+ *
+ * The same holds for how a relationship was known. The aggregate counts, per
+ * edge, how many of its records joined their caller through a lineage
+ * attribution rather than by nesting (`inferredCount`) and how many of those
+ * attributions were ambiguous (`ambiguousCount`). This component validates that
+ * the two shares nest inside the edge's `count` and derives nothing: an edge
+ * that carries neither is the measured relationship it is, and one whose shares
+ * do not add up is drawn without a lineage state and reported under the grid
+ * rather than capped into a claim the capture never made.
  *
  * ## PRIVACY: EVERY LABEL IS DATA, AND ARRIVES REDACTED
  *
@@ -95,7 +119,8 @@
  * passed the redaction layer — an interaction and its target, a matched route, a
  * module and a symbol, a database system (AAP 0.5.2). This file renders labels
  * as given: it never parses one, never reassembles a URL or a statement from
- * one, and shortens one only for display (with the full text in the tooltip).
+ * one, and shortens one only for display (with the full text in the tooltip on
+ * hover, and inline in the grid row that holds keyboard focus).
  * The only vocabulary this file writes is generic product vocabulary: the six
  * participant classes of the closed telemetry domain and the column headings.
  * A specific component, function or route name here would be exactly the
@@ -133,9 +158,12 @@
  *     `max-block-size`. The participants grid is the complete reading of a graph
  *     too large to take in at a glance, which is the other reason it is never
  *     virtualized.
- *   - **The relationship curves are faint, and that is flagged rather than
- *     overridden.** See the BLITZY [A11Y] flag beside the edge group below: the
- *     stroke is the design system's, and no information depends on it.
+ *   - **The relationship curves carry no information of their own.** The
+ *     stroke is the design system's edge treatment in
+ *     `../styles/components.css`, whose contrast is owned and tested with the
+ *     design tokens; this component writes no colour, and every relationship
+ *     is also enumerated in text in the grid. See the BLITZY [A11Y] note beside
+ *     the edge group below.
  *
  * ## WHAT IT READS
  *
@@ -145,9 +173,11 @@
  * draw (`sources`), which the source guard reports against, and the view's own
  * name (`label`), which the canvas's text alternative and the grid's caption are
  * composed from. The participant fields drawn here — label, class, tier, record
- * count, total and slowest duration, source location and layer — are what the
- * aggregate derives from the telemetry fields that same entry declares in
- * `reads`; this component reads prepared participants and never a raw record.
+ * count, total and slowest duration, source location, layer and event
+ * coordinate — and the relationship fields — its endpoints, its count and its
+ * inferred and ambiguous shares — are what the aggregate derives from the
+ * telemetry fields that same entry declares in `reads`; this component reads
+ * prepared participants and never a raw record.
  *
  * ## APPEARANCE IS A CLASS CONTRACT (AAP 0.6.4)
  *
@@ -189,6 +219,7 @@ import type {
   DataQuery,
   DependencyGraphNode as DependencyGraphNodeSpec,
 } from '@debuggen/panel-schema';
+import { isSpanId, isTraceId } from '@debuggen/shared';
 import type {
   DependencyGraphData,
   DependencyGraphEdge,
@@ -196,8 +227,8 @@ import type {
 } from '@debuggen/telemetry';
 import clsx from 'clsx';
 import { Workflow } from 'lucide-react';
-import { Fragment, useCallback, useMemo, useState } from 'react';
-import type { CSSProperties, ReactElement } from 'react';
+import { Fragment, createContext, useCallback, useContext, useMemo, useState } from 'react';
+import type { CSSProperties, FocusEvent, ReactElement } from 'react';
 
 import { usePanelActions } from '../host/PanelActions';
 import type { PanelEventRef } from '../host/PanelActions';
@@ -221,10 +252,10 @@ import {
   truncate,
 } from '../utils/format';
 import {
-  assignGraphLayers,
   edgePathData,
   interpolate,
   layoutDependencyGraph,
+  resolveGraphLayering,
 } from '../utils/scale';
 import type { DependencyGraphLayout, GraphNodeBox } from '../utils/scale';
 import { SourceLink } from './SourceLink';
@@ -413,36 +444,6 @@ function nodeColorStyle(kind: DependencyGraphNode['kind']): CssVariableStyle {
  * ---------------------------------------------------------------------------
  */
 
-/** Whether a payload's layer index can be used as a column. */
-function isPlacedLayer(layer: number | undefined): layer is number {
-  return layer !== undefined && Number.isInteger(layer) && layer >= 0;
-}
-
-/**
- * A column per participant id.
- *
- * The payload's own indices when every participant carries a usable one, and
- * otherwise a recomputation for all of them — the same all-or-nothing rule
- * `layoutDependencyGraph` applies internally, restated here because the
- * ordering below needs the layers *before* the layout is built. Mixing a
- * provided index with a computed one would place two participants in one column
- * by coincidence rather than by a rule.
- */
-function resolveLayers(data: DependencyGraphData): ReadonlyMap<string, number> {
-  if (!data.nodes.every((node) => isPlacedLayer(node.layer))) {
-    return assignGraphLayers(data.nodes, data.edges);
-  }
-
-  const layers = new Map<string, number>();
-  for (const node of data.nodes) {
-    if (isPlacedLayer(node.layer)) {
-      layers.set(node.id, node.layer);
-    }
-  }
-
-  return layers;
-}
-
 /** Ascending by column, then descending by total duration, then ascending by id. */
 function compareParticipants(
   left: DependencyGraphNode,
@@ -471,9 +472,17 @@ function compareParticipants(
  * participants arrived in another order it restores it, which is what makes the
  * geometry and the grid below reproducible rather than merely current: the id
  * tie-break is total, so no permutation of the input changes what is drawn.
+ *
+ * `layers` is the layering already resolved for this payload — the same map the
+ * layout is then built from — so ordering never computes a layering of its own.
+ * Only the participant order changes: the relationships and every participant
+ * object are the payload's own, which is what keeps that layering valid for the
+ * returned graph.
  */
-function canonicalGraph(data: DependencyGraphData): DependencyGraphData {
-  const layers = resolveLayers(data);
+function canonicalGraph(
+  data: DependencyGraphData,
+  layers: ReadonlyMap<string, number>,
+): DependencyGraphData {
   return {
     ...data,
     nodes: data.nodes.toSorted((left, right) => compareParticipants(left, right, layers)),
@@ -482,92 +491,162 @@ function canonicalGraph(data: DependencyGraphData): DependencyGraphData {
 
 /*
  * ---------------------------------------------------------------------------
- * The two optional coordinates a payload may carry
+ * The event coordinate and the lineage the aggregate declares — validated
  *
- * Both structures below are read through a local type with a REQUIRED `id`
- * overlapping the datum's own, which is what makes the read a plain assignment
- * rather than a cast (and keeps TypeScript's weak-type check satisfied). Both
- * fields are absent from the aggregate's declared shape and present on nothing
- * this component builds: they are the enrichment seam, the same one the datum's
- * `source` field documents, and reading them defensively is how an enriched
- * payload gains behaviour without this file ever inventing a value.
+ * Both are optional fields of the authoritative telemetry shapes, produced by
+ * `buildDependencyGraph`: a participant's `eventId` and `traceId`, and a
+ * relationship's `inferredCount` and `ambiguousCount`. Their invariants are
+ * stated on those declarations, and they are what this section checks:
+ *
+ *   - an event coordinate belongs to a participant that collapsed exactly one
+ *     record (`count === 1`, one well-formed span id in `spanIds`), and carries
+ *     an opaque, non-blank `eventId` together with a well-formed `traceId`;
+ *   - a relationship's shares nest: `0 ≤ ambiguousCount ≤ inferredCount ≤
+ *     count`, every one a whole number and `count` at least one.
+ *
+ * The protocol's guard on a `graph` result checks only its outer shape, and this
+ * package may take `@debuggen/telemetry` as types only (AAP 0.2.2), so the
+ * checks are written here, against those declared rules, and run before either
+ * field can drive anything. A declaration that breaks a rule is **not used** —
+ * no host selection, no inferred state — and is counted, so the view says under
+ * the grid that part of the payload was inconsistent rather than repairing it
+ * into a claim the capture never made. Nothing below derives a value the
+ * payload did not state.
  * ---------------------------------------------------------------------------
  */
 
-/** The event coordinate a participant carries when its producer recorded one. */
-interface ParticipantEventCoordinate {
-  readonly id: string;
-  readonly eventId?: unknown;
-  readonly spanId?: unknown;
-  readonly traceId?: unknown;
-}
+/**
+ * One optional declaration, read against its rules: absent, valid (with the
+ * value it declares), or present and inconsistent.
+ */
+type Declaration<T> =
+  | { readonly state: 'absent' }
+  | { readonly state: 'valid'; readonly value: T }
+  | { readonly state: 'invalid' };
 
-/** The lineage flags a relationship carries when it was inferred rather than measured. */
-interface RelationshipLineage {
-  readonly id: string;
-  readonly ambiguous?: unknown;
-  readonly inferred?: unknown;
-  readonly lineageAmbiguous?: unknown;
-  readonly lineage?: unknown;
-}
+/** The absent declaration, shared. */
+const ABSENT: Declaration<never> = Object.freeze({ state: 'absent' });
 
-/** The lineage value an asynchronous continuation is attributed with (AAP 0.4.2). */
-const ASYNC_CONTINUATION_LINEAGE = 'async-continuation';
+/** The inconsistent declaration, shared. */
+const INVALID: Declaration<never> = Object.freeze({ state: 'invalid' });
 
 /** The value when it is a string with something in it, and `undefined` otherwise. */
 function nonBlankString(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim().length > 0 ? value : undefined;
 }
 
-/** The single span a participant collapsed, when it collapsed exactly one. */
-function soleSpanId(node: DependencyGraphNode): string | undefined {
-  return node.count === 1 && node.spanIds.length === 1 ? node.spanIds[0] : undefined;
+/**
+ * Whether a value is an opaque event id: a non-empty string with no surrounding
+ * whitespace, the shape the telemetry event schema admits for `id`.
+ */
+function isOpaqueEventId(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && value.trim() === value;
 }
 
 /**
- * The event a participant stands for, or `undefined` when it stands for none.
+ * The event coordinate a participant declares, validated.
  *
- * `undefined` is the normal answer for an aggregate built from the telemetry
- * shape alone, and it is the honest one: see this module's header for why a span
- * id is never passed off as an event id. The span hint is added only for a
- * participant that collapsed exactly one record, where the sample really is
- * that record.
+ * Absent when the participant carries neither `eventId` nor `traceId` — the
+ * normal, honest answer for a collapse of several records; see this module's
+ * header for why a span id is never passed off as an event id. Valid only when
+ * every rule of the section above holds, in which case the reference carries
+ * the declared event and trace and the participant's one span as the hint.
+ * Anything else — an event id on a multi-record participant, a trace id
+ * without an event id, a blank or malformed id — is inconsistent, and the
+ * participant then reports no selection at all rather than a coordinate that
+ * could name the wrong event or none.
  */
-function eventRefFor(node: DependencyGraphNode): PanelEventRef | undefined {
-  const coordinate: ParticipantEventCoordinate = node;
-  const eventId = nonBlankString(coordinate.eventId);
-  if (eventId === undefined) {
-    return undefined;
+function eventCoordinateOf(node: DependencyGraphNode): Declaration<PanelEventRef> {
+  const { eventId, traceId } = node;
+  if (eventId === undefined && traceId === undefined) {
+    return ABSENT;
   }
 
-  const spanId = nonBlankString(coordinate.spanId) ?? soleSpanId(node);
-  const traceId = nonBlankString(coordinate.traceId);
+  const [spanId, ...otherSpans] = node.spanIds;
+  const singleRecord = node.count === 1 && otherSpans.length === 0 && isSpanId(spanId);
 
-  return {
-    eventId,
-    ...(spanId === undefined ? {} : { spanId }),
-    ...(traceId === undefined ? {} : { traceId }),
-  };
+  if (!singleRecord || !isOpaqueEventId(eventId) || !isTraceId(traceId)) {
+    return INVALID;
+  }
+
+  return { state: 'valid', value: { eventId, spanId, traceId } };
+}
+
+/** How a relationship was known, as the counts its payload declared. */
+interface LineageTally {
+  /** How many records the relationship stands for: its `count`. */
+  readonly total: number;
+  /** How many of them joined their caller through a lineage attribution. */
+  readonly inferred: number;
+  /** How many of those attributions had several candidates. */
+  readonly ambiguous: number;
+}
+
+/** Whether a value is a whole number of zero or more. */
+function isWholeCount(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0;
 }
 
 /**
- * Whether a relationship was inferred rather than measured.
+ * The lineage a relationship declares, validated.
+ *
+ * Absent when it declares neither share — a measured relationship. Valid when
+ * the shares nest (`0 ≤ ambiguousCount ≤ inferredCount ≤ count`, all whole,
+ * `count ≥ 1`), with an omitted share read as the zero the aggregate omits.
+ * Anything else is inconsistent: it is neither capped into agreement nor read
+ * as a measurement it may not be, but dropped and reported.
+ */
+function edgeLineageOf(edge: DependencyGraphEdge): Declaration<LineageTally> {
+  const { count, inferredCount, ambiguousCount } = edge;
+  if (inferredCount === undefined && ambiguousCount === undefined) {
+    return ABSENT;
+  }
+
+  const inferred = inferredCount ?? 0;
+  const ambiguous = ambiguousCount ?? 0;
+  const nested =
+    isWholeCount(count) &&
+    count >= 1 &&
+    isWholeCount(inferred) &&
+    inferred <= count &&
+    isWholeCount(ambiguous) &&
+    ambiguous <= inferred;
+
+  return nested ? { state: 'valid', value: { total: count, inferred, ambiguous } } : INVALID;
+}
+
+/** The counts of a relationship whose lineage is usable, and `undefined` otherwise. */
+function usableLineageOf(edge: DependencyGraphEdge): LineageTally | undefined {
+  const lineage = edgeLineageOf(edge);
+  return lineage.state === 'valid' ? lineage.value : undefined;
+}
+
+/**
+ * Whether any of a relationship's records was inferred rather than measured.
  *
  * An inferred relationship is drawn dashed and chipped as such, exactly as the
- * timeline marks an ambiguous async continuation: a guessed relationship must
- * never read as a measured one (AAP 0.4.2). Nothing is inferred *here* — the
- * flags are read, never derived, and an edge that carries none is drawn as the
- * measured relationship it is.
+ * timeline marks an async continuation: a guessed relationship must never read
+ * as a measured one (AAP 0.4.2). Nothing is inferred *here* — the counts are
+ * read and validated, never derived, and an edge that declares none, or
+ * declares an inconsistent lineage, is not marked.
  */
 function isInferredRelationship(edge: DependencyGraphEdge): boolean {
-  const lineage: RelationshipLineage = edge;
-  return (
-    lineage.ambiguous === true ||
-    lineage.inferred === true ||
-    lineage.lineageAmbiguous === true ||
-    nonBlankString(lineage.lineage) === ASYNC_CONTINUATION_LINEAGE
-  );
+  return (usableLineageOf(edge)?.inferred ?? 0) > 0;
 }
+
+/** How many declarations of a payload were present but inconsistent. */
+interface InconsistentDeclarations {
+  /** Participants whose event coordinate broke its rules. */
+  readonly coordinates: number;
+  /** Drawn relationships whose lineage shares broke theirs. */
+  readonly lineages: number;
+}
+
+/** No inconsistent declaration: the count of an unresolved query, shared. */
+const NO_INCONSISTENT_DECLARATIONS: InconsistentDeclarations = Object.freeze({
+  coordinates: 0,
+  lineages: 0,
+});
 
 /*
  * ---------------------------------------------------------------------------
@@ -585,7 +664,13 @@ interface ParticipantRelationship {
   readonly edge: DependencyGraphEdge;
   /** The called participant's own label, resolved from the payload's participants. */
   readonly targetLabel: string;
-  /** Whether the relationship was inferred rather than measured. */
+  /**
+   * How many of its records were inferred, and how many of those ambiguously —
+   * `undefined` when it declares no lineage or an inconsistent one; see
+   * {@link edgeLineageOf}.
+   */
+  readonly lineage: LineageTally | undefined;
+  /** Whether any of its records was inferred rather than measured. */
   readonly inferred: boolean;
 }
 
@@ -597,7 +682,10 @@ interface ParticipantRow {
   readonly box: GraphNodeBox;
   /** Its outgoing relationships, in the payload's order. */
   readonly outgoing: readonly ParticipantRelationship[];
-  /** The event it stands for, when it carries one; see {@link eventRefFor}. */
+  /**
+   * The event it stands for, when it declares a valid coordinate; see
+   * {@link eventCoordinateOf}.
+   */
   readonly eventRef: PanelEventRef | undefined;
 }
 
@@ -633,20 +721,51 @@ function buildRows(layout: DependencyGraphLayout): readonly ParticipantRow[] {
   for (const positioned of layout.edges) {
     const { edge } = positioned;
     const relationships = outgoing.get(edge.from) ?? [];
+    const lineage = usableLineageOf(edge);
     relationships.push({
       edge,
       targetLabel: labels.get(edge.to) ?? edge.to,
-      inferred: isInferredRelationship(edge),
+      lineage,
+      inferred: (lineage?.inferred ?? 0) > 0,
     });
     outgoing.set(edge.from, relationships);
   }
 
-  return layout.nodes.map((positioned) => ({
-    node: positioned.node,
-    box: positioned.box,
-    outgoing: outgoing.get(positioned.node.id) ?? NO_RELATIONSHIPS,
-    eventRef: eventRefFor(positioned.node),
-  }));
+  return layout.nodes.map((positioned) => {
+    const coordinate = eventCoordinateOf(positioned.node);
+    return {
+      node: positioned.node,
+      box: positioned.box,
+      outgoing: outgoing.get(positioned.node.id) ?? NO_RELATIONSHIPS,
+      eventRef: coordinate.state === 'valid' ? coordinate.value : undefined,
+    };
+  });
+}
+
+/**
+ * How many declarations of a laid-out payload were present but inconsistent.
+ *
+ * Counted over what is drawn: every participant, and every relationship both of
+ * whose endpoints exist (the others are already counted as dropped). The view
+ * reports each non-zero count under the grid, so a declaration that was not
+ * used is never silently discarded.
+ */
+function inconsistentDeclarationsOf(layout: DependencyGraphLayout): InconsistentDeclarations {
+  let coordinates = 0;
+  for (const positioned of layout.nodes) {
+    if (eventCoordinateOf(positioned.node).state === 'invalid') {
+      coordinates += 1;
+    }
+  }
+
+  let lineages = 0;
+  for (const positioned of layout.edges) {
+    if (edgeLineageOf(positioned.edge).state === 'invalid') {
+      lineages += 1;
+    }
+  }
+
+  return { coordinates, lineages };
 }
 
 /**
@@ -673,6 +792,73 @@ function buildColumns(rows: readonly ParticipantRow[]): readonly ParticipantColu
 
 /*
  * ---------------------------------------------------------------------------
+ * Keyboard focus
+ *
+ * The grid's focus target is its row — a roving tab stop the `DataTable`
+ * primitive owns — so a tooltip on the label, which opens only for focus inside
+ * its own wrapper, is never reached from the keyboard. Instead the block
+ * listens to focus arriving anywhere inside it, finds the grid row that holds
+ * it, and publishes that row's participant id; the one cell that answers to it
+ * then shows the label's detail inline. No element gains a tab stop, and
+ * neither the primitive nor the tooltip is changed.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * The id of the participant whose grid row holds keyboard focus, or `undefined`
+ * when focus is elsewhere.
+ *
+ * Context rather than a prop: the grid's cells are rendered by `DataTable` from
+ * the module-constant column list, which hands a cell its row and nothing
+ * else, so a context is how the one cell that answers to focus learns of it
+ * without the column list being rebuilt on every focus change.
+ */
+const FocusedParticipantContext = createContext<string | undefined>(undefined);
+
+/** A grid row, as the `DataTable` primitive marks every row it renders. */
+const GRID_ROW_SELECTOR = '[role="row"]';
+
+/**
+ * The attribute a participant's label carries its participant id in.
+ *
+ * Written literally on the label in {@link ParticipantCell} so the attribute is
+ * visible where it is set; this constant and {@link PARTICIPANT_LABEL_SELECTOR}
+ * are the only readers of it.
+ */
+const PARTICIPANT_ID_ATTRIBUTE = 'data-participant-id';
+
+/** The label element of a participant, in either of its two forms. */
+const PARTICIPANT_LABEL_SELECTOR = `[${PARTICIPANT_ID_ATTRIBUTE}]`;
+
+/**
+ * The participant whose grid row contains `target`, or `undefined` when focus
+ * landed outside every participant row.
+ *
+ * The row is required to lie inside `scope` — the block the listener sits on —
+ * so a graph rendered inside some other grid's row can never borrow a
+ * participant from a row that is not its own. The header row holds no
+ * participant label and so answers `undefined`, as does a label whose id is
+ * blank.
+ *
+ * @param target Where focus arrived.
+ * @param scope The block whose rows are considered.
+ */
+function focusedParticipantIdOf(target: EventTarget, scope: Element): string | undefined {
+  if (!(target instanceof Element)) {
+    return undefined;
+  }
+
+  const row = target.closest(GRID_ROW_SELECTOR);
+  if (row === null || !scope.contains(row)) {
+    return undefined;
+  }
+
+  const label = row.querySelector(PARTICIPANT_LABEL_SELECTOR);
+  return nonBlankString(label?.getAttribute(PARTICIPANT_ID_ATTRIBUTE));
+}
+
+/*
+ * ---------------------------------------------------------------------------
  * Copy
  *
  * Generic product vocabulary only, and every sentence states what the capture
@@ -683,7 +869,7 @@ function buildColumns(rows: readonly ParticipantRow[]): readonly ParticipantColu
 
 /** The recorded limitation of AAP 0.6.6, stated on screen rather than implied. */
 const STATIC_LAYOUT_NOTE =
-  'This layout is static in this version: hover a participant for its detail and select one to highlight it. Dragging, panning and zooming are not available.';
+  'This layout is static in this version: hover or focus a participant for its detail and select one to highlight it. Dragging, panning and zooming are not available.';
 
 /** What an empty graph says. */
 const EMPTY_MESSAGE = 'No dependency relationships were captured for this interaction.';
@@ -699,6 +885,9 @@ const SOURCE_MISMATCH_CODE = 'PANEL_INVALID';
 
 /** Marks a relationship chip whose relationship was inferred rather than measured. */
 const INFERRED_LABEL = 'inferred';
+
+/** Qualifies how many of a relationship's inferences had several candidates. */
+const AMBIGUOUS_LABEL = 'ambiguous';
 
 /** Precedes a called participant on a relationship chip. */
 const RELATIONSHIP_ARROW = '→';
@@ -717,6 +906,16 @@ const COMPUTED_LAYERS_NOTE =
 /** Said when a relationship named a participant the payload does not contain. */
 function droppedRelationshipsNote(count: number): string {
   return `${formatCount(count)} relationship(s) named a participant this graph does not contain and are not drawn.`;
+}
+
+/** Said when participants declared an event coordinate that contradicts their records. */
+function inconsistentCoordinatesNote(count: number): string {
+  return `${formatCount(count)} participant(s) declared an event that does not match their records, so selecting them opens no event.`;
+}
+
+/** Said when relationships declared lineage shares that do not add up. */
+function inconsistentLineagesNote(count: number): string {
+  return `${formatCount(count)} relationship(s) declared inconsistent inferred or ambiguous counts, which are not shown.`;
 }
 
 /** What a node whose query names another source says. */
@@ -762,21 +961,47 @@ function participantTitle(node: DependencyGraphNode): string {
   return `${node.label} · ${KIND_LABEL[node.kind]} · ${participantMetricsText(node)}`;
 }
 
+/**
+ * How a relationship was known, as the suffix of its chip.
+ *
+ * Nothing for a measured relationship; ` (inferred)` when every record was
+ * inferred; ` (1 of 3 inferred)` when only part of it was; and, when any of
+ * those inferences had several candidates, the ambiguous share appended — for
+ * example ` (inferred, 1 ambiguous)`. A partial inference is stated as a share
+ * rather than as the word alone, because "inferred" on an edge that is mostly
+ * measured would overstate the guess.
+ */
+function lineageSuffix(lineage: LineageTally | undefined): string {
+  if (lineage === undefined || lineage.inferred === 0) {
+    return '';
+  }
+
+  const share =
+    lineage.inferred >= lineage.total
+      ? INFERRED_LABEL
+      : `${formatCount(lineage.inferred)} of ${formatCount(lineage.total)} ${INFERRED_LABEL}`;
+  const ambiguity =
+    lineage.ambiguous > 0 ? `, ${formatCount(lineage.ambiguous)} ${AMBIGUOUS_LABEL}` : '';
+
+  return ` (${share}${ambiguity})`;
+}
+
 /** A relationship chip's text: what is called, how often, and how it was known. */
 function relationshipChipText(relationship: ParticipantRelationship): string {
   const target = truncate(relationship.targetLabel, MAX_CHIP_LABEL_CHARACTERS);
   const repeats = relationship.edge.count > 1 ? ` ×${formatCount(relationship.edge.count)}` : '';
-  const lineage = relationship.inferred ? ` (${INFERRED_LABEL})` : '';
-  return `${RELATIONSHIP_ARROW} ${target}${repeats}${lineage}`;
+  return `${RELATIONSHIP_ARROW} ${target}${repeats}${lineageSuffix(relationship.lineage)}`;
 }
 
 /*
  * ---------------------------------------------------------------------------
  * The grid's cells
  *
- * Each is a pure function of its row, which is what lets the column list below
- * be a module constant: no cell reads state, so nothing about the grid is
- * rebuilt when a selection or a hover changes.
+ * Each is a function of its row, which is what lets the column list below be a
+ * module constant: no cell reads component state, so nothing about the grid is
+ * rebuilt when a selection or a hover changes. The participant cell also reads
+ * {@link FocusedParticipantContext}, and a context change re-renders that cell
+ * alone.
  * ---------------------------------------------------------------------------
  */
 
@@ -791,16 +1016,48 @@ function ClassCell({ row }: { readonly row: ParticipantRow }): ReactElement {
   );
 }
 
+/** The focused participant's second line: its tier, when it has one, and its metrics. */
+function participantDetailText(node: DependencyGraphNode): string {
+  const metrics = participantMetricsText(node);
+  return node.tier === undefined ? metrics : `${formatTierLabel(node.tier)} · ${metrics}`;
+}
+
 /**
- * The participant's label, truncated by the stylesheet and described in full by
- * a tooltip that also names its class, its tier and its metrics.
+ * The participant's label, in one of two forms.
  *
- * The tooltip is the reason a class chip is not drawn inside the SVG box: the
- * canvas carries the colour, and the words that make the colour non-essential
- * live here and in the class column.
+ * - **Its row holds keyboard focus.** The full label, untruncated, with a muted
+ *   line under it naming the tier and the metrics — the tooltip's content,
+ *   inline. The grid's focus target is the row rather than anything inside this
+ *   cell, so a tooltip here would never open for a keyboard user; showing the
+ *   detail in the focused row is what makes it reachable without a pointer and
+ *   without a second tab stop. The class is not repeated: it is the next
+ *   column.
+ * - **Otherwise.** The label, truncated by the stylesheet and described in full
+ *   by a tooltip that also names its class, its tier and its metrics, for the
+ *   pointer user.
+ *
+ * Both forms mark the label with the participant id (`data-participant-id`),
+ * which is what {@link focusedParticipantIdOf} reads back from a focused row.
+ * The tooltip is also the reason a class chip is not drawn inside the SVG box:
+ * the canvas carries the colour, and the words that make the colour
+ * non-essential live here and in the class column.
  */
 function ParticipantCell({ row }: { readonly row: ParticipantRow }): ReactElement {
   const { node } = row;
+  const focusedId = useContext(FocusedParticipantContext);
+
+  if (focusedId === node.id) {
+    return (
+      <Stack gap={1}>
+        <Text size="sm" weight="medium" data-participant-id={node.id}>
+          {node.label}
+        </Text>
+        <Text size="xs" tone="muted">
+          {participantDetailText(node)}
+        </Text>
+      </Stack>
+    );
+  }
 
   const detail = (
     <Stack gap={1}>
@@ -823,7 +1080,7 @@ function ParticipantCell({ row }: { readonly row: ParticipantRow }): ReactElemen
 
   return (
     <Tooltip className="dg-dependency-graph__tooltip" content={detail}>
-      <Text size="sm" truncate>
+      <Text size="sm" truncate data-participant-id={node.id}>
         {node.label}
       </Text>
     </Tooltip>
@@ -833,10 +1090,12 @@ function ParticipantCell({ row }: { readonly row: ParticipantRow }): ReactElemen
 /**
  * Everything the participant calls, one chip each.
  *
- * An inferred relationship carries the state class the stylesheet dashes on the
- * canvas, a warning tone, and the word itself — so the distinction survives in
- * text, where a dash pattern cannot reach (AAP 0.6.4: colour and pattern are
- * never the sole indicator).
+ * A relationship with any inferred record carries the state class the
+ * stylesheet dashes on the canvas, a warning tone, and the word itself — with
+ * the inferred share and the ambiguous part when either applies, see
+ * {@link lineageSuffix} — so the distinction survives in text, where a dash
+ * pattern cannot reach (AAP 0.6.4: colour and pattern are never the sole
+ * indicator).
  */
 function RelationshipsCell({ row }: { readonly row: ParticipantRow }): ReactElement {
   if (row.outgoing.length === 0) {
@@ -885,7 +1144,8 @@ function SourceCell({ row }: { readonly row: ParticipantRow }): ReactElement {
  * The columns of the participants grid, in reading order: where a participant
  * sits, what it is, how long it took, what it called, and where it lives.
  *
- * A module constant because every cell is a pure function of its row.
+ * A module constant because every cell is a function of its row (and, for the
+ * participant cell, of {@link FocusedParticipantContext}).
  */
 const PARTICIPANT_COLUMNS: readonly DataTableColumn<ParticipantRow>[] = Object.freeze([
   {
@@ -967,6 +1227,7 @@ export function DependencyGraph(props: DependencyGraphProps): ReactElement {
 
   const [selectedId, setSelectedId] = useState<string | undefined>(undefined);
   const [hoveredId, setHoveredId] = useState<string | undefined>(undefined);
+  const [focusedId, setFocusedId] = useState<string | undefined>(undefined);
 
   // `undefined` when the node names a source this view cannot draw, which stops
   // the query from being issued at all.
@@ -975,15 +1236,25 @@ export function DependencyGraph(props: DependencyGraphProps): ReactElement {
 
   const { status, data, error, retry } = useQuery(query);
 
-  // The whole layout in one memo: canonical ordering, then the layered geometry.
-  // Both are pure functions of the payload, so the same payload always draws the
-  // same picture.
-  const layout = useMemo(
-    () => (data === undefined ? undefined : layoutDependencyGraph(canonicalGraph(data))),
-    [data],
-  );
+  // The whole layout in one memo: one layering, then the canonical ordering and
+  // the layered geometry, both built from that same layering object so it is
+  // resolved exactly once per payload. All three are pure functions of the
+  // payload, so the same payload always draws the same picture.
+  const layout = useMemo(() => {
+    if (data === undefined) {
+      return undefined;
+    }
+
+    const layering = resolveGraphLayering(data.nodes, data.edges);
+    return layoutDependencyGraph(canonicalGraph(data, layering.layers), undefined, layering);
+  }, [data]);
   const rows = useMemo(() => (layout === undefined ? NO_ROWS : buildRows(layout)), [layout]);
   const columns = useMemo(() => buildColumns(rows), [rows]);
+  const inconsistent = useMemo(
+    () =>
+      layout === undefined ? NO_INCONSISTENT_DECLARATIONS : inconsistentDeclarationsOf(layout),
+    [layout],
+  );
 
   const handleActivate = useCallback(
     (row: ParticipantRow): void => {
@@ -1000,6 +1271,18 @@ export function DependencyGraph(props: DependencyGraphProps): ReactElement {
 
   const handleHover = useCallback((id: string | undefined): void => {
     setHoveredId(id);
+  }, []);
+
+  // Focus arriving anywhere in the block names the participant of the grid row
+  // that holds it, or nothing. Leaving clears it; focus moving from one row to
+  // another fires this blur first and the next row's focus straight after, so
+  // the name follows the row. See the "Keyboard focus" section above.
+  const handleFocus = useCallback((event: FocusEvent<HTMLDivElement>): void => {
+    setFocusedId(focusedParticipantIdOf(event.target, event.currentTarget));
+  }, []);
+
+  const handleBlur = useCallback((): void => {
+    setFocusedId(undefined);
   }, []);
 
   const blockClass = clsx('dg-dependency-graph', className);
@@ -1059,7 +1342,7 @@ export function DependencyGraph(props: DependencyGraphProps): ReactElement {
   const canvas = canvasSize(layout);
 
   return (
-    <div className={blockClass}>
+    <div className={blockClass} onFocus={handleFocus} onBlur={handleBlur}>
       {/*
        * The key names all six classes even though it shows five colours:
        * `function` and `service` resolve to the same `--dg-kind-function`
@@ -1107,17 +1390,14 @@ export function DependencyGraph(props: DependencyGraphProps): ReactElement {
            * would be drawn across the labels it passes - and no rule in the
            * stylesheet could correct it afterwards.
            *
-           * BLITZY [A11Y]: `../styles/components.css` strokes these curves with
-           * `--dg-border-strong`, measured in Chrome at 1.76:1 against
-           * `--dg-surface-elevated` in the dark theme and 1.72:1 in light -
-           * below the 3:1 guidance for an essential non-text graphic. The value
-           * belongs to the design system, which sets it once for every view
-           * rather than here, so it is flagged for designer review instead of
-           * being overridden: AAP 0.6.4 permits no hardcoded colour in a
-           * component, and the high-contrast theme already raises the same
-           * stroke to 14.34:1. Nothing is lost meanwhile - every relationship
-           * is enumerated in text in the grid below, and an inferred one is
-           * named there as well as dashed here.
+           * BLITZY [A11Y]: the curves are drawn with the design system's edge
+           * treatment, which `../styles/components.css` declares for
+           * `dg-dependency-graph__edge`; its contrast against the canvas
+           * surface is owned by the design tokens and tested with them, in
+           * every theme, rather than decided here. This component writes no
+           * colour (AAP 0.6.4), and no information depends on the stroke
+           * alone: every relationship is also enumerated in text in the grid
+           * below, and an inferred one is named there as well as dashed here.
            */}
           <g className="dg-dependency-graph__edges">
             {layout.edges.map((positioned) => (
@@ -1210,19 +1490,22 @@ export function DependencyGraph(props: DependencyGraphProps): ReactElement {
       {/*
        * The keyboard-reachable equivalent, and deliberately unvirtualized: an
        * equivalent that covered a window of the participants rather than all of
-       * them would not be one.
+       * them would not be one. The focused participant is provided around it,
+       * so the row holding focus shows its label's detail inline.
        */}
-      <DataTable
-        className="dg-dependency-graph__equivalent"
-        rows={rows}
-        columns={PARTICIPANT_COLUMNS}
-        rowKey={participantRowKey}
-        caption={GRID_CAPTION}
-        selectedRowKey={selectedId ?? null}
-        onRowActivate={handleActivate}
-        virtualize={false}
-        compact
-      />
+      <FocusedParticipantContext.Provider value={focusedId}>
+        <DataTable
+          className="dg-dependency-graph__equivalent"
+          rows={rows}
+          columns={PARTICIPANT_COLUMNS}
+          rowKey={participantRowKey}
+          caption={GRID_CAPTION}
+          selectedRowKey={selectedId ?? null}
+          onRowActivate={handleActivate}
+          virtualize={false}
+          compact
+        />
+      </FocusedParticipantContext.Provider>
 
       <Stack gap={1} className="dg-dependency-graph__note">
         <Text as="p" size="xs" tone="muted">
@@ -1236,6 +1519,16 @@ export function DependencyGraph(props: DependencyGraphProps): ReactElement {
         {layout.droppedEdgeCount > 0 ? (
           <Text as="p" size="xs" tone="warning">
             {droppedRelationshipsNote(layout.droppedEdgeCount)}
+          </Text>
+        ) : null}
+        {inconsistent.coordinates > 0 ? (
+          <Text as="p" size="xs" tone="warning">
+            {inconsistentCoordinatesNote(inconsistent.coordinates)}
+          </Text>
+        ) : null}
+        {inconsistent.lineages > 0 ? (
+          <Text as="p" size="xs" tone="warning">
+            {inconsistentLineagesNote(inconsistent.lineages)}
           </Text>
         ) : null}
         {layout.layersComputed ? (

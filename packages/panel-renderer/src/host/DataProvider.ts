@@ -13,15 +13,36 @@
  * ## What it mirrors
  *
  * The shape below is the client-side face of the service's panel-data contract,
- * `POST /sessions/:id/panel-data` (AAP 0.4.2): the request body is a `DataQuery`
- * and the response is discriminated on `source`. Each host surface implements
- * this interface over whatever channel it owns — the DevTools panel proxies the
- * call through its extension service worker, the editor webview through host
- * messaging — and both return the same {@link DataQueryResponse}. Because the
- * two sides of that contract are described once, in `@debuggen/panel-schema`
- * (the query) and `@debuggen/telemetry` (the results), nothing here restates a
- * data shape: every result type below is an `import type` from the package that
- * owns it.
+ * `POST /sessions/:id/panel-data` (AAP 0.4.2): the route is addressed by a
+ * session id, the request body is a `DataQuery` and the response is
+ * discriminated on `source`. Each host surface implements this interface over
+ * whatever channel it owns — the DevTools panel proxies the call through its
+ * extension service worker, the editor webview through host messaging — and
+ * both return the same {@link DataQueryResponse}. Because the two sides of that
+ * contract are described once, in `@debuggen/panel-schema` (the query) and
+ * `@debuggen/telemetry` (the results), nothing here restates a data shape: every
+ * result type below is an `import type` from the package that owns it.
+ *
+ * ## Which session a query belongs to
+ *
+ * Every call names its session explicitly, as the first argument of
+ * {@link DataProvider.query}. The authoritative value is the `sessionId` of the
+ * panel specification being drawn: `PanelHost` places it in
+ * {@link PanelSessionContext} and `./useQuery` forwards it on every call,
+ * unchanged. A provider therefore never has to remember which session it was
+ * built for — the same provider object serves a reopened session's panel and
+ * the current one side by side, and a panel can never fetch another session's
+ * evidence because a closure outlived the panel it was created for.
+ *
+ * ## Paging counters, as the wire carries them
+ *
+ * The service's response marks the last page with `nextOffset: null` and always
+ * reports `total` for the array-valued sources (the protocol's `DataPage`
+ * echo). {@link DataQueryResponse} accepts exactly that form — `null` and an
+ * absent key both mean "no further page" — so a host surface forwards the
+ * decoded counters as they arrived instead of translating them.
+ * `./useQuery` then reports end-of-data to components one way only, as an
+ * `undefined` `nextOffset`.
  *
  * ## What it deliberately does not do
  *
@@ -39,10 +60,12 @@
  * response shapes ({@link DataQueryResponse}, {@link AnyDataQueryResponse}), the
  * interface and its options ({@link DataProvider}, {@link DataQueryOptions}),
  * one factory for implementing it from a source-agnostic resolver
- * ({@link createDataProvider}, {@link DataQueryResolver}), the React context
- * `PanelHost` provides ({@link DataProviderContext}) and the hook that reads it
- * ({@link useDataProvider}). The paging constants of the contract are re-exported
- * from `@debuggen/panel-schema` so that no consumer restates them.
+ * ({@link createDataProvider}, {@link DataQueryResolver},
+ * {@link DataQueryResolverContext}), the two React contexts `PanelHost` provides
+ * ({@link DataProviderContext}, {@link PanelSessionContext}) and the hooks that
+ * read them ({@link useDataProvider}, {@link usePanelSessionId}). The paging
+ * constants of the contract are re-exported from `@debuggen/panel-schema` so
+ * that no consumer restates them.
  */
 
 import { createContext, useContext } from 'react';
@@ -189,22 +212,31 @@ export interface DataQueryResponse<Source extends DataQuerySource = DataQuerySou
    * How many items the source holds in total after `filter` is applied, before
    * `limit` and `offset`.
    *
-   * Present only for the array-valued sources, where it is what lets a view say
-   * how much of the source the page it drew actually covers. The scalar sources
-   * — the correlated tree, the component-tree snapshot, the dependency graph —
-   * are not paged and omit it, as does any provider that cannot know the total.
+   * Present for the array-valued sources, where the service always reports it
+   * (as a non-negative whole number, never `null`) and it is what lets a view
+   * say how much of the source the page it drew actually covers. The scalar
+   * sources — the correlated tree, the component-tree snapshot, the dependency
+   * graph — are not paged and omit it, as does any provider that cannot know the
+   * total.
    */
   readonly total?: number | undefined;
   /**
-   * The `offset` that would return the next page, or absent when this page is
-   * the last one.
+   * The `offset` that would return the next page; `null` or absent when this
+   * page is the last one.
    *
-   * Present only for the array-valued sources. A view advances paging by copying
-   * this value into the next query's `offset`; it never computes an offset from
-   * the length of what it received, which would drift the moment the service
-   * clamped a `limit`.
+   * `null` is the wire's own spelling of "no further page" — the service sends
+   * `nextOffset: null` on the last page of every array-valued source, because
+   * JSON has no `undefined` and the protocol states the end explicitly rather
+   * than by omission — so a host surface forwards the decoded value untouched.
+   * Absent is the same answer, for the unpaged sources and for any provider
+   * that does not page. `./useQuery` folds both into one `undefined`, so no
+   * component has to know two spellings.
+   *
+   * A view advances paging by copying this value into the next query's
+   * `offset`; it never computes an offset from the length of what it received,
+   * which would drift the moment the service clamped a `limit`.
    */
-  readonly nextOffset?: number | undefined;
+  readonly nextOffset?: number | null | undefined;
 }
 
 /**
@@ -247,8 +279,13 @@ export interface DataQueryOptions {
  *
  * One method, promise-returning and transport-agnostic. It is generic over the
  * query's `source` so that the response's `data` is typed precisely at each call
- * site: `query({ source: 'renders', … })` resolves to render statistics, and no
- * caller has to cast or re-check what it received.
+ * site: `query(sessionId, { source: 'renders', … })` resolves to render
+ * statistics, and no caller has to cast or re-check what it received.
+ *
+ * The session is the first argument because the service's route is addressed by
+ * it (`POST /sessions/:id/panel-data`) and because the panel being drawn is what
+ * knows it: `./useQuery` passes the `sessionId` of the specification `PanelHost`
+ * is rendering, read from {@link PanelSessionContext}, on every call.
  *
  * ## Implementer obligations
  *
@@ -256,6 +293,10 @@ export interface DataQueryOptions {
  * each of the following. They are requirements, not suggestions: the library's
  * loading, empty and error states are only honest if they hold.
  *
+ * 0. **Route by the session it was given.** Address the request to exactly the
+ *    `sessionId` argument, never to a session remembered from construction or
+ *    from an earlier call. The argument is the panel's own claim about which
+ *    capture it describes, and the service authorises and resolves against it.
  * 1. **Echo the source.** Resolve with a response whose `source` equals the
  *    request's `source`. Components switch on it.
  * 2. **Never dress a failure as data.** A failed call must reject. Resolving
@@ -271,13 +312,16 @@ export interface DataQueryOptions {
  * 5. **Resolve one page, as given.** Pass `filter`, `sort`, `limit` and `offset`
  *    through to the side that owns the capture and return its answer untouched —
  *    no client-side re-ordering, no merging of pages, no de-duplication — along
- *    with its `total` and `nextOffset` for the array-valued sources.
+ *    with its `total` and `nextOffset` for the array-valued sources, `null`
+ *    included where the service sent one.
  * 6. **Preserve redaction.** Attribute values, URLs and statements arrive
  *    already redacted and truncated (AAP 0.5.2). An implementation must never
  *    enrich, expand or reconstruct them.
  * 7. **Stay referentially stable.** The provider object is passed through React
  *    context and is part of the query effect's dependencies, so a new object per
- *    render would refetch every node forever. Create it once per session.
+ *    render would refetch every node forever. Create it once per host surface
+ *    and keep it: because the session travels on every call, one provider serves
+ *    every session that surface shows.
  * 8. **Report every failure through the promise.** `query` must not throw
  *    synchronously — not for a disconnected channel, not for a query it rejects.
  *    The caller runs it inside a React effect, where a synchronous throw escapes
@@ -299,17 +343,39 @@ export interface DataQueryOptions {
  */
 export interface DataProvider {
   /**
-   * Resolve one page of one query.
+   * Resolve one page of one query for one session.
    *
    * @typeParam Source - The source named by `query.source`, inferred from it.
+   * @param sessionId - The session the query is addressed to: the `sessionId`
+   * of the panel specification being rendered, passed exactly as it carries it.
    * @param query - The declarative request carried by the node being rendered.
    * @param options - Per-call options; `signal` cancels the request.
    * @returns The response for that source, with its paging counters.
    */
   query<Source extends DataQuerySource>(
+    sessionId: string,
     query: DataQuery & { source: Source },
     options?: DataQueryOptions,
   ): Promise<DataQueryResponse<Source>>;
+}
+
+/**
+ * What {@link createDataProvider} hands a {@link DataQueryResolver} beside the
+ * query: the session the call is addressed to, and the per-call options.
+ *
+ * One object rather than further positional arguments, so the resolver's first
+ * parameter stays the query it answers — the one thing a stub that serves a
+ * single fixed capture reads — while the session a real transport routes by is
+ * always present on the second. `sessionId` is required: the factory rejects a
+ * call that names no session before the resolver ever runs, so a resolver can
+ * address its request without re-checking it.
+ */
+export interface DataQueryResolverContext extends DataQueryOptions {
+  /**
+   * The session the query is addressed to, exactly as the caller passed it to
+   * {@link DataProvider.query}. Never blank.
+   */
+  readonly sessionId: string;
 }
 
 /**
@@ -318,29 +384,53 @@ export interface DataProvider {
  *
  * This is the shape a host surface naturally has — one channel carrying every
  * query, one decoded response back — and the shape a test stub naturally has.
- * {@link createDataProvider} turns it into a {@link DataProvider}.
+ * {@link createDataProvider} turns it into a {@link DataProvider}, moving the
+ * provider's positional `sessionId` onto {@link DataQueryResolverContext}.
  *
- * The same obligations listed on {@link DataProvider} apply to a resolver, with
- * one relaxation: it need not thread the request's source into its return type,
- * because the factory checks at runtime that the two agree. The return type is
- * therefore the uncorrelated `DataQueryResponse<DataQuerySource>`, which accepts
- * both a value built from the request (`{ source: query.source, data: … }`) and
- * a precisely discriminated {@link AnyDataQueryResponse} that a transport
- * decoded.
+ * The same obligations listed on {@link DataProvider} apply to a resolver —
+ * route by `context.sessionId`, honour `context.signal` — with one relaxation:
+ * it need not thread the request's source into its return type, because the
+ * factory checks at runtime that the two agree. The return type is therefore
+ * the uncorrelated `DataQueryResponse<DataQuerySource>`, which accepts both a
+ * value built from the request (`{ source: query.source, data: … }`) and a
+ * precisely discriminated {@link AnyDataQueryResponse} that a transport decoded.
+ *
+ * @example A host surface forwarding every query over its own channel.
+ * ```ts
+ * const provider = createDataProvider((query, { sessionId, signal }) =>
+ *   channel.request({ sessionId, query }, signal),
+ * );
+ * ```
  *
  * @param query - The query to resolve, exactly as the node carried it.
- * @param options - Per-call options; `signal` cancels the request.
+ * @param context - The session to address and the per-call options.
  * @returns The response for the query's own source.
  */
 export type DataQueryResolver = (
   query: DataQuery,
-  options?: DataQueryOptions,
+  context: DataQueryResolverContext,
 ) => Promise<DataQueryResponse>;
+
+/**
+ * Whether a value can address a session: a string with a visible character.
+ *
+ * The one runtime check on the session argument: {@link createDataProvider}
+ * applies it before the resolver runs, and `./useQuery` applies it before it
+ * calls a provider at all, reporting a failure as the node's error state. A
+ * blank id would address `/sessions//panel-data`, which no service answers
+ * meaningfully, so it is refused before any transport runs.
+ *
+ * @param sessionId - The candidate session id.
+ * @returns `true` when the id is usable as a route segment's value.
+ */
+export function isAddressableSessionId(sessionId: unknown): sessionId is string {
+  return typeof sessionId === 'string' && sessionId.trim() !== '';
+}
 
 /**
  * Build a {@link DataProvider} from a source-agnostic {@link DataQueryResolver}.
  *
- * Two things are gained by going through here rather than implementing the
+ * Three things are gained by going through here rather than implementing the
  * generic interface by hand. The first is the type assertion the generic
  * signature forces on any uniform implementation: it lives on one line below,
  * guarded, instead of once per host surface and once per test stub. The second
@@ -351,12 +441,19 @@ export type DataQueryResolver = (
  * `source` and started reading fields the data does not have; here it becomes a
  * rejection with a code and a hint, which a node renders as its error state.
  *
- * The returned provider is a new object, so create it once per session (or per
- * test) and keep the reference: it is part of the query effect's dependencies.
- * It also satisfies the last obligation on {@link DataProvider} for free: the
- * resolver is invoked inside an `async` method, so even a resolver that throws
- * synchronously — one that reads a channel it has not opened, say — produces a
- * rejected promise rather than an exception in the middle of a render.
+ * A third is the session hand-over: the provider's positional `sessionId` is
+ * checked with {@link isAddressableSessionId} and passed to the resolver on
+ * {@link DataQueryResolverContext}, unchanged. A call naming no usable session
+ * is rejected with a code and a hint before the resolver runs, so no transport
+ * ever sends a request addressed to nobody.
+ *
+ * The returned provider is a new object, so create it once per host surface (or
+ * per test) and keep the reference: it is part of the query effect's
+ * dependencies. It also satisfies the last obligation on {@link DataProvider}
+ * for free: the resolver is invoked inside an `async` method, so even a
+ * resolver that throws synchronously — one that reads a channel it has not
+ * opened, say — produces a rejected promise rather than an exception in the
+ * middle of a render.
  *
  * @param resolve - The resolver to adapt. Called once per query.
  * @returns A provider that delegates every query to `resolve`.
@@ -364,10 +461,22 @@ export type DataQueryResolver = (
 export function createDataProvider(resolve: DataQueryResolver): DataProvider {
   return {
     async query<Source extends DataQuerySource>(
+      sessionId: string,
       query: DataQuery & { source: Source },
       options?: DataQueryOptions,
     ): Promise<DataQueryResponse<Source>> {
-      const response = await resolve(query, options);
+      if (!isAddressableSessionId(sessionId)) {
+        throw new DebuggenError(
+          'PROTOCOL_INVALID_MESSAGE',
+          `The data provider was asked for a "${query.source}" query without a session to address it to.`,
+          {
+            hint: 'Pass the sessionId of the panel being rendered; PanelHost provides it through PanelSessionContext.',
+            details: { source: query.source },
+          },
+        );
+      }
+
+      const response = await resolve(query, { sessionId, signal: options?.signal });
 
       if (response.source !== query.source) {
         throw new DebuggenError(
@@ -428,4 +537,43 @@ DataProviderContext.displayName = 'DebuggenDataProviderContext';
  */
 export function useDataProvider(): DataProvider | undefined {
   return useContext(DataProviderContext);
+}
+
+/**
+ * The session the panel beneath it belongs to, provided by `PanelHost` and read
+ * by `./useQuery`, which passes it as the first argument of every
+ * {@link DataProvider.query} call.
+ *
+ * `PanelHost` provides `spec.sessionId` — the specification's own statement of
+ * which session's capture it describes, and therefore the only value a panel's
+ * queries may be addressed to. A surface that mounts query-backed views without
+ * a `PanelHost` provides it itself, beside {@link DataProviderContext}.
+ *
+ * A separate context from the provider on purpose. The value is a string, so it
+ * is stable by value and costs the host no memoization; it changes exactly when
+ * the panel being drawn moves to another session, which is precisely when every
+ * query beneath it must be resolved again; and the provider object stays the
+ * one long-lived instance per host surface that obligation 7 on
+ * {@link DataProvider} asks for.
+ *
+ * The default is `undefined`, for the same reason as the provider context's: a
+ * query addressed to an invented session would be answered with someone else's
+ * evidence or with nothing, and both would look like a successful panel. An
+ * absent session is reported by `./useQuery` as a typed error state instead.
+ */
+export const PanelSessionContext = createContext<string | undefined>(undefined);
+
+PanelSessionContext.displayName = 'DebuggenPanelSessionContext';
+
+/**
+ * Read the ambient session id, or `undefined` when none is provided.
+ *
+ * Never throws, for the reasons given on {@link useDataProvider}: components
+ * that need no data are mounted with neither context on purpose, and a view that
+ * does need data reports the absence as its error state through `./useQuery`.
+ *
+ * @returns The session id from context, or `undefined` when the tree has none.
+ */
+export function usePanelSessionId(): string | undefined {
+  return useContext(PanelSessionContext);
 }

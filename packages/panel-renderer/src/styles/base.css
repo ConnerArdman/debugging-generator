@@ -52,11 +52,16 @@
  *
  * Purely relational forms encode no design decision and are permitted:
  * percentages such as `100%`, grid and flex ratios such as `1fr`,
- * `minmax(0, 1fr)` and `flex: 1 1 auto`, font-relative squares such as `1em`,
- * `inset(50%)`, unitless SVG geometry (for example `stroke-dasharray`), and
- * the CSS border-width keywords `thin` and `medium` — which is how a hairline
- * rule is expressed here, never as a length. A duration is not among them: a
- * transition or animation takes its timing from the motion tokens.
+ * `minmax(0, 1fr)` and `flex: 1 1 auto`, `inset(50%)`, unitless SVG geometry
+ * (for example `stroke-dasharray`), and the CSS border-width keywords `thin`
+ * and `medium` — which is how a hairline rule is expressed here, never as a
+ * length. A duration is not among them: a transition or animation takes its
+ * timing from the motion tokens, and a visible size is not either: a glyph box
+ * takes `--dg-icon-size`, which is font-relative in the token table itself.
+ * The one length literal in this file is the `1em` clip box of
+ * `.dg-visually-hidden`, which paints nothing and so encodes no visual
+ * dimension; `src/tokens/tokens.test.ts` names that exemption exactly and
+ * fails on any other length literal.
  *
  * ## Type roles
  *
@@ -330,17 +335,18 @@ body {
 
 /* An icon is a font-relative square that takes its colour from its context, so
  * it scales with the type role around it and needs no size or colour of its
- * own. `fill` and `stroke` are intentionally not set: the icon library's own
- * `currentColor` attributes resolve through `color`, which leaves a component
- * free to use either a stroked or a filled glyph.
+ * own: its square is the `--dg-icon-size` token, which is `1em` resolved
+ * against the icon's own font. `fill` and `stroke` are intentionally not set:
+ * the icon library's own `currentColor` attributes resolve through `color`,
+ * which leaves a component free to use either a stroked or a filled glyph.
  *
  * `flex: none` keeps it from stretching inside a layout primitive, and
  * `pointer-events: none` makes it inert — an icon is decoration or a label,
  * and an interactive icon is one placed inside a button. */
 .dg-icon {
   flex: none;
-  inline-size: 1em;
-  block-size: 1em;
+  inline-size: var(--dg-icon-size);
+  block-size: var(--dg-icon-size);
   color: currentColor;
   pointer-events: none;
 }

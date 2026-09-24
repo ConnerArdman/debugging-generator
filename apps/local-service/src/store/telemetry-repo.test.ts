@@ -42,9 +42,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { DATA_QUERY_DEFAULT_LIMIT, DATA_QUERY_MAX_LIMIT } from '@debuggen/panel-schema';
+import {
+  DATA_QUERY_DEFAULT_LIMIT,
+  DATA_QUERY_MAX_LIMIT,
+  DATA_QUERY_SORTS,
+} from '@debuggen/panel-schema';
 import {
   createConsoleLogger,
   isErr,
@@ -71,14 +75,26 @@ import type { Store } from './db.js';
 import {
   CANONICAL_ORDER_BY,
   DEFAULT_PURGE_BATCH_SIZE,
+  DELETE_OLDER_THAN_BATCH_SQL,
+  DELETE_SESSION_BATCH_SQL,
+  DELETE_SESSION_OLDER_THAN_BATCH_SQL,
   DURATION_DESC_ORDER_BY,
   EXISTENCE_LOOKUP_CHUNK_SIZE,
+  MAX_PURGE_BATCH_SIZE,
+  TELEMETRY_DEFAULT_GROUP_KEY,
+  TELEMETRY_GROUP_KEYS,
   TELEMETRY_QUERY_DEFAULT_LIMIT,
   TELEMETRY_QUERY_MAX_LIMIT,
   TELEMETRY_SORTS,
   createTelemetryRepo,
+  isTelemetryGroupKey,
 } from './telemetry-repo.js';
-import type { PersistableTelemetryEvent, TelemetryPage, TelemetryRepo } from './telemetry-repo.js';
+import type {
+  PersistableTelemetryEvent,
+  TelemetryGroupPage,
+  TelemetryPage,
+  TelemetryRepo,
+} from './telemetry-repo.js';
 
 /* -------------------------------------------------------------------------------------------------
  * Fixtures
@@ -312,6 +328,7 @@ describe('the contract', () => {
     const members = [
       'insertMany',
       'query',
+      'queryGroups',
       'listByTrace',
       'listByCapture',
       'listByRequestKey',
@@ -349,7 +366,25 @@ describe('the contract', () => {
   it('defines the canonical order once, and ends every ordering with it', () => {
     expect(CANONICAL_ORDER_BY).toBe('start_time ASC, producer_id ASC, seq ASC, ingest_seq ASC');
     expect(DURATION_DESC_ORDER_BY).toBe(`duration DESC, ${CANONICAL_ORDER_BY}`);
-    expect([...TELEMETRY_SORTS]).toEqual(['start_asc', 'duration_desc']);
+  });
+
+  it('accepts exactly the panel-data sort vocabulary, and a closed set of group keys', () => {
+    // The whole vocabulary, not a subset of it: a panel node's `sort` is
+    // forwarded unchanged, so a member missing here would be a panel that
+    // validates and then fails to load.
+    expect(TELEMETRY_SORTS).toBe(DATA_QUERY_SORTS);
+    expect([...TELEMETRY_SORTS].sort()).toEqual(['count_desc', 'duration_desc', 'start_asc']);
+    expect([...TELEMETRY_GROUP_KEYS]).toEqual([
+      'name',
+      'kind',
+      'traceId',
+      'requestKey',
+      'component',
+    ]);
+    expect(TELEMETRY_DEFAULT_GROUP_KEY).toBe('name');
+    expect(TELEMETRY_GROUP_KEYS.every((key) => isTelemetryGroupKey(key))).toBe(true);
+    expect(isTelemetryGroupKey('constructor')).toBe(false);
+    expect(isTelemetryGroupKey('trace_id')).toBe(false);
   });
 
   it('takes its paging bounds from the panel-data contract rather than restating them', () => {
@@ -469,10 +504,10 @@ describe('insertMany', () => {
     expect(unwrap(repo.countBySession(SESSION_A))).toBe(1);
   });
 
-  it('never reuses an arrival number after a purge', () => {
+  it('never reuses an arrival number after a purge', async () => {
     insertOk([buildEvent(), buildEvent(), buildEvent()]);
 
-    expect(unwrap(repo.deleteBySession(SESSION_A))).toBe(3);
+    expect(unwrap(await repo.deleteBySession(SESSION_A))).toBe(3);
 
     const [afterPurge] = insertOk([buildEvent()]);
 
@@ -588,6 +623,201 @@ describe('insertMany', () => {
     // The first element of the batch was written and then rolled back.
     expect(unwrap(repo.countBySession(SESSION_B))).toBe(0);
     expect(unwrap(repo.countBySession(SESSION_A))).toBe(1);
+  });
+
+  it('answers an exact replay with the stored event, not the candidate', () => {
+    const event = buildEvent({
+      startTime: BASE_TIME + 0.125,
+      duration: 3.375,
+      attributes: { 'http.method': 'GET', note: SENTINEL },
+    });
+    const [first] = insertOk([event]);
+    const replay = unwrap(repo.insertMany([event]));
+
+    expect(replay.inserted).toBe(0);
+    expect(replay.skipped).toBe(1);
+
+    // The persisted row, reconstructed with its own arrival number: exactly
+    // what a read returns for it.
+    const [returned] = replay.events;
+    const [read] = unwrap(repo.query({ sessionId: SESSION_A })).rows;
+
+    expect(returned).toEqual(first);
+    expect(returned).toEqual(read);
+    expect(returned?.ingestSeq).toBe(1);
+    expect(unwrap(repo.countBySession(SESSION_A))).toBe(1);
+  });
+
+  it('treats a replay differing only in key order or in an undefined optional field as exact', () => {
+    const event = buildEvent({
+      attributes: { alpha: 1, nested: { first: 'a', second: [1, 2.5] }, omega: true },
+    });
+
+    insertOk([event]);
+
+    // Every key reversed, at the top level and inside the attribute bag, plus
+    // two optional fields present as `undefined` where the stored copy has
+    // none: the stored JSON document cannot tell any of that apart.
+    const reordered = {
+      ...Object.fromEntries(Object.entries(event).reverse()),
+      attributes: { omega: true, nested: { second: [1, 2.5], first: 'a' }, alpha: 1 },
+      parentSpanId: undefined,
+      redacted: undefined,
+    } as unknown as PersistableTelemetryEvent;
+
+    const replay = repo.insertMany([reordered]);
+
+    expect(isErr(replay)).toBe(false);
+
+    if (isErr(replay)) {
+      return;
+    }
+
+    expect(replay.value.skipped).toBe(1);
+    expect(replay.value.inserted).toBe(0);
+    expect(replay.value.events[0]).toEqual({ ...event, ingestSeq: 1 });
+  });
+
+  it.each<readonly [string, (event: PersistableTelemetryEvent) => PersistableTelemetryEvent]>([
+    ['captureId', (event) => ({ ...event, captureId: CAPTURE_A2 })],
+    ['traceId', (event) => ({ ...event, traceId: TRACE_B })],
+    // A different double, not a different millisecond: the comparison is
+    // exact, so a sub-millisecond drift is a different event.
+    ['startTime', (event) => ({ ...event, startTime: event.startTime + 0.001 })],
+    ['duration', (event) => ({ ...event, duration: event.duration + 0.5 })],
+    [
+      'attributes',
+      (event) => ({ ...event, attributes: { ...event.attributes, note: `${SENTINEL}-changed` } }),
+    ],
+    [
+      'source',
+      (event) => ({
+        ...event,
+        source: {
+          file: 'src/server/report.ts',
+          line: 12,
+          column: 3,
+          resolvedBy: 'patch',
+          confidence: 1,
+        },
+      }),
+    ],
+  ])(
+    'refuses a same-session replay that differs in %s, and rolls the whole batch back',
+    (field, mutate) => {
+      const original = buildEvent({ attributes: { note: SENTINEL } });
+
+      insertOk([original]);
+
+      const storedDocument = readRow(original.id)?.['event'];
+      const before = unwrap(repo.countBySession(SESSION_A));
+
+      // Two new events ahead of the conflicting one, so the rollback is
+      // observable: they are written first, inside the batch transaction.
+      const written = repo.insertMany([buildEvent(), buildEvent(), mutate(original)]);
+
+      expect(isErr(written)).toBe(true);
+
+      if (!isErr(written)) {
+        return;
+      }
+
+      expect(written.error.code).toBe('STORE_ERROR');
+      expect(written.error.details?.['reason']).toBe('event-id-conflict');
+      expect(written.error.details?.['eventId']).toBe(original.id);
+      expect(written.error.details?.['fields']).toEqual([field]);
+      expect(written.error.message).toContain(field);
+
+      // Nothing of the batch survived, and the stored row is untouched.
+      expect(unwrap(repo.countBySession(SESSION_A))).toBe(before);
+      expect(readRow(original.id)?.['event']).toBe(storedDocument);
+
+      // Field names only: neither side's captured values reach the error or
+      // any log record.
+      expect(errorText(written.error)).not.toContain(SENTINEL);
+      expect(loggedText()).not.toContain(SENTINEL);
+    },
+  );
+
+  it('names every differing field, sorted', () => {
+    const original = buildEvent();
+
+    insertOk([original]);
+
+    const written = repo.insertMany([
+      { ...original, startTime: original.startTime + 1, attributes: { changed: 1 } },
+    ]);
+
+    expect(isErr(written)).toBe(true);
+
+    if (isErr(written)) {
+      expect(written.error.details?.['fields']).toEqual(['attributes', 'startTime']);
+    }
+  });
+
+  it('refuses two differing copies of one id inside the same batch', () => {
+    const event = buildEvent({ attributes: { note: SENTINEL } });
+    const written = repo.insertMany([
+      buildEvent(),
+      event,
+      { ...event, duration: event.duration + 1 },
+    ]);
+
+    expect(isErr(written)).toBe(true);
+
+    if (isErr(written)) {
+      expect(written.error.details?.['reason']).toBe('event-id-conflict');
+      expect(written.error.details?.['fields']).toEqual(['duration']);
+      expect(errorText(written.error)).not.toContain(SENTINEL);
+    }
+
+    // The first copy was written inside the batch transaction and rolled back
+    // with everything else.
+    expect(unwrap(repo.countBySession(SESSION_A))).toBe(0);
+  });
+
+  it('refuses a replay whose stored row no longer reconstructs, and rolls the batch back', () => {
+    const event = buildEvent();
+
+    // The id is held by a row written by another build: valid flat columns, a
+    // document this build cannot read, and a captured value inside it.
+    store
+      .statement(
+        `INSERT INTO telemetry_events (
+           id, session_id, capture_id, trace_id, span_id, kind, tier,
+           name, start_time, duration, producer_id, seq, event
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        event.id,
+        SESSION_A,
+        CAPTURE_A1,
+        TRACE_A,
+        event.spanId,
+        'fetch',
+        'browser',
+        'operation',
+        BASE_TIME,
+        1,
+        PRODUCER_BROWSER,
+        0,
+        JSON.stringify({ unexpected: SENTINEL }),
+      );
+
+    const written = repo.insertMany([buildEvent(), event]);
+
+    expect(isErr(written)).toBe(true);
+
+    if (isErr(written)) {
+      expect(written.error.code).toBe('STORE_ERROR');
+      expect(written.error.details?.['reason']).toBe('stored-event-unreadable');
+      expect(written.error.details?.['eventId']).toBe(event.id);
+      expect(written.error.details?.['ingestSeq']).toBe(1);
+      expect(errorText(written.error)).not.toContain(SENTINEL);
+    }
+
+    expect(unwrap(repo.countBySession(SESSION_A))).toBe(1);
+    expect(loggedText()).not.toContain(SENTINEL);
   });
 
   it('logs one line per batch, carrying counts only', () => {
@@ -834,7 +1064,11 @@ describe('query', () => {
       [{ sessionId: SESSION_A, offset: 2.5 }, 'invalid-offset'],
       [{ sessionId: SESSION_A, minDuration: Number.NaN }, 'invalid-min-duration'],
       [{ sessionId: SESSION_A, minDuration: -1 }, 'invalid-min-duration'],
-      [{ sessionId: SESSION_A, sort: 'count_desc' }, 'unknown-sort'],
+      [{ sessionId: SESSION_A, sort: 'not-a-sort' }, 'unknown-sort'],
+      // A name on Object.prototype: refused by membership, never looked up.
+      [{ sessionId: SESSION_A, sort: 'constructor' }, 'unknown-sort'],
+      [{ sessionId: SESSION_A, sort: 'count_desc', groupBy: 'not-a-key' }, 'unknown-group-key'],
+      [{ sessionId: SESSION_A, groupBy: 'constructor' }, 'unknown-group-key'],
       [{ sessionId: SESSION_A, kinds: ['not-a-kind'] }, 'unknown-kind'],
       [{ sessionId: SESSION_A, tiers: ['not-a-tier'] }, 'unknown-tier'],
     ] as const;
@@ -940,6 +1174,461 @@ describe('query', () => {
 
     expect(second.rows.map((event) => event.id)).toEqual([last.id]);
     expect(second.nextOffset).toBeUndefined();
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * count_desc and grouped reads
+ * ---------------------------------------------------------------------------------------------- */
+
+describe('count_desc and grouped reads', () => {
+  /**
+   * Six operation names with counts 3, 2, 2, 2, 1 and 1 — three ties of two
+   * and one tie of one, so the tie-break is what decides most of the order —
+   * inserted interleaved so neither arrival order nor start order matches the
+   * expected group order.
+   */
+  function insertNamedGroups(): TelemetryEvent[] {
+    const names = [
+      'gamma',
+      'alpha',
+      'zeta',
+      'beta',
+      'delta',
+      'alpha',
+      'gamma',
+      'epsilon',
+      'beta',
+      'delta',
+      'alpha',
+    ];
+
+    return insertOk(
+      names.map((name, index) =>
+        buildEvent({ name, startTime: BASE_TIME + 100 - index, duration: index + 0.25 }),
+      ),
+    );
+  }
+
+  it('accepts every DATA_QUERY_SORTS member, for rows and for groups', () => {
+    insertNamedGroups();
+
+    for (const sort of DATA_QUERY_SORTS) {
+      const rows = repo.query({ sessionId: SESSION_A, sort });
+      const groups = repo.queryGroups({ sessionId: SESSION_A, groupBy: 'name', sort });
+
+      expect(isErr(rows)).toBe(false);
+      expect(isErr(groups)).toBe(false);
+      expect(unwrap(rows).total).toBe(11);
+      expect(unwrap(groups).total).toBe(6);
+    }
+  });
+
+  it('pages groups largest first, breaking count ties on the key, across a multi-page walk', () => {
+    const stored = insertNamedGroups();
+    const whole = unwrap(repo.queryGroups({ sessionId: SESSION_A, groupBy: 'name' }));
+
+    expect(whole.groups.map((group) => [group.key, group.count])).toEqual([
+      ['alpha', 3],
+      ['beta', 2],
+      ['delta', 2],
+      ['gamma', 2],
+      ['epsilon', 1],
+      ['zeta', 1],
+    ]);
+    expect(whole.total).toBe(6);
+    expect(whole.nextOffset).toBeUndefined();
+
+    // Each group cites its first stored row and reports its timing unrounded.
+    const alpha = stored.filter((event) => event.name === 'alpha');
+
+    expect(whole.groups[0]).toEqual({
+      key: 'alpha',
+      count: 3,
+      firstEventId: alpha[0]?.id,
+      firstIngestSeq: alpha[0]?.ingestSeq,
+      firstStartTime: Math.min(...alpha.map((event) => event.startTime)),
+      totalDuration: alpha.reduce((sum, event) => sum + event.duration, 0),
+    });
+
+    // Two groups per page: every group exactly once, in the single-page order.
+    const walked: string[] = [];
+    const offsets: (number | undefined)[] = [];
+    let offset: number | undefined = 0;
+
+    while (offset !== undefined) {
+      const page: TelemetryGroupPage = unwrap(
+        repo.queryGroups({ sessionId: SESSION_A, groupBy: 'name', limit: 2, offset }),
+      );
+
+      expect(page.total).toBe(6);
+      walked.push(...page.groups.map((group) => group.key));
+      offsets.push(page.nextOffset);
+      offset = page.nextOffset;
+    }
+
+    expect(offsets).toEqual([2, 4, undefined]);
+    expect(walked).toEqual(whole.groups.map((group) => group.key));
+    expect(new Set(walked).size).toBe(6);
+  });
+
+  it('orders rows by their group\u2019s count, keeping each group together in canonical order', () => {
+    const stored = insertNamedGroups();
+    const whole = unwrap(repo.query({ sessionId: SESSION_A, sort: 'count_desc', limit: 50 }));
+
+    expect(whole.rows.map((event) => event.name)).toEqual([
+      'alpha',
+      'alpha',
+      'alpha',
+      'beta',
+      'beta',
+      'delta',
+      'delta',
+      'gamma',
+      'gamma',
+      'epsilon',
+      'zeta',
+    ]);
+
+    // Inside a group the canonical chain decides, exactly as the correlator
+    // orders events.
+    const alpha = whole.rows.filter((event) => event.name === 'alpha');
+
+    expect(alpha.map((event) => event.id)).toEqual(
+      stored
+        .filter((event) => event.name === 'alpha')
+        .sort(compareEventsCanonical)
+        .map((event) => event.id),
+    );
+
+    // The default group key is the operation name, so naming it changes
+    // nothing; and a three-row walk visits every row exactly once.
+    const named = unwrap(
+      repo.query({ sessionId: SESSION_A, sort: 'count_desc', groupBy: 'name', limit: 50 }),
+    );
+
+    expect(named.rows.map((event) => event.id)).toEqual(whole.rows.map((event) => event.id));
+
+    const walked: string[] = [];
+    let offset: number | undefined = 0;
+
+    while (offset !== undefined) {
+      const page: TelemetryPage = unwrap(
+        repo.query({ sessionId: SESSION_A, sort: 'count_desc', limit: 3, offset }),
+      );
+
+      walked.push(...page.rows.map((event) => event.id));
+      offset = page.nextOffset;
+    }
+
+    expect(walked).toEqual(whole.rows.map((event) => event.id));
+    expect(new Set(walked).size).toBe(stored.length);
+  });
+
+  it('respects the filter, and leaves rows without a key out of every group', () => {
+    const keyOne = 'd4'.repeat(32);
+    const keyTwo = 'e5'.repeat(32);
+
+    insertOk([
+      buildEvent({ attributes: { request_key: keyTwo }, startTime: BASE_TIME + 1 }),
+      buildEvent({ attributes: { request_key: keyOne }, startTime: BASE_TIME + 2 }),
+      buildEvent({ attributes: { request_key: keyOne }, startTime: BASE_TIME + 3 }),
+      buildEvent({ attributes: { request_key: keyOne }, startTime: BASE_TIME + 4 }),
+      buildEvent({
+        attributes: { request_key: keyTwo },
+        captureId: CAPTURE_A2,
+        startTime: BASE_TIME + 5,
+      }),
+      // Not requests: no request key, so no request group.
+      buildEvent({ kind: 'interaction', startTime: BASE_TIME + 6 }),
+      buildEvent({ kind: 'interaction', startTime: BASE_TIME + 7 }),
+      // Another session's request under the same key must not be counted.
+      buildEvent({
+        sessionId: SESSION_B,
+        captureId: CAPTURE_B1,
+        attributes: { request_key: keyOne },
+      }),
+    ]);
+
+    const all = unwrap(repo.queryGroups({ sessionId: SESSION_A, groupBy: 'requestKey' }));
+
+    expect(all.groups.map((group) => [group.key, group.count])).toEqual([
+      [keyOne, 3],
+      [keyTwo, 2],
+    ]);
+    expect(all.total).toBe(2);
+
+    const oneCapture = unwrap(
+      repo.queryGroups({ sessionId: SESSION_A, groupBy: 'requestKey', captureId: CAPTURE_A1 }),
+    );
+
+    expect(oneCapture.groups.map((group) => [group.key, group.count])).toEqual([
+      [keyOne, 3],
+      [keyTwo, 1],
+    ]);
+
+    const byKind = unwrap(
+      repo.queryGroups({ sessionId: SESSION_A, groupBy: 'kind', kinds: ['interaction'] }),
+    );
+
+    expect(byKind.groups.map((group) => [group.key, group.count])).toEqual([['interaction', 2]]);
+
+    const nothing = unwrap(
+      repo.queryGroups({ sessionId: SESSION_A, groupBy: 'requestKey', kinds: [] }),
+    );
+
+    expect(nothing).toEqual({ groups: [], total: 0 });
+
+    // Rows: the three keyOne requests, then the two keyTwo requests, then the
+    // two interactions that belong to no request group, in canonical order.
+    const rows = unwrap(
+      repo.query({ sessionId: SESSION_A, sort: 'count_desc', groupBy: 'requestKey' }),
+    );
+
+    expect(rows.total).toBe(7);
+    expect(rows.rows.map((event) => event.attributes['request_key'] ?? event.kind)).toEqual([
+      keyOne,
+      keyOne,
+      keyOne,
+      keyTwo,
+      keyTwo,
+      'interaction',
+      'interaction',
+    ]);
+  });
+
+  it('groups by component only where the attribute is a string', () => {
+    insertOk([
+      buildEvent({ kind: 'render', attributes: { component: 'Beta' } }),
+      buildEvent({ kind: 'render', attributes: { component: 'Alpha' } }),
+      buildEvent({ kind: 'render', attributes: { component: 'Beta' } }),
+      buildEvent({ kind: 'render', attributes: { component: 42 } }),
+      buildEvent({ kind: 'render', attributes: {} }),
+    ]);
+
+    const groups = unwrap(repo.queryGroups({ sessionId: SESSION_A, groupBy: 'component' }));
+
+    expect(groups.groups.map((group) => [group.key, group.count])).toEqual([
+      ['Beta', 2],
+      ['Alpha', 1],
+    ]);
+    expect(groups.total).toBe(2);
+  });
+
+  /**
+   * Writes a row another build could have left: valid flat columns, and a
+   * document this build cannot reconstruct as an event.
+   */
+  function plantUnreadableRow(fields: {
+    readonly name: string;
+    readonly startTime: number;
+    readonly document: string;
+  }): void {
+    store
+      .statement(
+        `INSERT INTO telemetry_events (
+           id, session_id, capture_id, trace_id, span_id, kind, tier,
+           name, start_time, duration, producer_id, seq, event
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        newEventId(),
+        SESSION_A,
+        CAPTURE_A1,
+        TRACE_A,
+        newSpanId(),
+        'render',
+        'browser',
+        fields.name,
+        fields.startTime,
+        7,
+        PRODUCER_BROWSER,
+        nextSeq(PRODUCER_BROWSER),
+        fields.document,
+      );
+  }
+
+  it('keeps grouping and filtering by component when a stored document is not valid JSON', () => {
+    const alpha = insertOk([
+      buildEvent({ kind: 'render', name: 'render', attributes: { component: 'Alpha' } }),
+      buildEvent({ kind: 'render', name: 'render', attributes: { component: 'Alpha' } }),
+    ]);
+    plantUnreadableRow({ name: 'render', startTime: BASE_TIME + 5, document: '{"attributes":' });
+    const beta = insertOk([
+      buildEvent({ kind: 'render', name: 'render', attributes: { component: 'Beta' } }),
+    ]);
+
+    // SQLite's JSON functions raise on a malformed document; the guarded
+    // expressions answer NULL, so the row simply has no component.
+    const byComponent = unwrap(repo.queryGroups({ sessionId: SESSION_A, groupBy: 'component' }));
+
+    expect(byComponent.groups.map((group) => [group.key, group.count])).toEqual([
+      ['Alpha', 2],
+      ['Beta', 1],
+    ]);
+    expect(byComponent.skipped).toBeUndefined();
+
+    const filtered = unwrap(repo.query({ sessionId: SESSION_A, component: 'Alpha' }));
+
+    expect(filtered.rows.map((event) => event.id)).toEqual(alpha.map((event) => event.id));
+
+    const ranked = unwrap(
+      repo.query({ sessionId: SESSION_A, sort: 'count_desc', groupBy: 'component' }),
+    );
+
+    // The unreadable row ranks with the rows that have no component and is
+    // then skipped and reported, as any row page does.
+    expect(ranked.rows.map((event) => event.id)).toEqual([
+      ...alpha.map((event) => event.id),
+      ...beta.map((event) => event.id),
+    ]);
+    expect(ranked.total).toBe(4);
+    expect(ranked.skipped).toBe(1);
+
+    // Under a key read from a flat column the same row reaches the fold, where
+    // it is left out of its group and reported.
+    const byName = unwrap(repo.queryGroups({ sessionId: SESSION_A, groupBy: 'name' }));
+
+    expect(byName.groups.map((group) => [group.key, group.count])).toEqual([['render', 3]]);
+    expect(byName.skipped).toBe(1);
+  });
+
+  it('counts and cites readable events only, and reports the rows it left out', () => {
+    // The unreadable row is the group's first arrival: it would have been its
+    // representative, and its only member for the second key.
+    plantUnreadableRow({
+      name: 'shared',
+      startTime: BASE_TIME - 50,
+      document: JSON.stringify({ unexpected: SENTINEL }),
+    });
+    plantUnreadableRow({
+      name: 'ghost',
+      startTime: BASE_TIME - 40,
+      document: JSON.stringify({ unexpected: SENTINEL }),
+    });
+    const readable = insertOk([
+      buildEvent({ name: 'shared', startTime: BASE_TIME + 1, duration: 2 }),
+      buildEvent({ name: 'shared', startTime: BASE_TIME + 2, duration: 3 }),
+    ]);
+
+    const page = unwrap(repo.queryGroups({ sessionId: SESSION_A, groupBy: 'name' }));
+
+    expect(page.groups).toEqual([
+      {
+        key: 'shared',
+        count: 2,
+        firstEventId: readable[0]?.id,
+        firstIngestSeq: readable[0]?.ingestSeq,
+        firstStartTime: BASE_TIME + 1,
+        totalDuration: 5,
+      },
+    ]);
+    // A group with no readable event does not exist.
+    expect(page.total).toBe(1);
+    expect(page.skipped).toBe(2);
+
+    // Every representative is an event a read can show.
+    const cited = page.groups.map((group) => group.firstEventId);
+
+    expect(unwrap(repo.existingEventIds(SESSION_A, cited)).size).toBe(cited.length);
+
+    const warning = logs.find(
+      (record) =>
+        record.message ===
+        'left telemetry rows that no longer match the event schema out of every group',
+    );
+
+    expect(warning?.level).toBe('warn');
+    expect(warning?.fields).toMatchObject({ skipped: 2, ingestSeqs: [1, 2] });
+    expect(loggedText()).not.toContain(SENTINEL);
+  });
+
+  it('orders groups by total duration or by first start under the other two sorts', () => {
+    insertOk([
+      buildEvent({ name: 'short-many', startTime: BASE_TIME + 1, duration: 1 }),
+      buildEvent({ name: 'short-many', startTime: BASE_TIME + 2, duration: 1 }),
+      buildEvent({ name: 'short-many', startTime: BASE_TIME + 3, duration: 1 }),
+      buildEvent({ name: 'long-once', startTime: BASE_TIME + 4, duration: 50.5 }),
+      buildEvent({ name: 'early-tie', startTime: BASE_TIME, duration: 3 }),
+    ]);
+
+    const byDuration = unwrap(
+      repo.queryGroups({ sessionId: SESSION_A, groupBy: 'name', sort: 'duration_desc' }),
+    );
+
+    expect(byDuration.groups.map((group) => [group.key, group.totalDuration])).toEqual([
+      ['long-once', 50.5],
+      // 3 and 3: tied on total duration, so the key decides.
+      ['early-tie', 3],
+      ['short-many', 3],
+    ]);
+
+    const byStart = unwrap(
+      repo.queryGroups({ sessionId: SESSION_A, groupBy: 'name', sort: 'start_asc' }),
+    );
+
+    expect(byStart.groups.map((group) => group.key)).toEqual([
+      'early-tie',
+      'short-many',
+      'long-once',
+    ]);
+  });
+
+  it('pages groups with the row-page bounds', () => {
+    insertNamedGroups();
+
+    const countOnly = unwrap(repo.queryGroups({ sessionId: SESSION_A, groupBy: 'name', limit: 0 }));
+
+    expect(countOnly).toEqual({ groups: [], total: 6, nextOffset: 0 });
+
+    const clamped = unwrap(
+      repo.queryGroups({
+        sessionId: SESSION_A,
+        groupBy: 'name',
+        limit: TELEMETRY_QUERY_MAX_LIMIT + 1,
+      }),
+    );
+
+    expect(clamped.groups).toHaveLength(6);
+    expect(clamped.nextOffset).toBeUndefined();
+
+    const past = unwrap(repo.queryGroups({ sessionId: SESSION_A, groupBy: 'name', offset: 6 }));
+
+    expect(past).toEqual({ groups: [], total: 6 });
+  });
+
+  it('refuses a grouped query it will not accept, naming the reason', () => {
+    const cases = [
+      [{ sessionId: SESSION_A }, 'missing-group-key'],
+      [{ sessionId: SESSION_A, groupBy: 'trace_id' }, 'unknown-group-key'],
+      [{ sessionId: SESSION_A, groupBy: 'constructor' }, 'unknown-group-key'],
+      [{ sessionId: SESSION_A, groupBy: 'name', sort: 'not-a-sort' }, 'unknown-sort'],
+      [{ sessionId: SESSION_A, groupBy: 'name', limit: -1 }, 'invalid-limit'],
+      [{ sessionId: SESSION_A, groupBy: 'name', offset: 1.5 }, 'invalid-offset'],
+      [{ sessionId: '', groupBy: 'name' }, 'blank-session-id'],
+      [{ sessionId: SESSION_A, groupBy: 'name', kinds: ['not-a-kind'] }, 'unknown-kind'],
+    ] as const;
+
+    for (const [query, reason] of cases) {
+      const result = repo.queryGroups(query as Parameters<TelemetryRepo['queryGroups']>[0]);
+
+      expect(isErr(result)).toBe(true);
+
+      if (isErr(result)) {
+        expect(result.error.code).toBe('STORE_ERROR');
+        expect(result.error.details?.['reason']).toBe(reason);
+      }
+    }
+  });
+
+  it('never logs a group key, which is captured data', () => {
+    insertOk([buildEvent({ name: SENTINEL }), buildEvent({ name: SENTINEL })]);
+
+    const groups = unwrap(repo.queryGroups({ sessionId: SESSION_A, groupBy: 'name' }));
+
+    expect(groups.groups[0]?.key).toBe(SENTINEL);
+    unwrap(repo.query({ sessionId: SESSION_A, sort: 'count_desc' }));
+    expect(loggedText()).not.toContain(SENTINEL);
   });
 });
 
@@ -1196,7 +1885,16 @@ describe('the existence lookups', () => {
  * ---------------------------------------------------------------------------------------------- */
 
 describe('retention', () => {
-  it('counts and deletes one session without reaching another', () => {
+  /** How many rows of the table started before `cutoff`, read directly. */
+  function countOlderThan(cutoff: number): number {
+    return Number(
+      store
+        .statement('SELECT COUNT(*) AS total FROM telemetry_events WHERE start_time < ?')
+        .get(cutoff)?.['total'],
+    );
+  }
+
+  it('counts and deletes one session without reaching another', async () => {
     insertOk([
       buildEvent(),
       buildEvent(),
@@ -1206,51 +1904,90 @@ describe('retention', () => {
     expect(unwrap(repo.countBySession(SESSION_A))).toBe(2);
     expect(unwrap(repo.countBySession(SESSION_B))).toBe(1);
 
-    expect(unwrap(repo.deleteBySession(SESSION_A))).toBe(2);
+    expect(unwrap(await repo.deleteBySession(SESSION_A))).toBe(2);
 
     expect(unwrap(repo.countBySession(SESSION_A))).toBe(0);
     expect(unwrap(repo.countBySession(SESSION_B))).toBe(1);
   });
 
-  it('deletes in bounded batches until the predicate is exhausted', () => {
+  it('deletes in bounded batches, one transaction each, until the predicate is exhausted', async () => {
     const events = Array.from({ length: 7 }, (_unused, index) =>
       buildEvent({ startTime: BASE_TIME + index }),
     );
 
     insertOk(events);
 
+    const transactions = vi.spyOn(store, 'transaction');
+
     // A batch size of two forces four statements, each in its own transaction,
     // which is what keeps a large purge from holding the write lock.
     expect(
-      unwrap(repo.deleteOlderThan(BASE_TIME + 100, { batchSize: 2, sessionIds: [SESSION_A] })),
+      unwrap(
+        await repo.deleteOlderThan(BASE_TIME + 100, { batchSize: 2, sessionIds: [SESSION_A] }),
+      ),
     ).toBe(7);
+
+    expect(transactions).toHaveBeenCalledTimes(4);
+    transactions.mockRestore();
 
     expect(unwrap(repo.countBySession(SESSION_A))).toBe(0);
   });
 
-  it('deletes only what started before the cutoff', () => {
+  it('deletes only what started before the cutoff', async () => {
     const old = buildEvent({ startTime: BASE_TIME });
     const recent = buildEvent({ startTime: BASE_TIME + 1000 });
 
     insertOk([old, recent]);
 
-    expect(unwrap(repo.deleteOlderThan(BASE_TIME + 500))).toBe(1);
+    expect(unwrap(await repo.deleteOlderThan(BASE_TIME + 500))).toBe(1);
     expect(unwrap(repo.query({ sessionId: SESSION_A })).rows.map((event) => event.id)).toEqual([
       recent.id,
     ]);
   });
 
-  it('restricts a purge to the sessions it names, and deletes nothing for an empty list', () => {
+  it('restricts a purge to the sessions it names, and deletes nothing for an empty list', async () => {
     insertOk([buildEvent(), buildEvent({ sessionId: SESSION_B, captureId: CAPTURE_B1 })]);
 
-    expect(unwrap(repo.deleteOlderThan(BASE_TIME + 100, { sessionIds: [] }))).toBe(0);
-    expect(unwrap(repo.deleteOlderThan(BASE_TIME + 100, { sessionIds: [SESSION_B] }))).toBe(1);
+    expect(unwrap(await repo.deleteOlderThan(BASE_TIME + 100, { sessionIds: [] }))).toBe(0);
+    expect(unwrap(await repo.deleteOlderThan(BASE_TIME + 100, { sessionIds: [SESSION_B] }))).toBe(
+      1,
+    );
 
     expect(unwrap(repo.countBySession(SESSION_A))).toBe(1);
     expect(unwrap(repo.countBySession(SESSION_B))).toBe(0);
   });
 
-  it('refuses a purge argument it will not accept', () => {
+  it('walks named sessions one at a time, honouring the cutoff in each', async () => {
+    insertOk([
+      buildEvent({ startTime: BASE_TIME }),
+      buildEvent({ startTime: BASE_TIME + 1 }),
+      buildEvent({ startTime: BASE_TIME + 1000 }),
+      buildEvent({ sessionId: SESSION_B, captureId: CAPTURE_B1, startTime: BASE_TIME }),
+      buildEvent({ sessionId: SESSION_B, captureId: CAPTURE_B1, startTime: BASE_TIME + 1000 }),
+    ]);
+
+    const transactions = vi.spyOn(store, 'transaction');
+
+    // Duplicates are harmless: the session list is de-duplicated first.
+    expect(
+      unwrap(
+        await repo.deleteOlderThan(BASE_TIME + 500, {
+          batchSize: 1,
+          sessionIds: [SESSION_A, SESSION_B, SESSION_A],
+        }),
+      ),
+    ).toBe(3);
+
+    // Session A: two full batches and the short one that ends it; session B:
+    // one full batch and the short one.
+    expect(transactions).toHaveBeenCalledTimes(5);
+    transactions.mockRestore();
+
+    expect(unwrap(repo.countBySession(SESSION_A))).toBe(1);
+    expect(unwrap(repo.countBySession(SESSION_B))).toBe(1);
+  });
+
+  it('refuses a purge argument it will not accept, without rejecting', async () => {
     const cases = [
       [Number.NaN, undefined, 'invalid-cutoff'],
       [BASE_TIME, { batchSize: 0 }, 'invalid-batch-size'],
@@ -1259,7 +1996,7 @@ describe('retention', () => {
     ] as const;
 
     for (const [cutoff, options, reason] of cases) {
-      const result = repo.deleteOlderThan(cutoff, options);
+      const result = await repo.deleteOlderThan(cutoff, options);
 
       expect(isErr(result)).toBe(true);
 
@@ -1268,6 +2005,184 @@ describe('retention', () => {
         expect(result.error.details?.['reason']).toBe(reason);
       }
     }
+
+    const blank = await repo.deleteBySession('');
+
+    expect(isErr(blank)).toBe(true);
+
+    if (isErr(blank)) {
+      expect(blank.error.details?.['reason']).toBe('blank-session-id');
+    }
+  });
+
+  it('clamps a batch size above MAX_PURGE_BATCH_SIZE instead of refusing it', async () => {
+    const events = Array.from({ length: MAX_PURGE_BATCH_SIZE + 1 }, (_unused, index) =>
+      buildEvent({ startTime: BASE_TIME + index / 8, seq: index }),
+    );
+
+    insertOk(events);
+
+    const transactions = vi.spyOn(store, 'transaction');
+
+    expect(
+      unwrap(
+        await repo.deleteOlderThan(BASE_TIME + 10_000, { batchSize: MAX_PURGE_BATCH_SIZE * 10 }),
+      ),
+    ).toBe(events.length);
+
+    // Two statements — the ceiling, then the one row left — where an unclamped
+    // batch would have taken everything in one lock hold.
+    expect(transactions).toHaveBeenCalledTimes(2);
+    transactions.mockRestore();
+
+    const purged = logs.find((record) => record.message === 'purged telemetry older than a cutoff');
+
+    expect(purged?.fields).toMatchObject({
+      batchSize: MAX_PURGE_BATCH_SIZE,
+      deleted: events.length,
+    });
+    expect(MAX_PURGE_BATCH_SIZE).toBe(DEFAULT_PURGE_BATCH_SIZE);
+  });
+
+  it('yields between batches, so an ingest batch scheduled mid-purge runs before it ends', async () => {
+    const cutoff = BASE_TIME + 100;
+    const old = Array.from({ length: 10 }, (_unused, index) =>
+      buildEvent({ startTime: BASE_TIME + index }),
+    );
+
+    insertOk(old);
+
+    let settled = false;
+    const purge = repo.deleteOlderThan(cutoff, { batchSize: 2 }).then((result) => {
+      settled = true;
+
+      return result;
+    });
+
+    // Queued after the purge has started. Under a synchronous sweep it could
+    // only run once every batch had committed; here it runs between two of
+    // them, with some old rows already gone and some still present.
+    const observed = await new Promise<{ settled: boolean; remaining: number; inserted: number }>(
+      (resolve) => {
+        setImmediate(() => {
+          const written = unwrap(repo.insertMany([buildEvent({ startTime: BASE_TIME + 5000 })]));
+
+          resolve({ settled, remaining: countOlderThan(cutoff), inserted: written.inserted });
+        });
+      },
+    );
+
+    expect(observed.settled).toBe(false);
+    expect(observed.inserted).toBe(1);
+    expect(observed.remaining).toBeGreaterThan(0);
+    expect(observed.remaining).toBeLessThan(old.length);
+
+    // The purge still removes every old row and leaves the fresh one alone.
+    expect(unwrap(await purge)).toBe(old.length);
+    expect(countOlderThan(cutoff)).toBe(0);
+    expect(unwrap(repo.countBySession(SESSION_A))).toBe(1);
+  });
+
+  it('refuses to run inside a caller\u2019s open transaction, deleting nothing', async () => {
+    insertOk(
+      Array.from({ length: 7 }, (_unused, index) => buildEvent({ startTime: BASE_TIME + index })),
+    );
+
+    let remainingInside = -1;
+    let byCutoff: ReturnType<TelemetryRepo['deleteOlderThan']> | undefined;
+    let bySession: ReturnType<TelemetryRepo['deleteBySession']> | undefined;
+
+    store.transaction(() => {
+      byCutoff = repo.deleteOlderThan(BASE_TIME + 100, { batchSize: 2 });
+      bySession = repo.deleteBySession(SESSION_A);
+
+      // Not one batch ran as a savepoint of this transaction: a sweep in here
+      // would hold the write lock until the caller committed.
+      remainingInside = countOlderThan(BASE_TIME + 100);
+    });
+
+    expect(remainingInside).toBe(7);
+
+    for (const pending of [byCutoff, bySession]) {
+      expect(pending).toBeDefined();
+
+      const result = await pending!;
+
+      expect(isErr(result)).toBe(true);
+
+      if (isErr(result)) {
+        expect(result.error.code).toBe('STORE_ERROR');
+        expect(result.error.details?.['reason']).toBe('purge-inside-transaction');
+        expect(result.error.details?.['deletedBeforeRefusal']).toBe(0);
+        expect(result.error.details?.['batchesCommitted']).toBe(0);
+      }
+    }
+
+    expect(unwrap(repo.countBySession(SESSION_A))).toBe(7);
+  });
+
+  it('stops a sweep, keeping the batches it committed, when a transaction is open by its next batch', async () => {
+    insertOk(
+      Array.from({ length: 7 }, (_unused, index) => buildEvent({ startTime: BASE_TIME + index })),
+    );
+
+    // The first batch runs, and commits, before the promise is returned.
+    const purge = repo.deleteOlderThan(BASE_TIME + 100, { batchSize: 2 });
+
+    expect(countOlderThan(BASE_TIME + 100)).toBe(5);
+
+    // Work that opens a transaction while the sweep is yielding: the next
+    // batch must not become a savepoint of it.
+    store.db.exec('BEGIN');
+
+    let result: Awaited<typeof purge>;
+
+    try {
+      result = await purge;
+
+      expect(countOlderThan(BASE_TIME + 100)).toBe(5);
+    } finally {
+      store.db.exec('ROLLBACK');
+    }
+
+    expect(isErr(result)).toBe(true);
+
+    if (isErr(result)) {
+      expect(result.error.details?.['reason']).toBe('purge-inside-transaction');
+      expect(result.error.details?.['deletedBeforeRefusal']).toBe(2);
+      expect(result.error.details?.['batchesCommitted']).toBe(1);
+    }
+
+    // The committed batch stays committed; the refused sweep removed nothing
+    // more, and a later purge outside any transaction finishes the job.
+    expect(countOlderThan(BASE_TIME + 100)).toBe(5);
+    expect(unwrap(await repo.deleteOlderThan(BASE_TIME + 100, { batchSize: 2 }))).toBe(5);
+    expect(countOlderThan(BASE_TIME + 100)).toBe(0);
+  });
+
+  it('resolves a failure between batches as an error rather than rejecting', async () => {
+    insertOk(
+      Array.from({ length: 6 }, (_unused, index) => buildEvent({ startTime: BASE_TIME + index })),
+    );
+
+    const purge = repo.deleteOlderThan(BASE_TIME + 100, { batchSize: 2 });
+
+    // The first batch ran synchronously; the store closes before the second.
+    store.close();
+
+    const result = await purge;
+
+    expect(isErr(result)).toBe(true);
+
+    if (isErr(result)) {
+      expect(result.error.code).toBe('STORE_ERROR');
+    }
+
+    store = unwrap(openStore({ databasePath: join(directory, 'sessions.sqlite') }));
+    repo = createTelemetryRepo({ store });
+
+    // The committed batch stays committed; the rest is still there.
+    expect(unwrap(repo.countBySession(SESSION_A))).toBe(4);
   });
 
   it('loses its rows when the session is deleted, through the schema cascade', () => {
@@ -1284,7 +2199,7 @@ describe('retention', () => {
  * ---------------------------------------------------------------------------------------------- */
 
 describe('privacy', () => {
-  it('keeps a captured value out of every log record and every error payload', () => {
+  it('keeps a captured value out of every log record and every error payload', async () => {
     const carrying = buildEvent({
       name: SENTINEL,
       attributes: { note: SENTINEL, url: `https://example.test/?token=${SENTINEL}` },
@@ -1297,7 +2212,8 @@ describe('privacy', () => {
     unwrap(repo.listByTrace(SESSION_A, TRACE_A));
     unwrap(repo.countByKind(SESSION_A));
     unwrap(repo.existingEventIds(SESSION_A, [carrying.id]));
-    unwrap(repo.deleteBySession(SESSION_A));
+    unwrap(repo.queryGroups({ sessionId: SESSION_A, groupBy: 'name' }));
+    unwrap(await repo.deleteBySession(SESSION_A));
 
     expect(loggedText()).not.toContain(SENTINEL);
 
@@ -1381,6 +2297,36 @@ describe('bulk insertion and index use', () => {
     for (const plan of [defaultPage, byTrace, count]) {
       expect(plan[0]).toContain('SEARCH');
       expect(plan.join(' ')).not.toContain('SCAN telemetry_events');
+    }
+  });
+
+  it('takes every purge batch from a covering purge index, with no sort and no table scan', () => {
+    insertOk([
+      buildEvent(),
+      buildEvent({ startTime: BASE_TIME + 1 }),
+      buildEvent({ sessionId: SESSION_B, captureId: CAPTURE_B1 }),
+    ]);
+
+    // The exported statement texts themselves, so the plan asserted is the plan
+    // the purge runs.
+    const cases = [
+      [DELETE_OLDER_THAN_BATCH_SQL, 'idx_telemetry_events_start_time_ingest_seq'],
+      [DELETE_SESSION_BATCH_SQL, 'idx_telemetry_events_session_id_start_time_ingest_seq'],
+      [
+        DELETE_SESSION_OLDER_THAN_BATCH_SQL,
+        'idx_telemetry_events_session_id_start_time_ingest_seq',
+      ],
+    ] as const;
+
+    for (const [sql, index] of cases) {
+      const plan = queryPlan(sql).join(' | ');
+
+      // The outer DELETE reaches rows by primary key; the batch subquery is an
+      // ordered covering-index range that stops at LIMIT.
+      expect(plan).toContain('USING INTEGER PRIMARY KEY');
+      expect(plan).toContain(`SEARCH telemetry_events USING COVERING INDEX ${index} (`);
+      expect(plan).not.toContain('TEMP B-TREE');
+      expect(plan).not.toContain('SCAN telemetry_events');
     }
   });
 });

@@ -2170,22 +2170,90 @@ describe('React components and hooks (C1-F13)', () => {
   });
 
   it('patches a function whose call is not hook-shaped', () => {
-    // `user(…)`, `used(…)` and a bare `use(…)` are not hooks, and refusing
-    // them would decline ordinary functions for the shape of a prefix.
-    for (const call of ['user(1)', 'used(1)', 'use(1)']) {
+    // `user(…)`, `used(…)`, `useful(…)` and `usex(…)` are not hooks — React's
+    // own rule wants `use` alone or followed by an upper-case letter or a digit
+    // — and refusing them would decline ordinary functions for the shape of a
+    // prefix.
+    for (const call of ['user(1)', 'used(1)', 'useful(1)', 'usex(1)', 'reuse(1)']) {
       expectPatch({
         file: 'src/components/Field.ts',
         symbol: 'field',
         text:
           'declare function user(a: number): number;\n' +
           'declare function used(a: number): number;\n' +
-          'declare function use(a: number): number;\n' +
+          'declare function useful(a: number): number;\n' +
+          'declare function usex(a: number): number;\n' +
+          'declare function reuse(a: number): number;\n' +
           '\n' +
           'export function field(): number {\n' +
           `  return ${call};\n` +
           '}\n',
       });
     }
+  });
+
+  it("refuses a function that calls React 19's bare use(…) API", () => {
+    // `use(promise)` and `use(context)` are hooks to React's analysis although
+    // no letter follows the prefix; moving the call into `__orig` would put it
+    // in a function that is neither a component nor a hook.
+    const details = expectReactRefusal(
+      {
+        file: 'src/components/theme.tsx',
+        symbol: 'readTheme',
+        text:
+          "import { use } from 'react';\n" +
+          "import type { Context } from 'react';\n" +
+          '\n' +
+          'export function readTheme(theme: Context<string>): string {\n' +
+          '  return use(theme);\n' +
+          '}\n',
+      },
+      'hook-call',
+    );
+
+    expect(details.hook).toBe('use');
+  });
+
+  it('refuses a function that calls use(…) through a namespace, as React.use(…)', () => {
+    const details = expectReactRefusal(
+      {
+        file: 'src/components/pending.tsx',
+        symbol: 'readPending',
+        text:
+          "import * as React from 'react';\n" +
+          '\n' +
+          'export function readPending(pending: Promise<number>): number {\n' +
+          '  return React.use(pending) + 1;\n' +
+          '}\n',
+      },
+      'hook-call',
+    );
+
+    expect(details.hook).toBe('use');
+  });
+
+  it.each([
+    ['use3DScene', 'const scene = use3DScene();'],
+    ['use2FA', 'const code = use2FA();'],
+  ])('refuses a function that calls the digit-suffixed hook %s', (hook, statement) => {
+    const details = expectReactRefusal(
+      {
+        file: 'src/components/scene.tsx',
+        symbol: 'renderScene',
+        text:
+          `declare function ${hook}(): string;\n` +
+          '\n' +
+          'export function renderScene(): string {\n' +
+          `  ${statement}\n` +
+          '  return String(' +
+          (hook === 'use3DScene' ? 'scene' : 'code') +
+          ');\n' +
+          '}\n',
+      },
+      'hook-call',
+    );
+
+    expect(details.hook).toBe(hook);
   });
 
   it('recognises sites only within its own vocabulary', () => {

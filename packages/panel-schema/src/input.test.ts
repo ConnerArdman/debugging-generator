@@ -88,7 +88,10 @@ import {
 } from '@debuggen/shared';
 import { METRIC_IDS, TELEMETRY_KINDS, TELEMETRY_TIERS } from '@debuggen/telemetry';
 
+import { PANEL_INPUT_MAX_NODE_COUNT as ENTRY_MAX_NODE_COUNT } from './index.js';
 import {
+  PANEL_INPUT_MAX_NODE_COUNT,
+  PANEL_INPUT_MAX_PREFLIGHT_ISSUES,
   panelNodeInputSchema,
   panelSpecInputSchema,
   parsePanelSpecInput,
@@ -102,7 +105,7 @@ import {
   panelSpecInputJsonSchemaText,
   type PanelSpecInputSchemaTarget,
 } from './json-schema.js';
-import { LAYOUT_NODE_TYPES } from './nodes/layout.js';
+import { LAYOUT_NODE_MAX_CHILDREN, LAYOUT_NODE_TYPES } from './nodes/layout.js';
 import {
   DATA_QUERY_FLAT_FIELD_KEYS,
   DATA_QUERY_MAX_LIMIT,
@@ -110,7 +113,8 @@ import {
   DATA_QUERY_SOURCES,
 } from './nodes/query.js';
 import { VISUALIZATION_NODE_TYPES } from './nodes/viz.js';
-import { PANEL_NODE_TYPES } from './spec.js';
+import { PANEL_LAYOUT_MAX_NODES, PANEL_NODE_TYPES } from './spec.js';
+import { PANEL_MAX_NODE_DEPTH, isPanelValidationIssueCode } from './validate.js';
 
 /*
  * ---------------------------------------------------------------------------
@@ -1053,20 +1057,20 @@ describe('the authored summary', () => {
 
 /*
  * ---------------------------------------------------------------------------
- * 9. Recursion and the layout bounds
+ * 9. Nesting and the layout bounds
  *
- * A panel is a forest, and the recursion is closed once, by the deferred child
- * position of the three containers. The bounds are the internal ones, imported
- * by the module under test, so a layout that passes here is a layout the
- * internal schema accepts.
+ * A panel is a forest, and the authoring schema parses it through an unrolled
+ * chain of node unions, one per nesting level. The bounds are the internal
+ * ones, imported by the module under test, so a layout that passes here is a
+ * layout the internal schema accepts.
  * ---------------------------------------------------------------------------
  */
 
 describe('recursion and layout bounds', () => {
   it('accepts a section containing a split containing a stack containing a view', () => {
     // Three containers deep, which is one more level than any single container
-    // can prove on its own: the deferred reference has to resolve at each step
-    // or the innermost node is never reached.
+    // can prove on its own: each level has to hand its children to the union
+    // of the level below, or the innermost node is never reached.
     const layout = [
       {
         type: 'section',
@@ -1158,6 +1162,913 @@ describe('recursion and layout bounds', () => {
         ]),
       ),
     ).toEqual(['layout.0.direction: invalid_value']);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * 9a. The nesting-depth bound
+ *
+ * The authoring schema admits exactly `PANEL_MAX_NODE_DEPTH` levels, counting a
+ * top-level node as level 1, the same bound `validatePanelSpec` applies at step
+ * 3. It is a property of the schema itself — the deepest level's union accepts
+ * no container — so the schema library never descends past it, and no depth of
+ * input can exhaust the call stack of either `safeParse` or the non-throwing
+ * parser. The parser additionally reports the validator's own code for a
+ * too-deep document, found by an iterative preflight before the schema runs,
+ * and turns an exception raised while reading the value into a rejection.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * A top-level node at the top of a chain of containers, with `leaf` at level
+ * `depth`.
+ *
+ * Built iteratively, from the leaf up, so a chain a hundred thousand levels deep
+ * costs this helper no call stack either. The containers alternate between
+ * `section` and `stack` — the two that accept a single child — so more than one
+ * container schema of the chain is exercised.
+ *
+ * @param depth The level of the leaf, a top-level node being level 1.
+ * @param leaf The node at that level.
+ * @returns The top-level node of the chain.
+ */
+function nestedNode(depth: number, leaf: unknown = { type: 'table', source: 'spans' }): unknown {
+  let node: unknown = leaf;
+
+  for (let level = depth - 1; level >= 1; level -= 1) {
+    node = { type: level % 2 === 0 ? 'section' : 'stack', children: [node] };
+  }
+
+  return node;
+}
+
+/**
+ * A document whose single top-level node is a {@link nestedNode} chain.
+ *
+ * @param depth The level of the leaf, a top-level node being level 1.
+ * @param leaf The node at that level.
+ * @returns A document of that nesting.
+ */
+function nestedPanel(depth: number, leaf?: unknown): Record<string, unknown> {
+  return panelOf([nestedNode(depth, leaf)]);
+}
+
+/**
+ * The dotted path of the node at a level of a {@link nestedPanel} chain: the
+ * top-level node, followed by one `children.0` hop per level below it.
+ *
+ * @param level The node's level, 1 for the top-level node.
+ * @returns For instance `layout.0.children.0` for level 2.
+ */
+function chainPathAt(level: number): string {
+  return `layout.0${'.children.0'.repeat(level - 1)}`;
+}
+
+/**
+ * A run of distinct, well-formed leaves, for the arrays whose length is what a
+ * test is about.
+ *
+ * @param count How many leaves.
+ * @returns A fresh array of that many fresh leaf objects.
+ */
+function tableLeaves(count: number): Record<string, unknown>[] {
+  return Array.from({ length: count }, () => ({ type: 'table', source: 'spans' }));
+}
+
+/**
+ * The message the deepest level's union reports for a container placed at it.
+ *
+ * Restated here as the literal a model is shown, so a change to the wording is
+ * a deliberate edit to this suite rather than an unnoticed change to the repair
+ * prompt. Built from the depth constant, as the module under test builds it.
+ */
+const DEEPEST_LEVEL_MESSAGE = `Only a visualization node is accepted here: this position is at the deepest nesting level a panel allows (${String(PANEL_MAX_NODE_DEPTH)}), so no section, split or stack may be placed at it.`;
+
+/** A sentinel planted in content a depth rejection must not echo. */
+const DEPTH_SENTINEL = 'QQ-DEPTH-SENTINEL-QQ';
+
+/**
+ * Every surface of a rejection a leaked value could appear on, as text.
+ *
+ * The same four surfaces the privacy block below checks: the message, the hint,
+ * the serialised details and the wire payload.
+ */
+function rejectionSurfaces(value: unknown): string {
+  const result = parsePanelSpecInput(value);
+
+  if (result.ok) {
+    throw new Error('the parser accepted a value this test expects it to reject.');
+  }
+
+  return [
+    result.error.message,
+    result.error.hint ?? '',
+    JSON.stringify(result.error.details ?? {}),
+    JSON.stringify(result.error.toPayload()),
+  ].join('\n');
+}
+
+/** The issues a rejected value's error carries in its details. */
+function reportedIssues(value: unknown): readonly unknown[] {
+  const result = parsePanelSpecInput(value);
+
+  if (result.ok) {
+    throw new Error('the parser accepted a value this test expects it to reject.');
+  }
+
+  expect(result.error.code).toBe('PANEL_INVALID');
+
+  const issues = (result.error.details ?? {})['issues'];
+
+  return Array.isArray(issues) ? (issues as readonly unknown[]) : [];
+}
+
+describe('the nesting-depth bound', () => {
+  it('bounds nesting at the validator’s depth, which leaves room for containers', () => {
+    // The chain needs a level below every container level; the module under
+    // test guards the same invariant when it builds the chain.
+    expect(Number.isInteger(PANEL_MAX_NODE_DEPTH)).toBe(true);
+    expect(PANEL_MAX_NODE_DEPTH).toBeGreaterThanOrEqual(2);
+  });
+
+  it('accepts a leaf at the deepest level, below a container at every level above it', () => {
+    const document = nestedPanel(PANEL_MAX_NODE_DEPTH);
+
+    expect(parsePanelOrFail(document)).toEqual(document);
+    expect(parsePanelSpecInput(document).ok).toBe(true);
+  });
+
+  it('accepts a split at the last container level, with leaves below it', () => {
+    // The split is the one container with a minimum of two children, so it is
+    // checked at the level where the chain hands over to the leaf-only union.
+    const document = nestedPanel(PANEL_MAX_NODE_DEPTH - 1, {
+      type: 'split',
+      direction: 'horizontal',
+      children: [
+        { type: 'table', source: 'spans' },
+        { type: 'flame', source: 'trace' },
+      ],
+    });
+
+    expect(parsePanelOrFail(document)).toEqual(document);
+  });
+
+  it('rejects a container at the deepest level with one issue at its type, and the fixed message', () => {
+    // One level too many: the container at the deepest level has nowhere to put
+    // its children, and nothing below it is parsed.
+    const document = nestedPanel(PANEL_MAX_NODE_DEPTH + 1);
+    const parsed = panelSpecInputSchema.safeParse(document);
+
+    expect(parsed.success).toBe(false);
+    if (parsed.success) {
+      return;
+    }
+
+    expect(
+      parsed.error.issues.map((issue) => ({
+        path: issue.path.map((segment) => String(segment)).join('.'),
+        code: issue.code,
+        message: issue.message,
+      })),
+    ).toEqual([
+      {
+        path: `${chainPathAt(PANEL_MAX_NODE_DEPTH)}.type`,
+        code: 'invalid_union',
+        message: DEEPEST_LEVEL_MESSAGE,
+      },
+    ]);
+  });
+
+  it('rejects every container type at the deepest level, and quotes no value of it', () => {
+    for (const type of LAYOUT_NODE_TYPES) {
+      const document = nestedPanel(PANEL_MAX_NODE_DEPTH, {
+        type,
+        title: DEPTH_SENTINEL,
+        children: [
+          { type: 'table', source: 'spans' },
+          { type: 'eventLog', source: 'events' },
+        ],
+      });
+      const parsed = panelSpecInputSchema.safeParse(document);
+
+      expect(parsed.success).toBe(false);
+      if (parsed.success) {
+        continue;
+      }
+
+      expect(issueLocations(parsed.error.issues)).toEqual([
+        `${chainPathAt(PANEL_MAX_NODE_DEPTH)}.type: invalid_union`,
+      ]);
+      expect(parsed.error.issues.map((issue) => issue.message)).toEqual([DEEPEST_LEVEL_MESSAGE]);
+      expect(JSON.stringify(parsed.error.issues.map((issue) => issue.message))).not.toContain(
+        DEPTH_SENTINEL,
+      );
+    }
+  });
+
+  it('keeps the ordinary message for a malformed leaf at the deepest level', () => {
+    // The deepest level's custom message belongs to its own no-matching-type
+    // issue only. A leaf that matched reports its field's own issue, word for
+    // word as it would at the top of the layout.
+    const badLeaf = { type: 'table', source: 'spans', sort: 'size_desc' };
+    const shallow = panelSpecInputSchema.safeParse(nestedPanel(1, badLeaf));
+    const deepest = panelSpecInputSchema.safeParse(nestedPanel(PANEL_MAX_NODE_DEPTH, badLeaf));
+
+    expect(shallow.success).toBe(false);
+    expect(deepest.success).toBe(false);
+    if (shallow.success || deepest.success) {
+      return;
+    }
+
+    expect(issueLocations(deepest.error.issues)).toEqual([
+      `${chainPathAt(PANEL_MAX_NODE_DEPTH)}.sort: invalid_value`,
+    ]);
+    expect(deepest.error.issues.map((issue) => issue.message)).toEqual(
+      shallow.error.issues.map((issue) => issue.message),
+    );
+    expect(deepest.error.issues.map((issue) => issue.message)).not.toContain(DEEPEST_LEVEL_MESSAGE);
+  });
+
+  it('keeps the ordinary message for a value at the deepest level that is not an object', () => {
+    const shallow = panelSpecInputSchema.safeParse(nestedPanel(1, 'not a node'));
+    const deepest = panelSpecInputSchema.safeParse(nestedPanel(PANEL_MAX_NODE_DEPTH, 'not a node'));
+
+    expect(shallow.success).toBe(false);
+    expect(deepest.success).toBe(false);
+    if (shallow.success || deepest.success) {
+      return;
+    }
+
+    expect(issueLocations(deepest.error.issues)).toEqual([
+      `${chainPathAt(PANEL_MAX_NODE_DEPTH)}: invalid_type`,
+    ]);
+    expect(deepest.error.issues.map((issue) => issue.message)).toEqual(
+      shallow.error.issues.map((issue) => issue.message),
+    );
+  });
+
+  it('parses a document of any depth without throwing, through the schema and the parser', () => {
+    for (const depth of [PANEL_MAX_NODE_DEPTH + 1, 1_000, 100_000]) {
+      const document = nestedPanel(depth);
+
+      expect(() => panelSpecInputSchema.safeParse(document)).not.toThrow();
+      expect(() => parsePanelSpecInput(document)).not.toThrow();
+      expect(panelSpecInputSchema.safeParse(document).success).toBe(false);
+      expect(parsePanelSpecInput(document).ok).toBe(false);
+    }
+  });
+
+  it('reports the validator’s depth code at the first node beyond the bound', () => {
+    // The first node beyond the bound sits one level below the deepest level,
+    // with one `children` hop per level above it — the path convention
+    // `validatePanelSpec` reports in — whatever lies further down.
+    const expected = [
+      { path: chainPathAt(PANEL_MAX_NODE_DEPTH + 1), code: 'panel_node_depth_exceeded' },
+    ];
+
+    for (const depth of [PANEL_MAX_NODE_DEPTH + 1, 1_000, 100_000]) {
+      expect(reportedIssues(nestedPanel(depth))).toEqual(expected);
+    }
+
+    expect(isPanelValidationIssueCode('panel_node_depth_exceeded')).toBe(true);
+
+    const result = parsePanelSpecInput(nestedPanel(1_000));
+
+    expect(result.ok).toBe(false);
+    if (result.ok) {
+      return;
+    }
+
+    expect(result.error.message).toContain(
+      `${chainPathAt(PANEL_MAX_NODE_DEPTH + 1)}: panel_node_depth_exceeded`,
+    );
+    expect(result.error.hint).toContain(String(PANEL_MAX_NODE_DEPTH));
+  });
+
+  it('reports every too-deep node, in reading order, with the count of those not listed', () => {
+    // Twelve leaves under one container at the deepest level: every one of them
+    // is a node beyond the bound, and the message lists the first eight.
+    const tooDeep = Array.from({ length: 12 }, () => ({ type: 'table', source: 'spans' }));
+    const document = nestedPanel(PANEL_MAX_NODE_DEPTH, { type: 'stack', children: tooDeep });
+    const issues = reportedIssues(document);
+    const deepestContainer = chainPathAt(PANEL_MAX_NODE_DEPTH);
+
+    expect(issues).toEqual(
+      tooDeep.map((_, index) => ({
+        path: `${deepestContainer}.children.${String(index)}`,
+        code: 'panel_node_depth_exceeded',
+      })),
+    );
+
+    const result = parsePanelSpecInput(document);
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error.message).toContain('and 4 more');
+    }
+  });
+
+  it('rejects through the schema every value the preflight rejects, except by the node count', () => {
+    // The preflight's width and depth rules only ever change which issues a
+    // document is reported with, never whether it is accepted. The one rule
+    // outside this invariant is the node count: the schema cannot express a
+    // total, so a document over it and within every other bound is accepted by
+    // the schema — asserted where the budget is, in the block below. No value in
+    // this corpus is rejected by that rule, which the loop checks as well.
+    const cyclic: { type: string; children: unknown[] } = { type: 'section', children: [] };
+    cyclic.children.push(cyclic);
+
+    const tooDeepContainer = {
+      type: 'split',
+      children: [
+        { type: 'table', source: 'spans' },
+        { type: 'flame', source: 'trace' },
+      ],
+    };
+    const sparseTooDeep: unknown[] = [];
+    sparseTooDeep[2] = { type: 'table', source: 'spans' };
+
+    const corpus: readonly (readonly [string, unknown, string])[] = [
+      ['one level too deep', nestedPanel(PANEL_MAX_NODE_DEPTH + 1), 'panel_node_depth_exceeded'],
+      ['far too deep', nestedPanel(1_000), 'panel_node_depth_exceeded'],
+      [
+        'a split one level too deep',
+        nestedPanel(PANEL_MAX_NODE_DEPTH, tooDeepContainer),
+        'panel_node_depth_exceeded',
+      ],
+      ['a self-containing section', panelOf([cyclic]), 'panel_node_depth_exceeded'],
+      [
+        'too deep below a well-formed first node',
+        panelOf([{ type: 'table', source: 'spans' }, nestedNode(PANEL_MAX_NODE_DEPTH + 2)]),
+        'panel_node_depth_exceeded',
+      ],
+      [
+        'too deep below a malformed leaf',
+        nestedPanel(PANEL_MAX_NODE_DEPTH + 1, { type: 'table', source: 'spans', extra: true }),
+        'panel_node_depth_exceeded',
+      ],
+      [
+        'a sparse array of children at the deepest level',
+        nestedPanel(PANEL_MAX_NODE_DEPTH, { type: 'stack', children: sparseTooDeep }),
+        'panel_node_depth_exceeded',
+      ],
+      ['a layout over its bound', panelOf(tableLeaves(PANEL_LAYOUT_MAX_NODES + 1)), 'too_big'],
+      [
+        'a top-level container over its bound',
+        nestedPanel(1, { type: 'section', children: tableLeaves(LAYOUT_NODE_MAX_CHILDREN + 1) }),
+        'too_big',
+      ],
+      [
+        'a container over its bound at the deepest level',
+        nestedPanel(PANEL_MAX_NODE_DEPTH, {
+          type: 'stack',
+          children: tableLeaves(LAYOUT_NODE_MAX_CHILDREN + 1),
+        }),
+        'too_big',
+      ],
+      [
+        'five thousand children at the deepest level',
+        nestedPanel(PANEL_MAX_NODE_DEPTH, { type: 'stack', children: tableLeaves(5_000) }),
+        'too_big',
+      ],
+    ];
+    const disagreements: string[] = [];
+
+    for (const [label, value, expectedCode] of corpus) {
+      const codes = reportedIssues(value).map((issue) =>
+        typeof issue === 'object' && issue !== null ? (issue as { code?: unknown }).code : issue,
+      );
+      const schemaAccepted = panelSpecInputSchema.safeParse(value).success;
+
+      if (!codes.includes(expectedCode)) {
+        disagreements.push(`${label}: the preflight did not report ${expectedCode}`);
+      }
+      if (codes.includes('panel_node_count_exceeded')) {
+        disagreements.push(`${label}: rejected by the node count, which this invariant excludes`);
+      }
+      if (schemaAccepted) {
+        disagreements.push(`${label}: the schema accepted a value the preflight rejects`);
+      }
+    }
+
+    expect(disagreements).toEqual([]);
+  });
+
+  it('rejects a self-containing node without throwing and without echoing its content', () => {
+    const cyclic: { type: string; title: string; children: unknown[] } = {
+      type: 'stack',
+      title: DEPTH_SENTINEL,
+      children: [],
+    };
+    cyclic.children.push(cyclic);
+    const document = panelOf([cyclic]);
+
+    expect(() => panelSpecInputSchema.safeParse(document)).not.toThrow();
+    expect(() => parsePanelSpecInput(document)).not.toThrow();
+    expect(reportedIssues(document)).toEqual([
+      { path: chainPathAt(PANEL_MAX_NODE_DEPTH + 1), code: 'panel_node_depth_exceeded' },
+    ]);
+    expect(rejectionSurfaces(document)).not.toContain(DEPTH_SENTINEL);
+  });
+
+  it('turns a throwing getter into a rejection that carries nothing of the exception', () => {
+    // Once on the document, where the preflight reads first, and once on a
+    // node's field, which only the schema reads.
+    const onDocument = {
+      title: 'Interaction latency',
+      summary: 'One sentence about the capture.',
+      get layout(): never {
+        throw new Error(DEPTH_SENTINEL);
+      },
+    };
+    const onNodeField = panelOf([
+      {
+        type: 'table',
+        source: 'spans',
+        get sort(): never {
+          throw new Error(DEPTH_SENTINEL);
+        },
+      },
+    ]);
+
+    for (const value of [onDocument, onNodeField]) {
+      expect(() => parsePanelSpecInput(value)).not.toThrow();
+
+      const result = parsePanelSpecInput(value);
+
+      expect(result.ok).toBe(false);
+      if (result.ok) {
+        continue;
+      }
+
+      expect(result.error.code).toBe('PANEL_INVALID');
+      expect(result.error.cause).toBeUndefined();
+      expect(result.error.message).toContain('<document>: panel_input_unreadable');
+      expect(reportedIssues(value)).toEqual([{ path: '', code: 'panel_input_unreadable' }]);
+      expect(rejectionSurfaces(value)).not.toContain(DEPTH_SENTINEL);
+    }
+  });
+
+  it('turns a throwing proxy trap into the same rejection', () => {
+    const hostile = new Proxy(
+      {},
+      {
+        get(): never {
+          throw new Error(DEPTH_SENTINEL);
+        },
+        ownKeys(): never {
+          throw new Error(DEPTH_SENTINEL);
+        },
+      },
+    );
+
+    expect(() => parsePanelSpecInput(hostile)).not.toThrow();
+    expect(reportedIssues(hostile)).toEqual([{ path: '', code: 'panel_input_unreadable' }]);
+    expect(rejectionSurfaces(hostile)).not.toContain(DEPTH_SENTINEL);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * 9b. The width, total and issue bounds of the node preflight
+ *
+ * The chain bounds how deep the schema parses; nothing in a schema bounds how
+ * wide an array is before its elements are parsed, and nothing in any one
+ * node's schema can see how many nodes a document holds in all. The preflight
+ * does both before anything is parsed: a node array longer than its position
+ * allows is rejected from its `length` alone, a document of more than
+ * `PANEL_INPUT_MAX_NODE_COUNT` positions is rejected at its root, and at most
+ * `PANEL_INPUT_MAX_PREFLIGHT_ISSUES` issues are collected — an early stop
+ * being said so rather than left to look like a complete count.
+ *
+ * The proofs that an array was never read are counts of the reads themselves,
+ * taken through a proxy or a getter, rather than timings: a count cannot pass on
+ * a fast machine and fail on a slow one.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The clause a truncated rejection's message ends with, as the module writes it. */
+const TRUNCATED_CLAUSE = '; the document was not examined further.';
+
+/**
+ * A document around a layout, taking the layout **as given**.
+ *
+ * {@link panelOf} copies its layout, which reads every entry and turns every
+ * hole into `undefined`; the tests below need the parser to receive the very
+ * array they built — a counting proxy, a sparse array, a ten-million-slot one.
+ *
+ * @param layout The value to place at `layout`, uncopied.
+ * @returns A document of that layout with a valid title and summary.
+ */
+function documentWithLayout(layout: unknown): Record<string, unknown> {
+  return {
+    title: 'Interaction latency',
+    summary: 'One sentence about the capture.',
+    layout,
+  };
+}
+
+/**
+ * An array wrapped so that every read of one of its entries is counted.
+ *
+ * `Array.isArray` sees through the proxy, so the parser treats it as the array
+ * it wraps; only reads of index keys are counted, so reading `length` is free.
+ *
+ * @param entries The array to wrap. Holes stay holes.
+ * @returns The wrapped array, and a function answering how many entry reads it
+ * has served.
+ */
+function countingArray(entries: unknown[]): {
+  readonly array: unknown[];
+  readonly entryReads: () => number;
+} {
+  let reads = 0;
+  const array = new Proxy(entries, {
+    get(target, key, receiver): unknown {
+      if (typeof key === 'string' && /^\d+$/.test(key)) {
+        reads += 1;
+      }
+
+      return Reflect.get(target, key, receiver);
+    },
+  });
+
+  return { array, entryReads: () => reads };
+}
+
+/**
+ * What a rejected value's error says, for the assertions about truncation.
+ *
+ * @param value The value expected to be rejected.
+ * @returns The message, the reported issues and the `truncated` detail.
+ */
+function rejectionSummary(value: unknown): {
+  readonly message: string;
+  readonly issues: readonly unknown[];
+  readonly truncated: unknown;
+} {
+  const result = parsePanelSpecInput(value);
+
+  if (result.ok) {
+    throw new Error('the parser accepted a value this test expects it to reject.');
+  }
+
+  expect(result.error.code).toBe('PANEL_INVALID');
+
+  const details = result.error.details ?? {};
+  const issues = details['issues'];
+
+  return {
+    message: result.error.message,
+    issues: Array.isArray(issues) ? (issues as readonly unknown[]) : [],
+    truncated: details['truncated'],
+  };
+}
+
+/**
+ * The issues the parser reports for a value, as `path: code` strings, or `[]`
+ * when it accepts the value — the form {@link issueLocations} renders the
+ * schema's issues in, so the two verdicts can be compared directly.
+ *
+ * @param value Any value.
+ * @returns One `path: code` string per reported issue.
+ */
+function parserLocations(value: unknown): readonly string[] {
+  const result = parsePanelSpecInput(value);
+
+  if (result.ok) {
+    return [];
+  }
+
+  const issues = (result.error.details ?? {})['issues'];
+
+  return (Array.isArray(issues) ? (issues as readonly { path: string; code: string }[]) : []).map(
+    (issue) => `${issue.path}: ${issue.code}`,
+  );
+}
+
+/**
+ * A layout of `sections` sections of `leavesEach` leaves each: two levels,
+ * `sections × (1 + leavesEach)` node positions.
+ *
+ * @param sections How many top-level sections.
+ * @param leavesEach How many leaves in each.
+ * @returns The layout.
+ */
+function sectionsOfLeaves(sections: number, leavesEach: number): Record<string, unknown>[] {
+  return Array.from({ length: sections }, () => ({
+    type: 'section',
+    children: tableLeaves(leavesEach),
+  }));
+}
+
+describe('the width, total and issue bounds of the node preflight', () => {
+  it('derives the node budget from the two width bounds, and exports it from the package entry', () => {
+    // The widest document two levels deep: every top-level position a
+    // container, every container full.
+    expect(PANEL_INPUT_MAX_NODE_COUNT).toBe(
+      PANEL_LAYOUT_MAX_NODES * (1 + LAYOUT_NODE_MAX_CHILDREN),
+    );
+    expect(ENTRY_MAX_NODE_COUNT).toBe(PANEL_INPUT_MAX_NODE_COUNT);
+    expect(Number.isSafeInteger(PANEL_INPUT_MAX_PREFLIGHT_ISSUES)).toBe(true);
+    expect(PANEL_INPUT_MAX_PREFLIGHT_ISSUES).toBeGreaterThan(0);
+  });
+
+  it('rejects a layout over its bound with too_big at layout, reading none of its entries', () => {
+    const over = countingArray(tableLeaves(PANEL_LAYOUT_MAX_NODES + 1));
+    const rejection = rejectionSummary(documentWithLayout(over.array));
+
+    expect(rejection.issues).toEqual([{ path: 'layout', code: 'too_big' }]);
+    expect(rejection.truncated).toBeUndefined();
+    expect(rejection.message).toContain('layout: too_big');
+    expect(over.entryReads()).toBe(0);
+
+    // The schema's own diagnosis at the same path: the preflight reports what
+    // the schema would, without letting it read the array.
+    expect(rejectionLocations(panelOf(tableLeaves(PANEL_LAYOUT_MAX_NODES + 1)))).toContain(
+      'layout: too_big',
+    );
+  });
+
+  it('sizes a ten-million-slot array from its length alone, at the root and in a container', () => {
+    const hugeLayout: unknown[] = [];
+    hugeLayout.length = 10_000_000;
+    const layout = countingArray(hugeLayout);
+
+    const hugeChildren: unknown[] = [];
+    hugeChildren.length = 10_000_000;
+    const children = countingArray(hugeChildren);
+
+    expect(reportedIssues(documentWithLayout(layout.array))).toEqual([
+      { path: 'layout', code: 'too_big' },
+    ]);
+    expect(reportedIssues(nestedPanel(1, { type: 'stack', children: children.array }))).toEqual([
+      { path: 'layout.0.children', code: 'too_big' },
+    ]);
+    expect(layout.entryReads()).toBe(0);
+    expect(children.entryReads()).toBe(0);
+  });
+
+  it('rejects children over their bound at level 1 and at the deepest level, as the schema does', () => {
+    for (const level of [1, PANEL_MAX_NODE_DEPTH]) {
+      const children = countingArray(tableLeaves(LAYOUT_NODE_MAX_CHILDREN + 1));
+
+      expect(
+        reportedIssues(nestedPanel(level, { type: 'stack', children: children.array })),
+      ).toEqual([{ path: `${chainPathAt(level)}.children`, code: 'too_big' }]);
+      expect(children.entryReads()).toBe(0);
+
+      // The schema rejects the same document: with the same issue at level 1,
+      // and at the deepest level by refusing the container outright.
+      const plain = nestedPanel(level, {
+        type: 'stack',
+        children: tableLeaves(LAYOUT_NODE_MAX_CHILDREN + 1),
+      });
+
+      expect(rejectionLocations(plain)).toContain(
+        level === PANEL_MAX_NODE_DEPTH
+          ? `${chainPathAt(level)}.type: invalid_union`
+          : `${chainPathAt(level)}.children: too_big`,
+      );
+    }
+  });
+
+  it('answers five thousand children at the deepest level with one bounded issue', () => {
+    // The case that once produced one issue per child: the array is refused
+    // from its length, so the rejection is one issue whatever the length.
+    const rejection = rejectionSummary(
+      nestedPanel(PANEL_MAX_NODE_DEPTH, { type: 'stack', children: tableLeaves(5_000) }),
+    );
+
+    expect(rejection.issues).toEqual([
+      { path: `${chainPathAt(PANEL_MAX_NODE_DEPTH)}.children`, code: 'too_big' },
+    ]);
+    expect(rejection.issues.length).toBeLessThanOrEqual(PANEL_INPUT_MAX_PREFLIGHT_ISSUES);
+    // Nothing admitted was left unexamined, so the rejection is not truncated.
+    expect(rejection.truncated).toBeUndefined();
+    expect(rejection.message).not.toContain(TRUNCATED_CLAUSE);
+  });
+
+  it('stops at the issue cap and says the document was not examined further', () => {
+    // A full container at the deepest level: one too-deep position per child,
+    // more of them than the cap.
+    expect(LAYOUT_NODE_MAX_CHILDREN).toBeGreaterThan(PANEL_INPUT_MAX_PREFLIGHT_ISSUES);
+
+    const deepestContainer = chainPathAt(PANEL_MAX_NODE_DEPTH);
+    const rejection = rejectionSummary(
+      nestedPanel(PANEL_MAX_NODE_DEPTH, {
+        type: 'stack',
+        children: tableLeaves(LAYOUT_NODE_MAX_CHILDREN),
+      }),
+    );
+
+    expect(rejection.issues).toEqual(
+      Array.from({ length: PANEL_INPUT_MAX_PREFLIGHT_ISSUES }, (_, index) => ({
+        path: `${deepestContainer}.children.${String(index)}`,
+        code: 'panel_node_depth_exceeded',
+      })),
+    );
+    expect(rejection.truncated).toBe(true);
+    expect(rejection.message.endsWith(TRUNCATED_CLAUSE)).toBe(true);
+    // The message lists eight and counts the rest of what was collected; the
+    // closing clause is what stops that count being read as complete.
+    expect(rejection.message).toContain(`and ${String(PANEL_INPUT_MAX_PREFLIGHT_ISSUES - 8)} more`);
+  });
+
+  it('does not call a walk truncated when its last position brings the issues to the cap', () => {
+    const rejection = rejectionSummary(
+      nestedPanel(PANEL_MAX_NODE_DEPTH, {
+        type: 'stack',
+        children: tableLeaves(PANEL_INPUT_MAX_PREFLIGHT_ISSUES),
+      }),
+    );
+
+    expect(rejection.issues).toHaveLength(PANEL_INPUT_MAX_PREFLIGHT_ISSUES);
+    expect(rejection.truncated).toBeUndefined();
+    expect(rejection.message).not.toContain(TRUNCATED_CLAUSE);
+  });
+
+  it('bounds the issues of a self-containing container at the cap', () => {
+    // One container placed in every one of its own child positions: sixty-four
+    // positions per level, cut off at the depth bound and then at the cap.
+    const cyclic: { type: string; children: unknown[] } = { type: 'stack', children: [] };
+    for (let index = 0; index < LAYOUT_NODE_MAX_CHILDREN; index += 1) {
+      cyclic.children.push(cyclic);
+    }
+
+    const rejection = rejectionSummary(panelOf([cyclic]));
+
+    expect(rejection.issues).toHaveLength(PANEL_INPUT_MAX_PREFLIGHT_ISSUES);
+    expect(rejection.truncated).toBe(true);
+  });
+
+  it('reads the holes of a sparse node array as absent nodes, and leaves the verdict to the schema', () => {
+    const sparseLayout: unknown[] = [];
+    sparseLayout[0] = { type: 'table', source: 'spans' };
+    sparseLayout[2] = { type: 'flame', source: 'trace' };
+
+    const sparseChildren: unknown[] = [];
+    sparseChildren[1] = { type: 'table', source: 'spans' };
+
+    const corpus: readonly (readonly [string, unknown])[] = [
+      ['a sparse layout', documentWithLayout(sparseLayout)],
+      ['sparse children at level 1', nestedPanel(1, { type: 'stack', children: sparseChildren })],
+      [
+        'sparse children of the last container level',
+        nestedPanel(PANEL_MAX_NODE_DEPTH - 1, { type: 'section', children: sparseChildren }),
+      ],
+      ['a layout of holes only', documentWithLayout(new Array<unknown>(3))],
+    ];
+
+    for (const [label, value] of corpus) {
+      expect(() => parsePanelSpecInput(value), label).not.toThrow();
+
+      const schema = panelSpecInputSchema.safeParse(value);
+
+      expect(parsePanelSpecInput(value).ok, label).toBe(schema.success);
+      expect(parserLocations(value), label).toEqual(
+        schema.success ? [] : issueLocations(schema.error.issues),
+      );
+    }
+  });
+
+  it('rejects a document over the node budget at its root, though every array is within its bound', () => {
+    // At the budget exactly, plus one position a level further down.
+    const layout = sectionsOfLeaves(PANEL_LAYOUT_MAX_NODES, LAYOUT_NODE_MAX_CHILDREN);
+    const [firstSection] = layout;
+    if (firstSection === undefined) {
+      throw new Error('the layout has no first section.');
+    }
+    firstSection['children'] = [
+      { type: 'stack', children: tableLeaves(1) },
+      ...tableLeaves(LAYOUT_NODE_MAX_CHILDREN - 1),
+    ];
+    const document = panelOf(layout);
+
+    expect(() => parsePanelSpecInput(document)).not.toThrow();
+
+    const rejection = rejectionSummary(document);
+
+    expect(rejection.issues).toEqual([{ path: '', code: 'panel_node_count_exceeded' }]);
+    expect(rejection.truncated).toBe(true);
+    expect(rejection.message).toContain('<document>: panel_node_count_exceeded');
+    expect(rejection.message.endsWith(TRUNCATED_CLAUSE)).toBe(true);
+
+    // The documented exception to "the schema rejects it too": a total is the
+    // one rule the schema cannot express, so the schema alone accepts this.
+    expect(panelSpecInputSchema.safeParse(document).success).toBe(true);
+  });
+
+  it('reports the node count first, ahead of what the walk found before it stopped', () => {
+    const layout = sectionsOfLeaves(PANEL_LAYOUT_MAX_NODES, LAYOUT_NODE_MAX_CHILDREN);
+    const [firstSection] = layout;
+    if (firstSection === undefined) {
+      throw new Error('the layout has no first section.');
+    }
+    // One extra position below the first child, and an over-long container as
+    // the second child, whose entries are refused and so never counted.
+    firstSection['children'] = [
+      { type: 'stack', children: tableLeaves(1) },
+      { type: 'stack', children: tableLeaves(LAYOUT_NODE_MAX_CHILDREN + 1) },
+      ...tableLeaves(LAYOUT_NODE_MAX_CHILDREN - 2),
+    ];
+
+    expect(reportedIssues(panelOf(layout))).toEqual([
+      { path: '', code: 'panel_node_count_exceeded' },
+      { path: 'layout.0.children.1.children', code: 'too_big' },
+    ]);
+  });
+
+  it('stops a graph that shares one subtree in every position, visiting no more than the budget', () => {
+    // Every container holds the one container of the level below in each of
+    // its sixty-four positions, down to a leaf at the deepest level: a few
+    // objects that present 64 + 64² + … + 64⁸ positions to a walk that follows
+    // references. Each container's `children` is a getter, so every visit is
+    // counted.
+    let childrenReads = 0;
+    let node: unknown = { type: 'table', source: 'spans' };
+
+    for (let level = PANEL_MAX_NODE_DEPTH - 1; level >= 1; level -= 1) {
+      const children: readonly unknown[] = Array.from(
+        { length: LAYOUT_NODE_MAX_CHILDREN },
+        () => node,
+      );
+
+      node = {
+        type: 'stack',
+        get children(): readonly unknown[] {
+          childrenReads += 1;
+
+          // A tripwire rather than a hang: a walk without a budget would follow
+          // these references for longer than any test runs, so one past the
+          // budget is stopped here, and fails the assertions below instead.
+          if (childrenReads > PANEL_INPUT_MAX_NODE_COUNT) {
+            throw new Error('the walk visited more positions than the budget allows.');
+          }
+
+          return children;
+        },
+      };
+    }
+
+    const shared = node;
+    const document = documentWithLayout(
+      Array.from({ length: PANEL_LAYOUT_MAX_NODES }, () => shared),
+    );
+    const rejection = rejectionSummary(document);
+
+    expect(rejection.issues).toEqual([{ path: '', code: 'panel_node_count_exceeded' }]);
+    expect(rejection.truncated).toBe(true);
+    expect(childrenReads).toBeGreaterThan(0);
+    expect(childrenReads).toBeLessThanOrEqual(PANEL_INPUT_MAX_NODE_COUNT);
+  });
+
+  it('admits a document exactly at the budget, so the schema decides', () => {
+    const layout = sectionsOfLeaves(PANEL_LAYOUT_MAX_NODES, LAYOUT_NODE_MAX_CHILDREN);
+    const positions = layout.length * (1 + LAYOUT_NODE_MAX_CHILDREN);
+
+    expect(positions).toBe(PANEL_INPUT_MAX_NODE_COUNT);
+    expect(parsePanelSpecInput(panelOf(layout)).ok).toBe(true);
+
+    // With one malformed leaf, the rejection is the schema's, issue for issue.
+    const malformed = sectionsOfLeaves(PANEL_LAYOUT_MAX_NODES, LAYOUT_NODE_MAX_CHILDREN);
+    const lastSection = malformed[malformed.length - 1];
+    if (lastSection === undefined) {
+      throw new Error('the layout has no last section.');
+    }
+    lastSection['children'] = [
+      ...tableLeaves(LAYOUT_NODE_MAX_CHILDREN - 1),
+      { type: 'table', source: 'spans', sort: 'size_desc' },
+    ];
+    const document = panelOf(malformed);
+    const expected = `layout.${String(PANEL_LAYOUT_MAX_NODES - 1)}.children.${String(
+      LAYOUT_NODE_MAX_CHILDREN - 1,
+    )}.sort: invalid_value`;
+
+    expect(rejectionLocations(document)).toEqual([expected]);
+    expect(parserLocations(document)).toEqual([expected]);
+    expect(rejectionSummary(document).truncated).toBeUndefined();
+  });
+
+  it('treats a node array that misreports its length as unreadable', () => {
+    // Only a proxy can answer `length` with something no array has; its size
+    // and entries cannot be trusted, so it takes the unreadable path.
+    for (const lie of [Number.NaN, -1, Number.POSITIVE_INFINITY, 2 ** 53, '3']) {
+      const lying = new Proxy<unknown[]>([], {
+        get(target, key, receiver): unknown {
+          return key === 'length' ? lie : Reflect.get(target, key, receiver);
+        },
+      });
+
+      for (const document of [
+        documentWithLayout(lying),
+        nestedPanel(1, { type: 'stack', children: lying }),
+      ]) {
+        expect(() => parsePanelSpecInput(document)).not.toThrow();
+        expect(reportedIssues(document)).toEqual([{ path: '', code: 'panel_input_unreadable' }]);
+      }
+    }
   });
 });
 
@@ -1446,48 +2357,89 @@ function keywordStrings(value: unknown, keyword: string, found: string[] = []): 
 }
 
 /**
- * The node-union definition and its options, keyed by the node type each option
- * pins.
+ * The options of one rendered node union, keyed by the node type each option
+ * pins, every option dereferenced.
  *
- * Found by content: the one definition whose branch list resolves to a set of
- * `type` constants matching the node vocabulary. That is also, in itself, the
- * assertion that the union survived rendering as a discriminated set of
- * branches rather than collapsing into a permissive object.
+ * Each branch is followed through its references, because a leaf is one shared
+ * schema at every nesting level and therefore renders as a definition each
+ * level's union refers to. A branch that does not resolve to an object with a
+ * `type` constant fails the test: that is the assertion that the union survived
+ * rendering as a discriminated set of branches rather than collapsing into a
+ * permissive object.
+ *
+ * @param document The emitted document.
+ * @param union The rendered union, already dereferenced.
+ * @param what How to name the union in a failure.
+ * @returns The union's options by node type, in branch order.
  */
-function nodeUnionOf(document: JsonRecord): {
-  key: string;
-  optionsByType: Map<string, JsonRecord>;
-} {
-  const definitions = definitionsOf(document);
+function unionOptionsOf(
+  document: JsonRecord,
+  union: JsonRecord,
+  what: string,
+): Map<string, JsonRecord> {
+  const branches = union['oneOf'] ?? union['anyOf'];
 
-  for (const [key, value] of Object.entries(definitions)) {
-    const entry = asRecord(value, `definition ${key}`);
-    const branches = entry['oneOf'] ?? entry['anyOf'];
-    if (!Array.isArray(branches) || branches.length !== PANEL_NODE_TYPES.length) {
-      continue;
-    }
-
-    const optionsByType = new Map<string, JsonRecord>();
-    for (const branch of branches) {
-      const option = asRecord(branch, `branch of definition ${key}`);
-      const properties = option['properties'];
-      if (typeof properties !== 'object' || properties === null) {
-        break;
-      }
-      const discriminator = deref(document, asRecord(properties, 'properties')['type'], 'type');
-      const constant = discriminator['const'];
-      if (typeof constant !== 'string') {
-        break;
-      }
-      optionsByType.set(constant, option);
-    }
-
-    if (optionsByType.size === PANEL_NODE_TYPES.length) {
-      return { key, optionsByType };
-    }
+  if (!Array.isArray(branches)) {
+    throw new Error(`the emitted schema's ${what} is not a union.`);
   }
 
-  throw new Error('the emitted schema holds no definition enumerating the panel node types.');
+  const optionsByType = new Map<string, JsonRecord>();
+
+  for (const branch of branches) {
+    const option = deref(document, branch, `branch of ${what}`);
+    const properties = asRecord(option['properties'], `properties of a branch of ${what}`);
+    const constant = deref(document, properties['type'], `type of a branch of ${what}`)['const'];
+
+    if (typeof constant !== 'string') {
+      throw new Error(`a branch of the emitted schema's ${what} pins no node type.`);
+    }
+    optionsByType.set(constant, option);
+  }
+
+  return optionsByType;
+}
+
+/**
+ * The top-level node union — level 1 of the nesting chain — and its options.
+ *
+ * Located structurally, through `layout.items`, rather than by searching the
+ * definitions for a union of the right size: every level above the deepest
+ * renders a union with one branch per node type, so a size-based search would
+ * find whichever level the emitter happened to list first.
+ *
+ * @param document The emitted document.
+ * @returns The level-1 union, dereferenced, and its options by node type.
+ */
+function nodeUnionOf(document: JsonRecord): {
+  union: JsonRecord;
+  optionsByType: Map<string, JsonRecord>;
+} {
+  const properties = asRecord(document['properties'], 'properties');
+  const layout = deref(document, properties['layout'], 'layout');
+  const union = deref(document, layout['items'], 'layout items');
+
+  return { union, optionsByType: unionOptionsOf(document, union, 'top-level node union') };
+}
+
+/**
+ * The definition a container option's `children` items refer to: the union of
+ * the level below that container.
+ *
+ * @param document The emitted document.
+ * @param option A container's rendered option.
+ * @param what How to name the container in a failure.
+ * @returns The `$ref` pointer of the child union.
+ */
+function childUnionPointerOf(document: JsonRecord, option: JsonRecord, what: string): string {
+  const properties = asRecord(option['properties'], `properties of ${what}`);
+  const children = deref(document, properties['children'], `children of ${what}`);
+  const pointer = asRecord(children['items'], `children items of ${what}`)['$ref'];
+
+  if (typeof pointer !== 'string') {
+    throw new Error(`the children of ${what} do not refer to a shared child union.`);
+  }
+
+  return pointer;
 }
 
 /** Parses emitted text back to a value, without widening anything to `any`. */
@@ -1736,32 +2688,88 @@ describe('the authoring schema rendered as JSON Schema', () => {
     }
   });
 
-  it('expresses the recursion as a reference that leads back to the node union', () => {
-    // A container holds child nodes, so the union is recursive and can only be
-    // expressed with a reference. This walks the definition-level reference
-    // graph and requires the node union to be reachable from itself, which is
-    // both the proof that the cycle is present and the proof that it resolves.
-    const document = panelSpecInputJsonSchema();
-    const definitions = definitionsOf(document);
-    const { key: unionKey } = nodeUnionOf(document);
-    const edges = new Map<string, readonly string[]>();
+  it('expresses the nesting bound as a finite chain that ends in a leaf-only union', () => {
+    // The authoring schema is unrolled rather than recursive: each level's
+    // containers refer to the union of the level below, and the deepest level
+    // names no container at all. So the model is shown the depth bound as
+    // structure, one level at a time, down to a union it cannot nest below.
+    const containers: readonly string[] = LAYOUT_NODE_TYPES;
+    const everyType = [...PANEL_NODE_TYPES].sort();
 
-    for (const [key, value] of Object.entries(definitions)) {
-      edges.set(key, refPointers(value).map(definitionKeyOf));
-    }
+    for (const target of PANEL_SPEC_INPUT_SCHEMA_TARGETS) {
+      const document = panelSpecInputJsonSchema({ target });
+      let { union, optionsByType } = nodeUnionOf(document);
 
-    const reached = new Set<string>();
-    const pending = [...(edges.get(unionKey) ?? [])];
-    while (pending.length > 0) {
-      const next = pending.pop();
-      if (next === undefined || reached.has(next)) {
-        continue;
+      for (let level = 1; level < PANEL_MAX_NODE_DEPTH; level += 1) {
+        expect([...optionsByType.keys()].sort()).toEqual(everyType);
+
+        // The three containers of one level share one child union.
+        const pointers = new Set(
+          containers.map((type) =>
+            childUnionPointerOf(
+              document,
+              asRecord(optionsByType.get(type), `${type} at level ${String(level)}`),
+              `${type} at level ${String(level)} (${target})`,
+            ),
+          ),
+        );
+        const [pointer] = pointers;
+
+        expect(pointers.size).toBe(1);
+        if (pointer === undefined) {
+          throw new Error(`the containers at level ${String(level)} have no child union.`);
+        }
+
+        const next = `union at level ${String(level + 1)} (${target})`;
+
+        union = deref(document, { $ref: pointer }, next);
+        optionsByType = unionOptionsOf(document, union, next);
       }
-      reached.add(next);
-      pending.push(...(edges.get(next) ?? []));
-    }
 
-    expect(reached.has(unionKey)).toBe(true);
+      // The deepest level: every visualization node and no container.
+      expect([...optionsByType.keys()]).toEqual([...VISUALIZATION_NODE_TYPES]);
+      expect([...optionsByType.keys()].filter((type) => containers.includes(type))).toEqual([]);
+      expect(String(union['description'])).toContain(String(PANEL_MAX_NODE_DEPTH));
+    }
+  });
+
+  it('holds no reference cycle, so it can be read without following a loop', () => {
+    // Walks the definition-level reference graph depth first and requires that
+    // no definition reaches itself. The recursive schema this chain replaced
+    // rendered exactly such a cycle, through the node union.
+    for (const target of PANEL_SPEC_INPUT_SCHEMA_TARGETS) {
+      const document = panelSpecInputJsonSchema({ target });
+      const definitions = definitionsOf(document);
+      const edges = new Map<string, readonly string[]>();
+
+      for (const [key, value] of Object.entries(definitions)) {
+        edges.set(key, refPointers(value).map(definitionKeyOf));
+      }
+
+      const cyclic: string[] = [];
+
+      for (const start of edges.keys()) {
+        const reached = new Set<string>();
+        const pending = [...(edges.get(start) ?? [])];
+
+        while (pending.length > 0) {
+          const next = pending.pop();
+          if (next === undefined || reached.has(next)) {
+            continue;
+          }
+          reached.add(next);
+          for (const onward of edges.get(next) ?? []) {
+            pending.push(onward);
+          }
+        }
+
+        if (reached.has(start)) {
+          cyclic.push(start);
+        }
+      }
+
+      expect(cyclic).toEqual([]);
+    }
   });
 
   it('carries the package’s stable identity, and omits it when asked', () => {

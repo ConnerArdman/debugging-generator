@@ -81,8 +81,9 @@
  *    specification says can put an uncatalogued thing on screen (AAP 0.6.4);
  *    `DataProvider` and `PanelActions` are the two seams a host implements —
  *    evidence in, interactions out — and `useQuery` is the only module in the
- *    library that calls a provider at all. No component here opens a socket,
- *    calls `fetch` or knows a message name (AAP 0.4.2).
+ *    library that calls a provider at all, addressing every query to the
+ *    session the host places in `PanelSessionContext`. No component here opens
+ *    a socket, calls `fetch` or knows a message name (AAP 0.4.2).
  *
  * ## What is deliberately not re-exported
  *
@@ -314,13 +315,16 @@ export {
   DATA_QUERY_DEFAULT_OFFSET,
   DATA_QUERY_MAX_LIMIT,
   DataProviderContext,
+  PanelSessionContext,
   useDataProvider,
+  usePanelSessionId,
 } from './host/DataProvider';
 export type {
   AnyDataQueryResponse,
   DataProvider,
   DataQueryOptions,
   DataQueryResolver,
+  DataQueryResolverContext,
   DataQueryResponse,
   DataResultFor,
   DataResultMap,

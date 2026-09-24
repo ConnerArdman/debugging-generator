@@ -276,6 +276,15 @@ CREATE INDEX IF NOT EXISTS idx_modifications_session_id_file
 CREATE INDEX IF NOT EXISTS idx_modifications_previous_record_id
   ON modifications (previous_record_id);
 
+-- Schema version 2, applied by ./migrations.ts rather than declared here, adds
+-- the single-child invariant of a chain: the chain_fork flag column and the
+-- partial unique index idx_modifications_previous_record_id_unique over
+-- previous_record_id, so no record carries two live layers at once. A reverted
+-- layer is excluded, which is what lets a follow-up be layered again on a
+-- parent whose earlier delta was rolled back. Forks written before that step
+-- are flagged rather than rewritten, and cleanup reports their files as
+-- conflicts instead of restoring either branch.
+
 -- -----------------------------------------------------------------------------
 -- captures - one row per runtime capture window. Owner: ./sessions-repo.ts
 --
@@ -392,6 +401,11 @@ CREATE INDEX IF NOT EXISTS idx_telemetry_events_session_id_request_key
   ON telemetry_events (session_id, request_key);
 CREATE INDEX IF NOT EXISTS idx_telemetry_events_session_id_producer_id_seq
   ON telemetry_events (session_id, producer_id, seq);
+
+-- Schema version 2, applied by ./migrations.ts, adds the two retention purge
+-- indexes idx_telemetry_events_start_time_ingest_seq and
+-- idx_telemetry_events_session_id_start_time_ingest_seq, so every bounded purge
+-- batch is an ordered index range read rather than a full scan and a sort.
 
 -- -----------------------------------------------------------------------------
 -- panels - the generated debugging panels of a session. Owner: ./panels-repo.ts

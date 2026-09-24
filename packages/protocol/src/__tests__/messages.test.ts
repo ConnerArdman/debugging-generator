@@ -76,12 +76,30 @@
  *   conflict shapes, so an absolute path, a `..` traversal and a zero line are
  *   refused by the same schema every located runtime item already answers to.
  *
- * Two cross-cutting suites close the file. One is driven from
+ * Two cross-cutting suites follow. One is driven from
  * `MESSAGE_PAYLOAD_SCHEMAS` itself, so a twenty-sixth message cannot escape the
  * JSON round trip or the no-transform check by being added without a test; the
  * other plants a sentinel in a refused field of several payloads — the
  * credential on `client.hello` included — and requires that nothing the
  * rejection produces contains it.
+ *
+ * ## Discrimination, frame by frame — `parseMessage`
+ *
+ * The final section is this file's evidence for `parseMessage` from
+ * `../envelope.ts`: the step every receiver takes, from a whole frame to a
+ * typed message. It is driven from the `MESSAGE_TYPES` tuple, one case per type,
+ * and proves two things of every registered message. Its fixture from
+ * `VALID_PAYLOADS`, framed as `{ id, type, sessionId?, ts, payload }`, parses to
+ * a message of that same type with its payload deep-equal and its routing key
+ * exactly as `createEnvelope` would have set it. And the same type framed around
+ * a payload that is valid for a *different* type — drawn from a second
+ * exhaustive table, typed so a type cannot be paired with its own payload — is
+ * refused with `PROTOCOL_INVALID_MESSAGE`, every issue located under `payload`,
+ * and a sentinel planted in that payload absent from the message, hint, details
+ * and `toPayload()` alike. Unknown types, the five HTTP-only operation names
+ * among them, are refused at the discriminator. `./envelope.test.ts` owns the
+ * envelope fields themselves; the pairing of `type` with `payload` is asserted
+ * here.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -139,6 +157,8 @@ import {
   parseAnalysisResult,
 } from '../analysis.js';
 import type { AnalysisFindings, AnalysisResult } from '../analysis.js';
+import { createEnvelope, parseMessage } from '../envelope.js';
+import type { MessageByType } from '../envelope.js';
 import {
   ERROR_MESSAGE_PAYLOADS,
   errorPayloadSchema,
@@ -3375,7 +3395,9 @@ describe('cleanup.completed — the verdict, and what was left alone', () => {
 // rather than from a list written here, which is the only way these cases stay
 // true of a protocol that grows: a twenty-sixth message added to the registry
 // without a fixture in `VALID_PAYLOADS` is a compile error, and one added with a
-// fixture is carried into the round-trip and no-transform cases without an edit.
+// fixture is carried into the round-trip and no-transform cases without an edit —
+// and into the frame-level `parseMessage` cases that close the file, which also
+// need it an entry in `MISMATCHED_PAYLOADS`, again enforced by the compiler.
 //
 // `../messages/index.ts` proves three properties of the registries at compile
 // time — the WebSocket registry covers exactly the twenty-five types, the
@@ -3759,5 +3781,483 @@ describe('a rejected payload never echoes what it refused', () => {
     }
     expect(parsed.error.message).toContain('projectroot');
     expect(parsed.error.message).not.toContain(PROJECT_ROOT);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Frames — `parseMessage` discriminates every registered type, and only that
+//
+// Everything above proves each payload schema in isolation. What this section
+// proves is the step a receiver actually takes: a whole frame
+// `{ id, type, sessionId?, ts, payload }` handed to `parseMessage` from
+// `../envelope.ts`, which must select the one union member the frame's `type`
+// names and validate the payload against that member alone (AAP §0.4.2). Two
+// properties follow, and both are asserted for every member of `MESSAGE_TYPES`
+// by iterating the tuple itself: a twenty-sixth message is carried into every
+// case below automatically, and it cannot be added at all without a fixture in
+// `VALID_PAYLOADS` and an entry in `MISMATCHED_PAYLOADS`, each of which is a
+// compile error when missing:
+//
+// - **Acceptance.** Each type's fixture from `VALID_PAYLOADS`, framed, parses to
+//   a message of that same type with the payload, the identifiers and the
+//   timestamp exactly as sent.
+// - **Discrimination.** Each type, framed around a payload that is valid for a
+//   *different* type, is refused — the payload is not accepted merely because
+//   some member of the union would take it — and the refusal is the transport's
+//   `PROTOCOL_INVALID_MESSAGE`, located under `payload`, with nothing of the
+//   refused value in any part of the error (AAP §0.5.2). An unknown `type` is
+//   refused as well, at the discriminator and before any payload is examined.
+//
+// Frames are built the way `createEnvelope` builds them — the payload's own
+// `sessionId`, where it has one, becomes the routing key; otherwise the key is
+// absent — and the first case below holds the builder to that rule. Identifiers
+// and the timestamp are fixed literals, never a clock or a generator.
+// `./envelope.test.ts` covers the envelope fields themselves (strictness, the
+// epoch-millisecond bound, text decoding); this section is about the pairing of
+// `type` and `payload`.
+// ---------------------------------------------------------------------------
+
+/**
+ * The frame identifier every case below sends, in the shape `newMessageId()`
+ * mints (`/^[a-z]{3}_[0-9a-z]{16}$/`, prefix `msg`).
+ */
+const FRAME_ID = 'msg_5t1v8w3x0y6z2a4b';
+
+/**
+ * The send timestamp every case below stamps: Unix epoch milliseconds with a
+ * sub-millisecond fraction, which the envelope must preserve rather than round.
+ */
+const FRAME_TS = 1_758_000_002_500.25;
+
+/** The shape every identifier `@debuggen/shared` mints matches. */
+const MINTED_ID_PATTERN = /^[a-z]{3}_[0-9a-z]{16}$/;
+
+/** A URL on the fixture origin whose path carries the sentinel. */
+const SENTINEL_URL = `${PAGE_ORIGIN}/${SENTINEL}`;
+
+/**
+ * A valid handshake whose credential is the sentinel.
+ *
+ * The one payload in the protocol that carries a bearer credential, so it is
+ * the sharpest thing a refused frame can hold. Named because two tables below
+ * use it: as the partner payload of the mismatch case for `agent.ready`, and as
+ * the payload every unknown-type frame carries.
+ */
+const CREDENTIAL_BEARING_HELLO: PayloadOf<'client.hello'> = {
+  ...VALID_PAYLOADS['client.hello'],
+  token: SENTINEL,
+};
+
+/**
+ * A payload valid for some message type other than `T`, tagged with the type it
+ * is valid for.
+ *
+ * A distributed union over every *other* type, so a fixture pairing a type with
+ * its own payload is a compile error (the `partner` literal is excluded), and
+ * the payload slot is typed from the partner's schema: the claim "this is a
+ * valid `partner` payload" is checked by the compiler here and again at run time
+ * by the case that uses it.
+ */
+type MismatchedPayload<T extends MessageType> = {
+  readonly [P in Exclude<MessageType, T>]: {
+    /** The type the payload is valid for — never `T` itself. */
+    readonly partner: P;
+    /** A valid `partner` payload with {@link SENTINEL} in one of its values. */
+    readonly payload: PayloadOf<P>;
+  };
+}[Exclude<MessageType, T>];
+
+/**
+ * For every message type, a payload that belongs to a different one.
+ *
+ * Keyed by the registry's own type, so a message added to `MESSAGE_TYPES` with
+ * no entry here is a compile error rather than a type the mismatch case skips.
+ *
+ * Any validator that checked `type` and `payload` independently — a known name,
+ * and a payload *some* member accepts — would accept every entry here. Partners
+ * are additionally chosen as near lookalikes wherever the protocol has one,
+ * because that is where a looser check fails first: the binding pair, the two
+ * agent configurations, the two capture frames, the two telemetry frames and the
+ * two instrumentation outcomes differ by a field or two, so a member that
+ * tolerated a missing or an extra key would accept exactly these. Where there is
+ * no lookalike — the two session broadcasts are identical to each other, so
+ * neither can partner the other — the partner is a payload from a neighbouring
+ * part of the protocol.
+ *
+ * Every payload carries {@link SENTINEL} in a **value** the partner's schema
+ * accepts — a credential, a URL path, the developer's question, captured event
+ * names, an element's text, free-text messages, identifiers — and never in a key
+ * position, which the renderer is sanctioned to name (see the last case of the
+ * suite above).
+ */
+const MISMATCHED_PAYLOADS: { readonly [T in MessageType]: MismatchedPayload<T> } = {
+  'client.hello': {
+    partner: 'agent.ready',
+    payload: { ...VALID_PAYLOADS['agent.ready'], url: SENTINEL_URL },
+  },
+  'agent.ready': { partner: 'client.hello', payload: CREDENTIAL_BEARING_HELLO },
+  'agent.config': {
+    partner: 'server-agent.config',
+    payload: { ...VALID_PAYLOADS['server-agent.config'], captureId: SENTINEL },
+  },
+  'server-agent.config': {
+    partner: 'agent.config',
+    payload: { ...VALID_PAYLOADS['agent.config'], captureId: SENTINEL },
+  },
+  'session.bind': {
+    partner: 'session.bound',
+    payload: { ...VALID_PAYLOADS['session.bound'], url: SENTINEL_URL },
+  },
+  'session.bound': {
+    partner: 'session.bind',
+    payload: { ...VALID_PAYLOADS['session.bind'], url: SENTINEL_URL },
+  },
+  'tab.navigated': {
+    partner: 'session.bind',
+    payload: { ...VALID_PAYLOADS['session.bind'], url: SENTINEL_URL },
+  },
+  'session.unbind': {
+    partner: 'tab.navigated',
+    payload: { ...VALID_PAYLOADS['tab.navigated'], url: SENTINEL_URL },
+  },
+  'session.created': {
+    partner: 'session.progress',
+    payload: { ...VALID_PAYLOADS['session.progress'], detail: SENTINEL },
+  },
+  'session.updated': {
+    partner: 'cleanup.completed',
+    payload: {
+      sessionId: SESSION_ID,
+      status: 'conflict',
+      conflicts: [{ ...validModificationConflict(), message: SENTINEL }],
+    },
+  },
+  'session.progress': {
+    partner: 'error',
+    payload: { ...VALID_PAYLOADS.error, message: SENTINEL },
+  },
+  'analysis.completed': {
+    partner: 'instrumentation.plan',
+    payload: { sessionId: SESSION_ID, plan: { ...validPlan(), objective: SENTINEL } },
+  },
+  'capture.started': {
+    partner: 'capture.stopped',
+    payload: { ...VALID_PAYLOADS['capture.stopped'], captureId: SENTINEL },
+  },
+  'capture.stopped': {
+    partner: 'capture.started',
+    payload: { sessionId: SESSION_ID, captureId: SENTINEL },
+  },
+  'instrumentation.plan': {
+    partner: 'analysis.completed',
+    payload: {
+      sessionId: SESSION_ID,
+      analysis: {
+        ...validResult(),
+        observed: [{ statement: SENTINEL, evidence: [{ eventId: EVENT_ID }] }],
+      },
+    },
+  },
+  'instrumentation.ready': {
+    partner: 'instrumentation.failed',
+    payload: {
+      sessionId: SESSION_ID,
+      error: { ...VALID_PAYLOADS['instrumentation.failed'].error, hint: SENTINEL },
+    },
+  },
+  'instrumentation.failed': {
+    partner: 'instrumentation.ready',
+    payload: {
+      ...VALID_PAYLOADS['instrumentation.ready'],
+      unavailable: [
+        {
+          signal: 'prisma',
+          reason: SENTINEL,
+          hint: 'Relaunch the dev server through the editor extension.',
+        },
+      ],
+    },
+  },
+  'telemetry.event': {
+    partner: 'telemetry.tail',
+    payload: { sessionId: SESSION_ID, events: [{ ...validPersistedEvent(), name: SENTINEL }] },
+  },
+  'telemetry.tail': {
+    partner: 'telemetry.event',
+    payload: { events: [{ ...validIngressEvent(), name: SENTINEL }] },
+  },
+  'panel.generated': {
+    partner: 'session.created',
+    payload: { session: { ...validSessionRecord(), question: SENTINEL } },
+  },
+  'source.open': {
+    partner: 'target.selected',
+    payload: { sessionId: SESSION_ID, target: { ...validSelectedTarget(), text: SENTINEL } },
+  },
+  'target.request': {
+    partner: 'target.selected',
+    payload: { sessionId: SESSION_ID, target: { ...validSelectedTarget(), url: SENTINEL_URL } },
+  },
+  'target.selected': {
+    partner: 'source.open',
+    payload: { sessionId: SESSION_ID, location: { ...validSourceLocation(), symbol: SENTINEL } },
+  },
+  'cleanup.completed': {
+    partner: 'instrumentation.ready',
+    payload: {
+      ...VALID_PAYLOADS['instrumentation.ready'],
+      applied: [{ ...validModification(), diff: SENTINEL }],
+    },
+  },
+  error: {
+    partner: 'instrumentation.failed',
+    payload: {
+      sessionId: SESSION_ID,
+      error: { ...VALID_PAYLOADS['instrumentation.failed'].error, message: SENTINEL },
+    },
+  },
+};
+
+/**
+ * The routing key a payload implies: its own `sessionId` when that is a string,
+ * otherwise none.
+ *
+ * The rule `createEnvelope` applies when no explicit routing key is given, stated
+ * structurally for the same reason it is there — most payloads carry a
+ * `sessionId` and some do not, and asking the value keeps one function correct
+ * for all of them without a per-type table.
+ *
+ * @param payload Any message payload.
+ * @returns The `sessionId` to put on the envelope, or `undefined` for none.
+ */
+function routingKeyOf(payload: unknown): string | undefined {
+  if (typeof payload !== 'object' || payload === null || !('sessionId' in payload)) {
+    return undefined;
+  }
+
+  return typeof payload.sessionId === 'string' ? payload.sessionId : undefined;
+}
+
+/**
+ * A complete frame around a payload, with the fixed id and timestamp.
+ *
+ * Written out rather than produced by `createEnvelope`, so the acceptance cases
+ * do not depend on the function they would otherwise be testing through; the
+ * first case of the suite below proves the two agree. Typed as the envelope of
+ * `T`, so a frame pairing a type with a payload of the wrong shape cannot be
+ * built here by accident — the mismatch cases relabel a correct frame instead.
+ *
+ * @param type The message type.
+ * @param payload A payload of that type.
+ * @returns `{ id, type, sessionId?, ts, payload }`, with `sessionId` present only
+ * when the payload implies one (see {@link routingKeyOf}).
+ */
+function frameOf<T extends MessageType>(type: T, payload: PayloadOf<T>): MessageByType<T> {
+  const routingKey = routingKeyOf(payload);
+
+  return routingKey === undefined
+    ? { id: FRAME_ID, type, ts: FRAME_TS, payload }
+    : { id: FRAME_ID, type, sessionId: routingKey, ts: FRAME_TS, payload };
+}
+
+/**
+ * The issue paths a `parseMessage` rejection rendered into its `details`.
+ *
+ * `details.issues` is the one structured, value-free account of a failure this
+ * package produces (`protocolParseError` in `../version.ts`): a path and a code
+ * per issue, nothing received. An entry without a string path is reported as a
+ * marker rather than dropped, so a malformed `details` fails the assertions that
+ * read it instead of passing them vacuously.
+ *
+ * @param error The error a rejection carried.
+ * @returns One dotted path per rendered issue, in order; empty when `details`
+ * carries no issue list.
+ */
+function renderedIssuePaths(error: DebuggenError): string[] {
+  const issues: unknown = error.details?.issues;
+
+  if (!Array.isArray(issues)) {
+    return [];
+  }
+
+  return issues.map((issue: unknown) =>
+    typeof issue === 'object' && issue !== null && 'path' in issue && typeof issue.path === 'string'
+      ? issue.path
+      : '<unrendered issue>',
+  );
+}
+
+/**
+ * Every form in which a rejection can leave the receiving process.
+ *
+ * The message and hint are logged and displayed, `details` is logged and may be
+ * persisted with a session, `toPayload()` is what crosses the wire in an `error`
+ * frame, and `DebuggenError.from` is the normalisation every boundary applies
+ * before any of those. `String(error)` is what a bare template or a console
+ * prints.
+ *
+ * @param error The error a rejection carried.
+ * @returns Each rendering, as text to search.
+ */
+function renderedSurfaces(error: DebuggenError): string[] {
+  return [
+    error.message,
+    error.hint ?? '',
+    JSON.stringify(error.details ?? {}),
+    JSON.stringify(error.toPayload()),
+    JSON.stringify(DebuggenError.from(error).toPayload()),
+    String(error),
+  ];
+}
+
+describe('parseMessage — every registered type is discriminated to its own member', () => {
+  it('frames each case exactly as createEnvelope would, from fixed well-formed values', () => {
+    // The frame builder is a restatement of the envelope's routing rule, so it is
+    // held to the implementation rather than trusted: for every type, the frame
+    // it writes out is the frame `createEnvelope` produces from the same payload,
+    // id and timestamp — routing key lifted or omitted alike. The id has the
+    // minted shape, and the timestamp really carries a sub-millisecond fraction,
+    // so the acceptance cases below prove that fraction survives validation.
+    expect(FRAME_ID).toMatch(MINTED_ID_PATTERN);
+    expect(Number.isInteger(FRAME_TS)).toBe(false);
+
+    for (const type of MESSAGE_TYPES) {
+      const payload = VALID_PAYLOADS[type];
+
+      expect(frameOf(type, payload)).toStrictEqual(
+        createEnvelope(type, payload, { id: FRAME_ID, ts: FRAME_TS }),
+      );
+    }
+  });
+
+  it.each([...MESSAGE_TYPES])(
+    '%s: accepts the framed fixture and returns that type with its payload intact',
+    (type) => {
+      const payload = VALID_PAYLOADS[type];
+      const frame = frameOf(type, payload);
+      const parsed = parseMessage(frame);
+
+      // Reported with the rendered issue paths, so a failure names the field that
+      // was refused rather than printing `false`.
+      expect(parsed.ok ? type : { type, issues: renderedIssuePaths(parsed.error) }).toEqual(type);
+      if (!parsed.ok) {
+        return;
+      }
+
+      // The discriminant selected this type's own member — not merely *a*
+      // member that happened to accept the payload — and validation handed back
+      // exactly what was sent: the payload deep-equal, nothing added, dropped or
+      // rewritten, and the id and sub-millisecond timestamp untouched.
+      expect(parsed.value.type).toBe(type);
+      expect(parsed.value.payload).toStrictEqual(payload);
+      expect(parsed.value).toStrictEqual(frame);
+      expect(parsed.value.id).toBe(FRAME_ID);
+      expect(parsed.value.ts).toBe(FRAME_TS);
+
+      // The routing key survives exactly as the envelope rule set it: equal to
+      // the payload's own `sessionId` where the payload has one, and an absent
+      // key — not a present `undefined` — where it does not.
+      const routingKey = routingKeyOf(payload);
+
+      expect(Object.hasOwn(parsed.value, 'sessionId')).toBe(routingKey !== undefined);
+      expect(parsed.value.sessionId).toBe(routingKey);
+    },
+  );
+});
+
+describe('parseMessage — a payload is accepted only under its own type', () => {
+  it.each([...MESSAGE_TYPES])(
+    '%s: refuses a frame carrying another type\u2019s payload, without echoing it',
+    (type) => {
+      const { partner, payload } = MISMATCHED_PAYLOADS[type];
+      const partnerSchema: z.ZodType = MESSAGE_PAYLOAD_SCHEMAS[partner];
+      const declaredSchema: z.ZodType = MESSAGE_PAYLOAD_SCHEMAS[type];
+      const partnerFrame = frameOf(partner, payload);
+
+      // Preconditions, each of which would otherwise make the rejection below
+      // prove nothing: the payload really belongs to another type, it really is
+      // valid there — alone and as a whole frame — while this type's own schema
+      // really refuses it, and the sentinel is really in it.
+      expect(partner).not.toBe(type);
+      expect(JSON.stringify(payload)).toContain(SENTINEL);
+      expect(partnerSchema.safeParse(payload).success).toBe(true);
+      expect(declaredSchema.safeParse(payload).success).toBe(false);
+      expect(parseMessage(partnerFrame).ok).toBe(true);
+
+      // The mismatch itself: the partner's valid frame with nothing changed but
+      // its `type`, so the envelope fields are all acceptable and the only fault
+      // is the pairing.
+      const parsed = parseMessage({ ...partnerFrame, type });
+
+      expect(isErr(parsed)).toBe(true);
+      if (!isErr(parsed)) {
+        return;
+      }
+
+      const { error } = parsed;
+
+      expect(DebuggenError.is(error)).toBe(true);
+      expect(error.code).toBe('PROTOCOL_INVALID_MESSAGE');
+      expect([...DEBUGGEN_ERROR_CODES]).toContain(error.code);
+      expect(error.message.startsWith('Invalid protocol message: ')).toBe(true);
+
+      // Every issue is located under `payload`: the frame was matched to the
+      // member its `type` names and failed there, rather than failing at the
+      // envelope or being reported as twenty-five rejected branches.
+      const paths = renderedIssuePaths(error);
+
+      expect(paths).not.toHaveLength(0);
+      for (const path of paths) {
+        expect(path === 'payload' || /^payload[.[]/.test(path) ? path : { outside: path }).toBe(
+          path,
+        );
+      }
+
+      // And nothing of what was refused leaves in any form (AAP §0.5.2).
+      for (const surface of renderedSurfaces(error)) {
+        expect(surface).not.toContain(SENTINEL);
+      }
+    },
+  );
+
+  it.each([
+    ...HTTP_ONLY_PAYLOAD_NAMES.map((name): [string, string] => [
+      `the HTTP-only operation ${name}`,
+      name,
+    ]),
+    ['a registered name in another case', 'Session.Progress'],
+    ['a registered name with trailing whitespace', 'session.progress '],
+    ['an empty type', ''],
+    ['the sentinel itself', SENTINEL],
+  ])('refuses %s as a message type, at the discriminator', (_label, type) => {
+    const messageTypes: readonly string[] = MESSAGE_TYPES;
+
+    // Precondition: the name really is outside the vocabulary. The HTTP-only
+    // names are the realistic case — an operation a client might try to send as
+    // a frame, which has a route and a response but no message (AAP §0.4.2).
+    expect(messageTypes).not.toContain(type);
+
+    const parsed = parseMessage({
+      ...frameOf('client.hello', CREDENTIAL_BEARING_HELLO),
+      type,
+    });
+
+    expect(isErr(parsed)).toBe(true);
+    if (!isErr(parsed)) {
+      return;
+    }
+
+    const { error } = parsed;
+
+    expect(error.code).toBe('PROTOCOL_INVALID_MESSAGE');
+    expect(error.message.startsWith('Invalid protocol message: ')).toBe(true);
+    // Refused at `type` alone: no member was selected, so the payload — a valid
+    // handshake carrying a credential — was never validated against anything.
+    // The credential is not echoed, and — as the case whose type *is* the
+    // sentinel shows — neither is the name that was offered.
+    expect(renderedIssuePaths(error)).toEqual(['type']);
+    for (const surface of renderedSurfaces(error)) {
+      expect(surface).not.toContain(SENTINEL);
+    }
   });
 });

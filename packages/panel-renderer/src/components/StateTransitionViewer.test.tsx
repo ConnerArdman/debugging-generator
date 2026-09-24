@@ -33,20 +33,22 @@
  * reveal, and an affordance implying otherwise would promise what the product
  * deliberately never captured.
  *
- * ## Two places this suite pins the component's contract rather than the
- * prompt's wording
+ * ## Two places this suite pins the component's contract precisely
  *
  * Both are deliberate decisions of the code under test, documented in its own
- * header and in `../host/useQuery`, and asserting the prompt's phrasing instead
- * would encode behaviour the library rules out:
+ * header and in `../host/useQuery`:
  *
- *   1. **"Load more" widens the window; it never advances an offset and
- *      stitches pages.** `useQuery` resolves one page and replaces it, because
- *      a renderer that concatenated two responses would show something no
- *      single response ever said. So the paging case asserts the
- *      loaded-versus-`total` statement, a second provider call at the **same**
- *      offset with a strictly **larger** `limit`, and rows that follow the
- *      second response.
+ *   1. **"Load more" advances to the provider's `nextOffset` and appends.**
+ *      Every request of a sequence carries the same `limit`, and the next one
+ *      starts at exactly the offset the previous response reported — never a
+ *      wider window at the old offset, never an offset counted from a page's
+ *      length, and never a stop at `DATA_QUERY_MAX_LIMIT` rows, which bounds
+ *      one request and not how far a reader can go. So the paging cases assert
+ *      the second request's offset and limit, rows appended in provider order
+ *      and de-duplicated by key, loaded rows kept while the next page is in
+ *      flight or has failed, a chain of offsets past 5 000, no control when no
+ *      usable `nextOffset` is reported, and a restart from the first page when
+ *      the order or the component narrowing changes.
  *   2. **`changed: false` is labelled "No values reported", not "unchanged".**
  *      The flag records whether the producer could describe the transition, and
  *      it is never computed by comparing two previews — two values differing
@@ -91,23 +93,27 @@
  * @see ./StateTransitionViewer for the component, its states and its class
  * contract.
  * @see ../host/DataProvider for the seam the stubs below implement.
- * @see ../host/useQuery for the one-page resolution contract the paging case
- * asserts.
+ * @see ../host/useQuery for the one-page resolution contract and the
+ * `nextOffset` the paging cases assert.
  * @see ../primitives/Code for the element a value summary is rendered into:
  * opaque text, never parsed content.
  */
 
-import { DATA_QUERY_DEFAULT_LIMIT, DATA_QUERY_DEFAULT_OFFSET } from '@debuggen/panel-schema';
+import {
+  DATA_QUERY_DEFAULT_LIMIT,
+  DATA_QUERY_DEFAULT_OFFSET,
+  DATA_QUERY_MAX_LIMIT,
+} from '@debuggen/panel-schema';
 import type { DataQuery, DataQuerySort, StateTransitionsNode } from '@debuggen/panel-schema';
 import { DebuggenError } from '@debuggen/shared';
 import type { SourceLocation } from '@debuggen/shared';
 import type { StateTransition } from '@debuggen/telemetry';
-import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Mock } from 'vitest';
 
-import { DataProviderContext, createDataProvider } from '../host/DataProvider';
+import { DataProviderContext, PanelSessionContext, createDataProvider } from '../host/DataProvider';
 import type { DataProvider, DataQueryResolver, DataQueryResponse } from '../host/DataProvider';
 import { PanelActionsContext } from '../host/PanelActions';
 import type { PanelActions, PanelEventRef } from '../host/PanelActions';
@@ -233,8 +239,14 @@ const GROUPING_NAME = 'Group by component';
 const ALL_COMPONENTS_LABEL = 'All components';
 const LONGEST_FIRST_LABEL = 'Longest first';
 
-/** The footer's "widen the window" control. */
+/** The footer's control that requests the next page. */
 const LOAD_MORE_NAME = 'Load more';
+
+/** The same control while that page is in flight. */
+const LOADING_MORE_NAME = 'Loading more…';
+
+/** What the footer's alert says when a next page failed. */
+const PAGE_ERROR_TEXT = 'The next page of state transitions could not be loaded.';
 
 /** The row-level disclosure control, in both of its states. */
 const SHOW_DETAILS_NAME = 'Show details';
@@ -602,6 +614,13 @@ function makeActions(): ActionSpies {
 }
 
 /**
+ * The session the rendered view's queries are addressed to, provided the way
+ * `PanelHost` provides a specification's `sessionId`. Nothing below asserts on
+ * it: the routing contract is pinned by `../host/PanelHost.test.tsx`.
+ */
+const PANEL_SESSION_ID = 'session-under-test';
+
+/**
  * Renders the component inside both host contexts.
  *
  * @param node The node to draw.
@@ -613,9 +632,11 @@ function renderComponent(
 ): void {
   render(
     <DataProviderContext.Provider value={context.provider}>
-      <PanelActionsContext.Provider value={context.actions}>
-        <StateTransitionViewer node={node} />
-      </PanelActionsContext.Provider>
+      <PanelSessionContext.Provider value={PANEL_SESSION_ID}>
+        <PanelActionsContext.Provider value={context.actions}>
+          <StateTransitionViewer node={node} />
+        </PanelActionsContext.Provider>
+      </PanelSessionContext.Provider>
     </DataProviderContext.Provider>,
   );
 }
@@ -1961,17 +1982,85 @@ describe('StateTransitionViewer narrowing', () => {
 });
 
 describe('StateTransitionViewer paging', () => {
-  it('says how much of the result is loaded, and widens the window on request', async () => {
+  /*
+   * Local to this block: the offset-aware stubs below are built per case on
+   * top of `recordingProvider`, so each case states the sequence it pages
+   * through in its own body, and nothing here changes a shared helper.
+   */
+
+  /**
+   * One response of the `stateTransitions` source, with only the paging
+   * counters a case asked for.
+   *
+   * @param data The page's rows, in the order the service returned them.
+   * @param counters The total and next offset to report, when reported.
+   * @returns The resolved response.
+   */
+  function transitionsResponse(
+    data: readonly StateTransition[],
+    counters: { readonly total?: number; readonly nextOffset?: number } = {},
+  ): Promise<DataQueryResponse> {
+    return Promise.resolve<DataQueryResponse>({
+      source: 'stateTransitions',
+      data,
+      ...(counters.total === undefined ? {} : { total: counters.total }),
+      ...(counters.nextOffset === undefined ? {} : { nextOffset: counters.nextOffset }),
+    });
+  }
+
+  /**
+   * A transition that occupies one position of a long paged sequence, with an
+   * id, span and value summary no other position shares.
+   *
+   * @param position A small positive integer, below 128.
+   * @returns The transition.
+   */
+  function sequenceTransition(position: number): StateTransition {
+    return makeTransition({
+      id: `evt_example_sequence_${String(position)}`,
+      spanId: spanIdFor(128 + position),
+      startTime: BASE_START_MS + position,
+      component: COMPONENT_WIDGET,
+      hookLabel: HOOK_VALUE_LABEL,
+      previousValue: sequenceValue(position),
+      nextValue: sequenceValue(position + 1),
+      transitionSource: 'state',
+      triggerEventId: TRIGGER_EVENT_ID,
+      triggerName: TRIGGER_NAME,
+      triggerKind: 'interaction',
+    });
+  }
+
+  /**
+   * The value-before summary {@link sequenceTransition} draws for a position.
+   *
+   * @param position The position.
+   * @returns Its summary.
+   */
+  function sequenceValue(position: number): string {
+    return `number ${String(1000 + position)}`;
+  }
+
+  /** A `stateTransitions` node with one page size, and a first offset when given. */
+  function pagedNode(limit: number, offset?: number): StateTransitionsNode {
+    return makeNode({
+      query: {
+        source: 'stateTransitions',
+        sort: CHRONOLOGICAL,
+        limit,
+        ...(offset === undefined ? {} : { offset }),
+      },
+    });
+  }
+
+  it('says how much of the result is loaded, and requests the next page at the reported offset', async () => {
     const stub = pagingProvider([
       { data: [WIDGET_VALUE_TRANSITION], total: 14, nextOffset: 1 },
-      { data: [WIDGET_VALUE_TRANSITION, WIDGET_FLAG_TRANSITION], total: 14, nextOffset: 2 },
+      { data: [WIDGET_FLAG_TRANSITION], total: 14, nextOffset: 2 },
     ]);
     const user = userEvent.setup();
 
-    renderComponent(
-      makeNode({ query: { source: 'stateTransitions', sort: CHRONOLOGICAL, limit: 1 } }),
-      { provider: stub.provider, actions: makeActions().actions },
-    );
+    renderComponent(pagedNode(1), { provider: stub.provider, actions: makeActions().actions });
 
     // One row of fourteen, said as three separate facts rather than implied by
     // a bare count.
@@ -1988,24 +2077,356 @@ describe('StateTransitionViewer paging', () => {
 
     const second = queryOfCall(stub, 2);
 
-    // ONE page, widened. `../host/useQuery` replaces a page rather than
-    // appending, because a renderer that stitched two responses together would
-    // show something no single response ever said — so a larger window at the
-    // SAME offset is the only request that can honestly show more rows. A
-    // component that advanced the offset and kept the previous rows locally
-    // fails here (see this file's header).
-    expect(second.offset).toBe(first.offset);
-    expect(second.limit ?? 0).toBeGreaterThan(first.limit ?? 0);
-    expect(second.limit).toBe(2);
+    // The NEXT page: exactly the offset the first response reported, with the
+    // same page size. A component that widened the window at the old offset
+    // (and so re-requested every row already on screen) fails here.
+    expect(second.offset).toBe(1);
+    expect(second.limit).toBe(first.limit);
     expect(second.sort).toBe(CHRONOLOGICAL);
     expect(second.source).toBe('stateTransitions');
+    expect(second.filter).toBeUndefined();
 
-    // And the rows on screen are the second response's page, counted as such.
+    // And the second page is appended after the first, counted together.
     await screen.findByText(countsText(2, 2, 14));
     expect(renderedValuesBefore()).toEqual([NUMBER_BEFORE, FLAG_BEFORE]);
   });
 
-  it('claims no total when the provider reported none, and offers no widening', async () => {
+  it('appends the next page in provider order, keeping the first copy of a repeated row', async () => {
+    // The second page repeats the flag transition the first page already
+    // delivered, as a result that shifted between two requests would.
+    const stub = recordingProvider((query) =>
+      query.offset === 2
+        ? transitionsResponse([WIDGET_FLAG_TRANSITION, PANEL_CONTEXT_TRANSITION], { total: 4 })
+        : transitionsResponse([WIDGET_VALUE_TRANSITION, WIDGET_FLAG_TRANSITION], {
+            total: 4,
+            nextOffset: 2,
+          }),
+    );
+    const user = userEvent.setup();
+
+    renderComponent(pagedNode(2), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByText(countsText(2, 2, 4));
+
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+
+    // Three distinct rows, in the order the pages delivered them: the repeated
+    // key is drawn once, where it first arrived.
+    await screen.findByText(countsText(3, 3, 4));
+    expect(renderedValuesBefore()).toEqual([...PROVIDER_ORDER_VALUES]);
+    expect(renderedValuesBefore().filter((value) => value === FLAG_BEFORE)).toHaveLength(1);
+
+    // The first page was never requested again: one request per page.
+    expect(stub.queries.map((query) => query.offset)).toEqual([DATA_QUERY_DEFAULT_OFFSET, 2]);
+    expect(stub.queries.map((query) => query.limit)).toEqual([2, 2]);
+
+    // The second response reported no next page, so nothing more is offered.
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+  });
+
+  it('keeps the loaded rows on screen while the next page is in flight', async () => {
+    let releaseNextPage: (response: DataQueryResponse) => void = () => undefined;
+    const nextPage = new Promise<DataQueryResponse>((resolve) => {
+      releaseNextPage = resolve;
+    });
+    const stub = recordingProvider((query) =>
+      query.offset === 1
+        ? nextPage
+        : transitionsResponse([WIDGET_VALUE_TRANSITION], { total: 2, nextOffset: 1 }),
+    );
+    const user = userEvent.setup();
+
+    renderComponent(pagedNode(1), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByText(countsText(1, 1, 2));
+
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+
+    expect(stub.resolve).toHaveBeenCalledTimes(2);
+
+    // The rows already loaded stay exactly where they are: no loading state
+    // replaces the grid, and the counts keep the total the provider reported.
+    expect(screen.getByRole('grid')).toBeDefined();
+    expect(renderedValuesBefore()).toEqual([NUMBER_BEFORE]);
+    expect(screen.queryByRole('status')).toBeNull();
+    expect(screen.getByText(countsText(1, 1, 2))).toBeDefined();
+
+    // The footer reports the load, and the control cannot request it twice.
+    const busy = screen.getByRole('button', { name: LOADING_MORE_NAME });
+    expect(busy.hasAttribute('disabled')).toBe(true);
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+
+    await act(async () => {
+      releaseNextPage({ source: 'stateTransitions', data: [WIDGET_FLAG_TRANSITION], total: 2 });
+      await nextPage;
+    });
+
+    await screen.findByText(countsText(2, 2, 2));
+    expect(renderedValuesBefore()).toEqual([NUMBER_BEFORE, FLAG_BEFORE]);
+    expect(screen.queryByRole('button', { name: LOADING_MORE_NAME })).toBeNull();
+    expect(stub.resolve).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps the loaded rows and offers a retry in the footer when the next page fails', async () => {
+    let nextPageAttempts = 0;
+    const stub = recordingProvider((query) => {
+      if (query.offset !== 1) {
+        return transitionsResponse([WIDGET_VALUE_TRANSITION], { total: 2, nextOffset: 1 });
+      }
+
+      nextPageAttempts += 1;
+
+      return nextPageAttempts === 1
+        ? Promise.reject(
+            new DebuggenError('TRANSPORT_DISCONNECTED', 'The channel to the service is closed.'),
+          )
+        : transitionsResponse([WIDGET_FLAG_TRANSITION], { total: 2 });
+    });
+    const user = userEvent.setup();
+
+    renderComponent(pagedNode(1), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByText(countsText(1, 1, 2));
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+
+    // Reported in the footer, beside the counts of the rows it left untouched —
+    // never by replacing those rows with an error state.
+    const alert = await screen.findByRole('alert');
+    expect(alert.closest('.dg-state-transitions__footer')).not.toBeNull();
+    expect(alert.textContent).toContain(PAGE_ERROR_TEXT);
+    expect(alert.textContent).toContain('TRANSPORT_DISCONNECTED');
+    expect(alert.textContent).not.toContain('The channel to the service is closed.');
+
+    // The request that failed is the next page's, offset included.
+    const shown = within(alert).getByRole('group', { name: FAILING_QUERY_NAME });
+    expect(JSON.parse(shown.textContent ?? '')).toEqual({
+      source: 'stateTransitions',
+      sort: CHRONOLOGICAL,
+      limit: 1,
+      offset: 1,
+    });
+
+    expect(renderedValuesBefore()).toEqual([NUMBER_BEFORE]);
+    expect(screen.getByText(countsText(1, 1, 2))).toBeDefined();
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+
+    // The retry asks for the same page again, and the page is appended.
+    await user.click(within(alert).getByRole('button', { name: RETRY_NAME }));
+
+    expect(stub.resolve).toHaveBeenCalledTimes(3);
+    expect(queryOfCall(stub, 3)).toEqual(queryOfCall(stub, 2));
+
+    await screen.findByText(countsText(2, 2, 2));
+    expect(renderedValuesBefore()).toEqual([NUMBER_BEFORE, FLAG_BEFORE]);
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('follows the reported offsets past 5 000, one fixed-size request per page', async () => {
+    const stub = recordingProvider((query) => {
+      switch (query.offset) {
+        case 4900:
+          return transitionsResponse([sequenceTransition(1)], { total: 5600, nextOffset: 5100 });
+        case 5100:
+          return transitionsResponse([sequenceTransition(2)], { total: 5600, nextOffset: 5300 });
+        default:
+          return transitionsResponse([sequenceTransition(3)], { total: 5600 });
+      }
+    });
+    const user = userEvent.setup();
+
+    renderComponent(pagedNode(DATA_QUERY_DEFAULT_LIMIT, 4900), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    await screen.findByText(countsText(1, 1, 5600));
+    expect(soleQuery(stub).offset).toBe(4900);
+
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+    await screen.findByText(countsText(2, 2, 5600));
+
+    // Past the 5 000 mark, at exactly the offset reported: the contract's
+    // per-request maximum bounds one page and never how far a reader can go.
+    expect(queryOfCall(stub, 2).offset).toBe(5100);
+
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+    await screen.findByText(countsText(3, 3, 5600));
+
+    expect(queryOfCall(stub, 3).offset).toBe(5300);
+    expect(stub.queries.map((query) => query.limit)).toEqual([
+      DATA_QUERY_DEFAULT_LIMIT,
+      DATA_QUERY_DEFAULT_LIMIT,
+      DATA_QUERY_DEFAULT_LIMIT,
+    ]);
+    expect(renderedValuesBefore()).toEqual([sequenceValue(1), sequenceValue(2), sequenceValue(3)]);
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+  });
+
+  it('keeps paging at the largest page size, which caps a request and not the sequence', async () => {
+    const stub = recordingProvider((query) => {
+      switch (query.offset) {
+        case DATA_QUERY_DEFAULT_OFFSET:
+          return transitionsResponse([sequenceTransition(1)], {
+            total: 12_000,
+            nextOffset: DATA_QUERY_MAX_LIMIT,
+          });
+        case DATA_QUERY_MAX_LIMIT:
+          return transitionsResponse([sequenceTransition(2)], {
+            total: 12_000,
+            nextOffset: DATA_QUERY_MAX_LIMIT * 2,
+          });
+        default:
+          return transitionsResponse([sequenceTransition(3)], { total: 12_000 });
+      }
+    });
+    const user = userEvent.setup();
+
+    renderComponent(pagedNode(DATA_QUERY_MAX_LIMIT), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    await screen.findByText(countsText(1, 1, 12_000));
+
+    // Once a page of the largest size has loaded, the control is still "Load
+    // more" rather than a note that nothing more can be reached.
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+    await screen.findByText(countsText(2, 2, 12_000));
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+    await screen.findByText(countsText(3, 3, 12_000));
+
+    expect(stub.queries.map((query) => query.offset)).toEqual([
+      DATA_QUERY_DEFAULT_OFFSET,
+      DATA_QUERY_MAX_LIMIT,
+      DATA_QUERY_MAX_LIMIT * 2,
+    ]);
+    expect(stub.queries.map((query) => query.limit)).toEqual([
+      DATA_QUERY_MAX_LIMIT,
+      DATA_QUERY_MAX_LIMIT,
+      DATA_QUERY_MAX_LIMIT,
+    ]);
+    expect(screen.queryByText(/largest page/i)).toBeNull();
+  });
+
+  it('offers no Load more without a reported next offset, whatever the total says', async () => {
+    // Fourteen reported, one loaded, and no next offset: the total says how
+    // much exists, not where a next page starts, so nothing is inferred from it.
+    const stub = resolvingProvider([WIDGET_VALUE_TRANSITION], { total: 14 });
+
+    renderComponent(pagedNode(1), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByText(countsText(1, 1, 14));
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+    expect(screen.queryByRole('button', { name: LOADING_MORE_NAME })).toBeNull();
+    expect(stub.resolve).toHaveBeenCalledTimes(1);
+  });
+
+  it('treats a next offset that does not move past its page as the end of the data', async () => {
+    // A provider pointing back at the page it just answered would otherwise
+    // have "Load more" request the same rows forever.
+    const stub = resolvingProvider([WIDGET_VALUE_TRANSITION], { total: 14, nextOffset: 3 });
+
+    renderComponent(pagedNode(1, 3), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByText(countsText(1, 1, 14));
+    expect(soleQuery(stub).offset).toBe(3);
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+  });
+
+  it('starts again from the first page when the order or the component narrowing changes', async () => {
+    const stub = recordingProvider((query) => {
+      const offset = query.offset ?? DATA_QUERY_DEFAULT_OFFSET;
+
+      if (query.filter?.component === COMPONENT_PANEL) {
+        return transitionsResponse([PANEL_CONTEXT_TRANSITION]);
+      }
+
+      if (query.sort === LONGEST_FIRST) {
+        return offset === DATA_QUERY_DEFAULT_OFFSET
+          ? transitionsResponse([PANEL_CONTEXT_TRANSITION], { nextOffset: 1 })
+          : transitionsResponse([WIDGET_VALUE_TRANSITION], { nextOffset: 2 });
+      }
+
+      return offset === DATA_QUERY_DEFAULT_OFFSET
+        ? transitionsResponse([WIDGET_VALUE_TRANSITION], { nextOffset: 1 })
+        : transitionsResponse([WIDGET_FLAG_TRANSITION], { nextOffset: 2 });
+    });
+    const user = userEvent.setup();
+
+    renderComponent(pagedNode(1), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByText(countsText(1, 1));
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+    await screen.findByText(countsText(2, 2));
+    expect(renderedValuesBefore()).toEqual([NUMBER_BEFORE, FLAG_BEFORE]);
+
+    // A new order is a new sequence: its first page, and none of the rows the
+    // previous ordering accumulated.
+    await user.selectOptions(
+      screen.getByRole('combobox', { name: ORDER_CONTROL_NAME }),
+      LONGEST_FIRST,
+    );
+
+    expect(queryOfCall(stub, 3).sort).toBe(LONGEST_FIRST);
+    expect(queryOfCall(stub, 3).offset).toBe(DATA_QUERY_DEFAULT_OFFSET);
+    await waitFor(() => {
+      expect(renderedValuesBefore()).toEqual([OBJECT_BEFORE]);
+    });
+    expect(screen.getByText(countsText(1, 1))).toBeDefined();
+
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+    await screen.findByText(countsText(2, 2));
+    expect(queryOfCall(stub, 4).offset).toBe(1);
+
+    // So is a new component narrowing.
+    await user.selectOptions(
+      screen.getByRole('combobox', { name: COMPONENT_CONTROL_NAME }),
+      COMPONENT_PANEL,
+    );
+
+    expect(queryOfCall(stub, 5).filter).toEqual({ component: COMPONENT_PANEL });
+    expect(queryOfCall(stub, 5).offset).toBe(DATA_QUERY_DEFAULT_OFFSET);
+    await waitFor(() => {
+      expect(renderedValuesBefore()).toEqual([OBJECT_BEFORE]);
+    });
+    expect(screen.getByText(countsText(1, 1))).toBeDefined();
+    expect(stub.queries.map((query) => query.offset)).toEqual([0, 1, 0, 1, 0]);
+    expect(stub.queries.map((query) => query.limit)).toEqual([1, 1, 1, 1, 1]);
+  });
+
+  it('keeps the selected and the disclosed row across an appended page', async () => {
+    const stub = pagingProvider([
+      { data: [WIDGET_VALUE_TRANSITION], nextOffset: 1 },
+      { data: [WIDGET_FLAG_TRANSITION] },
+    ]);
+    const user = userEvent.setup();
+
+    renderComponent(pagedNode(1), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+
+    const [row] = dataRows();
+    if (row === undefined) {
+      throw new Error('the grid rendered no data row');
+    }
+
+    await user.click(row);
+    await user.click(
+      within(cellsOf(row).component).getByRole('button', { name: SHOW_DETAILS_NAME }),
+    );
+
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+    await screen.findByText(countsText(2, 2));
+
+    // Appending a page is neither a new selection nor a collapse.
+    const selected = rowWithValueBefore(NUMBER_BEFORE);
+    expect(selected.getAttribute('aria-selected')).toBe('true');
+    expect(selected.getAttribute('aria-expanded')).toBe('true');
+    expect(rowWithValueBefore(FLAG_BEFORE).getAttribute('aria-selected')).toBe('false');
+    expect(screen.getByText(WIDGET_VALUE_TRANSITION.traceId)).toBeDefined();
+  });
+
+  it('claims no total when the provider reported none, and offers no next page', async () => {
     const stub = resolvingProvider([WIDGET_VALUE_TRANSITION]);
 
     renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
@@ -2038,5 +2459,321 @@ describe('StateTransitionViewer paging', () => {
     // order even when the panel did not: chronological, applied by the side
     // that holds the whole capture rather than here.
     expect(query.sort).toBe(CHRONOLOGICAL);
+  });
+
+  it('starts over from the authored first page, painting none of the old rows, when the data provider is replaced', async () => {
+    const earlier = recordingProvider((query) =>
+      query.offset === 1
+        ? transitionsResponse([WIDGET_FLAG_TRANSITION], { total: 2 })
+        : transitionsResponse([WIDGET_VALUE_TRANSITION], { total: 2, nextOffset: 1 }),
+    );
+    let releaseLater: (response: DataQueryResponse) => void = () => undefined;
+    const laterPage = new Promise<DataQueryResponse>((resolve) => {
+      releaseLater = resolve;
+    });
+    const later = recordingProvider(() => laterPage);
+    const { actions } = makeActions();
+    const user = userEvent.setup();
+    const node = pagedNode(1);
+
+    // One node, one query, two providers: a host rebinding a mounted panel to
+    // another session swaps the provider without remounting the node.
+    const view = render(
+      <DataProviderContext.Provider value={earlier.provider}>
+        <PanelSessionContext.Provider value={PANEL_SESSION_ID}>
+          <PanelActionsContext.Provider value={actions}>
+            <StateTransitionViewer node={node} />
+          </PanelActionsContext.Provider>
+        </PanelSessionContext.Provider>
+      </DataProviderContext.Provider>,
+    );
+
+    await screen.findByText(countsText(1, 1, 2));
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+    await screen.findByText(countsText(2, 2, 2));
+    expect(renderedValuesBefore()).toEqual([NUMBER_BEFORE, FLAG_BEFORE]);
+
+    view.rerender(
+      <DataProviderContext.Provider value={later.provider}>
+        <PanelSessionContext.Provider value={PANEL_SESSION_ID}>
+          <PanelActionsContext.Provider value={actions}>
+            <StateTransitionViewer node={node} />
+          </PanelActionsContext.Provider>
+        </PanelSessionContext.Provider>
+      </DataProviderContext.Provider>,
+    );
+
+    // The new provider is asked for the authored first page — not the offset
+    // the previous provider's pages reached — and while it loads nothing of the
+    // previous provider's is on screen.
+    expect(later.resolve).toHaveBeenCalledTimes(1);
+    const first = queryOfCall(later, 1);
+    expect(first.offset).toBe(DATA_QUERY_DEFAULT_OFFSET);
+    expect(first.limit).toBe(1);
+    expect(screen.queryByRole('grid')).toBeNull();
+    expect(screen.queryByText(countsText(2, 2, 2))).toBeNull();
+
+    await act(async () => {
+      releaseLater({ source: 'stateTransitions', data: [PANEL_CONTEXT_TRANSITION], total: 1 });
+      await laterPage;
+    });
+
+    await screen.findByText(countsText(1, 1, 1));
+    expect(dataRows()).toHaveLength(1);
+    expect(renderedValuesBefore()).not.toContain(NUMBER_BEFORE);
+    expect(renderedValuesBefore()).not.toContain(FLAG_BEFORE);
+    expect(earlier.resolve).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('StateTransitionViewer keyboard access to explanations', () => {
+  /*
+   * Every tooltip a row can carry is opened by keyboard focus here, through a
+   * trigger that is a tab stop only while its row holds focus: the grid keeps
+   * one roving row stop, and the explanations of the row being read follow it.
+   */
+
+  /** Enough presses to cross the toolbar and one row of controls, and no more. */
+  const MAX_TAB_PRESSES = 12;
+
+  /** A shortened value before, and a trigger the capture knows of but cannot open. */
+  const SHORTENED_ROW = makeTransition({
+    id: 'evt_example_0081',
+    spanId: spanIdFor(81),
+    startTime: BASE_START_MS + 10,
+    component: COMPONENT_WIDGET,
+    hookLabel: HOOK_VALUE_LABEL,
+    previousValue: OVER_BOUND_SUMMARY,
+    nextValue: NUMBER_AFTER,
+    transitionSource: 'state',
+    triggerSpanId: spanIdFor(9),
+  });
+
+  /** Neither value described, no attributed trigger, and a disclosed cut list. */
+  const UNDESCRIBED_ROW = makeTransition({
+    id: 'evt_example_0082',
+    spanId: spanIdFor(82),
+    startTime: BASE_START_MS + 20,
+    component: COMPONENT_WIDGET,
+    hookLabel: HOOK_FLAG_LABEL,
+    transitionSource: 'state',
+    changed: false,
+    truncated: true,
+    droppedTransitions: 3,
+  });
+
+  /**
+   * The bubble a trigger's own `aria-describedby` names.
+   *
+   * Resolved through the attribute rather than by role, because one cell can
+   * hold two tooltips, and because this is the very link a screen reader
+   * follows: a trigger that lost it would fail here.
+   *
+   * @param trigger The tooltip's trigger.
+   * @returns The bubble describing it.
+   */
+  function describedBubble(trigger: HTMLElement): HTMLElement {
+    const ids = (trigger.getAttribute('aria-describedby') ?? '').split(/\s+/u);
+
+    for (const id of ids) {
+      const element = id.length === 0 ? null : document.getElementById(id);
+
+      if (element !== null && element.getAttribute('role') === 'tooltip') {
+        return element;
+      }
+    }
+
+    throw new Error('the trigger names no tooltip in its aria-describedby');
+  }
+
+  /**
+   * Press Tab until `target` holds focus, failing if it never does.
+   *
+   * @param user The session pressing the keys.
+   * @param target The element Tab must reach.
+   */
+  async function tabUntil(
+    user: ReturnType<typeof userEvent.setup>,
+    target: HTMLElement,
+  ): Promise<void> {
+    for (let press = 0; press < MAX_TAB_PRESSES && document.activeElement !== target; press += 1) {
+      await user.tab();
+    }
+
+    expect(document.activeElement).toBe(target);
+  }
+
+  /** The two rows, and the tooltip triggers each of them carries. */
+  interface ExplainedRows {
+    readonly first: HTMLElement;
+    readonly second: HTMLElement;
+    readonly firstTriggers: readonly HTMLElement[];
+    readonly secondTriggers: readonly HTMLElement[];
+  }
+
+  /**
+   * Render both rows and find their triggers semantically.
+   *
+   * @returns The rows and their triggers, in document order.
+   */
+  async function renderExplainedRows(): Promise<ExplainedRows> {
+    const stub = resolvingProvider([SHORTENED_ROW, UNDESCRIBED_ROW]);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+
+    const [first, second] = dataRows();
+    if (first === undefined || second === undefined) {
+      throw new Error('the grid rendered fewer than the two rows of this case');
+    }
+
+    const firstCells = cellsOf(first);
+    const secondCells = cellsOf(second);
+
+    return {
+      first,
+      second,
+      firstTriggers: [
+        elementWithClass(firstCells.previous, 'dg-state-transitions__value'),
+        within(firstCells.trigger).getByText(GENERIC_TRIGGER_LABEL),
+      ],
+      secondTriggers: [
+        within(secondCells.trigger).getByText(UNDETERMINED_LABEL),
+        within(secondCells.changed).getByText(UNREPORTED_LABEL),
+        within(secondCells.changed).getByText(`${TRUNCATED_LABEL}: ${formatCount(3)}`),
+      ],
+    };
+  }
+
+  it('opens every explanation from the keyboard, through tab stops of the focused row only', async () => {
+    const user = userEvent.setup();
+    const { first, firstTriggers, secondTriggers } = await renderExplainedRows();
+    const [shortenedValue, outOfPageTrigger] = firstTriggers;
+    const [undeterminedTrigger, unreportedChip, truncatedChip] = secondTriggers;
+
+    if (
+      shortenedValue === undefined ||
+      outOfPageTrigger === undefined ||
+      undeterminedTrigger === undefined ||
+      unreportedChip === undefined ||
+      truncatedChip === undefined
+    ) {
+      throw new Error('a tooltip trigger of this case was not rendered');
+    }
+
+    // Before focus enters the grid, not one trigger adds a tab stop: the grid's
+    // single roving row stop is the way in.
+    for (const trigger of [...firstTriggers, ...secondTriggers]) {
+      expect(trigger.getAttribute('tabindex')).toBeNull();
+    }
+    expect(first.getAttribute('tabindex')).toBe('0');
+
+    // No explanation sits in a column header, where it would be nested inside
+    // a sort control.
+    for (const header of screen.getAllByRole('columnheader')) {
+      expect(within(header).queryAllByRole('tooltip')).toHaveLength(0);
+    }
+
+    // Tab reaches the row, and the row's own triggers join the tab order.
+    await tabUntil(user, first);
+
+    for (const trigger of firstTriggers) {
+      expect(trigger.getAttribute('tabindex')).toBe('0');
+    }
+    for (const trigger of secondTriggers) {
+      expect(trigger.getAttribute('tabindex')).toBeNull();
+    }
+
+    // Tab walks from the row into its explanations, and focus opens each one.
+    for (const trigger of firstTriggers) {
+      const bubble = describedBubble(trigger);
+      expect(bubble.classList.contains('dg-is-open')).toBe(false);
+
+      await tabUntil(user, trigger);
+
+      expect(bubble.classList.contains('dg-is-open')).toBe(true);
+    }
+
+    // Tab onward crosses into the next row, whose triggers take over the stops
+    // while the row left behind drops out of the tab order.
+    for (const trigger of secondTriggers) {
+      const bubble = describedBubble(trigger);
+
+      await tabUntil(user, trigger);
+
+      expect(trigger.getAttribute('tabindex')).toBe('0');
+      expect(bubble.classList.contains('dg-is-open')).toBe(true);
+    }
+    for (const trigger of firstTriggers) {
+      expect(trigger.getAttribute('tabindex')).toBeNull();
+    }
+
+    // Each bubble says what its trigger needs explained, and Escape dismisses
+    // the one the keyboard opened.
+    expect(describedBubble(shortenedValue).textContent).toContain('bounded summary');
+    expect(describedBubble(outOfPageTrigger).textContent).toContain('outside the page loaded here');
+    expect(describedBubble(undeterminedTrigger).textContent).toContain(
+      'Nothing is claimed about what caused it',
+    );
+    expect(describedBubble(unreportedChip).textContent).toContain(
+      'not a statement that the value stayed the same',
+    );
+    expect(describedBubble(truncatedChip).textContent).toContain('not a total');
+
+    await user.keyboard('{Escape}');
+
+    expect(document.activeElement).toBe(truncatedChip);
+    expect(describedBubble(truncatedChip).classList.contains('dg-is-open')).toBe(false);
+  });
+
+  it('moves the in-row tab stops with the row the arrow keys move to', async () => {
+    const user = userEvent.setup();
+    const { first, second, firstTriggers, secondTriggers } = await renderExplainedRows();
+
+    await tabUntil(user, first);
+
+    await user.keyboard('{ArrowDown}');
+
+    expect(document.activeElement).toBe(second);
+    for (const trigger of secondTriggers) {
+      expect(trigger.getAttribute('tabindex')).toBe('0');
+    }
+    for (const trigger of firstTriggers) {
+      expect(trigger.getAttribute('tabindex')).toBeNull();
+    }
+
+    await user.keyboard('{ArrowUp}');
+
+    expect(document.activeElement).toBe(first);
+    for (const trigger of firstTriggers) {
+      expect(trigger.getAttribute('tabindex')).toBe('0');
+    }
+    for (const trigger of secondTriggers) {
+      expect(trigger.getAttribute('tabindex')).toBeNull();
+    }
+  });
+
+  it('keeps row navigation after a pointer click on a trigger outside the focused row', async () => {
+    const user = userEvent.setup();
+    const { first, second, secondTriggers } = await renderExplainedRows();
+    const [undeterminedTrigger] = secondTriggers;
+
+    if (undeterminedTrigger === undefined) {
+      throw new Error('a tooltip trigger of this case was not rendered');
+    }
+
+    await tabUntil(user, first);
+
+    // The trigger carries no tab index outside the focused row, so a click on
+    // it focuses its row — where the grid answers the arrow keys — rather than
+    // the trigger itself.
+    await user.click(undeterminedTrigger);
+
+    expect(document.activeElement).toBe(second);
+
+    await user.keyboard('{ArrowUp}');
+
+    expect(document.activeElement).toBe(first);
   });
 });

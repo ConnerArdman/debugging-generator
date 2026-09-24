@@ -100,7 +100,7 @@ import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Mock } from 'vitest';
 
-import { DataProviderContext, createDataProvider } from '../host/DataProvider';
+import { DataProviderContext, PanelSessionContext, createDataProvider } from '../host/DataProvider';
 import type { DataProvider, DataQueryResolver, DataQueryResponse } from '../host/DataProvider';
 import { PanelActionsContext } from '../host/PanelActions';
 import type { PanelActions, PanelEventRef } from '../host/PanelActions';
@@ -418,6 +418,13 @@ interface RenderOptions {
 }
 
 /**
+ * The session the rendered view's queries are addressed to, provided the way
+ * `PanelHost` provides a specification's `sessionId`. Nothing below asserts on
+ * it: the routing contract is pinned by `../host/PanelHost.test.tsx`.
+ */
+const PANEL_SESSION_ID = 'session-under-test';
+
+/**
  * Renders the component inside both host contexts.
  *
  * @param node The node to draw.
@@ -429,9 +436,11 @@ function renderCards(node: MetricCardsNode, options: RenderOptions): HTMLElement
 
   const view = render(
     <DataProviderContext.Provider value={provider}>
-      <PanelActionsContext.Provider value={actions}>
-        <MetricCards node={node} className={className} />
-      </PanelActionsContext.Provider>
+      <PanelSessionContext.Provider value={PANEL_SESSION_ID}>
+        <PanelActionsContext.Provider value={actions}>
+          <MetricCards node={node} className={className} />
+        </PanelActionsContext.Provider>
+      </PanelSessionContext.Provider>
     </DataProviderContext.Provider>,
   );
 

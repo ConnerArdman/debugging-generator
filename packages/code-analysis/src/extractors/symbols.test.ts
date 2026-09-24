@@ -374,6 +374,30 @@ describe('symbolsExtractor: nested declarations that are recorded', () => {
     expect(nested.data).toHaveProperty('enclosing');
   });
 
+  it('records a function declared in a class static block, under the class it belongs to', () => {
+    // The instrumentation target resolver descends into a `static { … }` block
+    // like any function body, so a declaration there is one it can patch; the
+    // graph has to record it for the feasibility gate to agree.
+    const nodes = symbolsOf(
+      'src/lib/registry.ts',
+      [
+        'export class Registry {',
+        '  static {',
+        '    function boot() {',
+        '      return 8;',
+        '    }',
+        '',
+        '    boot();',
+        '  }',
+        '}',
+      ].join('\n'),
+    );
+
+    // The block has no name of its own and nothing that holds it names it, so
+    // the chain stops at the class.
+    expect(only(nodes, 'boot').data?.enclosing).toStrictEqual(['Registry']);
+  });
+
   it('records a nested declaration inside a block, not only at the top of a body', () => {
     const nodes = symbolsOf(
       'src/lib/panel.ts',

@@ -57,6 +57,21 @@
  * **stops at the first conflict** rather than skipping ahead to an earlier
  * record whose expectation cannot hold any more.
  *
+ * Reverse order only exists for a **single linear chain**. The service's
+ * journal refuses to append a second record onto one parent or a second open
+ * chain over one file, but a journal written before it did — or by a writer
+ * that bypassed it — can hold a *fork*: two open records naming the same
+ * `previousRecordId`, or more than one open record starting a chain for the
+ * same file. Each branch then claims to describe the bytes on disk, and
+ * restoring one would write its backup over the other's patch or strand it.
+ * So every per-file walk checks the shape of the file's open records
+ * **before anything is read or written**, and a forked file is refused whole:
+ * nothing is written, every backup is kept, every involved record is reported
+ * as a conflict (and moved to `conflict`, so the next pass keeps retaining it),
+ * and the refusal is reported as a {@link ChainFork} whose reason is
+ * {@link RECORD_CHAIN_FORK_REASON}. The other files of the same pass are
+ * restored as usual.
+ *
  * ## Start-up reconciliation dispatches on the record, never on the session
  *
  * A session left in `capturing`, `generated` or `failed` still has patched
@@ -236,6 +251,66 @@ export const CLEANUP_STATUSES = Object.freeze(['clean', 'partial', 'conflict'] a
 
 /** One of {@link CLEANUP_STATUSES}. */
 export type CleanupStatus = (typeof CLEANUP_STATUSES)[number];
+
+/**
+ * The stable reason of a {@link ChainFork}: one file's open records do not form
+ * a single chain, so no reverse order exists and nothing was written.
+ *
+ * A member of `MODIFICATION_CONFLICT_REASONS` (`./schema/modification.ts`) —
+ * checked here with `satisfies` — so the same spelling reaches every conflict
+ * report of a refused fork, `cleanup.completed` and both user interfaces, and it
+ * matches the `details.reason` vocabulary of this module's errors
+ * (`record-chain-cycle` is its sibling), so a caller that logs or branches on
+ * reasons reads all of them the same way.
+ */
+export const RECORD_CHAIN_FORK_REASON = 'record-chain-fork' satisfies ModificationConflictReason;
+
+/**
+ * One file a pass refused to restore because its open records do not form a
+ * single linear chain.
+ *
+ * Two shapes produce one, and a single file can show both:
+ *
+ * - **a shared parent** — two or more records name the same
+ *   `previousRecordId`, so each claims to continue from the same bytes;
+ * - **more than one root** — two or more records start a chain within the
+ *   file's open records (no `previousRecordId`, or one naming a record that is
+ *   no longer open), so two chains each claim the file.
+ *
+ * Every involved record also appears as a conflict in the pass's `conflicts`,
+ * which is what both user interfaces render; this report is the structured,
+ * machine-readable account of why, for the service's logs and for a caller
+ * that wants to tell a fork from an ordinary edit. Identifiers only — never a
+ * digest, a backup path or a byte of the file.
+ */
+export interface ChainFork {
+  /** Always {@link RECORD_CHAIN_FORK_REASON}. */
+  readonly reason: typeof RECORD_CHAIN_FORK_REASON;
+
+  /** The session that owns the records. */
+  readonly sessionId: string;
+
+  /** The project-relative file, normalised as the pass groups it. */
+  readonly file: string;
+
+  /** Every open record of the file, in the order a restore would have taken them. */
+  readonly recordIds: string[];
+
+  /** The previous records named by more than one of them, sorted; empty when there are none. */
+  readonly sharedPreviousRecordIds: string[];
+
+  /** The records that start a chain within the set, sorted; one entry for a linear chain. */
+  readonly rootRecordIds: string[];
+}
+
+/**
+ * The reason on the conflict report of each record of a refused fork:
+ * {@link RECORD_CHAIN_FORK_REASON}, never `'content-changed'` — the file may
+ * be exactly as this product left it, and telling the developer it was edited
+ * would send them looking for an edit that never happened. Each report's
+ * message says which fork shape was found.
+ */
+const CHAIN_FORK_CONFLICT_REASON: ModificationConflictReason = RECORD_CHAIN_FORK_REASON;
 
 /**
  * What a pass is allowed to do with a record, decided by the record's status
@@ -752,9 +827,22 @@ export interface ChainRestoreOutcome {
    * A conflict or a failure at plan version *n* makes every earlier version's
    * expectation unsatisfiable — the file no longer holds what those records
    * wrote — so the walk halts here instead of skipping ahead, and the earlier
-   * records are reported as skipped rather than as conflicts of their own.
+   * records are reported as skipped rather than as conflicts of their own. For
+   * a refused fork it is the first record in restoration order: the walk
+   * stopped before it began.
    */
   readonly stoppedAt: ModificationRecord | undefined;
+
+  /**
+   * Why the whole file was refused, when its records do not form a single
+   * chain; `undefined` for a chain that could be walked.
+   *
+   * When present, nothing was read from or written to the file, every backup
+   * was kept, and every record is in `retained` with its conflict report — or
+   * in `skipped` and `failures` where the journal would not record the
+   * conflict, or `skipped` alone after an abort.
+   */
+  readonly fork: ChainFork | undefined;
 }
 
 /** Options for {@link cleanupSession}. */
@@ -813,13 +901,20 @@ export interface CleanupOutcome {
 
   /**
    * Records this pass deliberately did not restore: a retained `conflict`
-   * record, everything behind a conflict in the same file's chain, everything
+   * record, everything behind a conflict in the same file's chain, every
+   * record of a file whose records do not form a single chain, everything
    * after an abort, and any record the pass could not finish.
    */
   readonly skipped: ModificationRecord[];
 
   /** Records the pass could not finish, with their errors. */
   readonly failures: CleanupFailure[];
+
+  /**
+   * Every file refused because its records do not form a single chain, in the
+   * order the pass met them. Empty for an ordinary pass. See {@link ChainFork}.
+   */
+  readonly forks: ChainFork[];
 }
 
 /** Options for {@link reconcileModifications}. */
@@ -883,6 +978,12 @@ export interface ReconcileOutcome {
 
   /** Records the pass could not finish, with their errors. */
   readonly failures: CleanupFailure[];
+
+  /**
+   * Every file refused because its records do not form a single chain, in the
+   * order the pass met them. Empty for an ordinary pass. See {@link ChainFork}.
+   */
+  readonly forks: ChainFork[];
 
   /** When the pass finished, in epoch milliseconds. */
   readonly completedAt: number;
@@ -1107,6 +1208,13 @@ export function orderRestorationChain(
  * remaining records are reported as skipped, stay open, and are re-examined by
  * the next pass once the developer has resolved the conflict.
  *
+ * **A fork is refused before the walk starts.** Records that do not form a
+ * single linear chain — two naming the same `previousRecordId`, or more than
+ * one starting a chain — have no reverse order, so the file is not read or
+ * written at all: every record is reported as a conflict and moved to
+ * `conflict`, every backup is kept, and {@link ChainRestoreOutcome.fork}
+ * says why.
+ *
  * Never rejects and never throws: every record's fate lands in one of the
  * outcome's lists.
  *
@@ -1159,6 +1267,12 @@ export async function restoreChain(
  * gets the right reading for each of the three without the caller classifying
  * anything.
  *
+ * A file whose open records do not form a single chain is refused whole before
+ * anything of it is read or written — see the module overview — and listed in
+ * {@link CleanupOutcome.forks}; the session's other files are still restored,
+ * so such a pass ends `partial` when they were, and `conflict` when the fork
+ * was all there was.
+ *
  * Called on `session.end`, on editor deactivation (the extension's
  * `deactivate()` ends the active session), and — through
  * {@link reconcileModifications} — on service start, so that a file left
@@ -1205,6 +1319,7 @@ export async function cleanupSession(
   const conflicts: ModificationConflict[] = [];
   const skipped: ModificationRecord[] = [];
   const failures: CleanupFailure[] = [];
+  const forks: ChainFork[] = [];
 
   const listed = await context.journal.listBySession(sessionId);
 
@@ -1221,6 +1336,7 @@ export async function cleanupSession(
       completedAt: clockReading(context, logger),
       skipped,
       failures: [{ recordId: '', sessionId, file: '', error: listed.error }],
+      forks,
     };
   }
 
@@ -1260,6 +1376,10 @@ export async function cleanupSession(
     conflicts.push(...chain.conflicts);
     skipped.push(...chain.retained, ...chain.skipped);
     failures.push(...chain.failures);
+
+    if (chain.fork !== undefined) {
+      forks.push(chain.fork);
+    }
   }
 
   await ledger.sweep(logger);
@@ -1276,6 +1396,7 @@ export async function cleanupSession(
     conflicts: conflicts.length,
     skipped: skipped.length,
     failures: failures.length,
+    forks: forks.length,
   });
 
   return {
@@ -1286,6 +1407,7 @@ export async function cleanupSession(
     completedAt: clockReading(context, logger),
     skipped,
     failures,
+    forks,
   };
 }
 
@@ -1302,7 +1424,12 @@ export async function cleanupSession(
  *
  * Records are grouped by session and file, and each file's chain is unwound in
  * strict reverse order, so a crash between two plan versions of the same file
- * is reconciled in the only order that can be verified.
+ * is reconciled in the only order that can be verified. A file whose open
+ * records do not form a single chain — a fork an older journal or a bypassing
+ * writer left behind — is refused whole before anything of it is read or
+ * written, reported in {@link ReconcileOutcome.forks}, and its records are
+ * moved to `conflict` so every later start keeps retaining them; the other
+ * files are reconciled as usual.
  *
  * ## Placing a record
  *
@@ -1334,6 +1461,7 @@ export async function reconcileModifications(
   const conflicts: ModificationConflict[] = [];
   const skipped: ModificationRecord[] = [];
   const failures: CleanupFailure[] = [];
+  const forks: ChainFork[] = [];
 
   const listed = await context.journal.listOpen();
 
@@ -1351,6 +1479,7 @@ export async function reconcileModifications(
       conflicts,
       skipped,
       failures: [{ recordId: '', sessionId: '', file: '', error: listed.error }],
+      forks,
       completedAt: clockReading(context, logger),
     };
   }
@@ -1386,6 +1515,10 @@ export async function reconcileModifications(
     conflicts.push(...chain.conflicts);
     skipped.push(...chain.skipped);
     failures.push(...chain.failures);
+
+    if (chain.fork !== undefined) {
+      forks.push(chain.fork);
+    }
   }
 
   await ledger.sweep(logger);
@@ -1404,6 +1537,7 @@ export async function reconcileModifications(
     conflicts: conflicts.length,
     skipped: skipped.length,
     failures: failures.length,
+    forks: forks.length,
   });
 
   return {
@@ -1415,6 +1549,7 @@ export async function reconcileModifications(
     conflicts,
     skipped,
     failures,
+    forks,
     completedAt: clockReading(context, logger),
   };
 }
@@ -1481,12 +1616,28 @@ interface RestoreSettings {
 }
 
 /**
+ * What reporting a conflict needs from a step's settings: the clock reading the
+ * report and the transition share, the logger, and the wording override.
+ *
+ * Narrower than {@link RestoreSettings} on purpose, so a refused fork — which
+ * resolves no scope and reads no file — reports through the same two functions
+ * as every other conflict.
+ */
+type ConflictSettings = Pick<RestoreSettings, 'logger' | 'now' | 'conflictMessage'>;
+
+/**
  * Unwinds one file's records in reverse order, halting at the first record that
  * cannot be reverted.
  *
  * The body of {@link restoreChain}, and the per-file step of
  * {@link cleanupSession} and {@link reconcileModifications}, which share one
  * {@link BackupLedger} across every file they visit.
+ *
+ * Three structural refusals come first, each before a single byte of the file
+ * is read: records naming different files, links that cannot be ordered (a
+ * duplicate id or a cycle), and records that order but do not form a single
+ * chain — a fork, which {@link refuseForkedChain} reports. Only a single linear
+ * chain reaches the walk.
  */
 async function restoreFileChain(
   records: readonly ModificationRecord[],
@@ -1514,6 +1665,7 @@ async function restoreFileChain(
       skipped,
       failures,
       stoppedAt: undefined,
+      fork: undefined,
     };
   }
 
@@ -1548,6 +1700,7 @@ async function restoreFileChain(
       skipped,
       failures,
       stoppedAt: first,
+      fork: undefined,
     };
   }
 
@@ -1577,7 +1730,17 @@ async function restoreFileChain(
       skipped,
       failures,
       stoppedAt: first,
+      fork: undefined,
     };
+  }
+
+  // Reverse order exists only for one linear chain. A fork is refused here,
+  // before the file is read or written, and never partly restored: writing
+  // either branch's backup could overwrite the other's patch.
+  const fork = detectChainFork(ordered.value, file);
+
+  if (fork !== undefined) {
+    return await refuseForkedChain(ordered.value, fork, context, pass);
   }
 
   let stoppedAt: ModificationRecord | undefined;
@@ -1680,6 +1843,203 @@ async function restoreFileChain(
     skipped,
     failures,
     stoppedAt,
+    fork: undefined,
+  };
+}
+
+/**
+ * Decides whether one file's records form a single linear chain, and describes
+ * the fork when they do not.
+ *
+ * Structural only — nothing is read from disk, and the `chain_fork` flag the
+ * service's store may carry is neither visible nor needed here: the shape of
+ * the records is the evidence. Only **live** records are judged: a `reverted`
+ * record is finished history that no pass acts on, and the installer's delta
+ * rollback (AAP 0.4.2) legitimately leaves one beside a later layer on the same
+ * parent — the parent stays `applied`, the rolled-back delta is `reverted`, and
+ * the next follow-up is layered on the parent again. The store's single-child
+ * index draws the same line. A set of live records is a single chain exactly
+ * when no two of them name the same `previousRecordId` and exactly one starts
+ * a chain within the set. A record starts one when it has no
+ * `previousRecordId` or names a record that is not live in the set — an earlier
+ * plan version already reverted — which is the same reading
+ * {@link orderRestorationChain} takes. Two siblings of a parent outside the set
+ * are therefore both a shared parent and two roots, and are refused on either
+ * count.
+ *
+ * Called after {@link orderRestorationChain} has refused duplicates and
+ * cycles, so every non-empty set it sees has at least one root.
+ *
+ * @param records One file's records, in restoration order, `reverted` ones
+ * included when a direct {@link restoreChain} caller passed them.
+ * @param file The file's normalised key, for the report.
+ * @returns The fork, or `undefined` for a single chain.
+ */
+function detectChainFork(
+  records: readonly ModificationRecord[],
+  file: string,
+): ChainFork | undefined {
+  const live = records.filter((record) => reconcileDispositionFor(record.status) !== 'none');
+  const first = live[0];
+
+  if (first === undefined) {
+    return undefined;
+  }
+
+  const ids = new Set(live.map((record) => record.id));
+  const childCounts = new Map<string, number>();
+  const rootRecordIds: string[] = [];
+
+  for (const record of live) {
+    const previousId = record.previousRecordId;
+
+    if (previousId === undefined || !ids.has(previousId)) {
+      rootRecordIds.push(record.id);
+    }
+
+    if (previousId !== undefined) {
+      childCounts.set(previousId, (childCounts.get(previousId) ?? 0) + 1);
+    }
+  }
+
+  const sharedPreviousRecordIds = [...childCounts]
+    .filter(([, children]) => children > 1)
+    .map(([previousId]) => previousId)
+    .sort();
+
+  if (sharedPreviousRecordIds.length === 0 && rootRecordIds.length <= 1) {
+    return undefined;
+  }
+
+  return {
+    reason: RECORD_CHAIN_FORK_REASON,
+    sessionId: first.sessionId,
+    file,
+    recordIds: live.map((record) => record.id),
+    sharedPreviousRecordIds,
+    rootRecordIds: rootRecordIds.sort(),
+  };
+}
+
+/**
+ * Refuses a forked file whole: nothing is read or written, every backup is
+ * kept, and every record is reported as a conflict.
+ *
+ * Each record goes through the same {@link reportSynthesizedConflict} and
+ * {@link recordConflict} path every other conflict takes, so it leaves the
+ * same trace — one journal transition to `conflict` (a no-op for a record
+ * already there; every open status may move to `conflict`), one bounded
+ * warning, one report for `cleanup.completed`. The report's reason is
+ * {@link CHAIN_FORK_CONFLICT_REASON}, and the fork itself — with the stable
+ * {@link RECORD_CHAIN_FORK_REASON} — travels as
+ * {@link ChainRestoreOutcome.fork}. Moving the records to `conflict` is what
+ * keeps the file safe afterwards: the next pass retains them rather than
+ * attempting a restore, and retention keeps a conflicting record's backup.
+ *
+ * Every record's backup is pinned in the ledger first, so a digest this file
+ * shares with a record of another file is not swept either. A journal that
+ * refuses a transition leaves that record `skipped` with the failure recorded,
+ * exactly as in the walk, and an abort stops between records.
+ *
+ * @param ordered The file's records, in restoration order.
+ * @param fork The fork {@link detectChainFork} found.
+ * @param context The pass's context, for the journal, the clock and the signal.
+ * @param pass The pass's shared settings.
+ * @returns The outcome, with `fork` set.
+ */
+async function refuseForkedChain(
+  ordered: readonly ModificationRecord[],
+  fork: ChainFork,
+  context: CleanupContext,
+  pass: PassSettings,
+): Promise<ChainRestoreOutcome> {
+  const outcomes: RestoreOutcome[] = [];
+  const retained: ModificationRecord[] = [];
+  const conflicts: ModificationConflict[] = [];
+  const skipped: ModificationRecord[] = [];
+  const failures: CleanupFailure[] = [];
+  const settings: ConflictSettings = {
+    logger: pass.logger,
+    now: clockReading(context, pass.logger),
+    conflictMessage: pass.conflictMessage,
+  };
+
+  pass.logger.error(
+    'the modification records for one file do not form a single chain; nothing was written to it',
+    {
+      sessionId: fork.sessionId,
+      file: fork.file,
+      reason: fork.reason,
+      records: fork.recordIds.length,
+      sharedPreviousRecords: fork.sharedPreviousRecordIds.length,
+      roots: fork.rootRecordIds.length,
+    },
+  );
+
+  for (const record of ordered) {
+    pass.ledger.pin(record);
+  }
+
+  let aborted = false;
+
+  for (const record of ordered) {
+    if (reconcileDispositionFor(record.status) === 'none') {
+      // A `reverted` record a direct caller passed along is history, not part
+      // of the fork: nothing is reported for it and its status is left alone,
+      // exactly as the walk would leave it.
+      outcomes.push(skippedOutcome(record, settings.now));
+      skipped.push(record);
+      continue;
+    }
+
+    if (aborted || context.signal?.aborted === true) {
+      if (!aborted) {
+        pass.logger.warn('cleanup was aborted between records; the rest stay open', {
+          recordId: record.id,
+          file: fork.file,
+        });
+      }
+
+      aborted = true;
+      skipped.push(record);
+      continue;
+    }
+
+    const reported = await reportSynthesizedConflict(
+      record,
+      undefined,
+      CHAIN_FORK_CONFLICT_REASON,
+      undefined,
+      chainForkMessage(record, fork),
+      context,
+      settings,
+    );
+
+    if (isErr(reported)) {
+      skipped.push(record);
+      failures.push(failureOf(record, reported.error));
+      continue;
+    }
+
+    outcomes.push(reported.value);
+    retained.push(reported.value.record);
+
+    if (reported.value.conflict !== undefined) {
+      conflicts.push(reported.value.conflict);
+    }
+  }
+
+  return {
+    file: fork.file,
+    outcomes,
+    restored: [],
+    closed: [],
+    retained,
+    conflicts,
+    skipped,
+    failures,
+    stoppedAt: ordered.find((record) => reconcileDispositionFor(record.status) !== 'none'),
+    fork,
   };
 }
 
@@ -2071,17 +2431,19 @@ async function retainRecord(
  * name is a `'backup-missing'` this function names with the record id, so the
  * developer has something to search the journal with; and a file that already
  * holds the original is reported as `'content-changed'` where the record's
- * status does not permit closing it. `./patch/conflict.ts` owns the bounding
- * and validation of every report, including these.
+ * status does not permit closing it. A refused fork reports each of its records
+ * through here too, with no path because none was resolved.
+ * `./patch/conflict.ts` owns the bounding and validation of every report,
+ * including these.
  */
 async function reportSynthesizedConflict(
   record: ModificationRecord,
-  path: string,
+  path: string | undefined,
   reason: ModificationConflictReason,
   actualHash: string | undefined,
   message: string,
   context: CleanupContext,
-  settings: RestoreSettings,
+  settings: ConflictSettings,
 ): Promise<Result<RestoreOutcome>> {
   const report = buildConflictReport({
     record,
@@ -2144,14 +2506,15 @@ async function reportRaceConflict(
  * the same trace: one journal transition, one bounded warning, one report for
  * `cleanup.completed`. A record already in `conflict` is not re-written: its
  * row says what it says, and the point of the pass is to re-report it, not to
- * churn the journal.
+ * churn the journal. `path` is `undefined` only for a refused fork, which never
+ * resolves one.
  */
 async function recordConflict(
   record: ModificationRecord,
   conflict: ModificationConflict,
-  path: string,
+  path: string | undefined,
   context: CleanupContext,
-  settings: RestoreSettings,
+  settings: ConflictSettings,
 ): Promise<Result<RestoreOutcome>> {
   let current = record;
 
@@ -3075,6 +3438,16 @@ function concurrentWriteMessage(
       : `while it was being restored (${staleReason})`;
 
   return `${record.file} changed ${observed}, so Debug Generator will not overwrite it. Nothing was written and the original is still at ${record.backupPath}.`;
+}
+
+/** A record of a file whose records do not form a single chain. */
+function chainForkMessage(record: ModificationRecord, fork: ChainFork): string {
+  const shape =
+    fork.sharedPreviousRecordIds.length > 0
+      ? 'two or more of its modification records are layered on the same earlier record'
+      : 'it has more than one open chain of modification records';
+
+  return `${record.file} was not restored: ${shape}, so Debug Generator cannot tell which of them the file holds and did not write to it. Every backup was kept; this record's original is at ${record.backupPath} and the modification record is ${record.id}.`;
 }
 
 /** A conflict carried over from an earlier pass. */

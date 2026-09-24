@@ -129,7 +129,15 @@
  *   input per visualization type, the three layout inputs, the authored summary
  *   in its prose and statement forms, and `panelSpecInputSchema` with its
  *   non-throwing `parsePanelSpecInput`. This is the only schema a model's output
- *   is ever measured against.
+ *   is ever measured against. Its node union is not recursive but an unrolled
+ *   chain bounded at `validate`'s `PANEL_MAX_NODE_DEPTH`, so parsing any
+ *   authored document costs a bounded depth; reading that constant and the
+ *   depth issue code is the one edge in this list that points at a module
+ *   listed after it, and `validate` imports nothing from `input`, so the graph
+ *   stays acyclic. `PANEL_INPUT_MAX_NODE_COUNT` is the total number of node
+ *   positions `parsePanelSpecInput` admits, checked before the schema runs —
+ *   the one rule that parser enforces and the schema cannot express, since a
+ *   total renders to no JSON Schema keyword.
  * - `catalog` — the node registry described above, its entry type, the lookup
  *   and the two guards over it, and the prompt renderer.
  * - `normalize` — `normalizePanel` and the two argument shapes it reads: the
@@ -389,6 +397,7 @@ export type {
 // against
 // ---------------------------------------------------------------------------
 export {
+  PANEL_INPUT_MAX_NODE_COUNT,
   authoredSummaryProseSchema,
   authoredSummaryStatementSchema,
   dataQueryInputSchema,

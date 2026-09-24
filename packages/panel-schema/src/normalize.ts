@@ -50,13 +50,19 @@
  * ## Totality
  *
  * For an input that has already passed `parsePanelSpecInput`, normalisation
- * does not throw. The only `throw` reachable from here is the exhaustiveness
- * guard on the node switch, which fires for a node type the vocabulary does not
- * contain — a state the parsed input cannot hold and a product bug if it ever
- * occurs. The return type is therefore {@link PanelSpec} and not a `Result`:
- * AAP 0.5.3 records that a normalisation failure "is a product bug, logged with
- * the input, never retried against the model", and a `Result` here would invite
- * the caller to report a bug of ours as a validation failure of the model's.
+ * does not throw. Two `throw`s are reachable from here, both `DebuggenError`
+ * with code `INTERNAL`, and both for states a parsed input cannot hold: the
+ * exhaustiveness guard on the node switch, which fires for a node type the
+ * vocabulary does not contain, and the cycle guard of the layout walk, which
+ * fires for a node found inside its own subtree (a parse always yields a fresh
+ * tree). Either is a product bug in whatever assembled the input. Depth is not
+ * a third: the layout is walked with an explicit stack rather than by
+ * recursion, so a hand-assembled layout of any depth normalizes instead of
+ * overflowing the call stack. The return type is therefore {@link PanelSpec}
+ * and not a `Result`: AAP 0.5.3 records that a normalisation failure "is a
+ * product bug, logged with the input, never retried against the model", and a
+ * `Result` here would invite the caller to report a bug of ours as a validation
+ * failure of the model's.
  *
  * Normalisation is not a second validator, either. Where the authored value is
  * incomplete in a way the authoring schema chose not to reject — a query-backed
@@ -84,7 +90,7 @@
  * ```
  */
 
-import { assertNever } from '@debuggen/shared';
+import { DebuggenError, assertNever } from '@debuggen/shared';
 import type { PanelId, SessionId } from '@debuggen/shared';
 
 import { PANEL_NODE_CATALOG } from './catalog.js';
@@ -111,7 +117,6 @@ import {
 } from './spec.js';
 import type {
   PanelNode,
-  PanelNodePath,
   PanelSectionNode,
   PanelSpec,
   PanelSplitNode,
@@ -228,8 +233,21 @@ const NODE_ID_SEPARATOR = '.';
  */
 const NODE_ID_ORDINAL_PREFIX = `${PANEL_LAYOUT_FIELD}${NODE_ID_SEPARATOR}node-`;
 
-/** Mints the id of one node, called once per node in depth-first pre-order. */
-type NodeIdMinter = (path: PanelNodePath) => PanelNodeId;
+/**
+ * The joined root every derived id starts from: the layout field, `layout`.
+ *
+ * Joined once from {@link PANEL_LAYOUT_PATH_ROOT}, the walker's own root, so an
+ * id and a reported path cannot disagree about how a position is spelled.
+ */
+const NODE_ID_ROOT = PANEL_LAYOUT_PATH_ROOT.join(NODE_ID_SEPARATOR);
+
+/**
+ * Mints the id of one node, called once per node in depth-first pre-order.
+ *
+ * Given the node's derived id — its path joined with `.` — when that fits
+ * {@link PANEL_NODE_ID_MAX_LENGTH}, or `undefined` when it does not.
+ */
+type NodeIdMinter = (derived: string | undefined) => PanelNodeId;
 
 /**
  * Create the id minter for one normalisation.
@@ -239,29 +257,71 @@ type NodeIdMinter = (path: PanelNodePath) => PanelNodeId;
  * which is stable, human-readable and identical to the path the walker reports.
  *
  * A path only fails to serve when its rendering exceeds
- * {@link PANEL_NODE_ID_MAX_LENGTH}, which takes a layout nested some seventeen
- * containers deep: the authoring schema bounds the width of a layout but not
- * its depth, so the case is reachable and an id too long for the internal
- * schema would make step 3 fail on a document this module produced. Such a node
- * takes `layout.node-<n>` instead, where `n` counts the nodes visited before it
- * in depth-first pre-order. That form is bounded, unique within the document,
- * and — because the counter advances for every node whether or not it is used —
- * as deterministic as the paths it stands in for.
+ * {@link PANEL_NODE_ID_MAX_LENGTH}, which takes a layout nested some eighteen
+ * containers deep. A parsed document never gets there — the authoring schema
+ * bounds nesting at the validator's `PANEL_MAX_NODE_DEPTH`, well short of it —
+ * but `normalizePanel` also accepts a hand-assembled input, which is bounded by
+ * nothing, and an id too long for the internal schema would make step 3 fail
+ * on a document this module produced. Such a node takes `layout.node-<n>`
+ * instead, where `n` counts the nodes visited before it in depth-first
+ * pre-order. That form is bounded, unique within the document, and — because
+ * the counter advances for every node whether or not it is used — as
+ * deterministic as the paths it stands in for.
+ *
+ * The minter is handed the derived id rather than the path so that minting
+ * costs the same at any depth: {@link derivedIdAt} builds each id from its
+ * parent's, and stops building once one no longer fits, so a node ten thousand
+ * levels down is not given a path ten thousand levels long to join.
  */
 function createNodeIdMinter(): NodeIdMinter {
   let ordinal = 0;
 
-  return (path: PanelNodePath): PanelNodeId => {
-    const derived = path.join(NODE_ID_SEPARATOR);
-    const id =
-      derived.length <= PANEL_NODE_ID_MAX_LENGTH
-        ? derived
-        : `${NODE_ID_ORDINAL_PREFIX}${String(ordinal)}`;
+  return (derived: string | undefined): PanelNodeId => {
+    const id = derived ?? `${NODE_ID_ORDINAL_PREFIX}${String(ordinal)}`;
 
     ordinal += 1;
 
     return id;
   };
+}
+
+/**
+ * The derived id of the node at `index` under `base`, or `undefined` when it
+ * would exceed {@link PANEL_NODE_ID_MAX_LENGTH}.
+ *
+ * Exactly the rule of joining the node's whole path with `.` and checking its
+ * length, computed incrementally: `base` is the joined path of the array the
+ * node sits in (`layout`, or a container's id plus `.children`), and an
+ * `undefined` base stays `undefined`, because a path that already did not fit
+ * only grows as it descends.
+ *
+ * @param base The joined path of the containing array, or `undefined` when an
+ * ancestor's path already exceeded the bound.
+ * @param index The node's index in that array.
+ * @returns The joined path when it fits, otherwise `undefined`.
+ */
+function derivedIdAt(base: string | undefined, index: number): string | undefined {
+  if (base === undefined) {
+    return undefined;
+  }
+
+  const derived = `${base}${NODE_ID_SEPARATOR}${String(index)}`;
+
+  return derived.length <= PANEL_NODE_ID_MAX_LENGTH ? derived : undefined;
+}
+
+/**
+ * The joined path of a container's `children` array — the base its children's
+ * ids are derived under — or `undefined` when the container's own id is not a
+ * derived one.
+ *
+ * @param derived The container's derived id, if it had one.
+ * @returns The base for {@link derivedIdAt}.
+ */
+function childrenIdBase(derived: string | undefined): string | undefined {
+  return derived === undefined
+    ? undefined
+    : `${derived}${NODE_ID_SEPARATOR}${PANEL_CHILDREN_FIELD}`;
 }
 
 /*
@@ -461,10 +521,50 @@ function normalizeQueryBackedNode(input: QueryBackedNodeInput, id: PanelNodeId):
 }
 
 /**
- * Normalize one authored node, and its subtree when it has one.
+ * One normalized node, and — for a container — the authored children still to
+ * be normalized into it.
+ *
+ * The seam between building a node and walking a tree: {@link normalizeNode}
+ * builds one node with its fields in their final order and, for a container,
+ * an output `children` array of the authored array's length, and hands the
+ * authored children back instead of recursing into them. {@link normalizeLayout}
+ * then fills that array in place, so a container's object is complete — keys,
+ * order and all — before any of its children exist.
+ */
+interface NormalizedNodeShell {
+  /** The node, final except for the entries of its `children` array. */
+  readonly node: PanelNode;
+
+  /** A container's children: the authored nodes, and the array they fill. */
+  readonly children?: {
+    readonly authored: readonly PanelNodeInput[];
+    readonly into: PanelNode[];
+  };
+}
+
+/**
+ * The output array for a list of authored nodes: the same length, filled later
+ * by index.
+ *
+ * Sized up front and filled by position — rather than pushed to — so a hole in
+ * a hand-assembled input array stays a hole in the output, exactly as the
+ * `Array.prototype.map` a recursive normaliser would use leaves it; see
+ * {@link queueNodes} for the other half of that rule.
+ *
+ * @param authored The authored nodes.
+ * @returns An array of the same length with no entries yet.
+ */
+function outputArrayFor(authored: readonly PanelNodeInput[]): PanelNode[] {
+  return new Array<PanelNode>(authored.length);
+}
+
+/**
+ * Normalize one authored node, without its subtree.
  *
  * Called once per node in depth-first pre-order, which is the order the id
  * minter counts in and the order `walkPanelNodes` reads a finished document in.
+ * A container's children are returned for the caller to walk, never recursed
+ * into here — see {@link normalizeLayout} for why.
  *
  * The switch is exhaustive by construction: every branch returns, and the
  * default hands the value to `assertNever`, so a node type added to the
@@ -472,23 +572,18 @@ function normalizeQueryBackedNode(input: QueryBackedNodeInput, id: PanelNodeId):
  * the only reason this function enumerates node types at all — the behaviour
  * within a branch is driven by the catalog, never by the name of the type.
  */
-function normalizeNode(
-  input: PanelNodeInput,
-  path: PanelNodePath,
-  mintId: NodeIdMinter,
-): PanelNode {
-  const id = mintId(path);
-
+function normalizeNode(input: PanelNodeInput, id: PanelNodeId): NormalizedNodeShell {
   switch (input.type) {
     case 'section': {
+      const children = outputArrayFor(input.children);
       const section: PanelSectionNode = {
         type: 'section',
         id,
         ...labelsOf(input),
-        children: normalizeChildren(input.children, path, mintId),
+        children,
       };
 
-      return section;
+      return { node: section, children: { authored: input.children, into: children } };
     }
 
     case 'split': {
@@ -499,26 +594,28 @@ function normalizeNode(
        * would freeze today's default into every stored document and make a
        * later change to it invisible to every panel already on disk.
        */
+      const children = outputArrayFor(input.children);
       const split: PanelSplitNode = {
         type: 'split',
         id,
         ...labelsOf(input),
         ...(input.direction === undefined ? {} : { direction: input.direction }),
-        children: normalizeChildren(input.children, path, mintId),
+        children,
       };
 
-      return split;
+      return { node: split, children: { authored: input.children, into: children } };
     }
 
     case 'stack': {
+      const children = outputArrayFor(input.children);
       const stack: PanelStackNode = {
         type: 'stack',
         id,
         ...labelsOf(input),
-        children: normalizeChildren(input.children, path, mintId),
+        children,
       };
 
-      return stack;
+      return { node: stack, children: { authored: input.children, into: children } };
     }
 
     case 'sourceLink': {
@@ -536,7 +633,7 @@ function normalizeNode(
         location: input.location,
       };
 
-      return sourceLink;
+      return { node: sourceLink };
     }
 
     case 'timeline':
@@ -551,26 +648,193 @@ function normalizeNode(
     case 'queryTable':
     case 'stateTransitions':
     case 'dependencyGraph':
-      return normalizeQueryBackedNode(input, id);
+      return { node: normalizeQueryBackedNode(input, id) };
 
     default:
       return assertNever(input, 'Unhandled authored panel node type');
   }
 }
 
-/**
- * Normalize the children of a container, extending the path with the same
- * `children` segment the walker uses, so an id and a validation issue path
- * describe the same position.
+/*
+ * ---------------------------------------------------------------------------
+ * The layout walk
+ *
+ * Iterative, with an explicit stack, for the reason `walkPanelNodes` in
+ * `./spec.ts` is: `normalizePanel` accepts a hand-assembled input as well as a
+ * parsed one — the deterministic fallback path of AAP 0.5.5 builds one — and
+ * nothing bounds how deep such an input is nested. A recursive walk would turn
+ * a deep layout into a `RangeError` from the call stack; this one turns it into
+ * a document, with the same ids in the same order a recursive walk would give.
+ * ---------------------------------------------------------------------------
  */
-function normalizeChildren(
-  children: readonly PanelNodeInput[],
-  path: PanelNodePath,
+
+/** An authored node waiting to be normalized, and where its result goes. */
+interface NormalizeNodeStep {
+  readonly kind: 'node';
+
+  /** The authored node. */
+  readonly input: PanelNodeInput;
+
+  /** Its derived id, when that fits; see {@link derivedIdAt}. */
+  readonly derivedId: string | undefined;
+
+  /** Its nesting level, a top-level node being 1. Reported by the cycle guard. */
+  readonly level: number;
+
+  /** The output array the normalized node is written into. */
+  readonly into: PanelNode[];
+
+  /** The position it is written at: its index among its authored siblings. */
+  readonly index: number;
+}
+
+/**
+ * The marker a container leaves below its children on the stack: when it is
+ * popped, the container's whole subtree has been normalized and the container
+ * leaves the ancestor chain.
+ */
+interface LeaveContainerStep {
+  readonly kind: 'leave';
+
+  /** The authored container whose subtree is complete. */
+  readonly container: PanelNodeInput;
+}
+
+/** One entry of {@link normalizeLayout}'s stack. */
+type NormalizeStep = NormalizeNodeStep | LeaveContainerStep;
+
+/**
+ * Queues one list of authored nodes, so that they are normalized in document
+ * order.
+ *
+ * The steps are gathered with `forEach` and pushed last to first: the stack is
+ * LIFO, so the first sibling comes out first, and each sibling's whole subtree
+ * is pushed — and therefore finished — before the next sibling is popped, which
+ * is exactly depth-first pre-order. `forEach` skips a hole in a sparse array
+ * the way `Array.prototype.map` does, so a hand-assembled array with a hole
+ * mints no id for it and leaves the hole in the output (see
+ * {@link outputArrayFor}). Pushed one at a time rather than spread, so no list
+ * length can exceed the runtime's argument limit.
+ *
+ * @param pending The walk's stack. **Mutated.**
+ * @param authored The nodes to queue.
+ * @param idBase The joined path of the array they sit in, for
+ * {@link derivedIdAt}.
+ * @param into The output array they are written into.
+ * @param level Their nesting level.
+ */
+function queueNodes(
+  pending: NormalizeStep[],
+  authored: readonly PanelNodeInput[],
+  idBase: string | undefined,
+  into: PanelNode[],
+  level: number,
+): void {
+  const steps: NormalizeNodeStep[] = [];
+
+  authored.forEach((input, index) => {
+    steps.push({ kind: 'node', input, derivedId: derivedIdAt(idBase, index), level, into, index });
+  });
+
+  steps.reverse();
+
+  for (const step of steps) {
+    pending.push(step);
+  }
+}
+
+/**
+ * The failure raised when an authored node is found inside its own subtree.
+ *
+ * Such an input is a graph, not a layout, and normalizing it would never end —
+ * a recursive walk would overflow the stack, an iterative one would run until
+ * memory ran out. It cannot come out of `parsePanelSpecInput`, whose output is a
+ * freshly built tree, so it is a defect in whatever assembled the value:
+ * `INTERNAL`, as the "Totality" contract in this module's documentation states
+ * for every throw here. The message names the nesting level and nothing
+ * authored.
+ *
+ * @param level The nesting level at which the node reappeared.
+ * @returns The error to throw.
+ */
+function layoutCycleError(level: number): DebuggenError {
+  return new DebuggenError(
+    'INTERNAL',
+    `An authored panel layout contains a node inside its own subtree, found again at nesting level ${String(level)}; a layout must be a tree.`,
+    {
+      hint: 'Assemble the authored layout so that no container holds itself at any depth. A subtree may be shared between positions, but never placed below itself.',
+      details: { level },
+    },
+  );
+}
+
+/**
+ * Normalize a whole authored layout, depth first, without recursion.
+ *
+ * Each node is popped, checked against the ancestor chain, given its id —
+ * pre-order, so the id minter's ordinals match a recursive walk's — built by
+ * {@link normalizeNode} and written into its parent's output array at its own
+ * index. A container additionally joins the ancestor chain, pushes a
+ * {@link LeaveContainerStep} and then its children above that marker, so the
+ * marker surfaces exactly when its subtree is done.
+ *
+ * **The ancestor chain is the cycle guard.** It holds the authored containers
+ * on the path from the root to the node being normalized, by identity; a node
+ * already on it has been reached from inside itself, and the walk throws
+ * {@link layoutCycleError} instead of running forever. A node that is merely
+ * *shared* — the same object at two positions, neither inside the other — is
+ * off the chain by the time its second position is reached, so it is
+ * normalized twice, with the two path-derived ids of its two positions, as a
+ * recursive walk would normalize it.
+ *
+ * Memory is proportional to the number of nodes plus the depth, and every id
+ * costs at most {@link PANEL_NODE_ID_MAX_LENGTH} characters to derive, so a
+ * layout ten thousand levels deep costs what ten thousand siblings cost.
+ *
+ * @param layout The authored top-level nodes.
+ * @param mintId The id minter for this normalisation.
+ * @returns The normalized top-level nodes.
+ * @throws DebuggenError `INTERNAL` if a node is found inside its own subtree,
+ * or if a node's type is outside the vocabulary.
+ */
+function normalizeLayout(
+  layout: readonly PanelNodeInput[],
   mintId: NodeIdMinter,
 ): readonly PanelNode[] {
-  const childBase: PanelNodePath = [...path, PANEL_CHILDREN_FIELD];
+  const normalized = outputArrayFor(layout);
+  const pending: NormalizeStep[] = [];
+  const ancestors = new Set<PanelNodeInput>();
 
-  return children.map((child, index) => normalizeNode(child, [...childBase, index], mintId));
+  queueNodes(pending, layout, NODE_ID_ROOT, normalized, 1);
+
+  for (let step = pending.pop(); step !== undefined; step = pending.pop()) {
+    if (step.kind === 'leave') {
+      ancestors.delete(step.container);
+      continue;
+    }
+
+    if (ancestors.has(step.input)) {
+      throw layoutCycleError(step.level);
+    }
+
+    const shell = normalizeNode(step.input, mintId(step.derivedId));
+
+    step.into[step.index] = shell.node;
+
+    if (shell.children !== undefined) {
+      ancestors.add(step.input);
+      pending.push({ kind: 'leave', container: step.input });
+      queueNodes(
+        pending,
+        shell.children.authored,
+        childrenIdBase(step.derivedId),
+        shell.children.into,
+        step.level + 1,
+      );
+    }
+  }
+
+  return normalized;
 }
 
 /*
@@ -702,7 +966,8 @@ function normalizeSummary(summary: PanelSummaryInput, analysis: NormalizeAnalysi
  *   one line of authored prose as `headline`. See {@link headlineFrom} for why
  *   nothing else of an authored summary survives.
  * - `layout` is the authored forest with an id derived from each node's
- *   position and each query-backed node's data request lifted into one `query`.
+ *   position and each query-backed node's data request lifted into one `query`,
+ *   walked without recursion so that no depth of input overflows the stack.
  * - `meta` appears only when `context.fallback` is `true`, so an ordinary
  *   panel's JSON carries no `meta` key at all.
  *
@@ -719,19 +984,16 @@ function normalizeSummary(summary: PanelSummaryInput, analysis: NormalizeAnalysi
  * @returns The internal panel document, ready for `parsePanelSpec` and then for
  *   semantic validation against the capture.
  * @throws DebuggenError with code `INTERNAL` if the input holds a node type
- *   outside the vocabulary — unreachable for a parsed input, and a product bug
- *   rather than a model failure if it ever happens (AAP 0.5.3).
+ *   outside the vocabulary, or a node inside its own subtree — both
+ *   unreachable for a parsed input, and a product bug rather than a model
+ *   failure if either ever happens (AAP 0.5.3).
  */
 export function normalizePanel(
   input: PanelSpecInput,
   analysis: NormalizeAnalysis,
   context: NormalizeContext,
 ): PanelSpec {
-  const mintId = createNodeIdMinter();
-
-  const layout: readonly PanelNode[] = input.layout.map((node, index) =>
-    normalizeNode(node, [...PANEL_LAYOUT_PATH_ROOT, index], mintId),
-  );
+  const layout = normalizeLayout(input.layout, createNodeIdMinter());
 
   return {
     version: PANEL_SPEC_VERSION,

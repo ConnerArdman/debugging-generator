@@ -248,6 +248,18 @@ export interface PanelActions {
  * embeds individual components may provide it too, or pass callbacks as props
  * instead — props always win, so both compose.
  *
+ * **What the value's identity means.** Every component that reads this context
+ * re-renders whenever the provided object changes identity, so the panel host
+ * never provides the `actions` prop it was handed: it provides an object it
+ * memoizes on the four callbacks' identities. A surface may therefore rebuild
+ * its actions object on every render (an object literal in JSX is fine) without
+ * re-rendering a single visualization, **as long as the callbacks themselves
+ * are stable** — define them once, or wrap them in `useCallback`. A callback
+ * that is a fresh closure on every render is a real change and re-renders every
+ * consumer, which is correct: the handler the views would call has changed. A
+ * surface that provides this context itself, outside the panel host, should
+ * memoize its value the same way.
+ *
  * Its default is `undefined`, and that value is meaningful rather than a
  * placeholder: it is exactly what a component sees when no host is present, and
  * what the degradation path described on {@link usePanelActions} keys off.

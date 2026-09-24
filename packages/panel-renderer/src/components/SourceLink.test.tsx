@@ -676,6 +676,69 @@ describe('SourceLink unresolved coordinates', () => {
   });
 });
 
+describe('SourceLink inside a composite widget', () => {
+  it('leaves the Tab order to the browser when no index is given', async () => {
+    const user = userEvent.setup();
+
+    render(<SourceLink location={makeLocation()} onOpenSource={makeOpenSourceSpy()} />);
+
+    const chip = screen.getByRole('button', { name: ACCESSIBLE_NAME });
+
+    // No attribute is written at all: an explicit `tabindex="0"` on every
+    // standalone chip would be noise, and the button is tabbable on its own.
+    expect(chip.hasAttribute('tabindex')).toBe(false);
+
+    await user.tab();
+    expect(document.activeElement).toBe(chip);
+  });
+
+  it('takes a nested chip out of the Tab order and keeps it a working control', async () => {
+    const location = makeLocation();
+    const onOpenSource = makeOpenSourceSpy();
+    const user = userEvent.setup();
+
+    render(<SourceLink location={location} onOpenSource={onOpenSource} tabIndex={-1} />);
+
+    const chip = screen.getByRole('button', { name: ACCESSIBLE_NAME });
+    expect(chip.getAttribute('tabindex')).toBe('-1');
+
+    // Tab passes the chip by: inside a tree or a grid the item is the stop, and
+    // a chip that stayed in the order would be a second stop per row.
+    await user.tab();
+    expect(document.activeElement).not.toBe(chip);
+
+    // Still a real button: the pointer activates it and the composite that
+    // owns it may still focus it programmatically.
+    await user.click(chip);
+    expect(soleLocation(onOpenSource)).toBe(location);
+
+    chip.focus();
+    expect(document.activeElement).toBe(chip);
+  });
+
+  it('writes an explicit zero index when one is asked for', () => {
+    render(
+      <SourceLink location={makeLocation()} onOpenSource={makeOpenSourceSpy()} tabIndex={0} />,
+    );
+
+    expect(screen.getByRole('button', { name: ACCESSIBLE_NAME }).getAttribute('tabindex')).toBe(
+      '0',
+    );
+  });
+
+  it('never makes the inert chip focusable, whatever index it is given', () => {
+    render(<SourceLink location={makeLocation()} tabIndex={0} />);
+
+    const root = chipRootOf(screen.getByText(CHIP_TEXT));
+
+    // A label is not a control, so neither index turns it into a tab stop.
+    expect(root.classList.contains('dg-is-static')).toBe(true);
+    expect(root.hasAttribute('tabindex')).toBe(false);
+    expect(root.querySelector('[tabindex]')).toBeNull();
+    expect(screen.queryByRole('button')).toBeNull();
+  });
+});
+
 describe('SourceLink purity', () => {
   it('does not modify the location it forwards', async () => {
     const location = makeLocation();

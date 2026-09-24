@@ -45,13 +45,18 @@
  *   a reply this schema actually accepts is invalid, and would spend one of two
  *   repair attempts on it.
  * - `reused: 'ref'` and `cycles: 'ref'` — references, not inlining, and for
- *   this schema inlining is not merely wasteful but impossible: a container node
- *   holds child nodes, so the node union is recursive and a recursive schema can
- *   only be expressed with `$ref`. The reuse setting then earns its keep on top
- *   of that, because `./input.ts` shares one instance of each field schema
- *   across all sixteen node types: measured on this schema, references produce a
- *   document of roughly 34 KB where inlining produces roughly 157 KB of
- *   duplication that says nothing more.
+ *   this schema inlining is not merely wasteful but unworkable. The authoring
+ *   schema bounds nesting by construction: it is an unrolled chain of one node
+ *   union per nesting level, whose three containers each hold the union of the
+ *   level below, ending in a union of leaves only. Rendered with references,
+ *   each level is one definition the three containers above it point at, and
+ *   `./input.ts` shares one instance of each leaf and of each field schema
+ *   across every level and all sixteen node types, so the document stays
+ *   roughly 60 KB. Inlined, every level would be copied into each of the three
+ *   containers above it, and the rendering outgrows the longest string the
+ *   runtime can hold — measured on this schema. The chain has no cycle, so
+ *   `cycles: 'ref'` changes nothing today; it is kept so that a reference cycle
+ *   introduced later would render as a `$ref` rather than fail.
  * - `unrepresentable: 'throw'` — the loud failure, deliberately. `./input.ts`
  *   constrains itself to constructs JSON Schema can express (`z.enum`,
  *   `.min`/`.max`, `.int`, `.regex`) precisely because it is rendered here, and
@@ -110,8 +115,10 @@
  * emitted document is a projection of the authoring schema, so the file that
  * pins that schema is its natural home. That suite asserts what matters here —
  * that the emission does not throw, that it enumerates every authoring node
- * type, that the metric-id enumeration survived it, that the recursive
- * reference resolves, and that the text is byte-identical across calls.
+ * type, that the metric-id enumeration survived it, that every reference
+ * resolves, that the nesting renders as a finite, acyclic chain ending in a
+ * union that admits no container, and that the text is byte-identical across
+ * calls.
  *
  * @example
  * ```ts
@@ -178,9 +185,10 @@ export type PanelSpecInputSchemaTarget = (typeof PANEL_SPEC_INPUT_SCHEMA_TARGETS
 /**
  * The dialect emitted unless a caller asks for another: **JSON Schema 2020-12**.
  *
- * Recursion forces definitions into the document, and this is the choice that
- * decides what they are called. Three things follow from it, all pointing the
- * same way:
+ * Reference reuse puts definitions into the document — every nesting level of
+ * the node chain and every shared leaf and field schema is one — and this is
+ * the choice that decides what they are called. Three things follow from it,
+ * all pointing the same way:
  *
  * - **It is the dialect the real provider's own emission speaks.**
  *   `@anthropic-ai/sdk`'s `zodOutputFormat` renders `panelSpecInputSchema` with
@@ -346,10 +354,13 @@ function unrepresentableValue(path: string, what: string): DebuggenError {
  * not schema content — out of the document this module hands to its callers.
  *
  * Shared sub-objects are fine and common: `seen` tracks only the current
- * ancestor chain, so a definition referenced twice is rendered twice while a
- * genuine cycle is reported instead of overflowing the stack. The emission is
- * configured to express recursion as `$ref`, so a cycle here would mean the
- * emitter had ignored that setting.
+ * ancestor chain, so a sub-object reached twice is rendered twice while a
+ * genuine cycle is reported instead of overflowing the stack. The authoring
+ * schema has no recursion to express — its nesting is a finite chain of
+ * definitions joined by `$ref` pointers, which are strings — and the emission
+ * is configured to render any reuse or cycle as `$ref` as well, so an object
+ * cycle here would mean the emitter had ignored those settings. The walk's own
+ * depth is that of the emitted JSON, which the finite chain keeps small.
  *
  * @param value The value to canonicalise.
  * @param path Where `value` sits, for a failure message.

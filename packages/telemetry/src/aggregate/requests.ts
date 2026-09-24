@@ -82,6 +82,43 @@
  * canonical order and candidates in start order, so the same capture yields
  * the same pairing however the events arrived.
  *
+ * ## Pending requests
+ *
+ * A request still on the wire when its capture ended reaches this module as an
+ * **in-flight snapshot**: the one event `../browser/fetch.ts` emits for it at
+ * the capture boundary, marked with {@link REQUEST_IN_FLIGHT_ATTRIBUTE}. The
+ * rules that keep such a request from being misread:
+ *
+ * - **Only the marker makes a request pending.** An event is pending exactly
+ *   when that attribute is the boolean `true`; the string `'true'`, `1`,
+ *   `false` and absence all read as settled. A missing status code never does:
+ *   a network error, an abort and an opaque response all settle without one.
+ * - **A pending occurrence reports no response.** It is published with
+ *   `pending: true` and without a `statusCode`, even if the event carried one;
+ *   its own transfer size is not read and it takes no part in the
+ *   resource-timing join, so it claims no entry and any entry that matches it
+ *   stays available to a settled request, or unclaimed for `./summary.ts`. Its
+ *   span status is carried as reported.
+ * - **It is never a failure.** Nothing had failed when it was observed, so a
+ *   group's `statusCodes` and `errorCount` describe its settled occurrences
+ *   only.
+ * - **It is counted.** A group carries `pendingCount` — pending occurrences
+ *   over every occurrence, before `maxOccurrencesPerGroup` truncation — only
+ *   when at least one is pending. Absence means zero, so a capture with no
+ *   pending request produces exactly the groups it always did.
+ * - **A settled event supersedes a snapshot of its own span.** A settled event
+ *   sharing a snapshot's `(traceId, spanId)` is the same request, observed
+ *   finishing, so the snapshot is dropped before the join and before grouping
+ *   and is counted nowhere; keeping both would report one request as a
+ *   duplicate of itself. Several snapshots of one span with no settled event
+ *   collapse to exactly one — the latest observation (largest `endTime`, then
+ *   smallest id), whatever order they arrived in. Settled events are never
+ *   dropped or merged: two settled events sharing a span both stay.
+ * - **Its timing is a lower bound.** Its duration is the time it had been
+ *   outstanding when observed, and that elapsed time is included in the
+ *   group's duration figures. Duplicate windows are swept by issuance start,
+ *   which a pending request has like any other.
+ *
  * ## Purity
  *
  * The input is an already-ingested, already-redacted event list. This module
@@ -199,6 +236,28 @@ export const RESOURCE_TIMING_URL_ATTRIBUTE = 'resourceTimingUrl';
  * interprets it.
  */
 export const TRANSFER_SIZE_EXPOSED_ATTRIBUTE = 'transferSizeExposed';
+
+/**
+ * Whether a request event is an **in-flight snapshot** rather than a settled
+ * request.
+ *
+ * **Declared by the catalog** in the `fetch` and `xhr` tuples of
+ * `../schema/attributes.ts`, and typed against that declaration with
+ * `satisfies` like the request keys at the top of this module: a rename
+ * upstream is a build error here, while the exported constant keeps its literal
+ * spelling for the producer-side test that pins `../browser/fetch.ts` to it. A
+ * producer writes it — as the boolean `true`, never any other value — on the
+ * one event it emits for a request that was still on the wire when the capture
+ * it belongs to ended: the request had started and had not settled, so the
+ * event carries no status code, reports span status `unset`, and measures its
+ * duration up to the moment of the snapshot rather than to a completion.
+ *
+ * It is the only thing that makes a request *pending*. An absent status code is
+ * not: a network error, an abort and a cross-origin refusal all settle without
+ * one, and reading any of them as "still waiting" would state something the
+ * capture never observed.
+ */
+export const REQUEST_IN_FLIGHT_ATTRIBUTE = 'inFlight' satisfies RequestAttributeKey;
 
 /**
  * Whether the grouping key is still a service-assigned attribute.
@@ -371,6 +430,19 @@ export interface RequestOccurrence {
   readonly statusCode?: number;
   /** The span status the producer reported. */
   readonly status: TelemetryEvent['status'];
+  /**
+   * `true` when the occurrence is an in-flight snapshot: the producer saw the
+   * request start and not settle before the capture ended (see
+   * {@link REQUEST_IN_FLIGHT_ATTRIBUTE}). Absent for every settled request —
+   * never `false` — so the field is present exactly when it says something.
+   *
+   * A pending occurrence has no {@link statusCode} and no transfer figure,
+   * because no response had arrived, and it never counts as a failure. Its
+   * {@link durationMs} is the time the request had been outstanding when it was
+   * observed, which is a lower bound on its real duration, and its
+   * {@link endTime} is that observation instant rather than a completion.
+   */
+  readonly pending?: true;
   /** The initiator label, when the producer reported one. */
   readonly initiator?: string;
   /** Where the request was issued from, when a location could be resolved. */
@@ -490,6 +562,19 @@ export interface RequestGroup {
   readonly statusCodes: readonly number[];
   /** Occurrences that failed: status code at or above 400, or span status `error`. */
   readonly errorCount: number;
+  /**
+   * Occurrences that were still pending when the capture ended — see
+   * {@link RequestOccurrence.pending} — counted over every occurrence, before
+   * truncation, so it is never larger than {@link count}.
+   *
+   * Present only when at least one occurrence is pending, like
+   * {@link transferredBytes}: absent means none was, which keeps every group
+   * shape that predates the field valid. When present, the group's duration
+   * figures include those occurrences' elapsed time and are therefore lower
+   * bounds, while {@link statusCodes} and {@link errorCount} describe the
+   * settled occurrences only.
+   */
+  readonly pendingCount?: number;
   /**
    * Distinct initiator labels, sorted.
    *
@@ -801,8 +886,17 @@ function groupIdForMethodPath(method: string, path: string): string {
   return `${GROUP_ID_PREFIX}:m:${method}:${path}`;
 }
 
-/** Whether an occurrence failed: an error status code, or an error span status. */
+/**
+ * Whether an occurrence failed: an error status code, or an error span status.
+ *
+ * A pending occurrence never failed — nothing had come back when it was
+ * observed — so it is excluded before either test, whatever span status its
+ * producer reported (see the header's "Pending requests").
+ */
 function isFailedOccurrence(occurrence: RequestOccurrence): boolean {
+  if (occurrence.pending === true) {
+    return false;
+  }
   if (occurrence.statusCode !== undefined && occurrence.statusCode >= HTTP_ERROR_STATUS_FLOOR) {
     return true;
   }
@@ -833,6 +927,8 @@ interface GroupAccumulator {
   lastStartTime: number;
   readonly statusCodes: Set<number>;
   errorCount: number;
+  /** Pending occurrences merged so far; published only when above zero. */
+  pendingCount: number;
   readonly initiators: Set<string>;
   /** Stays `undefined` until an occurrence actually has a size. */
   transferredBytes: number | undefined;
@@ -874,6 +970,7 @@ function createAccumulator(
     lastStartTime: Number.NEGATIVE_INFINITY,
     statusCodes: new Set<number>(),
     errorCount: 0,
+    pendingCount: 0,
     initiators: new Set<string>(),
     transferredBytes: undefined,
     transferEventIds: new Set<EventId>(),
@@ -919,6 +1016,9 @@ function mergeOccurrence(
   }
   if (isFailedOccurrence(occurrence)) {
     accumulator.errorCount += 1;
+  }
+  if (occurrence.pending === true) {
+    accumulator.pendingCount += 1;
   }
   if (occurrence.initiator !== undefined) {
     accumulator.initiators.add(occurrence.initiator);
@@ -1043,6 +1143,10 @@ function finalizeGroup(
     minDurationMs: finiteOrZero(accumulator.minDurationMs),
     statusCodes: [...accumulator.statusCodes].sort((left, right) => left - right),
     errorCount: accumulator.errorCount,
+    // Counted in `mergeOccurrence` over every occurrence, so the truncation of
+    // the published list above cannot change it; absent when zero, which keeps
+    // every group without a pending request exactly the shape it always had.
+    ...(accumulator.pendingCount > 0 ? { pendingCount: accumulator.pendingCount } : {}),
     initiators: [...accumulator.initiators].sort(compareStrings),
     ...(accumulator.transferredBytes !== undefined
       ? { transferredBytes: Math.round(accumulator.transferredBytes) }
@@ -1357,8 +1461,12 @@ function claimResourceTiming(
  * the grouping decide which request got which response — and because
  * {@link RequestOccurrence} is published `readonly`, so its transfer fields are
  * set at construction rather than patched afterwards.
+ *
+ * Named *unjoined* rather than anything built on "pending": in this module a
+ * pending occurrence is an in-flight snapshot ({@link RequestOccurrence.pending}),
+ * and every occurrence — settled or not — passes through this shape.
  */
-interface PendingOccurrence {
+interface UnjoinedOccurrence {
   /** Everything about the occurrence except the three transfer fields. */
   readonly base: RequestOccurrence;
   /** The group this occurrence belongs to. */
@@ -1371,14 +1479,20 @@ interface PendingOccurrence {
   readonly method: string;
   readonly url: string;
   readonly path: string;
-  /** The identities this request may appear under in the timing buffer. */
+  /**
+   * The identities this request may appear under in the timing buffer; empty
+   * for a pending occurrence, which never joins.
+   */
   readonly identities: readonly string[];
-  /** The occurrence's own exposed size, when the request event carried one. */
+  /**
+   * The occurrence's own exposed size, when the request event carried one;
+   * never read for a pending occurrence, whose response had not arrived.
+   */
   readonly ownTransferredBytes: number | undefined;
 }
 
 /** Canonical order for the join pass: start time, then the always-distinct id. */
-function comparePending(left: PendingOccurrence, right: PendingOccurrence): number {
+function compareUnjoined(left: UnjoinedOccurrence, right: UnjoinedOccurrence): number {
   if (left.base.startTime !== right.base.startTime) {
     return left.base.startTime < right.base.startTime ? -1 : 1;
   }
@@ -1386,7 +1500,83 @@ function comparePending(left: PendingOccurrence, right: PendingOccurrence): numb
 }
 
 /**
- * Attach transfer evidence to one pending occurrence.
+ * Whether one in-flight snapshot is a later observation of its span than
+ * another: the larger `endTime` — the snapshot instant — wins, and the
+ * smaller id breaks a tie, so the choice is total and independent of arrival
+ * order.
+ */
+function isLaterSnapshot(candidate: RequestOccurrence, current: RequestOccurrence): boolean {
+  if (candidate.endTime !== current.endTime) {
+    return candidate.endTime > current.endTime;
+  }
+  return compareStrings(candidate.id, current.id) < 0;
+}
+
+/**
+ * Apply the header's supersession rule to every occurrence before the join.
+ *
+ * A pending snapshot survives only when no settled event shares its
+ * `(traceId, spanId)` and it is the latest snapshot of that span; every settled
+ * occurrence survives unconditionally, so two settled events that share a span
+ * both stay, exactly as they did before snapshots existed.
+ *
+ * Spans are keyed through nested maps rather than a joined string, so no pair
+ * of identifiers can spell another pair and no value is ever converted — the
+ * module's never-throws guarantee holds for an identifier of any shape.
+ *
+ * @param occurrences every occurrence the capture holds, in any order.
+ * @returns the survivors, in input order; the input itself when no snapshot is
+ * present, which leaves a capture without one exactly as it was.
+ */
+function supersedeInFlightSnapshots(
+  occurrences: readonly UnjoinedOccurrence[],
+): readonly UnjoinedOccurrence[] {
+  const settledSpans = new Map<TraceId, Set<SpanId>>();
+  const latestSnapshots = new Map<TraceId, Map<SpanId, UnjoinedOccurrence>>();
+  let snapshotCount = 0;
+
+  for (const occurrence of occurrences) {
+    const { traceId, spanId } = occurrence.base;
+    if (occurrence.base.pending !== true) {
+      let spans = settledSpans.get(traceId);
+      if (spans === undefined) {
+        spans = new Set<SpanId>();
+        settledSpans.set(traceId, spans);
+      }
+      spans.add(spanId);
+      continue;
+    }
+
+    snapshotCount += 1;
+    let snapshots = latestSnapshots.get(traceId);
+    if (snapshots === undefined) {
+      snapshots = new Map<SpanId, UnjoinedOccurrence>();
+      latestSnapshots.set(traceId, snapshots);
+    }
+    const current = snapshots.get(spanId);
+    if (current === undefined || isLaterSnapshot(occurrence.base, current.base)) {
+      snapshots.set(spanId, occurrence);
+    }
+  }
+
+  if (snapshotCount === 0) {
+    return occurrences;
+  }
+
+  return occurrences.filter((occurrence) => {
+    if (occurrence.base.pending !== true) {
+      return true;
+    }
+    const { traceId, spanId } = occurrence.base;
+    if (settledSpans.get(traceId)?.has(spanId) === true) {
+      return false;
+    }
+    return latestSnapshots.get(traceId)?.get(spanId) === occurrence;
+  });
+}
+
+/**
+ * Attach transfer evidence to one unjoined occurrence.
  *
  * The request's own exposed size stays authoritative when it has one — it is
  * the page's account of its own request — but a matching entry is still
@@ -1394,34 +1584,42 @@ function comparePending(left: PendingOccurrence, right: PendingOccurrence): numb
  * `./summary.ts` and this response has already been counted. When the request
  * reported nothing, which is the ordinary browser case, the claimed entry's
  * bytes become the occurrence's.
+ *
+ * A pending occurrence is returned as it stands: no response had arrived, so
+ * it has no bytes to report and must not claim an entry that belongs to a
+ * settled request or to `./summary.ts`'s unattributed total.
  */
 function resolveOccurrenceTransfer(
-  pending: PendingOccurrence,
+  unjoined: UnjoinedOccurrence,
   byUrl: Map<string, ResourceTimingCandidate[]>,
   toleranceMs: number,
 ): RequestOccurrence {
+  if (unjoined.base.pending === true) {
+    return unjoined.base;
+  }
+
   const claimed =
-    pending.identities.length === 0
+    unjoined.identities.length === 0
       ? undefined
       : claimResourceTiming(
           byUrl,
-          pending.identities,
-          pending.base.kind,
-          pending.base.startTime,
-          pending.base.endTime,
+          unjoined.identities,
+          unjoined.base.kind,
+          unjoined.base.startTime,
+          unjoined.base.endTime,
           toleranceMs,
         );
 
-  const own = pending.ownTransferredBytes;
+  const own = unjoined.ownTransferredBytes;
   if (own === undefined && claimed === undefined) {
-    return pending.base;
+    return unjoined.base;
   }
 
   const bytes = own ?? claimed?.bytes;
   const source: RequestTransferSource = own !== undefined ? 'request' : 'resource-timing';
 
   return {
-    ...pending.base,
+    ...unjoined.base,
     ...(bytes !== undefined ? { transferredBytes: bytes, transferSource: source } : {}),
     ...(claimed !== undefined ? { transferEventId: claimed.eventId } : {}),
   };
@@ -1445,17 +1643,21 @@ function resolveOccurrenceTransfer(
  *
  * Selected events are grouped by {@link RequestGroup.groupedBy}: the
  * service-assigned request key where one is present, `method + path` otherwise.
- * No event is dropped — an unreadable method or URL is labelled, not discarded —
- * and no input is mutated.
+ * No settled event is dropped — an unreadable method or URL is labelled, not
+ * discarded — and no input is mutated. The one event that can be left out is an
+ * in-flight snapshot another event of the same span supersedes, by the rule in
+ * the header's "Pending requests"; it describes a request that is already
+ * reported, so leaving it out loses nothing.
  *
  * The capture's `perf.entry` resource events are read too, but never as
  * requests: they are the join candidates of the header's "transferred bytes
  * arrive by a join", and an entry that matches no request contributes nothing
  * here (`./summary.ts` accounts for those). Three passes, in this order and for
- * this reason: occurrences and candidates are built from the events, then every
- * occurrence in the capture is matched in one canonical order — so the pairing
- * cannot depend on how the events were grouped or on the order they arrived —
- * and only then are the matched occurrences folded into their groups.
+ * this reason: occurrences and candidates are built from the events and
+ * superseded snapshots are set aside, then every occurrence in the capture is
+ * matched in one canonical order — so the pairing cannot depend on how the
+ * events were grouped or on the order they arrived — and only then are the
+ * matched occurrences folded into their groups.
  *
  * @param events already-ingested, already-redacted events, in any order.
  * @param options window, tolerance and bounding overrides.
@@ -1469,14 +1671,18 @@ export function aggregateRequests(
   const maxOccurrences = resolveMaxOccurrences(options?.maxOccurrencesPerGroup);
   const toleranceMs = resolveResourceTimingToleranceMs(options?.resourceTimingToleranceMs);
 
-  // Pass 1 — read every request into a pending occurrence, and index the
-  // resource entries that measured something.
-  const pending: PendingOccurrence[] = [];
+  // Pass 1 — read every request into an unjoined occurrence, set aside the
+  // in-flight snapshots a later observation supersedes, and index the resource
+  // entries that measured something.
+  const read: UnjoinedOccurrence[] = [];
   for (const event of events) {
     if (!isRequestEvent(event)) {
       continue;
     }
 
+    // Strictly the boolean: see the header's "Pending requests" for why nothing
+    // else — least of all a missing status code — makes a request pending.
+    const pending = readAttribute(event, REQUEST_IN_FLIGHT_ATTRIBUTE) === true;
     const startTime = finiteOrZero(event.startTime);
     const durationMs = roundMs(clampNonNegative(finiteOrZero(event.duration)));
     const method = readNonBlankString(event, METHOD_ATTRIBUTE) ?? UNKNOWN_METHOD_LABEL;
@@ -1484,7 +1690,9 @@ export function aggregateRequests(
     const url = rawUrl ?? UNKNOWN_URL_LABEL;
     const path = rawUrl === undefined ? UNKNOWN_URL_LABEL : pathOfUrl(rawUrl);
     const requestKey = readRequestKey(event);
-    const statusCode = readInteger(event, STATUS_CODE_ATTRIBUTE);
+    // A snapshot's status code is ignored even when present: no response had
+    // arrived, so a code on it would describe something the capture never saw.
+    const statusCode = pending ? undefined : readInteger(event, STATUS_CODE_ATTRIBUTE);
     const initiator = readNonBlankString(event, INITIATOR_ATTRIBUTE);
 
     const base: RequestOccurrence = {
@@ -1498,6 +1706,7 @@ export function aggregateRequests(
       endTime: roundMs(startTime + durationMs),
       ...(statusCode !== undefined ? { statusCode } : {}),
       status: event.status,
+      ...(pending ? { pending: true as const } : {}),
       ...(initiator !== undefined ? { initiator } : {}),
       ...(event.source !== undefined ? { source: event.source } : {}),
       tier: event.tier,
@@ -1505,7 +1714,7 @@ export function aggregateRequests(
     };
 
     const groupedBy: RequestGroupedBy = requestKey === undefined ? 'method-path' : 'request-key';
-    pending.push({
+    read.push({
       base,
       groupId:
         requestKey === undefined
@@ -1516,22 +1725,23 @@ export function aggregateRequests(
       method,
       url,
       path,
-      identities: resourceIdentitiesOf(event, rawUrl),
-      ownTransferredBytes: readExposedTransferSize(event),
+      identities: pending ? [] : resourceIdentitiesOf(event, rawUrl),
+      ownTransferredBytes: pending ? undefined : readExposedTransferSize(event),
     });
   }
+  const unjoined = [...supersedeInFlightSnapshots(read)];
   const resourceTimings = collectResourceTimings(events);
 
   // Pass 2 — the join, in canonical occurrence order.
-  pending.sort(comparePending);
-  const resolved = pending.map((occurrence) => ({
-    pending: occurrence,
+  unjoined.sort(compareUnjoined);
+  const resolved = unjoined.map((occurrence) => ({
+    unjoined: occurrence,
     occurrence: resolveOccurrenceTransfer(occurrence, resourceTimings, toleranceMs),
   }));
 
   // Pass 3 — fold the joined occurrences into their groups.
   const accumulators = new Map<string, GroupAccumulator>();
-  for (const { pending: source, occurrence } of resolved) {
+  for (const { unjoined: source, occurrence } of resolved) {
     let accumulator = accumulators.get(source.groupId);
     if (accumulator === undefined) {
       accumulator = createAccumulator(source.groupId, source.groupedBy, source.requestKey);

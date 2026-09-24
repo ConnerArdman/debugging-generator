@@ -14,9 +14,10 @@
  * The single string operation applied anywhere below is the package's own
  * display truncation for the collapsed cell (`oneLinePreview`), and wherever a
  * preview is shown the untouched statement is carried beside it — in the cell's
- * tooltip, whose bubble is in the document at all times, and in the expanded
- * row's block. There is no "show values" affordance and nothing resembling a
- * result-set preview, because the evidence to build one was never captured.
+ * tooltip, whose bubble is in the document at all times and which keyboard
+ * focus opens as readily as a pointer does, and in the expanded row's block.
+ * There is no "show values" affordance and nothing resembling a result-set
+ * preview, because the evidence to build one was never captured.
  *
  * The instinct this file is written with, and the one to keep when editing it:
  * **display, never transform.** An "improvement" that formatted a statement,
@@ -60,6 +61,17 @@
  * keys and the row state classes (`dg-is-selected`, `dg-is-expanded`), which is
  * why none of them appears here; spacing comes from `Stack`, the ordering
  * control from `Toolbar`, colour only ever from `../utils/color`.
+ *
+ * The only focus stops this file adds of its own sit on the triggers of its
+ * tooltips — an abbreviated statement, a row count, a caller's execution count
+ * — each carrying `tabIndex={0}`, because a description a pointer reaches by
+ * hovering a keyboard reaches by focusing. Such a trigger is described, never
+ * operated: it gains no role, no handler and no name of its own (its visible
+ * text is what is read, the bubble its description), so the set of controls on
+ * screen is unchanged, and its focus ring is the global `:focus-visible` rule
+ * of `../styles/base.css`. `DataTable` answers only keys pressed on a row
+ * itself, so these stops leave the row navigation intact and let Escape reach
+ * the tooltip first.
  *
  * ## States
  *
@@ -649,7 +661,10 @@ function occurrenceOffsetText(startTime: number, originEpochMs: number): string 
  * package's display preview of it — one line, bounded by the same 120-code-point
  * budget that bounds every captured preview — and, whenever that preview is not
  * the whole statement, the untouched statement travels with it as the cell's
- * tooltip, whose bubble is in the document whether it is shown or not. Nothing
+ * tooltip, whose bubble is in the document whether it is shown or not and whose
+ * trigger — the preview — takes keyboard focus, so the full text opens without
+ * a pointer. A preview that already is the whole statement has nothing to
+ * disclose, so it carries neither a tooltip nor a focus stop. Nothing
  * re-formats, re-cases, highlights or completes a placeholder, here or anywhere
  * below.
  *
@@ -675,12 +690,18 @@ function renderStatementCell(
   // tooltip below takes a child whose props carry `aria-describedby`, which it
   // clones the description onto, and a widened element type does not satisfy
   // that. Both primitives accept the attribute; the element type says so.
+  //
+  // An abbreviated preview is a focus stop because its tooltip is the only
+  // place the whole statement appears in a collapsed row, and focus is how a
+  // keyboard reader opens one. It stays a plain `<code>` — no role, no handler,
+  // no name — so the preview is what is read and the bubble describes it. A
+  // preview that is the whole statement has no tooltip, and so no stop.
   const statement = unknown ? (
     <Text size="sm" tone="muted">
       {group.statement}
     </Text>
   ) : (
-    <Code size="sm" wrap className={STATEMENT_CLASS}>
+    <Code size="sm" wrap className={STATEMENT_CLASS} tabIndex={abbreviated ? 0 : undefined}>
       {preview}
     </Code>
   );
@@ -756,7 +777,8 @@ function renderExecutionsCell(group: QueryGroup): ReactNode {
  *
  * A count, never a hint that the rows themselves exist anywhere in this
  * product: nothing about a result is captured beyond its size (AAP 0.5.2),
- * which the cell's tooltip states in as many words.
+ * which the cell's tooltip states in as many words. The figure takes keyboard
+ * focus so that note is reachable without a pointer.
  *
  * @param group The row.
  * @returns The cell's content.
@@ -764,7 +786,10 @@ function renderExecutionsCell(group: QueryGroup): ReactNode {
 function renderRowCountCell(group: QueryGroup): ReactNode {
   return (
     <Tooltip content={ROW_COUNT_TOOLTIP}>
-      <Code size="sm" numeric className={ROWS_CLASS}>
+      {/* Focusable on purpose: focus is how a keyboard reader opens the
+          tooltip. The figure is read and the bubble describes it, so the
+          `<code>` gains no role, handler or name of its own. */}
+      <Code size="sm" numeric className={ROWS_CLASS} tabIndex={0}>
         {countOrUnavailable(group.totalRowCount)}
       </Code>
     </Tooltip>
@@ -785,7 +810,8 @@ function renderRowCountCell(group: QueryGroup): ReactNode {
  *
  * The chip carries the caller's span name and, beside it, that caller's share of
  * the group's executions; the count's meaning is in its tooltip, because a bare
- * number next to a location is ambiguous.
+ * number next to a location is ambiguous, and the count takes keyboard focus so
+ * that meaning is reachable without a pointer.
  *
  * @param group The row.
  * @returns The cell's content.
@@ -829,7 +855,11 @@ function renderCaller(caller: QueryCaller): ReactElement {
         <SourceLink location={source} label={caller.name} />
       )}
       <Tooltip content={CALLER_COUNT_TOOLTIP}>
-        <Badge tone="neutral" variant="soft">
+        {/* Focusable on purpose, and still a label rather than a control: no
+            role, handler or name, so the source chip, where there is one,
+            stays the only thing here that acts, and the bubble describes the
+            figure that is read. */}
+        <Badge tone="neutral" variant="soft" tabIndex={0}>
           {formatCount(caller.executionCount)}
         </Badge>
       </Tooltip>
@@ -895,7 +925,9 @@ function renderOccurrenceRow(
         className={DURATION_CLASS}
       />
       <Tooltip content={ROW_COUNT_TOOLTIP}>
-        <Code size="sm" numeric className={ROWS_CLASS}>
+        {/* Focusable on purpose, as in the row-count column: focus is how a
+            keyboard reader opens the privacy note that explains this figure. */}
+        <Code size="sm" numeric className={ROWS_CLASS} tabIndex={0}>
           {countOrUnavailable(occurrence.rowCount)}
         </Code>
       </Tooltip>

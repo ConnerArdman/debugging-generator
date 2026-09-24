@@ -99,6 +99,7 @@ import {
   chownSync,
   constants,
   existsSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -127,10 +128,13 @@ import {
   atomicReplaceFileIfUnchanged,
   createFileExclusive,
   ensureSecureDir,
+  inspectPrivateFileNoFollow,
+  isSameFileIdentity,
   pinFileWithinRoot,
   readFileNoFollow,
   readFileSnapshotNoFollow,
   writeSecureFileAtomic,
+  type PrivateFileState,
 } from './safe-fs.js';
 
 /*
@@ -2712,4 +2716,274 @@ describe('a project-internal symbolic link whose target is outside the root', ()
       expect(entriesIn(externalDir)).toEqual([externalEntry]);
     },
   );
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * inspectPrivateFileNoFollow
+ * ---------------------------------------------------------------------------
+ *
+ * The `lstat`-only inspector for a state file another writer opens by path:
+ * the session store, whose `node:sqlite` connection follows a link at the
+ * final component and whose POSIX locks a verifying open/close in the same
+ * process would silently release. Every refusal below is a policy error, and
+ * every one leaves the entry — and anything it points at — exactly as the
+ * fixture made it, because the inspector never opens, writes or tightens.
+ */
+
+/**
+ * Whether this process can give a file a second hard link.
+ *
+ * Probed once, in a directory of its own, for the reason symbolic links are:
+ * a filesystem without hard links (FAT, some network mounts) would turn the
+ * multiply-linked fixture into a setup failure that reads as a defect in the
+ * module. The link count is what confirms the call did what it claimed.
+ */
+const CAN_CREATE_HARD_LINKS = ((): boolean => {
+  const probeRoot = mkdtempSync(join(tmpdir(), 'debuggen-safefs-probe-'));
+  try {
+    const original = join(probeRoot, 'original');
+    writeFileSync(original, '');
+    linkSync(original, join(probeRoot, 'second'));
+    return lstatSync(original).nlink === 2;
+  } catch {
+    // Any failure is the answer: no second link could be made here.
+    return false;
+  } finally {
+    rmSync(probeRoot, { recursive: true, force: true });
+  }
+})();
+
+/** The state {@link inspectPrivateFileNoFollow} reports for a file that must exist. */
+function inspectedState(pathAbs: string): PrivateFileState {
+  const state = inspectPrivateFileNoFollow(pathAbs);
+  if (state === undefined) {
+    return expect.unreachable(`expected an entry at '${pathAbs}', and the inspector found none`);
+  }
+  return state;
+}
+
+describe('inspectPrivateFileNoFollow', () => {
+  it('returns undefined when nothing is at the path', () => {
+    expect(inspectPrivateFileNoFollow(join(sandbox, 'absent.sqlite'))).toBeUndefined();
+  });
+
+  it('lets an errno other than ENOENT through untouched', () => {
+    // A parent that is a file is not "absent": answering `undefined` would let a
+    // caller go on to create something that can never exist there.
+    const file = makeFile(join(sandbox, 'plain.txt'), 'one line\n');
+
+    const code = runtimeErrnoFrom(() => {
+      inspectPrivateFileNoFollow(join(file, 'sessions.sqlite'));
+    });
+
+    expect(code).toBe('ENOTDIR');
+  });
+
+  it('reports the identity a no-follow read of the same file reports', () => {
+    const target = makeFile(join(sandbox, 'sessions.sqlite'), NON_UTF8_BYTES);
+
+    const state = inspectedState(target);
+    const snapshot = readFileSnapshotNoFollow(target);
+
+    // `bigint`, for the reason `FileIdentity` states: a rounded inode number is
+    // the direction of failure that makes a swapped file compare equal.
+    expect(typeof state.identity.dev).toBe('bigint');
+    expect(typeof state.identity.ino).toBe('bigint');
+    expect(state.identity).toEqual(snapshot.identity);
+    expectFileBytes(target, NON_UTF8_BYTES);
+  });
+
+  it.skipIf(NO_POSIX_IDS)(
+    'reports the permission bits without judging them (POSIX permission bits)',
+    () => {
+      // A mode is the one property a caller can repair, so a loose one is
+      // reported for the caller to tighten rather than refused here.
+      const target = makeFile(join(sandbox, 'sessions.sqlite'), 'x', SECURE_FILE_MODE);
+      expect(inspectedState(target).mode).toBe(SECURE_FILE_MODE);
+
+      chmodSync(target, PROJECT_FILE_MODE);
+      expect(inspectedState(target).mode).toBe(PROJECT_FILE_MODE);
+      expect(permissionsOf(target)).toBe(PROJECT_FILE_MODE);
+    },
+  );
+
+  it('opens no descriptor on the file it inspects', async () => {
+    // The property the session store depends on: closing any descriptor this
+    // process holds on the database inode drops the connection's POSIX locks.
+    // Every `openSync` the module makes is recorded, and none may happen.
+    const target = makeFile(join(sandbox, 'sessions.sqlite'), 'x');
+    const expected = lstatSync(target, { bigint: true });
+    const opened: string[] = [];
+
+    await withInjectedFs(
+      (real) => ({
+        openSync: (...args: Parameters<typeof real.openSync>): number => {
+          opened.push(String(args[0]));
+          return real.openSync(...args);
+        },
+      }),
+      (injected) => {
+        const state = injected.inspectPrivateFileNoFollow(target);
+        expect(state?.identity).toEqual({ dev: expected.dev, ino: expected.ino });
+      },
+    );
+
+    expect(opened).toEqual([]);
+  });
+
+  it.skipIf(!CAN_CREATE_SYMLINKS)(
+    'refuses a symbolic link to a real file, and leaves the file it points at untouched (requires symlink creation)',
+    () => {
+      const victim = makeFile(join(sandbox, 'victim.txt'), 'another file\n');
+      const target = join(sandbox, 'sessions.sqlite');
+      symlinkSync(victim, target);
+
+      const error = unsafePathErrorFrom(() => {
+        inspectPrivateFileNoFollow(target);
+      });
+
+      expect(error.details?.path).toBe(target);
+      expect(error.details?.reason).toBe('symlink-component');
+      expect(lstatSync(target).isSymbolicLink()).toBe(true);
+      expectFileBytes(victim, 'another file\n');
+    },
+  );
+
+  it.skipIf(!CAN_CREATE_SYMLINKS)(
+    'refuses a dangling symbolic link, and creates nothing at its target (requires symlink creation)',
+    () => {
+      const planted = join(sandbox, 'planted.sqlite');
+      const target = join(sandbox, 'sessions.sqlite');
+      symlinkSync(planted, target);
+
+      const error = unsafePathErrorFrom(() => {
+        inspectPrivateFileNoFollow(target);
+      });
+
+      expect(error.details?.path).toBe(target);
+      expect(error.details?.reason).toBe('symlink-component');
+      expect(existsSync(planted)).toBe(false);
+      expect(lstatSync(target).isSymbolicLink()).toBe(true);
+    },
+  );
+
+  it.skipIf(!CAN_CREATE_SYMLINKS)(
+    'reports a link to a directory as a link rather than as a non-regular file (requires symlink creation)',
+    () => {
+      // The link test runs first, so the diagnosis names what the developer has
+      // to remove rather than what it happens to point at.
+      const elsewhere = makeDir(join(sandbox, 'elsewhere'), PROJECT_DIR_MODE);
+      const target = join(sandbox, 'sessions.sqlite');
+      symlinkSync(elsewhere, target);
+
+      const error = unsafePathErrorFrom(() => {
+        inspectPrivateFileNoFollow(target);
+      });
+
+      expect(error.details?.reason).toBe('symlink-component');
+      expect(entriesIn(elsewhere)).toEqual([]);
+    },
+  );
+
+  it('refuses a directory at the path as not a regular file', () => {
+    const target = makeDir(join(sandbox, 'sessions.sqlite'), SECURE_DIR_MODE);
+
+    const error = unsafePathErrorFrom(() => {
+      inspectPrivateFileNoFollow(target);
+    });
+
+    expect(error.details?.path).toBe(target);
+    expect(error.details?.reason).toBe('not-a-regular-file');
+    expect(lstatSync(target).isDirectory()).toBe(true);
+  });
+
+  it.skipIf(!CAN_CREATE_HARD_LINKS)(
+    'refuses a file with a second hard link through either name, and accepts it once the link is gone (requires hard-link creation)',
+    () => {
+      // The second name lives outside the private directory: that is the whole
+      // exposure, because both names reach one inode and one set of bytes.
+      const outside = makeDir(join(sandbox, 'outside'), PROJECT_DIR_MODE);
+      const target = makeFile(join(sandbox, 'sessions.sqlite'), 'x');
+      const second = join(outside, 'copy.sqlite');
+      linkSync(target, second);
+
+      for (const name of [target, second]) {
+        const error = unsafePathErrorFrom(() => {
+          inspectPrivateFileNoFollow(name);
+        });
+
+        expect(error.details?.path).toBe(name);
+        expect(error.details?.reason).toBe('multiply-linked');
+        expect(error.details?.links).toBe(2);
+      }
+      expect(lstatSync(target).nlink).toBe(2);
+
+      rmSync(second);
+      expect(inspectedState(target).identity.ino).toBe(lstatSync(target, { bigint: true }).ino);
+    },
+  );
+
+  it.skipIf(NO_POSIX_IDS || !CAN_ASSIGN_FOREIGN_OWNER)(
+    'refuses a file owned by another account (requires assigning a foreign owner)',
+    () => {
+      const target = makeFile(join(sandbox, 'sessions.sqlite'), 'x', SECURE_FILE_MODE);
+      const foreignUid = assignForeignOwner(target);
+
+      const error = unsafePathErrorFrom(() => {
+        inspectPrivateFileNoFollow(target);
+      });
+
+      expect(error.details?.path).toBe(target);
+      expect(error.details?.reason).toBe('foreign-owner');
+      expect(error.details?.owner).toBe(foreignUid);
+      expect(error.details?.expectedOwner).toBe(ownUid());
+      expect(error.hint).toMatch(/replace it with a copy owned by the account/);
+    },
+  );
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * isSameFileIdentity
+ * ---------------------------------------------------------------------------
+ *
+ * The comparison a caller of the inspector makes after acting on a path: the
+ * entry it tightened or handed to another writer must still be the inode it
+ * judged. Same path and same bytes are not enough — a rename replacement has
+ * both — so these cases pin the identity pair and its exactness.
+ */
+
+describe('isSameFileIdentity', () => {
+  it('is true for two observations of the same file, whichever function made them', () => {
+    const target = makeFile(join(sandbox, 'sessions.sqlite'), 'x');
+
+    const first = inspectedState(target).identity;
+    const second = inspectedState(target).identity;
+
+    expect(isSameFileIdentity(first, second)).toBe(true);
+    expect(isSameFileIdentity(first, readFileSnapshotNoFollow(target).identity)).toBe(true);
+  });
+
+  it('is false once the path has been replaced by a rename, even with identical bytes', () => {
+    const target = makeFile(join(sandbox, 'sessions.sqlite'), 'same bytes\n');
+    const before = inspectedState(target).identity;
+
+    const replacement = makeFile(join(sandbox, 'replacement.sqlite'), 'same bytes\n');
+    renameSync(replacement, target);
+    const after = inspectedState(target).identity;
+
+    expect(isSameFileIdentity(before, after)).toBe(false);
+    expectFileBytes(target, 'same bytes\n');
+  });
+
+  it('requires both the device and the inode to match, exactly beyond 2^53', () => {
+    // As doubles, 2^60 + 1 and 2^60 + 2 are the same number; as `bigint` they
+    // are not, and that difference is the one a swapped file would hide in.
+    const base = { dev: 2n ** 60n, ino: 2n ** 60n + 1n };
+
+    expect(isSameFileIdentity(base, { dev: base.dev, ino: base.ino })).toBe(true);
+    expect(isSameFileIdentity(base, { dev: base.dev + 1n, ino: base.ino })).toBe(false);
+    expect(isSameFileIdentity(base, { dev: base.dev, ino: base.ino + 1n })).toBe(false);
+  });
 });

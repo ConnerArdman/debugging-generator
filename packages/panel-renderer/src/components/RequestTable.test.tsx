@@ -84,18 +84,22 @@
  * @see ../host/useQuery for the loading/empty/error machine they drive.
  */
 
-import { DATA_QUERY_DEFAULT_LIMIT, DATA_QUERY_DEFAULT_OFFSET } from '@debuggen/panel-schema';
+import {
+  DATA_QUERY_DEFAULT_LIMIT,
+  DATA_QUERY_DEFAULT_OFFSET,
+  catalogEntryFor,
+} from '@debuggen/panel-schema';
 import type { DataQuery, DataQuerySort, RequestTableNode } from '@debuggen/panel-schema';
 import { DebuggenError } from '@debuggen/shared';
 import type { SourceLocation } from '@debuggen/shared';
 import type { DuplicateWindow, RequestGroup, RequestOccurrence } from '@debuggen/telemetry';
-import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import type { RenderResult } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Mock } from 'vitest';
 
-import { DataProviderContext, createDataProvider } from '../host/DataProvider';
+import { DataProviderContext, PanelSessionContext, createDataProvider } from '../host/DataProvider';
 import type { DataProvider, DataQueryResolver, DataQueryResponse } from '../host/DataProvider';
 import { PanelActionsContext } from '../host/PanelActions';
 import type { PanelActions, PanelEventRef } from '../host/PanelActions';
@@ -105,6 +109,7 @@ import {
   formatCount,
   formatDuration,
   formatOffset,
+  formatStatusLabel,
   humanizeLabel,
 } from '../utils/format';
 import { RequestTable } from './RequestTable';
@@ -633,6 +638,13 @@ function makeActions(): ActionSpies {
 }
 
 /**
+ * The session the rendered view's queries are addressed to, provided the way
+ * `PanelHost` provides a specification's `sessionId`. Nothing below asserts on
+ * it: the routing contract is pinned by `../host/PanelHost.test.tsx`.
+ */
+const PANEL_SESSION_ID = 'session-under-test';
+
+/**
  * Renders the component inside both host contexts.
  *
  * Returns the render result so a case that needs a second, independent mount —
@@ -650,9 +662,11 @@ function renderComponent(
 ): RenderResult {
   return render(
     <DataProviderContext.Provider value={context.provider}>
-      <PanelActionsContext.Provider value={context.actions}>
-        <RequestTable node={node} />
-      </PanelActionsContext.Provider>
+      <PanelSessionContext.Provider value={PANEL_SESSION_ID}>
+        <PanelActionsContext.Provider value={context.actions}>
+          <RequestTable node={node} />
+        </PanelActionsContext.Provider>
+      </PanelSessionContext.Provider>
     </DataProviderContext.Provider>,
   );
 }
@@ -2047,5 +2061,627 @@ describe('RequestTable local duplicates filter', () => {
     expect(await screen.findByText(/none of the groups loaded so far/i)).toBeDefined();
     expect(screen.queryByText(/no network requests were captured/i)).toBeNull();
     expect(dataRows()).toHaveLength(0);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Pending requests
+ *
+ * A request the producer saw start and not settle before the capture ended is
+ * an in-flight snapshot: `pending: true` on the occurrence, `pendingCount` on
+ * its group. The fixtures below are built by spreading those fields over the
+ * shared builders, never by recomputing them, and the cases pin the one
+ * distinction the component must keep: an absent status code is NOT pending
+ * unless the producer said so.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The visible word of the Pending badge. */
+const PENDING_TEXT = 'Pending';
+
+/**
+ * A copy of an occurrence with no status code at all.
+ *
+ * Needed because {@link makeOccurrence} applies its default code when handed
+ * `undefined` for it, so the builder alone cannot describe a request that
+ * settled — or had not settled — without one. The key is removed rather than
+ * set to `undefined`, as `exactOptionalPropertyTypes` requires of an absent
+ * optional field.
+ *
+ * @param occurrence The occurrence to copy.
+ * @returns The same occurrence without `statusCode`.
+ */
+function withoutStatusCode(occurrence: RequestOccurrence): RequestOccurrence {
+  const copy: { -readonly [Key in keyof RequestOccurrence]: RequestOccurrence[Key] } = {
+    ...occurrence,
+  };
+
+  delete copy.statusCode;
+
+  return copy;
+}
+
+/**
+ * One in-flight occurrence, as the contract describes it: no status code, span
+ * status `unset`, and the producer's flag.
+ *
+ * @param ordinal Identity ordinal, for distinct event and span ids.
+ * @param startOffsetMs Start relative to {@link BASE_START_MS}.
+ * @param durationMs Elapsed time until the capture ended.
+ * @returns A fresh pending occurrence.
+ */
+function pendingOccurrence(
+  ordinal: number,
+  startOffsetMs: number,
+  durationMs: number,
+): RequestOccurrence {
+  return {
+    ...withoutStatusCode(
+      makeOccurrence({
+        eventId: eventIdFor(ordinal),
+        spanId: spanIdFor(ordinal),
+        startTime: BASE_START_MS + startOffsetMs,
+        durationMs,
+        status: 'unset',
+      }),
+    ),
+    pending: true,
+  };
+}
+
+/**
+ * A group carrying the producer's pending count.
+ *
+ * @param overrides Fields of the shared builder to replace.
+ * @param pendingCount The count of occurrences still in flight.
+ * @returns A fresh group.
+ */
+function pendingGroup(overrides: GroupOverrides, pendingCount: number): RequestGroup {
+  return { ...makeRequestGroup(overrides), pendingCount };
+}
+
+/**
+ * Render one group and return its only data row.
+ *
+ * @param group The group to resolve.
+ * @returns The row the grid drew for it.
+ */
+async function renderSoleGroup(group: RequestGroup): Promise<HTMLElement> {
+  const stub = resolvingProvider([group]);
+
+  renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+  await screen.findByRole('grid');
+
+  const [row] = dataRows();
+
+  if (row === undefined) {
+    throw new Error('the grid rendered no data row');
+  }
+
+  return row;
+}
+
+/**
+ * Assert an element is the Pending badge: the base status chip with the info
+ * tone, the outline fill and a decorative icon, and no class of its own.
+ *
+ * @param badge The element found by its visible text.
+ */
+function expectPendingBadge(badge: HTMLElement): void {
+  expect(badge.classList.contains('dg-badge')).toBe(true);
+  expect(badge.classList.contains('dg-badge--info')).toBe(true);
+  expect(badge.classList.contains('dg-badge--outline')).toBe(true);
+  expect(badge.classList.contains('dg-request-table__status')).toBe(true);
+  expect(badge.querySelector('.dg-badge__icon svg')).not.toBeNull();
+  expect(badge.querySelector('.dg-badge__icon')?.getAttribute('aria-hidden')).toBe('true');
+
+  // The modifier is the Badge's own token-backed classes: nothing this file
+  // emits names the pending state, so the stylesheet needs no new rule.
+  for (const name of Array.from(badge.classList)) {
+    expect(name).not.toMatch(/pending/i);
+  }
+}
+
+describe('RequestTable pending requests', () => {
+  it('badges a group whose every occurrence was in flight, with no unavailable code', async () => {
+    const group = pendingGroup(
+      {
+        id: 'request-group-example-0081',
+        requestKey: 'request-key-example-0081',
+        count: 2,
+        statusCodes: [],
+        occurrences: [pendingOccurrence(21, 0, 310), pendingOccurrence(22, 12, 298)],
+      },
+      2,
+    );
+    const row = await renderSoleGroup(group);
+    const cell = cellsOf(row).status;
+
+    // The word is visible, with the count because the group holds more than one
+    // occurrence.
+    expectPendingBadge(within(cell).getByText(`${PENDING_TEXT} ${formatCount(2)}`));
+
+    // Every occurrence is pending, so the missing codes are fully explained and
+    // the unavailable label would claim a settled occurrence that never existed.
+    expect(within(cell).queryByText(NOT_AVAILABLE_LABEL)).toBeNull();
+
+    const description = tooltipTexts(cell).join(' ');
+    expect(description).toContain(
+      `Still in flight when the capture ended: ${formatCount(2)} of ${formatCount(2)} occurrences.`,
+    );
+    expect(description).toContain('no status code');
+    expect(description).toContain('lower bound');
+    expect(description).not.toContain('settled occurrences only');
+    expect(cell.querySelector('[class*="pending"]')).toBeNull();
+  });
+
+  it('says Pending without a count for a single in-flight request', async () => {
+    const group = pendingGroup(
+      {
+        id: 'request-group-example-0082',
+        requestKey: 'request-key-example-0082',
+        count: 1,
+        statusCodes: [],
+        occurrences: [pendingOccurrence(23, 0, 540)],
+      },
+      1,
+    );
+    const row = await renderSoleGroup(group);
+    const cell = cellsOf(row).status;
+
+    expectPendingBadge(within(cell).getByText(PENDING_TEXT));
+    expect(within(cell).queryByText(NOT_AVAILABLE_LABEL)).toBeNull();
+
+    const description = tooltipTexts(cell).join(' ');
+    expect(description).toContain('This request was still in flight when the capture ended.');
+    expect(description).toContain('no status code');
+    expect(description).toContain('lower bound');
+  });
+
+  it('shows the settled codes beside the pending count on a mixed group', async () => {
+    const group = pendingGroup(
+      {
+        id: 'request-group-example-0083',
+        requestKey: 'request-key-example-0083',
+        count: 4,
+        statusCodes: [200],
+      },
+      1,
+    );
+    const row = await renderSoleGroup(group);
+    const cell = cellsOf(row).status;
+
+    expect(within(cell).getByText('200').classList.contains('dg-request-table__status--ok')).toBe(
+      true,
+    );
+    expectPendingBadge(within(cell).getByText(`${PENDING_TEXT} ${formatCount(1)}`));
+    expect(within(cell).queryByText(NOT_AVAILABLE_LABEL)).toBeNull();
+
+    // The codes shown describe the settled occurrences only, and the tooltip
+    // says so rather than letting one code stand for all four.
+    const description = tooltipTexts(cell).join(' ');
+    expect(description).toContain(`${formatCount(1)} of ${formatCount(4)} occurrences`);
+    expect(description).toContain('settled occurrences only');
+  });
+
+  it('keeps the unavailable label beside Pending when settled occurrences had no code', async () => {
+    const group = pendingGroup(
+      {
+        id: 'request-group-example-0084',
+        requestKey: 'request-key-example-0084',
+        count: 3,
+        statusCodes: [],
+      },
+      1,
+    );
+    const row = await renderSoleGroup(group);
+    const cell = cellsOf(row).status;
+
+    // Both things were observed: two settled occurrences without a code, and one
+    // that had not settled.
+    expect(within(cell).getByText(NOT_AVAILABLE_LABEL).classList.contains('dg-badge')).toBe(true);
+    expectPendingBadge(within(cell).getByText(`${PENDING_TEXT} ${formatCount(1)}`));
+  });
+
+  it('never reads a missing status code as pending when the producer reported none', async () => {
+    const withoutCodes = makeRequestGroup({
+      id: 'request-group-example-0085',
+      requestKey: 'request-key-example-0085',
+      count: 2,
+      statusCodes: [],
+      occurrences: [
+        withoutStatusCode(makeOccurrence({ eventId: eventIdFor(24), status: 'unset' })),
+      ],
+    });
+    const row = await renderSoleGroup(withoutCodes);
+    const cell = cellsOf(row).status;
+
+    expect(within(cell).getByText(NOT_AVAILABLE_LABEL)).toBeDefined();
+    expect(within(cell).queryByText(new RegExp(`^${PENDING_TEXT}`))).toBeNull();
+    expect(tooltipTexts(row).join(' ')).not.toMatch(/in flight/i);
+  });
+
+  it('marks an in-flight occurrence Pending and leaves settled ones as they were', async () => {
+    const inFlight = pendingOccurrence(31, 0, 820);
+    const settledUnreported = withoutStatusCode(
+      makeOccurrence({
+        eventId: eventIdFor(32),
+        spanId: spanIdFor(32),
+        startTime: BASE_START_MS + 10,
+        status: 'unset',
+      }),
+    );
+    const settledError = withoutStatusCode(
+      makeOccurrence({
+        eventId: eventIdFor(33),
+        spanId: spanIdFor(33),
+        startTime: BASE_START_MS + 20,
+        status: 'error',
+      }),
+    );
+    const settledOk = makeOccurrence({
+      eventId: eventIdFor(34),
+      spanId: spanIdFor(34),
+      startTime: BASE_START_MS + 30,
+      statusCode: 200,
+    });
+    const group = pendingGroup(
+      {
+        id: 'request-group-example-0086',
+        requestKey: 'request-key-example-0086',
+        count: 4,
+        statusCodes: [200],
+        errorCount: 1,
+        lastStartTime: BASE_START_MS + 30,
+        occurrences: [inFlight, settledUnreported, settledError, settledOk],
+      },
+      1,
+    );
+    const user = userEvent.setup();
+
+    // None of the three carries a code, so the distinction drawn below rests on
+    // the producer's flag alone.
+    for (const occurrence of [inFlight, settledUnreported, settledError]) {
+      expect('statusCode' in occurrence).toBe(false);
+    }
+
+    await renderSoleGroup(group);
+    await user.click(screen.getByRole('button', { name: disclosureName(group, false) }));
+
+    const [detail] = detailRows();
+
+    if (detail === undefined) {
+      throw new Error('the opened group rendered no detail row');
+    }
+
+    const occurrenceRow = (occurrence: RequestOccurrence): HTMLElement => {
+      const found = within(detail)
+        .getByRole('button', { name: occurrenceName(group, occurrence) })
+        .closest<HTMLElement>('.dg-request-table__occurrence-row');
+
+      if (found === null) {
+        throw new Error(`no occurrence row holds the control for ${occurrence.eventId}`);
+      }
+
+      return found;
+    };
+
+    // The in-flight occurrence: Pending instead of the span status it carries,
+    // its elapsed time as the duration, and a tooltip that says what both mean.
+    const pendingRow = occurrenceRow(inFlight);
+    expectPendingBadge(within(pendingRow).getByText(PENDING_TEXT));
+    expect(within(pendingRow).queryByText(formatStatusLabel('unset'))).toBeNull();
+    expect(within(pendingRow).getByText(formatDuration(inFlight.durationMs))).toBeDefined();
+
+    const note = tooltipTexts(pendingRow).join(' ');
+    expect(note).toContain('still in flight when the capture ended');
+    expect(note).toContain('time elapsed until then');
+
+    // Settled occurrences without a code keep their span status, and none of
+    // them is called pending — the same `unset` status included.
+    const unreportedRow = occurrenceRow(settledUnreported);
+    expect(within(unreportedRow).getByText(formatStatusLabel('unset'))).toBeDefined();
+    expect(within(unreportedRow).queryByText(PENDING_TEXT)).toBeNull();
+
+    const errorRow = occurrenceRow(settledError);
+    expect(within(errorRow).getByText(formatStatusLabel('error'))).toBeDefined();
+    expect(within(errorRow).queryByText(PENDING_TEXT)).toBeNull();
+
+    const okRow = occurrenceRow(settledOk);
+    expect(within(okRow).getByText('200')).toBeDefined();
+    expect(within(okRow).queryByText(PENDING_TEXT)).toBeNull();
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Keyboard access to tooltip descriptions
+ *
+ * A tooltip opens on focus, so a trigger that cannot take focus hides its
+ * description from every keyboard reader. Each trigger below must be a plain
+ * tab stop — no button role, no accessible-name override — whose focus opens
+ * the bubble its `aria-describedby` names, and whose Escape and blur close it.
+ * Focus is moved with `act(() => element.focus())` because React's `onFocus`
+ * listens for `focusin`, which a synthetic `focus` event would not deliver.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * A redacted URL longer than the row's preview budget, so the row shows it
+ * shortened and the full value only in its tooltip.
+ */
+const LONG_URL = `${RESOURCE_PATH}?${Array.from(
+  { length: 16 },
+  (_, index) => `parameter${String(index)}=?`,
+).join('&')}`;
+
+/** The in-flight occurrence of {@link DISCLOSURE_GROUP}. */
+const DISCLOSURE_PENDING_OCCURRENCE = pendingOccurrence(41, 40, 610);
+
+/**
+ * A group that exercises every tooltip trigger the component draws at once: a
+ * shortened URL, the fallback grouping, more status codes than the row shows,
+ * a failure, duplicates, no exposed size and one occurrence still in flight.
+ */
+const DISCLOSURE_GROUP = pendingGroup(
+  {
+    id: 'request-group-example-0091',
+    requestKey: undefined,
+    groupedBy: 'method-path',
+    url: LONG_URL,
+    path: RESOURCE_PATH,
+    count: 5,
+    duplicateCount: 2,
+    hasDuplicates: true,
+    duplicateWindows: [
+      makeDuplicateWindow({
+        id: 'request-group-example-0091:0',
+        endTime: BASE_START_MS + 14,
+        count: 3,
+        eventIds: [eventIdFor(42), eventIdFor(43), eventIdFor(44)],
+      }),
+    ],
+    lastStartTime: BASE_START_MS + 40,
+    statusCodes: [200, 201, 204, 304, 404],
+    errorCount: 1,
+    occurrences: [
+      makeOccurrence({ eventId: eventIdFor(42), spanId: spanIdFor(42), startTime: BASE_START_MS }),
+      DISCLOSURE_PENDING_OCCURRENCE,
+    ],
+  },
+  1,
+);
+
+/**
+ * The tooltip bubble a trigger's `aria-describedby` resolves to.
+ *
+ * @param trigger The focusable trigger.
+ * @returns The one `role="tooltip"` element among the ids it names.
+ */
+function describingTooltip(trigger: HTMLElement): HTMLElement {
+  const ids = (trigger.getAttribute('aria-describedby') ?? '')
+    .split(/\s+/)
+    .filter((id) => id.length > 0);
+  const bubbles = ids
+    .map((id) => document.getElementById(id))
+    .filter((element): element is HTMLElement => element?.getAttribute('role') === 'tooltip');
+
+  expect(bubbles).toHaveLength(1);
+
+  const [bubble] = bubbles;
+
+  if (bubble === undefined) {
+    throw new Error('the trigger is described by no tooltip');
+  }
+
+  return bubble;
+}
+
+/** Whether a tooltip bubble is currently shown. */
+function isShown(bubble: HTMLElement): boolean {
+  return bubble.classList.contains('dg-is-open');
+}
+
+/**
+ * Assert the whole keyboard contract of one tooltip trigger.
+ *
+ * @param trigger The element carrying the tooltip.
+ * @param expected Text the description must contain.
+ */
+function expectKeyboardDisclosure(trigger: HTMLElement, expected: string): void {
+  // A plain tab stop: in the sequential order, and nothing more.
+  expect(trigger.tabIndex).toBe(0);
+  expect(trigger.getAttribute('tabindex')).toBe('0');
+  expect(trigger.hasAttribute('role')).toBe(false);
+  expect(trigger.hasAttribute('aria-label')).toBe(false);
+
+  const bubble = describingTooltip(trigger);
+  expect(bubble.textContent).toContain(expected);
+  expect(isShown(bubble)).toBe(false);
+
+  // Focus opens the description at once.
+  act(() => {
+    trigger.focus();
+  });
+  expect(document.activeElement).toBe(trigger);
+  expect(isShown(bubble)).toBe(true);
+
+  // Escape dismisses it without moving focus.
+  fireEvent.keyDown(trigger, { key: 'Escape' });
+  expect(isShown(bubble)).toBe(false);
+  expect(document.activeElement).toBe(trigger);
+
+  // Leaving and returning opens it again, and blur closes it.
+  act(() => {
+    trigger.blur();
+  });
+  act(() => {
+    trigger.focus();
+  });
+  expect(isShown(bubble)).toBe(true);
+  act(() => {
+    trigger.blur();
+  });
+  expect(isShown(bubble)).toBe(false);
+}
+
+/** One group-level tooltip trigger: how to find it and what it must describe. */
+interface TriggerCase {
+  /** The trigger, for the case title. */
+  readonly name: string;
+
+  /** Find the trigger inside the group's row. */
+  readonly find: (row: HTMLElement) => HTMLElement;
+
+  /** Text the description must contain. */
+  readonly expected: string;
+}
+
+/** The rendered URL element of a row, read off its row header. */
+function urlElementOf(row: HTMLElement): HTMLElement {
+  const url = within(row)
+    .getByRole('rowheader')
+    .querySelector<HTMLElement>('.dg-request-table__url');
+
+  if (url === null) {
+    throw new Error('the row header rendered no URL');
+  }
+
+  return url;
+}
+
+const GROUP_TRIGGERS: readonly TriggerCase[] = [
+  {
+    name: 'status overflow badge',
+    find: (row) => within(cellsOf(row).status).getByText(`+${formatCount(2)}`),
+    expected: 'All status codes observed: 200, 201, 204, 304, 404.',
+  },
+  {
+    name: 'failure count badge',
+    find: (row) => within(cellsOf(row).status).getByText(formatCount(1)),
+    expected: `Occurrences that failed: ${formatCount(1)} of ${formatCount(5)}.`,
+  },
+  {
+    name: 'group Pending badge',
+    find: (row) => within(cellsOf(row).status).getByText(`${PENDING_TEXT} ${formatCount(1)}`),
+    expected: `Still in flight when the capture ended: ${formatCount(1)} of ${formatCount(5)}`,
+  },
+  {
+    name: 'duplicate badge',
+    find: (row) => within(cellsOf(row).duplicates).getByText(formatCount(2)),
+    expected: `Redundant occurrences: ${formatCount(2)} of ${formatCount(5)}.`,
+  },
+  {
+    name: 'unavailable transfer size',
+    find: (row) => within(cellsOf(row).transferred).getByText(NOT_AVAILABLE_LABEL),
+    expected: 'No transfer size was exposed',
+  },
+  {
+    name: 'shortened URL',
+    find: urlElementOf,
+    expected: LONG_URL,
+  },
+  {
+    name: 'grouping badge',
+    find: (row) =>
+      within(within(row).getByRole('rowheader')).getByText(FALLBACK_GROUPING_BADGE_TEXT),
+    expected: 'no request key was available',
+  },
+];
+
+describe('RequestTable keyboard access to tooltip descriptions', () => {
+  it.each(GROUP_TRIGGERS)(
+    'makes the $name a tab stop whose focus opens its description',
+    async ({ find, expected }) => {
+      const row = await renderSoleGroup(DISCLOSURE_GROUP);
+
+      expectKeyboardDisclosure(find(row), expected);
+    },
+  );
+
+  it('discloses the full URL, and only the full URL, behind the shortened one', async () => {
+    const row = await renderSoleGroup(DISCLOSURE_GROUP);
+    const url = urlElementOf(row);
+
+    expect(url.textContent).not.toBe(LONG_URL);
+    expect(describingTooltip(url).textContent).toBe(LONG_URL);
+  });
+
+  it('makes the occurrence Pending badge a tab stop whose focus opens its description', async () => {
+    const user = userEvent.setup();
+
+    await renderSoleGroup(DISCLOSURE_GROUP);
+    await user.click(screen.getByRole('button', { name: disclosureName(DISCLOSURE_GROUP, false) }));
+
+    const [detail] = detailRows();
+
+    if (detail === undefined) {
+      throw new Error('the opened group rendered no detail row');
+    }
+
+    const occurrenceRow = within(detail)
+      .getByRole('button', {
+        name: occurrenceName(DISCLOSURE_GROUP, DISCLOSURE_PENDING_OCCURRENCE),
+      })
+      .closest<HTMLElement>('.dg-request-table__occurrence-row');
+
+    if (occurrenceRow === null) {
+      throw new Error('no occurrence row holds the in-flight occurrence');
+    }
+
+    expectKeyboardDisclosure(
+      within(occurrenceRow).getByText(PENDING_TEXT),
+      'still in flight when the capture ended',
+    );
+  });
+
+  it('leaves a URL shown in full out of the tab order', async () => {
+    const row = await renderSoleGroup(SINGLE_GROUP);
+    const url = urlElementOf(row);
+
+    // Nothing is shortened, so the disabled tooltip has nothing to disclose and
+    // the element adds no stop that would open nothing.
+    expect(url.textContent).toBe(SINGLE_GROUP.url);
+    expect(url.hasAttribute('tabindex')).toBe(false);
+    expect(url.tabIndex).toBe(-1);
+
+    // And were focus to arrive by any other route, the disabled tooltip still
+    // opens nothing.
+    act(() => {
+      url.focus();
+    });
+    expect(isShown(describingTooltip(url))).toBe(false);
+  });
+
+  it('keeps a focused trigger out of the grid row navigation', async () => {
+    const row = await renderSoleGroup(DISCLOSURE_GROUP);
+    const trigger = within(cellsOf(row).duplicates).getByText(formatCount(2));
+
+    act(() => {
+      trigger.focus();
+    });
+
+    // The grid reads the row index off the focused element itself, so an arrow
+    // key pressed on a descendant is not consumed and focus stays put.
+    const notCancelled = fireEvent.keyDown(trigger, { key: 'ArrowDown' });
+    expect(notCancelled).toBe(true);
+    expect(document.activeElement).toBe(trigger);
+    expect(isShown(describingTooltip(trigger))).toBe(true);
+  });
+});
+
+describe('RequestTable pending signal provenance', () => {
+  it('draws the Pending state from a field its catalog entry declares', () => {
+    // The Pending badges are projected by the aggregate from the request
+    // kinds' `inFlight` attribute. The catalog entry's `reads` is the field set
+    // this view is written against and the one semantic validation consults,
+    // so the pending signal must be part of it rather than an undeclared read.
+    const { reads, telemetryKinds } = catalogEntryFor('requestTable');
+
+    expect(telemetryKinds.length).toBeGreaterThan(0);
+    expect(reads).toContain('inFlight');
+    expect(reads).toContain('http.status_code');
   });
 });

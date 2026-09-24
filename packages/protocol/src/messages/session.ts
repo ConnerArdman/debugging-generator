@@ -167,8 +167,8 @@
 
 import { z } from 'zod';
 
-import { selectedTargetSchema } from '@debuggen/instrumentation';
-import type { SelectedTarget } from '@debuggen/instrumentation';
+import { selectedTargetSchema } from '@debuggen/instrumentation/schema';
+import type { SelectedTarget } from '@debuggen/instrumentation/schema';
 import { err, ok } from '@debuggen/shared';
 import type { DebuggenError, Result, SessionId } from '@debuggen/shared';
 

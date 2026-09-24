@@ -3,14 +3,15 @@
  * design system (AAP 0.6.1, 0.6.3).
  *
  * No third-party component library or design system is used, so this module
- * *is* the value layer: every colour, space, font, weight, radius, shadow,
- * focus ring, motion duration, easing function and stacking level that either
- * host surface renders resolves to a `--dg-*` custom property whose value
- * originates here, once. Nothing downstream may define a colour, a metric or a
- * motion constant of its own: AAP 0.6.4 permits only the literals `0`, `none`,
- * `auto`, `inherit`, `currentColor` and `transparent` in a component, so a
- * value that is missing here has no legal way to be expressed — the fix is to
- * add it here, never to inline it in a component.
+ * *is* the value layer: every colour, space, font, weight, radius, glyph and
+ * control size, shadow, focus ring, motion duration, easing function and
+ * stacking level that either host surface renders resolves to a `--dg-*`
+ * custom property whose value originates here, once. Nothing downstream may
+ * define a colour, a metric or a motion constant of its own: AAP 0.6.4 permits
+ * only the literals `0`, `none`, `auto`, `inherit`, `currentColor` and
+ * `transparent` in a component, so a value that is missing here has no legal
+ * way to be expressed — the fix is to add it here, never to inline it in a
+ * component.
  *
  * There is likewise no second namespace and no "internal constant" escape
  * hatch. A value declared beside these — under any other prefix, in any other
@@ -58,8 +59,17 @@
  * The colour values are load-bearing rather than decorative: the WCAG ratios
  * the token test pins (worst dark text pair 5.09:1, worst light text pair
  * 4.82:1, worst status-as-text 4.86:1, worst span-kind fill 3.21:1 with a
- * margin of only 0.21) were computed against these exact values. Re-picking or
- * rounding one is a product-wide accessibility regression.
+ * margin of only 0.21, worst relationship edge 4.82:1 against the 3:1 non-text
+ * bar) were computed against these exact values. Re-picking or rounding one is
+ * a product-wide accessibility regression.
+ *
+ * ## Sizes
+ *
+ * Every visual dimension a stylesheet renders is a token too — the spacing
+ * scale, the radii, and the glyph, spinner and icon-only control sizes. The
+ * last three are font-relative (`1em`-based), and the token test forbids a
+ * length literal anywhere in the authored stylesheets, so a glyph box can no
+ * more be written inline than a colour can.
  */
 
 /**
@@ -128,6 +138,18 @@ const darkTokens = {
   /** Alias of the danger colour. */
   durationCritical: 'var(--dg-danger)',
 
+  // --- Relationship edges ---------------------------------------------------
+  // The stroke of a connector drawn between two plotted items — a
+  // dependency-graph relationship, a timeline parent-to-child edge. Such a line
+  // is an essential non-text graphic, so it is held to the 3:1 non-text bar on
+  // every surface, which neither border colour reaches. It is an alias rather
+  // than a colour of its own: a connector reads in the same muted tone as the
+  // count label printed on it, and it stays in step with that tone in every
+  // theme by construction. Because it is not a border, the high-contrast set
+  // carries the dark value, as it does for every other non-border colour.
+  /** Alias of the muted text colour. */
+  graphEdge: 'var(--dg-text-muted)',
+
   // --- Spacing --------------------------------------------------------------
   // A dense scale: these surfaces show dense, data-heavy views.
   space0: '2px',
@@ -177,6 +199,26 @@ const darkTokens = {
   radiusSm: '2px',
   radiusMd: '4px',
   radiusLg: '6px',
+
+  // --- Glyph and control sizes ----------------------------------------------
+  // Font-relative on purpose: a glyph, a spinner and an icon-only control scale
+  // with the type role of the context they sit in, which is what keeps a small
+  // button's glyph small and a heading's glyph large without a size per role.
+  // A custom property holds its value as written, so `1em` resolves against
+  // the font of the element that CONSUMES the token, never against the root
+  // that declares it.
+  /** The square an icon glyph occupies. */
+  iconSize: '1em',
+  /** The inline progress spinner: the square of the glyph it stands in for. */
+  spinnerSize: 'var(--dg-icon-size)',
+  /**
+   * The inline size of an icon-only button: its glyph, the icon-only inline
+   * padding on either side (`space1`) and its two `thin` hairline borders,
+   * which together add the scale's smallest step (`space0`). This is the box
+   * `.dg-button--icon-only` renders, stated once so an element that reserves
+   * that control's room tracks it through any token change.
+   */
+  iconButtonSize: 'calc(var(--dg-icon-size) + var(--dg-space-1) * 2 + var(--dg-space-0))',
 
   // --- Elevation ------------------------------------------------------------
   shadow0: 'none',
@@ -276,6 +318,9 @@ const lightTokens: TokenValues = {
   durationSlow: 'var(--dg-warning)',
   durationCritical: 'var(--dg-danger)',
 
+  // --- Relationship edges ---------------------------------------------------
+  graphEdge: 'var(--dg-text-muted)',
+
   // --- Spacing --------------------------------------------------------------
   space0: '2px',
   space1: '4px',
@@ -302,6 +347,11 @@ const lightTokens: TokenValues = {
   radiusSm: '2px',
   radiusMd: '4px',
   radiusLg: '6px',
+
+  // --- Glyph and control sizes ----------------------------------------------
+  iconSize: '1em',
+  spinnerSize: 'var(--dg-icon-size)',
+  iconButtonSize: 'calc(var(--dg-icon-size) + var(--dg-space-1) * 2 + var(--dg-space-0))',
 
   // --- Elevation ------------------------------------------------------------
   // Same geometry as dark, tinted for a light background.
@@ -376,6 +426,11 @@ const highContrastTokens: TokenValues = {
   durationSlow: 'var(--dg-warning)',
   durationCritical: 'var(--dg-danger)',
 
+  // --- Relationship edges (as dark) -----------------------------------------
+  // Not a border, so not raised: the edge keeps the dark set's alias, and with
+  // it the dark set's contrast on every surface.
+  graphEdge: 'var(--dg-text-muted)',
+
   // --- Spacing (as dark) ----------------------------------------------------
   space0: '2px',
   space1: '4px',
@@ -402,6 +457,11 @@ const highContrastTokens: TokenValues = {
   radiusSm: '2px',
   radiusMd: '4px',
   radiusLg: '6px',
+
+  // --- Glyph and control sizes (as dark) ------------------------------------
+  iconSize: '1em',
+  spinnerSize: 'var(--dg-icon-size)',
+  iconButtonSize: 'calc(var(--dg-icon-size) + var(--dg-space-1) * 2 + var(--dg-space-0))',
 
   // --- Elevation (delta 3: no elevation shadows) ----------------------------
   shadow0: 'none',

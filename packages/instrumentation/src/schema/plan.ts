@@ -326,6 +326,95 @@ export function isInstrumentationMode(value: unknown): value is InstrumentationM
   return typeof value === 'string' && MODE_VALUES.includes(value);
 }
 
+// ---------------------------------------------------------------------------
+// Targetless actions
+//
+// Most runtime signals are about the whole page or the whole server process
+// rather than one declaration: the fiber hook observes every commit, the fetch
+// patch sees every request, the event-timing observer sees every interaction.
+// Such an action still carries `file` and `symbol` — the field set is AAP
+// §0.2.3's and every consumer keys on it — so it names them with one explicit
+// marker instead of an invented target. A marker is a fact the feasibility gate
+// can recognise; a plausible-looking file and symbol are a claim it would have
+// to check, and a hallucinated one would otherwise pass as validated.
+// ---------------------------------------------------------------------------
+
+/**
+ * The `file` a targetless action names: the project root, spelled `'.'`.
+ *
+ * The root is the one path that is always inside the project and never an
+ * indexed source file, so it cannot be mistaken for a target, and it satisfies
+ * the path rule both schemas already apply. It is only ever meaningful together
+ * with {@link TARGETLESS_SYMBOL}: the schemas refuse either half on its own.
+ */
+export const TARGETLESS_FILE = '.';
+
+/**
+ * The `symbol` a targetless action names: `'*'`, which no language this product
+ * indexes accepts as a declaration name, so it can never collide with one.
+ */
+export const TARGETLESS_SYMBOL = '*';
+
+/**
+ * The action types that address one named declaration, and so may never be
+ * targetless.
+ *
+ * Both are installed by wrapping that declaration's body (AAP §0.5.1): a
+ * function-timing or server-span action without a file and a symbol has no
+ * declaration to wrap, and accepting one would move the failure from the plan,
+ * where a repair re-prompt can fix it, to the installer.
+ */
+export const TARGET_REQUIRED_ACTION_TYPES = [
+  'function-timing',
+  'server-span',
+] as const satisfies readonly InstrumentationActionType[];
+
+/** One member of {@link TARGET_REQUIRED_ACTION_TYPES}. */
+export type TargetRequiredActionType = (typeof TARGET_REQUIRED_ACTION_TYPES)[number];
+
+/**
+ * Widened view of {@link TARGET_REQUIRED_ACTION_TYPES} used by
+ * {@link isTargetRequiredActionType}.
+ */
+const TARGET_REQUIRED_VALUES: readonly string[] = TARGET_REQUIRED_ACTION_TYPES;
+
+/**
+ * Whether an action type addresses one named declaration and therefore needs a
+ * real target.
+ *
+ * @param type An action type.
+ * @returns `true` for a member of {@link TARGET_REQUIRED_ACTION_TYPES}.
+ */
+export function isTargetRequiredActionType(type: string): type is TargetRequiredActionType {
+  return TARGET_REQUIRED_VALUES.includes(type);
+}
+
+/**
+ * Whether an action names the targetless marker — `{ file: '.', symbol: '*' }`
+ * — rather than one file and one symbol.
+ *
+ * Exact comparison, for a *normalised* action: the internal schema requires the
+ * normal form, in which the project root is exactly {@link TARGETLESS_FILE}. The
+ * feasibility gate uses this to decide which actions have a target to check;
+ * every other action, runtime or patch, is checked against the project and the
+ * code graph.
+ *
+ * @param target Anything carrying a `file` and a `symbol`.
+ * @returns `true` when both halves of the marker are present.
+ *
+ * @example
+ * ```ts
+ * isTargetlessAction({ file: TARGETLESS_FILE, symbol: TARGETLESS_SYMBOL }); // true
+ * isTargetlessAction({ file: 'src/checkout.tsx', symbol: 'Checkout' }); // false
+ * ```
+ */
+export function isTargetlessAction(target: {
+  readonly file: string;
+  readonly symbol: string;
+}): boolean {
+  return target.file === TARGETLESS_FILE && target.symbol === TARGETLESS_SYMBOL;
+}
+
 /**
  * The version of the normalised plan shape, carried on every plan.
  *
@@ -609,6 +698,99 @@ const PATH_RULE_MESSAGE =
   'file must be a project-relative POSIX path with forward slashes: no absolute or drive-letter path, no UNC prefix, no ".." segment and no control character.';
 
 /**
+ * The targetless-marker rule, stated once because both schemas enforce it and a
+ * rendered JSON Schema cannot carry the refinement it belongs to.
+ */
+const TARGETLESS_PAIR_RULE = `a targetless action names file "${TARGETLESS_FILE}" and symbol "${TARGETLESS_SYMBOL}" together; any other action must name a project file and a symbol that file declares, never the project root or "${TARGETLESS_SYMBOL}" on its own.`;
+
+/** The rule a target-required action type is held to. */
+const TARGET_REQUIRED_RULE = `${TARGET_REQUIRED_ACTION_TYPES.join(' and ')} actions wrap one named declaration, so they must name a project file and a symbol, never the targetless marker (file "${TARGETLESS_FILE}" and symbol "${TARGETLESS_SYMBOL}").`;
+
+/** The rule a resolved targetless action is held to. */
+const TARGETLESS_RUNTIME_RULE =
+  'a targetless action is installed by a runtime hook, so its mode must be "runtime".';
+
+/**
+ * Enforces the targetless marker on a target or an action: both halves or
+ * neither, and never on a type that wraps one declaration.
+ *
+ * The file is compared in its lexical normal form, so the authoring schema's
+ * cosmetic `'./'` is recognised as the project root exactly as
+ * {@link normalizePlan} will later rewrite it — a target that normalisation
+ * would turn into a half-marker is refused here, while a repair re-prompt can
+ * still fix it, instead of failing the internal schema afterwards.
+ *
+ * An issue is reported on the field that has to change: the missing half of the
+ * pair, or `type` when the marker itself is well-formed. Zod runs an object's
+ * checks only once its fields have parsed, so every value here is already a
+ * validated string, and — as everywhere in this module — the issue never
+ * carries the value that caused it.
+ *
+ * @param payload The parse payload of a target or an action.
+ */
+function checkTargetMarker(
+  payload: z.core.ParsePayload<{
+    readonly file: string;
+    readonly symbol: string;
+    readonly type: string;
+  }>,
+): void {
+  const namesProjectRoot = lexicallyNormalizePath(payload.value.file) === TARGETLESS_FILE;
+  const namesWildcard = payload.value.symbol === TARGETLESS_SYMBOL;
+
+  if (namesProjectRoot !== namesWildcard) {
+    payload.issues.push({
+      code: 'custom',
+      path: [namesProjectRoot ? 'symbol' : 'file'],
+      message: TARGETLESS_PAIR_RULE,
+      input: undefined,
+    });
+
+    return;
+  }
+
+  if (namesProjectRoot && isTargetRequiredActionType(payload.value.type)) {
+    payload.issues.push({
+      code: 'custom',
+      path: ['type'],
+      message: TARGET_REQUIRED_RULE,
+      input: undefined,
+    });
+  }
+}
+
+/**
+ * Enforces the targetless marker on a resolved action, plus the one rule only a
+ * resolved action can break: a targetless action is installed at runtime.
+ *
+ * A patch edits one declaration's body, so a patch-mode action with no target
+ * has nothing to edit. The mode is supplied by a caller's resolver during
+ * normalisation, and a resolver is ordinary code that can be wrong — this is
+ * where that mistake is caught, before the installer sees it.
+ *
+ * @param payload The parse payload of an action.
+ */
+function checkActionTarget(
+  payload: z.core.ParsePayload<{
+    readonly file: string;
+    readonly symbol: string;
+    readonly type: string;
+    readonly mode: InstrumentationMode;
+  }>,
+): void {
+  checkTargetMarker(payload);
+
+  if (isTargetlessAction(payload.value) && payload.value.mode !== 'runtime') {
+    payload.issues.push({
+      code: 'custom',
+      path: ['mode'],
+      message: TARGETLESS_RUNTIME_RULE,
+      input: undefined,
+    });
+  }
+}
+
+/**
  * A single instrumentation target, as authored.
  *
  * `z.strictObject`, so an unrecognised key is a rejection rather than a silent
@@ -622,75 +804,84 @@ const PATH_RULE_MESSAGE =
  * The four fields are exactly AAP §0.2.3's authoring field set. There is no
  * `adapter`, no `mode` and no `id`: an author does not choose which adapter
  * installs a signal, and an identity is assigned by {@link normalizePlan}.
+ *
+ * One rule spans fields: a signal that is not about one declaration names the
+ * targetless marker — `file` {@link TARGETLESS_FILE} with `symbol`
+ * {@link TARGETLESS_SYMBOL}, both or neither — and a
+ * {@link TARGET_REQUIRED_ACTION_TYPES} member never does ({@link checkTargetMarker}).
  */
-export const instrumentationTargetInputSchema = z.strictObject({
-  /**
-   * The file the target lives in: **project-relative, POSIX separators**.
-   *
-   * Validated leniently on form and strictly on safety by
-   * {@link isAuthoredProjectRelativePath}, so `'./src/lib/thing.ts'` and
-   * `'src\\lib\\thing.ts'` are accepted as the cosmetic variants they are,
-   * while an absolute path, a drive-letter or UNC path and any `'..'` escape
-   * are refused — the repair loop can fix a path that merely looks untidy, and
-   * nothing should be able to fix its way out of the project.
-   *
-   * The value is **not** rewritten here. Parsing stays byte-faithful so that a
-   * repair prompt can quote the field as written; {@link normalizePlan} is what
-   * turns it into the normal form the internal schema requires.
-   *
-   * A runtime-mode signal is not always about one file — a page-wide
-   * performance hook is not — and the field is still required, so an adapter
-   * that has no more specific answer names the project root (`'.'`), which the
-   * path rule accepts.
-   */
-  file: z.string().min(1).max(MAX_FILE_LENGTH).refine(isAuthoredProjectRelativePath, {
-    error: PATH_RULE_MESSAGE,
-  }),
+export const instrumentationTargetInputSchema = z
+  .strictObject({
+    /**
+     * The file the target lives in: **project-relative, POSIX separators**.
+     *
+     * Validated leniently on form and strictly on safety by
+     * {@link isAuthoredProjectRelativePath}, so `'./src/lib/thing.ts'` and
+     * `'src\\lib\\thing.ts'` are accepted as the cosmetic variants they are,
+     * while an absolute path, a drive-letter or UNC path and any `'..'` escape
+     * are refused — the repair loop can fix a path that merely looks untidy, and
+     * nothing should be able to fix its way out of the project.
+     *
+     * The value is **not** rewritten here. Parsing stays byte-faithful so that a
+     * repair prompt can quote the field as written; {@link normalizePlan} is what
+     * turns it into the normal form the internal schema requires.
+     *
+     * A runtime signal that is not about one declaration — the page-wide render
+     * hook, the fetch patch, the interaction observer — names the **targetless
+     * marker** instead: {@link TARGETLESS_FILE} here and {@link TARGETLESS_SYMBOL}
+     * as the symbol, both together (see {@link checkTargetMarker}). Anything
+     * else is a target, and the feasibility gate checks it against the project
+     * and the code graph whatever mode it is installed in.
+     */
+    file: z.string().min(1).max(MAX_FILE_LENGTH).refine(isAuthoredProjectRelativePath, {
+      error: PATH_RULE_MESSAGE,
+    }),
 
-  /**
-   * The function, method, component or route-handler export the action applies
-   * to.
-   *
-   * A name, not a signature and not a code excerpt: the feasibility gate looks
-   * it up in the indexed code graph, and the patcher finds the declaration it
-   * names. Whitespace-only and control-character values are refused because
-   * both are guaranteed to fail that lookup later, far from the place that
-   * could have explained them.
-   */
-  symbol: z.string().min(1).max(MAX_SYMBOL_LENGTH).refine(isIdentifierText, {
-    error: 'symbol must be a single-line name with at least one non-whitespace character.',
-  }),
+    /**
+     * The function, method, component or route-handler export the action applies
+     * to.
+     *
+     * A name, not a signature and not a code excerpt: the feasibility gate looks
+     * it up in the indexed code graph, and the patcher finds the declaration it
+     * names. Whitespace-only and control-character values are refused because
+     * both are guaranteed to fail that lookup later, far from the place that
+     * could have explained them.
+     */
+    symbol: z.string().min(1).max(MAX_SYMBOL_LENGTH).refine(isIdentifierText, {
+      error: 'symbol must be a single-line name with at least one non-whitespace character.',
+    }),
 
-  /**
-   * Which kind of instrumentation this target asks for. See
-   * {@link INSTRUMENTATION_ACTION_TYPES}.
-   *
-   * This — and only this — is what decides how the action is installed. The
-   * adapter and the install mode are *derived* from it during normalisation, by
-   * asking the registry which adapter claims the type, so an author never has
-   * to know the registry's contents and a third-party adapter can claim a type
-   * without a single schema change.
-   */
-  type: instrumentationActionTypeSchema,
+    /**
+     * Which kind of instrumentation this target asks for. See
+     * {@link INSTRUMENTATION_ACTION_TYPES}.
+     *
+     * This — and only this — is what decides how the action is installed. The
+     * adapter and the install mode are *derived* from it during normalisation, by
+     * asking the registry which adapter claims the type, so an author never has
+     * to know the registry's contents and a third-party adapter can claim a type
+     * without a single schema change.
+     */
+    type: instrumentationActionTypeSchema,
 
-  /**
-   * Why this target is in the plan, in one sentence.
-   *
-   * Optional when authored and **required** after normalisation: an action a
-   * developer can see in the editor view without being told why it exists is an
-   * unexplained edit to their working tree. When an author omits it,
-   * {@link normalizePlan} fills it from the plan's objective, which is a weaker
-   * answer than a per-target reason and still better than none.
-   */
-  rationale: z
-    .string()
-    .min(1)
-    .max(MAX_RATIONALE_LENGTH)
-    .refine(isProseText, {
-      error: 'rationale must contain at least one non-whitespace character.',
-    })
-    .optional(),
-});
+    /**
+     * Why this target is in the plan, in one sentence.
+     *
+     * Optional when authored and **required** after normalisation: an action a
+     * developer can see in the editor view without being told why it exists is an
+     * unexplained edit to their working tree. When an author omits it,
+     * {@link normalizePlan} fills it from the plan's objective, which is a weaker
+     * answer than a per-target reason and still better than none.
+     */
+    rationale: z
+      .string()
+      .min(1)
+      .max(MAX_RATIONALE_LENGTH)
+      .refine(isProseText, {
+        error: 'rationale must contain at least one non-whitespace character.',
+      })
+      .optional(),
+  })
+  .check(checkTargetMarker);
 
 /**
  * A single instrumentation target as authored — the input form, before an
@@ -877,97 +1068,104 @@ export function parseInstrumentationPlanInput(value: unknown): Result<Instrument
  * actions first), a `ModificationRecord` in the store references the action
  * that produced it, and a follow-up plan version re-states the actions it keeps
  * **with their original ids** so the installer can apply only the delta.
+ *
+ * The authoring form's targetless-marker rule holds here too, with one addition
+ * only a resolved action can break: a targetless action is runtime-mode, because
+ * a patch has no declaration to edit without a target ({@link checkActionTarget}).
  */
-export const instrumentationActionSchema = z.strictObject({
-  /**
-   * The action's stable identity, as minted by `newActionId()`.
-   *
-   * Stable is the operative word: AAP §0.4.2's follow-up path builds
-   * `planVersion n + 1` as the previous plan plus additive actions, and the
-   * installer applies the delta by id. An action that survives into the next
-   * plan version therefore **keeps** its id — {@link normalizePlan} reuses it
-   * — and an action whose id changed would be installed a second time on a file
-   * the journal already records as instrumented.
-   *
-   * Validated against {@link ACTION_ID_PATTERN} rather than accepted as any
-   * non-empty string, because this value is a store key and a wire identifier;
-   * a hand-built id that does not match is a defect worth finding here rather
-   * than in a modification record.
-   */
-  id: z.string().min(1).max(MAX_ID_LENGTH).regex(ACTION_ID_PATTERN, {
-    error: 'id must be an opaque id: a three-letter prefix, "_", then 16 lowercase alphanumerics.',
-  }),
-
-  /**
-   * The file this action applies to: project-relative POSIX, and already in its
-   * own normal form.
-   *
-   * Stricter than the authoring field on purpose. See
-   * {@link isNormalizedProjectRelativePath} for why the normal form is required
-   * and not merely preferred: this string participates in the identity key two
-   * plan versions are matched on, and in the path the patcher resolves against
-   * the project root.
-   */
-  file: z
-    .string()
-    .min(1)
-    .max(MAX_FILE_LENGTH)
-    .refine(isNormalizedProjectRelativePath, {
-      error: `${PATH_RULE_MESSAGE} It must also already be normalised (no "./" or "." segments, no duplicate separators).`,
+export const instrumentationActionSchema = z
+  .strictObject({
+    /**
+     * The action's stable identity, as minted by `newActionId()`.
+     *
+     * Stable is the operative word: AAP §0.4.2's follow-up path builds
+     * `planVersion n + 1` as the previous plan plus additive actions, and the
+     * installer applies the delta by id. An action that survives into the next
+     * plan version therefore **keeps** its id — {@link normalizePlan} reuses it
+     * — and an action whose id changed would be installed a second time on a file
+     * the journal already records as instrumented.
+     *
+     * Validated against {@link ACTION_ID_PATTERN} rather than accepted as any
+     * non-empty string, because this value is a store key and a wire identifier;
+     * a hand-built id that does not match is a defect worth finding here rather
+     * than in a modification record.
+     */
+    id: z.string().min(1).max(MAX_ID_LENGTH).regex(ACTION_ID_PATTERN, {
+      error:
+        'id must be an opaque id: a three-letter prefix, "_", then 16 lowercase alphanumerics.',
     }),
 
-  /** The symbol the action applies to, carried through from the target. */
-  symbol: z.string().min(1).max(MAX_SYMBOL_LENGTH).refine(isIdentifierText, {
-    error: 'symbol must be a single-line name with at least one non-whitespace character.',
-  }),
+    /**
+     * The file this action applies to: project-relative POSIX, and already in its
+     * own normal form.
+     *
+     * Stricter than the authoring field on purpose. See
+     * {@link isNormalizedProjectRelativePath} for why the normal form is required
+     * and not merely preferred: this string participates in the identity key two
+     * plan versions are matched on, and in the path the patcher resolves against
+     * the project root.
+     */
+    file: z
+      .string()
+      .min(1)
+      .max(MAX_FILE_LENGTH)
+      .refine(isNormalizedProjectRelativePath, {
+        error: `${PATH_RULE_MESSAGE} It must also already be normalised (no "./" or "." segments, no duplicate separators).`,
+      }),
 
-  /** Which kind of instrumentation this action installs. */
-  type: instrumentationActionTypeSchema,
+    /** The symbol the action applies to, carried through from the target. */
+    symbol: z.string().min(1).max(MAX_SYMBOL_LENGTH).refine(isIdentifierText, {
+      error: 'symbol must be a single-line name with at least one non-whitespace character.',
+    }),
 
-  /**
-   * The id of the adapter that claimed this action's type.
-   *
-   * A **bounded string, not an enumeration**, and that is a design decision
-   * rather than a missing constraint: adapter identity belongs to
-   * `../registry.ts`, and AAP §0.4.2 promises that adding an adapter means
-   * implementing the interface and registering it, with no orchestrator change.
-   * An enumeration here would break that promise for any adapter registered at
-   * runtime, and would put this schema module in the position of knowing the
-   * registry's contents — which is exactly the import this folder does not
-   * make.
-   *
-   * The value is supplied by the caller's {@link PlanAdapterResolver} during
-   * normalisation, and it is what the installer looks the adapter back up by.
-   */
-  adapter: z.string().min(1).max(MAX_ADAPTER_ID_LENGTH).refine(isIdentifierText, {
-    error: 'adapter must be a single-line adapter id with at least one non-whitespace character.',
-  }),
+    /** Which kind of instrumentation this action installs. */
+    type: instrumentationActionTypeSchema,
 
-  /**
-   * How this action is installed — and, because of it, whether a developer's
-   * file is touched. See {@link INSTRUMENTATION_MODES}.
-   *
-   * Resolved from the action type by the registry, never chosen by an author:
-   * the adapter that claims a type is the thing that knows whether it can be
-   * satisfied by a runtime hook.
-   */
-  mode: instrumentationModeSchema,
+    /**
+     * The id of the adapter that claimed this action's type.
+     *
+     * A **bounded string, not an enumeration**, and that is a design decision
+     * rather than a missing constraint: adapter identity belongs to
+     * `../registry.ts`, and AAP §0.4.2 promises that adding an adapter means
+     * implementing the interface and registering it, with no orchestrator change.
+     * An enumeration here would break that promise for any adapter registered at
+     * runtime, and would put this schema module in the position of knowing the
+     * registry's contents — which is exactly the import this folder does not
+     * make.
+     *
+     * The value is supplied by the caller's {@link PlanAdapterResolver} during
+     * normalisation, and it is what the installer looks the adapter back up by.
+     */
+    adapter: z.string().min(1).max(MAX_ADAPTER_ID_LENGTH).refine(isIdentifierText, {
+      error: 'adapter must be a single-line adapter id with at least one non-whitespace character.',
+    }),
 
-  /**
-   * Why this action is in the plan. **Required** here, unlike in the authoring
-   * form.
-   *
-   * Every action is shown to the developer — in the editor's plan and
-   * modification lists, and in the panel's session summary — and an
-   * instrumentation step with no stated reason is an unexplained change to
-   * their project. Normalisation guarantees a value by falling back to the
-   * plan's objective, so this field can be required without costing the author
-   * a repair round.
-   */
-  rationale: z.string().min(1).max(MAX_RATIONALE_LENGTH).refine(isProseText, {
-    error: 'rationale must contain at least one non-whitespace character.',
-  }),
-});
+    /**
+     * How this action is installed — and, because of it, whether a developer's
+     * file is touched. See {@link INSTRUMENTATION_MODES}.
+     *
+     * Resolved from the action type by the registry, never chosen by an author:
+     * the adapter that claims a type is the thing that knows whether it can be
+     * satisfied by a runtime hook.
+     */
+    mode: instrumentationModeSchema,
+
+    /**
+     * Why this action is in the plan. **Required** here, unlike in the authoring
+     * form.
+     *
+     * Every action is shown to the developer — in the editor's plan and
+     * modification lists, and in the panel's session summary — and an
+     * instrumentation step with no stated reason is an unexplained change to
+     * their project. Normalisation guarantees a value by falling back to the
+     * plan's objective, so this field can be required without costing the author
+     * a repair round.
+     */
+    rationale: z.string().min(1).max(MAX_RATIONALE_LENGTH).refine(isProseText, {
+      error: 'rationale must contain at least one non-whitespace character.',
+    }),
+  })
+  .check(checkActionTarget);
 
 /**
  * A resolved instrumentation action.

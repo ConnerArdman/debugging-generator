@@ -32,7 +32,11 @@
  *    hashes while the file still holds the original, then the transition to
  *    `applied` once it holds the patched bytes — and they land in
  *    `InstallResult.applied`, which is exactly what lets `../installer.ts`
- *    reverse-restore a failed plan (AAP §0.4.2).
+ *    reverse-restore a failed plan (AAP §0.4.2). A target that cannot be
+ *    completed stops the install there and is reported through the fatal
+ *    channel, `InstallResult.failure`, with the record journaled for its
+ *    attempt; the real `installPlan` is then shown to leave a failed follow-up
+ *    delta's files byte-identical to what the previous plan version left.
  * 5. **The adapter restores nothing and invents nothing.** `remove` leaves
  *    every patched file patched (restoration is `../cleanup.ts`'s, chain-aware
  *    and in strict reverse order), no record in `applied` is hand-built, and
@@ -86,6 +90,7 @@
  * suite starts.
  */
 
+import { Buffer } from 'node:buffer';
 import {
   chmodSync,
   cpSync,
@@ -135,8 +140,10 @@ import type {
   ObservedServerAgent,
   UnavailableSignal,
 } from '../adapter.js';
+import { installPlan } from '../installer.js';
 import { createBackupStore } from '../patch/backup-store.js';
-import type { Patcher, PatcherOptions } from '../patch/patcher.js';
+import { createPatcher } from '../patch/patcher.js';
+import type { Patcher, PatcherOptions, PatchStageEvent } from '../patch/patcher.js';
 import { modificationRecordSchema } from '../schema/modification.js';
 import type {
   ModificationJournal,
@@ -148,9 +155,14 @@ import {
   ACTION_ID_PATTERN,
   INSTRUMENTATION_ACTION_TYPES,
   INSTRUMENTATION_MODES,
+  INSTRUMENTATION_PLAN_VERSION,
   instrumentationActionSchema,
 } from '../schema/plan.js';
-import type { InstrumentationAction, InstrumentationActionType } from '../schema/plan.js';
+import type {
+  InstrumentationAction,
+  InstrumentationActionType,
+  InstrumentationPlan,
+} from '../schema/plan.js';
 import {
   CAPTURE_SIGNALS,
   DISABLED_SERVER_AGENT_SIGNALS,
@@ -398,15 +410,32 @@ afterEach(() => {
  * store verifies that its own directory is private and owned by this account
  * before it writes a single original into it.
  *
+ * Extra files are written into the copy before it is indexed, for the one case
+ * whose ordering claim the committed corpus cannot express; they exist only in
+ * that copy, never in the committed tree.
+ *
  * @param name A short name, so two sandboxes in one case do not collide.
+ * @param extraFiles Project-relative POSIX paths mapped to contents, added to
+ * the copy only.
  * @returns The sandbox.
  */
-async function sandbox(name = 'project'): Promise<Sandbox> {
+async function sandbox(
+  name = 'project',
+  extraFiles: Readonly<Record<string, string>> = {},
+): Promise<Sandbox> {
   const root = join(caseRoot, name);
   const projectRoot = join(root, 'project');
   const debuggenHome = join(root, 'home');
 
   cpSync(FIXTURE_ROOT, projectRoot, { recursive: true });
+
+  for (const [relativePath, contents] of Object.entries(extraFiles)) {
+    const absolute = join(projectRoot, relativePath);
+
+    mkdirSync(dirname(absolute), { recursive: true });
+    writeFileSync(absolute, contents, 'utf8');
+  }
+
   mkdirSync(debuggenHome, { recursive: true, mode: 0o700 });
   chmodSync(debuggenHome, 0o700);
 
@@ -1285,6 +1314,33 @@ const CHAIN_SOURCES: Readonly<Record<string, string>> = {
     '',
   ].join('\n'),
 };
+
+/**
+ * One module added to a single sandbox copy, never to the committed corpus.
+ *
+ * The committed corpus's generator-only module is also its last file in
+ * install order, so no real target of that corpus can sort *after* a refused
+ * generator. This module supplies one — under an arbitrary identifier, like
+ * {@link CHAIN_SOURCES} — so the refusal case can prove that a target behind a
+ * failure is never attempted, and not only that the targets before it were
+ * applied.
+ */
+const TRAILING_MODULE = {
+  file: 'src/server/tern-ledger.ts',
+  symbol: 'foldTernLedger',
+  source: [
+    'export function foldTernLedger(entries: readonly number[]): number {',
+    '  let total = 0;',
+    '',
+    '  for (const entry of entries) {',
+    '    total += entry;',
+    '  }',
+    '',
+    '  return total;',
+    '}',
+    '',
+  ].join('\n'),
+} as const;
 
 /** The committed corpus, indexed once and never written to. */
 let fixture: IndexedProject;
@@ -2279,8 +2335,8 @@ describe('install with the preload attached', () => {
     expect(result.agentHooks).toBeUndefined();
   });
 
-  it('reports a target it cannot wrap as data, and applies the rest', async () => {
-    const world = await sandbox();
+  it('stops at a target it cannot wrap and reports it through the fatal channel', async () => {
+    const world = await sandbox('refusal', { [TRAILING_MODULE.file]: TRAILING_MODULE.source });
     const { context, journal } = writableContext(world, {
       readiness: preloadPresets(world.projectRoot).fresh,
     });
@@ -2291,60 +2347,173 @@ describe('install with the preload attached', () => {
     expect(generatorFile).toBeDefined();
     expect(generatorSymbol).toBeDefined();
 
-    const planned = await smallPlan(world.project);
-    const refused = handWrittenAction(generatorFile ?? '', generatorSymbol ?? '');
-    const result = await createNextJsAdapter().install([refused, ...planned], context);
-
-    // The batch stops at its first failure and the sequence continues after
-    // it, so one unsupported declaration does not cost the capture every
-    // target behind it.
-    expect(result.applied.map((record) => record.file).sort()).toEqual(
-      [...new Set(planned.map((action) => action.file))].sort(),
+    // Install order is file, then declaration line. Every planned target of
+    // the committed corpus sorts before its generator-only module, and the
+    // trailing module added to this copy sorts after it — asserted rather than
+    // assumed, so a corpus that moved either could not make the "never
+    // attempted" half of this case vacuous.
+    const before = (await smallPlan(world.project)).filter(
+      (action) => action.file < (generatorFile ?? ''),
     );
-    expect(result.unavailable).toHaveLength(1);
+    const refused = handWrittenAction(generatorFile ?? '', generatorSymbol ?? '');
+    const after = handWrittenAction(TRAILING_MODULE.file, TRAILING_MODULE.symbol);
 
-    for (const gap of result.unavailable) {
-      expectGapShape(gap);
-      // The signal that is lost is the span the wrapper would have emitted,
-      // never the runtime spans the preload still produces on its own.
-      expect(gap.signal).toBe('functions');
-      expect(gap.reason).toContain(generatorSymbol ?? '');
-      expect(gap.reason).toContain(generatorFile ?? '');
-    }
+    expect(before.length).toBeGreaterThan(0);
+    expect(world.project.queries.hasSymbol(after.file, after.symbol)).toBe(true);
+    expect((generatorFile ?? '') < after.file).toBe(true);
 
-    // The refused file is untouched, and the reported records still match the
-    // files that changed.
-    expect(changedPaths(world.before, treeSnapshot(world.projectRoot))).not.toContain(
-      generatorFile,
+    // Handed over out of order on purpose: the adapter orders them itself.
+    const result = await createNextJsAdapter().install([after, refused, ...before], context);
+    const failure = result.failure;
+
+    // The patcher refuses the generator after the feasibility gate would have
+    // admitted it, and that is fatal: the install as planned did not happen.
+    expect(failure).toBeDefined();
+    expect(failure?.signal).toBe('functions');
+    expect(failure?.actionId).toBe(refused.id);
+    expect(failure?.file).toBe(generatorFile);
+    expect(failure?.symbol).toBe(generatorSymbol);
+    expect(failure?.error.code).toBe('PATCH_UNSUPPORTED');
+    expectSingleLine(failure?.error.hint ?? '', 'the refusal hint');
+    expect(failure?.record, 'a refused declaration never reaches the journal').toBeUndefined();
+
+    // Exactly the targets ordered before the failure were applied, and they
+    // are the records the installer will reverse-restore.
+    expect(result.applied.map((record) => record.file).sort()).toEqual(
+      [...new Set(before.map((action) => action.file))].sort(),
     );
     expectRecordsMatchChanges(world, result.applied);
-    expect(
-      journal.events.filter((event) => event.file === generatorFile),
-      'the refused target must never reach the journal',
-    ).toEqual([]);
+
+    for (const record of result.applied) {
+      expect(record.status).toBe('applied');
+    }
+
+    // Nothing at or behind the failure was attempted: neither the refused
+    // module nor the trailing one reached the journal or changed on disk.
+    const changed = changedPaths(world.before, treeSnapshot(world.projectRoot));
+
+    for (const file of [generatorFile ?? '', after.file]) {
+      expect(
+        journal.events.filter((event) => event.file === file),
+        `${file} must never reach the journal`,
+      ).toEqual([]);
+      expect(changed).not.toContain(file);
+    }
+
+    // A result carrying a failure claims no hook and no contribution, and
+    // under a fresh preload it has no gap to report either.
+    expect(result.runtimeHooks).toEqual([]);
+    expect(result.serverSignals).toBeUndefined();
+    expect(result.unavailable).toEqual([]);
   });
 
-  it('never reports a record for a file that did not change, even when cancelled', async () => {
+  it('reports a cancelled install through the fatal channel and writes nothing', async () => {
     const world = await sandbox();
     const cancelled = new AbortController();
 
     cancelled.abort();
 
-    const { context } = writableContext(world, {
+    const { context, journal } = writableContext(world, {
       readiness: preloadPresets(world.projectRoot).fresh,
       signal: cancelled.signal,
     });
     const result = await createNextJsAdapter().install(await smallPlan(world.project), context);
+    const failure = result.failure;
 
-    // Either nothing was applied or `applied` names exactly what was written:
-    // that equivalence is what `../installer.ts`'s reverse-restore depends on,
-    // and it is asserted in both directions.
-    expectRecordsMatchChanges(world, result.applied);
-    expect(result.unavailable.length).toBeGreaterThan(0);
+    // Cancelled before the first patch: a failure rather than a gap, so the
+    // installer unwinds whatever the adapters before this one applied.
+    expect(failure).toBeDefined();
+    expect(failure?.error.code).toBe('INSTRUMENTATION_INSTALL_FAILED');
+    expect(failure?.error.details?.['reason']).toBe('aborted');
+    expect(failure?.signal).toBe('functions');
+    expect(failure?.record).toBeUndefined();
+    expectSingleLine(failure?.error.message ?? '', 'the cancellation message');
+    expectSingleLine(failure?.error.hint ?? '', 'the cancellation hint');
 
-    for (const gap of result.unavailable) {
-      expectGapShape(gap);
+    expect(result.applied).toEqual([]);
+    expect(result.runtimeHooks).toEqual([]);
+    expect(result.serverSignals).toBeUndefined();
+    expect(changedPaths(world.before, treeSnapshot(world.projectRoot))).toEqual([]);
+    expect(journal.events).toEqual([]);
+    expect(backupEntries(world)).toEqual([]);
+  });
+
+  it('carries a write that failed after its rename as the failure record, and stops there', async () => {
+    const world = await sandbox();
+    const { context, journal } = writableContext(world, {
+      readiness: preloadPresets(world.projectRoot).fresh,
+    });
+    const planned = await smallPlan(world.project);
+
+    // Three targets in three files, so "the third was never attempted" is a
+    // statement about a file and not only about an action.
+    expect(planned.length).toBeGreaterThanOrEqual(3);
+    expect(new Set(planned.map((action) => action.file)).size).toBe(planned.length);
+
+    const started: string[] = [];
+    const renamed: string[] = [];
+    const onStage = (event: PatchStageEvent): void => {
+      if (event.stage === 'resolve-target') {
+        started.push(event.file);
+      }
+
+      if (event.stage === 'replace-file') {
+        renamed.push(event.file);
+
+        if (renamed.length === 2) {
+          // The process stops right after the second target's rename, before
+          // its record is marked applied: the file holds the patch and the
+          // journal row is still the pre-write one.
+          throw new Error('injected: interrupted after the rename');
+        }
+      }
+    };
+    const result = await createNextJsAdapter({
+      patcherFactory: (options) => createPatcher({ ...options, onStage }),
+    }).install(planned, context);
+    const failure = result.failure;
+    const record = failure?.record;
+
+    expect(failure).toBeDefined();
+    expect(failure?.file).toBe(renamed[1]);
+    expect(failure?.error.code).toBe('INSTRUMENTATION_INSTALL_FAILED');
+    expect(failure?.error.details?.['reason']).toBe('stage-hook-failed');
+
+    // The failed attempt's record travels as the failure's, never in
+    // `applied`, and the file it names holds exactly the bytes it recorded.
+    expect(record).toBeDefined();
+    expect(record?.status).toBe('failed');
+    expect(record?.file).toBe(renamed[1]);
+    expect(sha256Hex(readFileSync(inSandbox(world, record?.file ?? '')))).toBe(
+      record?.instrumentedHash,
+    );
+    expect(result.applied.map((applied) => applied.id)).not.toContain(record?.id);
+
+    // Only the target completed before it is applied...
+    expect(result.applied).toHaveLength(1);
+    expect(result.applied[0]?.status).toBe('applied');
+    expect(result.applied[0]?.file).toBe(renamed[0]);
+
+    // ...every changed file is one of the two records, in both directions...
+    expectRecordsMatchChanges(world, [
+      ...result.applied,
+      ...(record === undefined ? [] : [record]),
+    ]);
+
+    // ...and the third target was never started, journaled or written.
+    expect(started).toEqual(renamed);
+
+    const neverStarted = planned.filter((candidate) => !started.includes(candidate.file));
+
+    expect(neverStarted).toHaveLength(planned.length - 2);
+
+    for (const action of neverStarted) {
+      expect(journal.events.filter((event) => event.file === action.file)).toEqual([]);
     }
+
+    expect(new Set(journal.events.map((event) => event.recordId)).size).toBe(2);
+    expect(result.runtimeHooks).toEqual([]);
+    expect(result.serverSignals).toBeUndefined();
   });
 
   it('builds its patcher through the injected factory, and writes nothing through a double', async () => {
@@ -2418,6 +2587,235 @@ describe('install with the preload attached', () => {
     expect(changedPaths(world.before, treeSnapshot(world.projectRoot))).toEqual([]);
     expect(journal.events).toEqual([]);
   });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * A failed follow-up, end to end: this adapter's fatal channel and the real installer
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * A normalised plan document over the given actions, for the real installer.
+ *
+ * @param actions The plan's actions.
+ * @param planVersion The revision the document claims.
+ * @returns The plan.
+ */
+function planOf(
+  actions: readonly InstrumentationAction[],
+  planVersion: number,
+): InstrumentationPlan {
+  return {
+    version: INSTRUMENTATION_PLAN_VERSION,
+    planVersion,
+    sessionId: SESSION_ID,
+    objective: 'Time the server functions this question reaches.',
+    hypotheses: [],
+    capture: ['server function timing'],
+    instrumentationTargets: [...actions],
+  };
+}
+
+/** One patchable declaration: its file and the symbol that addresses it. */
+interface PatchableTarget {
+  /** The declaring file, project-relative POSIX. */
+  readonly file: string;
+
+  /** The declared name. */
+  readonly symbol: string;
+}
+
+/** The three targets the follow-up case needs, every one read off the graph. */
+interface FollowUpTargets {
+  /** Plan version 1's only target. */
+  readonly first: PatchableTarget;
+
+  /** A second declaration in the same file, so plan version 2 chains onto 1. */
+  readonly chained: PatchableTarget;
+
+  /** A declaration in a file that sorts after it, which is where the delta fails. */
+  readonly later: PatchableTarget;
+}
+
+/**
+ * Chooses the follow-up case's targets from the code graph.
+ *
+ * The first file, in install order, that declares two patchable server
+ * functions supplies version 1's target and the chained one — top-down, as the
+ * adapter patches them — and the first patchable function of any file that
+ * sorts after it is the target the injected failure lands on, so the chained
+ * patch is applied before the failure and has to be unwound.
+ *
+ * @param project The indexed project.
+ * @returns The targets.
+ * @throws {Error} When the corpus cannot express the case, which would make
+ * every assertion about it vacuous.
+ */
+function followUpTargets(project: IndexedProject): FollowUpTargets {
+  const byFile = new Map<string, CodeNodeOf<'server-function'>[]>();
+
+  for (const node of serverFunctions(project)) {
+    if (declaresGenerator(project, node.file, node.line)) {
+      continue;
+    }
+
+    const bucket = byFile.get(node.file);
+
+    if (bucket === undefined) {
+      byFile.set(node.file, [node]);
+    } else {
+      bucket.push(node);
+    }
+  }
+
+  const files = [...byFile.keys()].sort();
+  const chainFile = files.find((file) => (byFile.get(file)?.length ?? 0) >= 2);
+  const laterFile = files.find((file) => chainFile !== undefined && file > chainFile);
+  const inFile = (file: string | undefined): readonly CodeNodeOf<'server-function'>[] =>
+    [...(byFile.get(file ?? '') ?? [])].sort((left, right) => left.line - right.line);
+  const [first, chained] = inFile(chainFile);
+  const [later] = inFile(laterFile);
+
+  if (first === undefined || chained === undefined || later === undefined) {
+    throw new Error(
+      'the corpus must declare a file with two patchable server functions and a later file with one',
+    );
+  }
+
+  return {
+    first: { file: first.file, symbol: first.name },
+    chained: { file: chained.file, symbol: chained.name },
+    later: { file: later.file, symbol: later.name },
+  };
+}
+
+describe('a follow-up delta that fails part-way, through the real installer', () => {
+  it('reverse-restores the delta and leaves the session at its previous plan version', async () => {
+    const world = await sandbox('follow-up');
+    const journal = createRecordingJournal(world.projectRoot);
+    const backups = createBackupStore({ debuggenHome: world.debuggenHome, sessionId: SESSION_ID });
+    const contextAt = (planVersion: number): InstrumentationContext =>
+      contextFor({
+        project: world.project,
+        readiness: preloadPresets(world.projectRoot).fresh,
+        journal,
+        backups,
+        debuggenHome: world.debuggenHome,
+        planVersion,
+      });
+    const targets = followUpTargets(world.project);
+    const firstAction = handWrittenAction(targets.first.file, targets.first.symbol);
+    const chainedAction = handWrittenAction(targets.chained.file, targets.chained.symbol);
+    const laterAction = handWrittenAction(targets.later.file, targets.later.symbol);
+
+    // Plan version 1 installs one target, for real.
+    const first = await installPlan(planOf([firstAction], 1), contextAt(1), {
+      adapters: [createNextJsAdapter()],
+      skipFeasibility: true,
+    });
+
+    if (!first.ok) {
+      throw new Error(`plan version 1 must install: ${first.error.message}`);
+    }
+
+    const [v1Record] = first.value.applied;
+
+    expect(first.value.applied).toHaveLength(1);
+    expect(v1Record?.status).toBe('applied');
+
+    // What every file the delta will touch holds before it runs — the chained
+    // file holds version 1's instrumented bytes, not its pristine ones.
+    const deltaFiles = [...new Set([chainedAction.file, laterAction.file])];
+    const bytesBefore = new Map(
+      deltaFiles.map((file) => [file, readFileSync(inSandbox(world, file))] as const),
+    );
+
+    expect(sha256Hex(bytesBefore.get(chainedAction.file) ?? Buffer.alloc(0))).toBe(
+      v1Record?.instrumentedHash,
+    );
+    expect(v1Record?.instrumentedHash).not.toBe(v1Record?.originalHash);
+
+    const appendsBefore = journal.events.filter((event) => event.method === 'append').length;
+
+    // Plan version 2 adds two targets. The chained one lands; the later one's
+    // write fails right after its rename, which is the failure that leaves the
+    // most behind: a file holding the patch and a pre-write journal row.
+    const onStage = (event: PatchStageEvent): void => {
+      if (event.stage === 'replace-file' && event.file === laterAction.file) {
+        throw new Error('injected: interrupted after the rename');
+      }
+    };
+    const second = await installPlan(
+      planOf([firstAction, chainedAction, laterAction], 2),
+      contextAt(2),
+      {
+        adapters: [
+          createNextJsAdapter({
+            patcherFactory: (options) => createPatcher({ ...options, onStage }),
+          }),
+        ],
+        delta: { previousPlanVersion: 1, actionIds: [chainedAction.id, laterAction.id] },
+        skipFeasibility: true,
+      },
+    );
+
+    if (second.ok) {
+      throw new Error('a delta whose write failed part-way must not install');
+    }
+
+    const error = second.error;
+
+    expect(error.code).toBe('INSTRUMENTATION_INSTALL_FAILED');
+    expect(error.details?.['reason']).toBe('action-failed');
+    expect(error.details?.['previousPlanVersion']).toBe(1);
+    expect(error.details?.['attempted']).toBe(2);
+    expect(error.details?.['restoredCount']).toBe(2);
+    expect(error.details?.['conflictCount']).toBe(0);
+    expect(error.details?.['failureCount']).toBe(0);
+    expect(error.message).toContain('plan version 1');
+
+    // Every file the delta touched is byte-identical to what it held before
+    // the delta: compared as bytes and as digests, so a mistake in one cannot
+    // mask a mistake in the other.
+    for (const file of deltaFiles) {
+      const before = bytesBefore.get(file) ?? Buffer.alloc(0);
+      const now = readFileSync(inSandbox(world, file));
+
+      expect(Buffer.compare(now, before), `${file} must hold its pre-delta bytes`).toBe(0);
+      expect(sha256Hex(now)).toBe(sha256Hex(before));
+    }
+
+    // The chained file is back at version 1's patch, not at its original.
+    expect(sha256Hex(readFileSync(inSandbox(world, chainedAction.file)))).toBe(
+      v1Record?.instrumentedHash,
+    );
+
+    // The delta journaled a chained record and the failed attempt's record,
+    // and reverted them in strict reverse append order.
+    const deltaAppends = journal.events
+      .filter((event) => event.method === 'append')
+      .slice(appendsBefore);
+    const reverted = journal.events
+      .filter((event) => event.method === 'updateStatus' && event.status === 'reverted')
+      .map((event) => event.recordId);
+    const rows = journal.rowsById();
+
+    expect(deltaAppends.map((event) => event.file)).toEqual([chainedAction.file, laterAction.file]);
+    expect(reverted).toEqual(deltaAppends.map((event) => event.recordId).reverse());
+    expect(rows.get(deltaAppends[0]?.recordId ?? '')?.previousRecordId).toBe(v1Record?.id);
+    expect(rows.get(deltaAppends[0]?.recordId ?? '')?.originalHash).toBe(
+      v1Record?.instrumentedHash,
+    );
+
+    for (const event of deltaAppends) {
+      expect(rows.get(event.recordId)?.status).toBe('reverted');
+    }
+
+    // The session is exactly where version 1 left it: that record is still
+    // applied, and its file is the only one in the tree that differs from the
+    // copy as it was made.
+    expect(rows.get(v1Record?.id ?? '')?.status).toBe('applied');
+    expect(changedPaths(world.before, treeSnapshot(world.projectRoot))).toEqual([v1Record?.file]);
+  }, 60_000);
 });
 
 /* -------------------------------------------------------------------------------------------------

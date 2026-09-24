@@ -26,6 +26,7 @@
   --dg-duration-normal: var(--dg-text-primary);
   --dg-duration-slow: var(--dg-warning);
   --dg-duration-critical: var(--dg-danger);
+  --dg-graph-edge: var(--dg-text-muted);
   --dg-space-0: 2px;
   --dg-space-1: 4px;
   --dg-space-2: 6px;
@@ -47,6 +48,9 @@
   --dg-radius-sm: 2px;
   --dg-radius-md: 4px;
   --dg-radius-lg: 6px;
+  --dg-icon-size: 1em;
+  --dg-spinner-size: var(--dg-icon-size);
+  --dg-icon-button-size: calc(var(--dg-icon-size) + var(--dg-space-1) * 2 + var(--dg-space-0));
   --dg-shadow-0: none;
   --dg-shadow-1: 0 1px 2px rgba(0, 0, 0, 0.4);
   --dg-shadow-2: 0 4px 12px rgba(0, 0, 0, 0.5);
@@ -85,6 +89,7 @@
   --dg-duration-normal: var(--dg-text-primary);
   --dg-duration-slow: var(--dg-warning);
   --dg-duration-critical: var(--dg-danger);
+  --dg-graph-edge: var(--dg-text-muted);
   --dg-space-0: 2px;
   --dg-space-1: 4px;
   --dg-space-2: 6px;
@@ -106,6 +111,9 @@
   --dg-radius-sm: 2px;
   --dg-radius-md: 4px;
   --dg-radius-lg: 6px;
+  --dg-icon-size: 1em;
+  --dg-spinner-size: var(--dg-icon-size);
+  --dg-icon-button-size: calc(var(--dg-icon-size) + var(--dg-space-1) * 2 + var(--dg-space-0));
   --dg-shadow-0: none;
   --dg-shadow-1: 0 1px 2px rgba(16, 24, 40, 0.08);
   --dg-shadow-2: 0 4px 12px rgba(16, 24, 40, 0.16);
@@ -144,6 +152,7 @@
   --dg-duration-normal: var(--dg-text-primary);
   --dg-duration-slow: var(--dg-warning);
   --dg-duration-critical: var(--dg-danger);
+  --dg-graph-edge: var(--dg-text-muted);
   --dg-space-0: 2px;
   --dg-space-1: 4px;
   --dg-space-2: 6px;
@@ -165,6 +174,9 @@
   --dg-radius-sm: 2px;
   --dg-radius-md: 4px;
   --dg-radius-lg: 6px;
+  --dg-icon-size: 1em;
+  --dg-spinner-size: var(--dg-icon-size);
+  --dg-icon-button-size: calc(var(--dg-icon-size) + var(--dg-space-1) * 2 + var(--dg-space-0));
   --dg-shadow-0: none;
   --dg-shadow-1: none;
   --dg-shadow-2: none;

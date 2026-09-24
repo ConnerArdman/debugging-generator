@@ -406,17 +406,20 @@ const sharedExclude: string[] = [
  * at all); `coverage.include` is the option that does this, and `coverageExclude`
  * below is applied on top of it.
  *
- * The three trees are exactly the code the Vitest projects own: the packages'
- * sources, the service's sources, and the repository guard scripts of AAP 0.3.4
- * and 0.5.4. Deliberately NOT widened to `apps/chrome-extension` or
- * `apps/vscode-extension`: their projects hold no suite at this position, so
- * including them would bury the real gaps under whole unmeasured applications.
- * `apps/demo-app` stays out for the reason stated under `coverageExclude` - it
- * is Playwright's subject, not Vitest's.
+ * The trees are exactly the code the Vitest projects own and hold suites for:
+ * the packages' sources, the service's sources, the VS Code extension's host
+ * sources (the `vscode-extension-host` project), and the repository guard
+ * scripts of AAP 0.3.4 and 0.5.4. Deliberately NOT widened to
+ * `apps/chrome-extension` or to `apps/vscode-extension/src/webview/**` (kept
+ * out through `coverageExclude`): their projects hold no suite at this
+ * position, so including them would bury the real gaps under whole unmeasured
+ * applications. `apps/demo-app` stays out for the reason stated under
+ * `coverageExclude` - it is Playwright's subject, not Vitest's.
  */
 const coverageInclude: string[] = [
   'packages/*/src/**/*.{ts,tsx}',
   'apps/local-service/src/**/*.ts',
+  'apps/vscode-extension/src/**/*.ts',
   'scripts/*.mjs',
 ];
 
@@ -426,9 +429,10 @@ const coverageInclude: string[] = [
  * Applied AFTER `coverageInclude` above (Vitest 5.0.1: "Files are first checked
  * against `coverage.include`"), so this list is what trims the tests themselves,
  * config and build tooling, the declaration output of `tsc -b`, the guard
- * scripts' own suites, and the demo application - which is exercised end to end
- * through Playwright (AAP 0.8.3) rather than by any Vitest project - back out of
- * the three source trees the include globs sweep in.
+ * scripts' own suites, the demo application - which is exercised end to end
+ * through Playwright (AAP 0.8.3) rather than by any Vitest project - and the VS
+ * Code webview, whose project holds no suite yet, back out of the source trees
+ * the include globs sweep in.
  *
  * No `*.d.ts` exclusion is needed: the `include` trees hold no hand-written
  * declaration file, and generated declarations live in `dist/` and `.tsbuild/`,
@@ -446,6 +450,7 @@ const coverageExclude: string[] = [
   '**/test/fixtures/**',
   'scripts/*.test.mjs',
   'apps/demo-app/**',
+  'apps/vscode-extension/src/webview/**',
 ];
 
 /**
@@ -502,15 +507,28 @@ export const hermeticEnv: Readonly<Record<string, string>> = {
  *
  * `env` is spread into a fresh object per project so no two projects share one
  * mutable environment record.
+ *
+ * `additionalExclude` narrows ONE project beyond `sharedExclude`, for a project
+ * whose include glob covers a subtree another project owns (the extension host
+ * project and `src/webview/**`). It is appended, never substituted, so every
+ * shared exclusion still applies to that project too.
+ *
+ * @param name The project name - a contract for every `--project` filter.
+ * @param include Repository-root relative include globs.
+ * @param additionalExclude Extra exclude globs for this project only.
  */
-function nodeProject(name: string, include: string[]): UserWorkspaceConfig {
+function nodeProject(
+  name: string,
+  include: string[],
+  additionalExclude: readonly string[] = [],
+): UserWorkspaceConfig {
   return defineProject({
     test: {
       name,
       environment: 'node',
       globals: false,
       include,
-      exclude: sharedExclude,
+      exclude: [...sharedExclude, ...additionalExclude],
       env: { ...hermeticEnv },
     },
   });
@@ -714,14 +732,20 @@ export default defineConfig({
     // project sets `root`, so all of them share one Vite server and its transform
     // cache (`sharedViteServer`).
     //
-    // Two workspaces deliberately have NO project here:
+    // Two trees deliberately have NO project here:
     //   * `apps/demo-app` - AAP 0.8.3 defines no Vitest suite for it; it is the
     //     instrumentation target, exercised by `tests/e2e/**`, and its generated
     //     Prisma client must never be collected or measured.
     //   * `apps/vscode-extension/test/suite/**` - those tests need a real
     //     extension host and run under `pnpm test:vscode` (`@vscode/test-cli`),
-    //     where the `vscode` module exists. Only the webview React code, which is
-    //     plain DOM code, is a Vitest project.
+    //     where the `vscode` module exists.
+    // The VS Code extension's Vitest code is therefore split in two projects:
+    // the webview React code, which is plain DOM code
+    // (`vscode-extension-webview`), and host LOGIC colocated under `src/**`
+    // that runs with the `vscode` module substituted through `vi.mock`
+    // (`vscode-extension-host`). A suite that needs the real editor - activation,
+    // command registration, a document actually shown - belongs under
+    // `test/suite/**`, not here.
     projects: [
       // --- packages ---------------------------------------------------------
       nodeProject('shared', ['packages/shared/src/**/*.test.ts']),
@@ -766,6 +790,18 @@ export default defineConfig({
       domProject('vscode-extension-webview', [
         'apps/vscode-extension/src/webview/**/*.test.{ts,tsx}',
       ]),
+      // node: the extension host is a Node process. Its colocated logic suites
+      // - today the `vscode://` URI handler's validation sequence, driven
+      // against real temporary directories - substitute the `vscode` module
+      // with `vi.mock`, which works although no installable package provides
+      // it (the editor supplies it at runtime). `src/webview/**` is excluded for
+      // this project only: it is the webview project's tree, and a `.test.ts`
+      // there must run once, under happy-dom.
+      nodeProject(
+        'vscode-extension-host',
+        ['apps/vscode-extension/src/**/*.test.ts'],
+        ['apps/vscode-extension/src/webview/**'],
+      ),
 
       // --- repository tooling -----------------------------------------------
       // The guard scripts of AAP 0.3.4 and 0.5.4 (`check-secrets`,

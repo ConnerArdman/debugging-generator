@@ -116,9 +116,19 @@ import type { Fact, PanelSummary, SchemaIssueSummary } from './summary.js';
  *
  * The containers bound their own breadth — `./nodes/layout.ts` caps any one
  * container at 64 children and `./spec.ts` caps the layout array itself — but
- * neither can see how deep the tree they are part of goes, because a schema only
- * ever looks at one node. This is the only layer that sees a whole document, so
- * the depth bound is stated here (as both of those modules record).
+ * neither of those node schemas can see how deep the tree they are part of
+ * goes, because a schema only ever looks at one node. This layer sees a whole
+ * internal document, so the depth bound is stated here and checked here for
+ * every specification, however it was produced.
+ *
+ * It is also enforced one step earlier, **by construction**: `./input.ts`
+ * builds the authoring schema as an unrolled chain of exactly this many node
+ * levels, the deepest of which accepts no container, and its
+ * `parsePanelSpecInput` reports `panel_node_depth_exceeded` — this module's
+ * code, at this module's path convention — for an authored document that goes
+ * deeper. Both read this one constant, so an authored panel that parses can
+ * never be rejected here for its depth, and parsing an authored document costs
+ * a bounded number of levels whatever its nesting.
  *
  * Eight is generous against any panel a developer can read: the deepest
  * arrangement the product's own panels reach is a section holding a split
@@ -129,8 +139,10 @@ import type { Fact, PanelSummary, SchemaIssueSummary } from './summary.js';
  * nested thousands deep would exhaust a stack in the surface that renders it
  * rather than in the layer that validates it.
  *
- * Exported so that a deterministic panel assembler, a test fixture and this
- * validator agree on the number instead of each choosing one.
+ * Exported so that the authoring schema, a deterministic panel assembler, a test
+ * fixture and this validator agree on the number instead of each choosing one.
+ * It must stay a whole number of at least 2: a container needs a level below it
+ * for its children, and `./input.ts` refuses to build its chain otherwise.
  */
 export const PANEL_MAX_NODE_DEPTH = 8;
 

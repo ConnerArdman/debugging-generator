@@ -57,6 +57,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
+import { z } from 'zod';
 
 import { DebuggenError, DEBUGGEN_ERROR_CODES } from '@debuggen/shared';
 import type { Result } from '@debuggen/shared';
@@ -65,9 +66,15 @@ import {
   ACTION_ID_PATTERN,
   INSTRUMENTATION_ACTION_TYPES,
   INSTRUMENTATION_PLAN_VERSION,
+  TARGETLESS_FILE,
+  TARGETLESS_SYMBOL,
+  TARGET_REQUIRED_ACTION_TYPES,
   actionIdentityKey,
+  instrumentationActionSchema,
   instrumentationPlanInputSchema,
   instrumentationPlanSchema,
+  isTargetRequiredActionType,
+  isTargetlessAction,
   normalizePlan,
   parseInstrumentationPlanInput,
 } from './plan.js';
@@ -568,7 +575,6 @@ describe('instrumentationPlanInputSchema', () => {
     ['Windows-flavoured separators', 'src\\lib\\module.ts'],
     ['a nested directory path', 'src/lib/nested/deep/module.ts'],
     ['a non-ASCII file name', 'src/caf\u00e9.ts'],
-    ['the project root itself', '.'],
     ['an interior ".." that resolves back inside', 'src/lib/../module.ts'],
   ])('accepts %s as an authored path', (_label, file) => {
     expect(
@@ -768,7 +774,9 @@ describe('normalizePlan', () => {
   it('carries a runtime-mode resolution through as well', () => {
     const plan = okValue(
       normalizePlan(
-        planInputWith([{ file: '.', symbol: 'document', type: 'react-render-tracking' }]),
+        planInputWith([
+          { file: TARGETLESS_FILE, symbol: TARGETLESS_SYMBOL, type: 'react-render-tracking' },
+        ]),
         planContext(),
       ),
       'a runtime-mode plan',
@@ -1145,5 +1153,209 @@ describe('normalizePlan', () => {
     // The plan travels over a WebSocket and into a SQLite column, so nothing in
     // it may be a value JSON cannot carry.
     expect(roundTripped).toEqual(first);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The targetless marker
+// ---------------------------------------------------------------------------
+
+/** The action types a targetless action may carry: every type not target-required. */
+const TARGETLESS_CAPABLE_TYPES: readonly InstrumentationActionType[] =
+  INSTRUMENTATION_ACTION_TYPES.filter((type) => !isTargetRequiredActionType(type));
+
+/** A resolved action with every field valid, for the internal-schema cases. */
+function resolvedAction(overrides: Partial<InstrumentationAction> = {}): InstrumentationAction {
+  return {
+    id: 'act_00000000000000aa',
+    file: TARGETLESS_FILE,
+    symbol: TARGETLESS_SYMBOL,
+    type: 'react-render-tracking',
+    adapter: 'fake-render-adapter',
+    mode: 'runtime',
+    rationale: 'Observe every commit on the page.',
+    ...overrides,
+  };
+}
+
+/** The dotted paths of an authoring-schema rejection's issues. */
+function issuePaths(input: unknown): string[] {
+  const parsed = instrumentationPlanInputSchema.safeParse(input);
+
+  if (parsed.success) {
+    throw new Error('the input was expected to be rejected, but it parsed');
+  }
+
+  return parsed.error.issues.map((issue) => issue.path.map(String).join('.'));
+}
+
+describe('the targetless marker', () => {
+  it('is the project root paired with a symbol no language declares', () => {
+    expect(TARGETLESS_FILE).toBe('.');
+    expect(TARGETLESS_SYMBOL).toBe('*');
+    expect(isTargetlessAction({ file: TARGETLESS_FILE, symbol: TARGETLESS_SYMBOL })).toBe(true);
+    expect(isTargetlessAction({ file: TARGETLESS_FILE, symbol: 'run' })).toBe(false);
+    expect(isTargetlessAction({ file: 'src/module.ts', symbol: TARGETLESS_SYMBOL })).toBe(false);
+    expect(isTargetlessAction({ file: 'src/module.ts', symbol: 'run' })).toBe(false);
+  });
+
+  it('is refused for exactly the two action types that wrap one declaration', () => {
+    expect(TARGET_REQUIRED_ACTION_TYPES).toEqual(['function-timing', 'server-span']);
+
+    for (const type of INSTRUMENTATION_ACTION_TYPES) {
+      expect(isTargetRequiredActionType(type)).toBe(
+        type === 'function-timing' || type === 'server-span',
+      );
+    }
+
+    expect(isTargetRequiredActionType('not-an-action-type')).toBe(false);
+  });
+
+  it.each(TARGETLESS_CAPABLE_TYPES)('is accepted when authored for %s', (type) => {
+    const parsed = instrumentationPlanInputSchema.safeParse(
+      planInputWith([{ file: TARGETLESS_FILE, symbol: TARGETLESS_SYMBOL, type }]),
+    );
+
+    expect(parsed.success).toBe(true);
+  });
+
+  it('recognises the cosmetic "./" spelling of the project root, as normalisation will', () => {
+    expect(
+      instrumentationPlanInputSchema.safeParse(
+        planInputWith([{ file: './', symbol: TARGETLESS_SYMBOL, type: 'fetch-tracking' }]),
+      ).success,
+    ).toBe(true);
+    expect(
+      issuePaths(planInputWith([{ file: './', symbol: 'run', type: 'fetch-tracking' }])),
+    ).toEqual(['instrumentationTargets.0.symbol']);
+  });
+
+  it.each(TARGET_REQUIRED_ACTION_TYPES)(
+    'is refused when authored for %s, on the type field',
+    (type) => {
+      const input = planInputWith([{ file: TARGETLESS_FILE, symbol: TARGETLESS_SYMBOL, type }]);
+
+      expect(issuePaths(input)).toEqual(['instrumentationTargets.0.type']);
+
+      const error = errValue(parseInstrumentationPlanInput(input), 'a target-required marker');
+
+      expect(error.code).toBe('MODEL_OUTPUT_INVALID');
+      expect(JSON.stringify(error.details)).toContain('wrap one named declaration');
+    },
+  );
+
+  it.each([
+    [
+      'the project root with a real symbol name',
+      { file: TARGETLESS_FILE, symbol: 'run', type: 'react-render-tracking' },
+      'instrumentationTargets.0.symbol',
+    ],
+    [
+      'a real file with the wildcard symbol',
+      { file: 'src/module.ts', symbol: TARGETLESS_SYMBOL, type: 'react-render-tracking' },
+      'instrumentationTargets.0.file',
+    ],
+    [
+      'the project root named as a function-timing target',
+      { file: TARGETLESS_FILE, symbol: 'run', type: 'function-timing' },
+      'instrumentationTargets.0.symbol',
+    ],
+  ])('refuses half of the marker: %s', (_label, target, path) => {
+    const input = planInputWith([target]);
+
+    expect(issuePaths(input)).toEqual([path]);
+    expect(
+      JSON.stringify(errValue(parseInstrumentationPlanInput(input), 'a half marker').details),
+    ).toContain('targetless action names file');
+  });
+
+  it('still parses AAP §0.1.2 authoring example verbatim', () => {
+    expect(instrumentationPlanInputSchema.safeParse(AUTHORING_EXAMPLE).success).toBe(true);
+  });
+
+  it('leaves the authoring schema renderable as the JSON Schema the planning prompt embeds', () => {
+    const rendered = z.toJSONSchema(instrumentationPlanInputSchema) as {
+      readonly properties?: Readonly<Record<string, unknown>>;
+    };
+
+    expect(Object.keys(rendered.properties ?? {})).toEqual(
+      expect.arrayContaining(['objective', 'capture', 'instrumentationTargets']),
+    );
+    expect(Object.keys(instrumentationActionSchema.shape)).toEqual([
+      'id',
+      'file',
+      'symbol',
+      'type',
+      'adapter',
+      'mode',
+      'rationale',
+    ]);
+  });
+
+  it('is accepted by the internal schema as a runtime-mode action', () => {
+    expect(instrumentationActionSchema.safeParse(resolvedAction()).success).toBe(true);
+  });
+
+  it('is refused by the internal schema as a patch-mode action, on the mode field', () => {
+    const parsed = instrumentationActionSchema.safeParse(resolvedAction({ mode: 'patch' }));
+
+    expect(parsed.success).toBe(false);
+    expect(parsed.error?.issues.map((issue) => issue.path.join('.'))).toEqual(['mode']);
+  });
+
+  it.each([
+    ['a function-timing type', { type: 'function-timing', mode: 'runtime' }, 'type'],
+    ['a server-span type', { type: 'server-span', mode: 'runtime' }, 'type'],
+    ['half of the marker', { symbol: 'run' }, 'symbol'],
+  ] as const)('is refused by the internal schema with %s', (_label, overrides, path) => {
+    const parsed = instrumentationActionSchema.safeParse(resolvedAction(overrides));
+
+    expect(parsed.success).toBe(false);
+    expect(parsed.error?.issues.map((issue) => issue.path.join('.'))).toContain(path);
+  });
+
+  it('normalises the cosmetic root spelling into the exact marker', () => {
+    const plan = okValue(
+      normalizePlan(
+        planInputWith([{ file: './', symbol: TARGETLESS_SYMBOL, type: 'interaction-tracking' }]),
+        planContext(),
+      ),
+      'a targetless plan',
+    );
+
+    expect(plan.instrumentationTargets).toHaveLength(1);
+    expect(isTargetlessAction(plan.instrumentationTargets[0] ?? { file: '', symbol: '' })).toBe(
+      true,
+    );
+    expect(plan.instrumentationTargets[0]?.mode).toBe('runtime');
+  });
+
+  it('turns a resolver that installs a targetless action as a patch into a value-shaped rejection', () => {
+    const patchEverything: PlanAdapterResolver = {
+      resolveActionType: () => ({ adapter: 'fake-patch-adapter', mode: 'patch' }),
+    };
+    const outcome = notThrown(
+      normalizeOutcome(
+        planInputWith([
+          { file: TARGETLESS_FILE, symbol: TARGETLESS_SYMBOL, type: 'state-tracking' },
+        ]),
+        planContext({ resolver: patchEverything }),
+      ),
+      'normalising a targetless action resolved to patch mode',
+    );
+    const error = errValue(outcome, 'a targetless patch-mode resolution');
+
+    expect(error.code).toBe('PLAN_INVALID');
+    expect(error.message).toContain('instrumentationTargets.0.mode');
+  });
+
+  it('makes two targetless actions of one type the same action by identity', () => {
+    const first = resolvedAction({ id: 'act_00000000000000ab' });
+    const second = resolvedAction({ id: 'act_00000000000000ac' });
+
+    expect(actionIdentityKey(first)).toBe(actionIdentityKey(second));
+    expect(actionIdentityKey(first)).not.toBe(
+      actionIdentityKey(resolvedAction({ type: 'state-tracking' })),
+    );
   });
 });

@@ -61,7 +61,7 @@
  * | --- | --- |
  * | `SourceLocation`, `Result`, `DebuggenError`, the error codes | `@debuggen/shared` |
  * | `TelemetryEventIngress`, `TelemetryEvent`, the aggregates | `@debuggen/telemetry` |
- * | `InstrumentationPlan`, `InstrumentationAction`, the modification records | `@debuggen/instrumentation` |
+ * | `InstrumentationPlan`, `InstrumentationAction`, the modification records | `@debuggen/instrumentation` (imported through its browser-safe `./schema` entry) |
  * | `PanelSpec`, `DataQuery`, the node catalog | `@debuggen/panel-schema` |
  * | the messages, the session record and the analysis result | **this package** |
  *
@@ -93,9 +93,8 @@
  *   aggregate builders stay behind their own packages' front doors, which the
  *   local service (the one consumer that declares those dependencies) imports
  *   directly. Re-exporting one would make this package a second front door to a
- *   package it merely layers above, and would put that package's runtime —
- *   including, for `@debuggen/instrumentation`, a ts-morph-backed patch layer —
- *   inside three browser bundles. `src/__tests__/envelope.test.ts` asserts the
+ *   package it merely layers above, and would put that package's runtime inside
+ *   three browser bundles. `src/__tests__/envelope.test.ts` asserts the
  *   absence of those five names mechanically, so the rule outlives this comment.
  *
  * The one exception to "types only" is a closed `as const` vocabulary a user
@@ -112,7 +111,7 @@
  * The module graph runs strictly one way (`src/version.ts` states it in full):
  *
  * ```text
- * @debuggen/{shared,telemetry,instrumentation,panel-schema}
+ * @debuggen/{shared,telemetry,instrumentation/schema,panel-schema}
  *   → version.ts
  *   → analysis.ts → session-record.ts
  *   → messages/*.ts → messages/index.ts
@@ -154,8 +153,21 @@
  * `removeNodeProtocol: false`, which leaves esbuild no builtin list to
  * externalise a stray `node:*` import into. No `node:` builtin, no
  * `@debuggen/shared/node` entry and no `ws` import may enter the graph this file
- * roots; each would fail the build here rather than surface as an unresolved
- * builtin in the panel's Vite build.
+ * roots — neither directly nor **transitively**, through a dependency's own
+ * imports — and each would fail the build here rather than surface as an
+ * unresolved builtin in the panel's Vite build.
+ *
+ * The transitive half is the one a per-file rule cannot see, so it is checked
+ * on the built artefact. After every build `tsup.config.ts` bundles the fresh
+ * `dist/index.js` for `platform: 'browser'` *with* its dependencies resolved
+ * through their `exports` maps, as the extensions' bundlers resolve them, and
+ * fails the build naming each specifier that does not resolve and the module
+ * that imported it. What keeps that check green is the import discipline of
+ * `src/**`: from `@debuggen/shared` only the browser-safe `"."` entry, and from
+ * `@debuggen/instrumentation` only the `./schema` entry — the schema layer
+ * split from that package's ts-morph and `node:fs` patch layer — and never the
+ * package root, whose graph reaches `node:fs`, `node:os`, `node:path` and
+ * `node:crypto` through `@debuggen/code-analysis` and `@debuggen/shared/node`.
  *
  * `ReconnectingWsClient` is the shape of that guarantee where it would otherwise
  * be hardest to keep: it takes an **injected** WebSocket constructor, typed by
@@ -231,12 +243,14 @@ export * from './envelope.js';
 // ---------------------------------------------------------------------------
 // http — the conventional-request half of the transport: the `HTTP_ROUTES`
 // table with a request and response schema per operation, the `HTTP_OPERATIONS`
-// tuple and the `HttpRequestBody`/`HttpResponseBody` lookups over it, the
-// `AUTH_EXEMPT_OPERATIONS` pair and the bearer-header helpers that express the
-// access boundary of AAP §0.5.6, `WS_PATH` for the upgrade, the typed path
-// builders a caller uses instead of concatenating a URL, the paged `DataResult`
-// union the panel-data route answers with, and the two parse helpers that
-// validate a body against the operation that received it.
+// tuple, the `HttpOperationId` union derived from it (the key type of the
+// service's `Record<HttpOperationId, RouteHandler>` handler map, also spelled
+// `HttpOperation`) and the `HttpRequestBody`/`HttpResponseBody` lookups over
+// it, the `AUTH_EXEMPT_OPERATIONS` pair and the bearer-header helpers that
+// express the access boundary of AAP §0.5.6, `WS_PATH` for the upgrade, the
+// typed path builders a caller uses instead of concatenating a URL, the paged
+// `DataResult` union the panel-data route answers with, and the two parse
+// helpers that validate a body against the operation that received it.
 // ---------------------------------------------------------------------------
 export * from './http.js';
 
@@ -288,9 +302,8 @@ export * from './client/http-client.js';
 // promoted to value re-exports: a wildcard would re-export the owners' runtime
 // helpers (their normalisers, validators, correlator and aggregate builders)
 // and turn this package into a second front door to packages it merely layers
-// above — in `@debuggen/instrumentation`'s case dragging a ts-morph-backed
-// patch layer behind it. Only the local service declares those dependencies,
-// and it imports each owner directly.
+// above. Only the local service declares those dependencies, and it imports
+// each owner directly.
 //
 // A shape reaches this list by appearing in a public signature above. Nothing
 // is listed speculatively, and a shape defined here instead of being borrowed
@@ -329,14 +342,16 @@ export type {
   TraceTree,
 } from '@debuggen/telemetry';
 
-// The instrumentation model, from `@debuggen/instrumentation`. `instrumentation.plan`
-// carries the normalised plan and its actions; `instrumentation.ready` carries
-// the modification records, the runtime hooks that came up and the signals that
-// did not; `cleanup.completed` carries the conflicts; `target.selected` carries
-// the selected element; `agent.config` and `server-agent.config` carry the two
-// hook configurations; and `Readiness` is what gates the "Ready to capture"
-// state both user interfaces show. `ProblemUnderstanding` is the first
-// pipeline artifact a session record holds.
+// The instrumentation model, from `@debuggen/instrumentation/schema` — the
+// browser-safe entry of `@debuggen/instrumentation`, and the only one this
+// package imports. `instrumentation.plan` carries the normalised plan and its
+// actions; `instrumentation.ready` carries the modification records, the
+// runtime hooks that came up and the signals that did not; `cleanup.completed`
+// carries the conflicts; `target.selected` carries the selected element;
+// `agent.config` and `server-agent.config` carry the two hook configurations;
+// and `Readiness` is what gates the "Ready to capture" state both user
+// interfaces show. `ProblemUnderstanding` is the first pipeline artifact a
+// session record holds.
 export type {
   AgentHookConfig,
   CaptureSignal,
@@ -351,7 +366,7 @@ export type {
   SelectedTarget,
   ServerAgentSignals,
   UnavailableSignal,
-} from '@debuggen/instrumentation';
+} from '@debuggen/instrumentation/schema';
 
 // The panel model, from `@debuggen/panel-schema`. `panel.generated` carries the
 // validated specification and its layout nodes; the panel-data request body *is*
@@ -393,16 +408,17 @@ export type {
 // `telemetryEventSchema`, `panelSpecSchema`, `sourceLocationSchema`), which is
 // exactly what `tsup.config.ts` keeps external.
 //
-// What the third count does *not* claim, because it was measured rather than
-// assumed: a consumer that actually imports `MODIFICATION_STATUSES` loads the
-// whole of `@debuggen/instrumentation`'s `dist/index.js`, which is one bundled
-// file fusing that package's schema layer with its ts-morph and `node:fs` patch
-// layer, so a browser build of it is megabytes rather than kilobytes. That is a
-// property of how the owner is built — a `./schema` subpath entry, or split
-// entries, would fix it there — and it is already reached through the message
-// schemas named above, so this one line neither causes it nor worsens it. The
-// telemetry and panel-schema vocabularies have no such cost: their owners'
-// bundles import nothing but `zod` and `@debuggen/shared`.
+// What each of those edges costs a browser bundle was measured rather than
+// assumed. `MODIFICATION_STATUSES` and the instrumentation schemas above come
+// from `@debuggen/instrumentation/schema`, whose `dist/schema/index.js` imports
+// only the chunk holding that package's four schema modules, and that chunk
+// imports nothing but `zod` and `@debuggen/shared` — tens of kilobytes, not the
+// ts-morph and `node:fs` patch layer the package root fuses them with, which
+// this package never imports. The telemetry and panel-schema vocabularies cost
+// the same kind of thing: their owners' bundles import nothing but `zod` and
+// `@debuggen/shared`. `tsup.config.ts` re-proves all of it on every build by
+// bundling `dist/index.js` for a browser target, so a regression in any owner
+// fails this package's build rather than an extension's.
 //
 // Nothing else joins this block. A function, a Zod schema, a class or a mutable
 // object here would hand an upstream package's runtime to three browser bundles
@@ -419,7 +435,7 @@ export { METRIC_IDS, TELEMETRY_KINDS, TELEMETRY_TIERS } from '@debuggen/telemetr
 // (`pending → applied → reverted`, or `conflict`/`failed`): the legend the
 // editor's modification list and the panel's session summary render, and the
 // set a status badge must handle exhaustively.
-export { MODIFICATION_STATUSES } from '@debuggen/instrumentation';
+export { MODIFICATION_STATUSES } from '@debuggen/instrumentation/schema';
 
 // The panel-data query vocabulary: the ten sources, the three sort orders, the
 // three confidence levels a hypothesis badge renders, and the paging bounds a

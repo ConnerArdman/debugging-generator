@@ -63,7 +63,7 @@
  * `@debuggen/instrumentation`. A second declaration of any of them in this
  * workspace would be the defect AAP §0.4.2 names.
  *
- * ## The two invariants enforced on the way in
+ * ## The three invariants enforced on the way in
  *
  * 1. **A record must be restorable.** `parseModificationRecord` already
  *    guarantees two 64-character lowercase hex digests, a project-relative
@@ -85,6 +85,29 @@
  *    each step that the file hashes to that record's `instrumentedHash` before
  *    writing that record's backup, and a chain that does not line up cannot be
  *    unwound at all.
+ * 3. **A file's history is one chain.** Within one session, the records of one
+ *    file must form a single line: every record is layered on **at most once**
+ *    (the single-child rule), a chained record may only be layered on the
+ *    **sole current head** of that line — a record with no child, not
+ *    `reverted`, and with every other open record of the file among its
+ *    ancestors — and a new unchained record (a root) may only be appended once
+ *    every earlier record of the file is `reverted`. Two records naming one
+ *    parent, or two open chains over one file, would each claim to describe
+ *    the bytes on disk; cleanup could then restore one branch and conflict on,
+ *    or strand, the other. `append` enforces all three readings inside its
+ *    `BEGIN IMMEDIATE` transaction, which serialises the check against every
+ *    other writer — this connection's and any other process's — so the check
+ *    and the insert see one state. The partial unique index
+ *    `idx_modifications_previous_record_id_unique` (schema version 2, in
+ *    `./migrations.ts`) is the **second line of defence**: it refuses a second
+ *    child even from a writer that bypassed this repository, and an insert it
+ *    refuses is reported as the same typed chain-fork conflict. Forks written
+ *    before version 2 are flagged `chain_fork = 1` by that migration, exempt
+ *    from the index but never from these checks, which count every child that
+ *    is not `reverted`, whatever its flag. A `reverted` child is history rather
+ *    than a branch: the installer's delta rollback (AAP 0.4.2) reverts a
+ *    follow-up record while its parent stays `applied`, and the next follow-up
+ *    on that file is layered on the same parent again.
  *
  * ## Status transitions are refused, never papered over
  *
@@ -119,7 +142,11 @@
  *   schema failure the same way.
  * - `MODIFICATION_CONFLICT` — a chained record's `originalHash` is not the
  *   parent's `instrumentedHash`. The recorded hash no longer matches, which is
- *   exactly what that code means.
+ *   exactly what that code means. Also every refusal of invariant 3, with a
+ *   `details.reason` of `chain-parent-has-child`, `chain-parent-not-head` or
+ *   `chain-root-while-open`: the journal's record of the file no longer
+ *   supports the patch the caller is about to make, which is the same
+ *   situation seen from the journal's side.
  * - `SESSION_INVALID_STATE` — a status transition the matrix forbids: the
  *   operation is real but not legal from the record's current status.
  * - `STORE_ERROR` — persistence itself refused or surprised us: an unknown id,
@@ -176,6 +203,13 @@ const REPO_BINDING_KEY = 'repo';
  * quietly producing a query that matches nothing.
  */
 const CONFLICT_STATUS: ModificationStatus = 'conflict';
+
+/**
+ * The terminal status, named once for the single-child probe: a `reverted`
+ * layer never blocks a new one. Typed against the upstream vocabulary for the
+ * reason {@link CONFLICT_STATUS} is.
+ */
+const REVERTED_STATUS: ModificationStatus = 'reverted';
 
 /* -------------------------------------------------------------------------------------------------
  * The transition matrix
@@ -329,6 +363,34 @@ VALUES (${placeholders(RECORD_COLUMNS.length + 1)})`;
 /** Reads one record by id. */
 const SELECT_BY_ID_SQL = `SELECT ${SELECTED} FROM modifications WHERE id = ?`;
 
+/**
+ * Whether an id is already journalled, answered from the primary key without
+ * reading or validating the row.
+ *
+ * `append` asks this before its chain checks, so re-offering a record that is
+ * already stored is reported as the duplicate it is rather than as the chain
+ * fork it would otherwise also look like.
+ */
+const SELECT_ID_EXISTS_SQL = 'SELECT 1 AS present FROM modifications WHERE id = ?';
+
+/**
+ * The oldest record layered on a given record that is not `reverted`, if any —
+ * whatever its `chain_fork` flag.
+ *
+ * The single-child probe of `append`. Served by the non-unique
+ * `idx_modifications_previous_record_id`: the partial unique index of schema
+ * version 2 cannot answer it, because this lookup must also see the pre-existing
+ * forks that index exempts. The second placeholder binds
+ * {@link REVERTED_STATUS}: a reverted layer was rolled back and no longer
+ * describes bytes the file can hold, so it never blocks a new layer — the same
+ * exclusion the index makes. Ordered by `rowid` so the child it names is
+ * deterministic.
+ */
+const SELECT_FIRST_CHILD_SQL = `SELECT id FROM modifications
+WHERE previous_record_id = ? AND status <> ?
+ORDER BY rowid ASC
+LIMIT 1`;
+
 /** Reads one session's records in append order. */
 const SELECT_BY_SESSION_SQL = `SELECT ${SELECTED} FROM modifications
 WHERE session_id = ?
@@ -361,11 +423,16 @@ ORDER BY applied_at ASC, rowid ASC`;
 /**
  * Reads the head of the chain for one file of one session.
  *
- * The head is the record no later record is layered on top of, which is a
+ * The head is the record no live later record is layered on top of, which is a
  * stronger statement than "the newest by timestamp": two records of one chain
- * can carry the same `applied_at` reading, and the link is what orders them.
- * The ordering clause only settles the case of several unchained records for
- * one file, where the most recently applied one is the right answer.
+ * can carry the same `applied_at` reading, and the link is what orders them. A
+ * `reverted` layer does not count as layered on — both placeholders after the
+ * file bind {@link REVERTED_STATUS} — and an open candidate is preferred over a
+ * reverted one, so after the installer rolls a follow-up delta back the head is
+ * the parent the file holds again: the record the next follow-up is layered on,
+ * which `append`'s single-child probe accepts. The remaining ordering only
+ * settles several candidates of the same kind, where the most recently applied
+ * one is the right answer.
  */
 const SELECT_CHAIN_HEAD_SQL = `SELECT ${SELECTED} FROM modifications AS head
 WHERE head.session_id = ?
@@ -375,8 +442,9 @@ WHERE head.session_id = ?
     WHERE later.session_id = head.session_id
       AND later.file = head.file
       AND later.previous_record_id = head.id
+      AND later.status <> ?
   )
-ORDER BY head.applied_at DESC, head.rowid DESC
+ORDER BY (head.status = ?) ASC, head.applied_at DESC, head.rowid DESC
 LIMIT 1`;
 
 /** Counts one session's records. */
@@ -558,6 +626,22 @@ export interface ModificationsRepo extends ModificationJournal {
    * as its own `instrumentedHash`; a duplicate id; and a session id no
    * `sessions` row holds.
    *
+   * Also refuses, as `MODIFICATION_CONFLICT`, anything that would fork the
+   * file's history within the session (this module's invariant 3): a chained
+   * record whose parent already has a record layered on it that is not
+   * `reverted` (`chain-parent-has-child`); a chained record whose parent is not the sole
+   * current head of the file's chain — the parent is `reverted`, or another
+   * open record of the file is not among its ancestors
+   * (`chain-parent-not-head`); and an unchained record while the session still
+   * holds an open record for the file (`chain-root-while-open`) — a new root is
+   * legal only once every earlier record of the file is `reverted`. The checks
+   * run inside the append's own `BEGIN IMMEDIATE` transaction, so two writers
+   * racing onto one parent are serialised and the second is refused; the
+   * partial unique index on `previous_record_id` refuses a second child even
+   * from a writer that bypassed this repository, and that refusal comes back
+   * as the same `chain-parent-has-child` conflict. To extend a file's chain,
+   * layer the new record on {@link ModificationsRepo.latestRecordForFile}.
+   *
    * `appliedAt` is canonicalised to whole milliseconds, which is the resolution
    * of the store's `applied_at` column, and the **stored** record is what comes
    * back — so a caller comparing it with a later read sees the same values.
@@ -671,9 +755,12 @@ export interface ModificationsRepo extends ModificationJournal {
    * Reads the chain head for one file of one session: the record a restore
    * starts from.
    *
-   * The head is the record no later record is layered on top of, not merely the
-   * newest by timestamp — two records of one chain can share an `applied_at`
-   * reading, and the link is what orders them.
+   * The head is the record no live later record is layered on top of, not
+   * merely the newest by timestamp — two records of one chain can share an
+   * `applied_at` reading, and the link is what orders them. A `reverted` layer
+   * does not count, and an open head is preferred over a reverted one, so after
+   * a follow-up delta was rolled back this is the parent the file holds again —
+   * the record a new layer must name.
    *
    * @param sessionId The session to look in.
    * @param file The project-relative POSIX path.
@@ -784,7 +871,13 @@ type StoredRow = Record<string, unknown>;
  */
 const SQLITE_CONSTRAINT_PRIMARYKEY = 1555;
 
-/** A `UNIQUE` index refused the row. See {@link SQLITE_CONSTRAINT_PRIMARYKEY}. */
+/**
+ * A `UNIQUE` index refused the row. See {@link SQLITE_CONSTRAINT_PRIMARYKEY}.
+ *
+ * The primary key reports its own code, so on this table the only index that
+ * can raise this one is schema version 2's partial unique index on
+ * `previous_record_id`: the row would have been a second child of its parent.
+ */
 const SQLITE_CONSTRAINT_UNIQUE = 2067;
 
 /** No `sessions` row holds the record's session id. */
@@ -938,13 +1031,108 @@ function refusedRecordError(
 }
 
 /**
+ * The stable `details.reason` of each refusal that keeps a file's history one
+ * chain — invariant 3 of this module's overview.
+ *
+ * - `chain-parent-has-child` — the named parent already has a record layered on
+ *   it that is not `reverted`, whatever its `chain_fork` flag;
+ * - `chain-parent-not-head` — the named parent is not the sole current head of
+ *   the file's chain: it is `reverted`, or another open record of the file is
+ *   not among its ancestors;
+ * - `chain-root-while-open` — an unchained record for a file the session still
+ *   holds an open record for.
+ */
+type ChainForkReason = 'chain-parent-has-child' | 'chain-parent-not-head' | 'chain-root-while-open';
+
+/**
+ * Which line of defence refused a second child, as `details.detectedBy`: the
+ * in-transaction check of `append`, or the partial unique index behind it.
+ */
+type ChainForkDetector = 'journal-check' | 'unique-index';
+
+/** The message of a second child, whichever line of defence caught it. */
+const SECOND_CHILD_MESSAGE =
+  'A chained modification record names a previous record that already has a later record layered on it.';
+
+/** The hint of a second child, whichever line of defence caught it. */
+const SECOND_CHILD_HINT =
+  'A record may be layered on at most once, so that a file\u2019s history stays one chain cleanup can unwind. Nothing was written to the project: re-read the file\u2019s current head (latestRecordForFile) and layer the patch on that record, or revert the file\u2019s open modifications and instrument it again from its current content.';
+
+/**
+ * The error for an append that would fork a file's history: code
+ * `MODIFICATION_CONFLICT`.
+ *
+ * That code because the caller's picture of the file no longer matches the
+ * journal's — the same situation as a hash that no longer lines up, seen from
+ * the journal's side. Carries identifiers only: record ids, the session, the
+ * project-relative file, the plan version and the reason — never a hash, a
+ * backup path, a diff or any file content.
+ *
+ * @param message What was refused.
+ * @param hint What the caller should do instead.
+ * @param reason The stable reason. See {@link ChainForkReason}.
+ * @param details Identifiers to attach.
+ * @param cause The underlying failure, when an index raised it.
+ * @returns The coded error.
+ */
+function chainForkError(
+  message: string,
+  hint: string,
+  reason: ChainForkReason,
+  details: Readonly<Record<string, unknown>>,
+  cause?: unknown,
+): DebuggenError {
+  return new DebuggenError('MODIFICATION_CONFLICT', message, {
+    hint,
+    details: { subsystem: SUBSYSTEM, [REPO_BINDING_KEY]: REPO, ...details, reason },
+    cause,
+  });
+}
+
+/**
+ * The error for an id that is already journalled: code `STORE_ERROR`.
+ *
+ * Reached from `append`'s in-transaction probe and from the primary key behind
+ * it, so both report the same refusal.
+ *
+ * @param details Identifiers to attach.
+ * @param cause The constraint failure, when the primary key raised it.
+ * @returns The coded error.
+ */
+function duplicateRecordError(
+  details: Readonly<Record<string, unknown>>,
+  cause?: unknown,
+): DebuggenError {
+  return new DebuggenError(
+    'STORE_ERROR',
+    'A modification record with this id is already journalled.',
+    {
+      hint: 'Record ids are minted per modification and must not be reused. Nothing was written to the project, so the patch can be abandoned safely.',
+      details: {
+        subsystem: SUBSYSTEM,
+        [REPO_BINDING_KEY]: REPO,
+        ...details,
+        reason: 'duplicate-record-id',
+      },
+      cause,
+    },
+  );
+}
+
+/**
  * The error for a store operation that failed for a reason of its own.
  *
- * Classifies the two constraint failures a correct caller can still provoke —
- * an id that is already journalled, and a session that does not exist — so both
- * user interfaces can say something specific, and falls back to
+ * Classifies the three constraint failures a correct caller can still provoke
+ * — an id that is already journalled, a second child refused by the
+ * single-child index, and a session that does not exist — so both user
+ * interfaces can say something specific, and falls back to
  * `DebuggenError.from` for everything else (a closed handle, a disk failure, a
  * statement this build cannot prepare).
+ *
+ * The single-child index is the second line of defence behind `append`'s own
+ * check, so reaching it means a writer raced or bypassed that check; it is
+ * reported as the same typed chain-fork conflict rather than as a generic
+ * store failure, because the caller's remedy is the same.
  *
  * @param operation The repository method that failed.
  * @param cause Whatever was caught.
@@ -964,15 +1152,19 @@ function storeOperationError(
     ...details,
   };
 
-  if (errcode === SQLITE_CONSTRAINT_PRIMARYKEY || errcode === SQLITE_CONSTRAINT_UNIQUE) {
-    return new DebuggenError(
-      'STORE_ERROR',
-      'A modification record with this id is already journalled.',
-      {
-        hint: 'Record ids are minted per modification and must not be reused. Nothing was written to the project, so the patch can be abandoned safely.',
-        details: { ...context, reason: 'duplicate-record-id' },
-        cause,
-      },
+  if (errcode === SQLITE_CONSTRAINT_PRIMARYKEY) {
+    return duplicateRecordError(context, cause);
+  }
+
+  if (errcode === SQLITE_CONSTRAINT_UNIQUE) {
+    const detectedBy: ChainForkDetector = 'unique-index';
+
+    return chainForkError(
+      SECOND_CHILD_MESSAGE,
+      SECOND_CHILD_HINT,
+      'chain-parent-has-child',
+      { ...context, detectedBy },
+      cause,
     );
   }
 
@@ -1122,7 +1314,88 @@ function validateRecord(value: unknown, operation: string): Result<ModificationR
 }
 
 /**
- * Checks that a chained record lines up with the record it is layered on.
+ * What `append` reads, inside its own transaction, about the file a record
+ * patches — the view the single-chain checks are decided against.
+ */
+interface FileHistory {
+  /**
+   * Every record of the record's `(session, file)`, in append order, whatever
+   * its status.
+   */
+  readonly records: readonly ModificationRecord[];
+
+  /**
+   * The oldest record already layered on the parent a chained record names
+   * that is not `reverted` — whatever its `chain_fork` flag — or `undefined`
+   * when the parent has none, or when the record is unchained.
+   */
+  readonly existingChildId: string | undefined;
+}
+
+/**
+ * Whether a record still needs reconciliation: every status but `reverted`.
+ *
+ * Read from the upstream `OPEN_MODIFICATION_STATUSES` rather than spelled
+ * here, so a status added to the vocabulary is classified by the one list both
+ * packages share.
+ *
+ * @param record The record to classify.
+ * @returns `true` for an open record.
+ */
+function isOpenRecord(record: ModificationRecord): boolean {
+  const open: readonly ModificationStatus[] = OPEN_MODIFICATION_STATUSES;
+
+  return open.includes(record.status);
+}
+
+/**
+ * The ids of `head` and of every record it descends from, following
+ * `previousRecordId` through one file's records.
+ *
+ * Bounded twice, like {@link ModificationsRepo.listChain}: a visited set stops
+ * a cycle and {@link MAX_CHAIN_LENGTH} stops a corrupted list. Stopping early
+ * can only leave an ancestor out, which makes the sole-head check refuse — the
+ * conservative direction for a journal that is already inconsistent.
+ *
+ * @param head The record to walk back from.
+ * @param records The file's records, which must include `head`'s ancestors.
+ * @returns The ids on `head`'s line, `head` included.
+ */
+function lineageOf(head: ModificationRecord, records: readonly ModificationRecord[]): Set<string> {
+  const byId = new Map(records.map((entry) => [entry.id, entry] as const));
+  const lineage = new Set<string>();
+  let cursor: ModificationRecord | undefined = head;
+
+  while (cursor !== undefined && !lineage.has(cursor.id) && lineage.size < MAX_CHAIN_LENGTH) {
+    lineage.add(cursor.id);
+    cursor = cursor.previousRecordId === undefined ? undefined : byId.get(cursor.previousRecordId);
+  }
+
+  return lineage;
+}
+
+/**
+ * Checks that a chained record lines up with the record it is layered on, and
+ * that layering it there keeps the file's history one chain.
+ *
+ * Two groups of checks, in this order:
+ *
+ * 1. **The link itself** — the parent exists, belongs to the same session,
+ *    names the same file, and wrote exactly the bytes this record starts from.
+ * 2. **The single-chain invariant** (this module's invariant 3) — the parent
+ *    has no live record layered on it — none that is not `reverted`, whatever
+ *    its `chain_fork` flag (`chain-parent-has-child`) — and it is the **sole
+ *    current head** of the file's chain (`chain-parent-not-head`): it is not
+ *    `reverted`, and every other open record of the file is one of its
+ *    ancestors. A reverted parent describes bytes the file no longer holds; an
+ *    open record off the parent's line is a second chain over the same file.
+ *
+ * Every read this relies on is made inside `append`'s `BEGIN IMMEDIATE`
+ * transaction, which serialises it against every other writer, so the answer
+ * still holds when the insert runs. The partial unique index on
+ * `previous_record_id` is the second line of defence for the single-child
+ * half; nothing but this function enforces the sole-head half, which is why it
+ * reads the whole file history rather than only the parent.
  *
  * Returns the rejection rather than a `Result`, because there is nothing to
  * hand back on success and the caller is inside a transaction that must either
@@ -1132,12 +1405,15 @@ function validateRecord(value: unknown, operation: string): Result<ModificationR
  * @param previousRecordId The parent it names.
  * @param previous The parent as read inside the same transaction, or
  * `undefined` when there is none.
- * @returns The rejection, or `undefined` when the chain lines up.
+ * @param history The file's records and the parent's existing child, read in
+ * the same transaction.
+ * @returns The rejection, or `undefined` when the record may be layered there.
  */
 function checkChain(
   record: ModificationRecord,
   previousRecordId: string,
   previous: ModificationRecord | undefined,
+  history: FileHistory,
 ): DebuggenError | undefined {
   const details = {
     operation: 'append',
@@ -1191,7 +1467,77 @@ function checkChain(
     );
   }
 
+  if (history.existingChildId !== undefined) {
+    const detectedBy: ChainForkDetector = 'journal-check';
+
+    return chainForkError(SECOND_CHILD_MESSAGE, SECOND_CHILD_HINT, 'chain-parent-has-child', {
+      ...details,
+      existingChildRecordId: history.existingChildId,
+      detectedBy,
+    });
+  }
+
+  if (!isOpenRecord(previous)) {
+    return chainForkError(
+      'A chained modification record names a previous record that has already been reverted.',
+      'A reverted record describes bytes the file no longer holds, so nothing may be layered on it. Nothing was written to the project: once every record of the file is reverted, append the patch without a previous record.',
+      'chain-parent-not-head',
+      { ...details, parentStatus: previous.status },
+    );
+  }
+
+  const lineage = lineageOf(previous, history.records);
+  const offLine = history.records.filter((entry) => isOpenRecord(entry) && !lineage.has(entry.id));
+
+  if (offLine.length > 0) {
+    return chainForkError(
+      'A chained modification record names a previous record that is not the current head of its file\u2019s chain.',
+      'The session holds another open record for this file that the named record does not descend from, so layering on it would fork the file\u2019s history. Nothing was written to the project: reconcile the file\u2019s open modifications before patching it again.',
+      'chain-parent-not-head',
+      { ...details, openRecordIds: offLine.map((entry) => entry.id) },
+    );
+  }
+
   return undefined;
+}
+
+/**
+ * Checks that an unchained record — a new root — does not open a second chain
+ * over a file the session is still holding one for.
+ *
+ * A root is legal only while every earlier record of the file in the session is
+ * `reverted`: the file then holds its original bytes and a fresh chain can
+ * start from them. The patcher appends a root in exactly that situation — its
+ * parent resolution layers a patch on the file's last `applied` record and
+ * refuses a file with a `pending`, `failed` or `conflict` record — so no
+ * legitimate flow needs a second open root, and a record that would be one is
+ * a fork of the file's history. Other sessions' records are not consulted: a
+ * chain describes one file within one session.
+ *
+ * @param record The unchained record being appended.
+ * @param history The file's records, read inside `append`'s transaction.
+ * @returns The rejection, or `undefined` when a new root is legal.
+ */
+function checkRoot(record: ModificationRecord, history: FileHistory): DebuggenError | undefined {
+  const open = history.records.filter(isOpenRecord);
+
+  if (open.length === 0) {
+    return undefined;
+  }
+
+  return chainForkError(
+    'A modification record starts a new chain for a file this session still holds an open modification record for.',
+    'Two open chains over one file would each claim to describe its bytes. Nothing was written to the project: layer the patch on the file\u2019s current head (latestRecordForFile) through previousRecordId, or revert the file\u2019s open modifications first.',
+    'chain-root-while-open',
+    {
+      operation: 'append',
+      recordId: record.id,
+      [LOG_BINDING_KEYS.sessionId]: record.sessionId,
+      file: record.file,
+      planVersion: record.planVersion,
+      openRecordIds: open.map((entry) => entry.id),
+    },
+  );
 }
 
 /**
@@ -1555,6 +1901,36 @@ export function createModificationsRepo(deps: ModificationsRepoDeps): Modificati
     return ok(texts);
   }
 
+  /**
+   * The id of the oldest record layered on `recordId` that is not `reverted`,
+   * whatever its `chain_fork` flag, or `undefined` when no live record is
+   * layered on it.
+   */
+  function readFirstChildId(recordId: string): Result<string | undefined> {
+    const row = store.statement(SELECT_FIRST_CHILD_SQL).get(recordId, REVERTED_STATUS);
+
+    if (row === undefined) {
+      return ok(undefined);
+    }
+
+    const id = row['id'];
+
+    return typeof id === 'string' ? ok(id) : err(corruptColumnError('append', 'id'));
+  }
+
+  /**
+   * Appends one record, refusing anything that would break this module's three
+   * invariants.
+   *
+   * Everything between the validation and the insert runs inside one
+   * {@link Store.transaction} — `BEGIN IMMEDIATE`, which takes the write lock
+   * before the first read — so the duplicate probe, the file's history, the
+   * parent and its existing child are all read in the state the insert then
+   * writes into. A second writer racing onto the same parent, from this
+   * connection or another process, waits for this commit and is then refused by
+   * the same checks; a writer that bypasses them meets the single-child index,
+   * whose refusal {@link storeOperationError} reports as the same conflict.
+   */
   function append(record: ModificationRecord): Promise<Result<ModificationRecord>> {
     // Validation is wrapped too: the input crosses a package boundary, so even
     // reading a property off it has to be inside the guard that turns a throw
@@ -1572,24 +1948,62 @@ export function createModificationsRepo(deps: ModificationsRepoDeps): Modificati
       [LOG_BINDING_KEYS.sessionId]: candidate.sessionId,
       file: candidate.file,
       planVersion: candidate.planVersion,
+      ...(candidate.previousRecordId === undefined
+        ? {}
+        : { previousRecordId: candidate.previousRecordId }),
     };
 
     const outcome = attempt(
       'append',
       () =>
         store.transaction((): Result<ModificationRecord> => {
+          // A record that is already stored is a duplicate before it is
+          // anything else: re-offering it would otherwise also read as a second
+          // chain over its own file.
+          if (store.statement(SELECT_ID_EXISTS_SQL).get(candidate.id) !== undefined) {
+            return err(duplicateRecordError({ operation: 'append', ...context }));
+          }
+
+          // Every read below is made inside this transaction, so the history
+          // the single-chain checks decide on — and the hash the link is
+          // checked against — cannot change between the check and the insert.
+          const records = readAll(SELECT_BY_SESSION_AND_FILE_SQL, [
+            candidate.sessionId,
+            candidate.file,
+          ]);
+
+          if (isErr(records)) {
+            return records;
+          }
+
           const { previousRecordId } = candidate;
 
-          // The parent is read inside this transaction, so the hash the chain
-          // is checked against cannot change between the check and the insert.
-          if (previousRecordId !== undefined) {
+          if (previousRecordId === undefined) {
+            const rejection = checkRoot(candidate, {
+              records: records.value,
+              existingChildId: undefined,
+            });
+
+            if (rejection !== undefined) {
+              return err(rejection);
+            }
+          } else {
             const previous = readOne(SELECT_BY_ID_SQL, [previousRecordId]);
 
             if (isErr(previous)) {
               return previous;
             }
 
-            const rejection = checkChain(candidate, previousRecordId, previous.value);
+            const child = readFirstChildId(previousRecordId);
+
+            if (isErr(child)) {
+              return child;
+            }
+
+            const rejection = checkChain(candidate, previousRecordId, previous.value, {
+              records: records.value,
+              existingChildId: child.value,
+            });
 
             if (rejection !== undefined) {
               return err(rejection);
@@ -1609,6 +2023,7 @@ export function createModificationsRepo(deps: ModificationsRepoDeps): Modificati
       logger.warn('a modification could not be journalled', {
         ...context,
         code: outcome.error.code,
+        reason: outcome.error.details?.['reason'],
       });
     } else {
       logger.info('a modification was journalled', {
@@ -1825,7 +2240,9 @@ export function createModificationsRepo(deps: ModificationsRepoDeps): Modificati
     file: string,
   ): Promise<Result<ModificationRecord | undefined>> {
     return Promise.resolve(
-      attempt('latestRecordForFile', () => readOne(SELECT_CHAIN_HEAD_SQL, [sessionId, file])),
+      attempt('latestRecordForFile', () =>
+        readOne(SELECT_CHAIN_HEAD_SQL, [sessionId, file, REVERTED_STATUS, REVERTED_STATUS]),
+      ),
     );
   }
 

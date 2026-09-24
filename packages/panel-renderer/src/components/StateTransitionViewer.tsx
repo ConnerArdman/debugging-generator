@@ -58,29 +58,66 @@
  * two derived row fields (`changed`, `valueType`), and the entry is imported
  * rather than restated so a change to the catalog reaches this file.
  *
- * ## Paging grows the window; it never stitches pages
+ * ## Paging follows the provider's `nextOffset` and appends stable pages
  *
- * `../host/useQuery` resolves **one** page and replaces it on the next request:
- * it explicitly does not append, because a renderer that concatenated two
- * responses would be showing something no single response ever said. "Load
- * more" therefore raises the query's `limit` — the same offset, a strictly
- * larger window, still one page the provider ordered — instead of advancing the
- * offset and keeping the old rows locally. The ceiling is the contract's own
- * `DATA_QUERY_MAX_LIMIT`, and when the window reaches it the footer says so
- * rather than offering a control that cannot widen anything.
+ * `../host/useQuery` resolves **one** page per request. "Load more" requests the
+ * next page at exactly the offset the previous response reported as its
+ * `nextOffset` — never an offset counted from a page's length and never one
+ * inferred from `total` — with the same `limit` on every request of the
+ * sequence: the authored page size, clamped into `[1, DATA_QUERY_MAX_LIMIT]`.
+ * That constant bounds **one request**, not how far a reader can go: nothing
+ * here caps the rows a sequence can reach, so a capture of any size is
+ * traversable page by page, including every offset past 5 000. A response that
+ * reports no `nextOffset`, or one that does not move past the page it answered,
+ * is the end of the data, and the footer then offers no control.
  *
- * That choice is also what keeps this component inside the React Compiler rules
- * the repository lints with: accumulating pages would mean writing state when
- * data arrived, and `react-hooks/set-state-in-effect` forbids it. All local
- * state here is written from an event handler, and it is reset by *derivation*
- * — every value is stamped with the node's query identity and a stamp that no
- * longer matches is ignored — so no effect exists to reset it either.
+ * Pages already received are kept exactly as they arrived and the next one is
+ * appended after them, de-duplicated by the grid's row key (first occurrence
+ * kept), so the provider's order holds across pages and nothing already on
+ * screen is requested or rebuilt again. While a next page is in flight the
+ * loaded rows stay on screen and the footer reports the load; when one fails
+ * the rows stay and the footer carries the error and its retry. The local
+ * derivations — the "changed only" narrowing, the grouping and the component
+ * options — run over every row loaded so far.
+ *
+ * The accumulated pages belong to one request sequence: the node, its source,
+ * the filter including the reader's component narrowing, the applied order and
+ * the page size, but not the offset, which is the one thing that moves along a
+ * sequence. A new order or a new component narrowing is a new sequence and
+ * starts again from the node's first page.
+ *
+ * The accumulator is written only from the "Load more" handler — at the moment
+ * of the click the rows on screen and the next offset are both in hand — and
+ * cleared only by the handlers that start a new sequence, so nothing is written
+ * when data arrives and the React Compiler rules the repository lints with
+ * (`react-hooks/set-state-in-effect`) have nothing to forbid. All local state
+ * here is written from an event handler, and it is reset by *derivation* —
+ * every value is stamped with the identity it was taken against and a stamp
+ * that no longer matches is ignored — so no effect exists to reset it either.
+ *
+ * ## Every explanation is reachable from the keyboard
+ *
+ * A row can carry four tooltips — the bound behind a shortened summary, why a
+ * trigger cannot be opened, what "no values reported" does and does not claim,
+ * and what a dropped-transitions count is a floor of — and
+ * `../primitives/Tooltip` opens on focus. Their triggers are text, code and
+ * chip elements, which are not focusable of their own accord, so each is given
+ * a tab index. Not in every row, though: `DataTable` makes its body a single
+ * roving tab stop, and a stop per trigger per row would bury it under hundreds
+ * of them. The triggers join the tab order **only in the row that holds
+ * focus** — the view follows focus into the grid, onto a row or anything inside
+ * one, and gives that row's triggers `tabIndex={0}` and every other row's none
+ * — so Tab from a focused row walks into its explanations, and arrowing to
+ * another row moves them with it. Each trigger keeps the `aria-describedby` the
+ * tooltip merges onto it, and none sits in a column header, where `DataTable`
+ * nests a sortable header inside its sort control.
  *
  * ## What it never does
  *
  * No sorting, filtering or paging arithmetic on a resolved page beyond the one
  * local narrowing the toolbar declares (see the "changed only" toggle, whose
- * scope the footer states). Ordering is the service's: AAP 0.4.2 applies
+ * scope the footer states) and the removal of a row a later page repeats (see
+ * `appendPage`). Ordering is the service's: AAP 0.4.2 applies
  * `filter`, `sort`, `limit` and `offset` where the whole capture is, and a sort
  * here is a **re-query** mapped onto that vocabulary. No transport either — no
  * `fetch`, no socket, no message port: data arrives through the `DataProvider`
@@ -123,7 +160,8 @@
  * addresses them. The row's selected state is not written here at all —
  * `DataTable` owns `dg-is-selected` on the row it was told is selected.
  *
- * @see ../host/useQuery for the one-page-at-a-time resolution contract.
+ * @see ../host/useQuery for the one-page-at-a-time resolution contract and the
+ * `nextOffset` every "Load more" advances to.
  * @see ../host/PanelActions for the interaction contract.
  * @see ../primitives/DataTable for the ARIA grid, keyboard operation and
  * virtualization this view does not re-implement.
@@ -150,8 +188,10 @@ import {
   Zap,
 } from 'lucide-react';
 import { useCallback, useMemo, useState } from 'react';
-import type { ReactElement, ReactNode } from 'react';
+import type { FocusEvent as ReactFocusEvent, ReactElement, ReactNode } from 'react';
 
+import { useDataProvider } from '../host/DataProvider';
+import type { DataProvider } from '../host/DataProvider';
 import { usePanelActions } from '../host/PanelActions';
 import { useQuery } from '../host/useQuery';
 import { Stack } from '../layout/Stack';
@@ -195,6 +235,14 @@ import { SourceLink } from './SourceLink';
  * {@link StateTransitionViewer}.
  */
 const STATE_TRANSITIONS_SOURCE = 'stateTransitions' as const;
+
+/**
+ * A request this view issues: a data query naming the one source it reads.
+ *
+ * The literal source is what lets `useQuery` type the response as this
+ * source's rows rather than as the union over every source.
+ */
+type StateTransitionsQuery = DataQuery & { source: typeof STATE_TRANSITIONS_SOURCE };
 
 /**
  * The order a transition sequence reads in when no other is asked for.
@@ -377,11 +425,18 @@ const CHANGED_ONLY_SCOPE_NOTE =
 const GROUPED_SCOPE_NOTE =
   'Rows are grouped by component; within each component they keep the order the capture returned.';
 
-/** The footer's "widen the window" control. */
+/** The footer's control that requests the next page of the sequence. */
 const LOAD_MORE_LABEL = 'Load more';
 
-/** What the footer says instead when the window has reached the contract's ceiling. */
-const LIMIT_REACHED_NOTE = 'The largest page this contract allows is already loaded.';
+/** The same control while that page is in flight, when it cannot be pressed again. */
+const LOADING_MORE_LABEL = 'Loading more…';
+
+/**
+ * What the footer states when a next page failed: what failed, and that the
+ * rows already on screen are untouched by it.
+ */
+const PAGE_ERROR_MESSAGE =
+  'The next page of state transitions could not be loaded. The rows already loaded are unchanged.';
 
 /*
  * ---------------------------------------------------------------------------
@@ -399,22 +454,134 @@ const NO_TRANSITIONS: readonly StateTransition[] = Object.freeze([]);
 const NO_KEYS: readonly string[] = Object.freeze([]);
 
 /**
- * Clamp an authored page size into the contract's bounds.
+ * The element `DataTable` renders for one data row, found from anything inside
+ * it.
  *
- * AAP 0.4.2 fixes the window at `[1, DATA_QUERY_MAX_LIMIT]`, and a stored panel
- * can carry a `limit` of `0` — legal in the schema, and an explicit request for
- * no rows — which would make "load more" unable to widen anything, since every
- * multiple of zero is zero. One row is the smallest window that can grow.
+ * Both attributes, because the expanded detail beneath a row is a
+ * `role="row"` too and carries no index: focus inside a disclosed detail block
+ * belongs to no data row and moves no tab stops. `data-row-index` is the
+ * primitive's own name for a row's position in the `rows` it was handed.
+ */
+const DATA_ROW_SELECTOR = '[role="row"][data-row-index]';
+
+/**
+ * The tab index of a tooltip trigger inside a grid row.
+ *
+ * `0` in the row that holds focus, so Tab from that row reaches the
+ * explanation and its tooltip opens on focus; no `tabIndex` at all everywhere
+ * else, which keeps every other row's triggers out of the tab order. Not `-1`:
+ * that would make a pointer click focus the trigger instead of its row, and
+ * `DataTable` answers its arrow keys only on a row element, so the reader would
+ * lose row navigation at the point they clicked. See this module's header for
+ * why the stop follows the focused row rather than sitting on every trigger.
+ *
+ * @param tabbable Whether the trigger's row holds focus.
+ * @returns The trigger's `tabIndex`, or `undefined` for none.
+ */
+function inRowTabIndex(tabbable: boolean): 0 | undefined {
+  return tabbable ? 0 : undefined;
+}
+
+/**
+ * Clamp an authored page size into the contract's per-request bounds.
+ *
+ * AAP 0.4.2 bounds one request's `limit` at `[1, DATA_QUERY_MAX_LIMIT]`. That is
+ * a bound on a single page and never on how many rows "Load more" can reach:
+ * the result is sent unchanged with every page of a sequence, and the sequence
+ * itself goes as far as the provider's `nextOffset` does. A stored panel can
+ * carry a `limit` of `0` — legal in the schema, and an explicit request for no
+ * rows — which would page through nothing, since an empty page can never move
+ * the sequence on. One row is the smallest page that can.
  *
  * @param limit The `limit` the node authored, or the reader's default.
  * @returns A page size within the contract's bounds.
  */
-function clampWindowStep(limit: number): number {
+function clampPageLimit(limit: number): number {
   if (!Number.isFinite(limit)) {
     return DATA_QUERY_DEFAULT_LIMIT;
   }
 
   return Math.min(Math.max(Math.trunc(limit), 1), DATA_QUERY_MAX_LIMIT);
+}
+
+/**
+ * The offset of the page after the one that resolved, or `undefined` at the end
+ * of the data.
+ *
+ * The provider's `nextOffset` is the only thing that moves a sequence on:
+ * `../host/useQuery` documents that an offset counted from a page's length
+ * drifts the moment a limit is clamped, and a `total` says how much exists, not
+ * where the next page starts. Three answers therefore end the sequence:
+ *
+ * - no `nextOffset` at all (`undefined`, or a transport's `null`) — the provider
+ *   said this page is the last one;
+ * - one that is not a non-negative safe integer — no query could carry it, since
+ *   the schema's `offset` is exactly such an integer;
+ * - one that does not move past the page it answered — equal to or behind its
+ *   offset — because requesting it would ask again for rows already on screen,
+ *   and a provider that kept answering so would loop "Load more" forever.
+ *
+ * Deliberately no upper bound: `DATA_QUERY_MAX_LIMIT` caps one request, and an
+ * offset of 5 000 or beyond is as legitimate as the first page.
+ *
+ * @param nextOffset What the resolved page reported.
+ * @param offset The offset that page was requested at.
+ * @returns The next page's offset, or `undefined` when there is none.
+ */
+function advancedOffset(nextOffset: number | undefined, offset: number): number | undefined {
+  if (nextOffset === undefined || !Number.isSafeInteger(nextOffset) || nextOffset <= offset) {
+    return undefined;
+  }
+
+  return nextOffset;
+}
+
+/**
+ * The rows loaded so far: every earlier page, then the page that resolved.
+ *
+ * The provider's order is kept across pages and nothing is sorted, merged or
+ * re-ranked here. The one thing removed is a row whose key — the `id` the grid
+ * keys its rows by — is already loaded, keeping the first occurrence: the
+ * contract promises that paging never repeats an item, but a result that changed
+ * between two requests can shift a row across a page boundary, and two rows
+ * with one key would be two grid rows React cannot tell apart. Identity is kept
+ * wherever nothing was added, so the derivations downstream do not recompute for
+ * a page that contributed nothing new.
+ *
+ * @param carried The rows of the earlier pages of this sequence, already de-duplicated.
+ * @param page The page that resolved, or `undefined` while none has.
+ * @returns The rows to draw from, in the provider's order.
+ */
+function appendPage(
+  carried: readonly StateTransition[],
+  page: readonly StateTransition[] | undefined,
+): readonly StateTransition[] {
+  if (page === undefined || page.length === 0) {
+    return carried;
+  }
+
+  const seen = new Set<string>();
+  for (const row of carried) {
+    seen.add(row.id);
+  }
+
+  const appended: StateTransition[] = [];
+  for (const row of page) {
+    if (!seen.has(row.id)) {
+      seen.add(row.id);
+      appended.push(row);
+    }
+  }
+
+  if (appended.length === 0) {
+    return carried;
+  }
+
+  if (carried.length === 0 && appended.length === page.length) {
+    return page;
+  }
+
+  return [...carried, ...appended];
 }
 
 /**
@@ -431,6 +598,24 @@ function clampWindowStep(limit: number): number {
  */
 function nodeRequestKey(node: StateTransitionsNode): string {
   return `${node.id}\u0000${serializeQuery(node.query)}`;
+}
+
+/**
+ * The identity of one request sequence, which stamps the pages accumulated
+ * along it (see {@link PageAccumulator}).
+ *
+ * The node's id and the sequence's query — source, filter with the reader's
+ * component narrowing merged in, the applied order and the per-request page
+ * size. That query carries no offset: the offset is the one member that moves
+ * along a sequence, so it cannot be what tells two sequences apart. Compared,
+ * never parsed.
+ *
+ * @param nodeId The id of the node the sequence belongs to.
+ * @param sequence The sequence's query, without an offset.
+ * @returns A string equal for equal sequences.
+ */
+function sequenceIdentityOf(nodeId: string, sequence: DataQuery): string {
+  return `${nodeId}\u0000${serializeQuery(sequence)}`;
 }
 
 /**
@@ -621,11 +806,11 @@ function groupByComponent(rows: readonly StateTransition[]): readonly StateTrans
  * Derived rather than enumerated: `@debuggen/telemetry` is a type-only
  * dependency of this package, so there is no vocabulary constant to read, and a
  * component list is capture data in any case. The reader's current choice is
- * kept even if this page no longer contains it, so narrowing to a component and
- * then widening the window cannot leave the control displaying an option that
- * is not in force.
+ * kept even if the loaded rows do not contain it — while its first page is
+ * still in flight, say — so the control can never display an option that is
+ * not in force.
  *
- * @param rows The loaded page.
+ * @param rows Every row loaded so far.
  * @param current The component currently filtered on, or {@link ALL_COMPONENTS}.
  * @returns Options for the picker, "everything" first.
  */
@@ -658,10 +843,41 @@ function componentOptionsFor(
  */
 
 /**
+ * The pages already received along one request sequence, and the offset of the
+ * page requested next.
+ *
+ * Written **only** from the "Load more" handler, which is what keeps this
+ * component free of state written from an effect: at the moment of the click
+ * the rows on screen, the `nextOffset` the provider reported and the total it
+ * last reported are all in hand, so the accumulator is complete before the next
+ * page is even requested. The order and component handlers clear it, because
+ * each starts a different sequence.
+ *
+ * `identity` is the {@link sequenceIdentityOf} the pages were loaded under. An
+ * accumulator whose identity no longer matches the current sequence is ignored
+ * during render — again with no effect, and with no render able to show rows of
+ * one sequence beneath the next page of another.
+ */
+interface PageAccumulator {
+  /** The sequence these pages belong to; offset excluded by construction. */
+  readonly identity: string;
+  /** Every row received before the page in flight, de-duplicated, in the provider's order. */
+  readonly rows: readonly StateTransition[];
+  /** The offset of the page in flight: the `nextOffset` of the page before it. */
+  readonly offset: number;
+  /**
+   * The total the provider last reported for this sequence, carried so the
+   * footer keeps stating it while the next page is in flight or has failed,
+   * instead of momentarily claiming none was ever reported.
+   */
+  readonly total: number | undefined;
+}
+
+/**
  * Everything the reader controls, stamped with the request it belongs to.
  *
  * One object rather than six `useState` calls, because the stamp has to reset
- * all of them together: when the node's request changes, a page count, a
+ * all of them together: when the node's request changes, the loaded pages, a
  * component filter and a selection taken against the previous request are all
  * meaningless at once. Held as data and compared during render (see
  * {@link viewFor}), which is how the reset happens without an effect — the
@@ -675,12 +891,15 @@ interface ViewState {
   readonly sort: DataQuerySort | undefined;
   /** The component narrowed to, or {@link ALL_COMPONENTS}. */
   readonly component: string;
-  /** Whether the loaded page is narrowed to rows with reported values. */
+  /** Whether the loaded rows are narrowed to rows with reported values. */
   readonly changedOnly: boolean;
   /** Whether rows are grouped by component. */
   readonly grouped: boolean;
-  /** How many page sizes wide the requested window is; at least one. */
-  readonly pages: number;
+  /**
+   * The pages loaded before the one in flight, or `undefined` while the
+   * sequence's first page is the one requested. See {@link PageAccumulator}.
+   */
+  readonly pages: PageAccumulator | undefined;
   /** The row whose record was last selected, or `null`. */
   readonly selectedKey: string | null;
   /** The rows whose detail is disclosed. */
@@ -700,7 +919,7 @@ function initialView(requestKey: string): ViewState {
     component: ALL_COMPONENTS,
     changedOnly: false,
     grouped: true,
-    pages: 1,
+    pages: undefined,
     selectedKey: null,
     expandedKeys: NO_KEYS,
   };
@@ -759,12 +978,67 @@ export interface StateTransitionViewerProps {
  * @param props The props, as documented on {@link StateTransitionViewerProps}.
  * @returns The grid, or the node's loading, empty or error state.
  *
+ * The stateful view is rendered under a `key` that changes exactly when the
+ * ambient `DataProvider` is replaced (see {@link useProviderGeneration}). A
+ * host that rebinds a mounted panel to another session swaps the provider
+ * without remounting the node, and the same node id and query can recur in
+ * that session's panel; the accumulated pages, the next offset, the chosen
+ * order and narrowing and the selected, open and focused rows of the previous
+ * provider must not survive into it, so a new provider is a new instance that
+ * paints none of them and starts from the authored first page.
+ *
  * @example Inside a panel host that provides a `DataProvider` and `PanelActions`.
  * ```tsx
  * <StateTransitionViewer node={node} />
  * ```
  */
 export function StateTransitionViewer(props: StateTransitionViewerProps): ReactElement {
+  const providerGeneration = useProviderGeneration();
+
+  return <StateTransitionViewerView key={providerGeneration} {...props} />;
+}
+
+/** The provider a view was last rendered under, and how many it has seen. */
+interface ProviderBinding {
+  /** The ambient `DataProvider` of the latest render. */
+  readonly provider: DataProvider | undefined;
+
+  /** Incremented each time that provider is replaced by a different one. */
+  readonly generation: number;
+}
+
+/**
+ * A number that changes exactly when the ambient `DataProvider` is replaced.
+ *
+ * The binding is adjusted during render, React's documented pattern for state
+ * that follows a changed input: the replaced render is discarded before
+ * commit, so nothing loaded from the previous provider is ever painted under
+ * the new one. Compared by reference, which is what a provider's identity is:
+ * a host creates one per session.
+ *
+ * @returns The current provider's generation.
+ */
+function useProviderGeneration(): number {
+  const provider = useDataProvider();
+  const [binding, setBinding] = useState<ProviderBinding>(() => ({ provider, generation: 0 }));
+
+  if (binding.provider !== provider) {
+    const next: ProviderBinding = { provider, generation: binding.generation + 1 };
+    setBinding(next);
+    return next.generation;
+  }
+
+  return binding.generation;
+}
+
+/**
+ * The stateful body of {@link StateTransitionViewer}: one provider's pages,
+ * order, narrowing, selection and focus for one node.
+ *
+ * @param props The props, as documented on {@link StateTransitionViewerProps}.
+ * @returns The grid, or the node's loading, empty or error state.
+ */
+function StateTransitionViewerView(props: StateTransitionViewerProps): ReactElement {
   const { node, className } = props;
 
   const actions = usePanelActions();
@@ -775,49 +1049,83 @@ export function StateTransitionViewer(props: StateTransitionViewerProps): ReactE
   const requestKey = nodeRequestKey(node);
   const [heldView, setHeldView] = useState<ViewState>(() => initialView(requestKey));
   const view = viewFor(heldView, requestKey);
+  // The key of the row that last held focus, whose tooltip triggers are the
+  // only in-row ones in the tab order. Held apart from the view state: it
+  // records where focus is, not a choice the reader made, and a key no longer
+  // among the rows simply matches none of them.
+  const [focusedRowKey, setFocusedRowKey] = useState<string | null>(null);
 
   const sourceSupported = node.query.source === STATE_TRANSITIONS_SOURCE;
-  const windowStep = clampWindowStep(node.query.limit ?? DATA_QUERY_DEFAULT_LIMIT);
-  const windowLimit = Math.min(windowStep * view.pages, DATA_QUERY_MAX_LIMIT);
+  // One page size for every request of a sequence, and the offset its first
+  // page starts at. Neither grows: later pages move by `nextOffset` alone.
+  const pageLimit = clampPageLimit(node.query.limit ?? DATA_QUERY_DEFAULT_LIMIT);
+  const firstOffset = node.query.offset ?? DATA_QUERY_DEFAULT_OFFSET;
   const sort = view.sort ?? node.query.sort ?? DEFAULT_SORT;
 
   /**
-   * The request this render resolves: the node's query with the reader's order,
-   * component narrowing and window applied. `undefined` for a node whose source
-   * this view cannot draw, which holds the provider back while the branch below
-   * reports it.
+   * The request sequence this render pages through: the node's query with the
+   * reader's order and component narrowing applied and the page size fixed —
+   * every member of the request except the offset, which is what moves along
+   * it. `undefined` for a node whose source this view cannot draw, which holds
+   * the provider back while the branch below reports it.
+   *
+   * Every member is written out rather than spread from the node's query: the
+   * query schema is strict, so these four and the offset are all it can carry,
+   * and spreading it would bring the authored offset into a value that must
+   * not have one. The authored filter in particular is merged rather than
+   * spread through, so an authored `filter: {}` cannot survive beside the
+   * merged one: two spellings of "narrow by nothing" would be two sequence
+   * identities, and the reader's pages reset on a change of identity.
    */
-  const query = useMemo<
-    (DataQuery & { source: typeof STATE_TRANSITIONS_SOURCE }) | undefined
-  >(() => {
+  const sequenceQuery = useMemo<StateTransitionsQuery | undefined>(() => {
     if (!sourceSupported) {
       return undefined;
     }
 
-    // The authored filter is destructured out rather than spread through, so an
-    // authored `filter: {}` cannot survive into the request beside the merged
-    // one: two spellings of "narrow by nothing" would be two request
-    // identities, and the reader's paging resets on a change of identity.
-    const { filter: authored, ...fields } = node.query;
-
     const filter = {
-      ...authored,
+      ...node.query.filter,
       ...(view.component === ALL_COMPONENTS ? {} : { component: view.component }),
     };
 
     return {
-      ...fields,
       source: STATE_TRANSITIONS_SOURCE,
       sort,
-      limit: windowLimit,
-      offset: node.query.offset ?? DATA_QUERY_DEFAULT_OFFSET,
+      limit: pageLimit,
       ...(Object.keys(filter).length === 0 ? {} : { filter }),
     };
-  }, [node.query, sourceSupported, sort, view.component, windowLimit]);
+  }, [node.query.filter, pageLimit, sort, sourceSupported, view.component]);
+
+  const pagingIdentity =
+    sequenceQuery === undefined ? undefined : sequenceIdentityOf(node.id, sequenceQuery);
+
+  // Pages accumulated under another sequence are ignored during render rather
+  // than cleared in an effect: the comparison is pure, and it means a re-ordered
+  // or re-narrowed view can never paint rows of the previous sequence, not even
+  // for one frame. The handlers that start a new sequence also clear them.
+  const activePages =
+    view.pages !== undefined && view.pages.identity === pagingIdentity ? view.pages : undefined;
+  const offset = activePages?.offset ?? firstOffset;
+
+  /** The request this render resolves: the sequence's page at `offset`. */
+  const query = useMemo<StateTransitionsQuery | undefined>(
+    () => (sequenceQuery === undefined ? undefined : { ...sequenceQuery, offset }),
+    [offset, sequenceQuery],
+  );
 
   const { status, data, error, total, nextOffset, retry } = useQuery(query);
 
-  const loaded = data ?? NO_TRANSITIONS;
+  const carried = activePages?.rows ?? NO_TRANSITIONS;
+  // The page that resolved, or `undefined` while one is in flight or has failed
+  // — in both of which the rows already loaded stay exactly as they are.
+  const page = status === 'success' ? (data ?? NO_TRANSITIONS) : undefined;
+
+  /** Every row loaded along this sequence: earlier pages first, de-duplicated by key. */
+  const loaded = useMemo(() => appendPage(carried, page), [carried, page]);
+
+  // What the footer states and offers. The total survives a page in flight;
+  // the next offset exists only for a page that resolved and moved forward.
+  const knownTotal = total ?? activePages?.total;
+  const nextPageOffset = status === 'success' ? advancedOffset(nextOffset, offset) : undefined;
 
   /** The rows drawn: the reader's local narrowing, then the presentational grouping. */
   const rows = useMemo<readonly StateTransition[]>(() => {
@@ -844,10 +1152,16 @@ export function StateTransitionViewer(props: StateTransitionViewerProps): ReactE
         // second place for it to be spelled.
         const chosen = isDataQuerySort(next) ? next : current.sort;
 
-        // A new order is a new request, so the window returns to one page: a
-        // reader who widened a chronological page has not asked for an equally
-        // wide page of a different ranking.
-        return { ...current, sort: chosen, pages: 1, selectedKey: null, expandedKeys: NO_KEYS };
+        // A new order is a new sequence, so it starts again from the node's
+        // first page: rows accumulated under the old ranking describe a
+        // different ordering and must not be carried into this one.
+        return {
+          ...current,
+          sort: chosen,
+          pages: undefined,
+          selectedKey: null,
+          expandedKeys: NO_KEYS,
+        };
       });
     },
     [requestKey],
@@ -858,7 +1172,14 @@ export function StateTransitionViewer(props: StateTransitionViewerProps): ReactE
       setHeldView((held) => {
         const current = viewFor(held, requestKey);
 
-        return { ...current, component: next, pages: 1, selectedKey: null, expandedKeys: NO_KEYS };
+        // A new narrowing is a new sequence as well, for the same reason.
+        return {
+          ...current,
+          component: next,
+          pages: undefined,
+          selectedKey: null,
+          expandedKeys: NO_KEYS,
+        };
       });
       actions?.onFilterChange?.(node.id, next === ALL_COMPONENTS ? {} : { component: next });
     },
@@ -881,13 +1202,24 @@ export function StateTransitionViewer(props: StateTransitionViewerProps): ReactE
     });
   }, [requestKey]);
 
+  // The one writer of the accumulator. Everything it records is in hand at the
+  // click: the rows on screen become the carried rows, and the offset the
+  // provider reported becomes the next request's. The selection and the
+  // disclosed rows are left alone, because appending a page changes neither.
   const handleLoadMore = useCallback((): void => {
-    setHeldView((held) => {
-      const current = viewFor(held, requestKey);
+    if (nextPageOffset === undefined || pagingIdentity === undefined) {
+      return;
+    }
 
-      return { ...current, pages: current.pages + 1 };
-    });
-  }, [requestKey]);
+    const pages: PageAccumulator = {
+      identity: pagingIdentity,
+      rows: loaded,
+      offset: nextPageOffset,
+      total: knownTotal,
+    };
+
+    setHeldView((held) => ({ ...viewFor(held, requestKey), pages }));
+  }, [knownTotal, loaded, nextPageOffset, pagingIdentity, requestKey]);
 
   const handleRowActivate = useCallback(
     (row: StateTransition): void => {
@@ -952,15 +1284,52 @@ export function StateTransitionViewer(props: StateTransitionViewerProps): ReactE
     [actions],
   );
 
+  /**
+   * Follow focus into the grid, so the row being read is the one whose tooltip
+   * triggers are in the tab order (see this module's header).
+   *
+   * React's `onFocus` bubbles, so this one handler on the block sees focus land
+   * on a row — by Tab, by an arrow key through `DataTable`'s roving stop, or by
+   * a click — and on anything inside one. The row is resolved from the DOM
+   * attribute `DataTable` writes and then to its key, never kept as an index:
+   * an appended page or a regrouping moves indices, and the key stays with the
+   * transition. The containment check keeps a row of some enclosing grid, which
+   * `closest` could otherwise reach, from being mistaken for one of these.
+   */
+  const handleFocusWithin = useCallback(
+    (event: ReactFocusEvent<HTMLDivElement>): void => {
+      const target = event.target;
+
+      if (!(target instanceof Element)) {
+        return;
+      }
+
+      const rowElement = target.closest(DATA_ROW_SELECTOR);
+
+      if (rowElement === null || !event.currentTarget.contains(rowElement)) {
+        return;
+      }
+
+      const index = Number.parseInt(rowElement.getAttribute('data-row-index') ?? '', 10);
+      const focused = Number.isInteger(index) ? rows[index] : undefined;
+
+      if (focused !== undefined) {
+        setFocusedRowKey(focused.id);
+      }
+    },
+    [rows],
+  );
+
   const columns = useMemo<readonly DataTableColumn<StateTransition>[]>(
     () =>
       buildColumns({
         expandedKeys: view.expandedKeys,
+        focusedRowKey,
         onToggle: handleRowToggle,
         onTriggerSelect: handleTriggerSelect,
         onOpenSource: actions?.onOpenSource,
       }),
-    [actions?.onOpenSource, handleRowToggle, handleTriggerSelect, view.expandedKeys],
+    [actions?.onOpenSource, focusedRowKey, handleRowToggle, handleTriggerSelect, view.expandedKeys],
   );
 
   const renderDetail = useCallback(
@@ -974,8 +1343,11 @@ export function StateTransitionViewer(props: StateTransitionViewerProps): ReactE
   // States, in precedence: unsupported source, then loading, error, empty and
   // rows for the BODY. The toolbar stays mounted across all four, so a re-query
   // raised from one of its controls does not make that control disappear
-  // mid-interaction; the footer is rendered only for a resolved page, because
-  // its three counts are claims about a page that exists.
+  // mid-interaction. Loading and error replace the body only for a sequence's
+  // FIRST page — nothing is loaded yet, so there is nothing to keep. A later
+  // page in flight or failed leaves the loaded rows where they are and is
+  // reported by the footer instead, which is rendered whenever a page resolved
+  // or rows are loaded, because its counts are claims about rows that exist.
   // ---------------------------------------------------------------------------
 
   if (!sourceSupported) {
@@ -1034,8 +1406,28 @@ export function StateTransitionViewer(props: StateTransitionViewerProps): ReactE
     ? [{ label: TRUNCATED_LABEL, tone: 'warning' }]
     : [];
 
+  const anyLoaded = loaded.length > 0;
+  const firstPageLoading = status === 'loading' && !anyLoaded;
+  const firstPageFailed = status === 'error' && !anyLoaded;
+  // Shown with the failure it describes, first page or later: the request that
+  // failed, offset included, is what a developer needs to reproduce it.
+  const failedQuery =
+    status === 'error' && query !== undefined ? JSON.stringify(query, null, 2) : undefined;
+
+  // The footer's paging control, read off the status of the page requested
+  // last. Loading and failed reach the footer only behind loaded rows (the
+  // first page's are the body's), so they describe a NEXT page.
+  const nextPage: NextPageState =
+    status === 'loading'
+      ? { state: 'loading' }
+      : status === 'error'
+        ? { state: 'failed', code: error?.code, query: failedQuery, onRetry: retry }
+        : nextPageOffset === undefined
+          ? { state: 'end' }
+          : { state: 'available', onLoadMore: handleLoadMore };
+
   return (
-    <div className={clsx('dg-state-transitions', className)}>
+    <div className={clsx('dg-state-transitions', className)} onFocus={handleFocusWithin}>
       <Toolbar
         className="dg-state-transitions__toolbar"
         label={TOOLBAR_LABEL}
@@ -1046,18 +1438,18 @@ export function StateTransitionViewer(props: StateTransitionViewerProps): ReactE
         status={toolbarStatus}
       />
 
-      {status === 'loading' ? (
+      {firstPageLoading ? (
         <LoadingState
           className="dg-state-transitions__loading"
           variant="rows"
           label={LOADING_LABEL}
         />
-      ) : status === 'error' ? (
+      ) : firstPageFailed ? (
         <ErrorState
           className="dg-state-transitions__error"
           message={ERROR_MESSAGE}
           {...(error === undefined ? {} : { code: error.code })}
-          {...(query === undefined ? {} : { query: JSON.stringify(query, null, 2) })}
+          {...(failedQuery === undefined ? {} : { query: failedQuery })}
           onRetry={retry}
         />
       ) : rows.length === 0 ? (
@@ -1080,16 +1472,14 @@ export function StateTransitionViewer(props: StateTransitionViewerProps): ReactE
         />
       )}
 
-      {status === 'success' ? (
+      {status === 'success' || anyLoaded ? (
         <PagingFooter
           drawn={rows.length}
           loaded={loaded.length}
-          total={total}
-          hasMore={nextOffset !== undefined}
-          atCeiling={windowLimit >= DATA_QUERY_MAX_LIMIT}
+          total={knownTotal}
+          next={nextPage}
           changedOnly={view.changedOnly}
           grouped={view.grouped}
-          onLoadMore={handleLoadMore}
         />
       ) : null}
     </div>
@@ -1112,6 +1502,11 @@ export function StateTransitionViewer(props: StateTransitionViewerProps): ReactE
 interface ColumnContext {
   /** The rows whose detail is open, for the expand affordance's label and glyph. */
   readonly expandedKeys: readonly string[];
+  /**
+   * The row that holds focus, whose tooltip triggers join the tab order, or
+   * `null` before focus has entered the grid. See {@link inRowTabIndex}.
+   */
+  readonly focusedRowKey: string | null;
   /** Discloses or hides one row's detail. */
   readonly onToggle: (transition: StateTransition) => void;
   /** Opens the record a transition is attributed to. */
@@ -1123,8 +1518,8 @@ interface ColumnContext {
 /**
  * Build the column set.
  *
- * A function rather than a constant because three of the six cells need the
- * callbacks and the expansion set; it is memoized by the caller on exactly
+ * A function rather than a constant because the cells need the callbacks, the
+ * expansion set and the focused row; it is memoized by the caller on exactly
  * those inputs.
  *
  * @param context See {@link ColumnContext}.
@@ -1156,25 +1551,43 @@ function buildColumns(context: ColumnContext): readonly DataTableColumn<StateTra
       key: 'previous',
       header: HEADERS.previous,
       width: 'minmax(0, 1.4fr)',
-      cell: (row) => <ValueCell summary={row.previousValue} side="previous" />,
+      cell: (row) => (
+        <ValueCell
+          summary={row.previousValue}
+          side="previous"
+          tabbable={row.id === context.focusedRowKey}
+        />
+      ),
     },
     {
       key: 'trigger',
       header: HEADERS.trigger,
       width: 'minmax(0, 1.1fr)',
-      cell: (row) => <TriggerCell transition={row} onSelect={context.onTriggerSelect} />,
+      cell: (row) => (
+        <TriggerCell
+          transition={row}
+          onSelect={context.onTriggerSelect}
+          tabbable={row.id === context.focusedRowKey}
+        />
+      ),
     },
     {
       key: 'next',
       header: HEADERS.next,
       width: 'minmax(0, 1.4fr)',
-      cell: (row) => <ValueCell summary={row.nextValue} side="next" />,
+      cell: (row) => (
+        <ValueCell
+          summary={row.nextValue}
+          side="next"
+          tabbable={row.id === context.focusedRowKey}
+        />
+      ),
     },
     {
       key: 'changed',
       header: HEADERS.changed,
       width: 'minmax(0, 0.9fr)',
-      cell: (row) => <ChangedCell transition={row} />,
+      cell: (row) => <ChangedCell transition={row} tabbable={row.id === context.focusedRowKey} />,
     },
   ];
 }
@@ -1295,6 +1708,8 @@ interface ValueCellProps {
   readonly summary: string | undefined;
   /** Which side this cell is, which decides its classes and its direction glyph. */
   readonly side: 'previous' | 'next';
+  /** Whether this row holds focus, which puts a shortened summary in the tab order. */
+  readonly tabbable: boolean;
 }
 
 /**
@@ -1304,13 +1719,15 @@ interface ValueCellProps {
  * no parsing, no expansion, no re-serialisation, no comparison with the other
  * side (AAP 0.5.2). When the formatter shortened it, the cell says so through a
  * state class and a tooltip that explains the bound — it does not offer the
- * rest, because there is no rest to offer.
+ * rest, because there is no rest to offer. That summary is the tooltip's
+ * focusable trigger (see {@link inRowTabIndex}); a summary shown whole has no
+ * tooltip and so no tab index at all.
  *
  * @param props See {@link ValueCellProps}.
  * @returns The cell.
  */
 function ValueCell(props: ValueCellProps): ReactElement {
-  const { summary, side } = props;
+  const { summary, side, tabbable } = props;
 
   const preview = previewOf(summary);
   const cellClass = clsx(
@@ -1333,7 +1750,11 @@ function ValueCell(props: ValueCellProps): ReactElement {
         </Text>
       ) : preview.shortened ? (
         <Tooltip content={VALUE_SHORTENED_HINT}>
-          <Code size="sm" className="dg-state-transitions__value dg-is-truncated">
+          <Code
+            size="sm"
+            className="dg-state-transitions__value dg-is-truncated"
+            tabIndex={inRowTabIndex(tabbable)}
+          >
             {preview.text}
           </Code>
         </Tooltip>
@@ -1352,6 +1773,8 @@ interface TriggerCellProps {
   readonly transition: StateTransition;
   /** Opens the attributed record. */
   readonly onSelect: (eventId: string) => void;
+  /** Whether this row holds focus, which puts the label's explanation in the tab order. */
+  readonly tabbable: boolean;
 }
 
 /**
@@ -1361,13 +1784,16 @@ interface TriggerCellProps {
  * undetermined when there is not — never a disabled control that looks like a
  * link, and never an inference about what caused the transition. The control's
  * payload is the record id alone; see `handleTriggerSelect` in
- * {@link StateTransitionViewer} for why.
+ * {@link StateTransitionViewer} for why. The plain label is the trigger of the
+ * tooltip saying which of the two facts holds, and it is focusable for that
+ * reason alone (see {@link inRowTabIndex}): focus on it opens the explanation
+ * and activates nothing.
  *
  * @param props See {@link TriggerCellProps}.
  * @returns The cell.
  */
 function TriggerCell(props: TriggerCellProps): ReactElement {
-  const { transition, onSelect } = props;
+  const { transition, onSelect, tabbable } = props;
   const { triggerEventId, triggerKind } = transition;
 
   if (triggerEventId === undefined) {
@@ -1383,7 +1809,13 @@ function TriggerCell(props: TriggerCellProps): ReactElement {
     // assistive technology walks for no reason (AAP 0.6.4's flattening rule).
     return (
       <Tooltip content={known ? TRIGGER_OUT_OF_SLICE_HINT : TRIGGER_UNDETERMINED_HINT}>
-        <Text size="xs" tone="muted" className="dg-state-transitions__trigger" truncate>
+        <Text
+          size="xs"
+          tone="muted"
+          className="dg-state-transitions__trigger"
+          truncate
+          tabIndex={inRowTabIndex(tabbable)}
+        >
           {known ? triggerLabelOf(transition) : TRIGGER_UNDETERMINED_LABEL}
         </Text>
       </Tooltip>
@@ -1417,6 +1849,8 @@ function TriggerCell(props: TriggerCellProps): ReactElement {
 interface ChangedCellProps {
   /** The row. */
   readonly transition: StateTransition;
+  /** Whether this row holds focus, which puts its explained chips in the tab order. */
+  readonly tabbable: boolean;
 }
 
 /**
@@ -1431,16 +1865,20 @@ interface ChangedCellProps {
  *   reported floor, which describes a list and no value at all.
  *
  * Each chip carries a glyph and a word as well as a tone, so the state is never
- * conveyed by colour alone (AAP 0.6.4).
+ * conveyed by colour alone (AAP 0.6.4). The two chips that carry an
+ * explanation are that tooltip's focusable trigger (see {@link inRowTabIndex});
+ * the changed chip explains nothing and takes no tab index.
  *
  * @param props See {@link ChangedCellProps}.
  * @returns The cell.
  */
 function ChangedCell(props: ChangedCellProps): ReactElement {
-  const { transition } = props;
+  const { transition, tabbable } = props;
 
   const disclosure =
-    transition.truncated === true ? <TruncationChip transition={transition} /> : null;
+    transition.truncated === true ? (
+      <TruncationChip transition={transition} tabbable={tabbable} />
+    ) : null;
 
   if (isTruncationDisclosure(transition)) {
     return (
@@ -1473,7 +1911,11 @@ function ChangedCell(props: ChangedCellProps): ReactElement {
         </Badge>
       ) : (
         <Tooltip content={UNREPORTED_HINT}>
-          <Badge tone="neutral" icon={<CircleSlash aria-hidden="true" className="dg-icon" />}>
+          <Badge
+            tone="neutral"
+            icon={<CircleSlash aria-hidden="true" className="dg-icon" />}
+            tabIndex={inRowTabIndex(tabbable)}
+          >
             {UNREPORTED_LABEL}
           </Badge>
         </Tooltip>
@@ -1487,6 +1929,8 @@ function ChangedCell(props: ChangedCellProps): ReactElement {
 interface TruncationChipProps {
   /** The row carrying the disclosure. */
   readonly transition: StateTransition;
+  /** Whether that row holds focus, which puts the chip in the tab order. */
+  readonly tabbable: boolean;
 }
 
 /**
@@ -1494,13 +1938,15 @@ interface TruncationChipProps {
  *
  * The count is printed only when the producer disclosed one, and the tooltip
  * states that it is a floor rather than a total — which is what the aggregate
- * says it is.
+ * says it is. The chip is that tooltip's focusable trigger; see
+ * {@link inRowTabIndex}.
  *
  * @param props See {@link TruncationChipProps}.
  * @returns The chip.
  */
 function TruncationChip(props: TruncationChipProps): ReactElement {
-  const { droppedTransitions } = props.transition;
+  const { transition, tabbable } = props;
+  const { droppedTransitions } = transition;
 
   const label =
     droppedTransitions === undefined
@@ -1509,7 +1955,11 @@ function TruncationChip(props: TruncationChipProps): ReactElement {
 
   return (
     <Tooltip content={TRUNCATED_HINT}>
-      <Badge tone="warning" icon={<Scissors aria-hidden="true" className="dg-icon" />}>
+      <Badge
+        tone="warning"
+        icon={<Scissors aria-hidden="true" className="dg-icon" />}
+        tabIndex={inRowTabIndex(tabbable)}
+      >
         {label}
       </Badge>
     </Tooltip>
@@ -1652,24 +2102,47 @@ function DetailField(props: DetailFieldProps): ReactElement {
  * ---------------------------------------------------------------------------
  */
 
+/**
+ * Where the sequence stands after the page requested last, which decides the
+ * footer's paging control.
+ *
+ * A closed union rather than a set of flags, so the footer can never be asked
+ * to offer "Load more" and report a failure at once:
+ *
+ * - `end` — the provider reported no next page (see `advancedOffset`), so
+ *   nothing is offered;
+ * - `available` — a next page exists at the reported offset;
+ * - `loading` — that page is in flight, behind the rows already on screen;
+ * - `failed` — it failed; the rows stay and the retry re-requests the same page.
+ */
+type NextPageState =
+  | { readonly state: 'end' }
+  | { readonly state: 'available'; readonly onLoadMore: () => void }
+  | { readonly state: 'loading' }
+  | {
+      readonly state: 'failed';
+      /** The failure's code, when the provider's error carried one. */
+      readonly code: string | undefined;
+      /** The request that failed, serialised, offset included. */
+      readonly query: string | undefined;
+      /** Requests the same page again. */
+      readonly onRetry: () => void;
+    };
+
 /** Props of {@link PagingFooter}. */
 interface PagingFooterProps {
   /** How many rows are drawn after the reader's local narrowing and grouping. */
   readonly drawn: number;
-  /** How many rows the resolved page holds. */
+  /** How many rows every page received so far holds together. */
   readonly loaded: number;
   /** How many the source holds after the query's filter, when the provider said. */
   readonly total: number | undefined;
-  /** Whether the provider reported that more rows exist beyond this window. */
-  readonly hasMore: boolean;
-  /** Whether the window has reached the contract's ceiling. */
-  readonly atCeiling: boolean;
+  /** The paging control to offer; see {@link NextPageState}. */
+  readonly next: NextPageState;
   /** Whether the "changed only" narrowing is in force. */
   readonly changedOnly: boolean;
   /** Whether rows are grouped by component. */
   readonly grouped: boolean;
-  /** Widens the requested window by one page. */
-  readonly onLoadMore: () => void;
 }
 
 /**
@@ -1677,18 +2150,23 @@ interface PagingFooterProps {
  *
  * Three numbers rather than one, because they are three different facts and
  * conflating them is how a view starts overstating its evidence: `drawn` is
- * after the reader's own narrowing, `loaded` is the page the provider returned,
- * and `total` is what the source holds after the query's filter — absent
- * whenever the provider did not report it, in which case nothing is claimed
- * about it. The scope notes say plainly which narrowings are local, because a
- * filter that silently applied to only part of the evidence would misrepresent
- * the rest.
+ * after the reader's own narrowing, `loaded` is every page the provider
+ * returned so far, and `total` is what the source holds after the query's
+ * filter — absent whenever the provider did not report it, in which case
+ * nothing is claimed about it. The scope notes say plainly which narrowings
+ * are local, because a filter that silently applied to only part of the
+ * evidence would misrepresent the rest.
+ *
+ * The paging control follows {@link NextPageState}. While a page is in flight
+ * the same control stays in place, disabled and saying so, so it cannot request
+ * the page twice; a failed page is reported here as an alert with its retry,
+ * beside the counts of the rows it left untouched.
  *
  * @param props See {@link PagingFooterProps}.
  * @returns The footer.
  */
 function PagingFooter(props: PagingFooterProps): ReactElement {
-  const { drawn, loaded, total, hasMore, atCeiling, changedOnly, grouped, onLoadMore } = props;
+  const { drawn, loaded, total, next, changedOnly, grouped } = props;
 
   const counts =
     total === undefined
@@ -1720,16 +2198,22 @@ function PagingFooter(props: PagingFooterProps): ReactElement {
         ) : null}
       </Stack>
 
-      {hasMore ? (
-        atCeiling ? (
-          <Text size="xs" tone="muted">
-            {LIMIT_REACHED_NOTE}
-          </Text>
-        ) : (
-          <Button variant="secondary" size="sm" onClick={onLoadMore}>
-            {LOAD_MORE_LABEL}
-          </Button>
-        )
+      {next.state === 'available' ? (
+        <Button variant="secondary" size="sm" onClick={next.onLoadMore}>
+          {LOAD_MORE_LABEL}
+        </Button>
+      ) : next.state === 'loading' ? (
+        <Button variant="secondary" size="sm" disabled>
+          {LOADING_MORE_LABEL}
+        </Button>
+      ) : next.state === 'failed' ? (
+        <ErrorState
+          className="dg-state-transitions__error"
+          message={PAGE_ERROR_MESSAGE}
+          code={next.code}
+          query={next.query}
+          onRetry={next.onRetry}
+        />
       ) : null}
     </Stack>
   );

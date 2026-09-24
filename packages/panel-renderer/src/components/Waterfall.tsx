@@ -24,6 +24,18 @@
  * the top level — which is what keeps a database statement underneath the server
  * request that issued it when the function span between them is not drawn here.
  *
+ * A call the correlator itself RE-ATTACHED to the top level — its parent never
+ * arrived, or its parent links were malformed — is a different statement from a
+ * parent that is merely off this page, and it is drawn flagged rather than as an
+ * ordinary top-level row: a "Re-attached" badge, the `dg-is-orphan` state, and a
+ * sentence in its description naming the correlator's reason and the parent that
+ * could not be resolved (AAP 0.4.2: orphans are evidence, never dropped and never
+ * disguised). On the `trace` path the verdict is the tree node's own; on the flat
+ * path it is the flag the service persisted on the record, honoured only while
+ * the parent the record names is absent from what is loaded, because a parent
+ * that resolves proves the flag stale. A call lifted to the top level through an
+ * undrawn re-attached call carries that call's verdict, stated as inherited.
+ *
  * ## The sources it draws
  *
  * The catalog entry for this node type accepts `spans` and `requests`
@@ -94,22 +106,53 @@
  * ## Accessibility
  *
  * The row list is the keyboard-reachable representation of the chart and is a
- * `role="tree"` of `role="treeitem"` rows: each row is focusable, activates with
- * Enter or Space, carries `aria-level` and — when it has children —
- * `aria-expanded`, and owns its child group through `aria-owns` (the group is a
- * DOM sibling because the row itself is the three-column grid the stylesheet
- * defines, and a fourth grid child would land in the label column). The arrow
- * keys of the tree pattern move between rows: down and up to the next and
- * previous row, right to open a closed row and then to step into it, left to
- * close an open one and then to step out to its parent, Home and End to either
- * end. Each row names itself with `aria-label`, so what is announced is the
- * label, what the call was, how far into the window it started and how long it
- * took, rather than the truncated label and the tooltip's copy of it. Every row
- * is its own tab stop — a deliberate departure from the pattern's single roving
- * stop, because a waterfall is read by reaching one row among many and the rows
- * are few — and the bar layer is `aria-hidden`, which the guidance prefers
- * where the duration is printed as text. The time axis is a `role="img"`
- * graphic whose label states the window it spans.
+ * `role="tree"` of `role="treeitem"` rows: each row carries `aria-level` and —
+ * when it has children — `aria-expanded`, and owns its child group through
+ * `aria-owns` (the group is a DOM sibling because the row itself is the
+ * three-column grid the stylesheet defines, and a fourth grid child would land
+ * in the label column). Each row names itself with `aria-label`, so what is
+ * announced is the label, what the call was, how far into the window it
+ * started and how long it took, rather than the truncated label and the
+ * tooltip's copy of it. The bar layer is `aria-hidden`, which the guidance
+ * prefers where the duration is printed as text, and the time axis is a
+ * `role="img"` graphic whose label states the window it spans. A row's states
+ * are never colour alone: a failed call shows its failing status code or an
+ * "Error" badge beside the `dg-is-error` edge, and a re-attached call a
+ * "Re-attached" badge beside the `dg-is-orphan` edge.
+ *
+ * The tree is ONE composite widget, so it is ONE stop in the page's Tab order —
+ * a roving tab index: exactly one visible row carries `tabIndex={0}` and every
+ * other row `-1`. The stop starts on the first top-level row, follows focus to
+ * whichever row last received it, and falls back to the nearest visible
+ * ancestor when a collapse hides the row that held it (see
+ * {@link resolveTabStop}). Tab from any row therefore leaves the tree, and Tab
+ * back into it lands on the row that was left. The keyboard model, in full:
+ *
+ *   - **ArrowDown / ArrowUp** — the next and previous visible row.
+ *   - **ArrowRight** — open a closed row, then step into its first child.
+ *   - **ArrowLeft** — close an open row, then step out to its parent.
+ *   - **Home / End** — the first and last visible row.
+ *   - **Enter / Space** — select the row (`onSelectEvent`).
+ *   - **Shift+Enter** — open the row's source location (`onOpenSource`), on a
+ *     row that resolved to one while the host offers the action. Advertised
+ *     through `aria-keyshortcuts` on exactly those rows, and never consumed
+ *     anywhere else.
+ *   - **Escape** — dismiss the row's revealed description until focus leaves
+ *     the row; consumed only when there was a description to dismiss.
+ *
+ * The row's full description — the sentence its `aria-label` carries — is a
+ * hover tooltip on the label for a pointer. The label is not focusable and must
+ * not become a second stop, so for the KEYBOARD the same sentence is revealed
+ * when the treeitem itself receives focus other than from a pointer press, in
+ * the tooltip primitive's own open-state markup, with a Shift+Enter hint on a
+ * row whose source can be opened. That bubble is `aria-hidden`: a screen reader
+ * already hears the sentence as the row's name.
+ *
+ * The treeitem is the sole focus target of its row. The disclosure button and
+ * the source chip nested inside it stay real, pointer-activatable buttons but
+ * carry `tabIndex={-1}`, because a nested control left in the Tab order is a
+ * second or third stop per row that the pattern forbids; ArrowRight/ArrowLeft
+ * and Shift+Enter are the keyboard routes to the same two intents.
  */
 
 import type { DataQuery, WaterfallNode } from '@debuggen/panel-schema';
@@ -120,6 +163,7 @@ import type {
   DB_QUERY_ATTRIBUTE_KEYS,
   FETCH_ATTRIBUTE_KEYS,
   HTTP_SERVER_ATTRIBUTE_KEYS,
+  OrphanReason,
   RequestGroup,
   RequestOccurrence,
   TelemetryEvent,
@@ -131,8 +175,15 @@ import type {
 } from '@debuggen/telemetry';
 import clsx from 'clsx';
 import { ChevronDown, ChevronRight } from 'lucide-react';
-import { useCallback, useId, useMemo, useState } from 'react';
-import type { CSSProperties, KeyboardEvent, MouseEvent, ReactElement, ReactNode } from 'react';
+import { useCallback, useId, useMemo, useRef, useState } from 'react';
+import type {
+  CSSProperties,
+  FocusEvent,
+  KeyboardEvent,
+  MouseEvent,
+  ReactElement,
+  ReactNode,
+} from 'react';
 
 import { Stack } from '../layout/Stack';
 import { usePanelActions } from '../host/PanelActions';
@@ -145,6 +196,7 @@ import { Code } from '../primitives/Code';
 import { DurationCell } from '../primitives/DurationCell';
 import { EmptyState } from '../primitives/EmptyState';
 import { ErrorState } from '../primitives/ErrorState';
+import { Kbd } from '../primitives/Kbd';
 import { LoadingState } from '../primitives/LoadingState';
 import { Text } from '../primitives/Text';
 import { Tooltip } from '../primitives/Tooltip';
@@ -220,6 +272,17 @@ const DB_ROW_COUNT_KEY: DbQueryAttributeKey = 'db.rowCount';
  */
 const LINEAGE_AMBIGUOUS_KEY = 'lineageAmbiguous';
 const LINEAGE_CANDIDATES_KEY = 'lineageCandidates';
+
+/**
+ * The correlation keys, likewise a plain `readonly string[]` upstream
+ * (`CORRELATION_ATTRIBUTE_KEYS`): the flag the service writes onto a record it
+ * had to re-attach because the parent it named could not be resolved, and the
+ * id of that parent — so the repair survives in the store and is visible to a
+ * flat page, not only to a tree. The telemetry package's `orphanFlagsOf` reads
+ * the same two keys with the same meaning.
+ */
+const ORPHANED_KEY = 'orphaned';
+const ORPHANED_PARENT_SPAN_ID_KEY = 'orphanedParentSpanId';
 
 /* ---------------------------------------------------------------------------
  * Geometry and layout constants
@@ -351,6 +414,31 @@ function resolveIncludedKinds(
  * ------------------------------------------------------------------------- */
 
 /**
+ * Why a row sits at the top level although its call named a parent: the
+ * correlator re-attached it — or re-attached an enclosing call this view does
+ * not draw, lifting this one with it — because that parent could not be
+ * resolved. Real captured work with real timings, drawn and flagged rather than
+ * dropped, so the structure around it is never mistaken for the shape the
+ * application had (AAP 0.4.2).
+ */
+interface WaterfallOrphan {
+  /**
+   * The correlator's reason, when the payload carries one. A tree node does; a
+   * flag persisted on a flat record records only that the parent was
+   * unresolvable, never which way, so it is `undefined` there.
+   */
+  readonly reason: OrphanReason | undefined;
+  /** The parent id that could not be resolved, when one was recorded. */
+  readonly missingParentSpanId: string | undefined;
+  /**
+   * Set when the re-attached record is an undrawn call enclosing this one
+   * rather than this call itself: this row was lifted to the top level along
+   * with it.
+   */
+  readonly viaAncestor: boolean;
+}
+
+/**
  * One drawn row: a call, its measured place in the window, and the calls that
  * ran inside it.
  *
@@ -402,6 +490,8 @@ interface WaterfallRow {
   readonly lineageAmbiguous: boolean;
   /** The other candidate parents of an ambiguous continuation. */
   readonly lineageCandidates: readonly string[];
+  /** Set when the call was re-attached to the top level; see {@link WaterfallOrphan}. */
+  readonly orphan: WaterfallOrphan | undefined;
   /** Set when this row's own children were cut by the depth bound. */
   readonly childrenTruncated: boolean;
   /** The calls that ran inside this one. */
@@ -576,40 +666,93 @@ interface BuildState {
   truncated: boolean;
 }
 
+/** Where a record's parent chain led, within the records loaded so far. */
+interface Ancestry {
+  /** The nearest ancestor this view draws; `undefined` for a top-level row. */
+  readonly drawn: TelemetryEvent | undefined;
+  /**
+   * For a top-level row, the last record of the page the chain passed through
+   * before it ended — undrawn by construction — or `undefined` when the chain
+   * ended at the record itself. The one ancestor whose persisted orphan flag
+   * can still be current (see {@link persistedOrphan}), because every record
+   * below it on the chain has a parent the page holds.
+   */
+  readonly liftedThrough: TelemetryEvent | undefined;
+}
+
 /**
- * The nearest ancestor of `event` that this view is actually drawing.
+ * The nearest ancestor of `event` that this view is actually drawing, and the
+ * undrawn record a top-level row was lifted through.
  *
  * Walks the `parentSpanId` chain through *every* record in the page, not only
  * the drawn ones, which is what keeps a database statement nested under the
  * server request that issued it when the function span between them is a kind
  * this view does not draw. Bounded by {@link MAX_ANCESTOR_HOPS} and guarded
- * against a cycle in the links, both of which answer `undefined` — the row then
- * sits at the top level, which is honest about an unresolved ancestry rather
- * than inventing one.
+ * against a cycle in the links, both of which leave the row at the top level —
+ * which is honest about an unresolved ancestry rather than inventing one.
  */
-function nearestDrawnAncestor(
+function resolveAncestry(
   event: TelemetryEvent,
   bySpanId: ReadonlyMap<string, TelemetryEvent>,
   drawnBySpanId: ReadonlyMap<string, TelemetryEvent>,
-): TelemetryEvent | undefined {
+): Ancestry {
   const seen = new Set<string>([event.spanId]);
   let parentSpanId = event.parentSpanId;
+  let liftedThrough: TelemetryEvent | undefined;
   for (let hop = 0; parentSpanId !== undefined && hop < MAX_ANCESTOR_HOPS; hop += 1) {
     if (seen.has(parentSpanId)) {
-      return undefined;
+      break;
     }
     seen.add(parentSpanId);
     const drawn = drawnBySpanId.get(parentSpanId);
     if (drawn !== undefined && drawn.id !== event.id) {
-      return drawn;
+      return { drawn, liftedThrough: undefined };
     }
     const linked = bySpanId.get(parentSpanId);
     if (linked === undefined) {
-      return undefined;
+      break;
     }
+    liftedThrough = linked;
     parentSpanId = linked.parentSpanId;
   }
-  return undefined;
+  return { drawn: undefined, liftedThrough };
+}
+
+/**
+ * The orphan provenance a flat record carries in its own attribute bag, or
+ * `undefined` when it carries none that still holds.
+ *
+ * The flag is what ONE earlier correlation pass concluded, and a capture is
+ * correlated repeatedly as it streams in: a record whose parent arrived late
+ * was orphaned then and is placed correctly now. So the flag is honoured only
+ * while the parent the record names is NOT among the records loaded — a parent
+ * that resolves here proves it stale, and re-flagging a correctly nested call
+ * would invent evidence. A record naming itself resolves to nothing but itself,
+ * which does not count as resolving.
+ *
+ * @param record The record whose bag is read.
+ * @param bySpanId Every record loaded so far, by span id.
+ * @param viaAncestor Whether `record` is an undrawn call the row was lifted
+ * through rather than the row's own record.
+ */
+function persistedOrphan(
+  record: TelemetryEvent,
+  bySpanId: ReadonlyMap<string, TelemetryEvent>,
+  viaAncestor: boolean,
+): WaterfallOrphan | undefined {
+  const attributes: AttributeBag = record.attributes;
+  if (!booleanAttribute(attributes, ORPHANED_KEY)) {
+    return undefined;
+  }
+  const parent = record.parentSpanId === undefined ? undefined : bySpanId.get(record.parentSpanId);
+  if (parent !== undefined && parent.id !== record.id) {
+    return undefined;
+  }
+  return {
+    reason: undefined,
+    missingParentSpanId: stringAttribute(attributes, ORPHANED_PARENT_SPAN_ID_KEY),
+    viaAncestor,
+  };
 }
 
 /** One row from one record, with its children already materialised. */
@@ -618,6 +761,7 @@ function rowFromEvent(
   viewStart: number,
   children: readonly WaterfallRow[],
   childrenTruncated: boolean,
+  orphan: WaterfallOrphan | undefined,
 ): WaterfallRow {
   const attributes: AttributeBag = event.attributes;
   const isQuery = event.kind === 'db.query';
@@ -645,6 +789,7 @@ function rowFromEvent(
     source: event.source,
     lineageAmbiguous: booleanAttribute(attributes, LINEAGE_AMBIGUOUS_KEY),
     lineageCandidates: stringListAttribute(attributes, LINEAGE_CANDIDATES_KEY),
+    orphan,
     childrenTruncated,
     children,
   };
@@ -655,25 +800,27 @@ function materialiseEvent(
   event: TelemetryEvent,
   depth: number,
   childrenByParentId: ReadonlyMap<string, readonly TelemetryEvent[]>,
+  orphans: ReadonlyMap<string, WaterfallOrphan>,
   viewStart: number,
   state: BuildState,
   visited: Set<string>,
 ): WaterfallRow {
   visited.add(event.id);
   state.rowCount += 1;
+  const orphan = orphans.get(event.id);
   const candidates = childrenByParentId.get(event.id) ?? EMPTY_EVENTS;
   const pending = candidates.filter((child) => !visited.has(child.id));
   if (pending.length === 0) {
-    return rowFromEvent(event, viewStart, EMPTY_ROWS, false);
+    return rowFromEvent(event, viewStart, EMPTY_ROWS, false, orphan);
   }
   if (depth + 1 >= MAX_ROW_DEPTH) {
     state.truncated = true;
-    return rowFromEvent(event, viewStart, EMPTY_ROWS, true);
+    return rowFromEvent(event, viewStart, EMPTY_ROWS, true, orphan);
   }
   const children = pending.map((child) =>
-    materialiseEvent(child, depth + 1, childrenByParentId, viewStart, state, visited),
+    materialiseEvent(child, depth + 1, childrenByParentId, orphans, viewStart, state, visited),
   );
-  return rowFromEvent(event, viewStart, children, false);
+  return rowFromEvent(event, viewStart, children, false, orphan);
 }
 
 /**
@@ -717,11 +864,23 @@ function buildFromEvents(
   }
 
   const childrenByParentId = new Map<string, TelemetryEvent[]>();
+  // Orphan provenance, by record id. Only a top-level row can carry it: a row
+  // nested under a drawn ancestor has a parent chain the page resolves, which
+  // is exactly what proves any flag on it stale.
+  const orphans = new Map<string, WaterfallOrphan>();
   const roots: TelemetryEvent[] = [];
   for (const event of drawn) {
-    const ancestor = nearestDrawnAncestor(event, bySpanId, drawnBySpanId);
+    const { drawn: ancestor, liftedThrough } = resolveAncestry(event, bySpanId, drawnBySpanId);
     if (ancestor === undefined) {
       roots.push(event);
+      // The record's own flag wins; otherwise a flag on the undrawn call it was
+      // lifted through is inherited, as the tree path does for a collapsed node.
+      const orphan =
+        persistedOrphan(event, bySpanId, false) ??
+        (liftedThrough === undefined ? undefined : persistedOrphan(liftedThrough, bySpanId, true));
+      if (orphan !== undefined) {
+        orphans.set(event.id, orphan);
+      }
       continue;
     }
     const siblings = childrenByParentId.get(ancestor.id);
@@ -739,7 +898,7 @@ function buildFromEvents(
   const state: BuildState = { rowCount: 0, truncated: false };
   const visited = new Set<string>();
   const rows = roots.map((root) =>
-    materialiseEvent(root, 0, childrenByParentId, viewStart, state, visited),
+    materialiseEvent(root, 0, childrenByParentId, orphans, viewStart, state, visited),
   );
 
   return {
@@ -764,14 +923,40 @@ function buildFromEvents(
  * resolved lineage record per node.
  * ------------------------------------------------------------------------- */
 
-/** One row from one tree node, with its children already materialised. */
+/**
+ * The orphan provenance the correlator recorded on a tree node, or `undefined`
+ * for a node it placed where its record said it belonged.
+ *
+ * The node's own `orphaned` is authoritative on this path: it is the verdict of
+ * the correlation that built this very tree, so a flag persisted in the
+ * record's attribute bag — an earlier pass's verdict — is never consulted here.
+ */
+function traceOrphan(node: TraceNode, viaAncestor: boolean): WaterfallOrphan | undefined {
+  if (!node.orphaned) {
+    return undefined;
+  }
+  return {
+    reason: node.orphanReason,
+    missingParentSpanId: node.missingParentSpanId,
+    viaAncestor,
+  };
+}
+
+/**
+ * One row from one tree node, with its children already materialised.
+ *
+ * @param inherited The provenance of an undrawn orphaned node this one was
+ * lifted through, which the node's own verdict overrides.
+ */
 function rowFromTraceNode(
   node: TraceNode,
   viewStart: number,
   children: readonly WaterfallRow[],
   childrenTruncated: boolean,
+  inherited: WaterfallOrphan | undefined,
 ): WaterfallRow {
-  const base = rowFromEvent(node.event, viewStart, children, childrenTruncated);
+  const orphan = traceOrphan(node, false) ?? inherited;
+  const base = rowFromEvent(node.event, viewStart, children, childrenTruncated, orphan);
   const lineage = node.lineage;
   if (lineage === undefined) {
     return base;
@@ -789,6 +974,15 @@ function rowFromTraceNode(
  * A node of a kind this view does not draw is *collapsed through*: its drawable
  * descendants are lifted to the level it occupied, at the same depth, so nothing
  * disappears because an intermediate call was of another kind.
+ *
+ * Collapsing through an ORPHANED node must not launder its verdict: the rows it
+ * lifts to its level carry its provenance (`viaAncestor`), because they sit
+ * there only because it was re-attached. The provenance stops at the first
+ * drawn row — rows nested under a drawn row are placed correctly relative to
+ * it — and a lifted node's own verdict overrides the inherited one.
+ *
+ * @param inherited The provenance of the nearest undrawn orphaned node this
+ * level was lifted through, or `undefined`.
  */
 function collectTraceRows(
   nodes: readonly TraceNode[],
@@ -796,25 +990,27 @@ function collectTraceRows(
   kinds: ReadonlySet<TelemetryKind>,
   viewStart: number,
   state: BuildState,
+  inherited: WaterfallOrphan | undefined,
 ): readonly WaterfallRow[] {
   const rows: WaterfallRow[] = [];
   for (const node of nodes) {
     if (!kinds.has(node.event.kind)) {
-      rows.push(...collectTraceRows(node.children, depth, kinds, viewStart, state));
+      const lifted = traceOrphan(node, true) ?? inherited;
+      rows.push(...collectTraceRows(node.children, depth, kinds, viewStart, state, lifted));
       continue;
     }
     state.rowCount += 1;
     if (node.children.length === 0) {
-      rows.push(rowFromTraceNode(node, viewStart, EMPTY_ROWS, false));
+      rows.push(rowFromTraceNode(node, viewStart, EMPTY_ROWS, false, inherited));
       continue;
     }
     if (depth + 1 >= MAX_ROW_DEPTH) {
       state.truncated = true;
-      rows.push(rowFromTraceNode(node, viewStart, EMPTY_ROWS, true));
+      rows.push(rowFromTraceNode(node, viewStart, EMPTY_ROWS, true, inherited));
       continue;
     }
-    const children = collectTraceRows(node.children, depth + 1, kinds, viewStart, state);
-    rows.push(rowFromTraceNode(node, viewStart, children, false));
+    const children = collectTraceRows(node.children, depth + 1, kinds, viewStart, state, undefined);
+    rows.push(rowFromTraceNode(node, viewStart, children, false, inherited));
   }
   rows.sort(compareRows);
   return rows;
@@ -824,7 +1020,7 @@ function buildFromTrace(tree: TraceTree, kinds: ReadonlySet<TelemetryKind>): Wat
   const viewStart = asFiniteNumber(tree.startTime, 0);
   const viewEnd = Math.max(asFiniteNumber(tree.endTime, viewStart), viewStart);
   const state: BuildState = { rowCount: 0, truncated: tree.truncated };
-  const rows = collectTraceRows(tree.roots, 0, kinds, viewStart, state);
+  const rows = collectTraceRows(tree.roots, 0, kinds, viewStart, state, undefined);
   if (rows.length === 0) {
     return EMPTY_MODEL;
   }
@@ -880,6 +1076,8 @@ function rowFromOccurrence(
     source: occurrence.source,
     lineageAmbiguous: false,
     lineageCandidates: EMPTY_STRINGS,
+    // The grouped network result carries no correlation verdict.
+    orphan: undefined,
     childrenTruncated: false,
     children: EMPTY_ROWS,
   };
@@ -939,6 +1137,7 @@ function rowFromGroup(
     source: firstOccurrence?.source,
     lineageAmbiguous: false,
     lineageCandidates: EMPTY_STRINGS,
+    orphan: undefined,
     childrenTruncated: group.occurrencesTruncated,
     children,
   };
@@ -1194,6 +1393,20 @@ function statusCodeTone(statusCode: number): BadgeTone {
 }
 
 /**
+ * Whether a row needs the word "Error" to say that its call failed.
+ *
+ * A failure the telemetry reported is otherwise only a state class and a tint,
+ * and colour is never the only signal (AAP 0.6.4). A response status code of
+ * 400 or above already says it in a danger-toned chip, so the word is added
+ * only where no such code does: a failed statement or outgoing call that
+ * carries no HTTP status at all, or a request whose code does not read as a
+ * failure although the call itself did.
+ */
+function showsErrorBadge(row: WaterfallRow): boolean {
+  return row.status === 'error' && (row.statusCode === undefined || row.statusCode < 400);
+}
+
+/**
  * The full text a row is labelled with, exactly as it arrived.
  *
  * A statement wins for a database call, then — for a call that is actually a
@@ -1214,10 +1427,45 @@ function rowLabel(row: WaterfallRow): string {
 }
 
 /**
+ * Why the parent of `subject` could not be resolved, in the correlator's own
+ * four cases. A persisted flag records no reason, and is the missing-parent
+ * case by what the service writes it for.
+ */
+function orphanCause(orphan: WaterfallOrphan, subject: string): string {
+  switch (orphan.reason) {
+    case 'self-parent':
+      return `${subject} names itself as its parent`;
+    case 'cycle':
+      return `the parent chain of ${subject} loops back on itself`;
+    case 'max-depth':
+      return `${subject} sat deeper than the correlator's depth limit`;
+    case 'missing-parent':
+    case undefined:
+      return orphan.missingParentSpanId === undefined
+        ? `the parent ${subject} names never arrived`
+        : `the parent ${orphan.missingParentSpanId} of ${subject} never arrived`;
+  }
+}
+
+/**
+ * The sentence a re-attached row adds to its description: that it was lifted
+ * to the top level, whether itself or with an enclosing call this view does not
+ * draw, the correlator's reason when there is one, and the parent that could
+ * not be resolved.
+ */
+function describeOrphan(orphan: WaterfallOrphan): string {
+  const reason = orphan.reason === undefined ? '' : ` (${orphan.reason})`;
+  return orphan.viaAncestor
+    ? `re-attached to the top level with an enclosing call not drawn here${reason}: ${orphanCause(orphan, 'that call')}`
+    : `re-attached to the top level${reason}: ${orphanCause(orphan, 'this call')}`;
+}
+
+/**
  * Everything about a row that does not fit on it, as one line of text.
  *
- * Reached by pointer as a tooltip and by assistive technology as the label's
- * description. A byte figure that the runtime could not observe for a call that
+ * Reached by pointer as a tooltip, by keyboard focus of the row as the same
+ * bubble held open, and by assistive technology as the row's accessible name.
+ * A byte figure that the runtime could not observe for a call that
  * would normally carry one is stated as unavailable rather than omitted or
  * shown as a zero.
  */
@@ -1249,6 +1497,9 @@ function rowDescription(row: WaterfallRow): string {
         ? ''
         : ` · other candidates: ${row.lineageCandidates.join(', ')}`;
     parts.push(`parent inferred from an async continuation${candidates}`);
+  }
+  if (row.orphan !== undefined) {
+    parts.push(describeOrphan(row.orphan));
   }
   if (row.childrenTruncated) {
     parts.push('nested calls below this row were not drawn');
@@ -1341,6 +1592,127 @@ function focusParent(row: HTMLElement): void {
     owner.focus();
   }
 }
+
+/* ---------------------------------------------------------------------------
+ * The single tab stop
+ *
+ * The tree is one composite widget and so one stop in the page's Tab order:
+ * exactly one visible row carries `tabIndex={0}`, every other row `-1`, and the
+ * arrow keys — not Tab — move between rows. The helpers above move focus through
+ * the DOM; the row that receives it reports itself from its `onFocus`, which is
+ * what moves the stop. The stop is STATE rather than a DOM query because it has
+ * to be right on renders where nothing inside the tree holds focus — the first
+ * paint, a collapse, a newly appended page.
+ *
+ * Rows are identified by their PATH — the chain of record ids from the top level
+ * down — and not by `eventId` alone, because `eventId` is not unique among drawn
+ * rows: a grouped request's parent row reports its first occurrence's id, and
+ * that occurrence is drawn beneath it under the same id. Keyed by `eventId`,
+ * expanding such a group would put two rows in the Tab order.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * The path key of a row: its parent's key followed by its own record id.
+ *
+ * Each id is length-prefixed, which makes the concatenation uniquely decodable,
+ * so two different chains can never produce the same key whatever characters
+ * the ids contain.
+ */
+function rowKeyFor(parentKey: string | undefined, eventId: string): string {
+  return `${parentKey ?? ''}${String(eventId.length)}:${eventId}`;
+}
+
+/** What the tab-stop resolution needs to know about one drawn row. */
+interface RowIndexEntry {
+  /** The record id, which is what `expandedIds` is keyed by. */
+  readonly eventId: string;
+  /** The path key of the row this one is nested under; `undefined` at the top level. */
+  readonly parentKey: string | undefined;
+  /** Whether the row can be expanded at all. */
+  readonly hasChildren: boolean;
+}
+
+/** Every row of a model by path key, and the key of the row the stop starts on. */
+interface RowIndex {
+  readonly entries: ReadonlyMap<string, RowIndexEntry>;
+  /** The first top-level row, or `undefined` for an empty model. */
+  readonly firstKey: string | undefined;
+}
+
+/**
+ * Index every row of a model — collapsed subtrees included — by path key.
+ *
+ * Walked with an explicit stack; the model's depth is already bounded by
+ * {@link MAX_ROW_DEPTH}, and the order of insertion does not matter to a map.
+ */
+function indexRows(rows: readonly WaterfallRow[]): RowIndex {
+  const entries = new Map<string, RowIndexEntry>();
+  const pending: { readonly row: WaterfallRow; readonly parentKey: string | undefined }[] =
+    rows.map((row) => ({ row, parentKey: undefined }));
+  for (let next = pending.pop(); next !== undefined; next = pending.pop()) {
+    const { row, parentKey } = next;
+    const key = rowKeyFor(parentKey, row.eventId);
+    entries.set(key, { eventId: row.eventId, parentKey, hasChildren: row.children.length > 0 });
+    for (const child of row.children) {
+      pending.push({ row: child, parentKey: key });
+    }
+  }
+  const [first] = rows;
+  return {
+    entries,
+    firstKey: first === undefined ? undefined : rowKeyFor(undefined, first.eventId),
+  };
+}
+
+/**
+ * The row that holds the tree's single tab stop.
+ *
+ * The requested row — the one that last received focus — when it is on screen;
+ * otherwise the nearest ancestor of it that is (a collapse hid it); otherwise,
+ * when the requested row is not in the model at all (nothing was focused yet,
+ * or the query changed), the first top-level row. An ancestor chain is walked
+ * from the top down, and the first ancestor that is not open is the nearest
+ * visible one, because everything beneath a closed row is out of the document.
+ */
+function resolveTabStop(
+  index: RowIndex,
+  requestedKey: string | undefined,
+  expandedIds: ReadonlySet<string>,
+): string | undefined {
+  if (requestedKey === undefined || !index.entries.has(requestedKey)) {
+    return index.firstKey;
+  }
+  // The chain from the requested row up to its top-level ancestor. The bound is
+  // the model's own depth bound, which no well-formed chain reaches.
+  const chain: string[] = [];
+  for (
+    let key: string | undefined = requestedKey;
+    key !== undefined && chain.length <= MAX_ROW_DEPTH;
+    key = index.entries.get(key)?.parentKey
+  ) {
+    chain.push(key);
+  }
+  for (let position = chain.length - 1; position > 0; position -= 1) {
+    const ancestorKey = chain[position];
+    const ancestor = ancestorKey === undefined ? undefined : index.entries.get(ancestorKey);
+    if (ancestor === undefined) {
+      return index.firstKey;
+    }
+    if (!ancestor.hasChildren || !expandedIds.has(ancestor.eventId)) {
+      return ancestorKey;
+    }
+  }
+  return requestedKey;
+}
+
+/**
+ * The shortcut a row advertises through `aria-keyshortcuts` when Shift+Enter
+ * opens its source — the `aria-keyshortcuts` spelling of the chord.
+ */
+const OPEN_SOURCE_SHORTCUT = 'Shift+Enter';
+
+/** The same chord as the printed keys of the hint the revealed description shows. */
+const OPEN_SOURCE_KEYS: readonly string[] = ['Shift', 'Enter'];
 
 /* ---------------------------------------------------------------------------
  * The time axis
@@ -1452,8 +1824,20 @@ interface WaterfallRowItemProps {
   readonly groupIdPrefix: string;
   readonly expandedIds: ReadonlySet<string>;
   readonly selectedId: string | undefined;
+  /** The path key of the row this one is nested under; `undefined` at the top level. */
+  readonly parentKey: string | undefined;
+  /** The path key of the row holding the tree's single tab stop. */
+  readonly tabStopKey: string | undefined;
+  /** Reports that focus entered a row, which moves the tab stop to it. */
+  readonly onRowFocus: (rowKey: string) => void;
   readonly onToggle: (row: WaterfallRow) => void;
   readonly onSelect: (row: WaterfallRow) => void;
+  /**
+   * The host's open-source action, or `undefined` when there is no host. Passed
+   * down rather than read per row so the Shift+Enter command and its
+   * `aria-keyshortcuts` advertisement are decided by one value.
+   */
+  readonly onOpenSource: ((location: SourceLocation) => void) | undefined;
 }
 
 /**
@@ -1463,6 +1847,10 @@ interface WaterfallRowItemProps {
  * track, duration — so it holds exactly three children and the child group is a
  * DOM sibling, owned by the row through `aria-owns`. A fourth child would land
  * in the label column and squeeze the nesting into a two-fifths-wide box.
+ *
+ * The row element is the treeitem and the row's only focus target: it holds the
+ * tree's roving tab stop when `tabStopKey` names it, and its nested controls are
+ * out of the Tab order (see the module header's keyboard model).
  */
 function WaterfallRowItem(props: WaterfallRowItemProps): ReactElement {
   const {
@@ -1473,16 +1861,39 @@ function WaterfallRowItem(props: WaterfallRowItemProps): ReactElement {
     groupIdPrefix,
     expandedIds,
     selectedId,
+    parentKey,
+    tabStopKey,
+    onRowFocus,
     onToggle,
     onSelect,
+    onOpenSource,
   } = props;
 
   const hasChildren = row.children.length > 0;
   const expanded = hasChildren && expandedIds.has(row.eventId);
   const selected = selectedId === row.eventId;
   const groupId = `${groupIdPrefix}-${row.eventId}`;
+  const rowKey = rowKeyFor(parentKey, row.eventId);
   const label = rowLabel(row);
   const description = rowDescription(row);
+
+  // The row's source location, read once so the Shift+Enter command hands the
+  // host the very object the row holds — by reference, as the chip does.
+  const source = row.source;
+  const canOpenSource = source !== undefined && onOpenSource !== undefined;
+
+  // Whether the row's description is revealed for KEYBOARD focus. The label's
+  // `Tooltip` opens on hover and on focus of its own trigger, and its trigger —
+  // a truncated label — is not focusable and must not become a second stop in
+  // the row; so while the treeitem itself holds keyboard focus the same
+  // sentence is shown here instead. Set by a keyboard focus of the row element,
+  // cleared by Escape and by the row losing focus.
+  const [descriptionRevealed, setDescriptionRevealed] = useState(false);
+
+  // Set by a pointer press on the row and consumed by the focus it causes, so
+  // that a click — which focuses the row too — does not pop a bubble the hover
+  // tooltip already offers. A ref, not state: it changes nothing on screen.
+  const pointerFocusRef = useRef(false);
 
   // Bar geometry, in the scale's percentage range: `x` is how far into the
   // window the call started, `width` its extent with the scale's minimum
@@ -1519,17 +1930,51 @@ function WaterfallRowItem(props: WaterfallRowItemProps): ReactElement {
   };
 
   const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>): void => {
-    // A key pressed on the disclosure button or the source chip belongs to that
-    // control: both are buttons, and both act on Enter and Space themselves.
-    if (isNestedControlEvent(event.target)) {
+    // Focus can sit on the disclosure button or the source chip after a
+    // pointer pressed one — neither is in the Tab order. Enter and Space, with
+    // or without Shift, then belong to that control's own activation, which the
+    // browser performs; the arrow keys, Home and End still navigate from the
+    // row that holds it, so a pointer press never strands the keyboard.
+    if ((event.key === 'Enter' || event.key === ' ') && isNestedControlEvent(event.target)) {
       return;
     }
     const element = event.currentTarget;
     switch (event.key) {
+      case 'Escape':
+        // Dismisses the revealed description until the row loses focus, and is
+        // consumed only when there was one to dismiss: a dialog or a picking
+        // mode above the tree needs Escape too.
+        if (descriptionRevealed) {
+          event.preventDefault();
+          event.stopPropagation();
+          setDescriptionRevealed(false);
+        }
+        return;
       case 'Enter':
+        if (event.shiftKey) {
+          // The row's command for its source chip, which is out of the Tab
+          // order. Consumed only when it does something — the exact chord, on a
+          // row that resolved to a location, with a host to hand it to — so a
+          // Shift+Enter anywhere else still reaches whatever is above the tree.
+          // Never a selection: opening a file is not choosing a record.
+          if (
+            source !== undefined &&
+            onOpenSource !== undefined &&
+            !event.altKey &&
+            !event.ctrlKey &&
+            !event.metaKey
+          ) {
+            event.preventDefault();
+            onOpenSource(source);
+          }
+          return;
+        }
+        // Enter would submit an enclosing form in a host that has one.
+        event.preventDefault();
+        onSelect(row);
+        return;
       case ' ':
-        // Space scrolls the panel otherwise, and Enter would submit an
-        // enclosing form in a host that has one.
+        // Space scrolls the panel otherwise.
         event.preventDefault();
         onSelect(row);
         return;
@@ -1577,6 +2022,52 @@ function WaterfallRowItem(props: WaterfallRowItemProps): ReactElement {
     onToggle(row);
   };
 
+  const handlePointerDown = (): void => {
+    pointerFocusRef.current = true;
+  };
+
+  // Any focus inside the row — the row itself from the keyboard or a click, or
+  // a nested control a pointer landed on — moves the tree's single tab stop
+  // here. React's `onFocus` bubbles, and the child group is a DOM sibling of the
+  // row, so focus in a nested row never reaches this handler. The description
+  // is revealed only for focus of the row element itself that no pointer press
+  // caused: Tab, Shift+Tab and the tree's arrow keys.
+  const handleFocus = (event: FocusEvent<HTMLDivElement>): void => {
+    onRowFocus(rowKey);
+    const fromPointer = pointerFocusRef.current;
+    pointerFocusRef.current = false;
+    if (event.target === event.currentTarget && !fromPointer) {
+      setDescriptionRevealed(true);
+    }
+  };
+
+  // Focus leaving the row element — to another row, to a nested control, or out
+  // of the tree — ends the reveal and re-arms Escape for the next visit. A
+  // nested control's own blur is not the row's and changes nothing.
+  const handleBlur = (event: FocusEvent<HTMLDivElement>): void => {
+    pointerFocusRef.current = false;
+    if (event.target === event.currentTarget) {
+      setDescriptionRevealed(false);
+    }
+  };
+
+  // The label, in the type role its content calls for. Built once and placed
+  // in whichever of the two description forms below is active.
+  const labelElement =
+    row.statement === undefined ? (
+      <Text as="span" size="sm" truncate className="dg-waterfall__label">
+        {oneLinePreview(label, LABEL_PREVIEW_LENGTH)}
+      </Text>
+    ) : (
+      // A statement is monospace, and `dg-waterfall__label` carries the UI type
+      // role, which would override that role for the whole string. The
+      // truncation utility is composed directly instead, so the statement keeps
+      // both its font and its single line.
+      <Code size="sm" className="dg-truncate">
+        {oneLinePreview(label, LABEL_PREVIEW_LENGTH)}
+      </Code>
+    );
+
   return (
     <>
       <div
@@ -1586,6 +2077,7 @@ function WaterfallRowItem(props: WaterfallRowItemProps): ReactElement {
           selected && 'dg-is-selected',
           row.status === 'error' && 'dg-is-error',
           row.lineageAmbiguous && 'dg-is-ambiguous',
+          row.orphan !== undefined && 'dg-is-orphan',
         )}
         role="treeitem"
         aria-level={depth + 1}
@@ -1600,9 +2092,14 @@ function WaterfallRowItem(props: WaterfallRowItemProps): ReactElement {
         // name computed from the row's contents would read the label once as
         // itself and once again inside the description.
         aria-label={description}
-        tabIndex={0}
+        aria-keyshortcuts={canOpenSource ? OPEN_SOURCE_SHORTCUT : undefined}
+        // The roving tab index: one row of the whole tree is in the Tab order.
+        tabIndex={rowKey === tabStopKey ? 0 : -1}
         onClick={handleClick}
         onKeyDown={handleKeyDown}
+        onPointerDown={handlePointerDown}
+        onFocus={handleFocus}
+        onBlur={handleBlur}
       >
         <Stack direction="horizontal" gap={1} align="center" className="dg-waterfall__name">
           {hasChildren ? (
@@ -1622,6 +2119,10 @@ function WaterfallRowItem(props: WaterfallRowItemProps): ReactElement {
               // Referenced only while the group exists: a control may not point
               // at an id that is not in the document.
               {...(expanded ? { 'aria-controls': groupId } : {})}
+              // Out of the Tab order: the treeitem is the row's only stop, and
+              // ArrowRight/ArrowLeft on it are the keyboard route to the same
+              // disclosure. Still a real button for the pointer.
+              tabIndex={-1}
               onClick={handleToggle}
             />
           ) : null}
@@ -1631,22 +2132,35 @@ function WaterfallRowItem(props: WaterfallRowItemProps): ReactElement {
             </Badge>
           )}
           <span className="dg-waterfall__label-slot" style={LABEL_SLOT_STYLE}>
-            <Tooltip content={description} className="dg-waterfall__tooltip">
-              {row.statement === undefined ? (
-                <Text as="span" size="sm" truncate className="dg-waterfall__label">
-                  {oneLinePreview(label, LABEL_PREVIEW_LENGTH)}
-                </Text>
-              ) : (
-                // A statement is monospace, and `dg-waterfall__label` carries
-                // the UI type role, which would override that role for the
-                // whole string. The truncation utility is composed directly
-                // instead, so the statement keeps both its font and its single
-                // line.
-                <Code size="sm" className="dg-truncate">
-                  {oneLinePreview(label, LABEL_PREVIEW_LENGTH)}
-                </Code>
-              )}
-            </Tooltip>
+            {descriptionRevealed ? (
+              // The keyboard form: the `Tooltip` primitive's own open-state
+              // structure and classes, so it looks exactly like the hover
+              // bubble, held open by this row's focus rather than by the
+              // primitive. `aria-hidden` because the treeitem's `aria-label`
+              // already carries the same sentence and a reader must not hear
+              // it twice; one `role="tooltip"` per label at all times, since
+              // the primitive is not mounted while this is.
+              <span className="dg-tooltip dg-tooltip--bottom dg-waterfall__tooltip">
+                <span className="dg-tooltip__trigger">{labelElement}</span>
+                <span
+                  role="tooltip"
+                  aria-hidden="true"
+                  className="dg-tooltip__bubble dg-is-open dg-tooltip--bottom"
+                >
+                  {description}
+                  {canOpenSource ? (
+                    <>
+                      {' · '}
+                      <Kbd keys={OPEN_SOURCE_KEYS} /> opens the source
+                    </>
+                  ) : null}
+                </span>
+              </span>
+            ) : (
+              <Tooltip content={description} className="dg-waterfall__tooltip">
+                {labelElement}
+              </Tooltip>
+            )}
           </span>
           {row.occurrenceCount === undefined ? null : (
             <Badge tone="info" variant="outline">
@@ -1658,9 +2172,21 @@ function WaterfallRowItem(props: WaterfallRowItemProps): ReactElement {
               {String(row.statusCode)}
             </Badge>
           )}
+          {showsErrorBadge(row) ? (
+            <Badge tone="danger" className="dg-waterfall__status">
+              {formatStatusLabel('error')}
+            </Badge>
+          ) : null}
           {row.rowCount === undefined ? null : (
             <Badge tone="neutral" variant="outline">
               {`${formatCount(row.rowCount)} rows`}
+            </Badge>
+          )}
+          {row.orphan === undefined ? null : (
+            // The word Timeline uses for the same verdict; the reason and the
+            // unresolved parent are in the row's description.
+            <Badge tone="warning" variant="outline">
+              Re-attached
             </Badge>
           )}
           {row.lineageAmbiguous ? (
@@ -1673,7 +2199,9 @@ function WaterfallRowItem(props: WaterfallRowItemProps): ReactElement {
               Nested calls not drawn
             </Badge>
           ) : null}
-          {row.source === undefined ? null : <SourceLink location={row.source} compact />}
+          {/* Out of the Tab order for the same reason as the disclosure button;
+              Shift+Enter on the row is its keyboard route. */}
+          {source === undefined ? null : <SourceLink location={source} compact tabIndex={-1} />}
         </Stack>
         <div className="dg-waterfall__track">
           {/* Decorative: the duration cell beside it prints the same measurement
@@ -1703,8 +2231,12 @@ function WaterfallRowItem(props: WaterfallRowItemProps): ReactElement {
               groupIdPrefix={groupIdPrefix}
               expandedIds={expandedIds}
               selectedId={selectedId}
+              parentKey={rowKey}
+              tabStopKey={tabStopKey}
+              onRowFocus={onRowFocus}
               onToggle={onToggle}
               onSelect={onSelect}
+              onOpenSource={onOpenSource}
             />
           ))}
         </div>
@@ -1761,6 +2293,10 @@ export function Waterfall(props: WaterfallProps): ReactElement {
   );
   const [expandedIds, setExpandedIds] = useState<ReadonlySet<string>>(NO_EXPANDED_IDS);
   const [selectedId, setSelectedId] = useState<string | undefined>(undefined);
+  // The row that last received focus, by path key. What actually holds the tab
+  // stop is derived from it on every render (`resolveTabStop`), so a collapse or
+  // a new page can never leave the tree without one.
+  const [activeRowKey, setActiveRowKey] = useState<string | undefined>(undefined);
 
   // Accumulated pages belong to one query identity. When the node's query
   // changes, the pages held in state are simply not used — derived here rather
@@ -1854,6 +2390,10 @@ export function Waterfall(props: WaterfallProps): ReactElement {
       }),
     [scale, model.viewStart],
   );
+
+  const rowIndex = useMemo(() => indexRows(model.rows), [model.rows]);
+  const tabStopKey = resolveTabStop(rowIndex, activeRowKey, expandedIds);
+  const openSource = actions?.onOpenSource;
 
   const handleSelect = useCallback(
     (row: WaterfallRow): void => {
@@ -1970,8 +2510,12 @@ export function Waterfall(props: WaterfallProps): ReactElement {
               groupIdPrefix={domIdSeed}
               expandedIds={expandedIds}
               selectedId={selectedId}
+              parentKey={undefined}
+              tabStopKey={tabStopKey}
+              onRowFocus={setActiveRowKey}
               onToggle={handleToggle}
               onSelect={handleSelect}
+              onOpenSource={openSource}
             />
           ))}
         </div>

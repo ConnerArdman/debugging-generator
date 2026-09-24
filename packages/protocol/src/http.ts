@@ -98,8 +98,8 @@
 
 import { z } from 'zod';
 
-import { modificationRecordSchema } from '@debuggen/instrumentation';
-import type { ModificationRecord } from '@debuggen/instrumentation';
+import { modificationRecordSchema } from '@debuggen/instrumentation/schema';
+import type { ModificationRecord } from '@debuggen/instrumentation/schema';
 import {
   DATA_QUERY_DEFAULT_LIMIT,
   DATA_QUERY_DEFAULT_OFFSET,
@@ -1498,7 +1498,7 @@ export function parseDataResult(value: unknown): Result<DataResult, DebuggenErro
 // Seventeen entries, keyed by operation id, and the single definition of the
 // service's HTTP surface (AAP §0.9.1). `as const satisfies` is load-bearing
 // twice over: `as const` keeps every key, method, pattern and `authExempt` flag
-// a literal type, which is what lets `HttpOperation`, the mapped body helpers
+// a literal type, which is what lets `HttpOperationId`, the mapped body helpers
 // and the auth-exempt proof be derived from this object rather than declared
 // beside it; `satisfies` checks each entry against `HttpRouteDefinition` without
 // widening what `as const` narrowed, which is what keeps `HTTP_ROUTES[operation]`
@@ -1774,19 +1774,48 @@ export const HTTP_OPERATIONS = [
 ] as const satisfies readonly (keyof typeof HTTP_ROUTES)[];
 
 /**
- * One of {@link HTTP_OPERATIONS}.
+ * One of {@link HTTP_OPERATIONS}: the canonical operation-id type of the HTTP
+ * surface.
  *
- * The type every helper below is generic over, and the type a client's single
- * request method takes — which is what makes one method fully typed for
- * seventeen routes.
+ * Derived from the tuple, so it is exactly the seventeen table keys and can
+ * neither gain nor lose a member without the tuple and the table changing in
+ * the same edit. It is the type every helper below is generic over, and the key
+ * type of the one structure that must name every route:
+ * `apps/local-service/src/server/http.ts` declares its handlers as
+ * `Record<HttpOperationId, RouteHandler>` and takes this exact type from here
+ * rather than declaring a local union, so a route added to the table without a
+ * handler — or a handler left behind for a removed route — is a compile error in
+ * the service rather than a 404 discovered at run time.
+ *
+ * @example
+ * ```ts
+ * import type { HttpOperationId } from '@debuggen/protocol';
+ *
+ * const handlers: Record<HttpOperationId, RouteHandler> = {
+ *   'session.create': createSession,
+ *   // …one entry per operation; omitting any is a type error.
+ * };
+ * ```
  */
-export type HttpOperation = (typeof HTTP_OPERATIONS)[number];
+export type HttpOperationId = (typeof HTTP_OPERATIONS)[number];
+
+/**
+ * The same type as {@link HttpOperationId}, under the name the client SDK
+ * spells it.
+ *
+ * An alias, not a second derivation: both names denote one union, so a value of
+ * either is assignable to the other in both directions and the suite proves the
+ * two identical. `./client/http-client.ts`'s single `request(operation, …)`
+ * method is generic over this name, which is what makes one method fully typed
+ * for seventeen routes; new code may use either spelling.
+ */
+export type HttpOperation = HttpOperationId;
 
 /** The request schema bound to an operation, or `undefined` for a `GET`. */
-type RequestSchemaOf<O extends HttpOperation> = (typeof HTTP_ROUTES)[O]['request'];
+type RequestSchemaOf<O extends HttpOperationId> = (typeof HTTP_ROUTES)[O]['request'];
 
 /** The response schema bound to an operation. */
-type ResponseSchemaOf<O extends HttpOperation> = (typeof HTTP_ROUTES)[O]['response'];
+type ResponseSchemaOf<O extends HttpOperationId> = (typeof HTTP_ROUTES)[O]['response'];
 
 /**
  * The request body type of an operation — `undefined` for a `GET`, which carries
@@ -1800,7 +1829,7 @@ type ResponseSchemaOf<O extends HttpOperation> = (typeof HTTP_ROUTES)[O]['respon
  *
  * @typeParam O The operation.
  */
-export type HttpRequestBody<O extends HttpOperation> =
+export type HttpRequestBody<O extends HttpOperationId> =
   RequestSchemaOf<O> extends infer TSchema extends z.ZodType ? z.output<TSchema> : undefined;
 
 /**
@@ -1808,11 +1837,11 @@ export type HttpRequestBody<O extends HttpOperation> =
  *
  * @typeParam O The operation.
  */
-export type HttpResponseBody<O extends HttpOperation> =
+export type HttpResponseBody<O extends HttpOperationId> =
   ResponseSchemaOf<O> extends infer TSchema extends z.ZodType ? z.output<TSchema> : never;
 
 /** Every table key the {@link HTTP_OPERATIONS} tuple failed to list. */
-type UnlistedRouteKey = Exclude<keyof typeof HTTP_ROUTES, HttpOperation>;
+type UnlistedRouteKey = Exclude<keyof typeof HTTP_ROUTES, HttpOperationId>;
 
 /**
  * Compile-time proof that the operation tuple covers the whole table.
@@ -1831,8 +1860,8 @@ export type HttpOperationsCoverEveryRoute = AssertTrue<Identical<UnlistedRouteKe
 
 /** Every operation whose definition carries `authExempt: true`. */
 type AuthExemptRouteKey = {
-  [O in HttpOperation]: (typeof HTTP_ROUTES)[O]['authExempt'] extends true ? O : never;
-}[HttpOperation];
+  [O in HttpOperationId]: (typeof HTTP_ROUTES)[O]['authExempt'] extends true ? O : never;
+}[HttpOperationId];
 
 /**
  * The operations reachable without a credential: exactly `health` and
@@ -1889,7 +1918,7 @@ export type AuthExemptOperationsMatchRouteFlags = AssertTrue<
  * @returns `true` for `health` and `pair.complete`, `false` for the other
  * fifteen.
  */
-export function isAuthExemptOperation(operation: HttpOperation): boolean {
+export function isAuthExemptOperation(operation: HttpOperationId): boolean {
   return HTTP_ROUTES[operation].authExempt;
 }
 
@@ -1933,7 +1962,7 @@ export function isAuthExemptOperation(operation: HttpOperation): boolean {
  * // → '/sessions/ses_.../panels/pnl_...'
  * ```
  */
-export function buildPath<O extends HttpOperation>(
+export function buildPath<O extends HttpOperationId>(
   operation: O,
   params?: Readonly<Record<string, string>>,
 ): string {
@@ -2066,7 +2095,7 @@ export function pairCompletePath(): string {
  * @param value An unknown value, normally a parsed JSON request body.
  * @returns `ok(body)`, or `err(error)` naming the offending path.
  */
-export function parseHttpRequest<O extends HttpOperation>(
+export function parseHttpRequest<O extends HttpOperationId>(
   operation: O,
   value: unknown,
 ): Result<HttpRequestBody<O>, DebuggenError> {
@@ -2122,7 +2151,7 @@ export function parseHttpRequest<O extends HttpOperation>(
  * @param value An unknown value, normally a parsed JSON response body.
  * @returns `ok(body)`, or `err(error)` naming the offending path.
  */
-export function parseHttpResponse<O extends HttpOperation>(
+export function parseHttpResponse<O extends HttpOperationId>(
   operation: O,
   value: unknown,
 ): Result<HttpResponseBody<O>, DebuggenError> {

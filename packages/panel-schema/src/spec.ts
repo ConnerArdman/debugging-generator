@@ -407,12 +407,13 @@ function panelNodeChildren(node: PanelNode): readonly PanelNode[] {
  * **Depth.** Implemented with an explicit stack rather than recursion, so a
  * pathologically nested document cannot exhaust the call stack in a traversal
  * whose whole purpose may be to *detect* that nesting. The nesting bound itself
- * belongs to `./validate.ts`, the only layer that sees a whole document; this
- * function imposes none and completes on any tree it is given. Each node's path
- * is materialised as its own array, so the work is proportional to the number of
- * nodes times the depth they sit at — immaterial for a document bounded at
- * {@link PANEL_LAYOUT_MAX_NODES} nodes per container and a readable depth, and
- * the price of handing the visitor a path it may keep.
+ * belongs to `./validate.ts`, which checks it on a whole internal document (the
+ * authoring schema in `./input.ts` enforces the same constant on an authored
+ * one); this function imposes none and completes on any tree it is given. Each
+ * node's path is materialised as its own array, so the work is proportional to
+ * the number of nodes times the depth they sit at — immaterial for a document
+ * bounded at {@link PANEL_LAYOUT_MAX_NODES} nodes per container and a readable
+ * depth, and the price of handing the visitor a path it may keep.
  *
  * **Purity.** Nothing here mutates a node, and `visit` receives the node itself
  * rather than a copy: a specification is a read-only document, and every field
@@ -533,7 +534,9 @@ export const PANEL_TITLE_MAX_LENGTH = 200;
  * any panel a developer can read, because rejecting a legitimately large panel
  * does not produce a smaller one but a fallback one, which answers the
  * developer's question materially worse. Nesting *depth* is bounded separately,
- * by `./validate.ts`, which is the only layer that sees a whole document.
+ * by `PANEL_MAX_NODE_DEPTH` in `./validate.ts`: that validator checks it on
+ * every internal document, and the authoring schema in `./input.ts` enforces
+ * the same constant by construction, as a chain of that many node levels.
  */
 export const PANEL_LAYOUT_MAX_NODES = 64;
 

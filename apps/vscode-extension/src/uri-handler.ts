@@ -44,16 +44,55 @@
  *    project" has no meaning to check against.
  * 6. **Canonical containment.** Both the folder and the candidate are resolved
  *    with `fs.realpath` and compared with `isWithin`, then the result must be a
- *    regular file. This is the step that defeats a symlink inside the workspace
- *    whose target is outside it — the escape the string-level gate in
- *    `@debuggen/shared`'s `paths.ts` documents as beyond its reach.
- * 7. **The developer.** A modal confirmation, `Open ‹file›:‹line›?`, with one
+ *    regular file, and the device and inode it names are recorded as the
+ *    identity of the object being authorised. This is the step that defeats a
+ *    symlink inside the workspace whose target is outside it — the escape the
+ *    string-level gate in `@debuggen/shared`'s `paths.ts` documents as beyond
+ *    its reach.
+ * 7. **One dialog at a time.** A confirmation raised by this handler that is
+ *    still unanswered refuses every further request as `busy`, so a page
+ *    cannot stack dialogs on the developer.
+ * 8. **The developer.** A modal confirmation, `Open ‹file›:‹line›?`, with one
  *    `Open` button. Only that button proceeds.
+ * 9. **Revalidation after the answer.** The dialog is an unbounded,
+ *    user-controlled wait, and everything steps 5 and 6 proved is only true of
+ *    the instant it was proved. So the open folders are read again — a folder
+ *    closed while the dialog was up no longer contains anything — and step 6
+ *    runs again against them. The result must be the same canonical path *and*
+ *    the same device and inode that were authorised; a file replaced, renamed
+ *    over, or swapped for a link or a non-regular entry while the developer was
+ *    reading the question is refused rather than opened in its place.
+ * 10. **Identity at the moment of opening.** The canonical path is opened
+ *    `O_RDONLY | O_NOFOLLOW | O_NONBLOCK`, the descriptor's own `fstat` must be
+ *    the authorised regular file, and an `lstat` of the path must report that
+ *    same inode — which proves the path still binds to the authorised object
+ *    at that instant, with no link at its final component. The descriptor is
+ *    then **kept open**: it is the one reference to the authorised inode that
+ *    no later rename, unlink or link can re-point.
+ * 11. **The editor's copy.** VS Code reads a document by path, through its own
+ *    file service, so a verified descriptor cannot be handed to it — and a
+ *    name swapped after step 10 would otherwise be what the editor reads. So
+ *    the document is loaded into the editor *without being shown*, and its
+ *    text must equal the authorised bytes, read through the descriptor step 10
+ *    holds and decoded in the document's own encoding, before anything is
+ *    displayed. A difference is `changed`, and nothing is shown. A document
+ *    that is already open with unsaved edits is accepted as it stands: it is
+ *    the developer's own buffer, and loading it read nothing from disk.
  *
- * Only then is anything opened, and the opening itself is delegated to
- * {@link revealLocationInEditor} — the primitive that enforces no containment
- * policy precisely because its two callers disagree about what authorisation
- * means (AAP §0.2.3).
+ * Only then is anything shown, immediately and with no further wait, and the
+ * showing itself is delegated to {@link revealLocationInEditor} — the
+ * primitive that enforces no containment policy precisely because its two
+ * callers disagree about what authorisation means (AAP §0.2.3). Its own
+ * `openTextDocument` returns the model step 11 loaded and verified. What
+ * remains is stated rather than implied: the editor's model is keyed by path,
+ * as every open document is. Once the verified model exists, a later change on
+ * disk reaches it through VS Code's own file watcher, which reloads a document
+ * without unsaved edits exactly as it does for any file the developer has
+ * open, and a later save writes through whatever the path names then. Both are
+ * the editor's ordinary behaviour for an open file and outside this handler;
+ * what this handler guarantees is that the document it causes to be shown held,
+ * when it was verified, the text of the object the developer authorised — or
+ * the developer's own unsaved buffer for that path.
  *
  * ## What is deliberately *not* here
  *
@@ -97,11 +136,15 @@
  * argument, the second nothing but the filesystem — so the hostile-input table
  * in `test/suite/uri-handler.test.ts` can be exhaustive without driving a modal
  * dialog. {@link createOpenSourceUriHandler} composes them with the
- * confirmation and the reveal, every collaborator injectable, and
- * {@link registerDebuggenUriHandler} is the single registration site.
+ * confirmation, the post-confirmation revalidation, the editor-copy check and
+ * the reveal, every collaborator injectable, and
+ * {@link registerDebuggenUriHandler} is the single registration site. The
+ * colocated Vitest suite, `src/uri-handler.test.ts`, drives that composition
+ * against real temporary directories with the `vscode` module substituted —
+ * including every swap the steps above exist to refuse.
  */
 
-import { lstat, realpath } from 'node:fs/promises';
+import { constants, lstat, open, realpath, type FileHandle } from 'node:fs/promises';
 import { resolve as resolveFsPath } from 'node:path';
 import { URLSearchParams } from 'node:url';
 
@@ -112,12 +155,18 @@ import {
   err,
   isSafeRelativePath,
   isWithin,
+  map,
   mapErr,
   noopLogger,
   ok,
   toPosix,
 } from '@debuggen/shared';
 import type { DebuggenErrorCode, Logger, Result } from '@debuggen/shared';
+// The Node entry of `@debuggen/shared`: the extension host is a Node process,
+// so it may import it. The identity shape and its exact `bigint` comparison are
+// `safe-fs`'s own definitions, reused rather than restated, so "the same file"
+// means one thing in the store, the patcher and this handler.
+import { isSameFileIdentity, type FileIdentity } from '@debuggen/shared/node';
 
 import { revealLocationInEditor } from './source/open-location';
 
@@ -263,9 +312,18 @@ const REJECTION_LOG_MESSAGE = 'Refused a vscode:// source-open request';
  * - `declined` — the developer did not press `Open`.
  * - `busy` — a confirmation for another request is already open, and dialogs
  *   are never stacked.
- * - `reveal-failed` — everything was authorised and the editor still could not
- *   open the document, which normally means the file changed underneath the
- *   request.
+ * - `changed` — the developer confirmed, but what the path names is no longer
+ *   the object that was authorised before the dialog: a different canonical
+ *   path, a different device or inode, a link at the final component, a probe
+ *   that could not open it at all, a read through the verified descriptor
+ *   that failed, or an editor copy whose text is not the authorised file's.
+ *   Revalidation that fails for one of the reasons above — the folder was
+ *   closed, the path now escapes, it is no longer a regular file — reports
+ *   that reason instead.
+ * - `reveal-failed` — everything was authorised and verified, and the editor
+ *   still could not open the document: it could not load it as text (a binary
+ *   or oversized file), the authorised bytes could not be decoded in the
+ *   document's encoding, or showing the loaded document failed.
  * - `unexpected` — anything thrown that this file did not anticipate. It
  *   exists so `handleUri` can honour "never throws" without swallowing the
  *   failure silently.
@@ -281,6 +339,7 @@ export type UriRejectionReason =
   | 'not-a-file'
   | 'declined'
   | 'busy'
+  | 'changed'
   | 'reveal-failed'
   | 'unexpected';
 
@@ -326,8 +385,10 @@ interface RejectionDescriptor {
  * - `PATH_OUTSIDE_PROJECT` for the containment refusal. The vocabulary's
  *   guidance names this handler as one of the two places that raise it, "because
  *   a click-to-source request can originate from a page".
- * - `FS_UNSAFE_PATH` for a contained path that is not a regular file: a policy
- *   refusal about a filesystem object, not a raw errno under another name.
+ * - `FS_UNSAFE_PATH` for a contained path that is not a regular file, and for
+ *   a file whose identity or contents changed between authorisation and
+ *   display: both are policy refusals about a filesystem object, not a raw
+ *   errno under another name.
  * - `PROJECT_NOT_FOUND` when there is no folder to contain anything, and for a
  *   document the editor could not open.
  * - `UNAUTHORIZED` for a declined confirmation, which is precisely a refused
@@ -385,6 +446,11 @@ const REJECTIONS: Readonly<Record<UriRejectionReason, RejectionDescriptor>> = Ob
     code: 'RATE_LIMITED',
     message: 'Debug Generator is already asking about another link.',
     hint: 'Answer the open dialog, then use the link again.',
+  },
+  changed: {
+    code: 'FS_UNSAFE_PATH',
+    message: 'Debug Generator did not open the file because it changed before it could be opened.',
+    hint: 'Check the file, then use the link again.',
   },
   'reveal-failed': {
     code: 'PROJECT_NOT_FOUND',
@@ -459,9 +525,10 @@ export interface ParsedOpenRequest {
  * `registerDebuggenUriHandler(context)` is a complete call. They exist because
  * the assertions this file has to support — "a traversal opens nothing", "a
  * symlink escaping the workspace opens nothing", "declining opens nothing",
- * "no workspace is a refusal" — are about what did *not* happen, and a test
- * that cannot substitute the confirmation would have to drive a modal dialog to
- * make any of them.
+ * "no workspace is a refusal", "a file swapped while the dialog is open opens
+ * nothing" — are about what did *not* happen, and a test that cannot
+ * substitute the confirmation would have to drive a modal dialog to make any
+ * of them.
  */
 export interface UriHandlerDeps {
   /** Where refusals and successful opens are logged. Absent means no logging. */
@@ -474,6 +541,26 @@ export interface UriHandlerDeps {
    * Defaults to the modal dialog of AAP §0.2.3. A substitute must keep the
    * contract that matters: resolve `false` for anything that is not an explicit
    * confirmation, and never reject.
+   *
+   * A substitute is also the seam a host test uses to act *while the dialog is
+   * open*: it runs after the pre-dialog authorisation and before the
+   * post-confirmation revalidation, so replacing the authorised file with a
+   * link that escapes the workspace, a directory, a FIFO or another inode — or
+   * closing the folder — inside it and then resolving `true` must end in a
+   * refusal and no call to `reveal`.
+   *
+   * @example
+   * ```ts
+   * const handler = createOpenSourceUriHandler({
+   *   confirm: async () => {
+   *     await rm(authorisedFile);
+   *     await symlink(fileOutsideTheWorkspace, authorisedFile);
+   *     return true;
+   *   },
+   *   reveal: revealSpy,
+   * });
+   * await handler.handleUri(uri); // refused as `outside-workspace`; revealSpy never called
+   * ```
    */
   readonly confirm?: (request: ParsedOpenRequest) => Promise<boolean>;
 
@@ -494,6 +581,11 @@ export interface UriHandlerDeps {
    * The open folders to check containment against. Defaults to
    * `vscode.workspace.workspaceFolders`, and is injectable so the
    * no-workspace refusal can be asserted in a window that does have one open.
+   *
+   * Called twice per confirmed request — once before the dialog and once after
+   * it — so a substitute can also model a folder closed while the developer
+   * was answering, which must be refused as `no-workspace` or
+   * `outside-workspace` rather than opened.
    */
   readonly workspaceFolders?: () => readonly vscode.WorkspaceFolder[] | undefined;
 }
@@ -711,7 +803,33 @@ async function resolveInFolder(rootFsPath: string, file: string): Promise<string
 }
 
 /**
- * Whether a canonical path names a regular file.
+ * A file this handler has authorised: where it is, and *which object* it is.
+ *
+ * Internal on purpose. The exported {@link resolveWithinWorkspace} keeps
+ * answering with a URI, because that is all a caller outside this module
+ * needs; the handler itself needs the other two members, since a path is only
+ * a name and the dialog between authorisation and opening is long enough for
+ * the name to be given to something else.
+ */
+interface AuthorisedFile {
+  /** A `file:` URI built from {@link AuthorisedFile.canonicalPath}, never from the lexical candidate. */
+  readonly uri: vscode.Uri;
+
+  /** The `realpath` of the candidate, exactly as it passed containment. */
+  readonly canonicalPath: string;
+
+  /**
+   * The device and inode the canonical path named when it was authorised, as
+   * exact `bigint`s — see `FileIdentity` in `@debuggen/shared/node` for why a
+   * rounded inode number is the dangerous direction for a comparison that
+   * exists to refuse a swapped file.
+   */
+  readonly identity: FileIdentity;
+}
+
+/**
+ * The identity of the regular file a canonical path names, or `undefined` when
+ * it names anything else.
  *
  * `lstat`, not `stat`, even though `realpath` has already resolved every link
  * in the chain: if a link has appeared at that path in the interval — the
@@ -723,26 +841,35 @@ async function resolveInFolder(rootFsPath: string, file: string): Promise<string
  * Everything that is not a regular file is refused, not only a directory:
  * opening a FIFO blocks on a reader that may never come, a character device can
  * be endless, and a socket is not a document. A `stat` that throws is a
- * refusal too.
+ * refusal too, and indistinguishable from the others.
+ *
+ * `{ bigint: true }` so the recorded device and inode are exact; the identity
+ * is what the post-confirmation revalidation and the final probe compare
+ * against.
  */
-async function isRegularFile(fsPath: string): Promise<boolean> {
+async function regularFileIdentity(fsPath: string): Promise<FileIdentity | undefined> {
   try {
-    const stats = await lstat(fsPath);
-    return stats.isFile();
+    const stats = await lstat(fsPath, { bigint: true });
+    return stats.isFile() ? { dev: stats.dev, ino: stats.ino } : undefined;
   } catch {
-    return false;
+    return undefined;
   }
 }
 
 /**
- * The containment step, expressed in reasons. See
- * {@link resolveWithinWorkspace} for the contract; this is the same function
- * before the reason is wrapped in an error.
+ * The containment step, expressed in reasons and answering with the whole
+ * {@link AuthorisedFile}. See {@link resolveWithinWorkspace} for the contract;
+ * this is the same function before the reason is wrapped in an error and the
+ * authorised file is narrowed to its URI.
+ *
+ * The handler runs it twice for a confirmed request — before the dialog, and
+ * again after it against the folders open *then* — so everything it proves is
+ * proved at both instants.
  */
 async function resolveOpenRequest(
   request: ParsedOpenRequest,
   folders: readonly vscode.WorkspaceFolder[],
-): Promise<Result<vscode.Uri, UriRejectionReason>> {
+): Promise<Result<AuthorisedFile, UriRejectionReason>> {
   if (folders.length === 0) {
     return err('no-workspace');
   }
@@ -783,15 +910,18 @@ async function resolveOpenRequest(
       continue;
     }
 
-    if (!(await isRegularFile(resolved))) {
+    const identity = await regularFileIdentity(resolved);
+    if (identity === undefined) {
       sawNonFile = true;
       continue;
     }
 
     // The URI is built from the canonical path — the exact path that passed
     // containment — and not from the lexical candidate. Opening anything else
-    // would mean authorising one path and reading another.
-    return ok(vscode.Uri.file(resolved));
+    // would mean authorising one path and reading another. The identity
+    // travels with it, so "the same file" can be checked later rather than
+    // assumed from "the same name".
+    return ok({ uri: vscode.Uri.file(resolved), canonicalPath: resolved, identity });
   }
 
   return err(sawNonFile ? 'not-a-file' : 'outside-workspace');
@@ -814,6 +944,14 @@ async function resolveOpenRequest(
  * window does not have open. Merging them would weaken both, which is why
  * AAP §0.2.3 keeps them apart and why this function does not consult a session.
  *
+ * What the answer is worth, precisely: it is true of the instant it was
+ * computed. A caller that waits before opening the URI — on a dialog, above
+ * all — has to prove it again at the moment of opening, which is what the
+ * handler built by {@link createOpenSourceUriHandler} does after its
+ * confirmation (steps 9 to 11 of the module's validation sequence). This
+ * function is the pre-dialog half of that and is kept exported, with this
+ * signature, for the hostile-input table in `test/suite/uri-handler.test.ts`.
+ *
  * @param request A request whose `file` is a project-relative POSIX path. It is
  * re-validated here, whatever validated it before.
  * @param folders The open folders to check containment against, in the order
@@ -829,7 +967,280 @@ export async function resolveWithinWorkspace(
   request: ParsedOpenRequest,
   folders: readonly vscode.WorkspaceFolder[],
 ): Promise<Result<vscode.Uri, DebuggenError>> {
-  return mapErr(await resolveOpenRequest(request, folders), rejection);
+  const authorised = await resolveOpenRequest(request, folders);
+  return mapErr(
+    map(authorised, (file) => file.uri),
+    rejection,
+  );
+}
+
+/**
+ * Step 9: proves, after the developer has answered, that the request still
+ * names the object that was authorised before the dialog.
+ *
+ * The folders are the ones open **now**, read by the caller after the dialog
+ * resolved — never the array captured before it — so a folder closed while the
+ * question was up can no longer vouch for anything, and none at all is
+ * `no-workspace`. The whole of step 6 then runs again against them, and its
+ * own reasons pass through unchanged: a path that now escapes through a link
+ * is `outside-workspace`, one that is now a directory or a FIFO is
+ * `not-a-file`. Only a resolution that survives all of that is compared with
+ * the authorised object, and it must agree on the canonical path *and* on the
+ * device and inode; anything else — a different file at the same name, the
+ * same name reached through another folder, a file replaced by a rename — is
+ * `changed`.
+ *
+ * @param request The request the developer confirmed.
+ * @param authorised What step 6 authorised before the dialog.
+ * @param currentFolders The open folders as read after the dialog.
+ * @returns `Ok` with the authorised file when nothing has changed, otherwise
+ * the reason it no longer qualifies. Never throws.
+ */
+async function revalidateAfterConfirmation(
+  request: ParsedOpenRequest,
+  authorised: AuthorisedFile,
+  currentFolders: readonly vscode.WorkspaceFolder[] | undefined,
+): Promise<Result<AuthorisedFile, UriRejectionReason>> {
+  if (currentFolders === undefined || currentFolders.length === 0) {
+    return err('no-workspace');
+  }
+
+  const current = await resolveOpenRequest(request, currentFolders);
+  if (!current.ok) {
+    return current;
+  }
+
+  const unchanged =
+    current.value.canonicalPath === authorised.canonicalPath &&
+    isSameFileIdentity(authorised.identity, current.value.identity);
+
+  return unchanged ? ok(authorised) : err('changed');
+}
+
+/**
+ * An `open` flag read through `unknown`, or `0` where the platform lacks it.
+ *
+ * The same capability detection `safe-fs` in `@debuggen/shared/node` applies
+ * to `O_NOFOLLOW`, and for the same reason: the type declarations describe the
+ * POSIX constant set, so the compiler believes every such property is a
+ * number, while on Windows `O_NOFOLLOW` and `O_NONBLOCK` are genuinely absent
+ * at runtime. A missing flag must contribute nothing to the mask rather than a
+ * `NaN`, and the guarantee lost with it is covered by the `lstat` that
+ * {@link holdsAuthorisedIdentity} runs regardless.
+ */
+function openFlag(flag: unknown): number {
+  return typeof flag === 'number' ? flag : 0;
+}
+
+/**
+ * The flags of the final probe: read-only, refusing a link at the final
+ * component, and never blocking.
+ *
+ * `O_NONBLOCK` is what keeps a FIFO swapped in at the last moment from hanging
+ * the extension host: a read-only open of a FIFO with no writer would
+ * otherwise wait for one indefinitely, inside the one process every other
+ * extension shares. On a regular file it changes nothing — including for the
+ * read that step 11 makes through the same descriptor, which only happens once
+ * the descriptor's own `fstat` has proved it reached a regular file.
+ */
+function probeOpenFlags(): number {
+  return constants.O_RDONLY | openFlag(constants.O_NOFOLLOW) | openFlag(constants.O_NONBLOCK);
+}
+
+/**
+ * Step 10, first observation: opens the canonical path without following a
+ * link at its final component and without blocking.
+ *
+ * A link there fails the open with `ELOOP`, and `O_NONBLOCK` means a FIFO
+ * cannot stall it. Any failure — `ELOOP`, `ENOENT` for a file removed,
+ * `EACCES` for one whose permissions were withdrawn — answers `undefined`,
+ * which the handler reports as `changed`, so the reason set stays closed and
+ * nothing about the path reaches a log line.
+ *
+ * @param fsPath The canonical path step 9 has just re-proved.
+ * @returns The open descriptor, which the caller owns and must close, or
+ * `undefined`. Never throws.
+ */
+async function openWithoutFollowing(fsPath: string): Promise<FileHandle | undefined> {
+  try {
+    return await open(fsPath, probeOpenFlags());
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Step 10, second and third observations: proves that an open descriptor
+ * reached the authorised inode, and that the path still names it.
+ *
+ * 1. The **descriptor's** own `stat` must be a regular file with the
+ *    authorised device and inode. A descriptor cannot be re-pointed, so this
+ *    says what the open actually reached, not what the name means a moment
+ *    later.
+ * 2. An `lstat` of the path, taken while that descriptor is held, must report
+ *    the same identity. This proves the name still binds to that inode at
+ *    that instant — and, where the platform has no `O_NOFOLLOW`, it is also
+ *    what refuses a link at the final component, since `lstat` reports the
+ *    link itself.
+ *
+ * @param handle The descriptor {@link openWithoutFollowing} returned. Not
+ * closed here: its owner keeps it for step 11.
+ * @param authorised The file step 9 has just re-proved.
+ * @returns `true` only when both observations agree with the authorised
+ * identity; `false` for any disagreement and for a `stat` that throws. Never
+ * throws.
+ */
+async function holdsAuthorisedIdentity(
+  handle: FileHandle,
+  authorised: AuthorisedFile,
+): Promise<boolean> {
+  try {
+    const held = await handle.stat({ bigint: true });
+    if (!held.isFile() || !isSameFileIdentity(authorised.identity, held)) {
+      return false;
+    }
+
+    const bound = await lstat(authorised.canonicalPath, { bigint: true });
+    return bound.isFile() && isSameFileIdentity(authorised.identity, bound);
+  } catch {
+    return false;
+  }
+}
+
+/** A leading byte-order mark, which a decoder may or may not keep in the text it returns. */
+const BYTE_ORDER_MARK = '\uFEFF';
+
+/** Every line break the editor's text model recognises: `\r\n`, a lone `\r` and — untouched — `\n`. */
+const LINE_BREAKS = /\r\n?/g;
+
+/**
+ * The form in which the editor's text and the authorised bytes are compared.
+ *
+ * Two differences between them are the editor's representation rather than a
+ * different file, and only those two are removed: the text model normalises
+ * every line break in a document to a single end-of-line sequence, and whether
+ * one leading byte-order mark survives decoding depends on the encoding the
+ * editor chose. Nothing else is folded — not case, not whitespace, not Unicode
+ * normalisation — because anything else could make two different files
+ * compare equal.
+ */
+function comparableText(text: string): string {
+  const unmarked = text.startsWith(BYTE_ORDER_MARK) ? text.slice(BYTE_ORDER_MARK.length) : text;
+  return unmarked.replace(LINE_BREAKS, '\n');
+}
+
+/** Why steps 10 and 11 refused, and what was thrown when a throw is the reason. */
+interface OpeningRefusal {
+  /** The refusal reason the handler reports. */
+  readonly reason: UriRejectionReason;
+
+  /** The thrown value behind the refusal, kept for diagnosis and never put into any text. */
+  readonly cause?: unknown;
+}
+
+/**
+ * Step 11: proves that the document the editor holds for the authorised URI is
+ * the authorised file, before anything is shown.
+ *
+ * VS Code reads a document by path through its own file service, so a name
+ * swapped after step 10 would otherwise be what the editor reads — and what
+ * `reveal` then displays. This step closes that gap without depending on
+ * timing:
+ *
+ * 1. `openTextDocument` loads the document into the editor **without showing
+ *    it**. `reveal`'s own `openTextDocument` later returns this same model.
+ *    A throw — a binary file, one too large for the editor to hand to an
+ *    extension, a file that vanished — is `reveal-failed`, carrying the cause.
+ * 2. A document with unsaved edits is accepted as it stands. It was already
+ *    open, it is the developer's own buffer rather than anything on disk, and
+ *    loading it read nothing, so this request cannot have caused the editor to
+ *    read a swapped file.
+ * 3. Otherwise the authorised bytes are read **through the descriptor step 10
+ *    holds**. Whatever the path names by now, those are the bytes of the inode
+ *    the developer authorised. A read that throws is `changed`.
+ * 4. The bytes are decoded in the document's own encoding with the editor's
+ *    decoder, and must equal the document's text in {@link comparableText}
+ *    form. A difference is `changed`: the editor read something other than the
+ *    authorised file. A decoder that throws is `reveal-failed`.
+ *
+ * On a refusal the model step 1 loaded is left unshown; the editor disposes of
+ * it as it does any document no editor displays. The bytes are read only after
+ * the document loaded and only when it is not dirty, so a file the editor
+ * refused to load is never pulled into memory here.
+ *
+ * @param handle The descriptor step 10 verified and still holds.
+ * @param uri The authorised `file:` URI, as `reveal` will receive it.
+ * @returns `Ok` when the editor's copy is the authorised file's, otherwise the
+ * refusal. Never throws.
+ */
+async function verifyEditorCopy(
+  handle: FileHandle,
+  uri: vscode.Uri,
+): Promise<Result<void, OpeningRefusal>> {
+  let document: vscode.TextDocument;
+  try {
+    document = await vscode.workspace.openTextDocument(uri);
+  } catch (caught) {
+    return err({ reason: 'reveal-failed', cause: caught });
+  }
+
+  if (document.isDirty) {
+    return ok(undefined);
+  }
+
+  let authorisedBytes: Uint8Array;
+  try {
+    authorisedBytes = await handle.readFile();
+  } catch (caught) {
+    return err({ reason: 'changed', cause: caught });
+  }
+
+  let authorisedText: string;
+  try {
+    authorisedText = await vscode.workspace.decode(authorisedBytes, {
+      encoding: document.encoding,
+    });
+  } catch (caught) {
+    return err({ reason: 'reveal-failed', cause: caught });
+  }
+
+  return comparableText(document.getText()) === comparableText(authorisedText)
+    ? ok(undefined)
+    : err({ reason: 'changed' });
+}
+
+/**
+ * Steps 10 and 11 together: binds the canonical path to the authorised inode
+ * at the moment of opening, then binds the editor's copy to that same inode,
+ * through one descriptor held across both.
+ *
+ * The descriptor is the only reference to the authorised object that no later
+ * rename, unlink or link can re-point, which is why it stays open from the
+ * `fstat` of step 10 to the read of step 11 instead of being closed after the
+ * probe. It is closed here, in one place, on every path — before `reveal` is
+ * called, which it does not affect: the editor holds its own copy by then.
+ *
+ * @param authorised The file step 9 has just re-proved.
+ * @returns `Ok` when the path and the editor's copy both still belong to the
+ * authorised inode, otherwise the refusal. Rejects only if closing the
+ * descriptor fails, which the handler's own `catch` reports as `unexpected`,
+ * with nothing shown.
+ */
+async function verifyAtOpening(authorised: AuthorisedFile): Promise<Result<void, OpeningRefusal>> {
+  const handle = await openWithoutFollowing(authorised.canonicalPath);
+  if (handle === undefined) {
+    return err({ reason: 'changed' });
+  }
+
+  try {
+    if (!(await holdsAuthorisedIdentity(handle, authorised))) {
+      return err({ reason: 'changed' });
+    }
+
+    return await verifyEditorCopy(handle, authorised.uri);
+  } finally {
+    await handle.close();
+  }
 }
 
 /**
@@ -846,9 +1257,12 @@ export async function resolveWithinWorkspace(
  * shows the **project-relative** path: it is the path the developer recognises,
  * and the resolved absolute path would disclose the filesystem layout to
  * whatever is looking over their shoulder for no gain (AAP §0.5.2). By the time
- * this runs, that value has passed every gate — no control character can
- * rewrite the dialog around it, and the path is known to name a regular file
- * inside a folder the window has open.
+ * this runs, that value has passed every gate before the dialog — no control
+ * character can rewrite the dialog around it, and the path is known to have
+ * named a regular file inside a folder the window has open when the dialog was
+ * raised. How long the developer takes to answer is theirs to decide, so
+ * nothing proved before this call is relied on after it: the handler proves it
+ * all again once the answer is in.
  */
 async function confirmOpenRequest(request: ParsedOpenRequest): Promise<boolean> {
   const answer = await vscode.window.showWarningMessage(
@@ -879,7 +1293,8 @@ function showWarningNotification(message: string): void {
  * `vscode.workspace.workspaceFolders` changes while the window lives: a folder
  * added or removed after activation must be reflected in the very next request,
  * and a captured array would authorise against a workspace that no longer
- * exists.
+ * exists. The handler reads it again after its confirmation for the same
+ * reason: the dialog can stay open while the window's folders change.
  */
 function defaultWorkspaceFolders(): readonly vscode.WorkspaceFolder[] | undefined {
   return vscode.workspace.workspaceFolders;
@@ -962,7 +1377,22 @@ export function createOpenSourceUriHandler(deps: UriHandlerDeps = {}): vscode.Ur
 
   /**
    * The whole flow: parse, then workspace, then containment, then the flood
-   * guard, then the developer, then the editor.
+   * guard, then the developer, then — because the developer's answer can take
+   * as long as they like — the workspace and containment again with an
+   * identity comparison, then the identity-preserving probe, then the editor's
+   * unshown copy checked against the bytes behind that probe, then the editor.
+   * The step numbers in the comments below are the module's validation
+   * sequence.
+   *
+   * The file handed to `reveal` is the one authorised before the dialog, and
+   * only after steps 9 to 11 have proved that its canonical path still names
+   * the same device and inode inside a folder open after the answer, and that
+   * the document the editor loaded for it holds that inode's text. `reveal`
+   * is called directly after step 11 with no other wait in between, and shows
+   * the model step 11 verified — see {@link verifyEditorCopy} for why that
+   * check, rather than a descriptor handed to the editor, is what binds the
+   * displayed text to the authorised object, and the module header for what
+   * remains the editor's own behaviour once the document is open.
    *
    * Thin by design — each step is one call to one of the functions above — and
    * wrapped in a `try` that turns anything unforeseen into a refusal, because a
@@ -988,14 +1418,14 @@ export function createOpenSourceUriHandler(deps: UriHandlerDeps = {}): vscode.Ur
       }
 
       // Step 6: the canonical containment check, the gate a symlink cannot
-      // cross.
-      const resolved = await resolveOpenRequest(request, folders);
-      if (!resolved.ok) {
-        refuse(resolved.error);
+      // cross, recording which device and inode it authorised.
+      const authorised = await resolveOpenRequest(request, folders);
+      if (!authorised.ok) {
+        refuse(authorised.error);
         return;
       }
 
-      // Step 8, ahead of the dialog it guards: one unanswered confirmation at a
+      // Step 7, ahead of the dialog it guards: one unanswered confirmation at a
       // time, so a page cannot trap the developer in a stack of dialogs.
       if (pending) {
         refuse('busy');
@@ -1004,7 +1434,7 @@ export function createOpenSourceUriHandler(deps: UriHandlerDeps = {}): vscode.Ur
 
       pending = true;
       try {
-        // Step 7: the developer decides. Nothing is opened for any answer but
+        // Step 8: the developer decides. Nothing is opened for any answer but
         // an explicit confirmation.
         const confirmed = await confirm(request);
         if (!confirmed) {
@@ -1012,10 +1442,38 @@ export function createOpenSourceUriHandler(deps: UriHandlerDeps = {}): vscode.Ur
           return;
         }
 
-        // Step 9: the editor primitive owns everything about the document —
-        // the 1-based conversion, the selection, clamping a position the file
-        // no longer has, the scroll and the transient highlight.
-        const revealed = await reveal(resolved.value, request.line, request.column, { logger });
+        // Step 9: the dialog was an unbounded wait, so nothing steps 5 and 6
+        // proved is still assumed. The folders are read again — a folder
+        // closed meanwhile no longer counts — and containment, the regular-file
+        // check and the identity must all agree with what was authorised.
+        const revalidated = await revalidateAfterConfirmation(
+          request,
+          authorised.value,
+          readWorkspaceFolders(),
+        );
+        if (!revalidated.ok) {
+          refuse(revalidated.error);
+          return;
+        }
+
+        // Step 10: the path must still bind to that inode at the moment of
+        // opening, proved through a no-follow, non-blocking descriptor that
+        // stays open. Step 11: the editor loads the document without showing
+        // it, and its text must be the bytes read through that descriptor.
+        const verified = await verifyAtOpening(revalidated.value);
+        if (!verified.ok) {
+          refuse(verified.error.reason, verified.error.cause);
+          return;
+        }
+
+        // Straight from step 11, with no other wait in between: the editor
+        // primitive owns everything about the document — the 1-based
+        // conversion, the selection, clamping a position the file no longer
+        // has, the scroll and the transient highlight — and its own open
+        // returns the model step 11 verified.
+        const revealed = await reveal(revalidated.value.uri, request.line, request.column, {
+          logger,
+        });
         if (!revealed.ok) {
           refuse('reveal-failed', revealed.error);
           return;
@@ -1029,10 +1487,10 @@ export function createOpenSourceUriHandler(deps: UriHandlerDeps = {}): vscode.Ur
           clamped: revealed.value.clamped,
         });
       } finally {
-        // Released on every path out of the confirmation and the reveal,
-        // including a refusal and a thrown value. A guard that could stay set
-        // would turn one failure into a handler that refuses everything for the
-        // rest of the session.
+        // Released on every path out of the confirmation, the revalidation and
+        // the reveal, including a refusal and a thrown value. A guard that
+        // could stay set would turn one failure into a handler that refuses
+        // everything for the rest of the session.
         pending = false;
       }
     } catch (caught) {

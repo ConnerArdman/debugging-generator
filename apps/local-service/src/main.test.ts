@@ -55,6 +55,7 @@ import { join } from 'node:path';
 
 import { startService, type ServiceHandle } from './main.js';
 import { SESSIONS_DATABASE_FILE_NAME } from './config.js';
+import { STORE_SCHEMA_VERSION } from './store/migrations.js';
 
 /** The permission bits of a mode, masked out of the file-type bits. */
 const PERMISSION_BITS = 0o777;
@@ -133,7 +134,7 @@ describe('startService — the state tree and the session store', () => {
 
     const db = new DatabaseSync(databasePath);
     try {
-      expect(db.prepare('PRAGMA user_version').get()?.['user_version']).toBe(1);
+      expect(db.prepare('PRAGMA user_version').get()?.['user_version']).toBe(STORE_SCHEMA_VERSION);
       const tables = db
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
         .all()

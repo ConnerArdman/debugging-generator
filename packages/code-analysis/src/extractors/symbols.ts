@@ -1144,12 +1144,23 @@ function collectExportDeclaration(walk: Walk, declaration: ExportDeclaration): v
 /**
  * Whether a node's body is a lexical scope this walk counts and descends into.
  *
- * The seven forms that own a body a declaration can be written inside: a
+ * The eight forms that own a body a declaration can be written inside: a
  * function declaration, a function expression, an arrow function, a method, a
- * constructor and the two accessors. A class body is *not* one of them — it
- * declares members rather than holding statements — and is handled separately
- * so that entering a class does not spend depth (see
+ * constructor, the two accessors and a class `static { … }` block, whose
+ * statements run once when the class is evaluated. A class body is *not* one of
+ * them — it declares members rather than holding statements — and is handled
+ * separately so that entering a class does not spend depth (see
  * {@link collectNestedDeclarations}).
+ *
+ * The set is the one `isFunctionLikeScope` in
+ * `packages/instrumentation/src/patch/target-resolver.ts` descends into, and
+ * the two must stay equal: that resolver decides which nested declaration a
+ * patch rewrites, and the instrumentation feasibility gate asks this graph
+ * whether the declaration exists first. A scope one of them enters and the other
+ * does not is a function the patcher can time that the gate refuses as missing,
+ * or the reverse. A static block contributes no name to the enclosing chain —
+ * it has none, and neither does anything that holds it — so a function declared
+ * in one is recorded under the class it belongs to.
  *
  * @param node The node to classify.
  * @returns `true` when the node opens a nested function-like scope.
@@ -1162,7 +1173,8 @@ function isFunctionLikeScope(node: Node): boolean {
     Node.isMethodDeclaration(node) ||
     Node.isConstructorDeclaration(node) ||
     Node.isGetAccessorDeclaration(node) ||
-    Node.isSetAccessorDeclaration(node)
+    Node.isSetAccessorDeclaration(node) ||
+    Node.isClassStaticBlockDeclaration(node)
   );
 }
 

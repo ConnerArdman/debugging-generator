@@ -23,7 +23,9 @@
  *     rebuilt at all. A reconstruction covers only what rendered during the
  *     capture; presenting it as the page's structure would be a quiet lie, so
  *     the origin is a visible badge with a plain-language explanation, never a
- *     tooltip-only footnote.
+ *     tooltip-only footnote. The explanation is a line of text in the note
+ *     above the tree, which the tree names with `aria-describedby`: a sighted
+ *     reader sees it without hovering, and focusing the tree announces it.
  *   - `degraded` and `truncated` record incompleteness. Both are surfaced as
  *     short notes above the tree, and `nodeCount`/`maxDepth` are stated as
  *     numbers rather than implied by whatever happens to be on screen.
@@ -53,12 +55,35 @@
  *
  * ## Accessibility (AAP 0.6.4)
  *
- * The tree is a single composite widget: one tab stop, moved by a roving
- * `tabIndex` over the visible rows, with ArrowDown/ArrowUp for the previous and
- * next visible row, ArrowRight to expand then descend, ArrowLeft to collapse
- * then ascend, Home/End for the first and last visible row, and Enter/Space to
- * activate. Tab is never hijacked and focus is never trapped: a key this widget
- * does not own falls through untouched.
+ * The tree is a single composite widget with **one tab stop**: a roving
+ * `tabIndex` over the visible rows, and nothing inside a row in the Tab order.
+ * The keyboard model, on the focused row:
+ *
+ *   - ArrowDown/ArrowUp — the next and previous visible row; the ends do not
+ *     wrap round.
+ *   - ArrowRight — expand a closed branch, then descend to its first child.
+ *   - ArrowLeft — collapse an open branch, then ascend to the parent.
+ *   - Home/End — the first and last visible row.
+ *   - Enter/Space — activate: a branch toggles, and a leaf that resolved to
+ *     source opens it.
+ *   - Shift+Enter — open the row's source, on any row that resolved to one,
+ *     branch or leaf alike, without toggling or selecting it. Offered only when
+ *     the host can open a file, advertised on the row with
+ *     `aria-keyshortcuts`, and stated once in the note above the tree with a
+ *     `Kbd` hint. A row that cannot open anything leaves the key untouched.
+ *
+ * The two controls a row may hold — the disclosure toggle and the source chip
+ * — are `tabIndex={-1}`: still real buttons a pointer can press, but reached
+ * from the keyboard through the row's own keys above rather than by Tab, so a
+ * row is never two or three stops. A pointer press on either leaves focus on
+ * that control; the row still takes the roving stop (its `focus` handler sees
+ * the focus bubble up), the arrow keys still navigate from there, and Enter or
+ * Space is left to the focused control's own activation instead of being read
+ * as a row activation — so pressing Enter on a branch's chip opens the source
+ * rather than toggling the branch.
+ *
+ * Tab is never hijacked and focus is never trapped: a key this widget does not
+ * own falls through untouched.
  *
  * The child lists are real `role="group"` elements, but they are **siblings** of
  * the row they belong to rather than its descendants, tied to it with
@@ -118,6 +143,7 @@ import { Button } from '../primitives/Button';
 import { EmptyState } from '../primitives/EmptyState';
 import { ErrorState } from '../primitives/ErrorState';
 import { Input } from '../primitives/Input';
+import { Kbd } from '../primitives/Kbd';
 import { LoadingState } from '../primitives/LoadingState';
 import { Text } from '../primitives/Text';
 import { Tooltip } from '../primitives/Tooltip';
@@ -220,6 +246,29 @@ const EXPAND_PREFIX_LABEL = 'Expand';
 /** Collapse-toggle name prefix; completed with the row's own display name. */
 const COLLAPSE_PREFIX_LABEL = 'Collapse';
 
+/**
+ * The keys of the row command that opens a row's source, in pressing order.
+ *
+ * One list feeds both spellings of the shortcut — the `Kbd` chord a sighted
+ * reader sees in the note and the `aria-keyshortcuts` value a screen reader
+ * announces on the row — so the two can never name different keys. The key
+ * handler that honours it is {@link isOpenSourceChord}, which must change with
+ * this list.
+ */
+const OPEN_SOURCE_KEYS: readonly string[] = Object.freeze(['Shift', 'Enter']);
+
+/**
+ * `aria-keyshortcuts` for {@link OPEN_SOURCE_KEYS}: modifiers joined with `+`,
+ * as WAI-ARIA spells a chord.
+ */
+const OPEN_SOURCE_KEYSHORTCUTS = OPEN_SOURCE_KEYS.join('+');
+
+/** The hint in the note, before the chord: generic, naming no row or file. */
+const OPEN_SOURCE_HINT_PREFIX = 'Press';
+
+/** The hint in the note, after the chord. */
+const OPEN_SOURCE_HINT_SUFFIX = 'on a row to open its source.';
+
 /** Toolbar action: open every branch of the structure. */
 const EXPAND_ALL_LABEL = 'Expand all';
 
@@ -256,7 +305,11 @@ const ORIGIN_LABELS: Readonly<Record<ComponentTreeOrigin, string>> = Object.free
   flat: 'Flat listing',
 });
 
-/** What each construction route can and cannot promise, in the badge's tooltip. */
+/**
+ * What each construction route can and cannot promise, stated as visible text
+ * in the note beside the badge — never in a tooltip, which the badge, not being
+ * a focus target, could not open from the keyboard.
+ */
 const ORIGIN_DETAILS: Readonly<Record<ComponentTreeOrigin, string>> = Object.freeze({
   'commit-snapshot':
     'The runtime serialized this structure itself, at the last commit of the capture.',
@@ -556,6 +609,57 @@ function describeOrigin(origin: ComponentTreeOrigin): OriginDescription {
 /** The serialised query an error state shows, so a failure names its cause. */
 function serializeQuery(query: DataQuery): string {
   return JSON.stringify(query);
+}
+
+/* ---------------------------------------------------------------------------
+ * Row input
+ *
+ * A row is one focus target that may hold two real buttons, the disclosure
+ * toggle and the source chip. Both are out of the Tab order, but a pointer can
+ * still press — and so focus — either one, and every key and click on them
+ * bubbles to the row. The two helpers below are how the row tells its own
+ * gestures apart from gestures its controls already own.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * The button inside a row that an event came from, or `undefined` when it came
+ * from the row itself.
+ *
+ * Bounded by the row on purpose: `closest` walks past the row to the whole
+ * document, and a host that happened to place the view inside some other
+ * button must not make every row gesture look like a control's.
+ */
+function nestedControlOf(
+  event: Pick<
+    ReactMouseEvent<HTMLDivElement> | ReactKeyboardEvent<HTMLDivElement>,
+    'target' | 'currentTarget'
+  >,
+): Element | undefined {
+  const target = event.target;
+  const row = event.currentTarget;
+
+  if (!(target instanceof Element) || target === row) {
+    return undefined;
+  }
+
+  const control = target.closest('button');
+
+  return control !== null && row.contains(control) ? control : undefined;
+}
+
+/**
+ * Whether a key press is the open-source row command, {@link OPEN_SOURCE_KEYS}.
+ *
+ * Shift and nothing else: Ctrl, Alt and Meta chords with Enter belong to the
+ * host surface (an editor, a browser), which this widget never takes a key
+ * from.
+ */
+function isOpenSourceChord(
+  event: Pick<ReactKeyboardEvent, 'key' | 'shiftKey' | 'altKey' | 'ctrlKey' | 'metaKey'>,
+): boolean {
+  return (
+    event.key === 'Enter' && event.shiftKey && !event.altKey && !event.ctrlKey && !event.metaKey
+  );
 }
 
 /* ---------------------------------------------------------------------------
@@ -1072,6 +1176,15 @@ export function ComponentTree(props: ComponentTreeProps): ReactElement {
   const openSource = actions?.onOpenSource;
   const commitRef = commitEventRefOf(snapshot);
 
+  // Whether any node — shown or still collapsed — resolved to source. Decides
+  // the one-line keyboard hint in the note, which is about the whole structure
+  // rather than about the rows that happen to be open.
+  const anySource = useMemo(
+    () => prepared.all.some((entry) => entry.datum.source !== undefined),
+    [prepared],
+  );
+  const sourceCommandOffered = openSource !== undefined && anySource;
+
   const focusRow = (key: string): void => {
     setActiveKey(key);
     rowElements.current.get(key)?.focus();
@@ -1123,11 +1236,34 @@ export function ComponentTree(props: ComponentTreeProps): ReactElement {
     }
   };
 
+  /**
+   * The Shift+Enter row command: open the row's source and do nothing else.
+   *
+   * The keyboard route to the chip's intent, which is what lets the chip leave
+   * the Tab order. It works on a branch as well as a leaf — Enter on a branch
+   * toggles it, so without this a branch's source would be keyboard-unreachable
+   * — and it neither toggles, selects nor reports a disclosure. The location is
+   * handed over as the very object the datum holds, exactly as the chip does.
+   *
+   * @returns Whether the row could open anything; only then is the key consumed.
+   */
+  const openRowSource = (row: TreeRow): boolean => {
+    const location = row.node.datum.source;
+
+    if (location === undefined || openSource === undefined) {
+      return false;
+    }
+
+    openSource(location);
+
+    return true;
+  };
+
   const handleRowClick = (event: ReactMouseEvent<HTMLDivElement>, row: TreeRow): void => {
     // A control inside the row — the toggle, or the source chip — has already
     // handled this gesture. Without the guard, clicking a chip would open the
     // file and then activate the row that contains it.
-    if (event.target instanceof Element && event.target.closest('button') !== null) {
+    if (nestedControlOf(event) !== undefined) {
       return;
     }
 
@@ -1138,6 +1274,28 @@ export function ComponentTree(props: ComponentTreeProps): ReactElement {
     const position = projection.index.get(row.node.key);
 
     if (position === undefined) {
+      return;
+    }
+
+    // Checked before the switch so that Shift+Enter never reaches the plain
+    // Enter activation below. Consumed only when the row can actually open
+    // something; otherwise it falls through to the page untouched. Consuming it
+    // also cancels the native activation of a focused toggle or chip, so one
+    // press is one open, whichever element inside the row holds focus.
+    if (isOpenSourceChord(event)) {
+      if (openRowSource(row)) {
+        event.preventDefault();
+      }
+
+      return;
+    }
+
+    // Focus can sit on the toggle or the chip after a pointer press. Enter and
+    // Space then belong to that control's own activation — the chip opens the
+    // source, the toggle toggles — rather than to the row, which would otherwise
+    // toggle a branch when its chip was the thing pressed. The arrow keys, Home
+    // and End still navigate from there.
+    if ((event.key === 'Enter' || event.key === ' ') && nestedControlOf(event) !== undefined) {
       return;
     }
 
@@ -1265,6 +1423,9 @@ export function ComponentTree(props: ComponentTreeProps): ReactElement {
     const location = datum.source;
     const hasChildren = hierarchical && item.children.length > 0;
     const isSelected = item.key === selectedKey;
+    // The same two conditions `openRowSource` checks, so the row advertises the
+    // command exactly when pressing it would do something.
+    const opensSource = location !== undefined && openSource !== undefined;
 
     // The only inline style in this file, and the mechanism the stylesheet
     // expects: a unitless level it multiplies by one spacing token.
@@ -1294,6 +1455,7 @@ export function ComponentTree(props: ComponentTreeProps): ReactElement {
         aria-owns={hasChildren && row.expanded ? groupId : undefined}
         aria-labelledby={nameElementId}
         aria-describedby={metaId}
+        aria-keyshortcuts={opensSource ? OPEN_SOURCE_KEYSHORTCUTS : undefined}
         onClick={(event) => {
           handleRowClick(event, row);
         }}
@@ -1376,7 +1538,9 @@ export function ComponentTree(props: ComponentTreeProps): ReactElement {
 
         {location === undefined ? null : (
           // Forwarded field for field: this view rewrites no part of a location.
-          <SourceLink location={location} compact onOpenSource={openSource} />
+          // Out of the Tab order like the toggle: the row is the widget's one
+          // stop, and Shift+Enter on it is the keyboard route to this chip.
+          <SourceLink location={location} compact onOpenSource={openSource} tabIndex={-1} />
         )}
       </div>
     );
@@ -1550,15 +1714,22 @@ export function ComponentTree(props: ComponentTreeProps): ReactElement {
       <>
         <Stack gap={1} className="dg-component-tree__note" id={noteId}>
           <Stack direction="horizontal" gap={2} align="center" wrap>
-            <Tooltip content={origin.detail}>
-              <Badge tone={origin.tone} variant="outline">
-                {origin.label}
-              </Badge>
-            </Tooltip>
+            <Badge tone={origin.tone} variant="outline">
+              {origin.label}
+            </Badge>
             <Text size="xs" tone="muted" numeric>
               {statistics}
             </Text>
           </Stack>
+
+          {/* The badge's explanation is visible text, never a tooltip: the badge
+              is not a focus target, so a tooltip on it would be unreachable from
+              the keyboard, and what the structure can and cannot promise is part
+              of the answer. Being in the note, it is also in the description the
+              tree carries, so focusing the tree announces it. */}
+          <Text size="xs" tone="muted">
+            {origin.detail}
+          </Text>
 
           <Text size="xs" tone="muted">
             {PROVENANCE_NOTE}
@@ -1569,6 +1740,15 @@ export function ComponentTree(props: ComponentTreeProps): ReactElement {
               {caveat}
             </Text>
           ))}
+
+          {sourceCommandOffered ? (
+            // The visible half of the row command a chip out of the Tab order
+            // needs; the row's `aria-keyshortcuts` is the announced half. In the
+            // note, so it is also part of the description the tree carries.
+            <Text size="xs" tone="muted">
+              {OPEN_SOURCE_HINT_PREFIX} <Kbd keys={OPEN_SOURCE_KEYS} /> {OPEN_SOURCE_HINT_SUFFIX}
+            </Text>
+          ) : null}
         </Stack>
 
         <Toolbar

@@ -119,8 +119,8 @@ import { z } from 'zod';
 
 import { err, ok } from '@debuggen/shared';
 import type { DebuggenError, Result } from '@debuggen/shared';
-import { modificationConflictSchema } from '@debuggen/instrumentation';
-import type { ModificationConflict } from '@debuggen/instrumentation';
+import { modificationConflictSchema } from '@debuggen/instrumentation/schema';
+import type { ModificationConflict } from '@debuggen/instrumentation/schema';
 
 import { cleanupStatusSchema } from '../session-record.js';
 import type { CleanupStatus } from '../session-record.js';

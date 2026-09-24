@@ -2,13 +2,17 @@
  * `@debuggen/instrumentation` — the reversible-instrumentation layer of the
  * Debug Generator.
  *
- * ## This file is the package's only public door
+ * ## This file is the package's full public door, and `./schema` its browser-safe half
  *
- * `package.json` offers exactly one export condition — `"."`, mapped to
- * `dist/index.d.ts` and `dist/index.js` — and `tsup.config.ts` seeds its build
- * from this file and nothing else. Both consumers resolve the package through
- * that map, so neither can reach a module path inside `src/` and a symbol
- * absent from the re-exports below simply does not exist for them:
+ * `package.json` offers two export conditions: `"."`, mapped to
+ * `dist/index.d.ts` and `dist/index.js` and seeded from this file, and
+ * `"./schema"`, mapped to `dist/schema/index.d.ts` and `dist/schema/index.js`
+ * and seeded from `./schema/index.ts` — the four contract vocabularies and the
+ * `UnavailableSignal` type, with no Node-only module in their graph.
+ * `tsup.config.ts` builds exactly those two entries. Both consumers resolve the
+ * package through that map, so neither can reach a module path inside `src/`
+ * and a symbol absent from the re-exports of the entry they import simply does
+ * not exist for them:
  *
  * - `@debuggen/protocol` sits directly above this package in the layering of
  *   AAP §0.2.2 and embeds these shapes in its message schemas — the
@@ -16,7 +20,11 @@
  *   modification records and the `runtimeHooks` / `unavailable` triple in
  *   `instrumentation.ready`, the two producer configurations in `agent.config`
  *   and `server-agent.config`, the selected target in `target.selected`, and
- *   the conflict report in `cleanup.completed` (AAP §0.4.2).
+ *   the conflict report in `cleanup.completed` (AAP §0.4.2). It imports
+ *   **only** `@debuggen/instrumentation/schema`, because the protocol is
+ *   bundled into the Chrome service worker, the DevTools panel and the VS Code
+ *   webview, and this entry's graph reaches ts-morph, `node:fs` and
+ *   `@debuggen/shared/node`.
  * - `apps/local-service` parses and persists those shapes and drives every
  *   operation behind this entry from them:
  *   `src/instrumentation/service.ts` builds the
@@ -61,10 +69,12 @@
  *
  * Every non-test module under `src/` is re-exported here, in four groups that
  * follow the path one question travels: the four vocabularies of `schema/**`
- * that every other module is written in; the adapter contract, the six
- * built-in adapters and the registry that resolves an action type to one of
- * them; the three drivers that gate, apply and take back a plan; and the five
- * modules of `patch/**` the patch-mode half of that work is built from.
+ * that every other module is written in, taken through `./schema/index.ts` so
+ * that this entry and the `./schema` subpath publish one module list; the
+ * adapter contract, the six built-in adapters and the registry that resolves an
+ * action type to one of them; the three drivers that gate, apply and take back
+ * a plan; and the five modules of `patch/**` the patch-mode half of that work
+ * is built from.
  *
  * - `schema/target` — {@link SelectedTarget}, the descriptor of the element a
  *   developer picked in the inspected page, and {@link ProblemUnderstanding},
@@ -151,22 +161,31 @@
  * by one of these modules is declared by another, so nothing is ambiguous and
  * no alias is needed; keeping the form wildcard also means a symbol added to a
  * module is published without a second edit here, which is the failure mode an
- * explicit list invites. A future name collision is not silent — it is a
- * compile error at this file and in the declaration build — and the fix is to
- * convert the two colliding modules to explicit named re-export lists.
+ * explicit list invites. The one name reached twice — `UnavailableSignal`,
+ * through `./schema/index.js` and through `./adapter.js` — is the same
+ * declaration both times, which TypeScript resolves to one symbol rather than
+ * an ambiguity (TS2308); being a type, it has no run-time binding at all. The
+ * declaration build and the typecheck gate both confirm it. A future collision
+ * between two *different* declarations is not silent — it is a compile error
+ * at this file and in the declaration build — and the fix is to convert the two
+ * colliding modules to explicit named re-export lists.
  *
- * ## Node-only, by construction
+ * ## Node-only here, browser-safe under `./schema`
  *
- * Unlike `@debuggen/shared` and `@debuggen/telemetry`, this package splits off
- * no browser-safe entry, because none of it can run in a page: the patch layer
- * loads a target project through `ts-morph`, hashes and replaces files through
- * `node:fs` and the `./node` entry of `@debuggen/shared`, and keeps the
- * original bytes under the product's own state directory on disk
- * (`$DEBUGGEN_HOME/backups`, supplied by the caller rather than read from the
- * environment). `tsup` therefore builds this entry with `platform: 'node'`,
- * keeping every `node:` specifier external. The signals the schemas describe
- * for the browser tier are installed by the page agent in
- * `@debuggen/telemetry`; this package only declares them.
+ * This entry cannot run in a page: the patch layer loads a target project
+ * through `ts-morph`, hashes and replaces files through `node:fs` and the
+ * `./node` entry of `@debuggen/shared`, and keeps the original bytes under the
+ * product's own state directory on disk (`$DEBUGGEN_HOME/backups`, supplied by
+ * the caller rather than read from the environment). `tsup` therefore builds
+ * both entries with `platform: 'node'`, keeping every `node:` specifier
+ * external. The schema layer is the exception the `./schema` subpath exists
+ * for: its four modules import only `zod`, the browser-safe root of
+ * `@debuggen/shared` and erased types, so it is split into its own entry that
+ * `@debuggen/protocol` — and through it three browser bundles — can import
+ * without inheriting anything above. `packages/protocol/tsup.config.ts` proves
+ * that on every build by bundling the protocol for a browser target. The
+ * signals the schemas describe for the browser tier are installed by the page
+ * agent in `@debuggen/telemetry`; this package only declares them.
  *
  * ## Importing this module has no side effect
  *
@@ -188,12 +207,11 @@
 
 // ---------------------------------------------------------------------------
 // schema — the single definitions of the target, plan, journal and readiness
-// contracts that cross every process boundary in the product
+// contracts that cross every process boundary in the product, through the same
+// barrel the browser-safe `./schema` subpath publishes, so the two entries can
+// never list different modules
 // ---------------------------------------------------------------------------
-export * from './schema/target.js';
-export * from './schema/plan.js';
-export * from './schema/modification.js';
-export * from './schema/readiness.js';
+export * from './schema/index.js';
 
 // ---------------------------------------------------------------------------
 // adapter — the capability contract every adapter implements and the context

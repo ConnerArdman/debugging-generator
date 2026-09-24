@@ -75,27 +75,34 @@
  * ## PAGING IS HONEST ABOUT WHAT IT HAS (AAP 0.4.2)
  *
  * Two bounds apply and the reader is told about both. The result is paged —
- * `limit` defaults to 200 and is capped at 5 000 — so the footer states how many
- * rows are loaded against the reported total and offers "load more" only while
- * the response says more exist. Separately, each row's per-render list is
- * bounded by the producer, and a row that says so (`occurrencesTruncated`)
- * renders an explicit note instead of letting the expansion read as complete.
+ * every request carries the node's `limit`, which defaults to 200 and is clamped
+ * to the contract's 5 000 ceiling — so the footer states how many rows are
+ * loaded against the reported total and offers "load more" only while the
+ * provider's `nextOffset` says another page exists. Separately, each row's
+ * per-render list is bounded by the producer, and a row that says so
+ * (`occurrencesTruncated`) renders an explicit note instead of letting the
+ * expansion read as complete.
  *
- * "Load more" **grows the page** rather than accumulating pages in component
- * state: the query is re-resolved with a larger `limit`, so the rows on screen
- * are always exactly one provider answer — no evidence is held in a local
- * buffer, and there is no way for this view to draw a page of one query beneath
- * the total of another. `useQuery` compares a query by content, so rebuilding it
- * each render is free.
+ * "Load more" **advances the page sequence**; it never grows one request. The
+ * next query keeps the source, filter, order and `limit` of the first and moves
+ * its `offset` to exactly the `nextOffset` the provider returned — never to a
+ * position derived from the page length or the total — so the sequence reaches
+ * as far as the provider says it goes, past the 5 000-row page ceiling included.
+ * The pages that already arrived are frozen in a local accumulator and the new
+ * page is appended beneath them in provider order, de-duplicated by row id, so
+ * nothing is fetched or rebuilt twice. An absent `nextOffset`, or one that does
+ * not move past the page it answered, ends the sequence.
  *
- * Two consequences of that choice, both deliberate. The larger page resolves
- * through the ordinary loading state, so the block shows its silhouette while it
- * is in flight — the host contract holds no page while another request is
- * outstanding, and a table that kept drawing the previous rows would be showing
- * one query's page under another query's footer. And the view is keyed on the
- * **node's** query rather than the resolved one, so growing the page keeps the
- * reader's open rows and chosen order, while a node pointed at different
- * evidence starts over.
+ * Three consequences, all deliberate. The accumulator is written only by the
+ * "load more" gesture and is discarded — during render, with no effect — the
+ * moment the sequence's identity (node, source, filter, order, limit) changes, so
+ * a re-ordered table can never draw rows of the previous order. While the next
+ * page is in flight the loaded rows stay on screen under a busy footer, and a
+ * failed next page keeps them and reports the failure with its own retry below
+ * the footer line; only the first page resolves through the block's loading and
+ * error states. And the view is keyed on the **node's** query rather than the
+ * resolved one, so loading pages keeps the reader's open rows and chosen order,
+ * while a node pointed at different evidence starts over.
  *
  * ## ORDERING BELONGS TO THE DATA LAYER
  *
@@ -126,7 +133,8 @@
  *   `dg-render-table`                  the block: a column that may shrink
  *   `dg-render-table__toolbar`         the sort row, which never stretches
  *   `dg-render-table__loading`         the row silhouette box
- *   `dg-render-table__error`           the failure box
+ *   `dg-render-table__error`           the failure box, for the first page or
+ *                                      for a next page beneath loaded rows
  *   `dg-render-table__empty`           the empty box
  *   `dg-render-table__component-cell`  the component name, truncating, mono
  *   `dg-render-table__count-cell`      a figure column, mono and tabular
@@ -170,10 +178,16 @@ import { DATA_QUERY_SORTS, isDataQuerySort } from '@debuggen/panel-schema';
 import type { RenderOccurrence, RenderPhase, RenderStat, RenderTrigger } from '@debuggen/telemetry';
 import clsx from 'clsx';
 import { ChevronDown, ChevronRight, TriangleAlert } from 'lucide-react';
-import { useCallback, useState } from 'react';
-import type { ReactElement, ReactNode } from 'react';
+import { useCallback, useMemo, useState } from 'react';
+import type { FocusEvent as ReactFocusEvent, ReactElement, ReactNode } from 'react';
 
-import { DATA_QUERY_DEFAULT_LIMIT, DATA_QUERY_MAX_LIMIT } from '../host/DataProvider';
+import {
+  DATA_QUERY_DEFAULT_LIMIT,
+  DATA_QUERY_DEFAULT_OFFSET,
+  DATA_QUERY_MAX_LIMIT,
+  useDataProvider,
+} from '../host/DataProvider';
+import type { DataProvider } from '../host/DataProvider';
 import { usePanelActions } from '../host/PanelActions';
 import { useQuery } from '../host/useQuery';
 import { Stack } from '../layout/Stack';
@@ -241,6 +255,14 @@ const ERROR_MESSAGE = 'The render statistics for this panel could not be loaded.
 /** The empty sentence for this node — the wording AAP 0.6.2 gives this component. */
 const EMPTY_MESSAGE = 'No renders were captured for this interaction.';
 
+/**
+ * The sentence for a resolved page that held no rows while the provider still
+ * named a next page. It speaks only of this page: saying the capture holds no
+ * renders would contradict the offset the provider just returned.
+ */
+const EMPTY_PAGE_MESSAGE =
+  'This page of render statistics held no components. More of the result remains to be loaded.';
+
 /** The row-level note when the producer bounded a component's per-render list. */
 const OCCURRENCES_TRUNCATED_NOTE =
   'Not every render is listed: the per-render list is bounded by the producer.';
@@ -281,8 +303,14 @@ const SELECT_OCCURRENCE_LABEL = 'Select this render';
 /** The paging control. */
 const LOAD_MORE_LABEL = 'Load more';
 
-/** Stated instead of a paging control once the contract's page cap is reached. */
-const PAGE_CAP_NOTE = 'The largest page this view can request is already loaded.';
+/** The paging control's name while the next page is in flight behind the loaded rows. */
+const LOADING_MORE_LABEL = 'Loading more…';
+
+/**
+ * The failure line for a next page, shown beneath rows that are still on screen.
+ * States what failed, never what it might mean (AAP 0.5.5).
+ */
+const PAGE_ERROR_MESSAGE = 'The next page of render statistics could not be loaded.';
 
 /** The sort control's accessible name in the toolbar. */
 const SORT_LABEL = 'Order';
@@ -545,10 +573,36 @@ const LOADING_ROWS = 6;
 const NO_EXPANDED_KEYS: readonly string[] = Object.freeze([]);
 
 /**
- * The page a not-yet-resolved query stands in for: one frozen empty array, so
- * the rendered row list is a stable value rather than a new array per render.
+ * The rows carried before any page has been appended, and the page a resolved
+ * empty answer stands for: one frozen empty array, so the rendered row list is a
+ * stable value rather than a new array per render.
  */
 const NO_ROWS: readonly RenderStat[] = Object.freeze([]);
+
+/*
+ * ---------------------------------------------------------------------------
+ * The grid's row contract
+ *
+ * What `../primitives/DataTable` writes on a data row, read here only to learn
+ * which row keyboard focus is in (see `RenderTableView`, "The row-scoped tab
+ * stop"). Nothing here writes these attributes or competes with the primitive's
+ * own keyboard model.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * The attribute a data row element carries its index in — the row's position in
+ * the `rows` handed to the grid, and the same attribute the primitive's own
+ * keyboard handling reads.
+ */
+const ROW_INDEX_ATTRIBUTE = 'data-row-index';
+
+/**
+ * A data row element: a `role="row"` that carries a row index. The header row
+ * and an expanded detail row are `role="row"` too, without the index, so focus
+ * inside either of them matches no data row.
+ */
+const DATA_ROW_SELECTOR = `[role="row"][${ROW_INDEX_ATTRIBUTE}]`;
 
 /*
  * ---------------------------------------------------------------------------
@@ -562,24 +616,113 @@ const NO_ROWS: readonly RenderStat[] = Object.freeze([]);
  */
 
 /**
- * The page this view asks for first, and the step it grows by.
+ * The size of every page this view requests — the first and each one "load
+ * more" appends. It never changes within a page sequence: paging moves the
+ * `offset`, never the `limit`.
  *
  * The node's authored `limit` when it is usable, the contract's default
  * otherwise, clamped into `[1, DATA_QUERY_MAX_LIMIT]` and floored to whole rows.
  * The lower bound is deliberate: `limit: 0` is a legal query meaning "no items",
  * but a table drawn from it is indistinguishable from a capture that observed no
  * renders, so the smallest page this view requests is one row — the empty state
- * then means what it says.
+ * then means what it says. The upper bound is the contract's per-request ceiling
+ * and nothing more: it bounds one page, not how far the sequence may reach.
  *
  * @param limit The node's authored limit, if any.
  * @returns A whole row count between one and the contract's maximum.
  */
-function resolvePageStep(limit: number | undefined): number {
+function resolvePageLimit(limit: number | undefined): number {
   if (limit === undefined || !Number.isFinite(limit)) {
     return DATA_QUERY_DEFAULT_LIMIT;
   }
 
   return Math.min(Math.max(Math.floor(limit), 1), DATA_QUERY_MAX_LIMIT);
+}
+
+/**
+ * The position the first page of the sequence starts at.
+ *
+ * The node's authored `offset` when it is a usable position, the contract's
+ * default otherwise. Used only as the reference the first page's `nextOffset` is
+ * compared against: the first request itself carries the authored `offset`
+ * through untouched — or none at all, so the side that resolves the query applies
+ * the default and this view invents nothing on the wire.
+ *
+ * @param offset The node's authored offset, if any.
+ * @returns A whole, non-negative row position.
+ */
+function resolveBaseOffset(offset: number | undefined): number {
+  if (offset === undefined || !Number.isFinite(offset)) {
+    return DATA_QUERY_DEFAULT_OFFSET;
+  }
+
+  return Math.max(Math.floor(offset), DATA_QUERY_DEFAULT_OFFSET);
+}
+
+/**
+ * The offset "load more" advances to, or `undefined` when the sequence has ended.
+ *
+ * Only the provider's own `nextOffset` is ever followed. It is never inferred
+ * from the length of the page that arrived or from the reported total — either
+ * would drift the moment the provider clamped a page, filtered a row or grew the
+ * result underneath the reader — and no ceiling of this view's own applies to
+ * it, so an offset beyond the 5 000-row page ceiling is requested like any other.
+ *
+ * `null` and `undefined` both mean "no further page" (a JSON transport can
+ * deliver either). A value that is not a whole position, or that does not move
+ * past the page it answered, is treated as the end too: following it would
+ * re-request a page already on screen, or loop on it.
+ *
+ * @param nextOffset The provider's reported next offset for the current page.
+ * @param currentOffset The offset the current page was requested at.
+ * @returns The next page's offset, or `undefined` when there is none.
+ */
+function advanceOffset(
+  nextOffset: number | null | undefined,
+  currentOffset: number,
+): number | undefined {
+  if (nextOffset == null || !Number.isSafeInteger(nextOffset) || nextOffset <= currentOffset) {
+    return undefined;
+  }
+
+  return nextOffset;
+}
+
+/**
+ * The rows on screen: every row already loaded, then the page that just
+ * resolved, in provider order and de-duplicated by row id.
+ *
+ * The loaded rows are a frozen earlier answer and are kept exactly as they are —
+ * the first row seen for an id wins — so a row that reappears on a later page
+ * (the result grew or shifted between two requests) neither moves nor renders
+ * twice under one grid key. Nothing is sorted, re-ranked or recomputed: the
+ * service ordered both pages, and appending is the whole of the operation.
+ *
+ * @param loaded The rows accumulated before the current page, already unique.
+ * @param page The current page, or `undefined` while it is in flight or failed.
+ * @returns The combined rows; `loaded` itself when there is nothing to append.
+ */
+function appendPage(
+  loaded: readonly RenderStat[],
+  page: readonly RenderStat[] | undefined,
+): readonly RenderStat[] {
+  if (page === undefined || page.length === 0) {
+    return loaded;
+  }
+
+  const seen = new Set<string>(loaded.map((stat) => stat.id));
+  const combined: RenderStat[] = [...loaded];
+
+  for (const stat of page) {
+    if (seen.has(stat.id)) {
+      continue;
+    }
+
+    seen.add(stat.id);
+    combined.push(stat);
+  }
+
+  return combined;
 }
 
 /**
@@ -611,6 +754,41 @@ function queryIdentity(query: DataQuery): string {
     filter?.component ?? null,
     filter?.tier ?? null,
     filter?.minDuration ?? null,
+  ]);
+}
+
+/**
+ * The identity of one page sequence: which node is paging, and the first-page
+ * query every later page continues — the node's own query with the source this
+ * view forces, the order that is applied and the page size every request
+ * carries.
+ *
+ * Built from the **first** page's query, so the offset of the page in flight is
+ * excluded by construction and advancing through the sequence never changes it,
+ * while a different node, source, filter, applied order or page size does. The
+ * accumulated pages are kept only while this string is unchanged — compared
+ * during render, so a re-ordered or re-filtered table discards them in the same
+ * render that changed the query rather than one frame later.
+ *
+ * Takes the node's query and the two applied values rather than the query in
+ * flight, so the signature itself names everything a sequence is defined by and
+ * no caller can hand it a query that already carries a next page's offset.
+ *
+ * @param nodeId The id of the node whose pages these are.
+ * @param nodeQuery The query as the node carries it.
+ * @param sort The order applied to the sequence.
+ * @param limit The page size of every request in the sequence.
+ * @returns A string equal for two page sequences that continue the same query.
+ */
+function sequenceIdentity(
+  nodeId: string,
+  nodeQuery: DataQuery,
+  sort: DataQuerySort,
+  limit: number,
+): string {
+  return JSON.stringify([
+    nodeId,
+    queryIdentity({ ...nodeQuery, source: RENDERS_SOURCE, sort, limit }),
   ]);
 }
 
@@ -727,7 +905,8 @@ function median(values: readonly number[]): number | undefined {
  * too few rows to have a distribution, or a median of zero, where every non-zero
  * count would qualify and the mark would say nothing.
  *
- * @param stats The loaded page.
+ * @param stats Every row loaded so far — all accumulated pages, not only the
+ *        latest one — so the mark describes what the reader has on screen.
  * @returns The threshold, or `undefined` when no row should be marked.
  */
 function outlierThreshold(stats: readonly RenderStat[]): number | undefined {
@@ -807,7 +986,8 @@ interface TriggerChipProps {
 
   /**
    * A description to attach through `Tooltip`, for the form that has no column
-   * header above it to carry the vocabulary's definitions.
+   * header above it to carry the vocabulary's definitions. Supplying one also
+   * makes the chip a tab stop, because focus is how a keyboard reader opens it.
    */
   readonly description?: string | undefined;
 }
@@ -824,6 +1004,13 @@ interface TriggerChipProps {
  * dashed hairline that survives a monochrome surface. The hairline colour comes
  * from `../utils/color`, so this file states no colour of its own.
  *
+ * A chip that carries a description is focusable (`tabIndex={0}`): `Tooltip`
+ * opens on focus arriving inside it, so a chip nothing can focus would make its
+ * description hover-only. Only the single-render form inside an expanded row
+ * carries one — content the reader opened on purpose, beside that row's own
+ * select and source controls — while the histogram form in every grid row is
+ * explained by its column header and adds no tab stop at all.
+ *
  * @param props See {@link TriggerChipProps}.
  * @returns The chip, wrapped in a tooltip when a description was supplied.
  */
@@ -837,12 +1024,54 @@ function TriggerChip(props: TriggerChipProps): ReactElement {
       color={renderTriggerColorVar(trigger)}
       className={clsx('dg-render-table__trigger', TRIGGER_CLASSES[trigger])}
       data-trigger={trigger}
+      tabIndex={description === undefined ? undefined : 0}
     >
       {count === undefined ? trigger : `${trigger} ${formatCount(count)}`}
     </Badge>
   );
 
   return description === undefined ? chip : <Tooltip content={description}>{chip}</Tooltip>;
+}
+
+/** Props of {@link DescribedHeader}. */
+interface DescribedHeaderProps {
+  /** The column's visible header. */
+  readonly label: string;
+
+  /** The definition the header's tooltip carries. */
+  readonly description: string;
+}
+
+/**
+ * The header of a column that carries a definition: the header text, as the
+ * trigger of a tooltip holding that definition.
+ *
+ * The text is a tab stop of its own (`tabIndex={0}`), because `Tooltip` opens
+ * on focus arriving inside it and a trigger nothing can focus is a definition
+ * only a pointer can reach — and two of these definitions are what keep
+ * `Stable inputs` and `Unclassified` from being read as one figure (AAP 0.2.3).
+ * Header controls are ordinary tab stops in `../primitives/DataTable`'s keyboard
+ * model, its sort buttons included, and the body's roving tab stop is untouched:
+ * the header row carries no row index.
+ *
+ * Used only for columns that are **not** sortable. `DataTable` renders a
+ * sortable column's header inside its sort `Button`, so a tooltip there would be
+ * a focus target nested inside another — focus lands on the button and never on
+ * the trigger — and its bubble text would join the button's accessible name.
+ *
+ * @param props See {@link DescribedHeaderProps}.
+ * @returns The focusable header text inside its tooltip.
+ */
+function DescribedHeader(props: DescribedHeaderProps): ReactElement {
+  const { label, description } = props;
+
+  return (
+    <Tooltip content={description}>
+      <Text as="span" size="sm" weight="medium" tabIndex={0}>
+        {label}
+      </Text>
+    </Tooltip>
+  );
 }
 
 /** Props of {@link OccurrenceRow}. */
@@ -1051,11 +1280,18 @@ function RenderTableShell(props: RenderTableShellProps): ReactElement {
 interface ColumnContext {
   /**
    * The render count above which a row is marked, or `undefined` when no row is
-   * marked. Derived from the loaded page, so it moves as more rows load — which
-   * is why the mark states the resolved threshold rather than implying a
+   * marked. Derived from every accumulated page, so it moves as more rows load —
+   * which is why the mark states the resolved threshold rather than implying a
    * standing rule.
    */
   readonly markAbove: number | undefined;
+
+  /**
+   * Whether a row is the one the reader's keyboard focus last entered — the
+   * only row whose in-cell tooltip triggers are tab stops (see
+   * {@link RenderTableView} on the row-scoped tab stop).
+   */
+  readonly isFocusRow: (stat: RenderStat) => boolean;
 
   /** Whether a given row's per-render list is open. */
   readonly isExpanded: (stat: RenderStat) => boolean;
@@ -1085,11 +1321,19 @@ interface ColumnContext {
  * its own heading (see `../primitives/DataTable` on why an intrinsic track does
  * not), and neither form is a hardcoded length.
  *
+ * Every description is reachable from the keyboard, under two rules. A header
+ * definition is a {@link DescribedHeader} — its own tab stop — and only ever on
+ * a column that is not sortable, so no tooltip is nested inside a sort button;
+ * the two sortable columns carry plain-text headers. A description inside a
+ * data row is a tab stop only in the row the reader's focus is in
+ * (`isFocusRow`), so the body stays one roving tab stop plus that row's own
+ * controls instead of gaining a stop per rendered row.
+ *
  * @param context See {@link ColumnContext}.
  * @returns The column definitions.
  */
 function buildColumns(context: ColumnContext): readonly DataTableColumn<RenderStat>[] {
-  const { markAbove, isExpanded, onToggle } = context;
+  const { markAbove, isFocusRow, isExpanded, onToggle } = context;
 
   return [
     {
@@ -1141,12 +1385,19 @@ function buildColumns(context: ColumnContext): readonly DataTableColumn<RenderSt
         // reading as a verdict rather than as the explained heuristic it is.
         const marked = markAbove !== undefined && stat.renderCount > markAbove;
 
+        // A marked figure is its tooltip's trigger, so it must take focus for
+        // the explanation to reach a keyboard reader — but as a tab stop only in
+        // the row that reader is in. Elsewhere it carries no `tabIndex` at all:
+        // not `-1`, which would let a click focus the figure instead of its row
+        // and strand the arrow keys the grid answers only on a row element. So
+        // the body never grows a stop per row.
         const figure = (
           <Text
             as="span"
             size="sm"
             numeric
             className={clsx('dg-render-table__count-cell', marked && 'dg-is-outlier')}
+            tabIndex={marked && isFocusRow(stat) ? 0 : undefined}
           >
             {formatCount(stat.renderCount)}
             {marked ? <TriangleAlert aria-hidden="true" className="dg-icon" /> : null}
@@ -1192,11 +1443,7 @@ function buildColumns(context: ColumnContext): readonly DataTableColumn<RenderSt
     {
       key: COLUMN_KEYS.triggers,
       header: (
-        <Tooltip content={COLUMN_TOOLTIPS.triggers}>
-          <Text as="span" size="sm" weight="medium">
-            {COLUMN_HEADERS.triggers}
-          </Text>
-        </Tooltip>
+        <DescribedHeader label={COLUMN_HEADERS.triggers} description={COLUMN_TOOLTIPS.triggers} />
       ),
       headerLabel: COLUMN_HEADERS.triggers,
       width: 'minmax(0, 4fr)',
@@ -1215,11 +1462,7 @@ function buildColumns(context: ColumnContext): readonly DataTableColumn<RenderSt
     {
       key: COLUMN_KEYS.unchanged,
       header: (
-        <Tooltip content={COLUMN_TOOLTIPS.unchanged}>
-          <Text as="span" size="sm" weight="medium">
-            {COLUMN_HEADERS.unchanged}
-          </Text>
-        </Tooltip>
+        <DescribedHeader label={COLUMN_HEADERS.unchanged} description={COLUMN_TOOLTIPS.unchanged} />
       ),
       headerLabel: COLUMN_HEADERS.unchanged,
       align: 'end',
@@ -1233,11 +1476,7 @@ function buildColumns(context: ColumnContext): readonly DataTableColumn<RenderSt
     {
       key: COLUMN_KEYS.unknown,
       header: (
-        <Tooltip content={COLUMN_TOOLTIPS.unknown}>
-          <Text as="span" size="sm" weight="medium">
-            {COLUMN_HEADERS.unknown}
-          </Text>
-        </Tooltip>
+        <DescribedHeader label={COLUMN_HEADERS.unknown} description={COLUMN_TOOLTIPS.unknown} />
       ),
       headerLabel: COLUMN_HEADERS.unknown,
       align: 'end',
@@ -1251,11 +1490,10 @@ function buildColumns(context: ColumnContext): readonly DataTableColumn<RenderSt
     {
       key: COLUMN_KEYS.changedProps,
       header: (
-        <Tooltip content={COLUMN_TOOLTIPS.changedProps}>
-          <Text as="span" size="sm" weight="medium">
-            {COLUMN_HEADERS.changedProps}
-          </Text>
-        </Tooltip>
+        <DescribedHeader
+          label={COLUMN_HEADERS.changedProps}
+          description={COLUMN_TOOLTIPS.changedProps}
+        />
       ),
       headerLabel: COLUMN_HEADERS.changedProps,
       width: 'minmax(0, 3fr)',
@@ -1301,11 +1539,7 @@ function buildColumns(context: ColumnContext): readonly DataTableColumn<RenderSt
     {
       key: COLUMN_KEYS.phases,
       header: (
-        <Tooltip content={COLUMN_TOOLTIPS.phases}>
-          <Text as="span" size="sm" weight="medium">
-            {COLUMN_HEADERS.phases}
-          </Text>
-        </Tooltip>
+        <DescribedHeader label={COLUMN_HEADERS.phases} description={COLUMN_TOOLTIPS.phases} />
       ),
       headerLabel: COLUMN_HEADERS.phases,
       width: 'minmax(0, 2fr)',
@@ -1320,6 +1554,44 @@ function buildColumns(context: ColumnContext): readonly DataTableColumn<RenderSt
       ),
     },
   ];
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * Paging state
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * The pages already loaded for one page sequence, and the page being loaded
+ * next.
+ *
+ * Written **only** by the "load more" handler and cleared only by a sort change,
+ * which is what keeps this view free of state written from an effect: at the
+ * moment of the click the rows on screen, the provider's `nextOffset` and the
+ * total it last reported are all in hand, so the accumulator is complete before
+ * the next page is even requested. Nothing here is derived after the fact.
+ *
+ * `identity` is {@link sequenceIdentity} of the sequence these pages belong to.
+ * Comparing it during render is how a stale accumulator is ignored — again with
+ * no effect, and no chance of one render drawing rows from two different queries.
+ */
+interface PageAccumulator {
+  /** The sequence these pages belong to; the in-flight offset is not part of it. */
+  readonly identity: string;
+
+  /** Every row loaded before the page in flight, in provider order, unique by id. */
+  readonly rows: readonly RenderStat[];
+
+  /** The offset of the page in flight: the `nextOffset` the previous page reported. */
+  readonly offset: number;
+
+  /**
+   * The total the provider last reported, carried across the request so the
+   * footer does not lose it while the next page is in flight and momentarily
+   * claim the total was never reported.
+   */
+  readonly total: number | undefined;
 }
 
 /*
@@ -1353,19 +1625,27 @@ export interface RenderTableProps {
  *
  * ## Why this is two components
  *
- * Everything this view holds locally — how large a page it has asked for, which
- * order the reader chose, which rows are open — belongs to **one** query. When
+ * Everything this view holds locally — which pages it has loaded, which order
+ * the reader chose, which rows are open — belongs to **one** query. When
  * the node's query changes, all three have to go back to their initial values,
- * and the way to do that without writing state from an effect or during a render
- * (both of which `eslint-plugin-react-hooks` rejects, and rightly: the first is
- * a second render pass, the second is a render that depends on its own output)
- * is to let React discard the state with the instance. So the exported component
- * computes the query's identity and renders the view under it as a `key`; the
- * view below holds the state and knows nothing about resets.
+ * and the way to do that without writing state from an effect (which
+ * `eslint-plugin-react-hooks` rejects, and rightly: it is a second render pass
+ * that paints stale rows first) or resetting each field by hand is to let React
+ * discard the state with the instance. So the exported component computes the
+ * query's identity and renders the view under it as a `key`; the view below
+ * holds the state and knows nothing about resets.
  *
  * The identity is the query's *contents*, so a node re-parsed, re-spread or
- * rebuilt into a fresh object with the same fields keeps its page and its open
+ * rebuilt into a fresh object with the same fields keeps its pages and its open
  * rows — only a genuinely different request starts over.
+ *
+ * The key also carries the generation of the ambient `DataProvider` (see
+ * {@link useProviderGeneration}). A host that rebinds a mounted panel to
+ * another session swaps the provider without remounting the node, and the
+ * same layout path and query can recur in that session's panel; the pages,
+ * the next offset and the open rows loaded from the previous provider must
+ * not survive into it, so a new provider is a new instance that paints none
+ * of them and starts from the authored first page.
  *
  * @param props See {@link RenderTableProps}.
  * @returns The block, in whichever of its four states applies.
@@ -1377,13 +1657,74 @@ export interface RenderTableProps {
  */
 export function RenderTable(props: RenderTableProps): ReactElement {
   const { node, className } = props;
+  const providerGeneration = useProviderGeneration();
 
-  return <RenderTableView key={queryIdentity(node.query)} node={node} className={className} />;
+  return (
+    <RenderTableView
+      key={`${String(providerGeneration)}|${queryIdentity(node.query)}`}
+      node={node}
+      className={className}
+    />
+  );
+}
+
+/** The provider a view was last rendered under, and how many it has seen. */
+interface ProviderBinding {
+  /** The ambient `DataProvider` of the latest render. */
+  readonly provider: DataProvider | undefined;
+
+  /** Incremented each time that provider is replaced by a different one. */
+  readonly generation: number;
 }
 
 /**
- * The stateful half of {@link RenderTable}: resolves the page, draws it, and
+ * A number that changes exactly when the ambient `DataProvider` is replaced.
+ *
+ * Used as part of the stateful view's `key`, so the state that belongs to one
+ * provider's data — accumulated pages, the next offset, open and focused rows —
+ * is discarded with the instance instead of being carried into another's. The
+ * binding is adjusted during render, React's documented pattern for state that
+ * follows a changed input: the replaced render is discarded before commit, so
+ * nothing loaded from the previous provider is ever painted under the new one.
+ * Compared by reference, which is what a provider's identity is: a host
+ * creates one per session.
+ *
+ * @returns The current provider's generation.
+ */
+function useProviderGeneration(): number {
+  const provider = useDataProvider();
+  const [binding, setBinding] = useState<ProviderBinding>(() => ({ provider, generation: 0 }));
+
+  if (binding.provider !== provider) {
+    const next: ProviderBinding = { provider, generation: binding.generation + 1 };
+    setBinding(next);
+    return next.generation;
+  }
+
+  return binding.generation;
+}
+
+/**
+ * The stateful half of {@link RenderTable}: resolves the pages, draws them, and
  * owns the paging, ordering and disclosure of one query.
+ *
+ * ## The row-scoped tab stop
+ *
+ * `../primitives/DataTable` makes the body one roving tab stop: exactly one row
+ * is tabbable, and the arrow keys move it. A tooltip trigger inside a cell must
+ * take focus for its description to open, but a trigger that was a tab stop in
+ * every rendered row would turn that one stop into hundreds. So the grid is
+ * wrapped in an element that listens for focus arriving anywhere inside it and
+ * records which data row it landed in — read off the row element's own
+ * `role="row"` and `data-row-index`, the attributes the primitive writes — and
+ * in-row triggers are tab stops (`tabIndex={0}`) in that row alone and carry no
+ * `tabIndex` everywhere else — not `-1`, which would let a pointer click focus
+ * the trigger instead of its row, where the primitive's arrow keys do not act.
+ * Tab from the row the reader stands on therefore reaches that
+ * row's descriptions, and moving to another row moves them with it. Focus in
+ * the header or in an expanded detail row belongs to no data row and leaves the
+ * record as it was, just as the primitive's own roving stop keeps its row. The
+ * row is recorded by key rather than index, so an appended page cannot shift it.
  *
  * @param props The same props as {@link RenderTable}.
  * @returns The block, in whichever of its four states applies.
@@ -1396,12 +1737,20 @@ function RenderTableView(props: RenderTableProps): ReactElement {
   // view that draws everything and reports nothing.
   const actions = usePanelActions();
 
-  // The page the node asked for, and the step "load more" grows by.
-  const pageStep = resolvePageStep(node.query.limit);
-
-  const [pageLimit, setPageLimit] = useState(pageStep);
   const [chosenSort, setChosenSort] = useState<DataQuerySort | undefined>(undefined);
+  const [pages, setPages] = useState<PageAccumulator | undefined>(undefined);
   const [expandedKeys, setExpandedKeys] = useState<readonly string[]>(NO_EXPANDED_KEYS);
+  // The data row keyboard focus last entered, by row key; see "The row-scoped
+  // tab stop" above. `undefined` until focus first reaches a row.
+  const [focusRowKey, setFocusRowKey] = useState<string | undefined>(undefined);
+
+  // The size of every page in the sequence, and where its first page starts.
+  // Neither moves while the reader pages: "load more" advances the offset only.
+  // Declared after the state hooks on purpose: the React Compiler cannot see
+  // that these helpers return plain numbers, and a value it must treat as
+  // mutable across a `useState` call costs every memoized callback below.
+  const pageLimit = resolvePageLimit(node.query.limit);
+  const baseOffset = resolveBaseOffset(node.query.offset);
 
   // The reader's choice wins over the authored order, which wins over this
   // view's default. Only one of the three is ever applied, and it is the one the
@@ -1413,16 +1762,44 @@ function RenderTableView(props: RenderTableProps): ReactElement {
   // resolved page and the requested page to disagree. The authored filter and
   // offset pass through untouched; the source is forced to the one source this
   // component can draw (see RENDERS_SOURCE).
-  const query: DataQuery & { source: typeof RENDERS_SOURCE } = {
+  const firstPageQuery: DataQuery & { source: typeof RENDERS_SOURCE } = {
     ...node.query,
     source: RENDERS_SOURCE,
     sort: appliedSort,
     limit: pageLimit,
   };
 
+  // Accumulated pages count only while they belong to the sequence being drawn.
+  // Compared during render, so a changed order or filter can never show the
+  // previous sequence's rows, not even for one frame.
+  const identity = sequenceIdentity(node.id, node.query, appliedSort, pageLimit);
+  const activePages = pages !== undefined && pages.identity === identity ? pages : undefined;
+  const currentOffset = activePages?.offset ?? baseOffset;
+
+  // The page in flight: the first page, or the same query moved to the offset
+  // the previous page reported. Nothing else about the query ever changes.
+  const query: DataQuery & { source: typeof RENDERS_SOURCE } =
+    activePages === undefined ? firstPageQuery : { ...firstPageQuery, offset: activePages.offset };
+
   const { status, data, error, total, nextOffset, retry } = useQuery(query);
 
-  const rows: readonly RenderStat[] = data ?? NO_ROWS;
+  // The page that resolved, or `undefined` while it is in flight or has failed.
+  const pageRows = status === 'success' ? (data ?? NO_ROWS) : undefined;
+  const carriedRows = activePages?.rows ?? NO_ROWS;
+
+  // Frozen earlier pages first, then the page that just arrived, unique by the
+  // grid's row key. Memoized so the grid receives one stable array per answer
+  // rather than a fresh copy of every loaded row on every render.
+  const rows = useMemo(() => appendPage(carriedRows, pageRows), [carriedRows, pageRows]);
+
+  // The provider's total, or the one it reported last while the next page is
+  // in flight — so the footer never drops a total it was already told.
+  const knownTotal = total ?? activePages?.total;
+
+  // Where "load more" would go, read off the provider's `nextOffset` alone and
+  // only once the current page has resolved. `undefined` is the end of the data.
+  const followingOffset =
+    status === 'success' ? advanceOffset(nextOffset, currentOffset) : undefined;
 
   const handleGridSort = useCallback(
     (next: DataTableSort): void => {
@@ -1435,10 +1812,17 @@ function RenderTableView(props: RenderTableProps): ReactElement {
         return;
       }
 
+      // A new order is a new page sequence: rows accumulated under the old one
+      // describe a different ranking and are released here. Re-activating the
+      // order already applied keeps the pages the reader has loaded.
+      if (mapped !== appliedSort) {
+        setPages(undefined);
+      }
+
       setChosenSort(mapped);
       actions?.onFilterChange?.(node.id, { sort: mapped });
     },
-    [actions, node.id],
+    [actions, appliedSort, node.id],
   );
 
   const handleSortSelect = useCallback(
@@ -1449,15 +1833,61 @@ function RenderTableView(props: RenderTableProps): ReactElement {
         return;
       }
 
+      // The same release as a header activation: the toolbar is the second way
+      // to express one intent, and it starts the same new sequence.
+      if (value !== appliedSort) {
+        setPages(undefined);
+      }
+
       setChosenSort(value);
       actions?.onFilterChange?.(node.id, { sort: value });
     },
-    [actions, node.id],
+    [actions, appliedSort, node.id],
   );
 
   const handleLoadMore = useCallback((): void => {
-    setPageLimit((current) => Math.min(current + pageStep, DATA_QUERY_MAX_LIMIT));
-  }, [pageStep]);
+    // Only a resolved page with a provider-reported next offset can be advanced
+    // from. The rows on screen — every earlier page plus this one — are frozen
+    // into the accumulator, and the next request starts exactly where the
+    // provider said the next page begins.
+    if (followingOffset === undefined) {
+      return;
+    }
+
+    setPages({ identity, rows, offset: followingOffset, total: knownTotal });
+  }, [followingOffset, identity, knownTotal, rows]);
+
+  const isFocusRow = useCallback(
+    (stat: RenderStat): boolean => stat.id === focusRowKey,
+    [focusRowKey],
+  );
+
+  const handleTableFocus = useCallback(
+    (event: ReactFocusEvent<HTMLDivElement>): void => {
+      const target = event.target;
+
+      // Narrowed rather than cast, as the grid primitive does: only an `Element`
+      // can be asked which row it sits in.
+      if (!(target instanceof Element)) {
+        return;
+      }
+
+      // The data row the focus landed in or inside — the row element itself on
+      // a Tab into the body or an arrow key, a control within it otherwise. The
+      // header row and an expanded detail row carry no row index, so focus
+      // there matches nothing and the recorded row stays as it was.
+      const row = target.closest(DATA_ROW_SELECTOR);
+      const index = Number.parseInt(row?.getAttribute(ROW_INDEX_ATTRIBUTE) ?? '', 10);
+      const stat = Number.isInteger(index) ? rows[index] : undefined;
+
+      if (stat === undefined) {
+        return;
+      }
+
+      setFocusRowKey(stat.id);
+    },
+    [rows],
+  );
 
   const isExpanded = useCallback(
     (stat: RenderStat): boolean => expandedKeys.includes(stat.id),
@@ -1493,7 +1923,15 @@ function RenderTableView(props: RenderTableProps): ReactElement {
     [actions],
   );
 
-  if (status === 'loading') {
+  // Over every accumulated row, so the mark describes what the reader has on
+  // screen; memoized because it sorts the counts, and the rows only change when
+  // a page arrives.
+  const markAbove = useMemo(() => outlierThreshold(rows), [rows]);
+
+  // The first page is still resolving: nothing is loaded, so the block shows its
+  // silhouette. A next page in flight never reaches this — the rows it follows
+  // stay on screen and the footer reports the request instead.
+  if (status === 'loading' && rows.length === 0) {
     return (
       <RenderTableShell className={className}>
         <LoadingState
@@ -1506,7 +1944,9 @@ function RenderTableView(props: RenderTableProps): ReactElement {
     );
   }
 
-  if (status === 'error') {
+  // The first page failed. A failed next page keeps the loaded rows and is
+  // reported beneath them instead (see the end of this function).
+  if (status === 'error' && rows.length === 0) {
     return (
       <RenderTableShell className={className}>
         <ErrorState
@@ -1520,10 +1960,40 @@ function RenderTableView(props: RenderTableProps): ReactElement {
     );
   }
 
+  if (rows.length === 0 && followingOffset !== undefined) {
+    // A resolved page with no rows that still names where the next page
+    // starts. The provider's offset is the whole of the paging contract, so the
+    // rows after it stay reachable: the page is reported as empty — never the
+    // capture — and the paging control is offered exactly as under a full page.
+    return (
+      <RenderTableShell className={className}>
+        <EmptyState message={EMPTY_PAGE_MESSAGE} className="dg-render-table__empty" />
+        <Stack
+          direction="horizontal"
+          gap={2}
+          align="center"
+          justify="between"
+          wrap
+          className="dg-data-table__footer"
+        >
+          <Text as="p" size="xs" tone="muted">
+            {knownTotal === undefined
+              ? `${formatCount(0)} components loaded.`
+              : `Showing ${formatCount(0)} of ${formatCount(knownTotal)} components.`}
+          </Text>
+          <Button variant="secondary" size="sm" onClick={handleLoadMore}>
+            {LOAD_MORE_LABEL}
+          </Button>
+        </Stack>
+      </RenderTableShell>
+    );
+  }
+
   if (rows.length === 0) {
-    // A resolved page with no rows. The sentence names the class of evidence
-    // this node draws and says the capture holds none of it; the order control
-    // is not rendered, because reordering nothing is a control that cannot act.
+    // A resolved page with no rows and no next page. The sentence names the
+    // class of evidence this node draws and says the capture holds none of it;
+    // the order control is not rendered, because reordering nothing is a
+    // control that cannot act.
     return (
       <RenderTableShell className={className}>
         <EmptyState message={EMPTY_MESSAGE} className="dg-render-table__empty" />
@@ -1532,21 +2002,28 @@ function RenderTableView(props: RenderTableProps): ReactElement {
   }
 
   const columns = buildColumns({
-    markAbove: outlierThreshold(rows),
+    markAbove,
+    isFocusRow,
     isExpanded,
     onToggle: handleToggle,
   });
 
-  // `nextOffset` is the provider's own answer about whether more rows exist; it
-  // is never inferred from the length of what arrived, which would drift the
-  // moment a limit was clamped.
-  const moreExist = nextOffset !== undefined;
-  const atPageCap = pageLimit >= DATA_QUERY_MAX_LIMIT;
+  // A next page behind rows already on screen, in flight or failed. Both are
+  // reported where the paging control is, never by replacing what the reader is
+  // reading.
+  const appending = status === 'loading';
+  const pageFailed = status === 'error';
+
+  // `followingOffset` is the provider's own answer about whether more rows
+  // exist; it is never inferred from the length of what arrived or from the
+  // total, which would drift the moment a limit was clamped. While the next page
+  // is in flight the control stays in place, disabled and saying so.
+  const showLoadMore = followingOffset !== undefined || appending;
 
   const loadedText =
-    total === undefined
+    knownTotal === undefined
       ? `${formatCount(rows.length)} components loaded.`
-      : `Showing ${formatCount(rows.length)} of ${formatCount(total)} components.`;
+      : `Showing ${formatCount(rows.length)} of ${formatCount(knownTotal)} components.`;
 
   return (
     <RenderTableShell className={className}>
@@ -1566,22 +2043,29 @@ function RenderTableView(props: RenderTableProps): ReactElement {
         ]}
       />
 
-      <DataTable
-        rows={rows}
-        columns={columns}
-        rowKey={(stat) => stat.id}
-        caption={TABLE_CAPTION}
-        sort={gridSortFor(appliedSort)}
-        onSortChange={handleGridSort}
-        expandedRowKeys={expandedKeys}
-        onRowToggle={handleToggle}
-        renderExpandedRow={(stat) => (
-          <RenderDetail
-            stat={stat}
-            onSelect={actions === undefined ? undefined : handleSelectOccurrence}
-          />
-        )}
-      />
+      {/* A plain, unstyled box whose only job is to hear focus arriving inside
+          the grid, which the primitive does not report: the row it lands in is
+          the one row whose tooltip triggers are tab stops. It carries no role,
+          no class and no tab stop of its own, so the grid's semantics, layout
+          and keyboard model are exactly what they are without it. */}
+      <div onFocus={handleTableFocus}>
+        <DataTable
+          rows={rows}
+          columns={columns}
+          rowKey={(stat) => stat.id}
+          caption={TABLE_CAPTION}
+          sort={gridSortFor(appliedSort)}
+          onSortChange={handleGridSort}
+          expandedRowKeys={expandedKeys}
+          onRowToggle={handleToggle}
+          renderExpandedRow={(stat) => (
+            <RenderDetail
+              stat={stat}
+              onSelect={actions === undefined ? undefined : handleSelectOccurrence}
+            />
+          )}
+        />
+      </div>
 
       <Stack
         direction="horizontal"
@@ -1594,18 +2078,25 @@ function RenderTableView(props: RenderTableProps): ReactElement {
         <Text as="p" size="xs" tone="muted">
           {loadedText}
         </Text>
-        {moreExist ? (
-          atPageCap ? (
-            <Text as="p" size="xs" tone="muted">
-              {PAGE_CAP_NOTE}
-            </Text>
-          ) : (
-            <Button variant="secondary" size="sm" onClick={handleLoadMore}>
-              {LOAD_MORE_LABEL}
-            </Button>
-          )
+        {showLoadMore ? (
+          <Button variant="secondary" size="sm" disabled={appending} onClick={handleLoadMore}>
+            {appending ? LOADING_MORE_LABEL : LOAD_MORE_LABEL}
+          </Button>
         ) : null}
       </Stack>
+
+      {pageFailed ? (
+        // The next page's own failure, with the query that failed — at the
+        // offset the provider reported — and a retry that re-requests exactly
+        // that page. The rows above it are the earlier answers, untouched.
+        <ErrorState
+          message={PAGE_ERROR_MESSAGE}
+          code={error?.code}
+          query={serializeQuery(query)}
+          onRetry={retry}
+          className="dg-render-table__error"
+        />
+      ) : null}
     </RenderTableShell>
   );
 }

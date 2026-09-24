@@ -162,14 +162,14 @@ import {
   modificationRecordSchema,
   problemUnderstandingSchema,
   selectedTargetSchema,
-} from '@debuggen/instrumentation';
+} from '@debuggen/instrumentation/schema';
 import type {
   InstrumentationPlan,
   ModificationConflict,
   ModificationRecord,
   ProblemUnderstanding,
   SelectedTarget,
-} from '@debuggen/instrumentation';
+} from '@debuggen/instrumentation/schema';
 
 import { analysisResultSchema } from './analysis.js';
 import type { AnalysisResult } from './analysis.js';

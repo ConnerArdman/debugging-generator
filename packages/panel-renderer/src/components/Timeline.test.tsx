@@ -25,10 +25,20 @@
  *   - **Partial results say so.** A `spans` page states how much of the result it
  *     holds and offers to load more; a `trace` the correlator truncated says that
  *     instead of implying completeness.
+ *   - **Paging follows the service.** Each further page is requested at the
+ *     `nextOffset` the previous response named, at the same page size, and
+ *     appended with each record once; the loaded rows stay on screen while a
+ *     page is in flight or after it failed, a next offset past 5,000 is still
+ *     followed, a response naming none ends the walk whatever its total says,
+ *     and a changed query starts again from its first page.
  *   - **The canvas is not the only representation.** The SVG is `role="img"` with
  *     a text alternative, so its bars are deliberately outside the accessibility
  *     tree; the keyboard-reachable equivalent below it must therefore list every
  *     row and be operable (AAP 0.6.4).
+ *   - **Descriptions are not hover-only.** The focused row drives the detail
+ *     strip, whose name is a focusable tooltip trigger, and the focused row's
+ *     own name is one Tab away — in that row only, so the table body does not
+ *     grow a tab stop per row.
  *   - **The three states of a query-backed view** and the **click-to-source
  *     payload** that AAP 0.8.3 asks of every component suite in this folder.
  *
@@ -82,12 +92,13 @@ import type {
   TraceNodeLineage,
   TraceTree,
 } from '@debuggen/telemetry';
-import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import type { ReactElement } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Mock } from 'vitest';
 
-import { DataProviderContext, createDataProvider } from '../host/DataProvider';
+import { DataProviderContext, PanelSessionContext, createDataProvider } from '../host/DataProvider';
 import type { DataProvider, DataQueryResolver, DataQueryResponse } from '../host/DataProvider';
 import { PanelActionsContext } from '../host/PanelActions';
 import type { PanelActions, PanelEventRef } from '../host/PanelActions';
@@ -787,9 +798,11 @@ function renderComponent(
 ): void {
   render(
     <DataProviderContext.Provider value={context.provider}>
-      <PanelActionsContext.Provider value={context.actions}>
-        <Timeline node={node} />
-      </PanelActionsContext.Provider>
+      <PanelSessionContext.Provider value={SESSION_ID}>
+        <PanelActionsContext.Provider value={context.actions}>
+          <Timeline node={node} />
+        </PanelActionsContext.Provider>
+      </PanelSessionContext.Provider>
     </DataProviderContext.Provider>,
   );
 }
@@ -1177,14 +1190,560 @@ describe('Timeline cross-tier chain', () => {
   });
 });
 
+/*
+ * ---------------------------------------------------------------------------
+ * Offset-aware paging stubs
+ *
+ * Local to the paging cases below, and deliberately independent of the shared
+ * stub helpers above: a page is looked up from the query the component SENT —
+ * its offset, and for the reset case its filter — so a case can only pass when
+ * the component asks for the page the service's `nextOffset` named. Any call can
+ * be held open, to observe the view while a page is in flight, or failed once,
+ * to observe it after a page failed. Built on the library's own
+ * `createDataProvider`, like every other stub in this suite.
+ * ---------------------------------------------------------------------------
+ */
+
+/** One span page, as a service would answer the request that asked for it. */
+interface SpanPageAnswer {
+  readonly data: readonly TelemetryEvent[];
+  readonly total?: number | undefined;
+  readonly nextOffset?: number | undefined;
+}
+
+/** Finds the page that answers a query, or `undefined` for a page that does not exist. */
+type SpanPageLookup = (query: DataQuery) => SpanPageAnswer | undefined;
+
+/** Which requests an {@link offsetPagedProvider} holds open or fails, by 1-based call number. */
+interface OffsetStubOptions {
+  /** Calls whose answer waits for {@link OffsetStub.release}. */
+  readonly hold?: readonly number[] | undefined;
+  /** Calls that reject with {@link PAGE_FAILURE} instead of answering. */
+  readonly fail?: readonly number[] | undefined;
+}
+
+/** An offset-aware stub provider and what it has been asked. */
+interface OffsetStub {
+  /** The provider to hand to the component. */
+  readonly provider: DataProvider;
+  /** Every query received, in call order. */
+  readonly queries: readonly DataQuery[];
+  /** The recorded resolver, for call counts. */
+  readonly resolve: Mock<DataQueryResolver>;
+  /** Settles a held call with the page its query names. */
+  readonly release: (call: number) => void;
+}
+
+/** The failure a failed page reports: the provider's own message and code. */
+const PAGE_FAILURE = new DebuggenError(
+  'TRANSPORT_DISCONNECTED',
+  'The channel to the service closed mid-page.',
+);
+
+/** The footer control while the page it asked for is in flight. */
+const LOADING_MORE_NAME = 'Loading more spans…';
+
+/**
+ * A lookup that answers by the offset the query asked for, and only by it.
+ *
+ * @param pages The pages, keyed by the offset each one starts at.
+ * @returns The lookup.
+ */
+function pagesByOffset(pages: ReadonlyMap<number, SpanPageAnswer>): SpanPageLookup {
+  return (query) => (query.offset === undefined ? undefined : pages.get(query.offset));
+}
+
+/**
+ * A provider that answers each span query with the page its own offset names.
+ *
+ * A query for a page the lookup does not hold is rejected, so a component that
+ * asked for an offset the previous response never named fails loudly.
+ *
+ * @param lookup Which page answers which query.
+ * @param options Calls to hold open or to fail.
+ * @returns The stub.
+ */
+function offsetPagedProvider(lookup: SpanPageLookup, options: OffsetStubOptions = {}): OffsetStub {
+  const queries: DataQuery[] = [];
+  const held = new Set(options.hold ?? []);
+  const failing = new Set(options.fail ?? []);
+  const pending = new Map<number, () => void>();
+
+  const answer = (query: DataQuery): Promise<DataQueryResponse> => {
+    const page = lookup(query);
+
+    if (page === undefined) {
+      return Promise.reject(
+        new DebuggenError(
+          'INTERNAL',
+          `The stub holds no page at offset ${String(query.offset)}; the view asked for a page no response named.`,
+        ),
+      );
+    }
+
+    return Promise.resolve({
+      source: 'spans',
+      data: page.data,
+      ...(page.total === undefined ? {} : { total: page.total }),
+      ...(page.nextOffset === undefined ? {} : { nextOffset: page.nextOffset }),
+    });
+  };
+
+  const resolve = vi.fn<DataQueryResolver>((query) => {
+    queries.push(query);
+    const call = queries.length;
+
+    if (failing.has(call)) {
+      return Promise.reject(PAGE_FAILURE);
+    }
+
+    if (held.has(call)) {
+      return new Promise<DataQueryResponse>((settle, reject) => {
+        pending.set(call, () => {
+          answer(query).then(settle, reject);
+        });
+      });
+    }
+
+    return answer(query);
+  });
+
+  const release = (call: number): void => {
+    const settle = pending.get(call);
+
+    if (settle === undefined) {
+      throw new Error(`call ${String(call)} is not being held open`);
+    }
+
+    pending.delete(call);
+    settle();
+  };
+
+  return { provider: createDataProvider(resolve), queries, resolve, release };
+}
+
+/**
+ * The query an offset stub received on the given 1-based call.
+ *
+ * @param stub The stub.
+ * @param call The 1-based call number.
+ * @returns That query.
+ */
+function pageRequest(stub: OffsetStub, call: number): DataQuery {
+  const query = stub.queries[call - 1];
+
+  if (query === undefined) {
+    throw new Error(`the offset stub recorded no query for call ${String(call)}`);
+  }
+
+  return query;
+}
+
+/** The summary strip, where a partial result is named. */
+function summaryStrip(): HTMLElement {
+  return screen.getByRole('group', { name: 'Timeline summary' });
+}
+
+/** A span node paging the fixture trace at the given page size. */
+function pagedSpansNode(limit: number, offset?: number): TimelineNode {
+  return makeNode({
+    query: {
+      source: 'spans',
+      filter: { traceId: TRACE_ID },
+      limit,
+      ...(offset === undefined ? {} : { offset }),
+    },
+  });
+}
+
+describe('Timeline paging', () => {
+  it('advances by the next offset at a fixed page size, appending pages and keeping loaded rows on screen', async () => {
+    const stub = offsetPagedProvider(
+      pagesByOffset(
+        new Map<number, SpanPageAnswer>([
+          [0, { data: [INTERACTION_EVENT, FETCH_EVENT], total: 4, nextOffset: 2 }],
+          // The capture grew between the two requests and pushed the request
+          // record back across the page boundary, so this page repeats it.
+          [2, { data: [FETCH_EVENT, SERVER_EVENT], total: 4, nextOffset: 4 }],
+          [4, { data: [QUERY_EVENT], total: 4 }],
+        ]),
+      ),
+      { hold: [2] },
+    );
+    const user = userEvent.setup();
+
+    renderComponent(pagedSpansNode(2), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    await screen.findByText(`Showing ${formatCount(2)} of ${formatCount(4)} spans.`);
+    expect(renderedNames()).toEqual([INTERACTION_EVENT.name, FETCH_EVENT.name]);
+    expect(within(summaryStrip()).getByText('Partial result')).toBeDefined();
+
+    const first = pageRequest(stub, 1);
+    expect(first.offset).toBe(0);
+    expect(first.limit).toBe(2);
+
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+
+    // The next request starts exactly where the first response said the next
+    // page does, at the same page size: nothing is re-requested and nothing grows.
+    expect(stub.resolve).toHaveBeenCalledTimes(2);
+    const second = pageRequest(stub, 2);
+    expect(second.offset).toBe(2);
+    expect(second.limit).toBe(first.limit);
+    expect(second.source).toBe('spans');
+    expect(second.filter).toEqual({ traceId: TRACE_ID });
+
+    // While that page is in flight the loaded chart and table stay on screen,
+    // the footer keeps its total, and the control reports the page it awaits.
+    expect(renderedNames()).toEqual([INTERACTION_EVENT.name, FETCH_EVENT.name]);
+    expect(barsOf(screen.getByRole('img'))).toHaveLength(2);
+    expect(document.querySelector('.dg-timeline__loading')).toBeNull();
+    expect(screen.getByText(`Showing ${formatCount(2)} of ${formatCount(4)} spans.`)).toBeDefined();
+
+    const busy = screen.getByRole('button', { name: LOADING_MORE_NAME });
+    expect(busy.hasAttribute('disabled')).toBe(true);
+    expect(busy.getAttribute('aria-busy')).toBe('true');
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+
+    stub.release(2);
+
+    // Appended after the rows already drawn, and the repeated record drawn once.
+    await screen.findByText(`Showing ${formatCount(3)} of ${formatCount(4)} spans.`);
+    expect(renderedNames()).toEqual([INTERACTION_EVENT.name, FETCH_EVENT.name, SERVER_EVENT.name]);
+    expect(barsOf(screen.getByRole('img'))).toHaveLength(3);
+
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+
+    await screen.findByText(`Showing ${formatCount(4)} of ${formatCount(4)} spans.`);
+    expect(renderedNames()).toEqual([...CHAIN_NAMES]);
+
+    // Every page was asked for once, at the offset the page before it named.
+    expect(stub.queries.map((query) => query.offset)).toEqual([0, 2, 4]);
+    expect(stub.queries.map((query) => query.limit)).toEqual([2, 2, 2]);
+
+    // The last response named no next offset: the result is exhausted, and the
+    // view no longer calls itself partial.
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+    expect(within(summaryStrip()).queryByText('Partial result')).toBeNull();
+  });
+
+  it('keeps the loaded rows when the next page fails, and retries that same page', async () => {
+    const stub = offsetPagedProvider(
+      pagesByOffset(
+        new Map<number, SpanPageAnswer>([
+          [0, { data: [INTERACTION_EVENT, FETCH_EVENT], total: 4, nextOffset: 2 }],
+          [2, { data: [SERVER_EVENT, QUERY_EVENT], total: 4 }],
+        ]),
+      ),
+      { fail: [2] },
+    );
+    const user = userEvent.setup();
+
+    renderComponent(pagedSpansNode(2), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    await screen.findByText(`Showing ${formatCount(2)} of ${formatCount(4)} spans.`);
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+
+    // The failure is reported below the rows, never in place of them.
+    const alert = await screen.findByRole('alert');
+    expect(alert.textContent).toContain(PAGE_FAILURE.message);
+    expect(alert.textContent).toContain(PAGE_FAILURE.code);
+    expect(renderedNames()).toEqual([INTERACTION_EVENT.name, FETCH_EVENT.name]);
+    expect(barsOf(screen.getByRole('img'))).toHaveLength(2);
+    expect(screen.getByText(`Showing ${formatCount(2)} of ${formatCount(4)} spans.`)).toBeDefined();
+
+    // The query shown is the page that failed, not the node's first page.
+    const shown = within(alert).getByRole('group', { name: FAILING_QUERY_NAME });
+    expect(JSON.parse(shown.textContent ?? '')).toEqual({
+      source: 'spans',
+      filter: { traceId: TRACE_ID },
+      limit: 2,
+      offset: 2,
+    });
+
+    await user.click(within(alert).getByRole('button', { name: RETRY_NAME }));
+
+    await screen.findByText(`Showing ${formatCount(4)} of ${formatCount(4)} spans.`);
+    expect(renderedNames()).toEqual([...CHAIN_NAMES]);
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(stub.queries.map((query) => query.offset)).toEqual([0, 2, 2]);
+  });
+
+  it('requests a next offset beyond 5,000 and draws the rows it returns', async () => {
+    // Authored to start at 4,900; the service names 5,100 as the next page.
+    const stub = offsetPagedProvider(
+      pagesByOffset(
+        new Map<number, SpanPageAnswer>([
+          [4900, { data: [INTERACTION_EVENT, FETCH_EVENT], total: 5300, nextOffset: 5100 }],
+          [5100, { data: [SERVER_EVENT, QUERY_EVENT], total: 5300 }],
+        ]),
+      ),
+    );
+    const user = userEvent.setup();
+
+    renderComponent(pagedSpansNode(200, 4900), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    await screen.findByText(`Showing ${formatCount(2)} of ${formatCount(5300)} spans.`);
+    expect(pageRequest(stub, 1).offset).toBe(4900);
+
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+
+    await screen.findByText(`Showing ${formatCount(4)} of ${formatCount(5300)} spans.`);
+    expect(renderedNames()).toEqual([...CHAIN_NAMES]);
+
+    const second = pageRequest(stub, 2);
+    expect(second.offset).toBe(5100);
+    expect(second.limit).toBe(200);
+  });
+
+  it('keeps walking at the page ceiling: pages of 5,000 advance to offsets 5,000 and 10,000', async () => {
+    const stub = offsetPagedProvider(
+      pagesByOffset(
+        new Map<number, SpanPageAnswer>([
+          [0, { data: [INTERACTION_EVENT, FETCH_EVENT], total: 12_000, nextOffset: 5000 }],
+          [5000, { data: [SERVER_EVENT], total: 12_000, nextOffset: 10_000 }],
+          [10_000, { data: [QUERY_EVENT], total: 12_000 }],
+        ]),
+      ),
+    );
+    const user = userEvent.setup();
+
+    renderComponent(pagedSpansNode(DATA_QUERY_MAX_LIMIT), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    await screen.findByText(`Showing ${formatCount(2)} of ${formatCount(12_000)} spans.`);
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+    await screen.findByText(`Showing ${formatCount(3)} of ${formatCount(12_000)} spans.`);
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+    await screen.findByText(`Showing ${formatCount(4)} of ${formatCount(12_000)} spans.`);
+
+    expect(renderedNames()).toEqual([...CHAIN_NAMES]);
+    expect(stub.queries.map((query) => query.offset)).toEqual([0, 5000, 10_000]);
+    expect(stub.queries.map((query) => query.limit)).toEqual([
+      DATA_QUERY_MAX_LIMIT,
+      DATA_QUERY_MAX_LIMIT,
+      DATA_QUERY_MAX_LIMIT,
+    ]);
+  });
+
+  it('offers no next page when the service names none, whatever the total says', async () => {
+    const stub = offsetPagedProvider(
+      pagesByOffset(
+        new Map<number, SpanPageAnswer>([
+          [0, { data: [INTERACTION_EVENT, FETCH_EVENT], total: 10 }],
+        ]),
+      ),
+    );
+
+    renderComponent(pagedSpansNode(2), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    // The total is stated and the view is named partial, but a total is not a
+    // next offset: nothing is offered and nothing more is requested.
+    await screen.findByText(`Showing ${formatCount(2)} of ${formatCount(10)} spans.`);
+    expect(within(summaryStrip()).getByText('Partial result')).toBeDefined();
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+    expect(screen.queryByRole('button', { name: LOADING_MORE_NAME })).toBeNull();
+    expect(stub.resolve).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['names the page it answered', 3],
+    ['points backwards', 1],
+  ])(
+    'treats a next offset that %s as the end of the result',
+    async (_description: string, nextOffset: number) => {
+      const stub = offsetPagedProvider(
+        pagesByOffset(
+          new Map<number, SpanPageAnswer>([
+            [3, { data: [INTERACTION_EVENT, FETCH_EVENT], total: 10, nextOffset }],
+          ]),
+        ),
+      );
+
+      renderComponent(pagedSpansNode(2, 3), {
+        provider: stub.provider,
+        actions: makeActions().actions,
+      });
+
+      // Following it would re-request rows already on screen, or loop on them.
+      await screen.findByText(`Showing ${formatCount(2)} of ${formatCount(10)} spans.`);
+      expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+      expect(stub.resolve).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('returns to the first page, with none of the old rows, when the query changes', async () => {
+    const byOffset = pagesByOffset(
+      new Map<number, SpanPageAnswer>([
+        [0, { data: [INTERACTION_EVENT, FETCH_EVENT], total: 4, nextOffset: 2 }],
+        [2, { data: [SERVER_EVENT, QUERY_EVENT], total: 4 }],
+      ]),
+    );
+    const stub = offsetPagedProvider(
+      (query) =>
+        query.filter?.tier === 'db'
+          ? query.offset === 0
+            ? { data: [QUERY_EVENT], total: 1 }
+            : undefined
+          : byOffset(query),
+      { hold: [3] },
+    );
+    const { actions } = makeActions();
+    const user = userEvent.setup();
+
+    const withHost = (node: TimelineNode): ReactElement => (
+      <DataProviderContext.Provider value={stub.provider}>
+        <PanelSessionContext.Provider value={SESSION_ID}>
+          <PanelActionsContext.Provider value={actions}>
+            <Timeline node={node} />
+          </PanelActionsContext.Provider>
+        </PanelSessionContext.Provider>
+      </DataProviderContext.Provider>
+    );
+
+    const view = render(withHost(pagedSpansNode(2)));
+
+    await screen.findByText(`Showing ${formatCount(2)} of ${formatCount(4)} spans.`);
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+    await screen.findByText(`Showing ${formatCount(4)} of ${formatCount(4)} spans.`);
+
+    // Same node, a different query: a different page sequence.
+    view.rerender(
+      withHost(
+        makeNode({
+          query: { source: 'spans', filter: { traceId: TRACE_ID, tier: 'db' }, limit: 2 },
+        }),
+      ),
+    );
+
+    // Its first page, from the start, and the old query's rows are not painted
+    // while it loads: the first-page loading state is.
+    const third = pageRequest(stub, 3);
+    expect(third.offset).toBe(0);
+    expect(third.limit).toBe(2);
+    expect(third.filter).toEqual({ traceId: TRACE_ID, tier: 'db' });
+    expect(document.querySelector('.dg-timeline__loading')).not.toBeNull();
+    expect(screen.queryByRole('grid')).toBeNull();
+
+    stub.release(3);
+
+    await screen.findByText(`Showing ${formatCount(1)} of ${formatCount(1)} spans.`);
+    expect(renderedNames()).toEqual([QUERY_EVENT.name]);
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+    expect(stub.resolve).toHaveBeenCalledTimes(3);
+  });
+
+  it('offers the next page after a resolved page that held no spans but named one', async () => {
+    const stub = offsetPagedProvider(
+      pagesByOffset(
+        new Map<number, SpanPageAnswer>([
+          [0, { data: [], total: 2, nextOffset: 2 }],
+          [2, { data: [INTERACTION_EVENT, FETCH_EVENT], total: 2 }],
+        ]),
+      ),
+    );
+    const user = userEvent.setup();
+
+    renderComponent(pagedSpansNode(2), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    // The empty page is reported as a page, never as an empty capture, and the
+    // offset it named stays reachable.
+    await screen.findByText(`Showing ${formatCount(0)} of ${formatCount(2)} spans.`);
+    expect(
+      screen.queryByText('No correlated spans were captured for this interaction.'),
+    ).toBeNull();
+
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+
+    const second = pageRequest(stub, 2);
+    expect(second.offset).toBe(2);
+    expect(second.limit).toBe(pageRequest(stub, 1).limit);
+
+    await screen.findByText(`Showing ${formatCount(2)} of ${formatCount(2)} spans.`);
+    expect(renderedNames()).toEqual([INTERACTION_EVENT.name, FETCH_EVENT.name]);
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+  });
+
+  it('starts over from the authored first page, painting none of the old rows, when the data provider is replaced', async () => {
+    const earlier = offsetPagedProvider(
+      pagesByOffset(
+        new Map<number, SpanPageAnswer>([
+          [0, { data: [INTERACTION_EVENT, FETCH_EVENT], total: 4, nextOffset: 2 }],
+          [2, { data: [SERVER_EVENT, QUERY_EVENT], total: 4 }],
+        ]),
+      ),
+    );
+    const later = offsetPagedProvider(
+      pagesByOffset(new Map<number, SpanPageAnswer>([[0, { data: [QUERY_EVENT], total: 1 }]])),
+      { hold: [1] },
+    );
+    const { actions } = makeActions();
+    const user = userEvent.setup();
+
+    // One node, one query, two providers: a host rebinding a mounted panel to
+    // another session swaps the provider without remounting the node.
+    const withProvider = (provider: DataProvider): ReactElement => (
+      <DataProviderContext.Provider value={provider}>
+        <PanelSessionContext.Provider value={SESSION_ID}>
+          <PanelActionsContext.Provider value={actions}>
+            <Timeline node={pagedSpansNode(2)} />
+          </PanelActionsContext.Provider>
+        </PanelSessionContext.Provider>
+      </DataProviderContext.Provider>
+    );
+
+    const view = render(withProvider(earlier.provider));
+
+    await screen.findByText(`Showing ${formatCount(2)} of ${formatCount(4)} spans.`);
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+    await screen.findByText(`Showing ${formatCount(4)} of ${formatCount(4)} spans.`);
+    await user.click(rowNamed(SERVER_EVENT.name));
+
+    view.rerender(withProvider(later.provider));
+
+    // The new provider is asked for the authored first page — not the offset
+    // the previous provider's pages reached — and while it loads nothing of the
+    // previous provider's is on screen.
+    expect(later.resolve).toHaveBeenCalledTimes(1);
+    const first = pageRequest(later, 1);
+    expect(first.offset).toBe(0);
+    expect(first.limit).toBe(2);
+    expect(document.querySelector('.dg-timeline__loading')).not.toBeNull();
+    expect(screen.queryByRole('grid')).toBeNull();
+    expect(detailSlot()).toBeNull();
+
+    later.release(1);
+
+    await screen.findByText(`Showing ${formatCount(1)} of ${formatCount(1)} spans.`);
+    expect(renderedNames()).toEqual([QUERY_EVENT.name]);
+    expect(earlier.resolve).toHaveBeenCalledTimes(2);
+  });
+});
+
 describe('Timeline partial results', () => {
-  it('says how much of a span result is on screen and asks for a wider page', async () => {
-    // A page of one record out of twenty-five, then the wider page the component
-    // asks for. The second response is a superset of the first, which is the
-    // shape the service's stable ordering guarantees.
+  it('says how much of a span result is on screen and asks for the next page', async () => {
+    // A page of one record out of twenty-five, then the next page the component
+    // asks for, which holds the record after it.
     const stub = pagingProvider([
       { source: 'spans', data: [INTERACTION_EVENT], total: 25, nextOffset: 1 },
-      { source: 'spans', data: [INTERACTION_EVENT, FETCH_EVENT], total: 25, nextOffset: 2 },
+      { source: 'spans', data: [FETCH_EVENT], total: 25, nextOffset: 2 },
     ]);
     const user = userEvent.setup();
 
@@ -1210,18 +1769,16 @@ describe('Timeline partial results', () => {
 
     expect(stub.resolve).toHaveBeenCalledTimes(2);
 
-    // The window is GROWN from the query's own starting position rather than
-    // advanced past it: this view holds one page of rows at a time, and a wider
-    // window is a superset of a narrower one under the service's ordering.
+    // The walk ADVANCES to the offset the first response named, at the same
+    // page size, rather than widening a window over rows already on screen.
     const second = queryOfCall(stub, 2);
-    expect(second.limit ?? 0).toBeGreaterThan(first.limit ?? 0);
-    expect(second.offset).toBe(first.offset);
+    expect(second.offset).toBe(1);
+    expect(second.limit).toBe(first.limit);
     expect(second.source).toBe('spans');
     expect(second.filter).toEqual({ traceId: TRACE_ID });
-    expect(second.limit ?? 0).toBeLessThanOrEqual(DATA_QUERY_MAX_LIMIT);
 
-    // The rows then follow that response, and the coverage statement follows the
-    // rows.
+    // The page is appended after the row already drawn, and the coverage
+    // statement follows the rows.
     await waitFor(() => {
       expect(renderedNames()).toEqual([INTERACTION_EVENT.name, FETCH_EVENT.name]);
     });
@@ -1447,6 +2004,218 @@ describe('Timeline correlation honesty', () => {
 
     // The rows that were placed carry no re-attachment mark.
     expect(within(rowNamed(INTERACTION_EVENT.name)).queryByText(REATTACHED_FLAG)).toBeNull();
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Keyboard-reachable descriptions
+ *
+ * A row's full description is carried by a `Tooltip`, which opens on focus, so
+ * its trigger has to be reachable by the keyboard — and reachable without the
+ * table growing a tab stop per row. These readers address the two triggers the
+ * view has: the name in the detail strip above the table, and the name in each
+ * row's Operation cell. A class is read only off an element already obtained
+ * semantically, per the harness note at the top of this file.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The detail strip's tooltip slot, or `null` while no row is hovered, focused or selected. */
+function detailSlot(): Element | null {
+  return document.querySelector('.dg-timeline__tooltip');
+}
+
+/** The trigger of the detail strip's description: the focused, hovered or selected row's name. */
+function detailTrigger(): HTMLElement {
+  const trigger = detailSlot()?.querySelector('[aria-describedby]');
+
+  if (!(trigger instanceof HTMLElement)) {
+    throw new Error('the detail strip shows no described row name');
+  }
+
+  return trigger;
+}
+
+/** The detail strip's description bubble. */
+function detailBubble(): HTMLElement {
+  const slot = detailSlot();
+
+  if (!(slot instanceof HTMLElement)) {
+    throw new Error('the detail strip is not rendered');
+  }
+
+  return within(slot).getByRole('tooltip');
+}
+
+/** The trigger of one row's description: the name in its Operation cell. */
+function nameTriggerOf(row: HTMLElement): HTMLElement {
+  const trigger = within(row).getByRole('rowheader').querySelector('[aria-describedby]');
+
+  if (!(trigger instanceof HTMLElement)) {
+    throw new Error('the row header holds no described name');
+  }
+
+  return trigger;
+}
+
+/** Each rendered row's name trigger `tabindex`, in document order; `null` when it has none. */
+function nameTabIndexes(): (string | null)[] {
+  return dataRows().map((row) => nameTriggerOf(row).getAttribute('tabindex'));
+}
+
+/** Whether `bubble` is the description `trigger` announces. */
+function describes(trigger: HTMLElement, bubble: HTMLElement): boolean {
+  return (trigger.getAttribute('aria-describedby') ?? '').split(/\s+/u).includes(bubble.id);
+}
+
+describe('Timeline keyboard-reachable descriptions', () => {
+  it('drives the detail strip from the focused row, and opens its description on focus', async () => {
+    const stub = resolvingTrace(crossTierTree());
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await findCanvas();
+
+    // Nothing hovered, focused or selected: no strip yet, so Tab lands on the table.
+    expect(detailSlot()).toBeNull();
+
+    await user.tab();
+    const [firstRow, secondRow] = dataRows();
+
+    if (firstRow === undefined || secondRow === undefined) {
+      throw new Error('the equivalent rendered fewer than two rows');
+    }
+
+    expect(document.activeElement).toBe(firstRow);
+    expect(detailTrigger().textContent).toBe(INTERACTION_EVENT.name);
+
+    // The strip follows the row the arrow keys move to.
+    await user.keyboard('{ArrowDown}');
+    expect(document.activeElement).toBe(secondRow);
+    expect(detailTrigger().textContent).toBe(FETCH_EVENT.name);
+
+    // The strip's name is a focusable trigger one Shift+Tab away, and its
+    // description opens the moment it takes focus.
+    expect(detailTrigger().getAttribute('tabindex')).toBe('0');
+    expect(detailBubble().classList.contains('dg-is-open')).toBe(false);
+
+    await user.tab({ shift: true });
+
+    const trigger = detailTrigger();
+    const bubble = detailBubble();
+    expect(document.activeElement).toBe(trigger);
+    expect(bubble.classList.contains('dg-is-open')).toBe(true);
+    expect(describes(trigger, bubble)).toBe(true);
+    expect(bubble.textContent).toContain(FETCH_EVENT.name);
+    expect(bubble.textContent).toContain(formatDuration(FETCH_EVENT.duration));
+
+    // Focus moved within the view, so the strip still shows the row it came from.
+    expect(trigger.textContent).toBe(FETCH_EVENT.name);
+
+    // Escape dismisses it without moving focus.
+    await user.keyboard('{Escape}');
+    expect(detailBubble().classList.contains('dg-is-open')).toBe(false);
+    expect(document.activeElement).toBe(trigger);
+  });
+
+  it("makes the focused row's own name a tab stop that opens its description, and no other row's", async () => {
+    const stub = resolvingTrace(crossTierTree());
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await findCanvas();
+
+    // Before focus enters the table no row's name is in the tab order.
+    expect(nameTabIndexes()).toEqual([null, null, null, null]);
+
+    await user.tab();
+    const [firstRow, secondRow] = dataRows();
+
+    if (firstRow === undefined || secondRow === undefined) {
+      throw new Error('the equivalent rendered fewer than two rows');
+    }
+
+    expect(document.activeElement).toBe(firstRow);
+    expect(nameTabIndexes()).toEqual(['0', null, null, null]);
+
+    // One Tab from the row reaches its name, and focus opens the description.
+    await user.tab();
+
+    const trigger = nameTriggerOf(firstRow);
+    const bubble = within(firstRow).getByRole('tooltip');
+    expect(document.activeElement).toBe(trigger);
+    expect(bubble.classList.contains('dg-is-open')).toBe(true);
+    expect(describes(trigger, bubble)).toBe(true);
+    expect(bubble.textContent).toContain(INTERACTION_EVENT.name);
+
+    // Back to the row closes it; moving down moves the stop rather than adding one.
+    await user.tab({ shift: true });
+    expect(document.activeElement).toBe(firstRow);
+    expect(bubble.classList.contains('dg-is-open')).toBe(false);
+
+    await user.keyboard('{ArrowDown}');
+    expect(document.activeElement).toBe(secondRow);
+    expect(nameTabIndexes()).toEqual([null, '0', null, null]);
+
+    // The body holds the table's roving stop and the focused row's name, and
+    // nothing else carrying a tab index, however many rows it renders.
+    const grid = screen.getByRole('grid');
+    expect(grid.querySelectorAll('[tabindex="0"]')).toHaveLength(2);
+  });
+
+  it('forgets the focused row once focus leaves the view', async () => {
+    const stub = resolvingTrace(crossTierTree());
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await findCanvas();
+    await user.tab();
+
+    const [firstRow] = dataRows();
+
+    if (firstRow === undefined) {
+      throw new Error('the equivalent rendered no rows');
+    }
+
+    expect(document.activeElement).toBe(firstRow);
+    expect(detailTrigger().textContent).toBe(INTERACTION_EVENT.name);
+
+    act(() => {
+      firstRow.blur();
+    });
+
+    // No row is focused, hovered or selected any more: the strip is gone and no
+    // row's name is left in the tab order.
+    expect(detailSlot()).toBeNull();
+    expect(nameTabIndexes()).toEqual([null, null, null, null]);
+  });
+
+  it('reaches the description of a flat span page the same way', async () => {
+    const stub = resolvingSpans([INTERACTION_EVENT, FETCH_EVENT, CONTINUATION_EVENT]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode({ query: { source: 'spans', filter: { traceId: TRACE_ID } } }), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    await findCanvas();
+    await user.tab();
+    await user.keyboard('{End}');
+
+    const row = rowNamed(CONTINUATION_EVENT.name);
+    expect(document.activeElement).toBe(row);
+
+    await user.tab();
+
+    const bubble = within(row).getByRole('tooltip');
+    expect(document.activeElement).toBe(nameTriggerOf(row));
+    expect(bubble.classList.contains('dg-is-open')).toBe(true);
+    // The lineage notes a hover would show are in it too.
+    expect(bubble.textContent).toContain(AMBIGUOUS_CANDIDATE_SPAN_ID);
   });
 });
 

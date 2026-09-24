@@ -62,10 +62,29 @@
  * trace + code graph". Only the first half happens here: this package sits below
  * `@debuggen/code-analysis` in the acyclic package graph (AAP 0.2.2) and must
  * not import it, so {@link buildDependencyGraph} derives participants and edges
- * from span parentage and nothing else. The shapes are deliberately **additive**
- * for the other half: `apps/local-service`, which owns the code graph, attaches
- * a `source` to a node it can resolve without this module needing to know that
- * the code graph exists.
+ * from span parentage and nothing else.
+ *
+ * Two facts of that parentage travel with the graph, so that no consumer has to
+ * re-derive them from raw events or guess at them:
+ *
+ * - **The event a participant stands for.** A participant that collapsed
+ *   exactly one record carries that record's `eventId` and `traceId` — the
+ *   coordinate a host selects an event by. A collapse of several records stands
+ *   for no single event, so it carries neither, and no consumer is handed a
+ *   span id to pass off as one.
+ * - **How an edge was known.** `inferredCount` says how many of an edge's
+ *   callee spans joined their caller through a lineage attribution — AAP
+ *   0.4.2's asynchronous continuation — rather than by being nested inside it,
+ *   and `ambiguousCount` how many of those attributions had more than one
+ *   candidate. Both are read through `lineageOf`, the package's only reader of
+ *   the lineage keys, and both are omitted when zero, so a measured edge is
+ *   byte-for-byte the shape it always was.
+ *
+ * The shapes are deliberately **additive** for the other half:
+ * `apps/local-service`, which owns the code graph, attaches a `source` to a node
+ * it can resolve without this module needing to know that the code graph
+ * exists. Every added field is optional and JSON-safe, because the graph is
+ * embedded opaquely in the protocol's `graph` data result.
  *
  * ## Purity and environment
  *
@@ -2177,10 +2196,20 @@ const KIND_IDENTITY_ATTRIBUTE_KEYS: Readonly<Record<TelemetryKind, readonly stri
  * are answered by the interval unions at the top of this module, which is why
  * both live here and neither is used for the other's job.
  *
+ * ## It stands for one event only when it collapsed one record
+ *
+ * `eventId` and `traceId` are the coordinate a host selects an event by, and a
+ * collapse of forty records is not one event: pairing it with the first of them
+ * would send a details drawer to an arbitrary member of the group and present
+ * that choice as the participant. So both fields are set **only** when `count`
+ * is `1`, where the participant and its record are the same thing, and are
+ * absent — the key itself, not an `undefined` value — otherwise.
+ *
  * ## Nothing here holds a reference
  *
- * Edges name nodes by `id`, and a node names its spans by id. The whole shape
- * is JSON, because it crosses an HTTP response on its way to the panel.
+ * Edges name nodes by `id`, and a node names its spans and its event by id. The
+ * whole shape is JSON, because it crosses an HTTP response on its way to the
+ * panel.
  */
 export interface DependencyGraphNode {
   /** `dep:` followed by class, tier and identity: deterministic across runs. */
@@ -2223,9 +2252,42 @@ export interface DependencyGraphNode {
    * in the shape for the same reason as `tier`.
    */
   readonly layer?: number;
+  /**
+   * The id of the one captured event this participant stands for.
+   *
+   * Set by {@link buildDependencyGraph} exactly when `count` is `1`: the
+   * participant collapsed a single record, so that record's id is a coordinate
+   * a host can resolve. Absent for a collapse of several records, which stands
+   * for no single event, and for a participant contributed without a captured
+   * record.
+   */
+  readonly eventId?: EventId;
+  /**
+   * The trace the event named by `eventId` belongs to.
+   *
+   * Present exactly when `eventId` is, and taken from the same record.
+   */
+  readonly traceId?: TraceId;
 }
 
-/** One caller-to-callee relationship between two participants. */
+/**
+ * One caller-to-callee relationship between two participants.
+ *
+ * ## Measured, inferred, and ambiguous
+ *
+ * Most callee spans join their caller by being **nested** inside it: the
+ * parent link is the context the runtime carried, and the edge is measured.
+ * Some join through a **lineage attribution** instead — AAP 0.4.2's
+ * asynchronous continuation, which gives a commit that followed a settled
+ * response that response's span as its parent — and an attribution is an
+ * inference, sometimes one chosen from several open candidates. A reader must
+ * be able to tell the three apart, so an edge says how many of its `count`
+ * callee spans were attributed (`inferredCount`) and how many of those
+ * attributions were ambiguous (`ambiguousCount`). Both are read through
+ * `lineageOf` in `../correlation/tree.ts`, never from the attribute keys, and
+ * both keys are omitted when their value is `0`: an edge built entirely from
+ * nesting carries neither.
+ */
 export interface DependencyGraphEdge {
   /**
    * `edge:` followed by the two node ids, each escaped by
@@ -2241,6 +2303,23 @@ export interface DependencyGraphEdge {
   readonly count: number;
   /** The sum of those spans' durations: what the caller spent in this dependency. */
   readonly totalDurationMs: number;
+  /**
+   * How many of the `count` callee spans joined their caller through a lineage
+   * attribution rather than by being nested inside it.
+   *
+   * Between `1` and `count` when present; the key is omitted when no callee
+   * span was attributed, so `inferredCount === count` means the whole
+   * relationship is inferred and a smaller value that part of it is.
+   */
+  readonly inferredCount?: number;
+  /**
+   * How many of those attributed spans had more than one candidate caller open
+   * when they were attributed, so the caller shown is the most recently settled
+   * candidate rather than a certainty.
+   *
+   * Between `1` and `inferredCount` when present; omitted when `0`.
+   */
+  readonly ambiguousCount?: number;
 }
 
 /**
@@ -2285,6 +2364,16 @@ interface ParticipantAccumulator {
   readonly label: string;
   readonly tier: TelemetryTier;
   readonly spanIds: SpanId[];
+  /**
+   * The id of the first record folded in, in canonical order.
+   *
+   * Kept for every participant and published only while `count` is `1`, where
+   * it is the id of the participant's one record; see
+   * {@link DependencyGraphNode.eventId}.
+   */
+  readonly firstEventId: EventId;
+  /** The trace of that same record; see {@link DependencyGraphNode.traceId}. */
+  readonly firstTraceId: TraceId;
   count: number;
   totalDurationMs: number;
   maxDurationMs: number;
@@ -2298,6 +2387,10 @@ interface EdgeAccumulator {
   readonly to: string;
   count: number;
   totalDurationMs: number;
+  /** Callee spans attributed through lineage; see {@link DependencyGraphEdge.inferredCount}. */
+  inferredCount: number;
+  /** Of those, the ambiguous ones; see {@link DependencyGraphEdge.ambiguousCount}. */
+  ambiguousCount: number;
 }
 
 /** @see MutableRowSeed */
@@ -2312,6 +2405,19 @@ interface MutableDependencyGraphNode {
   maxDurationMs: number;
   source?: SourceLocation;
   layer?: number;
+  eventId?: EventId;
+  traceId?: TraceId;
+}
+
+/** @see MutableRowSeed */
+interface MutableDependencyGraphEdge {
+  id: string;
+  from: string;
+  to: string;
+  count: number;
+  totalDurationMs: number;
+  inferredCount?: number;
+  ambiguousCount?: number;
 }
 
 /**
@@ -2451,6 +2557,8 @@ function accumulateParticipant(
       label: identity,
       tier: event.tier,
       spanIds: [event.spanId],
+      firstEventId: event.id,
+      firstTraceId: event.traceId,
       count: 1,
       totalDurationMs: durationMs,
       maxDurationMs: durationMs,
@@ -2637,18 +2745,38 @@ function toDependencyNode(accumulator: ParticipantAccumulator, layer: number): D
     node.source = accumulator.source;
   }
 
+  // A single-record participant IS its record, so that record's coordinate is
+  // the participant's. A collapse of several stands for no single event, and
+  // publishing the first of them would present an arbitrary member of the
+  // group as the whole of it.
+  if (accumulator.count === 1) {
+    node.eventId = accumulator.firstEventId;
+    node.traceId = accumulator.firstTraceId;
+  }
+
   return node;
 }
 
 /** Finishes one edge into its output shape. */
 function toDependencyEdge(accumulator: EdgeAccumulator): DependencyGraphEdge {
-  return {
+  const edge: MutableDependencyGraphEdge = {
     id: accumulator.id,
     from: accumulator.from,
     to: accumulator.to,
     count: accumulator.count,
     totalDurationMs: roundMs(clampNonNegative(accumulator.totalDurationMs)),
   };
+
+  // Omitted rather than written as `0`, so an edge built entirely from nesting
+  // keeps exactly the shape it had before lineage was reported.
+  if (accumulator.inferredCount > 0) {
+    edge.inferredCount = accumulator.inferredCount;
+  }
+  if (accumulator.ambiguousCount > 0) {
+    edge.ambiguousCount = accumulator.ambiguousCount;
+  }
+
+  return edge;
 }
 
 /**
@@ -2662,6 +2790,12 @@ function toDependencyEdge(accumulator: EdgeAccumulator): DependencyGraphEdge {
  * at), and a span whose parent collapsed into the **same** participant
  * contributes none either — a self-edge is not drawable in a layered layout, and
  * the recursion it describes is already visible in that node's `count`.
+ *
+ * A participant that collapsed exactly one record carries that record's
+ * `eventId` and `traceId` ({@link DependencyGraphNode}), and an edge counts how
+ * many of its callee spans were attributed through lineage rather than nested,
+ * and how many of those ambiguously ({@link DependencyGraphEdge}). Both are
+ * read off the events; neither is guessed.
  *
  * Both bounds drop the least significant items rather than an arbitrary tail:
  * participants by descending total duration, edges by descending count. Keeping
@@ -2714,15 +2848,32 @@ export function buildDependencyGraph(
 
     const id = dependencyEdgeId(from, to);
     const durationMs = clampNonNegative(finiteOrZero(event.duration));
+    // How this callee span came to hang from its caller: through a lineage
+    // attribution when `lineageOf` finds one, by nesting otherwise. Read
+    // through the one reader of the lineage keys, so the edge and the timeline
+    // row built from the same event can never disagree about it.
+    const lineage = lineageOf(event);
+    const inferred = lineage === undefined ? 0 : 1;
+    const ambiguous = lineage?.ambiguous === true ? 1 : 0;
 
     const existing = edgeAccumulators.get(id);
     if (existing === undefined) {
-      edgeAccumulators.set(id, { id, from, to, count: 1, totalDurationMs: durationMs });
+      edgeAccumulators.set(id, {
+        id,
+        from,
+        to,
+        count: 1,
+        totalDurationMs: durationMs,
+        inferredCount: inferred,
+        ambiguousCount: ambiguous,
+      });
       continue;
     }
 
     existing.count += 1;
     existing.totalDurationMs += durationMs;
+    existing.inferredCount += inferred;
+    existing.ambiguousCount += ambiguous;
   }
 
   const allParticipants = [...participants.values()];

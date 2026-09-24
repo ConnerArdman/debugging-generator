@@ -25,20 +25,26 @@
  * It is the only party that can see every adapter's answer, which makes it the
  * only party that can make two judgements:
  *
- * - **"Nothing at all could be enabled" is the single hard failure.** Every
+ * - **"Nothing at all could be enabled" is the only gap that fails.** Every
  *   other gap — an action the feasibility gate refused, an adapter id no
  *   registry resolves, a signal an adapter could not arm here — is reported
  *   through {@link AggregateInstallResult.unavailable} so that
  *   `apps/local-service/src/instrumentation/service.ts` can render AAP §0.5.5's
  *   "Could not enable ‹signal›: ‹reason›. Continuing with: ‹enabled list›."
- *   instead of a failure. Only an install that armed no hook and patched no
- *   file returns `Err`, which the service turns into `instrumentation.failed`.
- * - **How far a failed install is unwound.** A follow-up's delta arrives as a
- *   new plan version, and AAP §0.4.2 requires that a part-way failure
- *   reverse-restores the records *this call* applied and leaves the earlier plan
- *   versions' records exactly as they are — which is what "the session stays at
- *   its previous plan version" means in bytes. See
- *   {@link installPlan}'s rollback section.
+ *   instead of a failure. Of the gaps, only an install that armed no hook and
+ *   patched no file returns `Err`, which the service turns into
+ *   `instrumentation.failed`; a gap in an adapter's `unavailable` never fails
+ *   an install on its own.
+ * - **How far a failed install is unwound.** An adapter that fails part-way —
+ *   it rejects, returns something that is not an install result, or returns a
+ *   result carrying {@link InstallResult.failure} because an accepted action
+ *   could not be completed — fails the whole install. A follow-up's delta
+ *   arrives as a new plan version, and AAP §0.4.2 requires that such a failure
+ *   reverse-restores the records *this call* applied, including the record
+ *   journaled for the failed attempt, and leaves the earlier plan versions'
+ *   records exactly as they are — which is what "the session stays at its
+ *   previous plan version" means in bytes. See {@link installPlan}'s rollback
+ *   section.
  *
  * ## What it deliberately does not know
  *
@@ -81,6 +87,7 @@ import { DebuggenError, err, isErr, ok } from '@debuggen/shared';
 import type { Logger, Result } from '@debuggen/shared';
 
 import type {
+  InstallFailure,
   InstallResult,
   InstrumentationAdapter,
   InstrumentationContext,
@@ -479,36 +486,51 @@ interface AdapterLookup {
  *   runtime hook armed. The error carries `'INSTRUMENTATION_UNAVAILABLE'` and a
  *   `hint` naming the most actionable blocked signal, because the service turns
  *   it into `instrumentation.failed`.
- * - **An adapter failed part-way** — it rejected, or returned something that is
- *   not an install result. The error carries
- *   `'INSTRUMENTATION_INSTALL_FAILED'`.
+ * - **An adapter failed part-way** — it rejected, returned something that is
+ *   not an install result, or returned a result carrying
+ *   {@link InstallResult.failure}: an action it accepted for install could not
+ *   be completed (a patch refused or failed after the feasibility gate
+ *   admitted it, a write-path failure, a cancellation mid-sequence). The error
+ *   carries `'INSTRUMENTATION_INSTALL_FAILED'`, its `details.reason` is
+ *   `'adapter-failed'`, `'invalid-result'` or `'action-failed'` respectively
+ *   (`'aborted'` whenever the context's signal is aborted), and nothing that
+ *   adapter armed or contributed is aggregated.
  *
  * Everything else returns `Ok`, including an install with a long `unavailable`
  * list: partial capability is the graceful-degradation path of AAP §0.5.5, and
  * the developer is told "Continuing with: ‹enabled list›" rather than shown a
- * dead session.
+ * dead session. A gap an adapter reports in `unavailable` — a preload that is
+ * absent or silent, a hook installed after React — never fails an install.
  *
  * ## Rollback: what "left at its previous plan version" means
  *
- * If a `patch`-mode adapter fails after one or more {@link ModificationRecord}s
- * have been applied **within this call**, those records — and only those — are
+ * If an adapter fails after one or more {@link ModificationRecord}s have been
+ * applied **within this call**, those records — and only those — are
  * reverse-restored, latest first, through `./cleanup.ts`'s
  * `restoreModification`, which verifies each file against the record's
  * `instrumentedHash` before writing its backup back and never overwrites a file
- * a developer has edited. Records from earlier plan versions are left applied,
- * so a failed delta leaves the project holding exactly the instrumentation the
- * previous plan version installed: a chained record's backup is the *previous*
- * instrumented content, so restoring the delta's record returns the file to
- * that state rather than to its pristine bytes. Reverse application order is
- * what keeps a chain over one file unwound strictly last-applied-first.
+ * a developer has edited. The set is every record the earlier groups applied,
+ * then the failing adapter's own {@link InstallResult.applied}, then the record
+ * it journaled for the failed attempt ({@link InstallFailure.record}) — last,
+ * so it is the first restored — de-duplicated by record id. That last record
+ * is settled by the reconciliation table of AAP §0.5.1: closed without a write
+ * when its file still holds the original, restored when the file holds the
+ * patch, reported as a conflict otherwise. Records from earlier plan versions
+ * are left applied, so a failed delta leaves the project holding exactly the
+ * instrumentation the previous plan version installed: a chained record's
+ * backup is the *previous* instrumented content, so restoring the delta's
+ * record returns the file to that state rather than to its pristine bytes.
+ * Reverse application order is what keeps a chain over one file unwound
+ * strictly last-applied-first.
  *
  * Rollback outcomes are collected, never swallowed and never retried in a
  * loop: each record is attempted once, a file that may not be restored is
  * reported as a conflict with its backup retained, and every restore failure is
  * summarised in the returned error's `details` and logged. A record a failing
- * adapter journaled but did not return is outside this call's view; it is an
- * open journal entry, which is what `./cleanup.ts`'s `reconcileModifications`
- * acts on at the next service start.
+ * adapter journaled but reported neither in `applied` nor as its failure's
+ * `record` — a rejecting adapter's, typically — is outside this call's view; it
+ * is an open journal entry, which is what `./cleanup.ts`'s
+ * `reconcileModifications` acts on at the next service start.
  *
  * {@link InstrumentationContext.signal} is honoured between groups: an abort
  * unwinds this call's records the same way and returns the same error code.
@@ -638,6 +660,26 @@ export async function installPlan(
             adapterId: group.adapter.id,
             planVersion,
             previousPlanVersion,
+          }),
+        );
+      }
+
+      const failure = reported.failure;
+
+      if (failure !== undefined) {
+        // The fatal channel: an action this adapter accepted could not be
+        // completed. Nothing it armed or contributed is aggregated, and every
+        // record this call applied — the earlier groups', this adapter's own,
+        // and the one it journaled for the failed attempt, which goes last so
+        // it is restored first — is reverse-restored before the error returns.
+        return err(
+          await unwind(rollbackSetOf(applied, reported.applied, failure.record), context, {
+            reason: isAborted(context) ? 'aborted' : 'action-failed',
+            adapterId: group.adapter.id,
+            planVersion,
+            previousPlanVersion,
+            cause: failure.error,
+            failure,
           }),
         );
       }
@@ -1236,6 +1278,39 @@ function groupActions(
 // rollback loop as though it were restorable.
 // ---------------------------------------------------------------------------
 
+/**
+ * An adapter's {@link InstallFailure}, after it has been read.
+ *
+ * Every member has been narrowed from what a possibly third-party adapter
+ * returned: the error is a real {@link DebuggenError}, a string fact is kept
+ * only when it is non-blank, a record only when the rollback can address it,
+ * and a conflict report only when it is an object. The report itself is never
+ * copied into an error's details or a log line — it holds diffs — and only its
+ * presence is recorded.
+ */
+interface ReportedFailure {
+  /** The failure's coded error, which becomes the returned error's `cause`. */
+  readonly error: DebuggenError;
+
+  /** The signal the failed action would have supplied, when it was named. */
+  readonly signal?: InstallFailure['signal'] | undefined;
+
+  /** The failed action's id, when it was named. */
+  readonly actionId?: string | undefined;
+
+  /** The failed target's project-relative file, when it was named. */
+  readonly file?: string | undefined;
+
+  /** The symbol the failed action addressed, when it was named. */
+  readonly symbol?: string | undefined;
+
+  /** The record journaled for the failed attempt, when there is one. */
+  readonly record?: ModificationRecord | undefined;
+
+  /** The baseline-conflict report, when there is one. Never logged. */
+  readonly conflict?: ModificationConflict | undefined;
+}
+
 /** What one adapter's result contributes, after it has been read. */
 interface ReportedInstall {
   /** The usable modification records, in the order the adapter applied them. */
@@ -1249,6 +1324,12 @@ interface ReportedInstall {
 
   /** Whether this adapter enabled anything at all: a hook or a modification. */
   readonly enabled: boolean;
+
+  /**
+   * The fatal-channel report, when the adapter could not complete an action it
+   * accepted. Present means the caller unwinds instead of aggregating.
+   */
+  readonly failure?: ReportedFailure | undefined;
 }
 
 /**
@@ -1323,7 +1404,77 @@ function isUnavailableLike(value: unknown): value is UnavailableSignal {
 }
 
 /**
+ * The outcome of reading an adapter's `failure` member.
+ *
+ * Three answers rather than two, because "no failure" and "not a failure at
+ * all" call for different unwinds: an absent member is the ordinary success an
+ * adapter written before the fatal channel existed returns, while a member of
+ * the wrong type means the value is not an install result.
+ */
+type FailureReading =
+  | { readonly kind: 'none' }
+  | { readonly kind: 'failed'; readonly failure: ReportedFailure }
+  | { readonly kind: 'invalid' };
+
+/**
+ * Reads an adapter's `failure` member structurally.
+ *
+ * `undefined` and `null` are no failure — the additive contract, under which an
+ * explicit `failure: undefined` is an ordinary success. A non-array object is a
+ * failure, whatever else it carries: an adapter that took the trouble to report
+ * one has not completed its install, and the worst reading of a malformed
+ * report is to ignore it. Anything else — a string, a number, an array — is not
+ * a failure report, and makes the whole value not an install result.
+ *
+ * @param value The member as the adapter returned it.
+ * @returns The reading.
+ */
+function readFailure(value: unknown): FailureReading {
+  if (value === undefined || value === null) {
+    return { kind: 'none' };
+  }
+
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    return { kind: 'invalid' };
+  }
+
+  const candidate = value as {
+    error?: unknown;
+    signal?: unknown;
+    actionId?: unknown;
+    file?: unknown;
+    symbol?: unknown;
+    record?: unknown;
+    conflict?: unknown;
+  };
+  const { signal, actionId, file, symbol, record, conflict } = candidate;
+
+  return {
+    kind: 'failed',
+    failure: {
+      // `from` returns a real error unchanged and normalises anything else,
+      // so a JavaScript adapter that reported a bare string or nothing at all
+      // still yields a coded error the service can send.
+      error: DebuggenError.from(candidate.error, 'INSTRUMENTATION_INSTALL_FAILED'),
+      ...(isNonEmptyString(signal) ? { signal } : {}),
+      ...(isNonEmptyString(actionId) ? { actionId } : {}),
+      ...(isNonEmptyString(file) ? { file } : {}),
+      ...(isNonEmptyString(symbol) ? { symbol } : {}),
+      ...(isRecordLike(record) ? { record } : {}),
+      ...(typeof conflict === 'object' && conflict !== null
+        ? { conflict: conflict as ModificationConflict }
+        : {}),
+    },
+  };
+}
+
+/**
  * Reads one adapter's result, or reports that it is not one.
+ *
+ * A result carrying a failure is read leniently: only its `applied` records
+ * matter — they are the adapter's share of the rollback set — and every other
+ * member is ignored, as the contract states, so a malformed hook list beside a
+ * real failure does not cost the rollback the records the adapter did return.
  *
  * @param value What the adapter returned.
  * @returns What it contributes, or `undefined` when the value is not an install
@@ -1338,8 +1489,25 @@ function readInstallResult(value: InstallResult): ReportedInstall | undefined {
     applied?: unknown;
     runtimeHooks?: unknown;
     unavailable?: unknown;
+    failure?: unknown;
   };
   const applied = asList(candidate.applied);
+  const failure = readFailure(candidate.failure);
+
+  if (failure.kind === 'invalid') {
+    return undefined;
+  }
+
+  if (failure.kind === 'failed') {
+    return {
+      applied: (applied ?? []).filter(isRecordLike),
+      runtimeHooks: [],
+      unavailable: [],
+      enabled: false,
+      failure: failure.failure,
+    };
+  }
+
   const runtimeHooks = asList(candidate.runtimeHooks);
   const unavailable = asList(candidate.unavailable);
 
@@ -1558,8 +1726,12 @@ function isAborted(context: InstrumentationContext): boolean {
 
 /** Why an install is being unwound, and what the error should say about it. */
 interface UnwindInput {
-  /** The condition that stopped the install. */
-  readonly reason: 'aborted' | 'adapter-failed' | 'invalid-result';
+  /**
+   * The condition that stopped the install: a cancellation, an adapter that
+   * rejected, a value that is not an install result, or a result that carried
+   * a failure through the fatal channel.
+   */
+  readonly reason: 'aborted' | 'adapter-failed' | 'invalid-result' | 'action-failed';
 
   /** The adapter that was installing, when one was. */
   readonly adapterId?: string | undefined;
@@ -1570,8 +1742,50 @@ interface UnwindInput {
   /** The revision the session returns to, for a delta install. */
   readonly previousPlanVersion?: number | undefined;
 
-  /** What the adapter threw, when it threw. */
+  /** What the adapter threw, or the error its reported failure carried. */
   readonly cause?: unknown;
+
+  /**
+   * The failure the adapter reported through the fatal channel, when it did.
+   *
+   * Its identifying facts are added to the error's details and its own message
+   * and hint are quoted; its conflict report, which holds diffs, is not copied.
+   */
+  readonly failure?: ReportedFailure | undefined;
+}
+
+/**
+ * The records a failed install must reverse-restore, in application order.
+ *
+ * The earlier groups' records, then the failing adapter's own, then the record
+ * it journaled for the failed attempt — which is therefore the first one
+ * {@link rollbackApplied} restores, because it is the last write that may have
+ * touched the project. De-duplicated by record id with the first occurrence's
+ * position kept, so an adapter that listed its failed record in both places
+ * does not have it restored twice (the second attempt would find the file
+ * already restored and report a conflict that is not one).
+ *
+ * @param earlier The records the groups before the failing one applied.
+ * @param reported The failing adapter's {@link InstallResult.applied}.
+ * @param failed The record journaled for the failed attempt, when there is one.
+ * @returns A fresh array in application order.
+ */
+function rollbackSetOf(
+  earlier: readonly ModificationRecord[],
+  reported: readonly ModificationRecord[],
+  failed: ModificationRecord | undefined,
+): ModificationRecord[] {
+  const seen = new Set<string>();
+  const set: ModificationRecord[] = [];
+
+  for (const record of [...earlier, ...reported, ...(failed === undefined ? [] : [failed])]) {
+    if (!seen.has(record.id)) {
+      seen.add(record.id);
+      set.push(record);
+    }
+  }
+
+  return set;
 }
 
 /**
@@ -1674,9 +1888,77 @@ function describeRollback(
 }
 
 /**
+ * Ends a sentence the way a message quoted mid-paragraph needs.
+ *
+ * @param text A developer-facing message.
+ * @returns The trimmed message, with a full stop when it had no terminal
+ * punctuation.
+ */
+function asSentence(text: string): string {
+  const trimmed = text.trim();
+
+  return /[.!?]$/u.test(trimmed) ? trimmed : `${trimmed}.`;
+}
+
+/**
+ * The headline for an install an adapter reported as failed.
+ *
+ * Names the adapter, then the target when the failure named one — the symbol
+ * and its file, or whichever of the two is known — and then quotes the
+ * failure's own message, which was written for the developer and says *why*.
+ *
+ * @param adapter The failing adapter's id.
+ * @param failure The failure it reported, when one was read.
+ * @returns One or two sentences for the error message.
+ */
+function failedActionHeadline(adapter: string, failure: ReportedFailure | undefined): string {
+  const target =
+    failure?.symbol !== undefined && failure.file !== undefined
+      ? `${failure.symbol} in ${failure.file}`
+      : (failure?.symbol ?? failure?.file);
+  const opening =
+    target === undefined
+      ? `The adapter "${adapter}" could not complete an action it accepted for install:`
+      : `The adapter "${adapter}" could not instrument ${target}:`;
+
+  return `${opening} ${asSentence(failure?.error.message ?? 'the adapter gave no reason')}`;
+}
+
+/**
+ * The identifying facts of a reported failure, as they go into the returned
+ * error's details and its log line.
+ *
+ * Identifiers, a project-relative path, a signal name, a code and a boolean —
+ * never the conflict report, whose three-way diffs are file content, and never
+ * any other byte of a file (AAP §0.5.2).
+ *
+ * @param failure The failure the adapter reported.
+ * @returns A JSON-serialisable summary.
+ */
+function failedActionFacts(failure: ReportedFailure): Record<string, unknown> {
+  return {
+    actionId: failure.actionId,
+    file: failure.file,
+    symbol: failure.symbol,
+    signal: failure.signal,
+    code: failure.error.code,
+    recordId: failure.record?.id,
+    conflictReported: failure.conflict !== undefined,
+  };
+}
+
+/**
  * Unwinds a failed or cancelled install and builds the error that reports it.
  *
- * @param applied The records this install applied, in application order.
+ * For an `'action-failed'` stop the headline names the adapter and the target
+ * and quotes the failure's own message, and the hint is the failure's own hint
+ * whenever the rollback left the project intact — it names the recovery for
+ * the cause — falling back to the generic re-ask otherwise; a rollback that
+ * left conflicts always points at them instead.
+ *
+ * @param applied The rollback set: every record this install applied, in
+ * application order, including a failed attempt's record last. Its length is
+ * reported as `details.attempted`.
  * @param context The session's context.
  * @param input Why the install stopped.
  * @returns The error to return in the failure channel.
@@ -1688,22 +1970,29 @@ async function unwind(
 ): Promise<DebuggenError> {
   const report = await rollbackApplied(applied, context);
   const intact = report.conflicts.length === 0 && report.failures.length === 0;
+  const adapter = input.adapterId ?? 'unknown';
   const headline =
     input.reason === 'aborted'
       ? 'Installing instrumentation was cancelled before it finished.'
       : input.reason === 'invalid-result'
-        ? `The adapter "${input.adapterId ?? 'unknown'}" did not return an install result.`
-        : `The adapter "${input.adapterId ?? 'unknown'}" failed while installing its share of the plan.`;
+        ? `The adapter "${adapter}" did not return an install result.`
+        : input.reason === 'action-failed'
+          ? failedActionHeadline(adapter, input.failure)
+          : `The adapter "${adapter}" failed while installing its share of the plan.`;
+  const failureHint = input.failure?.error.hint;
   const hint = intact
     ? input.reason === 'aborted'
       ? "Start the session's instrumentation again when you are ready to capture."
-      : 'Nothing from this attempt remains in the project; ask the question again to install instrumentation afresh.'
+      : input.reason === 'action-failed' && isNonEmptyString(failureHint)
+        ? failureHint
+        : 'Nothing from this attempt remains in the project; ask the question again to install instrumentation afresh.'
     : 'Review the reported conflicts before installing again: the original bytes are kept in this session\u2019s backup directory and no file was overwritten.';
   const details: Record<string, unknown> = {
     reason: input.reason,
     planVersion: input.planVersion,
     previousPlanVersion: input.previousPlanVersion,
     adapter: input.adapterId,
+    ...(input.failure === undefined ? {} : { failedAction: failedActionFacts(input.failure) }),
     attempted: applied.length,
     restored: report.restored.map((record) => record.id).slice(0, MAX_REPORTED_ITEMS),
     restoredCount: report.restored.length,

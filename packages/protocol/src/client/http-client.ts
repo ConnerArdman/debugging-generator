@@ -38,6 +38,31 @@
  * time**, never at import time, so importing this module still does nothing
  * (`package.json` declares `sideEffects: false`).
  *
+ * ## Only a loopback origin ever receives a credential
+ *
+ * The configured base URL is validated in the constructor by
+ * {@link parseServiceOrigin} — Section A.1, the one host policy this client and
+ * `./ws-client.ts` share — and reduced to a canonical {@link ServiceOrigin}. A
+ * value that names any host other than this machine's loopback interface, or
+ * that carries user information, a path, a query or a fragment, is refused: the
+ * constructor still returns (AAP §0.5.5), with {@link HttpClient.baseUrl}
+ * `undefined` and {@link HttpClient.configurationError} naming the rule, and
+ * every call — exempt ones included — answers `CONFIG_INVALID` **before** the
+ * credential provider or the transport is touched. The refused value is not
+ * kept, so no message, hint or `details` can quote it (AAP §0.5.2).
+ *
+ * ## Cancellation is established before the credential is resolved
+ *
+ * A call's caller signal and its timeout are linked into one controller before
+ * the call's first asynchronous step, and every step after it — resolving the
+ * credential, sending, reading the body — is raced against that controller. A
+ * credential provider that never settles therefore ends at the call's deadline
+ * rather than leaving the call pending forever, and a credential that resolves
+ * after the call was cancelled never reaches the transport. The failure is
+ * `TRANSPORT_DISCONNECTED` with `details.cancelled` naming the source that fired
+ * — `timeout` or `aborted` — and the timer and listener are released on every
+ * exit path.
+ *
  * ## Two routes carry no credential, and only two
  *
  * `Authorization: Bearer <token>` goes on every request except the two
@@ -71,8 +96,9 @@
  * `describeZodIssues` through the two parse helpers, which emit issue paths and
  * codes and no rejected value; a refusal carries the numeric status, the
  * operation and the fields the error payload's own schema validated; and the
- * only logging is one `debug` record per call with the operation, the status and
- * the elapsed milliseconds.
+ * only logging is one `debug` record per call that reached the transport, with
+ * the operation, the status when one arrived, the elapsed milliseconds and, for
+ * a cancelled call, which source fired.
  *
  * ## The public surface
  *
@@ -89,7 +115,8 @@
  * entry, so a symbol it does not re-export does not exist for a consumer), by
  * `apps/vscode-extension/src/service/{client,discovery,process}.ts`,
  * `apps/chrome-extension/src/background/{ws-bridge,auth}.ts` and the service's
- * own integration suites. Nothing inside `src/**` imports this module.
+ * own integration suites. Inside `src/**` only `./ws-client.ts` imports this
+ * module, and only for Section A.1's origin validator.
  */
 
 import {
@@ -162,6 +189,17 @@ const RATE_LIMITED_STATUS = 429;
 const SERVER_ERROR_STATUS_FLOOR = 500;
 
 /**
+ * The longest delay a platform timer honours, in milliseconds: 2³¹ − 1, about
+ * 24.8 days.
+ *
+ * Every runtime this bundle targets stores the delay as a signed 32-bit integer
+ * and fires *immediately* for anything larger, so a generous timeout would turn
+ * into an instant one. A longer timeout is scheduled at this bound instead,
+ * which no call outlives.
+ */
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
+/**
  * The error codes that already say "unauthorized" in the closed vocabulary of
  * `@debuggen/shared`.
  *
@@ -177,12 +215,466 @@ const UNAUTHORIZED_FAMILY_CODES: readonly DebuggenErrorCode[] = [
   'UNAUTHORIZED',
 ];
 
+// ---------------------------------------------------------------------------
+// Section A.1 — the service origin both transports send their credential to
+//
+// The one host policy of this SDK, shared by both halves: this client's
+// constructor and the sibling `./ws-client.ts` (its `resolveWsUrl` and its
+// constructor) validate the configured value here and nowhere else, so the two
+// transports cannot disagree about where a credential may go. The edge runs one
+// way only — the WebSocket half imports this section, and this module imports
+// nothing from it.
+//
+// Why a policy at all: the local service binds a loopback interface (AAP
+// §0.5.6, `DEBUGGEN_HOST` defaults to `127.0.0.1` per AAP §0.3.4), and both
+// clients present a bearer credential — the HTTP `Authorization` header, the
+// WebSocket `client.hello` frame — together with private project data on their
+// very first write. A configured base URL is not trusted input: the editor
+// reads it from `debuggen.serviceUrl`, a service worker from its own storage,
+// and a value naming any other host would hand the developer's credential and
+// project to that host before the service's own authentication or origin
+// policy could say anything (CWE-200, CWE-918). So a value that does not name
+// this machine's loopback interface is refused *before* any credential is
+// resolved, and nothing is sent.
+// ---------------------------------------------------------------------------
+
 /**
- * What `URL.origin` answers for a URL whose scheme has no origin — `file:`,
- * `data:` — and therefore the one value {@link normalizeBaseUrl} must not adopt
- * as a base.
+ * The brand that makes {@link ServiceOrigin} nominal.
+ *
+ * Declared, never defined: it exists only in the type system, so nothing is
+ * emitted and importing this module still has no side effect.
  */
-const OPAQUE_ORIGIN = 'null';
+declare const SERVICE_ORIGIN_BRAND: unique symbol;
+
+/**
+ * A validated origin of the local service: `http:` or `https:`, a loopback host,
+ * an optional port, and nothing else — no userinfo, no path, no query, no
+ * fragment. For example `http://127.0.0.1:43117`.
+ *
+ * Branded so that the only way to hold one is {@link parseServiceOrigin}: a
+ * plain `string` does not satisfy it, which is what lets a consumer that
+ * accepts a `ServiceOrigin` rely on the loopback check having run. It is still a
+ * `string` at run time, so it displays, compares and concatenates as one — the
+ * DevTools panel's `ConnectionStatus` pill and the editor's `StatusBar` render
+ * it as is.
+ */
+export type ServiceOrigin = string & { readonly [SERVICE_ORIGIN_BRAND]: true };
+
+/**
+ * Which rule a refused service base URL broke, as it appears in
+ * `error.details.rule`.
+ *
+ * A closed vocabulary rather than a message a consumer would have to parse, and
+ * never a function of the input: a refused value can carry a pasted credential,
+ * so the rule is the whole account of what was wrong with it.
+ *
+ * - `empty` — nothing but whitespace was configured.
+ * - `unparseable` — the value is not an absolute URL, or not a string at all.
+ * - `userinfo` — the authority embeds a user name or password.
+ * - `scheme` — the scheme is not `http`, `https`, `ws` or `wss`.
+ * - `host` — the URL names no host.
+ * - `not-loopback` — the host is not this machine's loopback interface.
+ * - `path` — the URL carries a path other than the root (or the one path the
+ *   caller allowed).
+ * - `query-or-fragment` — the URL carries a `?` query or a `#` fragment, even an
+ *   empty one.
+ */
+export type ServiceOriginRule =
+  | 'empty'
+  | 'unparseable'
+  | 'userinfo'
+  | 'scheme'
+  | 'host'
+  | 'not-loopback'
+  | 'path'
+  | 'query-or-fragment';
+
+/** How {@link parseServiceOrigin} is asked to read one value. */
+export interface ServiceOriginOptions {
+  /**
+   * The one path, besides the root, the value may carry — `WS_PATH` when the
+   * value is the socket URL rather than the base URL.
+   *
+   * Omitted means only the root is accepted, which is the right answer for a
+   * base URL: every route path is absolute, so a path prefix in the configured
+   * value could only be dropped silently or be a mistake.
+   */
+  readonly allowedPath?: string | undefined;
+}
+
+/**
+ * The scheme each accepted input scheme is canonicalised to.
+ *
+ * `ws:`/`wss:` are accepted because a socket URL and a base URL name the same
+ * service origin; the result is always the HTTP spelling, so both transports
+ * start from one canonical string. The default ports agree pairwise (80 for
+ * `http:`/`ws:`, 443 for `https:`/`wss:`), so the mapping never changes which
+ * port is meant.
+ */
+const SERVICE_ORIGIN_SCHEME_BY_INPUT_SCHEME: Readonly<
+  Record<string, 'http:' | 'https:' | undefined>
+> = Object.freeze({
+  'http:': 'http:',
+  'https:': 'https:',
+  'ws:': 'http:',
+  'wss:': 'https:',
+});
+
+/** The loopback name, as the WHATWG URL parser lowercases it. */
+const LOOPBACK_HOST_NAME = 'localhost';
+
+/** The IPv6 loopback address, as the URL parser serialises every spelling of it. */
+const IPV6_LOOPBACK_HOSTNAME = '[::1]';
+
+/**
+ * An IPv4-mapped IPv6 address inside `127.0.0.0/8`, as the URL parser
+ * serialises it: `[::ffff:127.0.0.1]` becomes `[::ffff:7f00:1]`, so the first
+ * embedded hextet always begins `7f`.
+ */
+const IPV4_MAPPED_LOOPBACK_HOSTNAME = /^\[::ffff:7f[0-9a-f]{2}:[0-9a-f]{1,4}\]$/u;
+
+/**
+ * A dotted-quad IPv4 hostname. The URL parser has already normalised every
+ * other IPv4 spelling (`127.1`, `0x7f.1`, `2130706433`) to this form with
+ * in-range octets, so the first capture is all the loopback test needs.
+ */
+const IPV4_DOTTED_QUAD_HOSTNAME = /^(\d{1,3})\.\d{1,3}\.\d{1,3}\.\d{1,3}$/u;
+
+/** The first octet of `127.0.0.0/8`, the IPv4 loopback block, as the parser prints it. */
+const IPV4_LOOPBACK_FIRST_OCTET = '127';
+
+/**
+ * The characters that begin a query or a fragment. Tested on the raw value
+ * because the parser reports an *empty* query or fragment as `''`, and a value
+ * that carries either marker is not an origin.
+ */
+const QUERY_OR_FRAGMENT_MARKER = /[?#]/u;
+
+/**
+ * The raw shape of an origin as written: a scheme, exactly `://`, the authority
+ * up to the first `/`, `\`, `?` or `#`, and then the path up to a query or a
+ * fragment.
+ *
+ * Why the raw value is read at all: the WHATWG parser is lenient in exactly the
+ * places this policy must be strict. It erases an **empty** userinfo
+ * (`http://@host`, `http://:@host` both parse with an empty `username`), it
+ * resolves dot segments (`/a/..` and `/hidden/../ws` become `/` and `/ws`),
+ * it reads `\` as `/` and `%2e` as `.` in a special URL's path, and it accepts a
+ * special scheme with no slashes at all (`http:host`). Each of those would let a
+ * value that is not written as a plain origin through a check made on the
+ * parsed result, so the userinfo and path rules below are applied to these two
+ * captures as written, and a value that does not have this shape is refused.
+ *
+ * The authority stops at the same four characters the parser stops at for a
+ * special scheme, so any `@` it contains is a userinfo separator to the parser
+ * too.
+ */
+const RAW_ORIGIN_SHAPE = /^[a-z][a-z0-9+.-]*:\/\/([^/\\?#]*)([^?#]*)/iu;
+
+/** The separator between a userinfo component and a host, in a raw authority. */
+const USERINFO_SEPARATOR = '@';
+
+/**
+ * The code points at or below which a character is an ASCII control or a
+ * space. The parser silently strips a tab or a newline anywhere in its input
+ * and trims controls and spaces at both ends, so a value carrying one inside it
+ * does not say what the parser reads; such a value is refused instead.
+ */
+const LAST_CONTROL_OR_SPACE_CODE_POINT = 0x20;
+
+/** DEL, the one ASCII control above {@link LAST_CONTROL_OR_SPACE_CODE_POINT}. */
+const DELETE_CODE_POINT = 0x7f;
+
+/** The root path the URL parser gives an origin with no path. */
+const ROOT_PATH = '/';
+
+/** The example every hint below points at. */
+const SERVICE_ORIGIN_EXAMPLE = 'http://127.0.0.1:43117';
+
+/**
+ * Validates a configured service base URL and reduces it to its canonical
+ * loopback origin.
+ *
+ * The single host policy both transports apply before they resolve or send a
+ * credential (see Section A.1 above). The rules, in the order they are checked:
+ * the value is a non-empty string; it contains no ASCII control character or
+ * space inside it and parses as an absolute URL; its authority embeds no user
+ * name or password; its scheme is `http`, `https`, `ws` or `wss`; it is written
+ * as `scheme://authority` and that authority, **as written**, contains no `@` —
+ * so an empty userinfo the parser would erase is refused too; it names a host;
+ * that host is this machine's loopback interface — the name `localhost`, an IPv4
+ * address in `127.0.0.0/8`, the IPv6 loopback address `[::1]` or an IPv4-mapped
+ * IPv6 address in `127.0.0.0/8`, the same set `apps/local-service/src/config.ts`
+ * accepts for `DEBUGGEN_HOST`; its path, **as written and as parsed**, is the
+ * root or exactly {@link ServiceOriginOptions.allowedPath} — so dot segments,
+ * `\` and `%2e` are refused however they would normalise; and it carries no
+ * query and no fragment. A name is compared, never resolved: a host that merely
+ * resolves to a loopback address today is still refused.
+ *
+ * **A failure is returned, not thrown**, because a misconfigured service URL is
+ * a state a user interface renders (AAP §0.5.5). Every failure is
+ * `CONFIG_INVALID` with a constant message, a constant hint and
+ * `details: { rule }` — and nothing else. The value itself never appears in the
+ * error, not even in part: the parser's own `TypeError` quotes its input and is
+ * therefore discarded, and a refused value can carry a pasted credential
+ * (AAP §0.5.2).
+ *
+ * @param value The configured value, for example `http://127.0.0.1:43117`.
+ * Surrounding whitespace is ignored.
+ * @param options The one extra path the value may carry, when it is a socket URL.
+ * @returns `ok(origin)` — always `http:` or `https:` followed by the host and any
+ * non-default port — or `err(error)` naming the rule the value broke.
+ *
+ * @example
+ * ```ts
+ * const origin = parseServiceOrigin(config.serviceUrl);
+ * if (isErr(origin)) {
+ *   return view.showConfigurationError(origin.error); // never quotes the value
+ * }
+ * statusBar.render(origin.value); // "http://127.0.0.1:43117"
+ * ```
+ */
+export function parseServiceOrigin(
+  value: string,
+  options?: ServiceOriginOptions,
+): Result<ServiceOrigin, DebuggenError> {
+  // Unreachable for a typed caller, but not for an untyped one: a service worker
+  // forwarding what it read from `chrome.storage.local` can hand over
+  // `undefined`, and both transports' constructors promise never to throw. Read
+  // as `unknown` so the guard is a real check rather than one the compiler
+  // considers dead, and answered here so the two transports report it alike.
+  const configured: unknown = value;
+
+  if (typeof configured !== 'string') {
+    return err(
+      serviceOriginError(
+        'unparseable',
+        'The service base URL is not text',
+        `Configure the service URL as a string naming a loopback host and port, for example ${SERVICE_ORIGIN_EXAMPLE}.`,
+      ),
+    );
+  }
+
+  const trimmed = configured.trim();
+
+  if (trimmed.length === 0) {
+    return err(
+      serviceOriginError(
+        'empty',
+        'The service base URL is empty',
+        `Set the service URL to the loopback host and port the local service listens on, for example ${SERVICE_ORIGIN_EXAMPLE}.`,
+      ),
+    );
+  }
+
+  // `new URL` throws a `TypeError` whose message quotes the input — the one
+  // thing that must not be forwarded — hence `tryCatch` and a constant sentence
+  // rather than the caught error, which is not kept even as `cause`. A value
+  // with a control character or a space inside it is refused the same way
+  // before it is parsed: the parser would drop or trim those silently, and the
+  // raw checks below have to see exactly what the parser sees.
+  const parsed = containsControlOrSpace(trimmed)
+    ? undefined
+    : tryCatch(() => new URL(trimmed), 'CONFIG_INVALID');
+
+  if (parsed === undefined || isErr(parsed)) {
+    return err(unparseableServiceOriginError());
+  }
+
+  const url = parsed.value;
+
+  if (url.username.length > 0 || url.password.length > 0) {
+    return err(
+      serviceOriginError(
+        'userinfo',
+        'The service base URL carries embedded credentials',
+        'Remove the user information from the URL: the local service authenticates with a bearer credential, never with credentials in the URL.',
+      ),
+    );
+  }
+
+  const scheme = SERVICE_ORIGIN_SCHEME_BY_INPUT_SCHEME[url.protocol];
+
+  if (scheme === undefined) {
+    return err(
+      serviceOriginError(
+        'scheme',
+        'The service base URL has an unsupported scheme',
+        'Use http or https (ws and wss name the same origin); the local service listens over plain HTTP on a loopback address.',
+      ),
+    );
+  }
+
+  // The value as written, for the two rules the parser's normalisation would
+  // otherwise defeat (see RAW_ORIGIN_SHAPE): a special scheme written without
+  // `//` — or with `\` in its place — is not an origin as written, so it is
+  // refused rather than read the way the parser would read it.
+  const raw = RAW_ORIGIN_SHAPE.exec(trimmed);
+  const rawAuthority = raw?.[1];
+  const rawPath = raw?.[2];
+
+  if (rawAuthority === undefined || rawPath === undefined) {
+    return err(unparseableServiceOriginError());
+  }
+
+  // Any `@` in the authority as written is a userinfo separator, including one
+  // in front of an empty user name or password, which the parser erases
+  // without a trace in `username` and `password`.
+  if (rawAuthority.includes(USERINFO_SEPARATOR)) {
+    return err(
+      serviceOriginError(
+        'userinfo',
+        'The service base URL carries embedded credentials',
+        'Remove the user information from the URL: the local service authenticates with a bearer credential, never with credentials in the URL.',
+      ),
+    );
+  }
+
+  if (url.hostname.length === 0) {
+    return err(
+      serviceOriginError(
+        'host',
+        'The service base URL names no host',
+        `Include the loopback host and port, for example ${SERVICE_ORIGIN_EXAMPLE}.`,
+      ),
+    );
+  }
+
+  if (!isLoopbackServiceHostname(url.hostname)) {
+    return err(
+      serviceOriginError(
+        'not-loopback',
+        'The service base URL does not name a loopback address',
+        'The local service only listens on this machine: use 127.0.0.1 (or another address in 127.0.0.0/8), localhost or [::1]. No credential is ever sent to another host.',
+      ),
+    );
+  }
+
+  // Judged as written *and* as parsed. The raw path must be exactly the root
+  // (or nothing) or exactly the allowed path — so dot segments, `\`, `%2e` and
+  // doubled slashes are refused however they would normalise — and the parsed
+  // path must agree, which it does for every raw path that passes.
+  if (
+    !isPermittedServicePath(rawPath, options?.allowedPath) ||
+    !isPermittedServicePath(url.pathname, options?.allowedPath)
+  ) {
+    return err(
+      serviceOriginError(
+        'path',
+        'The service base URL carries a path',
+        `Configure the origin only — scheme, host and port, for example ${SERVICE_ORIGIN_EXAMPLE}; every route path is added by the client.`,
+      ),
+    );
+  }
+
+  if (QUERY_OR_FRAGMENT_MARKER.test(trimmed)) {
+    return err(
+      serviceOriginError(
+        'query-or-fragment',
+        'The service base URL carries a query or a fragment',
+        `Configure the origin only — scheme, host and port, for example ${SERVICE_ORIGIN_EXAMPLE}.`,
+      ),
+    );
+  }
+
+  // The one assertion that mints the brand, and the reason the brand exists:
+  // every rule above has held, so this string is a loopback origin.
+  return ok(`${scheme}//${url.host}` as ServiceOrigin);
+}
+
+/**
+ * Whether a hostname, exactly as the WHATWG URL parser reports it, names this
+ * machine's loopback interface.
+ *
+ * Only the parser's canonical forms need recognising, because
+ * {@link parseServiceOrigin} is the only caller and always parses first: the
+ * name is already lowercase, an IPv4 address is already a dotted quad, and an
+ * IPv6 literal is already bracketed and compressed. An IPv4-*compatible* IPv6
+ * address (`[::7f00:1]`) is deliberately refused — it is deprecated and does not
+ * route to the loopback interface on every platform — and so is `localhost.`
+ * with a trailing dot, which a resolver may look up rather than answer locally.
+ *
+ * @param hostname `URL.hostname` of a parsed value.
+ * @returns `true` when the host is verifiably loopback without resolving it.
+ */
+function isLoopbackServiceHostname(hostname: string): boolean {
+  if (hostname === LOOPBACK_HOST_NAME || hostname === IPV6_LOOPBACK_HOSTNAME) {
+    return true;
+  }
+
+  if (IPV4_MAPPED_LOOPBACK_HOSTNAME.test(hostname)) {
+    return true;
+  }
+
+  const quad = IPV4_DOTTED_QUAD_HOSTNAME.exec(hostname);
+
+  return quad !== null && quad[1] === IPV4_LOOPBACK_FIRST_OCTET;
+}
+
+/**
+ * Builds one refusal of {@link parseServiceOrigin}: `CONFIG_INVALID`, a constant
+ * message and hint, and the rule as the only detail.
+ *
+ * @param rule The rule the value broke.
+ * @param message One constant sentence naming what was wrong.
+ * @param hint The step that corrects it.
+ * @returns The failure, which carries nothing derived from the refused value.
+ */
+function serviceOriginError(rule: ServiceOriginRule, message: string, hint: string): DebuggenError {
+  return new DebuggenError('CONFIG_INVALID', message, { hint, details: { rule } });
+}
+
+/**
+ * The refusal for a value that is not an absolute URL written as a plain
+ * `scheme://authority` origin — shared by the parse failure, a control
+ * character or space inside the value, and a special scheme written without
+ * `//`, which are all the `unparseable` rule.
+ *
+ * @returns The `unparseable` refusal, with a constant message and hint.
+ */
+function unparseableServiceOriginError(): DebuggenError {
+  return serviceOriginError(
+    'unparseable',
+    'The service base URL is not a valid absolute URL',
+    `Write the URL with a scheme, a loopback host and a port, for example ${SERVICE_ORIGIN_EXAMPLE}.`,
+  );
+}
+
+/**
+ * Whether a path — raw or parsed — is one a service origin may carry: nothing,
+ * the root, or exactly the one path the caller allowed.
+ *
+ * @param path The path to judge.
+ * @param allowedPath {@link ServiceOriginOptions.allowedPath}, when given.
+ * @returns `true` when the path is permitted.
+ */
+function isPermittedServicePath(path: string, allowedPath: string | undefined): boolean {
+  return path === '' || path === ROOT_PATH || (allowedPath !== undefined && path === allowedPath);
+}
+
+/**
+ * Whether a value contains an ASCII control character, a space or DEL.
+ *
+ * A loop over code units rather than a regular expression with a control range,
+ * which ESLint's `no-control-regex` would rightly flag as usually a mistake.
+ * Only the ASCII range matters here: it is what the URL parser strips or trims
+ * silently, while anything outside it survives into the parsed value, where
+ * the host and path rules judge it.
+ *
+ * @param value The trimmed configured value.
+ * @returns `true` when the value contains such a character anywhere.
+ */
+function containsControlOrSpace(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const codePoint = value.charCodeAt(index);
+
+    if (codePoint <= LAST_CONTROL_OR_SPACE_CODE_POINT || codePoint === DELETE_CODE_POINT) {
+      return true;
+    }
+  }
+
+  return false;
+}
 
 // ---------------------------------------------------------------------------
 // Section B — the injected transport, typed structurally
@@ -212,7 +704,11 @@ export interface HttpFetchInit {
   /** The JSON request body, present only for a route that declares one. */
   body?: string;
 
-  /** The abort signal, when the caller supplied one or a timeout applies. */
+  /**
+   * The abort signal, when the caller supplied one or a timeout applies: the
+   * call's own controller, which the caller's signal and the timeout both
+   * abort, so the transport sees one signal whichever fires first.
+   */
   signal?: AbortSignal | null;
 
   /** Always `'omit'`: the local service authenticates by bearer credential. */
@@ -274,25 +770,39 @@ type AssignableTo<TSource, TTarget> = [TSource] extends [TTarget] ? true : false
 export type GlobalFetchIsFetchLike = AssertTrue<AssignableTo<typeof fetch, FetchLike>>;
 
 /**
- * The statics this client feature-detects on `AbortSignal`.
+ * The platform globals one call's cancellation is built from, read off
+ * `globalThis` when the call is made.
  *
- * Both members are declared **optional** although the DOM lib types them as
+ * Every member is declared **optional** although the DOM lib types them as
  * always present, and that is the point: this bundle runs in three runtimes and
- * a static that is missing must degrade to "no timeout", never throw. Declaring
- * them optional is what makes the runtime check below type-checkable instead of
- * dead code the compiler has to be argued out of.
+ * a global that is missing must degrade — to "the caller's own signal" without
+ * `AbortController`, to "no timeout" without timers — never throw. Declaring
+ * them optional is what makes the runtime checks in
+ * {@link createCallCancellation} type-checkable instead of dead code the
+ * compiler has to be argued out of.
+ *
+ * Plain `AbortController` and `setTimeout` rather than the `AbortSignal.timeout`
+ * and `AbortSignal.any` statics, for two reasons: the timer behind
+ * `AbortSignal.timeout` cannot be cancelled, so it would outlive every call that
+ * finished early, whereas a handle from `setTimeout` is cleared the moment the
+ * call ends; and a timeout scheduled through the global `setTimeout` is one a
+ * test's fake clock can drive, so the deadline is provable without waiting for
+ * it.
  */
-interface AbortSignalStatics {
-  /** `AbortSignal.timeout(ms)`, when the runtime provides it. */
-  readonly timeout?: (milliseconds: number) => AbortSignal;
+interface CancellationPlatform {
+  /** The `AbortController` constructor, when the runtime provides it. */
+  readonly AbortController?: (new () => AbortController) | undefined;
 
   /**
-   * `AbortSignal.any(signals)`, when the runtime provides it.
+   * The platform `setTimeout`, when the runtime provides it.
    *
-   * The array is mutable because that is how the DOM lib declares the
-   * parameter; a `readonly` array would not satisfy it.
+   * Typed as the DOM lib types it — a numeric handle — which is also what Node
+   * 24 accepts back through `clearTimeout`, although it mints an object there.
    */
-  readonly any?: (signals: AbortSignal[]) => AbortSignal;
+  readonly setTimeout?: ((handler: () => void, milliseconds: number) => number) | undefined;
+
+  /** The platform `clearTimeout`, when the runtime provides it. */
+  readonly clearTimeout?: ((handle: number) => void) | undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -338,7 +848,17 @@ export interface HttpClientOptions {
    * Required and never defaulted: AAP §0.3.4 puts `DEBUGGEN_HOST` and
    * `DEBUGGEN_PORT` in the environment and each client resolves its own base URL
    * from configuration, which is what lets a second service instance run on
-   * another port. Only the **origin** is used (see {@link normalizeBaseUrl}).
+   * another port.
+   *
+   * **Only a loopback origin is accepted.** The value is validated by
+   * {@link parseServiceOrigin} — the one host policy this SDK's two transports
+   * share — so it must name `localhost`, an address in `127.0.0.0/8`, `[::1]`
+   * or an IPv4-mapped loopback address, with no user information, no path, no
+   * query and no fragment (`ws:`/`wss:` are accepted and read as `http:`/
+   * `https:`). A value that breaks any rule does not make the constructor throw:
+   * the client is built with {@link HttpClient.baseUrl} `undefined` and
+   * {@link HttpClient.configurationError} set, and every call answers
+   * `CONFIG_INVALID` without resolving a credential or touching the transport.
    */
   readonly baseUrl: string;
 
@@ -369,7 +889,12 @@ export interface HttpClientOptions {
    * Omitted means no timeout: the local service performs work — indexing a
    * project, running a model stage — that legitimately takes longer than any
    * default this file could pick, so the choice belongs to the caller that knows
-   * which operation it is waiting on.
+   * which operation it is waiting on. A value that is not a finite positive
+   * number also means no timeout.
+   *
+   * The timeout starts when the call is made and bounds all of it — resolving
+   * the credential, sending, and reading the reply — so a stalled credential
+   * provider is bounded exactly like a stalled service.
    */
   readonly defaultTimeoutMs?: number | undefined;
 }
@@ -479,6 +1004,102 @@ interface RefusalFields {
   readonly owningSessionId: string | undefined;
 }
 
+/**
+ * Which of a call's two cancellation sources ended it, as it appears in
+ * `error.details.cancelled`.
+ *
+ * - `timeout` — the call's timeout elapsed first.
+ * - `aborted` — the caller's `AbortSignal` fired first, including a signal that
+ *   had already fired when the call was made.
+ */
+type CancellationSource = 'timeout' | 'aborted';
+
+/**
+ * One call's cancellation: the caller's signal and the call's timeout, linked
+ * into one controller before anything asynchronous starts.
+ *
+ * Built per call by {@link createCallCancellation} — never shared, never kept
+ * on the client — and disposed of in a `finally` on every exit path, so no timer
+ * and no listener outlives the call it belonged to.
+ */
+interface CallCancellation {
+  /**
+   * The signal handed to the transport: the linked controller's; the caller's
+   * own when the runtime has no `AbortController`; `undefined` when neither a
+   * caller signal nor a timeout applies.
+   */
+  readonly signal: AbortSignal | undefined;
+
+  /** The timeout that applies, in milliseconds, or `undefined` for none. */
+  readonly timeoutMs: number | undefined;
+
+  /** Which source fired first, or `undefined` while neither has. */
+  readonly source: CancellationSource | undefined;
+
+  /**
+   * Fulfils with {@link CallCancellation.source} the moment the call is
+   * cancelled, and never settles for a call that is not. Never rejects, so it
+   * can be raced against any step without a rejection handler of its own.
+   */
+  readonly cancelled: Promise<CancellationSource>;
+
+  /**
+   * Clears the timer and removes the listener on the caller's signal.
+   * Idempotent; after it has run, neither source can fire any more.
+   */
+  dispose(): void;
+}
+
+/**
+ * What racing one step of a call against its cancellation produced: the step's
+ * own value, or the source that cancelled the call first.
+ *
+ * @typeParam T What the step produces. Always a `Result`, because every step
+ * raced here is one that has already been made non-rejecting.
+ */
+type RacedStep<T> =
+  | { readonly cancelled: false; readonly value: T }
+  | { readonly cancelled: true; readonly source: CancellationSource };
+
+/**
+ * Everything {@link HttpClient.request} has settled locally before the first
+ * asynchronous step: the route, the validated body, the transport and the URL.
+ *
+ * Handed to the private exchange step as one value so that the part of a call
+ * that can be cancelled is a single method, wrapped in a single `finally`.
+ */
+interface OutboundRequest {
+  /** The method, from the route definition. */
+  readonly method: string;
+
+  /** The absolute URL: the validated origin joined with the encoded path. */
+  readonly url: string;
+
+  /** Whether the route is sent without a credential. */
+  readonly authExempt: boolean;
+
+  /** The `accept` and, with a body, `content-type` headers — never a credential. */
+  readonly headers: Readonly<Record<string, string>>;
+
+  /** The serialised, schema-validated body, or `undefined` for none. */
+  readonly body: string | undefined;
+
+  /** The transport the request is sent with. */
+  readonly fetchImpl: FetchLike;
+}
+
+/** What the transport answered, before any of it has been parsed. */
+interface RawReply {
+  /** Whether the status is in the 2xx range. */
+  readonly ok: boolean;
+
+  /** The numeric status. */
+  readonly status: number;
+
+  /** The whole body, as text. */
+  readonly body: string;
+}
+
 // ---------------------------------------------------------------------------
 // Section E — the client
 // ---------------------------------------------------------------------------
@@ -491,9 +1112,18 @@ interface RefusalFields {
  * nothing: the only state is the configuration, and the credential is
  * deliberately re-resolved per call ({@link TokenProvider}).
  *
+ * The configured base URL is validated once, here, by {@link parseServiceOrigin}.
+ * A refused value — a remote host, embedded credentials, a path — still yields
+ * an instance, because a misconfiguration is a state a user interface renders
+ * (AAP §0.5.5): {@link HttpClient.configurationError} says which rule it broke,
+ * and every call answers `CONFIG_INVALID` before any credential is resolved.
+ *
  * @example
  * ```ts
  * const client = new HttpClient({ baseUrl, token: () => readPairedToken() });
+ * if (client.configurationError !== undefined) {
+ *   return showConfigurationError(client.configurationError); // never quotes the value
+ * }
  *
  * const health = await client.health();
  * if (isErr(health)) {
@@ -508,13 +1138,39 @@ interface RefusalFields {
  */
 export class HttpClient {
   /**
-   * The normalised base URL — the origin of the configured value.
+   * The validated service origin every request goes to — for example
+   * `http://127.0.0.1:43117` — or `undefined` when the configured base URL was
+   * refused.
    *
    * Public because both user interfaces show it: the DevTools panel's
    * `ConnectionStatus` pill and the editor's `StatusBar` say which service they
-   * are talking to, and neither should re-derive it from configuration.
+   * are talking to, and neither should re-derive it from configuration. Typed
+   * {@link ServiceOrigin} so a consumer holding it knows the loopback check has
+   * run: it is always the canonical `http:`/`https:` origin of a loopback host
+   * with no user information, so it is safe to display. A refused value is
+   * never kept, not even trimmed — it may carry a pasted credential — so there
+   * is nothing to display in its place but {@link HttpClient.configurationError}.
    */
-  readonly baseUrl: string;
+  readonly baseUrl: ServiceOrigin | undefined;
+
+  /**
+   * Why the configured base URL was refused, or `undefined` when it was
+   * accepted.
+   *
+   * Exactly the failure {@link parseServiceOrigin} returned: `CONFIG_INVALID`,
+   * a constant message and hint, and `details: { rule }` naming the
+   * {@link ServiceOriginRule} the value broke — nothing derived from the value
+   * itself. Defined exactly when {@link HttpClient.baseUrl} is `undefined`.
+   */
+  readonly configurationError: DebuggenError | undefined;
+
+  /**
+   * The validation outcome both public fields above are read from.
+   *
+   * Kept as one `Result` so {@link HttpClient.request} narrows it once — to the
+   * origin, or to the refusal — with no second source of truth to disagree with.
+   */
+  private readonly origin: Result<ServiceOrigin, DebuggenError>;
 
   /** The injected transport, or `undefined` to use the platform global. */
   private readonly fetchImpl: FetchLike | undefined;
@@ -535,11 +1191,22 @@ export class HttpClient {
   private tokenSource: string | TokenProvider | undefined;
 
   /**
+   * Never throws: a refused base URL is recorded in
+   * {@link HttpClient.configurationError} and reported by every call.
+   *
    * @param options The base URL, and optionally a credential, a transport, a
    * logger and a default timeout.
    */
   constructor(options: HttpClientOptions) {
-    this.baseUrl = normalizeBaseUrl(options.baseUrl);
+    // `parseServiceOrigin` is total, including for the one option that can
+    // arrive untyped — an unset `chrome.storage.local` key reads back as
+    // `undefined`, which it refuses as `unparseable` — so the constructor stays
+    // total as well (AAP §0.5.5).
+    const origin = parseServiceOrigin(options.baseUrl);
+
+    this.origin = origin;
+    this.baseUrl = isOk(origin) ? origin.value : undefined;
+    this.configurationError = isErr(origin) ? origin.error : undefined;
     this.fetchImpl = options.fetch;
     this.logger = options.logger ?? noopLogger;
     this.defaultTimeoutMs = options.defaultTimeoutMs;
@@ -572,11 +1239,29 @@ export class HttpClient {
    * MV3 service worker.
    *
    * The sequence is fixed, and every step before the request is one that must
-   * not reach the service when it fails: resolve the route and encode the path;
-   * validate the outbound body against the route's own schema; resolve the
-   * credential unless the operation is exempt; then send, read the body as text,
-   * and parse it — with the route's response schema for a 2xx, and with the
-   * shared error payload for anything else.
+   * not reach the service when it fails:
+   *
+   * 1. refuse the call when the configured base URL was refused — before
+   *    anything else, so neither the credential provider nor the transport is
+   *    reached for a host this client must not send to;
+   * 2. resolve the route and encode the path;
+   * 3. validate the outbound body against the route's own schema, and
+   *    serialise it;
+   * 4. resolve the transport and join the path to the validated origin;
+   * 5. link the caller's signal and the timeout into the call's cancellation —
+   *    a signal that has already fired ends the call here, with nothing read
+   *    and nothing sent;
+   * 6. resolve the credential unless the operation is exempt, raced against
+   *    that cancellation;
+   * 7. send with the linked signal and read the body as text, both raced
+   *    against it as well;
+   * 8. parse the body — with the route's response schema for a 2xx, and with
+   *    the shared error payload for anything else.
+   *
+   * The timeout therefore bounds the whole call from the moment it is made,
+   * credential resolution included, and a cancelled call answers
+   * `TRANSPORT_DISCONNECTED` with `details.cancelled` set to `timeout` or
+   * `aborted`.
    *
    * @typeParam O The operation, which fixes both the body and the result type.
    * @param operation The operation to call, keyed into the route table.
@@ -590,6 +1275,17 @@ export class HttpClient {
     operation: O,
     args?: HttpRequestArgs<O>,
   ): Promise<Result<HttpResponseBody<O>, DebuggenError>> {
+    // First, before anything else runs: a refused base URL names a host this
+    // client must never send to, so neither the credential provider nor the
+    // transport may be reached — not even for the two exempt operations, whose
+    // bodies (a pairing code) are capabilities too (AAP §0.5.6).
+    const origin = this.origin;
+
+    if (isErr(origin)) {
+      return err(refusedOriginError(operation, origin.error));
+    }
+
+    const baseUrl = origin.value;
     const prepared = prepareRoute(operation, args?.params);
 
     if (isErr(prepared)) {
@@ -637,18 +1333,6 @@ export class HttpClient {
       headers[CONTENT_TYPE_HEADER] = JSON_MEDIA_TYPE;
     }
 
-    // Exempt in both directions: no credential is demanded for the two exempt
-    // operations, and none is sent on them even when one is available.
-    if (!prepared.value.authExempt) {
-      const token = await this.resolveToken(operation);
-
-      if (isErr(token)) {
-        return err(token.error);
-      }
-
-      headers[AUTHORIZATION_HEADER] = formatBearer(token.value);
-    }
-
     const fetchImpl = this.fetchImpl ?? resolveGlobalFetch();
 
     if (fetchImpl === undefined) {
@@ -664,79 +1348,60 @@ export class HttpClient {
       );
     }
 
-    // `new URL` rather than concatenation: the path is absolute, so a trailing
-    // slash on the configured base URL cannot produce a double slash.
-    const url = tryCatch(
-      () => new URL(prepared.value.path, this.baseUrl).toString(),
-      'CONFIG_INVALID',
-    );
+    // `new URL` rather than concatenation: the path is absolute and the origin
+    // carries no path, so the join cannot produce a double slash or keep a
+    // prefix. It cannot fail for a validated origin and an encoded path, but a
+    // failure is still returned rather than thrown — with a constant sentence
+    // and no `cause`, because the parser's `TypeError` quotes its input.
+    const url = tryCatch(() => new URL(prepared.value.path, baseUrl).toString(), 'CONFIG_INVALID');
 
     if (isErr(url)) {
       return err(
         new DebuggenError(
           'CONFIG_INVALID',
-          `Cannot call ${operation}: ${this.baseUrl} is not a usable service base URL`,
+          `Cannot call ${operation}: the request URL could not be built from the service origin`,
           {
-            hint: 'Configure the service base URL as an absolute origin, for example http://127.0.0.1:<port>.',
-            details: { operation, baseUrl: this.baseUrl },
-            cause: url.error,
+            hint: `Configure the service URL as a loopback origin only — scheme, host and port, for example ${SERVICE_ORIGIN_EXAMPLE}.`,
+            details: { operation },
           },
         ),
       );
     }
 
-    const timeoutMs = args?.timeoutMs ?? this.defaultTimeoutMs;
-    const signal = combineAbortSignals(args?.signal, timeoutMs);
-    const init: HttpFetchInit = {
-      method: prepared.value.method,
-      headers,
-      credentials: 'omit',
-      ...(bodyText === undefined ? {} : { body: bodyText }),
-      ...(signal === undefined ? {} : { signal }),
-    };
+    // The call's cancellation exists before its first asynchronous step, so the
+    // caller's signal and the timeout bound credential resolution as well as the
+    // request: a credential provider that never settles — a suspended storage
+    // read — ends the call at its deadline instead of leaving it pending forever.
+    // Disposed on every exit path, so no timer and no listener outlives the call.
+    const cancellation = createCallCancellation(
+      args?.signal,
+      args?.timeoutMs ?? this.defaultTimeoutMs,
+    );
+    let exchanged: Result<RawReply, DebuggenError>;
 
-    const startedAt = Date.now();
-    // Invoked inside `tryCatch` as well as awaited through `fromPromise`: an
-    // injected transport may throw synchronously, and this method's contract is
-    // that it never rejects.
-    const invoked = tryCatch(() => fetchImpl(url.value, init), 'TRANSPORT_DISCONNECTED');
-
-    if (isErr(invoked)) {
-      return err(this.transportError(operation, timeoutMs, invoked.error));
-    }
-
-    const responded = await fromPromise(invoked.value, 'TRANSPORT_DISCONNECTED');
-
-    if (isErr(responded)) {
-      this.logger.debug('protocol http request did not complete', {
+    try {
+      exchanged = await this.exchange(
         operation,
-        elapsedMs: Date.now() - startedAt,
-      });
-
-      return err(this.transportError(operation, timeoutMs, responded.error));
+        baseUrl,
+        {
+          method: prepared.value.method,
+          url: url.value,
+          authExempt: prepared.value.authExempt,
+          headers,
+          body: bodyText,
+          fetchImpl,
+        },
+        cancellation,
+      );
+    } finally {
+      cancellation.dispose();
     }
 
-    const response = responded.value;
-    const status = response.status;
-    // `text()` is invoked inside `tryCatch` for the reason the transport itself
-    // is: an injected response may throw synchronously, and a synchronous throw
-    // would escape `fromPromise` and reject this method.
-    const readBody = tryCatch(() => response.text(), 'TRANSPORT_DISCONNECTED');
-    const rawBody = isErr(readBody)
-      ? readBody
-      : await fromPromise(readBody.value, 'TRANSPORT_DISCONNECTED');
-
-    // The only record this client emits: the operation, the status and the
-    // elapsed time. No URL, no header, no body, no credential (AAP §0.5.2).
-    this.logger.debug('protocol http request completed', {
-      operation,
-      status,
-      elapsedMs: Date.now() - startedAt,
-    });
-
-    if (isErr(rawBody)) {
-      return err(this.transportError(operation, timeoutMs, rawBody.error));
+    if (isErr(exchanged)) {
+      return err(exchanged.error);
     }
+
+    const { status, body: rawBody } = exchanged.value;
 
     // An empty body stands for `{}`, which is a diagnosis rather than a
     // success: every route in the table answers with fields, so an empty reply
@@ -744,11 +1409,11 @@ export class HttpClient {
     // fields — a far more useful failure than "not valid JSON", and the right
     // one when a proxy, a redirect or a 204-style reply delivered nothing.
     const decoded = tryCatch(
-      () => (rawBody.value.trim() === '' ? {} : (JSON.parse(rawBody.value) as unknown)),
+      () => (rawBody.trim() === '' ? {} : (JSON.parse(rawBody) as unknown)),
       'PROTOCOL_INVALID_MESSAGE',
     );
 
-    if (!response.ok) {
+    if (!exchanged.value.ok) {
       return err(httpFailureError(operation, status, isOk(decoded) ? decoded.value : undefined));
     }
 
@@ -843,6 +1508,148 @@ export class HttpClient {
   }
 
   /**
+   * The cancellable part of a call: resolve the credential, send, read the body.
+   *
+   * Each asynchronous step is raced against the call's cancellation, and the
+   * race is what makes a stalled step harmless: the call ends at its deadline or
+   * at the caller's abort whatever the step is doing, and a step that settles
+   * afterwards is ignored — a credential that resolves late never reaches the
+   * transport, and a reply that arrives late is never read. The transport is
+   * also handed the linked signal, so a compliant `fetch` stops the request
+   * itself rather than leaving it to finish unobserved.
+   *
+   * Never rejects: every step raced here is already non-rejecting
+   * (`resolveToken` returns a `Result`, and the transport and body promises are
+   * wrapped by `fromPromise`), and the cancellation promise only ever fulfils.
+   *
+   * @param operation The operation being called.
+   * @param baseUrl The validated origin, named in a transport failure.
+   * @param outbound The request, settled locally by {@link HttpClient.request}.
+   * @param cancellation This call's cancellation, disposed of by the caller.
+   * @returns The status and body text, or the failure that prevented them.
+   */
+  private async exchange(
+    operation: HttpOperation,
+    baseUrl: ServiceOrigin,
+    outbound: OutboundRequest,
+    cancellation: CallCancellation,
+  ): Promise<Result<RawReply, DebuggenError>> {
+    const timeoutMs = cancellation.timeoutMs;
+
+    // A caller signal that had already fired when the call was made: nothing
+    // is started — no credential is read and the transport is never touched.
+    if (cancellation.source !== undefined) {
+      return err(cancellationError(operation, cancellation.source, timeoutMs));
+    }
+
+    const headers: Record<string, string> = { ...outbound.headers };
+
+    // Exempt in both directions: no credential is demanded for the two exempt
+    // operations, and none is sent on them even when one is available.
+    if (!outbound.authExempt) {
+      const token = await raceCancellation(this.resolveToken(operation), cancellation);
+
+      if (token.cancelled) {
+        return err(cancellationError(operation, token.source, timeoutMs));
+      }
+
+      if (isErr(token.value)) {
+        return err(token.value.error);
+      }
+
+      headers[AUTHORIZATION_HEADER] = formatBearer(token.value.value);
+    }
+
+    const signal = cancellation.signal;
+    const init: HttpFetchInit = {
+      method: outbound.method,
+      headers,
+      credentials: 'omit',
+      ...(outbound.body === undefined ? {} : { body: outbound.body }),
+      ...(signal === undefined ? {} : { signal }),
+    };
+
+    const startedAt = Date.now();
+    // Invoked inside `tryCatch` as well as awaited through `fromPromise`: an
+    // injected transport may throw synchronously, and this method's contract is
+    // that it never rejects. Called detached, never as `outbound.fetchImpl(…)`:
+    // the platform `fetch` refuses a receiver other than the global object
+    // ("Illegal invocation" in Chromium), and a detached call has none.
+    const fetchImpl = outbound.fetchImpl;
+    const invoked = tryCatch(() => fetchImpl(outbound.url, init), 'TRANSPORT_DISCONNECTED');
+
+    if (isErr(invoked)) {
+      const source = cancellation.source;
+
+      return err(
+        source === undefined
+          ? this.transportError(operation, baseUrl, timeoutMs, invoked.error)
+          : cancellationError(operation, source, timeoutMs),
+      );
+    }
+
+    const responded = await raceCancellation(
+      fromPromise(invoked.value, 'TRANSPORT_DISCONNECTED'),
+      cancellation,
+    );
+
+    if (responded.cancelled) {
+      this.logger.debug('protocol http request did not complete', {
+        operation,
+        cancelled: responded.source,
+        elapsedMs: Date.now() - startedAt,
+      });
+
+      return err(cancellationError(operation, responded.source, timeoutMs));
+    }
+
+    if (isErr(responded.value)) {
+      this.logger.debug('protocol http request did not complete', {
+        operation,
+        elapsedMs: Date.now() - startedAt,
+      });
+
+      return err(this.transportError(operation, baseUrl, timeoutMs, responded.value.error));
+    }
+
+    const response = responded.value.value;
+    const status = response.status;
+    // `text()` is invoked inside `tryCatch` for the reason the transport itself
+    // is: an injected response may throw synchronously, and a synchronous throw
+    // would escape `fromPromise` and reject this method.
+    const readBody = tryCatch(() => response.text(), 'TRANSPORT_DISCONNECTED');
+    const rawBody: RacedStep<Result<string, DebuggenError>> = isErr(readBody)
+      ? { cancelled: false, value: readBody }
+      : await raceCancellation(fromPromise(readBody.value, 'TRANSPORT_DISCONNECTED'), cancellation);
+
+    if (rawBody.cancelled) {
+      this.logger.debug('protocol http request did not complete', {
+        operation,
+        status,
+        cancelled: rawBody.source,
+        elapsedMs: Date.now() - startedAt,
+      });
+
+      return err(cancellationError(operation, rawBody.source, timeoutMs));
+    }
+
+    // The only record this client emits for a completed exchange: the
+    // operation, the status and the elapsed time. No URL, no header, no body,
+    // no credential (AAP §0.5.2).
+    this.logger.debug('protocol http request completed', {
+      operation,
+      status,
+      elapsedMs: Date.now() - startedAt,
+    });
+
+    if (isErr(rawBody.value)) {
+      return err(this.transportError(operation, baseUrl, timeoutMs, rawBody.value.error));
+    }
+
+    return ok({ ok: response.ok, status, body: rawBody.value.value });
+  }
+
+  /**
    * Resolves the credential for a protected operation.
    *
    * A provider is called per request and may be synchronous or asynchronous, may
@@ -861,13 +1668,13 @@ export class HttpClient {
       const produced = tryCatch(() => source(), 'UNAUTHORIZED');
 
       if (isErr(produced)) {
-        return err(credentialError(operation, 'the credential provider threw', produced.error));
+        return err(credentialError(operation, 'the credential provider threw'));
       }
 
       const awaited = await fromPromise(Promise.resolve(produced.value), 'UNAUTHORIZED');
 
       if (isErr(awaited)) {
-        return err(credentialError(operation, 'the credential provider failed', awaited.error));
+        return err(credentialError(operation, 'the credential provider failed'));
       }
 
       resolved = awaited.value;
@@ -876,7 +1683,7 @@ export class HttpClient {
     }
 
     if (resolved === undefined || resolved === '') {
-      return err(credentialError(operation, 'no bearer credential is available', undefined));
+      return err(credentialError(operation, 'no bearer credential is available'));
     }
 
     return ok(resolved);
@@ -886,29 +1693,37 @@ export class HttpClient {
    * Builds the failure for a request that never produced a response.
    *
    * The service not being started is the overwhelmingly common cause and the one
-   * the hint names; an aborted call and a connection dropped mid-body reach the
-   * same path. The thrown value is kept as `cause` for a developer reading a
-   * stack, and nothing from it enters the message: a rejection reason is
-   * arbitrary text this client did not produce.
+   * the hint names; a connection dropped mid-body reaches the same path. A call
+   * ended by its caller's signal or its timeout does **not**: that is reported
+   * by {@link cancellationError}, with the source that fired, even when it
+   * surfaced as a transport rejection. The thrown value is kept as `cause` for a
+   * developer reading a stack, and nothing from it enters the message: a
+   * rejection reason is arbitrary text this client did not produce.
+   *
+   * The origin is named in the message, the hint and `details`, and that is safe
+   * only because it is the validated {@link ServiceOrigin}: a loopback host and
+   * port with no user information, never the raw configured value.
    *
    * @param operation The operation that failed.
+   * @param baseUrl The validated origin the request was sent to.
    * @param timeoutMs The timeout that applied, when one did.
    * @param cause The normalised rejection reason.
    * @returns A `TRANSPORT_DISCONNECTED` failure naming the operation and origin.
    */
   private transportError(
     operation: HttpOperation,
+    baseUrl: ServiceOrigin,
     timeoutMs: number | undefined,
     cause: DebuggenError,
   ): DebuggenError {
     return new DebuggenError(
       'TRANSPORT_DISCONNECTED',
-      `The ${operation} request to ${this.baseUrl} did not complete`,
+      `The ${operation} request to ${baseUrl} did not complete`,
       {
-        hint: `The Debug Generator local service may not be running at ${this.baseUrl}, or the request was cancelled.`,
+        hint: `The Debug Generator local service may not be running at ${baseUrl}, or the connection dropped before the reply was read.`,
         details: {
           operation,
-          baseUrl: this.baseUrl,
+          baseUrl,
           ...(timeoutMs === undefined ? {} : { timeoutMs }),
         },
         cause,
@@ -958,33 +1773,30 @@ function prepareRoute<O extends HttpOperation>(
 }
 
 /**
- * Reduces the configured base URL to the origin this client sends to.
+ * Builds the failure every call of a client whose base URL was refused answers
+ * with.
  *
- * Only the origin is used, because every path in the route table is absolute:
- * `new URL('/x', 'http://host:1/ignored')` resolves to `http://host:1/x`, so a
- * path prefix in the configured value would be silently dropped. Reducing it
- * here makes that explicit and gives both user interfaces one canonical string
- * to display.
+ * `CONFIG_INVALID`, like the refusal it wraps, and built only from values this
+ * module produced: a constant sentence naming the operation, the refusal's own
+ * constant hint, and `details: { operation, rule }`. The refused value itself is
+ * not available here to leak — the constructor never kept it — and the
+ * refusal is attached as `cause` so the rule stays reachable to a developer
+ * reading a stack.
  *
- * Deliberately non-throwing. A malformed value is returned trimmed, and the
- * first call then fails with `CONFIG_INVALID` — a constructor that threw would
- * be a constructor an extension has to guard, and AAP §0.5.5 makes a
- * misconfiguration a renderable state.
- *
- * @param baseUrl The configured value.
- * @returns The origin, or the trimmed input when it has none.
+ * @param operation The operation that was not called.
+ * @param refusal The failure {@link parseServiceOrigin} returned at construction.
+ * @returns The failure to hand the caller.
  */
-function normalizeBaseUrl(baseUrl: string): string {
-  const trimmed = baseUrl.trim();
-  const parsed = tryCatch(() => new URL(trimmed), 'CONFIG_INVALID');
-
-  if (!isOk(parsed)) {
-    return trimmed;
-  }
-
-  const origin = parsed.value.origin;
-
-  return origin === OPAQUE_ORIGIN ? trimmed : origin;
+function refusedOriginError(operation: HttpOperation, refusal: DebuggenError): DebuggenError {
+  return new DebuggenError(
+    'CONFIG_INVALID',
+    `Cannot call ${operation}: the configured service base URL was refused`,
+    {
+      ...(refusal.hint === undefined ? {} : { hint: refusal.hint }),
+      details: { operation, rule: refusal.details?.rule },
+      cause: refusal,
+    },
+  );
 }
 
 /**
@@ -1004,45 +1816,201 @@ function resolveGlobalFetch(): FetchLike | undefined {
 }
 
 /**
- * Combines a caller's abort signal with a timeout, using only statics the
- * runtime actually provides.
+ * Builds one call's cancellation: the caller's signal and the call's timeout,
+ * linked into one controller whose signal the transport receives.
  *
- * Feature-detected rather than assumed: this bundle runs in Node, in an MV3
- * service worker and in a webview, and a missing static must degrade to "no
- * timeout" instead of throwing on the path that was meant to bound a request.
- * When the caller supplied a signal and the runtime cannot combine two, the
- * caller's signal wins — losing a timeout costs patience, whereas losing the
- * caller's signal would leave a disposed view unable to cancel its request.
+ * Created by {@link HttpClient.request} before the call's first asynchronous
+ * step, so both sources bound everything after it — credential resolution
+ * included — and disposed of when the call ends. The first source to fire wins
+ * and is recorded; a later one changes nothing. Firing aborts the linked
+ * controller (with the caller's own abort reason, when it was the caller) and
+ * then fulfils {@link CallCancellation.cancelled}.
+ *
+ * The platform globals are read here, when a call is made, and feature-detected
+ * rather than assumed ({@link CancellationPlatform}): this bundle runs in Node,
+ * in an MV3 service worker and in a webview, and a missing global must degrade
+ * instead of throwing on the path that was meant to bound a request. Without
+ * `AbortController` the transport receives the caller's own signal and the
+ * timeout is still enforced by the race; without timers there is no timeout.
+ * The caller's signal is never lost — losing a timeout costs patience, whereas
+ * losing the caller's signal would leave a disposed view unable to cancel its
+ * request.
+ *
+ * A timeout that is absent, not finite or not positive means "no timeout", as
+ * {@link HttpClientOptions.defaultTimeoutMs} documents; one beyond
+ * {@link MAX_TIMER_DELAY_MS} is scheduled at that bound.
  *
  * @param callerSignal The caller's signal, when it passed one.
- * @param timeoutMs The timeout in milliseconds, when one applies.
- * @returns The signal to send, or `undefined` when neither applies.
+ * @param requestedTimeoutMs The timeout for this call, in milliseconds.
+ * @returns The call's cancellation. Its source is already `aborted` when the
+ * caller's signal had fired before the call was made.
  */
-function combineAbortSignals(
+function createCallCancellation(
   callerSignal: AbortSignal | undefined,
+  requestedTimeoutMs: number | undefined,
+): CallCancellation {
+  const timeoutMs =
+    requestedTimeoutMs !== undefined &&
+    Number.isFinite(requestedTimeoutMs) &&
+    requestedTimeoutMs > 0
+      ? requestedTimeoutMs
+      : undefined;
+  const platform: CancellationPlatform = globalThis;
+  const Controller = platform.AbortController;
+  const controller =
+    (callerSignal !== undefined || timeoutMs !== undefined) && typeof Controller === 'function'
+      ? new Controller()
+      : undefined;
+  // Captured from the executor, which runs synchronously, so `resolve` is set
+  // before anything below can fire.
+  const settlement: { resolve?: (source: CancellationSource) => void } = {};
+  const cancelled = new Promise<CancellationSource>((resolve) => {
+    settlement.resolve = resolve;
+  });
+
+  let source: CancellationSource | undefined;
+  let timerHandle: number | undefined;
+  let disposed = false;
+
+  const fire = (fired: CancellationSource, reason: unknown): void => {
+    if (source !== undefined || disposed) {
+      return;
+    }
+
+    source = fired;
+    // Aborted before `cancelled` settles, so a transport holding the signal is
+    // told to stop in the same turn the call is abandoned.
+    controller?.abort(reason);
+    settlement.resolve?.(fired);
+  };
+
+  const onCallerAbort = (): void => {
+    const reason: unknown = callerSignal?.reason;
+
+    fire('aborted', reason);
+  };
+
+  if (callerSignal !== undefined) {
+    if (callerSignal.aborted) {
+      onCallerAbort();
+    } else {
+      callerSignal.addEventListener('abort', onCallerAbort, { once: true });
+    }
+  }
+
+  // Called as a method of `globalThis`, never detached, and only when the call
+  // is not already cancelled: a pre-aborted call schedules nothing.
+  if (
+    source === undefined &&
+    timeoutMs !== undefined &&
+    typeof platform.setTimeout === 'function'
+  ) {
+    timerHandle = platform.setTimeout(
+      () => {
+        timerHandle = undefined;
+        fire('timeout', undefined);
+      },
+      Math.min(timeoutMs, MAX_TIMER_DELAY_MS),
+    );
+  }
+
+  const dispose = (): void => {
+    if (disposed) {
+      return;
+    }
+
+    disposed = true;
+
+    if (timerHandle !== undefined && typeof platform.clearTimeout === 'function') {
+      platform.clearTimeout(timerHandle);
+    }
+
+    timerHandle = undefined;
+    callerSignal?.removeEventListener('abort', onCallerAbort);
+  };
+
+  return {
+    signal: controller?.signal ?? callerSignal,
+    timeoutMs,
+    get source(): CancellationSource | undefined {
+      return source;
+    },
+    cancelled,
+    dispose,
+  };
+}
+
+/**
+ * Races one non-rejecting step of a call against the call's cancellation.
+ *
+ * A step that loses is abandoned, not stopped — the promise may still settle,
+ * and nothing observes it when it does — which is exactly what keeps a late
+ * credential out of the transport. A step that settles in the same turn the
+ * call is cancelled is discarded as well: once a source has fired, the call is
+ * over, and reporting the step's outcome instead would make the result depend
+ * on microtask order.
+ *
+ * @typeParam T What the step produces.
+ * @param work The step, which must not reject.
+ * @param cancellation The call's cancellation.
+ * @returns The step's value, or the source that cancelled the call.
+ */
+async function raceCancellation<T>(
+  work: Promise<T>,
+  cancellation: CallCancellation,
+): Promise<RacedStep<T>> {
+  const raced = await Promise.race([
+    work.then((value): RacedStep<T> => ({ cancelled: false, value })),
+    cancellation.cancelled.then((source): RacedStep<T> => ({ cancelled: true, source })),
+  ]);
+  const source = cancellation.source;
+
+  return !raced.cancelled && source !== undefined ? { cancelled: true, source } : raced;
+}
+
+/**
+ * Builds the failure for a call its caller's signal or its timeout ended.
+ *
+ * `TRANSPORT_DISCONNECTED`, because the service's answer — if it ever comes —
+ * will not reach the caller; `details.cancelled` says which source fired, so a
+ * user interface can tell "the service is slow" from "you cancelled this". The
+ * message is a constant sentence naming the operation and, for a timeout, the
+ * milliseconds that elapsed. No `cause`: an abort reason is whatever the caller
+ * chose to pass, and the source already says everything this client knows.
+ *
+ * @param operation The operation that was cancelled.
+ * @param source Which source fired first.
+ * @param timeoutMs The timeout that applied, when one did.
+ * @returns The failure to hand the caller.
+ */
+function cancellationError(
+  operation: HttpOperation,
+  source: CancellationSource,
   timeoutMs: number | undefined,
-): AbortSignal | undefined {
-  if (timeoutMs === undefined || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
-    return callerSignal;
+): DebuggenError {
+  const details = {
+    operation,
+    cancelled: source,
+    ...(timeoutMs === undefined ? {} : { timeoutMs }),
+  };
+
+  if (source === 'timeout') {
+    return new DebuggenError(
+      'TRANSPORT_DISCONNECTED',
+      timeoutMs === undefined
+        ? `The ${operation} request timed out`
+        : `The ${operation} request timed out after ${String(timeoutMs)} ms`,
+      {
+        hint: 'The local service did not answer in time. Check that it is running and not stalled, or allow this call a longer timeoutMs.',
+        details,
+      },
+    );
   }
 
-  const statics: AbortSignalStatics | undefined = globalThis.AbortSignal;
-
-  if (statics === undefined || typeof statics.timeout !== 'function') {
-    return callerSignal;
-  }
-
-  const timeoutSignal = statics.timeout(timeoutMs);
-
-  if (callerSignal === undefined) {
-    return timeoutSignal;
-  }
-
-  if (typeof statics.any !== 'function') {
-    return callerSignal;
-  }
-
-  return statics.any([callerSignal, timeoutSignal]);
+  return new DebuggenError('TRANSPORT_DISCONNECTED', `The ${operation} request was cancelled`, {
+    hint: 'The caller cancelled this request before it completed. Nothing was retried; call it again if the result is still wanted.',
+    details,
+  });
 }
 
 /**
@@ -1247,19 +2215,20 @@ function withRequestContext(
  * not whether a provider returned an empty string or nothing at all. The hint
  * names the two ways a client obtains one (AAP §0.5.6).
  *
+ * A provider that threw or rejected is reported by the constant `reason`
+ * alone, and its own error is deliberately **not** kept as `cause` — exactly as
+ * the sibling WebSocket client reports the same failure. A credential store's
+ * failure text is arbitrary and can name a storage key or quote the value it
+ * could not read, and a `cause` travels wherever the error does: into a log, a
+ * user interface, a serialised report (AAP §0.5.2).
+ *
  * @param operation The operation that could not be called.
  * @param reason Why no credential was available, in a clause.
- * @param cause The provider's failure, when a provider produced one.
  * @returns An `UNAUTHORIZED` failure.
  */
-function credentialError(
-  operation: HttpOperation,
-  reason: string,
-  cause: DebuggenError | undefined,
-): DebuggenError {
+function credentialError(operation: HttpOperation, reason: string): DebuggenError {
   return new DebuggenError('UNAUTHORIZED', `Cannot call ${operation}: ${reason}`, {
     hint: 'Supply a credential with setToken(): the editor reads one from the service home directory, and the DevTools client obtains one by redeeming a pairing code.',
     details: { operation },
-    ...(cause === undefined ? {} : { cause }),
   });
 }

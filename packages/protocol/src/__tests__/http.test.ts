@@ -19,6 +19,12 @@
  *   checked for separately: `/sessions` legitimately appears twice, under
  *   different methods, which is exactly the shape a second collision could hide
  *   in.
+ * - **The operation-id type.** `HttpOperationId` is the key type the service's
+ *   `Record<HttpOperationId, RouteHandler>` handler map is written against, so
+ *   the cases prove at compile time that it is exactly the `HTTP_OPERATIONS`
+ *   member union, that `HttpOperation` is the same type, that the package
+ *   barrel publishes both names, and that a handler map missing one operation —
+ *   or naming one the table does not hold — does not type-check.
  * - **The authentication exemption.** AAP §0.5.6 makes exactly two routes
  *   reachable without a bearer credential. The module states that twice — as a
  *   tuple and as a per-route flag — and although a compile-time proof ties them
@@ -28,9 +34,13 @@
  * - **Identity, not similarity.** The panel-data body must be
  *   `@debuggen/panel-schema`'s `dataQuerySchema` *itself*, and the session and
  *   capture bodies must be the very schema objects `../messages/session.ts` and
- *   `../messages/capture.ts` declare. A structural comparison would pass for a
- *   hand-written copy, which is the duplicate definition AAP §0.9.1 forbids, so
- *   these are `toBe` assertions.
+ *   `../messages/capture.ts` declare. The modification journal's element schema
+ *   must be `@debuggen/instrumentation`'s `modificationRecordSchema` as both of
+ *   that package's entries export it — the browser-safe `./schema` entry this
+ *   package imports and the root the local service imports — which is what
+ *   proves the two entries share one module rather than each carrying a copy.
+ *   A structural comparison would pass for a hand-written copy, which is the
+ *   duplicate definition AAP §0.9.1 forbids, so these are `toBe` assertions.
  * - **The `DataResult` union.** `DATA_QUERY_SOURCES` states that its ten members
  *   are "exactly the discriminants" of this union; the cases check that as a set,
  *   in order, with one member each, and then parse a real aggregate for every
@@ -59,8 +69,13 @@
  *   in production rather than here.
  */
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, expectTypeOf, it } from 'vitest';
 
+// Both entries of the owning package, on purpose: the root is what the local
+// service imports and `./schema` is what this package's modules import, and the
+// identity case below holds the two to one schema instance.
+import { modificationRecordSchema as rootModificationRecordSchema } from '@debuggen/instrumentation';
+import { modificationRecordSchema } from '@debuggen/instrumentation/schema';
 import {
   DATA_QUERY_DEFAULT_LIMIT,
   DATA_QUERY_DEFAULT_OFFSET,
@@ -137,9 +152,16 @@ import type {
   DataResult,
   DataResultFor,
   HttpOperation,
+  HttpOperationId,
   HttpRequestBody,
   HttpResponseBody,
 } from '../http.js';
+// Type-only, so the barrel is never loaded at run time: what is on trial is
+// that a consumer importing from the package's one door can name the type.
+import type {
+  HttpOperation as BarrelHttpOperation,
+  HttpOperationId as BarrelHttpOperationId,
+} from '../index.js';
 import { CLEANUP_STATUSES } from '../session-record.js';
 import { PROTOCOL_VERSION } from '../version.js';
 
@@ -396,7 +418,7 @@ const CAPTURE_SUMMARY = computeCaptureSummary(EVENTS, {
  * compile error, so this table cannot fall behind the route table it mirrors.
  * The `GET` routes hold `undefined`, which is their request body type.
  */
-const VALID_REQUESTS: { readonly [O in HttpOperation]: HttpRequestBody<O> } = {
+const VALID_REQUESTS: { readonly [O in HttpOperationId]: HttpRequestBody<O> } = {
   'session.create': { projectRoot: PROJECT_ROOT, question: 'Why does this action take so long?' },
   'session.list': undefined,
   'session.get': undefined,
@@ -423,7 +445,7 @@ const VALID_REQUESTS: { readonly [O in HttpOperation]: HttpRequestBody<O> } = {
  * the input to the JSON round-trip cases: each one is serialised, parsed back and
  * re-validated, which is what catches a body that only works in memory.
  */
-const VALID_RESPONSES: { readonly [O in HttpOperation]: HttpResponseBody<O> } = {
+const VALID_RESPONSES: { readonly [O in HttpOperationId]: HttpResponseBody<O> } = {
   'session.create': SESSION_RECORD,
   'session.list': { sessions: [SESSION_RECORD] },
   'session.get': SESSION_RECORD,
@@ -698,6 +720,83 @@ describe('HTTP_ROUTES — the seventeen routes, pinned', () => {
 });
 
 // ---------------------------------------------------------------------------
+// The operation-id type
+//
+// Compile-time proofs, checked by `pnpm typecheck` (this suite is part of the
+// package's `tsc -b` program): `expectTypeOf` and `@ts-expect-error` fail that
+// gate, not the Vitest run, when the relationship they state stops holding. Each
+// case also asserts the run-time fact the type stands for, so the suite is not a
+// set of empty bodies to a reader of the Vitest report.
+// ---------------------------------------------------------------------------
+
+describe('HttpOperationId — the canonical operation-id type', () => {
+  it('is exactly the HTTP_OPERATIONS member union, which is exactly the table keys', () => {
+    expectTypeOf<HttpOperationId>().toEqualTypeOf<(typeof HTTP_OPERATIONS)[number]>();
+    expectTypeOf<HttpOperationId>().toEqualTypeOf<keyof typeof HTTP_ROUTES>();
+
+    expect([...HTTP_OPERATIONS].sort()).toEqual(Object.keys(HTTP_ROUTES).sort());
+  });
+
+  it('is the same type HttpOperation names, in both directions', () => {
+    expectTypeOf<HttpOperation>().toEqualTypeOf<HttpOperationId>();
+
+    const viaAlias: HttpOperation = 'session.create';
+    const viaCanonical: HttpOperationId = viaAlias;
+    const backViaAlias: HttpOperation = viaCanonical;
+    expect(backViaAlias).toBe('session.create');
+  });
+
+  it('is published through the package barrel under both names', () => {
+    expectTypeOf<BarrelHttpOperationId>().toEqualTypeOf<HttpOperationId>();
+    expectTypeOf<BarrelHttpOperation>().toEqualTypeOf<HttpOperationId>();
+
+    const fromBarrel: BarrelHttpOperationId = 'health';
+    expect(HTTP_OPERATIONS).toContain(fromBarrel);
+  });
+
+  it('keys an exhaustive handler map: a missing or an unknown operation is a type error', () => {
+    // The shape `apps/local-service/src/server/http.ts` declares its handlers
+    // in, with each handler reduced to the method it serves.
+    const handlers: Record<HttpOperationId, string> = {
+      'session.create': 'POST',
+      'session.list': 'GET',
+      'session.get': 'GET',
+      'session.question': 'POST',
+      'session.end': 'POST',
+      'capture.start': 'POST',
+      'capture.stop': 'POST',
+      'panel.data': 'POST',
+      'panel.get': 'GET',
+      'panel.getById': 'GET',
+      'modifications.list': 'GET',
+      'telemetry.event': 'POST',
+      'devServer.launch': 'POST',
+      'devServer.stop': 'POST',
+      health: 'GET',
+      'pair.start': 'POST',
+      'pair.complete': 'POST',
+    };
+
+    for (const operation of HTTP_OPERATIONS) {
+      expect(handlers[operation]).toBe(HTTP_ROUTES[operation].method);
+    }
+
+    const { 'pair.complete': omitted, ...withoutPairComplete } = handlers;
+    // @ts-expect-error - a handler map that omits one operation does not satisfy Record<HttpOperationId, …>.
+    const incomplete: Record<HttpOperationId, string> = withoutPairComplete;
+    expect(omitted).toBe('POST');
+    expect(Object.keys(incomplete)).toHaveLength(HTTP_OPERATIONS.length - 1);
+
+    const stale: Record<HttpOperationId, string> = {
+      ...handlers,
+      // @ts-expect-error - a handler for an operation the table does not hold is refused.
+      'session.rename': 'POST',
+    };
+    expect(Object.keys(stale)).toHaveLength(HTTP_OPERATIONS.length + 1);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Authentication
 // ---------------------------------------------------------------------------
 
@@ -770,6 +869,17 @@ describe('the route table binds imported schemas by identity, never by copy', ()
     expect(HTTP_ROUTES['capture.start'].response).toBe(captureStartResponseSchema);
     expect(HTTP_ROUTES['capture.stop'].request).toBe(captureStopRequestSchema);
     expect(HTTP_ROUTES['capture.stop'].response).toBe(captureStopResponseSchema);
+  });
+
+  it('uses instrumentation’s modificationRecordSchema itself as the journal element, from either entry', () => {
+    const element = HTTP_ROUTES['modifications.list'].response.shape.modifications.element;
+
+    expect(element).toBe(modificationRecordSchema);
+    expect(element).toBe(rootModificationRecordSchema);
+    // The two entries are one module: `./schema` is not a second build of the
+    // schema layer, so a record the service validated through the root is the
+    // same schema's output that a protocol message embeds.
+    expect(rootModificationRecordSchema).toBe(modificationRecordSchema);
   });
 
   it('reports a capture conflict with a code from the shared vocabulary', () => {
@@ -1497,13 +1607,13 @@ describe('buildPath — substitution, encoding and a loud failure', () => {
   });
 
   it('fails loudly on an operation the table does not hold', () => {
-    // The first guard is the compiler: `HttpOperation` is derived from the table,
-    // so a call naming an operation that does not exist cannot be written without
-    // the cast below. The assertion is that the run-time behaviour behind that
-    // cast is a throw rather than a path built from nothing — a silent
+    // The first guard is the compiler: `HttpOperationId` is derived from the
+    // table, so a call naming an operation that does not exist cannot be written
+    // without the cast below. The assertion is that the run-time behaviour behind
+    // that cast is a throw rather than a path built from nothing — a silent
     // `'undefined'` segment would be a request sent to a route that never
     // existed, answered with a 404 nobody could trace back to a typo.
-    const unknownOperation = 'session.rename' as HttpOperation;
+    const unknownOperation = 'session.rename' as HttpOperationId;
 
     expect(() => buildPath(unknownOperation, { id: SESSION_ID })).toThrow();
     expect(() => buildPath(unknownOperation)).toThrow();

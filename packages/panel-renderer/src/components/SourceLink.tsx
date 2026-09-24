@@ -43,6 +43,27 @@
  *   3. Either of the above, wrapped in `Tooltip` when the visible text is
  *      abbreviated, so the full `file:line:column` is always reachable.
  *
+ * ## INSIDE A COMPOSITE WIDGET, THE CHIP IS NOT A TAB STOP
+ *
+ * A tree, a grid or a list with a roving tab index is ONE stop in the page's
+ * Tab order: the composite moves focus between its own items with the arrow
+ * keys, and every control nested inside an item that stays in the Tab order is
+ * a second, third or fourth stop per row that the pattern forbids. The chip
+ * therefore accepts `tabIndex`, restricted to `0` and `-1`, and forwards it to
+ * the interactive form's `<button>` and nowhere else:
+ *
+ *   - `-1` takes the chip out of the Tab order while keeping it a real,
+ *     pointer-activatable, programmatically focusable button. The composite
+ *     that asks for it owns the keyboard route to the same intent — a command
+ *     on its focused item that calls `onOpenSource` with the same location —
+ *     and must advertise that command (for example with `aria-keyshortcuts`).
+ *   - `0`, or omitting the prop, is the browser's own order for a button: the
+ *     standalone chip of a summary header or a detail drawer.
+ *
+ * A positive index is not offered: it reorders the whole page's Tab sequence
+ * and is never what a leaf chip means. The inert form ignores the prop
+ * entirely, because a label is never focusable in the first place.
+ *
  * **Rendering without a host must never throw.** The summary header imports
  * this component and imports nothing from `../host`, and the editor webview
  * renders it with no provider mounted at all. `usePanelActions` answers
@@ -188,6 +209,17 @@ export interface SourceLinkProps {
    * `PanelActions`. When neither is available the chip renders inert.
    */
   onOpenSource?: ((location: SourceLocation) => void) | undefined;
+
+  /**
+   * The interactive chip's place in the Tab order. `-1` for a chip nested in an
+   * item of a composite widget — a tree row, a grid row — whose roving tab stop
+   * is the item itself; `0` or omitted for a standalone chip.
+   *
+   * Forwarded to the `<button>` of the interactive form only; the inert form
+   * is never focusable and ignores it. A caller passing `-1` owns the keyboard
+   * route to the same intent (see this module's header).
+   */
+  tabIndex?: 0 | -1 | undefined;
 }
 
 /**
@@ -206,9 +238,21 @@ export interface SourceLinkProps {
  * ```tsx
  * <SourceLink location={location} label="Open the handler" onOpenSource={open} />
  * ```
+ * @example A chip inside a tree row, where the row is the only tab stop.
+ * ```tsx
+ * <SourceLink location={row.source} compact tabIndex={-1} />
+ * ```
  */
 export function SourceLink(props: SourceLinkProps): ReactElement {
-  const { location, label, showSymbol = true, compact = false, className, onOpenSource } = props;
+  const {
+    location,
+    label,
+    showSymbol = true,
+    compact = false,
+    className,
+    onOpenSource,
+    tabIndex,
+  } = props;
 
   // The prop wins; the host is the fallback; `undefined` is a normal value that
   // selects the inert form. Reading the context is unconditional, as a hook must
@@ -290,6 +334,9 @@ export function SourceLink(props: SourceLinkProps): ReactElement {
         className={chipClass}
         aria-label={`Open ${target}`}
         onClick={handleClick}
+        // Spread only when given, so an omitted index leaves the button's own
+        // Tab order untouched rather than writing an explicit attribute.
+        {...(tabIndex === undefined ? {} : { tabIndex })}
       >
         {content}
       </Button>

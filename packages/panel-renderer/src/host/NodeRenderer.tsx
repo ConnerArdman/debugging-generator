@@ -26,13 +26,18 @@
  *   component's own `useQuery` against the ambient `DataProvider`, and an
  *   interaction leaves through the ambient `PanelActions` (AAP 0.1.2, 0.4.2).
  *   There is no `fetch`, no socket, no message port and no host API in this
- *   file, and no provider or callback prop either — the host mounts both
+ *   file, and no provider or callback prop either — the host mounts the
  *   contexts once, around the whole panel.
- * - **It holds nothing.** No state, no hook, no effect, no memoization. A
- *   memoized node is a node that can stay on screen after the specification
- *   behind it has been replaced, and this package's render behaviour is
- *   something the product reports on rather than something the renderer should
- *   smooth over.
+ * - **It holds nothing.** No state, no hook, no effect. It is memoized, and the
+ *   memo is keyed on the node *object*: a node that is the same object as on
+ *   the previous render, at the same position and outline level, draws the same
+ *   thing, so re-rendering it would only re-render every table and SVG view
+ *   beneath it for nothing. A replaced specification brings new node objects,
+ *   so a node can never stay on screen after the document behind it changed —
+ *   which is why identity, and never the node's `id`, is what the memo compares.
+ *   A view that reads a context (its data, its session, its actions) still
+ *   re-renders when that context changes; the memo only stops a parent's render
+ *   from reaching it.
  *
  * ## A node type with no component is an error ON SCREEN, never a blank area
  *
@@ -70,14 +75,18 @@
  * them — while a *container's* own labels are forwarded by that container's
  * registry adapter, whose layout primitive already renders them.
  *
- * The outline depth this module tracks is the depth of the headings it owns:
- * {@link NodeRendererProps.headingLevel} is the level a labelled leaf's heading
- * sits at, and the children of a container whose title has text are rendered
- * one level deeper, clamped at the deepest legal level. The containers' own
- * headings are at their layout primitives' defaults, which the uniform registry
- * contract carries no way to override; tracking depth anyway is what keeps the
- * levels this module emits from skipping one, and a skipped level is the
- * failure that actually costs a screen-reader user their sense of structure.
+ * The outline depth this module tracks is the depth of every heading a node
+ * renders: {@link NodeRendererProps.headingLevel} is the level of the node's own
+ * heading — a labelled leaf's, drawn by the `Section` this module wraps it in,
+ * or a container's, drawn by its layout primitive and passed to it through the
+ * registry's uniform contract (`PanelNodeComponentProps.headingLevel`). The
+ * children of a container are rendered one level below the heading that
+ * container actually drew: one level deeper when its title has text, at the
+ * same level when it has none (a description alone adds prose, not an outline
+ * level), clamped at the deepest legal level. A section inside a split inside a
+ * section therefore reads as three consecutive levels, never a repeated or a
+ * skipped one — the failure that actually costs a screen-reader user their
+ * sense of structure.
  *
  * ## Children are an ARRAY, never a fragment
  *
@@ -104,17 +113,24 @@
  * entries are module constants, so a node type resolves to the same component
  * on every render and nothing inside a view is remounted by this dispatch.
  *
- * ## Keys are path-derived
+ * ## Keys are node ids
  *
- * A node's key is the document path that reaches it, joined with `.` —
- * `layout.0`, `layout.0.children.1` — which is unique by construction. For a
- * normalized panel that string *is* the node's id, because the normaliser
- * derives an id from exactly this path, so the keys read as ids in practice
- * while staying collision-free for a specification that reached the renderer
- * with duplicate ids (which validation forbids, and which would otherwise cost
- * a React key warning and a confused reconciliation). The identity reported to
- * `PanelActions` is a separate value and always the node's own `id`: that is
- * what the specification named it and what a stored panel's evidence references
+ * A sibling's key is its own validated `id`. That is what makes a view's
+ * identity survive a regenerated or re-ordered layout: a node that moves keeps
+ * its component instance, its local sort and filter state and its settled
+ * query, instead of being remounted and refetched because it now sits at a
+ * different index. Validation forbids duplicate ids, but a specification read
+ * back unvalidated could still carry one, so {@link renderPanelNodes} keeps the
+ * keys unique regardless: a repeated id is suffixed with its index after a `#`,
+ * a character no valid id contains, so it can never collide with a real one and
+ * React never has to reconcile two siblings under one key.
+ *
+ * The document path — `layout.0`, `layout.0.children.1` — is kept, and kept
+ * for diagnosis only: it is carried down the recursion and written onto each
+ * node's wrapper as `data-node-path`, so a node on screen can be traced back to
+ * its place in the stored specification. The identity reported to
+ * `PanelActions` is a third value and always the node's own `id`: that is what
+ * the specification named it and what a stored panel's evidence references
  * point at.
  *
  * ## Appearance is two class names and no CSS value
@@ -155,7 +171,7 @@ import {
 } from '@debuggen/panel-schema';
 import type { PanelNode, PanelNodePath } from '@debuggen/panel-schema';
 import type { DebuggenErrorCode } from '@debuggen/shared';
-import { createElement } from 'react';
+import { createElement, memo } from 'react';
 import type { ReactElement } from 'react';
 
 import { Section } from '../layout/Section';
@@ -211,9 +227,11 @@ const FAILURE_CODE: DebuggenErrorCode = 'PANEL_INVALID';
  */
 
 /**
- * The level a labelled leaf's heading sits at when the caller states none:
- * **2**, the level `../layout/Section` itself defaults to, so a leaf wrapped
- * here and a `section` node reach the outline at the same depth.
+ * The level a node's own heading sits at when the caller states none: **2**,
+ * the level `../layout/Section` itself defaults to. Every node rendered without
+ * a stated level — a labelled leaf, or a container of any of the three types —
+ * therefore opens the outline at the same depth. `PanelHost` always states one,
+ * placing a panel's layout below its title.
  */
 const DEFAULT_HEADING_LEVEL: HeadingLevel = 2;
 
@@ -323,17 +341,70 @@ function describeNode(node: PanelNode): string | undefined {
 }
 
 /**
- * The document path that reaches a node, as the key React identifies it by.
+ * The document path that reaches a node, in its diagnostic spelling.
  *
- * Joined with `.`, which is the form the normaliser derives a node id in, so a
- * normalized panel's keys and its ids coincide without this module reading an
- * id that a malformed specification could have duplicated.
+ * Joined with `.` — `layout.0.children.1` — which is also the form the
+ * normaliser derives a node id in, so for a normalized panel the value reads as
+ * the node's id and points at the same place in the stored document. Written
+ * onto the node's wrapper as `data-node-path` and used for nothing else: React
+ * identifies siblings by their ids (see {@link uniqueSiblingKey}).
  *
  * @param path The node's path within its specification.
- * @returns The key for that position.
+ * @returns The path as one string.
  */
 function pathKey(path: PanelNodePath): string {
   return path.join('.');
+}
+
+/**
+ * Whether two optional node paths name the same position.
+ *
+ * Compared element by element, because {@link renderPanelNodes} builds a fresh
+ * path array for every node on every call: identity would say "moved" for a node
+ * that has not, and defeat the memo it exists for.
+ *
+ * @param left One path, or `undefined`.
+ * @param right The other path, or `undefined`.
+ * @returns `true` when both are absent, or both hold the same segments.
+ */
+function samePath(left: PanelNodePath | undefined, right: PanelNodePath | undefined): boolean {
+  if (left === right) {
+    return true;
+  }
+
+  if (left === undefined || right === undefined || left.length !== right.length) {
+    return false;
+  }
+
+  return left.every((segment, index) => segment === right[index]);
+}
+
+/**
+ * The React key of one sibling: its own id, made unique among its siblings.
+ *
+ * The id is what keeps a view's instance — its local state and its settled
+ * query — attached to the node when a layout is re-ordered or regenerated. A
+ * valid specification has unique ids, so this is normally the id itself. A
+ * repeated id (a specification that reached the renderer unvalidated) is
+ * suffixed with its index after `#`, a character `PANEL_NODE_ID_PATTERN` does not
+ * admit, so the suffixed key can never equal a valid sibling's id; the loop only
+ * matters for ids that are themselves invalid, and guarantees uniqueness even
+ * then.
+ *
+ * @param id The node's id, as the specification carries it.
+ * @param index The node's index among its siblings.
+ * @param used The keys already given to earlier siblings; extended in place.
+ * @returns A key no earlier sibling holds.
+ */
+function uniqueSiblingKey(id: string, index: number, used: Set<string>): string {
+  let key = used.has(id) ? `${id}#${String(index)}` : id;
+
+  while (used.has(key)) {
+    key = `${key}#`;
+  }
+
+  used.add(key);
+  return key;
 }
 
 /**
@@ -345,11 +416,12 @@ function pathKey(path: PanelNodePath): string {
  *
  * @param node The node that could not be rendered.
  * @param message What went wrong, in one sentence.
+ * @param diagnosticPath The node's document path, for `data-node-path`.
  * @returns The wrapper and the error state inside it.
  */
-function renderNodeFailure(node: PanelNode, message: string): ReactElement {
+function renderNodeFailure(node: PanelNode, message: string, diagnosticPath: string): ReactElement {
   return (
-    <div className={NODE_FAILURE_CLASS}>
+    <div className={NODE_FAILURE_CLASS} data-node-path={diagnosticPath}>
       <ErrorState
         title={FAILURE_TITLE}
         message={message}
@@ -370,9 +442,9 @@ function renderNodeFailure(node: PanelNode, message: string): ReactElement {
  * The inputs of one rendered node.
  *
  * Three, and the last two are positioning rather than content: the node is the
- * whole of what is drawn, and the data provider and the action contract are
- * ambient — the host mounts them once around the panel, so they are not props
- * here and must not become them (AAP 0.1.2).
+ * whole of what is drawn, and the data provider, the session and the action
+ * contract are ambient — the host mounts them once around the panel, so they are
+ * not props here and must not become them (AAP 0.1.2).
  *
  * Every optional member spells `| undefined` explicitly, because
  * `exactOptionalPropertyTypes` is in force repository-wide and a caller
@@ -392,27 +464,49 @@ export interface NodeRendererProps {
    * Where this node sits in its specification, as the path that reaches it —
    * `['layout', 0]` for the first top-level node.
    *
-   * Used for one thing: deriving the keys of this node's children, so that a
-   * position in the document rather than a value inside it identifies a child
-   * across renders. Defaults to the node's own id as a single-segment path,
+   * Diagnostic only: written onto the node's wrapper as `data-node-path` and
+   * extended for its children, so every node on screen can be traced back to its
+   * place in the stored document. It identifies nothing to React — siblings are
+   * keyed by their ids. Defaults to the node's own id as a single-segment path,
    * which is what a caller rendering a node on its own — a test, or a surface
-   * showing one view — gets without having to invent a document position; for a
-   * normalized panel that yields exactly the child ids the normaliser derived,
-   * because it derives them from this same path.
+   * showing one view — gets without having to invent a document position.
    */
   readonly path?: PanelNodePath | undefined;
 
   /**
    * The outline level this node's own heading sits at, when it has one.
    *
-   * Only a labelled leaf has a heading this module emits (see the header): the
-   * container types render their labels through their own layout primitives.
-   * The value is passed one level deeper to the children of a container whose
-   * title has text, so that the headings this module emits never skip a level.
+   * A labelled leaf's heading is the `Section` this module wraps it in; a
+   * container's heading is its layout primitive's, reached through the
+   * registry's uniform contract. Either way the heading renders at this level,
+   * and the children of a container whose title has text render one level
+   * deeper, so the outline never repeats or skips a level.
    *
    * @default 2
    */
   readonly headingLevel?: HeadingLevel | undefined;
+}
+
+/**
+ * Whether a re-render of a node would draw exactly what is already on screen.
+ *
+ * The same node object at the same position and outline level: the node is the
+ * whole of the content, the other two are the whole of its placement, and
+ * everything else a view reads arrives through a context, which re-renders its
+ * consumers on its own. The node is compared by identity — never by id, which a
+ * regenerated panel can share with the panel it replaced — so a changed
+ * document always renders.
+ *
+ * @param previous The props of the last render.
+ * @param next The props of this render.
+ * @returns `true` when the render may be skipped.
+ */
+function sameNodeRendererProps(previous: NodeRendererProps, next: NodeRendererProps): boolean {
+  return (
+    previous.node === next.node &&
+    previous.headingLevel === next.headingLevel &&
+    samePath(previous.path, next.path)
+  );
 }
 
 /**
@@ -425,19 +519,18 @@ export interface NodeRendererProps {
  * wrapped in `../layout/Section`; a type the registry has no component for
  * renders a visible failure rather than nothing (AAP 0.6.2, 0.5.5).
  *
- * Pure and presentational: no state, no effect, no hook, no memoization.
+ * Pure and presentational: no state, no effect, no hook. The exported
+ * {@link NodeRenderer} is this function behind a memo; see
+ * {@link sameNodeRendererProps} for when a render is skipped.
  *
  * @param props See {@link NodeRendererProps}.
  * @returns The node's wrapper and whatever belongs inside it — never an empty
  * element, whatever the node turns out to be.
- *
- * @example One node, rendered on its own.
- * ```tsx
- * <NodeRenderer node={node} />
- * ```
  */
-export function NodeRenderer(props: NodeRendererProps): ReactElement {
+function NodeRendererView(props: NodeRendererProps): ReactElement {
   const { node, path, headingLevel = DEFAULT_HEADING_LEVEL } = props;
+  const nodePath: PanelNodePath = path ?? [node.id];
+  const diagnosticPath = pathKey(nodePath);
 
   // First, and deliberately: this lookup is the only *runtime* check that the
   // node's type is one this package draws. `node.type` is typed as a catalogued
@@ -452,6 +545,7 @@ export function NodeRenderer(props: NodeRendererProps): ReactElement {
     return renderNodeFailure(
       node,
       `This panel names a node of type "${node.type}" (node "${node.id}"), which this renderer has no component for.`,
+      diagnosticPath,
     );
   }
 
@@ -465,18 +559,23 @@ export function NodeRenderer(props: NodeRendererProps): ReactElement {
       return renderNodeFailure(
         node,
         `The node type "${node.type}" (node "${node.id}") is catalogued as a container, but this renderer cannot read its children.`,
+        diagnosticPath,
       );
     }
 
     return (
-      <div className={NODE_CLASS}>
+      <div className={NODE_CLASS} data-node-path={diagnosticPath}>
         {createElement(component, {
           node,
           nodeId: node.id,
+          // The container's own heading sits at the level this node was given;
+          // its layout primitive renders it there instead of at its default.
+          headingLevel,
           children: renderPanelNodes(children, {
-            basePath: [...(path ?? [node.id]), PANEL_CHILDREN_FIELD],
-            // One level deeper only when the container actually renders a
-            // heading; a description alone adds prose, not an outline level.
+            basePath: [...nodePath, PANEL_CHILDREN_FIELD],
+            // One level below the heading the container actually drew: deeper
+            // only when its title has text, because a description alone adds
+            // prose, not an outline level.
             headingLevel: hasText(node.title) ? nextHeadingLevel(headingLevel) : headingLevel,
           }),
         })}
@@ -497,7 +596,7 @@ export function NodeRenderer(props: NodeRendererProps): ReactElement {
   // field for either and this file may not invent one (AAP 0.6.4).
   if (hasText(node.title) || hasText(node.description)) {
     return (
-      <div className={NODE_CLASS}>
+      <div className={NODE_CLASS} data-node-path={diagnosticPath}>
         <Section title={node.title} description={node.description} headingLevel={headingLevel}>
           {view}
         </Section>
@@ -505,8 +604,33 @@ export function NodeRenderer(props: NodeRendererProps): ReactElement {
     );
   }
 
-  return <div className={NODE_CLASS}>{view}</div>;
+  return (
+    <div className={NODE_CLASS} data-node-path={diagnosticPath}>
+      {view}
+    </div>
+  );
 }
+
+/**
+ * Draws one node of a validated panel, and its subtree — skipping the render
+ * when the same node object is asked for again at the same position and outline
+ * level.
+ *
+ * {@link NodeRendererView} behind `memo`, with {@link sameNodeRendererProps} as
+ * the comparison: a parent that re-renders for its own reasons does not
+ * re-render a table or an SVG view beneath it, while a replaced node, a moved
+ * node or a changed outline level always does. Data, session and actions reach
+ * the views through contexts, which re-render their consumers independently of
+ * this memo.
+ *
+ * @example One node, rendered on its own.
+ * ```tsx
+ * <NodeRenderer node={node} />
+ * ```
+ */
+export const NodeRenderer = memo(NodeRendererView, sameNodeRendererProps);
+
+NodeRenderer.displayName = 'NodeRenderer';
 
 /*
  * ---------------------------------------------------------------------------
@@ -517,12 +641,12 @@ export function NodeRenderer(props: NodeRendererProps): ReactElement {
 /** How {@link renderPanelNodes} positions the nodes it renders. */
 export interface RenderPanelNodesOptions {
   /**
-   * The path the list itself sits at, which each node's own path extends with
-   * its index.
+   * The path the list itself sits at, which each node's own diagnostic path
+   * extends with its index.
    *
    * Defaults to a specification's `layout` field, so a host rendering a panel's
-   * layout states nothing and gets the paths — and therefore the keys —
-   * `layout.0`, `layout.1`, … that the normaliser used as those nodes' ids.
+   * layout states nothing and gets the paths `layout.0`, `layout.1`, … — the
+   * same strings the normaliser used as those nodes' ids.
    */
   readonly basePath?: PanelNodePath | undefined;
 
@@ -550,13 +674,19 @@ export interface RenderPanelNodesOptions {
  * was nothing to draw" — and a panel that drew nothing is the host's to explain,
  * since only the host knows the summary and the state of the session behind it.
  *
+ * Each element is keyed by its node's id (see {@link uniqueSiblingKey}), so a
+ * node that moves among its siblings keeps its component instance rather than
+ * being remounted — and re-queried — at its new index. A caller that renders the
+ * same `nodes` array on every render should memoize the result on that array,
+ * as `PanelHost` does: identical elements are what let React skip the subtree.
+ *
  * @param nodes The sibling nodes, in reading order.
  * @param options See {@link RenderPanelNodesOptions}.
- * @returns One element per node, keyed by its document path.
+ * @returns One element per node, keyed by its id.
  *
  * @example A host rendering a validated panel's layout.
  * ```tsx
- * <div className="dg-panel__body">{renderPanelNodes(spec.layout)}</div>
+ * const body = useMemo(() => renderPanelNodes(spec.layout), [spec.layout]);
  * ```
  */
 export function renderPanelNodes(
@@ -564,10 +694,18 @@ export function renderPanelNodes(
   options: RenderPanelNodesOptions = {},
 ): ReactElement[] {
   const { basePath = PANEL_LAYOUT_PATH_ROOT, headingLevel } = options;
+  const usedKeys = new Set<string>();
 
   return nodes.map((node, index) => {
     const path: PanelNodePath = [...basePath, index];
 
-    return <NodeRenderer key={pathKey(path)} node={node} path={path} headingLevel={headingLevel} />;
+    return (
+      <NodeRenderer
+        key={uniqueSiblingKey(node.id, index, usedKeys)}
+        node={node}
+        path={path}
+        headingLevel={headingLevel}
+      />
+    );
   });
 }

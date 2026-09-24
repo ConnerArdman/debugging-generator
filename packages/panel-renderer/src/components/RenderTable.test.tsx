@@ -42,10 +42,12 @@
  *     control exists to reveal a value, no cell pairs a name with one, and the
  *     expanded row states that values are never captured.
  *  4. **Bounded evidence is declared as bounded** (AAP 0.4.2): the footer says
- *     how much of the result is on screen, "Load more" asks the provider for a
- *     larger page, a page beyond the contract's ceiling is clamped before it is
- *     requested, and a row whose per-render list the producer truncated says so
- *     when it is expanded.
+ *     how much of the result is on screen; "Load more" requests the next page at
+ *     exactly the provider's `nextOffset` with an unchanged `limit` and appends
+ *     it, de-duplicated, beneath the rows already loaded — past the 5 000-row
+ *     page ceiling too, and never without a `nextOffset`; a page beyond the
+ *     contract's ceiling is clamped before it is requested; and a row whose
+ *     per-render list the producer truncated says so when it is expanded.
  *  5. **The interaction contract**: the very `SourceLocation` a row carries
  *     reaches `onOpenSource` field for field; an individual render selects
  *     itself through `onSelectEvent`; and an **aggregate row selects nothing**,
@@ -54,7 +56,12 @@
  *     never pointed at.
  *  6. **Ordering belongs to the data layer**: rows appear in the provider's own
  *     order, and a sort gesture is a re-query carrying the mapped
- *     `DataQuerySort` rather than a local re-ranking of one page.
+ *     `DataQuerySort` rather than a local re-ranking of one page — and it
+ *     starts the page sequence over.
+ *  7. **Tooltips are reachable from the keyboard** (AAP 0.6.2): every header
+ *     description opens when its trigger takes focus and none sits inside a
+ *     sortable header's button, and an in-row description is a tab stop only in
+ *     the row the reader is standing on.
  *
  * ## Harness conventions (shared with `./SpanTable.test.tsx`)
  *
@@ -94,7 +101,11 @@
  * @see ../primitives/DataTable for the grid roles these queries rely on.
  */
 
-import { DATA_QUERY_DEFAULT_LIMIT, DATA_QUERY_MAX_LIMIT } from '@debuggen/panel-schema';
+import {
+  DATA_QUERY_DEFAULT_LIMIT,
+  DATA_QUERY_DEFAULT_OFFSET,
+  DATA_QUERY_MAX_LIMIT,
+} from '@debuggen/panel-schema';
 import type { DataQuery, DataQuerySort, RenderTableNode } from '@debuggen/panel-schema';
 import { DebuggenError } from '@debuggen/shared';
 import type { SourceLocation } from '@debuggen/shared';
@@ -107,16 +118,21 @@ import type {
   RenderTrigger,
   RenderTriggerHistogram,
 } from '@debuggen/telemetry';
-import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Mock } from 'vitest';
 
-import { DataProviderContext, createDataProvider } from '../host/DataProvider';
+import { DataProviderContext, PanelSessionContext, createDataProvider } from '../host/DataProvider';
 import type { DataProvider, DataQueryResolver, DataQueryResponse } from '../host/DataProvider';
 import { PanelActionsContext } from '../host/PanelActions';
 import type { PanelActions, PanelEventRef } from '../host/PanelActions';
-import { formatCount, formatDuration, formatOffset } from '../utils/format';
+import {
+  formatCount,
+  formatDuration,
+  formatOffset,
+  formatRenderTriggerLabel,
+} from '../utils/format';
 import { RenderTable } from './RenderTable';
 
 /*
@@ -646,6 +662,13 @@ function makeActions(): ActionSpies {
 }
 
 /**
+ * The session the rendered view's queries are addressed to, provided the way
+ * `PanelHost` provides a specification's `sessionId`. Nothing below asserts on
+ * it: the routing contract is pinned by `../host/PanelHost.test.tsx`.
+ */
+const PANEL_SESSION_ID = 'session-under-test';
+
+/**
  * Renders the component inside both host contexts.
  *
  * @param node The node to draw.
@@ -657,9 +680,11 @@ function renderComponent(
 ): void {
   render(
     <DataProviderContext.Provider value={context.provider}>
-      <PanelActionsContext.Provider value={context.actions}>
-        <RenderTable node={node} />
-      </PanelActionsContext.Provider>
+      <PanelSessionContext.Provider value={PANEL_SESSION_ID}>
+        <PanelActionsContext.Provider value={context.actions}>
+          <RenderTable node={node} />
+        </PanelActionsContext.Provider>
+      </PanelSessionContext.Provider>
     </DataProviderContext.Provider>,
   );
 }
@@ -1680,14 +1705,13 @@ describe('RenderTable ordering', () => {
 });
 
 describe('RenderTable paging', () => {
-  it('says how much of the result is on screen and asks the provider for more', async () => {
-    // `nextOffset` deliberately differs from the length of the page: a view
-    // never derives paging from what arrived. This one grows the page it asks
-    // for rather than stitching a second answer onto the first, so the rows on
-    // screen are always exactly one provider answer.
+  it('says how much of the result is on screen and asks the provider for the next page', async () => {
+    // The provider answers each call with the next page. "Load more" advances
+    // the sequence to the provider's own `nextOffset` and appends the answer
+    // beneath the page already on screen; it never grows one request.
     const stub = pagingProvider([
       { data: [WIDGET_ROW], total: 12, nextOffset: 1 },
-      { data: [WIDGET_ROW, LIST_ROW], total: 12, nextOffset: 2 },
+      { data: [LIST_ROW], total: 12, nextOffset: 2 },
     ]);
     const user = userEvent.setup();
 
@@ -1706,15 +1730,15 @@ describe('RenderTable paging', () => {
 
     await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
 
-    // A larger page of the same query: same source, same ordering, same
-    // starting position, more rows.
+    // The next page of the same query: same source, same ordering, same page
+    // size, starting exactly where the provider said it starts.
     expect(stub.resolve).toHaveBeenCalledTimes(2);
 
     const second = queryOfCall(stub, 2);
-    expect(second.limit ?? 0).toBeGreaterThan(first.limit ?? 0);
+    expect(second.limit).toBe(first.limit);
     expect(second.source).toBe('renders');
     expect(second.sort).toBe(MOST_RENDERS_FIRST);
-    expect(second.offset).toBeUndefined();
+    expect(second.offset).toBe(1);
 
     // And the reader keeps what they were reading, with the new row beneath it.
     await waitFor(() => {
@@ -1723,6 +1747,9 @@ describe('RenderTable paging', () => {
     expect(
       screen.getByText(`Showing ${formatCount(2)} of ${formatCount(12)} components.`),
     ).toBeDefined();
+
+    // The second page reported a further one, so the control is still offered.
+    expect(screen.getByRole('button', { name: LOAD_MORE_NAME })).toBeDefined();
   });
 
   it('offers no paging control once the response reports no further page', async () => {
@@ -1747,13 +1774,17 @@ describe('RenderTable paging', () => {
     expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
   });
 
-  it('clamps a page beyond the published maximum, and says when it cannot grow further', async () => {
-    const stub = resolvingProvider([WIDGET_ROW], { total: 9_000, nextOffset: 1 });
+  it('clamps a page beyond the published maximum, and keeps paging past it', async () => {
+    const stub = resolvingProvider([WIDGET_ROW], {
+      total: 9_000,
+      nextOffset: DATA_QUERY_MAX_LIMIT,
+    });
+    const user = userEvent.setup();
 
     // A node whose `limit` exceeds the contract's ceiling: the service would
-    // reject the query, so the request is bounded here instead — and, being at
-    // the ceiling already, the footer explains itself instead of offering a
-    // control that cannot act.
+    // reject the query, so the request is bounded here instead. The ceiling
+    // bounds one page, not the sequence: the provider reports a next page, so
+    // the control is offered and follows it.
     renderComponent(
       makeNode({
         query: { source: 'renders', sort: MOST_RENDERS_FIRST, limit: DATA_QUERY_MAX_LIMIT + 1_000 },
@@ -1764,7 +1795,766 @@ describe('RenderTable paging', () => {
     await screen.findByRole('grid', { name: GRID_NAME });
 
     expect(soleQuery(stub).limit).toBe(DATA_QUERY_MAX_LIMIT);
+
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+
+    expect(stub.resolve).toHaveBeenCalledTimes(2);
+    expect(queryOfCall(stub, 2).offset).toBe(DATA_QUERY_MAX_LIMIT);
+    expect(queryOfCall(stub, 2).limit).toBe(DATA_QUERY_MAX_LIMIT);
+
+    // The stub repeats its page, so the second answer reports the offset it was
+    // requested at: a `nextOffset` that does not advance ends the sequence, and
+    // the repeated row is drawn once.
+    await waitFor(() => {
+      expect(screen.queryByRole('button', { name: /^Load/ })).toBeNull();
+    });
+    expect(renderedNames()).toEqual([WIDGET_COMPONENT]);
+  });
+});
+
+describe('RenderTable page sequence', () => {
+  /*
+   * An offset-aware stub, local to these cases: each request is answered by
+   * the page defined at its own `offset` (and, for the ordering case, its own
+   * `sort`), so a component that re-requested the prefix, grew a window or
+   * derived an offset from what arrived would receive the wrong page and fail
+   * visibly rather than by coincidence. A request may also be held open, so the
+   * state between "Load more" and the next answer can be asserted, or rejected.
+   */
+
+  /** How the stub answers one request: a page, a request held open, or a failure. */
+  type SequenceAnswer = RenderPage | 'pending' | DebuggenError;
+
+  /** The stub, the queries it received and the handle that settles a held request. */
+  interface SequenceStub {
+    /** The provider to hand to {@link renderComponent}. */
+    readonly provider: DataProvider;
+
+    /** Every query received, in call order. */
+    readonly queries: readonly DataQuery[];
+
+    /**
+     * Answers the request held open at `offset` with `page`. Synchronous: the
+     * caller awaits the resulting render through `waitFor`.
+     */
+    readonly settle: (offset: number, page: RenderPage) => void;
+  }
+
+  /** The label the paging control carries while the next page is in flight. */
+  const LOADING_MORE_NAME = 'Loading more…';
+
+  /** Anything whose accessible name starts with "Load" — both paging labels. */
+  const ANY_PAGING_CONTROL = /^Load/;
+
+  /**
+   * The position a query asks for, with the contract's default applied — the
+   * same default the side resolving a query applies to one that carries none.
+   *
+   * @param query The received query.
+   * @returns Its offset.
+   */
+  function offsetOf(query: DataQuery): number {
+    return query.offset ?? DATA_QUERY_DEFAULT_OFFSET;
+  }
+
+  /**
+   * The response a page stands for, with its counters present only when set.
+   *
+   * @param page The page.
+   * @returns The response.
+   */
+  function responseFor(page: RenderPage): DataQueryResponse {
+    return {
+      source: 'renders',
+      data: page.data,
+      ...(page.total === undefined ? {} : { total: page.total }),
+      ...(page.nextOffset === undefined ? {} : { nextOffset: page.nextOffset }),
+    };
+  }
+
+  /**
+   * Builds the offset-aware stub.
+   *
+   * @param answer Called with each query and its 1-based call number.
+   * @returns The stub.
+   */
+  function sequenceProvider(
+    answer: (query: DataQuery, call: number) => SequenceAnswer,
+  ): SequenceStub {
+    const queries: DataQuery[] = [];
+    const held = new Map<number, (response: DataQueryResponse) => void>();
+
+    const provider = createDataProvider((query) => {
+      queries.push(query);
+
+      const answered = answer(query, queries.length);
+
+      if (answered === 'pending') {
+        return new Promise<DataQueryResponse>((resolve) => {
+          held.set(offsetOf(query), resolve);
+        });
+      }
+
+      if (answered instanceof DebuggenError) {
+        return Promise.reject(answered);
+      }
+
+      return Promise.resolve(responseFor(answered));
+    });
+
+    const settle = (offset: number, page: RenderPage): void => {
+      const resolve = held.get(offset);
+
+      if (resolve === undefined) {
+        throw new Error(`no request at offset ${String(offset)} is being held`);
+      }
+
+      held.delete(offset);
+      resolve(responseFor(page));
+    };
+
+    return { provider, queries, settle };
+  }
+
+  /**
+   * The query received on the given 1-based call.
+   *
+   * @param stub The stub.
+   * @param call The call number.
+   * @returns That query.
+   */
+  function requestOf(stub: SequenceStub, call: number): DataQuery {
+    const query = stub.queries[call - 1];
+
+    if (query === undefined) {
+      throw new Error(`the stub received no query for call ${String(call)}`);
+    }
+
+    return query;
+  }
+
+  /**
+   * A quiet component: two renders, so a louder one stands out against it.
+   *
+   * @param component The component name.
+   * @returns The row.
+   */
+  function quietRow(component: string): RenderStat {
+    return makeRenderStat({
+      component,
+      renderCount: 2,
+      totalDurationMs: 24,
+      averageDurationMs: 12,
+      maxDurationMs: 16,
+      triggers: makeTriggers({ props: 1, unchanged: 1 }),
+      phaseCounts: makePhases({ mount: 1, update: 1 }),
+    });
+  }
+
+  const CARD_COMPONENT = 'ExampleCard';
+  const PANEL_COMPONENT = 'ExamplePanel';
+  const FORM_COMPONENT = 'ExampleForm';
+  const CARD_ROW = quietRow(CARD_COMPONENT);
+  const PANEL_ROW = quietRow(PANEL_COMPONENT);
+  const FORM_ROW = quietRow(FORM_COMPONENT);
+
+  it('requests the next page at the provider nextOffset with the same limit, and appends it once', async () => {
+    const stub = sequenceProvider((query) =>
+      offsetOf(query) === 0 ? { data: [LIST_ROW, WIDGET_ROW], total: 4, nextOffset: 2 } : 'pending',
+    );
+    const user = userEvent.setup();
+
+    renderComponent(
+      makeNode({ query: { source: 'renders', sort: MOST_RENDERS_FIRST, limit: 2 } }),
+      { provider: stub.provider, actions: makeActions().actions },
+    );
+
+    await screen.findByText(`Showing ${formatCount(2)} of ${formatCount(4)} components.`);
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+
+    // The same query, moved to exactly the offset the provider reported: the
+    // same source, filter, order and page size — one new page, not a larger one.
+    expect(stub.queries).toHaveLength(2);
+    const first = requestOf(stub, 1);
+    const second = requestOf(stub, 2);
+    expect(second).toEqual({ ...first, offset: 2 });
+    expect(second.limit).toBe(2);
+    expect(first.limit).toBe(2);
+
+    // While it is in flight, the loaded rows stay where the reader is reading,
+    // under their total, with a busy control rather than the block's silhouette.
+    expect(renderedNames()).toEqual([LIST_COMPONENT, WIDGET_COMPONENT]);
+    expect(screen.queryByRole('status')).toBeNull();
+    expect(
+      screen.getByText(`Showing ${formatCount(2)} of ${formatCount(4)} components.`),
+    ).toBeDefined();
+    const busy = screen.getByRole('button', { name: LOADING_MORE_NAME });
+    expect(busy instanceof HTMLButtonElement && busy.disabled).toBe(true);
     expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
-    expect(screen.getByText(/largest page this view can request/i)).toBeDefined();
+
+    // The next page repeats a row the reader already has: it is drawn once, in
+    // its original place, and the new row lands beneath the loaded ones.
+    stub.settle(2, { data: [WIDGET_ROW, CARD_ROW], total: 4 });
+
+    await waitFor(() => {
+      expect(renderedNames()).toEqual([LIST_COMPONENT, WIDGET_COMPONENT, CARD_COMPONENT]);
+    });
+    expect(
+      screen.getByText(`Showing ${formatCount(3)} of ${formatCount(4)} components.`),
+    ).toBeDefined();
+
+    // No further page was reported, so none is offered — and nothing already
+    // on screen was requested a second time.
+    expect(screen.queryByRole('button', { name: ANY_PAGING_CONTROL })).toBeNull();
+    expect(stub.queries).toHaveLength(2);
+  });
+
+  it('keeps following the reported offsets past the 5 000-row page ceiling', async () => {
+    const pagesAt = new Map<number, RenderPage>([
+      [4_800, { data: [CARD_ROW], total: 6_000, nextOffset: 4_900 }],
+      [4_900, { data: [PANEL_ROW], total: 6_000, nextOffset: 5_100 }],
+      [5_100, { data: [FORM_ROW], total: 6_000 }],
+    ]);
+    const stub = sequenceProvider((query) => {
+      const page = pagesAt.get(offsetOf(query));
+
+      if (page === undefined) {
+        throw new Error(`no page is defined at offset ${String(offsetOf(query))}`);
+      }
+
+      return page;
+    });
+    const user = userEvent.setup();
+
+    renderComponent(
+      makeNode({
+        query: { source: 'renders', sort: MOST_RENDERS_FIRST, limit: 100, offset: 4_800 },
+      }),
+      { provider: stub.provider, actions: makeActions().actions },
+    );
+
+    await waitFor(() => {
+      expect(renderedNames()).toEqual([CARD_COMPONENT]);
+    });
+
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+    await waitFor(() => {
+      expect(renderedNames()).toEqual([CARD_COMPONENT, PANEL_COMPONENT]);
+    });
+
+    // The provider skipped ahead; the view follows it rather than counting rows,
+    // and a request beyond the ceiling is issued like any other.
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+    await waitFor(() => {
+      expect(renderedNames()).toEqual([CARD_COMPONENT, PANEL_COMPONENT, FORM_COMPONENT]);
+    });
+
+    expect(stub.queries.map((query) => query.offset)).toEqual([4_800, 4_900, 5_100]);
+    expect(stub.queries.map((query) => query.limit)).toEqual([100, 100, 100]);
+    expect(requestOf(stub, 3).offset ?? 0).toBeGreaterThan(DATA_QUERY_MAX_LIMIT);
+    expect(screen.queryByRole('button', { name: ANY_PAGING_CONTROL })).toBeNull();
+  });
+
+  it('offers no paging control without a nextOffset, however large the total', async () => {
+    // Fifty components reported and one delivered, but no next offset: the
+    // provider did not say where more rows start, so none are requested.
+    const stub = sequenceProvider(() => ({ data: [WIDGET_ROW], total: 50 }));
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByText(`Showing ${formatCount(1)} of ${formatCount(50)} components.`);
+    expect(screen.queryByRole('button', { name: ANY_PAGING_CONTROL })).toBeNull();
+    expect(stub.queries).toHaveLength(1);
+  });
+
+  it('treats a nextOffset that does not move past the current page as the end', async () => {
+    // Following it would re-request the page on screen, and loop on it.
+    const stub = sequenceProvider(() => ({ data: [WIDGET_ROW], total: 50, nextOffset: 3 }));
+
+    renderComponent(
+      makeNode({ query: { source: 'renders', sort: MOST_RENDERS_FIRST, offset: 3 } }),
+      { provider: stub.provider, actions: makeActions().actions },
+    );
+
+    await screen.findByRole('grid', { name: GRID_NAME });
+    expect(requestOf(stub, 1).offset).toBe(3);
+    expect(screen.queryByRole('button', { name: ANY_PAGING_CONTROL })).toBeNull();
+    expect(stub.queries).toHaveLength(1);
+  });
+
+  it('starts the sequence over from the first page when the order changes', async () => {
+    const stub = sequenceProvider((query) => {
+      const firstPage =
+        query.sort === LONGEST_TOTAL_FIRST ? [WIDGET_ROW, LIST_ROW] : [LIST_ROW, WIDGET_ROW];
+
+      return offsetOf(query) === 0
+        ? { data: firstPage, total: 3, nextOffset: 2 }
+        : { data: [CARD_ROW], total: 3 };
+    });
+    const user = userEvent.setup();
+
+    renderComponent(
+      makeNode({ query: { source: 'renders', sort: MOST_RENDERS_FIRST, limit: 2 } }),
+      { provider: stub.provider, actions: makeActions().actions },
+    );
+
+    await screen.findByRole('grid', { name: GRID_NAME });
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+    await waitFor(() => {
+      expect(renderedNames()).toEqual([LIST_COMPONENT, WIDGET_COMPONENT, CARD_COMPONENT]);
+    });
+
+    // A header activation is a new ordering, so a new sequence: its first page,
+    // with the node's own (absent) offset and the same page size.
+    await user.click(screen.getByRole('button', { name: TOTAL_SORT_NAME }));
+
+    expect(stub.queries).toHaveLength(3);
+    expect(requestOf(stub, 3)).toEqual({ ...requestOf(stub, 1), sort: LONGEST_TOTAL_FIRST });
+
+    // The rows loaded under the old order are released, not carried over.
+    await waitFor(() => {
+      expect(renderedNames()).toEqual([WIDGET_COMPONENT, LIST_COMPONENT]);
+    });
+
+    // The new sequence pages on its own offsets.
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+    expect(requestOf(stub, 4)).toEqual({
+      ...requestOf(stub, 1),
+      sort: LONGEST_TOTAL_FIRST,
+      offset: 2,
+    });
+    await waitFor(() => {
+      expect(renderedNames()).toEqual([WIDGET_COMPONENT, LIST_COMPONENT, CARD_COMPONENT]);
+    });
+
+    // The toolbar is the other way to change the order, and it resets the same way.
+    await user.selectOptions(orderControl(), MOST_RENDERS_FIRST);
+
+    expect(requestOf(stub, 5)).toEqual(requestOf(stub, 1));
+    await waitFor(() => {
+      expect(renderedNames()).toEqual([LIST_COMPONENT, WIDGET_COMPONENT]);
+    });
+  });
+
+  it('keeps the loaded rows when the next page fails, and retries exactly that page', async () => {
+    let nextPageAttempts = 0;
+    const stub = sequenceProvider((query) => {
+      if (offsetOf(query) === 0) {
+        return { data: [LIST_ROW, WIDGET_ROW], total: 3, nextOffset: 2 };
+      }
+
+      nextPageAttempts += 1;
+
+      return nextPageAttempts === 1
+        ? new DebuggenError('TRANSPORT_DISCONNECTED', 'The channel to the service is closed.')
+        : { data: [CARD_ROW], total: 3 };
+    });
+    const user = userEvent.setup();
+
+    renderComponent(
+      makeNode({ query: { source: 'renders', sort: MOST_RENDERS_FIRST, limit: 2 } }),
+      { provider: stub.provider, actions: makeActions().actions },
+    );
+
+    await screen.findByRole('grid', { name: GRID_NAME });
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+
+    // The failure is reported beneath the rows, with the query that failed —
+    // at the reported offset — and the rows already loaded are untouched.
+    const alert = await screen.findByRole('alert');
+    expect(
+      within(alert).getByText(/next page of render statistics could not be loaded/i),
+    ).toBeDefined();
+    expect(alert.textContent).toContain('TRANSPORT_DISCONNECTED');
+    const shown = within(alert).getByRole('group', { name: FAILING_QUERY_NAME });
+    expect(JSON.parse(shown.textContent ?? '')).toEqual({
+      source: 'renders',
+      sort: MOST_RENDERS_FIRST,
+      limit: 2,
+      offset: 2,
+    });
+    expect(screen.getByRole('grid', { name: GRID_NAME })).toBeDefined();
+    expect(renderedNames()).toEqual([LIST_COMPONENT, WIDGET_COMPONENT]);
+    expect(screen.queryByRole('button', { name: ANY_PAGING_CONTROL })).toBeNull();
+
+    // The retry re-requests the page that failed, and its rows are appended.
+    await user.click(within(alert).getByRole('button', { name: RETRY_NAME }));
+
+    expect(stub.queries).toHaveLength(3);
+    expect(requestOf(stub, 3)).toEqual(requestOf(stub, 2));
+    await waitFor(() => {
+      expect(renderedNames()).toEqual([LIST_COMPONENT, WIDGET_COMPONENT, CARD_COMPONENT]);
+    });
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('keeps an open row open, and marks outliers over every loaded row, as pages append', async () => {
+    const loud = makeRenderStat({ renderCount: 40, totalDurationMs: 1_600 });
+    const stub = sequenceProvider((query) =>
+      offsetOf(query) === 0
+        ? { data: [loud, quietRow(LIST_COMPONENT)], total: 5, nextOffset: 2 }
+        : { data: [CARD_ROW, PANEL_ROW, FORM_ROW], total: 5 },
+    );
+    const user = userEvent.setup();
+
+    renderComponent(
+      makeNode({ query: { source: 'renders', sort: MOST_RENDERS_FIRST, limit: 2 } }),
+      { provider: stub.provider, actions: makeActions().actions },
+    );
+
+    await screen.findByRole('grid', { name: GRID_NAME });
+
+    // Two rows are no distribution, so nothing is marked yet.
+    const figure = (): HTMLElement =>
+      within(cellFor(rowFor(WIDGET_COMPONENT), 'Renders')).getByText(formatCount(40));
+    expect(figure().classList.contains('dg-is-outlier')).toBe(false);
+
+    await user.click(within(rowFor(WIDGET_COMPONENT)).getByRole('button', { name: EXPAND_NAME }));
+    expect(detailRows()).toHaveLength(1);
+
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+    await waitFor(() => {
+      expect(dataRows()).toHaveLength(5);
+    });
+
+    // Five loaded rows with a median of two: the loud one now stands out, and
+    // the row the reader opened is still open.
+    expect(figure().classList.contains('dg-is-outlier')).toBe(true);
+    expect(cellFor(rowFor(WIDGET_COMPONENT), 'Renders').textContent ?? '').toMatch(
+      /median of the loaded rows/i,
+    );
+    expect(rowFor(WIDGET_COMPONENT).getAttribute('aria-expanded')).toBe('true');
+    expect(detailRows()).toHaveLength(1);
+  });
+
+  it('offers the next page after a resolved page that held no rows but named one', async () => {
+    const stub = sequenceProvider((query) =>
+      offsetOf(query) === 0
+        ? { data: [], total: 2, nextOffset: 2 }
+        : { data: [WIDGET_ROW, LIST_ROW], total: 2 },
+    );
+    const user = userEvent.setup();
+
+    renderComponent(
+      makeNode({ query: { source: 'renders', sort: MOST_RENDERS_FIRST, limit: 2 } }),
+      { provider: stub.provider, actions: makeActions().actions },
+    );
+
+    // The empty page is reported as a page, never as a capture without renders,
+    // and the offset it named stays reachable.
+    await screen.findByText(`Showing ${formatCount(0)} of ${formatCount(2)} components.`);
+    expect(screen.queryByText(EMPTY_MESSAGE)).toBeNull();
+
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+
+    await screen.findByRole('grid', { name: GRID_NAME });
+    expect(stub.queries).toHaveLength(2);
+    expect(requestOf(stub, 2)).toEqual({ ...requestOf(stub, 1), offset: 2 });
+    expect(renderedNames()).toEqual([WIDGET_COMPONENT, LIST_COMPONENT]);
+    expect(screen.queryByRole('button', { name: ANY_PAGING_CONTROL })).toBeNull();
+  });
+
+  it('starts over from the authored first page, painting none of the old rows, when the data provider is replaced', async () => {
+    const earlier = sequenceProvider((query) =>
+      offsetOf(query) === 0
+        ? { data: [WIDGET_ROW, LIST_ROW], total: 4, nextOffset: 2 }
+        : { data: [CARD_ROW, PANEL_ROW], total: 4 },
+    );
+    const later = sequenceProvider(() => 'pending');
+    const { actions } = makeActions();
+    const user = userEvent.setup();
+    const node = makeNode({ query: { source: 'renders', sort: MOST_RENDERS_FIRST, limit: 2 } });
+
+    // One node, one query, two providers: a host rebinding a mounted panel to
+    // another session swaps the provider without remounting the node.
+    const view = render(
+      <DataProviderContext.Provider value={earlier.provider}>
+        <PanelSessionContext.Provider value={PANEL_SESSION_ID}>
+          <PanelActionsContext.Provider value={actions}>
+            <RenderTable node={node} />
+          </PanelActionsContext.Provider>
+        </PanelSessionContext.Provider>
+      </DataProviderContext.Provider>,
+    );
+
+    await screen.findByRole('grid', { name: GRID_NAME });
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+    await waitFor(() => {
+      expect(dataRows()).toHaveLength(4);
+    });
+    await user.click(within(rowFor(WIDGET_COMPONENT)).getByRole('button', { name: EXPAND_NAME }));
+    expect(detailRows()).toHaveLength(1);
+
+    view.rerender(
+      <DataProviderContext.Provider value={later.provider}>
+        <PanelSessionContext.Provider value={PANEL_SESSION_ID}>
+          <PanelActionsContext.Provider value={actions}>
+            <RenderTable node={node} />
+          </PanelActionsContext.Provider>
+        </PanelSessionContext.Provider>
+      </DataProviderContext.Provider>,
+    );
+
+    // The new provider is asked for the authored first page — not the offset
+    // the previous provider's pages reached — and while it loads nothing of the
+    // previous provider's is on screen, open rows included.
+    expect(later.queries).toHaveLength(1);
+    expect(requestOf(later, 1)).toEqual(requestOf(earlier, 1));
+    expect(screen.queryByRole('grid')).toBeNull();
+    expect(screen.queryByText(WIDGET_COMPONENT)).toBeNull();
+
+    act(() => {
+      later.settle(DATA_QUERY_DEFAULT_OFFSET, { data: [PANEL_ROW], total: 1 });
+    });
+
+    await screen.findByRole('grid', { name: GRID_NAME });
+    expect(renderedNames()).toEqual([PANEL_COMPONENT]);
+    expect(detailRows()).toHaveLength(0);
+    expect(earlier.queries).toHaveLength(2);
+  });
+});
+
+describe('RenderTable keyboard descriptions', () => {
+  /** The five columns whose header carries a definition, in display order. */
+  const DESCRIBED_COLUMNS: readonly ColumnLabel[] = [
+    'Triggers',
+    STABLE_INPUTS_COLUMN,
+    UNCLASSIFIED_COLUMN,
+    'Changed props',
+    'Phases',
+  ];
+
+  /**
+   * The tooltip trigger inside an element: the one descendant carrying an
+   * `aria-describedby`, which `Tooltip` merges onto the trigger it clones.
+   *
+   * @param container Where to look.
+   * @returns The trigger.
+   */
+  function triggerIn(container: HTMLElement): HTMLElement {
+    const triggers = [...container.querySelectorAll<HTMLElement>('[aria-describedby]')];
+
+    expect(triggers).toHaveLength(1);
+
+    const [trigger] = triggers;
+
+    if (trigger === undefined) {
+      throw new Error('no tooltip trigger was found');
+    }
+
+    return trigger;
+  }
+
+  /**
+   * The bubble a trigger is described by, resolved through its
+   * `aria-describedby` exactly as an assistive technology resolves it.
+   *
+   * @param trigger The trigger.
+   * @returns The bubble.
+   */
+  function bubbleOf(trigger: HTMLElement): HTMLElement {
+    const id = trigger.getAttribute('aria-describedby') ?? '';
+    const bubble = document.getElementById(id);
+
+    if (bubble === null) {
+      throw new Error(`aria-describedby "${id}" resolves to no element`);
+    }
+
+    expect(bubble.getAttribute('role')).toBe('tooltip');
+
+    return bubble;
+  }
+
+  /** Whether a bubble is being shown, by the class `Tooltip` couples to that state. */
+  function isOpen(bubble: HTMLElement): boolean {
+    return bubble.classList.contains('dg-is-open');
+  }
+
+  it('opens every header definition when Tab reaches it, and nests none in a sort button', async () => {
+    const stub = resolvingProvider(PROVIDER_ORDER);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid', { name: GRID_NAME });
+
+    // No header control holds a tooltip, so each sort button is named by its
+    // header text alone and no description hides behind a button's focus.
+    for (const header of screen.getAllByRole('columnheader')) {
+      for (const button of within(header).queryAllByRole('button')) {
+        expect(button.querySelector('[role="tooltip"]')).toBeNull();
+        expect(button.querySelector('[aria-describedby]')).toBeNull();
+      }
+    }
+    expect(screen.getByRole('button', { name: RENDERS_SORT_NAME })).toBeDefined();
+    expect(screen.getByRole('button', { name: TOTAL_SORT_NAME })).toBeDefined();
+
+    const triggers = DESCRIBED_COLUMNS.map((label) => {
+      const trigger = triggerIn(headerFor(label));
+
+      // The header text itself is the trigger, and a tab stop of its own.
+      expect(trigger.textContent).toBe(label);
+      expect(trigger.tabIndex).toBe(0);
+      expect(trigger.closest('button')).toBeNull();
+      expect(isOpen(bubbleOf(trigger))).toBe(false);
+
+      return trigger;
+    });
+
+    // From the last sort control, Tab walks the five definitions in display
+    // order, and each one opens as focus arrives and closes as it leaves.
+    act(() => {
+      screen.getByRole('button', { name: TOTAL_SORT_NAME }).focus();
+    });
+
+    let previous: HTMLElement | undefined;
+
+    for (const trigger of triggers) {
+      await user.tab();
+
+      expect(document.activeElement).toBe(trigger);
+      expect(isOpen(bubbleOf(trigger))).toBe(true);
+
+      if (previous !== undefined) {
+        expect(isOpen(bubbleOf(previous))).toBe(false);
+      }
+
+      previous = trigger;
+    }
+
+    // The two definitions that must never be read as one stay distinct.
+    expect(bubbleOf(triggerIn(headerFor(STABLE_INPUTS_COLUMN))).textContent).toMatch(
+      /evaluated and none of them had changed/i,
+    );
+    expect(bubbleOf(triggerIn(headerFor(UNCLASSIFIED_COLUMN))).textContent).toMatch(
+      /could not be evaluated/i,
+    );
+  });
+
+  it('makes an in-row description a tab stop only in the row the reader is in', async () => {
+    // Two components far above a median of two, so both counts are marked and
+    // both carry an explanation.
+    const quiet = ['ExampleCard', 'ExamplePanel', 'ExampleForm'].map((component) =>
+      makeRenderStat({
+        component,
+        renderCount: 2,
+        totalDurationMs: 24,
+        averageDurationMs: 12,
+        maxDurationMs: 16,
+        triggers: makeTriggers({ props: 1, unchanged: 1 }),
+        phaseCounts: makePhases({ mount: 1, update: 1 }),
+      }),
+    );
+    const loudWidget = makeRenderStat({ renderCount: 40, totalDurationMs: 1_600 });
+    const loudList = makeRenderStat({
+      component: LIST_COMPONENT,
+      renderCount: 50,
+      totalDurationMs: 2_000,
+    });
+    const stub = resolvingProvider([loudWidget, loudList, ...quiet]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    const grid = await screen.findByRole('grid', { name: GRID_NAME });
+
+    const figureOf = (component: string, count: number): HTMLElement =>
+      within(cellFor(rowFor(component), 'Renders')).getByText(formatCount(count));
+    const tabbableFigures = (): Element[] => [
+      ...grid.querySelectorAll('.dg-render-table__count-cell[tabindex="0"]'),
+    ];
+
+    // Before focus reaches any row, no figure is in the Tab sequence — yet each
+    // is still described, and the description still resolves.
+    for (const [component, count] of [
+      [WIDGET_COMPONENT, 40],
+      [LIST_COMPONENT, 50],
+    ] as const) {
+      const figure = figureOf(component, count);
+      expect(figure.getAttribute('tabindex')).toBeNull();
+      expect(bubbleOf(figure).textContent ?? '').toMatch(/median of the loaded rows/i);
+    }
+    expect(tabbableFigures()).toHaveLength(0);
+
+    // The reader arrives on the first loud row: its figure joins the Tab
+    // sequence, and no other row's does.
+    act(() => {
+      rowFor(WIDGET_COMPONENT).focus();
+    });
+
+    expect(figureOf(WIDGET_COMPONENT, 40).tabIndex).toBe(0);
+    expect(figureOf(LIST_COMPONENT, 50).getAttribute('tabindex')).toBeNull();
+    expect(tabbableFigures()).toEqual([figureOf(WIDGET_COMPONENT, 40)]);
+
+    // Tab from the row passes its disclosure control and lands on the figure,
+    // whose explanation opens.
+    await user.tab();
+    expect(document.activeElement).toBe(
+      within(rowFor(WIDGET_COMPONENT)).getByRole('button', { name: EXPAND_NAME }),
+    );
+    await user.tab();
+    expect(document.activeElement).toBe(figureOf(WIDGET_COMPONENT, 40));
+    expect(isOpen(bubbleOf(figureOf(WIDGET_COMPONENT, 40)))).toBe(true);
+
+    // Moving to the other loud row moves the stop with it.
+    act(() => {
+      rowFor(LIST_COMPONENT).focus();
+    });
+
+    expect(figureOf(LIST_COMPONENT, 50).tabIndex).toBe(0);
+    expect(figureOf(WIDGET_COMPONENT, 40).getAttribute('tabindex')).toBeNull();
+    expect(tabbableFigures()).toEqual([figureOf(LIST_COMPONENT, 50)]);
+    expect(isOpen(bubbleOf(figureOf(WIDGET_COMPONENT, 40)))).toBe(false);
+
+    // A pointer click on a figure outside the focused row puts focus on that
+    // figure's ROW, not on the figure, so the grid's arrow keys keep working
+    // from where the reader clicked.
+    await user.click(figureOf(WIDGET_COMPONENT, 40));
+    expect(document.activeElement).toBe(rowFor(WIDGET_COMPONENT));
+    await user.keyboard('{ArrowDown}');
+    expect(document.activeElement).toBe(rowFor(LIST_COMPONENT));
+  });
+
+  it('lets Tab reach the trigger description of an individual render in an open row', async () => {
+    const occurrence = makeOccurrence({
+      eventId: 'event-example-0011',
+      spanId: spanIdFor(11),
+      startTime: BASE_START_MS + 64,
+      durationMs: 8,
+      trigger: 'context',
+    });
+    const stat = makeRenderStat({
+      renderCount: 1,
+      totalDurationMs: 8,
+      averageDurationMs: 8,
+      maxDurationMs: 8,
+      triggers: makeTriggers({ context: 1 }),
+      phaseCounts: makePhases({ update: 1 }),
+      occurrences: [occurrence],
+      occurrencesTruncated: false,
+    });
+    const stub = resolvingProvider([stat]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid', { name: GRID_NAME });
+    await user.click(within(rowFor(WIDGET_COMPONENT)).getByRole('button', { name: EXPAND_NAME }));
+
+    const chip = triggerIn(onlyDetailRow());
+    expect(chip.getAttribute('data-trigger')).toBe('context');
+    expect(chip.tabIndex).toBe(0);
+    expect(bubbleOf(chip).textContent).toBe(formatRenderTriggerLabel('context'));
+    expect(isOpen(bubbleOf(chip))).toBe(false);
+
+    // Focus is on the disclosure control the reader just used; Tab moves on
+    // through the open row — its select control, then the chip.
+    await user.tab();
+    expect(document.activeElement).toBe(
+      within(onlyDetailRow()).getByRole('button', { name: SELECT_OCCURRENCE_NAME }),
+    );
+    await user.tab();
+    expect(document.activeElement).toBe(chip);
+    expect(isOpen(bubbleOf(chip))).toBe(true);
   });
 });

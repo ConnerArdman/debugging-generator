@@ -76,16 +76,19 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { DebuggenError } from '@debuggen/shared';
+
 import { PANEL_NODE_CATALOG } from './catalog.js';
 import { parsePanelSpecInput } from './input.js';
-import type { PanelNodeInput, PanelSpecInput } from './input.js';
+import type { PanelNodeInput, PanelSpecInput, StackNodeInput } from './input.js';
 import { normalizePanel } from './normalize.js';
 import type { NormalizeAnalysis, NormalizeContext } from './normalize.js';
+import { PANEL_NODE_ID_MAX_LENGTH } from './nodes/query.js';
 import { PANEL_SPEC_VERSION, parsePanelSpec } from './spec.js';
 import type { PanelNode, PanelSpec } from './spec.js';
 import { MAX_HEADLINE_LENGTH } from './summary.js';
 import type { Fact, Hypothesis } from './summary.js';
-import { validatePanelSpec } from './validate.js';
+import { PANEL_MAX_NODE_DEPTH, validatePanelSpec } from './validate.js';
 
 /*
  * ---------------------------------------------------------------------------
@@ -1100,6 +1103,233 @@ describe('normalizePanel layout recursion', () => {
     const spec = normalizeValid(parseInput(inputWith([])));
 
     expect(spec.layout).toEqual([]);
+  });
+
+  it('normalizes the deepest nesting the authoring schema accepts into a document step 3 accepts', () => {
+    // The authoring schema and the validator share one depth bound, so the
+    // deepest parsed document is one the internal gate must accept too.
+    let node: PanelNodeInput = { type: 'table', source: 'spans' };
+
+    for (let level = PANEL_MAX_NODE_DEPTH - 1; level >= 1; level -= 1) {
+      node = { type: 'stack', children: [node] };
+    }
+
+    const spec = normalizeValid(parseInput(inputWith([node])));
+    const [top] = preorderIds(spec.layout);
+
+    expect(top).toBe('layout.0');
+    expect(preorderIds(spec.layout)).toHaveLength(PANEL_MAX_NODE_DEPTH);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Layouts no parse produces: deep, cyclic and shared
+ *
+ * `normalizePanel` accepts a hand-assembled input as well as a parsed one, and
+ * nothing bounds the depth of the first kind. These cases hold the walk to its
+ * documented contract on inputs the authoring schema would never hand it: any
+ * depth normalizes without exhausting the call stack, with the ids a recursive
+ * walk would mint; a node inside its own subtree is a defect reported as
+ * `INTERNAL`; a node merely shared between positions is normalized once per
+ * position.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * The ids of a normalized layout in depth-first pre-order, collected without
+ * recursion so the helper itself survives a ten-thousand-level layout.
+ */
+function preorderIds(layout: readonly PanelNode[]): readonly string[] {
+  const ids: string[] = [];
+  const pending: PanelNode[] = [...layout].reverse();
+
+  for (let node = pending.pop(); node !== undefined; node = pending.pop()) {
+    ids.push(node.id);
+
+    if ('children' in node) {
+      for (let index = node.children.length - 1; index >= 0; index -= 1) {
+        const child = node.children[index];
+
+        if (child !== undefined) {
+          pending.push(child);
+        }
+      }
+    }
+  }
+
+  return ids;
+}
+
+/** The fallback form of an id, as `./normalize.ts` documents it. */
+function fallbackId(ordinal: number): string {
+  return `layout.node-${String(ordinal)}`;
+}
+
+/**
+ * The id a node takes under the documented rule: its path joined with `.` when
+ * that fits the internal id bound, otherwise the fallback form with its
+ * pre-order ordinal.
+ *
+ * Takes the length of the joined path separately so a caller can decide the
+ * rule for a node thousands of levels deep without building a path that long.
+ */
+function expectedId(joinedLength: number, joined: () => string, ordinal: number): string {
+  return joinedLength <= PANEL_NODE_ID_MAX_LENGTH ? joined() : fallbackId(ordinal);
+}
+
+describe('normalizePanel on layouts no parse produces', () => {
+  it('normalizes a ten-thousand-level layout without throwing, with pre-order ids', () => {
+    // Every container holds the next container first and a leaf second, so the
+    // pre-order visits the whole chain of containers before the first leaf, and
+    // the ordinal of each leaf therefore counts the entire chain below it. The
+    // expected ids are computed here independently of the implementation: a
+    // `.children.0` hop is eleven characters, so the joined path of a chain
+    // node at level L is 8 + 11 × (L − 1) long.
+    const depth = 10_000;
+    let node: PanelNodeInput = { type: 'table', source: 'spans' };
+
+    for (let level = depth - 1; level >= 1; level -= 1) {
+      node = { type: 'stack', children: [node, { type: 'eventLog', source: 'events' }] };
+    }
+
+    const hop = '.children.0';
+    const joinedLengthAt = (level: number): number => 'layout.0'.length + hop.length * (level - 1);
+    const expected: string[] = [];
+
+    // The chain, levels 1 to depth, is visited first: ordinals 0 to depth − 1.
+    for (let level = 1; level <= depth; level += 1) {
+      expected.push(
+        expectedId(joinedLengthAt(level), () => `layout.0${hop.repeat(level - 1)}`, level - 1),
+      );
+    }
+
+    // Then the leaves, deepest first, each the second child of the container
+    // one level above it: its joined path is as long as its chain sibling's.
+    for (let level = depth; level >= 2; level -= 1) {
+      const ordinal = depth + (depth - level);
+
+      expected.push(
+        expectedId(
+          joinedLengthAt(level),
+          () => `layout.0${hop.repeat(level - 2)}.children.1`,
+          ordinal,
+        ),
+      );
+    }
+
+    const input = inputWith([node]);
+    const normalize = (): PanelSpec => normalizePanel(input, ANALYSIS, CONTEXT);
+
+    expect(normalize).not.toThrow();
+
+    const ids = preorderIds(normalize().layout);
+
+    expect(ids).toEqual(expected);
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(ids.every((id) => id.length <= PANEL_NODE_ID_MAX_LENGTH)).toBe(true);
+    // Both forms occur, so the assertion above covers the switch between them.
+    expect(ids).toContain('layout.0.children.0');
+    expect(ids).toContain(fallbackId(depth - 1));
+  });
+
+  it('writes every node of a deep layout in the documented field order', () => {
+    let node: PanelNodeInput = { type: 'flame', title: 'Innermost', source: 'trace' };
+
+    for (let level = 40; level >= 1; level -= 1) {
+      node =
+        level % 2 === 0
+          ? { type: 'split', direction: 'vertical', children: [node, { type: 'table' }] }
+          : { type: 'section', title: 'Level heading', children: [node] };
+    }
+
+    const spec = normalizePanel(inputWith([node]), ANALYSIS, CONTEXT);
+    const pending: PanelNode[] = [...spec.layout];
+    const unexpected: string[] = [];
+
+    for (let current = pending.pop(); current !== undefined; current = pending.pop()) {
+      const keys = Object.keys(current).join(',');
+      const expected =
+        current.type === 'section'
+          ? 'type,id,title,children'
+          : current.type === 'split'
+            ? 'type,id,direction,children'
+            : current.type === 'flame'
+              ? 'type,id,title,query'
+              : 'type,id';
+
+      if (keys !== expected) {
+        unexpected.push(`${current.id}: ${keys}`);
+      }
+      if ('children' in current) {
+        pending.push(...current.children);
+      }
+    }
+
+    expect(unexpected).toEqual([]);
+  });
+
+  it('throws an INTERNAL DebuggenError for a node inside its own subtree, never a RangeError', () => {
+    // A direct self-reference, and one closed two levels further down.
+    const selfChildren: PanelNodeInput[] = [];
+    const selfContaining: StackNodeInput = { type: 'stack', children: selfChildren };
+    selfChildren.push(selfContaining);
+
+    const outerChildren: PanelNodeInput[] = [{ type: 'table', source: 'spans' }];
+    const outer: StackNodeInput = { type: 'stack', children: outerChildren };
+    outerChildren.push({
+      type: 'section',
+      children: [{ type: 'split', children: [{ type: 'table', source: 'spans' }, outer] }],
+    });
+
+    for (const [layout, level] of [
+      [[selfContaining], 2],
+      [[{ type: 'table', source: 'spans' }, outer], 4],
+    ] as const) {
+      let thrown: unknown;
+
+      try {
+        normalizePanel(inputWith(layout), ANALYSIS, CONTEXT);
+      } catch (error) {
+        thrown = error;
+      }
+
+      expect(thrown).toBeInstanceOf(DebuggenError);
+      expect(thrown).not.toBeInstanceOf(RangeError);
+      expect(DebuggenError.is(thrown) ? thrown.code : undefined).toBe('INTERNAL');
+      expect(DebuggenError.is(thrown) ? thrown.details : undefined).toEqual({ level });
+    }
+  });
+
+  it('normalizes a shared subtree once per position, with path-distinct ids', () => {
+    // The same authored object at three positions, none of them inside another:
+    // not a cycle, so each position is normalized on its own.
+    const shared: PanelNodeInput = {
+      type: 'section',
+      title: 'Shared group',
+      children: [{ type: 'table', source: 'spans' }],
+    };
+    const spec = normalizeValid(inputWith([shared, { type: 'stack', children: [shared, shared] }]));
+
+    expect(preorderIds(spec.layout)).toEqual([
+      'layout.0',
+      'layout.0.children.0',
+      'layout.1',
+      'layout.1.children.0',
+      'layout.1.children.0.children.0',
+      'layout.1.children.1',
+      'layout.1.children.1.children.0',
+    ]);
+
+    const stack = nodeOfType(nodeAt(spec, 1), 'stack');
+    const first = childAt(stack, 0);
+    const second = childAt(stack, 1);
+
+    // Two positions, two distinct output objects: the document shares no
+    // structure between them, whatever the input shared.
+    expect(first).not.toBe(second);
+    expect(first).not.toBe(nodeAt(spec, 0));
+    expect({ ...first, id: '', children: [] }).toEqual({ ...second, id: '', children: [] });
   });
 });
 

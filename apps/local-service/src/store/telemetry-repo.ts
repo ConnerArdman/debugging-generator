@@ -92,13 +92,25 @@
  *
  * ## What this module does not do
  *
- * It returns rows and counts. Aggregation lives in
+ * It returns rows, counts and occurrence groups. Aggregation proper lives in
  * `packages/telemetry/src/aggregate/*` — render statistics, request and query
- * groups, timeline lanes, the component tree snapshot and the metric set — and
- * `../panels/data.ts` is what maps a panel's `DataQuery` onto this repository
- * plus those aggregates. A render or request aggregate computed here would be a
- * second implementation of a shape a panel already validates against, so there
- * is none.
+ * groups with their duplicate counts, timeline lanes, the component tree
+ * snapshot and the metric set — and `../panels/data.ts` is what maps a panel's
+ * `DataQuery` onto this repository plus those aggregates. A render or request
+ * aggregate computed here would be a second implementation of a shape a panel
+ * already validates against, so there is none.
+ *
+ * The one grouping it does compute is the occurrence count: every
+ * `DataQuerySort` member is accepted, and `count_desc` — largest group first —
+ * needs a count per group to be a total, pageable order.
+ * {@link TelemetryRepo.queryGroups} returns one entry per distinct value of a
+ * key drawn from a closed vocabulary ({@link TELEMETRY_GROUP_KEYS}) with its
+ * count, first event and timing over the **readable** events of the filter,
+ * ordered `count DESC, key ASC, first ingest_seq ASC`;
+ * {@link TelemetryRepo.query} under `count_desc` ranks rows by the count of the
+ * group each belongs to, through a window function over the stored rows — the
+ * basis `total` uses. Neither is an alias for a row ordering, and neither
+ * computes what an aggregate shape adds on top of a count.
  *
  * ## Failure discipline
  *
@@ -125,8 +137,16 @@
  * @packageDocumentation
  */
 
-import { DATA_QUERY_DEFAULT_LIMIT, DATA_QUERY_MAX_LIMIT } from '@debuggen/panel-schema';
-import type { IdResolution } from '@debuggen/panel-schema';
+import { Buffer } from 'node:buffer';
+import { setImmediate as yieldToEventLoop } from 'node:timers/promises';
+
+import {
+  DATA_QUERY_DEFAULT_LIMIT,
+  DATA_QUERY_MAX_LIMIT,
+  DATA_QUERY_SORTS,
+  isDataQuerySort,
+} from '@debuggen/panel-schema';
+import type { DataQuerySort, IdResolution } from '@debuggen/panel-schema';
 import { DebuggenError, err, isErr, noopLogger, ok } from '@debuggen/shared';
 import type { CaptureId, Logger, Result, SessionId } from '@debuggen/shared';
 import {
@@ -257,31 +277,219 @@ export const CANONICAL_ORDER_BY = 'start_time ASC, producer_id ASC, seq ASC, ing
 export const DURATION_DESC_ORDER_BY = `duration DESC, ${CANONICAL_ORDER_BY}`;
 
 /**
- * The orderings a caller may ask for, and the `ORDER BY` clause each maps to.
+ * How a page of telemetry rows, or of occurrence groups, may be ordered.
  *
- * Both members are `DataQuerySort` values from `@debuggen/panel-schema`, which
- * is what lets `../panels/data.ts` forward a panel node's `sort` field
- * unchanged. That vocabulary's third member, `count_desc`, is absent on
- * purpose: it orders *aggregates* by occurrence count, which this row store
- * does not compute (see this module's overview), and accepting it here would
- * answer a caller with rows sorted by something they did not ask for.
+ * **Exactly** `DataQuerySort` from `@debuggen/panel-schema`, not a subset of
+ * it: `../panels/data.ts` forwards a panel node's `sort` field unchanged, and
+ * the two ordering tables below are typed `Record<TelemetrySort, …>`, so a
+ * member added to that vocabulary fails this module's compilation until both
+ * tables say what it means.
  */
-const ORDERING_BY_SORT: Readonly<Record<TelemetrySort, string>> = Object.freeze({
-  start_asc: CANONICAL_ORDER_BY,
-  duration_desc: DURATION_DESC_ORDER_BY,
-});
+export type TelemetrySort = DataQuerySort;
 
 /**
- * The sort values {@link TelemetryQuery.sort} accepts, as a tuple, for the
- * message of a refusal and for a suite that wants to exercise each one.
+ * The sort values {@link TelemetryQuery.sort} and
+ * {@link TelemetryGroupQuery.sort} accept — the panel-data vocabulary itself,
+ * re-exported rather than restated, for the message of a refusal and for a
+ * suite that wants to exercise each one.
  */
-export const TELEMETRY_SORTS: readonly TelemetrySort[] = Object.freeze([
-  'start_asc',
-  'duration_desc',
-]);
+export const TELEMETRY_SORTS: readonly TelemetrySort[] = DATA_QUERY_SORTS;
 
-/** How a page of telemetry rows may be ordered. */
-export type TelemetrySort = 'start_asc' | 'duration_desc';
+/* -------------------------------------------------------------------------------------------------
+ * Grouping
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * The keys an occurrence count may group rows by — a **closed** vocabulary.
+ *
+ * `count_desc` means "largest group first", so answering it needs a group, and
+ * the group is always one of these: the operation `name`, the span `kind`, the
+ * `traceId` of an interaction, the service-assigned `requestKey` that makes
+ * byte-identical requests collide (AAP 0.5.2), and the `component` a render
+ * names. Each maps to a SQL expression fixed in {@link GROUP_KEY_SQL}; a
+ * caller picks a member and never supplies text, so no statement below ever
+ * contains a caller's value.
+ */
+export const TELEMETRY_GROUP_KEYS = Object.freeze([
+  'name',
+  'kind',
+  'traceId',
+  'requestKey',
+  'component',
+] as const);
+
+/** One member of {@link TELEMETRY_GROUP_KEYS}. */
+export type TelemetryGroupKey = (typeof TELEMETRY_GROUP_KEYS)[number];
+
+/**
+ * The group a `count_desc` row page ranks by when the caller names none:
+ * `name`.
+ *
+ * The operation name is the one key every row carries (the column is
+ * `NOT NULL`), so the default puts no row in the ungrouped tail, and "the
+ * operations that happened most often, first" is what largest-group-first
+ * means for a flat list of spans or events.
+ */
+export const TELEMETRY_DEFAULT_GROUP_KEY: TelemetryGroupKey = 'name';
+
+/**
+ * The component attribute as SQL, `NULL` for a document that is not valid JSON.
+ *
+ * Every JSON function below is reached only through this guard. SQLite's JSON
+ * functions raise `malformed JSON` on an unparseable document rather than
+ * answering `NULL`, so one poisoned row would otherwise fail a whole filtered
+ * or grouped read — the opposite of this module's rule that an unreadable row
+ * is skipped and counted, never allowed to blank out a panel. The nested
+ * `CASE` is what guarantees the order: its branch is evaluated only after
+ * `json_valid` has answered.
+ */
+const COMPONENT_VALUE_SQL = `CASE WHEN json_valid(event) THEN json_extract(event, '${COMPONENT_JSON_PATH}') END`;
+
+/**
+ * The component group expression: the `component` attribute when it is a JSON
+ * string, and `NULL` otherwise — including for a document that is not valid
+ * JSON (see {@link COMPONENT_VALUE_SQL}).
+ *
+ * The attribute bag is open (`z.record(z.string(), z.unknown())`), so a
+ * producer may put a number or an object under the key; typing the
+ * expression to text is what keeps a group key a string and keeps such a row
+ * out of every component group rather than grouping it under a stringified
+ * value the filter could never match.
+ */
+const COMPONENT_GROUP_SQL = `CASE WHEN json_valid(event) THEN CASE WHEN json_type(event, '${COMPONENT_JSON_PATH}') = 'text' THEN json_extract(event, '${COMPONENT_JSON_PATH}') END END`;
+
+/**
+ * The SQL expression each group key evaluates to, per row.
+ *
+ * `NULL` means "belongs to no group": `request_key` is `NULL` for an event
+ * that is not a request, and {@link COMPONENT_GROUP_SQL} is `NULL` for an
+ * event that names no component. Every expression is a module constant.
+ */
+const GROUP_KEY_SQL: Readonly<Record<TelemetryGroupKey, string>> = Object.freeze({
+  name: 'name',
+  kind: 'kind',
+  traceId: 'trace_id',
+  requestKey: 'request_key',
+  component: COMPONENT_GROUP_SQL,
+});
+
+/** Widened view of {@link TELEMETRY_GROUP_KEYS}, for {@link isTelemetryGroupKey}. */
+const TELEMETRY_GROUP_KEY_VALUES: readonly string[] = TELEMETRY_GROUP_KEYS;
+
+/**
+ * Narrows an untrusted value to a {@link TelemetryGroupKey} by membership.
+ *
+ * Membership in the tuple rather than `key in GROUP_KEY_SQL`, which would
+ * also accept `constructor` and every other name on `Object.prototype`.
+ *
+ * @param value The value to test.
+ * @returns Whether it is a group key.
+ */
+export function isTelemetryGroupKey(value: unknown): value is TelemetryGroupKey {
+  return typeof value === 'string' && TELEMETRY_GROUP_KEY_VALUES.includes(value);
+}
+
+/**
+ * The `count_desc` row ordering for one group key: rows of the most frequent
+ * group first, a group's rows kept together, and each group's rows in
+ * canonical order.
+ *
+ * `COUNT(key) OVER (PARTITION BY key)` is the occurrence count of the row's own
+ * group, evaluated over exactly the filtered stored rows — the same set, and
+ * the same basis, `total` counts: a row the page then skips as unreadable was
+ * still ranked, exactly as it is still counted in `total`, and the page reports
+ * it in {@link TelemetryPage.skipped}. A document that is not valid JSON has no
+ * component, so under that key it ranks with the rows that belong to no group.
+ * `COUNT(key)` rather than `COUNT(*)` counts only non-`NULL` keys, so a
+ * row that belongs to no group ranks with a count of zero: after every group,
+ * in canonical order. The key itself separates two groups of equal size, and
+ * the canonical chain orders rows inside a group and makes the whole order
+ * total, which is what keeps a multi-page walk from repeating or skipping a
+ * row.
+ *
+ * @param groupBy The group key.
+ * @returns The `ORDER BY` clause.
+ */
+function countDescOrderBy(groupBy: TelemetryGroupKey): string {
+  const key = GROUP_KEY_SQL[groupBy];
+
+  return `COUNT(${key}) OVER (PARTITION BY ${key}) DESC, ${key} ASC, ${CANONICAL_ORDER_BY}`;
+}
+
+/**
+ * The row orderings a caller may ask for, and the `ORDER BY` clause each maps
+ * to — one entry per `DataQuerySort` member, enforced by the type.
+ *
+ * `start_asc` is the canonical chain and `duration_desc` puts the chain behind
+ * `duration DESC`. `count_desc` is **not** an alias for either: it ranks each
+ * row by the occurrence count of the group it belongs to under
+ * {@link TelemetryQuery.groupBy} (see {@link countDescOrderBy}), which is what
+ * "largest group first" means for a list of rows. A page of the groups
+ * themselves — one entry per group, with its count — is
+ * {@link TelemetryRepo.queryGroups}.
+ */
+const ORDERING_BY_SORT: Readonly<Record<TelemetrySort, (groupBy: TelemetryGroupKey) => string>> =
+  Object.freeze({
+    start_asc: () => CANONICAL_ORDER_BY,
+    duration_desc: () => DURATION_DESC_ORDER_BY,
+    count_desc: countDescOrderBy,
+  });
+
+/**
+ * Compares two group keys the way SQLite's default `BINARY` collation does: by
+ * their UTF-8 bytes.
+ *
+ * JavaScript's `<` compares UTF-16 code units, which disagrees with byte order
+ * for a character above U+FFFF against one in U+E000–U+FFFF; comparing the
+ * encoded bytes keeps the group order identical to the `key ASC` tie-break of
+ * the row ordering in {@link countDescOrderBy}, so a group and its rows page in
+ * the same order on both surfaces.
+ *
+ * @param left One key.
+ * @param right The other.
+ * @returns Negative, zero or positive, as for `Array.prototype.sort`.
+ */
+function compareKeysBinary(left: string, right: string): number {
+  return Buffer.compare(Buffer.from(left, 'utf8'), Buffer.from(right, 'utf8'));
+}
+
+/**
+ * The tie-break every group ordering ends in: the group key, which is unique
+ * per group, then the group's first arrival number.
+ *
+ * The key alone already makes the order total — one group per distinct key —
+ * and the arrival number states the second, always-distinct key explicitly, so
+ * the order stays total even if a future key were to compare two distinct
+ * values as equal.
+ *
+ * @param left One group.
+ * @param right The other.
+ * @returns Negative, zero or positive, as for `Array.prototype.sort`.
+ */
+function groupTieBreak(left: TelemetryGroup, right: TelemetryGroup): number {
+  return compareKeysBinary(left.key, right.key) || left.firstIngestSeq - right.firstIngestSeq;
+}
+
+/**
+ * The group orderings, one comparator per `DataQuerySort` member, enforced by
+ * the type.
+ *
+ * - `count_desc` — most occurrences first. The ordering the grouped panel
+ *   sources open with, and the reason this read exists.
+ * - `duration_desc` — most total time first, the group-level reading of
+ *   "longest first", matching `totalDurationMs` in
+ *   `packages/telemetry/src/aggregate/*`.
+ * - `start_asc` — the group whose earliest occurrence started first.
+ */
+const GROUP_ORDERING_BY_SORT: Readonly<
+  Record<TelemetrySort, (left: TelemetryGroup, right: TelemetryGroup) => number>
+> = Object.freeze({
+  count_desc: (left, right) => right.count - left.count || groupTieBreak(left, right),
+  duration_desc: (left, right) =>
+    right.totalDuration - left.totalDuration || groupTieBreak(left, right),
+  start_asc: (left, right) =>
+    left.firstStartTime - right.firstStartTime || groupTieBreak(left, right),
+});
 
 /* -------------------------------------------------------------------------------------------------
  * Bounds
@@ -334,14 +542,33 @@ export const EXISTENCE_LOOKUP_CHUNK_SIZE = 500;
  * and then fail — losing evidence from a capture in flight to reclaim space
  * from one that ended. Bounded batches inside short transactions turn that into
  * a brief wait instead.
+ *
+ * The wait is one batch for a writer in **this** process too, not only for
+ * another connection: `node:sqlite` is synchronous, so the purge yields to the
+ * event loop between batches (see {@link TelemetryRepo.deleteOlderThan}), and
+ * an ingest request that arrived during a batch is served before the next one
+ * starts.
  */
 export const DEFAULT_PURGE_BATCH_SIZE = 5000;
+
+/**
+ * The largest batch a purge will run: **5 000** rows, the default itself.
+ *
+ * `batchSize` is a tuning knob, and what it tunes is how long one batch holds
+ * the write lock and the event loop. The default is already the largest hold
+ * this service accepts, so a caller may ask for smaller batches but not for
+ * larger ones. A larger request is **clamped**, not refused — the same policy
+ * as {@link TELEMETRY_QUERY_MAX_LIMIT} — because the sweep still has a correct
+ * answer to give: it deletes everything it was asked to, in batches of this
+ * size.
+ */
+export const MAX_PURGE_BATCH_SIZE = DEFAULT_PURGE_BATCH_SIZE;
 
 /* -------------------------------------------------------------------------------------------------
  * Statement text
  *
- * Every string below is assembled at module load from column names, placeholder
- * counts and the two ordering constants — never from a value. That is the
+ * Every string below is assembled from column names, placeholder counts and the
+ * module's ordering and grouping constants — never from a value. That is the
  * injection defence and the privacy guarantee at once: `Store.statement` caches
  * on the text, so a text containing a value would both leak it into the cache
  * and defeat the cache, and no parameter can reach SQLite except through a
@@ -413,13 +640,18 @@ ON CONFLICT(id) DO NOTHING
 RETURNING ingest_seq`;
 
 /**
- * Reads the arrival number of a row a replay conflicted with.
+ * Reads the complete stored row an insert conflicted with.
  *
- * Scoped to the session as well as the id so a repository call can never report
- * a number from another session's row, even though `id` is globally unique.
+ * Keyed on `id` alone — the column the conflict was raised on — rather than on
+ * `(id, session_id)`, so the insert path learns *whose* row holds the id instead
+ * of only that the caller's session does not. Owning session, arrival number
+ * and the authoritative document all come back, because deciding whether the
+ * suppressed insert was a genuine replay means comparing the whole stored event
+ * with the candidate, and reporting it means returning the stored copy (see
+ * {@link TelemetryRepo.insertMany}).
  */
-const SELECT_INGEST_SEQ_BY_ID_SQL = `SELECT ingest_seq FROM ${TABLE}
-WHERE id = ? AND session_id = ?`;
+const SELECT_STORED_BY_ID_SQL = `SELECT ingest_seq, session_id, event FROM ${TABLE}
+WHERE id = ?`;
 
 /** The two columns every read below needs: the arrival number and the document. */
 const SELECTED = 'ingest_seq, event';
@@ -450,39 +682,68 @@ GROUP BY kind`;
 const COUNT_BY_SESSION_SQL = `SELECT COUNT(*) AS total FROM ${TABLE} WHERE session_id = ?`;
 
 /**
- * Deletes one bounded batch of a session's rows.
+ * The order every purge batch is taken in: `start_time`, then the arrival
+ * number that can never tie.
+ *
+ * It is the trailing key sequence of both schema-version-2 purge indexes —
+ * `idx_telemetry_events_start_time_ingest_seq (start_time, ingest_seq)` and
+ * `idx_telemetry_events_session_id_start_time_ingest_seq (session_id,
+ * start_time, ingest_seq)`, added by `./migrations.ts` — so each batch's
+ * subquery is an ordered **covering** index range read that stops after
+ * `LIMIT` entries: no table scan, and no temporary B-tree to sort the whole
+ * predicate before the first row can be returned. `ingest_seq` closes the key
+ * so a batch boundary between two rows of equal `start_time` is deterministic.
+ */
+const PURGE_ORDER_BY = 'start_time, ingest_seq';
+
+/**
+ * Deletes one bounded batch of a session's rows. Binds the session id, then
+ * the batch size.
  *
  * The subquery form is used rather than `DELETE … LIMIT`, which needs a
  * compile-time SQLite option (`SQLITE_ENABLE_UPDATE_DELETE_LIMIT`) this service
- * cannot assume of the runtime's bundled build. Ordering the subquery by
- * `ingest_seq` makes each batch a contiguous slice, which is both the cheapest
- * traversal and the one whose progress is observable.
+ * cannot assume of the runtime's bundled build; the outer `DELETE` then reaches
+ * each chosen row through the primary key. Read from
+ * `idx_telemetry_events_session_id_start_time_ingest_seq` (see
+ * {@link PURGE_ORDER_BY}).
+ *
+ * Exported, like the other two purge statements, so the suite explains the
+ * exact text the purge runs rather than a copy of it.
  */
-const DELETE_SESSION_BATCH_SQL = `DELETE FROM ${TABLE}
+export const DELETE_SESSION_BATCH_SQL = `DELETE FROM ${TABLE}
 WHERE ingest_seq IN (
-  SELECT ingest_seq FROM ${TABLE} WHERE session_id = ? ORDER BY ingest_seq LIMIT ?
-)`;
-
-/** Deletes one bounded batch of rows older than a cutoff. See {@link DELETE_SESSION_BATCH_SQL}. */
-const DELETE_OLDER_THAN_BATCH_SQL = `DELETE FROM ${TABLE}
-WHERE ingest_seq IN (
-  SELECT ingest_seq FROM ${TABLE} WHERE start_time < ? ORDER BY ingest_seq LIMIT ?
+  SELECT ingest_seq FROM ${TABLE} WHERE session_id = ? ORDER BY ${PURGE_ORDER_BY} LIMIT ?
 )`;
 
 /**
- * Deletes one bounded batch of rows older than a cutoff within named sessions.
+ * Deletes one bounded batch of rows, of every session, older than a cutoff.
+ * Binds the cutoff, then the batch size.
  *
- * @param sessionSlots How many session ids the `IN` list binds.
- * @returns The statement text for that width.
+ * Read from `idx_telemetry_events_start_time_ingest_seq` as a range ending at
+ * the cutoff. See {@link DELETE_SESSION_BATCH_SQL}.
  */
-function deleteOlderThanForSessionsSql(sessionSlots: number): string {
-  return `DELETE FROM ${TABLE}
+export const DELETE_OLDER_THAN_BATCH_SQL = `DELETE FROM ${TABLE}
+WHERE ingest_seq IN (
+  SELECT ingest_seq FROM ${TABLE} WHERE start_time < ? ORDER BY ${PURGE_ORDER_BY} LIMIT ?
+)`;
+
+/**
+ * Deletes one bounded batch of **one** session's rows older than a cutoff.
+ * Binds the session id, the cutoff, then the batch size.
+ *
+ * One session per statement, not an `IN` list of them: an index range over
+ * `(session_id, start_time, ingest_seq)` is only ordered by `start_time` within
+ * one `session_id`, so a list of sessions would force a temporary B-tree to
+ * merge the ranges before `LIMIT` could apply. The session-restricted purge
+ * therefore walks its sessions one at a time, each through the same prepared
+ * statement.
+ */
+export const DELETE_SESSION_OLDER_THAN_BATCH_SQL = `DELETE FROM ${TABLE}
 WHERE ingest_seq IN (
   SELECT ingest_seq FROM ${TABLE}
-  WHERE start_time < ? AND session_id IN (${placeholders(sessionSlots)})
-  ORDER BY ingest_seq LIMIT ?
+  WHERE session_id = ? AND start_time < ?
+  ORDER BY ${PURGE_ORDER_BY} LIMIT ?
 )`;
-}
 
 /**
  * Selects the subset of a column's values that a session holds.
@@ -502,6 +763,31 @@ function existenceSql(column: string, slots: number, byCapture: boolean): string
 
   return `SELECT DISTINCT ${column} FROM ${TABLE}
 WHERE session_id = ?${capture} AND ${column} IN (${placeholders(slots)})`;
+}
+
+/**
+ * Selects every filtered row that belongs to a group under one key, with its
+ * key, in arrival order.
+ *
+ * The rows are reconstructed and validated before they are counted — see
+ * {@link TelemetryRepo.queryGroups} — so the statement returns the document
+ * rather than aggregating in SQL: SQLite cannot tell a stored row that no
+ * longer matches the event schema from one that does, and a group count or a
+ * representative event taken from such a row would cite evidence no read can
+ * show. Arrival order makes the first row seen for a key its smallest
+ * `ingest_seq`, which is the group's representative when it is readable.
+ *
+ * @param groupBy The group key — a vocabulary member, never caller text.
+ * @param clause The `WHERE` clause from the filter planner: column names and
+ * placeholders only.
+ * @returns The statement text; binds the filter values only.
+ */
+function groupRowsSql(groupBy: TelemetryGroupKey, clause: string): string {
+  const key = GROUP_KEY_SQL[groupBy];
+
+  return `SELECT ${SELECTED}, ${key} AS group_key FROM ${TABLE}
+WHERE ${clause} AND ${key} IS NOT NULL
+ORDER BY ingest_seq ASC`;
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -528,15 +814,17 @@ export interface InsertTelemetryResult {
    * The batch as the store now holds it, in the order it was offered, each
    * event carrying its `ingestSeq`.
    *
-   * Every offered event appears, whether it was written or skipped: a skipped
-   * event carries the arrival number of the row already in the table, read
-   * back rather than invented, so `../telemetry/live-tail.ts` can broadcast
-   * persisted objects and `correlate.ts` can use `ingestSeq` as its final
-   * ordering tie-break without knowing which rows were replays.
+   * Every offered event appears, whether it was written or skipped, so
+   * `../telemetry/live-tail.ts` can broadcast persisted objects and
+   * `correlate.ts` can use `ingestSeq` as its final ordering tie-break without
+   * knowing which rows were replays.
    *
-   * For a skipped event the *content* is the caller's and the stored row is
-   * untouched — the two are byte-identical in the only case that produces a
-   * conflict, a producer replaying its own buffered batch.
+   * A skipped event is **the stored row itself**, reconstructed and validated
+   * with its own arrival number — never the caller's candidate. It is only ever
+   * skipped after the whole stored event was compared with the candidate and
+   * found identical (see {@link TelemetryRepo.insertMany}), so the two agree in
+   * every field; returning the stored copy is what makes that agreement a
+   * property of the result rather than an assumption about the producer.
    */
   readonly events: TelemetryEvent[];
 
@@ -617,8 +905,26 @@ export interface TelemetryQuery {
    */
   readonly requestKey?: string | undefined;
 
-  /** How to order the page. Defaults to `'start_asc'`, the canonical order. */
+  /**
+   * How to order the page. Defaults to `'start_asc'`, the canonical order.
+   *
+   * Every `DataQuerySort` member is accepted. `'count_desc'` ranks rows by the
+   * size of the group each belongs to under {@link TelemetryQuery.groupBy} —
+   * see {@link TelemetryRepo.query} — and a page of the groups themselves is
+   * {@link TelemetryRepo.queryGroups}.
+   */
   readonly sort?: TelemetrySort | undefined;
+
+  /**
+   * The group `'count_desc'` ranks rows by. Defaults to
+   * {@link TELEMETRY_DEFAULT_GROUP_KEY}.
+   *
+   * It decides ordering only — it never narrows the rows, so `total` is the
+   * same whichever key is named — and the other two sorts do not read it. An
+   * unknown key is still refused under every sort, because a caller naming one
+   * has a bug the ordering would otherwise hide.
+   */
+  readonly groupBy?: TelemetryGroupKey | undefined;
 
   /**
    * How many rows to return. Defaults to {@link TELEMETRY_QUERY_DEFAULT_LIMIT}
@@ -690,6 +996,91 @@ export interface TelemetryPage {
   readonly skipped?: number;
 }
 
+/**
+ * A grouped read: the same narrowing as {@link TelemetryQuery}, over the groups
+ * the filtered rows form under one key.
+ *
+ * `groupBy` is **required** here — a page of groups with no named key has no
+ * meaning — and `sort` defaults to `'count_desc'`, the ordering this read
+ * exists to answer. `limit` and `offset` count **groups**, with the same
+ * default, ceiling and refusals as a row page.
+ */
+export interface TelemetryGroupQuery extends TelemetryQuery {
+  /** The key the filtered rows are grouped by. */
+  readonly groupBy: TelemetryGroupKey;
+
+  /** How to order the groups. Defaults to `'count_desc'`. */
+  readonly sort?: TelemetrySort | undefined;
+}
+
+/**
+ * One group of rows sharing a key value, as {@link TelemetryRepo.queryGroups}
+ * reports it.
+ *
+ * Counts and identifiers rather than an aggregate's full shape: render
+ * statistics, request groups with their duplicate counts and the other panel
+ * result shapes stay in `packages/telemetry/src/aggregate/*`. What this carries
+ * is what a count-ordered, pageable list needs from SQL — the size of the
+ * group, the timing it can be ranked by, and a stored event to cite for it.
+ */
+export interface TelemetryGroup {
+  /**
+   * The value the group's rows share. Captured data for `name` and
+   * `component`, so it is returned to the caller and never logged.
+   */
+  readonly key: string;
+
+  /**
+   * How many readable filtered events the group holds; always at least one. A
+   * stored row that no longer reconstructs as an event is not counted — see
+   * {@link TelemetryGroupPage.skipped}.
+   */
+  readonly count: number;
+
+  /**
+   * The id of the group's first readable event — the smallest `ingest_seq`
+   * among the events counted — so a panel fact about the group cites an event
+   * every read of the store can show.
+   */
+  readonly firstEventId: string;
+
+  /** That event's arrival number, the group order's final tie-break. */
+  readonly firstIngestSeq: number;
+
+  /** The earliest `startTime` among the group's counted events, unrounded. */
+  readonly firstStartTime: number;
+
+  /** The sum of the counted events' durations in milliseconds, unrounded. */
+  readonly totalDuration: number;
+}
+
+/** One page of groups, with everything a pager needs to continue. */
+export interface TelemetryGroupPage {
+  /** The groups of this page, in the requested order. */
+  readonly groups: TelemetryGroup[];
+
+  /**
+   * How many groups the filter forms in full, before `limit` and `offset`.
+   * Rows whose key is `NULL` belong to no group and are not counted, and
+   * neither is a group whose every row is unreadable.
+   */
+  readonly total: number;
+
+  /**
+   * The offset to ask for next, or **absent** when this page is the last one —
+   * the same contract as {@link TelemetryPage.nextOffset}, in groups.
+   */
+  readonly nextOffset?: number;
+
+  /**
+   * How many filtered rows carrying a key were left out of every group because
+   * they no longer reconstruct as an event — the grouped counterpart of
+   * {@link TelemetryPage.skipped}, and **absent** when there were none. Each
+   * such row is also reported at `warn` by arrival number alone.
+   */
+  readonly skipped?: number;
+}
+
 /** What {@link createTelemetryRepo} is constructed from. */
 export interface TelemetryRepoDeps {
   /**
@@ -728,7 +1119,8 @@ export interface DeleteOlderThanOptions {
 
   /**
    * How many rows one statement deletes before committing. Defaults to
-   * {@link DEFAULT_PURGE_BATCH_SIZE}; must be a positive integer.
+   * {@link DEFAULT_PURGE_BATCH_SIZE}; must be a positive integer, and is
+   * clamped to {@link MAX_PURGE_BATCH_SIZE}.
    */
   readonly batchSize?: number | undefined;
 }
@@ -740,10 +1132,13 @@ export interface DeleteOlderThanOptions {
 /**
  * The telemetry repository, over the session store.
  *
- * Every method answers with a {@link Result} and **never throws**, and every
- * method is synchronous underneath: `node:sqlite` is a synchronous binding and
+ * Every method answers with a {@link Result} and **never throws**. Every method
+ * but the two purges is synchronous: `node:sqlite` is a synchronous binding and
  * `Store.transaction` commits before it returns, so a successful
- * {@link TelemetryRepo.insertMany} means committed rows.
+ * {@link TelemetryRepo.insertMany} means committed rows. The purges
+ * ({@link TelemetryRepo.deleteBySession}, {@link TelemetryRepo.deleteOlderThan})
+ * answer with a promise of a `Result` that never rejects, because they yield
+ * to the event loop between batches.
  *
  * Nothing is mutated in place. A returned event is reconstructed from its row
  * and validated, so a caller may keep it without ever observing a value the
@@ -752,13 +1147,30 @@ export interface DeleteOlderThanOptions {
 export interface TelemetryRepo {
   /**
    * Writes a batch of attributed, **already-redacted** events in one
-   * transaction, skipping any whose `id` the table already holds.
+   * transaction, skipping any whose `id` the table already holds **as the
+   * identical event**.
    *
    * Refuses the whole batch, without writing anything, when an element does not
    * match the persisted event schema — including a missing `sessionId` or
    * `captureId`, which is not a partially attributed event but one that should
    * never have been ingested (AAP 0.5.1, 0.7.1). The refusal names the field
    * paths that failed and never a value.
+   *
+   * A conflict on `id` is an idempotent replay only when the stored event and
+   * the candidate are the same event. The stored row is read in full, validated
+   * and compared canonically with the candidate — key order inside objects is
+   * not significant, numbers compare exactly, and an optional field that is
+   * absent equals one that is `undefined`, because the stored JSON document
+   * cannot tell those apart. An exact replay is skipped and reported as the
+   * **stored** event. Anything else rolls the whole batch back — including the
+   * rows written earlier in it, and including two differing copies of one id
+   * inside the same batch — with `STORE_ERROR` and one of three reasons:
+   *
+   * - `event-id-reused` — the id belongs to another session's row;
+   * - `event-id-conflict` — same session, different content; `details.fields`
+   *   names the differing top-level fields (never a value);
+   * - `stored-event-unreadable` — the stored row no longer reconstructs, so the
+   *   replay cannot be confirmed.
    *
    * @param events The batch, in producer order. An empty batch is a successful
    * no-op that does not touch the database.
@@ -772,12 +1184,46 @@ export interface TelemetryRepo {
   /**
    * Reads one page of a session's events.
    *
+   * Under `'count_desc'` the rows of the largest group under `groupBy` come
+   * first, each group's rows together and in canonical order, groups of equal
+   * size in ascending key order, and rows belonging to no group last — a total
+   * order, so paging is as stable as under the other two sorts.
+   *
    * @param filter What to match, how to order it and which page to return.
    * @returns The page, or the refusal for an argument this repository will not
-   * accept (an unknown sort or kind, a negative or fractional `limit` or
-   * `offset`, a non-finite `minDuration`).
+   * accept (an unknown sort, group key or kind, a negative or fractional
+   * `limit` or `offset`, a non-finite `minDuration`).
    */
   query(filter: TelemetryQuery): Result<TelemetryPage, DebuggenError>;
+
+  /**
+   * Reads one page of the groups a session's filtered events form under one
+   * key, largest group first by default.
+   *
+   * The grouped half of `count_desc`: one entry per distinct key value, with
+   * its occurrence count, its first event and its timing, formed from exactly
+   * the rows {@link TelemetryRepo.query} would match for the same filter. Rows
+   * whose key is `NULL` — a non-request under `requestKey`, an event naming no
+   * component under `component`, a document that is not valid JSON under
+   * `component` — belong to no group and are left out. Only **readable**
+   * events count: a stored row that no longer reconstructs as an event is left
+   * out of every group and reported in {@link TelemetryGroupPage.skipped} and
+   * at `warn`, the same skip-and-report rule a row page follows, so no count
+   * and no representative event rests on evidence a read cannot show. Every
+   * ordering ends in the group key (compared as SQLite's `BINARY` collation
+   * does) and then the first arrival number, so groups of equal count page
+   * deterministically.
+   *
+   * The whole filtered set is read to form the groups, so the cost grows with
+   * the rows matched rather than with the page; narrow by capture, kind or
+   * trace for a large session.
+   *
+   * @param query The narrowing, the required group key, and the page.
+   * @returns The page of groups, or the refusal for an argument this
+   * repository will not accept — the refusals of {@link TelemetryRepo.query},
+   * plus a missing group key.
+   */
+  queryGroups(query: TelemetryGroupQuery): Result<TelemetryGroupPage, DebuggenError>;
 
   /**
    * Every event of one correlated interaction, in canonical order by default.
@@ -924,16 +1370,22 @@ export interface TelemetryRepo {
   countBySession(sessionId: SessionId): Result<number, DebuggenError>;
 
   /**
-   * Deletes every event of one session, in bounded batches.
+   * Deletes every event of one session, in bounded batches of
+   * {@link DEFAULT_PURGE_BATCH_SIZE}.
    *
    * Used where the session itself is kept — a capture's evidence aged out while
    * the analysis and panel that cite it stay readable. Deleting the `sessions`
    * row cascades to these rows instead, which is why this is a retention tool
    * rather than part of session deletion.
    *
-   * @returns How many rows were deleted.
+   * Asynchronous for the reason {@link TelemetryRepo.deleteOlderThan} gives, and
+   * with the same guarantees: one committed transaction per batch, a yield
+   * between batches, a refusal (`purge-inside-transaction`) instead of a sweep
+   * inside a caller's open transaction, and a promise that never rejects.
+   *
+   * @returns How many rows were deleted, or the failure.
    */
-  deleteBySession(sessionId: SessionId): Result<number, DebuggenError>;
+  deleteBySession(sessionId: SessionId): Promise<Result<number, DebuggenError>>;
 
   /**
    * Deletes every event that started before `cutoffEpochMs`, in bounded
@@ -945,15 +1397,35 @@ export interface TelemetryRepo {
    * monotonically increasing, and the canonical ordering is as total after a
    * purge as it was before one.
    *
+   * **Asynchronous, and yielding.** Each batch is one short transaction, and
+   * between two batches the purge awaits `setImmediate`, so a same-process
+   * ingest batch — which `node:sqlite` could otherwise only run once the whole
+   * synchronous sweep had returned — waits for at most one batch. The first
+   * batch runs before the call returns its promise.
+   *
+   * **Refused inside a transaction.** Called while the connection is already
+   * inside a transaction — or when one has been opened on it by the time a
+   * later batch is due — the purge deletes nothing further and answers
+   * `STORE_ERROR` with reason `purge-inside-transaction`. Every batch would
+   * otherwise be a savepoint of that transaction: nothing would commit until
+   * the caller did, the write lock would be held for the whole sweep, and
+   * same-process ingest would wait for all of it. A retention step that must
+   * remove a session's telemetry atomically with the session deletes the
+   * `sessions` row instead, whose cascade removes these rows in one statement.
+   *
+   * The promise **never rejects**: every failure, including one raised between
+   * batches (the store closed mid-sweep), resolves as an `err`. Rows deleted
+   * by batches that committed before a failure stay deleted.
+   *
    * @param cutoffEpochMs The threshold, in epoch milliseconds; a row with
    * `startTime < cutoffEpochMs` is removed.
    * @param options Session restriction and batch size.
-   * @returns How many rows were deleted.
+   * @returns How many rows were deleted, or the failure.
    */
   deleteOlderThan(
     cutoffEpochMs: number,
     options?: DeleteOlderThanOptions,
-  ): Result<number, DebuggenError>;
+  ): Promise<Result<number, DebuggenError>>;
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -1004,8 +1476,11 @@ type FilterPlan =
 
 /** The paging and ordering a query resolved to, after defaults and clamping. */
 interface PagePlan {
-  /** The `ORDER BY` clause, always ending in the canonical tie-break chain. */
-  readonly ordering: string;
+  /** The effective sort, a checked member of the vocabulary. */
+  readonly sort: TelemetrySort;
+
+  /** The effective group key, a checked member of the vocabulary. */
+  readonly groupBy: TelemetryGroupKey;
 
   /** The effective page size, clamped to {@link TELEMETRY_QUERY_MAX_LIMIT}. */
   readonly limit: number;
@@ -1263,11 +1738,43 @@ function attempt<T>(
 }
 
 /**
+ * {@link attempt} for an asynchronous operation: whatever `fn` throws or
+ * rejects with becomes a coded error, so the returned promise **never
+ * rejects**.
+ *
+ * The purges need it because a failure can now arrive after an `await` — the
+ * store closed between two batches during shutdown, a disk failure on the
+ * fourth batch — and a rejected promise would reach a retention sweep that was
+ * written against a `Result`.
+ *
+ * @typeParam T The operation's success value.
+ * @param operation The method's name, for the error's `details`.
+ * @param fn The work to run.
+ * @param details Identifiers to attach to a failure.
+ * @returns What `fn` resolved to, or the classified failure.
+ */
+async function attemptAsync<T>(
+  operation: string,
+  fn: () => Promise<Result<T, DebuggenError>>,
+  details?: Readonly<Record<string, unknown>>,
+): Promise<Result<T, DebuggenError>> {
+  try {
+    return await fn();
+  } catch (cause) {
+    if (DebuggenError.is(cause)) {
+      return err(cause);
+    }
+
+    return err(storeOperationError(operation, cause, details));
+  }
+}
+
+/**
  * A change count as a number.
  *
  * `node:sqlite` types it as `number | bigint` because it is read with
  * `sqlite3_changes64()`. A batch here is bounded by
- * {@link DEFAULT_PURGE_BATCH_SIZE} or by the caller's array length, so the
+ * {@link MAX_PURGE_BATCH_SIZE} or by the caller's array length, so the
  * conversion is lossless.
  *
  * @param result What `StatementSync.run` returned.
@@ -1555,9 +2062,11 @@ function buildFilter(filter: InternalFilter, operation: string): Result<FilterPl
   if (filter.component !== undefined) {
     // The path is a module constant derived from the attribute catalog; the
     // component name is bound. See COMPONENT_JSON_PATH for why this is the one
-    // filter that reads inside the document, and TelemetryQuery.component for
-    // why it is always combined with session_id.
-    clauses.push(`json_extract(event, '${COMPONENT_JSON_PATH}') = ?`);
+    // filter that reads inside the document, TelemetryQuery.component for why
+    // it is always combined with session_id, and COMPONENT_VALUE_SQL for why a
+    // document that is not valid JSON must match nothing rather than fail the
+    // whole read.
+    clauses.push(`(${COMPONENT_VALUE_SQL}) = ?`);
     values.push(filter.component);
   }
 
@@ -1573,21 +2082,44 @@ function buildFilter(filter: InternalFilter, operation: string): Result<FilterPl
  * a negative or fractional value is refused, because it is a bug rather than an
  * appetite.
  *
+ * The sort and the group key are checked by **membership** in their tuples, not
+ * by looking them up in the ordering tables: a JavaScript caller passing
+ * `'constructor'` would otherwise find a function on `Object.prototype` and
+ * reach SQLite with it.
+ *
  * @param filter The query as the caller wrote it.
  * @param operation The calling method, for a refusal's `details`.
+ * @param defaultSort The sort an omitted `sort` means: `'start_asc'` for rows,
+ * `'count_desc'` for groups.
  * @returns The plan, or the refusal.
  */
-function buildPagePlan(filter: TelemetryQuery, operation: string): Result<PagePlan, DebuggenError> {
-  const sort = filter.sort ?? 'start_asc';
-  const ordering = ORDERING_BY_SORT[sort];
+function buildPagePlan(
+  filter: TelemetryQuery,
+  operation: string,
+  defaultSort: TelemetrySort,
+): Result<PagePlan, DebuggenError> {
+  const sort: unknown = filter.sort ?? defaultSort;
 
-  if (ordering === undefined) {
+  if (!isDataQuerySort(sort)) {
     return err(
       argumentError(
         operation,
         'A telemetry query named an ordering the store does not implement.',
-        `Use one of: ${TELEMETRY_SORTS.join(', ')}. An aggregate ordering such as count_desc is applied where the aggregate is computed, not over rows.`,
+        `Use one of: ${TELEMETRY_SORTS.join(', ')}.`,
         'unknown-sort',
+      ),
+    );
+  }
+
+  const groupBy: unknown = filter.groupBy ?? TELEMETRY_DEFAULT_GROUP_KEY;
+
+  if (!isTelemetryGroupKey(groupBy)) {
+    return err(
+      argumentError(
+        operation,
+        'A telemetry query named a group key the store does not know.',
+        `Use one of: ${TELEMETRY_GROUP_KEYS.join(', ')}.`,
+        'unknown-group-key',
       ),
     );
   }
@@ -1619,7 +2151,8 @@ function buildPagePlan(filter: TelemetryQuery, operation: string): Result<PagePl
   }
 
   return ok({
-    ordering,
+    sort,
+    groupBy,
     limit: Math.min(requestedLimit, TELEMETRY_QUERY_MAX_LIMIT),
     offset,
   });
@@ -1736,6 +2269,91 @@ function readEvents(
   return ok({ events, skipped });
 }
 
+/** What {@link collectGroups} builds from the rows of {@link groupRowsSql}. */
+interface CollectedGroups {
+  /** One group per key that at least one readable event carries, unordered. */
+  readonly groups: TelemetryGroup[];
+
+  /** The arrival numbers of the rows left out because they could not be read. */
+  readonly skipped: number[];
+}
+
+/**
+ * Folds the rows of {@link groupRowsSql} into groups, counting **readable
+ * events only**.
+ *
+ * Every row goes through {@link readEvents} — the reconstruction and schema
+ * check every other read applies — before it may count. A row that fails is
+ * left out of every group and reported by arrival number, exactly as a row
+ * page skips and reports it, so a group's `count` is the number of events a
+ * caller can actually read under that key, and its `firstEventId`,
+ * `firstStartTime` and `totalDuration` come from those events alone. A group
+ * whose rows are all unreadable therefore does not exist, rather than existing
+ * with evidence nobody can show.
+ *
+ * The rows arrive in arrival order, so the first readable event seen for a key
+ * is the group's smallest readable `ingest_seq`. Timing is taken from the
+ * validated document, which is the authoritative copy (the flat columns are
+ * projections of it).
+ *
+ * @param rows The rows, in arrival order.
+ * @param operation The calling method, for a column failure's `details`.
+ * @returns The groups and the skipped arrival numbers, or a column failure —
+ * a missing arrival number or a non-text key can only come from a database
+ * this build did not write.
+ */
+function collectGroups(
+  rows: readonly StoredRow[],
+  operation: string,
+): Result<CollectedGroups, DebuggenError> {
+  const byKey = new Map<string, TelemetryGroup>();
+  const skipped: number[] = [];
+
+  for (const row of rows) {
+    const read = readEvents([row], operation);
+
+    if (isErr(read)) {
+      return read;
+    }
+
+    const [event] = read.value.events;
+
+    if (event === undefined) {
+      skipped.push(...read.value.skipped);
+      continue;
+    }
+
+    const key = row['group_key'];
+
+    if (typeof key !== 'string') {
+      return err(corruptColumnError(operation, 'group_key'));
+    }
+
+    const current = byKey.get(key);
+
+    byKey.set(
+      key,
+      current === undefined
+        ? {
+            key,
+            count: 1,
+            firstEventId: event.id,
+            firstIngestSeq: event.ingestSeq,
+            firstStartTime: event.startTime,
+            totalDuration: event.duration,
+          }
+        : {
+            ...current,
+            count: current.count + 1,
+            firstStartTime: Math.min(current.firstStartTime, event.startTime),
+            totalDuration: current.totalDuration + event.duration,
+          },
+    );
+  }
+
+  return ok({ groups: [...byKey.values()], skipped });
+}
+
 /**
  * Refuses a call that named no session.
  *
@@ -1778,6 +2396,182 @@ function reusedEventIdError(eventId: string): DebuggenError {
       details: context('insertMany', { eventId, reason: 'event-id-reused' }),
     },
   );
+}
+
+/**
+ * The error for an event id the session already holds as a **different**
+ * event.
+ *
+ * A producer replaying its own buffered batch re-sends the identical event, so
+ * a same-session conflict whose content differs is not a replay: it is an id
+ * reused for a second event, and skipping it would report the candidate as
+ * stored while the table holds something else — evidence the live tail, the
+ * correlator and the model would each read differently. The whole batch is
+ * rolled back instead.
+ *
+ * `fields` carries the differing **top-level field names** only — `attributes`,
+ * `startTime`, `source` — because the values on either side are captured data
+ * (AAP 0.5.2). The names come from the strict persisted event schema both
+ * sides were validated against, so none of them is caller text.
+ *
+ * @param eventId The id that collided.
+ * @param fields The differing top-level field names, sorted.
+ * @returns The coded error.
+ */
+function eventIdConflictError(eventId: string, fields: readonly string[]): DebuggenError {
+  return new DebuggenError(
+    'STORE_ERROR',
+    `A telemetry event id is already stored as a different event (differing fields: ${fields.join(', ')}).`,
+    {
+      hint: 'A replayed event must be identical to the event first stored under its id; reusing an id for another event is a producer defect. Nothing of this batch was written.',
+      details: context('insertMany', { eventId, fields: [...fields], reason: 'event-id-conflict' }),
+    },
+  );
+}
+
+/**
+ * The error for an id conflict whose stored row cannot be reconstructed, so
+ * whether the candidate is a replay cannot be decided.
+ *
+ * Refused rather than skipped: skipping would report an event as stored on the
+ * strength of a row no read can return, and writing over it would destroy the
+ * only copy there is. Also raised in the unreachable case of a suppressed insert
+ * with no row behind it, which leaves the question equally unanswerable.
+ *
+ * @param eventId The id that collided.
+ * @param ingestSeq The stored row's arrival number, when it could be read.
+ * @returns The coded error.
+ */
+function unconfirmableReplayError(eventId: string, ingestSeq: number | undefined): DebuggenError {
+  return new DebuggenError(
+    'STORE_ERROR',
+    'A telemetry event id is already stored, but the stored row is not a readable event.',
+    {
+      hint: 'The session store may have been written or altered by something other than Debug Generator, so the replay cannot be confirmed. Nothing of this batch was written; report the event id with the service log.',
+      details: context('insertMany', {
+        eventId,
+        ...(ingestSeq === undefined ? {} : { ingestSeq }),
+        reason: 'stored-event-unreadable',
+      }),
+    },
+  );
+}
+
+/**
+ * A deterministic serialisation of a JSON value: object keys sorted at every
+ * depth, arrays kept in order.
+ *
+ * Only ever applied to values that came out of `JSON.parse`, so every value is
+ * `null`, a boolean, a finite number, a string, an array or a plain object.
+ * Numbers are written by `JSON.stringify`, whose shortest round-trip form makes
+ * two doubles serialise identically exactly when they are the same double —
+ * which is the "exact float equality" a replay check needs for sub-millisecond
+ * timestamps.
+ *
+ * @param value A JSON-derived value.
+ * @returns Its canonical text.
+ */
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map((element) => canonicalJson(element)).join(',')}]`;
+  }
+
+  if (typeof value === 'object' && value !== null) {
+    const record = value as Record<string, unknown>;
+    const members = Object.keys(record)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`);
+
+    return `{${members.join(',')}}`;
+  }
+
+  return JSON.stringify(value);
+}
+
+/**
+ * The top-level fields in which two events differ **as the store would hold
+ * them**.
+ *
+ * Both sides are passed through {@link toStoredDocument} and parsed back before
+ * they are compared, so the comparison is over exactly the document the `event`
+ * column stores: `ingestSeq` is excluded (the database owns it), an optional
+ * field set to `undefined` equals one that is absent, and key order is
+ * irrelevant once {@link canonicalJson} has sorted it. What remains is a
+ * field-for-field, value-for-value equality — a different capture, trace,
+ * timing, attribute bag or source location each shows up by name.
+ *
+ * @param candidate The validated event offered for insertion.
+ * @param stored The validated event the table holds under the same id.
+ * @returns The differing field names, sorted; `[]` for an exact replay.
+ */
+function differingEventFields(candidate: TelemetryEvent, stored: TelemetryEvent): string[] {
+  const offered = JSON.parse(toStoredDocument(candidate)) as Record<string, unknown>;
+  const held = JSON.parse(toStoredDocument(stored)) as Record<string, unknown>;
+  const canonicalField = (record: Record<string, unknown>, field: string): string | undefined =>
+    Object.hasOwn(record, field) ? canonicalJson(record[field]) : undefined;
+
+  return [...new Set([...Object.keys(offered), ...Object.keys(held)])]
+    .filter((field) => canonicalField(offered, field) !== canonicalField(held, field))
+    .sort();
+}
+
+/**
+ * Decides what a suppressed insert means, and answers with the event the store
+ * holds or throws the refusal that rolls the batch back.
+ *
+ * Called inside the batch transaction, which is why every refusal is a throw:
+ * `Store.transaction` rolls back on it and {@link attempt} returns the coded
+ * error unchanged. The checks run in the order that keeps each answer honest —
+ * whose row it is, whether it can be read at all, and only then whether it is
+ * the same event. The stored copy is reconstructed through {@link readEvents},
+ * the path every read uses, so "readable" means the same thing here as on a
+ * panel query.
+ *
+ * @param existing The row {@link SELECT_STORED_BY_ID_SQL} returned, if any.
+ * @param candidate The validated event whose insert was suppressed.
+ * @param operation The calling method, for a column failure's `details`.
+ * @returns The stored event, with its own arrival number, for an exact replay.
+ * @throws {DebuggenError} `STORE_ERROR` with reason `event-id-reused`,
+ * `event-id-conflict` or `stored-event-unreadable`, or a corrupt-column error.
+ */
+function resolveReplay(
+  existing: StoredRow | undefined,
+  candidate: TelemetryEvent,
+  operation: string,
+): TelemetryEvent {
+  if (existing === undefined) {
+    throw unconfirmableReplayError(candidate.id, undefined);
+  }
+
+  const owner = existing['session_id'];
+
+  if (typeof owner !== 'string') {
+    throw corruptColumnError(operation, 'session_id');
+  }
+
+  if (owner !== candidate.sessionId) {
+    throw reusedEventIdError(candidate.id);
+  }
+
+  const read = readEvents([existing], operation);
+
+  if (isErr(read)) {
+    throw read.error;
+  }
+
+  const [stored] = read.value.events;
+
+  if (stored === undefined) {
+    throw unconfirmableReplayError(candidate.id, read.value.skipped[0]);
+  }
+
+  const fields = differingEventFields(candidate, stored);
+
+  if (fields.length > 0) {
+    throw eventIdConflictError(candidate.id, fields);
+  }
+
+  return stored;
 }
 
 /**
@@ -1863,7 +2657,7 @@ export function createTelemetryRepo(deps: TelemetryRepoDeps): TelemetryRepo {
         return plan;
       }
 
-      const paging = buildPagePlan(filter, operation);
+      const paging = buildPagePlan(filter, operation, 'start_asc');
 
       if (isErr(paging)) {
         return paging;
@@ -1877,7 +2671,8 @@ export function createTelemetryRepo(deps: TelemetryRepoDeps): TelemetryRepo {
       }
 
       const { clause, values } = plan.value;
-      const { ordering, limit, offset } = paging.value;
+      const { sort, groupBy, limit, offset } = paging.value;
+      const ordering = ORDERING_BY_SORT[sort](groupBy);
 
       // One count over the identical WHERE clause, so `total` and `rows` can
       // never describe different filters.
@@ -1931,29 +2726,77 @@ ORDER BY ${ordering} LIMIT ? OFFSET ?`,
   }
 
   /**
-   * Deletes rows one bounded batch at a time until a batch comes up short,
-   * which is the only signal that the predicate is exhausted.
+   * Deletes rows one bounded batch at a time, target after target, until each
+   * target's batch comes up short — the only signal that its predicate is
+   * exhausted.
    *
    * Each batch is its own transaction, so the write lock is released between
-   * them and an ingest batch arriving mid-sweep waits for one batch rather than
-   * for the whole purge (see {@link DEFAULT_PURGE_BATCH_SIZE}).
+   * them, and between any two batches — within one target or across two — the
+   * sweep awaits `setImmediate`, which lets every callback the event loop has
+   * queued run first. An ingest batch arriving mid-sweep therefore waits for one
+   * batch rather than for the whole purge, whether it comes from another
+   * connection or from this process (see {@link DEFAULT_PURGE_BATCH_SIZE}).
+   * The first batch runs synchronously, before the caller receives the
+   * promise.
    *
-   * @param batchSize How many rows one statement removes.
-   * @param deleteBatch Runs one batch and returns how many rows it removed.
+   * **A purge never runs inside a transaction it did not open.** Before every
+   * batch — the first included — the connection is checked, and a transaction
+   * already open on it refuses the purge with `STORE_ERROR` reason
+   * `purge-inside-transaction`, naming how many rows earlier batches had
+   * already committed. Inside a caller's transaction every batch would be a
+   * savepoint of it: nothing would commit until the caller did, the write lock
+   * would be held for the whole sweep, and same-process ingest would wait for
+   * all of it — exactly what bounded batches exist to prevent. Checking before
+   * each batch rather than once also covers a transaction opened by other work
+   * while the sweep was yielding, which the batch would otherwise have joined.
+   * To remove a session's telemetry atomically with the session itself, delete
+   * the `sessions` row instead; its `ON DELETE CASCADE` removes these rows in
+   * the same statement.
+   *
+   * @param operation The calling method, for the refusal's `details`.
+   * @param batchSize How many rows one statement removes, already clamped.
+   * @param targets One batch runner per predicate, each returning how many
+   * rows one run removed.
    * @returns The total removed.
+   * @throws {DebuggenError} `STORE_ERROR` with reason
+   * `purge-inside-transaction`; {@link attemptAsync} turns it into an `Err`.
    */
-  function purgeInBatches(batchSize: number, deleteBatch: (limit: number) => number): number {
+  async function purgeInBatches(
+    operation: string,
+    batchSize: number,
+    targets: readonly ((limit: number) => number)[],
+  ): Promise<number> {
     let deleted = 0;
+    let batches = 0;
 
-    for (;;) {
-      const removed = store.transaction(() => deleteBatch(batchSize));
+    for (const deleteBatch of targets) {
+      for (;;) {
+        if (batches > 0) {
+          await yieldToEventLoop();
+        }
 
-      deleted += removed;
+        if (store.db.isTransaction) {
+          throw argumentError(
+            operation,
+            'A telemetry purge was asked to run inside an open transaction.',
+            'Call the purge outside any transaction, so each bounded batch commits on its own and ingest can run between batches. To delete a session\u2019s telemetry together with the session, delete the session row instead; the cascade removes its events in the same statement.',
+            'purge-inside-transaction',
+            { deletedBeforeRefusal: deleted, batchesCommitted: batches },
+          );
+        }
 
-      if (removed < batchSize) {
-        return deleted;
+        const removed = store.transaction(() => deleteBatch(batchSize));
+
+        batches += 1;
+        deleted += removed;
+
+        if (removed < batchSize) {
+          break;
+        }
       }
     }
+
+    return deleted;
   }
 
   /**
@@ -2080,7 +2923,7 @@ ORDER BY ${ordering} LIMIT ? OFFSET ?`,
         operation,
         () => {
           const insert = store.statement(INSERT_SQL);
-          const lookup = store.statement(SELECT_INGEST_SEQ_BY_ID_SQL);
+          const lookup = store.statement(SELECT_STORED_BY_ID_SQL);
 
           // One transaction for the whole batch, and one prepared statement
           // reused per row: an ingest batch is the hot path of a running
@@ -2092,31 +2935,26 @@ ORDER BY ${ordering} LIMIT ? OFFSET ?`,
 
             for (const event of validated) {
               const written = insert.get(...insertValues(event, toStoredDocument(event)));
-              let ingestSeq: number | undefined;
 
               if (written === undefined) {
                 // The conflict clause suppressed the insert: this id is already
-                // stored. Its arrival number is read back rather than invented,
-                // because the caller's copy of the event must carry the number
-                // the store actually holds.
+                // stored — by an earlier batch, or by an earlier element of this
+                // one. It is a replay only if the stored event is this event,
+                // and the result then carries the stored copy with its own
+                // arrival number; anything else throws, and the throw rolls the
+                // whole batch back.
+                stored.push(resolveReplay(lookup.get(event.id), event, operation));
                 skipped += 1;
-
-                const existing = lookup.get(event.id, event.sessionId);
-
-                if (existing === undefined) {
-                  throw reusedEventIdError(event.id);
-                }
-
-                ingestSeq = readInteger(existing['ingest_seq']);
-              } else {
-                inserted += 1;
-                ingestSeq = readInteger(written['ingest_seq']);
+                continue;
               }
+
+              const ingestSeq = readInteger(written['ingest_seq']);
 
               if (ingestSeq === undefined) {
                 throw corruptColumnError(operation, 'ingest_seq');
               }
 
+              inserted += 1;
               stored.push({ ...event, ingestSeq });
             }
 
@@ -2138,6 +2976,87 @@ ORDER BY ${ordering} LIMIT ? OFFSET ?`,
 
     query(filter) {
       return readPage(filter, 'query');
+    },
+
+    queryGroups(query) {
+      const operation = 'queryGroups';
+
+      return attempt<TelemetryGroupPage>(operation, () => {
+        // Checked before the page plan, which would otherwise fill in the row
+        // default: a page of groups under a key the caller never chose is an
+        // answer to a question nobody asked.
+        const named: unknown = query.groupBy;
+
+        if (named === undefined) {
+          return err(
+            argumentError(
+              operation,
+              'A grouped telemetry query named no group key.',
+              `Name the key to group by, one of: ${TELEMETRY_GROUP_KEYS.join(', ')}.`,
+              'missing-group-key',
+            ),
+          );
+        }
+
+        const plan = buildFilter(query, operation);
+
+        if (isErr(plan)) {
+          return plan;
+        }
+
+        const paging = buildPagePlan(query, operation, 'count_desc');
+
+        if (isErr(paging)) {
+          return paging;
+        }
+
+        if (plan.value.kind === 'nothing') {
+          return ok({ groups: [], total: 0 });
+        }
+
+        const { clause, values } = plan.value;
+        const { sort, groupBy, limit, offset } = paging.value;
+
+        // Every group is formed from readable events only, so the whole
+        // filtered set is folded before the page is cut: `total`, each count
+        // and each representative then describe the same, readable events,
+        // and `limit: 0` still answers with the true number of groups.
+        const collected = collectGroups(
+          store.statement(groupRowsSql(groupBy, clause)).all(...values),
+          operation,
+        );
+
+        if (isErr(collected)) {
+          return collected;
+        }
+
+        const { skipped } = collected.value;
+
+        if (skipped.length > 0) {
+          // The arrival numbers and nothing else, as on a row page: a row that
+          // failed validation may hold any captured value (AAP 0.5.2).
+          logger.warn(
+            'left telemetry rows that no longer match the event schema out of every group',
+            {
+              operation,
+              skipped: skipped.length,
+              ingestSeqs: skipped,
+            },
+          );
+        }
+
+        const ordered = collected.value.groups.sort(GROUP_ORDERING_BY_SORT[sort]);
+        const total = ordered.length;
+        const groups = ordered.slice(offset, offset + limit);
+        const nextOffset = offset + groups.length;
+
+        return ok({
+          groups,
+          total,
+          ...(nextOffset < total ? { nextOffset } : {}),
+          ...(skipped.length > 0 ? { skipped: skipped.length } : {}),
+        });
+      });
     },
 
     listByTrace(sessionId, traceId, options) {
@@ -2303,7 +3222,7 @@ ORDER BY ${ordering} LIMIT ? OFFSET ?`,
     deleteBySession(sessionId) {
       const operation = 'deleteBySession';
 
-      return attempt(operation, () => {
+      return attemptAsync<number>(operation, async () => {
         const refusal = requireSession(sessionId, operation);
 
         if (refusal !== undefined) {
@@ -2311,9 +3230,9 @@ ORDER BY ${ordering} LIMIT ? OFFSET ?`,
         }
 
         const statement = store.statement(DELETE_SESSION_BATCH_SQL);
-        const deleted = purgeInBatches(DEFAULT_PURGE_BATCH_SIZE, (limit) =>
-          changesOf(statement.run(sessionId, limit)),
-        );
+        const deleted = await purgeInBatches(operation, DEFAULT_PURGE_BATCH_SIZE, [
+          (limit) => changesOf(statement.run(sessionId, limit)),
+        ]);
 
         logger.debug('purged a session of telemetry', {
           operation,
@@ -2328,7 +3247,7 @@ ORDER BY ${ordering} LIMIT ? OFFSET ?`,
     deleteOlderThan(cutoffEpochMs, options) {
       const operation = 'deleteOlderThan';
 
-      return attempt(operation, () => {
+      return attemptAsync<number>(operation, async () => {
         if (!Number.isFinite(cutoffEpochMs)) {
           return err(
             argumentError(
@@ -2340,26 +3259,29 @@ ORDER BY ${ordering} LIMIT ? OFFSET ?`,
           );
         }
 
-        const batchSize = options?.batchSize ?? DEFAULT_PURGE_BATCH_SIZE;
+        const requestedBatchSize = options?.batchSize ?? DEFAULT_PURGE_BATCH_SIZE;
 
-        if (!Number.isSafeInteger(batchSize) || batchSize < 1) {
+        if (!Number.isSafeInteger(requestedBatchSize) || requestedBatchSize < 1) {
           return err(
             argumentError(
               operation,
               'A telemetry purge named a batch size that cannot bound a statement.',
-              `Pass a positive integer, or omit the field for ${String(DEFAULT_PURGE_BATCH_SIZE)} rows per batch.`,
+              `Pass a positive integer of at most ${String(MAX_PURGE_BATCH_SIZE)}, or omit the field for ${String(DEFAULT_PURGE_BATCH_SIZE)} rows per batch.`,
               'invalid-batch-size',
             ),
           );
         }
 
+        // Clamped, not refused: see MAX_PURGE_BATCH_SIZE. The effective value is
+        // what the debug line reports, so a clamp is visible in the log.
+        const batchSize = Math.min(requestedBatchSize, MAX_PURGE_BATCH_SIZE);
         const sessionIds = options?.sessionIds;
 
         if (sessionIds === undefined) {
           const statement = store.statement(DELETE_OLDER_THAN_BATCH_SQL);
-          const deleted = purgeInBatches(batchSize, (limit) =>
-            changesOf(statement.run(cutoffEpochMs, limit)),
-          );
+          const deleted = await purgeInBatches(operation, batchSize, [
+            (limit) => changesOf(statement.run(cutoffEpochMs, limit)),
+          ]);
 
           logger.debug('purged telemetry older than a cutoff', { operation, batchSize, deleted });
 
@@ -2387,18 +3309,20 @@ ORDER BY ${ordering} LIMIT ? OFFSET ?`,
           return ok(0);
         }
 
-        let deleted = 0;
-
-        // Chunked for the same reason the existence lookups are: a sweep naming
-        // hundreds of sessions must not assemble one statement whose parameter
-        // count depends on how many sessions a developer has accumulated.
-        for (const part of chunk(unique)) {
-          const statement = store.statement(deleteOlderThanForSessionsSql(part.length));
-
-          deleted += purgeInBatches(batchSize, (limit) =>
-            changesOf(statement.run(cutoffEpochMs, ...part, limit)),
-          );
-        }
+        // One session at a time, through one prepared statement: each batch is
+        // then an ordered range of the (session_id, start_time, ingest_seq)
+        // index, which an IN list of sessions could not be (see
+        // DELETE_SESSION_OLDER_THAN_BATCH_SQL). The statement text and its
+        // parameter count no longer depend on how many sessions are named.
+        const statement = store.statement(DELETE_SESSION_OLDER_THAN_BATCH_SQL);
+        const deleted = await purgeInBatches(
+          operation,
+          batchSize,
+          unique.map(
+            (sessionId) => (limit: number) =>
+              changesOf(statement.run(sessionId, cutoffEpochMs, limit)),
+          ),
+        );
 
         logger.debug('purged telemetry older than a cutoff', {
           operation,

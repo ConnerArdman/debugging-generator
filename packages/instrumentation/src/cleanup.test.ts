@@ -138,6 +138,19 @@ const OTHER_FILE = 'src/server/cone-rules.ts';
 /** A named declaration in {@link OTHER_FILE}. */
 const OTHER_SYMBOL = 'assertConeValue';
 
+/**
+ * A second declaration in {@link OTHER_FILE}.
+ *
+ * With {@link OTHER_THIRD_SYMBOL} it is what lets one file carry three plan
+ * versions: each version wraps one more declaration of the bytes the previous
+ * version wrote, so the chain is three real patches rather than fabricated
+ * records.
+ */
+const OTHER_SECOND_SYMBOL = 'findConeProfile';
+
+/** A third declaration in {@link OTHER_FILE}. See {@link OTHER_SECOND_SYMBOL}. */
+const OTHER_THIRD_SYMBOL = 'findRampCeiling';
+
 /** A plain-JavaScript fixture file: the variant patched without a type alias. */
 const LEGACY_FILE = 'src/legacy/bisque-schedule.js';
 
@@ -1170,6 +1183,50 @@ describe('a developer edit on top of an instrumented file', () => {
  * ---------------------------------------------------------------------------
  */
 
+/**
+ * Three real plan versions over {@link OTHER_FILE}, each wrapping one more
+ * declaration of the bytes the previous version wrote.
+ *
+ * Nothing is fabricated: the real patcher resolves each version's parent from
+ * the journal, hashes the file it finds, backs it up and journals the record,
+ * so the chain carries the digests and backups a follow-up install really
+ * leaves behind.
+ *
+ * @param world The sandbox to patch inside.
+ * @returns The three links, oldest first.
+ */
+async function patchThreeLinks(world: World): Promise<[PatchedFile, PatchedFile, PatchedFile]> {
+  const first = await patchSymbol(world, {
+    file: OTHER_FILE,
+    symbol: OTHER_SYMBOL,
+    planVersion: 1,
+  });
+  const second = await patchSymbol(world, {
+    file: OTHER_FILE,
+    symbol: OTHER_SECOND_SYMBOL,
+    planVersion: 2,
+  });
+  const third = await patchSymbol(world, {
+    file: OTHER_FILE,
+    symbol: OTHER_THIRD_SYMBOL,
+    planVersion: 3,
+  });
+
+  return [first, second, third];
+}
+
+/** What the journal and the filesystem said at the moment one backup was deleted. */
+interface RemovalSnapshot {
+  /** The digest whose backup was being deleted. */
+  readonly digest: string;
+
+  /** How many conditional writes had landed by then. */
+  readonly writes: number;
+
+  /** Each link's status at that moment, oldest link first. */
+  readonly statuses: ModificationStatus[];
+}
+
 describe('a chain of plan versions over one file', () => {
   it('links the later record to the earlier one through the hash it replaced', async () => {
     const world = makeWorld();
@@ -1259,6 +1316,249 @@ describe('a chain of plan versions over one file', () => {
     expect(existsSync(world.backupPathOf(first.record.originalHash))).toBe(false);
     expect(existsSync(world.backupPathOf(second.record.originalHash))).toBe(false);
     expect(world.journal.sessionStatusOf(world.sessionId)).toBe('analyzing');
+  });
+
+  it('unwinds a three-link chain strictly 3 → 2 → 1, deleting each backup only once its own restore verified', async () => {
+    // Filled in once the world and the links exist; the hook only fires during
+    // the pass under test, because patching deletes no backup.
+    const holder: { world: World | undefined; links: readonly PatchedFile[] } = {
+      world: undefined,
+      links: [],
+    };
+    const snapshots: RemovalSnapshot[] = [];
+    const world = makeWorld({
+      afterBackupRemoval: (removal): void => {
+        const current = holder.world;
+
+        if (current !== undefined) {
+          snapshots.push({
+            digest: removal.digest,
+            writes: current.log.writes.length,
+            statuses: holder.links.map((link) => current.journal.row(link.record.id).status),
+          });
+        }
+      },
+    });
+
+    holder.world = world;
+
+    const pristine = readFileSync(world.pathOf(OTHER_FILE));
+    const [first, second, third] = await patchThreeLinks(world);
+
+    holder.links = [first, second, third];
+
+    // Each link continues from exactly the bytes the previous one wrote, and
+    // its backup holds those bytes — the middle link's backup is the first
+    // patch's output, not the pristine file.
+    expect([first, second, third].map((link) => link.record.planVersion)).toEqual([1, 2, 3]);
+    expect(first.record.previousRecordId).toBeUndefined();
+    expect(second.record.previousRecordId).toBe(first.record.id);
+    expect(third.record.previousRecordId).toBe(second.record.id);
+    expect(second.record.originalHash).toBe(first.record.instrumentedHash);
+    expect(third.record.originalHash).toBe(second.record.instrumentedHash);
+
+    for (const link of [first, second, third]) {
+      expect(link.record.originalHash).toBe(sha256Hex(link.originalBytes));
+      expect(link.record.instrumentedHash).toBe(sha256Hex(link.instrumentedBytes));
+      expectFileBytes(world.backupPathOf(link.record.originalHash), link.originalBytes);
+    }
+
+    expect(Buffer.compare(second.originalBytes, first.instrumentedBytes)).toBe(0);
+    expect(Buffer.compare(third.originalBytes, second.instrumentedBytes)).toBe(0);
+    expect(first.record.originalHash).toBe(sha256Hex(pristine));
+
+    // Last applied first, whatever order the records arrive in.
+    for (const given of [
+      [first.record, second.record, third.record],
+      [second.record, third.record, first.record],
+    ]) {
+      expect(
+        expectOk(orderRestorationChain(given), 'a restoration order').map((r) => r.id),
+      ).toEqual([third.record.id, second.record.id, first.record.id]);
+    }
+
+    world.watch(OTHER_FILE);
+    world.resetLog();
+
+    const mark = world.mark();
+    const outcome = await cleanupSession(world.sessionId, world.context);
+
+    expect(outcome.status).toBe('clean');
+    expect(outcome.restored.map((record) => record.id)).toEqual([
+      third.record.id,
+      second.record.id,
+      first.record.id,
+    ]);
+    expect(outcome.conflicts).toEqual([]);
+    expect(outcome.skipped).toEqual([]);
+    expect(outcome.failures).toEqual([]);
+    expect(outcome.forks).toEqual([]);
+
+    // Each write was conditional on *that* link's instrumented content and
+    // wrote *that* link's original, in strict reverse order.
+    expect(world.log.writes.map((write) => write.expectedHash)).toEqual([
+      third.record.instrumentedHash,
+      second.record.instrumentedHash,
+      first.record.instrumentedHash,
+    ]);
+    expect(world.log.writes.map((write) => write.contentHash)).toEqual([
+      third.record.originalHash,
+      second.record.originalHash,
+      first.record.originalHash,
+    ]);
+    expect(world.log.creates).toEqual([]);
+    expect(world.journal.transitions(mark)).toEqual([
+      { recordId: third.record.id, status: 'reverted' },
+      { recordId: second.record.id, status: 'reverted' },
+      { recordId: first.record.id, status: 'reverted' },
+    ]);
+
+    // Staged deletion: each backup went only after its own link's restore was
+    // written, re-read against its original and journaled — and before the next
+    // link's write began.
+    expect(world.removals.map((removal) => removal.digest)).toEqual([
+      third.record.originalHash,
+      second.record.originalHash,
+      first.record.originalHash,
+    ]);
+    expect(world.removals.map((removal) => removal.restoredContentHash)).toEqual([
+      third.record.originalHash,
+      second.record.originalHash,
+      first.record.originalHash,
+    ]);
+    expect(world.removals.map((removal) => removal.watchedDigest)).toEqual([
+      third.record.originalHash,
+      second.record.originalHash,
+      first.record.originalHash,
+    ]);
+    expect(snapshots).toEqual([
+      {
+        digest: third.record.originalHash,
+        writes: 1,
+        statuses: ['applied', 'applied', 'reverted'],
+      },
+      {
+        digest: second.record.originalHash,
+        writes: 2,
+        statuses: ['applied', 'reverted', 'reverted'],
+      },
+      {
+        digest: first.record.originalHash,
+        writes: 3,
+        statuses: ['reverted', 'reverted', 'reverted'],
+      },
+    ]);
+
+    // The file is the file the session started with, byte for byte.
+    expectFileBytes(world.pathOf(OTHER_FILE), pristine);
+    expect(digestOf(world.pathOf(OTHER_FILE))).toBe(sha256Hex(pristine));
+
+    for (const link of [first, second, third]) {
+      expect(existsSync(world.backupPathOf(link.record.originalHash))).toBe(false);
+    }
+
+    expect(existsSync(world.backups.sessionDirectory)).toBe(false);
+  });
+
+  it('stops at the middle link when the file is edited after link 3 is restored, leaving link 1 unresolved', async () => {
+    let interference: Buffer | undefined;
+
+    const world = makeWorld({
+      afterBackupRemoval: (_removal, projectRoot): void => {
+        // Fires once, after link 3's restore was written, verified and
+        // journaled and before link 2 is looked at: a developer saving the file
+        // between the two restores.
+        if (interference === undefined) {
+          interference = developerEdits(join(projectRoot, OTHER_FILE));
+        }
+      },
+    });
+    const [first, second, third] = await patchThreeLinks(world);
+
+    world.resetLog();
+
+    const mark = world.mark();
+    const outcome = await cleanupSession(world.sessionId, world.context);
+
+    expect(outcome.status).toBe('partial');
+    expect(outcome.restored.map((record) => record.id)).toEqual([third.record.id]);
+    expect(outcome.skipped.map((record) => record.id)).toEqual([second.record.id, first.record.id]);
+    expect(outcome.failures).toEqual([]);
+
+    const conflict = only(outcome.conflicts, 'conflict report');
+    expect(conflict.recordId).toBe(second.record.id);
+    expect(conflict.reason).toBe('content-changed');
+    expect(conflict.expectedHash).toBe(second.record.instrumentedHash);
+    expect(interference, 'the interference hook must have run').toBeDefined();
+    expect(conflict.actualHash).toBe(sha256Hex(interference ?? Buffer.alloc(0)));
+
+    // One write — link 3's. Neither link 2's nor link 1's backup went over the
+    // developer's line.
+    expect(world.log.writes.map((write) => write.expectedHash)).toEqual([
+      third.record.instrumentedHash,
+    ]);
+    expectFileBytes(world.pathOf(OTHER_FILE), interference ?? Buffer.alloc(0));
+
+    // Link 3 closed, link 2 reported, link 1 not even asked: still open with no
+    // transition, so the next pass judges it again once link 2 is resolved.
+    expect(world.journal.transitions(mark)).toEqual([
+      { recordId: third.record.id, status: 'reverted' },
+      { recordId: second.record.id, status: 'conflict' },
+    ]);
+    expect(world.journal.row(third.record.id).status).toBe('reverted');
+    expect(world.journal.row(second.record.id).status).toBe('conflict');
+    expect(world.journal.row(first.record.id).status).toBe('applied');
+
+    // Only link 3's backup was deleted; links 2 and 1 keep theirs.
+    expect(world.removals.map((removal) => removal.digest)).toEqual([third.record.originalHash]);
+    expect(existsSync(world.backupPathOf(third.record.originalHash))).toBe(false);
+    expectFileBytes(world.backupPathOf(second.record.originalHash), second.originalBytes);
+    expectFileBytes(world.backupPathOf(first.record.originalHash), first.originalBytes);
+    expect(existsSync(world.backups.sessionDirectory)).toBe(true);
+  });
+
+  it('stops at the middle link when its backup cannot be read back, leaving link 1 unresolved', async () => {
+    const world = makeWorld();
+    const [first, second, third] = await patchThreeLinks(world);
+
+    // Link 2's original — the first patch's output — is gone from the store.
+    rmSync(world.backupPathOf(second.record.originalHash));
+    world.resetLog();
+
+    const mark = world.mark();
+    // Given in append order on purpose: the walker orders them itself.
+    const chain = await restoreChain(
+      [first.record, second.record, third.record].map((record) => world.journal.row(record.id)),
+      world.context,
+    );
+
+    expect(chain.file).toBe(OTHER_FILE);
+    expect(chain.fork).toBeUndefined();
+    expect(chain.stoppedAt?.id).toBe(second.record.id);
+    expect(chain.outcomes.map((outcome) => outcome.kind)).toEqual(['restored', 'conflict']);
+    expect(chain.restored.map((record) => record.id)).toEqual([third.record.id]);
+    expect(chain.retained.map((record) => record.id)).toEqual([second.record.id]);
+    expect(chain.skipped.map((record) => record.id)).toEqual([first.record.id]);
+    expect(chain.closed).toEqual([]);
+    expect(chain.failures).toEqual([]);
+
+    const conflict = only(chain.conflicts, 'conflict report');
+    expect(conflict.recordId).toBe(second.record.id);
+    expect(conflict.reason).toBe('backup-missing');
+    expect(conflict.actualHash).toBe(second.record.instrumentedHash);
+
+    // Link 3 came back to the bytes link 2 wrote, and stopped there.
+    expect(world.log.writes.map((write) => write.expectedHash)).toEqual([
+      third.record.instrumentedHash,
+    ]);
+    expectFileBytes(world.pathOf(OTHER_FILE), second.instrumentedBytes);
+    expect(world.journal.transitions(mark)).toEqual([
+      { recordId: third.record.id, status: 'reverted' },
+      { recordId: second.record.id, status: 'conflict' },
+    ]);
+    expect(world.journal.row(first.record.id).status).toBe('applied');
+    expectFileBytes(world.backupPathOf(first.record.originalHash), first.originalBytes);
+    expect(existsSync(world.backupPathOf(third.record.originalHash))).toBe(false);
   });
 
   it('stops at a conflict introduced between the two restores and leaves the earlier record open', async () => {
@@ -1362,6 +1662,357 @@ describe('a chain of plan versions over one file', () => {
     ]);
     expect(existsSync(world.backupPathOf(first.record.originalHash))).toBe(true);
     expect(existsSync(world.backupPathOf(second.record.originalHash))).toBe(true);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * A file whose records do not form a single chain
+ * ---------------------------------------------------------------------------
+ */
+
+/** A fork over {@link OTHER_FILE}, and the bytes it left on disk. */
+interface ForkedFile {
+  /** The record both branches are layered on, `applied`. */
+  readonly parent: PatchedFile;
+
+  /** The first branch, rolled back and then re-opened as `applied`. */
+  readonly left: ModificationRecord;
+
+  /** The second branch, whose patch is what the file holds. */
+  readonly right: PatchedFile;
+
+  /** The absolute path of the forked file. */
+  readonly path: string;
+}
+
+/**
+ * Builds a fork on a shared parent out of three real patches.
+ *
+ * The parent patches {@link OTHER_FILE}; the left branch is layered on it and
+ * rolled back the way the installer unwinds a failed delta, which returns the
+ * file to the parent's bytes; the right branch is then layered on the same
+ * parent. Re-opening the left branch as `applied` produces exactly what a
+ * journal written before single-child chains were enforced could hold: two
+ * open records naming one `previousRecordId`, each with a real backup behind
+ * it, and a file holding one branch's patch.
+ *
+ * @param world The sandbox to build it in.
+ * @returns The three records and the file.
+ */
+async function forkOnSharedParent(world: World): Promise<ForkedFile> {
+  const parent = await patchSymbol(world, {
+    file: OTHER_FILE,
+    symbol: OTHER_SYMBOL,
+    planVersion: 1,
+  });
+  const left = await patchSymbol(world, {
+    file: OTHER_FILE,
+    symbol: OTHER_SECOND_SYMBOL,
+    planVersion: 2,
+  });
+
+  expect(left.record.previousRecordId).toBe(parent.record.id);
+  expect(
+    expectOk(await restoreModification(left.record, world.context), 'the left branch rollback')
+      .kind,
+  ).toBe('restored');
+  expectFileBytes(left.path, parent.instrumentedBytes);
+
+  const right = await patchSymbol(world, {
+    file: OTHER_FILE,
+    symbol: OTHER_THIRD_SYMBOL,
+    planVersion: 3,
+  });
+
+  expect(right.record.previousRecordId).toBe(parent.record.id);
+  expect(right.record.originalHash).toBe(parent.record.instrumentedHash);
+
+  world.journal.arrange({ ...world.journal.row(left.record.id), status: 'applied' });
+
+  return { parent, left: world.journal.row(left.record.id), right, path: right.path };
+}
+
+/** The ids of `records`, sorted, for a comparison that does not depend on order. */
+function sortedIds(records: readonly { readonly id: string }[]): string[] {
+  return records.map((record) => record.id).sort();
+}
+
+/** The paths the recording filesystem was asked about at all, reads and writes alike. */
+function touchedPaths(log: FileSystemLog): string[] {
+  return [
+    ...log.reads,
+    ...log.snapshots,
+    ...log.resolutions,
+    ...log.writes.map((write) => write.path),
+    ...log.creates.map((write) => write.path),
+  ];
+}
+
+describe('a file whose records do not form a single chain', () => {
+  it('is refused whole when two records share a parent: nothing read or written, every backup kept', async () => {
+    const world = makeWorld();
+    const fork = await forkOnSharedParent(world);
+    const records = [fork.parent.record, fork.left, fork.right.record];
+
+    world.resetLog();
+
+    const mark = world.mark();
+    const outcome = await cleanupSession(world.sessionId, world.context);
+
+    // The file is exactly what it was, and nothing of it was even resolved.
+    expectFileBytes(fork.path, fork.right.instrumentedBytes);
+    expectNoFileSystemAccess(world.log);
+
+    expect(outcome.status).toBe('conflict');
+    expect(outcome.restored).toEqual([]);
+    expect(outcome.failures).toEqual([]);
+    expect(sortedIds(outcome.skipped)).toEqual(sortedIds(records));
+
+    // Every involved record is reported, with the file, the record's own
+    // expectation and the backup the developer is pointed at.
+    expect(outcome.conflicts.map((conflict) => conflict.recordId).sort()).toEqual(
+      sortedIds(records),
+    );
+
+    for (const conflict of outcome.conflicts) {
+      // Its own reason, never 'content-changed': nobody edited this file.
+      expect(conflict.reason).toBe('record-chain-fork');
+      expect(conflict.file).toBe(OTHER_FILE);
+      expect(conflict.detectedAt).toBe(FIXED_NOW);
+      expect(conflict.message).toContain('layered on the same earlier record');
+      expect(conflict.message).toContain(conflict.recordId);
+    }
+
+    // The structured account, with the stable reason.
+    const reported = only(outcome.forks, 'fork report');
+    expect(reported.reason).toBe('record-chain-fork');
+    expect(reported.sessionId).toBe(world.sessionId);
+    expect(reported.file).toBe(OTHER_FILE);
+    expect([...reported.recordIds].sort()).toEqual(sortedIds(records));
+    expect(reported.sharedPreviousRecordIds).toEqual([fork.parent.record.id]);
+    expect(reported.rootRecordIds).toEqual([fork.parent.record.id]);
+
+    // Moved to `conflict`, so the next pass retains them instead of trying.
+    for (const record of records) {
+      expect(world.journal.row(record.id).status).toBe('conflict');
+    }
+
+    expect(world.journal.transitions(mark)).toHaveLength(3);
+    expect(new Set(world.journal.transitions(mark).map((move) => move.status))).toEqual(
+      new Set(['conflict']),
+    );
+
+    // Both originals survive: the pristine one and the parent's output, which
+    // the two branches share.
+    expect(world.removals).toEqual([]);
+    expectFileBytes(world.backupPathOf(fork.parent.record.originalHash), fork.parent.originalBytes);
+    expectFileBytes(
+      world.backupPathOf(fork.right.record.originalHash),
+      fork.parent.instrumentedBytes,
+    );
+    expect(fork.left.originalHash).toBe(fork.right.record.originalHash);
+    expect(existsSync(world.backups.sessionDirectory)).toBe(true);
+  });
+
+  it('still restores an unrelated file in the same pass', async () => {
+    const world = makeWorld();
+    const fork = await forkOnSharedParent(world);
+    const unrelated = await patchSymbol(world, { file: TARGET_FILE, symbol: TARGET_SYMBOL });
+    const forked = [fork.parent.record, fork.left, fork.right.record];
+
+    world.resetLog();
+
+    const outcome = await reconcileModifications(world.context);
+
+    expect(outcome.status).toBe('partial');
+    expect(outcome.examined).toBe(4);
+    expect(outcome.restored.map((record) => record.id)).toEqual([unrelated.record.id]);
+    expect(outcome.closed).toEqual([]);
+    expect(outcome.failures).toEqual([]);
+    expect(outcome.skipped).toEqual([]);
+    expect(sortedIds(outcome.retained)).toEqual(sortedIds(forked));
+    expect(outcome.conflicts.map((conflict) => conflict.recordId).sort()).toEqual(
+      sortedIds(forked),
+    );
+    expect(only(outcome.forks, 'fork report').file).toBe(OTHER_FILE);
+
+    // One write, to the unrelated file; the forked one was not even looked at.
+    expectFileBytes(unrelated.path, unrelated.originalBytes);
+    expectFileBytes(fork.path, fork.right.instrumentedBytes);
+    expect(world.log.writes.map((write) => write.expectedHash)).toEqual([
+      unrelated.record.instrumentedHash,
+    ]);
+    expect(touchedPaths(world.log).filter((path) => path.endsWith(OTHER_FILE))).toEqual([]);
+
+    expect(world.journal.row(unrelated.record.id).status).toBe('reverted');
+    expect(existsSync(world.backupPathOf(unrelated.record.originalHash))).toBe(false);
+    expect(existsSync(world.backupPathOf(fork.parent.record.originalHash))).toBe(true);
+    expect(existsSync(world.backupPathOf(fork.right.record.originalHash))).toBe(true);
+  });
+
+  it('treats a rolled-back layer as history, not a fork: the live layer, then its parent', async () => {
+    // AAP 0.4.2 rollback then retry: plan version 2 was layered on the applied
+    // root and rolled back by the installer (reverted, the root still applied),
+    // and plan version 3 was then layered on the same root. One parent, two
+    // children — but only one of them live, so the file has one reverse order.
+    const world = makeWorld();
+    const pristine = readFileSync(world.pathOf(OTHER_FILE));
+    const parent = await patchSymbol(world, {
+      file: OTHER_FILE,
+      symbol: OTHER_SYMBOL,
+      planVersion: 1,
+    });
+    const rolledBack = await patchSymbol(world, {
+      file: OTHER_FILE,
+      symbol: OTHER_SECOND_SYMBOL,
+      planVersion: 2,
+    });
+
+    expect(rolledBack.record.previousRecordId).toBe(parent.record.id);
+    expect(
+      expectOk(
+        await restoreModification(rolledBack.record, world.context),
+        'the installer rollback of the delta',
+      ).kind,
+    ).toBe('restored');
+    expectFileBytes(rolledBack.path, parent.instrumentedBytes);
+
+    const retry = await patchSymbol(world, {
+      file: OTHER_FILE,
+      symbol: OTHER_THIRD_SYMBOL,
+      planVersion: 3,
+    });
+
+    expect(retry.record.previousRecordId).toBe(parent.record.id);
+    expect(world.journal.row(rolledBack.record.id).status).toBe('reverted');
+
+    // Handed every record, the reverted one included, as a direct caller may.
+    const chain = await restoreChain(
+      [
+        world.journal.row(parent.record.id),
+        world.journal.row(rolledBack.record.id),
+        world.journal.row(retry.record.id),
+      ],
+      world.context,
+    );
+
+    expect(chain.fork).toBeUndefined();
+    expect(chain.conflicts).toEqual([]);
+    expect(chain.failures).toEqual([]);
+    expect(chain.restored.map((record) => record.id)).toEqual([retry.record.id, parent.record.id]);
+    expectFileBytes(world.pathOf(OTHER_FILE), pristine);
+
+    for (const record of [parent.record, rolledBack.record, retry.record]) {
+      expect(world.journal.row(record.id).status).toBe('reverted');
+    }
+  });
+
+  it('is refused whole when two open chains start over one file', async () => {
+    const world = makeWorld();
+    const first = await patchSymbol(world, { file: OTHER_FILE, symbol: OTHER_SYMBOL });
+
+    // Rolled back, then the file is instrumented afresh: the patcher starts a
+    // new root because the only earlier record is reverted.
+    expectOk(await restoreModification(first.record, world.context), 'the first root rollback');
+
+    const second = await patchSymbol(world, { file: OTHER_FILE, symbol: OTHER_SECOND_SYMBOL });
+
+    expect(second.record.previousRecordId).toBeUndefined();
+
+    // Re-opened: two open roots, as a bypassing writer could leave them.
+    world.journal.arrange({ ...world.journal.row(first.record.id), status: 'applied' });
+    world.resetLog();
+
+    const mark = world.mark();
+    const chain = await restoreChain(
+      [world.journal.row(first.record.id), world.journal.row(second.record.id)],
+      world.context,
+    );
+
+    expect(chain.file).toBe(OTHER_FILE);
+    expect(chain.fork?.reason).toBe('record-chain-fork');
+    expect(chain.fork?.sharedPreviousRecordIds).toEqual([]);
+    expect(chain.fork?.rootRecordIds).toEqual([first.record.id, second.record.id].sort());
+    expect(chain.restored).toEqual([]);
+    expect(chain.closed).toEqual([]);
+    expect(chain.skipped).toEqual([]);
+    expect(chain.failures).toEqual([]);
+    expect(sortedIds(chain.retained)).toEqual(sortedIds([first.record, second.record]));
+    expect(chain.outcomes.map((outcome) => outcome.kind)).toEqual(['conflict', 'conflict']);
+    expect(chain.outcomes.map((outcome) => outcome.path)).toEqual([undefined, undefined]);
+    expect(chain.stoppedAt?.id).toBe(chain.fork?.recordIds[0]);
+
+    for (const conflict of chain.conflicts) {
+      expect(conflict.message).toContain('more than one open chain');
+    }
+
+    expectNoFileSystemAccess(world.log);
+    expectFileBytes(second.path, second.instrumentedBytes);
+    expect(world.journal.transitions(mark)).toHaveLength(2);
+    expect(world.journal.row(first.record.id).status).toBe('conflict');
+    expect(world.journal.row(second.record.id).status).toBe('conflict');
+    expectFileBytes(world.backupPathOf(second.record.originalHash), second.originalBytes);
+  });
+
+  it('keeps a record whose conflict the journal refused open, and reports the refusal', async () => {
+    const world = makeWorld();
+    const fork = await forkOnSharedParent(world);
+    const refusal = new DebuggenError('STORE_ERROR', 'The suite journal refuses this write.', {
+      details: { recordId: fork.right.record.id },
+    });
+    const journal: ModificationJournal = {
+      ...world.journal,
+      updateStatus: (id, status, patch) =>
+        id === fork.right.record.id
+          ? Promise.resolve(err(refusal))
+          : world.journal.updateStatus(id, status, patch),
+    };
+
+    world.resetLog();
+
+    const outcome = await cleanupSession(world.sessionId, { ...world.context, journal });
+
+    expect(outcome.status).toBe('conflict');
+    expect(only(outcome.forks, 'fork report').file).toBe(OTHER_FILE);
+    expect(outcome.conflicts.map((conflict) => conflict.recordId).sort()).toEqual(
+      sortedIds([fork.parent.record, fork.left]),
+    );
+
+    const failure = only(outcome.failures, 'failure');
+    expect(failure.recordId).toBe(fork.right.record.id);
+    expect(failure.error.code).toBe('STORE_ERROR');
+    expect(failure.error.details?.['reason']).toBe('journal-transition-failed');
+
+    expect(world.journal.row(fork.right.record.id).status).toBe('applied');
+    expect(world.journal.row(fork.parent.record.id).status).toBe('conflict');
+    expectNoFileSystemAccess(world.log);
+    expect(world.removals).toEqual([]);
+  });
+
+  it('writes nothing to the journal either when the pass is aborted, but still names the fork', async () => {
+    const world = makeWorld();
+    const fork = await forkOnSharedParent(world);
+
+    world.resetLog();
+
+    const mark = world.mark();
+    const outcome = await cleanupSession(world.sessionId, {
+      ...world.context,
+      signal: AbortSignal.abort(),
+    });
+
+    expect(outcome.status).toBe('conflict');
+    expect(outcome.conflicts).toEqual([]);
+    expect(sortedIds(outcome.skipped)).toEqual(
+      sortedIds([fork.parent.record, fork.left, fork.right.record]),
+    );
+    expect(only(outcome.forks, 'fork report').sharedPreviousRecordIds).toEqual([
+      fork.parent.record.id,
+    ]);
+    expect(world.journal.transitions(mark)).toEqual([]);
+    expectNoFileSystemAccess(world.log);
+    expect(world.journal.row(fork.right.record.id).status).toBe('applied');
   });
 });
 

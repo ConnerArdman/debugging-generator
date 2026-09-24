@@ -36,9 +36,10 @@
  *   query" is a real answer, and the component's empty state is how it is shown;
  * - an error clears `data`, so no component can render rows from an earlier page
  *   underneath an error banner;
- * - a missing provider is an error with a code and a hint rather than an empty
- *   result — a query-backed node mounted outside a host that provides data is a
- *   defect in that host surface, and it is reported where a developer sees it;
+ * - a missing provider, or a missing session to address the query to, is an
+ *   error with a code and a hint rather than an empty result — a query-backed
+ *   node mounted outside a host that provides both is a defect in that host
+ *   surface, and it is reported where a developer sees it;
  * - a request that was aborted, because the node unmounted or because its query
  *   changed, reports nothing at all: no state is written on behalf of a component
  *   that has gone, and a superseded answer never overwrites a newer one.
@@ -53,11 +54,12 @@
  * instead of a schedule hidden in here.
  *
  * It also holds no cache. Exactly one settlement is kept — the answer to the
- * request currently described by the provider, the query and the attempt counter
- * — so returning to a query that was resolved earlier resolves it again. That is
- * the honest behaviour for a library that cannot know whether a capture has grown
- * since, and it is what keeps all three states derivable from one value instead
- * of from a store whose invalidation nothing here could reason about.
+ * request currently described by the provider, the session, the query and the
+ * attempt counter — so returning to a query that was resolved earlier resolves
+ * it again. That is the honest behaviour for a library that cannot know whether
+ * a capture has grown since, and it is what keeps all three states derivable
+ * from one value instead of from a store whose invalidation nothing here could
+ * reason about.
  *
  * ## Why the query is keyed by value
  *
@@ -75,7 +77,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { DataQuery, DataQuerySource } from '@debuggen/panel-schema';
 import { DebuggenError } from '@debuggen/shared';
 
-import { useDataProvider } from './DataProvider';
+import { isAddressableSessionId, useDataProvider, usePanelSessionId } from './DataProvider';
 import type { DataProvider, DataQueryResponse, DataResultFor } from './DataProvider';
 
 /*
@@ -273,6 +275,12 @@ export interface UseQueryResult<T> {
    * The offset that would return the next page, or `undefined` when this page is
    * the last one — or when the source is not paged.
    *
+   * `undefined` is the only end-of-data value a component ever sees. The
+   * provider may report the last page either by omitting the counter or with the
+   * wire's own `null` (see `DataQueryResponse.nextOffset`); this hook folds both
+   * into `undefined`, so a view's `nextOffset === undefined` test is complete and
+   * a `null` can never read as "another page exists".
+   *
    * A view advances paging by copying this value into the `offset` of the query
    * it passes in on the next render. It must never derive an offset from the
    * length of `data`, which drifts the moment a limit is clamped.
@@ -334,11 +342,11 @@ export interface UseQueryOptions {
  *
  * The stamp is what makes staleness decidable during render rather than by a
  * follow-up state write. A settlement describes the current request only while
- * the provider, the query key and the attempt counter all still match; the
- * moment any of them changes, the previous answer stops being reported and the
- * result reads as `"loading"` in the very same render that changed it. No
- * component ever draws one query's page while another query's request is in
- * flight, and no reset write is needed to make that true.
+ * the provider, the session, the query key and the attempt counter all still
+ * match; the moment any of them changes, the previous answer stops being
+ * reported and the result reads as `"loading"` in the very same render that
+ * changed it. No component ever draws one query's page while another query's
+ * request is in flight, and no reset write is needed to make that true.
  *
  * @typeParam Data - The result type of the query's source.
  */
@@ -346,9 +354,18 @@ interface QuerySettlement<Data> {
   /**
    * The provider that produced this answer, and `undefined` for the
    * missing-provider error, which no provider produced. Compared by identity,
-   * which is why a provider is expected to be created once per session.
+   * which is why a provider is expected to be created once per host surface.
    */
   readonly provider: DataProvider | undefined;
+
+  /**
+   * The session value in context when the request was made: the session the
+   * request was addressed to, or — for the missing-session error — the absent
+   * or blank value that made it unaddressable. Part of the stamp so an answer
+   * for one session is never reported under a panel for another: the same query
+   * shape asked of two sessions is two different requests.
+   */
+  readonly sessionId: string | undefined;
 
   /** The {@link stableQueryKey} of the query this answers. */
   readonly key: string;
@@ -374,7 +391,7 @@ interface QuerySettlement<Data> {
 
 /**
  * Whether a settlement answers the request currently described by the provider,
- * the query key and the attempt counter.
+ * the session, the query key and the attempt counter.
  *
  * Every condition is compared explicitly rather than through optional chaining:
  * `settlement?.key === key` is `true` when both are `undefined`, which would
@@ -382,6 +399,7 @@ interface QuerySettlement<Data> {
  *
  * @param settlement - The settlement held in state, if any.
  * @param provider - The provider currently in context.
+ * @param sessionId - The session currently in context, if any.
  * @param key - The current query's stable key, or `undefined` for no query.
  * @param attempt - The current attempt counter.
  * @returns `true` when the settlement is the answer to the current request.
@@ -389,6 +407,7 @@ interface QuerySettlement<Data> {
 function describesCurrentRequest<Data>(
   settlement: QuerySettlement<Data> | undefined,
   provider: DataProvider | undefined,
+  sessionId: string | undefined,
   key: string | undefined,
   attempt: number,
 ): settlement is QuerySettlement<Data> {
@@ -397,7 +416,8 @@ function describesCurrentRequest<Data>(
     key !== undefined &&
     settlement.key === key &&
     settlement.attempt === attempt &&
-    settlement.provider === provider
+    settlement.provider === provider &&
+    settlement.sessionId === sessionId
   );
 }
 
@@ -428,6 +448,33 @@ function missingProviderError(source: DataQuerySource): DebuggenError {
   );
 }
 
+/**
+ * The error reported for a query-backed node that has a provider but no session
+ * to address its query to.
+ *
+ * The same kind of defect as a missing provider, and reported the same way for
+ * the same reason: `POST /sessions/:id/panel-data` cannot be addressed without
+ * an id, and inventing one — or letting a provider fall back to whichever
+ * session it last served — would draw another capture's evidence under this
+ * panel's title. `PanelHost` always provides its specification's `sessionId`,
+ * so reaching this means a surface mounted query-backed views on its own and
+ * provided only half of the data contract. The details name the source only;
+ * the unusable value itself is not echoed.
+ *
+ * @param source - The source of the query that could not be addressed.
+ * @returns A fresh error, so its stack points at the render that needed data.
+ */
+function missingSessionError(source: DataQuerySource): DebuggenError {
+  return new DebuggenError(
+    'INTERNAL',
+    `No session is available to address the "${source}" query this view is built from.`,
+    {
+      hint: "Render this view inside a panel host, which provides its specification's sessionId through PanelSessionContext.",
+      details: { source },
+    },
+  );
+}
+
 /*
  * ---------------------------------------------------------------------------
  * The hook
@@ -445,19 +492,24 @@ function missingProviderError(source: DataQuerySource): DebuggenError {
  *
  * ## What it does, in order
  *
- * 1. Reads the provider from context. A missing provider is reported as an error
- *    (see {@link missingProviderError}); it never throws, because a throw here
- *    would take down a panel instead of showing a node's error state.
+ * 1. Reads the provider and the panel's session id from context. A missing
+ *    provider, or a missing or blank session id, is reported as an error (see
+ *    {@link missingProviderError} and {@link missingSessionError}); it never
+ *    throws, because a throw here would take down a panel instead of showing a
+ *    node's error state.
  * 2. Computes the query's {@link stableQueryKey}. That key, the provider's
- *    identity and the attempt counter together identify "the current request".
- * 3. Resolves that request once through `provider.query`, with an
- *    `AbortController` whose signal travels on the call. The effect's cleanup
- *    aborts it, so a request is abandoned the moment the node unmounts, the
- *    query changes, the provider changes, the query is disabled or a retry
- *    supersedes it — and the settlement of an abandoned request is discarded
- *    rather than written, which is what keeps a slow first answer from
- *    overwriting a fast second one.
- * 4. Reports the outcome as one of the three states of {@link UseQueryResult}.
+ *    identity, the session id and the attempt counter together identify "the
+ *    current request".
+ * 3. Resolves that request once through `provider.query(sessionId, query, …)` —
+ *    the session id exactly as the context holds it, the query exactly as the
+ *    node carried it — with an `AbortController` whose signal travels on the
+ *    call. The effect's cleanup aborts it, so a request is abandoned the moment
+ *    the node unmounts, the query changes, the provider or the session changes,
+ *    the query is disabled or a retry supersedes it — and the settlement of an
+ *    abandoned request is discarded rather than written, which is what keeps a
+ *    slow first answer from overwriting a fast second one.
+ * 4. Reports the outcome as one of the three states of {@link UseQueryResult},
+ *    with the provider's `null` end-of-data marker folded into `undefined`.
  *
  * ## States
  *
@@ -486,6 +538,7 @@ export function useQuery<S extends DataQuerySource>(
   options?: UseQueryOptions,
 ): UseQueryResult<DataResultFor<S>> {
   const provider = useDataProvider();
+  const sessionId = usePanelSessionId();
   const enabled = options?.enabled ?? true;
 
   // Recomputed every render, deliberately: the key is what makes an unstable
@@ -542,11 +595,32 @@ export function useQuery<S extends DataQuerySource>(
     if (provider === undefined) {
       setSettlement({
         provider: undefined,
+        sessionId,
         key,
         attempt,
         status: 'error',
         data: undefined,
         error: missingProviderError(pending.source),
+        total: undefined,
+        nextOffset: undefined,
+      });
+      return undefined;
+    }
+
+    if (!isAddressableSessionId(sessionId)) {
+      // A provider with nowhere to address the query. Reported rather than
+      // forwarded: the provider would reject a blank session anyway, but only
+      // after a transport hop, and a query must never go out addressed to a
+      // session this panel does not name. Stamped with the unusable value that
+      // is in context, so providing a real session afterwards supersedes it.
+      setSettlement({
+        provider,
+        sessionId,
+        key,
+        attempt,
+        status: 'error',
+        data: undefined,
+        error: missingSessionError(pending.source),
         total: undefined,
         nextOffset: undefined,
       });
@@ -565,8 +639,10 @@ export function useQuery<S extends DataQuerySource>(
     // outcomes are handled here, so there is nothing left for a caller to catch.
     // The type argument is explicit so the response's `data` is typed as this
     // source's result rather than inferred from an intersection — which is why
-    // no cast is needed anywhere in this module.
-    void provider.query<S>(pending, { signal: controller.signal }).then(
+    // no cast is needed anywhere in this module. The session id is the one the
+    // context holds, passed exactly: `PanelHost` puts its specification's own
+    // `sessionId` there, and that is the only session this panel may read.
+    void provider.query<S>(sessionId, pending, { signal: controller.signal }).then(
       (response: DataQueryResponse<S>) => {
         if (cancelled) {
           return;
@@ -575,15 +651,19 @@ export function useQuery<S extends DataQuerySource>(
         // Written through verbatim: no validation, no transformation, no
         // re-ordering, no merging with a previous page (AAP 0.4.2). An empty
         // page is a success, and the component's empty state is how it shows.
+        // The one normalisation is of spelling, not of meaning: the wire's
+        // `nextOffset: null` ("this is the last page") becomes the `undefined`
+        // every component already reads as end-of-data.
         setSettlement({
           provider,
+          sessionId,
           key,
           attempt,
           status: 'success',
           data: response.data,
           error: undefined,
           total: response.total,
-          nextOffset: response.nextOffset,
+          nextOffset: response.nextOffset ?? undefined,
         });
       },
       (cause: unknown) => {
@@ -600,6 +680,7 @@ export function useQuery<S extends DataQuerySource>(
         // drawn over rows from an earlier answer.
         setSettlement({
           provider,
+          sessionId,
           key,
           attempt,
           status: 'error',
@@ -615,7 +696,7 @@ export function useQuery<S extends DataQuerySource>(
       cancelled = true;
       controller.abort();
     };
-  }, [provider, key, enabled, attempt]);
+  }, [provider, sessionId, key, enabled, attempt]);
 
   const retry = useCallback(() => {
     setAttempt((previous) => previous + 1);
@@ -623,11 +704,13 @@ export function useQuery<S extends DataQuerySource>(
 
   // Staleness is decided here, during render, rather than by a state write: a
   // settlement is reported only while it still answers the current request, so
-  // changing a sort, advancing an offset, retrying, disabling the query or
-  // swapping the provider reads as `"loading"` immediately and without a second
-  // render.
+  // changing a sort, advancing an offset, retrying, disabling the query, or
+  // swapping the provider or the session reads as `"loading"` immediately and
+  // without a second render.
   const settled =
-    enabled && describesCurrentRequest(settlement, provider, key, attempt) ? settlement : undefined;
+    enabled && describesCurrentRequest(settlement, provider, sessionId, key, attempt)
+      ? settlement
+      : undefined;
 
   // Memoized because twelve components read this inside render and some of them
   // pass it, or its `retry`, into memoized children. Both dependencies are

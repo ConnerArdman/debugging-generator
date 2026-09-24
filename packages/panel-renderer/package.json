@@ -20,11 +20,12 @@
     "dist"
   ],
   "scripts": {
-    "prebuild": "node scripts/build-tokens.mjs",
+    "prebuild": "node scripts/build-tokens.mjs && node scripts/check-css-classes.mjs",
     "build": "tsup",
     "typecheck": "tsc -b",
     "test": "vitest run --root ../.. --project panel-renderer",
-    "tokens:check": "node scripts/build-tokens.mjs --check"
+    "tokens:check": "node scripts/build-tokens.mjs --check",
+    "css:check": "node scripts/check-css-classes.mjs"
   },
   "dependencies": {
     "@debuggen/panel-schema": "workspace:*",

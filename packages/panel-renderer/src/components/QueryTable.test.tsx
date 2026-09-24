@@ -83,12 +83,12 @@ import type { DataQuery, DataQuerySort, QueryTableNode } from '@debuggen/panel-s
 import { DebuggenError } from '@debuggen/shared';
 import type { SourceLocation } from '@debuggen/shared';
 import type { QueryCaller, QueryGroup, QueryOccurrence } from '@debuggen/telemetry';
-import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Mock } from 'vitest';
 
-import { DataProviderContext, createDataProvider } from '../host/DataProvider';
+import { DataProviderContext, PanelSessionContext, createDataProvider } from '../host/DataProvider';
 import type { DataProvider, DataQueryResolver, DataQueryResponse } from '../host/DataProvider';
 import { PanelActionsContext } from '../host/PanelActions';
 import type { PanelActions, PanelEventRef } from '../host/PanelActions';
@@ -715,6 +715,13 @@ function makeActions(): ActionSpies {
 }
 
 /**
+ * The session the rendered view's queries are addressed to, provided the way
+ * `PanelHost` provides a specification's `sessionId`. Nothing below asserts on
+ * it: the routing contract is pinned by `../host/PanelHost.test.tsx`.
+ */
+const PANEL_SESSION_ID = 'session-under-test';
+
+/**
  * Renders the component inside both host contexts.
  *
  * @param node The node to draw.
@@ -726,9 +733,11 @@ function renderComponent(
 ): void {
   render(
     <DataProviderContext.Provider value={context.provider}>
-      <PanelActionsContext.Provider value={context.actions}>
-        <QueryTable node={node} />
-      </PanelActionsContext.Provider>
+      <PanelSessionContext.Provider value={PANEL_SESSION_ID}>
+        <PanelActionsContext.Provider value={context.actions}>
+          <QueryTable node={node} />
+        </PanelActionsContext.Provider>
+      </PanelSessionContext.Provider>
     </DataProviderContext.Provider>,
   );
 }
@@ -1858,5 +1867,392 @@ describe('QueryTable paging', () => {
 
     expect(stub.resolve).toHaveBeenCalledTimes(3);
     expect(queryOfCall(stub, 3)).toEqual(queryOfCall(stub, 2));
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Keyboard-reachable descriptions
+ *
+ * Every tooltip in this view carries text a reader needs — the whole statement
+ * behind an abbreviated preview, and the meaning of a bare count — so every
+ * trigger must open by keyboard focus as well as by hover (WCAG 2.1.1). The
+ * cases below move real focus onto each trigger, follow its `aria-describedby`
+ * to the bubble it announces, and check that the focus stops add no control: a
+ * trigger is described, never operated.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * The sentence the caller-count tooltip carries, spelled out so this suite pins
+ * the explanation a reader hears beside a bare number.
+ */
+const CALLER_COUNT_TOOLTIP = 'How many of this statement’s executions came from this location.';
+
+/**
+ * The aggregate's "no readable statement" key, typed against its upstream
+ * declaration so a changed spelling fails to compile here rather than letting
+ * this case silently test an ordinary statement.
+ */
+const UNKNOWN_STATEMENT: typeof import('@debuggen/telemetry').UNKNOWN_STATEMENT_KEY =
+  '(unknown statement)';
+
+/** The state class `Tooltip` writes on its bubble while the bubble is shown. */
+const OPEN_BUBBLE_CLASS = 'dg-is-open';
+
+/** The user-event instance a case drives its keyboard with. */
+type KeyboardUser = ReturnType<typeof userEvent.setup>;
+
+/**
+ * The one element matching `selector` inside `scope`, failing on any other count.
+ *
+ * @param scope The element to search within.
+ * @param selector A CSS selector.
+ * @returns The single match.
+ */
+function soleMatch(scope: ParentNode, selector: string): HTMLElement {
+  const matches = [...scope.querySelectorAll<HTMLElement>(selector)];
+  const [only] = matches;
+
+  if (only === undefined || matches.length !== 1) {
+    throw new Error(`expected exactly one "${selector}", found ${String(matches.length)}`);
+  }
+
+  return only;
+}
+
+/**
+ * The tooltip a trigger announces, resolved the way an assistive technology
+ * resolves it: through the ids in its `aria-describedby`.
+ *
+ * @param trigger The described element.
+ * @returns The single `role="tooltip"` element among its descriptions.
+ */
+function describingTooltip(trigger: HTMLElement): HTMLElement {
+  const bubbles = (trigger.getAttribute('aria-describedby') ?? '')
+    .split(/\s+/u)
+    .filter((id) => id.length > 0)
+    .map((id) => document.getElementById(id))
+    .filter((element): element is HTMLElement => element?.getAttribute('role') === 'tooltip');
+  const [only] = bubbles;
+
+  if (only === undefined || bubbles.length !== 1) {
+    throw new Error(`expected exactly one describing tooltip, found ${String(bubbles.length)}`);
+  }
+
+  return only;
+}
+
+/**
+ * Whether a tooltip bubble is currently shown.
+ *
+ * @param bubble The `role="tooltip"` element.
+ * @returns `true` while `Tooltip` holds it open.
+ */
+function isShown(bubble: HTMLElement): boolean {
+  return bubble.classList.contains(OPEN_BUBBLE_CLASS);
+}
+
+/**
+ * Drives one trigger through the whole keyboard contract of a tooltip: it is a
+ * tab stop, it is described by a bubble carrying exactly `description`, focus
+ * opens that bubble at once, Escape dismisses it without taking focus away, and
+ * leaving the trigger closes it — after which focus opens it again.
+ *
+ * It also pins what the stop is NOT: no role, no accessible name of its own and
+ * no enclosing control, so the visible figure or preview is what is read and
+ * the bubble is its description.
+ *
+ * @param user The user-event instance of the case.
+ * @param trigger The tooltip's trigger element.
+ * @param description The exact text its bubble must carry.
+ */
+async function expectKeyboardDisclosure(
+  user: KeyboardUser,
+  trigger: HTMLElement,
+  description: string,
+): Promise<void> {
+  expect(trigger.getAttribute('tabindex')).toBe('0');
+  expect(trigger.tabIndex).toBe(0);
+  expect(trigger.getAttribute('role')).toBeNull();
+  expect(trigger.getAttribute('aria-label')).toBeNull();
+  expect(trigger.closest('button, [role="button"]')).toBeNull();
+
+  const bubble = describingTooltip(trigger);
+
+  expect(bubble.textContent).toBe(description);
+  expect(isShown(bubble)).toBe(false);
+
+  act(() => {
+    trigger.focus();
+  });
+
+  expect(document.activeElement).toBe(trigger);
+  expect(isShown(bubble)).toBe(true);
+
+  // Escape belongs to the open bubble first, and dismisses the description
+  // rather than the reader's place.
+  await user.keyboard('{Escape}');
+
+  expect(isShown(bubble)).toBe(false);
+  expect(document.activeElement).toBe(trigger);
+
+  act(() => {
+    trigger.blur();
+  });
+
+  expect(document.activeElement).not.toBe(trigger);
+
+  // Leaving clears the dismissal, so the next arrival opens it again, and the
+  // next departure closes it.
+  act(() => {
+    trigger.focus();
+  });
+
+  expect(isShown(bubble)).toBe(true);
+
+  act(() => {
+    trigger.blur();
+  });
+
+  expect(isShown(bubble)).toBe(false);
+}
+
+describe('QueryTable keyboard-reachable descriptions', () => {
+  it('opens the whole statement behind an abbreviated preview on keyboard focus', async () => {
+    const stub = resolvingProvider([FIRST_GROUP]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+
+    const header = within(dataRow(0)).getByRole('rowheader');
+    const preview = soleMatch(header, 'code.dg-query-table__statement');
+
+    // The preview is abbreviated — the premise of the tooltip — and the bubble
+    // carries the received statement byte for byte, not a re-derived form.
+    expect(preview.textContent).toBe(oneLinePreview(STATEMENT));
+    expect(preview.textContent).not.toBe(STATEMENT);
+
+    await expectKeyboardDisclosure(user, preview, STATEMENT);
+
+    // Reached by Tab too, straight after the row's disclosure control, which is
+    // the order a keyboard reader walks the cell in.
+    const bubble = describingTooltip(preview);
+
+    act(() => {
+      within(header).getByRole('button', { name: EXPAND_ROW_NAME }).focus();
+    });
+    await user.tab();
+
+    expect(document.activeElement).toBe(preview);
+    expect(isShown(bubble)).toBe(true);
+    expect(bubble.textContent).toBe(STATEMENT);
+
+    // Focus displays; it never transforms.
+    expect(preview.textContent).toBe(oneLinePreview(STATEMENT));
+  });
+
+  it('explains the row-count column on keyboard focus, reported or not', async () => {
+    const unreported = makeQueryGroup({
+      id: 'query-example-0003',
+      statement: SECOND_STATEMENT,
+      normalizedStatement: SECOND_STATEMENT,
+      totalRowCount: undefined,
+    });
+    const stub = resolvingProvider([FIRST_GROUP, unreported]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+
+    const figures = [formatCount(DEFAULT_ROW_COUNT), NOT_AVAILABLE_LABEL];
+
+    for (const [index, figure] of figures.entries()) {
+      const cell = soleMatch(dataRow(index), 'code.dg-query-table__rows');
+
+      expect(cell.textContent).toBe(figure);
+
+      await expectKeyboardDisclosure(user, cell, ROW_COUNT_TOOLTIP);
+    }
+  });
+
+  it('explains every caller execution count on keyboard focus', async () => {
+    const stub = resolvingProvider([FIRST_GROUP]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+
+    const callers = [...dataRow(0).querySelectorAll<HTMLElement>('.dg-query-table__caller')];
+
+    // Both callers — the one that resolved to a chip and the one that did not —
+    // carry a count, and each count is reachable on its own.
+    expect(callers).toHaveLength(FIRST_GROUP.callers.length);
+
+    for (const [index, caller] of callers.entries()) {
+      const expected = FIRST_GROUP.callers[index];
+
+      if (expected === undefined) {
+        throw new Error(`the fixture group carries no caller at index ${String(index)}`);
+      }
+
+      const count = soleMatch(caller, '.dg-badge');
+
+      expect(count.textContent).toBe(formatCount(expected.executionCount));
+
+      await expectKeyboardDisclosure(user, count, CALLER_COUNT_TOOLTIP);
+    }
+  });
+
+  it('explains the row count of every execution in an expanded row on keyboard focus', async () => {
+    const stub = resolvingProvider([FIRST_GROUP]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+    await user.click(screen.getByRole('button', { name: EXPAND_ROW_NAME }));
+
+    const detail = detailRow();
+    const executions = [...detail.querySelectorAll<HTMLElement>('.dg-query-table__occurrence-row')];
+
+    expect(executions).toHaveLength(FIRST_GROUP.occurrences.length);
+
+    for (const [index, execution] of executions.entries()) {
+      const rowCount = FIRST_GROUP.occurrences[index]?.rowCount;
+
+      if (rowCount === undefined) {
+        throw new Error(`the fixture execution at index ${String(index)} reports no row count`);
+      }
+
+      const cell = soleMatch(execution, 'code.dg-query-table__rows');
+
+      expect(cell.textContent).toBe(formatCount(rowCount));
+
+      await expectKeyboardDisclosure(user, cell, ROW_COUNT_TOOLTIP);
+    }
+
+    // The expanded statement block keeps the focus stop its primitive gives a
+    // scrollable box, independent of any tooltip.
+    const [block] = statementBlocks(detail);
+
+    expect(block?.getAttribute('tabindex')).toBe('0');
+    expect(block?.textContent).toBe(STATEMENT);
+  });
+
+  it('adds no focus stop where there is nothing to disclose', async () => {
+    const whole = makeQueryGroup({
+      id: 'query-example-0004',
+      statement: SECOND_STATEMENT,
+      normalizedStatement: SECOND_STATEMENT,
+    });
+    const unknown = makeQueryGroup({
+      id: 'query-example-0005',
+      statement: UNKNOWN_STATEMENT,
+      normalizedStatement: UNKNOWN_STATEMENT,
+    });
+    const stub = resolvingProvider([whole, unknown]);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+
+    // A preview that is already the whole statement: no tooltip, so no stop and
+    // no description that would repeat what is on screen.
+    expect(oneLinePreview(SECOND_STATEMENT)).toBe(SECOND_STATEMENT);
+
+    const wholeHeader = within(dataRow(0)).getByRole('rowheader');
+    const wholeStatement = soleMatch(wholeHeader, 'code.dg-query-table__statement');
+
+    expect(wholeStatement.textContent).toBe(SECOND_STATEMENT);
+    expect(wholeStatement.getAttribute('tabindex')).toBeNull();
+    expect(wholeStatement.getAttribute('aria-describedby')).toBeNull();
+    expect(within(wholeHeader).queryAllByRole('tooltip')).toHaveLength(0);
+
+    // The aggregate's word for an absence is prose, never code, and carries no
+    // tooltip either — so the disclosure control is the header's only stop.
+    const unknownHeader = within(dataRow(1)).getByRole('rowheader');
+
+    expect(unknownHeader.querySelector('code')).toBeNull();
+    expect(within(unknownHeader).getByText(UNKNOWN_STATEMENT)).toBeDefined();
+    expect(within(unknownHeader).queryAllByRole('tooltip')).toHaveLength(0);
+
+    for (const header of [wholeHeader, unknownHeader]) {
+      expect(header.querySelectorAll('[tabindex]')).toHaveLength(0);
+    }
+  });
+
+  it('adds focus stops without adding a control or disturbing the row keys', async () => {
+    const stub = resolvingProvider(PROVIDER_ORDER);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    await screen.findByRole('grid');
+
+    // The control surface is exactly the one the privacy case pins: every new
+    // stop is a described element, never a button.
+    expect(controlNames()).toEqual(
+      [
+        EXECUTIONS_SORT_NAME,
+        TOTAL_TIME_SORT_NAME,
+        EXPAND_ROW_NAME,
+        EXPAND_ROW_NAME,
+        SOURCE_CHIP_NAME,
+        SOURCE_CHIP_NAME,
+      ].sort(),
+    );
+
+    // The keys a row answers are not answered by a trigger inside it: Enter,
+    // Space and the arrows pressed on a focused count expand nothing, select
+    // nothing and leave focus where the reader put it.
+    const count = soleMatch(dataRow(0), 'code.dg-query-table__rows');
+
+    act(() => {
+      count.focus();
+    });
+    await user.keyboard('{Enter}{ }{ArrowDown}{ArrowUp}');
+
+    expect(document.activeElement).toBe(count);
+    expect(detailRowCount()).toBe(0);
+    expect(spies.onExpand).not.toHaveBeenCalled();
+    expect(spies.onSelectEvent).not.toHaveBeenCalled();
+    expect(spies.onOpenSource).not.toHaveBeenCalled();
+
+    // And the rows still answer them: the grid's own navigation is intact.
+    const firstRow = dataRow(0);
+
+    act(() => {
+      firstRow.focus();
+    });
+    await user.keyboard('{ArrowDown}');
+
+    expect(document.activeElement).toBe(dataRow(1));
+
+    // Opening a row adds the executions' own controls and nothing else, as the
+    // privacy case pins for a single row.
+    await user.click(within(dataRow(0)).getByRole('button', { name: EXPAND_ROW_NAME }));
+
+    const occurrenceNames = FIRST_GROUP.occurrences.map(
+      (occurrence) =>
+        `Select the execution at +${formatOffset(occurrence.startTime, FIRST_GROUP.firstStartTime)}`,
+    );
+
+    expect(controlNames()).toEqual(
+      [
+        EXECUTIONS_SORT_NAME,
+        TOTAL_TIME_SORT_NAME,
+        COLLAPSE_ROW_NAME,
+        EXPAND_ROW_NAME,
+        SOURCE_CHIP_NAME,
+        SOURCE_CHIP_NAME,
+        ...occurrenceNames,
+      ].sort(),
+    );
   });
 });

@@ -36,12 +36,30 @@
  *   run into a fallback view, which is a materially worse answer to the
  *   question they asked.
  *
- * The node-type coverage carries extra weight while
- * `packages/panel-renderer/src/host` is still empty and its `registry.test.ts`
- * does not exist: together with `./catalog.test.ts`, this file is the only live
- * enforcement of the catalog↔renderer invariant, so a catalog entry whose
- * declared sources this validator would refuse — and a node type it has no
- * handling for — must fail here.
+ * The node-type coverage is this package's half of the catalog↔renderer
+ * invariant, which two packages enforce between them. Each half lives in the
+ * suite that can see it, because the renderer depends on this package and
+ * never the reverse (AAP §0.6.2):
+ *
+ * - **Schema side, in this package.** `./catalog.test.ts` asserts that the
+ *   catalog's key set equals the node-type union exactly. This file asserts
+ *   that the validator accepts every catalogued node type with each source its
+ *   entry declares, and that a node type outside the catalog is rejected before
+ *   rendering — "an unknown node type must fail" (AAP §0.8.3).
+ * - **Renderer side, in `packages/panel-renderer/src/host`.** `registry.ts`
+ *   keys the component registry by the catalog's node-type vocabulary, and the
+ *   record's `satisfies` clause makes a missing or an extra entry a compile
+ *   error. The colocated `registry.test.ts` pairs every catalogued node type
+ *   with a component in both directions, finds no component for a type outside
+ *   the catalog, renders every catalogued component against a recorded
+ *   panel-data response, and renders a node type with no component as an error
+ *   state, never a blank area. `PanelHost.test.tsx` covers rendering at the
+ *   host level: the summary, the fallback notice and a nested layout.
+ *
+ * Neither side stands in for the other. The renderer's suites assume a
+ * validated specification, so a catalog entry whose declared sources this
+ * validator would refuse — and a node type it has no handling for — must fail
+ * here.
  *
  * ## Privacy (AAP §0.5.2)
  *
@@ -813,10 +831,11 @@ describe('validatePanelSpec accepts well-formed specifications', () => {
  * ---------------------------------------------------------------------------
  * Acceptance: the catalog ↔ validator loop
  *
- * The half of AAP §0.6.2's renderer contract this package can still enforce
- * while `packages/panel-renderer/src/host` is empty. Two directions are closed
- * here: a catalog entry whose declared sources this validator would refuse, and
- * a node type the validator has no handling for.
+ * This package's half of AAP §0.6.2's renderer contract; the renderer's half —
+ * one component per catalogued node type, in both directions — is asserted by
+ * `packages/panel-renderer/src/host/registry.test.ts`. Two directions are
+ * closed here: a catalog entry whose declared sources this validator would
+ * refuse, and a node type the validator has no handling for.
  * ---------------------------------------------------------------------------
  */
 

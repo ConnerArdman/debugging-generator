@@ -52,11 +52,15 @@
  * property of *this* module rather than of the emitter: the field schemas below
  * are **shared instances**, not per-node copies — one source enumeration, one
  * filter, one limit — so every repetition across the sixteen node types is the
- * same schema object. Rendering with reference reuse therefore collapses the
- * document from roughly 99 KB of inlined duplication to roughly 22 KB of
- * definitions and references, measured on this schema. A future edit that
- * rebuilt any of those fields per node would quadruple the prompt's schema
- * section while changing nothing about what is accepted.
+ * same schema object, and each leaf is the same schema object at every one of
+ * the nesting levels described under "The node union, level by level". Rendered
+ * with reference reuse, the document is roughly 60 KB of definitions and
+ * references (60,046 characters, measured on this schema); inlined, each level
+ * would be copied into each of the three containers of the level above, and
+ * the rendering outgrows the longest string the runtime can hold. A future edit
+ * that rebuilt any of those fields per node, or the leaves per level, would
+ * multiply the prompt's schema section while changing nothing about what is
+ * accepted.
  *
  * ## What the authored form deliberately allows
  *
@@ -130,6 +134,7 @@ import type { Result } from '@debuggen/shared';
 import { METRIC_IDS } from '@debuggen/telemetry';
 
 import {
+  isLayoutNodeType,
   LAYOUT_NODE_MAX_CHILDREN,
   LAYOUT_NODE_MIN_CHILDREN,
   splitDirectionSchema,
@@ -145,7 +150,14 @@ import {
   type DataQueryFlatFieldKey,
 } from './nodes/query.js';
 import type { QueryBackedNodeType } from './nodes/viz.js';
-import { PANEL_LAYOUT_MAX_NODES, PANEL_NODE_TYPES, PANEL_TITLE_MAX_LENGTH } from './spec.js';
+import {
+  PANEL_CHILDREN_FIELD,
+  PANEL_LAYOUT_FIELD,
+  PANEL_LAYOUT_MAX_NODES,
+  PANEL_NODE_TYPES,
+  PANEL_TITLE_MAX_LENGTH,
+  PANEL_VIZ_NODE_TYPES,
+} from './spec.js';
 import {
   describeIssues,
   MAX_HEADLINE_LENGTH,
@@ -154,6 +166,7 @@ import {
   MAX_SUMMARY_HYPOTHESES,
   type SchemaIssueSummary,
 } from './summary.js';
+import { PANEL_MAX_NODE_DEPTH, type PanelValidationIssueCode } from './validate.js';
 
 /*
  * ---------------------------------------------------------------------------
@@ -637,17 +650,20 @@ export type VisualizationNodeInput = QueryBackedNodeInput | SourceLinkNodeInput;
  *
  * The authored form of a container is the internal one minus the derived id:
  * the same three types, the same child-count bounds, the same optional axis on
- * the split. The bounds are imported rather than restated, so a layout that
- * passes this schema is a layout the internal schema accepts — which is what
- * keeps a container failure at step 1, where it is repairable, instead of at
- * step 3, where it would be a product bug.
+ * the split, and the same nesting-depth bound. The bounds are imported rather
+ * than restated, so a layout that passes this schema is a layout the internal
+ * schema and the syntactic validator accept — which is what keeps a container
+ * failure at step 1, where it is repairable, instead of at step 3, where it
+ * would be a product bug.
  *
  * The internal schema factories in `./nodes/layout.ts` cannot be reused here:
  * they require the `id` that only the normaliser can supply. The types below
  * are therefore declared explicitly, as interfaces, for the reason that module
  * records — a recursive type routed through a second type alias is rejected
  * outright (TS2456), while a reference to an interface is deferred and may be
- * circular.
+ * circular. The *types* are recursive and admit any depth; the *schemas* that
+ * follow them are not recursive at all, and admit exactly
+ * {@link PANEL_MAX_NODE_DEPTH} levels (see "The node union, level by level").
  * ---------------------------------------------------------------------------
  */
 
@@ -715,77 +731,132 @@ export type LayoutNodeInput = SectionNodeInput | SplitNodeInput | StackNodeInput
  * {@link LayoutNodeInput}, because only a reference to an *interface* is
  * deferred by the compiler; routing the recursion through the alias is rejected
  * as a circular type reference.
+ *
+ * The type admits a tree of any depth, because a type cannot count; the schema
+ * that produces values of it does, and admits {@link PANEL_MAX_NODE_DEPTH}
+ * levels. A value built by hand rather than parsed can therefore be deeper than
+ * any parsed one, which is why `./normalize.ts` walks one without recursion.
  */
 export type PanelNodeInput =
   VisualizationNodeInput | SectionNodeInput | SplitNodeInput | StackNodeInput;
 
 /**
- * The child position of every container, deferred.
+ * Builds the authored form of the three containers for one nesting level, with
+ * `child` as the schema every child position of that level is parsed by.
  *
- * `z.lazy` is what makes a panel a tree: the reference to the union below is
- * read when the first nested node is parsed, not while the schemas are being
- * constructed, so there is no initialisation cycle despite the apparent one.
- * Only the *child* position is deferred — the union itself is built eagerly,
- * once, at module load, so a node's schema identity does not change between
- * parses.
+ * A factory rather than three constants because the authoring schema is an
+ * unrolled chain (see "The node union, level by level" below): each level has
+ * its own three container schemas, identical to those of every other level
+ * except in the schema their `children` array holds. Everything an author reads
+ * — the strictness, the labels, the split axis, the child-count bounds and
+ * every description — is therefore stated once, here, for all levels.
+ *
+ * The return type is deliberately inferred: the `type` literal of each schema
+ * has to survive into it, or the discriminated union a level is built from
+ * could no longer see its options' discriminators.
+ *
+ * @param child The schema of a node one level below the containers built here.
+ * @returns The section, split and stack schemas of this level, in the
+ * container vocabulary's order.
  */
-const lazyPanelNodeInput = z.lazy((): z.ZodType<PanelNodeInput> => panelNodeInputSchema);
+function containerNodeInputSchemasFor(child: z.ZodType<PanelNodeInput>) {
+  /** A titled group of nodes, as authored. */
+  const section = z
+    .strictObject({
+      type: z.literal('section'),
+      ...authoredNodeLabelShape,
+      children: z
+        .array(child)
+        .min(LAYOUT_NODE_MIN_CHILDREN.section)
+        .max(LAYOUT_NODE_MAX_CHILDREN)
+        .describe(
+          `The nodes this section groups, in reading order. At least ${String(LAYOUT_NODE_MIN_CHILDREN.section)} and at most ${String(LAYOUT_NODE_MAX_CHILDREN)}; a heading over no nodes shows the developer an empty region they cannot interpret.`,
+        ),
+    })
+    .describe(
+      'A titled group of nodes. Use it to give one part of a panel a heading and a boundary, so each question the panel answers is visibly its own section. It arranges nodes only and reads no data itself.',
+    );
 
-/** A titled group of nodes, as authored. */
-const sectionNodeInputSchema = z
-  .strictObject({
-    type: z.literal('section'),
-    ...authoredNodeLabelShape,
-    children: z
-      .array(lazyPanelNodeInput)
-      .min(LAYOUT_NODE_MIN_CHILDREN.section)
-      .max(LAYOUT_NODE_MAX_CHILDREN)
-      .describe(
-        `The nodes this section groups, in reading order. At least ${String(LAYOUT_NODE_MIN_CHILDREN.section)} and at most ${String(LAYOUT_NODE_MAX_CHILDREN)}; a heading over no nodes shows the developer an empty region they cannot interpret.`,
-      ),
-  })
-  .describe(
-    'A titled group of nodes. Use it to give one part of a panel a heading and a boundary, so each question the panel answers is visibly its own section. It arranges nodes only and reads no data itself.',
-  );
+  /** Two or more panes along one axis, as authored. */
+  const split = z
+    .strictObject({
+      type: z.literal('split'),
+      ...authoredNodeLabelShape,
+      direction: splitDirectionSchema.optional(),
+      children: z
+        .array(child)
+        .min(LAYOUT_NODE_MIN_CHILDREN.split)
+        .max(LAYOUT_NODE_MAX_CHILDREN)
+        .describe(
+          `The panes of this split, in order along its axis. At least ${String(LAYOUT_NODE_MIN_CHILDREN.split)}, because a division with one pane is just that pane, and at most ${String(LAYOUT_NODE_MAX_CHILDREN)}.`,
+        ),
+    })
+    .describe(
+      'Two or more nodes placed along one axis. Use it when the views are read against each other — a claim beside the evidence for it — rather than one after another.',
+    );
 
-/** Two or more panes along one axis, as authored. */
-const splitNodeInputSchema = z
-  .strictObject({
-    type: z.literal('split'),
-    ...authoredNodeLabelShape,
-    direction: splitDirectionSchema.optional(),
-    children: z
-      .array(lazyPanelNodeInput)
-      .min(LAYOUT_NODE_MIN_CHILDREN.split)
-      .max(LAYOUT_NODE_MAX_CHILDREN)
-      .describe(
-        `The panes of this split, in order along its axis. At least ${String(LAYOUT_NODE_MIN_CHILDREN.split)}, because a division with one pane is just that pane, and at most ${String(LAYOUT_NODE_MAX_CHILDREN)}.`,
-      ),
-  })
-  .describe(
-    'Two or more nodes placed along one axis. Use it when the views are read against each other — a claim beside the evidence for it — rather than one after another.',
-  );
+  /** A vertical sequence of nodes, as authored. */
+  const stack = z
+    .strictObject({
+      type: z.literal('stack'),
+      ...authoredNodeLabelShape,
+      children: z
+        .array(child)
+        .min(LAYOUT_NODE_MIN_CHILDREN.stack)
+        .max(LAYOUT_NODE_MAX_CHILDREN)
+        .describe(
+          `The nodes of this sequence, in reading order. At least ${String(LAYOUT_NODE_MIN_CHILDREN.stack)} and at most ${String(LAYOUT_NODE_MAX_CHILDREN)}.`,
+        ),
+    })
+    .describe(
+      'One or more nodes in vertical sequence. The default way to put several views in a section: each is read after the one above it, and the arrangement carries no other meaning.',
+    );
 
-/** A vertical sequence of nodes, as authored. */
-const stackNodeInputSchema = z
-  .strictObject({
-    type: z.literal('stack'),
-    ...authoredNodeLabelShape,
-    children: z
-      .array(lazyPanelNodeInput)
-      .min(LAYOUT_NODE_MIN_CHILDREN.stack)
-      .max(LAYOUT_NODE_MAX_CHILDREN)
-      .describe(
-        `The nodes of this sequence, in reading order. At least ${String(LAYOUT_NODE_MIN_CHILDREN.stack)} and at most ${String(LAYOUT_NODE_MAX_CHILDREN)}.`,
-      ),
-  })
-  .describe(
-    'One or more nodes in vertical sequence. The default way to put several views in a section: each is read after the one above it, and the arrangement carries no other meaning.',
-  );
+  return [section, split, stack] as const;
+}
 
 /*
  * ---------------------------------------------------------------------------
- * The node union
+ * The node union, level by level
+ *
+ * **Unrolled, not recursive.** A container holds nodes, and the natural way to
+ * say so is a union whose containers refer back to the union itself through
+ * `z.lazy`. That schema admits nesting of *any* depth, and the schema library
+ * descends one call frame per level while parsing it, so an authored document
+ * nested a few thousand containers deep exhausts the call stack inside
+ * `safeParse` and throws — on the very path whose contract is to return a
+ * rejection. Nor is `parsePanelSpecInput` the only caller that would need
+ * protecting: the model provider's repair loop parses a reply with this schema
+ * directly and quotes each issue's message back to the model.
+ *
+ * So the bound is made a property of the schema itself. The chain below has
+ * exactly {@link PANEL_MAX_NODE_DEPTH} levels, counting a top-level node as
+ * level 1 — the counting `./validate.ts` uses — and each level is its own
+ * discriminated union:
+ *
+ * - levels 1 to `PANEL_MAX_NODE_DEPTH - 1` accept all sixteen node types, and
+ *   their containers parse their children with the union of the level below;
+ * - level `PANEL_MAX_NODE_DEPTH`, the deepest, accepts the thirteen
+ *   visualization nodes only, so a container placed there is rejected with one
+ *   issue on its own `type` path and nothing below it is ever parsed.
+ *
+ * The consequences, each of them the point rather than a side effect:
+ *
+ * - **Parsing is bounded** by the chain's length whatever the input: a document
+ *   nested a hundred thousand deep costs `PANEL_MAX_NODE_DEPTH` levels of
+ *   parsing and one issue. A cyclic object graph terminates the same way.
+ * - **The schema admits exactly the depth `validatePanelSpec` admits**, because
+ *   both read the one constant. A document that passes here cannot be rejected
+ *   at step 3 for its depth — which would be a product bug and a fallback panel
+ *   rather than a repair prompt.
+ * - **The emitted JSON Schema is finite and acyclic**: each level renders as
+ *   one definition referenced by the three containers of the level above, and
+ *   the chain ends in a union that names no container type. The model is shown
+ *   the bound as structure rather than as prose it may ignore.
+ *
+ * Everything else about a node — strictness, labels, query fields, bounds — is
+ * shared by every level, because the leaves are the same schema instances at
+ * every level and the containers come from one factory.
  * ---------------------------------------------------------------------------
  */
 
@@ -806,36 +877,40 @@ type SchemaParsingNodeType<TType extends string> = {
 };
 
 /**
- * Compile-time proof that the tuple below lists exactly one schema per member
- * of the panel's node-type vocabulary, in the same order.
+ * Compile-time proof that a schema tuple lists exactly one schema per member of
+ * a node-type vocabulary, in the same order.
  *
  * A homomorphic mapped type over that vocabulary, so it *is* a tuple of the
  * same length, and each position demands a schema parsing the literal at that
  * position. Written as a generic over `TTypes` rather than directly over the
  * frozen vocabulary because only the generic form maps element positions alone.
  *
- * What it catches, here, at compile time: a node type with no authored schema,
- * a schema listed twice, the tuple drifting out of the vocabulary's order, and
- * a node type added to `./nodes/layout.ts` or `./nodes/viz.ts` without an
- * authored counterpart beside it. There is no second list of node-type strings
- * in this module for either to drift from — the vocabulary is imported, and
- * this proof is what binds the sixteen schemas to it.
+ * Applied twice below: to the thirteen leaves against the visualization
+ * vocabulary, and to the sixteen top-level schemas against the whole node
+ * vocabulary. What it catches, at compile time: a node type with no authored
+ * schema, a schema listed twice, a tuple drifting out of the vocabulary's
+ * order, and a node type added to `./nodes/layout.ts` or `./nodes/viz.ts`
+ * without an authored counterpart beside it. There is no second list of
+ * node-type strings in this module for either to drift from — the vocabularies
+ * are imported, and this proof is what binds the schemas to them.
  */
 type NodeInputSchemaTupleFor<TTypes extends readonly string[]> = {
   readonly [K in keyof TTypes]: SchemaParsingNodeType<TTypes[K]>;
 };
 
 /**
- * Every authored node schema, in the panel node vocabulary's order — the three
- * containers first, then the thirteen leaves.
+ * The thirteen authored leaf schemas, in the visualization vocabulary's order.
+ *
+ * One tuple of shared instances, spread into every level of the chain: a leaf
+ * is the same schema object whether it sits at the top of a layout or at the
+ * deepest level, so a leaf parses — and fails — identically at every depth, and
+ * the emitted JSON Schema renders each leaf once as a definition every level
+ * refers to.
  *
  * Frozen, like every other vocabulary in this package: shared, read-only, built
  * once at module load with no side effect.
  */
-const PANEL_NODE_INPUT_SCHEMAS = Object.freeze([
-  sectionNodeInputSchema,
-  splitNodeInputSchema,
-  stackNodeInputSchema,
+const LEAF_NODE_INPUT_SCHEMAS = Object.freeze([
   timelineNodeInputSchema,
   waterfallNodeInputSchema,
   eventLogNodeInputSchema,
@@ -849,10 +924,119 @@ const PANEL_NODE_INPUT_SCHEMAS = Object.freeze([
   stateTransitionsNodeInputSchema,
   dependencyGraphNodeInputSchema,
   sourceLinkNodeInputSchema,
+] as const) satisfies NodeInputSchemaTupleFor<typeof PANEL_VIZ_NODE_TYPES>;
+
+/**
+ * The fewest levels the chain can be built with: **2**.
+ *
+ * A container needs at least one child (`LAYOUT_NODE_MIN_CHILDREN`), so a
+ * container is only usable at a level that has a level below it. With a single
+ * level there would be nowhere to put a container's children, and the top-level
+ * tuple could not hold the three containers its completeness proof requires.
+ */
+const MIN_NODE_DEPTH_LEVELS = 2;
+
+/**
+ * The schema-level message of the deepest level's union, for a node there whose
+ * `type` names no visualization node — in practice a container placed one level
+ * too deep.
+ *
+ * Static, and built from the depth constant alone: like every message this
+ * module produces, it carries no input value (AAP 0.5.2). It is what the model
+ * provider's repair loop quotes back to the model for this failure, so it says
+ * both what the position accepts and why.
+ */
+const DEEPEST_LEVEL_NODE_MESSAGE = `Only a visualization node is accepted here: this position is at the deepest nesting level a panel allows (${String(PANEL_MAX_NODE_DEPTH)}), so no section, split or stack may be placed at it.`;
+
+/**
+ * The union parsing a node at the deepest level, {@link PANEL_MAX_NODE_DEPTH}:
+ * the thirteen leaves, and no container.
+ *
+ * The end of the chain, and the reason the chain is finite: no option here has
+ * a child position, so nothing below this level is ever parsed.
+ *
+ * The custom message is attached through an error *function* scoped to the
+ * union's own no-matching-discriminator issue (`invalid_union`). The union
+ * raises one other issue of its own — `invalid_type`, for a value that is not an
+ * object at all — and that keeps the library's message, because "no container
+ * here" would misdescribe it. Issues raised inside a matched leaf belong to that
+ * leaf's field schemas, so a leaf at this level with a malformed field reports
+ * exactly what it would report at level 1.
+ */
+const deepestNodeInputSchema: z.ZodType<PanelNodeInput> = z
+  .discriminatedUnion('type', [...LEAF_NODE_INPUT_SCHEMAS], {
+    error: (issue) => (issue.code === 'invalid_union' ? DEEPEST_LEVEL_NODE_MESSAGE : undefined),
+  })
+  .describe(
+    `A node at the deepest nesting level a panel allows (${String(PANEL_MAX_NODE_DEPTH)}, counting a node written directly in the layout as level 1). Only visualization nodes are accepted at this level; a section, split or stack placed here has nowhere to put its children.`,
+  );
+
+/**
+ * Builds the chain from the deepest level up to level 2, and returns level 2:
+ * the schema every child position of a top-level container is parsed by.
+ *
+ * Each iteration wraps the level below in a new discriminated union of the three
+ * containers — built by {@link containerNodeInputSchemasFor} around that lower
+ * level — plus the shared leaves. The loop variable stays typed as
+ * `z.ZodType<PanelNodeInput>`, the same annotation {@link panelNodeInputSchema}
+ * carries, so the inferred type does not grow with the number of levels and
+ * every level is interchangeable to the compiler.
+ *
+ * Runs once, at module load, and builds schemas and nothing else.
+ *
+ * @returns The union for level 2.
+ * @throws DebuggenError `INTERNAL` if {@link PANEL_MAX_NODE_DEPTH} is not an
+ * integer of at least {@link MIN_NODE_DEPTH_LEVELS} — a product defect in that
+ * constant, reported at load rather than as a schema that silently admits a
+ * different depth than the validator.
+ */
+function buildSecondLevelNodeInputSchema(): z.ZodType<PanelNodeInput> {
+  if (!Number.isInteger(PANEL_MAX_NODE_DEPTH) || PANEL_MAX_NODE_DEPTH < MIN_NODE_DEPTH_LEVELS) {
+    throw new DebuggenError(
+      'INTERNAL',
+      `The authored panel schema needs a nesting depth of at least ${String(MIN_NODE_DEPTH_LEVELS)} levels, and PANEL_MAX_NODE_DEPTH does not provide one.`,
+      {
+        hint: 'Set PANEL_MAX_NODE_DEPTH in the panel validator to a whole number of at least 2: containers need a level below them for their children.',
+      },
+    );
+  }
+
+  let level: z.ZodType<PanelNodeInput> = deepestNodeInputSchema;
+
+  for (let depth = PANEL_MAX_NODE_DEPTH - 1; depth >= MIN_NODE_DEPTH_LEVELS; depth -= 1) {
+    level = z.discriminatedUnion('type', [
+      ...containerNodeInputSchemasFor(level),
+      ...LEAF_NODE_INPUT_SCHEMAS,
+    ]);
+  }
+
+  return level;
+}
+
+/**
+ * Every top-level authored node schema, in the panel node vocabulary's order —
+ * the three level-1 containers first, then the thirteen leaves.
+ *
+ * The `satisfies` clause is the completeness proof for the whole vocabulary:
+ * the top level is where every node type is accepted, so it is where a type
+ * without an authored schema would first go missing. Frozen, like the leaf
+ * tuple.
+ */
+const PANEL_NODE_INPUT_SCHEMAS = Object.freeze([
+  ...containerNodeInputSchemasFor(buildSecondLevelNodeInputSchema()),
+  ...LEAF_NODE_INPUT_SCHEMAS,
 ] as const) satisfies NodeInputSchemaTupleFor<typeof PANEL_NODE_TYPES>;
 
 /**
- * The validator for one node of an authored panel.
+ * The validator for one **top-level** node of an authored panel — level 1 of
+ * the chain, whose containers admit {@link PANEL_MAX_NODE_DEPTH} levels in all,
+ * the node itself included.
+ *
+ * `layout` parses each of its entries with this schema, and a caller validating
+ * a lone node gets the same bound: counting the node itself as level 1, a
+ * container is accepted at levels 1 to `PANEL_MAX_NODE_DEPTH - 1`, a leaf at
+ * every level to `PANEL_MAX_NODE_DEPTH`, and a container at the deepest level
+ * is rejected at its own `type` path.
  *
  * A discriminated union over `type` rather than a plain union, and that is the
  * difference between a usable rejection and an unreadable one: an unrecognised
@@ -869,12 +1053,14 @@ const PANEL_NODE_INPUT_SCHEMAS = Object.freeze([
  * looseness anywhere else.
  *
  * The annotation is what keeps the emitted declarations honest. Left to
- * inference, a container's `children` resolves to `any` in the package's
- * declaration output, silently, and every consumer that walks an authored panel
- * loses type safety one level into the tree; annotated with the explicitly
- * declared {@link PanelNodeInput}, the declaration is genuinely recursive. The
- * cost is that this binding is a `z.ZodType` rather than a
- * `z.ZodDiscriminatedUnion`, which no consumer of the authored form needs.
+ * inference, this binding — and through it `PanelSpecInput['layout']` — would
+ * be typed as the structural output of sixteen strict-object schemas written
+ * out in the package's declaration output, a second statement of the node
+ * shape beside the declared one that the two could drift apart in; annotated
+ * with the explicitly declared {@link PanelNodeInput}, the declaration is that
+ * one genuinely recursive type. The cost is that this binding is a `z.ZodType`
+ * rather than a `z.ZodDiscriminatedUnion`, which no consumer of the authored
+ * form needs.
  */
 export const panelNodeInputSchema: z.ZodType<PanelNodeInput> = z.discriminatedUnion('type', [
   ...PANEL_NODE_INPUT_SCHEMAS,
@@ -1080,12 +1266,17 @@ export const panelSpecInputSchema = z
      * against an author that loops, set far above any panel a developer can
      * read, because rejecting a legitimately large panel does not produce a
      * smaller one but a fallback one.
+     *
+     * Each entry is parsed by {@link panelNodeInputSchema}, level 1 of the
+     * chain, so the nesting bound below every entry is the validator's
+     * {@link PANEL_MAX_NODE_DEPTH} — stated to the author here as well, because
+     * the emitted schema shows it only as structure.
      */
     layout: z
       .array(panelNodeInputSchema)
       .max(PANEL_LAYOUT_MAX_NODES)
       .describe(
-        `The panel content as a list of nodes, in reading order. Containers may nest further nodes inside themselves. At most ${String(PANEL_LAYOUT_MAX_NODES)} nodes at this level; an empty list is valid when the capture holds nothing worth drawing.`,
+        `The panel content as a list of nodes, in reading order. Containers may nest further nodes inside themselves, at most ${String(PANEL_MAX_NODE_DEPTH)} levels deep counting a node in this list as level 1, and the deepest level holds visualization nodes only. At most ${String(PANEL_LAYOUT_MAX_NODES)} nodes at this level; an empty list is valid when the capture holds nothing worth drawing.`,
       ),
   })
   .describe(
@@ -1123,9 +1314,132 @@ const PANEL_SPEC_INPUT_ROOT_PATH = '<document>';
  */
 const MAX_REPORTED_ISSUE_PATHS = 8;
 
-/** The hint offered when an authored panel fails validation. */
-const PANEL_SPEC_INPUT_HINT =
-  'An authored panel needs a non-empty title, a summary written as a sentence or as an object of prose, and a layout of nodes whose types, sources, sorts and metric ids come from the closed vocabularies; no other field is accepted, and node ids are assigned rather than authored.';
+/**
+ * The most node positions an authored panel may hold in all: **4,160**, which
+ * is `PANEL_LAYOUT_MAX_NODES × (1 + LAYOUT_NODE_MAX_CHILDREN)`.
+ *
+ * A node position is one entry of `layout` or of a container's `children`, and
+ * it is counted each time it is reached: a node object placed in two positions
+ * counts twice, because it is parsed, normalised and drawn twice.
+ *
+ * **Derived from the two width bounds, never chosen.** It is the size of the
+ * widest document two levels deep — every top-level position a container, and
+ * every container full — so every document of depth 1 or 2 that the width
+ * bounds admit is within it, and the rule can only reject a document of depth 3
+ * or more. That is far above any panel a developer can read (the product's own
+ * panels hold a few dozen nodes) and far below the more than 64⁸ positions the
+ * width and depth bounds alone would admit.
+ *
+ * **The one rule {@link parsePanelSpecInput} enforces that
+ * {@link panelSpecInputSchema} cannot express.** A total is a property of the
+ * whole document, which no node's schema sees. Stating it in the schema would
+ * take a refinement or a preprocess, and neither renders to JSON Schema, which
+ * `./json-schema.ts` emits with `unrepresentable: 'throw'`. So a document that
+ * is inside every width and depth bound but over this total is accepted by the
+ * schema and rejected by the parser, with `panel_node_count_exceeded` at the
+ * document root.
+ *
+ * A direct caller of the schema is not exposed by that gap, for two reasons.
+ * First, measured on Zod 4.6.5: the schema library applies `.max` without
+ * skipping elements, so an array over its bound still has every element parsed
+ * — 200,000 malformed elements produce 200,001 issues in about a quarter of a
+ * second — and the schema's work is therefore linear in the size of the value
+ * it is given. Second, on the model path
+ * `packages/model-provider/src/structured.ts` calls
+ * `panelSpecInputSchema.safeParse` on `JSON.parse` output, which is always a
+ * tree and never shares a subtree, so that size is the size of the reply, which
+ * the provider's output limit bounds, while depth is bounded by the schema's
+ * construction. What this total adds is a bound for a value assembled in code,
+ * which can place one subtree object in every position of every level and so
+ * present more than 64⁸ positions in a few kilobytes.
+ */
+export const PANEL_INPUT_MAX_NODE_COUNT = PANEL_LAYOUT_MAX_NODES * (1 + LAYOUT_NODE_MAX_CHILDREN);
+
+/**
+ * The most issues the node preflight collects before it stops: **32**, four
+ * times the {@link MAX_REPORTED_ISSUE_PATHS} a message lists.
+ *
+ * The cap is what keeps a preflight rejection's `details.issues` small
+ * whatever the input: without it they would be bounded only by
+ * {@link PANEL_INPUT_MAX_NODE_COUNT}, since a document can hold one too-deep
+ * position per child of every container it places at the deepest level —
+ * thousands of them within the budget. Four messages' worth leaves a caller
+ * reading the details more than the message shows, and stays small enough to
+ * log, persist and send whole.
+ *
+ * When the walk stops here with positions still unexamined, the rejection says
+ * so — `details.truncated` and a fixed closing clause — so the message's
+ * "and N more" is never read as a complete count. Exported for the colocated
+ * suite; it is not part of the package entry.
+ */
+export const PANEL_INPUT_MAX_PREFLIGHT_ISSUES = MAX_REPORTED_ISSUE_PATHS * 4;
+
+/**
+ * The clause a rejection's message ends with when the preflight stopped before
+ * examining the whole document.
+ *
+ * Fixed text, carrying no count and no value: what it tells the reader is that
+ * the issues listed are the ones found before the walk stopped, not all the
+ * document holds.
+ */
+const PREFLIGHT_TRUNCATED_CLAUSE = 'the document was not examined further';
+
+/**
+ * The hint offered when an authored panel fails validation.
+ *
+ * States the rules, never the values that broke them. The depth and node-count
+ * figures are the constants the schema and the preflight enforce, so the
+ * sentence cannot drift from either bound.
+ */
+const PANEL_SPEC_INPUT_HINT = `An authored panel needs a non-empty title, a summary written as a sentence or as an object of prose, and a layout of nodes whose types, sources, sorts and metric ids come from the closed vocabularies; containers nest at most ${String(PANEL_MAX_NODE_DEPTH)} levels deep, counting a top-level node as level 1, and the deepest level holds visualization nodes only; a panel holds at most ${String(PANEL_INPUT_MAX_NODE_COUNT)} nodes in all; no other field is accepted, and node ids are assigned rather than authored.`;
+
+/**
+ * The issue code reported when a too-deeply nested node is found before the
+ * schema runs: the syntactic validator's own code for the same condition.
+ *
+ * Typed to that validator's closed vocabulary, so the code a rejection carries
+ * here and the code `validatePanelSpec` reports at step 3 are provably one
+ * member of `PANEL_VALIDATION_ISSUE_CODES` and cannot drift apart.
+ */
+const NODE_DEPTH_EXCEEDED_CODE: PanelValidationIssueCode = 'panel_node_depth_exceeded';
+
+/**
+ * The issue code reported when the value could not be read at all:
+ * `panel_input_unreadable`.
+ *
+ * Raised when inspecting the value threw rather than answered — an accessor
+ * property whose getter throws, a proxy whose trap throws, a revoked proxy.
+ * Such a value cannot be a panel, and the exception it raised is caller-owned
+ * data, so it is replaced by this fixed code at the document's root and nothing
+ * of it — message, value or the error itself as a `cause` — reaches the
+ * rejection. Snake case, like the schema library's codes and the validator's,
+ * because all three can appear in the same `issues` array.
+ */
+const PANEL_INPUT_UNREADABLE_CODE = 'panel_input_unreadable';
+
+/**
+ * The issue code reported when a document holds more node positions than
+ * {@link PANEL_INPUT_MAX_NODE_COUNT}: `panel_node_count_exceeded`.
+ *
+ * Reported once, at the document's root, because the total belongs to the
+ * document rather than to any one node, and the walk that counts stops the
+ * moment the total would be exceeded, so no later position is named. A code of
+ * this module's own, like {@link PANEL_INPUT_UNREADABLE_CODE}: the schema has no
+ * code for a rule it cannot express, and the internal validator has no such
+ * rule. Snake case for the same reason as that code.
+ */
+const PANEL_NODE_COUNT_EXCEEDED_CODE = 'panel_node_count_exceeded';
+
+/**
+ * The issue code reported when a node array is longer than its position
+ * allows: the schema library's own `too_big`.
+ *
+ * Typed to that library's issue shape, so the code is provably the one its
+ * `.max` check reports at the same path — which is what lets the preflight
+ * report the schema's diagnosis for an over-long array without letting the
+ * schema read it.
+ */
+const ARRAY_TOO_BIG_CODE: z.core.$ZodIssueTooBig['code'] = 'too_big';
 
 /**
  * Renders issue locations for the rejection message: **paths and codes only**.
@@ -1170,16 +1484,451 @@ function describeIssueLocations(issues: readonly SchemaIssueSummary[]): string {
   return omitted > 0 ? `${reported.join('; ')}; and ${String(omitted)} more` : reported.join('; ');
 }
 
+/** How a rejection is qualified beyond its issues. */
+interface PanelSpecInputRejectionOptions {
+  /**
+   * Whether the preflight stopped before examining the whole document — for
+   * the node budget or for the issue cap. Absent means it did not.
+   */
+  readonly truncated?: boolean;
+}
+
+/**
+ * Builds the rejection for an authored panel: `PANEL_INVALID`, the issue
+ * locations in the message, the issues themselves in the details.
+ *
+ * One builder for every way {@link parsePanelSpecInput} can reject — a
+ * preflight finding (a node array too long, a node nested too deeply, too many
+ * nodes in all), a schema failure, a value that could not be read — so all of
+ * them are the same error to every consumer: the same code, the same message
+ * shape, the same hint and the same privacy rule (paths and codes only, see
+ * {@link describeIssueLocations}).
+ *
+ * A truncated rejection adds `details.truncated: true` and ends its message
+ * with {@link PREFLIGHT_TRUNCATED_CLAUSE}, so a reader never takes the issues
+ * listed, or the "and N more" after them, for everything the document holds.
+ * An untruncated one carries no `truncated` key at all.
+ *
+ * @param issues The issues to report, in report order.
+ * @param options Whether the issues are those of a walk that stopped early.
+ * @returns The rejection.
+ */
+function panelSpecInputRejection(
+  issues: readonly SchemaIssueSummary[],
+  options: PanelSpecInputRejectionOptions = {},
+): DebuggenError {
+  const truncated = options.truncated === true;
+  const locations = describeIssueLocations(issues);
+
+  return new DebuggenError(
+    'PANEL_INVALID',
+    truncated
+      ? `A value did not match the ${PANEL_SPEC_INPUT_SCHEMA_NAME} schema: ${locations}; ${PREFLIGHT_TRUNCATED_CLAUSE}.`
+      : `A value did not match the ${PANEL_SPEC_INPUT_SCHEMA_NAME} schema: ${locations}.`,
+    {
+      hint: PANEL_SPEC_INPUT_HINT,
+      details: truncated
+        ? { schema: PANEL_SPEC_INPUT_SCHEMA_NAME, issues, truncated: true }
+        : { schema: PANEL_SPEC_INPUT_SCHEMA_NAME, issues },
+    },
+  );
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * The node preflight
+ *
+ * Defence in depth behind the chain above, run over the raw value before the
+ * schema sees it. The chain already bounds the depth of parsing; the preflight
+ * bounds its breadth and its total, and does so before anything is parsed:
+ *
+ * - **width** — a node array longer than the schema allows at its position is
+ *   reported with the schema's own `too_big` at the array's path, from its
+ *   `length` alone, and none of its entries is read;
+ * - **depth** — the validator's own diagnosis, `panel_node_depth_exceeded` at
+ *   the path of each node beyond the bound;
+ * - **total** — a document holding more than {@link PANEL_INPUT_MAX_NODE_COUNT}
+ *   node positions is reported with `panel_node_count_exceeded` at its root;
+ * - **issues** — at most {@link PANEL_INPUT_MAX_PREFLIGHT_ISSUES} are
+ *   collected.
+ *
+ * The walk has no recursion, so no depth of input can make it throw, and its
+ * work is at most one visit per admitted position plus one `length` read per
+ * container — bounded by the budget, whatever the size of the input.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * Whether a value is an array, narrowing to an array of `unknown`.
+ *
+ * A predicate rather than a bare `Array.isArray` call, because that narrows an
+ * `unknown` to `any[]`, and every element read from it would then be an `any`.
+ *
+ * @param value Any value.
+ * @returns `true` when `value` is an array.
+ */
+function isUnknownArray(value: unknown): value is readonly unknown[] {
+  return Array.isArray(value);
+}
+
+/** One node position awaiting the node preflight. */
+interface NodePreflightFrame {
+  /** Whatever sits at this node position, not yet classified. */
+  readonly value: unknown;
+
+  /** The position as a dotted path — the form `describeIssues` reports. */
+  readonly path: string;
+
+  /** The position's nesting level, a node written directly in `layout` being 1. */
+  readonly level: number;
+}
+
+/**
+ * Why the node preflight stopped before its stack was empty.
+ *
+ * - `node_budget` — admitting one more node array would have taken the walk
+ *   past {@link PANEL_INPUT_MAX_NODE_COUNT} positions;
+ * - `issue_cap` — {@link PANEL_INPUT_MAX_PREFLIGHT_ISSUES} issues were
+ *   collected with positions still unexamined;
+ * - `unreadable` — a node array reported a `length` no array can have, which
+ *   only a proxy can do, so its size and its entries cannot be trusted.
+ */
+type NodePreflightStop = 'node_budget' | 'issue_cap' | 'unreadable';
+
+/**
+ * The state of one node preflight walk. **Mutated** by the walk, and by
+ * nothing else: one is built per call and never escapes it.
+ */
+interface NodePreflightWalk {
+  /** The positions admitted and not yet visited: a LIFO stack. */
+  readonly pending: NodePreflightFrame[];
+
+  /** What the walk has found so far, in reading order. */
+  readonly issues: SchemaIssueSummary[];
+
+  /** How many node positions have been admitted, over the whole walk. */
+  positions: number;
+
+  /** Why the walk stopped early, once it has; `undefined` while it runs. */
+  stoppedBy: NodePreflightStop | undefined;
+}
+
+/** What the node preflight found, and whether it examined the whole document. */
+interface NodePreflightOutcome {
+  /**
+   * The issues found, in reading order — the node-count issue, when there is
+   * one, first. Empty when there is none, and never longer than
+   * {@link PANEL_INPUT_MAX_PREFLIGHT_ISSUES}.
+   */
+  readonly issues: readonly SchemaIssueSummary[];
+
+  /** Whether the walk stopped with node positions still unexamined. */
+  readonly truncated: boolean;
+}
+
+/** The one issue a value that could not be read is rejected with. */
+const UNREADABLE_INPUT_ISSUES: readonly SchemaIssueSummary[] = Object.freeze([
+  Object.freeze({ path: '', code: PANEL_INPUT_UNREADABLE_CODE }),
+]);
+
+/** The one issue a document over the node budget is rejected with. */
+const NODE_COUNT_EXCEEDED_ISSUE: SchemaIssueSummary = Object.freeze({
+  path: '',
+  code: PANEL_NODE_COUNT_EXCEEDED_CODE,
+});
+
+/** The outcome of a preflight that found nothing: the schema decides. */
+const CLEAN_PREFLIGHT: NodePreflightOutcome = Object.freeze({
+  issues: Object.freeze([]),
+  truncated: false,
+});
+
+/**
+ * The outcome of a preflight that met a node array it could not size: the
+ * same rejection a value whose inspection throws receives.
+ */
+const UNREADABLE_PREFLIGHT: NodePreflightOutcome = Object.freeze({
+  issues: UNREADABLE_INPUT_ISSUES,
+  truncated: false,
+});
+
+/**
+ * The children the chain would parse below a value, or `undefined` when it
+ * would parse none.
+ *
+ * Mirrors what a level of the chain does and nothing more: it descends only
+ * into a non-array object whose `type` names one of the three containers, and
+ * only through that object's `children` array. Properties are read with
+ * ordinary property access, as the schema library reads them, so the preflight
+ * walks the same tree the schema would. Every other value — a leaf, an unknown
+ * type, a primitive, a container whose `children` is not an array — has no
+ * child position here, exactly as it has none in the schema.
+ *
+ * @param value The value at one node position.
+ * @returns The children array to descend into, or `undefined`.
+ */
+function containerChildrenOf(value: unknown): readonly unknown[] | undefined {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return undefined;
+  }
+
+  const node = value as Readonly<Record<string, unknown>>;
+
+  if (!isLayoutNodeType(node['type'])) {
+    return undefined;
+  }
+
+  const children = node[PANEL_CHILDREN_FIELD];
+
+  return isUnknownArray(children) ? children : undefined;
+}
+
+/**
+ * Admits the entries of one node array to the walk as node positions, or
+ * records why it does not.
+ *
+ * Everything is decided from the array's `length`, read once, before any entry
+ * is read — so an array's size costs the walk nothing, however large it is:
+ *
+ * 1. A `length` that is not a non-negative safe integer — possible only for a
+ *    proxy, which may answer anything — stops the walk as `unreadable`.
+ * 2. A `length` over `maxEntries`, the bound the schema's `.max` applies at
+ *    this position, records the schema's own `too_big` at the array's path and
+ *    admits nothing; the walk goes on with the rest of the document.
+ * 3. A `length` that would take the walk past
+ *    {@link PANEL_INPUT_MAX_NODE_COUNT} positions admits nothing and stops the
+ *    walk as `node_budget`.
+ * 4. Otherwise each entry is pushed, by index from the last to the first. The
+ *    stack is LIFO, so the first sibling comes out first and issues are
+ *    reported in reading order; indices are read only below `length`, so a
+ *    hole in a sparse array is read as `undefined`, which has no children; and
+ *    pushing one at a time rather than by spread means no length can meet the
+ *    runtime's argument limit.
+ *
+ * @param walk The walk to admit to. **Mutated.**
+ * @param nodes The array whose entries are node positions.
+ * @param arrayPath The dotted path of that array: `layout`, or a container's
+ * path followed by `children`.
+ * @param level The nesting level of its entries.
+ * @param maxEntries The most entries the schema accepts at this position.
+ */
+function admitNodePositions(
+  walk: NodePreflightWalk,
+  nodes: readonly unknown[],
+  arrayPath: string,
+  level: number,
+  maxEntries: number,
+): void {
+  // Typed as `unknown` rather than trusted as the `number` an array's type
+  // promises: a proxy's `get` trap may answer anything for `length`.
+  const length: unknown = nodes.length;
+
+  if (typeof length !== 'number' || !Number.isSafeInteger(length) || length < 0) {
+    walk.stoppedBy = 'unreadable';
+    return;
+  }
+
+  if (length > maxEntries) {
+    walk.issues.push({ path: arrayPath, code: ARRAY_TOO_BIG_CODE });
+    return;
+  }
+
+  if (walk.positions + length > PANEL_INPUT_MAX_NODE_COUNT) {
+    walk.stoppedBy = 'node_budget';
+    return;
+  }
+
+  walk.positions += length;
+
+  for (let index = length - 1; index >= 0; index -= 1) {
+    walk.pending.push({ value: nodes[index], path: `${arrayPath}.${String(index)}`, level });
+  }
+}
+
+/**
+ * The next position for the walk to visit, or `undefined` when the walk is
+ * over — because its stack is empty, because it has stopped, or because the
+ * issue cap has just stopped it.
+ *
+ * The cap is checked here, before each visit, and a visit adds at most one
+ * issue, so the walk never holds more than
+ * {@link PANEL_INPUT_MAX_PREFLIGHT_ISSUES}. It stops the walk only when a
+ * position is still waiting: a document whose last position brings the count
+ * to the cap has been examined in full, and is not reported as truncated.
+ *
+ * @param walk The walk. **Mutated** when the cap stops it.
+ * @returns The next frame, or `undefined`.
+ */
+function nextNodePosition(walk: NodePreflightWalk): NodePreflightFrame | undefined {
+  if (walk.stoppedBy !== undefined || walk.pending.length === 0) {
+    return undefined;
+  }
+
+  if (walk.issues.length >= PANEL_INPUT_MAX_PREFLIGHT_ISSUES) {
+    walk.stoppedBy = 'issue_cap';
+    return undefined;
+  }
+
+  return walk.pending.pop();
+}
+
+/**
+ * The outcome a finished walk reports.
+ *
+ * @param walk The walk, run to its end.
+ * @returns Its issues and whether it was truncated, with the node-count issue
+ * leading the list when the budget stopped it: that issue concerns the whole
+ * document, and it is the reason nothing after the issues before it was
+ * examined.
+ */
+function nodePreflightOutcomeOf(walk: NodePreflightWalk): NodePreflightOutcome {
+  switch (walk.stoppedBy) {
+    case undefined:
+      return walk.issues.length === 0 ? CLEAN_PREFLIGHT : { issues: walk.issues, truncated: false };
+    case 'issue_cap':
+      return { issues: walk.issues, truncated: true };
+    case 'node_budget':
+      return { issues: [NODE_COUNT_EXCEEDED_ISSUE, ...walk.issues], truncated: true };
+    case 'unreadable':
+      return UNREADABLE_PREFLIGHT;
+  }
+}
+
+/**
+ * Checks the node positions of a raw value — how many there are in each array,
+ * how deep they go and how many there are in all — without recursion and
+ * before the schema runs.
+ *
+ * Walks `value.layout` when it is an array — a value without one is left
+ * entirely to the schema — depth first with an explicit stack, descending only
+ * where {@link containerChildrenOf} says the schema would, and admitting each
+ * node array through {@link admitNodePositions}, which reads its `length`
+ * before any entry. What it reports:
+ *
+ * - `too_big` at the path of a node array longer than its position allows —
+ *   {@link PANEL_LAYOUT_MAX_NODES} for `layout`,
+ *   {@link LAYOUT_NODE_MAX_CHILDREN} for a container's `children` — whose
+ *   entries are then never read;
+ * - `panel_node_depth_exceeded` at the path of each position beyond
+ *   {@link PANEL_MAX_NODE_DEPTH} (one `children` segment per container above
+ *   it, the convention `validatePanelSpec` reports in), which is never looked
+ *   into;
+ * - `panel_node_count_exceeded` at the document root, once, when admitting a
+ *   node array would take the walk past {@link PANEL_INPUT_MAX_NODE_COUNT}
+ *   positions — at which point the walk stops at once.
+ *
+ * It also stops once {@link PANEL_INPUT_MAX_PREFLIGHT_ISSUES} issues are
+ * collected. Either early stop is reported as `truncated`.
+ *
+ * **The work is bounded by the budget, not by the input.** Each admitted
+ * position is visited once, and admission reads one `length` per container
+ * visited, so the walk costs at most {@link PANEL_INPUT_MAX_NODE_COUNT} visits
+ * plus one length read each, however long its arrays, however sparse, and
+ * however many positions a shared subtree presents. A cyclic object graph
+ * terminates at the depth cut-off or the budget, whichever it meets first.
+ *
+ * **Every value this rejects, the schema rejects too — except by the node
+ * count.** A `too_big` array is one the schema's `.max` refuses at the same
+ * path, or, at the deepest level, sits in a container that level's union
+ * refuses outright. A position beyond the depth bound exists only below a
+ * container at the deepest level, which the schema refuses the same way. The
+ * one exception is `panel_node_count_exceeded`: a total is the one rule the
+ * schema cannot express (see {@link PANEL_INPUT_MAX_NODE_COUNT}), so a document
+ * within every width and depth bound but over the total is accepted by the
+ * schema and rejected here.
+ *
+ * May throw, when reading the value throws — a throwing getter, a proxy trap —
+ * which is why {@link parsePanelSpecInput} calls it inside its `try`.
+ *
+ * @param value The raw value handed to the parser.
+ * @returns The issues found, in reading order with the node-count issue first,
+ * and whether the walk stopped early; no issues when the schema should decide.
+ */
+function preflightNodePositions(value: unknown): NodePreflightOutcome {
+  if (typeof value !== 'object' || value === null) {
+    return CLEAN_PREFLIGHT;
+  }
+
+  const layout = (value as Readonly<Record<string, unknown>>)[PANEL_LAYOUT_FIELD];
+
+  if (!isUnknownArray(layout)) {
+    return CLEAN_PREFLIGHT;
+  }
+
+  const walk: NodePreflightWalk = { pending: [], issues: [], positions: 0, stoppedBy: undefined };
+
+  admitNodePositions(walk, layout, PANEL_LAYOUT_FIELD, 1, PANEL_LAYOUT_MAX_NODES);
+
+  for (let frame = nextNodePosition(walk); frame !== undefined; frame = nextNodePosition(walk)) {
+    if (frame.level > PANEL_MAX_NODE_DEPTH) {
+      walk.issues.push({ path: frame.path, code: NODE_DEPTH_EXCEEDED_CODE });
+      continue;
+    }
+
+    const children = containerChildrenOf(frame.value);
+
+    if (children !== undefined) {
+      admitNodePositions(
+        walk,
+        children,
+        `${frame.path}.${PANEL_CHILDREN_FIELD}`,
+        frame.level + 1,
+        LAYOUT_NODE_MAX_CHILDREN,
+      );
+    }
+  }
+
+  return nodePreflightOutcomeOf(walk);
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * The parser
+ * ---------------------------------------------------------------------------
+ */
+
 /**
  * Validates an unknown value as a {@link PanelSpecInput}, without throwing.
  *
- * This is step 1 of the three-step pipeline, and the only step a model's output
- * is judged by directly: `packages/model-provider/src/structured.ts` calls it,
- * and on a rejection re-prompts with the message below, at most twice, before
- * the generating stage gives up and substitutes a deterministic fallback panel
- * marked as one (AAP 0.5.3, 0.5.5). Non-throwing is therefore a requirement
- * rather than a preference: a rejected panel has a defined outcome, and that
- * outcome is not "abort the stage".
+ * This is step 1 of the three-step pipeline. The model provider's
+ * structured-output loop (`packages/model-provider/src/structured.ts`) applies
+ * the same judgement by parsing a reply against {@link panelSpecInputSchema}
+ * itself, re-prompting with the issues at most twice before the generating
+ * stage gives up and substitutes a deterministic fallback panel marked as one
+ * (AAP 0.5.3, 0.5.5); this function is that judgement as a `Result`, for every
+ * caller holding a value believed to be an authored panel, plus the one rule
+ * the schema cannot express — the node budget of step 1. Non-throwing is a
+ * requirement rather than a preference: a rejected panel has a defined outcome,
+ * and that outcome is not "abort the stage".
+ *
+ * Three steps, and no input makes any of them throw out of here:
+ *
+ * 1. **The node preflight** ({@link preflightNodePositions}), whose work is
+ *    bounded by {@link PANEL_INPUT_MAX_NODE_COUNT} whatever the input. A node
+ *    array longer than its position allows is rejected with `too_big` at its
+ *    path without an entry of it being read; a node nested beyond
+ *    {@link PANEL_MAX_NODE_DEPTH} with `panel_node_depth_exceeded` at its path —
+ *    the validator's code and path convention; and a document of more than
+ *    {@link PANEL_INPUT_MAX_NODE_COUNT} node positions in all with
+ *    `panel_node_count_exceeded` at its root. Any of these rejects without the
+ *    schema running at all. The first two are rejections the schema would make
+ *    too; **the node count is not** — it is the one rule this function enforces
+ *    that {@link panelSpecInputSchema} cannot express, so a document the schema
+ *    alone accepts can be rejected here for its total, and for nothing else.
+ *    The preflight collects at most {@link PANEL_INPUT_MAX_PREFLIGHT_ISSUES}
+ *    issues; when it stops early, for that cap or for the budget, the
+ *    rejection carries `details.truncated: true` and says so in its message.
+ * 2. **The schema**, which is itself depth-bounded by construction, so even a
+ *    value the preflight could not see into is parsed in bounded depth, and
+ *    which after a clean preflight parses at most the budget's node positions,
+ *    none of them in an array longer than its bound.
+ * 3. **Exception translation.** A value whose inspection throws — a throwing
+ *    getter, a proxy trap — is rejected with the fixed
+ *    `panel_input_unreadable` issue at the document root, and so is a node
+ *    array that reports a `length` no array can have. The caught exception is
+ *    discarded unread: it is caller-controlled data, so neither its message,
+ *    nor any value it carries, nor the error itself as a `cause` reaches the
+ *    rejection.
  *
  * A value that passes here is well formed, not yet true. It still has to
  * normalise, pass the internal schema, and be checked against the capture — and
@@ -1191,34 +1940,35 @@ function describeIssueLocations(issues: readonly SchemaIssueSummary[]): string {
  * for why that is not optional here.
  *
  * The code is the panel-validation code from `@debuggen/shared`'s closed
- * vocabulary, the same code this package's other parsers use; no code is
- * invented. A caller at the model boundary that wants the model-output
- * vocabulary maps it with the shared `mapErr`.
+ * vocabulary, the same code this package's other parsers use, whichever step
+ * rejected; no code is invented. A caller at the model boundary that wants the
+ * model-output vocabulary maps it with the shared `mapErr`.
  *
  * @param value Any value believed to be an authored panel.
- * @returns `ok(input)` with the parsed document, or `err(error)` naming every
- * issue found, by path and code only.
+ * @returns `ok(input)` with the parsed document, or `err(error)` naming the
+ * issues found, by path and code only — every one of them, unless the error's
+ * details say it is truncated.
  */
 export function parsePanelSpecInput(value: unknown): Result<PanelSpecInput, DebuggenError> {
-  const parsed = panelSpecInputSchema.safeParse(value);
+  let preflight: NodePreflightOutcome;
+  let parsed: z.ZodSafeParseResult<PanelSpecInput> | undefined;
+
+  try {
+    preflight = preflightNodePositions(value);
+    parsed = preflight.issues.length === 0 ? panelSpecInputSchema.safeParse(value) : undefined;
+  } catch {
+    // Deliberately unbound: the exception is caller-controlled data and must
+    // not reach the rejection in any form (see step 3 above).
+    return err(panelSpecInputRejection(UNREADABLE_INPUT_ISSUES));
+  }
+
+  if (parsed === undefined) {
+    return err(panelSpecInputRejection(preflight.issues, { truncated: preflight.truncated }));
+  }
 
   if (parsed.success) {
     return ok(parsed.data);
   }
 
-  const issues = describeIssues(parsed.error.issues);
-
-  return err(
-    new DebuggenError(
-      'PANEL_INVALID',
-      `A value did not match the ${PANEL_SPEC_INPUT_SCHEMA_NAME} schema: ${describeIssueLocations(issues)}.`,
-      {
-        hint: PANEL_SPEC_INPUT_HINT,
-        details: {
-          schema: PANEL_SPEC_INPUT_SCHEMA_NAME,
-          issues,
-        },
-      },
-    ),
-  );
+  return err(panelSpecInputRejection(describeIssues(parsed.error.issues)));
 }

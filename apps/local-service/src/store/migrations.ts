@@ -95,9 +95,12 @@ import type { DatabaseSync } from 'node:sqlite';
  * the service's own start and its test suites rather than shipping a database
  * that no build agrees about.
  *
- * Version 1 is the schema declared by `./schema.sql`.
+ * Version 1 is the schema declared by `./schema.sql`. Version 2 adds the
+ * single-child invariant of the modification journal's chains and the
+ * traversal-aligned telemetry purge indexes — see
+ * {@link CHAIN_INTEGRITY_AND_PURGE_INDEXES_MIGRATION}.
  */
-export const STORE_SCHEMA_VERSION = 1;
+export const STORE_SCHEMA_VERSION = 2;
 
 /**
  * The `subsystem` field every log record from this module carries, so store
@@ -253,6 +256,171 @@ export interface StoreMigration {
   apply(db: DatabaseSync, context: MigrationContext): void;
 }
 
+/* -------------------------------------------------------------------------------------------------
+ * Version 2 — chain integrity and purge traversal
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * The column that exempts a pre-existing chain fork from the single-child index.
+ *
+ * `1` marks a record that, when version 2 was applied, shared its
+ * `previous_record_id` with at least one other non-`reverted` sibling — a fork
+ * written before the store enforced that a record carries at most one live
+ * layer. Such rows cannot be made to satisfy a unique index without rewriting
+ * or deleting journal rows, which the additive-only policy forbids because
+ * those rows are what restore a developer's files. So the step marks them
+ * instead, and the index below ignores marked rows. Every row written
+ * afterwards takes the default `0` and is held to the invariant by the
+ * database itself.
+ *
+ * Marking a fork is not resolving it. Cleanup in
+ * `packages/instrumentation/src/cleanup.ts` detects a fork structurally — two
+ * open records naming the same previous record — and refuses to write to that
+ * file, reporting a conflict and keeping every backup, whichever value this
+ * column holds.
+ */
+const CHAIN_FORK_COLUMN = 'chain_fork';
+
+/**
+ * Whether `modifications` already declares {@link CHAIN_FORK_COLUMN}.
+ *
+ * SQLite has no `ADD COLUMN IF NOT EXISTS`, and every step must be safe to
+ * reason about as idempotent, so the column is probed before it is added. The
+ * table-valued pragma form is used because it can be filtered by a bound name.
+ */
+const CHAIN_FORK_COLUMN_EXISTS_SQL = `SELECT 1 AS present FROM pragma_table_info('modifications') WHERE name = ?`;
+
+/**
+ * Adds {@link CHAIN_FORK_COLUMN}. `NOT NULL` with a constant default, so every
+ * existing row reads `0` without a rewrite, and a `CHECK` so a recovery path
+ * that writes the column directly cannot store anything but a flag.
+ */
+const ADD_CHAIN_FORK_COLUMN_SQL = `ALTER TABLE modifications ADD COLUMN ${CHAIN_FORK_COLUMN} INTEGER NOT NULL DEFAULT 0 CHECK (${CHAIN_FORK_COLUMN} IN (0, 1))`;
+
+/**
+ * The status a record leaves the single-child invariant in.
+ *
+ * `reverted` is terminal in the repository's transition matrix, so a row that
+ * reaches it only ever leaves the index below and never re-enters it: the
+ * predicate cannot be violated by a status write. It must be excluded because
+ * the installer's delta rollback (AAP 0.4.2) reverts a follow-up record while
+ * its parent stays `applied`, and the next follow-up on that file is then
+ * layered on the same parent again — a reverted sibling is history, not a
+ * branch the file can hold.
+ */
+const TERMINAL_MODIFICATION_STATUS = 'reverted';
+
+/**
+ * Marks every non-`reverted` record whose previous record has more than one
+ * non-`reverted` child.
+ *
+ * Every live sibling of a fork is marked, not all but one: the database cannot
+ * tell which branch describes the bytes on disk, and choosing one would let the
+ * index bless a branch that cleanup would then restore through. A parent with
+ * one live child and any number of reverted ones is the rollback-then-retry
+ * shape, not a fork, and is left alone.
+ */
+const MARK_PRE_EXISTING_FORKS_SQL = `UPDATE modifications SET ${CHAIN_FORK_COLUMN} = 1
+WHERE status <> '${TERMINAL_MODIFICATION_STATUS}'
+  AND previous_record_id IN (
+    SELECT previous_record_id FROM modifications
+    WHERE previous_record_id IS NOT NULL AND status <> '${TERMINAL_MODIFICATION_STATUS}'
+    GROUP BY previous_record_id
+    HAVING COUNT(*) > 1
+  )`;
+
+/**
+ * The single-child invariant of a modification chain, as a database constraint.
+ *
+ * A chain restores strictly in reverse (AAP 0.4.2): a record's backup is only
+ * written once the file hashes to that record's `instrumented_hash`. Two
+ * records layered on one parent would each claim to continue from its bytes,
+ * and cleanup could restore one branch and then either conflict on or strand
+ * the other. `./modifications-repo.ts` refuses such an append inside its
+ * `BEGIN IMMEDIATE` transaction; this partial unique index is the second line,
+ * which holds even for a writer that bypassed the repository. Partial for three
+ * reasons: a root record has no previous record and many roots may coexist; a
+ * `reverted` child no longer describes bytes the file can hold (see
+ * {@link TERMINAL_MODIFICATION_STATUS}); and {@link CHAIN_FORK_COLUMN} exempts
+ * forks that predate the index.
+ *
+ * The existing non-unique `idx_modifications_previous_record_id` stays: a
+ * lookup by previous record id cannot prove the whole predicate, so the planner
+ * keeps using that index for the chain-head and child probes.
+ */
+const CREATE_SINGLE_CHILD_INDEX_SQL = `CREATE UNIQUE INDEX IF NOT EXISTS idx_modifications_previous_record_id_unique
+  ON modifications (previous_record_id)
+  WHERE previous_record_id IS NOT NULL
+    AND status <> '${TERMINAL_MODIFICATION_STATUS}'
+    AND ${CHAIN_FORK_COLUMN} = 0`;
+
+/**
+ * The telemetry purge indexes.
+ *
+ * Retention deletes in bounded batches (`./telemetry-repo.ts`), and each batch
+ * must be an index range read that stops after its limit rather than a full
+ * scan followed by a temporary sort. Two indexes serve all three purge shapes
+ * when every purge orders a batch by `start_time, ingest_seq`:
+ *
+ * - a global cutoff, `start_time < ?`, reads `(start_time, ingest_seq)`;
+ * - a cutoff restricted to named sessions, `session_id = ? AND start_time < ?`,
+ *   and a whole-session purge, `session_id = ?`, both read
+ *   `(session_id, start_time, ingest_seq)`.
+ *
+ * `ingest_seq` closes each key so a batch boundary between two rows of equal
+ * `start_time` is deterministic. A third `(session_id, ingest_seq)` index would
+ * serve the whole-session purge no better than the second one does, and every
+ * index on this table is paid for on the ingest hot path of a running capture,
+ * so it is deliberately not added.
+ */
+const CREATE_PURGE_INDEXES_SQL = `CREATE INDEX IF NOT EXISTS idx_telemetry_events_start_time_ingest_seq
+  ON telemetry_events (start_time, ingest_seq);
+CREATE INDEX IF NOT EXISTS idx_telemetry_events_session_id_start_time_ingest_seq
+  ON telemetry_events (session_id, start_time, ingest_seq);`;
+
+/**
+ * Normalises a `changes` count, which `node:sqlite` reports as a `bigint` on a
+ * connection opened with `readBigInts`.
+ *
+ * @param changes The count a statement reported.
+ * @returns The count as a number.
+ */
+function changeCount(changes: number | bigint): number {
+  return typeof changes === 'bigint' ? Number(changes) : changes;
+}
+
+/**
+ * Schema version 2: the modification journal's single-child chain invariant and
+ * the telemetry purge indexes.
+ *
+ * Purely additive, as the ladder policy requires: one column with a constant
+ * default, one flag update on rows that already violate the new invariant, and
+ * three `IF NOT EXISTS` indexes. No journal row is rewritten beyond that flag,
+ * detached or deleted. A pre-existing fork is reported at `warn` with the
+ * number of records marked — identifiers and counts only, never a diff or a
+ * path, because this line reaches the service log.
+ */
+const CHAIN_INTEGRITY_AND_PURGE_INDEXES_MIGRATION: StoreMigration = {
+  version: 2,
+  description: 'enforce single-child modification chains and add the telemetry purge indexes',
+  apply: (db, { logger }) => {
+    if (db.prepare(CHAIN_FORK_COLUMN_EXISTS_SQL).get(CHAIN_FORK_COLUMN) === undefined) {
+      db.exec(ADD_CHAIN_FORK_COLUMN_SQL);
+    }
+
+    const marked = changeCount(db.prepare(MARK_PRE_EXISTING_FORKS_SQL).run().changes);
+    if (marked > 0) {
+      logger.warn(
+        'the modification journal holds chain forks written before single-child chains were enforced; cleanup reports their files as conflicts',
+        { subsystem: SUBSYSTEM, forkedRecords: marked },
+      );
+    }
+
+    db.exec(CREATE_SINGLE_CHILD_INDEX_SQL);
+    db.exec(CREATE_PURGE_INDEXES_SQL);
+  },
+};
+
 /**
  * The store's schema ladder, in ascending version order.
  *
@@ -267,7 +435,7 @@ export interface StoreMigration {
  * @example
  * ```ts
  * {
- *   version: 2,
+ *   version: 3,
  *   description: 'add the capture retention index',
  *   apply: (db) => {
  *     db.exec(
@@ -296,6 +464,7 @@ export const STORE_MIGRATIONS: readonly StoreMigration[] = [
       db.exec(ddl);
     },
   },
+  CHAIN_INTEGRITY_AND_PURGE_INDEXES_MIGRATION,
 ];
 
 /**

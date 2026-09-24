@@ -76,17 +76,21 @@
  * @see ../host/useQuery for the loading/empty/error machine they drive.
  */
 
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
 import { DATA_QUERY_DEFAULT_OFFSET } from '@debuggen/panel-schema';
 import type { DataQuery, WaterfallNode } from '@debuggen/panel-schema';
 import { DebuggenError } from '@debuggen/shared';
 import type { SourceLocation } from '@debuggen/shared';
-import type { TelemetryEvent } from '@debuggen/telemetry';
-import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
+import type { OrphanReason, TelemetryEvent, TraceNode, TraceTree } from '@debuggen/telemetry';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Mock } from 'vitest';
 
-import { DataProviderContext, createDataProvider } from '../host/DataProvider';
+import { DataProviderContext, PanelSessionContext, createDataProvider } from '../host/DataProvider';
 import type { DataProvider, DataQueryResolver, DataQueryResponse } from '../host/DataProvider';
 import { PanelActionsContext } from '../host/PanelActions';
 import type { PanelActions, PanelEventRef } from '../host/PanelActions';
@@ -524,9 +528,11 @@ function renderComponent(
 ): void {
   render(
     <DataProviderContext.Provider value={context.provider}>
-      <PanelActionsContext.Provider value={context.actions}>
-        <Waterfall node={node} />
-      </PanelActionsContext.Provider>
+      <PanelSessionContext.Provider value={SESSION_ID}>
+        <PanelActionsContext.Provider value={context.actions}>
+          <Waterfall node={node} />
+        </PanelActionsContext.Provider>
+      </PanelSessionContext.Provider>
     </DataProviderContext.Provider>,
   );
 }
@@ -1418,9 +1424,11 @@ describe('Waterfall interactions', () => {
 
     await screen.findByRole('tree', { name: TREE_NAME });
 
-    // Every row is its own tab stop, so reaching one and pressing Enter is the
-    // keyboard route to the same intent a click raises.
+    // The tree is one tab stop, and with a single row on screen that row holds
+    // it; reaching it and pressing Enter is the keyboard route to the same
+    // intent a click raises.
     const row = rowLabelled(SERVER_ROUTE);
+    expect(row.getAttribute('tabindex')).toBe('0');
     row.focus();
     expect(document.activeElement).toBe(row);
 
@@ -1522,5 +1530,865 @@ describe('Waterfall paging', () => {
     await screen.findByText(`${formatCount(CHAIN.length)} calls`);
     expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
     expect(soleQuery(stub).offset).toBe(DATA_QUERY_DEFAULT_OFFSET);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The tree as one composite widget
+ *
+ * A `role="tree"` is ONE stop in the page's Tab order (a roving tab index):
+ * exactly one visible row is tabbable, the arrow keys move between rows, and
+ * the controls nested inside a row are out of the Tab order so that a row is
+ * never two or three stops. The cases below read `tabindex` straight off the
+ * elements the roles resolved to, because the attribute IS the contract.
+ * ---------------------------------------------------------------------------
+ */
+
+/** A top-level call with no source and nothing nested, labelled by its name. */
+const LONE_CALL = makeEvent({
+  id: eventIdFor(51),
+  spanId: spanIdFor(51),
+  kind: 'fetch',
+  tier: 'browser',
+  name: 'example.lone-call',
+  startTime: BASE_START_MS + 1300,
+  duration: 30,
+  seq: 5,
+  ingestSeq: 6,
+});
+
+/** A second one, drawn after it. */
+const LATER_CALL = makeEvent({
+  id: eventIdFor(52),
+  spanId: spanIdFor(52),
+  kind: 'fetch',
+  tier: 'browser',
+  name: 'example.later-call',
+  startTime: BASE_START_MS + 1400,
+  duration: 20,
+  seq: 6,
+  ingestSeq: 7,
+});
+
+/** The rows currently in the page's Tab order. */
+function tabbableRows(): HTMLElement[] {
+  return drawnRows().filter((row) => row.getAttribute('tabindex') === '0');
+}
+
+/** The single row in the Tab order, failing when there is not exactly one. */
+function soleTabStop(): HTMLElement {
+  const rows = tabbableRows();
+  expect(rows).toHaveLength(1);
+  const [row] = rows;
+  if (row === undefined) {
+    throw new Error('no row holds the tab stop');
+  }
+  return row;
+}
+
+describe('Waterfall keyboard composite', () => {
+  it('keeps exactly one row in the Tab order, and moves it with the arrow keys', async () => {
+    const stub = resolvingProvider([...CHAIN, LONE_CALL, LATER_CALL]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+    expect(drawnRows()).toHaveLength(3);
+
+    // The stop starts on the first top-level row, and every other row is
+    // reachable only through the tree's own keys.
+    expect(soleTabStop()).toBe(rowLabelled(REQUEST_URL));
+    for (const row of drawnRows().slice(1)) {
+      expect(row.getAttribute('tabindex')).toBe('-1');
+    }
+
+    rowLabelled(REQUEST_URL).focus();
+
+    await user.keyboard('{ArrowDown}');
+    expect(document.activeElement).toBe(rowLabelled(LONE_CALL.name));
+    expect(soleTabStop()).toBe(rowLabelled(LONE_CALL.name));
+
+    await user.keyboard('{End}');
+    expect(document.activeElement).toBe(rowLabelled(LATER_CALL.name));
+    expect(soleTabStop()).toBe(rowLabelled(LATER_CALL.name));
+
+    await user.keyboard('{Home}');
+    expect(document.activeElement).toBe(rowLabelled(REQUEST_URL));
+    expect(soleTabStop()).toBe(rowLabelled(REQUEST_URL));
+
+    // Opening a row and stepping into it moves the stop one level in, and the
+    // nested rows join the tree without adding a stop.
+    await user.keyboard('{ArrowRight}');
+    expect(drawnRows()).toHaveLength(4);
+    expect(soleTabStop()).toBe(rowLabelled(REQUEST_URL));
+
+    await user.keyboard('{ArrowRight}');
+    expect(document.activeElement).toBe(rowLabelled(SERVER_ROUTE));
+    expect(soleTabStop()).toBe(rowLabelled(SERVER_ROUTE));
+
+    // A collapse that hides the row holding the stop hands it to the nearest
+    // row still on screen — its parent — rather than leaving the tree with no
+    // stop at all. Dispatched without focus, so it is the fallback and not a
+    // focus event that moves the stop.
+    fireEvent.click(within(rowLabelled(REQUEST_URL)).getByRole('button', { name: COLLAPSE_NAME }));
+    expect(drawnRows()).toHaveLength(3);
+    expect(soleTabStop()).toBe(rowLabelled(REQUEST_URL));
+  });
+
+  it('leaves the tree on Tab and returns to the row it left, never stopping inside a row', async () => {
+    // A next page exists, so the footer's "Load more" is the control after the
+    // tree in the Tab order — which is what makes "Tab left the tree" provable.
+    const stub = resolvingProvider([...CHAIN, LONE_CALL], { total: 30, nextOffset: 4 });
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+    const loadMore = screen.getByRole('button', { name: LOAD_MORE_NAME });
+
+    // Into the tree: the first row, which holds a disclosure button and a
+    // source chip — and the next Tab passes over both.
+    await user.tab();
+    expect(document.activeElement).toBe(rowLabelled(REQUEST_URL));
+    await user.tab();
+    expect(document.activeElement).toBe(loadMore);
+
+    // Back in, to the row that was left; then the stop follows the arrow keys,
+    // and leaving and returning comes back to where the reader was.
+    await user.tab({ shift: true });
+    expect(document.activeElement).toBe(rowLabelled(REQUEST_URL));
+    await user.keyboard('{ArrowDown}');
+    expect(document.activeElement).toBe(rowLabelled(LONE_CALL.name));
+    await user.tab();
+    expect(document.activeElement).toBe(loadMore);
+    await user.tab({ shift: true });
+    expect(document.activeElement).toBe(rowLabelled(LONE_CALL.name));
+  });
+
+  it('keeps the disclosure and the source chip out of the Tab order, and both still work by pointer', async () => {
+    const stub = resolvingProvider(CHAIN);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+    const row = rowLabelled(REQUEST_URL);
+    const disclosure = within(row).getByRole('button', { name: EXPAND_NAME });
+    const chip = within(row).getByRole('button', { name: SOURCE_CHIP_NAME });
+
+    expect(disclosure.getAttribute('tabindex')).toBe('-1');
+    expect(chip.getAttribute('tabindex')).toBe('-1');
+
+    await user.click(disclosure);
+    expect(rowLabelled(REQUEST_URL).getAttribute('aria-expanded')).toBe('true');
+    expect(spies.onExpand).toHaveBeenCalledWith(NODE_ID, REQUEST_EVENT.id, true);
+
+    await user.click(
+      within(rowLabelled(REQUEST_URL)).getByRole('button', { name: SOURCE_CHIP_NAME }),
+    );
+    expect(spies.onOpenSource).toHaveBeenCalledTimes(1);
+    expect(spies.onSelectEvent).not.toHaveBeenCalled();
+
+    // Neither control became a stop by being used: the row still is the one.
+    expect(soleTabStop()).toBe(rowLabelled(REQUEST_URL));
+  });
+
+  it('opens the source of the focused row on Shift+Enter, with the very location, and selects nothing', async () => {
+    const stub = resolvingProvider([REQUEST_EVENT, LONE_CALL]);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+    const sourceRow = rowLabelled(REQUEST_URL);
+    const plainRow = rowLabelled(LONE_CALL.name);
+
+    // Advertised exactly where it does something.
+    expect(sourceRow.getAttribute('aria-keyshortcuts')).toBe('Shift+Enter');
+    expect(plainRow.getAttribute('aria-keyshortcuts')).toBeNull();
+
+    sourceRow.focus();
+    await user.keyboard('{Shift>}{Enter}{/Shift}');
+
+    expect(spies.onOpenSource).toHaveBeenCalledTimes(1);
+    const [call] = spies.onOpenSource.mock.calls;
+    if (call === undefined) {
+      throw new Error('the open-source handler recorded no call');
+    }
+    // The object the record carried, by reference — the same guarantee the
+    // chip keeps — and opening a file is not choosing a record.
+    expect(call[0]).toBe(BASE_SOURCE);
+    expect(spies.onSelectEvent).not.toHaveBeenCalled();
+    expect(rowLabelled(REQUEST_URL).getAttribute('aria-selected')).toBe('false');
+
+    // On a row with nowhere to go, the chord is not consumed and does nothing.
+    const notPrevented = fireEvent.keyDown(plainRow, { key: 'Enter', shiftKey: true });
+    expect(notPrevented).toBe(true);
+    expect(spies.onOpenSource).toHaveBeenCalledTimes(1);
+    expect(spies.onSelectEvent).not.toHaveBeenCalled();
+
+    // Plain Enter still selects.
+    rowLabelled(REQUEST_URL).focus();
+    await user.keyboard('{Enter}');
+    expect(spies.onSelectEvent).toHaveBeenCalledTimes(1);
+    expect(spies.onSelectEvent).toHaveBeenCalledWith({
+      eventId: REQUEST_EVENT.id,
+      spanId: REQUEST_EVENT.spanId,
+      traceId: TRACE_ID,
+    });
+    expect(spies.onOpenSource).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps navigating from a nested control a pointer focused, and leaves its Enter to it', async () => {
+    const stub = resolvingProvider([...CHAIN, LONE_CALL]);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+
+    // A pointer press leaves focus on the disclosure button, which is out of
+    // the Tab order but still focusable — and the arrow keys must still work
+    // from there, or a click would strand the keyboard inside the row.
+    const disclosure = within(rowLabelled(REQUEST_URL)).getByRole('button', { name: EXPAND_NAME });
+    await user.click(disclosure);
+    expect(document.activeElement).toBe(disclosure);
+    expect(soleTabStop()).toBe(rowLabelled(REQUEST_URL));
+
+    await user.keyboard('{ArrowDown}');
+    expect(document.activeElement).toBe(rowLabelled(SERVER_ROUTE));
+    expect(soleTabStop()).toBe(rowLabelled(SERVER_ROUTE));
+
+    // Enter on a pointer-focused chip is the chip's own activation: it opens
+    // the source again, and the row it sits in is not selected.
+    const chip = within(rowLabelled(REQUEST_URL)).getByRole('button', { name: SOURCE_CHIP_NAME });
+    await user.click(chip);
+    expect(document.activeElement).toBe(chip);
+    await user.keyboard('{Enter}');
+
+    expect(spies.onOpenSource).toHaveBeenCalledTimes(2);
+    for (const [location] of spies.onOpenSource.mock.calls) {
+      expect(location).toBe(BASE_SOURCE);
+    }
+    expect(spies.onSelectEvent).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * The bubble that carries a row's description: the one `role="tooltip"` in the
+ * row whose text begins with the sentence the row is named by. A row with a
+ * source chip holds a second tooltip — the chip's own — which this excludes,
+ * and finding anything other than exactly one fails the case.
+ *
+ * @param row The row.
+ * @returns Its description bubble.
+ */
+function descriptionBubble(row: HTMLElement): HTMLElement {
+  const name = row.getAttribute('aria-label') ?? '';
+  const bubbles = within(row)
+    .queryAllByRole('tooltip', { hidden: true })
+    .filter((bubble) => (bubble.textContent ?? '').startsWith(name));
+  expect(bubbles).toHaveLength(1);
+  const [bubble] = bubbles;
+  if (bubble === undefined) {
+    throw new Error('the row has no description bubble');
+  }
+  return bubble;
+}
+
+/** Whether a bubble is on screen: the open state, and not the hidden utility. */
+function isShown(bubble: HTMLElement): boolean {
+  return (
+    bubble.classList.contains('dg-is-open') && !bubble.classList.contains('dg-visually-hidden')
+  );
+}
+
+describe('Waterfall description for the keyboard', () => {
+  it('reveals the full description on keyboard focus of a row, with the source hint where it applies', async () => {
+    const stub = resolvingProvider([REQUEST_EVENT, LONE_CALL]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+    expect(isShown(descriptionBubble(rowLabelled(REQUEST_URL)))).toBe(false);
+
+    // Tab into the tree: the row that receives focus shows its description in
+    // the tooltip's open form, and hides it from assistive technology, which
+    // already hears the same sentence as the row's name.
+    await user.tab();
+    const sourceRow = rowLabelled(REQUEST_URL);
+    expect(document.activeElement).toBe(sourceRow);
+    const revealed = descriptionBubble(sourceRow);
+    expect(isShown(revealed)).toBe(true);
+    expect(revealed.getAttribute('aria-hidden')).toBe('true');
+    expect(revealed.textContent ?? '').toContain(`transferred ${formatBytes(TRANSFERRED_BYTES)}`);
+    // The row's source is one chord away, and the bubble says which.
+    expect(revealed.textContent ?? '').toContain('opens the source');
+    expect(within(revealed).getByText('Shift').tagName.toLowerCase()).toBe('kbd');
+    expect(within(revealed).getByText('Enter').tagName.toLowerCase()).toBe('kbd');
+
+    // The arrow keys carry the reveal with the focus; a row with no source
+    // offers no hint it could not honour.
+    await user.keyboard('{ArrowDown}');
+    const plainRow = rowLabelled(LONE_CALL.name);
+    expect(isShown(descriptionBubble(plainRow))).toBe(true);
+    expect(descriptionBubble(plainRow).textContent ?? '').not.toContain('opens the source');
+    expect(isShown(descriptionBubble(rowLabelled(REQUEST_URL)))).toBe(false);
+  });
+
+  it('dismisses the revealed description on Escape until focus leaves the row', async () => {
+    const stub = resolvingProvider([REQUEST_EVENT, LONE_CALL]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+    await user.tab();
+    await user.keyboard('{ArrowDown}');
+    const row = rowLabelled(LONE_CALL.name);
+    expect(isShown(descriptionBubble(row))).toBe(true);
+
+    // Consumed when there was something to dismiss, and only then: a second
+    // Escape belongs to whatever sits above the tree.
+    expect(fireEvent.keyDown(row, { key: 'Escape' })).toBe(false);
+    expect(isShown(descriptionBubble(rowLabelled(LONE_CALL.name)))).toBe(false);
+    expect(document.activeElement).toBe(rowLabelled(LONE_CALL.name));
+    expect(fireEvent.keyDown(rowLabelled(LONE_CALL.name), { key: 'Escape' })).toBe(true);
+    expect(isShown(descriptionBubble(rowLabelled(LONE_CALL.name)))).toBe(false);
+
+    // Leaving and returning is a new visit, and the description comes back.
+    await user.keyboard('{ArrowUp}');
+    await user.keyboard('{ArrowDown}');
+    expect(isShown(descriptionBubble(rowLabelled(LONE_CALL.name)))).toBe(true);
+  });
+
+  it('does not pop the description when a click focuses the row', async () => {
+    const stub = resolvingProvider([REQUEST_EVENT, LONE_CALL]);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+    await user.click(rowLabelled(LONE_CALL.name));
+
+    // The click focused and selected the row — and moved the tab stop to it —
+    // but a pointer already has the hover tooltip, so nothing popped.
+    const row = rowLabelled(LONE_CALL.name);
+    expect(document.activeElement).toBe(row);
+    expect(spies.onSelectEvent).toHaveBeenCalledTimes(1);
+    expect(soleTabStop()).toBe(row);
+    expect(isShown(descriptionBubble(row))).toBe(false);
+
+    // The same row reached from the keyboard afterwards does reveal it.
+    await user.keyboard('{ArrowUp}');
+    await user.keyboard('{ArrowDown}');
+    expect(isShown(descriptionBubble(rowLabelled(LONE_CALL.name)))).toBe(true);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Re-attached calls (orphans)
+ *
+ * A call the correlator re-attached to the top level because the parent it
+ * named could not be resolved is evidence, drawn and FLAGGED — never dropped and
+ * never disguised as an ordinary top-level row (AAP 0.4.2). The tree path takes
+ * the verdict from the node; the flat path from the flag the service persisted
+ * on the record, which a parent present in the page proves stale.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The badge word a re-attached row shows — the one Timeline uses too. */
+const REATTACHED_BADGE = 'Re-attached';
+
+/** The phrase every re-attached row's description starts its sentence with. */
+const REATTACHED_PHRASE = 're-attached to the top level';
+
+/**
+ * One node of a correlated tree, shaped as the correlator shapes one: the two
+ * orphan keys exist only on an orphan, and no parent pointer exists at all.
+ *
+ * @param event The record the node stands for.
+ * @param depth Its distance from the trace root.
+ * @param children The nodes it caused, in canonical order.
+ * @param orphan The correlator's verdict, for a re-attached node.
+ * @returns The node.
+ */
+function traceNodeOf(
+  event: TelemetryEvent,
+  depth: number,
+  children: readonly TraceNode[],
+  orphan?: { readonly reason: OrphanReason; readonly missingParentSpanId: string },
+): TraceNode {
+  return {
+    event,
+    children,
+    depth,
+    orphaned: orphan !== undefined,
+    ...(orphan === undefined
+      ? {}
+      : { orphanReason: orphan.reason, missingParentSpanId: orphan.missingParentSpanId }),
+  };
+}
+
+/**
+ * A correlated tree over `events`, with the aggregates computed from them the
+ * way the builder derives them.
+ *
+ * @param roots The root nodes, in canonical order.
+ * @param events Every record the nodes hold.
+ * @returns The tree.
+ */
+function traceTreeOf(roots: readonly TraceNode[], events: readonly TelemetryEvent[]): TraceTree {
+  const startTime = Math.min(...events.map((event) => event.startTime));
+  const endTime = Math.max(...events.map((event) => event.startTime + event.duration));
+  const orphanCount = roots.filter((root) => root.orphaned).length;
+  return {
+    traceId: TRACE_ID,
+    roots,
+    nodeCount: events.length,
+    maxDepth: 2,
+    startTime,
+    endTime,
+    totalDuration: endTime - startTime,
+    orphanCount,
+    tiers: ['browser', 'server', 'db'],
+    kinds: ['fetch', 'http.server', 'db.query', 'http.client', 'function'],
+    producerIds: [PRODUCER_ID],
+    duplicateSpanIds: [],
+    truncated: false,
+  };
+}
+
+/** The node a trace-backed case draws, and the provider answering it. */
+const TRACE_NODE = makeNode({ query: { source: 'trace' } });
+
+/** Whether a row carries the re-attached flag in all three of its forms. */
+function isFlaggedReattached(row: HTMLElement): boolean {
+  const badge = within(row).queryByText(REATTACHED_BADGE);
+  const flagged = row.classList.contains('dg-is-orphan');
+  const described = (row.getAttribute('aria-label') ?? '').includes(REATTACHED_PHRASE);
+  // All three or none: a class with no word, or a word with no state, is the
+  // half-signal this view must never emit.
+  expect([badge !== null, described]).toEqual([flagged, flagged]);
+  if (badge !== null) {
+    expect(badge.classList.contains('dg-badge--warning')).toBe(true);
+    expect(badge.classList.contains('dg-badge--outline')).toBe(true);
+  }
+  return flagged;
+}
+
+describe('Waterfall re-attached calls', () => {
+  it('flags a re-attached tree node, and the call lifted through an undrawn one, and nothing nested beneath', async () => {
+    const orphanServer = makeEvent({
+      id: eventIdFor(61),
+      spanId: spanIdFor(61),
+      parentSpanId: spanIdFor(60),
+      kind: 'http.server',
+      tier: 'server',
+      name: 'example.orphan-server',
+      startTime: BASE_START_MS,
+      duration: 200,
+    });
+    const orphanServerQuery = makeEvent({
+      id: eventIdFor(62),
+      spanId: spanIdFor(62),
+      parentSpanId: spanIdFor(61),
+      kind: 'db.query',
+      tier: 'db',
+      name: 'example.orphan-server-statement',
+      startTime: BASE_START_MS + 10,
+      duration: 50,
+    });
+    // A function span — a kind this view does not draw — that the correlator
+    // re-attached, with a drawn call beneath it and a statement beneath that.
+    const bridge = makeEvent({
+      id: eventIdFor(63),
+      spanId: spanIdFor(63),
+      parentSpanId: spanIdFor(64),
+      kind: 'function',
+      tier: 'server',
+      name: 'example.undrawn-step',
+      startTime: BASE_START_MS + 300,
+      duration: 300,
+    });
+    const lifted = makeEvent({
+      id: eventIdFor(65),
+      spanId: spanIdFor(65),
+      parentSpanId: spanIdFor(63),
+      kind: 'http.client',
+      tier: 'server',
+      name: 'example.lifted-outgoing',
+      startTime: BASE_START_MS + 310,
+      duration: 100,
+    });
+    const liftedQuery = makeEvent({
+      id: eventIdFor(66),
+      spanId: spanIdFor(66),
+      parentSpanId: spanIdFor(65),
+      kind: 'db.query',
+      tier: 'db',
+      name: 'example.lifted-statement',
+      startTime: BASE_START_MS + 320,
+      duration: 40,
+    });
+    const selfParented = makeEvent({
+      id: eventIdFor(68),
+      spanId: spanIdFor(68),
+      parentSpanId: spanIdFor(68),
+      kind: 'fetch',
+      tier: 'browser',
+      name: 'example.self-parented',
+      startTime: BASE_START_MS + 500,
+      duration: 20,
+    });
+    const placed = makeEvent({
+      id: eventIdFor(67),
+      spanId: spanIdFor(67),
+      kind: 'fetch',
+      tier: 'browser',
+      name: 'example.placed-call',
+      startTime: BASE_START_MS + 700,
+      duration: 20,
+    });
+    const tree = traceTreeOf(
+      [
+        traceNodeOf(orphanServer, 0, [traceNodeOf(orphanServerQuery, 1, [])], {
+          reason: 'missing-parent',
+          missingParentSpanId: spanIdFor(60),
+        }),
+        traceNodeOf(bridge, 0, [traceNodeOf(lifted, 1, [traceNodeOf(liftedQuery, 2, [])])], {
+          reason: 'missing-parent',
+          missingParentSpanId: spanIdFor(64),
+        }),
+        traceNodeOf(selfParented, 0, [], {
+          reason: 'self-parent',
+          missingParentSpanId: spanIdFor(68),
+        }),
+        traceNodeOf(placed, 0, []),
+      ],
+      [orphanServer, orphanServerQuery, bridge, lifted, liftedQuery, selfParented, placed],
+    );
+    const stub = recordingProvider(() => Promise.resolve({ source: 'trace', data: tree }));
+    const user = userEvent.setup();
+
+    renderComponent(TRACE_NODE, { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+    expect(drawnRows()).toHaveLength(4);
+
+    // Its own verdict: the reason and the parent that never arrived.
+    const orphanRow = rowLabelled(orphanServer.name);
+    expect(isFlaggedReattached(orphanRow)).toBe(true);
+    expect(orphanRow.getAttribute('aria-label') ?? '').toContain(
+      `${REATTACHED_PHRASE} (missing-parent): the parent ${spanIdFor(60)} of this call never arrived`,
+    );
+
+    // Lifted to the top level through the undrawn re-attached step, so it
+    // carries that step's verdict — stated as the enclosing call's.
+    const liftedRow = rowLabelled(lifted.name);
+    expect(isFlaggedReattached(liftedRow)).toBe(true);
+    expect(liftedRow.getAttribute('aria-label') ?? '').toContain(
+      `${REATTACHED_PHRASE} with an enclosing call not drawn here (missing-parent): the parent ${spanIdFor(64)} of that call never arrived`,
+    );
+    expect(screen.queryByText(bridge.name)).toBeNull();
+
+    // A malformed link is named as what it was, not as a parent that is late.
+    const selfRow = rowLabelled(selfParented.name);
+    expect(isFlaggedReattached(selfRow)).toBe(true);
+    expect(selfRow.getAttribute('aria-label') ?? '').toContain(
+      `${REATTACHED_PHRASE} (self-parent): this call names itself as its parent`,
+    );
+
+    // A node the correlator placed is an ordinary row.
+    expect(isFlaggedReattached(rowLabelled(placed.name))).toBe(false);
+
+    // And the verdict stops at the first drawn row: what ran inside a
+    // re-attached call is placed correctly relative to it.
+    await user.click(
+      within(rowLabelled(orphanServer.name)).getByRole('button', { name: EXPAND_NAME }),
+    );
+    expect(isFlaggedReattached(rowLabelled(orphanServerQuery.name))).toBe(false);
+    await user.click(within(rowLabelled(lifted.name)).getByRole('button', { name: EXPAND_NAME }));
+    expect(isFlaggedReattached(rowLabelled(liftedQuery.name))).toBe(false);
+  });
+
+  it('flags a flat record from its persisted flag, and ignores a flag its loaded parent proves stale', async () => {
+    const ownFlag = makeEvent({
+      id: eventIdFor(71),
+      spanId: spanIdFor(71),
+      parentSpanId: spanIdFor(70),
+      kind: 'db.query',
+      tier: 'db',
+      name: 'example.persisted-orphan',
+      startTime: BASE_START_MS,
+      duration: 80,
+      attributes: { orphaned: true, orphanedParentSpanId: spanIdFor(70) },
+    });
+    // Flagged, but with no recorded parent id: the sentence says so rather than
+    // naming one.
+    const bareFlag = makeEvent({
+      id: eventIdFor(80),
+      spanId: spanIdFor(80),
+      parentSpanId: spanIdFor(81),
+      kind: 'fetch',
+      tier: 'browser',
+      name: 'example.bare-flag',
+      startTime: BASE_START_MS + 50,
+      duration: 30,
+      attributes: { orphaned: true },
+    });
+    // An undrawn step flagged as re-attached (the string form of the flag), and
+    // the drawn call it lifts to the top level.
+    const flaggedStep = makeEvent({
+      id: eventIdFor(77),
+      spanId: spanIdFor(77),
+      parentSpanId: spanIdFor(78),
+      kind: 'function',
+      tier: 'server',
+      name: 'example.flagged-step',
+      startTime: BASE_START_MS + 100,
+      duration: 200,
+      attributes: { orphaned: 'true', orphanedParentSpanId: spanIdFor(78) },
+    });
+    const liftedCall = makeEvent({
+      id: eventIdFor(79),
+      spanId: spanIdFor(79),
+      parentSpanId: spanIdFor(77),
+      kind: 'http.client',
+      tier: 'server',
+      name: 'example.lifted-call',
+      startTime: BASE_START_MS + 110,
+      duration: 90,
+    });
+    // Stale at the top level: the flagged call's parent is an unflagged,
+    // undrawn step that IS in the page, so an earlier pass's verdict no longer
+    // holds even though the call still sits at the top level.
+    const placedStep = makeEvent({
+      id: eventIdFor(75),
+      spanId: spanIdFor(75),
+      kind: 'function',
+      tier: 'server',
+      name: 'example.placed-step',
+      startTime: BASE_START_MS + 400,
+      duration: 100,
+    });
+    const staleTop = makeEvent({
+      id: eventIdFor(76),
+      spanId: spanIdFor(76),
+      parentSpanId: spanIdFor(75),
+      kind: 'http.client',
+      tier: 'server',
+      name: 'example.stale-top',
+      startTime: BASE_START_MS + 410,
+      duration: 60,
+      attributes: { orphaned: true, orphanedParentSpanId: spanIdFor(75) },
+    });
+    // Stale and nested: the parent arrived and is drawn.
+    const server = makeEvent({
+      id: eventIdFor(73),
+      spanId: spanIdFor(73),
+      kind: 'http.server',
+      tier: 'server',
+      name: 'example.late-parent',
+      startTime: BASE_START_MS + 600,
+      duration: 150,
+    });
+    const staleNested = makeEvent({
+      id: eventIdFor(74),
+      spanId: spanIdFor(74),
+      parentSpanId: spanIdFor(73),
+      kind: 'db.query',
+      tier: 'db',
+      name: 'example.stale-nested',
+      startTime: BASE_START_MS + 610,
+      duration: 70,
+      attributes: { orphaned: 'true', orphanedParentSpanId: spanIdFor(73) },
+    });
+    const stub = resolvingProvider([
+      ownFlag,
+      bareFlag,
+      flaggedStep,
+      liftedCall,
+      placedStep,
+      staleTop,
+      server,
+      staleNested,
+    ]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+    expect(drawnRows()).toHaveLength(5);
+
+    // A persisted flag records THAT the parent was unresolvable, not which of
+    // the correlator's cases applied, so no reason is claimed.
+    const ownRow = rowLabelled(ownFlag.name);
+    expect(isFlaggedReattached(ownRow)).toBe(true);
+    expect(ownRow.getAttribute('aria-label') ?? '').toContain(
+      `${REATTACHED_PHRASE}: the parent ${spanIdFor(70)} of this call never arrived`,
+    );
+    expect(ownRow.getAttribute('aria-label') ?? '').not.toContain('(missing-parent)');
+
+    expect(isFlaggedReattached(rowLabelled(bareFlag.name))).toBe(true);
+    expect(rowLabelled(bareFlag.name).getAttribute('aria-label') ?? '').toContain(
+      `${REATTACHED_PHRASE}: the parent this call names never arrived`,
+    );
+
+    const liftedRow = rowLabelled(liftedCall.name);
+    expect(isFlaggedReattached(liftedRow)).toBe(true);
+    expect(liftedRow.getAttribute('aria-label') ?? '').toContain(
+      `${REATTACHED_PHRASE} with an enclosing call not drawn here: the parent ${spanIdFor(78)} of that call never arrived`,
+    );
+
+    // Stale flags draw nothing, at the top level and nested.
+    expect(isFlaggedReattached(rowLabelled(staleTop.name))).toBe(false);
+    expect(isFlaggedReattached(rowLabelled(server.name))).toBe(false);
+    await user.click(within(rowLabelled(server.name)).getByRole('button', { name: EXPAND_NAME }));
+    expect(isFlaggedReattached(rowLabelled(staleNested.name))).toBe(false);
+
+    // The undrawn steps are not drawn for carrying a flag.
+    expect(screen.queryByText(flaggedStep.name)).toBeNull();
+    expect(screen.queryByText(placedStep.name)).toBeNull();
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Failure in words, and the two row states the stylesheet paints
+ * ---------------------------------------------------------------------------
+ */
+
+/** The word a failed call without a failing status code shows. */
+const ERROR_BADGE = 'Error';
+
+/**
+ * The component stylesheet, read from disk with the `import.meta.url`
+ * convention `../tokens/tokens.test.ts` documents, so the working directory is
+ * irrelevant. The path is joined with `node:path` rather than resolved with
+ * `new URL(…)`: under happy-dom the global `URL` is the DOM's, which Node's
+ * `fileURLToPath` rejects.
+ */
+const COMPONENT_STYLESHEET = readFileSync(
+  path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'styles', 'components.css'),
+  'utf8',
+);
+
+/**
+ * The declaration block of one selector in {@link COMPONENT_STYLESHEET}, and
+ * the offset its rule starts at, failing when the rule is absent.
+ *
+ * @param selector The selector exactly as written at the start of its rule.
+ * @returns The rule's start offset and the text between its braces.
+ */
+function ruleOf(selector: string): { readonly start: number; readonly body: string } {
+  const start = COMPONENT_STYLESHEET.indexOf(`\n${selector} {`);
+  expect(start).toBeGreaterThanOrEqual(0);
+  const open = COMPONENT_STYLESHEET.indexOf('{', start);
+  const close = COMPONENT_STYLESHEET.indexOf('}', open);
+  return { start, body: COMPONENT_STYLESHEET.slice(open + 1, close) };
+}
+
+describe('Waterfall failure and state styling', () => {
+  it('says "Error" on a failed call no status code conveys, and never beside one that does', async () => {
+    const failedQuery = makeEvent({
+      id: eventIdFor(91),
+      spanId: spanIdFor(91),
+      kind: 'db.query',
+      tier: 'db',
+      name: 'example.failed-statement',
+      startTime: BASE_START_MS,
+      duration: 120,
+      status: 'error',
+    });
+    // A failed outgoing call whose response code does not read as a failure:
+    // the code alone would say "fine", so the word is added.
+    const failedDespiteCode = makeEvent({
+      id: eventIdFor(92),
+      spanId: spanIdFor(92),
+      kind: 'http.client',
+      tier: 'server',
+      name: 'example.failed-outgoing',
+      startTime: BASE_START_MS + 150,
+      duration: 60,
+      status: 'error',
+      attributes: { 'http.status_code': 200 },
+    });
+    const unavailable = makeEvent({
+      id: eventIdFor(93),
+      spanId: spanIdFor(93),
+      kind: 'fetch',
+      tier: 'browser',
+      name: 'example.unavailable',
+      startTime: BASE_START_MS + 250,
+      duration: 40,
+      status: 'error',
+      attributes: { 'http.status_code': 503 },
+    });
+    const succeeded = makeEvent({
+      id: eventIdFor(94),
+      spanId: spanIdFor(94),
+      kind: 'db.query',
+      tier: 'db',
+      name: 'example.fine-statement',
+      startTime: BASE_START_MS + 320,
+      duration: 20,
+      status: 'ok',
+    });
+    const stub = resolvingProvider([failedQuery, failedDespiteCode, unavailable, succeeded]);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree', { name: TREE_NAME });
+
+    for (const event of [failedQuery, failedDespiteCode]) {
+      const row = rowLabelled(event.name);
+      const badge = within(row).getByText(ERROR_BADGE);
+      expect(badge.classList.contains('dg-badge')).toBe(true);
+      expect(badge.classList.contains('dg-badge--danger')).toBe(true);
+      expect(badge.classList.contains('dg-waterfall__status')).toBe(true);
+      expect(row.classList.contains('dg-is-error')).toBe(true);
+    }
+    expect(rowLabelled(failedQuery.name).getAttribute('aria-label') ?? '').toContain(
+      'status Error',
+    );
+
+    // A failing code already says it, in the danger tone; a second word beside
+    // it would say the same thing twice.
+    const unavailableRow = rowLabelled(unavailable.name);
+    expect(within(unavailableRow).getByText('503').classList.contains('dg-badge--danger')).toBe(
+      true,
+    );
+    expect(within(unavailableRow).queryByText(ERROR_BADGE)).toBeNull();
+    expect(unavailableRow.classList.contains('dg-is-error')).toBe(true);
+
+    // And a success is not marked at all.
+    const fineRow = rowLabelled(succeeded.name);
+    expect(within(fineRow).queryByText(ERROR_BADGE)).toBeNull();
+    expect(fineRow.classList.contains('dg-is-error')).toBe(false);
+  });
+
+  it('paints the failed and re-attached row states from tokens, beneath the selected state', () => {
+    const orphan = ruleOf('.dg-waterfall__row.dg-is-orphan');
+    const failed = ruleOf('.dg-waterfall__row.dg-is-error');
+    const selected = ruleOf('.dg-waterfall__row.dg-is-selected');
+
+    expect(orphan.body).toContain('border-inline-start-color: var(--dg-warning);');
+    expect(orphan.body).toContain('border-inline-start-style: dashed;');
+    expect(failed.body).toContain('border-inline-start-color: var(--dg-danger);');
+
+    // Equal specificity, so source order decides: selection's accent edge must
+    // come last to win over both.
+    expect(orphan.start).toBeLessThan(selected.start);
+    expect(failed.start).toBeLessThan(selected.start);
+    expect(selected.body).toContain('border-inline-start-color: var(--dg-accent);');
   });
 });

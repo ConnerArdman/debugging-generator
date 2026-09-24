@@ -37,11 +37,16 @@
  *   span is pure risk to a developer's working tree, so when no preload is
  *   attached this adapter applies nothing and reports the gap with the exact
  *   relaunch command instead (see {@link NextJsAdapterOptions.relaunch}).
- * - **No rollback.** `../installer.ts` reverse-restores exactly the records one
- *   install call applied, and `../cleanup.ts` owns restoration — chain-aware
- *   and in strict reverse order. This adapter's contribution to both is an
- *   accurate {@link InstallResult.applied}, which is why a record whose write
- *   may have landed is reported even when its patch did not complete.
+ * - **No stepping past a failed patch, and no rollback of its own.** The
+ *   patcher stops at the first target it cannot complete, and this adapter
+ *   stops with it: the records applied so far go back in
+ *   {@link InstallResult.applied} and the failure — with the record journaled
+ *   for the failed attempt — in {@link InstallResult.failure}, the contract's
+ *   fatal channel. `../installer.ts` then reverse-restores every record the
+ *   current install applied, so a follow-up's delta is all-or-nothing
+ *   (AAP §0.4.2), and `../cleanup.ts` owns the restoration itself —
+ *   chain-aware and in strict reverse order. Continuing after a failure would
+ *   hand the installer a partial install shaped like a successful one.
  * - **No probing.** Readiness is a statement about observed evidence: no port
  *   is opened, no process is spawned, no environment variable is read.
  *
@@ -57,7 +62,7 @@
  * session's "Ready to capture" state.
  */
 
-import { newActionId, normalizePosix, nowEpochMs, toPosix } from '@debuggen/shared';
+import { DebuggenError, newActionId, normalizePosix, nowEpochMs, toPosix } from '@debuggen/shared';
 import type { Logger } from '@debuggen/shared';
 import { HTTP_METHOD_NAMES } from '@debuggen/code-analysis';
 import type {
@@ -71,6 +76,7 @@ import type {
 
 import type {
   AdapterRemoveRequest,
+  InstallFailure,
   InstallResult,
   InstrumentationContext,
   InstrumentationAdapter,
@@ -1491,8 +1497,9 @@ function functionActions(
  * Id and type, and nothing else: a `mode` that disagrees with
  * {@link NEXTJS_ADAPTER_CLAIMS} is not silently corrected here, because the
  * patcher refuses a runtime-mode action with a message a developer can act on,
- * and that refusal reaching {@link InstallResult.unavailable} is more useful
- * than an action disappearing from this adapter's view.
+ * and that refusal reaching the installer through
+ * {@link InstallResult.failure} is more useful than an action disappearing
+ * from this adapter's view.
  *
  * @param action One action of a normalised plan.
  * @returns `true` when this adapter must install it.
@@ -1535,77 +1542,65 @@ function orderForInstall(
 }
 
 /**
- * Where the failed action sits in the set still to be installed.
+ * The patch the batch stopped on, as the fatal channel reports it.
  *
- * By id first, because that is what a batch reports for an action, and by
- * `(file, symbol)` as the fallback for a failure raised before the action's id
- * was carried. A negative answer stops the sequence rather than restarting it,
- * which is the one outcome that could otherwise loop.
+ * The patcher's own error is forwarded unchanged — its message and hint are
+ * already written for a developer (an unsupported declaration, a baseline
+ * conflict naming where the original is kept, a path that escapes the project,
+ * a cancelled sequence) and `../installer.ts` quotes them rather than a
+ * paraphrase. The signal is the patched-span signal in both families: what the
+ * failed action would have supplied is the span its wrapper emits, never the
+ * runtime spans the preload produces on its own.
  *
- * @param remaining The actions still to install.
- * @param failure The failure the batch stopped on.
- * @returns The index, or `-1`.
- */
-function indexOfFailed(
-  remaining: readonly InstrumentationAction[],
-  failure: PatchBatchFailure,
-): number {
-  if (failure.actionId !== undefined) {
-    const byId = remaining.findIndex((action) => action.id === failure.actionId);
-
-    if (byId >= 0) {
-      return byId;
-    }
-  }
-
-  return remaining.findIndex(
-    (action) => action.file === failure.file && action.symbol === failure.symbol,
-  );
-}
-
-/**
- * One patch that could not be applied, as a gap a developer can act on.
+ * The record journaled for the attempt travels here and only here. Whatever
+ * stage the sequence reached, it is the installer's to settle through the
+ * reconciliation table — closed without a write when the file still holds the
+ * original, restored when the file holds the patch — so it is forwarded even
+ * when the rename never ran. The conflict report is forwarded for the caller
+ * that shows it, and is never logged: it holds diffs.
  *
- * The patcher's own message and hint are already written for a developer — an
- * unsupported declaration, a baseline conflict naming where the original is
- * kept, a path that escapes the project — so they are surfaced rather than
- * paraphrased, prefixed with the target they are about. The signal is the
- * patched-span signal in both families: what is lost is the span the wrapper
- * would have emitted, never the runtime spans the preload still produces.
+ * Optional members are spread rather than assigned, so an absent fact is an
+ * absent key and not a key holding `undefined`.
  *
  * @param failure The failure the batch stopped on.
- * @returns The entry.
+ * @returns The fatal-channel entry.
  */
-function patchGap(failure: PatchBatchFailure): UnavailableSignal {
+function installFailureOf(failure: PatchBatchFailure): InstallFailure {
   return {
+    error: failure.error,
     signal: PATCHED_SPAN_SIGNAL,
-    reason: singleLine(
-      `${failure.symbol} in ${failure.file} could not be wrapped — ${failure.error.message}`,
-    ),
-    hint: singleLine(
-      failure.error.hint ??
-        'Choose a different symbol for this signal, or ask the question again without it.',
-    ),
+    file: failure.file,
+    symbol: failure.symbol,
+    ...(failure.actionId === undefined ? {} : { actionId: failure.actionId }),
+    ...(failure.record === undefined ? {} : { record: failure.record }),
+    ...(failure.conflict === undefined ? {} : { conflict: failure.conflict }),
   };
 }
 
 /**
- * The gap a cancelled install leaves behind.
+ * The fatal-channel entry for an install cancelled before its first patch.
  *
- * Reported rather than thrown: the actions applied before the cancellation are
- * real and are reported in {@link InstallResult.applied}, and the ones that
- * never started are a narrower capture the developer is told about.
+ * A failure rather than a gap: the actions were accepted for install and none
+ * of them will be, so the install as planned did not happen and the installer
+ * must unwind whatever the adapters before this one applied — exactly as it
+ * does for a cancellation it notices itself between groups.
  *
- * @param pending How many actions were left.
- * @returns The entry.
+ * @param pending How many accepted actions were left unattempted.
+ * @returns The fatal-channel entry.
  */
-function abortGap(pending: number): UnavailableSignal {
+function cancelledBeforePatching(pending: number): InstallFailure {
   return {
-    signal: PATCHED_SPAN_SIGNAL,
-    reason: singleLine(
-      `this install was cancelled with ${pending} planned target${pending === 1 ? '' : 's'} left, so their spans are not produced`,
+    error: new DebuggenError(
+      'INSTRUMENTATION_INSTALL_FAILED',
+      singleLine(
+        `The install was cancelled before ${String(pending)} planned target${pending === 1 ? ' was' : 's were'} patched.`,
+      ),
+      {
+        hint: 'Nothing was written for these targets. Start the capture again to install them.',
+        details: { reason: 'aborted', pending },
+      },
     ),
-    hint: 'Start the capture again to install the remaining targets.',
+    signal: PATCHED_SPAN_SIGNAL,
   };
 }
 
@@ -1827,10 +1822,19 @@ export function createNextJsAdapter(options?: NextJsAdapterOptions): NextJsAdapt
      *
      * Every byte reaches the file through `../patch/patcher.js`, whose hash →
      * backup → journal → atomic-rename sequence is what makes the edit
-     * reversible. Failures are reported, never thrown, and never rolled back
-     * here: `../installer.ts` reverse-restores exactly the records this call
-     * reports, which is why a record whose write may have landed is included in
-     * {@link InstallResult.applied} even though its patch did not complete.
+     * reversible. The accepted actions go to the patcher as **one batch** in
+     * {@link orderForInstall}'s order, and the batch **stops at the first
+     * target it cannot complete** — a refused declaration, a baseline
+     * conflict, a write-path failure, a cancellation between stages. That
+     * failure is fatal to this install and is reported, never thrown, through
+     * {@link InstallResult.failure}: the records completed before it are in
+     * {@link InstallResult.applied}, the record journaled for the failed
+     * attempt is in {@link InstallFailure.record}, and no hook or signal
+     * contribution is claimed. Nothing is rolled back here — `../installer.ts`
+     * reverse-restores every record the current install applied, which is
+     * what keeps a follow-up's delta all-or-nothing (AAP §0.4.2). A signal
+     * that was already aborted when the call arrived is the same failure with
+     * nothing written.
      */
     async install(
       actions: readonly InstrumentationAction[],
@@ -1871,6 +1875,21 @@ export function createNextJsAdapter(options?: NextJsAdapterOptions): NextJsAdapt
         });
       }
 
+      if (context.signal?.aborted === true) {
+        logger.info('the install was cancelled before any target was patched', {
+          actions: accepted.length,
+          planVersion: context.planVersion,
+        });
+
+        return {
+          adapterId: NEXTJS_ADAPTER_ID,
+          applied: [],
+          runtimeHooks: [],
+          unavailable,
+          failure: cancelledBeforePatching(accepted.length),
+        };
+      }
+
       // One patcher per install call: its own duplicate-target guard is scoped
       // to this plan version, and the chain parent for a file an earlier plan
       // version already instrumented is resolved through the journal by the
@@ -1886,60 +1905,45 @@ export function createNextJsAdapter(options?: NextJsAdapterOptions): NextJsAdapt
         signal: context.signal,
       });
 
-      const applied: ModificationRecord[] = [];
-      let remaining = orderForInstall(accepted, context.queries);
+      // One batch, and no loop around it. The patcher stops at the first
+      // target it cannot complete, which is the safe reading of a failure: the
+      // installer that called this is about to unwind, and every further edit
+      // would be one more file to restore. Stepping past the failure instead
+      // would hand the installer a partial install shaped like a successful
+      // one, which is precisely what would make a follow-up's delta non-atomic.
+      const ordered = orderForInstall(accepted, context.queries);
+      const batch = await patcher.patchActions(ordered);
+      const applied: ModificationRecord[] = batch.applied.map((outcome) => outcome.record);
+      const failure = batch.failure;
 
-      while (remaining.length > 0) {
-        if (context.signal?.aborted === true) {
-          unavailable.push(abortGap(remaining.length));
-          break;
-        }
-
-        // The batch stops at its first failure, which is what lets each failure
-        // be reported on its own terms; the sequence then continues after the
-        // action that failed, so one unsupported declaration does not cost the
-        // capture every target behind it.
-        const batch = await patcher.patchActions(remaining);
-
-        for (const outcome of batch.applied) {
-          applied.push(outcome.record);
-        }
-
-        const failure = batch.failure;
-
-        if (failure === undefined) {
-          break;
-        }
-
-        if (failure.fileMayHoldPatch && failure.record !== undefined) {
-          // The rename returned and the failure came afterwards: the file may
-          // hold the patched bytes and the record is on file with both hashes,
-          // so omitting it would hide a change from the only party that can
-          // restore it.
-          applied.push(failure.record);
-        }
-
-        unavailable.push(patchGap(failure));
-        logger.warn('a planned target could not be instrumented', {
+      if (failure !== undefined) {
+        // Identifiers, a project-relative path and codes only: the conflict
+        // report holds diffs, and nothing of a file's content is logged.
+        logger.warn('a planned target could not be instrumented; this install stops here', {
+          actionId: failure.actionId,
           file: failure.file,
           symbol: failure.symbol,
           stage: failure.stage,
           code: failure.error.code,
+          recordId: failure.record?.id,
           fileMayHoldPatch: failure.fileMayHoldPatch,
           conflicted: failure.conflict !== undefined,
+          applied: applied.length,
+          notAttempted: Math.max(0, ordered.length - applied.length - 1),
+          planVersion: context.planVersion,
         });
 
-        const failedAt = indexOfFailed(remaining, failure);
-
-        if (failedAt < 0) {
-          logger.warn('stopping: the reported failure names no remaining target', {
-            file: failure.file,
-            symbol: failure.symbol,
-          });
-          break;
-        }
-
-        remaining = remaining.slice(failedAt + 1);
+        // Only the silent-preload gaps are carried: the failure is what this
+        // result reports, and the installer ignores every other member of it
+        // while it unwinds. No hook and no signal contribution is claimed for
+        // an install that is being reversed.
+        return {
+          adapterId: NEXTJS_ADAPTER_ID,
+          applied,
+          runtimeHooks: [],
+          unavailable,
+          failure: installFailureOf(failure),
+        };
       }
 
       const signals = deriveServerAgentSignals(accepted);

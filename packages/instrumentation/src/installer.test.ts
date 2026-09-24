@@ -1,7 +1,7 @@
 /**
  * Unit suite for `./installer.ts` — the ordered installation driver.
  *
- * Six of its promises cannot be read off the type system, and each one is a
+ * Seven of its promises cannot be read off the type system, and each one is a
  * product guarantee rather than an implementation detail:
  *
  * 1. **Runtime hooks are armed before the first byte is written.** A capture
@@ -30,6 +30,14 @@
  *    previous plan version left, and that version's own file still instrumented.
  * 6. **A cancelled install unwinds the same way**, whether the signal was
  *    already aborted when the call started or was aborted mid-flight.
+ * 7. **A failure an adapter reports is fatal, not a gap.** An adapter that
+ *    returns `InstallResult.failure` — the contract's fatal channel, for an
+ *    action it accepted and could not complete — fails the install exactly as
+ *    one that throws, and the rollback also restores the records it returned
+ *    beside the failure and the record journaled for the failed attempt, in
+ *    strict reverse append order. A malformed `failure` is an invalid result,
+ *    and an explicit `failure: undefined` is still an ordinary success, which
+ *    is what keeps the channel additive for adapters written before it.
  *
  * Three habits here are deliberate.
  *
@@ -91,6 +99,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Mock } from 'vitest';
 
 import type {
+  InstallFailure,
   InstallResult,
   InstrumentationAdapter,
   InstrumentationContext,
@@ -100,13 +109,14 @@ import { installPlan } from './installer.js';
 import type { AggregateInstallResult, InstallPlanOptions } from './installer.js';
 import { createBackupStore } from './patch/backup-store.js';
 import { createPatcher } from './patch/patcher.js';
+import type { Patcher, PatchStageObserver } from './patch/patcher.js';
 import type {
   ModificationJournal,
   ModificationRecord,
   ModificationStatus,
   ModificationStatusPatch,
 } from './schema/modification.js';
-import { INSTRUMENTATION_PLAN_VERSION } from './schema/plan.js';
+import { INSTRUMENTATION_PLAN_VERSION, TARGETLESS_FILE, TARGETLESS_SYMBOL } from './schema/plan.js';
 import type {
   AdapterActionResolution,
   InstrumentationAction,
@@ -801,7 +811,28 @@ async function patchThrough(
   actions: readonly InstrumentationAction[],
   context: InstrumentationContext,
 ): Promise<ModificationRecord[]> {
-  const patcher = createPatcher({
+  const batch = await patcherFor(context).patchActions(actions);
+
+  if (batch.failure !== undefined) {
+    throw batch.failure.error;
+  }
+
+  return batch.applied.map((outcome) => outcome.record);
+}
+
+/**
+ * The production patcher for one install call, built from the context the
+ * installer handed the adapter.
+ *
+ * @param context The session's context, supplying the project root, the session
+ * id, the plan version to stamp, the backup store, the journal, the clock and
+ * the cancellation signal.
+ * @param onStage A stage observer, for a case that injects a failure — or
+ * raises a cancellation — at a named boundary of the write sequence.
+ * @returns The patcher.
+ */
+function patcherFor(context: InstrumentationContext, onStage?: PatchStageObserver): Patcher {
+  return createPatcher({
     projectRoot: context.projectRoot,
     sessionId: context.sessionId,
     planVersion: context.planVersion,
@@ -812,14 +843,8 @@ async function patchThrough(
     // real adapter forwards both rather than reaching for the globals.
     ...(context.now === undefined ? {} : { now: context.now }),
     ...(context.signal === undefined ? {} : { signal: context.signal }),
+    ...(onStage === undefined ? {} : { onStage }),
   });
-  const batch = await patcher.patchActions(actions);
-
-  if (batch.failure !== undefined) {
-    throw batch.failure.error;
-  }
-
-  return batch.applied.map((outcome) => outcome.record);
 }
 
 /**
@@ -849,6 +874,99 @@ function throwingPatchAdapter(
 
     return Promise.reject(error);
   });
+}
+
+/** A fatal-channel adapter, and the failure it last reported. */
+interface ReportingAdapter {
+  /** The adapter, to pass in `InstallPlanOptions.adapters`. */
+  readonly adapter: InstrumentationAdapter;
+
+  /** The failure its last install returned, or `undefined` when it had none. */
+  readonly reported: () => InstallFailure | undefined;
+}
+
+/**
+ * A patch-mode adapter that reports a failed batch through the fatal channel
+ * instead of throwing it.
+ *
+ * It patches exactly the actions it was handed through the production patcher
+ * — an optional stage observer is where a case injects a failure — and returns
+ * a stopped batch the way the adapter contract says a failed install is
+ * returned: the completed records in `applied`, and the error, the target and
+ * the record journaled for the failed attempt in `failure`. A batch that did
+ * not stop is returned as an ordinary success. The failure it returned is kept,
+ * so a case can compare the installer's error against the very object the
+ * adapter reported.
+ *
+ * @param id The adapter's id, as a plan's `adapter` field names it.
+ * @param calls The shared call log every adapter in a case appends to.
+ * @param onStage A stage observer for the patcher, where a case injects its
+ * failure.
+ * @returns The adapter and an accessor for what it reported.
+ */
+function reportingPatchAdapter(
+  id: string,
+  calls: string[],
+  onStage?: PatchStageObserver,
+): ReportingAdapter {
+  let reported: InstallFailure | undefined;
+
+  const adapter = fakeAdapter(
+    id,
+    async (
+      actions: readonly InstrumentationAction[],
+      context: InstrumentationContext,
+    ): Promise<InstallResult> => {
+      calls.push(id);
+      reported = undefined;
+
+      const batch = await patcherFor(context, onStage).patchActions(actions);
+      const applied = batch.applied.map((outcome) => outcome.record);
+
+      if (batch.failure === undefined) {
+        return {
+          adapterId: id,
+          applied,
+          runtimeHooks: [],
+          unavailable: [],
+          serverSignals: { functions: actions.map((item) => item.symbol) },
+        };
+      }
+
+      const { error, actionId, file, symbol, record } = batch.failure;
+
+      reported = {
+        error,
+        signal: 'functions',
+        file,
+        symbol,
+        ...(actionId === undefined ? {} : { actionId }),
+        ...(record === undefined ? {} : { record }),
+      };
+
+      return { adapterId: id, applied, runtimeHooks: [], unavailable: [], failure: reported };
+    },
+  );
+
+  return { adapter, reported: () => reported };
+}
+
+/**
+ * A stage observer that throws right after one file's rename.
+ *
+ * The injected failure that leaves the most behind: the target holds the
+ * patched bytes and its journal row is still the pre-write one, so only a
+ * rollback that includes the failed attempt's record can bring the file back.
+ *
+ * @param file The project-relative file whose `'replace-file'` step fails.
+ * @returns The observer.
+ */
+function failAfterRenameOf(file: string): PatchStageObserver {
+  return (event) => {
+    if (event.stage === 'replace-file' && event.file === file) {
+      throw new Error(`injected: interrupted right after renaming ${file}`);
+    }
+  };
 }
 
 /**
@@ -1461,7 +1579,16 @@ describe('graceful degradation', () => {
     const journal = fakeJournal();
     const calls: string[] = [];
     const plan = planWith([
-      action({ adapter: 'renders', id: 'act_0000000000000501', type: 'react-render-tracking' }),
+      // Page-wide render tracking names the targetless marker: the real gate
+      // checks every target it is given, so a runtime action naming a file the
+      // copied fixture does not have would be refused alongside the patches.
+      action({
+        adapter: 'renders',
+        id: 'act_0000000000000501',
+        type: 'react-render-tracking',
+        file: TARGETLESS_FILE,
+        symbol: TARGETLESS_SYMBOL,
+      }),
       // A generator: a wrapper that calls the body as a function cannot
       // preserve `yield`, and the gate refuses it by reading the real syntax
       // tree of the copied fixture.
@@ -1533,7 +1660,14 @@ describe('graceful degradation', () => {
   it('forwards a registry as the gate resolver and installs what it claims', async () => {
     const calls: string[] = [];
     const adapter = runtimeAdapter('renders', calls, { agentHooks: { react: true } });
-    const plan = planWith([action({ adapter: 'renders', type: 'react-render-tracking' })]);
+    const plan = planWith([
+      action({
+        adapter: 'renders',
+        type: 'react-render-tracking',
+        file: TARGETLESS_FILE,
+        symbol: TARGETLESS_SYMBOL,
+      }),
+    ]);
 
     const installed = expectOk(
       await installPlan(plan, makeContext(), {
@@ -2057,6 +2191,368 @@ describe('a patch failing part-way', () => {
     // the record is not claimed to be reverted.
     expect(readFileSync(pathIn(workspace, TARGETS.cones.file), 'utf8')).toBe(developerEdit);
     expect(journal.rows().map((row) => row.status)).not.toContain('reverted');
+  }, 30_000);
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * The fatal channel: a failure an adapter returns rather than throws
+ * ---------------------------------------------------------------------------------------------- */
+
+describe('a failure reported through the fatal channel', () => {
+  it('reverse-restores a delta whose adapter applied two targets and failed after a third one\u2019s rename', async () => {
+    const workspace = makeWorkspace();
+    const journal = fakeJournal();
+
+    // Plan version 1 is already installed: its file carries the patch and its
+    // record is applied.
+    const previousAction = action({
+      adapter: 'framework',
+      id: 'act_0000000000000601',
+      type: 'function-timing',
+      mode: 'patch',
+      ...TARGETS.plannerSegments,
+    });
+    const previousInstall = expectOk(
+      await installPlan(
+        planWith([previousAction], 1),
+        makeContext({ workspace, journal, planVersion: 1 }),
+        { adapters: [patchingAdapter('framework', [])], skipFeasibility: true },
+      ),
+    );
+    const previousRecord = onlyRecord(previousInstall.applied);
+    const previousInstrumentedDigest = digestIn(workspace, previousAction.file);
+
+    expect(previousInstrumentedDigest).toBe(previousRecord.instrumentedHash);
+
+    // The delta's three targets, in the order the group installs them (by id).
+    // The third is in plan version 1's file, so its record chains onto that
+    // version's — and it is the one whose write fails after the rename.
+    const route = action({
+      adapter: 'writer',
+      id: 'act_0000000000000602',
+      type: 'server-span',
+      mode: 'patch',
+      ...TARGETS.route,
+    });
+    const cones = action({
+      adapter: 'writer',
+      id: 'act_0000000000000603',
+      type: 'function-timing',
+      mode: 'patch',
+      ...TARGETS.cones,
+    });
+    const chained = action({
+      adapter: 'writer',
+      id: 'act_0000000000000604',
+      type: 'function-timing',
+      mode: 'patch',
+      ...TARGETS.planner,
+    });
+    const deltaFiles = [route.file, cones.file, chained.file] as const;
+    const bytesBefore = new Map(
+      deltaFiles.map((file) => [file, readFileSync(pathIn(workspace, file))] as const),
+    );
+    const appendsBefore = appendedIds(journal).length;
+    const calls: string[] = [];
+    const writer = reportingPatchAdapter('writer', calls, failAfterRenameOf(chained.file));
+
+    const error = expectErr(
+      await installPlan(
+        planWith([previousAction, route, cones, chained], 2),
+        makeContext({ workspace, journal, planVersion: 2 }),
+        {
+          adapters: [writer.adapter],
+          delta: { previousPlanVersion: 1, actionIds: [route.id, cones.id, chained.id] },
+          skipFeasibility: true,
+        },
+      ),
+    );
+    const reported = writer.reported();
+    const appliedInThisCall = appendedIds(journal).slice(appendsBefore);
+
+    // The adapter really applied two targets and journaled a third, and said so
+    // through the channel rather than by throwing.
+    expect(calls).toEqual(['writer']);
+    expect(appliedInThisCall).toHaveLength(3);
+    expect(reported?.record?.id).toBe(appliedInThisCall[2]);
+    expect(reported?.record?.previousRecordId).toBe(previousRecord.id);
+
+    expect(error.code).toBe('INSTRUMENTATION_INSTALL_FAILED');
+    expect(error.cause).toBe(reported?.error);
+    expect(error.details?.['reason']).toBe('action-failed');
+    expect(error.details?.['adapter']).toBe('writer');
+    expect(error.details?.['previousPlanVersion']).toBe(1);
+    expect(error.details?.['attempted']).toBe(3);
+    expect(error.details?.['restoredCount']).toBe(3);
+    expect(error.details?.['conflictCount']).toBe(0);
+    expect(error.details?.['failureCount']).toBe(0);
+    expect(error.details?.['failedAction']).toEqual({
+      actionId: chained.id,
+      file: chained.file,
+      symbol: chained.symbol,
+      signal: 'functions',
+      code: reported?.error.code,
+      recordId: appliedInThisCall[2],
+      conflictReported: false,
+    });
+    expect(error.message).toContain('"writer"');
+    expect(error.message).toContain(`${chained.symbol} in ${chained.file}`);
+    expect(error.message).toContain('plan version 1');
+    expect(error.hint).toBe(reported?.error.hint);
+
+    // Strictly latest-appended-first: the failed attempt, then the two that
+    // completed — which is what unwinds the chain over plan version 1's file.
+    expect(transitionedIds(journal, 'reverted')).toEqual([...appliedInThisCall].reverse());
+    expect(
+      journal
+        .rows()
+        .filter((row) => row.planVersion === 2)
+        .map((row) => row.status),
+    ).toEqual(['reverted', 'reverted', 'reverted']);
+
+    // Every file the delta touched holds its pre-delta bytes — plan version
+    // 1's file its instrumented ones, the other two their originals.
+    for (const file of deltaFiles) {
+      const before = bytesBefore.get(file) ?? Buffer.alloc(0);
+
+      expect(digestIn(workspace, file)).toBe(sha256Hex(before));
+      expect(Buffer.compare(readFileSync(pathIn(workspace, file)), before)).toBe(0);
+    }
+
+    expect(digestIn(workspace, route.file)).toBe(FIXTURE_DIGESTS[route.file]);
+    expect(digestIn(workspace, cones.file)).toBe(FIXTURE_DIGESTS[cones.file]);
+    expect(digestIn(workspace, previousAction.file)).toBe(previousInstrumentedDigest);
+    expect(journal.rows().find((row) => row.id === previousRecord.id)?.status).toBe('applied');
+  }, 30_000);
+
+  it('fails a first install after earlier groups succeeded, restoring what they wrote and quoting the failure\u2019s hint', async () => {
+    const workspace = makeWorkspace();
+    const journal = fakeJournal();
+    const calls: string[] = [];
+    const refuser = reportingPatchAdapter('refuser', calls);
+    const plan = planWith([
+      action({ adapter: 'renders', id: 'act_0000000000000611' }),
+      action({
+        adapter: 'writer',
+        id: 'act_0000000000000612',
+        type: 'function-timing',
+        mode: 'patch',
+        ...TARGETS.cones,
+      }),
+      action({
+        adapter: 'refuser',
+        id: 'act_0000000000000613',
+        type: 'function-timing',
+        mode: 'patch',
+        ...TARGETS.generator,
+      }),
+    ]);
+
+    const error = expectErr(
+      await installPlan(plan, makeContext({ workspace, journal }), {
+        adapters: [
+          runtimeAdapter('renders', calls),
+          patchingAdapter('writer', calls),
+          refuser.adapter,
+        ],
+        // Skipped on purpose: the gate would refuse the generator, and this
+        // case is about a refusal that arrives after the gate admitted it.
+        skipFeasibility: true,
+      }),
+    );
+    const reported = refuser.reported();
+
+    expect(calls).toEqual(['renders', 'writer', 'refuser']);
+    expect(reported?.error.code).toBe('PATCH_UNSUPPORTED');
+    expect(reported?.record).toBeUndefined();
+
+    expect(error.code).toBe('INSTRUMENTATION_INSTALL_FAILED');
+    expect(error.details?.['reason']).toBe('action-failed');
+    expect(error.details?.['adapter']).toBe('refuser');
+    expect(error.details?.['attempted']).toBe(1);
+    expect(error.details?.['restoredCount']).toBe(1);
+    expect(error.message).toContain(`${TARGETS.generator.symbol} in ${TARGETS.generator.file}`);
+    expect(error.message).toContain(reported?.error.message ?? '\u0000');
+    // The project came back intact, so the hint is the failure's own: it
+    // names the recovery for the cause, which a generic re-ask would not.
+    expect(reported?.error.hint).toBeTruthy();
+    expect(error.hint).toBe(reported?.error.hint);
+
+    // The earlier patch adapter's record was restored; the runtime hook it ran
+    // alongside is not reported, because the install is not.
+    expect(digestIn(workspace, TARGETS.cones.file)).toBe(FIXTURE_DIGESTS[TARGETS.cones.file]);
+    expect(journal.rows().map((row) => row.status)).toEqual(['reverted']);
+    expect(journal.rows().map((row) => row.file)).toEqual([TARGETS.cones.file]);
+  }, 30_000);
+
+  it('says nothing had to be restored when the failure left no record at all', async () => {
+    const workspace = makeWorkspace();
+    const journal = fakeJournal();
+    const before = treeDigests(workspace.projectRoot);
+    const calls: string[] = [];
+    const refuser = reportingPatchAdapter('refuser', calls);
+
+    const error = expectErr(
+      await installPlan(
+        planWith([
+          action({
+            adapter: 'refuser',
+            id: 'act_0000000000000621',
+            type: 'function-timing',
+            mode: 'patch',
+            ...TARGETS.generator,
+          }),
+        ]),
+        makeContext({ workspace, journal }),
+        { adapters: [refuser.adapter], skipFeasibility: true },
+      ),
+    );
+
+    expect(calls).toEqual(['refuser']);
+    expect(error.code).toBe('INSTRUMENTATION_INSTALL_FAILED');
+    expect(error.details?.['reason']).toBe('action-failed');
+    expect(error.details?.['attempted']).toBe(0);
+    expect(error.details?.['restoredCount']).toBe(0);
+    expect(error.message).toContain('nothing had to be restored');
+    expect(journal.calls().filter((entry) => entry.op === 'append')).toEqual([]);
+    expect(treeDigests(workspace.projectRoot)).toEqual(before);
+  }, 30_000);
+
+  it('treats a failure member that is not an object as an invalid result', async () => {
+    const workspace = makeWorkspace();
+    const journal = fakeJournal();
+    const calls: string[] = [];
+
+    const error = expectErr(
+      await installPlan(
+        planWith([
+          action({
+            adapter: 'writer',
+            id: 'act_0000000000000631',
+            type: 'function-timing',
+            mode: 'patch',
+            ...TARGETS.cones,
+          }),
+          action({
+            adapter: 'garbled',
+            id: 'act_0000000000000632',
+            type: 'function-timing',
+            mode: 'patch',
+            ...TARGETS.coneProfile,
+          }),
+        ]),
+        makeContext({ workspace, journal }),
+        {
+          adapters: [
+            patchingAdapter('writer', calls),
+            fakeAdapter('garbled', () => {
+              calls.push('garbled');
+
+              return Promise.resolve({
+                adapterId: 'garbled',
+                applied: [],
+                runtimeHooks: [],
+                unavailable: [],
+                failure: 'boom',
+              } as unknown as InstallResult);
+            }),
+          ],
+          skipFeasibility: true,
+        },
+      ),
+    );
+
+    expect(calls).toEqual(['writer', 'garbled']);
+    expect(error.code).toBe('INSTRUMENTATION_INSTALL_FAILED');
+    expect(error.details?.['reason']).toBe('invalid-result');
+    expect(error.details?.['failedAction']).toBeUndefined();
+    expect(digestIn(workspace, TARGETS.cones.file)).toBe(FIXTURE_DIGESTS[TARGETS.cones.file]);
+    expect(journal.rows().map((row) => row.status)).toEqual(['reverted']);
+  }, 30_000);
+
+  it('reads an explicit `failure: undefined` as an ordinary success', async () => {
+    const calls: string[] = [];
+    const adapter = fakeAdapter('renders', (): Promise<InstallResult> => {
+      calls.push('renders');
+
+      return Promise.resolve({
+        adapterId: 'renders',
+        applied: [],
+        runtimeHooks: ['React renders'],
+        unavailable: [],
+        agentHooks: { react: true },
+        failure: undefined,
+      });
+    });
+
+    const installed = expectOk(
+      await installPlan(planWith([action({ adapter: 'renders' })]), makeContext(), {
+        adapters: [adapter],
+        skipFeasibility: true,
+      }),
+    );
+
+    expect(calls).toEqual(['renders']);
+    expect(installed.runtimeHooks).toEqual(['React renders']);
+    expect(installed.agentHooks.react).toBe(true);
+    expect(installed.perAdapter.map((result) => result.adapterId)).toEqual(['renders']);
+  });
+
+  it('reports a cancellation raised inside the adapter that then returned a failure as aborted', async () => {
+    const workspace = makeWorkspace();
+    const journal = fakeJournal();
+    const controller = new AbortController();
+    const calls: string[] = [];
+
+    // The developer cancels once the first target is fully applied; the
+    // patcher then abandons the second one at its first stage boundary, and
+    // the adapter forwards that through the fatal channel.
+    const writer = reportingPatchAdapter('writer', calls, (event) => {
+      if (event.stage === 'mark-applied' && event.file === TARGETS.cones.file) {
+        controller.abort();
+      }
+    });
+
+    const error = expectErr(
+      await installPlan(
+        planWith([
+          action({
+            adapter: 'writer',
+            id: 'act_0000000000000641',
+            type: 'function-timing',
+            mode: 'patch',
+            ...TARGETS.cones,
+          }),
+          action({
+            adapter: 'writer',
+            id: 'act_0000000000000642',
+            type: 'function-timing',
+            mode: 'patch',
+            ...TARGETS.planner,
+          }),
+        ]),
+        makeContext({ workspace, journal, signal: controller.signal }),
+        { adapters: [writer.adapter], skipFeasibility: true },
+      ),
+    );
+    const reported = writer.reported();
+
+    expect(calls).toEqual(['writer']);
+    expect(reported?.error.details?.['reason']).toBe('aborted');
+    expect(reported?.file).toBe(TARGETS.planner.file);
+
+    expect(error.code).toBe('INSTRUMENTATION_INSTALL_FAILED');
+    expect(error.details?.['reason']).toBe('aborted');
+    expect(error.details?.['attempted']).toBe(1);
+    expect(error.details?.['restoredCount']).toBe(1);
+    expect(error.details?.['failedAction']).toMatchObject({
+      file: TARGETS.planner.file,
+      symbol: TARGETS.planner.symbol,
+    });
+    expect(error.message).toContain('cancelled');
+    expect(digestIn(workspace, TARGETS.cones.file)).toBe(FIXTURE_DIGESTS[TARGETS.cones.file]);
+    expect(digestIn(workspace, TARGETS.planner.file)).toBe(FIXTURE_DIGESTS[TARGETS.planner.file]);
+    expect(journal.rows().map((row) => row.status)).toEqual(['reverted']);
   }, 30_000);
 });
 

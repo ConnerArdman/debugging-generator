@@ -15,7 +15,12 @@
  *    every other assertion.
  * 2. **Refusal over repair.** A record with nothing to restore from, nothing to
  *    show the developer, or two identical hashes is refused; a chain that does
- *    not line up hash-for-hash is refused; a status transition the lifecycle
+ *    not line up hash-for-hash is refused; a record that would fork a file's
+ *    history — a second child of one parent, a child of a record that is not
+ *    the file's sole open head, a second open root — is refused by the
+ *    repository and, beneath it, by the database's single-child index, which
+ *    a pre-existing fork migrated from version 1 does not get past either; a
+ *    status transition the lifecycle
  *    forbids is refused and the row is left exactly as it was. Each refusal is
  *    checked *together with* the state of the table, because "returned an
  *    error" and "changed nothing" are two different claims.
@@ -59,6 +64,7 @@ import { sha256Hex } from '@debuggen/shared/node';
 
 import { openStore } from './db.js';
 import type { Store } from './db.js';
+import { STORE_SCHEMA_VERSION } from './migrations.js';
 import {
   MODIFICATION_STATUS_TRANSITIONS,
   canTransitionModificationStatus,
@@ -669,6 +675,526 @@ describe('follow-up chains', () => {
 });
 
 /* -------------------------------------------------------------------------------------------------
+ * One chain per file: the single-child and sole-head invariant
+ * ---------------------------------------------------------------------------------------------- */
+
+describe('one chain per file', () => {
+  /** A delta layered on `parent`, continuing from the bytes it wrote. */
+  function deltaOf(parent: ModificationRecord, planVersion: number): ModificationRecord {
+    return buildRecord({
+      file: parent.file,
+      sessionId: parent.sessionId,
+      planVersion,
+      originalHash: parent.instrumentedHash,
+      instrumentedHash: hashOf(`instrumented:${parent.file}:plan-${String(planVersion)}`),
+      previousRecordId: parent.id,
+    });
+  }
+
+  /** The ids the journal holds for one session, in append order. */
+  async function idsOf(sessionId: string): Promise<string[]> {
+    const listed = await repo.listBySession(sessionId);
+
+    if (isErr(listed)) {
+      throw new Error(`listBySession refused: ${listed.error.code}`);
+    }
+
+    return listed.value.map((entry) => entry.id);
+  }
+
+  /** Moves a record through `applied` to `reverted`, as a verified restore would. */
+  async function revert(record: ModificationRecord): Promise<void> {
+    clock += 1_000;
+    unwrap(await repo.updateStatus(record.id, 'applied'));
+    clock += 1_000;
+    unwrap(await repo.updateStatus(record.id, 'reverted'));
+  }
+
+  it('refuses a second child of one parent and leaves the row set unchanged', async () => {
+    const root = await appendOk(buildRecord());
+    const first = await appendOk(deltaOf(root, 2));
+    const before = await idsOf(SESSION_A);
+    const sibling = deltaOf(root, 3);
+
+    const appended = await repo.append(sibling);
+
+    expect(isErr(appended)).toBe(true);
+
+    if (!isErr(appended)) {
+      return;
+    }
+
+    expect(appended.error.code).toBe('MODIFICATION_CONFLICT');
+    expect(appended.error.details?.['reason']).toBe('chain-parent-has-child');
+    expect(appended.error.details?.['detectedBy']).toBe('journal-check');
+    expect(appended.error.details?.['existingChildRecordId']).toBe(first.id);
+    expect(appended.error.details?.['previousRecordId']).toBe(root.id);
+    expect(appended.error.hint).toContain('latestRecordForFile');
+
+    // Refused *and* unchanged: the same rows, in the same order, and no trace
+    // of the sibling.
+    expect(await idsOf(SESSION_A)).toEqual(before);
+    expect(readRow(sibling.id)).toBeUndefined();
+    expect(readRow(root.id)?.['status']).toBe('pending');
+    expect(readRow(first.id)?.['previous_record_id']).toBe(root.id);
+
+    // Identifiers only: no digest, backup path or diff in anything returned.
+    const serialised = JSON.stringify({
+      payload: appended.error.toPayload(),
+      details: appended.error.details ?? {},
+      message: appended.error.message,
+      hint: appended.error.hint ?? '',
+    });
+
+    expect(serialised).not.toContain(sibling.originalHash);
+    expect(serialised).not.toContain(sibling.instrumentedHash);
+    expect(serialised).not.toContain(sibling.backupPath);
+    expect(serialised).not.toContain(sibling.diff);
+  });
+
+  it('re-layers a parent whose follow-up delta was rolled back (AAP 0.4.2)', async () => {
+    // The installer's delta rollback: plan version 2 patched the file on top of
+    // the applied root, a later step of that install failed, and the delta was
+    // restored — the file holds the root's instrumented bytes again and the
+    // session stays at plan version 1. The next follow-up must be able to layer
+    // plan version 3 on the same root.
+    const root = await appendOk(buildRecord({ status: 'applied' }));
+    const rolledBack = await appendOk(deltaOf(root, 2));
+
+    await revert(rolledBack);
+
+    // The head a new layer must name is the parent the file holds again, not
+    // the reverted delta.
+    const headBefore = await repo.latestRecordForFile(SESSION_A, root.file);
+
+    expect(headBefore.ok && headBefore.value?.id).toBe(root.id);
+
+    const retry = await appendOk(deltaOf(root, 3));
+
+    expect(retry.previousRecordId).toBe(root.id);
+    expect(await idsOf(SESSION_A)).toEqual([root.id, rolledBack.id, retry.id]);
+
+    const headAfter = await repo.latestRecordForFile(SESSION_A, root.file);
+
+    expect(headAfter.ok && headAfter.value?.id).toBe(retry.id);
+
+    const chain = await repo.listChain(retry.id);
+
+    expect(chain.ok && chain.value.map((entry) => entry.id)).toEqual([root.id, retry.id]);
+
+    // One live layer is still the limit: a second one beside the retry is a fork.
+    const sibling = await repo.append(deltaOf(root, 4));
+
+    expect(isErr(sibling) ? sibling.error.details?.['reason'] : undefined).toBe(
+      'chain-parent-has-child',
+    );
+    expect(isErr(sibling) ? sibling.error.details?.['existingChildRecordId'] : undefined).toBe(
+      retry.id,
+    );
+  });
+
+  it('keeps a fully reverted file at its newest record as the head', async () => {
+    const root = await appendOk(buildRecord({ status: 'applied' }));
+    const delta = await appendOk(deltaOf(root, 2));
+
+    await revert(delta);
+    clock += 1_000;
+    unwrap(await repo.updateStatus(root.id, 'reverted'));
+
+    const head = await repo.latestRecordForFile(SESSION_A, root.file);
+
+    expect(head.ok && head.value?.id).toBe(delta.id);
+  });
+
+  it('lets the database index ignore a reverted layer but not a second live one', async () => {
+    const root = await appendOk(buildRecord({ status: 'applied' }));
+    const rolledBack = await appendOk(deltaOf(root, 2));
+
+    await revert(rolledBack);
+
+    const bypass = new DatabaseSync(store.path);
+    let caught: unknown;
+
+    try {
+      bypass.exec('PRAGMA foreign_keys = ON');
+      // Beside a reverted sibling, one live layer is legal to the index too.
+      insertRawRecord(bypass, deltaOf(root, 3));
+
+      try {
+        insertRawRecord(bypass, deltaOf(root, 4));
+      } catch (error) {
+        caught = error;
+      }
+    } finally {
+      bypass.close();
+    }
+
+    expect(errcodeOf(caught)).toBe(2067);
+    expect(await repo.countBySession(SESSION_A)).toStrictEqual({ ok: true, value: 3 });
+  });
+
+  it('refuses a child of a reverted record, which is no longer the file’s current head', async () => {
+    const root = await appendOk(buildRecord());
+
+    await revert(root);
+
+    const delta = deltaOf(root, 2);
+    const appended = await repo.append(delta);
+
+    expect(isErr(appended)).toBe(true);
+    expect(isErr(appended) ? appended.error.code : undefined).toBe('MODIFICATION_CONFLICT');
+    expect(isErr(appended) ? appended.error.details?.['reason'] : undefined).toBe(
+      'chain-parent-not-head',
+    );
+    expect(isErr(appended) ? appended.error.details?.['parentStatus'] : undefined).toBe('reverted');
+    expect(readRow(delta.id)).toBeUndefined();
+  });
+
+  it('refuses a child of a record that is not the sole open head of its file', async () => {
+    const root = await appendOk(buildRecord());
+    // A second open root, planted the way a writer that bypassed the repository
+    // would have left it — a root has no parent, so no index can refuse it.
+    const stray = buildRecord({ instrumentedHash: hashOf('instrumented:stray-root') });
+
+    insertRawRecord(store.db, stray);
+
+    const before = await idsOf(SESSION_A);
+    const delta = deltaOf(root, 2);
+    const appended = await repo.append(delta);
+
+    expect(isErr(appended)).toBe(true);
+    expect(isErr(appended) ? appended.error.details?.['reason'] : undefined).toBe(
+      'chain-parent-not-head',
+    );
+    expect(isErr(appended) ? appended.error.details?.['openRecordIds'] : undefined).toEqual([
+      stray.id,
+    ]);
+    expect(await idsOf(SESSION_A)).toEqual(before);
+  });
+
+  it('accepts a child of the head of a chain whose ancestors are all on its line', async () => {
+    const root = await appendOk(buildRecord({ status: 'applied' }));
+    const second = await appendOk(deltaOf(root, 2));
+    const third = await appendOk(deltaOf(second, 3));
+
+    expect(third.previousRecordId).toBe(second.id);
+
+    const head = await repo.latestRecordForFile(SESSION_A, root.file);
+
+    expect(head.ok && head.value?.id).toBe(third.id);
+  });
+
+  it('refuses a second open root for one file', async () => {
+    const root = await appendOk(buildRecord());
+    const second = buildRecord({ instrumentedHash: hashOf('instrumented:second-root') });
+
+    const appended = await repo.append(second);
+
+    expect(isErr(appended)).toBe(true);
+
+    if (!isErr(appended)) {
+      return;
+    }
+
+    expect(appended.error.code).toBe('MODIFICATION_CONFLICT');
+    expect(appended.error.details?.['reason']).toBe('chain-root-while-open');
+    expect(appended.error.details?.['openRecordIds']).toEqual([root.id]);
+    expect(readRow(second.id)).toBeUndefined();
+    expect(await idsOf(SESSION_A)).toEqual([root.id]);
+  });
+
+  it('accepts a new root once every earlier record of the file is reverted', async () => {
+    const root = await appendOk(buildRecord({ status: 'applied' }));
+    const delta = await appendOk(deltaOf(root, 2));
+
+    // Still open: a new root is a second chain.
+    const early = await repo.append(buildRecord({ planVersion: 3 }));
+
+    expect(isErr(early) ? early.error.details?.['reason'] : undefined).toBe(
+      'chain-root-while-open',
+    );
+
+    // Unwound strictly last-first, as cleanup does.
+    await revert(delta);
+    clock += 1_000;
+    unwrap(await repo.updateStatus(root.id, 'reverted'));
+
+    const fresh = await appendOk(buildRecord({ planVersion: 3 }));
+
+    expect(fresh.previousRecordId).toBeUndefined();
+
+    // And the new chain grows from its own head, the reverted chain being
+    // finished business off its line.
+    const next = await appendOk(deltaOf(fresh, 4));
+
+    expect(next.previousRecordId).toBe(fresh.id);
+    expect(await idsOf(SESSION_A)).toEqual([root.id, delta.id, fresh.id, next.id]);
+  });
+
+  it('judges each session’s chain on its own', async () => {
+    await appendOk(buildRecord({ sessionId: SESSION_A }));
+
+    // Another session's open record for the same path is not this session's
+    // history: a chain describes one file within one session.
+    const other = await appendOk(buildRecord({ sessionId: SESSION_B }));
+
+    expect(other.sessionId).toBe(SESSION_B);
+  });
+
+  it('reports a duplicate id as a duplicate, not as a second chain', async () => {
+    const record = await appendOk(buildRecord());
+    const again = await repo.append(record);
+
+    expect(isErr(again) ? again.error.code : undefined).toBe('STORE_ERROR');
+    expect(isErr(again) ? again.error.details?.['reason'] : undefined).toBe('duplicate-record-id');
+  });
+
+  it('enforces the single-child rule in the database for a writer that bypasses the repository', async () => {
+    const root = await appendOk(buildRecord());
+
+    await appendOk(deltaOf(root, 2));
+
+    const bypass = new DatabaseSync(store.path);
+    let caught: unknown;
+
+    try {
+      insertRawRecord(bypass, deltaOf(root, 3));
+    } catch (error) {
+      caught = error;
+    } finally {
+      bypass.close();
+    }
+
+    // SQLITE_CONSTRAINT_UNIQUE from the partial unique index of schema v2; a
+    // duplicate primary key would have been SQLITE_CONSTRAINT_PRIMARYKEY (1555).
+    expect(errcodeOf(caught)).toBe(2067);
+    expect(await repo.countBySession(SESSION_A)).toStrictEqual({ ok: true, value: 2 });
+  });
+
+  it('reports a second child the index refused as the same typed chain-fork conflict', async () => {
+    const root = await appendOk(buildRecord());
+    const racer = deltaOf(root, 2);
+    const loser = deltaOf(root, 3);
+    const racing = createModificationsRepo({
+      store: storeThatInsertsFirst(store, racer),
+      now: () => clock,
+    });
+
+    // The racer lands between this append's checks and its insert — the one
+    // interval the checks cannot see — so only the index can refuse the loser.
+    const appended = await racing.append(loser);
+
+    expect(isErr(appended)).toBe(true);
+    expect(isErr(appended) ? appended.error.code : undefined).toBe('MODIFICATION_CONFLICT');
+    expect(isErr(appended) ? appended.error.details?.['reason'] : undefined).toBe(
+      'chain-parent-has-child',
+    );
+    expect(isErr(appended) ? appended.error.details?.['detectedBy'] : undefined).toBe(
+      'unique-index',
+    );
+    expect(isErr(appended) ? appended.error.details?.['previousRecordId'] : undefined).toBe(
+      root.id,
+    );
+
+    // The refusal rolled the append's transaction back, the racer included.
+    expect(readRow(loser.id)).toBeUndefined();
+    expect(await idsOf(SESSION_A)).toEqual([root.id]);
+  });
+
+  it('migrates a version-1 store holding a pre-existing fork, keeps every row and refuses to extend the fork', async () => {
+    const legacyDirectory = mkdtempSync(join(tmpdir(), 'debuggen-modifications-v1-'));
+    const legacyPath = join(legacyDirectory, 'sessions.sqlite');
+    const parent = buildRecord({ status: 'applied' });
+    const left = deltaOf(parent, 2);
+    const right = buildRecord({
+      planVersion: 2,
+      originalHash: parent.instrumentedHash,
+      instrumentedHash: hashOf('instrumented:right-branch'),
+      previousRecordId: parent.id,
+    });
+
+    // A store written before schema version 2: the version-1 DDL, stamped 1,
+    // holding a parent with two children — what two racing writers could leave.
+    const legacy = new DatabaseSync(legacyPath);
+
+    try {
+      legacy.exec(readFileSync(fileURLToPath(new URL('./schema.sql', import.meta.url)), 'utf8'));
+      legacy.exec('PRAGMA user_version = 1');
+      insertRawSession(legacy, SESSION_A);
+
+      for (const record of [parent, left, right]) {
+        insertRawRecord(legacy, record);
+      }
+    } finally {
+      legacy.close();
+    }
+
+    const migrated = unwrap(
+      openStore({
+        databasePath: legacyPath,
+        logger: createConsoleLogger({
+          level: 'trace',
+          sink: (entry) => {
+            logs.push(entry);
+          },
+        }),
+      }),
+    );
+
+    try {
+      expect(migrated.schemaVersion).toBe(STORE_SCHEMA_VERSION);
+      expect(STORE_SCHEMA_VERSION).toBeGreaterThanOrEqual(2);
+
+      // No row lost, none rewritten beyond the flag: every sibling of the fork
+      // is marked, the parent is not.
+      const rows = migrated
+        .statement(
+          `SELECT id, original_hash, instrumented_hash, backup_path, status, diff, previous_record_id, chain_fork
+           FROM modifications ORDER BY rowid ASC`,
+        )
+        .all();
+
+      // Spread because `node:sqlite` hands rows back with a null prototype.
+      expect(rows.map((row) => ({ ...row }))).toStrictEqual(
+        [parent, left, right].map((record) => ({
+          id: record.id,
+          original_hash: record.originalHash,
+          instrumented_hash: record.instrumentedHash,
+          backup_path: record.backupPath,
+          status: record.status,
+          diff: record.diff,
+          previous_record_id: record.previousRecordId ?? null,
+          chain_fork: record.id === parent.id ? 0 : 1,
+        })),
+      );
+      expect(
+        migrated
+          .statement(`SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?`)
+          .get('idx_modifications_previous_record_id_unique'),
+      ).toBeDefined();
+      expect(
+        logs.some((entry) => entry.level === 'warn' && entry.fields['forkedRecords'] === 2),
+      ).toBe(true);
+
+      const journal = createModificationsRepo({ store: migrated, now: () => clock });
+
+      // The migrated rows still read as records: the new column never reaches
+      // a ModificationRecord.
+      const chain = await journal.listChain(left.id);
+
+      expect(chain.ok && chain.value).toStrictEqual([parent, left]);
+
+      // A third child of the forked parent: refused, although the index exempts
+      // the flagged siblings — the journal's check counts every child.
+      const third = await journal.append(deltaOf(parent, 3));
+
+      expect(isErr(third) ? third.error.details?.['reason'] : undefined).toBe(
+        'chain-parent-has-child',
+      );
+
+      // Extending either branch: refused, because the other branch is an open
+      // record off its line.
+      const onLeft = await journal.append(deltaOf(left, 3));
+
+      expect(isErr(onLeft) ? onLeft.error.details?.['reason'] : undefined).toBe(
+        'chain-parent-not-head',
+      );
+      expect(isErr(onLeft) ? onLeft.error.details?.['openRecordIds'] : undefined).toEqual([
+        right.id,
+      ]);
+
+      // And a fresh root over the forked file: refused while it is open.
+      const root = await journal.append(buildRecord({ planVersion: 3 }));
+
+      expect(isErr(root) ? root.error.details?.['reason'] : undefined).toBe(
+        'chain-root-while-open',
+      );
+      expect(await journal.countBySession(SESSION_A)).toStrictEqual({ ok: true, value: 3 });
+    } finally {
+      migrated.close();
+      rmSync(legacyDirectory, { recursive: true, force: true });
+    }
+  });
+
+  it('migrates a version-1 rollback-then-retry chain without flagging it as a fork', async () => {
+    const legacyDirectory = mkdtempSync(join(tmpdir(), 'debuggen-modifications-v1-retry-'));
+    const legacyPath = join(legacyDirectory, 'sessions.sqlite');
+    const parent = buildRecord({ status: 'applied' });
+    const rolledBack = buildRecord({
+      planVersion: 2,
+      status: 'reverted',
+      originalHash: parent.instrumentedHash,
+      instrumentedHash: hashOf('instrumented:rolled-back-delta'),
+      previousRecordId: parent.id,
+    });
+    const retry = buildRecord({
+      planVersion: 3,
+      status: 'applied',
+      originalHash: parent.instrumentedHash,
+      instrumentedHash: hashOf('instrumented:retried-delta'),
+      previousRecordId: parent.id,
+    });
+
+    // One reverted layer and one live layer on the same parent: the shape the
+    // installer's delta rollback followed by a successful follow-up leaves, and
+    // not a fork — the file can only hold the live layer's bytes.
+    const legacy = new DatabaseSync(legacyPath);
+
+    try {
+      legacy.exec(readFileSync(fileURLToPath(new URL('./schema.sql', import.meta.url)), 'utf8'));
+      legacy.exec('PRAGMA user_version = 1');
+      insertRawSession(legacy, SESSION_A);
+
+      for (const record of [parent, rolledBack, retry]) {
+        insertRawRecord(legacy, record);
+      }
+    } finally {
+      legacy.close();
+    }
+
+    const migrated = unwrap(
+      openStore({
+        databasePath: legacyPath,
+        logger: createConsoleLogger({
+          level: 'trace',
+          sink: (entry) => {
+            logs.push(entry);
+          },
+        }),
+      }),
+    );
+
+    try {
+      expect(migrated.schemaVersion).toBe(STORE_SCHEMA_VERSION);
+
+      const flags = migrated
+        .statement('SELECT id, chain_fork FROM modifications ORDER BY rowid ASC')
+        .all()
+        .map((row) => ({ ...row }));
+
+      expect(flags).toStrictEqual([
+        { id: parent.id, chain_fork: 0 },
+        { id: rolledBack.id, chain_fork: 0 },
+        { id: retry.id, chain_fork: 0 },
+      ]);
+      expect(logs.some((entry) => entry.fields['forkedRecords'] !== undefined)).toBe(false);
+
+      const journal = createModificationsRepo({ store: migrated, now: () => clock });
+      const head = await journal.latestRecordForFile(SESSION_A, parent.file);
+
+      expect(head.ok && head.value?.id).toBe(retry.id);
+
+      const next = await journal.append(deltaOf(retry, 4));
+
+      expect(next.ok && next.value.previousRecordId).toBe(retry.id);
+    } finally {
+      migrated.close();
+      rmSync(legacyDirectory, { recursive: true, force: true });
+    }
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
  * updateStatus and the transition matrix
  * ---------------------------------------------------------------------------------------------- */
 
@@ -1185,6 +1711,107 @@ function storeThatMovesTheRow(target: Store, recordId: string, moveTo: Modificat
       target.close();
     },
   };
+}
+
+/**
+ * A {@link Store} on which another writer inserts `racer` immediately before
+ * the repository's own `INSERT` runs — after every check `append` makes.
+ *
+ * The same seam as {@link storeThatMovesTheRow}: everything here is
+ * synchronous, so the only interval between a check and its insert is the
+ * `statement` call that prepares the insert. The racer is written through the
+ * underlying connection rather than through this wrapper, so it cannot recurse,
+ * and inside the repository's transaction, so a rollback takes it too.
+ */
+function storeThatInsertsFirst(target: Store, racer: ModificationRecord): Store {
+  let raced = false;
+
+  return {
+    get path(): string {
+      return target.path;
+    },
+    get db(): DatabaseSync {
+      return target.db;
+    },
+    get schemaVersion(): number {
+      return target.schemaVersion;
+    },
+    get isClosed(): boolean {
+      return target.isClosed;
+    },
+    statement(sql: string) {
+      if (!raced && sql.startsWith('INSERT INTO modifications')) {
+        raced = true;
+        insertRawRecord(target.db, racer);
+      }
+
+      return target.statement(sql);
+    },
+    transaction<T>(fn: () => T): T {
+      return target.transaction(fn);
+    },
+    checkpoint(): void {
+      target.checkpoint();
+    },
+    close(): void {
+      target.close();
+    },
+  };
+}
+
+/**
+ * Writes a record's row with raw SQL, the way a writer that bypasses the
+ * repository — another process, an older build, a hand edit — would.
+ *
+ * Names the version-1 columns only, so `chain_fork` takes its default and the
+ * same helper serves a version-1 file and a migrated one.
+ */
+function insertRawRecord(db: DatabaseSync, record: ModificationRecord): void {
+  db.prepare(
+    `INSERT INTO modifications (
+       id, session_id, plan_version, file, original_hash, backup_path,
+       instrumented_hash, applied_at, updated_at, status, diff, previous_record_id
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    record.id,
+    record.sessionId,
+    record.planVersion,
+    record.file,
+    record.originalHash,
+    record.backupPath,
+    record.instrumentedHash,
+    record.appliedAt,
+    record.appliedAt,
+    record.status,
+    record.diff,
+    record.previousRecordId ?? null,
+  );
+}
+
+/** Writes the `sessions` row a record's foreign key needs, on a raw connection. */
+function insertRawSession(db: DatabaseSync, sessionId: string): void {
+  db.prepare(
+    `INSERT INTO sessions (
+       id, project_root, project_name, status, question, dev_server_url, created_at, updated_at, record
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    sessionId,
+    '/home/dev/projects/storefront',
+    'storefront',
+    'instrumenting',
+    'Why is this button slow?',
+    'http://127.0.0.1:20531',
+    clock,
+    clock,
+    '{}',
+  );
+}
+
+/** The extended SQLite result code a `node:sqlite` error carries, if any. */
+function errcodeOf(value: unknown): unknown {
+  return typeof value === 'object' && value !== null && 'errcode' in value
+    ? value.errcode
+    : undefined;
 }
 
 /**

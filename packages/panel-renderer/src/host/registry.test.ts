@@ -34,7 +34,10 @@
  * inside a dispatched component reaches the ambient `PanelActions` — proving the
  * registry's *prop wiring*, not merely its keys. The depth of each component's
  * own interactions stays in `../components/*.test.tsx`; this file proves the
- * wiring exists.
+ * wiring exists. The third piece of wiring is the outline: each container
+ * adapter draws its heading at the `headingLevel` it is handed rather than at
+ * its layout primitive's default, and the node renderer hands a titled
+ * container's children the next level down.
  *
  * ## What the sixteen cases are driven by
  *
@@ -115,7 +118,7 @@ import type { ReactElement } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Mock } from 'vitest';
 
-import { DataProviderContext, createDataProvider } from './DataProvider';
+import { DataProviderContext, PanelSessionContext, createDataProvider } from './DataProvider';
 import type { DataProvider, DataQueryResolver, DataQueryResponse } from './DataProvider';
 import { NodeRenderer } from './NodeRenderer';
 import { PanelActionsContext } from './PanelActions';
@@ -869,12 +872,13 @@ function makeActions(): ActionSpies {
 }
 
 /**
- * One node under both ambient contexts, dispatched exactly as a panel dispatches
- * it.
+ * One node under the three ambient contexts, dispatched exactly as a panel
+ * dispatches it.
  *
  * `createElement` rather than JSX because this module is `.ts`; the tree is the
- * one `PanelHost` mounts — the data seam outermost, the action contract inside
- * it, the node renderer within both.
+ * one `PanelHost` mounts — the data seam outermost, the session the recorded
+ * page belongs to inside it, the action contract inside that, the node renderer
+ * within all three.
  *
  * @param node The node to render.
  * @param provider The provider resolving its query.
@@ -886,9 +890,13 @@ function panelTree(node: PanelNode, provider: DataProvider, actions: PanelAction
     DataProviderContext.Provider,
     { value: provider },
     createElement(
-      PanelActionsContext.Provider,
-      { value: actions },
-      createElement(NodeRenderer, { node }),
+      PanelSessionContext.Provider,
+      { value: SESSION_ID },
+      createElement(
+        PanelActionsContext.Provider,
+        { value: actions },
+        createElement(NodeRenderer, { node }),
+      ),
     ),
   );
 }
@@ -1525,5 +1533,74 @@ describe('a dispatched component reaches the ambient host actions', () => {
     // rather than an order.
     expect(RECORDED_EVENTS.map((event) => event.id)).toContain(ref.eventId);
     expect(spies.onOpenSource).not.toHaveBeenCalled();
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The outline level: assigned by the node renderer, drawn by the container
+ * ---------------------------------------------------------------------------
+ */
+
+/** The title of the outer container of {@link OUTLINE_NODE}. */
+const OUTLINE_SECTION_TITLE = 'Outline outer section';
+
+/** The title of the inner container of {@link OUTLINE_NODE}. */
+const OUTLINE_SPLIT_TITLE = 'Outline inner split';
+
+/**
+ * A titled section holding a titled split of two source links: two headings,
+ * one nested inside the other, so a level that is not forwarded — or not
+ * stepped — is visible as a wrong tag.
+ */
+const OUTLINE_NODE: PanelNode = {
+  type: 'section',
+  id: 'node:outline',
+  title: OUTLINE_SECTION_TITLE,
+  children: [
+    {
+      type: 'split',
+      id: 'node:outline.0',
+      title: OUTLINE_SPLIT_TITLE,
+      children: [
+        sourceLinkNode('node:outline.0.0', COMPONENT_SOURCE),
+        sourceLinkNode('node:outline.0.1', SECOND_SOURCE),
+      ],
+    },
+  ],
+};
+
+describe('the outline level a container is rendered at', () => {
+  it.each([
+    ['section', SECTION_TITLE],
+    ['split', SPLIT_TITLE],
+    ['stack', STACK_TITLE],
+  ] as const)('the %s adapter draws its heading at the level it is handed', (type, title) => {
+    const { node } = RENDER_CASES[type];
+
+    const scope = render(
+      createElement(PANEL_COMPONENT_REGISTRY[type], { node, nodeId: node.id, headingLevel: 5 }),
+    ).container;
+
+    // The level arrives on the component props and reaches the layout
+    // primitive's heading unchanged — not the primitive's own default.
+    within(scope).getByRole('heading', { level: 5, name: title });
+    expect(within(scope).getAllByRole('heading')).toHaveLength(1);
+  });
+
+  it('renders a container at the level it is handed and its children one level below', () => {
+    const scope = render(
+      createElement(NodeRenderer, { node: OUTLINE_NODE, headingLevel: 4 }),
+    ).container;
+
+    within(scope).getByRole('heading', { level: 4, name: OUTLINE_SECTION_TITLE });
+    within(scope).getByRole('heading', { level: 5, name: OUTLINE_SPLIT_TITLE });
+  });
+
+  it('renders a container with no stated level at the renderer default of 2', () => {
+    const scope = render(createElement(NodeRenderer, { node: OUTLINE_NODE })).container;
+
+    within(scope).getByRole('heading', { level: 2, name: OUTLINE_SECTION_TITLE });
+    within(scope).getByRole('heading', { level: 3, name: OUTLINE_SPLIT_TITLE });
   });
 });

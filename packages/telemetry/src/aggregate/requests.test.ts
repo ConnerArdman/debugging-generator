@@ -51,6 +51,13 @@
  *   result is asserted to survive a JSON round trip, because these groups cross
  *   a WebSocket inside `CaptureSummary` and an HTTP response as the `requests`
  *   DataResult.
+ * - **Pending is a marker, never an absence.** A request still on the wire at
+ *   the end of its capture arrives as an in-flight snapshot, and only the
+ *   boolean marker makes it pending; a missing status code never does. The
+ *   in-flight section asserts what a pending occurrence may not do — carry a
+ *   code, count as a failure, claim a resource entry — and that a settled event
+ *   of the same span supersedes its snapshot, so one request is never reported
+ *   as a duplicate of itself.
  *
  * ## Two fixture sources, on purpose
  *
@@ -114,6 +121,8 @@ import {
   FETCH_ATTRIBUTE_KEYS,
   PERF_ENTRY_ATTRIBUTE_KEYS,
   SERVICE_ASSIGNED_ATTRIBUTE_KEYS,
+  XHR_ATTRIBUTE_KEYS,
+  attributeKeysFor,
 } from '../schema/attributes.js';
 import { isTelemetryEvent, telemetryEventSchema } from '../schema/event.js';
 import type { TelemetryEvent } from '../schema/event.js';
@@ -125,6 +134,7 @@ import {
   DEFAULT_MAX_REQUEST_OCCURRENCES_PER_GROUP,
   DEFAULT_RESOURCE_TIMING_TOLERANCE_MS,
   REQUEST_GROUPED_BY,
+  REQUEST_IN_FLIGHT_ATTRIBUTE,
   REQUEST_TRANSFER_SOURCES,
   RESOURCE_ENTRY_TYPE,
   RESOURCE_TIMING_URL_ATTRIBUTE,
@@ -2521,6 +2531,432 @@ describe('the resource-timing contract', () => {
 
   it('names the resource entry type the join and the summary both test for', () => {
     expect(RESOURCE_ENTRY_TYPE).toBe('resource');
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * In-flight snapshots
+ *
+ * A request still on the wire when its capture ended is reported by
+ * `../browser/fetch.ts` as one snapshot event carrying the in-flight marker,
+ * no status code and span status `unset`. What these cases pin, and why:
+ *
+ * - **Only the marker makes a request pending.** A network error, an abort and
+ *   an opaque response all settle without a code, so a missing code read as
+ *   "still waiting" would state something the capture never observed.
+ * - **A pending occurrence says nothing about a response.** No code, no
+ *   failure, no bytes and no resource-timing claim — a claim would take an
+ *   entry away from the settled request it belongs to, or from the unclaimed
+ *   total `./summary.ts` adds.
+ * - **One request is one occurrence.** A settled event supersedes a snapshot of
+ *   its own span and several snapshots of one span collapse to the latest, or
+ *   the duplicate-request finding would be raised against a request and its own
+ *   snapshot.
+ * - **Nothing else moves.** A capture with no snapshot keeps every group shape
+ *   it had, `pendingCount` included by its absence.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * One in-flight snapshot, shaped as the producer emits it: the marker, span
+ * status `unset` and no status code.
+ *
+ * Built on {@link makeRequestEvent} so every other attribute is the default a
+ * settled fixture carries; `overrides` may still reinstate a status code or a
+ * status, which is how the cases that ignore one are stated.
+ */
+function makeInFlightEvent(overrides: RequestEventOverrides = {}): TelemetryEvent {
+  return makeRequestEvent({
+    status: UNSET_STATUS,
+    ...overrides,
+    omitAttributes:
+      overrides.statusCode === undefined
+        ? [STATUS_CODE_ATTRIBUTE, ...(overrides.omitAttributes ?? [])]
+        : [...(overrides.omitAttributes ?? [])],
+    extraAttributes: { ...overrides.extraAttributes, [REQUEST_IN_FLIGHT_ATTRIBUTE]: true },
+  });
+}
+
+describe('aggregateRequests in-flight snapshots', () => {
+  it('builds snapshot fixtures the persisted event schema accepts', () => {
+    const snapshot = makeInFlightEvent();
+
+    expect(isTelemetryEvent(snapshot)).toBe(true);
+    expect(snapshot.attributes[REQUEST_IN_FLIGHT_ATTRIBUTE]).toBe(true);
+    expect(Object.hasOwn(snapshot.attributes, STATUS_CODE_ATTRIBUTE)).toBe(false);
+    expect(snapshot.status).toBe(UNSET_STATUS);
+  });
+
+  it('marks an occurrence pending only when the marker is the boolean true', () => {
+    // Every fixture here lacks a status code, which is the point: the absence
+    // is shared, and only the first one is pending.
+    const markerKey = opaqueRequestKey('p1');
+    const markers: readonly (readonly [string, unknown])[] = [
+      [opaqueRequestKey('p2'), 'true'],
+      [opaqueRequestKey('p3'), 1],
+      [opaqueRequestKey('p4'), false],
+    ];
+    const absentKey = opaqueRequestKey('p5');
+    const events = [
+      makeInFlightEvent({ requestKey: markerKey }),
+      ...markers.map(([requestKey, value]) =>
+        makeRequestEvent({
+          requestKey,
+          status: UNSET_STATUS,
+          omitAttributes: [STATUS_CODE_ATTRIBUTE],
+          extraAttributes: { [REQUEST_IN_FLIGHT_ATTRIBUTE]: value },
+        }),
+      ),
+      makeRequestEvent({
+        requestKey: absentKey,
+        status: UNSET_STATUS,
+        omitAttributes: [STATUS_CODE_ATTRIBUTE],
+      }),
+    ];
+
+    const groups = aggregateRequests(events);
+    expect(totalCount(groups)).toBe(events.length);
+
+    for (const group of groups) {
+      const occurrence = occurrenceAt(group, 0);
+      if (group.requestKey === markerKey) {
+        expect(occurrence.pending).toBe(true);
+        expect(group.pendingCount).toBe(1);
+        continue;
+      }
+      expect(Object.hasOwn(occurrence, 'pending')).toBe(false);
+      expect(Object.hasOwn(group, 'pendingCount')).toBe(false);
+    }
+  });
+
+  it('publishes no status code for a pending occurrence, even when the event carried one', () => {
+    const group = onlyGroup(
+      aggregateRequests([
+        makeInFlightEvent({ requestKey: opaqueRequestKey('p6'), statusCode: 200 }),
+      ]),
+    );
+    const occurrence = occurrenceAt(group, 0);
+
+    expect(occurrence.pending).toBe(true);
+    expect(Object.hasOwn(occurrence, 'statusCode')).toBe(false);
+    expect(occurrence.status).toBe(UNSET_STATUS);
+    expect(group.statusCodes).toStrictEqual([]);
+  });
+
+  it('never counts a pending occurrence as a failure, whatever status it reported', () => {
+    // A code at the error floor and an `error` span status would each make a
+    // settled occurrence a failure; neither may for a request still waiting.
+    const group = onlyGroup(
+      aggregateRequests([
+        makeInFlightEvent({
+          requestKey: opaqueRequestKey('p7'),
+          statusCode: 503,
+          status: ERROR_STATUS,
+        }),
+      ]),
+    );
+
+    expect(group.errorCount).toBe(0);
+    expect(group.statusCodes).toStrictEqual([]);
+    expect(group.pendingCount).toBe(1);
+    // The span status travels as the producer reported it.
+    expect(occurrenceAt(group, 0).status).toBe(ERROR_STATUS);
+  });
+
+  it('keeps a pending occurrence out of the resource-timing join, leaving the entry unclaimed', () => {
+    const resolvedUrl = `${RESOURCE_FIXTURE_ORIGIN}${ITEMS_PATH}`;
+    const request = makeInFlightEvent({
+      requestKey: opaqueRequestKey('p8'),
+      url: ITEMS_PATH,
+      transferSize: 512,
+      extraAttributes: { [RESOURCE_TIMING_URL_ATTRIBUTE]: resolvedUrl },
+    });
+    const entry = makeResourceEvent({
+      url: resolvedUrl,
+      transferSize: 4096,
+      transferSizeExposed: true,
+      initiatorType: 'fetch',
+    });
+
+    const group = onlyGroup(aggregateRequests([request, entry]));
+    const occurrence = occurrenceAt(group, 0);
+
+    // Neither the request's own size nor the entry's: nothing had arrived.
+    for (const field of ['transferredBytes', 'transferSource', 'transferEventId']) {
+      expect(Object.hasOwn(occurrence, field)).toBe(false);
+    }
+    expect(Object.hasOwn(group, 'transferredBytes')).toBe(false);
+    expect(Object.hasOwn(group, 'transferEventIds')).toBe(false);
+  });
+
+  it('leaves a matching entry to the settled request it belongs to', () => {
+    // The pending request comes first in canonical order, so a claim made by it
+    // would leave the settled request — the one the entry measured — with
+    // nothing.
+    const resolvedUrl = `${RESOURCE_FIXTURE_ORIGIN}${ITEMS_PATH}`;
+    const identity = { [RESOURCE_TIMING_URL_ATTRIBUTE]: resolvedUrl };
+    const pendingKey = opaqueRequestKey('p9');
+    const settledKey = opaqueRequestKey('pa');
+    const events = [
+      makeInFlightEvent({
+        requestKey: pendingKey,
+        url: ITEMS_PATH,
+        startTime: BASE_TIME,
+        duration: 40,
+        extraAttributes: identity,
+      }),
+      makeRequestEvent({
+        requestKey: settledKey,
+        url: ITEMS_PATH,
+        startTime: BASE_TIME + 5,
+        extraAttributes: identity,
+      }),
+    ];
+    const entry = makeResourceEvent({
+      url: resolvedUrl,
+      startTime: BASE_TIME + 5,
+      transferSize: 2048,
+      transferSizeExposed: true,
+      initiatorType: 'fetch',
+    });
+
+    const groups = aggregateRequests([...events, entry]);
+    const pendingGroup = elementAt(
+      groups.filter((group) => group.requestKey === pendingKey),
+      0,
+      'the pending group',
+    );
+    const settledGroup = elementAt(
+      groups.filter((group) => group.requestKey === settledKey),
+      0,
+      'the settled group',
+    );
+
+    expect(Object.hasOwn(pendingGroup, 'transferEventIds')).toBe(false);
+    expect(occurrenceAt(settledGroup, 0).transferEventId).toBe(entry.id);
+    expect(settledGroup.transferredBytes).toBe(2048);
+  });
+
+  it('counts pending occurrences over every occurrence, before truncation', () => {
+    const requestKey = opaqueRequestKey('pb');
+    const events = [
+      ...makeKeyedSeries(requestKey, [0, 3000]),
+      makeInFlightEvent({ requestKey, startTime: BASE_TIME + 6000 }),
+      makeInFlightEvent({ requestKey, startTime: BASE_TIME + 9000 }),
+      makeInFlightEvent({ requestKey, startTime: BASE_TIME + 12_000 }),
+    ];
+
+    const bounded = noDuplicates(
+      onlyGroup(aggregateRequests(events, { maxOccurrencesPerGroup: 2 })),
+    );
+    const none = onlyGroup(aggregateRequests(events, { maxOccurrencesPerGroup: 0 }));
+
+    expect(bounded.count).toBe(5);
+    expect(bounded.pendingCount).toBe(3);
+    expect(bounded.occurrencesTruncated).toBe(true);
+    // The listed occurrences are the two settled ones; the count still holds
+    // the three pending ones the list omits.
+    expect(bounded.occurrences.map((occurrence) => occurrence.pending)).toStrictEqual([
+      undefined,
+      undefined,
+    ]);
+    expect(none.pendingCount).toBe(3);
+    expect(none.occurrences).toStrictEqual([]);
+  });
+
+  it('adds no pending field to a capture that holds no snapshot', () => {
+    const groups = aggregateRequests([
+      ...makeKeyedSeries(opaqueRequestKey('pc'), [0, 7, 14]),
+      makeRequestEvent({ omitAttributes: [REQUEST_KEY_ATTRIBUTE, STATUS_CODE_ATTRIBUTE] }),
+    ]);
+
+    expect(groups).toHaveLength(2);
+    for (const group of groups) {
+      expect(Object.hasOwn(group, 'pendingCount')).toBe(false);
+      for (const occurrence of group.occurrences) {
+        expect(Object.hasOwn(occurrence, 'pending')).toBe(false);
+      }
+    }
+  });
+
+  it('lets a settled event of the same span supersede its snapshot', () => {
+    const requestKey = opaqueRequestKey('pd');
+    const traceId = nextTraceId();
+    const spanId = nextSpanId();
+    const snapshot = makeInFlightEvent({ requestKey, traceId, spanId, duration: 30 });
+    const settled = makeRequestEvent({ requestKey, traceId, spanId, duration: 45 });
+
+    for (const events of [
+      [snapshot, settled],
+      [settled, snapshot],
+    ]) {
+      const group = noDuplicates(onlyGroup(aggregateRequests(events)));
+      const occurrence = occurrenceAt(group, 0);
+
+      // One request, observed finishing: never a duplicate of its own snapshot.
+      expect(group.count).toBe(1);
+      expect(occurrence.eventId).toBe(settled.id);
+      expect(Object.hasOwn(occurrence, 'pending')).toBe(false);
+      expect(occurrence.statusCode).toBe(DEFAULT_STATUS_CODE);
+      expect(Object.hasOwn(group, 'pendingCount')).toBe(false);
+      expect(group.totalDurationMs).toBe(45);
+    }
+  });
+
+  it('pairs a snapshot with a settled event by trace and span together', () => {
+    // The same span id under a different trace is a different request, so the
+    // snapshot stands — and, issued inside the window, it is a duplicate.
+    const requestKey = opaqueRequestKey('pe');
+    const spanId = nextSpanId();
+    const group = onlyGroup(
+      aggregateRequests([
+        makeInFlightEvent({ requestKey, spanId, traceId: nextTraceId() }),
+        makeRequestEvent({ requestKey, spanId, traceId: nextTraceId(), startTime: BASE_TIME + 3 }),
+      ]),
+    );
+
+    expect(group.count).toBe(2);
+    expect(group.pendingCount).toBe(1);
+    expect(group.duplicateCount).toBe(1);
+  });
+
+  it('keeps only the latest of several snapshots of one span, whatever their order', () => {
+    const requestKey = opaqueRequestKey('pf');
+    const traceId = nextTraceId();
+    const spanId = nextSpanId();
+    // Ids are minted in ascending order, so `latestTied` is the smaller of the
+    // two snapshots sharing the latest end time and must win the tie.
+    const latestTied = makeInFlightEvent({ requestKey, traceId, spanId, duration: 30 });
+    const alsoLatest = makeInFlightEvent({ requestKey, traceId, spanId, duration: 30 });
+    const earlier = makeInFlightEvent({ requestKey, traceId, spanId, duration: 10 });
+    const events = [earlier, alsoLatest, latestTied];
+
+    for (const arrangement of [events, [...events].reverse(), deterministicShuffle(events)]) {
+      const group = noDuplicates(onlyGroup(aggregateRequests(arrangement)));
+
+      expect(group.count).toBe(1);
+      expect(group.pendingCount).toBe(1);
+      expect(occurrenceAt(group, 0).eventId).toBe(latestTied.id);
+      expect(group.totalDurationMs).toBe(30);
+    }
+  });
+
+  it('never drops or merges two settled events that share a span', () => {
+    const requestKey = opaqueRequestKey('pg');
+    const traceId = nextTraceId();
+    const spanId = nextSpanId();
+    const first = makeRequestEvent({ requestKey, traceId, spanId });
+    const second = makeRequestEvent({ requestKey, traceId, spanId, startTime: BASE_TIME + 4 });
+
+    const group = onlyGroup(aggregateRequests([first, second]));
+
+    expect(group.count).toBe(2);
+    expect(group.occurrences.map((occurrence) => occurrence.eventId)).toStrictEqual([
+      first.id,
+      second.id,
+    ]);
+  });
+
+  it('reads a mixed group’s codes and failures from its settled occurrences', () => {
+    const requestKey = opaqueRequestKey('ph');
+    const group = noDuplicates(
+      onlyGroup(
+        aggregateRequests([
+          makeRequestEvent({ requestKey, statusCode: 200 }),
+          makeRequestEvent({ requestKey, statusCode: 500, startTime: BASE_TIME + 3000 }),
+          makeInFlightEvent({ requestKey, startTime: BASE_TIME + 6000 }),
+        ]),
+      ),
+    );
+
+    expect(group.count).toBe(3);
+    expect(group.pendingCount).toBe(1);
+    expect(group.statusCodes).toStrictEqual([200, 500]);
+    expect(group.errorCount).toBe(1);
+  });
+
+  it('includes a pending occurrence’s elapsed time in the durations, as a lower bound', () => {
+    const requestKey = opaqueRequestKey('pi');
+    const group = noDuplicates(
+      onlyGroup(
+        aggregateRequests([
+          makeRequestEvent({ requestKey, duration: 10 }),
+          makeInFlightEvent({ requestKey, startTime: BASE_TIME + 3000, duration: 40 }),
+        ]),
+      ),
+    );
+    const pending = occurrenceAt(group, 1);
+
+    expect(group.totalDurationMs).toBe(50);
+    expect(group.averageDurationMs).toBe(25);
+    expect(group.maxDurationMs).toBe(40);
+    expect(group.minDurationMs).toBe(10);
+    // The end is the observation instant, which is all the capture knows.
+    expect(pending.pending).toBe(true);
+    expect(pending.endTime).toBe(roundMs(BASE_TIME + 3000 + 40));
+  });
+
+  it('sweeps a pending occurrence into a duplicate window by its issuance start', () => {
+    const requestKey = opaqueRequestKey('pj');
+    const settled = makeRequestEvent({ requestKey });
+    const pending = makeInFlightEvent({ requestKey, startTime: BASE_TIME + 5 });
+
+    const group = onlyGroup(aggregateRequests([settled, pending]));
+    const duplicateWindow = windowAt(group, 0);
+
+    expect(group.duplicateCount).toBe(1);
+    expect(duplicateWindow.eventIds).toStrictEqual([settled.id, pending.id]);
+    // A window is bounded by issuance, so its end is the pending request's
+    // start rather than any completion it has not reached.
+    expect(duplicateWindow.endTime).toBe(BASE_TIME + 5);
+  });
+
+  it('survives the transports it travels on and leaves its input untouched', () => {
+    const requestKey = opaqueRequestKey('pk');
+    const traceId = nextTraceId();
+    const spanId = nextSpanId();
+    const events = [
+      makeRequestEvent({ requestKey, statusCode: 404 }),
+      makeInFlightEvent({ requestKey, startTime: BASE_TIME + 9 }),
+      makeInFlightEvent({ requestKey, traceId, spanId, startTime: BASE_TIME + 2000 }),
+      makeRequestEvent({ requestKey, traceId, spanId, startTime: BASE_TIME + 2000 }),
+      makeResourceEvent({ url: ITEMS_PATH, transferSize: 64, transferSizeExposed: true }),
+    ];
+    const snapshot = structuredClone(events);
+    const references = [...events];
+
+    const groups = aggregateRequests(events);
+    const group = onlyGroup(groups);
+
+    expect(group.count).toBe(3);
+    expect(group.pendingCount).toBe(1);
+    expect(JSON.parse(JSON.stringify(groups))).toStrictEqual(groups);
+    expect(events).toStrictEqual(snapshot);
+    events.forEach((event, index) => {
+      expect(event).toBe(elementAt(references, index, 'an input event'));
+    });
+  });
+
+  it('spells the in-flight key exactly as the producer writes it', () => {
+    // `../browser/fetch.ts` writes the key and may not import this module, so
+    // `../browser/in-flight-requests.test.ts` pins the producer to this
+    // constant and this case pins the constant to its literal.
+    expect(REQUEST_IN_FLIGHT_ATTRIBUTE).toBe('inFlight');
+    expect(SERVICE_ASSIGNED_ATTRIBUTE_KEYS).not.toContain(REQUEST_IN_FLIGHT_ATTRIBUTE);
+  });
+
+  it('reads a key the attribute catalog declares for every request kind', () => {
+    // The catalog is the authoritative vocabulary (AAP 0.2.3): the panel node
+    // catalog derives `requestTable.reads` from it, so a pending signal the
+    // aggregate reads but the catalog omitted would be evidence no reader was
+    // told about. Both transports carry it, and so does every request kind.
+    expect(FETCH_ATTRIBUTE_KEYS).toContain(REQUEST_IN_FLIGHT_ATTRIBUTE);
+    expect(XHR_ATTRIBUTE_KEYS).toContain(REQUEST_IN_FLIGHT_ATTRIBUTE);
+    expect(REQUEST_KINDS.length).toBeGreaterThan(0);
+    for (const kind of REQUEST_KINDS) {
+      expect(attributeKeysFor(kind)).toContain(REQUEST_IN_FLIGHT_ATTRIBUTE);
+    }
   });
 });
 

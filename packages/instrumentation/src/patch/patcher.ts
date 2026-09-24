@@ -111,6 +111,15 @@
  * bytes before anything is patched. Content that fails either check is refused
  * rather than rewritten into something merely similar.
  *
+ * A UTF-8 byte-order mark (`EF BB BF`) is preserved **exactly once, at byte
+ * 0** — never stripped, moved or duplicated. TypeScript tooling reads the mark
+ * as an encoding mark rather than source text, so the transform is handed the
+ * decoded text without it and the mark is put back in front of the transform's
+ * output before that output is encoded, hashed, diffed and written. The
+ * journaled diff therefore describes the full file on both sides, mark
+ * included, and a file without a mark is patched exactly as the transform
+ * produced it.
+ *
  * @example Patching one planned action
  * ```ts
  * const patcher = createPatcher({
@@ -234,6 +243,16 @@ const DIFF_LABELS = Object.freeze({
   original: 'original',
   instrumented: 'instrumented',
 });
+
+/**
+ * The UTF-8 byte-order mark as {@link decodeSource} yields it: one U+FEFF code
+ * unit at offset 0 of the decoded text, which re-encodes to exactly the three
+ * bytes `EF BB BF` it was decoded from.
+ *
+ * Named because it is the one character this module moves across the
+ * text-to-transform boundary itself — see {@link separateByteOrderMark}.
+ */
+const BYTE_ORDER_MARK = '\uFEFF';
 
 /**
  * The action types that reduce to an in-place patch of a named symbol.
@@ -737,6 +756,15 @@ export interface PatchOutcome {
   /**
    * The transform's own result, for a caller that wants the edit ranges, the
    * emitted identifiers or the declaration shape.
+   *
+   * Exactly what the transform returned, which for a file that starts with a
+   * UTF-8 byte-order mark means **without the mark**: the transform is handed
+   * the decoded text minus its encoding mark (TypeScript tooling does not read
+   * it as source text), so `originalText`, `patchedText`, every edit offset and
+   * the recorded {@link PatchOutcome.location} are relative to that BOM-less
+   * text. The bytes on disk — and {@link PatchOutcome.instrumentedHash} and the
+   * journaled diff — carry the mark once at byte 0. For a file without a mark
+   * the two texts are the same.
    *
    * Held in memory only — it carries the file's text, so it is never logged,
    * journaled or sent anywhere (AAP §0.5.2).
@@ -1480,10 +1508,17 @@ class SequencedPatcher implements Patcher {
       // ---------------------------------------------------------------------
       stage = 'build-patch';
 
+      // The transform sees the source without its byte-order mark, and the
+      // mark is put back — once, at byte 0 — around what it returns. Every
+      // step from here on (the encode, `instrumentedHash`, the no-op check,
+      // the journaled diff and the write) works on that full file text, so
+      // the bytes hashed, described and installed are the same bytes.
+      const boundary = separateByteOrderMark(originalText);
+
       const request: FunctionTimingRequest = {
         file,
         symbol,
-        text: originalText,
+        text: boundary.transformText,
         ...(input.action !== undefined ? { action: input.action } : {}),
         ...(input.spanName !== undefined ? { spanName: input.spanName } : {}),
       };
@@ -1507,7 +1542,8 @@ class SequencedPatcher implements Patcher {
         );
       }
 
-      const patchedBytes = new TextEncoder().encode(patched.value.patchedText);
+      const patchedText = boundary.toFileText(patched.value.patchedText);
+      const patchedBytes = new TextEncoder().encode(patchedText);
 
       instrumentedHash = this.#files.hashBytes(patchedBytes);
 
@@ -1577,7 +1613,7 @@ class SequencedPatcher implements Patcher {
       // ---------------------------------------------------------------------
       stage = 'journal-pending';
 
-      const rendered = renderDiff(file, originalText, patched.value.patchedText);
+      const rendered = renderDiff(file, originalText, patchedText);
 
       const created = createModificationRecord(
         {
@@ -2109,10 +2145,12 @@ function raceLostDuringWrite(
  * Strict (`fatal: true`), so content that is not valid UTF-8 is refused instead
  * of being peppered with replacement characters and written back as a file the
  * developer did not have. `ignoreBOM: true` is the load-bearing half: the
- * default *removes* a byte-order mark, and a patch computed from BOM-less text
- * would silently drop three bytes from the front of the file — a change outside
- * the patched region, which is precisely what this module promises never to
- * make.
+ * default *removes* a byte-order mark, and a file text rebuilt from BOM-less
+ * text would silently drop three bytes from the front of the file — a change
+ * outside the patched region, which is precisely what this module promises
+ * never to make. Keeping the mark in the decoded text is what lets the
+ * round-trip proof cover it and lets {@link separateByteOrderMark} hand the
+ * transform the text without it and then put it back exactly once.
  *
  * The decoder is constructed per call rather than shared at module scope, so
  * importing this module still does nothing at all.
@@ -2133,6 +2171,98 @@ function decodeSource(bytes: Uint8Array, file: string): Result<string> {
       ),
     );
   }
+}
+
+/**
+ * The decoded source as it crosses the text-to-transform boundary: the text the
+ * transform is handed, and the one operation that turns the transform's output
+ * back into the file's full text.
+ */
+interface TransformBoundary {
+  /**
+   * The decoded source without its leading run of {@link BYTE_ORDER_MARK} —
+   * in practice the one mark an editor wrote — or the whole decoded source
+   * when it has none.
+   */
+  readonly transformText: string;
+
+  /**
+   * The full text to encode, hash, journal and write: the transform's
+   * `patchedText` with the original's leading mark back at offset 0, exactly as
+   * the file held it. Returns its argument unchanged for a file that had no
+   * mark.
+   */
+  toFileText(transformedText: string): string;
+}
+
+/**
+ * Separates a leading UTF-8 byte-order mark from the text the transform sees,
+ * so it can be put back — exactly once, at byte 0 — around what the transform
+ * returns.
+ *
+ * TypeScript tooling treats a byte-order mark as an encoding mark, not as
+ * source text: ts-morph drops a leading U+FEFF when it creates a source file,
+ * so every position it reports is relative to the text *without* it. Handed the
+ * BOM-bearing text {@link decodeSource} deliberately preserves,
+ * `./function-timing.js` would apply each of those offsets one code unit early
+ * to a string that still starts with the mark. Measured against the fixture
+ * project, that silently rewrote bytes outside the patched region of a
+ * JavaScript target (`}) {` became `}){`) and made every TypeScript target fail
+ * the transform's own introduced-diagnostic check — so a file saved by an
+ * editor that writes a BOM either could not be instrumented at all or was
+ * changed where the patch had no business. Setting the mark aside here keeps
+ * the transform a pure function of source text, and keeps the byte-level
+ * concern in the module that owns bytes.
+ *
+ * Exact in both directions:
+ *
+ * - **The whole leading run is set aside.** In practice that run is the single
+ *   mark an editor wrote. A file that also holds zero-width no-break spaces
+ *   immediately after it gets the run set aside whole, because ts-morph drops
+ *   exactly one leading U+FEFF per parse: handing it text that still began
+ *   with one would reintroduce the same one-code-unit skew. The run is put back
+ *   verbatim, so its length on disk never changes.
+ * - **Never duplicated.** The transform was handed text that does not start
+ *   with a U+FEFF, so any at the front of its output were introduced by it and
+ *   are dropped before the file's own run is restored.
+ *
+ * A file without a mark crosses unchanged in both directions, so nothing about
+ * its patch differs from what the transform produced.
+ *
+ * @param text The decoded source, exactly as {@link decodeSource} returned it.
+ * @returns The text for the transform, and the inverse to apply to its output.
+ */
+function separateByteOrderMark(text: string): TransformBoundary {
+  const markLength = leadingByteOrderMarkLength(text);
+
+  if (markLength === 0) {
+    return { transformText: text, toFileText: (transformedText) => transformedText };
+  }
+
+  const mark = text.slice(0, markLength);
+
+  return {
+    transformText: text.slice(markLength),
+    toFileText: (transformedText) =>
+      `${mark}${transformedText.slice(leadingByteOrderMarkLength(transformedText))}`,
+  };
+}
+
+/**
+ * How many {@link BYTE_ORDER_MARK} code units a text starts with: `0` for
+ * ordinary source, `1` for a file an editor saved with a BOM.
+ *
+ * Counted by code unit rather than matched by pattern, so
+ * {@link separateByteOrderMark} slices both texts by exactly what was counted.
+ */
+function leadingByteOrderMarkLength(text: string): number {
+  let length = 0;
+
+  while (text.startsWith(BYTE_ORDER_MARK, length)) {
+    length += BYTE_ORDER_MARK.length;
+  }
+
+  return length;
 }
 
 /**

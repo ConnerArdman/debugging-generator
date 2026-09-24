@@ -20,6 +20,10 @@
  *     order. A graph that reshuffled between two readings of one capture would
  *     read as noise and would quietly undermine the evidence it exists to
  *     present, which is why that case matters more here than any visual one.
+ *     `layering` then pins the layering itself: one linear pass that lays a
+ *     chain of any length out in full, gives a cycle one column, answers the
+ *     same for any order of arrival, and is resolved once per payload and
+ *     handed to the layout rather than computed again.
  *   - **Nothing interactive is implied that does not exist.** `static layout`
  *     dispatches a wheel and a pointer drag over the canvas and asserts every
  *     positional attribute is byte-identical afterwards, that no element
@@ -28,12 +32,16 @@
  *     gap instead of a control that looks draggable and is not. The note that
  *     states the limitation on screen is asserted alongside it.
  *   - **No selection is ever fabricated.** A participant is a *collapse* of
- *     many records, so the aggregate gives it span ids and no event id.
- *     `interactions` asserts that activating such a participant highlights it
- *     locally and reports **nothing** to the host, while a participant that
- *     really carries an event coordinate reports exactly that coordinate. A
- *     control claiming to select an event that does not exist would be an
- *     unevidenced claim of precisely the kind AAP 0.8.4 rules out.
+ *     records, and the aggregate declares an `eventId` and `traceId` on it only
+ *     when it collapsed exactly one. `interactions` asserts that activating a
+ *     participant without one highlights it locally and reports **nothing** to
+ *     the host, while a participant that carries the declared coordinate
+ *     reports exactly that coordinate, while a coordinate that breaks the
+ *     declared rules (an event id on a multi-record participant, a malformed
+ *     trace id) reports nothing and is counted under the grid — and `aggregate
+ *     contract` proves the same end to end, over a graph the real aggregate
+ *     built. A control claiming to select an event that does not exist would
+ *     be an unevidenced claim of precisely the kind AAP 0.8.4 rules out.
  *
  * Alongside those, AAP 0.8.3 asks every component suite in this folder for the
  * three states of a query-backed view — loading, empty and error — and for the
@@ -59,11 +67,16 @@
  *     contract as what it drew.
  *   - **In-file synthetic builders, no fixture files.** {@link makeGraph},
  *     {@link makeParticipant}, {@link makeEdge} and {@link makeNode} take
- *     overrides; nothing here is read from disk, shared with another suite or
- *     produced by `buildDependencyGraph` — this suite tests the renderer, so
- *     its payloads are hand-constructed and include shapes the aggregate would
- *     never emit (a participant with no `layer`, a cycle) because those are the
- *     defensive paths the component declares.
+ *     overrides and return the authoritative telemetry types, optional
+ *     `eventId`/`traceId` and `inferredCount`/`ambiguousCount` included; nothing
+ *     here is read from disk or shared with another suite. Most payloads are
+ *     hand-constructed and include shapes the aggregate would never emit (a
+ *     participant with no `layer`, a cycle, an event id on a multi-record
+ *     participant) because those are the defensive paths the component
+ *     declares. The one exception is deliberate: the `aggregate contract` case
+ *     runs the real `buildDependencyGraph` over hand-built events, so the
+ *     fields this component reads are proven to be fields the aggregate
+ *     produces rather than fields only this suite supplies.
  *   - **Generic fixture vocabulary only** (AAP 0.5.4). Participant classes come
  *     from the closed telemetry domain, and every label, path and symbol
  *     belongs to no application, demonstration or otherwise:
@@ -77,6 +90,11 @@
  *     `jest-dom` matcher is available in this repository. SVG shapes carry no
  *     role by design — the canvas is one image — so they are read through the
  *     canvas element the role query returned.
+ *   - **One pass-through module mock.** `../utils/scale` is mocked with its own
+ *     implementation, recording calls to `resolveGraphLayering` and
+ *     `layoutDependencyGraph` in a hoisted record, so `layering` can prove the
+ *     layering is resolved once per payload and reused rather than computed a
+ *     second time. Nothing about the geometry changes under the mock.
  *   - **No timers, no fake clocks, no arbitrary waits.** Post-resolution
  *     assertions go through `await screen.findBy…`; `userEvent` drives pointer
  *     activation, and `fireEvent` the two low-level gestures (a wheel and a key
@@ -86,7 +104,8 @@
  *     (imported here as `DependencyGraphNodeSpec`, exactly as the component
  *     aliases it) and the telemetry *datum* for one participant (imported
  *     unaliased alongside `DependencyGraphData` and `DependencyGraphEdge`).
- *     Both arrive as types only.
+ *     Both arrive as types only; the one runtime import from
+ *     `@debuggen/telemetry` is the aggregate itself, for the contract case.
  *
  * @see ./DependencyGraph for the component, its four states and its class contract.
  * @see ../host/DataProvider for the seam the stubs below implement.
@@ -100,28 +119,89 @@ import type {
 } from '@debuggen/panel-schema';
 import { DebuggenError } from '@debuggen/shared';
 import type { SourceLocation } from '@debuggen/shared';
+import { buildDependencyGraph } from '@debuggen/telemetry';
 import type {
   DependencyGraphData,
   DependencyGraphEdge,
   DependencyGraphNode,
+  TelemetryEvent,
 } from '@debuggen/telemetry';
-import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Mock } from 'vitest';
 
-import { DataProviderContext, createDataProvider } from '../host/DataProvider';
+import { DataProviderContext, PanelSessionContext, createDataProvider } from '../host/DataProvider';
 import type { DataProvider, DataQueryResolver, DataQueryResponse } from '../host/DataProvider';
 import { PanelActionsContext } from '../host/PanelActions';
 import type { PanelActions, PanelEventRef } from '../host/PanelActions';
 import { dependencyNodeColorVar } from '../utils/color';
+import { formatDurationCompact, formatTierLabel } from '../utils/format';
 import {
   DEFAULT_GRAPH_COLUMN_GAP,
   DEFAULT_GRAPH_NODE_HEIGHT,
   DEFAULT_GRAPH_NODE_WIDTH,
   DEFAULT_GRAPH_ROW_GAP,
+  assignGraphLayers,
+  layoutDependencyGraph,
+  resolveGraphLayering,
 } from '../utils/scale';
+import type { GraphLayering } from '../utils/scale';
+import type * as ScaleModule from '../utils/scale';
 import { DependencyGraph } from './DependencyGraph';
+
+/*
+ * ---------------------------------------------------------------------------
+ * The layering call record
+ *
+ * `../utils/scale` is mocked with its own implementation: every export behaves
+ * exactly as shipped, and the two layering entry points additionally record
+ * what they were called with, so the layering-once case can prove the component
+ * resolves one layering per payload and hands that very object to the layout.
+ * ---------------------------------------------------------------------------
+ */
+
+/** What the component asked of the two layering entry points since the last reset. */
+interface ScaleCallRecord {
+  /** Every layering `resolveGraphLayering` returned, in call order. */
+  readonly resolved: GraphLayering[];
+
+  /** The `layering` argument of every `layoutDependencyGraph` call, in call order. */
+  readonly supplied: (GraphLayering | undefined)[];
+}
+
+/**
+ * The record itself.
+ *
+ * Hoisted, because Vitest lifts the `vi.mock` factory above the imports and the
+ * factory closes over it. Plain arrays rather than `vi.fn` history: `afterEach`
+ * restores every mock, and this record must not depend on what that does to a
+ * spy.
+ */
+const scaleCalls = vi.hoisted<ScaleCallRecord>(() => ({ resolved: [], supplied: [] }));
+
+vi.mock('../utils/scale', async (importOriginal) => {
+  const actual = await importOriginal<typeof ScaleModule>();
+
+  const resolveGraphLayering: typeof actual.resolveGraphLayering = (nodes, edges) => {
+    const layering = actual.resolveGraphLayering(nodes, edges);
+    scaleCalls.resolved.push(layering);
+    return layering;
+  };
+
+  const layoutDependencyGraph: typeof actual.layoutDependencyGraph = (data, options, layering) => {
+    scaleCalls.supplied.push(layering);
+    return actual.layoutDependencyGraph(data, options, layering);
+  };
+
+  return { ...actual, resolveGraphLayering, layoutDependencyGraph };
+});
+
+/** Empties {@link scaleCalls}, so a case reads only the calls its own render made. */
+function resetScaleCalls(): void {
+  scaleCalls.resolved.length = 0;
+  scaleCalls.supplied.length = 0;
+}
 
 /*
  * ---------------------------------------------------------------------------
@@ -133,10 +213,10 @@ import { DependencyGraph } from './DependencyGraph';
  * ---------------------------------------------------------------------------
  */
 
-/** The fixture trace the enriched participant belongs to: 32 lower-case hex digits. */
+/** The fixture trace a single-record participant belongs to: 32 lower-case hex digits. */
 const TRACE_ID = 'a1b2c3d4e5f60718293a4b5c6d7e8f90';
 
-/** The event id an enriched participant carries; see {@link makeParticipant}. */
+/** The event id a single-record participant carries; see {@link makeParticipant}. */
 const EVENT_ID = 'event-example-0001';
 
 /** A project-relative, POSIX path for the one participant that resolved to source. */
@@ -240,25 +320,6 @@ function spanIdFor(ordinal: number): string {
  */
 
 /**
- * A participant, plus the two optional coordinates an **enriched** payload may
- * carry.
- *
- * `eventId` and `traceId` are absent from the aggregate's declared shape: they
- * are the enrichment seam the datum's `source` field documents, which the
- * coordination service fills for a participant whose producer recorded a
- * resolvable event. The component reads them defensively and reports a
- * selection only when one is present, so this suite needs a type that can carry
- * them without a cast.
- */
-interface EnrichedParticipant extends DependencyGraphNode {
-  /** The event this participant stands for, when it stands for exactly one. */
-  readonly eventId?: string | undefined;
-
-  /** The trace that event belongs to. */
-  readonly traceId?: string | undefined;
-}
-
-/**
  * Overrides accepted by {@link makeParticipant}.
  *
  * The optional fields admit `undefined` explicitly, which `Partial` does not
@@ -266,7 +327,9 @@ interface EnrichedParticipant extends DependencyGraphNode {
  * `{ layer: undefined }` is how a case asks for a participant the payload never
  * placed — the defensive path where the component recomputes every column from
  * the relationships — and the builder drops the key rather than storing the
- * value.
+ * value. `eventId` and `traceId` are the authoritative datum's own optional
+ * coordinate, which the aggregate sets for a participant that collapsed exactly
+ * one record.
  */
 type ParticipantOverrides = Partial<
   Pick<DependencyGraphNode, 'id' | 'kind' | 'label' | 'spanIds' | 'count' | 'totalDurationMs'>
@@ -275,8 +338,8 @@ type ParticipantOverrides = Partial<
   readonly maxDurationMs?: number | undefined;
   readonly source?: SourceLocation | undefined;
   readonly layer?: number | undefined;
-  readonly eventId?: string | undefined;
-  readonly traceId?: string | undefined;
+  readonly eventId?: DependencyGraphNode['eventId'] | undefined;
+  readonly traceId?: DependencyGraphNode['traceId'] | undefined;
 };
 
 /**
@@ -290,7 +353,7 @@ type ParticipantOverrides = Partial<
  * @param overrides Fields to replace, or `undefined` to omit an optional one.
  * @returns A fresh participant; nothing is shared between calls.
  */
-function makeParticipant(overrides: ParticipantOverrides = {}): EnrichedParticipant {
+function makeParticipant(overrides: ParticipantOverrides = {}): DependencyGraphNode {
   const {
     id = 'dep:function|browser|example.participant',
     kind = 'function',
@@ -323,29 +386,21 @@ function makeParticipant(overrides: ParticipantOverrides = {}): EnrichedParticip
 }
 
 /**
- * A relationship, plus the lineage flags an **inferred** one carries.
+ * Overrides accepted by {@link makeEdge}, with the same `undefined` policy.
  *
- * `lineage` is the field an asynchronous continuation is attributed with
- * (AAP 0.4.2) and `ambiguous` the flag a correlation that could not be resolved
- * to one candidate carries. Neither is part of the aggregate's declared edge
- * shape and neither is derived by the component — they are read, so that a
- * guessed relationship can never read as a measured one.
+ * `inferredCount` and `ambiguousCount` are the authoritative edge's own
+ * optional lineage counts (AAP 0.4.2): how many of its records joined their
+ * caller through an asynchronous-continuation attribution rather than by
+ * nesting, and how many of those attributions were ambiguous. The component
+ * reads them and derives neither, so a guessed relationship can never read as a
+ * measured one.
  */
-interface LineageEdge extends DependencyGraphEdge {
-  /** Set when the correlation had more than one candidate. */
-  readonly ambiguous?: boolean | undefined;
-
-  /** The lineage an asynchronous continuation is attributed with. */
-  readonly lineage?: string | undefined;
-}
-
-/** Overrides accepted by {@link makeEdge}, with the same `undefined` policy. */
 type EdgeOverrides = {
   readonly id?: string | undefined;
   readonly count?: number | undefined;
   readonly totalDurationMs?: number | undefined;
-  readonly ambiguous?: boolean | undefined;
-  readonly lineage?: string | undefined;
+  readonly inferredCount?: DependencyGraphEdge['inferredCount'] | undefined;
+  readonly ambiguousCount?: DependencyGraphEdge['ambiguousCount'] | undefined;
 };
 
 /**
@@ -356,13 +411,13 @@ type EdgeOverrides = {
  * @param overrides Fields to replace.
  * @returns A fresh relationship.
  */
-function makeEdge(from: string, to: string, overrides: EdgeOverrides = {}): LineageEdge {
+function makeEdge(from: string, to: string, overrides: EdgeOverrides = {}): DependencyGraphEdge {
   const {
     id = `edge:${from}=>${to}`,
     count = 1,
     totalDurationMs = 12,
-    ambiguous,
-    lineage,
+    inferredCount,
+    ambiguousCount,
   } = overrides;
 
   return {
@@ -371,18 +426,18 @@ function makeEdge(from: string, to: string, overrides: EdgeOverrides = {}): Line
     to,
     count,
     totalDurationMs,
-    ...(ambiguous === undefined ? {} : { ambiguous }),
-    ...(lineage === undefined ? {} : { lineage }),
+    ...(inferredCount === undefined ? {} : { inferredCount }),
+    ...(ambiguousCount === undefined ? {} : { ambiguousCount }),
   };
 }
 
 /** Overrides accepted by {@link makeGraph}. */
 interface GraphOverrides {
   /** The participants, in the order the provider hands them over. */
-  readonly nodes?: readonly EnrichedParticipant[] | undefined;
+  readonly nodes?: readonly DependencyGraphNode[] | undefined;
 
   /** The relationships, in the order the provider hands them over. */
-  readonly edges?: readonly LineageEdge[] | undefined;
+  readonly edges?: readonly DependencyGraphEdge[] | undefined;
 
   /** What the payload claims about its own column count. */
   readonly layerCount?: number | undefined;
@@ -453,8 +508,9 @@ function makeNode(overrides: NodeOverrides = {}): DependencyGraphNodeSpec {
  *   - {@link CHAIN_PARTICIPANTS} is NOT in canonical order — the layers run
  *     3, 4, 0, 2, 1 as handed over;
  *   - {@link CHAIN_RELATIONSHIPS} is NOT in topological order — it runs from
- *     the last handover to the first, which is the input a longest-path
- *     layering has to iterate to resolve.
+ *     the last handover to the first, which is the input a layering that
+ *     followed array order — or relaxed edges in list order a bounded number
+ *     of times — would get wrong.
  * ---------------------------------------------------------------------------
  */
 
@@ -517,7 +573,7 @@ const DATASTORE = makeParticipant({
 });
 
 /** The five participants, in the order the provider hands them over. */
-const CHAIN_PARTICIPANTS: readonly EnrichedParticipant[] = [
+const CHAIN_PARTICIPANTS: readonly DependencyGraphNode[] = [
   ROUTE,
   DATASTORE,
   INTERACTION,
@@ -526,7 +582,7 @@ const CHAIN_PARTICIPANTS: readonly EnrichedParticipant[] = [
 ];
 
 /** The four handovers, from the last to the first. */
-const CHAIN_RELATIONSHIPS: readonly LineageEdge[] = [
+const CHAIN_RELATIONSHIPS: readonly DependencyGraphEdge[] = [
   makeEdge(ROUTE.id, DATASTORE.id, { count: 2, totalDurationMs: 640 }),
   makeEdge(REQUEST.id, ROUTE.id, { totalDurationMs: 1100 }),
   makeEdge(HANDLER.id, REQUEST.id, { totalDurationMs: 1120 }),
@@ -571,7 +627,7 @@ function chainGraph(overrides: Omit<GraphOverrides, 'nodes' | 'edges'> = {}): De
  * @param nodes The participants to strip and reorder, in the order to hand over.
  * @returns The payload, carrying no layering of its own.
  */
-function unplacedGraph(nodes: readonly EnrichedParticipant[]): DependencyGraphData {
+function unplacedGraph(nodes: readonly DependencyGraphNode[]): DependencyGraphData {
   return makeGraph({
     nodes: nodes.map((node) => makeParticipant({ ...node, layer: undefined })),
     edges: CHAIN_RELATIONSHIPS,
@@ -630,7 +686,7 @@ const TIE_BETA = makeParticipant({
  * @param nodes The three participants, in the order to hand over.
  * @returns The payload.
  */
-function tieGraph(nodes: readonly EnrichedParticipant[]): DependencyGraphData {
+function tieGraph(nodes: readonly DependencyGraphNode[]): DependencyGraphData {
   return makeGraph({
     nodes,
     edges: [makeEdge(TIE_ROOT.id, TIE_ALPHA.id), makeEdge(TIE_ROOT.id, TIE_BETA.id)],
@@ -803,6 +859,13 @@ function makeActions(): ActionSpies {
 }
 
 /**
+ * The session the rendered view's queries are addressed to, provided the way
+ * `PanelHost` provides a specification's `sessionId`. Nothing below asserts on
+ * it: the routing contract is pinned by `../host/PanelHost.test.tsx`.
+ */
+const PANEL_SESSION_ID = 'session-under-test';
+
+/**
  * Renders the component inside both host contexts.
  *
  * The `RenderResult` is returned rather than discarded because two elements of
@@ -819,9 +882,11 @@ function renderComponent(
 ): ReturnType<typeof render> {
   return render(
     <DataProviderContext.Provider value={context.provider}>
-      <PanelActionsContext.Provider value={context.actions}>
-        <DependencyGraph node={node} />
-      </PanelActionsContext.Provider>
+      <PanelSessionContext.Provider value={PANEL_SESSION_ID}>
+        <PanelActionsContext.Provider value={context.actions}>
+          <DependencyGraph node={node} />
+        </PanelActionsContext.Provider>
+      </PanelSessionContext.Provider>
     </DataProviderContext.Provider>,
   );
 }
@@ -870,25 +935,38 @@ function cellOf(row: HTMLElement, columnIndex: number): HTMLElement {
 }
 
 /**
- * The participant label of a row.
+ * The label element of a row: the one element the component marks with the
+ * participant's id.
  *
- * Read off the row header's tooltip trigger rather than the header's whole text
- * content: the cell also carries the tooltip's description — the label again,
- * with the participant's class, tier and metrics — which a bare `textContent`
- * would concatenate.
+ * Read by that attribute rather than by the header's whole text content: the
+ * cell also carries the detail — in the tooltip's description while the row is
+ * unfocused, on a second line while it holds focus — which a bare `textContent`
+ * would concatenate. The attribute is on the label in both forms, so the reader
+ * works whichever one the row is in.
+ *
+ * @param row A row obtained by role.
+ * @returns The label element.
+ */
+function participantLabelElementOf(row: HTMLElement): HTMLElement {
+  const header = within(row).getByRole('rowheader');
+  const labels = header.querySelectorAll<HTMLElement>('[data-participant-id]');
+  const label = labels[0];
+
+  if (label === undefined || labels.length !== 1) {
+    throw new Error(`the participant cell rendered ${String(labels.length)} labels, not one`);
+  }
+
+  return label;
+}
+
+/**
+ * The participant label of a row.
  *
  * @param row A row obtained by role.
  * @returns The label that row stands for.
  */
 function participantLabelOf(row: HTMLElement): string {
-  const header = within(row).getByRole('rowheader');
-  const trigger = header.querySelector<HTMLElement>('.dg-tooltip__trigger');
-
-  if (trigger === null) {
-    throw new Error('the participant cell rendered no label');
-  }
-
-  return trigger.textContent ?? '';
+  return participantLabelElementOf(row).textContent ?? '';
 }
 
 /** The participant labels of the grid, in document order. */
@@ -1269,6 +1347,7 @@ describe('DependencyGraph rendering', () => {
   it('gives the grid one tab stop, moves between rows and activates from the keyboard', async () => {
     const spies = makeActions();
     const stub = resolvingProvider(chainGraph());
+    const user = userEvent.setup();
 
     renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
     await screen.findByRole('grid');
@@ -1282,6 +1361,13 @@ describe('DependencyGraph rendering', () => {
 
     expect(first.getAttribute('tabindex')).toBe('0');
     expect(rest.map((row) => row.getAttribute('tabindex'))).toEqual(rest.map(() => '-1'));
+
+    // Entered the way a keyboard user enters it, with one Tab. Pressing an
+    // arrow on a row that never received focus is not a gesture a reader can
+    // make, and it would race the grid's own focus bookkeeping against the
+    // commit that mounted it.
+    await user.tab();
+    expect(document.activeElement).toBe(first);
 
     fireEvent.keyDown(first, { key: 'ArrowDown' });
 
@@ -1360,6 +1446,150 @@ describe('DependencyGraph rendering', () => {
   });
 });
 
+describe('DependencyGraph keyboard detail', () => {
+  /** A generic label far longer than the participant column shows, so the column truncates it. */
+  const LONG_LABEL =
+    'example.participant.with.a.label.long.enough.that.its.column.has.to.shorten.it';
+
+  /** The chain, with the participant of its first row given {@link LONG_LABEL}. */
+  function longLabelGraph(): DependencyGraphData {
+    return makeGraph({
+      nodes: CHAIN_PARTICIPANTS.map((node) =>
+        node.id === INTERACTION.id ? makeParticipant({ ...node, label: LONG_LABEL }) : node,
+      ),
+      edges: CHAIN_RELATIONSHIPS,
+    });
+  }
+
+  /**
+   * Asserts that a row shows its label in the pointer form: truncated by the
+   * stylesheet, inside the tooltip trigger.
+   *
+   * @param row A row obtained by role.
+   */
+  function expectTooltipForm(row: HTMLElement): void {
+    const label = participantLabelElementOf(row);
+    expect(label.classList.contains('dg-text--truncate')).toBe(true);
+    expect(label.closest('.dg-tooltip__trigger')).not.toBeNull();
+  }
+
+  /**
+   * Asserts that a row shows its participant's detail inline: the full label,
+   * untruncated and outside any tooltip, then the tier and the metrics.
+   *
+   * @param row A row obtained by role.
+   * @param node The participant it stands for.
+   */
+  function expectInlineForm(row: HTMLElement, node: DependencyGraphNode): void {
+    const label = participantLabelElementOf(row);
+    expect(label.textContent).toBe(node.label);
+    expect(label.classList.contains('dg-text--truncate')).toBe(false);
+    expect(label.closest('.dg-tooltip')).toBeNull();
+
+    const tier = node.tier === undefined ? '' : `${formatTierLabel(node.tier)} · `;
+    const metrics = `Records ${String(node.count)} · Total ${formatDurationCompact(node.totalDurationMs)} · Slowest ${formatDurationCompact(node.maxDurationMs)}`;
+    const header = within(row).getByRole('rowheader');
+    expect(header.textContent).toBe(`${node.label}${tier}${metrics}`);
+    expect(header.querySelector('[role="tooltip"]')).toBeNull();
+  }
+
+  /** The grid, and every element in it that carries a tab index. */
+  function gridTabIndices(): { readonly zero: number; readonly total: number } {
+    const indexed = Array.from(screen.getByRole('grid').querySelectorAll('[tabindex]'));
+    return {
+      zero: indexed.filter((element) => element.getAttribute('tabindex') === '0').length,
+      total: indexed.length,
+    };
+  }
+
+  it('shows the focused row its full label and detail inline, and nothing else changes form', async () => {
+    const user = userEvent.setup();
+    const stub = resolvingProvider(longLabelGraph());
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+    await screen.findByRole('grid');
+
+    // Unfocused, every label is the pointer form: truncated, with the tooltip.
+    for (const row of dataRows()) {
+      expectTooltipForm(row);
+    }
+
+    // One Tab reaches the grid's single tab stop, the first row.
+    await user.tab();
+
+    const [first, ...others] = dataRows();
+    if (first === undefined) {
+      throw new Error('the grid rendered no data row');
+    }
+
+    expect(document.activeElement).toBe(first);
+    expectInlineForm(first, makeParticipant({ ...INTERACTION, label: LONG_LABEL }));
+
+    // The rows that do not hold focus keep the pointer form.
+    for (const row of others) {
+      expectTooltipForm(row);
+    }
+  });
+
+  it('moves the detail with the arrow keys and restores the pointer form when focus leaves', async () => {
+    const user = userEvent.setup();
+    const stub = resolvingProvider(longLabelGraph());
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+    await screen.findByRole('grid');
+
+    await user.tab();
+    await user.keyboard('{ArrowDown}');
+
+    // Re-read: the key re-renders the rows.
+    const [first, second] = dataRows();
+    if (first === undefined || second === undefined) {
+      throw new Error('the grid rendered fewer than two data rows');
+    }
+
+    expect(document.activeElement).toBe(second);
+    expectInlineForm(second, HANDLER);
+    expectTooltipForm(first);
+    expect(participantLabelOf(first)).toBe(LONG_LABEL);
+
+    // Focus leaving the grid takes the detail with it.
+    act(() => {
+      second.blur();
+    });
+
+    expect(document.activeElement).not.toBe(second);
+    for (const row of dataRows()) {
+      expectTooltipForm(row);
+    }
+  });
+
+  it('adds no tab stop: the grid keeps exactly one before, during and after focus', async () => {
+    const user = userEvent.setup();
+    const stub = resolvingProvider(longLabelGraph());
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+    await screen.findByRole('grid');
+
+    // Only the rows carry a tab index, and exactly one of them is the stop.
+    const rowCount = dataRows().length;
+    expect(gridTabIndices()).toEqual({ zero: 1, total: rowCount });
+
+    await user.tab();
+    expect(gridTabIndices()).toEqual({ zero: 1, total: rowCount });
+
+    await user.keyboard('{ArrowDown}');
+    expect(gridTabIndices()).toEqual({ zero: 1, total: rowCount });
+
+    // Nothing focusable was put in a participant cell to carry the detail.
+    for (const row of dataRows()) {
+      const header = within(row).getByRole('rowheader');
+      expect(
+        header.querySelectorAll('[tabindex], a, button, input, select, textarea'),
+      ).toHaveLength(0);
+    }
+  });
+});
+
 describe('DependencyGraph determinism', () => {
   it('draws one payload identically across two fresh mounts', async () => {
     const first = resolvingProvider(chainGraph());
@@ -1401,7 +1631,7 @@ describe('DependencyGraph determinism', () => {
 
     // The payload placed nothing, so every column here was derived from the
     // handovers — and the handovers arrived from the last to the first, which
-    // is the input a longest-path layering has to iterate rather than read.
+    // is the input a layering that followed list order would get wrong.
     expect(orderedReading.map((row) => row.label)).toEqual(CANONICAL_LABELS);
     expect(orderedReading.map((row) => row.layer)).toEqual(CANONICAL_LAYERS);
 
@@ -1465,8 +1695,9 @@ describe('DependencyGraph determinism', () => {
 describe('DependencyGraph cycles', () => {
   it('draws a cyclic flow without hanging, throwing or dropping a participant', async () => {
     // A cycle is what a mutually dependent pair of participants produces, and
-    // no relaxation can order one: the layering is capped, and this case is the
-    // proof that the cap is what runs rather than the clock.
+    // no longest path can order one: the layering groups a cycle into one
+    // strongly connected component in a single linear pass, and this case is
+    // the proof that the pass terminates and keeps every member.
     const first = makeParticipant({
       id: 'dep:ui-event|browser|example.first',
       kind: 'ui-event',
@@ -1522,8 +1753,8 @@ describe('DependencyGraph cycles', () => {
 
     expect(backwards.textContent).toContain('example.first');
 
-    // The relaxation could not separate them, so they share a column and are
-    // stacked in it — a legible answer rather than an invented ordering.
+    // A cycle cannot be ordered, so its members share a column and are stacked
+    // in it — a legible answer rather than an invented ordering.
     const stated = statedLayers();
     expect(new Set(stated).size).toBe(1);
     expect(columnGroups()).toHaveLength(1);
@@ -1534,6 +1765,241 @@ describe('DependencyGraph cycles', () => {
       String(rowPitch),
       String(rowPitch * 2),
     ]);
+  });
+});
+
+describe('DependencyGraph layering', () => {
+  /** A layering as a plain record, so two maps compare regardless of insertion order. */
+  function layersRecord(layers: ReadonlyMap<string, number>): Record<string, number> {
+    return Object.fromEntries(layers);
+  }
+
+  /** One order of arrival of a graph: its participants and its relationships. */
+  type Arrival = readonly [readonly DependencyGraphNode[], readonly DependencyGraphEdge[]];
+
+  /** A copy of `values` starting at position `by` and wrapping round. */
+  function rotated<T>(values: readonly T[], by: number): T[] {
+    return [...values.slice(by), ...values.slice(0, by)];
+  }
+
+  /** The id of step `index` of a synthetic chain. */
+  function stepId(index: number): string {
+    return `dep:function|server|example.step-${String(index)}`;
+  }
+
+  /**
+   * A chain of `length` unplaced participants, step `i` calling step `i + 1`,
+   * with its relationships listed from the LAST handover to the first.
+   *
+   * @param length How many steps.
+   * @returns The participants in step order and the relationships in reverse.
+   */
+  function reversedChain(length: number): {
+    readonly nodes: readonly DependencyGraphNode[];
+    readonly edges: readonly DependencyGraphEdge[];
+  } {
+    const nodes = Array.from({ length }, (_unused, index) =>
+      makeParticipant({ id: stepId(index), label: `example.step-${String(index)}` }),
+    );
+    const edges = Array.from({ length: Math.max(length - 1, 0) }, (_unused, offset) => {
+      const from = length - 2 - offset;
+      return makeEdge(stepId(from), stepId(from + 1));
+    });
+
+    return { nodes, edges };
+  }
+
+  it('reads a fully placed payload as given, and computes an incomplete one whole', () => {
+    const placed = chainGraph();
+    const fromPayload = resolveGraphLayering(placed.nodes, placed.edges);
+
+    expect(fromPayload.computed).toBe(false);
+    expect(layersRecord(fromPayload.layers)).toEqual(
+      Object.fromEntries(placed.nodes.map((node) => [node.id, node.layer])),
+    );
+
+    const unplaced = unplacedGraph(CHAIN_PARTICIPANTS);
+    const computed = resolveGraphLayering(unplaced.nodes, unplaced.edges);
+
+    expect(computed.computed).toBe(true);
+    expect(layersRecord(computed.layers)).toEqual({
+      [INTERACTION.id]: 0,
+      [HANDLER.id]: 1,
+      [REQUEST.id]: 2,
+      [ROUTE.id]: 3,
+      [DATASTORE.id]: 4,
+    });
+
+    // All or nothing: one participant without a usable column — absent,
+    // negative or fractional — recomputes every column, so the declared `7`
+    // below is not mixed with derived ones.
+    for (const unusable of [undefined, -1, 1.5]) {
+      const mixed = resolveGraphLayering(
+        [
+          makeParticipant({ ...INTERACTION, layer: 7 }),
+          makeParticipant({ ...HANDLER, layer: unusable }),
+        ],
+        [makeEdge(INTERACTION.id, HANDLER.id)],
+      );
+
+      expect(mixed.computed).toBe(true);
+      expect(layersRecord(mixed.layers)).toEqual({ [INTERACTION.id]: 0, [HANDLER.id]: 1 });
+    }
+  });
+
+  it('lays the graph out by the layering it is handed and never resolves its own', () => {
+    // Deliberately NOT the payload's layering: the columns are reversed and the
+    // flag says "computed" although the payload placed every participant. A
+    // layout that recomputed would draw the payload's columns and say "read".
+    const placed = chainGraph();
+    const reversed: GraphLayering = {
+      layers: new Map([
+        [INTERACTION.id, 4],
+        [HANDLER.id, 3],
+        [REQUEST.id, 2],
+        [ROUTE.id, 1],
+        [DATASTORE.id, 0],
+      ]),
+      computed: true,
+    };
+
+    const layout = layoutDependencyGraph(placed, undefined, reversed);
+
+    expect(
+      Object.fromEntries(
+        layout.nodes.map((positioned) => [positioned.node.id, positioned.box.layer]),
+      ),
+    ).toEqual(layersRecord(reversed.layers));
+    expect(layout.layersComputed).toBe(true);
+    expect(layout.layerCount).toBe(5);
+
+    // The other flag, the other way round: an unplaced payload handed a flat
+    // layering that says it was read keeps both the columns and the flag.
+    const unplaced = unplacedGraph(CHAIN_PARTICIPANTS);
+    const flat: GraphLayering = {
+      layers: new Map(unplaced.nodes.map((node) => [node.id, 0])),
+      computed: false,
+    };
+
+    const flatLayout = layoutDependencyGraph(unplaced, undefined, flat);
+
+    expect(flatLayout.nodes.map((positioned) => positioned.box.layer)).toEqual([0, 0, 0, 0, 0]);
+    expect(flatLayout.layersComputed).toBe(false);
+    expect(flatLayout.layerCount).toBe(1);
+
+    // Handed nothing, it resolves the layering itself, by the same rule.
+    const own = layoutDependencyGraph(unplaced);
+
+    expect(own.layersComputed).toBe(true);
+    expect(
+      Object.fromEntries(own.nodes.map((positioned) => [positioned.node.id, positioned.box.layer])),
+    ).toEqual(layersRecord(resolveGraphLayering(unplaced.nodes, unplaced.edges).layers));
+  });
+
+  it('lays a 600-step chain out in full when its relationships arrive last to first', () => {
+    // Relaxing edges in list order moves a reversed chain's frontier one column
+    // per pass, so any pass budget below the chain's length strands the tail
+    // short of its column. The linear layering has no budget to run out of.
+    const length = 600;
+    const { nodes, edges } = reversedChain(length);
+
+    const layers = assignGraphLayers(nodes, edges);
+
+    expect(layers.size).toBe(length);
+    expect(Array.from({ length }, (_unused, index) => layers.get(stepId(index)))).toEqual(
+      Array.from({ length }, (_unused, index) => index),
+    );
+  });
+
+  it('never recurses, so neither a very long chain nor a very long cycle can exhaust the stack', () => {
+    const length = 50_000;
+    const { nodes, edges } = reversedChain(length);
+
+    const chain = assignGraphLayers(nodes, edges);
+
+    expect(chain.get(stepId(0))).toBe(0);
+    expect(chain.get(stepId(length - 1))).toBe(length - 1);
+
+    // Closing the chain makes every step reach every other: one strongly
+    // connected component, and therefore one shared column.
+    const cycle = assignGraphLayers(nodes, [...edges, makeEdge(stepId(length - 1), stepId(0))]);
+
+    expect(new Set(cycle.values())).toEqual(new Set([0]));
+    expect(cycle.size).toBe(length);
+  });
+
+  it('gives the members of a cycle one column, and the same map for any order of arrival', () => {
+    const origin = makeParticipant({ id: 'dep:ui-event|browser|example.origin', layer: undefined });
+    const loopA = makeParticipant({ id: 'dep:function|browser|example.loop-a', layer: undefined });
+    const loopB = makeParticipant({ id: 'dep:function|browser|example.loop-b', layer: undefined });
+    const loopC = makeParticipant({ id: 'dep:function|browser|example.loop-c', layer: undefined });
+    const sink = makeParticipant({ id: 'dep:database|db|example.sink', layer: undefined });
+
+    const nodes = [
+      origin,
+      loopA,
+      loopB,
+      loopC,
+      sink,
+      makeParticipant({ ...loopA, label: 'again' }),
+    ];
+    const edges = [
+      makeEdge(origin.id, loopA.id),
+      makeEdge(loopA.id, loopB.id),
+      makeEdge(loopB.id, loopC.id),
+      makeEdge(loopC.id, loopA.id),
+      makeEdge(loopC.id, sink.id),
+      // Ignored: a self-reference, and a participant the graph does not hold.
+      makeEdge(loopB.id, loopB.id),
+      makeEdge(sink.id, 'dep:external|server|example.absent'),
+    ];
+
+    const expected = {
+      [origin.id]: 0,
+      [loopA.id]: 1,
+      [loopB.id]: 1,
+      [loopC.id]: 1,
+      [sink.id]: 2,
+    };
+
+    // The repeated id is one participant, and the cycle is one column between
+    // the participant calling into it and the one it calls out to.
+    expect(layersRecord(assignGraphLayers(nodes, edges))).toEqual(expected);
+
+    const arrivals: readonly Arrival[] = [
+      [[...nodes].reverse(), [...edges].reverse()],
+      [rotated(nodes, 2), rotated(edges, 3)],
+      [rotated([...nodes].reverse(), 4), rotated(edges, 5)],
+    ];
+
+    for (const [shuffledNodes, shuffledEdges] of arrivals) {
+      expect(layersRecord(assignGraphLayers(shuffledNodes, shuffledEdges))).toEqual(expected);
+    }
+  });
+
+  it('resolves the layering exactly once per payload and hands that object to the layout', async () => {
+    resetScaleCalls();
+    const stub = resolvingProvider(
+      unplacedGraph([DATASTORE, REQUEST, INTERACTION, ROUTE, HANDLER]),
+    );
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+    await screen.findByRole('grid');
+
+    // One layering for the canonical order and the geometry together — not one
+    // for each — and the layout was handed that very object rather than left
+    // to resolve a second one internally.
+    expect(scaleCalls.resolved).toHaveLength(1);
+    expect(scaleCalls.supplied).toHaveLength(1);
+
+    const [resolved] = scaleCalls.resolved;
+    expect(resolved?.computed).toBe(true);
+    expect(scaleCalls.supplied[0]).toBe(resolved);
+
+    // And the drawing is that layering.
+    expect(reading()).toEqual(
+      CANONICAL_LABELS.map((label, index) => ({ label, layer: CANONICAL_LAYERS[index] })),
+    );
   });
 });
 
@@ -1665,12 +2131,12 @@ describe('DependencyGraph interactions', () => {
 
     await user.click(rowNamed(HANDLER_LABEL));
 
-    // THE HONESTY CASE. A participant of this graph is a collapse of many
-    // records: the aggregate gives it a bounded span sample and no event id, so
-    // there is no coordinate a details drawer could resolve. The activation is
-    // therefore local — the row and its shape both show where the reader aimed
-    // — and the host is told nothing rather than being handed a span id
-    // masquerading as an event id (AAP 0.8.4).
+    // THE HONESTY CASE. This participant declares no `eventId` — it carries a
+    // span sample and nothing else — so there is no coordinate a details
+    // drawer could resolve. The activation is therefore local — the row and
+    // its shape both show where the reader aimed — and the host is told
+    // nothing rather than being handed a span id masquerading as an event id
+    // (AAP 0.8.4).
     expect(spies.onSelectEvent).not.toHaveBeenCalled();
     expect(spies.onOpenSource).not.toHaveBeenCalled();
     expect(rowNamed(HANDLER_LABEL).getAttribute('aria-selected')).toBe('true');
@@ -1680,7 +2146,7 @@ describe('DependencyGraph interactions', () => {
     expect(rowNamed(REQUEST_LABEL).getAttribute('aria-selected')).toBe('false');
   });
 
-  it('reports the event coordinate an enriched participant carries', async () => {
+  it('reports the event coordinate a single-record participant declares', async () => {
     const enriched = makeParticipant({ ...HANDLER, eventId: EVENT_ID, traceId: TRACE_ID });
     const stub = resolvingProvider(
       makeGraph({
@@ -1713,8 +2179,16 @@ describe('DependencyGraph interactions', () => {
     expect(spies.onOpenSource).not.toHaveBeenCalled();
   });
 
-  it('offers no span id as a span hint for a participant that collapsed several records', async () => {
-    const enriched = makeParticipant({ ...DATASTORE, eventId: EVENT_ID, source: undefined });
+  it('reports no selection for a multi-record participant that declares an event anyway', async () => {
+    // The aggregate never pairs an event id with a collapse of several records,
+    // but a payload crosses only a shallow guard. Two records are not one event,
+    // so the declaration is inconsistent: it is not used, and the view says so.
+    const enriched = makeParticipant({
+      ...DATASTORE,
+      eventId: EVENT_ID,
+      traceId: TRACE_ID,
+      source: undefined,
+    });
     const stub = resolvingProvider(makeGraph({ nodes: [enriched], edges: [], layerCount: 5 }));
     const spies = makeActions();
     const user = userEvent.setup();
@@ -1724,18 +2198,67 @@ describe('DependencyGraph interactions', () => {
 
     await user.click(rowNamed(DATASTORE_LABEL));
 
-    expect(spies.onSelectEvent).toHaveBeenCalledTimes(1);
+    expect(spies.onSelectEvent).not.toHaveBeenCalled();
 
-    const [call] = spies.onSelectEvent.mock.calls;
-    if (call === undefined) {
-      throw new Error('the selection handler recorded no call');
+    // The activation is still honoured locally, so the reader sees where they
+    // aimed; only the host is told nothing.
+    expect(rowNamed(DATASTORE_LABEL).getAttribute('aria-selected')).toBe('true');
+
+    const note = await screen.findByText(/declared an event that does not match their records/i);
+    expect(note.closest('.dg-dependency-graph__note')).not.toBeNull();
+    expect(note.textContent).toBe(
+      '1 participant(s) declared an event that does not match their records, so selecting them opens no event.',
+    );
+  });
+
+  it('reports no selection for a single-record participant whose coordinate is malformed', async () => {
+    // Every way a single-record coordinate can break its rules, one participant
+    // each: a blank event id, an event id with no trace, a malformed trace, a
+    // trace with no event, and a well-formed pair on a malformed span sample.
+    const broken = [
+      makeParticipant({ ...HANDLER, eventId: '   ', traceId: TRACE_ID }),
+      makeParticipant({ ...REQUEST, eventId: EVENT_ID }),
+      makeParticipant({ ...ROUTE, eventId: EVENT_ID, traceId: 'not-a-trace-id' }),
+      makeParticipant({ ...INTERACTION, traceId: TRACE_ID }),
+      makeParticipant({
+        id: 'dep:external|server|example.outbound',
+        kind: 'external',
+        label: 'example.outbound',
+        tier: 'server',
+        spanIds: ['not-a-span-id'],
+        layer: 4,
+        eventId: EVENT_ID,
+        traceId: TRACE_ID,
+      }),
+    ];
+    const stub = resolvingProvider(makeGraph({ nodes: broken, edges: [] }));
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+    await screen.findByRole('grid');
+
+    for (const participant of broken) {
+      await user.click(rowNamed(participant.label));
     }
 
-    // Two records collapsed into this participant, so no single span stands for
-    // it and the sample is not passed off as one: the event coordinate travels
-    // alone.
-    expect(call[0]).toEqual({ eventId: EVENT_ID });
-    expect(Object.keys(call[0])).toEqual(['eventId']);
+    expect(spies.onSelectEvent).not.toHaveBeenCalled();
+
+    const note = await screen.findByText(/declared an event that does not match their records/i);
+    expect(note.textContent).toContain(`${String(broken.length)} participant(s)`);
+  });
+
+  it('reports nothing inconsistent for a payload whose coordinates all hold', async () => {
+    const enriched = makeParticipant({ ...HANDLER, eventId: EVENT_ID, traceId: TRACE_ID });
+    const stub = resolvingProvider(
+      makeGraph({ nodes: [INTERACTION, enriched], edges: [makeEdge(INTERACTION.id, HANDLER.id)] }),
+    );
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+    await screen.findByRole('grid');
+
+    expect(screen.queryByText(/does not match their records/i)).toBeNull();
+    expect(screen.queryByText(/inconsistent inferred or ambiguous counts/i)).toBeNull();
   });
 
   it('selects the same participant from the canvas as from the grid', async () => {
@@ -1800,7 +2323,7 @@ describe('DependencyGraph legend', () => {
 
 describe('DependencyGraph relationships', () => {
   it('marks an inferred relationship as inferred, on the chip and on the curve', async () => {
-    const inferred = makeEdge(HANDLER.id, REQUEST.id, { lineage: 'async-continuation' });
+    const inferred = makeEdge(HANDLER.id, REQUEST.id, { inferredCount: 1 });
     const stub = resolvingProvider(
       makeGraph({
         nodes: [INTERACTION, HANDLER, REQUEST],
@@ -1821,8 +2344,7 @@ describe('DependencyGraph relationships', () => {
     // 0.6.4).
     expect(chip.getAttribute('data-edge-id')).toBe(inferred.id);
     expect(chip.classList.contains('dg-is-ambiguous')).toBe(true);
-    expect(chip.textContent).toContain('inferred');
-    expect(chip.textContent).toContain(REQUEST_LABEL);
+    expect(chip.textContent).toBe(`→ ${REQUEST_LABEL} (inferred)`);
 
     // The measured relationship beside it is not marked, in either
     // representation.
@@ -1836,6 +2358,113 @@ describe('DependencyGraph relationships', () => {
     expect(
       edgeCurves().filter((curve) => curve.classList.contains('dg-is-ambiguous')),
     ).toHaveLength(1);
+  });
+
+  it('states the inferred share and the ambiguous part of a relationship in text', async () => {
+    // Three records: two joined through an attribution, one of those two chosen
+    // among several open candidates — and an all-inferred, ambiguous one beside
+    // it, so both suffix shapes are read off one render.
+    const partial = makeEdge(HANDLER.id, REQUEST.id, {
+      count: 3,
+      inferredCount: 2,
+      ambiguousCount: 1,
+    });
+    const whole = makeEdge(INTERACTION.id, HANDLER.id, { inferredCount: 1, ambiguousCount: 1 });
+    const stub = resolvingProvider(
+      makeGraph({ nodes: [INTERACTION, HANDLER, REQUEST], edges: [whole, partial] }),
+    );
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+    await screen.findByRole('grid');
+
+    const [partialChip] = relationshipChips(rowNamed(HANDLER_LABEL));
+    const [wholeChip] = relationshipChips(rowNamed(INTERACTION_LABEL));
+    if (partialChip === undefined || wholeChip === undefined) {
+      throw new Error('a participant rendered no relationship chip');
+    }
+
+    // A mostly measured edge is not called "inferred" outright: its share is.
+    expect(partialChip.textContent).toBe(`→ ${REQUEST_LABEL} ×3 (2 of 3 inferred, 1 ambiguous)`);
+    expect(wholeChip.textContent).toBe(`→ ${HANDLER_LABEL} (inferred, 1 ambiguous)`);
+
+    // Any inferred record marks the relationship, in the grid and on the canvas.
+    expect(partialChip.classList.contains('dg-is-ambiguous')).toBe(true);
+    expect(wholeChip.classList.contains('dg-is-ambiguous')).toBe(true);
+    expect(
+      edgeCurves().filter((curve) => curve.classList.contains('dg-is-ambiguous')),
+    ).toHaveLength(2);
+  });
+
+  it('uses no lineage whose shares do not nest inside the relationship, and says so', async () => {
+    // The protocol's guard on a graph result is shallow, so the shares are
+    // validated rather than trusted or repaired: each of these breaks
+    // `0 ≤ ambiguousCount ≤ inferredCount ≤ count` one way, and none may be
+    // capped into a claim — "inferred", "ambiguous" — the capture never made.
+    const overstated = makeEdge(INTERACTION.id, HANDLER.id, { inferredCount: 5 });
+    const overAmbiguous = makeEdge(HANDLER.id, REQUEST.id, {
+      count: 3,
+      inferredCount: 1,
+      ambiguousCount: 2,
+    });
+    const negative = makeEdge(REQUEST.id, ROUTE.id, { inferredCount: -1 });
+    const fractional = makeEdge(ROUTE.id, DATASTORE.id, { count: 2, inferredCount: 0.5 });
+    const stub = resolvingProvider(
+      makeGraph({
+        nodes: [INTERACTION, HANDLER, REQUEST, ROUTE, DATASTORE],
+        edges: [overstated, overAmbiguous, negative, fractional],
+      }),
+    );
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+    await screen.findByRole('grid');
+
+    const expected: readonly (readonly [string, string])[] = [
+      [INTERACTION_LABEL, `→ ${HANDLER_LABEL}`],
+      [HANDLER_LABEL, `→ ${REQUEST_LABEL} ×3`],
+      [REQUEST_LABEL, `→ ${ROUTE_LABEL}`],
+      [ROUTE_LABEL, `→ ${DATASTORE_LABEL} ×2`],
+    ];
+
+    for (const [label, text] of expected) {
+      const [chip] = relationshipChips(rowNamed(label));
+      if (chip === undefined) {
+        throw new Error(`the participant "${label}" rendered no relationship chip`);
+      }
+      expect(chip.textContent).toBe(text);
+      expect(chip.classList.contains('dg-is-ambiguous')).toBe(false);
+    }
+
+    expect(
+      edgeCurves().filter((curve) => curve.classList.contains('dg-is-ambiguous')),
+    ).toHaveLength(0);
+
+    // Dropped, but never silently: the count of inconsistent declarations is
+    // stated under the grid.
+    const note = await screen.findByText(/inconsistent inferred or ambiguous counts/i);
+    expect(note.closest('.dg-dependency-graph__note')).not.toBeNull();
+    expect(note.textContent).toBe(
+      '4 relationship(s) declared inconsistent inferred or ambiguous counts, which are not shown.',
+    );
+  });
+
+  it('accepts a zero share as the share the aggregate omits', async () => {
+    // `0` is inside the nesting rule, so an explicit zero reads exactly as an
+    // omitted key: a measured relationship, and nothing reported as broken.
+    const explicitZero = makeEdge(INTERACTION.id, HANDLER.id, {
+      inferredCount: 0,
+      ambiguousCount: 0,
+    });
+    const stub = resolvingProvider(
+      makeGraph({ nodes: [INTERACTION, HANDLER], edges: [explicitZero] }),
+    );
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+    await screen.findByRole('grid');
+
+    const [chip] = relationshipChips(rowNamed(INTERACTION_LABEL));
+    expect(chip?.textContent).toBe(`→ ${HANDLER_LABEL}`);
+    expect(chip?.classList.contains('dg-is-ambiguous')).toBe(false);
+    expect(screen.queryByText(/inconsistent inferred or ambiguous counts/i)).toBeNull();
   });
 
   it('says how often a repeated relationship ran, in the grid and on the canvas', async () => {
@@ -1895,5 +2524,123 @@ describe('DependencyGraph relationships', () => {
     expect(edgeCurves()).toHaveLength(1);
     expect(relationshipChips(rowNamed(HANDLER_LABEL))).toHaveLength(0);
     expect(screen.queryByText(/unlisted/i)).toBeNull();
+  });
+});
+
+describe('DependencyGraph aggregate contract', () => {
+  /** Monotonic ordinal behind the captured events' ids, span ids, times and sequences. */
+  let ordinal = 100;
+
+  /**
+   * One persisted, already-redacted event, shaped as the store hands it to the
+   * aggregate: construction order is canonical order, because start time and
+   * both sequences follow it.
+   *
+   * @param over The fields that make the event what the case needs.
+   * @returns A fresh event.
+   */
+  function capturedEvent(
+    over: Pick<TelemetryEvent, 'kind' | 'name'> & Partial<TelemetryEvent>,
+  ): TelemetryEvent {
+    ordinal += 1;
+    return {
+      id: `event-example-${String(ordinal)}`,
+      traceId: TRACE_ID,
+      spanId: spanIdFor(ordinal),
+      startTime: 1_700_000_000_000 + ordinal,
+      duration: 5,
+      tier: 'browser',
+      attributes: {},
+      status: 'ok',
+      producerId: 'producer-example',
+      seq: ordinal,
+      sessionId: 'session-example',
+      captureId: 'capture-example',
+      ingestSeq: ordinal,
+      ...over,
+    };
+  }
+
+  it('selects, withholds and marks exactly what the real aggregate produced', async () => {
+    // A page event that issued one request and reached one function twice; a
+    // view update attributed to the settled request through an asynchronous
+    // continuation (AAP 0.4.2) rather than nested inside it.
+    const press = capturedEvent({ kind: 'interaction', name: 'example.press' });
+    const request = capturedEvent({
+      kind: 'fetch',
+      name: 'GET /example/resource',
+      parentSpanId: press.spanId,
+    });
+    const firstWork = capturedEvent({
+      kind: 'function',
+      name: 'example.work',
+      parentSpanId: press.spanId,
+    });
+    const secondWork = capturedEvent({
+      kind: 'function',
+      name: 'example.work',
+      parentSpanId: press.spanId,
+    });
+    const update = capturedEvent({
+      kind: 'render',
+      name: 'example.view',
+      parentSpanId: request.spanId,
+      attributes: { lineage: 'async-continuation' },
+    });
+
+    // The real aggregate, not a hand-built payload: whatever this component
+    // reads must be something `buildDependencyGraph` actually writes.
+    const graph = buildDependencyGraph([press, request, firstWork, secondWork, update]);
+    const stub = resolvingProvider(graph);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+    await screen.findByRole('grid');
+
+    // The participant that collapsed two records stands for no single event:
+    // activating it selects it locally and reports nothing to the host.
+    await user.click(rowNamed('example.work'));
+
+    expect(rowNamed('example.work').getAttribute('aria-selected')).toBe('true');
+    expect(spies.onSelectEvent).not.toHaveBeenCalled();
+
+    // The single-record participant reports the coordinate of its one event:
+    // the aggregate's `eventId` and `traceId`, and its one span as the hint.
+    await user.click(rowNamed('GET /example/resource'));
+
+    expect(spies.onSelectEvent).toHaveBeenCalledTimes(1);
+    const [call] = spies.onSelectEvent.mock.calls;
+    if (call === undefined) {
+      throw new Error('the selection handler recorded no call');
+    }
+    expect(call[0]).toEqual({
+      eventId: request.id,
+      spanId: request.spanId,
+      traceId: request.traceId,
+    });
+
+    // The continuation-attributed relationship is chipped inferred and its
+    // curve dashed; the nested ones beside it are neither.
+    const [inferredChip] = relationshipChips(rowNamed('GET /example/resource'));
+    if (inferredChip === undefined) {
+      throw new Error('the request participant rendered no relationship chip');
+    }
+    expect(inferredChip.textContent).toBe('→ example.view (inferred)');
+    expect(inferredChip.classList.contains('dg-is-ambiguous')).toBe(true);
+
+    for (const chip of relationshipChips(rowNamed('example.press'))) {
+      expect(chip.classList.contains('dg-is-ambiguous')).toBe(false);
+      expect(chip.textContent).not.toContain('inferred');
+    }
+
+    const dashed = edgeCurves().filter((curve) => curve.classList.contains('dg-is-ambiguous'));
+    expect(dashed).toHaveLength(1);
+    expect(edgeCurves()).toHaveLength(graph.edges.length);
+
+    // Everything the real aggregate declared passes the component's validation:
+    // nothing is reported as inconsistent.
+    expect(screen.queryByText(/does not match their records/i)).toBeNull();
+    expect(screen.queryByText(/inconsistent inferred or ambiguous counts/i)).toBeNull();
   });
 });
